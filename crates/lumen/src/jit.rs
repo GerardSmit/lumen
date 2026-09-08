@@ -24,6 +24,89 @@
     allow(dead_code)
 )]
 
+pub(crate) mod iterator_entry;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod captured;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod collection_insert;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod collection_lookup;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod guarded_write_region;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod inline_frames;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod inline_guard_coverage;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod inline_method;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod local_exit;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod local_load;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod local_store;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod mixed_loop;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod numeric_cfg;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod numeric_expr;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod packed_element;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod property_probe;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod region_exit;
+
 use std::rc::Rc;
 
 use crate::bytecode::Chunk;
@@ -335,6 +418,9 @@ pub struct JitCtx {
     pub opstat_enabled: bool,
     pub callstat_enabled: bool,
     pub inline_recompile_at: u32,
+    /// Binding-array base owned by this activation, valid only while scope generation is zero.
+    /// Shared-context callees have no captured locals and leave this field untouched.
+    pub captured_base: *mut crate::interpreter::Binding,
 }
 
 impl JitCtx {
@@ -394,6 +480,10 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_drop_packed_at as *const () as usize,
         crate::bytecode::jit_strict_eq as *const () as usize,
         crate::bytecode::jit_make_regexp as *const () as usize,
+        crate::bytecode::jit_load_cached_name as *const () as usize,
+        crate::bytecode::collection_lookup::read as *const () as usize,
+        crate::bytecode::collection_insert::map_set as *const () as usize,
+        crate::bytecode::collection_insert::set_add as *const () as usize,
     ]
 }
 
@@ -558,7 +648,11 @@ unsafe extern "C" fn jit_scheduler_trace_fail(stage: usize) {
         }
     }
 }
-pub const N_HELPERS: usize = 26;
+pub const H_LOAD_CACHED_NAME: usize = 26;
+pub const H_COLLECTION_LOOKUP: usize = 27;
+pub const H_COLLECTION_MAP_SET: usize = 28;
+pub const H_COLLECTION_SET_ADD: usize = 29;
+pub const N_HELPERS: usize = 30;
 
 /// ARM64 condition codes used by the inline templates.
 #[cfg(all(
@@ -668,7 +762,8 @@ mod layout_asserts {
     const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, coro) == 8);
     const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, strict) == 12);
     const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, extra) == 16);
-    const _: () = assert!(std::mem::size_of::<crate::interpreter::FnFrame>() == 24);
+    const _: () = assert!(std::mem::size_of::<crate::interpreter::FnFrame>() == 32);
+    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, inline) == 24);
     // The direct-call sequence reads the callee's code/pc_offsets straight from its JitCode.
     const _: () = assert!(std::mem::offset_of!(super::JitCode, mem) == 0);
     const _: () = assert!(std::mem::offset_of!(super::JitCode, pc_offsets) == 16);
@@ -1451,7 +1546,9 @@ pub fn compile(
         return None;
     }
     let cfg = crate::jit_ir::Cfg::build(chunk).ok()?;
+    let guard_coverage = inline_guard_coverage::Compilation::begin(chunk);
     let max_stack = cfg.jit_stack_capacity();
+    let last_uses = crate::jit_ir::liveness::LastUses::build(chunk, &cfg);
     // Debug: `LUMEN_JIT_DUMP=<substr>` prints the op stream of chunks whose leading slot names
     // contain the substring (empty value = all chunks) as they compile.
     if let Ok(pat) = std::env::var("LUMEN_JIT_DUMP") {
@@ -1509,6 +1606,7 @@ pub fn compile(
     let mut a = asm::Asm::new();
     // One label per bytecode pc (branch/catch targets bind as we emit).
     let pc_labels: Vec<usize> = (0..ops.len()).map(|_| a.new_label()).collect();
+    let write_fallback_labels: Vec<usize> = (0..ops.len()).map(|_| a.new_label()).collect();
     let has_active_null_dispatch = fast_scheduler_shell
         .as_ref()
         .and_then(|(_, shell)| shell.active.as_ref())
@@ -1595,8 +1693,30 @@ pub fn compile(
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
             // pc-offset still bind here (harmless: nothing jumps into a fused region — checked).
             skip -= 1;
+            a.bind(write_fallback_labels[pc]);
             continue;
         }
+        mixed_loop::try_emit(
+            &mut a,
+            chunk,
+            &cfg,
+            pc,
+            &write_fallback_labels,
+            &mut targeted,
+            layout,
+        );
+        guarded_write_region::try_emit(
+            &mut a,
+            chunk,
+            &cfg,
+            pc,
+            (&pc_labels, &write_fallback_labels),
+            &mut targeted,
+            layout,
+        );
+        a.bind(write_fallback_labels[pc]);
+        // Mixed object/numeric expressions retain their original templates on every guard miss.
+        numeric_expr::try_emit(&mut a, chunk, &cfg, pc, &pc_labels, &mut targeted, layout);
         // A web-trace regexp workload is dominated by tiny loops whose body is exactly
         // `re.exec(strings[i])` with the result discarded. Let one guarded Rust entry process
         // the dense string range; a declined guard falls through to these untouched templates.
@@ -1899,6 +2019,17 @@ pub fn compile(
                 }
             }
             if !emitted_region {
+                emitted_region = numeric_cfg::try_emit(
+                    &mut a,
+                    chunk,
+                    &cfg,
+                    layout,
+                    pc,
+                    &pc_labels,
+                    &mut targeted,
+                );
+            }
+            if !emitted_region {
                 if let Some(plan) = plan_loop(chunk, ops, pc, &targeted, layout, fast, &cfg) {
                     let plain_h = emit_loop_chain(&mut a, layout, &plan, &pc_labels);
                     a.bind(plain_h);
@@ -2167,6 +2298,7 @@ pub fn compile(
                     false,
                     arr_ok,
                     PropRecv::Stack,
+                    None,
                 );
             }
             // Receiver-direct reads (`this.x`, `slotlocal.x`): the receiver never crosses the
@@ -2189,6 +2321,7 @@ pub fn compile(
                     false,
                     arr_ok,
                     PropRecv::This,
+                    None,
                 );
             }
             Op::GetPropLocal(s, n, cache)
@@ -2213,6 +2346,7 @@ pub fn compile(
                     false,
                     arr_ok,
                     PropRecv::Slot(*s as u32 * 16),
+                    None,
                 );
             }
             Op::ToPropKey | Op::ToPropKeyLocal(_) if fast & 64 != 0 => {
@@ -2287,7 +2421,7 @@ pub fn compile(
                     layout,
                     chunk.jit_name_cache_ptr(*cache),
                     chunk.jit_name_number(*cache),
-                    pc as u32,
+                    (pc as u32, H_LOAD_CACHED_NAME),
                     l_unwind,
                     false,
                 );
@@ -2298,7 +2432,7 @@ pub fn compile(
                     layout,
                     chunk.jit_name_cache_ptr(*cache),
                     chunk.jit_name_number(*cache),
-                    pc as u32,
+                    (pc as u32, H_LOAD_CACHED_NAME),
                     l_unwind,
                     true,
                 );
@@ -2324,6 +2458,35 @@ pub fn compile(
                     l_unwind,
                 );
             }
+            Op::LoadCap(name)
+                if fast & 8192 != 0
+                    && load_name_inlinable(layout)
+                    && layout.binding_init.abs_diff(layout.binding_value) < 256
+                    && chunk.jit_capture_offset(*name).is_some() =>
+            {
+                captured::load(
+                    &mut a,
+                    layout,
+                    chunk.jit_capture_offset(*name).unwrap(),
+                    pc as u32,
+                    l_unwind,
+                );
+            }
+            Op::StoreCap(name) | Op::StoreCapInit(name)
+                if fast & 8192 != 0
+                    && load_name_inlinable(layout)
+                    && layout.binding_init.abs_diff(layout.binding_value) < 256
+                    && chunk.jit_capture_offset(*name).is_some() =>
+            {
+                captured::store(
+                    &mut a,
+                    layout,
+                    chunk.jit_capture_offset(*name).unwrap(),
+                    matches!(op, Op::StoreCapInit(_)),
+                    pc as u32,
+                    l_unwind,
+                );
+            }
             // Captured bindings use the same guarded scope-entry cache as free names, but are
             // keyed by interned name because resolution is always in the current activation.
             // Fresh/recursive activations miss the raw env comparison once and refill safely.
@@ -2333,7 +2496,7 @@ pub fn compile(
                     layout,
                     chunk.jit_cap_cache_ptr(*name),
                     None,
-                    pc as u32,
+                    (pc as u32, H_EXEC),
                     l_unwind,
                     false,
                 );
@@ -2417,6 +2580,10 @@ pub fn compile(
                     .as_bytes()
                     .first()
                     .is_some_and(|b| b.is_ascii_digit());
+                let inline_method = inline_method::plan(chunk, pc, &pc_labels, layout);
+                if inline_method.is_some() {
+                    targeted[pc + 3] = true;
+                }
                 emit_prop_load_inline(
                     &mut a,
                     layout,
@@ -2429,6 +2596,7 @@ pub fn compile(
                     true,
                     arr_ok,
                     PropRecv::Stack,
+                    inline_method,
                 );
             }
             // ---- inline fast paths (tags: 3 = Bool, 4 = Num; payload at +8; Value = 16) ----
@@ -2694,82 +2862,22 @@ pub fn compile(
                 a.bind(done);
             }
             Op::LoadLocal(slot) if fast & 8 != 0 && (*slot as u32) * 16 + 16 < 4096 => {
-                let off = *slot as u32 * 16;
-                let slow = a.new_label();
-                let done = a.new_label();
-                a.ldrb_imm(9, 22, off);
-                a.cmp_imm_w(9, 1); // Empty = TDZ throw → slow
-                a.b_cond(C_EQ, slow);
-                if rc_ok {
-                    a.cmp_imm_w(9, 5);
-                    a.b_cond(C_EQ, slow);
-                    a.ldr_imm(10, 22, off);
-                    a.ldr_imm(11, 22, off + 8);
-                    a.stur(10, 20, 0);
-                    a.stur(11, 20, 8);
-                    let nobump = a.new_label();
-                    a.cmp_imm_w(9, 6);
-                    a.b_cond(C_LO, nobump);
-                    a.ldur(13, 11, rc_strong);
-                    a.add_imm(13, 13, 1);
-                    a.stur(13, 11, rc_strong);
-                    a.bind(nobump);
-                } else {
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_HI, slow);
-                    a.ldr_imm(10, 22, off);
-                    a.ldr_imm(11, 22, off + 8);
-                    a.stur(10, 20, 0);
-                    a.stur(11, 20, 8);
-                }
-                a.add_imm(20, 20, 16);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
+                local_load::emit(&mut a, *slot, pc, layout, last_uses.contains(pc), l_unwind);
             }
             Op::StoreLocal(slot) if fast & 16 != 0 && (*slot as u32) * 16 + 16 < 4096 => {
-                let off = *slot as u32 * 16;
-                let slow = a.new_label();
-                let done = a.new_label();
-                a.ldrb_imm(9, 22, off);
-                if rc_ok {
-                    let drop_old = a.new_label();
-                    a.cmp_imm_w(9, 5);
-                    a.b_cond(C_EQ, drop_old);
-                    let mv = a.new_label();
-                    a.cmp_imm_w(9, 6);
-                    a.b_cond(C_LO, mv);
-                    a.ldr_imm(10, 22, off + 8);
-                    a.ldur(9, 10, rc_strong);
-                    a.cmp_imm_x(9, 1);
-                    a.b_cond(C_LS, drop_old);
-                    a.sub_imm(9, 9, 1);
-                    a.stur(9, 10, rc_strong);
-                    a.b(mv);
-                    // Last references and BigInts need a real destructor, but StoreLocal itself
-                    // cannot throw. Drop only the old slot through the tiny dedicated helper,
-                    // then keep the actual stack-to-slot move in generated code.
-                    a.bind(drop_old);
-                    a.mov(0, 19);
-                    a.movz(1, 0, 0);
-                    a.add_imm(2, 22, off);
-                    a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
-                    a.blr(16);
-                    a.bind(mv);
-                } else {
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_HI, slow);
+                let continuation = (fast & 8 != 0
+                    && local_store::can_forward(
+                        ops,
+                        pc,
+                        last_uses.contains(pc + 1),
+                        targeted[pc + 1],
+                    ))
+                .then(|| pc_labels.get(pc + 2).copied())
+                .flatten();
+                if continuation.is_some() {
+                    targeted[pc + 2] = true;
                 }
-                a.ldur(9, 20, -16);
-                a.ldur(10, 20, -8);
-                a.str_imm(9, 22, off);
-                a.str_imm(10, 22, off + 8);
-                a.sub_imm(20, 20, 16);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
+                local_store::emit(&mut a, *slot, pc, layout, l_unwind, continuation);
             }
             Op::UpdateLocal(slot, kind) if fast & 32 != 0 && (*slot as u32) * 16 + 8 < 4096 => {
                 let off = *slot as u32 * 16;
@@ -2941,39 +3049,16 @@ pub fn compile(
             // Speculative-inline guard: the callee (argc+1 deep) must be the pinned function —
             // a tag compare and a pointer compare; mismatch branches to the generic call.
             Op::InlineGuard(t, target) => {
-                let it = chunk.jit_inline_target(*t);
-                // A Value::Obj payload holds the STORED Rc pointer (the RcBox base), not
-                // `Rc::as_ptr` — read the expected stored word out of an Option<Gc> exactly
-                // like `value::jit_layout` probes it. A dead callee (or an unprobed layout)
-                // degrades to the generic call unconditionally.
-                let stored = it.pin.upgrade().filter(|_| layout.valid).map(|o| {
-                    let some: Option<crate::value::Gc> = Some(o);
-                    unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
-                });
-                match stored {
-                    None => a.b(pc_labels[*target as usize]),
-                    Some(s) => {
-                        if it.expected_env != 0 {
-                            a.ldr_imm(11, 19, 40); // ctx.env_raw
-                            a.mov_imm64(12, it.expected_env as u64);
-                            a.cmp_reg_x(11, 12);
-                            a.b_cond(C_NE, pc_labels[*target as usize]);
-                        }
-                        let dm = (it.argc as i32 + 1) * 16;
-                        a.ldurb(9, 20, -dm);
-                        a.cmp_imm_w(9, 8);
-                        a.b_cond(C_NE, pc_labels[*target as usize]);
-                        a.ldur(9, 20, -dm + 8);
-                        a.mov_imm64(10, s as u64);
-                        a.cmp_reg_x(9, 10);
-                        a.b_cond(C_NE, pc_labels[*target as usize]);
-                        if it.check_this {
-                            a.ldurb(9, 20, -dm - 16);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, pc_labels[*target as usize]);
-                        }
-                    }
-                }
+                let id = guard_coverage
+                    .as_ref()
+                    .and_then(|coverage| coverage.ordinary(pc));
+                inline_guard_coverage::emit(
+                    &mut a,
+                    layout,
+                    chunk.jit_inline_target(*t),
+                    pc_labels[*target as usize],
+                    id,
+                );
             }
             // Calls take the dedicated helper: same contract as the generic one, minus the full
             // op dispatch (they dominate helper traffic in call-heavy code). With bit 524288,
@@ -2983,6 +3068,9 @@ pub fn compile(
             // and op decode. Any mismatch (incl. an empty way: callee 0 matches no payload)
             // falls to the full helper.
             Op::Call(argc, c) | Op::CallWithThis(argc, c) => {
+                if chunk.has_inline_frames() {
+                    inline_frames::record(&mut a, ilayout, chunk.inline_location(pc));
+                }
                 let inline_probe = fast & 524288 != 0;
                 let slow = a.new_label();
                 let done = a.new_label();
@@ -3053,9 +3141,11 @@ pub fn compile(
                             let array_push = array_intrinsics_on.then(|| a.new_label());
                             let no_intr = a.new_label();
                             a.ldrb_imm(9, 12, 96); // ic.intrinsic (offset compile-asserted)
+                            collection_lookup::emit(&mut a, pc, done, l_unwind);
+                            collection_insert::emit(&mut a, pc, 1, done, l_unwind);
                             a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_AT as u32);
                             a.b_cond(C_EQ, char_at);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32);
+                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ASCII_CODE_UNIT as u32);
                             a.b_cond(C_EQ, char_code);
                             a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
                             a.b_cond(C_EQ, sqrt);
@@ -3117,8 +3207,8 @@ pub fn compile(
                             a.ucvtf_d_w(1, 9);
                             a.fcmp(0, 1);
                             a.b_cond(C_NE, hit_slow);
-                            // bounds (ASCII: byte index == unit index); OOB answers NaN in the
-                            // helper
+                            // Bounds (ASCII: byte index == unit index). Out-of-bounds results
+                            // differ by builtin and remain on its original native path.
                             a.ldr_w_imm(14, 11, crate::lstr::LEN_OFF as u32);
                             a.cmp_reg_x(9, 14);
                             a.b_cond(C_HS, hit_slow);
@@ -3294,6 +3384,7 @@ pub fn compile(
                                 matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
                             let no_intr = a.new_label();
                             a.ldrb_imm(9, 12, 96);
+                            collection_insert::emit(&mut a, pc, 2, done, l_unwind);
                             a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
                             a.b_cond(C_EQ, slice);
                             a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32);
@@ -3596,6 +3687,9 @@ pub fn compile(
                 );
             }
         }
+        if let Some(coverage) = &guard_coverage {
+            coverage.installed();
+        }
         Some(JitCode {
             needs_global: ops
                 .iter()
@@ -3751,6 +3845,7 @@ fn emit_prop_load_inline(
     // collide with one. Prototype hops stay `Exotic::None`-only.
     arr_ok: bool,
     recv: PropRecv,
+    inline_method: Option<inline_method::Guard>,
 ) {
     use crate::bytecode::{
         IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID_OK, IC_OFF_MID_SHAPE,
@@ -4158,6 +4253,9 @@ fn emit_prop_load_inline(
     a.madd(15, 13, 16, 15);
     a.bind(val);
     guard_prop_data(a, 9, 15, ea, slow);
+    if let Some(guard) = &inline_method {
+        inline_method::emit(a, guard, ev);
+    }
     if layout.entry_accessor == layout.entry_value + 8 {
         // Decode the NaN-box into the execution tier's wide `{tag,payload}` pair. BigInt keeps
         // the checked path (matching the old template); strings/symbols/objects clone by bumping
@@ -4530,9 +4628,9 @@ fn emit_direct_call(
     a.add_imm(11, 11, 1);
     a.str_w_imm(11, 14, il.depth as u32); // depth++ (u32 field)
     a.str_w_imm(13, 14, il.gc_tick as u32); // tick (not due)
-                                            // FnFrame push: entry = ptr + len*24
+                                            // FnFrame push: entry = ptr + len*32
     a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
-    a.movz(5, 24, 0);
+    a.movz(5, 32, 0);
     a.madd(6, 16, 5, 6);
     a.add_imm(4, 10, gc_data_off as u32);
     a.stur(4, 6, 0); // fn_ptr = the callee's as_ptr identity
@@ -4541,6 +4639,7 @@ fn emit_direct_call(
     a.ldrb_imm(5, 12, IC_STRICT);
     a.sturb(5, 6, 12); // strict
     a.stur(31, 6, 16); // extra = None (xzr)
+    a.stur(31, 6, 24); // no inline source location yet
     a.add_imm(16, 16, 1);
     a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
     // frame pool pop: buf = ptr[--len] → x9 (the callee slots base)
@@ -4798,7 +4897,7 @@ fn emit_direct_finish_stub(
         a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
         a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
         a.sub_imm(16, 16, 1);
-        a.movz(5, 24, 0);
+        a.movz(5, 32, 0);
         a.madd(6, 16, 5, 6);
         a.ldur(9, 6, 16); // FnFrame.extra
         a.cbnz(9, true, slow);
@@ -6599,7 +6698,7 @@ fn emit_load_name_inline(
     layout: &crate::value::JitLayout,
     cache_ptr: usize,
     preferred_number: Option<u64>,
-    pc: u32,
+    (pc, helper): (u32, usize),
     l_unwind: usize,
     // `LoadNameForCall`: the fast path pushes the `this` slot (Undefined — a depth-0 hit can't
     // come through a `with` object) below the value; the slow path runs the full op.
@@ -6710,7 +6809,7 @@ fn emit_load_name_inline(
     a.add_imm(20, 20, 16);
     a.b(done);
     a.bind(slow);
-    emit_exec(a, pc, l_unwind);
+    emit_op_helper(a, helper, pc, l_unwind);
     a.bind(done);
 }
 
@@ -6968,15 +7067,7 @@ fn emit_get_elem_inline(
     a.cbz(12, true, slow);
     if packed_elem_inlinable(layout) {
         let classic_dense = a.new_label();
-        a.ldr_imm(15, 12, layout.dense_packed as u32);
-        a.cbz(15, true, classic_dense);
-        // Packed elements are a keyless Vec<Property>: Empty remains a semantic hole, while a
-        // live data slot can be decoded directly without an index string or entry-table chase.
-        a.ldr_imm(14, 15, layout.vec_len_off as u32);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.ldr_imm(15, 15, layout.vec_ptr_off as u32);
-        a.add_shifted(15, 15, 9, 4); // property_size == 16 (gate above)
+        packed_element::address(a, layout, classic_dense, slow, packed_element::Site::Stack);
         guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
         a.ldur(13, 15, layout.property_value as i32);
         a.mov_imm64(14, crate::value::PACK_EMPTY);
@@ -7703,13 +7794,7 @@ fn emit_elem_local_keyed(
     a.cbz(12, true, slow);
     if get && packed_elem_inlinable(layout) {
         let classic_dense = a.new_label();
-        a.ldr_imm(15, 12, layout.dense_packed as u32);
-        a.cbz(15, true, classic_dense);
-        a.ldr_imm(14, 15, layout.vec_len_off as u32);
-        a.cmp_reg_x(9, 14);
-        a.b_cond(C_HS, slow);
-        a.ldr_imm(15, 15, layout.vec_ptr_off as u32);
-        a.add_shifted(15, 15, 9, 4);
+        packed_element::address(a, layout, classic_dense, slow, packed_element::Site::Local);
         guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
         a.ldur(13, 15, layout.property_value as i32);
         a.mov_imm64(14, crate::value::PACK_EMPTY);
@@ -21991,6 +22076,7 @@ pub fn run(
         global_body: jit_global_body(i, code),
         genv: Rc::as_ptr(&i.global_env) as usize,
         env_parent_raw,
+        captured_base: chunk.jit_capture_base(&env),
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
@@ -22385,6 +22471,7 @@ unsafe fn run_moved_inner(
         global_body: jit_global_body(i, code),
         genv: Rc::as_ptr(&i.global_env) as usize,
         env_parent_raw,
+        captured_base: chunk.jit_capture_base(&env),
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),

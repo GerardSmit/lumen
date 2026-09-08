@@ -17,6 +17,22 @@
 //! immediately). Selectable via the `LUMEN_TIER` / `LUMEN_TIER_THRESHOLD` env vars, the CLI's
 //! `--tier`, or `Engine::set_tier`.
 
+mod activation;
+pub(crate) mod array_destructure;
+pub(crate) mod array_iterator_step;
+pub(crate) mod collection_insert;
+pub(crate) mod collection_lookup;
+mod for_in;
+mod inline_frames;
+mod iterator_entry;
+mod name_path;
+pub(crate) use name_path::jit::load_cached as jit_load_cached_name;
+mod object_literal;
+mod parameters;
+mod switch;
+mod this_binding;
+mod write_strictness;
+
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -254,7 +270,7 @@ pub struct CallIc {
     /// is never reassigned while the object lives.
     pub native: usize,
     /// Intrinsic id for a native entry the call template can inline entirely (0 = none;
-    /// see `INTRINSIC_CHAR_CODE_AT`). Filled from the fn pointer at record time.
+    /// see `INTRINSIC_ASCII_CODE_UNIT`). Filled from the fn pointer at record time.
     pub intrinsic: u8,
 }
 
@@ -264,9 +280,9 @@ pub struct CallIc {
 /// first gate routes them to the helper.
 pub const CALL_IC_NEEDS_ENV: u8 = 16;
 
-/// `String.prototype.charCodeAt`: the call template inlines the all-ASCII receiver + exact-u32
+/// `String.prototype.charCodeAt` and `codePointAt`: inline the all-ASCII receiver + exact-u32
 /// in-bounds index case to a byte load (see `crate::lstr::ASCII_HINT`).
-pub const INTRINSIC_CHAR_CODE_AT: u8 = 1;
+pub const INTRINSIC_ASCII_CODE_UNIT: u8 = 1;
 pub const INTRINSIC_STRING_SLICE: u8 = 2;
 pub const INTRINSIC_OBJECT_HAS_OWN: u8 = 3;
 pub const INTRINSIC_FUNCTION_APPLY: u8 = 4;
@@ -278,6 +294,7 @@ pub const INTRINSIC_REGEXP_EXEC_DISCARD: u8 = 9;
 pub const INTRINSIC_STRING_REPLACE_DISCARD: u8 = 10;
 pub const INTRINSIC_STRING_SPLIT_DISCARD: u8 = 11;
 pub const INTRINSIC_CHAR_AT: u8 = 12;
+// IDs 13..=17 belong to collection lookup/insertion and their dedicated consuming helpers.
 
 impl CallIc {
     pub const EMPTY: CallIc = CallIc {
@@ -437,6 +454,8 @@ pub enum Op {
     /// [`Op::StoreName`] with a per-site generation-checked name cache.
     StoreNameCached(u32, u32),
     LoadThis,
+    /// Resolve lexical this at the read, preserving derived-constructor TDZ semantics.
+    LoadLexicalThis,
     /// `obj.name`. First operand is the name index; second is the per-site inline-cache index into
     /// `Chunk::caches` (see `Interp::get_prop_ic`).
     GetProp(u32, u32),
@@ -461,6 +480,10 @@ pub enum Op {
     /// `for…of` prologue: pops the iterable, pushes the iterator object then its `next` method
     /// (GetIterator with the sync hint, via the interpreter's own helper).
     GetIter,
+    /// Snapshot for-in keys with the interpreter's enumeration rules.
+    ForInKeys,
+    /// Step a private key snapshot, skipping deleted properties. Base, keys, cursor slots.
+    ForInStepL(u16, u16, u16),
     /// One `for…of` step against the iterator/next stored in the two slots: pushes the yielded
     /// value (or `undefined` at exhaustion) then a has-value bool — a following `JumpIfFalse`
     /// exits the loop, so the branch reuses existing machinery in both tiers. A `next`/`done`/
@@ -666,6 +689,7 @@ pub struct Chunk {
     /// Captured bindings to seed into a fresh activation env at entry; empty = no activation
     /// needed (closures, if any, capture the definition env directly).
     cap_inits: Vec<CapInit>,
+    activation_layout: Option<activation::ActivationLayout>,
     /// An inner arrow chain reads the outer `this`: the activation carries a `this` binding.
     env_this: bool,
     /// One inline-cache slot per property-access op (`GetProp`/`SetProp`/`SetPropDrop`/`GetMethod`),
@@ -680,6 +704,8 @@ pub struct Chunk {
     /// One [`NameIc`] slot per free-name op (`LoadName`/`LoadNameForCall`), persisting across
     /// calls like `caches`.
     name_caches: Vec<std::cell::Cell<NameIc>>,
+    name_paths: Vec<std::cell::RefCell<Option<name_path::NamePath>>>,
+    iterator_entry_feedback: Option<Box<iterator_entry::Feedback>>,
     /// Weak handles pinning each name cache's scope allocation (parallel to `name_caches`), so
     /// the cached raw `env` pointer can never be recycled into a different scope while cached.
     name_pins: std::cell::RefCell<
@@ -725,6 +751,7 @@ pub struct Chunk {
     >,
     /// Guard data for speculatively inlined call sites (`Op::InlineGuard` indexes this).
     inline_targets: Vec<InlineTarget>,
+    inline_frames: Option<inline_frames::Locations>,
     /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
     pub(crate) jit_runs: std::cell::Cell<u32>,
     /// Whether the one-shot inline recompile has been attempted for this chunk.
@@ -928,93 +955,10 @@ impl Chunk {
     /// captured — closures then capture the definition env directly, which resolves identically
     /// because none of their free names are outer locals.
     fn make_run_env(&self, i: &Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
-        if !self.makes_env() {
-            return env.clone();
+        match &self.activation_layout {
+            Some(layout) => layout.make_env(self, i, env, this_val, args),
+            None => env.clone(),
         }
-        let act = crate::interpreter::new_var_scope_with_capacity(
-            Some(env.clone()),
-            self.cap_inits.len() + usize::from(self.env_this),
-        );
-        // Function-declaration closures capture the activation itself, so they are created after
-        // the borrow below is released.
-        let mut fns: Vec<(u16, Rc<str>)> = Vec::new();
-        {
-            let mut b = act.borrow_mut();
-            for ci in &self.cap_inits {
-                match ci {
-                    CapInit::Param(k, name) => {
-                        b.vars.insert(
-                            name.clone(),
-                            crate::interpreter::Binding {
-                                value: args.get(*k as usize).cloned().unwrap_or(Value::Undefined),
-                                mutable: true,
-                                strict_immutable: false,
-                                initialized: true,
-                                import_ref: None,
-                                deletable: false,
-                            },
-                        );
-                    }
-                    CapInit::Var(name) => {
-                        if !b.vars.contains_key(&**name) {
-                            b.vars.insert(
-                                name.clone(),
-                                crate::interpreter::Binding {
-                                    value: Value::Undefined,
-                                    mutable: true,
-                                    strict_immutable: false,
-                                    initialized: true,
-                                    import_ref: None,
-                                    deletable: false,
-                                },
-                            );
-                        }
-                    }
-                    CapInit::Fn(fidx, name) => fns.push((*fidx, name.clone())),
-                    CapInit::Lexical(name, is_const) => {
-                        b.vars.insert(
-                            name.clone(),
-                            crate::interpreter::Binding {
-                                value: Value::Undefined,
-                                mutable: !is_const,
-                                strict_immutable: *is_const,
-                                initialized: false,
-                                import_ref: None,
-                                deletable: false,
-                            },
-                        );
-                    }
-                }
-            }
-            if self.env_this {
-                b.vars.insert(
-                    "this",
-                    crate::interpreter::Binding {
-                        value: this_val.clone(),
-                        mutable: false,
-                        strict_immutable: true,
-                        initialized: true,
-                        import_ref: None,
-                        deletable: false,
-                    },
-                );
-            }
-        }
-        for (fidx, name) in fns {
-            let v = i.make_function(self.funcs[fidx as usize].clone(), act.clone());
-            act.borrow_mut().vars.insert(
-                name.to_string(),
-                crate::interpreter::Binding {
-                    value: v,
-                    mutable: true,
-                    strict_immutable: false,
-                    initialized: true,
-                    import_ref: None,
-                    deletable: false,
-                },
-            );
-        }
-        act
     }
 }
 
@@ -1878,7 +1822,9 @@ pub(crate) fn compile_with_inlines(
     let seed = std::env::var_os("LUMEN_JIT_NO_CACHE_SEED")
         .is_none()
         .then_some(hot);
-    compile_inner(func, plan, seed)
+    let compiled = compile_inner(func, plan, seed)?;
+    inline_plan::compiled::record(func, &compiled);
+    Some(compiled)
 }
 
 fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])> {
@@ -1984,7 +1930,7 @@ fn compile_inner(
     hot: Option<&Chunk>,
 ) -> Option<Rc<Chunk>> {
     // Body facts the scanner already knows: `new.target` is an observation channel into the
-    // activation that slots do not provide; `this` / `arguments` in an arrow are free variables
+    // activation that slots do not provide; `arguments` in an arrow is a free variable
     // we do not model. Parameterless synchronous ordinary functions can materialize an unmapped
     // arguments object into a dedicated slot (the common variadic-helper shape).
     let scan = func.scan_flags();
@@ -1995,10 +1941,6 @@ fn compile_inner(
     let uses_arguments = scan & SCAN_ARGUMENTS != 0;
     if uses_arguments && (func.is_arrow || func.is_async || !func.params.is_empty()) {
         log_bail("fn", "arguments with arrow/async/parameters");
-        return None;
-    }
-    if func.is_arrow && scan & SCAN_THIS != 0 {
-        log_bail("fn", "arrow reading this");
         return None;
     }
     // Generators still run in the tree-walker (their `.return()`/`.throw()` injection and yield*
@@ -2035,7 +1977,10 @@ fn compile_inner(
     };
 
     let mut c = Compiler {
-        env_this,
+        // Arrows forward the enclosing binding through their scope chain. They must not
+        // synthesize a new this binding for nested arrows, especially before super().
+        env_this: env_this && !func.is_arrow,
+        lexical_this: func.is_arrow,
         strict: func.is_strict,
         plan_stack: vec![(plan.clone(), 0)],
         cache_seed_stack: hot
@@ -2068,7 +2013,7 @@ fn compile_inner(
     // Parameters: plain identifiers only, one positional slot each (a sloppy duplicate name
     // resolves to the later parameter, matching the env behavior where the later insert wins).
     // A captured parameter keeps its positional slot (dead) but homes in the activation env.
-    let mut defaulted: Vec<(u16, &Expr)> = Vec::new();
+    let mut defaulted: Vec<(u16, &Expr, Option<u32>)> = Vec::new();
     for (k, p) in func.params.iter().enumerate() {
         if p.rest {
             log_bail("params", "rest parameter");
@@ -2079,10 +2024,10 @@ fn compile_inner(
             return None;
         };
         if let Some(d) = &p.default {
-            // Lowerable defaults: an uncaptured identifier parameter whose default expression
-            // can't observe this-or-later parameters (see `default_expr_safe`).
-            if captured.contains(name) {
-                log_bail("params", "captured defaulted parameter");
+            // Captured defaults need a bounded initialization proof; uncaptured defaults
+            // retain the existing expression-safety check below.
+            if captured.contains(name) && !parameters::captured_default_safe(func, name, d) {
+                log_bail("params", "unsafe captured defaulted parameter");
                 return None;
             }
             let banned: std::collections::HashSet<&str> = func.params[k..]
@@ -2092,11 +2037,12 @@ fn compile_inner(
                     _ => None,
                 })
                 .collect();
-            if !default_expr_safe(d, &banned) {
+            if !parameters::default_expr_safe(d, &banned) {
                 log_bail("params", "unsafe default expression");
                 return None;
             }
-            defaulted.push((k as u16, d));
+            let cap = captured.contains(name).then(|| c.name_idx(name));
+            defaulted.push((k as u16, d, cap));
         }
         let slot = c.fresh_slot(name);
         if captured.contains(name) {
@@ -2110,14 +2056,8 @@ fn compile_inner(
     c.n_params = func.params.len();
     // Parameter defaults fill missing/undefined arguments before anything else runs (spec
     // order: parameter binding precedes var/function hoisting).
-    for (slot, d) in defaulted {
-        c.emit(Op::LoadLocal(slot));
-        c.emit(Op::Undef);
-        c.emit(Op::StrictEq);
-        let jf = c.emit(Op::JumpIfFalse(0));
-        c.expr(d).ok()?;
-        c.emit(Op::StoreLocal(slot));
-        c.patch(jf);
+    for (slot, d, cap) in defaulted {
+        c.parameter_default(slot, d, cap).ok()?;
     }
     // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
     for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &[]) {
@@ -2233,7 +2173,9 @@ fn compile_inner(
     });
     let cap_cache_len = c.names.len();
     let op_count = c.ops.len();
+    let activation_layout = activation::ActivationLayout::new(&c.cap_inits, c.env_this, &c.names);
     Some(Rc::new(Chunk {
+        iterator_entry_feedback: iterator_entry::Feedback::for_ops(&c.ops),
         ops: c.ops,
         consts: c.consts,
         names: c.names,
@@ -2247,12 +2189,16 @@ fn compile_inner(
         forwarded_capacity_hint: std::cell::Cell::new(0),
         funcs: c.funcs,
         cap_inits: c.cap_inits,
+        activation_layout,
         env_this: c.env_this,
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),
         caches: c.caches,
         name_pins: std::cell::RefCell::new(c.name_pins),
+        name_paths: (0..c.name_caches.len())
+            .map(|_| std::cell::RefCell::new(None))
+            .collect(),
         name_caches: c.name_caches,
         name_num_bits: c.name_num_bits,
         name_num_valid: c.name_num_valid,
@@ -2267,6 +2213,7 @@ fn compile_inner(
         call_caches: c.call_caches,
         construct_caches: c.construct_caches,
         call_pins: std::cell::RefCell::new(c.call_pins),
+        inline_frames: c.inline_frames.finish(&c.inline_targets),
         inline_targets: c.inline_targets,
         jit_runs: std::cell::Cell::new(0),
         inline_attempted: std::cell::Cell::new(false),
@@ -2286,179 +2233,13 @@ pub(crate) fn inline_recompile_at() -> u32 {
     })
 }
 
-/// Build the speculative-inline plan for a hot chunk: for each monomorphic, filled call site,
-/// the callee qualifies when it is a plain same-strictness function whose compiled body is
-/// small, needs no activation environment, touches no free names, and hides no control-flow
-/// the splice can't reproduce (handlers, closures). The plan keys are the sites' `CallIc`
-/// indices, which equal the second compile's caller-level site ordinals (same AST, same
-/// emission order).
-pub(crate) fn plan_inlines(
-    chunk: &Chunk,
-    caller: &Function,
-    global_env: &crate::interpreter::Env,
-    caller_env: *const std::cell::RefCell<crate::interpreter::Scope>,
-) -> crate::fasthash::FastMap<u32, InlinePlanEntry> {
-    // Bound the *whole* optimized body rather than stopping after one arbitrary nesting level.
-    // OO hot loops tend to be call chains (dispatcher -> virtual method -> small scheduler
-    // helper); a depth-one cap leaves the most valuable dispatch intact.  The shared source-op
-    // budget prevents four-way polymorphic sites from growing exponentially.  It is deliberately
-    // conservative: an inline property op can expand to substantially more machine code than a
-    // simple arithmetic op.
-    const INLINE_SOURCE_OP_BUDGET: usize = 320;
-    let limit = std::env::var("LUMEN_INLINE_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(INLINE_SOURCE_OP_BUDGET);
-    let mut budget = limit.saturating_sub(chunk.ops.len());
-    plan_inlines_at(chunk, caller, global_env, caller_env, 0, &mut budget)
-}
-
-fn plan_inlines_at(
-    chunk: &Chunk,
-    caller: &Function,
-    global_env: &crate::interpreter::Env,
-    caller_env: *const std::cell::RefCell<crate::interpreter::Scope>,
-    depth: u32,
-    budget: &mut usize,
-) -> crate::fasthash::FastMap<u32, InlinePlanEntry> {
-    const INLINE_MAX_DEPTH: u32 = 3;
-    const INLINE_MAX_WAYS: usize = 4;
-    let max_ops = std::env::var("LUMEN_INLINE_MAX_OPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(96);
-    let mut plan: crate::fasthash::FastMap<u32, InlinePlanEntry> = Default::default();
-    let log = std::env::var_os("LUMEN_TIER_LOG").is_some();
-    macro_rules! skip {
-        ($idx:expr, $why:expr) => {{
-            if log {
-                eprintln!("[tier] inline skip site {}: {}", $idx, $why);
-            }
-            continue;
-        }};
-    }
-    let pins = chunk.call_pins.borrow();
-    for (idx, site) in chunk.call_caches.iter().enumerate() {
-        let mut filled: Vec<CallIc> = site
-            .entries
-            .iter()
-            .map(|e| e.get())
-            .filter(|c| c.callee != 0)
-            .collect();
-        // Distinct callees (refills may duplicate one across ways).  Call ICs retain four ways,
-        // so consume all four when the body budget permits: Richards' central task dispatcher is
-        // exactly four-way polymorphic, and leaving half of it as real calls dominates runtime.
-        filled.dedup_by_key(|c| c.callee);
-        let mut ways: Vec<InlineWay> = Vec::new();
-        for ic in filled.iter().take(INLINE_MAX_WAYS) {
-            let Some(weak) = pins.get(&ic.callee) else {
-                skip!(idx, "no pin")
-            };
-            let Some(obj) = weak.upgrade() else {
-                skip!(idx, "dead callee")
-            };
-            let b = obj.borrow();
-            let crate::value::Callable::User(user) = &b.call else {
-                continue;
-            };
-            // Free names are spliceable when the callee closes directly over the global scope,
-            // or when caller and callee close over the exact same activation. The latter is
-            // guarded again in generated code because an optimized Chunk is shared by every
-            // closure instance created from the same Function AST.
-            let global_closure = Rc::ptr_eq(&user.env, global_env);
-            let callee_env = Rc::as_ptr(&user.env);
-            let shared_closure = !caller_env.is_null() && callee_env == caller_env;
-            let f = &user.func;
-            if f.is_arrow || f.is_strict != caller.is_strict {
-                skip!(idx, "arrow/strictness");
-            }
-            if f.params.iter().any(|p| {
-                p.rest || p.default.is_some() || !matches!(p.pattern, crate::ast::Pattern::Ident(_))
-            }) {
-                skip!(idx, "param shape");
-            }
-            let Some(Some(callee_chunk)) = f.code.get() else {
-                skip!(idx, "callee not compiled");
-            };
-            if std::ptr::eq(&**callee_chunk, chunk) {
-                skip!(idx, "self-recursion");
-            }
-            if callee_chunk.ops.len() > max_ops
-                || callee_chunk.n_slots > 32
-                || !callee_chunk.jit_no_activation()
-                || callee_chunk.env_this
-                || ic.n_params > 8
-            {
-                skip!(idx, "callee size/shape");
-            }
-            // The splice runs under the caller's frame: no handler regions to relocate, no inner
-            // closures, no name writes. Free-name READS are allowed for global-closure callees —
-            // the compiler re-resolves them at the splice site and refuses shadowed ones.
-            if callee_chunk.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::PushHandler(_)
-                        | Op::MakeClosure(..)
-                        | Op::StoreName(_)
-                        | Op::StoreNameCached(..)
-                        | Op::UpdateName(..)
-                        | Op::UpdateNameCached(..)
-                )
-            }) {
-                skip!(idx, "callee ops (handlers/closures/name writes)");
-            }
-            let mut free_names: Vec<Rc<str>> = Vec::new();
-            for op in callee_chunk.ops.iter() {
-                if let Op::LoadName(n, _) | Op::LoadNameForCall(n, _) = op {
-                    let name = callee_chunk.names[*n as usize].clone();
-                    if !free_names.contains(&name) {
-                        free_names.push(name);
-                    }
-                }
-            }
-            if !free_names.is_empty() && !global_closure && !shared_closure {
-                skip!(idx, "free names in a non-global closure");
-            }
-            let inline_cost = callee_chunk.ops.len();
-            if inline_cost > *budget {
-                skip!(idx, "optimized-body budget");
-            }
-            *budget -= inline_cost;
-            let uses_this = callee_chunk.uses_this();
-            // Follow small hot call chains under the shared body budget.  This reaches through a
-            // dispatcher into its virtual target and then into leaf helpers without allowing
-            // unbounded recursive expansion.
-            let nested = if depth < INLINE_MAX_DEPTH && *budget > 0 {
-                plan_inlines_at(callee_chunk, f, global_env, callee_env, depth + 1, budget)
-            } else {
-                Default::default()
-            };
-            let f = f.clone();
-            drop(b);
-            ways.push(InlineWay {
-                check_this: uses_this && !f.is_strict,
-                uses_this,
-                f,
-                obj,
-                free_names,
-                expected_env: if shared_closure {
-                    callee_env as usize
-                } else {
-                    0
-                },
-                nested,
-            });
-        }
-        if ways.is_empty() {
-            continue;
-        }
-        plan.insert(idx as u32, InlinePlanEntry { ways });
-    }
-    plan
-}
+mod inline_plan;
+pub(crate) use inline_plan::plan_inlines;
 
 #[derive(Default)]
 struct Compiler {
+    /// Root arrow bodies read this from the closure environment.
+    lexical_this: bool,
     /// The compiled function's strictness (carried into ops whose runtime behavior forks on it).
     strict: bool,
     /// Captured once-per-call block `let`s homed in the activation (see CaptureScan's
@@ -2527,6 +2308,7 @@ struct Compiler {
     /// `return` jumps inside the current spliced body, patched to the join point.
     inline_returns: Vec<usize>,
     inline_targets: Vec<InlineTarget>,
+    inline_frames: inline_frames::Builder,
 }
 
 /// One planned inline: the callee function (AST) and its pinned identity.
@@ -2594,59 +2376,6 @@ fn log_bail(what: &str, detail: &str) {
 struct Bail;
 type CResult = Result<(), Bail>;
 
-/// Whether a parameter default is in the compiler's lowerable subset: no reference to any
-/// *banned* name (this parameter itself or a later one — the spec's param-scope TDZ would throw
-/// where slots would read a seeded `undefined`), and no nested function/class (whose capture
-/// analysis of a *parameter expression* scope the slot model doesn't carry). Whitelist
-/// recursion: unknown constructs answer false (the function stays on the tree-walker).
-fn default_expr_safe(e: &Expr, banned: &std::collections::HashSet<&str>) -> bool {
-    match e {
-        Expr::Num(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Null
-        | Expr::Undefined
-        | Expr::This
-        | Expr::Regex { .. } => true,
-        Expr::Ident(n) => !banned.contains(n.as_str()),
-        Expr::Paren(x) | Expr::ToStr(x) | Expr::Unary { arg: x, .. } => {
-            default_expr_safe(x, banned)
-        }
-        Expr::Update { arg, .. } => default_expr_safe(arg, banned),
-        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
-            default_expr_safe(left, banned) && default_expr_safe(right, banned)
-        }
-        Expr::Cond { test, cons, alt } => {
-            default_expr_safe(test, banned)
-                && default_expr_safe(cons, banned)
-                && default_expr_safe(alt, banned)
-        }
-        Expr::Member { obj, .. } => default_expr_safe(obj, banned),
-        Expr::Index { obj, index, .. } => {
-            default_expr_safe(obj, banned) && default_expr_safe(index, banned)
-        }
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
-            default_expr_safe(callee, banned)
-                && args.iter().all(|a| match a {
-                    ArrayElem::Item(x) | ArrayElem::Spread(x) => default_expr_safe(x, banned),
-                    ArrayElem::Hole => true,
-                })
-        }
-        Expr::Array(elems) => elems.iter().all(|a| match a {
-            ArrayElem::Item(x) | ArrayElem::Spread(x) => default_expr_safe(x, banned),
-            ArrayElem::Hole => true,
-        }),
-        Expr::Object(props) => props.iter().all(|p| match p {
-            PropDef::KeyValue { key, value } => {
-                !matches!(key, PropKey::Computed(_)) && default_expr_safe(value, banned)
-            }
-            _ => false,
-        }),
-        _ => false,
-    }
-}
-
 /// Whether `e` provably cannot reassign the local `name` (for fused element ops, which defer the
 /// base-slot read past this expression's evaluation). Whitelist recursion: any variant not
 /// explicitly handled answers `false` (don't fuse). Calls and nested functions are safe — a slot
@@ -2707,6 +2436,7 @@ fn no_assign_to(e: &Expr, name: &str) -> bool {
 
 impl Compiler {
     fn emit(&mut self, op: Op) -> usize {
+        self.inline_frames.emit();
         self.ops.push(op);
         self.ops.len() - 1
     }
@@ -2821,9 +2551,11 @@ impl Compiler {
             self.inline_targets.len(),
             self.slot_names.len(),
             self.funcs.len(),
+            self.inline_frames.checkpoint(),
         );
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
             self.ops.truncate(snap.0);
+            self.inline_frames.rollback(snap.9, snap.0);
             self.consts.truncate(snap.1);
             self.names.truncate(snap.2);
             self.caches.truncate(snap.3);
@@ -2984,7 +2716,9 @@ impl Compiler {
             };
             self.scope_bind(name, param_slots[k], false);
         }
+        let frame_context = self.inline_frames.enter(t, f.is_strict, self.ops.len());
         let r = self.inline_body(f);
+        self.inline_frames.leave(frame_context);
         self.call_seed_stack.pop();
         self.name_seed_stack.pop();
         self.cache_seed_stack.pop();
@@ -3742,78 +3476,7 @@ impl Compiler {
             // so fall-through is just falling through. Any lexical/class/function declaration
             // directly in a case body bails — the oracle gives all cases one shared block scope
             // whose TDZ interleavings slots don't model.
-            Stmt::Switch { disc, cases } => {
-                for case in cases {
-                    for s in &case.body {
-                        match s {
-                            Stmt::VarDecl {
-                                kind:
-                                    DeclKind::Let
-                                    | DeclKind::Const
-                                    | DeclKind::Using
-                                    | DeclKind::AwaitUsing,
-                                ..
-                            }
-                            | Stmt::ClassDecl(_)
-                            | Stmt::FuncDecl(_) => return Err(Bail),
-                            _ => {}
-                        }
-                    }
-                }
-                self.expr(disc)?;
-                let tmp = self.fresh_slot("%switch%");
-                self.emit(Op::StoreLocal(tmp));
-                // Phase 1: the test chain. Each match jumps to its (not yet emitted) body.
-                let mut body_jumps: Vec<(usize, usize)> = Vec::new();
-                for (ci, case) in cases.iter().enumerate() {
-                    if let Some(test) = &case.test {
-                        self.emit(Op::LoadLocal(tmp));
-                        self.expr(test)?;
-                        self.emit(Op::StrictEq);
-                        let jf = self.emit(Op::JumpIfFalse(0));
-                        let jb = self.emit(Op::Jump(0));
-                        body_jumps.push((ci, jb));
-                        self.patch(jf);
-                    }
-                }
-                let jdefault = self.emit(Op::Jump(0));
-                self.loops.push(LoopCtx {
-                    labels: std::mem::take(&mut self.pending_labels),
-                    is_switch: true,
-                    ..LoopCtx::default()
-                });
-                // Phase 2: bodies, contiguous and in source order.
-                let mut body_starts = vec![0usize; cases.len()];
-                let mut r = Ok(());
-                'bodies: for (ci, case) in cases.iter().enumerate() {
-                    body_starts[ci] = self.ops.len();
-                    for s in &case.body {
-                        r = self.stmt(s);
-                        if r.is_err() {
-                            break 'bodies;
-                        }
-                    }
-                }
-                let ctx = self.loops.pop().unwrap();
-                r?;
-                for (ci, at) in body_jumps {
-                    match &mut self.ops[at] {
-                        Op::Jump(t) => *t = body_starts[ci] as u32,
-                        _ => unreachable!(),
-                    }
-                }
-                match cases.iter().position(|c| c.test.is_none()) {
-                    Some(di) => match &mut self.ops[jdefault] {
-                        Op::Jump(t) => *t = body_starts[di] as u32,
-                        _ => unreachable!(),
-                    },
-                    None => self.patch(jdefault),
-                }
-                for b in ctx.breaks {
-                    self.patch(b);
-                }
-                Ok(())
-            }
+            Stmt::Switch { disc, cases } => self.switch_statement(disc, cases),
             // `try { ... } catch (e?) { ... }` — no `finally` (bails), catch param an ident or none.
             // On a throw in the try region the VM unwinds to `catch_pc` with the exception pushed.
             Stmt::Try {
@@ -3863,12 +3526,20 @@ impl Compiler {
                 self.patch(jmp_after);
                 Ok(())
             }
+            Stmt::ForInOf {
+                decl: Some(kind @ (DeclKind::Let | DeclKind::Const)),
+                left: Pattern::Ident(name),
+                right,
+                of: false,
+                is_await: false,
+                body,
+            } => self.for_in_statement(*kind, name, right, body),
             // `for (x of it)`: the iterator and its `next` live in hidden slots; each step is
             // IterStepL + JumpIfFalse (existing branch machinery in both tiers); the body runs
             // under a per-iteration handler whose pad closes the iterator in throw mode and
             // rethrows. Exhaustion closes nothing (spec); break/return close via
-            // `emit_exit_cleanup` / the Return arm. for-in, `for await`, destructuring bindings
-            // and captured loop variables stay on the tree-walker.
+            // `emit_exit_cleanup` / the Return arm. Other for-in heads, `for await`, and
+            // captured loop variables stay on the tree-walker.
             Stmt::ForInOf {
                 decl,
                 left,
@@ -4292,7 +3963,7 @@ impl Compiler {
             } if op == "="
                 && !prop.starts_with('#')
                 && match &**mobj {
-                    Expr::This => true,
+                    Expr::This => self.direct_this_allowed(),
                     Expr::Ident(name) => {
                         matches!(self.home(name), Some(Home::Slot(..))) && no_assign_to(value, name)
                     }
@@ -4471,15 +4142,7 @@ impl Compiler {
                 Ok(())
             }
             Expr::This => {
-                // A spliced callee's `this` is the receiver, parked in a caller slot.
-                if let Some(slot) = self.inline_this {
-                    if self.inline_depth > 0 {
-                        self.emit(Op::LoadLocal(slot));
-                        return Ok(());
-                    }
-                }
-                self.uses_this = true;
-                self.emit(Op::LoadThis);
+                self.emit_this();
                 Ok(())
             }
             Expr::Paren(inner) => self.expr(inner),
@@ -4509,7 +4172,7 @@ impl Compiler {
                             return Ok(());
                         }
                     }
-                    Expr::This => {
+                    Expr::This if self.direct_this_allowed() => {
                         self.uses_this = true;
                         let i = self.name_idx(prop);
                         let c = self.new_cache(i);
@@ -4802,49 +4465,7 @@ impl Compiler {
                 self.emit(Op::MakeArray(elems.len() as u16));
                 Ok(())
             }
-            Expr::Object(props) => {
-                let mut count = 0u16;
-                // Keys must land contiguously in `names`; values go on the stack in order.
-                let mut keys: Vec<String> = Vec::new();
-                for p in props {
-                    let PropDef::KeyValue { key, value } = p else {
-                        return Err(Bail);
-                    };
-                    let k = match key {
-                        PropKey::Ident(k) => k.clone(),
-                        PropKey::Str(k) => k.to_string(),
-                        _ => return Err(Bail),
-                    };
-                    // `__proto__:` in literal position sets the prototype, not a property.
-                    if k == "__proto__" || k.starts_with('#') {
-                        return Err(Bail);
-                    }
-                    // NamedEvaluation: `{ m: function(){} }` names the anonymous function "m".
-                    self.named_expr(value, &k)?;
-                    keys.push(k);
-                    count += 1;
-                }
-                // Keys go into `names` only after every value is compiled — value expressions
-                // add names of their own, and the key range must stay contiguous.
-                let start = self.names.len() as u32;
-                for k in &keys {
-                    self.names.push(Rc::from(k.as_str()));
-                }
-                // Distinct keys → a pre-shaped template site ({a:1, a:2} keeps the insert path:
-                // the template's slot-indexed value writes assume one slot per key).
-                let tidx = {
-                    let mut sorted: Vec<&String> = keys.iter().collect();
-                    sorted.sort();
-                    if count > 0 && sorted.windows(2).all(|w| w[0] != w[1]) {
-                        self.obj_maps += 1;
-                        self.obj_maps - 1
-                    } else {
-                        u32::MAX
-                    }
-                };
-                self.emit(Op::MakeObject(start, count, tidx));
-                Ok(())
-            }
+            Expr::Object(props) => self.object_literal(props),
             other => {
                 log_bail("expr", &format!("{:.60}", format!("{other:?}")));
                 Err(Bail)
@@ -5159,6 +4780,7 @@ fn run_vm(
         };
     }
     loop {
+        chunk.record_inline_location(i, *pc);
         let op = chunk.ops[*pc];
         *pc += 1;
         match op {
@@ -5315,6 +4937,7 @@ fn run_vm(
                 chunk.store_name_ic(i, env, n, c, v)?;
             }
             Op::LoadThis => stack.push(this_val.clone()),
+            Op::LoadLexicalThis => stack.push(i.lexical_this(env)?),
             Op::GetProp(n, c) => {
                 let obj = pop!();
                 let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
@@ -5391,22 +5014,26 @@ fn run_vm(
             }
             Op::DestructureArr(n) => {
                 let v = pop!();
-                let (it, nx) = i.get_iterator(&v)?;
-                let mut done = false;
-                for _ in 0..n {
-                    if !done {
-                        match i.iterator_step(&it, &nx)? {
-                            Some(x) => {
-                                stack.push(x);
-                                continue;
+                if let Some(values) = array_destructure::try_dense(i, &v, n) {
+                    stack.extend(values);
+                } else {
+                    let (it, nx) = i.get_iterator(&v)?;
+                    let mut done = false;
+                    for _ in 0..n {
+                        if !done {
+                            match i.iterator_step(&it, &nx)? {
+                                Some(x) => {
+                                    stack.push(x);
+                                    continue;
+                                }
+                                None => done = true,
                             }
-                            None => done = true,
                         }
+                        stack.push(Value::Undefined);
                     }
-                    stack.push(Value::Undefined);
-                }
-                if !done {
-                    i.iterator_close_normal(&it)?;
+                    if !done {
+                        i.iterator_close_normal(&it)?;
+                    }
                 }
             }
             Op::DeleteProp(n, strict) => {
@@ -5868,6 +5495,17 @@ fn run_vm(
                 let s = i.to_string(&v)?;
                 stack.push(Value::Str(s));
             }
+            Op::ForInKeys => {
+                let base = pop!();
+                let keys = i.for_in_keys(&base)?;
+                stack.push(i.make_array(keys));
+            }
+            Op::ForInStepL(base, keys, cursor) => {
+                let value = for_in::step(i, slots, base, keys, cursor)?;
+                let more = value.is_some();
+                stack.push(value.unwrap_or(Value::Undefined));
+                stack.push(Value::Bool(more));
+            }
             Op::GetIter => {
                 let v = pop!();
                 let (it, nx) = i.get_iterator(&v)?;
@@ -5875,9 +5513,20 @@ fn run_vm(
                 stack.push(nx);
             }
             Op::IterStepL(is, ns) => {
-                let it = slots[is as usize].clone();
-                let nx = slots[ns as usize].clone();
-                match i.iterator_step(&it, &nx)? {
+                // The pure fast path borrows rooted slots; only fallback crosses a callback.
+                let stepped = match array_iterator_step::try_yield(
+                    i,
+                    &slots[is as usize],
+                    &slots[ns as usize],
+                ) {
+                    Some(value) => Some(value),
+                    None => {
+                        let it = slots[is as usize].clone();
+                        let nx = slots[ns as usize].clone();
+                        iterator_entry::fallback(chunk, *pc - 1, i, it, nx)?
+                    }
+                };
+                match stepped {
                     Some(v) => {
                         stack.push(v);
                         stack.push(Value::Bool(true));
@@ -6290,6 +5939,9 @@ impl Chunk {
     /// throws the proper error).
     #[inline]
     fn name_ic_hit(&self, i: &Interp, env: &Env, c: u32) -> Option<Value> {
+        if let Some(value) = self.name_path_hit(i, env, c) {
+            return Some(value);
+        }
         let ic = self.name_caches[c as usize].get();
         let raw = Rc::as_ptr(env) as usize;
         if ic.env == raw {
@@ -6413,7 +6065,10 @@ impl Chunk {
         }
         // Global mode: only when there are no intermediate scopes whose later mutation could
         // re-route the name — i.e. the chunk runs directly under the global scope.
-        if !Rc::ptr_eq(env, &i.global_env) || !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize) {
+        if !Rc::ptr_eq(env, &i.global_env) {
+            return self.name_path_fill(i, env, n, c);
+        }
+        if !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize) {
             return None;
         }
         let g = i.global.borrow();
@@ -6437,8 +6092,8 @@ impl Chunk {
         self.name_pins.borrow_mut()[c as usize] = Some(Rc::downgrade(env));
         Some(v)
     }
-    /// Cached free-name read: hit, else depth-0 refill, else the interpreter's full walk
-    /// (deeper resolutions, `with`, module imports, TDZ, globals — uncached every time).
+    /// Cached free-name read: primary or guarded-path hit, refill, then the interpreter's
+    /// full walk for dynamic resolutions, imports, TDZ and uncached global properties.
     pub(crate) fn load_name_ic(
         &self,
         i: &mut Interp,
@@ -6472,8 +6127,14 @@ impl Chunk {
         let (binding, generation) = {
             let mut b = env.borrow_mut();
             let generation = b.vars.generation();
-            let binding = b.vars.get_mut(name).expect("captured binding missing")
-                as *mut crate::interpreter::Binding;
+            let binding = match self
+                .activation_layout
+                .as_ref()
+                .and_then(|layout| layout.binding_mut(&mut b.vars, index))
+            {
+                Some(binding) => binding,
+                None => b.vars.get_mut(name).expect("captured binding missing"),
+            } as *mut crate::interpreter::Binding;
             (binding, generation)
         };
         self.cap_caches[index].set(NameIc {
@@ -6924,6 +6585,7 @@ impl Chunk {
             | Op::LoadCap(_)
             | Op::LoadName(..)
             | Op::LoadThis
+            | Op::LoadLexicalThis
             | Op::MakeClosure(..) => (0, 1),
             Op::Dup => (1, 2),
             Op::Dup2 => (2, 4),
@@ -6956,6 +6618,8 @@ impl Chunk {
             Op::CallSpread(argc) => (*argc as usize + 1, 1),
             Op::CallSpreadThis(argc) => (*argc as usize + 2, 1),
             Op::ToStr => (1, 1),
+            Op::ForInKeys => (1, 1),
+            Op::ForInStepL(..) => (0, 2),
             Op::GetIter => (1, 2),
             Op::IterStepL(..) => (0, 2),
             Op::IterCloseL(_) => (0, 0),
@@ -7064,6 +6728,7 @@ pub(crate) unsafe extern "C" fn jit_exec(
             | Op::SetElemLocalDrop(_)
             | Op::ToPropKeyLocal(_)
             | Op::IterStepL(..)
+            | Op::ForInStepL(..)
             | Op::IterCloseL(_)
             | Op::IterAbortL(_)
             | Op::ResetSlots(..)
@@ -7075,7 +6740,14 @@ pub(crate) unsafe extern "C" fn jit_exec(
     };
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
-    match jit_exec_inner(ctx, pc, &mut sp) {
+    let chunk = &*ctx.chunk;
+    let saved_strict = write_strictness::needed(chunk.ops[pc as usize])
+        .then(|| write_strictness::enter(&mut *ctx.interp, chunk, pc));
+    let result = jit_exec_inner(ctx, pc, &mut sp);
+    if let Some(saved) = saved_strict {
+        (*ctx.interp).strict = saved;
+    }
+    match result {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
             ctx.error = Some(ab);
@@ -7146,6 +6818,7 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
     pc: u32,
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    (*(*ctx).chunk).record_inline_location(&mut *(*ctx).interp, pc as usize);
     let ctx = unsafe { &mut *ctx };
     let chunk = unsafe { &*ctx.chunk };
     let Op::MakeRegExp(body, flags) = chunk.ops[pc as usize] else {
@@ -7175,6 +6848,7 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     pc: u32,
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    (*(*ctx).chunk).record_inline_location(&mut *(*ctx).interp, pc as usize);
     let base = unsafe { sp.sub(2) };
     if !matches!(unsafe { &*base }, Value::Str(_))
         || !matches!(unsafe { &*base.add(1) }, Value::Str(_))
@@ -7216,6 +6890,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     packed: u32,
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    (*(*ctx).chunk).record_inline_location(&mut *(*ctx).interp, (packed & 0xffff) as usize);
     let ctx = &mut *ctx;
     let i = &mut *ctx.interp;
     let intrinsic = (packed >> 16) as u8;
@@ -7522,6 +7197,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
     ctx: *mut crate::jit::JitCtx,
     head: u32,
 ) -> u64 {
+    (*(*ctx).chunk).record_inline_location(&mut *(*ctx).interp, head as usize);
     macro_rules! decline {
         () => {{
             return 0;
@@ -7683,6 +7359,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_exec_discard(
     ctx: *mut crate::jit::JitCtx,
     literal_pc: u32,
 ) -> u64 {
+    (*(*ctx).chunk).record_inline_location(&mut *(*ctx).interp, literal_pc as usize);
     macro_rules! decline {
         () => {{
             return 0;
@@ -7794,6 +7471,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_replace_discard(
     ctx: *mut crate::jit::JitCtx,
     start_pc: u32,
 ) -> u64 {
+    (*(*ctx).chunk).record_inline_location(&mut *(*ctx).interp, start_pc as usize);
     macro_rules! decline {
         () => {{
             return 0;
@@ -7890,6 +7568,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
     ctx: *mut crate::jit::JitCtx,
     start_pc: u32,
 ) -> u64 {
+    (*(*ctx).chunk).record_inline_location(&mut *(*ctx).interp, start_pc as usize);
     macro_rules! decline {
         () => {{
             return 0;
@@ -8213,6 +7892,7 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
     jit_opstat(ctx, pc);
     let i = unsafe { &mut *ctx.interp };
     let chunk = unsafe { &*ctx.chunk };
+    let saved_strict = write_strictness::enter(i, chunk, pc);
     let result: Result<(), Abrupt> = (|| match chunk.ops[pc as usize] {
         Op::SetElem | Op::SetElemDrop => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElem);
@@ -8270,6 +7950,7 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
         }
         _ => unreachable!("jit_set_elem emitted only for element stores"),
     })();
+    i.strict = saved_strict;
     match result {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(abrupt) => {
@@ -8402,6 +8083,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
+    let saved_strict = write_strictness::enter(i, chunk, pc);
     let r: Result<(), Abrupt> = (|| match chunk.ops[pc as usize] {
         Op::SetProp(n, c) => {
             sp = sp.sub(1);
@@ -8453,6 +8135,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
         }
         _ => unreachable!("jit_set_prop emitted only for property stores"),
     })();
+    i.strict = saved_strict;
     match r {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
@@ -8662,9 +8345,11 @@ unsafe fn jit_call_inner(
                                 intrinsic: match nf as *const () as usize {
                                     p if p
                                         == crate::builtins::nf_char_code_at as *const ()
+                                            as usize
+                                        || p == crate::builtins::nf_code_point_at as *const ()
                                             as usize =>
                                     {
-                                        INTRINSIC_CHAR_CODE_AT
+                                        INTRINSIC_ASCII_CODE_UNIT
                                     }
                                     p if p == crate::builtins::nf_char_at as *const () as usize => {
                                         INTRINSIC_CHAR_AT
@@ -8725,7 +8410,7 @@ unsafe fn jit_call_inner(
                                     {
                                         INTRINSIC_STRING_SPLIT_DISCARD
                                     }
-                                    _ => 0,
+                                    p => crate::builtins::collection_intrinsic(p),
                                 },
                             });
                         }
@@ -8946,6 +8631,7 @@ pub(crate) fn jit_opstat_enabled() -> bool {
 
 #[inline(always)]
 unsafe fn jit_opstat(ctx: &mut crate::jit::JitCtx, pc: u32) {
+    (*ctx.chunk).record_inline_location(&mut *ctx.interp, pc as usize);
     {
         if ctx.opstat_enabled {
             struct OpstatDump(crate::fasthash::FastMap<String, u64>);
@@ -9122,6 +8808,7 @@ unsafe fn jit_exec_inner(
             chunk.store_name_ic(i, env, n, c, v)?;
         }
         Op::LoadThis => push!(ctx.this_val.clone()),
+        Op::LoadLexicalThis => push!(i.lexical_this(env)?),
         Op::GetProp(n, c) => {
             let obj = pop!();
             let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
@@ -9193,22 +8880,28 @@ unsafe fn jit_exec_inner(
         }
         Op::DestructureArr(n) => {
             let v = pop!();
-            let (it, nx) = i.get_iterator(&v)?;
-            let mut done = false;
-            for _ in 0..n {
-                if !done {
-                    match i.iterator_step(&it, &nx)? {
-                        Some(x) => {
-                            push!(x);
-                            continue;
-                        }
-                        None => done = true,
-                    }
+            if let Some(values) = array_destructure::try_dense(i, &v, n) {
+                for value in values {
+                    push!(value);
                 }
-                push!(Value::Undefined);
-            }
-            if !done {
-                i.iterator_close_normal(&it)?;
+            } else {
+                let (it, nx) = i.get_iterator(&v)?;
+                let mut done = false;
+                for _ in 0..n {
+                    if !done {
+                        match i.iterator_step(&it, &nx)? {
+                            Some(x) => {
+                                push!(x);
+                                continue;
+                            }
+                            None => done = true,
+                        }
+                    }
+                    push!(Value::Undefined);
+                }
+                if !done {
+                    i.iterator_close_normal(&it)?;
+                }
             }
         }
         Op::DeleteProp(n, strict) => {
@@ -9677,6 +9370,17 @@ unsafe fn jit_exec_inner(
             let s = i.to_string(&v)?;
             push!(Value::Str(s));
         }
+        Op::ForInKeys => {
+            let base = pop!();
+            let keys = i.for_in_keys(&base)?;
+            push!(i.make_array(keys));
+        }
+        Op::ForInStepL(base, keys, cursor) => {
+            let value = for_in::step(i, slots, base, keys, cursor)?;
+            let more = value.is_some();
+            push!(value.unwrap_or(Value::Undefined));
+            push!(Value::Bool(more));
+        }
         Op::GetIter => {
             let v = pop!();
             let (it, nx) = i.get_iterator(&v)?;
@@ -9684,9 +9388,17 @@ unsafe fn jit_exec_inner(
             push!(nx);
         }
         Op::IterStepL(is, ns) => {
-            let it = slots[is as usize].clone();
-            let nx = slots[ns as usize].clone();
-            match i.iterator_step(&it, &nx)? {
+            // The pure fast path borrows rooted slots; only fallback crosses a callback.
+            let stepped =
+                match array_iterator_step::try_yield(i, &slots[is as usize], &slots[ns as usize]) {
+                    Some(value) => Some(value),
+                    None => {
+                        let it = slots[is as usize].clone();
+                        let nx = slots[ns as usize].clone();
+                        iterator_entry::fallback(chunk, pc as usize, i, it, nx)?
+                    }
+                };
+            match stepped {
                 Some(v) => {
                     push!(v);
                     push!(Value::Bool(true));

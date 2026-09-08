@@ -4,6 +4,15 @@
 //! Control flow uses [`Abrupt`] threaded through `Result`: expressions can only ever raise
 //! `Throw`, while statements additionally produce `Return`/`Break`/`Continue` completions.
 
+mod arrays;
+mod bindings;
+pub(crate) mod call_entry;
+mod constructor_body;
+mod fresh_call;
+mod this_binding;
+pub(crate) use bindings::BindingLayout;
+pub use bindings::VarMap;
+
 use crate::ast::*;
 use crate::value::*;
 use std::cell::RefCell;
@@ -147,56 +156,9 @@ pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
 
 pub type Env = Rc<RefCell<Scope>>;
 
-/// One entry of the legacy `fn.caller`/`fn.arguments` reflection stack (see `call_user`). The
-/// arguments object materializes lazily: a body that never names `arguments` skips building it,
-/// and `lazy` keeps what a later reflective read needs to conjure it on demand.
-/// `repr(C)`: the asm call sequence (arc 3b) pushes frames from machine code — fn_ptr@0,
-/// coro@8, strict@12, extra@16, size 24 (asserted in jit.rs).
-#[repr(C)]
-pub struct FnFrame {
-    /// `Rc::as_ptr` of the callee. No strong handle is kept: every frame is pushed while its
-    /// caller holds the callee alive (the callee `Value` sits on the caller's operand stack or in
-    /// the dispatch chain for the whole call — for frames owned by a parked coroutine, the
-    /// worker's frozen stack; a torn-down coroutine's worker parks forever rather than unwinding,
-    /// which this invariant depends on), so the rare reflective reads reconstruct one via
-    /// [`FnFrame::callee`] instead of paying a refcount round-trip on every call.
-    pub fn_ptr: usize,
-    /// Owning coroutine body (`Interp::cur_coro`; 0 = the main driver): a worker-thread panic
-    /// evicts the dead body's frames by this tag (see `ThreadCoro::resume`).
-    pub coro: u32,
-    pub strict: bool,
-    /// The rare per-frame state (a live `arguments` object, or what a reflective `fn.arguments`
-    /// read needs to conjure one). Boxed so the common frame stays 24 bytes — frames are pushed
-    /// and popped on EVERY call, and the pop's copy-out and drop-check of a fat frame was a
-    /// measurable slice of the call path.
-    pub extra: Option<Box<FrameExtra>>,
-}
-
-/// See [`FnFrame::extra`].
-pub struct FrameExtra {
-    pub args_obj: Value,
-    pub lazy: Option<(Rc<crate::ast::Function>, Rc<[Value]>, Env)>,
-}
-
-impl Default for FrameExtra {
-    fn default() -> FrameExtra {
-        FrameExtra {
-            args_obj: Value::Null,
-            lazy: None,
-        }
-    }
-}
-
-impl FnFrame {
-    /// A strong handle to the callee, reconstructed from `fn_ptr` (see its aliveness invariant).
-    pub fn callee(&self) -> Gc {
-        let p = self.fn_ptr as *const RefCell<crate::value::Object>;
-        unsafe {
-            Rc::increment_strong_count(p);
-            Rc::from_raw(p)
-        }
-    }
-}
+mod frames;
+pub use frames::FnFrame;
+pub(crate) use frames::InlineFrame;
 
 /// The JIT fast call's frame-buffer freelist (see `Interp::frame_pool`). A newtype so teardown
 /// frees the raw buffers (their contents are already dropped whenever a buffer is pooled).
@@ -266,194 +228,6 @@ impl Default for RegexpDependencyCache {
             shape: u32::MAX,
             slots: [u32::MAX; 10],
         }
-    }
-}
-
-/// One scope's binding map, wrapping the raw hash map so every *structural* mutation — anything
-/// that can move entries or change what a name resolves to (insert, remove, clear) — bumps a
-/// generation counter. The bytecode tier's per-site name caches hold a raw `&Binding` pointer
-/// plus the generation they resolved it at (see `bytecode::NameIc`): a matching generation
-/// proves the map hasn't changed shape since, so the pointer is still valid *and* still the
-/// right resolution. In-place binding writes (`get_mut`) intentionally don't bump — they can't
-/// move entries, and a cache read-through observes the new value, which is exactly correct.
-/// Reads pass through via `Deref`; mutations only exist as the inherent methods below, so a new
-/// mutation site can't forget the bump (it won't compile).
-pub struct VarMap {
-    map: VarStorage,
-    generation: std::cell::Cell<u32>,
-}
-
-const SMALL_VAR_MAP_CAPACITY: usize = 8;
-
-enum VarStorage {
-    Small(Vec<(std::rc::Rc<str>, Binding)>),
-    Large(crate::fasthash::FastMap<std::rc::Rc<str>, Binding>),
-}
-
-impl Default for VarMap {
-    fn default() -> Self {
-        Self {
-            map: VarStorage::Small(Vec::new()),
-            generation: std::cell::Cell::new(0),
-        }
-    }
-}
-
-pub enum VarIter<'a> {
-    Small(std::slice::Iter<'a, (std::rc::Rc<str>, Binding)>),
-    Large(std::collections::hash_map::Iter<'a, std::rc::Rc<str>, Binding>),
-}
-
-impl<'a> Iterator for VarIter<'a> {
-    type Item = (&'a std::rc::Rc<str>, &'a Binding);
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            VarIter::Small(iter) => iter.next().map(|(name, binding)| (name, binding)),
-            VarIter::Large(iter) => iter.next(),
-        }
-    }
-}
-
-pub enum VarKeys<'a> {
-    Small(std::slice::Iter<'a, (std::rc::Rc<str>, Binding)>),
-    Large(std::collections::hash_map::Keys<'a, std::rc::Rc<str>, Binding>),
-}
-
-impl<'a> Iterator for VarKeys<'a> {
-    type Item = &'a std::rc::Rc<str>;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            VarKeys::Small(iter) => iter.next().map(|(name, _)| name),
-            VarKeys::Large(iter) => iter.next(),
-        }
-    }
-}
-
-pub enum VarValues<'a> {
-    Small(std::slice::Iter<'a, (std::rc::Rc<str>, Binding)>),
-    Large(std::collections::hash_map::Values<'a, std::rc::Rc<str>, Binding>),
-}
-
-impl<'a> Iterator for VarValues<'a> {
-    type Item = &'a Binding;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            VarValues::Small(iter) => iter.next().map(|(_, binding)| binding),
-            VarValues::Large(iter) => iter.next(),
-        }
-    }
-}
-
-impl VarMap {
-    pub(crate) fn with_capacity(capacity: usize) -> VarMap {
-        VarMap {
-            map: if capacity <= SMALL_VAR_MAP_CAPACITY {
-                VarStorage::Small(Vec::with_capacity(capacity))
-            } else {
-                VarStorage::Large(crate::fasthash::FastMap::with_capacity_and_hasher(
-                    capacity,
-                    Default::default(),
-                ))
-            },
-            generation: std::cell::Cell::new(0),
-        }
-    }
-
-    /// The structural generation (name-cache validation token).
-    #[inline]
-    pub(crate) fn generation(&self) -> u32 {
-        self.generation.get()
-    }
-    #[inline]
-    fn bump(&self) {
-        self.generation.set(self.generation.get().wrapping_add(1));
-    }
-    pub fn insert(&mut self, k: impl Into<std::rc::Rc<str>>, v: Binding) -> Option<Binding> {
-        self.bump();
-        let k = k.into();
-        match &mut self.map {
-            VarStorage::Small(entries) => {
-                if let Some((_, old)) = entries.iter_mut().find(|(name, _)| **name == *k) {
-                    return Some(std::mem::replace(old, v));
-                }
-                if entries.len() < SMALL_VAR_MAP_CAPACITY {
-                    entries.push((k, v));
-                    return None;
-                }
-                let mut large = crate::fasthash::FastMap::with_capacity_and_hasher(
-                    entries.len() + 1,
-                    Default::default(),
-                );
-                for (name, binding) in std::mem::take(entries) {
-                    large.insert(name, binding);
-                }
-                let old = large.insert(k, v);
-                self.map = VarStorage::Large(large);
-                old
-            }
-            VarStorage::Large(entries) => entries.insert(k, v),
-        }
-    }
-    pub fn remove(&mut self, k: &str) -> Option<Binding> {
-        self.bump();
-        match &mut self.map {
-            VarStorage::Small(entries) => entries
-                .iter()
-                .position(|(name, _)| &**name == k)
-                .map(|index| entries.swap_remove(index).1),
-            VarStorage::Large(entries) => entries.remove(k),
-        }
-    }
-    pub fn clear(&mut self) {
-        self.bump();
-        match &mut self.map {
-            VarStorage::Small(entries) => entries.clear(),
-            VarStorage::Large(entries) => entries.clear(),
-        }
-    }
-    /// In-place binding write: entries don't move, so the generation stays (see the type docs).
-    pub fn get_mut(&mut self, k: &str) -> Option<&mut Binding> {
-        match &mut self.map {
-            VarStorage::Small(entries) => entries
-                .iter_mut()
-                .find(|(name, _)| &**name == k)
-                .map(|(_, binding)| binding),
-            VarStorage::Large(entries) => entries.get_mut(k),
-        }
-    }
-    pub fn get(&self, k: &str) -> Option<&Binding> {
-        match &self.map {
-            VarStorage::Small(entries) => entries
-                .iter()
-                .find(|(name, _)| &**name == k)
-                .map(|(_, binding)| binding),
-            VarStorage::Large(entries) => entries.get(k),
-        }
-    }
-    pub fn contains_key(&self, k: &str) -> bool {
-        self.get(k).is_some()
-    }
-    pub fn iter(&self) -> VarIter<'_> {
-        match &self.map {
-            VarStorage::Small(entries) => VarIter::Small(entries.iter()),
-            VarStorage::Large(entries) => VarIter::Large(entries.iter()),
-        }
-    }
-    pub fn keys(&self) -> VarKeys<'_> {
-        match &self.map {
-            VarStorage::Small(entries) => VarKeys::Small(entries.iter()),
-            VarStorage::Large(entries) => VarKeys::Large(entries.keys()),
-        }
-    }
-    pub fn values(&self) -> VarValues<'_> {
-        match &self.map {
-            VarStorage::Small(entries) => VarValues::Small(entries.iter()),
-            VarStorage::Large(entries) => VarValues::Large(entries.values()),
-        }
-    }
-    /// Byte offset of the generation counter within a `VarMap` (for the JIT's inline template).
-    pub(crate) fn generation_offset() -> usize {
-        std::mem::offset_of!(VarMap, generation)
     }
 }
 
@@ -596,9 +370,13 @@ pub fn new_var_scope(parent: Option<Env>) -> Env {
 }
 
 pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) -> Env {
+    new_var_scope_with_bindings(parent, VarMap::with_capacity(capacity))
+}
+
+pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
     let e = Rc::new(RefCell::new(Scope {
-        vars: VarMap::with_capacity(capacity),
+        vars,
         parent,
         with_obj: None,
         under_with,
@@ -952,6 +730,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
     i.fn_frames = Vec::with_capacity(7);
     for k in 0..3 {
         i.fn_frames.push(FnFrame {
+            inline: std::ptr::null(),
             fn_ptr: 0x1000 + k,
             coro: 0,
             strict: false,
@@ -1158,7 +937,8 @@ pub struct Interp {
     >,
     /// Backing store for Map/Set/WeakMap/WeakSet instances (ordered entries), keyed by the object's
     /// pointer — the engine analogue of an internal `[[MapData]]` slot.
-    pub(crate) map_data: crate::fasthash::FastMap<usize, Vec<(Value, Value)>>,
+    pub(crate) map_data:
+        crate::fasthash::FastMap<usize, crate::builtins::collection_data::CollectionData>,
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
@@ -1802,7 +1582,7 @@ impl Interp {
     /// the `name: message` head. Bounded by the engine's own recursion guard (~128 frames).
     fn capture_stack(&self) -> Rc<str> {
         let mut out = String::new();
-        for frame in self.fn_frames.iter().rev() {
+        for frame in self.reflected_frames().iter().rev() {
             let callee = frame.callee();
             let name = {
                 let b = callee.borrow();
@@ -2236,62 +2016,6 @@ impl Interp {
         let buf = self.array_buffers.get_mut(&info.buffer)?;
         let ptr = unsafe { buf.as_mut_ptr().add(info.offset) };
         Some((code, byte_len, ptr))
-    }
-
-    pub fn make_array(&self, items: Vec<Value>) -> Value {
-        let obj = Object::new(Some(self.array_proto.clone()));
-        let len = items.len();
-        let numeric = items.iter().all(|v| matches!(v, Value::Num(_)));
-        {
-            let mut b = obj.borrow_mut();
-            b.props.mark_array();
-            b.props.reserve_dense_exact(len, numeric);
-        }
-        obj.borrow_mut().exotic = Exotic::Array;
-        {
-            let mut b = obj.borrow_mut();
-            for v in items {
-                b.props.push_dense(Property::plain(v));
-            }
-            b.props.insert(
-                "length",
-                Property::data(Value::Num(len as f64), true, false, false),
-            );
-        }
-        Value::Obj(obj)
-    }
-
-    /// Build an array by moving `len` initialized values directly from a JIT operand stack.
-    ///
-    /// # Safety
-    /// `items` must point to `len` live, non-overlapping `Value`s. This method consumes every
-    /// value exactly once; the caller must reset its stack pointer to `items` before returning.
-    pub(crate) unsafe fn make_array_from_raw(&self, items: *mut Value, len: usize) -> Value {
-        if len <= 32 {
-            let obj = Object::new_with_parts(
-                Some(self.array_proto.clone()),
-                unsafe { Props::packed_array_from_raw(items, len) },
-                Exotic::Array,
-            );
-            return Value::Obj(obj);
-        }
-        let obj = Object::new(Some(self.array_proto.clone()));
-        let numeric = (0..len).all(|k| matches!(unsafe { &*items.add(k) }, Value::Num(_)));
-        {
-            let mut b = obj.borrow_mut();
-            b.props.mark_array();
-            b.props.reserve_dense_exact(len, numeric);
-            b.exotic = Exotic::Array;
-            for k in 0..len {
-                b.props
-                    .push_dense(Property::plain(unsafe { items.add(k).read() }));
-            }
-            b.props.insert(
-                "length",
-                Property::data(Value::Num(len as f64), true, false, false),
-            );
-        }
-        Value::Obj(obj)
     }
 
     /// Build the generator/iterator object whose `next`/`return`/`throw` drive its coroutine (stored
@@ -3690,10 +3414,14 @@ impl Interp {
                                 // strict caller is censored to null). Eval runs inline, so eval
                                 // frames are naturally skipped.
                                 let rptr = Rc::as_ptr(r) as usize;
-                                let top = self.fn_frames.iter().rposition(|fr| fr.fn_ptr == rptr);
+                                let frames = self.reflected_frames();
+                                let top = frames.iter().rposition(|fr| fr.fn_ptr == rptr);
                                 return Ok(match (key, top) {
                                     (_, None) => Value::Null,
                                     ("arguments", Some(k)) => {
+                                        let Some(k) = frames[k].physical else {
+                                            return Ok(Value::Null);
+                                        };
                                         // The activation skipped building its arguments object
                                         // (the body never names it) — conjure it now.
                                         let lazy = match self.fn_frames[k].extra.as_deref() {
@@ -3715,7 +3443,7 @@ impl Interp {
                                             None => Value::Null,
                                         }
                                     }
-                                    (_, Some(k)) => match self.fn_frames[..k].last() {
+                                    (_, Some(k)) => match frames[..k].last() {
                                         None => Value::Null,
                                         Some(fr) if fr.strict => Value::Null,
                                         Some(fr) => Value::Obj(fr.callee()),
@@ -3830,8 +3558,12 @@ impl Interp {
     }
 
     pub fn set_member(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Abrupt> {
-        self.set_member_recv(base, key, value, base.clone())
-            .map(|_| ())
+        let strict = self.strict;
+        let success = self.set_member_recv(base, key, value, base.clone())?;
+        if !success && strict {
+            return Err(self.throw("TypeError", format!("cannot assign to property '{key}'")));
+        }
+        Ok(())
     }
 
     /// [[Set]](P, V, Receiver): like [`set_member`] but with an explicit `receiver` and returning the
@@ -4543,40 +4275,6 @@ impl Interp {
         t
     }
 
-    /// Append object references held directly by `o` into a reusable scratch vector. The source
-    /// borrow is released before callers follow the collected edges, which remains essential for
-    /// self-referential objects; reusing the allocation avoids one fresh Vec per object per GC
-    /// pass.
-    fn obj_refs_into(o: &Gc, refs: &mut Vec<Gc>) {
-        refs.clear();
-        let b = o.borrow();
-        if let Some(p) = &b.proto {
-            refs.push(p.clone());
-        }
-        for prop in b.props.values() {
-            if let Value::Obj(p) = prop.value() {
-                refs.push(p);
-            }
-            if let Some(Value::Obj(p)) = prop.getter() {
-                refs.push(p.clone());
-            }
-            if let Some(Value::Obj(p)) = prop.setter() {
-                refs.push(p.clone());
-            }
-        }
-        if let Callable::Bound(bound) = &b.call {
-            refs.push(bound.target.clone());
-            if let Value::Obj(p) = &bound.this {
-                refs.push(p.clone());
-            }
-            for a in &bound.args {
-                if let Value::Obj(p) = a {
-                    refs.push(p.clone());
-                }
-            }
-        }
-    }
-
     /// Refcount-based cycle collector. An object whose `Rc::strong_count` exceeds the references it
     /// receives from other heap objects has an *external* holder — the Rust stack, a scope, the
     /// global, or a side table — so it (and everything it reaches) is live. Everything else is
@@ -4599,6 +4297,7 @@ impl Interp {
     }
 
     pub(crate) fn gc_collect(&mut self) {
+        let _inline_roots = self.inline_gc_roots();
         let live = crate::value::gc_snapshot();
         // Scopes are graph nodes too: a closure's captured environment references objects (its
         // bindings) and vice versa (`Callable::User`), so cycles routinely pass through them.
@@ -4620,7 +4319,7 @@ impl Interp {
         let mut object_refs = Vec::new();
         let mut scope_refs = Vec::new();
         for o in &live {
-            Self::obj_refs_into(o, &mut object_refs);
+            crate::value::gc_edges::object_refs_into(o, &mut object_refs);
             for p in object_refs.drain(..) {
                 let pb = p.borrow();
                 pb.gc_internal.set(pb.gc_internal.get() + 1);
@@ -4717,7 +4416,7 @@ impl Interp {
         // Mark everything reachable from the roots, across both node types.
         loop {
             if let Some(o) = stack.pop() {
-                Self::obj_refs_into(&o, &mut object_refs);
+                crate::value::gc_edges::object_refs_into(&o, &mut object_refs);
                 for p in object_refs.drain(..) {
                     if !p.borrow().gc_mark.get() {
                         p.borrow().gc_mark.set(true);
@@ -5568,6 +5267,7 @@ impl Interp {
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
         self.fn_frames.push(FnFrame {
+            inline: std::ptr::null(),
             fn_ptr: Rc::as_ptr(fn_obj) as usize,
             coro: self.cur_coro,
             strict: func.is_strict,
@@ -5627,44 +5327,14 @@ impl Interp {
         let ic = match hit {
             Some(ic) => ic,
             None => {
-                // Fresh-closure retry: a needs-env entry whose AST FUNCTION matches the callee
-                // still applies — closures created per call share the function and chunk; only
-                // the environment differs, and that comes from the live callee object. One
-                // borrow + pointer compare instead of a full call_jit_fast re-walk + refill
-                // per instance.
-                let has_env_entry = site.entries.iter().any(|e| {
-                    let p = e.as_ptr();
-                    unsafe { (*p).direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 }
-                });
-                if !has_env_entry {
-                    return None;
+                let ic = self.fresh_call_ic(site, o, key, genv, epoch)?;
+                if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
+                    return Some(unsafe {
+                        self.call_jit_env_committed(ic, ic.env, this_slot, args, argc)
+                    });
                 }
-                let (fp, ep) = match &o.borrow().call {
-                    // `under_with`: see the refusal in `call_jit_fast` — this retry runs a
-                    // FRESH closure instance whose env was never vetted there.
-                    Callable::User(user)
-                        if !user.func.is_arrow && !user.env.borrow().under_with =>
-                    {
-                        (Rc::as_ptr(&user.func), Rc::as_ptr(&user.env))
-                    }
-                    _ => return None,
-                };
-                let mut found = None;
-                for e in &site.entries {
-                    let p = e.as_ptr();
-                    unsafe {
-                        if (*p).direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0
-                            && (*p).func == fp
-                            && (*p).global_env == genv
-                            && (*p).epoch == epoch
-                        {
-                            found = Some(*p);
-                            break;
-                        }
-                    }
-                }
-                let ic = found?;
-                return Some(unsafe { self.call_jit_env_committed(ic, ep, this_slot, args, argc) });
+                // Fresh no-activation calls retain the normal recompile opportunity below.
+                ic
             }
         };
         if ic.native != 0 {
@@ -5720,6 +5390,7 @@ impl Interp {
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
         let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
         self.fn_frames.push(FnFrame {
+            inline: std::ptr::null(),
             fn_ptr: ic.callee,
             coro: self.cur_coro,
             strict: ic.strict,
@@ -5877,6 +5548,7 @@ impl Interp {
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
         let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
         self.fn_frames.push(FnFrame {
+            inline: std::ptr::null(),
             fn_ptr: ic.callee,
             coro: self.cur_coro,
             strict: ic.strict,
@@ -5976,6 +5648,7 @@ impl Interp {
                     head.replace('\n', " ")
                 );
             }
+            chunk2.pin_inline_callees(self);
             let _ = func.code2.set(Some(chunk2));
             crate::bytecode::CALL_IC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -6514,6 +6187,7 @@ impl Interp {
         // the body invokes could observe it ambiently.
         let saved_nt = std::mem::replace(&mut self.new_target, callee.clone());
         self.fn_frames.push(FnFrame {
+            inline: std::ptr::null(),
             fn_ptr: key,
             coro: self.cur_coro,
             strict: ic.strict,
@@ -6873,6 +6547,7 @@ impl Interp {
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
         let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
         self.fn_frames.push(FnFrame {
+            inline: std::ptr::null(),
             fn_ptr: Rc::as_ptr(o) as usize,
             coro: self.cur_coro,
             strict: func.is_strict,
@@ -6936,23 +6611,18 @@ impl Interp {
         is_construct: bool,
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
-        // Bytecode fast call: an eligible sync callee with a compiled chunk runs on the VM with no
-        // activation environment at all. Sound because a compiled body has no closures,
-        // `arguments`, direct eval, `with`, `super`, or `new.target` (`bytecode::compile` refuses
-        // them all): nothing can observe the activation, so free names resolve through the
-        // definition env exactly as they would through an empty activation parented there.
-        // Constructs qualify too when the callee is a *plain* function (no `class_info`): the
-        // fresh `this` came in from `construct_nt`, which also maps a non-object return back to
-        // it — and a VM body cannot rebind `this`, so the slow path's scope walk-back would find
-        // the same value. Class constructors (field initializers, derived-`this` TDZ) and
-        // generators/async stay on the tree-walker. For plain calls `call_dispatch` already
-        // saved/cleared `new_target`/`constructing`. One divergence: no `lazy` args stash, so
-        // legacy `f.arguments` reflection during an active VM frame reads null (the VM's
-        // slot-based locals never aliased it faithfully anyway).
+        // Eligible synchronous bodies use compiled slots, with a real activation only when
+        // capture analysis requires one. Compiler refusals retain the tree-walker fallback.
+        // Plain and base-class constructor bodies qualify: run_constructor_on has already
+        // initialized base-class instance elements, and the caller maps non-object returns to
+        // the original this. Derived constructors keep the tree-walker's TDZ this binding,
+        // super rebinding and special return validation. Class calls and construction shortcuts
+        // remain guarded separately; compiling a body does not make a class ordinarily callable.
+        // Legacy arguments reflection retains the existing compiled-frame limitations.
         if !matches!(self.tier, crate::bytecode::Tier::Interp)
             && !func.is_generator
             && !func.is_async
-            && (!is_construct || !self.class_info.contains_key(&(Rc::as_ptr(fn_obj) as usize)))
+            && (!is_construct || self.constructor_body_can_compile(fn_obj))
             // Closures under a `with` scope stay on the tree-walker (see `Scope::under_with`).
             && !closure.borrow().under_with
         {

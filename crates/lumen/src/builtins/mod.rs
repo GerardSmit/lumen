@@ -9,8 +9,14 @@ use std::rc::Rc;
 
 // Per-object modules split out of this file (behavior-preserving). Shared helpers remain here and
 // are reachable from each submodule via `use super::*`.
+mod array_iterator;
 mod atomics;
+pub(crate) mod collection_data;
 mod collections;
+use collections::brand::{coll_ptr, coll_ptr_kind};
+pub(crate) use collections::{
+    insert as collection_insert, intrinsic as collection_intrinsic, lookup as collection_lookup,
+};
 mod dataview;
 mod date;
 mod disposable;
@@ -26,6 +32,9 @@ mod proxy;
 mod reflect;
 mod regexp;
 mod shadowrealm;
+mod string_code_point;
+mod string_substring;
+pub(crate) use string_code_point::nf_code_point_at;
 mod typedarray;
 mod weakrefs;
 
@@ -293,13 +302,6 @@ pub(crate) fn intl_delegate(
     let inst = ab(i.construct(ctor, &[locales, options]))?;
     let f = ab(i.get_member(&inst, method))?;
     ab(i.call(f, inst, call_args))
-}
-
-fn is_tombstone(i: &Interp, k: &Value) -> bool {
-    match (k.as_obj(), i.extra_protos.get("%MapTombstone%")) {
-        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-        _ => false,
-    }
 }
 
 /// Proxy `[[OwnPropertyKeys]]`: the trap result (must be a list of strings/symbols) or the target's
@@ -2900,156 +2902,6 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
             }
         }
         _ => "Object",
-    }
-}
-
-/// Brand-check a Map/Set receiver: it must be an object carrying a collection data slot (every
-/// Map/Set/WeakMap/WeakSet gets one at construction), else TypeError.
-fn coll_ptr(i: &Interp, this: &Value) -> Result<usize, Value> {
-    coll_ptr_kind(i, this, None)
-}
-
-/// Resolve a Map/Set backing pointer with a brand check. `want = Some("Map"|"Set")` requires that
-/// exact kind; `None` accepts either strong collection but still rejects WeakMap/WeakSet and plain
-/// objects (which lack a strong `[[MapData]]`/`[[SetData]]` slot).
-fn coll_ptr_kind(i: &Interp, this: &Value, want: Option<&str>) -> Result<usize, Value> {
-    let err = || i.make_error("TypeError", "method called on an incompatible receiver");
-    let o = this.as_obj().ok_or_else(err)?;
-    let ptr = Rc::as_ptr(o) as usize;
-    if !i.map_data.contains_key(&ptr) {
-        return Err(err());
-    }
-    let kind = o.borrow().props.get("__ck").map(|p| p.value());
-    let ok = match (&kind, want) {
-        (Some(Value::Str(s)), Some(w)) => &**s == w,
-        (Some(Value::Str(s)), None) => &**s == "Map" || &**s == "Set",
-        _ => false,
-    };
-    if !ok {
-        return Err(err());
-    }
-    Ok(ptr)
-}
-
-/// Build an iterator over a Map/Set's snapshot. `kind`: 0 = values, 1 = keys, 2 = [key,value].
-/// Like [`collection_iter`] but brand-checks the exact collection kind ("Set" / "Map").
-fn collection_iter_kind(
-    i: &mut Interp,
-    this: &Value,
-    kind: u8,
-    want: &str,
-) -> Result<Value, Value> {
-    coll_ptr_kind(i, this, Some(want))?;
-    collection_iter(i, this, kind)
-}
-
-/// forEach shared by Map/Set, brand-checking the exact kind.
-fn collection_for_each(
-    i: &mut Interp,
-    this: Value,
-    a: &[Value],
-    want: Option<&str>,
-) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, want)?;
-    let cb = arg(a, 0);
-    if !cb.is_callable() {
-        return Err(i.make_error("TypeError", "forEach callback is not callable"));
-    }
-    let cb_this = arg(a, 1);
-    // Iterate the LIVE backing list by index (positions are stable — deletes leave tombstones), so
-    // entries appended during the callback are visited and deleted entries are skipped.
-    let mut idx = 0usize;
-    loop {
-        let entry = i.map_data.get(&ptr).and_then(|e| e.get(idx).cloned());
-        idx += 1;
-        let (k, v) = match entry {
-            Some(kv) => kv,
-            None => break,
-        };
-        if is_tombstone(i, &k) {
-            continue;
-        }
-        ab(i.call(cb.clone(), cb_this.clone(), &[v, k, this.clone()]))?;
-    }
-    Ok(Value::Undefined)
-}
-
-fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Value> {
-    coll_ptr(i, this)?; // brand check (a real Map/Set)
-    let is_set = this
-        .as_obj()
-        .and_then(|o| o.borrow().props.get("__ck").map(|p| p.value()))
-        .map(|v| matches!(v, Value::Str(ref s) if &**s == "Set"))
-        .unwrap_or(false);
-    let key = if is_set {
-        "%SetIteratorPrototype%"
-    } else {
-        "%MapIteratorPrototype%"
-    };
-    let proto = i
-        .extra_protos
-        .get(key)
-        .cloned()
-        .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned());
-    let obj = Object::new(proto);
-    set_builtin(&obj, "__ci_coll", this.clone());
-    set_builtin(&obj, "__ci_index", Value::Num(0.0));
-    set_builtin(&obj, "__ci_kind", Value::Num(kind as f64));
-    Ok(Value::Obj(obj))
-}
-
-/// `next()` for a Map/Set iterator: reads the live backing entries at the current index (so entries
-/// appended during iteration are observed). The `__ci_coll` slot is the brand.
-fn map_set_iter_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let coll = this
-        .as_obj()
-        .and_then(|o| o.borrow().props.get("__ci_coll").map(|p| p.value()));
-    let coll = match coll {
-        Some(c) => c,
-        None => return Err(i.make_error("TypeError", "not a Map/Set Iterator")),
-    };
-    let obj = this.as_obj().unwrap();
-    let num = |o: &Gc, k: &str| -> f64 {
-        match o.borrow().props.get(k).map(|p| p.value()) {
-            Some(Value::Num(n)) => n,
-            _ => 0.0,
-        }
-    };
-    // A once-exhausted iterator stays done, even if the collection later grows.
-    if matches!(
-        obj.borrow().props.get("__ci_done").map(|p| p.value()),
-        Some(Value::Bool(true))
-    ) {
-        return Ok(iter_result(i, Value::Undefined, true));
-    }
-    let mut idx = num(obj, "__ci_index") as usize;
-    let kind = num(obj, "__ci_kind") as u8;
-    let coll_ptr = map_ptr(&coll);
-    // Skip tombstoned (deleted) slots so the iterator observes a live view.
-    loop {
-        let entry = coll_ptr
-            .and_then(|p| i.map_data.get(&p))
-            .and_then(|e| e.get(idx).cloned());
-        match entry {
-            Some((k, v)) => {
-                idx += 1;
-                if is_tombstone(i, &k) {
-                    continue;
-                }
-                set_internal(obj, "__ci_index", Value::Num(idx as f64));
-                let val = match kind {
-                    1 => k,
-                    2 => i.make_array(vec![k, v]),
-                    _ => v,
-                };
-                return Ok(iter_result(i, val, false));
-            }
-            None => {
-                set_internal(obj, "__ci_index", Value::Num(idx as f64));
-                set_internal(obj, "__ci_done", Value::Bool(true));
-                return Ok(iter_result(i, Value::Undefined, true));
-            }
-        }
     }
 }
 
@@ -5783,6 +5635,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
     // `arr[Symbol.iterator]` is `Array.prototype.values`.
     if let Some(sym) = it.iterator_sym.clone() {
         let values_fn = ap.borrow().props.get("values").map(|p| p.value()).unwrap();
+        crate::bytecode::array_destructure::remember_values(it, &values_fn);
         ap.borrow_mut()
             .props
             .insert(Interp::sym_key(&sym), Property::builtin(values_fn));
@@ -6601,7 +6454,14 @@ fn install_iterator(it: &mut Interp) {
     // is %IteratorPrototype%), so getPrototypeOf(getPrototypeOf(arrIter)) lands on %IteratorPrototype%.
     let arr_iter_proto = Object::new(it.extra_protos.get("%IteratorPrototype%").cloned());
     set_to_string_tag(it, &arr_iter_proto, "Array Iterator");
-    it.def_method(&arr_iter_proto, "next", 0, array_iter_next);
+    let array_next: NativeFn = if std::env::var_os("LUMEN_NO_ARRAY_ITERATOR_STATE").is_some() {
+        array_iterator::baseline
+    } else {
+        array_iterator::fast
+    };
+    it.def_method(&arr_iter_proto, "next", 0, array_next);
+    crate::bytecode::array_destructure::remember_next(it, &arr_iter_proto);
+    crate::bytecode::array_iterator_step::install(it);
     it.extra_protos
         .insert("%ArrayIteratorPrototype%", arr_iter_proto);
 
@@ -8224,68 +8084,6 @@ pub(crate) fn async_iterator_key(i: &Interp) -> Option<Rc<str>> {
     well_known_key(i, "asyncIterator")
 }
 
-fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
-    // Brand check: the receiver must carry the Array Iterator internal slots.
-    if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("__ai_kind")) {
-        return Err(i.make_error(
-            "TypeError",
-            "Array Iterator next called on an incompatible receiver",
-        ));
-    }
-    let target = ab(i.get_member(&this, "__ai_target"))?;
-    // An exhausted iterator clears its target so it stays done even if the source later grows.
-    if matches!(target, Value::Undefined) {
-        let result = i.new_object();
-        set_data(&result, "value", Value::Undefined);
-        set_data(&result, "done", Value::Bool(true));
-        return Ok(Value::Obj(result));
-    }
-    let idx_v = ab(i.get_member(&this, "__ai_index"))?;
-    let idx = ab(i.to_number(&idx_v))? as usize;
-    let kind_v = ab(i.get_member(&this, "__ai_kind"))?;
-    let kind = ab(i.to_number(&kind_v))? as u8;
-    // A TypedArray target re-derives its length each step; an out-of-bounds (detached/shrunk-past)
-    // view throws TypeError.
-    let len = if let Some(info) = map_ptr(&target).and_then(|p| i.typed_arrays.get(&p).copied()) {
-        match i.ta_len(&info) {
-            Some(l) => l,
-            None => return Err(i.make_error("TypeError", "TypedArray is out of bounds")),
-        }
-    } else {
-        match &target {
-            // LengthOfArrayLike through [[Get]], so a proxy target's traps are honored.
-            Value::Obj(_) => {
-                let lv = ab(i.get_member(&target, "length"))?;
-                let n = ab(i.to_number(&lv))?;
-                if n.is_nan() || n <= 0.0 {
-                    0
-                } else {
-                    n.min(9007199254740991.0) as usize
-                }
-            }
-            Value::Str(s) => crate::jstr::unit_len(s),
-            _ => 0,
-        }
-    };
-    let result = i.new_object();
-    if idx >= len {
-        ab(i.set_member(&this, "__ai_target", Value::Undefined))?;
-        set_data(&result, "value", Value::Undefined);
-        set_data(&result, "done", Value::Bool(true));
-        return Ok(Value::Obj(result));
-    }
-    ab(i.set_member(&this, "__ai_index", Value::Num((idx + 1) as f64)))?;
-    let elem = ab(i.get_member(&target, &idx.to_string()))?;
-    let value = match kind {
-        1 => Value::Num(idx as f64),
-        2 => i.make_array(vec![Value::Num(idx as f64), elem]),
-        _ => elem,
-    };
-    set_data(&result, "value", value);
-    set_data(&result, "done", Value::Bool(false));
-    Ok(Value::Obj(result))
-}
-
 fn norm_index(n: f64, len: i64) -> i64 {
     // ToIntegerOrInfinity: NaN maps to 0 (undefined args are handled by callers).
     if n.is_nan() {
@@ -8507,7 +8305,7 @@ fn locale_upper(s: &str, lang: Option<&str>) -> String {
 }
 
 /// `String.prototype.charCodeAt` (named: the JIT's call-IC fill compares the fn pointer to
-/// tag intrinsic entries — see `bytecode::INTRINSIC_CHAR_CODE_AT`).
+/// tag intrinsic entries — see `bytecode::INTRINSIC_ASCII_CODE_UNIT`).
 pub(crate) fn nf_char_code_at(
     i: &mut crate::interpreter::Interp,
     this: Value,
@@ -8916,22 +8714,7 @@ fn install_string(it: &mut Interp) {
         ))
     });
     it.def_method(&sp, "slice", 2, nf_string_slice);
-    it.def_method(&sp, "substring", 2, |i, this, args| {
-        let s = this_string(i, &this)?;
-        let chars = i.units_full(&s);
-        let len = chars.len() as i64;
-        let mut a = (ab(i.to_number(&arg(args, 0)))? as i64).clamp(0, len);
-        let mut b = match arg(args, 1) {
-            Value::Undefined => len,
-            v => (ab(i.to_number(&v))? as i64).clamp(0, len),
-        };
-        if a > b {
-            std::mem::swap(&mut a, &mut b);
-        }
-        Ok(Value::from_string(crate::jstr::from_units(
-            &chars[a as usize..b as usize],
-        )))
-    });
+    string_substring::install(it, &sp);
     // Annex B B.2.3.1 String.prototype.substr(start, length).
     it.def_method(&sp, "substr", 2, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -9100,26 +8883,7 @@ fn install_string(it: &mut Interp) {
             }
         })
     });
-    it.def_method(&sp, "codePointAt", 1, |i, this, args| {
-        let s = this_string(i, &this)?;
-        let n = ab(i.to_number(&arg(args, 0)))?;
-        let n = if n.is_nan() { 0.0 } else { n.trunc() };
-        if n < 0.0 || !n.is_finite() {
-            return Ok(Value::Undefined);
-        }
-        let idx = n as usize;
-        Ok(match i.unit_at(&s, idx) {
-            Some(u) if (0xD800..0xDC00).contains(&u) => match i.unit_at(&s, idx + 1) {
-                Some(lo) if (0xDC00..0xE000).contains(&lo) => {
-                    let c = 0x10000 + ((u as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00);
-                    Value::Num(c as f64)
-                }
-                _ => Value::Num(u as f64),
-            },
-            Some(u) => Value::Num(u as f64),
-            None => Value::Undefined,
-        })
-    });
+    it.def_method(&sp, "codePointAt", 1, nf_code_point_at);
     it.def_method(&sp, "trimStart", 0, |i, this, _| {
         Ok(Value::from_string(
             this_string(i, &this)?
