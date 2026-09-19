@@ -31,7 +31,7 @@ pub(super) fn captured_default_safe(func: &Function, name: &str, expr: &Expr) ->
     }
     // Hoisted function bindings are seeded into the activation before bytecode runs. Do not
     // overwrite one with a default; supporting that case needs separate parameter/body scopes.
-    !crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &[])
+    !crate::interpreter::collect_hoist_ops(&func.body(), func.is_strict, &[])
         .iter()
         .any(|op| matches!(op, HoistOp::Fn(n, _) | HoistOp::AnnexB(n, _) if n == name))
 }

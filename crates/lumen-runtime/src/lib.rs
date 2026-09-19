@@ -43,6 +43,21 @@ pub struct Runtime {
     /// `onerror` convention and `(promise, reason) -> suppressed` for `onunhandledrejection`.
     fire_error: Value,
     fire_rejection: Value,
+    /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
+    /// `finish_process` emits `'exit'` with this code (no `'beforeExit'`) and returns it.
+    fatal_exit: Option<i32>,
+    /// When the loop last collected because it was about to block, and the heap-object count it
+    /// saw then (see `idle_collect`).
+    idle_gc: (Instant, i64),
+    idle_gc_followup: bool,
+}
+
+/// Why the entry script did not start cleanly.
+enum StartError {
+    /// The node glue is missing from this engine.
+    NotInstalled(String),
+    /// The script threw; the value is the thrown error.
+    Thrown(Value),
 }
 
 impl Default for Runtime {
@@ -103,7 +118,21 @@ impl Runtime {
                 r#"
                 globalThis.onerror = null;
                 globalThis.onunhandledrejection = null;
-                globalThis.__lumen_fire_error = function (error) {
+                // Node's process-level hooks come first: a registered 'uncaughtException' /
+                // 'unhandledRejection' listener owns the error, exactly as it does in Node.
+                const processHas = (event) => {
+                    const p = globalThis.process;
+                    return !!(p && typeof p.listenerCount === 'function' && p.listenerCount(event) > 0);
+                };
+                globalThis.__lumen_fire_error = function (error, origin = 'uncaughtException') {
+                    if (processHas('uncaughtException')) {
+                        try {
+                            globalThis.process.emit('uncaughtException', error, origin);
+                            return true;
+                        } catch {
+                            return false;
+                        }
+                    }
                     const h = globalThis.onerror;
                     if (typeof h !== 'function') return false;
                     let message = '';
@@ -120,6 +149,14 @@ impl Runtime {
                     }
                 };
                 globalThis.__lumen_fire_rejection = function (promise, reason) {
+                    if (processHas('unhandledRejection')) {
+                        try {
+                            globalThis.process.emit('unhandledRejection', reason, promise);
+                            return true;
+                        } catch {
+                            return false;
+                        }
+                    }
                     const h = globalThis.onunhandledrejection;
                     if (typeof h !== 'function') return false;
                     let prevented = false;
@@ -171,6 +208,9 @@ impl Runtime {
             completions: rx,
             fire_error,
             fire_rejection,
+            fatal_exit: None,
+            idle_gc: (Instant::now(), 0),
+            idle_gc_followup: false,
         }
     }
 
@@ -183,15 +223,28 @@ impl Runtime {
     /// `__filename`/`require` in scope), then loop to quiescence. `Err` is the rendered
     /// uncaught error. This is what the CLI uses for `lumen-cli file.js`.
     pub fn run_main(&mut self, path: &str) -> Result<(), String> {
-        let result = self.start_main(path);
+        match self.start_main_raw(path) {
+            Ok(()) => {}
+            Err(StartError::NotInstalled(message)) => return Err(message),
+            // A throw out of the entry script is an uncaught exception like any other: a
+            // `process.on('uncaughtException')` listener may own it, otherwise it is fatal.
+            Err(StartError::Thrown(error)) => self.report_uncaught(&error),
+        }
         self.run_to_completion();
-        result
+        Ok(())
     }
 
     /// Start `path` as the CJS main module WITHOUT pumping the macrotask loop (only the top-level
     /// microtask checkpoint runs). Worker threads use this: the caller arms its message inbox
     /// first and then drives the loop itself. `Err` is the rendered uncaught error.
     pub(crate) fn start_main(&mut self, path: &str) -> Result<(), String> {
+        self.start_main_raw(path).map_err(|e| match e {
+            StartError::NotInstalled(message) => message,
+            StartError::Thrown(error) => describe_error(self.engine.ctx(), &error),
+        })
+    }
+
+    fn start_main_raw(&mut self, path: &str) -> Result<(), StartError> {
         // A CJS script can still dynamic-`import()`: give the engine the ESM loader and resolve
         // bare relative specifiers against the entry file.
         let loader = esm::make_loader(self.builtin_modules());
@@ -204,16 +257,14 @@ impl Runtime {
             .engine
             .ctx()
             .get_member(&global, "__runMain")
-            .map_err(|_| "node runtime not installed".to_string())?;
+            .map_err(|_| StartError::NotInstalled("node runtime not installed".to_string()))?;
         let result = self.engine.call_function(
             &run_main,
             Value::Undefined,
             &[Value::from_string(path.to_string())],
         );
         self.engine.run_microtasks();
-        result
-            .map(|_| ())
-            .map_err(|e| describe_error(self.engine.ctx(), &e))
+        result.map(|_| ()).map_err(StartError::Thrown)
     }
 
     /// Run `path` as an ES module: its `import` graph resolves against disk + `node_modules`
@@ -234,14 +285,22 @@ impl Runtime {
             .into_owned();
         let loader = esm::make_loader(self.builtin_modules());
         let result = self.engine.eval_module_attrs(&source, &key, loader);
-        self.run_to_completion();
         match result {
-            Ok(Completion::Value(_)) => Ok(()),
-            Ok(Completion::Throw { name, message }) => Err(if name.is_empty() {
-                message
-            } else {
-                format!("{name}: {message}")
-            }),
+            Ok(Completion::Value(_)) => {
+                self.run_to_completion();
+                Ok(())
+            }
+            // The module evaluation reports a rendered throw, not the value, so process-level
+            // listeners cannot own it; it is fatal outright, as in Node: the loop does not run,
+            // and the caller prints the error.
+            Ok(Completion::Throw { name, message }) => {
+                self.fatal_exit = Some(1);
+                Err(if name.is_empty() {
+                    message
+                } else {
+                    format!("{name}: {message}")
+                })
+            }
             Err(e) => Err(format!("SyntaxError: {} (line {})", e.message, e.line)),
         }
     }
@@ -395,26 +454,36 @@ impl Runtime {
             loop {
                 let mut progressed = false;
                 for (cb, args) in self.take_queued_callbacks() {
+                    if self.fatal_exit.is_some() {
+                        return;
+                    }
                     progressed = true;
                     self.fire(&cb, &args);
                 }
                 for (cb, args) in self.take_due_timers() {
+                    if self.fatal_exit.is_some() {
+                        return;
+                    }
                     progressed = true;
                     self.fire(&cb, &args);
                 }
-                while let Ok(done) = self.completions.try_recv() {
+                while self.fatal_exit.is_none() {
+                    let Ok(done) = self.completions.try_recv() else {
+                        break;
+                    };
                     progressed = true;
                     self.dispatch(done);
                 }
-                if !progressed {
+                if !progressed || self.fatal_exit.is_some() {
                     break;
                 }
             }
 
-            if self.idle() {
+            if self.fatal_exit.is_some() || self.idle() {
                 return;
             }
 
+            self.idle_collect();
             // Blocked: only a timer deadline or a task completion can make progress now.
             match self.next_timer_deadline() {
                 Some(deadline) => {
@@ -433,6 +502,116 @@ impl Runtime {
                 },
             }
         }
+    }
+
+    /// Collect while the loop is about to block. The engine's own trigger fires on allocation
+    /// volume, so a program that loads a lot and then waits (a server, an editor host) never
+    /// collects again and keeps every function body it ran once; the collector releases those
+    /// bodies only across two collections it actually runs. Throttled so a loop that blocks
+    /// between every request does not collect on every request.
+    fn idle_collect(&mut self) {
+        const MIN_INTERVAL: Duration = Duration::from_secs(1);
+        const MIN_NEW_OBJECTS: i64 = 10_000;
+        let (last, live_then) = self.idle_gc;
+        if last.elapsed() < MIN_INTERVAL {
+            return;
+        }
+        let ctx = self.engine.ctx();
+        let live = ctx.live_object_count();
+        // A collection releases the bodies that were cold across the *previous* one, so the
+        // collection after a busy stretch is followed by one more even when nothing allocated.
+        let busy = (live - live_then).abs() >= MIN_NEW_OBJECTS;
+        if !busy && !self.idle_gc_followup {
+            self.idle_gc.0 = Instant::now();
+            return;
+        }
+        ctx.collect_garbage_for_host();
+        ctx.release_unused_memory_for_host();
+        self.idle_gc_followup = busy;
+        self.idle_gc = (Instant::now(), ctx.live_object_count());
+    }
+
+    /// Set `process.argv` to `[argv0, ...script_argv]` and `process.execArgv` to the runtime
+    /// flags, the way Node splits its command line. The runtime's default is the raw process
+    /// arguments, which is right for an embedder but not for a CLI that takes flags.
+    pub fn set_process_args(&mut self, argv0: &str, exec_argv: &[String], script_argv: &[String]) {
+        let global = self.engine.global_this();
+        let ctx = self.engine.ctx();
+        let Ok(process) = ctx.get_member(&global, "process") else {
+            return;
+        };
+        let argv: Vec<Value> = std::iter::once(argv0.to_string())
+            .chain(script_argv.iter().cloned())
+            .map(Value::from_string)
+            .collect();
+        let argv = ctx.make_array(argv);
+        let _ = ctx.set_member(&process, "argv", argv);
+        let exec: Vec<Value> = exec_argv.iter().cloned().map(Value::from_string).collect();
+        let exec = ctx.make_array(exec);
+        let _ = ctx.set_member(&process, "execArgv", exec);
+    }
+
+    /// Node's `--expose-gc`: define `globalThis.gc`, which runs lumen's cycle collector.
+    pub fn expose_gc(&mut self) {
+        // `Bun.gc` is the JS-visible entry to the same collector; V8's `gc()` returns nothing.
+        let _ = self.engine.eval(
+            "globalThis.gc = function gc() { globalThis.Bun.gc(true); };",
+            false,
+        );
+    }
+
+    /// Node's end-of-program protocol, for a CLI that has run the loop to quiescence: emit
+    /// `process` `'beforeExit'` (and keep running while a listener schedules more work), then
+    /// `'exit'`, and return the code the process should exit with — `process.exitCode`, or 0.
+    pub fn finish_process(&mut self) -> i32 {
+        let global = self.engine.global_this();
+        let Ok(process) = self.engine.ctx().get_member(&global, "process") else {
+            return 0;
+        };
+        let Ok(emit) = self.engine.ctx().get_member(&process, "emit") else {
+            return 0;
+        };
+        let code = |rt: &mut Runtime| -> i32 {
+            match rt.engine.ctx().get_member(&process, "exitCode") {
+                Ok(Value::Num(n)) => n as i32,
+                Ok(Value::Str(s)) => s.to_string().parse().unwrap_or(0),
+                _ => 0,
+            }
+        };
+        // An uncaught exception ends the process without 'beforeExit': only 'exit' runs, with
+        // the fatal code.
+        if let Some(fatal) = self.fatal_exit {
+            let _ = self.engine.call_function(
+                &emit,
+                process.clone(),
+                &[Value::from_string("exit".to_string()), Value::Num(fatal as f64)],
+            );
+            self.engine.run_microtasks();
+            return fatal;
+        }
+        // A 'beforeExit' listener may schedule more work; Node re-enters the loop until one
+        // round adds nothing.
+        for _ in 0..1000 {
+            let c = code(self);
+            let _ = self.engine.call_function(
+                &emit,
+                process.clone(),
+                &[Value::from_string("beforeExit".to_string()), Value::Num(c as f64)],
+            );
+            self.engine.run_microtasks();
+            if self.idle() {
+                break;
+            }
+            self.run_to_completion();
+        }
+        let c = code(self);
+        let _ = self.engine.call_function(
+            &emit,
+            process.clone(),
+            &[Value::from_string("exit".to_string()), Value::Num(c as f64)],
+        );
+        self.engine.run_microtasks();
+        code(self)
     }
 
     fn idle(&mut self) -> bool {
@@ -485,6 +664,10 @@ impl Runtime {
         let Some(entry) = entry else {
             return; // cancelled while in flight
         };
+        // A host completion is a fresh turn of the loop: it runs in no async context. Ops that
+        // settle a promise get the right context back through the reaction (captured at `then`
+        // time), which is how `await __op()` inside an `AsyncLocalStorage.run` keeps its store.
+        let outer = self.engine.ctx().set_async_context(Value::Undefined);
         match (entry.decode)(self.engine.ctx(), done.result) {
             Ok(args) => self.fire(&entry.on_ok, &args),
             Err(e) => match &entry.on_err {
@@ -492,6 +675,7 @@ impl Runtime {
                 None => self.report_uncaught(&e),
             },
         }
+        self.engine.ctx().set_async_context(outer);
         self.engine.run_microtasks();
         self.report_unhandled_rejections();
     }
@@ -505,28 +689,35 @@ impl Runtime {
         self.report_unhandled_rejections();
     }
 
-    /// An exception escaped a loop-fired callback. Node prints and keeps the loop alive (we
-    /// don't model `process.on('uncaughtException')`/exit semantics yet).
+    /// An exception escaped the entry script or a loop-fired callback. A
+    /// `process.on('uncaughtException')` listener (or the HTML `onerror` returning `true`) owns
+    /// it and the loop continues; otherwise, as in Node, the error is printed and the process is
+    /// done: the loop stops and the exit code is 1.
     fn report_uncaught(&mut self, error: &Value) {
-        // HTML "report an exception": the global `onerror` handler runs first; returning `true`
-        // suppresses the default report.
+        self.report_fatal(error, "Uncaught", "uncaughtException");
+    }
+
+    fn report_fatal(&mut self, error: &Value, prefix: &str, origin: &str) {
         let fire = self.fire_error.clone();
-        if let Ok(Value::Bool(true)) =
-            self.engine
-                .call_function(&fire, Value::Undefined, std::slice::from_ref(error))
-        {
+        if let Ok(Value::Bool(true)) = self.engine.call_function(
+            &fire,
+            Value::Undefined,
+            &[error.clone(), Value::str(origin)],
+        ) {
             return;
         }
         let text = console::describe_error(self.engine.ctx(), error);
-        console::write_err_line(self.engine.ctx(), format!("Uncaught {text}"));
+        console::write_err_line(self.engine.ctx(), format!("{prefix} {text}"));
+        self.fatal_exit.get_or_insert(1);
     }
 
-    /// Report promises rejected without a handler (Node prints `Uncaught (in promise) …`). Called
-    /// after each microtask checkpoint; a rejection handled in the same checkpoint won't appear.
+    /// Report promises rejected without a handler. Called after each microtask checkpoint; a
+    /// rejection handled in the same checkpoint won't appear. Node's default
+    /// (`--unhandled-rejections=throw`): a `process.on('unhandledRejection')` listener owns it,
+    /// otherwise it is raised as an uncaught exception — which an `'uncaughtException'` listener
+    /// may still catch, and which is fatal if nothing does.
     fn report_unhandled_rejections(&mut self) {
         for (promise, reason) in self.engine.take_unhandled_rejections_full() {
-            // The global `onunhandledrejection` handler runs first; `event.preventDefault()`
-            // suppresses the default report.
             let fire = self.fire_rejection.clone();
             if let Ok(Value::Bool(true)) =
                 self.engine
@@ -534,9 +725,13 @@ impl Runtime {
             {
                 continue;
             }
-            let text = console::describe_error(self.engine.ctx(), &reason);
-            console::write_err_line(self.engine.ctx(), format!("Uncaught (in promise) {text}"));
+            self.report_fatal(&reason, "Uncaught (in promise)", "unhandledRejection");
         }
+    }
+
+    /// The exit code an unhandled exception or rejection decided, if one did.
+    pub fn fatal_exit_code(&self) -> Option<i32> {
+        self.fatal_exit
     }
 }
 

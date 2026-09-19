@@ -2,7 +2,7 @@
 //! streaming buys nothing) and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
 
-use crate::token::{Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
+use crate::token::{RegexTok, Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
 
 pub struct LexError {
     pub message: String,
@@ -13,8 +13,7 @@ pub struct LexError {
 }
 
 struct Lexer<'a> {
-    src: &'a [u8],
-    chars: Vec<char>,
+    chars: &'a [char],
     pos: usize,
     line: u32,
     out: Vec<Token>,
@@ -50,12 +49,37 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
 /// Tokenize with an explicit goal: `html_comments` is true for Scripts (Annex B `<!--`/`-->`
 /// comments apply) and false for Modules (where they are ordinary punctuation, i.e. errors).
 pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexError> {
+    let chars: Vec<char> = src.chars().collect();
+    tokenize_chars(&chars, html_comments, 1)
+}
+
+/// [`tokenize_goal`] over an already-collected char buffer (the parser decodes a file once and
+/// drops the buffer when the parse ends).
+pub fn tokenize_goal_chars(chars: &[char], html_comments: bool) -> Result<Vec<Token>, LexError> {
+    tokenize_chars(chars, html_comments, 1)
+}
+
+/// Tokenize a range cut out of a larger source (a function body parsed lazily): `line` is the
+/// line its first char is on, so the tokens carry the same lines they would have had in a
+/// whole-file tokenization. Token offsets are chars into `chars`; the parser maps them back
+/// to byte offsets in the whole file. The range must start at a token boundary where no
+/// regex/division ambiguity carries over — a body's `{` does.
+pub fn tokenize_range(
+    chars: &[char],
+    html_comments: bool,
+    line: u32,
+) -> Result<Vec<Token>, LexError> {
+    tokenize_chars(chars, html_comments, line)
+}
+
+fn tokenize_chars(chars: &[char], html_comments: bool, line: u32) -> Result<Vec<Token>, LexError> {
     let mut lx = Lexer {
-        src: src.as_bytes(),
-        chars: src.chars().collect(),
+        chars,
         pos: 0,
-        line: 1,
-        out: Vec::new(),
+        line,
+        // About one token per six chars of minified or ordinary source; sized up front so the
+        // vector does not overshoot by doubling on a multi-megabyte bundle.
+        out: Vec::with_capacity(chars.len() / 6 + 16),
         nl_pending: false,
         html_comments,
         pending_legacy: false,
@@ -70,7 +94,7 @@ pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexEr
     Ok(lx.out)
 }
 
-impl<'a> Lexer<'a> {
+impl Lexer<'_> {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
     }
@@ -104,9 +128,9 @@ impl<'a> Lexer<'a> {
     fn regex_allowed(&self) -> bool {
         match self.out.last().map(|t| &t.kind) {
             None => true,
-            Some(
-                Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) | Tok::Regex { .. },
-            ) => false,
+            Some(Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) | Tok::Regex(_)) => {
+                false
+            }
             // `await`/`yield` are contextual: when they are keywords (module top level, async or
             // generator bodies) they prefix an expression, so a following `/` starts a regex. They
             // are `Ident` tokens here since the lexer lacks that context; allow the regex form —
@@ -1075,7 +1099,7 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        self.push(Tok::Regex { body, flags });
+        self.push(Tok::Regex(Box::new(RegexTok { body, flags })));
         Ok(())
     }
 
@@ -1104,7 +1128,6 @@ impl<'a> Lexer<'a> {
                 return Ok(());
             }
         }
-        let _ = self.src; // keep field used; byte view reserved for future fast paths
         Err(self.err(format!(
             "unexpected character {:?}",
             self.peek().unwrap_or('\0')

@@ -8,13 +8,21 @@
 //! - **Only parser output is encoded.** `Function`'s `scan`/`hoist`/`calls`/`code` are lazy
 //!   runtime caches (`Cell`/`OnceCell`); decode initializes them empty, exactly as the parser
 //!   leaves them, so a decoded tree is indistinguishable from a freshly parsed one.
+//! - **Lazy bodies stay lazy.** A function whose body the parser skipped (see
+//!   [`Function::ensure_body`]) is written as its [`LazyBody`] — a byte range into the source
+//!   plus the parse context — and no statements; the decoder needs the same source text, which
+//!   the glue crates already carry as a `&'static str`, and hands one shared `Rc<str>` of it to
+//!   every decoded range. So a decoded glue function costs its name, params and a few integers
+//!   until it is first called, exactly like one parsed from source. A source-length + hash in
+//!   the header makes a mismatched source a clean decode error.
 //! - Interned `&'static str` operators are re-interned from [`KEYWORDS`]/[`PUNCTUATORS`] on
 //!   decode (every op the parser emits comes from those tables).
 //!
 //! The format is deliberately dumb — a preorder walk with a `u8` tag per enum, LEB128 lengths,
 //! little-endian `f64`. It is an internal build/runtime contract, never persisted across builds.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -23,12 +31,29 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+
+/// FNV-1a over the source, eight bytes at a time: the header's check that the source handed to
+/// [`decode`] is the one the ranges were recorded against.
+fn source_hash(src: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let (chunks, rest) = src.as_bytes().as_chunks::<8>();
+    for c in chunks {
+        h = (h ^ u64::from_le_bytes(*c)).wrapping_mul(0x0100_0000_01b3);
+    }
+    for &b in rest {
+        h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
 
 // ---- writer / reader --------------------------------------------------------------------------
 
 struct Writer {
     buf: Vec<u8>,
+    /// Private-name scopes already written, by identity: a later reference is an index into the
+    /// order they were first defined in, which the reader rebuilds.
+    scopes: HashMap<*const PrivateScope, u32>,
 }
 
 impl Writer {
@@ -57,11 +82,18 @@ impl Writer {
         self.uv(s.len() as u64);
         self.buf.extend_from_slice(s.as_bytes());
     }
+    fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
 }
 
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// The source every decoded range points into.
+    src: Rc<str>,
+    /// Private-name scopes decoded so far, in definition order (see `Writer::scopes`).
+    scopes: Vec<Rc<PrivateScope>>,
 }
 
 type R<T> = Result<T, String>;
@@ -112,6 +144,28 @@ impl Reader<'_> {
     fn rcstr(&mut self) -> R<Rc<str>> {
         Ok(Rc::from(self.str()?.as_str()))
     }
+    fn u64(&mut self) -> R<u64> {
+        let end = self.pos + 8;
+        let bytes = self
+            .buf
+            .get(self.pos..end)
+            .ok_or("snapshot: truncated u64")?;
+        self.pos = end;
+        Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+    /// A byte range into `src`, checked to lie on char boundaries so a slice can never panic.
+    fn range(&mut self) -> R<(u32, u32)> {
+        let start = self.uv()?;
+        let end = self.uv()?;
+        let ok = start <= end
+            && end <= self.src.len() as u64
+            && self.src.is_char_boundary(start as usize)
+            && self.src.is_char_boundary(end as usize);
+        if !ok {
+            return Err("snapshot: source range out of bounds".into());
+        }
+        Ok((start as u32, end as u32))
+    }
 }
 
 /// Re-intern an operator string to the `&'static str` the parser would have used.
@@ -126,27 +180,41 @@ fn intern_op(s: &str) -> R<&'static str> {
 
 // ---- public API -------------------------------------------------------------------------------
 
-/// Encode a parsed script body to a snapshot blob.
-pub fn encode(body: &[Stmt]) -> Vec<u8> {
+/// Encode a script body parsed from `src` to a snapshot blob. Function source ranges and lazy
+/// bodies are byte offsets into `src`, which [`decode`] must be handed again.
+pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
     let mut w = Writer {
         buf: Vec::with_capacity(body.len() * 32),
+        scopes: HashMap::new(),
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
+    w.uv(src.len() as u64);
+    w.u64(source_hash(src));
     enc_stmts(&mut w, body);
     w.buf
 }
 
-/// Decode a snapshot blob back into a script body. `Err` (skew/truncation/corruption) tells the
-/// caller to fall back to parsing the original source.
-pub fn decode(bytes: &[u8]) -> R<Vec<Stmt>> {
-    let mut r = Reader { buf: bytes, pos: 0 };
+/// Decode a snapshot blob back into a script body. `src` is the source it was encoded from; one
+/// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
+/// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
+pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
+    let mut r = Reader {
+        buf: bytes,
+        pos: 0,
+        src: Rc::from(""),
+        scopes: Vec::new(),
+    };
     if r.uv()? != MAGIC as u64 {
         return Err("snapshot: bad magic".into());
     }
     if r.uv()? != VERSION as u64 {
         return Err("snapshot: version mismatch".into());
     }
+    if r.uv()? != src.len() as u64 || r.u64()? != source_hash(src) {
+        return Err("snapshot: source mismatch".into());
+    }
+    r.src = Rc::from(src);
     let body = dec_stmts(&mut r)?;
     Ok(body)
 }
@@ -429,7 +497,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             }
             Stmt::VarDecl { kind, decls }
         }
-        2 => Stmt::FuncDecl(Rc::new(dec_function(r)?)),
+        2 => Stmt::FuncDecl(dec_function(r)?),
         3 => Stmt::Return(dec_opt_expr(r)?),
         4 => {
             let test = dec_expr(r)?;
@@ -713,11 +781,13 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             w.u8(28);
             enc_exprs(w, exprs);
         }
-        Expr::TaggedTemplate { tag, quasis, subs } => {
+        Expr::TaggedTemplate {
+            tag, quasis, subs, ..
+        } => {
             w.u8(29);
             enc_expr(w, tag);
             w.uv(quasis.len() as u64);
-            for (cooked, raw) in quasis {
+            for (cooked, raw) in quasis.iter() {
                 enc_opt_str(w, cooked);
                 w.str(raw);
             }
@@ -782,7 +852,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
             }
             Expr::Object(props)
         }
-        13 => Expr::Func(Rc::new(dec_function(r)?)),
+        13 => Expr::Func(dec_function(r)?),
         14 => Expr::Class(Rc::new(dec_class(r)?)),
         15 => {
             let delegate = r.bool()?;
@@ -853,7 +923,8 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
             }
             Expr::TaggedTemplate {
                 tag,
-                quasis,
+                quasis: quasis.into_boxed_slice(),
+                site: crate::parser::fresh_template_site(),
                 subs: dec_exprs(r)?,
             }
         }
@@ -963,15 +1034,15 @@ fn dec_propdef(r: &mut Reader) -> R<PropDef> {
         },
         2 => PropDef::Method {
             key: dec_propkey(r)?,
-            func: Rc::new(dec_function(r)?),
+            func: dec_function(r)?,
         },
         3 => PropDef::Getter {
             key: dec_propkey(r)?,
-            func: Rc::new(dec_function(r)?),
+            func: dec_function(r)?,
         },
         4 => PropDef::Setter {
             key: dec_propkey(r)?,
-            func: Rc::new(dec_function(r)?),
+            func: dec_function(r)?,
         },
         5 => PropDef::Spread(dec_expr(r)?),
         6 => PropDef::Proto(dec_expr(r)?),
@@ -1088,6 +1159,140 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
     })
 }
 
+fn enc_fnsource(w: &mut Writer, s: &FnSource) {
+    match s {
+        FnSource::None => w.u8(0),
+        FnSource::Text(t) => {
+            w.u8(1);
+            w.str(t);
+        }
+        FnSource::Range { start, end, .. } => {
+            w.u8(2);
+            w.uv(*start as u64);
+            w.uv(*end as u64);
+        }
+    }
+}
+fn dec_fnsource(r: &mut Reader) -> R<FnSource> {
+    Ok(match r.u8()? {
+        0 => FnSource::None,
+        1 => FnSource::Text(r.rcstr()?),
+        2 => {
+            let (start, end) = r.range()?;
+            FnSource::Range {
+                src: r.src.clone(),
+                start,
+                end,
+            }
+        }
+        t => return Err(format!("snapshot: bad FnSource {t}")),
+    })
+}
+
+/// A class's private-name scope, by identity: defined inline (parent first, then its names) the
+/// first time a lazy body refers to it, referenced by definition index afterwards, so every
+/// method of a class shares one `Rc` after decode just as after a parse.
+fn enc_scope(w: &mut Writer, s: &Option<Rc<PrivateScope>>) {
+    let Some(s) = s else {
+        w.u8(0);
+        return;
+    };
+    let key = Rc::as_ptr(s);
+    if let Some(&id) = w.scopes.get(&key) {
+        w.u8(1);
+        w.uv(id as u64);
+        return;
+    }
+    w.u8(2);
+    enc_scope(w, &s.parent);
+    let names = s.names.get().map(Vec::as_slice).unwrap_or_default();
+    w.uv(names.len() as u64);
+    for n in names {
+        w.str(n);
+    }
+    let id = w.scopes.len() as u32;
+    w.scopes.insert(key, id);
+}
+fn dec_scope(r: &mut Reader) -> R<Option<Rc<PrivateScope>>> {
+    Ok(match r.u8()? {
+        0 => None,
+        1 => {
+            let id = r.uv()? as usize;
+            Some(
+                r.scopes
+                    .get(id)
+                    .cloned()
+                    .ok_or("snapshot: bad private scope ref")?,
+            )
+        }
+        2 => {
+            let parent = dec_scope(r)?;
+            let n = r.uv()? as usize;
+            let mut names = Vec::with_capacity(n);
+            for _ in 0..n {
+                names.push(r.str()?);
+            }
+            let scope = Rc::new(PrivateScope {
+                names: OnceCell::from(names),
+                parent,
+            });
+            r.scopes.push(scope.clone());
+            Some(scope)
+        }
+        t => return Err(format!("snapshot: bad private scope tag {t}")),
+    })
+}
+
+fn enc_lazy(w: &mut Writer, l: &LazyBody) {
+    w.uv(l.start as u64);
+    w.uv(l.end as u64);
+    w.uv(l.line as u64);
+    w.bool(l.html_comments);
+    let c = &l.ctx;
+    let bits = (c.strict as u16)
+        | (c.in_generator as u16) << 1
+        | (c.in_async as u16) << 2
+        | (c.module as u16) << 3
+        | (c.allow_new_target as u16) << 4
+        | (c.super_prop_ok as u16) << 5
+        | (c.super_call_ok as u16) << 6
+        | (c.in_derived_class as u16) << 7
+        | (c.no_arguments_refs as u16) << 8
+        | (c.in_field_init as u16) << 9;
+    w.uv(bits as u64);
+    enc_scope(w, &l.private_scope);
+}
+fn dec_lazy(r: &mut Reader) -> R<LazyBody> {
+    let (start, end) = r.range()?;
+    let line = r.uv()? as u32;
+    let html_comments = r.bool()?;
+    let bits = r.uv()?;
+    let ctx = LazyCtx {
+        strict: bits & 1 != 0,
+        in_generator: bits & 2 != 0,
+        in_async: bits & 4 != 0,
+        module: bits & 8 != 0,
+        allow_new_target: bits & 16 != 0,
+        super_prop_ok: bits & 32 != 0,
+        super_call_ok: bits & 64 != 0,
+        in_derived_class: bits & 128 != 0,
+        no_arguments_refs: bits & 256 != 0,
+        in_field_init: bits & 512 != 0,
+    };
+    Ok(LazyBody {
+        src: r.src.clone(),
+        start,
+        end,
+        line,
+        html_comments,
+        ctx,
+        private_scope: dec_scope(r)?,
+    })
+}
+
+/// A function the parser skipped the body of is written as its [`LazyBody`] — whether or not
+/// the body has since been materialised — and decodes lazy again; an eagerly parsed one (an
+/// IIFE, eval code) carries its statements.
 fn enc_function(w: &mut Writer, f: &Function) {
     enc_opt_str(w, &f.name);
     w.uv(f.params.len() as u64);
@@ -1096,7 +1301,6 @@ fn enc_function(w: &mut Writer, f: &Function) {
         enc_opt_expr(w, &p.default);
         w.bool(p.rest);
     }
-    enc_stmts(w, &f.body);
     // Flags packed into one byte.
     let flags = (f.is_arrow as u8)
         | (f.is_strict as u8) << 1
@@ -1106,9 +1310,20 @@ fn enc_function(w: &mut Writer, f: &Function) {
         | (f.is_method as u8) << 5
         | (f.is_fn_expr as u8) << 6;
     w.u8(flags);
-    enc_opt_rcstr(w, &f.source);
+    enc_fnsource(w, &f.source);
+    let lazy = f.lazy.borrow();
+    match lazy.as_ref() {
+        Some(l) => {
+            w.u8(1);
+            enc_lazy(w, l);
+        }
+        None => {
+            w.u8(0);
+            enc_stmts(w, &f.body());
+        }
+    }
 }
-fn dec_function(r: &mut Reader) -> R<Function> {
+fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
     let name = dec_opt_str(r)?;
     let n = r.uv()? as usize;
     let mut params = Vec::with_capacity(n);
@@ -1119,13 +1334,19 @@ fn dec_function(r: &mut Reader) -> R<Function> {
             rest: r.bool()?,
         });
     }
-    let body = dec_stmts(r)?;
     let flags = r.u8()?;
-    let source = dec_opt_rcstr(r)?;
-    Ok(Function {
+    let source = dec_fnsource(r)?;
+    let (body, lazy) = match r.u8()? {
+        0 => (Some(Rc::new(dec_stmts(r)?)), None),
+        1 => (None, Some(Box::new(dec_lazy(r)?))),
+        t => return Err(format!("snapshot: bad body tag {t}")),
+    };
+    let f = Rc::new(Function {
         name,
         params,
-        body,
+        body: RefCell::new(body),
+        lazy: RefCell::new(lazy),
+        lazy_error: OnceCell::new(),
         is_arrow: flags & 1 != 0,
         is_strict: flags & 2 != 0,
         expr_body: flags & 4 != 0,
@@ -1136,12 +1357,19 @@ fn dec_function(r: &mut Reader) -> R<Function> {
         source,
         // Lazy runtime caches — start empty, exactly as the parser leaves them.
         scan: Cell::new(0),
-        hoist: OnceCell::new(),
+        hoist: RefCell::new(None),
+        body_used: Cell::new(false),
         calls: Cell::new(0),
         code: OnceCell::new(),
         code2: OnceCell::new(),
         fn_maps: OnceCell::new(),
-    })
+    });
+    // Same registration a parsed lazy function gets (parser `rc_fn`): the collector releases
+    // the body once it goes cold.
+    if f.lazy.borrow().is_some() {
+        crate::value::register_lazy_function(&f);
+    }
+    Ok(f)
 }
 
 fn enc_class(w: &mut Writer, c: &Class) {
@@ -1177,7 +1405,7 @@ fn enc_class(w: &mut Writer, c: &Class) {
         enc_exprs(w, &m.decorators);
     }
     enc_exprs(w, &c.decorators);
-    enc_opt_rcstr(w, &c.source);
+    enc_fnsource(w, &c.source);
 }
 fn dec_class(r: &mut Reader) -> R<Class> {
     let name = dec_opt_str(r)?;
@@ -1202,7 +1430,7 @@ fn dec_class(r: &mut Reader) -> R<Class> {
         };
         let is_static = r.bool()?;
         let func = if r.u8()? == 1 {
-            Some(Rc::new(dec_function(r)?))
+            Some(dec_function(r)?)
         } else {
             None
         };
@@ -1220,7 +1448,7 @@ fn dec_class(r: &mut Reader) -> R<Class> {
         superclass,
         members,
         decorators: dec_exprs(r)?,
-        source: dec_opt_rcstr(r)?,
+        source: dec_fnsource(r)?,
     })
 }
 
@@ -1319,14 +1547,36 @@ fn dec_declkind(r: &mut Reader) -> R<DeclKind> {
 #[cfg(test)]
 mod tests {
     use super::{decode, encode};
+    use crate::ast::{Expr, Stmt};
+    use crate::{Completion, Engine};
 
     /// `encode` and `decode` must be exact inverses: re-encoding a decoded tree reproduces the
     /// bytes. This catches every tag/field-order asymmetry (a *dropped* field is caught instead
     /// by the behavioral suites that run the decoded glue).
     fn assert_roundtrips(src: &str) {
         let blob = crate::compile_snapshot(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}"));
-        let ast = decode(&blob).unwrap_or_else(|e| panic!("decode {src:?}: {e}"));
-        assert_eq!(blob, encode(&ast), "re-encode differs for: {src}");
+        let ast = decode(&blob, src).unwrap_or_else(|e| panic!("decode {src:?}: {e}"));
+        assert_eq!(blob, encode(&ast, src), "re-encode differs for: {src}");
+    }
+
+    /// Compile `src` to a snapshot and run it from the snapshot; `'passed'` is the expected
+    /// completion.
+    fn run_snapshot(src: &str) -> Completion {
+        let blob = crate::compile_snapshot(src).unwrap_or_else(|e| panic!("compile: {e}"));
+        let mut engine = Engine::new();
+        engine
+            .eval_snapshot(&blob, src, false)
+            .unwrap_or_else(|e| panic!("decode: {}", e.message))
+    }
+
+    fn check_snapshot(src: &str) {
+        let script = format!(
+            "function assert(x, m) {{ if (!x) throw new Error(m || 'assertion'); }}\n{src}\n'passed'"
+        );
+        match run_snapshot(&script) {
+            Completion::Value(v) => assert_eq!(v, "passed"),
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
     }
 
     #[test]
@@ -1342,6 +1592,8 @@ mod tests {
             "switch (x) { case 1: break; default: } do { i++ } while (i < 10); function ctor(){ return new.target; }",
             "const p = import('m'); const q = import('m', { with: { type: 'json' } });",
             "obj = { __proto__: p, shorthand, key: v, [comp]: w, m() {}, get g() {}, *gen() {}, async am() {}, ...spread };",
+            "(function iife() { function inner() { return 1; } return inner(); })(); (() => { class K { #p; m() { return this.#p; } } })();",
+            "class Outer { #o; m() { class Inner { #i; n() { return this.#i + this.#o; } } return Inner; } }",
         ] {
             assert_roundtrips(src);
         }
@@ -1363,5 +1615,208 @@ mod tests {
             let src = std::fs::read_to_string(format!("{dir}{file}")).unwrap();
             assert_roundtrips(&src);
         }
+    }
+
+    #[test]
+    fn a_skipped_body_decodes_lazy_and_shares_the_source() {
+        let src = "function f(a) { return a + 1; }\nconst g = () => { return 2; };\n(function iife() { return 3; })();";
+        let blob = crate::compile_snapshot(src).unwrap();
+        let ast = decode(&blob, src).unwrap();
+        let mut lazy = Vec::new();
+        for s in &ast {
+            match s {
+                Stmt::FuncDecl(f) => lazy.push(f.clone()),
+                Stmt::VarDecl { decls, .. } => {
+                    if let Some(Expr::Func(f)) = &decls[0].1 {
+                        lazy.push(f.clone());
+                    }
+                }
+                Stmt::Expr(Expr::Call { callee, .. }) => {
+                    let f = match &**callee {
+                        Expr::Func(f) => f,
+                        Expr::Paren(inner) => match &**inner {
+                            Expr::Func(f) => f,
+                            e => panic!("unexpected callee {e:?}"),
+                        },
+                        e => panic!("unexpected callee {e:?}"),
+                    };
+                    assert!(f.parsed_body().is_some(), "an IIFE is encoded eagerly");
+                    assert!(f.lazy.borrow().is_none());
+                    assert_eq!(f.source.as_str(), Some("function iife() { return 3; }"));
+                }
+                _ => panic!("unexpected {s:?}"),
+            }
+        }
+        assert_eq!(lazy.len(), 2);
+        let mut srcs = Vec::new();
+        for f in &lazy {
+            assert!(f.parsed_body().is_none(), "a skipped body decodes unparsed");
+            let l = f.lazy.borrow();
+            let l = l.as_ref().expect("lazy record");
+            assert_eq!(
+                &l.src[l.start as usize..l.end as usize],
+                if f.is_arrow {
+                    "{ return 2; }"
+                } else {
+                    "{ return a + 1; }"
+                }
+            );
+            srcs.push(l.src.clone());
+            let crate::ast::FnSource::Range { src: s, .. } = &f.source else {
+                panic!("source is a range")
+            };
+            srcs.push(s.clone());
+        }
+        assert!(
+            srcs.windows(2).all(|w| std::rc::Rc::ptr_eq(&w[0], &w[1])),
+            "one shared copy"
+        );
+        assert_eq!(
+            lazy[0].source.as_str(),
+            Some("function f(a) { return a + 1; }")
+        );
+    }
+
+    #[test]
+    fn decoded_functions_run_from_the_snapshot() {
+        check_snapshot(
+            "function f(x) { function g() { return x + 1; } return g(); }
+             assert(f(1) === 2, 'nested function declaration');
+             const arrow = (a, b = 2) => { return a * b; };
+             assert(arrow(3) === 6, 'arrow with a default');
+             function* gen() { yield 1; yield* [2, 3]; }
+             assert([...gen()].join() === '1,2,3', 'generator');
+             const o = { m() { return this.v; }, v: 7, get g() { return this.v + 1; } };
+             assert(o.m() === 7 && o.g === 8, 'method and getter');
+             let done = false;
+             async function a() { const v = await Promise.resolve(4); done = v === 4; }
+             a();",
+        );
+    }
+
+    #[test]
+    fn decoded_class_methods_keep_private_names_and_super() {
+        check_snapshot(
+            "class Base { greet() { return 'base'; } static s() { return 'S'; } }
+             class C extends Base {
+               #x = 1;
+               static #count = 0;
+               constructor() { super(); C.#count++; }
+               get x() { return this.#x; }
+               set x(v) { this.#x = v; }
+               greet() { return super.greet() + '+c'; }
+               static made() { return C.#count; }
+               static ss() { return super.s() + '!'; }
+               has(o) { return #x in o; }
+               nested() { class Inner { #y = 2; both(c) { return this.#y + c.#x; } } return new Inner().both(this); }
+             }
+             const c = new C();
+             assert(c.x === 1, 'private get');
+             c.x = 5;
+             assert(c.x === 5, 'private set');
+             assert(c.greet() === 'base+c', 'super property');
+             assert(C.made() === 1 && C.ss() === 'S!', 'static private and static super');
+             assert(c.has(c) && !c.has({}), 'private in');
+             assert(c.nested() === 7, 'inner class reaches the enclosing private name');",
+        );
+    }
+
+    /// Encode `src` without `compile_snapshot`'s whole-source validation pass, so a body that
+    /// does not parse reaches the decoder unparsed, and run `probe` against the loaded script.
+    fn snapshot_unchecked(src: &str, probe: &str) -> Completion {
+        let body = crate::parser::parse_script_lazy(src).unwrap();
+        let blob = encode(&body, src);
+        let mut engine = Engine::new();
+        match engine.eval_snapshot(&blob, src, false).unwrap() {
+            Completion::Value(_) => {}
+            Completion::Throw { name, message } => panic!("load threw {name}: {message}"),
+        }
+        engine.eval(probe, false).unwrap()
+    }
+
+    #[test]
+    fn an_undeclared_private_name_in_a_decoded_body_is_a_syntax_error_at_first_call() {
+        let src = "class C { #x; ok() { return this.#x; } bad() { return this.#nope; } }
+                   const c = new C();";
+        match snapshot_unchecked(src, "c.ok()") {
+            Completion::Value(v) => assert_eq!(v, "undefined"),
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+        match snapshot_unchecked(src, "c.bad()") {
+            Completion::Throw { name, .. } => assert_eq!(name, "SyntaxError"),
+            Completion::Value(v) => panic!("bad() returned {v}"),
+        }
+    }
+
+    #[test]
+    fn a_syntax_error_in_a_decoded_body_throws_at_call_not_at_load() {
+        let src = "function bad() { return 1 + ; }\nfunction fine() { return 'ok'; }";
+        match snapshot_unchecked(src, "fine()") {
+            Completion::Value(v) => assert_eq!(v, "ok"),
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+        match snapshot_unchecked(src, "bad()") {
+            Completion::Throw { name, .. } => assert_eq!(name, "SyntaxError"),
+            Completion::Value(v) => panic!("bad() returned {v}"),
+        }
+    }
+
+    #[test]
+    fn to_string_of_a_decoded_function_is_its_source_text() {
+        check_snapshot(
+            "function  f ( a ) { /* c */ return a; }
+             const arrow = async (x) => { return x; };
+             class K { m() { return 1; } }
+             assert(f.toString() === 'function  f ( a ) { /* c */ return a; }', 'declaration: ' + f.toString());
+             assert(arrow.toString() === 'async (x) => { return x; }', 'arrow: ' + arrow.toString());
+             assert(K.toString() === 'class K { m() { return 1; } }', 'class: ' + K.toString());
+             assert(K.prototype.m.toString() === 'm() { return 1; }', 'method: ' + K.prototype.m.toString());
+             assert((function iife() { return 2; }).toString() === 'function iife() { return 2; }', 'eager expression');",
+        );
+    }
+
+    #[test]
+    fn a_decoded_body_flushed_by_the_collector_is_reparsed_on_the_next_call() {
+        check_snapshot(
+            "function f(a, b) { const c = a * b; return c + 1; }
+             const before = f(2, 3);
+             $262.gc(); $262.gc();
+             assert(f(2, 3) === before, 'same result after the flush');
+             class C { #x = 4; m() { return this.#x; } }
+             const c = new C();
+             assert(c.m() === 4, 'before');
+             $262.gc(); $262.gc(); $262.gc();
+             assert(c.m() === 4, 'private name still resolves after the flush');",
+        );
+    }
+
+    #[test]
+    fn a_decoded_lazy_function_is_registered_with_the_collector() {
+        let src = "function f(a) { const b = a; return b; }";
+        let blob = crate::compile_snapshot(src).unwrap();
+        let ast = decode(&blob, src).unwrap();
+        let Stmt::FuncDecl(f) = &ast[0] else { panic!() };
+        assert!(f.parsed_body().is_none());
+        assert_eq!(f.body().len(), 2, "parsed on demand from the shared source");
+        // The pass right after a read only clears the used flag; a body untouched for a whole
+        // interval is released, and comes back on the next read.
+        assert_eq!(crate::value::flush_cold_lazy_bodies(), 0);
+        assert_eq!(crate::value::flush_cold_lazy_bodies(), 1);
+        assert!(f.parsed_body().is_none());
+        assert_eq!(f.body().len(), 2);
+    }
+
+    #[test]
+    fn another_source_is_a_decode_error() {
+        let src = "function f() { return 1; }";
+        let blob = crate::compile_snapshot(src).unwrap();
+        assert!(decode(&blob, "function f() { return 2; }").is_err());
+        assert!(decode(&blob, "function f() { return 1; } ").is_err());
+        assert!(decode(&blob, src).is_ok());
+    }
+
+    #[test]
+    fn a_body_that_does_not_parse_is_a_compile_error() {
+        assert!(crate::compile_snapshot("function f() { return 1 + ; }").is_err());
     }
 }

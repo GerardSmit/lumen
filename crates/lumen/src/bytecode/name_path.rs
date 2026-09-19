@@ -246,7 +246,7 @@ fn global_value(interp: &Interp, object: &Gc, shape: u32, slot: usize) -> Option
     if !matches!(object.exotic, Exotic::None) || object.props.shape() != shape {
         return None;
     }
-    let (_, property) = object.props.entry_at(slot)?;
+    let property = object.props.entry_at(slot)?;
     (!property.accessor()).then(|| property.value())
 }
 

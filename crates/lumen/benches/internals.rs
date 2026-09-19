@@ -44,12 +44,12 @@ fn stage_group(b: &mut Bench, label: &str, src: &str) {
 
     // Snapshot encode/decode operate on an already-parsed AST.
     let body = parse_script(src, false).unwrap_or_else(|_| panic!("parse"));
-    let bytes = encode(&body);
+    let bytes = encode(&body, src);
     b.run(&format!("{label}: snapshot-encode"), || {
-        black_box(encode(black_box(&body)));
+        black_box(encode(black_box(&body), src));
     });
     b.run(&format!("{label}: snapshot-decode"), || {
-        black_box(decode(black_box(&bytes)).unwrap_or_else(|_| panic!("decode")));
+        black_box(decode(black_box(&bytes), src).unwrap_or_else(|_| panic!("decode")));
     });
 }
 

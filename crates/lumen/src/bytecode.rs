@@ -115,10 +115,10 @@ pub const IC_ABSENT: u8 = 0xFC;
 pub const PROP_IC_WAYS: usize = 4;
 /// Flag bit OR'd into `IcState::depth` when the HOLDER is an `Exotic::Array` (including a
 /// depth-0 array receiver — `arr.length`, and `Array.prototype`, itself an Array exotic, as a
-/// method holder): array shapes don't pin named slots (element entries occupy slots without
-/// transitioning the shape), so a hit must re-check the entry's key. The JIT templates compare
-/// `depth` exactly and so route these to the helper automatically. Only meaningful while
-/// `depth < 0x80` (`IC_CREATE`/`IC_EMPTY` have the bit set but are filtered by range first).
+/// method holder). The named prefix of an array's entries is pinned by its shape like any other
+/// object's (elements live past it), so such a hit validates by shape alone; the flag only tells
+/// the probes which exotic gate the holder must pass. Only meaningful while `depth < 0x80`
+/// (`IC_CREATE`/`IC_EMPTY` have the bit set but are filtered by range first).
 pub const IC_ARR_KEYCHK: u8 = 0x40;
 /// Deepest prototype hop the IC will record; hotter sites deeper than this stay on the slow path.
 pub const IC_MAX_DEPTH: u8 = 4;
@@ -1229,10 +1229,11 @@ impl CaptureScan {
                 names.insert(n.clone());
             }
         }
-        if !hoisted_vars(&func.body, true, func.is_strict, &mut names) {
+        let body = func.body();
+        if !hoisted_vars(&body, true, func.is_strict, &mut names) {
             return None;
         }
-        self.declare_lexicals(&func.body, &mut names);
+        self.declare_lexicals(&body, &mut names);
         self.push_scope(names);
         // Parameter defaults evaluate in the function scope.
         for p in &func.params {
@@ -1240,7 +1241,7 @@ impl CaptureScan {
                 self.expr(d)?;
             }
         }
-        for s in &func.body {
+        for s in body.iter() {
             self.stmt(s)?;
         }
         self.scopes.pop();
@@ -1588,11 +1589,21 @@ impl CaptureScan {
 
     /// Enter an inner function (declaration, expression, method, accessor…).
     fn inner_fn(&mut self, f: &Function) -> Option<()> {
+        // Capture analysis needs the inner body; one that does not parse makes the outer
+        // function uncompilable (the tree-walker reports the error when the inner is called).
+        // A body parsed only for this scan is released again: compiling one enclosing function
+        // must not materialise the AST of every function nested under it (V8's preparser scans
+        // inner functions for free variables without keeping their trees either).
+        let borrowed = f.parsed_body().is_none();
+        f.ensure_body().ok()?;
         self.fn_depth += 1;
         self.arrow_path.push(f.is_arrow);
         let r = self.fn_body(f);
         self.arrow_path.pop();
         self.fn_depth -= 1;
+        if borrowed {
+            f.release_body();
+        }
         r
     }
 
@@ -1906,6 +1917,9 @@ fn compile_inner(
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
     hot: Option<&Chunk>,
 ) -> Option<Rc<Chunk>> {
+    if func.ensure_body().is_err() {
+        return None;
+    }
     // Body facts the scanner already knows: `new.target` is an observation channel into the
     // activation that slots do not provide; `arguments` in an arrow is a free variable
     // we do not model. Parameterless synchronous ordinary functions can materialize an unmapped
@@ -1937,7 +1951,7 @@ fn compile_inner(
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
     let Some((captured, env_this, block_lets)) = CaptureScan::run(func) else {
         let head: String = func
-            .source
+            .source()
             .as_deref()
             .unwrap_or("<no source>")
             .chars()
@@ -2037,7 +2051,8 @@ fn compile_inner(
         c.parameter_default(slot, d, cap).ok()?;
     }
     // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
-    for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &[]) {
+    let body = func.body();
+    for op in crate::interpreter::collect_hoist_ops(&body, func.is_strict, &[]) {
         match op {
             HoistOp::Var(name) => {
                 if captured.contains(&name) {
@@ -2095,13 +2110,13 @@ fn compile_inner(
     }
     // Body-level lexicals: captured ones home in the activation (inserted in TDZ by
     // make_run_env), the rest get TDZ slots.
-    if c.declare_body_lexicals(&func.body, &captured).is_err() {
+    if c.declare_body_lexicals(&body, &captured).is_err() {
         log_bail("body-lexicals", "unsupported declaration form");
         return None;
     }
-    for stmt in &func.body {
+    for stmt in body.iter() {
         if c.stmt(stmt).is_err() {
-            log_bail("stmt-in", &format!("{:.80}", format!("{stmt:?}")));
+            log_bail_node("stmt-in", stmt, 80);
             return None;
         }
     }
@@ -2346,9 +2361,21 @@ struct LoopCtx {
 
 /// Debug (`LUMEN_TIER_LOG=1`): report the AST construct a compile bail came from.
 fn log_bail(what: &str, detail: &str) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("LUMEN_TIER_LOG").is_some()) {
+    if bail_log_enabled() {
         eprintln!("[tier] unsupported {what}: {detail}");
+    }
+}
+
+fn bail_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUMEN_TIER_LOG").is_some())
+}
+
+/// Debug-formats an AST node for a bail log line, only when logging is on: a class expression's
+/// Debug output walks every member, and doing that for every bail is measurable.
+fn log_bail_node(what: &str, node: &dyn std::fmt::Debug, width: usize) {
+    if bail_log_enabled() {
+        log_bail(what, &format!("{:.width$}", format!("{node:?}")));
     }
 }
 
@@ -2895,7 +2922,7 @@ impl Compiler {
         if let Some(i) = self.names.iter().position(|n| &**n == name) {
             return i as u32;
         }
-        self.names.push(Rc::from(name));
+        self.names.push(intern_name(name));
         (self.names.len() - 1) as u32
     }
     fn patch(&mut self, at: usize) {
@@ -3475,7 +3502,7 @@ impl Compiler {
                 Ok(())
             }
             other => {
-                log_bail("stmt", &format!("{:.60}", format!("{other:?}")));
+                log_bail_node("stmt", other, 60);
                 Err(Bail)
             }
         }
@@ -4230,7 +4257,7 @@ impl Compiler {
             }
             Expr::Object(props) => self.object_literal(props),
             other => {
-                log_bail("expr", &format!("{:.60}", format!("{other:?}")));
+                log_bail_node("expr", other, 60);
                 Err(Bail)
             }
         }
@@ -4280,7 +4307,7 @@ impl Compiler {
                 Ok(())
             }
             other => {
-                log_bail("expr", &format!("{:.60}", format!("{other:?}")));
+                log_bail_node("expr", other, 60);
                 Err(Bail)
             }
         }
@@ -4867,7 +4894,7 @@ fn run_vm(
                     }
                 }
                 if matches!(obj, Value::Undefined | Value::Null) {
-                    return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+                    return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
                 }
                 let k = i.to_property_key(&key)?;
                 let v = i.get_member(&obj, &k)?;
@@ -4923,7 +4950,7 @@ fn run_vm(
                 }
                 let obj = slots[s as usize].clone();
                 if matches!(obj, Value::Undefined | Value::Null) {
-                    return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+                    return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
                 }
                 let k = i.to_property_key(&key)?;
                 let v = i.get_member(&obj, &k)?;
@@ -4983,7 +5010,7 @@ fn run_vm(
                 // General path: nullish check, one ToPropertyKey, [[Get]], ToNumeric, [[Set]] —
                 // the oracle's Reference order exactly.
                 if matches!(obj, Value::Undefined | Value::Null) {
-                    return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+                    return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
                 }
                 let k = i.to_property_key(&key)?;
                 let old = i.get_member(&obj, &k)?;
@@ -5049,9 +5076,7 @@ fn run_vm(
                     }
                 } else {
                     if matches!(obj, Value::Undefined | Value::Null) {
-                        return Err(
-                            i.throw("TypeError", "cannot read property of null or undefined")
-                        );
+                        return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
                     }
                     let k = i.to_property_key(&key)?;
                     i.get_member(&obj, &k)?
@@ -5734,7 +5759,7 @@ impl Chunk {
             {
                 return None;
             }
-            let (_, p) = g.props.entry_at(ic.binding as u32 as usize)?;
+            let p = g.props.entry_at(ic.binding as u32 as usize)?;
             if p.accessor() {
                 return None;
             }
@@ -5839,7 +5864,7 @@ impl Chunk {
             return None;
         }
         let slot = g.props.slot_of(&self.names[n as usize])?;
-        let (_, p) = g.props.entry_at(slot)?;
+        let p = g.props.entry_at(slot)?;
         if p.accessor() {
             return None;
         }
@@ -5979,7 +6004,7 @@ impl Chunk {
                 if matches!(g.exotic, crate::value::Exotic::None)
                     && g.props.shape() == (ic.binding >> 32) as u32
                 {
-                    if let Some((_, p)) = g.props.entry_at_mut(ic.binding as u32 as usize) {
+                    if let Some(p) = g.props.entry_at_mut(ic.binding as u32 as usize) {
                         if !p.accessor() && p.writable() {
                             p.set_value(value);
                             return Ok(());
@@ -7932,6 +7957,28 @@ thread_local! {
         const { [const { std::cell::Cell::new(IcState::EMPTY) }; PROP_IC_WAYS] };
 }
 
+thread_local! {
+    /// Every property name a chunk ever carried, kept for the thread's lifetime. The stub cache
+    /// keys on the name's data pointer, and a chunk dies with its function node — a nested
+    /// function's node goes when the enclosing body is released cold and no closure holds it —
+    /// so a chunk-owned name could be freed and its address handed to a different name; the
+    /// stub entry would then answer the new name with the old slot. Interning bounds the set by
+    /// the distinct names in the program and makes the pointer identity permanent.
+    static NAMES: std::cell::RefCell<crate::fasthash::FastSet<Rc<str>>> = Default::default();
+}
+
+fn intern_name(name: &str) -> Rc<str> {
+    NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if let Some(n) = names.get(name) {
+            return n.clone();
+        }
+        let n: Rc<str> = Rc::from(name);
+        names.insert(n.clone());
+        n
+    })
+}
+
 /// Computed string-key read fast path: route through the property-IC machinery instead of the
 /// raw `get_member` chain walk. The way cells are CLEARED first — an `IcState` carries no
 /// name (a real site cell binds one implicitly), so a stale way entry filled for one key
@@ -8747,7 +8794,7 @@ unsafe fn jit_exec_inner(
                 }
             }
             if matches!(obj, Value::Undefined | Value::Null) {
-                return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+                return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
             }
             let k = i.to_property_key(&key)?;
             let v = i.get_member(&obj, &k)?;
@@ -8803,7 +8850,7 @@ unsafe fn jit_exec_inner(
             }
             let obj = slots[s as usize].clone();
             if matches!(obj, Value::Undefined | Value::Null) {
-                return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+                return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
             }
             let k = i.to_property_key(&key)?;
             let v = i.get_member(&obj, &k)?;
@@ -8860,7 +8907,7 @@ unsafe fn jit_exec_inner(
                 }
             }
             if matches!(obj, Value::Undefined | Value::Null) {
-                return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+                return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
             }
             let k = i.to_property_key(&key)?;
             let old = i.get_member(&obj, &k)?;
@@ -8916,7 +8963,7 @@ unsafe fn jit_exec_inner(
                 }
             } else {
                 if matches!(obj, Value::Undefined | Value::Null) {
-                    return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+                    return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
                 }
                 let k = i.to_property_key(&key)?;
                 i.get_member(&obj, &k)?

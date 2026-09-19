@@ -2,10 +2,11 @@
 //! tree. Any failure is a [`ParseError`], which the engine reports as a SyntaxError (parse phase).
 
 use crate::ast::*;
-use crate::lexer::tokenize;
-use crate::token::{Tok, Token, TplPart, KEYWORDS};
+use crate::lexer::tokenize_goal_chars;
+use crate::token::{RegexTok, Tok, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
 
+#[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
     pub line: u32,
@@ -17,11 +18,50 @@ pub struct ParseError {
 /// Parse a complete script. `strict` seeds strict mode (e.g. for the strict test262 variant); a
 /// `"use strict"` directive prologue also turns it on.
 pub fn parse_script(src: &str, strict: bool) -> Result<Vec<Stmt>, ParseError> {
-    parse_script_eval(src, strict, false, false, &[])
+    parse_script_inner(src, strict, false, false, &[], lazy_bodies(), false)
+}
+
+/// [`parse_script`] with function bodies skipped whatever the environment says: the parse a
+/// snapshot is encoded from, so the snapshot's functions decode lazy even when the build runs
+/// under `LUMEN_EAGER_PARSE=1`.
+pub fn parse_script_lazy(src: &str) -> Result<Vec<Stmt>, ParseError> {
+    parse_script_inner(src, false, false, false, &[], true, false)
+}
+
+/// Parse the source CreateDynamicFunction synthesizes (`new Function(...)`, a CommonJS module
+/// wrapper): the outermost function's body is parsed now — it is about to be called, and its
+/// syntax errors are reported at creation — while the functions inside it stay lazy.
+pub fn parse_dynamic_function(src: &str) -> Result<Vec<Stmt>, ParseError> {
+    parse_script_inner(src, false, false, false, &[], lazy_bodies(), true)
+}
+
+/// Whether function bodies are skipped at parse time and parsed on first call. Off with
+/// `LUMEN_EAGER_PARSE=1` (every early error is then reported at load, as test262 expects) or
+/// inside [`with_eager_bodies`].
+pub fn lazy_bodies() -> bool {
+    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !EAGER_OVERRIDE.get()
+        && *LAZY.get_or_init(|| {
+            !std::env::var_os("LUMEN_EAGER_PARSE").is_some_and(|v| !v.is_empty() && v != "0")
+        })
+}
+
+thread_local! {
+    static EAGER_OVERRIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with every function body parsed eagerly on this thread — for a test that asserts a
+/// body-only early error is reported at load.
+pub fn with_eager_bodies<R>(f: impl FnOnce() -> R) -> R {
+    let prev = EAGER_OVERRIDE.replace(true);
+    let r = f();
+    EAGER_OVERRIDE.set(prev);
+    r
 }
 
 /// Parse eval code. Like [`parse_script`], but `allow_new_target` permits a top-level `new.target`
-/// (a direct eval whose caller is inside a function).
+/// (a direct eval whose caller is inside a function). Eval code is parsed eagerly: the caller
+/// runs whole-tree early-error checks (super/arguments context) on the result.
 pub fn parse_script_eval(
     src: &str,
     strict: bool,
@@ -29,15 +69,47 @@ pub fn parse_script_eval(
     allow_super: bool,
     private_names: &[String],
 ) -> Result<Vec<Stmt>, ParseError> {
-    let tokens = tokenize(src).map_err(|e| ParseError {
+    parse_script_inner(
+        src,
+        strict,
+        allow_new_target,
+        allow_super,
+        private_names,
+        false,
+        false,
+    )
+}
+
+fn parse_script_inner(
+    src: &str,
+    strict: bool,
+    allow_new_target: bool,
+    allow_super: bool,
+    private_names: &[String],
+    lazy: bool,
+    eager_outermost: bool,
+) -> Result<Vec<Stmt>, ParseError> {
+    let chars: Vec<char> = src.chars().collect();
+    let tokens = tokenize_goal_chars(&chars, true).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
         at_eof: e.at_eof,
     })?;
+    drop(chars);
+    let private_scope = (!private_names.is_empty()).then(|| {
+        Rc::new(PrivateScope {
+            names: std::cell::OnceCell::from(private_names.to_vec()),
+            parent: None,
+        })
+    });
     let mut p = Parser {
         toks: tokens,
         pos: 0,
-        src_chars: Rc::new(src.chars().collect()),
+        src: SrcMap::whole(src),
+        lazy,
+        eager_outermost,
+        private_scope,
+        in_field_init: false,
         strict,
         depth: 0,
         in_generator: false,
@@ -93,21 +165,38 @@ pub fn parse_script_eval(
             });
         }
     }
+    drop(p);
+    release_parse_scratch(src.len());
     Ok(body)
+}
+
+/// A large parse leaves the token vector and char buffer (≈12 bytes per source byte) freed but
+/// resident; hand the pages back so a bundle load does not set the process's high-water mark.
+fn release_parse_scratch(src_len: usize) {
+    const BIG_PARSE: usize = 256 * 1024;
+    if src_len >= BIG_PARSE {
+        crate::fastalloc::trim();
+    }
 }
 
 /// Parse a module (always strict; `import`/`export` are allowed only here). Modules permit top-level
 /// `await`, so `await` is treated as a keyword at the module's top level.
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
-    let tokens = crate::lexer::tokenize_goal(src, false).map_err(|e| ParseError {
+    let chars: Vec<char> = src.chars().collect();
+    let tokens = tokenize_goal_chars(&chars, false).map_err(|e| ParseError {
         at_eof: e.at_eof,
         message: e.message,
         line: e.line,
     })?;
+    drop(chars);
     let mut p = Parser {
         toks: tokens,
         pos: 0,
-        src_chars: Rc::new(src.chars().collect()),
+        src: SrcMap::whole(src),
+        lazy: lazy_bodies(),
+        eager_outermost: false,
+        private_scope: None,
+        in_field_init: false,
         strict: true,
         depth: 0,
         in_generator: false,
@@ -146,6 +235,8 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         message,
         line: 0,
     })?;
+    drop(p);
+    release_parse_scratch(src.len());
     Ok(body)
 }
 
@@ -304,15 +395,147 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
     }
 }
 
+/// Parse a body the parser skipped (see [`Parser::parse_function_body`]): re-lex the `{ ... }`
+/// range, seed a parser from the context the body was written in, and run the body-dependent
+/// early errors the eager path would have reported at load.
+pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
+    let (s, e) = (lazy.start as usize, lazy.end as usize);
+    let chars: Vec<char> = lazy.src[s..e].chars().collect();
+    let tokens =
+        crate::lexer::tokenize_range(&chars, lazy.html_comments, lazy.line).map_err(|e| {
+            ParseError {
+                message: e.message,
+                line: e.line,
+                at_eof: false,
+            }
+        })?;
+    drop(chars);
+    let ctx = lazy.ctx;
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        src: SrcMap::new(lazy.src.clone(), lazy.start, lazy.end),
+        lazy: true,
+        eager_outermost: false,
+        private_scope: lazy.private_scope.clone(),
+        in_field_init: ctx.in_field_init,
+        strict: ctx.strict,
+        depth: 0,
+        in_generator: ctx.in_generator,
+        in_async: ctx.in_async,
+        in_params: false,
+        no_in: false,
+        last_for_await: false,
+        module: ctx.module,
+        fn_depth: 1,
+        nonarrow_fn_depth: 0,
+        iter_depth: 0,
+        switch_depth: 0,
+        labels: Vec::new(),
+        iter_labels: Vec::new(),
+        decl_scopes: vec![DeclScope {
+            fn_boundary: true,
+            ..Default::default()
+        }],
+        next_scope_is_fn_boundary: true,
+        allow_new_target: ctx.allow_new_target,
+        top_level: false,
+        super_prop_ok: ctx.super_prop_ok,
+        super_call_ok: ctx.super_call_ok,
+        in_derived_class: ctx.in_derived_class,
+        in_case_clause: false,
+        no_arguments_refs: ctx.no_arguments_refs,
+        proto_dups: Vec::new(),
+        last_paren: false,
+        single_stmt: false,
+        in_static_block: false,
+    };
+    p.expect_punct("{")?;
+    let body = p.parse_block_body()?;
+    if !p.at_eof() {
+        return p.err("unexpected token after function body");
+    }
+    if let Some(e) = p.proto_dups.pop() {
+        return Err(e);
+    }
+    if let Some(dup) = params_body_lexical_clash(&func.params, &body) {
+        return p.err_semantic(format!("Identifier '{dup}' has already been declared"));
+    }
+    let mut st = lazy
+        .private_scope
+        .as_ref()
+        .map(PrivateScope::visible_names)
+        .unwrap_or_default();
+    pn_stmts(&body, &mut st).map_err(|message| ParseError {
+        at_eof: false,
+        message,
+        line: lazy.line,
+    })?;
+    Ok(body)
+}
+
 /// Recursion-depth ceiling for the parser. Beyond this we bail with a SyntaxError rather than
 /// overflow the native stack on pathologically nested input (test262 has deeply-nested fixtures).
 const MAX_PARSE_DEPTH: u32 = 1200;
 
+/// The source a parser records function text against: the whole file (shared by every function
+/// and lazy body parsed from it, however deeply nested) plus the mapping from the char offsets
+/// the tokens carry to byte offsets in that file. A lazily parsed body lexes only its own
+/// `{ ... }` slice, so its tokens count chars from `base`.
+struct SrcMap {
+    src: Rc<str>,
+    base: u32,
+    /// Byte offset of each char index in the lexed slice, plus one past the last char; `None`
+    /// when the slice is ASCII and the two coincide.
+    bytes: Option<Vec<u32>>,
+}
+
+impl SrcMap {
+    fn whole(src: &str) -> Self {
+        let len = src.len() as u32;
+        Self::new(Rc::from(src), 0, len)
+    }
+    fn new(src: Rc<str>, start: u32, end: u32) -> Self {
+        let slice = &src[start as usize..end as usize];
+        let bytes = (!slice.is_ascii()).then(|| {
+            let mut v: Vec<u32> = slice.char_indices().map(|(i, _)| i as u32).collect();
+            v.push(slice.len() as u32);
+            v
+        });
+        SrcMap {
+            src,
+            base: start,
+            bytes,
+        }
+    }
+    /// The byte range in `src` of a char range in the lexed slice.
+    fn byte_range(&self, start: u32, end: u32) -> Option<(u32, u32)> {
+        if start > end {
+            return None;
+        }
+        let at = |ch: u32| -> Option<u32> {
+            match &self.bytes {
+                None => (ch as usize <= self.src.len() - self.base as usize).then_some(ch),
+                Some(b) => b.get(ch as usize).copied(),
+            }
+        };
+        Some((self.base + at(start)?, self.base + at(end)?))
+    }
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
-    /// The source as chars, for slicing function source text by token offsets.
-    src_chars: Rc<Vec<char>>,
+    /// The source, for slicing function text by token offsets.
+    src: SrcMap,
+    /// Skip function bodies (see [`Parser::parse_function_body`]).
+    lazy: bool,
+    /// Parse a top-level function's body eagerly even so (see [`parse_dynamic_function`]).
+    eager_outermost: bool,
+    /// The innermost class being parsed, handed to skipped bodies for their private-name check.
+    private_scope: Option<Rc<PrivateScope>>,
+    /// Inside a class field initializer (where `arguments` is an early error; survives arrows).
+    in_field_init: bool,
     strict: bool,
     depth: u32,
     /// Whether the body currently being parsed is a generator / async function — controls whether
@@ -382,6 +605,88 @@ struct Parser {
     in_static_block: bool,
 }
 
+thread_local! {
+    /// Template-site ids for `Expr::TaggedTemplate::site`, keyed by the source the site was
+    /// parsed from, its byte offset there, and a hash of its raw text. A tagged template inside
+    /// a lazily-parsed body must present the same strings object after the body was released
+    /// and parsed again (GetTemplateObject is per *site*), so the id derives from where the
+    /// site is, not from the node the parse produced. A freed source whose address is reused
+    /// by another can only collide with a site whose raw text matches — the same strings, so the
+    /// worst case is two identical sites sharing one frozen object.
+    static TEMPLATE_SITES: std::cell::RefCell<(crate::fasthash::FastMap<(usize, u32, u64), u32>, u32)> =
+        std::cell::RefCell::new((Default::default(), 0));
+}
+
+fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (_, raw) in quasis {
+        raw.hash(&mut h);
+    }
+    let key = (Rc::as_ptr(src) as *const u8 as usize, offset, h.finish());
+    TEMPLATE_SITES.with(|t| {
+        let (map, next) = &mut *t.borrow_mut();
+        *map.entry(key).or_insert_with(|| {
+            *next += 1;
+            *next
+        })
+    })
+}
+
+/// A template-site id no parsed site shares (snapshot-decoded templates, whose bodies are never
+/// released).
+pub(crate) fn fresh_template_site() -> u32 {
+    TEMPLATE_SITES.with(|t| {
+        let (_, next) = &mut *t.borrow_mut();
+        *next += 1;
+        *next
+    })
+}
+
+/// Wrap a parsed function node. One whose body was skipped is registered with the collector,
+/// which releases the body again once it goes cold (see `Function::release_cold_body`); a
+/// function parsed eagerly has no source range to re-parse from and is never released.
+fn rc_fn(f: Function) -> Rc<Function> {
+    let f = Rc::new(f);
+    if f.lazy.borrow().is_some() {
+        crate::value::register_lazy_function(&f);
+    }
+    f
+}
+
+/// A parsed function body, or one skipped for [`parse_lazy_body`].
+enum Body {
+    Eager(Vec<Stmt>),
+    Lazy(LazyBody),
+}
+
+impl Body {
+    /// [`params_body_lexical_clash`] for an eager body; a lazy body runs it when parsed.
+    fn params_lexical_clash(&self, params: &[Param]) -> Option<String> {
+        match self {
+            Body::Eager(b) => params_body_lexical_clash(params, b),
+            Body::Lazy(_) => None,
+        }
+    }
+    fn cells(
+        self,
+    ) -> (
+        std::cell::RefCell<Option<Rc<Vec<Stmt>>>>,
+        std::cell::RefCell<Option<Box<LazyBody>>>,
+    ) {
+        match self {
+            Body::Eager(b) => (
+                std::cell::RefCell::new(Some(Rc::new(b))),
+                std::cell::RefCell::new(None),
+            ),
+            Body::Lazy(l) => (
+                std::cell::RefCell::new(None),
+                std::cell::RefCell::new(Some(Box::new(l))),
+            ),
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeclScope {
     lexical: Vec<String>,
@@ -405,14 +710,26 @@ impl Parser {
             self.toks[self.pos - 1].end
         }
     }
-    /// The source text between two char offsets (a function's `toString` view).
-    fn src_slice(&self, start: u32, end: u32) -> Option<Rc<str>> {
-        let (s, e) = (start as usize, end as usize);
-        if s <= e && e <= self.src_chars.len() {
-            Some(Rc::from(self.src_chars[s..e].iter().collect::<String>()))
-        } else {
-            None
+    /// The source text between two token offsets (a function's `toString` view), as a range into
+    /// the shared source.
+    fn src_slice(&self, start: u32, end: u32) -> FnSource {
+        match self.src.byte_range(start, end) {
+            Some((start, end)) => FnSource::Range {
+                src: self.src.src.clone(),
+                start,
+                end,
+            },
+            None => FnSource::None,
         }
+    }
+    /// Whether the token before `idx` makes a function starting at `idx` look like an IIFE
+    /// operand (`(function(){...})()`, `!function(){...}()`).
+    fn call_prefix_before(&self, idx: usize) -> bool {
+        idx > 0
+            && matches!(
+                self.toks[idx - 1].kind,
+                Tok::Punct("(" | "!" | "~" | "+" | "-") | Tok::Keyword("void")
+            )
     }
 
     fn cur(&self) -> &Tok {
@@ -726,7 +1043,7 @@ impl Parser {
                         self.declare_fn_decl(n, f.is_async, f.is_generator)?;
                     }
                 }
-                Ok(Stmt::FuncDecl(Rc::new(f)))
+                Ok(Stmt::FuncDecl(rc_fn(f)))
             }
             // `async function f(){}` declaration (async is a contextual keyword).
             Tok::Ident(w)
@@ -747,7 +1064,7 @@ impl Parser {
                         self.declare_fn_decl(n, f.is_async, f.is_generator)?;
                     }
                 }
-                Ok(Stmt::FuncDecl(Rc::new(f)))
+                Ok(Stmt::FuncDecl(rc_fn(f)))
             }
             Tok::Keyword("class") | Tok::Punct("@") => {
                 let c = self.parse_class()?;
@@ -896,7 +1213,7 @@ impl Parser {
                                 Some(n) => self.declare_fn_decl(n, false, false),
                                 None => Ok(()),
                             };
-                            declared.map(|_| Stmt::FuncDecl(Rc::new(f)))
+                            declared.map(|_| Stmt::FuncDecl(rc_fn(f)))
                         }
                         Err(e) => Err(e),
                     }
@@ -1753,7 +2070,7 @@ impl Parser {
             {
                 let start = self.cur_start();
                 let is_async = self.eat_ident_word("async");
-                Stmt::FuncDecl(Rc::new(self.parse_function(is_async, false, start)?))
+                Stmt::FuncDecl(rc_fn(self.parse_function(is_async, false, start)?))
             } else if self.is_kw("class") {
                 Stmt::ClassDecl(Rc::new(self.parse_class()?))
             } else {
@@ -1969,9 +2286,10 @@ impl Parser {
     /// If the current token is a regex literal, re-lex its text as `/`-division followed by the
     /// pattern/flags source (used after `yield`/`await` in identifier position — see caller).
     fn split_regex_as_division(&mut self) {
-        let Tok::Regex { body, flags } = self.cur().clone() else {
+        let Tok::Regex(re) = self.cur().clone() else {
             return;
         };
+        let RegexTok { body, flags } = *re;
         let tok = &self.toks[self.pos];
         let (line, start, end) = (tok.line, tok.start, tok.end);
         let rest = format!("{body}/{flags}");
@@ -2611,7 +2929,11 @@ impl Parser {
         }
         match self.cur().clone() {
             Tok::Ident(n) if n == "arguments" && self.no_arguments_refs => {
-                self.err("'arguments' is not allowed in a class static block")
+                if self.in_field_init {
+                    self.err("'arguments' is not allowed in a class field initializer")
+                } else {
+                    self.err("'arguments' is not allowed in a class static block")
+                }
             }
             Tok::Num(n) => {
                 self.advance();
@@ -2629,8 +2951,9 @@ impl Parser {
                 self.advance();
                 self.build_template(parts)
             }
-            Tok::Regex { body, flags } => {
+            Tok::Regex(re) => {
                 self.advance();
+                let RegexTok { body, flags } = *re;
                 // A regex literal is validated when parsed: an invalid pattern/flags is an early
                 // (parse-phase) SyntaxError, not a runtime one.
                 if let Err(msg) = crate::regex::Regex::new(&body, &flags) {
@@ -2660,7 +2983,7 @@ impl Parser {
             }
             Tok::Keyword("function") => {
                 let f = self.parse_function(false, true, self.cur_start())?;
-                Ok(Expr::Func(Rc::new(f)))
+                Ok(Expr::Func(rc_fn(f)))
             }
             Tok::Keyword("class") | Tok::Punct("@") => {
                 let c = self.parse_class()?;
@@ -2744,7 +3067,7 @@ impl Parser {
                 let start = self.cur_start();
                 self.advance();
                 let f = self.parse_function(true, true, start)?;
-                Ok(Expr::Func(Rc::new(f)))
+                Ok(Expr::Func(rc_fn(f)))
             }
             Tok::Ident(name) => {
                 self.advance();
@@ -2827,7 +3150,11 @@ impl Parser {
                     let mut sub = Parser {
                         toks: tokens,
                         pos: 0,
-                        src_chars: Rc::new(src.chars().collect()),
+                        src: SrcMap::whole(&src),
+                        lazy: self.lazy,
+                        eager_outermost: false,
+                        private_scope: self.private_scope.clone(),
+                        in_field_init: self.in_field_init,
                         strict: self.strict,
                         depth: self.depth,
                         in_generator: self.in_generator,
@@ -2898,7 +3225,11 @@ impl Parser {
                     let mut sub = Parser {
                         toks: tokens,
                         pos: 0,
-                        src_chars: Rc::new(src.chars().collect()),
+                        src: SrcMap::whole(&src),
+                        lazy: self.lazy,
+                        eager_outermost: false,
+                        private_scope: self.private_scope.clone(),
+                        in_field_init: self.in_field_init,
                         strict: self.strict,
                         depth: self.depth,
                         in_generator: self.in_generator,
@@ -2936,9 +3267,12 @@ impl Parser {
                 }
             }
         }
+        let start = self.toks[self.pos - 1].start;
+        let offset = self.src.byte_range(start, start).map_or(0, |(b, _)| b);
         Ok(Expr::TaggedTemplate {
             tag: Box::new(tag),
-            quasis,
+            site: template_site(&self.src.src, offset, &quasis),
+            quasis: quasis.into_boxed_slice(),
             subs,
         })
     }
@@ -3018,12 +3352,12 @@ impl Parser {
                 props.push(if is_get {
                     PropDef::Getter {
                         key,
-                        func: Rc::new(func),
+                        func: rc_fn(func),
                     }
                 } else {
                     PropDef::Setter {
                         key,
-                        func: Rc::new(func),
+                        func: rc_fn(func),
                     }
                 });
                 if !self.eat_punct(",") {
@@ -3068,7 +3402,7 @@ impl Parser {
                 }
                 props.push(PropDef::Method {
                     key,
-                    func: Rc::new(func),
+                    func: rc_fn(func),
                 });
             } else if self.eat_punct(":") {
                 // Two `__proto__: value` data properties in one literal are a SyntaxError — but
@@ -3181,6 +3515,7 @@ impl Parser {
         is_expr: bool,
         start: u32,
     ) -> Result<Function, ParseError> {
+        let call_prefix = self.call_prefix_before(self.pos - usize::from(is_async));
         self.eat_kw("function");
         let is_generator = self.eat_punct("*");
         let name = if let Tok::Ident(n) = self.cur().clone() {
@@ -3221,12 +3556,15 @@ impl Parser {
         let scall = std::mem::replace(&mut self.super_call_ok, false);
         let ssb = std::mem::replace(&mut self.in_static_block, false);
         let sargs = std::mem::replace(&mut self.no_arguments_refs, false);
+        let sfi = std::mem::replace(&mut self.in_field_init, false);
         let params = self.parse_params_fn()?;
-        let (body, is_strict) = self.parse_function_body(!params_complex(&params), false)?;
+        let (body, is_strict) =
+            self.parse_function_body(!params_complex(&params), false, is_expr && call_prefix)?;
         self.super_prop_ok = ssuper;
         self.super_call_ok = scall;
         self.in_static_block = ssb;
         self.no_arguments_refs = sargs;
+        self.in_field_init = sfi;
         self.in_generator = sg;
         self.in_async = sa;
         let strict = is_strict || self.strict;
@@ -3251,19 +3589,23 @@ impl Parser {
                 return self.err(format!("duplicate parameter name '{dup}'"));
             }
         }
-        if let Some(dup) = params_body_lexical_clash(&params, &body) {
+        if let Some(dup) = body.params_lexical_clash(&params) {
             return self.err_semantic(format!("Identifier '{dup}' has already been declared"));
         }
+        let (body, lazy) = body.cells();
         let func = Function {
             scan: std::cell::Cell::new(0),
-            hoist: std::cell::OnceCell::new(),
+            hoist: std::cell::RefCell::new(None),
+            body_used: std::cell::Cell::new(false),
             calls: std::cell::Cell::new(0),
             code: std::cell::OnceCell::new(),
             code2: std::cell::OnceCell::new(),
             fn_maps: std::cell::OnceCell::new(),
+            lazy_error: std::cell::OnceCell::new(),
             name,
             params,
             body,
+            lazy,
             is_arrow: false,
             is_strict: strict,
             expr_body: false,
@@ -3365,12 +3707,31 @@ impl Parser {
         };
         self.expect_punct("{")?;
         let sderived = std::mem::replace(&mut self.in_derived_class, superclass.is_some());
+        let scope = Rc::new(PrivateScope {
+            names: std::cell::OnceCell::new(),
+            parent: self.private_scope.take(),
+        });
+        self.private_scope = Some(scope.clone());
         let mut members = Vec::new();
-        while !self.is_punct("}") && !self.at_eof() {
-            members.extend(self.parse_class_member()?);
-        }
+        let r = (|| {
+            while !self.is_punct("}") && !self.at_eof() {
+                members.extend(self.parse_class_member()?);
+            }
+            Ok(())
+        })();
+        self.private_scope = scope.parent.clone();
         self.in_derived_class = sderived;
         self.strict = saved;
+        r?;
+        let _ = scope.names.set(
+            members
+                .iter()
+                .filter_map(|m| match &m.key {
+                    PropKey::Ident(n) if n.starts_with('#') => Some(n.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
         self.expect_punct("}")?;
         // The class constructor's `toString` is the whole class's source text.
         let class_src = self.src_slice(class_start, self.prev_end());
@@ -3393,7 +3754,7 @@ impl Parser {
             superclass,
             members,
             decorators,
-            source: self.src_slice(class_start, self.prev_end()),
+            source: class_src,
         })
     }
 
@@ -3450,14 +3811,17 @@ impl Parser {
             let body = body?;
             let func = Function {
                 scan: std::cell::Cell::new(0),
-                hoist: std::cell::OnceCell::new(),
+                hoist: std::cell::RefCell::new(None),
+                body_used: std::cell::Cell::new(false),
                 calls: std::cell::Cell::new(0),
                 code: std::cell::OnceCell::new(),
                 code2: std::cell::OnceCell::new(),
                 fn_maps: std::cell::OnceCell::new(),
+                lazy_error: std::cell::OnceCell::new(),
                 name: None,
                 params: Vec::new(),
-                body,
+                body: std::cell::RefCell::new(Some(Rc::new(body))),
+                lazy: std::cell::RefCell::new(None),
                 is_arrow: false,
                 is_strict: true,
                 expr_body: false,
@@ -3465,13 +3829,13 @@ impl Parser {
                 is_async: false,
                 is_method: false,
                 is_fn_expr: false,
-                source: None,
+                source: FnSource::None,
             };
             return Ok(vec![ClassMember {
                 key: PropKey::Ident(String::new()),
                 kind: MemberKind::StaticBlock,
                 is_static: true,
-                func: Some(Rc::new(func)),
+                func: Some(rc_fn(func)),
                 value: None,
                 decorators,
             }]);
@@ -3548,7 +3912,7 @@ impl Parser {
                 key,
                 kind,
                 is_static,
-                func: Some(Rc::new(func)),
+                func: Some(rc_fn(func)),
                 value: None,
                 decorators,
             }])
@@ -3559,6 +3923,10 @@ impl Parser {
                 let ssuper = std::mem::replace(&mut self.super_prop_ok, true);
                 let scall = std::mem::replace(&mut self.super_call_ok, false);
                 let snt = std::mem::replace(&mut self.allow_new_target, true);
+                // `arguments` is an early error here, through arrows (whose bodies may be
+                // parsed lazily, so the flag travels with them rather than a post-parse walk).
+                let sargs = std::mem::replace(&mut self.no_arguments_refs, true);
+                let sfi = std::mem::replace(&mut self.in_field_init, true);
                 // Field initializers are their own function-like context: an enclosing async
                 // function's [+Await] (or a generator's [+Yield]) does not apply. In modules
                 // `await` stays reserved regardless.
@@ -3568,6 +3936,8 @@ impl Parser {
                 self.super_prop_ok = ssuper;
                 self.super_call_ok = scall;
                 self.allow_new_target = snt;
+                self.no_arguments_refs = sargs;
+                self.in_field_init = sfi;
                 self.in_async = sasync;
                 self.in_generator = sgen;
                 Some(v?)
@@ -3606,6 +3976,7 @@ impl Parser {
         // `arguments` reservations.
         let ssb = std::mem::replace(&mut self.in_static_block, false);
         let sargs = std::mem::replace(&mut self.no_arguments_refs, false);
+        let sfi = std::mem::replace(&mut self.in_field_init, false);
         let params = self.parse_params_fn()?;
         // A method has UniqueFormalParameters: duplicate parameter names are always an error.
         if let Some(dup) = duplicate_name(&param_names(&params)) {
@@ -3614,27 +3985,33 @@ impl Parser {
             self.super_prop_ok = ssuper;
             self.in_static_block = ssb;
             self.no_arguments_refs = sargs;
+            self.in_field_init = sfi;
             return self.err(format!("duplicate parameter name '{dup}'"));
         }
-        let (body, is_strict) = self.parse_function_body(!params_complex(&params), false)?;
+        let (body, is_strict) = self.parse_function_body(!params_complex(&params), false, false)?;
         self.super_prop_ok = ssuper;
         self.in_static_block = ssb;
         self.no_arguments_refs = sargs;
+        self.in_field_init = sfi;
         self.in_generator = sg;
         self.in_async = sa;
-        if let Some(dup) = params_body_lexical_clash(&params, &body) {
+        if let Some(dup) = body.params_lexical_clash(&params) {
             return self.err_semantic(format!("Identifier '{dup}' has already been declared"));
         }
+        let (body, lazy) = body.cells();
         Ok(Function {
             scan: std::cell::Cell::new(0),
-            hoist: std::cell::OnceCell::new(),
+            hoist: std::cell::RefCell::new(None),
+            body_used: std::cell::Cell::new(false),
             calls: std::cell::Cell::new(0),
             code: std::cell::OnceCell::new(),
             code2: std::cell::OnceCell::new(),
             fn_maps: std::cell::OnceCell::new(),
+            lazy_error: std::cell::OnceCell::new(),
             name: None,
             params,
             body,
+            lazy,
             is_arrow: false,
             is_strict: is_strict || self.strict,
             expr_body: false,
@@ -3711,12 +4088,20 @@ impl Parser {
         Ok(params)
     }
 
+    /// Parse a `{ ... }` function body, or — when bodies are lazy — skip it: walk the tokens to
+    /// the matching `}` (the lexer has already resolved strings, templates, regexes and comments,
+    /// so a brace count is exact) and record the range with the context the body inherits, for
+    /// [`parse_lazy_body`] on first call. `call_prefix` says the function is an expression sitting
+    /// after `(`/`!`/…: with a call right after the body it is an IIFE, parsed eagerly since it
+    /// runs at load anyway.
     fn parse_function_body(
         &mut self,
         params_simple: bool,
         is_arrow: bool,
-    ) -> Result<(Vec<Stmt>, bool), ParseError> {
+        call_prefix: bool,
+    ) -> Result<(Body, bool), ParseError> {
         self.expect_punct("{")?;
+        let open = self.pos - 1;
         let saved_strict = self.strict;
         let inner_strict = self.prologue_has_use_strict(self.pos);
         // A function with a non-simple parameter list (defaults / rest / destructuring) can't apply a
@@ -3728,6 +4113,47 @@ impl Parser {
         }
         if inner_strict {
             self.strict = true;
+        }
+        if self.lazy && !(self.eager_outermost && self.fn_depth == 0) {
+            if let Some(close) = self.matching_brace(open) {
+                let next = |i: usize| self.toks.get(i).map(|t| &t.kind);
+                let called_after = matches!(next(close + 1), Some(Tok::Punct("(")))
+                    || (call_prefix
+                        && matches!(next(close + 1), Some(Tok::Punct(")")))
+                        && matches!(next(close + 2), Some(Tok::Punct("(" | "."))));
+                if !called_after {
+                    let ctx = LazyCtx {
+                        strict: self.strict,
+                        in_generator: self.in_generator,
+                        in_async: self.in_async,
+                        module: self.module,
+                        allow_new_target: !is_arrow
+                            || self.nonarrow_fn_depth > 0
+                            || self.allow_new_target,
+                        super_prop_ok: self.super_prop_ok,
+                        super_call_ok: self.super_call_ok,
+                        in_derived_class: self.in_derived_class,
+                        no_arguments_refs: self.no_arguments_refs,
+                        in_field_init: self.in_field_init,
+                    };
+                    let (start, end) = self
+                        .src
+                        .byte_range(self.toks[open].start, self.toks[close].end)
+                        .expect("brace tokens lie inside the lexed source");
+                    let lazy = LazyBody {
+                        src: self.src.src.clone(),
+                        start,
+                        end,
+                        line: self.toks[open].line,
+                        html_comments: !self.module,
+                        ctx,
+                        private_scope: self.private_scope.clone(),
+                    };
+                    self.pos = close + 1;
+                    self.strict = saved_strict;
+                    return Ok((Body::Lazy(lazy), ctx.strict));
+                }
+            }
         }
         // A function body is a fresh context for return/break/continue and labels.
         let (siter, sswitch) = (self.iter_depth, self.switch_depth);
@@ -3753,13 +4179,14 @@ impl Parser {
         let body = body?;
         let result_strict = self.strict;
         self.strict = saved_strict;
-        Ok((body, result_strict))
+        Ok((Body::Eager(body), result_strict))
     }
 
     // ----- arrow functions --------------------------------------------------------------------
 
     fn try_parse_arrow(&mut self) -> Result<Option<Expr>, ParseError> {
         let arrow_start = self.cur_start();
+        let call_prefix = self.call_prefix_before(self.pos);
         // Optional `async` prefix (on the same line) for an async arrow.
         let async_arrow = self.is_ident_word("async")
             && !self.cur_escaped()
@@ -3798,7 +4225,12 @@ impl Parser {
                     default: None,
                     rest: false,
                 }];
-                return Ok(Some(self.finish_arrow(params, async_arrow, arrow_start)?));
+                return Ok(Some(self.finish_arrow(
+                    params,
+                    async_arrow,
+                    arrow_start,
+                    call_prefix,
+                )?));
             }
         }
         // `( params ) => ...`
@@ -3819,7 +4251,12 @@ impl Parser {
                     self.in_async = sa;
                     let params = params?;
                     self.expect_punct("=>")?;
-                    return Ok(Some(self.finish_arrow(params, async_arrow, arrow_start)?));
+                    return Ok(Some(self.finish_arrow(
+                        params,
+                        async_arrow,
+                        arrow_start,
+                        call_prefix,
+                    )?));
                 }
             }
         }
@@ -3831,6 +4268,7 @@ impl Parser {
         params: Vec<Param>,
         is_async: bool,
         start: u32,
+        call_prefix: bool,
     ) -> Result<Expr, ParseError> {
         // Arrow parameters must always be unique (the list is treated as if it had a `[+Strict]`).
         if let Some(dup) = duplicate_name(&param_names(&params)) {
@@ -3842,9 +4280,10 @@ impl Parser {
         // (the parameters, parsed by the caller, are not).
         let ssb = std::mem::replace(&mut self.in_static_block, false);
         let result = if self.is_punct("{") {
-            let (body, is_strict) = self.parse_function_body(!params_complex(&params), true)?;
+            let (body, is_strict) =
+                self.parse_function_body(!params_complex(&params), true, call_prefix)?;
             // A body-level lexical may not redeclare a parameter name.
-            if let Some(dup) = params_body_lexical_clash(&params, &body) {
+            if let Some(dup) = body.params_lexical_clash(&params) {
                 self.in_async = sa;
                 self.in_static_block = ssb;
                 return self.err_semantic(format!("Identifier '{dup}' has already been declared"));
@@ -3858,16 +4297,20 @@ impl Parser {
                     }
                 }
             }
+            let (body, lazy) = body.cells();
             Function {
                 scan: std::cell::Cell::new(0),
-                hoist: std::cell::OnceCell::new(),
+                hoist: std::cell::RefCell::new(None),
+                body_used: std::cell::Cell::new(false),
                 calls: std::cell::Cell::new(0),
                 code: std::cell::OnceCell::new(),
                 code2: std::cell::OnceCell::new(),
                 fn_maps: std::cell::OnceCell::new(),
+                lazy_error: std::cell::OnceCell::new(),
                 name: None,
                 params,
                 body,
+                lazy,
                 is_arrow: true,
                 is_strict: is_strict || self.strict,
                 expr_body: false,
@@ -3881,14 +4324,17 @@ impl Parser {
             let expr = self.parse_assign()?;
             Function {
                 scan: std::cell::Cell::new(0),
-                hoist: std::cell::OnceCell::new(),
+                hoist: std::cell::RefCell::new(None),
+                body_used: std::cell::Cell::new(false),
                 calls: std::cell::Cell::new(0),
                 code: std::cell::OnceCell::new(),
                 code2: std::cell::OnceCell::new(),
                 fn_maps: std::cell::OnceCell::new(),
+                lazy_error: std::cell::OnceCell::new(),
                 name: None,
                 params,
-                body: vec![Stmt::Return(Some(expr))],
+                body: std::cell::RefCell::new(Some(Rc::new(vec![Stmt::Return(Some(expr))]))),
+                lazy: std::cell::RefCell::new(None),
                 is_arrow: true,
                 is_strict: self.strict,
                 expr_body: true,
@@ -3901,7 +4347,26 @@ impl Parser {
         };
         self.in_async = sa;
         self.in_static_block = ssb;
-        Ok(Expr::Func(Rc::new(result)))
+        Ok(Expr::Func(rc_fn(result)))
+    }
+
+    /// Index of the `}` matching the `{` at `open`.
+    fn matching_brace(&self, open: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for (i, t) in self.toks.iter().enumerate().skip(open) {
+            match &t.kind {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                Tok::Eof => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Index of the `)` matching the `(` at `open`, scanning balanced brackets.
@@ -4285,7 +4750,9 @@ fn pn_class(class: &Class, st: &mut Vec<Vec<String>>) -> Result<(), String> {
         }
         if let Some(f) = &m.func {
             pn_params(&f.params, st)?;
-            pn_stmts(&f.body, st)?;
+            if let Some(b) = f.parsed_body() {
+                pn_stmts(&b, st)?;
+            }
         }
         if let Some(v) = &m.value {
             pn_expr(v, st)?;
@@ -4355,7 +4822,9 @@ fn pn_stmt(stmt: &Stmt, st: &mut Vec<Vec<String>>) -> Result<(), String> {
         }
         Stmt::FuncDecl(f) => {
             pn_params(&f.params, st)?;
-            pn_stmts(&f.body, st)?;
+            if let Some(b) = f.parsed_body() {
+                pn_stmts(&b, st)?;
+            }
         }
         Stmt::Return(Some(e)) => pn_expr(e, st)?,
         Stmt::If { test, cons, alt } => {
@@ -4483,7 +4952,9 @@ fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
         Expr::Class(c) => pn_class(c, st)?,
         Expr::Func(f) => {
             pn_params(&f.params, st)?;
-            pn_stmts(&f.body, st)?;
+            if let Some(b) = f.parsed_body() {
+                pn_stmts(&b, st)?;
+            }
         }
         Expr::Unary { arg, .. }
         | Expr::Update { arg, .. }
@@ -4527,7 +4998,9 @@ fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
                             pn_expr(e, st)?;
                         }
                         pn_params(&func.params, st)?;
-                        pn_stmts(&func.body, st)?;
+                        if let Some(b) = func.parsed_body() {
+                            pn_stmts(&b, st)?;
+                        }
                     }
                     PropDef::Spread(e) | PropDef::Proto(e) => pn_expr(e, st)?,
                 }

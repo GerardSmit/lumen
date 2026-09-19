@@ -139,7 +139,8 @@ impl Compiler {
         // Hoisted vars start undefined on EVERY pass through the site; fused-reset runs are
         // emitted per contiguous slot range (fresh slots are consecutive, so usually one op).
         let mut resets: Vec<u16> = Vec::new();
-        for op in crate::interpreter::collect_hoist_ops(&f.body, f.is_strict, &[]) {
+        let body = f.body();
+        for op in crate::interpreter::collect_hoist_ops(&body, f.is_strict, &[]) {
             match op {
                 HoistOp::Var(name) => {
                     if self.lookup(&name).is_none() {
@@ -177,8 +178,8 @@ impl Compiler {
             k += count as usize;
         }
         let empty = std::collections::HashSet::new();
-        self.declare_body_lexicals(&f.body, &empty)?;
-        for stmt in &f.body {
+        self.declare_body_lexicals(&body, &empty)?;
+        for stmt in body.iter() {
             self.stmt(stmt)?;
         }
         self.emit(Op::Undef); // implicit return value

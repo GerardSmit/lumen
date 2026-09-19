@@ -108,13 +108,18 @@ pub(crate) fn host_now_ms() -> Option<f64> {
 
 /// Parse `src` as a script and encode its AST to a snapshot blob — a build-time helper (used
 /// from op crates' `build.rs`) so static JS glue is parsed once at build and decoded, not
-/// re-parsed, on every boot. Decode it at runtime with [`Engine::eval_snapshot`]. `Err` is a
-/// parse-error message.
+/// re-parsed, on every boot. Decode it at runtime with [`Engine::eval_snapshot`], handing it the
+/// same `src`: the snapshot's functions carry byte ranges into it, not copies of it, and decode
+/// with their bodies unparsed until first call. `Err` is a parse-error message — from anywhere
+/// in `src`, including bodies the snapshot leaves unparsed.
 pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
-    let body =
-        parser::parse_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
-    Ok(snapshot::encode(&body))
+    let fmt = |e: parser::ParseError| format!("{} (line {})", e.message, e.line);
+    parser::with_eager_bodies(|| parser::parse_script(src, false)).map_err(fmt)?;
+    let body = parser::parse_script_lazy(src).map_err(fmt)?;
+    Ok(snapshot::encode(&body, src))
 }
+
+pub use parser::with_eager_bodies;
 
 /// A parse-phase failure. test262 reports these as a `SyntaxError` thrown during parsing.
 #[derive(Debug)]
@@ -202,13 +207,20 @@ impl Engine {
     }
 
     /// Like [`eval`](Engine::eval), but the script body comes from a precompiled snapshot blob
-    /// (see [`compile_snapshot`]) instead of parsing source — the runtime uses this to skip
-    /// re-lexing/parsing its static JS glue on every boot. A decode failure (version skew,
-    /// corruption) surfaces as `Err(ParseError)` so the caller can fall back to `eval` on the
-    /// original source; the resulting AST is otherwise identical to a parsed one, so execution
-    /// is byte-for-byte the same.
-    pub fn eval_snapshot(&mut self, bytes: &[u8], strict: bool) -> Result<Completion, ParseError> {
-        let body = snapshot::decode(bytes).map_err(|message| ParseError {
+    /// (see [`compile_snapshot`]) instead of parsing `src` — the runtime uses this to skip
+    /// re-lexing/parsing its static JS glue on every boot. `src` must be the text the snapshot
+    /// was compiled from: decoded functions slice their `toString` text and lazily parsed bodies
+    /// out of one shared copy of it. A decode failure (version skew, corruption, another source)
+    /// surfaces as `Err(ParseError)` so the caller can fall back to `eval` on `src`; the
+    /// resulting AST is otherwise identical to a parsed one, so execution is byte-for-byte the
+    /// same.
+    pub fn eval_snapshot(
+        &mut self,
+        bytes: &[u8],
+        src: &str,
+        strict: bool,
+    ) -> Result<Completion, ParseError> {
+        let body = snapshot::decode(bytes, src).map_err(|message| ParseError {
             message,
             line: 0,
             at_eof: false,
@@ -288,6 +300,11 @@ impl Engine {
     /// [`set_tier_threshold`](Engine::set_tier_threshold) calls.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
         self.interp.tier = tier;
+    }
+
+    /// The execution tier new calls are considered for (see [`set_tier`](Engine::set_tier)).
+    pub fn tier(&self) -> bytecode::Tier {
+        self.interp.tier
     }
 
     /// Calls before a function is considered for bytecode compilation (0 = immediately).
