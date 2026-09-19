@@ -227,6 +227,8 @@ fn main() {
     }
     glue.push_str("\n})();");
 
+    // The snapshot's functions are byte ranges into `glue`, resolved at boot against the
+    // `include_str!` of node_glue.js — so the text written there must be exactly this string.
     let snapshot = lumen::compile_snapshot(&glue)
         .unwrap_or_else(|e| panic!("node glue failed to parse for snapshotting: {e}"));
 

@@ -16,12 +16,21 @@ use lumen_host::{ops, CompletionSender, Ctx, OpDecl, TaskId, TaskRegistry, Value
 
 /// A readable child stream (stdout or stderr), boxed to a common type.
 type ReadStream = Arc<Mutex<Option<Box<dyn Read + Send>>>>;
+type WriteStream = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+/// The parent's end of an extra stdio slot (`stdio[3]` and up): a socketpair, so it is duplex
+/// like Node's, split into the two halves the read/write worker threads lock separately.
+struct ExtraPipe {
+    reader: ReadStream,
+    writer: WriteStream,
+}
 
 struct ChildProc {
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdout: ReadStream,
     stderr: ReadStream,
+    extra: HashMap<u32, ExtraPipe>,
     /// `child.unref()` was called — its pending reads/waits must not keep the loop alive.
     unref: bool,
     /// Task ids of this child's in-flight reads/waits, so `unref()` can retroactively mark the
@@ -44,6 +53,8 @@ pub const CHILD_OPS: &[OpDecl] = ops![
     "ref" (1) => op_ref,
     "kill" (2) => op_kill,
     "closeStdin" (1) => op_close_stdin,
+    "writeFd" (5) => op_write_fd,
+    "closeFd" (2) => op_close_fd,
     "execSync" (4) => op_exec_sync,
 ];
 
@@ -90,7 +101,7 @@ fn build_command(
     ctx: &mut Ctx,
     cmd: &str,
     args: &[Value],
-) -> Result<(Command, [String; 3]), Value> {
+) -> Result<(Command, Vec<String>), Value> {
     let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
     let cwd = opt_string(ctx, args.get(2));
     let env_pairs = args.get(3).cloned().unwrap_or(Value::Undefined);
@@ -118,8 +129,73 @@ fn build_command(
             }
         }
     }
-    let s = |i: usize| stdio.get(i).cloned().unwrap_or_else(|| "pipe".to_string());
-    Ok((command, [s(0), s(1), s(2)]))
+    let mut stdio = stdio;
+    while stdio.len() < 3 {
+        stdio.push("pipe".to_string());
+    }
+    Ok((command, stdio))
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn dup2(src: std::os::raw::c_int, dst: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+/// Wire `stdio[3..]` slots marked `"pipe"` (a browser's `--remote-debugging-pipe` talks on fds
+/// 3 and 4): each gets a socketpair whose child end is `dup2`'d onto its fd number after the
+/// fork. Both ends are CLOEXEC, so the child sees only the numbered fd and the parent's end is
+/// not leaked into it. Returns the parent halves keyed by fd.
+#[cfg(unix)]
+fn wire_extra_stdio(command: &mut Command, stdio: &[String]) -> std::io::Result<HashMap<u32, ExtraPipe>> {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+
+    let mut extra = HashMap::new();
+    let mut child_ends = Vec::new();
+    for (fd, kind) in stdio.iter().enumerate().skip(3) {
+        if kind != "pipe" {
+            continue;
+        }
+        let (parent, child) = UnixStream::pair()?;
+        let reader: Box<dyn Read + Send> = Box::new(parent.try_clone()?);
+        let writer: Box<dyn Write + Send> = Box::new(parent);
+        extra.insert(
+            fd as u32,
+            ExtraPipe {
+                reader: Arc::new(Mutex::new(Some(reader))),
+                writer: Arc::new(Mutex::new(Some(writer))),
+            },
+        );
+        child_ends.push((child, fd as std::os::raw::c_int));
+    }
+    if !child_ends.is_empty() {
+        // SAFETY: runs in the forked child before exec; dup2 is async-signal-safe and the
+        // sockets it renumbers are kept alive by the closure until exec replaces the image.
+        unsafe {
+            command.pre_exec(move || {
+                for (sock, fd) in &child_ends {
+                    if dup2(sock.as_raw_fd(), *fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    Ok(extra)
+}
+
+#[cfg(not(unix))]
+fn wire_extra_stdio(_command: &mut Command, stdio: &[String]) -> std::io::Result<HashMap<u32, ExtraPipe>> {
+    if stdio.iter().skip(3).any(|k| k == "pipe") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "extra stdio pipes (stdio[3] and up) are only supported on unix",
+        ));
+    }
+    Ok(HashMap::new())
 }
 
 // ---- ops --------------------------------------------------------------------------------------
@@ -134,6 +210,8 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .stdin(stdio_for(&stdio[0]))
         .stdout(stdio_for(&stdio[1]))
         .stderr(stdio_for(&stdio[2]));
+    let extra = wire_extra_stdio(&mut command, &stdio)
+        .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
 
     let mut child = command
         .spawn()
@@ -145,6 +223,7 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         stdin: Arc::new(Mutex::new(child.stdin.take())),
         stdout: Arc::new(Mutex::new(stdout)),
         stderr: Arc::new(Mutex::new(stderr)),
+        extra,
         child: Arc::new(Mutex::new(child)),
         unref: false,
         pending_tasks: Vec::new(),
@@ -183,8 +262,8 @@ fn completions(ctx: &mut Ctx) -> CompletionSender {
         .clone()
 }
 
-/// `(childId, which, resolve, reject)` — read a chunk from stdout (which=1) or stderr (which=2).
-/// Resolves with a Uint8Array, or `null` at EOF.
+/// `(childId, which, resolve, reject)` — read a chunk from stdout (which=1), stderr (which=2) or
+/// an extra stdio pipe (which=3+). Resolves with a Uint8Array, or `null` at EOF.
 fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0) as u32;
@@ -193,15 +272,15 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let (handle, unref) = ctx
         .host_mut::<ChildRegistry>()
         .and_then(|r| r.procs.get(&child_id))
-        .map(|p| {
-            let h = if which == 2 {
-                p.stderr.clone()
-            } else {
-                p.stdout.clone()
+        .and_then(|p| {
+            let h = match which {
+                2 => p.stderr.clone(),
+                3.. => p.extra.get(&which)?.reader.clone(),
+                _ => p.stdout.clone(),
             };
-            (h, p.unref)
+            Some((h, p.unref))
         })
-        .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
+        .ok_or_else(|| ctx.make_error("Error", "child: unknown process or stdio slot"))?;
 
     let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
     let id = reg.register(resolve, Some(reject), decode_read);
@@ -285,7 +364,8 @@ fn decode_ok(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Ve
     }
 }
 
-/// `(childId, resolve, reject)` — wait for exit; resolves with the exit code (or null if signaled).
+/// `(childId, resolve, reject)` — wait for exit; resolves with `[code, signal]`: the exit code
+/// and `null`, or `null` and the terminating signal number.
 fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
@@ -304,10 +384,10 @@ fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     completions(ctx).run_blocking(id, move || {
         // Poll try_wait(), releasing the child lock between checks, so `kill()` can acquire it (a
         // blocking wait() would hold the lock for the child's whole life and deadlock kill).
-        let result: Result<Option<i32>, String> = loop {
+        let result: Result<(Option<i32>, Option<i32>), String> = loop {
             {
                 match handle.lock().expect("child lock").try_wait() {
-                    Ok(Some(status)) => break Ok(status.code()),
+                    Ok(Some(status)) => break Ok((status.code(), exit_signal(&status))),
                     Ok(None) => {}
                     Err(e) => break Err(e.to_string()),
                 }
@@ -321,13 +401,26 @@ fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 
 fn decode_exit(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
     match *payload
-        .downcast::<Result<Option<i32>, String>>()
+        .downcast::<Result<(Option<i32>, Option<i32>), String>>()
         .expect("exit payload")
     {
-        Ok(Some(code)) => Ok(vec![Value::Num(code as f64)]),
-        Ok(None) => Ok(vec![Value::Null]), // terminated by signal
+        Ok((code, signal)) => {
+            let num = |n: Option<i32>| n.map_or(Value::Null, |n| Value::Num(n as f64));
+            Ok(vec![ctx.make_array(vec![num(code), num(signal)])])
+        }
         Err(e) => Err(ctx.make_error("Error", e)),
     }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 /// Remember a child's in-flight task so `unref()` can mark it later (see [`ChildProc::pending_tasks`]).
@@ -377,14 +470,86 @@ fn op_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
+/// `(childId, fd, bytes, resolve, reject)` — write to an extra stdio pipe (fd 3+).
+fn op_write_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
+    let fd = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
+    let data = ctx
+        .typed_array_bytes(args.get(2).unwrap_or(&Value::Undefined))
+        .ok_or_else(|| ctx.make_error("TypeError", "child write expects bytes"))?;
+    let (resolve, reject) = take_resolve_reject(ctx, args.get(3), args.get(4))?;
+
+    let handle = ctx
+        .host_mut::<ChildRegistry>()
+        .and_then(|r| r.procs.get(&child_id))
+        .and_then(|p| p.extra.get(&fd))
+        .map(|e| e.writer.clone())
+        .ok_or_else(|| ctx.make_error("Error", "child: unknown process or stdio slot"))?;
+
+    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+        resolve,
+        Some(reject),
+        decode_ok,
+    );
+    completions(ctx).run_blocking(id, move || {
+        let mut guard = handle.lock().expect("pipe lock");
+        let result: Result<(), String> = match guard.as_mut() {
+            Some(w) => w
+                .write_all(&data)
+                .and_then(|()| w.flush())
+                .map_err(|e| format!("write: {e}")),
+            None => Err("child pipe is closed".to_string()),
+        };
+        Box::new(result)
+    });
+    Ok(Value::Undefined)
+}
+
+/// `(childId, fd)` — close the parent's write half of an extra stdio pipe (EOF to the child).
+fn op_close_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
+    let fd = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
+    if let Some(e) = ctx
+        .host_mut::<ChildRegistry>()
+        .and_then(|r| r.procs.get(&child_id))
+        .and_then(|p| p.extra.get(&fd))
+    {
+        e.writer.lock().expect("pipe lock").take();
+    }
+    Ok(Value::Undefined)
+}
+
+/// `(childId, signal)` — `signal` is the numeric signal (0 means the default, SIGTERM). On unix
+/// any signal is delivered with kill(2); elsewhere every signal is a hard kill.
 fn op_kill(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
+    let signal = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as i32;
     let killed = ctx
         .host_mut::<ChildRegistry>()
         .and_then(|r| r.procs.get(&child_id))
-        .map(|p| p.child.lock().expect("child lock").kill().is_ok())
+        .map(|p| send_signal(&p.child, signal))
         .unwrap_or(false);
     Ok(Value::Bool(killed))
+}
+
+#[cfg(unix)]
+fn send_signal(child: &Arc<Mutex<Child>>, signal: i32) -> bool {
+    let mut child = child.lock().expect("child lock");
+    if signal == 9 {
+        return child.kill().is_ok();
+    }
+    // A reaped child has no pid to signal; `try_wait` also keeps us from signalling a recycled one.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return false;
+    }
+    let sig = if signal == 0 { 15 } else { signal };
+    // SAFETY: plain syscall on a pid this process spawned and has not reaped.
+    unsafe { kill(child.id() as std::os::raw::c_int, sig) == 0 }
+}
+
+#[cfg(not(unix))]
+fn send_signal(child: &Arc<Mutex<Child>>, _signal: i32) -> bool {
+    child.lock().expect("child lock").kill().is_ok()
 }
 
 fn op_close_stdin(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {

@@ -8,7 +8,9 @@
 
 const path = __builtins.get("path");
 const CORE = new Set([...__builtins.keys()]);
-const cache = new Map(); // resolved filename -> module
+// resolved filename -> module. A plain null-prototype object, exposed live as `require.cache`
+// and `Module._cache`, so `delete require.cache[file]` forces the next require to re-run it.
+const cache = Object.create(null);
 
 const EXTENSIONS = [".js", ".json", ".cjs", ".ts", ".cts", ".node"];
 
@@ -104,9 +106,8 @@ function defaultResolveFilename(specifier, fromDir) {
 // steps, LIFO like Node's (the most recently registered hook runs first; nextResolve/nextLoad
 // walks toward the default). Hooks speak URLs — file:// for files, node: for builtins — so the
 // default steps translate to/from the path-based machinery above. Scope, honestly: this covers
-// the CommonJS require() path (resolve + load, including require.resolve and Module._load).
-// ESM `import` of files is resolved/loaded by the runtime's native loader and does NOT consult
-// these hooks (wiring that up needs loader changes in Rust, not glue).
+// the CommonJS require() path (resolve + load, including require.resolve and Module._load) and,
+// through `esmHook` below, ESM `import` — the native loader consults the chains first.
 const __registeredHooks = []; // registration order; chains are built newest-outermost
 
 // Minimal path <-> file URL translation (symmetric; percent-encodes only what breaks a URL).
@@ -190,6 +191,44 @@ function resolveFilename(specifier, fromDir, parentFilename) {
   );
 }
 
+// ESM imports: the engine asks here before its native resolver whenever hooks are registered
+// (`__lumenEsmHook`, see `Interp::fetch_module`). The chains run exactly as for require(), with
+// a default step that hands the decision back to the native loader: a hook that defers on both
+// resolve and load answers `undefined`, one that redirects to a file answers `{ specifier }`,
+// and one that short-circuits both with a module answers `{ key, source }`.
+function esmHook(specifier, referrer, attrType) {
+  if (!hasHook("resolve") && !hasHook("load")) return undefined;
+  const parentURL = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(referrer) ? referrer : pathToFileUrl(referrer);
+  const importAttributes = attrType ? { type: attrType } : {};
+  const conditions = ["import", "node", "default"];
+  let nativeResolve = false;
+  const resolved = chainHooks("resolve", (spec) => {
+    nativeResolve = true;
+    return { url: String(spec), shortCircuit: true };
+  })(String(specifier), { conditions, importAttributes, parentURL });
+  const url = String(resolved.url);
+  let nativeLoad = false;
+  const loaded = chainHooks("load", (u) => {
+    nativeLoad = true;
+    return { format: resolved.format, source: null, shortCircuit: true };
+  })(url, { conditions, format: resolved.format, importAttributes });
+  if (nativeLoad) {
+    if (nativeResolve) return undefined;
+    if (url.startsWith("node:") || isBuiltin(url)) return { specifier: url };
+    if (url.startsWith("file://")) return { specifier: fileUrlToPath(url) };
+    throw new Error(`registerHooks: resolve returned '${url}', which no load hook answered and the runtime cannot load`);
+  }
+  if (loaded.format !== "module") {
+    throw new Error(`registerHooks: load format '${loaded.format}' is not supported for import in lumen (module is)`);
+  }
+  const source = loaded.source;
+  return {
+    key: nativeResolve ? pathToFileUrl(defaultResolveFilename(url, path.dirname(fileUrlToPath(parentURL)))) : url,
+    source: typeof source === "string" ? source : Buffer.from(source).toString("utf8"),
+  };
+}
+Object.defineProperty(globalThis, "__lumenEsmHook", { value: esmHook, writable: true, configurable: true, enumerable: false });
+
 // Compile CommonJS source into `module` via the wrapper — the shared back half of the `.js`
 // extension handler, split out so a registerHooks load hook can feed transformed source in.
 function compileCommonJS(module, filename, source) {
@@ -251,7 +290,7 @@ function loadModule(filename, parent) {
   if (filename.startsWith("node:")) {
     return { exports: __builtins.get(filename.slice(5)), filename, loaded: true };
   }
-  const cached = cache.get(filename);
+  const cached = cache[filename];
   if (cached) return cached;
 
   const module = {
@@ -263,7 +302,7 @@ function loadModule(filename, parent) {
     children: [],
     paths: [],
   };
-  cache.set(filename, module);
+  cache[filename] = module;
   if (parent) parent.children.push(module);
 
   // registerHooks load chain first (it can rewrite the source); otherwise — and for results the
@@ -282,21 +321,17 @@ function loadModule(filename, parent) {
 function makeRequire(fromDir, parentModule) {
   const parentFilename = parentModule && typeof parentModule.filename === "string" ? parentModule.filename : undefined;
   const require = function (specifier) {
-    const filename = resolveFilename(String(specifier), fromDir, parentFilename);
-    return loadModule(filename, parentModule).exports;
+    // Like Node, every require() goes through the *current* `Module._load`, so a host that
+    // replaces it (the VS Code extension host does, to serve `require("vscode")`) intercepts
+    // loads from modules it did not create. The default `_load` resolves against the parent's
+    // directory; a parentless require (createRequire, the REPL) carries its own base directory.
+    return Module._load(String(specifier), parentModule ?? { path: fromDir }, false);
   };
   // Node v22.16 quirk, mirrored deliberately: require.resolve() does NOT consult registerHooks
   // (only actual loads do) — verified against `node -e`.
   require.resolve = (specifier) => defaultResolveFilename(String(specifier), fromDir);
-  require.cache = Object.create(null);
+  require.cache = cache;
   require.main = mainModule;
-  Object.defineProperty(require, "cache", {
-    get() {
-      const obj = Object.create(null);
-      for (const [k, v] of cache) obj[k] = v;
-      return obj;
-    },
-  });
   return require;
 }
 
@@ -315,7 +350,7 @@ function runMain(filename) {
     paths: [],
   };
   mainModule = module;
-  cache.set(resolved, module);
+  cache[resolved] = module;
   const ext = path.extname(resolved);
   const handler = Module._extensions[ext] || Module._extensions[".js"];
   handler(module, resolved);
@@ -442,8 +477,9 @@ function _resolveFilename(request, parent) {
 
 // Module._load(request, parent, isMain): resolve then load, returning the module's exports.
 function _load(request, parent, isMain) {
-  const filename = resolveFilename(String(request), parentDir(parent));
-  const mod = loadModule(filename, parent);
+  const parentFilename = parent && typeof parent.filename === "string" ? parent.filename : undefined;
+  const filename = resolveFilename(String(request), parentDir(parent), parentFilename);
+  const mod = loadModule(filename, parent && typeof parent.filename === "string" ? parent : null);
   if (isMain) mainModule = mod;
   return mod.exports;
 }
@@ -546,7 +582,6 @@ function flushCompileCache() {}
 
 // registerHooks({ resolve, load }) — Node's SYNC module customization hooks, wired into the
 // resolve/load funnels above (see the "__registeredHooks" section). Returns { deregister }.
-// Covers CommonJS require(); ESM file imports go through the native loader and are not hooked.
 function registerHooks(hooks) {
   if (hooks == null || typeof hooks !== "object") {
     throw new TypeError(`Cannot destructure property 'resolve' of 'hooks' as it is ${hooks === null ? "null" : typeof hooks}.`);
@@ -609,16 +644,9 @@ Module._resolveLookupPaths = _resolveLookupPaths;
 Module._load = _load;
 Module._initPaths = function () {};
 Module._preloadModules = function () {};
-// _cache mirrors the live require cache; globalPaths is computed on access because process.env is
+// _cache is the live require cache; globalPaths is computed on access because process.env is
 // populated by the runtime *after* this glue runs (so reading HOME eagerly here would miss it).
-Object.defineProperty(Module, "_cache", {
-  enumerable: true,
-  get() {
-    const obj = Object.create(null);
-    for (const [k, v] of cache) obj[k] = v;
-    return obj;
-  },
-});
+Module._cache = cache;
 Object.defineProperty(Module, "globalPaths", {
   enumerable: true,
   get() {

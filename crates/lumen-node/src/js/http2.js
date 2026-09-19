@@ -213,6 +213,9 @@ class ClientHttp2Session extends EventEmitter {
   }
 
   _sendData(streamId, bytes, endStream, callback) {
+    // Like the HEADERS frame, DATA queued before the connection is up (a request ended in the
+    // same tick it was made) waits behind the preface and SETTINGS.
+    if (this.connecting) { this._pending.push(() => this._sendData(streamId, bytes, endStream, callback)); return; }
     const max = this.remoteSettings.maxFrameSize || 16384;
     let offset = 0;
     do {

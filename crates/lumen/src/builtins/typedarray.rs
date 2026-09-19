@@ -228,7 +228,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
         v => {
             let n = ab(i.to_number(&v))?;
             let n = if n.is_nan() { 0.0 } else { n.trunc() };
-            if n < 0.0 || !n.is_finite() || n as usize > MAX_ARRAY_OP_LEN {
+            if n < 0.0 || !n.is_finite() || n as usize > MAX_BUFFER_BYTES {
                 return Err(i.make_error("RangeError", "invalid transfer length"));
             }
             Some(n as usize)
@@ -1454,14 +1454,49 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         // a Symbol/BigInt → TypeError via ToNumber.
         Some(v) if !matches!(v, Value::Obj(_)) => {
             let len = to_index(i, v)?;
-            if len > MAX_ARRAY_OP_LEN {
+            // A fresh typed array is one flat allocation, so the byte ceiling is the bound —
+            // not the element cap that guards Value-per-element arrays. `Buffer.alloc(2 MiB)`
+            // is ordinary Node.
+            if len.saturating_mul(es) > MAX_BUFFER_BYTES {
                 return Err(i.make_error("RangeError", "Invalid typed array length"));
             }
             let (bv, bp) = make_array_buffer(i, len * es);
             (bv, bp, 0, len, false)
         }
+        // InitializeTypedArrayFromTypedArray: a source typed array is copied element by element
+        // (bytewise when the element types match), never through its iterator — which also keeps
+        // a multi-megabyte `new Uint8Array(bytes)` clear of the per-element iteration cap.
+        Some(other)
+            if let Some(src) = map_ptr(other).and_then(|p| i.typed_arrays.get(&p).copied()) =>
+        {
+            let len = i
+                .ta_len(&src)
+                .ok_or_else(|| i.make_error("TypeError", "source typed array is detached"))?;
+            if len.saturating_mul(es) > MAX_BUFFER_BYTES {
+                return Err(i.make_error("RangeError", "Invalid typed array length"));
+            }
+            let (bv, bp) = make_array_buffer(i, len * es);
+            let info = TaInfo {
+                buffer: bp,
+                offset: 0,
+                len,
+                kind,
+                track: false,
+            };
+            if src.kind == kind {
+                if let Some(bytes) = i.ta_read_bytes(&src, 0, len) {
+                    i.ta_write_bytes(&info, 0, &bytes);
+                }
+            } else {
+                for idx in 0..len {
+                    let v = i.ta_read(&src, idx);
+                    ab(i.ta_store(&info, idx, &v))?;
+                }
+            }
+            (bv, bp, 0, len, false)
+        }
         Some(other) => {
-            // TypedArray / array-like / iterable object: copy element values into a fresh buffer.
+            // Array-like / iterable object: copy element values into a fresh buffer.
             // GetMethod(@@iterator): a non-callable non-nullish value is a TypeError, and a
             // callable one is used (so a patched Array.prototype[@@iterator] is honored).
             let iter_key = well_known_key(i, "iterator");

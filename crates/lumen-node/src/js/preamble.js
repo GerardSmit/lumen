@@ -17,6 +17,35 @@ delete globalThis.__ffi;
 delete globalThis.__crypto;
 delete globalThis.__password;
 
+// Async context: an opaque value the engine carries along promise reactions (captured at
+// `then`/`await`, restored around the handler). Everything else that defers a callback — timers,
+// nextTick, setImmediate — binds the context at scheduling time with this helper, and
+// `AsyncLocalStorage` (shims.js) keys its stores off the value. A frame is an immutable Map
+// from storage to store; `undefined` is the empty context, which is also what a fresh loop
+// turn (an I/O completion) runs in.
+const __asyncContextGet = __node.asyncContextGet;
+const __asyncContextSet = __node.asyncContextSet;
+function __bindAsyncContext(fn) {
+  const context = __asyncContextGet();
+  if (context === undefined) return fn;
+  return function boundWithAsyncContext(...args) {
+    const previous = __asyncContextSet(context);
+    try {
+      return fn.apply(this, args);
+    } finally {
+      __asyncContextSet(previous);
+    }
+  };
+}
+function __runInAsyncContext(context, fn, thisArg, args) {
+  const previous = __asyncContextSet(context);
+  try {
+    return Reflect.apply(fn, thisArg, args);
+  } finally {
+    __asyncContextSet(previous);
+  }
+}
+
 // Node's `global` is an alias for the global object.
 if (typeof globalThis.global === "undefined") {
   globalThis.global = globalThis;

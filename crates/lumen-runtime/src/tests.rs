@@ -137,17 +137,43 @@ fn timer_args_pass_through_and_nested_timers_work() {
 }
 
 #[test]
-fn uncaught_callback_error_reports_and_loop_survives() {
+fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
+    // Node: an exception nobody catches ends the process with code 1 — later timers never run,
+    // 'exit' fires (no 'beforeExit'), and the error is printed.
     let (mut rt, out, err) = test_runtime();
     eval_ok(
         &mut rt,
         r#"
+        process.on("beforeExit", () => console.log("beforeExit must not run"));
+        process.on("exit", (code) => console.log("exit", code));
         setTimeout(() => { throw new TypeError("boom") }, 5);
-        setTimeout(() => console.log("still running"), 10);
+        setTimeout(() => console.log("must not run"), 10);
         "#,
     );
-    assert_eq!(out.lines(), ["still running"]);
+    assert_eq!(rt.fatal_exit_code(), Some(1));
+    assert_eq!(rt.finish_process(), 1);
+    assert_eq!(out.lines(), ["exit 1"]);
     assert_eq!(err.lines(), ["Uncaught TypeError: boom"]);
+
+    // A 'uncaughtException' listener owns the error and the loop carries on; an unhandled
+    // rejection with no 'unhandledRejection' listener is raised through the same hook.
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        process.on("uncaughtException", (e, origin) => console.log("caught", e.message, origin));
+        setTimeout(() => { throw new TypeError("boom") }, 5);
+        setTimeout(() => console.log("still running"), 10);
+        Promise.reject(new Error("rejected"));
+        "#,
+    );
+    assert_eq!(rt.fatal_exit_code(), None);
+    assert_eq!(rt.finish_process(), 0);
+    assert_eq!(
+        out.lines(),
+        ["caught rejected unhandledRejection", "caught boom uncaughtException", "still running"]
+    );
+    assert_eq!(err.lines(), Vec::<String>::new());
 }
 
 #[test]

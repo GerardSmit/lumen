@@ -191,7 +191,9 @@ class Socket extends Duplex {
   constructor(options = {}) {
     if (options === null || typeof options !== "object") options = {};
     if (options.fd !== undefined) fdNotSupported("new Socket({ fd })");
-    super({});
+    // The socket closes itself in _maybeClose once both directions are done (it also owns the
+    // native handle), so the generic autoDestroy would only race it.
+    super({ autoDestroy: false });
     this._id = null;
     this.connecting = false;
     this.pending = true;
@@ -286,6 +288,16 @@ class Socket extends Duplex {
   }
 
   _write(chunk, encoding, cb) {
+    // Node buffers writes issued while the socket is still connecting and flushes them on
+    // 'connect' (an http2 preface, a client's first request); a failed connect destroys the
+    // socket, which fails the pending write.
+    if (this.connecting) {
+      const onConnect = () => { this.off("close", onClose); this._write(chunk, encoding, cb); };
+      const onClose = () => { this.off("connect", onConnect); cb(this._writableState.errored || new Error("This socket has been ended by the other party")); };
+      this.once("connect", onConnect);
+      this.once("close", onClose);
+      return;
+    }
     if (this._id === null) {
       cb(new Error("This socket has been ended by the other party"));
       return;

@@ -7,7 +7,8 @@ use std::io::{Read, Write};
 use std::time::Instant;
 
 use lumen_host::{
-    ops, CallbackQueue, CompletionSender, Ctx, Engine, Extension, OpState, TaskRegistry, Value,
+    ops, CallbackQueue, CompletionSender, Ctx, Engine, Extension, OpState, TaskId, TaskRegistry,
+    Value,
 };
 
 use crate::console::ConsoleOut;
@@ -36,6 +37,7 @@ pub(crate) fn extension() -> Extension {
                     "writeStdout" (1) => op_write_stdout,
                     "writeStderr" (1) => op_write_stderr,
                     "readStdin" (2) => op_read_stdin,
+                    "stdinRef" (2) => op_stdin_ref,
                     "hrtime" (0) => op_hrtime,
                     "chdir" (1) => op_chdir,
                     "abort" (0) => op_abort,
@@ -70,14 +72,32 @@ pub(crate) fn extension() -> Extension {
 const JS_INIT: &str = r#"(() => {
   const proc = globalThis.__proc;
   const readStdin = proc.readStdin;
+  const stdinRef = proc.stdinRef;
   const rawExecve = proc.execve;
   const metrics = proc.metrics;
   delete globalThis.__proc;
   const process = globalThis.process;
 
+  // Node's `write(chunk[, encoding][, callback])` / `end([chunk][, encoding][, callback])`: the
+  // raw op writes synchronously, so the callback runs on the next tick with the write done.
+  const writeArgs = (chunk, encoding, callback) => {
+    if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+    if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
+    return [chunk, callback];
+  };
   const makeStream = (writeFn, fd) => ({
-    write(chunk) { writeFn(chunk); return true; },
-    end(chunk) { if (chunk != null) writeFn(chunk); return this; },
+    write(chunk, encoding, callback) {
+      const [data, cb] = writeArgs(chunk, encoding, callback);
+      if (data != null) writeFn(data);
+      if (cb) queueMicrotask(() => cb());
+      return true;
+    },
+    end(chunk, encoding, callback) {
+      const [data, cb] = writeArgs(chunk, encoding, callback);
+      if (data != null) writeFn(data);
+      if (cb) queueMicrotask(() => cb());
+      return this;
+    },
     isTTY: false,
     fd,
     columns: 80,
@@ -92,6 +112,7 @@ const JS_INIT: &str = r#"(() => {
   Object.defineProperty(process, "stdout", { value: makeStream(proc.writeStdout, 1), enumerable: true, configurable: true });
   Object.defineProperty(process, "stderr", { value: makeStream(proc.writeStderr, 2), enumerable: true, configurable: true });
   Object.defineProperty(process, "_readStdin", { value: readStdin, configurable: true });
+  Object.defineProperty(process, "_stdinRef", { value: stdinRef, configurable: true });
   Object.defineProperty(process, "_nativeMetrics", { value: metrics, configurable: true });
 
   const raw = proc.hrtime;
@@ -255,6 +276,25 @@ fn op_read_stdin(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
             .map_err(|e| format!("stdin read: {e}"));
         Box::new(result)
     });
+    Ok(Value::Num(id as f64))
+}
+
+/// `(taskId, ref)` — whether the pending stdin read returned by `readStdin` keeps the loop alive.
+/// A paused or destroyed `process.stdin` must not: the OS read cannot be cancelled, so it stays
+/// pending until the pipe closes, and Node's semantics (a paused stdin lets the process exit) are
+/// recovered by unref'ing it.
+fn op_stdin_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = match args.first() {
+        Some(Value::Num(n)) => *n as TaskId,
+        _ => return Ok(Value::Undefined),
+    };
+    let keep = args.get(1).map(|v| ctx.to_boolean(v)).unwrap_or(true);
+    let reg = ctx.host_mut::<TaskRegistry>().expect("runtime installs task registry");
+    if keep {
+        reg.set_ref(id);
+    } else {
+        reg.set_unref(id);
+    }
     Ok(Value::Undefined)
 }
 

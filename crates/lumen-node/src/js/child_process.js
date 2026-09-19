@@ -7,17 +7,34 @@
 const EventEmitter = __builtins.get("events");
 const IPC_PREFIX = "\x1eLUMEN_IPC ";
 
-// Normalize the stdio option to a 3-tuple of "pipe" | "inherit" | "ignore".
+// Normalize the stdio option to a list of "pipe" | "inherit" | "ignore" — three entries for the
+// standard fds, plus one per extra slot (`stdio[3]`...), which only "pipe" and "ignore" support.
 function normalizeStdio(stdio) {
   if (stdio === "inherit") return ["inherit", "inherit", "inherit"];
   if (stdio === "ignore") return ["ignore", "ignore", "ignore"];
   if (Array.isArray(stdio)) {
-    return [0, 1, 2].map((i) => {
+    const out = [];
+    for (let i = 0; i < Math.max(3, stdio.length); i++) {
       const v = stdio[i];
-      return v === "inherit" || v === "ignore" ? v : "pipe";
-    });
+      out.push(i >= 3 ? (v === "pipe" ? "pipe" : "ignore") : v === "inherit" || v === "ignore" ? v : "pipe");
+    }
+    return out;
   }
   return ["pipe", "pipe", "pipe"];
+}
+
+const SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGABRT: 6, SIGKILL: 9, SIGUSR1: 10, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15 };
+const SIGNAL_NAMES = Object.fromEntries(Object.entries(SIGNALS).map(([name, n]) => [n, name]));
+function signalNumber(signal) {
+  if (signal === undefined || signal === null) return 0;
+  if (typeof signal === "number") return signal;
+  const n = SIGNALS[String(signal)];
+  if (n === undefined) {
+    const err = new TypeError(`Unknown signal: ${signal}`);
+    err.code = "ERR_UNKNOWN_SIGNAL";
+    throw err;
+  }
+  return n;
 }
 
 // env object -> array of [key, value] pairs (or undefined to inherit).
@@ -78,6 +95,29 @@ function makeWritable(childId) {
   });
 }
 
+// An extra stdio slot is duplex (a socketpair, as in Node): reads pump like stdout, writes go
+// to the same fd.
+function makeExtraPipe(childId, fd) {
+  const { Duplex } = __builtins.get("stream");
+  const readable = makeReadable(childId, fd);
+  const pipe = new Duplex({
+    read() {},
+    write(chunk, enc, cb) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, typeof enc === "string" ? enc : "utf8");
+      __child.writeFd(childId, fd, bytes, () => cb(), (e) => cb(e));
+    },
+    final(cb) {
+      __child.closeFd(childId, fd);
+      cb();
+    },
+  });
+  readable.on("data", (chunk) => pipe.push(chunk));
+  // Like a non-allowHalfOpen net.Socket: the child closing its end ends ours, so 'close' follows.
+  readable.on("end", () => { pipe.push(null); if (!pipe.writableEnded) pipe.end(); });
+  readable.on("error", (e) => pipe.destroy(e));
+  return pipe;
+}
+
 class ChildProcess extends EventEmitter {
   constructor(childId, pid, stdio, onIpcMessage) {
     super();
@@ -90,21 +130,25 @@ class ChildProcess extends EventEmitter {
     this.stdout = stdio[1] === "pipe" ? makeReadable(childId, 1, onIpcMessage) : null;
     this.stderr = stdio[2] === "pipe" ? makeReadable(childId, 2) : null;
     this.stdio = [this.stdin, this.stdout, this.stderr];
+    for (let fd = 3; fd < stdio.length; fd++) this.stdio.push(stdio[fd] === "pipe" ? makeExtraPipe(childId, fd) : null);
     this.connected = typeof onIpcMessage === "function";
     queueMicrotask(() => this.emit("spawn"));
     new Promise((resolve, reject) => __child.wait(childId, resolve, reject)).then(
-      (code) => {
+      ([code, signalNumber]) => {
+        const signal = signalNumber === null ? null : SIGNAL_NAMES[signalNumber] ?? `SIG${signalNumber}`;
         this.exitCode = code;
-        this.emit("exit", code, null);
+        this.signalCode = signal;
+        this.emit("exit", code, signal);
         // 'close' should follow once stdio has flushed; a microtask is close enough here.
-        queueMicrotask(() => this.emit("close", code, null));
+        queueMicrotask(() => this.emit("close", code, signal));
       },
       (err) => this.emit("error", err),
     );
   }
   kill(signal) {
-    this.killed = true;
-    return __child.kill(this._id, typeof signal === "number" ? signal : 0);
+    const ok = __child.kill(this._id, signalNumber(signal));
+    if (ok) this.killed = true;
+    return ok;
   }
   ref() {
     __child.ref(this._id);

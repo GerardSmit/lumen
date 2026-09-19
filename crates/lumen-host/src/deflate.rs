@@ -213,37 +213,8 @@ fn inflate_block(
 pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut reader = BitReader::new(data);
     let mut out = Vec::new();
-    loop {
-        let final_block = reader.bit()?;
-        let btype = reader.bits(2)?;
-        match btype {
-            0 => {
-                reader.align_to_byte();
-                if reader.pos + 4 > data.len() {
-                    return Err("inflate: truncated stored block".into());
-                }
-                let len = data[reader.pos] as usize | ((data[reader.pos + 1] as usize) << 8);
-                reader.pos += 4; // LEN + NLEN
-                if reader.pos + len > data.len() {
-                    return Err("inflate: stored block overruns input".into());
-                }
-                out.extend_from_slice(&data[reader.pos..reader.pos + len]);
-                reader.pos += len;
-            }
-            1 => {
-                let (lit, dist) = fixed_huffman();
-                inflate_block(&mut reader, &mut out, &lit, &dist)?;
-            }
-            2 => {
-                let (lit, dist) = read_dynamic_tables(&mut reader)?;
-                inflate_block(&mut reader, &mut out, &lit, &dist)?;
-            }
-            _ => return Err("inflate: reserved block type".into()),
-        }
-        if final_block == 1 {
-            return Ok(out);
-        }
-    }
+    while !inflate_one_block(&mut reader, &mut out)? {}
+    Ok(out)
 }
 
 const CODE_LENGTH_ORDER: [usize; 19] = [
@@ -325,6 +296,14 @@ impl BitWriter {
         }
         self.write(reversed, n);
     }
+    /// Pad to the next byte boundary (the start of a stored block's LEN field).
+    fn align(&mut self) {
+        if self.bit_cnt > 0 {
+            self.out.push((self.bit_buf & 0xff) as u8);
+            self.bit_buf = 0;
+            self.bit_cnt = 0;
+        }
+    }
     fn finish(mut self) -> Vec<u8> {
         if self.bit_cnt > 0 {
             self.out.push((self.bit_buf & 0xff) as u8);
@@ -373,10 +352,20 @@ fn hash3(data: &[u8], i: usize) -> usize {
     (v.wrapping_mul(2654435761)) >> (32 - HASH_BITS) & (HASH_SIZE - 1)
 }
 
+const WINDOW_SIZE: usize = 32 * 1024;
+
 /// Encode raw DEFLATE: one fixed-Huffman block with greedy LZ77 (hash-chain match finder).
 pub fn deflate(data: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.write(1, 1); // BFINAL = 1 (single block)
+    deflate_block(&mut w, &[], data, true);
+    w.finish()
+}
+
+/// Append one fixed-Huffman block encoding `data` to `w`. Matches may reach back into
+/// `history` (the bytes the decoder already holds in its window), which is what lets a stream
+/// keep compressing across flushes with context takeover.
+fn deflate_block(w: &mut BitWriter, history: &[u8], data: &[u8], final_block: bool) {
+    w.write(final_block as u32, 1); // BFINAL
     w.write(1, 2); // BTYPE = 01 (fixed Huffman)
 
     let emit_literal = |w: &mut BitWriter, byte: u8| {
@@ -384,21 +373,32 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
         w.write_code(code, len);
     };
 
-    let n = data.len();
+    let history = &history[history.len().saturating_sub(WINDOW_SIZE)..];
+    let buf: Vec<u8> = [history, data].concat();
+    let n = buf.len();
+    let start = history.len();
     let mut head = vec![usize::MAX; HASH_SIZE];
     let mut prev = vec![usize::MAX; n.max(1)];
-    let mut i = 0;
+    let insert = |head: &mut Vec<usize>, prev: &mut Vec<usize>, j: usize| {
+        let h = hash3(&buf, j);
+        prev[j] = head[h];
+        head[h] = j;
+    };
+    for j in 0..start.saturating_sub(MIN_MATCH - 1) {
+        insert(&mut head, &mut prev, j);
+    }
+    let mut i = start;
     while i < n {
         let mut best_len = 0;
         let mut best_dist = 0;
         if i + MIN_MATCH <= n {
-            let h = hash3(data, i);
+            let h = hash3(&buf, i);
             let mut cand = head[h];
             let mut chain = 0;
-            while cand != usize::MAX && chain < 128 {
+            while cand != usize::MAX && chain < 128 && i - cand <= WINDOW_SIZE {
                 let max_len = (n - i).min(MAX_MATCH);
                 let mut len = 0;
-                while len < max_len && data[cand + len] == data[i + len] {
+                while len < max_len && buf[cand + len] == buf[i + len] {
                     len += 1;
                 }
                 if len > best_len {
@@ -431,21 +431,193 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
             let end = i + best_len;
             let mut j = i + 1;
             while j < end && j + MIN_MATCH <= n {
-                let h = hash3(data, j);
-                prev[j] = head[h];
-                head[h] = j;
+                insert(&mut head, &mut prev, j);
                 j += 1;
             }
             i = end;
         } else {
-            emit_literal(&mut w, data[i]);
+            emit_literal(w, buf[i]);
             i += 1;
         }
     }
     // End-of-block symbol (256).
     let (code, len) = fixed_lit_code(256);
     w.write_code(code, len);
-    w.finish()
+}
+
+// ---- streaming (node:zlib Deflate/Inflate objects) --------------------------------------------
+
+/// How a [`Deflater::flush`] ends the data written so far — the subset of zlib's flush modes
+/// that produce distinct output.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Flush {
+    /// Buffer only; nothing is emitted.
+    None,
+    /// Close the current block and append an empty stored block, so everything written so far
+    /// is decodable and the output ends on a byte boundary (`Z_SYNC_FLUSH` / `Z_FULL_FLUSH`).
+    Sync,
+    /// Emit the final block (`Z_FINISH`).
+    Finish,
+}
+
+/// Incremental raw-DEFLATE encoder: bytes accumulate across `write`s and are emitted as one
+/// fixed-Huffman block per flush. The last 32K of output stays as the match window, so a stream
+/// that is flushed per message (websocket permessage-deflate) still compresses across messages.
+#[derive(Default)]
+pub struct Deflater {
+    history: Vec<u8>,
+    pending: Vec<u8>,
+    finished: bool,
+}
+
+impl Deflater {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn write(&mut self, data: &[u8]) {
+        self.pending.extend_from_slice(data);
+    }
+
+    pub fn flush(&mut self, mode: Flush) -> Result<Vec<u8>, String> {
+        if self.finished {
+            return Err("deflate: stream already finished".into());
+        }
+        if mode == Flush::None {
+            return Ok(Vec::new());
+        }
+        let mut w = BitWriter::new();
+        let pending = std::mem::take(&mut self.pending);
+        let finish = mode == Flush::Finish;
+        if !pending.is_empty() || finish {
+            deflate_block(&mut w, &self.history, &pending, finish);
+        }
+        if !finish {
+            // Empty stored block: BFINAL=0, BTYPE=00, pad to a byte, LEN=0, NLEN=0xffff.
+            w.write(0, 3);
+            w.align();
+            w.out.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+        }
+        self.history.extend_from_slice(&pending);
+        if self.history.len() > WINDOW_SIZE {
+            self.history.drain(..self.history.len() - WINDOW_SIZE);
+        }
+        self.finished = finish;
+        Ok(w.finish())
+    }
+
+    /// Forget the window (`zlib.reset()`): the next block cannot reference earlier output.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Incremental raw-DEFLATE decoder. Input may arrive at any boundary: a block that runs past the
+/// bytes seen so far is retried from its start when more input arrives, and the last 32K of
+/// output is kept so back-references across writes (and across messages, with context takeover)
+/// resolve.
+#[derive(Default)]
+pub struct Inflater {
+    window: Vec<u8>,
+    pending: Vec<u8>,
+    bit_buf: u32,
+    bit_cnt: u32,
+    finished: bool,
+}
+
+impl Inflater {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed bytes and return whatever became decodable. Once the final block has been decoded,
+    /// `finished()` reports true and further input is ignored.
+    pub fn write(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.pending.extend_from_slice(data);
+        let mut out = std::mem::take(&mut self.window);
+        let window_len = out.len();
+        let mut reader = BitReader::new(&self.pending);
+        reader.bit_buf = self.bit_buf;
+        reader.bit_cnt = self.bit_cnt;
+        loop {
+            let checkpoint = (reader.pos, reader.bit_buf, reader.bit_cnt, out.len());
+            match inflate_one_block(&mut reader, &mut out) {
+                Ok(final_block) => {
+                    if final_block {
+                        self.finished = true;
+                        break;
+                    }
+                }
+                Err(e) if e.contains("unexpected end of input")
+                    || e.contains("truncated")
+                    || e.contains("overruns input") =>
+                {
+                    (reader.pos, reader.bit_buf, reader.bit_cnt) =
+                        (checkpoint.0, checkpoint.1, checkpoint.2);
+                    out.truncate(checkpoint.3);
+                    break;
+                }
+                Err(e) => {
+                    self.window = out;
+                    return Err(e);
+                }
+            }
+        }
+        let (consumed, bit_buf, bit_cnt) = (reader.pos, reader.bit_buf, reader.bit_cnt);
+        self.pending.drain(..consumed);
+        self.bit_buf = bit_buf;
+        self.bit_cnt = bit_cnt;
+        let produced = out.split_off(window_len);
+        out.extend_from_slice(&produced);
+        if out.len() > WINDOW_SIZE {
+            out.drain(..out.len() - WINDOW_SIZE);
+        }
+        self.window = out;
+        Ok(produced)
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Decode one block from `reader` into `out`; returns whether it was the final block.
+fn inflate_one_block(reader: &mut BitReader, out: &mut Vec<u8>) -> Result<bool, String> {
+    let final_block = reader.bit()?;
+    let btype = reader.bits(2)?;
+    let data = reader.data;
+    match btype {
+        0 => {
+            reader.align_to_byte();
+            if reader.pos + 4 > data.len() {
+                return Err("inflate: truncated stored block".into());
+            }
+            let len = data[reader.pos] as usize | ((data[reader.pos + 1] as usize) << 8);
+            reader.pos += 4; // LEN + NLEN
+            if reader.pos + len > data.len() {
+                return Err("inflate: stored block overruns input".into());
+            }
+            out.extend_from_slice(&data[reader.pos..reader.pos + len]);
+            reader.pos += len;
+        }
+        1 => {
+            let (lit, dist) = fixed_huffman();
+            inflate_block(reader, out, &lit, &dist)?;
+        }
+        2 => {
+            let (lit, dist) = read_dynamic_tables(reader)?;
+            inflate_block(reader, out, &lit, &dist)?;
+        }
+        _ => return Err("inflate: reserved block type".into()),
+    }
+    Ok(final_block == 1)
 }
 
 // ---- zlib / gzip framing ----------------------------------------------------------------------
@@ -546,6 +718,60 @@ mod tests {
             compressed.len() < data.len() / 2,
             "expected real compression"
         );
+    }
+
+    #[test]
+    fn streaming_roundtrip_with_context_takeover() {
+        let messages: Vec<&[u8]> = vec![b"hello world", b"hello world again", b"", b"and hello world once more"];
+        let mut enc = Deflater::new();
+        let mut dec = Inflater::new();
+        for (i, m) in messages.iter().enumerate() {
+            enc.write(m);
+            let frame = enc.flush(Flush::Sync).unwrap();
+            assert_eq!(&frame[frame.len() - 4..], &[0, 0, 0xff, 0xff], "sync flush trailer");
+            // Feed byte by byte: every block boundary must survive an arbitrary split.
+            let mut got = Vec::new();
+            for b in &frame {
+                got.extend(dec.write(std::slice::from_ref(b)).unwrap());
+            }
+            assert_eq!(&got, m, "message {i}");
+            assert!(!dec.finished());
+        }
+        assert!(!enc.flush(Flush::Finish).unwrap().is_empty());
+        // The second message referenced the first: with the window, it is smaller than alone.
+        let mut lone = Deflater::new();
+        lone.write(messages[1]);
+        let lone_frame = lone.flush(Flush::Sync).unwrap();
+        let mut ctx = Deflater::new();
+        ctx.write(messages[0]);
+        ctx.flush(Flush::Sync).unwrap();
+        ctx.write(messages[1]);
+        assert!(ctx.flush(Flush::Sync).unwrap().len() < lone_frame.len());
+    }
+
+    #[test]
+    fn streaming_inflate_matches_one_shot_and_finishes() {
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(2000);
+        let compressed = deflate(text.as_bytes());
+        let mut dec = Inflater::new();
+        let mut got = Vec::new();
+        for chunk in compressed.chunks(7) {
+            got.extend(dec.write(chunk).unwrap());
+        }
+        assert!(dec.finished());
+        assert_eq!(got, text.as_bytes());
+        assert!(dec.write(b"ignored").unwrap().is_empty());
+        let mut enc = Deflater::new();
+        enc.write(text.as_bytes());
+        let out = enc.flush(Flush::Finish).unwrap();
+        assert_eq!(inflate(&out).unwrap(), text.as_bytes());
+        assert!(enc.flush(Flush::Sync).is_err());
+    }
+
+    #[test]
+    fn streaming_inflate_rejects_garbage() {
+        let mut dec = Inflater::new();
+        assert!(dec.write(&[0x07, 0xff, 0xff]).is_err()); // BTYPE = 11 is reserved
     }
 
     #[test]

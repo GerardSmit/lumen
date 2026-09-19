@@ -601,18 +601,58 @@ __builtins.set("tty", {
 });
 
 // ---- node:async_hooks -------------------------------------------------------------------------
-// A no-op AsyncResource / hook surface. lumen has no async-context tracking; on-finished/raw-body
-// use `AsyncResource.bind` only to preserve context we don't model, so binding is identity.
+// AsyncLocalStorage and AsyncResource over the engine's async context (see preamble.js): a
+// context is an immutable Map from storage to store, propagated along promise reactions by the
+// engine and bound into timers/nextTick by the glue. The async_hooks *hook* API (createHook,
+// executionAsyncId) stays a no-op surface: there is no async-id graph to report.
 {
   let nextId = 1;
   class AsyncResource {
-    constructor(type) { this.type = type; this._id = nextId++; }
-    runInAsyncScope(fn, thisArg, ...args) { return Reflect.apply(fn, thisArg, args); }
-    bind(fn) { return fn; }
+    constructor(type) {
+      this.type = type;
+      this._id = nextId++;
+      this._context = __asyncContextGet();
+    }
+    runInAsyncScope(fn, thisArg, ...args) { return __runInAsyncContext(this._context, fn, thisArg, args); }
+    bind(fn) {
+      const resource = this;
+      const bound = function (...args) { return resource.runInAsyncScope(fn, this, ...args); };
+      Object.defineProperty(bound, "asyncResource", { value: resource, enumerable: true, configurable: true, writable: true });
+      return bound;
+    }
     emitDestroy() { return this; }
     asyncId() { return this._id; }
     triggerAsyncId() { return 0; }
-    static bind(fn) { return fn; }
+    static bind(fn, type, thisArg) {
+      const bound = new AsyncResource(type ?? fn.name ?? "bound-anonymous-fn").bind(fn);
+      return thisArg === undefined ? bound : bound.bind(thisArg);
+    }
+  }
+  const withStore = (storage, store) => {
+    const next = new Map(__asyncContextGet());
+    next.set(storage, store);
+    return next;
+  };
+  class AsyncLocalStorage {
+    constructor() { this._enabled = true; }
+    run(store, cb, ...args) { return __runInAsyncContext(withStore(this, store), cb, undefined, args); }
+    getStore() {
+      if (!this._enabled) return undefined;
+      const context = __asyncContextGet();
+      return context === undefined ? undefined : context.get(this);
+    }
+    enterWith(store) { this._enabled = true; __asyncContextSet(withStore(this, store)); }
+    exit(cb, ...args) {
+      const next = new Map(__asyncContextGet());
+      next.delete(this);
+      return __runInAsyncContext(next.size === 0 ? undefined : next, cb, undefined, args);
+    }
+    disable() { this._enabled = false; }
+    static bind(fn) { return AsyncResource.bind(fn); }
+    static snapshot() {
+      const context = __asyncContextGet();
+      return (fn, ...args) => __runInAsyncContext(context, fn, undefined, args);
+    }
   }
   __builtins.set("async_hooks", {
     AsyncResource,
@@ -638,13 +678,7 @@ __builtins.set("tty", {
     triggerAsyncId: () => 0,
     executionAsyncResource: () => ({}),
     createHook: () => ({ enable() { return this; }, disable() { return this; } }),
-    AsyncLocalStorage: class AsyncLocalStorage {
-      run(store, cb, ...args) { const prev = this._store; this._store = store; try { return cb(...args); } finally { this._store = prev; } }
-      getStore() { return this._store; }
-      enterWith(store) { this._store = store; }
-      exit(cb, ...args) { const prev = this._store; this._store = undefined; try { return cb(...args); } finally { this._store = prev; } }
-      disable() { this._store = undefined; }
-    },
+    AsyncLocalStorage,
   });
 }
 
@@ -675,10 +709,16 @@ __builtins.set("tty", {
 
   const zlib = {};
 
-  // A Transform subclass that buffers input and (de)compresses it whole on flush (the codec is
-  // one-shot). `stream` (node:stream) is resolved lazily on first construction: shims.js loads
+  const Z_NO_FLUSH = 0;
+  const Z_FINISH = 4;
+
+  // A Transform subclass over a codec. Raw deflate/inflate (`streamKind` set) run on a real
+  // incremental codec — input may be split anywhere, `flush()` emits a sync-flushed block and
+  // the 32K window carries across flushes, which websocket permessage-deflate depends on. The
+  // framed codecs (gzip/zlib/brotli/zstd) are one-shot: they buffer input and (de)compress it
+  // whole on end. `stream` (node:stream) is resolved lazily on first construction: shims.js loads
   // before stream.js, so the class can't `extends Transform` until the user actually needs it.
-  const defineStreamClass = (className, syncFn) => {
+  const defineStreamClass = (className, syncFn, streamKind) => {
     Object.defineProperty(zlib, className, {
       enumerable: true,
       configurable: true,
@@ -688,18 +728,72 @@ __builtins.set("tty", {
           constructor(options) {
             super(options);
             this._chunks = [];
+            this._handle = streamKind ? __zlib.streamOpen(streamKind) : 0;
+            this._closed = false;
           }
           _transform(chunk, enc, next) {
-            this._chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc));
-            next();
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc);
+            if (!streamKind) {
+              this._chunks.push(buf);
+              return next();
+            }
+            if (this._closed) return next(new Error("zlib stream is closed"));
+            try {
+              const out = __zlib.streamWrite(this._handle, buf);
+              next(null, out.length ? Buffer.from(out) : null);
+            } catch (e) {
+              next(e);
+            }
           }
           _flush(done) {
             try {
-              this.push(syncFn(Buffer.concat(this._chunks)));
+              if (streamKind) {
+                if (streamKind === "deflate" && !this._closed) {
+                  const out = __zlib.streamFlush(this._handle, true);
+                  if (out.length) this.push(Buffer.from(out));
+                }
+              } else {
+                this.push(syncFn(Buffer.concat(this._chunks)));
+              }
               done();
             } catch (e) {
               done(e);
             }
+          }
+          // zlib.flush([kind], cb): runs once the queued writes have gone through; a deflater
+          // emits what it holds as a sync-flushed (or, for Z_FINISH, final) block first.
+          flush(kind, cb) {
+            if (typeof kind === "function") { cb = kind; kind = undefined; }
+            __builtins.get("stream")._afterWrites(this, () => {
+              if (streamKind === "deflate" && !this._closed && kind !== Z_NO_FLUSH) {
+                try {
+                  const out = __zlib.streamFlush(this._handle, kind === Z_FINISH);
+                  if (out.length) this.push(Buffer.from(out));
+                } catch (e) {
+                  this.emit("error", e);
+                }
+              }
+              // The 'data' events for that push have fired by now; the callback follows them.
+              if (cb) return Promise.resolve().then(cb);
+            });
+          }
+          reset() {
+            if (streamKind && !this._closed) __zlib.streamReset(this._handle);
+            this._chunks = [];
+          }
+          _release() {
+            if (this._closed) return;
+            this._closed = true;
+            if (streamKind) __zlib.streamClose(this._handle);
+          }
+          close(cb) {
+            this._release();
+            this.destroy();
+            if (cb) queueMicrotask(cb);
+          }
+          destroy(err) {
+            this._release();
+            return super.destroy(err);
           }
         };
         Object.defineProperty(zlib, className, {
@@ -719,7 +813,8 @@ __builtins.set("tty", {
     zlib[`${name}Sync`] = syncFn;
     zlib[name] = asyncOf(syncFn);
     // Gzip / Gunzip / Deflate / Inflate / DeflateRaw / InflateRaw (+ their create* factories).
-    defineStreamClass(cap, syncFn);
+    const streamKind = name === "deflateRaw" ? "deflate" : name === "inflateRaw" ? "inflate" : null;
+    defineStreamClass(cap, syncFn, streamKind);
     zlib[`create${cap}`] = (options) => new zlib[cap](options);
   }
   // Aliases Node exposes: `unzip` auto-detects gzip vs. zlib framing — our gunzip covers gzip.

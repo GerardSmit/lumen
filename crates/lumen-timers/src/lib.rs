@@ -23,6 +23,9 @@ pub fn extension() -> Extension {
             "clearTimeout" (1) => op_clear_timer,
             "clearInterval" (1) => op_clear_timer,
             "setImmediate" (1) => op_set_immediate,
+            // Node's Timeout handle methods, wrapped by the node:timers glue.
+            "__timerSetRef" (2) => op_timer_set_ref,
+            "__timerRefresh" (1) => op_timer_refresh,
         ],
         namespaces: &[],
         state_init: Some(|state| state.put(Timers::default())),
@@ -34,8 +37,15 @@ pub fn extension() -> Extension {
 struct Entry {
     callback: Value,
     args: Vec<Value>,
+    delay: Duration,
     /// `Some(period)` for `setInterval`: reschedule after each firing.
     repeat: Option<Duration>,
+    /// The deadline the live heap node carries; a node with any other deadline is stale
+    /// (the timer was refreshed) and is skipped like a cancelled one.
+    deadline: Instant,
+    /// Node's `timer.unref()`: an unref'd timer still fires if the loop is alive for another
+    /// reason, but does not by itself keep it alive.
+    refed: bool,
 }
 
 /// The timer heap. Cancellation is lazy: `clear*` removes the entry; stale heap nodes are
@@ -57,15 +67,19 @@ impl Timers {
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
+        let deadline = Instant::now() + delay;
         self.entries.insert(
             id,
             Entry {
                 callback,
                 args,
+                delay,
                 repeat: repeat.then_some(delay),
+                deadline,
+                refed: true,
             },
         );
-        self.heap.push(Reverse((Instant::now() + delay, id)));
+        self.heap.push(Reverse((deadline, id)));
         id
     }
 
@@ -73,16 +87,42 @@ impl Timers {
         self.entries.remove(&id);
     }
 
-    /// Whether any live timer remains (the loop stays alive while true).
-    pub fn has_pending(&self) -> bool {
-        !self.entries.is_empty()
+    /// `timer.ref()` / `timer.unref()`; false when the timer no longer exists.
+    pub fn set_ref(&mut self, id: u64, refed: bool) -> bool {
+        match self.entries.get_mut(&id) {
+            Some(e) => {
+                e.refed = refed;
+                true
+            }
+            None => false,
+        }
     }
 
-    /// When the loop may sleep until. Pops cancelled heap nodes so a cleared timer can't
-    /// produce a busy-wakeup loop.
+    /// `timer.refresh()`: restart a live timer's delay from now. False when it has already
+    /// fired (a one-shot) or was cleared — the caller re-schedules it then.
+    pub fn refresh(&mut self, id: u64) -> bool {
+        let Some(e) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        e.deadline = Instant::now() + e.delay;
+        self.heap.push(Reverse((e.deadline, id)));
+        true
+    }
+
+    /// Whether any live ref'd timer remains (the loop stays alive while true).
+    pub fn has_pending(&self) -> bool {
+        self.entries.values().any(|e| e.refed)
+    }
+
+    fn is_live(&self, id: u64, deadline: Instant) -> bool {
+        self.entries.get(&id).is_some_and(|e| e.deadline == deadline)
+    }
+
+    /// When the loop may sleep until. Pops cancelled and stale heap nodes so a cleared or
+    /// refreshed timer can't produce a busy-wakeup loop.
     pub fn next_deadline(&mut self) -> Option<Instant> {
         while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
-            if self.entries.contains_key(&id) {
+            if self.is_live(id, deadline) {
                 return Some(deadline);
             }
             self.heap.pop();
@@ -99,12 +139,16 @@ impl Timers {
                 break;
             }
             self.heap.pop();
-            let Some(entry) = self.entries.get(&id) else {
-                continue; // cancelled
-            };
+            if !self.is_live(id, deadline) {
+                continue; // cancelled, or superseded by a refresh
+            }
+            let entry = self.entries.get_mut(&id).expect("live entry");
             due.push((entry.callback.clone(), entry.args.clone()));
             match entry.repeat {
-                Some(period) => self.heap.push(Reverse((deadline + period, id))),
+                Some(period) => {
+                    entry.deadline = deadline + period;
+                    self.heap.push(Reverse((entry.deadline, id)));
+                }
                 None => {
                     self.entries.remove(&id);
                 }
@@ -158,6 +202,35 @@ fn op_clear_timer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         }
     }
     Ok(Value::Undefined)
+}
+
+fn timer_id_arg(ctx: &mut Ctx, args: &[Value]) -> Result<Option<u64>, Value> {
+    match args.first() {
+        Some(v) => {
+            let id = ctx.coerce_number(v)?;
+            Ok((id.is_finite() && id >= 0.0).then_some(id as u64))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `(id, refed)` — Node's `timer.ref()`/`unref()`; returns whether the timer is still live.
+fn op_timer_set_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(id) = timer_id_arg(ctx, args)? else {
+        return Ok(Value::Bool(false));
+    };
+    let refed = !matches!(args.get(1), Some(Value::Bool(false)));
+    let timers = ctx.host_mut::<Timers>().expect("timers state installed");
+    Ok(Value::Bool(timers.set_ref(id, refed)))
+}
+
+/// `(id)` — Node's `timer.refresh()`; false when the timer must be re-scheduled from scratch.
+fn op_timer_refresh(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(id) = timer_id_arg(ctx, args)? else {
+        return Ok(Value::Bool(false));
+    };
+    let timers = ctx.host_mut::<Timers>().expect("timers state installed");
+    Ok(Value::Bool(timers.refresh(id)))
 }
 
 /// Queue for the next loop turn (after microtasks, before timers get another look).

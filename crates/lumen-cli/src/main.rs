@@ -14,15 +14,43 @@ use lumen_host::Completion;
 use lumen_repl::Repl;
 use lumen_runtime::Runtime;
 
+/// The interpreter, the regex backtracker and the JSON/structured-clone walkers all recurse on
+/// the native stack, and a debug build's frames are several KiB each — deep enough JS recursion
+/// (well within the engine's own `MAX_EVAL_DEPTH` guard) overflows the default 8 MiB main-thread
+/// stack before the guard fires. The reservation is virtual; pages are committed as touched.
+const MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
+
 fn main() {
+    let worker = std::thread::Builder::new()
+        .name("lumen-main".to_string())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(real_main)
+        .expect("spawn main thread");
+    if worker.join().is_err() {
+        std::process::exit(1);
+    }
+}
+
+fn real_main() {
     let mut tier = None;
     let mut threshold = None;
     let mut eval_source = None;
     let mut file = None;
     let mut force_repl = false;
+    let mut expose_gc = false;
+    // Runtime flags seen before the script, reported as `process.execArgv` (Node's split).
+    let mut exec_argv = Vec::new();
 
-    let mut args = std::env::args().skip(1);
+    let all_args: Vec<String> = std::env::args().collect();
+    let argv0 = all_args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "lumen".to_string());
+    let mut args = all_args.iter().skip(1).cloned();
     while let Some(a) = args.next() {
+        if a.starts_with('-') && a != "-" {
+            exec_argv.push(a.clone());
+        }
         if let Some(t) = a.strip_prefix("--tier=") {
             tier = Some(match t {
                 "bytecode" => lumen_host::Tier::Bytecode,
@@ -46,6 +74,12 @@ fn main() {
         } else if a == "-v" || a == "--version" {
             println!("lumen {}", full_version());
             return;
+        } else if a == "--expose-gc" || a == "--expose_gc" {
+            expose_gc = true;
+        } else if is_ignored_node_flag(&a) {
+            // Accepted for Node command-line compatibility; lumen has no equivalent knob.
+        } else if a.starts_with("--") {
+            die(2, &format!("{argv0}: bad option: {a}"));
         } else {
             // First free arg is the script; the rest belong to it (visible via process.argv).
             file = Some(a);
@@ -54,6 +88,15 @@ fn main() {
     }
 
     let mut runtime = Runtime::new();
+    // process.argv is [binary, script, ...its args]: the runtime flags live in execArgv.
+    let script_argv: Vec<String> = match &file {
+        Some(f) => std::iter::once(f.clone()).chain(args).collect(),
+        None => Vec::new(),
+    };
+    runtime.set_process_args(&argv0, &exec_argv, &script_argv);
+    if expose_gc {
+        runtime.expose_gc();
+    }
     if let Some(t) = tier {
         runtime.engine().set_tier(t);
     }
@@ -77,6 +120,10 @@ fn main() {
         if let Err(e) = result {
             die(1, &format!("Uncaught {e}"));
         }
+        let code = runtime.finish_process();
+        if code != 0 {
+            std::process::exit(code);
+        }
     } else if force_repl || std::io::stdin().is_terminal() {
         println!(
             "lumen {} (.help for help, .exit or Ctrl-D to quit)",
@@ -97,7 +144,12 @@ fn main() {
 /// streamed as the script ran).
 fn run_source(runtime: &mut Runtime, src: &str) {
     match runtime.eval(src) {
-        Ok(Completion::Value(_)) => {}
+        Ok(Completion::Value(_)) => {
+            let code = runtime.finish_process();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Ok(Completion::Throw { name, message }) => {
             if name.is_empty() {
                 die(1, &format!("Uncaught {message}"));
@@ -148,6 +200,32 @@ fn json_type_field(json: &str) -> Option<String> {
         .trim_start()
         .strip_prefix('"')?;
     rest.find('"').map(|end| rest[..end].to_string())
+}
+
+/// Node flags that tune V8 or Node internals lumen does not have: accepted and ignored so a
+/// `package.json` script or a spawned `process.execPath` invocation written for Node still runs.
+fn is_ignored_node_flag(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "--no-warnings",
+        "--no-deprecation",
+        "--enable-source-maps",
+        "--preserve-symlinks",
+        "--trace-warnings",
+        "--trace-uncaught",
+        "--pending-deprecation",
+        "--throw-deprecation",
+        "--unhandled-rejections=strict",
+        "--unhandled-rejections=throw",
+        "--jitless",
+    ];
+    EXACT.contains(&a)
+        || a.starts_with("--max-old-space-size")
+        || a.starts_with("--max-semi-space-size")
+        || a.starts_with("--stack-size")
+        || a.starts_with("--experimental-")
+        || a.starts_with("--no-experimental-")
+        || a.starts_with("--disable-warning")
+        || a.starts_with("--title=")
 }
 
 fn die(code: i32, message: &str) -> ! {

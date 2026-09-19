@@ -75,26 +75,31 @@ function fsError(code, syscall, path, extra) {
   return err;
 }
 
-// Map a Node open-flags string (or numeric flag) to lumen-fs's r/w/a/r+/w+/a+ mode. The
-// exclusive ('x') and sync ('s') qualifiers are accepted but not separately enforced (lumen-fs
-// has no O_EXCL); the read/write/append intent is honoured.
+// Map a Node open-flags string (or numeric flag) to lumen-fs's r/w/a/r+/w+/a+ mode, with a
+// trailing 'x' for exclusive creation (O_EXCL: EEXIST if the file is already there). The sync
+// ('s') qualifier is accepted but not separately enforced.
 function flagToMode(flags) {
   if (flags == null) return "r";
   if (typeof flags === "number") {
     const c = nodeFs.constants;
     const rw = flags & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-    if (flags & c.O_APPEND) return rw === 0 ? "a" : "a+";
-    if (flags & c.O_TRUNC || flags & c.O_CREAT) return rw === 2 ? "w+" : "w";
+    const x = flags & c.O_EXCL ? "x" : "";
+    if (flags & c.O_APPEND) return (rw === 0 ? "a" : "a+") + x;
+    if (flags & c.O_TRUNC || flags & c.O_CREAT) return (rw === 2 ? "w+" : "w") + x;
     if (rw === 2) return "r+";
     return "r";
   }
   switch (String(flags)) {
     case "r": case "rs": return "r";
     case "r+": case "rs+": return "r+";
-    case "w": case "wx": return "w";
-    case "w+": case "wx+": return "w+";
-    case "a": case "ax": return "a";
-    case "a+": case "ax+": return "a+";
+    case "w": return "w";
+    case "wx": case "xw": return "wx";
+    case "w+": return "w+";
+    case "wx+": case "xw+": return "w+x";
+    case "a": return "a";
+    case "ax": case "xa": return "ax";
+    case "a+": return "a+";
+    case "ax+": case "xa+": return "a+x";
     default: return "r";
   }
 }
@@ -117,14 +122,17 @@ const nodeFs = {
     if (typeof path === "number") { nodeFs.writeSync(path, buf, 0, undefined, null); return; }
     // Write raw bytes via a handle so binary content is preserved (the string op re-encodes UTF-8).
     const flag = (options && options.flag) || "w";
-    const fd = __fs_native.openSync(toPath(path), flagToMode(flag));
+    const mode = options && typeof options.mode === "number" ? options.mode : undefined;
+    const fd = __fs_native.openSync(toPath(path), flagToMode(flag), mode);
     try { __fs_native.pwriteSync(fd, buf, -1); } finally { __fs_native.closeSync(fd); }
   },
   appendFileSync(path, data, options) {
     const enc = encOf(options);
     const buf = toBuffer(data, enc);
     if (typeof path === "number") { nodeFs.writeSync(path, buf); return; }
-    const fd = __fs_native.openSync(toPath(path), "a");
+    const flag = (options && options.flag) || "a";
+    const mode = options && typeof options.mode === "number" ? options.mode : undefined;
+    const fd = __fs_native.openSync(toPath(path), flagToMode(flag), mode);
     try { __fs_native.pwriteSync(fd, buf, -1); } finally { __fs_native.closeSync(fd); }
   },
   existsSync(path) {
@@ -196,7 +204,7 @@ const nodeFs = {
 
   // ---- file-descriptor ops ----
   openSync(path, flags, mode) {
-    return __fs_native.openSync(toPath(path), flagToMode(flags));
+    return __fs_native.openSync(toPath(path), flagToMode(flags), typeof mode === "number" ? mode : undefined);
   },
   closeSync(fd) {
     __fs_native.closeSync(fd);
