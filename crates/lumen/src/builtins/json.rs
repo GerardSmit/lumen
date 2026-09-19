@@ -27,7 +27,7 @@ pub(super) fn install_json(it: &mut Interp) {
                     Value::Str(s) => Some(s.to_string()),
                     Value::Num(n) => Some(i.num_to_str(*n)),
                     Value::Obj(o)
-                        if matches!(o.borrow().exotic, Exotic::StrWrap(_) | Exotic::NumWrap(_)) =>
+                        if matches!(o.borrow().exotic, Exotic::StrWrap | Exotic::NumWrap) =>
                     {
                         Some(ab(i.to_string(&item))?.to_string())
                     }
@@ -55,8 +55,8 @@ pub(super) fn install_json(it: &mut Interp) {
         if let Value::Obj(o) = &space {
             let exotic = o.borrow().exotic.clone();
             match exotic {
-                Exotic::NumWrap(_) => space = Value::Num(ab(i.to_number(&space))?),
-                Exotic::StrWrap(_) => space = Value::Str(ab(i.to_string(&space))?),
+                Exotic::NumWrap => space = Value::Num(ab(i.to_number(&space))?),
+                Exotic::StrWrap => space = Value::Str(ab(i.to_string(&space))?),
                 _ => {}
             }
         }
@@ -345,12 +345,15 @@ fn json_str(
     // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
     // valueOf/toString is observed); booleans read the wrapped datum directly.
     if let Value::Obj(o) = &value {
-        let exotic = o.borrow().exotic.clone();
+        let (exotic, wrapped_bool) = {
+            let b = o.borrow();
+            (b.exotic, b.bool_wrap())
+        };
         match exotic {
-            Exotic::NumWrap(_) => value = Value::Num(ab(i.to_number(&value))?),
-            Exotic::StrWrap(_) => value = Value::Str(ab(i.to_string(&value))?),
-            Exotic::BoolWrap(b) => value = Value::Bool(b),
-            Exotic::BigIntWrap(_) => {
+            Exotic::NumWrap => value = Value::Num(ab(i.to_number(&value))?),
+            Exotic::StrWrap => value = Value::Str(ab(i.to_string(&value))?),
+            Exotic::BoolWrap => value = Value::Bool(wrapped_bool.unwrap_or(false)),
+            Exotic::BigIntWrap => {
                 return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
             }
             _ => {}

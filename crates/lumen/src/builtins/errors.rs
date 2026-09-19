@@ -47,9 +47,9 @@ pub(super) fn install_errors(it: &mut Interp) {
     // shadows this with an own data property, so `err.stack = x` caches as usual.
     let get_stack = it.make_native("get stack", 0, |i, this, _| {
         let frames = match &this {
-            Value::Obj(o) => match &o.borrow().exotic {
-                Exotic::Error(frames) => frames.clone(),
-                _ => return Ok(Value::Undefined),
+            Value::Obj(o) => match o.borrow().error_stack() {
+                Some(frames) => frames,
+                None => return Ok(Value::Undefined),
             },
             _ => {
                 return Err(i.make_error(
@@ -181,7 +181,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         if name == "Error" {
             it.def_method(&ctor, "isError", 1, |_i, _t, a| {
                 Ok(Value::Bool(
-                    matches!(arg(a, 0), Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Error(_))),
+                    matches!(arg(a, 0), Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Error)),
                 ))
             });
             error_ctor = Some(ctor.clone());

@@ -45,18 +45,10 @@ pub(super) fn emit(a: &mut Asm, layout: &JitLayout, fail: usize) {
     a.ldr_w_imm(13, 12, 0);
     a.cmn_imm_w(13, 1);
     a.b_cond(C_EQ, fail);
-    a.ldr_imm(
-        14,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    a.ldr_w_imm(14, 11, (layout.obj_props + layout.props_entries_len) as u32);
     a.cmp_reg_x(13, 14);
     a.b_cond(C_HS, fail);
-    a.ldr_imm(
-        15,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    a.ldr_imm(15, 11, (layout.obj_props + layout.props_entries_ptr) as u32);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     crate::jit::guard_prop_data(a, 9, 15, layout.entry_accessor as u32, fail);

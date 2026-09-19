@@ -311,9 +311,9 @@ pub(super) fn install_boolean(it: &mut Interp) {
 fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
     match this {
         Value::Bool(b) => Ok(*b),
-        Value::Obj(o) => match o.borrow().exotic {
-            Exotic::BoolWrap(b) => Ok(b),
-            _ => Err(i.make_error(
+        Value::Obj(o) => match o.borrow().bool_wrap() {
+            Some(b) => Ok(b),
+            None => Err(i.make_error(
                 "TypeError",
                 "Boolean method called on incompatible receiver",
             )),
@@ -329,9 +329,9 @@ fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
 fn this_symbol(i: &mut Interp, this: &Value) -> Result<Rc<SymbolData>, Value> {
     match this {
         Value::Sym(s) => Ok(s.clone()),
-        Value::Obj(o) => match &o.borrow().exotic {
-            Exotic::SymWrap(s) => Ok(s.clone()),
-            _ => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
+        Value::Obj(o) => match o.borrow().sym_wrap() {
+            Some(s) => Ok(s),
+            None => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
     }
@@ -486,9 +486,9 @@ fn to_bigint(i: &mut Interp, v: &Value) -> Result<crate::bigint::JsBigInt, Value
 fn this_bigint(i: &mut Interp, this: &Value) -> Result<crate::bigint::JsBigInt, Value> {
     match this {
         Value::BigInt(n) => Ok(n.clone()),
-        Value::Obj(o) => match &o.borrow().exotic {
-            Exotic::BigIntWrap(n) => Ok((**n).clone()),
-            _ => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),
+        Value::Obj(o) => match o.borrow().bigint_wrap() {
+            Some(n) => Ok(n),
+            None => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),
     }

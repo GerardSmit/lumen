@@ -1,8 +1,6 @@
 //! Optional dense buffers and inline packed property ownership.
+use super::{MIRROR_ALL_I32, MIRROR_NO_HOLES, MIRROR_OK};
 use crate::value::{Property, Value};
-use std::rc::Rc;
-/// Insertion-ordered string-keyed property map. A `Vec` of entries preserves order (good enough for
-/// `for-in`/`Object.keys`); a side `HashMap` keeps lookup O(1).
 pub(super) const INLINE_PACKED_CAPACITY: usize = 10;
 
 pub(super) struct InlinePacked {
@@ -71,13 +69,33 @@ impl Drop for InlinePacked {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(in crate::value) struct DenseBuffers {
-    pub(in crate::value) index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
     pub(in crate::value) packed: Option<Box<Vec<Property>>>,
     pub(super) inline_packed: InlinePacked,
     pub(in crate::value) elems: Vec<u32>,
     pub(in crate::value) mirror: Vec<f64>,
+    /// See `Props::mirror`: [`MIRROR_OK`] | [`MIRROR_ALL_I32`] | [`MIRROR_NO_HOLES`]. A map
+    /// without a sidecar has no elements, so its mirror is vacuously coherent.
+    pub(in crate::value) mirror_flags: u8,
+    /// Live hole count in `mirror` (descending array fills pad with holes and then fill them:
+    /// `MIRROR_NO_HOLES` comes back when this returns to zero).
+    pub(in crate::value) mirror_holes: u32,
+}
+
+pub(super) const MIRROR_DEFAULT: u8 = MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES;
+
+impl Default for DenseBuffers {
+    fn default() -> Self {
+        DenseBuffers {
+            packed: None,
+            inline_packed: InlinePacked::default(),
+            elems: Vec::new(),
+            mirror: Vec::new(),
+            mirror_flags: MIRROR_DEFAULT,
+            mirror_holes: 0,
+        }
+    }
 }
 
 impl DenseBuffers {
@@ -88,6 +106,9 @@ impl DenseBuffers {
     pub(in crate::value) const fn inline_slots_offset() -> usize {
         std::mem::offset_of!(Self, inline_packed) + std::mem::offset_of!(InlinePacked, slots)
     }
+    pub(in crate::value) const fn mirror_flags_offset() -> usize {
+        std::mem::offset_of!(Self, mirror_flags)
+    }
 }
 
 struct EmptyDenseBuffers(DenseBuffers);
@@ -96,11 +117,12 @@ struct EmptyDenseBuffers(DenseBuffers);
 unsafe impl Sync for EmptyDenseBuffers {}
 
 static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
-    index: None,
     packed: None,
     inline_packed: InlinePacked::EMPTY,
     elems: Vec::new(),
     mirror: Vec::new(),
+    mirror_flags: MIRROR_DEFAULT,
+    mirror_holes: 0,
 });
 
 #[derive(Clone, Default)]
@@ -115,14 +137,12 @@ impl std::ops::Deref for DenseStorage {
 }
 
 impl DenseStorage {
+    pub(in crate::value) fn is_present(&self) -> bool {
+        self.0.is_some()
+    }
     #[inline]
     pub(in crate::value) fn buffers_mut(&mut self) -> &mut DenseBuffers {
         self.0.get_or_insert_with(Default::default)
-    }
-    pub(in crate::value) fn index_mut(
-        &mut self,
-    ) -> Option<&mut crate::fasthash::FastMap<Rc<str>, usize>> {
-        self.0.as_deref_mut()?.index.as_deref_mut()
     }
     pub(in crate::value) fn packed_mut(&mut self) -> Option<&mut Vec<Property>> {
         let dense = self.0.as_deref_mut()?;
@@ -141,16 +161,6 @@ impl DenseStorage {
     }
     pub(in crate::value) fn packed_is_some(&self) -> bool {
         self.packed_ref().is_some()
-    }
-    pub(in crate::value) fn set_index(
-        &mut self,
-        index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
-    ) {
-        if index.is_some() {
-            self.buffers_mut().index = index;
-        } else if let Some(d) = self.0.as_deref_mut() {
-            d.index = None;
-        }
     }
     pub(in crate::value) fn set_packed(&mut self, packed: Option<Box<Vec<Property>>>) {
         if packed.is_some() {
@@ -220,13 +230,26 @@ impl DenseStorage {
     pub(in crate::value) fn mirror_pop(&mut self) -> Option<f64> {
         self.0.as_deref_mut().and_then(|d| d.mirror.pop())
     }
-    pub(in crate::value) fn mirror_clear(&mut self) {
-        if let Some(d) = self.0.as_deref_mut() {
-            d.mirror.clear();
-        }
+    #[inline]
+    pub(in crate::value) fn mirror_flags(&self) -> u8 {
+        self.0.as_deref().map_or(MIRROR_DEFAULT, |d| d.mirror_flags)
     }
-    pub(in crate::value) fn mirror_extend<I: IntoIterator<Item = f64>>(&mut self, iter: I) {
-        self.buffers_mut().mirror.extend(iter);
+    /// Mutable flags; allocates the sidecar when absent (a caller clearing a vacuous mirror
+    /// should use [`mirror_invalidate`](Props::mirror_invalidate) instead).
+    #[inline]
+    pub(in crate::value) fn mirror_flags_mut(&mut self) -> &mut u8 {
+        &mut self.buffers_mut().mirror_flags
+    }
+    #[inline]
+    pub(in crate::value) fn mirror_holes_mut(&mut self) -> &mut u32 {
+        &mut self.buffers_mut().mirror_holes
+    }
+    /// Reset the mirror to the coherent, hole-free, all-i32 state (after the elements went).
+    pub(in crate::value) fn mirror_reset(&mut self) {
+        if let Some(d) = self.0.as_deref_mut() {
+            d.mirror_flags = MIRROR_DEFAULT;
+            d.mirror_holes = 0;
+        }
     }
 }
 

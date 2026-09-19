@@ -27,13 +27,14 @@ impl Interp {
         obj.borrow_mut().exotic = Exotic::Array;
         {
             let mut b = obj.borrow_mut();
-            for v in items {
-                b.props.push_dense(Property::plain(v));
-            }
+            // `length` first: the named prefix of `entries` precedes the elements.
             b.props.insert(
                 "length",
                 Property::data(Value::Num(len as f64), true, false, false),
             );
+            for v in items {
+                b.props.push_dense(Property::plain(v));
+            }
         }
         Value::Obj(obj)
     }
@@ -59,14 +60,14 @@ impl Interp {
             b.props.mark_array();
             b.props.reserve_dense_exact(len, numeric);
             b.exotic = Exotic::Array;
-            for k in 0..len {
-                b.props
-                    .push_dense(Property::plain(unsafe { items.add(k).read() }));
-            }
             b.props.insert(
                 "length",
                 Property::data(Value::Num(len as f64), true, false, false),
             );
+            for k in 0..len {
+                b.props
+                    .push_dense(Property::plain(unsafe { items.add(k).read() }));
+            }
         }
         Value::Obj(obj)
     }

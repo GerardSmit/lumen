@@ -258,8 +258,7 @@ fn emit_prop_num(
     let Ok(proto) = i32::try_from(layout.obj_proto) else {
         return false;
     };
-    let Ok(entries) = i32::try_from(layout.obj_props + layout.props_entries + layout.vec_ptr_off)
-    else {
+    let Ok(entries) = i32::try_from(layout.obj_props + layout.props_entries_ptr) else {
         return false;
     };
     let Some(entry_base) = layout.entry_size.checked_mul(st.slot as usize) else {

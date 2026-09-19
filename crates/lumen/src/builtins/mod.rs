@@ -2886,13 +2886,13 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "Arguments"
             } else if !matches!(b.call, Callable::None) {
                 "Function"
-            } else if matches!(b.exotic, Exotic::Error(_)) {
+            } else if matches!(b.exotic, Exotic::Error) {
                 "Error"
-            } else if matches!(b.exotic, Exotic::BoolWrap(_)) {
+            } else if matches!(b.exotic, Exotic::BoolWrap) {
                 "Boolean"
-            } else if matches!(b.exotic, Exotic::NumWrap(_)) {
+            } else if matches!(b.exotic, Exotic::NumWrap) {
                 "Number"
-            } else if matches!(b.exotic, Exotic::StrWrap(_)) {
+            } else if matches!(b.exotic, Exotic::StrWrap) {
                 "String"
             } else if b.props.contains("__date_ms") {
                 "Date"
@@ -4743,7 +4743,6 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
                     b.props
                         .entry_at_mut(s)
                         .unwrap()
-                        .1
                         .set_value(Value::Num(len as f64));
                 }
                 if ok {
@@ -4791,7 +4790,6 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
                 b.props
                     .entry_at_mut(s)
                     .unwrap()
-                    .1
                     .set_value(Value::Num((len - 1) as f64));
                 return Ok(v);
             }
@@ -4836,7 +4834,6 @@ pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result
             b.props
                 .entry_at_mut(slot)
                 .unwrap()
-                .1
                 .set_value(Value::Num(next as f64));
             Ok(Value::Num(next as f64))
         }
@@ -4865,7 +4862,6 @@ pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
     b.props
         .entry_at_mut(slot)
         .unwrap()
-        .1
         .set_value(Value::Num((len - 1) as f64));
     Some(value)
 }
@@ -8345,9 +8341,9 @@ pub(crate) fn nf_char_at(
 fn this_string(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value> {
     match this {
         Value::Str(s) => Ok(s.clone()),
-        Value::Obj(o) => match &o.borrow().exotic {
-            Exotic::StrWrap(s) => Ok((**s).clone()),
-            _ => ab(i.to_string(this)),
+        Value::Obj(o) => match o.borrow().str_wrap() {
+            Some(s) => Ok(s),
+            None => ab(i.to_string(this)),
         },
         // String.prototype methods RequireObjectCoercible(this): null/undefined → TypeError.
         Value::Undefined | Value::Null => Err(i.make_error(
@@ -9179,12 +9175,12 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
 /// values pass through unchanged (Symbol/BigInt wrappers are not modeled yet).
 fn box_primitive(i: &mut Interp, v: Value) -> Value {
     let (proto, exotic) = match &v {
-        Value::Num(n) => (i.number_proto.clone(), Exotic::NumWrap(*n)),
-        Value::Bool(b) => (i.boolean_proto.clone(), Exotic::BoolWrap(*b)),
-        Value::Str(s) => (i.string_proto.clone(), Exotic::str_wrap(s.clone())),
-        Value::Sym(s) => (i.symbol_proto.clone(), Exotic::SymWrap(s.clone())),
-        Value::BigInt(n) => match i.extra_protos.get("BigInt").cloned() {
-            Some(p) => (p, Exotic::bigint_wrap(n.clone())),
+        Value::Num(_) => (i.number_proto.clone(), Exotic::NumWrap),
+        Value::Bool(_) => (i.boolean_proto.clone(), Exotic::BoolWrap),
+        Value::Str(_) => (i.string_proto.clone(), Exotic::StrWrap),
+        Value::Sym(_) => (i.symbol_proto.clone(), Exotic::SymWrap),
+        Value::BigInt(_) => match i.extra_protos.get("BigInt").cloned() {
+            Some(p) => (p, Exotic::BigIntWrap),
             None => return v,
         },
         _ => return v,
@@ -9192,7 +9188,7 @@ fn box_primitive(i: &mut Interp, v: Value) -> Value {
     let obj = Object::new(Some(proto));
     // A String exotic object exposes each character as an own, enumerable, non-writable,
     // non-configurable index property, plus a non-enumerable `length`.
-    if let Exotic::StrWrap(s) = &exotic {
+    if let Value::Str(s) = &v {
         let units = crate::jstr::units(s);
         let mut b = obj.borrow_mut();
         for (idx, u) in units.iter().enumerate() {
@@ -9206,7 +9202,7 @@ fn box_primitive(i: &mut Interp, v: Value) -> Value {
             Property::data(Value::Num(units.len() as f64), false, false, false),
         );
     }
-    obj.borrow_mut().exotic = exotic;
+    obj.borrow_mut().set_exotic(exotic, Some(v));
     Value::Obj(obj)
 }
 
@@ -9221,9 +9217,9 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
     let nt = i.new_target.clone();
     if let (Value::Obj(o), Value::Obj(_)) = (&boxed, &nt) {
         let key = match o.borrow().exotic {
-            Exotic::NumWrap(_) => "Number",
-            Exotic::BoolWrap(_) => "Boolean",
-            Exotic::StrWrap(_) => "String",
+            Exotic::NumWrap => "Number",
+            Exotic::BoolWrap => "Boolean",
+            Exotic::StrWrap => "String",
             _ => "",
         };
         if !key.is_empty() {
@@ -9273,9 +9269,9 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
 fn string_this_value(i: &mut Interp, this: &Value) -> Result<Value, Value> {
     match this {
         Value::Str(s) => Ok(Value::Str(s.clone())),
-        Value::Obj(o) => match &o.borrow().exotic {
-            Exotic::StrWrap(s) => Ok(Value::Str((**s).clone())),
-            _ => Err(i.make_error("TypeError", "not a String object")),
+        Value::Obj(o) => match o.borrow().str_wrap() {
+            Some(s) => Ok(Value::Str(s)),
+            None => Err(i.make_error("TypeError", "not a String object")),
         },
         _ => Err(i.make_error("TypeError", "not a String object")),
     }
@@ -9386,9 +9382,9 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisNumberValue: only a Number primitive or Number wrapper is acceptable.
     match this {
         Value::Num(n) => Ok(*n),
-        Value::Obj(o) => match o.borrow().exotic {
-            Exotic::NumWrap(n) => Ok(n),
-            _ => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),
+        Value::Obj(o) => match o.borrow().num_wrap() {
+            Some(n) => Ok(n),
+            None => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),
     }
