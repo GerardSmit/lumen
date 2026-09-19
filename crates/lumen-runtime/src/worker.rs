@@ -162,6 +162,9 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
     let worker_stop = Arc::clone(&stop);
     std::thread::Builder::new()
         .name(format!("lumen-worker-{thread_id}"))
+        // Same reasoning as the CLI's main thread: the engine recurses natively, and a debug
+        // build's frames overflow the 2 MiB default long before the depth guard trips.
+        .stack_size(64 * 1024 * 1024)
         .spawn(move || run_worker(spec, to_worker_rx, to_main_tx, worker_stop))
         .expect("spawn worker thread");
 
@@ -620,6 +623,9 @@ const WORKER_JS: &str = r#"
       this.dispatchEvent(event);
     }
     #onEvent(kind, args) {
+      // A message the worker posted before `terminate()` reached it may still be in flight;
+      // a terminated Worker dispatches nothing but its exit.
+      if (this.#terminated && kind !== "exit") return;
       if (kind === "message") {
         let data;
         try { data = deserialize(args[0]); }

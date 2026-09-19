@@ -241,6 +241,9 @@ pub const UNSUPPORTED_MSG: &str =
 /// reason `spawn` was — the driver stops touching them the instant it sends.
 struct Job {
     ptr: InterpPtr,
+    /// The driver's heap state: the body allocates into and tombstones out of the same registry
+    /// as the interpreter that spawned it (see `value::GcState`).
+    gc: std::sync::Arc<crate::value::GcState>,
     body: SendBody,
     resume_rx: Receiver<Resume>,
     suspend_tx: Sender<Suspend>,
@@ -275,17 +278,32 @@ fn worker_loop(job_rx: Receiver<Job>, self_tx: Sender<Job>) {
     }
 }
 
+struct RestoreGcState(Option<std::sync::Arc<crate::value::GcState>>);
+
+impl Drop for RestoreGcState {
+    fn drop(&mut self) {
+        if let Some(own) = self.0.take() {
+            crate::value::enter_gc_state(own);
+        }
+    }
+}
+
 /// Set up this thread's coroutine TLS, run the body from its first drive to completion, and hand
 /// the outcome to the driver. Resets the per-thread coroutine state a reused worker would otherwise
 /// inherit from its previous job.
 fn run_job(job: Job) {
     let Job {
         ptr,
+        gc,
         body,
         resume_rx,
         suspend_tx,
     } = job;
     let SendBody(body) = body;
+    // Everything this job drops — the captured closure on an undriven job, the values a body
+    // leaves behind — belongs to the driver's registry, so route it there until the job is done.
+    let own_gc = crate::value::enter_gc_state(gc);
+    let _restore = RestoreGcState(Some(own_gc));
     // A plain async body never sets ASYNC_GEN, so it must not inherit a previous async-generator
     // job's `true`.
     ASYNC_GEN.with(|c| c.set(false));
@@ -322,6 +340,7 @@ pub fn spawn_coroutine(interp: *mut Interp, body: SendBody) -> std::io::Result<C
     let worker = get_worker()?;
     let job = Job {
         ptr: InterpPtr(interp),
+        gc: crate::value::gc_state_handle(),
         body,
         resume_rx,
         suspend_tx,

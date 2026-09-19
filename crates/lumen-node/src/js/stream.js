@@ -12,13 +12,23 @@ class Readable extends Stream {
   constructor(opts = {}) {
     super();
     const objectMode = !!(opts.objectMode || opts.readableObjectMode);
-    this._readableState = { flowing: null, ended: false, endEmitted: false, buffer: [], length: 0, objectMode, highWaterMark: opts.highWaterMark === undefined ? getDefaultHighWaterMark(objectMode) : Number(opts.highWaterMark), encoding: null, destroyed: false, reading: false, errored: null };
+    this._readableState = { flowing: null, ended: false, endEmitted: false, buffer: [], length: 0, objectMode, highWaterMark: opts.highWaterMark === undefined ? getDefaultHighWaterMark(objectMode) : Number(opts.highWaterMark), encoding: null, destroyed: false, reading: false, errored: null, autoDestroy: opts.autoDestroy !== false, emitClose: opts.emitClose !== false, closeEmitted: false };
     this.readable = true;
     if (opts.encoding) this.setEncoding(opts.encoding);
     if (typeof opts.read === "function") this._read = opts.read;
   }
   _read() {}
   get readableLength() { return this._readableState.length; }
+  get readableFlowing() { return this._readableState.flowing; }
+  set readableFlowing(v) { this._readableState.flowing = v; }
+  get readableEnded() { return this._readableState.endEmitted; }
+  get readableAborted() { return !!(this._readableState.destroyed || this._readableState.errored) && !this._readableState.endEmitted; }
+  get destroyed() { return !!(this._readableState.destroyed || (this._writableState && this._writableState.destroyed)); }
+  set destroyed(v) { this._readableState.destroyed = !!v; if (this._writableState) this._writableState.destroyed = !!v; }
+  get closed() { return this._readableState.closeEmitted; }
+  // Settable for subclasses that keep their own closed flag on the instance (node:http2's streams).
+  set closed(v) { this._readableState.closeEmitted = !!v; }
+  get errored() { return this._readableState.errored || (this._writableState && this._writableState.errored) || null; }
   get readableHighWaterMark() { return this._readableState.highWaterMark; }
   get readableObjectMode() { return this._readableState.objectMode; }
 
@@ -34,6 +44,20 @@ class Readable extends Stream {
     if (state.flowing) this.emit("data", chunk);
     else { state.buffer.push(chunk); state.length += state.objectMode ? 1 : chunk.length; this.emit("readable"); }
     return state.length < state.highWaterMark;
+  }
+
+  // Put a chunk back at the head of the buffer — what a protocol parser does with the bytes it
+  // read past its own frame (http's `upgrade` head, ws's first frame). Delivered ahead of anything
+  // pushed later; a flowing stream drains it on the next tick like any buffered chunk.
+  unshift(chunk) {
+    const state = this._readableState;
+    if (chunk === null || chunk === undefined || state.destroyed) return;
+    if (state.encoding && chunk instanceof Uint8Array) chunk = Buffer.from(chunk).toString(state.encoding);
+    if (!state.objectMode && chunk.length === 0) return;
+    state.buffer.unshift(chunk);
+    state.length += state.objectMode ? 1 : chunk.length;
+    if (state.flowing) queueMicrotask(() => flow(this));
+    else this.emit("readable");
   }
 
   read(size) {
@@ -121,9 +145,10 @@ class Readable extends Stream {
     state.destroyed = true;
     if (err) { state.errored = err; if (this._writableState) this._writableState.errored = err; }
     this.readable = false;
+    if (this._writableState) this.writable = false;
     queueMicrotask(() => {
       if (err) this.emit("error", err);
-      this.emit("close");
+      if (state.emitClose) { state.closeEmitted = true; this.emit("close"); }
     });
     return this;
   }
@@ -172,8 +197,21 @@ function maybeEmitEnd(stream) {
     state.endEmitted = true;
     state.flowing = false;
     stream.readable = false;
-    queueMicrotask(() => stream.emit("end"));
+    queueMicrotask(() => { stream.emit("end"); maybeAutoDestroy(stream); });
   }
+}
+
+// Node's autoDestroy (on by default): a stream destroys itself — and so emits 'close' — once
+// its readable side has ended and its writable side (if any) has finished. Consumers that wait
+// on 'close' rather than 'end' (a browser's CDP pipe reader, for one) depend on it.
+function maybeAutoDestroy(stream) {
+  const r = stream._readableState, w = stream._writableState;
+  const autoDestroy = r ? r.autoDestroy : w.autoDestroy;
+  if (!autoDestroy) return;
+  if (r && !(r.endEmitted || r.destroyed)) return;
+  if (w && !(w.finished || w.destroyed)) return;
+  if (isDestroyed(stream)) return;
+  if (typeof stream.destroy === "function") stream.destroy();
 }
 
 class Writable extends Stream {
@@ -208,12 +246,7 @@ class Writable extends Stream {
   _queueBatch(entries) {
     const state = this._writableState;
     if (entries.length > 1 && typeof this._writev === "function") {
-      state.tail = state.tail.then(() => new Promise(resolve => {
-        this._writev(entries.map(entry => ({ chunk: entry.chunk, encoding: entry.encoding })), err => {
-          for (const entry of entries) completeWrite(this, entry, err);
-          resolve();
-        });
-      }));
+      queueWrite(this, { entries, length: entries.reduce((n, e) => n + e.length, 0) });
     } else for (const entry of entries) queueWrite(this, entry);
   }
 
@@ -225,9 +258,9 @@ class Writable extends Stream {
     state.ended = true;
     if (state.corked) { state.corked = 0; const entries = state.corkBuffer.splice(0); this._queueBatch(entries); }
     // Wait for all queued writes to drain, then run _final (e.g. close the child's stdin).
-    state.tail.then(() => {
+    whenWritesDrained(this).then(() => {
       if (state.finished) return;
-      const done = () => { state.finished = true; if (cb) cb(); this.emit("finish"); };
+      const done = () => { state.finished = true; if (cb) cb(); this.emit("finish"); maybeAutoDestroy(this); };
       if (this._final) this._final((err) => { if (err) this.emit("error", err); else done(); });
       else done();
     });
@@ -242,6 +275,15 @@ class Writable extends Stream {
   }
   setDefaultEncoding() { return this; }
   get writableLength() { return this._writableState.length; }
+  get writableEnded() { return this._writableState.ended; }
+  get writableFinished() { return this._writableState.finished; }
+  get writableNeedDrain() { return this._writableState.needDrain; }
+  get writableCorked() { return this._writableState.corked; }
+  get destroyed() { return this._writableState.destroyed; }
+  set destroyed(v) { this._writableState.destroyed = !!v; }
+  get closed() { return this._writableState.closeEmitted; }
+  set closed(v) { this._writableState.closeEmitted = !!v; }
+  get errored() { return this._writableState.errored; }
   get writableHighWaterMark() { return this._writableState.highWaterMark; }
   get writableObjectMode() { return this._writableState.objectMode; }
 
@@ -251,25 +293,64 @@ class Writable extends Stream {
     state.destroyed = true;
     if (err) { state.errored = err; if (this._readableState) this._readableState.errored = err; }
     this.writable = false;
-    queueMicrotask(() => { if (err) this.emit("error", err); this.emit("close"); });
+    queueMicrotask(() => { if (err) this.emit("error", err); if (state.emitClose) { state.closeEmitted = true; this.emit("close"); } });
     return this;
   }
 }
 
 function writableState(opts) {
   const objectMode = !!(opts.objectMode || opts.writableObjectMode);
-  return { ended: false, finished: false, destroyed: false, corked: 0, corkBuffer: [], errored: null, tail: Promise.resolve(), objectMode, highWaterMark: opts.highWaterMark === undefined ? getDefaultHighWaterMark(objectMode) : Number(opts.highWaterMark), length: 0, needDrain: false };
+  return { ended: false, finished: false, destroyed: false, autoDestroy: opts.autoDestroy !== false, emitClose: opts.emitClose !== false, closeEmitted: false, corked: 0, corkBuffer: [], errored: null, buffered: [], writing: false, drainWaiters: [], objectMode, highWaterMark: opts.highWaterMark === undefined ? getDefaultHighWaterMark(objectMode) : Number(opts.highWaterMark), length: 0, needDrain: false };
 }
+// Writes go to _write one at a time, in order, and — like Node — the first one starts
+// synchronously inside write(): a _write that calls back synchronously has completed (and
+// writableLength has dropped) before write() returns. An entry is a chunk, a writev batch
+// (`entries`), or a `run(cb)` step other code sequences behind the pending writes.
 function queueWrite(stream, entry) {
   const state = stream._writableState;
-  state.tail = state.tail.then(() => new Promise(resolve => {
-    stream._write(entry.chunk, entry.encoding, err => { completeWrite(stream, entry, err); resolve(); });
-  }));
+  state.buffered.push(entry);
+  if (!state.writing) clearWriteBuffer(stream);
+}
+function clearWriteBuffer(stream) {
+  const state = stream._writableState;
+  while (!state.writing && state.buffered.length) {
+    const entry = state.buffered.shift();
+    state.writing = true;
+    let sync = true;
+    let called = false;
+    const done = (err) => {
+      if (called) return;
+      called = true;
+      state.writing = false;
+      if (entry.entries) for (const e of entry.entries) completeWrite(stream, e, err);
+      else if (!entry.run) completeWrite(stream, entry, err);
+      else if (err) stream.emit("error", err);
+      // A synchronous callback lets the loop below pick up the next entry; an asynchronous one
+      // has to restart it.
+      if (!sync) clearWriteBuffer(stream);
+    };
+    if (entry.run) entry.run(done);
+    else if (entry.entries) stream._writev(entry.entries.map(e => ({ chunk: e.chunk, encoding: e.encoding })), done);
+    else stream._write(entry.chunk, entry.encoding, done);
+    sync = false;
+  }
+  if (!state.writing && !state.buffered.length) for (const w of state.drainWaiters.splice(0)) w();
+}
+// Resolves once every write queued so far has completed.
+function whenWritesDrained(stream) {
+  const state = stream._writableState;
+  if (!state.writing && !state.buffered.length) return Promise.resolve();
+  return new Promise(resolve => state.drainWaiters.push(resolve));
+}
+// Run `fn` after the writes queued before it, before any queued after it.
+function afterWrites(stream, fn) {
+  queueWrite(stream, { run: (done) => { let r; try { r = fn(); } catch (e) { done(e); return; } Promise.resolve(r).then(() => done(), done); } });
 }
 function completeWrite(stream, entry, error) {
   const state = stream._writableState;
   state.length -= entry.length;
-  if (error) stream.emit("error", error);
+  // Node's errorOrDestroy: a stream that is already destroyed has reported its error.
+  if (error && !isDestroyed(stream)) stream.emit("error", error);
   if (entry.cb) entry.cb(error);
   if (state.needDrain && state.length < state.highWaterMark) { state.needDrain = false; queueMicrotask(() => stream.emit("drain")); }
 }
@@ -289,7 +370,7 @@ class Duplex extends Readable {
 for (const m of ["_write", "write", "_queueBatch", "end", "cork", "uncork", "setDefaultEncoding"]) {
   Duplex.prototype[m] = Writable.prototype[m];
 }
-for (const name of ["writableLength", "writableHighWaterMark", "writableObjectMode"]) {
+for (const name of ["writableLength", "writableHighWaterMark", "writableObjectMode", "writableEnded", "writableFinished", "writableNeedDrain", "writableCorked"]) {
   Object.defineProperty(Duplex.prototype, name, Object.getOwnPropertyDescriptor(Writable.prototype, name));
 }
 
@@ -520,6 +601,8 @@ function compose(...streams) {
 
 Stream.Readable = Readable;
 Stream.Writable = Writable;
+// Internal: lets node:zlib sequence a flush behind the writes already queued on a stream.
+Object.defineProperty(Stream, "_afterWrites", { value: afterWrites, enumerable: false });
 Stream.Duplex = Duplex;
 Stream.Transform = Transform;
 Stream.PassThrough = PassThrough;

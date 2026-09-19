@@ -105,7 +105,12 @@ function makePath(sep, isWin) {
         resolved = p + sep + resolved;
         absolute = isAbs(p);
       }
-      if (!absolute) resolved = (isWin ? "" : process.cwd()) + sep + resolved;
+      if (!absolute) {
+        resolved = (isWin ? "" : process.cwd()) + sep + resolved;
+        // A relative input resolved against the cwd is absolute from here on: the root must
+        // come back with the result and `..` must not climb above it.
+        absolute = !isWin;
+      }
       const parts = normalizeArray(resolved.split(splitRe), !absolute).join(sep);
       return absolute ? sep + parts : parts || ".";
     },

@@ -30,16 +30,17 @@ const os = {
   arch: () => __osInfo.arch,
   type: () => __osInfo.type,
   release: () => __osInfo.release,
-  version: () => __osInfo.release,
+  version: () => __osInfo.version,
   homedir: () => __osInfo.homedir,
   tmpdir: () => __osInfo.tmpdir,
   hostname: () => __os.hostname(),
   endianness: () => __osInfo.endianness,
-  // A minimal cpus() — count is real; per-core model/speed/times aren't reachable from std.
+  // cpus(): count, model and speed are real (one model for every core); per-core times aren't
+  // reachable from std and read as zero.
   cpus: () =>
     Array.from({ length: __osInfo.cpus }, () => ({
-      model: "unknown",
-      speed: 0,
+      model: __osInfo.cpuModel || "unknown",
+      speed: __osInfo.cpuSpeed,
       times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
     })),
   availableParallelism: () => __osInfo.cpus,
@@ -83,7 +84,7 @@ const os = {
     const r = __os.setPriority(pid, priority);
     if (r && typeof r === "object") throw systemError("uv_os_setpriority", r);
   },
-  totalmem: () => 0,
+  totalmem: () => __osInfo.totalmem,
   freemem: () => 0,
   uptime: () => 0,
   loadavg: () => [0, 0, 0],

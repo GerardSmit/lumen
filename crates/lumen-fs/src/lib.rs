@@ -38,7 +38,7 @@ pub fn extension() -> Extension {
                     "unlinkSync" (1) => op_unlink_sync,
                     "mkdirSync" (1) => op_mkdir_sync,
                     "readdirSync" (1) => op_readdir_sync,
-                    "openSync" (2) => op_open_sync,
+                    "openSync" (3) => op_open_sync,
                     "readSync" (1) => op_read_fd_sync,
                     "writeSync" (2) => op_write_fd_sync,
                     "closeSync" (1) => op_close_sync,
@@ -71,7 +71,7 @@ pub fn extension() -> Extension {
                     "unlinkSync" (1) => op_unlink_sync,
                     "mkdirSync" (1) => op_mkdir_sync,
                     "readdirSync" (1) => op_readdir_sync,
-                    "openSync" (2) => op_open_sync,
+                    "openSync" (3) => op_open_sync,
                     "readSync" (1) => op_read_fd_sync,
                     "writeSync" (2) => op_write_fd_sync,
                     "closeSync" (1) => op_close_sync,
@@ -114,8 +114,25 @@ fn arg_string(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<String, Value> 
         .to_string())
 }
 
+/// An errno-tagged error in Node's shape: `code` is what callers switch on (`EEXIST` from an
+/// exclusive create, `ENOENT`), with `syscall` and `path` alongside.
 fn io_error(ctx: &mut Ctx, op: &str, path: &str, e: std::io::Error) -> Value {
-    ctx.make_error("Error", format!("{op} '{path}': {e}"))
+    let code = match e.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EACCES",
+        std::io::ErrorKind::AlreadyExists => "EEXIST",
+        _ => match e.raw_os_error() {
+            Some(20) => "ENOTDIR",
+            Some(21) => "EISDIR",
+            Some(39) | Some(66) => "ENOTEMPTY",
+            _ => "EIO",
+        },
+    };
+    let err = ctx.make_error("Error", format!("{code}: {e}, {op} '{path}'"));
+    let _ = ctx.set_member(&err, "code", Value::str(code));
+    let _ = ctx.set_member(&err, "path", Value::str(path));
+    let _ = ctx.set_member(&err, "syscall", Value::str(op));
+    err
 }
 
 // ---- sync path ops ----
@@ -184,29 +201,65 @@ fn op_readdir_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// File` while the table hands out shared `Rc`s.
 type FsHandle = RefCell<File>;
 
+/// `(path, mode[, permissions])` — `mode` is one of `r`/`w`/`a` (+ `+` for read-write) with an
+/// optional trailing `x` for exclusive creation (Node's `wx`/`ax`: fail if the file exists);
+/// `permissions` is the mode bits a created file gets (Node's `{ mode }`, unix only).
 fn op_open_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let path = arg_string(ctx, args, 0)?;
     let mode = match args.get(1) {
         None | Some(Value::Undefined) => "r".to_string(),
         Some(v) => ctx.coerce_string(v)?.to_string(),
     };
+    let permissions = match args.get(2) {
+        Some(Value::Num(n)) if n.is_finite() && *n >= 0.0 => Some(*n as u32),
+        _ => None,
+    };
+    let (base, exclusive) = match mode.strip_suffix('x') {
+        Some(base) => (base, true),
+        None => (mode.as_str(), false),
+    };
     let mut opts = std::fs::OpenOptions::new();
-    let file = match mode.as_str() {
-        "r" => opts.read(true).open(&path),
-        "w" => opts.write(true).create(true).truncate(true).open(&path),
-        "a" => opts.append(true).create(true).open(&path),
+    let creates = match base {
+        "r" => {
+            opts.read(true);
+            false
+        }
+        "w" => {
+            opts.write(true).create(true).truncate(true);
+            true
+        }
+        "a" => {
+            opts.append(true).create(true);
+            true
+        }
         // Read+write variants back FileHandle and the fd read/write ops.
-        "r+" => opts.read(true).write(true).open(&path),
-        "w+" => opts
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path),
-        "a+" => opts.read(true).append(true).create(true).open(&path),
-        other => return Err(ctx.make_error("TypeError", format!("openSync: bad mode '{other}'"))),
+        "r+" => {
+            opts.read(true).write(true);
+            false
+        }
+        "w+" => {
+            opts.read(true).write(true).create(true).truncate(true);
+            true
+        }
+        "a+" => {
+            opts.read(true).append(true).create(true);
+            true
+        }
+        _ => return Err(ctx.make_error("TypeError", format!("openSync: bad mode '{mode}'"))),
+    };
+    if exclusive && creates {
+        opts.create_new(true);
     }
-    .map_err(|e| io_error(ctx, "openSync", &path, e))?;
+    #[cfg(unix)]
+    if let (true, Some(bits)) = (creates, permissions) {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(bits);
+    }
+    #[cfg(not(unix))]
+    let _ = permissions;
+    let file = opts
+        .open(&path)
+        .map_err(|e| io_error(ctx, "open", &path, e))?;
     let rid = ctx.resource_table().add::<FsHandle>(RefCell::new(file));
     Ok(Value::Num(rid as f64))
 }

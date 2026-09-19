@@ -310,7 +310,11 @@ function validateHeaderValue(name, value) {
 // outbound request, which needs a socket lumen doesn't expose — constructing it throws honestly.
 class OutgoingMessage extends Writable {
   constructor() {
-    super();
+    // Finishing the body is not the end of the message's life: a ClientRequest outlives its
+    // 'finish' until the response (or the upgraded socket) is done with it, so it must not be
+    // auto-destroyed the way a plain Writable is — that would tear down the socket it just
+    // handed over.
+    super({ autoDestroy: false });
     this.headersSent = false;
     this.finished = false;
     this.sendDate = true;
@@ -387,9 +391,20 @@ class ClientRequest extends OutgoingMessage {
   }
   _final(cb) { this._send(); cb(); }
 
+  // A request that asks to switch protocols (`Upgrade: websocket` — the `ws` client, and so
+  // every CDP/DevTools client built on it) cannot go over fetch(): the reply is a 101 followed by
+  // a raw byte stream the caller takes over. Those go over a plain socket instead.
+  _wantsUpgrade() {
+    const upgrade = this.getHeader("upgrade");
+    if (upgrade !== undefined && String(upgrade) !== "") return true;
+    const connection = this.getHeader("connection");
+    return connection !== undefined && /\bupgrade\b/i.test(String(connection));
+  }
+
   async _send() {
     if (this.aborted || this.destroyed) return;
     this.headersSent = true;
+    if (this._wantsUpgrade()) return this._sendOverSocket();
     const url = `${this.protocol}//${this.host}${this.port ? ":" + this.port : ""}${this.path}`;
     const headers = new Headers();
     for (const { name, value } of this._headers.values()) {
@@ -440,6 +455,111 @@ class ClientRequest extends OutgoingMessage {
     if (buf.length) res.push(buf);
     res.push(null);
     res.complete = true;
+  }
+
+  // The socket path: write the request head (plus any buffered body) on a net/tls socket, parse
+  // the status line and headers by hand, and hand the socket over. A 101 goes to 'upgrade' with
+  // whatever bytes arrived past the headers as `head` (Node's contract, and what `ws` consumes);
+  // any other status is an ordinary 'response' whose body is the rest of the stream. Without an
+  // 'upgrade' listener a 101 destroys the socket, as in Node.
+  _sendOverSocket() {
+    const secure = this.protocol === "https:";
+    const net = __builtins.get("net");
+    const opts = this._opts;
+    let socket;
+    try {
+      socket = secure
+        ? __builtins.get("tls").connect({ host: this.host, port: this.port, servername: opts.servername || this.host, rejectUnauthorized: opts.rejectUnauthorized })
+        : net.connect({ host: this.host, port: this.port });
+    } catch (err) {
+      this._clearTimer();
+      this.emit("error", err);
+      return;
+    }
+    this.socket = this.connection = socket;
+    this.emit("socket", socket);
+
+    const lines = [`${this.method} ${this.path} HTTP/1.1`];
+    if (!this.hasHeader("host")) lines.push(`Host: ${this.host}${this.port ? ":" + this.port : ""}`);
+    for (const { name, value } of this._headers.values()) {
+      if (Array.isArray(value)) for (const v of value) lines.push(`${name}: ${v}`);
+      else lines.push(`${name}: ${value}`);
+    }
+    let total = 0;
+    for (const c of this._bodyChunks) total += c.length;
+    if (total && !this.hasHeader("content-length") && !this.hasHeader("transfer-encoding")) lines.push(`Content-Length: ${total}`);
+    const head = Buffer.from(lines.join("\r\n") + "\r\n\r\n");
+    const body = total ? Buffer.concat(this._bodyChunks, total) : null;
+
+    const onError = (err) => {
+      this._clearTimer();
+      if (this.aborted || this.destroyed) return;
+      this.emit("error", err);
+    };
+    socket.once("error", onError);
+    const abortSocket = () => { try { socket.destroy(); } catch {} };
+    this._controller.signal.addEventListener("abort", abortSocket, { once: true });
+
+    socket.once(secure ? "secureConnect" : "connect", () => {
+      socket.write(head);
+      if (body) socket.write(body);
+    });
+
+    let buffered = Buffer.alloc(0);
+    const onData = (chunk) => {
+      buffered = buffered.length ? Buffer.concat([buffered, chunk]) : Buffer.from(chunk);
+      const end = buffered.indexOf("\r\n\r\n");
+      if (end === -1) return;
+      socket.removeListener("data", onData);
+      socket.removeListener("end", onEarlyEnd);
+      socket.removeListener("error", onError);
+      // Like Node, hand the socket over with `readableFlowing === null`: whoever attaches the
+      // next 'data' listener (the upgrade consumer, or the body pump below) starts the flow.
+      // A hard pause() would leave it stuck, since on('data') only resumes a never-paused stream.
+      socket._readableState.flowing = null;
+      const rest = buffered.subarray(end + 4);
+      const headerLines = buffered.subarray(0, end).toString("latin1").split("\r\n");
+      const status = /^HTTP\/(\d)\.(\d) (\d{3}) ?(.*)$/.exec(headerLines[0] || "");
+      if (!status) {
+        socket.destroy();
+        onError(new Error("Parse Error: Invalid HTTP status line"));
+        return;
+      }
+      const res = new IncomingMessage(socket);
+      res.httpVersionMajor = Number(status[1]);
+      res.httpVersionMinor = Number(status[2]);
+      res.httpVersion = `${status[1]}.${status[2]}`;
+      res.statusCode = Number(status[3]);
+      res.statusMessage = status[4] || STATUS_CODES[res.statusCode] || "";
+      res.url = "";
+      res.method = this.method;
+      for (const line of headerLines.slice(1)) {
+        const colon = line.indexOf(":");
+        if (colon <= 0) continue;
+        const name = line.slice(0, colon).trim().toLowerCase();
+        const value = line.slice(colon + 1).trim();
+        res.headers[name] = res.headers[name] !== undefined ? res.headers[name] + ", " + value : value;
+        res.rawHeaders.push(line.slice(0, colon).trim(), value);
+      }
+      this.res = res;
+      res.req = this;
+      this._clearTimer();
+      if (res.statusCode === 101) {
+        this._controller.signal.removeEventListener("abort", abortSocket);
+        if (this.listenerCount("upgrade") === 0) { socket.destroy(); return; }
+        this.emit("upgrade", res, socket, Buffer.from(rest));
+        return;
+      }
+      // An ordinary reply: the rest of the stream is the body, delimited by the peer closing.
+      this.emit("response", res);
+      if (rest.length) res.push(Buffer.from(rest));
+      socket.on("data", (c) => res.push(c));
+      socket.once("end", () => { res.complete = true; res.push(null); });
+      socket.once("error", (err) => res.destroy(err));
+    };
+    const onEarlyEnd = () => onError(new Error("socket hang up"));
+    socket.on("data", onData);
+    socket.once("end", onEarlyEnd);
   }
 
   abort() {

@@ -660,6 +660,17 @@ __builtins.set("sys", __builtins.get("util"));
     }
   }
 
+  // nextTick callbacks run in the async context they were queued from (AsyncLocalStorage).
+  const rawNextTick = proc.nextTick;
+  proc.nextTick = function nextTick(callback, ...args) {
+    if (typeof callback !== "function") {
+      const err = new TypeError(`The "callback" argument must be of type function. Received ${callback === null ? "null" : typeof callback}`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    return rawNextTick(__bindAsyncContext(callback), ...args);
+  };
+
   // exit() honors process.exitCode when called without an explicit code; reallyExit is the raw op.
   const nativeExit = proc.exit;
   proc.reallyExit = nativeExit;
@@ -876,10 +887,19 @@ __builtins.set("sys", __builtins.get("util"));
   if (streamMod && streamMod.Readable) {
     stdin = new streamMod.Readable({ read() {} });
     let pumping = false;
+    // The read in flight. It cannot be cancelled, so a paused or destroyed stdin unrefs it instead
+    // of waiting for the writer to close the pipe (Node lets the process exit in both cases).
+    let pending = null;
+    let wanted = true;
+    const setRef = (keep) => {
+      wanted = keep;
+      if (pending !== null) proc._stdinRef(pending, keep);
+    };
     const pump = async () => {
       try {
         for (;;) {
-          const chunk = await new Promise((resolve, reject) => proc._readStdin(resolve, reject));
+          const chunk = await new Promise((resolve, reject) => { pending = proc._readStdin(resolve, reject); if (!wanted) proc._stdinRef(pending, false); });
+          pending = null;
           if (chunk === null) {
             stdin.push(null);
             return;
@@ -887,6 +907,7 @@ __builtins.set("sys", __builtins.get("util"));
           stdin.push(Buffer.from(chunk));
         }
       } catch (error) {
+        pending = null;
         stdin.destroy(error);
       }
     };
@@ -896,8 +917,20 @@ __builtins.set("sys", __builtins.get("util"));
         pumping = true;
         pump();
       }
+      setRef(true);
       return resume.call(this);
     };
+    const pause = stdin.pause;
+    stdin.pause = function () {
+      setRef(false);
+      return pause.call(this);
+    };
+    stdin._destroy = function (error, callback) {
+      setRef(false);
+      callback(error);
+    };
+    stdin.ref = function () { setRef(true); return this; };
+    stdin.unref = function () { setRef(false); return this; };
   } else {
     stdin = {
       on: () => stdin, once: () => stdin, removeListener: () => stdin,
@@ -1118,27 +1151,328 @@ __builtins.set("process", globalThis.process);
 }
 
 // ---- node:test --------------------------------------------------------------------------------
-// A minimal runner: tests execute eagerly and surface failures. lumen has no test-reporter
-// integration, so this is just enough for a module that imports node:test to load and run.
+// The runner Node ships: tests and suites run one at a time in declaration order, hooks wrap
+// them, `t.after`/`t.mock` clean up, a spec-style report goes to stdout, and a failure sets the
+// exit code — so a `test/*.test.cjs` file behaves under lumen as it does under `node --test`.
 {
-  const test = (name, options, fn) => {
-    const body = typeof options === "function" ? options : fn;
-    try {
-      const r = body && body({ name, diagnostic() {}, mock: test.mock });
-      return r && typeof r.then === "function" ? r : Promise.resolve();
-    } catch (e) {
-      console.error(`test "${name}" failed:`, e && e.message);
-      return Promise.reject(e);
+  const assert = __builtins.get("assert");
+  const now = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+
+  class MockTracker {
+    constructor() { this._restores = []; }
+    fn(original, implementation, options) {
+      if (typeof original === "object" && original !== null && implementation === undefined) { options = original; original = undefined; }
+      const impl = typeof implementation === "function" ? implementation : original;
+      const times = options && options.times;
+      const state = { calls: [], impl, original, remaining: times === undefined ? Infinity : times };
+      const mock = function (...args) {
+        const call = { arguments: args, this: this, result: undefined, error: undefined, stack: new Error(), target: new.target };
+        const fnToCall = state.remaining > 0 && state.impl ? state.impl : (state.original || (() => undefined));
+        if (state.remaining > 0) state.remaining--;
+        try {
+          call.result = new.target ? Reflect.construct(fnToCall, args, new.target) : fnToCall.apply(this, args);
+        } catch (e) {
+          call.error = e;
+          state.calls.push(call);
+          throw e;
+        }
+        state.calls.push(call);
+        return call.result;
+      };
+      mock.mock = {
+        get calls() { return state.calls.slice(); },
+        callCount() { return state.calls.length; },
+        mockImplementation(fn) { state.impl = fn; state.remaining = Infinity; },
+        mockImplementationOnce(fn, onCall) {
+          const prev = state.impl;
+          const at = onCall === undefined ? state.calls.length : onCall;
+          const once = function (...args) { if (state.calls.length === at) { state.impl = prev; return fn.apply(this, args); } return prev.apply(this, args); };
+          state.impl = once;
+        },
+        resetCalls() { state.calls.length = 0; },
+        restore() { state.impl = state.original; },
+      };
+      return mock;
     }
+    method(object, methodName, implementation, options) {
+      const original = object[methodName];
+      if (typeof original !== "function") throw new TypeError(`The "methodName" argument must name a function property. Received ${typeof original}`);
+      const mock = this.fn(original, implementation, options);
+      const descriptor = Object.getOwnPropertyDescriptor(object, methodName);
+      object[methodName] = mock;
+      const restore = mock.mock.restore;
+      mock.mock.restore = () => { if (descriptor) Object.defineProperty(object, methodName, descriptor); else delete object[methodName]; restore(); };
+      this._restores.push(mock.mock.restore);
+      return mock;
+    }
+    getter(object, name, implementation, options) { return this.method(object, name, implementation, { ...options, getter: true }); }
+    setter(object, name, implementation, options) { return this.method(object, name, implementation, { ...options, setter: true }); }
+    module() { throw new Error("mock.module is not supported in lumen"); }
+    reset() { this.restoreAll(); }
+    restoreAll() { for (const r of this._restores.splice(0)) r(); }
+  }
+
+  let passed = 0, failed = 0, skipped = 0, todo = 0, total = 0;
+  const out = (s) => { process.stdout.write(s + "\n"); };
+  // Report lines stream out as tests finish, like Node's spec reporter.
+  const lines = { push: out, splice: () => [] };
+
+  function describeError(e) {
+    if (e && typeof e === "object" && "stack" in e && e.stack) return String(e.stack);
+    if (e && typeof e === "object" && "message" in e) return `${e.name || "Error"}: ${e.message}`;
+    return String(e);
+  }
+
+  // A test (or suite) in the tree. Children run after the body has registered them, in order.
+  class TestNode {
+    constructor(parent, name, options, fn, kind) {
+      this.parent = parent;
+      this.name = name;
+      this.options = options || {};
+      this.fn = fn;
+      this.kind = kind; // "test" | "suite"
+      this.children = [];
+      this.hooks = { before: [], after: [], beforeEach: [], afterEach: [] };
+      this.depth = parent ? parent.depth + 1 : 0;
+      this.mock = new MockTracker();
+      this.done = false;
+    }
+    get fullName() { return this.parent && this.parent.parent ? `${this.parent.fullName} > ${this.name}` : this.name; }
+    hasOnly() { return this.children.some((c) => c.options.only || c.hasOnly()); }
+  }
+
+  const root = new TestNode(null, "<root>", {}, null, "suite");
+  let current = root;
+  let running = false;
+
+  async function runHooks(list, ctx) { for (const h of list) await h(ctx); }
+  async function runEachHooks(node, which, ctx) {
+    const chain = [];
+    for (let n = node.parent; n; n = n.parent) chain.push(n);
+    if (which === "beforeEach") chain.reverse();
+    for (const n of chain) await runHooks(n.hooks[which], ctx);
+  }
+
+  function makeContext(node) {
+    const ctx = {
+      name: node.name,
+      fullName: node.fullName,
+      signal: typeof AbortController === "function" ? new AbortController().signal : undefined,
+      mock: node.mock,
+      assert,
+      diagnostic(message) { lines.push(`${"  ".repeat(node.depth)}# ${message}`); },
+      skip(message) { ctx._skipped = message || true; },
+      todo(message) { ctx._todo = message || true; },
+      plan() {},
+      after(fn) { node.hooks.after.push(fn); },
+      before(fn) { node.hooks.before.push(fn); },
+      beforeEach(fn) { node.hooks.beforeEach.push(fn); },
+      afterEach(fn) { node.hooks.afterEach.push(fn); },
+      test(name, options, fn) { return declare(node, name, options, fn, "test"); },
+      waitFor: async (fn, options) => {
+        const timeout = (options && options.timeout) || 1000, interval = (options && options.interval) || 50;
+        const deadline = now() + timeout;
+        for (;;) {
+          try { return await fn(); } catch (e) { if (now() >= deadline) throw e; }
+          await new Promise((r) => setTimeout(r, interval));
+        }
+      },
+    };
+    ctx.runOnly = () => {};
+    return ctx;
+  }
+
+  function withTimeout(promise, ms, name) {
+    if (!(ms > 0) || ms === Infinity) return promise;
+    let timer;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`test timed out after ${ms}ms`)), ms); });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  async function runNode(node, onlyMode) {
+    const skipReason = node.options.skip;
+    const todoReason = node.options.todo;
+    const indent = "  ".repeat(node.depth - 1);
+    const skipNow = (suffix) => {
+      if (node.kind === "test") { skipped++; total++; }
+      lines.push(`${indent}﹣ ${node.name} # SKIP${suffix}`);
+      node.done = true;
+      if (node.onDone) node.onDone();
+    };
+    if (onlyMode && !node.options.only && !node.hasOnly()) return skipNow("");
+    if (skipReason) return skipNow(typeof skipReason === "string" ? " " + skipReason : "");
+    const start = now();
+    const ctx = makeContext(node);
+    let error = null;
+    const previous = current;
+    current = node;
+    try {
+      if (node.kind === "test") await runEachHooks(node, "beforeEach", ctx);
+      await runHooks(node.hooks.before, ctx);
+      node.running = true;
+      if (typeof node.fn === "function") {
+        const result = node.fn.length >= 2
+          ? new Promise((resolve, reject) => { try { node.fn(ctx, (e) => (e ? reject(e) : resolve())); } catch (e) { reject(e); } })
+          : Promise.resolve().then(() => node.fn(ctx));
+        await withTimeout(result, node.options.timeout, node.name);
+      }
+      const childOnly = node.hasOnly();
+      while (node.children.some((c) => !c.done && !c.running)) {
+        await runNode(node.children.find((c) => !c.done && !c.running), childOnly);
+      }
+    } catch (e) {
+      error = e;
+    } finally {
+      node.running = false;
+      current = previous;
+      try { await runHooks(node.hooks.after, ctx); } catch (e) { error = error || e; }
+      // Each-hooks wrap tests, not suites (a suite's own hooks wrap the tests inside it).
+      if (node.kind === "test") {
+        try { await runEachHooks(node, "afterEach", ctx); } catch (e) { error = error || e; }
+      }
+      node.mock.restoreAll();
+      node.done = true;
+      if (node.onDone) node.onDone();
+    }
+    const ms = (now() - start).toFixed(3);
+    // The summary counts tests; suites are tallied separately and a suite fails only through
+    // its tests (or its own hooks), so it is not one more failure.
+    const isTest = node.kind === "test";
+    if (isTest) total++;
+    const childFailed = node.children.some((c) => c.failed);
+    if (ctx._skipped) { if (isTest) skipped++; lines.push(`${indent}﹣ ${node.name} # SKIP`); return; }
+    if (ctx._todo || todoReason) { if (isTest) todo++; lines.push(`${indent}${error ? "✖" : "✔"} ${node.name} # TODO`); return; }
+    if (error || childFailed) {
+      if (isTest || (error && !childFailed)) failed++;
+      node.failed = true;
+      lines.push(`${indent}✖ ${node.name} (${ms}ms)`);
+      if (error) {
+        for (const l of describeError(error).split("\n")) lines.push(`${indent}  ${l}`);
+        node.error = error;
+      }
+    } else {
+      if (isTest) passed++;
+      lines.push(`${indent}✔ ${node.name} (${ms}ms)`);
+    }
+  }
+
+  let queue = Promise.resolve();
+  let scheduled = false;
+  // A test awaiting something the loop does not otherwise hold open (an unref'd timer, say)
+  // must still get to finish: the harness keeps the loop alive for the whole run, as Node's
+  // does, and the exit hook above only ever sees a genuinely stuck test.
+  let keepAlive = null;
+  function schedule() {
+    if (scheduled) return;
+    scheduled = true;
+    // Let the whole file register its tests before the first one runs (Node does the same).
+    setTimeout(() => {
+      scheduled = false;
+      if (running) return;
+      running = true;
+      keepAlive = setInterval(() => {}, 1 << 30);
+      queue = queue.then(async () => {
+        const onlyMode = root.hasOnly();
+        const rootCtx = makeContext(root);
+        try {
+          await runHooks(root.hooks.before, rootCtx);
+          while (root.children.some((c) => !c.done && !c.running)) {
+            await runNode(root.children.find((c) => !c.done && !c.running), onlyMode);
+          }
+        } catch (e) {
+          failed++;
+          lines.push(`✖ hook failed: ${describeError(e)}`);
+        }
+        try { await runHooks(root.hooks.after, rootCtx); } catch (e) { failed++; lines.push(`✖ after hook failed: ${describeError(e)}`); }
+        root.hooks.before.length = root.hooks.after.length = 0;
+        running = false;
+        clearInterval(keepAlive);
+        report();
+      });
+    }, 0);
+  }
+
+  // A test that is still awaiting something when the loop goes quiet never finishes: Node
+  // reports it as cancelled and fails the run, rather than exiting 0 in silence.
+  process.on("exit", () => {
+    if (!running) return;
+    const unfinished = [];
+    const walk = (n) => { for (const c of n.children) { if (!c.done) unfinished.push(c); walk(c); } };
+    walk(root);
+    for (const c of unfinished) out(`✖ ${c.fullName} (cancelled: the process exited before the test finished)`);
+    if (unfinished.length) { failed += unfinished.length; total += unfinished.length; }
+    running = false;
+    clearInterval(keepAlive);
+    report();
+  });
+
+  function report() {
+    out(`ℹ tests ${total}`);
+    out(`ℹ suites ${root.children.filter((c) => c.kind === "suite").length}`);
+    out(`ℹ pass ${passed}`);
+    out(`ℹ fail ${failed}`);
+    out(`ℹ cancelled 0`);
+    out(`ℹ skipped ${skipped}`);
+    out(`ℹ todo ${todo}`);
+    if (failed > 0) {
+      out("");
+      out("✖ failing tests:");
+      const walk = (n) => { for (const c of n.children) { if ((c.failed && c.error) || !c.done) out(`✖ ${c.fullName}`); walk(c); } };
+      walk(root);
+      process.exitCode = 1;
+    }
+    passed = failed = skipped = todo = total = 0;
+    root.children.length = 0;
+  }
+
+  function normalize(name, options, fn) {
+    if (typeof name === "function") { fn = name; name = fn.name || "<anonymous>"; options = {}; }
+    else if (typeof options === "function") { fn = options; options = {}; }
+    return { name: String(name), options: options || {}, fn };
+  }
+
+  function declare(parent, name, options, fn, kind) {
+    const spec = normalize(name, options, fn);
+    const node = new TestNode(parent, spec.name, spec.options, spec.fn, kind);
+    parent.children.push(node);
+    // A subtest declared from inside its parent's body runs right away, so `await t.test(...)`
+    // sequences like it does in Node; a top-level test waits for the file to finish registering.
+    if (parent.running) return runNode(node, false);
+    if (parent === root) schedule();
+    return new Promise((resolve) => { node.onDone = resolve; });
+  }
+
+  const test = (name, options, fn) => declare(current, name, options, fn, "test");
+  const describe = (name, options, fn) => {
+    const spec = normalize(name, options, fn);
+    const node = new TestNode(current, spec.name, spec.options, null, "suite");
+    current.children.push(node);
+    // A suite's body runs immediately so its tests register in order under it.
+    const previous = current;
+    current = node;
+    try { if (spec.fn) spec.fn(); } finally { current = previous; }
+    if (previous === root) schedule();
+    return Promise.resolve();
   };
+  const variants = (base) => {
+    base.skip = (name, options, fn) => { const s = normalize(name, options, fn); return base(s.name, { ...s.options, skip: true }, s.fn); };
+    base.todo = (name, options, fn) => { const s = normalize(name, options, fn); return base(s.name, { ...s.options, todo: true }, s.fn); };
+    base.only = (name, options, fn) => { const s = normalize(name, options, fn); return base(s.name, { ...s.options, only: true }, s.fn); };
+    return base;
+  };
+  variants(test);
+  variants(describe);
   test.test = test;
   test.it = test;
-  test.describe = (name, fn) => { if (typeof name === "function") name(); else if (fn) fn(); };
-  test.suite = test.describe;
-  test.before = () => {};
-  test.after = () => {};
-  test.beforeEach = () => {};
-  test.afterEach = () => {};
-  test.mock = { fn: (impl) => impl || (() => {}), method: () => {}, reset: () => {} };
+  test.describe = describe;
+  test.suite = describe;
+  test.before = (fn) => { current.hooks.before.push(fn); };
+  test.after = (fn) => { current.hooks.after.push(fn); };
+  test.beforeEach = (fn) => { current.hooks.beforeEach.push(fn); };
+  test.afterEach = (fn) => { current.hooks.afterEach.push(fn); };
+  test.mock = new MockTracker();
+  test.run = () => { throw new Error("test.run is not supported in lumen"); };
+  test.snapshot = { setDefaultSnapshotSerializers() {}, setResolveSnapshotPath() {} };
+  test.assert = assert;
   __builtins.set("test", test);
 }

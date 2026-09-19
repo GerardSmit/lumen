@@ -62,6 +62,8 @@ pub fn extension() -> Extension {
                     "loadNativeAddon" (1) => napi::op_load_addon,
                     "isProxy" (1) => op_is_proxy,
                     "collectGarbage" (0) => op_collect_garbage,
+                    "asyncContextGet" (0) => op_async_context_get,
+                    "asyncContextSet" (1) => op_async_context_set,
                     "heapObjectCount" (0) => op_heap_object_count,
                     "drainMicrotasks" (0) => op_drain_microtasks,
                     "transformJsx" (1) => op_transform_jsx,
@@ -109,6 +111,11 @@ pub fn extension() -> Extension {
                     "zstdCompress" (1) => op_zlib_zstd_compress,
                     "zstdDecompress" (1) => op_zlib_zstd_decompress,
                     "crc32" (2) => op_zlib_crc32,
+                    "streamOpen" (1) => op_zlib_stream_open,
+                    "streamWrite" (2) => op_zlib_stream_write,
+                    "streamFlush" (2) => op_zlib_stream_flush,
+                    "streamReset" (1) => op_zlib_stream_reset,
+                    "streamClose" (1) => op_zlib_stream_close,
                 ],
             ),
             (
@@ -164,6 +171,7 @@ pub fn extension() -> Extension {
             state.put(net::NetRegistry::default());
             state.put(net::DgramRegistry::default());
             state.put(tls::TlsRegistry::default());
+            state.put(ZlibStreams::default());
         }),
         js_init: Some(JS_GLUE),
         js_init_snapshot: Some(JS_GLUE_SNAPSHOT),
@@ -190,6 +198,16 @@ fn op_is_proxy(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
     Ok(Value::Bool(
         ctx.is_proxy_value(args.first().unwrap_or(&Value::Undefined)),
     ))
+}
+
+/// `()` — the current async context value (see `Interp::async_context`).
+fn op_async_context_get(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(ctx.async_context())
+}
+
+/// `(context)` — make `context` current, returning the previous one so the caller can restore it.
+fn op_async_context_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(ctx.set_async_context(args.first().cloned().unwrap_or(Value::Undefined)))
 }
 
 fn op_collect_garbage(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -830,7 +848,7 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let release = os_release();
+    let (release, version) = os_release_version();
 
     let obj = Value::Obj(ctx.new_object());
     for (k, v) in [
@@ -840,6 +858,7 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         ("homedir", home),
         ("tmpdir", tmpdir),
         ("release", release),
+        ("version", version),
         (
             "endianness",
             if cfg!(target_endian = "big") {
@@ -853,15 +872,129 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         let _ = ctx.set_member(&obj, k, Value::from_string(v));
     }
     let _ = ctx.set_member(&obj, "cpus", Value::Num(cpus as f64));
+    let (cpu_model, cpu_speed_mhz, total_mem) = cpu_and_memory_facts();
+    let _ = ctx.set_member(&obj, "cpuModel", Value::from_string(cpu_model));
+    let _ = ctx.set_member(&obj, "cpuSpeed", Value::Num(cpu_speed_mhz as f64));
+    let _ = ctx.set_member(&obj, "totalmem", Value::Num(total_mem as f64));
     Ok(obj)
 }
 
-fn os_release() -> String {
-    // std exposes no uname(); read the one file Linux publishes it in, else leave it blank
-    // rather than invent a version.
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+/// `(cpu model, cpu speed in MHz, total memory in bytes)` for `os.cpus()` / `os.totalmem()`.
+/// Playwright reads the model to tell Apple silicon from Intel when it picks a browser build.
+#[cfg(target_os = "macos")]
+fn cpu_and_memory_facts() -> (String, u64, u64) {
+    extern "C" {
+        fn sysctlbyname(
+            name: *const std::os::raw::c_char,
+            oldp: *mut std::os::raw::c_void,
+            oldlenp: *mut usize,
+            newp: *mut std::os::raw::c_void,
+            newlen: usize,
+        ) -> std::os::raw::c_int;
+    }
+    fn read(name: &str, buf: &mut [u8]) -> Option<usize> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let mut len = buf.len();
+        // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
+        let rc = unsafe {
+            sysctlbyname(
+                cname.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(len)
+    }
+    let mut model = [0u8; 256];
+    let model = read("machdep.cpu.brand_string", &mut model)
+        .map(|n| String::from_utf8_lossy(&model[..n]).trim_end_matches('\0').to_string())
+        .unwrap_or_default();
+    let mut u64_buf = [0u8; 8];
+    let hz = read("hw.cpufrequency", &mut u64_buf)
+        .filter(|&n| n == 8)
+        .map(|_| u64::from_ne_bytes(u64_buf))
+        .unwrap_or(0);
+    let memsize = read("hw.memsize", &mut u64_buf)
+        .filter(|&n| n == 8)
+        .map(|_| u64::from_ne_bytes(u64_buf))
+        .unwrap_or(0);
+    (model, hz / 1_000_000, memsize)
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_and_memory_facts() -> (String, u64, u64) {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let field = |key: &str| {
+        cpuinfo
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+    };
+    let model = field("model name").unwrap_or_default();
+    let mhz = field("cpu MHz")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0) as u64;
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(0);
+    (model, mhz, total)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn cpu_and_memory_facts() -> (String, u64, u64) {
+    (String::new(), 0, 0)
+}
+
+/// `(os.release(), os.version())` — utsname's `release` and `version` fields. std exposes no
+/// uname(), so on macOS and Linux this calls it directly; Playwright reads the release to pick a
+/// browser build for the running macOS, and an empty string sends it to the wrong one.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn os_release_version() -> (String, String) {
+    // struct utsname is N fixed-size char arrays: 256 each on macOS, 65 each on Linux (glibc
+    // adds a sixth, `domainname`). Only sysname/nodename/release/version/machine are read.
+    #[cfg(target_os = "macos")]
+    const FIELD: usize = 256;
+    #[cfg(target_os = "linux")]
+    const FIELD: usize = 65;
+    #[repr(C)]
+    struct Utsname([[std::os::raw::c_char; FIELD]; 6]);
+    extern "C" {
+        fn uname(buf: *mut Utsname) -> std::os::raw::c_int;
+    }
+    let mut buf = Utsname([[0; FIELD]; 6]);
+    // SAFETY: `buf` is a writable utsname at least as large as the platform's struct.
+    if unsafe { uname(&mut buf) } != 0 {
+        return (String::new(), String::new());
+    }
+    let field = |i: usize| {
+        let bytes: Vec<u8> = buf.0[i]
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    (field(2), field(3))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn os_release_version() -> (String, String) {
+    // No uname; Linux-style fallback for other unixes, blank elsewhere rather than an invented
+    // version.
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (release, String::new())
 }
 
 /// Best-effort hostname without a syscall or crate: env, then the file Linux writes it to,
@@ -1031,6 +1164,108 @@ fn op_zlib_zstd_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Valu
     zlib_decompress_op(ctx, a, lumen_host::zstd::zstd_decompress)
 }
 /// `__zlib.crc32(bytes, seed)` — CRC-32 of `bytes`, optionally continued from `seed`.
+// ---- streaming raw deflate/inflate (`zlib.createDeflateRaw` / `createInflateRaw`) ---------------
+
+enum ZlibStream {
+    Deflate(lumen_host::deflate::Deflater),
+    Inflate(lumen_host::deflate::Inflater),
+}
+
+/// Live streaming codecs, keyed by the id JS holds. A stream is released by `streamClose`
+/// (the JS object's `close()`/`destroy()`), or leaks with the object — Node's does the same.
+#[derive(Default)]
+struct ZlibStreams {
+    next: u64,
+    streams: std::collections::HashMap<u64, ZlibStream>,
+}
+
+/// `(kind)` — `"deflate"` or `"inflate"`; returns the stream id.
+fn op_zlib_stream_open(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let kind = ctx
+        .coerce_string(a.first().unwrap_or(&Value::Undefined))?
+        .to_string();
+    let stream = match kind.as_str() {
+        "deflate" => ZlibStream::Deflate(lumen_host::deflate::Deflater::new()),
+        "inflate" => ZlibStream::Inflate(lumen_host::deflate::Inflater::new()),
+        other => {
+            return Err(ctx.make_error("TypeError", format!("unknown zlib stream kind {other:?}")))
+        }
+    };
+    let reg = ctx.host_mut::<ZlibStreams>().expect("registry");
+    reg.next += 1;
+    let id = reg.next;
+    reg.streams.insert(id, stream);
+    Ok(Value::Num(id as f64))
+}
+
+fn zlib_stream_id(a: &[Value]) -> u64 {
+    a.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64
+}
+
+fn zlib_stream_missing(ctx: &Ctx) -> Value {
+    ctx.make_error("Error", "zlib stream is closed")
+}
+
+/// `(id, chunk)` — feed bytes; returns the bytes produced so far (always empty for deflate,
+/// which only emits on flush).
+fn op_zlib_stream_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let id = zlib_stream_id(a);
+    let Some(bytes) = ctx.typed_array_bytes(a.get(1).unwrap_or(&Value::Undefined)) else {
+        return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
+    };
+    let result = match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
+        Some(ZlibStream::Deflate(d)) => {
+            d.write(&bytes);
+            Ok(Vec::new())
+        }
+        Some(ZlibStream::Inflate(i)) => i.write(&bytes),
+        None => return Err(zlib_stream_missing(ctx)),
+    };
+    match result {
+        Ok(out) => ctx.make_uint8array(&out),
+        Err(e) => Err(ctx.make_error("Error", e)),
+    }
+}
+
+/// `(id, finish)` — deflate: close the block (`Z_SYNC_FLUSH`, or `Z_FINISH` when `finish`) and
+/// return its bytes; inflate: returns whether the final block has been seen (as a boolean).
+fn op_zlib_stream_flush(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let id = zlib_stream_id(a);
+    let finish = matches!(a.get(1), Some(Value::Bool(true)));
+    let result = match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
+        Some(ZlibStream::Deflate(d)) => d.flush(if finish {
+            lumen_host::deflate::Flush::Finish
+        } else {
+            lumen_host::deflate::Flush::Sync
+        }),
+        Some(ZlibStream::Inflate(i)) => return Ok(Value::Bool(i.finished())),
+        None => return Err(zlib_stream_missing(ctx)),
+    };
+    match result {
+        Ok(out) => ctx.make_uint8array(&out),
+        Err(e) => Err(ctx.make_error("Error", e)),
+    }
+}
+
+/// `(id)` — `zlib.reset()`: drop the window so the next message stands alone.
+fn op_zlib_stream_reset(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let id = zlib_stream_id(a);
+    match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
+        Some(ZlibStream::Deflate(d)) => d.reset(),
+        Some(ZlibStream::Inflate(i)) => i.reset(),
+        None => return Err(zlib_stream_missing(ctx)),
+    }
+    Ok(Value::Undefined)
+}
+
+fn op_zlib_stream_close(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let id = zlib_stream_id(a);
+    if let Some(reg) = ctx.host_mut::<ZlibStreams>() {
+        reg.streams.remove(&id);
+    }
+    Ok(Value::Undefined)
+}
+
 fn op_zlib_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let v = a.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {

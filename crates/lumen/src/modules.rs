@@ -100,6 +100,13 @@ enum Resolution {
     NotFound,
 }
 
+/// What a runtime's module hook decided for one `import` (see `Interp::esm_hook`).
+enum EsmHook {
+    Default,
+    Redirect(String),
+    Module(String, String),
+}
+
 impl Interp {
     /// Load, link, and evaluate the module identified by canonical `key` (with initial `src`),
     /// returning its namespace object.
@@ -406,12 +413,59 @@ impl Interp {
             Some(l) => l.clone(),
             None => return Err(self.throw("TypeError", "no module loader configured")),
         };
-        match loader(specifier, referrer, attr_type) {
+        // Runtime-level customization hooks (Node's `module.registerHooks`) get the first say:
+        // they can redirect the specifier or synthesize the module outright.
+        let mut specifier = specifier.to_string();
+        match self.esm_hook(&specifier, referrer, attr_type)? {
+            EsmHook::Default => {}
+            EsmHook::Redirect(s) => specifier = s,
+            EsmHook::Module(key, source) => return Ok((key, source)),
+        }
+        match loader(&specifier, referrer, attr_type) {
             Some(pair) => Ok(pair),
             None => Err(self.throw(
                 "TypeError",
                 format!("module not found: {specifier} (imported from {referrer})"),
             )),
+        }
+    }
+
+    /// Consult `globalThis.__lumenEsmHook(specifier, referrer, attrType)` when a runtime installs
+    /// one. It answers `undefined` (resolve normally), `{ specifier }` (resolve this instead) or
+    /// `{ key, source }` (an ES module synthesized by the hooks).
+    fn esm_hook(
+        &mut self,
+        specifier: &str,
+        referrer: &str,
+        attr_type: Option<&str>,
+    ) -> Result<EsmHook, Abrupt> {
+        let global = Value::Obj(self.global.clone());
+        let hook = self.get_member(&global, "__lumenEsmHook")?;
+        if !hook.is_callable() {
+            return Ok(EsmHook::Default);
+        }
+        let attr = attr_type.map_or(Value::Undefined, |t| Value::from_string(t.to_string()));
+        let args = [
+            Value::from_string(specifier.to_string()),
+            Value::from_string(referrer.to_string()),
+            attr,
+        ];
+        let result = self.call(hook, Value::Undefined, &args)?;
+        if !matches!(result, Value::Obj(_)) {
+            return Ok(EsmHook::Default);
+        }
+        let string_field = |i: &mut Self, name: &str| -> Result<Option<String>, Abrupt> {
+            Ok(match i.get_member(&result, name)? {
+                Value::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+        };
+        if let Some(redirect) = string_field(self, "specifier")? {
+            return Ok(EsmHook::Redirect(redirect));
+        }
+        match (string_field(self, "key")?, string_field(self, "source")?) {
+            (Some(key), Some(source)) => Ok(EsmHook::Module(key, source)),
+            _ => Ok(EsmHook::Default),
         }
     }
 
@@ -530,7 +584,7 @@ impl Interp {
                         mutable: false,
                         strict_immutable: true,
                         initialized: true,
-                        import_ref: Some((src_env, src_local)),
+                        import_ref: Some(Box::new((src_env, src_local))),
                         deletable: false,
                     },
                 );
@@ -776,7 +830,7 @@ impl Interp {
             let mut dst = dns.borrow_mut();
             for (k, p) in src.props.iter() {
                 let mut p = p.clone();
-                if Interp::is_sym_key(k) {
+                if Interp::is_sym_key(&k) {
                     if let Value::Str(tag) = p.value() {
                         if &*tag == "Module" {
                             p.set_value(Value::from_string("Deferred Module".to_string()));
@@ -826,9 +880,9 @@ impl Interp {
                             let src = base_o.borrow();
                             let mut dst = stub.borrow_mut();
                             for (k, p) in src.props.iter() {
-                                if dst.props.get(k).is_none() {
+                                if dst.props.get(&k).is_none() {
                                     let mut p = p.clone();
-                                    if Interp::is_sym_key(k) {
+                                    if Interp::is_sym_key(&k) {
                                         if let Value::Str(tag) = p.value() {
                                             if &*tag == "Module" {
                                                 p.set_value(Value::from_string(
