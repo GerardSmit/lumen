@@ -1,7 +1,7 @@
 //! Shared bounded packed-array construction from owned values.
-use super::shapes::{fn_key, shape_transition, ARRAY_LENGTH_SHAPE, SHAPE_EMPTY};
+use super::shapes::array_length_shape;
 use super::storage::{DenseBuffers, DenseStorage, InlinePacked, INLINE_PACKED_CAPACITY};
-use super::{Props, NO_SLOT};
+use super::Props;
 use crate::value::{Property, Value};
 use std::cell::Cell;
 
@@ -34,37 +34,23 @@ impl Props {
             assert_eq!(packed.len(), len, "incorrect exact iterator length");
             (InlinePacked::default(), Some(Box::new(packed)))
         };
-        let length_key = fn_key(0);
-        let shape = ARRAY_LENGTH_SHAPE.with(|cached| {
-            let shape = cached.get();
-            if shape != 0 {
-                shape
-            } else {
-                let shape = shape_transition(SHAPE_EMPTY, &length_key);
-                cached.set(shape);
-                shape
-            }
-        });
+        let shape = array_length_shape();
         Props {
-            entries: vec![(
-                length_key,
-                Property::data(Value::Num(len as f64), true, false, false),
-            )],
-            shape,
+            entries: std::iter::once(Property::data(Value::Num(len as f64), true, false, false))
+                .collect(),
+            shape: shape.id,
+            shape_rc: Some(shape),
             elems: DenseStorage(Some(Box::new(DenseBuffers {
-                index: None,
                 packed,
                 inline_packed,
                 elems: Vec::new(),
                 mirror: Vec::new(),
+                mirror_flags: 0,
+                mirror_holes: 0,
             }))),
-            mirror_flags: 0,
-            mirror_holes: 0,
             proto_flag: Cell::new(false),
             has_far: Cell::new(false),
             elem_mode: Cell::new(true),
-            proto_slot: Cell::new(NO_SLOT),
-            len_slot: Cell::new(0),
         }
     }
 }
@@ -90,7 +76,7 @@ mod tests {
             assert!(length.writable() && !length.enumerable() && !length.configurable());
             assert!(matches!(length.value(), Value::Num(n) if n == len as f64));
             assert_eq!(props.entries.len(), 1);
-            assert_eq!(props.mirror_flags, 0);
+            assert_eq!(props.elems.mirror_flags(), 0);
             assert_eq!(*shape.get_or_insert(props.shape), props.shape);
             for index in 0..len {
                 assert!(

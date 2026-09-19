@@ -90,6 +90,6 @@ fn describe_callee(target: &crate::bytecode::InlineTarget) -> String {
     format!(
         "callee_object={object_id} callee_function={} callee_source={:?}",
         Rc::as_ptr(&user.func) as usize,
-        user.func.source.as_deref()
+        user.func.source().as_deref()
     )
 }

@@ -1,12 +1,11 @@
 //! A guarded own hint uses its known exotic kind and constant entry offset.
-use super::key;
 use crate::bytecode::{IcState, IC_ARR_KEYCHK};
 use crate::jit::{asm::Asm, C_HS, C_NE};
 use crate::value::JitLayout;
 
 /// Input x11 is a stored Rc. Success returns x15 through `done`; failure restores x11
 /// for the generic probe. Only x9..x17 are scratch; no values or ownership are changed.
-pub(super) fn emit(a: &mut Asm, layout: &JitLayout, state: IcState, name: &str, done: usize) {
+pub(super) fn emit(a: &mut Asm, layout: &JitLayout, state: IcState, done: usize) {
     let miss = a.new_label();
     a.add_imm(11, 11, layout.obj_from_rc as u32);
     a.ldrb_imm(9, 11, layout.obj_exotic as u32);
@@ -23,19 +22,11 @@ pub(super) fn emit(a: &mut Asm, layout: &JitLayout, state: IcState, name: &str, 
     a.mov_imm64(16, state.recv_shape as u64);
     a.cmp_reg_w(9, 16);
     a.b_cond(C_NE, miss);
-    a.ldr_imm(
-        16,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    a.ldr_w_imm(16, 11, (layout.obj_props + layout.props_entries_len) as u32);
     a.mov_imm64(13, state.slot as u64);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, miss);
-    a.ldr_imm(
-        15,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    a.ldr_imm(15, 11, (layout.obj_props + layout.props_entries_ptr) as u32);
     // get_prop_inlinable bounds entry_size below 65536; slot is u32, so this fits u64.
     let offset = state.slot as u64 * layout.entry_size as u64;
     if offset != 0 {
@@ -45,9 +36,6 @@ pub(super) fn emit(a: &mut Asm, layout: &JitLayout, state: IcState, name: &str, 
             a.mov_imm64(16, offset);
             a.add_shifted(15, 15, 16, 0);
         }
-    }
-    if state.depth == IC_ARR_KEYCHK {
-        key::emit(a, layout, name, miss);
     }
     crate::jit::guard_prop_data(a, 9, 15, layout.entry_accessor as u32, miss);
     #[cfg(test)]

@@ -170,12 +170,7 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
             });
         slots
     };
-    let property_at = |index: usize| {
-        p.props
-            .entry_at(slots[index] as usize)
-            .filter(|(key, _)| &**key == names[index])
-            .map(|(_, property)| property)
-    };
+    let property_at = |index: usize| p.props.entry_at(slots[index] as usize);
     let getter_is = |index: usize, native: NativeFn| {
         property_at(index).is_some_and(|property| {
             matches!(

@@ -545,10 +545,72 @@ experimental binaries, the iterator-only control patch, valid profile and raw re
 `layout-control-metadata.json` records binary and workload hashes; `layout-control-results.json`
 and `layout-control-summary.json` contain all five final rounds.
 
+### Shape-owned property keys
+
+Property keys now live in the shape rather than in each object. `Props.entries` is a
+`Vec<Property>` (16 bytes per slot, down from 32 for `(Rc<str>, Property)`); the ordered key
+list and, past eight keys, a lazily built key-to-slot hash index belong to the `Shape` and are
+shared by every object of that shape. The transition tree is unchanged (memoized by parent id
+and key, hosted in `GcState` so coroutine workers see one table). A structural change that is
+not a tree transition — deletion, or growth past 32 named keys — detaches the object to an
+*owned* shape: a private copy of the key list, mutated in place and re-identified on every
+change, so a stale inline-cache entry can never validate against it. Creation caches refuse to
+record an owned child shape.
+
+Array elements keep their slots in `entries` past the named prefix (`entries[0..shape.len()]`
+holds the named properties in shape order); inserting a named key while elements exist moves
+the element at that slot to the end. This pins an array's named slots by shape exactly like an
+ordinary object's, which retired the inline key compare the JIT performed for array holders
+(`IC_ARR_KEYCHK` now only selects the exotic gate).
+
+On the driver workload the live heap fell from 99.6 MB to 92.6 MB and the physical footprint
+from 117.7 MB to 110.0 MB; `Props` stayed at 56 bytes. Djot (10000 verified iterations) went
+from a 8255–8458 ms median band to 7706–7824 ms, and the v8-v7 suite scored flat to better
+(DeltaBlue 1937–1950 to 2027–2069, RayTrace 2420–2452 to 2534–2554). test262 pass counts on
+the object and property directories are identical before and after (14925 pass, 723 fail).
+
 The next profile-driven target is the blanket exclusion of class constructors from compiled
 execution. Base-class field initialization already occurs before the body in
 `run_constructor_on`; derived constructors still require their special this/return handling.
 This needs explicit eligibility and correctness checks before any performance claim.
+
+### Object header at 72 bytes and shared closure entry blocks
+
+`Object` is 72 bytes (96 allocated with the `Rc<RefCell<_>>` header, down from 104/128):
+
+- `Props` is 40 bytes. `entries` is an `EntryVec` (`ptr`, `u32 len`, `u32 cap`) instead of a
+  24-byte `Vec`; the dense mirror flags and hole count moved into the `DenseBuffers` sidecar,
+  which only arrays with element storage allocate.
+- `Exotic` is a one-byte tag. The wrapper payloads (`[[NumberData]]`, the boxed string, the
+  error stack) live in a hidden own entry under the private key `EXOTIC_SLOT` (`#\0exotic`),
+  which every reflection path already filters as a private key. `Object::set_exotic`,
+  `str_wrap`, `num_wrap`, `error_stack` and friends are the accessors.
+- The GC mark bit shares the `gc_internal` word (bit 31) with the slot/internal-ref count.
+
+Going below 72 was not pursued: 64 and 72 both land in the 96-byte malloc class on macOS, and the
+remaining candidates (`shape`, `shape_rc`, `elems`) sit on inline-cache paths.
+
+Closures no longer copy their `length`/`name` entries. `EntryVec` has a shared mode
+(`cap == 0 && len > 0`, refcount header before the entries) that every `&mut` path unshares
+with a copy; a function's `FnMaps` template holds the block, and `make_function` hands each
+non-constructor closure a reference to it. `set_fn_name` (NamedEvaluation) swaps in a cached
+named variant of the template rather than writing. Only non-writable, non-accessor,
+non-object entries may be shared: JIT in-place stores need a writable slot and the cycle
+collector counts object edges per owner. The creation inline cache sees `cap == 0` and misses,
+so a shared block is never appended to in place. Constructors still get an eager `prototype`
+entry (5857 of 89899 closures on the driver workload), so their blocks stay owned.
+
+`JitLayout` now exposes `props_entries_ptr/len/cap` (32-bit len and cap loads, `ldr_w`) and
+`dense_mirror_flags`, an offset inside the sidecar; every mirror-flag read loads the `elems`
+pointer first and falls back when it is null. `vec_cap_off` and `props_mirror_flags` are gone.
+
+On the driver workload (`require("patchright-core")`) the live heap fell from 90.66 MB to
+82.62 MB and the physical footprint from 103.6–105.4 MB to 96.0–102.0 MB; the 128-byte malloc
+class went from 157018 to 5024 nodes and 96-byte from 15274 to 182708. Closure creation got
+faster (3M `function`/arrow pairs: 5844 to 4929 ms); property get/set/create, dictionary and
+call micro-benches are flat within noise. The playwright driver suite (97 tests) peaked at
+269 MB RSS versus 283 MB. test262 on the function, class and object directories is identical
+(10685 pass, 628 fail; `built-ins/Function/prototype/bind` 100/100).
 
 ### Compiled base-class constructor bodies
 

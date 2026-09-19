@@ -1,6 +1,7 @@
-//! Borrow an own data-property entry through live ordinary/array cache ways.
+//! Borrow an own data-property entry through live ordinary/array cache ways. Named slots are
+//! pinned by the shape on arrays too (element entries live past the named prefix), so an array
+//! holder needs no key re-check — only its exotic tag differs.
 mod compact;
-mod key;
 use crate::bytecode::{
     IcState, IC_ARR_KEYCHK, IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS,
 };
@@ -22,11 +23,12 @@ pub(super) fn own_entry_with_hint(
     preferred: Option<IcState>,
     fail: usize,
 ) {
+    let _ = name;
     let done = a.new_label();
     let mut preferred = preferred.filter(|s| matches!(s.depth, 0 | IC_ARR_KEYCHK));
     if std::env::var_os("LUMEN_JIT_NO_COMPACT_PROPERTY_HINT").is_none() {
         if let Some(state) = preferred {
-            compact::emit(a, layout, state, name, done);
+            compact::emit(a, layout, state, done);
             preferred = None;
         }
     }
@@ -39,7 +41,7 @@ pub(super) fn own_entry_with_hint(
         a.cmp_reg_w(9, 10);
         a.b_cond(C_NE, live);
         a.mov_imm64(13, state.slot as u64);
-        entry(a, layout, name, live);
+        entry(a, layout, live);
         #[cfg(test)]
         record_hint(a);
         a.b(done);
@@ -55,7 +57,7 @@ pub(super) fn own_entry_with_hint(
         a.cmp_reg_w(9, 10);
         a.b_cond(C_NE, miss);
         a.ldr_w_imm(13, 12, IC_OFF_SLOT);
-        entry(a, layout, name, miss);
+        entry(a, layout, miss);
         a.b(done);
         a.bind(miss);
     }
@@ -82,25 +84,13 @@ fn receiver(a: &mut Asm, layout: &JitLayout, fail: usize) {
     a.ldr_w_imm(10, 11, (layout.obj_props + layout.props_shape) as u32);
 }
 
-fn entry(a: &mut Asm, layout: &JitLayout, name: &str, fail: usize) {
-    a.ldr_imm(
-        16,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+fn entry(a: &mut Asm, layout: &JitLayout, fail: usize) {
+    a.ldr_w_imm(16, 11, (layout.obj_props + layout.props_entries_len) as u32);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    a.ldr_imm(
-        15,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    a.ldr_imm(15, 11, (layout.obj_props + layout.props_entries_ptr) as u32);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
-    let ordinary = a.new_label();
-    a.cbz(8, false, ordinary);
-    key::emit(a, layout, name, fail);
-    a.bind(ordinary);
     crate::jit::guard_prop_data(a, 9, 15, layout.entry_accessor as u32, fail);
 }
 

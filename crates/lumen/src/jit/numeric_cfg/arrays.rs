@@ -4,7 +4,7 @@ use super::plan::Plan;
 use crate::value::{JitLayout, MIRROR_NO_HOLES, MIRROR_OK};
 
 pub(super) fn supported(layout: &JitLayout) -> bool {
-    super::super::get_elem_inlinable(layout) && layout.obj_props + layout.props_mirror_flags < 4096
+    super::super::get_elem_inlinable(layout) && layout.dense_mirror_flags < 4096
 }
 
 // x0..x7 hold (data, length) pairs. The region is helper-free, never changes receiver
@@ -32,12 +32,12 @@ pub(super) fn preamble(a: &mut asm::Asm, plan: &Plan, layout: &JitLayout, fail: 
         a.ldrb_imm(10, 9, layout.obj_ic_plain as u32);
         a.cbz(10, false, fail);
         let need = (MIRROR_OK | MIRROR_NO_HOLES) as u32;
-        a.ldrb_imm(10, 9, (layout.obj_props + layout.props_mirror_flags) as u32);
+        a.ldr_imm(9, 9, (layout.obj_props + layout.props_elems) as u32);
+        a.cbz(9, true, fail);
+        a.ldrb_imm(10, 9, layout.dense_mirror_flags as u32);
         a.logic_imm_w(0, 10, 10, asm::logical_imm_w(need).unwrap());
         a.cmp_imm_w(10, need);
         a.b_cond(C_NE, fail);
-        a.ldr_imm(9, 9, (layout.obj_props + layout.props_elems) as u32);
-        a.cbz(9, true, fail);
         a.ldr_imm(data, 9, (layout.dense_mirror + layout.vec_ptr_off) as u32);
         a.ldr_imm(len, 9, (layout.dense_mirror + layout.vec_len_off) as u32);
     }

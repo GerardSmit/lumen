@@ -242,7 +242,7 @@ mod tests {
         binding.initialized = false;
         assert!(unsafe { checked_binding(&binding) }.is_null());
         binding.initialized = true;
-        binding.import_ref = Some((new_scope(None), "x".into()));
+        binding.import_ref = Some(Box::new((new_scope(None), "x".into())));
         assert!(unsafe { checked_binding(&binding) }.is_null());
         binding.import_ref = None;
         binding.value = Value::Empty;
@@ -309,7 +309,7 @@ mod tests {
         assert!(probe().is_null());
         holder.borrow_mut().vars.get_mut("x").unwrap().initialized = true;
         holder.borrow_mut().vars.get_mut("x").unwrap().import_ref =
-            Some((new_scope(None), "y".into()));
+            Some(Box::new((new_scope(None), "y".into())));
         assert!(probe().is_null());
         holder.borrow_mut().vars.get_mut("x").unwrap().import_ref = None;
         assert!(!probe().is_null());

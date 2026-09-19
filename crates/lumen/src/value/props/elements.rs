@@ -1,7 +1,7 @@
 //! Dense element storage and array length access.
 
 use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
-use crate::value::{index_key, Property, Value};
+use crate::value::{Property, Value};
 
 impl Props {
     /// Reserve the exact backing storage for a dense array whose initial length is known.
@@ -14,7 +14,7 @@ impl Props {
             self.entries.reserve_exact(1); // own `length`
             self.elems
                 .set_packed(Some(Box::new(Vec::with_capacity(len))));
-            self.mirror_flags = 0;
+            *self.elems.mirror_flags_mut() = 0;
         } else {
             self.entries.reserve_exact(len.saturating_add(1));
             self.elems.reserve_exact(len);
@@ -44,7 +44,7 @@ impl Props {
         packed.resize_with(len, || Property::plain(Value::Empty));
         self.elems.set_packed(Some(Box::new(packed)));
         // The raw-f64 mirror describes classic `elems` slots, not keyless packed properties.
-        self.mirror_flags = 0;
+        *self.elems.mirror_flags_mut() = 0;
     }
 
     /// Validate the storage contract used by the numeric CFG region and return the stable boxed
@@ -72,17 +72,11 @@ impl Props {
         self.elem_mode.set(true);
     }
 
-    /// The `"length"` property, resolved through the `len_slot` memo (one compare, no hashing).
-    /// `None` when there is no own `length`.
+    /// The `"length"` property, resolved through the shape's `len_slot` memo (one compare, no
+    /// hashing). `None` when there is no own `length`.
     pub(crate) fn length_property(&self) -> Option<&Property> {
-        let s = self.len_slot.get();
-        if s != NO_SLOT {
-            debug_assert!(matches!(self.entries.get(s as usize), Some((k, _)) if &**k == "length"));
-            return self.entries.get(s as usize).map(|(_, p)| p);
-        }
         let slot = self.find("length")?;
-        self.len_slot.set(slot as u32);
-        Some(&self.entries[slot].1)
+        Some(&self.entries[slot])
     }
 
     /// The own property for canonical index `n`, without hashing. `None` only means "not in the
@@ -98,28 +92,7 @@ impl Props {
         if slot == NO_SLOT {
             return None;
         }
-        Some(&self.entries[slot as usize].1)
-    }
-
-    /// Mutable [`get_index`].
-    #[inline]
-    pub(crate) fn get_index_mut(&mut self, n: u32) -> Option<&mut Property> {
-        // A raw &mut escape can rewrite the value behind the mirror's back.
-        self.mirror_invalidate();
-        if self.elems.packed_is_some() {
-            return self
-                .elems
-                .packed_mut()
-                .expect("packed storage checked")
-                .get_mut(n as usize)
-                .filter(|p| !matches!(p.value(), Value::Empty));
-        }
-        let dense = self.elems.buffers_mut();
-        let slot = *dense.elems.get(n as usize)?;
-        if slot == NO_SLOT {
-            return None;
-        }
-        Some(&mut self.entries[slot as usize].1)
+        Some(&self.entries[slot as usize])
     }
 
     /// Dense tail append: insert element `n` when `n` is exactly the dense frontier and no
@@ -141,12 +114,8 @@ impl Props {
         }
         self.note_structural();
         let slot = self.entries.len();
-        let key = index_key(n as usize);
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key.clone(), slot);
-        }
         self.reserve_entry();
-        self.entries.push((key, prop));
+        self.entries.push(prop);
         self.elems.push(slot as u32);
         self.mirror_grow(0, slot);
         Ok(())
@@ -175,12 +144,8 @@ impl Props {
         }
         self.note_structural();
         let slot = self.entries.len();
-        let key = index_key(n);
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key.clone(), slot);
-        }
         self.reserve_entry();
-        self.entries.push((key, prop));
+        self.entries.push(prop);
         if n < old_len {
             self.elems[n] = slot as u32;
             self.mirror_sync(n, slot, true);
@@ -228,49 +193,49 @@ impl Props {
             return None;
         }
         let slot = self.elems[n as usize];
-        if slot == NO_SLOT || slot as usize + 1 != self.entries.len() {
+        // The element must be the last entry and sit in the element region (a named index key —
+        // `has_far` is excluded above, but a non-array-built map could hold one — would need a
+        // shape change).
+        if slot == NO_SLOT
+            || slot as usize + 1 != self.entries.len()
+            || (slot as usize) < self.named_len()
+        {
             return None;
         }
-        let p = &self.entries[slot as usize].1;
+        let p = &self.entries[slot as usize];
         if p.accessor() || !p.configurable() {
             return None;
         }
         self.note_structural();
-        let (_, p) = self.entries.pop().unwrap();
+        let p = self.entries.pop().unwrap();
         self.elems.pop();
-        if let Some(index) = self.elems.index_mut() {
-            index.remove(&index_key(n as usize));
-        }
-        if self.mirror_flags & MIRROR_OK != 0 {
+        if self.elems.mirror_flags() & MIRROR_OK != 0 {
             debug_assert_eq!(self.elems.mirror_len(), self.elems.len() + 1);
             let m = self.elems.mirror_pop();
             if m.map(f64::to_bits) == Some(MIRROR_HOLE) {
                 // (Unreachable while the slot was live, but keep the accounting exact.)
-                self.mirror_holes -= 1;
-                if self.mirror_holes == 0 {
-                    self.mirror_flags |= MIRROR_NO_HOLES;
+                let holes = self.elems.mirror_holes_mut();
+                *holes -= 1;
+                if *holes == 0 {
+                    *self.elems.mirror_flags_mut() |= MIRROR_NO_HOLES;
                 }
             }
         }
         Some(p.into_value())
     }
 
-    /// Append the next dense element while *building a fresh array in order* (element index ==
-    /// entry slot == dense slot): skips the canonical-index parse and, for small indices, the
-    /// key-string allocation. Only valid on a Props whose entries so far are exactly the dense
-    /// elements 0..len.
+    /// Append the next dense element while *building a fresh array in order*: element index ==
+    /// dense slot, entry slot == the next free entry. Skips the canonical-index parse and any
+    /// key allocation. Only valid on an array map whose dense elements so far are exactly
+    /// 0..len.
     pub(crate) fn push_dense(&mut self, prop: Property) {
         if let Some(packed) = self.elems.packed_mut() {
             packed.push(prop);
             return;
         }
         let slot = self.entries.len();
-        let key = index_key(slot);
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key.clone(), slot);
-        }
         self.reserve_entry();
-        self.entries.push((key, prop));
+        self.entries.push(prop);
         self.elems.push(slot as u32);
         self.mirror_grow(0, slot);
     }

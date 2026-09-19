@@ -1,91 +1,125 @@
-//! Property insertion, removal, and secondary index maintenance.
-use super::shapes::{shape_fresh, shape_transition, INDEX_THRESHOLD};
-use super::{Props, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
+//! Property insertion, removal, and shape maintenance.
+use super::shapes::{
+    fresh_owned_id, shape_by_id, shape_owned_from, shape_transition, Shape, INDEX_THRESHOLD,
+    OWNED_THRESHOLD, SHAPE_EMPTY,
+};
+use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
 use crate::value::{canonical_index, Property, Value};
 use std::rc::Rc;
 
 impl Props {
-    /// Whether adding `key` should create the string-key hash index. Dense array elements already
-    /// have O(1) lookup through `elems`, so counting them toward the generic-map threshold creates
-    /// a redundant hash table for every modest-sized array. Only named properties count toward
-    /// the threshold on arrays; once an index exists we continue maintaining all of its entries.
-    pub(super) fn should_build_index(&self, key: &str) -> bool {
-        if !self.elem_mode.get() {
-            return self.entries.len() + 1 > INDEX_THRESHOLD;
-        }
-        if canonical_index(key).is_some() {
-            return false;
-        }
-        self.entries
-            .iter()
-            .filter(|(k, _)| canonical_index(k).is_none())
-            .count()
-            + 1
-            > INDEX_THRESHOLD
-    }
-
-    /// Build the hash index for every current entry (crossing the small-map threshold).
-    pub(super) fn build_index(&mut self) {
-        let mut index = Box::<crate::fasthash::FastMap<Rc<str>, usize>>::default();
-        for (j, (k, _)) in self.entries.iter().enumerate() {
-            index.insert(k.clone(), j);
-        }
-        self.elems.set_index(Some(index));
-    }
-
     /// Drop every property (used by the GC to break a garbage object's reference cycles).
     pub(crate) fn clear(&mut self) {
         self.note_structural();
         self.entries.clear();
         self.elems.clear();
-        self.elems.mirror_clear();
-        self.mirror_flags = MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES;
-        self.mirror_holes = 0;
-        self.len_slot.set(NO_SLOT);
-        self.proto_slot.set(NO_SLOT);
-        self.shape = shape_fresh();
+        self.shape_rc = None;
+        self.shape = SHAPE_EMPTY;
+    }
+
+    /// Install `shape` as this map's shape.
+    #[inline]
+    fn set_shape(&mut self, shape: Rc<Shape>) {
+        self.shape = shape.id;
+        self.shape_rc = Some(shape);
+    }
+
+    /// Detach to an owned shape holding the current key list (a structural change that is not
+    /// a tree transition follows).
+    fn detach_shape(&mut self) -> &mut Shape {
+        if !self.shape_rc.as_ref().is_some_and(|s| s.owned()) {
+            let owned = shape_owned_from(self.shape_rc.as_deref());
+            self.set_shape(owned);
+        }
+        let shape = self.shape_rc.as_mut().expect("owned shape just installed");
+        Rc::get_mut(shape).expect("owned shapes have one owner")
+    }
+
+    /// Re-id an owned shape after mutating its key list, and mirror the id here.
+    fn reid_owned_shape(&mut self) {
+        let id = fresh_owned_id();
+        let shape = self.shape_rc.as_mut().expect("owned shape");
+        Rc::get_mut(shape).expect("owned shapes have one owner").id = id;
+        self.shape = id;
+    }
+
+    /// Add `key` to the shape: a tree transition while the shape is shared and small, else an
+    /// in-place append on an owned shape (detaching first when the shared chain would grow past
+    /// [`OWNED_THRESHOLD`]).
+    fn transition_key(&mut self, key: Rc<str>) {
+        let shared = self.shape_rc.as_ref().is_none_or(|s| !s.owned());
+        if shared && self.named_len() < OWNED_THRESHOLD {
+            let child = shape_transition(self.shape_rc.as_ref(), &key);
+            self.set_shape(child);
+            return;
+        }
+        self.detach_shape().push_key(key);
+        self.reid_owned_shape();
+    }
+
+    /// Make room for a new named property at slot `named_len` (the end of the named prefix):
+    /// an element sitting there moves to the end of `entries`. Returns the slot.
+    fn open_named_slot(&mut self, prop: Property) -> usize {
+        let slot = self.named_len();
+        self.reserve_entry();
+        if slot < self.entries.len() {
+            let displaced = std::mem::replace(&mut self.entries[slot], prop);
+            self.entries.push(displaced);
+            let moved_to = (self.entries.len() - 1) as u32;
+            if self.elems.is_present() {
+                for e in self.elems.iter_mut() {
+                    if *e == slot as u32 {
+                        *e = moved_to;
+                        break;
+                    }
+                }
+            }
+        } else {
+            self.entries.push(prop);
+        }
+        slot
     }
 
     /// Insert a key *known to be absent* (the caller shape-validated the map), landing on a
     /// *known* child shape: skips both the existence scan and the transition-table lookup that
     /// [`Props::insert`] pays. `new_shape` must be the memoized `shape_transition(shape, key)`
-    /// result recorded when this (shape, key) pair was first inserted the slow way.
+    /// result recorded when this (shape, key) pair was first inserted the slow way — a shared
+    /// shape id (see [`Props::shape_is_shared`]).
     pub(crate) fn append_new(&mut self, key: Rc<str>, prop: Property, new_shape: u32) {
         self.note_structural();
-        let slot = self.entries.len();
-        if let Some(index) = self.elems.index_mut() {
-            index.insert(key.clone(), slot);
-        } else if self.should_build_index(&key) {
-            self.build_index();
-            self.elems.index_mut().unwrap().insert(key.clone(), slot);
-        }
-        self.shape = new_shape;
-        self.reserve_entry();
-        self.entries.push((key, prop));
-        self.note_inserted(slot);
+        let child = shape_by_id(new_shape);
+        debug_assert_eq!(child.last_key().map(|k| &**k), Some(&*key));
+        debug_assert_eq!(child.len(), self.named_len() + 1);
+        let slot = self.open_named_slot(prop);
+        self.set_shape(child);
+        self.note_inserted(slot, &key);
     }
 
     /// Build the named-property prefix of a brand-new ordinary object after creation ICs proved
     /// every key absent/non-indexed and supplied the complete shape chain. Up to the small-map
-    /// threshold no dense/index sidecar or special-slot memo can be required, so the whole batch
-    /// is just entry appends followed by its already-known final shape.
+    /// threshold no dense sidecar can be required, so the whole batch is just entry appends
+    /// followed by its already-known final shape.
     pub(crate) fn append_proven_plain(&mut self, key: Rc<str>, prop: Property) {
         debug_assert!(self.entries.len() < INDEX_THRESHOLD);
         debug_assert!(canonical_index(&key).is_none());
         debug_assert!(self.elems.0.is_none());
+        let _ = key;
         self.reserve_entry();
-        self.entries.push((key, prop));
+        self.entries.push(prop);
     }
 
     pub(crate) fn finish_proven_plain_shape(&mut self, shape: u32) {
         debug_assert!(!self.entries.is_empty());
         debug_assert!(self.entries.len() <= INDEX_THRESHOLD);
-        self.shape = shape;
+        let shape = shape_by_id(shape);
+        debug_assert_eq!(shape.len(), self.entries.len());
+        self.set_shape(shape);
     }
 
     pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
         let key = key.into();
-        if let (Some(n), Some(packed)) = (canonical_index(&key), self.elems.packed_ref()) {
+        let index = canonical_index(&key);
+        if let (Some(n), Some(packed)) = (index, self.elems.packed_ref()) {
             let n = n as usize;
             if n < packed.len() {
                 self.note_structural();
@@ -101,12 +135,12 @@ impl Props {
             }
             self.has_far.set(true);
         }
-        if let Some(i) = self.find(&key) {
-            self.entries[i].1 = prop;
-            if self.mirror_flags & MIRROR_OK != 0
+        if let Some(i) = self.slot_of(&key) {
+            self.entries[i] = prop;
+            if self.elems.mirror_flags() & MIRROR_OK != 0
                 && key.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
             {
-                match canonical_index(&key) {
+                match index {
                     Some(n) if (n as usize) < self.elems.mirror_len() => {
                         // Replacing an existing entry: position n already had the element.
                         self.mirror_sync(n as usize, i, false)
@@ -116,66 +150,128 @@ impl Props {
                     None => self.mirror_invalidate(), // "007"-style: not canonical, be safe
                 }
             }
-        } else {
-            self.note_structural();
-            let slot = self.entries.len();
-            if let Some(index) = self.elems.index_mut() {
-                index.insert(key.clone(), slot);
-            } else if self.should_build_index(&key) {
-                self.build_index();
-                self.elems.index_mut().unwrap().insert(key.clone(), slot);
-            }
-            if !(self.elem_mode.get() && canonical_index(&key).is_some()) {
-                self.shape = shape_transition(self.shape, &key);
-            }
-            if &*key == "length" {
-                self.len_slot.set(slot as u32);
-            } else if &*key == "prototype" {
-                self.proto_slot.set(slot as u32);
-            }
-            self.reserve_entry();
-            self.entries.push((key, prop));
-            self.note_inserted(slot);
+            return;
         }
+        self.note_structural();
+        let dense_element = self.elem_mode.get()
+            && !self.elems.packed_is_some()
+            && index.is_some_and(|n| n as usize <= self.elems.len() + 256);
+        let slot = if dense_element {
+            // An array element: no shape transition, element region (after the named prefix).
+            // Farther-out indices become named keys (`has_far`) so they stay reachable by name.
+            self.reserve_entry();
+            self.entries.push(prop);
+            self.entries.len() - 1
+        } else {
+            let slot = self.open_named_slot(prop);
+            self.transition_key(key.clone());
+            slot
+        };
+        self.note_inserted(slot, &key);
+    }
+
+    /// Remove `entries[slot]`, shifting later slots down and repointing the dense map. The
+    /// shape is the caller's business.
+    fn remove_slot(&mut self, slot: usize) -> Property {
+        let removed = self.entries.remove(slot);
+        // Dense slots shift down past the removed entry; the removed key's own slot holes.
+        if self.elems.is_present() {
+            for e in self.elems.iter_mut() {
+                if *e == NO_SLOT {
+                    continue;
+                }
+                match (*e as usize).cmp(&slot) {
+                    std::cmp::Ordering::Equal => *e = NO_SLOT,
+                    std::cmp::Ordering::Greater => *e -= 1,
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+        }
+        removed
     }
 
     /// Remove every canonical-index key `>= from` in one pass — array truncation
-    /// (`arr.length = n`). Entries compact and the lookup/dense maps rebuild once: O(n) total,
-    /// where the per-key [`Props::remove`] loop it replaces was O(n) *per key*.
+    /// (`arr.length = n`). Entries compact and the dense map rebuilds once: O(n) total, where
+    /// the per-key [`Props::remove`] loop it replaces was O(n) *per key*.
     pub(crate) fn remove_indices_from(&mut self, from: usize) {
-        let keep = |k: &str| match canonical_index(k) {
-            Some(n) => (n as usize) < from,
-            None => true,
-        };
         let packed_remove = self.elems.packed_ref().is_some_and(|p| {
             p.len() > from && p[from..].iter().any(|p| !matches!(p.value(), Value::Empty))
         });
-        if !packed_remove && self.entries.iter().all(|(k, _)| keep(k)) {
+        let named = self.named_len();
+        // Slot → canonical index for every dense-mapped entry (element region and named index
+        // keys alike).
+        let mut slot_index: Vec<u32> = vec![NO_SLOT; self.entries.len()];
+        if !self.elems.packed_is_some() {
+            for n in 0..self.elems.len() {
+                let slot = self.elems[n];
+                if slot != NO_SLOT {
+                    slot_index[slot as usize] = n as u32;
+                }
+            }
+        }
+        let keep: Vec<bool> = {
+            let keys = self.shape_keys();
+            (0..self.entries.len())
+                .map(|slot| {
+                    if slot < named {
+                        !canonical_index(&keys[slot]).is_some_and(|n| n as usize >= from)
+                    } else {
+                        slot_index[slot] == NO_SLOT || (slot_index[slot] as usize) < from
+                    }
+                })
+                .collect()
+        };
+        let any_named = keep[..named].iter().any(|k| !k);
+        let any_entry = keep.iter().any(|k| !k);
+        if !packed_remove && !any_entry {
             return;
         }
         self.note_structural();
         if let Some(packed) = self.elems.packed_mut() {
             packed.truncate(from);
         }
-        self.entries.retain(|(k, _)| keep(k));
-        self.len_slot.set(NO_SLOT);
-        self.proto_slot.set(NO_SLOT);
-        self.elems.set_index(None);
-        if self.entries.len() > INDEX_THRESHOLD {
-            self.build_index();
+        if !any_entry {
+            return;
+        }
+        let mut slot = 0;
+        self.entries.retain(|_| {
+            let k = keep[slot];
+            slot += 1;
+            k
+        });
+        // Element-region entries need their index back once the dense map is rebuilt.
+        let mut kept_indices: Vec<(usize, u32)> = Vec::new();
+        let mut new_slot = 0;
+        for (old_slot, &k) in keep.iter().enumerate() {
+            if k {
+                if old_slot >= named && slot_index[old_slot] != NO_SLOT {
+                    kept_indices.push((new_slot, slot_index[old_slot]));
+                }
+                new_slot += 1;
+            }
+        }
+        if any_named {
+            // A removal shifts named slots: not a tree transition, so detach to an owned shape.
+            let keep_named = &keep[..named];
+            self.detach_shape().retain_keys(|slot, _| keep_named[slot]);
+            self.reid_owned_shape();
         }
         self.elems.clear_elems();
-        self.mirror_flags = MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES;
-        self.mirror_holes = 0;
-        for slot in 0..self.entries.len() {
-            self.note_inserted(slot);
+        self.elems.mirror_reset();
+        for slot in 0..self.named_len() {
+            let key = self.shape_rc.as_ref().expect("named keys").key_at(slot);
+            if let Some(n) = canonical_index(key) {
+                self.note_index_inserted(slot, n);
+            }
         }
-        // A removal shifts slots: it can't be a tree transition, so deopt to a fresh unique id.
-        self.shape = shape_fresh();
+        for (slot, n) in kept_indices {
+            self.note_index_inserted(slot, n);
+        }
     }
 
     pub(crate) fn remove(&mut self, key: &str) -> bool {
-        if let (Some(n), Some(packed)) = (canonical_index(key), self.elems.packed_ref()) {
+        let index = canonical_index(key);
+        if let (Some(n), Some(packed)) = (index, self.elems.packed_ref()) {
             if packed
                 .get(n as usize)
                 .is_some_and(|p| !matches!(p.value(), Value::Empty))
@@ -185,49 +281,28 @@ impl Props {
                 return true;
             }
         }
-        let Some(i) = self.find(key) else {
+        let Some(i) = self.slot_of(key) else {
             return false;
         };
         self.note_structural();
-        self.entries.remove(i);
-        // Slots shifted — deopt to a fresh shape id (see remove_indices_from). Array maps skip
-        // this for ELEMENT keys: their shape tracks named keys only, and array entry slots are
-        // only ever trusted through key-checked ICs (IC_ARR_KEYCHK), which re-verify on hit.
-        if !(self.elem_mode.get() && canonical_index(key).is_some()) {
-            self.shape = shape_fresh();
-        }
-        self.len_slot.set(NO_SLOT);
-        self.proto_slot.set(NO_SLOT);
-        if let Some(index) = self.elems.index_mut() {
-            index.remove(key);
-            // Re-index everything after the removed slot.
-            for (j, (k, _)) in self.entries.iter().enumerate().skip(i) {
-                index.insert(k.clone(), j);
-            }
-        }
-        if self.mirror_flags & MIRROR_OK != 0 {
-            match canonical_index(key) {
-                Some(n) if (n as usize) < self.elems.mirror_len() => {
-                    if self.elems.mirror_get(n as usize).unwrap().to_bits() != MIRROR_HOLE {
-                        *self.elems.mirror_get_mut(n as usize).unwrap() =
-                            f64::from_bits(MIRROR_HOLE);
-                        self.mirror_flags &= !MIRROR_NO_HOLES;
-                        self.mirror_holes += 1;
-                    }
+        if self.elems.mirror_flags() & MIRROR_OK != 0 {
+            if let Some(n) = index {
+                if (n as usize) < self.elems.mirror_len()
+                    && self.elems.mirror_get(n as usize).unwrap().to_bits() != MIRROR_HOLE
+                {
+                    *self.elems.mirror_get_mut(n as usize).unwrap() = f64::from_bits(MIRROR_HOLE);
+                    *self.elems.mirror_flags_mut() &= !MIRROR_NO_HOLES;
+                    *self.elems.mirror_holes_mut() += 1;
                 }
-                Some(_) | None => {}
             }
         }
-        // Dense slots shift down past the removed entry; the removed key's own slot holes.
-        for e in self.elems.iter_mut() {
-            if *e == NO_SLOT {
-                continue;
-            }
-            match (*e as usize).cmp(&i) {
-                std::cmp::Ordering::Equal => *e = NO_SLOT,
-                std::cmp::Ordering::Greater => *e -= 1,
-                std::cmp::Ordering::Less => {}
-            }
+        let named = i < self.named_len();
+        self.remove_slot(i);
+        if named {
+            // Named slots shifted: not a tree transition, so detach to an owned shape. Element
+            // region removals leave the shape alone — array shapes track named keys only.
+            self.detach_shape().remove_key(i);
+            self.reid_owned_shape();
         }
         true
     }
