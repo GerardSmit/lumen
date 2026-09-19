@@ -6,6 +6,7 @@ use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub type Gc = Rc<RefCell<Object>>;
 
@@ -349,14 +350,16 @@ pub struct JitLayout {
     pub obj_extensible: usize,
     pub props_shape: usize,
     pub props_proto_flag: usize,
-    /// The `entries` `Vec` within `Props`.
-    pub props_entries: usize,
+    /// The `entries` thin vector within `Props`: its data pointer (a 64-bit word) and its
+    /// length and capacity (32-bit words; the inline append checks `len < cap`, which a
+    /// copy-on-write shared block — capacity zero — never passes).
+    pub props_entries_ptr: usize,
+    pub props_entries_len: usize,
+    pub props_entries_cap: usize,
     /// The data-pointer word within a `Vec` (not necessarily offset 0 — RawVec layout is unstable).
     pub vec_ptr_off: usize,
     /// The length word within a `Vec` (probed like `vec_ptr_off`).
     pub vec_len_off: usize,
-    /// The capacity word within a `Vec` (probed alongside pointer and length).
-    pub vec_cap_off: usize,
     /// The nullable pointer to the shared boxed dense-buffer headers within `Props`.
     pub props_elems: usize,
     /// The `elems` Vec header within the shared dense-buffer allocation.
@@ -369,17 +372,20 @@ pub struct JitLayout {
     /// Initialized inline element count and slot base within DenseBuffers.
     pub dense_inline_len: usize,
     pub dense_inline_slots: usize,
-    /// The `mirror_flags` byte within `Props`.
-    pub props_mirror_flags: usize,
-    /// `size_of::<(Rc<str>, Property)>()` — the entry stride.
+    /// The `mirror_flags` byte within the dense sidecar (a map without a sidecar has no
+    /// elements to mirror; templates must follow `props_elems` first).
+    pub dense_mirror_flags: usize,
+    /// `size_of::<Property>()` — the entry stride (entries are bare `Property`s; keys live in
+    /// the shape).
     pub entry_size: usize,
-    /// `Value` within an entry `(Rc<str>, Property)`.
+    /// `Value` within an entry.
     pub entry_value: usize,
-    /// Descriptor flags byte within an entry (used to test `PROP_ACCESSOR`).
+    /// Descriptor flags word within an entry (used to test `PROP_ACCESSOR`).
     pub entry_accessor: usize,
-    /// Descriptor flags byte within an entry (used to test `PROP_WRITABLE`).
+    /// Descriptor flags word within an entry (used to test `PROP_WRITABLE`).
     pub entry_writable: usize,
-    /// Standalone `Property` layout used by keyless packed elements (not tuple-entry offsets).
+    /// Standalone `Property` layout used by keyless packed elements (same as the entry offsets
+    /// now that entries are bare properties; kept separate for the element templates' clarity).
     pub property_size: usize,
     pub property_value: usize,
     pub property_meta: usize,
@@ -402,37 +408,35 @@ pub struct JitLayout {
     pub binding_mutable: usize,
     /// `initialized` bool within a `Binding` (TDZ check).
     pub binding_init: usize,
-    /// The `Rc<str>` key within an entry `(Rc<str>, Property)` (tuple field order is unstable).
-    pub entry_key: usize,
-    /// The length word within an `Rc<str>` fat pointer (0 or 8 — layout is unstable).
-    pub str_len_word: usize,
-    /// The pointer word within an `Rc<str>` fat pointer (the other one).
-    pub str_ptr_word: usize,
-    /// Stored `Rc<str>` pointer word → the first byte of the string data (the RcBox header).
-    pub str_data_off: usize,
-    /// Whether the four fields above probed successfully (key-checked array-holder entries can
-    /// inline their key compare only when they did).
-    pub key_probe_ok: bool,
+    /// The `Option<Rc<Shape>>` word within `Props` (the stored `Rc` pointer, or 0 for the empty
+    /// shape). The creation template swaps it for the recorded child shape.
+    pub props_shape_rc: usize,
+    /// Address of the shared-shape `by_id` `Vec<Rc<Shape>>` header (see
+    /// [`props::shape_table_by_id_ptr`]): indexed by a cache's child shape id to fetch the
+    /// stored `Rc<Shape>` pointer whose strong count the creation template bumps.
+    pub shape_by_id_vec: usize,
+    /// The `Option<Rc<Shape>>` niche and `Rc<Shape>` strong-count placement matched the probes.
+    pub shape_rc_ok: bool,
     pub valid: bool,
 }
 
 /// Measure [`JitLayout`] against the live types, probing the non-guaranteed std layouts.
 pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     use std::mem::offset_of;
-    // Rc<str> fat-pointer probe (word order and RcBox data offset are not std-guaranteed): a
-    // known 8-byte string tells us which word holds the length; the data pointer is the other,
-    // and `as_ptr` minus the stored word gives the RcBox header size. Fails closed.
-    let (str_len_word, str_ptr_word, str_data_off, key_probe_ok) = {
-        let probe: Rc<str> = "probe_8B".into();
-        let words: [usize; 2] = unsafe { std::mem::transmute_copy::<Rc<str>, [usize; 2]>(&probe) };
-        let data = probe.as_ptr() as usize;
-        if words[0] == 8 && words[1] != 8 && data > words[1] && data - words[1] < 256 {
-            (0usize, 8usize, data - words[1], true)
-        } else if words[1] == 8 && words[0] != 8 && data > words[0] && data - words[0] < 256 {
-            (8usize, 0usize, data - words[0], true)
-        } else {
-            (0, 0, 0, false)
-        }
+    // `Option<Rc<Shape>>` probe: `None` must be the null word and `Some` the stored RcBox
+    // pointer whose first word is the strong count (the creation template bumps it in place).
+    let shape_rc_ok = {
+        let mut probe = Props::new();
+        probe.insert(Rc::<str>::from("probe"), Property::plain(Value::Undefined));
+        let some_word =
+            unsafe { *(&probe.shape_rc as *const Option<Rc<props::Shape>> as *const usize) };
+        let none: Option<Rc<props::Shape>> = None;
+        let none_word = unsafe { *(&none as *const Option<Rc<props::Shape>> as *const usize) };
+        let strong = probe.shape_rc.as_ref().map_or(0, Rc::strong_count);
+        std::mem::size_of::<Option<Rc<props::Shape>>>() == 8
+            && none_word == 0
+            && some_word != 0
+            && unsafe { *(some_word as *const usize) } == strong
     };
     let as_ptr = Rc::as_ptr(sample) as usize; // → the RefCell<Object> (RcBox value field)
     let stored_word = unsafe { *(sample as *const Gc as *const usize) };
@@ -457,18 +461,17 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
 
     // Vec data-pointer and length words (RawVec layout is not guaranteed — locate them by value).
     // Capacity 3 / length 1 makes the three words distinguishable.
-    let mut v: Vec<(Rc<str>, Property)> = Vec::with_capacity(3);
-    v.push((Rc::from("p"), Property::plain(Value::Num(0.0))));
+    let mut v: Vec<Property> = Vec::with_capacity(3);
+    v.push(Property::plain(Value::Num(0.0)));
     let vptr = v.as_ptr() as usize;
     let vwords = unsafe {
         std::slice::from_raw_parts(
             &v as *const Vec<_> as *const usize,
-            std::mem::size_of::<Vec<(Rc<str>, Property)>>() / 8,
+            std::mem::size_of::<Vec<Property>>() / 8,
         )
     };
     let vec_ptr_off = vwords.iter().position(|&w| w == vptr).map(|i| i * 8);
     let vec_len_off = vwords.iter().position(|&w| w == 1).map(|i| i * 8);
-    let vec_cap_off = vwords.iter().position(|&w| w == 3).map(|i| i * 8);
     // The element templates index a `Vec<u32>` (`Props::elems`) with the same offsets; verify the
     // layout really is per-Vec-struct, not per-element-type.
     let mut v32: Vec<u32> = Vec::with_capacity(3);
@@ -481,8 +484,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         )
     };
     let vec32_ok = vec_ptr_off.is_some_and(|o| v32words[o / 8] == v32ptr)
-        && vec_len_off.is_some_and(|o| v32words[o / 8] == 1)
-        && vec_cap_off.is_some_and(|o| v32words[o / 8] == 3);
+        && vec_len_off.is_some_and(|o| v32words[o / 8] == 1);
 
     // DenseStorage is deliberately a transparent nullable pointer to boxed buffer headers. The
     // JIT first follows this pointer and then uses the probed Vec offsets above. Verify the niche
@@ -507,8 +509,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         )
     };
     let pv_header_ok = vec_ptr_off.is_some_and(|o| pv_words[o / 8] == pv_ptr)
-        && vec_len_off.is_some_and(|o| pv_words[o / 8] == 1)
-        && vec_cap_off.is_some_and(|o| pv_words[o / 8] == 3);
+        && vec_len_off.is_some_and(|o| pv_words[o / 8] == 1);
     let packed_some: Option<Box<Vec<Property>>> = Some(Box::new(pv));
     let packed_word =
         unsafe { *(&packed_some as *const Option<Box<Vec<Property>>> as *const usize) };
@@ -521,13 +522,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let packed_elems_valid =
         pv_header_ok && packed_word == packed_expected && packed_word != 0 && packed_none_word == 0;
 
-    // Exotic::None / Exotic::Array discriminants (Exotic is repr(Rust); probe to be certain).
-    let none = Exotic::None;
-    let exotic_none_tag = unsafe { *(&none as *const Exotic as *const u8) };
-    let arr = Exotic::Array;
-    let exotic_array_tag = unsafe { *(&arr as *const Exotic as *const u8) };
-    let sw = Exotic::str_wrap("".into());
-    let exotic_strwrap_tag = unsafe { *(&sw as *const Exotic as *const u8) };
+    let exotic_none_tag = Exotic::None as u8;
+    let exotic_array_tag = Exotic::Array as u8;
+    let exotic_strwrap_tag = Exotic::StrWrap as u8;
 
     // Scope offsets for the inline LoadName template: Rc::as_ptr → RefCell<Scope> value →
     // Scope.vars → VarMap generation. The RefCell value offset is probed on a live scope.
@@ -548,7 +545,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && niche_ok
         && vec_ptr_off.is_some()
         && vec_len_off.is_some()
-        && vec_cap_off.is_some()
         && vec32_ok
         && thin_vec_ok;
     JitLayout {
@@ -563,26 +559,25 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         obj_extensible: offset_of!(Object, extensible),
         props_shape: offset_of!(Props, shape),
         props_proto_flag: offset_of!(Props, proto_flag),
-        props_entries: offset_of!(Props, entries),
+        props_entries_ptr: offset_of!(Props, entries) + props::EntryVec::ptr_offset(),
+        props_entries_len: offset_of!(Props, entries) + props::EntryVec::len_offset(),
+        props_entries_cap: offset_of!(Props, entries) + props::EntryVec::cap_offset(),
         vec_ptr_off: vec_ptr_off.unwrap_or(0),
         vec_len_off: vec_len_off.unwrap_or(0),
-        vec_cap_off: vec_cap_off.unwrap_or(0),
         props_elems: offset_of!(Props, elems),
         dense_elems: offset_of!(DenseBuffers, elems),
         dense_mirror: offset_of!(DenseBuffers, mirror),
         dense_packed: offset_of!(DenseBuffers, packed),
         dense_inline_len: DenseBuffers::inline_len_offset(),
         dense_inline_slots: DenseBuffers::inline_slots_offset(),
-        props_mirror_flags: offset_of!(Props, mirror_flags),
-        entry_size: std::mem::size_of::<(Rc<str>, Property)>(),
-        entry_key: offset_of!((Rc<str>, Property), 0),
-        str_len_word,
-        str_ptr_word,
-        str_data_off,
-        key_probe_ok,
-        entry_value: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, packed),
-        entry_accessor: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, meta),
-        entry_writable: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, meta),
+        dense_mirror_flags: DenseBuffers::mirror_flags_offset(),
+        entry_size: std::mem::size_of::<Property>(),
+        entry_value: offset_of!(Property, packed),
+        entry_accessor: offset_of!(Property, meta),
+        entry_writable: offset_of!(Property, meta),
+        props_shape_rc: offset_of!(Props, shape_rc),
+        shape_by_id_vec: shape_table_by_id_ptr() as usize,
+        shape_rc_ok,
         property_size: std::mem::size_of::<Property>(),
         property_value: offset_of!(Property, packed),
         property_meta: offset_of!(Property, meta),
@@ -748,50 +743,41 @@ impl Callable {
     }
 }
 
-/// Exotic internal data for built-in object kinds (arrays, primitive wrappers). The wrapper
-/// variants are read by the `this_*` coercion helpers but not yet constructed (`new String()` etc.
-/// still return primitives — boxing is the next built-ins milestone).
-#[derive(Clone)]
-#[allow(dead_code)]
+/// Exotic internal-slot kind of a built-in object. A primitive wrapper's [[NumberData]] /
+/// [[StringData]] / ... and an error's captured stack live in one hidden own entry
+/// ([`EXOTIC_SLOT`]; private-keyed, so no reflection sees it), which keeps the tag one byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Exotic {
     None,
     Array,
-    BoolWrap(bool),
-    NumWrap(f64),
-    StrWrap(Box<crate::lstr::LStr>),
-    SymWrap(Rc<SymbolData>),
-    BigIntWrap(Box<crate::bigint::JsBigInt>),
-    /// An error object. Carries the captured call-stack frames as a preformatted string (the
-    /// `\n    at <fn>` lines, empty when thrown at top level), snapshotted at construction; the
-    /// `Error.prototype.stack` getter prepends the live `name: message` head. name/message live as
-    /// ordinary properties, and the tag lets `Error.prototype.toString` / the test262 runner
-    /// recognise an error cheaply.
-    Error(Box<Rc<str>>),
+    BoolWrap,
+    NumWrap,
+    StrWrap,
+    SymWrap,
+    BigIntWrap,
+    /// An error object. Its slot carries the captured call-stack frames as a preformatted string
+    /// (the `\n    at <fn>` lines, empty when thrown at top level), snapshotted at construction;
+    /// the `Error.prototype.stack` getter prepends the live `name: message` head. name/message
+    /// live as ordinary properties, and the tag lets `Error.prototype.toString` / the test262
+    /// runner recognise an error cheaply.
+    Error,
     /// An `arguments` exotic object (mapped index/parameter aliasing lives in
     /// `Interp::mapped_arguments`).
     Arguments,
 }
 
-impl Exotic {
-    pub(crate) fn str_wrap(value: crate::lstr::LStr) -> Exotic {
-        Exotic::StrWrap(Box::new(value))
-    }
+/// The hidden own entry holding an exotic object's internal-slot value (see [`Exotic`]).
+pub(crate) const EXOTIC_SLOT: &str = "#\u{0}exotic";
 
-    pub(crate) fn bigint_wrap(value: crate::bigint::JsBigInt) -> Exotic {
-        Exotic::BigIntWrap(Box::new(value))
-    }
-
-    pub(crate) fn error(stack: Rc<str>) -> Exotic {
-        Exotic::Error(Box::new(stack))
-    }
-}
-
+/// 72 bytes (96 allocated with the `Rc<RefCell<_>>` header): the layout is measured by
+/// [`jit_layout`] and every byte-sized field is read by the JIT as its own byte.
 pub struct Object {
     pub(crate) proto: Option<Gc>,
     pub(crate) props: Props,
-    pub(crate) extensible: bool,
     pub(crate) call: Callable,
     pub(crate) exotic: Exotic,
+    pub(crate) extensible: bool,
     /// `false` for objects whose behavior lives in an interpreter side table — proxies, typed
     /// arrays, module namespaces — which the `exotic` tag can't reveal. The JIT's inline
     /// property/element caches check this byte on the receiver and take the checked helper when
@@ -800,14 +786,126 @@ pub struct Object {
     pub(crate) ic_plain: Cell<bool>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
-    /// GC scratch: mark bit and internal-reference count while collection runs. Between
-    /// collections `gc_internal` holds this object's raw-registry slot; the collector restores
-    /// every slot before sweeping can drop an object.
-    pub(crate) gc_mark: Cell<bool>,
-    pub(crate) gc_internal: Cell<u32>,
+    /// GC scratch: the internal-reference count (low bits) and mark bit ([`GC_MARK`]) while
+    /// collection runs. Between collections the low bits hold this object's raw-registry slot;
+    /// the collector restores every slot before sweeping can drop an object.
+    gc_internal: Cell<u32>,
 }
 
+const GC_MARK: u32 = 1 << 31;
+
 impl Object {
+    #[inline]
+    pub(crate) fn gc_marked(&self) -> bool {
+        self.gc_internal.get() & GC_MARK != 0
+    }
+    #[inline]
+    pub(crate) fn gc_set_mark(&self) {
+        self.gc_internal.set(self.gc_internal.get() | GC_MARK);
+    }
+    /// Start a collection: no mark, zero internal references.
+    #[inline]
+    pub(crate) fn gc_reset(&self) {
+        self.gc_internal.set(0);
+    }
+    #[inline]
+    pub(crate) fn gc_refs(&self) -> u32 {
+        self.gc_internal.get() & !GC_MARK
+    }
+    #[inline]
+    pub(crate) fn gc_add_ref(&self) {
+        self.gc_internal.set(self.gc_internal.get() + 1);
+    }
+    /// Put the registry slot back after collection, keeping the mark for the sweep.
+    #[inline]
+    fn gc_set_slot(&self, slot: u32) {
+        self.gc_internal
+            .set(slot | (self.gc_internal.get() & GC_MARK));
+    }
+
+    /// Give this object an exotic kind together with its internal-slot value.
+    pub(crate) fn set_exotic(&mut self, exotic: Exotic, payload: Option<Value>) {
+        self.exotic = exotic;
+        if let Some(v) = payload {
+            self.props
+                .insert(EXOTIC_SLOT, Property::data(v, false, false, false));
+        }
+    }
+
+    /// The internal-slot value of a wrapper / error object (see [`Exotic`]).
+    pub(crate) fn exotic_payload(&self) -> Option<Value> {
+        match self.exotic {
+            Exotic::None | Exotic::Array | Exotic::Arguments => None,
+            _ => self.props.get(EXOTIC_SLOT).map(|p| p.value()),
+        }
+    }
+
+    /// [[StringData]] of a String wrapper.
+    pub(crate) fn str_wrap(&self) -> Option<crate::lstr::LStr> {
+        if self.exotic != Exotic::StrWrap {
+            return None;
+        }
+        match self.exotic_payload() {
+            Some(Value::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// [[NumberData]] of a Number wrapper.
+    pub(crate) fn num_wrap(&self) -> Option<f64> {
+        if self.exotic != Exotic::NumWrap {
+            return None;
+        }
+        match self.exotic_payload() {
+            Some(Value::Num(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// [[BooleanData]] of a Boolean wrapper.
+    pub(crate) fn bool_wrap(&self) -> Option<bool> {
+        if self.exotic != Exotic::BoolWrap {
+            return None;
+        }
+        match self.exotic_payload() {
+            Some(Value::Bool(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// [[SymbolData]] of a Symbol wrapper.
+    pub(crate) fn sym_wrap(&self) -> Option<Rc<SymbolData>> {
+        if self.exotic != Exotic::SymWrap {
+            return None;
+        }
+        match self.exotic_payload() {
+            Some(Value::Sym(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// [[BigIntData]] of a BigInt wrapper.
+    pub(crate) fn bigint_wrap(&self) -> Option<crate::bigint::JsBigInt> {
+        if self.exotic != Exotic::BigIntWrap {
+            return None;
+        }
+        match self.exotic_payload() {
+            Some(Value::BigInt(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// The captured stack frames of an error object (see [`Exotic::Error`]).
+    pub(crate) fn error_stack(&self) -> Option<crate::lstr::LStr> {
+        if self.exotic != Exotic::Error {
+            return None;
+        }
+        match self.exotic_payload() {
+            Some(Value::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+
     pub(crate) fn new(proto: Option<Gc>) -> Gc {
         Self::new_with_capacity(proto, 0)
     }
@@ -823,7 +921,7 @@ impl Object {
     /// the map from moved stack values before allocation, avoiding an empty map plus RefCell
     /// replacement on every object.
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
-        GC_STATE.with(|state| {
+        with_gc_state(|state| {
             state.live.set(state.live.get() + 1);
             let mut reg = state.registry.borrow_mut();
             let slot = match reg.free.pop() {
@@ -838,12 +936,11 @@ impl Object {
             let obj = Rc::new(RefCell::new(Object {
                 proto,
                 props,
-                extensible: true,
                 call: Callable::None,
                 exotic,
+                extensible: true,
                 ic_plain: Cell::new(true),
                 is_constructor: false,
-                gc_mark: Cell::new(false),
                 gc_internal: Cell::new(slot_u32),
             }));
             reg.entries[slot] = Rc::as_ptr(&obj);
@@ -857,8 +954,8 @@ impl Drop for Object {
         // Remove the raw registry pointer before the surrounding RcBox is freed. Tombstone reuse
         // is O(1), does not touch another (possibly borrowed) object, and bounds registry memory
         // by peak simultaneously-live objects instead of cumulative allocation count.
-        let slot = self.gc_internal.get() as usize;
-        let _ = GC_STATE.try_with(|state| {
+        let slot = (self.gc_internal.get() & !GC_MARK) as usize;
+        let _ = try_with_gc_state(|state| {
             let mut reg = state.registry.borrow_mut();
             if slot < reg.entries.len() && !reg.entries[slot].is_null() {
                 reg.entries[slot] = std::ptr::null();
@@ -880,41 +977,95 @@ struct GcRegistry {
     free: Vec<usize>,
 }
 
-struct GcState {
+/// One interpreter's heap bookkeeping: the object registry, the live count, and the scope
+/// registry (every `Scope` weakly, so the collector can see env-involving cycles).
+///
+/// A state belongs to the thread that created it, but it is *not* thread-local in the strict
+/// sense: a coroutine body runs on a pooled worker thread (see `coroutine.rs`) and must allocate
+/// into, and tombstone out of, the registry of the interpreter that spawned it — otherwise an
+/// object born on the worker is invisible to the driver's collector, and an object dropped on the
+/// worker tombstones a slot in the wrong registry, leaving the driver's slot dangling. The
+/// coroutine's strict ping-pong handoff is what makes sharing the (non-`Sync`) cells sound: at any
+/// instant exactly one of the threads that can reach this state is running.
+pub(crate) struct GcState {
     registry: RefCell<GcRegistry>,
     live: Cell<i64>,
+    scopes: RefCell<Vec<std::rc::Weak<RefCell<crate::interpreter::Scope>>>>,
+    /// Every function the parser gave a lazy body, weakly: the collector's flush pass releases
+    /// the bodies that went cold (see `Function::release_cold_body`). Dead entries are pruned by
+    /// that pass; a `Weak` pins only the node's allocation, never a body.
+    lazy_fns: RefCell<Vec<std::rc::Weak<crate::ast::Function>>>,
+    /// The object-shape transition tree for this heap (see [`props::ShapeTable`]): objects flow
+    /// between the driver and its coroutine workers, so their shapes must resolve on either.
+    pub(in crate::value) shapes: RefCell<props::ShapeTable>,
+}
+
+// See the type-level comment: exclusivity comes from the coroutine handoff, not from these cells.
+unsafe impl Send for GcState {}
+unsafe impl Sync for GcState {}
+
+impl GcState {
+    fn new() -> Arc<GcState> {
+        Arc::new(GcState {
+            registry: RefCell::new(GcRegistry {
+                entries: Vec::new(),
+                free: Vec::new(),
+            }),
+            live: Cell::new(0),
+            scopes: RefCell::new(Vec::new()),
+            lazy_fns: RefCell::new(Vec::new()),
+            shapes: RefCell::new(props::ShapeTable::new()),
+        })
+    }
 }
 
 thread_local! {
-    static GC_STATE: GcState = GcState {
-        registry: RefCell::new(GcRegistry {
-            entries: Vec::new(),
-            free: Vec::new(),
-        }),
-        live: Cell::new(0),
-    };
+    /// The state this thread allocates into. A driver thread owns its own; a coroutine worker
+    /// points at its driver's for the duration of the job (`enter_gc_state`).
+    static GC_STATE: RefCell<Arc<GcState>> = RefCell::new(GcState::new());
+}
+
+pub(in crate::value) fn with_gc_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
+    GC_STATE.with(|s| f(&s.borrow()))
+}
+
+fn try_with_gc_state<R>(f: impl FnOnce(&GcState) -> R) -> Result<R, std::thread::AccessError> {
+    GC_STATE.try_with(|s| f(&s.borrow()))
+}
+
+/// A handle to the state the current thread allocates into, for handing to a coroutine worker.
+pub(crate) fn gc_state_handle() -> Arc<GcState> {
+    GC_STATE.with(|s| s.borrow().clone())
+}
+
+/// Make `state` the current thread's heap state, returning the previous one so the caller can
+/// restore it. Only called at quiescent points (between coroutine jobs), when no object on this
+/// thread is being allocated or dropped.
+pub(crate) fn enter_gc_state(state: Arc<GcState>) -> Arc<GcState> {
+    GC_STATE.with(|s| std::mem::replace(&mut *s.borrow_mut(), state))
 }
 
 /// Number of live heap objects right now.
 pub fn live_objects() -> i64 {
-    GC_STATE.with(|state| state.live.get())
+    with_gc_state(|state| state.live.get())
 }
 
-/// Stable address of this thread's live-object counter. The Rc-based runtime and its compiled
-/// chunks are `!Send`, so generated code executes on the thread that baked this TLS address.
+/// Stable address of this thread's live-object counter. The state is heap-allocated and shared
+/// with the coroutine workers that run this interpreter's bodies, so generated code baked on the
+/// driver thread counts correctly from either.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) fn live_objects_ptr() -> *const i64 {
-    GC_STATE.with(|state| state.live.as_ptr())
+    with_gc_state(|state| state.live.as_ptr())
 }
 
 /// Strong handles to every currently-live heap object. Registry slots are non-owning raw
-/// pointers tombstoned synchronously by `Object::drop`; while this thread-local borrow is held no
-/// object can disappear between reading a slot and incrementing its strong count.
+/// pointers tombstoned synchronously by `Object::drop`; while this borrow is held no object can
+/// disappear between reading a slot and incrementing its strong count.
 pub fn gc_snapshot() -> Vec<Gc> {
-    GC_STATE.with(|state| {
+    with_gc_state(|state| {
         let reg = state.registry.borrow();
         let mut live = Vec::with_capacity(reg.entries.len() - reg.free.len());
         for &ptr in &reg.entries {
@@ -934,20 +1085,86 @@ pub fn gc_snapshot() -> Vec<Gc> {
 /// this after marking and before sweeping side tables/properties can release the final owner of
 /// any object, so `Object::drop` always sees its stable slot.
 pub(crate) fn gc_restore_registry_slots() {
-    GC_STATE.with(|state| {
+    with_gc_state(|state| {
         let reg = state.registry.borrow();
         for (slot, &ptr) in reg.entries.iter().enumerate() {
             if !ptr.is_null() {
                 let slot: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-                unsafe { (*ptr).borrow().gc_internal.set(slot) };
+                unsafe { (*ptr).borrow().gc_set_slot(slot) };
             }
         }
     });
 }
 
+pub(crate) fn register_scope(e: &crate::interpreter::Env) {
+    with_gc_state(|state| state.scopes.borrow_mut().push(Rc::downgrade(e)));
+}
+
+/// Registered scope entries (live + not-yet-purged dead weaks).
+pub(crate) fn scope_registry_len() -> usize {
+    with_gc_state(|state| state.scopes.borrow().len())
+}
+
+/// Purge dead weak entries, returning the live count. A dead `Weak` still pins its `RcBox`
+/// allocation, so an interpreter that churns through scopes without allocating many objects
+/// (which is what arms the main GC) must prune on scope volume too — see `Interp::gc_check`.
+pub(crate) fn scope_registry_prune() -> usize {
+    with_gc_state(|state| {
+        let mut reg = state.scopes.borrow_mut();
+        reg.retain(|w| w.strong_count() > 0);
+        reg.len()
+    })
+}
+
+/// The live scopes (purging dead weak entries as it goes).
+pub(crate) fn scope_snapshot() -> Vec<crate::interpreter::Env> {
+    with_gc_state(|state| {
+        let mut reg = state.scopes.borrow_mut();
+        let mut live = Vec::with_capacity(reg.len());
+        reg.retain(|w| match w.upgrade() {
+            Some(e) => {
+                live.push(e);
+                true
+            }
+            None => false,
+        });
+        live
+    })
+}
+
+pub(crate) fn register_lazy_function(f: &Rc<crate::ast::Function>) {
+    with_gc_state(|state| state.lazy_fns.borrow_mut().push(Rc::downgrade(f)));
+}
+
+/// Release every registered function's body that no read touched since the previous pass, and
+/// drop the entries of functions that died. A flat pass over the registry with no allocation:
+/// the registry is one `Weak` per lazily-parsed function in the program (~100k for a large
+/// bundle), and each entry costs a strong-count check plus one flag test. Returns the number of
+/// bodies released.
+pub(crate) fn flush_cold_lazy_bodies() -> usize {
+    with_gc_state(|state| {
+        let mut reg = state.lazy_fns.borrow_mut();
+        let mut released = 0;
+        reg.retain(|w| match w.upgrade() {
+            Some(f) => {
+                if f.release_cold_body() {
+                    released += 1;
+                }
+                true
+            }
+            None => false,
+        });
+        released
+    })
+}
+
+pub(crate) fn lazy_function_registry_len() -> usize {
+    with_gc_state(|state| state.lazy_fns.borrow().len())
+}
+
 #[cfg(test)]
 pub(crate) fn gc_registry_stats() -> (usize, usize) {
-    GC_STATE.with(|state| {
+    with_gc_state(|state| {
         let reg = state.registry.borrow();
         (reg.entries.len(), reg.free.len())
     })
@@ -1291,10 +1508,11 @@ impl Property {
 
 pub(crate) mod gc_edges;
 mod props;
+pub(crate) use props::FnMaps;
 pub use props::Props;
 pub(crate) use props::{
-    bump_proto_epoch, fn_key, index_key, proto_epoch, proto_epoch_ptr, MIRROR_ALL_I32,
-    MIRROR_NO_HOLES, MIRROR_OK,
+    bump_proto_epoch, fn_key, proto_epoch, proto_epoch_ptr, shape_table_by_id_ptr,
+    shape_table_census, MIRROR_ALL_I32, MIRROR_NO_HOLES, MIRROR_OK,
 };
 use props::{DenseBuffers, DenseStorage};
 

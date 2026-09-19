@@ -1433,42 +1433,46 @@ fn lexical_substatement() {
 }
 #[test]
 fn dup_lexical() {
-    // errors
-    for src in [
-        "let x; let x",
-        "{ let y; let y }",
-        "let a; const a=1",
-        "let b; var b",
-        "var bb; let bb",
-        "let c; function c(){}",
-        "const d=1; let d",
-        "class E{}; let E",
-        "switch(1){case 1: let s; default: let s}",
-        "function z(){ let e; let e }",
-    ] {
-        assert!(
-            Engine::new().eval(src, false).is_err(),
-            "should reject: {src}"
-        );
-    }
-    // allowed (no false positives)
-    for src in [
-        "let x; { let x }",
-        "{let a}{let a}",
-        "var n; var n",
-        "let m=1; m=2",
-        "function f(){} function f(){}",
-        "for(let i=0;i<2;i++){} for(let i=0;i<2;i++){}",
-        "if(1){let p}else{let p}",
-        "let q; function g(){ let q }",
-        "switch(1){case 1:{let s} case 2:{let s}}",
-        "try{}catch(x){let y}",
-    ] {
-        assert!(
-            Engine::new().eval(src, false).is_ok(),
-            "should accept: {src}"
-        );
-    }
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        // errors
+        for src in [
+            "let x; let x",
+            "{ let y; let y }",
+            "let a; const a=1",
+            "let b; var b",
+            "var bb; let bb",
+            "let c; function c(){}",
+            "const d=1; let d",
+            "class E{}; let E",
+            "switch(1){case 1: let s; default: let s}",
+            "function z(){ let e; let e }",
+        ] {
+            assert!(
+                Engine::new().eval(src, false).is_err(),
+                "should reject: {src}"
+            );
+        }
+        // allowed (no false positives)
+        for src in [
+            "let x; { let x }",
+            "{let a}{let a}",
+            "var n; var n",
+            "let m=1; m=2",
+            "function f(){} function f(){}",
+            "for(let i=0;i<2;i++){} for(let i=0;i<2;i++){}",
+            "if(1){let p}else{let p}",
+            "let q; function g(){ let q }",
+            "switch(1){case 1:{let s} case 2:{let s}}",
+            "try{}catch(x){let y}",
+        ] {
+            assert!(
+                Engine::new().eval(src, false).is_ok(),
+                "should accept: {src}"
+            );
+        }
+    });
 }
 #[test]
 fn typeof_tdz() {
@@ -9141,20 +9145,24 @@ fn promise_all_user_then() {
 }
 #[test]
 fn async_label_dup_param() {
-    assert!(Engine::new()
-        .eval("async function f(){ await: 1; }", false)
-        .is_err());
-    assert!(Engine::new()
-        .eval("function* g(){ yield: 1; }", false)
-        .is_err());
-    assert!(Engine::new().eval("var f = (a,a)=>1", false).is_err());
-    assert!(Engine::new().eval("var f = (a,b,a)=>1", false).is_err());
-    assert_eq!(run("var f = (a,b)=>a+b; f(1,2)"), "3");
-    assert_eq!(run("function f(){ foo: 1; return 2 } f()"), "2"); // normal label ok
-    assert_eq!(
-        run("async function f(){ x: 1; return 5 } typeof f"),
-        "function"
-    ); // non-await label ok in async
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        assert!(Engine::new()
+            .eval("async function f(){ await: 1; }", false)
+            .is_err());
+        assert!(Engine::new()
+            .eval("function* g(){ yield: 1; }", false)
+            .is_err());
+        assert!(Engine::new().eval("var f = (a,a)=>1", false).is_err());
+        assert!(Engine::new().eval("var f = (a,b,a)=>1", false).is_err());
+        assert_eq!(run("var f = (a,b)=>a+b; f(1,2)"), "3");
+        assert_eq!(run("function f(){ foo: 1; return 2 } f()"), "2"); // normal label ok
+        assert_eq!(
+            run("async function f(){ x: 1; return 5 } typeof f"),
+            "function"
+        ); // non-await label ok in async
+    });
 }
 #[test]
 fn update_target_errors() {
@@ -9190,17 +9198,21 @@ fn catch_dup_binding() {
 }
 #[test]
 fn delete_private_member() {
-    assert!(Engine::new()
-        .eval("class C{ #x=1; m(){ delete this.#x } }", false)
-        .is_err());
-    assert!(Engine::new()
-        .eval("class C{ #x=1; m(){ delete this?.#x } }", false)
-        .is_err());
-    assert_eq!(
-        run("class C{ #x=1; m(){ return delete this.foo } }; new C().m()"),
-        "true"
-    );
-    assert_eq!(run("var o={a:1}; delete o.a; typeof o.a"), "undefined");
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        assert!(Engine::new()
+            .eval("class C{ #x=1; m(){ delete this.#x } }", false)
+            .is_err());
+        assert!(Engine::new()
+            .eval("class C{ #x=1; m(){ delete this?.#x } }", false)
+            .is_err());
+        assert_eq!(
+            run("class C{ #x=1; m(){ return delete this.foo } }; new C().m()"),
+            "true"
+        );
+        assert_eq!(run("var o={a:1}; delete o.a; typeof o.a"), "undefined");
+    });
 }
 #[test]
 fn class_validation() {
@@ -9395,36 +9407,40 @@ fn private_name_no_escape() {
 }
 #[test]
 fn undeclared_private_name() {
-    assert!(Engine::new()
-        .eval("class C { m() { something.#x } }", false)
-        .is_err());
-    assert!(Engine::new()
-        .eval("class C { m() { return this.#y } }", false)
-        .is_err());
-    assert!(Engine::new()
-        .eval("class C { #x=1; m() { return obj.#z } }", false)
-        .is_err());
-    assert!(Engine::new()
-        .eval("class C { m() { return #w in obj } }", false)
-        .is_err());
-    assert!(Engine::new().eval("obj.#top", false).is_err()); // outside any class
-                                                             // valid: declared in the class (incl. forward + nested-class enclosing)
-    assert_eq!(
-        run("class C { #x=5; getX(){return this.#x} }; new C().getX()"),
-        "5"
-    );
-    assert_eq!(
-        run("class C { useLater(){return this.#y} #y=7 }; new C().useLater()"),
-        "7"
-    );
-    assert_eq!(
-        run("class C { #x=1; m(){ return class D { d(o){ return o.#x } } } } typeof new C().m()"),
-        "function"
-    );
-    assert_eq!(
-        run("class C { #x=3; has(o){ return #x in o } }; var c=new C(); c.has(c)"),
-        "true"
-    );
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        assert!(Engine::new()
+            .eval("class C { m() { something.#x } }", false)
+            .is_err());
+        assert!(Engine::new()
+            .eval("class C { m() { return this.#y } }", false)
+            .is_err());
+        assert!(Engine::new()
+            .eval("class C { #x=1; m() { return obj.#z } }", false)
+            .is_err());
+        assert!(Engine::new()
+            .eval("class C { m() { return #w in obj } }", false)
+            .is_err());
+        assert!(Engine::new().eval("obj.#top", false).is_err()); // outside any class
+                                                                 // valid: declared in the class (incl. forward + nested-class enclosing)
+        assert_eq!(
+            run("class C { #x=5; getX(){return this.#x} }; new C().getX()"),
+            "5"
+        );
+        assert_eq!(
+            run("class C { useLater(){return this.#y} #y=7 }; new C().useLater()"),
+            "7"
+        );
+        assert_eq!(
+            run("class C { #x=1; m(){ return class D { d(o){ return o.#x } } } } typeof new C().m()"),
+            "function"
+        );
+        assert_eq!(
+            run("class C { #x=3; has(o){ return #x in o } }; var c=new C(); c.has(c)"),
+            "true"
+        );
+    });
 }
 #[test]
 fn nonsimple_params_use_strict() {
@@ -12134,25 +12150,29 @@ fn module_tdz_across_import() {
 
 #[test]
 fn super_property_context() {
-    // `super` outside a method / field / static block is a SyntaxError (parse error).
-    assert!(Engine::new().eval("super.x", false).is_err());
-    // A bare `super` (neither property nor call) is always a SyntaxError.
-    assert!(Engine::new().eval("function f(){ super }", false).is_err());
-    // `super.x` in a plain function (not a method) is a SyntaxError.
-    assert!(Engine::new()
-        .eval("function f(){ return super.x; }", false)
-        .is_err());
-    // `super.x` inside a method body parses (it is a super-property context).
-    assert!(Engine::new()
-        .eval("({ m(){ return super.v; } })", false)
-        .is_ok());
-    // A class method and a field initializer are also super-property contexts.
-    assert!(Engine::new()
-        .eval(
-            "class C extends Object { m(){ return super.x; } f = super.y; }",
-            false
-        )
-        .is_ok());
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        // `super` outside a method / field / static block is a SyntaxError (parse error).
+        assert!(Engine::new().eval("super.x", false).is_err());
+        // A bare `super` (neither property nor call) is always a SyntaxError.
+        assert!(Engine::new().eval("function f(){ super }", false).is_err());
+        // `super.x` in a plain function (not a method) is a SyntaxError.
+        assert!(Engine::new()
+            .eval("function f(){ return super.x; }", false)
+            .is_err());
+        // `super.x` inside a method body parses (it is a super-property context).
+        assert!(Engine::new()
+            .eval("({ m(){ return super.v; } })", false)
+            .is_ok());
+        // A class method and a field initializer are also super-property contexts.
+        assert!(Engine::new()
+            .eval(
+                "class C extends Object { m(){ return super.x; } f = super.y; }",
+                false
+            )
+            .is_ok());
+    });
 }
 
 #[test]
@@ -12848,27 +12868,31 @@ fn array_from_async_getmethod_and_arraylike() {
 
 #[test]
 fn super_call_in_ordinary_function_is_early_error() {
-    // A super() call in a function/generator/async(-generator) that is not a derived constructor
-    // is an early SyntaxError.
-    assert!(Engine::new()
-        .eval("(function(){ super(); })", false)
-        .is_err());
-    assert!(Engine::new()
-        .eval("(function*(){ super(); })", false)
-        .is_err());
-    assert!(Engine::new()
-        .eval("(async function*(){ super(); })", false)
-        .is_err());
-    // A derived-class constructor's super() is still valid.
-    assert_eq!(
-        run("class B{constructor(){this.v=1}}class D extends B{constructor(){super()}}new D().v"),
-        "1"
-    );
-    // A nested arrow inherits, a nested class constructor is its own context (both fine).
-    assert_eq!(
-        run("class B{constructor(){this.v=2}}class D extends B{constructor(){(()=>super())()}}new D().v"),
-        "2"
-    );
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        // A super() call in a function/generator/async(-generator) that is not a derived constructor
+        // is an early SyntaxError.
+        assert!(Engine::new()
+            .eval("(function(){ super(); })", false)
+            .is_err());
+        assert!(Engine::new()
+            .eval("(function*(){ super(); })", false)
+            .is_err());
+        assert!(Engine::new()
+            .eval("(async function*(){ super(); })", false)
+            .is_err());
+        // A derived-class constructor's super() is still valid.
+        assert_eq!(
+            run("class B{constructor(){this.v=1}}class D extends B{constructor(){super()}}new D().v"),
+            "1"
+        );
+        // A nested arrow inherits, a nested class constructor is its own context (both fine).
+        assert_eq!(
+            run("class B{constructor(){this.v=2}}class D extends B{constructor(){(()=>super())()}}new D().v"),
+            "2"
+        );
+    });
 }
 
 #[test]
@@ -13451,26 +13475,30 @@ fn from_char_code_combines_surrogate_pairs() {
 
 #[test]
 fn parser_early_errors_operators() {
-    // A UnaryExpression (or await expression) cannot be the base of `**`.
-    for src in [
-        "-1 ** 2",
-        "+x ** 2",
-        "!x ** 2",
-        "~x ** 2",
-        "void x ** 2",
-        "typeof x ** 2",
-        "delete x.y ** 2",
-        "async function f(){ await x ** 2 }",
-    ] {
-        assert!(
-            Engine::new().eval(src, false).is_err(),
-            "should reject: {src}"
-        );
-    }
-    // Parenthesized bases and update-expression bases stay valid.
-    assert_eq!(run("(-2) ** 2"), "4");
-    assert_eq!(run("var x=2; String(x++ ** 2)"), "4");
-    assert_eq!(run("2 ** -1"), "0.5");
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        // A UnaryExpression (or await expression) cannot be the base of `**`.
+        for src in [
+            "-1 ** 2",
+            "+x ** 2",
+            "!x ** 2",
+            "~x ** 2",
+            "void x ** 2",
+            "typeof x ** 2",
+            "delete x.y ** 2",
+            "async function f(){ await x ** 2 }",
+        ] {
+            assert!(
+                Engine::new().eval(src, false).is_err(),
+                "should reject: {src}"
+            );
+        }
+        // Parenthesized bases and update-expression bases stay valid.
+        assert_eq!(run("(-2) ** 2"), "4");
+        assert_eq!(run("var x=2; String(x++ ** 2)"), "4");
+        assert_eq!(run("2 ** -1"), "0.5");
+    });
 }
 
 #[test]
@@ -13490,29 +13518,33 @@ fn parser_early_errors_coalesce_mixing() {
 
 #[test]
 fn parser_early_errors_yield_await_identifiers() {
-    for src in [
-        "function *g(){ void yield; }",
-        "function *g(){ void yi\\u0065ld; }",
-        "(function *yield(){})",
-        "async function f(){ void aw\\u0061it; }",
-    ] {
-        assert!(
-            Engine::new().eval(src, false).is_err(),
-            "should reject: {src}"
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        for src in [
+            "function *g(){ void yield; }",
+            "function *g(){ void yi\\u0065ld; }",
+            "(function *yield(){})",
+            "async function f(){ void aw\\u0061it; }",
+        ] {
+            assert!(
+                Engine::new().eval(src, false).is_err(),
+                "should reject: {src}"
+            );
+        }
+        // `yield`/`await` stay usable as identifiers outside those contexts (sloppy mode).
+        assert_eq!(run("var yield = 3; yield"), "3");
+        assert_eq!(run("var await = 4; await"), "4");
+        // A generator *declaration*'s name binds in the enclosing (non-generator) scope.
+        assert_eq!(
+            run("function *yield(){ return 1; } typeof yield"),
+            "function"
         );
-    }
-    // `yield`/`await` stay usable as identifiers outside those contexts (sloppy mode).
-    assert_eq!(run("var yield = 3; yield"), "3");
-    assert_eq!(run("var await = 4; await"), "4");
-    // A generator *declaration*'s name binds in the enclosing (non-generator) scope.
-    assert_eq!(
-        run("function *yield(){ return 1; } typeof yield"),
-        "function"
-    );
-    // `yield <newline> *` cannot form yield* (ASI splits it).
-    assert!(Engine::new()
-        .eval("function *g(){ yield\n* 2; }", false)
-        .is_err());
+        // `yield <newline> *` cannot form yield* (ASI splits it).
+        assert!(Engine::new()
+            .eval("function *g(){ yield\n* 2; }", false)
+            .is_err());
+    });
 }
 
 #[test]
@@ -13960,27 +13992,31 @@ fn literal_early_errors() {
 
 #[test]
 fn directive_prologue_scans_all_directives() {
-    // "use strict" anywhere in the prologue makes the whole prologue strict — a legacy
-    // octal escape in an *earlier* directive is a SyntaxError.
-    for src in [
-        "function f() { '\\1'; 'use strict'; }",
-        "function f() { '\\8'; 'use strict'; }",
-        "'\\1'; 'use strict';",
-    ] {
-        assert!(
-            Engine::new().eval(src, false).is_err(),
-            "should reject: {src}"
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        // "use strict" anywhere in the prologue makes the whole prologue strict — a legacy
+        // octal escape in an *earlier* directive is a SyntaxError.
+        for src in [
+            "function f() { '\\1'; 'use strict'; }",
+            "function f() { '\\8'; 'use strict'; }",
+            "'\\1'; 'use strict';",
+        ] {
+            assert!(
+                Engine::new().eval(src, false).is_err(),
+                "should reject: {src}"
+            );
+        }
+        // A string after the prologue (or a non-directive continuation) stays sloppy.
+        assert_eq!(
+            run("function f() { var x; '\\1'; return 1; } String(f())"),
+            "1"
         );
-    }
-    // A string after the prologue (or a non-directive continuation) stays sloppy.
-    assert_eq!(
-        run("function f() { var x; '\\1'; return 1; } String(f())"),
-        "1"
-    );
-    assert_eq!(
-        run("var s = '\\1' + 'use strict'; s.length.toString()"),
-        "11"
-    );
+        assert_eq!(
+            run("var s = '\\1' + 'use strict'; s.length.toString()"),
+            "11"
+        );
+    });
 }
 
 #[test]
@@ -14619,22 +14655,26 @@ fn global_declaration_instantiation() {
 
 #[test]
 fn block_scope_redeclaration_early_errors() {
-    fn parse_err(src: &str) -> bool {
-        Engine::new().eval(src, false).is_err()
-    }
-    assert!(parse_err("{ var f; function f() {} }"));
-    assert!(parse_err("{ function f() {} var f; }"));
-    assert!(parse_err("{ function f() {} { var f; } }"));
-    assert!(parse_err("{ { var f; } function f() {} }"));
-    assert!(parse_err("{ { var f; } let f; }"));
-    assert!(!parse_err("{ function f() {} function f() {} }")); // sloppy duplicates OK
-    assert!(!parse_err("var f; function f() {} ")); // top level OK
-    assert!(!parse_err("let f; { function f() {} }")); // Annex B shadowing OK
-                                                       // super()/new.target restrictions in global code.
-    assert!(parse_err("super();"));
-    assert!(parse_err("() => { super(); };"));
-    assert!(parse_err("() => { new.target; };"));
-    assert!(!parse_err("function g() { () => new.target; }"));
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        fn parse_err(src: &str) -> bool {
+            Engine::new().eval(src, false).is_err()
+        }
+        assert!(parse_err("{ var f; function f() {} }"));
+        assert!(parse_err("{ function f() {} var f; }"));
+        assert!(parse_err("{ function f() {} { var f; } }"));
+        assert!(parse_err("{ { var f; } function f() {} }"));
+        assert!(parse_err("{ { var f; } let f; }"));
+        assert!(!parse_err("{ function f() {} function f() {} }")); // sloppy duplicates OK
+        assert!(!parse_err("var f; function f() {} ")); // top level OK
+        assert!(!parse_err("let f; { function f() {} }")); // Annex B shadowing OK
+                                                           // super()/new.target restrictions in global code.
+        assert!(parse_err("super();"));
+        assert!(parse_err("() => { super(); };"));
+        assert!(parse_err("() => { new.target; };"));
+        assert!(!parse_err("function g() { () => new.target; }"));
+    });
 }
 
 #[test]
@@ -15438,22 +15478,26 @@ fn atomics_waitasync_sees_same_job_notify() {
 
 #[test]
 fn super_call_early_errors() {
-    // SuperCall outside a derived class constructor is a parse-time SyntaxError.
-    assert!(parse_err("var C = class { constructor() { super(); } };"));
-    assert!(parse_err("class C { m() { super(); } }"));
-    assert!(parse_err("({ m() { super(); } });"));
-    assert!(!parse_err(
-        "class C extends B { constructor() { super(); } }"
-    ));
-    assert!(!parse_err(
-        "class C extends B { constructor() { () => super(); } }"
-    ));
-    assert!(parse_err("class C extends B { m() { super(); } }"));
-    assert!(parse_err("class C extends B { f = super(); }"));
-    assert!(parse_err("class C extends B { static { super(); } }"));
-    assert!(parse_err(
-        "class C extends B { constructor() { function f() { super(); } } }"
-    ));
+    // Body-only early errors are reported at the first call when bodies are lazy; this
+    // test is about the early error itself.
+    crate::parser::with_eager_bodies(|| {
+        // SuperCall outside a derived class constructor is a parse-time SyntaxError.
+        assert!(parse_err("var C = class { constructor() { super(); } };"));
+        assert!(parse_err("class C { m() { super(); } }"));
+        assert!(parse_err("({ m() { super(); } });"));
+        assert!(!parse_err(
+            "class C extends B { constructor() { super(); } }"
+        ));
+        assert!(!parse_err(
+            "class C extends B { constructor() { () => super(); } }"
+        ));
+        assert!(parse_err("class C extends B { m() { super(); } }"));
+        assert!(parse_err("class C extends B { f = super(); }"));
+        assert!(parse_err("class C extends B { static { super(); } }"));
+        assert!(parse_err(
+            "class C extends B { constructor() { function f() { super(); } } }"
+        ));
+    });
 }
 
 fn parse_err(src: &str) -> bool {
@@ -16757,4 +16801,126 @@ fn interp_layout_probes() {
     };
     assert!(words(l.fnf_ptr_word, l.fnf_len_word, l.fnf_cap_word));
     assert!(words(l.fp_ptr_word, l.fp_len_word, l.fp_cap_word));
+}
+
+#[test]
+fn lazy_body_errors_carry_the_file_line() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let src = "function f() {\n  return 1;\n  var 1;\n}\nf();";
+    let body = crate::parser::parse_script(src, false).unwrap();
+    let crate::ast::Stmt::FuncDecl(f) = &body[0] else {
+        panic!("expected a declaration")
+    };
+    assert!(f.body().is_empty(), "the body is skipped at parse time");
+    let err = f.ensure_body().unwrap_err();
+    assert_eq!(err.line, 3);
+    assert_eq!(f.ensure_body().unwrap_err().message, err.message);
+    // The eager parse reports the same error, at load, from the same line.
+    let eager = crate::parser::with_eager_bodies(|| crate::parser::parse_script(src, false))
+        .expect_err("eager parse fails at load");
+    assert_eq!((eager.line, eager.message), (err.line, err.message));
+}
+
+#[test]
+fn a_cold_lazy_body_is_released_by_the_flush_pass_and_reparsed_on_demand() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let src = "function f(a) {\n  function g() { return a + 1; }\n  return g();\n}\nf(1);";
+    let body = crate::parser::parse_script(src, false).unwrap();
+    let crate::ast::Stmt::FuncDecl(f) = &body[0] else {
+        panic!("expected a declaration")
+    };
+    assert!(crate::value::lazy_function_registry_len() >= 1);
+    assert!(
+        f.parsed_body().is_none(),
+        "the body is skipped at parse time"
+    );
+    let first = f.body();
+    assert_eq!(first.len(), 2);
+    assert!(
+        f.lazy.borrow().is_some(),
+        "the source range stays for a re-parse"
+    );
+    // The pass right after a read only clears the used flag; a body untouched for a whole
+    // interval is released.
+    assert_eq!(crate::value::flush_cold_lazy_bodies(), 0);
+    assert!(f.parsed_body().is_some());
+    assert_eq!(crate::value::flush_cold_lazy_bodies(), 1);
+    assert!(
+        f.parsed_body().is_none(),
+        "the body cell is empty after the flush"
+    );
+    assert!(f.hoist.borrow().is_none());
+    assert_eq!(f.scan.get(), 0);
+    assert_eq!(
+        first.len(),
+        2,
+        "a holder's Rc keeps the released statements alive"
+    );
+    let again = f.body();
+    assert_eq!(again.len(), 2);
+    assert!(
+        !std::rc::Rc::ptr_eq(&first, &again),
+        "the body was parsed again"
+    );
+    assert_eq!(
+        f.source().as_deref(),
+        Some("function f(a) {\n  function g() { return a + 1; }\n  return g();\n}")
+    );
+    // Never released while it keeps being read.
+    let _ = f.body();
+    assert_eq!(crate::value::flush_cold_lazy_bodies(), 0);
+    let _ = f.body();
+    assert_eq!(crate::value::flush_cold_lazy_bodies(), 0);
+    assert!(f.parsed_body().is_some());
+}
+
+#[test]
+fn an_eager_body_is_never_released() {
+    let src = "(function f() { return 1; })();";
+    let body = crate::parser::parse_script(src, false).unwrap();
+    let f = match &body[0] {
+        crate::ast::Stmt::Expr(crate::ast::Expr::Call { callee, .. }) => match &**callee {
+            crate::ast::Expr::Paren(inner) => match &**inner {
+                crate::ast::Expr::Func(f) => f.clone(),
+                other => panic!("unexpected callee {other:?}"),
+            },
+            crate::ast::Expr::Func(f) => f.clone(),
+            other => panic!("unexpected callee {other:?}"),
+        },
+        other => panic!("unexpected statement {other:?}"),
+    };
+    assert!(f.lazy.borrow().is_none(), "an IIFE is parsed at load");
+    let _ = f.body();
+    crate::value::flush_cold_lazy_bodies();
+    crate::value::flush_cold_lazy_bodies();
+    assert!(f.parsed_body().is_some());
+}
+
+#[test]
+fn lazy_and_eager_parses_agree() {
+    let src = r#"
+        function outer(a, b) {
+          "use strict";
+          b = b === undefined ? a + 1 : b;
+          const inner = function named(c) { return a + b + c; };
+          class K extends Object { constructor() { super(); this.k = inner(1); } }
+          return new K().k;
+        }
+        outer(1) + [1, 2].map((v) => { return v * 2; }).join();
+    "#;
+    let lazy = run(src);
+    let eager = crate::parser::with_eager_bodies(|| run(src));
+    assert_eq!(lazy, "42,4");
+    assert_eq!(lazy, eager);
+    // A lazy function's source is sliced from the shared file text, not copied at parse.
+    let body = crate::parser::parse_script(src, false).unwrap();
+    let crate::ast::Stmt::FuncDecl(f) = &body[0] else {
+        panic!("expected a declaration")
+    };
+    assert!(matches!(f.source, crate::ast::FnSource::Range { .. }));
+    assert!(f.source().unwrap().starts_with("function outer(a, b) {"));
 }

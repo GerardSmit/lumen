@@ -533,6 +533,11 @@ pub struct ReText {
 }
 
 impl ReText {
+    /// Heap bytes this view keeps alive beyond the subject string itself.
+    pub fn heap_bytes(&self) -> usize {
+        self.elems.capacity() * 4 + self.unit_of.as_ref().map_or(0, |u| u.capacity() * 8)
+    }
+
     /// Prepare `s` for matching, keeping the caller's `Rc` for zero-copy ASCII slicing.
     pub fn new_rc(unicode: bool, s: &crate::lstr::LStr) -> ReText {
         // Engine strings maintain an exact one-way ASCII hint in their allocation header.
@@ -872,7 +877,7 @@ impl Regex {
             .and_then(|captures| captures[0])
     }
 
-    fn exec_impl<I: ReInput>(&self, input: I, start: usize) -> Option<Captures> {
+    fn exec_impl<I: ReInput + Send>(&self, input: I, start: usize) -> Option<Captures> {
         if start > input.len() {
             return None;
         }
@@ -895,6 +900,8 @@ impl Regex {
             marks: scratch.marks,
             steps: 0,
             depth: 0,
+            max_depth: MAX_MATCH_DEPTH,
+            depth_exhausted: false,
             back: false,
             flags: scratch.flags,
             unicode: self.flags.contains('u') || self.flags.contains('v'),
@@ -949,8 +956,14 @@ impl Regex {
             m.flags.truncate(1);
             m.steps = 0;
             m.depth = 0;
+            m.depth_exhausted = false;
             if m.run(&self.prog, 0, from) {
                 break 'scan Some(Captures::from_slots(&m.caps, self.ngroups));
+            }
+            if m.depth_exhausted {
+                if let Some(captures) = self.run_deep(input, from, m.unicode) {
+                    break 'scan Some(captures);
+                }
             }
             if self.sticky {
                 break 'scan None;
@@ -965,6 +978,55 @@ impl Regex {
             });
         });
         result
+    }
+}
+
+/// A raw pointer that may cross to the deep-match thread. The pointee holds `Rc`s (compiled
+/// instructions share character classes), which is sound only because the spawning thread blocks
+/// in `join` for the whole match: exactly one thread touches them at a time, and the matcher only
+/// reads through them.
+struct SendPtr<T: ?Sized>(*const T);
+unsafe impl<T: ?Sized> Send for SendPtr<T> {}
+
+impl Regex {
+    /// Re-run one attempt at `from` on a thread with a deep stack, for an attempt the calling
+    /// thread had to cut off at `MAX_MATCH_DEPTH`. `None` when the deep attempt fails too, or
+    /// when the platform cannot spawn threads (wasm32), where the old cut-off result stands.
+    fn run_deep<I: ReInput + Send>(
+        &self,
+        input: I,
+        from: usize,
+        unicode: bool,
+    ) -> Option<Captures> {
+        let prog = SendPtr(&self.prog[..] as *const [Inst]);
+        let ngroups = self.ngroups;
+        let nmarks = self.nmarks;
+        let flags = (self.ignore_case, self.multiline, self.dotall);
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .name("lumen-regex-deep".into())
+                .stack_size(DEEP_MATCH_STACK)
+                .spawn_scoped(scope, move || {
+                    let prog = prog;
+                    let prog: &[Inst] = unsafe { &*prog.0 };
+                    let mut m = Matcher {
+                        input,
+                        caps: vec![None; 2 * (ngroups + 1)],
+                        marks: vec![None; nmarks],
+                        steps: 0,
+                        depth: 0,
+                        max_depth: DEEP_MATCH_DEPTH,
+                        depth_exhausted: false,
+                        back: false,
+                        flags: vec![flags],
+                        unicode,
+                    };
+                    m.run(prog, 0, from)
+                        .then(|| Captures::from_slots(&m.caps, ngroups))
+                })
+                .ok()?;
+            handle.join().ok().flatten()
+        })
     }
 }
 
@@ -2368,10 +2430,20 @@ fn clone_class(cc: &CharClass) -> CharClass {
 // Backtracking matcher
 // ---------------------------------------------------------------------------------------------
 
-/// Recursion-depth ceiling for the backtracking matcher (separate from the step budget): a long
-/// input against a greedy quantifier recurses once per consumed char, which would overflow the
-/// native stack on big inputs.
+/// Recursion-depth ceiling for the backtracking matcher on the calling thread (separate from the
+/// step budget): a long input against a greedy quantifier recurses once per consumed char, which
+/// would overflow the native stack on big inputs. An attempt that hits it is not a failed match —
+/// it is retried on a dedicated deep-stack thread (`Regex::run_deep`) with `DEEP_MATCH_DEPTH`.
 const MAX_MATCH_DEPTH: u32 = 3000;
+
+/// Depth ceiling on the deep-match thread. Sized against `DEEP_MATCH_STACK` for a debug-build
+/// frame (measured: ~300k frames fit in 1 GiB); release frames are smaller, so the ceiling is the
+/// binding limit there. Roughly three frames per consumed character for a `(?:a|b)*` loop.
+const DEEP_MATCH_DEPTH: u32 = 250_000;
+
+/// Stack reserved for the deep-match thread. Virtual reservation only: pages are committed as
+/// the recursion actually touches them, so a shallow retry costs the thread spawn and little else.
+const DEEP_MATCH_STACK: usize = 1 << 30;
 
 fn find_ascii_literal(
     subject: &[u8],
@@ -2472,6 +2544,11 @@ struct Matcher<I: ReInput> {
     marks: Vec<Option<usize>>,
     steps: u64,
     depth: u32,
+    /// Recursion ceiling for this matcher (`MAX_MATCH_DEPTH`, or `DEEP_MATCH_DEPTH` on the
+    /// deep-match thread).
+    max_depth: u32,
+    /// Set when an attempt was cut off by `max_depth` rather than by a genuine mismatch.
+    depth_exhausted: bool,
     /// Matching direction: a lookbehind body (compiled from the reversed AST) consumes leftward.
     back: bool,
     /// `(icase, multiline, dotall)` stack — the base flags, plus an entry per active `(?ims-ims:…)`
@@ -2698,7 +2775,8 @@ impl<I: ReInput> Matcher<I> {
     }
 
     fn run(&mut self, prog: &[Inst], pc: usize, pos: usize) -> bool {
-        if self.depth > MAX_MATCH_DEPTH {
+        if self.depth > self.max_depth {
+            self.depth_exhausted = true;
             return false;
         }
         self.depth += 1;

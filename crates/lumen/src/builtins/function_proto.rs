@@ -80,7 +80,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         // (natives, bound functions, proxies) renders as a native function carrying its name.
         if let Value::Obj(o) = &this {
             if let Callable::User(user) = &o.borrow().call {
-                if let Some(src) = &user.func.source {
+                if let Some(src) = user.func.source() {
                     return Ok(Value::from_string(src.to_string()));
                 }
             }
@@ -244,10 +244,13 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
             .map_err(|e| i.make_error("SyntaxError", e.message))?;
     }
     let src = format!("{prefix} anonymous({params}\n) {{\n{body}\n}}");
-    let program = crate::parser::parse_script(&src, false)
+    let program = crate::parser::parse_dynamic_function(&src)
         .map_err(|e| i.make_error("SyntaxError", e.message))?;
     match program.into_iter().next() {
         Some(crate::ast::Stmt::FuncDecl(f)) => {
+            // CreateDynamicFunction reports a body that does not parse at creation.
+            f.ensure_body()
+                .map_err(|e| i.make_error("SyntaxError", e.message))?;
             let env = i.global_env.clone();
             let func = i.make_function(f, env);
             // GetPrototypeFromConstructor(new.target, ...): a cross-realm `new other.Function()`

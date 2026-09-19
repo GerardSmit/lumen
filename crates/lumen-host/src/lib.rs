@@ -66,7 +66,8 @@ pub struct Extension {
     /// A build-time snapshot of `js_init`'s parsed AST (see `Engine::eval_snapshot`). When
     /// present, `install` decodes it instead of re-lexing/parsing `js_init` every boot — the
     /// dominant cold-start cost. A decode failure (version skew) falls back to `js_init`, so it
-    /// is a pure optimization. `js_init` must still be set (the fallback source).
+    /// is a pure optimization. `js_init` must still be set: it is the fallback source, and the
+    /// text the snapshot's functions read their source ranges and unparsed bodies from.
     pub js_init_snapshot: Option<&'static [u8]>,
 }
 
@@ -100,13 +101,20 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
             engine.define_namespace(ns, &table);
         }
         if let Some(src) = ext.js_init {
+            // The glue's setup path runs once, in the tree-walker: compiling it would parse the
+            // body of every function it defines (the capture scan needs them) for code that
+            // never runs again. Functions it defines tier up on their own calls as usual.
+            let tier = engine.tier();
+            engine.set_tier(lumen::bytecode::Tier::Interp);
             // Prefer the precompiled snapshot (skips lex+parse); on a decode failure fall back to
             // parsing the source, so the snapshot can never change behavior — only speed.
             let completion = ext
                 .js_init_snapshot
-                .and_then(|bytes| engine.eval_snapshot(bytes, false).ok())
+                .filter(|_| std::env::var_os("LUMEN_NO_SNAPSHOT").is_none())
+                .and_then(|bytes| engine.eval_snapshot(bytes, src, false).ok())
                 .map(Ok)
                 .unwrap_or_else(|| engine.eval(src, false));
+            engine.set_tier(tier);
             match completion {
                 Ok(Completion::Value(_)) => {}
                 Ok(Completion::Throw { name, message }) => {

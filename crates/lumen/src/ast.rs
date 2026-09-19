@@ -121,7 +121,121 @@ pub struct Class {
     /// `@dec` decorators applied to the whole class (outermost last).
     pub decorators: Vec<Expr>,
     /// The class's source text (what the constructor's `toString` returns).
-    pub source: Option<Rc<str>>,
+    pub source: FnSource,
+}
+
+/// Source text for `Function.prototype.toString`: either owned (a snapshot-decoded or synthesized
+/// function) or a byte range into the shared source of the file it was parsed from, sliced on
+/// demand so nested functions do not each carry a copy of their enclosing text.
+#[derive(Clone, Default)]
+pub enum FnSource {
+    #[default]
+    None,
+    Text(Rc<str>),
+    Range {
+        src: Rc<str>,
+        start: u32,
+        end: u32,
+    },
+}
+
+impl std::fmt::Debug for FnSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FnSource::None => f.write_str("None"),
+            FnSource::Text(t) => f.debug_tuple("Text").field(t).finish(),
+            FnSource::Range { start, end, .. } => f
+                .debug_struct("Range")
+                .field("start", start)
+                .field("end", end)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl FnSource {
+    pub fn text(&self) -> Option<Rc<str>> {
+        match self {
+            FnSource::None => None,
+            FnSource::Text(s) => Some(s.clone()),
+            FnSource::Range { .. } => self.as_str().map(Rc::from),
+        }
+    }
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            FnSource::None => None,
+            FnSource::Text(s) => Some(s),
+            FnSource::Range { src, start, end } => src.get(*start as usize..*end as usize),
+        }
+    }
+    pub fn is_some(&self) -> bool {
+        !matches!(self, FnSource::None)
+    }
+}
+
+/// A function body the parser skipped: the byte range of `{ ... }` in the shared file source,
+/// the line the `{` is on, and the parser context the body inherits. Parsed on first call (see
+/// [`Function::ensure_body`]) and kept afterwards, so a body the collector released can be
+/// parsed again (see [`Function::release_cold_body`]).
+#[derive(Clone)]
+pub struct LazyBody {
+    pub src: Rc<str>,
+    pub start: u32,
+    pub end: u32,
+    pub line: u32,
+    pub html_comments: bool,
+    pub ctx: LazyCtx,
+    /// The innermost class the body is written in (its private names, and its enclosing
+    /// classes' through `parent`), for the body's private-name check.
+    pub private_scope: Option<Rc<PrivateScope>>,
+}
+
+impl std::fmt::Debug for LazyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyBody")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("line", &self.line)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The private names one class declares, filled in once its members have all been parsed (a
+/// method body may reference a name declared after it), chained to the enclosing class's.
+#[derive(Debug, Default)]
+pub struct PrivateScope {
+    pub names: std::cell::OnceCell<Vec<String>>,
+    pub parent: Option<Rc<PrivateScope>>,
+}
+
+impl PrivateScope {
+    /// The declared names of this class and every enclosing one, innermost last.
+    pub fn visible_names(self: &Rc<Self>) -> Vec<Vec<String>> {
+        let mut chain = Vec::new();
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            chain.push(s.names.get().cloned().unwrap_or_default());
+            cur = s.parent.clone();
+        }
+        chain.reverse();
+        chain
+    }
+}
+
+/// The parser flags a function body inherits from where it was written.
+#[derive(Debug, Clone, Copy)]
+pub struct LazyCtx {
+    /// Strictness after the body's own directive prologue.
+    pub strict: bool,
+    pub in_generator: bool,
+    pub in_async: bool,
+    pub module: bool,
+    pub allow_new_target: bool,
+    pub super_prop_ok: bool,
+    pub super_call_ok: bool,
+    pub in_derived_class: bool,
+    pub no_arguments_refs: bool,
+    pub in_field_init: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -297,10 +411,13 @@ pub enum Expr {
         optional: bool,
     },
     Seq(Vec<Expr>),
-    /// `tag\`a${x}b\`` — `quasis` are (cooked, raw) chunks (one more than `subs`).
+    /// `tag\`a${x}b\`` — `quasis` are (cooked, raw) chunks (one more than `subs`). `site` is
+    /// the template site's identity for GetTemplateObject (see `parser::template_site`): stable
+    /// across a lazy re-parse of the function it sits in, unlike the node's address.
     TaggedTemplate {
         tag: P<Expr>,
-        quasis: Vec<(Option<String>, String)>,
+        quasis: Box<[(Option<String>, String)]>,
+        site: u32,
         subs: Vec<Expr>,
     },
     /// An optional chain (`a?.b.c`): evaluates the inner LHS, short-circuiting to `undefined` if any
@@ -392,7 +509,18 @@ pub enum PropKey {
 pub struct Function {
     pub name: Option<String>,
     pub params: Vec<Param>,
-    pub body: Vec<Stmt>,
+    /// The parsed body, read through [`Function::body`]. `None` until the first `ensure_body`
+    /// when `lazy` is set, and again after the collector releases a body that went cold (see
+    /// [`Function::release_cold_body`]); a released body is re-parsed from `lazy` on demand.
+    pub body: std::cell::RefCell<Option<Rc<Vec<Stmt>>>>,
+    /// The unparsed body: the source range a lazy parse (and any re-parse after a release) reads.
+    /// `None` for an eagerly parsed body, which is never released.
+    pub lazy: std::cell::RefCell<Option<Box<LazyBody>>>,
+    /// Set by every [`Function::body`]; cleared by the collector's flush pass. A body that was
+    /// not read between two collections is released.
+    pub body_used: std::cell::Cell<bool>,
+    /// The error a lazy parse produced, replayed by every later `ensure_body`.
+    pub lazy_error: std::cell::OnceCell<Box<crate::parser::ParseError>>,
     pub is_arrow: bool,
     pub is_strict: bool,
     /// Arrow with an expression body (`x => x+1`): the single statement is a synthetic `return`.
@@ -406,15 +534,15 @@ pub struct Function {
     /// function. A declaration's name binds (mutably) in the enclosing scope instead.
     pub is_fn_expr: bool,
     /// The source text this function was parsed from, for `Function.prototype.toString`.
-    pub source: Option<Rc<str>>,
+    pub source: FnSource,
     /// Lazily-computed body facts (see [`Function::scan_flags`]): bit 0 = scanned, bit 1 =
     /// references `arguments`, bit 2 = references `new.target`, bit 3 = references `this`.
     /// A direct `eval` sets all three (it can reach any of them dynamically).
     pub scan: std::cell::Cell<u8>,
     /// Lazily-computed hoisting plan for the body (the strict flag it was computed under plus the
     /// ops), so calls replay a flat list instead of re-walking the AST (see
-    /// `interpreter::collect_hoist_ops`).
-    pub hoist: std::cell::OnceCell<(bool, Rc<Vec<HoistOp>>)>,
+    /// `interpreter::collect_hoist_ops`). Reset with the body: the ops reference its nested nodes.
+    pub hoist: std::cell::RefCell<Option<(bool, Rc<Vec<HoistOp>>)>>,
     /// Bytecode-tier state: call count until tier-up, and the compile result once attempted
     /// (`None` = uses constructs outside the bytecode subset; runs in the tree-walker forever).
     pub calls: std::cell::Cell<u32>,
@@ -424,11 +552,12 @@ pub struct Function {
     /// stays alive because filled call ICs hold raw pointers into it.
     pub code2: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
     /// Lazily-built object-map templates for closures of this function (see
-    /// `Interp::make_function`): the function object's `Props` (length/name and a `prototype`
-    /// placeholder) and, for prototype-bearing kinds, the fresh `.prototype`'s `Props` — cloned
-    /// per closure instance instead of rebuilt insert by insert, so key hashing and shape
-    /// transitions are paid once per FUNCTION rather than once per closure.
-    pub fn_maps: std::cell::OnceCell<(crate::value::Props, Option<crate::value::Props>)>,
+    /// `Interp::make_function` and [`crate::value::FnMaps`]): the function object's `Props`
+    /// (length/name and a `prototype` placeholder) and, for prototype-bearing kinds, the fresh
+    /// `.prototype`'s `Props` — cloned per closure instance instead of rebuilt insert by insert,
+    /// so key hashing and shape transitions are paid once per FUNCTION rather than once per
+    /// closure, and a prototype-less closure shares the template's entry block outright.
+    pub fn_maps: std::cell::OnceCell<Box<crate::value::FnMaps>>,
 }
 
 /// One pre-scanned hoisting action for a statement list, replayed against a scope at function
@@ -458,6 +587,80 @@ pub const SCAN_THIS: u8 = 8;
 pub const SCAN_HAS_LOOP: u8 = 16;
 
 impl Function {
+    /// The body statements, parsed (or re-parsed after a release) on demand. Empty for a lazy
+    /// body whose parse failed — every reader that can run before the first call goes through
+    /// [`ensure_body`](Function::ensure_body) first, which is where the SyntaxError surfaces.
+    /// The returned `Rc` keeps the statements alive across a collection that releases the cell,
+    /// so a reader that walks them holds it rather than a slice borrowed from a temporary.
+    pub fn body(&self) -> Rc<Vec<Stmt>> {
+        self.body_used.set(true);
+        if let Some(b) = self.parsed_body() {
+            return b;
+        }
+        let _ = self.ensure_body();
+        self.parsed_body().unwrap_or_default()
+    }
+
+    /// The body only if it is currently materialised: never parses. For the parse-time
+    /// early-error scans, which a skipped body runs itself when it is parsed.
+    pub fn parsed_body(&self) -> Option<Rc<Vec<Stmt>>> {
+        self.body.borrow().clone()
+    }
+
+    /// Parse a skipped body. A failed parse is remembered and returned again on every later
+    /// call, as the SyntaxError the first call throws.
+    pub fn ensure_body(&self) -> Result<(), crate::parser::ParseError> {
+        if self.parsed_body().is_some() {
+            return Ok(());
+        }
+        if let Some(e) = self.lazy_error.get() {
+            return Err((**e).clone());
+        }
+        let lazy = self.lazy.borrow();
+        let Some(lazy) = lazy.as_ref() else {
+            *self.body.borrow_mut() = Some(Rc::new(Vec::new()));
+            return Ok(());
+        };
+        match crate::parser::parse_lazy_body(lazy, self) {
+            Ok(stmts) => {
+                *self.body.borrow_mut() = Some(Rc::new(stmts));
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.lazy_error.set(Box::new(e.clone()));
+                Err(e)
+            }
+        }
+    }
+
+    /// The collector's flush step for one lazily-parsed function: a materialised body that no
+    /// [`body`](Function::body) read since the previous collection is released, with the
+    /// caches derived from it (`scan`, `hoist`), and is re-parsed from `lazy` if the function
+    /// ever runs again. An activation still executing the body holds its own `Rc` to the
+    /// statements, so releasing the cell never frees code under a running frame. Returns
+    /// whether a body was released.
+    pub fn release_cold_body(&self) -> bool {
+        if self.body_used.replace(false) {
+            return false;
+        }
+        self.release_body()
+    }
+
+    /// Drop a materialised body now, whatever its use flag says (the caller only borrowed it —
+    /// see the bytecode tier's capture scan). Same re-parse contract as `release_cold_body`.
+    pub fn release_body(&self) -> bool {
+        if self.lazy.borrow().is_none() || self.body.take().is_none() {
+            return false;
+        }
+        self.scan.set(0);
+        self.hoist.take();
+        true
+    }
+
+    pub fn source(&self) -> Option<Rc<str>> {
+        self.source.text()
+    }
+
     /// What this function's own activation must provide: whether the body (or a nested arrow, or a
     /// possible direct `eval`) can observe `arguments`, `new.target`, or `this`. Ordinary nested
     /// functions are opaque (they get their own); arrows are transparent. Conservative on the
@@ -474,7 +677,12 @@ impl Function {
                 scan_expr(d, &mut flags);
             }
         }
-        scan_stmts(&self.body, &mut flags);
+        // A lazy body that fails to parse never runs; the flags only need to be safe, and the
+        // conservative set costs nothing more than an unused binding.
+        if self.ensure_body().is_err() {
+            flags |= SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS;
+        }
+        scan_stmts(&self.body(), &mut flags);
         self.scan.set(flags);
         flags
     }
@@ -727,11 +935,7 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
                 scan_expr(e, flags);
             }
         }
-        Expr::TaggedTemplate {
-            tag,
-            quasis: _,
-            subs,
-        } => {
+        Expr::TaggedTemplate { tag, subs, .. } => {
             scan_expr(tag, flags);
             for e in subs {
                 scan_expr(e, flags);

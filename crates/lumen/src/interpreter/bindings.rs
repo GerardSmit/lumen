@@ -89,6 +89,14 @@ impl<'a> Iterator for VarValues<'a> {
 }
 
 impl VarMap {
+    /// (bindings, reserved slots, mode) for a heap census.
+    pub(crate) fn census(&self) -> (usize, usize, &'static str) {
+        match &self.map {
+            VarStorage::Template(_, v) => (v.len(), v.capacity(), "template"),
+            VarStorage::Small(v) => (v.len(), v.capacity(), "small"),
+            VarStorage::Large(m) => (m.len(), m.capacity(), "large"),
+        }
+    }
     pub(crate) fn template_layout(&self) -> Option<&Rc<BindingLayout>> {
         match &self.map {
             VarStorage::Template(layout, _) if self.generation() == 0 => Some(layout),
@@ -193,6 +201,12 @@ impl VarMap {
                     return Some(std::mem::replace(old, v));
                 }
                 if entries.len() < SMALL_VAR_MAP_CAPACITY {
+                    // Grow by exactly what is needed: a scope's bindings are declared once, at
+                    // entry, and closures keep tens of thousands of these vectors alive, so the
+                    // doubling policy's slack is real memory, not amortisation.
+                    if entries.len() == entries.capacity() {
+                        entries.reserve_exact(1);
+                    }
                     entries.push((k, v));
                     return None;
                 }

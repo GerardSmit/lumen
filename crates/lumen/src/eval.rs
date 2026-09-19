@@ -445,6 +445,7 @@ impl Interp {
                         let mut names = Vec::new();
                         pattern_idents(pat, &mut names);
                         for name in names {
+                            let name: Rc<str> = name.into();
                             let mut b = scope.borrow_mut();
                             b.lexical_names.push(name.clone());
                             b.vars.insert(
@@ -480,9 +481,10 @@ impl Interp {
                 Stmt::ClassDecl(class) => {
                     if let Some(name) = &class.name {
                         // Classes are lexically scoped with a TDZ until the declaration executes.
+                        let name: Rc<str> = name.as_str().into();
                         scope.borrow_mut().lexical_names.push(name.clone());
                         scope.borrow_mut().vars.insert(
-                            name.clone(),
+                            name,
                             Binding {
                                 value: Value::Undefined,
                                 mutable: true,
@@ -1707,7 +1709,11 @@ impl Interp {
             let (import_ref, uninit, found) = {
                 let b = s.borrow();
                 match b.vars.get(name) {
-                    Some(binding) => (binding.import_ref.clone(), !binding.initialized, true),
+                    Some(binding) => (
+                        binding.import_ref.as_deref().cloned(),
+                        !binding.initialized,
+                        true,
+                    ),
                     None => (None, false, false),
                 }
             };
@@ -1778,7 +1784,7 @@ impl Interp {
                     ));
                 }
                 // A live module import reads through to the exporter's binding.
-                if let Some((src_env, local)) = &binding.import_ref {
+                if let Some((src_env, local)) = binding.import_ref.as_deref() {
                     let (src_env, local) = (src_env.clone(), local.clone());
                     drop(b);
                     return Ok((self.get_var(&local, &src_env)?, None));
@@ -2231,7 +2237,7 @@ impl Interp {
             }
         }
         // A String wrapper's `length` and in-range indices are own exotic properties.
-        if let crate::value::Exotic::StrWrap(s) = o.borrow().exotic.clone() {
+        if let Some(s) = o.borrow().str_wrap() {
             if key == "length" {
                 return Ok(true);
             }
@@ -2512,9 +2518,7 @@ impl Interp {
                 let idx = self.eval(index, env)?;
                 // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
                 if matches!(base, Value::Undefined | Value::Null) {
-                    return Err(
-                        self.throw("TypeError", "cannot read property of null or undefined")
-                    );
+                    return Err(self.throw("TypeError", self.null_read_message(&base, Some(&idx))));
                 }
                 if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
                     if let Some(v) = self.fast_get_elem(o, *n) {
@@ -2529,9 +2533,12 @@ impl Interp {
                 args,
                 optional,
             } => self.eval_call(callee, args, *optional, env),
-            Expr::TaggedTemplate { tag, quasis, subs } => {
-                self.eval_tagged_template(tag, quasis, subs, env)
-            }
+            Expr::TaggedTemplate {
+                tag,
+                quasis,
+                site,
+                subs,
+            } => self.eval_tagged_template(tag, quasis, *site, subs, env),
             Expr::New { callee, args } => {
                 let c = self.eval(callee, env)?;
                 let argv = self.eval_args(args, env)?;
@@ -2597,18 +2604,40 @@ impl Interp {
             return;
         }
         if let Value::Obj(o) = v {
-            let empty = o
-                .borrow()
+            let mut b = o.borrow_mut();
+            let empty = b
                 .props
                 .get("name")
                 .map(|p| matches!(p.value(), Value::Str(s) if s.is_empty()))
                 .unwrap_or(true);
-            if empty {
-                o.borrow_mut().props.insert(
-                    "name".to_string(),
-                    Property::data(Value::from_string(name.to_string()), false, false, true),
-                );
+            if !empty {
+                return;
             }
+            // A pristine closure still shares its function's template block: take (or build)
+            // the template's named variant so closures of one site keep sharing.
+            if let Callable::User(u) = &b.call {
+                if let Some(maps) = u.func.fn_maps.get() {
+                    if b.props.shares_entries_with(&maps.fn_map) {
+                        let (cached, named) = &**maps.named.get_or_init(|| {
+                            let mut p = maps.fn_map.clone();
+                            p.insert(
+                                crate::value::fn_key(1),
+                                Property::data(Value::str(name), false, false, true),
+                            );
+                            p.share_entries();
+                            Box::new((Rc::from(name), p))
+                        });
+                        if &**cached == name {
+                            b.props = named.clone();
+                            return;
+                        }
+                    }
+                }
+            }
+            b.props.insert(
+                crate::value::fn_key(1),
+                Property::data(Value::str(name), false, false, true),
+            );
         }
     }
 
@@ -2736,10 +2765,11 @@ impl Interp {
         &mut self,
         tag: &Expr,
         quasis: &[(Option<String>, String)],
+        site: u32,
         subs: &[Expr],
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        let strings = self.template_object(quasis)?;
+        let strings = self.template_object(quasis, site)?;
         // Evaluate the tag callee, capturing `this` for method tags (`obj.tag\`...\``).
         let (func, this) = match tag {
             Expr::Member { obj, prop, .. } => {
@@ -2768,8 +2798,11 @@ impl Interp {
 
     /// GetTemplateObject: one frozen strings array (with a frozen `.raw`) per template *site* —
     /// re-evaluating the same site passes the identical object.
-    fn template_object(&mut self, quasis: &[(Option<String>, String)]) -> Result<Value, Abrupt> {
-        let site = quasis.as_ptr() as usize;
+    fn template_object(
+        &mut self,
+        quasis: &[(Option<String>, String)],
+        site: u32,
+    ) -> Result<Value, Abrupt> {
         let strings = match self.template_cache.get(&site) {
             Some(v) => v.clone(),
             None => {
@@ -2920,7 +2953,13 @@ impl Interp {
         e: &Expr,
         env: &Env,
     ) -> Result<Option<(Value, Value, Vec<Value>)>, Abrupt> {
-        let Expr::TaggedTemplate { tag, quasis, subs } = e else {
+        let Expr::TaggedTemplate {
+            tag,
+            quasis,
+            site,
+            subs,
+        } = e
+        else {
             return Ok(None);
         };
         let (func, this) = match &**tag {
@@ -2938,7 +2977,7 @@ impl Interp {
         if !func.is_callable() {
             return Ok(None);
         }
-        let strings = self.template_object(quasis)?;
+        let strings = self.template_object(quasis, *site)?;
         let mut argv = vec![strings];
         for s in subs {
             argv.push(self.eval(s, env)?);
@@ -3294,6 +3333,7 @@ impl Interp {
                         result: Value::Undefined,
                         value: Value::Undefined,
                         fulfilled: true,
+                        context: self.async_context.clone(),
                     });
                     return;
                 }
@@ -3337,13 +3377,14 @@ impl Interp {
             self.unhandled_rejections
                 .insert(ptr, (promise.clone(), value.clone()));
         }
-        for (on_f, on_r, result) in reactions {
+        for (on_f, on_r, result, context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
             self.microtasks.push_back(Job {
                 handler,
                 result,
                 value: value.clone(),
                 fulfilled,
+                context,
             });
         }
     }
@@ -3373,8 +3414,9 @@ impl Interp {
         self.unhandled_rejections.remove(&ptr);
         match status {
             0 => {
+                let context = self.async_context.clone();
                 if let Some(s) = self.promises.get_mut(&ptr) {
-                    s.reactions.push((on_f, on_r, result.clone()));
+                    s.reactions.push((on_f, on_r, result.clone(), context));
                 }
             }
             1 => {
@@ -3384,6 +3426,7 @@ impl Interp {
                     result: result.clone(),
                     value: v,
                     fulfilled: true,
+                    context: self.async_context.clone(),
                 });
             }
             _ => {
@@ -3393,6 +3436,7 @@ impl Interp {
                     result: result.clone(),
                     value: v,
                     fulfilled: false,
+                    context: self.async_context.clone(),
                 });
             }
         }
@@ -3445,14 +3489,12 @@ impl Interp {
         }
     }
 
+    /// Run every queued job, including the ones the jobs themselves enqueue. There is no budget:
+    /// a promise with 100k reactions (a stop promise every dropped frame attached a `.catch` to)
+    /// is legitimate work, and a cap that clears the queue silently loses settlements the program
+    /// is awaiting. A genuinely infinite microtask loop spins here, as it does in Node.
     pub(crate) fn drain_microtasks(&mut self) {
-        let mut budget = 100_000u32;
         while let Some(job) = self.microtasks.pop_front() {
-            budget -= 1;
-            if budget == 0 {
-                self.microtasks.clear();
-                break;
-            }
             self.run_job(job);
         }
     }
@@ -3461,11 +3503,14 @@ impl Interp {
     /// settlement through when there is no handler).
     pub(crate) fn run_job(&mut self, job: crate::interpreter::Job) {
         if job.handler.is_callable() {
-            match self.call(
+            let outer = std::mem::replace(&mut self.async_context, job.context.clone());
+            let outcome = self.call(
                 job.handler.clone(),
                 Value::Undefined,
                 std::slice::from_ref(&job.value),
-            ) {
+            );
+            self.async_context = outer;
+            match outcome {
                 Ok(r) => self.resolve_promise(&job.result, r),
                 Err(Abrupt::Throw(e)) => self.reject_promise(&job.result, e),
                 Err(_) => {}
@@ -3793,7 +3838,7 @@ impl Interp {
             // The variable environment itself may hold body-level lexicals (our function body
             // scope carries both); a var may not hoist over one of those either.
             for name in &var_names {
-                if var_env.borrow().lexical_names.iter().any(|n| n == name) {
+                if var_env.borrow().lexical_names.iter().any(|n| &**n == name) {
                     return Err(self.throw(
                         "SyntaxError",
                         format!("Identifier '{name}' has already been declared"),
@@ -4354,14 +4399,15 @@ impl Interp {
             if let Some(func) = block {
                 // A static block instantiates its declarations like a function body,
                 // including a `using` disposal frame.
-                self.hoist(&func.body, &scope, &[]);
-                self.declare_block_lexicals(&func.body, &scope, false);
-                let has_using = func.body.iter().any(stmt_declares_using);
+                let body = func.body();
+                self.hoist(&body, &scope, &[]);
+                self.declare_block_lexicals(&body, &scope, false);
+                let has_using = body.iter().any(stmt_declares_using);
                 if has_using {
                     self.using_stack.push(Vec::new());
                 }
                 let mut result: Completion = Ok(Value::Undefined);
-                for stmt in &func.body {
+                for stmt in body.iter() {
                     if let Err(e) = self.exec_stmt(stmt, &scope) {
                         result = Err(e);
                         break;
@@ -4767,12 +4813,15 @@ impl Interp {
                         }
                         // A subclass instance inherits the built-in's exotic behavior (e.g. an Array
                         // subclass is itself an Array exotic).
-                        let src_exotic = src.borrow().exotic.clone();
+                        let (src_exotic, payload) = {
+                            let sb = src.borrow();
+                            (sb.exotic, sb.exotic_payload())
+                        };
                         if !matches!(src_exotic, crate::value::Exotic::None) {
                             if matches!(src_exotic, crate::value::Exotic::Array) {
                                 dst.borrow().props.mark_array();
                             }
-                            dst.borrow_mut().exotic = src_exotic;
+                            dst.borrow_mut().set_exotic(src_exotic, payload);
                         }
                         // Move the native object's internal slots (Map/Set/TypedArray/buffer/etc.)
                         // onto `this`, so a subclass instance carries the built-in's state.
@@ -5092,8 +5141,8 @@ impl Interp {
 
     /// [`Interp::make_plain_object_vm`] through a per-site pre-shaped map (distinct keys only —
     /// the compiler guarantees it): the first execution builds the final `Props` once via the
-    /// insert path with placeholder values; every later instance clones it (entry-vector copy,
-    /// key refcount bumps) and writes the values slot by slot — no hashing, no shape
+    /// insert path with placeholder values; every later instance takes its shape (one refcount
+    /// bump) and builds the entry vector straight from the values — no hashing, no shape
     /// transitions. Values arrive in key order, one slot per key.
     pub(crate) fn make_plain_object_templated(
         &mut self,
@@ -6328,9 +6377,7 @@ impl Interp {
                     .then(|| {
                         b.props
                             .entry_at(cached.slot as usize)
-                            .and_then(|(_, property)| {
-                                (!property.accessor()).then(|| property.value())
-                            })
+                            .and_then(|property| (!property.accessor()).then(|| property.value()))
                     })
                     .flatten()
                 } else {
@@ -6809,14 +6856,17 @@ fn default_constructor(derived: bool) -> Function {
     };
     Function {
         scan: std::cell::Cell::new(0),
-        hoist: std::cell::OnceCell::new(),
+        hoist: std::cell::RefCell::new(None),
+        body_used: std::cell::Cell::new(false),
         calls: std::cell::Cell::new(0),
         code: std::cell::OnceCell::new(),
         code2: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
+        lazy_error: std::cell::OnceCell::new(),
         name: None,
         params,
-        body,
+        body: std::cell::RefCell::new(Some(Rc::new(body))),
+        lazy: std::cell::RefCell::new(None),
         is_arrow: false,
         is_strict: true,
         expr_body: false,
@@ -6824,7 +6874,7 @@ fn default_constructor(derived: bool) -> Function {
         is_async: false,
         is_method: false,
         is_fn_expr: false,
-        source: None,
+        source: FnSource::None,
     }
 }
 
@@ -6935,7 +6985,7 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
         // `Contains` descends into arrow functions; an ordinary function/class does not.
         Expr::Func(f) if f.is_arrow => {
             f.params.iter().any(|p| p.default.as_ref().is_some_and(&e))
-                || stmts_contain(&f.body, pred)
+                || f.parsed_body().is_some_and(|b| stmts_contain(&b, pred))
         }
         _ => false,
     }
@@ -6983,7 +7033,7 @@ pub(crate) fn field_init_error(e: &Expr) -> Option<&'static str> {
 /// A `static { … }` block may not contain `arguments` or a `super(...)` call (the scan stops at
 /// nested ordinary functions and classes).
 pub(crate) fn static_block_error(func: &crate::ast::Function) -> Option<&'static str> {
-    fi_stmts(&func.body, true)
+    fi_stmts(&func.parsed_body()?, true)
 }
 
 /// A non-constructor method body may not contain a `super(...)` call (only a derived constructor
@@ -7002,7 +7052,7 @@ pub(crate) fn method_super_call_error_full(func: &crate::ast::Function) -> Optio
             }
         }
     }
-    fi_stmts(&func.body, false)
+    fi_stmts(&func.parsed_body()?, false)
 }
 
 /// `args` also flags `arguments` (a field-initializer rule); methods omit it since they may use it.
@@ -7052,7 +7102,7 @@ fn fi_expr(e: &Expr, args: bool) -> Option<&'static str> {
         }),
         // Arrow functions inherit the surrounding context: descend into params and body.
         Expr::Func(f) if f.is_arrow => {
-            fi_params(&f.params, args).or_else(|| fi_stmts(&f.body, args))
+            fi_params(&f.params, args).or_else(|| fi_stmts(&f.parsed_body()?, args))
         }
         // Ordinary functions / classes establish their own context.
         _ => None,
@@ -7464,7 +7514,11 @@ impl Interp {
                     let (initialized, value, import) = {
                         let b = s.borrow();
                         match b.vars.get(name.as_str()) {
-                            Some(bd) => (bd.initialized, bd.value.clone(), bd.import_ref.clone()),
+                            Some(bd) => (
+                                bd.initialized,
+                                bd.value.clone(),
+                                bd.import_ref.as_deref().cloned(),
+                            ),
                             None => return self.get_var(name, s),
                         }
                     };

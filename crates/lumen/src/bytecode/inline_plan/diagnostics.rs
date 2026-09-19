@@ -28,7 +28,7 @@ fn strings<'a>(values: impl Iterator<Item = &'a str>) -> String {
     format!("[{}]", values.map(quoted).collect::<Vec<_>>().join(","))
 }
 pub(super) fn source(function: &Function) -> String {
-    quoted(function.source.as_deref().unwrap_or(""))
+    quoted(function.source().as_deref().unwrap_or(""))
 }
 fn json(r: &Record<'_>, reason: &str) -> String {
     let uses_this = r.callee_chunk.uses_this();

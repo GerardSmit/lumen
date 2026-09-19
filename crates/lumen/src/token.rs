@@ -37,12 +37,16 @@ pub enum Tok {
     Keyword(&'static str),
     /// A punctuator. Interned to `&'static str` (e.g. `"=>"`, `"==="`, `"+="`).
     Punct(&'static str),
-    /// A regular-expression literal: `/body/flags`.
-    Regex {
-        body: String,
-        flags: String,
-    },
+    /// A regular-expression literal: `/body/flags`. Boxed to keep `Tok` at one `String` wide —
+    /// a token vector for a multi-megabyte bundle is sized by its largest variant.
+    Regex(Box<RegexTok>),
     Eof,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegexTok {
+    pub body: String,
+    pub flags: String,
 }
 
 /// One piece of a template literal: a literal chunk (with both the cooked value and the raw source,
