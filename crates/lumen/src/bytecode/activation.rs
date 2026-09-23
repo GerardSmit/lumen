@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn captured_access_survives_structural_change_during_a_native_callback() {
-        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);

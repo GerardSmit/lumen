@@ -151,7 +151,7 @@ fn instanceof_default_intrinsic_and_override() {
     // prototype value preserves A's shape and must still be observed; adding @@hasInstance
     // changes it and must deopt to the user hook.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function A(){} var o=new A();
              function hit(v, C){ return v instanceof C; }
              for(var i=0;i<1000;i++) hit(o,A);
@@ -169,7 +169,7 @@ fn instanceof_default_intrinsic_and_override() {
 #[test]
 fn jit_constructor_creation_cache_deopts_on_prototype_changes() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function C(v){ this.x=v; this.y={v:v}; }
              var last;
              for(var i=0;i<1000;i++) last=new C(i);
@@ -182,7 +182,7 @@ fn jit_constructor_creation_cache_deopts_on_prototype_changes() {
         "999:999:x,y:7:false:7"
     );
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function C(v){this.x=v;}
              for(var i=0;i<1000;i++) new C(i);
              var hits=0;
@@ -196,7 +196,7 @@ fn jit_constructor_creation_cache_deopts_on_prototype_changes() {
     // shape is common in prototype-style constructors; changing it to a setter must invalidate
     // the creation proof before the next store.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function C(v){this.x=v;}
              C.prototype.x=0;
              var last;
@@ -212,7 +212,7 @@ fn jit_constructor_creation_cache_deopts_on_prototype_changes() {
     // Activation-requiring forwarding constructors learn the initialized size dynamically. Their
     // reserved storage must not weaken the same live prototype/descriptor guards.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function C(){
                this.ctor=(arguments.callee===C);
                this.argc=arguments.length;
@@ -233,7 +233,7 @@ fn jit_constructor_creation_cache_deopts_on_prototype_changes() {
     );
     // The activation-aware construct entry must still honor an explicit object return.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function R(){arguments;return {argc:arguments.length};}
              var r;
              for(var i=0;i<1000;i++) r=new R(1,2,3);
@@ -245,7 +245,7 @@ fn jit_constructor_creation_cache_deopts_on_prototype_changes() {
     // polymorphic in prototype identity even when every fresh receiver has the same empty shape;
     // mutating one prototype must invalidate all ways before the next assignment.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function Base(v){this.x=v;}
              function A(v){Base.call(this,v)} function B(v){Base.call(this,v)}
              function C(v){Base.call(this,v)} function D(v){Base.call(this,v)}
@@ -1661,7 +1661,7 @@ fn packed_elements_do_not_duplicate_far_index_entries() {
 #[test]
 fn jit_linked_scan_preserves_loose_htmldda_null_semantics() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function loose(next){var peek;while((peek=next.link)!=null)next=peek;return [next,peek]}
              function strict(next){var peek;while((peek=next.link)!==null)next=peek;return [next,peek]}
              for(var i=0;i<600;i++){var tail={link:null},head={link:tail};loose(head);strict(head)}
@@ -1675,7 +1675,7 @@ fn jit_linked_scan_preserves_loose_htmldda_null_semantics() {
 #[test]
 fn jit_reads_packed_dense_values_without_losing_identity() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "var obj={x:7}, sym=Symbol('s');
              var a=[obj,'text',true,null,undefined,sym,13.5];
              function local(a,i){return a[i];}
@@ -1697,7 +1697,7 @@ fn jit_reads_packed_dense_values_without_losing_identity() {
 #[test]
 fn jit_writes_packed_dense_values_without_losing_ownership() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "var obj={x:7}, sym=Symbol('s'), a=[0,1,2,3,4,5,6,7];
              function drop(a,i,v){a[i]=v;}
              function keep(a,i,v){return a[i]=v;}
@@ -1726,7 +1726,7 @@ fn jit_writes_packed_dense_values_without_losing_ownership() {
 #[test]
 fn jit_compact_warmed_property_probes_deopt_cleanly() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function read(o) { return o.x; }
              var a = { x: 1 };
              var otherShape = { pad: 0, x: 2 };
@@ -1749,7 +1749,7 @@ fn jit_compact_warmed_property_probes_deopt_cleanly() {
 #[test]
 fn jit_numeric_property_chains_guard_live_values_and_shapes() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function below(o, n) { return o.x < n; }
              function same(n) { return this.x === n; }
              var a = { x: 3 }, holder = { x: 5 }, child = Object.create(holder);
@@ -2386,7 +2386,7 @@ fn compiled_parameterless_arguments_object() {
       function strictArgs() { "use strict"; try { return arguments.callee; } catch (e) { return e.constructor.name; } }
       collect("a", "b", "c") + "|" + (fresh() !== fresh()) + "|" + strictArgs();
     "#;
-    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+    for tier in [crate::bytecode::Tier::Bytecode] {
         let mut e = Engine::new();
         e.interp.tier = tier;
         e.interp.tier_threshold = 0;
@@ -2403,7 +2403,7 @@ fn jit_function_apply_forwards_dense_arguments() {
     // The ARM64 call intrinsic moves an unmapped, dense arguments list directly into a compiled
     // target. A deleted entry must leave that path and preserve the inherited indexed getter.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function sum(a,b,c){ return this.bias+a+b+c; }
              var recv={bias:10};
              function forward(){ return sum.apply(recv, arguments); }
@@ -2423,7 +2423,7 @@ fn jit_function_apply_forwards_dense_arguments() {
 #[test]
 fn jit_construct_arguments_apply_forwarder_preserves_live_guards() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function Wrapper(){this.initialize.apply(this,arguments);}
              function init(a,b){this.sum=a+b;this.argc=arguments.length;return {replace:true};}
              Wrapper.prototype.initialize=init;
@@ -2472,7 +2472,7 @@ fn jit_construct_arguments_apply_forwarder_preserves_live_guards() {
 
 #[test]
 fn compiled_typeof_unresolved_name() {
-    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+    for tier in [crate::bytecode::Tier::Bytecode] {
         let mut e = Engine::new();
         e.interp.tier = tier;
         e.interp.tier_threshold = 0;
@@ -2507,7 +2507,7 @@ fn compiled_update_free_name() {
       var bump = outer();
       bump() + "|" + bump();
     "#;
-    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+    for tier in [crate::bytecode::Tier::Bytecode] {
         let mut e = Engine::new();
         e.interp.tier = tier;
         e.interp.tier_threshold = 0;
@@ -2536,7 +2536,7 @@ fn compiled_regexp_literal_is_fresh() {
         })
         .expect("function declaration");
     assert!(crate::bytecode::compile(&func).is_some());
-    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+    for tier in [crate::bytecode::Tier::Bytecode] {
         let mut e = Engine::new();
         e.interp.tier = tier;
         e.interp.tier_threshold = 0;
@@ -2607,8 +2607,8 @@ fn bytecode_labelled_loops_match_interp() {
 
 #[test]
 fn fused_typeof_tests_agree_across_tiers() {
-    // `typeof v === "<kind>"` compiles to `Op::TypeofIs`; the JIT inlines it over locals and
-    // stack temporaries (including last-reference strings/objects that must be dropped).
+    // `typeof v === "<kind>"` compiles to `Op::TypeofIs`, over locals and stack temporaries
+    // (including last-reference strings/objects that must be dropped).
     let src = r#"
         function mk() { return [undefined, null, true, 0, NaN, 1n, "", "s" + 1, Symbol("q"), {}, [],
             function () {}, class {}, () => 1, new Proxy(function () {}, {}), new Proxy({}, {})]; }
@@ -2658,7 +2658,6 @@ fn fused_typeof_tests_agree_across_tiers() {
     let interp = on_tier(src, crate::bytecode::Tier::Interp);
     assert!(interp.ends_with("|true|true"), "{interp}");
     assert_eq!(interp, on_tier(src, crate::bytecode::Tier::Bytecode));
-    assert_eq!(interp, on_tier(src, crate::bytecode::Tier::Jit));
 }
 
 #[test]
@@ -5417,7 +5416,7 @@ fn math_constants_and_hypot() {
 #[test]
 fn jit_math_sqrt_intrinsic_preserves_fallbacks_and_identity_guards() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function root(x){return Math.sqrt(x);}
              var original=Math.sqrt, holder={sqrt:original};
              function viaHolder(x){return holder.sqrt(x);}
@@ -10374,14 +10373,13 @@ fn import_json_attr_distinct_from_plain_import() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Loop-spanning JIT chains (aarch64-macos): fully-chainable loops keep locals in registers
-// across the back edge. These pin the guard/bail/flush semantics on the machine-code tier;
-// elsewhere they still pass (the plain tiers run the same programs).
+// Programs written against the removed native tier's register chains, moved frames and inline
+// caches. They still pin observable semantics and now run on the bytecode VM.
 // ---------------------------------------------------------------------------------------------
 
-fn run_jit(src: &str) -> String {
+fn run_bytecode(src: &str) -> String {
     let mut e = Engine::new();
-    e.set_tier(crate::bytecode::Tier::Jit);
+    e.set_tier(crate::bytecode::Tier::Bytecode);
     e.set_tier_threshold(0);
     match e.eval(src, false).expect("parse") {
         Completion::Value(v) => v,
@@ -10396,7 +10394,7 @@ fn jit_moved_frames_preserve_activations_and_arguments() {
     // `this` must see the bound method receiver, and an `arguments` object must include surplus
     // arguments even though those source stack values are consumed by the moved entry.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function make(x) {
                return function step(y) { x = x + y; return x; };
              }
@@ -10428,7 +10426,7 @@ fn jit_moved_frames_preserve_activations_and_arguments() {
 fn loop_chain_int_kernel() {
     // bignum-style inner loop: elem reads/writes, masks, shifts, int mul/add chains.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function kern(src, dst, x, n) {
                var xl = x & 0x3fff, xh = x >> 14, i = 0, j = 0, c = 0;
                while (--n >= 0) {
@@ -10457,7 +10455,7 @@ fn loop_chain_name_probe_does_not_clobber_sixth_integer_home() {
     // locals also assigns x7, so captured/global names must be validated before local homes are
     // populated. This four-receiver stencil is the pressure shape that exposed the overwrite.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "var width = 6, rowSize = 8;
              function project(u, v, p, div, h, j) {
                var row = j * rowSize;
@@ -10493,7 +10491,7 @@ fn loop_chain_name_probe_does_not_clobber_sixth_integer_home() {
 fn loop_chain_zero_trip_and_bails() {
     // Zero-trip: virgin locals keep their pre-loop values (nothing sanitized or flushed).
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(n) {
                var s = 'keep';
                var arr = [1, 2, 3];
@@ -10507,7 +10505,7 @@ fn loop_chain_zero_trip_and_bails() {
     );
     // A hole bails mid-iteration; the plain templates finish with identical state.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(arr, n) {
                var s = 0, i = 0;
                while (--n >= 0) { s = s + (arr[i] & 0xff); i++; }
@@ -10526,7 +10524,7 @@ fn loop_chain_zero_trip_and_bails() {
 fn loop_chain_counter_edges() {
     // i32 overflow in a ++ counter bails to the plain loop and stays exact.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(i, n) {
                var s = 0;
                while (--n >= 0) { s = (s + i) % 97; i = i + 1; }
@@ -10539,7 +10537,7 @@ fn loop_chain_counter_edges() {
     );
     // Walking past 2^53 must stick like f64 (the plain tier's semantics), not keep counting.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(i, n) {
                var last = 0;
                while (--n >= 0) { i = i + 1; last = i; }
@@ -10556,7 +10554,7 @@ fn loop_chain_counter_edges() {
 fn loop_chain_float_loops_stay_float() {
     // A float kernel must not be sent through int entry guards (it would bail every entry).
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(arr, n) {
                var s = 0.0, i = 0;
                while (--n >= 0) { s = s + arr[i] * 1.5; i++; }
@@ -10574,7 +10572,7 @@ fn loop_chain_float_loops_stay_float() {
 fn loop_chain_elem_dedup_and_aliasing() {
     // src and dst are the same array: the element-read memo must not survive the write.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(a, b, n) {
                var i = 0, s = 0;
                while (--n >= 0) { s = s + (a[i] & 0xff); b[i] = (a[i] & 0xf) + 1; s = s + (a[i] & 0xff); i++; }
@@ -10593,7 +10591,7 @@ fn jit_bitnot_numeric_fast_path_and_coercion_bails() {
     // Exercise signed boundaries, modulo-2^32 behavior, fractional truncation and the values
     // that must bail out of the machine template to full ToNumber/ToInt32 semantics.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(x) { return ~x; }
              var hot = 0;
              for (var i = 0; i < 200; i++) hot = f(i);
@@ -10605,7 +10603,7 @@ fn jit_bitnot_numeric_fast_path_and_coercion_bails() {
         "-1:0:-2147483648:2147483647:0:-1:-4:2:-1:-1:-1:-8:-10"
     );
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(x) { return ~x; }
              for (var i = 0; i < 100; i++) f(i);
              String(f(1n))"
@@ -10613,7 +10611,7 @@ fn jit_bitnot_numeric_fast_path_and_coercion_bails() {
         "-2"
     );
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(x) { return ~x; }
              for (var i = 0; i < 100; i++) f(i);
              try { f(Symbol('x')); 'no throw' } catch (e) { e.name }"
@@ -10627,7 +10625,7 @@ fn jit_plain_object_templates_move_values_without_aliasing() {
     // Repeated literal sites must retain independent descriptors and owned refcounted values.
     // Numeric-looking keys also exercise the template's dense lookup sidecar copy.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function make(i) {
                var child = { value: i };
                return { alpha: 'v' + i, child: child, 0: i + 10, omega: [i] };
@@ -10651,7 +10649,7 @@ fn jit_direct_calls_support_wide_argument_lists() {
     // Keep refcounted operands, method receivers, nested wide calls and an unwind in the test:
     // these pin the move/drop ownership rules on both successful and throwing exits.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function sum12(a,b,c,d,e,f,g,h,i,j,k,l) {
                return a+b+c+d+e+f+g+h+i+j+k+l;
              }
@@ -10687,7 +10685,7 @@ fn jit_direct_calls_support_wide_argument_lists() {
 #[test]
 fn jit_slice_and_hasown_intrinsics_preserve_slow_paths() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function cut(s, a, b) { return s.slice(a, b); }
              var out = '';
              for (var i = 0; i < 400; i++) out = cut('abcdefghij', 2, 7);
@@ -10699,7 +10697,7 @@ fn jit_slice_and_hasown_intrinsics_preserve_slow_paths() {
         "cdefg:ghij:ab:bcd:de:1"
     );
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function own(o, k) { return Object.hasOwn(o, k); }
              var o = { alpha: 1, beta: 2 };
              var v;
@@ -10723,15 +10721,14 @@ fn jit_slice_and_hasown_intrinsics_preserve_slow_paths() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Speculative inlining: hot chunks recompile with monomorphic callees spliced inline behind an
-// identity guard (bytecode::plan_inlines). Drivers loop enough times to cross the recompile
-// trigger; every case must behave exactly like the generic call path.
+// Programs from the removed speculative-inlining pass: hot monomorphic call sites, reassigned
+// methods and per-invocation state. Every case must behave exactly like the generic call path.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
 fn inline_four_way_nested_dispatch_and_deopt() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function A() {} function B() {} function C() {} function D() {}
              A.prototype.bump = function (x) { return x + 1; };
              B.prototype.bump = function (x) { return x + 2; };
@@ -10759,7 +10756,7 @@ fn inline_four_way_nested_dispatch_and_deopt() {
 #[test]
 fn inline_deopt_on_method_reassignment() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function A() {}
              A.prototype.m = function (x) { return x + 1; };
              var a = new A();
@@ -10777,7 +10774,7 @@ fn inline_deopt_on_method_reassignment() {
 #[test]
 fn inline_vars_reset_per_invocation() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function acc(n) {
                var t;
                if (n > 0) t = n;
@@ -10795,7 +10792,7 @@ fn inline_vars_reset_per_invocation() {
 #[test]
 fn inline_argc_adjustment_and_returns() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f(a, b, c) { return '' + a + b + c; }
              var o = { f: f };
              function d2(o) { return o.f(1, 2); }
@@ -10806,7 +10803,7 @@ fn inline_argc_adjustment_and_returns() {
         "12undefined|123"
     );
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function find(arr, x) {
                for (var i = 0; i < arr.length; i++) {
                  if (arr[i] === x) return i;
@@ -10827,7 +10824,7 @@ fn inline_argc_adjustment_and_returns() {
 #[test]
 fn inline_sloppy_this_primitive_receiver_deopts() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function who() { return typeof this; }
              Number.prototype.who = who;
              function driver(o) { return o.who(); }
@@ -10842,7 +10839,7 @@ fn inline_sloppy_this_primitive_receiver_deopts() {
 #[test]
 fn inline_throw_from_spliced_body() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function pick(arr, i) { return arr[i].x; }
              var o = { pick: pick };
              var arr = [{ x: 1 }, { x: 2 }];
@@ -10863,7 +10860,7 @@ fn inline_recompile_preserves_monomorphic_and_polymorphic_property_sites() {
     // should remain monomorphic after splicing, while the shared virtual-call site must retain
     // every observed receiver shape instead of baking only its most recent way.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function A(x) { this.x = x; }
              function B(x) { this.x = x; this.pad = 1; }
              function C(x) { this.x = x; this.pad = 1; this.more = 2; }
@@ -10891,7 +10888,7 @@ fn inline_recompile_preserves_four_way_call_sites_across_epoch_refill() {
     // tail, then an unrelated inline compile bumps CALL_IC_EPOCH.  The copied entry must
     // miss/refill at the new epoch and execute the replacement exactly once per invocation.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function f0(x) { return x + 1; }
              function f1(x) { return x + 2; }
              function f2(x) { return x + 3; }
@@ -10944,7 +10941,7 @@ fn inline_seeded_call_cache_pins_dead_callee_addresses() {
     // drop every target and allocate many fresh closures: no recycled address may turn a new
     // function into a stale identity hit (the classic raw-pointer ABA failure).
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "var OLD_HITS = [0, 0, 0, 0];
              var oldFns = [
                Function('x', 'OLD_HITS[0]++; try { return x + 1; } catch (e) { return -1; }'),
@@ -10993,7 +10990,7 @@ fn jit_peek_truthiness_covers_all_value_kinds() {
     // common tags without taking ownership; BigInt and HTMLDDA deliberately exercise the helper
     // fallback while nullish coalescing must still treat HTMLDDA as a non-nullish object.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function flags(v) {
                return (v ? 100 : 0) + ((v && true) ? 10 : 0) +
                       (((v ?? null) === null) ? 0 : 1);
@@ -11014,7 +11011,7 @@ fn jit_local_equality_branch_preserves_coercion_and_htmldda() {
     // The local/local branch fusion handles borrowed object identity and nullish values. Mixed
     // coercing pairs, TDZ, and the HTMLDDA nullish exception must retain the checked helpers.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function ne(a,b){if(a!=b)return 1;return 0;}
              function eq(a,b){if(a==b)return 1;return 0;}
              function sne(a,b){if(a!==b)return 1;return 0;}
@@ -11042,7 +11039,7 @@ fn jit_inlined_equality_return_threads_into_caller_condition() {
     // branch on equality directly, including the coercing slow path, without materializing a
     // temporary Bool or disturbing other predecessors of the join.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function isOne() { return this.x == 1; }
              function choose(o) { if (o.isOne()) return 7; return 3; }
              var a = { x: 1, isOne: isOne };
@@ -11062,7 +11059,7 @@ fn jit_seeded_numeric_name_cache_reads_live_mutations() {
     // generated path must compare the live packed property every time: assigning a new value
     // after recompilation falls back to the generic decoder instead of baking a constant.
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "var HOT_NUMBER = 11;
              function readHot() { return HOT_NUMBER; }
              function outer() { return readHot() + 1; }
@@ -11078,7 +11075,7 @@ fn jit_seeded_numeric_name_cache_reads_live_mutations() {
 #[test]
 fn jit_cached_name_updates_and_stores_preserve_live_guards() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function localCase() {
                let x=0, held={id:1}, coercions=0;
                function post(){return x++;}
@@ -11118,7 +11115,7 @@ fn jit_cached_name_updates_and_stores_preserve_live_guards() {
 #[test]
 fn jit_array_push_pop_intrinsics_preserve_live_guards_and_ownership() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function pushOne(a,v){return a.push(v);}
              function popOne(a){return a.pop();}
              var warm=[];
@@ -11165,7 +11162,7 @@ fn jit_array_push_pop_intrinsics_preserve_live_guards_and_ownership() {
 #[test]
 fn jit_function_call_intrinsic_preserves_target_and_receiver_guards() {
     assert_eq!(
-        run_jit(
+        run_bytecode(
             "function target(x){this.sum+=x;return this;}
              function via(f,t,x){return f.call(t,x);}
              function target2(x,y){this.sum+=x*y;return this;}

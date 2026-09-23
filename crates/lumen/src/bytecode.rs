@@ -12,8 +12,8 @@
 //! which is what makes slot storage sound. TDZ is represented by `Value::Empty` in the slot —
 //! reads check it and throw the same ReferenceError the tree-walker would.
 //!
-//! Tier selection (see `Interp::tier`): `jit` (default), `bytecode`, or `interp` (this module is
-//! never entered — the tree-walker runs). Compiled tiers kick in at `tier_threshold` calls (0 =
+//! Tier selection (see `Interp::tier`): `bytecode` (default) or `interp` (this module is never
+//! entered — the tree-walker runs). Compilation kicks in at `tier_threshold` calls (0 =
 //! immediately). Selectable via the `LUMEN_TIER` / `LUMEN_TIER_THRESHOLD` env vars, the CLI's
 //! `--tier`, or `Engine::set_tier`.
 
@@ -37,13 +37,14 @@ use crate::ast::*;
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
 
-/// Execution tier. `Interp` must not touch any codegen path at all; `Jit` compiles eligible
-/// chunks to ARM64 machine code (macOS/Apple Silicon), falling back to the bytecode VM.
+/// Execution tier. `Interp` must not touch any codegen path at all; `Bytecode` (the default)
+/// compiles eligible functions to this module's stack VM. The string `"jit"` (CLI `--tier`,
+/// `LUMEN_TIER`) is still accepted as an alias for `Bytecode`: native tier being rewritten; see
+/// docs/jit.md.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
     Interp,
     Bytecode,
-    Jit,
 }
 
 /// Per-site property inline-cache state. `depth == IC_EMPTY` means the site has not cached yet.

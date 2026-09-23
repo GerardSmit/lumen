@@ -26,7 +26,7 @@ fn check_with(tier: Tier, source: &str) {
 }
 
 fn check(source: &str) {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+    for tier in [Tier::Interp, Tier::Bytecode] {
         check_with(tier, source);
     }
 }
@@ -35,7 +35,7 @@ fn check(source: &str) {
 /// runs.
 fn load_error(source: &str) -> String {
     let mut last = None;
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+    for tier in [Tier::Interp, Tier::Bytecode] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         match engine.eval(&format!("throw new Error('ran');\n{source}"), false) {

@@ -2,8 +2,8 @@
 #
 # Time the ejs benchmark (see README.md) on lumen and, when installed, node/bun/qjs.
 #
-#   ./bench.sh          # lumen jit tier + node/bun/qjs if present
-#   ./bench.sh --all    # also the lumen default (interp) tier — slow
+#   ./bench.sh          # lumen bytecode tier + node/bun/qjs if present
+#   ./bench.sh --all    # also the lumen interp tier — slow
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -30,7 +30,7 @@ run() {
 run "node" node
 run "bun" bun
 run "qjs" qjs
-run "lumen (jit)" "$ROOT/target/release/lumen" --tier=jit
+run "lumen (bytecode)" "$ROOT/target/release/lumen" --tier=bytecode
 if [ "${1:-}" = "--all" ]; then
-  run "lumen (interp)" "$ROOT/target/release/lumen"
+  run "lumen (interp)" "$ROOT/target/release/lumen" --tier=interp
 fi
