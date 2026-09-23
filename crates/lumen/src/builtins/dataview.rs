@@ -138,12 +138,14 @@ fn dv_set(i: &mut Interp, this: &Value, args: &[Value], kind: TaKind) -> Result<
     if byte_off.checked_add(es).is_none_or(|e| e > vlen) {
         return Err(i.make_error("RangeError", "Offset is outside the bounds of the DataView"));
     }
-    let mut bytes = kind.write(value);
+    let mut bytes = [0; 8];
+    let len = kind.write_into(value, &mut bytes);
+    let bytes = &mut bytes[..len];
     if !little {
         bytes.reverse();
     }
     let start = off + byte_off;
-    dv_put(i, buf, start, &bytes);
+    dv_put(i, buf, start, bytes);
     Ok(Value::Undefined)
 }
 
