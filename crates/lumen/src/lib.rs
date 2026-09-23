@@ -49,6 +49,7 @@ mod modules;
 #[cfg(feature = "intl")]
 mod numbering;
 mod parser;
+pub mod precompiled;
 mod regex;
 mod regex_emoji;
 mod regex_fold;
@@ -133,6 +134,11 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 }
 
 pub use parser::with_eager_bodies;
+
+/// Ahead-of-time compilation (see [`Engine::load_precompiled`] and the `lumen-aot` crate):
+/// [`precompile`] / [`precompiled::PrecompileBundle`] run at build time and produce a
+/// source-free blob; [`Precompiled`] wraps one linked into the binary.
+pub use precompiled::{precompile, Precompiled, SourceKind};
 
 /// A parse-phase failure. test262 reports these as a `SyntaxError` thrown during parsing.
 #[derive(Debug)]
@@ -249,6 +255,66 @@ impl Engine {
             Ok(v) => Ok(Completion::Value(self.render(&v))),
             Err(thrown) => Ok(self.describe_throw(thrown)),
         }
+    }
+
+    /// Load and run an ahead-of-time compiled blob (see [`Precompiled`]): every script unit
+    /// runs in order (like [`eval`](Engine::eval)), then the entry module, if the blob has
+    /// one, is loaded and evaluated (like [`eval_module`](Engine::eval_module)). Every module
+    /// unit is registered with the realm first, so imports between them resolve inside the
+    /// blob; other specifiers go to the loader installed with
+    /// [`set_module_loader`](Engine::set_module_loader) (install it before this call). A blob
+    /// that fails validation (built by another lumen version, corrupt) is `Err(ParseError)`.
+    pub fn load_precompiled(&mut self, blob: &Precompiled) -> Result<Completion, ParseError> {
+        let bad = |message: String| ParseError {
+            message,
+            line: 0,
+            at_eof: false,
+        };
+        let parsed = precompiled::parse(blob.as_bytes()).map_err(bad)?;
+        precompiled::register_modules(&mut self.interp, &parsed);
+        let mut last = Completion::Value(String::new());
+        for unit in parsed.units.iter().filter(|u| u.kind == SourceKind::Script) {
+            let body = precompiled::decode_unit(unit.ast)
+                .map_err(|e| bad(format!("{}: {e}", unit.key)))?;
+            let directive_strict = matches!(
+                body.first(),
+                Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
+            );
+            self.interp.strict = directive_strict;
+            let result = self.interp.run_program(&body);
+            self.interp.run_agent_event_loop();
+            last = match result {
+                Ok(v) => Completion::Value(self.render(&v)),
+                Err(thrown) => return Ok(self.describe_throw(thrown)),
+            };
+        }
+        if let Some(entry) = parsed.entry {
+            let key = parsed.units[entry].key.clone();
+            let result = self.interp.load_module(&key, "");
+            self.interp.run_agent_event_loop();
+            last = match result {
+                Ok(_) => Completion::Value(String::new()),
+                Err(a) => self.describe_throw(interpreter::abrupt_value(a)),
+            };
+        }
+        Ok(last)
+    }
+
+    /// Register a precompiled blob's modules with the realm without running anything, so a
+    /// later `import` (static from another module, or dynamic) of an `aot:/…` key — or of a
+    /// relative specifier from such a module — resolves inside the blob. Returns the entry
+    /// module's key, if the blob has one.
+    pub fn register_precompiled(
+        &mut self,
+        blob: &Precompiled,
+    ) -> Result<Option<String>, ParseError> {
+        let parsed = precompiled::parse(blob.as_bytes()).map_err(|message| ParseError {
+            message,
+            line: 0,
+            at_eof: false,
+        })?;
+        precompiled::register_modules(&mut self.interp, &parsed);
+        Ok(parsed.entry.map(|e| parsed.units[e].key.clone()))
     }
 
     /// Install a host module loader used by dynamic `import()` (and `eval_module`). `loader(specifier,

@@ -228,8 +228,12 @@ impl Interp {
             Some(s) => s,
             None => return Err(self.throw("TypeError", format!("module not found: {key}"))),
         };
-        let body =
-            crate::parser::parse_module(&src).map_err(|e| self.throw("SyntaxError", e.message))?;
+        // A module from a loaded precompiled bundle decodes its AST instead of parsing.
+        let body = match crate::precompiled::module_body(self, key) {
+            Some(decoded) => decoded.map_err(|e| self.throw("SyntaxError", e))?,
+            None => crate::parser::parse_module(&src)
+                .map_err(|e| self.throw("SyntaxError", e.message))?,
+        };
         let body = Rc::new(body);
 
         // Resolve every dependency specifier to a canonical key up front (fetching its source), so
@@ -410,6 +414,11 @@ impl Interp {
         referrer: &str,
         attr_type: Option<&str>,
     ) -> Result<(String, String), Abrupt> {
+        // A specifier naming a module of a loaded precompiled bundle resolves inside the bundle
+        // (its AST is decoded in `parse_and_register`); no host loader is consulted.
+        if let Some(key) = crate::precompiled::resolve(self, specifier, referrer, attr_type) {
+            return Ok((key, String::new()));
+        }
         let loader = match &self.module_loader {
             Some(l) => l.clone(),
             None => return Err(self.throw("TypeError", "no module loader configured")),

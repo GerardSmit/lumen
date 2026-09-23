@@ -31,7 +31,7 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 2;
 
 /// FNV-1a over the source, eight bytes at a time: the header's check that the source handed to
 /// [`decode`] is the one the ranges were recorded against.
@@ -54,6 +54,9 @@ struct Writer {
     /// Private-name scopes already written, by identity: a later reference is an index into the
     /// order they were first defined in, which the reader rebuilds.
     scopes: HashMap<*const PrivateScope, u32>,
+    /// Ahead-of-time mode (see [`encode_stripped`]): no source text or source ranges are
+    /// written — every `FnSource` becomes `None` and every function carries its statements.
+    strip: bool,
 }
 
 impl Writer {
@@ -186,11 +189,31 @@ pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
     let mut w = Writer {
         buf: Vec::with_capacity(body.len() * 32),
         scopes: HashMap::new(),
+        strip: false,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
     w.uv(src.len() as u64);
     w.u64(source_hash(src));
+    enc_stmts(&mut w, body);
+    w.buf
+}
+
+/// Encode `body` with no trace of its source text — the ahead-of-time (`lumen::precompile`)
+/// form. Every function's `toString` text is dropped (it renders as a NativeFunction
+/// placeholder) and every function body is written as statements, never as a lazy byte range,
+/// so the blob decodes against the empty source (`decode(bytes, "")`). `body` should come from
+/// an eager parse; a lazy body left in it is materialised here.
+pub fn encode_stripped(body: &[Stmt]) -> Vec<u8> {
+    let mut w = Writer {
+        buf: Vec::with_capacity(body.len() * 32),
+        scopes: HashMap::new(),
+        strip: true,
+    };
+    w.uv(MAGIC as u64);
+    w.uv(VERSION as u64);
+    w.uv(0);
+    w.u64(source_hash(""));
     enc_stmts(&mut w, body);
     w.buf
 }
@@ -1160,6 +1183,9 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
 }
 
 fn enc_fnsource(w: &mut Writer, s: &FnSource) {
+    if w.strip {
+        return w.u8(0);
+    }
     match s {
         FnSource::None => w.u8(0),
         FnSource::Text(t) => {
@@ -1311,6 +1337,10 @@ fn enc_function(w: &mut Writer, f: &Function) {
         | (f.is_fn_expr as u8) << 6;
     w.u8(flags);
     enc_fnsource(w, &f.source);
+    if w.strip {
+        w.u8(0);
+        return enc_stmts(w, &f.body());
+    }
     let lazy = f.lazy.borrow();
     match lazy.as_ref() {
         Some(l) => {
