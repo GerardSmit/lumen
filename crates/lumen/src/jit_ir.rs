@@ -556,6 +556,9 @@ impl RegionIr {
                             op,
                             Op::Jump(_)
                                 | Op::JumpIfFalse(_)
+                                | Op::JumpIfNotCmp(..)
+                                | Op::JumpIfNotCmpLL(..)
+                                | Op::JumpIfNotCmpLK(..)
                                 | Op::Return
                                 | Op::ReturnUndef
                                 | Op::Throw
@@ -970,6 +973,9 @@ pub(crate) fn jump_target(op: &Op) -> Option<usize> {
     match op {
         Op::Jump(t)
         | Op::JumpIfFalse(t)
+        | Op::JumpIfNotCmp(_, t)
+        | Op::JumpIfNotCmpLL(.., t)
+        | Op::JumpIfNotCmpLK(.., t)
         | Op::JumpIfFalsePeek(t)
         | Op::JumpIfTruePeek(t)
         | Op::JumpIfNotNullishPeek(t)
@@ -983,6 +989,9 @@ fn ends_block(op: &Op) -> bool {
         op,
         Op::Jump(_)
             | Op::JumpIfFalse(_)
+            | Op::JumpIfNotCmp(..)
+            | Op::JumpIfNotCmpLL(..)
+            | Op::JumpIfNotCmpLK(..)
             | Op::JumpIfFalsePeek(_)
             | Op::JumpIfTruePeek(_)
             | Op::JumpIfNotNullishPeek(_)
@@ -998,6 +1007,9 @@ fn normal_successor_pcs(op: &Op, pc: usize, len: usize, out: &mut Vec<usize>) {
     match op {
         Op::Jump(t) => out.push(*t as usize),
         Op::JumpIfFalse(t)
+        | Op::JumpIfNotCmp(_, t)
+        | Op::JumpIfNotCmpLL(.., t)
+        | Op::JumpIfNotCmpLK(.., t)
         | Op::JumpIfFalsePeek(t)
         | Op::JumpIfTruePeek(t)
         | Op::JumpIfNotNullishPeek(t) => {
@@ -1056,6 +1068,9 @@ fn analyze_stack(
                 work.push((target, next));
             }
             Op::JumpIfFalse(t)
+            | Op::JumpIfNotCmp(_, t)
+            | Op::JumpIfNotCmpLL(.., t)
+            | Op::JumpIfNotCmpLK(.., t)
             | Op::JumpIfFalsePeek(t)
             | Op::JumpIfTruePeek(t)
             | Op::JumpIfNotNullishPeek(t) => {

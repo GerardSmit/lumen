@@ -94,7 +94,10 @@ fn effect(op: &Op) -> (u128, u128) {
         | ToPropKeyLocal(s)
         | IterCloseL(s)
         | IterAbortL(s) => (bit(s), 0),
-        IterStepL(a, b) => (bit(a) | bit(b), 0),
+        IterStepL(a, b) | JumpIfNotCmpLL(_, a, b, _) => (bit(a) | bit(b), 0),
+        JumpIfNotCmpLK(_, s, ..) => (bit(s), 0),
+        ArithLL(_, d, a, b) => (bit(a) | bit(b), bit(d)),
+        ArithLK(_, d, a, _) => (bit(a), bit(d)),
         UpdateLocal(s, _) => (bit(s), bit(s)),
         StoreLocal(s) | Tdz(s) => (0, bit(s)),
         Const(_)
@@ -133,6 +136,7 @@ fn effect(op: &Op) -> (u128, u128) {
         | GetMethodElem
         | Jump(_)
         | JumpIfFalse(_)
+        | JumpIfNotCmp(..)
         | JumpIfFalsePeek(_)
         | JumpIfTruePeek(_)
         | JumpIfNotNullishPeek(_)
