@@ -208,6 +208,7 @@ fn jit_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let target = cfg!(target_arch = "x86_64")
+            || cfg!(all(target_arch = "aarch64", not(target_os = "ios")))
             || (cfg!(target_arch = "wasm32") && crate::WASM_JIT_HOST.get().is_some());
         // wasm32 has no process environment worth reading (`var_os` is always `None` there).
         target && std::env::var_os("LUMEN_NO_JIT").is_none()
