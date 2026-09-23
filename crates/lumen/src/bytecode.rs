@@ -231,6 +231,123 @@ impl TypeofKind {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArithKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    UShr,
+}
+
+impl ArithKind {
+    fn of(op: &Op) -> Option<ArithKind> {
+        Some(match op {
+            Op::Add => ArithKind::Add,
+            Op::Sub => ArithKind::Sub,
+            Op::Mul => ArithKind::Mul,
+            Op::Div => ArithKind::Div,
+            Op::Mod => ArithKind::Mod,
+            Op::BitAnd => ArithKind::BitAnd,
+            Op::BitOr => ArithKind::BitOr,
+            Op::BitXor => ArithKind::BitXor,
+            Op::Shl => ArithKind::Shl,
+            Op::Shr => ArithKind::Shr,
+            Op::UShr => ArithKind::UShr,
+            _ => return None,
+        })
+    }
+    fn name(self) -> &'static str {
+        match self {
+            ArithKind::Add => "+",
+            ArithKind::Sub => "-",
+            ArithKind::Mul => "*",
+            ArithKind::Div => "/",
+            ArithKind::Mod => "%",
+            ArithKind::BitAnd => "&",
+            ArithKind::BitOr => "|",
+            ArithKind::BitXor => "^",
+            ArithKind::Shl => "<<",
+            ArithKind::Shr => ">>",
+            ArithKind::UShr => ">>>",
+        }
+    }
+    #[inline(always)]
+    fn num(self, a: f64, b: f64) -> f64 {
+        use crate::eval::to_int32 as i32_;
+        match self {
+            ArithKind::Add => a + b,
+            ArithKind::Sub => a - b,
+            ArithKind::Mul => a * b,
+            ArithKind::Div => a / b,
+            ArithKind::Mod => crate::eval::js_mod(a, b),
+            ArithKind::BitAnd => (i32_(a) & i32_(b)) as f64,
+            ArithKind::BitOr => (i32_(a) | i32_(b)) as f64,
+            ArithKind::BitXor => (i32_(a) ^ i32_(b)) as f64,
+            ArithKind::Shl => i32_(a).wrapping_shl(i32_(b) as u32 & 31) as f64,
+            ArithKind::Shr => (i32_(a) >> (i32_(b) as u32 & 31)) as f64,
+            ArithKind::UShr => ((i32_(a) as u32) >> (i32_(b) as u32 & 31)) as f64,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CmpKind {
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    EqEq,
+    NotEq,
+    StrictEq,
+    StrictNotEq,
+}
+
+impl CmpKind {
+    fn of(op: &str) -> Option<CmpKind> {
+        Some(match op {
+            "<" => CmpKind::Lt,
+            ">" => CmpKind::Gt,
+            "<=" => CmpKind::Le,
+            ">=" => CmpKind::Ge,
+            "==" => CmpKind::EqEq,
+            "!=" => CmpKind::NotEq,
+            "===" => CmpKind::StrictEq,
+            "!==" => CmpKind::StrictNotEq,
+            _ => return None,
+        })
+    }
+    fn name(self) -> &'static str {
+        match self {
+            CmpKind::Lt => "<",
+            CmpKind::Gt => ">",
+            CmpKind::Le => "<=",
+            CmpKind::Ge => ">=",
+            CmpKind::EqEq => "==",
+            CmpKind::NotEq => "!=",
+            CmpKind::StrictEq => "===",
+            CmpKind::StrictNotEq => "!==",
+        }
+    }
+    #[inline(always)]
+    fn num(self, a: f64, b: f64) -> bool {
+        match self {
+            CmpKind::Lt => a < b,
+            CmpKind::Gt => a > b,
+            CmpKind::Le => a <= b,
+            CmpKind::Ge => a >= b,
+            CmpKind::EqEq | CmpKind::StrictEq => a == b,
+            CmpKind::NotEq | CmpKind::StrictNotEq => a != b,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
     Const(u32),
@@ -415,6 +532,17 @@ pub enum Op {
     Void,
     Jump(u32),
     JumpIfFalse(u32),
+    /// `a <cmp> b` then `JumpIfFalse`, fused: no boolean pushed and popped (a store-forwarding
+    /// stall on the 16-byte stack slots) and one dispatch fewer — the shape of every loop test.
+    JumpIfNotCmp(CmpKind, u32),
+    /// [`Op::JumpIfNotCmp`] on two locals, read in place (TDZ-checked like `LoadLocal`).
+    JumpIfNotCmpLL(CmpKind, u16, u16, u32),
+    /// [`Op::JumpIfNotCmp`] on a local and a constant: `k < n` loop tests touch no stack.
+    JumpIfNotCmpLK(CmpKind, u16, u32, u32),
+    /// `LoadLocal(a) LoadLocal(b) <arith> StoreLocal(dst)`, fused by [`peephole`]: `(dst, a, b)`.
+    ArithLL(ArithKind, u16, u16, u16),
+    /// `LoadLocal(a) Const(k) <arith> StoreLocal(dst)`, fused by [`peephole`]: `(dst, a, k)`.
+    ArithLK(ArithKind, u16, u16, u32),
     /// Peek variants leave the operand on the stack (for `&&` / `||` / `??`).
     JumpIfFalsePeek(u32),
     JumpIfTruePeek(u32),
@@ -1602,6 +1730,14 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
         }
     }
     c.emit(Op::ReturnUndef);
+    peephole(&mut c.ops);
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DUMP.get_or_init(|| std::env::var_os("LUMEN_BC_DUMP").is_some()) {
+        eprintln!("[bc] {:?}", func.name);
+        for (pc, op) in c.ops.iter().enumerate() {
+            eprintln!("  {pc:4} {op:?}");
+        }
+    }
     let cap_cache_len = c.names.len();
     let activation_layout = activation::ActivationLayout::new(&c.cap_inits, c.env_this, &c.names);
     Some(Rc::new(Chunk {
@@ -2166,11 +2302,49 @@ impl Compiler {
         self.names.push(intern_name(name));
         (self.names.len() - 1) as u32
     }
+    /// Compile `test` and a jump taken when it is falsy; returns the jump to patch. A comparison
+    /// fuses into the jump ([`Op::JumpIfNotCmp`]): nothing inside `test` can jump between the
+    /// compare and the branch, since a comparison's own operands end at the compare.
+    fn jump_if_false(&mut self, test: &Expr) -> Result<usize, Bail> {
+        if let Expr::Binary { op, left, right } = test {
+            if let Some(kind) = CmpKind::of(op) {
+                if typeof_test(op, left, right).is_none() {
+                    let at = self.ops.len();
+                    self.expr(left)?;
+                    self.expr(right)?;
+                    // Both operands single loads: nothing can target the second, so the three ops
+                    // collapse into one at the first's index (where a loop head may point).
+                    if self.ops.len() == at + 2 {
+                        let fused = match (self.ops[at], self.ops[at + 1]) {
+                            (Op::LoadLocal(a), Op::LoadLocal(b)) => {
+                                Some(Op::JumpIfNotCmpLL(kind, a, b, 0))
+                            }
+                            (Op::LoadLocal(a), Op::Const(k)) => {
+                                Some(Op::JumpIfNotCmpLK(kind, a, k, 0))
+                            }
+                            _ => None,
+                        };
+                        if let Some(op) = fused {
+                            self.ops.truncate(at);
+                            return Ok(self.emit(op));
+                        }
+                    }
+                    return Ok(self.emit(Op::JumpIfNotCmp(kind, 0)));
+                }
+            }
+        }
+        self.expr(test)?;
+        Ok(self.emit(Op::JumpIfFalse(0)))
+    }
+
     fn patch(&mut self, at: usize) {
         let target = self.ops.len() as u32;
         match &mut self.ops[at] {
             Op::Jump(t)
             | Op::JumpIfFalse(t)
+            | Op::JumpIfNotCmp(_, t)
+            | Op::JumpIfNotCmpLL(.., t)
+            | Op::JumpIfNotCmpLK(.., t)
             | Op::JumpIfFalsePeek(t)
             | Op::JumpIfTruePeek(t)
             | Op::JumpIfNotNullishPeek(t) => *t = target,
@@ -2350,8 +2524,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::If { test, cons, alt } => {
-                self.expr(test)?;
-                let jf = self.emit(Op::JumpIfFalse(0));
+                let jf = self.jump_if_false(test)?;
                 self.stmt(cons)?;
                 match alt {
                     Some(a) => {
@@ -2373,8 +2546,7 @@ impl Compiler {
             Stmt::While { test, body } => {
                 let labels = std::mem::take(&mut self.pending_labels);
                 let start = self.ops.len();
-                self.expr(test)?;
-                let jf = self.emit(Op::JumpIfFalse(0));
+                let jf = self.jump_if_false(test)?;
                 self.loops.push(LoopCtx {
                     labels,
                     ..LoopCtx::default()
@@ -2412,8 +2584,7 @@ impl Compiler {
                         _ => unreachable!(),
                     }
                 }
-                self.expr(test)?;
-                let jf = self.emit(Op::JumpIfFalse(0));
+                let jf = self.jump_if_false(test)?;
                 self.emit(Op::Jump(start as u32));
                 self.patch(jf);
                 for b in ctx.breaks {
@@ -2832,10 +3003,7 @@ impl Compiler {
         }
         let start = self.ops.len();
         let jf = match test {
-            Some(t) => {
-                self.expr(t)?;
-                Some(self.emit(Op::JumpIfFalse(0)))
-            }
+            Some(t) => Some(self.jump_if_false(t)?),
             None => None,
         };
         self.loops.push(LoopCtx {
@@ -3264,8 +3432,7 @@ impl Compiler {
                 Ok(())
             }
             Expr::Cond { test, cons, alt } => {
-                self.expr(test)?;
-                let jf = self.emit(Op::JumpIfFalse(0));
+                let jf = self.jump_if_false(test)?;
                 self.expr(cons)?;
                 let jend = self.emit(Op::Jump(0));
                 self.patch(jf);
@@ -4371,6 +4538,64 @@ fn run_vm(
                     *pc = t as usize;
                 }
             }
+            Op::JumpIfNotCmp(kind, t) => {
+                let b = pop!();
+                let a = pop!();
+                let yes = match (&a, &b) {
+                    (Value::Num(x), Value::Num(y)) => kind.num(*x, *y),
+                    _ => {
+                        let v = i.binary(kind.name(), a, b)?;
+                        i.to_boolean(&v)
+                    }
+                };
+                if !yes {
+                    *pc = t as usize;
+                }
+            }
+            Op::ArithLL(kind, d, a, b) => {
+                let v = match (&slots[a as usize], &slots[b as usize]) {
+                    (Value::Num(x), Value::Num(y)) => Value::Num(kind.num(*x, *y)),
+                    (x, y) => {
+                        let (x, y) = (x.clone(), y.clone());
+                        arith_slow(i, chunk, kind, x, y, a, Some(b))?
+                    }
+                };
+                slots[d as usize] = v;
+            }
+            Op::ArithLK(kind, d, a, k) => {
+                let v = match (&slots[a as usize], &chunk.consts[k as usize]) {
+                    (Value::Num(x), Value::Num(y)) => Value::Num(kind.num(*x, *y)),
+                    (x, y) => {
+                        let (x, y) = (x.clone(), y.clone());
+                        arith_slow(i, chunk, kind, x, y, a, None)?
+                    }
+                };
+                slots[d as usize] = v;
+            }
+            Op::JumpIfNotCmpLL(kind, a, b, t) => {
+                let yes = match (&slots[a as usize], &slots[b as usize]) {
+                    (Value::Num(x), Value::Num(y)) => kind.num(*x, *y),
+                    (x, y) => {
+                        let (x, y) = (x.clone(), y.clone());
+                        cmp_slow(i, chunk, kind, x, y, a, Some(b))?
+                    }
+                };
+                if !yes {
+                    *pc = t as usize;
+                }
+            }
+            Op::JumpIfNotCmpLK(kind, a, k, t) => {
+                let yes = match (&slots[a as usize], &chunk.consts[k as usize]) {
+                    (Value::Num(x), Value::Num(y)) => kind.num(*x, *y),
+                    (x, y) => {
+                        let (x, y) = (x.clone(), y.clone());
+                        cmp_slow(i, chunk, kind, x, y, a, None)?
+                    }
+                };
+                if !yes {
+                    *pc = t as usize;
+                }
+            }
             Op::JumpIfFalsePeek(t) => {
                 if !i.to_boolean(stack.last().expect("vm stack underflow")) {
                     *pc = t as usize;
@@ -5169,6 +5394,9 @@ impl Chunk {
             Op::TypeofName(_) => (0, 1),
             Op::Jump(_) => (0, 0),
             Op::JumpIfFalse(_) => (1, 0),
+            Op::JumpIfNotCmp(..) => (2, 0),
+            Op::JumpIfNotCmpLL(..) | Op::JumpIfNotCmpLK(..) => (0, 0),
+            Op::ArithLL(..) | Op::ArithLK(..) => (0, 0),
             Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
             Op::Call(argc) => (*argc as usize + 1, 1),
             Op::LoadNameForCall(..) => (0, 2),
@@ -5183,6 +5411,117 @@ impl Chunk {
             Op::PushHandler(_) | Op::PopHandler => (0, 0),
         })
     }
+}
+
+/// A local read by a fused op still in its TDZ: the `LoadLocal` ReferenceError.
+fn tdz_check(
+    i: &mut Interp,
+    chunk: &Chunk,
+    reads: [(&Value, Option<u16>); 2],
+) -> Result<(), Abrupt> {
+    for (v, s) in reads {
+        if let (Value::Empty, Some(s)) = (v, s) {
+            return Err(i.throw(
+                "ReferenceError",
+                format!(
+                    "cannot access '{}' before initialization",
+                    chunk.slot_names[s as usize]
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The generic path of a fused local arithmetic op: TDZ checks, then `binary`.
+#[cold]
+#[inline(never)]
+fn arith_slow(
+    i: &mut Interp,
+    chunk: &Chunk,
+    kind: ArithKind,
+    x: Value,
+    y: Value,
+    a: u16,
+    b: Option<u16>,
+) -> Result<Value, Abrupt> {
+    tdz_check(i, chunk, [(&x, Some(a)), (&y, b)])?;
+    i.binary(kind.name(), x, y)
+}
+
+/// Fuse `LoadLocal LoadLocal|Const <arith> StoreLocal` into [`Op::ArithLL`]/[`Op::ArithLK`] where
+/// no jump lands inside the run, then renumber every jump target.
+fn peephole(ops: &mut Vec<Op>) {
+    let n = ops.len();
+    let mut target = vec![false; n + 1];
+    for op in ops.iter() {
+        if let Some(t) = crate::jit_ir::jump_target(op) {
+            target[t.min(n)] = true;
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut map = vec![0u32; n + 1];
+    let mut pc = 0;
+    while pc < n {
+        map[pc] = out.len() as u32;
+        if pc + 3 < n && !target[pc + 1] && !target[pc + 2] && !target[pc + 3] {
+            if let (Op::LoadLocal(a), rhs, Some(kind), Op::StoreLocal(d)) = (
+                ops[pc],
+                ops[pc + 1],
+                ArithKind::of(&ops[pc + 2]),
+                ops[pc + 3],
+            ) {
+                let fused = match rhs {
+                    Op::LoadLocal(b) => Some(Op::ArithLL(kind, d, a, b)),
+                    Op::Const(k) => Some(Op::ArithLK(kind, d, a, k)),
+                    _ => None,
+                };
+                if let Some(op) = fused {
+                    out.push(op);
+                    pc += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(ops[pc]);
+        pc += 1;
+    }
+    map[n] = out.len() as u32;
+    if out.len() == n {
+        return;
+    }
+    for op in out.iter_mut() {
+        match op {
+            Op::Jump(t)
+            | Op::JumpIfFalse(t)
+            | Op::JumpIfNotCmp(_, t)
+            | Op::JumpIfNotCmpLL(.., t)
+            | Op::JumpIfNotCmpLK(.., t)
+            | Op::JumpIfFalsePeek(t)
+            | Op::JumpIfTruePeek(t)
+            | Op::JumpIfNotNullishPeek(t)
+            | Op::PushHandler(t) => *t = map[*t as usize],
+            _ => {}
+        }
+    }
+    *ops = out;
+}
+
+/// The generic path of a fused local compare: TDZ checks (left, then right), then `binary`.
+#[cold]
+#[inline(never)]
+fn cmp_slow(
+    i: &mut Interp,
+    chunk: &Chunk,
+    kind: CmpKind,
+    x: Value,
+    y: Value,
+    a: u16,
+    b: Option<u16>,
+) -> Result<bool, Abrupt> {
+    tdz_check(i, chunk, [(&x, Some(a)), (&y, b)])?;
+    let v = i.binary(kind.name(), x, y)?;
+    Ok(i.to_boolean(&v))
 }
 
 /// Recognize `typeof x ==/===/!=/!== "<kind>"` in either operand order. The literal side has no
