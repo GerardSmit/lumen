@@ -641,6 +641,11 @@ pub struct Interp {
     /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
     /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
     pub(crate) vm_pool: Vec<(Vec<Value>, Vec<Value>)>,
+    /// Recycled inline-frame stacks for `bytecode::drive_vm` (bytecode→bytecode calls run as
+    /// frames on the caller's loop), so a root run doesn't allocate one per call tree.
+    pub(crate) vm_frame_pool: Vec<Vec<crate::bytecode::InlineFrame>>,
+    /// Recycled single frame records for `bytecode::call_compiled` (`Interp::call`'s shortcut).
+    pub(crate) vm_frame_one: Vec<crate::bytecode::InlineFrame>,
     /// Megamorphic stub cache: a global open-addressed table keyed by (receiver shape, site name
     /// pointer) holding the last derived [`crate::bytecode::IcState`] for that pair. Probed when
     /// both of a site's ways miss, so a site rotating through more receiver shapes than it has
@@ -1290,6 +1295,8 @@ impl Interp {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
             vm_pool: Vec::new(),
+            vm_frame_pool: Vec::new(),
+            vm_frame_one: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             creation_pins: Default::default(),
             cur_coro: 0,
@@ -4603,7 +4610,12 @@ impl Interp {
             self.depth -= 1;
             return Err(e);
         }
-        let mut r = self.call_inner(callee, this, args);
+        // An already-compiled ordinary callee (the hot case: VM-to-VM calls from JIT code,
+        // callbacks from natives, tree-walker calls) skips the generic dispatch chain.
+        let mut r = match crate::bytecode::inline_callee(self, &callee) {
+            Some(c) => crate::bytecode::call_compiled(self, callee, this, args, c),
+            None => self.call_inner(callee, this, args),
+        };
         // Trampoline: a proper tail call unwound out of the callee re-dispatches here, in the
         // same stack frame, so mutual tail recursion runs in constant stack space.
         while r.is_ok() {
@@ -4803,15 +4815,17 @@ impl Interp {
             Callable::User(user) => {
                 // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
                 // single call, and most programs define no classes.)
+                // (Not an early return: `constructing`/`new_target` are restored below.)
                 if !self.class_info.is_empty()
                     && self.class_info.contains_key(&(Gc::as_ptr(&obj) as usize))
                 {
-                    return Err(self.throw(
+                    Err(self.throw(
                         "TypeError",
                         "Class constructor cannot be invoked without 'new'",
-                    ));
+                    ))
+                } else {
+                    self.call_user(&user.func, user.env.clone(), this, args, false, &obj)
                 }
-                self.call_user(&user.func, user.env.clone(), this, args, false, &obj)
             }
             Callable::Bound(bound) => {
                 let mut all = bound.args.clone();
@@ -5250,10 +5264,22 @@ impl Interp {
         this: Value,
         is_construct: bool,
     ) -> Value {
+        self.bind_compiled_this_flags(func.is_strict, chunk, this, is_construct)
+    }
+
+    /// [`Self::bind_compiled_this`] given the callee's strictness directly.
+    #[inline]
+    pub(crate) fn bind_compiled_this_flags(
+        &mut self,
+        is_strict: bool,
+        chunk: &crate::bytecode::Chunk,
+        this: Value,
+        is_construct: bool,
+    ) -> Value {
         if !chunk.uses_this() {
             return Value::Undefined;
         }
-        if func.is_strict || is_construct {
+        if is_strict || is_construct {
             return this;
         }
         match this {
@@ -5313,7 +5339,7 @@ impl Interp {
         r
     }
 
-    fn learned_construct_capacity(&self, constructor: &Gc) -> usize {
+    pub(crate) fn learned_construct_capacity(&self, constructor: &Gc) -> usize {
         let key = Gc::as_ptr(constructor) as usize;
         self.construct_capacity_hints
             .get(&key)
@@ -5323,7 +5349,7 @@ impl Interp {
             .unwrap_or(0)
     }
 
-    fn observe_construct_capacity(&mut self, constructor: &Gc, instance: &Gc) {
+    pub(crate) fn observe_construct_capacity(&mut self, constructor: &Gc, instance: &Gc) {
         let observed = instance.borrow().props.observed_instance_capacity();
         if observed == 0 {
             return;

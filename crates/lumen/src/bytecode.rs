@@ -3886,24 +3886,554 @@ fn drive_vm(
     handlers: &mut Vec<Handler>,
     mut pending_throw: Option<Value>,
 ) -> Result<VmStep, Abrupt> {
-    loop {
+    // Compiled callees the body calls run as inline frames on this same loop (see
+    // [`InlineFrame`]); the record vector is only taken from the pool on the first such call.
+    let mut frames = InlineFrames {
+        recs: Vec::new(),
+        live: 0,
+    };
+    let r = loop {
         let outcome = match pending_throw.take() {
             Some(e) => Err(Abrupt::Throw(e)),
-            None => run_vm::<false>(i, chunk, env, slots, stack, pc, this_val, handlers),
+            None => run_vm_frames::<false>(
+                i,
+                chunk,
+                env,
+                slots,
+                stack,
+                pc,
+                this_val,
+                handlers,
+                &mut frames,
+            ),
         };
         match outcome {
-            Ok(step) => return Ok(step),
-            Err(Abrupt::Throw(e)) => match handlers.pop() {
-                Some(h) => {
-                    stack.truncate(h.stack_depth);
-                    stack.push(e);
-                    *pc = h.catch_pc;
+            // The innermost inline frame returned: hand the value to its caller and continue there.
+            Ok(VmStep::Done(v)) if frames.live != 0 => {
+                let v = construct_result(i, &mut frames, v);
+                leave_inline(i, &mut frames);
+                match frames.top() {
+                    Some(caller) => caller.stack.push(v),
+                    None => stack.push(v),
                 }
-                None => return Err(Abrupt::Throw(e)),
-            },
+            }
+            Ok(step) => {
+                debug_assert!(frames.live == 0, "only the root frame can await");
+                break Ok(step);
+            }
+            // Unwind to the innermost `try` handler, leaving inline frames that have none.
+            Err(Abrupt::Throw(e)) => {
+                let uncaught = loop {
+                    match frames.top() {
+                        Some(f) => match f.handlers.pop() {
+                            Some(h) => {
+                                f.stack.truncate(h.stack_depth);
+                                f.stack.push(e);
+                                f.pc = h.catch_pc;
+                                break None;
+                            }
+                            None => leave_inline(i, &mut frames),
+                        },
+                        None => match handlers.pop() {
+                            Some(h) => {
+                                stack.truncate(h.stack_depth);
+                                stack.push(e);
+                                *pc = h.catch_pc;
+                                break None;
+                            }
+                            None => break Some(e),
+                        },
+                    }
+                };
+                if let Some(e) = uncaught {
+                    break Err(Abrupt::Throw(e));
+                }
+            }
             // Return/Break/Continue never escape a compiled body as an Abrupt; propagate defensively.
-            Err(other) => return Err(other),
+            Err(other) => {
+                while frames.live != 0 {
+                    leave_inline(i, &mut frames);
+                }
+                break Err(other);
+            }
         }
+    };
+    if frames.recs.capacity() != 0 && i.vm_frame_pool.len() < 16 {
+        i.vm_frame_pool.push(frames.recs);
+    }
+    r
+}
+
+/// The inline-frame stack of one [`drive_vm`]: `recs[..live]` are running frames (innermost
+/// last); records past `live` are retired ones kept for reuse — they hold no values, only their
+/// slot/operand/handler buffers' capacity, so a hot call site re-enters without allocating or
+/// moving a record.
+pub(crate) struct InlineFrames {
+    recs: Vec<InlineFrame>,
+    live: usize,
+}
+
+impl InlineFrames {
+    #[inline]
+    fn top(&mut self) -> Option<&mut InlineFrame> {
+        match self.live {
+            0 => None,
+            n => Some(&mut self.recs[n - 1]),
+        }
+    }
+
+    /// Make sure a retired record exists at `live` (may move the records: callers re-derive).
+    #[inline]
+    fn reserve_one(&mut self, i: &mut Interp) {
+        if self.recs.len() == self.live {
+            if self.recs.capacity() == 0 {
+                if let Some(pooled) = i.vm_frame_pool.pop() {
+                    self.recs = pooled;
+                    if self.recs.len() > self.live {
+                        return;
+                    }
+                }
+            }
+            self.recs.push(InlineFrame::default());
+        }
+    }
+}
+
+/// A compiled callee running inline on its caller's [`drive_vm`] loop: a bytecode→bytecode call
+/// of an eligible function (see [`inline_callee`]) enters one of these instead of recursing
+/// through `Interp::call` → `run`. It holds exactly what `run` would have kept on the Rust stack
+/// (slot/operand buffers, handlers, pc, bound `this`, the run env) plus the engine flags the
+/// ordinary call path saves and restores around the body ([`leave_inline`] undoes them).
+///
+/// The VM's working references point into the innermost record; they are re-derived after
+/// every enter/leave (entering may grow the record vector and move the records — the buffers
+/// they own never move).
+#[derive(Default)]
+pub(crate) struct InlineFrame {
+    chunk: Option<Rc<Chunk>>,
+    env: Option<Env>,
+    this_val: Value,
+    /// The callee function object, kept alive for the frame's `FnFrame` (`fn_ptr`) invariant.
+    callee: Value,
+    /// `[[Construct]]` frames: the fresh instance (the result unless the body returns an
+    /// object). `Undefined` for calls.
+    construct_this: Value,
+    pc: usize,
+    slots: Vec<Value>,
+    stack: Vec<Value>,
+    handlers: Vec<Handler>,
+    saved_nt: Option<Value>,
+    saved_strict: bool,
+    saved_tco: bool,
+    saved_field_init: bool,
+    saved_agb: bool,
+    saved_ctor: bool,
+}
+
+/// A callee [`drive_vm`] can run as an [`InlineFrame`]: an ordinary (non-class, non-proxy) user
+/// function whose body is already compiled and is synchronous, in the active realm, not under a
+/// `with`. Anything else — natives, bound functions, generators/async, not-yet-compiled bodies
+/// (the ordinary path counts calls and tiers them up), the recursion limit — takes `Interp::call`.
+pub(crate) struct InlineCallee {
+    chunk: Rc<Chunk>,
+    env: Env,
+    strict: bool,
+    arrow: bool,
+}
+
+#[inline]
+pub(crate) fn inline_callee(i: &Interp, callee: &Value) -> Option<InlineCallee> {
+    let Value::Obj(o) = callee else {
+        return None;
+    };
+    let b = o.borrow();
+    let crate::value::Callable::User(u) = &b.call else {
+        return None;
+    };
+    let f = &u.func;
+    let Some(Some(chunk)) = f.code.get() else {
+        return None;
+    };
+    if f.is_generator
+        || f.is_async
+        || i.depth >= crate::interpreter::MAX_EVAL_DEPTH
+        || matches!(i.tier, Tier::Interp)
+        || i.multi_realm()
+    {
+        return None;
+    }
+    // Class constructors (never [[Call]]able) are strict non-arrow functions; a registered
+    // proxy object is never inlined.
+    let key = Gc::as_ptr(o) as usize;
+    if (f.is_strict && !f.is_arrow && !i.class_info.is_empty() && i.class_info.contains_key(&key))
+        || (!i.proxies.is_empty() && i.proxies.contains_key(&key))
+        || u.env.borrow().under_with
+    {
+        return None;
+    }
+    Some(InlineCallee {
+        chunk: chunk.clone(),
+        env: u.env.clone(),
+        strict: f.is_strict,
+        arrow: f.is_arrow,
+    })
+}
+
+/// [`inline_callee`] for `new`: an ordinary compiled constructor *function* (never a class —
+/// class construction runs field initializers and `super` machinery on the ordinary path).
+#[inline]
+fn inline_ctor(i: &Interp, callee: &Value) -> Option<InlineCallee> {
+    let Value::Obj(o) = callee else {
+        return None;
+    };
+    let b = o.borrow();
+    let crate::value::Callable::User(u) = &b.call else {
+        return None;
+    };
+    let f = &u.func;
+    let Some(Some(chunk)) = f.code.get() else {
+        return None;
+    };
+    if f.is_arrow
+        || f.is_method
+        || f.is_generator
+        || f.is_async
+        || i.depth >= crate::interpreter::MAX_EVAL_DEPTH
+        || matches!(i.tier, Tier::Interp)
+        || i.multi_realm()
+    {
+        return None;
+    }
+    let key = Gc::as_ptr(o) as usize;
+    if (!i.class_info.is_empty() && i.class_info.contains_key(&key))
+        || (!i.proxies.is_empty() && i.proxies.contains_key(&key))
+        || u.env.borrow().under_with
+    {
+        return None;
+    }
+    Some(InlineCallee {
+        chunk: chunk.clone(),
+        env: u.env.clone(),
+        strict: f.is_strict,
+        arrow: false,
+    })
+}
+
+/// The value the innermost inline frame's caller receives for its body's completion `v`: for a
+/// `[[Construct]]` frame, `v` if it is an object, else the instance (after recording the
+/// instance's size hint, as `construct_dispatch` does after a successful body).
+#[inline]
+fn construct_result(i: &mut Interp, frames: &mut InlineFrames, v: Value) -> Value {
+    let f = &mut frames.recs[frames.live - 1];
+    let Value::Obj(inst) = &f.construct_this else {
+        return v;
+    };
+    if let Value::Obj(ctor) = &f.callee {
+        i.observe_construct_capacity(ctor, inst);
+    }
+    match v {
+        Value::Obj(_) => v,
+        _ => std::mem::take(&mut f.construct_this),
+    }
+}
+
+/// Enter an [`InlineFrame`] (in the retired record at `frames.live`, which
+/// [`InlineFrames::reserve_one`] provided) for the call whose window sits on the caller's
+/// `stack`: callee at `stack[at - 1]`, receiver below it when `has_this`, arguments at
+/// `stack[at..]` (moved into the callee's slots). Counts the recursion depth and polls the
+/// collector like `Interp::call`, then pops the call window off `stack`. On `Err` nothing was
+/// changed.
+///
+/// SAFETY: `frames` is valid and has a retired record at `live`; `stack` is the caller's
+/// operand stack (the root's, or record `live - 1`'s) — never the record being entered.
+#[inline(never)]
+unsafe fn enter_inline(
+    i: &mut Interp,
+    frames: *mut InlineFrames,
+    stack: &mut Vec<Value>,
+    at: usize,
+    has_this: bool,
+    construct: bool,
+    c: InlineCallee,
+) -> Result<(), Abrupt> {
+    i.depth += 1;
+    if let Err(e) = i.gc_check_amortized() {
+        i.depth -= 1;
+        return Err(e);
+    }
+    // [[Construct]] (construct_dispatch's user-function arm): OrdinaryCreateFromConstructor
+    // with new.target = the callee itself.
+    let instance = if construct {
+        let proto = match i.get_member(&stack[at - 1], "prototype") {
+            Ok(Value::Obj(p)) => p,
+            Ok(_) => i.object_proto.clone(),
+            Err(e) => {
+                i.depth -= 1;
+                return Err(e);
+            }
+        };
+        let Value::Obj(ctor) = &stack[at - 1] else {
+            unreachable!("inline constructor is a function object")
+        };
+        let capacity = i.learned_construct_capacity(ctor);
+        Some(crate::value::Object::new_with_capacity(
+            Some(proto),
+            capacity,
+        ))
+    } else {
+        None
+    };
+    let f: &mut InlineFrame = &mut *(*frames).recs.as_mut_ptr().add((*frames).live);
+    let (base, this) = if has_this {
+        (at - 2, std::mem::take(&mut stack[at - 2]))
+    } else {
+        (at - 1, Value::Undefined)
+    };
+    let callee = std::mem::take(&mut stack[at - 1]);
+    let argc = stack.len() - at;
+    let seed = enter_frame(
+        i,
+        f,
+        callee,
+        this,
+        instance,
+        c,
+        stack.as_mut_ptr().add(at),
+        argc,
+        true,
+    );
+    if seed == argc {
+        // Everything above `base` was moved out (all `Undefined` now): nothing to drop.
+        stack.set_len(base);
+    } else {
+        stack.truncate(base);
+    }
+    (*frames).live += 1;
+    Ok(())
+}
+
+/// Fill retired record `f` for a call of `callee` (described by `c`): exactly the ordinary call
+/// path's entry work (`call_dispatch` → `call_user` → `call_user_inner` → `run_compiled_chunk` →
+/// [`run`]) in the same order. The `argc` arguments at `args` are moved into the parameter slots
+/// when `move_args` (they are left `Undefined`), cloned otherwise. Returns how many were seeded.
+///
+/// SAFETY: `args..args + argc` is valid (and writable when `move_args`) and not inside `f`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn enter_frame(
+    i: &mut Interp,
+    f: &mut InlineFrame,
+    callee: Value,
+    this: Value,
+    instance: Option<Gc>,
+    c: InlineCallee,
+    args: *mut Value,
+    argc: usize,
+    move_args: bool,
+) -> usize {
+    let construct = instance.is_some();
+    // A retired record's value fields are empty (see `leave_frame`): plain writes, no drops.
+    let fn_ptr = match &callee {
+        Value::Obj(o) => Gc::as_ptr(o) as usize,
+        _ => unreachable!("inline callee is a function object"),
+    };
+    let this = match instance {
+        // A construct leaves `constructing` alone and installs new.target = the callee (the
+        // pending-new-target handoff of `construct_dispatch` → `call_user_inner`, net).
+        Some(inst) => {
+            f.saved_ctor = i.constructing;
+            let nt = std::mem::replace(&mut i.new_target, callee.clone());
+            std::ptr::write(&mut f.saved_nt, Some(nt));
+            drop_value_fast(std::mem::take(&mut i.pending_new_target));
+            drop_value_fast(this);
+            std::ptr::write(&mut f.construct_this, Value::Obj(inst.clone()));
+            Value::Obj(inst)
+        }
+        None => {
+            f.saved_ctor = std::mem::replace(&mut i.constructing, false);
+            // An ordinary call clears new.target (an arrow inherits it). When it is already
+            // undefined — nearly always — there is nothing to save or restore: every callee puts
+            // back what it changed. (Skipping the write also avoids a partial-width store that
+            // the next call's full-width read would stall on.)
+            if !c.arrow && !matches!(i.new_target, Value::Undefined) {
+                std::ptr::write(
+                    &mut f.saved_nt,
+                    Some(std::mem::replace(&mut i.new_target, Value::Undefined)),
+                );
+            }
+            this
+        }
+    };
+    std::ptr::write(&mut f.callee, callee);
+    i.fn_frames.push(crate::interpreter::FnFrame {
+        fn_ptr,
+        coro: i.cur_coro,
+        strict: c.strict,
+        extra: None,
+    });
+    let chunk = &*c.chunk;
+    let this_val = if chunk.uses_this() {
+        i.bind_compiled_this_flags(c.strict, chunk, this, construct)
+    } else {
+        drop_value_fast(this);
+        Value::Undefined
+    };
+    std::ptr::write(&mut f.this_val, this_val);
+    f.saved_strict = std::mem::replace(&mut i.strict, c.strict);
+    f.saved_tco = std::mem::replace(&mut i.tco_ok, c.strict && !construct);
+    f.saved_field_init = i.in_field_init_code;
+    f.saved_agb = i.in_async_gen_body;
+    if !c.arrow {
+        i.in_field_init_code = false;
+        i.in_async_gen_body = false;
+    }
+    let arg_slice = std::slice::from_raw_parts_mut(args, argc);
+    let env = match &chunk.activation_layout {
+        Some(layout) => layout.make_env(chunk, i, &c.env, &f.this_val, arg_slice),
+        None => c.env,
+    };
+    let args_obj = match chunk.arguments_slot {
+        Some(_) => Some(i.make_compiled_arguments_object(arg_slice, &env)),
+        None => None,
+    };
+    let slots = &mut f.slots;
+    let seed = chunk.n_params.min(argc);
+    slots.reserve(chunk.n_slots);
+    if move_args {
+        // No refcount traffic: the caller's window is discarded right after.
+        for v in &mut arg_slice[..seed] {
+            slots.push(std::mem::take(v));
+        }
+    } else {
+        slots.extend_from_slice(&arg_slice[..seed]);
+    }
+    while slots.len() < chunk.n_slots {
+        slots.push(Value::Undefined);
+    }
+    if let (Some(s), Some(ao)) = (chunk.arguments_slot, args_obj) {
+        slots[s as usize] = Value::Obj(ao);
+    }
+    for &s in &chunk.var_force_resets {
+        slots[s as usize] = Value::Undefined;
+    }
+    std::ptr::write(&mut f.env, Some(env));
+    std::ptr::write(&mut f.chunk, Some(c.chunk));
+    f.pc = 0;
+    seed
+}
+
+/// Leave the innermost [`InlineFrame`] (returned or unwound) and give back its recursion depth.
+fn leave_inline(i: &mut Interp, frames: &mut InlineFrames) {
+    frames.live -= 1;
+    leave_frame(i, &mut frames.recs[frames.live]);
+    i.depth -= 1;
+}
+
+/// The exit half of the ordinary call path, in the same order — buffers emptied, per-body flags,
+/// the reflection frame, the dispatch's `constructing`/`new.target`. The record is retired in
+/// place (every value field emptied).
+fn leave_frame(i: &mut Interp, f: &mut InlineFrame) {
+    clear_values_fast(&mut f.slots);
+    clear_values_fast(&mut f.stack);
+    f.handlers.clear();
+    drop_value_fast(std::mem::take(&mut f.this_val));
+    f.env = None;
+    f.chunk = None;
+    i.strict = f.saved_strict;
+    i.tco_ok = f.saved_tco;
+    i.in_field_init_code = f.saved_field_init;
+    i.in_async_gen_body = f.saved_agb;
+    // Pop the reflection frame reading only its `extra` word (the frame was written field by
+    // field; a whole-record read would stall on store forwarding).
+    let n = i.fn_frames.len() - 1;
+    if i.fn_frames[n].extra.is_some() {
+        i.fn_frames.truncate(n);
+    } else {
+        // SAFETY: the remaining fields of `FnFrame` are plain data.
+        unsafe { i.fn_frames.set_len(n) };
+    }
+    i.constructing = f.saved_ctor;
+    if let Some(nt) = f.saved_nt.take() {
+        drop_value_fast(std::mem::replace(&mut i.new_target, nt));
+    }
+    drop_value_fast(std::mem::take(&mut f.callee));
+    drop_value_fast(std::mem::take(&mut f.construct_this));
+}
+
+/// `Interp::call`'s shortcut for a callee [`inline_callee`] accepted: run the compiled body on a
+/// fresh [`drive_vm`] (its own calls then run inline there) without the generic dispatch chain.
+/// The caller has already counted the recursion depth and polled the collector.
+pub(crate) fn call_compiled(
+    i: &mut Interp,
+    callee: Value,
+    this: Value,
+    args: &[Value],
+    c: InlineCallee,
+) -> Result<Value, Abrupt> {
+    let mut rec = i.vm_frame_one.pop().unwrap_or_default();
+    // SAFETY: `args` is only read (not moved from) with `move_args == false`.
+    unsafe {
+        enter_frame(
+            i,
+            &mut rec,
+            callee,
+            this,
+            None,
+            c,
+            args.as_ptr() as *mut Value,
+            args.len(),
+            false,
+        )
+    };
+    let r = {
+        let InlineFrame {
+            chunk,
+            env,
+            this_val,
+            pc,
+            slots,
+            stack,
+            handlers,
+            ..
+        } = &mut rec;
+        // SAFETY: `enter_frame` filled both.
+        let (chunk, env) = unsafe {
+            (
+                chunk.as_deref().unwrap_unchecked(),
+                env.as_ref().unwrap_unchecked(),
+            )
+        };
+        drive_vm(i, chunk, env, slots, stack, pc, this_val, handlers, None)
+    };
+    leave_frame(i, &mut rec);
+    if i.vm_frame_one.len() < 64 {
+        i.vm_frame_one.push(rec);
+    }
+    match r? {
+        VmStep::Done(v) => Ok(v),
+        VmStep::Await(_) => unreachable!("a synchronous bytecode function cannot await"),
+    }
+}
+
+/// Drop a `Value`, skipping the out-of-line drop glue for the refcount-free variants (tags
+/// `0..=4`, see [`Value`]'s layout note) — most slot and operand values on a hot call path.
+#[inline(always)]
+fn drop_value_fast(v: Value) {
+    if matches!(
+        v,
+        Value::Undefined | Value::Empty | Value::Null | Value::Bool(_) | Value::Num(_)
+    ) {
+        std::mem::forget(v);
+    } else {
+        drop(v);
+    }
+}
+
+/// `values.clear()` through [`drop_value_fast`].
+#[inline(always)]
+fn clear_values_fast(values: &mut Vec<Value>) {
+    while let Some(v) = values.pop() {
+        drop_value_fast(v);
     }
 }
 
@@ -3916,6 +4446,7 @@ fn drive_vm(
 /// that returns or awaits). The check sits at the loop head so arms that `continue` stop too, and
 /// it compiles away in the interpreter's `ONE = false` instantiation.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn run_vm<const ONE: bool>(
     i: &mut Interp,
     chunk: &Chunk,
@@ -3926,6 +4457,102 @@ fn run_vm<const ONE: bool>(
     this_val: &Value,
     handlers: &mut Vec<Handler>,
 ) -> Result<VmStep, Abrupt> {
+    run_vm_frames::<ONE>(
+        i,
+        chunk,
+        env,
+        slots,
+        stack,
+        pc,
+        this_val,
+        handlers,
+        std::ptr::null_mut(),
+    )
+}
+
+/// [`run_vm`] plus inline frames: with a non-null `frames` (only [`drive_vm`] passes one), a
+/// call to an eligible compiled function pushes an [`InlineFrame`] and keeps executing in this
+/// loop on the callee's state; the body's `Done`/throw then surfaces to `drive_vm`, which pops
+/// or unwinds the frame and re-enters here on the caller's state. Execution always resumes in
+/// the innermost frame, so the working state below is derived from `frames.last()` (the root
+/// arguments otherwise).
+#[allow(clippy::too_many_arguments)]
+fn run_vm_frames<const ONE: bool>(
+    i: &mut Interp,
+    root_chunk: &Chunk,
+    root_env: &Env,
+    root_slots: &mut [Value],
+    root_stack: &mut Vec<Value>,
+    root_pc: &mut usize,
+    root_this: &Value,
+    root_handlers: &mut Vec<Handler>,
+    frames: *mut InlineFrames,
+) -> Result<VmStep, Abrupt> {
+    // SAFETY: the root references are exclusively ours for this call; inline-frame references
+    // point into `frames` records (or the buffers they own) and are re-derived by `load_frame!`
+    // after every push, before any of the previous references is used again. Nothing else
+    // touches `frames` while this loop runs (reentrant calls get their own `drive_vm`).
+    let root_slots: *mut [Value] = root_slots;
+    let root_stack: *mut Vec<Value> = root_stack;
+    let root_pc: *mut usize = root_pc;
+    let root_handlers: *mut Vec<Handler> = root_handlers;
+    let mut chunk: &Chunk;
+    let mut env: &Env;
+    let mut slots: &mut [Value];
+    let mut stack: &mut Vec<Value>;
+    let mut pc: &mut usize;
+    let mut this_val: &Value;
+    let mut handlers: &mut Vec<Handler>;
+    macro_rules! load_frame {
+        () => {
+            match if ONE || frames.is_null() {
+                None
+            } else {
+                unsafe { (*frames).top().map(|f| f as *mut InlineFrame) }
+            } {
+                Some(f) => unsafe {
+                    chunk = (*f).chunk.as_deref().unwrap_unchecked();
+                    env = (*f).env.as_ref().unwrap_unchecked();
+                    slots = (&mut (*f).slots).as_mut_slice();
+                    stack = &mut (*f).stack;
+                    pc = &mut (*f).pc;
+                    this_val = &(*f).this_val;
+                    handlers = &mut (*f).handlers;
+                },
+                None => unsafe {
+                    chunk = root_chunk;
+                    env = root_env;
+                    slots = &mut *root_slots;
+                    stack = &mut *root_stack;
+                    pc = &mut *root_pc;
+                    this_val = root_this;
+                    handlers = &mut *root_handlers;
+                },
+            }
+        };
+    }
+    load_frame!();
+    // Push a prepared inline frame and switch the working state to it.
+    // Call the function at `stack[at - 1]` as an inline frame if it qualifies (see
+    // [`inline_callee`]) and switch the working state to it; otherwise fall through to the
+    // ordinary call.
+    macro_rules! try_inline_call {
+        ($at:expr, $has_this:expr) => {
+            if !ONE && !frames.is_null() {
+                if let Some(c) = inline_callee(i, &stack[$at - 1]) {
+                    // Reserving may move the records (and with them the caller's `stack`).
+                    unsafe { (*frames).reserve_one(i) };
+                    stack = match unsafe { (*frames).top() } {
+                        Some(f) => unsafe { &mut *(&mut f.stack as *mut Vec<Value>) },
+                        None => unsafe { &mut *root_stack },
+                    };
+                    unsafe { enter_inline(i, frames, stack, $at, $has_this, false, c)? };
+                    load_frame!();
+                    continue;
+                }
+            }
+        };
+    }
     macro_rules! pop {
         () => {
             stack.pop().expect("vm stack underflow")
@@ -4651,6 +5278,7 @@ fn run_vm<const ONE: bool>(
             // fine: the handler unwind (or function exit) truncates it.
             Op::Call(argc) => {
                 let at = stack.len() - argc as usize;
+                try_inline_call!(at, false);
                 let callee = stack[at - 1].clone();
                 let v = i.call(callee, Value::Undefined, &stack[at..])?;
                 stack.truncate(at - 1);
@@ -4673,6 +5301,7 @@ fn run_vm<const ONE: bool>(
             }
             Op::CallWithThis(argc) => {
                 let at = stack.len() - argc as usize;
+                try_inline_call!(at, true);
                 let m = stack[at - 1].clone();
                 let this = stack[at - 2].clone();
                 let v = i.call(m, this, &stack[at..])?;
@@ -4681,6 +5310,18 @@ fn run_vm<const ONE: bool>(
             }
             Op::New(argc) => {
                 let at = stack.len() - argc as usize;
+                if !ONE && !frames.is_null() {
+                    if let Some(c) = inline_ctor(i, &stack[at - 1]) {
+                        unsafe { (*frames).reserve_one(i) };
+                        stack = match unsafe { (*frames).top() } {
+                            Some(f) => unsafe { &mut *(&mut f.stack as *mut Vec<Value>) },
+                            None => unsafe { &mut *root_stack },
+                        };
+                        unsafe { enter_inline(i, frames, stack, at, false, true, c)? };
+                        load_frame!();
+                        continue;
+                    }
+                }
                 let callee = stack[at - 1].clone();
                 let v = i.construct(callee, &stack[at..])?;
                 stack.truncate(at - 1);
