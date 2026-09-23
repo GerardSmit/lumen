@@ -280,6 +280,10 @@ struct Translator<'m, 'f> {
     m: &'m Module,
     b: FunctionBuilder<'f>,
     vmctx: Value,
+    /// Linear memory's `(base, len)`, kept in SSA variables so they stay in registers: they only
+    /// change across calls (which may grow memory), after which [`Self::reload_mem`] refreshes them.
+    mem: Option<(Variable, Variable)>,
+    bounds_checks: bool,
     locals: Vec<Variable>,
     stack: Vec<Value>,
     ctrl: Vec<Frame>,
@@ -288,8 +292,14 @@ struct Translator<'m, 'f> {
     dead_depth: usize,
 }
 
-/// Translate function index `f` (a defined function) of `m`.
+/// Translate function index `f` (a defined function) of `m`, with explicit bounds checks.
 pub fn translate(m: &Module, f: u32) -> Result<Function, String> {
+    translate_with(m, f, true)
+}
+
+/// [`translate`]; without `bounds_checks` memory accesses are unchecked, for a memory whose
+/// out-of-bounds accesses fault (see `lumen_codegen::guard`).
+pub fn translate_with(m: &Module, f: u32, bounds_checks: bool) -> Result<Function, String> {
     let defined = f
         .checked_sub(m.imported_func_count)
         .ok_or("wasm jit: cannot translate an import")?;
@@ -327,6 +337,8 @@ pub fn translate(m: &Module, f: u32) -> Result<Function, String> {
             m,
             b,
             vmctx,
+            mem: None,
+            bounds_checks,
             locals,
             stack: Vec::new(),
             ctrl: vec![Frame {
@@ -341,6 +353,15 @@ pub fn translate(m: &Module, f: u32) -> Result<Function, String> {
             reachable: true,
             dead_depth: 0,
         };
+        if !m.memories.is_empty() || m.imported_mem_count != 0 {
+            let base = t.b.declare_var(Type::I64);
+            let len = t.b.declare_var(Type::I64);
+            t.mem = Some((base, len));
+            // The base never moves (memory grows in place); only the length is reloaded.
+            let v = t.b.load(MemKind::I64, t.vmctx, VMCTX_MEM_BASE);
+            t.b.def_var(base, v);
+            t.reload_mem();
+        }
         let mut cur = Cursor {
             code: &body.code,
             pos: 0,
@@ -418,11 +439,23 @@ impl Translator<'_, '_> {
 
     // ----- memory ----------------------------------------------------------------------------
 
+    fn reload_mem(&mut self) {
+        if let Some((_, len)) = self.mem {
+            let v = self.b.load(MemKind::I64, self.vmctx, VMCTX_MEM_LEN);
+            self.b.def_var(len, v);
+        }
+    }
     fn mem_base(&mut self) -> Value {
-        self.b.load(MemKind::I64, self.vmctx, VMCTX_MEM_BASE)
+        match self.mem {
+            Some(m) => self.b.use_var(m.0),
+            None => self.b.iconst(Type::I64, 0), // unreachable: validation requires a memory
+        }
     }
     fn mem_len(&mut self) -> Value {
-        self.b.load(MemKind::I64, self.vmctx, VMCTX_MEM_LEN)
+        match self.mem {
+            Some(m) => self.b.use_var(m.1),
+            None => self.b.iconst(Type::I64, 0), // unreachable: validation requires a memory
+        }
     }
 
     /// Bounds-check `addr + offset .. + bytes` and return the host address and folded offset.
@@ -432,11 +465,13 @@ impl Translator<'_, '_> {
             self.b.trap(trap::MEMORY_OOB);
         }
         let ea = self.b.convert(ConvOp::Uext, Type::I64, addr);
-        let len = self.mem_len();
-        let span = self.b.iconst(Type::I64, offset as i64 + bytes as i64);
-        let end = self.b.binary(BinaryOp::Iadd, ea, span);
-        let oob = self.b.icmp(IntCC::Ugt, end, len);
-        self.b.trap_if(oob, trap::MEMORY_OOB);
+        if self.bounds_checks {
+            let len = self.mem_len();
+            let span = self.b.iconst(Type::I64, offset as i64 + bytes as i64);
+            let end = self.b.binary(BinaryOp::Iadd, ea, span);
+            let oob = self.b.icmp(IntCC::Ugt, end, len);
+            self.b.trap_if(oob, trap::MEMORY_OOB);
+        }
         let base = self.mem_base();
         let host = self.b.binary(BinaryOp::Iadd, base, ea);
         if offset <= i32::MAX as u32 {
@@ -501,7 +536,9 @@ impl Translator<'_, '_> {
         let fr = self.b.func.import_function(Signature::new(p, results), id);
         let mut a = vec![self.vmctx];
         a.extend_from_slice(args);
-        self.b.call_fn(fr, &a)
+        let rs = self.b.call_fn(fr, &a);
+        self.reload_mem();
+        rs
     }
 
     fn call(&mut self, f: u32) -> Result<(), String> {
@@ -512,6 +549,7 @@ impl Translator<'_, '_> {
         let mut a = vec![self.vmctx];
         a.extend(args);
         let rs = self.b.call_fn(fr, &a);
+        self.reload_mem();
         self.stack.extend(rs);
         Ok(())
     }
@@ -545,6 +583,7 @@ impl Translator<'_, '_> {
         let mut a = vec![callee_vmctx];
         a.extend(args);
         let rs = self.b.call_indirect(sr, code, &a);
+        self.reload_mem();
         self.stack.extend(rs);
         Ok(())
     }

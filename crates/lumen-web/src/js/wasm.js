@@ -3,9 +3,8 @@
 // a Memory/Table/Global can be created standalone and imported by any module (cross-module
 // linking). Functions are called by their store address.
 //
-// A Memory's bytes are owned by its ArrayBuffer; the store borrows them (an O(1) swap, no copy)
-// only while wasm runs, and hands them back to JS around every imported-function call. No
-// SIMD/threads/GC.
+// A Memory's buffer views the store's bytes in place (no copies); growing the memory replaces
+// the buffer and detaches the old one. No SIMD/threads/GC.
 
 class CompileError extends Error {
   constructor(m) { super(m); this.name = "CompileError"; }
@@ -32,13 +31,11 @@ function toBytes(source) {
   throw new TypeError("WebAssembly: expected a BufferSource");
 }
 
-// Wrap a store function address as a callable.
+__wasm.setErrors(RuntimeError);
+
+// A store function address as a callable (a native function: no JS frame per call).
 function funcFromAddr(faddr) {
-  const fn = (...args) => {
-    let r;
-    try { r = __wasm.call(faddr, args); } catch (err) { throw wrapWasmError(err); }
-    return r.length === 0 ? undefined : r.length === 1 ? r[0] : r;
-  };
+  const fn = __wasm.func(faddr);
   fn._funcAddr = faddr;
   return fn;
 }

@@ -619,4 +619,11 @@ impl MachInst for MInst {
     fn is_call(&self) -> bool {
         matches!(self, MInst::Call { .. })
     }
+
+    fn jump_args(&self) -> Option<(usize, &[VReg])> {
+        match self {
+            MInst::Jmp { target, args } => Some((*target, args)),
+            _ => None,
+        }
+    }
 }

@@ -169,12 +169,11 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi, feat: &Features) -> Result<Lowe
 
     let entry = f.entry();
     let pre_entry = !cfg.preds[entry.index()].is_empty();
-    let order: Vec<Block> = f
-        .layout
-        .iter()
-        .copied()
-        .filter(|&b| cfg.is_reachable(b))
-        .collect();
+    let order = rotate_loops(
+        f,
+        cfg,
+        f.layout.iter().copied().filter(|&b| cfg.is_reachable(b)).collect(),
+    );
     let mut bmap = vec![usize::MAX; f.blocks.len()];
     for (i, &b) in order.iter().enumerate() {
         bmap[b.index()] = i + pre_entry as usize;
@@ -239,6 +238,43 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi, feat: &Features) -> Result<Lowe
         outgoing: l.outgoing,
         has_traps: l.has_traps,
     })
+}
+
+/// Loop rotation by layout: a loop header that ends in a conditional branch moves to just after
+/// its last latch, so the back edge falls through into the exit test (`cmp; jcc body`) and each
+/// iteration takes one branch instead of two. Entry jumps to the test once.
+fn rotate_loops(f: &Function, cfg: &Cfg, mut order: Vec<Block>) -> Vec<Block> {
+    let is_brif = |b: Block| {
+        f.terminator(b)
+            .is_some_and(|t| matches!(f.inst(t), InstData::Brif { .. }))
+    };
+    let is_jump_to = |b: Block, h: Block| {
+        f.terminator(b)
+            .is_some_and(|t| matches!(f.inst(t), InstData::Jump { dest } if dest.block == h))
+    };
+    let headers: Vec<Block> = order
+        .iter()
+        .copied()
+        .filter(|&h| h != f.entry() && is_brif(h))
+        .collect();
+    for h in headers {
+        let pos = |order: &[Block], b: Block| order.iter().position(|&x| x == b);
+        let Some(hp) = pos(&order, h) else { continue };
+        // The back edge from the latest block in layout (a latch the header dominates).
+        let latch = cfg.preds[h.index()]
+            .iter()
+            .copied()
+            .filter(|&p| cfg.dominates(h, p))
+            .filter_map(|p| pos(&order, p).map(|i| (i, p)))
+            .max();
+        let Some((lp, l)) = latch else { continue };
+        if lp <= hp || !is_jump_to(l, h) {
+            continue;
+        }
+        order.remove(hp);
+        order.insert(lp, h);
+    }
+    order
 }
 
 impl Lower<'_> {

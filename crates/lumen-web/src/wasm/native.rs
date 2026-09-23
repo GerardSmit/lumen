@@ -14,6 +14,7 @@
 use super::exec::{FuncEntity, Host, Store, Val};
 use super::parse::FuncType;
 use super::translate::{self, *};
+use lumen_codegen::guard;
 use lumen_codegen::jitmem::ExecMemory;
 use lumen_codegen::{opt, x64, Signature};
 use std::collections::HashMap;
@@ -58,6 +59,7 @@ struct FuncSlot {
 
 pub struct NativeInstance {
     vm: Box<VmCtx>,
+    _code_range: Option<guard::CodeRange>,
     _code: ExecMemory,
     /// Per function index: entry address, whether it is a real body (not a bridge), its type.
     addrs: Vec<u64>,
@@ -96,6 +98,12 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
     let inst = store.instances[inst_idx].clone();
     let m = &inst.module;
     let cfg = config();
+    // With a guarded memory, out-of-bounds accesses fault into the reserved tail and the fault
+    // handler turns them into traps, so generated code carries no bounds checks.
+    let guarded = inst
+        .mem_addrs
+        .first()
+        .is_some_and(|&a| store.memories[a].bytes.guarded());
     let nfuncs = inst.func_addrs.len();
     let mut compiled = Vec::with_capacity(nfuncs + m.types.len());
     let mut is_body = vec![false; nfuncs];
@@ -105,7 +113,7 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
     for f in 0..nfuncs {
         let ty = translate::func_type(m, f as u32).ok()?.clone();
         let body = if f as u32 >= m.imported_func_count {
-            translate::translate(m, f as u32)
+            translate::translate_with(m, f as u32, !guarded)
                 .and_then(|mut func| {
                     opt::optimize(&mut func);
                     x64::compile(&func, &cfg)
@@ -135,6 +143,12 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
         if let Ok(c) = c {
             generic[t] = Some(compiled.len());
             compiled.push(c);
+        }
+    }
+    if let Ok(dir) = std::env::var("LUMEN_WASM_JIT_DUMP") {
+        // Raw machine code per function (disassemble with e.g. `objdump -D -b binary -mi386:x86-64`).
+        for (f, c) in compiled.iter().enumerate() {
+            let _ = std::fs::write(format!("{dir}/i{inst_idx}_f{f}.bin"), &c.code);
         }
     }
     let (code, addrs) = x64::load(&compiled, |id, addrs| {
@@ -195,8 +209,10 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
             eprintln!("wasm jit:   f{f} interpreted: {e}");
         }
     }
+    let code_range = guarded.then(|| guard::CodeRange::new(code.as_ptr() as usize, code.len()));
     Some(Box::new(NativeInstance {
         vm,
+        _code_range: code_range,
         _code: code,
         addrs,
         is_body,
@@ -256,7 +272,9 @@ pub fn invoke(
         v.depth += 1;
         sync_mem(v);
         let entry: Tramp = std::mem::transmute(tramp);
+        let prev = guard::set_target(vm as *mut u8, VMCTX_ENTRY_SP, trap::MEMORY_OOB);
         let rc = entry(vm, ni.addrs[f], slots.as_mut_ptr());
+        guard::restore_target(prev);
         let v = &mut *vm;
         v.depth -= 1;
         (v.store, v.host) = saved;

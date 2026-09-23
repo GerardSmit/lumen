@@ -217,6 +217,11 @@ pub trait MachInst: Clone + fmt::Debug {
     fn is_call(&self) -> bool {
         false
     }
+    /// `(target block, args)` of a jump passing block arguments (hints: args and params prefer
+    /// one register, so the edge move disappears).
+    fn jump_args(&self) -> Option<(usize, &[VReg])> {
+        None
+    }
 }
 
 pub struct VBlock {

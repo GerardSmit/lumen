@@ -181,7 +181,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(bp, vec![0u8; len]);
+        i.array_buffers.insert(bp, vec![0u8; len].into());
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "__abResizable", Value::Bool(max.is_some()));
         let id = crate::interpreter::alloc_shared_mem(len);
@@ -268,17 +268,21 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
 pub(crate) fn array_buffer_from_vec(i: &mut Interp, bytes: Vec<u8>) -> Value {
     let (v, p) = make_array_buffer(i, 0);
     if let Value::Obj(o) = &v {
-        set_internal(o, "__abMaxByteLength", Value::Num(bytes.len() as f64));
+        set_max_byte_length(o, bytes.len());
     }
-    i.array_buffers.insert(p, bytes);
+    i.array_buffers.insert(p, bytes.into());
     v
+}
+
+pub(crate) fn set_max_byte_length(o: &Gc, len: usize) {
+    set_internal(o, "__abMaxByteLength", Value::Num(len as f64));
 }
 
 fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, vec![0u8; byte_len]);
+    i.array_buffers.insert(p, vec![0u8; byte_len].into());
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
     // behind the `__ab*` prefix and surfaced through prototype accessor getters.
     set_internal(&obj, "__abMaxByteLength", Value::Num(byte_len as f64));
@@ -569,7 +573,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let len = n as usize;
         let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(p, vec![0u8; len]);
+        i.array_buffers.insert(p, vec![0u8; len].into());
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "__abResizable", Value::Bool(max.is_some()));
         Ok(Value::Obj(obj))

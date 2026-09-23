@@ -39,17 +39,6 @@ impl Allocation {
     }
 }
 
-#[derive(Clone)]
-struct Interval {
-    vreg: VReg,
-    start: u32,
-    end: u32,
-    weight: f64,
-    hint: Option<PReg>,
-    /// Hint from a copy: take the source's register if it was allocated one.
-    copy_of: Option<VReg>,
-}
-
 fn class_index(c: RegClass) -> usize {
     match c {
         RegClass::Int => 0,
@@ -119,33 +108,39 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
         }
     }
 
-    // ----- intervals -----
-    let mut start = vec![u32::MAX; nv];
-    let mut end = vec![0u32; nv];
+    // ----- intervals: per-block live segments (lifetime holes) -----
+    let mut segs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
     let mut weight = vec![0f64; nv];
     let mut hint: Vec<Option<PReg>> = vec![None; nv];
-    let mut copy_of: Vec<Option<VReg>> = vec![None; nv];
-    let touch = |v: VReg, p: u32, start: &mut Vec<u32>, end: &mut Vec<u32>| {
-        start[v.index()] = start[v.index()].min(p);
-        end[v.index()] = end[v.index()].max(p);
-    };
+    // Values that want to share a register: copy source/destination, jump argument/parameter.
+    let mut related: Vec<Vec<VReg>> = vec![Vec::new(); nv];
     // Clobber positions per physical register (sorted, since instructions are visited in order).
     let mut clobbers: Vec<Vec<u32>> = vec![Vec::new(); 64];
-    let mut has_call = false;
+    // Per block: the (lo, hi) of each value touched in it, then flushed into `segs`.
+    let mut lo = vec![u32::MAX; nv];
+    let mut hi = vec![0u32; nv];
+    let mut touched: Vec<VReg> = Vec::new();
+    let touch = |v: VReg, p: u32, lo: &mut Vec<u32>, hi: &mut Vec<u32>, t: &mut Vec<VReg>| {
+        if lo[v.index()] == u32::MAX {
+            t.push(v);
+        }
+        lo[v.index()] = lo[v.index()].min(p);
+        hi[v.index()] = hi[v.index()].max(p);
+    };
     for (bi, b) in code.blocks.iter().enumerate() {
         let w = 8f64.powi(b.loop_depth.min(6) as i32);
         let entry = use_pos(b.start);
         let exit = def_pos(b.end - 1);
         for &p in &b.params {
-            touch(p, entry, &mut start, &mut end);
+            touch(p, entry, &mut lo, &mut hi, &mut touched);
             weight[p.index()] += w;
         }
         for v in 0..nv {
             if live_in[bi][v / 64] & (1 << (v % 64)) != 0 {
-                touch(VReg(v as u32), entry, &mut start, &mut end);
+                touch(VReg(v as u32), entry, &mut lo, &mut hi, &mut touched);
             }
             if live_out[bi][v / 64] & (1 << (v % 64)) != 0 {
-                touch(VReg(v as u32), exit, &mut start, &mut end);
+                touch(VReg(v as u32), exit, &mut lo, &mut hi, &mut touched);
             }
         }
         for i in b.start..b.end {
@@ -159,12 +154,12 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                 match o.kind {
                     OperandKind::Use => {
                         let p = if o.late { def_pos(i) } else { use_pos(i) };
-                        touch(v, p, &mut start, &mut end);
+                        touch(v, p, &mut lo, &mut hi, &mut touched);
                     }
-                    OperandKind::Def => touch(v, def_pos(i), &mut start, &mut end),
+                    OperandKind::Def => touch(v, def_pos(i), &mut lo, &mut hi, &mut touched),
                     OperandKind::Mod => {
-                        touch(v, use_pos(i), &mut start, &mut end);
-                        touch(v, def_pos(i), &mut start, &mut end);
+                        touch(v, use_pos(i), &mut lo, &mut hi, &mut touched);
+                        touch(v, def_pos(i), &mut lo, &mut hi, &mut touched);
                     }
                 }
                 if let Constraint::Fixed(r) = o.constraint {
@@ -173,91 +168,116 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                 }
             }
             if let Some((dst, src)) = inst.as_move() {
-                copy_of[dst.index()] = Some(src);
+                related[dst.index()].push(src);
+                related[src.index()].push(dst);
             }
-            if inst.is_call() {
-                has_call = true;
+            if let Some((t, args)) = inst.jump_args() {
+                for (&a, &p) in args.iter().zip(&code.blocks[t].params) {
+                    related[a.index()].push(p);
+                    related[p.index()].push(a);
+                }
             }
             for r in clob.iter() {
                 clobbers[r.bit() as usize].push(def_pos(i));
             }
         }
+        for v in touched.drain(..) {
+            let s = &mut segs[v.index()];
+            let (l, h) = (lo[v.index()], hi[v.index()]);
+            // Blocks are visited in order, so segments arrive sorted; merge adjacent ones.
+            match s.last_mut() {
+                Some(last) if last.1 + 1 >= l => last.1 = last.1.max(h),
+                _ => s.push((l, h)),
+            }
+            lo[v.index()] = u32::MAX;
+            hi[v.index()] = 0;
+        }
     }
-    let _ = has_call;
 
-    let mut intervals: Vec<Interval> = (0..nv)
-        .filter(|&v| start[v] != u32::MAX)
-        .map(|v| Interval {
-            vreg: VReg(v as u32),
-            start: start[v],
-            end: end[v],
-            weight: weight[v],
-            hint: hint[v],
-            copy_of: copy_of[v],
-        })
-        .collect();
-    intervals.sort_by_key(|iv| (iv.start, iv.vreg));
+    let mut order: Vec<usize> = (0..nv).filter(|&v| !segs[v].is_empty()).collect();
+    order.sort_by_key(|&v| (segs[v][0].0, v));
 
-    // Whether register `r` is overwritten strictly inside `(s, e]`.
-    let conflicts = |r: PReg, s: u32, e: u32| -> bool {
+    // Whether register `r` is overwritten strictly inside `(s, e]` of one of `v`'s segments.
+    let clobbered = |r: PReg, v: usize| -> bool {
         let list = &clobbers[r.bit() as usize];
-        let i = list.partition_point(|&p| p <= s);
-        i < list.len() && list[i] <= e
+        segs[v].iter().any(|&(s, e)| {
+            let i = list.partition_point(|&p| p <= s);
+            i < list.len() && list[i] <= e
+        })
+    };
+    // Owners of register `r`'s segments that overlap value `v`.
+    let overlapping = |assigned: &[Vec<(u32, u32, u32)>], r: PReg, v: usize| -> Vec<u32> {
+        let list = &assigned[r.bit() as usize];
+        let mut out = Vec::new();
+        for &(s, e) in &segs[v] {
+            let mut i = list.partition_point(|x| x.1 < s);
+            while i < list.len() && list[i].0 <= e {
+                if !out.contains(&list[i].2) {
+                    out.push(list[i].2);
+                }
+                i += 1;
+            }
+        }
+        out
     };
 
-    // ----- linear scan -----
+    // ----- allocation: greedy over values in start order; registers hold disjoint segments -----
     let mut locs = vec![Loc::None; nv];
     let mut num_slots = 0u32;
     let mut used_callee_saved = RegSet::EMPTY;
-    // Active intervals per class: (end, vreg, reg, weight).
-    let mut active: [Vec<(u32, VReg, PReg, f64)>; 2] = [Vec::new(), Vec::new()];
-    for iv in &intervals {
-        let class = code.class(iv.vreg);
+    // Segments assigned to each physical register, sorted and disjoint: (start, end, vreg).
+    let mut assigned: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 64];
+    for &v in &order {
+        let class = code.class(VReg(v as u32));
         let ci = class_index(class);
-        active[ci].retain(|a| a.0 >= iv.start);
-        let busy = RegSet::of(&active[ci].iter().map(|a| a.2).collect::<Vec<_>>());
-        let free = |r: PReg| !busy.contains(r) && !conflicts(r, iv.start, iv.end);
-
-        let copy_hint = iv.copy_of.and_then(|s| match locs[s.index()] {
-            Loc::Reg(r) => Some(r),
+        let usable = |r: PReg| r.class == class && info.order[ci].contains(&r) && !clobbered(r, v);
+        let free = |assigned: &[Vec<(u32, u32, u32)>], r: PReg| {
+            usable(r) && overlapping(assigned, r, v).is_empty()
+        };
+        let related_reg = related[v].iter().find_map(|s| match locs[s.index()] {
+            Loc::Reg(r) if free(&assigned, r) => Some(r),
             _ => None,
         });
-        let choice = copy_hint
-            .filter(|&r| free(r))
-            .or(iv.hint.filter(|&r| r.class == class && info.order[ci].contains(&r) && free(r)))
-            .or_else(|| info.order[ci].iter().copied().find(|&r| free(r)));
-
-        let reg = match choice {
-            Some(r) => Some(r),
-            None => {
-                // Spill the cheapest of the current value and the active values whose register
-                // could hold the current one.
-                let victim = active[ci]
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| !conflicts(a.2, iv.start, iv.end))
-                    .min_by(|x, y| x.1 .3.total_cmp(&y.1 .3));
-                match victim {
-                    Some((vi, a)) if a.3 < iv.weight => {
-                        let (_, vv, r, _) = active[ci].remove(vi);
-                        locs[vv.index()] = Loc::Stack(num_slots);
+        let mut choice = related_reg
+            .or(hint[v].filter(|&r| free(&assigned, r)))
+            .or_else(|| info.order[ci].iter().copied().find(|&r| free(&assigned, r)));
+        if choice.is_none() {
+            // Evict the cheapest set of values occupying one register, if cheaper than `v`.
+            let best = info.order[ci]
+                .iter()
+                .copied()
+                .filter(|&r| usable(r))
+                .map(|r| {
+                    let owners = overlapping(&assigned, r, v);
+                    let cost: f64 = owners.iter().map(|&o| weight[o as usize]).sum();
+                    (r, owners, cost)
+                })
+                .min_by(|x, y| x.2.total_cmp(&y.2));
+            if let Some((r, owners, cost)) = best {
+                if cost < weight[v] {
+                    assigned[r.bit() as usize].retain(|x| !owners.contains(&x.2));
+                    for o in owners {
+                        locs[o as usize] = Loc::Stack(num_slots);
                         num_slots += 1;
-                        Some(r)
                     }
-                    _ => None,
+                    choice = Some(r);
                 }
             }
-        };
-        match reg {
+        }
+        match choice {
             Some(r) => {
-                locs[iv.vreg.index()] = Loc::Reg(r);
+                locs[v] = Loc::Reg(r);
                 if info.callee_saved.contains(r) {
                     used_callee_saved.insert(r);
                 }
-                active[ci].push((iv.end, iv.vreg, r, iv.weight));
+                let list = &mut assigned[r.bit() as usize];
+                for &(s, e) in &segs[v] {
+                    let i = list.partition_point(|x| x.0 < s);
+                    list.insert(i, (s, e, v as u32));
+                }
             }
             None => {
-                locs[iv.vreg.index()] = Loc::Stack(num_slots);
+                locs[v] = Loc::Stack(num_slots);
                 num_slots += 1;
             }
         }
