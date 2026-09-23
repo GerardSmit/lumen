@@ -5,11 +5,13 @@
 //! explicit check: anything past the committed prefix lands in the reserved tail and faults.
 //! [`install`] adds a process-wide fault handler that, for a fault inside a registered region
 //! raised by registered generated code, resumes at the trampoline exactly as a trap stub would
-//! (see [`crate::x64::trampoline`]): `rsp = [ctx + entry_sp]; ret` with `eax = code + 1`.
+//! (see [`crate::x64::trampoline`], [`crate::aarch64::trampoline`]): with `S = [ctx +
+//! entry_sp]`, the stack pointer becomes `S + 8`, the pc `[S]` and `eax` / `w0` `code + 1`.
 //!
 //! The base never moves, so native code may keep it in a register across calls and `grow` only
-//! commits more pages. Supported on x86-64 Windows and Linux; elsewhere [`install`] returns
-//! false and callers keep explicit bounds checks.
+//! commits more pages. Supported on Windows (x86-64, ARM64), Linux (x86-64, AArch64), Android
+//! (AArch64) and macOS (AArch64); elsewhere [`install`] returns false and callers keep explicit
+//! bounds checks.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -92,7 +94,9 @@ static CODE: Ranges = Ranges([EMPTY; SLOTS]);
 
 fn register(r: &Ranges, start: usize, end: usize) -> usize {
     for (i, (s, e)) in r.0.iter().enumerate() {
-        if s.compare_exchange(0, start, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        if s.compare_exchange(0, start, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             e.store(end, Ordering::Release);
             return i;
         }
@@ -107,7 +111,7 @@ fn unregister(r: &Ranges, slot: usize) {
     }
 }
 
-#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+#[allow(dead_code)] // unused on targets without a fault handler
 fn contains(r: &Ranges, addr: usize) -> bool {
     r.0.iter().any(|(s, e)| {
         let s = s.load(Ordering::Acquire);
@@ -148,8 +152,9 @@ pub fn restore_target(prev: (usize, i32, u32)) {
     TARGET.with(|t| t.set(prev));
 }
 
-/// For a fault at `pc` touching `addr`: the `(rsp, rip, rax)` to resume with, if it is ours.
-#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+/// For a fault at `pc` touching `addr`: the `(sp, pc, result register)` to resume with, if it
+/// is ours.
+#[allow(dead_code)] // unused on targets without a fault handler
 fn redirect(pc: usize, addr: usize) -> Option<(u64, u64, u64)> {
     if !contains(&REGIONS, addr) || !contains(&CODE, pc) {
         return None;
@@ -199,7 +204,13 @@ mod sys {
         VirtualFree(at, 0, MEM_RELEASE);
     }
 
+    /// `CONTEXT` offsets of the result register, stack pointer and program counter.
     #[cfg(target_arch = "x86_64")]
+    const RET_SP_PC: (usize, usize, usize) = (0x78, 0x98, 0xF8); // Rax, Rsp, Rip
+    #[cfg(target_arch = "aarch64")]
+    const RET_SP_PC: (usize, usize, usize) = (0x08, 0x100, 0x108); // X0, Sp, Pc
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     unsafe extern "system" fn handler(info: *mut [*mut u8; 2]) -> i32 {
         const CONTINUE_EXECUTION: i32 = -1;
         const CONTINUE_SEARCH: i32 = 0;
@@ -210,24 +221,23 @@ mod sys {
             return CONTINUE_SEARCH;
         }
         let addr = *(record.add(40) as *const usize);
-        // CONTEXT (x64): Rax @0x78, Rsp @0x98, Rip @0xF8.
-        let pc = *(context.add(0xF8) as *const usize);
-        match super::redirect(pc, addr) {
-            Some((rsp, rip, rax)) => {
-                *(context.add(0x78) as *mut u64) = rax;
-                *(context.add(0x98) as *mut u64) = rsp;
-                *(context.add(0xF8) as *mut u64) = rip;
+        let (ret, sp, pc) = RET_SP_PC;
+        match super::redirect(*(context.add(pc) as *const usize), addr) {
+            Some((new_sp, new_pc, new_ret)) => {
+                *(context.add(ret) as *mut u64) = new_ret;
+                *(context.add(sp) as *mut u64) = new_sp;
+                *(context.add(pc) as *mut u64) = new_pc;
                 CONTINUE_EXECUTION
             }
             None => CONTINUE_SEARCH,
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub unsafe fn install() -> bool {
         !AddVectoredExceptionHandler(1, handler as *const () as usize).is_null()
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn install() -> bool {
         false
     }
@@ -274,9 +284,17 @@ mod sys {
         munmap(at, len);
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "android", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+    ))]
     mod handler {
-        /// glibc's `struct sigaction` on x86-64.
+        /// glibc's / musl's `struct sigaction` (the same on x86-64 and AArch64).
+        #[cfg(target_os = "linux")]
         #[repr(C)]
         pub struct SigAction {
             pub sa_sigaction: usize,
@@ -284,26 +302,93 @@ mod sys {
             pub sa_flags: i32,
             pub sa_restorer: usize,
         }
+        /// Bionic's LP64 `struct sigaction`.
+        #[cfg(target_os = "android")]
+        #[repr(C)]
+        pub struct SigAction {
+            pub sa_flags: i32,
+            pub sa_sigaction: usize,
+            pub sa_mask: u64,
+            pub sa_restorer: usize,
+        }
+        /// Darwin's `struct sigaction`.
+        #[cfg(target_os = "macos")]
+        #[repr(C)]
+        pub struct SigAction {
+            pub sa_sigaction: usize,
+            pub sa_mask: u32,
+            pub sa_flags: i32,
+        }
         extern "C" {
             pub fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
         }
-        const SIGBUS: i32 = 7;
-        const SIGSEGV: i32 = 11;
-        const SA_SIGINFO: i32 = 4;
-        const SA_ONSTACK: i32 = 0x0800_0000;
-        const SA_NODEFER: i32 = 0x4000_0000;
+        #[cfg(not(target_os = "macos"))]
+        mod k {
+            pub const SIGBUS: i32 = 7;
+            pub const SIGSEGV: i32 = 11;
+            pub const SA_SIGINFO: i32 = 4;
+            pub const SA_ONSTACK: i32 = 0x0800_0000;
+            pub const SA_NODEFER: i32 = 0x4000_0000;
+        }
+        #[cfg(target_os = "macos")]
+        mod k {
+            pub const SIGBUS: i32 = 10;
+            pub const SIGSEGV: i32 = 11;
+            pub const SA_SIGINFO: i32 = 0x40;
+            pub const SA_ONSTACK: i32 = 0x1;
+            pub const SA_NODEFER: i32 = 0x10;
+        }
+        use k::*;
 
         static mut PREV: [SigAction; 2] = unsafe { std::mem::zeroed() };
 
-        unsafe extern "C" fn handler(sig: i32, info: *mut u8, uctx: *mut u8) {
+        /// The faulting address, and the saved result register (rax / x0), stack pointer and
+        /// program counter in the signal context.
+        type Frame = (usize, *mut u64, *mut u64, *mut u64);
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        unsafe fn frame(info: *mut u8, uctx: *mut u8) -> Frame {
             // siginfo_t.si_addr @16; ucontext_t.uc_mcontext.gregs @40: RAX=13, RSP=15, RIP=16.
-            let addr = *(info.add(16) as *const usize);
             let gregs = uctx.add(40) as *mut u64;
-            let pc = *gregs.add(16) as usize;
-            if let Some((rsp, rip, rax)) = super::super::redirect(pc, addr) {
-                *gregs.add(13) = rax;
-                *gregs.add(15) = rsp;
-                *gregs.add(16) = rip;
+            let addr = *(info.add(16) as *const usize);
+            (addr, gregs.add(13), gregs.add(15), gregs.add(16))
+        }
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        ))]
+        unsafe fn frame(info: *mut u8, uctx: *mut u8) -> Frame {
+            // siginfo_t.si_addr @16. The kernel's ucontext pads uc_sigmask to 128 bytes, so
+            // uc_mcontext (16-aligned) is @176: fault_address, regs[31] @+8, sp @+256, pc @+264.
+            let mc = uctx.add(176);
+            let addr = *(info.add(16) as *const usize);
+            (
+                addr,
+                mc.add(8) as *mut u64,
+                mc.add(256) as *mut u64,
+                mc.add(264) as *mut u64,
+            )
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        unsafe fn frame(info: *mut u8, uctx: *mut u8) -> Frame {
+            // siginfo_t.si_addr @24; ucontext_t.uc_mcontext is a pointer @48 to
+            // { __es (16 bytes), __ss: x[29], fp, lr, sp, pc, .. }: x0 @16, sp @264, pc @272.
+            let mc = *(uctx.add(48) as *const *mut u8);
+            let addr = *(info.add(24) as *const usize);
+            (
+                addr,
+                mc.add(16) as *mut u64,
+                mc.add(264) as *mut u64,
+                mc.add(272) as *mut u64,
+            )
+        }
+
+        unsafe extern "C" fn handler(sig: i32, info: *mut u8, uctx: *mut u8) {
+            let (addr, ret, sp, pc) = frame(info, uctx);
+            if let Some((new_sp, new_pc, new_ret)) = super::super::redirect(*pc as usize, addr) {
+                *ret = new_ret;
+                *sp = new_sp;
+                *pc = new_pc;
                 return;
             }
             // Not ours: chain to the previous handler (e.g. Rust's stack-overflow reporter).
@@ -325,22 +410,34 @@ mod sys {
         }
 
         pub unsafe fn install() -> bool {
-            let act = SigAction {
-                sa_sigaction: handler as *const () as usize,
-                sa_mask: [0; 16],
-                sa_flags: SA_SIGINFO | SA_ONSTACK | SA_NODEFER,
-                sa_restorer: 0,
-            };
+            let mut act: SigAction = std::mem::zeroed();
+            act.sa_sigaction = handler as *const () as usize;
+            act.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
             let prev = &mut *std::ptr::addr_of_mut!(PREV);
-            sigaction(SIGBUS, &act, &mut prev[0]) == 0 && sigaction(SIGSEGV, &act, &mut prev[1]) == 0
+            sigaction(SIGBUS, &act, &mut prev[0]) == 0
+                && sigaction(SIGSEGV, &act, &mut prev[1]) == 0
         }
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "android", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+    ))]
     pub unsafe fn install() -> bool {
         handler::install()
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "android", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+    )))]
     pub unsafe fn install() -> bool {
         false
     }
