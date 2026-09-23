@@ -1,0 +1,15 @@
+# Target-neutral optimizing compiler backend: a typed SSA IR, optimization passes, register
+# allocation and machine-code emitters for x86-64 and ARM64. Front ends (the JS bytecode tier in
+# `lumen`, the WebAssembly tier in `lumen-web`) build IR through `builder`; see docs/jit.md.
+[package]
+name = "lumen-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
