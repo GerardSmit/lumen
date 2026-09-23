@@ -79,7 +79,7 @@ mod tests {
             }
             'passed'
         "#;
-        for tier in [Tier::Bytecode, Tier::Jit] {
+        for tier in [Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);

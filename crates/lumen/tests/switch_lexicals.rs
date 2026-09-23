@@ -1,8 +1,8 @@
-//! Case-block lexical environments through all three execution tiers.
+//! Case-block lexical environments through both execution tiers.
 use lumen::{bytecode::Tier, Completion, Engine};
 
 fn check(source: &str) {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+    for tier in [Tier::Interp, Tier::Bytecode] {
         let mut e = Engine::new();
         e.set_tier(tier);
         e.set_tier_threshold(0);

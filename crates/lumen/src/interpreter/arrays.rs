@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn builtin_array_boundaries_preserve_reflection_growth_and_gc_edges() {
-        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn regexp_capture_arrays_keep_descriptors_indices_and_unicode_values() {
-        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);

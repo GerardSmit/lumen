@@ -48,11 +48,11 @@ fn main() {
                 false
             } else if let Some(t) = a.strip_prefix("--tier=") {
                 tier = Some(match t {
-                    "bytecode" => lumen::bytecode::Tier::Bytecode,
-                    "jit" => lumen::bytecode::Tier::Jit,
+                    // Native tier being rewritten; see docs/jit.md.
+                    "bytecode" | "jit" => lumen::bytecode::Tier::Bytecode,
                     "interp" => lumen::bytecode::Tier::Interp,
                     other => {
-                        eprintln!("error: unknown tier '{other}' (interp|bytecode|jit)");
+                        eprintln!("error: unknown tier '{other}' (interp|bytecode)");
                         std::process::exit(2);
                     }
                 });
@@ -136,11 +136,10 @@ Options:
       --module            Evaluate each file as an ES module (relative imports
                           resolve against the importing file on disk)
   -i, --interactive       Force the REPL even when stdin is not a terminal
-      --tier=TIER         Execution tier: interp | bytecode | jit
-                          (default: jit; falls back to the bytecode VM where the
-                          JIT is unavailable)
-      --tier-threshold=N  Calls before an eligible function tiers up to a
-                          compiled tier; 0 = immediately (default: 8)
+      --tier=TIER         Execution tier: interp | bytecode (default: bytecode;
+                          `jit` is accepted as an alias for bytecode)
+      --tier-threshold=N  Calls before an eligible function tiers up to the
+                          bytecode VM; 0 = immediately (default: 8)
 
 Environment:
   LUMEN_TIER=TIER         Default execution tier (--tier overrides it)
@@ -148,11 +147,6 @@ Environment:
 
 Diagnostics (env, unstable):
   LUMEN_TIER_LOG=1        Report the AST construct a compile bail came from
-  LUMEN_JIT_DUMP=SUBSTR   Dump the op stream of JIT'd chunks whose slot names match
-  LUMEN_JIT_CODEDUMP=SUB  Dump the finished machine code of matching chunks (hex)
-  LUMEN_JIT_OPSTAT=1      Tally ops that reach the JIT slow path (top at exit; =2 pinpoints sites)
-  LUMEN_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
-  LUMEN_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
 "
     );
 }

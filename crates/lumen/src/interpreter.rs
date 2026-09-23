@@ -633,7 +633,7 @@ pub struct Interp {
     pub(crate) console: Vec<String>,
     /// Current strict-mode flag (pushed/popped around function bodies).
     pub(crate) strict: bool,
-    /// Execution tier (env `LUMEN_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
+    /// Execution tier (env `LUMEN_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Bytecode` is the
     /// default; `Interp` is the reference tree-walker, opt-in via `LUMEN_TIER=interp`.
     pub(crate) tier: crate::bytecode::Tier,
     /// Calls before an eligible function tier-ups to bytecode (env `LUMEN_TIER_THRESHOLD`).
@@ -1280,10 +1280,11 @@ impl Interp {
             module_recs: Default::default(),
             module_loader: None,
             module_ns: Default::default(),
+            // "jit" (and anything unrecognized) selects bytecode: native tier being rewritten;
+            // see docs/jit.md.
             tier: match std::env::var("LUMEN_TIER").as_deref() {
                 Ok("interp") => crate::bytecode::Tier::Interp,
-                Ok("bytecode") => crate::bytecode::Tier::Bytecode,
-                _ => crate::bytecode::Tier::Jit,
+                _ => crate::bytecode::Tier::Bytecode,
             },
             tier_threshold: std::env::var("LUMEN_TIER_THRESHOLD")
                 .ok()

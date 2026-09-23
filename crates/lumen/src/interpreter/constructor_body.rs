@@ -19,7 +19,7 @@ mod tests {
     use crate::{bytecode::Tier, Completion, Engine};
 
     fn run(source: &str, compiled: &[&str]) {
-        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
