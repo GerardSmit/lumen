@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/lumen",
     "crates/lumen-cli",
+    "crates/lumen-codegen",
     "crates/lumen-difftest",
     "crates/lumen-fs",
     "crates/lumen-host",
