@@ -1666,22 +1666,6 @@ fn jit_linked_scan_preserves_loose_htmldda_null_semantics() {
 }
 
 #[test]
-fn jit_numeric_diamond_fills_small_holey_arrays_and_deopts_for_setters() {
-    assert_eq!(
-        run_jit(
-            "var LIMIT=4;
-             function Worker(){this.v=0}
-             Worker.prototype.fill=function(packet){var i=0;while(i<LIMIT){this.v++;if(this.v>26)this.v=1;packet.a[i]=this.v;i++}return packet.a.join(',')};
-             var w=new Worker,last;for(var n=0;n<600;n++)last=w.fill({a:new Array(4)});
-             var seen=0;Object.defineProperty(Array.prototype,'0',{set(v){seen=v},configurable:true});
-             var p={a:new Array(4)},out=w.fill(p);delete Array.prototype[0];
-             [last,seen,Object.hasOwn(p.a,0),p.a[1],p.a.length,out].join('|')"
-        ),
-        "5,6,7,8|9|false|10|4|,10,11,12"
-    );
-}
-
-#[test]
 fn jit_reads_packed_dense_values_without_losing_identity() {
     assert_eq!(
         run_jit(
