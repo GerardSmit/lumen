@@ -1,0 +1,208 @@
+// Executable-memory reference (NOT compiled).
+//
+// Copied verbatim on 2026-09-23 from crates/lumen/src/jit.rs (lines 126-313) at commit
+// f3ce3df ("refactor(jit): remove RegExp benchmark statement matchers"), section
+// "Executable memory (platform W^X policy)", just before the native template JIT
+// (ARM64 + x86-64 backends) was deleted. Kept so the new optimizing compiler crate can
+// reuse the platform declarations and the W^X page logic:
+//
+//   - macOS (aarch64/x86_64): one RWX MAP_JIT mapping; toggle per-thread write protection
+//     with pthread_jit_write_protect_np(0/1) around the copy, then sys_icache_invalidate.
+//   - Linux x86_64: mmap RW, copy, mprotect to R+X (no icache flush needed).
+//   - Linux aarch64: mmap RW, copy, manual D-cache clean / I-cache invalidate using the
+//     CTR_EL0 line sizes (dc cvau / dsb ish / ic ivau / dsb ish; isb), then mprotect R+X.
+//   - Windows (aarch64/x86_64): VirtualAlloc RW, copy, VirtualProtect to
+//     PAGE_EXECUTE_READ, FlushInstructionCache.
+//
+// In the original, `JitCode::drop` released the mapping with `sys::free_exec(mem, len)`
+// under a cfg covering {aarch64, x86_64} x {macos, linux, windows}; other targets had no
+// `sys` module and never produced native code.
+
+// Executable memory (platform W^X policy)
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "macos"
+))]
+mod sys {
+    extern "C" {
+        pub fn mmap(
+            addr: *mut u8,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn pthread_jit_write_protect_np(enabled: i32);
+        fn sys_icache_invalidate(start: *mut u8, len: usize);
+    }
+    const PROT_RWX: i32 = 0x1 | 0x2 | 0x4;
+    const MAP_PRIVATE_ANON_JIT: i32 = 0x0002 | 0x1000 | 0x0800;
+
+    pub unsafe fn alloc_exec(src: *const u8, len: usize) -> *mut u8 {
+        let mem = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_RWX,
+            MAP_PRIVATE_ANON_JIT,
+            -1,
+            0,
+        );
+        if mem as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        pthread_jit_write_protect_np(0);
+        std::ptr::copy_nonoverlapping(src, mem, len);
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(mem, len);
+        mem
+    }
+
+    pub unsafe fn free_exec(mem: *mut u8, len: usize) {
+        munmap(mem, len);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod sys {
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+    }
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+
+    pub unsafe fn alloc_exec(src: *const u8, len: usize) -> *mut u8 {
+        let mem = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE_ANON,
+            -1,
+            0,
+        );
+        if mem as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(src, mem, len);
+        if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 {
+            munmap(mem, len);
+            return std::ptr::null_mut();
+        }
+        mem
+    }
+
+    pub unsafe fn free_exec(mem: *mut u8, len: usize) {
+        munmap(mem, len);
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod sys {
+    use core::arch::asm;
+
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+    }
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+
+    unsafe fn flush_icache(start: *mut u8, len: usize) {
+        let ctr: usize;
+        asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack, preserves_flags));
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let iline = 4usize << (ctr & 0xf);
+        let end = start as usize + len;
+        let mut p = (start as usize) & !(dline - 1);
+        while p < end {
+            asm!("dc cvau, {p}", p = in(reg) p, options(nostack, preserves_flags));
+            p += dline;
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+        p = (start as usize) & !(iline - 1);
+        while p < end {
+            asm!("ic ivau, {p}", p = in(reg) p, options(nostack, preserves_flags));
+            p += iline;
+        }
+        asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+
+    pub unsafe fn alloc_exec(src: *const u8, len: usize) -> *mut u8 {
+        let mem = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE_ANON,
+            -1,
+            0,
+        );
+        if mem as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(src, mem, len);
+        flush_icache(mem, len);
+        if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 {
+            munmap(mem, len);
+            return std::ptr::null_mut();
+        }
+        mem
+    }
+
+    pub unsafe fn free_exec(mem: *mut u8, len: usize) {
+        munmap(mem, len);
+    }
+}
+
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "windows"
+))]
+mod sys {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn VirtualAlloc(addr: *mut u8, len: usize, kind: u32, protect: u32) -> *mut u8;
+        fn VirtualProtect(addr: *mut u8, len: usize, protect: u32, old: *mut u32) -> i32;
+        fn VirtualFree(addr: *mut u8, len: usize, kind: u32) -> i32;
+        fn FlushInstructionCache(process: *mut u8, addr: *const u8, len: usize) -> i32;
+        fn GetCurrentProcess() -> *mut u8;
+    }
+    const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    pub unsafe fn alloc_exec(src: *const u8, len: usize) -> *mut u8 {
+        let mem = VirtualAlloc(
+            std::ptr::null_mut(),
+            len,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        );
+        if mem.is_null() {
+            return mem;
+        }
+        std::ptr::copy_nonoverlapping(src, mem, len);
+        let mut old = 0;
+        if VirtualProtect(mem, len, PAGE_EXECUTE_READ, &mut old) == 0
+            || FlushInstructionCache(GetCurrentProcess(), mem, len) == 0
+        {
+            VirtualFree(mem, 0, MEM_RELEASE);
+            return std::ptr::null_mut();
+        }
+        mem
+    }
+
+    pub unsafe fn free_exec(mem: *mut u8, _len: usize) {
+        VirtualFree(mem, 0, MEM_RELEASE);
+    }
+}

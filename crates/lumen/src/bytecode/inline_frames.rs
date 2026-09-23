@@ -225,14 +225,6 @@ mod tests {
             .and_then(Option::as_ref)
             .expect("optimized caller");
         assert!(chunk.has_inline_frames());
-        #[cfg(all(
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        ))]
-        assert!(
-            chunk.jit.get().is_some_and(Option::is_some),
-            "optimized native code"
-        );
     }
 
     #[test]
