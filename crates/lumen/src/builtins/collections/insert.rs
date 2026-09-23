@@ -1,11 +1,11 @@
 //! Owned collection insertion behind the native Map/Set insertion methods.
-use crate::value::Gc;
 use super::canonicalize_map_key;
 use crate::builtins::{
     arg,
     collection_data::{CollectionData, CollectionKind},
 };
 use crate::interpreter::Interp;
+use crate::value::Gc;
 use crate::value::Value;
 
 fn data<'a>(

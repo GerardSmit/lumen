@@ -1,6 +1,6 @@
 //! Shared for-in key snapshots, including namespace checks and prototype ordering.
-use crate::value::Gc;
 use crate::interpreter::{Abrupt, Interp};
+use crate::value::Gc;
 use crate::value::Value;
 
 impl Interp {

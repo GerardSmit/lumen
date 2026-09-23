@@ -1,6 +1,5 @@
 //! Map and Set prototype methods.
 
-use crate::value::Gc;
 use super::iteration::{collection_for_each, collection_iter_kind};
 use super::{canonicalize_map_key, coll_live_len};
 use crate::builtins::collection_data::CollectionData;
@@ -8,6 +7,7 @@ use crate::builtins::{
     ab, arg, coll_ptr_kind, install_species, same_value_zero, set_to_string_tag,
 };
 use crate::interpreter::Interp;
+use crate::value::Gc;
 use crate::value::{set_builtin, NativeFn, Object, Property, Value};
 
 fn map_size(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {

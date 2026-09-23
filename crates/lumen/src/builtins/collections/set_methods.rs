@@ -1,10 +1,10 @@
 //! Set algebra and set-like protocol helpers.
 
-use crate::value::Gc;
 use super::{canonicalize_map_key, coll_live_len};
 use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::builtins::{ab, arg, coll_ptr_kind, new_from_ctor, same_value_zero};
 use crate::interpreter::Interp;
+use crate::value::Gc;
 use crate::value::{Object, Value};
 
 /// The receiver Set's values (deduped insertion order). Errors if `this` isn't a Set.

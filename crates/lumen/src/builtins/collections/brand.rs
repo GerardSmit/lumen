@@ -1,7 +1,7 @@
 //! Collection brands are internal data slots, independent of ordinary JS properties.
-use crate::value::Gc;
 use crate::builtins::collection_data::CollectionKind;
 use crate::interpreter::Interp;
+use crate::value::Gc;
 use crate::value::Value;
 
 pub(in crate::builtins) fn coll_ptr(i: &Interp, this: &Value) -> Result<usize, Value> {

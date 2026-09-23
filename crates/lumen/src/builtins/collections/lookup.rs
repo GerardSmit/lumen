@@ -1,7 +1,7 @@
 //! Borrowed collection reads behind the native Map/Set lookup methods.
-use crate::value::Gc;
 use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::interpreter::Interp;
+use crate::value::Gc;
 use crate::value::Value;
 
 pub(crate) const MAP_GET: u8 = 13;
