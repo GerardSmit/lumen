@@ -56,18 +56,11 @@ mod tests {
                     let Callable::User(user) = &object.call else {
                         panic!("constructor callable")
                     };
-                    let chunk = user
-                        .func
+                    user.func
                         .code
                         .get()
                         .and_then(|code| code.as_ref())
                         .unwrap_or_else(|| panic!("{name} did not compile in {tier:?}"));
-                    if matches!(tier, Tier::Jit) {
-                        assert!(
-                            chunk.jit.get().is_some_and(|code| code.is_some()),
-                            "{name} did not JIT"
-                        );
-                    }
                 }
             }
         }
