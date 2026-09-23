@@ -123,6 +123,8 @@ pub fn extension() -> Extension {
                     "allocGlobal" (3) => wasm_ops::op_alloc_global,
                     "instantiate" (2) => wasm_ops::op_instantiate,
                     "call" (2) => wasm_ops::op_call,
+                    "func" (1) => wasm_ops::op_func,
+                    "setErrors" (1) => wasm_ops::op_set_errors,
                     "memBuffer" (1) => wasm_ops::op_mem_buffer,
                     "memGrow" (2) => wasm_ops::op_mem_grow,
                     "tableGet" (2) => wasm_ops::op_table_get,

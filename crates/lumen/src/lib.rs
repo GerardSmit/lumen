@@ -25,6 +25,7 @@
 mod ast;
 mod bigint;
 mod builtins;
+pub mod bytebuf;
 pub mod bytecode;
 mod coroutine;
 mod eval;

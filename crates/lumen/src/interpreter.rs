@@ -778,7 +778,7 @@ pub struct Interp {
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
     /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer.
-    pub(crate) array_buffers: crate::fasthash::FastMap<usize, Vec<u8>>,
+    pub(crate) array_buffers: crate::fasthash::FastMap<usize, crate::bytebuf::ByteBuf>,
     /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
     /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
     pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
@@ -2244,25 +2244,25 @@ impl Interp {
         crate::builtins::typedarray::array_buffer_from_vec(self, bytes)
     }
 
-    /// Exchange a (non-shared, attached) `ArrayBuffer`'s backing bytes with `bytes` in O(1).
-    /// `false` when `v` is no such buffer. Views over the buffer see the new length at once, so
-    /// an embedder that borrows the bytes (e.g. wasm memory during a call) must swap them back
-    /// before JS runs again.
-    pub fn array_buffer_swap(&mut self, v: &Value, bytes: &mut Vec<u8>) -> bool {
-        let Some(o) = v.as_obj() else {
-            return false;
-        };
-        let p = Gc::as_ptr(o) as usize;
-        if self.shared_buffers.contains_key(&p) {
-            return false;
+    /// A fresh fixed-length `ArrayBuffer` viewing `len` bytes at `ptr`, kept alive by `owner`
+    /// (no copy: JS and the embedder share the bytes).
+    ///
+    /// # Safety
+    /// See [`crate::bytebuf::ByteBuf::external`].
+    pub unsafe fn make_array_buffer_external(
+        &mut self,
+        ptr: *mut u8,
+        len: usize,
+        owner: Rc<dyn std::any::Any>,
+    ) -> Value {
+        let v = self.make_array_buffer_from(Vec::new());
+        if let Value::Obj(o) = &v {
+            let p = Gc::as_ptr(o) as usize;
+            self.array_buffers
+                .insert(p, crate::bytebuf::ByteBuf::external(ptr, len, owner));
+            crate::builtins::typedarray::set_max_byte_length(o, len);
         }
-        match self.array_buffers.get_mut(&p) {
-            Some(b) => {
-                std::mem::swap(b, bytes);
-                true
-            }
-            None => false,
-        }
+        v
     }
 
     /// Detach an `ArrayBuffer`, dropping its backing store.

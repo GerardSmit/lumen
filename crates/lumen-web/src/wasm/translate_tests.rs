@@ -501,7 +501,7 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                             });
                         assert!(same, "results differ: interpreter {w:?}, native {g:x?} for {ctx}");
                         let imem = &store.memories[instance.mem_addrs[0]].bytes;
-                        assert!(*imem == nmem, "memory differs after {ctx}");
+                        assert!(imem[..] == nmem[..], "memory differs after {ctx}");
                         for (i, &ga) in instance.global_addrs.iter().enumerate() {
                             let t = match store.globals[ga].get() {
                                 Val::I32(_) | Val::F32(_) => ncells[i] & 0xffff_ffff,
@@ -534,7 +534,7 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                 (w, g) => panic!("outcomes differ: interpreter {w:?}, IR {g:?} for {ctx}"),
             }
             let imem = &store.memories[instance.mem_addrs[0]].bytes;
-            assert!(imem == env.memory(), "memory differs after {ctx}");
+            assert!(imem[..] == *env.memory(), "memory differs after {ctx}");
             for (i, &ga) in instance.global_addrs.iter().enumerate() {
                 let cell = env.rd(CELLS + 8 * i as u64);
                 let t = match store.globals[ga].get() {

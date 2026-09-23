@@ -130,8 +130,100 @@ pub struct TableEntity {
 }
 
 pub struct MemEntity {
-    pub bytes: Vec<u8>,
+    pub bytes: LinearMem,
     pub max: Option<u32>,
+}
+
+impl MemEntity {
+    /// Grow by `delta` pages; returns the previous page count, or -1 on failure.
+    pub fn grow(&mut self, delta: i32) -> i32 {
+        if delta < 0 {
+            return -1;
+        }
+        let old_pages = (self.bytes.len() / PAGE_SIZE) as u32;
+        let new_pages = old_pages.saturating_add(delta as u32);
+        if self.max.is_some_and(|max| new_pages > max) || new_pages > 65536 {
+            return -1;
+        }
+        if !self.bytes.resize(new_pages as usize * PAGE_SIZE, 0) {
+            return -1;
+        }
+        old_pages as i32
+    }
+}
+
+/// A linear memory's bytes: a prefix of a reserved address range, so the base never moves (grow
+/// commits more pages in place) and JS `ArrayBuffer`s can view it directly. When the range is the
+/// full guarded reservation and the fault handler is installed, native code needs no bounds
+/// checks ([`LinearMem::guarded`]).
+pub struct LinearMem {
+    region: std::rc::Rc<lumen_codegen::guard::Region>,
+    len: usize,
+    guarded: bool,
+}
+
+impl LinearMem {
+    pub fn new(len: usize, max_pages: Option<u32>) -> Result<LinearMem, String> {
+        use lumen_codegen::guard::{install, Region, FULL_RESERVATION};
+        let full = cfg!(target_arch = "x86_64") && install();
+        let region = full
+            .then(|| Region::reserve(FULL_RESERVATION))
+            .flatten()
+            .map(|r| (r, true))
+            .or_else(|| {
+                let max = max_pages.map_or(1 << 32, |m| m as usize * PAGE_SIZE).max(len);
+                Region::reserve(max.max(PAGE_SIZE)).map(|r| (r, false))
+            });
+        let (region, guarded) = region.ok_or("wasm: cannot reserve linear memory")?;
+        if !region.commit(len) {
+            return Err("wasm: cannot commit linear memory".into());
+        }
+        Ok(LinearMem {
+            region: std::rc::Rc::new(region),
+            len,
+            guarded,
+        })
+    }
+
+    pub fn base(&self) -> *mut u8 {
+        self.region.base()
+    }
+
+    /// Out-of-bounds accesses fault in the reserved tail (no explicit checks needed).
+    pub fn guarded(&self) -> bool {
+        self.guarded
+    }
+
+    /// Keeps the bytes alive (an `ArrayBuffer` viewing them holds one).
+    pub fn owner(&self) -> std::rc::Rc<dyn std::any::Any> {
+        self.region.clone()
+    }
+
+    /// Grow to `len` bytes (zero-filled); false when the reservation can't hold it.
+    pub fn resize(&mut self, len: usize, _fill: u8) -> bool {
+        if len > self.len {
+            if !self.region.commit(len) {
+                return false;
+            }
+            self.len = len;
+        }
+        true
+    }
+}
+
+impl std::ops::Deref for LinearMem {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the first `len` bytes are committed and owned by this memory.
+        unsafe { std::slice::from_raw_parts(self.base(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for LinearMem {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as for `deref`.
+        unsafe { std::slice::from_raw_parts_mut(self.base(), self.len) }
+    }
 }
 
 /// A global's value lives in a boxed cell, so native code can address it directly and both
@@ -660,29 +752,13 @@ impl Store {
     /// Grow the memory at store address `mem_addr` by `delta` pages; returns the previous page
     /// count, or -1 on failure.
     pub fn mem_grow(&mut self, mem_addr: usize, delta: i32) -> i32 {
-        if delta < 0 {
-            return -1;
-        }
-        let mem = &mut self.memories[mem_addr];
-        let old_pages = (mem.bytes.len() / PAGE_SIZE) as u32;
-        let new_pages = old_pages.saturating_add(delta as u32);
-        if let Some(max) = mem.max {
-            if new_pages > max {
-                return -1;
-            }
-        }
-        if new_pages > 65536 {
-            return -1;
-        }
-        mem.bytes.resize(new_pages as usize * PAGE_SIZE, 0);
-        old_pages as i32
+        self.memories[mem_addr].grow(delta)
     }
 
     pub fn alloc_memory(&mut self, min_pages: usize, max: Option<u32>) -> usize {
-        self.memories.push(MemEntity {
-            bytes: vec![0u8; min_pages * PAGE_SIZE],
-            max,
-        });
+        let bytes = LinearMem::new(min_pages * PAGE_SIZE, max)
+            .unwrap_or_else(|e| panic!("{e}"));
+        self.memories.push(MemEntity { bytes, max });
         self.memories.len() - 1
     }
     pub fn alloc_table(&mut self, min: usize, max: Option<u32>) -> usize {

@@ -9,77 +9,76 @@ use std::rc::Rc;
 use lumen_host::{Ctx, Value};
 
 use crate::wasm;
-use crate::wasm::exec::{Host, Imports, MemEntity, Store, Val, PAGE_SIZE};
+use crate::wasm::exec::{Host, Imports, MemEntity, Store, Val};
 use crate::wasm::parse::{Module, ValType};
 
-#[derive(Default)]
 pub(crate) struct WasmStore {
     next_module: u32,
     modules: HashMap<u32, Rc<Module>>,
     store: Store,
     /// Imported JS callbacks, indexed by the host id stored in `FuncEntity::Host`.
     host_funcs: Vec<Value>,
-    /// Memories JS has seen a `buffer` for. Their bytes live in that ArrayBuffer and are lent to
-    /// the store (an O(1) `Vec` swap, never a copy) only while wasm runs.
+    /// Memories JS has seen a `buffer` for: each buffer views the memory's bytes in place.
     bufs: Vec<MemBuf>,
+    /// While wasm runs (and the store is moved out), the memories an import may grow.
+    active_mems: *mut [MemEntity],
+    /// The JS `WebAssembly.RuntimeError` constructor (registered by the JS glue).
+    runtime_error: Value,
+}
+
+impl Default for WasmStore {
+    fn default() -> WasmStore {
+        WasmStore {
+            next_module: 0,
+            modules: HashMap::new(),
+            store: Store::default(),
+            host_funcs: Vec::new(),
+            bufs: Vec::new(),
+            active_mems: std::ptr::slice_from_raw_parts_mut(std::ptr::null_mut(), 0),
+            runtime_error: Value::Undefined,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct MemBuf {
     addr: usize,
     buf: Value,
-    /// The buffer's length; a lent memory that comes back a different size (grown) gets a new
-    /// buffer and the old one is detached, as `memory.grow` requires.
+    /// The length the buffer views; when the memory grows, the buffer is replaced by a longer
+    /// view and detached, as `memory.grow` requires.
     len: usize,
-    max: Option<u32>,
 }
 
-fn bufs(ctx: &mut Ctx) -> Vec<MemBuf> {
-    ctx.host_mut::<WasmStore>()
-        .map(|ws| ws.bufs.clone())
-        .unwrap_or_default()
+fn view(ctx: &mut Ctx, m: &MemEntity) -> Value {
+    // SAFETY: the view is kept alive by the region's owner and never outlives its length:
+    // memories only grow, and a grown memory gets a new view.
+    unsafe { ctx.make_array_buffer_external(m.bytes.base(), m.bytes.len(), m.bytes.owner()) }
 }
 
-/// Move every bound memory's bytes from its ArrayBuffer into `mems` (before wasm runs).
-fn lend(ctx: &mut Ctx, mems: &mut [MemEntity]) {
-    for b in bufs(ctx) {
-        if let Some(m) = mems.get_mut(b.addr) {
-            ctx.array_buffer_swap(&b.buf, &mut m.bytes);
+/// Replace the buffers of memories whose length changed (after wasm ran or grew them).
+fn refresh(ctx: &mut Ctx, mems: &[MemEntity]) {
+    let bufs = ctx.host_mut::<WasmStore>().expect("wasm store").bufs.clone();
+    for (i, b) in bufs.into_iter().enumerate() {
+        let Some(m) = mems.get(b.addr) else { continue };
+        if m.bytes.len() != b.len {
+            ctx.array_buffer_detach(&b.buf);
+            let buf = view(ctx, m);
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            ws.bufs[i] = MemBuf {
+                addr: b.addr,
+                buf,
+                len: m.bytes.len(),
+            };
         }
     }
 }
 
-/// Move the bytes back into the ArrayBuffers (before JS runs); a resized memory gets a fresh
-/// buffer.
-fn reclaim(ctx: &mut Ctx, mems: &mut [MemEntity]) {
-    for (i, b) in bufs(ctx).into_iter().enumerate() {
-        let Some(m) = mems.get_mut(b.addr) else {
-            continue;
-        };
-        if m.bytes.len() == b.len {
-            ctx.array_buffer_swap(&b.buf, &mut m.bytes);
-        } else {
-            rebind(ctx, i, &b.buf, std::mem::take(&mut m.bytes));
-        }
-    }
-}
-
-/// Detach binding `i`'s buffer and give it a new one owning `bytes`.
-fn rebind(ctx: &mut Ctx, i: usize, old: &Value, bytes: Vec<u8>) {
-    ctx.array_buffer_detach(old);
-    let len = bytes.len();
-    let buf = ctx.make_array_buffer_from(bytes);
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    ws.bufs[i].buf = buf;
-    ws.bufs[i].len = len;
-}
-
-/// Run `f` on the store with every bound memory lent to it.
+/// Run `f` on the store (moved out of OpState, so imports can re-enter JS), then refresh the
+/// memory buffers.
 fn with_store<R>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx, &mut Store) -> R) -> R {
     let mut store = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").store);
-    lend(ctx, &mut store.memories);
     let r = f(ctx, &mut store);
-    reclaim(ctx, &mut store.memories);
+    refresh(ctx, &store.memories);
     ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
     r
 }
@@ -138,9 +137,11 @@ impl Host for CtxHost<'_> {
         results: &[ValType],
         mems: &mut [MemEntity],
     ) -> Result<Vec<Val>, String> {
-        reclaim(self.ctx, mems);
+        refresh(self.ctx, mems);
+        let ws = self.ctx.host_mut::<WasmStore>().expect("wasm store");
+        let prev = std::mem::replace(&mut ws.active_mems, mems);
         let r = self.call_js(id, args, results);
-        lend(self.ctx, mems);
+        self.ctx.host_mut::<WasmStore>().expect("wasm store").active_mems = prev;
         r
     }
 }
@@ -432,63 +433,120 @@ pub(crate) fn op_call(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
     Ok(ctx.make_array(js))
 }
 
+/// `(RuntimeError)`: register the constructor wasm traps are thrown as.
+pub(crate) fn op_set_errors(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let ctor = a.first().cloned().unwrap_or(Value::Undefined);
+    ctx.host_mut::<WasmStore>().expect("wasm store").runtime_error = ctor;
+    Ok(Value::Undefined)
+}
+
+/// `(funcAddr) -> function`: the store function as a native JS function — arguments convert
+/// straight from the call, a single result comes back as a value (none: `undefined`, several:
+/// an array), and traps throw `WebAssembly.RuntimeError`.
+pub(crate) fn op_func(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let func_addr = num(a, 0) as usize;
+    let ty = {
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        match ws.store.funcs.get(func_addr) {
+            Some(f) => f.ty().clone(),
+            None => return Err(ctx.make_error("Error", "wasm: bad function address")),
+        }
+    };
+    let arity = ty.params.len();
+    let f = move |ctx: &mut Ctx, _this: Value, args: &[Value]| -> Result<Value, Value> {
+        let vals = ty
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| js_to_val(ctx, args.get(i).unwrap_or(&Value::Undefined), t))
+            .collect();
+        let results = run_func_js(ctx, func_addr, vals)?;
+        Ok(match results.len() {
+            0 => Value::Undefined,
+            1 => val_to_js(results[0]),
+            _ => {
+                let js = results.into_iter().map(val_to_js).collect();
+                ctx.make_array(js)
+            }
+        })
+    };
+    Ok(ctx.new_native_fn(&func_addr.to_string(), arity, std::rc::Rc::new(f)))
+}
+
+/// [`run_func`], with a trap thrown as a `WebAssembly.RuntimeError`.
+fn run_func_js(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Val>, Value> {
+    let host_funcs = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").host_funcs);
+    let (result, host_err) = with_store(ctx, |ctx, store| {
+        let mut host = CtxHost {
+            ctx,
+            host_funcs: &host_funcs,
+            error: None,
+        };
+        let r = store.invoke(func_addr, args, &mut host, 0);
+        (r, host.error)
+    });
+    ctx.host_mut::<WasmStore>().expect("wasm store").host_funcs = host_funcs;
+    result.map_err(|msg| {
+        host_err.unwrap_or_else(|| {
+            let ctor = ctx.host_mut::<WasmStore>().expect("wasm store").runtime_error.clone();
+            ctx.construct_value(ctor, &[Value::from_string(msg.clone())])
+                .unwrap_or_else(|_| ctx.make_error("Error", format!("RuntimeError: {msg}")))
+        })
+    })
+}
+
 // ---- memory / table / global accessors (by store address) -------------------------------------
 
-/// `(memAddr) -> ArrayBuffer`: the memory's buffer, binding it on first use (the bytes move out
-/// of the store into the buffer, which owns them from then on).
+/// `(memAddr) -> ArrayBuffer`: a view of the memory's bytes (no copy), stable until it grows.
 pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let addr = num(a, 0) as usize;
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
     if let Some(b) = ws.bufs.iter().find(|b| b.addr == addr) {
         return Ok(b.buf.clone());
     }
-    let Some(m) = ws.store.memories.get_mut(addr) else {
-        return Err(ctx.make_error("Error", "wasm: bad memory address"));
+    let store = std::mem::take(&mut ws.store);
+    let r = match store.memories.get(addr) {
+        Some(m) => {
+            let buf = view(ctx, m);
+            let len = m.bytes.len();
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            ws.bufs.push(MemBuf {
+                addr,
+                buf: buf.clone(),
+                len,
+            });
+            Ok(buf)
+        }
+        None => Err(ctx.make_error("Error", "wasm: bad memory address")),
     };
-    let (bytes, max) = (std::mem::take(&mut m.bytes), m.max);
-    let len = bytes.len();
-    let buf = ctx.make_array_buffer_from(bytes);
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    ws.bufs.push(MemBuf {
-        addr,
-        buf: buf.clone(),
-        len,
-        max,
-    });
-    Ok(buf)
+    ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
+    r
 }
 
-/// `(memAddr, delta) -> previous pages | -1`. A bound memory grows in its buffer (so this also
-/// works from inside an import, while the store is out); the old buffer is detached.
+/// `(memAddr, delta) -> previous pages | -1`. Works from inside an import too (the memories are
+/// reached through `active_mems` while the store is moved out).
 pub(crate) fn op_mem_grow(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let addr = num(a, 0) as usize;
     let delta = num(a, 1);
+    let delta = if (0.0..=65536.0).contains(&delta) { delta as i32 } else { -1 };
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    let Some(i) = ws.bufs.iter().position(|b| b.addr == addr) else {
-        if addr >= ws.store.memories.len() {
-            return Err(ctx.make_error("Error", "wasm: bad memory address"));
-        }
-        let delta = if (0.0..=65536.0).contains(&delta) {
-            delta as i32
-        } else {
-            -1
-        };
-        return Ok(Value::Num(ws.store.mem_grow(addr, delta) as f64));
+    let active = ws.active_mems;
+    // SAFETY: `active_mems` is set only while an import runs, and points at the running store's
+    // memories, which no one else borrows until the import returns.
+    let mems: &mut [MemEntity] = if active.is_null() || ws.store.memories.len() > addr {
+        &mut ws.store.memories
+    } else {
+        unsafe { &mut *active }
     };
-    let b = ws.bufs[i].clone();
-    let old = (b.len / PAGE_SIZE) as f64;
-    let new = old + delta;
-    let max = b.max.map_or(65536.0, |m| m as f64);
-    if !(delta >= 0.0 && new <= max && new <= 65536.0) {
-        return Ok(Value::Num(-1.0));
-    }
-    if delta > 0.0 {
-        let mut bytes = Vec::new();
-        ctx.array_buffer_swap(&b.buf, &mut bytes);
-        bytes.resize(new as usize * PAGE_SIZE, 0);
-        rebind(ctx, i, &b.buf, bytes);
-    }
-    Ok(Value::Num(old))
+    let Some(m) = mems.get_mut(addr) else {
+        return Err(ctx.make_error("Error", "wasm: bad memory address"));
+    };
+    let r = m.grow(delta);
+    let mems: &[MemEntity] = if active.is_null() { &[] } else { unsafe { &*active } };
+    let store = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").store);
+    refresh(ctx, if mems.is_empty() { &store.memories } else { mems });
+    ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
+    Ok(Value::Num(r as f64))
 }
 
 pub(crate) fn op_table_get(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {

@@ -10,6 +10,7 @@ pub mod eval;
 pub mod interp;
 pub mod ir;
 pub mod jitmem;
+pub mod guard;
 pub mod legalize;
 pub mod machinst;
 pub mod opt;
