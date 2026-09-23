@@ -229,16 +229,24 @@ fn compile(chunk: &Chunk, header: usize, backedge: usize, slots: &[Value]) -> Re
     })
 }
 
-/// x86-64: machine code in executable memory.
-#[cfg(target_arch = "x86_64")]
+/// x86-64 and AArch64: machine code in executable memory. iOS forbids runtime code generation,
+/// so it keeps the interpreter (and later, ahead-of-time code in `.text`).
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", not(target_os = "ios"))
+))]
 fn emit(
     func: &lumen_codegen::Function,
     header: usize,
     backedge: usize,
 ) -> Result<(Box<dyn std::any::Any>, NativeFn), String> {
-    let cfg = lumen_codegen::x64::Config::host(None);
-    let compiled = lumen_codegen::x64::compile(func, &cfg)?;
-    let (mem, addrs) = lumen_codegen::x64::load(&[compiled], |id, _| helpers::address(id))?;
+    #[cfg(target_arch = "x86_64")]
+    use lumen_codegen::x64 as native;
+    #[cfg(target_arch = "aarch64")]
+    use lumen_codegen::aarch64 as native;
+    let cfg = native::Config::host(None);
+    let compiled = native::compile(func, &cfg)?;
+    let (mem, addrs) = native::load(&[compiled], |id, _| helpers::address(id))?;
     if let Some(dir) = std::env::var_os("LUMEN_JIT_DUMP") {
         let path = std::path::Path::new(&dir).join(format!("loop_{header}_{backedge}.bin"));
         // SAFETY: `mem` holds `mem.len()` initialized bytes.
@@ -272,7 +280,11 @@ fn emit(
     Ok((Box::new(()), entry))
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "wasm32",
+    all(target_arch = "aarch64", not(target_os = "ios"))
+)))]
 fn emit(
     _func: &lumen_codegen::Function,
     _header: usize,
@@ -281,11 +293,23 @@ fn emit(
     Err("no JIT backend for this target".into())
 }
 
+/// The interpreter's inline per-backedge check: bump the chunk's tick counter and report whether
+/// [`on_backedge`] has anything to do (native code exists, or a tick boundary to look for a
+/// compile). Keeps the out-of-line hook's call off the interpreter's loop path.
+#[inline(always)]
+pub(super) fn backedge_due(chunk: &Chunk) -> bool {
+    let jit = &chunk.jit;
+    let t = jit.ticks.get().wrapping_add(1);
+    jit.ticks.set(t);
+    t & TICK_MASK == 0 || jit.has_code.get() || eager()
+}
+
 /// The hook at a backward `Jump` from `backedge` to `header`; `*pc == header` (the interpreter
 /// is about to continue there). Returns `Ok(None)` to keep interpreting at `*pc` (which moved
 /// if native code ran part of the loop), `Ok(Some(step))` when the function returned, or a throw.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
+#[cold]
 pub(super) fn on_backedge(
     i: &mut Interp,
     chunk: &Chunk,
@@ -300,9 +324,8 @@ pub(super) fn on_backedge(
     let jit = &chunk.jit;
     // `LUMEN_JIT_EAGER` compiles at the first backedge (stress testing: every loop runs
     // natively as soon as possible).
-    let t = if eager() { 0 } else { jit.ticks.get().wrapping_add(1) };
-    jit.ticks.set(t);
-    if !stack.is_empty() || (!jit.has_code.get() && t & TICK_MASK != 0) || !jit_enabled() {
+    let t = if eager() { 0 } else { jit.ticks.get() };
+    if !stack.is_empty() || !jit_enabled() {
         return Ok(None);
     }
     let native = {
