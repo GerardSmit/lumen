@@ -175,8 +175,11 @@ fn parse_script_inner(
 
 /// A large parse leaves the token vector and char buffer (≈12 bytes per source byte) freed but
 /// resident; hand the pages back so a bundle load does not set the process's high-water mark.
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 fn release_parse_scratch(src_len: usize) {
     const BIG_PARSE: usize = 256 * 1024;
+    // wasm32 has no `fastalloc` (the page allocator is the module's linear memory).
+    #[cfg(not(target_arch = "wasm32"))]
     if src_len >= BIG_PARSE {
         crate::fastalloc::trim();
     }

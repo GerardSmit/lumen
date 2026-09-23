@@ -17,7 +17,8 @@
 
 use std::fmt;
 
-/// A value's type. Pointers are `I64`.
+/// A value's type. Pointers are `I64` on native targets and `I32` or `I64` on wasm32 (see
+/// [`crate::wasm::Config::ptr32`]); an `I32` address is zero-extended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     I32,
@@ -344,7 +345,7 @@ pub enum InstData {
         to: Type,
         arg: Value,
     },
-    /// Load from the raw address `addr + offset` (`addr` is I64).
+    /// Load from the raw address `addr + offset` (`addr` is I64, or I32 on wasm32).
     Load {
         kind: MemKind,
         addr: Value,
@@ -362,7 +363,8 @@ pub enum InstData {
         func: FuncRef,
         args: Vec<Value>,
     },
-    /// Call the function at address `callee` (I64) with signature `sig`.
+    /// Call the function at address `callee` (I64, or an I32 table index on wasm32) with
+    /// signature `sig`.
     CallIndirect {
         sig: SigRef,
         callee: Value,

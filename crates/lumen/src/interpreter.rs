@@ -686,8 +686,7 @@ pub struct Interp {
     /// through a site's normal polymorphic ways, so tying a pin to a physical cache cell would
     /// break when `ic_insert` demotes that state. The Weak prevents allocator ABA while any
     /// cached state compares the encoded raw prototype address.
-    pub(crate) creation_pins:
-        crate::fasthash::FastMap<usize, crate::value::WeakGc>,
+    pub(crate) creation_pins: crate::fasthash::FastMap<usize, crate::value::WeakGc>,
     /// The coroutine body currently executing through this interpreter (0 = the main driver);
     /// stamps `FnFrame::coro` so a dead worker's frames can be evicted precisely.
     pub(crate) cur_coro: u32,

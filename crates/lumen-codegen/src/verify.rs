@@ -119,6 +119,14 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
             Err(format!("{v} is {:?}, expected {t:?}", ty(v)))
         }
     };
+    // Pointer width is the front end's choice: I64 for native targets, I32 for wasm32.
+    let want_ptr = |v: Value| {
+        if ty(v).is_int() {
+            Ok(())
+        } else {
+            Err(format!("{v} is {:?}, expected an I32 or I64 address", ty(v)))
+        }
+    };
     match data {
         InstData::Iconst { ty: t, imm } => {
             if !t.is_int() {
@@ -177,9 +185,9 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
             };
             if ok { Ok(()) } else { Err(format!("{op:?} {from:?} -> {to:?}")) }
         }
-        InstData::Load { addr, .. } => want(*addr, Type::I64),
+        InstData::Load { addr, .. } => want_ptr(*addr),
         InstData::Store { kind, addr, value, .. } => {
-            want(*addr, Type::I64)?;
+            want_ptr(*addr)?;
             want(*value, kind.ty())
         }
         InstData::Call { func: f, args } => {
@@ -187,7 +195,7 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
             check_args(func, &sig.params, args)
         }
         InstData::CallIndirect { sig, callee, args } => {
-            want(*callee, Type::I64)?;
+            want_ptr(*callee)?;
             check_args(func, &func.sigs[sig.index()].params, args)
         }
         InstData::TrapIf { cond, .. } => want(*cond, Type::I32),

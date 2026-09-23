@@ -115,6 +115,77 @@ pub(crate) fn f64_exact_i32(f: f64) -> bool {
 /// `elems` hole marker (also caps how many entries dense slots can address).
 pub(super) const NO_SLOT: u32 = u32::MAX;
 
+/// Byte offsets the optimizing tier's inline element / `length` reads rely on
+/// (`bytecode::jit::layout`): `offset_of!` facts plus one measured `Rc<Shape>` distance (std's
+/// `Rc` layout is not public). `props_*` are relative to the `Props`, `dense_*` to the
+/// `DenseBuffers` the sidecar word points at.
+pub(crate) struct PropsLayout {
+    /// `EntryVec` pointer / `u32` length / `u32` capacity (capacity 0 with a length = shared,
+    /// read-only block).
+    pub entries_ptr: usize,
+    pub entries_len: usize,
+    pub entries_cap: usize,
+    /// The `u32` shape id.
+    pub shape: usize,
+    /// `Option<Rc<Shape>>`: one word, null = the empty shape.
+    pub shape_rc: usize,
+    /// From the `Rc<Shape>` handle word to the shape's `u32` `len_slot` memo.
+    pub shape_len_slot: usize,
+    /// The sidecar: one word, null = no `DenseBuffers`.
+    pub elems: usize,
+    /// `Option<Box<Vec<Property>>>`: one word, null = not boxed-packed.
+    pub dense_packed: usize,
+    /// `InlinePacked`'s `u8` length and its slot array.
+    pub dense_inline_len: usize,
+    pub dense_inline_slots: usize,
+    /// `Vec<u32>` slot map and `Vec<f64>` mirror (their inner layout is probed by the caller).
+    pub dense_elems: usize,
+    pub dense_mirror: usize,
+    /// `u8` mirror flags.
+    pub dense_mirror_flags: usize,
+}
+
+const _: () = {
+    // Each is one nullable pointer word.
+    assert!(std::mem::size_of::<Option<Rc<Shape>>>() == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<DenseStorage>() == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<Option<Box<Vec<Property>>>>() == std::mem::size_of::<usize>());
+};
+
+/// See [`PropsLayout`]. `None` when the `Rc<Shape>` probe is inconclusive.
+pub(crate) fn jit_props_layout() -> Option<PropsLayout> {
+    use std::mem::offset_of;
+    // Measure handle word → `len_slot` on a real one-key shape whose `length` sits at slot 0.
+    let mut probe = Props::new();
+    probe.insert("length", Property::plain(Value::Num(0.0)));
+    let rc = probe.shape_rc.as_ref()?;
+    if rc.len_slot != 0 {
+        return None;
+    }
+    let word = unsafe { *(rc as *const Rc<Shape> as *const usize) };
+    let shape_len_slot = (std::ptr::addr_of!(rc.len_slot) as usize).wrapping_sub(word);
+    if shape_len_slot > 4096 {
+        return None;
+    }
+    Some(PropsLayout {
+        entries_ptr: offset_of!(Props, entries) + entries::ENTRY_VEC_PTR,
+        entries_len: offset_of!(Props, entries) + entries::ENTRY_VEC_LEN,
+        entries_cap: offset_of!(Props, entries) + entries::ENTRY_VEC_CAP,
+        shape: offset_of!(Props, shape),
+        shape_rc: offset_of!(Props, shape_rc),
+        shape_len_slot,
+        elems: offset_of!(Props, elems),
+        dense_packed: offset_of!(storage::DenseBuffers, packed),
+        dense_inline_len: offset_of!(storage::DenseBuffers, inline_packed)
+            + offset_of!(storage::InlinePacked, len),
+        dense_inline_slots: offset_of!(storage::DenseBuffers, inline_packed)
+            + offset_of!(storage::InlinePacked, slots),
+        dense_elems: offset_of!(storage::DenseBuffers, elems),
+        dense_mirror: offset_of!(storage::DenseBuffers, mirror),
+        dense_mirror_flags: offset_of!(storage::DenseBuffers, mirror_flags),
+    })
+}
+
 impl std::fmt::Debug for FnMaps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FnMaps")

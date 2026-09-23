@@ -1430,6 +1430,7 @@ mod props;
 pub(crate) use props::FnMaps;
 pub use props::Props;
 pub(crate) use props::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
+pub(crate) use props::{jit_props_layout, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK};
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).
 #[inline(always)]
@@ -1535,4 +1536,53 @@ pub fn f64_to_f16(value: f64) -> u16 {
         h = h.wrapping_add(1); // carry into exponent is intentional
     }
     sign | h
+}
+
+// ----- layout facts for the optimizing tier's inline reads (`bytecode::jit::layout`) ---------
+
+/// Byte offset of a [`Property`]'s NaN-boxed value word.
+pub(crate) const PROPERTY_PACKED_OFFSET: usize = std::mem::offset_of!(Property, packed);
+/// Byte offset of a [`Property`]'s flag / accessor-pointer word.
+pub(crate) const PROPERTY_META_OFFSET: usize = std::mem::offset_of!(Property, meta);
+
+/// `(object, borrow flag)`: byte offsets from a `Gc` handle word (the `GcBox` address) to the
+/// `Object` inside its `RefCell` and to that `RefCell`'s borrow counter (an `isize`: 0 = free,
+/// > 0 = shared borrows, < 0 = mutably borrowed). std's `RefCell` field order is not public, so
+/// both are measured once from a real cell; `None` when the probe is inconclusive.
+pub(crate) fn jit_gc_offsets() -> Option<(usize, usize)> {
+    static OFFSETS: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *OFFSETS.get_or_init(|| {
+        // Never dropped: `Object::drop` would decrement a live count this object never joined.
+        // Its parts own no allocation (empty props, no call target), so nothing leaks.
+        let cell = std::mem::ManuallyDrop::new(RefCell::new(Object {
+            proto: None,
+            props: Props::new(),
+            call: Callable::None,
+            exotic: Exotic::None,
+            extensible: true,
+            ic_plain: Cell::new(true),
+            is_constructor: false,
+            gc_internal: Cell::new(0),
+        }));
+        let base = &*cell as *const RefCell<Object> as usize;
+        let value = cell.as_ptr() as usize - base;
+        const W: usize = std::mem::size_of::<isize>();
+        let words = std::mem::size_of::<RefCell<Object>>() / W;
+        let read = |w: usize| unsafe { std::ptr::read_volatile((base + w * W) as *const isize) };
+        let outside =
+            |w: usize| w * W + W <= value || w * W >= value + std::mem::size_of::<Object>();
+        let free: Vec<usize> = (0..words).filter(|&w| outside(w) && read(w) == 0).collect();
+        let shared: Vec<usize> = {
+            let _r = cell.borrow();
+            free.iter().copied().filter(|&w| read(w) == 1).collect()
+        };
+        let excl: Vec<usize> = {
+            let _w = cell.borrow_mut();
+            shared.iter().copied().filter(|&w| read(w) < 0).collect()
+        };
+        match excl[..] {
+            [w] => Some((GC_VALUE_OFFSET + value, GC_VALUE_OFFSET + w * W)),
+            _ => None,
+        }
+    })
 }

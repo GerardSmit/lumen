@@ -627,6 +627,8 @@ pub struct Chunk {
     /// `Chunk` is shared across calls via `Rc`, so these persist. `Cell` is fine: the VM runs one
     /// thread at a time (coroutine ping-pong), like the rest of the engine's shared-`Rc` state.
     caches: Vec<std::cell::Cell<IcState>>,
+    /// Optimizing-tier state: loop hotness and native code (see [`jit`]).
+    jit: jit::ChunkJit,
     /// One pre-shaped `Props` template per plain object-literal site (`Op::MakeObject`'s third
     /// operand indexes this; `u32::MAX` = duplicate keys, take the insert path). Built on first
     /// execution, cloned per instance — key hashing and shape transitions paid once per SITE.
@@ -1759,6 +1761,7 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
             .map(|_| std::cell::OnceCell::new())
             .collect(),
         caches: c.caches,
+        jit: Default::default(),
         name_pins: std::cell::RefCell::new(vec![None; c.name_caches.len()]),
         name_paths: (0..c.name_caches.len())
             .map(|_| std::cell::RefCell::new(None))
@@ -3881,7 +3884,7 @@ fn drive_vm(
     loop {
         let outcome = match pending_throw.take() {
             Some(e) => Err(Abrupt::Throw(e)),
-            None => run_vm(i, chunk, env, slots, stack, pc, this_val, handlers),
+            None => run_vm::<false>(i, chunk, env, slots, stack, pc, this_val, handlers),
         };
         match outcome {
             Ok(step) => return Ok(step),
@@ -3902,8 +3905,13 @@ fn drive_vm(
 /// Run from `*pc` until the body returns (`Done`), suspends at an `await` (`Await`, async bodies
 /// only), or throws (`Err(Abrupt::Throw)`, caught by [`drive_vm`]). Operates on borrowed state so an
 /// async [`VmCoro`] can save it at a suspension and restore it on resume.
+///
+/// `ONE = true` executes exactly the op at `*pc` and returns `Ok(VmStep::Done(Value::Empty))`
+/// (the optimizing tier's generic fallback, `jit::helpers::generic`, which never feeds it an op
+/// that returns or awaits). The check sits at the loop head so arms that `continue` stop too, and
+/// it compiles away in the interpreter's `ONE = false` instantiation.
 #[allow(clippy::too_many_arguments)]
-fn run_vm(
+fn run_vm<const ONE: bool>(
     i: &mut Interp,
     chunk: &Chunk,
     env: &Env,
@@ -3918,7 +3926,14 @@ fn run_vm(
             stack.pop().expect("vm stack underflow")
         };
     }
+    let mut stepped = false;
     loop {
+        if ONE {
+            if stepped {
+                return Ok(VmStep::Done(Value::Empty));
+            }
+            stepped = true;
+        }
         let op = chunk.ops[*pc];
         *pc += 1;
         match op {
@@ -4530,6 +4545,14 @@ fn run_vm(
                 // collector and the embedder's interrupt.
                 if (t as usize) < *pc {
                     i.gc_check_amortized()?;
+                    let backedge = *pc - 1;
+                    *pc = t as usize;
+                    if let Some(step) =
+                        jit::on_backedge(i, chunk, env, slots, stack, pc, this_val, backedge)?
+                    {
+                        return Ok(step);
+                    }
+                    continue;
                 }
                 *pc = t as usize
             }
