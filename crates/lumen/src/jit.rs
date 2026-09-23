@@ -480,11 +480,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_get_prop as *const () as usize,
         crate::bytecode::jit_intrinsic as *const () as usize,
         crate::bytecode::jit_new as *const () as usize,
-        crate::bytecode::jit_regexp_exec_loop as *const () as usize,
         crate::bytecode::jit_add_strings as *const () as usize,
-        crate::bytecode::jit_regexp_literal_exec_discard as *const () as usize,
-        crate::bytecode::jit_regexp_literal_replace_discard as *const () as usize,
-        crate::bytecode::jit_regexp_literal_match_discard as *const () as usize,
         crate::bytecode::jit_instanceof as *const () as usize,
         crate::bytecode::jit_make_array as *const () as usize,
         crate::bytecode::jit_set_elem as *const () as usize,
@@ -525,30 +521,26 @@ pub const H_GET_PROP: usize = 12;
 pub const H_INTRINSIC: usize = 13;
 /// Dedicated `Op::New` entry: constructor-cache probe and dispatch without generic op decode.
 pub const H_NEW: usize = 14;
-pub const H_REGEXP_EXEC_LOOP: usize = 15;
-pub const H_ADD_STRINGS: usize = 16;
-pub const H_REGEXP_LITERAL_EXEC_DISCARD: usize = 17;
-pub const H_REGEXP_LITERAL_REPLACE_DISCARD: usize = 18;
-pub const H_REGEXP_LITERAL_MATCH_DISCARD: usize = 19;
-pub const H_INSTANCEOF: usize = 20;
+pub const H_ADD_STRINGS: usize = 15;
+pub const H_INSTANCEOF: usize = 16;
 /// Dedicated `Op::MakeArray` entry: moves stack values directly into dense storage.
-pub const H_MAKE_ARRAY: usize = 21;
+pub const H_MAKE_ARRAY: usize = 17;
 /// Dedicated element-store entry for dense misses and fresh indexed writes.
-pub const H_SET_ELEM: usize = 22;
+pub const H_SET_ELEM: usize = 18;
 /// Drop a NaN-boxed property value at a validated address.
-pub const H_DROP_PACKED_AT: usize = 23;
+pub const H_DROP_PACKED_AT: usize = 19;
 /// Strict equality misses after the generated fast path: handles content comparison and
 /// last-owner destruction without entering the generic bytecode decoder.
-pub const H_STRICT_EQ: usize = 24;
+pub const H_STRICT_EQ: usize = 20;
 /// Fresh RegExp-literal allocation using the chunk's immutable compiled-program cache.
-pub const H_MAKE_REGEXP: usize = 25;
+pub const H_MAKE_REGEXP: usize = 21;
 
-pub const H_LOAD_CACHED_NAME: usize = 26;
-pub const H_COLLECTION_LOOKUP: usize = 27;
-pub const H_COLLECTION_MAP_SET: usize = 28;
-pub const H_COLLECTION_SET_ADD: usize = 29;
-pub const H_INLINE_CLOSURE: usize = 30;
-pub const N_HELPERS: usize = 31;
+pub const H_LOAD_CACHED_NAME: usize = 22;
+pub const H_COLLECTION_LOOKUP: usize = 23;
+pub const H_COLLECTION_MAP_SET: usize = 24;
+pub const H_COLLECTION_SET_ADD: usize = 25;
+pub const H_INLINE_CLOSURE: usize = 26;
+pub const N_HELPERS: usize = 27;
 
 /// ARM64 condition codes used by the inline templates.
 #[cfg(all(
@@ -1324,97 +1316,6 @@ mod asm {
 // Compilation
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_exec_loop_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::{Op, UpdKind};
-    let [Op::LoadLocal(local0), Op::Const(_), Op::Lt, Op::JumpIfFalse(exit), Op::LoadName(..), Op::GetMethod(..), Op::LoadName(..), Op::LoadLocal(local1), Op::GetElem, Op::CallWithThis(1, _), Op::Pop, Op::UpdateLocal(local2, UpdKind::IncDiscard), Op::Jump(back)] =
-        ops.get(pc..pc + 13)?
-    else {
-        return None;
-    };
-    (*local0 == *local1 && *local0 == *local2 && *back as usize == pc && *exit as usize == pc + 13)
-        .then_some(*exit as usize)
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_literal_exec_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::Op;
-    if matches!(
-        ops.get(pc..pc + 7),
-        Some([
-            Op::MakeRegExp(..),
-            Op::GetMethod(..),
-            Op::LoadName(..),
-            Op::LoadLocal(..),
-            Op::GetElem,
-            Op::CallWithThis(1, _),
-            Op::Pop
-        ])
-    ) {
-        return Some(pc + 7);
-    }
-    matches!(
-        ops.get(pc..pc + 5),
-        Some([
-            Op::MakeRegExp(..),
-            Op::GetMethod(..),
-            Op::Const(..),
-            Op::CallWithThis(1, _),
-            Op::Pop
-        ])
-    )
-    .then_some(pc + 5)
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_literal_replace_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::Op;
-    matches!(
-        ops.get(pc..pc + 8)?,
-        [
-            Op::LoadName(..),
-            Op::LoadLocal(..),
-            Op::GetElem,
-            Op::GetMethod(..),
-            Op::MakeRegExp(..),
-            Op::Const(..),
-            Op::CallWithThis(2, _),
-            Op::Pop
-        ]
-    )
-    .then_some(pc + 8)
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_literal_match_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::Op;
-    matches!(
-        ops.get(pc..pc + 7),
-        Some([
-            Op::LoadName(..),
-            Op::LoadLocal(..),
-            Op::GetElem,
-            Op::GetMethod(..),
-            Op::MakeRegExp(..),
-            Op::CallWithThis(1, _),
-            Op::Pop
-        ])
-    )
-    .then_some(pc + 7)
-}
-
 /// Compile `chunk` to machine code, or `None` when unsupported (non-macOS/ARM64, async bodies,
 /// or an op stream whose stack depths don't line up — a compiler bug caught defensively).
 #[cfg(all(
@@ -1556,64 +1457,6 @@ pub fn compile(
         a.bind(write_fallback_labels[pc]);
         // Expressions only publish operands; hidden callees remain in their owning locals.
         numeric_expr::try_emit(&mut a, chunk, &cfg, pc, &pc_labels, &mut targeted, layout);
-        // A web-trace regexp workload is dominated by tiny loops whose body is exactly
-        // `re.exec(strings[i])` with the result discarded. Let one guarded Rust entry process
-        // the dense string range; a declined guard falls through to these untouched templates.
-        // This must precede numeric-chain selection, which otherwise consumes the loop's
-        // LoadLocal/Const/Lt header.
-        if let Some(exit) = regexp_exec_loop_exit(ops, pc) {
-            if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
-                eprintln!("[jit-region] head {pc}: regexp exec loop -> {exit}");
-            }
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_EXEC_LOOP * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
-        // A fresh literal immediately used for a canonical `exec` whose result dies need not
-        // allocate its observable wrapper object. The helper validates the live method and
-        // side-effect-free dense subject load before performing the real match; every miss
-        // falls through to the untouched literal/GetMethod/call templates.
-        if let Some(exit) = regexp_literal_exec_exit(ops, pc)
-            .filter(|exit| !targeted[pc + 1..*exit].iter().any(|target| *target))
-        {
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_LITERAL_EXEC_DISCARD * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
-        if let Some(exit) = regexp_literal_replace_exit(ops, pc)
-            .filter(|exit| !targeted[pc + 1..*exit].iter().any(|target| *target))
-        {
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_LITERAL_REPLACE_DISCARD * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
-        if let Some(exit) = regexp_literal_match_exit(ops, pc)
-            .filter(|exit| !targeted[pc + 1..*exit].iter().any(|target| *target))
-        {
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_LITERAL_MATCH_DISCARD * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
         // Loop-spanning chain: a fully-chainable, branch-free loop headed here runs with its
         // locals register-resident across the back edge. The plain templates for the region are
         // still emitted below (starting at `plain_h`) as the bail target; the head's canonical
