@@ -1,7 +1,6 @@
 //! Eligibility for executing a constructor body in the compiled tiers.
 use super::Interp;
 use crate::value::Gc;
-use std::rc::Rc;
 
 impl Interp {
     /// Base-class fields/private members/decorator initializers have already run in

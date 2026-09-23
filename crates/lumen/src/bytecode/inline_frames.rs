@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn virtual_callee_survives_gc_while_active_and_is_collectable_after_return() {
         use crate::value::{set_builtin, Value};
-        use std::rc::Rc;
+        
         let mut engine = Engine::new();
         engine.set_tier(Tier::Jit);
         engine.set_tier_threshold(0);

@@ -9,7 +9,6 @@ use crate::builtins::{
 };
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, NativeFn, Object, Property, Value};
-use std::rc::Rc;
 
 fn map_size(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let ptr = coll_ptr_kind(i, &this, Some("Map"))?;

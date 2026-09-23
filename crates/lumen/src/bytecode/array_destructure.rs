@@ -3,7 +3,6 @@ use crate::{
     interpreter::Interp,
     value::{Exotic, Gc, Value},
 };
-use std::rc::Rc;
 
 // extra_protos is already rooted, saved and restored with the active realm. These
 // private entries retain original method identities even after JS replaces properties.

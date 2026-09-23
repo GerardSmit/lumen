@@ -6,7 +6,6 @@ use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::builtins::{ab, arg, coll_ptr_kind, new_from_ctor, same_value_zero};
 use crate::interpreter::Interp;
 use crate::value::{Object, Value};
-use std::rc::Rc;
 
 /// The receiver Set's values (deduped insertion order). Errors if `this` isn't a Set.
 fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {

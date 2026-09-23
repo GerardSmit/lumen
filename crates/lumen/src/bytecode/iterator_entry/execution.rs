@@ -3,7 +3,6 @@ use crate::value::Gc;
 use super::{classification, same_realm, Feedback, Outcome};
 use crate::interpreter::{call_entry::EntryResult, Abrupt, Interp};
 use crate::value::{Callable, Value};
-use std::rc::Rc;
 
 pub(super) fn enabled() -> bool {
     let enabled = std::env::var_os("LUMEN_ITERATOR_ENTRY_NATIVE").is_some();

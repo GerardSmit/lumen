@@ -1,7 +1,7 @@
 //! Hash-free lexical resolution through guarded scope paths, including fresh activations.
 use super::Chunk;
 use crate::interpreter::{Binding, BindingLayout, Env, Interp, Scope};
-use crate::value::{Exotic, Gc, Object, Value};
+use crate::value::{Exotic, Gc, Value};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 

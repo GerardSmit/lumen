@@ -3,7 +3,6 @@ use crate::value::Gc;
 use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::interpreter::Interp;
 use crate::value::{NativeFn, Value};
-use std::rc::Rc;
 
 pub(crate) const MAP_GET: u8 = 13;
 pub(crate) const MAP_HAS: u8 = 14;

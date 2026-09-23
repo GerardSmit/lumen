@@ -79,7 +79,7 @@ mod tests {
     use super::{emit, supported, Operand};
     use crate::jit::{asm::Asm, sys};
     use crate::value::{jit_layout, Gc, Object, Value};
-    use std::{mem::MaybeUninit, rc::Rc};
+    use std::mem::MaybeUninit;
 
     #[test]
     fn preflight_rejects_capacity_overflow_and_scratch_homes_without_emission() {

@@ -4,7 +4,6 @@ use crate::{
     interpreter::Interp,
     value::{Exotic, Value},
 };
-use std::rc::Rc;
 
 const ENABLED_NEXT: &str = "%ArrayIteratorStepIntrinsic%";
 

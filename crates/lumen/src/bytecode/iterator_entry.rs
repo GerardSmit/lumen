@@ -2,10 +2,10 @@
 use crate::value::Gc;
 use super::{Chunk, Op};
 use crate::interpreter::{Abrupt, Interp};
-use crate::value::{Callable, Object, Value};
+use crate::value::{Callable, Value};
 use std::{
     cell::RefCell,
-    rc::{Rc, Weak},
+    rc::Rc,
 };
 
 mod classification;

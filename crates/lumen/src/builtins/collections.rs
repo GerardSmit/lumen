@@ -5,7 +5,6 @@ use super::collection_data::{CollectionData, CollectionKind};
 use super::{ab, new_from_ctor, set_to_string_tag, step_iter_with};
 use crate::interpreter::Interp;
 use crate::value::{Object, Value};
-use std::rc::Rc;
 
 pub(super) mod brand;
 pub(crate) mod insert;

@@ -60,7 +60,7 @@ mod tests {
     use crate::{ast::Stmt, bytecode, parser, Engine};
     use std::{
         cell::RefCell,
-        rc::{Rc, Weak},
+        rc::Rc,
     };
 
     fn parse_function(source: &str) -> Rc<Function> {
