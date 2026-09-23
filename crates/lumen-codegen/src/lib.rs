@@ -9,8 +9,13 @@ pub mod cfg;
 pub mod eval;
 pub mod interp;
 pub mod ir;
+pub mod jitmem;
+pub mod legalize;
+pub mod machinst;
 pub mod opt;
+pub mod regalloc;
 pub mod verify;
+pub mod x64;
 
 pub use builder::{FunctionBuilder, Variable};
 pub use ir::*;

@@ -31,6 +31,8 @@ pub mod trap {
     pub const SIGNATURE_MISMATCH: u32 = 7;
     /// A runtime helper reported a trap (its own message is recorded by the runtime).
     pub const HELPER: u32 = 8;
+    /// Native code ran below `VmCtx::stack_limit`.
+    pub const STACK_OVERFLOW: u32 = 9;
 
     pub fn message(code: u32) -> &'static str {
         match code {
@@ -42,6 +44,7 @@ pub mod trap {
             TABLE_OOB => "wasm: undefined element (indirect call)",
             NULL_ELEMENT => "wasm: uninitialized table element",
             SIGNATURE_MISMATCH => "wasm: indirect call type mismatch",
+            STACK_OVERFLOW => "wasm: call stack exhausted",
             _ => "wasm: trap",
         }
     }
@@ -50,6 +53,8 @@ pub mod trap {
 pub const VMCTX_MEM_BASE: i32 = 0;
 pub const VMCTX_MEM_LEN: i32 = 8;
 pub const VMCTX_GLOBALS: i32 = 16;
+pub const VMCTX_ENTRY_SP: i32 = 24;
+pub const VMCTX_STACK_LIMIT: i32 = 32;
 
 /// External ids at and above this are runtime helpers, not wasm functions.
 pub const HELPER_BASE: u32 = 0x8000_0000;

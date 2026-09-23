@@ -292,6 +292,148 @@ impl Env for TestEnv {
     }
 }
 
+/// Native execution through the x64 backend, with a minimal runtime around `VmCtx`.
+#[cfg(target_arch = "x86_64")]
+mod native {
+    use super::*;
+    use lumen_codegen::jitmem::ExecMemory;
+    use lumen_codegen::x64;
+
+    #[repr(C)]
+    pub struct VmCtx {
+        pub mem_base: *mut u8,
+        pub mem_len: u64,
+        pub globals: *const *mut u64,
+        pub entry_sp: u64,
+        pub stack_limit: u64,
+        /// Test runtime state for the helpers.
+        pub mem: *mut Vec<u8>,
+    }
+
+    unsafe fn memory<'a>(vm: *mut VmCtx) -> &'a mut Vec<u8> {
+        &mut *(*vm).mem
+    }
+
+    unsafe fn sync(vm: *mut VmCtx) {
+        let m = memory(vm);
+        (*vm).mem_base = m.as_mut_ptr();
+        (*vm).mem_len = m.len() as u64;
+    }
+
+    extern "C" fn grow(vm: *mut VmCtx, delta: i32) -> i32 {
+        unsafe {
+            let m = memory(vm);
+            let old = m.len() / PAGE_SIZE;
+            if delta < 0 || old + delta as usize > 4 {
+                return -1;
+            }
+            m.resize((old + delta as usize) * PAGE_SIZE, 0);
+            sync(vm);
+            old as i32
+        }
+    }
+
+    fn copy_fill(vm: *mut VmCtx, d: i32, s: i32, n: i32, fill: bool) -> i32 {
+        let m = unsafe { memory(vm) };
+        let (d, s, n) = (d as u32 as usize, s as u32 as usize, n as u32 as usize);
+        if d + n > m.len() || (!fill && s + n > m.len()) {
+            return 1;
+        }
+        if fill {
+            m[d..d + n].fill(s as u8);
+        } else {
+            m.copy_within(s..s + n, d);
+        }
+        0
+    }
+
+    extern "C" fn copy(vm: *mut VmCtx, d: i32, s: i32, n: i32) -> i32 {
+        copy_fill(vm, d, s, n, false)
+    }
+
+    extern "C" fn fill(vm: *mut VmCtx, d: i32, v: i32, n: i32) -> i32 {
+        copy_fill(vm, d, v, n, true)
+    }
+
+    pub fn config() -> x64::Config {
+        x64::Config::host(Some(x64::TrapConfig {
+            entry_sp_offset: VMCTX_ENTRY_SP,
+            stack_limit: Some((VMCTX_STACK_LIMIT, trap::STACK_OVERFLOW)),
+        }))
+    }
+
+    pub struct Loaded {
+        _code: ExecMemory,
+        addrs: Vec<u64>,
+    }
+
+    /// Compile every function, or `None` when one has no native path.
+    pub fn load(funcs: &[Function]) -> Option<Loaded> {
+        let cfg = config();
+        let mut compiled = Vec::new();
+        for f in funcs {
+            match x64::compile(f, &cfg) {
+                Ok(c) => compiled.push(c),
+                Err(e) => {
+                    eprintln!("native: {} stays interpreted: {e}", f.name);
+                    return None;
+                }
+            }
+        }
+        let (code, addrs) = x64::load(&compiled, |id, addrs| match id {
+            HELPER_MEMORY_GROW => Some(grow as *const () as u64),
+            HELPER_MEMORY_COPY => Some(copy as *const () as u64),
+            HELPER_MEMORY_FILL => Some(fill as *const () as u64),
+            id if (id as usize) < addrs.len() => Some(addrs[id as usize]),
+            _ => None,
+        })
+        .unwrap();
+        Some(Loaded { _code: code, addrs })
+    }
+
+    type Tramp = unsafe extern "C" fn(*mut VmCtx, u64, *mut u64) -> u32;
+
+    /// Run function `f`: its result bits or trap code, the final memory and global cells.
+    pub fn run(
+        l: &Loaded,
+        sig: &Signature,
+        f: u32,
+        args: &[u64],
+        mem: Vec<u8>,
+        cells: Vec<u64>,
+    ) -> (Result<Vec<u64>, u32>, Vec<u8>, Vec<u64>) {
+        let tramp = ExecMemory::new(&x64::trampoline(sig, &config()).unwrap()).unwrap();
+        let mut mem = Box::new(mem);
+        let mut cells = cells;
+        let table: Vec<*mut u64> = (0..cells.len()).map(|i| &mut cells[i] as *mut u64).collect();
+        let here = 0u8;
+        let mut vm = VmCtx {
+            mem_base: std::ptr::null_mut(),
+            mem_len: 0,
+            globals: table.as_ptr(),
+            entry_sp: 0,
+            // Leave plenty of the test thread's stack for the host.
+            stack_limit: &here as *const u8 as u64 - 512 * 1024,
+            mem: &mut *mem,
+        };
+        unsafe { sync(&mut vm) };
+        let mut slots = vec![0u64];
+        slots.extend_from_slice(args);
+        let vmp: *mut VmCtx = &mut vm;
+        slots[0] = vmp as u64;
+        let entry: Tramp = unsafe { std::mem::transmute(tramp.as_ptr()) };
+        let rc = unsafe { entry(vmp, l.addrs[f as usize], slots.as_mut_ptr()) };
+        assert_eq!(vm.entry_sp, 0, "trampoline restores entry_sp");
+        let out = if rc == 0 {
+            Ok(slots[..sig.results.len()].to_vec())
+        } else {
+            Err(rc - 1)
+        };
+        drop(table);
+        (out, *mem, cells)
+    }
+}
+
 /// Run every `(function, args)` case through both engines and compare.
 fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
     for optimize in [false, true] {
@@ -305,6 +447,8 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                 func
             })
             .collect();
+        #[cfg(target_arch = "x86_64")]
+        let loaded = native::load(&funcs);
         for (f, args) in cases {
             // Fresh instances per case so memory and globals start equal.
             let mut store = Store::default();
@@ -327,9 +471,41 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                 env.wr(cell, val_bits(store.globals[ga].val));
             }
 
+            let init_mem = env.memory().to_vec();
+            let init_cells: Vec<u64> = (0..instance.global_addrs.len())
+                .map(|i| env.rd(CELLS + 8 * i as u64))
+                .collect();
             let want = store.invoke(addr, args.clone(), &mut NoHost, 0);
             let mut ir_args = vec![0u64];
             ir_args.extend(args.iter().map(|&v| val_bits(v)));
+            #[cfg(target_arch = "x86_64")]
+            if let Some(l) = &loaded {
+                let sig = &funcs[*f as usize].sig;
+                let (got, nmem, ncells) = native::run(l, sig, *f, &ir_args[1..], init_mem, init_cells);
+                let ctx = format!("f{f}{args:?} natively (optimize={optimize})
+{}", funcs[*f as usize]);
+                match (&want, &got) {
+                    (Ok(w), Ok(g)) => {
+                        let same = w.len() == g.len()
+                            && w.iter().zip(g).all(|(&a, &b)| {
+                                let (a, b) = (val_bits(a), b);
+                                a == b || (is_nan_bits(a) && is_nan_bits(b))
+                            });
+                        assert!(same, "results differ: interpreter {w:?}, native {g:x?} for {ctx}");
+                        let imem = &store.memories[instance.mem_addrs[0]].bytes;
+                        assert!(*imem == nmem, "memory differs after {ctx}");
+                        for (i, &ga) in instance.global_addrs.iter().enumerate() {
+                            let t = match store.globals[ga].val {
+                                Val::I32(_) | Val::F32(_) => ncells[i] & 0xffff_ffff,
+                                _ => ncells[i],
+                            };
+                            assert_eq!(val_bits(store.globals[ga].val), t, "global {i} differs after {ctx}");
+                        }
+                    }
+                    (Err(w), Err(code)) => assert_eq!(w, trap::message(*code), "trap kinds differ for {ctx}"),
+                    (w, g) => panic!("outcomes differ: interpreter {w:?}, native {g:?} for {ctx}"),
+                }
+            }
             let got = interp::run(&funcs[*f as usize], &mut env, &ir_args);
             let ty = translate::func_type(&module, *f).unwrap();
             let ctx = format!("f{f}{args:?} (optimize={optimize})\n{}", funcs[*f as usize]);
