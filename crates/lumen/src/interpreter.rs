@@ -6,7 +6,6 @@
 
 mod arrays;
 mod bindings;
-pub(crate) mod call_entry;
 mod constructor_body;
 mod this_binding;
 pub(crate) use bindings::BindingLayout;
@@ -185,7 +184,6 @@ impl Interp {
 
 mod frames;
 pub use frames::FnFrame;
-pub(crate) use frames::InlineFrame;
 
 /// Cached UTF-16 view of one string, keyed by `Rc<str>` identity (see `Interp::str_units`).
 /// JS string semantics are code units but the engine stores UTF-8 `str`; without a cache every
@@ -211,23 +209,6 @@ pub(crate) struct RegexpLastMatch {
     /// Dead-result regexp operations record only the whole match and defer capture extraction
     /// until a legacy `RegExp.$1`-style accessor actually observes it.
     pub lazy_captures: Option<(Rc<crate::regex::Regex>, usize)>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct RegexpDependencyCache {
-    pub proto: usize,
-    pub shape: u32,
-    pub slots: [u32; 10],
-}
-
-impl Default for RegexpDependencyCache {
-    fn default() -> Self {
-        RegexpDependencyCache {
-            proto: 0,
-            shape: u32::MAX,
-            slots: [u32::MAX; 10],
-        }
-    }
 }
 
 pub struct Scope {
@@ -633,19 +614,6 @@ fn stub_slot(shape: u32, name: &str) -> usize {
     (shape as usize ^ n ^ (n >> 7)) & (STUB_CACHE_SIZE - 1)
 }
 
-struct ConstructIc {
-    call: crate::bytecode::CallIc,
-    pin: crate::value::WeakGc,
-    /// Shape and own-entry slot of the constructor's `prototype` data property. The slot's
-    /// value is deliberately read live on every `new`, so `F.prototype = other` remains visible
-    /// without invalidation; the shape guard only removes the repeated string-map lookup.
-    prototype_shape: u32,
-    prototype_slot: u32,
-    /// The constructor's immutable chunk has the exact Prototype.js
-    /// `this.initialize.apply(this, arguments)` forwarding body.
-    arguments_apply_forwarder: bool,
-}
-
 pub struct Interp {
     pub(crate) global: Gc,
     pub(crate) global_env: Env,
@@ -688,11 +656,6 @@ pub struct Interp {
     /// cached state compares the encoded raw prototype address.
     pub(crate) creation_pins:
         crate::fasthash::FastMap<usize, crate::value::WeakGc>,
-    /// Strong pins for every global scope a call cache has ever recorded (see
-    /// [`crate::bytecode::CallIc::global_env`]): the cached same-realm proof compares the scope
-    /// address raw, so those addresses must never be recycled. Bounded by the number of realms
-    /// (which the engine keeps alive anyway).
-    pub(crate) global_env_pins: Vec<Env>,
     /// The coroutine body currently executing through this interpreter (0 = the main driver);
     /// stamps `FnFrame::coro` so a dead worker's frames can be evicted precisely.
     pub(crate) cur_coro: u32,
@@ -711,9 +674,6 @@ pub struct Interp {
         crate::fasthash::FastMap<(usize, bool), (crate::lstr::LStr, Rc<crate::regex::ReText>)>,
     /// Bytes pinned by `re_texts` (subject strings plus element vectors).
     pub(crate) re_texts_bytes: usize,
-    /// Shape-validated entry slots for the ten RegExp prototype dependencies checked by
-    /// dead-result specializations. Values/accessors remain live-checked on every operation.
-    pub(crate) regexp_dependency_cache: std::cell::Cell<RegexpDependencyCache>,
     /// The last successful `exec` match, kept raw for the legacy `RegExp.$1`-style statics:
     /// the 14 strings materialize into the constructor's hidden props only when an accessor
     /// actually reads them (see `builtins::flush_regexp_legacy`), not on every match.
@@ -739,15 +699,9 @@ pub struct Interp {
     /// the proof lapses. Every defineProperty / proto swap / structural change to a marked
     /// prototype bumps the epoch, forcing a re-verify.
     pub(crate) elems_protector: std::cell::Cell<(u32, bool)>,
-    /// Per-CONSTRUCTOR construct cache (`new F(...)` — keyed by callee identity, since a
-    /// constructor's derived state doesn't vary per site): the same raw pointers a [`CallIc`]
-    /// caches, validated by the same epoch. The `Weak` pins the callee's address against
-    /// recycling (ABA), exactly like `Chunk::call_pins`.
-    construct_ics: crate::fasthash::FastMap<usize, ConstructIc>,
     /// Small final named-map sizes learned from successful ordinary construction, keyed and
-    /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
-    /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
-    /// wrappers), so their fresh instances can reserve enough slots for creation-IC appends.
+    /// weak-pinned by constructor identity, so fresh instances can reserve enough slots for
+    /// creation-IC appends.
     pub(crate) construct_capacity_hints:
         crate::fasthash::FastMap<usize, (crate::value::WeakGc, u8)>,
     /// `Symbol.iterator`, cached so the iterator protocol can look up `obj[@@iterator]` cheaply.
@@ -885,9 +839,7 @@ pub struct Interp {
     pub(crate) generators: crate::fasthash::FastMap<usize, crate::coroutine::Coroutine>,
     /// Live-object count above which the next allocation safe point runs the cycle collector.
     pub(crate) gc_next: i64,
-    /// Call counter for [`Interp::gc_check_amortized`]. Layered calls poll every 256 calls; direct
-    /// JIT calls compare live objects with `gc_next` exactly and use this only for sparse scope-
-    /// registry maintenance.
+    /// Call counter for [`Interp::gc_check_amortized`]: calls poll every 256 calls.
     pub(crate) gc_tick: u32,
     /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point.
     pub(crate) interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1043,12 +995,8 @@ pub const MAX_LIVE: i64 = 3_000_000;
 
 /// Live-object count at which the collector first runs; the threshold then floats (see `gc_check`).
 pub const GC_TRIGGER: i64 = 100_000;
-/// Layered calls check allocation counters once per 256 calls. Direct JIT calls compare object
-/// pressure exactly; this mask also arms a forced full check when that comparison is due.
+/// Layered calls check allocation counters once per 256 calls.
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
-/// Direct calls compare object pressure exactly. This sparser cadence only maintains the scope
-/// weak registry, bounding dead-header slack without forcing frequent Rust transitions.
-pub(crate) const GC_DIRECT_MAINT_MASK: u32 = 4095;
 /// Scope-registry entry count that arms a registry prune.
 const SCOPE_GC_TRIGGER: usize = 65_536;
 
@@ -1322,7 +1270,6 @@ impl Interp {
             eval_fn: None,
             eval_realm_fns: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
-            construct_ics: Default::default(),
             construct_capacity_hints: Default::default(),
             iterator_sym: None,
             wk_syms: Vec::new(),
@@ -1345,13 +1292,11 @@ impl Interp {
             vm_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             creation_pins: Default::default(),
-            global_env_pins: Vec::new(),
             cur_coro: 0,
             inline_ic_safe: std::cell::Cell::new(true),
             str_units: Vec::new(),
             re_texts: Default::default(),
             re_texts_bytes: 0,
-            regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
             map_data: Default::default(),
             extra_protos: Default::default(),
@@ -1465,7 +1410,7 @@ impl Interp {
     /// the `name: message` head. Bounded by the engine's own recursion guard (~128 frames).
     fn capture_stack(&self) -> Rc<str> {
         let mut out = String::new();
-        for frame in self.reflected_frames().iter().rev() {
+        for frame in self.fn_frames.iter().rev() {
             let callee = frame.callee();
             let name = {
                 let b = callee.borrow();
@@ -2539,41 +2484,17 @@ impl Interp {
     /// each hop below the holder is hash-checked to still lack an own `name`, the holder slot is
     /// key-compared — so staleness costs a re-derivation, never a wrong answer. Anything not a
     /// plain data property on an ordinary (or array) chain falls through to full `[[Get]]`.
+    /// `name` must be a site-interned chunk name alive for the chunk's lifetime: the global stub
+    /// cache keys on its data pointer, which a transient runtime key could recycle.
     pub(crate) fn get_prop_ic(
         &mut self,
         base: &Value,
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
-        self.get_prop_ic_impl(base, name, cache, true)
-    }
-
-    /// [`Interp::get_prop_ic`] for a RUNTIME string key (computed reads — `o[k]`): the global
-    /// stub cache is keyed by name data pointer under the invariant that those pointers are
-    /// site-interned `Rc<str>`s alive for the chunk's lifetime. A transient key must neither
-    /// probe it (a freed key's recycled address false-hits another key's entry — with the
-    /// size-class allocator this happens on the very next iteration of an
-    /// `Object.entries` loop) nor fill it (the dangling pointer would later false-match a
-    /// fresh site name allocated at the same address).
-    pub(crate) fn get_prop_keyed(
-        &mut self,
-        base: &Value,
-        name: &str,
-        cache: &std::cell::Cell<crate::bytecode::IcState>,
-    ) -> Result<Value, Abrupt> {
-        self.get_prop_ic_impl(base, name, cache, false)
-    }
-
-    fn get_prop_ic_impl(
-        &mut self,
-        base: &Value,
-        name: &str,
-        cache: &std::cell::Cell<crate::bytecode::IcState>,
-        stable_name: bool,
-    ) -> Result<Value, Abrupt> {
         match base {
             Value::Obj(o) => {
-                if let Some(v) = self.try_ic_get(o, name, cache, stable_name) {
+                if let Some(v) = self.try_ic_get(o, name, cache) {
                     return Ok(v);
                 }
             }
@@ -2590,7 +2511,7 @@ impl Interp {
                     Value::Num(_) => self.number_proto.clone(),
                     _ => self.boolean_proto.clone(),
                 };
-                if let Some(v) = self.try_ic_get(&proto, name, cache, stable_name) {
+                if let Some(v) = self.try_ic_get(&proto, name, cache) {
                     return Ok(v);
                 }
             }
@@ -2624,7 +2545,6 @@ impl Interp {
         o: &Gc,
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
-        stable_name: bool,
     ) -> Option<Value> {
         let head = Gc::as_ptr(o);
         // PROP_IC_WAYS ways per site (polymorphic receivers — subclass hierarchies rotating
@@ -2636,19 +2556,17 @@ impl Interp {
                 return Some(v);
             }
         }
-        if stable_name {
-            let shape = unsafe { (*head).borrow().props.shape() };
-            let e = self.stub_cache[stub_slot(shape, name)].get();
-            if e.name == name.as_ptr() as usize && e.st.recv_shape == shape {
-                if let Some(v) = self.ic_shape_probe(head, name, e.st) {
-                    // Promote into the site (demoting the other ways): the next access hits
-                    // way-first.
-                    self.ic_insert(cache, e.st);
-                    return Some(v);
-                }
+        let shape = unsafe { (*head).borrow().props.shape() };
+        let e = self.stub_cache[stub_slot(shape, name)].get();
+        if e.name == name.as_ptr() as usize && e.st.recv_shape == shape {
+            if let Some(v) = self.ic_shape_probe(head, name, e.st) {
+                // Promote into the site (demoting the other ways): the next access hits
+                // way-first.
+                self.ic_insert(cache, e.st);
+                return Some(v);
             }
         }
-        self.ic_get_rederive(o, name, cache, stable_name)
+        self.ic_get_rederive(o, name, cache)
     }
 
     /// Cache way `k` of a property site (sites allocate `PROP_IC_WAYS` consecutive cells — see
@@ -2802,7 +2720,6 @@ impl Interp {
         o: &Gc,
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
-        stable_name: bool,
     ) -> Option<Value> {
         use crate::bytecode::{IcState, IC_MAX_DEPTH};
         type ObjCell = std::cell::RefCell<Object>;
@@ -2869,14 +2786,11 @@ impl Interp {
                     };
                     self.ic_insert(cache, st);
                     // Mirror into the stub cache so OTHER shapes rotating through this
-                    // site don't evict this resolution for good — stable site names only
-                    // (see `get_prop_keyed`).
-                    if stable_name {
-                        self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
-                            name: name.as_ptr() as usize,
-                            st,
-                        });
-                    }
+                    // site don't evict this resolution for good.
+                    self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
+                        name: name.as_ptr() as usize,
+                        st,
+                    });
                     return Some(v);
                 }
                 if depth == 1 && matches!(b.exotic, Exotic::None | Exotic::StrWrap) {
@@ -2903,12 +2817,10 @@ impl Interp {
                                 mid2_shape: absent_shapes[2],
                             };
                             self.ic_insert(cache, st);
-                            if stable_name {
-                                self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
-                                    name: name.as_ptr() as usize,
-                                    st,
-                                });
-                            }
+                            self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
+                                name: name.as_ptr() as usize,
+                                st,
+                            });
                             return Some(Value::Undefined);
                         }
                         return None;
@@ -3481,14 +3393,10 @@ impl Interp {
                                 // strict caller is censored to null). Eval runs inline, so eval
                                 // frames are naturally skipped.
                                 let rptr = Gc::as_ptr(r) as usize;
-                                let frames = self.reflected_frames();
-                                let top = frames.iter().rposition(|fr| fr.fn_ptr == rptr);
+                                let top = self.fn_frames.iter().rposition(|fr| fr.fn_ptr == rptr);
                                 return Ok(match (key, top) {
                                     (_, None) => Value::Null,
                                     ("arguments", Some(k)) => {
-                                        let Some(k) = frames[k].physical else {
-                                            return Ok(Value::Null);
-                                        };
                                         // The activation skipped building its arguments object
                                         // (the body never names it) — conjure it now.
                                         let lazy = match self.fn_frames[k].extra.as_deref() {
@@ -3510,7 +3418,7 @@ impl Interp {
                                             None => Value::Null,
                                         }
                                     }
-                                    (_, Some(k)) => match frames[..k].last() {
+                                    (_, Some(k)) => match self.fn_frames[..k].last() {
                                         None => Value::Null,
                                         Some(fr) if fr.strict => Value::Null,
                                         Some(fr) => Value::Obj(fr.callee()),
@@ -4281,8 +4189,7 @@ impl Interp {
         }
     }
 
-    /// [`gc_check`] amortized for layered calls. Direct JIT calls perform the cheap live-object
-    /// comparison in machine code and enter this path only when collection is actually due.
+    /// [`gc_check`] amortized for calls.
     #[inline]
     pub(crate) fn gc_check_amortized(&mut self) -> Result<(), Abrupt> {
         self.gc_tick = self.gc_tick.wrapping_add(1);
@@ -4410,7 +4317,6 @@ impl Interp {
     }
 
     pub(crate) fn gc_collect(&mut self) {
-        let _inline_roots = self.inline_gc_roots();
         let live = crate::value::gc_snapshot();
         // Scopes are graph nodes too: a closure's captured environment references objects (its
         // bindings) and vice versa (`Callable::User`), so cycles routinely pass through them.
@@ -5324,7 +5230,7 @@ impl Interp {
         }
     }
 
-    /// Run an already-compiled chunk (JIT or bytecode VM), saving/restoring the per-body engine
+    /// Run an already-compiled chunk on the bytecode VM, saving/restoring the per-body engine
     /// flags (`strict`, `tco_ok`, field-init / async-gen-body markers). Shared by the lean
     /// [`call_user_inner`] path and the [`call_compiled_fast`] shortcut so they can't diverge.
     /// `this_val` is already OrdinaryCallBindThis-bound; `new_target`/`constructing`/frame
@@ -5364,7 +5270,6 @@ impl Interp {
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
         self.fn_frames.push(FnFrame {
-            inline: std::ptr::null(),
             fn_ptr: Gc::as_ptr(fn_obj) as usize,
             coro: self.cur_coro,
             strict: func.is_strict,
@@ -5444,7 +5349,7 @@ impl Interp {
                     let _ = func.code.set(compiled);
                 }
             }
-            if let Some(Some(chunk)) = func.code2.get().or_else(|| func.code.get()) {
+            if let Some(Some(chunk)) = func.code.get() {
                 let chunk = chunk.clone();
                 let this_val = self.bind_compiled_this(func, &chunk, this, is_construct);
                 // A construct consumes the pending new.target exactly like the slow path, so a
@@ -5889,7 +5794,7 @@ impl Interp {
                 let _ = func.code.set(crate::bytecode::compile(func));
             }
         }
-        match func.code2.get().or_else(|| func.code.get()) {
+        match func.code.get() {
             Some(Some(chunk)) => Some(chunk.clone()),
             _ => None,
         }
@@ -6484,7 +6389,7 @@ impl Interp {
                 };
                 // A forwarding constructor's own body may contain no direct field stores. Record
                 // the small final named-map size after a successful call so its next instance has
-                // spare capacity for the machine-code creation caches. The hint changes only
+                // spare capacity for the property-creation caches. The hint changes only
                 // allocation size; all writes still perform their normal live semantic guards.
                 self.observe_construct_capacity(&obj, &this);
                 // A constructor explicitly returning an object overrides the instance;

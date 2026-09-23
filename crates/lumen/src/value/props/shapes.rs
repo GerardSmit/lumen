@@ -23,12 +23,6 @@ pub(crate) fn proto_epoch() -> u32 {
     PROTO_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Stable address used by the ARM64 creation-IC template for the same relaxed epoch check.
-#[inline]
-pub(crate) fn proto_epoch_ptr() -> *const u32 {
-    PROTO_EPOCH.as_ptr()
-}
-
 /// Invalidate every property-creation inline cache (see [`PROTO_EPOCH`]).
 pub(crate) fn bump_proto_epoch() {
     let _ = PROTO_EPOCH.fetch_update(
@@ -355,7 +349,7 @@ impl Shape {
     }
 }
 
-/// The object-shape transition tree plus the id → shape index the JIT's creation IC reads. A
+/// The object-shape transition tree plus the id → shape index. A
 /// shape id encodes an *ordered sequence of property keys* — two `Props` share an id exactly
 /// when they added the same keys in the same order. `transitions[(parent, key)] = child` is
 /// memoized, so structurally-identical objects converge on one shape — which is what makes a
@@ -505,14 +499,6 @@ pub(crate) fn shape_table_census() -> ShapeTableCensus {
             + t.transitions.len() * transition;
         c
     })
-}
-
-/// Address of the shared-shape `by_id` vector header, for the JIT creation template: it indexes
-/// the vector with the cache's child shape id to obtain the stored `Rc<Shape>` pointer. The
-/// header lives inside the `Arc<GcState>` the emitting thread and its workers share, so the
-/// address is stable for the code's lifetime.
-pub(crate) fn shape_table_by_id_ptr() -> *const Vec<Rc<Shape>> {
-    with_shapes(|t| &t.by_id as *const Vec<Rc<Shape>>)
 }
 
 thread_local! {

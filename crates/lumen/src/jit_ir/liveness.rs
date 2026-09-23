@@ -97,10 +97,6 @@ fn effect(op: &Op) -> (u128, u128) {
         IterStepL(a, b) => (bit(a) | bit(b), 0),
         UpdateLocal(s, _) => (bit(s), bit(s)),
         StoreLocal(s) | Tdz(s) => (0, bit(s)),
-        ResetSlots(start, count) => (
-            0,
-            (start..start.saturating_add(count)).fold(0, |v, s| v | bit(s)),
-        ),
         Const(_)
         | Undef
         | Dup
@@ -142,7 +138,6 @@ fn effect(op: &Op) -> (u128, u128) {
         | JumpIfNotNullishPeek(_)
         | Call(..)
         | CallWithThis(..)
-        | InlineGuard(..)
         | New(..)
         | MakeRegExp(..)
         | MakeArray(_)
@@ -265,6 +260,5 @@ mod tests {
         assert_eq!(effect(&Op::GetPropLocal(3, 0, 0)), (8, 0));
         assert_eq!(effect(&Op::IterStepL(2, 4)), (20, 0));
         assert_eq!(effect(&Op::MakeClosure(0, 0)), (u128::MAX, 0));
-        assert_eq!(effect(&Op::ResetSlots(2, 3)), (0, 28));
     }
 }

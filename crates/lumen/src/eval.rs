@@ -3540,14 +3540,6 @@ impl Interp {
         self.make_regexp_with_proto(source, flags, proto)
     }
 
-    pub(crate) fn make_regexp_compiled(
-        &mut self,
-        re: Rc<crate::regex::Regex>,
-    ) -> Result<Value, Abrupt> {
-        let proto = self.regexp_alloc_proto()?;
-        Ok(self.make_regexp_object(re, proto))
-    }
-
     /// GetPrototypeFromConstructor for RegExpAlloc: `new` with a subclass/cross-realm newTarget
     /// overrides the instance prototype (falling back to newTarget's realm's %RegExp.prototype%).
     pub(crate) fn regexp_alloc_proto(&mut self) -> Result<Option<crate::value::Gc>, Abrupt> {
@@ -5122,34 +5114,6 @@ impl Interp {
         Value::Obj(obj)
     }
 
-    /// [`Interp::make_plain_object_templated`] reading the values straight off the JIT operand
-    /// stack (moved; the caller forgets them) — no intermediate `Vec` per instantiation.
-    ///
-    /// # Safety
-    /// `base..base+count` must be initialized `Value`s the caller relinquishes.
-    pub(crate) unsafe fn make_plain_object_templated_from(
-        &mut self,
-        tmpl: &std::cell::OnceCell<crate::value::Props>,
-        keys: &[std::rc::Rc<str>],
-        base: *const Value,
-        count: usize,
-    ) -> Value {
-        let map = tmpl.get_or_init(|| {
-            let mut p = crate::value::Props::new();
-            for k in keys {
-                p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
-            }
-            p
-        });
-        let props = map.instantiate_plain((0..count).map(|slot| unsafe { base.add(slot).read() }));
-        let obj = crate::value::Object::new_with_parts(
-            Some(self.object_proto.clone()),
-            props,
-            crate::value::Exotic::None,
-        );
-        Value::Obj(obj)
-    }
-
     /// [`Interp::make_plain_object_vm`] through a per-site pre-shaped map (distinct keys only —
     /// the compiler guarantees it): the first execution builds the final `Props` once via the
     /// insert path with placeholder values; every later instance takes its shape (one refcount
@@ -5343,7 +5307,7 @@ impl Interp {
     }
 
     /// [[Delete]] with the caller's strictness: the VM's delete ops carry the compiled
-    /// function's flag (a direct JIT→JIT call sequence does not maintain `self.strict`).
+    /// function's flag rather than relying on `self.strict`.
     pub(crate) fn delete_prop_with(
         &mut self,
         base: Value,
@@ -6340,9 +6304,9 @@ impl Interp {
         Ok(Value::Bool(self.ordinary_has_instance(r, l)?))
     }
 
-    /// Execute `instanceof` and seed the JIT's narrow ordinary-constructor cache. Filling is
-    /// observationally inert: the real abstract operation still runs on every miss, and the
-    /// generated hit revalidates every fact captured here before touching the operand stack.
+    /// Execute `instanceof` through a narrow ordinary-constructor cache. Filling is
+    /// observationally inert: the real abstract operation still runs on every miss, and a hit
+    /// revalidates every fact captured here.
     pub(crate) fn instanceof_ic(
         &mut self,
         l: &Value,
@@ -6350,9 +6314,8 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
         let key = crate::builtins::well_known_key(self, "hasInstance");
-        // Checked counterpart of the machine-code hit. This also makes helper fallbacks cheap
-        // when the generated path cannot consume last-reference operands: the cached RHS shape
-        // proves no own @@hasInstance appeared, while the inherited intrinsic is read live.
+        // The cached RHS shape proves no own @@hasInstance appeared, while the inherited
+        // intrinsic is read live.
         let cached = cache.get();
         if self.inline_ic_safe.get() && cached.depth == 0 {
             if let (Some(key), Value::Obj(lhs), Value::Obj(rhs)) = (key.as_deref(), l, r) {
@@ -6871,7 +6834,6 @@ fn default_constructor(derived: bool) -> Function {
         body_used: std::cell::Cell::new(false),
         calls: std::cell::Cell::new(0),
         code: std::cell::OnceCell::new(),
-        code2: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
         lazy_error: std::cell::OnceCell::new(),
         name: None,

@@ -3,17 +3,10 @@ use super::{Compiler, Op};
 
 impl Compiler {
     pub(super) fn direct_this_allowed(&self) -> bool {
-        !self.lexical_this || self.inline_depth > 0
+        !self.lexical_this
     }
 
     pub(super) fn emit_this(&mut self) {
-        // An inlined ordinary callee reads its receiver, regardless of the caller's kind.
-        if let Some(slot) = self.inline_this {
-            if self.inline_depth > 0 {
-                self.emit(Op::LoadLocal(slot));
-                return;
-            }
-        }
         if self.direct_this_allowed() {
             self.uses_this = true;
             self.emit(Op::LoadThis);

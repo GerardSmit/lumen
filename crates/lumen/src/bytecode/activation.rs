@@ -21,16 +21,6 @@ fn init_name(init: &CapInit) -> &Rc<str> {
 }
 
 impl ActivationLayout {
-    fn base(&self, env: &Env) -> *mut Binding {
-        let mut scope = env.borrow_mut();
-        if scope.vars.generation() != 0 {
-            return std::ptr::null_mut();
-        }
-        scope
-            .vars
-            .layout_base(&self.bindings)
-            .unwrap_or(std::ptr::null_mut())
-    }
     pub(super) fn new(inits: &[CapInit], env_this: bool, names: &[Rc<str>]) -> Option<Self> {
         if inits.is_empty() && !env_this {
             return None;
@@ -107,19 +97,6 @@ impl ActivationLayout {
             }
         }
         act
-    }
-}
-
-impl Chunk {
-    pub(crate) fn jit_capture_base(&self, env: &Env) -> *mut Binding {
-        self.activation_layout
-            .as_ref()
-            .map_or(std::ptr::null_mut(), |layout| layout.base(env))
-    }
-
-    pub(crate) fn jit_capture_offset(&self, name: u32) -> Option<usize> {
-        self.activation_layout.as_ref()?.name_slots[name as usize]?
-            .checked_mul(std::mem::size_of::<Binding>())
     }
 }
 

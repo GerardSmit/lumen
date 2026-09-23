@@ -7,9 +7,7 @@
 //! referenced* an append writes in place (amortized by capacity doubling); shared strings copy
 //! first, exactly like `Rc::make_mut`.
 //!
-//! The payload is a single 8-byte pointer with the strong count at offset 0 — the same shape the
-//! JIT's inline templates already assume for refcounted payloads (`Rc`'s RcBox), so the machine
-//! code that bumps/decrements tag-6 values is unchanged. Logical content is always `len` bytes of
+//! The payload is a single 8-byte pointer to the header. Logical content is always `len` bytes of
 //! valid UTF-8 (lone surrogates smuggled, as before — see [`crate::jstr`]); capacity beyond `len`
 //! is invisible to every reader because `Deref` slices to `len`.
 //!
@@ -20,9 +18,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
 use std::ptr::NonNull;
 
-#[repr(C)]
 struct Header {
-    /// Strong count — MUST stay the first field (the JIT bumps it at payload offset 0).
     strong: Cell<usize>,
     len: Cell<u32>,
     cap: Cell<u32>,
@@ -36,14 +32,6 @@ pub struct LStr {
 
 const HDR: usize = std::mem::size_of::<Header>();
 
-/// Byte offset of the length within the header — the JIT's inline equality/truthiness templates
-/// read `len` from machine code through the stored pointer (the strong count stays at offset 0).
-pub(crate) const LEN_OFF: usize = std::mem::offset_of!(Header, len);
-/// Byte offset of `cap` (which carries [`ASCII_HINT`] in its top bit) — the JIT's charCodeAt
-/// intrinsic tests the hint from machine code.
-pub(crate) const CAP_OFF: usize = std::mem::offset_of!(Header, cap);
-/// Byte offset of the first content byte.
-pub(crate) const DATA_OFF: usize = HDR;
 /// Top bit of `cap`: the content is KNOWN all-ASCII (byte index == UTF-16 unit index, and every
 /// byte IS its unit). Purely a hint — never set for non-ASCII content, may be clear for ASCII
 /// content. Maintained by every constructor/mutator; capacity readers mask it off.

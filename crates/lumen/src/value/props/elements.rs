@@ -8,7 +8,7 @@ impl Props {
     /// `entries` needs one additional slot for the array's own `length` property. Small literals
     /// use the keyless packed representation: it avoids allocating/cloning one decimal string key
     /// per element, while all indexed/reflection paths already understand packed properties.
-    /// Larger numeric arrays retain the raw-f64 mirror used by numeric JIT regions.
+    /// Larger numeric arrays retain the raw-f64 mirror.
     pub(crate) fn reserve_dense_exact(&mut self, len: usize, numeric: bool) {
         if (1..=32).contains(&len) {
             self.entries.reserve_exact(1); // own `length`
@@ -22,29 +22,6 @@ impl Props {
         if numeric && !self.elems.packed_is_some() {
             self.elems.mirror_reserve_exact(len);
         }
-    }
-
-    /// Represent a very small holey array with keyless packed property slots. `Value::Empty`
-    /// remains an absent property to every reflective operation, but a later indexed write can
-    /// activate the already-allocated slot without allocating an index string or growing the
-    /// entry/dense vectors. Keep this deliberately tiny: an untouched `new Array(n)` must not
-    /// turn a length word into an unbounded allocation, and eight slots cap the speculative
-    /// footprint at 128 bytes while becoming smaller than the classic representation once filled.
-    pub(crate) fn reserve_small_holes(&mut self, len: usize) {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var_os("LUMEN_JIT_NO_PACKED_HOLES").is_none())
-            || len == 0
-            || len > 8
-            || self.elems.packed_is_some()
-        {
-            return;
-        }
-        debug_assert_eq!(self.elems.len(), 0);
-        let mut packed = Vec::with_capacity(len);
-        packed.resize_with(len, || Property::plain(Value::Empty));
-        self.elems.set_packed(Some(Box::new(packed)));
-        // The raw-f64 mirror describes classic `elems` slots, not keyless packed properties.
-        *self.elems.mirror_flags_mut() = 0;
     }
 
     /// Mark this map as an array's (see `elem_mode`). One-way, set when the owning object
@@ -106,7 +83,7 @@ impl Props {
     /// Insert an absent canonical index directly into the classic dense map, including a bounded
     /// run of holes. The caller has already proved ordinary Array prototype semantics. This is
     /// the numeric-key counterpart of `insert`: it avoids parsing/comparing a decimal key we
-    /// already know, while retaining the JIT-addressable entry/slot layout.
+    /// already know.
     pub(crate) fn try_define_dense_element(
         &mut self,
         n: u32,

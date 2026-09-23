@@ -14,9 +14,6 @@ mod atomics;
 pub(crate) mod collection_data;
 mod collections;
 use collections::brand::{coll_ptr, coll_ptr_kind};
-pub(crate) use collections::{
-    insert as collection_insert, intrinsic as collection_intrinsic, lookup as collection_lookup,
-};
 mod dataview;
 mod date;
 mod disposable;
@@ -37,9 +34,6 @@ mod string_substring;
 pub(crate) use string_code_point::nf_code_point_at;
 mod typedarray;
 mod weakrefs;
-
-pub(crate) use function_proto::nf_function_call;
-pub(crate) use math::nf_math_sqrt;
 
 /// `args[i]` or `undefined`.
 fn arg(args: &[Value], i: usize) -> Value {
@@ -66,9 +60,7 @@ pub(crate) fn default_has_instance(
     Ok(Value::Bool(ab(i.ordinary_has_instance(&this, &arg(a, 0)))?))
 }
 
-/// `Function.prototype.apply` is named so the JIT call cache can recognize the unmodified
-/// intrinsic and bypass this native frame for the common dense-arguments → compiled-function
-/// case. The JIT helper falls back to this exact implementation whenever its guards do not hold.
+/// `Function.prototype.apply`.
 pub(crate) fn nf_function_apply(
     i: &mut Interp,
     this: Value,
@@ -2122,7 +2114,7 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
     }
 }
 
-/// Allocation-free `RegExp.prototype.exec` for a JIT call whose result is immediately discarded.
+/// Allocation-free `RegExp.prototype.exec` for a call whose result is immediately discarded.
 /// Returns `None` unless every potentially observable coercion/property operation is proven to be
 /// the ordinary built-in shape, in which case all matcher side effects (lastIndex and the legacy
 /// RegExp statics) are preserved.
@@ -2206,89 +2198,6 @@ pub(crate) fn regexp_exec_discard_direct(
             Ok(true)
         }
     }
-}
-
-/// Allocation-free dead-result `String.prototype.replace` for the direct ordinary RegExp case.
-/// The raw property checks are side-effect-free; any customization declines to the exact builtin.
-pub(crate) fn string_replace_discard_fast(
-    i: &mut Interp,
-    input: &Value,
-    search: &Value,
-    replacement: &Value,
-) -> Option<Result<Value, Value>> {
-    let (Value::Str(input), Value::Obj(obj), Value::Str(_)) = (input, search, replacement) else {
-        return None;
-    };
-    let ptr = Gc::as_ptr(obj) as usize;
-    let re = i.regexps.get(&ptr)?.clone();
-    let proto = i.extra_protos.get("RegExp")?.clone();
-    let replace_key = well_known_key(i, "replace")?;
-    {
-        let b = obj.borrow();
-        if !matches!(b.exotic, Exotic::None)
-            || b.props.contains(&replace_key)
-            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
-            || [
-                "exec",
-                "flags",
-                "hasIndices",
-                "global",
-                "ignoreCase",
-                "multiline",
-                "dotAll",
-                "unicode",
-                "unicodeSets",
-                "sticky",
-            ]
-            .iter()
-            .any(|name| b.props.contains(name))
-        {
-            return None;
-        }
-        let last = b.props.get("lastIndex")?;
-        if last.accessor() || !last.writable() {
-            return None;
-        }
-        if re.sticky
-            && !re.global
-            && !matches!(
-                last.value(),
-                Value::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0
-            )
-        {
-            return None;
-        }
-    }
-    if !regexp::literal_match_dependencies_canonical(i) {
-        return None;
-    }
-    let canonical = {
-        let p = proto.borrow();
-        let Value::Obj(method) = p.props.get(&replace_key)?.value() else {
-            return None;
-        };
-        let canonical = matches!(
-            method.borrow().call,
-            Callable::Native(nf)
-                if nf as usize == regexp::re_sym_replace as *const () as usize
-        );
-        canonical
-    };
-    if !canonical {
-        return None;
-    }
-    Some(regexp::re_sym_replace_discard_direct(i, obj, &re, input))
-}
-
-/// Allocation-free dead-result `String.prototype.split` for a direct ordinary RegExp separator.
-/// The child routine validates every protocol/species/flag dependency before touching state.
-pub(crate) fn string_split_discard_fast(
-    i: &mut Interp,
-    input: &Value,
-    separator: &Value,
-    limit: &Value,
-) -> Option<Result<Value, Value>> {
-    regexp::re_sym_split_discard_fast(i, input, separator, limit)
 }
 
 /// Refresh the %RegExp% constructor's legacy static state after a successful RegExpBuiltinExec.
@@ -4603,64 +4512,6 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
     Ok(last)
 }
 
-/// JIT-only ownership-transfer form of the one-argument dense `Array#push` case.
-///
-/// `Err(value)` means no mutation occurred and hands the argument back to the caller for the
-/// exact generic builtin path. `Ok(length)` means the argument's ownership moved into the array.
-pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result<Value, Value> {
-    if !matches!(o.borrow().exotic, Exotic::Array)
-        || !i.ordinary_get_ptr(Gc::as_ptr(o) as usize)
-        || !i.array_append_unshadowed(o)
-    {
-        return Err(value);
-    }
-    let mut b = o.borrow_mut();
-    let len = match b.props.length_property() {
-        Some(p) if !p.accessor() && p.writable() => match p.value() {
-            Value::Num(n) if n.trunc() == n && (0.0..u32::MAX as f64).contains(&n) => n as u32,
-            _ => return Err(value),
-        },
-        _ => return Err(value),
-    };
-    match b.props.try_append_element(len, Property::plain(value)) {
-        Ok(()) => {
-            let next = len + 1;
-            let slot = b.props.slot_of("length").unwrap();
-            b.props
-                .entry_at_mut(slot)
-                .unwrap()
-                .set_value(Value::Num(next as f64));
-            Ok(Value::Num(next as f64))
-        }
-        Err(prop) => Err(prop.into_value()),
-    }
-}
-
-/// JIT-only dense `Array#pop` form. `None` is a guard miss with no mutation.
-pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
-    if !matches!(o.borrow().exotic, Exotic::Array) || !i.ordinary_get_ptr(Gc::as_ptr(o) as usize) {
-        return None;
-    }
-    let mut b = o.borrow_mut();
-    let len = match b.props.length_property() {
-        Some(p) if !p.accessor() && p.writable() => match p.value() {
-            Value::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => n as u32,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    if len == 0 {
-        return Some(Value::Undefined);
-    }
-    let value = b.props.pop_last_element(len - 1)?;
-    let slot = b.props.slot_of("length").unwrap();
-    b.props
-        .entry_at_mut(slot)
-        .unwrap()
-        .set_value(Value::Num((len - 1) as f64));
-    Some(value)
-}
-
 fn install_array_rest(it: &mut Interp, ap: &Gc) {
     it.def_method(&ap, "shift", 0, |i, this, _args| {
         let o = arr_to_object(i, &this)?;
@@ -5586,16 +5437,6 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
         // validates that it is a valid uint32 (else RangeError: Invalid array length).
         let a = i.make_array(Vec::new());
         ab(i.set_member(&a, "length", args[0].clone()))?;
-        #[cfg(all(
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        ))]
-        if let (Value::Obj(o), Value::Num(n)) = (&a, &args[0]) {
-            // Tiny fixed-length work arrays are commonly filled immediately. Keyless Empty
-            // slots preserve hole semantics while avoiding four separate key/entry
-            // allocations for cases such as `new Array(4)`.
-            o.borrow_mut().props.reserve_small_holes(*n as usize);
-        }
         a
     } else {
         i.make_array(args.to_vec())
@@ -8284,8 +8125,7 @@ fn locale_upper(s: &str, lang: Option<&str>) -> String {
     }
 }
 
-/// `String.prototype.charCodeAt` (named: the JIT's call-IC fill compares the fn pointer to
-/// tag intrinsic entries — see `bytecode::INTRINSIC_ASCII_CODE_UNIT`).
+/// `String.prototype.charCodeAt`.
 pub(crate) fn nf_char_code_at(
     i: &mut crate::interpreter::Interp,
     this: Value,
@@ -8303,7 +8143,7 @@ pub(crate) fn nf_char_code_at(
     })
 }
 
-/// `String.prototype.charAt` (named so the JIT call IC can prove and tag its exact identity).
+/// `String.prototype.charAt`.
 pub(crate) fn nf_char_at(
     i: &mut crate::interpreter::Interp,
     this: Value,

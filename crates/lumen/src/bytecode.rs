@@ -21,12 +21,12 @@ mod activation;
 pub(crate) mod array_destructure;
 pub(crate) mod array_iterator_step;
 mod for_in;
-mod inline_frames;
 mod name_path;
 mod object_literal;
 mod parameters;
 mod switch;
 mod this_binding;
+#[cfg(test)]
 mod write_strictness;
 
 use crate::value::Gc;
@@ -59,12 +59,7 @@ pub enum Tier {
 /// too. Deeper hits, exotics (arrays), and shape misses fall back to the key-checked walk.
 ///
 /// [object shapes]: crate::value::Props::shape
-///
-/// `repr(C)` with this field order gives the JIT's inline templates fixed byte offsets to read
-/// the live cache from machine code: recv_shape@0, holder_shape@4, slot@8, depth@12, mid_ok@13,
-/// mid_shape@16.
 #[derive(Clone, Copy)]
-#[repr(C)]
 pub struct IcState {
     pub recv_shape: u32,
     pub holder_shape: u32,
@@ -79,18 +74,9 @@ pub struct IcState {
     pub mid_shape: u32,
     /// The depth-2 hop's shape for a `depth == 3` hit (three-level class hierarchies put base
     /// methods three hops from an instance; without this they'd re-walk every access). Recorded
-    /// iff `mid_ok & 2`. The JIT templates handle depth ≤ 2 and route deeper hits to the helper.
+    /// iff `mid_ok & 2`.
     pub mid2_shape: u32,
 }
-
-/// Byte offsets into an [`IcState`] `Cell`, for the JIT inline templates.
-pub const IC_OFF_RECV_SHAPE: u32 = 0;
-pub const IC_OFF_HOLDER_SHAPE: u32 = 4;
-pub const IC_OFF_SLOT: u32 = 8;
-pub const IC_OFF_DEPTH: u32 = 12;
-pub const IC_OFF_MID_OK: u32 = 13;
-pub const IC_OFF_MID_SHAPE: u32 = 16;
-pub const IC_OFF_MID2_SHAPE: u32 = 20;
 
 pub const IC_EMPTY: u8 = u8::MAX;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
@@ -101,9 +87,8 @@ pub const IC_EMPTY: u8 = u8::MAX;
 /// non-elem-mode map, and every level's exotic/side-table gates are re-checked live.
 pub const IC_ABSENT: u8 = 0xFC;
 /// Way count of a property IC site: `Compiler::new_cache` allocates this many consecutive
-/// cells, the Rust probes walk all of them, and the JIT get/set templates loop over them
-/// inline (a 3-4 shape site — one dispatch loop over a class hierarchy — otherwise thrashes
-/// 2 ways and helper-calls forever).
+/// cells and the probes walk all of them (a 3-4 shape site — one dispatch loop over a class
+/// hierarchy — otherwise thrashes 2 ways and re-derives forever).
 pub const PROP_IC_WAYS: usize = 4;
 /// Flag bit OR'd into `IcState::depth` when the HOLDER is an `Exotic::Array` (including a
 /// depth-0 array receiver — `arr.length`, and `Array.prototype`, itself an Array exotic, as a
@@ -147,10 +132,7 @@ pub const IC_CREATE: u8 = 0xFD;
 /// ≥8-aligned). A hit revalidates the scope generation (no shadowing binding appeared) and the
 /// global object's shape (same ordered key layout ⇒ the slot still maps this name), then
 /// re-checks `accessor` at the slot (attributes are not part of the shape).
-///
-/// `repr(C)` with this field order gives the JIT template fixed offsets: env@0, binding@8, gen@16.
 #[derive(Clone, Copy)]
-#[repr(C)]
 pub struct NameIc {
     /// `Rc::as_ptr` of the scope at cache time (0 = empty). Low tag bits (scope allocations
     /// are ≥8-aligned): bit 0 = global-object mode; bit 1 = depth-1 mode, where the pointer
@@ -177,12 +159,6 @@ impl NameIc {
     };
 }
 
-/// Byte offsets into a [`NameIc`] `Cell`, for the JIT inline template.
-pub const NAME_IC_OFF_ENV: u32 = 0;
-pub const NAME_IC_OFF_BINDING: u32 = 8;
-pub const NAME_IC_OFF_GEN: u32 = 16;
-pub const NAME_IC_OFF_ACT_GEN: u32 = 20;
-
 impl IcState {
     pub const EMPTY: IcState = IcState {
         recv_shape: 0,
@@ -192,200 +168,6 @@ impl IcState {
         mid_ok: 0,
         mid_shape: 0,
         mid2_shape: 0,
-    };
-}
-
-/// Per-site call cache (`Op::Call` / `Op::CallWithThis`): the last callee that took the JIT→JIT
-/// fast call at this site, keyed by object identity. `callee` is the callee object's stored `Rc`
-/// pointer; a `Weak` pin in [`Chunk::call_pins`] keeps that ADDRESS from ever being recycled, so
-/// a live `Value::Obj` whose payload equals `callee` proves it is the *same, still-alive* object
-/// — and therefore that everything recorded at fill time still holds: its `call` field is the
-/// same `Callable::User` (a live function's `call` is never reassigned; the one upgrade site
-/// only converts `Callable::None`), which pins the `Function`, its env, its compiled chunk
-/// (`Function::code` is set once) and machine code (`Chunk::jit` is set once). A hit therefore
-/// skips the borrow + dispatch checks and reads everything through raw pointers with a single
-/// refcount bump (the env handle the frame needs).
-///
-/// The fill happens only after [`crate::interpreter::Interp::call_jit_fast`] passed its full
-/// guard set (plain same-realm user fn, not an arrow / class ctor / proxy, compiled, machine
-/// code, no activation env), so a hit replays exactly that committed path. The same-realm proof
-/// is carried by `global_env`: the fill's env-root walk was relative to the then-active global
-/// scope, whose address is compared raw on every hit (and strong-pinned in
-/// `Interp::global_env_pins` so it can never be recycled); a realm switch changes the active
-/// global and makes every cached site miss and revalidate. The blanket proxy/realm gates
-/// `call_jit_fast` re-checks per call are safe to skip on a hit: they exist to keep EXOTIC
-/// callees off the fast path, and identity proves this callee is the same plain user function.
-#[derive(Clone, Copy)]
-/// `repr(C)` with this field order gives the JIT call template fixed byte offsets for its
-/// inline way-1 probe: callee@0, env@8, chunk@16, code@24, global_env@32, strict@40,
-/// uses_this@41, n_params@42, n_slots@44, func@48, epoch@56 — 64-byte stride inside
-/// [`CallSite::entries`] (compile-asserted in jit.rs).
-#[repr(C)]
-pub struct CallIc {
-    /// Stored `Rc` pointer of the callee function object; 0 = empty.
-    pub callee: usize,
-    /// `Rc::as_ptr` of the callee's closure env (a hit reconstructs one owned handle from it).
-    pub env: *const std::cell::RefCell<crate::interpreter::Scope>,
-    /// Address of the `Rc<Chunk>` handle inside the callee's `Function::code` (set-once cell).
-    pub chunk: *const Rc<Chunk>,
-    /// `Rc::as_ptr` of the active realm's global scope at fill time: the fill's same-realm proof
-    /// (the callee's env-chain root) is relative to it, so a hit requires the active global to be
-    /// unchanged — a realm switch makes every site miss and revalidate through the full path.
-    pub global_env: usize,
-    /// The callee's strictness (feeds the frame record and the `this` binding).
-    pub strict: bool,
-    /// `Chunk::uses_this()` at fill time (set-once state): skips the `this` binding entirely.
-    pub uses_this: bool,
-    /// `Chunk::jit_frame()` at fill time: the callee frame shape without touching the chunk.
-    pub n_params: u16,
-    pub n_slots: u16,
-    /// Direct-call gates computed at fill: bit 0 = the chunk has NO `jit_var_force_resets`
-    /// (the asm sequence's tag-byte slot init suffices); bit 1 = the chunk needs the realm's
-    /// global body pointer (the sequence requires the caller's `ctx.global_body` to be live).
-    pub direct: u8,
-    /// `Rc::as_ptr` of the callee's `ast::Function` (alive while the callee object is: `call`
-    /// is never reassigned) — the inline-recompile trigger needs the AST.
-    pub func: *const crate::ast::Function,
-    /// [`CALL_IC_EPOCH`] at fill time; a mismatch forces a re-fill (so a fresh second-stage
-    /// compile of the callee replaces the cached chunk/code pointers).
-    pub epoch: u32,
-    /// `Rc::as_ptr` of the callee's chunk — what `ctx.chunk` holds (the direct-call sequence
-    /// swaps it in without the RcBox-offset arithmetic a `*const Rc<Chunk>` deref would need).
-    /// NULL for a NATIVE entry (see `native`) — every machine-code consumer that dereferences
-    /// chunk state must route null to the helper first.
-    pub chunk_raw: *const Chunk,
-    /// Native-callee entry: the builtin's fn pointer (0 = a user-function entry). A hit
-    /// invokes it straight from the IC — no receiver borrow, no `Callable` dispatch, no
-    /// re-probe. Identity/epoch/realm guards are exactly the user-entry ones; the callee
-    /// object is pinned in `call_pins` like any cached callee, and a builtin's `call` field
-    /// is never reassigned while the object lives.
-    pub native: usize,
-    /// Intrinsic id for a native entry the call template can inline entirely (0 = none;
-    /// see `INTRINSIC_ASCII_CODE_UNIT`). Filled from the fn pointer at record time.
-    pub intrinsic: u8,
-}
-
-/// [`CallIc::direct`] bit 4: the callee needs an activation environment (captured locals or
-/// lexical `this`) — the committed path enters through `jit::run` (which builds it) instead of
-/// `run_moved`. Bits 0-3 stay clear on such entries, so the machine-code direct sequence's
-/// first gate routes them to the helper.
-pub const CALL_IC_NEEDS_ENV: u8 = 16;
-
-/// `String.prototype.charCodeAt` and `codePointAt`: inline the all-ASCII receiver + exact-u32
-/// in-bounds index case to a byte load (see `crate::lstr::ASCII_HINT`).
-pub const INTRINSIC_ASCII_CODE_UNIT: u8 = 1;
-pub const INTRINSIC_STRING_SLICE: u8 = 2;
-pub const INTRINSIC_OBJECT_HAS_OWN: u8 = 3;
-pub const INTRINSIC_FUNCTION_APPLY: u8 = 4;
-pub const INTRINSIC_MATH_SQRT: u8 = 5;
-pub const INTRINSIC_ARRAY_PUSH: u8 = 6;
-pub const INTRINSIC_ARRAY_POP: u8 = 7;
-pub const INTRINSIC_FUNCTION_CALL: u8 = 8;
-pub const INTRINSIC_REGEXP_EXEC_DISCARD: u8 = 9;
-pub const INTRINSIC_STRING_REPLACE_DISCARD: u8 = 10;
-pub const INTRINSIC_STRING_SPLIT_DISCARD: u8 = 11;
-pub const INTRINSIC_CHAR_AT: u8 = 12;
-// IDs 13..=17 belong to collection lookup/insertion and their dedicated consuming helpers.
-
-impl CallIc {
-    pub const EMPTY: CallIc = CallIc {
-        callee: 0,
-        env: std::ptr::null(),
-        chunk: std::ptr::null(),
-        global_env: 0,
-        strict: false,
-        uses_this: false,
-        n_params: 0,
-        n_slots: 0,
-        direct: 0,
-        func: std::ptr::null(),
-        epoch: 0,
-        chunk_raw: std::ptr::null(),
-        native: 0,
-        intrinsic: 0,
-    };
-}
-
-/// A speculative-inline site's guard data: the pinned expected callee plus how the call site's
-/// stack is shaped when the guard runs (`argc` arguments above the callee).
-pub struct InlineTarget {
-    /// Stored `Rc` pointer of the expected callee function object.
-    pub expected: usize,
-    /// Keeps `expected` from ever being recycled (same ABA argument as [`CallIc`]): a live
-    /// `Value::Obj` whose payload equals it therefore IS the same, still-alive function.
-    pub pin: crate::value::WeakGc,
-    /// Exact shared closure environment required by a non-global free-name inline. Zero means
-    /// the callee has no such dependency.
-    pub expected_env: usize,
-    pub argc: u16,
-    /// Sloppy callee that reads `this`: the receiver must already be an object (the generic
-    /// path would box a primitive or substitute the global object).
-    pub check_this: bool,
-}
-
-/// Bumped whenever any function gains a second-stage (inlined) compile: every [`CallIc`] fills
-/// with the current value and misses on mismatch, so cached callers re-resolve through
-/// [`crate::interpreter::Interp::call_jit_fast`] and pick up `Function::code2`.
-pub static CALL_IC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// A call site's cache: 4-way set-associative over callee identity. Method-dispatch sites are
-/// routinely polymorphic (DeltaBlue rotates a handful of `execute` implementations through one
-/// loop), so a single entry thrashes; four entries filled round-robin stabilize any site with up
-/// to four distinct callees.
-/// Way count of [`CallSite::entries`] — the JIT call template's inline probe walks all of them.
-pub const CALL_IC_WAYS: usize = 4;
-
-pub struct CallSite {
-    pub entries: [std::cell::Cell<CallIc>; CALL_IC_WAYS],
-    /// Round-robin fill cursor.
-    pub next: std::cell::Cell<u8>,
-}
-
-impl CallSite {
-    pub fn empty() -> CallSite {
-        CallSite {
-            entries: [
-                std::cell::Cell::new(CallIc::EMPTY),
-                std::cell::Cell::new(CallIc::EMPTY),
-                std::cell::Cell::new(CallIc::EMPTY),
-                std::cell::Cell::new(CallIc::EMPTY),
-            ],
-            next: std::cell::Cell::new(0),
-        }
-    }
-    /// Record `ic`, replacing an existing way for the same callee (epoch or realm refills must
-    /// not fan one callee across ways — the inline planner reads way-count as polymorphism),
-    /// else the next way round-robin.
-    pub fn fill(&self, ic: CallIc) {
-        for e in &self.entries {
-            if e.get().callee == ic.callee {
-                e.set(ic);
-                return;
-            }
-        }
-        let k = self.next.get() as usize & 3;
-        self.entries[k].set(ic);
-        self.next.set((k as u8 + 1) & 3);
-    }
-}
-
-/// Monomorphic `new`-site cache. Constructors are overwhelmingly fixed per source site, so this
-/// avoids the interpreter-wide constructor hash table after the first execution while retaining
-/// the same epoch/realm/prototype guards.
-#[derive(Clone, Copy)]
-pub(crate) struct ConstructSite {
-    pub call: CallIc,
-    pub prototype_shape: u32,
-    pub prototype_slot: u32,
-    pub arguments_apply_forwarder: bool,
-}
-
-impl ConstructSite {
-    const EMPTY: ConstructSite = ConstructSite {
-        call: CallIc::EMPTY,
-        prototype_shape: 0,
-        prototype_slot: 0,
-        arguments_apply_forwarder: false,
     };
 }
 
@@ -466,8 +248,8 @@ pub enum Op {
     UpdateCap(u32, UpdKind),
     /// `++`/`--` on a free binding resolved through the closure/global environment.
     UpdateName(u32, UpdKind),
-    /// [`Op::UpdateName`] with a per-site generation-checked name cache. The JIT uses it for a
-    /// guarded numeric update; misses retain the complete free-name/ToNumeric semantics.
+    /// [`Op::UpdateName`] with a per-site generation-checked name cache; misses retain the
+    /// complete free-name/ToNumeric semantics.
     UpdateNameCached(u32, u32, UpdKind),
     /// Create a closure over the current environment from `Chunk::funcs[fidx]`. The second
     /// operand names an anonymous function expression per NamedEvaluation (`names` index, or
@@ -540,8 +322,8 @@ pub enum Op {
     /// iterator steps in the wrong order.
     DestructureArr(u16),
     /// `delete obj.name` (pops obj, pushes the bool result). Operands: name index and the
-    /// *function's* strictness — the oracle's `self.strict` is not maintained across direct
-    /// JIT→JIT call sequences, so it travels in the op.
+    /// *function's* strictness, which travels in the op rather than relying on the oracle's
+    /// `self.strict`.
     DeleteProp(u32, bool),
     /// `delete obj[k]` (pops k then obj, pushes the bool result; ToPropertyKey on the key
     /// before the nullish-base check, matching the oracle's order).
@@ -614,8 +396,7 @@ pub enum Op {
     StrictEq,
     StrictNotEq,
     /// `lhs instanceof rhs`, with one shape cache for the overwhelmingly common ordinary
-    /// constructor case. The JIT additionally validates the live constructor/prototype chain;
-    /// misses retain the complete `@@hasInstance` semantics through the generic executor.
+    /// constructor case; misses retain the complete `@@hasInstance` semantics through the generic executor.
     InstanceOf(u32),
     /// Any other binary operator (`**`, `in`, `instanceof`) via the interpreter, op in names.
     GenBin(u32),
@@ -636,26 +417,15 @@ pub enum Op {
     JumpIfFalsePeek(u32),
     JumpIfTruePeek(u32),
     JumpIfNotNullishPeek(u32),
-    /// Plain call: pops argc args and the callee; `this` is undefined. Second operand = the
-    /// per-site [`CallIc`] index.
-    Call(u16, u32),
+    /// Plain call: pops argc args and the callee; `this` is undefined.
+    Call(u16),
     /// Resolve a free name as a call target *before* the arguments evaluate (spec order):
     /// pushes the `with`-object `this` (or undefined) then the callee, feeding CallWithThis.
     /// Operands: name index, per-site [`NameIc`] index.
     LoadNameForCall(u32, u32),
-    /// Method call: pops argc args, the method, and the receiver pushed by GetMethod*. Second
-    /// operand = the per-site [`CallIc`] index.
-    CallWithThis(u16, u32),
-    /// Speculative-inline guard (see [`plan_inlines`]): with the stack holding
-    /// `[this, callee, arg0..argN]` for the call site, verify the callee is the pinned expected
-    /// function (and, for a sloppy this-using callee, that the receiver is already an object);
-    /// on mismatch jump to the operand (the generic call op). Operands: `Chunk::inline_targets`
-    /// index, jump target.
-    InlineGuard(u32, u32),
-    /// Reset `count` slots starting at `start` to undefined (dropping old values): a spliced
-    /// callee's hoisted vars start fresh on every pass through the site.
-    ResetSlots(u16, u16),
-    New(u16, u32),
+    /// Method call: pops argc args, the method, and the receiver pushed by GetMethod*.
+    CallWithThis(u16),
+    New(u16),
     /// A regexp literal: source and flags indices in `names`. Each execution allocates a fresh
     /// JS RegExp object while `Interp::regexp_programs` shares the immutable compiled matcher.
     MakeRegExp(u32, u32),
@@ -713,13 +483,6 @@ pub struct Chunk {
     /// hoisting overwrites same-named params; replicated bug-for-bug — it is the oracle).
     var_force_resets: Vec<u16>,
     uses_this: bool,
-    /// Distinct `this.name = …` stores before the body's first control-flow split, capped small.
-    /// `new` uses this to reserve the instance property vector exactly once; it costs no bytes
-    /// per object and avoids retaining geometric-growth slack.
-    instance_capacity_hint: u8,
-    /// Field count learned from a structurally proven `initialize.apply(this, arguments)`
-    /// forwarder. Once set it is as stable as the immutable forwarding/initializer chunks.
-    forwarded_capacity_hint: std::cell::Cell<u8>,
     /// Inner function templates for `MakeClosure`.
     funcs: Vec<Rc<Function>>,
     /// Captured bindings to seed into a fresh activation env at entry; empty = no activation
@@ -746,11 +509,6 @@ pub struct Chunk {
     name_pins: std::cell::RefCell<
         Vec<Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>>,
     >,
-    /// Numeric value observed when each name cache was filled. The JIT compares the live value
-    /// before using it, so ordinary assignment needs no invalidation. Split validity/bits keeps
-    /// this at nine bytes per site rather than padding a feedback struct to sixteen.
-    name_num_bits: Vec<std::cell::Cell<u64>>,
-    name_num_valid: Vec<std::cell::Cell<bool>>,
     /// Captured-binding cache keyed by the chunk's interned-name index. Unlike a free-name cache,
     /// this always resolves in the current activation; a weak pin keeps its raw scope pointer
     /// ABA-safe until a fresh/recursive activation refills the entry.
@@ -758,225 +516,21 @@ pub struct Chunk {
     cap_pins: std::cell::RefCell<
         Vec<Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>>,
     >,
-    /// Parsed straight-line initializer body (`this.x = arg` with optional truthy defaults).
-    initializer_plan: std::cell::OnceCell<Option<InitializerPlan>>,
-    /// Complete creation-shape chain for an exact straight-line constructor, keyed by the live
-    /// prototype epoch/identity and fresh receiver shape.
-    simple_constructor_shapes: std::cell::Cell<InitializerShapes>,
-    /// Parsed exact straight-line constructor fields; immutable bytecode makes this a one-time
-    /// structural decision rather than work repeated by every `new`.
-    simple_constructor_plan: std::cell::OnceCell<Option<Vec<InitializerField>>>,
-    /// Parsed `this.initialize.apply(this, arguments)` forwarding body.
-    arguments_forwarder: std::cell::OnceCell<Option<ArgumentsForwarder>>,
-    /// Immutable callable metadata behind a warmed forwarding constructor. Observable
-    /// properties are still IC-validated on every construction before this cache is used.
-    arguments_forwarder_runtime: std::cell::RefCell<Option<ForwarderRuntime>>,
-    /// Compiled matcher per RegExp-literal bytecode pc. Literal evaluation still allocates a
-    /// fresh JS wrapper and `lastIndex`; only immutable source/flags compilation is shared.
-    regexp_literals: Vec<std::cell::OnceCell<Rc<crate::regex::Regex>>>,
-    /// One [`CallSite`] per `Call`/`CallWithThis` site (the JIT→JIT fast call's callee cache).
-    call_caches: Vec<CallSite>,
-    /// One monomorphic identity cache per `New` site.
-    construct_caches: Vec<std::cell::Cell<ConstructSite>>,
-    /// Weak handles pinning every callee address a call cache has ever recorded (see [`CallIc`]),
-    /// keyed by that address — one pin per distinct callee no matter how often sites refill, so a
-    /// megamorphic site can't exhaust the budget for the whole chunk.
-    call_pins: std::cell::RefCell<
-        crate::fasthash::FastMap<usize, crate::value::WeakGc>,
-    >,
-    /// Guard data for speculatively inlined call sites (`Op::InlineGuard` indexes this).
-    inline_targets: Vec<InlineTarget>,
-    inline_frames: Option<inline_frames::Locations>,
-    /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
-    pub(crate) jit_runs: std::cell::Cell<u32>,
-    /// Whether the one-shot inline recompile has been attempted for this chunk.
-    pub(crate) inline_attempted: std::cell::Cell<bool>,
-}
-
-/// Borrowed description of a constructor whose complete body is a sequence of unique
-/// parameter-to-`this` stores followed by implicit return.
-pub(crate) struct SimpleConstructor<'a> {
-    chunk: &'a Chunk,
-    fields: &'a [InitializerField],
-}
-
-pub(crate) struct InitializerPlan {
-    fields: Vec<InitializerField>,
-    shapes: std::cell::Cell<InitializerShapes>,
-}
-
-struct InitializerField {
-    slot: u16,
-    default: Option<u32>,
-    name: u32,
-    cache: u32,
-}
-
-#[derive(Clone, Copy)]
-struct ArgumentsForwarder {
-    initializer: u32,
-    initializer_cache: u32,
-    apply_cache: u32,
-}
-
-struct ForwarderRuntime {
-    initializer: usize,
-    apply: usize,
-    pin: crate::value::WeakGc,
-    chunk: Rc<Chunk>,
-}
-
-#[derive(Clone, Copy, Default)]
-struct InitializerShapes {
-    epoch: u32,
-    proto: usize,
-    start: u32,
-    len: u8,
-    transitions: [u32; 16],
-}
-
-impl InitializerPlan {
-    #[inline(always)]
-    pub(crate) fn len(&self) -> usize {
-        self.fields.len()
-    }
-
-    pub(crate) fn cached_shapes(&self, epoch: u32, proto: usize, start: u32) -> Option<[u32; 16]> {
-        let cached = self.shapes.get();
-        (cached.epoch == epoch
-            && cached.proto == proto
-            && cached.start == start
-            && cached.len as usize == self.fields.len())
-        .then_some(cached.transitions)
-    }
-
-    pub(crate) fn cache_shapes(&self, epoch: u32, proto: usize, start: u32, values: &[u32]) {
-        debug_assert!(values.len() <= 16);
-        let mut transitions = [0; 16];
-        transitions[..values.len()].copy_from_slice(values);
-        self.shapes.set(InitializerShapes {
-            epoch,
-            proto,
-            start,
-            len: values.len() as u8,
-            transitions,
-        });
-    }
-}
-
-impl SimpleConstructor<'_> {
-    #[inline(always)]
-    pub(crate) fn len(&self) -> usize {
-        self.fields.len()
-    }
-
-    #[inline(always)]
-    pub(crate) fn field(&self, index: usize) -> (usize, &Rc<str>, &std::cell::Cell<IcState>) {
-        let field = &self.fields[index];
-        (
-            field.slot as usize,
-            &self.chunk.names[field.name as usize],
-            &self.chunk.caches[field.cache as usize],
-        )
-    }
-
-    pub(crate) fn cached_shapes(&self, epoch: u32, proto: usize, start: u32) -> Option<[u32; 16]> {
-        let cached = self.chunk.simple_constructor_shapes.get();
-        (cached.epoch == epoch
-            && cached.proto == proto
-            && cached.start == start
-            && cached.len as usize == self.fields.len())
-        .then_some(cached.transitions)
-    }
-
-    pub(crate) fn cache_shapes(&self, epoch: u32, proto: usize, start: u32, values: &[u32]) {
-        debug_assert!(values.len() <= 16);
-        let mut transitions = [0; 16];
-        transitions[..values.len()].copy_from_slice(values);
-        self.chunk.simple_constructor_shapes.set(InitializerShapes {
-            epoch,
-            proto,
-            start,
-            len: values.len() as u8,
-            transitions,
-        });
-    }
 }
 
 impl Chunk {
-    pub(crate) fn compiled_regexp_literal(
-        &self,
-        i: &mut Interp,
-        pc: usize,
-        body: u32,
-        flags: u32,
-    ) -> Result<Rc<crate::regex::Regex>, Abrupt> {
-        if let Some(re) = self.regexp_literals[pc].get() {
-            return Ok(re.clone());
-        }
-        let re = i.compiled_regexp(&self.names[body as usize], &self.names[flags as usize])?;
-        let _ = self.regexp_literals[pc].set(re.clone());
-        Ok(re)
-    }
-
-    fn make_regexp_literal(
-        &self,
-        i: &mut Interp,
-        pc: usize,
-        body: u32,
-        flags: u32,
-    ) -> Result<Value, Abrupt> {
-        let re = self.compiled_regexp_literal(i, pc, body, flags)?;
-        i.make_regexp_compiled(re)
-    }
-
-    #[inline]
-    fn record_name_number(&self, cache: usize, value: &Value) {
-        if let Value::Num(n) = value {
-            if !n.is_nan() {
-                self.name_num_bits[cache].set(n.to_bits());
-                self.name_num_valid[cache].set(true);
-                return;
-            }
-        }
-        self.name_num_valid[cache].set(false);
-    }
-
     /// Whether the body (or an inner arrow chain) reads `this`, so the caller must bind it.
     pub fn uses_this(&self) -> bool {
         self.uses_this || self.env_this
     }
 
-    pub(crate) fn instance_capacity_hint(&self) -> usize {
-        self.instance_capacity_hint
-            .max(self.forwarded_capacity_hint.get()) as usize
-    }
-    pub(crate) fn note_forwarded_capacity(&self, capacity: usize) {
-        self.forwarded_capacity_hint
-            .set(self.forwarded_capacity_hint.get().max(capacity as u8));
-    }
-    pub(crate) fn construct_cache(&self, cache: u32) -> ConstructSite {
-        self.construct_caches[cache as usize].get()
-    }
-    pub(crate) fn fill_construct_cache(
-        &self,
-        cache: u32,
-        entry: ConstructSite,
-        constructor: &crate::value::Gc,
-    ) {
-        self.construct_caches[cache as usize].set(entry);
-        self.call_pins
-            .borrow_mut()
-            .entry(entry.call.callee)
-            .or_insert_with(|| Gc::downgrade(constructor));
-    }
     /// Whether calls need a real activation environment (captured locals / lexical `this`).
     fn makes_env(&self) -> bool {
         !self.cap_inits.is_empty() || self.env_this
     }
 
-    /// Whether the JIT-to-JIT moved-frame path must stand down. An `arguments` object observes
-    /// the call frame even though it does not itself require an activation scope.
+    /// Whether the frame is observable beyond its slots: an activation environment, or an
+    /// `arguments` object (which observes the call frame without needing an activation scope).
     fn needs_env(&self) -> bool {
         self.makes_env() || self.arguments_slot.is_some()
     }
@@ -1852,126 +1406,6 @@ impl CaptureScan {
 
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
-    compile_inner(func, &Default::default(), None)
-}
-
-/// Second-stage compile: same as [`compile`], with hot monomorphic callees from `plan` spliced
-/// inline at their call sites (guarded; see [`plan_inlines`]).
-pub(crate) fn compile_with_inlines(
-    func: &Function,
-    plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
-    hot: &Chunk,
-) -> Option<Rc<Chunk>> {
-    let seed = std::env::var_os("LUMEN_JIT_NO_CACHE_SEED")
-        .is_none()
-        .then_some(hot);
-    let compiled = compile_inner(func, plan, seed)?;
-    inline_plan::compiled::record(func, &compiled);
-    Some(compiled)
-}
-
-fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])> {
-    chunk
-        .ops
-        .iter()
-        .filter_map(|op| {
-            let (name, cache) = match *op {
-                Op::GetProp(n, c)
-                | Op::GetPropThis(n, c)
-                | Op::SetProp(n, c)
-                | Op::SetPropDrop(n, c)
-                | Op::SetPropThisDrop(n, c)
-                | Op::AppendProp(n, c)
-                | Op::GetMethod(n, c) => (n, c),
-                Op::GetPropLocal(_, n, c) | Op::SetPropLocalDrop(_, n, c) => (n, c),
-                Op::UpdateProp(n, c, _) => (n, c),
-                _ => return None,
-            };
-            let states = std::array::from_fn(|way| chunk.caches[cache as usize + way].get());
-            Some((chunk.names[name as usize].clone(), states))
-        })
-        .collect()
-}
-
-type NamePin = Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>;
-type NameSeed = (Rc<str>, NameIc, NamePin, Option<u64>);
-type CallPin = crate::value::WeakGc;
-
-struct CallSeed {
-    entries: [CallIc; CALL_IC_WAYS],
-    next: u8,
-    pins: Vec<(usize, CallPin)>,
-}
-
-fn name_cache_seeds(chunk: &Chunk) -> Vec<NameSeed> {
-    let pins = chunk.name_pins.borrow();
-    chunk
-        .ops
-        .iter()
-        .filter_map(|op| {
-            let (name, cache) = match *op {
-                Op::LoadName(n, c)
-                | Op::LoadNameForCall(n, c)
-                | Op::StoreNameCached(n, c)
-                | Op::UpdateNameCached(n, c, _) => (n, c as usize),
-                _ => return None,
-            };
-            let number = chunk.name_num_valid[cache]
-                .get()
-                .then(|| chunk.name_num_bits[cache].get());
-            Some((
-                chunk.names[name as usize].clone(),
-                chunk.name_caches[cache].get(),
-                pins[cache].clone(),
-                number,
-            ))
-        })
-        .collect()
-}
-
-fn call_cache_seeds(chunk: &Chunk) -> Vec<CallSeed> {
-    let pins = chunk.call_pins.borrow();
-    chunk
-        .ops
-        .iter()
-        .filter_map(|op| {
-            let cache = match *op {
-                Op::Call(_, cache) | Op::CallWithThis(_, cache) => cache as usize,
-                _ => return None,
-            };
-            let site = chunk.call_caches.get(cache)?;
-            let entries = std::array::from_fn(|way| {
-                let entry = site.entries[way].get();
-                if entry.callee == 0 || pins.contains_key(&entry.callee) {
-                    entry
-                } else {
-                    CallIc::EMPTY
-                }
-            });
-            let mut seed_pins = Vec::new();
-            for entry in entries {
-                if entry.callee == 0 || seed_pins.iter().any(|(callee, _)| *callee == entry.callee)
-                {
-                    continue;
-                }
-                if let Some(pin) = pins.get(&entry.callee) {
-                    seed_pins.push((entry.callee, pin.clone()));
-                }
-            }
-            Some(CallSeed {
-                entries,
-                next: site.next.get(),
-                pins: seed_pins,
-            })
-        })
-        .collect()
-}
-
-fn compile_inner(
-    func: &Function,
-    plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
-    hot: Option<&Chunk>,
-) -> Option<Rc<Chunk>> {
     if func.ensure_body().is_err() {
         return None;
     }
@@ -2028,16 +1462,6 @@ fn compile_inner(
         env_this: env_this && !func.is_arrow,
         lexical_this: func.is_arrow,
         strict: func.is_strict,
-        plan_stack: vec![(plan.clone(), 0)],
-        cache_seed_stack: hot
-            .map(|chunk| vec![(property_cache_seeds(chunk), 0)])
-            .unwrap_or_default(),
-        name_seed_stack: hot
-            .map(|chunk| vec![(name_cache_seeds(chunk), 0)])
-            .unwrap_or_default(),
-        call_seed_stack: hot
-            .map(|chunk| vec![(call_cache_seeds(chunk), 0)])
-            .unwrap_or_default(),
         ..Compiler::default()
     };
     if uses_arguments {
@@ -2176,50 +1600,7 @@ fn compile_inner(
         }
     }
     c.emit(Op::ReturnUndef);
-    // Constructors in OO workloads overwhelmingly initialize a short, straight-line list of
-    // fields. Count distinct names only until control flow can make the estimate speculative,
-    // and decline large reservations: this is an allocation/memory optimization, not metadata
-    // proportional to object count.
-    let mut instance_names = [u32::MAX; 16];
-    let mut instance_capacity_hint = 0u8;
-    for op in &c.ops {
-        match op {
-            Op::SetPropThisDrop(name, _) => {
-                if !instance_names[..instance_capacity_hint as usize].contains(name) {
-                    if instance_capacity_hint == instance_names.len() as u8 {
-                        instance_capacity_hint = 0;
-                        break;
-                    }
-                    instance_names[instance_capacity_hint as usize] = *name;
-                    instance_capacity_hint += 1;
-                }
-            }
-            Op::Jump(..)
-            | Op::JumpIfFalse(..)
-            | Op::JumpIfFalsePeek(..)
-            | Op::JumpIfTruePeek(..)
-            | Op::JumpIfNotNullishPeek(..)
-            | Op::InlineGuard(..)
-            | Op::Throw
-            | Op::Return
-            | Op::ReturnUndef
-            | Op::Await
-            | Op::PushHandler(..) => break,
-            _ => {}
-        }
-    }
-    // A speculative inline can allocate child call-cache seeds and then roll its op/cache
-    // vectors back. Keep only Weak pins referenced by the surviving fixed-size sites so failed
-    // speculation neither retains dead Rc allocation blocks nor consumes the runtime pin budget.
-    c.call_pins.retain(|callee, _| {
-        c.call_caches.iter().any(|site| {
-            site.entries
-                .iter()
-                .any(|entry| entry.get().callee == *callee)
-        })
-    });
     let cap_cache_len = c.names.len();
-    let op_count = c.ops.len();
     let activation_layout = activation::ActivationLayout::new(&c.cap_inits, c.env_this, &c.names);
     Some(Rc::new(Chunk {
         ops: c.ops,
@@ -2231,8 +1612,6 @@ fn compile_inner(
         arguments_slot: c.arguments_slot,
         var_force_resets: c.var_force_resets,
         uses_this: c.uses_this,
-        instance_capacity_hint,
-        forwarded_capacity_hint: std::cell::Cell::new(0),
         funcs: c.funcs,
         cap_inits: c.cap_inits,
         activation_layout,
@@ -2241,45 +1620,15 @@ fn compile_inner(
             .map(|_| std::cell::OnceCell::new())
             .collect(),
         caches: c.caches,
-        name_pins: std::cell::RefCell::new(c.name_pins),
+        name_pins: std::cell::RefCell::new(vec![None; c.name_caches.len()]),
         name_paths: (0..c.name_caches.len())
             .map(|_| std::cell::RefCell::new(None))
             .collect(),
         name_caches: c.name_caches,
-        name_num_bits: c.name_num_bits,
-        name_num_valid: c.name_num_valid,
         cap_caches: vec![std::cell::Cell::new(NameIc::EMPTY); cap_cache_len],
         cap_pins: std::cell::RefCell::new(vec![None; cap_cache_len]),
-        initializer_plan: std::cell::OnceCell::new(),
-        simple_constructor_shapes: std::cell::Cell::new(InitializerShapes::default()),
-        simple_constructor_plan: std::cell::OnceCell::new(),
-        arguments_forwarder: std::cell::OnceCell::new(),
-        arguments_forwarder_runtime: std::cell::RefCell::new(None),
-        regexp_literals: (0..op_count).map(|_| std::cell::OnceCell::new()).collect(),
-        call_caches: c.call_caches,
-        construct_caches: c.construct_caches,
-        call_pins: std::cell::RefCell::new(c.call_pins),
-        inline_frames: c.inline_frames.finish(&c.inline_targets),
-        inline_targets: c.inline_targets,
-        jit_runs: std::cell::Cell::new(0),
-        inline_attempted: std::cell::Cell::new(false),
     }))
 }
-
-/// How many machine-code runs of a chunk trigger the one-shot inline recompile
-/// (`LUMEN_INLINE_AT` overrides; 0 disables).
-pub(crate) fn inline_recompile_at() -> u32 {
-    static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *AT.get_or_init(|| {
-        std::env::var("LUMEN_INLINE_AT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100)
-    })
-}
-
-mod inline_plan;
-pub(crate) use inline_plan::plan_inlines;
 
 #[derive(Default)]
 struct Compiler {
@@ -2310,24 +1659,7 @@ struct Compiler {
     /// Count of object-literal template sites handed out (see `Chunk::obj_maps`).
     obj_maps: u32,
     caches: Vec<std::cell::Cell<IcState>>,
-    /// Property-cache snapshots for the source frame currently being recompiled. The hot
-    /// first-stage caller is the root; entering a speculative inline pushes that callee's own
-    /// hot first-stage property-site vector. Cursors follow source property-op order, which is
-    /// stable for a function's AST even when `this` becomes an inline local; each seed also
-    /// carries its property name so a compiler-shape mismatch safely leaves the new site cold.
-    cache_seed_stack: Vec<(Vec<(Rc<str>, [IcState; PROP_IC_WAYS])>, usize)>,
     name_caches: Vec<std::cell::Cell<NameIc>>,
-    name_pins: Vec<NamePin>,
-    name_num_bits: Vec<std::cell::Cell<u64>>,
-    name_num_valid: Vec<std::cell::Cell<bool>>,
-    name_seed_stack: Vec<(Vec<NameSeed>, usize)>,
-    call_caches: Vec<CallSite>,
-    construct_caches: Vec<std::cell::Cell<ConstructSite>>,
-    call_pins: crate::fasthash::FastMap<usize, CallPin>,
-    /// Polymorphic call feedback for the source frame currently being recompiled. Like property
-    /// seeds, this is a compile-time stack: speculative child splices consume their own original
-    /// call-site order without disturbing the caller's cursor.
-    call_seed_stack: Vec<(Vec<CallSeed>, usize)>,
     /// Number of `PushHandler` regions active at the current emission point. `break`/`continue`
     /// jumping out of a `try` block (or a for-of body, which wraps itself in a handler) must
     /// emit a `PopHandler` per region crossed, or the stale handler catches unrelated throws
@@ -2342,43 +1674,6 @@ struct Compiler {
     funcs: Vec<Rc<Function>>,
     cap_inits: Vec<CapInit>,
     env_this: bool,
-    /// Speculative-inline plan stack (second-stage only): one frame per active splice, each
-    /// mapping that frame's call-site ordinal (== the function's first-compile `CallIc` index —
-    /// same AST, same emission order) to the callees to splice. See [`plan_inlines`].
-    plan_stack: Vec<(crate::fasthash::FastMap<u32, InlinePlanEntry>, u32)>,
-    /// > 0 while compiling a spliced callee body.
-    inline_depth: u32,
-    /// The slot holding the receiver while inlining a `this`-using callee.
-    inline_this: Option<u16>,
-    /// `return` jumps inside the current spliced body, patched to the join point.
-    inline_returns: Vec<usize>,
-    inline_targets: Vec<InlineTarget>,
-    inline_frames: inline_frames::Builder,
-}
-
-/// One planned inline: the callee function (AST) and its pinned identity.
-#[derive(Clone)]
-pub struct InlinePlanEntry {
-    /// Guarded ways, tried in order; a polymorphic site (DeltaBlue's constraint hierarchies)
-    /// splices each hot callee behind its own identity guard, falling through to the next.
-    pub ways: Vec<InlineWay>,
-}
-
-#[derive(Clone)]
-pub struct InlineWay {
-    pub f: Rc<Function>,
-    pub obj: crate::value::Gc,
-    pub check_this: bool,
-    pub uses_this: bool,
-    /// Free names the callee reads (global-closure callees only): the splice refuses any that
-    /// the caller's scopes shadow, so the inlined LoadNames resolve identically.
-    pub free_names: Vec<Rc<str>>,
-    /// Exact shared closure environment required by non-global free-name inlines.
-    pub expected_env: usize,
-    /// The callee's OWN inline plan (depth-capped recursion): call sites inside the spliced
-    /// body splice too, keyed by the callee-frame ordinal — its first-compile cache numbering,
-    /// which the splice reproduces by walking the same AST in the same order.
-    pub nested: crate::fasthash::FastMap<u32, InlinePlanEntry>,
 }
 
 /// Where a name resolves inside the compiled body.
@@ -2493,29 +1788,17 @@ fn no_assign_to(e: &Expr, name: &str) -> bool {
 
 impl Compiler {
     fn emit(&mut self, op: Op) -> usize {
-        self.inline_frames.emit();
         self.ops.push(op);
         self.ops.len() - 1
     }
     /// Reserve a fresh inline-cache slot (starts empty) for a property-access op.
-    fn new_cache(&mut self, name: u32) -> u32 {
+    fn new_cache(&mut self) -> u32 {
         // PROP_IC_WAYS consecutive ways per site: consumers address way 1; probes reach the
         // others at `cache_ptr + k` (see `Interp::ic_way`). Keeps every existing call site
         // untouched.
         let idx = self.caches.len() as u32;
-        let seed = self
-            .cache_seed_stack
-            .last_mut()
-            .and_then(|(sites, cursor)| {
-                let site = sites.get(*cursor);
-                *cursor += 1;
-                site.filter(|(hot_name, _)| &**hot_name == &*self.names[name as usize])
-                    .map(|(_, states)| *states)
-            });
-        for way in 0..PROP_IC_WAYS {
-            self.caches.push(std::cell::Cell::new(
-                seed.map(|states| states[way]).unwrap_or(IcState::EMPTY),
-            ));
+        for _ in 0..PROP_IC_WAYS {
+            self.caches.push(std::cell::Cell::new(IcState::EMPTY));
         }
         idx
     }
@@ -2528,324 +1811,13 @@ impl Compiler {
         idx
     }
     /// Reserve a fresh name-cache slot for a free-name op.
-    fn new_name_cache(&mut self, name: u32) -> u32 {
-        let seed = self.name_seed_stack.last_mut().and_then(|(sites, cursor)| {
-            let site = sites.get(*cursor);
-            *cursor += 1;
-            site.filter(|(hot_name, ..)| &**hot_name == &*self.names[name as usize])
-                .cloned()
-        });
-        let (ic, pin, number) = match seed {
-            Some((_, ic, pin, number)) => (ic, pin, number),
-            None => (NameIc::EMPTY, None, None),
-        };
-        self.name_caches.push(std::cell::Cell::new(ic));
-        self.name_pins.push(pin);
-        self.name_num_bits
-            .push(std::cell::Cell::new(number.unwrap_or(0)));
-        self.name_num_valid
-            .push(std::cell::Cell::new(number.is_some()));
+    fn new_name_cache(&mut self) -> u32 {
+        self.name_caches.push(std::cell::Cell::new(NameIc::EMPTY));
         (self.name_caches.len() - 1) as u32
     }
     fn emit_store_name(&mut self, name: u32) {
-        let cache = self.new_name_cache(name);
+        let cache = self.new_name_cache();
         self.emit(Op::StoreNameCached(name, cache));
-    }
-    /// Reserve a fresh call-cache slot for a `Call`/`CallWithThis` site.
-    fn new_call_cache(&mut self) -> u32 {
-        // Every frame counts its own call-site ordinals (see `Compiler::plan_stack`).
-        if let Some(top) = self.plan_stack.last_mut() {
-            top.1 += 1;
-        }
-        let seed = self.call_seed_stack.last_mut().and_then(|(sites, cursor)| {
-            let seed = sites.get(*cursor);
-            *cursor += 1;
-            seed.map(|seed| (seed.entries, seed.next, seed.pins.clone()))
-        });
-        let site = if let Some((entries, next, pins)) = seed {
-            for (callee, pin) in pins {
-                self.call_pins.entry(callee).or_insert(pin);
-            }
-            CallSite {
-                entries: std::array::from_fn(|way| std::cell::Cell::new(entries[way])),
-                next: std::cell::Cell::new(next),
-            }
-        } else {
-            CallSite::empty()
-        };
-        self.call_caches.push(site);
-        (self.call_caches.len() - 1) as u32
-    }
-    fn new_construct_cache(&mut self) -> u32 {
-        let cache = self.construct_caches.len() as u32;
-        self.construct_caches
-            .push(std::cell::Cell::new(ConstructSite::EMPTY));
-        cache
-    }
-
-    /// The current frame's plan entry for the NEXT call site (call before `new_call_cache`).
-    fn plan_hit(&self) -> Option<InlinePlanEntry> {
-        let (plan, ord) = self.plan_stack.last()?;
-        plan.get(ord).cloned()
-    }
-
-    /// Emit a planned speculative inline for a method call site whose stack already holds
-    /// `[this, method, args...]`; anything the splice can't express reverts to the plain call.
-    fn emit_call_with_inline(
-        &mut self,
-        entry: InlinePlanEntry,
-        argc: u16,
-        cc: u32,
-        has_this: bool,
-    ) {
-        let snap = (
-            self.ops.len(),
-            self.consts.len(),
-            self.names.len(),
-            self.caches.len(),
-            self.name_caches.len(),
-            self.call_caches.len(),
-            self.inline_targets.len(),
-            self.slot_names.len(),
-            self.funcs.len(),
-            self.inline_frames.checkpoint(),
-        );
-        if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
-            self.ops.truncate(snap.0);
-            self.inline_frames.rollback(snap.9, snap.0);
-            self.consts.truncate(snap.1);
-            self.names.truncate(snap.2);
-            self.caches.truncate(snap.3);
-            self.name_caches.truncate(snap.4);
-            self.name_pins.truncate(snap.4);
-            self.name_num_bits.truncate(snap.4);
-            self.name_num_valid.truncate(snap.4);
-            self.call_caches.truncate(snap.5);
-            self.inline_targets.truncate(snap.6);
-            self.slot_names.truncate(snap.7);
-            self.funcs.truncate(snap.8);
-            if has_this {
-                self.emit(Op::CallWithThis(argc, cc));
-            } else {
-                self.emit(Op::Call(argc, cc));
-            }
-        }
-    }
-
-    fn try_emit_inline(
-        &mut self,
-        entry: &InlinePlanEntry,
-        argc: u16,
-        cc: u32,
-        has_this: bool,
-    ) -> CResult {
-        if argc > 8 {
-            return Err(Bail); // the JIT guard peeks the callee with a ±256-byte unscaled load
-        }
-        // Per-way gates: a plain `Call` site has no `this` beneath the callee (a this-using
-        // callee needs the generic binding, and the guard's receiver peek would read past the
-        // operands); a caller binding (slot or captured) would shadow a global free name.
-        let ways: Vec<&InlineWay> = entry
-            .ways
-            .iter()
-            .filter(|w| {
-                (has_this || !w.uses_this)
-                    && (w.expected_env != 0
-                        || !w.free_names.iter().any(|name| {
-                            self.lookup(name).is_some() || self.env_names.contains_key(&**name)
-                        }))
-            })
-            .collect();
-        if ways.is_empty() {
-            return Err(Bail);
-        }
-        // Each way: identity guard → bind → spliced body → jump to the shared join; a guard
-        // mismatch falls to the next way, the last one to the generic call.
-        let mut end_jumps: Vec<usize> = Vec::new();
-        let mut pending_guard: Option<usize> = None;
-        for w in &ways {
-            if let Some(g) = pending_guard.take() {
-                self.patch(g); // previous way's mismatch lands on this way's guard
-            }
-            let guard = self.emit_inline_way(w, argc, has_this, &mut end_jumps)?;
-            pending_guard = Some(guard);
-        }
-        // ---- join: every way's result jumps here; the last mismatch runs the generic call.
-        self.patch(pending_guard.take().expect("at least one way"));
-        if has_this {
-            self.emit(Op::CallWithThis(argc, cc));
-        } else {
-            self.emit(Op::Call(argc, cc));
-        }
-        for j in end_jumps {
-            self.patch(j);
-        }
-        Ok(())
-    }
-
-    /// One guarded splice: emits the identity guard (returned unpatched — the caller chains it
-    /// to the next way or the generic call), the frame binds, and the body; the result-carrying
-    /// exits are appended to `end_jumps`.
-    fn emit_inline_way(
-        &mut self,
-        w: &InlineWay,
-        argc: u16,
-        has_this: bool,
-        end_jumps: &mut Vec<usize>,
-    ) -> Result<usize, Bail> {
-        let f = &w.f;
-        let t = self.inline_targets.len() as u32;
-        self.inline_targets.push(InlineTarget {
-            expected: Gc::as_ptr(&w.obj) as usize,
-            pin: Gc::downgrade(&w.obj),
-            expected_env: w.expected_env,
-            argc,
-            check_this: has_this && w.check_this,
-        });
-        let guard = self.emit(Op::InlineGuard(t, 0));
-
-        // ---- bind the callee frame into fresh caller slots ----
-        let n_params = f.params.len();
-        for _ in n_params..argc as usize {
-            self.emit(Op::Pop); // surplus arguments (evaluated; excess drops from the top)
-        }
-        for _ in argc as usize..n_params {
-            self.emit(Op::Undef); // missing arguments
-        }
-        let mut param_slots: Vec<u16> = Vec::with_capacity(n_params);
-        for p in &f.params {
-            let Pattern::Ident(name) = &p.pattern else {
-                return Err(Bail);
-            };
-            if p.default.is_some() || p.rest {
-                return Err(Bail);
-            }
-            param_slots.push(self.fresh_slot(name));
-        }
-        for &s in param_slots.iter().rev() {
-            self.emit(Op::StoreLocal(s));
-        }
-        self.emit(Op::Pop); // the method (identity proven; the value itself is dead)
-        let this_slot = if !has_this {
-            None // a plain Call site: nothing beneath the callee
-        } else if w.uses_this {
-            let s = self.fresh_slot("(inline this)");
-            self.emit(Op::StoreLocal(s));
-            Some(s)
-        } else {
-            self.emit(Op::Pop);
-            None
-        };
-
-        // ---- compile the body under the callee's (empty) namespace ----
-        let saved_scopes = std::mem::take(&mut self.scopes);
-        let saved_env_names = std::mem::take(&mut self.env_names);
-        let saved_loops = std::mem::take(&mut self.loops);
-        let saved_labels = std::mem::take(&mut self.pending_labels);
-        let saved_try = std::mem::replace(&mut self.try_depth, 0);
-        let saved_this = std::mem::replace(&mut self.inline_this, this_slot);
-        let saved_returns = std::mem::take(&mut self.inline_returns);
-        self.inline_depth += 1;
-        self.plan_stack.push((w.nested.clone(), 0));
-        let hot_chunk = f.code.get().and_then(Option::as_ref);
-        self.cache_seed_stack.push((
-            hot_chunk
-                .map(|chunk| property_cache_seeds(chunk))
-                .unwrap_or_default(),
-            0,
-        ));
-        self.name_seed_stack.push((
-            hot_chunk
-                .map(|chunk| name_cache_seeds(chunk))
-                .unwrap_or_default(),
-            0,
-        ));
-        self.call_seed_stack.push((
-            hot_chunk
-                .map(|chunk| call_cache_seeds(chunk))
-                .unwrap_or_default(),
-            0,
-        ));
-        self.scopes.push(Vec::new());
-        for (k, p) in f.params.iter().enumerate() {
-            let Pattern::Ident(name) = &p.pattern else {
-                unreachable!()
-            };
-            self.scope_bind(name, param_slots[k], false);
-        }
-        let frame_context = self.inline_frames.enter(t, f.is_strict, self.ops.len());
-        let r = self.inline_body(f);
-        self.inline_frames.leave(frame_context);
-        self.call_seed_stack.pop();
-        self.name_seed_stack.pop();
-        self.cache_seed_stack.pop();
-        self.plan_stack.pop();
-        self.inline_depth -= 1;
-        let returns = std::mem::replace(&mut self.inline_returns, saved_returns);
-        self.inline_this = saved_this;
-        self.try_depth = saved_try;
-        self.pending_labels = saved_labels;
-        self.loops = saved_loops;
-        self.env_names = saved_env_names;
-        self.scopes = saved_scopes;
-        r?;
-
-        end_jumps.push(self.emit(Op::Jump(0)));
-        end_jumps.extend(returns);
-        Ok(guard)
-    }
-
-    /// Compile a spliced callee body: mirrors `compile_inner`'s hoist + lexical + statement
-    /// sequence, with explicit per-execution resets replacing the fresh frame's zeroed slots.
-    fn inline_body(&mut self, f: &Function) -> CResult {
-        // Hoisted vars start undefined on EVERY pass through the site; fused-reset runs are
-        // emitted per contiguous slot range (fresh slots are consecutive, so usually one op).
-        let mut resets: Vec<u16> = Vec::new();
-        let body = f.body();
-        for op in crate::interpreter::collect_hoist_ops(&body, f.is_strict, &[]) {
-            match op {
-                HoistOp::Var(name) => {
-                    if self.lookup(&name).is_none() {
-                        let slot = self.fresh_slot(&name);
-                        self.scope_bind(&name, slot, false);
-                        resets.push(slot);
-                    }
-                }
-                HoistOp::VarForce(name) => {
-                    let slot = match self.lookup(&name) {
-                        Some((s, _)) => s,
-                        None => {
-                            let s = self.fresh_slot(&name);
-                            self.scope_bind(&name, s, false);
-                            s
-                        }
-                    };
-                    if !resets.contains(&slot) {
-                        resets.push(slot);
-                    }
-                }
-                HoistOp::Fn(..) | HoistOp::AnnexB(..) => return Err(Bail),
-            }
-        }
-        resets.sort_unstable();
-        let mut k = 0;
-        while k < resets.len() {
-            let start = resets[k];
-            let mut count = 1u16;
-            while k + (count as usize) < resets.len() && resets[k + count as usize] == start + count
-            {
-                count += 1;
-            }
-            self.emit(Op::ResetSlots(start, count));
-            k += count as usize;
-        }
-        let empty = std::collections::HashSet::new();
-        self.declare_body_lexicals(&body, &empty)?;
-        for stmt in body.iter() {
-            self.stmt(stmt)?;
-        }
-        self.emit(Op::Undef); // implicit return value
-        Ok(())
     }
     /// Declare every binding a lexical declaration pattern introduces, in source order (slot +
     /// TDZ each, like the plain-identifier path). Only the destructuring subset the compiler
@@ -2936,7 +1908,7 @@ impl Compiler {
                     };
                     let ki = self.name_idx(&key);
                     self.emit(Op::Dup);
-                    let c = self.new_cache(ki);
+                    let c = self.new_cache();
                     self.emit(Op::GetProp(ki, c));
                     self.destructure_store(&prop.value, kind)?;
                 }
@@ -3053,7 +2025,7 @@ impl Compiler {
                     self.opt_link(1, shorts);
                 }
                 let i = self.name_idx(prop);
-                let c = self.new_cache(i);
+                let c = self.new_cache();
                 self.emit(Op::GetProp(i, c));
                 Ok(())
             }
@@ -3091,7 +2063,7 @@ impl Compiler {
                     self.opt_link(1, shorts);
                 }
                 let i = self.name_idx(prop);
-                let c = self.new_cache(i);
+                let c = self.new_cache();
                 self.emit(Op::GetMethod(i, c));
                 if *call_opt {
                     // `a.b?.(args)`: the method value is peeked; nullish drops [obj, method].
@@ -3103,8 +2075,7 @@ impl Compiler {
                     };
                     self.expr(a)?;
                 }
-                let cc = self.new_call_cache();
-                self.emit(Op::CallWithThis(args.len() as u16, cc));
+                self.emit(Op::CallWithThis(args.len() as u16));
                 Ok(())
             }
             // The chain's base (before any `?.` link): an ordinary expression.
@@ -3200,8 +2171,7 @@ impl Compiler {
             | Op::JumpIfFalse(t)
             | Op::JumpIfFalsePeek(t)
             | Op::JumpIfTruePeek(t)
-            | Op::JumpIfNotNullishPeek(t)
-            | Op::InlineGuard(_, t) => *t = target,
+            | Op::JumpIfNotNullishPeek(t) => *t = target,
             _ => unreachable!("patching a non-jump"),
         }
     }
@@ -3343,20 +2313,6 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Return(arg) => {
-                // Inside a spliced callee body, `return v` is "leave v on the stack and jump to
-                // the join point" (the plan guarantees no handlers/for-of regions to unwind:
-                // the callee chunk contains no PushHandler).
-                if self.inline_depth > 0 {
-                    match arg {
-                        Some(e) => self.expr(e)?,
-                        None => {
-                            self.emit(Op::Undef);
-                        }
-                    }
-                    let j = self.emit(Op::Jump(0));
-                    self.inline_returns.push(j);
-                    return Ok(());
-                }
                 // A return crossing compiled for-of loops must IteratorClose them (the value
                 // evaluates first, spec order). One level is modeled exactly; more would need
                 // the spec's cascading throw-mode closes — bail to the tree-walker.
@@ -4002,7 +2958,7 @@ impl Compiler {
                         // closures under `with` are rejected at entry and direct eval in this
                         // body prevents compilation, so no nearer binding can appear between
                         // this read and StoreName; re-resolution names the same Reference.
-                        let c = self.new_name_cache(i);
+                        let c = self.new_name_cache();
                         self.emit(Op::LoadName(i, c));
                         self.expr(value)?;
                         self.emit_compound(op)?;
@@ -4030,20 +2986,11 @@ impl Compiler {
             {
                 self.expr(value)?;
                 let i = self.name_idx(prop);
-                let c = self.new_cache(i);
+                let c = self.new_cache();
                 match &**mobj {
                     Expr::This => {
-                        if self.inline_depth > 0 {
-                            match self.inline_this {
-                                Some(slot) => {
-                                    self.emit(Op::SetPropLocalDrop(slot, i, c));
-                                }
-                                None => return Err(Bail), // splice without a this binding
-                            }
-                        } else {
-                            self.uses_this = true;
-                            self.emit(Op::SetPropThisDrop(i, c));
-                        }
+                        self.uses_this = true;
+                        self.emit(Op::SetPropThisDrop(i, c));
                     }
                     Expr::Ident(name) => {
                         let Some(Home::Slot(slot, _)) = self.home(name) else {
@@ -4066,10 +3013,10 @@ impl Compiler {
                     // Fused append: same evaluation order (read before RHS), and the op itself
                     // falls back to the generic Add + store when anything isn't plain strings.
                     self.emit(Op::Dup);
-                    let cg = self.new_cache(i);
+                    let cg = self.new_cache();
                     self.emit(Op::GetProp(i, cg));
                     self.expr(value)?;
-                    let c = self.new_cache(i);
+                    let c = self.new_cache();
                     self.emit(Op::AppendProp(i, c));
                     return Ok(true);
                 }
@@ -4077,12 +3024,12 @@ impl Compiler {
                     self.expr(value)?;
                 } else {
                     self.emit(Op::Dup);
-                    let cg = self.new_cache(i);
+                    let cg = self.new_cache();
                     self.emit(Op::GetProp(i, cg));
                     self.expr(value)?;
                     self.emit_compound(op)?;
                 }
-                let c = self.new_cache(i);
+                let c = self.new_cache();
                 self.emit(Op::SetPropDrop(i, c));
                 Ok(true)
             }
@@ -4193,7 +3140,7 @@ impl Compiler {
                     }
                     None => {
                         let i = self.name_idx(name);
-                        let c = self.new_name_cache(i);
+                        let c = self.new_name_cache();
                         self.emit(Op::LoadName(i, c));
                     }
                 };
@@ -4221,26 +3168,17 @@ impl Compiler {
                 // Receiver-direct forms: `this.x` and `slotlocal.x` skip the operand-stack
                 // round trip (push + refcount bump + drop) entirely.
                 match &**obj {
-                    // Inside a splice `this` is the receiver slot; otherwise the frame binding.
-                    Expr::This if self.inline_depth > 0 => {
-                        if let Some(slot) = self.inline_this {
-                            let i = self.name_idx(prop);
-                            let c = self.new_cache(i);
-                            self.emit(Op::GetPropLocal(slot, i, c));
-                            return Ok(());
-                        }
-                    }
                     Expr::This if self.direct_this_allowed() => {
                         self.uses_this = true;
                         let i = self.name_idx(prop);
-                        let c = self.new_cache(i);
+                        let c = self.new_cache();
                         self.emit(Op::GetPropThis(i, c));
                         return Ok(());
                     }
                     Expr::Ident(name) => {
                         if let Some(Home::Slot(slot, _)) = self.home(name) {
                             let i = self.name_idx(prop);
-                            let c = self.new_cache(i);
+                            let c = self.new_cache();
                             self.emit(Op::GetPropLocal(slot, i, c));
                             return Ok(());
                         }
@@ -4249,7 +3187,7 @@ impl Compiler {
                 }
                 self.expr(obj)?;
                 let i = self.name_idx(prop);
-                let c = self.new_cache(i);
+                let c = self.new_cache();
                 self.emit(Op::GetProp(i, c));
                 Ok(())
             }
@@ -4423,21 +3361,12 @@ impl Compiler {
                     } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                         self.expr(obj)?;
                         let i = self.name_idx(prop);
-                        let c = self.new_cache(i);
+                        let c = self.new_cache();
                         self.emit(Op::GetMethod(i, c));
                         if self.call_args(args)? {
                             self.emit(Op::CallSpreadThis(args.len() as u16));
                         } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, true)
-                                }
-                                None => {
-                                    self.emit(Op::CallWithThis(args.len() as u16, cc));
-                                }
-                            }
+                            self.emit(Op::CallWithThis(args.len() as u16));
                         }
                     }
                     Expr::Index {
@@ -4451,16 +3380,7 @@ impl Compiler {
                         if self.call_args(args)? {
                             self.emit(Op::CallSpreadThis(args.len() as u16));
                         } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, true)
-                                }
-                                None => {
-                                    self.emit(Op::CallWithThis(args.len() as u16, cc));
-                                }
-                            }
+                            self.emit(Op::CallWithThis(args.len() as u16));
                         }
                     }
                     Expr::Super => return Err(Bail),
@@ -4468,21 +3388,12 @@ impl Compiler {
                         // Free-name callee: resolved before the arguments (spec order), and a
                         // `with (obj) f()` hit supplies obj as `this`.
                         let i = self.name_idx(name);
-                        let c = self.new_name_cache(i);
+                        let c = self.new_name_cache();
                         self.emit(Op::LoadNameForCall(i, c));
                         if self.call_args(args)? {
                             self.emit(Op::CallSpreadThis(args.len() as u16));
                         } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, true)
-                                }
-                                None => {
-                                    self.emit(Op::CallWithThis(args.len() as u16, cc));
-                                }
-                            }
+                            self.emit(Op::CallWithThis(args.len() as u16));
                         }
                     }
                     other => {
@@ -4490,16 +3401,7 @@ impl Compiler {
                         if self.call_args(args)? {
                             self.emit(Op::CallSpread(args.len() as u16));
                         } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, false)
-                                }
-                                None => {
-                                    self.emit(Op::Call(args.len() as u16, cc));
-                                }
-                            }
+                            self.emit(Op::Call(args.len() as u16));
                         }
                     }
                 }
@@ -4513,8 +3415,7 @@ impl Compiler {
                     };
                     self.expr(a)?;
                 }
-                let cache = self.new_construct_cache();
-                self.emit(Op::New(args.len() as u16, cache));
+                self.emit(Op::New(args.len() as u16));
                 Ok(())
             }
             Expr::Regex { body, flags } => {
@@ -4558,7 +3459,7 @@ impl Compiler {
                 Some(Home::Slot(_, true)) | Some(Home::Env(true)) => Err(Bail),
                 None => {
                     let n = self.name_idx(name);
-                    let c = self.new_name_cache(n);
+                    let c = self.new_name_cache();
                     self.emit(Op::UpdateNameCached(n, c, kind));
                     Ok(())
                 }
@@ -4570,7 +3471,7 @@ impl Compiler {
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 let i = self.name_idx(prop);
-                let c = self.new_cache(i);
+                let c = self.new_cache();
                 self.emit(Op::UpdateProp(i, c, kind));
                 Ok(())
             }
@@ -4635,7 +3536,7 @@ impl Compiler {
                         self.named_expr(value, name)?;
                     } else {
                         // See the discarded-assignment path above for the stable-Reference proof.
-                        let c = self.new_name_cache(i);
+                        let c = self.new_name_cache();
                         self.emit(Op::LoadName(i, c));
                         self.expr(value)?;
                         self.emit_compound(op)?;
@@ -4657,12 +3558,12 @@ impl Compiler {
                 } else {
                     // Compound: base evaluated once (Dup), get before the RHS — Reference order.
                     self.emit(Op::Dup);
-                    let cg = self.new_cache(i);
+                    let cg = self.new_cache();
                     self.emit(Op::GetProp(i, cg));
                     self.expr(value)?;
                     self.emit_compound(op)?;
                 }
-                let c = self.new_cache(i);
+                let c = self.new_cache();
                 self.emit(Op::SetProp(i, c));
                 Ok(())
             }
@@ -4848,7 +3749,6 @@ fn run_vm(
         };
     }
     loop {
-        chunk.record_inline_location(i, *pc);
         let op = chunk.ops[*pc];
         *pc += 1;
         match op {
@@ -5463,25 +4363,6 @@ fn run_vm(
                 }
                 *pc = t as usize
             }
-            Op::InlineGuard(t, target) => {
-                let it = &chunk.inline_targets[t as usize];
-                let d = it.argc as usize + 1;
-                let callee_ok = matches!(
-                    &stack[stack.len() - d],
-                    Value::Obj(o) if Gc::as_ptr(o) as usize == it.expected
-                );
-                let this_ok =
-                    !it.check_this || matches!(&stack[stack.len() - d - 1], Value::Obj(_));
-                let env_ok = it.expected_env == 0 || Rc::as_ptr(env) as usize == it.expected_env;
-                if !(callee_ok && this_ok && env_ok) {
-                    *pc = target as usize;
-                }
-            }
-            Op::ResetSlots(start, count) => {
-                for k in start as usize..start as usize + count as usize {
-                    slots[k] = Value::Undefined;
-                }
-            }
             Op::JumpIfFalse(t) => {
                 let a = pop!();
                 if !i.to_boolean(&a) {
@@ -5510,7 +4391,7 @@ fn run_vm(
             // The callee/receiver slots below the window are cloned out first, then the whole
             // region is truncated away after the call. On a throw the stack is left long, which is
             // fine: the handler unwind (or function exit) truncates it.
-            Op::Call(argc, _) => {
+            Op::Call(argc) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack[at - 1].clone();
                 let v = i.call(callee, Value::Undefined, &stack[at..])?;
@@ -5532,7 +4413,7 @@ fn run_vm(
                     stack.push(callee);
                 }
             }
-            Op::CallWithThis(argc, _) => {
+            Op::CallWithThis(argc) => {
                 let at = stack.len() - argc as usize;
                 let m = stack[at - 1].clone();
                 let this = stack[at - 2].clone();
@@ -5540,7 +4421,7 @@ fn run_vm(
                 stack.truncate(at - 2);
                 stack.push(v);
             }
-            Op::New(argc, _) => {
+            Op::New(argc) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack[at - 1].clone();
                 let v = i.construct(callee, &stack[at..])?;
@@ -5862,63 +4743,6 @@ impl Chunk {
     pub(crate) fn jit_ops(&self) -> &[Op] {
         &self.ops
     }
-    /// Leading slot names, for debug identification of a chunk (`LUMEN_JIT_DUMP`).
-    pub(crate) fn jit_slot_names(&self) -> &[Rc<str>] {
-        &self.slot_names
-    }
-    /// Guard data for a speculative-inline site (`Op::InlineGuard`'s first operand).
-    pub(crate) fn jit_inline_target(&self, t: u32) -> &InlineTarget {
-        &self.inline_targets[t as usize]
-    }
-    /// The interned name a property op refers to (the emitter gates array-receiver inlining on
-    /// whether it could be an element key).
-    pub(crate) fn jit_name(&self, n: u32) -> &str {
-        &self.names[n as usize]
-    }
-    /// The stable address of inline-cache site `idx`'s `Cell<IcState>`. The `caches` `Vec` is
-    /// fixed once compilation finishes (never reallocated), and the `Chunk` outlives its own JIT
-    /// code, so the JIT bakes this address as an immediate to read the live cache from machine
-    /// code. `None` if the emitter cannot use it (the address must be reachable — always is here).
-    pub(crate) fn jit_cache_ptr(&self, idx: u32) -> usize {
-        self.caches.as_ptr() as usize
-            + idx as usize * std::mem::size_of::<std::cell::Cell<IcState>>()
-    }
-    /// The hottest property-cache way observed during bytecode warmup. A compact JIT site may
-    /// bake this state behind full shape/prototype guards and route misses to the checked helper.
-    pub(crate) fn jit_cache_preferred(&self, idx: u32) -> Option<IcState> {
-        let st = self.caches[idx as usize].get();
-        // A compact template bakes one shape. It is a win only for a truly monomorphic site;
-        // choosing way 0 at a polymorphic virtual-method call makes every other stable way fall
-        // through to Rust. Seeded second-stage chunks preserve all hot ways, so keep their full
-        // native probe whenever warmup observed more than one receiver shape.
-        let mono =
-            (1..PROP_IC_WAYS).all(|way| self.caches[idx as usize + way].get().depth == IC_EMPTY);
-        (st.depth != IC_EMPTY && mono).then_some(st)
-    }
-    /// The stable address of call site `idx`'s way-1 `Cell<CallIc>` (same contract as
-    /// [`Chunk::jit_cache_ptr`]: `call_caches` is fixed once compilation finishes and the Chunk
-    /// outlives its JIT code).
-    pub(crate) fn jit_call_cache_ptr(&self, idx: u32) -> usize {
-        self.call_caches[idx as usize].entries.as_ptr() as usize
-    }
-    /// The stable address of name-cache site `idx`'s `Cell<NameIc>` (same contract as
-    /// [`Chunk::jit_cache_ptr`]).
-    pub(crate) fn jit_name_cache_ptr(&self, idx: u32) -> usize {
-        self.name_caches.as_ptr() as usize
-            + idx as usize * std::mem::size_of::<std::cell::Cell<NameIc>>()
-    }
-    /// Stable address of the captured-binding cache for interned name `idx`.
-    pub(crate) fn jit_cap_cache_ptr(&self, idx: u32) -> usize {
-        self.cap_caches.as_ptr() as usize
-            + idx as usize * std::mem::size_of::<std::cell::Cell<NameIc>>()
-    }
-    /// Numeric value observed at this name site before second-stage compilation. Generated code
-    /// compares the live binding/property bits before taking the specialized decode path.
-    pub(crate) fn jit_name_number(&self, idx: u32) -> Option<u64> {
-        self.name_num_valid[idx as usize]
-            .get()
-            .then(|| self.name_num_bits[idx as usize].get())
-    }
     /// Name-cache hit check (see [`NameIc`] for the validation story): a pointer compare, a
     /// generation compare, and a value clone. `None` = miss (including TDZ — the slow path
     /// throws the proper error).
@@ -6004,7 +4828,6 @@ impl Chunk {
                     return None;
                 }
                 let v = bd.value.clone();
-                self.record_name_number(c as usize, &v);
                 self.name_caches[c as usize].set(NameIc {
                     env: Rc::as_ptr(env) as usize,
                     binding: bd as *const _ as usize as u64,
@@ -6029,7 +4852,6 @@ impl Chunk {
                         if let Some(bd) = pb.vars.get(&*self.names[n as usize]) {
                             if bd.initialized && bd.import_ref.is_none() {
                                 let v = bd.value.clone();
-                                self.record_name_number(c as usize, &v);
                                 self.name_caches[c as usize].set(NameIc {
                                     env: Rc::as_ptr(p) as usize | 2,
                                     binding: bd as *const _ as usize as u64,
@@ -6066,7 +4888,6 @@ impl Chunk {
             return None;
         }
         let v = p.value();
-        self.record_name_number(c as usize, &v);
         self.name_caches[c as usize].set(NameIc {
             env: Rc::as_ptr(env) as usize | 1,
             binding: ((g.props.shape() as u64) << 32) | slot as u64,
@@ -6242,293 +5063,21 @@ impl Chunk {
     pub(crate) fn jit_frame(&self) -> (usize, usize) {
         (self.n_params, self.n_slots)
     }
-    pub(crate) fn jit_arguments_slot(&self) -> Option<u16> {
-        self.arguments_slot
-    }
-    /// Recognize the Prototype.js-style forwarding constructor
-    /// `this.<initializer>.apply(this, arguments);`.
-    ///
-    /// The construct fast path can execute this exact, branch-free body without materializing
-    /// the otherwise short-lived `arguments` exotic. Property and builtin-identity guards remain
-    /// live there; any accessor, proxy, `apply` override, or other body shape runs normally.
-    #[inline]
-    pub(crate) fn jit_arguments_apply_forwarder(
-        &self,
-    ) -> Option<(&str, &std::cell::Cell<IcState>, &std::cell::Cell<IcState>)> {
-        let plan = self.arguments_forwarder.get_or_init(|| {
-            let [Op::GetPropThis(initializer, initializer_cache), Op::GetMethod(apply, apply_cache), Op::LoadThis, Op::LoadLocal(arguments), Op::CallWithThis(2, _), Op::Pop, Op::ReturnUndef] =
-                self.ops.as_slice()
-            else {
-                return None;
-            };
-            (self.arguments_slot == Some(*arguments) && &*self.names[*apply as usize] == "apply")
-                .then_some(ArgumentsForwarder {
-                    initializer: *initializer,
-                    initializer_cache: *initializer_cache,
-                    apply_cache: *apply_cache,
-                })
-        });
-        let plan = plan.as_ref()?;
-        Some((
-            &self.names[plan.initializer as usize],
-            &self.caches[plan.initializer_cache as usize],
-            &self.caches[plan.apply_cache as usize],
-        ))
-    }
-
-    pub(crate) fn jit_forwarder_runtime(
-        &self,
-        initializer: &crate::value::Gc,
-        apply: usize,
-    ) -> Option<Rc<Chunk>> {
-        let initializer_ptr = Gc::as_ptr(initializer) as usize;
-        self.arguments_forwarder_runtime
-            .borrow()
-            .as_ref()
-            .filter(|runtime| {
-                runtime.initializer == initializer_ptr
-                    && runtime.apply == apply
-                    && runtime.pin.as_ptr() == Gc::as_ptr(initializer)
-            })
-            .map(|runtime| runtime.chunk.clone())
-    }
-
-    pub(crate) fn cache_jit_forwarder_runtime(
-        &self,
-        initializer: &crate::value::Gc,
-        apply: usize,
-        runtime_chunk: Rc<Chunk>,
-    ) {
-        let initializer_ptr = Gc::as_ptr(initializer) as usize;
-        *self.arguments_forwarder_runtime.borrow_mut() = Some(ForwarderRuntime {
-            initializer: initializer_ptr,
-            apply,
-            pin: Gc::downgrade(initializer),
-            chunk: runtime_chunk,
-        });
-    }
-
-    fn parse_initializer_plan(&self) -> Option<InitializerPlan> {
-        if self.arguments_slot.is_some()
-            || !self.var_force_resets.is_empty()
-            || self.needs_env()
-            || self.n_params > 128
-            || !matches!(self.ops.last(), Some(Op::ReturnUndef))
-        {
-            return None;
-        }
-
-        let finish = |fields: Vec<InitializerField>| {
-            let mut used = 0u128;
-            if fields.is_empty()
-                || fields.len() > 8
-                || fields.iter().any(|field| {
-                    if field.slot as usize >= self.n_params {
-                        return true;
-                    }
-                    let bit = 1u128 << field.slot;
-                    let duplicate = used & bit != 0;
-                    used |= bit;
-                    duplicate
-                })
-            {
-                None
-            } else {
-                Some(InitializerPlan {
-                    fields,
-                    shapes: std::cell::Cell::new(InitializerShapes::default()),
-                })
-            }
-        };
-
-        // `this.x = arg ? arg : constant`, repeated, then implicit return.
-        let mut pc = 0usize;
-        let mut fields = Vec::new();
-        while let Some(
-            [Op::LoadLocal(test), Op::JumpIfFalse(on_false), Op::LoadLocal(value), Op::Jump(done), Op::Const(default), Op::SetPropThisDrop(name, cache)],
-        ) = self.ops.get(pc..pc + 6)
-        {
-            if test != value || *on_false as usize != pc + 4 || *done as usize != pc + 5 {
-                break;
-            }
-            fields.push(InitializerField {
-                slot: *test,
-                default: Some(*default),
-                name: *name,
-                cache: *cache,
-            });
-            pc += 6;
-        }
-        if pc + 1 == self.ops.len() && matches!(self.ops[pc], Op::ReturnUndef) {
-            return finish(fields);
-        }
-
-        // `if (!arg) arg = constant` prefixes followed by direct `this.x = arg` stores.
-        let mut defaults = [None; 128];
-        pc = 0;
-        while let Some(
-            [Op::LoadLocal(test), Op::Not, Op::JumpIfFalse(done), Op::Const(default), Op::StoreLocal(store)],
-        ) = self.ops.get(pc..pc + 5)
-        {
-            if test != store
-                || *test as usize >= self.n_params
-                || *done as usize != pc + 5
-                || defaults[*test as usize].is_some()
-            {
-                break;
-            }
-            defaults[*test as usize] = Some(*default);
-            pc += 5;
-        }
-        fields = Vec::new();
-        while let Some([Op::LoadLocal(slot), Op::SetPropThisDrop(name, cache)]) =
-            self.ops.get(pc..pc + 2)
-        {
-            fields.push(InitializerField {
-                slot: *slot,
-                default: defaults.get(*slot as usize).copied().flatten(),
-                name: *name,
-                cache: *cache,
-            });
-            pc += 2;
-        }
-        if pc + 1 == self.ops.len() && matches!(self.ops[pc], Op::ReturnUndef) {
-            return finish(fields);
-        }
-        None
-    }
-
-    pub(crate) fn jit_initializer_plan(&self) -> Option<&InitializerPlan> {
-        self.initializer_plan
-            .get_or_init(|| self.parse_initializer_plan())
-            .as_ref()
-    }
-
-    #[inline(always)]
-    pub(crate) fn jit_initializer_field(
-        &self,
-        plan: &InitializerPlan,
-        index: usize,
-    ) -> (usize, Option<&Value>, &Rc<str>, &std::cell::Cell<IcState>) {
-        let field = &plan.fields[index];
-        (
-            field.slot as usize,
-            field
-                .default
-                .map(|constant| &self.consts[constant as usize]),
-            &self.names[field.name as usize],
-            &self.caches[field.cache as usize],
-        )
-    }
-
-    /// Exact straight-line field constructor recognized without function or benchmark identity.
-    /// Unique parameter slots let the construct path move owned values directly into the fresh
-    /// object. Any computed value, control flow, duplicate parameter use, forced `var` reset, or
-    /// materialized `arguments` object declines to ordinary execution.
-    pub(crate) fn jit_simple_constructor(&self) -> Option<SimpleConstructor<'_>> {
-        let fields = self
-            .simple_constructor_plan
-            .get_or_init(|| {
-                if self.ops.len() < 3
-                    || self.ops.len() > 17
-                    || self.ops.len() % 2 == 0
-                    || !matches!(self.ops.last(), Some(Op::ReturnUndef))
-                    || !self.var_force_resets.is_empty()
-                    || self.arguments_slot.is_some()
-                    || self.n_params > 128
-                {
-                    return None;
-                }
-                let count = self.ops.len() / 2;
-                let mut fields = Vec::with_capacity(count);
-                let mut used = 0u128;
-                for pair in self.ops[..count * 2].chunks_exact(2) {
-                    let [Op::LoadLocal(slot), Op::SetPropThisDrop(name, cache)] = pair else {
-                        return None;
-                    };
-                    if *slot as usize >= self.n_params {
-                        return None;
-                    }
-                    let bit = 1u128 << *slot;
-                    if used & bit != 0 {
-                        return None;
-                    }
-                    used |= bit;
-                    fields.push(InitializerField {
-                        slot: *slot,
-                        default: None,
-                        name: *name,
-                        cache: *cache,
-                    });
-                }
-                Some(fields)
-            })
-            .as_deref()?;
-        Some(SimpleConstructor {
-            chunk: self,
-            fields,
-        })
-    }
 
     /// Whether calls run without an activation environment (nothing captured, no lexical
-    /// `this`) — the precondition for the JIT→JIT fast call's moved-argument entry.
+    /// `this`).
     pub(crate) fn jit_no_activation(&self) -> bool {
         !self.needs_env()
     }
-    /// Byte offset of `inline_attempted` within `Chunk` (self-probed; every Chunk shares the
-    /// monomorphized layout, so the caller's offset is the callee's too).
-    pub(crate) fn jit_inline_attempted_off(&self) -> usize {
-        &self.inline_attempted as *const _ as usize - self as *const Chunk as usize
-    }
-    pub(crate) fn jit_var_force_resets(&self) -> &[u16] {
-        &self.var_force_resets
-    }
-    /// Whether const `k` is a trivially-copyable value the JIT may materialize inline.
-    pub(crate) fn jit_const_copyable(&self, k: u32) -> bool {
-        matches!(
-            self.consts[k as usize],
-            Value::Undefined | Value::Null | Value::Bool(_) | Value::Num(_)
-        )
-    }
-    /// Stable address of const `k` (the chunk is pinned by any code that runs it): the JIT's
-    /// string-const template copies the Value and bumps its refcount inline.
-    pub(crate) fn jit_const_ptr(&self, k: u32) -> *const Value {
-        &self.consts[k as usize] as *const Value
-    }
-    /// Whether const `k` is a string (payload strong count at offset 0 — the template's bump).
-    pub(crate) fn jit_const_is_str(&self, k: u32) -> bool {
-        matches!(self.consts[k as usize], Value::Str(_))
-    }
-    /// The f64 bits of a Num const (for the JIT's register-chain emitter).
+    /// The f64 bits of a Num const.
     pub(crate) fn jit_const_num(&self, k: u32) -> Option<u64> {
         match &self.consts[k as usize] {
             Value::Num(n) => Some(n.to_bits()),
             _ => None,
         }
     }
-    /// The first 16 bytes of a copyable const as two words, for inline materialization.
-    /// repr(u8) puts each payload at its own alignment: Bool's byte sits in word0 at offset 1,
-    /// Num's f64 fills word1 (offset 8).
-    pub(crate) fn jit_const_bits(&self, k: u32) -> (u64, u64) {
-        match &self.consts[k as usize] {
-            Value::Undefined => (0, 0),
-            Value::Null => (2, 0),
-            Value::Bool(b) => (3 | ((*b as u64) << 8), 0),
-            Value::Num(n) => (4, n.to_bits()),
-            _ => unreachable!("non-copyable const in jit_const_bits"),
-        }
-    }
-    pub(crate) fn jit_make_run_env(
-        &self,
-        i: &Interp,
-        env: &Env,
-        this_val: &Value,
-        args: &[Value],
-    ) -> Env {
-        self.make_run_env(i, env, this_val, args)
-    }
     /// (pops, pushes) of the op at `pc`, for the static stack-depth analysis. `None` = an op the
-    /// JIT can't account for (which refuses compilation).
+    /// analysis can't account for.
     pub(crate) fn jit_stack_effect(&self, pc: usize) -> Option<(usize, usize)> {
         let upd = |k: &UpdKind| match k {
             UpdKind::IncDiscard | UpdKind::DecDiscard => 0,
@@ -6617,14 +5166,12 @@ impl Chunk {
             | Op::Void => (1, 1),
             Op::TypeofName(_) => (0, 1),
             Op::Jump(_) => (0, 0),
-            Op::InlineGuard(..) => (0, 0),
-            Op::ResetSlots(..) => (0, 0),
             Op::JumpIfFalse(_) => (1, 0),
             Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
-            Op::Call(argc, _) => (*argc as usize + 1, 1),
+            Op::Call(argc) => (*argc as usize + 1, 1),
             Op::LoadNameForCall(..) => (0, 2),
-            Op::CallWithThis(argc, _) => (*argc as usize + 2, 1),
-            Op::New(argc, _) => (*argc as usize + 1, 1),
+            Op::CallWithThis(argc) => (*argc as usize + 2, 1),
+            Op::New(argc) => (*argc as usize + 1, 1),
             Op::MakeRegExp(..) => (0, 1),
             Op::MakeArray(n) => (*n as usize, 1),
             Op::MakeObject(_, count, _) => (*count as usize, 1),

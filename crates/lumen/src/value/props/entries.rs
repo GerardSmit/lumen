@@ -5,8 +5,7 @@
 //! never mutated in place; the first mutable access copies them out into an owned allocation
 //! (copy-on-write). Closures use it: every instance of one function shares its template's
 //! `length`/`name` entries, so the ordinary closure allocates no entry storage at all. Owned
-//! mode is a plain vector. The JIT reads entries through `ptr`/`len` only, and its one inline
-//! *append* checks `len < cap`, which shared mode (capacity zero) never satisfies.
+//! mode is a plain vector.
 use crate::value::Property;
 use std::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
 use std::cell::Cell;
@@ -29,16 +28,6 @@ pub(in crate::value) struct EntryVec {
 }
 
 impl EntryVec {
-    pub(in crate::value) const fn len_offset() -> usize {
-        std::mem::offset_of!(EntryVec, len)
-    }
-    pub(in crate::value) const fn cap_offset() -> usize {
-        std::mem::offset_of!(EntryVec, cap)
-    }
-    pub(in crate::value) const fn ptr_offset() -> usize {
-        std::mem::offset_of!(EntryVec, ptr)
-    }
-
     pub(in crate::value) const fn new() -> EntryVec {
         EntryVec {
             ptr: NonNull::dangling(),
@@ -172,11 +161,6 @@ impl EntryVec {
     #[inline]
     pub(in crate::value) fn len(&self) -> usize {
         self.len as usize
-    }
-
-    #[inline]
-    pub(in crate::value) fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// Owned capacity (zero while shared).
@@ -394,7 +378,6 @@ mod tests {
     #[test]
     fn layout_is_sixteen_bytes() {
         assert_eq!(std::mem::size_of::<EntryVec>(), 16);
-        assert_eq!(EntryVec::ptr_offset(), 0);
     }
 
     #[test]

@@ -1,25 +1,12 @@
-//! Borrowed collection reads shared by native methods and guarded JIT calls.
+//! Borrowed collection reads behind the native Map/Set lookup methods.
 use crate::value::Gc;
 use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::interpreter::Interp;
-use crate::value::{NativeFn, Value};
+use crate::value::Value;
 
 pub(crate) const MAP_GET: u8 = 13;
 pub(crate) const MAP_HAS: u8 = 14;
 pub(crate) const SET_HAS: u8 = 15;
-
-pub(crate) fn intrinsic(native: usize) -> u8 {
-    for (method, id) in [
-        (map_get as NativeFn, MAP_GET),
-        (map_has, MAP_HAS),
-        (set_has, SET_HAS),
-    ] {
-        if native == method as *const () as usize {
-            return id;
-        }
-    }
-    0
-}
 
 fn data<'a>(
     i: &'a Interp,
@@ -67,23 +54,6 @@ pub(super) fn set_has(i: &mut Interp, this: Value, args: &[Value]) -> Result<Val
     read(i, &this, args.first().unwrap_or(&Value::Undefined), SET_HAS)
 }
 
-#[inline]
-pub(crate) fn read_intrinsic(
-    i: &Interp,
-    this: &Value,
-    key: &Value,
-    id: u8,
-) -> Result<Value, Value> {
-    #[cfg(test)]
-    HITS.with(|hits| hits.set(hits.get() + 1));
-    read(i, this, key, id)
-}
-
-#[cfg(test)]
-thread_local! {
-    static HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{bytecode::Tier, Completion, Engine};
@@ -93,22 +63,11 @@ mod tests {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            super::HITS.with(|hits| hits.set(0));
             let script = format!("function assert(x) {{ if(!x) throw new Error('assertion'); }} function drive() {{ {source} }} drive(); 'passed'");
             let result = engine.eval(&script, false).unwrap();
             match result {
                 Completion::Value(v) => assert_eq!(v, "passed", "{tier:?}"),
                 Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
-            }
-            #[cfg(all(
-                target_arch = "aarch64",
-                any(target_os = "macos", target_os = "linux", target_os = "windows")
-            ))]
-            if tier == Tier::Jit {
-                assert!(
-                    super::HITS.with(|hits| hits.get()) > 0,
-                    "native collection reads not exercised"
-                );
             }
         }
     }

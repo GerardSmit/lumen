@@ -14,12 +14,8 @@ mod shapes;
 mod storage;
 #[cfg(test)]
 mod tests;
-pub(crate) use shapes::{
-    bump_proto_epoch, fn_key, proto_epoch, proto_epoch_ptr, shape_table_by_id_ptr,
-    shape_table_census,
-};
+pub(crate) use shapes::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
 pub(in crate::value) use shapes::{Shape, ShapeTable};
-pub(in crate::value) use storage::DenseBuffers;
 /// Sizes for a heap census (`LUMEN_HEAP_CENSUS`): entries used / reserved, how many of them are
 /// named (shape-keyed), whether a dense sidecar exists, and whether the shape is owned by this
 /// object alone (its key list is then per-object memory).
@@ -65,8 +61,8 @@ pub struct Props {
     /// (their fill-time chain walks proved "no hop shadows this name" — see
     /// [`crate::bytecode::IC_CREATE`]). Set by the creation-IC fill walk itself, one-way.
     pub(in crate::value) proto_flag: std::cell::Cell<bool>,
-    /// The shape's id, duplicated from `shape_rc` for the inline caches (a 32-bit compare in the
-    /// JIT templates). `SHAPE_EMPTY` while `shape_rc` is `None`. Bumped to a child on new-key
+    /// The shape's id, duplicated from `shape_rc` for the inline caches (a 32-bit compare).
+    /// `SHAPE_EMPTY` while `shape_rc` is `None`. Bumped to a child on new-key
     /// insert, to a fresh owned id on a structural removal or an owned-shape mutation. Only
     /// consulted for non-exotic objects and named keys — array shapes encode the named-key
     /// sequence only, so a shape match never says anything about elements.
@@ -83,8 +79,8 @@ pub struct Props {
     /// `mirror_flags & MIRROR_OK`: `mirror.len() == elems.len()`, and for every `n`:
     /// `mirror[n]` is [`MIRROR_HOLE`] exactly when `elems[n]` names no element, else the element
     /// is a plain writable data property whose value is `Num(mirror[n])`. Element reads become
-    /// one indexed load (no entry chase, no tag check), and `MIRROR_ALL_I32` lets the JIT's int
-    /// loops skip the exactness guard entirely. Entries stay authoritative: fast writers
+    /// one indexed load (no entry chase, no tag check), and `MIRROR_ALL_I32` lets int loops skip
+    /// the exactness guard entirely. Entries stay authoritative: fast writers
     /// dual-store through [`Props::set_index_value`]; any foreign `&mut` escape (`get_index_mut`,
     /// `get_mut` / `entry_at_mut` on an index key) invalidates the mirror instead of tracking it.
     /// Some canonical-index key lives ONLY as a named (shape) key (inserted too far past the
@@ -99,8 +95,7 @@ pub struct Props {
     pub(in crate::value) elem_mode: std::cell::Cell<bool>,
 }
 
-/// See [`Props::mirror`]. Bit values are chosen so the masks the JIT tests (`OK|NO_HOLES` and
-/// `OK|NO_HOLES|ALL_I32`) are contiguous — encodable ARM64 logical immediates.
+/// See [`Props::mirror`].
 pub(crate) const MIRROR_OK: u8 = 1;
 pub(crate) const MIRROR_NO_HOLES: u8 = 2;
 /// Every non-hole mirror value is an exact i32 (bit-identical through an i32 round trip, which
@@ -254,8 +249,8 @@ impl Props {
 
     /// Turn the entries into a shared block (see [`EntryVec::make_shared`]): clones then share
     /// it and copy on their first write through this type. Only for templates whose entries
-    /// are non-writable data — the JIT's inline stores write a writable slot in place after
-    /// the shape check alone — and hold no object references, since the cycle collector counts
+    /// are non-writable data — inline-cached stores write a writable slot in place after the
+    /// shape check alone — and hold no object references, since the cycle collector counts
     /// each map's values as that object's own edges.
     pub(crate) fn share_entries(&mut self) {
         debug_assert!(self
@@ -312,9 +307,8 @@ impl Props {
         self.shape_rc.as_ref().map_or(0, |s| s.len())
     }
 
-    /// Final named-property count of a small ordinary instance. The construct JIT records this
-    /// after a successful call so forwarding constructors whose own bytecode has no direct
-    /// `this.x` stores can reserve the right capacity on later allocations.
+    /// Final named-property count of a small ordinary instance, recorded after a successful
+    /// construct so later allocations can reserve the right capacity.
     pub(crate) fn observed_instance_capacity(&self) -> usize {
         if self.elems.0.is_none() && self.entries.len() <= 16 {
             self.entries.len()

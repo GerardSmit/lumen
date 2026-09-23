@@ -1,7 +1,7 @@
 //! Property insertion, removal, and shape maintenance.
 use super::shapes::{
-    fresh_owned_id, shape_by_id, shape_owned_from, shape_transition, Shape, INDEX_THRESHOLD,
-    OWNED_THRESHOLD, SHAPE_EMPTY,
+    fresh_owned_id, shape_by_id, shape_owned_from, shape_transition, Shape, OWNED_THRESHOLD,
+    SHAPE_EMPTY,
 };
 use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
 use crate::value::{canonical_index, Property, Value};
@@ -93,27 +93,6 @@ impl Props {
         let slot = self.open_named_slot(prop);
         self.set_shape(child);
         self.note_inserted(slot, &key);
-    }
-
-    /// Build the named-property prefix of a brand-new ordinary object after creation ICs proved
-    /// every key absent/non-indexed and supplied the complete shape chain. Up to the small-map
-    /// threshold no dense sidecar can be required, so the whole batch is just entry appends
-    /// followed by its already-known final shape.
-    pub(crate) fn append_proven_plain(&mut self, key: Rc<str>, prop: Property) {
-        debug_assert!(self.entries.len() < INDEX_THRESHOLD);
-        debug_assert!(canonical_index(&key).is_none());
-        debug_assert!(self.elems.0.is_none());
-        let _ = key;
-        self.reserve_entry();
-        self.entries.push(prop);
-    }
-
-    pub(crate) fn finish_proven_plain_shape(&mut self, shape: u32) {
-        debug_assert!(!self.entries.is_empty());
-        debug_assert!(self.entries.len() <= INDEX_THRESHOLD);
-        let shape = shape_by_id(shape);
-        debug_assert_eq!(shape.len(), self.entries.len());
-        self.set_shape(shape);
     }
 
     pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
