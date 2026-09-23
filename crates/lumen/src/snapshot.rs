@@ -1721,44 +1721,25 @@ mod tests {
         );
     }
 
-    /// Encode `src` without `compile_snapshot`'s whole-source validation pass, so a body that
-    /// does not parse reaches the decoder unparsed, and run `probe` against the loaded script.
-    fn snapshot_unchecked(src: &str, probe: &str) -> Completion {
-        let body = crate::parser::parse_script_lazy(src).unwrap();
-        let blob = encode(&body, src);
-        let mut engine = Engine::new();
-        match engine.eval_snapshot(&blob, src, false).unwrap() {
-            Completion::Value(_) => {}
-            Completion::Throw { name, message } => panic!("load threw {name}: {message}"),
-        }
-        engine.eval(probe, false).unwrap()
+    /// Early errors inside a skipped body are load-time errors: the lazy parse that feeds the
+    /// snapshot encoder rejects the source, so no unparseable body ever reaches the decoder.
+    fn lazy_parse_error(src: &str) -> crate::parser::ParseError {
+        crate::parser::parse_script_lazy(src).expect_err("the lazy parse rejects the source")
     }
 
     #[test]
-    fn an_undeclared_private_name_in_a_decoded_body_is_a_syntax_error_at_first_call() {
+    fn an_undeclared_private_name_in_a_skipped_body_is_a_load_time_syntax_error() {
         let src = "class C { #x; ok() { return this.#x; } bad() { return this.#nope; } }
                    const c = new C();";
-        match snapshot_unchecked(src, "c.ok()") {
-            Completion::Value(v) => assert_eq!(v, "undefined"),
-            Completion::Throw { name, message } => panic!("{name}: {message}"),
-        }
-        match snapshot_unchecked(src, "c.bad()") {
-            Completion::Throw { name, .. } => assert_eq!(name, "SyntaxError"),
-            Completion::Value(v) => panic!("bad() returned {v}"),
-        }
+        let err = lazy_parse_error(src);
+        assert!(err.message.contains("#nope"), "{}", err.message);
     }
 
     #[test]
-    fn a_syntax_error_in_a_decoded_body_throws_at_call_not_at_load() {
-        let src = "function bad() { return 1 + ; }\nfunction fine() { return 'ok'; }";
-        match snapshot_unchecked(src, "fine()") {
-            Completion::Value(v) => assert_eq!(v, "ok"),
-            Completion::Throw { name, message } => panic!("{name}: {message}"),
-        }
-        match snapshot_unchecked(src, "bad()") {
-            Completion::Throw { name, .. } => assert_eq!(name, "SyntaxError"),
-            Completion::Value(v) => panic!("bad() returned {v}"),
-        }
+    fn a_syntax_error_in_a_skipped_body_is_a_load_time_error() {
+        let src = "function bad() { return 1 + ; }
+function fine() { return 'ok'; }";
+        assert_eq!(lazy_parse_error(src).line, 1);
     }
 
     #[test]
