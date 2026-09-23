@@ -3968,3 +3968,11 @@ is unchanged.
 The numeric-diamond region (an exact 18-op match of Richards'
 `WorkerTask.run` fill loop, with its `jit_prepare_numeric_packed_array` helper)
 was removed at the same time for the same reason.
+
+### RegExp benchmark statement matchers removed (2026-09-23)
+
+The JIT's four exact op-sequence matchers for `v8-v7/regexp.js` driver
+statements (`for (i<K) re.exec(s[i])` batching, and discarded
+`/lit/.exec(s[i])`, `s[i].replace(/lit/, 'c')`, `s[i].match(/lit/)`) and their
+Rust helpers were removed as benchmark-specific. The builtin-identity discard
+intrinsics (`INTRINSIC_REGEXP_EXEC_DISCARD` and friends) remain.
