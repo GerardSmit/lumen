@@ -7,7 +7,6 @@ use super::service::{
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, set_data, Gc, Value};
-use std::rc::Rc;
 
 /// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's algorithm).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {

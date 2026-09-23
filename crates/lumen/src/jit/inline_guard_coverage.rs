@@ -107,7 +107,6 @@ mod tests {
         jit::{sys, JitCode},
         value::{jit_layout, Object, Value},
     };
-    use std::rc::Rc;
 
     fn code(it: &InlineTarget, layout: &JitLayout, id: Option<u64>) -> JitCode {
         let mut a = Asm::new();

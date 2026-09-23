@@ -9,113 +9,221 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// A handle to a heap object. Opaque on purpose: every engine site goes through this API rather
-/// than `Rc`/`RefCell` directly, so the storage underneath (today a refcounted `RcBox`) can be
-/// replaced by a traced heap without touching call sites. `repr(transparent)` keeps the stored
-/// word identical to the `Rc` pointer the JIT's measured layout probes expect.
+/// than `Rc`/`RefCell` directly, so the storage underneath can move to a traced heap without
+/// touching call sites (see `docs/gc.md`).
+///
+/// The box is lumen's own, laid out exactly like std's `RcBox` — `{strong, weak, value}` — so the
+/// stored word is what the JIT's measured layout probes already expect (strong count at offset 0,
+/// the object cell `2 * usize` further on). Semantics match `Rc`: the strong owners collectively
+/// hold one implicit weak count, the value drops when `strong` reaches zero and the allocation is
+/// freed when `weak` does.
 #[repr(transparent)]
-pub struct Gc(Rc<RefCell<Object>>);
+pub struct Gc(std::ptr::NonNull<GcBox>);
 
-/// A non-owning [`Gc`]: upgrades while the object is alive.
+#[repr(C)]
+struct GcBox {
+    strong: Cell<usize>,
+    weak: Cell<usize>,
+    value: RefCell<Object>,
+}
+
+/// Byte offset from the stored handle word to the object cell.
+const GC_VALUE_OFFSET: usize = std::mem::offset_of!(GcBox, value);
+
+/// A non-owning [`Gc`]: upgrades while the object is alive. `WeakGc::new()` holds a dangling
+/// sentinel (never dereferenced), as `std::rc::Weak::new` does.
 #[repr(transparent)]
-pub struct WeakGc(std::rc::Weak<RefCell<Object>>);
+pub struct WeakGc(std::ptr::NonNull<GcBox>);
+
+const WEAK_DANGLING: usize = usize::MAX;
+
+impl Gc {
+    #[inline]
+    fn alloc(cell: RefCell<Object>) -> Gc {
+        let b = Box::new(GcBox {
+            strong: Cell::new(1),
+            weak: Cell::new(1),
+            value: cell,
+        });
+        Gc(unsafe { std::ptr::NonNull::new_unchecked(Box::into_raw(b)) })
+    }
+    #[inline]
+    fn inner(&self) -> &GcBox {
+        unsafe { self.0.as_ref() }
+    }
+    #[inline]
+    pub fn ptr_eq(a: &Gc, b: &Gc) -> bool {
+        a.0 == b.0
+    }
+    /// The address of the object cell — stable for the object's lifetime, usable as an identity.
+    #[inline]
+    pub fn as_ptr(this: &Gc) -> *const RefCell<Object> {
+        unsafe { std::ptr::addr_of!((*this.0.as_ptr()).value) }
+    }
+    #[inline]
+    pub fn downgrade(this: &Gc) -> WeakGc {
+        let b = this.inner();
+        b.weak.set(b.weak.get() + 1);
+        WeakGc(this.0)
+    }
+    #[inline]
+    pub fn strong_count(this: &Gc) -> usize {
+        this.inner().strong.get()
+    }
+    /// Consume the handle into a raw cell pointer (see [`Gc::from_raw`]).
+    #[inline]
+    pub fn into_raw(this: Gc) -> *const RefCell<Object> {
+        let p = Gc::as_ptr(&this);
+        std::mem::forget(this);
+        p
+    }
+    /// # Safety
+    /// `ptr` must come from [`Gc::into_raw`] (or [`Gc::as_ptr`] with a matching strong count).
+    #[inline]
+    pub unsafe fn from_raw(ptr: *const RefCell<Object>) -> Gc {
+        let base = (ptr as *const u8).sub(GC_VALUE_OFFSET) as *mut GcBox;
+        Gc(std::ptr::NonNull::new_unchecked(base))
+    }
+    /// # Safety
+    /// `ptr` must point at a live object cell obtained from [`Gc::as_ptr`] / [`Gc::into_raw`].
+    #[inline]
+    pub unsafe fn increment_strong_count(ptr: *const RefCell<Object>) {
+        let g = std::mem::ManuallyDrop::new(Gc::from_raw(ptr));
+        let b = g.inner();
+        b.strong.set(b.strong.get() + 1);
+    }
+    /// # Safety
+    /// As [`Gc::increment_strong_count`], and the count being released must be owned.
+    #[inline]
+    pub unsafe fn decrement_strong_count(ptr: *const RefCell<Object>) {
+        drop(Gc::from_raw(ptr));
+    }
+    #[inline]
+    pub fn get_mut(this: &mut Gc) -> Option<&mut RefCell<Object>> {
+        let b = this.inner();
+        if b.strong.get() == 1 && b.weak.get() == 1 {
+            Some(unsafe { &mut (*this.0.as_ptr()).value })
+        } else {
+            None
+        }
+    }
+    #[inline]
+    pub fn try_unwrap(this: Gc) -> Result<RefCell<Object>, Gc> {
+        if this.inner().strong.get() != 1 {
+            return Err(this);
+        }
+        let this = std::mem::ManuallyDrop::new(this);
+        unsafe {
+            let b = this.0.as_ptr();
+            (*b).strong.set(0);
+            let value = std::ptr::read(std::ptr::addr_of!((*b).value));
+            // Release the strong owners' implicit weak reference.
+            drop(WeakGc(this.0));
+            Ok(value)
+        }
+    }
+}
 
 impl Clone for Gc {
     #[inline]
     fn clone(&self) -> Gc {
-        Gc(Rc::clone(&self.0))
+        let b = self.inner();
+        b.strong.set(b.strong.get() + 1);
+        Gc(self.0)
     }
+}
+
+impl Drop for Gc {
+    #[inline]
+    fn drop(&mut self) {
+        let b = self.inner();
+        let s = b.strong.get() - 1;
+        b.strong.set(s);
+        if s == 0 {
+            unsafe { gc_drop_slow(self.0) };
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn gc_drop_slow(p: std::ptr::NonNull<GcBox>) {
+    std::ptr::drop_in_place(std::ptr::addr_of_mut!((*p.as_ptr()).value));
+    drop(WeakGc(p));
 }
 
 impl std::ops::Deref for Gc {
     type Target = RefCell<Object>;
     #[inline]
     fn deref(&self) -> &RefCell<Object> {
-        &self.0
-    }
-}
-
-impl Gc {
-    #[inline]
-    fn alloc(cell: RefCell<Object>) -> Gc {
-        Gc(Rc::new(cell))
-    }
-    #[inline]
-    pub fn ptr_eq(a: &Gc, b: &Gc) -> bool {
-        Rc::ptr_eq(&a.0, &b.0)
-    }
-    /// The address of the object cell — stable for the object's lifetime, usable as an identity.
-    #[inline]
-    pub fn as_ptr(this: &Gc) -> *const RefCell<Object> {
-        Rc::as_ptr(&this.0)
-    }
-    #[inline]
-    pub fn downgrade(this: &Gc) -> WeakGc {
-        WeakGc(Rc::downgrade(&this.0))
-    }
-    #[inline]
-    pub fn strong_count(this: &Gc) -> usize {
-        Rc::strong_count(&this.0)
-    }
-    /// Consume the handle into a raw cell pointer (see [`Gc::from_raw`]).
-    #[inline]
-    pub fn into_raw(this: Gc) -> *const RefCell<Object> {
-        Rc::into_raw(this.0)
-    }
-    /// # Safety
-    /// `ptr` must come from [`Gc::into_raw`] (or [`Gc::as_ptr`] with a matching strong count).
-    #[inline]
-    pub unsafe fn from_raw(ptr: *const RefCell<Object>) -> Gc {
-        Gc(Rc::from_raw(ptr))
-    }
-    /// # Safety
-    /// `ptr` must point at a live object cell obtained from [`Gc::as_ptr`] / [`Gc::into_raw`].
-    #[inline]
-    pub unsafe fn increment_strong_count(ptr: *const RefCell<Object>) {
-        Rc::increment_strong_count(ptr)
-    }
-    /// # Safety
-    /// As [`Gc::increment_strong_count`], and the count being released must be owned.
-    #[inline]
-    pub unsafe fn decrement_strong_count(ptr: *const RefCell<Object>) {
-        Rc::decrement_strong_count(ptr)
-    }
-    #[inline]
-    pub fn get_mut(this: &mut Gc) -> Option<&mut RefCell<Object>> {
-        Rc::get_mut(&mut this.0)
-    }
-    #[inline]
-    pub fn try_unwrap(this: Gc) -> Result<RefCell<Object>, Gc> {
-        Rc::try_unwrap(this.0).map_err(Gc)
+        &self.inner().value
     }
 }
 
 impl WeakGc {
     #[inline]
     pub fn new() -> WeakGc {
-        WeakGc(std::rc::Weak::new())
+        WeakGc(unsafe { std::ptr::NonNull::new_unchecked(WEAK_DANGLING as *mut GcBox) })
+    }
+    #[inline]
+    fn inner(&self) -> Option<&GcBox> {
+        if self.0.as_ptr() as usize == WEAK_DANGLING {
+            None
+        } else {
+            Some(unsafe { self.0.as_ref() })
+        }
     }
     #[inline]
     pub fn upgrade(&self) -> Option<Gc> {
-        self.0.upgrade().map(Gc)
+        let b = self.inner()?;
+        let s = b.strong.get();
+        if s == 0 {
+            return None;
+        }
+        b.strong.set(s + 1);
+        Some(Gc(self.0))
     }
     #[inline]
     pub fn as_ptr(&self) -> *const RefCell<Object> {
-        self.0.as_ptr()
+        if self.0.as_ptr() as usize == WEAK_DANGLING {
+            return WEAK_DANGLING as *const RefCell<Object>;
+        }
+        unsafe { std::ptr::addr_of!((*self.0.as_ptr()).value) }
     }
     #[inline]
     pub fn ptr_eq(&self, other: &WeakGc) -> bool {
-        self.0.ptr_eq(&other.0)
+        self.0 == other.0
     }
     #[inline]
     pub fn strong_count(&self) -> usize {
-        self.0.strong_count()
+        self.inner().map_or(0, |b| b.strong.get())
     }
 }
 
 impl Clone for WeakGc {
     #[inline]
     fn clone(&self) -> WeakGc {
-        WeakGc(self.0.clone())
+        if let Some(b) = self.inner() {
+            b.weak.set(b.weak.get() + 1);
+        }
+        WeakGc(self.0)
+    }
+}
+
+impl Drop for WeakGc {
+    #[inline]
+    fn drop(&mut self) {
+        let Some(b) = self.inner() else { return };
+        let w = b.weak.get() - 1;
+        b.weak.set(w);
+        if w == 0 {
+            unsafe {
+                std::alloc::dealloc(
+                    self.0.as_ptr().cast(),
+                    std::alloc::Layout::new::<GcBox>(),
+                )
+            };
+        }
     }
 }
 

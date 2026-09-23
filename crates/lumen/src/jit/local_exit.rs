@@ -58,7 +58,6 @@ mod tests {
         jit::{asm::Asm, sys},
         value::{Object, Value},
     };
-    use std::rc::Rc;
 
     #[test]
     fn native_shadow_publishes_aliases_tags_stack_and_destroys_stale_graph() {

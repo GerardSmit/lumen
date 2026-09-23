@@ -7,7 +7,6 @@ use crate::builtins::{
 };
 use crate::interpreter::Interp;
 use crate::value::{NativeFn, Value};
-use std::rc::Rc;
 
 pub(crate) const MAP_SET: u8 = 16;
 pub(crate) const SET_ADD: u8 = 17;

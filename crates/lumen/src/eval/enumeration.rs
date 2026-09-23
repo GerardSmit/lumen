@@ -2,7 +2,6 @@
 use crate::value::Gc;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
-use std::rc::Rc;
 
 impl Interp {
     pub(crate) fn for_in_keys(&mut self, rhs: &Value) -> Result<Vec<Value>, Abrupt> {

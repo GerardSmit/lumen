@@ -2,7 +2,7 @@
 use super::{Env, Interp};
 use crate::value::{Gc, Value};
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 /// One entry of the legacy `fn.caller`/`fn.arguments` reflection stack (see `call_user`). The
 /// arguments object materializes lazily: a body that never names `arguments` skips building it,
