@@ -14,6 +14,7 @@ publish = false
 [dependencies]
 lumen-host = { path = "../lumen-host" }
 lumen-tls = { path = "../lumen-tls" }
+lumen-codegen = { path = "../lumen-codegen" }
 
 # Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
 [build-dependencies]
