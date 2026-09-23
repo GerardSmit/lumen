@@ -409,7 +409,10 @@ mod native {
         cells: Vec<u64>,
     ) -> (Result<Vec<u64>, u32>, Vec<u8>, Vec<u64>) {
         let tramp = ExecMemory::new(&x64::trampoline(sig, &config()).unwrap()).unwrap();
+        // Generated code keeps the memory base across calls (the runtime's memory never moves),
+        // so reserve room for every grow up front.
         let mut mem = Box::new(mem);
+        mem.reserve_exact(4 * PAGE_SIZE);
         let mut cells = cells;
         let table: Vec<*mut u64> = (0..cells.len()).map(|i| &mut cells[i] as *mut u64).collect();
         let here = 0u8;
