@@ -22,13 +22,32 @@
 //! entry Boxed (the edges materialize unboxed entries); single-edge blocks inherit the exact
 //! entries. SSA locals merge through the builder's variables.
 //!
-//! # Bounds-check elimination hook
+//! # Borrowed entries
 //!
-//! Every element read goes through [`Tr::elem_read`], which a later pass can specialize for an
-//! index proven in bounds (`i < a.length` loop tests over an unmodified `a`) by swapping the
-//! [`layout::elem_get_num`] call for an unchecked load.
+//! A `LoadLocal` of a Boxed slot, a captured variable (`LoadCap`), a free name that resolves to
+//! a scope binding (`LoadName`), and `this` push an [`Entry::Ref`]: the *address* of the value
+//! where it lives, with no clone. Consumers that only read (element / property reads, number
+//! operands) use the address directly; every other consumer — and every exit or merge —
+//! materializes a clone first ([`Tr::force`]). A slot or `this` address stays valid while the
+//! slot is not written; a binding address only until JS runs, so env Refs that survive an op
+//! which may run JS are materialized before it ([`Tr::prepare`]).
+//!
+//! # Region caches and facts
+//!
+//! Some run-time knowledge lives in IR variables that are reset (to 0) whenever it may have
+//! become stale — after every helper that can run JS ([`Tr::call_js`]), and on writes to the
+//! slot it depends on: binding addresses (`NamePtr` / `CapPtr` results), `Math` intrinsic
+//! guards, and the bounds-check-elimination facts below.
+//!
+//! # Bounds-check elimination
+//!
+//! A loop test `i < a.length` (`i` a Num local, `a` a Boxed local, captured variable or binding)
+//! records, next to the length it read, a view of `a`'s element storage (base, count, kind; see
+//! [`layout::array_view`]) and whether `i` is an integer inside it. An element read `a[i]` while
+//! that fact holds loads the element directly ([`layout::view_elem_num`]); the fact dies when
+//! `i` or `a` is written or JS runs.
 
-use super::helpers::{self, Helper};
+use super::helpers::{self, Helper, MathFn};
 use super::layout;
 use super::*;
 use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
@@ -36,6 +55,7 @@ use lumen_codegen::{
     BinaryOp, Block, ConvOp, FloatCC, FuncRef, Function, FunctionBuilder, IntCC, MemKind,
     Signature, Type, UnaryOp, Value as V, Variable,
 };
+use std::collections::{HashMap, HashSet};
 
 /// A translated region.
 pub(crate) struct Built {
@@ -65,6 +85,7 @@ pub(crate) fn build(
             kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
         }
     }
+    let plan = plan(chunk, header, backedge, &an, &kinds);
 
     let mut func = Function::new(
         format!("loop_{header}_{backedge}"),
@@ -119,6 +140,11 @@ pub(crate) fn build(
             leaders,
             stack: Vec::new(),
             max_stack: 1,
+            plan,
+            ptr_vars: HashMap::new(),
+            arr_vars: HashMap::new(),
+            idx_vars: HashMap::new(),
+            math_vars: HashMap::new(),
         };
         tr.entry(&an);
         tr.body(&an)?;
@@ -290,6 +316,180 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize) -> Result<Analysis, St
     })
 }
 
+/// Where a borrowed ([`Entry::Ref`]) value lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Src {
+    /// A Boxed frame slot: valid until the slot is written.
+    Slot(u16),
+    /// The binding free name `names[n]` resolves to: valid until JS runs.
+    Name(u32),
+    /// Captured binding `names[n]` in the activation env: valid until JS runs.
+    Cap(u32),
+    /// `frame.this_val`: valid for the whole region.
+    This,
+}
+
+impl Src {
+    /// Whether JS running elsewhere can change or move the value.
+    fn in_env(self) -> bool {
+        matches!(self, Src::Name(_) | Src::Cap(_))
+    }
+}
+
+/// What the translator decides before emitting anything (see [`plan`]).
+#[derive(Default)]
+struct Plan {
+    /// `LoadName` sites translated as a borrowed binding address.
+    name_ref: HashSet<usize>,
+    /// Name / capture addresses cached in region variables.
+    ptr_srcs: Vec<Src>,
+    /// Arrays whose element storage view is tracked (bounds-check elimination).
+    arr_srcs: Vec<Src>,
+    /// `(array, index slot)` pairs with an in-bounds fact.
+    idx_facts: Vec<(Src, u16)>,
+    /// Inline `Math` calls: `LoadName(Math)` pc → (function, `CallWithThis` pc).
+    math: HashMap<usize, (MathFn, usize)>,
+}
+
+/// Whether name cache `c` currently resolves through a scope binding (the modes
+/// [`Helper::NamePtr`] can return an address for).
+fn name_scope_mode(chunk: &Chunk, c: u32) -> bool {
+    chunk
+        .name_caches
+        .get(c as usize)
+        .is_some_and(|ic| {
+            let ic = ic.get();
+            ic.env != 0 && ic.env & 1 == 0
+        })
+}
+
+fn plan(chunk: &Chunk, header: usize, backedge: usize, an: &Analysis, kinds: &[Kind]) -> Plan {
+    let ops = &chunk.ops;
+    let reach = |pc: usize| an.depth[pc - header].is_some();
+    let lead = |pc: usize| an.leader[pc - header];
+    let num_slot = |s: u16| kinds[s as usize] == Kind::Num;
+    let is_len = |n: u32| chunk.names.get(n as usize).is_some_and(|x| &**x == "length");
+    let mut p = Plan::default();
+    let add_ptr = |p: &mut Plan, s: Src| {
+        if !p.ptr_srcs.contains(&s) {
+            p.ptr_srcs.push(s);
+        }
+    };
+
+    // An inline `Math.f(args)`: `LoadName GetMethod <pure Number ops> CallWithThis(arity)` in
+    // one basic block, where nothing between can exit (the two receiver/callee entries are
+    // placeholders that must never be materialized).
+    let math_site = |pc: usize| -> Option<(MathFn, usize)> {
+        let (Op::LoadName(..), Some(Op::GetMethod(m, _))) = (ops[pc], ops.get(pc + 1).copied())
+        else {
+            return None;
+        };
+        if pc + 1 > backedge || lead(pc + 1) {
+            return None;
+        }
+        let f = helpers::math_intrinsic(chunk.names.get(m as usize)?)?;
+        if helpers::math_site_failed(chunk, pc) {
+            return None;
+        }
+        let mut depth = 0usize;
+        for q in pc + 2..=backedge {
+            if lead(q) {
+                return None;
+            }
+            match ops[q] {
+                Op::CallWithThis(argc) => {
+                    return (argc as usize == depth && depth == f.arity()).then_some((f, q));
+                }
+                Op::LoadLocal(s) if num_slot(s) && !an.tdz[s as usize] => depth += 1,
+                Op::Const(k) if matches!(chunk.consts[k as usize], Value::Num(_)) => depth += 1,
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+                    if depth >= 2 =>
+                {
+                    depth -= 1
+                }
+                Op::Neg | Op::Plus | Op::BitNot if depth >= 1 => {}
+                _ => return None,
+            }
+        }
+        None
+    };
+
+    for pc in header..=backedge {
+        if !reach(pc) {
+            continue;
+        }
+        match ops[pc] {
+            Op::LoadName(n, c) => {
+                if let Some(m) = math_site(pc) {
+                    p.math.insert(pc, m);
+                } else if name_scope_mode(chunk, c) {
+                    p.name_ref.insert(pc);
+                    add_ptr(&mut p, Src::Name(n));
+                }
+            }
+            Op::LoadCap(n) | Op::UpdateCap(n, _) | Op::StoreCap(n) => {
+                add_ptr(&mut p, Src::Cap(n));
+            }
+            _ => {}
+        }
+    }
+
+    // `i < <a>.length` loop tests: the array source and the index slot.
+    for pc in header..=backedge {
+        if !reach(pc) || !matches!(ops[pc], Op::JumpIfNotCmp(CmpKind::Lt, _)) {
+            continue;
+        }
+        let fact = if pc >= header + 2
+            && !lead(pc)
+            && !lead(pc - 1)
+            && matches!(ops[pc - 1], Op::GetPropLocal(s, n, _) if is_len(n) && kinds[s as usize] == Kind::Boxed)
+            && matches!(ops[pc - 2], Op::LoadLocal(i) if num_slot(i))
+        {
+            match (ops[pc - 1], ops[pc - 2]) {
+                (Op::GetPropLocal(s, ..), Op::LoadLocal(i)) => Some((Src::Slot(s), i)),
+                _ => None,
+            }
+        } else if pc >= header + 3
+            && !lead(pc)
+            && !lead(pc - 1)
+            && !lead(pc - 2)
+            && matches!(ops[pc - 1], Op::GetProp(n, _) if is_len(n))
+        {
+            let src = match ops[pc - 2] {
+                Op::LoadLocal(s) if kinds[s as usize] == Kind::Boxed => Some(Src::Slot(s)),
+                Op::LoadName(n, _) if p.name_ref.contains(&(pc - 2)) => Some(Src::Name(n)),
+                Op::LoadCap(n) => Some(Src::Cap(n)),
+                _ => None,
+            };
+            match (src, ops[pc - 3]) {
+                (Some(src), Op::LoadLocal(i)) if num_slot(i) => Some((src, i)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((src, i)) = fact {
+            if !p.idx_facts.contains(&(src, i)) {
+                p.idx_facts.push((src, i));
+            }
+            if !p.arr_srcs.contains(&src) {
+                p.arr_srcs.push(src);
+            }
+        }
+    }
+    p
+}
+
 // ---- translation -------------------------------------------------------------------------------
 
 /// An abstract operand-stack entry.
@@ -301,6 +501,17 @@ enum Entry {
     Bool(V),
     /// An owned `Value` at `frame.stack[depth]`.
     Boxed,
+    /// A borrowed value: the address of a `Value` owned elsewhere (see the module docs);
+    /// `frame.stack[depth]` holds nothing live.
+    Ref(V, Src),
+}
+
+/// The IR variables of an array's element-storage view (see [`layout::array_view`]).
+#[derive(Clone, Copy)]
+struct ArrVars {
+    kind: Variable,
+    base: Variable,
+    count: Variable,
 }
 
 /// An IR block starting a bytecode basic block.
@@ -319,20 +530,21 @@ struct Leader {
 /// The slow path of an op with an inline fast path.
 #[derive(Clone, Copy)]
 enum Slow {
-    /// Run the op itself through [`Helper::Generic`].
+    /// Run the op itself through [`Helper::Generic`] (slot-reading ops only on Boxed slots).
     Generic,
-    /// `GetElemLocal(s)`: clone the slot beneath the key and run the `GetElem` at `run`.
-    ElemLocal { s: u16, run: usize },
-    /// `GetPropLocal(s, ..)`: load the slot (TDZ-checked) and run the `GetProp` at `run`.
-    PropLocal { s: u16, run: usize },
-    /// `SetElemLocal[Drop](s)`: clone the slot beneath key and value and run the
-    /// `SetElem[Drop]` at `run`.
-    SetElemLocal { s: u16, run: usize },
-    /// `SetPropLocalDrop(s, ..)`: load the slot beneath the value and run the `SetPropDrop` at
-    /// `run`.
-    SetPropLocal { s: u16, run: usize },
-    /// No equivalent op to borrow: exit before the op.
-    Exit,
+    /// A property read through [`Helper::GetProp`] with the result at the op's result index.
+    Prop { n: u32, c: u32, obj: PropObj },
+}
+
+/// The receiver of a property read's slow path.
+#[derive(Clone, Copy)]
+enum PropObj {
+    /// The entry at this stack index (consumed; an env Ref is materialized first).
+    Stack(usize),
+    /// A frame slot's address: TDZ-checked (exit before the op), borrowed.
+    Slot(V),
+    /// An address that stays valid across JS (`this`, a slot Ref), borrowed.
+    Ptr(V),
 }
 
 /// An operand of a fused local op.
@@ -365,6 +577,15 @@ struct Tr<'a, 'f> {
     leaders: Vec<Option<Leader>>,
     stack: Vec<Entry>,
     max_stack: usize,
+    plan: Plan,
+    /// Cached binding addresses (PTR, 0 = unknown), per [`Plan::ptr_srcs`].
+    ptr_vars: HashMap<Src, Variable>,
+    /// Element-storage views, per [`Plan::arr_srcs`].
+    arr_vars: HashMap<Src, ArrVars>,
+    /// In-bounds facts (I32), per [`Plan::idx_facts`].
+    idx_vars: HashMap<(Src, u16), Variable>,
+    /// Passed `Math` guards (I32), per [`Plan::math`] site.
+    math_vars: HashMap<usize, Variable>,
 }
 
 fn cmp_of(op: &Op) -> Option<CmpKind> {
@@ -466,6 +687,165 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.call(h, args).expect("helper returns a status")
     }
 
+    /// Call a helper that may run JS: every region cache and fact is stale afterwards. Env
+    /// Refs must not be live across it (see [`Tr::prepare`]).
+    fn call_js(&mut self, h: Helper, args: &[V]) -> V {
+        let st = self.call_status(h, args);
+        self.invalidate_js();
+        st
+    }
+
+    /// Reset every region cache and fact (JS may have run).
+    fn invalidate_js(&mut self) {
+        let vars: Vec<(Variable, Type)> = self
+            .ptr_vars
+            .values()
+            .map(|&v| (v, PTR))
+            .chain(self.arr_vars.values().map(|a| (a.kind, Type::I32)))
+            .chain(self.idx_vars.values().map(|&v| (v, Type::I32)))
+            .chain(self.math_vars.values().map(|&v| (v, Type::I32)))
+            .collect();
+        self.reset_vars(&vars);
+    }
+
+    fn reset_vars(&mut self, vars: &[(Variable, Type)]) {
+        if vars.is_empty() {
+            return;
+        }
+        let z32 = self.i32c(0);
+        let zp = self.ptrc(0);
+        for &(v, ty) in vars {
+            self.fb.def_var(v, if ty == PTR { zp } else { z32 });
+        }
+    }
+
+    /// Reset the facts about the value at `src` (it is being written).
+    fn invalidate_src(&mut self, src: Src) {
+        let mut vars = Vec::new();
+        if let Some(a) = self.arr_vars.get(&src) {
+            vars.push((a.kind, Type::I32));
+        }
+        for (&(s, i), &v) in &self.idx_vars {
+            if s == src || Src::Slot(i) == src {
+                vars.push((v, Type::I32));
+            }
+        }
+        self.reset_vars(&vars);
+    }
+
+    /// Before writing slot `s`: materialize the Refs to it and drop the facts about it.
+    fn slot_write(&mut self, s: usize) {
+        for k in 0..self.stack.len() {
+            if matches!(self.stack[k], Entry::Ref(_, Src::Slot(x)) if x as usize == s) {
+                self.force(k);
+            }
+        }
+        self.invalidate_src(Src::Slot(s as u16));
+    }
+
+    /// Materialize a Ref entry at `i` into an owned clone at `frame.stack[i]`.
+    fn force(&mut self, i: usize) {
+        if let Entry::Ref(p, _) = self.stack[i] {
+            let dst = self.sptr(i);
+            self.call(Helper::Clone, &[dst, p]);
+            self.stack[i] = Entry::Boxed;
+        }
+    }
+
+    /// Make entries `from..` valid `Value`s in memory: unboxed ones get a trivial copy (and
+    /// stay unboxed), Refs are materialized (and become Boxed).
+    fn box_from(&mut self, from: usize) {
+        for i in from..self.stack.len() {
+            match self.stack[i] {
+                Entry::Ref(..) => self.force(i),
+                e => self.store_entry(i, e),
+            }
+        }
+    }
+
+    /// Per-op bookkeeping before translating the op at `pc`: materialize the operands of ops
+    /// that cannot read through a Ref, the env Refs that survive an op that may run JS, and
+    /// the Refs to a slot the op writes.
+    fn prepare(&mut self, pc: usize) {
+        let op = self.ops[pc];
+        let (pops, _) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
+        let d = self.stack.len();
+        let pops = pops.min(d);
+        let math_part = self.plan.math.contains_key(&pc)
+            || self.plan.math.values().any(|&(_, q)| q == pc)
+            || (pc > 0 && self.plan.math.contains_key(&(pc - 1)));
+        let ref_aware = math_part
+            || matches!(
+                op,
+                Op::Pop
+                    | Op::Void
+                    | Op::Dup
+                    | Op::Dup2
+                    | Op::GetElem
+                    | Op::GetProp(..)
+                    | Op::SetElem
+                    | Op::SetElemDrop
+                    | Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::BitAnd
+                    | Op::BitOr
+                    | Op::BitXor
+                    | Op::Shl
+                    | Op::Shr
+                    | Op::UShr
+                    | Op::Lt
+                    | Op::Gt
+                    | Op::Le
+                    | Op::Ge
+                    | Op::EqEq
+                    | Op::NotEq
+                    | Op::StrictEq
+                    | Op::StrictNotEq
+                    | Op::JumpIfNotCmp(..)
+            );
+        if !ref_aware {
+            for k in d - pops..d {
+                self.force(k);
+            }
+        }
+        let pure = math_part
+            || matches!(
+                op,
+                Op::Const(_)
+                    | Op::Undef
+                    | Op::LoadLocal(_)
+                    | Op::LoadCap(_)
+                    | Op::LoadThis
+                    | Op::Dup
+                    | Op::Dup2
+                    | Op::Pop
+                    | Op::Void
+                    | Op::UpdateLocal(..)
+                    | Op::StoreLocal(_)
+                    | Op::Tdz(_)
+                    | Op::JumpIfFalse(_)
+                    | Op::JumpIfFalsePeek(_)
+                    | Op::JumpIfTruePeek(_)
+                    | Op::JumpIfNotNullishPeek(_)
+                    | Op::Not
+            )
+            || (matches!(op, Op::LoadName(..)) && self.plan.name_ref.contains(&pc));
+        if !pure {
+            for k in 0..d - pops {
+                if matches!(self.stack[k], Entry::Ref(_, src) if src.in_env()) {
+                    self.force(k);
+                }
+            }
+        }
+        match op {
+            Op::StoreLocal(s) | Op::UpdateLocal(s, _) | Op::Tdz(s) => self.slot_write(s as usize),
+            Op::ArithLL(_, s, ..) | Op::ArithLK(_, s, ..) => self.slot_write(s as usize),
+            _ => {}
+        }
+    }
+
     fn i32c(&mut self, v: i64) -> V {
         self.fb.iconst(Type::I32, v)
     }
@@ -533,32 +913,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                     .store(MemKind::I32U8, self.stackp, b, o + VALUE_BOOL);
             }
             Entry::Boxed => {}
+            // An owned clone (exits and merges, where the entry itself is left behind).
+            Entry::Ref(p, _) => {
+                let dst = self.sptr(d);
+                self.call(Helper::Clone, &[dst, p]);
+            }
         }
-    }
-
-    /// Store every unboxed entry to memory, so the whole stack is valid `Value`s (what
-    /// [`Helper::Generic`] reads). The entries stay unboxed: memory now holds trivial copies.
-    fn box_all(&mut self) {
-        for i in 0..self.stack.len() {
-            let e = self.stack[i];
-            self.store_entry(i, e);
-        }
-    }
-
-    /// Move the owned value at `from` to `to` bitwise (`to` holds a trivially droppable value;
-    /// `from` must be overwritten or treated as dead afterwards).
-    fn move_entry(&mut self, from: usize, to: usize) {
-        let (fo, to_) = (self.soff(from), self.soff(to));
-        let a = self.fb.load(MemKind::I64, self.stackp, fo);
-        let b = self.fb.load(MemKind::I64, self.stackp, fo + 8);
-        self.fb.store(MemKind::I64, self.stackp, a, to_);
-        self.fb.store(MemKind::I64, self.stackp, b, to_ + 8);
-    }
-
-    fn clone_slot_to(&mut self, s: usize, d: usize) {
-        let dst = self.sptr(d);
-        let src = self.slot_ptr(s);
-        self.call(Helper::Clone, &[dst, src]);
     }
 
     /// Drop the Boxed value at `frame.stack[d]` (a helper call only for refcounted tags).
@@ -754,6 +1114,10 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// Branch on `cond` (nonzero → `then_pc`), both successors taking the current stack.
     fn branch(&mut self, pc: usize, cond: V, then_pc: usize, else_pc: usize) -> Result<(), String> {
+        // A Ref materialized for one successor's merge would leak on the other: settle them.
+        for k in 0..self.stack.len() {
+            self.force(k);
+        }
         let st = self.stack.clone();
         let t = self.dest(pc, then_pc)?;
         let e = self.dest(pc, else_pc)?;
@@ -778,7 +1142,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.brif(low, sp, &[], cont, &[]);
         self.fb.seal_block(sp);
         self.fb.switch_to_block(sp);
-        let st = self.call_status(Helper::Safepoint, &[self.frame]);
+        let st = self.call_js(Helper::Safepoint, &[self.frame]);
         let stack = self.stack.clone();
         self.throw_if(st, to, &stack, stack.len());
         self.fb.jump(cont, &[]);
@@ -818,6 +1182,47 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.def_var(flag, z);
                 self.tdz[s] = Some(flag);
             }
+        }
+        // Region caches start unknown; `Math` guards are checked here, so a replaced intrinsic
+        // fails the entry (and after enough failures the loop recompiles without the site).
+        let zp = self.ptrc(0);
+        let z32 = self.i32c(0);
+        for &src in &self.plan.ptr_srcs.clone() {
+            let v = self.fb.declare_var(PTR);
+            self.fb.def_var(v, zp);
+            self.ptr_vars.insert(src, v);
+        }
+        for &src in &self.plan.arr_srcs.clone() {
+            let a = ArrVars {
+                kind: self.fb.declare_var(Type::I32),
+                base: self.fb.declare_var(PTR),
+                count: self.fb.declare_var(PTR),
+            };
+            self.fb.def_var(a.kind, z32);
+            self.fb.def_var(a.base, zp);
+            self.fb.def_var(a.count, zp);
+            self.arr_vars.insert(src, a);
+        }
+        for &key in &self.plan.idx_facts.clone() {
+            let v = self.fb.declare_var(Type::I32);
+            self.fb.def_var(v, z32);
+            self.idx_vars.insert(key, v);
+        }
+        let mut sites: Vec<usize> = self.plan.math.keys().copied().collect();
+        sites.sort_unstable();
+        for pc in sites {
+            let pcv = self.i32c(pc as i64);
+            let ok = self.call_status(Helper::MathGuard, &[self.frame, pcv]);
+            let zero = self.i32c(0);
+            let bad = self.fb.icmp(IntCC::Eq, ok, zero);
+            let next = self.fb.create_block();
+            self.fb.brif(bad, fail, &[], next, &[]);
+            self.fb.seal_block(next);
+            self.fb.switch_to_block(next);
+            let v = self.fb.declare_var(Type::I32);
+            let one = self.i32c(1);
+            self.fb.def_var(v, one);
+            self.math_vars.insert(pc, v);
         }
         let header_block = self
             .edge(false, self.header)
@@ -936,34 +1341,31 @@ impl<'a, 'f> Tr<'a, 'f> {
         false
     }
 
-    /// Find an op to run through [`Helper::Generic`] in place of a slot-reading op: `Generic`
-    /// runs the single op at a pc, and these ops' semantics do not depend on where they are.
-    fn borrow(&self, want: impl Fn(&Op) -> bool) -> Option<usize> {
-        self.ops.iter().position(want)
-    }
-
     // ---- generic paths -----------------------------------------------------------------------
 
-    /// Call [`Helper::Generic`] on `run` with `depth` Boxed entries in memory; a throw exits at
-    /// `pc` with all `depth` entries (the helper wrote back what the op left).
-    fn call_generic(&mut self, run: usize, depth: usize, pc: usize) {
+    /// Call [`Helper::Generic`] on `run` over `frame.stack[base..depth]` (valid Boxed values in
+    /// memory); a throw exits at `pc` with the entries below `base` materialized and all
+    /// `depth` entries (the helper wrote back what the op left).
+    fn call_generic(&mut self, run: usize, base: usize, depth: usize, pc: usize) {
         let (pops, pushes) = self.chunk.jit_stack_effect(run).unwrap_or((0, 0));
         self.max_stack = self
             .max_stack
             .max(depth)
             .max(depth.saturating_sub(pops) + pushes);
         let r = self.i32c(run as i64);
+        let bv = self.i32c(base as i64);
         let dv = self.i32c(depth as i64);
-        let st = self.call_status(Helper::Generic, &[self.frame, r, dv]);
-        self.throw_if(st, pc, &[], depth);
+        let st = self.call_js(Helper::Generic, &[self.frame, r, bv, dv]);
+        let below = self.stack[..base.min(self.stack.len())].to_vec();
+        self.throw_if(st, pc, &below, depth);
     }
 
     /// Run the op at `pc` through [`Helper::Generic`].
     fn generic(&mut self, pc: usize) {
         let (pops, pushes) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
         let d = self.stack.len();
-        self.box_all();
-        self.call_generic(pc, d, pc);
+        self.box_from(d - pops);
+        self.call_generic(pc, d - pops, d, pc);
         self.stack.truncate(d - pops);
         self.stack.extend(std::iter::repeat_n(Entry::Boxed, pushes));
     }
@@ -974,44 +1376,29 @@ impl<'a, 'f> Tr<'a, 'f> {
         let (pops, pushes) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
         let d = self.stack.len();
         match slow {
-            Slow::Exit => {
-                self.exit_now(pc);
-                return false;
-            }
             Slow::Generic => {
                 self.generic(pc);
                 return true;
             }
-            Slow::ElemLocal { s, run } => {
-                self.box_all();
-                self.move_entry(d - 1, d);
-                self.clone_slot_to(s as usize, d - 1);
-                self.call_generic(run, d + 1, pc);
-            }
-            Slow::PropLocal { s, run } => {
-                self.box_all();
-                let p = self.sptr(d);
-                let sc = self.i32c(s as i64);
-                let st = self.call_status(Helper::LoadLocal, &[self.frame, sc, p]);
-                self.throw_if(st, pc, &[], d);
-                self.call_generic(run, d + 1, pc);
-            }
-            Slow::SetElemLocal { s, run } => {
-                self.box_all();
-                self.move_entry(d - 1, d);
-                self.move_entry(d - 2, d - 1);
-                self.clone_slot_to(s as usize, d - 2);
-                self.call_generic(run, d + 1, pc);
-            }
-            Slow::SetPropLocal { s, run } => {
-                self.box_all();
-                self.move_entry(d - 1, d);
-                let p = self.sptr(d - 1);
-                let sc = self.i32c(s as i64);
-                let st = self.call_status(Helper::LoadLocal, &[self.frame, sc, p]);
-                // The value moved up to `d` is live; `d - 1` is still trivially droppable.
-                self.throw_if(st, pc, &[], d + 1);
-                self.call_generic(run, d + 1, pc);
+            Slow::Prop { n, c, obj } => {
+                let at = d - pops;
+                self.box_from(at);
+                let (objp, consume) = match obj {
+                    PropObj::Stack(i) => {
+                        self.force(i);
+                        (self.sptr(i), 1)
+                    }
+                    PropObj::Slot(p) => {
+                        self.slot_tdz_exit(p, pc);
+                        (p, 0)
+                    }
+                    PropObj::Ptr(p) => (p, 0),
+                };
+                let (nv, cv, kv) = (self.i32c(n as i64), self.i32c(c as i64), self.i32c(consume));
+                let dst = self.sptr(at);
+                let st = self.call_js(Helper::GetProp, &[self.frame, nv, cv, objp, kv, dst]);
+                let below = self.stack[..at].to_vec();
+                self.throw_if(st, pc, &below, at);
             }
         }
         self.stack.truncate(d - pops);
@@ -1019,12 +1406,18 @@ impl<'a, 'f> Tr<'a, 'f> {
         true
     }
 
-    /// An op with no fast path: its slow path, unless that is an unconditional exit — native
-    /// code that leaves at an op on every execution would only add entry and exit overhead.
+    /// Exit before the op at `pc` when the slot at address `p` is in its TDZ (the interpreter
+    /// throws the ReferenceError).
+    fn slot_tdz_exit(&mut self, p: V, pc: usize) {
+        let tag = self.fb.load(MemKind::I32U8, p, 0);
+        let e = self.i32c(TAG_EMPTY as i64);
+        let is = self.fb.icmp(IntCC::Eq, tag, e);
+        let st = self.stack.clone();
+        self.exit_if(is, pc, EXIT_RESUME, &st, st.len());
+    }
+
+    /// An op with no fast path: its slow path.
     fn slow_only(&mut self, pc: usize, slow: Slow) -> Result<(), String> {
-        if matches!(slow, Slow::Exit) {
-            return Err(format!("{:?} at {pc} has no native path", self.ops[pc]));
-        }
         self.slow_path(pc, slow);
         Ok(())
     }
@@ -1093,6 +1486,16 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn num_or_slow(&mut self, e: Entry, idx: usize, slow: Block) -> V {
         match e {
             Entry::Num(x) => x,
+            Entry::Ref(p, _) => {
+                let tag = self.fb.load(MemKind::I32U8, p, 0);
+                let four = self.i32c(TAG_NUM as i64);
+                let is = self.fb.icmp(IntCC::Eq, tag, four);
+                let ok = self.fb.create_block();
+                self.fb.brif(is, ok, &[], slow, &[]);
+                self.fb.seal_block(ok);
+                self.fb.switch_to_block(ok);
+                self.fb.load(MemKind::F64, p, VALUE_PAYLOAD)
+            }
             _ => {
                 let tag = self.stack_tag(idx);
                 let four = self.i32c(TAG_NUM as i64);
@@ -1117,6 +1520,18 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.binary(BinaryOp::Band, nz, ord)
             }
             Entry::Bool(b) => b,
+            // (Not reached: `prepare` forces the operand.) A clone the Boxed path consumes.
+            Entry::Ref(..) if consume => {
+                self.store_entry(idx, e);
+                self.truthy(Entry::Boxed, idx, true)
+            }
+            Entry::Ref(p, _) => {
+                let scratch = self.stack.len();
+                let dst = self.sptr(scratch);
+                self.call(Helper::Clone, &[dst, p]);
+                let t = self.call_status(Helper::ToBoolean, &[self.frame, dst]);
+                t
+            }
             Entry::Boxed => {
                 let tag = self.stack_tag(idx);
                 let three = self.i32c(TAG_BOOL as i64);
@@ -1153,9 +1568,128 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     fn op(&mut self, pc: usize) -> Result<(), String> {
         let op = self.ops[pc];
+        self.prepare(pc);
         let d = self.stack.len();
+        // The parts of an inline `Math` call.
+        if self.plan.math.contains_key(&pc) {
+            return self.math_begin(pc);
+        }
+        if pc > 0 && self.plan.math.contains_key(&(pc - 1)) {
+            // `GetMethod`: the placeholder receiver stays, a placeholder callee joins it.
+            self.set_stack_tag(d, TAG_UNDEFINED);
+            self.stack.push(Entry::Boxed);
+            return Ok(());
+        }
+        if let Some(&(f, _)) = self.plan.math.values().find(|&&(_, q)| q == pc) {
+            return self.math_call(pc, f);
+        }
         match op {
             Op::Const(k) => self.push_const(k as usize),
+            Op::LoadThis => {
+                let p = self.fb.load(PTR_MEM, self.frame, FRAME_THIS);
+                self.stack.push(Entry::Ref(p, Src::This));
+            }
+            Op::LoadCap(n) => {
+                let p = self.src_ptr(Src::Cap(n), None);
+                self.ptr_or_exit(p, pc);
+                self.stack.push(Entry::Ref(p, Src::Cap(n)));
+            }
+            Op::LoadName(n, c) if self.plan.name_ref.contains(&pc) => {
+                let p = self.src_ptr(Src::Name(n), Some(c));
+                self.ptr_or_exit(p, pc);
+                self.stack.push(Entry::Ref(p, Src::Name(n)));
+            }
+            Op::LoadName(n, c) | Op::LoadNameForCall(n, c) => {
+                let h = if matches!(op, Op::LoadName(..)) {
+                    Helper::LoadName
+                } else {
+                    Helper::LoadNameForCall
+                };
+                let (nv, cv, dst) = (self.i32c(n as i64), self.i32c(c as i64), self.sptr(d));
+                if h == Helper::LoadNameForCall {
+                    self.soff(d + 1);
+                }
+                let st = self.call_status(h, &[self.frame, nv, cv, dst]);
+                let snap = self.stack.clone();
+                let one = self.i32c(STATUS_THROW as i64);
+                let threw = self.fb.icmp(IntCC::Eq, st, one);
+                self.exit_if(threw, pc, EXIT_THROW, &snap, d);
+                // The full lookup may have run a getter: caches are stale then.
+                let slow = self.i32c(helpers::STATUS_OK_SLOW as i64);
+                let ran = self.fb.icmp(IntCC::Eq, st, slow);
+                let inv = self.fb.create_block();
+                let cont = self.fb.create_block();
+                self.fb.brif(ran, inv, &[], cont, &[]);
+                self.fb.seal_block(inv);
+                self.fb.switch_to_block(inv);
+                self.invalidate_js();
+                self.fb.jump(cont, &[]);
+                self.fb.seal_block(cont);
+                self.fb.switch_to_block(cont);
+                self.stack.push(Entry::Boxed);
+                if h == Helper::LoadNameForCall {
+                    self.stack.push(Entry::Boxed);
+                }
+            }
+            Op::StoreNameCached(n, c) => {
+                self.store_entry(d - 1, self.stack[d - 1]);
+                let (nv, cv, src) = (self.i32c(n as i64), self.i32c(c as i64), self.sptr(d - 1));
+                let st = self.call_js(Helper::StoreName, &[self.frame, nv, cv, src]);
+                let below = self.stack[..d - 1].to_vec();
+                self.throw_if(st, pc, &below, d - 1);
+                self.stack.pop();
+            }
+            Op::StoreCap(n) => self.store_cap(pc, n)?,
+            Op::StoreCapInit(n) => {
+                self.store_entry(d - 1, self.stack[d - 1]);
+                let (nv, src, one) = (self.i32c(n as i64), self.sptr(d - 1), self.i32c(1));
+                let st = self.call_js(Helper::StoreCap, &[self.frame, nv, src, one]);
+                let below = self.stack[..d - 1].to_vec();
+                self.throw_if(st, pc, &below, d - 1);
+                self.stack.pop();
+            }
+            Op::UpdateCap(n, k) => self.update_cap(pc, n, k),
+            Op::Call(argc) | Op::CallWithThis(argc) => {
+                let with_this = matches!(op, Op::CallWithThis(_));
+                let base = d - argc as usize - 1 - with_this as usize;
+                self.box_from(base);
+                let (bv, av, wv) = (
+                    self.i32c(base as i64),
+                    self.i32c(argc as i64),
+                    self.i32c(with_this as i64),
+                );
+                let st = self.call_js(Helper::Call, &[self.frame, bv, av, wv]);
+                let below = self.stack[..base].to_vec();
+                self.throw_if(st, pc, &below, base);
+                self.stack.truncate(base);
+                self.stack.push(Entry::Boxed);
+            }
+            Op::GetMethod(n, c) => {
+                self.box_from(d - 1);
+                let (nv, cv) = (self.i32c(n as i64), self.i32c(c as i64));
+                let (obj, dst) = (self.sptr(d - 1), self.sptr(d));
+                let st = self.call_js(Helper::GetMethod, &[self.frame, nv, cv, obj, dst]);
+                let snap = self.stack.clone();
+                self.throw_if(st, pc, &snap, d);
+                self.stack.push(Entry::Boxed);
+            }
+            Op::SetPropDrop(n, c) => {
+                let obj = self.sptr(d - 2);
+                self.prop_write(pc, n, c, obj, Some(d - 2))?;
+            }
+            Op::SetPropThisDrop(n, c) => {
+                let obj = self.fb.load(PTR_MEM, self.frame, FRAME_THIS);
+                self.prop_write(pc, n, c, obj, None)?;
+            }
+            Op::SetPropLocalDrop(s, n, c) => {
+                if self.kinds[s as usize] != Kind::Boxed {
+                    self.exit_now(pc);
+                    return Ok(());
+                }
+                let obj = self.slot_ptr(s as usize);
+                self.slot_tdz_exit(obj, pc);
+                self.prop_write(pc, n, c, obj, None)?;
+            }
             Op::Undef => {
                 self.set_stack_tag(d, TAG_UNDEFINED);
                 self.stack.push(Entry::Boxed);
@@ -1253,7 +1787,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let known = match self.stack[d - 1] {
                     Entry::Num(_) => Some(kind == TypeofKind::Number),
                     Entry::Bool(_) => Some(kind == TypeofKind::Boolean),
-                    Entry::Boxed => None,
+                    Entry::Boxed | Entry::Ref(..) => None,
                 };
                 match known {
                     Some(k) => {
@@ -1311,6 +1845,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 }
             },
             Op::JumpIfNotCmp(k, t) => {
+                if k == CmpKind::Lt {
+                    self.set_idx_fact(pc);
+                }
                 let c = self.cmp_stack(pc, k)?;
                 self.branch(pc, c, pc + 1, t as usize)?;
             }
@@ -1336,7 +1873,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                 (Entry::Boxed, Entry::Num(key)) => {
                     let want = self.want_num(pc, d - 2);
                     let obj = self.sptr(d - 2);
-                    self.elem_read(pc, obj, key, Some(d - 2), d - 2, want, Slow::Generic);
+                    self.elem_read(pc, obj, key, Some(d - 2), d - 2, want, Slow::Generic, None);
+                }
+                (Entry::Ref(obj, src), Entry::Num(key)) => {
+                    let want = self.want_num(pc, d - 2);
+                    let fact = self.idx_fact_at(pc, src);
+                    self.elem_read(pc, obj, key, None, d - 2, want, Slow::Generic, fact);
                 }
                 _ => self.generic(pc),
             },
@@ -1345,25 +1887,25 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.exit_now(pc);
                     return Ok(());
                 }
-                let slow = match self.borrow(|o| matches!(o, Op::GetElem)) {
-                    Some(run) => Slow::ElemLocal { s, run },
-                    None => Slow::Exit,
-                };
                 match self.stack[d - 1] {
                     Entry::Num(key) => {
                         let want = self.want_num(pc, d - 1);
                         let obj = self.slot_ptr(s as usize);
-                        self.elem_read(pc, obj, key, None, d - 1, want, slow);
+                        let fact = self.idx_fact_at(pc, Src::Slot(s));
+                        self.elem_read(pc, obj, key, None, d - 1, want, Slow::Generic, fact);
                     }
-                    _ => self.slow_only(pc, slow)?,
+                    _ => self.generic(pc),
                 }
             }
             Op::SetElem | Op::SetElemDrop => {
                 let keep = matches!(op, Op::SetElem);
                 match (self.stack[d - 3], self.stack[d - 2], self.stack[d - 1]) {
-                    (Entry::Boxed, Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed)) => {
+                    (Entry::Boxed, Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..))) => {
                         let obj = self.sptr(d - 3);
                         self.elem_write(pc, obj, key, v, Some(d - 3), keep, d - 3, Slow::Generic);
+                    }
+                    (Entry::Ref(obj, _), Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..))) => {
+                        self.elem_write(pc, obj, key, v, None, keep, d - 3, Slow::Generic);
                     }
                     _ => self.generic(pc),
                 }
@@ -1374,57 +1916,59 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.exit_now(pc);
                     return Ok(());
                 }
-                let slow = match self.borrow(|o| {
-                    if keep {
-                        matches!(o, Op::SetElem)
-                    } else {
-                        matches!(o, Op::SetElemDrop)
-                    }
-                }) {
-                    Some(run) => Slow::SetElemLocal { s, run },
-                    None => Slow::Exit,
-                };
                 match (self.stack[d - 2], self.stack[d - 1]) {
                     (Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed)) => {
                         let obj = self.slot_ptr(s as usize);
-                        self.elem_write(pc, obj, key, v, None, keep, d - 2, slow);
+                        self.elem_write(pc, obj, key, v, None, keep, d - 2, Slow::Generic);
                     }
-                    _ => self.slow_only(pc, slow)?,
+                    _ => self.generic(pc),
                 }
             }
             Op::GetProp(n, c) => match self.stack[d - 1] {
                 Entry::Boxed => {
                     let obj = self.sptr(d - 1);
-                    self.prop_read(pc, obj, n, c, Some(d - 1), d - 1, Slow::Generic)?;
+                    let slow = Slow::Prop {
+                        n,
+                        c,
+                        obj: PropObj::Stack(d - 1),
+                    };
+                    self.prop_read(pc, obj, n, c, Some(d - 1), d - 1, slow, None)?;
+                }
+                Entry::Ref(obj, src) => {
+                    let slow = Slow::Prop {
+                        n,
+                        c,
+                        obj: if src.in_env() {
+                            PropObj::Stack(d - 1)
+                        } else {
+                            PropObj::Ptr(obj)
+                        },
+                    };
+                    self.prop_read(pc, obj, n, c, None, d - 1, slow, Some(src))?;
                 }
                 _ => self.generic(pc),
             },
             Op::GetPropThis(n, c) => {
                 let obj = self.fb.load(PTR_MEM, self.frame, FRAME_THIS);
-                self.prop_read(pc, obj, n, c, None, d, Slow::Generic)?;
+                let slow = Slow::Prop {
+                    n,
+                    c,
+                    obj: PropObj::Ptr(obj),
+                };
+                self.prop_read(pc, obj, n, c, None, d, slow, Some(Src::This))?;
             }
             Op::GetPropLocal(s, n, c) => {
                 if self.kinds[s as usize] != Kind::Boxed {
                     self.exit_now(pc);
                     return Ok(());
                 }
-                let slow = match self.borrow(|o| matches!(o, Op::GetProp(m, _) if *m == n)) {
-                    Some(run) => Slow::PropLocal { s, run },
-                    None => Slow::Exit,
-                };
                 let obj = self.slot_ptr(s as usize);
-                self.prop_read(pc, obj, n, c, None, d, slow)?;
-            }
-            Op::SetPropLocalDrop(s, n, _) => {
-                if self.kinds[s as usize] != Kind::Boxed {
-                    self.exit_now(pc);
-                    return Ok(());
-                }
-                let slow = match self.borrow(|o| matches!(o, Op::SetPropDrop(m, _) if *m == n)) {
-                    Some(run) => Slow::SetPropLocal { s, run },
-                    None => Slow::Exit,
+                let slow = Slow::Prop {
+                    n,
+                    c,
+                    obj: PropObj::Slot(obj),
                 };
-                self.slow_only(pc, slow)?;
+                self.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))?;
             }
             Op::ToPropKeyLocal(s) => {
                 // Num and Str keys pass through untouched; anything else needs the coercion
@@ -1435,7 +1979,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 }
                 match self.stack[d - 1] {
                     Entry::Num(_) => {}
-                    Entry::Bool(_) => self.exit_now(pc),
+                    Entry::Bool(_) | Entry::Ref(..) => self.exit_now(pc),
                     Entry::Boxed => {
                         let tag = self.stack_tag(d - 1);
                         let four = self.i32c(TAG_NUM as i64);
@@ -1505,13 +2049,379 @@ impl<'a, 'f> Tr<'a, 'f> {
             let e = self.ssa_entry(s);
             self.stack.push(e);
         } else {
-            let p = self.sptr(d);
-            let sc = self.i32c(s as i64);
-            let st = self.call_status(Helper::LoadLocal, &[self.frame, sc, p]);
-            let snap = self.stack.clone();
-            self.throw_if(st, pc, &snap, d);
-            self.stack.push(Entry::Boxed);
+            // Borrow the slot (the TDZ error comes from the interpreter).
+            let _ = d;
+            let p = self.slot_ptr(s);
+            self.slot_tdz_exit(p, pc);
+            self.stack.push(Entry::Ref(p, Src::Slot(s as u16)));
         }
+    }
+
+    // ---- names and captures ------------------------------------------------------------------
+
+    /// The cached address of `src`'s binding value (resolving it when the cache is empty); 0
+    /// when it cannot be resolved to an address.
+    fn src_ptr(&mut self, src: Src, cache: Option<u32>) -> V {
+        let Some(&var) = self.ptr_vars.get(&src) else {
+            return self.resolve_ptr(src, cache);
+        };
+        let p0 = self.fb.use_var(var);
+        let z = self.ptrc(0);
+        let null = self.fb.icmp(IntCC::Eq, p0, z);
+        let res = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(null, res, &[], cont, &[]);
+        self.fb.seal_block(res);
+        self.fb.switch_to_block(res);
+        let p1 = self.resolve_ptr(src, cache);
+        self.fb.def_var(var, p1);
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        self.fb.use_var(var)
+    }
+
+    fn resolve_ptr(&mut self, src: Src, cache: Option<u32>) -> V {
+        match src {
+            Src::Name(n) => {
+                let nv = self.i32c(n as i64);
+                let cv = self.i32c(cache.unwrap_or(u32::MAX) as i64);
+                self.call(Helper::NamePtr, &[self.frame, nv, cv])
+                    .expect("NamePtr returns an address")
+            }
+            Src::Cap(n) => {
+                let nv = self.i32c(n as i64);
+                self.call(Helper::CapPtr, &[self.frame, nv])
+                    .expect("CapPtr returns an address")
+            }
+            Src::Slot(s) => self.slot_ptr(s as usize),
+            Src::This => self.fb.load(PTR_MEM, self.frame, FRAME_THIS),
+        }
+    }
+
+    /// Exit before the op at `pc` when `p` is null (the interpreter does the full lookup).
+    fn ptr_or_exit(&mut self, p: V, pc: usize) {
+        let z = self.ptrc(0);
+        let null = self.fb.icmp(IntCC::Eq, p, z);
+        let st = self.stack.clone();
+        self.exit_if(null, pc, EXIT_RESUME, &st, st.len());
+    }
+
+    /// `StoreCap(n)`: an in-place store when the binding holds a trivially droppable value,
+    /// else [`Helper::StoreCap`].
+    fn store_cap(&mut self, pc: usize, n: u32) -> Result<(), String> {
+        let d = self.stack.len();
+        let e = self.stack[d - 1];
+        let p = self.src_ptr(Src::Cap(n), None);
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let z = self.ptrc(0);
+        let nonnull = self.fb.icmp(IntCC::Ne, p, z);
+        let ok1 = self.fb.create_block();
+        self.fb.brif(nonnull, ok1, &[], slow, &[]);
+        self.fb.seal_block(ok1);
+        self.fb.switch_to_block(ok1);
+        let tag = self.fb.load(MemKind::I32U8, p, 0);
+        let four = self.i32c(TAG_NUM as i64);
+        let trivial = self.fb.icmp(IntCC::Ule, tag, four);
+        let ok2 = self.fb.create_block();
+        self.fb.brif(trivial, ok2, &[], slow, &[]);
+        self.fb.seal_block(ok2);
+        self.fb.switch_to_block(ok2);
+        match e {
+            Entry::Num(x) => {
+                let t = self.i32c(TAG_NUM as i64);
+                self.fb.store(MemKind::I32U8, p, t, 0);
+                self.fb.store(MemKind::F64, p, x, VALUE_PAYLOAD);
+            }
+            Entry::Bool(b) => {
+                let t = self.i32c(TAG_BOOL as i64);
+                self.fb.store(MemKind::I32U8, p, t, 0);
+                self.fb.store(MemKind::I32U8, p, b, VALUE_BOOL);
+            }
+            _ => {
+                // Move the owned value in bitwise; its old home becomes trivially droppable.
+                let o = self.soff(d - 1);
+                let a = self.fb.load(MemKind::I64, self.stackp, o);
+                let b = self.fb.load(MemKind::I64, self.stackp, o + 8);
+                self.fb.store(MemKind::I64, p, a, 0);
+                self.fb.store(MemKind::I64, p, b, 8);
+                self.set_stack_tag(d - 1, TAG_UNDEFINED);
+            }
+        }
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        self.store_entry(d - 1, e);
+        let (nv, src, zero) = (self.i32c(n as i64), self.sptr(d - 1), self.i32c(0));
+        let st = self.call_js(Helper::StoreCap, &[self.frame, nv, src, zero]);
+        let below = self.stack[..d - 1].to_vec();
+        self.throw_if(st, pc, &below, d - 1);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.invalidate_src(Src::Cap(n));
+        self.stack.pop();
+        Ok(())
+    }
+
+    /// `UpdateCap(n, k)`: in place on a Number, else the interpreter's op.
+    fn update_cap(&mut self, pc: usize, n: u32, k: UpdKind) {
+        let d = self.stack.len();
+        let pushes = !matches!(k, UpdKind::IncDiscard | UpdKind::DecDiscard);
+        let p = self.src_ptr(Src::Cap(n), None);
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let param = pushes.then(|| self.fb.append_block_param(join, Type::F64));
+        let z = self.ptrc(0);
+        let nonnull = self.fb.icmp(IntCC::Ne, p, z);
+        let ok1 = self.fb.create_block();
+        self.fb.brif(nonnull, ok1, &[], slow, &[]);
+        self.fb.seal_block(ok1);
+        self.fb.switch_to_block(ok1);
+        let tag = self.fb.load(MemKind::I32U8, p, 0);
+        let four = self.i32c(TAG_NUM as i64);
+        let is = self.fb.icmp(IntCC::Eq, tag, four);
+        let ok2 = self.fb.create_block();
+        self.fb.brif(is, ok2, &[], slow, &[]);
+        self.fb.seal_block(ok2);
+        self.fb.switch_to_block(ok2);
+        let old = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
+        let one = self.fb.f64const(1.0);
+        let inc = matches!(k, UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard);
+        let new = if inc {
+            self.fb.binary(BinaryOp::Fadd, old, one)
+        } else {
+            self.fb.binary(BinaryOp::Fsub, old, one)
+        };
+        self.fb.store(MemKind::F64, p, new, VALUE_PAYLOAD);
+        let r = match k {
+            UpdKind::PostInc | UpdKind::PostDec => old,
+            _ => new,
+        };
+        if pushes {
+            self.fb.jump(join, &[r]);
+        } else {
+            self.fb.jump(join, &[]);
+        }
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        let pre = self.stack.clone();
+        self.generic(pc);
+        if pushes {
+            self.slow_to_join(pc, d, true, join);
+        } else {
+            self.fb.jump(join, &[]);
+        }
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.invalidate_src(Src::Cap(n));
+        self.stack = pre;
+        if let Some(r) = param {
+            self.stack.push(Entry::Num(r));
+        }
+    }
+
+    // ---- calls and properties ----------------------------------------------------------------
+
+    /// `obj.<names[n]> = v` for `v` on top of the stack (popped), `obj` an address; `consume`:
+    /// the stack index of a Boxed receiver dropped by the op.
+    fn prop_write(
+        &mut self,
+        pc: usize,
+        n: u32,
+        c: u32,
+        obj: V,
+        consume: Option<usize>,
+    ) -> Result<(), String> {
+        let d = self.stack.len();
+        let (pops, _) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
+        let base = d - pops;
+        let v = self.stack[d - 1];
+        let pre = self.stack.clone();
+        let join = self.fb.create_block();
+        let ic = if matches!(v, Entry::Num(_) | Entry::Boxed) {
+            layout::prop_ic(self.chunk, c)
+        } else {
+            None
+        };
+        if let Some(ic) = &ic {
+            let miss = self.fb.create_block();
+            let x = self.num_or_slow(v, d - 1, miss);
+            layout::prop_set_num(&mut self.fb, obj, ic, x, miss);
+            self.seal_current();
+            if let Some(i) = consume {
+                self.drop_at(i);
+            }
+            self.fb.jump(join, &[]);
+            self.fb.seal_block(miss);
+            self.fb.switch_to_block(miss);
+        }
+        self.stack = pre;
+        self.box_from(d - 1);
+        let objp = match consume {
+            Some(i) => {
+                self.force(i);
+                self.sptr(i)
+            }
+            None => obj,
+        };
+        let (nv, cv) = (self.i32c(n as i64), self.i32c(c as i64));
+        let (vp, kv) = (self.sptr(d - 1), self.i32c(consume.is_some() as i64));
+        let st = self.call_js(Helper::SetProp, &[self.frame, nv, cv, objp, vp, kv]);
+        let below = self.stack[..base].to_vec();
+        self.throw_if(st, pc, &below, base);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack.truncate(base);
+        Ok(())
+    }
+
+    // ---- Math intrinsics ---------------------------------------------------------------------
+
+    /// `LoadName(Math)` of an inline `Math.f(..)` site: re-check the guard if JS may have run
+    /// since the last check (exit before the site when it fails: the interpreter makes the
+    /// call), then push the placeholder receiver.
+    fn math_begin(&mut self, pc: usize) -> Result<(), String> {
+        let var = *self
+            .math_vars
+            .get(&pc)
+            .ok_or_else(|| format!("no guard for the Math site at {pc}"))?;
+        let ok = self.fb.use_var(var);
+        let zero = self.i32c(0);
+        let unknown = self.fb.icmp(IntCC::Eq, ok, zero);
+        let check = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(unknown, check, &[], cont, &[]);
+        self.fb.seal_block(check);
+        self.fb.switch_to_block(check);
+        let pcv = self.i32c(pc as i64);
+        let g = self.call_status(Helper::MathGuard, &[self.frame, pcv]);
+        let zero = self.i32c(0);
+        let bad = self.fb.icmp(IntCC::Eq, g, zero);
+        let st = self.stack.clone();
+        self.exit_if(bad, pc, EXIT_RESUME, &st, st.len());
+        let one = self.i32c(1);
+        self.fb.def_var(var, one);
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        let d = self.stack.len();
+        self.set_stack_tag(d, TAG_UNDEFINED);
+        self.stack.push(Entry::Boxed);
+        Ok(())
+    }
+
+    /// The `CallWithThis` of an inline `Math.f(..)` site: the Number arguments (the planner
+    /// admitted only ops producing unboxed Numbers) replace the placeholders with the result.
+    fn math_call(&mut self, pc: usize, f: MathFn) -> Result<(), String> {
+        let d = self.stack.len();
+        let argc = f.arity();
+        let mut args = Vec::with_capacity(argc);
+        for e in &self.stack[d - argc..] {
+            match *e {
+                Entry::Num(x) => args.push(x),
+                other => return Err(format!("Math argument {other:?} at {pc} is not a Number")),
+            }
+        }
+        let x = args[0];
+        let r = match f {
+            MathFn::Sqrt => self.fb.unary(UnaryOp::Sqrt, x),
+            MathFn::Abs => self.fb.unary(UnaryOp::Fabs, x),
+            MathFn::Floor => self.fb.unary(UnaryOp::Floor, x),
+            MathFn::Ceil => self.fb.unary(UnaryOp::Ceil, x),
+            MathFn::Trunc => self.fb.unary(UnaryOp::Trunc, x),
+            MathFn::Round => {
+                // floor(x), +1 when the fraction is >= 0.5; -0 for x in [-0.5, 0). NaN, ±Inf and
+                // ±0 come through unchanged (x - floor(x) is NaN or 0 for them).
+                let fl = self.fb.unary(UnaryOp::Floor, x);
+                let frac = self.fb.binary(BinaryOp::Fsub, x, fl);
+                let half = self.fb.f64const(0.5);
+                let up = self.fb.fcmp(FloatCC::Ge, frac, half);
+                let one = self.fb.f64const(1.0);
+                let fl1 = self.fb.binary(BinaryOp::Fadd, fl, one);
+                let r = self.fb.select(up, fl1, fl);
+                let zero = self.fb.f64const(0.0);
+                let rz = self.fb.fcmp(FloatCC::Eq, r, zero);
+                let neg = self.fb.fcmp(FloatCC::Lt, x, zero);
+                let both = self.fb.binary(BinaryOp::Band, rz, neg);
+                let nz = self.fb.f64const(-0.0);
+                self.fb.select(both, nz, r)
+            }
+            MathFn::Max => self.fb.binary(BinaryOp::Fmax, x, args[1]),
+            MathFn::Min => self.fb.binary(BinaryOp::Fmin, x, args[1]),
+            MathFn::Imul => {
+                let a = self.to_int32(x);
+                let b = self.to_int32(args[1]);
+                let m = self.fb.binary(BinaryOp::Imul, a, b);
+                self.fb.convert(ConvOp::FromSint, Type::F64, m)
+            }
+        };
+        // Receiver and callee are placeholders (trivially droppable, never materialized).
+        self.stack.truncate(d - argc - 2);
+        self.stack.push(Entry::Num(r));
+        Ok(())
+    }
+
+    // ---- bounds-check elimination ------------------------------------------------------------
+
+    /// The in-bounds fact for `src[i]` when the element read at `pc` takes its key from
+    /// `LoadLocal(i)` right before it in the same block.
+    fn idx_fact_at(&self, pc: usize, src: Src) -> Option<(Src, u16)> {
+        if pc == 0 || self.is_leader(pc) {
+            return None;
+        }
+        match self.ops[pc - 1] {
+            Op::LoadLocal(i) if self.idx_vars.contains_key(&(src, i)) => Some((src, i)),
+            _ => None,
+        }
+    }
+
+    /// At a `JumpIfNotCmp(Lt)` of `LoadLocal(i)` against `<a>.length` (see [`plan`]): record
+    /// whether `i` is an integer index inside `a`'s element-storage view.
+    fn set_idx_fact(&mut self, pc: usize) {
+        let d = self.stack.len();
+        if pc < self.header + 2 || self.is_leader(pc) || self.is_leader(pc - 1) {
+            return;
+        }
+        let at = |q: usize| if q >= self.header { Some(self.ops[q]) } else { None };
+        let fact = match (self.ops[pc - 1], self.ops[pc - 2]) {
+            (Op::GetPropLocal(s, ..), Op::LoadLocal(i)) => Some((Src::Slot(s), i)),
+            (Op::GetProp(..), obj) if !self.is_leader(pc - 2) => {
+                let src = match obj {
+                    Op::LoadLocal(s) => Some(Src::Slot(s)),
+                    Op::LoadName(n, _) if self.plan.name_ref.contains(&(pc - 2)) => {
+                        Some(Src::Name(n))
+                    }
+                    Op::LoadCap(n) => Some(Src::Cap(n)),
+                    _ => None,
+                };
+                match (src, pc.checked_sub(3).and_then(at)) {
+                    (Some(src), Some(Op::LoadLocal(i))) => Some((src, i)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((src, i)) = fact else { return };
+        let (Some(&var), Some(&a)) = (self.idx_vars.get(&(src, i)), self.arr_vars.get(&src)) else {
+            return;
+        };
+        let Entry::Num(x) = self.stack[d - 2] else {
+            return;
+        };
+        let kind = self.fb.use_var(a.kind);
+        let count = self.fb.use_var(a.count);
+        let ii = self.fb.convert(ConvOp::ToSintSat, PTR, x);
+        let back = self.fb.convert(ConvOp::FromSint, Type::F64, ii);
+        let exact = self.fb.fcmp(FloatCC::Eq, back, x);
+        let inb = self.fb.icmp(IntCC::Ult, ii, count);
+        let zero = self.i32c(0);
+        let has = self.fb.icmp(IntCC::Ne, kind, zero);
+        let ok = self.fb.binary(BinaryOp::Band, exact, inb);
+        let ok = self.fb.binary(BinaryOp::Band, ok, has);
+        self.fb.def_var(var, ok);
     }
 
     fn store_local(&mut self, pc: usize, s: usize) {
@@ -1782,7 +2692,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                 };
                 self.fb.icmp(cc, x, y)
             }
-            (Entry::Num(_) | Entry::Boxed, Entry::Num(_) | Entry::Boxed) => {
+            (
+                Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
+                Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
+            ) => {
                 let slow = self.fb.create_block();
                 let join = self.fb.create_block();
                 let r = self.fb.append_block_param(join, Type::I32);
@@ -1807,7 +2720,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// `Binary` + `ToBoolean` on the top two entries (the stack itself is left for the caller).
     fn cmp_slow(&mut self, pc: usize, kind: CmpKind) -> Result<V, String> {
         let d = self.stack.len();
-        self.box_all();
+        self.box_from(d - 2);
         let code = self.i32c(bin_code(&cmp_op(kind))? as i64);
         let (pa, pb, pr) = (self.sptr(d - 2), self.sptr(d - 1), self.sptr(d));
         let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
@@ -1848,8 +2761,10 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             // A Boxed operand that holds a Number at run time still takes the inline path; the
             // result then lives in memory (Boxed) so both paths agree on the entry's kind.
-            (Entry::Num(_) | Entry::Boxed, Entry::Num(_) | Entry::Boxed)
-                if !matches!(op, Op::Mod) =>
+            (
+                Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
+                Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
+            ) if !matches!(op, Op::Mod) =>
             {
                 let pre = self.stack.clone();
                 let slow = self.fb.create_block();
@@ -1905,11 +2820,38 @@ impl<'a, 'f> Tr<'a, 'f> {
         at: usize,
         want: bool,
         slow: Slow,
+        fact: Option<(Src, u16)>,
     ) {
         let pre = self.stack.clone();
         let miss = self.fb.create_block();
         let join = self.fb.create_block();
         let param = want.then(|| self.fb.append_block_param(join, Type::F64));
+        let fact = fact.and_then(|k| Some((*self.idx_vars.get(&k)?, *self.arr_vars.get(&k.0)?)));
+        if let Some((ok_var, a)) = fact {
+            // `key` is an integer inside the array's element-storage view: load it directly.
+            let ok = self.fb.use_var(ok_var);
+            let fast = self.fb.create_block();
+            let checked = self.fb.create_block();
+            self.fb.brif(ok, fast, &[], checked, &[]);
+            self.fb.seal_block(fast);
+            self.fb.switch_to_block(fast);
+            let kind = self.fb.use_var(a.kind);
+            let base = self.fb.use_var(a.base);
+            let ii = self.fb.convert(ConvOp::ToSintSat, PTR, key);
+            let x = layout::view_elem_num(&mut self.fb, kind, base, ii, checked);
+            self.seal_current();
+            if let Some(i) = drop {
+                self.drop_at(i);
+            }
+            if want {
+                self.fb.jump(join, &[x]);
+            } else {
+                self.store_entry(at, Entry::Num(x));
+                self.fb.jump(join, &[]);
+            }
+            self.fb.seal_block(checked);
+            self.fb.switch_to_block(checked);
+        }
         let x = layout::elem_get_num(&mut self.fb, obj, key, miss);
         self.seal_current();
         if let Some(i) = drop {
@@ -1960,7 +2902,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         if let Some(i) = drop {
             self.drop_at(i);
         }
-        if keep && v == Entry::Boxed {
+        if keep && matches!(v, Entry::Boxed | Entry::Ref(..)) {
             self.store_entry(base, Entry::Num(vf));
         }
         self.fb.jump(join, &[]);
@@ -1975,7 +2917,10 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.stack = pre[..base].to_vec();
         if keep {
             // An unboxed value stays valid: the slow path's result is a copy of the same Number.
-            self.stack.push(v);
+            self.stack.push(match v {
+                Entry::Ref(..) => Entry::Boxed,
+                e => e,
+            });
         }
     }
 
@@ -1990,6 +2935,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         drop: Option<usize>,
         at: usize,
         slow: Slow,
+        src: Option<Src>,
     ) -> Result<(), String> {
         let is_len = &*self.chunk.names[n as usize] == "length";
         let ic = if is_len {
@@ -2009,6 +2955,13 @@ impl<'a, 'f> Tr<'a, 'f> {
             None => {
                 let x = layout::length(&mut self.fb, obj, miss);
                 self.seal_current();
+                // A tracked array: refresh its element-storage view next to its length.
+                if let Some(a) = src.and_then(|k| self.arr_vars.get(&k).copied()) {
+                    let (kind, base, count) = layout::array_view(&mut self.fb, obj);
+                    self.fb.def_var(a.kind, kind);
+                    self.fb.def_var(a.base, base);
+                    self.fb.def_var(a.count, count);
+                }
                 if let Some(i) = drop {
                     self.drop_at(i);
                 }
@@ -2048,6 +3001,12 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         self.fb.seal_block(miss);
         self.fb.switch_to_block(miss);
+        if is_len {
+            // No view on the slow path.
+            if let Some(a) = src.and_then(|k| self.arr_vars.get(&k).copied()) {
+                self.reset_vars(&[(a.kind, Type::I32)]);
+            }
+        }
         self.stack = pre.clone();
         if self.slow_path(pc, slow) {
             self.slow_to_join(pc, at, want, join);
