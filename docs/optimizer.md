@@ -4016,3 +4016,13 @@ to show material allocation, destruction and collector work, with no single
 small arithmetic site explaining the application gap. See the
 [numeric-region report](closure-numeric-regions.md) for complete measurements,
 profile limitations, validation and the checked-in raw report.
+
+### Scheduler specialization removed (2026-09-23)
+
+The Richards scheduler specialization described in earlier entries (scheduler
+shell, Active/Idle/Worker/Handler/Device task regions, role and graph epochs, the
+pc59 role dispatch, and the extended x23..x28 scheduler frame) has been removed
+from the ARM64 JIT as benchmark-specific: it matched one program's structure and
+was not exercised by real code. Every chunk now uses the compact 112-byte frame.
+Generic region lowering (linked scan, numeric diamond, numeric CFG, loop chains)
+is unchanged.

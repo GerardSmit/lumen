@@ -5708,72 +5708,11 @@ impl Chunk {
             (1..PROP_IC_WAYS).all(|way| self.caches[idx as usize + way].get().depth == IC_EMPTY);
         (st.depth != IC_EMPTY && mono).then_some(st)
     }
-    /// The property-cache way for one exact receiver shape at a polymorphic site. Region
-    /// planners use this when an earlier guarded discriminator has already proved the receiver
-    /// shape (for example, one arm of a virtual task dispatch). Returning `None` for duplicate
-    /// ways is defensive: a stable cache should contain a receiver shape at most once, and a
-    /// contradictory snapshot is not worth specializing.
-    pub(crate) fn jit_cache_for_shape(&self, idx: u32, recv_shape: u32) -> Option<IcState> {
-        let mut found = None;
-        for way in 0..PROP_IC_WAYS {
-            let st = self.caches[idx as usize + way].get();
-            if st.depth == IC_EMPTY || st.recv_shape != recv_shape {
-                continue;
-            }
-            if found.is_some() {
-                return None;
-            }
-            found = Some(st);
-        }
-        found
-    }
     /// The stable address of call site `idx`'s way-1 `Cell<CallIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]: `call_caches` is fixed once compilation finishes and the Chunk
     /// outlives its JIT code).
     pub(crate) fn jit_call_cache_ptr(&self, idx: u32) -> usize {
         self.call_caches[idx as usize].entries.as_ptr() as usize
-    }
-    /// The one live callee observed at a call site, together with a strong handle proving that
-    /// the raw function/chunk pointers in [`CallIc`] remain valid while a region planner inspects
-    /// them. A polymorphic site is deliberately rejected. Generated code must still guard the
-    /// exact callee identity before relying on any child-chunk facts.
-    pub(crate) fn jit_call_target(&self, idx: u32) -> Option<(CallIc, crate::value::Gc)> {
-        let site = self.call_caches.get(idx as usize)?;
-        let mut found = None;
-        for entry in &site.entries {
-            let ic = entry.get();
-            if ic.callee == 0 {
-                continue;
-            }
-            if found.is_some_and(|old: CallIc| old.callee != ic.callee) {
-                return None;
-            }
-            found = Some(ic);
-        }
-        let ic = found?;
-        let obj = self.call_pins.borrow().get(&ic.callee)?.upgrade()?;
-        Some((ic, obj))
-    }
-    /// All distinct live callees recorded at a polymorphic call site. Region planners use this
-    /// only at compile time to discover a structurally recognized child transaction (for
-    /// example one arm of a four-way task dispatcher); generated code must still guard the
-    /// selected callee identity before consuming any child-chunk cache pointer.
-    pub(crate) fn jit_call_targets(&self, idx: u32) -> Vec<(CallIc, crate::value::Gc)> {
-        let Some(site) = self.call_caches.get(idx as usize) else {
-            return Vec::new();
-        };
-        let pins = self.call_pins.borrow();
-        let mut out: Vec<(CallIc, crate::value::Gc)> = Vec::new();
-        for entry in &site.entries {
-            let ic = entry.get();
-            if ic.callee == 0 || out.iter().any(|(seen, _)| seen.callee == ic.callee) {
-                continue;
-            }
-            if let Some(obj) = pins.get(&ic.callee).and_then(crate::value::WeakGc::upgrade) {
-                out.push((ic, obj));
-            }
-        }
-        out
     }
     /// The stable address of name-cache site `idx`'s `Cell<NameIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]).
