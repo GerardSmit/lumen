@@ -272,8 +272,44 @@ fn fd_handle(ctx: &mut Ctx, args: &[Value]) -> Result<std::rc::Rc<FsHandle>, Val
     handle.ok_or_else(|| ctx.make_error("TypeError", format!("bad file descriptor {fd}")))
 }
 
+/// fd 0, 1 or 2: the standard streams. They are not in the resource table (its ids start above
+/// them), and an embedded realm has its own.
+fn std_fd(args: &[Value]) -> Option<u32> {
+    let fd = args.first()?.as_num_opt()?;
+    (fd == 0.0 || fd == 1.0 || fd == 2.0).then_some(fd as u32)
+}
+
+/// Read up to `cap` bytes from stdin; fd 1 and fd 2 are not readable.
+fn read_std(ctx: &mut Ctx, fd: u32, cap: usize, op: &str) -> Result<Vec<u8>, Value> {
+    if fd != 0 {
+        return Err(ctx.make_error("TypeError", format!("bad file descriptor {fd}")));
+    }
+    let mut buf = vec![0u8; cap];
+    let n = lumen_host::read_stdin_fd(ctx, &mut buf).map_err(|e| io_error(ctx, op, "fd", e))?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+fn write_std(ctx: &mut Ctx, fd: u32, bytes: &[u8], op: &str) -> Result<(), Value> {
+    if fd == 0 {
+        return Err(ctx.make_error("TypeError", "bad file descriptor 0"));
+    }
+    lumen_host::write_std_fd(ctx, fd, bytes).map_err(|e| io_error(ctx, op, "fd", e))
+}
+
 /// Read everything from the handle's current position (sequential reads consume the file).
 fn op_read_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(fd) = std_fd(args) {
+        let mut all = Vec::new();
+        loop {
+            let chunk = read_std(ctx, fd, 64 * 1024, "readSync")?;
+            if chunk.is_empty() {
+                break;
+            }
+            all.extend_from_slice(&chunk);
+        }
+        return Ok(Value::from_string(String::from_utf8_lossy(&all).into_owned()));
+    }
     let handle = fd_handle(ctx, args)?;
     let mut bytes = Vec::new();
     handle
@@ -287,6 +323,10 @@ fn op_read_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 
 fn op_write_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let data = arg_string(ctx, args, 1)?;
+    if let Some(fd) = std_fd(args) {
+        write_std(ctx, fd, data.as_bytes(), "writeSync")?;
+        return Ok(Value::Undefined);
+    }
     let handle = fd_handle(ctx, args)?;
     handle
         .borrow_mut()
@@ -312,6 +352,16 @@ fn op_close_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 fn op_pread_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let length = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))?;
     let position = args.get(2).and_then(|v| v.as_num_opt());
+    // The standard streams are pipes: a position on them is ignored, as Node ignores it.
+    if let Some(fd) = std_fd(args) {
+        let cap = if length.is_finite() && length > 0.0 {
+            length as usize
+        } else {
+            0
+        };
+        let buf = read_std(ctx, fd, cap, "read")?;
+        return ctx.make_uint8array(&buf);
+    }
     let handle = fd_handle(ctx, args)?;
     let mut file = handle.borrow_mut();
     if let Some(pos) = position.filter(|p| p.is_finite() && *p >= 0.0) {
@@ -342,6 +392,10 @@ fn op_pwrite_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         None => Vec::new(),
     };
     let position = args.get(2).and_then(|v| v.as_num_opt());
+    if let Some(fd) = std_fd(args) {
+        write_std(ctx, fd, &bytes, "write")?;
+        return Ok(Value::Num(bytes.len() as f64));
+    }
     let handle = fd_handle(ctx, args)?;
     let mut file = handle.borrow_mut();
     if let Some(pos) = position.filter(|p| p.is_finite() && *p >= 0.0) {

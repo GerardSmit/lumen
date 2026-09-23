@@ -144,6 +144,21 @@ pub struct ThreadCoro {
     pub(crate) id: u32,
 }
 
+impl Drop for ThreadCoro {
+    /// A body that never ran is still owned by its worker, which drops it once it sees the resume
+    /// channel close. Wait for that: the body holds `Rc`s into the driver's heap, and releasing
+    /// them on the worker while the driver keeps running (a collection sweeping dead generators,
+    /// say) races the refcounts and the object registry. A started body needs no wait — a
+    /// finished one released everything before its last handoff, and a suspended one parks for
+    /// good without touching the heap again (see `park`).
+    fn drop(&mut self) {
+        if !self.started {
+            drop(std::mem::replace(&mut self.resume_tx, channel().0));
+            let _ = self.suspend_rx.recv();
+        }
+    }
+}
+
 /// Allocates [`ThreadCoro::id`]s; 0 is reserved for "not in a coroutine body" (the main driver).
 static CORO_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -317,15 +332,33 @@ fn run_job(job: Job) {
     let first = YIELDER.with(|y| y.borrow().as_ref().unwrap().resume_rx.recv());
     let outcome = match first {
         Err(_) => {
+            // Dropped before its first drive (see `ThreadCoro`'s `Drop`): the driver is parked
+            // waiting for this job to release the body's `Rc`s, so drop them now, while nothing
+            // else runs, then let the driver go.
             YIELDER.with(|y| *y.borrow_mut() = None);
-            return; // dropped before first drive
+            drop(body);
+            let _ = suspend_tx.send(Suspend::Done(Value::Undefined));
+            return;
         }
-        Ok(Resume::Next(_)) => {
+        // The first `next(v)`'s argument is unobservable; release it before the body runs, not
+        // after the final handoff, when the driver is running again.
+        Ok(Resume::Next(v)) => {
+            drop(v);
             let interp = unsafe { &mut *ptr.0 };
             body(interp)
         }
-        Ok(Resume::Return(v)) => Suspend::Done(v),
-        Ok(Resume::Throw(e)) => Suspend::Throw(e),
+        // `return()`/`throw()` before the first `next()`: the body never runs. Release its
+        // captures here, into the driver's registry and while the driver is parked — left to the
+        // end of this function they would drop after the handoff (racing the driver) and after
+        // `_restore` (tombstoning the worker's registry, leaving the driver's slots dangling).
+        Ok(Resume::Return(v)) => {
+            drop(body);
+            Suspend::Done(v)
+        }
+        Ok(Resume::Throw(e)) => {
+            drop(body);
+            Suspend::Throw(e)
+        }
     };
     let _ = suspend_tx.send(outcome);
     // Clear the TLS so the next job starts clean and `in_coroutine()` reads false between jobs.

@@ -9,7 +9,7 @@ use super::{
     H_GET_PROP, H_INLINE_CLOSURE, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN, H_SET_PROP,
     H_UNWIND,
 };
-use crate::bytecode::{Chunk, Op};
+use crate::bytecode::{Chunk, Op, TypeofKind};
 
 #[derive(Clone, Copy)]
 enum PropRecv {
@@ -211,6 +211,69 @@ impl Asm {
         self.bytes(&[0x48, 0x85, 0xd2]); // test rdx, rdx (throw flag)
         self.jcc(0x85, unwind); // jne
     }
+    /// Classify the `Value` tag in eax for a `typeof` test. Empty (TDZ) and BigInt always take
+    /// `slow`; an Obj does too when callability or [[IsHTMLDDA]] decides the answer. Returns
+    /// the tag whose equality means "typeof matches", or `None` when no remaining tag can match.
+    fn typeof_classify(&mut self, kind: TypeofKind, slow: usize) -> Option<u8> {
+        self.bytes(&[0x83, 0xf8, 0x01]);
+        self.jcc(0x84, slow);
+        self.bytes(&[0x83, 0xf8, 0x05]);
+        self.jcc(0x84, slow);
+        if matches!(
+            kind,
+            TypeofKind::Undefined | TypeofKind::Object | TypeofKind::Function
+        ) {
+            self.bytes(&[0x83, 0xf8, 0x08]);
+            self.jcc(0x84, slow);
+        }
+        match kind {
+            TypeofKind::Undefined => Some(0),
+            TypeofKind::Object => Some(2),
+            TypeofKind::Boolean => Some(3),
+            TypeofKind::Number => Some(4),
+            TypeofKind::BigInt => None, // tag 5 already went slow
+            TypeofKind::String => Some(6),
+            TypeofKind::Symbol => Some(7),
+            TypeofKind::Function => None,
+        }
+    }
+    /// Branch on a classified `typeof` test: `false_label` when the (possibly negated) test
+    /// fails, `true_label` otherwise. Flags come from comparing eax against the matching tag.
+    fn typeof_branch(
+        &mut self,
+        tag: Option<u8>,
+        negated: bool,
+        false_label: usize,
+        true_label: usize,
+    ) {
+        match tag {
+            Some(tag) => {
+                self.bytes(&[0x83, 0xf8, tag]);
+                self.jcc(if negated { 0x84 } else { 0x85 }, false_label);
+                self.jmp(true_label);
+            }
+            None => self.jmp(if negated { true_label } else { false_label }),
+        }
+    }
+    /// eax/edx = the `Value::Bool` for a classified `typeof` test (tag in eax).
+    fn typeof_bool(&mut self, tag: Option<u8>, negated: bool) {
+        match tag {
+            Some(tag) => {
+                self.bytes(&[0x83, 0xf8, tag]);
+                self.bytes(&[0x0f, if negated { 0x95 } else { 0x94 }, 0xc1]); // setcc cl
+                self.bytes(&[
+                    0x0f, 0xb6, 0xc1, // movzx eax,cl
+                    0xc1, 0xe0, 0x08, // shl eax,8 (Bool payload)
+                    0x83, 0xc8, 0x03, // or eax,3 (Bool tag)
+                ]);
+            }
+            None => {
+                self.code.push(0xb8);
+                self.bytes(&((u32::from(negated) << 8) | 3).to_le_bytes());
+            }
+        }
+        self.bytes(&[0x31, 0xd2]); // xor edx,edx
+    }
     fn finish(mut self) -> Vec<u8> {
         for (at, label) in self.patches {
             let target = self.labels[label].expect("unbound x64 JIT label");
@@ -367,7 +430,13 @@ pub(super) fn compile(
     {
         return None;
     }
-    let max_stack = crate::jit_ir::Cfg::build(chunk).ok()?.jit_stack_capacity();
+    let cfg = crate::jit_ir::Cfg::build(chunk).ok()?;
+    let max_stack = cfg.jit_stack_capacity();
+    // Peepholes may only span ops that no edge enters.
+    let mut leader = vec![false; ops.len() + 1];
+    for block in cfg.blocks() {
+        leader[block.start] = true;
+    }
     let mut a = Asm::new();
     let pcs: Vec<_> = (0..ops.len()).map(|_| a.label()).collect();
     let unwind = a.label();
@@ -399,6 +468,28 @@ pub(super) fn compile(
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pcs[pc]);
         pc_offsets.push(a.code.len() as u32);
+        // `typeof local === "<kind>"`, typically an argument guard: read the borrowed slot tag
+        // and decide without touching the stack or any refcount. Anything undecidable here falls
+        // through into the ordinary templates for the same ops.
+        if let (Op::LoadLocal(slot), Some(Op::TypeofIs(kind, negated))) = (op, ops.get(pc + 1)) {
+            if !leader[pc + 1] {
+                let slow = a.label();
+                a.load_byte_r15(i32::from(*slot) * 16);
+                let tag = a.typeof_classify(*kind, slow);
+                match ops.get(pc + 2) {
+                    Some(Op::JumpIfFalse(target)) if !leader[pc + 2] => {
+                        a.typeof_branch(tag, *negated, pcs[*target as usize], pcs[pc + 3]);
+                    }
+                    _ => {
+                        a.typeof_bool(tag, *negated);
+                        a.store_pair_r13(0);
+                        a.add_sp(16);
+                        a.jmp(pcs[pc + 2]);
+                    }
+                }
+                a.bind(slow);
+            }
+        }
         match op {
             Op::Const(k) if chunk.jit_const_copyable(*k) => {
                 let (lo, hi) = chunk.jit_const_bits(*k);
@@ -575,6 +666,37 @@ pub(super) fn compile(
                 a.bind(slow);
                 a.helper_spflag(H_EXEC, pc as u32, unwind);
                 a.bind(done);
+            }
+            Op::TypeofIs(kind, negated) => {
+                let slow = a.label();
+                let exit = a.label();
+                let classified = a.label();
+                a.load_byte_r13(-16);
+                let tag = a.typeof_classify(*kind, slow);
+                a.bytes(&[0x83, 0xf8, 0x06]);
+                a.jcc(0x82, classified); // tags below Str own no refcount
+                if rc_ok {
+                    a.load_pair_r13(-16);
+                    a.guard_dec_strong_rdx(rc_strong, slow);
+                    a.load_byte_r13(-16);
+                } else {
+                    a.jmp(slow);
+                }
+                a.bind(classified);
+                match ops.get(pc + 1) {
+                    Some(Op::JumpIfFalse(target)) if !leader[pc + 1] => {
+                        a.add_sp(-16);
+                        a.typeof_branch(tag, *negated, pcs[*target as usize], pcs[pc + 2]);
+                    }
+                    _ => {
+                        a.typeof_bool(tag, *negated);
+                        a.store_pair_r13(-16);
+                        a.jmp(exit);
+                    }
+                }
+                a.bind(slow);
+                a.helper_spflag(H_EXEC, pc as u32, unwind);
+                a.bind(exit);
             }
             Op::Jump(target) => a.jmp(pcs[*target as usize]),
             Op::JumpIfFalse(target) => {

@@ -65,6 +65,19 @@ fn path_resolve_relative_input_is_rooted() {
     assert_eq!(out.lines(), ["true true false"]);
 }
 
+/// `path.win32` knows drive, UNC and device roots (it used to be the posix algorithm with a
+/// backslash). Expectations are Node's own output for the same calls; runs on every platform.
+#[test]
+fn path_win32_handles_drive_and_unc_roots() {
+    let (mut rt, out) = runtime();
+    eval_ok(&mut rt, include_str!("fixtures/win32_path.js"));
+    let lines = out.lines();
+    assert!(
+        lines.last().is_some_and(|l| l.ends_with("all ok")),
+        "{lines:#?}"
+    );
+}
+
 #[test]
 fn buffer_numeric_family_and_search() {
     let (mut rt, out) = runtime();

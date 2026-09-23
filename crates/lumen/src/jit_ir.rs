@@ -569,6 +569,7 @@ impl RegionIr {
                                 | Op::StrictEq
                                 | Op::StrictNotEq
                                 | Op::Not
+                                | Op::TypeofIs(..)
                                 | Op::InstanceOf(_) => Rep::Bool,
                                 _ => Rep::Tagged,
                             };

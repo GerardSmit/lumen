@@ -112,20 +112,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         if !matches!(t, Value::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.resolve called on a non-object"));
         }
-        let v = arg(a, 0);
-        // A promise whose own `constructor` is `this` is returned unchanged.
-        if let Value::Obj(o) = &v {
-            if i.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
-                let c = ab(i.get_member(&v, "constructor"))?;
-                if same_value(&c, &t) {
-                    return Ok(v);
-                }
-            }
-        }
-        // NewPromiseCapability(C): resolution goes through the capability's own resolve.
-        let (promise, resolve_fn, _reject_fn) = new_promise_capability_full(i, &t)?;
-        ab(i.call(resolve_fn, Value::Undefined, &[v]))?;
-        Ok(promise)
+        promise_resolve(i, &t, arg(a, 0))
     });
     it.def_method(&ctor, "reject", 1, |i, t, a| {
         if !matches!(t, Value::Obj(_)) {
@@ -525,20 +512,39 @@ pub(super) fn install_promise(it: &mut Interp) {
         promise_keyed_combinator(i, t, arg(a, 0), true)
     });
     it.def_method(&ctor, "try", 1, |i, t, a| {
-        // Promise.try(fn, ...args): NewPromiseCapability(this), call fn synchronously, and settle
-        // through the capability.
+        // Promise.try(fn, ...args): call fn synchronously; a throw rejects a fresh
+        // NewPromiseCapability(this), a return goes through PromiseResolve(this, v) — so a
+        // returned promise already of this constructor comes back unwrapped.
         if !matches!(t, Value::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.try called on a non-object"));
         }
-        let (promise, resolve_fn, reject_fn) = new_promise_capability_full(i, &t)?;
         let func = arg(a, 0);
         let rest: Vec<Value> = a.iter().skip(1).cloned().collect();
         match ab(i.call(func, Value::Undefined, &rest)) {
-            Ok(v) => ab(i.call(resolve_fn, Value::Undefined, &[v]))?,
-            Err(e) => ab(i.call(reject_fn, Value::Undefined, &[e]))?,
-        };
-        Ok(promise)
+            Ok(v) => promise_resolve(i, &t, v),
+            Err(e) => {
+                let (promise, _resolve_fn, reject_fn) = new_promise_capability_full(i, &t)?;
+                ab(i.call(reject_fn, Value::Undefined, &[e]))?;
+                Ok(promise)
+            }
+        }
     });
     install_species(it, &ctor);
     set_builtin(&it.global, "Promise", Value::Obj(ctor));
+}
+
+/// PromiseResolve(C, x): a promise whose own `constructor` is C is returned unchanged; anything
+/// else resolves a fresh NewPromiseCapability(C) through the capability's own resolve.
+fn promise_resolve(i: &mut Interp, ctor: &Value, v: Value) -> Result<Value, Value> {
+    if let Value::Obj(o) = &v {
+        if i.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
+            let c = ab(i.get_member(&v, "constructor"))?;
+            if same_value(&c, ctor) {
+                return Ok(v);
+            }
+        }
+    }
+    let (promise, resolve_fn, _reject_fn) = new_promise_capability_full(i, ctor)?;
+    ab(i.call(resolve_fn, Value::Undefined, &[v]))?;
+    Ok(promise)
 }

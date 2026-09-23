@@ -48,5 +48,9 @@
     getWindowSize() { return [this.columns, this.rows]; }
   }
 
+  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
+  ReadStream = __legacyConstructor(ReadStream);
+  WriteStream = __legacyConstructor(WriteStream);
+
   __builtins.set("tty", { isatty: () => false, ReadStream, WriteStream });
 }

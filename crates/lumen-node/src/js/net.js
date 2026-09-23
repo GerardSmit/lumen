@@ -550,6 +550,10 @@ function _createServerHandle() {
 }
 function _setSimultaneousAccepts() { /* no-op: Windows-only accept tuning, inert everywhere else */ }
 
+// Callable without `new`, as Node's constructors are (see __legacyConstructor).
+Socket = __legacyConstructor(Socket);
+Server = __legacyConstructor(Server);
+
 __builtins.set("net", {
   isIP, isIPv4, isIPv6,
   BlockList, SocketAddress,

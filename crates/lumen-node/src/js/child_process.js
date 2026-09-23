@@ -37,6 +37,45 @@ function signalNumber(signal) {
   return n;
 }
 
+// libuv errno values (the table util.getSystemErrorName reads) for the ways a spawn can fail.
+const SPAWN_ERRNO = { ENOENT: -2, EACCES: -13, ENOTDIR: -20, EINVAL: -22 };
+
+// A native spawn failure as Node reports it: `spawn foo ENOENT` with errno, syscall, path and
+// spawnargs (the arguments after the file). Anything else is rethrown unchanged.
+function spawnError(err, syscall, file, args) {
+  if (!err || !(err.code in SPAWN_ERRNO)) return null;
+  const e = new Error(`${syscall} ${file} ${err.code}`);
+  e.errno = SPAWN_ERRNO[err.code];
+  e.code = err.code;
+  e.syscall = `${syscall} ${file}`;
+  e.path = file;
+  e.spawnargs = args;
+  return e;
+}
+
+// Node's `shell` option: `/bin/sh -c <line>` on Unix; on Windows `cmd.exe /d /s /c "<line>"`,
+// passed verbatim because cmd.exe parses its own command line, or `<shell> -c <line>` for any
+// other shell (bash, pwsh).
+function shellCommand(command, args, shell) {
+  const line = [command, ...args].join(" ");
+  if (process.platform === "win32") {
+    const file = typeof shell === "string" ? shell : process.env.comspec || "cmd.exe";
+    if (/^(?:.*[\\/])?cmd(?:\.exe)?$/i.test(file)) {
+      return { file, args: ["/d", "/s", "/c", `"${line}"`], verbatim: true };
+    }
+    return { file, args: ["-c", line], verbatim: false };
+  }
+  return { file: typeof shell === "string" ? shell : "/bin/sh", args: ["-c", line], verbatim: false };
+}
+
+// The program, arguments and verbatim flag a spawn call resolves to.
+function resolveCommand(command, args, options) {
+  const file = String(command);
+  const argv = (args || []).map(String);
+  if (options.shell) return shellCommand(file, argv, options.shell);
+  return { file, args: argv, verbatim: !!options.windowsVerbatimArguments };
+}
+
 // env object -> array of [key, value] pairs (or undefined to inherit).
 function envPairs(env) {
   if (!env || typeof env !== "object") return undefined;
@@ -119,8 +158,12 @@ function makeExtraPipe(childId, fd) {
 }
 
 class ChildProcess extends EventEmitter {
-  constructor(childId, pid, stdio, onIpcMessage) {
+  constructor(childId, pid, stdio, onIpcMessage, error) {
     super();
+    if (error) {
+      this._failed(stdio, error);
+      return;
+    }
     this._id = childId;
     this.pid = pid;
     this.killed = false;
@@ -145,7 +188,34 @@ class ChildProcess extends EventEmitter {
       (err) => this.emit("error", err),
     );
   }
+  // A spawn that failed (missing program, no permission): like Node, the object still has its
+  // stdio streams but no pid, then emits 'error' and 'close' with the negative errno, never 'spawn'
+  // or 'exit'.
+  _failed(stdio, error) {
+    const { Readable, Writable } = __builtins.get("stream");
+    const ended = () => {
+      const stream = new Readable({ read() {} });
+      stream.push(null);
+      return stream;
+    };
+    this._id = null;
+    this.pid = undefined;
+    this.killed = false;
+    this.exitCode = null;
+    this.signalCode = null;
+    this.stdin = stdio[0] === "pipe" ? new Writable({ write(chunk, enc, cb) { cb(); } }) : null;
+    this.stdout = stdio[1] === "pipe" ? ended() : null;
+    this.stderr = stdio[2] === "pipe" ? ended() : null;
+    this.stdio = [this.stdin, this.stdout, this.stderr];
+    this.connected = false;
+    process.nextTick(() => {
+      this.exitCode = error.errno;
+      this.emit("error", error);
+      this.emit("close", error.errno, null);
+    });
+  }
   kill(signal) {
+    if (this._id === null) return false;
     const ok = __child.kill(this._id, signalNumber(signal));
     if (ok) this.killed = true;
     return ok;
@@ -200,15 +270,18 @@ function spawn(command, args, options) {
     args = [];
   }
   options = options || {};
-  let cmd = String(command);
-  let argv = (args || []).map(String);
-  if (options.shell) {
-    const shell = typeof options.shell === "string" ? options.shell : "/bin/sh";
-    argv = ["-c", [cmd, ...argv].join(" ")];
-    cmd = shell;
-  }
+  const { file, args: argv, verbatim } = resolveCommand(command, args, options);
   const stdio = normalizeStdio(options.stdio);
-  const info = __child.spawn(cmd, argv, options.cwd, envPairs(options.env), stdio);
+  let info;
+  try {
+    // Node hands a child `process.env` when no env is given: the live object, not the OS table
+    // (they differ once the program edits it, and always for a realm embedded in a host).
+    info = __child.spawn(file, argv, options.cwd, envPairs(options.env || process.env), stdio, verbatim);
+  } catch (e) {
+    const error = spawnError(e, "spawn", file, argv);
+    if (!error) throw e;
+    return new ChildProcess(null, undefined, stdio, undefined, error);
+  }
   let child;
   const onIpcMessage = options._ipc
     ? (message) => child.emit("message", message, null)
@@ -248,7 +321,7 @@ function exec(command, options, callback) {
     options = {};
   }
   options = options || {};
-  const child = spawn(command, { ...options, shell: options.shell || "/bin/sh" });
+  const child = spawn(command, { ...options, shell: options.shell || true });
   if (callback) collect(child, options.encoding ?? "utf8", callback);
   return child;
 }
@@ -283,39 +356,10 @@ function makeSyncResult(res, encoding) {
   };
 }
 
-function execFileSync(file, args, options) {
-  if (!Array.isArray(args)) {
-    options = args;
-    args = [];
-  }
-  options = options || {};
-  const input = options.input ? (Buffer.isBuffer(options.input) ? options.input : Buffer.from(options.input)) : null;
-  const res = __child.execSync(String(file), (args || []).map(String), input, options.cwd);
-  if (res.status !== 0 && res.status !== null) {
-    const e = new Error(`Command failed: ${file}`);
-    e.status = res.status;
-    e.stdout = Buffer.from(res.stdout);
-    e.stderr = Buffer.from(res.stderr);
-    throw e;
-  }
-  const enc = (options.encoding && options.encoding !== "buffer") ? options.encoding : null;
-  const out = Buffer.from(res.stdout);
-  return enc ? out.toString(enc) : out;
-}
-
-function execSync(command, options) {
-  options = options || {};
-  const input = options.input ? (Buffer.isBuffer(options.input) ? options.input : Buffer.from(options.input)) : null;
-  const res = __child.execSync("/bin/sh", ["-c", String(command)], input, options.cwd);
-  if (res.status !== 0 && res.status !== null) {
-    const e = new Error(`Command failed: ${command}`);
-    e.status = res.status;
-    e.stderr = Buffer.from(res.stderr);
-    throw e;
-  }
-  const enc = (options.encoding && options.encoding !== "buffer") ? options.encoding : null;
-  const out = Buffer.from(res.stdout);
-  return enc ? out.toString(enc) : out;
+// Node's result shape; a failed spawn carries `error` and has no output or status.
+function syncResult(res, error, encoding) {
+  if (error) return { error, status: null, signal: null, output: null, pid: 0, stdout: null, stderr: null };
+  return makeSyncResult(res, encoding);
 }
 
 function spawnSync(command, args, options) {
@@ -324,16 +368,46 @@ function spawnSync(command, args, options) {
     args = [];
   }
   options = options || {};
-  let cmd = String(command);
-  let argv = (args || []).map(String);
-  if (options.shell) {
-    const shell = typeof options.shell === "string" ? options.shell : "/bin/sh";
-    argv = ["-c", [cmd, ...argv].join(" ")];
-    cmd = shell;
-  }
+  const { file, args: argv, verbatim } = resolveCommand(command, args, options);
   const input = options.input ? (Buffer.isBuffer(options.input) ? options.input : Buffer.from(options.input)) : null;
-  const res = __child.execSync(cmd, argv, input, options.cwd);
-  return makeSyncResult(res, options.encoding);
+  try {
+    const res = __child.execSync(file, argv, input, options.cwd, envPairs(options.env || process.env), verbatim);
+    return syncResult(res, null, options.encoding);
+  } catch (e) {
+    const error = spawnError(e, "spawnSync", file, argv);
+    if (!error) throw e;
+    return syncResult(null, error, options.encoding);
+  }
+}
+
+// execFileSync/execSync: the spawnSync result, thrown as an error if the spawn failed or the
+// child exited non-zero; otherwise its stdout.
+function checkedOutput(ret, what, options) {
+  if (ret.error) throw ret.error;
+  if (ret.status !== 0 && ret.status !== null) {
+    const e = new Error(`Command failed: ${what}`);
+    e.status = ret.status;
+    e.stdout = ret.stdout;
+    e.stderr = ret.stderr;
+    throw e;
+  }
+  return ret.stdout;
+}
+
+function execFileSync(file, args, options) {
+  if (!Array.isArray(args)) {
+    options = args;
+    args = [];
+  }
+  options = options || {};
+  const ret = spawnSync(file, args, options);
+  return checkedOutput(ret, [file, ...(args || [])].join(" "), options);
+}
+
+function execSync(command, options) {
+  options = options || {};
+  const ret = spawnSync(command, [], { ...options, shell: options.shell || true });
+  return checkedOutput(ret, command, options);
 }
 
 function fork(modulePath, args, options) {

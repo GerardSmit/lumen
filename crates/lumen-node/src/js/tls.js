@@ -249,5 +249,9 @@
   }
   function createServer(options, listener) { return new Server(options, listener); }
 
+  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
+  TLSSocket = __legacyConstructor(TLSSocket);
+  Server = __legacyConstructor(Server);
+
   __builtins.set("tls", { ...base, connect, TLSSocket, Server, createServer, SecureContext, createSecureContext });
 }

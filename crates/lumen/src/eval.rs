@@ -2391,9 +2391,15 @@ impl Interp {
                 };
                 match phase {
                     // A Source Text Module Record's GetModuleSource always throws a SyntaxError, so
-                    // `import.source(x)` rejects once the specifier has been coerced.
+                    // `import.source(x)` rejects once the specifier has been coerced — except for
+                    // the host-defined '<module source>' module, which has a ModuleSource object.
                     ImportPhase::Source => {
                         let p = self.new_promise();
+                        if s.as_str() == "<module source>" {
+                            let src_obj = self.module_source_of(&s);
+                            self.resolve_promise(&p, src_obj);
+                            return Ok(p);
+                        }
                         let reason = crate::interpreter::abrupt_value(
                             self.throw("SyntaxError", "source phase import is not available"),
                         );
@@ -3495,6 +3501,11 @@ impl Interp {
     /// is awaiting. A genuinely infinite microtask loop spins here, as it does in Node.
     pub(crate) fn drain_microtasks(&mut self) {
         while let Some(job) = self.microtasks.pop_front() {
+            // A terminated realm runs no more reactions; the queue dies with it.
+            if self.terminating {
+                self.microtasks.clear();
+                return;
+            }
             self.run_job(job);
         }
     }

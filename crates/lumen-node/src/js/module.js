@@ -358,6 +358,24 @@ function runMain(filename) {
   return module.exports;
 }
 
+// The main module from source the embedder holds, under a `filename` that need not exist.
+function runMainSource(filename, source) {
+  const module = {
+    id: ".",
+    filename,
+    loaded: false,
+    exports: {},
+    parent: null,
+    children: [],
+    paths: [],
+  };
+  mainModule = module;
+  cache[filename] = module;
+  compileCommonJS(module, filename, source);
+  module.loaded = true;
+  return module.exports;
+}
+
 // A cwd-bound require for -e / the REPL, plus createRequire(fromPath) like node:module's.
 const cwdRequire = makeRequire(process.cwd(), null);
 globalThis.require = cwdRequire;
@@ -663,6 +681,7 @@ __builtins.set("node:module", Module);
 
 // Exposed to the CLI (via a tiny bootstrap) to run a file as the main module.
 globalThis.__runMain = runMain;
+globalThis.__runMainSource = runMainSource;
 
 // --- ESM interop: synthetic re-export modules for the builtins ---
 // The runtime's module loader (Rust) can't enumerate a builtin's keys, so we precompute one

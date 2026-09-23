@@ -1,0 +1,3 @@
+# Node test-suite files the runner never starts, with the reason. Only for files that cannot be
+# run at all (hang past the timeout on every run, crash or wedge the runner, need a real network).
+# A test that merely fails belongs out of passing.txt, not in here.

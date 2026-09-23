@@ -389,6 +389,51 @@ pub enum UpdKind {
     DecDiscard,
 }
 
+/// The result a fused `typeof v === "<literal>"` test compares against (see `Op::TypeofIs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeofKind {
+    Undefined,
+    Object,
+    Boolean,
+    Number,
+    BigInt,
+    String,
+    Symbol,
+    Function,
+}
+
+impl TypeofKind {
+    /// The kind a `typeof` result literal names, or `None` for a string `typeof` never yields.
+    pub(crate) fn from_literal(s: &str) -> Option<Self> {
+        Some(match s {
+            "undefined" => Self::Undefined,
+            "object" => Self::Object,
+            "boolean" => Self::Boolean,
+            "number" => Self::Number,
+            "bigint" => Self::BigInt,
+            "string" => Self::String,
+            "symbol" => Self::Symbol,
+            "function" => Self::Function,
+            _ => return None,
+        })
+    }
+
+    fn of(i: &crate::interpreter::Interp, v: &Value) -> Self {
+        match v {
+            Value::Obj(_) if i.is_htmldda(v) => Self::Undefined,
+            Value::Undefined | Value::Empty => Self::Undefined,
+            Value::Null => Self::Object,
+            Value::Bool(_) => Self::Boolean,
+            Value::Num(_) => Self::Number,
+            Value::BigInt(_) => Self::BigInt,
+            Value::Str(_) => Self::String,
+            Value::Sym(_) => Self::Symbol,
+            Value::Obj(_) if v.is_callable() => Self::Function,
+            Value::Obj(_) => Self::Object,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
     Const(u32),
@@ -566,6 +611,9 @@ pub enum Op {
     Not,
     BitNot,
     Typeof,
+    /// `typeof v === "<kind>"` (or `!==` when the flag is set; loose and strict equality agree
+    /// on two strings): pops `v`, pushes a Bool. No result string is built or compared.
+    TypeofIs(TypeofKind, bool),
     /// `typeof freeName`: absent bindings yield "undefined", while lexical TDZ still throws.
     TypeofName(u32),
     Void,
@@ -4001,6 +4049,16 @@ impl Compiler {
                 Ok(())
             }
             Expr::Binary { op, left, right } => {
+                if let Some((arg, kind, negated)) = typeof_test(op, left, right) {
+                    // `typeof freeName` must not throw for an unresolvable name; that path keeps
+                    // TypeofName and the ordinary string comparison.
+                    let free = matches!(arg, Expr::Ident(n) if self.home(n).is_none());
+                    if !free {
+                        self.expr(arg)?;
+                        self.emit(Op::TypeofIs(kind, negated));
+                        return Ok(());
+                    }
+                }
                 self.expr(left)?;
                 self.expr(right)?;
                 let bop = match *op {
@@ -5165,6 +5223,10 @@ fn run_vm(
                 let v = i.eval_unary_vm("typeof", a)?;
                 stack.push(v);
             }
+            Op::TypeofIs(kind, negated) => {
+                let a = pop!();
+                stack.push(Value::Bool((TypeofKind::of(i, &a) == kind) != negated));
+            }
             Op::TypeofName(n) => {
                 stack.push(i.typeof_name_vm(&chunk.names[n as usize], env)?);
             }
@@ -5172,7 +5234,15 @@ fn run_vm(
                 pop!();
                 stack.push(Value::Undefined);
             }
-            Op::Jump(t) => *pc = t as usize,
+            Op::Jump(t) => {
+                // A backward jump is a loop turn: the same safe point the tree-walker runs at every
+                // loop head, amortized, so an allocation-free `while (true) {}` still reaches the
+                // collector and the embedder's interrupt.
+                if (t as usize) < *pc {
+                    i.gc_check_amortized()?;
+                }
+                *pc = t as usize
+            }
             Op::InlineGuard(t, target) => {
                 let it = &chunk.inline_targets[t as usize];
                 let d = it.argc as usize + 1;
@@ -6440,7 +6510,13 @@ impl Chunk {
             | Op::StrictNotEq
             | Op::InstanceOf(_)
             | Op::GenBin(_) => (2, 1),
-            Op::Neg | Op::Plus | Op::Not | Op::BitNot | Op::Typeof | Op::Void => (1, 1),
+            Op::Neg
+            | Op::Plus
+            | Op::Not
+            | Op::BitNot
+            | Op::Typeof
+            | Op::TypeofIs(..)
+            | Op::Void => (1, 1),
             Op::TypeofName(_) => (0, 1),
             Op::Jump(_) => (0, 0),
             Op::InlineGuard(..) => (0, 0),
@@ -6460,6 +6536,26 @@ impl Chunk {
             Op::PushHandler(_) | Op::PopHandler => (0, 0),
         })
     }
+}
+
+/// Recognize `typeof x ==/===/!=/!== "<kind>"` in either operand order. The literal side has no
+/// effects, so evaluating only `x` preserves order. Literals `typeof` never produces stay unfused.
+fn typeof_test<'e>(
+    op: &str,
+    left: &'e Expr,
+    right: &'e Expr,
+) -> Option<(&'e Expr, TypeofKind, bool)> {
+    let negated = match op {
+        "==" | "===" => false,
+        "!=" | "!==" => true,
+        _ => return None,
+    };
+    let (arg, lit) = match (left, right) {
+        (Expr::Unary { op: "typeof", arg }, Expr::Str(lit))
+        | (Expr::Str(lit), Expr::Unary { op: "typeof", arg }) => (arg, lit),
+        _ => return None,
+    };
+    Some((&**arg, TypeofKind::from_literal(lit)?, negated))
 }
 
 /// Execute the single (non-control-flow) op at `pc` against the raw operand stack `sp`. Returns
@@ -9052,6 +9148,10 @@ unsafe fn jit_exec_inner(
             let a = pop!();
             let v = i.eval_unary_vm("typeof", a)?;
             push!(v);
+        }
+        Op::TypeofIs(kind, negated) => {
+            let a = pop!();
+            push!(Value::Bool((TypeofKind::of(i, &a) == kind) != negated));
         }
         Op::TypeofName(n) => {
             push!(i.typeof_name_vm(&chunk.names[n as usize], env)?);

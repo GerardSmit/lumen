@@ -99,6 +99,9 @@ struct WorkerSpec {
     /// Structured-clone bytes of `{ workerData, argv, env, envData, entry }` (node mode).
     init: Option<Vec<u8>>,
     thread_id: u64,
+    /// The parent's embedding, when the parent realm runs inside a host process: a worker must
+    /// not fall back to the host's own cwd, stdio and process.
+    embedding: Option<crate::WorkerEmbedding>,
 }
 
 /// `__worker.spawn(path, isModule, dispatch, opts?)` → `{ id, threadId }`. Spawns the worker
@@ -151,6 +154,10 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         id
     };
 
+    let embedding = ctx
+        .op_state()
+        .get::<crate::WorkerEmbedding>()
+        .cloned();
     let spec = WorkerSpec {
         entry,
         is_module,
@@ -158,6 +165,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         is_eval,
         init,
         thread_id,
+        embedding,
     };
     let worker_stop = Arc::clone(&stop);
     std::thread::Builder::new()
@@ -321,7 +329,7 @@ fn run_worker(
     to_main_tx: Sender<ToMain>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut rt = Runtime::new();
+    let mut rt = Runtime::new_worker(spec.embedding.clone());
     lumen_host::install(rt.engine(), &[worker_scope_extension()]);
     rt.engine().ctx().op_state().put(WorkerSelf {
         to_main: to_main_tx.clone(),
@@ -369,7 +377,11 @@ fn run_worker(
     let entry_result = if spec.is_eval {
         // `eval: true` — the entry IS the source, run as a classic script (global `require` in
         // scope, like Node's eval workers). Imports resolve against the cwd.
-        let base = std::env::current_dir()
+        let cwd = match &spec.embedding {
+            Some(embedding) => Ok(embedding.cwd.clone()),
+            None => std::env::current_dir(),
+        };
+        let base = cwd
             .map(|d| d.join("[worker eval]").to_string_lossy().into_owned())
             .unwrap_or_else(|_| "[worker eval]".to_string());
         rt.eval_worker_entry(&spec.entry, &base, false)

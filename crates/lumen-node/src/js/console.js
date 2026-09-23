@@ -197,8 +197,10 @@
       }
     }
   }
-  Console.prototype.Console = Console;
   Object.assign(Console.prototype, methods);
+  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
+  Console = __legacyConstructor(Console);
+  Console.prototype.Console = Console;
 
   // --- augment the global console into the module object ---------------------------------------
   // Node's `console` module *is* the global console (`require('console') === globalThis.console`).

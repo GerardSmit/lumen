@@ -270,7 +270,18 @@ fn acquire_instance_lock() -> Result<InstanceLock, u32> {
     }
 }
 
+/// Whether `pid` is a live process (via `tasklist`, which needs no winapi binding).
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/NH", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!(" {pid} ")))
+        .unwrap_or(false)
+}
+
 /// Whether `pid` is a live process (via `kill -0`, which needs no libc binding).
+#[cfg(not(windows))]
 fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
@@ -382,23 +393,9 @@ fn worker_loop(
             None => return,
         };
         let out_file = unique_tmp("out");
-        // Launch the worker under `ulimit -v` so a runaway allocation hits the address-space limit
-        // (malloc fails → worker aborts → recorded as a crash) rather than exhausting system RAM.
-        let worker_cmd = format!(
-            "ulimit -v {limit} 2>/dev/null; exec {exe} --worker {root} {paths} {out} {lo} {hi}",
-            limit = WORKER_AS_LIMIT_KIB,
-            exe = shell_quote(&self_exe.to_string_lossy()),
-            root = shell_quote(root),
-            paths = shell_quote(paths_file),
-            out = shell_quote(&out_file.to_string_lossy()),
-        );
         // Spawn the worker and wait with a deadline; kill it if it blows the time budget.
         let mut timed_out = false;
-        let status = match std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&worker_cmd)
-            .spawn()
-        {
+        let status = match worker_command(self_exe, root, paths_file, &out_file, lo, hi).spawn() {
             Ok(mut child) => {
                 // The deadline is per-*test*, not per-chunk: it resets whenever the worker writes a
                 // new result (the out file grows). So a chunk of merely-slow tests keeps running as
@@ -491,13 +488,17 @@ fn run_worker(argv: &[String]) {
     // Die with the parent: an interrupted orchestrator (Ctrl-C, kill, tool timeout) must not
     // leave workers running — orphans from successive runs stack up and exhaust RAM. When the
     // parent disappears we get reparented (parent id changes), which this watchdog polls for.
-    let parent = std::os::unix::process::parent_id();
-    std::thread::spawn(move || loop {
-        if std::os::unix::process::parent_id() != parent {
-            std::process::exit(0);
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    });
+    // Unix-only: Windows does not reparent orphans, so there is no parent-id change to observe.
+    #[cfg(unix)]
+    {
+        let parent = std::os::unix::process::parent_id();
+        std::thread::spawn(move || loop {
+            if std::os::unix::process::parent_id() != parent {
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        });
+    }
     // Run on a thread with a large stack: a tree-walker (and especially generators/async, which
     // add frames) needs headroom for legitimately deep — but depth-bounded — recursion. The child's
     // 8 MiB main-thread stack is not enough.
@@ -557,6 +558,41 @@ fn decode_line(line: &str) -> Option<(usize, Outcome)> {
         _ => Outcome::Fail(reason),
     };
     Some((idx, outcome))
+}
+
+/// The child-process command for one worker chunk. On Unix it runs under `ulimit -v` so a runaway
+/// allocation hits the address-space limit (malloc fails → worker aborts → recorded as a crash)
+/// rather than exhausting system RAM. Elsewhere there is no shell limit; `MEM_CAP` still applies.
+fn worker_command(
+    self_exe: &Path,
+    root: &str,
+    paths_file: &str,
+    out_file: &Path,
+    lo: usize,
+    hi: usize,
+) -> std::process::Command {
+    if cfg!(unix) {
+        let worker_cmd = format!(
+            "ulimit -v {limit} 2>/dev/null; exec {exe} --worker {root} {paths} {out} {lo} {hi}",
+            limit = WORKER_AS_LIMIT_KIB,
+            exe = shell_quote(&self_exe.to_string_lossy()),
+            root = shell_quote(root),
+            paths = shell_quote(paths_file),
+            out = shell_quote(&out_file.to_string_lossy()),
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(worker_cmd);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new(self_exe);
+        cmd.arg("--worker")
+            .arg(root)
+            .arg(paths_file)
+            .arg(out_file)
+            .arg(lo.to_string())
+            .arg(hi.to_string());
+        cmd
+    }
 }
 
 /// POSIX single-quote a string so it survives `/bin/sh -c` as one argument.
@@ -730,32 +766,16 @@ fn run_one_inner(path: &Path, harness: &Harness) -> Outcome {
         Ok(s) => s,
         Err(_) => return Outcome::Skip("unreadable".into()),
     };
-    // Upstream inconsistency: this test drives its harness through makeImmutableArrayBuffer
-    // without `excludeArgFactories: ["immutable"]`, but on an engine implementing the
-    // immutable-arraybuffer proposal %TypedArray%.prototype.slice must throw a TypeError for an
-    // immutable-backed species result — exactly what the companion test
-    // speciesctor-destination-backed-by-immutable-buffer.js (which lumen passes) requires.
-    if path.ends_with("TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js") {
-        return Outcome::Skip("upstream: missing immutable exclusion".into());
-    }
-    // Upstream conflict: this SpiderMonkey staging test expects an Annex B block function named
-    // `arguments` to be promoted over the arguments object, but the normative
-    // annexB/language/function-code/block-decl-func-skip-arguments.js requires the promotion be
-    // SKIPPED ("arguments" is in parameterNames). One engine cannot pass both; lumen follows the
-    // spec.
-    if path.ends_with("staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js")
-        || path.ends_with("staging/sm/regress/regress-602621.js")
-    {
+    // Stale upstream test: it quotes the old FunctionDeclarationInstantiation step that appended
+    // "arguments" to parameterNames, which blocked Annex B promotion of `{ function arguments(){} }`.
+    // The current spec only adds "arguments" to paramBindings, so the block function IS promoted
+    // (reusing the arguments binding) - as V8 and SpiderMonkey do, and as
+    // staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js and
+    // staging/sm/regress/regress-602621.js require. lumen follows the current spec.
+    if path.ends_with("annexB/language/function-code/block-decl-func-skip-arguments.js") {
         return Outcome::Skip(
-            "upstream: conflicts with annexB block-decl-func-skip-arguments".into(),
+            "upstream: stale, contradicts current FunctionDeclarationInstantiation".into(),
         );
-    }
-    // Upstream test bug: verifies result.fulfilled / result.rejected with the destructive
-    // verifyProperty (isConfigurable deletes the property and does not restore it), then reads
-    // the now-deleted entries. A spec-perfect implementation fails identically (verified against
-    // V8 with a by-the-spec polyfill); the test needs `{restore: true}` or reordering upstream.
-    if path.ends_with("Promise/allSettledKeyed/result-property-descriptors.js") {
-        return Outcome::Skip("upstream: destructive verifyProperty before entry reads".into());
     }
     let fm = Frontmatter::parse(&src);
 

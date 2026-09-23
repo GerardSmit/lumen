@@ -364,3 +364,149 @@ impl Drop for ThreadPool {
 
 #[cfg(test)]
 mod tests;
+
+/// Starts a subprocess for `child_process`. The default is `command.spawn()`; an embedder that runs
+/// realms inside its own process supplies one that puts the child where it belongs (a job object
+/// or cgroup per realm) — the realm has no process of its own for descendants to inherit.
+pub trait Spawner: Send + Sync {
+    fn spawn(&self, command: &mut std::process::Command) -> std::io::Result<std::process::Child>;
+}
+
+/// Present in [`OpState`] when the runtime runs inside a host process instead of owning one (see
+/// `lumen_runtime::Embedding`). Everything a Node program believes is process-wide and a realm
+/// must not change for its host lives here instead: the working directory, the exit request,
+/// stdin, and how subprocesses start. Ops that would otherwise reach the OS consult it first.
+pub struct RealmProcess {
+    /// `process.cwd()`; `process.chdir` moves only this.
+    pub cwd: std::path::PathBuf,
+    /// Set by `process.exit` / `process.abort`: the realm is terminating with this code.
+    pub exit_code: Option<i32>,
+    /// The realm's stop request; `process.exit` sets it so the engine unwinds at its next safe
+    /// point.
+    pub interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `process.stdin`'s source. Shared because a blocking read runs on its own thread.
+    pub stdin: std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Read + Send>>>,
+    /// What fd 1 and fd 2 write to: the same writers `console` and `process.stdout` use.
+    pub stdout: std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+    pub stderr: std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+    pub spawner: Option<std::sync::Arc<dyn Spawner>>,
+}
+
+impl RealmProcess {
+    /// Resolve `path` against the realm's working directory (absolute paths pass through).
+    pub fn resolve(&self, path: &str) -> std::path::PathBuf {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.cwd.join(p)
+        }
+    }
+}
+
+/// Read from fd 0: the realm's stdin when embedded, the process's otherwise.
+pub fn read_stdin_fd(ctx: &mut Ctx, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    let realm = ctx
+        .op_state()
+        .get::<RealmProcess>()
+        .map(|realm| std::sync::Arc::clone(&realm.stdin));
+    match realm {
+        Some(stdin) => stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read(buf),
+        None => std::io::stdin().read(buf),
+    }
+}
+
+/// Write to fd 1 or fd 2: the realm's writers when embedded, the process's otherwise.
+pub fn write_std_fd(ctx: &mut Ctx, fd: u32, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let realm = ctx.op_state().get::<RealmProcess>().map(|realm| {
+        std::sync::Arc::clone(if fd == 2 { &realm.stderr } else { &realm.stdout })
+    });
+    match realm {
+        Some(writer) => {
+            let mut writer = writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            writer.write_all(bytes)?;
+            writer.flush()
+        }
+        None if fd == 2 => {
+            let mut stderr = std::io::stderr();
+            stderr.write_all(bytes)?;
+            stderr.flush()
+        }
+        None => {
+            let mut stdout = std::io::stdout();
+            stdout.write_all(bytes)?;
+            stdout.flush()
+        }
+    }
+}
+
+/// `std::fs::canonicalize` as Node's `realpath` reports it. On Windows std returns verbatim paths
+/// (`\\?\C:\dir`, `\\?\UNC\server\share`), which Node never shows a program: they leak into
+/// `__filename`, `require.cache` keys and paths handed to Node APIs that reject them.
+pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(path).map(strip_verbatim)
+}
+
+/// Drop Windows' verbatim prefix: `\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`.
+pub fn strip_verbatim(path: std::path::PathBuf) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path,
+    }
+}
+
+/// Spawn `command` through the realm's [`Spawner`] when one is installed, else directly.
+pub fn spawn_command(
+    ctx: &mut Ctx,
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    let spawner = ctx
+        .op_state()
+        .get::<RealmProcess>()
+        .and_then(|realm| realm.spawner.clone());
+    match spawner {
+        Some(spawner) => spawner.spawn(command),
+        None => command.spawn(),
+    }
+}
+
+/// Fill `buf` from the operating system's CSPRNG: `ProcessPrng` on Windows (what std itself
+/// uses), `/dev/urandom` elsewhere.
+pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        #[link(name = "bcryptprimitives", kind = "raw-dylib")]
+        extern "system" {
+            fn ProcessPrng(data: *mut u8, len: usize) -> i32;
+        }
+        // Documented to always succeed (it returns TRUE); checked anyway.
+        if unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) } == 0 {
+            return Err(std::io::Error::other("ProcessPrng failed"));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+        static URANDOM: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+        let file = match URANDOM.get() {
+            Some(file) => file,
+            None => {
+                let opened = std::fs::File::open("/dev/urandom")?;
+                URANDOM.get_or_init(|| opened)
+            }
+        };
+        (&*file).read_exact(buf)
+    }
+}

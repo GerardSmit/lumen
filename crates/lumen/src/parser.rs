@@ -140,10 +140,13 @@ fn parse_script_inner(
         last_paren: false,
         single_stmt: false,
         in_static_block: false,
+        check_skipped: true,
+        pending_private: Vec::new(),
     };
     let strict_prologue = p.has_use_strict_prologue();
     p.strict = p.strict || strict_prologue;
     let body = p.parse_stmts_until_eof()?;
+    p.resolve_pending_private()?;
     // A direct eval sees the private names visible where it was called.
     let mut st: Vec<Vec<String>> = Vec::new();
     if !private_names.is_empty() {
@@ -227,8 +230,11 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         last_paren: false,
         single_stmt: false,
         in_static_block: false,
+        check_skipped: true,
+        pending_private: Vec::new(),
     };
     let body = p.parse_stmts_until_eof()?;
+    p.resolve_pending_private()?;
     validate_module(&body)?;
     validate_private_names(&body).map_err(|message| ParseError {
         at_eof: false,
@@ -449,6 +455,8 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         last_paren: false,
         single_stmt: false,
         in_static_block: false,
+        check_skipped: false,
+        pending_private: Vec::new(),
     };
     p.expect_punct("{")?;
     let body = p.parse_block_body()?;
@@ -603,6 +611,21 @@ struct Parser {
     /// Inside a `static { … }` class block, where `await` is reserved entirely (neither an
     /// identifier nor an await expression). Cleared by nested function boundaries.
     in_static_block: bool,
+    /// Check a body it skips for early errors before skipping it (see
+    /// [`Parser::parse_function_body`]). Off in [`parse_lazy_body`], whose skipped bodies were
+    /// checked with it when the enclosing source was parsed.
+    check_skipped: bool,
+    /// Private names referenced in checked-then-skipped bodies that no class inside the body
+    /// declares, with the class scope they must resolve in. Resolved once parsing finishes, when
+    /// every enclosing class's names are known.
+    pending_private: Vec<PendingPrivate>,
+}
+
+/// See [`Parser::pending_private`].
+struct PendingPrivate {
+    scope: Option<Rc<PrivateScope>>,
+    names: Vec<String>,
+    line: u32,
 }
 
 thread_local! {
@@ -654,18 +677,20 @@ fn rc_fn(f: Function) -> Rc<Function> {
     f
 }
 
-/// A parsed function body, or one skipped for [`parse_lazy_body`].
+/// A parsed function body, or one skipped for [`parse_lazy_body`]. A skipped body may carry the
+/// throwaway parse it was checked with, kept only until the function node is built.
 enum Body {
     Eager(Vec<Stmt>),
-    Lazy(LazyBody),
+    Lazy(LazyBody, Option<Vec<Stmt>>),
 }
 
 impl Body {
-    /// [`params_body_lexical_clash`] for an eager body; a lazy body runs it when parsed.
+    /// [`params_body_lexical_clash`] for a parsed (or checked) body; an unchecked lazy body runs
+    /// it when parsed.
     fn params_lexical_clash(&self, params: &[Param]) -> Option<String> {
         match self {
-            Body::Eager(b) => params_body_lexical_clash(params, b),
-            Body::Lazy(_) => None,
+            Body::Eager(b) | Body::Lazy(_, Some(b)) => params_body_lexical_clash(params, b),
+            Body::Lazy(_, None) => None,
         }
     }
     fn cells(
@@ -679,7 +704,7 @@ impl Body {
                 std::cell::RefCell::new(Some(Rc::new(b))),
                 std::cell::RefCell::new(None),
             ),
-            Body::Lazy(l) => (
+            Body::Lazy(l, _) => (
                 std::cell::RefCell::new(None),
                 std::cell::RefCell::new(Some(Box::new(l))),
             ),
@@ -3185,10 +3210,13 @@ impl Parser {
                         last_paren: false,
                         single_stmt: false,
                         in_static_block: false,
+                        check_skipped: self.check_skipped,
+                        pending_private: Vec::new(),
                     };
                     // A substitution is ToString'd (string hint), not concatenated raw.
                     let e = sub.parse_expr()?;
                     self.proto_dups.append(&mut sub.proto_dups);
+                    self.pending_private.append(&mut sub.pending_private);
                     Expr::ToStr(Box::new(e))
                 }
             };
@@ -3260,9 +3288,12 @@ impl Parser {
                         last_paren: false,
                         single_stmt: false,
                         in_static_block: false,
+                        check_skipped: self.check_skipped,
+                        pending_private: Vec::new(),
                     };
                     let e = sub.parse_expr()?;
                     self.proto_dups.append(&mut sub.proto_dups);
+                    self.pending_private.append(&mut sub.pending_private);
                     subs.push(e);
                 }
             }
@@ -3328,10 +3359,19 @@ impl Parser {
         let mut proto_seen = false;
         while !self.is_punct("}") {
             if self.eat_punct("...") {
-                props.push(PropDef::Spread(self.parse_assign()?));
+                let inner = self.parse_assign()?;
                 if !self.eat_punct(",") {
+                    props.push(PropDef::Spread(inner));
                     break;
                 }
+                // `{...x,}` is a valid literal but a rest property can't carry a trailing comma
+                // in a destructuring pattern; the transparent Seq wrapper marks that for
+                // validation (a spread followed by more properties is already not last).
+                props.push(PropDef::Spread(if self.is_punct("}") {
+                    Expr::Seq(vec![inner])
+                } else {
+                    inner
+                }));
                 continue;
             }
             // The property-definition start: a method's `toString` source begins here.
@@ -4114,6 +4154,7 @@ impl Parser {
         if inner_strict {
             self.strict = true;
         }
+        let mut skipped = None;
         if self.lazy && !(self.eager_outermost && self.fn_depth == 0) {
             if let Some(close) = self.matching_brace(open) {
                 let next = |i: usize| self.toks.get(i).map(|t| &t.kind);
@@ -4149,11 +4190,21 @@ impl Parser {
                         ctx,
                         private_scope: self.private_scope.clone(),
                     };
-                    self.pos = close + 1;
-                    self.strict = saved_strict;
-                    return Ok((Body::Lazy(lazy), ctx.strict));
+                    if !self.check_skipped {
+                        self.pos = close + 1;
+                        self.strict = saved_strict;
+                        return Ok((Body::Lazy(lazy, None), ctx.strict));
+                    }
+                    skipped = Some(lazy);
                 }
             }
+        }
+        // A body about to be skipped is still parsed once, in full (its nested functions too), so
+        // its early errors are reported at load as the spec requires; that parse is then dropped
+        // and the body re-parsed from its range on first call.
+        let saved_lazy = self.lazy;
+        if skipped.is_some() {
+            self.lazy = false;
         }
         // A function body is a fresh context for return/break/continue and labels.
         let (siter, sswitch) = (self.iter_depth, self.switch_depth);
@@ -4168,6 +4219,7 @@ impl Parser {
         self.switch_depth = 0;
         self.next_scope_is_fn_boundary = true;
         let body = self.parse_block_body();
+        self.lazy = saved_lazy;
         self.fn_depth -= 1;
         if !is_arrow {
             self.nonarrow_fn_depth -= 1;
@@ -4179,7 +4231,51 @@ impl Parser {
         let body = body?;
         let result_strict = self.strict;
         self.strict = saved_strict;
+        if let Some(lazy) = skipped {
+            self.defer_private_names(&body, lazy.line)?;
+            return Ok((Body::Lazy(lazy, Some(body)), result_strict));
+        }
         Ok((Body::Eager(body), result_strict))
+    }
+
+    /// The private-name check [`parse_lazy_body`] runs, for a body checked at skip time: names a
+    /// class inside the body declares resolve now; the rest wait in `pending_private` until the
+    /// enclosing classes are complete.
+    fn defer_private_names(&mut self, body: &[Stmt], line: u32) -> Result<(), ParseError> {
+        let outer = PN_UNRESOLVED.with(|u| u.replace(Some(Vec::new())));
+        let r = pn_stmts(body, &mut Vec::new());
+        let unresolved = PN_UNRESOLVED.with(|u| u.replace(outer)).unwrap_or_default();
+        r.map_err(|message| ParseError {
+            at_eof: false,
+            message,
+            line,
+        })?;
+        if !unresolved.is_empty() {
+            self.pending_private.push(PendingPrivate {
+                scope: self.private_scope.clone(),
+                names: unresolved,
+                line,
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_pending_private(&mut self) -> Result<(), ParseError> {
+        for p in std::mem::take(&mut self.pending_private) {
+            let st = p
+                .scope
+                .as_ref()
+                .map(PrivateScope::visible_names)
+                .unwrap_or_default();
+            if let Some(n) = p.names.iter().find(|n| !pn_declared(&st, n)) {
+                return Err(ParseError {
+                    at_eof: false,
+                    message: format!("Private name '{n}' is not declared in an enclosing class"),
+                    line: p.line,
+                });
+            }
+        }
+        Ok(())
     }
 
     // ----- arrow functions --------------------------------------------------------------------
@@ -4727,6 +4823,26 @@ fn validate_private_names(stmts: &[Stmt]) -> Result<(), String> {
     pn_stmts(stmts, &mut st)
 }
 
+thread_local! {
+    /// While set, [`pn_undeclared`] collects names here instead of failing (see
+    /// [`Parser::defer_private_names`]).
+    static PN_UNRESOLVED: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A private name no class on the walk's stack declares.
+fn pn_undeclared(name: &str) -> Result<(), String> {
+    PN_UNRESOLVED.with(|u| match &mut *u.borrow_mut() {
+        Some(names) => {
+            names.push(name.to_string());
+            Ok(())
+        }
+        None => Err(format!(
+            "Private name '{name}' is not declared in an enclosing class"
+        )),
+    })
+}
+
 fn pn_declared(st: &[Vec<String>], name: &str) -> bool {
     st.iter().any(|s| s.iter().any(|n| n == name))
 }
@@ -4931,17 +5047,13 @@ fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
         }
         Expr::Member { obj, prop, .. } => {
             if prop.starts_with('#') && !pn_declared(st, prop) {
-                return Err(format!(
-                    "Private name '{prop}' is not declared in an enclosing class"
-                ));
+                pn_undeclared(prop)?;
             }
             pn_expr(obj, st)?;
         }
         Expr::PrivateIn { name, obj } => {
             if !pn_declared(st, name) {
-                return Err(format!(
-                    "Private name '{name}' is not declared in an enclosing class"
-                ));
+                pn_undeclared(name)?;
             }
             pn_expr(obj, st)?;
         }

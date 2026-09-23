@@ -12,8 +12,8 @@
 //!   ArrayBuffer, typed arrays; no transfer list)
 //! - [x] `URL` / `URLSearchParams` (see url.rs for the parser's declared subset — no IDNA)
 //! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
-//! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (`/dev/urandom` via std::fs — no
-//!   syscalls, no crates), `crypto.subtle.digest` (SHA-256 only)
+//! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
+//!   `lumen_host::fill_random`, no crates), `crypto.subtle.digest` (SHA-256 only)
 //! - [x] `fetch` / `Headers` / `Request` / `Response` — HTTP and certificate-verified HTTPS
 //!   through the dynamically loaded system OpenSSL backend
 //! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
@@ -26,9 +26,7 @@
 //! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
 //!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
 
-use std::cell::RefCell;
 use std::fs::File;
-use std::io::Read;
 use std::time::Instant;
 
 use lumen_host::{ops, Ctx, Extension, OpState, SpawnHandle, TaskRegistry, Value};
@@ -161,9 +159,6 @@ struct WebState {
     /// captured at the same instant — set together on first access.
     start: Option<Instant>,
     time_origin_ms: f64,
-    /// Cached `/dev/urandom` handle (macOS/Linux; the only randomness std can reach without
-    /// syscalls or crates).
-    urandom: Option<RefCell<File>>,
 }
 
 impl WebState {
@@ -263,24 +258,9 @@ pub(crate) fn web_random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value
 }
 
 fn random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
-    let state = ctx.host_mut::<WebState>().expect("web state installed");
-    if state.urandom.is_none() {
-        match File::open("/dev/urandom") {
-            Ok(f) => state.urandom = Some(RefCell::new(f)),
-            Err(e) => {
-                return Err(ctx.make_error("Error", format!("no randomness source: {e}")));
-            }
-        }
-    }
     let mut buf = vec![0u8; n];
-    let ok = {
-        let state = ctx.host_mut::<WebState>().expect("just set");
-        let f = state.urandom.as_ref().expect("just set");
-        f.borrow_mut().read_exact(&mut buf).is_ok()
-    };
-    if !ok {
-        return Err(ctx.make_error("Error", "randomness source read failed"));
-    }
+    lumen_host::fill_random(&mut buf)
+        .map_err(|e| ctx.make_error("Error", format!("no randomness source: {e}")))?;
     Ok(buf)
 }
 

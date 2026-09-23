@@ -54,6 +54,7 @@ pub fn extension() -> Extension {
             (
                 "__node",
                 ops![
+                    "realmCwd" (0) => op_realm_cwd,
                     "isFile" (1) => op_is_file,
                     "isDir" (1) => op_is_dir,
                     "readText" (1) => op_read_text,
@@ -270,7 +271,7 @@ fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 /// path doesn't exist yet (matching how the JS resolver probes candidates).
 fn op_realpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    match std::fs::canonicalize(&p) {
+    match lumen_host::canonicalize(&p) {
         Ok(c) => Ok(Value::from_string(c.to_string_lossy().into_owned())),
         Err(_) => Ok(Value::from_string(p)),
     }
@@ -1275,4 +1276,14 @@ fn op_zlib_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> 
     Ok(Value::Num(
         lumen_host::deflate::crc32_from(seed, &bytes) as f64
     ))
+}
+
+/// `() -> string | undefined` — the embedded realm's working directory, or `undefined` when the
+/// runtime owns its process (the OS cwd is then the right base and paths stay as written).
+fn op_realm_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(ctx
+        .op_state()
+        .get::<lumen_host::RealmProcess>()
+        .map(|realm| Value::from_string(realm.cwd.to_string_lossy().into_owned()))
+        .unwrap_or(Value::Undefined))
 }

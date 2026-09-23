@@ -611,15 +611,13 @@ impl Interp {
     }
 
     /// The (cached, per canonical key) ModuleSource object a source-phase import binds: an
-    /// ordinary object whose prototype is %AbstractModuleSource%.prototype.
+    /// ordinary object whose prototype is the host's concrete module-source prototype, itself
+    /// inheriting from %AbstractModuleSource%.prototype.
     pub(crate) fn module_source_of(&mut self, dep: &str) -> Value {
         if let Some(v) = self.module_source_objs.get(dep) {
             return v.clone();
         }
-        let proto = self
-            .extra_protos
-            .get("%AbstractModuleSourceProto%")
-            .cloned();
+        let proto = self.extra_protos.get("%ModuleSourceProto%").cloned();
         let obj = Object::new(proto);
         let v = Value::Obj(obj);
         self.module_source_objs.insert(dep.to_string(), v.clone());
@@ -1540,6 +1538,16 @@ impl Interp {
     /// (which may use top-level await) completes. Dependencies evaluate synchronously first; the
     /// module's own body runs in a coroutine so a top-level await parks it.
     fn evaluate_module_dynamic(&mut self, key: &str) -> Value {
+        // Evaluate() step: an evaluating-async or evaluated module defers to its [[CycleRoot]],
+        // so a member that finished before its cycle failed reports the cycle's error.
+        let key = {
+            let rec = &self.module_recs[key];
+            match &rec.cycle_root {
+                Some(root) if rec.evaluated || rec.async_order.is_some() => root.clone(),
+                _ => key.to_string(),
+            }
+        };
+        let key = key.as_str();
         let (top, err, settled) = {
             let rec = &self.module_recs[key];
             (

@@ -376,7 +376,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
 
 /// Whether a locale's Collator supports a collation type (mirrors the CLDR availability that
 /// Intl.supportedValuesOf("collation") reflects). "eor"/"emoji" are available everywhere.
-fn supported_collation(lang: &str, c: &str) -> bool {
+pub(super) fn supported_collation(lang: &str, c: &str) -> bool {
     match c {
         "eor" | "emoji" => true,
         "phonebk" => lang == "de",

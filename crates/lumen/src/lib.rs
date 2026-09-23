@@ -299,7 +299,42 @@ impl Engine {
     /// touches any codegen path; `Bytecode` compiles eligible functions after
     /// [`set_tier_threshold`](Engine::set_tier_threshold) calls.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
+        // An interruptible realm stays off the JIT (see `set_interrupt`).
+        let tier = match tier {
+            bytecode::Tier::Jit if self.interp.interrupt.is_some() => bytecode::Tier::Bytecode,
+            other => other,
+        };
         self.interp.tier = tier;
+    }
+
+    /// Give an embedder a way to stop this realm from another thread. Once `flag` is set, the next
+    /// safe point (a call, a loop turn) throws, every later one throws again, and no further
+    /// promise reactions run. Safe points are only polled by the interpreter and bytecode tiers,
+    /// so an interruptible realm must not run on [`Tier::Jit`](bytecode::Tier::Jit); this caps
+    /// the tier at `Bytecode`.
+    pub fn set_interrupt(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.interp.interrupt = Some(flag);
+        if matches!(self.interp.tier, bytecode::Tier::Jit) {
+            self.interp.tier = bytecode::Tier::Bytecode;
+        }
+    }
+
+    /// Lower this realm's live-object ceiling (default [`interpreter::MAX_LIVE`]). With an
+    /// interrupt set, crossing it terminates the realm (see [`Engine::heap_limit_hit`]); without
+    /// one it is the usual catchable `RangeError`.
+    pub fn set_live_object_limit(&mut self, limit: i64) {
+        self.interp.live_limit = limit.clamp(interpreter::GC_TRIGGER, interpreter::MAX_LIVE);
+        self.interp.gc_next = self.interp.gc_next.min(self.interp.live_limit);
+    }
+
+    /// Whether this realm has been terminated (interrupt or live-object ceiling).
+    pub fn is_terminated(&self) -> bool {
+        self.interp.terminating
+    }
+
+    /// Whether the termination came from the live-object ceiling.
+    pub fn heap_limit_hit(&self) -> bool {
+        self.interp.heap_limit_hit
     }
 
     /// The execution tier new calls are considered for (see [`set_tier`](Engine::set_tier)).

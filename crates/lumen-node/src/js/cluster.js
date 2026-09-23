@@ -127,5 +127,9 @@
     }
   };
 
+  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
+  Worker = __legacyConstructor(Worker);
+  cluster.Worker = Worker;
+
   __builtins.set("cluster", cluster);
 }

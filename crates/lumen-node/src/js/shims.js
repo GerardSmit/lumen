@@ -796,13 +796,15 @@ __builtins.set("tty", {
             return super.destroy(err);
           }
         };
+        // Named like Node's (`Gzip`, not `cls`) and callable without `new` (see __legacyConstructor).
+        Object.defineProperty(cls, "name", { value: className });
         Object.defineProperty(zlib, className, {
-          value: cls,
+          value: __legacyConstructor(cls),
           enumerable: true,
           configurable: true,
           writable: true,
         });
-        return cls;
+        return zlib[className];
       },
     });
   };

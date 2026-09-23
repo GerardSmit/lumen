@@ -55,7 +55,7 @@ pub const CHILD_OPS: &[OpDecl] = ops![
     "closeStdin" (1) => op_close_stdin,
     "writeFd" (5) => op_write_fd,
     "closeFd" (2) => op_close_fd,
-    "execSync" (4) => op_exec_sync,
+    "execSync" (5) => op_exec_sync,
 ];
 
 // ---- helpers ----------------------------------------------------------------------------------
@@ -97,6 +97,46 @@ fn opt_string(ctx: &mut Ctx, v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// The child's working directory: the one asked for, else the realm's (an embedded realm's cwd is
+/// not the host process's), else inherited. A relative `cwd` is relative to the realm's.
+fn apply_cwd(ctx: &mut Ctx, command: &mut Command, cwd: Option<String>) {
+    let realm = ctx.op_state().get::<lumen_host::RealmProcess>();
+    match (cwd, realm) {
+        (Some(cwd), Some(realm)) => {
+            command.current_dir(realm.resolve(&cwd));
+        }
+        (Some(cwd), None) => {
+            command.current_dir(cwd);
+        }
+        (None, Some(realm)) => {
+            command.current_dir(&realm.cwd);
+        }
+        (None, None) => {}
+    }
+}
+
+/// env: an array of `[k, v]` pairs *replaces* the environment (Node semantics); absent = inherit.
+fn apply_env(ctx: &mut Ctx, command: &mut Command, env_pairs: &Value) -> Result<(), Value> {
+    if env_pairs.as_obj().is_none() {
+        return Ok(());
+    }
+    if let Ok(Value::Num(n)) = ctx.get_member(env_pairs, "length") {
+        command.env_clear();
+        for i in 0..(n as usize) {
+            let pair = ctx
+                .get_member(env_pairs, &i.to_string())
+                .unwrap_or(Value::Undefined);
+            let k = ctx.get_member(&pair, "0").unwrap_or(Value::Undefined);
+            let v = ctx.get_member(&pair, "1").unwrap_or(Value::Undefined);
+            command.env(
+                ctx.coerce_string(&k)?.to_string(),
+                ctx.coerce_string(&v)?.to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn build_command(
     ctx: &mut Ctx,
     cmd: &str,
@@ -107,28 +147,12 @@ fn build_command(
     let env_pairs = args.get(3).cloned().unwrap_or(Value::Undefined);
     let stdio = read_string_array(ctx, args.get(4).unwrap_or(&Value::Undefined))?;
 
+    let verbatim = matches!(args.get(5), Some(Value::Bool(true)));
+
     let mut command = Command::new(cmd);
-    command.args(&arg_list);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    // env: an array of [k, v] pairs *replaces* the environment (Node semantics); absent = inherit.
-    if env_pairs.as_obj().is_some() {
-        if let Ok(Value::Num(n)) = ctx.get_member(&env_pairs, "length") {
-            command.env_clear();
-            for i in 0..(n as usize) {
-                let pair = ctx
-                    .get_member(&env_pairs, &i.to_string())
-                    .unwrap_or(Value::Undefined);
-                let k = ctx.get_member(&pair, "0").unwrap_or(Value::Undefined);
-                let v = ctx.get_member(&pair, "1").unwrap_or(Value::Undefined);
-                command.env(
-                    ctx.coerce_string(&k)?.to_string(),
-                    ctx.coerce_string(&v)?.to_string(),
-                );
-            }
-        }
-    }
+    add_args(&mut command, &arg_list, verbatim);
+    apply_cwd(ctx, &mut command, cwd);
+    apply_env(ctx, &mut command, &env_pairs)?;
     let mut stdio = stdio;
     while stdio.len() < 3 {
         stdio.push("pipe".to_string());
@@ -201,6 +225,38 @@ fn wire_extra_stdio(_command: &mut Command, stdio: &[String]) -> std::io::Result
 // ---- ops --------------------------------------------------------------------------------------
 
 /// `(cmd, argsArray, cwd, envPairsOrNull, stdioArray) -> { childId, pid }`.
+/// Append the child's arguments. `verbatim` (Node's `windowsVerbatimArguments`, which `shell` sets
+/// for `cmd.exe`) passes them through without Windows' quoting: `cmd /d /s /c "<line>"` must reach
+/// cmd.exe exactly as written. Unix has no command-line quoting, so it is a no-op there.
+fn add_args(command: &mut Command, arg_list: &[String], verbatim: bool) {
+    #[cfg(windows)]
+    if verbatim {
+        use std::os::windows::process::CommandExt;
+        for arg in arg_list {
+            command.raw_arg(arg);
+        }
+        return;
+    }
+    let _ = verbatim;
+    command.args(arg_list);
+}
+
+/// A failed spawn as an error carrying the errno `code` (`ENOENT` for a missing program); the JS
+/// glue turns it into Node's `spawn <file> ENOENT` error with `syscall`, `path` and `spawnargs`.
+fn spawn_failure(ctx: &mut Ctx, cmd: &str, e: &std::io::Error) -> Value {
+    let code = match e.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EACCES",
+        _ => match e.raw_os_error() {
+            Some(20) => "ENOTDIR",
+            _ => "EINVAL",
+        },
+    };
+    let err = ctx.make_error("Error", format!("spawn {cmd} {code}"));
+    let _ = ctx.set_member(&err, "code", Value::str(code));
+    err
+}
+
 fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let cmd = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
@@ -213,9 +269,8 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let extra = wire_extra_stdio(&mut command, &stdio)
         .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
+    let mut child =
+        lumen_host::spawn_command(ctx, &mut command).map_err(|e| spawn_failure(ctx, &cmd, &e))?;
     let pid = child.id();
     let stdout: Option<Box<dyn Read + Send>> = child.stdout.take().map(|s| Box::new(s) as _);
     let stderr: Option<Box<dyn Read + Send>> = child.stderr.take().map(|s| Box::new(s) as _);
@@ -563,7 +618,7 @@ fn op_close_stdin(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
     Ok(Value::Undefined)
 }
 
-/// `(cmd, argsArray, inputBytesOrNull, cwd) -> { stdout, stderr, status }`. Synchronous: spawns,
+/// `(cmd, argsArray, inputBytesOrNull, cwd, envPairsOrNull) -> { stdout, stderr, status }`. Synchronous: spawns,
 /// writes optional stdin, waits, and captures output — for `execFileSync`/`spawnSync`/`execSync`.
 fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let cmd = ctx
@@ -572,10 +627,12 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
     let input = ctx.typed_array_bytes(args.get(2).unwrap_or(&Value::Undefined));
     let cwd = opt_string(ctx, args.get(3));
+    let env_pairs = args.get(4).cloned().unwrap_or(Value::Undefined);
+    let verbatim = matches!(args.get(5), Some(Value::Bool(true)));
 
     let mut command = Command::new(&cmd);
+    add_args(&mut command, &arg_list, verbatim);
     command
-        .args(&arg_list)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.stdin(if input.is_some() {
@@ -583,12 +640,10 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     } else {
         Stdio::null()
     });
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
+    apply_cwd(ctx, &mut command, cwd);
+    apply_env(ctx, &mut command, &env_pairs)?;
+    let mut child =
+        lumen_host::spawn_command(ctx, &mut command).map_err(|e| spawn_failure(ctx, &cmd, &e))?;
     if let Some(input) = input {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(&input); // dropping stdin here signals EOF

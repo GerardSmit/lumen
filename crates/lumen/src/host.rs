@@ -43,10 +43,24 @@ pub type ResourceId = u32;
 /// Open handles (files, sockets, streams): `Rc<dyn Any>` keyed by a small integer that JS code
 /// holds. Ids are never reused within a table's lifetime, so a stale id after `close` is a
 /// lookup miss, not a use-after-free of a recycled slot.
-#[derive(Default)]
+///
+/// Ids start at 3: JS code uses these as file descriptors, and 0, 1 and 2 are stdin, stdout and
+/// stderr, which no open file may shadow.
 pub struct ResourceTable {
     next: ResourceId,
     map: HashMap<ResourceId, Rc<dyn Any>>,
+}
+
+/// The first id [`ResourceTable::add`] hands out.
+pub const FIRST_RESOURCE_ID: ResourceId = 3;
+
+impl Default for ResourceTable {
+    fn default() -> Self {
+        ResourceTable {
+            next: FIRST_RESOURCE_ID,
+            map: HashMap::new(),
+        }
+    }
 }
 
 impl ResourceTable {

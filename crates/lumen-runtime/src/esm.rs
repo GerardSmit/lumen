@@ -67,7 +67,7 @@ fn resolve(
         } else {
             resolve_node_modules(specifier, Path::new(referrer).parent()?)?.0
         };
-        let key = std::fs::canonicalize(&file)
+        let key = lumen_host::canonicalize(&file)
             .unwrap_or_else(|_| file.to_path_buf())
             .to_string_lossy()
             .into_owned();
@@ -248,7 +248,7 @@ fn package_is_esm(pkg_dir: &Path) -> bool {
 /// Turn a resolved file into `(canonical_key, source)`. `.mjs`/`.js` are real ESM; `.json`
 /// and (when `cjs_default`) `.cjs`/CJS packages get a synthetic default-export wrapper.
 fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
-    let key = std::fs::canonicalize(file)
+    let key = lumen_host::canonicalize(file)
         .unwrap_or_else(|_| file.to_path_buf())
         .to_string_lossy()
         .into_owned();

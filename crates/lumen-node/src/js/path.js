@@ -198,6 +198,7 @@ function makePath(sep, isWin) {
 
 const posix = makePath("/", false);
 const win32 = makePath("\\", true);
+applyWin32Roots(win32);
 posix.posix = posix;
 posix.win32 = win32;
 win32.posix = posix;
@@ -209,6 +210,158 @@ __builtins.set("path", isWindows ? win32 : posix);
 // so `require('path/posix') === require('path').posix`.
 __builtins.set("path/posix", posix);
 __builtins.set("path/win32", win32);
+
+// Windows paths have roots the separator-only algorithm above cannot see: a drive (`C:\`, or
+// drive-relative `C:foo`), a UNC share (`\\server\share\`), a device namespace (`\\?\C:\`,
+// `\\.\pipe\x`), or a bare `\` (the current drive's root). Every operation that cares about the
+// root is replaced here; the rest (extname, format, matchesGlob) is root-agnostic.
+function applyWin32Roots(path) {
+  const isSep = (c) => c === "\\" || c === "/";
+  const splitRe = /[\\/]+/;
+
+  // { device, absolute, rest }: `device` is `C:` or `\\server\share` (or `\\?\…` / `\\.\…`
+  // up to its first component), `absolute` whether a separator follows it, `rest` the remainder.
+  function splitRoot(p) {
+    if (p.length >= 2 && isSep(p[0]) && isSep(p[1])) {
+      // `\\?\C:\x` and `\\.\pipe\x`: the namespace prefix plus its first component.
+      const ns = /^[\\/][\\/]([?.])[\\/]([^\\/]+)(?:[\\/]|$)(.*)$/s.exec(p);
+      if (ns) {
+        const device = `\\\\${ns[1]}\\${ns[2]}`;
+        return { device, absolute: true, rest: ns[3] };
+      }
+      const unc = /^[\\/][\\/]([^\\/]+)[\\/]+([^\\/]+)(?:[\\/]|$)(.*)$/s.exec(p);
+      if (unc) return { device: `\\\\${unc[1]}\\${unc[2]}`, absolute: true, rest: unc[3] };
+      return { device: "", absolute: true, rest: p.replace(/^[\\/]+/, "") };
+    }
+    if (/^[a-zA-Z]:/.test(p)) {
+      const absolute = p.length > 2 && isSep(p[2]);
+      return { device: p.slice(0, 2), absolute, rest: p.slice(absolute ? 3 : 2) };
+    }
+    if (p.length > 0 && isSep(p[0])) return { device: "", absolute: true, rest: p.slice(1) };
+    return { device: "", absolute: false, rest: p };
+  }
+
+  function normalizeParts(rest, absolute) {
+    const res = [];
+    for (const part of rest.split(splitRe)) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") {
+        if (res.length && res[res.length - 1] !== "..") res.pop();
+        else if (!absolute) res.push("..");
+      } else {
+        res.push(part);
+      }
+    }
+    return res;
+  }
+
+  const rootOf = (r) => r.device + (r.absolute ? "\\" : "");
+  const sameDevice = (a, b) => a.toLowerCase() === b.toLowerCase();
+
+  path.isAbsolute = (p) => splitRoot(String(p)).absolute;
+
+  path.normalize = (p) => {
+    p = String(p);
+    if (p.length === 0) return ".";
+    const r = splitRoot(p);
+    let tail = normalizeParts(r.rest, r.absolute).join("\\");
+    if (!tail && !r.absolute) tail = ".";
+    if (tail && isSep(p[p.length - 1])) tail += "\\";
+    return rootOf(r) + tail;
+  };
+
+  path.join = (...args) => {
+    const joined = args.map(String).filter((a) => a !== "").join("\\");
+    return joined === "" ? "." : path.normalize(joined);
+  };
+
+  path.resolve = (...args) => {
+    let device = "";
+    let tail = "";
+    let absolute = false;
+    for (let i = args.length - 1; i >= -1; i--) {
+      let p;
+      if (i >= 0) {
+        p = String(args[i]);
+        if (p === "") continue;
+      } else {
+        // Out of arguments: the cwd, unless it is on another drive than the one already found
+        // (Node consults `=C:` there; a realm has no per-drive cwd, so that drive's root).
+        p = process.cwd();
+        if (device && !sameDevice(splitRoot(p).device, device)) p = device + "\\";
+      }
+      const r = splitRoot(p);
+      if (r.device) {
+        if (device && !sameDevice(r.device, device)) continue;
+        if (!device) device = r.device;
+      }
+      if (!absolute) {
+        tail = r.rest + "\\" + tail;
+        absolute = r.absolute;
+      }
+      if (absolute && device) break;
+    }
+    const parts = normalizeParts(tail, absolute).join("\\");
+    return device + (absolute ? "\\" : "") + parts || ".";
+  };
+
+  path.dirname = (p) => {
+    p = String(p);
+    const r = splitRoot(p);
+    const parts = r.rest.split(splitRe).filter((x) => x !== "");
+    if (parts.length <= 1) return rootOf(r) || ".";
+    parts.pop();
+    return rootOf(r) + parts.join("\\");
+  };
+
+  path.basename = (p, ext) => {
+    p = String(p);
+    const parts = splitRoot(p).rest.split(splitRe).filter((x) => x !== "");
+    let base = parts.length ? parts[parts.length - 1] : "";
+    if (ext && base.endsWith(ext) && base !== ext) base = base.slice(0, -ext.length);
+    return base;
+  };
+
+  path.parse = (p) => {
+    p = String(p);
+    const r = splitRoot(p);
+    const root = rootOf(r);
+    const base = path.basename(p);
+    const ext = path.extname(base);
+    const parts = r.rest.split(splitRe).filter((x) => x !== "");
+    const dir = parts.length <= 1 ? root : path.dirname(p);
+    return { root, dir, base, ext, name: ext ? base.slice(0, -ext.length) : base };
+  };
+
+  path.relative = (from, to) => {
+    from = path.resolve(from);
+    to = path.resolve(to);
+    if (from.toLowerCase() === to.toLowerCase()) return "";
+    const f = splitRoot(from);
+    const t = splitRoot(to);
+    if (!sameDevice(f.device, t.device)) return to;
+    const fromParts = f.rest.split(splitRe).filter(Boolean);
+    const toParts = t.rest.split(splitRe).filter(Boolean);
+    let i = 0;
+    while (
+      i < fromParts.length &&
+      i < toParts.length &&
+      fromParts[i].toLowerCase() === toParts[i].toLowerCase()
+    ) i++;
+    const up = fromParts.slice(i).map(() => "..");
+    return [...up, ...toParts.slice(i)].join("\\") || ".";
+  };
+
+  path.toNamespacedPath = (p) => {
+    if (typeof p !== "string" || p.length === 0) return p;
+    if (/^[\\/][\\/][?.][\\/]/.test(p)) return p;
+    const resolved = path.resolve(p);
+    if (/^[a-zA-Z]:\\/.test(resolved)) return "\\\\?\\" + resolved;
+    if (resolved.startsWith("\\\\")) return "\\\\?\\UNC\\" + resolved.slice(2);
+    return p;
+  };
+  path._makeLong = path.toNamespacedPath;
+}
 
 function os_platform_is_win() {
   // __os.info() is available (os.js runs after this file? no — before). Use the raw op.
