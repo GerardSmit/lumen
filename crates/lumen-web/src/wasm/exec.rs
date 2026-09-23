@@ -1127,8 +1127,8 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0x93 => binop!(stack, f32, F32, |a: f32, b: f32| a - b),
         0x94 => binop!(stack, f32, F32, |a: f32, b: f32| a * b),
         0x95 => binop!(stack, f32, F32, |a: f32, b: f32| a / b),
-        0x96 => binop!(stack, f32, F32, f32::min),
-        0x97 => binop!(stack, f32, F32, f32::max),
+        0x96 => binop!(stack, f32, F32, wasm_min_f32),
+        0x97 => binop!(stack, f32, F32, wasm_max_f32),
         0x98 => binop!(stack, f32, F32, |a: f32, b: f32| a.copysign(b)),
         // f64 arithmetic
         0x99 => unf64(stack, |a: f64| a.abs()),
@@ -1142,21 +1142,21 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0xa1 => binop!(stack, f64, F64, |a: f64, b: f64| a - b),
         0xa2 => binop!(stack, f64, F64, |a: f64, b: f64| a * b),
         0xa3 => binop!(stack, f64, F64, |a: f64, b: f64| a / b),
-        0xa4 => binop!(stack, f64, F64, f64::min),
-        0xa5 => binop!(stack, f64, F64, f64::max),
+        0xa4 => binop!(stack, f64, F64, wasm_min_f64),
+        0xa5 => binop!(stack, f64, F64, wasm_max_f64),
         0xa6 => binop!(stack, f64, F64, |a: f64, b: f64| a.copysign(b)),
         // conversions
         0xa7 => conv(stack, |v: Val| Val::I32(v.i64() as i32)), // i32.wrap_i64
-        0xa8 => conv(stack, |v: Val| Val::I32(v.f32().trunc() as i32)), // i32.trunc_f32_s
-        0xa9 => conv(stack, |v: Val| Val::I32(v.f32().trunc() as u32 as i32)),
-        0xaa => conv(stack, |v: Val| Val::I32(v.f64().trunc() as i32)),
-        0xab => conv(stack, |v: Val| Val::I32(v.f64().trunc() as u32 as i32)),
+        0xa8 => trunc(stack, |v| v.f32() as f64, I32S, |x| Val::I32(x as i32))?, // i32.trunc_f32_s
+        0xa9 => trunc(stack, |v| v.f32() as f64, I32U, |x| Val::I32(x as u32 as i32))?,
+        0xaa => trunc(stack, |v| v.f64(), I32S, |x| Val::I32(x as i32))?,
+        0xab => trunc(stack, |v| v.f64(), I32U, |x| Val::I32(x as u32 as i32))?,
         0xac => conv(stack, |v: Val| Val::I64(v.i32() as i64)), // i64.extend_i32_s
         0xad => conv(stack, |v: Val| Val::I64(v.i32() as u32 as i64)), // i64.extend_i32_u
-        0xae => conv(stack, |v: Val| Val::I64(v.f32().trunc() as i64)),
-        0xaf => conv(stack, |v: Val| Val::I64(v.f32().trunc() as u64 as i64)),
-        0xb0 => conv(stack, |v: Val| Val::I64(v.f64().trunc() as i64)),
-        0xb1 => conv(stack, |v: Val| Val::I64(v.f64().trunc() as u64 as i64)),
+        0xae => trunc(stack, |v| v.f32() as f64, I64S, |x| Val::I64(x as i64))?,
+        0xaf => trunc(stack, |v| v.f32() as f64, I64U, |x| Val::I64(x as u64 as i64))?,
+        0xb0 => trunc(stack, |v| v.f64(), I64S, |x| Val::I64(x as i64))?,
+        0xb1 => trunc(stack, |v| v.f64(), I64U, |x| Val::I64(x as u64 as i64))?,
         0xb2 => conv(stack, |v: Val| Val::F32(v.i32() as f32)),
         0xb3 => conv(stack, |v: Val| Val::F32(v.i32() as u32 as f32)),
         0xb4 => conv(stack, |v: Val| Val::F32(v.i64() as f32)),
@@ -1198,26 +1198,63 @@ fn unf64(stack: &mut Vec<Val>, f: impl Fn(f64) -> f64) {
     let a = stack.pop().unwrap().f64();
     stack.push(Val::F64(f(a)));
 }
+// Exclusive bounds for trapping float -> int truncation: valid iff lo < x < hi. f32 inputs are
+// promoted to f64 first, which is exact, so one table serves both widths.
+const I32S: (f64, f64) = (-2147483649.0, 2147483648.0);
+const I32U: (f64, f64) = (-1.0, 4294967296.0);
+const I64S: (f64, f64) = (-9223372036854777856.0, 9223372036854775808.0);
+const I64U: (f64, f64) = (-1.0, 18446744073709551616.0);
+
+fn trunc(
+    stack: &mut Vec<Val>,
+    get: impl Fn(Val) -> f64,
+    (lo, hi): (f64, f64),
+    make: impl Fn(f64) -> Val,
+) -> Result<(), String> {
+    let x = get(stack.pop().unwrap());
+    if x.is_nan() {
+        return Err("wasm: invalid conversion to integer".into());
+    }
+    if !(x > lo && x < hi) {
+        return Err("wasm: integer overflow".into());
+    }
+    stack.push(make(x.trunc()));
+    Ok(())
+}
+
 fn conv(stack: &mut Vec<Val>, f: impl Fn(Val) -> Val) {
     let a = stack.pop().unwrap();
     stack.push(f(a));
 }
 
+// WebAssembly min/max: NaN propagates and -0 orders below +0 (Rust's `min`/`max` ignore NaN
+// and leave the sign of zero unspecified).
+macro_rules! wasm_minmax {
+    ($name:ident, $t:ty, $min:expr) => {
+        fn $name(a: $t, b: $t) -> $t {
+            if a.is_nan() || b.is_nan() {
+                <$t>::NAN
+            } else if a == b {
+                if $min == a.is_sign_negative() { a } else { b }
+            } else if (a < b) == $min {
+                a
+            } else {
+                b
+            }
+        }
+    };
+}
+wasm_minmax!(wasm_min_f32, f32, true);
+wasm_minmax!(wasm_max_f32, f32, false);
+wasm_minmax!(wasm_min_f64, f64, true);
+wasm_minmax!(wasm_max_f64, f64, false);
+
+// Ties-to-even rounding that keeps the sign of zero (`nearest(-0.5)` is -0.0).
 fn round_ties_even_f32(a: f32) -> f32 {
-    let r = a.round();
-    if (a - a.trunc()).abs() == 0.5 && (r as i64) % 2 != 0 {
-        r - a.signum()
-    } else {
-        r
-    }
+    a.round_ties_even()
 }
 fn round_ties_even_f64(a: f64) -> f64 {
-    let r = a.round();
-    if (a - a.trunc()).abs() == 0.5 && (r as i64) % 2 != 0 {
-        r - a.signum()
-    } else {
-        r
-    }
+    a.round_ties_even()
 }
 
 fn idiv_i32(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {

@@ -5,6 +5,9 @@
 
 pub mod exec;
 pub mod parse;
+pub mod translate;
+#[cfg(test)]
+mod translate_tests;
 
 pub use parse::{ExportKind, ImportKind, Module};
 
