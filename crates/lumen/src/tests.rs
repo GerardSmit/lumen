@@ -819,7 +819,7 @@ fn gc_keeps_reachable_cycles() {
 
 #[test]
 fn gc_registry_reuses_dead_object_slots() {
-    use std::rc::Rc;
+    
 
     let (slots_before, _) = crate::value::gc_registry_stats();
     for _ in 0..200_000 {
@@ -16876,15 +16876,10 @@ fn lazy_body_errors_carry_the_file_line() {
         return;
     }
     let src = "function f() {\n  return 1;\n  var 1;\n}\nf();";
-    let body = crate::parser::parse_script(src, false).unwrap();
-    let crate::ast::Stmt::FuncDecl(f) = &body[0] else {
-        panic!("expected a declaration")
-    };
-    assert!(f.body().is_empty(), "the body is skipped at parse time");
-    let err = f.ensure_body().unwrap_err();
+    // The body is skipped, but checked first: its early error is reported at load, from the
+    // same line and with the same message as the eager parse.
+    let err = crate::parser::parse_script(src, false).expect_err("lazy parse fails at load");
     assert_eq!(err.line, 3);
-    assert_eq!(f.ensure_body().unwrap_err().message, err.message);
-    // The eager parse reports the same error, at load, from the same line.
     let eager = crate::parser::with_eager_bodies(|| crate::parser::parse_script(src, false))
         .expect_err("eager parse fails at load");
     assert_eq!((eager.line, eager.message), (err.line, err.message));
