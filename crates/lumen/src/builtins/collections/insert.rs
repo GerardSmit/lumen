@@ -1,4 +1,4 @@
-//! Owned collection insertion shared by native methods and consuming JIT helpers.
+//! Owned collection insertion behind the native Map/Set insertion methods.
 use crate::value::Gc;
 use super::canonicalize_map_key;
 use crate::builtins::{
@@ -6,19 +6,7 @@ use crate::builtins::{
     collection_data::{CollectionData, CollectionKind},
 };
 use crate::interpreter::Interp;
-use crate::value::{NativeFn, Value};
-
-pub(crate) const MAP_SET: u8 = 16;
-pub(crate) const SET_ADD: u8 = 17;
-
-pub(super) fn intrinsic(native: usize) -> u8 {
-    for (method, id) in [(map_set as NativeFn, MAP_SET), (set_add, SET_ADD)] {
-        if native == method as *const () as usize {
-            return id;
-        }
-    }
-    0
-}
+use crate::value::Value;
 
 fn data<'a>(
     i: &'a mut Interp,

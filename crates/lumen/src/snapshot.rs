@@ -1361,7 +1361,6 @@ fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
         body_used: Cell::new(false),
         calls: Cell::new(0),
         code: OnceCell::new(),
-        code2: OnceCell::new(),
         fn_maps: OnceCell::new(),
     });
     // Same registration a parsed lazy function gets (parser `rc_fn`): the collector releases

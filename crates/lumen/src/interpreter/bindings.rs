@@ -111,15 +111,6 @@ impl VarMap {
         }
     }
 
-    pub(crate) fn layout_base(&mut self, expected: &Rc<BindingLayout>) -> Option<*mut Binding> {
-        match &mut self.map {
-            VarStorage::Template(layout, values) if Rc::ptr_eq(layout, expected) => {
-                Some(values.as_mut_ptr())
-            }
-            _ => None,
-        }
-    }
-
     pub(crate) fn from_layout(layout: Rc<BindingLayout>) -> Self {
         let values = layout
             .names
@@ -290,9 +281,5 @@ impl VarMap {
             VarStorage::Large(entries) => VarValues::Large(entries.values()),
             VarStorage::Template(_, values) => VarValues::Template(values.iter()),
         }
-    }
-    /// Byte offset of the generation counter within a `VarMap` (for the JIT's inline template).
-    pub(crate) fn generation_offset() -> usize {
-        std::mem::offset_of!(VarMap, generation)
     }
 }

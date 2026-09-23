@@ -265,7 +265,6 @@ impl Chunk {
     ) -> Option<Value> {
         let (path, value) = NamePath::build(interp, env, &self.names[name as usize])?;
         *self.name_paths[cache as usize].borrow_mut() = Some(path);
-        self.record_name_number(cache as usize, &value);
         Some(value)
     }
 }

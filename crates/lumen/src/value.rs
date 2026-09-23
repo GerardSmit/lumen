@@ -12,9 +12,8 @@ use std::sync::Arc;
 /// than `Rc`/`RefCell` directly, so the storage underneath can move to a traced heap without
 /// touching call sites (see `docs/gc.md`).
 ///
-/// The box is lumen's own, laid out exactly like std's `RcBox` — `{strong, weak, value}` — so the
-/// stored word is what the JIT's measured layout probes already expect (strong count at offset 0,
-/// the object cell `2 * usize` further on). Semantics match `Rc`: the strong owners collectively
+/// The box is lumen's own, laid out like std's `RcBox` — `{strong, weak, value}`. Semantics match
+/// `Rc`: the strong owners collectively
 /// hold one implicit weak count, the value drops when `strong` reaches zero and the allocation is
 /// freed when `weak` does.
 #[repr(transparent)]
@@ -242,9 +241,8 @@ pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
 /// The engine value. `repr(u8)` with fixed discriminants gives it a *defined* layout — tag byte
-/// at offset 0, payload at offset 8 — which the JIT's inline fast paths read directly (see
-/// `jit::layout` for the compile-time assertions). Tags 0..=4 are the trivially-copyable
-/// variants (no refcount): the JIT may memcpy exactly those.
+/// at offset 0, payload at offset 8. Tags 0..=4 are the trivially-copyable variants (no
+/// refcount).
 #[derive(Clone, Default)]
 #[repr(u8)]
 pub enum Value {
@@ -392,52 +390,6 @@ impl PackedValue {
             _ => Value::Num(f64::from_bits(this.0)),
         }
     }
-
-    /// Drop one owned packed word in raw frame storage without first widening the frame.
-    pub(crate) unsafe fn drop_raw(word: *mut u64) {
-        drop(unsafe { std::ptr::read(word as *const PackedValue) });
-    }
-
-    /// Clone one packed owner out of raw frame storage into a wide execution value.
-    pub(crate) unsafe fn clone_raw(word: *const u64) -> Value {
-        unsafe { &*(word as *const PackedValue) }.unpack()
-    }
-
-    /// Replace one packed owner with a moved wide value and drop the previous owner.
-    pub(crate) unsafe fn replace_raw(word: *mut u64, value: Value) {
-        let old = unsafe { std::ptr::replace(word as *mut PackedValue, PackedValue::pack(value)) };
-        drop(old);
-    }
-
-    /// Compact `len` initialized wide values into the first half of the same allocation. The
-    /// source stride is 16 and destination stride is 8, so a forward walk never overwrites a
-    /// source that has not been moved yet.
-    ///
-    /// # Safety
-    /// `base` must address `len` initialized contiguous `Value`s and enough aligned storage for
-    /// them. After return only `len` packed words at `base` are initialized.
-    pub(crate) unsafe fn pack_in_place(base: *mut Value, len: usize) {
-        let packed = base.cast::<PackedValue>();
-        for k in 0..len {
-            let value = unsafe { base.add(k).read() };
-            unsafe { packed.add(k).write(PackedValue::pack(value)) };
-        }
-    }
-
-    /// Expand packed frame words back into wide `Value`s without cloning reference payloads.
-    /// Expansion walks backward so each packed source is consumed before a wider destination can
-    /// overlap it.
-    ///
-    /// # Safety
-    /// `base` must address `len` initialized `PackedValue`s followed by enough aligned storage for
-    /// `len` wide values. After return only those wide values are initialized.
-    pub(crate) unsafe fn unpack_in_place(base: *mut Value, len: usize) {
-        let packed = base.cast::<PackedValue>();
-        for k in (0..len).rev() {
-            let value = unsafe { packed.add(k).read() }.into_value();
-            unsafe { base.add(k).write(value) };
-        }
-    }
 }
 
 impl Clone for PackedValue {
@@ -504,38 +456,6 @@ mod packed_value_tests {
         drop(out);
         assert_eq!(Gc::strong_count(&obj), before);
     }
-
-    #[test]
-    fn packed_frame_conversion_is_overlap_safe_and_ownership_neutral() {
-        let obj = Object::new(None);
-        let before = Gc::strong_count(&obj);
-        let mut frame: [std::mem::MaybeUninit<Value>; 5] =
-            std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
-        let base = frame.as_mut_ptr().cast::<Value>();
-        unsafe {
-            base.add(0).write(Value::Num(1.5));
-            base.add(1).write(Value::Obj(obj.clone()));
-            base.add(2).write(Value::Bool(true));
-            base.add(3).write(Value::Null);
-            base.add(4).write(Value::Num(-0.0));
-        }
-        assert_eq!(Gc::strong_count(&obj), before + 1);
-        unsafe {
-            PackedValue::pack_in_place(base, 5);
-            assert_eq!(Gc::strong_count(&obj), before + 1);
-            PackedValue::unpack_in_place(base, 5);
-            assert_eq!(Gc::strong_count(&obj), before + 1);
-            assert!(matches!(&*base.add(0), Value::Num(n) if *n == 1.5));
-            assert!(matches!(&*base.add(1), Value::Obj(o) if Gc::ptr_eq(o, &obj)));
-            assert!(matches!(&*base.add(2), Value::Bool(true)));
-            assert!(matches!(&*base.add(3), Value::Null));
-            assert!(matches!(&*base.add(4), Value::Num(n) if n.to_bits() == (-0.0f64).to_bits()));
-            for k in 0..5 {
-                std::ptr::drop_in_place(base.add(k));
-            }
-        }
-        assert_eq!(Gc::strong_count(&obj), before);
-    }
 }
 
 /// A unique Symbol. Identity is the `id` (every `Symbol()` call gets a fresh one); `description` is
@@ -543,276 +463,6 @@ mod packed_value_tests {
 pub struct SymbolData {
     pub id: u64,
     pub description: Option<Rc<str>>,
-}
-
-/// Byte offsets the JIT's inline property-cache templates read directly out of the object graph.
-/// Every field is *measured at runtime* against the real types (never hardcoded); the std layouts
-/// that aren't guaranteed — where a `Vec`'s data pointer sits, the `RcBox` header size, the
-/// `Option<Gc>` niche — are located by probing and reported in `valid`. If `valid` is false the
-/// JIT emits no inline caches and everything routes through the checked helper, so a future
-/// libstd layout change degrades performance, never correctness.
-///
-/// All offsets are relative to the *stored* `Rc` pointer — the value in a `Value::Obj` payload and
-/// in an `Option<Gc>` (proto) field, which points at the `RcBox` header (`{strong, weak, value}`),
-/// NOT at `Rc::as_ptr` (which is the inner `value`, `rcbox_data` bytes further on). The inline
-/// templates only ever have the stored pointer, so measuring from it is what makes them correct.
-#[derive(Clone, Copy)]
-pub struct JitLayout {
-    /// Stored `Rc` pointer → the `Object` (through the `RcBox` header and the `RefCell` wrapper).
-    pub obj_from_rc: usize,
-    /// Stored `Rc` pointer → `Rc::as_ptr` (the RcBox header size): what the call probes add to
-    /// a Value payload before comparing against a fill-time `Rc::as_ptr` identity.
-    pub gc_data_off: usize,
-    /// Stored `Rc` pointer → the strong count (the `RcBox`'s first field).
-    pub rc_strong_off: usize,
-    pub obj_proto: usize,
-    pub obj_props: usize,
-    pub obj_exotic: usize,
-    pub obj_is_constructor: usize,
-    pub obj_extensible: usize,
-    pub props_shape: usize,
-    pub props_proto_flag: usize,
-    /// The `entries` thin vector within `Props`: its data pointer (a 64-bit word) and its
-    /// length and capacity (32-bit words; the inline append checks `len < cap`, which a
-    /// copy-on-write shared block — capacity zero — never passes).
-    pub props_entries_ptr: usize,
-    pub props_entries_len: usize,
-    pub props_entries_cap: usize,
-    /// The data-pointer word within a `Vec` (not necessarily offset 0 — RawVec layout is unstable).
-    pub vec_ptr_off: usize,
-    /// The length word within a `Vec` (probed like `vec_ptr_off`).
-    pub vec_len_off: usize,
-    /// The nullable pointer to the shared boxed dense-buffer headers within `Props`.
-    pub props_elems: usize,
-    /// The `elems` Vec header within the shared dense-buffer allocation.
-    pub dense_elems: usize,
-    /// The `mirror` Vec header within the shared dense-buffer allocation.
-    pub dense_mirror: usize,
-    /// Nullable `Box<Vec<Property>>` within the dense sidecar. When non-null the box points at
-    /// the Vec header; packed element slots use [`Value::Empty`] for holes and have no key Rc.
-    pub dense_packed: usize,
-    /// Initialized inline element count and slot base within DenseBuffers.
-    pub dense_inline_len: usize,
-    pub dense_inline_slots: usize,
-    /// The `mirror_flags` byte within the dense sidecar (a map without a sidecar has no
-    /// elements to mirror; templates must follow `props_elems` first).
-    pub dense_mirror_flags: usize,
-    /// `size_of::<Property>()` — the entry stride (entries are bare `Property`s; keys live in
-    /// the shape).
-    pub entry_size: usize,
-    /// `Value` within an entry.
-    pub entry_value: usize,
-    /// Descriptor flags word within an entry (used to test `PROP_ACCESSOR`).
-    pub entry_accessor: usize,
-    /// Descriptor flags word within an entry (used to test `PROP_WRITABLE`).
-    pub entry_writable: usize,
-    /// Standalone `Property` layout used by keyless packed elements (same as the entry offsets
-    /// now that entries are bare properties; kept separate for the element templates' clarity).
-    pub property_size: usize,
-    pub property_value: usize,
-    pub property_meta: usize,
-    /// The `Option<Box<Vec<Property>>>` niche and Vec header words matched the live probes.
-    pub packed_elems_valid: bool,
-    /// `Exotic::None`'s discriminant byte (the inline path requires an ordinary object).
-    pub exotic_none_tag: u8,
-    /// `Exotic::Array`'s discriminant byte (the element templates also accept arrays).
-    pub exotic_array_tag: u8,
-    /// `Exotic::StrWrap`'s discriminant byte (String.prototype IS a StrWrap — the GetMethod
-    /// template accepts it as a named-read holder; index/length reads never take that path).
-    pub exotic_strwrap_tag: u8,
-    /// `ic_plain` byte within `Object` (the per-receiver "not in an exotic side table" flag).
-    pub obj_ic_plain: usize,
-    /// `Rc::as_ptr(env)` → the scope's `VarMap` generation counter (through the `RefCell`).
-    pub scope_gen: usize,
-    /// `value` within a `Binding` (the LoadName template's 16-byte copy source).
-    pub binding_value: usize,
-    /// `mutable` within a `Binding` (free-name update/store guard).
-    pub binding_mutable: usize,
-    /// `initialized` bool within a `Binding` (TDZ check).
-    pub binding_init: usize,
-    /// The `Option<Rc<Shape>>` word within `Props` (the stored `Rc` pointer, or 0 for the empty
-    /// shape). The creation template swaps it for the recorded child shape.
-    pub props_shape_rc: usize,
-    /// Address of the shared-shape `by_id` `Vec<Rc<Shape>>` header (see
-    /// [`props::shape_table_by_id_ptr`]): indexed by a cache's child shape id to fetch the
-    /// stored `Rc<Shape>` pointer whose strong count the creation template bumps.
-    pub shape_by_id_vec: usize,
-    /// The `Option<Rc<Shape>>` niche and `Rc<Shape>` strong-count placement matched the probes.
-    pub shape_rc_ok: bool,
-    pub valid: bool,
-}
-
-/// Measure [`JitLayout`] against the live types, probing the non-guaranteed std layouts.
-pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
-    use std::mem::offset_of;
-    // `Option<Rc<Shape>>` probe: `None` must be the null word and `Some` the stored RcBox
-    // pointer whose first word is the strong count (the creation template bumps it in place).
-    let shape_rc_ok = {
-        let mut probe = Props::new();
-        probe.insert(Rc::<str>::from("probe"), Property::plain(Value::Undefined));
-        let some_word =
-            unsafe { *(&probe.shape_rc as *const Option<Rc<props::Shape>> as *const usize) };
-        let none: Option<Rc<props::Shape>> = None;
-        let none_word = unsafe { *(&none as *const Option<Rc<props::Shape>> as *const usize) };
-        let strong = probe.shape_rc.as_ref().map_or(0, Rc::strong_count);
-        std::mem::size_of::<Option<Rc<props::Shape>>>() == 8
-            && none_word == 0
-            && some_word != 0
-            && unsafe { *(some_word as *const usize) } == strong
-    };
-    let as_ptr = Gc::as_ptr(sample) as usize; // → the RefCell<Object> (RcBox value field)
-    let stored_word = unsafe { *(sample as *const Gc as *const usize) };
-    let gc_data_off = as_ptr.wrapping_sub(stored_word);
-    let obj_addr = &*sample.borrow() as *const Object as usize;
-    let refcell_value = obj_addr - as_ptr;
-
-    // The *stored* Rc pointer — what a Value::Obj payload / Option<Gc> holds — is the RcBox base
-    // (strong count at its start), `rcbox_data` bytes before `Rc::as_ptr`. Read it out of an
-    // Option<Gc> (whose Some variant is exactly the raw pointer, None = null via the niche).
-    let some_proto: Option<Gc> = Some(sample.clone());
-    let stored = unsafe { *(&some_proto as *const Option<Gc> as *const usize) };
-    let none_proto: Option<Gc> = None;
-    let none_word = unsafe { *(&none_proto as *const Option<Gc> as *const usize) };
-    let niche_ok = none_word == 0 && as_ptr >= stored;
-    let rcbox_data = as_ptr - stored; // RcBox header (strong+weak) before the value
-    let obj_from_rc = rcbox_data + refcell_value; // stored ptr → Object
-    let rc_strong_off = 0usize; // strong count is the RcBox's first field
-                                // Verify: the strong count sits at `stored + rc_strong_off` and reads the live count.
-    let strong_ok =
-        unsafe { *((stored + rc_strong_off) as *const usize) } == Gc::strong_count(sample);
-
-    // Vec data-pointer and length words (RawVec layout is not guaranteed — locate them by value).
-    // Capacity 3 / length 1 makes the three words distinguishable.
-    let mut v: Vec<Property> = Vec::with_capacity(3);
-    v.push(Property::plain(Value::Num(0.0)));
-    let vptr = v.as_ptr() as usize;
-    let vwords = unsafe {
-        std::slice::from_raw_parts(
-            &v as *const Vec<_> as *const usize,
-            std::mem::size_of::<Vec<Property>>() / 8,
-        )
-    };
-    let vec_ptr_off = vwords.iter().position(|&w| w == vptr).map(|i| i * 8);
-    let vec_len_off = vwords.iter().position(|&w| w == 1).map(|i| i * 8);
-    // The element templates index a `Vec<u32>` (`Props::elems`) with the same offsets; verify the
-    // layout really is per-Vec-struct, not per-element-type.
-    let mut v32: Vec<u32> = Vec::with_capacity(3);
-    v32.push(7);
-    let v32ptr = v32.as_ptr() as usize;
-    let v32words = unsafe {
-        std::slice::from_raw_parts(
-            &v32 as *const Vec<u32> as *const usize,
-            std::mem::size_of::<Vec<u32>>() / 8,
-        )
-    };
-    let vec32_ok = vec_ptr_off.is_some_and(|o| v32words[o / 8] == v32ptr)
-        && vec_len_off.is_some_and(|o| v32words[o / 8] == 1);
-
-    // DenseStorage is deliberately a transparent nullable pointer to boxed buffer headers. The
-    // JIT first follows this pointer and then uses the probed Vec offsets above. Verify the niche
-    // than relying on it silently if a future compiler changes the representation.
-    let thin_some = DenseStorage(Some(Box::new(DenseBuffers::default())));
-    let thin_word = unsafe { *(&thin_some as *const DenseStorage as *const usize) };
-    let thin_expected = thin_some.0.as_deref().unwrap() as *const DenseBuffers as usize;
-    let thin_none = DenseStorage(None);
-    let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
-    let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
-
-    // Keyless packed-element sidecar: probe both Option<Box<_>>'s null niche and Vec<Property>'s
-    // header words independently. The JIT follows the Box pointer, then uses the same located
-    // Vec word offsets as the classic entry/element vectors.
-    let mut pv = Vec::with_capacity(3);
-    pv.push(Property::plain(Value::Num(1.0)));
-    let pv_ptr = pv.as_ptr() as usize;
-    let pv_words = unsafe {
-        std::slice::from_raw_parts(
-            &pv as *const Vec<Property> as *const usize,
-            std::mem::size_of::<Vec<Property>>() / 8,
-        )
-    };
-    let pv_header_ok = vec_ptr_off.is_some_and(|o| pv_words[o / 8] == pv_ptr)
-        && vec_len_off.is_some_and(|o| pv_words[o / 8] == 1);
-    let packed_some: Option<Box<Vec<Property>>> = Some(Box::new(pv));
-    let packed_word =
-        unsafe { *(&packed_some as *const Option<Box<Vec<Property>>> as *const usize) };
-    let packed_expected = packed_some
-        .as_deref()
-        .map_or(0, |v| v as *const Vec<Property> as usize);
-    let packed_none: Option<Box<Vec<Property>>> = None;
-    let packed_none_word =
-        unsafe { *(&packed_none as *const Option<Box<Vec<Property>>> as *const usize) };
-    let packed_elems_valid =
-        pv_header_ok && packed_word == packed_expected && packed_word != 0 && packed_none_word == 0;
-
-    let exotic_none_tag = Exotic::None as u8;
-    let exotic_array_tag = Exotic::Array as u8;
-    let exotic_strwrap_tag = Exotic::StrWrap as u8;
-
-    // Scope offsets for the inline LoadName template: Rc::as_ptr → RefCell<Scope> value →
-    // Scope.vars → VarMap generation. The RefCell value offset is probed on a live scope.
-    let probe_env = crate::interpreter::new_scope(None);
-    let scope_addr = {
-        let b = probe_env.borrow();
-        &*b as *const crate::interpreter::Scope as usize
-    };
-    let scope_refcell = scope_addr - Rc::as_ptr(&probe_env) as usize;
-    let scope_gen = scope_refcell
-        + offset_of!(crate::interpreter::Scope, vars)
-        + crate::interpreter::VarMap::generation_offset();
-    let binding_value = offset_of!(crate::interpreter::Binding, value);
-    let binding_mutable = offset_of!(crate::interpreter::Binding, mutable);
-    let binding_init = offset_of!(crate::interpreter::Binding, initialized);
-
-    let valid = strong_ok
-        && niche_ok
-        && vec_ptr_off.is_some()
-        && vec_len_off.is_some()
-        && vec32_ok
-        && thin_vec_ok;
-    JitLayout {
-        obj_from_rc,
-        gc_data_off,
-        rc_strong_off,
-        obj_proto: offset_of!(Object, proto),
-        obj_ic_plain: offset_of!(Object, ic_plain),
-        obj_props: offset_of!(Object, props),
-        obj_exotic: offset_of!(Object, exotic),
-        obj_is_constructor: offset_of!(Object, is_constructor),
-        obj_extensible: offset_of!(Object, extensible),
-        props_shape: offset_of!(Props, shape),
-        props_proto_flag: offset_of!(Props, proto_flag),
-        props_entries_ptr: offset_of!(Props, entries) + props::EntryVec::ptr_offset(),
-        props_entries_len: offset_of!(Props, entries) + props::EntryVec::len_offset(),
-        props_entries_cap: offset_of!(Props, entries) + props::EntryVec::cap_offset(),
-        vec_ptr_off: vec_ptr_off.unwrap_or(0),
-        vec_len_off: vec_len_off.unwrap_or(0),
-        props_elems: offset_of!(Props, elems),
-        dense_elems: offset_of!(DenseBuffers, elems),
-        dense_mirror: offset_of!(DenseBuffers, mirror),
-        dense_packed: offset_of!(DenseBuffers, packed),
-        dense_inline_len: DenseBuffers::inline_len_offset(),
-        dense_inline_slots: DenseBuffers::inline_slots_offset(),
-        dense_mirror_flags: DenseBuffers::mirror_flags_offset(),
-        entry_size: std::mem::size_of::<Property>(),
-        entry_value: offset_of!(Property, packed),
-        entry_accessor: offset_of!(Property, meta),
-        entry_writable: offset_of!(Property, meta),
-        props_shape_rc: offset_of!(Props, shape_rc),
-        shape_by_id_vec: shape_table_by_id_ptr() as usize,
-        shape_rc_ok,
-        property_size: std::mem::size_of::<Property>(),
-        property_value: offset_of!(Property, packed),
-        property_meta: offset_of!(Property, meta),
-        packed_elems_valid,
-        exotic_none_tag,
-        exotic_array_tag,
-        exotic_strwrap_tag,
-        scope_gen,
-        binding_value,
-        binding_mutable,
-        binding_init,
-        valid,
-    }
 }
 
 impl Value {
@@ -992,8 +642,7 @@ pub enum Exotic {
 /// The hidden own entry holding an exotic object's internal-slot value (see [`Exotic`]).
 pub(crate) const EXOTIC_SLOT: &str = "#\u{0}exotic";
 
-/// 72 bytes (96 allocated with the `Rc<RefCell<_>>` header): the layout is measured by
-/// [`jit_layout`] and every byte-sized field is read by the JIT as its own byte.
+/// 72 bytes (96 allocated with the `Rc<RefCell<_>>` header).
 pub struct Object {
     pub(crate) proto: Option<Gc>,
     pub(crate) props: Props,
@@ -1001,10 +650,9 @@ pub struct Object {
     pub(crate) exotic: Exotic,
     pub(crate) extensible: bool,
     /// `false` for objects whose behavior lives in an interpreter side table — proxies, typed
-    /// arrays, module namespaces — which the `exotic` tag can't reveal. The JIT's inline
-    /// property/element caches check this byte on the receiver and take the checked helper when
-    /// clear, so ONE proxy existing somewhere no longer disables the caches for every plain
-    /// object in the program (the old global `inline_ic_safe` latch).
+    /// arrays, module namespaces — which the `exotic` tag can't reveal. Inline property/element
+    /// caches check this byte on the receiver and take the checked path when clear, so ONE proxy
+    /// existing somewhere doesn't disable the caches for every plain object in the program.
     pub(crate) ic_plain: Cell<bool>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
@@ -1240,17 +888,6 @@ pub(crate) fn enter_gc_state(state: Arc<GcState>) -> Arc<GcState> {
 /// Number of live heap objects right now.
 pub fn live_objects() -> i64 {
     with_gc_state(|state| state.live.get())
-}
-
-/// Stable address of this thread's live-object counter. The state is heap-allocated and shared
-/// with the coroutine workers that run this interpreter's bodies, so generated code baked on the
-/// driver thread counts correctly from either.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-pub(crate) fn live_objects_ptr() -> *const i64 {
-    with_gc_state(|state| state.live.as_ptr())
 }
 
 /// Strong handles to every currently-live heap object. The slab borrow is held for the walk,
@@ -1591,7 +1228,7 @@ pub enum TaIndex {
 /// A property descriptor. A data property uses `value`/`writable`; an accessor uses the boxed
 /// getter/setter pair. The low bits of `meta` hold the four descriptor flags; its aligned upper
 /// bits point to an accessor pair only for accessor properties. Thus ordinary properties are 32
-/// bytes and allocate no metadata, while still keeping the flags directly readable by the JIT.
+/// bytes and allocate no metadata.
 pub struct Property {
     packed: PackedValue,
     meta: usize,
@@ -1792,11 +1429,7 @@ mod heap;
 mod props;
 pub(crate) use props::FnMaps;
 pub use props::Props;
-pub(crate) use props::{
-    bump_proto_epoch, fn_key, proto_epoch, proto_epoch_ptr, shape_table_by_id_ptr,
-    shape_table_census, MIRROR_ALL_I32, MIRROR_NO_HOLES, MIRROR_OK,
-};
-use props::{DenseBuffers, DenseStorage};
+pub(crate) use props::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).
 #[inline(always)]

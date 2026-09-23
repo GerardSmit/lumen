@@ -1,4 +1,4 @@
-//! Array construction from owned builtin values or moved JIT operands.
+//! Array construction from owned builtin values.
 use super::Interp;
 use crate::value::{Exotic, Object, Property, Props, Value};
 use std::sync::OnceLock;
@@ -34,39 +34,6 @@ impl Interp {
             );
             for v in items {
                 b.props.push_dense(Property::plain(v));
-            }
-        }
-        Value::Obj(obj)
-    }
-
-    /// Build an array by moving `len` initialized values directly from a JIT operand stack.
-    ///
-    /// # Safety
-    /// `items` must point to `len` live, non-overlapping `Value`s. This method consumes every
-    /// value exactly once; the caller must reset its stack pointer to `items` before returning.
-    pub(crate) unsafe fn make_array_from_raw(&self, items: *mut Value, len: usize) -> Value {
-        if len <= 32 {
-            let obj = Object::new_with_parts(
-                Some(self.array_proto.clone()),
-                unsafe { Props::packed_array_from_raw(items, len) },
-                Exotic::Array,
-            );
-            return Value::Obj(obj);
-        }
-        let obj = Object::new(Some(self.array_proto.clone()));
-        let numeric = (0..len).all(|k| matches!(unsafe { &*items.add(k) }, Value::Num(_)));
-        {
-            let mut b = obj.borrow_mut();
-            b.props.mark_array();
-            b.props.reserve_dense_exact(len, numeric);
-            b.exotic = Exotic::Array;
-            b.props.insert(
-                "length",
-                Property::data(Value::Num(len as f64), true, false, false),
-            );
-            for k in 0..len {
-                b.props
-                    .push_dense(Property::plain(unsafe { items.add(k).read() }));
             }
         }
         Value::Obj(obj)
