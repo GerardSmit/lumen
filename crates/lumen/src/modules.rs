@@ -12,10 +12,10 @@
 //! Specifier resolution + source fetching is delegated to a host loader (`Interp::module_loader`)
 //! so the engine stays filesystem-agnostic.
 
-use crate::value::Gc;
 use crate::ast::*;
 use crate::builtins::make_bound_len;
 use crate::interpreter::{new_scope, Abrupt, Binding, Env, Interp};
+use crate::value::Gc;
 use crate::value::{Object, Property, Value};
 use std::collections::HashMap;
 use std::rc::Rc;

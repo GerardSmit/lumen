@@ -271,7 +271,6 @@ mod tests {
     use crate::fasthash::FxHasher;
     use crate::value::{Object, Value};
     use std::hash::{Hash, Hasher};
-    
 
     #[test]
     fn colliding_keys_remain_distinct_through_updates_and_deletes() {
@@ -354,7 +353,9 @@ mod tests {
         data.insert(Value::Obj(key.clone()), Value::Undefined);
         let mut cursor = 0;
         assert!(matches!(data.next(&mut cursor), Some((Value::Num(1.0), _))));
-        assert!(matches!(data.next(&mut cursor), Some((Value::Obj(o), _)) if crate::value::Gc::ptr_eq(o, &key)));
+        assert!(
+            matches!(data.next(&mut cursor), Some((Value::Obj(o), _)) if crate::value::Gc::ptr_eq(o, &key))
+        );
         assert!(data.next(&mut cursor).is_none());
     }
     #[test]
