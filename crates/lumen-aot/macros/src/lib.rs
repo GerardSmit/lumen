@@ -129,9 +129,16 @@ fn parse_spec(input: TokenStream) -> Result<walk::Spec, String> {
                     v => return Err(format!("`walk` takes true/false, found `{v}`")),
                 }
             }
+            "bytecode" => {
+                spec.no_bytecode = match value.to_string().as_str() {
+                    "true" => false,
+                    "false" => true,
+                    v => return Err(format!("`bytecode` takes true/false, found `{v}`")),
+                }
+            }
             k => {
                 return Err(format!(
-                    "unknown key `{k}` (expected script, entry, modules, root, walk)"
+                    "unknown key `{k}` (expected script, entry, modules, root, walk, bytecode)"
                 ))
             }
         }
@@ -157,9 +164,10 @@ fn expand(input: TokenStream) -> Result<TokenStream, String> {
 
     let mut code = String::from("{\n");
     code.push_str(&format!(
-        "const _: () = ::lumen_aot::__check_versions({}, {});\n",
+        "const _: () = ::lumen_aot::__check_versions({}, {}, {});\n",
         lumen::precompiled::FORMAT_VERSION,
-        lumen::precompiled::AST_VERSION
+        lumen::precompiled::AST_VERSION,
+        lumen::precompiled::LAYOUT_FINGERPRINT
     ));
     // Rebuild tracking only: an unreferenced const is never code-generated, so these bytes do
     // not reach the binary (see the crate docs).

@@ -4,8 +4,13 @@
 //! reads its own executable and asserts that no JS source text (comments, source lines) made
 //! it into the binary.
 //!
+//! The bundle is built twice — with precompiled bytecode (the default) and AST-only
+//! (`bytecode = false`) — and both must produce identical results; the bytecode build must run
+//! without a single bytecode compile at run time (every function's chunk comes from the blob).
+//!
 //! `cargo run -p lumen-aot --example aot_demo [--release]`
 
+use lumen::precompiled::{reset_stats, stats};
 use lumen::{Completion, Engine, Precompiled};
 
 /// The whole bundle: the prelude script runs first, then the entry module.
@@ -13,6 +18,14 @@ static APP: Precompiled = lumen_aot::include_js!(
     script = "examples/js/prelude.js",
     entry = "examples/js/main.js",
     modules = ["examples/js/lib/extra.js"],
+);
+
+/// The same bundle without precompiled bytecode: functions compile at run time.
+static APP_AST: Precompiled = lumen_aot::include_js!(
+    script = "examples/js/prelude.js",
+    entry = "examples/js/main.js",
+    modules = ["examples/js/lib/extra.js"],
+    bytecode = false,
 );
 
 /// A script on its own (the shorthand form).
@@ -37,10 +50,35 @@ fn rev(s: &str) -> String {
     s.chars().rev().collect()
 }
 
+/// Load a bundle in a fresh engine (the host supplies only the bare import) and return it with
+/// the bytecode-tier counters of the load and top-level run.
+fn load_bundle(blob: &Precompiled) -> (Engine, lumen::precompiled::PrecompiledStats) {
+    let mut e = Engine::new();
+    // Only the bare specifier reaches the host; every `aot:/` module resolves in the blob.
+    e.set_module_loader(|spec, referrer| {
+        assert_eq!(
+            spec, "host:greeting",
+            "host loader asked for {spec} from {referrer}"
+        );
+        Some((
+            "host:greeting".to_string(),
+            "export function greet(who) { return 'hello ' + who; }".to_string(),
+        ))
+    });
+    reset_stats();
+    match e.load_precompiled(blob) {
+        Ok(Completion::Value(_)) => {}
+        Ok(Completion::Throw { name, message }) => panic!("bundle threw {name}: {message}"),
+        Err(err) => panic!("bundle failed to load: {}", err.message),
+    }
+    (e, stats())
+}
+
 fn main() {
     println!(
-        "blob sizes: bundle {} bytes, prelude {} bytes",
+        "blob sizes: bundle {} bytes ({} AST-only), prelude {} bytes",
         APP.as_bytes().len(),
+        APP_AST.as_bytes().len(),
         PRELUDE.as_bytes().len()
     );
 
@@ -63,23 +101,70 @@ fn main() {
     );
 
     // --- the bundle -------------------------------------------------------------------------
-    let mut e = Engine::new();
-    // Only the bare specifier reaches the host; every `aot:/` module resolves in the blob.
-    e.set_module_loader(|spec, referrer| {
-        assert_eq!(
-            spec, "host:greeting",
-            "host loader asked for {spec} from {referrer}"
+    // AST-only first: the reference results, and proof the run-time tier-up path compiles.
+    let (mut reference, ast_stats) = load_bundle(&APP_AST);
+    println!("    AST-only bundle: {ast_stats:?}");
+    assert_eq!(
+        ast_stats.chunks_attached, 0,
+        "no bytecode in the AST-only blob"
+    );
+    assert!(
+        ast_stats.compiles > 0,
+        "the AST-only bundle should compile at run time (the loop body tiers up on its first call)"
+    );
+
+    let (mut e, bc_stats) = load_bundle(&APP);
+    println!("    bytecode bundle: {bc_stats:?}");
+    assert!(
+        bc_stats.chunks_registered >= 12,
+        "precompiled chunks should be registered: {bc_stats:?}"
+    );
+    // Chunks decode when their function tiers up: `sumTo` (a loop) on its first call.
+    assert!(
+        bc_stats.chunks_attached >= 1,
+        "the loop's chunk should be attached on its first call: {bc_stats:?}"
+    );
+    assert!(
+        bc_stats.refusals_attached >= 1,
+        "the generator is a recorded refusal: {bc_stats:?}"
+    );
+    assert_eq!(
+        bc_stats.compiles, 0,
+        "loading and running the precompiled bundle must not compile anything"
+    );
+    println!(
+        "ok  ran from precompiled bytecode: {} chunks registered, {} attached, {} refusals, 0 compiles",
+        bc_stats.chunks_registered, bc_stats.chunks_attached, bc_stats.refusals_attached
+    );
+    // A call-count tier-up (past the threshold of 8) also takes the precompiled chunk.
+    eval(&mut e, "for (let i = 0; i < 20; i++) prelude.scale(i); 0");
+    let after = stats();
+    assert_eq!(after.compiles, 0, "tier-up must use the chunk: {after:?}");
+    // (With LUMEN_AOT_EAGER every chunk was already attached at load.)
+    if std::env::var_os("LUMEN_AOT_EAGER").is_none() {
+        assert!(
+            after.chunks_attached > bc_stats.chunks_attached,
+            "the tier-up should attach a chunk: {after:?}"
         );
-        Some((
-            "host:greeting".to_string(),
-            "export function greet(who) { return 'hello ' + who; }".to_string(),
-        ))
-    });
-    match e.load_precompiled(&APP) {
-        Ok(Completion::Value(_)) => {}
-        Ok(Completion::Throw { name, message }) => panic!("bundle threw {name}: {message}"),
-        Err(err) => panic!("bundle failed to load: {}", err.message),
     }
+    println!("ok  hot function tiered up from its precompiled chunk: {after:?}");
+    let results = concat!(
+        "JSON.stringify([out.sum, out.greeting, out.mulSrc, out.classSrc, out.metaUrl, ",
+        "out.loop, out.closures, out.acc, out.gen])"
+    );
+    check(
+        "bytecode and AST-only bundles agree",
+        eval(&mut e, results),
+        &eval(&mut reference, results),
+    );
+    check("loop", eval(&mut e, "out.loop"), "571571");
+    check(
+        "closures + constants",
+        eval(&mut e, "out.closures"),
+        "3,3,function,1000,true,dflt,1.5e-7",
+    );
+    check("class method", eval(&mut e, "out.acc"), "6");
+    check("generator (tree-walker)", eval(&mut e, "out.gen"), "1+2");
     check("sum across the cycle", eval(&mut e, "out.sum"), "66");
     check(
         "host bare import",
@@ -130,14 +215,22 @@ fn main() {
     );
 
     // A corrupted blob is a clean load error, not a crash.
-    let mut bad = APP.as_bytes().to_vec();
-    bad[16] ^= 0xff; // AST version
-    let bad: &'static [u8] = Box::leak(bad.into_boxed_slice());
-    let err = Engine::new()
-        .load_precompiled(&Precompiled::from_static(bad))
-        .err()
-        .expect("rejected");
-    println!("ok  corrupted blob rejected: {}", err.message);
+    for (at, what) in [(16, "AST version"), (24, "bytecode layout fingerprint")] {
+        let mut bad = APP.as_bytes().to_vec();
+        bad[at] ^= 0xff;
+        let bad: &'static [u8] = Box::leak(bad.into_boxed_slice());
+        let err = Engine::new()
+            .load_precompiled(&Precompiled::from_static(bad))
+            .err()
+            .expect("rejected");
+        println!("ok  corrupted {what} rejected: {}", err.message);
+    }
+    // Every attached chunk equals a fresh compile of the decoded function.
+    let report = lumen::precompiled::verify_bytecode(APP.as_bytes()).expect("bytecode verifies");
+    println!(
+        "ok  verified {} chunks + {} refusals over {} functions against fresh compiles",
+        report.chunks, report.refusals, report.functions
+    );
 
     // --- the binary holds no JS source --------------------------------------------------------
     let exe = std::env::current_exe().unwrap();

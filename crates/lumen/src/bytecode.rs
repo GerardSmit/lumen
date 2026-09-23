@@ -25,6 +25,7 @@ pub(crate) mod jit;
 mod name_path;
 mod object_literal;
 mod parameters;
+pub(crate) mod serialize;
 mod switch;
 mod this_binding;
 #[cfg(test)]
@@ -1538,6 +1539,11 @@ impl CaptureScan {
 
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
+    // An ahead-of-time blob's chunk for this function, if one is registered (see `serialize`).
+    if let Some(chunk) = serialize::take_precompiled(func) {
+        return Some(chunk);
+    }
+    serialize::note_compile();
     if func.ensure_body().is_err() {
         return None;
     }

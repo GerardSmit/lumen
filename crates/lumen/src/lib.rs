@@ -274,7 +274,8 @@ impl Engine {
         precompiled::register_modules(&mut self.interp, &parsed);
         let mut last = Completion::Value(String::new());
         for unit in parsed.units.iter().filter(|u| u.kind == SourceKind::Script) {
-            let body = precompiled::decode_unit(unit.ast)
+            let body = unit
+                .decode()
                 .map_err(|e| bad(format!("{}: {e}", unit.key)))?;
             let directive_strict = matches!(
                 body.first(),
