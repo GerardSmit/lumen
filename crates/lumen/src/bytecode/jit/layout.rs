@@ -715,3 +715,201 @@ pub(crate) fn prop_get(
     let payload = fb.select(is_num, bits, p);
     (tag, payload)
 }
+
+/// The element storage `v`'s own elements can be read from directly, for bounds-check
+/// elimination: `(kind: I32, base: PTR, count: PTR)`. Never misses — `kind` 0 means "no view".
+///
+/// - kind 2: the numeric mirror while `MIRROR_OK` (`base` = the `f64` array, `count` = its
+///   length; a `MIRROR_HOLE` word is a hole, see [`view_elem_num`]);
+/// - kind 1: packed storage, boxed or inline (`base` = the first `Property`, `count` = the
+///   packed length).
+///
+/// Only `Exotic::None` / `Exotic::Array` ic-plain objects not mutably borrowed have a view.
+/// The view is a snapshot: it stays valid while no JS and no helper runs (only the interpreter
+/// reallocates or restructures element storage; the inline element stores only overwrite).
+pub(crate) fn array_view(fb: &mut FunctionBuilder, v: IrValue) -> (IrValue, IrValue, IrValue) {
+    let join = fb.create_block();
+    let kind = fb.append_block_param(join, Type::I32);
+    let base = fb.append_block_param(join, PTR);
+    let count = fb.append_block_param(join, PTR);
+    let none = fb.create_block();
+    if let Some(l) = layout() {
+        let gc = object(fb, l, v, none, false);
+        exotic_is(fb, l, gc, &[Exotic::None, Exotic::Array], none);
+        let d = dense(fb, l, gc, none);
+
+        let mirror = fb.create_block();
+        let mirror_ok = fb.create_block();
+        let packed_b = fb.create_block();
+        let flags = fb.load(MemKind::I32U8, d, l.mirror_flags);
+        let ok = bin_imm(fb, BinaryOp::Band, Type::I32, flags, MIRROR_OK as i64);
+        fb.brif(ok, mirror, &[], packed_b, &[]);
+        fb.seal_block(mirror);
+
+        fb.switch_to_block(mirror);
+        let mlen = fb.load(PTR_MEM, d, l.mirror_len);
+        let some = cmp_imm(fb, IntCC::Ne, PTR, mlen, 0);
+        fb.brif(some, mirror_ok, &[], packed_b, &[]);
+        fb.seal_block(mirror_ok);
+        fb.seal_block(packed_b);
+
+        fb.switch_to_block(mirror_ok);
+        let mptr = fb.load(PTR_MEM, d, l.mirror_ptr);
+        let two = fb.iconst(Type::I32, 2);
+        fb.jump(join, &[two, mptr, mlen]);
+
+        fb.switch_to_block(packed_b);
+        let boxed = fb.create_block();
+        let not_boxed = fb.create_block();
+        let packed = fb.load(PTR_MEM, d, l.dense_packed);
+        let is_boxed = cmp_imm(fb, IntCC::Ne, PTR, packed, 0);
+        fb.brif(is_boxed, boxed, &[], not_boxed, &[]);
+        fb.seal_block(boxed);
+        fb.seal_block(not_boxed);
+
+        fb.switch_to_block(boxed);
+        let len = fb.load(PTR_MEM, packed, l.packed_len);
+        let ptr = fb.load(PTR_MEM, packed, l.packed_ptr);
+        let one = fb.iconst(Type::I32, 1);
+        fb.jump(join, &[one, ptr, len]);
+
+        // Inline packed storage: a non-zero `u8` length selects it (zero: no packed view).
+        fb.switch_to_block(not_boxed);
+        let inline = fb.create_block();
+        let ilen = fb.load(PTR_U8, d, l.dense_inline_len);
+        let is_inline = cmp_imm(fb, IntCC::Ne, PTR, ilen, 0);
+        fb.brif(is_inline, inline, &[], none, &[]);
+        fb.seal_block(inline);
+        fb.switch_to_block(inline);
+        let slots = bin_imm(fb, BinaryOp::Iadd, PTR, d, l.dense_inline_slots as i64);
+        let one = fb.iconst(Type::I32, 1);
+        fb.jump(join, &[one, slots, ilen]);
+    } else {
+        fb.jump(none, &[]);
+    }
+
+    fb.seal_block(none);
+    fb.switch_to_block(none);
+    let z = fb.iconst(Type::I32, 0);
+    let zp = fb.iconst(PTR, 0);
+    fb.jump(join, &[z, zp, zp]);
+    fb.seal_block(join);
+    fb.switch_to_block(join);
+    (kind, base, count)
+}
+
+/// Element `ii` (`PTR`, known `< count`) of a non-empty [`array_view`] `(kind, base)`, as F64.
+/// Misses on a hole, an accessor or a non-Number element.
+pub(crate) fn view_elem_num(
+    fb: &mut FunctionBuilder,
+    kind: IrValue,
+    base: IrValue,
+    ii: IrValue,
+    miss: Block,
+) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.f64const(0.0);
+    };
+    let done = fb.create_block();
+    let result = fb.append_block_param(done, Type::F64);
+    let mirror = fb.create_block();
+    let packed = fb.create_block();
+    let is_mirror = cmp_imm(fb, IntCC::Eq, Type::I32, kind, 2);
+    fb.brif(is_mirror, mirror, &[], packed, &[]);
+    fb.seal_block(mirror);
+    fb.seal_block(packed);
+
+    fb.switch_to_block(mirror);
+    let at = scaled(fb, base, ii, 8);
+    let bits = fb.load(MemKind::I64, at, 0);
+    let hole = fb.iconst(Type::I64, MIRROR_HOLE as i64);
+    let present = fb.icmp(IntCC::Ne, bits, hole);
+    guard(fb, present, miss);
+    let f = fb.convert(ConvOp::Bitcast, Type::F64, bits);
+    fb.jump(done, &[f]);
+
+    fb.switch_to_block(packed);
+    let prop = scaled(fb, base, ii, l.prop_size);
+    let f = data_num(fb, l, prop, miss);
+    fb.jump(done, &[f]);
+
+    fb.seal_block(done);
+    fb.switch_to_block(done);
+    result
+}
+
+/// `v.<prop> = n` (n F64) through the baked IC: overwrite an existing own writable data
+/// property of an ordinary object holding a trivially-droppable value. Misses otherwise
+/// (setters, frozen / non-writable, shared copy-on-write entries, new properties...). Every
+/// guard precedes the store.
+pub(crate) fn prop_set_num(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    ic: &PropIc,
+    n: IrValue,
+    miss: Block,
+) {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return;
+    };
+    let gc = object(fb, l, v, miss, true);
+    exotic_is(fb, l, gc, &[Exotic::None], miss);
+    let cap = fb.load(PTR_U32, gc, l.entries_cap);
+    let owned = cmp_imm(fb, IntCC::Ne, PTR, cap, 0);
+    guard(fb, owned, miss);
+    let shape = fb.load(MemKind::I32, gc, l.shape);
+    let nent = fb.load(PTR_U32, gc, l.entries_len);
+
+    let got = fb.create_block();
+    let prop = fb.append_block_param(got, PTR);
+    for &(recv_shape, slot) in &ic.ways {
+        let hit = fb.create_block();
+        let next = fb.create_block();
+        let same = cmp_imm(fb, IntCC::Eq, Type::I32, shape, recv_shape as i32 as i64);
+        fb.brif(same, hit, &[], next, &[]);
+        fb.seal_block(hit);
+        fb.seal_block(next);
+
+        fb.switch_to_block(hit);
+        let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, slot as i64);
+        guard(fb, inb, miss);
+        let base = fb.load(PTR_MEM, gc, l.entries_ptr);
+        let sl = fb.iconst(PTR, slot as i64);
+        let p = scaled(fb, base, sl, l.prop_size);
+        fb.jump(got, &[p]);
+
+        fb.switch_to_block(next);
+    }
+    fb.jump(miss, &[]);
+    fb.seal_block(got);
+
+    fb.switch_to_block(got);
+    let meta = fb.load(PTR_MEM, prop, l.prop_meta);
+    let attrs = bin_imm(
+        fb,
+        BinaryOp::Band,
+        PTR,
+        meta,
+        (PROP_ACCESSOR | PROP_WRITABLE) as i64,
+    );
+    let writable = cmp_imm(fb, IntCC::Eq, PTR, attrs, PROP_WRITABLE as i64);
+    guard(fb, writable, miss);
+    let old = fb.load(MemKind::I64, prop, l.prop_packed);
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, old, 48);
+    let empty = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_EMPTY);
+    let ge = cmp_imm(fb, IntCC::Uge, Type::I64, top, TOP_BIGINT);
+    let le = cmp_imm(fb, IntCC::Ule, Type::I64, top, TOP_SYM);
+    let rc_prim = fb.binary(BinaryOp::Band, ge, le);
+    let obj = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_OBJ);
+    let bad = fb.binary(BinaryOp::Bor, empty, rc_prim);
+    let bad = fb.binary(BinaryOp::Bor, bad, obj);
+    let droppable = cmp_imm(fb, IntCC::Eq, Type::I32, bad, 0);
+    guard(fb, droppable, miss);
+    let nbits = fb.convert(ConvOp::Bitcast, Type::I64, n);
+    let is_nan = fb.fcmp(FloatCC::Ne, n, n);
+    let canon = fb.iconst(Type::I64, PACK_CANON_NAN as i64);
+    let packed = fb.select(is_nan, canon, nbits);
+    fb.store(MemKind::I64, prop, packed, l.prop_packed);
+}

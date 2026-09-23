@@ -23,6 +23,7 @@ mod globals;
 mod host;
 mod json;
 mod math;
+pub(crate) use math::jit_math_fns;
 mod primitives;
 mod promise;
 mod proxy;

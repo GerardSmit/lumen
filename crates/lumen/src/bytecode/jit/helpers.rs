@@ -50,17 +50,57 @@ pub(crate) enum Helper {
     Binary,
     /// `(frame, v: *mut Value) -> u32` — ToBoolean of `*v` (consumed), 0/1. Never throws.
     ToBoolean,
-    /// `(frame, pc: u32, depth: u32) -> status` — the generic fallback: run the single
-    /// interpreter op at `pc` with `frame.stack[0..depth]` (all Boxed) as its operand stack; the
-    /// results are left at `frame.stack[depth - pops ..]`. Only for ops that do not touch
-    /// locals, do not jump and do not push/pop handlers (see [`generic_ok`]).
+    /// `(frame, pc: u32, base: u32, depth: u32) -> status` — the generic fallback: run the
+    /// single interpreter op at `pc` with `frame.stack[base..depth]` (all Boxed; `base` at or
+    /// below the op's operands) as its operand stack; the results are left at
+    /// `frame.stack[base..]`. Only for ops that do not write locals, do not jump and do not
+    /// push/pop handlers (see [`generic_ok`]), or that read a Boxed local (see
+    /// [`generic_slot_ok`]: the translator only sends those when the slot's memory is
+    /// authoritative).
     Generic,
     /// `(frame) -> status` — the loop safepoint: resets `frame.budget` to [`SAFEPOINT_BUDGET`]
     /// and runs the collector / interrupt check the interpreter runs at backward jumps.
     Safepoint,
+    /// `(frame, n: u32, c: u32) -> *const Value` — the address of the value of the binding the
+    /// free name `names[n]` (name cache `c`) resolves to, when the name cache proves it is a
+    /// plain initialized scope binding (filling the cache first on a miss); null otherwise.
+    /// Pure: never runs JS, never throws. The address stays valid until JS runs (only JS
+    /// restructures a scope or reassigns a binding).
+    NamePtr,
+    /// `(frame, n: u32) -> *mut Value` — the address of captured binding `names[n]`'s value in
+    /// the activation env, or null while it is in its TDZ. Pure, like [`Helper::NamePtr`].
+    CapPtr,
+    /// `(frame, n: u32, c: u32, dst) -> u32` — `LoadName(n, c)` into `dst`: 0 = done through the
+    /// name cache (no JS ran), 2 = done through the full lookup (JS may have run), 1 = threw.
+    LoadName,
+    /// `(frame, n: u32, c: u32, dst) -> u32` — `LoadNameForCall(n, c)`: the receiver into
+    /// `dst[0]` and the callee into `dst[1]`; statuses as [`Helper::LoadName`].
+    LoadNameForCall,
+    /// `(frame, n: u32, c: u32, src) -> status` — `StoreNameCached(n, c)` of the consumed `src`.
+    StoreName,
+    /// `(frame, n: u32, src, init: u32) -> status` — `StoreCap(n)` (`StoreCapInit` when `init`)
+    /// of the consumed `src`.
+    StoreCap,
+    /// `(frame, base: u32, argc: u32, with_this: u32) -> status` — `Call(argc)` (receiver
+    /// `undefined`, callee at `stack[base]`) or `CallWithThis(argc)` (receiver at `stack[base]`,
+    /// callee at `stack[base + 1]`), arguments following. Consumes all of them and leaves the
+    /// result at `stack[base]` (`Undefined` there on a throw).
+    Call,
+    /// `(frame, n: u32, c: u32, obj, consume: u32, dst) -> status` — `obj.<names[n]>` through
+    /// property cache `c` into `dst`; `obj` is dropped afterwards when `consume`.
+    GetProp,
+    /// `(frame, n: u32, c: u32, obj, dst) -> status` — `GetMethod`: like `GetProp`, `obj` kept.
+    GetMethod,
+    /// `(frame, n: u32, c: u32, obj, v, consume: u32) -> status` — `obj.<names[n]> = v` through
+    /// property cache `c`, consuming `v` (and `obj` when `consume`).
+    SetProp,
+    /// `(frame, pc: u32) -> u32` — 1 when the `LoadName(Math) GetMethod(f)` pair at `pc` still
+    /// yields the realm's intrinsic `Math.f` (see [`math_intrinsic`]). Pure; a failure is
+    /// remembered for the site ([`math_site_failed`]) so a recompile stops speculating.
+    MathGuard,
 }
 
-pub(crate) const ALL: [Helper; 9] = [
+pub(crate) const ALL: [Helper; 20] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -70,6 +110,17 @@ pub(crate) const ALL: [Helper; 9] = [
     Helper::ToBoolean,
     Helper::Generic,
     Helper::Safepoint,
+    Helper::NamePtr,
+    Helper::CapPtr,
+    Helper::LoadName,
+    Helper::LoadNameForCall,
+    Helper::StoreName,
+    Helper::StoreCap,
+    Helper::Call,
+    Helper::GetProp,
+    Helper::GetMethod,
+    Helper::SetProp,
+    Helper::MathGuard,
 ];
 
 /// The IR signature of `h`.
@@ -84,8 +135,18 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::Clone => (&[P, P], &[]),
         Helper::Binary => (&[P, I32, P, P, P], &[I32]),
         Helper::ToBoolean => (&[P, P], &[I32]),
-        Helper::Generic => (&[P, I32, I32], &[I32]),
+        Helper::Generic => (&[P, I32, I32, I32], &[I32]),
         Helper::Safepoint => (&[P], &[I32]),
+        Helper::NamePtr => (&[P, I32, I32], &[P]),
+        Helper::CapPtr => (&[P, I32], &[P]),
+        Helper::LoadName | Helper::LoadNameForCall => (&[P, I32, I32, P], &[I32]),
+        Helper::StoreName => (&[P, I32, I32, P], &[I32]),
+        Helper::StoreCap => (&[P, I32, P, I32], &[I32]),
+        Helper::Call => (&[P, I32, I32, I32], &[I32]),
+        Helper::GetProp => (&[P, I32, I32, P, I32, P], &[I32]),
+        Helper::GetMethod => (&[P, I32, I32, P, P], &[I32]),
+        Helper::SetProp => (&[P, I32, I32, P, P, I32], &[I32]),
+        Helper::MathGuard => (&[P, I32], &[I32]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -103,6 +164,17 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::ToBoolean => to_boolean as *const () as usize,
         Helper::Generic => generic as *const () as usize,
         Helper::Safepoint => safepoint as *const () as usize,
+        Helper::NamePtr => name_ptr as *const () as usize,
+        Helper::CapPtr => cap_ptr as *const () as usize,
+        Helper::LoadName => load_name as *const () as usize,
+        Helper::LoadNameForCall => load_name_for_call as *const () as usize,
+        Helper::StoreName => store_name as *const () as usize,
+        Helper::StoreCap => store_cap as *const () as usize,
+        Helper::Call => call as *const () as usize,
+        Helper::GetProp => get_prop as *const () as usize,
+        Helper::GetMethod => get_method as *const () as usize,
+        Helper::SetProp => set_prop as *const () as usize,
+        Helper::MathGuard => math_guard as *const () as usize,
     } as u64)
 }
 
@@ -262,6 +334,21 @@ pub(crate) fn generic_ok(op: &Op) -> bool {
     }
 }
 
+/// Slot-reading ops [`Helper::Generic`] may run when the translator knows the slot is Boxed —
+/// its memory is then authoritative. None of them writes a slot.
+pub(crate) fn generic_slot_ok(op: &Op) -> bool {
+    use Op::*;
+    matches!(
+        *op,
+        GetPropLocal(..)
+            | SetPropLocalDrop(..)
+            | GetElemLocal(_)
+            | SetElemLocal(_)
+            | SetElemLocalDrop(_)
+            | ToPropKeyLocal(_)
+    )
+}
+
 /// Record a completion's abrupt outcome in the frame. A compiled body only ever sees `Throw`;
 /// anything else would be an engine bug, surfaced as a thrown error rather than an abort.
 unsafe fn fail(f: *mut JitFrame, a: Abrupt) -> u32 {
@@ -356,11 +443,16 @@ pub(crate) unsafe extern "C" fn to_boolean(f: *mut JitFrame, v: *mut Value) -> u
     (*(*f).interp).to_boolean(&v) as u32
 }
 
-pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, depth: u32) -> u32 {
+pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, depth: u32) -> u32 {
     let chunk = &*(*f).chunk;
     let pc = pc as usize;
-    let depth = depth as usize;
-    if chunk.ops.get(pc).is_none_or(|op| !generic_ok(op)) {
+    let (base, depth) = (base as usize, depth as usize);
+    if base > depth
+        || chunk
+            .ops
+            .get(pc)
+            .is_none_or(|op| !generic_ok(op) && !generic_slot_ok(op))
+    {
         let e = (*(*f).interp).throw("TypeError", "compiled code ran an unsupported op");
         return fail(f, e);
     }
@@ -371,7 +463,7 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, depth: u32) -
     // A pooled buffer: this runs once per generic op on a hot loop's slow path.
     let (spare, mut stack) = i.vm_pool.pop().unwrap_or_default();
     stack.clear();
-    for d in 0..depth {
+    for d in base..depth {
         stack.push(std::ptr::replace((*f).stack.add(d), Value::Undefined));
     }
     let mut next_pc = pc;
@@ -388,17 +480,18 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, depth: u32) -
     );
     // Hand the stack back — on a throw too: the entries below the op's operands are untouched
     // (ops only pop from the top, and calls truncate only after returning), and native code
-    // still owns them as Boxed entries. `frame.stack[0..depth]` is all `Undefined` here, so a
-    // plain write neither leaks nor double-drops. On success the op's pushes fit in the region's
-    // `max_stack` (the builder sized it from the same stack effects); on a throw anything
-    // above the original depth is dropped rather than written past what the caller expects.
+    // still owns them as Boxed entries. `frame.stack[base..depth]` is all `Undefined` here, so
+    // a plain write neither leaks nor double-drops. On success the op's pushes fit in the
+    // region's `max_stack` (the builder sized it from the same stack effects); on a throw
+    // anything above the original depth is dropped rather than written past what the caller
+    // expects.
     let keep = if r.is_ok() {
         stack.len()
     } else {
-        stack.len().min(depth)
+        stack.len().min(depth - base)
     };
     for (d, v) in stack.drain(..).take(keep).enumerate() {
-        std::ptr::write((*f).stack.add(d), v);
+        std::ptr::write((*f).stack.add(base + d), v);
     }
     if i.vm_pool.len() < 64 {
         i.vm_pool.push((spare, stack));
@@ -417,4 +510,375 @@ pub(crate) unsafe extern "C" fn safepoint(f: *mut JitFrame) -> u32 {
         Ok(()) => STATUS_OK,
         Err(e) => fail(f, e),
     }
+}
+
+// ---- names, captures, calls and properties ---------------------------------------------------
+
+/// The binding a name cache resolves to through a scope (the depth-0 and depth-1 modes of
+/// [`crate::bytecode::NameIc`]), revalidated exactly like `Chunk::name_ic_hit` does.
+unsafe fn name_binding(
+    chunk: &Chunk,
+    env: &Env,
+    c: usize,
+) -> Option<*mut crate::interpreter::Binding> {
+    let ic = chunk.name_caches.get(c)?.get();
+    if ic.env == 0 || ic.env & 1 != 0 {
+        return None;
+    }
+    let raw = std::rc::Rc::as_ptr(env) as usize;
+    if ic.env == raw {
+        let b = env.try_borrow().ok()?;
+        if b.vars.generation() != ic.gen {
+            return None;
+        }
+        return Some(ic.binding as usize as *mut crate::interpreter::Binding);
+    }
+    if ic.env & 2 != 0 {
+        let b = env.try_borrow().ok()?;
+        if b.vars.generation() != ic.act_gen {
+            return None;
+        }
+        let p = b.parent.as_ref()?;
+        if std::rc::Rc::as_ptr(p) as usize | 2 != ic.env {
+            return None;
+        }
+        let pb = p.try_borrow().ok()?;
+        if pb.vars.generation() != ic.gen {
+            return None;
+        }
+        return Some(ic.binding as usize as *mut crate::interpreter::Binding);
+    }
+    None
+}
+
+pub(crate) unsafe extern "C" fn name_ptr(f: *mut JitFrame, n: u32, c: u32) -> *const Value {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    if c as usize >= chunk.name_caches.len() || n as usize >= chunk.names.len() {
+        return std::ptr::null();
+    }
+    let mut b = name_binding(chunk, env, c as usize);
+    if b.is_none() {
+        // Side-effect free: seeds the cache from plain data bindings / properties only.
+        let i = &*(*f).interp;
+        if chunk.name_ic_fill(i, env, n, c).is_some() {
+            b = name_binding(chunk, env, c as usize);
+        }
+    }
+    match b {
+        Some(bd) if (*bd).initialized && (*bd).import_ref.is_none() => &(*bd).value,
+        _ => std::ptr::null(),
+    }
+}
+
+pub(crate) unsafe extern "C" fn cap_ptr(f: *mut JitFrame, n: u32) -> *mut Value {
+    let chunk = &*(*f).chunk;
+    if n as usize >= chunk.names.len() {
+        return std::ptr::null_mut();
+    }
+    let env = &*(*f).env;
+    let bd = chunk.cap_binding_ptr(env, n);
+    if (*bd).initialized {
+        &mut (*bd).value
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// Status of a name read that went through the full (possibly JS-running) lookup.
+pub(crate) const STATUS_OK_SLOW: u32 = 2;
+
+pub(crate) unsafe extern "C" fn load_name(
+    f: *mut JitFrame,
+    n: u32,
+    c: u32,
+    dst: *mut Value,
+) -> u32 {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    let i = &mut *(*f).interp;
+    if let Some(v) = chunk
+        .name_ic_hit(i, env, c)
+        .or_else(|| chunk.name_ic_fill(i, env, n, c))
+    {
+        std::ptr::write(dst, v);
+        return STATUS_OK;
+    }
+    match i.get_var(&chunk.names[n as usize], env) {
+        Ok(v) => {
+            std::ptr::write(dst, v);
+            STATUS_OK_SLOW
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn load_name_for_call(
+    f: *mut JitFrame,
+    n: u32,
+    c: u32,
+    dst: *mut Value,
+) -> u32 {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    let i = &mut *(*f).interp;
+    // A depth-0 cache hit/fill can't have come through a `with` object: `this` is undefined.
+    if let Some(v) = chunk
+        .name_ic_hit(i, env, c)
+        .or_else(|| chunk.name_ic_fill(i, env, n, c))
+    {
+        std::ptr::write(dst, Value::Undefined);
+        std::ptr::write(dst.add(1), v);
+        return STATUS_OK;
+    }
+    match i.get_var_with(&chunk.names[n as usize], env) {
+        Ok((callee, with_this)) => {
+            std::ptr::write(dst, with_this.unwrap_or(Value::Undefined));
+            std::ptr::write(dst.add(1), callee);
+            STATUS_OK_SLOW
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn store_name(
+    f: *mut JitFrame,
+    n: u32,
+    c: u32,
+    src: *mut Value,
+) -> u32 {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    let v = std::ptr::replace(src, Value::Undefined);
+    match chunk.store_name_ic(&mut *(*f).interp, env, n, c, v) {
+        Ok(()) => STATUS_OK,
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn store_cap(
+    f: *mut JitFrame,
+    n: u32,
+    src: *mut Value,
+    init: u32,
+) -> u32 {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    let v = std::ptr::replace(src, Value::Undefined);
+    match chunk.store_cap_ic(&mut *(*f).interp, env, n, v, init != 0) {
+        Ok(()) => STATUS_OK,
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn call(
+    f: *mut JitFrame,
+    base: u32,
+    argc: u32,
+    with_this: u32,
+) -> u32 {
+    let s = (*f).stack;
+    let (base, argc) = (base as usize, argc as usize);
+    let (this, callee, at) = if with_this != 0 {
+        (
+            std::ptr::replace(s.add(base), Value::Undefined),
+            std::ptr::replace(s.add(base + 1), Value::Undefined),
+            base + 2,
+        )
+    } else {
+        (
+            Value::Undefined,
+            std::ptr::replace(s.add(base), Value::Undefined),
+            base + 1,
+        )
+    };
+    // The arguments stay owned by the frame's stack for the call (they root their objects
+    // there, like the interpreter's operand stack does), then are dropped.
+    let args = std::slice::from_raw_parts(s.add(at), argc);
+    let r = (*(*f).interp).call(callee, this, args);
+    for k in 0..argc {
+        *s.add(at + k) = Value::Undefined;
+    }
+    match r {
+        Ok(v) => {
+            std::ptr::write(s.add(base), v);
+            STATUS_OK
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn get_prop(
+    f: *mut JitFrame,
+    n: u32,
+    c: u32,
+    obj: *mut Value,
+    consume: u32,
+    dst: *mut Value,
+) -> u32 {
+    let chunk = &*(*f).chunk;
+    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize))
+    else {
+        let e = (*(*f).interp).throw("TypeError", "compiled code used a bad property cache");
+        return fail(f, e);
+    };
+    let r = (*(*f).interp).get_prop_ic(&*obj, name, cache);
+    if consume != 0 {
+        *obj = Value::Undefined;
+    }
+    match r {
+        Ok(v) => {
+            std::ptr::write(dst, v);
+            STATUS_OK
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn get_method(
+    f: *mut JitFrame,
+    n: u32,
+    c: u32,
+    obj: *mut Value,
+    dst: *mut Value,
+) -> u32 {
+    get_prop(f, n, c, obj, 0, dst)
+}
+
+pub(crate) unsafe extern "C" fn set_prop(
+    f: *mut JitFrame,
+    n: u32,
+    c: u32,
+    obj: *mut Value,
+    v: *mut Value,
+    consume: u32,
+) -> u32 {
+    let chunk = &*(*f).chunk;
+    let v = std::ptr::replace(v, Value::Undefined);
+    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize))
+    else {
+        let e = (*(*f).interp).throw("TypeError", "compiled code used a bad property cache");
+        return fail(f, e);
+    };
+    let r = (*(*f).interp).set_prop_ic(&*obj, name, v, cache);
+    if consume != 0 {
+        *obj = Value::Undefined;
+    }
+    match r {
+        Ok(()) => STATUS_OK,
+        Err(e) => fail(f, e),
+    }
+}
+
+// ---- Math intrinsics ---------------------------------------------------------------------------
+
+/// A `Math` function the translator emits inline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MathFn {
+    Sqrt,
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Max,
+    Min,
+    Imul,
+}
+
+impl MathFn {
+    pub(crate) fn arity(self) -> usize {
+        match self {
+            MathFn::Max | MathFn::Min | MathFn::Imul => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// The inlinable `Math` function called `name`.
+pub(crate) fn math_intrinsic(name: &str) -> Option<MathFn> {
+    Some(match name {
+        "sqrt" => MathFn::Sqrt,
+        "abs" => MathFn::Abs,
+        "floor" => MathFn::Floor,
+        "ceil" => MathFn::Ceil,
+        "round" => MathFn::Round,
+        "trunc" => MathFn::Trunc,
+        "max" => MathFn::Max,
+        "min" => MathFn::Min,
+        "imul" => MathFn::Imul,
+        _ => return None,
+    })
+}
+
+thread_local! {
+    /// `(chunk address, pc)` of `Math` call sites whose guard failed: compiled again, they take
+    /// the call path. An address reused by a later chunk only costs that chunk the inline path.
+    static MATH_FAILED: std::cell::RefCell<std::collections::HashSet<(usize, u32)>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+pub(crate) fn math_site_failed(chunk: &Chunk, pc: usize) -> bool {
+    MATH_FAILED.with(|s| {
+        s.borrow()
+            .contains(&(chunk as *const Chunk as usize, pc as u32))
+    })
+}
+
+/// Whether `LoadName(n, c) GetMethod(m, _)` at `pc` reads the intrinsic `Math.<m>`: `Math`
+/// resolves through its name cache (plain data bindings / properties only — no getter can
+/// run), `Math` is an ordinary object, and its own data property `m` holds a native function
+/// whose code is the builtin's.
+unsafe fn math_check(f: *mut JitFrame, pc: usize) -> Option<()> {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    let i = &*(*f).interp;
+    let (Op::LoadName(n, c), Op::GetMethod(m, _)) = (*chunk.ops.get(pc)?, *chunk.ops.get(pc + 1)?)
+    else {
+        return None;
+    };
+    if c as usize >= chunk.name_caches.len() {
+        return None;
+    }
+    let name = chunk.names.get(m as usize)?;
+    let want = crate::builtins::jit_math_fns()
+        .into_iter()
+        .find(|(k, _)| *k == &**name)?
+        .1;
+    let math = chunk
+        .name_ic_hit(i, env, c)
+        .or_else(|| chunk.name_ic_fill(i, env, n, c))?;
+    let Value::Obj(mo) = math else { return None };
+    if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&mo) as usize) {
+        return None;
+    }
+    let fv = {
+        let mb = mo.try_borrow().ok()?;
+        if !matches!(mb.exotic, crate::value::Exotic::None) {
+            return None;
+        }
+        let slot = mb.props.slot_of(name)?;
+        let p = mb.props.entry_at(slot)?;
+        if p.accessor() {
+            return None;
+        }
+        p.value()
+    };
+    let Value::Obj(fo) = fv else { return None };
+    let fb = fo.try_borrow().ok()?;
+    match fb.call {
+        crate::value::Callable::Native(fp) if fp as usize == want as usize => Some(()),
+        _ => None,
+    }
+}
+
+pub(crate) unsafe extern "C" fn math_guard(f: *mut JitFrame, pc: u32) -> u32 {
+    if math_check(f, pc as usize).is_some() {
+        return 1;
+    }
+    let key = ((*f).chunk as usize, pc);
+    MATH_FAILED.with(|s| {
+        s.borrow_mut().insert(key);
+    });
+    0
 }

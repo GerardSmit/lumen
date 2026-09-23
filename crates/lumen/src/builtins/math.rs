@@ -7,6 +7,93 @@ pub(crate) fn nf_math_sqrt(i: &mut Interp, _this: Value, args: &[Value]) -> Resu
     Ok(Value::Num(x.sqrt()))
 }
 
+// The Math functions the loop JIT inlines are named, so it can recognize the unmodified
+// intrinsics by function identity (see `jit_math_fns`).
+macro_rules! unary_fn {
+    ($name:ident, $f:expr) => {
+        pub(crate) fn $name(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
+            let x = ab(i.to_number(&arg(a, 0)))?;
+            Ok(Value::Num($f(x)))
+        }
+    };
+}
+unary_fn!(nf_math_abs, f64::abs);
+unary_fn!(nf_math_floor, f64::floor);
+unary_fn!(nf_math_ceil, f64::ceil);
+unary_fn!(nf_math_trunc, f64::trunc);
+// Math.round ties toward +Inf and keeps a negative sign for [-0.5, 0). Computed from floor(x)
+// (not floor(x + 0.5), which wrongly rounds up e.g. 0.5 - ε/4 and some large odd integers).
+unary_fn!(nf_math_round, |x: f64| {
+    if x.is_nan() || x.is_infinite() || x == 0.0 {
+        x
+    } else {
+        let f = x.floor();
+        let r = if x - f >= 0.5 { f + 1.0 } else { f };
+        if r == 0.0 && x < 0.0 {
+            -0.0
+        } else {
+            r
+        }
+    }
+});
+
+pub(crate) fn nf_math_imul(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
+    let x = to_uint32(ab(i.to_number(&arg(a, 0)))?) as i32;
+    let y = to_uint32(ab(i.to_number(&arg(a, 1)))?) as i32;
+    Ok(Value::Num(x.wrapping_mul(y) as f64))
+}
+
+pub(crate) fn nf_math_max(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
+    // ToNumber every argument first (side effects in order), then reduce. +0 is larger than -0.
+    let mut nums = Vec::with_capacity(a.len());
+    for v in a {
+        nums.push(ab(i.to_number(v))?);
+    }
+    let mut m = f64::NEG_INFINITY;
+    for &n in &nums {
+        if n.is_nan() {
+            return Ok(Value::Num(f64::NAN));
+        }
+        if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative()) {
+            m = n;
+        }
+    }
+    Ok(Value::Num(m))
+}
+
+pub(crate) fn nf_math_min(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
+    let mut nums = Vec::with_capacity(a.len());
+    for v in a {
+        nums.push(ab(i.to_number(v))?);
+    }
+    let mut m = f64::INFINITY;
+    for &n in &nums {
+        if n.is_nan() {
+            return Ok(Value::Num(f64::NAN));
+        }
+        if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive()) {
+            m = n;
+        }
+    }
+    Ok(Value::Num(m))
+}
+
+/// The Math functions the loop JIT inlines, by property name, as the native fn pointers the
+/// intrinsics are installed with.
+pub(crate) fn jit_math_fns() -> [(&'static str, crate::value::NativeFn); 9] {
+    [
+        ("sqrt", nf_math_sqrt),
+        ("abs", nf_math_abs),
+        ("floor", nf_math_floor),
+        ("ceil", nf_math_ceil),
+        ("round", nf_math_round),
+        ("trunc", nf_math_trunc),
+        ("max", nf_math_max),
+        ("min", nf_math_min),
+        ("imul", nf_math_imul),
+    ]
+}
+
 pub(super) fn install_math(it: &mut Interp) {
     let math = it.new_object();
     // The Math constants are { writable:false, enumerable:false, configurable:false }.
@@ -38,25 +125,11 @@ pub(super) fn install_math(it: &mut Interp) {
             });
         };
     }
-    unary!("abs", f64::abs);
-    unary!("floor", f64::floor);
-    unary!("ceil", f64::ceil);
-    // Math.round ties toward +Inf and keeps a negative sign for [-0.5, 0). Computed from floor(x)
-    // (not floor(x + 0.5), which wrongly rounds up e.g. 0.5 - ε/4 and some large odd integers).
-    unary!("round", |x: f64| {
-        if x.is_nan() || x.is_infinite() || x == 0.0 {
-            x
-        } else {
-            let f = x.floor();
-            let r = if x - f >= 0.5 { f + 1.0 } else { f };
-            if r == 0.0 && x < 0.0 {
-                -0.0
-            } else {
-                r
-            }
-        }
-    });
-    unary!("trunc", f64::trunc);
+    it.def_method(&math, "abs", 1, nf_math_abs);
+    it.def_method(&math, "floor", 1, nf_math_floor);
+    it.def_method(&math, "ceil", 1, nf_math_ceil);
+    it.def_method(&math, "round", 1, nf_math_round);
+    it.def_method(&math, "trunc", 1, nf_math_trunc);
     it.def_method(&math, "sqrt", 1, nf_math_sqrt);
     unary!("cbrt", f64::cbrt);
     unary!("sign", |x: f64| if x.is_nan() || x == 0.0 {
@@ -178,11 +251,7 @@ pub(super) fn install_math(it: &mut Interp) {
             sum.sqrt()
         }))
     });
-    it.def_method(&math, "imul", 2, |i, _t, a| {
-        let x = to_uint32(ab(i.to_number(&arg(a, 0)))?) as i32;
-        let y = to_uint32(ab(i.to_number(&arg(a, 1)))?) as i32;
-        Ok(Value::Num(x.wrapping_mul(y) as f64))
-    });
+    it.def_method(&math, "imul", 2, nf_math_imul);
     it.def_method(&math, "random", 0, |_i, _t, _a| {
         Ok(Value::Num(next_random()))
     });
@@ -213,39 +282,8 @@ pub(super) fn install_math(it: &mut Interp) {
             ab(i.to_number(&arg(a, 0)))?.atan2(ab(i.to_number(&arg(a, 1)))?),
         ))
     });
-    it.def_method(&math, "max", 2, |i, _t, a| {
-        // ToNumber every argument first (side effects in order), then reduce. +0 is larger than -0.
-        let mut nums = Vec::with_capacity(a.len());
-        for v in a {
-            nums.push(ab(i.to_number(v))?);
-        }
-        let mut m = f64::NEG_INFINITY;
-        for &n in &nums {
-            if n.is_nan() {
-                return Ok(Value::Num(f64::NAN));
-            }
-            if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative()) {
-                m = n;
-            }
-        }
-        Ok(Value::Num(m))
-    });
-    it.def_method(&math, "min", 2, |i, _t, a| {
-        let mut nums = Vec::with_capacity(a.len());
-        for v in a {
-            nums.push(ab(i.to_number(v))?);
-        }
-        let mut m = f64::INFINITY;
-        for &n in &nums {
-            if n.is_nan() {
-                return Ok(Value::Num(f64::NAN));
-            }
-            if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive()) {
-                m = n;
-            }
-        }
-        Ok(Value::Num(m))
-    });
+    it.def_method(&math, "max", 2, nf_math_max);
+    it.def_method(&math, "min", 2, nf_math_min);
     set_to_string_tag(it, &math, "Math");
     set_builtin(&it.global, "Math", Value::Obj(math));
 }
