@@ -4026,3 +4026,7 @@ from the ARM64 JIT as benchmark-specific: it matched one program's structure and
 was not exercised by real code. Every chunk now uses the compact 112-byte frame.
 Generic region lowering (linked scan, numeric diamond, numeric CFG, loop chains)
 is unchanged.
+
+The numeric-diamond region (an exact 18-op match of Richards'
+`WorkerTask.run` fill loop, with its `jit_prepare_numeric_packed_array` helper)
+was removed at the same time for the same reason.

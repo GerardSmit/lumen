@@ -47,24 +47,6 @@ impl Props {
         *self.elems.mirror_flags_mut() = 0;
     }
 
-    /// Validate the storage contract used by the numeric CFG region and return the stable boxed
-    /// Vec header. The caller separately proves ordinary Array prototype semantics and keeps the
-    /// owning object rooted; no helper or vector resize may run while the returned pointer lives.
-    pub(crate) fn jit_packed_numeric_slots(&mut self, len: usize) -> Option<*mut Vec<Property>> {
-        if len == 0 || self.proto_flag.get() || self.has_far.get() {
-            return None;
-        }
-        let packed = self.elems.packed_mut()?;
-        if packed.len() < len
-            || packed[..len].iter().any(|p| {
-                p.accessor() || !p.writable() || !matches!(p.value(), Value::Empty | Value::Num(_))
-            })
-        {
-            return None;
-        }
-        Some(packed as *mut Vec<Property>)
-    }
-
     /// Mark this map as an array's (see `elem_mode`). One-way, set when the owning object
     /// becomes `Exotic::Array`.
     #[inline]
