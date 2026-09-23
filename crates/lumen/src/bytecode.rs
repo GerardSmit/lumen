@@ -22,6 +22,7 @@ mod call_spread;
 pub(crate) mod array_destructure;
 pub(crate) mod array_iterator_step;
 mod for_in;
+pub(crate) mod jit;
 mod name_path;
 mod object_literal;
 mod parameters;
