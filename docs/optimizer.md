@@ -3954,3 +3954,13 @@ and `fresh-call-gated-*` for the current revision. The stopped batch is explicit
 marked `stopped_by_user`; pre-lint artifacts are separately preserved. These raw
 archives live outside the repository. This draft preserves the experiment for
 review, not as a completed performance milestone. The within-2x objective is unmet.
+
+### Scheduler specialization removed (2026-09-23)
+
+The Richards scheduler specialization described in earlier entries (scheduler
+shell, Active/Idle/Worker/Handler/Device task regions, role and graph epochs, the
+pc59 role dispatch, and the extended x23..x28 scheduler frame) has been removed
+from the ARM64 JIT as benchmark-specific: it matched one program's structure and
+was not exercised by real code. Every chunk now uses the compact 112-byte frame.
+Generic region lowering (linked scan, numeric diamond, numeric CFG, loop chains)
+is unchanged.
