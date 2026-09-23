@@ -818,31 +818,31 @@ fn gc_keeps_reachable_cycles() {
 }
 
 #[test]
-fn gc_registry_reuses_dead_object_slots() {
-    
-
-    let (slots_before, _) = crate::value::gc_registry_stats();
+fn gc_heap_reuses_dead_object_slots() {
+    // Churn reuses freed slab slots instead of mapping new chunks.
+    let chunks_before = crate::value::gc_heap_chunks();
     for _ in 0..200_000 {
         drop(crate::value::Object::new(None));
     }
-    let (slots_after, free_after) = crate::value::gc_registry_stats();
+    let chunks_after = crate::value::gc_heap_chunks();
     assert!(
-        slots_after <= slots_before + 1,
-        "registry grew with cumulative churn: {slots_before} -> {slots_after}"
+        chunks_after <= chunks_before + 1,
+        "heap grew with cumulative churn: {chunks_before} -> {chunks_after} chunks"
     );
-    assert!(free_after > 0);
 
-    // A live raw slot must become a strong snapshot handle, then tombstone synchronously when
-    // the final owner disappears; the same slot can be reused without retaining the dead RcBox.
+    // A live object is enumerated by the snapshot; once its final owner is gone its slot is free
+    // and is the next one handed out.
     let object = crate::value::Object::new(None);
     let ptr = crate::value::Gc::as_ptr(&object);
     let snapshot = crate::value::gc_snapshot();
     assert!(snapshot.iter().any(|o| crate::value::Gc::as_ptr(o) == ptr));
     drop(snapshot);
     drop(object);
-    let (slots_final, free_final) = crate::value::gc_registry_stats();
-    assert_eq!(slots_final, slots_after);
-    assert_eq!(free_final, free_after);
+    assert!(!crate::value::gc_snapshot()
+        .iter()
+        .any(|o| crate::value::Gc::as_ptr(o) == ptr));
+    let next = crate::value::Object::new(None);
+    assert_eq!(crate::value::Gc::as_ptr(&next), ptr);
 }
 
 #[test]
