@@ -80,7 +80,7 @@ fn describe_callee(target: &crate::bytecode::InlineTarget) -> String {
     let Some(object) = target.pin.upgrade() else {
         return "callee_object=0 callee_function=0".into();
     };
-    let object_id = Rc::as_ptr(&object) as usize;
+    let object_id = crate::value::Gc::as_ptr(&object) as usize;
     let Ok(borrowed) = object.try_borrow() else {
         return format!("callee_object={object_id} callee_borrowed=true");
     };

@@ -51,8 +51,8 @@ impl FnFrame {
     pub fn callee(&self) -> Gc {
         let p = self.fn_ptr as *const RefCell<crate::value::Object>;
         unsafe {
-            Rc::increment_strong_count(p);
-            Rc::from_raw(p)
+            Gc::increment_strong_count(p);
+            Gc::from_raw(p)
         }
     }
 }
@@ -61,7 +61,7 @@ impl FnFrame {
 /// active locations become explicit roots during collection, inactive targets remain collectable.
 pub(crate) struct InlineFrame {
     pub parent: Option<Rc<InlineFrame>>,
-    pub callee: Weak<RefCell<crate::value::Object>>,
+    pub callee: crate::value::WeakGc,
     pub strict: bool,
 }
 
@@ -75,8 +75,8 @@ impl ReflectedFrame {
     pub fn callee(&self) -> Gc {
         let pointer = self.fn_ptr as *const RefCell<crate::value::Object>;
         unsafe {
-            Rc::increment_strong_count(pointer);
-            Rc::from_raw(pointer)
+            Gc::increment_strong_count(pointer);
+            Gc::from_raw(pointer)
         }
     }
 }

@@ -85,7 +85,7 @@ mod tests {
             sites: vec![(
                 12,
                 RefCell::new(Site {
-                    callee: Weak::new(),
+                    callee: crate::value::WeakGc::new(),
                     version: Version::Cold,
                     outcome: Outcome::Cold,
                     native: None,

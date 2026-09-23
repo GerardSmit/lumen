@@ -83,14 +83,14 @@ mod tests {
         property.set_getter(Some(Value::Obj(target.clone())));
         property.set_setter(Some(Value::Obj(target.clone())));
         assert!(!property.accessor());
-        let before = Rc::strong_count(&target);
+        let before = Gc::strong_count(&target);
         let mut refs = Vec::new();
         property.append_object_refs(&mut refs);
         assert_eq!(refs.len(), 3);
-        assert!(refs.iter().all(|edge| Rc::ptr_eq(edge, &target)));
-        assert_eq!(Rc::strong_count(&target), before + 3);
+        assert!(refs.iter().all(|edge| Gc::ptr_eq(edge, &target)));
+        assert_eq!(Gc::strong_count(&target), before + 3);
         refs.clear();
-        assert_eq!(Rc::strong_count(&target), before);
+        assert_eq!(Gc::strong_count(&target), before);
     }
 
     #[test]
@@ -126,22 +126,22 @@ mod tests {
                 Property::data(Value::Num(f64::NAN), true, true, true),
             );
         }
-        let before = Rc::strong_count(&target);
+        let before = Gc::strong_count(&target);
         let mut refs = vec![target.clone()];
         object_refs_into(&object, &mut refs);
         assert_eq!(refs.len(), 5);
         assert_eq!(
             refs.iter()
-                .filter(|value| Rc::ptr_eq(value, &target))
+                .filter(|value| Gc::ptr_eq(value, &target))
                 .count(),
             4
         );
-        assert_eq!(Rc::strong_count(&target), before + 4);
+        assert_eq!(Gc::strong_count(&target), before + 4);
         for value in &refs {
             drop(value.borrow_mut());
         }
         refs.clear();
-        assert_eq!(Rc::strong_count(&target), before);
+        assert_eq!(Gc::strong_count(&target), before);
         object.borrow_mut().props.remove("self");
     }
 }

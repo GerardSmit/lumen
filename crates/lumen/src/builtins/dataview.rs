@@ -268,7 +268,7 @@ pub(super) fn install_dataview(it: &mut Interp) {
         // ArrayBuffer, so ToNumber(byteOffset) must run before the detached check throws.
         let (bv, bp) = match arg(a, 0) {
             Value::Obj(o) if o.borrow().props.contains("__abMaxByteLength") => {
-                (Value::Obj(o.clone()), Rc::as_ptr(&o) as usize)
+                (Value::Obj(o.clone()), Gc::as_ptr(&o) as usize)
             }
             _ => return Err(i.make_error("TypeError", "DataView requires an ArrayBuffer")),
         };
@@ -320,7 +320,7 @@ pub(super) fn install_dataview(it: &mut Interp) {
         // A length-tracking DataView (no explicit byteLength) over a resizable buffer follows the
         // buffer's current length; its stored `len` is only the initial snapshot.
         let track = !has_len && resizable;
-        let p = Rc::as_ptr(&obj) as usize;
+        let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         i.data_views.insert(p, (bp, offset, len, track));
         // buffer/byteOffset/byteLength are accessor getters on the prototype, not own properties;

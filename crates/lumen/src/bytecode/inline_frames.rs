@@ -173,7 +173,7 @@ mod tests {
             .get("target")
             .unwrap()
             .value();
-        let weak = Rc::downgrade(target.as_obj().unwrap());
+        let weak = crate::value::Gc::downgrade(target.as_obj().unwrap());
         drop(target);
         match engine.eval("drive(); 'passed'", false).unwrap() {
             Completion::Value(v) => assert_eq!(v, "passed"),

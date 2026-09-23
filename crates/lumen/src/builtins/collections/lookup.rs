@@ -1,4 +1,5 @@
 //! Borrowed collection reads shared by native methods and guarded JIT calls.
+use crate::value::Gc;
 use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::interpreter::Interp;
 use crate::value::{NativeFn, Value};
@@ -30,7 +31,7 @@ fn data<'a>(
     let object = this.as_obj().ok_or_else(err)?;
     let data = i
         .map_data
-        .get(&(Rc::as_ptr(object) as usize))
+        .get(&(Gc::as_ptr(object) as usize))
         .ok_or_else(err)?;
     if data.kind() != kind {
         return Err(err());

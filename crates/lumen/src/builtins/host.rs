@@ -63,7 +63,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
     });
     it.def_method(&host, "detachArrayBuffer", 1, |i, _t, args| {
         if let Value::Obj(o) = arg(args, 0) {
-            let p = Rc::as_ptr(&o) as usize;
+            let p = Gc::as_ptr(&o) as usize;
             // Truly detach: drop the backing store (so views see it as detached) and zero the views.
             i.array_buffers.remove(&p);
             let views: Vec<usize> = i
@@ -132,7 +132,7 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
 /// Reconstruct a SharedArrayBuffer object in this agent that aliases the global shared block `id`.
 fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.array_buffers.insert(p, vec![0u8; len]); // length placeholder; bytes live in the registry
     set_internal(&obj, "__abMaxByteLength", Value::Num(len as f64));
@@ -171,7 +171,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         // Accept a SharedArrayBuffer directly, or a TypedArray view over one.
         let p = match sab.as_obj() {
             Some(o) => {
-                let p = Rc::as_ptr(o) as usize;
+                let p = Gc::as_ptr(o) as usize;
                 if i.shared_buffers.contains_key(&p) {
                     p
                 } else if let Some(info) = i.typed_arrays.get(&p) {

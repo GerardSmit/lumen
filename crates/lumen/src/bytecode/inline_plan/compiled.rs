@@ -32,7 +32,7 @@ pub(crate) fn record(function: &Function, chunk: &Chunk) {
             format!("\"root_source\":{}", diagnostics::source(function)),
             format!(
                 "\"target_index\":{index},\"callee_object\":{}",
-                Rc::as_ptr(&object) as usize
+                crate::value::Gc::as_ptr(&object) as usize
             ),
             format!(
                 "\"callee_function\":{},\"callee_source\":{}",

@@ -1,4 +1,5 @@
 //! Opt-in iterator entry feedback and experimental native execution.
+use crate::value::Gc;
 use super::{Chunk, Op};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::{Callable, Object, Value};
@@ -16,7 +17,7 @@ mod execution;
 use classification::{Outcome, Version};
 
 struct Site {
-    callee: Weak<RefCell<Object>>,
+    callee: crate::value::WeakGc,
     version: Version,
     outcome: Outcome,
     native: Option<crate::jit::iterator_entry::Entry>,
@@ -45,7 +46,7 @@ impl Feedback {
                 (
                     pc,
                     RefCell::new(Site {
-                        callee: Weak::new(),
+                        callee: crate::value::WeakGc::new(),
                         version: Version::Cold,
                         outcome: Outcome::Cold,
                         native: None,
@@ -83,7 +84,7 @@ impl Feedback {
             self.record("non-user");
             return;
         };
-        if !interp.ordinary_get_ptr(Rc::as_ptr(object) as usize) || !object_ref.ic_plain.get() {
+        if !interp.ordinary_get_ptr(Gc::as_ptr(object) as usize) || !object_ref.ic_plain.get() {
             self.record("nonordinary-callee");
             return;
         }
@@ -92,9 +93,9 @@ impl Feedback {
             return;
         }
         let version = classification::version(&user.func);
-        let same = site.callee.as_ptr() == Rc::as_ptr(object);
+        let same = site.callee.as_ptr() == Gc::as_ptr(object);
         if !same || site.version != version || matches!(site.outcome, Outcome::Cold) {
-            site.callee = Rc::downgrade(object);
+            site.callee = Gc::downgrade(object);
             site.version = version;
             site.outcome = classification::classify(&user.func);
             let reused = self.execute
@@ -229,7 +230,7 @@ mod tests {
             let feedback = chunk.iterator_entry_feedback.as_ref().unwrap();
             assert_eq!(
                 feedback.sites[0].1.borrow().callee.as_ptr(),
-                Rc::as_ptr(&original)
+                Gc::as_ptr(&original)
             );
             drop(object);
             COUNTS.with(|c| c.borrow_mut().0.clear());
@@ -302,7 +303,7 @@ mod tests {
                 (
                     pc,
                     RefCell::new(Site {
-                        callee: Weak::new(),
+                        callee: crate::value::WeakGc::new(),
                         version: Version::Cold,
                         outcome: Outcome::Cold,
                         native: None,
@@ -331,7 +332,7 @@ mod tests {
             let Value::Obj(first_obj) = &first else {
                 panic!("callable")
             };
-            let owners = Rc::strong_count(first_obj);
+            let owners = Gc::strong_count(first_obj);
             let value = fallback(
                 &chunk,
                 pc,
@@ -341,10 +342,10 @@ mod tests {
             )
             .unwrap_or_else(|_| panic!("successful first next"));
             assert!(matches!(value, Some(Value::Num(7.0))));
-            assert_eq!(Rc::strong_count(first_obj), owners);
+            assert_eq!(Gc::strong_count(first_obj), owners);
             assert_eq!(
                 feedback.sites[0].1.borrow().callee.as_ptr(),
-                Rc::as_ptr(first_obj)
+                Gc::as_ptr(first_obj)
             );
             let value = fallback(&chunk, pc, &mut engine.interp, iterator, second.clone())
                 .unwrap_or_else(|_| panic!("successful second next"));
@@ -354,7 +355,7 @@ mod tests {
             };
             assert_eq!(
                 feedback.sites[0].1.borrow().callee.as_ptr(),
-                Rc::as_ptr(second_obj)
+                Gc::as_ptr(second_obj)
             );
             if !matches!(tier, Tier::Interp) {
                 assert!(matches!(

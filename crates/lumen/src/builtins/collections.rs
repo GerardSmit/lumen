@@ -1,5 +1,6 @@
 //! Collection installation and constructors; storage and method families have separate owners.
 
+use crate::value::Gc;
 use super::collection_data::{CollectionData, CollectionKind};
 use super::{ab, new_from_ctor, set_to_string_tag, step_iter_with};
 use crate::interpreter::Interp;
@@ -59,7 +60,7 @@ fn collection_ctor(i: &mut Interp, args: &[Value], kind: CollectionKind) -> Resu
     let name = kind.name();
     let is_set = matches!(kind, CollectionKind::Set | CollectionKind::WeakSet);
     let obj = new_from_ctor(i, name)?;
-    let ptr = Rc::as_ptr(&obj) as usize;
+    let ptr = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.map_data.insert(ptr, CollectionData::new(kind));
     let mv = Value::Obj(obj);

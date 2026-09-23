@@ -1,4 +1,5 @@
 //! Owned collection insertion shared by native methods and consuming JIT helpers.
+use crate::value::Gc;
 use super::canonicalize_map_key;
 use crate::builtins::{
     arg,
@@ -27,7 +28,7 @@ fn data<'a>(
 ) -> Option<&'a mut CollectionData> {
     let object = this.as_obj()?;
     i.map_data
-        .get_mut(&(Rc::as_ptr(object) as usize))
+        .get_mut(&(Gc::as_ptr(object) as usize))
         .filter(|data| data.kind() == kind)
 }
 

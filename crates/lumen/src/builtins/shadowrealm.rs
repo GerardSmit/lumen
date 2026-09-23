@@ -16,7 +16,7 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
             return Err(i.make_error("TypeError", "ShadowRealm constructor requires 'new'"));
         }
         let obj = Object::new(i.extra_protos.get("ShadowRealm").cloned());
-        let p = Rc::as_ptr(&obj) as usize;
+        let p = Gc::as_ptr(&obj) as usize;
         i.shadow_realms.insert(p, Box::new(Interp::new()));
         Ok(Value::Obj(obj))
     });

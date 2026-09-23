@@ -95,7 +95,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             ));
         }
         // Setting on %Error.prototype% itself throws (it emulates a non-writable home property).
-        if Rc::ptr_eq(&o, &i.error_protos["Error"]) {
+        if Gc::ptr_eq(&o, &i.error_protos["Error"]) {
             return Err(i.make_error("TypeError", "cannot set stack on %Error.prototype%"));
         }
         // [[GetOwnProperty]]("stack") (proxy-aware): does the receiver already have its own stack?

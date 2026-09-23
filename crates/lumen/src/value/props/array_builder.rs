@@ -91,21 +91,21 @@ mod tests {
     fn owned_and_raw_builders_transfer_duplicate_owners_once() {
         for len in [2, 10, 11, 32] {
             let child = Object::new(None);
-            let initial = Rc::strong_count(&child);
+            let initial = crate::value::Gc::strong_count(&child);
             let values: Vec<_> = (0..len).map(|_| Value::Obj(child.clone())).collect();
             let props = Props::packed_array_from_values(values.into_iter());
-            assert_eq!(Rc::strong_count(&child), initial + len);
+            assert_eq!(crate::value::Gc::strong_count(&child), initial + len);
             drop(props);
-            assert_eq!(Rc::strong_count(&child), initial);
+            assert_eq!(crate::value::Gc::strong_count(&child), initial);
             let mut values: Vec<_> = (0..len).map(|_| Value::Obj(child.clone())).collect();
             let ptr = values.as_mut_ptr();
             // Relinquish the initialized prefix before the raw ownership transfer.
             unsafe { values.set_len(0) };
             let props = unsafe { Props::packed_array_from_raw(ptr, len) };
-            assert_eq!(Rc::strong_count(&child), initial + len);
+            assert_eq!(crate::value::Gc::strong_count(&child), initial + len);
             drop(props);
             drop(values);
-            assert_eq!(Rc::strong_count(&child), initial);
+            assert_eq!(crate::value::Gc::strong_count(&child), initial);
         }
     }
 
@@ -113,7 +113,7 @@ mod tests {
     fn iterator_panic_releases_initialized_inline_and_heap_owners() {
         for len in [10, 11] {
             let child = Object::new(None);
-            let initial = Rc::strong_count(&child);
+            let initial = crate::value::Gc::strong_count(&child);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Props::packed_array_from_values((0..len).map(|index| {
                     assert!(index != 3, "deliberate iterator panic");
@@ -121,7 +121,7 @@ mod tests {
                 }))
             }));
             assert!(result.is_err());
-            assert_eq!(Rc::strong_count(&child), initial);
+            assert_eq!(crate::value::Gc::strong_count(&child), initial);
         }
     }
 
@@ -135,11 +135,11 @@ mod tests {
         ));
         let child = Object::new(None);
         let values = vec![Value::Obj(child.clone()); 33];
-        let initial = Rc::strong_count(&child) - 33;
+        let initial = crate::value::Gc::strong_count(&child) - 33;
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Props::packed_array_from_values(values.into_iter())
         }))
         .is_err());
-        assert_eq!(Rc::strong_count(&child), initial);
+        assert_eq!(crate::value::Gc::strong_count(&child), initial);
     }
 }

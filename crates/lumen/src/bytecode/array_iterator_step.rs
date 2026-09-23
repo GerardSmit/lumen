@@ -1,4 +1,5 @@
 //! Elide a yielded Array Iterator result while retaining the real iterator for close.
+use crate::value::Gc;
 use crate::{
     interpreter::Interp,
     value::{Exotic, Value},
@@ -20,7 +21,7 @@ pub(crate) fn install(i: &mut Interp) {
 /// execute the original iterator_step. Exhaustion deliberately remains on that path.
 pub(super) fn try_yield(i: &Interp, iterator: &Value, captured_next: &Value) -> Option<Value> {
     let expected = i.extra_protos.get(ENABLED_NEXT)?;
-    if !matches!(captured_next, Value::Obj(actual) if Rc::ptr_eq(actual, expected)) {
+    if !matches!(captured_next, Value::Obj(actual) if Gc::ptr_eq(actual, expected)) {
         return None;
     }
     let Value::Obj(object) = iterator else {

@@ -9,7 +9,7 @@ impl Interp {
     /// Derived constructors still need a TDZ this binding, super rebinding and return checks.
     pub(super) fn constructor_body_can_compile(&self, constructor: &Gc) -> bool {
         self.class_info
-            .get(&(Rc::as_ptr(constructor) as usize))
+            .get(&(Gc::as_ptr(constructor) as usize))
             .is_none_or(|info| !info.derived)
     }
 }

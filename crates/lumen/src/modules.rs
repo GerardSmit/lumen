@@ -12,6 +12,7 @@
 //! Specifier resolution + source fetching is delegated to a host loader (`Interp::module_loader`)
 //! so the engine stays filesystem-agnostic.
 
+use crate::value::Gc;
 use crate::ast::*;
 use crate::builtins::make_bound_len;
 use crate::interpreter::{new_scope, Abrupt, Binding, Env, Interp};
@@ -134,7 +135,7 @@ impl Interp {
         self.inner_module_evaluation_async(key, &mut stack, &mut 0);
         self.run_agent_event_loop();
         if let Value::Obj(o) = &top {
-            if let Some(ps) = self.promises.get(&(Rc::as_ptr(o) as usize)) {
+            if let Some(ps) = self.promises.get(&(Gc::as_ptr(o) as usize)) {
                 if ps.status == 2 {
                     let reason = ps.value.clone();
                     return Err(Abrupt::Throw(reason));
@@ -805,7 +806,7 @@ impl Interp {
         }
         ns.borrow_mut().extensible = false;
         ns.borrow().ic_plain.set(false);
-        self.module_ns.insert(Rc::as_ptr(ns) as usize, live);
+        self.module_ns.insert(Gc::as_ptr(ns) as usize, live);
         Ok(())
     }
 
@@ -839,13 +840,13 @@ impl Interp {
             }
             dst.extensible = false;
         }
-        if let Some(live) = self.module_ns.get(&(Rc::as_ptr(base_o) as usize)).cloned() {
+        if let Some(live) = self.module_ns.get(&(Gc::as_ptr(base_o) as usize)).cloned() {
             dns.borrow().ic_plain.set(false);
-            self.module_ns.insert(Rc::as_ptr(&dns) as usize, live);
+            self.module_ns.insert(Gc::as_ptr(&dns) as usize, live);
         }
         dns.borrow().ic_plain.set(false);
         self.deferred_ns
-            .insert(Rc::as_ptr(&dns) as usize, dep.to_string());
+            .insert(Gc::as_ptr(&dns) as usize, dep.to_string());
         self.deferred_ns_objs
             .insert(dep.to_string(), Value::Obj(dns.clone()));
         Value::Obj(dns)
@@ -870,7 +871,7 @@ impl Interp {
             // A stub minted mid-link for a cyclic dependency copied an empty export table —
             // hydrate it from the real namespace now that the module is linked and evaluated.
             if let Some(Value::Obj(stub)) = self.deferred_ns_objs.get(key).cloned() {
-                let hydrated = self.module_ns.contains_key(&(Rc::as_ptr(&stub) as usize));
+                let hydrated = self.module_ns.contains_key(&(Gc::as_ptr(&stub) as usize));
                 if !hydrated {
                     let base = self.module_recs[key].ns.clone();
                     if let Value::Obj(base_o) = &base {
@@ -894,10 +895,10 @@ impl Interp {
                             }
                         }
                         if let Some(live) =
-                            self.module_ns.get(&(Rc::as_ptr(base_o) as usize)).cloned()
+                            self.module_ns.get(&(Gc::as_ptr(base_o) as usize)).cloned()
                         {
                             stub.borrow().ic_plain.set(false);
-                            self.module_ns.insert(Rc::as_ptr(&stub) as usize, live);
+                            self.module_ns.insert(Gc::as_ptr(&stub) as usize, live);
                         }
                     }
                 }
@@ -1304,10 +1305,10 @@ impl Interp {
                     }
                 };
             if let Value::Obj(o) = &top {
-                self.generators.insert(Rc::as_ptr(o) as usize, coro);
+                self.generators.insert(Gc::as_ptr(o) as usize, coro);
             }
             let top_key = match &top {
-                Value::Obj(o) => Rc::as_ptr(o) as usize,
+                Value::Obj(o) => Gc::as_ptr(o) as usize,
                 _ => return,
             };
             self.drive_async(
@@ -1622,7 +1623,7 @@ impl Interp {
 fn same_binding(a: &Resolution, b: &Resolution) -> bool {
     match (a, b) {
         (Resolution::Local(e1, l1), Resolution::Local(e2, l2)) => Rc::ptr_eq(e1, e2) && l1 == l2,
-        (Resolution::Ns(Value::Obj(o1)), Resolution::Ns(Value::Obj(o2))) => Rc::ptr_eq(o1, o2),
+        (Resolution::Ns(Value::Obj(o1)), Resolution::Ns(Value::Obj(o2))) => Gc::ptr_eq(o1, o2),
         (Resolution::DeferNs(d1), Resolution::DeferNs(d2)) => d1 == d2,
         _ => false,
     }

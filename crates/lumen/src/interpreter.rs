@@ -768,7 +768,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
 
 struct ConstructIc {
     call: crate::bytecode::CallIc,
-    pin: std::rc::Weak<RefCell<crate::value::Object>>,
+    pin: crate::value::WeakGc,
     /// Shape and own-entry slot of the constructor's `prototype` data property. The slot's
     /// value is deliberately read live on every `new`, so `F.prototype = other` remains visible
     /// without invalidation; the shape guard only removes the repeated string-map lookup.
@@ -824,7 +824,7 @@ pub struct Interp {
     /// break when `ic_insert` demotes that state. The Weak prevents allocator ABA while any
     /// cached state compares the encoded raw prototype address.
     pub(crate) creation_pins:
-        crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>,
+        crate::fasthash::FastMap<usize, crate::value::WeakGc>,
     /// Strong pins for every global scope a call cache has ever recorded (see
     /// [`crate::bytecode::CallIc::global_env`]): the cached same-realm proof compares the scope
     /// address raw, so those addresses must never be recycled. Bounded by the number of realms
@@ -895,7 +895,7 @@ pub struct Interp {
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
     /// wrappers), so their fresh instances can reserve enough slots for creation-IC appends.
     pub(crate) construct_capacity_hints:
-        crate::fasthash::FastMap<usize, (std::rc::Weak<RefCell<crate::value::Object>>, u8)>,
+        crate::fasthash::FastMap<usize, (crate::value::WeakGc, u8)>,
     /// `Symbol.iterator`, cached so the iterator protocol can look up `obj[@@iterator]` cheaply.
     pub(crate) iterator_sym: Option<Rc<SymbolData>>,
     /// Well-known symbols, minted once per Interp — additional realms (`$262.createRealm()`) reuse
@@ -1280,7 +1280,7 @@ impl Interp {
         // and resolve its intrinsics like any other realm's.
         if self.realms.is_empty() {
             let main = self.snapshot_realm();
-            self.realms.insert(Rc::as_ptr(&main.global) as usize, main);
+            self.realms.insert(Gc::as_ptr(&main.global) as usize, main);
         }
         let saved = self.snapshot_realm();
         let saved_iter = self.iterator_sym.clone();
@@ -1357,11 +1357,11 @@ impl Interp {
                 "__eval_realm",
                 Property::data(Value::Obj(self.global.clone()), false, false, false),
             );
-            self.eval_realm_fns.insert(Rc::as_ptr(ef) as usize);
+            self.eval_realm_fns.insert(Gc::as_ptr(ef) as usize);
         }
 
         let realm_state = self.snapshot_realm();
-        let ptr = Rc::as_ptr(&global) as usize;
+        let ptr = Gc::as_ptr(&global) as usize;
         self.realms.insert(ptr, realm_state);
         self.restore_realm(&saved);
         Value::Obj(global)
@@ -1370,7 +1370,7 @@ impl Interp {
     /// Run `src` as a script in the realm whose global is `realm_global`.
     pub fn eval_in_realm(&mut self, realm_global: &Value, src: &str) -> Result<Value, Abrupt> {
         let ptr = match realm_global {
-            Value::Obj(o) => Rc::as_ptr(o) as usize,
+            Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return Err(self.throw("TypeError", "not a realm global")),
         };
         let realm = match self.realms.get(&ptr) {
@@ -1585,7 +1585,7 @@ impl Interp {
         let main = interp.snapshot_realm();
         interp
             .realms
-            .insert(Rc::as_ptr(&interp.global) as usize, main);
+            .insert(Gc::as_ptr(&interp.global) as usize, main);
         interp
     }
 
@@ -1920,7 +1920,7 @@ impl Interp {
     /// Used by host addons to key per-object native state (`napi_wrap`) and to implement `===`
     /// on objects without exposing the object handle.
     pub fn object_addr(&self, v: &Value) -> Option<usize> {
-        v.as_obj().map(|o| Rc::as_ptr(o) as usize)
+        v.as_obj().map(|o| Gc::as_ptr(o) as usize)
     }
 
     /// Whether `v` has Proxy exotic behavior. Hosts need this for Node's
@@ -2201,7 +2201,7 @@ impl Interp {
         let obj = v.as_obj()?;
         let info = self
             .typed_arrays
-            .get(&(Rc::as_ptr(obj) as usize))
+            .get(&(Gc::as_ptr(obj) as usize))
             .copied()?;
         let len = self.ta_len(&info)?;
         let (code, elem) = match info.kind {
@@ -2369,7 +2369,7 @@ impl Interp {
         let obj = v.as_obj()?;
         let info = self
             .typed_arrays
-            .get(&(Rc::as_ptr(obj) as usize))
+            .get(&(Gc::as_ptr(obj) as usize))
             .copied()?;
         let len = self.ta_len(&info)?;
         self.ta_read_bytes(&info, 0, len)
@@ -2382,7 +2382,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(obj) as usize)).copied() else {
+        let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(obj) as usize)).copied() else {
             return false;
         };
         self.ta_write_bytes(&info, 0, bytes);
@@ -2531,7 +2531,7 @@ impl Interp {
         {
             let b = o.borrow();
             match b.proto.as_ref() {
-                Some(p) if Rc::ptr_eq(p, &self.array_proto) => {}
+                Some(p) if Gc::ptr_eq(p, &self.array_proto) => {}
                 _ => return false,
             }
         }
@@ -2559,9 +2559,9 @@ impl Interp {
         };
         let ap = &self.array_proto;
         let op = &self.object_proto;
-        let ok = self.ordinary_get_ptr(Rc::as_ptr(ap) as usize)
-            && self.ordinary_get_ptr(Rc::as_ptr(op) as usize)
-            && matches!(ap.borrow().proto.as_ref(), Some(p) if Rc::ptr_eq(p, op))
+        let ok = self.ordinary_get_ptr(Gc::as_ptr(ap) as usize)
+            && self.ordinary_get_ptr(Gc::as_ptr(op) as usize)
+            && matches!(ap.borrow().proto.as_ref(), Some(p) if Gc::ptr_eq(p, op))
             && op.borrow().proto.is_none()
             && matches!(op.borrow().exotic, Exotic::None)
             && no_index_keys(ap)
@@ -2582,7 +2582,7 @@ impl Interp {
             return false;
         }
         if !self.module_ns.is_empty() || !self.deferred_ns.is_empty() {
-            let ptr = Rc::as_ptr(o) as usize;
+            let ptr = Gc::as_ptr(o) as usize;
             if self.module_ns.contains_key(&ptr) || self.deferred_ns.contains_key(&ptr) {
                 return false;
             }
@@ -2622,7 +2622,7 @@ impl Interp {
             return Err(v);
         }
         if (!self.module_ns.is_empty() || !self.deferred_ns.is_empty()) && {
-            let ptr = Rc::as_ptr(o) as usize;
+            let ptr = Gc::as_ptr(o) as usize;
             self.module_ns.contains_key(&ptr) || self.deferred_ns.contains_key(&ptr)
         } {
             return Err(v);
@@ -2642,7 +2642,7 @@ impl Interp {
         // remain under this single borrow.
         if !matches!(b.exotic, Exotic::Array)
             || !b.extensible
-            || !matches!(b.proto.as_ref(), Some(p) if Rc::ptr_eq(p, &self.array_proto))
+            || !matches!(b.proto.as_ref(), Some(p) if Gc::ptr_eq(p, &self.array_proto))
             || !self.array_prototypes_unshadowed()
         {
             return Err(v);
@@ -2776,7 +2776,7 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
     ) -> Option<Value> {
-        let head = Rc::as_ptr(o);
+        let head = Gc::as_ptr(o);
         // PROP_IC_WAYS ways per site (polymorphic receivers — subclass hierarchies rotating
         // through one access site — miss fewer ways constantly): probe all, then the global
         // stub cache (unbounded polymorphism), then re-derive into way 1 with the older ways
@@ -2863,7 +2863,7 @@ impl Interp {
                     return None;
                 }
                 match b.proto.as_ref() {
-                    Some(p) => cur = Rc::as_ptr(p),
+                    Some(p) => cur = Gc::as_ptr(p),
                     None => {
                         return if k + 1 == levels {
                             Some(Value::Undefined)
@@ -2908,7 +2908,7 @@ impl Interp {
                         }
                     }
                 } else if let Some(pr) = rb.proto.as_ref() {
-                    let mut hp = Rc::as_ptr(pr);
+                    let mut hp = Gc::as_ptr(pr);
                     drop(rb); // the next hop is a different object; release the borrow
                               // Validate each intermediate hop's shape (a match proves it still lacks
                               // the name), following live protos.
@@ -2924,7 +2924,7 @@ impl Interp {
                             return None;
                         }
                         match mb.proto.as_ref() {
-                            Some(p) => hp = Rc::as_ptr(p),
+                            Some(p) => hp = Gc::as_ptr(p),
                             None => return None,
                         }
                     }
@@ -2956,7 +2956,7 @@ impl Interp {
     ) -> Option<Value> {
         use crate::bytecode::{IcState, IC_MAX_DEPTH};
         type ObjCell = std::cell::RefCell<Object>;
-        let head = Rc::as_ptr(o);
+        let head = Gc::as_ptr(o);
         // Re-derive: walk the chain by raw pointer (every object is kept alive transitively by
         // `o`, nothing mutates during the read). On a plain data hit within reach record
         // (depth, slot, receiver shape, holder shape); a non-plain level or accessor defers to
@@ -3036,7 +3036,7 @@ impl Interp {
                     mid2 = Some(b.props.shape());
                 }
                 match b.proto.as_ref() {
-                    Some(p) => cur = Rc::as_ptr(p),
+                    Some(p) => cur = Gc::as_ptr(p),
                     None => {
                         // Chain ended: the property is absent. Cache that (the cheapest read
                         // there is) when every level was a plain ordinary object and the
@@ -3197,7 +3197,7 @@ impl Interp {
         if b.extensible {
             let shape = b.props.shape();
             let epoch = crate::value::proto_epoch();
-            let proto_ptr = b.proto.as_ref().map_or(0, |p| Rc::as_ptr(p) as usize);
+            let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
             for way in 0..crate::bytecode::PROP_IC_WAYS {
                 let st = self.ic_way(cache, way).get();
                 if st.depth == crate::bytecode::IC_CREATE
@@ -3272,7 +3272,7 @@ impl Interp {
         if epoch == u32::MAX {
             return false;
         }
-        let proto_ptr = b.proto.as_ref().map_or(0, |p| Rc::as_ptr(p) as usize);
+        let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
         // Bound the pin map for cache-churn-heavy embedders (per-request eval): existing sites
         // keep hitting; new sites just stop caching once the budget is spent.
         if self.creation_pins.len() >= 65536 && !self.creation_pins.contains_key(&proto_ptr) {
@@ -3331,7 +3331,7 @@ impl Interp {
                 mid2_shape: ((proto_ptr as u64) >> 32) as u32,
             },
         );
-        let pin = cur.take().map(|p| Rc::downgrade(&p)).unwrap_or_default();
+        let pin = cur.take().map(|p| Gc::downgrade(&p)).unwrap_or_default();
         self.creation_pins.insert(proto_ptr, pin);
         true
     }
@@ -3377,7 +3377,7 @@ impl Interp {
         {
             return Ok(());
         }
-        let module_key = match self.deferred_ns.get(&(Rc::as_ptr(o) as usize)) {
+        let module_key = match self.deferred_ns.get(&(Gc::as_ptr(o) as usize)) {
             Some(k) => k.clone(),
             None => return Ok(()),
         };
@@ -3444,7 +3444,7 @@ impl Interp {
             },
             Value::Obj(o) => {
                 let o = o.clone();
-                let ptr = Rc::as_ptr(&o) as usize;
+                let ptr = Gc::as_ptr(&o) as usize;
                 // A mapped `arguments` index aliases its parameter binding.
                 if !self.mapped_arguments.is_empty() {
                     if let Some(name) = self.mapped_arg_name(ptr, key) {
@@ -3558,7 +3558,7 @@ impl Interp {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&obj, Some(key))?;
             // A proxy anywhere on the chain handles the read itself (with the original receiver).
-            let ptr = Rc::as_ptr(&obj) as usize;
+            let ptr = Gc::as_ptr(&obj) as usize;
             if let Some((target, handler)) = self.proxy_at(ptr) {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
@@ -3606,7 +3606,7 @@ impl Interp {
                     // yields undefined instead of throwing.
                     if matches!(key, "caller" | "arguments")
                         && self.is_throw_type_error(&p.get)
-                        && !Rc::ptr_eq(
+                        && !Gc::ptr_eq(
                             &obj,
                             match receiver {
                                 Value::Obj(r) => r,
@@ -3630,7 +3630,7 @@ impl Interp {
                                 // arguments object / calling function (null when inactive; a
                                 // strict caller is censored to null). Eval runs inline, so eval
                                 // frames are naturally skipped.
-                                let rptr = Rc::as_ptr(r) as usize;
+                                let rptr = Gc::as_ptr(r) as usize;
                                 let frames = self.reflected_frames();
                                 let top = frames.iter().rposition(|fr| fr.fn_ptr == rptr);
                                 return Ok(match (key, top) {
@@ -3699,7 +3699,7 @@ impl Interp {
     /// Whether `v` is the [[IsHTMLDDA]] object.
     pub(crate) fn is_htmldda(&self, v: &Value) -> bool {
         match v {
-            Value::Obj(o) => self.htmldda.iter().any(|d| Rc::ptr_eq(o, d)),
+            Value::Obj(o) => self.htmldda.iter().any(|d| Gc::ptr_eq(o, d)),
             _ => false,
         }
     }
@@ -3707,7 +3707,7 @@ impl Interp {
     /// Whether `getter` is the %ThrowTypeError% intrinsic.
     fn is_throw_type_error(&self, getter: &Option<Value>) -> bool {
         match (getter, self.extra_protos.get("%ThrowTypeError%")) {
-            (Some(Value::Obj(g)), Some(tte)) => Rc::ptr_eq(g, tte),
+            (Some(Value::Obj(g)), Some(tte)) => Gc::ptr_eq(g, tte),
             _ => false,
         }
     }
@@ -3797,7 +3797,7 @@ impl Interp {
         // (and the own property, so unmapped reads and enumeration stay consistent).
         if !self.mapped_arguments.is_empty() {
             if let Value::Obj(o) = base {
-                let ptr = Rc::as_ptr(o) as usize;
+                let ptr = Gc::as_ptr(o) as usize;
                 if let Some(name) = self.mapped_arg_name(ptr, key) {
                     if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
                         let env = env.clone();
@@ -3844,7 +3844,7 @@ impl Interp {
                 let mut cur = proto;
                 while let Some(o) = cur {
                     // A proxy on the chain (or any accessor) takes over with the original receiver.
-                    if self.proxies.contains_key(&(Rc::as_ptr(&o) as usize)) {
+                    if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
                         return self.set_member_recv(&Value::Obj(o), key, value, receiver);
                     }
                     let prop = o.borrow().props.get(key).cloned();
@@ -3885,7 +3885,7 @@ impl Interp {
             }
         };
 
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         // A module namespace exotic object's [[Set]] always fails: in strict code (all module code
         // is strict) the assignment throws a TypeError; a sloppy caller sees an inert no-op. The
         // property is resolved first, so a binding still in its TDZ throws ReferenceError instead.
@@ -3958,7 +3958,7 @@ impl Interp {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&o, Some(key))?;
             // A proxy on the chain handles the write itself (with the original receiver).
-            let optr = Rc::as_ptr(&o) as usize;
+            let optr = Gc::as_ptr(&o) as usize;
             if let Some((target, handler)) = self.proxies.get(&optr).cloned() {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'set' on a revoked proxy"));
@@ -3990,10 +3990,10 @@ impl Interp {
             // properties, so the search must stop here (never consulting the TA prototype's
             // accessors). A valid index is a writable data property → create one on the receiver; a
             // canonical-numeric non-index is an inert success.
-            if !Rc::ptr_eq(&o, &obj) {
+            if !Gc::ptr_eq(&o, &obj) {
                 if let Some(info) = self.typed_arrays.get(&optr).copied() {
                     match self.ta_index_kind(&info, key) {
-                        TaIndex::Element(_) | TaIndex::Exotic if matches!(&receiver, Value::Obj(r) if Rc::ptr_eq(r, &o)) =>
+                        TaIndex::Element(_) | TaIndex::Exotic if matches!(&receiver, Value::Obj(r) if Gc::ptr_eq(r, &o)) =>
                         {
                             // The receiver IS this TypedArray: IntegerIndexedElementSet applies
                             // (coerce, then store or silently drop an out-of-range write).
@@ -4035,7 +4035,7 @@ impl Interp {
                         }
                     };
                 }
-                if Rc::ptr_eq(&o, &obj) {
+                if Gc::ptr_eq(&o, &obj) {
                     if !p.writable() {
                         if self.strict {
                             return Err(self.throw(
@@ -4065,10 +4065,10 @@ impl Interp {
         // Reflect.set with an explicit receiver). A namespace receiver rejects the define,
         // probing the binding first so a TDZ export surfaces ReferenceError.
         let obj = match &receiver {
-            Value::Obj(r) if !Rc::ptr_eq(r, &obj) => {
+            Value::Obj(r) if !Gc::ptr_eq(r, &obj) => {
                 // A deferred-namespace receiver evaluates before its own properties are consulted.
                 self.defer_trigger(r, Some(key))?;
-                let rptr = Rc::as_ptr(r) as usize;
+                let rptr = Gc::as_ptr(r) as usize;
                 if self.is_namespace(rptr) {
                     self.ns_probe_tdz(rptr, key)?;
                     if self.strict {
@@ -4319,7 +4319,7 @@ impl Interp {
 
     pub(crate) fn array_length(&self, obj: &Gc) -> usize {
         // A TypedArray's length lives in its info slot, not an own `length` property.
-        if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(obj) as usize)) {
+        if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(obj) as usize)) {
             return self.ta_len(info).unwrap_or(0);
         }
         match obj.borrow().props.length_property().map(|p| p.value()) {
@@ -4501,7 +4501,7 @@ impl Interp {
 
     /// Pin `o` for the lifetime of its side-table entries (see `gc_pins`).
     pub(crate) fn gc_pin(&mut self, o: &Gc) {
-        self.gc_pins.insert(Rc::as_ptr(o) as usize, o.clone());
+        self.gc_pins.insert(Gc::as_ptr(o) as usize, o.clone());
     }
 
     /// A regex-ready view of `s`, cached by string identity: repeated exec/replace/split over the
@@ -4550,7 +4550,7 @@ impl Interp {
         if let Callable::User(user) = &o.borrow().call {
             out.push(user.env.clone());
         }
-        let ptr = Rc::as_ptr(o) as usize;
+        let ptr = Gc::as_ptr(o) as usize;
         if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
             out.push(env.clone());
         }
@@ -4625,7 +4625,7 @@ impl Interp {
         let mut sstack: Vec<Env> = Vec::new();
         for o in &live {
             let internal = o.borrow().gc_refs() as usize;
-            if Rc::strong_count(o) > internal + 1 {
+            if Gc::strong_count(o) > internal + 1 {
                 o.borrow().gc_set_mark();
                 stack.push(o.clone());
             }
@@ -4646,7 +4646,7 @@ impl Interp {
                     continue;
                 }
                 let internal = b.gc_refs() as usize;
-                let strong = Rc::strong_count(o);
+                let strong = Gc::strong_count(o);
                 let keys: Vec<Rc<str>> = b.props.iter().take(4).map(|(k, _)| k).collect();
                 eprintln!("[gc-dump] root strong={strong} internal={internal} props={keys:?}");
                 shown += 1;
@@ -4740,7 +4740,7 @@ impl Interp {
                 {
                     garbage += 1;
                 }
-                let ptr = Rc::as_ptr(o) as usize;
+                let ptr = Gc::as_ptr(o) as usize;
                 self.class_info.remove(&ptr);
                 self.map_data.remove(&ptr);
                 self.typed_arrays.remove(&ptr);
@@ -4838,7 +4838,7 @@ impl Interp {
     pub(crate) fn get_function_realm_global(&mut self, obj: &Gc) -> Result<Option<usize>, Abrupt> {
         let mut cur = obj.clone();
         for _ in 0..64 {
-            if let Some((target, handler)) = self.proxies.get(&(Rc::as_ptr(&cur) as usize)) {
+            if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&cur) as usize)) {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "proxy has been revoked"));
                 }
@@ -4874,7 +4874,7 @@ impl Interp {
             if let Value::Obj(o) = &callee {
                 // A proxy's trap machinery runs in the caller's realm (the trap-arguments array is
                 // a caller-realm Array); invoking the trap function swaps on its own.
-                if !self.proxies.contains_key(&(Rc::as_ptr(o) as usize)) {
+                if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
                     if let Some(gptr) = self.callee_realm_global(o) {
                         let saved = self.snapshot_realm();
                         let target = self.realms[&gptr].snapshot_clone();
@@ -4915,7 +4915,7 @@ impl Interp {
             }
             for (g, rs) in &self.realms {
                 if root == Rc::as_ptr(&rs.global_env) {
-                    if Rc::ptr_eq(&rs.global, &self.global) {
+                    if Gc::ptr_eq(&rs.global, &self.global) {
                         return None;
                     }
                     return Some(*g);
@@ -4925,12 +4925,12 @@ impl Interp {
         let mut cur = obj.borrow().proto.clone();
         let mut hops = 0;
         while let Some(p) = cur {
-            if Rc::ptr_eq(&p, &self.function_proto) {
+            if Gc::ptr_eq(&p, &self.function_proto) {
                 return None;
             }
             for (g, rs) in &self.realms {
-                if Rc::ptr_eq(&p, &rs.function_proto) {
-                    if Rc::ptr_eq(&rs.function_proto, &self.function_proto) {
+                if Gc::ptr_eq(&p, &rs.function_proto) {
+                    if Gc::ptr_eq(&rs.function_proto, &self.function_proto) {
                         return None;
                     }
                     return Some(*g);
@@ -4962,7 +4962,7 @@ impl Interp {
         };
         // Proxy with an `apply` trap (or forward to the target).
         if !self.proxies.is_empty() {
-            if let Some((target, handler)) = self.proxies.get(&(Rc::as_ptr(&obj) as usize)).cloned()
+            if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&obj) as usize)).cloned()
             {
                 let trap = self.get_member(&handler, "apply")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
@@ -4979,7 +4979,7 @@ impl Interp {
         // `eval(...)` of the current realm is intercepted earlier, in `eval_call`.) Only a
         // native function can be a realm's `eval` — skip the property lookup for user calls,
         // which is every hot call (the main realm always registers, so the map is never empty).
-        if self.multi_realm() && self.eval_realm_fns.contains(&(Rc::as_ptr(&obj) as usize)) {
+        if self.multi_realm() && self.eval_realm_fns.contains(&(Gc::as_ptr(&obj) as usize)) {
             let realm_g = obj.borrow().props.get("__eval_realm").map(|p| p.value());
             if let Some(realm_g @ Value::Obj(_)) = realm_g {
                 return match args.first() {
@@ -5014,7 +5014,7 @@ impl Interp {
                 // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
                 // single call, and most programs define no classes.)
                 if !self.class_info.is_empty()
-                    && self.class_info.contains_key(&(Rc::as_ptr(&obj) as usize))
+                    && self.class_info.contains_key(&(Gc::as_ptr(&obj) as usize))
                 {
                     return Err(self.throw(
                         "TypeError",
@@ -5428,7 +5428,7 @@ impl Interp {
             if names.iter().any(Option::is_some) {
                 self.gc_pin(&ao);
                 self.mapped_arguments
-                    .insert(Rc::as_ptr(&ao) as usize, (scope.clone(), names));
+                    .insert(Gc::as_ptr(&ao) as usize, (scope.clone(), names));
             }
         }
         ao
@@ -5538,7 +5538,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         self.fn_frames.push(FnFrame {
             inline: std::ptr::null(),
-            fn_ptr: Rc::as_ptr(fn_obj) as usize,
+            fn_ptr: Gc::as_ptr(fn_obj) as usize,
             coro: self.cur_coro,
             strict: func.is_strict,
             extra: None,
@@ -5579,7 +5579,7 @@ impl Interp {
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
         let Value::Obj(o) = callee else { return None };
-        let key = Rc::as_ptr(o) as usize;
+        let key = Gc::as_ptr(o) as usize;
         let genv = Rc::as_ptr(&self.global_env) as usize;
         // Probe the identity fields through the Cell without copying whole entries; only the
         // hit is copied out (nothing re-entrant runs between the probe and the copy).
@@ -5944,11 +5944,11 @@ impl Interp {
     /// Same contract as `call_jit_cached`: `args..args+argc` must be live operand-stack values
     /// the caller forgets on `Some`.
     fn learned_construct_capacity(&self, constructor: &Gc) -> usize {
-        let key = Rc::as_ptr(constructor) as usize;
+        let key = Gc::as_ptr(constructor) as usize;
         self.construct_capacity_hints
             .get(&key)
             .and_then(|(pin, capacity)| {
-                (pin.as_ptr() == Rc::as_ptr(constructor)).then_some(*capacity as usize)
+                (pin.as_ptr() == Gc::as_ptr(constructor)).then_some(*capacity as usize)
             })
             .unwrap_or(0)
     }
@@ -5958,12 +5958,12 @@ impl Interp {
         if observed == 0 {
             return;
         }
-        let key = Rc::as_ptr(constructor) as usize;
+        let key = Gc::as_ptr(constructor) as usize;
         if let Some((_, capacity)) = self.construct_capacity_hints.get_mut(&key) {
             *capacity = (*capacity).max(observed as u8);
         } else if self.construct_capacity_hints.len() < 65536 {
             self.construct_capacity_hints
-                .insert(key, (Rc::downgrade(constructor), observed as u8));
+                .insert(key, (Gc::downgrade(constructor), observed as u8));
         }
     }
 
@@ -5997,8 +5997,8 @@ impl Interp {
         let Value::Obj(apply_obj) = &apply else {
             return None;
         };
-        let initializer_ptr = Rc::as_ptr(initializer_obj) as usize;
-        let apply_ptr = Rc::as_ptr(apply_obj) as usize;
+        let initializer_ptr = Gc::as_ptr(initializer_obj) as usize;
+        let apply_ptr = Gc::as_ptr(apply_obj) as usize;
 
         // A large family of Prototype.js-era constructors forwards directly into a tiny
         // `initialize` body. Once that body has compiled and every property-creation site has
@@ -6083,7 +6083,7 @@ impl Interp {
             let proto_ptr = object
                 .proto
                 .as_ref()
-                .map_or(0, |proto| Rc::as_ptr(proto) as usize);
+                .map_or(0, |proto| Gc::as_ptr(proto) as usize);
             let start_shape = object.props.shape();
             drop(object);
             if epoch == u32::MAX {
@@ -6218,7 +6218,7 @@ impl Interp {
             return None;
         }
         let Value::Obj(o) = callee else { return None };
-        let key = Rc::as_ptr(o) as usize;
+        let key = Gc::as_ptr(o) as usize;
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         let genv = Rc::as_ptr(&self.global_env) as usize;
         // A live site entry can only have been installed by `construct_ic_fill`, hence it is
@@ -6288,7 +6288,7 @@ impl Interp {
             ),
             None => match self.construct_ics.get(&key) {
                 Some(entry)
-                    if entry.pin.as_ptr() == Rc::as_ptr(o)
+                    if entry.pin.as_ptr() == Gc::as_ptr(o)
                         && entry.call.epoch == epoch
                         && entry.call.global_env == genv =>
                 {
@@ -6344,7 +6344,7 @@ impl Interp {
         } else {
             self.learned_construct_capacity(o)
         };
-        let proto_ptr = Rc::as_ptr(&proto) as usize;
+        let proto_ptr = Gc::as_ptr(&proto) as usize;
         let this = crate::value::Object::new_with_capacity(Some(proto), instance_capacity);
         let this_val = Value::Obj(this.clone());
         // --- committed: identical shape to call_jit_cached's committed path ---
@@ -6649,7 +6649,7 @@ impl Interp {
             key,
             ConstructIc {
                 call: ic,
-                pin: Rc::downgrade(o),
+                pin: Gc::downgrade(o),
                 prototype_shape,
                 prototype_slot,
                 arguments_apply_forwarder,
@@ -6673,7 +6673,7 @@ impl Interp {
         // subsequent calls take [`Interp::call_jit_cached`]'s pointer-compare path.
         site: Option<(
             &crate::bytecode::CallSite,
-            &RefCell<crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>>,
+            &RefCell<crate::fasthash::FastMap<usize, crate::value::WeakGc>>,
         )>,
     ) -> Option<Result<Value, Abrupt>> {
         // Any exotic engine state (live proxies, multiple realms with possible cross-realm
@@ -6717,7 +6717,7 @@ impl Interp {
                 return None;
             }
         }
-        if !self.class_info.is_empty() && self.class_info.contains_key(&(Rc::as_ptr(o) as usize)) {
+        if !self.class_info.is_empty() && self.class_info.contains_key(&(Gc::as_ptr(o) as usize)) {
             return None;
         }
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
@@ -6741,10 +6741,10 @@ impl Interp {
         // address can't be recycled while pinned); a megamorphic site stops refilling at the cap
         // instead of growing the pin list without bound.
         if let Some((cs, pins)) = site {
-            let key = Rc::as_ptr(o) as usize;
+            let key = Gc::as_ptr(o) as usize;
             let mut p = pins.borrow_mut();
             if p.len() < 4096 || p.contains_key(&key) {
-                p.entry(key).or_insert_with(|| Rc::downgrade(o));
+                p.entry(key).or_insert_with(|| Gc::downgrade(o));
                 // Pin the active global scope's address too: the cached same-realm proof
                 // compares it raw, so it must never be recycled while cached (realms already
                 // outlive their caches in practice; this makes it airtight). Fills are rare, so
@@ -6818,7 +6818,7 @@ impl Interp {
         let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
         self.fn_frames.push(FnFrame {
             inline: std::ptr::null(),
-            fn_ptr: Rc::as_ptr(o) as usize,
+            fn_ptr: Gc::as_ptr(o) as usize,
             coro: self.cur_coro,
             strict: func.is_strict,
             extra: None,
@@ -7040,11 +7040,11 @@ impl Interp {
             // `super.x` resolves its receiver through it, and a constructor's non-object return
             // reads the *current* binding back out of the scope. Otherwise it exists only for
             // bodies that can name `this`.
-            let is_class_fn = self.class_info.contains_key(&(Rc::as_ptr(fn_obj) as usize));
+            let is_class_fn = self.class_info.contains_key(&(Gc::as_ptr(fn_obj) as usize));
             let derived_tdz = is_construct
                 && self
                     .class_info
-                    .get(&(Rc::as_ptr(fn_obj) as usize))
+                    .get(&(Gc::as_ptr(fn_obj) as usize))
                     .map(|ci| ci.derived)
                     .unwrap_or(false);
             if scan & crate::ast::SCAN_THIS != 0 || func.is_method || is_class_fn || is_construct {
@@ -7099,7 +7099,7 @@ impl Interp {
             }
             // Methods and class constructors may reference `super.x` — including from a direct
             // eval in a nested arrow, which resolves this marker lexically long after the call.
-            if func.is_method || self.class_info.contains_key(&(Rc::as_ptr(fn_obj) as usize)) {
+            if func.is_method || self.class_info.contains_key(&(Gc::as_ptr(fn_obj) as usize)) {
                 scope.borrow_mut().vars.insert(
                     "%superpropok%".to_string(),
                     Binding::data(Value::Bool(true), false, true),
@@ -7222,7 +7222,7 @@ impl Interp {
         if is_construct && !func.is_arrow {
             let derived = self
                 .class_info
-                .get(&(Rc::as_ptr(fn_obj) as usize))
+                .get(&(Gc::as_ptr(fn_obj) as usize))
                 .map(|c| c.derived)
                 .unwrap_or(false);
             if let Ok(v) = &result {
@@ -7336,9 +7336,9 @@ impl Interp {
         let obj = self.make_generator(is_async, gen_proto);
         if let Value::Obj(o) = &obj {
             self.gc_pin(o);
-            self.generators.insert(Rc::as_ptr(o) as usize, coro);
+            self.generators.insert(Gc::as_ptr(o) as usize, coro);
             if is_async {
-                self.async_gens.insert(Rc::as_ptr(o) as usize);
+                self.async_gens.insert(Gc::as_ptr(o) as usize);
             }
         }
         Ok(obj)
@@ -7397,10 +7397,10 @@ impl Interp {
         let promise = self.new_promise();
         if let Value::Obj(o) = &promise {
             self.gc_pin(o);
-            self.generators.insert(Rc::as_ptr(o) as usize, coro);
+            self.generators.insert(Gc::as_ptr(o) as usize, coro);
         }
         let key = match &promise {
-            Value::Obj(o) => Rc::as_ptr(o) as usize,
+            Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => unreachable!(),
         };
         self.drive_async(
@@ -7685,7 +7685,7 @@ impl Interp {
     /// poisoned getter surfaces as the returned error.
     pub(crate) fn promise_resolve_checked(&mut self, v: Value) -> Result<Value, Value> {
         if let Value::Obj(o) = &v {
-            if self.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
+            if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
                 return match self.get_member(&v, "constructor") {
                     Ok(_) => Ok(v),
                     Err(Abrupt::Throw(e)) => Err(e),
@@ -7831,7 +7831,7 @@ impl Interp {
         // realm is remembered for the [[Construct]] errors thrown after the callee context pops.
         if self.multi_realm() {
             if let Value::Obj(o) = &callee {
-                if !self.proxies.contains_key(&(Rc::as_ptr(o) as usize)) {
+                if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
                     if let Some(gptr) = self.callee_realm_global(o) {
                         let saved = self.snapshot_realm();
                         let target = self.realms[&gptr].snapshot_clone();
@@ -7864,7 +7864,7 @@ impl Interp {
         };
         // Proxy with a `construct` trap (or forward to the target).
         if !self.proxies.is_empty() {
-            if let Some((target, handler)) = self.proxies.get(&(Rc::as_ptr(&obj) as usize)).cloned()
+            if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&obj) as usize)).cloned()
             {
                 let trap = self.get_member(&handler, "construct")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
@@ -7936,7 +7936,7 @@ impl Interp {
                             .or_else(|| Some(self.object_proto.clone()))
                     }
                 };
-                let ctor_key = Rc::as_ptr(&obj) as usize;
+                let ctor_key = Gc::as_ptr(&obj) as usize;
                 let learned_capacity = self.learned_construct_capacity(&obj);
                 let this = Object::new_with_capacity(proto, learned_capacity);
                 let this_val = Value::Obj(this.clone());

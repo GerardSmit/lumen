@@ -1,4 +1,5 @@
 //! Collection brands are internal data slots, independent of ordinary JS properties.
+use crate::value::Gc;
 use crate::builtins::collection_data::CollectionKind;
 use crate::interpreter::Interp;
 use crate::value::Value;
@@ -16,7 +17,7 @@ pub(in crate::builtins) fn coll_ptr_kind(
 ) -> Result<usize, Value> {
     let err = || i.make_error("TypeError", "method called on an incompatible receiver");
     let object = this.as_obj().ok_or_else(err)?;
-    let ptr = Rc::as_ptr(object) as usize;
+    let ptr = Gc::as_ptr(object) as usize;
     let kind = i.map_data.get(&ptr).ok_or_else(err)?.kind();
     let valid = match want {
         Some(name) => kind.name() == name,

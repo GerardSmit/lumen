@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn native_publication_creates_duplicate_owners_and_preserves_prefix() {
         let object = Object::new(None);
-        let weak = Rc::downgrade(&object);
+        let weak = crate::value::Gc::downgrade(&object);
         let layout = jit_layout(&object);
         let mut a = Asm::new();
         // ABI arguments: x0=borrowed stored Rc, x1=first unused stack position.
@@ -141,9 +141,9 @@ mod tests {
             sys::free_exec(code, words.len() * 4);
             assert_eq!(end, base.add(4));
         }
-        assert_eq!(Rc::strong_count(&object), 4);
+        assert_eq!(crate::value::Gc::strong_count(&object), 4);
         let [prefix, first, number, second] = stack.map(|value| unsafe { value.assume_init() });
-        assert!(matches!(&prefix, Value::Obj(value) if Rc::ptr_eq(value, &object)));
+        assert!(matches!(&prefix, Value::Obj(value) if crate::value::Gc::ptr_eq(value, &object)));
         assert!(matches!(number, Value::Num(value) if value.to_bits() == (-0.0f64).to_bits()));
         drop(prefix);
         drop(object);

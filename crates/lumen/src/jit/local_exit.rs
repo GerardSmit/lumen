@@ -65,9 +65,9 @@ mod tests {
         let a = Object::new(None);
         let b = Object::new(None);
         let child = Object::new(None);
-        let child_weak = Rc::downgrade(&child);
+        let child_weak = crate::value::Gc::downgrade(&child);
         let old = Object::new(Some(child));
-        let old_weak = Rc::downgrade(&old);
+        let old_weak = crate::value::Gc::downgrade(&old);
         let mut locals: [Value; 12] = std::array::from_fn(|_| Value::Undefined);
         locals[0] = Value::Obj(b.clone());
         locals[1] = Value::Obj(a.clone());
@@ -113,16 +113,16 @@ mod tests {
         assert!(matches!(&locals[11], Value::Num(v) if v.to_bits() == (-0.0f64).to_bits()));
         let published = stack.map(|value| unsafe { value.assume_init() });
         assert!(matches!(&published[0], Value::Num(123.0)));
-        assert!(matches!(&published[1], Value::Obj(v) if Rc::ptr_eq(v, &a)));
+        assert!(matches!(&published[1], Value::Obj(v) if crate::value::Gc::ptr_eq(v, &a)));
         assert!(matches!(&published[2], Value::Str(v) if v.as_str() == "stack string"));
         assert!(matches!(&published[3], Value::Num(7.0)));
         drop(shadow);
-        assert_eq!(Rc::strong_count(&a), 7); // root + five locals + operand
-        assert_eq!(Rc::strong_count(&b), 5);
+        assert_eq!(crate::value::Gc::strong_count(&a), 7); // root + five locals + operand
+        assert_eq!(crate::value::Gc::strong_count(&b), 5);
         drop(locals);
         drop(published);
-        assert_eq!(Rc::strong_count(&a), 1);
-        assert_eq!(Rc::strong_count(&b), 1);
+        assert_eq!(crate::value::Gc::strong_count(&a), 1);
+        assert_eq!(crate::value::Gc::strong_count(&b), 1);
     }
 
     #[test]
