@@ -88,9 +88,15 @@ fn real_main() {
     }
 
     let mut runtime = Runtime::new();
-    // process.argv is [binary, script, ...its args]: the runtime flags live in execArgv.
+    // process.argv is [binary, script, ...its args]: the runtime flags live in execArgv. Like
+    // Node, the script is reported as an absolute path (`path.resolve`, symlinks kept).
     let script_argv: Vec<String> = match &file {
-        Some(f) => std::iter::once(f.clone()).chain(args).collect(),
+        Some(f) => {
+            let script = std::path::absolute(f)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| f.clone());
+            std::iter::once(script).chain(args).collect()
+        }
         None => Vec::new(),
     };
     runtime.set_process_args(&argv0, &exec_argv, &script_argv);

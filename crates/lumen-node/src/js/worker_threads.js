@@ -78,12 +78,15 @@
         let p = filename;
         if (typeof URL === "function" && p instanceof URL) p = p.href;
         p = String(p);
-        if (p.startsWith("file://")) p = p.slice(7);
-        if (!(p.startsWith("/") || p.startsWith("./") || p.startsWith("../"))) {
-          throw new TypeError(
+        if (p.startsWith("file:")) p = __builtins.get("url").fileURLToPath(p);
+        // Node's check: absolute for this platform, or explicitly relative (`./x`, `..\x`).
+        if (!pathMod.isAbsolute(p) && !/^\.\.?[\\/]/.test(p)) {
+          const error = new TypeError(
             "The worker script or module filename must be an absolute path or a relative path " +
               `starting with './' or '../'. Received ${JSON.stringify(p)}`,
           );
+          error.code = "ERR_WORKER_PATH";
+          throw error;
         }
         p = pathMod.resolve(p);
         isModule = p.endsWith(".mjs");

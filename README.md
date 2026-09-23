@@ -47,8 +47,10 @@ code meets the object graph (the JIT's executable pages and its templates' raw r
 baked offset is *measured at runtime* against the live types and fails closed to the checked
 helper if anything doesn't hold) and in the N-API addon loader's `dlopen` bridge.
 
-**Passes 100% of [tc39/test262](https://github.com/tc39/test262): 53,400/53,400** (including
-annexB, intl402, and staging) — on the default JIT tier and under `LUMEN_TIER=interp`.
+**Passes 100% of [tc39/test262](https://github.com/tc39/test262): 53,577/53,577** (including
+annexB, intl402, and staging) — on the default JIT tier and under `LUMEN_TIER=interp`. One
+test is skipped: `annexB/.../block-decl-func-skip-arguments.js` predates the current
+FunctionDeclarationInstantiation text and contradicts two SpiderMonkey staging tests (and V8).
 
 Extracted from — and used by — the [lucid-softworks/browser](https://github.com/lucid-softworks/browser)
 engine as its JS backend (`backend-lumen`), with full git history.

@@ -1,6 +1,6 @@
 //! `Intl.Locale` and the shared locale-support predicate.
 
-use super::{ab, coerce_options, def_getter, make_service};
+use super::{ab, coerce_options, data, def_getter, make_service};
 use crate::interpreter::Interp;
 use crate::intl::tags;
 use crate::value::{set_builtin, set_data, Gc, Value};
@@ -110,15 +110,29 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     });
 
     // Intl.Locale-info: getX() return the locale's preferred values (the keyword override, if any,
-    // else a data default) as a fresh Array.
+    // else CLDR data for the RegionPreference region) as a fresh Array.
     it.def_method(&proto, "getCalendars", 0, |i, this, _| {
-        info_list(i, &this, "__locale_ca", &["gregory"])
+        let region = lookup_region(i, &this)?;
+        info_list(i, &this, "__locale_ca", data::calendar_preferences(&region))
     });
     it.def_method(&proto, "getCollations", 0, |i, this, _| {
-        info_list(i, &this, "__locale_co", &["default"])
+        // The root collations (emoji, eor) plus the language's own tailorings, sorted; an
+        // unavailable language (und, private-use) gets just the root list.
+        let lang = slot(i, &this, "__locale_language")?;
+        let mut list: Vec<&str> = [
+            "big5han", "compat", "dict", "emoji", "eor", "gb2312", "phonebk", "phonetic", "pinyin",
+            "reformed", "searchjl", "stroke", "trad", "unihan", "zhuyin",
+        ]
+        .into_iter()
+        .filter(|c| super::collator::supported_collation(&lang, c))
+        .collect();
+        list.sort_unstable();
+        info_list(i, &this, "__locale_co", &list)
     });
     it.def_method(&proto, "getHourCycles", 0, |i, this, _| {
-        info_list(i, &this, "__locale_hc", &["h23"])
+        let region = lookup_region(i, &this)?;
+        let lang = slot(i, &this, "__locale_language")?;
+        info_list(i, &this, "__locale_hc", &[data::hour_cycle(&lang, &region)])
     });
     it.def_method(&proto, "getNumberingSystems", 0, |i, this, _| {
         info_list(i, &this, "__locale_nu", &["latn"])
@@ -145,21 +159,60 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         Ok(Value::Obj(o))
     });
     it.def_method(&proto, "getWeekInfo", 0, |i, this, _| {
-        let _ = slot(i, &this, "__locale_tag")?;
-        // firstDay comes from the fw keyword (option or -u-fw-), defaulting to Monday.
+        let region = lookup_region(i, &this)?;
+        let (region_first, weekend) = data::week_data(&region);
+        // firstDay comes from the fw keyword (option or -u-fw-), else the region's week data.
         let first = match opt_slot(i, &this, "__locale_fw")? {
-            Value::Str(s) => fw_to_num(&s).unwrap_or(1.0),
-            _ => 1.0,
+            Value::Str(s) => fw_to_num(&s).unwrap_or(region_first as f64),
+            _ => region_first as f64,
         };
         let o = i.new_object();
         set_data(&o, "firstDay", Value::Num(first));
-        set_data(
-            &o,
-            "weekend",
-            i.make_array(vec![Value::Num(6.0), Value::Num(7.0)]),
-        );
+        let weekend = weekend.iter().map(|&d| Value::Num(d as f64)).collect();
+        set_data(&o, "weekend", i.make_array(weekend));
         Ok(Value::Obj(o))
     });
+}
+
+/// The region whose CLDR data a locale-info method consults: RegionPreference's `rg` override when
+/// present (our data covers every region), else the region subtag, else the `sd` subdivision's
+/// region, else the Add Likely Subtags region, else "001". Brand-checks the receiver.
+fn lookup_region(i: &mut Interp, this: &Value) -> Result<String, Value> {
+    let _ = slot(i, this, "__locale_tag")?;
+    let mut get = |name: &str| match opt_slot(i, this, name) {
+        Ok(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
+        _ => None,
+    };
+    if let Some(r) = get("__locale_rg").and_then(|v| subdivision_region(&v)) {
+        return Ok(r);
+    }
+    if let Some(r) = get("__locale_region") {
+        return Ok(r);
+    }
+    if let Some(r) = get("__locale_sd").and_then(|v| subdivision_region(&v)) {
+        return Ok(r);
+    }
+    let lang = get("__locale_language").unwrap_or_default();
+    let script = get("__locale_script").unwrap_or_default();
+    Ok(add_likely(&lang, &script, "")
+        .map(|(_, _, r)| r)
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| "001".to_string()))
+}
+
+/// CanonicalUnicodeSubdivision's region: the leading region code of a unicode_subdivision_id
+/// ("thzzzz" → "TH", "inka" → "IN", "419zzzz" → "419"), or None if the value is not one.
+fn subdivision_region(v: &str) -> Option<String> {
+    if !(3..=7).contains(&v.len()) || !is_alnum(v) {
+        return None;
+    }
+    if is_digit(&v[..3]) {
+        Some(v[..3].to_string())
+    } else if is_alpha(&v[..2]) {
+        Some(v[..2].to_uppercase())
+    } else {
+        None
+    }
 }
 
 /// The value list for a `getX` info method: `[keyword]` if the locale carries that keyword, else the

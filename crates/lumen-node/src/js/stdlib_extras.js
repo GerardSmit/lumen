@@ -534,6 +534,8 @@ __builtins.set("sys", __builtins.get("util"));
     }
   }
 
+  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
+  Interface = __legacyConstructor(Interface);
   const createInterface = (options) => new Interface(options);
   const questionPromise = (rl) => (query) => new Promise((resolve) => rl.question(query, resolve));
 

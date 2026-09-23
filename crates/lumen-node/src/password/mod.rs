@@ -15,7 +15,6 @@
 //!   accepted as bcrypt aliases (Bun verifies every minor identically). Errors carry
 //!   Bun's exact "Password verification failed with error \"...\"" messages.
 
-use std::io::Read;
 
 use lumen_host::{ops, Ctx, OpDecl, TaskRegistry, Value};
 
@@ -844,9 +843,7 @@ pub fn verify_password(password: &[u8], hash: &str) -> Result<bool, PasswordErro
 }
 
 fn fill_random(buf: &mut [u8]) -> Result<(), String> {
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(buf))
-        .map_err(|e| format!("read /dev/urandom: {e}"))
+    lumen_host::fill_random(buf).map_err(|e| format!("randomness source: {e}"))
 }
 
 /// Hash with a fresh random salt. `algorithm` is one of bcrypt/argon2id/argon2i/argon2d;

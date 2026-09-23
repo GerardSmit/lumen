@@ -55,7 +55,17 @@ const encOf = (options) => (typeof options === "string" ? options : options && o
 function toPath(p) {
   if (p instanceof URL) return __builtins.get("url").fileURLToPath(p);
   const s = p instanceof Uint8Array ? Buffer.from(p).toString("utf8") : String(p);
-  return s.startsWith("file://") ? __builtins.get("url").fileURLToPath(s) : s;
+  return s.startsWith("file://") ? __builtins.get("url").fileURLToPath(s) : realmPath(s);
+}
+
+// A realm embedded in a host process has its own working directory; the OS one belongs to the
+// host. The ops resolve relative paths against the OS cwd, so resolve them here first. A path
+// that is already absolute (the common case) costs one check.
+function realmPath(s) {
+  const path = __builtins.get("path");
+  if (s === "" || path.isAbsolute(s)) return s;
+  const base = __node.realmCwd();
+  return base === undefined ? s : path.resolve(base, s);
 }
 
 // Coerce write data (string | Buffer | TypedArray | DataView | ArrayBuffer) to a Buffer for the
@@ -769,6 +779,9 @@ nodeFs.Stats = Stats;
 nodeFs.Dirent = Dirent;
 nodeFs.Dir = Dir;
 nodeFs.StatWatcher = StatWatcher;
+// Callable without `new`, as Node's constructors are (see __legacyConstructor).
+ReadStream = __legacyConstructor(ReadStream);
+WriteStream = __legacyConstructor(WriteStream);
 nodeFs.ReadStream = ReadStream;
 nodeFs.WriteStream = WriteStream;
 nodeFs.FileReadStream = ReadStream;

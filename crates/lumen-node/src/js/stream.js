@@ -599,6 +599,14 @@ function compose(...streams) {
   return d;
 }
 
+// Callable and `Readable.call(this, opts)`-inheritable, as in Node (see __legacyConstructor).
+Stream = __legacyConstructor(Stream, (self, [opts]) => EventEmitter.init.call(self, opts));
+Readable = __legacyConstructor(Readable, __initByCopy(Readable));
+Writable = __legacyConstructor(Writable, __initByCopy(Writable));
+Duplex = __legacyConstructor(Duplex, __initByCopy(Duplex));
+Transform = __legacyConstructor(Transform, __initByCopy(Transform));
+PassThrough = __legacyConstructor(PassThrough, __initByCopy(PassThrough));
+
 Stream.Readable = Readable;
 Stream.Writable = Writable;
 // Internal: lets node:zlib sequence a flush behind the writes already queued on a stream.

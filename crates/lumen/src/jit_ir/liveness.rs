@@ -186,6 +186,7 @@ fn stack_operator(op: &Op) -> bool {
             | Not
             | BitNot
             | Typeof
+            | TypeofIs(..)
             | TypeofName(_)
             | Void
     )

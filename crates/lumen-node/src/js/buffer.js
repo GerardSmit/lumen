@@ -106,9 +106,9 @@ function stringFromBytes(bytes, enc, start, end) {
 class Buffer extends Uint8Array {
   static from(value, encOrOffset, length) {
     if (typeof value === "string") return new Buffer(bytesFromString(value, encOrOffset));
-    if (value instanceof ArrayBuffer) {
-      const u = length === undefined ? new Uint8Array(value, encOrOffset || 0) : new Uint8Array(value, encOrOffset || 0, length);
-      return new Buffer(u);
+    // A view over the same memory, as in Node (the Uint8Array constructor's ArrayBuffer form).
+    if (value instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer)) {
+      return length === undefined ? new Buffer(value, encOrOffset || 0) : new Buffer(value, encOrOffset || 0, length);
     }
     if (ArrayBuffer.isView(value)) return new Buffer(new Uint8Array(value));
     if (Array.isArray(value) || (value && typeof value.length === "number")) {
@@ -527,6 +527,24 @@ function resolveObjectURL(_id) {
 
 const kMaxLength = 9007199254740991;
 const kStringMaxLength = 536870888;
+
+// The public constructor is Node's deprecated `Buffer(arg)` / `new Buffer(arg)`: a number
+// allocates (zero-filled), anything else goes through Buffer.from. Subclasses still get the
+// Uint8Array constructor, and so do TypedArray methods that build a Buffer through the species
+// constructor (`subarray` passes an ArrayBuffer, which Buffer.from turns into a view).
+Buffer = __legacyConstructor(Buffer, undefined, ([arg, encodingOrOffset, length]) => {
+  if (typeof arg === "number") {
+    if (typeof encodingOrOffset === "string") {
+      const error = new TypeError(
+        `The "string" argument must be of type string. Received type number (${arg})`,
+      );
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    return Buffer.alloc(arg);
+  }
+  return Buffer.from(arg, encodingOrOffset, length);
+});
 
 globalThis.Buffer = Buffer;
 __builtins.set("buffer", {

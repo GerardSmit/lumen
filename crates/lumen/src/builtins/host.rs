@@ -115,10 +115,13 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
         "constructor",
         Property::data(Value::Obj(ctor.clone()), true, false, true),
     );
-    // `.prototype` is non-writable, non-enumerable, non-configurable — and the prototype of every
-    // source-phase ModuleSource object (see Interp::module_source_of).
+    // `.prototype` is non-writable, non-enumerable, non-configurable. Like a WebAssembly.Module, a
+    // host module-source object's prototype is its concrete class's prototype, which in turn
+    // inherits from %AbstractModuleSource%.prototype (see Interp::module_source_of).
     it.extra_protos
         .insert("%AbstractModuleSourceProto%", proto.clone());
+    it.extra_protos
+        .insert("%ModuleSourceProto%", Object::new(Some(proto.clone())));
     ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(proto), false, false, false),

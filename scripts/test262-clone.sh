@@ -16,9 +16,12 @@ if [ -d "$DEST/test" ] && [ -d "$DEST/harness" ]; then
 fi
 
 echo "Cloning test262 into $DEST ..."
+# Byte-exact checkout: tests such as Function.prototype.toString line-terminator normalisation and
+# `import ... with { type: "bytes" }` compare against the files' exact bytes, which a Windows
+# `core.autocrlf=true` checkout would rewrite to CRLF.
 if [ -n "$REF" ]; then
-  git clone --depth 1 --branch "$REF" "$REPO" "$DEST"
+  git clone -c core.autocrlf=false --depth 1 --branch "$REF" "$REPO" "$DEST"
 else
-  git clone --depth 1 "$REPO" "$DEST"
+  git clone -c core.autocrlf=false --depth 1 "$REPO" "$DEST"
 fi
 echo "Done. $(find "$DEST/test" -name '*.js' | wc -l | tr -d ' ') test files."

@@ -2713,6 +2713,17 @@ const constants = {
 
 // ---- module surface ---------------------------------------------------------------------------
 
+// Callable without `new`, as Node's constructors are (see __legacyConstructor).
+Hash = __legacyConstructor(Hash);
+Hmac = __legacyConstructor(Hmac);
+ECDH = __legacyConstructor(ECDH);
+DiffieHellman = __legacyConstructor(DiffieHellman);
+DiffieHellmanGroup = __legacyConstructor(DiffieHellmanGroup);
+Sign = __legacyConstructor(Sign);
+Verify = __legacyConstructor(Verify);
+Cipheriv = __legacyConstructor(Cipheriv);
+Decipheriv = __legacyConstructor(Decipheriv);
+
 const crypto = {
   argon2,
   argon2Sync,

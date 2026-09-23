@@ -285,6 +285,9 @@ function _createSocketHandle() {
   throw new Error("node:dgram raw socket handles are not supported in lumen (use dgram.createSocket)");
 }
 
+// Callable without `new`, as Node's constructors are (see __legacyConstructor).
+Socket = __legacyConstructor(Socket);
+
 __builtins.set("dgram", {
   Socket,
   createSocket,

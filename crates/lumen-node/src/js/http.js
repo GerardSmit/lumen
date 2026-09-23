@@ -649,6 +649,14 @@ const WebSocket = globalThis.WebSocket || class WebSocket {};
 const MessageEvent = globalThis.MessageEvent || class MessageEvent {};
 const CloseEvent = globalThis.CloseEvent || class CloseEvent {};
 
+// Callable without `new`, as Node's constructors are (see __legacyConstructor).
+IncomingMessage = __legacyConstructor(IncomingMessage);
+ServerResponse = __legacyConstructor(ServerResponse);
+Server = __legacyConstructor(Server);
+OutgoingMessage = __legacyConstructor(OutgoingMessage);
+ClientRequest = __legacyConstructor(ClientRequest);
+Agent = __legacyConstructor(Agent);
+
 const http = {
   createServer,
   Server,

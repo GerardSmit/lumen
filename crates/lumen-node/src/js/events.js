@@ -433,4 +433,8 @@ class EventEmitterAsyncResource extends EventEmitter {
 const kAsyncResource = Symbol("kAsyncResource");
 EventEmitter.EventEmitterAsyncResource = EventEmitterAsyncResource;
 
+// Callable and `EventEmitter.call(this)`-inheritable, as in Node (see __legacyConstructor).
+EventEmitter = __legacyConstructor(EventEmitter, (self, [opts]) => EventEmitter.init.call(self, opts));
+EventEmitter.EventEmitter = EventEmitter;
+
 __builtins.set("events", EventEmitter);

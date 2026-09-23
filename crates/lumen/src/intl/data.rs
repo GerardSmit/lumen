@@ -159,3 +159,77 @@ pub fn plural_categories(lang: &str) -> &'static [&'static str] {
         _ => &["one", "other"],
     }
 }
+
+/// CLDR calendarPreferenceData for a region, most preferred first (Intl.Locale getCalendars).
+/// Regions without an entry use the "001" (gregory-only) preference. Only calendar ids that
+/// DateTimeFormat supports are listed (CLDR's bare "islamic"/"islamic-rgsa" are omitted).
+pub fn calendar_preferences(region: &str) -> &'static [&'static str] {
+    match region {
+        "TH" => &["buddhist", "gregory"],
+        "AF" | "IR" => &["persian", "gregory", "islamic-civil", "islamic-tbla"],
+        "SA" => &["islamic-umalqura", "gregory"],
+        "AE" | "BH" | "KW" | "QA" => &[
+            "gregory",
+            "islamic-umalqura",
+            "islamic-civil",
+            "islamic-tbla",
+        ],
+        "EG" => &["gregory", "coptic", "islamic-civil", "islamic-tbla"],
+        "IL" => &["gregory", "hebrew", "islamic-civil", "islamic-tbla"],
+        "BD" | "DJ" | "DZ" | "EH" | "ER" | "IQ" | "JO" | "KM" | "LB" | "LY" | "MA" | "MR"
+        | "OM" | "PK" | "PS" | "SD" | "SY" | "TD" | "TN" | "YE" => {
+            &["gregory", "islamic-civil", "islamic-tbla"]
+        }
+        "CN" | "CX" | "HK" | "MO" | "SG" => &["gregory", "chinese"],
+        "TW" => &["gregory", "roc", "chinese"],
+        "KR" => &["gregory", "dangi"],
+        "JP" => &["gregory", "japanese"],
+        "IN" => &["gregory", "indian"],
+        "ET" => &["gregory", "ethiopic"],
+        _ => &["gregory"],
+    }
+}
+
+/// The preferred hour cycle from CLDR timeData (Intl.Locale getHourCycles). A language-region
+/// entry (e.g. fr_CA) takes precedence over the region's; "001" is the H (h23) default.
+pub fn hour_cycle(lang: &str, region: &str) -> &'static str {
+    match (lang, region) {
+        ("fr", "CA") | ("ku", "SY") => return "h23",
+        ("ar", "001") => return "h12",
+        _ => {}
+    }
+    match region {
+        "AE" | "AG" | "AS" | "AU" | "BB" | "BD" | "BH" | "BM" | "BN" | "BS" | "BT" | "CA"
+        | "CO" | "DJ" | "DM" | "DZ" | "EG" | "EH" | "ER" | "ET" | "FJ" | "FM" | "GD" | "GH"
+        | "GM" | "GU" | "GY" | "IN" | "IQ" | "JM" | "JO" | "KI" | "KN" | "KR" | "KW" | "KY"
+        | "LB" | "LC" | "LR" | "LS" | "LY" | "MH" | "MP" | "MR" | "MW" | "MY" | "NZ" | "OM"
+        | "PG" | "PH" | "PK" | "PR" | "PS" | "QA" | "SA" | "SB" | "SD" | "SL" | "SO" | "SS"
+        | "SY" | "SZ" | "TC" | "TD" | "TN" | "TO" | "TT" | "TW" | "UM" | "US" | "VC" | "VG"
+        | "VI" | "VU" | "WS" | "YE" | "ZM" => "h12",
+        _ => "h23",
+    }
+}
+
+/// CLDR weekData for a region: (firstDay, weekend days), with days numbered 1 (Mon)..7 (Sun).
+pub fn week_data(region: &str) -> (u8, &'static [u8]) {
+    let first = match region {
+        "MV" => 5,
+        "AE" | "AF" | "BH" | "DJ" | "DZ" | "EG" | "IQ" | "IR" | "JO" | "KW" | "LY" | "OM"
+        | "QA" | "SD" | "SY" => 6,
+        "AG" | "AS" | "BD" | "BR" | "BS" | "BT" | "BW" | "BZ" | "CA" | "CN" | "CO" | "DM"
+        | "DO" | "ET" | "GT" | "GU" | "HK" | "HN" | "ID" | "IL" | "IN" | "JM" | "JP" | "KE"
+        | "KH" | "KR" | "LA" | "MH" | "MM" | "MO" | "MT" | "MX" | "MZ" | "NI" | "NP" | "PA"
+        | "PE" | "PH" | "PK" | "PR" | "PT" | "PY" | "SA" | "SG" | "SV" | "TH" | "TT" | "TW"
+        | "UM" | "US" | "VE" | "VI" | "WS" | "YE" | "ZA" | "ZW" => 7,
+        _ => 1,
+    };
+    let weekend: &'static [u8] = match region {
+        "IN" | "UG" => &[7],
+        "IR" => &[5],
+        "AF" => &[4, 5],
+        "AE" | "BH" | "DZ" | "EG" | "IL" | "IQ" | "JO" | "KW" | "LY" | "OM" | "QA" | "SA"
+        | "SD" | "SY" | "YE" => &[5, 6],
+        _ => &[6, 7],
+    };
+    (first, weekend)
+}

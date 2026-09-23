@@ -95,3 +95,69 @@ Error.captureStackTrace = function (target, _ctorOpt) {
 
 // A registry the module system fills in; each builtin registers itself as it is defined.
 const __builtins = new Map();
+
+// Node defines most of its public classes as plain constructor functions, and two legacy idioms
+// depend on that: calling one without `new` (`Buffer(4)`, `net.Socket()`, `zlib.Gzip()`), and
+// old-style inheritance, `Parent.call(this, opts)` plus `util.inherits`. lumen writes them as ES
+// classes, which throw on both. This wraps a finished class (statics assigned) in a constructor
+// function that shares its prototype:
+//   - `new X()` and `class Y extends X` construct the class exactly as before;
+//   - `X()` constructs one, as Node's `if (!(this instanceof X)) return new X(...)` does;
+//   - `X.call(obj, ...)` on an object that already inherits `X.prototype` runs `init(obj, args)`.
+//     Without an `init` it throws: a class whose constructor closes over `this` cannot initialize
+//     an object it did not allocate.
+// `construct(args)`, when given, replaces the class constructor for `X(...)` and `new X(...)` (not
+// for subclasses): Buffer's public constructor means `Buffer.alloc`/`Buffer.from`, while lumen's own
+// code builds Buffers with the Uint8Array constructor.
+// The class's own statics are mirrored as accessors, so `X.defaultMaxListeners = n` still reaches
+// the class that its methods read.
+function __legacyConstructor(Class, init, construct) {
+  const Legacy = {
+    [Class.name]: function (...args) {
+      if (construct && (new.target === undefined || new.target === Legacy)) {
+        if (new.target === undefined && this instanceof Legacy && init) {
+          init(this, args);
+          return undefined;
+        }
+        return construct(args);
+      }
+      if (new.target) return Reflect.construct(Class, args, new.target);
+      if (this !== null && typeof this === "object" && this instanceof Legacy) {
+        if (!init) {
+          throw new TypeError(
+            `${Class.name}.call(this) inheritance is not supported in lumen; extend it with \`class ... extends ${Class.name}\``,
+          );
+        }
+        init(this, args);
+        return undefined;
+      }
+      return Reflect.construct(Class, args, Legacy);
+    },
+  }[Class.name];
+  Legacy.prototype = Class.prototype;
+  Object.defineProperty(Class.prototype, "constructor", { value: Legacy, writable: true, configurable: true });
+  Object.defineProperty(Legacy, "length", { value: Class.length });
+  Object.setPrototypeOf(Legacy, Class);
+  for (const key of Reflect.ownKeys(Class)) {
+    if (key === "prototype" || key === "length" || key === "name") continue;
+    const desc = Object.getOwnPropertyDescriptor(Class, key);
+    if (!("value" in desc)) continue; // accessors are inherited and run against the class already
+    Object.defineProperty(Legacy, key, {
+      get: () => Class[key],
+      set: (value) => { Class[key] = value; },
+      enumerable: desc.enumerable,
+      configurable: true,
+    });
+  }
+  return Legacy;
+}
+
+// An `init` for __legacyConstructor when the constructor only sets state on `this` (no closures
+// over it): construct a twin with the target's prototype and copy the twin's own properties over.
+function __initByCopy(Class) {
+  return (self, args) => {
+    const Twin = function () {};
+    Twin.prototype = Object.getPrototypeOf(self);
+    Object.defineProperties(self, Object.getOwnPropertyDescriptors(Reflect.construct(Class, args, Twin)));
+  };
+}

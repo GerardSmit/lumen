@@ -105,14 +105,10 @@ pub fn futex_block(
                 if now >= deadline {
                     break false;
                 }
-                let (g, res) = cvar.wait_timeout(woken, deadline - now).unwrap();
-                woken = g;
-                if *woken {
-                    break true;
-                }
-                if res.timed_out() {
-                    break false;
-                }
+                // The loop head decides the timeout, not `timed_out()`: a platform wait can end a
+                // little before the deadline (Windows condition variables count whole
+                // milliseconds), and a wait must never report "timed-out" before its time.
+                woken = cvar.wait_timeout(woken, deadline - now).unwrap().0;
             }
         }
         None => loop {
@@ -1039,6 +1035,16 @@ pub struct Interp {
     /// JIT calls compare live objects with `gc_next` exactly and use this only for sparse scope-
     /// registry maintenance.
     pub(crate) gc_tick: u32,
+    /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point.
+    pub(crate) interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Latched once `interrupt` was seen set: from then on every safe point (not one in 256)
+    /// throws, so a `catch` that swallows the termination reaches the next call or loop turn
+    /// and is terminated again.
+    pub(crate) terminating: bool,
+    /// Set when the termination came from `live_limit`, not the interrupt flag.
+    pub(crate) heap_limit_hit: bool,
+    /// Live-object ceiling for this realm: `MAX_LIVE` unless the embedder lowers it.
+    pub(crate) live_limit: i64,
     /// Prune the scope registry once its entry count passes this floating threshold.
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
@@ -1531,6 +1537,10 @@ impl Interp {
             generators: Default::default(),
             gc_next: GC_TRIGGER,
             gc_tick: 0,
+            interrupt: None,
+            terminating: false,
+            heap_limit_hit: false,
+            live_limit: MAX_LIVE,
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
             super_call_ok: false,
@@ -1918,6 +1928,15 @@ impl Interp {
     pub fn is_proxy_value(&self, v: &Value) -> bool {
         self.object_addr(v)
             .is_some_and(|ptr| self.proxies.contains_key(&ptr))
+    }
+
+    /// End this realm now: every safe point from here on throws (see `Engine::set_interrupt`).
+    /// Only meaningful with an interrupt installed — `process.exit` in an embedded realm uses it
+    /// so a `catch` around the exit cannot keep the program running for another 255 calls.
+    pub fn terminate_for_host(&mut self) {
+        if self.interrupt.is_some() {
+            self.terminating = true;
+        }
     }
 
     /// Run lumen's cycle collector and return the number of reclaimed heap objects.
@@ -4417,7 +4436,7 @@ impl Interp {
     #[inline]
     pub(crate) fn gc_check_amortized(&mut self) -> Result<(), Abrupt> {
         self.gc_tick = self.gc_tick.wrapping_add(1);
-        if self.gc_tick & GC_CALL_POLL_MASK == 0 {
+        if self.gc_tick & GC_CALL_POLL_MASK == 0 || self.terminating {
             self.gc_check()
         } else {
             Ok(())
@@ -4425,6 +4444,7 @@ impl Interp {
     }
 
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
+        self.poll_interrupt()?;
         // Scope churn is tracked separately: call-heavy code can retire millions of scopes while
         // allocating few objects, and each dead weak registry entry pins its allocation.
         if scope_registry_len() > self.scope_gc_next {
@@ -4439,15 +4459,44 @@ impl Interp {
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!("[gc] live={live}");
         }
-        if live > MAX_LIVE {
+        if live > self.live_limit {
+            if self.interrupt.is_some() {
+                // An embedded realm is terminated, not handed a catchable RangeError: past its
+                // ceiling it must not keep running (the embedder reports why).
+                self.heap_limit_hit = true;
+                self.terminating = true;
+                return Err(self.termination());
+            }
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
         // Re-arm: collect again after another GC_TRIGGER objects, or once live has grown by
         // half, whichever is later. Doubling let a heap of 300k live objects carry 300k more of
         // cyclic garbage (closures and their scopes) before the next pass — about as much memory
         // again as the live set.
-        self.gc_next = (live + (live / 4).max(GC_TRIGGER)).clamp(GC_TRIGGER, MAX_LIVE);
+        self.gc_next = (live + (live / 4).max(GC_TRIGGER)).clamp(GC_TRIGGER, self.live_limit);
         Ok(())
+    }
+
+    /// Throw the termination if the embedder asked this realm to stop. Cheap when it has not:
+    /// one branch on `terminating`, one relaxed load.
+    #[inline]
+    pub(crate) fn poll_interrupt(&mut self) -> Result<(), Abrupt> {
+        if !self.terminating {
+            match &self.interrupt {
+                Some(flag) if flag.load(std::sync::atomic::Ordering::Relaxed) => {
+                    self.terminating = true;
+                }
+                _ => return Ok(()),
+            }
+        }
+        Err(self.termination())
+    }
+
+    /// The error a terminated realm throws. An ordinary `Error`, so native code that catches and
+    /// converts (a promise executor, an iterator close) behaves normally; the latched
+    /// `terminating` flag is what makes it stick.
+    fn termination(&mut self) -> Abrupt {
+        self.throw("Error", "realm terminated")
     }
 
     /// Pin `o` for the lifetime of its side-table entries (see `gc_pins`).
@@ -7122,12 +7171,10 @@ impl Interp {
         }
 
         // Hoist `var`/function declarations into the function scope before executing the body.
-        // ("arguments" joins the blocked names: an Annex B block function of that name would
-        // clash with the arguments object, so it is not var-hoisted.)
-        let mut param_names = param_bound_names(&func.params);
-        if !func.is_arrow {
-            param_names.push("arguments".to_string());
-        }
+        // (Only the formals block Annex B promotion: a block function named `arguments` is still
+        // promoted — it reuses the arguments object's binding rather than creating one — so after
+        // the block `arguments` is the function, per FunctionDeclarationInstantiation.)
+        let param_names = param_bound_names(&func.params);
         self.hoist_fn_body(func, &body, &param_names);
         if let Some(ps) = &param_seed {
             self.seed_param_vars(ps, &body);
@@ -7238,10 +7285,7 @@ impl Interp {
             // (it can leak back to `true` across a `yield`/`await` resume) so a return here can't be
             // parked as a pending tail call that nothing runs. See the note in `run_async`.
             let saved_tco = std::mem::replace(&mut i.tco_ok, false);
-            let mut pn = param_bound_names(&func.params);
-            if !func.is_arrow {
-                pn.push("arguments".to_string());
-            }
+            let pn = param_bound_names(&func.params);
             let body = func.body();
             i.hoist(&body, &scope, &pn);
             if let Some(ps) = &param_seed {
@@ -7387,10 +7431,7 @@ impl Interp {
             // off before *each* statement rather than just once — a `return` reads `tco_ok` at its
             // very start, so this makes the body's own returns take the ordinary path.
             let saved_tco = std::mem::replace(&mut i.tco_ok, false);
-            let mut pn = param_bound_names(&func.params);
-            if !func.is_arrow {
-                pn.push("arguments".to_string());
-            }
+            let pn = param_bound_names(&func.params);
             let body = func.body();
             i.hoist(&body, &scope, &pn);
             if let Some(ps) = &param_seed {

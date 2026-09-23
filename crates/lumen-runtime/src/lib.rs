@@ -15,12 +15,15 @@
 //! reactor (epoll/kqueue) would need raw syscalls and stays out unless explicitly authorized;
 //! threadpool + completions is libuv's own fs strategy and covers everything we host today.
 
-use std::sync::mpsc;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lumen_host::{
-    install, CallbackQueue, CompletionSender, Engine, TaskCompletion, TaskDecoder, TaskRegistry,
-    ThreadPool, Value,
+    install, CallbackQueue, CompletionSender, Engine, TaskCompletion, TaskDecoder, TaskId,
+    TaskRegistry, ThreadPool, Value,
 };
 
 mod console;
@@ -30,7 +33,96 @@ mod process;
 mod worker;
 
 pub use console::{describe_error, render_value, ConsoleOut};
-pub use lumen_host::{Completion, Ctx};
+pub use lumen_host::{Completion, Ctx, RealmProcess, Spawner};
+
+/// A realm that runs inside a host process instead of owning one (an editor running extensions on
+/// a thread). Everything a Node program treats as process-wide comes from here, so the program
+/// cannot reach the host's: `process.exit` ends the realm, `process.chdir` moves the realm's cwd,
+/// `process.env` starts as `env`, stdio are the embedder's streams, and subprocesses start through
+/// `spawner`. The engine polls `interrupt` at every call and loop turn (see
+/// [`Engine::set_interrupt`](lumen_host::Engine::set_interrupt)).
+pub struct Embedding {
+    /// `process.argv`: `[argv0, script, ...args]`. `argv0` is also `execPath`.
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: PathBuf,
+    pub stdin: Box<dyn Read + Send>,
+    pub stdout: SharedWriter,
+    pub stderr: SharedWriter,
+    pub interrupt: Arc<AtomicBool>,
+    /// Lower live-object ceiling for this realm; crossing it ends the realm with
+    /// [`RealmExit::HeapLimit`].
+    pub live_object_limit: Option<i64>,
+    pub spawner: Option<Arc<dyn Spawner>>,
+}
+
+/// A writer several realms (a realm and its workers) can share: `console` and `process.stdout`
+/// write whole chunks under the lock.
+#[derive(Clone)]
+pub struct SharedWriter(pub(crate) Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl SharedWriter {
+    pub fn new(inner: impl Write + Send + 'static) -> SharedWriter {
+        SharedWriter(Arc::new(Mutex::new(Box::new(inner))))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.lock().write(buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.lock().write_all(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.lock().flush()
+    }
+}
+
+/// How an embedded realm ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealmExit {
+    /// The program finished or called `process.exit(code)`; an uncaught error is `Exited(1)`.
+    Exited(i32),
+    /// The embedder set the interrupt.
+    Terminated,
+    /// The realm crossed its live-object ceiling.
+    HeapLimit,
+}
+
+/// Stops an embedded realm from any thread: sets its interrupt and wakes its loop if it is
+/// blocked waiting for I/O or a timer.
+#[derive(Clone)]
+pub struct Terminator {
+    interrupt: Arc<AtomicBool>,
+    wake: mpsc::Sender<TaskCompletion>,
+}
+
+impl Terminator {
+    pub fn terminate(&self) {
+        self.interrupt.store(true, Ordering::SeqCst);
+        // No task has this id, so the loop wakes, finds nothing to settle, and sees the flag.
+        let _ = self.wake.send(TaskCompletion {
+            task: TaskId::MAX,
+            result: Box::new(()),
+        });
+    }
+}
+
+/// What a worker inherits from an embedded parent realm.
+#[derive(Clone)]
+pub(crate) struct WorkerEmbedding {
+    pub(crate) cwd: PathBuf,
+    env: Vec<(String, String)>,
+    stdout: SharedWriter,
+    stderr: SharedWriter,
+    interrupt: Arc<AtomicBool>,
+    spawner: Option<Arc<dyn Spawner>>,
+}
 
 /// Workers for blocking work. libuv's default; revisit when async fs lands and has numbers.
 const POOL_SIZE: usize = 4;
@@ -50,6 +142,10 @@ pub struct Runtime {
     /// saw then (see `idle_collect`).
     idle_gc: (Instant, i64),
     idle_gc_followup: bool,
+    /// Embedded realms only: the stop request (see [`Terminator`]).
+    interrupt: Option<Arc<AtomicBool>>,
+    /// Wakes the loop when it is blocked on completions.
+    wake: mpsc::Sender<TaskCompletion>,
 }
 
 /// Why the entry script did not start cleanly.
@@ -70,6 +166,31 @@ impl Runtime {
     /// An engine with the runtime globals installed: timers, streaming `console`, minimal
     /// `process`, `queueMicrotask`.
     pub fn new() -> Runtime {
+        Self::build(None)
+    }
+
+    /// A runtime for a realm inside a host process (see [`Embedding`]). Runs on the calling
+    /// thread, which must have a large stack (the CLI uses 256 MiB; the engine recurses natively).
+    pub fn new_embedded(embedding: Embedding) -> Runtime {
+        Self::build(Some(embedding))
+    }
+
+    /// A worker's runtime: embedded like its parent when the parent is, else process-backed.
+    pub(crate) fn new_worker(parent: Option<WorkerEmbedding>) -> Runtime {
+        Self::build(parent.map(|p| Embedding {
+            argv: Vec::new(),
+            env: p.env,
+            cwd: p.cwd,
+            stdin: Box::new(std::io::empty()),
+            stdout: p.stdout,
+            stderr: p.stderr,
+            interrupt: p.interrupt,
+            live_object_limit: None,
+            spawner: p.spawner,
+        }))
+    }
+
+    fn build(embedding: Option<Embedding>) -> Runtime {
         let (tx, rx) = mpsc::channel();
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
         let mut engine = Engine::new();
@@ -77,8 +198,39 @@ impl Runtime {
         engine.ctx().op_state().put(pool.handle());
         // Dedicated-thread completions for unbounded-blocking work (child stdio) that must not
         // occupy a shared pool worker.
-        engine.ctx().op_state().put(CompletionSender::new(tx));
+        engine.ctx().op_state().put(CompletionSender::new(tx.clone()));
         engine.ctx().op_state().put(TaskRegistry::default());
+        // Before install: the extensions' js_init already asks for the cwd.
+        let mut embedded_io = None;
+        let mut interrupt = None;
+        if let Some(mut e) = embedding {
+            // `process.cwd()` never carries Windows' verbatim `\\?\` prefix; JS path code does
+            // not expect it.
+            e.cwd = lumen_host::strip_verbatim(e.cwd);
+            engine.set_interrupt(Arc::clone(&e.interrupt));
+            if let Some(limit) = e.live_object_limit {
+                engine.set_live_object_limit(limit);
+            }
+            engine.ctx().op_state().put(RealmProcess {
+                cwd: e.cwd.clone(),
+                exit_code: None,
+                interrupt: Arc::clone(&e.interrupt),
+                stdin: Arc::new(Mutex::new(e.stdin)),
+                stdout: Arc::clone(&e.stdout.0),
+                stderr: Arc::clone(&e.stderr.0),
+                spawner: e.spawner.clone(),
+            });
+            engine.ctx().op_state().put(WorkerEmbedding {
+                cwd: e.cwd,
+                env: e.env.clone(),
+                stdout: e.stdout.clone(),
+                stderr: e.stderr.clone(),
+                interrupt: Arc::clone(&e.interrupt),
+                spawner: e.spawner,
+            });
+            interrupt = Some(e.interrupt);
+            embedded_io = Some((e.argv, e.env, e.stdout, e.stderr));
+        }
         install(
             &mut engine,
             &[
@@ -93,7 +245,16 @@ impl Runtime {
                 worker::extension(),
             ],
         );
-        process::install_data_props(&mut engine);
+        let data = embedded_io
+            .as_ref()
+            .map(|(argv, env, _, _)| (argv.as_slice(), env.as_slice()));
+        process::install_data_props(&mut engine, data);
+        if let Some((_, _, stdout, stderr)) = embedded_io {
+            engine.ctx().op_state().put(ConsoleOut {
+                out: Box::new(stdout),
+                err: Box::new(stderr),
+            });
+        }
         // queueMicrotask, via the promise queue the engine already has. Close enough to spec
         // for v0 (a thrown callback error becomes an unhandled rejection, not a reported
         // exception); a native microtask hook can replace it if that gap ever matters.
@@ -205,6 +366,8 @@ impl Runtime {
         Runtime {
             engine,
             pool,
+            interrupt,
+            wake: tx,
             completions: rx,
             fire_error,
             fire_rejection,
@@ -223,7 +386,14 @@ impl Runtime {
     /// `__filename`/`require` in scope), then loop to quiescence. `Err` is the rendered
     /// uncaught error. This is what the CLI uses for `lumen-cli file.js`.
     pub fn run_main(&mut self, path: &str) -> Result<(), String> {
-        match self.start_main_raw(path) {
+        self.run_main_from(path, None)
+    }
+
+    /// [`Self::run_main`] with `source` as the main module's text instead of `path`'s contents.
+    /// `path` is still its `__filename`: relative `require`s and `__dirname` resolve against it,
+    /// whether or not anything exists there.
+    fn run_main_from(&mut self, path: &str, source: Option<&str>) -> Result<(), String> {
+        match self.start_main_raw(path, source) {
             Ok(()) => {}
             Err(StartError::NotInstalled(message)) => return Err(message),
             // A throw out of the entry script is an uncaught exception like any other: a
@@ -238,31 +408,34 @@ impl Runtime {
     /// microtask checkpoint runs). Worker threads use this: the caller arms its message inbox
     /// first and then drives the loop itself. `Err` is the rendered uncaught error.
     pub(crate) fn start_main(&mut self, path: &str) -> Result<(), String> {
-        self.start_main_raw(path).map_err(|e| match e {
+        self.start_main_raw(path, None).map_err(|e| match e {
             StartError::NotInstalled(message) => message,
             StartError::Thrown(error) => describe_error(self.engine.ctx(), &error),
         })
     }
 
-    fn start_main_raw(&mut self, path: &str) -> Result<(), StartError> {
+    fn start_main_raw(&mut self, path: &str, source: Option<&str>) -> Result<(), StartError> {
         // A CJS script can still dynamic-`import()`: give the engine the ESM loader and resolve
         // bare relative specifiers against the entry file.
         let loader = esm::make_loader(self.builtin_modules());
         self.engine.set_module_loader_attrs(loader);
-        if let Ok(abs) = std::fs::canonicalize(path) {
-            self.engine.set_import_base(&abs.to_string_lossy());
+        match lumen_host::canonicalize(path) {
+            Ok(abs) => self.engine.set_import_base(&abs.to_string_lossy()),
+            Err(_) if source.is_some() => self.engine.set_import_base(path),
+            Err(_) => {}
         }
         let global = self.engine.global_this();
+        let entry = if source.is_some() { "__runMainSource" } else { "__runMain" };
         let run_main = self
             .engine
             .ctx()
-            .get_member(&global, "__runMain")
+            .get_member(&global, entry)
             .map_err(|_| StartError::NotInstalled("node runtime not installed".to_string()))?;
-        let result = self.engine.call_function(
-            &run_main,
-            Value::Undefined,
-            &[Value::from_string(path.to_string())],
-        );
+        let mut args = vec![Value::from_string(path.to_string())];
+        if let Some(source) = source {
+            args.push(Value::from_string(source.to_string()));
+        }
+        let result = self.engine.call_function(&run_main, Value::Undefined, &args);
         self.engine.run_microtasks();
         result.map(|_| ()).map_err(StartError::Thrown)
     }
@@ -279,7 +452,7 @@ impl Runtime {
         } else {
             source
         };
-        let key = std::fs::canonicalize(path)
+        let key = lumen_host::canonicalize(path)
             .unwrap_or_else(|_| std::path::PathBuf::from(path))
             .to_string_lossy()
             .into_owned();
@@ -343,10 +516,9 @@ impl Runtime {
     /// polls `stop` on a short interval so a `terminate()` from another thread is noticed even
     /// with no message or timer due.
     pub fn run_worker_loop(&mut self, stop: &std::sync::atomic::AtomicBool) {
-        use std::sync::atomic::Ordering;
         let poll = Duration::from_millis(50);
         loop {
-            if stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) || self.interrupted() {
                 return;
             }
             self.engine.run_microtasks();
@@ -357,7 +529,8 @@ impl Runtime {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
-                for (cb, args) in self.take_due_timers() {
+                let now = Instant::now();
+                while let Some((cb, args)) = self.take_next_due_timer(now) {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
@@ -454,32 +627,33 @@ impl Runtime {
             loop {
                 let mut progressed = false;
                 for (cb, args) in self.take_queued_callbacks() {
-                    if self.fatal_exit.is_some() {
+                    if self.halted() {
                         return;
                     }
                     progressed = true;
                     self.fire(&cb, &args);
                 }
-                for (cb, args) in self.take_due_timers() {
-                    if self.fatal_exit.is_some() {
+                let now = Instant::now();
+                while let Some((cb, args)) = self.take_next_due_timer(now) {
+                    if self.halted() {
                         return;
                     }
                     progressed = true;
                     self.fire(&cb, &args);
                 }
-                while self.fatal_exit.is_none() {
+                while !self.halted() {
                     let Ok(done) = self.completions.try_recv() else {
                         break;
                     };
                     progressed = true;
                     self.dispatch(done);
                 }
-                if !progressed || self.fatal_exit.is_some() {
+                if !progressed || self.halted() {
                     break;
                 }
             }
 
-            if self.fatal_exit.is_some() || self.idle() {
+            if self.halted() || self.idle() {
                 return;
             }
 
@@ -638,12 +812,14 @@ impl Runtime {
         }
     }
 
-    fn take_due_timers(&mut self) -> Vec<(Value, Vec<Value>)> {
-        let now = Instant::now();
-        match self.engine.ctx().host_mut::<lumen_timers::Timers>() {
-            Some(t) => t.take_due(now),
-            None => Vec::new(),
-        }
+    /// One due timer at a time (see `Timers::take_next_due`): each callback runs before the next
+    /// is taken, so it can clear or refresh a timer due in the same turn. `now` is fixed for the
+    /// turn, so an interval cannot keep itself due forever.
+    fn take_next_due_timer(&mut self, now: Instant) -> Option<(Value, Vec<Value>)> {
+        self.engine
+            .ctx()
+            .host_mut::<lumen_timers::Timers>()?
+            .take_next_due(now)
     }
 
     fn next_timer_deadline(&mut self) -> Option<Instant> {
@@ -698,6 +874,10 @@ impl Runtime {
     }
 
     fn report_fatal(&mut self, error: &Value, prefix: &str, origin: &str) {
+        // A terminating realm's unwinding error is the termination, not a program failure.
+        if self.interrupted() {
+            return;
+        }
         let fire = self.fire_error.clone();
         if let Ok(Value::Bool(true)) = self.engine.call_function(
             &fire,
@@ -732,6 +912,73 @@ impl Runtime {
     /// The exit code an unhandled exception or rejection decided, if one did.
     pub fn fatal_exit_code(&self) -> Option<i32> {
         self.fatal_exit
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// The loop stops: a fatal error, or the embedder / `process.exit` asked the realm to end.
+    fn halted(&self) -> bool {
+        self.fatal_exit.is_some() || self.interrupted()
+    }
+
+    /// A handle that stops this realm from another thread. `None` unless embedded.
+    pub fn terminator(&self) -> Option<Terminator> {
+        Some(Terminator {
+            interrupt: Arc::clone(self.interrupt.as_ref()?),
+            wake: self.wake.clone(),
+        })
+    }
+
+    /// Run an embedded realm's entry script to the end: `.mjs` as an ES module, anything else as
+    /// the CommonJS main module (the Node programs this hosts are `.cjs`). Returns how it ended.
+    pub fn run_embedded_main(&mut self, path: &str) -> RealmExit {
+        let result = if path.ends_with(".mjs") {
+            self.run_module(path)
+        } else {
+            self.run_main(path)
+        };
+        self.finish_embedded(result)
+    }
+
+    /// [`Self::run_embedded_main`] for a CommonJS program the embedder holds in memory (a bundle
+    /// compiled into its binary, say). `path` is the program's `__filename`; nothing is read
+    /// from it, and it need not exist.
+    pub fn run_embedded_source(&mut self, path: &str, source: &str) -> RealmExit {
+        let result = self.run_main_from(path, Some(source));
+        self.finish_embedded(result)
+    }
+
+    fn finish_embedded(&mut self, result: Result<(), String>) -> RealmExit {
+        if let Err(message) = result {
+            if !self.interrupted() {
+                console::write_err_line(self.engine.ctx(), format!("Uncaught {message}"));
+                self.fatal_exit.get_or_insert(1);
+            }
+        }
+        self.realm_exit()
+    }
+
+    fn realm_exit(&mut self) -> RealmExit {
+        if self.engine.heap_limit_hit() {
+            return RealmExit::HeapLimit;
+        }
+        let requested = self
+            .engine
+            .ctx()
+            .op_state()
+            .get::<RealmProcess>()
+            .and_then(|realm| realm.exit_code);
+        if let Some(code) = requested {
+            return RealmExit::Exited(code);
+        }
+        if self.interrupted() {
+            return RealmExit::Terminated;
+        }
+        RealmExit::Exited(self.finish_process())
     }
 }
 

@@ -8231,6 +8231,62 @@ fn bytecode_labelled_loops_match_interp() {
 }
 
 #[test]
+fn fused_typeof_tests_agree_across_tiers() {
+    // `typeof v === "<kind>"` compiles to `Op::TypeofIs`; the JIT inlines it over locals and
+    // stack temporaries (including last-reference strings/objects that must be dropped).
+    let src = r#"
+        function mk() { return [undefined, null, true, 0, NaN, 1n, "", "s" + 1, Symbol("q"), {}, [],
+            function () {}, class {}, () => 1, new Proxy(function () {}, {}), new Proxy({}, {})]; }
+        function viaLocal(v) {
+            return [typeof v === "undefined", typeof v === "object", typeof v === "boolean",
+                typeof v === "number", typeof v === "bigint", typeof v === "string",
+                typeof v === "symbol", typeof v === "function", typeof v !== "string",
+                "object" == typeof v, typeof v != "function"].join();
+        }
+        function viaStack(f) {
+            return [typeof f() === "undefined", typeof f() === "object", typeof f() === "string",
+                typeof f() === "function", typeof f() !== "symbol"].join();
+        }
+        function branchy(v) {
+            let r = 0;
+            if (typeof v === "string") r |= 1;
+            if (typeof v !== "number") r |= 2;
+            if (typeof v === "function") r |= 4;
+            if (typeof v === "object") r |= 8;
+            if (typeof v === "nonsense") r |= 16;
+            return r;
+        }
+        function tdz() {
+            try { typeof z === "string"; } catch (e) { return e instanceof ReferenceError; }
+            let z = 1;
+        }
+        let out = [];
+        for (let round = 0; round < 50; round++) {
+            out = [];
+            for (const v of mk()) {
+                out.push(viaLocal(v), viaStack(() => v), branchy(v));
+                out.push(viaStack(() => "x".repeat(round % 3 + 1)), viaStack(() => ({})));
+            }
+            out.push(tdz(), typeof undeclaredGlobal === "undefined");
+        }
+        out.join("|")
+    "#;
+    fn on_tier(src: &str, tier: crate::bytecode::Tier) -> String {
+        let mut e = Engine::new();
+        e.interp.tier = tier;
+        e.interp.tier_threshold = 0;
+        match e.eval(src, false).expect("parse") {
+            Completion::Value(v) => v,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        }
+    }
+    let interp = on_tier(src, crate::bytecode::Tier::Interp);
+    assert!(interp.ends_with("|true|true"), "{interp}");
+    assert_eq!(interp, on_tier(src, crate::bytecode::Tier::Bytecode));
+    assert_eq!(interp, on_tier(src, crate::bytecode::Tier::Jit));
+}
+
+#[test]
 fn bytecode_async_vm() {
     // Async bodies compile to the bytecode VM and suspend at `await` without an OS-thread
     // coroutine. Checks the awaited value flows back, `await` in a loop accumulates, the return

@@ -6108,6 +6108,81 @@ fn install_iterator(it: &mut Interp) {
     it.def_method(&proto, "flatMap", 1, |i, t, a| {
         make_iter_helper(i, t, "flatMap", arg(a, 0))
     });
+    it.def_method(&proto, "chunks", 1, |i, t, a| {
+        make_chunking_helper(i, t, false, arg(a, 0), Value::Undefined)
+    });
+    it.def_method(&proto, "windows", 1, |i, t, a| {
+        make_chunking_helper(i, t, true, arg(a, 0), arg(a, 1))
+    });
+    it.def_method(&proto, "includes", 1, |i, this, a| {
+        require_iterator_object(i, &this)?;
+        // skippedElements: undefined → 0, else an integral Number or ±Infinity (no coercion,
+        // TypeError); negative or finite above 2^53 - 1 is a RangeError. A failure closes the
+        // receiver without reading its `next`.
+        let to_skip = match arg(a, 1) {
+            Value::Undefined => Ok(0.0),
+            Value::Num(n) if n.is_infinite() || n.trunc() == n => {
+                if n < 0.0 || (n.is_finite() && n > 9007199254740991.0) {
+                    Err("RangeError")
+                } else {
+                    Ok(n)
+                }
+            }
+            _ => Err("TypeError"),
+        };
+        let to_skip = match to_skip {
+            Ok(n) => n,
+            Err(ty) => {
+                i.iterator_close(&this);
+                return Err(i.make_error(ty, "invalid skippedElements"));
+            }
+        };
+        let search = arg(a, 0);
+        let next = ab(i.get_member(&this, "next"))?;
+        let mut skipped = 0.0;
+        while let Some(v) = step_iter_with(i, &this, &next)? {
+            if skipped < to_skip {
+                skipped += 1.0;
+            } else if same_value_zero(&v, &search) {
+                ab(i.iterator_close_normal(&this))?;
+                return Ok(Value::Bool(true));
+            }
+        }
+        Ok(Value::Bool(false))
+    });
+    it.def_method(&proto, "join", 1, |i, this, a| {
+        require_iterator_object(i, &this)?;
+        // The separator is coerced before `next` is read; a throwing coercion (of it or of an
+        // element) closes the iterator, iterator-protocol errors don't.
+        let sep = match arg(a, 0) {
+            Value::Undefined => ",".to_string(),
+            v => match i.to_string(&v) {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    i.iterator_close(&this);
+                    return Err(crate::interpreter::abrupt_value(e));
+                }
+            },
+        };
+        let next = ab(i.get_member(&this, "next"))?;
+        let mut parts = Vec::new();
+        while let Some(v) = step_iter_with(i, &this, &next)? {
+            parts.push(match v {
+                Value::Undefined | Value::Null => String::new(),
+                other => match i.to_string(&other) {
+                    Ok(s) => s.to_string(),
+                    Err(e) => {
+                        i.iterator_close(&this);
+                        return Err(crate::interpreter::abrupt_value(e));
+                    }
+                },
+            });
+        }
+        let out = parts.join(&sep);
+        Ok(Value::from_string(
+            crate::jstr::canonicalize(&out).unwrap_or(out),
+        ))
+    });
     it.def_method(&proto, "toArray", 0, |i, this, _| {
         require_iterator_object(i, &this)?;
         let next = ab(i.get_member(&this, "next"))?;
@@ -6253,8 +6328,8 @@ fn install_iterator(it: &mut Interp) {
             .insert("%WrapForValidIteratorPrototype%", wrap_proto);
     }
 
-    // %IteratorHelperPrototype%: the shared prototype of every map/filter/take/drop/flatMap
-    // helper (so cross-realm helpers interoperate — the methods live here, not per-object).
+    // %IteratorHelperPrototype%: the shared prototype of every map/filter/take/drop/flatMap/
+    // chunks/windows helper (so cross-realm helpers interoperate — the methods live here, not per-object).
     {
         let helper_proto = Object::new(Some(proto.clone()));
         it.def_method(&helper_proto, "next", 0, iter_helper_next);
@@ -6960,8 +7035,9 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
         i.iterator_close(&source);
         return Err(i.make_error("TypeError", "Iterator helper argument is not callable"));
     }
-    // take/drop validate the limit (ToNumber → NaN or negative is a RangeError) before reading the
-    // source's `next`; any validation failure closes the underlying iterator (calls its `return`).
+    // take/drop validate the limit (ToNumber → NaN, negative or finite above 2^53 - 1 is a
+    // RangeError) before reading the source's `next`; any validation failure closes the
+    // underlying iterator (calls its `return`).
     let limit = if matches!(kind, "take" | "drop") {
         let raw = match i.to_number(&f) {
             Ok(n) => n,
@@ -6970,7 +7046,7 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
                 return Err(crate::interpreter::abrupt_value(e));
             }
         };
-        if raw.is_nan() || raw.trunc() < 0.0 {
+        if raw.is_nan() || raw.trunc() < 0.0 || (raw.is_finite() && raw > 9007199254740991.0) {
             i.iterator_close(&source);
             return Err(i.make_error("RangeError", "limit must be a non-negative number"));
         }
@@ -6978,24 +7054,81 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
     } else {
         None
     };
+    let obj = new_iter_helper(i, source, kind, f)?;
+    if let Some(n) = limit {
+        set_builtin(&obj, "__ih_n", Value::Num(n));
+        set_builtin(&obj, "__ih_started", Value::Bool(false));
+    }
+    Ok(Value::Obj(obj))
+}
+
+/// Allocate a %IteratorHelperPrototype% object over an already-validated `source`, reading its
+/// `next` method (GetIteratorDirect) exactly once, now.
+fn new_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Result<Gc, Value> {
     let proto = i
         .extra_protos
         .get("%IteratorHelperPrototype%")
         .or_else(|| i.extra_protos.get("%IteratorPrototype%"))
         .cloned();
     let obj = Object::new(proto);
-    // GetIteratorDirect: read the source's `next` method exactly once, now.
     let next = ab(i.get_member(&source, "next"))?;
     set_builtin(&obj, "__ih_next", next);
     set_builtin(&obj, "__ih_src", source);
     set_builtin(&obj, "__ih_kind", Value::str(kind));
-    set_builtin(&obj, "__ih_fn", f.clone());
-    if let Some(n) = limit {
-        set_builtin(&obj, "__ih_n", Value::Num(n));
-        set_builtin(&obj, "__ih_started", Value::Bool(false));
-    }
+    set_builtin(&obj, "__ih_fn", f);
     set_builtin(&obj, "__ih_count", Value::Num(0.0));
     set_builtin(&obj, "__ih_done", Value::Bool(false));
+    Ok(obj)
+}
+
+/// `Iterator.prototype.chunks` / `.windows`: validate the size (a Number, integral, in
+/// [1, 2^32 - 1] — no coercion) and, for windows, `undersized`, closing the receiver on any
+/// failure before its `next` is read; then build the lazy helper.
+fn make_chunking_helper(
+    i: &mut Interp,
+    source: Value,
+    windows: bool,
+    size: Value,
+    undersized: Value,
+) -> Result<Value, Value> {
+    if !matches!(source, Value::Obj(_)) {
+        return Err(i.make_error("TypeError", "Iterator helper called on a non-object"));
+    }
+    let name = if windows { "windowSize" } else { "chunkSize" };
+    let err = match size {
+        Value::Num(n) if n.is_finite() && n.trunc() == n => {
+            if (1.0..=4294967295.0).contains(&n) {
+                None
+            } else {
+                Some((
+                    "RangeError",
+                    format!("{name} must be between 1 and 2^32 - 1"),
+                ))
+            }
+        }
+        _ => Some(("TypeError", format!("{name} must be an integral Number"))),
+    };
+    if let Some((ty, msg)) = err {
+        i.iterator_close(&source);
+        return Err(i.make_error(ty, msg));
+    }
+    let partial = match &undersized {
+        _ if !windows => false,
+        Value::Undefined => false,
+        Value::Str(s) if &*s.to_string() == "only-full" => false,
+        Value::Str(s) if &*s.to_string() == "allow-partial" => true,
+        _ => {
+            i.iterator_close(&source);
+            return Err(i.make_error(
+                "TypeError",
+                "undersized must be \"only-full\" or \"allow-partial\"",
+            ));
+        }
+    };
+    let kind = if windows { "windows" } else { "chunks" };
+    let obj = new_iter_helper(i, source, kind, Value::Undefined)?;
+    set_builtin(&obj, "__ih_n", size);
+    set_builtin(&obj, "__ih_partial", Value::Bool(partial));
     Ok(Value::Obj(obj))
 }
 
@@ -7021,6 +7154,12 @@ fn iter_helper_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value
             set_internal(&o, "__ih_done", Value::Bool(true));
         }
         let res = (|i: &mut Interp| -> Result<(), Value> {
+            // Suspended at the final undersized chunk/window yield: the source is already
+            // exhausted and the closure just returns.
+            let exhausted = ab(i.get_member(&this, "__ih_exhausted"))?;
+            if i.to_boolean(&exhausted) {
+                return Ok(());
+            }
             // A helper suspended inside a flatMap inner iterator closes it first.
             let inner = ab(i.get_member(&this, "__ih_inner"))?;
             if matches!(inner, Value::Obj(_)) {
@@ -7808,6 +7947,55 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                                 i.iterator_close(&src);
                                 return Err(e);
                             }
+                        }
+                    }
+                }
+            }
+        }
+        "chunks" | "windows" => {
+            let windows = &*kind == "windows";
+            // The final undersized chunk/window was yielded: the closure has returned since.
+            let exhausted = ab(i.get_member(&this, "__ih_exhausted"))?;
+            if i.to_boolean(&exhausted) {
+                return Ok(iter_result(i, Value::Undefined, true));
+            }
+            let nv = ab(i.get_member(&this, "__ih_n"))?;
+            let n = ab(i.to_number(&nv))? as usize;
+            // A window slides by one: the previous full window minus its oldest element carries
+            // over (a chunk starts empty every time).
+            let mut buf = Vec::new();
+            let prev = ab(i.get_member(&this, "__ih_buf"))?;
+            let had_prev = matches!(prev, Value::Obj(_));
+            if let Value::Obj(p) = &prev {
+                for j in 1..i.array_length(p) {
+                    buf.push(ab(i.get_member(&prev, &j.to_string()))?);
+                }
+            }
+            loop {
+                match step_iter_with(i, &src, &inext)? {
+                    None => {
+                        let partial_v = ab(i.get_member(&this, "__ih_partial"))?;
+                        // chunks always yields a non-empty remainder; windows only with
+                        // 'allow-partial' and only when no full window was ever produced.
+                        let yield_rest = !buf.is_empty()
+                            && (!windows || (i.to_boolean(&partial_v) && !had_prev));
+                        if !yield_rest {
+                            return Ok(iter_result(i, Value::Undefined, true));
+                        }
+                        set_internal(this.as_obj().unwrap(), "__ih_exhausted", Value::Bool(true));
+                        let arr = i.make_array(buf);
+                        return Ok(iter_result(i, arr, false));
+                    }
+                    Some(v) => {
+                        buf.push(v);
+                        if buf.len() == n {
+                            if windows {
+                                let keep = i.make_array(buf.clone());
+                                set_internal(this.as_obj().unwrap(), "__ih_buf", keep);
+                            }
+                            // Every yield is a fresh array.
+                            let arr = i.make_array(buf);
+                            return Ok(iter_result(i, arr, false));
                         }
                     }
                 }

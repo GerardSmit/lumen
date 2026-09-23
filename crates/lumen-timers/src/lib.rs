@@ -132,18 +132,31 @@ impl Timers {
 
     /// Callbacks due at `now`, earliest first. Intervals are rescheduled (from their
     /// deadline, not `now`, so periods don't drift); one-shots are removed.
+    ///
+    /// A batch is a snapshot: a callback that clears or refreshes a later timer in the same batch
+    /// does not stop it firing. The event loop uses [`Timers::take_next_due`] instead.
     pub fn take_due(&mut self, now: Instant) -> Vec<(Value, Vec<Value>)> {
         let mut due = Vec::new();
+        while let Some(next) = self.take_next_due(now) {
+            due.push(next);
+        }
+        due
+    }
+
+    /// The earliest callback due at `now`, if any, taken the same way as [`Timers::take_due`].
+    /// Taking one at a time and running it before taking the next is what lets a timer callback
+    /// cancel or refresh another timer that is due in the same turn, as in Node.
+    pub fn take_next_due(&mut self, now: Instant) -> Option<(Value, Vec<Value>)> {
         while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
             if deadline > now {
-                break;
+                return None;
             }
             self.heap.pop();
             if !self.is_live(id, deadline) {
                 continue; // cancelled, or superseded by a refresh
             }
             let entry = self.entries.get_mut(&id).expect("live entry");
-            due.push((entry.callback.clone(), entry.args.clone()));
+            let due = (entry.callback.clone(), entry.args.clone());
             match entry.repeat {
                 Some(period) => {
                     entry.deadline = deadline + period;
@@ -153,8 +166,9 @@ impl Timers {
                     self.entries.remove(&id);
                 }
             }
+            return Some(due);
         }
-        due
+        None
     }
 }
 

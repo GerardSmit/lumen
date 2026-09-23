@@ -105,6 +105,8 @@
 
   function start(options) { return new REPLServer(options || {}); }
 
+  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
+  REPLServer = __legacyConstructor(REPLServer);
   const repl = { REPLServer, start, writer, Recoverable, REPL_MODE_SLOPPY, REPL_MODE_STRICT };
   Object.defineProperty(repl, "builtinModules", { enumerable: false, configurable: true, get() { const module = __builtins.get("module"); return module ? module.builtinModules : []; } });
   __builtins.set("repl", repl);

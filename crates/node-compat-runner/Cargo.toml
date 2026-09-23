@@ -1,0 +1,19 @@
+[package]
+name = "node-compat-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Runs Node.js's own test suite (test/parallel, test/sequential from nodejs/node) against the
+# `lumen-cli` runtime, the way Deno's tests/node_compat does. Each test file is a standalone
+# script that passes by exiting 0. Std-only: it drives the runtime binary as child processes and
+# does not link it.
+
+[[bin]]
+name = "node-compat-runner"
+path = "src/main.rs"
+
+[lints]
+workspace = true

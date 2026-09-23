@@ -7,8 +7,8 @@ use std::io::{Read, Write};
 use std::time::Instant;
 
 use lumen_host::{
-    ops, CallbackQueue, CompletionSender, Ctx, Engine, Extension, OpState, TaskId, TaskRegistry,
-    Value,
+    ops, CallbackQueue, CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId,
+    TaskRegistry, Value,
 };
 
 use crate::console::ConsoleOut;
@@ -181,8 +181,12 @@ const JS_INIT: &str = r#"(() => {
 })();"#;
 
 /// The data properties (`argv`, `env`, `platform`) — snapshots taken at startup, like Node's.
-/// Runs after `install` because it needs the `process` object that install created.
-pub(crate) fn install_data_props(engine: &mut Engine) {
+/// Runs after `install` because it needs the `process` object that install created. An embedded
+/// realm passes its own `(argv, env)`; otherwise they come from the OS process.
+pub(crate) fn install_data_props(
+    engine: &mut Engine,
+    embedded: Option<(&[String], &[(String, String)])>,
+) {
     let global = engine.global_this();
     let ctx = engine.ctx();
     let process = match ctx.get_member(&global, "process") {
@@ -190,10 +194,15 @@ pub(crate) fn install_data_props(engine: &mut Engine) {
         _ => unreachable!("install() defined the process namespace"),
     };
 
-    let argv0_str = std::env::args()
-        .next()
+    let (args, vars): (Vec<String>, Vec<(String, String)>) = match embedded {
+        Some((argv, env)) => (argv.to_vec(), env.to_vec()),
+        None => (std::env::args().collect(), std::env::vars().collect()),
+    };
+    let argv0_str = args
+        .first()
+        .cloned()
         .unwrap_or_else(|| "lumen".to_string());
-    let argv: Vec<Value> = std::env::args().map(Value::from_string).collect();
+    let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
     let argv = ctx.make_array(argv);
     let _ = ctx.set_member(&process, "argv", argv);
 
@@ -212,13 +221,15 @@ pub(crate) fn install_data_props(engine: &mut Engine) {
 
     let env = ctx.new_object();
     let env = Value::Obj(env);
-    for (k, v) in std::env::vars() {
+    for (k, v) in vars {
         let _ = ctx.set_member(&env, &k, Value::from_string(v));
     }
     let _ = ctx.set_member(&process, "env", env);
 
     let platform = match std::env::consts::OS {
-        "macos" => "darwin", // Node's name for it
+        // Node's names for them; programs branch on `process.platform === "win32"`.
+        "macos" => "darwin",
+        "windows" => "win32",
         other => other,
     };
     let _ = ctx.set_member(&process, "platform", Value::str(platform));
@@ -265,10 +276,21 @@ fn op_read_stdin(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
         .get::<CompletionSender>()
         .expect("runtime installs completion sender")
         .clone();
-    sender.run_blocking(id, || {
+    // An embedded realm reads the stream its host gave it, never the host's own stdin.
+    let source = ctx
+        .op_state()
+        .get::<RealmProcess>()
+        .map(|realm| std::sync::Arc::clone(&realm.stdin));
+    sender.run_blocking(id, move || {
         let mut buf = vec![0u8; 65_536];
-        let result = std::io::stdin()
-            .read(&mut buf)
+        let read = match &source {
+            Some(source) => source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read(&mut buf),
+            None => std::io::stdin().read(&mut buf),
+        };
+        let result = read
             .map(|n| {
                 buf.truncate(n);
                 buf
@@ -482,6 +504,11 @@ fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
 }
 
 fn op_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    if let Some(realm) = ctx.op_state().get::<RealmProcess>() {
+        return Ok(Value::from_string(
+            realm.cwd.to_string_lossy().into_owned(),
+        ));
+    }
     match std::env::current_dir() {
         Ok(p) => Ok(Value::from_string(p.to_string_lossy().into_owned())),
         Err(e) => Err(ctx.make_error("Error", format!("cwd unavailable: {e}"))),
@@ -493,7 +520,36 @@ fn op_exit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
         Some(v) => ctx.coerce_number(v)? as i32,
         None => 0,
     };
-    std::process::exit(code);
+    end_realm_or_process(ctx, code)
+}
+
+/// In an embedded realm, `process.exit` / `process.abort` end the realm, not the host: record the
+/// code, raise the interrupt, and throw so the calling code unwinds now — the engine rethrows at
+/// every safe point after this, so a `catch` around the call cannot keep the program running.
+fn end_realm_or_process(ctx: &mut Ctx, code: i32) -> Result<Value, Value> {
+    let Some(realm) = ctx.host_mut::<RealmProcess>() else {
+        std::process::exit(code);
+    };
+    realm.exit_code.get_or_insert(code);
+    realm
+        .interrupt
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    ctx.terminate_for_host();
+    Err(ctx.make_error("Error", format!("process.exit({code})")))
+}
+
+/// Ops that change what the whole OS process is (its identity, its image, its signal handling)
+/// cannot be granted to a realm that shares a process with its host.
+fn refuse_in_realm(ctx: &mut Ctx, what: &str) -> Result<(), Value> {
+    if ctx.op_state().get::<RealmProcess>().is_some() {
+        let err = ctx.make_error(
+            "Error",
+            format!("{what} is not available to a program embedded in a host process"),
+        );
+        let _ = ctx.set_member(&err, "code", Value::str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"));
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Queued on the loop's callback queue: runs next turn, before timers. (Node runs nextTick
@@ -515,6 +571,17 @@ fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     let dir = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
+    if let Some(realm) = ctx.host_mut::<RealmProcess>() {
+        let target = realm.resolve(&dir);
+        return match lumen_host::canonicalize(&target) {
+            Ok(path) if path.is_dir() => {
+                realm.cwd = path;
+                Ok(Value::Undefined)
+            }
+            Ok(_) => Err(ctx.make_error("Error", format!("ENOTDIR: chdir '{dir}'"))),
+            Err(e) => Err(ctx.make_error("Error", format!("ENOENT: chdir '{dir}': {e}"))),
+        };
+    }
     match std::env::set_current_dir(&dir) {
         Ok(()) => Ok(Value::Undefined),
         Err(e) => Err(ctx.make_error("Error", format!("ENOENT: chdir '{dir}': {e}"))),
@@ -523,7 +590,11 @@ fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
 
 /// `process.abort()` — terminate immediately (SIGABRT, core dump where enabled). `std::process::abort`
 /// is the real thing; never returns.
-fn op_abort(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_abort(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    if ctx.op_state().get::<RealmProcess>().is_some() {
+        // 134: what a shell reports for SIGABRT.
+        return end_realm_or_process(ctx, 134);
+    }
     std::process::abort();
 }
 
@@ -533,6 +604,10 @@ fn op_abort(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Valu
 fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
+    // The realm's own pid is the host's, and 0 / negative pids reach the host's process group.
+    if pid <= 0 || pid as u32 == std::process::id() {
+        refuse_in_realm(ctx, "process.kill of the host process")?;
+    }
     let rc = unsafe { ffi::kill(pid, sig) };
     if rc == 0 {
         Ok(Value::Undefined)
@@ -551,6 +626,7 @@ fn op_kill(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value>
 fn op_umask(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let prev = match args.first() {
         Some(v) if !matches!(v, Value::Undefined) => {
+            refuse_in_realm(ctx, "process.umask(mask)")?;
             let m = ctx.coerce_number(v)? as u32;
             unsafe { ffi::umask(m) }
         }
@@ -597,6 +673,7 @@ fn op_execve(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     use std::ffi::CString;
     use std::os::raw::c_char;
 
+    refuse_in_realm(ctx, "process.execve")?;
     let path = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -646,21 +723,25 @@ fn identity_result(ctx: &mut Ctx, rc: i32, name: &str) -> Result<Value, Value> {
 }
 #[cfg(unix)]
 fn op_setuid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    refuse_in_realm(ctx, "process.setuid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::setuid(id) }, "setuid")
 }
 #[cfg(unix)]
 fn op_seteuid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    refuse_in_realm(ctx, "process.seteuid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::seteuid(id) }, "seteuid")
 }
 #[cfg(unix)]
 fn op_setgid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    refuse_in_realm(ctx, "process.setgid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::setgid(id) }, "setgid")
 }
 #[cfg(unix)]
 fn op_setegid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    refuse_in_realm(ctx, "process.setegid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::setegid(id) }, "setegid")
 }
@@ -686,6 +767,7 @@ fn op_getgroups(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Valu
 }
 #[cfg(unix)]
 fn op_setgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    refuse_in_realm(ctx, "process.setgroups")?;
     let text = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -706,6 +788,7 @@ fn op_setgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
 #[cfg(unix)]
 fn op_initgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     use std::ffi::CString;
+    refuse_in_realm(ctx, "process.initgroups")?;
     let user = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();

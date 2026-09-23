@@ -1,9 +1,10 @@
-//! Function bodies are skipped at parse time and parsed on first call (plan 0223). A body that is
-//! never called is never parsed — a syntax error in it is not a load-time error — and one that is
-//! called sees exactly the parse context it was written in: strictness, generator/async, `super`
-//! and `new.target` validity, private names, closures over the enclosing scope. A parsed body
-//! that no call touched for a whole collection interval is released by the collector and parsed
-//! again on the next call (the tests under "released cold bodies").
+//! Function bodies are skipped at parse time and parsed on first call (plan 0223). A skipped body
+//! is still checked once at load — its early errors are load-time SyntaxErrors, as the spec
+//! requires — but that parse is dropped; the body is built on first call and sees exactly the
+//! parse context it was written in: strictness, generator/async, `super` and `new.target`
+//! validity, private names, closures over the enclosing scope. A parsed body that no call touched
+//! for a whole collection interval is released by the collector and parsed again on the next call
+//! (the tests under "released cold bodies").
 use lumen::{bytecode::Tier, Completion, Engine};
 
 fn run_with(tier: Tier, source: &str) -> Completion {
@@ -30,71 +31,51 @@ fn check(source: &str) {
     }
 }
 
-/// The tests that assert an error is *deferred* to the first call do not apply when every body
-/// is parsed at load (`LUMEN_EAGER_PARSE=1`, the test262 configuration).
-fn bodies_are_lazy() -> bool {
-    !std::env::var_os("LUMEN_EAGER_PARSE").is_some_and(|v| !v.is_empty() && v != "0")
-}
-
-fn throws(source: &str) -> (String, String) {
+/// The message of the SyntaxError `source` fails to load with — on every tier, before any of it
+/// runs.
+fn load_error(source: &str) -> String {
     let mut last = None;
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-        match run_with(tier, source) {
-            Completion::Throw { name, message } => last = Some((name, message)),
-            Completion::Value(v) => panic!("{tier:?}: expected a throw, got {v}"),
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        match engine.eval(&format!("throw new Error('ran');\n{source}"), false) {
+            Err(e) => last = Some(e.message),
+            Ok(_) => panic!("{tier:?}: expected a load-time SyntaxError"),
         }
     }
     last.unwrap()
 }
 
 #[test]
-fn a_syntax_error_in_an_uncalled_body_is_not_a_load_error() {
-    if !bodies_are_lazy() {
-        return;
+fn a_syntax_error_in_an_uncalled_body_is_a_load_error() {
+    for source in [
+        "function never() { var 1 = 2; ) }",
+        "const arrow = () => { class { } ; ( };",
+        "class C { m() { let let = 1; } }",
+        "class C { static s() { return ; ; ]; } }",
+        "class C { get g() { !!! } }",
+        "const o = { m() { for (;;) { } , } };",
+        "function outer() { function inner() { function deepest() { ((( } } }",
+    ] {
+        load_error(source);
     }
-    check(
-        r#"
-        function never() { var 1 = 2; ) }
-        const arrow = () => { class { } ; ( };
-        class C { m() { let let = 1; } static s() { return ; ; ]; } get g() { !!! } }
-        const o = { m() { for (;;) { } , } };
-        assert(typeof never === "function");
-        assert(typeof arrow === "function");
-        assert(typeof C.prototype.m === "function");
-        assert(typeof o.m === "function");
-        "#,
-    );
-}
-
-#[test]
-fn calling_a_body_that_does_not_parse_throws_a_syntax_error_every_time() {
-    if !bodies_are_lazy() {
-        return;
-    }
-    let (name, message) = throws(
-        r#"
-        function bad() {
-          return 1;
-          var 1;
-        }
-        let first, second;
-        try { bad(); } catch (e) { first = e; }
-        try { bad(); } catch (e) { second = e; }
-        assert(first instanceof SyntaxError, "first call");
-        assert(second instanceof SyntaxError, "second call");
-        assert(first.message === second.message, "same message");
-        throw first;
-        "#,
-    );
-    assert_eq!(name, "SyntaxError");
+    let message = load_error("function bad() { return 1; var 1; }");
     assert!(message.contains("binding identifier"), "{message}");
 }
 
 #[test]
+fn a_body_that_parses_is_still_built_only_on_first_call() {
+    check(
+        r#"
+        let built = 0;
+        function counted() { built++; return built; }
+        assert(counted() === 1 && counted() === 2, "runs normally after the load-time check");
+        "#,
+    );
+}
+
+#[test]
 fn nested_functions_stay_lazy_until_their_own_first_call() {
-    if !bodies_are_lazy() {
-        return;
-    }
     check(
         r#"
         function outer(x) {
@@ -102,7 +83,6 @@ fn nested_functions_stay_lazy_until_their_own_first_call() {
             const deeper = (z) => { return x + y + z; };
             return deeper(3);
           }
-          function broken() { ((( }
           return inner(2);
         }
         assert(outer(1) === 6);
@@ -181,33 +161,14 @@ fn a_use_strict_prologue_inside_a_lazy_body_governs_it() {
 }
 
 #[test]
-fn a_use_strict_prologue_makes_strict_only_syntax_an_error_at_first_call() {
-    if !bodies_are_lazy() {
-        return;
-    }
-    let (name, message) = throws(
-        r#"
-        function f() { "use strict"; with ({}) {} }
-        f();
-        "#,
-    );
-    assert_eq!(name, "SyntaxError");
+fn a_use_strict_prologue_makes_strict_only_syntax_a_load_error() {
+    let message = load_error(r#"function f() { "use strict"; with ({}) {} }"#);
     assert!(message.contains("with"), "{message}");
 }
 
 #[test]
-fn a_body_lexical_clashing_with_a_parameter_errors_at_first_call() {
-    if !bodies_are_lazy() {
-        return;
-    }
-    let (name, message) = throws(
-        r#"
-        function f(a) { let a = 1; return a; }
-        assert(typeof f === "function", "declared fine");
-        f(1);
-        "#,
-    );
-    assert_eq!(name, "SyntaxError");
+fn a_body_lexical_clashing_with_a_parameter_is_a_load_error() {
+    let message = load_error("function f(a) { let a = 1; return a; }");
     assert!(
         message.contains("'a' has already been declared"),
         "{message}"
@@ -323,50 +284,32 @@ fn private_names_used_inside_a_lazy_method_resolve() {
 }
 
 #[test]
-fn an_undeclared_private_name_inside_a_lazy_body_is_a_syntax_error_at_first_call() {
-    if !bodies_are_lazy() {
-        return;
-    }
-    let (name, message) = throws(
+fn an_undeclared_private_name_inside_a_lazy_body_is_a_load_error() {
+    let message = load_error("class A { m() { return this.#nope; } }");
+    assert!(message.contains("#nope"), "{message}");
+    // Declared by a class nested in the body, or by an enclosing class after the method: fine.
+    check(
         r#"
-        class A { m() { return this.#nope; } }
-        new A().m();
+        class A {
+          m() { return this.#late + new (class { #own = 2; get() { return this.#own; } })().get(); }
+          #late = 1;
+        }
+        assert(new A().m() === 3);
         "#,
     );
-    assert_eq!(name, "SyntaxError");
-    assert!(message.contains("#nope"), "{message}");
+    let message = load_error("class A { m() { return () => this.#gone; } } class B { #gone; }");
+    assert!(message.contains("#gone"), "{message}");
 }
 
 #[test]
-fn super_and_arguments_context_errors_are_still_reported() {
-    if !bodies_are_lazy() {
-        return;
-    }
-    // A super call outside a derived constructor, through an arrow, at the arrow's first call.
-    let (name, _) = throws(
-        r#"
-        class A { m() { const f = () => { super(); }; f(); } }
-        new A().m();
-        "#,
-    );
-    assert_eq!(name, "SyntaxError");
+fn super_and_arguments_context_errors_are_load_errors() {
+    // A super call outside a derived constructor, through an arrow.
+    load_error("class A { m() { const f = () => { super(); }; f(); } }");
     // `arguments` in a field initializer, through an arrow whose body is lazy.
-    let (name, message) = throws(
-        r#"
-        class A { f = () => { return arguments; }; }
-        new A().f();
-        "#,
-    );
-    assert_eq!(name, "SyntaxError");
+    let message = load_error("class A { f = () => { return arguments; }; }");
     assert!(message.contains("field initializer"), "{message}");
     // `new.target` inside an arrow at the top level has no enclosing function.
-    let (name, _) = throws(
-        r#"
-        const f = () => { return new.target; };
-        f();
-        "#,
-    );
-    assert_eq!(name, "SyntaxError");
+    load_error("const f = () => { return new.target; };");
 }
 
 #[test]
@@ -586,20 +529,6 @@ fn a_flushed_class_method_still_reaches_super_and_private_names() {
          assert(b.g === 11, 'an accessor');
          $262.gc(); $262.gc();
          assert(new B().m() === 'a1', 'a new instance');",
-    );
-}
-
-#[test]
-fn a_body_that_does_not_parse_keeps_throwing_after_collections() {
-    if !bodies_are_lazy() {
-        return;
-    }
-    check(
-        "function bad() { var 1; }
-         function probe() { try { bad(); } catch (e) { return e.constructor === SyntaxError; } return false; }
-         assert(probe(), 'first call');
-         $262.gc(); $262.gc();
-         assert(probe(), 'after collections');",
     );
 }
 
