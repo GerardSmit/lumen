@@ -3,10 +3,9 @@
 // a Memory/Table/Global can be created standalone and imported by any module (cross-module
 // linking). Functions are called by their store address.
 //
-// Memory is kept coherent by syncing Memory.buffer with the store's bytes at call boundaries (JS
-// writes pushed in before a call, wasm writes pulled out after) — see the Memory class. lumen's
-// embed API can't share an ArrayBuffer's backing store with Rust, so this stands in for a live
-// shared buffer; it's correct as long as wasm memory only changes during calls. No SIMD/threads/GC.
+// A Memory's bytes are owned by its ArrayBuffer; the store borrows them (an O(1) swap, no copy)
+// only while wasm runs, and hands them back to JS around every imported-function call. No
+// SIMD/threads/GC.
 
 class CompileError extends Error {
   constructor(m) { super(m); this.name = "CompileError"; }
@@ -62,27 +61,11 @@ class Memory {
       const initial = (descriptor && descriptor.initial) || 0;
       this._addr = __wasm.allocMemory(initial, descriptor && descriptor.maximum);
     }
-    this._buf = null;
-    this._view = null;
-    this._syncFromStore();
   }
-  get buffer() { return this._buf; }
-  _syncToStore() {
-    if (this._view) __wasm.memWrite(this._addr, 0, this._view);
-  }
-  _syncFromStore() {
-    const bytes = __wasm.memBytes(this._addr);
-    if (!this._buf || this._buf.byteLength !== bytes.byteLength) {
-      this._buf = bytes.buffer; // grow detaches the old buffer, per spec
-      this._view = new Uint8Array(this._buf);
-    } else {
-      this._view.set(bytes); // same size: copy in place, preserving buffer identity
-    }
-  }
+  get buffer() { return __wasm.memBuffer(this._addr); }
   grow(delta) {
     const prev = __wasm.memGrow(this._addr, delta);
     if (prev < 0) throw new RangeError("WebAssembly.Memory.grow() failed");
-    this._syncFromStore();
     return prev;
   }
 }
@@ -137,16 +120,7 @@ function buildExports(exportsMeta, importedMemory) {
   }
   for (const e of exportsMeta) {
     if (e.kind === "function") {
-      const faddr = e.addr;
-      const fn = (...args) => {
-        if (memory) memory._syncToStore();
-        let r;
-        try { r = __wasm.call(faddr, args); } catch (err) { throw wrapWasmError(err); }
-        if (memory) memory._syncFromStore();
-        return r.length === 0 ? undefined : r.length === 1 ? r[0] : r;
-      };
-      fn._funcAddr = faddr;
-      exports[e.name] = fn;
+      exports[e.name] = funcFromAddr(e.addr);
     } else if (e.kind === "global") {
       exports[e.name] = new Global({ __addr: e.addr, mutable: false });
     } else if (e.kind === "table") {

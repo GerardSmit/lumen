@@ -2403,6 +2403,39 @@ impl Interp {
         Ok(ta)
     }
 
+    /// A fresh (fixed-length) `ArrayBuffer` that takes ownership of `bytes` without copying.
+    pub fn make_array_buffer_from(&mut self, bytes: Vec<u8>) -> Value {
+        crate::builtins::typedarray::array_buffer_from_vec(self, bytes)
+    }
+
+    /// Exchange a (non-shared, attached) `ArrayBuffer`'s backing bytes with `bytes` in O(1).
+    /// `false` when `v` is no such buffer. Views over the buffer see the new length at once, so
+    /// an embedder that borrows the bytes (e.g. wasm memory during a call) must swap them back
+    /// before JS runs again.
+    pub fn array_buffer_swap(&mut self, v: &Value, bytes: &mut Vec<u8>) -> bool {
+        let Some(o) = v.as_obj() else {
+            return false;
+        };
+        let p = Gc::as_ptr(o) as usize;
+        if self.shared_buffers.contains_key(&p) {
+            return false;
+        }
+        match self.array_buffers.get_mut(&p) {
+            Some(b) => {
+                std::mem::swap(b, bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Detach an `ArrayBuffer`, dropping its backing store.
+    pub fn array_buffer_detach(&mut self, v: &Value) {
+        if let Some(o) = v.as_obj() {
+            self.array_buffers.remove(&(Gc::as_ptr(o) as usize));
+        }
+    }
+
     pub(crate) fn make_function(&self, func: Rc<Function>, env: Env) -> Value {
         let is_arrow = func.is_arrow;
         let is_method = func.is_method;

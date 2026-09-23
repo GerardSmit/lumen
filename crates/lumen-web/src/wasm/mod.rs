@@ -4,6 +4,7 @@
 //! saturating conversions, bulk memory). Not supported: SIMD, threads/atomics, exceptions, GC.
 
 pub mod exec;
+pub mod native;
 pub mod parse;
 pub mod translate;
 #[cfg(test)]
@@ -48,7 +49,7 @@ fn kind_str(kind: ExportKind) -> &'static str {
 mod tests {
     use std::rc::Rc;
 
-    use super::exec::{Host, Imports, Store, Val};
+    use super::exec::{Host, Imports, MemEntity, Store, Val};
     use super::*;
 
     struct NoHost;
@@ -58,6 +59,7 @@ mod tests {
             _id: usize,
             _a: &[Val],
             _r: &[parse::ValType],
+            _m: &mut [MemEntity],
         ) -> Result<Vec<Val>, String> {
             Err("no imports".into())
         }

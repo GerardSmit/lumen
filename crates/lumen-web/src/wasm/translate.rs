@@ -55,6 +55,11 @@ pub const VMCTX_MEM_LEN: i32 = 8;
 pub const VMCTX_GLOBALS: i32 = 16;
 pub const VMCTX_ENTRY_SP: i32 = 24;
 pub const VMCTX_STACK_LIMIT: i32 = 32;
+/// Store address of the function a bridge stub is about to call (see [`bridge_stub`]).
+pub const VMCTX_PENDING: i32 = 40;
+/// Argument / result exchange area for bridge stubs: [`VMCTX_ARGS_LEN`] 8-byte slots.
+pub const VMCTX_ARGS: i32 = 64;
+pub const VMCTX_ARGS_LEN: usize = 64;
 
 /// External ids at and above this are runtime helpers, not wasm functions.
 pub const HELPER_BASE: u32 = 0x8000_0000;
@@ -67,6 +72,43 @@ pub const HELPER_MEMORY_FILL: u32 = HELPER_BASE + 2;
 /// `(vmctx, type_index: i32, table: i32, elem: i32) -> i64` — resolve an indirect callee to a
 /// `FuncSlot { code: u64, vmctx: u64 }` pointer, or a trap code below 16.
 pub const HELPER_RESOLVE_INDIRECT: u32 = HELPER_BASE + 3;
+/// `(vmctx) -> i32` — call the store function at `VmCtx::pending` with the arguments in
+/// `VmCtx::args`, leaving its results there; nonzero means it trapped.
+pub const HELPER_CALL_SLOW: u32 = HELPER_BASE + 4;
+
+/// A native-callable function of wasm type `ty` that forwards to the runtime: it stores its
+/// arguments in `VmCtx::args` (and `callee`, when given, in `VmCtx::pending`), calls
+/// [`HELPER_CALL_SLOW`] and returns the results it leaves. Native code reaches imports and
+/// functions without a native body through these.
+pub fn bridge_stub(ty: &FuncType, callee: Option<u64>) -> Result<Function, String> {
+    if ty.params.len().max(ty.results.len()) > VMCTX_ARGS_LEN {
+        return Err("wasm jit: too many parameters for a bridge".into());
+    }
+    let sig = native_signature(ty)?;
+    let mut f = Function::new("bridge", sig);
+    let helper = f.import_function(Signature::new(vec![Type::I64], vec![Type::I32]), HELPER_CALL_SLOW);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let params = b.block_params(entry).to_vec();
+    let vmctx = params[0];
+    if let Some(c) = callee {
+        let c = b.iconst(Type::I64, c as i64);
+        b.store(MemKind::I64, vmctx, c, VMCTX_PENDING);
+    }
+    for (i, &p) in params[1..].iter().enumerate() {
+        let t = b.func.value_type(p);
+        b.store(mem_kind(t), vmctx, p, VMCTX_ARGS + 8 * i as i32);
+    }
+    let status = b.call_fn(helper, &[vmctx])[0];
+    b.trap_if(status, trap::HELPER);
+    let mut results = Vec::new();
+    for (i, &t) in ir_types(&ty.results)?.iter().enumerate() {
+        results.push(b.load(mem_kind(t), vmctx, VMCTX_ARGS + 8 * i as i32));
+    }
+    b.ret(&results);
+    b.finish();
+    Ok(f)
+}
 
 fn ir_type(t: ValType) -> Result<Type, String> {
     Ok(match t {
