@@ -4838,6 +4838,7 @@ impl Interp {
         // confines the expensive platform pressure-relief call to phase changes, not ordinary
         // generational churn.
         scratch.clear();
+        crate::value::gc_trim_heap();
         self.gc_scratch = scratch;
         // Function bodies that ran (a module initialiser, a one-shot setup path) and then sat
         // untouched for a whole collection interval are released here and re-parsed if they

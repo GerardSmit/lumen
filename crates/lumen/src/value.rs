@@ -21,9 +21,9 @@ use std::sync::Arc;
 pub struct Gc(std::ptr::NonNull<GcBox>);
 
 #[repr(C)]
-struct GcBox {
-    strong: Cell<usize>,
-    weak: Cell<usize>,
+pub(in crate::value) struct GcBox {
+    pub(in crate::value) strong: Cell<usize>,
+    pub(in crate::value) weak: Cell<usize>,
     value: RefCell<Object>,
 }
 
@@ -38,14 +38,18 @@ pub struct WeakGc(std::ptr::NonNull<GcBox>);
 const WEAK_DANGLING: usize = usize::MAX;
 
 impl Gc {
+    /// Place a new object in `state`'s slab.
     #[inline]
-    fn alloc(cell: RefCell<Object>) -> Gc {
-        let b = Box::new(GcBox {
-            strong: Cell::new(1),
-            weak: Cell::new(1),
-            value: cell,
-        });
-        Gc(unsafe { std::ptr::NonNull::new_unchecked(Box::into_raw(b)) })
+    fn alloc(state: &GcState, cell: RefCell<Object>) -> Gc {
+        let p = state.heap.borrow_mut().alloc();
+        unsafe {
+            p.write(GcBox {
+                strong: Cell::new(1),
+                weak: Cell::new(1),
+                value: cell,
+            });
+            Gc(std::ptr::NonNull::new_unchecked(p))
+        }
     }
     #[inline]
     fn inner(&self) -> &GcBox {
@@ -217,12 +221,7 @@ impl Drop for WeakGc {
         let w = b.weak.get() - 1;
         b.weak.set(w);
         if w == 0 {
-            unsafe {
-                std::alloc::dealloc(
-                    self.0.as_ptr().cast(),
-                    std::alloc::Layout::new::<GcBox>(),
-                )
-            };
+            unsafe { heap::free(self.0.as_ptr()) };
         }
     }
 }
@@ -1010,8 +1009,7 @@ pub struct Object {
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
     /// GC scratch: the internal-reference count (low bits) and mark bit ([`GC_MARK`]) while
-    /// collection runs. Between collections the low bits hold this object's raw-registry slot;
-    /// the collector restores every slot before sweeping can drop an object.
+    /// collection runs; zero between collections.
     gc_internal: Cell<u32>,
 }
 
@@ -1039,11 +1037,10 @@ impl Object {
     pub(crate) fn gc_add_ref(&self) {
         self.gc_internal.set(self.gc_internal.get() + 1);
     }
-    /// Put the registry slot back after collection, keeping the mark for the sweep.
+    /// Drop the scratch reference count after collection, keeping the mark for the sweep.
     #[inline]
-    fn gc_set_slot(&self, slot: u32) {
-        self.gc_internal
-            .set(slot | (self.gc_internal.get() & GC_MARK));
+    fn gc_clear_refs(&self) {
+        self.gc_internal.set(self.gc_internal.get() & GC_MARK);
     }
 
     /// Give this object an exotic kind together with its internal-slot value.
@@ -1146,59 +1143,34 @@ impl Object {
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
         with_gc_state(|state| {
             state.live.set(state.live.get() + 1);
-            let mut reg = state.registry.borrow_mut();
-            let slot = match reg.free.pop() {
-                Some(slot) => slot,
-                None => {
-                    let slot = reg.entries.len();
-                    reg.entries.push(std::ptr::null());
-                    slot
-                }
-            };
-            let slot_u32: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-            let obj = Gc::alloc(RefCell::new(Object {
-                proto,
-                props,
-                call: Callable::None,
-                exotic,
-                extensible: true,
-                ic_plain: Cell::new(true),
-                is_constructor: false,
-                gc_internal: Cell::new(slot_u32),
-            }));
-            reg.entries[slot] = Gc::as_ptr(&obj);
-            obj
+            Gc::alloc(
+                state,
+                RefCell::new(Object {
+                    proto,
+                    props,
+                    call: Callable::None,
+                    exotic,
+                    extensible: true,
+                    ic_plain: Cell::new(true),
+                    is_constructor: false,
+                    gc_internal: Cell::new(0),
+                }),
+            )
         })
     }
 }
 
 impl Drop for Object {
     fn drop(&mut self) {
-        // Remove the raw registry pointer before the surrounding RcBox is freed. Tombstone reuse
-        // is O(1), does not touch another (possibly borrowed) object, and bounds registry memory
-        // by peak simultaneously-live objects instead of cumulative allocation count.
-        let slot = (self.gc_internal.get() & !GC_MARK) as usize;
-        let _ = try_with_gc_state(|state| {
-            let mut reg = state.registry.borrow_mut();
-            if slot < reg.entries.len() && !reg.entries[slot].is_null() {
-                reg.entries[slot] = std::ptr::null();
-                reg.free.push(slot);
-            }
-            drop(reg);
-            state.live.set(state.live.get() - 1);
-        });
         // `try_with` so a drop during thread-local teardown at process exit can't panic.
+        let _ = try_with_gc_state(|state| state.live.set(state.live.get() - 1));
     }
 }
 
-// The GC is a refcount-based cycle collector (lumen has no tracing GC). Every heap object is
-// registered through a non-owning raw slot and the live count is maintained via Object::new /
-// Drop. `Interp::gc_collect` reclaims objects referenced only by other (also-unreachable)
-// objects — see interpreter.rs.
-struct GcRegistry {
-    entries: Vec<*const RefCell<Object>>,
-    free: Vec<usize>,
-}
+// The GC is a refcount-based cycle collector (lumen has no tracing GC). Every heap object lives
+// in its interpreter's slab (`heap::ObjHeap`), which the collector walks to enumerate objects;
+// the live count is maintained via Object::new / Drop. `Interp::gc_collect` reclaims objects
+// referenced only by other (also-unreachable) objects — see interpreter.rs.
 
 /// One interpreter's heap bookkeeping: the object registry, the live count, and the scope
 /// registry (every `Scope` weakly, so the collector can see env-involving cycles).
@@ -1211,7 +1183,7 @@ struct GcRegistry {
 /// coroutine's strict ping-pong handoff is what makes sharing the (non-`Sync`) cells sound: at any
 /// instant exactly one of the threads that can reach this state is running.
 pub(crate) struct GcState {
-    registry: RefCell<GcRegistry>,
+    heap: RefCell<heap::ObjHeap>,
     live: Cell<i64>,
     scopes: RefCell<Vec<std::rc::Weak<RefCell<crate::interpreter::Scope>>>>,
     /// Every function the parser gave a lazy body, weakly: the collector's flush pass releases
@@ -1230,10 +1202,7 @@ unsafe impl Sync for GcState {}
 impl GcState {
     fn new() -> Arc<GcState> {
         Arc::new(GcState {
-            registry: RefCell::new(GcRegistry {
-                entries: Vec::new(),
-                free: Vec::new(),
-            }),
+            heap: RefCell::new(heap::ObjHeap::new()),
             live: Cell::new(0),
             scopes: RefCell::new(Vec::new()),
             lazy_fns: RefCell::new(Vec::new()),
@@ -1284,9 +1253,8 @@ pub(crate) fn live_objects_ptr() -> *const i64 {
     with_gc_state(|state| state.live.as_ptr())
 }
 
-/// Strong handles to every currently-live heap object. Registry slots are non-owning raw
-/// pointers tombstoned synchronously by `Object::drop`; while this thread-local borrow is held no
-/// object can disappear between reading a slot and incrementing its strong count.
+/// Strong handles to every currently-live heap object. The slab borrow is held for the walk,
+/// and taking a handle only increments counts, so no object can disappear mid-walk.
 #[allow(dead_code)]
 pub fn gc_snapshot() -> Vec<Gc> {
     let mut live = Vec::new();
@@ -1298,33 +1266,34 @@ pub fn gc_snapshot() -> Vec<Gc> {
 pub(crate) fn gc_snapshot_into(live: &mut Vec<Gc>) {
     live.clear();
     with_gc_state(|state| {
-        let reg = state.registry.borrow();
-        live.reserve(reg.entries.len().saturating_sub(reg.free.len()));
-        for &ptr in &reg.entries {
-            if ptr.is_null() {
-                continue;
-            }
-            unsafe {
-                Gc::increment_strong_count(ptr);
-                live.push(Gc::from_raw(ptr));
-            }
-        }
+        let heap = state.heap.borrow();
+        live.reserve(state.live.get().max(0) as usize);
+        heap.for_each_live(|b| unsafe {
+            (*b).strong.set((*b).strong.get() + 1);
+            live.push(Gc(std::ptr::NonNull::new_unchecked(b)));
+        });
     })
 }
 
-/// Restore `gc_internal` from scratch reference counts to registry-slot ids. Collection calls
-/// this after marking and before sweeping side tables/properties can release the final owner of
-/// any object, so `Object::drop` always sees its stable slot.
+/// Clear the scratch reference counts left in `gc_internal` by a collection, keeping the mark
+/// for the sweep. Collection calls this after marking.
 pub(crate) fn gc_restore_registry_slots() {
     with_gc_state(|state| {
-        let reg = state.registry.borrow();
-        for (slot, &ptr) in reg.entries.iter().enumerate() {
-            if !ptr.is_null() {
-                let slot: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-                unsafe { (*ptr).borrow().gc_set_slot(slot) };
-            }
-        }
+        state.heap.borrow().for_each_live(|b| unsafe {
+            (*b).value.borrow().gc_clear_refs();
+        });
     });
+}
+
+/// Return empty slab chunks to the system (after a sweep).
+pub(crate) fn gc_trim_heap() {
+    with_gc_state(|state| state.heap.borrow_mut().trim());
+}
+
+/// Slab chunks currently mapped for this thread's heap.
+#[cfg(test)]
+pub(crate) fn gc_heap_chunks() -> usize {
+    with_gc_state(|state| state.heap.borrow().chunk_count())
 }
 
 pub(crate) fn register_scope(e: &crate::interpreter::Env) {
@@ -1398,14 +1367,6 @@ pub(crate) fn flush_cold_lazy_bodies() -> usize {
 
 pub(crate) fn lazy_function_registry_len() -> usize {
     with_gc_state(|state| state.lazy_fns.borrow().len())
-}
-
-#[cfg(test)]
-pub(crate) fn gc_registry_stats() -> (usize, usize) {
-    with_gc_state(|state| {
-        let reg = state.registry.borrow();
-        (reg.entries.len(), reg.free.len())
-    })
 }
 
 /// The element type of a TypedArray.
@@ -1827,6 +1788,7 @@ impl Property {
 }
 
 pub(crate) mod gc_edges;
+mod heap;
 mod props;
 pub(crate) use props::FnMaps;
 pub use props::Props;
