@@ -835,9 +835,9 @@ fn gc_registry_reuses_dead_object_slots() {
     // A live raw slot must become a strong snapshot handle, then tombstone synchronously when
     // the final owner disappears; the same slot can be reused without retaining the dead RcBox.
     let object = crate::value::Object::new(None);
-    let ptr = Rc::as_ptr(&object);
+    let ptr = crate::value::Gc::as_ptr(&object);
     let snapshot = crate::value::gc_snapshot();
-    assert!(snapshot.iter().any(|o| Rc::as_ptr(o) == ptr));
+    assert!(snapshot.iter().any(|o| crate::value::Gc::as_ptr(o) == ptr));
     drop(snapshot);
     drop(object);
     let (slots_final, free_final) = crate::value::gc_registry_stats();

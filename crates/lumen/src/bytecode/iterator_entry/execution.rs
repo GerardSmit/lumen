@@ -1,4 +1,5 @@
 //! Experimental call/result elision through the existing logical call boundary.
+use crate::value::Gc;
 use super::{classification, same_realm, Feedback, Outcome};
 use crate::interpreter::{call_entry::EntryResult, Abrupt, Interp};
 use crate::value::{Callable, Value};
@@ -57,7 +58,7 @@ fn try_cached(
     let Value::Obj(object) = next else {
         return None;
     };
-    if site.callee.as_ptr() != Rc::as_ptr(object) {
+    if site.callee.as_ptr() != Gc::as_ptr(object) {
         return None;
     }
     {
@@ -155,8 +156,8 @@ fn entry_environment(i: &Interp, next: &Value) -> Option<crate::interpreter::Env
     let Value::Obj(callee) = next else {
         return None;
     };
-    if !i.ordinary_get_ptr(Rc::as_ptr(callee) as usize)
-        || i.class_info.contains_key(&(Rc::as_ptr(callee) as usize))
+    if !i.ordinary_get_ptr(Gc::as_ptr(callee) as usize)
+        || i.class_info.contains_key(&(Gc::as_ptr(callee) as usize))
     {
         return None;
     }
@@ -342,7 +343,7 @@ mod tests {
         let crate::value::Value::Obj(next) = next else {
             panic!("callable")
         };
-        let weak = std::rc::Rc::downgrade(&next);
+        let weak = crate::value::Gc::downgrade(&next);
         let env_weak = {
             let borrowed = next.borrow();
             let crate::value::Callable::User(user) = &borrowed.call else {

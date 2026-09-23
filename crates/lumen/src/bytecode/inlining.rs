@@ -77,8 +77,8 @@ impl Compiler {
             slot
         });
         self.inline_targets.push(InlineTarget {
-            expected: Rc::as_ptr(&w.obj) as usize,
-            pin: Rc::downgrade(&w.obj),
+            expected: Gc::as_ptr(&w.obj) as usize,
+            pin: Gc::downgrade(&w.obj),
             expected_env: w.expected_env,
             argc,
             check_this: has_this && w.check_this,

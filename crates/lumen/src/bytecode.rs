@@ -38,6 +38,7 @@ mod switch;
 mod this_binding;
 mod write_strictness;
 
+use crate::value::Gc;
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -330,7 +331,7 @@ pub struct InlineTarget {
     pub expected: usize,
     /// Keeps `expected` from ever being recycled (same ABA argument as [`CallIc`]): a live
     /// `Value::Obj` whose payload equals it therefore IS the same, still-alive function.
-    pub pin: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+    pub pin: crate::value::WeakGc,
     /// Exact shared closure environment required by a non-global free-name inline. Zero means
     /// the callee has no such dependency.
     pub expected_env: usize,
@@ -772,7 +773,7 @@ pub struct Chunk {
     /// keyed by that address — one pin per distinct callee no matter how often sites refill, so a
     /// megamorphic site can't exhaust the budget for the whole chunk.
     call_pins: std::cell::RefCell<
-        crate::fasthash::FastMap<usize, std::rc::Weak<std::cell::RefCell<crate::value::Object>>>,
+        crate::fasthash::FastMap<usize, crate::value::WeakGc>,
     >,
     /// Guard data for speculatively inlined call sites (`Op::InlineGuard` indexes this).
     inline_targets: Vec<InlineTarget>,
@@ -815,7 +816,7 @@ struct ArgumentsForwarder {
 struct ForwarderRuntime {
     initializer: usize,
     apply: usize,
-    pin: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+    pin: crate::value::WeakGc,
     chunk: Rc<Chunk>,
 }
 
@@ -961,7 +962,7 @@ impl Chunk {
         self.call_pins
             .borrow_mut()
             .entry(entry.call.callee)
-            .or_insert_with(|| Rc::downgrade(constructor));
+            .or_insert_with(|| Gc::downgrade(constructor));
     }
     /// Whether calls need a real activation environment (captured locals / lexical `this`).
     fn makes_env(&self) -> bool {
@@ -1888,7 +1889,7 @@ fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])
 
 type NamePin = Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>;
 type NameSeed = (Rc<str>, NameIc, NamePin, Option<u64>);
-type CallPin = std::rc::Weak<std::cell::RefCell<crate::value::Object>>;
+type CallPin = crate::value::WeakGc;
 
 struct CallSeed {
     entries: [CallIc; CALL_IC_WAYS],
@@ -5768,7 +5769,7 @@ impl Chunk {
             if ic.callee == 0 || out.iter().any(|(seen, _)| seen.callee == ic.callee) {
                 continue;
             }
-            if let Some(obj) = pins.get(&ic.callee).and_then(std::rc::Weak::upgrade) {
+            if let Some(obj) = pins.get(&ic.callee).and_then(crate::value::WeakGc::upgrade) {
                 out.push((ic, obj));
             }
         }
@@ -5926,7 +5927,7 @@ impl Chunk {
         if !Rc::ptr_eq(env, &i.global_env) {
             return self.name_path_fill(i, env, n, c);
         }
-        if !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize) {
+        if !i.ordinary_get_ptr(Gc::as_ptr(&i.global) as usize) {
             return None;
         }
         let g = i.global.borrow();
@@ -6154,14 +6155,14 @@ impl Chunk {
         initializer: &crate::value::Gc,
         apply: usize,
     ) -> Option<Rc<Chunk>> {
-        let initializer_ptr = Rc::as_ptr(initializer) as usize;
+        let initializer_ptr = Gc::as_ptr(initializer) as usize;
         self.arguments_forwarder_runtime
             .borrow()
             .as_ref()
             .filter(|runtime| {
                 runtime.initializer == initializer_ptr
                     && runtime.apply == apply
-                    && runtime.pin.as_ptr() == Rc::as_ptr(initializer)
+                    && runtime.pin.as_ptr() == Gc::as_ptr(initializer)
             })
             .map(|runtime| runtime.chunk.clone())
     }
@@ -6172,11 +6173,11 @@ impl Chunk {
         apply: usize,
         runtime_chunk: Rc<Chunk>,
     ) {
-        let initializer_ptr = Rc::as_ptr(initializer) as usize;
+        let initializer_ptr = Gc::as_ptr(initializer) as usize;
         *self.arguments_forwarder_runtime.borrow_mut() = Some(ForwarderRuntime {
             initializer: initializer_ptr,
             apply,
-            pin: Rc::downgrade(initializer),
+            pin: Gc::downgrade(initializer),
             chunk: runtime_chunk,
         });
     }
@@ -6909,10 +6910,10 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                     // execute the named builtin unchanged.
                     let dense = match (&*base, &*base.add(3)) {
                         (Value::Obj(_), Value::Obj(list))
-                            if i.ordinary_get_ptr(Rc::as_ptr(list) as usize)
+                            if i.ordinary_get_ptr(Gc::as_ptr(list) as usize)
                                 && !i
                                     .mapped_arguments
-                                    .contains_key(&(Rc::as_ptr(list) as usize)) =>
+                                    .contains_key(&(Gc::as_ptr(list) as usize)) =>
                         {
                             let b = list.borrow();
                             let len = match b.props.get("length") {
@@ -7173,8 +7174,8 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
     {
         let b = re_obj.borrow();
         if b.props.contains("exec")
-            || b.proto.as_ref().is_none_or(|p| !Rc::ptr_eq(p, re_proto))
-            || !i.regexps.contains_key(&(Rc::as_ptr(re_obj) as usize))
+            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, re_proto))
+            || !i.regexps.contains_key(&(Gc::as_ptr(re_obj) as usize))
         {
             decline!();
         }
@@ -7197,7 +7198,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
         decline!();
     }
 
-    let regexp_matcher = match i.regexps.get(&(Rc::as_ptr(re_obj) as usize)) {
+    let regexp_matcher = match i.regexps.get(&(Gc::as_ptr(re_obj) as usize)) {
         Some(matcher) => matcher.clone(),
         None => decline!(),
     };
@@ -7317,7 +7318,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_exec_discard(
             let Value::Obj(array_obj) = array_value else {
                 decline!();
             };
-            if !i.ordinary_get_ptr(Rc::as_ptr(&array_obj) as usize) {
+            if !i.ordinary_get_ptr(Gc::as_ptr(&array_obj) as usize) {
                 decline!();
             }
             let Value::Num(index) = *ctx.slots.add(index as usize) else {
@@ -7410,7 +7411,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_replace_discard(
     let Value::Obj(array_obj) = array_value else {
         decline!();
     };
-    if !i.ordinary_get_ptr(Rc::as_ptr(&array_obj) as usize) {
+    if !i.ordinary_get_ptr(Gc::as_ptr(&array_obj) as usize) {
         decline!();
     }
     let Value::Num(index) = *ctx.slots.add(*index as usize) else {
@@ -7505,7 +7506,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
     let Value::Obj(array_obj) = array_value else {
         decline!();
     };
-    if !i.ordinary_get_ptr(Rc::as_ptr(&array_obj) as usize) {
+    if !i.ordinary_get_ptr(Gc::as_ptr(&array_obj) as usize) {
         decline!();
     }
     let Value::Num(index) = *ctx.slots.add(*index as usize) else {
@@ -7690,8 +7691,8 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
     sp = args_ptr.sub(1);
     match sp.read() {
         Value::Obj(o) => {
-            if Rc::strong_count(&o) > 1 {
-                unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+            if Gc::strong_count(&o) > 1 {
+                unsafe { Gc::decrement_strong_count(Gc::into_raw(o)) };
             } else {
                 drop(o);
             }
@@ -7943,8 +7944,8 @@ unsafe fn jit_new_inner(
         *sp = unsafe { args_ptr.sub(1) };
         match unsafe { sp.read() } {
             Value::Obj(o) => {
-                if Rc::strong_count(&o) > 1 {
-                    unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+                if Gc::strong_count(&o) > 1 {
+                    unsafe { Gc::decrement_strong_count(Gc::into_raw(o)) };
                 } else {
                     drop(o);
                 }
@@ -8218,10 +8219,10 @@ unsafe fn jit_call_inner(
                 };
                 if let Some(nf) = nf {
                     {
-                        let key = Rc::as_ptr(o) as usize;
+                        let key = Gc::as_ptr(o) as usize;
                         let mut p = chunk.call_pins.borrow_mut();
                         if p.len() < 4096 || p.contains_key(&key) {
-                            p.entry(key).or_insert_with(|| Rc::downgrade(o));
+                            p.entry(key).or_insert_with(|| Gc::downgrade(o));
                             drop(p);
                             if !i
                                 .global_env_pins
@@ -8332,8 +8333,8 @@ unsafe fn jit_call_inner(
                     *sp = args_ptr.sub(1);
                     match sp.read() {
                         Value::Obj(o) => {
-                            if Rc::strong_count(&o) > 1 {
-                                unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+                            if Gc::strong_count(&o) > 1 {
+                                unsafe { Gc::decrement_strong_count(Gc::into_raw(o)) };
                             } else {
                                 drop(o);
                             }
@@ -8366,8 +8367,8 @@ unsafe fn jit_call_inner(
         // outlined generic Value drop.
         match sp.read() {
             Value::Obj(o) => {
-                if Rc::strong_count(&o) > 1 {
-                    unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+                if Gc::strong_count(&o) > 1 {
+                    unsafe { Gc::decrement_strong_count(Gc::into_raw(o)) };
                 } else {
                     drop(o);
                 }
@@ -8506,7 +8507,7 @@ unsafe fn jit_callstat(
             }
         }
         if let Value::Obj(o) = &*sp.sub(argc + 1) {
-            if Rc::strong_count(o) <= 1 {
+            if Gc::strong_count(o) <= 1 {
                 break 'r "gate: callee refcount <= 1";
             }
         }

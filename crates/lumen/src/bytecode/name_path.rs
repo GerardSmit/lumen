@@ -61,7 +61,7 @@ enum Holder {
     /// The final layout guard proves the index names the same binding in a fresh activation.
     Slot(usize),
     Global {
-        object: Weak<RefCell<Object>>,
+        object: crate::value::WeakGc,
         shape: u32,
         slot: usize,
     },
@@ -150,7 +150,7 @@ impl GuardedPath {
                 slot,
             } => {
                 if scope_pointer != Rc::as_ptr(&interp.global_env)
-                    || object.as_ptr() != Rc::as_ptr(&interp.global)
+                    || object.as_ptr() != Gc::as_ptr(&interp.global)
                 {
                     return None;
                 }
@@ -221,7 +221,7 @@ impl NamePath {
                 drop(global);
                 let value = global_value(interp, &interp.global, shape, slot)?;
                 let holder = Holder::Global {
-                    object: Rc::downgrade(&interp.global),
+                    object: Gc::downgrade(&interp.global),
                     shape,
                     slot,
                 };
@@ -239,7 +239,7 @@ impl NamePath {
 }
 
 fn global_value(interp: &Interp, object: &Gc, shape: u32, slot: usize) -> Option<Value> {
-    if !interp.ordinary_get_ptr(Rc::as_ptr(object) as usize) {
+    if !interp.ordinary_get_ptr(Gc::as_ptr(object) as usize) {
         return None;
     }
     let object = object.borrow();

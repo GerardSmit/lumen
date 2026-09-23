@@ -8,7 +8,122 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub type Gc = Rc<RefCell<Object>>;
+/// A handle to a heap object. Opaque on purpose: every engine site goes through this API rather
+/// than `Rc`/`RefCell` directly, so the storage underneath (today a refcounted `RcBox`) can be
+/// replaced by a traced heap without touching call sites. `repr(transparent)` keeps the stored
+/// word identical to the `Rc` pointer the JIT's measured layout probes expect.
+#[repr(transparent)]
+pub struct Gc(Rc<RefCell<Object>>);
+
+/// A non-owning [`Gc`]: upgrades while the object is alive.
+#[repr(transparent)]
+pub struct WeakGc(std::rc::Weak<RefCell<Object>>);
+
+impl Clone for Gc {
+    #[inline]
+    fn clone(&self) -> Gc {
+        Gc(Rc::clone(&self.0))
+    }
+}
+
+impl std::ops::Deref for Gc {
+    type Target = RefCell<Object>;
+    #[inline]
+    fn deref(&self) -> &RefCell<Object> {
+        &self.0
+    }
+}
+
+impl Gc {
+    #[inline]
+    fn alloc(cell: RefCell<Object>) -> Gc {
+        Gc(Rc::new(cell))
+    }
+    #[inline]
+    pub fn ptr_eq(a: &Gc, b: &Gc) -> bool {
+        Rc::ptr_eq(&a.0, &b.0)
+    }
+    /// The address of the object cell — stable for the object's lifetime, usable as an identity.
+    #[inline]
+    pub fn as_ptr(this: &Gc) -> *const RefCell<Object> {
+        Rc::as_ptr(&this.0)
+    }
+    #[inline]
+    pub fn downgrade(this: &Gc) -> WeakGc {
+        WeakGc(Rc::downgrade(&this.0))
+    }
+    #[inline]
+    pub fn strong_count(this: &Gc) -> usize {
+        Rc::strong_count(&this.0)
+    }
+    /// Consume the handle into a raw cell pointer (see [`Gc::from_raw`]).
+    #[inline]
+    pub fn into_raw(this: Gc) -> *const RefCell<Object> {
+        Rc::into_raw(this.0)
+    }
+    /// # Safety
+    /// `ptr` must come from [`Gc::into_raw`] (or [`Gc::as_ptr`] with a matching strong count).
+    #[inline]
+    pub unsafe fn from_raw(ptr: *const RefCell<Object>) -> Gc {
+        Gc(Rc::from_raw(ptr))
+    }
+    /// # Safety
+    /// `ptr` must point at a live object cell obtained from [`Gc::as_ptr`] / [`Gc::into_raw`].
+    #[inline]
+    pub unsafe fn increment_strong_count(ptr: *const RefCell<Object>) {
+        Rc::increment_strong_count(ptr)
+    }
+    /// # Safety
+    /// As [`Gc::increment_strong_count`], and the count being released must be owned.
+    #[inline]
+    pub unsafe fn decrement_strong_count(ptr: *const RefCell<Object>) {
+        Rc::decrement_strong_count(ptr)
+    }
+    #[inline]
+    pub fn get_mut(this: &mut Gc) -> Option<&mut RefCell<Object>> {
+        Rc::get_mut(&mut this.0)
+    }
+    #[inline]
+    pub fn try_unwrap(this: Gc) -> Result<RefCell<Object>, Gc> {
+        Rc::try_unwrap(this.0).map_err(Gc)
+    }
+}
+
+impl WeakGc {
+    #[inline]
+    pub fn new() -> WeakGc {
+        WeakGc(std::rc::Weak::new())
+    }
+    #[inline]
+    pub fn upgrade(&self) -> Option<Gc> {
+        self.0.upgrade().map(Gc)
+    }
+    #[inline]
+    pub fn as_ptr(&self) -> *const RefCell<Object> {
+        self.0.as_ptr()
+    }
+    #[inline]
+    pub fn ptr_eq(&self, other: &WeakGc) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+    #[inline]
+    pub fn strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+}
+
+impl Clone for WeakGc {
+    #[inline]
+    fn clone(&self) -> WeakGc {
+        WeakGc(self.0.clone())
+    }
+}
+
+impl Default for WeakGc {
+    fn default() -> WeakGc {
+        WeakGc::new()
+    }
+}
 
 /// A native (Rust-implemented) function. It can only throw (via `Err`), never break/return/continue,
 /// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract.
@@ -274,19 +389,19 @@ mod packed_value_tests {
     #[test]
     fn packed_value_moves_reference_ownership_without_a_bump() {
         let obj = Object::new(None);
-        let before = Rc::strong_count(&obj);
+        let before = Gc::strong_count(&obj);
         let packed = PackedValue::pack(Value::Obj(obj.clone()));
-        assert_eq!(Rc::strong_count(&obj), before + 1);
+        assert_eq!(Gc::strong_count(&obj), before + 1);
         let out = packed.into_value();
-        assert_eq!(Rc::strong_count(&obj), before + 1);
+        assert_eq!(Gc::strong_count(&obj), before + 1);
         drop(out);
-        assert_eq!(Rc::strong_count(&obj), before);
+        assert_eq!(Gc::strong_count(&obj), before);
     }
 
     #[test]
     fn packed_frame_conversion_is_overlap_safe_and_ownership_neutral() {
         let obj = Object::new(None);
-        let before = Rc::strong_count(&obj);
+        let before = Gc::strong_count(&obj);
         let mut frame: [std::mem::MaybeUninit<Value>; 5] =
             std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
         let base = frame.as_mut_ptr().cast::<Value>();
@@ -297,14 +412,14 @@ mod packed_value_tests {
             base.add(3).write(Value::Null);
             base.add(4).write(Value::Num(-0.0));
         }
-        assert_eq!(Rc::strong_count(&obj), before + 1);
+        assert_eq!(Gc::strong_count(&obj), before + 1);
         unsafe {
             PackedValue::pack_in_place(base, 5);
-            assert_eq!(Rc::strong_count(&obj), before + 1);
+            assert_eq!(Gc::strong_count(&obj), before + 1);
             PackedValue::unpack_in_place(base, 5);
-            assert_eq!(Rc::strong_count(&obj), before + 1);
+            assert_eq!(Gc::strong_count(&obj), before + 1);
             assert!(matches!(&*base.add(0), Value::Num(n) if *n == 1.5));
-            assert!(matches!(&*base.add(1), Value::Obj(o) if Rc::ptr_eq(o, &obj)));
+            assert!(matches!(&*base.add(1), Value::Obj(o) if Gc::ptr_eq(o, &obj)));
             assert!(matches!(&*base.add(2), Value::Bool(true)));
             assert!(matches!(&*base.add(3), Value::Null));
             assert!(matches!(&*base.add(4), Value::Num(n) if n.to_bits() == (-0.0f64).to_bits()));
@@ -312,7 +427,7 @@ mod packed_value_tests {
                 std::ptr::drop_in_place(base.add(k));
             }
         }
-        assert_eq!(Rc::strong_count(&obj), before);
+        assert_eq!(Gc::strong_count(&obj), before);
     }
 }
 
@@ -438,7 +553,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             && some_word != 0
             && unsafe { *(some_word as *const usize) } == strong
     };
-    let as_ptr = Rc::as_ptr(sample) as usize; // → the RefCell<Object> (RcBox value field)
+    let as_ptr = Gc::as_ptr(sample) as usize; // → the RefCell<Object> (RcBox value field)
     let stored_word = unsafe { *(sample as *const Gc as *const usize) };
     let gc_data_off = as_ptr.wrapping_sub(stored_word);
     let obj_addr = &*sample.borrow() as *const Object as usize;
@@ -457,7 +572,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let rc_strong_off = 0usize; // strong count is the RcBox's first field
                                 // Verify: the strong count sits at `stored + rc_strong_off` and reads the live count.
     let strong_ok =
-        unsafe { *((stored + rc_strong_off) as *const usize) } == Rc::strong_count(sample);
+        unsafe { *((stored + rc_strong_off) as *const usize) } == Gc::strong_count(sample);
 
     // Vec data-pointer and length words (RawVec layout is not guaranteed — locate them by value).
     // Capacity 3 / length 1 makes the three words distinguishable.
@@ -933,7 +1048,7 @@ impl Object {
                 }
             };
             let slot_u32: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-            let obj = Rc::new(RefCell::new(Object {
+            let obj = Gc::alloc(RefCell::new(Object {
                 proto,
                 props,
                 call: Callable::None,
@@ -943,7 +1058,7 @@ impl Object {
                 is_constructor: false,
                 gc_internal: Cell::new(slot_u32),
             }));
-            reg.entries[slot] = Rc::as_ptr(&obj);
+            reg.entries[slot] = Gc::as_ptr(&obj);
             obj
         })
     }
@@ -1082,8 +1197,8 @@ pub(crate) fn gc_snapshot_into(live: &mut Vec<Gc>) {
                 continue;
             }
             unsafe {
-                Rc::increment_strong_count(ptr);
-                live.push(Rc::from_raw(ptr));
+                Gc::increment_strong_count(ptr);
+                live.push(Gc::from_raw(ptr));
             }
         }
     })

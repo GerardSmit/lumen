@@ -10,7 +10,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     // SharedArrayBuffer.prototype accessors require a shared buffer: reject a plain ArrayBuffer
     // `this` with a TypeError (the shared side table is the discriminator).
     fn require_shared_buffer(i: &Interp, this: &Value) -> Result<(), Value> {
-        let shared = matches!(this, Value::Obj(o) if i.shared_buffers.contains_key(&(Rc::as_ptr(o) as usize)));
+        let shared = matches!(this, Value::Obj(o) if i.shared_buffers.contains_key(&(Gc::as_ptr(o) as usize)));
         if !shared {
             return Err(i.make_error("TypeError", "requires a SharedArrayBuffer"));
         }
@@ -28,7 +28,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         let p = this
             .as_obj()
             .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
-            .map(|o| Rc::as_ptr(o) as usize)
+            .map(|o| Gc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))?;
         Ok(Value::Num(
             i.array_buffers.get(&p).map(|b| b.len()).unwrap_or(0) as f64,
@@ -59,7 +59,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         let mv = ab(i.get_member(&this, "maxByteLength"))?;
         let max = ab(i.to_number(&mv))? as usize;
         let new_len = ab(i.to_number(&arg(a, 0)))?;
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         let cur = i.array_buffers.get(&ptr).map(|b| b.len()).unwrap_or(0);
         if !new_len.is_finite() || new_len < cur as f64 || new_len as usize > max {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
@@ -79,14 +79,14 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         // RequireInternalSlot + IsSharedArrayBuffer(O).
         let o = this
             .as_obj()
-            .filter(|o| i.shared_buffers.contains_key(&(Rc::as_ptr(o) as usize)))
+            .filter(|o| i.shared_buffers.contains_key(&(Gc::as_ptr(o) as usize)))
             .ok_or_else(|| {
                 i.make_error(
                     "TypeError",
                     "SharedArrayBuffer.prototype.slice requires a SharedArrayBuffer",
                 )
             })?;
-        let ptr = Rc::as_ptr(o) as usize;
+        let ptr = Gc::as_ptr(o) as usize;
         let len = i.array_buffers.get(&ptr).map(|b| b.len()).unwrap_or(0) as i64;
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
@@ -106,8 +106,8 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         let ctor = species_constructor(i, &this, &sab_ctor)?;
         let new_buf = ab(i.construct(ctor, &[Value::Num(new_len as f64)]))?;
         let nptr = match &new_buf {
-            Value::Obj(no) if i.shared_buffers.contains_key(&(Rc::as_ptr(no) as usize)) => {
-                Rc::as_ptr(no) as usize
+            Value::Obj(no) if i.shared_buffers.contains_key(&(Gc::as_ptr(no) as usize)) => {
+                Gc::as_ptr(no) as usize
             }
             _ => {
                 return Err(i.make_error(
@@ -179,7 +179,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         {
             return Err(i.make_error("RangeError", "SharedArrayBuffer allocation too large"));
         }
-        let bp = Rc::as_ptr(&obj) as usize;
+        let bp = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         i.array_buffers.insert(bp, vec![0u8; len]);
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
@@ -218,7 +218,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
         .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
         .cloned()
         .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
-    let ptr = Rc::as_ptr(&o) as usize;
+    let ptr = Gc::as_ptr(&o) as usize;
     if i.shared_buffers.contains_key(&ptr) {
         return Err(i.make_error("TypeError", "transfer requires a non-shared ArrayBuffer"));
     }
@@ -266,7 +266,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
 
 fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.array_buffers.insert(p, vec![0u8; byte_len]);
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
@@ -285,7 +285,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     // `this` with a TypeError (both buffer kinds carry `__abMaxByteLength`, so brand alone isn't enough).
     fn reject_shared_buffer(i: &Interp, this: &Value) -> Result<(), Value> {
         if let Value::Obj(o) = this {
-            if i.shared_buffers.contains_key(&(Rc::as_ptr(o) as usize)) {
+            if i.shared_buffers.contains_key(&(Gc::as_ptr(o) as usize)) {
                 return Err(i.make_error("TypeError", "requires a non-shared ArrayBuffer"));
             }
         }
@@ -303,7 +303,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let p = this
             .as_obj()
             .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
-            .map(|o| Rc::as_ptr(o) as usize)
+            .map(|o| Gc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         // Detached (absent from the side table) → 0.
         Ok(Value::Num(
@@ -322,7 +322,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
                 // A detached buffer reports 0.
                 let detached = this
                     .as_obj()
-                    .map(|o| !i.array_buffers.contains_key(&(Rc::as_ptr(o) as usize)))
+                    .map(|o| !i.array_buffers.contains_key(&(Gc::as_ptr(o) as usize)))
                     .unwrap_or(true);
                 Ok(if detached { Value::Num(0.0) } else { v })
             }
@@ -346,7 +346,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         Ok(Value::Bool(
-            !i.array_buffers.contains_key(&(Rc::as_ptr(o) as usize)),
+            !i.array_buffers.contains_key(&(Gc::as_ptr(o) as usize)),
         ))
     });
     ab_getter(it, &proto, "immutable", |i, this, _| {
@@ -356,7 +356,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         Ok(Value::Bool(
-            i.immutable_buffers.contains(&(Rc::as_ptr(o) as usize)),
+            i.immutable_buffers.contains(&(Gc::as_ptr(o) as usize)),
         ))
     });
     it.def_method(&proto, "slice", 2, |i, this, a| {
@@ -371,7 +371,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
                     "ArrayBuffer.prototype.slice requires an ArrayBuffer",
                 )
             })?;
-        let ptr = Rc::as_ptr(o) as usize;
+        let ptr = Gc::as_ptr(o) as usize;
         if !i.array_buffers.contains_key(&ptr) {
             return Err(i.make_error("TypeError", "Cannot slice a detached ArrayBuffer"));
         }
@@ -394,7 +394,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let new_buf = ab(i.construct(ctor, &[Value::Num(new_len as f64)]))?;
         let nptr = match &new_buf {
             Value::Obj(no) if no.borrow().props.contains("__abMaxByteLength") => {
-                Rc::as_ptr(no) as usize
+                Gc::as_ptr(no) as usize
             }
             _ => {
                 return Err(i.make_error("TypeError", "slice species did not create an ArrayBuffer"))
@@ -451,17 +451,17 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         }
         // The coercion may have detached the buffer — that is a TypeError, checked before the
         // max-length RangeError.
-        if !i.array_buffers.contains_key(&(Rc::as_ptr(&o) as usize)) {
+        if !i.array_buffers.contains_key(&(Gc::as_ptr(&o) as usize)) {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
         }
         if new_len as usize > max {
             return Err(i.make_error("RangeError", "ArrayBuffer resize out of range"));
         }
         let n = new_len as usize;
-        if i.immutable_buffers.contains(&(Rc::as_ptr(&o) as usize)) {
+        if i.immutable_buffers.contains(&(Gc::as_ptr(&o) as usize)) {
             return Err(i.make_error("TypeError", "ArrayBuffer is immutable"));
         }
-        if let Some(buf) = i.array_buffers.get_mut(&(Rc::as_ptr(&o) as usize)) {
+        if let Some(buf) = i.array_buffers.get_mut(&(Gc::as_ptr(&o) as usize)) {
             buf.resize(n, 0);
         }
         // byteLength derives from the backing store length, which the resize above updated.
@@ -474,7 +474,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     it.def_method(&proto, "transferToImmutable", 0, |i, this, a| {
         let bv = ab_transfer_fixed(i, this, a)?;
         if let Value::Obj(o) = &bv {
-            i.immutable_buffers.insert(Rc::as_ptr(o) as usize);
+            i.immutable_buffers.insert(Gc::as_ptr(o) as usize);
         }
         Ok(bv)
     });
@@ -483,7 +483,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let ptr = this
             .as_obj()
             .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
-            .map(|o| Rc::as_ptr(o) as usize)
+            .map(|o| Gc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         if !i.array_buffers.contains_key(&ptr) {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
@@ -557,7 +557,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             return Err(i.make_error("RangeError", "ArrayBuffer allocation too large"));
         }
         let len = n as usize;
-        let p = Rc::as_ptr(&obj) as usize;
+        let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         i.array_buffers.insert(p, vec![0u8; len]);
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
@@ -576,7 +576,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         // A view is a TypedArray or a DataView (identified by its `__dv_buffer` internal slot).
         let is_view = match arg(a, 0) {
             Value::Obj(o) => {
-                i.typed_arrays.contains_key(&(Rc::as_ptr(&o) as usize))
+                i.typed_arrays.contains_key(&(Gc::as_ptr(&o) as usize))
                     || o.borrow().props.contains("__dv_buffer")
             }
             _ => false,
@@ -1393,10 +1393,10 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         // by the [[ArrayBufferData]] marker for a detached buffer (still an ArrayBuffer, so it can't
         // fall through to the array-like path — using a detached buffer is a TypeError).
         Some(Value::Obj(o))
-            if i.array_buffers.contains_key(&(Rc::as_ptr(o) as usize))
+            if i.array_buffers.contains_key(&(Gc::as_ptr(o) as usize))
                 || o.borrow().props.contains("__abMaxByteLength") =>
         {
-            let bp = Rc::as_ptr(o) as usize;
+            let bp = Gc::as_ptr(o) as usize;
             let bv = Value::Obj(o.clone());
             // byteOffset is a ToIndex value and must be a multiple of the element size — both
             // observed BEFORE the detached-buffer check (spec steps 6-7 precede step 9).
@@ -1549,7 +1549,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         _ => i.extra_protos.get(kind.name()).cloned(),
     };
     let obj = Object::new(proto);
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     obj.borrow().ic_plain.set(false);
     i.typed_arrays.insert(
@@ -1603,7 +1603,7 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let source = arg(args, 0);
     let src_info = source
         .as_obj()
-        .and_then(|o| i.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied());
+        .and_then(|o| i.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied());
     if let Some(src_info) = src_info {
         // SetTypedArrayFromTypedArray: the source view must be in bounds, the target long enough,
         // and the content types must match (mixing BigInt and Number is a TypeError).

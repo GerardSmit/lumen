@@ -1,5 +1,6 @@
 //! Set algebra and set-like protocol helpers.
 
+use crate::value::Gc;
 use super::{canonicalize_map_key, coll_live_len};
 use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::builtins::{ab, arg, coll_ptr_kind, new_from_ctor, same_value_zero};
@@ -17,7 +18,7 @@ fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
 fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
     let obj =
         new_from_ctor(i, "Set").unwrap_or_else(|_| Object::new(i.extra_protos.get("Set").cloned()));
-    let ptr = Rc::as_ptr(&obj) as usize;
+    let ptr = Gc::as_ptr(&obj) as usize;
     let mut entries = CollectionData::new(CollectionKind::Set);
     for v in values {
         // Set records canonicalize -0 to +0.

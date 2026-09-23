@@ -537,7 +537,7 @@ pub(super) fn install_promise(it: &mut Interp) {
 /// else resolves a fresh NewPromiseCapability(C) through the capability's own resolve.
 fn promise_resolve(i: &mut Interp, ctor: &Value, v: Value) -> Result<Value, Value> {
     if let Value::Obj(o) = &v {
-        if i.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
+        if i.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
             let c = ab(i.get_member(&v, "constructor"))?;
             if same_value(&c, ctor) {
                 return Ok(v);

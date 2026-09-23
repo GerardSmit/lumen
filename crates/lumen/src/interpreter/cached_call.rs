@@ -36,7 +36,7 @@ impl Interp {
     ) -> Option<Result<Value, Abrupt>> {
         let Value::Obj(o) = callee else { return None };
         let site = caller.call_site(site_index);
-        let key = Rc::as_ptr(o) as usize;
+        let key = Gc::as_ptr(o) as usize;
         let genv = Rc::as_ptr(&self.global_env) as usize;
         // Probe the identity fields through the Cell without copying whole entries; only the
         // hit is copied out (nothing re-entrant runs between the probe and the copy).

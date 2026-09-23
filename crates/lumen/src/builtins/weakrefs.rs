@@ -74,7 +74,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         if !matches!(token, Value::Undefined) {
             if let Value::Obj(o) = &this {
                 i.fr_tokens
-                    .entry(Rc::as_ptr(o) as usize)
+                    .entry(Gc::as_ptr(o) as usize)
                     .or_default()
                     .push(token);
             }
@@ -94,7 +94,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         }
         let mut removed = false;
         if let Value::Obj(o) = &this {
-            if let Some(tokens) = i.fr_tokens.get_mut(&(Rc::as_ptr(o) as usize)) {
+            if let Some(tokens) = i.fr_tokens.get_mut(&(Gc::as_ptr(o) as usize)) {
                 let before = tokens.len();
                 tokens.retain(|t| !same_value(t, &token));
                 removed = tokens.len() != before;

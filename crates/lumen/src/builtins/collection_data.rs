@@ -2,6 +2,7 @@
 //! Deleted slots remain in place so live iterators and forEach can observe later appends.
 
 mod dense;
+use crate::value::Gc;
 use dense::DenseIndex;
 
 use super::same_value_zero;
@@ -253,7 +254,7 @@ fn key_hash(key: &Value) -> u64 {
         Value::BigInt(v) => v.hash(&mut hash),
         Value::Str(v) => (**v).hash(&mut hash),
         Value::Sym(v) => Rc::as_ptr(v).hash(&mut hash),
-        Value::Obj(v) => Rc::as_ptr(v).hash(&mut hash),
+        Value::Obj(v) => Gc::as_ptr(v).hash(&mut hash),
         Value::Undefined | Value::Empty | Value::Null => {}
     }
     // FxHash preserves common low bits in integer-valued doubles. Avalanche before using
@@ -328,8 +329,8 @@ mod tests {
         let mut cursor = 0;
         assert!(data.next(&mut cursor).is_some());
         data.clear();
-        assert_eq!(Rc::strong_count(&key), 1);
-        assert_eq!(Rc::strong_count(&value), 1);
+        assert_eq!(crate::value::Gc::strong_count(&key), 1);
+        assert_eq!(crate::value::Gc::strong_count(&value), 1);
         assert!(data.entries.is_empty());
         data.insert(Value::Num(42.0), Value::Undefined);
         assert!(matches!(
@@ -348,12 +349,12 @@ mod tests {
         data.insert(Value::Obj(key.clone()), Value::Obj(value.clone()));
         data.insert(Value::Num(1.0), Value::Undefined);
         assert!(data.remove(&Value::Obj(key.clone())));
-        assert_eq!(Rc::strong_count(&key), 1);
-        assert_eq!(Rc::strong_count(&value), 1);
+        assert_eq!(crate::value::Gc::strong_count(&key), 1);
+        assert_eq!(crate::value::Gc::strong_count(&value), 1);
         data.insert(Value::Obj(key.clone()), Value::Undefined);
         let mut cursor = 0;
         assert!(matches!(data.next(&mut cursor), Some((Value::Num(1.0), _))));
-        assert!(matches!(data.next(&mut cursor), Some((Value::Obj(o), _)) if Rc::ptr_eq(o, &key)));
+        assert!(matches!(data.next(&mut cursor), Some((Value::Obj(o), _)) if crate::value::Gc::ptr_eq(o, &key)));
         assert!(data.next(&mut cursor).is_none());
     }
     #[test]

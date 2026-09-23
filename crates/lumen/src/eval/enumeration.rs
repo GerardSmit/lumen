@@ -1,4 +1,5 @@
 //! Shared for-in key snapshots, including namespace checks and prototype ordering.
+use crate::value::Gc;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
 use std::rc::Rc;
@@ -8,7 +9,7 @@ impl Interp {
         // A module namespace's [[GetOwnProperty]] runs during enumeration, so an uninitialized export
         // makes the loop throw ReferenceError before any iteration.
         if let Value::Obj(o) = rhs {
-            let ptr = std::rc::Rc::as_ptr(o) as usize;
+            let ptr = crate::value::Gc::as_ptr(o) as usize;
             if self.is_namespace(ptr) {
                 for k in self.enum_keys(rhs)? {
                     if let Some(res) = self.namespace_own_property(ptr, &k) {
@@ -42,7 +43,7 @@ impl Interp {
             let ov = Value::Obj(o.clone());
             // A proxy level enumerates via its [[OwnPropertyKeys]] filtered by [[GetOwnProperty]]'s
             // enumerable flag, then walks its [[GetPrototypeOf]].
-            if self.proxies.contains_key(&(Rc::as_ptr(&o) as usize)) {
+            if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
                 let keys =
                     crate::builtins::proxy_enum_string_keys(self, &ov).map_err(Abrupt::Throw)?;
                 for k in keys {
@@ -62,7 +63,7 @@ impl Interp {
             }
             // for-in visits own enumerable string keys in spec order, then up the prototype chain.
             // TypedArray elements enumerate first (they live outside the property map).
-            if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(&o) as usize)).copied() {
+            if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(&o) as usize)).copied() {
                 for idx in 0..self.ta_len(&info).unwrap_or(0) {
                     let k = idx.to_string();
                     if seen.insert(k.clone()) {

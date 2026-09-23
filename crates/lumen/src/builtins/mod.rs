@@ -80,8 +80,8 @@ pub(crate) fn nf_function_apply(
         Value::Obj(o) => {
             let len = ab(i.checked_array_len(&o))?;
             let mut v = Vec::with_capacity(len);
-            let direct_dense = i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
-                && !i.mapped_arguments.contains_key(&(Rc::as_ptr(&o) as usize));
+            let direct_dense = i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
+                && !i.mapped_arguments.contains_key(&(Gc::as_ptr(&o) as usize));
             for k in 0..len {
                 // Arrays and unmapped arguments objects overwhelmingly contain plain own dense
                 // entries. Read those by slot: the generic path allocates a decimal key and walks
@@ -122,7 +122,7 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
     // e.g. a RegExp's `lastIndex` after each exec) needs none of the [[Set]] machinery.
     if let Value::Obj(o) = base {
         if matches!(o.borrow().exotic, crate::value::Exotic::None)
-            && i.ordinary_get_ptr(Rc::as_ptr(o) as usize)
+            && i.ordinary_get_ptr(Gc::as_ptr(o) as usize)
         {
             let mut b = o.borrow_mut();
             if let Some(p) = b.props.get_mut(key) {
@@ -478,7 +478,7 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         return Ok(true);
     }
     // %Object.prototype% is an immutable-prototype exotic object: any actual change fails.
-    if Rc::ptr_eq(&o, &i.object_proto) {
+    if Gc::ptr_eq(&o, &i.object_proto) {
         return Ok(false);
     }
     if !o.borrow().extensible {
@@ -488,7 +488,7 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
     // any proxy, whose [[GetPrototypeOf]] may be non-deterministic).
     let mut p = proto.clone();
     while let Value::Obj(po) = &p {
-        if Rc::ptr_eq(po, &o) {
+        if Gc::ptr_eq(po, &o) {
             return Ok(false);
         }
         if proxy_pair(i, &p).is_some() {
@@ -566,7 +566,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         // TypedArray [[PreventExtensions]] refuses unless IsTypedArrayFixedLength: length-tracking
         // views, and any view over a resizable (non-shared) buffer, can change length.
         if let Some(info) = ta_info(i, o) {
-            let resizable = Rc::as_ptr(o) as usize;
+            let resizable = Gc::as_ptr(o) as usize;
             let resizable = i
                 .ta_buffer
                 .get(&resizable)
@@ -643,7 +643,7 @@ fn ta_buffer_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
 /// If `v` is a Proxy, its (target, handler) pair.
 pub(crate) fn proxy_pair(i: &Interp, v: &Value) -> Option<(Value, Value)> {
     if let Value::Obj(o) = v {
-        i.proxies.get(&(Rc::as_ptr(o) as usize)).cloned()
+        i.proxies.get(&(Gc::as_ptr(o) as usize)).cloned()
     } else {
         None
     }
@@ -1085,7 +1085,7 @@ fn arr_require_coercible(i: &mut Interp, this: &Value) -> Result<(), Value> {
 
 /// TypedArray info for `o`, if it is one.
 fn ta_info(i: &Interp, o: &Gc) -> Option<crate::value::TaInfo> {
-    i.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied()
+    i.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied()
 }
 
 /// ToObject for an `Object.*` argument: an object is returned as-is, a primitive is boxed to its
@@ -1274,7 +1274,7 @@ fn reflect_ordinary_set(
     // in range) and never falls back to creating an ordinary shadowing property.
     // A module namespace exotic object's [[Set]] always returns false.
     if let Value::Obj(o) = target {
-        if i.is_namespace(Rc::as_ptr(o) as usize) {
+        if i.is_namespace(Gc::as_ptr(o) as usize) {
             return Ok(false);
         }
     }
@@ -1291,7 +1291,7 @@ fn reflect_ordinary_set(
         // non-index is an inert success.
         if let Some(info) = map_ptr(&current).and_then(|p| i.typed_arrays.get(&p).copied()) {
             if i.canonical_numeric_index(key).is_some() {
-                let same = matches!((&current, receiver), (Value::Obj(a), Value::Obj(b)) if Rc::ptr_eq(a, b));
+                let same = matches!((&current, receiver), (Value::Obj(a), Value::Obj(b)) if Gc::ptr_eq(a, b));
                 if same {
                     if info.kind.is_bigint() {
                         let n = ab(i.to_bigint(&value))?;
@@ -1458,7 +1458,7 @@ pub(crate) fn reflect_ordinary_get(
         // A deferred namespace on the chain triggers its module's evaluation before the read.
         ab(i.defer_trigger(&obj, Some(key)))?;
         // A module namespace's [[Get]] reads the export's live value (throwing for a TDZ binding).
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, key) {
                 return Ok(ab(res)?.into_value());
@@ -1538,7 +1538,7 @@ fn make_aggregate_error(i: &mut Interp, errors: Value) -> Result<Value, Value> {
 /// `Promise.resolve(x)` as a value helper (returns existing promises unchanged).
 fn promise_resolve_value(i: &mut Interp, v: Value) -> Value {
     if let Value::Obj(o) = &v {
-        if i.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
+        if i.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
             return v;
         }
     }
@@ -1855,7 +1855,7 @@ fn ctor_realm_proto(i: &mut Interp, nt: &Value, default_proto: &str) -> Result<O
     let mut ntobj: Gc = o.clone();
     // GetFunctionRealm unwraps bound functions and (unrevoked) proxies to their targets.
     for _ in 0..64 {
-        if let Some((target, handler)) = i.proxies.get(&(Rc::as_ptr(&ntobj) as usize)) {
+        if let Some((target, handler)) = i.proxies.get(&(Gc::as_ptr(&ntobj) as usize)) {
             if matches!(handler, Value::Null) {
                 return Err(i.make_error("TypeError", "cannot get the realm of a revoked proxy"));
             }
@@ -2134,7 +2134,7 @@ pub(crate) fn regexp_exec_discard_fast(
     let Value::Obj(obj) = this else {
         return None;
     };
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
     {
         let b = obj.borrow();
@@ -2423,7 +2423,7 @@ pub(crate) fn string_replace_discard_fast(
     let (Value::Str(input), Value::Obj(obj), Value::Str(_)) = (input, search, replacement) else {
         return None;
     };
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
     let proto = i.extra_protos.get("RegExp")?.clone();
     let replace_key = well_known_key(i, "replace")?;
@@ -2431,7 +2431,7 @@ pub(crate) fn string_replace_discard_fast(
         let b = obj.borrow();
         if !matches!(b.exotic, Exotic::None)
             || b.props.contains(&replace_key)
-            || b.proto.as_ref().is_none_or(|p| !Rc::ptr_eq(p, &proto))
+            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
             || [
                 "exec",
                 "flags",
@@ -2512,14 +2512,14 @@ fn update_regexp_legacy_statics(
         None => return,
     };
     if let Some(prev) = &i.regexp_last {
-        if !Rc::ptr_eq(&prev.ctor, &ctor) {
+        if !Gc::ptr_eq(&prev.ctor, &ctor) {
             flush_regexp_legacy(i);
         }
     }
     if let Some(previous) = i
         .regexp_last
         .as_mut()
-        .filter(|previous| Rc::ptr_eq(&previous.ctor, &ctor))
+        .filter(|previous| Gc::ptr_eq(&previous.ctor, &ctor))
     {
         previous.input = input.clone();
         previous.text = text.clone();
@@ -2552,14 +2552,14 @@ fn update_regexp_legacy_statics_lazy(
         None => return,
     };
     if let Some(prev) = &i.regexp_last {
-        if !Rc::ptr_eq(&prev.ctor, &ctor) {
+        if !Gc::ptr_eq(&prev.ctor, &ctor) {
             flush_regexp_legacy(i);
         }
     }
     if let Some(previous) = i
         .regexp_last
         .as_mut()
-        .filter(|previous| Rc::ptr_eq(&previous.ctor, &ctor))
+        .filter(|previous| Gc::ptr_eq(&previous.ctor, &ctor))
     {
         previous.input = input.clone();
         previous.text = text.clone();
@@ -2770,7 +2770,7 @@ pub(crate) fn well_known_key(it: &Interp, name: &str) -> Option<Rc<str>> {
 }
 
 fn map_ptr(this: &Value) -> Option<usize> {
-    this.as_obj().map(|o| Rc::as_ptr(o) as usize)
+    this.as_obj().map(|o| Gc::as_ptr(o) as usize)
 }
 
 /// ArraySpeciesCreate(originalArray, length): build the result array for a method like map/filter,
@@ -2804,8 +2804,8 @@ fn array_species_create(i: &mut Interp, original: &Value, len: usize) -> Result<
             let foreign_array = i.realms.values().any(|rs| {
                 matches!(
                     rs.global.borrow().props.get("Array").map(|p| p.value()),
-                    Some(Value::Obj(ac)) if Rc::ptr_eq(&ac, co)
-                        && !Rc::ptr_eq(&rs.global, &i.global)
+                    Some(Value::Obj(ac)) if Gc::ptr_eq(&ac, co)
+                        && !Gc::ptr_eq(&rs.global, &i.global)
                 )
             });
             if foreign_array {
@@ -2826,7 +2826,7 @@ fn array_species_create(i: &mut Interp, original: &Value, len: usize) -> Result<
     }
     let array_ctor = i.global.borrow().props.get("Array").map(|p| p.value());
     if let (Value::Obj(s), Some(Value::Obj(ac))) = (&c, &array_ctor) {
-        if Rc::ptr_eq(s, ac) {
+        if Gc::ptr_eq(s, ac) {
             return make_sparse_array(i, len);
         }
     }
@@ -2896,7 +2896,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "String"
             } else if b.props.contains("__date_ms") {
                 "Date"
-            } else if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)) {
+            } else if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
                 "RegExp"
             } else {
                 "Object"
@@ -3392,7 +3392,7 @@ fn install_object(it: &mut Interp) {
             return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
         }
         // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, &key) {
                 ab(res)?;
@@ -3502,7 +3502,7 @@ fn install_object(it: &mut Interp) {
         let mut cur = js_get_prototype_of(i, &v)?;
         loop {
             match &cur {
-                Value::Obj(o) if Rc::ptr_eq(o, &me) => return Ok(Value::Bool(true)),
+                Value::Obj(o) if Gc::ptr_eq(o, &me) => return Ok(Value::Bool(true)),
                 Value::Obj(_) => {}
                 _ => return Ok(Value::Bool(false)),
             }
@@ -3512,7 +3512,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&op, "propertyIsEnumerable", 1, |i, this, args| {
         let key = ab(i.to_property_key(&arg(args, 0)))?;
         let o = to_object_arg(i, this, "Object.prototype.propertyIsEnumerable")?;
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, &key) {
                 ab(res)?;
@@ -3612,7 +3612,7 @@ fn install_object(it: &mut Interp) {
             if let Value::Obj(nt) = i.new_target.clone() {
                 let is_self = matches!(
                     i.extra_protos.get("%ObjectCtor%"),
-                    Some(c) if Rc::ptr_eq(c, &nt)
+                    Some(c) if Gc::ptr_eq(c, &nt)
                 );
                 if !is_self {
                     let proto = match ab(i.get_member(&Value::Obj(nt.clone()), "prototype"))? {
@@ -3689,7 +3689,7 @@ fn install_object(it: &mut Interp) {
         let names = ordered_enum_keys(&o);
         // A module namespace's Object.keys reads each binding's [[GetOwnProperty]], throwing for an
         // uninitialized export.
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             for k in &names {
                 if let Some(res) = i.namespace_own_property(ptr, k) {
@@ -3861,7 +3861,7 @@ fn install_object(it: &mut Interp) {
             return Ok(Value::Undefined); // private-name slot is not an own property
         }
         // A mapped arguments index reports the live parameter value.
-        if let Some(v) = i.mapped_arg_value(Rc::as_ptr(&o) as usize, &key) {
+        if let Some(v) = i.mapped_arg_value(Gc::as_ptr(&o) as usize, &key) {
             if let Some(p) = o.borrow_mut().props.get_mut(&key) {
                 p.set_value(v);
             }
@@ -3883,7 +3883,7 @@ fn install_object(it: &mut Interp) {
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             return proxy_gopd_value(i, &target, &handler, &key);
         }
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, &key) {
                 return Ok(descriptor_from_prop(i, ab(res)?));
@@ -4300,7 +4300,7 @@ fn define_own_property(i: &mut Interp, o: &Gc, key: &str, desc: &Value) -> Resul
     // ArgumentsExoticObject [[DefineOwnProperty]]: sync the live parameter value into the
     // ordinary property first; after a successful ordinary define, a plain value write goes
     // through the map, and only an accessor or writable:false severs the alias.
-    let args_ptr = Rc::as_ptr(o) as usize;
+    let args_ptr = Gc::as_ptr(o) as usize;
     let mapped = i.mapped_arg_name(args_ptr, key).is_some();
     if mapped {
         if let Some(cur) = i.mapped_arg_value(args_ptr, key) {
@@ -4341,7 +4341,7 @@ fn define_own_property_ordinary(
     // Module namespace [[DefineOwnProperty]]: a String key is only redefinable to a descriptor that
     // matches the export's fixed shape (writable, enumerable, non-configurable, same value); adding
     // a new String key fails. Symbol keys fall through to the ordinary algorithm.
-    let ptr = Rc::as_ptr(o) as usize;
+    let ptr = Gc::as_ptr(o) as usize;
     if i.is_namespace(ptr) && !Interp::is_sym_key(key) {
         return match i.namespace_own_property(ptr, key) {
             Some(res) => {
@@ -4652,7 +4652,7 @@ fn same_value(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::BigInt(x), Value::BigInt(y)) => x == y,
         (Value::Sym(x), Value::Sym(y)) => Rc::ptr_eq(x, y),
-        (Value::Obj(x), Value::Obj(y)) => Rc::ptr_eq(x, y),
+        (Value::Obj(x), Value::Obj(y)) => Gc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -4711,7 +4711,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
     // whose tail is exactly the dense frontier appends in place — no key strings, no
     // existence scans, no observable coercions (a whole-number own `length` needs none).
     if matches!(o.borrow().exotic, Exotic::Array)
-        && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+        && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         && i.array_append_unshadowed(&o)
     {
         let mut b = o.borrow_mut();
@@ -4773,7 +4773,7 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
     // Dense fast path (mirror of push's): take the last element straight off the entries
     // tail — no key strings, no hash lookups, and crucially NO shape reset, so the array's
     // inline caches survive a pop (stack-discipline arrays live on push/pop).
-    if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize) {
+    if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize) {
         let mut b = o.borrow_mut();
         let len = match b.props.length_property() {
             Some(p) if !p.accessor() && p.writable() => match p.value() {
@@ -4814,7 +4814,7 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
 /// exact generic builtin path. `Ok(length)` means the argument's ownership moved into the array.
 pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result<Value, Value> {
     if !matches!(o.borrow().exotic, Exotic::Array)
-        || !i.ordinary_get_ptr(Rc::as_ptr(o) as usize)
+        || !i.ordinary_get_ptr(Gc::as_ptr(o) as usize)
         || !i.array_append_unshadowed(o)
     {
         return Err(value);
@@ -4843,7 +4843,7 @@ pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result
 
 /// JIT-only dense `Array#pop` form. `None` is a guard miss with no mutation.
 pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
-    if !matches!(o.borrow().exotic, Exotic::Array) || !i.ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+    if !matches!(o.borrow().exotic, Exotic::Array) || !i.ordinary_get_ptr(Gc::as_ptr(o) as usize) {
         return None;
     }
     let mut b = o.borrow_mut();
@@ -5815,7 +5815,7 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
                 _ => ctor_realm_proto(i, &nt, "Array")?,
             };
             if let (Value::Obj(o), Some(p)) = (&a, proto) {
-                if !Rc::ptr_eq(&p, &i.array_proto) {
+                if !Gc::ptr_eq(&p, &i.array_proto) {
                     o.borrow_mut().proto = Some(p);
                 }
             }
@@ -6344,7 +6344,7 @@ fn install_iterator(it: &mut Interp) {
         // Abstract: NewTarget must be present and must not be %Iterator% itself.
         let nt = i.new_target.clone();
         let is_self = match (&nt, i.extra_protos.get("%IteratorCtorMarker%")) {
-            (Value::Obj(a), Some(b)) => Rc::ptr_eq(a, b),
+            (Value::Obj(a), Some(b)) => Gc::ptr_eq(a, b),
             _ => false,
         };
         if !i.constructing || matches!(nt, Value::Undefined) || is_self {
@@ -6383,7 +6383,7 @@ fn install_iterator(it: &mut Interp) {
             let p = js_get_prototype_of(i, &cur)?;
             match p {
                 Value::Obj(pp) => {
-                    if iter_proto.as_ref().is_some_and(|ip| Rc::ptr_eq(&pp, ip)) {
+                    if iter_proto.as_ref().is_some_and(|ip| Gc::ptr_eq(&pp, ip)) {
                         inherits = true;
                         break;
                     }
@@ -6756,7 +6756,7 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
         }
     };
     if let Value::Obj(o) = &promise {
-        let key = Rc::as_ptr(o) as usize;
+        let key = Gc::as_ptr(o) as usize;
         i.generators.insert(key, coro);
         i.drive_async(
             key,
@@ -6917,7 +6917,7 @@ pub(crate) fn cdp_or_throw(
     };
     // Fast path: a fresh element on a plain, extensible Array with writable length skips the
     // descriptor-object round trip (this is the hot loop of from/map/filter/slice/concat).
-    if !i.proxies.contains_key(&(Rc::as_ptr(o) as usize)) {
+    if !i.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
         let fast = {
             let b = o.borrow();
             matches!(b.exotic, Exotic::Array)
@@ -7189,7 +7189,7 @@ fn iterator_proto_weird_set(
     key: &str,
 ) -> Result<Value, Value> {
     if let (Some(h), Value::Obj(t)) = (i.extra_protos.get("%IteratorProtoMarker%"), &this) {
-        if Rc::ptr_eq(h, t) {
+        if Gc::ptr_eq(h, t) {
             return Err(i.make_error(
                 "TypeError",
                 "cannot assign to a property of Iterator.prototype",
@@ -8076,7 +8076,7 @@ fn drive_generator(
 ) -> Result<Value, Value> {
     use crate::coroutine::{Resume, Suspend};
     let key = match this {
-        Value::Obj(o) => Rc::as_ptr(o) as usize,
+        Value::Obj(o) => Gc::as_ptr(o) as usize,
         _ => return Err(i.make_error("TypeError", "Generator method called on a non-generator")),
     };
     let mut coro = match i.generators.remove(&key) {
@@ -8113,7 +8113,7 @@ pub(crate) fn async_react_fulfil(
 ) -> Result<Value, Value> {
     if let Value::Obj(o) = arg(args, 0) {
         i.drive_async(
-            Rc::as_ptr(&o) as usize,
+            Gc::as_ptr(&o) as usize,
             arg(args, 0),
             crate::coroutine::Resume::Next(arg(args, 1)),
         );
@@ -8128,7 +8128,7 @@ pub(crate) fn async_react_reject(
 ) -> Result<Value, Value> {
     if let Value::Obj(o) = arg(args, 0) {
         i.drive_async(
-            Rc::as_ptr(&o) as usize,
+            Gc::as_ptr(&o) as usize,
             arg(args, 0),
             crate::coroutine::Resume::Throw(arg(args, 1)),
         );
@@ -8162,8 +8162,8 @@ fn async_gen_drive(
     match this {
         // Brand check: the receiver must be an actual async generator instance; a mismatch
         // rejects the returned promise rather than throwing.
-        Value::Obj(o) if i.async_gens.contains(&(Rc::as_ptr(o) as usize)) => {
-            i.drive_async_gen(Rc::as_ptr(o) as usize, r.clone(), signal)
+        Value::Obj(o) if i.async_gens.contains(&(Gc::as_ptr(o) as usize)) => {
+            i.drive_async_gen(Gc::as_ptr(o) as usize, r.clone(), signal)
         }
         _ => {
             let e = i.make_error(
@@ -8556,7 +8556,7 @@ fn arg_is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
                 return Ok(i.to_boolean(&m));
             }
         }
-        return Ok(i.regexps.contains_key(&(Rc::as_ptr(o) as usize)));
+        return Ok(i.regexps.contains_key(&(Gc::as_ptr(o) as usize)));
     }
     Ok(false)
 }
@@ -8697,7 +8697,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
         }
     };
     let is_live_regexp =
-        matches!(&arg(args, 0), Value::Obj(o) if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)));
+        matches!(&arg(args, 0), Value::Obj(o) if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)));
     let sep_str: Option<Rc<str>> = match &arg(args, 0) {
         Value::Undefined => None,
         _ if is_live_regexp => None,
@@ -8708,8 +8708,8 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     // Regex separator: split on each match (group captures are inserted between pieces).
     if let Value::Obj(o) = &arg(args, 0) {
-        if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)) {
-            let re = i.regexps[&(Rc::as_ptr(o) as usize)].clone();
+        if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
+            let re = i.regexps[&(Gc::as_ptr(o) as usize)].clone();
             let text = i.re_text(re.unicode, &s);
             let mut parts = Vec::new();
             let mut last = 0;

@@ -146,7 +146,7 @@ mod tests {
         let layout = jit_layout(&callee);
         let target = InlineTarget {
             expected: 0,
-            pin: Rc::downgrade(&callee),
+            pin: crate::value::Gc::downgrade(&callee),
             expected_env: 123,
             argc: 0,
             check_this: true,

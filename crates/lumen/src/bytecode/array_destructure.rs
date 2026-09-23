@@ -102,7 +102,7 @@ fn array_length(array: &Gc) -> Option<usize> {
 }
 
 fn identity(actual: Value, expected: &Gc) -> bool {
-    matches!(actual, Value::Obj(o) if Rc::ptr_eq(&o, expected))
+    matches!(actual, Value::Obj(o) if Gc::ptr_eq(&o, expected))
 }
 
 /// Outer None means unsafe lookup; inner None means proven absent through null.

@@ -330,7 +330,7 @@ mod tests {
         let crate::value::Value::Obj(target) = target else {
             panic!("function")
         };
-        let key = Rc::as_ptr(&target) as usize;
+        let key = crate::value::Gc::as_ptr(&target) as usize;
         let genv = Rc::as_ptr(&engine.interp.global_env) as usize;
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         let mut baseline = CallIc::EMPTY;

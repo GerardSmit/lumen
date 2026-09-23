@@ -1,5 +1,6 @@
 //! Map and Set prototype methods.
 
+use crate::value::Gc;
 use super::iteration::{collection_for_each, collection_iter_kind};
 use super::{canonicalize_map_key, coll_live_len};
 use crate::builtins::collection_data::CollectionData;
@@ -216,7 +217,7 @@ pub(super) fn install_map_like(
                 }
             }
             let m = Object::new(i.extra_protos.get("Map").cloned());
-            let ptr = Rc::as_ptr(&m) as usize;
+            let ptr = Gc::as_ptr(&m) as usize;
             let entries: CollectionData = groups
                 .into_iter()
                 .map(|(k, v)| (k, i.make_array(v)))

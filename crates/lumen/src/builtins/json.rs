@@ -375,7 +375,7 @@ fn json_str(
             if !matches!(o.borrow().call, Callable::None) {
                 return Ok(None); // functions are omitted
             }
-            let ptr = Rc::as_ptr(o) as usize;
+            let ptr = Gc::as_ptr(o) as usize;
             if seen.contains(&ptr) {
                 return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
             }

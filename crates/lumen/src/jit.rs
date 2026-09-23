@@ -563,7 +563,7 @@ unsafe extern "C" fn jit_prepare_numeric_packed_array(
     let interp = unsafe { &mut *ctx.interp };
     // `raw` is Rc::as_ptr. The frame owns the live Gc throughout this call and the generated
     // region, so borrow an Rc view without changing its strong count.
-    let obj = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
+    let obj = std::mem::ManuallyDrop::new(unsafe { crate::value::Gc::from_raw(raw) });
     {
         let b = obj.borrow();
         if !matches!(&b.exotic, crate::value::Exotic::Array) || !b.ic_plain.get() || !b.extensible {
@@ -597,13 +597,13 @@ unsafe extern "C" fn jit_scheduler_materialize(
 ) {
     debug_assert!(!tcb_slot.is_null() && !packet_slot.is_null() && !tcb_raw.is_null());
     // Both raw pointers are Rc::as_ptr views whose real owners remain live across this call.
-    let tcb = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(tcb_raw) });
-    let new_tcb = crate::value::Value::Obj(Rc::clone(&*tcb));
+    let tcb = std::mem::ManuallyDrop::new(unsafe { crate::value::Gc::from_raw(tcb_raw) });
+    let new_tcb = crate::value::Value::Obj(crate::value::Gc::clone(&*tcb));
     let new_packet = if packet_raw.is_null() {
         crate::value::Value::Null
     } else {
-        let packet = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(packet_raw) });
-        crate::value::Value::Obj(Rc::clone(&*packet))
+        let packet = std::mem::ManuallyDrop::new(unsafe { crate::value::Gc::from_raw(packet_raw) });
+        crate::value::Value::Obj(crate::value::Gc::clone(&*packet))
     };
     // Construct both new owners before either stale local is released so source/old aliases are
     // harmless and an object graph cannot disappear between the replacements.
@@ -636,8 +636,8 @@ unsafe extern "C" fn jit_scheduler_device_materialize(
             && !task_raw.is_null()
     );
     let packet = unsafe { (&*packet_src).clone() };
-    let task = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(task_raw) });
-    let task = crate::value::Value::Obj(Rc::clone(&*task));
+    let task = std::mem::ManuallyDrop::new(unsafe { crate::value::Gc::from_raw(task_raw) });
+    let task = crate::value::Value::Obj(crate::value::Gc::clone(&*task));
     let old_packet = unsafe { std::ptr::replace(packet_dst, packet) };
     let old_task = unsafe { std::ptr::replace(task_dst, task) };
     let old_temp = unsafe { std::ptr::replace(temp_dst, crate::value::Value::Undefined) };
@@ -9494,7 +9494,7 @@ fn plan_scheduler_active_idle(
             continue;
         }
         let run_expected = {
-            let some: Option<crate::value::Gc> = Some(Rc::clone(&callee));
+            let some: Option<crate::value::Gc> = Some(crate::value::Gc::clone(&callee));
             unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
         };
         if release.state.recv_shape != active.id.recv_shape
@@ -9623,7 +9623,7 @@ fn plan_scheduler_active_worker(
                 continue;
             }
             let run_expected = {
-                let some: Option<crate::value::Gc> = Some(Rc::clone(&callee));
+                let some: Option<crate::value::Gc> = Some(crate::value::Gc::clone(&callee));
                 unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
             };
             let mut suspend = base_suspend;
@@ -10772,7 +10772,7 @@ fn plan_scheduler_handler_deliver(
         return None;
     }
     let gc_raw = |obj: &crate::value::Gc| {
-        let some: Option<crate::value::Gc> = Some(Rc::clone(obj));
+        let some: Option<crate::value::Gc> = Some(crate::value::Gc::clone(obj));
         unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
     };
     let queue_obj = queue_target.pin.upgrade()?;
@@ -11128,7 +11128,7 @@ fn plan_scheduler_device(
     }
     let device_obj = target.pin.upgrade()?;
     let run_expected = {
-        let some: Option<crate::value::Gc> = Some(Rc::clone(&device_obj));
+        let some: Option<crate::value::Gc> = Some(crate::value::Gc::clone(&device_obj));
         unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
     };
     let task_state = chunk.jit_cache_preferred(*task_cache)?;
@@ -11380,7 +11380,7 @@ fn plan_scheduler_device_hold(
         return None;
     }
     let hold_expected = {
-        let some: Option<crate::value::Gc> = Some(Rc::clone(&hold_obj));
+        let some: Option<crate::value::Gc> = Some(crate::value::Gc::clone(&hold_obj));
         unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
     };
     let hold_func = match &hold_obj.borrow().call {
@@ -11551,7 +11551,7 @@ fn plan_scheduler_device_queue(
         return None;
     }
     let queue_expected = {
-        let some: Option<crate::value::Gc> = Some(Rc::clone(&queue_obj));
+        let some: Option<crate::value::Gc> = Some(crate::value::Gc::clone(&queue_obj));
         unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
     };
     let queue_func = match &queue_obj.borrow().call {

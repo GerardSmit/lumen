@@ -105,7 +105,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             return Ok(Value::Undefined); // private-name slot is not an own property
         }
         // A mapped arguments index reports the live parameter value.
-        if let Some(v) = i.mapped_arg_value(Rc::as_ptr(&o) as usize, &key) {
+        if let Some(v) = i.mapped_arg_value(Gc::as_ptr(&o) as usize, &key) {
             if let Some(p) = o.borrow_mut().props.get_mut(&key) {
                 p.set_value(v);
             }
@@ -126,7 +126,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             return proxy_gopd_value(i, &target, &handler, &key);
         }
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, &key) {
                 return Ok(descriptor_from_prop(i, ab(res)?));
