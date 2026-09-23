@@ -264,6 +264,16 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     Ok(bv)
 }
 
+/// A fixed-length ArrayBuffer owning `bytes` (no copy).
+pub(crate) fn array_buffer_from_vec(i: &mut Interp, bytes: Vec<u8>) -> Value {
+    let (v, p) = make_array_buffer(i, 0);
+    if let Value::Obj(o) = &v {
+        set_internal(o, "__abMaxByteLength", Value::Num(bytes.len() as f64));
+    }
+    i.array_buffers.insert(p, bytes);
+    v
+}
+
 fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Gc::as_ptr(&obj) as usize;

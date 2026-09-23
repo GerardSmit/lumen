@@ -45,6 +45,37 @@ impl Val {
             _ => 0.0,
         }
     }
+    /// Raw bits as native code stores them: integers and floats zero-extended to 64 bits,
+    /// references as their index (`u64::MAX` for null).
+    pub fn to_bits(self) -> u64 {
+        match self {
+            Val::I32(v) => v as u32 as u64,
+            Val::I64(v) => v as u64,
+            Val::F32(v) => v.to_bits() as u64,
+            Val::F64(v) => v.to_bits(),
+            Val::Ref(r) => r.map_or(u64::MAX, |i| i as u64),
+        }
+    }
+    pub fn from_bits(t: ValType, b: u64) -> Val {
+        match t {
+            ValType::I32 => Val::I32(b as u32 as i32),
+            ValType::I64 => Val::I64(b as i64),
+            ValType::F32 => Val::F32(f32::from_bits(b as u32)),
+            ValType::F64 => Val::F64(f64::from_bits(b)),
+            ValType::FuncRef | ValType::ExternRef => {
+                Val::Ref((b != u64::MAX).then_some(b as u32))
+            }
+        }
+    }
+    pub fn ty(self) -> ValType {
+        match self {
+            Val::I32(_) => ValType::I32,
+            Val::I64(_) => ValType::I64,
+            Val::F32(_) => ValType::F32,
+            Val::F64(_) => ValType::F64,
+            Val::Ref(_) => ValType::FuncRef,
+        }
+    }
     pub fn default_for(t: ValType) -> Val {
         match t {
             ValType::I32 => Val::I32(0),
@@ -103,9 +134,35 @@ pub struct MemEntity {
     pub max: Option<u32>,
 }
 
+/// A global's value lives in a boxed cell, so native code can address it directly and both
+/// tiers see one copy.
 pub struct GlobalEntity {
-    pub val: Val,
+    ty: ValType,
+    cell: Box<std::cell::UnsafeCell<u64>>,
     pub mutable: bool,
+}
+
+impl GlobalEntity {
+    pub fn new(val: Val, mutable: bool) -> GlobalEntity {
+        GlobalEntity {
+            ty: val.ty(),
+            cell: Box::new(std::cell::UnsafeCell::new(val.to_bits())),
+            mutable,
+        }
+    }
+    pub fn get(&self) -> Val {
+        Val::from_bits(self.ty, unsafe { *self.cell.get() })
+    }
+    pub fn set(&mut self, v: Val) {
+        *self.cell.get_mut() = v.to_bits();
+    }
+    pub fn ty(&self) -> ValType {
+        self.ty
+    }
+    /// The cell's stable address.
+    pub fn cell(&self) -> *mut u64 {
+        self.cell.get()
+    }
 }
 
 /// Import values resolved by the op layer, as store addresses (for memory/table/globals — whether
@@ -138,16 +195,21 @@ pub struct Store {
     pub memories: Vec<MemEntity>,
     pub globals: Vec<GlobalEntity>,
     pub instances: Vec<Rc<Instance>>,
+    /// Native code per instance (see [`super::native`]); `None` runs it interpreted.
+    pub native: Vec<Option<Box<super::native::NativeInstance>>>,
 }
 
 /// The host bridge: the op layer implements this to call imported JS functions. `results` is the
 /// import's declared result types, so the host can coerce the JS return value(s) to wasm values.
+/// `mems` is the store's memories, so a host that lends their bytes to JS buffers can hand them
+/// over for the duration of the call.
 pub trait Host {
     fn call_host(
         &mut self,
         id: usize,
         args: &[Val],
         results: &[ValType],
+        mems: &mut [MemEntity],
     ) -> Result<Vec<Val>, String>;
 }
 
@@ -356,6 +418,12 @@ impl Store {
         if depth > 1024 {
             return Err("wasm: call stack exhausted".into());
         }
+        if let Some(FuncEntity::Wasm { instance, .. }) = self.funcs.get(func_addr) {
+            let instance = *instance;
+            if let Some(r) = super::native::invoke(self, instance, func_addr, &args, host) {
+                return r;
+            }
+        }
         // Host functions run immediately; wasm functions run below, in their defining instance's
         // context. `inst`/`compiled` are cloned Rcs so the loop can borrow `self` (the store)
         // mutably for entity access without conflicting.
@@ -367,7 +435,7 @@ impl Store {
             FuncEntity::Host { id, ty } => {
                 let (id, nres) = (*id, ty.results.len());
                 let results = ty.results.clone();
-                let r = host.call_host(id, &args, &results)?;
+                let r = host.call_host(id, &args, &results, &mut self.memories)?;
                 if r.len() != nres {
                     return Err("wasm: host function returned wrong arity".into());
                 }
@@ -540,13 +608,13 @@ impl Store {
                 0x23 => {
                     let i = read_uleb(code, &mut ip)? as usize;
                     let addr = *inst.global_addrs.get(i).ok_or("wasm: bad global index")?;
-                    stack.push(self.globals[addr].val);
+                    stack.push(self.globals[addr].get());
                 }
                 0x24 => {
                     let i = read_uleb(code, &mut ip)? as usize;
                     let addr = *inst.global_addrs.get(i).ok_or("wasm: bad global index")?;
                     let v = stack.pop().ok_or("wasm: stack underflow")?;
-                    self.globals[addr].val = v;
+                    self.globals[addr].set(v);
                 }
                 // memory loads/stores
                 0x28..=0x3e => {
@@ -625,7 +693,7 @@ impl Store {
         self.tables.len() - 1
     }
     pub fn alloc_global(&mut self, val: Val, mutable: bool) -> usize {
-        self.globals.push(GlobalEntity { val, mutable });
+        self.globals.push(GlobalEntity::new(val, mutable));
         self.globals.len() - 1
     }
 
@@ -688,7 +756,7 @@ impl Store {
         }
         // Defined globals: each init expr sees the globals resolved so far (by value).
         for g in &module.globals {
-            let seen: Vec<Val> = global_addrs.iter().map(|&a| self.globals[a].val).collect();
+            let seen: Vec<Val> = global_addrs.iter().map(|&a| self.globals[a].get()).collect();
             let v = eval_const_expr(&g.init, &seen)?;
             let a = self.alloc_global(v, g.ty.mutable);
             global_addrs.push(a);
@@ -705,7 +773,7 @@ impl Store {
         let seen_globals: Vec<Val> = inst
             .global_addrs
             .iter()
-            .map(|&a| self.globals[a].val)
+            .map(|&a| self.globals[a].get())
             .collect();
 
         // Active element segments: local function indices → store func addresses.
@@ -745,6 +813,9 @@ impl Store {
                 mem[offset..end].copy_from_slice(&seg.bytes);
             }
         }
+        let native = super::native::build(self, inst_idx);
+        self.native.resize_with(inst_idx + 1, || None);
+        self.native[inst_idx] = native;
         Ok(inst_idx)
     }
 

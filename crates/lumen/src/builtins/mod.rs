@@ -35,7 +35,7 @@ mod shadowrealm;
 mod string_code_point;
 mod string_substring;
 pub(crate) use string_code_point::nf_code_point_at;
-mod typedarray;
+pub(crate) mod typedarray;
 mod weakrefs;
 
 pub(crate) use function_proto::nf_function_call;

@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use super::exec::{Host, Imports, Store, Val, PAGE_SIZE};
+use super::exec::{Host, Imports, MemEntity, Store, Val, PAGE_SIZE};
 use super::parse::{self, ValType};
 use super::translate::{self, *};
 use lumen_codegen::interp::{self, Env};
@@ -189,7 +189,13 @@ use ValType::{F32, F64, I32, I64};
 
 struct NoHost;
 impl Host for NoHost {
-    fn call_host(&mut self, _: usize, _: &[Val], _: &[ValType]) -> Result<Vec<Val>, String> {
+    fn call_host(
+        &mut self,
+        _: usize,
+        _: &[Val],
+        _: &[ValType],
+        _: &mut [MemEntity],
+    ) -> Result<Vec<Val>, String> {
         Err("no host".into())
     }
 }
@@ -453,6 +459,8 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
             // Fresh instances per case so memory and globals start equal.
             let mut store = Store::default();
             let inst = store.instantiate(Rc::clone(&module), Imports::default()).unwrap();
+            // The wasm interpreter is the reference here.
+            store.native[inst] = None;
             let (_, addr) = store.export_addr(inst, &format!("f{f}")).unwrap();
             let instance = Rc::clone(&store.instances[inst]);
 
@@ -468,7 +476,7 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
             for (i, &ga) in instance.global_addrs.iter().enumerate() {
                 let cell = CELLS + 8 * i as u64;
                 env.wr(GLOBAL_TABLE + 8 * i as u64, cell);
-                env.wr(cell, val_bits(store.globals[ga].val));
+                env.wr(cell, val_bits(store.globals[ga].get()));
             }
 
             let init_mem = env.memory().to_vec();
@@ -495,11 +503,11 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                         let imem = &store.memories[instance.mem_addrs[0]].bytes;
                         assert!(*imem == nmem, "memory differs after {ctx}");
                         for (i, &ga) in instance.global_addrs.iter().enumerate() {
-                            let t = match store.globals[ga].val {
+                            let t = match store.globals[ga].get() {
                                 Val::I32(_) | Val::F32(_) => ncells[i] & 0xffff_ffff,
                                 _ => ncells[i],
                             };
-                            assert_eq!(val_bits(store.globals[ga].val), t, "global {i} differs after {ctx}");
+                            assert_eq!(val_bits(store.globals[ga].get()), t, "global {i} differs after {ctx}");
                         }
                     }
                     (Err(w), Err(code)) => assert_eq!(w, trap::message(*code), "trap kinds differ for {ctx}"),
@@ -529,11 +537,11 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
             assert!(imem == env.memory(), "memory differs after {ctx}");
             for (i, &ga) in instance.global_addrs.iter().enumerate() {
                 let cell = env.rd(CELLS + 8 * i as u64);
-                let t = match store.globals[ga].val {
+                let t = match store.globals[ga].get() {
                     Val::I32(_) | Val::F32(_) => cell & 0xffff_ffff,
                     _ => cell,
                 };
-                assert_eq!(val_bits(store.globals[ga].val), t, "global {i} differs after {ctx}");
+                assert_eq!(val_bits(store.globals[ga].get()), t, "global {i} differs after {ctx}");
             }
         }
     }
