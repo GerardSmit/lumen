@@ -1,0 +1,17 @@
+# The `include_js!` proc macro behind `lumen-aot` (use it through that crate). It runs the lumen
+# parser at compile time; the JS source never reaches the expanded code.
+[package]
+name = "lumen-aot-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+lumen = { path = "../../lumen", default-features = false }
+
+[lints]
+workspace = true

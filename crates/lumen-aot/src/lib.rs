@@ -1,0 +1,118 @@
+//! Ahead-of-time compiled JavaScript for lumen embedders: ship a binary that contains the
+//! program, not its source.
+//!
+//! ```ignore
+//! static APP: lumen::Precompiled = lumen_aot::include_js!(
+//!     entry = "node_modules/puppeteer-core/lib/esm/puppeteer/puppeteer-core.js",
+//! );
+//!
+//! let mut engine = lumen::Engine::new();
+//! engine.set_module_loader(host_loader); // bare specifiers ("ws", "debug", node:*)
+//! engine.load_precompiled(&APP)?;
+//! ```
+//!
+//! # `include_js!`
+//! Paths are relative to the invoking crate's `CARGO_MANIFEST_DIR`. Forms:
+//! - `include_js!("app.js")` — one classic script.
+//! - `include_js!(entry = "main.js")` (alias `module = …`) — an ES module entry; every module
+//!   reachable from it through *relative* static imports/re-exports (`./`, `../`; exact path,
+//!   then `.js`, then `/index.js`) is bundled and keyed `aot:/<path from the bundle root>`.
+//!   Bare specifiers and attribute imports are left to the host's module loader.
+//! - Any combination of `script = "a.js" | ["a.js", …]` (scripts, run first, in order),
+//!   `entry = "…"`, `modules = ["…", …]` (extra modules, e.g. dynamic `import()` targets the
+//!   walk cannot see), `walk = false` (take the listed files only — an explicit file list),
+//!   `root = "dir"` (the directory keys are relative to; default: the deepest directory holding
+//!   every bundled module).
+//!
+//! Every file is parsed eagerly at compile time, so a syntax error anywhere in the bundle is a
+//! compile error. The expansion is a `lumen::Precompiled` constant expression holding the blob
+//! (a byte-string literal) — see [`lumen::precompiled`] for the format.
+//!
+//! # No source text in the binary
+//! The blob holds the parsed AST with all function source text stripped
+//! (`Function.prototype.toString()` of precompiled code returns
+//! `function name() { [native code] }`). String/template/regex literals and identifiers remain
+//! (they are the program's data); comments, whitespace and function text do not.
+//!
+//! Rebuild tracking: a proc macro cannot declare file dependencies on stable Rust
+//! (`proc_macro::tracked_path` is unstable), so the expansion also contains, per input file,
+//! `const _: &[u8] = include_bytes!("<absolute path>");`. That makes cargo/rustc record the
+//! file as a dependency of the crate (edits trigger a rebuild) — and since an unreferenced
+//! `const` item is never code-generated, its bytes never reach the object file (checked by
+//! this crate's `aot_demo` example, which greps its own executable for the source). If you
+//! need that as a hard guarantee rather than a property of rustc's codegen, use [`build`] from
+//! a build script instead: it tracks inputs with `cargo:rerun-if-changed` and the binary only
+//! ever `include_bytes!`s the blob.
+//!
+//! Loading checks the blob's container format, AST codec version and lumen version; the
+//! expansion also asserts at compile time that the macro's lumen and the one this crate links
+//! agree on the format.
+
+pub use lumen::precompiled::Precompiled;
+pub use lumen_aot_macros::include_js;
+
+#[path = "walk.rs"]
+mod walk;
+
+/// Precompile from a build script (`[build-dependencies] lumen-aot = …`), writing the blob to
+/// a file — normally in `OUT_DIR` — and printing `cargo:rerun-if-changed` for every input.
+/// Pick it up with [`include_precompiled!`](crate::include_precompiled):
+///
+/// ```ignore
+/// // build.rs
+/// fn main() {
+///     let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("app.aot");
+///     lumen_aot::build::precompile_to(&out, "js/main.js").unwrap();
+/// }
+/// // main.rs
+/// static APP: lumen::Precompiled = lumen_aot::include_precompiled!("app.aot");
+/// ```
+pub mod build {
+    use std::path::{Path, PathBuf};
+
+    pub use crate::walk::Spec;
+
+    /// Bundle the ES module graph rooted at `entry` (see [`precompile_spec`]).
+    pub fn precompile_to(out: impl AsRef<Path>, entry: impl AsRef<Path>) -> Result<(), String> {
+        precompile_spec(
+            out,
+            &Spec {
+                entry: Some(entry.as_ref().to_path_buf()),
+                walk: true,
+                ..Spec::default()
+            },
+        )
+    }
+
+    /// Bundle `spec` (paths relative to `CARGO_MANIFEST_DIR`, else the current directory) and
+    /// write the blob to `out`.
+    pub fn precompile_spec(out: impl AsRef<Path>, spec: &Spec) -> Result<(), String> {
+        let base = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let bundle = crate::walk::bundle(&base, spec)?;
+        for input in &bundle.inputs {
+            println!("cargo:rerun-if-changed={}", input.display());
+        }
+        std::fs::write(out.as_ref(), &bundle.blob)
+            .map_err(|e| format!("{}: {e}", out.as_ref().display()))
+    }
+}
+
+/// A blob a build script wrote to `OUT_DIR` with [`build`], as a [`Precompiled`].
+#[macro_export]
+macro_rules! include_precompiled {
+    ($name:literal) => {
+        $crate::Precompiled::from_static(include_bytes!(concat!(env!("OUT_DIR"), "/", $name)))
+    };
+}
+
+/// Compile-time agreement check emitted by `include_js!`: the blob's container and AST
+/// versions (from the lumen the macro ran) must match the lumen this crate links.
+#[doc(hidden)]
+pub const fn __check_versions(format: u32, ast: u32) {
+    assert!(
+        format == lumen::precompiled::FORMAT_VERSION && ast == lumen::precompiled::AST_VERSION,
+        "include_js!: lumen-aot-macros and lumen disagree on the precompiled format; use one lumen version"
+    );
+}

@@ -1,0 +1,17 @@
+# Ahead-of-time compilation of JavaScript for lumen embedders: `include_js!` turns JS files (a
+# script, or an ES module graph walked from an entry) into a source-free precompiled blob at
+# compile time; `build` does the same from a build script. Load it with
+# `lumen::Engine::load_precompiled`.
+[package]
+name = "lumen-aot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen = { path = "../lumen", default-features = false }
+lumen-aot-macros = { path = "macros" }
+
+[lints]
+workspace = true

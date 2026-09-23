@@ -57,6 +57,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-aot"
+version = "0.1.3"
+dependencies = [
+ "lumen",
+ "lumen-aot-macros",
+]
+
+[[package]]
+name = "lumen-aot-macros"
+version = "0.1.3"
+dependencies = [
+ "lumen",
+]
+
+[[package]]
 name = "lumen-cli"
 version = "0.1.3"
 dependencies = [
