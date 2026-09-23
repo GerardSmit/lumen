@@ -22,11 +22,17 @@
 //!   `entry = "…"`, `modules = ["…", …]` (extra modules, e.g. dynamic `import()` targets the
 //!   walk cannot see), `walk = false` (take the listed files only — an explicit file list),
 //!   `root = "dir"` (the directory keys are relative to; default: the deepest directory holding
-//!   every bundled module).
+//!   every bundled module), `bytecode = false` (AST only: functions compile at run time).
 //!
 //! Every file is parsed eagerly at compile time, so a syntax error anywhere in the bundle is a
 //! compile error. The expansion is a `lumen::Precompiled` constant expression holding the blob
 //! (a byte-string literal) — see [`lumen::precompiled`] for the format.
+//!
+//! # Precompiled bytecode
+//! Every function the bytecode compiler accepts is compiled at build time and its chunk stored
+//! next to the AST; loading attaches it to the function, so the first call runs on the VM with
+//! no compile at run time. Functions the compiler refuses run on the tree-walker as usual.
+//! `lumen::precompiled::stats()` counts attached chunks and run-time compiles.
 //!
 //! # No source text in the binary
 //! The blob holds the parsed AST with all function source text stripped
@@ -44,9 +50,9 @@
 //! a build script instead: it tracks inputs with `cargo:rerun-if-changed` and the binary only
 //! ever `include_bytes!`s the blob.
 //!
-//! Loading checks the blob's container format, AST codec version and lumen version; the
-//! expansion also asserts at compile time that the macro's lumen and the one this crate links
-//! agree on the format.
+//! Loading checks the blob's container format, AST codec version, bytecode layout fingerprint
+//! and lumen version; the expansion also asserts at compile time that the macro's lumen and the
+//! one this crate links agree on all of them.
 
 pub use lumen::precompiled::Precompiled;
 pub use lumen_aot_macros::include_js;
@@ -108,11 +114,14 @@ macro_rules! include_precompiled {
 }
 
 /// Compile-time agreement check emitted by `include_js!`: the blob's container and AST
-/// versions (from the lumen the macro ran) must match the lumen this crate links.
+/// versions and bytecode layout fingerprint (from the lumen the macro ran) must match the lumen
+/// this crate links.
 #[doc(hidden)]
-pub const fn __check_versions(format: u32, ast: u32) {
+pub const fn __check_versions(format: u32, ast: u32, layout: u64) {
     assert!(
-        format == lumen::precompiled::FORMAT_VERSION && ast == lumen::precompiled::AST_VERSION,
+        format == lumen::precompiled::FORMAT_VERSION
+            && ast == lumen::precompiled::AST_VERSION
+            && layout == lumen::precompiled::LAYOUT_FINGERPRINT,
         "include_js!: lumen-aot-macros and lumen disagree on the precompiled format; use one lumen version"
     );
 }

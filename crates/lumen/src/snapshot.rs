@@ -8,6 +8,8 @@
 //! - **Only parser output is encoded.** `Function`'s `scan`/`hoist`/`calls`/`code` are lazy
 //!   runtime caches (`Cell`/`OnceCell`); decode initializes them empty, exactly as the parser
 //!   leaves them, so a decoded tree is indistinguishable from a freshly parsed one.
+//!   (An ahead-of-time blob may fill `code` right after decode, from its bytecode section:
+//!   see [`decode_with_functions`] and `crate::precompiled`.)
 //! - **Lazy bodies stay lazy.** A function whose body the parser skipped (see
 //!   [`Function::ensure_body`]) is written as its [`LazyBody`] — a byte range into the source
 //!   plus the parse context — and no statements; the decoder needs the same source text, which
@@ -57,6 +59,9 @@ struct Writer {
     /// Ahead-of-time mode (see [`encode_stripped`]): no source text or source ranges are
     /// written — every `FnSource` becomes `None` and every function carries its statements.
     strip: bool,
+    /// When collecting (see [`encode_stripped_with_functions`]): every function in the order
+    /// it is entered — its *function index*, which the decoder reproduces.
+    funcs: Option<Vec<Rc<Function>>>,
 }
 
 impl Writer {
@@ -97,6 +102,9 @@ struct Reader<'a> {
     src: Rc<str>,
     /// Private-name scopes decoded so far, in definition order (see `Writer::scopes`).
     scopes: Vec<Rc<PrivateScope>>,
+    /// When collecting: every decoded function by function index (a slot is reserved when the
+    /// function is entered, filled once it is built — the writer's preorder numbering).
+    funcs: Option<Vec<Option<Rc<Function>>>>,
 }
 
 type R<T> = Result<T, String>;
@@ -190,6 +198,7 @@ pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
         buf: Vec::with_capacity(body.len() * 32),
         scopes: HashMap::new(),
         strip: false,
+        funcs: None,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -204,29 +213,63 @@ pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
 /// placeholder) and every function body is written as statements, never as a lazy byte range,
 /// so the blob decodes against the empty source (`decode(bytes, "")`). `body` should come from
 /// an eager parse; a lazy body left in it is materialised here.
+#[allow(dead_code)] // the AST-only form; blobs use `encode_stripped_with_functions`
 pub fn encode_stripped(body: &[Stmt]) -> Vec<u8> {
+    encode_stripped_inner(body, false).0
+}
+
+/// [`encode_stripped`], also returning every function of `body` by *function index*: the
+/// order the encoder enters them (preorder — a function before the functions in its params and
+/// body). [`decode_with_functions`] numbers the decoded tree identically, which is how the
+/// ahead-of-time bytecode section ([`crate::precompiled`]) keys its chunks.
+pub(crate) fn encode_stripped_with_functions(body: &[Stmt]) -> (Vec<u8>, Vec<Rc<Function>>) {
+    let (buf, funcs) = encode_stripped_inner(body, true);
+    (buf, funcs.unwrap_or_default())
+}
+
+fn encode_stripped_inner(body: &[Stmt], collect: bool) -> (Vec<u8>, Option<Vec<Rc<Function>>>) {
     let mut w = Writer {
         buf: Vec::with_capacity(body.len() * 32),
         scopes: HashMap::new(),
         strip: true,
+        funcs: collect.then(Vec::new),
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
     w.uv(0);
     w.u64(source_hash(""));
     enc_stmts(&mut w, body);
-    w.buf
+    (w.buf, w.funcs)
 }
 
 /// Decode a snapshot blob back into a script body. `src` is the source it was encoded from; one
 /// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
 /// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
 pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
+    decode_inner(bytes, src, false).map(|(body, _)| body)
+}
+
+/// [`decode`], also returning every decoded function by function index (see
+/// [`encode_stripped_with_functions`]).
+pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Vec<Rc<Function>>)> {
+    let (body, funcs) = decode_inner(bytes, src, true)?;
+    let funcs = funcs
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or("snapshot: unfinished function")?;
+    Ok((body, funcs))
+}
+
+type Decoded = (Vec<Stmt>, Option<Vec<Option<Rc<Function>>>>);
+
+fn decode_inner(bytes: &[u8], src: &str, collect: bool) -> R<Decoded> {
     let mut r = Reader {
         buf: bytes,
         pos: 0,
         src: Rc::from(""),
         scopes: Vec::new(),
+        funcs: collect.then(Vec::new),
     };
     if r.uv()? != MAGIC as u64 {
         return Err("snapshot: bad magic".into());
@@ -239,7 +282,7 @@ pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
     }
     r.src = Rc::from(src);
     let body = dec_stmts(&mut r)?;
-    Ok(body)
+    Ok((body, r.funcs))
 }
 
 // ---- Vec / Option helpers (monomorphized by hand to keep the reader borrow simple) ------------
@@ -1319,7 +1362,10 @@ fn dec_lazy(r: &mut Reader) -> R<LazyBody> {
 /// A function the parser skipped the body of is written as its [`LazyBody`] — whether or not
 /// the body has since been materialised — and decodes lazy again; an eagerly parsed one (an
 /// IIFE, eval code) carries its statements.
-fn enc_function(w: &mut Writer, f: &Function) {
+fn enc_function(w: &mut Writer, f: &Rc<Function>) {
+    if let Some(funcs) = &mut w.funcs {
+        funcs.push(f.clone());
+    }
     enc_opt_str(w, &f.name);
     w.uv(f.params.len() as u64);
     for p in &f.params {
@@ -1354,6 +1400,10 @@ fn enc_function(w: &mut Writer, f: &Function) {
     }
 }
 fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
+    let slot = r.funcs.as_mut().map(|funcs| {
+        funcs.push(None);
+        funcs.len() - 1
+    });
     let name = dec_opt_str(r)?;
     let n = r.uv()? as usize;
     let mut params = Vec::with_capacity(n);
@@ -1397,6 +1447,9 @@ fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
     // the body once it goes cold.
     if f.lazy.borrow().is_some() {
         crate::value::register_lazy_function(&f);
+    }
+    if let (Some(funcs), Some(slot)) = (&mut r.funcs, slot) {
+        funcs[slot] = Some(f.clone());
     }
     Ok(f)
 }

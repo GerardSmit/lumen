@@ -3,13 +3,27 @@
 //! [`Engine::load_precompiled`](crate::Engine::load_precompiled).
 //!
 //! ## What is in a blob
-//! Only parser output. Each unit (a script, or one ES module of a bundle) is its AST encoded
-//! by [`snapshot::encode_stripped`]: every function body is written out in full (nothing is
-//! a lazy byte range into the source) and no function keeps its source text, so the blob
-//! decodes against the *empty* source. `Function.prototype.toString` of a precompiled
-//! function renders the spec's NativeFunction form (`function f() { [native code] }`).
-//! String literals, template strings, regex literals, identifiers and property names are of
-//! course still in it — they are program data, not source text.
+//! Parser output plus bytecode. Each unit (a script, or one ES module of a bundle) is its AST
+//! encoded by [`snapshot::encode_stripped`]: every function body is written out in full
+//! (nothing is a lazy byte range into the source) and no function keeps its source text, so
+//! the blob decodes against the *empty* source. `Function.prototype.toString` of a
+//! precompiled function renders the spec's NativeFunction form (`function f() { [native
+//! code] }`). String literals, template strings, regex literals, identifiers and property
+//! names are of course still in it — they are program data, not source text.
+//!
+//! Next to its AST, a unit normally carries a bytecode section: every function of the unit
+//! run through the bytecode compiler at build time, each resulting chunk serialized (see
+//! `bytecode::serialize` for the chunk format) and keyed by the function's *function index* —
+//! the order the AST codec enters functions, which its decoder reproduces. Loading attaches
+//! each chunk to its function: when the function tiers up (the same point a source-loaded
+//! function would compile) the chunk is decoded instead of compiled — no bytecode compile at
+//! run time — and a function the compiler refused is recorded too (it stays on the
+//! tree-walker without a retry). Decoding is on demand because a large bundle calls few of its
+//! functions at load (typescript.js: 20k chunks, ~40 tier-ups); `LUMEN_AOT_EAGER=1` decodes
+//! every chunk at load instead, so even a function's first call runs on the VM. The AST is still decoded eagerly in full — the VM needs the
+//! `Function` nodes (params, flags, inner function templates) and the interpreter still
+//! consults the body (hoisting, the tree-walker tier, bodies the compiler refused), so function
+//! bodies are not skipped when their bytecode is present.
 //!
 //! ## Layout (all integers little-endian)
 //! ```text
@@ -18,20 +32,24 @@
 //! 12  flags          u32 reserved, 0
 //! 16  ast_version    u32 the AST codec's version (snapshot::VERSION)
 //! 20  section_count  u32
-//! 24  layout_fp      u64 0 = no native code; else the fingerprint native sections were built
-//!                        against (target, pointer width, VM frame/value layout) — reserved
+//! 24  layout_fp      u64 0 = no layout-dependent sections; else the fingerprint of the
+//!                        encodings they use, which must equal the loader's
+//!                        [`LAYOUT_FINGERPRINT`] (today: the bytecode codec — op table, operand
+//!                        enums, chunk fields; native sections will fold in target, pointer
+//!                        width and VM frame/value layout)
 //! 32  lumen_version  16  the building lumen's CARGO_PKG_VERSION, NUL-padded
 //! 48  section table  section_count x 24: kind u32, flags u32, offset u64, len u64
 //!                        (offset is from the start of the blob)
 //! ..  section payloads
 //! ```
-//! Section kinds: [`SEC_MANIFEST`] (exactly one — the unit list), [`SEC_AST`] (one per unit).
-//! Readers skip kinds they do not know, so later tiers (bytecode, native code) are added as
-//! new section kinds referenced from new manifest fields without breaking the AST path.
+//! Section kinds: [`SEC_MANIFEST`] (exactly one — the unit list), [`SEC_AST`] (one per unit),
+//! [`SEC_BYTECODE`] (at most one per unit). Readers skip kinds they do not know, so later tiers
+//! (native code) are added as new section kinds referenced from new manifest fields.
 //!
 //! The manifest: `unit_count` (LEB128), then per unit `kind` (u8: 0 script, 1 module), `key`
-//! (LEB128 length + UTF-8), `ast_section` (LEB128 index into the section table); then
-//! `entry` (LEB128: unit index + 1, 0 = none).
+//! (LEB128 length + UTF-8), `ast_section` (LEB128 index into the section table),
+//! `bytecode_section` (LEB128 index, 0 = none); then `entry` (LEB128: unit index + 1, 0 =
+//! none).
 //!
 //! ## Modules
 //! A module unit's key is `aot:/<path>` (a path relative to the bundle root, `/`-separated).
@@ -48,7 +66,7 @@ use crate::interpreter::Interp;
 use crate::snapshot;
 
 /// The container format version (header + section table + manifest). Bump on any change.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 /// The AST codec version units are encoded with.
 pub const AST_VERSION: u32 = snapshot::VERSION;
 
@@ -60,7 +78,14 @@ const SECTION_ENTRY_LEN: usize = 24;
 pub const SEC_MANIFEST: u32 = 1;
 /// One unit's source-free AST (a stripped snapshot).
 pub const SEC_AST: u32 = 2;
-// Reserved for later tiers: 3 = bytecode chunks, 4 = native code (guarded by `layout_fp`).
+/// One unit's precompiled bytecode chunks, keyed by function index.
+pub const SEC_BYTECODE: u32 = 3;
+// Reserved for later tiers: 4 = native code (guarded by `layout_fp`).
+
+/// The layout fingerprint a blob with bytecode must carry (see the header's `layout_fp`).
+pub const LAYOUT_FINGERPRINT: u64 = crate::bytecode::serialize::FINGERPRINT;
+
+pub use crate::bytecode::serialize::SectionStats;
 
 /// The lumen version a blob must be built by (checked on load).
 pub const LUMEN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -109,13 +134,26 @@ pub enum SourceKind {
 pub struct CompiledUnit {
     kind: SourceKind,
     ast: Vec<u8>,
+    bytecode: Option<Vec<u8>>,
+    stats: SectionStats,
     imports: Vec<String>,
 }
 
 impl CompiledUnit {
-    /// Parse `src` eagerly (every early error surfaces now, at build time) and encode it without
-    /// its source text. `Err` is a `SyntaxError` message with its line.
+    /// Parse `src` eagerly (every early error surfaces now, at build time), encode it without
+    /// its source text and precompile its functions to bytecode. `Err` is a `SyntaxError`
+    /// message with its line.
     pub fn compile(src: &str, kind: SourceKind) -> Result<CompiledUnit, String> {
+        CompiledUnit::compile_with(src, kind, true)
+    }
+
+    /// [`CompiledUnit::compile`], with or without the bytecode section (without it, every
+    /// function compiles at run time as if the program had been loaded from source).
+    pub fn compile_with(
+        src: &str,
+        kind: SourceKind,
+        bytecode: bool,
+    ) -> Result<CompiledUnit, String> {
         let fmt =
             |e: crate::parser::ParseError| format!("SyntaxError: {} (line {})", e.message, e.line);
         let body = crate::parser::with_eager_bodies(|| match kind {
@@ -140,11 +178,30 @@ impl CompiledUnit {
                 }
             }
         }
+        let (ast, funcs) = snapshot::encode_stripped_with_functions(&body);
+        let (bytecode, stats) = if bytecode {
+            let (bc, stats) = crate::bytecode::serialize::encode_unit(&funcs);
+            (Some(bc), stats)
+        } else {
+            (None, SectionStats::default())
+        };
         Ok(CompiledUnit {
             kind,
-            ast: snapshot::encode_stripped(&body),
+            ast,
+            bytecode,
+            stats,
             imports,
         })
+    }
+
+    /// What the bytecode precompile did (all zero when built without bytecode).
+    pub fn bytecode_stats(&self) -> SectionStats {
+        self.stats
+    }
+
+    /// The encoded bytecode section's size in bytes (0 without one).
+    pub fn bytecode_len(&self) -> usize {
+        self.bytecode.as_ref().map_or(0, Vec::len)
     }
 
     pub fn kind(&self) -> SourceKind {
@@ -157,7 +214,7 @@ impl CompiledUnit {
         &self.imports
     }
 
-    /// The encoded AST's size in bytes.
+    /// The encoded AST's size in bytes (the bytecode section is [`CompiledUnit::bytecode_len`]).
     pub fn len(&self) -> usize {
         self.ast.len()
     }
@@ -172,8 +229,16 @@ impl CompiledUnit {
 /// bundling needs can use it directly (e.g. from a `build.rs`).
 #[derive(Default)]
 pub struct PrecompileBundle {
-    units: Vec<(SourceKind, String, Vec<u8>)>,
+    units: Vec<BundleUnit>,
     entry: Option<usize>,
+    no_bytecode: bool,
+}
+
+struct BundleUnit {
+    kind: SourceKind,
+    key: String,
+    ast: Vec<u8>,
+    bytecode: Option<Vec<u8>>,
 }
 
 impl PrecompileBundle {
@@ -181,10 +246,17 @@ impl PrecompileBundle {
         PrecompileBundle::default()
     }
 
+    /// Whether [`PrecompileBundle::add`] precompiles bytecode (default on). Units added with
+    /// [`PrecompileBundle::add_compiled`] keep whatever they were compiled with.
+    pub fn set_bytecode(&mut self, on: bool) {
+        self.no_bytecode = !on;
+    }
+
     /// Compile and add one unit (see [`PrecompileBundle::add_compiled`]); returns the module's
     /// static import specifiers (relative ones are the caller's to resolve and add).
     pub fn add(&mut self, path: &str, src: &str, kind: SourceKind) -> Result<Vec<String>, String> {
-        let unit = CompiledUnit::compile(src, kind).map_err(|e| format!("{path}: {e}"))?;
+        let unit = CompiledUnit::compile_with(src, kind, !self.no_bytecode)
+            .map_err(|e| format!("{path}: {e}"))?;
         let imports = unit.imports.clone();
         self.add_compiled(path, unit)?;
         Ok(imports)
@@ -201,11 +273,16 @@ impl PrecompileBundle {
         if self
             .units
             .iter()
-            .any(|(k, n, _)| *k == unit.kind && *n == key)
+            .any(|u| u.kind == unit.kind && u.key == key)
         {
             return Err(format!("{key}: added twice"));
         }
-        self.units.push((unit.kind, key, unit.ast));
+        self.units.push(BundleUnit {
+            kind: unit.kind,
+            key,
+            ast: unit.ast,
+            bytecode: unit.bytecode,
+        });
         Ok(())
     }
 
@@ -214,7 +291,7 @@ impl PrecompileBundle {
         let key = module_key(path);
         self.units
             .iter()
-            .any(|(k, n, _)| *k == SourceKind::Module && *n == key)
+            .any(|u| u.kind == SourceKind::Module && u.key == key)
     }
 
     /// Make the (already added) module at `path` the entry `load_precompiled` evaluates.
@@ -223,7 +300,7 @@ impl PrecompileBundle {
         let i = self
             .units
             .iter()
-            .position(|(k, n, _)| *k == SourceKind::Module && *n == key)
+            .position(|u| u.kind == SourceKind::Module && u.key == key)
             .ok_or_else(|| format!("entry {key} is not a module of the bundle"))?;
         self.entry = Some(i);
         Ok(())
@@ -231,30 +308,47 @@ impl PrecompileBundle {
 
     /// Serialize the blob.
     pub fn finish(self) -> Vec<u8> {
+        // Section order: the manifest, every unit's AST, then the bytecode sections.
+        let n = self.units.len();
+        let mut next_bc = 1 + n;
         let mut manifest = Vec::new();
-        uv(&mut manifest, self.units.len() as u64);
-        for (i, (kind, key, _)) in self.units.iter().enumerate() {
-            manifest.push(match kind {
+        uv(&mut manifest, n as u64);
+        for (i, u) in self.units.iter().enumerate() {
+            manifest.push(match u.kind {
                 SourceKind::Script => 0,
                 SourceKind::Module => 1,
             });
-            uv(&mut manifest, key.len() as u64);
-            manifest.extend_from_slice(key.as_bytes());
+            uv(&mut manifest, u.key.len() as u64);
+            manifest.extend_from_slice(u.key.as_bytes());
             uv(&mut manifest, i as u64 + 1); // section 0 is the manifest
+            match &u.bytecode {
+                Some(_) => {
+                    uv(&mut manifest, next_bc as u64);
+                    next_bc += 1;
+                }
+                None => uv(&mut manifest, 0),
+            }
         }
         uv(&mut manifest, self.entry.map_or(0, |e| e as u64 + 1));
 
         let mut sections: Vec<(u32, &[u8])> = vec![(SEC_MANIFEST, &manifest)];
-        for (_, _, ast) in &self.units {
-            sections.push((SEC_AST, ast));
+        for u in &self.units {
+            sections.push((SEC_AST, &u.ast));
         }
+        for u in &self.units {
+            if let Some(bc) = &u.bytecode {
+                sections.push((SEC_BYTECODE, bc));
+            }
+        }
+        let has_bytecode = sections.iter().any(|(k, _)| *k == SEC_BYTECODE);
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&AST_VERSION.to_le_bytes());
         out.extend_from_slice(&(sections.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0u64.to_le_bytes()); // layout fingerprint: no native code
+        let layout_fp = if has_bytecode { LAYOUT_FINGERPRINT } else { 0 };
+        out.extend_from_slice(&layout_fp.to_le_bytes());
         let mut ver = [0u8; 16];
         let v = env!("CARGO_PKG_VERSION").as_bytes();
         ver[..v.len().min(16)].copy_from_slice(&v[..v.len().min(16)]);
@@ -311,11 +405,19 @@ fn uv(out: &mut Vec<u8>, mut v: u64) {
 
 // ---- reading ----------------------------------------------------------------------------------
 
-/// One unit of a parsed blob: its kind, key, and AST section bytes.
+/// One unit of a parsed blob: its kind, key, and AST (and bytecode) section bytes.
 pub(crate) struct Unit {
     pub kind: SourceKind,
     pub key: String,
     pub ast: &'static [u8],
+    pub bytecode: Option<&'static [u8]>,
+}
+
+impl Unit {
+    /// Decode the unit's AST and attach its precompiled bytecode.
+    pub fn decode(&self) -> Result<Vec<Stmt>, String> {
+        decode_unit(self.ast, self.bytecode)
+    }
 }
 
 pub(crate) struct Parsed {
@@ -350,6 +452,10 @@ pub(crate) fn parse(bytes: &'static [u8]) -> Result<Parsed, String> {
             String::from_utf8_lossy(built),
             env!("CARGO_PKG_VERSION")
         ));
+    }
+    let layout_fp = read_u64(bytes, 24);
+    if layout_fp != 0 && layout_fp != LAYOUT_FINGERPRINT {
+        return err("bytecode layout fingerprint mismatch (rebuild with this lumen)");
     }
     let count = read_u32(bytes, 20) as usize;
     let table_end = HEADER_LEN + count * SECTION_ENTRY_LEN;
@@ -437,7 +543,19 @@ fn read_manifest(m: &[u8], sections: &[(u32, &'static [u8])]) -> Result<Parsed, 
             Some((SEC_AST, d)) => *d,
             _ => return Err(format!("precompiled: {key}: bad AST section {sec}")),
         };
-        units.push(Unit { kind, key, ast });
+        let bytecode = match c.uv()? as usize {
+            0 => None,
+            sec => match sections.get(sec) {
+                Some((SEC_BYTECODE, d)) => Some(*d),
+                _ => return Err(format!("precompiled: {key}: bad bytecode section {sec}")),
+            },
+        };
+        units.push(Unit {
+            kind,
+            key,
+            ast,
+            bytecode,
+        });
     }
     let entry = match c.uv()? {
         0 => None,
@@ -452,9 +570,98 @@ fn read_manifest(m: &[u8], sections: &[(u32, &'static [u8])]) -> Result<Parsed, 
     Ok(Parsed { units, entry })
 }
 
-/// Decode one unit's AST.
-pub(crate) fn decode_unit(ast: &[u8]) -> Result<Vec<Stmt>, String> {
-    snapshot::decode(ast, "")
+/// Decode one unit's AST and attach its bytecode section to the decoded functions: refusals
+/// at once, chunks on demand (decoded when the function first tiers up) unless
+/// `LUMEN_AOT_EAGER` is set, which decodes every chunk now so first calls run on the VM.
+pub(crate) fn decode_unit(
+    ast: &[u8],
+    bytecode: Option<&'static [u8]>,
+) -> Result<Vec<Stmt>, String> {
+    let Some(bc) = bytecode else {
+        return snapshot::decode(ast, "");
+    };
+    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let eager = *EAGER.get_or_init(|| std::env::var_os("LUMEN_AOT_EAGER").is_some());
+    let (body, funcs) = snapshot::decode_with_functions(ast, "")?;
+    crate::bytecode::serialize::attach_unit(bc, &funcs, eager)?;
+    Ok(body)
+}
+
+/// Bytecode-tier counters, process-wide (see [`stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrecompiledStats {
+    /// Bytecode compiles (at run time: functions tiering up without a precompiled chunk).
+    pub compiles: u64,
+    /// Precompiled chunks registered at load, to decode when their function tiers up.
+    pub chunks_registered: u64,
+    /// Precompiled chunks decoded into a function's code cache (on tier-up, or at load with
+    /// `LUMEN_AOT_EAGER`) — each one a compile the load did not do.
+    pub chunks_attached: u64,
+    /// Precompiled compiler refusals attached (functions that stay on the tree-walker).
+    pub refusals_attached: u64,
+}
+
+/// The counters since the last [`reset_stats`] — e.g. to check that a precompiled
+/// program ran without compiling anything at run time.
+pub fn stats() -> PrecompiledStats {
+    let (compiles, chunks_registered, chunks_attached, refusals_attached) =
+        crate::bytecode::serialize::counters();
+    PrecompiledStats {
+        compiles,
+        chunks_registered,
+        chunks_attached,
+        refusals_attached,
+    }
+}
+
+pub fn reset_stats() {
+    crate::bytecode::serialize::reset_counters();
+}
+
+/// What [`verify_bytecode`] checked, and how long each step took.
+#[derive(Clone, Debug, Default)]
+pub struct VerifyReport {
+    pub units: usize,
+    pub functions: usize,
+    /// Attached chunks found identical to a fresh compile of the decoded function.
+    pub chunks: usize,
+    /// Attached refusals confirmed by a fresh compile.
+    pub refusals: usize,
+    /// Decoding every unit's AST.
+    pub decode_ast: std::time::Duration,
+    /// Decoding + attaching every bytecode section.
+    pub attach: std::time::Duration,
+    /// Compiling every attached function afresh (what the load saved).
+    pub recompile: std::time::Duration,
+}
+
+/// Round-trip check of a blob's bytecode (for tests and tooling): decode every unit, attach its
+/// chunks, then recompile each function of the decoded AST and require the result to equal the
+/// attached chunk (or refusal) exactly.
+#[doc(hidden)]
+pub fn verify_bytecode(blob: &'static [u8]) -> Result<VerifyReport, String> {
+    use std::time::Instant;
+    let parsed = parse(blob)?;
+    let mut rep = VerifyReport::default();
+    for u in &parsed.units {
+        rep.units += 1;
+        let t = Instant::now();
+        let (_body, funcs) = snapshot::decode_with_functions(u.ast, "")?;
+        rep.decode_ast += t.elapsed();
+        rep.functions += funcs.len();
+        let Some(bc) = u.bytecode else { continue };
+        let t = Instant::now();
+        crate::bytecode::serialize::attach_unit(bc, &funcs, true)
+            .map_err(|e| format!("{}: {e}", u.key))?;
+        rep.attach += t.elapsed();
+        let t = Instant::now();
+        let (chunks, refusals) = crate::bytecode::serialize::verify_unit(&funcs)
+            .map_err(|e| format!("{}: {e}", u.key))?;
+        rep.recompile += t.elapsed();
+        rep.chunks += chunks;
+        rep.refusals += refusals;
+    }
+    Ok(rep)
 }
 
 // ---- the realm's module table -----------------------------------------------------------------
@@ -462,7 +669,7 @@ pub(crate) fn decode_unit(ast: &[u8]) -> Result<Vec<Stmt>, String> {
 /// Module units registered with a realm (kept in its host state), by key.
 #[derive(Default)]
 pub(crate) struct PrecompiledModules {
-    units: HashMap<String, &'static [u8]>,
+    units: HashMap<String, (&'static [u8], Option<&'static [u8]>)>,
 }
 
 pub(crate) fn register_modules(interp: &mut Interp, parsed: &Parsed) {
@@ -471,7 +678,7 @@ pub(crate) fn register_modules(interp: &mut Interp, parsed: &Parsed) {
     }
     let table = interp.host_state.get_mut::<PrecompiledModules>().unwrap();
     for u in parsed.units.iter().filter(|u| u.kind == SourceKind::Module) {
-        table.units.insert(u.key.clone(), u.ast);
+        table.units.insert(u.key.clone(), (u.ast, u.bytecode));
     }
 }
 
@@ -480,12 +687,12 @@ pub(crate) fn module_body(interp: &Interp, key: &str) -> Option<Result<Vec<Stmt>
     if !key.starts_with(KEY_PREFIX) {
         return None;
     }
-    let ast = *interp
+    let (ast, bytecode) = *interp
         .host_state
         .get::<PrecompiledModules>()?
         .units
         .get(key)?;
-    Some(decode_unit(ast).map_err(|e| format!("{key}: {e}")))
+    Some(decode_unit(ast, bytecode).map_err(|e| format!("{key}: {e}")))
 }
 
 /// Resolve `specifier` (imported from `referrer`) to a registered precompiled module's key.

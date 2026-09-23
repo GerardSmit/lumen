@@ -24,6 +24,8 @@ pub struct Spec {
     /// The directory module keys are relative to (`aot:/<path from root>`). Default: the
     /// deepest directory containing every module of the bundle.
     pub root: Option<PathBuf>,
+    /// Leave out the precompiled bytecode (AST only; functions compile at run time).
+    pub no_bytecode: bool,
 }
 
 /// The finished blob and every file read to build it (for rebuild tracking).
@@ -80,7 +82,7 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
     for (i, script) in spec.scripts.iter().enumerate() {
         let path = abs(script);
         let src = read(&path)?;
-        let unit = CompiledUnit::compile(&src, SourceKind::Script)
+        let unit = CompiledUnit::compile_with(&src, SourceKind::Script, !spec.no_bytecode)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let label = format!(
             "script{i}:{}",
@@ -108,7 +110,7 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
             Some(from) => format!("{e} (imported from {})", from.display()),
             None => e,
         })?;
-        let unit = CompiledUnit::compile(&src, SourceKind::Module)
+        let unit = CompiledUnit::compile_with(&src, SourceKind::Module, !spec.no_bytecode)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         if spec.walk {
             for s in unit.imports().iter().filter(|s| is_relative(s)) {
