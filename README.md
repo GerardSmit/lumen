@@ -33,10 +33,12 @@ bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` an
 modifiers), typed arrays, `Proxy`/`Reflect`, ES modules (top-level await, `import defer`,
 source phase), `Intl`, and `Temporal`.
 
-`Intl` (ECMA-402) and its CLDR data tables are behind the default-on `intl` cargo feature —
-the largest single contributor to binary size (~3 MB of the release binary). Build with
-`--no-default-features` for a small engine: the `Intl` global is absent and the `toLocale*`
-methods degrade to their locale-independent forms, the way engines built without i18n do.
+`Intl` (ECMA-402) and `Temporal` are behind the default-on `intl` and `temporal` Cargo features.
+The CLDR data tables included by `intl` are the largest single contributor to binary size (~3 MB
+of the release binary). Build with `--no-default-features` for a small engine: the `Intl` and
+`Temporal` globals are absent, `Date.prototype.toTemporalInstant` is omitted, and the `toLocale*`
+methods degrade to their locale-independent forms, the way engines built without i18n do. Either
+feature can be enabled independently.
 
 On dependencies and `unsafe`: the workspace stays std-only — the JIT maps executable memory
 through raw platform declarations (`mmap`/`mprotect`, macOS `MAP_JIT`, or Windows

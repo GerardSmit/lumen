@@ -2698,6 +2698,7 @@ pub fn install(it: &mut Interp) {
     weakrefs::install_weak_refs(it);
     disposable::install_disposable_stack(it);
     shadowrealm::install_shadow_realm(it);
+    #[cfg(feature = "temporal")]
     crate::temporal::install(it);
     #[cfg(feature = "intl")]
     crate::intl::install(it);

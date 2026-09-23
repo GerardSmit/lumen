@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(lumen)* gate the Temporal API behind a default-on `temporal` Cargo feature
+
 ## [0.1.3](https://github.com/lucid-softworks/lumen/compare/v0.1.2...v0.1.3) - 2026-07-27
 
 ### Added

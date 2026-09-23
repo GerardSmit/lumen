@@ -12,12 +12,16 @@ license.workspace = true
 [dependencies]
 
 [features]
-default = ["intl"]
+default = ["intl", "temporal"]
 # ECMA-402 (`Intl`) and the CLDR data tables backing it — the single largest contributor to
 # binary size. Disable (`--no-default-features`) for a small build: the `Intl` global is absent
 # and the `toLocale*` methods degrade to their locale-independent forms (like engines built
 # without i18n support).
 intl = []
+# TC39 Temporal globals and Date.prototype.toTemporalInstant. Default-on for compatibility;
+# embedders that do not need the proposal can exclude the public surface with
+# `--no-default-features` or `--no-default-features --features intl`.
+temporal = []
 # The curated embedder surface (`lumen::embed`: Ctx, host state, define_global, event-loop
 # hooks) used by the lumen-host/lumen-runtime crates. Off by default: everything under it is a
 # public-API commitment on a published crate, gated until it stabilizes with those crates.

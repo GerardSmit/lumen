@@ -917,6 +917,7 @@ fn host_262() {
     assert_eq!(run("typeof $262.gc"), "function");
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_basics() {
     assert_eq!(run("typeof Temporal"), "object");
@@ -965,6 +966,7 @@ fn temporal_basics() {
     assert_eq!(throws("new Temporal.PlainDate(2020,13,1)"), "RangeError");
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_until_since() {
     assert_eq!(
@@ -990,6 +992,7 @@ fn temporal_until_since() {
     assert_eq!(run("Temporal.Instant.fromEpochMilliseconds(0).until(Temporal.Instant.fromEpochMilliseconds(5000)).seconds"), "5");
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_zoned() {
     assert_eq!(run("typeof Temporal.ZonedDateTime"), "function");
@@ -1043,6 +1046,7 @@ fn to_string_tag() {
         "[object RegExp]"
     );
     assert_eq!(run("Object.prototype.toString.call(5)"), "[object Number]");
+    #[cfg(feature = "temporal")]
     assert_eq!(
         run("Object.prototype.toString.call(new Temporal.PlainDate(2021,1,1))"),
         "[object Temporal.PlainDate]"
@@ -1053,6 +1057,7 @@ fn to_string_tag() {
     );
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_tostring_options() {
     assert_eq!(
@@ -1077,6 +1082,7 @@ fn temporal_tostring_options() {
     );
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_duration_round_relative() {
     // P1Y rounded to months relative to 2021-01-01 = 12 months.
@@ -1085,6 +1091,7 @@ fn temporal_duration_round_relative() {
     assert_eq!(run("Temporal.Duration.from({days:40}).round({largestUnit:'month', relativeTo:'2021-01-01'}).months"), "1");
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_named_timezones() {
     // Fixed-offset named zones.
@@ -7753,6 +7760,7 @@ fn iterator_helpers() {
         "2,3"
     );
 }
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_round_string() {
     assert_eq!(
@@ -12333,6 +12341,7 @@ fn typed_array_bytes_per_element_descriptor() {
     }
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn date_to_temporal_instant() {
     // A valid Date yields a Temporal.Instant at ms×10^6 ns.
@@ -14366,6 +14375,7 @@ fn regexp_v_flag_class_sets() {
     assert_eq!(run("String(/[&]/v.test('&'))"), "true");
 }
 
+#[cfg(feature = "temporal")]
 #[test]
 fn temporal_duration_arithmetic_and_parsing() {
     // Fractional ISO components spread exactly into sub-units.
@@ -14503,6 +14513,7 @@ fn listformat_to_parts_and_temporal_removed_methods() {
         ),
         "ef|l, |eo|l, or |eo"
     );
+    #[cfg(feature = "temporal")]
     assert_eq!(
         run("['withPlainDate' in Temporal.PlainDateTime.prototype,
              'epochSeconds' in Temporal.ZonedDateTime.prototype,

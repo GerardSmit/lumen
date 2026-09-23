@@ -555,6 +555,7 @@ pub(super) fn install_date(it: &mut Interp) {
         let t = date_ms(i, &this)?;
         Ok(Value::Num(if t.is_nan() { f64::NAN } else { 0.0 }))
     });
+    #[cfg(feature = "temporal")]
     it.def_method(&proto, "toTemporalInstant", 0, |i, this, _| {
         // RequireInternalSlot([[DateValue]]) then a Temporal.Instant at ms×10^6 ns.
         let ms = date_ms(i, &this)?;
