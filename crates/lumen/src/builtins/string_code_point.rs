@@ -1,4 +1,4 @@
-//! Full codePointAt semantics, also used when the ASCII call intrinsic declines.
+//! Full `String.prototype.codePointAt` semantics.
 use super::{ab, arg, this_string};
 use crate::{interpreter::Interp, value::Value};
 
@@ -7,8 +7,6 @@ pub(crate) fn nf_code_point_at(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-    #[cfg(test)]
-    NATIVE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let s = this_string(i, &this)?;
     let n = ab(i.to_number(&arg(args, 0)))?;
     let n = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -30,37 +28,19 @@ pub(crate) fn nf_code_point_at(
 }
 
 #[cfg(test)]
-thread_local! {
-    static NATIVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
 mod tests {
     use crate::{bytecode::Tier, Completion, Engine};
 
-    fn check(source: &str, ascii_only: bool) {
-        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+    fn check(source: &str) {
+        for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            super::NATIVE_CALLS.with(|calls| calls.set(0));
             let script = format!("function assert(x){{if(!x)throw new Error('code point assertion');}} function point(s,n){{return s.codePointAt(n);}} {source}; 'passed'");
             match engine.eval(&script, false).unwrap() {
                 Completion::Value(v) => assert_eq!(v, "passed", "{tier:?}"),
                 Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
             }
-            #[cfg(all(
-                target_arch = "aarch64",
-                any(target_os = "macos", target_os = "linux", target_os = "windows")
-            ))]
-            if ascii_only && matches!(tier, Tier::Jit) {
-                let calls = super::NATIVE_CALLS.with(|calls| calls.get());
-                assert!(
-                    calls < 20,
-                    "ASCII reads must bypass native dispatch: {calls}"
-                );
-            }
-            let _ = ascii_only;
         }
     }
 
@@ -71,7 +51,6 @@ mod tests {
             const text='ASCII text';
             for(let i=0;i<1000;i++)assert(point(text,i%text.length)===text.charCodeAt(i%text.length));
         "#,
-            true,
         );
     }
 
@@ -89,7 +68,6 @@ mod tests {
             assert(Number.isNaN('A'.charCodeAt(1)) && point('A',1)===undefined);
             for(let i=0;i<1000;i++)assert(point(text,0)===65);
         "#,
-            false,
         );
     }
 
@@ -112,7 +90,6 @@ mod tests {
             rejected=false;try{point(text,1n);}catch(e){rejected=e instanceof realm.global.TypeError;}assert(rejected);
             String.prototype.codePointAt=original;assert(point(text,2)===67);
         "#,
-            false,
         );
     }
 }

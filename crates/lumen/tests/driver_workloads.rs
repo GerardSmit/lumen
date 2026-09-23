@@ -18,7 +18,7 @@ fn check_with(tier: Tier, source: &str) {
 }
 
 fn check(source: &str) {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+    for tier in [Tier::Interp, Tier::Bytecode] {
         check_with(tier, source);
     }
 }
@@ -83,7 +83,7 @@ fn regex_long_inputs() {
 /// chains longer than the budget unresolved, which read as a hang in a 100k-frame stress test.
 #[test]
 fn microtask_queue_drains_to_empty() {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+    for tier in [Tier::Interp, Tier::Bytecode] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);

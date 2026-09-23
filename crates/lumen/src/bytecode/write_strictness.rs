@@ -1,42 +1,10 @@
-//! Restore the source function's strictness around writes reached by fast JIT calls.
-use super::{Chunk, Op};
-use crate::interpreter::Interp;
+//! Writes keep the callee's strictness when strict and sloppy functions call each other.
 
-pub(super) fn enter(interp: &mut Interp, chunk: &Chunk, pc: u32) -> bool {
-    let strict = chunk.execution_strictness(interp, pc as usize);
-    std::mem::replace(&mut interp.strict, strict)
-}
-
-pub(super) fn needed(op: Op) -> bool {
-    matches!(
-        op,
-        Op::SetProp(..)
-            | Op::SetPropDrop(..)
-            | Op::SetPropThisDrop(..)
-            | Op::SetPropLocalDrop(..)
-            | Op::SetElem
-            | Op::SetElemDrop
-            | Op::SetElemLocal(..)
-            | Op::SetElemLocalDrop(..)
-            | Op::AppendProp(..)
-            | Op::UpdateProp(..)
-            | Op::UpdateElem(..)
-            | Op::StoreName(..)
-            | Op::StoreNameCached(..)
-            | Op::UpdateName(..)
-            | Op::UpdateNameCached(..)
-            | Op::StoreCap(..)
-            | Op::StoreCapInit(..)
-            | Op::UpdateCap(..)
-    )
-}
-
-#[cfg(test)]
 mod tests {
     use crate::{bytecode::Tier, Completion, Engine};
 
     fn check(source: &str) {
-        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);

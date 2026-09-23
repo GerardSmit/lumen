@@ -5,8 +5,6 @@ use crate::value::{Exotic, Gc, Value};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-pub(crate) mod jit;
-
 const MAX_DEPTH: usize = 8;
 
 enum ScopeGuard {
@@ -179,7 +177,6 @@ impl Chunk {
     ) -> Option<Value> {
         let (path, value) = NamePath::build(interp, env, &self.names[name as usize])?;
         *self.name_paths[cache as usize].borrow_mut() = Some(path);
-        self.record_name_number(cache as usize, &value);
         Some(value)
     }
 }

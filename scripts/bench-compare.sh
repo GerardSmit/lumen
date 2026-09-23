@@ -4,8 +4,8 @@
 # markdown comparison table. Higher is better; scores are normalized to a 2008
 # reference machine at 100.
 #
-#   scripts/bench-compare.sh                 # node + bun + lumen (jit tier)
-#   scripts/bench-compare.sh --tiers         # also include lumen bytecode + interp tiers
+#   scripts/bench-compare.sh                 # node + bun + lumen (bytecode tier)
+#   scripts/bench-compare.sh --tiers         # also include the lumen interp tier
 #
 # Requires: node and bun on PATH (either is skipped with a warning if missing).
 # Downloads the benchmark JS into ./v8-v7 (gitignored) on first run and builds
@@ -79,14 +79,11 @@ else
   echo "warning: bun not found, skipping" >&2
 fi
 
-echo "Running lumen (jit) ..." >&2
-run_suite "$TMP/lumen-jit.txt" "$ROOT/target/release/lumen" --tier=jit "${LUMEN_ARGS[@]}"
-COLS+=("Lumen (jit)"); OUTS+=("$TMP/lumen-jit.txt")
+echo "Running lumen (bytecode) ..." >&2
+run_suite "$TMP/lumen-bc.txt" "$ROOT/target/release/lumen" --tier=bytecode "${LUMEN_ARGS[@]}"
+COLS+=("Lumen (bytecode)"); OUTS+=("$TMP/lumen-bc.txt")
 
 if [ "$ALL_TIERS" = 1 ]; then
-  echo "Running lumen (bytecode) ..." >&2
-  run_suite "$TMP/lumen-bc.txt" "$ROOT/target/release/lumen" --tier=bytecode "${LUMEN_ARGS[@]}"
-  COLS+=("Lumen (bytecode)"); OUTS+=("$TMP/lumen-bc.txt")
   echo "Running lumen (interp) ..." >&2
   run_suite "$TMP/lumen-interp.txt" "$ROOT/target/release/lumen" --tier=interp "${LUMEN_ARGS[@]}"
   COLS+=("Lumen (interp)"); OUTS+=("$TMP/lumen-interp.txt")

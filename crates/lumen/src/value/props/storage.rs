@@ -98,19 +98,6 @@ impl Default for DenseBuffers {
     }
 }
 
-impl DenseBuffers {
-    pub(in crate::value) const fn inline_len_offset() -> usize {
-        std::mem::offset_of!(Self, inline_packed) + std::mem::offset_of!(InlinePacked, len)
-    }
-
-    pub(in crate::value) const fn inline_slots_offset() -> usize {
-        std::mem::offset_of!(Self, inline_packed) + std::mem::offset_of!(InlinePacked, slots)
-    }
-    pub(in crate::value) const fn mirror_flags_offset() -> usize {
-        std::mem::offset_of!(Self, mirror_flags)
-    }
-}
-
 struct EmptyDenseBuffers(DenseBuffers);
 // This one value contains only `None` and empty Vec dangling sentinels and is never mutated; no
 // non-Sync payload is reachable through it. Live DenseBuffers remain thread-local as before.

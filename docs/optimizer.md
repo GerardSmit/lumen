@@ -1,3 +1,6 @@
+The template JIT described below was removed on 2026-09-23; this file is kept as history.
+See docs/jit.md.
+
 # Optimizing JIT work
 
 The first implemented pass is backward local liveness over the existing target-neutral

@@ -7,26 +7,23 @@ loop and host APIs. Every crate in the workspace is std-only: no `tokio`, `mio`,
 
 ## The engine (`crates/lumen`)
 
-A lexer, parser, and **three execution tiers**:
+A lexer, parser, and **two execution tiers**:
 
 - a **tree-walking interpreter** — the reference oracle: the spec semantics live here, and
-  every other tier must match it observably (a differential fuzzer, `lumen-difftest`, holds
+  the other tier must match it observably (a differential fuzzer, `lumen-difftest`, holds
   them to that);
-- an opt-in **bytecode VM** — functions compile whole (or not at all — no deoptimization) to
-  a stack machine with slot-homed locals, per-site inline caches for property and free-name
-  access backed by object shapes (hidden classes), and dense-array element fast paths;
-- a **native template JIT** — bytecode lowers to real ARM64 machine code on macOS, Linux,
-  and Windows, with a correctness-first x86-64 backend on Intel macOS, Linux, and Windows:
-  per-op templates with the interpreter as the shared slow path, inline-cache reads baked
-  into the instruction stream, fused compare-and-branch, exact-`ToInt32` bitops, and numeric
-  *register chains* that keep runs of arithmetic entirely in FP registers. The full set of
-  inline fast paths currently lives in the ARM64 backend; x86-64 starts with native control
-  flow and checked per-op helpers. Other architectures degrade to the bytecode VM.
+- a **bytecode VM** (the default) — functions compile whole (or not at all — no
+  deoptimization) to a stack machine with slot-homed locals, per-site inline caches for
+  property and free-name access backed by object shapes (hidden classes), and dense-array
+  element fast paths.
 
-Tier selection: `--tier=interp|bytecode|jit` (**jit is the default**; where the JIT is
-unavailable it degrades to the bytecode VM). Functions tier up after a call-count threshold —
-immediately if the body contains a loop. Force the reference tree-walker with `--tier=interp`
-(or `LUMEN_TIER=interp`).
+A new optimizing native compiler is being built to replace the earlier template JIT; see
+[docs/jit.md](docs/jit.md).
+
+Tier selection: `--tier=interp|bytecode` (**bytecode is the default**; `jit` is still
+accepted as an alias for it). Functions tier up after a call-count threshold — immediately if
+the body contains a loop. Force the reference tree-walker with `--tier=interp` (or
+`LUMEN_TIER=interp`).
 
 The language surface: generators and `async`/`await` running on stackful coroutines (async
 bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` and inline
@@ -38,17 +35,11 @@ the largest single contributor to binary size (~3 MB of the release binary). Bui
 `--no-default-features` for a small engine: the `Intl` global is absent and the `toLocale*`
 methods degrade to their locale-independent forms, the way engines built without i18n do.
 
-On dependencies and `unsafe`: the workspace stays std-only — the JIT maps executable memory
-through raw platform declarations (`mmap`/`mprotect`, macOS `MAP_JIT`, or Windows
-`VirtualAlloc`/`VirtualProtect`) rather than libc. Pages are writable only while code is copied,
-then executable/read-only, and instruction caches are synchronized where required. The
-interpreter and bytecode VM are safe Rust; `unsafe` is concentrated where machine
-code meets the object graph (the JIT's executable pages and its templates' raw reads — every
-baked offset is *measured at runtime* against the live types and fails closed to the checked
-helper if anything doesn't hold) and in the N-API addon loader's `dlopen` bridge.
+On dependencies and `unsafe`: the workspace stays std-only. `unsafe` is concentrated in the
+object heap and its inline-cache fast paths, and in the N-API addon loader's `dlopen` bridge.
 
 **Passes 100% of [tc39/test262](https://github.com/tc39/test262): 53,577/53,577** (including
-annexB, intl402, and staging) — on the default JIT tier and under `LUMEN_TIER=interp`. One
+annexB, intl402, and staging) — on the compiled tier and under `LUMEN_TIER=interp`. One
 test is skipped: `annexB/.../block-decl-func-skip-arguments.js` predates the current
 FunctionDeclarationInstantiation text and contradicts two SpiderMonkey staging tests (and V8).
 
@@ -136,7 +127,7 @@ lumen-repl     interactive shell
 lumen-cli      node/deno-style entrypoint
 
 test262-runner   conformance harness (parallel workers over ./test262)
-lumen-difftest   differential fuzzer across the three execution tiers
+lumen-difftest   differential fuzzer across the two execution tiers
 lumen-wasm       wasm build of the engine
 ```
 
@@ -179,11 +170,11 @@ cargo build --release -p lumen --bin lumen
 ```sh
 scripts/test262-clone.sh    # one-time: clone the suite into ./test262
 scripts/run-test262.sh      # run it (see crates/test262-runner for env knobs)
-LUMEN_TIER=jit scripts/run-test262.sh    # same suite against the compiled tiers
+LUMEN_TIER=bytecode scripts/run-test262.sh    # same suite against the bytecode tier
 ```
 
 The execution tiers are also held together by a differential fuzzer: every generated program
-runs in all three tiers, which must agree on the completion value, thrown errors, the
+runs in both tiers, which must agree on the completion value, thrown errors, the
 observable side-effect trace, and final global state. Divergences are delta-minimized into a
 regression corpus that replays on every run.
 

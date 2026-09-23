@@ -1,16 +1,14 @@
 //! Target-neutral control-flow and stack analysis for optimizing JIT regions.
 //!
-//! The baseline emitters deliberately remain architecture-specific.  This module owns the
-//! shared facts an optimizing tier needs: exact settled stack depths, basic blocks, normal-flow
-//! dominance, and natural loops.  Exception handlers are represented as independent roots, not
+//! This module owns the shared facts an optimizing tier needs: exact settled stack depths, basic
+//! blocks, normal-flow dominance, and natural loops.  Exception handlers are represented as independent roots, not
 //! ordinary predecessors -- a catch is entered with the saved try-entry depth plus the thrown
 //! value, and pretending `PushHandler` branches to it would make dominance unsound.
 
-// The IR is landing incrementally: CFG/stack analysis and selected region lowerings are live,
-// while representation variants and verifier accessors are consumed by the next stages.
+// The native template JIT that consumed this IR was removed; the analysis is kept for the new
+// optimizing compiler's frontend (see docs/jit.md) and is exercised by its own tests until then.
 #![allow(dead_code)]
 
-pub(crate) mod iterator_entry;
 pub(crate) mod liveness;
 
 use crate::bytecode::{Chunk, Op, UpdKind};
@@ -166,12 +164,10 @@ pub(crate) enum InstKind {
     CheckLocal(u16),
     StoreLocal(u16),
     UpdateLocal(u16, UpdKind),
-    ResetSlots { start: u16, count: u16 },
     Clone,
     Dup,
     Dup2,
     Branch,
-    InlineGuard,
 }
 
 #[derive(Clone, Debug)]
@@ -244,7 +240,6 @@ impl RegionIr {
             lp,
             n_slots,
             |pc| chunk.jit_stack_effect(pc),
-            |target| chunk.jit_inline_target(target).argc as usize,
             |k| {
                 if chunk.jit_const_num(k).is_some() {
                     Rep::F64
@@ -261,7 +256,6 @@ impl RegionIr {
         lp: &NaturalLoop,
         n_slots: usize,
         mut effect: impl FnMut(usize) -> Option<(usize, usize)>,
-        mut inline_argc: impl FnMut(u32) -> usize,
         mut const_rep: impl FnMut(u32) -> Rep,
     ) -> Result<Self, IrError> {
         if lp.blocks.len() > 128
@@ -417,22 +411,6 @@ impl RegionIr {
                             outputs: vec![value],
                         });
                     }
-                    Op::ResetSlots(start, count) => {
-                        let mut outputs = Vec::with_capacity(count as usize);
-                        for slot in start as usize..start as usize + count as usize {
-                            let dst = locals.get_mut(slot).ok_or(IrError::BadLocal { pc, slot })?;
-                            let value =
-                                push_value(&mut values, ValueDef::Undefined { pc }, Rep::Nullish);
-                            *dst = value;
-                            outputs.push(value);
-                        }
-                        insts.push(Inst {
-                            pc,
-                            kind: InstKind::ResetSlots { start, count },
-                            inputs: Vec::new(),
-                            outputs,
-                        });
-                    }
                     Op::UpdateLocal(slot, kind) => {
                         let old = local(slot, &locals)?;
                         let old_num = push_value(
@@ -503,19 +481,6 @@ impl RegionIr {
                             pc,
                             kind: InstKind::Generic,
                             inputs: vec![value],
-                            outputs: Vec::new(),
-                        });
-                    }
-                    Op::InlineGuard(target, _) => {
-                        let width = inline_argc(target) + 2;
-                        let at = stack
-                            .len()
-                            .checked_sub(width)
-                            .ok_or(IrError::StackUnderflow { pc })?;
-                        insts.push(Inst {
-                            pc,
-                            kind: InstKind::InlineGuard,
-                            inputs: stack[at..].to_vec(),
                             outputs: Vec::new(),
                         });
                     }
@@ -1008,7 +973,6 @@ pub(crate) fn jump_target(op: &Op) -> Option<usize> {
         | Op::JumpIfFalsePeek(t)
         | Op::JumpIfTruePeek(t)
         | Op::JumpIfNotNullishPeek(t)
-        | Op::InlineGuard(_, t)
         | Op::PushHandler(t) => Some(*t as usize),
         _ => None,
     }
@@ -1022,7 +986,6 @@ fn ends_block(op: &Op) -> bool {
             | Op::JumpIfFalsePeek(_)
             | Op::JumpIfTruePeek(_)
             | Op::JumpIfNotNullishPeek(_)
-            | Op::InlineGuard(..)
             | Op::Return
             | Op::ReturnUndef
             | Op::Throw
@@ -1037,8 +1000,7 @@ fn normal_successor_pcs(op: &Op, pc: usize, len: usize, out: &mut Vec<usize>) {
         Op::JumpIfFalse(t)
         | Op::JumpIfFalsePeek(t)
         | Op::JumpIfTruePeek(t)
-        | Op::JumpIfNotNullishPeek(t)
-        | Op::InlineGuard(_, t) => {
+        | Op::JumpIfNotNullishPeek(t) => {
             out.push(*t as usize);
             if pc + 1 <= len {
                 out.push(pc + 1);
@@ -1096,8 +1058,7 @@ fn analyze_stack(
             Op::JumpIfFalse(t)
             | Op::JumpIfFalsePeek(t)
             | Op::JumpIfTruePeek(t)
-            | Op::JumpIfNotNullishPeek(t)
-            | Op::InlineGuard(_, t) => {
+            | Op::JumpIfNotNullishPeek(t) => {
                 let target = *t as usize;
                 validate_target(ops.len(), pc, target)?;
                 work.push((target, next));
@@ -1295,8 +1256,8 @@ mod tests {
             Op::Dup2 => (2, 4),
             Op::StoreLocal(_) | Op::Pop | Op::Return | Op::Throw => (1, 0),
             Op::Lt | Op::Add => (2, 1),
-            Op::Jump(_) | Op::InlineGuard(..) | Op::PushHandler(_) | Op::PopHandler => (0, 0),
-            Op::ResetSlots(..) | Op::Tdz(_) => (0, 0),
+            Op::Jump(_) | Op::PushHandler(_) | Op::PopHandler => (0, 0),
+            Op::Tdz(_) => (0, 0),
             Op::JumpIfFalse(_) => (1, 0),
             Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
             Op::ReturnUndef => (0, 0),
@@ -1436,22 +1397,6 @@ mod tests {
     }
 
     #[test]
-    fn cfg_inline_guard_retains_the_operand_window() {
-        let g = cfg(&[
-            Op::Undef,
-            Op::Undef,
-            Op::InlineGuard(0, 4),
-            Op::Jump(4),
-            Op::Pop,
-            Op::Pop,
-            Op::ReturnUndef,
-        ])
-        .unwrap();
-        assert_eq!(g.stack_depth_at(3), Some(2));
-        assert_eq!(g.stack_depth_at(4), Some(2));
-    }
-
-    #[test]
     fn cfg_catch_is_an_independent_root_with_exception_depth() {
         let ops = [
             Op::PushHandler(4),
@@ -1474,16 +1419,8 @@ mod tests {
     fn region<'a>(ops: &'a [Op], head: usize, n_slots: usize) -> (Cfg, RegionIr) {
         let g = cfg(ops).unwrap();
         let lp = g.loop_at_header(head).unwrap();
-        let ir = RegionIr::build_with(
-            ops,
-            &g,
-            lp,
-            n_slots,
-            |pc| effect(&ops[pc]),
-            |_| 0,
-            |_| Rep::F64,
-        )
-        .unwrap();
+        let ir = RegionIr::build_with(ops, &g, lp, n_slots, |pc| effect(&ops[pc]), |_| Rep::F64)
+            .unwrap();
         (g, ir)
     }
 
@@ -1614,32 +1551,5 @@ mod tests {
             .unwrap();
         assert_eq!(dup.inputs.len(), 1);
         assert!(dup.outputs.is_empty());
-    }
-
-    #[test]
-    fn ssa_reset_slots_redefines_only_requested_range() {
-        let ops = [Op::ResetSlots(1, 2), Op::Jump(0)];
-        let (_g, ir) = region(&ops, 0, 4);
-        let backedge = ir.blocks[0]
-            .successors
-            .iter()
-            .find(|edge| edge.target == ir.header)
-            .unwrap();
-        assert!(matches!(
-            ir.values[backedge.args[1].index()].def,
-            ValueDef::Undefined { pc: 0 }
-        ));
-        assert!(matches!(
-            ir.values[backedge.args[2].index()].def,
-            ValueDef::Undefined { pc: 0 }
-        ));
-        assert!(matches!(
-            ir.values[backedge.args[0].index()].def,
-            ValueDef::RegionInput(FrameLoc::Local(0))
-        ));
-        assert!(matches!(
-            ir.values[backedge.args[3].index()].def,
-            ValueDef::RegionInput(FrameLoc::Local(3))
-        ));
     }
 }

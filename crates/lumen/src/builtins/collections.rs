@@ -111,12 +111,3 @@ fn canonicalize_map_key(k: Value) -> Value {
         other => other,
     }
 }
-
-pub(crate) fn intrinsic(native: usize) -> u8 {
-    let read = lookup::intrinsic(native);
-    if read != 0 {
-        read
-    } else {
-        insert::intrinsic(native)
-    }
-}
