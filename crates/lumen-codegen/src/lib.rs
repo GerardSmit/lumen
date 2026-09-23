@@ -4,6 +4,7 @@
 //! allocation → machine code for x86-64 or ARM64, or a WebAssembly module ([`wasm`]). [`interp`] runs IR directly and is the
 //! reference every later stage is differentially tested against. See docs/jit.md.
 
+pub mod aarch64;
 pub mod builder;
 pub mod cfg;
 pub mod eval;
