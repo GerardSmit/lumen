@@ -27,6 +27,11 @@ pub(in crate::value) struct EntryVec {
     cap: u32,
 }
 
+/// Field offsets for the optimizing tier's inline reads (see `Props`' `jit_props_layout`).
+pub(in crate::value) const ENTRY_VEC_PTR: usize = std::mem::offset_of!(EntryVec, ptr);
+pub(in crate::value) const ENTRY_VEC_LEN: usize = std::mem::offset_of!(EntryVec, len);
+pub(in crate::value) const ENTRY_VEC_CAP: usize = std::mem::offset_of!(EntryVec, cap);
+
 impl EntryVec {
     pub(in crate::value) const fn new() -> EntryVec {
         EntryVec {

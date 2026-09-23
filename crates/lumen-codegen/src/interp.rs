@@ -60,6 +60,7 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
             let results = func.results(inst);
             match d {
                 InstData::Load { kind, addr, offset } => {
+                    // An I32 address is held zero-extended, so both pointer widths work as is.
                     let a = get(&vals, *addr).wrapping_add(*offset as i64 as u64);
                     let raw = env.load(a, kind.bytes());
                     let v = if kind.is_signed() {

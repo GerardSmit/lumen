@@ -107,6 +107,7 @@ fn unregister(r: &Ranges, slot: usize) {
     }
 }
 
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn contains(r: &Ranges, addr: usize) -> bool {
     r.0.iter().any(|(s, e)| {
         let s = s.load(Ordering::Acquire);
@@ -148,6 +149,7 @@ pub fn restore_target(prev: (usize, i32, u32)) {
 }
 
 /// For a fault at `pc` touching `addr`: the `(rsp, rip, rax)` to resume with, if it is ours.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn redirect(pc: usize, addr: usize) -> Option<(u64, u64, u64)> {
     if !contains(&REGIONS, addr) || !contains(&CODE, pc) {
         return None;
@@ -339,6 +341,22 @@ mod sys {
         handler::install()
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    pub unsafe fn install() -> bool {
+        false
+    }
+}
+
+/// No address-space reservation or fault handling on targets without an OS memory API
+/// (wasm32): [`Region::reserve`] fails and [`install`] returns false.
+#[cfg(not(any(unix, windows)))]
+mod sys {
+    pub unsafe fn reserve(_len: usize) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn commit(_at: *mut u8, _len: usize) -> bool {
+        false
+    }
+    pub unsafe fn release(_at: *mut u8, _len: usize) {}
     pub unsafe fn install() -> bool {
         false
     }

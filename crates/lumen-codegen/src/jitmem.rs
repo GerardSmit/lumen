@@ -163,3 +163,16 @@ mod sys {
         VirtualFree(mem, 0, MEM_RELEASE);
     }
 }
+
+/// No executable memory on targets without an OS memory API (wasm32): allocation fails and
+/// callers fall back (on wasm32, to the [`crate::wasm`] backend).
+#[cfg(not(any(unix, windows)))]
+mod sys {
+    pub unsafe fn alloc(_len: usize) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn make_exec(_mem: *mut u8, _len: usize) -> bool {
+        false
+    }
+    pub unsafe fn free_exec(_mem: *mut u8, _len: usize) {}
+}

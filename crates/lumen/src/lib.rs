@@ -101,6 +101,19 @@ pub fn set_host_clock(f: fn() -> f64) {
     let _ = HOST_CLOCK.set(f);
 }
 
+/// Install the WebAssembly JIT host (first call wins; meaningful on wasm32 only). On wasm32 the
+/// optimizing tier compiles hot loops to small WebAssembly modules that import the engine's own
+/// `env.memory` and `env.table` (the indirect-function table, which must be growable — link with
+/// `--growable-table`). `f` receives a module's bytes, instantiates it with those imports, appends
+/// its export `f0` to the table and returns that table index — or `None` (the loop then stays
+/// interpreted). Without a host the tier is off on wasm32.
+pub fn set_wasm_jit_host(f: fn(&[u8]) -> Option<u32>) {
+    let _ = WASM_JIT_HOST.set(f);
+}
+
+pub(crate) static WASM_JIT_HOST: std::sync::OnceLock<fn(&[u8]) -> Option<u32>> =
+    std::sync::OnceLock::new();
+
 /// The installed host clock's current time, if one was set.
 pub(crate) fn host_now_ms() -> Option<f64> {
     HOST_CLOCK.get().map(|f| f())

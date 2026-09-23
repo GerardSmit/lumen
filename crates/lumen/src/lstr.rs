@@ -31,6 +31,10 @@ pub struct LStr {
 }
 
 const HDR: usize = std::mem::size_of::<Header>();
+/// Offsets of the header's `u32` byte length and `u32` capacity (with [`ASCII_HINT`]), for the
+/// optimizing tier's inline `.length` (see `bytecode::jit::layout`).
+pub(crate) const LSTR_LEN_OFFSET: usize = std::mem::offset_of!(Header, len);
+pub(crate) const LSTR_CAP_OFFSET: usize = std::mem::offset_of!(Header, cap);
 
 /// Top bit of `cap`: the content is KNOWN all-ASCII (byte index == UTF-16 unit index, and every
 /// byte IS its unit). Purely a hint — never set for non-ASCII content, may be clear for ASCII

@@ -4,3 +4,8 @@
 # finishes. Keep this in project config so local and CI release builds agree.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:16777216"]
+
+# The optimizing tier on wasm32 appends each compiled loop to the indirect-function table
+# (see lumen::set_wasm_jit_host), so the table must be growable.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--growable-table"]

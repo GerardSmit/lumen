@@ -9,6 +9,30 @@ fn js_clock_ms() -> f64 {
     js_sys::Date::now()
 }
 
+/// The engine's WebAssembly JIT host (see `lumen::set_wasm_jit_host`): instantiate a compiled
+/// loop over this module's own memory and function table and append its entry to the table.
+/// Browsers cap *synchronous* compilation on the main thread (Chrome: 4 KB modules), so a larger
+/// loop fails here and stays interpreted — run the engine in a Worker for the full tier.
+fn jit_instantiate(bytes: &[u8]) -> Option<u32> {
+    use js_sys::{Object, Reflect, WebAssembly};
+    use wasm_bindgen::JsCast;
+    let module = WebAssembly::Module::new(&js_sys::Uint8Array::from(bytes).into()).ok()?;
+    let table: WebAssembly::Table = wasm_bindgen::function_table().dyn_into().ok()?;
+    let env = Object::new();
+    Reflect::set(&env, &"memory".into(), &wasm_bindgen::memory()).ok()?;
+    Reflect::set(&env, &"table".into(), &table).ok()?;
+    let imports = Object::new();
+    Reflect::set(&imports, &"env".into(), &env).ok()?;
+    let instance = WebAssembly::Instance::new(&module, &imports).ok()?;
+    let entry: js_sys::Function = Reflect::get(&instance.exports(), &"f0".into())
+        .ok()?
+        .dyn_into()
+        .ok()?;
+    let index = table.grow(1).ok()?;
+    table.set(index, &entry).ok()?;
+    Some(index)
+}
+
 /// One engine realm, persistent across `eval` calls (a playground "session"). `reset()` on the JS
 /// side is just dropping it and constructing a new one.
 #[wasm_bindgen]
@@ -21,6 +45,7 @@ impl Session {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Session {
         lumen::set_host_clock(js_clock_ms);
+        lumen::set_wasm_jit_host(jit_instantiate);
         let mut engine = lumen::Engine::new();
         // The $262 test harness object is meaningless in a playground, and its agent machinery
         // needs OS threads (a trap on wasm) — drop it from the global.
