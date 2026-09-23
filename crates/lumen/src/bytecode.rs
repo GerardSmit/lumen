@@ -4546,10 +4546,12 @@ fn run_vm<const ONE: bool>(
                     i.gc_check_amortized()?;
                     let backedge = *pc - 1;
                     *pc = t as usize;
-                    if let Some(step) =
-                        jit::on_backedge(i, chunk, env, slots, stack, pc, this_val, backedge)?
-                    {
-                        return Ok(step);
+                    if jit::backedge_due(chunk) {
+                        if let Some(step) =
+                            jit::on_backedge(i, chunk, env, slots, stack, pc, this_val, backedge)?
+                        {
+                            return Ok(step);
+                        }
                     }
                     continue;
                 }
