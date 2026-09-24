@@ -127,6 +127,34 @@ pub(crate) struct WorkerEmbedding {
 /// Workers for blocking work. libuv's default; revisit when async fs lands and has numbers.
 const POOL_SIZE: usize = 4;
 
+/// First scalar of the engine's lone-surrogate smuggle range (see `lumen::jstr`).
+const SMUGGLE_BASE: u32 = 0x10F800;
+
+/// Bring source text read from disk into the engine's string encoding. The engine stores a lone
+/// surrogate as a plane-16 private-use scalar (U+10F800..=U+10FFFF) and a *real* character in that
+/// range as the corresponding smuggled surrogate pair; text decoded from UTF-8 can hold such a real
+/// character (e.g. a literal U+10FFFF in a string), which the parser would otherwise read as a
+/// lone surrogate. Everything else passes through untouched.
+pub fn import_source_text(s: String) -> String {
+    // Every scalar >= U+10F800 encodes with a leading F4 8F byte pair; most text has none.
+    if !s.as_bytes().contains(&0xF4) {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        let v = c as u32;
+        if v >= SMUGGLE_BASE {
+            let w = v - 0x10000;
+            let (hi, lo) = (0xD800 + (w >> 10), 0xDC00 + (w & 0x3FF));
+            out.push(char::from_u32(SMUGGLE_BASE + hi - 0xD800).expect("smuggle scalar"));
+            out.push(char::from_u32(SMUGGLE_BASE + lo - 0xD800).expect("smuggle scalar"));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub struct Runtime {
     engine: Engine,
     pool: ThreadPool,
@@ -200,6 +228,11 @@ impl Runtime {
         // occupy a shared pool worker.
         engine.ctx().op_state().put(CompletionSender::new(tx.clone()));
         engine.ctx().op_state().put(TaskRegistry::default());
+        // `#[op(async)]` / `Ctx::spawn_blocking` / `Ctx::completer` settle through the loop.
+        engine.ctx().set_async_host(lumen_host::LoopAsyncHost {
+            spawn: pool.handle(),
+            completions: CompletionSender::new(tx.clone()),
+        });
         // Before install: the extensions' js_init already asks for the cwd.
         let mut embedded_io = None;
         let mut interrupt = None;
@@ -446,6 +479,7 @@ impl Runtime {
     pub fn run_module(&mut self, path: &str) -> Result<(), String> {
         let source =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let source = import_source_text(source);
         // A `.jsx` entry is lowered to plain JS before the engine parses it.
         let source = if path.ends_with(".jsx") {
             jsx::transform(&source).map_err(|e| format!("JSX transform failed for {path}: {e}"))?
@@ -475,6 +509,33 @@ impl Runtime {
                 })
             }
             Err(e) => Err(format!("SyntaxError: {} (line {})", e.message, e.line)),
+        }
+    }
+
+    /// Run an ahead-of-time compiled program (a `lumen_aot::include_js!` blob): its scripts,
+    /// then its entry module, then the loop to quiescence — [`Self::run_module`] with no JS
+    /// source on disk. Imports between the blob's units (and bare packages it bundled with
+    /// `node_modules = true`) resolve inside the blob; `require` loads its CommonJS units from
+    /// it; `node:*` builtins come from the runtime, and anything else falls back to the usual
+    /// disk resolution (bare packages from the current directory's `node_modules`). `Err` is the
+    /// rendered uncaught error.
+    pub fn run_precompiled(&mut self, blob: &lumen::Precompiled) -> Result<(), String> {
+        let loader = esm::make_loader(self.builtin_modules());
+        self.engine.set_module_loader_attrs(loader);
+        match self.engine.load_precompiled(blob) {
+            Ok(Completion::Value(_)) => {
+                self.run_to_completion();
+                Ok(())
+            }
+            Ok(Completion::Throw { name, message }) => {
+                self.fatal_exit = Some(1);
+                Err(if name.is_empty() {
+                    message
+                } else {
+                    format!("{name}: {message}")
+                })
+            }
+            Err(e) => Err(e.message),
         }
     }
 
@@ -714,7 +775,12 @@ impl Runtime {
         let Ok(process) = ctx.get_member(&global, "process") else {
             return;
         };
-        let argv: Vec<Value> = std::iter::once(argv0.to_string())
+        // Node reports argv[0] as the resolved execPath (argv0 keeps what was typed).
+        let exec_path = match ctx.get_member(&process, "execPath") {
+            Ok(Value::Str(s)) if !s.to_string().is_empty() => s.to_string(),
+            _ => argv0.to_string(),
+        };
+        let argv: Vec<Value> = std::iter::once(exec_path)
             .chain(script_argv.iter().cloned())
             .map(Value::from_string)
             .collect();

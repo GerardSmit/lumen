@@ -30,7 +30,9 @@ pub struct FnFrame {
 pub struct FrameExtra {
     pub args_obj: Value,
     pub lazy: Option<(Rc<crate::ast::Function>, Rc<[Value]>, Env)>,
-    inline_callees: Vec<(u16, Weak<RefCell<crate::value::Object>>)>,
+    /// `lazy` was stashed by a compiled frame (`bytecode::reflect`): its parameters live in
+    /// slots, so the conjured object is an unmapped snapshot.
+    pub unmapped: bool,
 }
 
 impl Default for FrameExtra {
@@ -38,7 +40,7 @@ impl Default for FrameExtra {
         FrameExtra {
             args_obj: Value::Null,
             lazy: None,
-            inline_callees: Vec::new(),
+            unmapped: false,
         }
     }
 }

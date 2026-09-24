@@ -75,6 +75,10 @@ const JS_FILES: &[GlueFile] = &[
         wrap: true,
     },
     GlueFile {
+        name: "assert.js",
+        wrap: true,
+    },
+    GlueFile {
         name: "stream.js",
         wrap: true,
     },
@@ -82,11 +86,10 @@ const JS_FILES: &[GlueFile] = &[
         name: "net.js",
         wrap: true,
     },
-    // fs.js is unwrapped (shares the outer scope) but its ReadStream/WriteStream/StatWatcher
-    // extend the `stream`/`events` builtins, so it must load after them.
+    // fs.js runs Node's fs sources over `stream`/`events`/`url`/`os`, so it loads after them.
     GlueFile {
         name: "fs.js",
-        wrap: false,
+        wrap: true,
     },
     GlueFile {
         name: "http.js",
@@ -204,6 +207,12 @@ const JS_FILES: &[GlueFile] = &[
     GlueFile {
         name: "module.js",
         wrap: false,
+    },
+    // After module.js: registers the node_modules-first fallback addons (bufferutil, ...), which
+    // must stay out of the core-module set module.js snapshots.
+    GlueFile {
+        name: "addons.js",
+        wrap: true,
     },
 ];
 

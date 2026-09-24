@@ -176,6 +176,8 @@ impl ThreadCoro {
         self.started = true;
         let (saved_strict, saved_depth, saved_tco) = (i.strict, i.depth, i.tco_ok);
         let saved_coro = std::mem::replace(&mut i.cur_coro, self.id);
+        // The body mutates `*i` from its worker thread while we block (see `park`).
+        std::hint::black_box(&mut *i as *mut Interp);
         let _ = self.resume_tx.send(signal);
         let s = self.suspend_rx.recv();
         i.cur_coro = saved_coro;
@@ -209,6 +211,12 @@ impl ThreadCoro {
 /// resumed. Restores the body's scalar context (which the driver mutated while it ran).
 fn park(i: &mut Interp, msg: Suspend) -> Resume {
     let (gen_strict, gen_depth, gen_tco) = (i.strict, i.depth, i.tco_ok);
+    // The resumer runs arbitrary code in between (it may itself be another generator body).
+    let gen_agb = i.in_async_gen_body;
+    // The driver mutates `*i` through its own pointer while this thread blocks: escape `i` so
+    // the compiler cannot treat the restores below as dead stores of unchanged values (`&mut`
+    // is `noalias`, and the channel calls never see `i`).
+    std::hint::black_box(&mut *i as *mut Interp);
     let resumed = YIELDER.with(|y| {
         let b = y.borrow();
         let yl = b.as_ref().expect("suspend outside a coroutine");
@@ -220,6 +228,7 @@ fn park(i: &mut Interp, msg: Suspend) -> Resume {
             i.strict = gen_strict;
             i.depth = gen_depth;
             i.tco_ok = gen_tco;
+            i.in_async_gen_body = gen_agb;
             r
         }
         // `recv` errors only when the driver's `resume_tx` was dropped — i.e. the `Coroutine` (and

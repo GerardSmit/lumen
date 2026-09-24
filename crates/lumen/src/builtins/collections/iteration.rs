@@ -66,31 +66,89 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
 
 /// `next()` for a Map/Set iterator: reads the live backing entries at the current index (so entries
 /// appended during iteration are observed). The `__ci_coll` slot is the brand.
-pub(super) fn map_set_iter_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let coll = this
-        .as_obj()
-        .and_then(|o| o.borrow().props.get("__ci_coll").map(|p| p.value()));
-    let coll = match coll {
-        Some(c) => c,
-        None => return Err(i.make_error("TypeError", "not a Map/Set Iterator")),
+pub(crate) fn map_set_iter_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
+    let obj = match this.as_obj() {
+        Some(o) if o.borrow().props.get("__ci_coll").is_some() => o.clone(),
+        _ => return Err(i.make_error("TypeError", "not a Map/Set Iterator")),
     };
-    let obj = this.as_obj().unwrap();
-    let num = |o: &Gc, k: &str| -> f64 {
-        match o.borrow().props.get(k).map(|p| p.value()) {
-            Some(Value::Num(n)) => n,
-            _ => 0.0,
+    Ok(match map_set_iter_step(i, &obj) {
+        Some(val) => iter_result(i, val, false),
+        None => iter_result(i, Value::Undefined, true),
+    })
+}
+
+/// Every remaining value of a Map/Set iterator (`obj` carries the `__ci_coll` brand), leaving
+/// it exhausted — the same end state as calling `next()` until `done`, for a caller that runs
+/// no user code in between.
+pub(crate) fn map_set_iter_drain(i: &mut Interp, obj: &Gc) -> Vec<Value> {
+    let (coll, done, mut idx, kind) = {
+        let b = obj.borrow();
+        let num = |k: &str| -> f64 {
+            match b.props.get(k).map(|p| p.value()) {
+                Some(Value::Num(n)) => n,
+                _ => 0.0,
+            }
+        };
+        (
+            b.props.get("__ci_coll").map(|p| p.value()),
+            matches!(
+                b.props.get("__ci_done").map(|p| p.value()),
+                Some(Value::Bool(true))
+            ),
+            num("__ci_index") as usize,
+            num("__ci_kind") as u8,
+        )
+    };
+    if done {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
+    if let Some(data) = coll.as_ref().and_then(map_ptr).and_then(|p| i.map_data.get(&p)) {
+        while let Some((k, v)) = data.next(&mut idx) {
+            match kind {
+                1 => out.push(k.clone()),
+                2 => pairs.push((k.clone(), v.clone())),
+                _ => out.push(v.clone()),
+            }
         }
+    }
+    for (k, v) in pairs {
+        out.push(i.make_array(vec![k, v]));
+    }
+    set_internal(obj, "__ci_index", Value::Num(idx as f64));
+    set_internal(obj, "__ci_done", Value::Bool(true));
+    out
+}
+
+/// One `next()` of a Map/Set iterator (`obj` carries the `__ci_coll` brand) without the
+/// iterator-result object: `Some(value)`, or `None` once exhausted. Advances the iterator's
+/// state exactly as `next()` does, so a caller that would immediately unpack the fresh result
+/// object may use this instead.
+pub(crate) fn map_set_iter_step(i: &mut Interp, obj: &Gc) -> Option<Value> {
+    let (coll, done, mut idx, kind) = {
+        let b = obj.borrow();
+        let num = |k: &str| -> f64 {
+            match b.props.get(k).map(|p| p.value()) {
+                Some(Value::Num(n)) => n,
+                _ => 0.0,
+            }
+        };
+        (
+            b.props.get("__ci_coll").map(|p| p.value()),
+            matches!(
+                b.props.get("__ci_done").map(|p| p.value()),
+                Some(Value::Bool(true))
+            ),
+            num("__ci_index") as usize,
+            num("__ci_kind") as u8,
+        )
     };
     // A once-exhausted iterator stays done, even if the collection later grows.
-    if matches!(
-        obj.borrow().props.get("__ci_done").map(|p| p.value()),
-        Some(Value::Bool(true))
-    ) {
-        return Ok(iter_result(i, Value::Undefined, true));
+    if done {
+        return None;
     }
-    let mut idx = num(obj, "__ci_index") as usize;
-    let kind = num(obj, "__ci_kind") as u8;
-    let coll_ptr = map_ptr(&coll);
+    let coll_ptr = coll.as_ref().and_then(map_ptr);
     // Skip tombstoned (deleted) slots so the iterator observes a live view.
     let entry = coll_ptr
         .and_then(|p| i.map_data.get(&p))
@@ -98,17 +156,16 @@ pub(super) fn map_set_iter_next(i: &mut Interp, this: Value, _a: &[Value]) -> Re
     match entry {
         Some((k, v)) => {
             set_internal(obj, "__ci_index", Value::Num(idx as f64));
-            let val = match kind {
+            Some(match kind {
                 1 => k,
                 2 => i.make_array(vec![k, v]),
                 _ => v,
-            };
-            Ok(iter_result(i, val, false))
+            })
         }
         None => {
             set_internal(obj, "__ci_index", Value::Num(idx as f64));
             set_internal(obj, "__ci_done", Value::Bool(true));
-            Ok(iter_result(i, Value::Undefined, true))
+            None
         }
     }
 }

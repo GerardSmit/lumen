@@ -16,6 +16,7 @@ pub mod legalize;
 pub mod machinst;
 pub mod opt;
 pub mod regalloc;
+pub mod unroll;
 pub mod verify;
 pub mod wasm;
 pub mod x64;

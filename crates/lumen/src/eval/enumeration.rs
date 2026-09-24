@@ -17,6 +17,11 @@ impl Interp {
                 }
             }
         }
+        if let Value::Obj(o) = rhs {
+            if let Some(keys) = self.for_in_keys_fast(o) {
+                return Ok(keys);
+            }
+        }
         Ok(self
             .enum_keys(rhs)?
             .into_iter()

@@ -241,7 +241,15 @@ fn instantiate_plain_keeps_the_template_shape() {
 fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
     // A shape allocation must not grow back toward a flat key list per shape.
     assert!(std::mem::size_of::<super::Shape>() <= 64);
-    let before = super::shape_table_census();
+    // Checked on this map's own shape chain rather than by diffing whole-table censuses, so
+    // nothing else touching the shape table can disturb it.
+    fn flat_lists(p: &Props) -> Vec<usize> {
+        let leaf = p.shape_rc.as_ref().expect("a shared shape");
+        leaf.chain()
+            .filter(|(s, _)| s.flat_built())
+            .map(|(s, _)| s.len())
+            .collect()
+    }
     let mut p = Props::new();
     let names: Vec<String> = (0..OWNED_THRESHOLD)
         .map(|i| format!("chain{i}_{}", std::process::id()))
@@ -253,21 +261,20 @@ fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
         assert_eq!(p.slot_of(&names[0]), Some(0));
         assert_eq!(p.slot_of("absent"), None);
     }
-    let mid = super::shape_table_census();
-    assert_eq!(mid.shapes - before.shapes, OWNED_THRESHOLD);
-    assert_eq!(
-        mid.keys - before.keys,
-        OWNED_THRESHOLD * (OWNED_THRESHOLD + 1) / 2
-    );
-    assert_eq!(mid.flat_lists, before.flat_lists, "no iteration yet");
+    {
+        // One shared shape per insert, each storing only its own key.
+        let leaf = p.shape_rc.as_ref().expect("a shared shape");
+        assert!(!leaf.owned());
+        let chain: Vec<_> = leaf.chain().collect();
+        assert_eq!(chain.len(), OWNED_THRESHOLD);
+        for (depth, (s, key)) in chain.iter().enumerate() {
+            assert_eq!(s.len(), OWNED_THRESHOLD - depth);
+            assert_eq!(&***key, names[OWNED_THRESHOLD - 1 - depth].as_str());
+        }
+    }
+    assert_eq!(flat_lists(&p), Vec::<usize>::new(), "no iteration yet");
     assert_eq!(keys(&p), names);
-    let after = super::shape_table_census();
-    assert_eq!(
-        after.flat_lists - mid.flat_lists,
-        1,
-        "only the iterated leaf"
-    );
-    assert_eq!(after.flat_keys - mid.flat_keys, OWNED_THRESHOLD);
+    assert_eq!(flat_lists(&p), vec![OWNED_THRESHOLD], "only the iterated leaf");
     // The materialised list answers the same lookups.
     for (i, k) in names.iter().enumerate() {
         assert_eq!(p.slot_of(k), Some(i));

@@ -1,6 +1,6 @@
-// node:crypto — the subset that has a real, verifiable backing in lumen. Randomness bridges to the
-// native web-crypto source (/dev/urandom); hashing (md5/sha1/sha256/sha384/sha512), HMAC, PBKDF2
-// and HKDF are pure-JS but bit-exact with Node (cross-checked against Node). Asymmetric crypto is
+// node:crypto — the subset that has a real, verifiable backing in lumen. Randomness is the native
+// CSPRNG; hashing (md5/sha1/sha224/sha256/sha384/sha512/sha512-224/sha512-256), HMAC, PBKDF2 and
+// HKDF are native (src/hash.rs, bit-exact with Node; the async forms run on the worker pool). Asymmetric crypto is
 // pure-JS over BigInt: Ed25519/X25519 sign/verify + key generation, and ASN.1 DER/PEM/JWK key
 // plumbing (createPublicKey/createPrivateKey, KeyObject.export as pkcs1/sec1/pkcs8/spki ×
 // pem/der/jwk) for RSA, Ed25519, X25519 and EC P-256 — all cross-verified against Node v22 in
@@ -29,359 +29,321 @@ function concatBytes(a, b) {
   return out;
 }
 
-// ---- SHA-1 (pure JS) --------------------------------------------------------------------------
+// ---- digests (native: src/hash.rs, via src/native.rs) -------------------------------------------
+// md5 / sha1 / sha224 / sha256 / sha384 / sha512 / sha512-224 / sha512-256, streaming or one-shot,
+// HMAC, PBKDF2 and HKDF all run in Rust; SHA-1/SHA-256 use the CPU's SHA extensions when present.
 
-function sha1(bytes) {
-  const ml = bytes.length * 8;
-  const withOne = bytes.length + 1;
-  const total = withOne + ((56 - (withOne % 64) + 64) % 64) + 8;
-  const msg = new Uint8Array(total);
-  msg.set(bytes);
-  msg[bytes.length] = 0x80;
-  const dv = new DataView(msg.buffer);
-  dv.setUint32(total - 4, ml >>> 0);
-  dv.setUint32(total - 8, Math.floor(ml / 0x100000000));
-
-  let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
-  const w = new Uint32Array(80);
-  const rotl = (n, b) => (n << b) | (n >>> (32 - b));
-  for (let i = 0; i < total; i += 64) {
-    for (let j = 0; j < 16; j++) w[j] = dv.getUint32(i + j * 4);
-    for (let j = 16; j < 80; j++) w[j] = rotl(w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16], 1);
-    let a = h0, b = h1, c = h2, d = h3, e = h4;
-    for (let j = 0; j < 80; j++) {
-      let f, k;
-      if (j < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
-      else if (j < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
-      else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
-      else { f = b ^ c ^ d; k = 0xca62c1d6; }
-      const t = (rotl(a, 5) + f + e + k + w[j]) >>> 0;
-      e = d; d = c; c = rotl(b, 30); b = a; a = t;
-    }
-    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
-  }
-  const out = new Uint8Array(20);
-  new DataView(out.buffer).setUint32(0, h0);
-  new DataView(out.buffer).setUint32(4, h1);
-  new DataView(out.buffer).setUint32(8, h2);
-  new DataView(out.buffer).setUint32(12, h3);
-  new DataView(out.buffer).setUint32(16, h4);
-  return out;
+function cryptoError(Ctor, code, message) {
+  const err = new Ctor(message);
+  err.code = code;
+  return err;
 }
 
-// ---- SHA-256 (pure JS) ------------------------------------------------------------------------
-
-const K256 = new Uint32Array([
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-]);
-
-function sha256(bytes) {
-  const ml = bytes.length * 8;
-  const withOne = bytes.length + 1;
-  const total = withOne + ((56 - (withOne % 64) + 64) % 64) + 8;
-  const msg = new Uint8Array(total);
-  msg.set(bytes);
-  msg[bytes.length] = 0x80;
-  const dv = new DataView(msg.buffer);
-  dv.setUint32(total - 4, ml >>> 0);
-  dv.setUint32(total - 8, Math.floor(ml / 0x100000000));
-
-  const h = new Uint32Array([
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-  ]);
-  const w = new Uint32Array(64);
-  const rotr = (n, b) => (n >>> b) | (n << (32 - b));
-  for (let i = 0; i < total; i += 64) {
-    for (let j = 0; j < 16; j++) w[j] = dv.getUint32(i + j * 4);
-    for (let j = 16; j < 64; j++) {
-      const s0 = rotr(w[j - 15], 7) ^ rotr(w[j - 15], 18) ^ (w[j - 15] >>> 3);
-      const s1 = rotr(w[j - 2], 17) ^ rotr(w[j - 2], 19) ^ (w[j - 2] >>> 10);
-      w[j] = (w[j - 16] + s0 + w[j - 7] + s1) >>> 0;
+// Node's "Received ..." suffix for ERR_INVALID_ARG_TYPE.
+function describeReceived(value) {
+  if (value === null) return "Received null";
+  if (value === undefined) return "Received undefined";
+  switch (typeof value) {
+    case "function": return `Received function ${value.name}`;
+    case "object":
+      if (value.constructor && value.constructor.name) return `Received an instance of ${value.constructor.name}`;
+      return "Received an instance of Object";
+    case "string": {
+      const s = value.length > 28 ? `${value.slice(0, 25)}...` : value;
+      return `Received type string (${s.includes("'") ? JSON.stringify(s) : `'${s}'`})`;
     }
-    let [a, b, c, d, e, f, g, hh] = h;
-    for (let j = 0; j < 64; j++) {
-      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-      const ch = (e & f) ^ (~e & g);
-      const t1 = (hh + S1 + ch + K256[j] + w[j]) >>> 0;
-      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const t2 = (S0 + maj) >>> 0;
-      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
-    }
-    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
-    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+    case "bigint": return `Received type bigint (${value}n)`;
+    case "number": return `Received type number (${Object.is(value, -0) ? "-0" : value})`;
+    default: return `Received type ${typeof value} (${String(value)})`;
   }
-  const out = new Uint8Array(32);
-  const odv = new DataView(out.buffer);
-  for (let j = 0; j < 8; j++) odv.setUint32(j * 4, h[j]);
-  return out;
+}
+function invalidArgType(name, expected, value) {
+  return cryptoError(TypeError, "ERR_INVALID_ARG_TYPE", `The "${name}" argument must be ${expected}. ${describeReceived(value)}`);
+}
+function outOfRangeErr(name, range, value) {
+  const received = Number.isInteger(value) && Math.abs(value) > 2 ** 32 ? addNumericalSeparator(String(value)) : value;
+  return cryptoError(RangeError, "ERR_OUT_OF_RANGE", `The value of "${name}" is out of range. It must be ${range}. Received ${received}`);
+}
+// OpenSSL 3 refuses to derive zero bytes; Node surfaces that as this error.
+const derivingFailed = () => new Error("Deriving bits failed");
+function validateString(value, name) {
+  if (typeof value !== "string") throw invalidArgType(name, "of type string", value);
+}
+function validateInt32(value, name, min = -2147483648, max = 2147483647) {
+  if (typeof value !== "number") throw invalidArgType(name, "of type number", value);
+  if (!Number.isInteger(value)) throw outOfRangeErr(name, "an integer", value);
+  if (value < min || value > max) throw outOfRangeErr(name, `>= ${min} && <= ${max}`, value);
+}
+function validateFunction(value, name) {
+  if (typeof value !== "function") throw invalidArgType(name, "of type function", value);
+}
+const BUFFER_SOURCE = "of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
+// Node's getArrayBufferOrView: strings encode, BufferSources pass through as byte views.
+function bufferSource(value, name, encoding) {
+  if (typeof value === "string") return Buffer.from(value, encoding || "utf8");
+  if (value instanceof Uint8Array) return value;
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer)) {
+    return new Uint8Array(value);
+  }
+  throw invalidArgType(name, BUFFER_SOURCE, value);
 }
 
-// ---- MD5 (pure JS, RFC 1321) ------------------------------------------------------------------
-
-const MD5_S = [
-  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-];
-const MD5_K = new Uint32Array(64);
-for (let i = 0; i < 64; i++) MD5_K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) >>> 0;
-
-function md5(bytes) {
-  const ml = bytes.length * 8;
-  const withOne = bytes.length + 1;
-  const total = withOne + ((56 - (withOne % 64) + 64) % 64) + 8;
-  const msg = new Uint8Array(total);
-  msg.set(bytes);
-  msg[bytes.length] = 0x80;
-  const dv = new DataView(msg.buffer);
-  dv.setUint32(total - 8, ml >>> 0, true);
-  dv.setUint32(total - 4, Math.floor(ml / 0x100000000), true);
-
-  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
-  const M = new Uint32Array(16);
-  const rotl = (x, c) => ((x << c) | (x >>> (32 - c))) >>> 0;
-  for (let i = 0; i < total; i += 64) {
-    for (let j = 0; j < 16; j++) M[j] = dv.getUint32(i + j * 4, true);
-    let A = a0, B = b0, C = c0, D = d0;
-    for (let j = 0; j < 64; j++) {
-      let F, g;
-      if (j < 16) { F = (B & C) | (~B & D); g = j; }
-      else if (j < 32) { F = (D & B) | (~D & C); g = (5 * j + 1) % 16; }
-      else if (j < 48) { F = B ^ C ^ D; g = (3 * j + 5) % 16; }
-      else { F = C ^ (B | ~D); g = (7 * j) % 16; }
-      F = (F + A + MD5_K[j] + M[g]) >>> 0;
-      A = D; D = C; C = B;
-      B = (B + rotl(F, MD5_S[j])) >>> 0;
-    }
-    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+// { id, outLen, blockSize, fn } of a digest name; null when unknown.
+const digestCache = new Map();
+function digestInfo(name) {
+  let info = digestCache.get(name);
+  if (info === undefined) {
+    const id = typeof name === "string" ? __native.hashId(name) : -1;
+    if (id < 0) return null;
+    const [outLen, blockSize] = __native.hashInfo(id);
+    info = { id, outLen, blockSize, fn: (bytes) => __native.digest(id, bytes) };
+    digestCache.set(name, info);
   }
-  const out = new Uint8Array(16);
-  const odv = new DataView(out.buffer);
-  odv.setUint32(0, a0, true); odv.setUint32(4, b0, true);
-  odv.setUint32(8, c0, true); odv.setUint32(12, d0, true);
-  return out;
+  return info;
 }
+function digestOrThrow(name) {
+  const info = digestInfo(name);
+  if (!info) throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_DIGEST", `Invalid digest: ${name}`);
+  return info;
+}
+
+const MD5 = digestInfo("md5");
+const SHA1 = digestInfo("sha1");
+const SHA256 = digestInfo("sha256");
+const SHA384 = digestInfo("sha384");
+const SHA512 = digestInfo("sha512");
+function md5(bytes) { return __native.digest(MD5.id, bytes); }
+function sha1(bytes) { return __native.digest(SHA1.id, bytes); }
+function sha256(bytes) { return __native.digest(SHA256.id, bytes); }
+function sha384(bytes) { return __native.digest(SHA384.id, bytes); }
+function sha512(bytes) { return __native.digest(SHA512.id, bytes); }
 
 // ---- hash registry ----------------------------------------------------------------------------
-// Every algorithm here is bit-exact with Node (verified in the probe). blockSize is the HMAC block
-// size (64 bytes for md5/sha1/sha256; 128 for the SHA-512 family, which is native — see
-// lumen-node/src/crypto.rs).
-
-const HASH_REG = {
-  md5: { fn: md5, outLen: 16, blockSize: 64 },
-  sha1: { fn: sha1, outLen: 20, blockSize: 64 },
-  sha256: { fn: sha256, outLen: 32, blockSize: 64 },
-  sha512: { fn: (b) => __crypto.sha512(0, b), outLen: 64, blockSize: 128 },
-  sha384: { fn: (b) => __crypto.sha512(1, b), outLen: 48, blockSize: 128 },
-  "sha512-224": { fn: (b) => __crypto.sha512(2, b), outLen: 28, blockSize: 128 },
-  "sha512-256": { fn: (b) => __crypto.sha512(3, b), outLen: 32, blockSize: 128 },
-};
-HASH_REG["sha-1"] = HASH_REG.sha1;
-HASH_REG["sha-256"] = HASH_REG.sha256;
-HASH_REG["sha-384"] = HASH_REG.sha384;
-HASH_REG["sha-512"] = HASH_REG.sha512;
-HASH_REG["ssl3-md5"] = HASH_REG.md5;
-HASH_REG["ssl3-sha1"] = HASH_REG.sha1;
+// `{ id, fn, outLen, blockSize }` per algorithm (digestInfo above; blockSize is the HMAC block
+// size), shared by Hash/Hmac, the KDFs and the public-key code.
 
 function resolveHash(algorithm) {
-  const reg = HASH_REG[String(algorithm).toLowerCase()];
-  if (!reg) {
-    throw new Error(
-      `Digest method not supported: ${algorithm} (lumen supports md5, sha1, sha256, sha384, sha512, sha512-224, sha512-256)`,
-    );
-  }
+  const reg = digestInfo(String(algorithm));
+  if (!reg) throw new Error("Digest method not supported");
   return reg;
 }
 
-// Raw HMAC over Uint8Array inputs — the shared core for the Hmac class, PBKDF2 and HKDF.
+// Raw HMAC over byte inputs — the shared core for the public-key helpers.
 function hmacRaw(reg, keyBytes, dataBytes) {
-  const bs = reg.blockSize;
-  let k = keyBytes;
-  if (k.length > bs) k = reg.fn(k);
-  const ipad = new Uint8Array(bs);
-  const opad = new Uint8Array(bs);
-  for (let i = 0; i < bs; i++) {
-    const kb = i < k.length ? k[i] : 0;
-    ipad[i] = kb ^ 0x36;
-    opad[i] = kb ^ 0x5c;
-  }
-  const inner = reg.fn(concatBytes(ipad, dataBytes));
-  return reg.fn(concatBytes(opad, inner));
+  return __native.hmac(reg.id, keyBytes, dataBytes);
 }
 
 // ---- Hash / Hmac classes ----------------------------------------------------------------------
 
+const HASH_DATA = "of type string or an instance of Buffer, TypedArray, or DataView";
+function feed(state, data, encoding) {
+  if (typeof data === "string") {
+    if (encoding === undefined || encoding === "utf8" || encoding === "utf-8" || !Buffer.isEncoding(encoding)) {
+      state.updateStr(data);
+    } else {
+      state.update(Buffer.from(data, encoding));
+    }
+  } else if (ArrayBuffer.isView(data)) {
+    state.update(data);
+  } else {
+    throw invalidArgType("data", HASH_DATA, data);
+  }
+}
+// An op's fresh Uint8Array, adopted as a Buffer in place (no copy, no derived-class construct).
+const asBuffer = (bytes) => Object.setPrototypeOf(bytes, Buffer.prototype);
+function finish(bytes, encoding) {
+  const digest = asBuffer(bytes);
+  return encoding && encoding !== "buffer" && Buffer.isEncoding(encoding) ? digest.toString(encoding) : digest;
+}
+
 class Hash {
-  constructor(algorithm) {
+  constructor(algorithm, options) {
+    if (algorithm instanceof Hash) {
+      // copy(): an independent snapshot of the running state.
+      this._state = algorithm._state.copy();
+      this._reg = algorithm._reg;
+      return;
+    }
+    validateString(algorithm, "algorithm");
     this._reg = resolveHash(algorithm);
-    this._chunks = [];
-    this._used = false;
+    this._state = __native.hashNew(this._reg.id);
+    void options;
   }
   update(data, encoding) {
-    this._chunks.push(toBytes(data, encoding));
+    feed(this._state, data, encoding);
     return this;
   }
-  _bytes() {
-    let total = 0;
-    for (const c of this._chunks) total += c.length;
-    const all = new Uint8Array(total);
-    let off = 0;
-    for (const c of this._chunks) { all.set(c, off); off += c.length; }
-    return all;
-  }
   digest(encoding) {
-    if (this._used) throw new Error("Digest already called");
-    this._used = true;
-    const digest = Buffer.from(this._reg.fn(this._bytes()));
-    return encoding && encoding !== "buffer" ? digest.toString(encoding) : digest;
+    return finish(this._state.digest(), encoding);
   }
   copy() {
-    const h = new Hash("md5");
-    h._reg = this._reg;
-    h._chunks = this._chunks.slice();
-    return h;
+    return new Hash(this);
   }
 }
 
 class Hmac {
-  constructor(algorithm, key) {
-    this._reg = resolveHash(algorithm);
-    this._key = key instanceof KeyObject ? key._material : toBytes(key);
-    this._chunks = [];
-    this._used = false;
+  constructor(algorithm, key, options) {
+    validateString(algorithm, "algorithm");
+    const reg = digestInfo(algorithm);
+    if (!reg) throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_DIGEST", `Invalid digest: ${algorithm}`);
+    let k;
+    if (key instanceof KeyObject) k = key._material;
+    else if (typeof key === "string") k = Buffer.from(key, (options && options.encoding) || "utf8");
+    else if (ArrayBuffer.isView(key) || key instanceof ArrayBuffer) k = bufferSource(key, "key");
+    else if (key && typeof key === "object" && key._material instanceof Uint8Array) k = key._material;
+    else throw invalidArgType("key", "of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey", key);
+    this._reg = reg;
+    this._state = __native.hmacNew(reg.id, k);
+    this._done = false;
   }
   update(data, encoding) {
-    this._chunks.push(toBytes(data, encoding));
+    feed(this._state, data, encoding);
     return this;
   }
   digest(encoding) {
-    if (this._used) throw new Error("Digest already called");
-    this._used = true;
-    let total = 0;
-    for (const c of this._chunks) total += c.length;
-    const all = new Uint8Array(total);
-    let off = 0;
-    for (const c of this._chunks) { all.set(c, off); off += c.length; }
-    const digest = Buffer.from(hmacRaw(this._reg, this._key, all));
-    return encoding && encoding !== "buffer" ? digest.toString(encoding) : digest;
+    // Node: a second digest() on an Hmac returns an empty result instead of throwing.
+    const bytes = this._done ? new Uint8Array(0) : this._state.digest();
+    this._done = true;
+    return finish(bytes, encoding);
   }
 }
 
 // ---- one-shot hash (Node 22 crypto.hash) ------------------------------------------------------
 
 function hash(algorithm, data, outputEncoding) {
+  validateString(algorithm, "algorithm");
+  if (typeof data !== "string" && !ArrayBuffer.isView(data)) throw invalidArgType("data", HASH_DATA, data);
   const enc = outputEncoding === undefined ? "hex" : outputEncoding;
-  const h = new Hash(algorithm);
-  h.update(data);
-  return enc === "buffer" ? h.digest() : h.digest(enc);
+  const reg = resolveHash(algorithm);
+  const bytes = typeof data === "string" ? __native.digestStr(reg.id, data) : __native.digest(reg.id, data);
+  return finish(bytes, enc);
 }
 
-// ---- KDFs (pure JS, bit-exact with Node) ------------------------------------------------------
+// ---- KDFs (native) ----------------------------------------------------------------------------
+
+function pbkdf2Check(password, salt, iterations, keylen, digest) {
+  validateString(digest, "digest");
+  password = bufferSource(password, "password");
+  salt = bufferSource(salt, "salt");
+  validateInt32(iterations, "iterations", 1);
+  validateInt32(keylen, "keylen", 0);
+  return { password, salt, reg: digestOrThrow(digest) };
+}
 
 function pbkdf2Sync(password, salt, iterations, keylen, digest) {
-  if (digest === undefined) throw new TypeError("The \"digest\" argument is required");
-  const reg = resolveHash(digest);
-  const pw = toBytes(password);
-  const saltBytes = toBytes(salt);
-  const hLen = reg.outLen;
-  const numBlocks = Math.ceil(keylen / hLen);
-  const out = Buffer.alloc(numBlocks * hLen);
-  const idx = new Uint8Array(4);
-  for (let i = 1; i <= numBlocks; i++) {
-    idx[0] = (i >>> 24) & 0xff; idx[1] = (i >>> 16) & 0xff; idx[2] = (i >>> 8) & 0xff; idx[3] = i & 0xff;
-    let u = hmacRaw(reg, pw, concatBytes(saltBytes, idx));
-    const t = Uint8Array.from(u);
-    for (let j = 1; j < iterations; j++) {
-      u = hmacRaw(reg, pw, u);
-      for (let k = 0; k < t.length; k++) t[k] ^= u[k];
-    }
-    out.set(t, (i - 1) * hLen);
-  }
-  return out.subarray(0, keylen);
+  const c = pbkdf2Check(password, salt, iterations, keylen, digest);
+  if (keylen === 0) throw derivingFailed();
+  return asBuffer(__native.pbkdf2(c.reg.id, c.password, c.salt, iterations, keylen));
 }
 
-function pbkdf2(password, salt, iterations, keylen, digest, cb) {
-  if (typeof digest === "function") { cb = digest; digest = undefined; }
-  if (typeof cb !== "function") throw new TypeError("callback must be a function");
-  let result, err;
-  try { result = pbkdf2Sync(password, salt, iterations, keylen, digest); }
-  catch (e) { err = e; }
-  queueMicrotask(() => (err ? cb(err) : cb(null, result)));
+function pbkdf2(password, salt, iterations, keylen, digest, callback) {
+  if (typeof digest === "function") { callback = digest; digest = undefined; }
+  const c = pbkdf2Check(password, salt, iterations, keylen, digest);
+  validateFunction(callback, "callback");
+  if (keylen === 0) { process.nextTick(() => callback.call(null, derivingFailed())); return; }
+  // Derived on the worker pool; timers and I/O keep running meanwhile.
+  __native.pbkdf2Async(c.reg.id, c.password, c.salt, iterations, keylen).then(
+    (out) => callback.call(null, null, asBuffer(out)),
+    (err) => callback.call(null, err),
+  );
+}
+
+function hkdfCheck(digest, ikm, salt, info, keylen) {
+  validateString(digest, "digest");
+  const reg = digestOrThrow(digest);
+  const ikmB = ikm instanceof KeyObject ? ikm._material : bufferSource(ikm, "ikm");
+  const saltB = bufferSource(salt, "salt");
+  const infoB = bufferSource(info, "info");
+  validateInt32(keylen, "length", 0);
+  if (infoB.length > 1024) {
+    throw outOfRangeErr("info", "must not contain more than 1024 bytes", infoB.length);
+  }
+  if (keylen > 255 * reg.outLen) throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length");
+  return { reg, ikmB, saltB, infoB };
 }
 
 function hkdfSync(digest, ikm, salt, info, keylen) {
-  const reg = resolveHash(digest);
-  const ikmB = toBytes(ikm);
-  const saltB = toBytes(salt);
-  const infoB = toBytes(info);
-  const hLen = reg.outLen;
-  // RFC 5869: an empty salt is replaced by HashLen zero bytes.
-  const saltFinal = saltB.length ? saltB : new Uint8Array(hLen);
-  const prk = hmacRaw(reg, saltFinal, ikmB); // extract
-  const n = Math.ceil(keylen / hLen);
-  if (n > 255) throw new RangeError("hkdf: requested key length is too large");
-  const okm = new Uint8Array(n * hLen);
-  let prev = new Uint8Array(0);
-  for (let i = 1; i <= n; i++) {
-    const input = concatBytes(concatBytes(prev, infoB), new Uint8Array([i]));
-    prev = hmacRaw(reg, prk, input);
-    okm.set(prev, (i - 1) * hLen);
-  }
-  return okm.slice(0, keylen).buffer; // Node returns an ArrayBuffer
+  const c = hkdfCheck(digest, ikm, salt, info, keylen);
+  if (keylen === 0) throw derivingFailed();
+  const okm = __native.hkdf(c.reg.id, c.ikmB, c.saltB, c.infoB, keylen);
+  return okm.buffer; // Node returns an ArrayBuffer (the op's Uint8Array owns all of it)
 }
 
-function hkdf(digest, ikm, salt, info, keylen, cb) {
-  if (typeof cb !== "function") throw new TypeError("callback must be a function");
-  let result, err;
-  try { result = hkdfSync(digest, ikm, salt, info, keylen); }
-  catch (e) { err = e; }
-  queueMicrotask(() => (err ? cb(err) : cb(null, result)));
+function hkdf(digest, ikm, salt, info, keylen, callback) {
+  const c = hkdfCheck(digest, ikm, salt, info, keylen);
+  validateFunction(callback, "callback");
+  if (keylen === 0) { process.nextTick(() => callback.call(null, derivingFailed())); return; }
+  __native.hkdfAsync(c.reg.id, c.ikmB, c.saltB, c.infoB, keylen).then(
+    (ab) => callback.call(null, null, ab),
+    (err) => callback.call(null, err),
+  );
 }
 
-// ---- randomness (native /dev/urandom via web crypto) ------------------------------------------
+// ---- WebCrypto subtle.digest --------------------------------------------------------------------
+// lumen-web's SubtleCrypto knows SHA-256 only; under node: every WebCrypto digest (SHA-1/256/384/
+// 512) is native and computed on the worker pool, like Node's.
+const SUBTLE_DIGESTS = { "SHA-1": "sha1", "SHA-256": "sha256", "SHA-384": "sha384", "SHA-512": "sha512" };
+if (webCrypto && webCrypto.subtle) {
+  const subtleProto = Object.getPrototypeOf(webCrypto.subtle);
+  Object.defineProperty(subtleProto, "digest", {
+    value: async function digest(algorithm, data) {
+      const name = typeof algorithm === "string" ? algorithm : algorithm && algorithm.name;
+      const alg = typeof name === "string" ? SUBTLE_DIGESTS[name.toUpperCase()] : undefined;
+      if (!alg) throw new DOMException("Unrecognized algorithm name", "NotSupportedError");
+      let bytes;
+      if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+      else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      else throw new TypeError("Failed to execute 'digest' on 'SubtleCrypto': parameter 2 is not of type 'BufferSource'.");
+      return __native.digestAsync(digestInfo(alg).id, bytes);
+    },
+    writable: true,
+    configurable: true,
+  });
+}
+
+// ---- randomness (native CSPRNG) -----------------------------------------------------------------
 
 function fillRandom(view) {
-  const CHUNK = 65536; // getRandomValues quota
-  for (let off = 0; off < view.length; off += CHUNK) {
-    const end = Math.min(off + CHUNK, view.length);
-    webCrypto.getRandomValues(view.subarray(off, end));
-  }
+  __native.randomFill(view);
 }
 
 function randomBytes(size, cb) {
-  const buf = Buffer.alloc(size);
+  validateInt32(size, "size", 0);
+  if (cb !== undefined) validateFunction(cb, "callback");
+  const buf = Buffer.allocUnsafe(size);
   fillRandom(buf);
   if (cb) { queueMicrotask(() => cb(null, buf)); return; }
   return buf;
 }
 
-function randomFillSync(buf, offset, size) {
-  const view = ArrayBuffer.isView(buf)
-    ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
-    : new Uint8Array(buf);
+function randomFillRange(buf, offset, size) {
+  let view;
+  if (ArrayBuffer.isView(buf)) view = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  else if (buf instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && buf instanceof SharedArrayBuffer)) view = new Uint8Array(buf);
+  else throw invalidArgType("buf", "an instance of ArrayBuffer or ArrayBufferView", buf);
+  const elem = ArrayBuffer.isView(buf) && buf.BYTES_PER_ELEMENT ? buf.BYTES_PER_ELEMENT : 1;
+  const count = view.length / elem;
   const off = offset === undefined ? 0 : offset;
-  const sz = size === undefined ? view.length - off : size;
-  const rnd = randomBytes(sz);
-  view.set(rnd, off);
+  if (typeof off !== "number") throw invalidArgType("offset", "of type number", off);
+  if (!Number.isInteger(off) || off < 0 || off > count) throw outOfRangeErr("offset", `>= 0 && <= ${count}`, off);
+  const sz = size === undefined ? count - off : size;
+  if (typeof sz !== "number") throw invalidArgType("size", "of type number", sz);
+  if (!Number.isInteger(sz) || sz < 0 || sz + off > count) throw outOfRangeErr("size", `>= 0 && <= ${count - off}`, sz);
+  return view.subarray(off * elem, (off + sz) * elem);
+}
+
+function randomFillSync(buf, offset, size) {
+  fillRandom(randomFillRange(buf, offset, size));
   return buf;
 }
 
 function randomFill(buf, offset, size, cb) {
   if (typeof offset === "function") { cb = offset; offset = undefined; size = undefined; }
   else if (typeof size === "function") { cb = size; size = undefined; }
-  if (typeof cb !== "function") throw new TypeError("callback must be a function");
-  let err;
-  try { randomFillSync(buf, offset, size); } catch (e) { err = e; }
-  queueMicrotask(() => (err ? cb(err) : cb(null, buf)));
+  validateFunction(cb, "callback");
+  const range = randomFillRange(buf, offset, size);
+  queueMicrotask(() => { fillRandom(range); cb(null, buf); });
 }
 
 function randomInt(...args) {
@@ -419,14 +381,17 @@ function randomInt(...args) {
 }
 
 function timingSafeEqual(a, b) {
-  const ab = toBytes(a);
-  const bb = toBytes(b);
+  const view = (x, name) => {
+    if (ArrayBuffer.isView(x)) return new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+    if (x instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && x instanceof SharedArrayBuffer)) return new Uint8Array(x);
+    throw cryptoError(TypeError, "ERR_INVALID_ARG_TYPE", `The "${name}" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.`);
+  };
+  const ab = view(a, "buf1");
+  const bb = view(b, "buf2");
   if (ab.length !== bb.length) {
-    throw new RangeError("Input buffers must have the same byte length");
+    throw cryptoError(RangeError, "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH", "Input buffers must have the same byte length");
   }
-  let diff = 0;
-  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
-  return diff === 0;
+  return __native.timingSafeEqual(ab, bb);
 }
 
 // ---- secret KeyObjects ------------------------------------------------------------------------
@@ -547,86 +512,6 @@ function concatAll(arrs) {
   for (const a of arrs) { out.set(a, off); off += a.length; }
   return out;
 }
-
-// ---- SHA-512 / SHA-384 (pure JS, BigInt u64; bit-exact with Node — verified) --------------------
-
-const MASK64 = (1n << 64n) - 1n;
-const K512 = [
-  0x428a2f98d728ae22n, 0x7137449123ef65cdn, 0xb5c0fbcfec4d3b2fn, 0xe9b5dba58189dbbcn,
-  0x3956c25bf348b538n, 0x59f111f1b605d019n, 0x923f82a4af194f9bn, 0xab1c5ed5da6d8118n,
-  0xd807aa98a3030242n, 0x12835b0145706fben, 0x243185be4ee4b28cn, 0x550c7dc3d5ffb4e2n,
-  0x72be5d74f27b896fn, 0x80deb1fe3b1696b1n, 0x9bdc06a725c71235n, 0xc19bf174cf692694n,
-  0xe49b69c19ef14ad2n, 0xefbe4786384f25e3n, 0x0fc19dc68b8cd5b5n, 0x240ca1cc77ac9c65n,
-  0x2de92c6f592b0275n, 0x4a7484aa6ea6e483n, 0x5cb0a9dcbd41fbd4n, 0x76f988da831153b5n,
-  0x983e5152ee66dfabn, 0xa831c66d2db43210n, 0xb00327c898fb213fn, 0xbf597fc7beef0ee4n,
-  0xc6e00bf33da88fc2n, 0xd5a79147930aa725n, 0x06ca6351e003826fn, 0x142929670a0e6e70n,
-  0x27b70a8546d22ffcn, 0x2e1b21385c26c926n, 0x4d2c6dfc5ac42aedn, 0x53380d139d95b3dfn,
-  0x650a73548baf63den, 0x766a0abb3c77b2a8n, 0x81c2c92e47edaee6n, 0x92722c851482353bn,
-  0xa2bfe8a14cf10364n, 0xa81a664bbc423001n, 0xc24b8b70d0f89791n, 0xc76c51a30654be30n,
-  0xd192e819d6ef5218n, 0xd69906245565a910n, 0xf40e35855771202an, 0x106aa07032bbd1b8n,
-  0x19a4c116b8d2d0c8n, 0x1e376c085141ab53n, 0x2748774cdf8eeb99n, 0x34b0bcb5e19b48a8n,
-  0x391c0cb3c5c95a63n, 0x4ed8aa4ae3418acbn, 0x5b9cca4f7763e373n, 0x682e6ff3d6b2b8a3n,
-  0x748f82ee5defb2fcn, 0x78a5636f43172f60n, 0x84c87814a1f0ab72n, 0x8cc702081a6439ecn,
-  0x90befffa23631e28n, 0xa4506cebde82bde9n, 0xbef9a3f7b2c67915n, 0xc67178f2e372532bn,
-  0xca273eceea26619cn, 0xd186b8c721c0c207n, 0xeada7dd6cde0eb1en, 0xf57d4f7fee6ed178n,
-  0x06f067aa72176fban, 0x0a637dc5a2c898a6n, 0x113f9804bef90daen, 0x1b710b35131c471bn,
-  0x28db77f523047d84n, 0x32caab7b40c72493n, 0x3c9ebe0a15c9bebcn, 0x431d67c49c100d4cn,
-  0x4cc5d4becb3e42b6n, 0x597f299cfc657e2an, 0x5fcb6fab3ad6faecn, 0x6c44198c4a475817n,
-];
-const rotr64 = (x, n) => ((x >> n) | (x << (64n - n))) & MASK64;
-function sha512core(bytes, iv, outLen) {
-  const ml = BigInt(bytes.length) * 8n;
-  const withOne = bytes.length + 1;
-  const total = withOne + (((112 - (withOne % 128)) + 128) % 128) + 16;
-  const msg = new Uint8Array(total);
-  msg.set(bytes);
-  msg[bytes.length] = 0x80;
-  for (let i = 0; i < 8; i++) msg[total - 1 - i] = Number((ml >> BigInt(8 * i)) & 0xffn);
-  let h = iv.slice();
-  const w = new Array(80);
-  for (let i = 0; i < total; i += 128) {
-    for (let j = 0; j < 16; j++) {
-      let v = 0n;
-      for (let k = 0; k < 8; k++) v = (v << 8n) | BigInt(msg[i + j * 8 + k]);
-      w[j] = v;
-    }
-    for (let j = 16; j < 80; j++) {
-      const s0 = rotr64(w[j - 15], 1n) ^ rotr64(w[j - 15], 8n) ^ (w[j - 15] >> 7n);
-      const s1 = rotr64(w[j - 2], 19n) ^ rotr64(w[j - 2], 61n) ^ (w[j - 2] >> 6n);
-      w[j] = (w[j - 16] + s0 + w[j - 7] + s1) & MASK64;
-    }
-    let [a, b, c, d, e, f, g, hh] = h;
-    for (let j = 0; j < 80; j++) {
-      const S1 = rotr64(e, 14n) ^ rotr64(e, 18n) ^ rotr64(e, 41n);
-      const ch = (e & f) ^ ((~e & MASK64) & g);
-      const t1 = (hh + S1 + ch + K512[j] + w[j]) & MASK64;
-      const S0 = rotr64(a, 28n) ^ rotr64(a, 34n) ^ rotr64(a, 39n);
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const t2 = (S0 + maj) & MASK64;
-      hh = g; g = f; f = e; e = (d + t1) & MASK64; d = c; c = b; b = a; a = (t1 + t2) & MASK64;
-    }
-    h = [(h[0] + a) & MASK64, (h[1] + b) & MASK64, (h[2] + c) & MASK64, (h[3] + d) & MASK64,
-      (h[4] + e) & MASK64, (h[5] + f) & MASK64, (h[6] + g) & MASK64, (h[7] + hh) & MASK64];
-  }
-  const out = new Uint8Array(64);
-  for (let i = 0; i < 8; i++) for (let k = 0; k < 8; k++) out[i * 8 + k] = Number((h[i] >> BigInt(56 - 8 * k)) & 0xffn);
-  return outLen === 64 ? out : Uint8Array.from(out.subarray(0, outLen));
-}
-const SHA512_IV = [
-  0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n,
-  0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n];
-const SHA384_IV = [
-  0xcbbb9d5dc1059ed8n, 0x629a292a367cd507n, 0x9159015a3070dd17n, 0x152fecd8f70e5939n,
-  0x67332667ffc00b31n, 0x8eb44a8768581511n, 0xdb0c2e0d64f98fa7n, 0x47b5481dbefa4fa4n];
-function sha512(bytes) { return sha512core(bytes, SHA512_IV, 64); }
-function sha384(bytes) { return sha512core(bytes, SHA384_IV, 48); }
-
-// Register the SHA-512 family so Hash/Hmac/pbkdf2/hkdf and the public-key code share one
-// implementation. HMAC block size for SHA-384/512 is 128 bytes.
-HASH_REG.sha512 = { fn: sha512, outLen: 64, blockSize: 128 };
-HASH_REG.sha384 = { fn: sha384, outLen: 48, blockSize: 128 };
-HASH_REG["sha-512"] = HASH_REG.sha512;
-HASH_REG["sha-384"] = HASH_REG.sha384;
 
 // Digest-name normalisation for public-key algorithms ("RSA-SHA256", "sha256WithRSAEncryption",
 // "ecdsa-with-SHA256" …).
@@ -2733,7 +2618,7 @@ const crypto = {
   Hash,
   Hmac,
   hash,
-  getHashes: () => ["md5", "sha1", "sha256", "sha384", "sha512", "sha512-224", "sha512-256"],
+  getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-224", "sha512-256"],
   pbkdf2,
   pbkdf2Sync,
   hkdf,

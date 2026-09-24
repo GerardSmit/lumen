@@ -89,6 +89,7 @@ fn parse_script_inner(
     lazy: bool,
     eager_outermost: bool,
 ) -> Result<Vec<Stmt>, ParseError> {
+    crate::bytecode::reflect::note_source(src);
     let chars: Vec<char> = src.chars().collect();
     let tokens = tokenize_goal_chars(&chars, true).map_err(|e| ParseError {
         message: e.message,
@@ -188,6 +189,7 @@ fn release_parse_scratch(src_len: usize) {
 /// Parse a module (always strict; `import`/`export` are allowed only here). Modules permit top-level
 /// `await`, so `await` is treated as a keyword at the module's top level.
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
+    crate::bytecode::reflect::note_source(src);
     let chars: Vec<char> = src.chars().collect();
     let tokens = tokenize_goal_chars(&chars, false).map_err(|e| ParseError {
         at_eof: e.at_eof,

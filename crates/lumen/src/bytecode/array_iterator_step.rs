@@ -1,9 +1,5 @@
 //! Elide a yielded Array Iterator result while retaining the real iterator for close.
-use crate::value::Gc;
-use crate::{
-    interpreter::Interp,
-    value::{Exotic, Value},
-};
+use crate::{interpreter::Interp, value::Value};
 
 const ENABLED_NEXT: &str = "%ArrayIteratorStepIntrinsic%";
 
@@ -19,88 +15,20 @@ pub(crate) fn install(i: &mut Interp) {
 /// Some is a yielded owned value, including Undefined. None has no visible effects:
 /// execute the original iterator_step. Exhaustion deliberately remains on that path.
 pub(super) fn try_yield(i: &Interp, iterator: &Value, captured_next: &Value) -> Option<Value> {
-    let expected = i.extra_protos.get(ENABLED_NEXT)?;
-    if !matches!(captured_next, Value::Obj(actual) if Gc::ptr_eq(actual, expected)) {
+    if !matches!(captured_next, Value::Obj(actual) if i.is_elidable_array_iter_next(actual)) {
         return None;
     }
-    let Value::Obj(object) = iterator else {
-        return None;
-    };
-    let (target, index) = {
-        let b = object.borrow();
-        if !matches!(b.exotic, Exotic::None) || !b.ic_plain.get() {
-            return None;
+    // A shape-memoized own-data read of the iterator state and the target element (see
+    // `Interp::array_iter_step_fast`). Exhaustion reports None here; the caller's full
+    // iterator_step then observes the (already exhausted) iterator and reports done.
+    match i.array_iter_step_fast(iterator) {
+        Some(Some(value)) => {
+            #[cfg(test)]
+            SUCCESSES.with(|n| n.set(n.get() + 1));
+            Some(value)
         }
-        let kind = b.props.get("__ai_kind")?;
-        if kind.accessor() || !matches!(kind.value(), Value::Num(0.0)) {
-            return None;
-        }
-        let p = b.props.get("__ai_index")?;
-        if p.accessor() || !p.writable() {
-            return None;
-        }
-        let Value::Num(index) = p.value() else {
-            return None;
-        };
-        if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index >= u32::MAX as f64 {
-            return None;
-        }
-        let p = b.props.get("__ai_target")?;
-        if p.accessor() {
-            return None;
-        }
-        let Value::Obj(target) = p.value() else {
-            return None;
-        };
-        (target, index as u32)
-    };
-    let value = own_array_value(&target, index)?;
-    // All preflight is pure; no user code or GC occurred. Recheck on the mutable
-    // borrow anyway, and never fall back after replacing this Number with Number.
-    {
-        let mut b = object.borrow_mut();
-        if !matches!(b.exotic, Exotic::None) || !b.ic_plain.get() {
-            return None;
-        }
-        let p = b.props.get_mut("__ai_index")?;
-        if p.accessor() || !p.writable() || !matches!(p.value(), Value::Num(_)) {
-            return None;
-        }
-        p.set_value(Value::Num(f64::from(index) + 1.0));
+        _ => None,
     }
-    #[cfg(test)]
-    SUCCESSES.with(|n| n.set(n.get() + 1));
-    Some(value)
-}
-
-fn own_array_value(target: &crate::value::Gc, index: u32) -> Option<Value> {
-    let b = target.borrow();
-    if !matches!(b.exotic, Exotic::Array) || !b.ic_plain.get() {
-        return None;
-    }
-    let length = b.props.get("length")?;
-    if length.accessor() {
-        return None;
-    }
-    let Value::Num(length) = length.value() else {
-        return None;
-    };
-    if !length.is_finite()
-        || length.fract() != 0.0
-        || length > u32::MAX as f64
-        || f64::from(index) >= length
-    {
-        return None;
-    }
-    let element = b.props.get_index(index)?;
-    if element.accessor() {
-        return None;
-    }
-    let value = element.value();
-    if matches!(value, Value::Empty) {
-        return None;
-    }
-    Some(value)
 }
 
 #[cfg(test)]

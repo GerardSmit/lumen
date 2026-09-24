@@ -57,6 +57,8 @@ pub(crate) fn extension() -> Extension {
                     "setgroups" (1) => op_setgroups,
                     "initgroups" (2) => op_initgroups,
                     "metrics" (0) => op_metrics,
+                    "isatty" (1) => op_isatty,
+                    "ttySize" (1) => op_tty_size,
                 ],
             ),
         ],
@@ -114,6 +116,8 @@ const JS_INIT: &str = r#"(() => {
   Object.defineProperty(process, "_readStdin", { value: readStdin, configurable: true });
   Object.defineProperty(process, "_stdinRef", { value: stdinRef, configurable: true });
   Object.defineProperty(process, "_nativeMetrics", { value: metrics, configurable: true });
+  Object.defineProperty(process, "_isatty", { value: proc.isatty, configurable: true });
+  Object.defineProperty(process, "_ttySize", { value: proc.ttySize, configurable: true });
 
   const raw = proc.hrtime;
   const hrtime = (prev) => {
@@ -132,7 +136,17 @@ const JS_INIT: &str = r#"(() => {
   process.uptime = () => { const t = raw(); return t[0] + t[1] / 1e9; };
 
   process.version = "v20.11.0";
-  process.versions = { node: "20.11.0", lumen: "0.1.1", v8: "0.0.0" };
+  // The component versions Node 20.11.0 reports. Packages and Node's own test/common probe
+  // these (`hasCrypto` is `Boolean(process.versions.openssl)`); lumen implements the matching
+  // surfaces (node:crypto, Intl, zlib, N-API 9) natively, so it reports the versions it is
+  // compatible with rather than leaving them empty.
+  process.versions = {
+    node: "20.11.0", lumen: "0.1.1", acorn: "8.11.2", ada: "2.7.4", ares: "1.20.1",
+    base64: "0.5.1", brotli: "1.0.9", cjs_module_lexer: "1.2.2", cldr: "44.0", icu: "74.1",
+    llhttp: "8.1.1", modules: "115", napi: "9", nghttp2: "1.58.0", openssl: "3.0.12+quic",
+    simdutf: "4.0.4", tz: "2023c", undici: "5.27.2", unicode: "15.1", uv: "1.46.0",
+    uvwasi: "0.0.19", v8: "11.3.244.8-node.17", zlib: "1.2.13.1-motley",
+  };
 
   // Real OS-identity / control surface over the native ops. These need the (about-to-be-deleted)
   // `__proc` namespace, so they are wired here rather than in the lumen-node JS glue.
@@ -210,7 +224,15 @@ pub(crate) fn install_data_props(
     // than in the JS glue because the glue runs before this data-prop pass, so argv isn't ready
     // there yet. `title` defaults to the executable's basename (settable afterwards).
     let _ = ctx.set_member(&process, "argv0", Value::from_string(argv0_str.clone()));
-    let _ = ctx.set_member(&process, "execPath", Value::from_string(argv0_str.clone()));
+    // Node's execPath is always the absolute path of the running binary (uv_exepath), even when
+    // it was started through a relative path; child_process.fork/spawn(process.execPath) rely on it.
+    let exec_path = match embedded {
+        Some(_) => argv0_str.clone(),
+        None => std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| argv0_str.clone()),
+    };
+    let _ = ctx.set_member(&process, "execPath", Value::from_string(exec_path));
     let title = argv0_str
         .rsplit(['/', '\\'])
         .next()
@@ -243,7 +265,39 @@ pub(crate) fn install_data_props(
         other => other,
     };
     let _ = ctx.set_member(&process, "arch", Value::str(arch));
+
+    // Node's process.env stores every value as a string, and on Windows looks names up without
+    // regard to case (`process.env.windir` finds `WINDIR`).
+    let _ = engine.eval(ENV_PROXY, false);
 }
+
+const ENV_PROXY: &str = r#"(() => {
+  const target = process.env;
+  if (target === null || typeof target !== "object") return;
+  const win = process.platform === "win32";
+  const has = Object.prototype.hasOwnProperty;
+  const find = (key) => {
+    if (!win || typeof key !== "string" || has.call(target, key)) return key;
+    const upper = key.toUpperCase();
+    for (const k of Object.keys(target)) if (k.toUpperCase() === upper) return k;
+    return key;
+  };
+  process.env = new Proxy(target, {
+    get: (t, key) => Reflect.get(t, find(key)),
+    set: (t, key, value) => {
+      t[find(key)] = `${value}`;
+      return true;
+    },
+    has: (t, key) => Reflect.has(t, find(key)),
+    deleteProperty: (t, key) => {
+      delete t[find(key)];
+      return true;
+    },
+    getOwnPropertyDescriptor: (t, key) => Reflect.getOwnPropertyDescriptor(t, find(key)),
+    defineProperty: (t, key, desc) =>
+      Reflect.defineProperty(t, find(key), "value" in desc ? { ...desc, value: `${desc.value}` } : desc),
+  });
+})();"#;
 
 /// `(chunk)` — write raw bytes to stdout (no trailing newline, unlike `console.log`). A typed
 /// array is written as-is; anything else is coerced to a string. Backs `process.stdout.write`.
@@ -332,6 +386,88 @@ fn decode_stdin_read(
         Ok(bytes) => Ok(vec![ctx.make_uint8array(&bytes)?]),
         Err(message) => Err(ctx.make_error("Error", message)),
     }
+}
+
+/// `isatty(fd)` for the standard streams (an embedded realm's streams are never terminals).
+fn op_isatty(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use std::io::IsTerminal;
+    if ctx.op_state().get::<RealmProcess>().is_some() {
+        return Ok(Value::Bool(false));
+    }
+    let fd = args.first().and_then(|v| v.as_num_opt()).unwrap_or(-1.0);
+    Ok(Value::Bool(match fd as i64 {
+        0 => std::io::stdin().is_terminal(),
+        1 => std::io::stdout().is_terminal(),
+        2 => std::io::stderr().is_terminal(),
+        _ => false,
+    }))
+}
+
+/// `[columns, rows]` of the terminal on `fd` (1 or 2), or undefined when it is not one.
+fn op_tty_size(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let fd = args.first().and_then(|v| v.as_num_opt()).unwrap_or(1.0) as i32;
+    match terminal_size(fd) {
+        Some((cols, rows)) => Ok(_ctx.make_array(vec![Value::Num(cols as f64), Value::Num(rows as f64)])),
+        None => Ok(Value::Undefined),
+    }
+}
+
+#[cfg(windows)]
+fn terminal_size(fd: i32) -> Option<(u16, u16)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Info {
+        size: [i16; 2],
+        cursor: [i16; 2],
+        attrs: u16,
+        window: [i16; 4],
+        max: [i16; 2],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleScreenBufferInfo(h: *mut std::ffi::c_void, info: *mut Info) -> i32;
+    }
+    let which = if fd == 2 { -12i32 as u32 } else { -11i32 as u32 };
+    let mut info = Info::default();
+    // SAFETY: GetStdHandle takes no pointers; `info` is a CONSOLE_SCREEN_BUFFER_INFO.
+    let ok = unsafe { GetConsoleScreenBufferInfo(GetStdHandle(which), &mut info) };
+    if ok == 0 {
+        return None;
+    }
+    let cols = info.window[2] - info.window[0] + 1;
+    let rows = info.window[3] - info.window[1] + 1;
+    Some((cols.max(1) as u16, rows.max(1) as u16))
+}
+
+#[cfg(unix)]
+fn terminal_size(fd: i32) -> Option<(u16, u16)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Winsize {
+        rows: u16,
+        cols: u16,
+        x: u16,
+        y: u16,
+    }
+    extern "C" {
+        fn ioctl(fd: i32, req: std::os::raw::c_ulong, ...) -> i32;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
+    let mut ws = Winsize::default();
+    // SAFETY: TIOCGWINSZ writes one `struct winsize` through the pointer.
+    if unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) } != 0 || ws.cols == 0 {
+        return None;
+    }
+    Some((ws.cols, ws.rows))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminal_size(_fd: i32) -> Option<(u16, u16)> {
+    None
 }
 
 fn write_raw(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Value> {

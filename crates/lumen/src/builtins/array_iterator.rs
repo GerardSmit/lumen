@@ -1,5 +1,5 @@
 //! Guarded own-data Array Iterator state; target reads retain existing semantics.
-use super::{ab, map_ptr, set_data};
+use super::{ab, map_ptr};
 use crate::{
     interpreter::Interp,
     value::{Exotic, Property, Value},
@@ -90,14 +90,41 @@ fn write_index(i: &mut Interp, this: &Value, next: f64) -> Result<(), Value> {
 }
 
 fn next<const FAST: bool>(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(match step::<FAST>(i, &this)? {
+        Some(value) => super::iter_result(i, value, false),
+        None => super::iter_result(i, Value::Undefined, true),
+    })
+}
+
+/// Whether `f` is an intrinsic %ArrayIteratorPrototype%.next.
+pub(super) fn is_next(f: super::NativeFn) -> bool {
+    f as usize == fast as super::NativeFn as usize
+        || f as usize == baseline as super::NativeFn as usize
+}
+
+/// One step of an Array Iterator (`next()` without the result object): `Some(value)`, or
+/// `None` once done. `this` is the receiver `next` was called with.
+pub(super) fn step_with(
+    i: &mut Interp,
+    f: super::NativeFn,
+    this: &Value,
+) -> Result<Option<Value>, Value> {
+    if f as usize == baseline as super::NativeFn as usize {
+        step::<false>(i, this)
+    } else {
+        step::<true>(i, this)
+    }
+}
+
+fn step<const FAST: bool>(i: &mut Interp, this: &Value) -> Result<Option<Value>, Value> {
     // Brand check: the receiver must carry the Array Iterator internal slots.
-    if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("__ai_kind")) {
+    if !matches!(this, Value::Obj(o) if o.borrow().props.contains("__ai_kind")) {
         return Err(i.make_error(
             "TypeError",
             "Array Iterator next called on an incompatible receiver",
         ));
     }
-    let state = if FAST { own_state(&this) } else { None };
+    let state = if FAST { own_state(this) } else { None };
     #[cfg(test)]
     if state.is_some() {
         SNAPSHOTS.with(|n| n.set(n.get() + 1));
@@ -108,47 +135,43 @@ fn next<const FAST: bool>(i: &mut Interp, this: Value, _args: &[Value]) -> Resul
             index,
             kind,
         }) => (target, Some((index, kind))),
-        None => (ab(i.get_member(&this, "__ai_target"))?, None),
+        None => (ab(i.get_member(this, "__ai_target"))?, None),
     };
     // An exhausted iterator clears its target so it stays done even if the source later grows.
     if matches!(target, Value::Undefined) {
-        let result = i.new_object();
-        set_data(&result, "value", Value::Undefined);
-        set_data(&result, "done", Value::Bool(true));
-        return Ok(Value::Obj(result));
+        return Ok(None);
     }
     let (idx, kind) = match state {
         Some(state) => state,
         None => {
-            let idx_v = ab(i.get_member(&this, "__ai_index"))?;
+            let idx_v = ab(i.get_member(this, "__ai_index"))?;
             let idx = ab(i.to_number(&idx_v))? as usize;
-            let kind_v = ab(i.get_member(&this, "__ai_kind"))?;
+            let kind_v = ab(i.get_member(this, "__ai_kind"))?;
             let kind = ab(i.to_number(&kind_v))? as u8;
             (idx, kind)
         }
     };
     let len = target_len(i, &target)?;
-    let result = i.new_object();
     if idx >= len {
-        ab(i.set_member(&this, "__ai_target", Value::Undefined))?;
-        set_data(&result, "value", Value::Undefined);
-        set_data(&result, "done", Value::Bool(true));
-        return Ok(Value::Obj(result));
+        ab(i.set_member(this, "__ai_target", Value::Undefined))?;
+        return Ok(None);
     }
     if FAST {
-        write_index(i, &this, (idx + 1) as f64)?;
+        write_index(i, this, (idx + 1) as f64)?;
     } else {
-        ab(i.set_member(&this, "__ai_index", Value::Num((idx + 1) as f64)))?;
+        ab(i.set_member(this, "__ai_index", Value::Num((idx + 1) as f64)))?;
     }
-    let elem = ab(i.get_member(&target, &idx.to_string()))?;
-    let value = match kind {
-        1 => Value::Num(idx as f64),
+    if kind == 1 {
+        return Ok(Some(Value::Num(idx as f64)));
+    }
+    let elem = match &target {
+        Value::Obj(o) => super::array_fast::get_elem(i, o, &target, idx)?,
+        _ => ab(i.get_member(&target, &idx.to_string()))?,
+    };
+    Ok(Some(match kind {
         2 => i.make_array(vec![Value::Num(idx as f64), elem]),
         _ => elem,
-    };
-    set_data(&result, "value", value);
-    set_data(&result, "done", Value::Bool(false));
-    Ok(Value::Obj(result))
+    }))
 }
 
 fn target_len(i: &mut Interp, target: &Value) -> Result<usize, Value> {
@@ -226,8 +249,9 @@ mod tests {
             assert(it.next().value===10);assert(it.next().value===20);
             assert(it.next().done);assert(it.next().done);
             var log='';var target=new Proxy({0:5,length:1},{get:function(t,k){log+=k+',';return t[k];}});
+            // A keys iterator (kind 1) yields the index without a Get of the element.
             var fake={__ai_target:target,__ai_kind:1,__ai_index:0};
-            assert(next.call(fake).value===0&&log==='length,0,');
+            assert(next.call(fake).value===0&&log==='length,');
         "#,
             (5, 3, 0),
         );

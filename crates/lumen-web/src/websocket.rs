@@ -447,7 +447,7 @@ pub(crate) fn op_ws_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 /// subprotocol ("" when none).
 fn handshake(u: &url::Url, key: &str, protocols: &str) -> Result<ConnectedSocket, String> {
     let port = u.port.unwrap_or(if u.scheme == "wss" { 443 } else { 80 });
-    let host = u.host.trim_matches(['[', ']']);
+    let host = u.hostname().trim_matches(['[', ']']);
     let tcp = TcpStream::connect((host, port)).map_err(|e| format!("connect: {e}"))?;
     tcp.set_nodelay(true).ok();
     tcp.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
@@ -459,16 +459,11 @@ fn handshake(u: &url::Url, key: &str, protocols: &str) -> Result<ConnectedSocket
     };
 
     let host_header = if u.port.is_some() && u.port != Some(80) {
-        format!("{}:{}", u.host, port)
+        format!("{}:{}", u.hostname(), port)
     } else {
-        u.host.clone()
+        u.hostname().to_string()
     };
-    let mut path = if u.path.is_empty() {
-        "/".to_string()
-    } else {
-        u.path.clone()
-    };
-    path.push_str(&u.query); // `query` already carries its leading '?' when present
+    let path = u.request_target();
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\n\
          Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"

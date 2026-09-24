@@ -1,29 +1,54 @@
 //! Eligibility for executing a constructor body in the compiled tiers.
-use super::Interp;
-use crate::value::Gc;
+use super::{Abrupt, Env, Interp};
+use crate::value::{Gc, Value};
 
 impl Interp {
     /// Base-class fields/private members/decorator initializers have already run in
     /// `run_constructor_on`. Its body can use the ordinary compiled calling convention.
-    /// Derived constructors still need a TDZ this binding, super rebinding and return checks.
+    /// Derived constructors need a TDZ this binding, super rebinding and return checks: only a
+    /// chunk compiled in derived mode (`Chunk::is_derived`) models those.
     pub(super) fn constructor_body_can_compile(&self, constructor: &Gc) -> bool {
         self.class_info
             .get(&(Gc::as_ptr(constructor) as usize))
             .is_none_or(|info| !info.derived)
     }
 
-    /// Whether construction has no class-owned instance setup before the body. Only this class
-    /// shape may share the ordinary function-constructor IC path: derived classes need TDZ
-    /// `this`/`super()` handling, while every other metadata list has observable work or errors.
-    pub(super) fn is_empty_base_class(&self, constructor: &Gc) -> bool {
-        self.class_info
-            .get(&(Rc::as_ptr(constructor) as usize))
-            .is_some_and(|info| {
-                !info.derived
-                    && info.fields.is_empty()
-                    && info.instance_initializers.is_empty()
-                    && info.private_members.is_empty()
-            })
+    /// [[Construct]]'s completion rule for a derived constructor body that returned `v` (the
+    /// compiled tier's `Op::DerivedReturn`; mirrors the tail of `call_user_inner`): an object
+    /// wins; any other non-undefined value is a TypeError; otherwise the current `this` binding
+    /// found from `env` — a ReferenceError while still uninitialized (no `super()` ran). Both
+    /// errors belong to the caller's realm.
+    pub(crate) fn derived_construct_result(&mut self, env: &Env, v: Value) -> Result<Value, Abrupt> {
+        if matches!(v, Value::Obj(_)) {
+            return Ok(v);
+        }
+        if !matches!(v, Value::Undefined | Value::Empty) {
+            return Err(self.throw_in_caller_realm(
+                "TypeError",
+                "a derived constructor may only return an object or undefined",
+            ));
+        }
+        let mut cur = Some(env.clone());
+        while let Some(scope) = cur {
+            let found = scope
+                .borrow()
+                .vars
+                .get("this")
+                .map(|b| (b.value.clone(), b.initialized));
+            if let Some((t, init)) = found {
+                return if init {
+                    Ok(t)
+                } else {
+                    Err(self.throw_in_caller_realm(
+                        "ReferenceError",
+                        "derived constructor returned without calling super()",
+                    ))
+                };
+            }
+            let parent = scope.borrow().parent.clone();
+            cur = parent;
+        }
+        Ok(v)
     }
 }
 

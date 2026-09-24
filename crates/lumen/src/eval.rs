@@ -2,6 +2,7 @@
 //! of `interpreter.rs` to keep each file readable; this is the same `impl Interp`.
 
 mod enumeration;
+pub(crate) mod fastpaths;
 
 use crate::ast::*;
 use crate::interpreter::*;
@@ -1437,6 +1438,15 @@ impl Interp {
             let arr = self.make_array(chars);
             return self.get_iterator(&arr);
         }
+        // A pristine Array: `@@iterator` is the intrinsic `values` (no user code runs to find or
+        // call it) — build its iterator directly and hand back the intrinsic `next`.
+        if let Value::Obj(o) = v {
+            if self.pristine_array_iteration(o) {
+                if let Some(next) = self.array_iter_next_intrinsic() {
+                    return Ok((self.new_array_iterator(v), Value::Obj(next)));
+                }
+            }
+        }
         let key = match &self.iterator_sym {
             Some(s) => Interp::sym_key(s),
             None => return Err(self.throw("TypeError", "no iterator symbol")),
@@ -1461,6 +1471,23 @@ impl Interp {
         iter: &Value,
         next: &Value,
     ) -> Result<Option<Value>, Abrupt> {
+        // The intrinsic Array Iterator `next`: step without the call or its result object.
+        if let Value::Obj(nf) = next {
+            if self.is_array_iter_next(nf) {
+                if let Some(step) = self.array_iter_step_fast(iter) {
+                    return Ok(step);
+                }
+                let f = match nf.borrow().call {
+                    Callable::Native(f) => Some(f),
+                    _ => None,
+                };
+                if let Some(f) = f {
+                    if let Some(r) = crate::builtins::array_iterator_step_with(self, f, iter) {
+                        return r.map_err(Abrupt::Throw);
+                    }
+                }
+            }
+        }
         let res = self.call(next.clone(), iter.clone(), &[])?;
         if !matches!(res, Value::Obj(_)) {
             return Err(self.throw("TypeError", "iterator result is not an object"));
@@ -1474,6 +1501,9 @@ impl Interp {
     }
     /// IteratorClose: call `return()` if present (swallowing its result/most errors).
     pub(crate) fn iterator_close(&mut self, iter: &Value) {
+        if self.array_iter_close_is_noop(iter) {
+            return;
+        }
         if let Ok(ret) = self.get_member(iter, "return") {
             if ret.is_callable() {
                 let _ = self.call(ret, iter.clone(), &[]);
@@ -1484,6 +1514,9 @@ impl Interp {
     /// IteratorClose for a *normal* completion: errors from reading or calling `return` propagate
     /// (unlike the throw-completion `iterator_close`, which swallows them).
     pub(crate) fn iterator_close_normal(&mut self, iter: &Value) -> Result<(), Abrupt> {
+        if self.array_iter_close_is_noop(iter) {
+            return Ok(());
+        }
         let ret = self.get_member(iter, "return")?;
         if !matches!(ret, Value::Undefined | Value::Null) {
             if !ret.is_callable() {
@@ -1507,7 +1540,12 @@ impl Interp {
                     .map(|c| Value::from_string(c.to_string()))
                     .collect());
             }
-            Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {
+            // A pristine Array iterates as its own elements (holes read through [[Get]], which
+            // is what the intrinsic iterator does); any other Array uses the protocol.
+            Value::Obj(o) if self.pristine_array_iteration(o) => {
+                if let Some(out) = self.dense_array_values(o) {
+                    return Ok(out);
+                }
                 let len = self.checked_array_len(o)?;
                 let mut out = Vec::with_capacity(len.min(1024));
                 for i in 0..len {
@@ -1526,6 +1564,33 @@ impl Interp {
             }
         }
         Err(self.throw("TypeError", "value is not iterable"))
+    }
+
+    /// The argument list a default derived constructor forwards: the elements of its own rest
+    /// array (see [`DEFAULT_CTOR_ARGS`]), read by index — the spec passes the arguments through
+    /// directly, so `Array.prototype[@@iterator]` must not be consulted.
+    pub(crate) fn default_ctor_args(&mut self, v: &Value) -> Result<Vec<Value>, Abrupt> {
+        let Value::Obj(o) = v else {
+            return self.iterate(v);
+        };
+        let len = self.checked_array_len(o)?;
+        let mut out = Vec::with_capacity(len.min(1024));
+        for i in 0..len {
+            out.push(self.get_member(v, &i.to_string())?);
+        }
+        Ok(out)
+    }
+
+    /// Whether the constructor running in `env` is a synthesized default derived one.
+    pub(crate) fn in_default_derived_ctor(&self, env: &Env) -> bool {
+        let Some(Value::Obj(c)) = self.peek_binding("%thisctor%", env) else {
+            return false;
+        };
+        let b = c.borrow();
+        matches!(&b.call, Callable::User(u) if matches!(
+            u.func.params.as_slice(),
+            [Param { pattern: Pattern::Ident(n), rest: true, .. }] if n == DEFAULT_CTOR_ARGS
+        ))
     }
 
     /// Drive the iterator protocol on `v` using an already-resolved `@@iterator` method `itfn`
@@ -1884,7 +1949,7 @@ impl Interp {
     /// Resolve a source-level private name (`#x`) to this class evaluation's runtime key through
     /// the scope chain (each class evaluation binds its private names in its class scope — the
     /// spec's PrivateEnvironment). An unresolved name keeps its literal spelling.
-    fn resolve_private(&self, name: &str, env: &Env) -> String {
+    pub(crate) fn resolve_private(&self, name: &str, env: &Env) -> String {
         let mut cur = Some(env.clone());
         while let Some(s) = cur {
             let b = s.borrow();
@@ -2033,7 +2098,7 @@ impl Interp {
 
     /// PrivateGet: read a private field/method after a brand check. An object that was not
     /// constructed with this private name in scope (`#x` absent) is a TypeError, not `undefined`.
-    fn get_private_member(&mut self, base: &Value, name: &str) -> Completion {
+    pub(crate) fn get_private_member(&mut self, base: &Value, name: &str) -> Completion {
         let prop = match base {
             Value::Obj(o) => o.borrow().props.get(name).cloned(),
             _ => None,
@@ -2063,7 +2128,7 @@ impl Interp {
     /// PrivateSet: write a private field (or invoke a private setter) after a brand check. A
     /// private *method* (non-writable) or a getter-only private accessor is a TypeError — never a
     /// silent sloppy-mode no-op.
-    fn set_private_member(&mut self, base: &Value, name: &str, value: Value) -> Result<(), Abrupt> {
+    pub(crate) fn set_private_member(&mut self, base: &Value, name: &str, value: Value) -> Result<(), Abrupt> {
         let shown = private_display(name).to_string();
         let (o, prop) = match base {
             Value::Obj(o) => (o.clone(), o.borrow().props.get(name).cloned()),
@@ -2107,7 +2172,7 @@ impl Interp {
     /// The object `super.x` reads/writes through: `GetPrototypeOf([[HomeObject]])` when a home
     /// object is in scope (object-literal & class methods bound via `%homeobject%`), else the
     /// statically-resolved `%superproto%` carried by older class-method environments.
-    fn super_base(&mut self, env: &Env) -> Result<Value, Abrupt> {
+    pub(crate) fn super_base(&mut self, env: &Env) -> Result<Value, Abrupt> {
         if let Some(Value::Obj(home)) = self.peek_binding("%homeobject%", env) {
             return Ok(match home.borrow().proto.clone() {
                 Some(p) => Value::Obj(p),
@@ -2589,7 +2654,7 @@ impl Interp {
 
     /// The NamedEvaluation name for a property key: a symbol key names the function "[desc]"
     /// (or "" without a description); a string key is used as-is.
-    fn fn_name_for_key(&self, key: &str) -> String {
+    pub(crate) fn fn_name_for_key(&self, key: &str) -> String {
         if Interp::is_sym_key(key) {
             match self.sym_from_key(key) {
                 Some(Value::Sym(d)) => match &d.description {
@@ -2709,7 +2774,7 @@ impl Interp {
         Ok(Value::Obj(obj))
     }
 
-    fn define_accessor(&self, obj: &Gc, key: &str, get: Option<Value>, set: Option<Value>) {
+    pub(crate) fn define_accessor(&self, obj: &Gc, key: &str, get: Option<Value>, set: Option<Value>) {
         let mut b = obj.borrow_mut();
         if let Some(p) = b.props.get_mut(key) {
             if p.accessor() {
@@ -2736,6 +2801,135 @@ impl Interp {
                 self.to_property_key(&v)
             }
         }
+    }
+
+    /// `super(...)`, before ArgumentListEvaluation: the super-call legality checks and
+    /// GetSuperConstructor, plus the `this` value the parent constructor will run on (read from
+    /// the TDZ `this` binding). Shared by the tree-walker and the bytecode tier's `SuperCtor`.
+    pub(crate) fn super_call_prepare(&mut self, env: &Env) -> Result<(Value, Value), Abrupt> {
+        // A super-call outside a derived constructor body (a method, a field initializer, or
+        // anything reached via a direct `eval` from those) is illegal — but an arrow created
+        // inside the constructor keeps its lexical super-call capability even when invoked
+        // later (BindThisValue then throws ReferenceError instead).
+        if !self.super_call_ok
+            && (self.peek_binding("%superclass%", env).is_none()
+                || self.peek_binding("%thisctor%", env).is_none())
+        {
+            return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
+        }
+        if matches!(self.get_var("%superclass%", env)?, Value::Undefined) {
+            return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
+        }
+        // GetSuperConstructor: the *live* [[GetPrototypeOf]] of the running class
+        // constructor (Object.setPrototypeOf(C, ...) between definition and the call is
+        // honored). The IsConstructor check waits until the arguments have evaluated.
+        let this_ctor_for_parent = self.get_var("%thisctor%", env)?;
+        let parent = crate::builtins::js_get_prototype_of(self, &this_ctor_for_parent)
+            .map_err(Abrupt::Throw)?;
+        // Read the `this` binding directly (it is in TDZ until this very call completes);
+        // an already-initialized binding means super() ran twice.
+        let this_env = {
+            let mut cur = Some(env.clone());
+            let mut found = None;
+            while let Some(scope) = cur {
+                if scope.borrow().vars.contains_key("this") {
+                    found = Some(scope);
+                    break;
+                }
+                let parent_scope = scope.borrow().parent.clone();
+                cur = parent_scope;
+            }
+            found
+        };
+        let Some(this_env) = this_env else {
+            return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
+        };
+        let this = this_env
+            .borrow()
+            .vars
+            .get("this")
+            .map(|b| b.value.clone())
+            .unwrap();
+        Ok((parent, this))
+    }
+
+    /// `super(...)` after its arguments evaluated: IsConstructor, Construct(parent, argv,
+    /// new.target) on `this`, BindThisValue (with the base-constructor return override) and the
+    /// instance field initializers. Returns the (possibly overridden) `this`.
+    pub(crate) fn super_call_complete(
+        &mut self,
+        env: &Env,
+        parent: Value,
+        this: Value,
+        argv: Vec<Value>,
+    ) -> Result<Value, Abrupt> {
+        let this_env = {
+            let mut cur = Some(env.clone());
+            let mut found = None;
+            while let Some(scope) = cur {
+                if scope.borrow().vars.contains_key("this") {
+                    found = Some(scope);
+                    break;
+                }
+                let parent_scope = scope.borrow().parent.clone();
+                cur = parent_scope;
+            }
+            found
+        };
+        let Some(this_env) = this_env else {
+            return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
+        };
+        // A null (extends null) or non-constructor parent is a TypeError — after
+        // ArgumentListEvaluation.
+        if !self.value_is_constructor(&parent) {
+            return Err(self.throw("TypeError", "super constructor is not a constructor"));
+        }
+        // Construct(parent, args, GetNewTarget()): the parent runs with the derived
+        // constructor's active newTarget.
+        self.pending_new_target = self.new_target.clone();
+        let returned = self.run_constructor_on(&parent, &this, &argv)?;
+        // BindThisValue: an already-initialized `this` (a second super()) is a
+        // ReferenceError — but only after the arguments and parent construct ran.
+        {
+            let b = this_env.borrow();
+            let bd = b.vars.get("this").unwrap();
+            if bd.initialized {
+                return Err(self.throw("ReferenceError", "super() may only be called once"));
+            }
+        }
+        // A base constructor that returns an object overrides `this` for the derived
+        // constructor (and everything downstream: field initializers, super.x accesses,
+        // the implicit return).
+        let this = match (&returned, &this) {
+            (Value::Obj(r), Value::Obj(t)) if !Gc::ptr_eq(r, t) => {
+                let mut cur = Some(env.clone());
+                while let Some(scope) = cur {
+                    let done = {
+                        let mut b = scope.borrow_mut();
+                        if let Some(bd) = b.vars.get_mut("this") {
+                            bd.value = returned.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if done {
+                        break;
+                    }
+                    let parent_scope = scope.borrow().parent.clone();
+                    cur = parent_scope;
+                }
+                returned.clone()
+            }
+            _ => this,
+        };
+        if let Some(bd) = this_env.borrow_mut().vars.get_mut("this") {
+            bd.initialized = true;
+        }
+        let this_ctor = self.get_var("%thisctor%", env)?;
+        self.init_instance_fields(&this_ctor, &this)?;
+        // The value of a `super(...)` expression is the (possibly overridden) `this`.
+        Ok(this)
     }
 
     fn eval_args(&mut self, args: &[ArrayElem], env: &Env) -> Result<Vec<Value>, Abrupt> {
@@ -3017,101 +3211,15 @@ impl Interp {
         // `super(...)`: invoke the parent constructor on the current `this`, then run this class's
         // instance-field initializers.
         if matches!(callee, Expr::Super) {
-            // A super-call outside a derived constructor body (a method, a field initializer, or
-            // anything reached via a direct `eval` from those) is illegal — but an arrow created
-            // inside the constructor keeps its lexical super-call capability even when invoked
-            // later (BindThisValue then throws ReferenceError instead).
-            if !self.super_call_ok
-                && (self.peek_binding("%superclass%", env).is_none()
-                    || self.peek_binding("%thisctor%", env).is_none())
-            {
-                return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
-            }
-            if matches!(self.get_var("%superclass%", env)?, Value::Undefined) {
-                return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
-            }
-            // GetSuperConstructor: the *live* [[GetPrototypeOf]] of the running class
-            // constructor (Object.setPrototypeOf(C, ...) between definition and the call is
-            // honored). The IsConstructor check waits until the arguments have evaluated.
-            let this_ctor_for_parent = self.get_var("%thisctor%", env)?;
-            let parent = crate::builtins::js_get_prototype_of(self, &this_ctor_for_parent)
-                .map_err(Abrupt::Throw)?;
-            // Read the `this` binding directly (it is in TDZ until this very call completes);
-            // an already-initialized binding means super() ran twice.
-            let this_env = {
-                let mut cur = Some(env.clone());
-                let mut found = None;
-                while let Some(scope) = cur {
-                    if scope.borrow().vars.contains_key("this") {
-                        found = Some(scope);
-                        break;
-                    }
-                    let parent_scope = scope.borrow().parent.clone();
-                    cur = parent_scope;
+            let (parent, this) = self.super_call_prepare(env)?;
+            let argv = match args {
+                [ArrayElem::Spread(Expr::Ident(n))] if n == DEFAULT_CTOR_ARGS => {
+                    let v = self.get_var(n, env)?;
+                    self.default_ctor_args(&v)?
                 }
-                found
+                _ => self.eval_args(args, env)?,
             };
-            let Some(this_env) = this_env else {
-                return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
-            };
-            let this = this_env
-                .borrow()
-                .vars
-                .get("this")
-                .map(|b| b.value.clone())
-                .unwrap();
-            let argv = self.eval_args(args, env)?;
-            // A null (extends null) or non-constructor parent is a TypeError — after
-            // ArgumentListEvaluation.
-            if !self.value_is_constructor(&parent) {
-                return Err(self.throw("TypeError", "super constructor is not a constructor"));
-            }
-            // Construct(parent, args, GetNewTarget()): the parent runs with the derived
-            // constructor's active newTarget.
-            self.pending_new_target = self.new_target.clone();
-            let returned = self.run_constructor_on(&parent, &this, &argv)?;
-            // BindThisValue: an already-initialized `this` (a second super()) is a
-            // ReferenceError — but only after the arguments and parent construct ran.
-            {
-                let b = this_env.borrow();
-                let bd = b.vars.get("this").unwrap();
-                if bd.initialized {
-                    return Err(self.throw("ReferenceError", "super() may only be called once"));
-                }
-            }
-            // A base constructor that returns an object overrides `this` for the derived
-            // constructor (and everything downstream: field initializers, super.x accesses,
-            // the implicit return).
-            let this = match (&returned, &this) {
-                (Value::Obj(r), Value::Obj(t)) if !Gc::ptr_eq(r, t) => {
-                    let mut cur = Some(env.clone());
-                    while let Some(scope) = cur {
-                        let done = {
-                            let mut b = scope.borrow_mut();
-                            if let Some(bd) = b.vars.get_mut("this") {
-                                bd.value = returned.clone();
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if done {
-                            break;
-                        }
-                        let parent_scope = scope.borrow().parent.clone();
-                        cur = parent_scope;
-                    }
-                    returned.clone()
-                }
-                _ => this,
-            };
-            if let Some(bd) = this_env.borrow_mut().vars.get_mut("this") {
-                bd.initialized = true;
-            }
-            let this_ctor = self.get_var("%thisctor%", env)?;
-            self.init_instance_fields(&this_ctor, &this)?;
-            // The value of a `super(...)` expression is the (possibly overridden) `this`.
-            return Ok(this);
+            return self.super_call_complete(env, parent, this, argv);
         }
         // `super.m(...)` / `super[k](...)`: method on the super prototype, called with current `this`.
         if let Expr::Member { obj, prop, .. } = callee {
@@ -3540,6 +3648,18 @@ impl Interp {
         self.make_regexp_with_proto(source, flags, proto)
     }
 
+    /// A regular expression literal: a fresh RegExp object around the program compiled once per
+    /// literal site (`source`/`flags` are the chunk's own name entries).
+    pub(crate) fn make_regexp_literal(
+        &mut self,
+        source: &Rc<str>,
+        flags: &Rc<str>,
+    ) -> Result<Value, Abrupt> {
+        let proto = self.regexp_alloc_proto()?;
+        let re = self.regexp_site_program(source, flags)?;
+        Ok(self.make_regexp_object(re, proto))
+    }
+
     /// GetPrototypeFromConstructor for RegExpAlloc: `new` with a subclass/cross-realm newTarget
     /// overrides the instance prototype (falling back to newTarget's realm's %RegExp.prototype%).
     pub(crate) fn regexp_alloc_proto(&mut self) -> Result<Option<crate::value::Gc>, Abrupt> {
@@ -3573,14 +3693,10 @@ impl Interp {
         re: Rc<crate::regex::Regex>,
         proto: Option<crate::value::Gc>,
     ) -> Value {
-        let obj = Object::new(proto);
-        let ptr = Gc::as_ptr(&obj) as usize;
         // source/flags/global/... are accessor getters on RegExp.prototype (computed from the
         // matcher); only `lastIndex` is an own writable data property.
-        obj.borrow_mut().props.insert(
-            "lastIndex",
-            Property::data(Value::Num(0.0), true, false, false),
-        );
+        let obj = Object::new_with_parts(proto, self.regexp_props(), Exotic::None);
+        let ptr = Gc::as_ptr(&obj) as usize;
         self.gc_pin(&obj);
         self.regexps.insert(ptr, re);
         Value::Obj(obj)
@@ -3998,7 +4114,7 @@ impl Interp {
 
     // ----- classes ----------------------------------------------------------------------------
 
-    fn eval_class(&mut self, class: &Rc<Class>, env: &Env) -> Result<Value, Abrupt> {
+    pub(crate) fn eval_class(&mut self, class: &Rc<Class>, env: &Env) -> Result<Value, Abrupt> {
         // ClassDefinitionEvaluation is strict code throughout — the heritage expression and
         // computed member keys included, whatever the surrounding mode.
         let saved_strict = self.strict;
@@ -4880,7 +4996,7 @@ impl Interp {
         Ok(rest)
     }
 
-    fn copy_data_properties_into(
+    pub(crate) fn copy_data_properties_into(
         &mut self,
         rest: &Gc,
         value: &Value,
@@ -4910,6 +5026,7 @@ impl Interp {
             return Ok(());
         }
         match value {
+            Value::Obj(src) if excluded.is_empty() && self.copy_data_props_fast(rest, src) => {}
             Value::Obj(src) => {
                 let keys = src.borrow().props.ordered_keys();
                 for k in keys {
@@ -5119,12 +5236,16 @@ impl Interp {
     /// insert path with placeholder values; every later instance takes its shape (one refcount
     /// bump) and builds the entry vector straight from the values — no hashing, no shape
     /// transitions. Values arrive in key order, one slot per key.
-    pub(crate) fn make_plain_object_templated(
+    pub(crate) fn make_plain_object_templated<I>(
         &mut self,
         tmpl: &std::cell::OnceCell<crate::value::Props>,
         keys: &[std::rc::Rc<str>],
-        values: Vec<Value>,
-    ) -> Value {
+        values: I,
+    ) -> Value
+    where
+        I: IntoIterator<Item = Value>,
+        I::IntoIter: ExactSizeIterator,
+    {
         let map = tmpl.get_or_init(|| {
             let mut p = crate::value::Props::new();
             for k in keys {
@@ -5132,10 +5253,10 @@ impl Interp {
             }
             p
         });
-        let obj = crate::value::Object::new_with_parts(
+        let obj = crate::value::Object::new_from_template(
             Some(self.object_proto.clone()),
-            map.instantiate_plain(values.into_iter()),
-            crate::value::Exotic::None,
+            map,
+            values.into_iter(),
         );
         Value::Obj(obj)
     }
@@ -6807,13 +6928,18 @@ fn opt_obj(o: &Option<Gc>) -> Value {
     }
 }
 
+/// The synthesized default derived constructor's rest parameter: a name no source text can
+/// spell, so the only spread of it is the constructor's own `super(...)`, which passes the
+/// argument list through without the (observable) Array iterator protocol.
+pub(crate) const DEFAULT_CTOR_ARGS: &str = "%args";
+
 /// The synthesized default class constructor. Derived: `constructor(...args) { super(...args); }`;
 /// base: `constructor() {}`.
 fn default_constructor(derived: bool) -> Function {
     let body = if derived {
         vec![Stmt::Expr(Expr::Call {
             callee: Box::new(Expr::Super),
-            args: vec![ArrayElem::Spread(Expr::Ident("args".to_string()))],
+            args: vec![ArrayElem::Spread(Expr::Ident(DEFAULT_CTOR_ARGS.to_string()))],
             optional: false,
         })]
     } else {
@@ -6821,7 +6947,7 @@ fn default_constructor(derived: bool) -> Function {
     };
     let params = if derived {
         vec![Param {
-            pattern: Pattern::Ident("args".to_string()),
+            pattern: Pattern::Ident(DEFAULT_CTOR_ARGS.to_string()),
             default: None,
             rest: true,
         }]
@@ -6964,7 +7090,7 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
     }
 }
 
-fn stmts_have_super_call(stmts: &[Stmt]) -> bool {
+pub(crate) fn stmts_have_super_call(stmts: &[Stmt]) -> bool {
     stmts_contain(
         stmts,
         |e| matches!(e, Expr::Call { callee, .. } if matches!(**callee, Expr::Super)),

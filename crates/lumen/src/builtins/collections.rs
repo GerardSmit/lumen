@@ -4,7 +4,7 @@ use super::collection_data::{CollectionData, CollectionKind};
 use super::{ab, new_from_ctor, set_to_string_tag, step_iter_with};
 use crate::interpreter::Interp;
 use crate::value::Gc;
-use crate::value::{Object, Value};
+use crate::value::{Callable, NativeFn, Object, Value};
 
 pub(super) mod brand;
 pub(crate) mod insert;
@@ -13,7 +13,8 @@ pub(crate) mod lookup;
 mod set_methods;
 mod strong;
 mod weak;
-use iteration::map_set_iter_next;
+pub(crate) use iteration::map_set_iter_next;
+pub(crate) use iteration::{map_set_iter_drain, map_set_iter_step};
 use set_methods::install_set_methods;
 use strong::{install_map_like, install_map_methods};
 use weak::install_weak;
@@ -71,22 +72,62 @@ fn collection_ctor(i: &mut Interp, args: &[Value], kind: CollectionKind) -> Resu
             }
             // Step the source lazily: an error while processing an entry closes the iterator.
             let (iter, next) = ab(i.get_iterator(src))?;
+            // Intrinsic Array Iterator `next` / intrinsic adder: step and add in place, without
+            // iterator result objects or call frames (same operations, same order).
+            let arr_next = match &next {
+                Value::Obj(f) => match f.borrow().call {
+                    Callable::Native(f) if super::array_iterator::is_next(f) => Some(f),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let adder: Option<NativeFn> = match &add_fn {
+                Value::Obj(f) => match f.borrow().call {
+                    Callable::Native(f)
+                        if f as usize == insert::set_add as NativeFn as usize
+                            || f as usize == insert::map_set as NativeFn as usize =>
+                    {
+                        Some(f)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
             loop {
-                let item = match step_iter_with(i, &iter, &next)? {
-                    Some(v) => v,
-                    None => break,
+                let item = match arr_next {
+                    Some(f) => match super::array_iterator::step_with(i, f, &iter)? {
+                        Some(v) => v,
+                        None => break,
+                    },
+                    None => match step_iter_with(i, &iter, &next)? {
+                        Some(v) => v,
+                        None => break,
+                    },
                 };
                 let step = if is_set {
-                    i.call(add_fn.clone(), mv.clone(), &[item])
+                    match adder {
+                        Some(f) => f(i, mv.clone(), std::slice::from_ref(&item))
+                            .map_err(crate::interpreter::Abrupt::Throw),
+                        None => i.call(add_fn.clone(), mv.clone(), &[item]),
+                    }
                 } else if !matches!(item, Value::Obj(_)) {
                     Err(crate::interpreter::Abrupt::Throw(i.make_error(
                         "TypeError",
                         "iterator value is not an entry object",
                     )))
                 } else {
-                    i.get_member(&item, "0")
-                        .and_then(|k| i.get_member(&item, "1").map(|v| (k, v)))
-                        .and_then(|(k, v)| i.call(add_fn.clone(), mv.clone(), &[k, v]))
+                    let entry = match &item {
+                        Value::Obj(o) => super::array_fast::get_elem(i, o, &item, 0)
+                            .and_then(|k| {
+                                super::array_fast::get_elem(i, o, &item, 1).map(|v| (k, v))
+                            })
+                            .map_err(crate::interpreter::Abrupt::Throw),
+                        _ => unreachable!("entry objects are checked above"),
+                    };
+                    entry.and_then(|(k, v)| match adder {
+                        Some(f) => f(i, mv.clone(), &[k, v]).map_err(crate::interpreter::Abrupt::Throw),
+                        None => i.call(add_fn.clone(), mv.clone(), &[k, v]),
+                    })
                 };
                 if let Err(e) = step {
                     i.iterator_close(&iter);

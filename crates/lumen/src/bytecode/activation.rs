@@ -80,9 +80,10 @@ impl ActivationLayout {
                 };
                 *scope.vars.layout_binding_mut(&self.bindings, slot).unwrap() = binding;
             }
+            // A derived constructor's `this` starts in TDZ; `super(…)` initializes it.
             if let Some(slot) = self.this_slot {
                 *scope.vars.layout_binding_mut(&self.bindings, slot).unwrap() =
-                    Binding::data(this.clone(), false, true);
+                    Binding::data(this.clone(), false, !chunk.derived);
             }
         }
         // Hoisted closures capture the completed activation and overwrite parameter/var

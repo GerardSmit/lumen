@@ -26,13 +26,19 @@ use lumen_host::{ops, Ctx, Extension, SpawnHandle, Value};
 
 mod bunhash;
 mod child;
+mod codec;
+#[cfg(windows)]
+mod win_spawn;
 mod crypto;
 mod dns;
 mod dylib;
 mod ffi;
+mod hash;
 #[path = "../../lumen-runtime/src/jsx.rs"]
 mod jsx;
 mod napi;
+mod fsb;
+mod native;
 mod net;
 mod password;
 mod sqlite;
@@ -55,6 +61,8 @@ pub fn extension() -> Extension {
                 "__node",
                 ops![
                     "realmCwd" (0) => op_realm_cwd,
+                    "native" (0) => native::op_native,
+                    "fsBinding" (0) => fsb::op_fs_binding,
                     "isFile" (1) => op_is_file,
                     "isDir" (1) => op_is_dir,
                     "readText" (1) => op_read_text,
@@ -62,6 +70,8 @@ pub fn extension() -> Extension {
                     "realpath" (1) => op_realpath,
                     "loadNativeAddon" (1) => napi::op_load_addon,
                     "isProxy" (1) => op_is_proxy,
+                    "promiseState" (1) => op_promise_state,
+                    "proxyParts" (1) => op_proxy_parts,
                     "collectGarbage" (0) => op_collect_garbage,
                     "asyncContextGet" (0) => op_async_context_get,
                     "asyncContextSet" (1) => op_async_context_set,
@@ -201,6 +211,25 @@ fn op_is_proxy(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
     ))
 }
 
+/// `(promise)` — `[status, value]` (0 pending, 1 fulfilled, 2 rejected) for util.inspect, or
+/// `undefined` for a non-promise.
+fn op_promise_state(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(match ctx.promise_state_for_host(&v) {
+        Some((status, value)) => ctx.make_array(vec![Value::Num(status as f64), value]),
+        None => Value::Undefined,
+    })
+}
+
+/// `(proxy)` — `[target, handler]` for util.inspect's `showProxy`, or `undefined`.
+fn op_proxy_parts(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(match ctx.proxy_parts_for_host(&v) {
+        Some((target, handler)) => ctx.make_array(vec![target, handler]),
+        None => Value::Undefined,
+    })
+}
+
 /// `()` — the current async context value (see `Interp::async_context`).
 fn op_async_context_get(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(ctx.async_context())
@@ -243,7 +272,7 @@ fn op_is_dir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 fn op_read_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
     match std::fs::read_to_string(&p) {
-        Ok(s) => Ok(Value::from_string(s)),
+        Ok(s) => Ok(Value::from_string(crate::codec::canonical(s))),
         Err(e) => Err(ctx.make_error("Error", format!("cannot read '{p}': {e}"))),
     }
 }
@@ -742,7 +771,7 @@ fn op_lutimes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
 /// the platform's `struct statvfs`, so the call can never write out of bounds.
 #[cfg(target_os = "macos")]
 #[repr(C)]
-struct Statvfs {
+pub(crate) struct Statvfs {
     f_bsize: u64,
     f_frsize: u64,
     f_blocks: u32,
@@ -758,7 +787,7 @@ struct Statvfs {
 }
 #[cfg(target_os = "linux")]
 #[repr(C)]
-struct Statvfs {
+pub(crate) struct Statvfs {
     f_bsize: u64,
     f_frsize: u64,
     f_blocks: u64,
@@ -774,7 +803,7 @@ struct Statvfs {
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 extern "C" {
-    fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> i32;
+    pub(crate) fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> i32;
 }
 
 fn op_statfs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {

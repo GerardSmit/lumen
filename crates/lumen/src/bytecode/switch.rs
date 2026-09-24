@@ -35,6 +35,7 @@ impl Compiler {
         let jdefault = self.emit(Op::Jump(0));
         self.loops.push(LoopCtx {
             labels: std::mem::take(&mut self.pending_labels),
+            entry_try_depth: self.try_depth,
             is_switch: true,
             ..LoopCtx::default()
         });
@@ -87,7 +88,15 @@ mod tests {
         let tdz = ops.iter().position(|op| matches!(op, Op::Tdz(_))).unwrap();
         let test = ops
             .iter()
-            .position(|op| matches!(op, Op::StrictEq))
+            .position(|op| {
+                matches!(
+                    op,
+                    Op::StrictEq
+                        | Op::JumpIfNotCmp(crate::bytecode::CmpKind::StrictEq, _)
+                        | Op::JumpIfNotCmpLK(crate::bytecode::CmpKind::StrictEq, ..)
+                        | Op::JumpIfNotCmpLL(crate::bytecode::CmpKind::StrictEq, ..)
+                )
+            })
             .unwrap();
         assert!(tdz < test);
     }

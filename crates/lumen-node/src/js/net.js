@@ -188,6 +188,9 @@ function pumpSocket(socket) {
 }
 
 class Socket extends Duplex {
+  // Data is pushed as it arrives from the native side; there is nothing to pull.
+  _read() {}
+
   constructor(options = {}) {
     if (options === null || typeof options !== "object") options = {};
     if (options.fd !== undefined) fdNotSupported("new Socket({ fd })");
@@ -314,6 +317,13 @@ class Socket extends Duplex {
     if (this._id !== null) __net.endWritable(this._id);
     cb();
     this._maybeClose();
+  }
+
+  // 'finish' (the write side flushed and _final done) arrives a tick after _final: re-check then.
+  emit(event, ...args) {
+    const r = super.emit(event, ...args);
+    if (event === "finish") this._maybeClose();
+    return r;
   }
 
   // Emit 'close' once both directions are done (Node: after 'end' + 'finish', or on destroy).

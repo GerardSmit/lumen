@@ -162,9 +162,14 @@ impl CallbackQueue {
     }
 }
 
-struct Task {
-    id: TaskId,
-    work: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+enum Task {
+    /// Work whose result goes back to the loop as a [`TaskCompletion`] tagged `id`.
+    Tracked {
+        id: TaskId,
+        work: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+    },
+    /// Work that reports back by itself (an async op's job holds a `Completer`).
+    Detached(Box<dyn FnOnce() + Send>),
 }
 
 /// A fixed pool of std worker threads running blocking work (`std::fs`, blocking
@@ -192,12 +197,15 @@ impl ThreadPool {
                         Ok(t) => t,
                         Err(_) => return, // pool dropped: no more work
                     };
-                    let result = (task.work)();
-                    // The loop shutting down first is fine; the result just has nowhere to go.
-                    let _ = completions.send(TaskCompletion {
-                        task: task.id,
-                        result,
-                    });
+                    match task {
+                        Task::Tracked { id, work } => {
+                            let result = work();
+                            // The loop shutting down first is fine; the result just has nowhere
+                            // to go.
+                            let _ = completions.send(TaskCompletion { task: id, result });
+                        }
+                        Task::Detached(job) => job(),
+                    }
                 })
             })
             .collect();
@@ -217,7 +225,7 @@ impl ThreadPool {
         self.work_tx
             .as_ref()
             .expect("pool shut down")
-            .send(Task {
+            .send(Task::Tracked {
                 id,
                 work: Box::new(work),
             })
@@ -247,10 +255,18 @@ impl SpawnHandle {
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
         self.work_tx
-            .send(Task {
+            .send(Task::Tracked {
                 id,
                 work: Box::new(work),
             })
+            .expect("worker threads gone");
+    }
+
+    /// Run `job` on a pool thread; it reports back by itself (e.g. through a
+    /// [`lumen::embed::Completer`]), so no completion is sent for it.
+    pub fn spawn_detached(&self, job: Box<dyn FnOnce() + Send>) {
+        self.work_tx
+            .send(Task::Detached(job))
             .expect("worker threads gone");
     }
 }
@@ -282,6 +298,48 @@ impl CompletionSender {
             let _ = tx.send(TaskCompletion { task: id, result });
         });
     }
+    /// Deliver a completion from any thread (an I/O callback, a readiness thread).
+    pub fn send(&self, id: TaskId, result: Box<dyn Any + Send>) {
+        let _ = self.tx.send(TaskCompletion { task: id, result });
+    }
+}
+
+/// The event loop's [`AsyncHost`](lumen::embed::AsyncHost): what `#[op(async)]`,
+/// [`Ctx::spawn_blocking`] and [`Ctx::completer`] run on inside a lumen runtime. A pending
+/// promise is a [`TaskRegistry`] entry (so it keeps the loop alive) whose resolve/reject pair
+/// the loop calls when the completion arrives; the completion's payload is the
+/// [`Settle`](lumen::embed::Settle) closure, run on the loop thread to build the JS value.
+pub struct LoopAsyncHost {
+    pub spawn: SpawnHandle,
+    pub completions: CompletionSender,
+}
+
+impl lumen::embed::AsyncHost for LoopAsyncHost {
+    fn pending(&self, ctx: &mut Ctx, deferred: lumen::embed::Deferred) -> lumen::embed::Completer {
+        let (resolve, reject) = deferred.resolving_functions(ctx);
+        let id = ctx
+            .host_mut::<TaskRegistry>()
+            .expect("the runtime installs the task registry with its async host")
+            .register(resolve, Some(reject), decode_settle);
+        let completions = self.completions.clone();
+        lumen::embed::Completer::new(move |settle| completions.send(id, Box::new(settle)))
+    }
+
+    fn spawn(&self, job: Box<dyn FnOnce() + Send>, dedicated: bool) {
+        if dedicated {
+            std::thread::spawn(job);
+        } else {
+            self.spawn.spawn_detached(job);
+        }
+    }
+}
+
+/// [`TaskDecoder`] for [`LoopAsyncHost`] completions: run the `Settle` on the loop thread.
+fn decode_settle(ctx: &mut Ctx, payload: Box<dyn Any + Send>) -> Result<Vec<Value>, Value> {
+    let settle = payload
+        .downcast::<lumen::embed::Settle>()
+        .expect("async completion carries a Settle");
+    settle(ctx).map(|v| vec![v])
 }
 
 /// Turns a completed task's `Send` payload back into JS callback arguments, on the loop

@@ -5,6 +5,19 @@ use std::rc::Rc;
 
 impl Compiler {
     pub(super) fn object_literal(&mut self, props: &[PropDef]) -> CResult {
+        // The shared-template path covers plain data literals with static keys; everything
+        // else (methods, accessors, computed keys, spread, `__proto__`) builds incrementally.
+        let template_ok = props.len() <= u16::MAX as usize
+            && props.iter().all(|prop| match prop {
+                PropDef::KeyValue { key, .. } => static_key(key).is_some_and(|name| {
+                    !name.starts_with('#')
+                        && !(name == "__proto__" && !matches!(key, PropKey::Computed(_)))
+                }),
+                _ => false,
+            });
+        if !template_ok {
+            return self.object_literal_general(props);
+        }
         let mut keys = Vec::with_capacity(props.len());
         let count = u16::try_from(props.len()).map_err(|_| Bail)?;
         for prop in props {

@@ -69,19 +69,35 @@ pub(super) fn install_json(it: &mut Interp) {
             _ => String::new(),
         };
         // SerializeJSONProperty starts from a wrapper holder `{ "": value }`.
-        let wrapper = i.new_object();
-        set_data(&wrapper, "", value);
-        let mut seen = Vec::new();
-        match json_str(i, &Value::Obj(wrapper), "", &opts, &gap, "", &mut seen)? {
-            Some(s) => Ok(Value::from_string(s)),
-            None => Ok(Value::Undefined),
+        // The wrapper is only observable by a replacer function (as its `this`).
+        let holder = if opts.func.is_some() {
+            let wrapper = i.new_object();
+            set_data(&wrapper, "", value.clone());
+            Value::Obj(wrapper)
+        } else {
+            Value::Undefined
+        };
+        let mut ser = JsonSer {
+            opts: &opts,
+            gap: &gap,
+            indent: String::new(),
+            stack: Vec::new(),
+            out: String::new(),
+        };
+        if ser.property(i, &holder, JsonKey::Str(""), value)? {
+            Ok(Value::from_string(ser.out))
+        } else {
+            Ok(Value::Undefined)
         }
     });
     it.def_method(&j, "parse", 2, |i, _t, args| {
         let text = ab(i.to_string(&arg(args, 0)))?;
+        let reviver = arg(args, 1);
+        if !reviver.is_callable() {
+            return JsonBytes::new(&text).document(i);
+        }
         let chars: Vec<char> = text.chars().collect();
         let mut pos = 0;
-        let reviver = arg(args, 1);
         // A callable reviver walks the result via InternalizeJSONProperty from a `{ "": v }` root,
         // recording primitive source spans for its `context` argument.
         if reviver.is_callable() {
@@ -137,8 +153,48 @@ pub(super) fn install_json(it: &mut Interp) {
     set_builtin(&it.global, "JSON", Value::Obj(j));
 }
 
-fn json_quote(s: &str) -> String {
-    let mut out = String::from("\"");
+/// Append the JSON quoting of `s` (QuoteJSONString) to `out`.
+fn json_quote_into(out: &mut String, s: &str) {
+    out.push('"');
+    let bytes = s.as_bytes();
+    // Plain-ASCII runs need no escaping and are copied as slices.
+    let mut run = 0usize;
+    let mut k = 0usize;
+    while k < bytes.len() {
+        let b = bytes[k];
+        if b >= 0x20 && b != b'"' && b != b'\\' && b < 0x80 {
+            k += 1;
+            continue;
+        }
+        out.push_str(&s[run..k]);
+        if b >= 0x80 {
+            // Non-ASCII tail: the character-level loop (smuggled surrogates).
+            json_quote_chars(out, &s[k..]);
+            out.push('"');
+            return;
+        }
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            c => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c);
+            }
+        }
+        k += 1;
+        run = k;
+    }
+    out.push_str(&s[run..]);
+    out.push('"');
+}
+
+fn json_quote_chars(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
     let mut chars = s.chars().peekable();
     while let Some(mut c) = chars.next() {
         // A smuggled pair round-trips as its real character. If that character itself falls in
@@ -161,22 +217,282 @@ fn json_quote(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{0008}' => out.push_str("\\b"),
             '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => match crate::jstr::smuggled(c) {
                 // Well-formed JSON.stringify: a lone surrogate is written as its \u escape.
-                Some(u) => out.push_str(&format!("\\u{u:04x}")),
+                Some(u) => {
+                    let _ = write!(out, "\\u{u:04x}");
+                }
                 None => out.push(c),
             },
         }
     }
-    out.push('"');
-    out
 }
 
 /// JSON.stringify options: an optional function replacer and/or an array PropertyList of keys.
 struct JsonOpts {
     func: Option<Value>,
     keys: Option<Vec<String>>,
+}
+
+/// SerializeJSONProperty state: the options, the output being built, the current indentation
+/// and the stack of objects being serialized (cycle detection).
+struct JsonSer<'a> {
+    opts: &'a JsonOpts,
+    gap: &'a str,
+    indent: String,
+    stack: Vec<usize>,
+    out: String,
+}
+
+/// A property key as SerializeJSONProperty sees it; an array index is only spelled out as a
+/// string when user code (toJSON / a replacer function) receives it.
+#[derive(Clone, Copy)]
+enum JsonKey<'k> {
+    Str(&'k str),
+    Index(usize),
+}
+
+impl JsonKey<'_> {
+    fn to_value(self) -> Value {
+        match self {
+            JsonKey::Str(s) => Value::from_string(s.to_string()),
+            JsonKey::Index(n) => Value::from_string(n.to_string()),
+        }
+    }
+}
+
+/// Get(value, "toJSON") with the ordinary lookup done in place along a chain of plain objects
+/// (any exotic, proxy or accessor on the way takes the generic [[Get]]).
+fn json_get_tojson(i: &mut Interp, value: &Value) -> Result<Value, Value> {
+    if let Value::Obj(o) = value {
+        let mut cur = o.clone();
+        loop {
+            let next = {
+                let b = cur.borrow();
+                if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None | Exotic::Array) {
+                    break;
+                }
+                match b.props.get("toJSON") {
+                    Some(p) if p.accessor() => break,
+                    Some(p) => return Ok(p.value()),
+                    None => b.proto.clone(),
+                }
+            };
+            match next {
+                Some(p) => cur = p,
+                None => return Ok(Value::Undefined),
+            }
+        }
+    }
+    ab(i.get_member(value, "toJSON"))
+}
+
+/// Get(O, key) for an object being serialized: an own plain data property is read in place.
+fn json_get_prop(i: &mut Interp, o: &Gc, ov: &Value, key: &str) -> Result<Value, Value> {
+    {
+        let b = o.borrow();
+        if b.ic_plain.get() && matches!(b.exotic, Exotic::None | Exotic::Array) {
+            if let Some(p) = b.props.get(key) {
+                if !p.accessor() {
+                    return Ok(p.value());
+                }
+            }
+        }
+    }
+    ab(i.get_member(ov, key))
+}
+
+impl JsonSer<'_> {
+    fn newline(&mut self) {
+        if !self.gap.is_empty() {
+            self.out.push('\n');
+            self.out.push_str(&self.indent);
+        }
+    }
+
+    /// SerializeJSONProperty for `value` (already read from `holder[key]`). Writes the text and
+    /// returns true, or writes nothing and returns false for `undefined`.
+    fn property(
+        &mut self,
+        i: &mut Interp,
+        holder: &Value,
+        key: JsonKey,
+        mut value: Value,
+    ) -> Result<bool, Value> {
+        if matches!(value, Value::Obj(_) | Value::BigInt(_)) {
+            let tojson = json_get_tojson(i, &value)?;
+            if tojson.is_callable() {
+                value = ab(i.call(tojson, value.clone(), &[key.to_value()]))?;
+            }
+        }
+        if let Some(func) = &self.opts.func {
+            value = ab(i.call(func.clone(), holder.clone(), &[key.to_value(), value]))?;
+        }
+        if let Value::Obj(o) = &value {
+            // A JSON.rawJSON object serializes as its stored raw text, verbatim.
+            let (exotic, wrapped_bool, raw) = {
+                let b = o.borrow();
+                let raw = if matches!(b.exotic, Exotic::None) {
+                    match b.props.get("\u{0}raw_json").map(|p| p.value()) {
+                        Some(Value::Str(raw)) => Some(raw),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                (b.exotic, b.bool_wrap(), raw)
+            };
+            if let Some(raw) = raw {
+                self.out.push_str(&raw);
+                return Ok(true);
+            }
+            // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
+            // valueOf/toString is observed); booleans read the wrapped datum directly.
+            match exotic {
+                Exotic::NumWrap => value = Value::Num(ab(i.to_number(&value))?),
+                Exotic::StrWrap => value = Value::Str(ab(i.to_string(&value))?),
+                Exotic::BoolWrap => value = Value::Bool(wrapped_bool.unwrap_or(false)),
+                Exotic::BigIntWrap => {
+                    return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
+                }
+                _ => {}
+            }
+        }
+        match value {
+            Value::Undefined | Value::Empty | Value::Sym(_) => Ok(false),
+            Value::Null => {
+                self.out.push_str("null");
+                Ok(true)
+            }
+            Value::Bool(b) => {
+                self.out.push_str(if b { "true" } else { "false" });
+                Ok(true)
+            }
+            Value::Num(n) => {
+                if !n.is_finite() {
+                    self.out.push_str("null");
+                } else if !num_fmt::fast_num_to_str(n, &mut self.out) {
+                    self.out.push_str(&i.num_to_str(n));
+                }
+                Ok(true)
+            }
+            Value::BigInt(_) => {
+                Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"))
+            }
+            Value::Str(s) => {
+                json_quote_into(&mut self.out, &s);
+                Ok(true)
+            }
+            Value::Obj(ref o) => {
+                if !matches!(o.borrow().call, Callable::None) {
+                    return Ok(false); // functions are omitted
+                }
+                let ptr = Gc::as_ptr(o) as usize;
+                if self.stack.contains(&ptr) {
+                    return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
+                }
+                self.stack.push(ptr);
+                let outer_len = self.indent.len();
+                self.indent.push_str(self.gap);
+                // IsArray sees through proxies; key enumeration / length use proxy-aware
+                // operations.
+                let is_array = json_is_array(i, &value)?;
+                let is_proxy = proxy_pair(i, &value).is_some();
+                if is_array {
+                    let len = if is_proxy {
+                        ab(i.to_length(o))?
+                    } else {
+                        i.array_length(o)
+                    };
+                    self.out.push('[');
+                    for k in 0..len {
+                        if k > 0 {
+                            self.out.push(',');
+                        }
+                        self.newline();
+                        let v = array_fast::get_elem(i, o, &value, k)?;
+                        if !self.property(i, &value, JsonKey::Index(k), v)? {
+                            self.out.push_str("null");
+                        }
+                    }
+                    self.indent.truncate(outer_len);
+                    if len > 0 {
+                        self.newline();
+                    }
+                    self.out.push(']');
+                } else {
+                    // An array replacer restricts the keys (in its order); else all enumerable
+                    // own string keys, snapshotted before any value is read.
+                    let owned: Vec<Rc<str>>;
+                    let listed: Vec<Rc<str>>;
+                    let keys: &[Rc<str>] = match &self.opts.keys {
+                        Some(list) => {
+                            listed = list.iter().map(|k| Rc::from(k.as_str())).collect();
+                            &listed
+                        }
+                        None if is_proxy => {
+                            owned = proxy_enum_string_keys(i, &value)?
+                                .iter()
+                                .filter_map(|k| match k {
+                                    Value::Str(s) => Some(Rc::from(&**s)),
+                                    _ => None,
+                                })
+                                .collect();
+                            &owned
+                        }
+                        None => {
+                            owned = match ta_info(i, o) {
+                                // A TypedArray's enumerable own keys: its indices, then string
+                                // expandos.
+                                Some(info) => {
+                                    let n = i.ta_len(&info).unwrap_or(0);
+                                    let mut keys: Vec<Rc<str>> =
+                                        (0..n).map(|k| Rc::from(k.to_string())).collect();
+                                    keys.extend(ordered_enum_keys(o).into_iter().filter(|k| {
+                                        k.parse::<usize>().is_err()
+                                            && !TA_META_KEYS.contains(&&**k)
+                                    }));
+                                    keys
+                                }
+                                None => ordered_enum_keys(o),
+                            };
+                            &owned
+                        }
+                    };
+                    self.out.push('{');
+                    let mut any = false;
+                    for k in keys {
+                        let v = json_get_prop(i, o, &value, k)?;
+                        let mark = self.out.len();
+                        if any {
+                            self.out.push(',');
+                        }
+                        self.newline();
+                        json_quote_into(&mut self.out, k);
+                        self.out.push(':');
+                        if !self.gap.is_empty() {
+                            self.out.push(' ');
+                        }
+                        if self.property(i, &value, JsonKey::Str(k), v)? {
+                            any = true;
+                        } else {
+                            self.out.truncate(mark);
+                        }
+                    }
+                    self.indent.truncate(outer_len);
+                    if any {
+                        self.newline();
+                    }
+                    self.out.push('}');
+                }
+                self.stack.pop();
+                Ok(true)
+            }
+        }
+    }
 }
 
 /// [[Delete]] for the JSON reviver: trap-aware, discarding the boolean status (per `Perform ?`).
@@ -308,141 +624,319 @@ fn internalize_json_property(
     ))
 }
 
-fn json_str(
-    i: &mut Interp,
-    holder: &Value,
-    key: &str,
-    opts: &JsonOpts,
-    gap: &str,
-    indent: &str,
-    seen: &mut Vec<usize>,
-) -> Result<Option<String>, Value> {
-    // SerializeJSONProperty: fetch the value, then apply toJSON, then the function replacer.
-    let mut value = ab(i.get_member(holder, key))?;
-    if matches!(value, Value::Obj(_) | Value::BigInt(_)) {
-        let tojson = ab(i.get_member(&value, "toJSON"))?;
-        if tojson.is_callable() {
-            value = ab(i.call(
-                tojson,
-                value.clone(),
-                &[Value::from_string(key.to_string())],
-            ))?;
-        }
-    }
-    if let Some(func) = &opts.func {
-        value = ab(i.call(
-            func.clone(),
-            holder.clone(),
-            &[Value::from_string(key.to_string()), value],
-        ))?;
-    }
-    // A JSON.rawJSON object serializes as its stored raw text, verbatim.
-    if let Value::Obj(o) = &value {
-        if let Some(Value::Str(raw)) = o.borrow().props.get("\u{0}raw_json").map(|p| p.value()) {
-            return Ok(Some(raw.to_string()));
-        }
-    }
-    // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
-    // valueOf/toString is observed); booleans read the wrapped datum directly.
-    if let Value::Obj(o) = &value {
-        let (exotic, wrapped_bool) = {
-            let b = o.borrow();
-            (b.exotic, b.bool_wrap())
-        };
-        match exotic {
-            Exotic::NumWrap => value = Value::Num(ab(i.to_number(&value))?),
-            Exotic::StrWrap => value = Value::Str(ab(i.to_string(&value))?),
-            Exotic::BoolWrap => value = Value::Bool(wrapped_bool.unwrap_or(false)),
-            Exotic::BigIntWrap => {
-                return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
-            }
-            _ => {}
-        }
-    }
-    match &value {
-        Value::Undefined | Value::Empty | Value::Sym(_) => Ok(None),
-        Value::Null => Ok(Some("null".to_string())),
-        Value::Bool(b) => Ok(Some(if *b { "true" } else { "false" }.to_string())),
-        Value::Num(n) => Ok(Some(if n.is_finite() {
-            i.num_to_str(*n)
-        } else {
-            "null".to_string()
-        })),
-        // JSON.stringify of a BigInt throws (matches the spec).
-        Value::BigInt(_) => Err(i.make_error("TypeError", "Do not know how to serialize a BigInt")),
-        Value::Str(s) => Ok(Some(json_quote(s))),
-        Value::Obj(o) => {
-            if !matches!(o.borrow().call, Callable::None) {
-                return Ok(None); // functions are omitted
-            }
-            let ptr = Gc::as_ptr(o) as usize;
-            if seen.contains(&ptr) {
-                return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
-            }
-            seen.push(ptr);
-            let new_indent = format!("{indent}{gap}");
-            // IsArray sees through proxies; key enumeration / length use proxy-aware operations.
-            let is_array = json_is_array(i, &value)?;
-            let is_proxy = proxy_pair(i, &value).is_some();
-            let result = if is_array {
-                let len = if is_proxy {
-                    ab(i.to_length(o))?
-                } else {
-                    i.array_length(o)
-                };
-                let mut items = Vec::with_capacity(len);
-                for k in 0..len {
-                    items.push(
-                        json_str(i, &value, &k.to_string(), opts, gap, &new_indent, seen)?
-                            .unwrap_or_else(|| "null".to_string()),
-                    );
-                }
-                join_json("[", "]", items, gap, &new_indent, indent)
-            } else {
-                // An array replacer restricts the keys (in its order); else all enumerable keys.
-                let keys: Vec<String> = match &opts.keys {
-                    Some(list) => list.clone(),
-                    None if is_proxy => proxy_enum_string_keys(i, &value)?
-                        .iter()
-                        .filter_map(|k| match k {
-                            Value::Str(s) => Some(s.to_string()),
-                            _ => None,
-                        })
-                        .collect(),
-                    None => ordered_enum_keys(o).iter().map(|k| k.to_string()).collect(),
-                };
-                let mut parts = Vec::new();
-                for k in &keys {
-                    if let Some(vs) = json_str(i, &value, k, opts, gap, &new_indent, seen)? {
-                        let colon = if gap.is_empty() { ":" } else { ": " };
-                        parts.push(format!("{}{colon}{vs}", json_quote(k)));
-                    }
-                }
-                join_json("{", "}", parts, gap, &new_indent, indent)
-            };
-            seen.pop();
-            Ok(Some(result))
-        }
-    }
+/// JSON.parse without a reviver, over the source's UTF-8 bytes. Every structural character is
+/// ASCII, so string contents are copied as byte runs; object keys that repeat within one parse
+/// share one key allocation.
+struct JsonBytes<'a> {
+    b: &'a [u8],
+    src: &'a str,
+    pos: usize,
+    keys: crate::fasthash::FastMap<&'a str, Rc<str>>,
 }
 
-fn join_json(
-    open: &str,
-    close: &str,
-    parts: Vec<String>,
-    gap: &str,
-    inner: &str,
-    outer: &str,
-) -> String {
-    if parts.is_empty() {
-        format!("{open}{close}")
-    } else if gap.is_empty() {
-        format!("{open}{}{close}", parts.join(","))
-    } else {
-        format!(
-            "{open}\n{inner}{}\n{outer}{close}",
-            parts.join(&format!(",\n{inner}"))
-        )
+impl<'a> JsonBytes<'a> {
+    fn new(src: &'a str) -> Self {
+        JsonBytes {
+            b: src.as_bytes(),
+            src,
+            pos: 0,
+            keys: Default::default(),
+        }
+    }
+
+    #[inline]
+    fn ws(&mut self) {
+        while let Some(&c) = self.b.get(self.pos) {
+            if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.pos).copied()
+    }
+
+    fn document(&mut self, i: &mut Interp) -> Result<Value, Value> {
+        let v = self.value(i)?;
+        self.ws();
+        if self.pos != self.b.len() {
+            return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
+        }
+        Ok(v)
+    }
+
+    fn value(&mut self, i: &mut Interp) -> Result<Value, Value> {
+        self.ws();
+        let Some(c) = self.peek() else {
+            return Err(i.make_error("SyntaxError", "Unexpected end of JSON input"));
+        };
+        match c {
+            b'{' => {
+                self.pos += 1;
+                let obj = i.new_object();
+                self.ws();
+                if self.peek() == Some(b'}') {
+                    self.pos += 1;
+                    return Ok(Value::Obj(obj));
+                }
+                loop {
+                    self.ws();
+                    if self.peek() != Some(b'"') {
+                        return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
+                    }
+                    let key = self.key(i)?;
+                    self.ws();
+                    if self.peek() != Some(b':') {
+                        return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
+                    }
+                    self.pos += 1;
+                    let v = self.value(i)?;
+                    obj.borrow_mut().props.insert(key, Property::plain(v));
+                    self.ws();
+                    match self.peek() {
+                        Some(b',') => self.pos += 1,
+                        Some(b'}') => {
+                            self.pos += 1;
+                            break;
+                        }
+                        _ => {
+                            return Err(
+                                i.make_error("SyntaxError", "Expected ',' or '}' in JSON object")
+                            );
+                        }
+                    }
+                }
+                Ok(Value::Obj(obj))
+            }
+            b'[' => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                self.ws();
+                if self.peek() == Some(b']') {
+                    self.pos += 1;
+                    return Ok(i.make_array(items));
+                }
+                loop {
+                    items.push(self.value(i)?);
+                    self.ws();
+                    match self.peek() {
+                        Some(b',') => self.pos += 1,
+                        Some(b']') => {
+                            self.pos += 1;
+                            break;
+                        }
+                        _ => {
+                            return Err(
+                                i.make_error("SyntaxError", "Expected ',' or ']' in JSON array")
+                            );
+                        }
+                    }
+                }
+                Ok(i.make_array(items))
+            }
+            b'"' => {
+                let s = self.string(i)?;
+                Ok(match s {
+                    Ok(raw) => Value::str(raw),
+                    Err(owned) => Value::from_string(owned),
+                })
+            }
+            b't' => self.lit(i, b"true", Value::Bool(true)),
+            b'f' => self.lit(i, b"false", Value::Bool(false)),
+            b'n' => self.lit(i, b"null", Value::Null),
+            b'-' | b'0'..=b'9' => self.number(i),
+            _ => Err(i.make_error("SyntaxError", "Unexpected token in JSON")),
+        }
+    }
+
+    fn lit(&mut self, i: &mut Interp, lit: &[u8], v: Value) -> Result<Value, Value> {
+        if self.b[self.pos..].starts_with(lit) {
+            self.pos += lit.len();
+            Ok(v)
+        } else {
+            Err(i.make_error("SyntaxError", "Invalid literal in JSON"))
+        }
+    }
+
+    fn number(&mut self, i: &mut Interp) -> Result<Value, Value> {
+        // Strict JSON number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)? — no leading zeros, a
+        // mandatory integer part, and at least one digit after `.` / exponent.
+        let start = self.pos;
+        let digits = |p: &mut usize, b: &[u8]| {
+            let s = *p;
+            while b.get(*p).is_some_and(|c| c.is_ascii_digit()) {
+                *p += 1;
+            }
+            *p - s
+        };
+        let neg = self.peek() == Some(b'-');
+        if neg {
+            self.pos += 1;
+        }
+        let int_start = self.pos;
+        match self.peek() {
+            Some(b'0') => self.pos += 1,
+            Some(b'1'..=b'9') => {
+                digits(&mut self.pos, self.b);
+            }
+            _ => return Err(i.make_error("SyntaxError", "Invalid number in JSON")),
+        }
+        let int_end = self.pos;
+        let mut simple = true;
+        if self.peek() == Some(b'.') {
+            simple = false;
+            self.pos += 1;
+            if digits(&mut self.pos, self.b) == 0 {
+                return Err(i.make_error("SyntaxError", "Invalid number in JSON"));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            simple = false;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if digits(&mut self.pos, self.b) == 0 {
+                return Err(i.make_error("SyntaxError", "Invalid number in JSON"));
+            }
+        }
+        if simple && int_end - int_start <= 15 {
+            let mut n = 0u64;
+            for &c in &self.b[int_start..int_end] {
+                n = n * 10 + (c - b'0') as u64;
+            }
+            let n = n as f64;
+            return Ok(Value::Num(if neg { -n } else { n }));
+        }
+        self.src[start..self.pos]
+            .parse::<f64>()
+            .map(Value::Num)
+            .map_err(|_| i.make_error("SyntaxError", "Invalid number in JSON"))
+    }
+
+    /// An object key, shared across the parse when it has no escapes.
+    fn key(&mut self, i: &mut Interp) -> Result<Rc<str>, Value> {
+        match self.string(i)? {
+            Ok(raw) => {
+                if let Some(k) = self.keys.get(raw) {
+                    return Ok(k.clone());
+                }
+                let k: Rc<str> = Rc::from(raw);
+                self.keys.insert(raw, k.clone());
+                Ok(k)
+            }
+            Err(owned) => Ok(Rc::from(owned)),
+        }
+    }
+
+    /// A string literal at `pos` (on its opening quote): `Ok(slice)` when it is a verbatim span
+    /// of the source (no escapes), else `Err(decoded)`.
+    fn string(&mut self, i: &mut Interp) -> Result<Result<&'a str, String>, Value> {
+        self.pos += 1; // opening quote
+        let start = self.pos;
+        // Fast scan: the common escape-free literal is a slice of the (canonical) source.
+        loop {
+            match self.b.get(self.pos) {
+                None => return Err(i.make_error("SyntaxError", "Unterminated JSON string")),
+                Some(b'"') => {
+                    let s = &self.src[start..self.pos];
+                    self.pos += 1;
+                    return Ok(Ok(s));
+                }
+                Some(b'\\') => break,
+                Some(&c) if c < 0x20 => {
+                    return Err(
+                        i.make_error("SyntaxError", "Unescaped control character in JSON string")
+                    );
+                }
+                Some(_) => self.pos += 1,
+            }
+        }
+        let mut s = String::from(&self.src[start..self.pos]);
+        let mut surrogate = false;
+        loop {
+            let run = self.pos;
+            loop {
+                match self.b.get(self.pos) {
+                    None => return Err(i.make_error("SyntaxError", "Unterminated JSON string")),
+                    Some(b'"' | b'\\') => break,
+                    Some(&c) if c < 0x20 => {
+                        return Err(i.make_error(
+                            "SyntaxError",
+                            "Unescaped control character in JSON string",
+                        ));
+                    }
+                    Some(_) => self.pos += 1,
+                }
+            }
+            s.push_str(&self.src[run..self.pos]);
+            if self.b[self.pos] == b'"' {
+                self.pos += 1;
+                break;
+            }
+            self.pos += 1; // backslash
+            let Some(e) = self.peek() else {
+                return Err(i.make_error("SyntaxError", "Bad escape in JSON"));
+            };
+            self.pos += 1;
+            match e {
+                b'"' => s.push('"'),
+                b'\\' => s.push('\\'),
+                b'/' => s.push('/'),
+                b'n' => s.push('\n'),
+                b't' => s.push('\t'),
+                b'r' => s.push('\r'),
+                b'b' => s.push('\u{0008}'),
+                b'f' => s.push('\u{000C}'),
+                b'u' => {
+                    let n = self
+                        .hex4(self.pos)
+                        .ok_or_else(|| i.make_error("SyntaxError", "Bad \\u escape in JSON"))?;
+                    self.pos += 4;
+                    if (0xD800..0xDC00).contains(&n)
+                        && self.b.get(self.pos) == Some(&b'\\')
+                        && self.b.get(self.pos + 1) == Some(&b'u')
+                    {
+                        // A high surrogate followed by \uDCxx forms a pair.
+                        if let Some(n2) = self.hex4(self.pos + 2) {
+                            if (0xDC00..0xE000).contains(&n2) {
+                                self.pos += 6;
+                                let c = 0x10000 + ((n - 0xD800) << 10) + (n2 - 0xDC00);
+                                s.push(char::from_u32(c).unwrap());
+                                continue;
+                            }
+                        }
+                    }
+                    if (0xD800..0xE000).contains(&n) {
+                        surrogate = true;
+                        s.push(crate::jstr::smuggle(n as u16));
+                    } else {
+                        s.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
+                    }
+                }
+                _ => return Err(i.make_error("SyntaxError", "Bad escape in JSON")),
+            }
+        }
+        if surrogate {
+            // An escaped lone half next to a (literal or escaped) partner recombines.
+            if let Some(c) = crate::jstr::canonicalize(&s) {
+                s = c;
+            }
+        }
+        Ok(Err(s))
+    }
+
+    fn hex4(&self, at: usize) -> Option<u32> {
+        let h = self.b.get(at..at + 4)?;
+        let mut n = 0u32;
+        for &c in h {
+            n = n * 16 + (c as char).to_digit(16)?;
+        }
+        Some(n)
     }
 }
 

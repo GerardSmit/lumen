@@ -62,6 +62,79 @@ struct Writer {
     /// When collecting (see [`encode_stripped_with_functions`]): every function in the order
     /// it is entered — its *function index*, which the decoder reproduces.
     funcs: Option<Vec<Rc<Function>>>,
+    /// Stripped mode with kept function text (see [`encode_stripped_keep`]): the first pass
+    /// records every function/class source range here ...
+    ranges: Option<Vec<(u32, u32)>>,
+    /// ... and the second pass writes those ranges remapped into the kept text.
+    keep: Option<KeepMap>,
+    /// When collecting: the string-literal specifiers of `import("x")` and `require("x")`.
+    deps: Option<Deps>,
+    /// The unit's source, to tell its ranges from those into another text (see
+    /// `enc_fnsource`), with a per-`Rc` verdict cache. `None`: every range is the unit's.
+    unit_src: Option<(Rc<str>, HashMap<*const u8, bool>)>,
+}
+
+impl Writer {
+    fn is_unit_src(&mut self, src: &Rc<str>) -> bool {
+        let Some((unit, seen)) = &mut self.unit_src else {
+            return true;
+        };
+        *seen
+            .entry(src.as_ptr())
+            .or_insert_with(|| Rc::ptr_eq(unit, src) || **unit == **src)
+    }
+}
+
+/// The string-literal module references found in an encoded body, beyond its static imports:
+/// dynamic `import("x")` (no import attributes) and CommonJS `require("x")` calls.
+#[derive(Default, Debug, Clone)]
+pub struct Deps {
+    pub dynamic_imports: Vec<String>,
+    pub requires: Vec<String>,
+}
+
+/// The kept-text layout: the maximal source intervals (original coordinates) that were kept,
+/// each with its offset in the kept text.
+struct KeepMap {
+    /// (orig_start, orig_end, kept_offset), sorted, disjoint.
+    spans: Vec<(u32, u32, u32)>,
+}
+
+impl KeepMap {
+    /// Build from every recorded range (nested/overlapping ones collapse into their enclosing
+    /// span). `skip` is a range that is not kept (a synthesized wrapper around the whole unit).
+    fn build(src: &str, ranges: &[(u32, u32)], skip: Option<(u32, u32)>) -> (KeepMap, String) {
+        let mut rs: Vec<(u32, u32)> = ranges
+            .iter()
+            .copied()
+            .filter(|r| Some(*r) != skip && r.0 < r.1 && (r.1 as usize) <= src.len())
+            .collect();
+        rs.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::new();
+        for (s, e) in rs {
+            match merged.last_mut() {
+                Some(last) if s < last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        let mut text = String::new();
+        let mut spans = Vec::with_capacity(merged.len());
+        for (s, e) in merged {
+            let Some(slice) = src.get(s as usize..e as usize) else {
+                continue;
+            };
+            spans.push((s, e, text.len() as u32));
+            text.push_str(slice);
+        }
+        (KeepMap { spans }, text)
+    }
+
+    /// `start..end` in kept-text coordinates (`None`: not inside one kept span).
+    fn map(&self, start: u32, end: u32) -> Option<(u32, u32)> {
+        let i = self.spans.partition_point(|s| s.0 <= start).checked_sub(1)?;
+        let (s, e, off) = self.spans[i];
+        (end <= e).then(|| (off + (start - s), off + (end - s)))
+    }
 }
 
 impl Writer {
@@ -199,6 +272,10 @@ pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
         scopes: HashMap::new(),
         strip: false,
         funcs: None,
+        ranges: None,
+        keep: None,
+        deps: None,
+        unit_src: Some((Rc::from(src), HashMap::new())),
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -222,6 +299,7 @@ pub fn encode_stripped(body: &[Stmt]) -> Vec<u8> {
 /// order the encoder enters them (preorder — a function before the functions in its params and
 /// body). [`decode_with_functions`] numbers the decoded tree identically, which is how the
 /// ahead-of-time bytecode section ([`crate::precompiled`]) keys its chunks.
+#[allow(dead_code)] // tests; blobs use `encode_stripped_keep`
 pub(crate) fn encode_stripped_with_functions(body: &[Stmt]) -> (Vec<u8>, Vec<Rc<Function>>) {
     let (buf, funcs) = encode_stripped_inner(body, true);
     (buf, funcs.unwrap_or_default())
@@ -233,6 +311,10 @@ fn encode_stripped_inner(body: &[Stmt], collect: bool) -> (Vec<u8>, Option<Vec<R
         scopes: HashMap::new(),
         strip: true,
         funcs: collect.then(Vec::new),
+        ranges: None,
+        keep: None,
+        deps: None,
+        unit_src: None,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -240,6 +322,70 @@ fn encode_stripped_inner(body: &[Stmt], collect: bool) -> (Vec<u8>, Option<Vec<R
     w.u64(source_hash(""));
     enc_stmts(&mut w, body);
     (w.buf, w.funcs)
+}
+
+/// What [`encode_stripped_keep`] produces.
+pub(crate) struct StrippedUnit {
+    pub ast: Vec<u8>,
+    pub funcs: Vec<Rc<Function>>,
+    /// The kept function text the AST's source ranges point into (empty without `keep`). The
+    /// AST decodes against exactly this string: `decode_with_functions(&ast, &kept)`.
+    pub kept: String,
+    pub deps: Deps,
+}
+
+/// [`encode_stripped_with_functions`], optionally keeping the exact source text of every
+/// function and class (`keep = Some((src, skip))`, `src` the text `body` was parsed from): the
+/// maximal function/class slices of `src` are concatenated into [`StrippedUnit::kept`] — text
+/// between top-level functions (comments, module-level statements) is not — and each
+/// function's `toString` range is remapped into it. `skip` excludes one range (a synthesized
+/// wrapper spanning the whole unit, whose own text must not be kept). Also collects the unit's
+/// literal `import("x")` / `require("x")` specifiers.
+pub(crate) fn encode_stripped_keep(
+    body: &[Stmt],
+    keep: Option<(&str, Option<(u32, u32)>)>,
+) -> StrippedUnit {
+    let mut kept = String::new();
+    let mut map = None;
+    let unit_src: Option<Rc<str>> = keep.map(|(src, _)| Rc::from(src));
+    if let Some((src, skip)) = keep {
+        // Pass 1: record every range (the buffer is thrown away).
+        let mut w = Writer {
+            buf: Vec::new(),
+            scopes: HashMap::new(),
+            strip: true,
+            funcs: None,
+            ranges: Some(Vec::new()),
+            keep: None,
+            deps: None,
+            unit_src: unit_src.clone().map(|s| (s, HashMap::new())),
+        };
+        enc_stmts(&mut w, body);
+        let (m, text) = KeepMap::build(src, w.ranges.as_deref().unwrap_or(&[]), skip);
+        map = Some(m);
+        kept = text;
+    }
+    let mut w = Writer {
+        buf: Vec::with_capacity(body.len() * 32),
+        scopes: HashMap::new(),
+        strip: true,
+        funcs: Some(Vec::new()),
+        ranges: None,
+        keep: map,
+        deps: Some(Deps::default()),
+        unit_src: unit_src.map(|s| (s, HashMap::new())),
+    };
+    w.uv(MAGIC as u64);
+    w.uv(VERSION as u64);
+    w.uv(kept.len() as u64);
+    w.u64(source_hash(&kept));
+    enc_stmts(&mut w, body);
+    StrippedUnit {
+        ast: w.buf,
+        funcs: w.funcs.unwrap_or_default(),
+        kept,
+        deps: w.deps.unwrap_or_default(),
+    }
 }
 
 /// Decode a snapshot blob back into a script body. `src` is the source it was encoded from; one
@@ -813,6 +959,13 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             args,
             optional,
         } => {
+            if let (Some(deps), Expr::Ident(name), [ArrayElem::Item(Expr::Str(spec))]) =
+                (&mut w.deps, &**callee, args.as_slice())
+            {
+                if name == "require" && !deps.requires.iter().any(|d| **d == **spec) {
+                    deps.requires.push(spec.to_string());
+                }
+            }
             w.u8(24);
             enc_expr(w, callee);
             enc_array_elems(w, args);
@@ -873,6 +1026,13 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             phase,
             options,
         } => {
+            if let (Some(deps), Expr::Str(s), ImportPhase::Evaluation, None) =
+                (&mut w.deps, &**spec, phase, options)
+            {
+                if !deps.dynamic_imports.iter().any(|d| **d == **s) {
+                    deps.dynamic_imports.push(s.to_string());
+                }
+            }
             w.u8(32);
             enc_expr(w, spec);
             w.u8(match phase {
@@ -1226,11 +1386,45 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
 }
 
 fn enc_fnsource(w: &mut Writer, s: &FnSource) {
+    // A function parsed out of a template substitution carries a range into the substitution's
+    // own text (the parser re-lexes `${...}` separately), not into the unit's source: its range
+    // means nothing against the unit source, so its text is written out instead.
+    let foreign = match s {
+        FnSource::Range { src, .. } => !w.is_unit_src(src),
+        _ => false,
+    };
     if w.strip {
+        if let FnSource::Range { start, end, .. } = s {
+            if !foreign {
+                if let Some(ranges) = &mut w.ranges {
+                    ranges.push((*start, *end));
+                }
+                if let Some((start, end)) = w.keep.as_ref().and_then(|k| k.map(*start, *end)) {
+                    w.u8(2);
+                    w.uv(start as u64);
+                    w.uv(end as u64);
+                    return;
+                }
+            }
+        }
+        if w.keep.is_some() && (foreign || matches!(s, FnSource::Text(_))) {
+            if let Some(t) = s.as_str() {
+                w.u8(1);
+                w.str(t);
+                return;
+            }
+        }
         return w.u8(0);
     }
     match s {
         FnSource::None => w.u8(0),
+        FnSource::Range { .. } if foreign => match s.as_str() {
+            Some(t) => {
+                w.u8(1);
+                w.str(t);
+            }
+            None => w.u8(0),
+        },
         FnSource::Text(t) => {
             w.u8(1);
             w.str(t);

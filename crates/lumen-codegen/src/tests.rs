@@ -182,3 +182,88 @@ fn eval_follows_wasm_rules() {
     assert_eq!(convert(ConvOp::ToUint, Type::F32, Type::I32, (-0.9f32).to_bits() as u64), Some(0));
     assert_eq!(unary(UnaryOp::Nearest, Type::F64, 2.5f64.to_bits()), 2.0f64.to_bits());
 }
+
+/// `s = x; for (i = 0.0; i < n; i += 1.0) { s = s * 2 + i; if s > 1000 { return -s } }; return s`
+/// with `n` a constant: F64 induction, a side exit in the body, a value live after the loop.
+fn const_trip_loop(n: f64) -> Function {
+    let mut f = Function::new("u", Signature::new(vec![Type::F64], vec![Type::F64]));
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let x = b.block_params(entry)[0];
+    let (i, s) = (b.declare_var(Type::F64), b.declare_var(Type::F64));
+    let zero = b.f64const(0.0);
+    b.def_var(i, zero);
+    b.def_var(s, x);
+    let (header, body, side, latch, exit) =
+        (b.create_block(), b.create_block(), b.create_block(), b.create_block(), b.create_block());
+    b.jump(header, &[]);
+    b.switch_to_block(header);
+    let iv = b.use_var(i);
+    let lim = b.f64const(n);
+    let c = b.fcmp(FloatCC::Lt, iv, lim);
+    b.brif(c, body, &[], exit, &[]);
+    b.seal_block(body);
+    b.seal_block(exit);
+    b.switch_to_block(body);
+    let sv = b.use_var(s);
+    let two = b.f64const(2.0);
+    let t = b.binary(BinaryOp::Fmul, sv, two);
+    let iv = b.use_var(i);
+    let t = b.binary(BinaryOp::Fadd, t, iv);
+    b.def_var(s, t);
+    let big = b.f64const(1000.0);
+    let over = b.fcmp(FloatCC::Gt, t, big);
+    b.brif(over, side, &[], latch, &[]);
+    b.seal_block(side);
+    b.seal_block(latch);
+    b.switch_to_block(side);
+    let neg = b.unary(UnaryOp::Fneg, t);
+    b.ret(&[neg]);
+    b.switch_to_block(latch);
+    let one = b.f64const(1.0);
+    let iv = b.use_var(i);
+    let ni = b.binary(BinaryOp::Fadd, iv, one);
+    b.def_var(i, ni);
+    b.jump(header, &[]);
+    b.seal_block(header);
+    b.switch_to_block(exit);
+    let r = b.use_var(s);
+    b.ret(&[r]);
+    b.finish();
+    f
+}
+
+fn has_back_edge(f: &Function) -> bool {
+    let cfg = crate::cfg::Cfg::new(f);
+    cfg.rpo
+        .iter()
+        .any(|&h| cfg.preds[h.index()].iter().any(|&p| cfg.dominates(h, p)))
+}
+
+#[test]
+fn small_constant_loops_unroll() {
+    let reference = |x: f64, n: f64| {
+        let mut s = x;
+        let mut i = 0.0;
+        while i < n {
+            s = s * 2.0 + i;
+            if s > 1000.0 {
+                return -s;
+            }
+            i += 1.0;
+        }
+        s
+    };
+    for n in [1.0, 3.0, 4.0, 8.0, 9.0, 0.5] {
+        let mut f = const_trip_loop(n);
+        opt::optimize(&mut f);
+        verify::verify(&f).unwrap();
+        // Up to 8 trips unroll completely; 9 stays a loop.
+        assert_eq!(has_back_edge(&f), n > 8.0, "n = {n}\n{f}");
+        let mut e = env();
+        for x in [0.0f64, 1.5, 100.0, 600.0, -3.0] {
+            let got = run(&f, &mut e, &[x.to_bits()]).unwrap();
+            assert_eq!(f64::from_bits(got[0]), reference(x, n), "n = {n}, x = {x}\n{f}");
+        }
+    }
+}

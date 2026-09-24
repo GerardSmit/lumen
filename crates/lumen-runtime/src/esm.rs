@@ -15,6 +15,10 @@
 //!   literal file first, then via the package's `exports` map (`"./logger"` -> its
 //!   `import`/`default` target).
 //!
+//! - `aot:/…` referrer (a module of a precompiled blob) -> the engine resolves the blob's own
+//!   units and bundled packages first; only what the blob lacks arrives here, and a bare
+//!   package then resolves from the current directory's `node_modules`.
+//!
 //! Deferred (documented, not silently wrong): named imports from a CommonJS *package* (Node
 //! uses source static-analysis we don't), subpath-*pattern* `exports` (`"./*"`), import maps.
 
@@ -48,10 +52,41 @@ fn resolve(
         return Some((format!("node:{bare}"), src.clone()));
     }
 
+    // A module of an ahead-of-time blob (`aot:/…`, see `Runtime::run_precompiled`). The engine
+    // already resolved everything the blob holds (its own units, the packages it bundled)
+    // before asking here, so what is left is not in the blob: a relative path has nothing on
+    // disk to be relative to, and a bare package is looked up from the current directory's
+    // `node_modules`, as a program started there would.
+    if referrer.starts_with("aot:") {
+        if attr_type.is_some()
+            || specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier.starts_with("aot:")
+        {
+            return None;
+        }
+        if Path::new(specifier).is_absolute() || specifier.starts_with("file://") {
+            return resolve(specifier, "", builtins, attr_type);
+        }
+        let cwd = std::env::current_dir().ok()?;
+        let (file, is_esm_pkg) = resolve_node_modules(specifier, &cwd)?;
+        return load_as_module(&file, !is_esm_pkg);
+    }
+
     // A dynamic import's referrer is `import.meta.url`, a `file://` URL — reduce it (and a
     // `file://` specifier) to a plain path for the filesystem resolver.
-    let referrer = referrer.strip_prefix("file://").unwrap_or(referrer);
-    let specifier = specifier.strip_prefix("file://").unwrap_or(specifier);
+    let referrer_path = strip_file_scheme(referrer);
+    let specifier_path = strip_file_scheme(specifier);
+    let referrer: &str = &referrer_path;
+    let specifier: &str = &specifier_path;
+
+    // An absolute filesystem path (`C:\x\y.js` on Windows — which `starts_with('/')` misses and
+    // the bare-package walk would reject — or `/x/y.js`) names the file directly; the referrer
+    // plays no part. `require(esm)` hands its already-resolved filename in this form.
+    if attr_type.is_none() && Path::new(specifier).is_absolute() {
+        let file = resolve_file_or_dir(&normalize(Path::new(specifier)))?;
+        return load_as_module(&file, !file_is_esm(&file));
+    }
 
     // A `with { type: "json" | "text" | "bytes" }` import wants the file's RAW contents — the
     // engine synthesizes the wrapper module itself. No CJS/ESM classification, no JSX transform:
@@ -87,6 +122,47 @@ fn resolve(
     let from = Path::new(referrer).parent()?;
     let (file, is_esm_pkg) = resolve_node_modules(specifier, from)?;
     load_as_module(&file, !is_esm_pkg)
+}
+
+/// Reduce a `file://` URL to a filesystem path: `file:///C:/x` -> `C:/x` on Windows (the drive
+/// letter follows the URL path's leading slash), `file:///x` -> `/x` elsewhere. `%XX` escapes are
+/// decoded (a path with a space arrives as `%20`). Anything else is returned unchanged.
+fn strip_file_scheme(s: &str) -> std::borrow::Cow<'_, str> {
+    let Some(rest) = s.strip_prefix("file://") else {
+        return std::borrow::Cow::Borrowed(s);
+    };
+    // `file://localhost/x` is the same as `file:///x`.
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let rest = if cfg!(windows)
+        && bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        &rest[1..]
+    } else {
+        rest
+    };
+    if !rest.contains('%') {
+        return std::borrow::Cow::Owned(rest.to_string());
+    }
+    let mut out = Vec::with_capacity(rest.len());
+    let b = rest.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Escape `text` as a JavaScript double-quoted string literal (for synthesized module source).
@@ -274,7 +350,15 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
             Some((key, js))
         }
         "cjs" => Some((key.clone(), cjs_wrapper(&key, source_of(file)))),
-        _ if cjs_default => Some((key.clone(), cjs_wrapper(&key, source_of(file)))),
+        _ if cjs_default => {
+            let text = source_of(file);
+            // Node's syntax detection: a `.js` file outside any package "type" that only parses
+            // as a module (it has `import`/`export`) is ESM after all.
+            if ext == "js" && package_type_of(file).is_none() && detect_module_syntax(&text) {
+                return Some((key, text));
+            }
+            Some((key.clone(), cjs_wrapper(&key, text)))
+        }
         _ => {
             let text = std::fs::read_to_string(file).ok()?;
             Some((key, text))
@@ -299,6 +383,36 @@ fn file_is_esm(file: &Path) -> bool {
             false
         }
     }
+}
+
+/// The nearest enclosing package.json's `"type"` field (`None` when absent — or no package).
+fn package_type_of(file: &Path) -> Option<String> {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        let pkg = d.join("package.json");
+        if pkg.is_file() {
+            return std::fs::read_to_string(pkg)
+                .ok()
+                .and_then(|t| json_string_field(&t, "type"));
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Whether `src` is ESM by Node's detection rule: it has module syntax and does not parse as a
+/// CommonJS body. The textual pre-check — a line that starts with an `import`/`export`
+/// declaration or uses `import.meta` — keeps ordinary CommonJS to no extra parse at all; only a
+/// candidate is test-parsed as a script. (A file that is neither is left to the module parser,
+/// which reports its syntax error.)
+fn detect_module_syntax(src: &str) -> bool {
+    let candidate = src.lines().any(|line| {
+        let l = line.trim_start();
+        let after = |kw: &str| l.strip_prefix(kw).and_then(|r| r.chars().next());
+        matches!(after("import"), Some(' ' | '\t' | '{' | '*' | '"' | '\'' | '.'))
+            || matches!(after("export"), Some(' ' | '\t' | '{' | '*'))
+    });
+    candidate && lumen::compile_snapshot(src).is_err()
 }
 
 /// Read a file's source (empty on failure — the wrapper still yields a working default export).

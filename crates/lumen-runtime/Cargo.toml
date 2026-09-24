@@ -11,11 +11,16 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+lumen = { path = "../lumen" }
 lumen-fs = { path = "../lumen-fs" }
 lumen-host = { path = "../lumen-host" }
 lumen-node = { path = "../lumen-node" }
 lumen-timers = { path = "../lumen-timers" }
 lumen-web = { path = "../lumen-web" }
+
+[dev-dependencies]
+# tests/async_ops.rs binds its ops with #[lumen::op].
+lumen = { path = "../lumen", features = ["macros"] }
 
 [lints]
 workspace = true

@@ -34,10 +34,11 @@
 //! - `LStr`: pointer to a header with a `u32` UTF-8 byte length and a `u32` capacity whose top
 //!   bit is the all-ASCII hint (byte length == UTF-16 length only when it is set).
 //!
-//! Typed arrays are not handled inline: their element kind, offset and length live in
-//! `Interp::typed_arrays` and their bytes in `Interp::array_buffers`, both hash maps keyed by
+//! Typed arrays are not handled by these emitters: their element kind, offset and length live
+//! in `Interp::typed_arrays` and their bytes in `Interp::array_buffers`, both hash maps keyed by
 //! object / buffer pointer, so nothing is reachable from the object itself. Typed arrays have
-//! `ic_plain` clear, so every emitter here misses on them.
+//! `ic_plain` clear, so every emitter here misses on them. The translator reaches their bytes
+//! through a per-site view cache instead (`Helper::TaView`; see [`side_table_object`]).
 
 use super::{PTR, PTR_MEM, TAG_OBJ, TAG_STR, VALUE_PAYLOAD};
 use crate::bytecode::{Chunk, PROP_IC_WAYS};
@@ -120,7 +121,7 @@ struct Layout {
 
 /// `(pointer word, length word)` byte offsets inside a `Vec<T>`, measured on a vector whose
 /// pointer, length (1) and capacity (>= 4) are pairwise distinct. `None` if ambiguous.
-fn vec_layout<T>(one: T) -> Option<(usize, usize)> {
+pub(crate) fn vec_layout<T>(one: T) -> Option<(usize, usize)> {
     if std::mem::size_of::<Vec<T>>() != 3 * std::mem::size_of::<usize>() {
         return None;
     }
@@ -369,6 +370,23 @@ fn data_num(fb: &mut FunctionBuilder, l: &Layout, prop: IrValue, miss: Block) ->
 }
 
 // ----- emitters --------------------------------------------------------------------------------
+
+/// Guard `v` holds an object with `ic_plain` clear (a typed array, proxy or module namespace)
+/// and return its `Gc` handle word. No borrow is needed: nothing inside the cell is read.
+pub(crate) fn side_table_object(fb: &mut FunctionBuilder, v: IrValue, miss: Block) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(PTR, 0);
+    };
+    let tag = fb.load(MemKind::I32U8, v, 0);
+    let is_obj = cmp_imm(fb, IntCC::Eq, Type::I32, tag, TAG_OBJ as i64);
+    guard(fb, is_obj, miss);
+    let gc = fb.load(PTR_MEM, v, VALUE_PAYLOAD);
+    let plain = fb.load(MemKind::I32U8, gc, l.ic_plain);
+    let side = cmp_imm(fb, IntCC::Eq, Type::I32, plain, 0);
+    guard(fb, side, miss);
+    gc
+}
 
 /// `v[index]` where the element is a Number: dense `Array` elements and every numeric typed
 /// array kind (converted to F64). `index` is F64; non-integral, negative or out-of-bounds

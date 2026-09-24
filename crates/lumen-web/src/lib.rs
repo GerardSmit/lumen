@@ -65,7 +65,16 @@ pub fn extension() -> Extension {
                 "__encoding",
                 ops!["encode" (1) => op_encode, "decode" (2) => op_decode],
             ),
-            ("__url", ops!["parse" (2) => op_url_parse]),
+            (
+                "__url",
+                ops![
+                    "parse" (2) => op_url_parse,
+                    "update" (3) => op_url_update,
+                    "canParse" (2) => op_url_can_parse,
+                    "domainToASCII" (1) => op_url_domain_to_ascii,
+                    "domainToUnicode" (1) => op_url_domain_to_unicode,
+                ],
+            ),
             ("__http", ops!["request" (6) => op_http_request]),
             (
                 "__http_server",
@@ -218,36 +227,89 @@ fn op_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 
 // ---- url ----
 
-/// `(input, base?)` -> component object. Throws TypeError, as the URL constructor must.
-fn op_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let input = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let base = match args.get(1) {
-        None | Some(Value::Undefined) => None,
-        Some(v) => Some(ctx.coerce_string(v)?.to_string()),
-    };
-    let u = url::parse(&input, base.as_deref())
-        .map_err(|e| ctx.make_error("TypeError", format!("URL: {e}")))?;
-    let obj = Value::Obj(ctx.new_object());
-    let port = u.port.map(|p| p.to_string()).unwrap_or_default();
-    let href = u.href();
-    let origin = u.origin();
-    for (k, v) in [
-        ("scheme", u.scheme),
-        ("username", u.username),
-        ("password", u.password),
-        ("host", u.host),
-        ("port", port),
-        ("path", u.path),
-        ("query", u.query),
-        ("fragment", u.fragment),
-        ("href", href),
-        ("origin", origin),
-    ] {
-        let _ = ctx.set_member(&obj, k, Value::from_string(v));
+fn str_arg(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<Option<String>, Value> {
+    match args.get(i) {
+        None | Some(Value::Undefined) => Ok(None),
+        Some(v) => Ok(Some(ctx.coerce_string(v)?.to_string())),
     }
-    Ok(obj)
+}
+
+/// `[href, protocol_end, username_end, host_start, host_end, port, pathname_start, search_start,
+/// hash_start, scheme_type]` — the shape Node's `URLContext` keeps (ada's url_components).
+fn url_record(ctx: &mut Ctx, u: &url::Url) -> Value {
+    let mut items = vec![Value::from_string(u.href())];
+    items.extend(u.components().iter().map(|&c| Value::Num(c as f64)));
+    ctx.make_array(items)
+}
+
+/// `(input, base?)` -> URL record array, or `null` when either fails to parse (the JS side raises
+/// `ERR_INVALID_URL`).
+fn op_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
+    let base = match str_arg(ctx, args, 1)? {
+        Some(b) => match url::parse_url(&b, None) {
+            Some(u) => Some(u),
+            None => return Ok(Value::Null),
+        },
+        None => None,
+    };
+    Ok(match url::parse_url(&input, base.as_ref()) {
+        Some(u) => url_record(ctx, &u),
+        None => Value::Null,
+    })
+}
+
+/// `(href, action, value)` -> updated record, or `null` when the setter declines (Node's
+/// `bindingUrl.update`; action numbering is internal/url's `updateActions`).
+fn op_url_update(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let href = str_arg(ctx, args, 0)?.unwrap_or_default();
+    let action = match args.get(1) {
+        Some(Value::Num(n)) => *n as i32,
+        _ => -1,
+    };
+    let value = str_arg(ctx, args, 2)?.unwrap_or_default();
+    let Some(mut u) = url::parse_url(&href, None) else {
+        return Ok(Value::Null);
+    };
+    let ok = match action {
+        0 => u.set_protocol(&value),
+        1 => u.set_host(&value),
+        2 => u.set_hostname(&value),
+        3 => u.set_port(&value),
+        4 => u.set_username(&value),
+        5 => u.set_password(&value),
+        6 => u.set_pathname(&value),
+        7 => {
+            u.set_search(&value);
+            true
+        }
+        8 => {
+            u.set_hash(&value);
+            true
+        }
+        9 => u.set_href(&value),
+        _ => false,
+    };
+    Ok(if ok { url_record(ctx, &u) } else { Value::Null })
+}
+
+fn op_url_can_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
+    let ok = match str_arg(ctx, args, 1)? {
+        Some(b) => url::parse_url(&b, None).is_some_and(|base| url::parse_url(&input, Some(&base)).is_some()),
+        None => url::parse_url(&input, None).is_some(),
+    };
+    Ok(Value::Bool(ok))
+}
+
+fn op_url_domain_to_ascii(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
+    Ok(Value::from_string(url::domain_to_ascii(&input)))
+}
+
+fn op_url_domain_to_unicode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
+    Ok(Value::from_string(url::domain_to_unicode(&input)))
 }
 
 // ---- crypto ----

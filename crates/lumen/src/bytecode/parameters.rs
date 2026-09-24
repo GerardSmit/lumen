@@ -51,6 +51,34 @@ fn literal_default(expr: &Expr) -> bool {
     }
 }
 
+/// [`default_expr_safe`] over every expression inside a destructuring parameter pattern
+/// (property defaults and computed keys, nested patterns included).
+pub(super) fn pattern_exprs_safe(
+    p: &crate::ast::Pattern,
+    banned: &std::collections::HashSet<&str>,
+) -> bool {
+    use crate::ast::{ArrayPatElem, Pattern};
+    match p {
+        Pattern::Ident(_) => true,
+        Pattern::Object(o) => o.props.iter().all(|prop| {
+            (match &prop.key {
+                PropKey::Computed(k) => default_expr_safe(k, banned),
+                _ => true,
+            }) && prop.default.as_ref().is_none_or(|d| default_expr_safe(d, banned))
+                && pattern_exprs_safe(&prop.value, banned)
+        }),
+        Pattern::Array(elems) => elems.iter().all(|e| match e {
+            ArrayPatElem::Hole => true,
+            ArrayPatElem::Elem { pattern, default } => {
+                default.as_ref().is_none_or(|d| default_expr_safe(d, banned))
+                    && pattern_exprs_safe(pattern, banned)
+            }
+            ArrayPatElem::Rest(p) => pattern_exprs_safe(p, banned),
+        }),
+        Pattern::Member(_) => false,
+    }
+}
+
 /// Whether a parameter default is in the compiler's lowerable subset: no reference to any
 /// *banned* name (this parameter itself or a later one — the spec's param-scope TDZ would throw
 /// where slots would read a seeded `undefined`), and no nested function/class (whose capture

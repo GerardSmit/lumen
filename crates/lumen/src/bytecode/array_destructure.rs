@@ -33,37 +33,43 @@ pub(crate) fn remember_values(i: &mut Interp, values: &Value) {
     }
 }
 
-/// None is a pure miss: the caller still owns the original input, and must run
-/// the complete existing DestructureArr opcode, including its IteratorClose.
-pub(super) fn try_dense(i: &Interp, input: &Value, count: u16) -> Option<Vec<Value>> {
+/// `false` is a pure miss (nothing was pushed): the caller still owns the original input, and
+/// must run the complete existing DestructureArr opcode, including its IteratorClose. `true`:
+/// exactly `count` values were handed to `push`, in order.
+pub(super) fn try_dense(
+    i: &Interp,
+    input: &Value,
+    count: u16,
+    push: impl FnMut(Value),
+) -> bool {
+    try_dense_opt(i, input, count, push).is_some()
+}
+
+fn try_dense_opt(
+    i: &Interp,
+    input: &Value,
+    count: u16,
+    mut push: impl FnMut(Value),
+) -> Option<()> {
     let count = usize::from(count);
     if count > LIMIT {
         return None;
     }
-    let values = i.extra_protos.get(VALUES)?;
-    let next = i.extra_protos.get(NEXT)?;
+    // Present only when this scalar replacement is enabled for the realm (checked, memoized,
+    // by `pristine_array_iteration`).
     let Value::Obj(array) = input else {
         return None;
     };
-    let len = array_length(array)?;
-    let key = Interp::sym_key(i.iterator_sym.as_ref()?);
-    if !identity(plain_lookup(array, &key)??, values) {
+    // Shape-memoized proof that GetIterator/IteratorStep over `array` are the intrinsic ones.
+    if !i.pristine_array_iteration(array) {
         return None;
     }
-    let proto = i.extra_protos.get("%ArrayIteratorPrototype%")?;
-    if !identity(plain_lookup(proto, "next")??, next) {
-        return None;
-    }
+    let b = array.try_borrow().ok()?;
+    let len = array_length(&b)?;
     // Exactly count==len still closes: no subsequent exhausted step occurred.
-    if count <= len
-        && !matches!(
-            plain_lookup(proto, "return")?,
-            None | Some(Value::Undefined | Value::Null)
-        )
-    {
+    if count <= len && !i.array_iter_return_absent() {
         return None;
     }
-    let b = array.borrow();
     let yielded = count.min(len);
     // Guard every read before cloning outputs; holes/inherited/accessor elements
     // fall back, since any one can execute JS and invalidate earlier proofs.
@@ -72,22 +78,22 @@ pub(super) fn try_dense(i: &Interp, input: &Value, count: u16) -> Option<Vec<Val
             return None;
         }
     }
-    let mut outputs = Vec::with_capacity(count);
     for index in 0..yielded {
-        outputs.push(b.props.get_index(index as u32)?.value());
+        push(b.props.get_index(index as u32)?.value());
     }
-    outputs.resize(count, Value::Undefined);
+    for _ in yielded..count {
+        push(Value::Undefined);
+    }
     #[cfg(test)]
     SUCCESSES.with(|n| n.set(n.get() + 1));
-    Some(outputs)
+    Some(())
 }
 
-fn array_length(array: &Gc) -> Option<usize> {
-    let b = array.borrow();
+fn array_length(b: &crate::value::Object) -> Option<usize> {
     if !matches!(b.exotic, Exotic::Array) || !b.ic_plain.get() {
         return None;
     }
-    let p = b.props.get("length")?;
+    let p = b.props.length_property()?;
     if p.accessor() {
         return None;
     }
@@ -98,35 +104,6 @@ fn array_length(array: &Gc) -> Option<usize> {
         return None;
     }
     Some(n as usize)
-}
-
-fn identity(actual: Value, expected: &Gc) -> bool {
-    matches!(actual, Value::Obj(o) if Gc::ptr_eq(&o, expected))
-}
-
-/// Outer None means unsafe lookup; inner None means proven absent through null.
-fn plain_lookup(start: &Gc, name: &str) -> Option<Option<Value>> {
-    let mut current = Some(start.clone());
-    for _ in 0..8 {
-        let Some(object) = current else {
-            return Some(None);
-        };
-        let b = object.borrow();
-        // All callers use named non-index keys (symbol iterator, next, return).
-        // Arrays, including Array.prototype, have ordinary own lookup for these.
-        if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None | Exotic::Array) {
-            return None;
-        }
-        if let Some(p) = b.props.get(name) {
-            return if p.accessor() {
-                None
-            } else {
-                Some(Some(p.value()))
-            };
-        }
-        current = b.proto.clone();
-    }
-    None
 }
 
 #[cfg(test)]

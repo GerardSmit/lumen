@@ -13,5 +13,9 @@ rust-version.workspace = true
 lumen = { path = "../lumen", default-features = false }
 lumen-aot-macros = { path = "macros" }
 
+[dev-dependencies]
+# examples/aot_node.rs runs a node_modules bundle on the Node runtime.
+lumen-runtime = { path = "../lumen-runtime" }
+
 [lints]
 workspace = true

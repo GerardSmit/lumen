@@ -71,7 +71,16 @@ class Socket extends EventEmitter {
       const last = args[args.length - 1];
       if (typeof last === "function") cb = last;
     }
-    if (cb) this.once("listening", cb);
+    if (cb) {
+      // As Node: a failed bind drops its callback along with the error hook.
+      const onListening = () => { removeListeners.call(this); cb.call(this); };
+      function removeListeners() {
+        this.removeListener("error", removeListeners);
+        this.removeListener("listening", onListening);
+      }
+      this.on("error", removeListeners);
+      this.on("listening", onListening);
+    }
     this._bindState = 1;
     let info;
     try {

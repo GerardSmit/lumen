@@ -213,8 +213,33 @@ pub(super) fn install_regexp(it: &mut Interp) {
             return Err(i.make_error("TypeError", "RegExp.prototype.test requires an object"));
         }
         let s = ab(i.to_string(&arg(a, 0)))?;
+        // RegExpExec with the intrinsic `exec`: its match array is dead here, so run the
+        // allocation-free matcher (same lastIndex and legacy-statics effects) when it applies.
+        let exec = ab(i.get_member(&this, "exec"))?;
+        let intrinsic = matches!(&exec, Value::Obj(f) if matches!(
+            f.borrow().call,
+            Callable::Native(nf) if nf as usize == regexp_exec as *const () as usize
+        ));
+        if intrinsic {
+            if let Some(r) = regexp_exec_discard_fast(i, &this, &s) {
+                return r.map(Value::Bool);
+            }
+        }
+        if exec.is_callable() {
+            let res = ab(i.call(exec, this.clone(), &[Value::Str(s)]))?;
+            if !matches!(res, Value::Obj(_) | Value::Null) {
+                return Err(i.make_error(
+                    "TypeError",
+                    "RegExp exec method returned something other than an Object or null",
+                ));
+            }
+            return Ok(Value::Bool(!matches!(res, Value::Null)));
+        }
+        if map_ptr(&this).map(|p| i.regexps.contains_key(&p)) != Some(true) {
+            return Err(i.make_error("TypeError", "exec called on a non-RegExp object"));
+        }
         Ok(Value::Bool(!matches!(
-            regexp_exec_abstract(i, &this, s)?,
+            regexp_exec(i, this.clone(), &[Value::Str(s)])?,
             Value::Null
         )))
     });
@@ -484,6 +509,20 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     }
     let unicode = flags.contains('u') || flags.contains('v');
     set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
+    if let Some(direct) = direct_regexp(i, &this, &flags) {
+        let (_re, text, all) = direct_collect(i, direct, &s, true);
+        if all.is_empty() {
+            return Ok(Value::Null);
+        }
+        let items: Vec<Value> = all
+            .iter()
+            .map(|caps| {
+                let (a, b) = caps[0].expect("whole match");
+                Value::from_string(text.slice(a, b))
+            })
+            .collect();
+        return Ok(i.make_array(items));
+    }
     let mut results: Vec<Value> = Vec::new();
     loop {
         let result = regexp_exec_abstract(i, &this, s.clone())?;
@@ -535,9 +574,6 @@ fn re_sym_replace_impl(
 ) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.replace]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
-    // All positions are UTF-16 unit offsets.
-    let sunits: Vec<u16> = crate::jstr::units(&s);
-    let size = sunits.len();
     let repl = arg(a, 1);
     let functional = repl.is_callable();
     let repl_str = if functional {
@@ -627,6 +663,12 @@ fn re_sym_replace_impl(
             }
         }
     }
+    if let Some(direct) = direct_regexp(i, &this, &flags) {
+        return re_replace_direct(i, direct, &s, global, functional, &repl, &repl_str);
+    }
+    // All positions are UTF-16 unit offsets.
+    let sunits: Vec<u16> = crate::jstr::units(&s);
+    let size = sunits.len();
     // Collect every match (RegExpExec advances lastIndex; empty matches step forward manually).
     let mut results: Vec<Value> = Vec::new();
     loop {
@@ -829,18 +871,438 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     ))
 }
 
+/// All eight flags of a flags string as a bitmask (`None` when the RegExp constructor would
+/// reject it).
+fn full_flag_mask(flags: &str) -> Option<u32> {
+    let mut seen = 0u32;
+    for f in flags.chars() {
+        let bit = 1u32 << "dgimsuvy".find(f)?;
+        if seen & bit != 0 {
+            return None;
+        }
+        seen |= bit;
+    }
+    Some(seen)
+}
+
+/// A RegExp whose `RegExpExec` steps are all unobservable: an ordinary object with the
+/// [[RegExpMatcher]] slot, this realm's %RegExp.prototype% as its prototype, no own `exec`, the
+/// intrinsic `exec` inherited as a data property, a writable data `lastIndex` holding a
+/// non-negative integer, no named groups, and an observed `flags` string that agrees with the
+/// matcher's own flags. Every `exec` call on it then only reads/writes `lastIndex` and updates
+/// the legacy statics, and the match arrays it would return are fresh and never escape.
+struct DirectRegExp {
+    obj: Gc,
+    re: Rc<crate::regex::Regex>,
+    last_index: usize,
+}
+
+fn direct_regexp(i: &Interp, this: &Value, flags: &str) -> Option<DirectRegExp> {
+    let Value::Obj(obj) = this else {
+        return None;
+    };
+    let re = i.regexps.get(&(Gc::as_ptr(obj) as usize))?.clone();
+    if !re.names.is_empty() || full_flag_mask(&re.flags)? != full_flag_mask(flags)? {
+        return None;
+    }
+    let proto = i.extra_protos.get("RegExp")?;
+    let last_index = {
+        let b = obj.borrow();
+        if !matches!(b.exotic, Exotic::None)
+            || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, proto))
+            || b.props.contains("exec")
+        {
+            return None;
+        }
+        let p = b.props.get("lastIndex")?;
+        if p.accessor() || !p.writable() {
+            return None;
+        }
+        match p.value() {
+            Value::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+            _ => return None,
+        }
+    };
+    let canonical = {
+        let pb = proto.borrow();
+        match pb.props.get("exec") {
+            Some(prop) if !prop.accessor() => match prop.value() {
+                Value::Obj(f) => matches!(
+                    f.borrow().call,
+                    Callable::Native(nf) if nf as usize == regexp_exec as *const () as usize
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    };
+    if !canonical {
+        return None;
+    }
+    Some(DirectRegExp {
+        obj: obj.clone(),
+        re,
+        last_index,
+    })
+}
+
+/// The RegExpExec loop of @@replace / @@match on a [`DirectRegExp`]: every match (one unless
+/// `global`), with the final `lastIndex` and the legacy statics of the last match committed.
+#[allow(clippy::type_complexity)]
+fn direct_collect(
+    i: &mut Interp,
+    d: DirectRegExp,
+    s: &crate::lstr::LStr,
+    global: bool,
+) -> (
+    Rc<crate::regex::Regex>,
+    Rc<crate::regex::ReText>,
+    Vec<crate::regex::Captures>,
+) {
+    let DirectRegExp {
+        obj,
+        re,
+        last_index,
+    } = d;
+    let text = i.re_text(re.unicode, s);
+    let total = text.unit_index(text.len());
+    let use_last = re.global || re.sticky;
+    let mut li = last_index;
+    let mut all: Vec<crate::regex::Captures> = Vec::new();
+    loop {
+        let from = if use_last { li } else { 0 };
+        if from > total {
+            li = 0;
+            break;
+        }
+        let Some(caps) = re.exec_text_shared(&text, text.elem_at_unit(from)) else {
+            li = 0;
+            break;
+        };
+        let (a, b) = caps[0].expect("whole match");
+        li = text.unit_index(b);
+        all.push(caps);
+        if !global {
+            break;
+        }
+        if a == b {
+            // AdvanceStringIndex from the empty match's lastIndex.
+            li = if re.unicode && li < total {
+                text.unit_index(text.elem_at_unit(li) + 1)
+            } else {
+                li + 1
+            };
+        }
+    }
+    if use_last {
+        obj.borrow_mut()
+            .props
+            .get_mut("lastIndex")
+            .expect("direct regexp lastIndex")
+            .set_value(Value::Num(li as f64));
+    }
+    if let Some(caps) = all.last() {
+        update_regexp_legacy_statics(i, &re, caps, &text, s);
+    }
+    (re, text, all)
+}
+
+/// Append subject elements `a..b` to `out`.
+fn push_elems(
+    out: &mut String,
+    s: &crate::lstr::LStr,
+    text: &crate::regex::ReText,
+    a: usize,
+    b: usize,
+) {
+    if a >= b {
+        return;
+    }
+    if s.ascii_hint() {
+        out.push_str(&s[a..b]);
+    } else {
+        out.push_str(&text.slice(a, b));
+    }
+}
+
+/// @@replace over a [`DirectRegExp`]: the matches are collected exactly as the generic loop
+/// would (all `exec` calls before any replacement callback runs), without materializing the
+/// match arrays.
+fn re_replace_direct(
+    i: &mut Interp,
+    d: DirectRegExp,
+    s: &crate::lstr::LStr,
+    global: bool,
+    functional: bool,
+    repl: &Value,
+    repl_str: &crate::lstr::LStr,
+) -> Result<Value, Value> {
+    let (re, text, all) = direct_collect(i, d, s, global);
+    if all.is_empty() {
+        return Ok(Value::Str(s.clone()));
+    }
+    let plain_template = !functional && !repl_str.contains('$');
+    let sunits: Vec<u16> = if functional || plain_template {
+        Vec::new()
+    } else {
+        crate::jstr::units(s)
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut next = 0usize;
+    let mut cbargs: Vec<Value> = Vec::new();
+    for caps in &all {
+        let (a, b) = caps[0].expect("whole match");
+        if plain_template {
+            push_elems(&mut out, s, &text, next, a);
+            out.push_str(repl_str);
+        } else {
+            let matched = text.slice(a, b);
+            let position = text.unit_index(a);
+            let mut captures: Vec<Value> = Vec::with_capacity(re.ngroups);
+            for g in 1..=re.ngroups {
+                captures.push(match caps[g] {
+                    Some((x, y)) => Value::from_string(text.slice(x, y)),
+                    None => Value::Undefined,
+                });
+            }
+            let replacement = if functional {
+                cbargs.clear();
+                cbargs.push(Value::from_string(matched));
+                cbargs.extend(captures);
+                cbargs.push(Value::Num(position as f64));
+                cbargs.push(Value::Str(s.clone()));
+                let r = ab(i.call(repl.clone(), Value::Undefined, &cbargs))?;
+                ab(i.to_string(&r))?
+            } else {
+                crate::lstr::LStr::from(get_substitution(
+                    i,
+                    &matched,
+                    &sunits,
+                    position,
+                    &captures,
+                    &Value::Undefined,
+                    repl_str,
+                )?)
+            };
+            push_elems(&mut out, s, &text, next, a);
+            out.push_str(&replacement);
+        }
+        if out.len() > MAX_STR_LEN {
+            return Err(i.make_error("RangeError", "Invalid string length"));
+        }
+        next = b;
+    }
+    push_elems(&mut out, s, &text, next, text.len());
+    if out.is_ascii() {
+        return Ok(Value::from_string(out));
+    }
+    Ok(Value::from_string(
+        crate::jstr::canonicalize(&out).unwrap_or(out),
+    ))
+}
+
+/// The matching-relevant flag set of a flags string (`g`, `d`, `y` do not change what matches at
+/// a position), or `None` when the string would be rejected by the RegExp constructor.
+fn split_flag_mask(flags: &str) -> Option<u32> {
+    let mut seen = 0u32;
+    for f in flags.chars() {
+        let bit = 1u32 << "dgimsuvy".find(f)?;
+        if seen & bit != 0 {
+            return None;
+        }
+        seen |= bit;
+    }
+    let (u, v) = (1u32 << 5, 1u32 << 6);
+    if seen & u != 0 && seen & v != 0 {
+        return None;
+    }
+    Some(seen & !(1 | 2 | 1 << 7))
+}
+
+/// `RegExp.prototype[@@split]` when the species constructor is this realm's intrinsic `%RegExp%`
+/// and `rx` is a RegExp object. `Construct(%RegExp%, «rx, flags+"y"»)` then observably performs
+/// only `Get(rx, @@match)`; the splitter it would build compiles `rx`'s current source with the
+/// already-read flags and never escapes, so every `lastIndex` write and `exec` on it is
+/// unobservable apart from the legacy RegExp statics of its last successful match (recorded
+/// here). A sticky match attempt at each position is replaced by one leftmost search from `q`,
+/// which finds the same first position that matches (and the same match there).
+fn re_split_direct(
+    i: &mut Interp,
+    this: &Value,
+    c: &Value,
+    s: &crate::lstr::LStr,
+    flags: &str,
+    limit_v: Value,
+) -> Option<Result<Value, Value>> {
+    let Value::Obj(rx) = this else {
+        return None;
+    };
+    let Value::Obj(co) = c else {
+        return None;
+    };
+    if !i
+        .extra_protos
+        .get("%RegExpCtor%")
+        .is_some_and(|rc| Gc::ptr_eq(rc, co))
+    {
+        return None;
+    }
+    let ptr = Gc::as_ptr(rx) as usize;
+    if !i.regexps.contains_key(&ptr) {
+        return None;
+    }
+    let mask = split_flag_mask(flags)?;
+    Some(re_split_direct_run(i, this, ptr, mask, s, flags, limit_v))
+}
+
+fn re_split_direct_run(
+    i: &mut Interp,
+    this: &Value,
+    ptr: usize,
+    mask: u32,
+    s: &crate::lstr::LStr,
+    flags: &str,
+    limit_v: Value,
+) -> Result<Value, Value> {
+    // The constructor's IsRegExp step. Its result does not matter with a NewTarget present (the
+    // [[RegExpMatcher]] slot supplies the source), but the Get is observable.
+    if let Some(key) = well_known_key(i, "match") {
+        ab(i.get_member(this, &key))?;
+    }
+    let re = i.regexps[&ptr].clone();
+    let new_flags = if flags.contains('y') {
+        flags.to_string()
+    } else {
+        format!("{flags}y")
+    };
+    // RegExpInitialize of the splitter: `rx`'s current source with the observed flags.
+    let matcher = if split_flag_mask(&re.flags) == Some(mask) {
+        re.clone()
+    } else {
+        Rc::new(
+            crate::regex::Regex::new(&re.source, &new_flags)
+                .map_err(|e| i.make_error("SyntaxError", &e))?,
+        )
+    };
+    let limit = match limit_v {
+        Value::Undefined => u32::MAX as usize,
+        v => {
+            // ToUint32: modular, so a negative limit is a huge one.
+            let n = ab(i.to_number(&v))?;
+            if n.is_nan() || n.is_infinite() || n == 0.0 {
+                0
+            } else {
+                crate::eval::to_int32(n) as u32 as usize
+            }
+        }
+    };
+    // Every `exec` on the splitter resolves through %RegExp.prototype% (the splitter has no own
+    // `exec`); anything but the intrinsic there — possibly installed by the limit's valueOf —
+    // runs the observable loop on a real splitter object.
+    let proto = i.extra_protos.get("RegExp").cloned();
+    let intrinsic_exec = proto.as_ref().is_some_and(|proto| {
+        match proto.borrow().props.get("exec") {
+            Some(p) if !p.accessor() => matches!(p.value(), Value::Obj(f) if matches!(
+                f.borrow().call,
+                Callable::Native(nf) if nf as usize == regexp_exec as *const () as usize
+            )),
+            _ => false,
+        }
+    });
+    if !intrinsic_exec {
+        let splitter = ab(i.make_regexp_with_proto(&re.source, &new_flags, proto))?;
+        let unicode = flags.contains('u') || flags.contains('v');
+        return re_split_loop(i, &splitter, s, limit, unicode);
+    }
+    re_split_run(i, &matcher, s, limit)
+}
+
+fn re_split_run(
+    i: &mut Interp,
+    re: &Rc<crate::regex::Regex>,
+    s: &crate::lstr::LStr,
+    limit: usize,
+) -> Result<Value, Value> {
+    let mut out: Vec<Value> = Vec::new();
+    if limit == 0 {
+        return Ok(i.make_array(out));
+    }
+    let text = i.re_text(re.unicode, s);
+    let size_e = text.len();
+    let mut last: Option<crate::regex::Captures> = None;
+    let result = 'run: {
+        if size_e == 0 {
+            // A sticky attempt at 0 on the empty subject.
+            if let Some(caps) = re.exec_text_shared(&text, 0) {
+                if caps[0].is_some_and(|(a, _)| a == 0) {
+                    last = Some(caps);
+                    break 'run out;
+                }
+            }
+            out.push(Value::Str(s.clone()));
+            break 'run out;
+        }
+        // Element positions: `p` is the end of the last separator, `q` the next start to try.
+        let mut p = 0usize;
+        let mut q = 0usize;
+        while q < size_e {
+            let Some(caps) = re.exec_text_shared(&text, q) else {
+                if re.sticky {
+                    q += 1;
+                    continue;
+                }
+                break;
+            };
+            let (ms, me) = caps[0].expect("whole match");
+            if ms >= size_e {
+                break;
+            }
+            let e = me.min(size_e);
+            if e == p {
+                last = Some(caps);
+                q = ms + 1;
+                continue;
+            }
+            out.push(Value::from_string(text.slice(p, ms)));
+            if out.len() == limit {
+                last = Some(caps);
+                break 'run out;
+            }
+            p = e;
+            for g in 1..=re.ngroups {
+                out.push(match caps[g] {
+                    Some((a, b)) => Value::from_string(text.slice(a, b)),
+                    None => Value::Undefined,
+                });
+                if out.len() == limit {
+                    last = Some(caps);
+                    break 'run out;
+                }
+            }
+            last = Some(caps);
+            q = p;
+        }
+        out.push(Value::from_string(text.slice(p, size_e)));
+        out
+    };
+    if let Some(caps) = last {
+        update_regexp_legacy_statics(i, re, &caps, &text, s);
+    }
+    Ok(i.make_array(result))
+}
+
 pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.split]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
-    // All positions are UTF-16 unit offsets.
-    let sunits: Vec<u16> = crate::jstr::units(&s);
-    let size = sunits.len();
     // SpeciesConstructor(rx, %RegExp%), then a sticky-flagged splitter constructed from it.
     let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "RegExp"))?;
     let c = species_constructor(i, &this, &default_ctor)?;
     let flags_v = ab(i.get_member(&this, "flags"))?;
     let flags = ab(i.to_string(&flags_v))?;
     let unicode = flags.contains('u') || flags.contains('v');
+    if let Some(done) = re_split_direct(i, &this, &c, &s, &flags, arg(a, 1)) {
+        return done;
+    }
     let new_flags = if flags.contains('y') {
         flags.to_string()
     } else {
@@ -855,16 +1317,31 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
             if n.is_nan() || n.is_infinite() || n == 0.0 {
                 0
             } else {
-                (n.trunc() as i64).rem_euclid(1i64 << 32) as usize
+                crate::eval::to_int32(n) as u32 as usize
             }
         }
     };
+    re_split_loop(i, &splitter, &s, limit, unicode)
+}
+
+/// The observable @@split loop over a constructed sticky `splitter`.
+fn re_split_loop(
+    i: &mut Interp,
+    splitter: &Value,
+    s: &crate::lstr::LStr,
+    limit: usize,
+    unicode: bool,
+) -> Result<Value, Value> {
+    let s = s.clone();
+    // All positions are UTF-16 unit offsets.
+    let sunits: Vec<u16> = crate::jstr::units(&s);
+    let size = sunits.len();
     let mut out: Vec<Value> = Vec::new();
     if limit == 0 {
         return Ok(i.make_array(out));
     }
     if size == 0 {
-        let z = regexp_exec_abstract(i, &splitter, s.clone())?;
+        let z = regexp_exec_abstract(i, splitter, s.clone())?;
         if !matches!(z, Value::Null) {
             return Ok(i.make_array(out));
         }
@@ -874,13 +1351,13 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     let mut p = 0usize;
     let mut q = 0usize;
     while q < size {
-        ab(i.set_member(&splitter, "lastIndex", Value::Num(q as f64)))?;
-        let z = regexp_exec_abstract(i, &splitter, s.clone())?;
+        ab(i.set_member(splitter, "lastIndex", Value::Num(q as f64)))?;
+        let z = regexp_exec_abstract(i, splitter, s.clone())?;
         if matches!(z, Value::Null) {
             q = advance_string_index(q, &s, unicode);
             continue;
         }
-        let li_v = ab(i.get_member(&splitter, "lastIndex"))?;
+        let li_v = ab(i.get_member(splitter, "lastIndex"))?;
         let e = to_length_val(i, &li_v)?.min(size);
         if e == p {
             q = advance_string_index(q, &s, unicode);

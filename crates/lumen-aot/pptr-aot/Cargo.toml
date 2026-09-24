@@ -1,0 +1,43 @@
+# Puppeteer, ahead-of-time compiled into one executable: `js/test.mjs` plus puppeteer-core, ws and
+# @puppeteer/browsers (everything their imports reach under `node_modules`) are precompiled by
+# `lumen_aot::include_js!` and run on the lumen Node runtime — no JS files on disk at run time.
+# Built OUTSIDE the lumen workspace (its own `[workspace]`) because it needs `node_modules`:
+#
+#   npm install                 # puppeteer-core 25 (pinned in package.json)
+#   cargo build --release
+#   target/release/pptr-aot     # PPTR_EXE=<chrome/edge> to pick the browser
+#
+# `pptr-aot --scan` checks the executable for JS source text outside kept function bodies.
+[package]
+name = "pptr-aot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lumen = { path = "../../lumen" }
+lumen-aot = { path = ".." }
+lumen-runtime = { path = "../../lumen-runtime" }
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# include_js! runs lumen's parser and bytecode compiler inside the proc macro: optimize it, or
+# precompiling ~3 MB of JavaScript at build time takes minutes.
+[profile.release.build-override]
+opt-level = 3
+
+# Quicker local iteration: `cargo build --profile fast`.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
+[profile.fast.build-override]
+opt-level = 3

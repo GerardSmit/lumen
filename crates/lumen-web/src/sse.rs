@@ -143,7 +143,7 @@ fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, 
             )));
         }
         let port = u.port.unwrap_or(if u.scheme == "https" { 443 } else { 80 });
-        let host = u.host.trim_matches(['[', ']']);
+        let host = u.hostname().trim_matches(['[', ']']);
         let tcp = TcpStream::connect((host, port))
             .map_err(|e| ConnectError::Retriable(format!("connect: {e}")))?;
         tcp.set_nodelay(true).ok();
@@ -155,16 +155,11 @@ fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, 
         };
 
         let host_header = if u.port.is_some() && u.port != Some(80) {
-            format!("{}:{}", u.host, port)
+            format!("{}:{}", u.hostname(), port)
         } else {
-            u.host.clone()
+            u.hostname().to_string()
         };
-        let mut path = if u.path.is_empty() {
-            "/".to_string()
-        } else {
-            u.path.clone()
-        };
-        path.push_str(&u.query);
+        let path = u.request_target();
         let mut req = format!(
             "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: text/event-stream\r\n\
              Cache-Control: no-cache\r\nConnection: keep-alive\r\n"

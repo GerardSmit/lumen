@@ -87,6 +87,13 @@ pub struct Regex {
     /// [`FirstFilter::Atoms`] baked into a byte-indexed table (elements < 256): the scan loop
     /// becomes one load per position.
     first_lut: Option<Box<[bool; 256]>>,
+    /// The program opens with an unbounded greedy `C+` (`C{m,}`, m ≥ 1) outside every group. A
+    /// failed attempt at `s` then already tried every continuation an attempt at `s' ∈ (s, e)`
+    /// could reach (`e` = end of the `C` run at `s`): the run's end choices from `s'` are a subset
+    /// of those from `s`, and the continuation depends only on its position and its own
+    /// captures, never on group 0's start. So the scan resumes at `e`, keeping `\w+@x`-style
+    /// scans linear instead of quadratic per run.
+    lead_run: Option<Rep>,
     pub unicode: bool,
     pub ngroups: usize,
     pub source: String,
@@ -221,10 +228,35 @@ struct CharClass {
     builtins: Vec<char>,
     /// Unicode property escapes `\p{…}` / `\P{…}`: `(negated, sorted codepoint ranges)`.
     props: Vec<(bool, &'static [(u32, u32)])>,
+    /// Memoized ASCII membership bitmaps per `(icase, unicode)` mode, filled on first match
+    /// (a compiled class never changes).
+    ascii: [std::cell::Cell<Option<u128>>; 4],
 }
 
 impl CharClass {
+    #[inline]
     fn matches(&self, u: u32, icase: bool, unicode: bool) -> bool {
+        if u < 128 {
+            let cell = &self.ascii[usize::from(icase) * 2 + usize::from(unicode)];
+            let bits = match cell.get() {
+                Some(b) => b,
+                None => {
+                    let mut b = 0u128;
+                    for c in 0..128u32 {
+                        if self.matches_slow(c, icase, unicode) {
+                            b |= 1 << c;
+                        }
+                    }
+                    cell.set(Some(b));
+                    b
+                }
+            };
+            return bits >> u & 1 != 0;
+        }
+        self.matches_slow(u, icase, unicode)
+    }
+
+    fn matches_slow(&self, u: u32, icase: bool, unicode: bool) -> bool {
         let mut hit = self.matches_raw2(u, icase, unicode);
         let c = char::from_u32(u);
         if !hit && icase {
@@ -796,6 +828,15 @@ impl Regex {
             first_byte,
             literal_ascii,
             first_lut: None,
+            lead_run: match prog.get(1) {
+                Some(Inst::Many {
+                    rep,
+                    min,
+                    max: None,
+                    greedy: true,
+                }) if *min >= 1 => Some(rep.clone()),
+                _ => None,
+            },
             prog,
             ngroups: p.ngroups,
             source: if pattern.is_empty() {
@@ -960,6 +1001,7 @@ impl Regex {
             if m.run(&self.prog, 0, from) {
                 break 'scan Some(Captures::from_slots(&m.caps, self.ngroups));
             }
+            let exhaustive = !m.depth_exhausted && m.steps <= STEP_LIMIT;
             if m.depth_exhausted {
                 if let Some(captures) = self.run_deep(input, from, m.unicode) {
                     break 'scan Some(captures);
@@ -968,7 +1010,18 @@ impl Regex {
             if self.sticky {
                 break 'scan None;
             }
-            from += 1;
+            match &self.lead_run {
+                // See `lead_run`. Only after a complete (not budget-cut) failed attempt.
+                Some(rep) if exhaustive => {
+                    m.flags.truncate(1);
+                    let mut e = from;
+                    while e < input.len() && m.rep_matches(rep, input.at(e)) {
+                        e += 1;
+                    }
+                    from = e.max(from + 1);
+                }
+                _ => from += 1,
+            }
         };
         MATCH_SCRATCH.with(|s| {
             *s.borrow_mut() = Some(MatchScratch {
@@ -2423,6 +2476,7 @@ fn clone_class(cc: &CharClass) -> CharClass {
         ranges: cc.ranges.clone(),
         builtins: cc.builtins.clone(),
         props: cc.props.clone(),
+        ascii: Default::default(),
     }
 }
 
@@ -3388,6 +3442,7 @@ fn class_set_to_node(mut set: ClassSet) -> Node {
         ranges,
         builtins: Vec::new(),
         props: Vec::new(),
+        ascii: Default::default(),
     });
     if set.strings.is_empty() {
         return class;

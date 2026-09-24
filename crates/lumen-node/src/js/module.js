@@ -83,9 +83,41 @@ function loadNodeModules(name, start) {
   }
 }
 
-function defaultResolveFilename(specifier, fromDir) {
+// --- ahead-of-time blobs ------------------------------------------------------------------------
+// A precompiled blob (lumen_aot::include_js!) with CommonJS units defines `__lumenAot`: its
+// units are keyed `aot:/<path>`, and every require() the bundler resolved is recorded in it. A
+// require from an `aot:/` module (or of an `aot:/` key) resolves there first; what the blob lacks
+// falls back to the filesystem — bare packages from the current directory.
+function isAotKey(s) {
+  return typeof s === "string" && s.startsWith("aot:/");
+}
+function aotResolve(specifier, parentFilename) {
+  const aot = globalThis.__lumenAot;
+  if (aot === undefined) return undefined;
+  if (!isAotKey(specifier) && !isAotKey(parentFilename)) return undefined;
+  return aot.resolve(specifier, isAotKey(parentFilename) ? parentFilename : "");
+}
+function aotDirname(key) {
+  const i = key.lastIndexOf("/");
+  return i >= "aot:/".length ? key.slice(0, i) : "aot:/";
+}
+
+function defaultResolveFilename(specifier, fromDir, parentFilename) {
   const core = isCoreSpecifier(specifier);
   if (core) return "node:" + core;
+  // A `node:` specifier never falls back to disk (Node: ERR_UNKNOWN_BUILTIN_MODULE).
+  if (specifier.startsWith("node:")) throw new __errors.ERR_UNKNOWN_BUILTIN_MODULE(specifier);
+  const aotKey = aotResolve(specifier, parentFilename);
+  if (aotKey !== undefined) return aotKey;
+  if (isAotKey(fromDir) || isAotKey(specifier)) {
+    // Not in the blob: nothing on disk is relative to an `aot:/` module.
+    if (isAotKey(specifier) || specifier.startsWith("./") || specifier.startsWith("../")) {
+      const e = new Error(`Cannot find module '${specifier}' from '${parentFilename || fromDir}'`);
+      e.code = "MODULE_NOT_FOUND";
+      throw e;
+    }
+    fromDir = process.cwd();
+  }
   if (specifier.startsWith("./") || specifier.startsWith("../") || path.isAbsolute(specifier)) {
     const base = path.resolve(fromDir, specifier);
     const found = loadAsFile(base) || loadAsDirectory(base);
@@ -96,6 +128,8 @@ function defaultResolveFilename(specifier, fromDir) {
   }
   const found = loadNodeModules(specifier, fromDir);
   if (found) return __node.realpath(found);
+  // Optional native addons lumen implements itself (bufferutil, ...): used only when not installed.
+  if (__native.isFallbackModule(specifier)) return "node:" + specifier;
   const e = new Error(`Cannot find module '${specifier}'`);
   e.code = "MODULE_NOT_FOUND";
   throw e;
@@ -169,9 +203,10 @@ function hasHook(kind) {
 // _resolveFilename all land here). With hooks registered, run the chain over URLs and map the
 // winning url back into the internal filename form ("node:x" or an absolute path).
 function resolveFilename(specifier, fromDir, parentFilename) {
-  if (!hasHook("resolve")) return defaultResolveFilename(specifier, fromDir);
+  if (!hasHook("resolve")) return defaultResolveFilename(specifier, fromDir, parentFilename);
   const defaultStep = (spec, _context) => {
-    const filename = defaultResolveFilename(String(spec), fromDir);
+    const filename = defaultResolveFilename(String(spec), fromDir, parentFilename);
+    if (isAotKey(filename)) return { url: filename, shortCircuit: true };
     return {
       url: filename.startsWith("node:") ? filename : pathToFileUrl(filename),
       shortCircuit: true,
@@ -184,6 +219,7 @@ function resolveFilename(specifier, fromDir, parentFilename) {
     parentURL: parentFilename ? pathToFileUrl(parentFilename) : pathToFileUrl(fromDir + "/"),
   });
   const url = String(result.url);
+  if (isAotKey(url)) return url;
   if (url.startsWith("node:") || isBuiltin(url)) return url.startsWith("node:") ? url : "node:" + url;
   if (url.startsWith("file://")) return __node.realpath(fileUrlToPath(url));
   throw new Error(
@@ -231,13 +267,22 @@ Object.defineProperty(globalThis, "__lumenEsmHook", { value: esmHook, writable: 
 
 // Compile CommonJS source into `module` via the wrapper — the shared back half of the `.js`
 // extension handler, split out so a registerHooks load hook can feed transformed source in.
-function compileCommonJS(module, filename, source) {
+// With `detectEsm`, a source that does not parse as CommonJS returns false (nothing ran) so the
+// caller can load it as ESM instead; otherwise the parse error propagates.
+function compileCommonJS(module, filename, source, detectEsm = false) {
   const dirname = path.dirname(filename);
   // A leading #! shebang line is stripped, as Node does, before wrapping.
   source = String(source).replace(/^#!.*/, "");
   const require = makeRequire(dirname, module);
-  const compiled = new Function("exports", "require", "module", "__filename", "__dirname", source);
+  let compiled;
+  try {
+    compiled = new Function("exports", "require", "module", "__filename", "__dirname", source);
+  } catch (e) {
+    if (detectEsm && e instanceof SyntaxError) return false;
+    throw e;
+  }
   compiled.call(module.exports, module.exports, require, module, filename, dirname);
+  return true;
 }
 
 // A load-hook `source` may be a string or a TypedArray/ArrayBuffer (Node accepts both).
@@ -305,6 +350,28 @@ function loadModule(filename, parent) {
   cache[filename] = module;
   if (parent) parent.children.push(module);
 
+  // A unit of a precompiled blob: CommonJS runs its precompiled module wrapper; an ES module
+  // unit loads through import() (require(esm)).
+  if (isAotKey(filename)) {
+    const aot = globalThis.__lumenAot;
+    const kind = aot === undefined ? undefined : aot.kind(filename);
+    const dirname = aotDirname(filename);
+    module.path = dirname;
+    if (kind === "commonjs") {
+      const wrapper = aot.load(filename);
+      wrapper.call(module.exports, module.exports, makeRequire(dirname, module), module, filename, dirname);
+    } else if (kind === "module") {
+      loadESM(module, filename);
+    } else {
+      delete cache[filename];
+      const e = new Error(`Cannot find module '${filename}'`);
+      e.code = "MODULE_NOT_FOUND";
+      throw e;
+    }
+    module.loaded = true;
+    return module;
+  }
+
   // registerHooks load chain first (it can rewrite the source); otherwise — and for results the
   // hooks leave alone (addons) — dispatch on file extension through Module._extensions, exactly
   // as Node does: `.js`/`.cjs` run the module wrapper, `.json` is parsed, `.node` is dlopen'd for
@@ -329,7 +396,7 @@ function makeRequire(fromDir, parentModule) {
   };
   // Node v22.16 quirk, mirrored deliberately: require.resolve() does NOT consult registerHooks
   // (only actual loads do) — verified against `node -e`.
-  require.resolve = (specifier) => defaultResolveFilename(String(specifier), fromDir);
+  require.resolve = (specifier) => defaultResolveFilename(String(specifier), fromDir, parentFilename);
   require.cache = cache;
   require.main = mainModule;
   return require;
@@ -384,6 +451,11 @@ function createRequire(fromPath) {
   // Node accepts a path or a file: URL (string or URL object), e.g. createRequire(import.meta.url).
   let p = typeof fromPath === "object" && fromPath ? fromPath.href || String(fromPath) : String(fromPath);
   if (p.startsWith("file://")) p = p.slice(7).replace(/^\/([A-Za-z]:)/, "$1");
+  if (isAotKey(p)) {
+    // createRequire(import.meta.url) in a module of a precompiled blob: resolve like a unit there.
+    const dir = aotDirname(p);
+    return makeRequire(dir, { id: p, filename: p, path: dir, exports: {}, loaded: true, children: [], paths: [] });
+  }
   const dir = __node.isDir(p) ? p : path.dirname(p);
   return makeRequire(dir, null);
 }
@@ -427,11 +499,104 @@ function wrap(source) {
   return wrapper[0] + source + wrapper[1];
 }
 
+// The nearest enclosing package.json's "type" for `filename` ("module" | "commonjs" | undefined),
+// Node's package scope lookup. Cached per directory: a package tree asks once per folder.
+const packageTypeCache = new Map();
+function packageScopeType(filename) {
+  const seen = [];
+  let dir = path.dirname(filename);
+  let type;
+  for (;;) {
+    if (packageTypeCache.has(dir)) {
+      type = packageTypeCache.get(dir);
+      break;
+    }
+    seen.push(dir);
+    const pkgPath = path.join(dir, "package.json");
+    if (__node.isFile(pkgPath)) {
+      try {
+        const t = JSON.parse(__node.readText(pkgPath)).type;
+        type = typeof t === "string" ? t : undefined;
+      } catch {
+        type = undefined;
+      }
+      break;
+    }
+    // A node_modules folder bounds the scope lookup the way a package root does.
+    if (path.basename(dir) === "node_modules") break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  for (const d of seen) packageTypeCache.set(d, type);
+  return type;
+}
+
+// require(esm) — Node 22.12+/20.19+: a synchronous ES module graph loads through require() and
+// yields its namespace object (or the value exported under the string name "module.exports").
+// lumen's `import()` fetches, links and evaluates a graph without top-level await synchronously,
+// only settling the returned promise in a reaction job, so draining the microtask queue here
+// observes the settled namespace. A graph still pending after the drain is suspended at a
+// top-level await, which require() cannot wait for: ERR_REQUIRE_ASYNC_MODULE, as in Node.
+function loadESM(module, filename) {
+  let state = 0;
+  let value;
+  import(filename).then(
+    (ns) => {
+      state = 1;
+      value = ns;
+    },
+    (e) => {
+      state = 2;
+      value = e;
+    },
+  );
+  __node.drainMicrotasks();
+  if (state === 2) throw value;
+  if (state === 0) {
+    const e = new Error(
+      `require() cannot be used on an ESM graph with top-level await. Use import() instead. To see where the top-level await comes from, use --experimental-print-required-tla.\n  From ${filename}`,
+    );
+    e.code = "ERR_REQUIRE_ASYNC_MODULE";
+    throw e;
+  }
+  module.exports = esmExportsForRequire(value);
+}
+
+// What require(esm) returns for namespace `ns` (Node's rule): the "module.exports" string export
+// when there is one; otherwise the namespace — except that one with a default export (and no
+// __esModule of its own) comes back as a namespace-like facade carrying `__esModule: true`, so
+// transpiled-CJS consumers (`_interopRequireDefault`) pick up `default` instead of wrapping.
+function esmExportsForRequire(ns) {
+  if ("module.exports" in ns) return ns["module.exports"];
+  if (!("default" in ns) || "__esModule" in ns) return ns;
+  const facade = Object.create(null);
+  Object.defineProperty(facade, "__esModule", { value: true, enumerable: true });
+  for (const name of Object.keys(ns)) {
+    // Live bindings, like the namespace's own.
+    Object.defineProperty(facade, name, { get: () => ns[name], enumerable: true });
+  }
+  Object.defineProperty(facade, Symbol.toStringTag, { value: "Module" });
+  return Object.preventExtensions(facade);
+}
+
+// Node's syntax detection for a `.js` file outside any "type" scope: source that fails to
+// compile as CommonJS but uses ESM syntax is re-run as a module. The probe is a cheap textual
+// check; the CJS wrapper failing to parse decides that it was not CommonJS in the first place.
+const ESM_SYNTAX = /(^|[\s;})])(import\s*[{*\w"']|export\s*[{*\w]|import\.meta\b)/m;
+
 // Node's per-extension loaders. loadModule() above dispatches through these, so replacing or
 // wrapping an entry (as ts-node / pirates do) actually takes effect — real behavior, not a stub.
 const _extensions = {
   ".js": function (module, filename) {
-    compileCommonJS(module, filename, __node.readText(filename));
+    const type = packageScopeType(filename);
+    if (type === "module") return loadESM(module, filename);
+    const source = __node.readText(filename);
+    const detect = type === undefined && ESM_SYNTAX.test(source);
+    if (!compileCommonJS(module, filename, source, detect)) loadESM(module, filename);
+  },
+  ".mjs": function (module, filename) {
+    loadESM(module, filename);
   },
   ".ts": function (module, filename) {
     compileCommonJS(module, filename, stripTypeScriptTypes(__node.readText(filename), { sourceUrl: filename }));
@@ -490,7 +655,7 @@ function _resolveFilename(request, parent) {
   const spec = String(request);
   if (isBuiltin(spec)) return spec;
   // Like require.resolve, Node v22.16's _resolveFilename does not consult registerHooks.
-  return defaultResolveFilename(spec, parentDir(parent));
+  return defaultResolveFilename(spec, parentDir(parent), parent && parent.filename);
 }
 
 // Module._load(request, parent, isMain): resolve then load, returning the module's exports.
