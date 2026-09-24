@@ -21,6 +21,10 @@ impl Write for Captured {
 
 #[test]
 fn secure_client_negotiates_h2_with_node_server() {
+    // lumen-tls has no Windows backend yet.
+    if cfg!(windows) {
+        return;
+    }
     if Command::new("node").arg("--version").output().is_err()
         || Command::new("openssl").arg("version").output().is_err()
     {

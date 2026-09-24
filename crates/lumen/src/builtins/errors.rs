@@ -41,40 +41,31 @@ pub(super) fn install_errors(it: &mut Interp) {
         }))
     });
     // Error.prototype.stack accessor (error-stack-accessor proposal). The frames are snapshotted
-    // at construction (Exotic::Error); the getter formats V8-style: `Name: message` followed by the
-    // `\n    at <fn>` lines. get stack: non-object → TypeError; an object without [[ErrorData]] →
-    // undefined; an Error instance → the formatted (implementation-defined) trace. The setter
-    // shadows this with an own data property, so `err.stack = x` caches as usual.
-    let get_stack = it.make_native("get stack", 0, |i, this, _| {
-        let frames = match &this {
-            Value::Obj(o) => match o.borrow().error_stack() {
-                Some(frames) => frames,
-                None => return Ok(Value::Undefined),
-            },
-            _ => {
-                return Err(i.make_error(
-                    "TypeError",
-                    "Error.prototype.stack getter called on a non-object",
-                ))
-            }
-        };
-        let name = match ab(i.get_member(&this, "name"))? {
-            Value::Undefined => "Error".to_string(),
-            v => ab(i.to_string(&v))?.to_string(),
-        };
-        let msg = match ab(i.get_member(&this, "message"))? {
-            Value::Undefined => String::new(),
-            v => ab(i.to_string(&v))?.to_string(),
-        };
-        let head = if msg.is_empty() {
-            name
-        } else if name.is_empty() {
-            msg
-        } else {
-            format!("{name}: {msg}")
-        };
-        Ok(Value::from_string(format!("{head}{frames}")))
+    // at construction (Exotic::Error) and formatted V8-style on the first read, then cached (see
+    // `interpreter::stack_trace`). get stack: non-object → TypeError; an object without
+    // [[ErrorData]] (or a captured trace) → undefined. The setter shadows this with an own data
+    // property, so `err.stack = x` caches as usual. The same getter backs the own `stack`
+    // accessor `Error.captureStackTrace` defines.
+    let get_stack = it.make_native("get stack", 0, |i, this, _| match &this {
+        Value::Obj(o) => i.read_stack(&o.clone(), &this),
+        _ => Err(i.make_error(
+            "TypeError",
+            "Error.prototype.stack getter called on a non-object",
+        )),
     });
+    // The setter of a captureStackTrace accessor: an own data property replaces it (V8).
+    let set_captured = it.make_native("set stack", 1, |i, this, a| {
+        if let Value::Obj(o) = &this {
+            o.borrow_mut()
+                .props
+                .insert("stack", Property::data(arg(a, 0), true, false, true));
+            Ok(Value::Undefined)
+        } else {
+            Err(i.make_error("TypeError", "stack setter called on a non-object"))
+        }
+    });
+    it.extra_protos.insert("%StackGetter%", get_stack.clone());
+    it.extra_protos.insert("%StackSetter%", set_captured);
     // set stack: SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v).
     let set_stack = it.make_native("set stack", 1, |i, this, a| {
         let o = match &this {
@@ -184,6 +175,16 @@ pub(super) fn install_errors(it: &mut Interp) {
                     matches!(arg(a, 0), Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Error)),
                 ))
             });
+            // V8's stack-trace API: Error.captureStackTrace(target, fn?) and
+            // Error.stackTraceLimit (Error.prepareStackTrace is read when a stack formats).
+            it.def_method(&ctor, "captureStackTrace", 2, |i, _t, a| {
+                i.capture_stack_trace(&arg(a, 0), &arg(a, 1))?;
+                Ok(Value::Undefined)
+            });
+            ctor.borrow_mut()
+                .props
+                .insert("stackTraceLimit", Property::data(Value::Num(10.0), true, true, true));
+            it.extra_protos.insert("%Error%", ctor.clone());
             error_ctor = Some(ctor.clone());
         } else if let Some(ec) = &error_ctor {
             // A native error subtype's [[Prototype]] is the Error constructor (it subclasses Error).
@@ -206,7 +207,7 @@ pub(super) fn install_errors(it: &mut Interp) {
     set_builtin(&agg_proto, "message", Value::str(""));
     it.error_protos.insert("AggregateError", agg_proto.clone());
     let agg_ctor = it.make_native("AggregateError", 2, |i, _t, a| {
-        let err = i.make_error("AggregateError", "");
+        let err = i.make_error_skip("AggregateError", "", ctor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
         if matches!(i.new_target, Value::Obj(_)) {
             let nt = i.new_target.clone();
@@ -259,7 +260,7 @@ pub(super) fn install_errors(it: &mut Interp) {
     set_builtin(&sup_proto, "message", Value::str(""));
     it.error_protos.insert("SuppressedError", sup_proto.clone());
     let sup_ctor = it.make_native("SuppressedError", 3, |i, _t, a| {
-        let err = i.make_error("SuppressedError", "");
+        let err = i.make_error_skip("SuppressedError", "", ctor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
         if matches!(i.new_target, Value::Obj(_)) {
             let nt = i.new_target.clone();
@@ -306,8 +307,17 @@ pub(super) fn install_errors(it: &mut Interp) {
     set_builtin(&it.global, "SuppressedError", Value::Obj(sup_ctor));
 }
 
+/// The stack-trace skip of an error constructor: a subclass constructor's frames (up to
+/// new.target's) are not part of the trace (V8).
+fn ctor_skip(i: &Interp) -> Option<(usize, bool)> {
+    match &i.new_target {
+        Value::Obj(nt) => Some((Gc::as_ptr(nt) as usize, false)),
+        _ => None,
+    }
+}
+
 fn make_err(i: &mut Interp, kind: &str, args: &[Value]) -> Result<Value, Value> {
-    let err = i.make_error(kind, "");
+    let err = i.make_error_skip(kind, "", ctor_skip(i));
     // OrdinaryCreateFromConstructor: a subclass / Reflect.construct new.target sets the prototype.
     if matches!(i.new_target, Value::Obj(_)) {
         let nt = i.new_target.clone();

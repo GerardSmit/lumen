@@ -1,0 +1,26 @@
+// Decorators before `export` (puppeteer's JSHandle.ts: `@moveable export abstract class`).
+// Node (swc) blanks the `export` keyword of a decorated abstract class and keeps `abstract`;
+// the engine's own blanked source keeps the valid form (`export`, `abstract` erased).
+                                                  
+                                                
+
+@moveable
+       abstract class Handle              {
+                           
+                
+  #n        ;
+  constructor(n        ) {
+    this.#n = n;
+  }
+                           
+}
+
+@sealed @moveable
+export class Plain                                          {
+  *[Symbol.iterator]()              {}
+}
+
+@moveable        default abstract class Base {}
+
+@sealed
+                               

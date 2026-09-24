@@ -353,13 +353,16 @@ function internalConstructorName(obj) {
   return tag === "Object" || tag === "" ? "Object" : tag;
 }
 
-function getConstructorName(obj, ctx, recurseTimes) {
+function getConstructorName(obj, ctx, recurseTimes, protoProps) {
   let firstProto;
   const tmp = obj;
   while (obj) {
     const descriptor = Object.getOwnPropertyDescriptor(obj, "constructor");
     if (descriptor !== undefined && typeof descriptor.value === "function" &&
         descriptor.value.name !== "" && isInstanceof(tmp, descriptor.value)) {
+      if (protoProps !== undefined && (firstProto !== obj || !builtInObjects.has(descriptor.value.name))) {
+        addPrototypeProperties(ctx, tmp, firstProto || tmp, recurseTimes, protoProps);
+      }
       return String(descriptor.value.name);
     }
     obj = Object.getPrototypeOf(obj);
@@ -368,11 +371,48 @@ function getConstructorName(obj, ctx, recurseTimes) {
   if (firstProto === null) return null;
   const res = internalConstructorName(tmp);
   if (recurseTimes > ctx.depth && ctx.depth !== null) return `${res} <Complex prototype>`;
-  const protoConstr = getConstructorName(firstProto, ctx, recurseTimes + 1);
+  const protoConstr = getConstructorName(firstProto, ctx, recurseTimes + 1, protoProps);
   if (protoConstr === null) {
     return `${res} <${inspect(firstProto, { ...ctx, customInspect: false, depth: -1 })}>`;
   }
   return `${res} <${protoConstr}>`;
+}
+
+// Node's showHidden view also lists the non-method properties (accessors, data) that user-defined
+// prototypes add, up to three layers deep, stopping at the first built-in prototype. Appends to
+// `output`.
+function addPrototypeProperties(ctx, main, obj, recurseTimes, output) {
+  let depth = 0;
+  let keys;
+  let keySet;
+  do {
+    if (depth !== 0 || main === obj) {
+      obj = Object.getPrototypeOf(obj);
+      if (obj === null) return;
+      const descriptor = Object.getOwnPropertyDescriptor(obj, "constructor");
+      if (descriptor !== undefined && typeof descriptor.value === "function" && builtInObjects.has(descriptor.value.name)) {
+        return;
+      }
+    }
+    if (depth === 0) {
+      keySet = new Set();
+    } else {
+      keys.forEach((key) => keySet.add(key));
+    }
+    keys = Reflect.ownKeys(obj);
+    ctx.seen.push(main);
+    for (const key of keys) {
+      if (key === "constructor" || Object.prototype.hasOwnProperty.call(main, key) || (depth !== 0 && keySet.has(key))) {
+        continue;
+      }
+      const desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (typeof desc.value === "function") continue;
+      const value = formatProperty(ctx, obj, recurseTimes, key, kObjectType, desc, main);
+      if (ctx.colors) output.push(`[2m${value}[22m`);
+      else output.push(value);
+    }
+    ctx.seen.pop();
+  } while (++depth !== 3);
 }
 
 function getPrefix(constructor, tag, fallback, size = "") {
@@ -558,7 +598,10 @@ function isErrorValue(value) {
 
 function formatRaw(ctx, value, recurseTimes, typedArray) {
   let keys;
-  const constructor = getConstructorName(value, ctx, recurseTimes);
+  let protoProps;
+  if (ctx.showHidden && (recurseTimes <= ctx.depth || ctx.depth === null)) protoProps = [];
+  const constructor = getConstructorName(value, ctx, recurseTimes, protoProps);
+  if (protoProps !== undefined && protoProps.length === 0) protoProps = undefined;
   let tag = value[Symbol.toStringTag];
   // Only list the tag in case it's non-enumerable / not an own property, otherwise it would be
   // printed twice.
@@ -581,7 +624,7 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
       const prefix = constructor !== "Array" || tag !== "" ? getPrefix(constructor, tag, "Array", `(${value.length})`) : "";
       keys = getOwnNonIndexProperties(value, ctx.showHidden);
       braces = [`${prefix}[`, "]"];
-      if (value.length === 0 && keys.length === 0) return `${braces[0]}]`;
+      if (value.length === 0 && keys.length === 0 && protoProps === undefined) return `${braces[0]}]`;
       extrasType = kArrayExtrasType;
       formatter = formatArray;
     } else if (valueTag === "Set" && isSetValue(value)) {
@@ -589,14 +632,14 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
       const prefix = getPrefix(constructor, tag, "Set", `(${size})`);
       keys = getKeys(value, ctx.showHidden);
       formatter = (c, v, r) => formatSet(v, c, r);
-      if (size === 0 && keys.length === 0) return `${prefix}{}`;
+      if (size === 0 && keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
       braces = [`${prefix}{`, "}"];
     } else if (valueTag === "Map" && isMapValue(value)) {
       const size = Reflect.apply(Object.getOwnPropertyDescriptor(Map.prototype, "size").get, value, []);
       const prefix = getPrefix(constructor, tag, "Map", `(${size})`);
       keys = getKeys(value, ctx.showHidden);
       formatter = (c, v, r) => formatMap(v, c, r);
-      if (size === 0 && keys.length === 0) return `${prefix}{}`;
+      if (size === 0 && keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
       braces = [`${prefix}{`, "}"];
     } else if (taTag !== undefined) {
       keys = getOwnNonIndexProperties(value, ctx.showHidden);
@@ -609,7 +652,7 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
       const size = value.length;
       const prefix = getPrefix(constructor, tag, fallback, `(${size})`);
       braces = [`${prefix}[`, "]"];
-      if (value.length === 0 && keys.length === 0 && !ctx.showHidden) return `${braces[0]}]`;
+      if (value.length === 0 && keys.length === 0 && protoProps === undefined && !ctx.showHidden) return `${braces[0]}]`;
       formatter = (c, v, r) => formatTypedArray(bound, size, c, r);
       extrasType = kArrayExtrasType;
     } else if (valueTag === "Map Iterator") {
@@ -633,29 +676,29 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
       } else if (tag !== "") {
         braces[0] = `${getPrefix(constructor, tag, "Object")}{`;
       }
-      if (keys.length === 0) return `${braces[0]}}`;
+      if (keys.length === 0 && protoProps === undefined) return `${braces[0]}}`;
     } else if (typeof value === "function") {
       base = getFunctionBase(value, constructor, tag);
-      if (keys.length === 0) return ctx.stylize(base, "special");
+      if (keys.length === 0 && protoProps === undefined) return ctx.stylize(base, "special");
     } else if (valueTag === "RegExp") {
       base = RegExp.prototype.toString.call(constructor !== null ? value : new RegExp(value));
       const prefix = getPrefix(constructor, tag, "RegExp");
       if (prefix !== "RegExp ") base = `${prefix}${base}`;
-      if (keys.length === 0 || (recurseTimes > ctx.depth && ctx.depth !== null)) return ctx.stylize(base, "regexp");
+      if (keys.length === 0 && protoProps === undefined || (recurseTimes > ctx.depth && ctx.depth !== null)) return ctx.stylize(base, "regexp");
     } else if (valueTag === "Date") {
       const time = Date.prototype.getTime.call(value);
       base = Number.isNaN(time) ? Date.prototype.toString.call(value) : Date.prototype.toISOString.call(value);
       const prefix = getPrefix(constructor, tag, "Date");
       if (prefix !== "Date ") base = `${prefix}${base}`;
-      if (keys.length === 0) return ctx.stylize(base, "date");
+      if (keys.length === 0 && protoProps === undefined) return ctx.stylize(base, "date");
     } else if (isErrorValue(value)) {
       base = formatError(value, constructor, tag, ctx, keys);
-      if (keys.length === 0) return base;
+      if (keys.length === 0 && protoProps === undefined) return base;
     } else if (valueTag === "ArrayBuffer" || valueTag === "SharedArrayBuffer") {
       const prefix = getPrefix(constructor, tag, valueTag);
       if (typedArray === undefined) {
         formatter = formatArrayBuffer;
-      } else if (keys.length === 0) {
+      } else if (keys.length === 0 && protoProps === undefined) {
         return prefix + `{ byteLength: ${formatNumber(ctx.stylize, value.byteLength, false)} }`;
       }
       braces[0] = `${prefix}{`;
@@ -677,9 +720,9 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
       formatter = (c, v, r) => formatNamespaceObject(keys, c, v, r);
     } else if (BOXED_TAGS.has(valueTag) && typeof value === "object" && isBoxedPrimitiveValue(value, valueTag)) {
       base = getBoxedBase(value, ctx, keys, constructor, tag);
-      if (keys.length === 0) return base;
+      if (keys.length === 0 && protoProps === undefined) return base;
     } else {
-      if (keys.length === 0) return `${getPrefix(constructor, tag, "Object")}{}`;
+      if (keys.length === 0 && protoProps === undefined) return `${getPrefix(constructor, tag, "Object")}{}`;
       braces[0] = `${getPrefix(constructor, tag, "Object")}{`;
     }
   }
@@ -699,6 +742,7 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
     for (let i = 0; i < keys.length; i++) {
       output.push(formatProperty(ctx, value, recurseTimes, keys[i], extrasType));
     }
+    if (protoProps !== undefined) output.push(...protoProps);
   } catch (err) {
     if (err instanceof RangeError && /call stack/i.test(err.message)) {
       ctx.seen.pop();
@@ -1260,17 +1304,31 @@ function format(...args) {
 
 // ---- deprecate / promisify / callbackify ------------------------------------------------------
 
+// Node's util.deprecate: one DeprecationWarning per code (or per wrapper without a code) through
+// process.emitWarning, so --no-deprecation / --throw-deprecation / 'warning' listeners apply.
+const codesWarned = new Set();
 function deprecate(fn, msg, code) {
+  __validators.validateFunction(fn, "fn");
+  if (process.noDeprecation === true) return fn;
+  if (code !== undefined) __validators.validateString(code, "code");
   let warned = false;
   function deprecated(...args) {
-    if (!warned) {
+    if (!warned && !process.noDeprecation) {
       warned = true;
-      if (typeof console !== "undefined" && console.error) {
-        console.error(`DeprecationWarning:${code ? ` [${code}]` : ""} ${msg}`);
+      if (code !== undefined) {
+        if (!codesWarned.has(code)) {
+          codesWarned.add(code);
+          process.emitWarning(msg, "DeprecationWarning", code, deprecated);
+        }
+      } else {
+        process.emitWarning(msg, "DeprecationWarning", deprecated);
       }
     }
+    if (new.target) return Reflect.construct(fn, args, new.target);
     return Reflect.apply(fn, this, args);
   }
+  Object.setPrototypeOf(deprecated, fn);
+  if (fn.prototype) deprecated.prototype = fn.prototype;
   return deprecated;
 }
 

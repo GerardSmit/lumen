@@ -383,6 +383,11 @@ fn symbols() {
         "1"
     );
     assert_eq!(run("Symbol.for('k') === Symbol.for('k')"), "true"); // registry
+    // A generator body runs on a coroutine worker thread; it shares its driver's registry.
+    assert_eq!(
+        run("var k = Symbol.for('g'); function* g() { yield Symbol.for('g') === k; yield Symbol.keyFor(k); } var it = g(); it.next().value + ',' + it.next().value"),
+        "true,g"
+    );
     assert_eq!(run("String(Symbol('hi'))"), "Symbol(hi)");
     assert_eq!(run("Symbol('z').toString()"), "Symbol(z)");
     assert_eq!(throws("Symbol() + ''"), "TypeError"); // no implicit string coercion
@@ -1894,13 +1899,14 @@ fn regex_validation() {
 }
 #[test]
 fn poison_pill() {
-    // Function.prototype.caller/arguments: the getter reflects the call stack for an ordinary
-    // sloppy function (null while inactive — legacy web compat) and throws for strict ones; the
-    // setter always throws.
+    // An ordinary sloppy function's own legacy caller/arguments reflect the call stack (null
+    // while inactive) and are read-only (V8); every other function inherits
+    // Function.prototype's poison pill, which throws.
     assert_eq!(run("function f(){}; String(f.caller)"), "null");
     assert_eq!(run("function f(){}; String(f.arguments)"), "null");
+    assert_eq!(run("function f(){}; f.caller = 1; String(f.caller)"), "null");
     assert_eq!(
-        throws("function f(){}; 'use strict'; f.caller = 1"),
+        throws("function f(){}; (function(){ 'use strict'; f.caller = 1; })()"),
         "TypeError"
     );
     assert_eq!(
@@ -2566,8 +2572,8 @@ fn bytecode_compiles_labelled_loops() {
     assert!(compiles(
         "function f(){ outer: for(var i=0;i<2;i++){ for(var j=0;j<2;j++){ continue outer; } } }"
     ));
-    // A label on a non-loop statement stays outside the compiled subset (bails to the interpreter).
-    assert!(!compiles("function f(){ a: { break a; } }"));
+    // A label on a non-loop statement is a break-only target.
+    assert!(compiles("function f(){ a: { break a; } }"));
 }
 
 #[test]
@@ -3961,6 +3967,27 @@ fn regex_no_line_terminator() {
     assert_eq!(run(r"/ab/.test('ab')"), "true");
 }
 #[test]
+fn regex_dot_and_anchors_line_terminators() {
+    // `.` excludes \n, \r, U+2028, U+2029 (greedy runs, lazy runs and single steps alike).
+    assert_eq!(run(r#"JSON.stringify("Cookie: a=b\r\nH".match(/^Cookie: .+$/m))"#), r#"["Cookie: a=b"]"#);
+    assert_eq!(run(r#""Cookie: a=b\r\nH".match(/^Cookie: .+$/)"#), "null");
+    assert_eq!(run(r#""a\rb".match(/a.*/)[0]"#), "a");
+    assert_eq!(run(r#""a\u2028b".match(/a.*/)[0].length"#), "1");
+    assert_eq!(run(r#""a\u2029b".match(/a.*?b/)"#), "null");
+    assert_eq!(run(r#"/a.b/.test("a\rb")"#), "false");
+    assert_eq!(run(r#"/a.b/s.test("a\rb")"#), "true");
+    assert_eq!(run(r#""x\r\ny".match(/.+/gs)[0].length"#), "4");
+    assert_eq!(run(r#"/^.$/u.test("\u2028")"#), "false");
+    assert_eq!(run(r#"/[^]/.test("\r")"#), "true");
+    // Multiline anchors treat all four terminators as line boundaries.
+    assert_eq!(run(r#""a\rb\u2028c\u2029d".match(/^\w$/gm).join()"#), "a,b,c,d");
+    assert_eq!(run(r#""ab\r".match(/b$/m)[0]"#), "b");
+    assert_eq!(run(r#"/b$/.test("ab\r")"#), "false");
+    assert_eq!(run(r#""x\r\ny\rz".split(/^/m).length"#), "4");
+    // Leading-run skip (`.+x` scans) must not jump across a terminator.
+    assert_eq!(run(r#""aa\rbx".match(/.+x/)[0]"#), "bx");
+}
+#[test]
 fn private_names_not_observable() {
     assert_eq!(
         run("class C{ static #x(){return 1} } Object.prototype.hasOwnProperty.call(C,'#x')"),
@@ -4038,6 +4065,39 @@ fn ta_prototype_accessors() {
         run("var b=new ArrayBuffer(4); new Int8Array(b).buffer===b"),
         "true"
     );
+    // A replaced getter, or one a subclass shadows, is what `[[Get]]` finds.
+    assert_eq!(
+        run("class S extends Uint8Array { get length() { return 9; } } new S(2).length"),
+        "9"
+    );
+    assert_eq!(
+        run("var p=Object.getPrototypeOf(Int8Array.prototype); Object.defineProperty(p,'byteOffset',{get(){return 7}}); new Int8Array(2).byteOffset"),
+        "7"
+    );
+    // Huge stores reduce modulo 2^bits (no saturation).
+    assert_eq!(run("var t=new Int8Array(2); t[0]=1e20; t[1]=-3e20; t.join()"), "0,0");
+}
+
+#[test]
+fn finalization_registry_cleanup_after_gc() {
+    let mut e = Engine::new();
+    let setup = "var fired=[]; var fr=new FinalizationRegistry(h=>fired.push(h));
+        (function(){ for (let i=0;i<3;i++){ const a={i}, b={a}; a.b=b; fr.register(a,'c'+i); } })();
+        fr.register({}, 'plain'); var kept={}; fr.register(kept,'kept');
+        var tok={}; fr.register({}, 'unreg', tok); var un=fr.unregister(tok);
+        var wr; (function(){ wr=new WeakRef({v:1}); })(); var sync=wr.deref().v; $262.gc(); 0";
+    assert!(matches!(e.eval(setup, false).expect("parse"), Completion::Value(_)));
+    match e.eval("fired.sort().join()+' '+un+' '+sync+' '+(wr.deref()===undefined)", false) {
+        // The WeakRef target was kept only until the end of that job (then freed).
+        Ok(Completion::Value(v)) => assert_eq!(v, "c0,c1,c2,plain true 1 true"),
+        _ => panic!("eval failed"),
+    }
+    // Live and already-cleaned registrations never fire (again).
+    assert!(matches!(e.eval("$262.gc(); 0", false).expect("parse"), Completion::Value(_)));
+    match e.eval("fired.length", false) {
+        Ok(Completion::Value(v)) => assert_eq!(v, "4"),
+        _ => panic!("eval failed"),
+    }
 }
 #[test]
 fn number_tostring_spec() {

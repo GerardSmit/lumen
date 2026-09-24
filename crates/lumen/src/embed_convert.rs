@@ -2168,6 +2168,8 @@ pub mod private {
     pub const OP_COERCE: u32 = 1;
     pub const OP_CTX: u32 = 2;
     pub const OP_ASYNC: u32 = 4;
+    /// Bit of JS argument 0 being a `SyncFn` (argument `i`: `<< i`).
+    pub const OP_SYNC_CB_SHIFT: u32 = crate::sync_callbacks::OP_SYNC_CB_SHIFT;
 
     /// Implemented by `#[methods]`; `#[class]`'s `Class::class_desc` forwards here (a class
     /// without members still needs an empty `#[methods] impl T {}`).

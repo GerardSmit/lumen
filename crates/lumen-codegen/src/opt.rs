@@ -40,24 +40,24 @@ pub fn remove_unreachable(func: &mut Function) {
     func.layout.retain(|&b| cfg.is_reachable(b));
 }
 
-/// Every branch edge into `block`, as the terminator and the successor slot.
-fn incoming(func: &Function, block: Block) -> Vec<(Inst, usize)> {
-    let mut out = Vec::new();
+/// Every block's incoming branch edges, as the terminator and the successor slot (indexed by
+/// block; one pass over the layout).
+fn incoming_all(func: &Function) -> Vec<Vec<(Inst, usize)>> {
+    let mut out = vec![Vec::new(); func.blocks.len()];
     for &b in &func.layout {
         if let Some(t) = func.terminator(b) {
             for (i, c) in func.inst(t).successors().iter().enumerate() {
-                if c.block == block {
-                    out.push((t, i));
-                }
+                out[c.block.index()].push((t, i));
             }
         }
     }
     out
 }
 
-/// Remove parameter `idx` of `block` and the matching argument on every incoming edge.
-fn remove_param(func: &mut Function, block: Block, idx: usize) {
-    for (t, slot) in incoming(func, block) {
+/// Remove parameter `idx` of `block` and the matching argument on each of its incoming
+/// `edges`.
+fn remove_param(func: &mut Function, block: Block, idx: usize, edges: &[(Inst, usize)]) {
+    for &(t, slot) in edges {
         func.insts[t.index()].successors_mut()[slot].args.remove(idx);
     }
     func.blocks[block.index()].params.remove(idx);
@@ -76,18 +76,20 @@ pub fn simplify_params(func: &mut Function) {
     let mut changed = true;
     while changed {
         changed = false;
+        // (Removing parameters leaves the edges themselves unchanged.)
+        let all = incoming_all(func);
         for bi in 0..func.layout.len() {
             let b = func.layout[bi];
             if b == entry {
                 continue;
             }
-            let edges = incoming(func, b);
+            let edges = &all[b.index()];
             let mut i = 0;
             while i < func.blocks[b.index()].params.len() {
                 let p = func.blocks[b.index()].params[i];
                 let mut same: Option<Value> = None;
                 let mut trivial = true;
-                for &(t, slot) in &edges {
+                for &(t, slot) in edges {
                     let a = func.resolve(func.inst(t).successors()[slot].args[i]);
                     if a == p || Some(a) == same {
                         continue;
@@ -101,7 +103,7 @@ pub fn simplify_params(func: &mut Function) {
                 match (trivial, same) {
                     (true, Some(v)) => {
                         func.replace_uses(p, v);
-                        remove_param(func, b, i);
+                        remove_param(func, b, i, edges);
                         changed = true;
                     }
                     _ => i += 1,
@@ -396,7 +398,7 @@ pub fn dce(func: &mut Function) {
         while i > 0 {
             i -= 1;
             if !live[func.blocks[b.index()].params[i].index()] {
-                remove_param(func, b, i);
+                remove_param(func, b, i, &edges[b.index()]);
             }
         }
     }

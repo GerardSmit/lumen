@@ -25,6 +25,12 @@ static APP: lumen::Precompiled = lumen_aot::include_js!(
     keep_source = ["js/**", "puppeteer-core/**"],
 );
 
+/// The engine's size-class allocator, as the `lumen` CLI uses: startup alone (the Node glue, the
+/// blob's ASTs) is millions of small same-sized blocks, where the system allocator is slowest.
+#[cfg(not(target_arch = "wasm32"))]
+#[global_allocator]
+static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;
+
 const MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 fn main() {
@@ -67,7 +73,11 @@ fn real_main(t0: Instant) -> i32 {
         eprintln!("Uncaught {e}");
         return 1;
     }
-    runtime.finish_process()
+    let code = runtime.finish_process();
+    if lumen::memstats::enabled() {
+        runtime.engine().ctx().mem_report();
+    }
+    code
 }
 
 fn stats() -> i32 {

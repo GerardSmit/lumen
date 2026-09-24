@@ -5212,7 +5212,9 @@ function newStreamWritableFromWritableStream(writableStream, options = kEmptyObj
 function newWritableStreamFromStreamWritable(streamWritable) {
   // Not using the internal/streams/utils isWritableNodeStream utility here because it will return
   // false if the argument is a Duplex whose writable side has ended.
-  if (typeof streamWritable?._writableState !== "object") {
+  // A writable-shaped object without stream state (http.ServerResponse) is accepted too, as in
+  // later Node versions.
+  if (typeof streamWritable?._writableState !== "object" && !isWritableNodeStream(streamWritable)) {
     throw new ERR_INVALID_ARG_TYPE("streamWritable", "stream.Writable", streamWritable);
   }
 

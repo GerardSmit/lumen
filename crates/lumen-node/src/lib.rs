@@ -24,14 +24,18 @@ use std::path::Path;
 
 use lumen_host::{ops, Ctx, Extension, SpawnHandle, Value};
 
+#[cfg(feature = "bun")]
 mod bunhash;
 mod child;
 mod codec;
 #[cfg(windows)]
 mod win_spawn;
+#[cfg(windows)]
+mod win_pipe;
 mod crypto;
 mod dns;
 mod dylib;
+#[cfg(feature = "bun")]
 mod ffi;
 mod hash;
 #[path = "../../lumen-runtime/src/jsx.rs"]
@@ -41,8 +45,10 @@ mod fsb;
 mod native;
 mod net;
 mod password;
+#[cfg(feature = "bun")]
 mod sqlite;
 mod tls;
+mod vm_timeout;
 
 /// The runtime's blocking-work spawner (threadpool), for async ops.
 fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
@@ -70,6 +76,7 @@ pub fn extension() -> Extension {
                     "realpath" (1) => op_realpath,
                     "loadNativeAddon" (1) => napi::op_load_addon,
                     "isProxy" (1) => op_is_proxy,
+                    "nameSource" (2) => op_name_source,
                     "promiseState" (1) => op_promise_state,
                     "proxyParts" (1) => op_proxy_parts,
                     "collectGarbage" (0) => op_collect_garbage,
@@ -78,6 +85,8 @@ pub fn extension() -> Extension {
                     "heapObjectCount" (0) => op_heap_object_count,
                     "drainMicrotasks" (0) => op_drain_microtasks,
                     "transformJsx" (1) => op_transform_jsx,
+                    "stripTypes" (1) => op_strip_types,
+                    "compileCommonJS" (3) => op_compile_commonjs,
                     "stat" (1) => op_stat,
                     "lstat" (1) => op_lstat,
                     "rm" (3) => op_rm,
@@ -129,6 +138,7 @@ pub fn extension() -> Extension {
                     "streamClose" (1) => op_zlib_stream_close,
                 ],
             ),
+            #[cfg(feature = "bun")]
             (
                 "__ffi",
                 ops![
@@ -146,6 +156,7 @@ pub fn extension() -> Extension {
                     "cc" (2) => ffi::op_cc,
                 ],
             ),
+            #[cfg(feature = "bun")]
             (
                 "__bunhash",
                 ops![
@@ -162,11 +173,13 @@ pub fn extension() -> Extension {
                 ],
             ),
             ("__child", child::CHILD_OPS),
+            ("__vm", vm_timeout::VM_OPS),
             ("__net", net::NET_OPS),
             ("__udp", net::UDP_OPS),
             ("__tls", tls::TLS_OPS),
             ("__crypto", crypto::CRYPTO_OPS),
             ("__password", password::PASSWORD_OPS),
+            #[cfg(feature = "bun")]
             ("__sqlite", sqlite::SQLITE_OPS),
             (
                 "__dns",
@@ -184,15 +197,14 @@ pub fn extension() -> Extension {
             state.put(tls::TlsRegistry::default());
             state.put(ZlibStreams::default());
         }),
-        js_init: Some(JS_GLUE),
-        js_init_snapshot: Some(JS_GLUE_SNAPSHOT),
+        js_init: None,
+        js_init_snapshot: Some(JS_GLUE_AOT),
     }
 }
 
-// Assembled by build.rs from src/js/*.js (single source of truth). JS_GLUE is the fallback
-// source; JS_GLUE_SNAPSHOT is its precompiled AST, decoded at boot to skip re-parsing.
-const JS_GLUE: &str = include_str!(concat!(env!("OUT_DIR"), "/node_glue.js"));
-const JS_GLUE_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node_glue.snap"));
+// Assembled by build.rs from src/js/*.js (single source of truth) and precompiled there to an
+// ahead-of-time blob (AST, bytecode, compressed function text), loaded at boot.
+const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node_glue.aot"));
 
 fn arg_path(ctx: &mut Ctx, args: &[Value]) -> Result<String, Value> {
     Ok(ctx
@@ -203,6 +215,17 @@ fn arg_path(ctx: &mut Ctx, args: &[Value]) -> Result<String, Value> {
 fn op_is_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
     Ok(Value::Bool(Path::new(&p).is_file()))
+}
+
+/// `(fn, filename)` — name a CommonJS module wrapper's source for stack traces (see
+/// `Ctx::name_function_source`).
+fn op_name_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = match args.get(1) {
+        Some(Value::Str(s)) => s.to_string(),
+        _ => return Ok(Value::Bool(false)),
+    };
+    let f = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(Value::Bool(ctx.name_function_source(&f, &name)))
 }
 
 fn op_is_proxy(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -260,6 +283,50 @@ fn op_transform_jsx(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     jsx::transform(&source)
         .map(Value::from_string)
         .map_err(|message| ctx.make_error("SyntaxError", message))
+}
+
+/// `stripTypes(code)`: Node's strip-only TypeScript erasure (the engine parser's TypeScript
+/// mode), offsets kept.
+/// Throws a SyntaxError with Node's `code` (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX /
+/// ERR_INVALID_TYPESCRIPT_SYNTAX).
+fn op_strip_types(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let source = ctx
+        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
+        .to_string();
+    match lumen::typescript::strip_types(&source) {
+        Ok(s) => Ok(Value::from_string(s)),
+        Err(e) => {
+            // Node's `stack` for these: the code frame (no file name), then the header.
+            let stack = lumen::typescript::node_error_text(
+                "",
+                &source,
+                Some((e.offset, e.end)),
+                e.line,
+                &e.message,
+            );
+            let err = ctx.make_error("SyntaxError", e.message);
+            if let Some(code) = e.code {
+                let _ = ctx.set_member(&err, "code", Value::str(code));
+            }
+            let _ = ctx.set_member(&err, "stack", Value::from_string(stack));
+            Err(err)
+        }
+    }
+}
+
+/// `compileCommonJS(source, filename, ts)`: a CommonJS module as the function
+/// `(exports, require, module, __filename, __dirname) => { source }`, compiled with no
+/// synthesized header, so positions are the file's; its frames print as `filename`. With `ts`
+/// the source is TypeScript (the engine's strip-only mode; errors carry Node's `code`).
+fn op_compile_commonjs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let source = ctx
+        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
+        .to_string();
+    let filename = ctx
+        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
+        .to_string();
+    let ts = matches!(args.get(2), Some(Value::Bool(true)));
+    ctx.compile_cjs_function(&source, &lumen::typescript::CJS_PARAMS, &filename, ts)
 }
 
 fn op_is_dir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -1193,12 +1260,11 @@ fn op_zlib_zstd_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value,
 fn op_zlib_zstd_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     zlib_decompress_op(ctx, a, lumen_host::zstd::zstd_decompress)
 }
-/// `__zlib.crc32(bytes, seed)` — CRC-32 of `bytes`, optionally continued from `seed`.
-// ---- streaming raw deflate/inflate (`zlib.createDeflateRaw` / `createInflateRaw`) ---------------
+// ---- streaming deflate/inflate (`zlib.createGzip`, `createDeflate`, `createDeflateRaw`, …) ----
 
 enum ZlibStream {
-    Deflate(lumen_host::deflate::Deflater),
-    Inflate(lumen_host::deflate::Inflater),
+    Deflate(lumen_host::deflate::FramedDeflater),
+    Inflate(lumen_host::deflate::FramedInflater),
 }
 
 /// Live streaming codecs, keyed by the id JS holds. A stream is released by `streamClose`
@@ -1209,14 +1275,21 @@ struct ZlibStreams {
     streams: std::collections::HashMap<u64, ZlibStream>,
 }
 
-/// `(kind)` — `"deflate"` or `"inflate"`; returns the stream id.
+/// `(kind)` — `"deflate"`/`"inflate"` (raw), `"zlib"`/`"unzlib"` (zlib framing),
+/// `"gzip"`/`"gunzip"`, or `"unzip"` (gzip or zlib by header); returns the stream id.
 fn op_zlib_stream_open(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    use lumen_host::deflate::{FramedDeflater as D, FramedInflater as I, Framing};
     let kind = ctx
         .coerce_string(a.first().unwrap_or(&Value::Undefined))?
         .to_string();
     let stream = match kind.as_str() {
-        "deflate" => ZlibStream::Deflate(lumen_host::deflate::Deflater::new()),
-        "inflate" => ZlibStream::Inflate(lumen_host::deflate::Inflater::new()),
+        "deflate" => ZlibStream::Deflate(D::new(Framing::Raw)),
+        "zlib" => ZlibStream::Deflate(D::new(Framing::Zlib)),
+        "gzip" => ZlibStream::Deflate(D::new(Framing::Gzip)),
+        "inflate" => ZlibStream::Inflate(I::new(Framing::Raw)),
+        "unzlib" => ZlibStream::Inflate(I::new(Framing::Zlib)),
+        "gunzip" => ZlibStream::Inflate(I::new(Framing::Gzip)),
+        "unzip" => ZlibStream::Inflate(I::new(Framing::Auto)),
         other => {
             return Err(ctx.make_error("TypeError", format!("unknown zlib stream kind {other:?}")))
         }
@@ -1236,18 +1309,15 @@ fn zlib_stream_missing(ctx: &Ctx) -> Value {
     ctx.make_error("Error", "zlib stream is closed")
 }
 
-/// `(id, chunk)` — feed bytes; returns the bytes produced so far (always empty for deflate,
-/// which only emits on flush).
+/// `(id, chunk)` — feed bytes; returns the bytes produced so far (a compressor emits a block
+/// whenever enough input is buffered, otherwise only on flush).
 fn op_zlib_stream_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let id = zlib_stream_id(a);
     let Some(bytes) = ctx.typed_array_bytes(a.get(1).unwrap_or(&Value::Undefined)) else {
         return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
     };
     let result = match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
-        Some(ZlibStream::Deflate(d)) => {
-            d.write(&bytes);
-            Ok(Vec::new())
-        }
+        Some(ZlibStream::Deflate(d)) => Ok(d.write(&bytes)),
         Some(ZlibStream::Inflate(i)) => i.write(&bytes),
         None => return Err(zlib_stream_missing(ctx)),
     };
@@ -1257,17 +1327,19 @@ fn op_zlib_stream_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, 
     }
 }
 
-/// `(id, finish)` — deflate: close the block (`Z_SYNC_FLUSH`, or `Z_FINISH` when `finish`) and
-/// return its bytes; inflate: returns whether the final block has been seen (as a boolean).
+/// `(id, mode)` — a compressor flushes with zlib flush constant `mode` (`true` = `Z_FINISH`,
+/// `false`/absent = `Z_SYNC_FLUSH`) and returns the bytes; a decompressor returns whether its
+/// stream has ended (as a boolean).
 fn op_zlib_stream_flush(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    use lumen_host::deflate::Flush;
     let id = zlib_stream_id(a);
-    let finish = matches!(a.get(1), Some(Value::Bool(true)));
+    let mode = match a.get(1) {
+        Some(Value::Bool(true)) => Flush::Finish,
+        Some(Value::Num(n)) => Flush::from_zlib(*n as u32).unwrap_or(Flush::Sync),
+        _ => Flush::Sync,
+    };
     let result = match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
-        Some(ZlibStream::Deflate(d)) => d.flush(if finish {
-            lumen_host::deflate::Flush::Finish
-        } else {
-            lumen_host::deflate::Flush::Sync
-        }),
+        Some(ZlibStream::Deflate(d)) => d.flush(mode),
         Some(ZlibStream::Inflate(i)) => return Ok(Value::Bool(i.finished())),
         None => return Err(zlib_stream_missing(ctx)),
     };
@@ -1296,6 +1368,7 @@ fn op_zlib_stream_close(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
+/// `__zlib.crc32(bytes, seed)` — CRC-32 of `bytes`, optionally continued from `seed`.
 fn op_zlib_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let v = a.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {

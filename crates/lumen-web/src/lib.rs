@@ -26,7 +26,6 @@
 //! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
 //!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
 
-use std::fs::File;
 use std::time::Instant;
 
 use lumen_host::{ops, Ctx, Extension, OpState, SpawnHandle, TaskRegistry, Value};
@@ -73,6 +72,9 @@ pub fn extension() -> Extension {
                     "canParse" (2) => op_url_can_parse,
                     "domainToASCII" (1) => op_url_domain_to_ascii,
                     "domainToUnicode" (1) => op_url_domain_to_unicode,
+                    "toASCII" (1) => op_idna_to_ascii,
+                    "toUnicode" (1) => op_idna_to_unicode,
+                    "format" (5) => op_url_format,
                 ],
             ),
             ("__http", ops!["request" (6) => op_http_request]),
@@ -151,17 +153,16 @@ pub fn extension() -> Extension {
             state.put(sse::SseRegistry::default());
             state.put(wasm_ops::WasmStore::default());
         }),
-        js_init: Some(JS_GLUE),
-        js_init_snapshot: Some(JS_GLUE_SNAPSHOT),
+        js_init: None,
+        js_init_snapshot: Some(JS_GLUE_AOT),
     }
 }
 
 /// One IIFE (preamble captures and deletes the raw `__*` namespaces, the rest defines the
 /// standard classes over them), assembled by `build.rs` from `src/js/*.js` — the single source
-/// of truth. `JS_GLUE` is the fallback source; `JS_GLUE_SNAPSHOT` is its precompiled AST, decoded
-/// at boot to skip re-parsing (see `lumen_host::install` / `Engine::eval_snapshot`).
-const JS_GLUE: &str = include_str!(concat!(env!("OUT_DIR"), "/web_glue.js"));
-const JS_GLUE_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.snap"));
+/// of truth — and precompiled there to an ahead-of-time blob (AST, bytecode, compressed function
+/// text), loaded at boot (see `lumen_host::install`).
+const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
 
 #[derive(Default)]
 struct WebState {
@@ -310,6 +311,26 @@ fn op_url_domain_to_ascii(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 fn op_url_domain_to_unicode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let input = str_arg(ctx, args, 0)?.unwrap_or_default();
     Ok(Value::from_string(url::domain_to_unicode(&input)))
+}
+
+fn op_idna_to_ascii(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
+    Ok(Value::from_string(url::idna_to_ascii(&input)))
+}
+
+fn op_idna_to_unicode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
+    Ok(Value::from_string(url::domain_to_unicode_raw(&input)))
+}
+
+/// `(href, hash, unicode, search, auth)` -> href with the dropped parts removed.
+fn op_url_format(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let href = str_arg(ctx, args, 0)?.unwrap_or_default();
+    let flag = |i: usize| matches!(args.get(i), Some(Value::Bool(true)));
+    Ok(match url::format(&href, flag(1), flag(2), flag(3), flag(4)) {
+        Some(s) => Value::from_string(s),
+        None => Value::from_string(href),
+    })
 }
 
 // ---- crypto ----

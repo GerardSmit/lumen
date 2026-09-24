@@ -16,7 +16,11 @@ lumen-codegen = { path = "../lumen-codegen" }
 lumen-macros = { path = "../lumen-macros", optional = true }
 
 [features]
-default = ["intl"]
+default = ["intl", "typed"]
+# The typed tier's TypeScript/JSDoc analysis (`lumen::typescript::analyze`, the checker behind
+# `lumen typed`). TypeScript *syntax* is always parsed; this adds the type checker. Off for a
+# small build (release-small, mobile).
+typed = []
 # ECMA-402 (`Intl`) and the CLDR data tables backing it — the single largest contributor to
 # binary size. Disable (`--no-default-features`) for a small build: the `Intl` global is absent
 # and the `toLocale*` methods degrade to their locale-independent forms (like engines built
@@ -32,6 +36,11 @@ macros = ["embed", "dep:lumen-macros"]
 # Exposes internal compilation stages (`lumen::bench_api`) for the `internals` benchmark. Not a
 # stability commitment — for measurement only.
 bench = []
+# Exact allocation counters in `fastalloc` for the `LUMEN_MEM_STATS=1` report (live / peak /
+# free-list-cached bytes). They sit on the allocation fast path, so they are off by default; the
+# rest of the report (OS counters, system-heap summary, the engine's per-category walk) works
+# without this feature.
+mem-stats = []
 
 [lints]
 workspace = true

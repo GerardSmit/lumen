@@ -429,8 +429,11 @@ fn std_write(ctx: &mut Ctx, fd: i32, data: &[u8]) -> R<usize> {
 /// (seconds, nanoseconds) for atime, mtime, ctime, birthtime.
 type StatVec = Vec<f64>;
 
+#[cfg(windows)]
 const S_IFREG: f64 = 0o100000 as f64;
+#[cfg(windows)]
 const S_IFDIR: f64 = 0o040000 as f64;
+#[cfg(windows)]
 const S_IFLNK: f64 = 0o120000 as f64;
 #[cfg(windows)]
 const S_IFCHR: f64 = 0o020000 as f64;
@@ -524,6 +527,7 @@ mod win {
         pub delete_pending: u8,
         pub directory: u8,
     }
+    #[allow(clashing_extern_declarations)] // win_pipe.rs uses isize handles
     #[link(name = "kernel32")]
     extern "system" {
         pub fn GetFileInformationByHandle(h: HANDLE, info: *mut ByHandleInfo) -> i32;

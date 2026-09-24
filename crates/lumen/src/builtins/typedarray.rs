@@ -848,25 +848,19 @@ fn ta_native(
         })()),
         "forEach" => Some((|| {
             require_cb(i)?;
+            let mut f = crate::bytecode::PreparedCall::new(i, cb.clone(), this_arg.clone());
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                f.call3(i, v, Value::Num(k as f64), this)?;
             }
             Ok(Value::Undefined)
         })()),
         "every" => Some((|| {
             require_cb(i)?;
+            let mut f = crate::bytecode::PreparedCall::new(i, cb.clone(), this_arg.clone());
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = f.call3(i, v, Value::Num(k as f64), this)?;
                 if !i.to_boolean(&r) {
                     return Ok(Value::Bool(false));
                 }
@@ -875,13 +869,10 @@ fn ta_native(
         })()),
         "some" => Some((|| {
             require_cb(i)?;
+            let mut f = crate::bytecode::PreparedCall::new(i, cb.clone(), this_arg.clone());
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = f.call3(i, v, Value::Num(k as f64), this)?;
                 if i.to_boolean(&r) {
                     return Ok(Value::Bool(true));
                 }
@@ -890,6 +881,7 @@ fn ta_native(
         })()),
         "find" | "findIndex" | "findLast" | "findLastIndex" => Some((|| {
             require_cb(i)?;
+            let mut f = crate::bytecode::PreparedCall::new(i, cb.clone(), this_arg.clone());
             let want_value = method == "find" || method == "findLast";
             let reverse = method == "findLast" || method == "findLastIndex";
             let order: Vec<usize> = if reverse {
@@ -899,11 +891,7 @@ fn ta_native(
             };
             for k in order {
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v.clone(), Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = f.call3(i, v.clone(), Value::Num(k as f64), this)?;
                 if i.to_boolean(&r) {
                     return Ok(if want_value { v } else { Value::Num(k as f64) });
                 }
@@ -916,6 +904,7 @@ fn ta_native(
         })()),
         "map" => Some((|| {
             require_cb(i)?;
+            let mut f = crate::bytecode::PreparedCall::new(i, cb.clone(), this_arg.clone());
             let new_ta = ta_species_create(i, this, info.kind, &[Value::Num(len as f64)], true)?;
             let new_info = map_ptr(&new_ta)
                 .and_then(|p| i.typed_arrays.get(&p).copied())
@@ -924,25 +913,18 @@ fn ta_native(
                 })?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let mapped = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                let mapped = f.call3(i, v, Value::Num(k as f64), this)?;
                 ab(i.ta_store(&new_info, k, &mapped))?;
             }
             Ok(new_ta)
         })()),
         "filter" => Some((|| {
             require_cb(i)?;
+            let mut f = crate::bytecode::PreparedCall::new(i, cb.clone(), this_arg.clone());
             let mut kept: Vec<Value> = Vec::new();
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v.clone(), Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = f.call3(i, v.clone(), Value::Num(k as f64), this)?;
                 if i.to_boolean(&r) {
                     kept.push(v);
                 }
@@ -1789,7 +1771,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
     });
     // length / byteLength / byteOffset / buffer are accessor getters on %TypedArray.prototype% that
     // brand-check the receiver (calling one on a non-TypedArray is a TypeError).
-    for (name, getter) in [
+    for (k, (name, getter)) in [
         (
             "length",
             ta_length_get as fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>,
@@ -1797,8 +1779,14 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         ("byteLength", ta_bytelength_get),
         ("byteOffset", ta_byteoffset_get),
         ("buffer", ta_buffer_get),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let g = it.make_native(&format!("get {name}"), 0, getter);
+        // Remembered for `Interp::ta_meta_intrinsic` (the `ta.length` fast path's guard).
+        it.extra_protos
+            .insert(crate::interpreter::ta_meta::TA_META_GETTERS[k], g.clone());
         ta_proto.borrow_mut().props.insert(
             name,
             Property::accessor_prop(Some(Value::Obj(g)), None, false, true),

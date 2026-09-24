@@ -5,10 +5,13 @@
 //! `Throw`, while statements additionally produce `Return`/`Break`/`Continue` completions.
 
 mod arrays;
+mod async_body;
 mod bindings;
+pub(crate) mod class_fields;
 mod constructor_body;
 mod generator_body;
 mod this_binding;
+pub(crate) mod ta_meta;
 pub(crate) use bindings::BindingLayout;
 pub use bindings::VarMap;
 
@@ -183,7 +186,8 @@ impl Interp {
     }
 }
 
-mod frames;
+pub(crate) mod frames;
+pub(crate) mod stack_trace;
 pub use frames::FnFrame;
 
 /// Cached UTF-16 view of one string, keyed by `Rc<str>` identity (see `Interp::str_units`).
@@ -411,38 +415,72 @@ pub(crate) fn update_abrupt_empty(a: Abrupt, v: Value) -> Abrupt {
     }
 }
 
+/// The GlobalSymbolRegistry (`Symbol.for`): shared by every realm (incl. ShadowRealms).
+pub(crate) type SymRegistry = RefCell<HashMap<String, Rc<crate::value::SymbolData>>>;
+
 thread_local! {
-    /// The GlobalSymbolRegistry (`Symbol.for`): shared by every realm (incl. ShadowRealms).
-    static SYM_FOR: std::cell::RefCell<HashMap<String, Rc<crate::value::SymbolData>>> =
-        RefCell::new(Default::default());
+    static SYM_FOR: SymRegistry = RefCell::new(Default::default());
+    /// On a coroutine worker thread, the registry of the thread driving it (see
+    /// [`sym_for_enter`]); null elsewhere.
+    static SYM_FOR_DRIVER: std::cell::Cell<*const SymRegistry> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Run `f` on this thread's registry: its own, or on a coroutine worker the driver's.
+fn with_sym_for<T>(f: impl FnOnce(&SymRegistry) -> T) -> T {
+    let driver = SYM_FOR_DRIVER.with(|d| d.get());
+    if driver.is_null() {
+        SYM_FOR.with(f)
+    } else {
+        // SAFETY: set by `sym_for_enter` to the driving thread's registry, which outlives the
+        // coroutine (the driver's thread owns the engine), and only this thread runs while the
+        // driver is parked (the coroutine handoff is strict ping-pong).
+        f(unsafe { &*driver })
+    }
+}
+
+/// The registry this thread's code uses, for a coroutine body it hands to a worker thread.
+pub(crate) fn sym_for_handle() -> *const SymRegistry {
+    let driver = SYM_FOR_DRIVER.with(|d| d.get());
+    if driver.is_null() {
+        SYM_FOR.with(|m| m as *const SymRegistry)
+    } else {
+        driver
+    }
+}
+
+/// Make this (coroutine worker) thread use `registry` ([`sym_for_handle`] of its driver), or
+/// its own again for null; returns the previous setting.
+pub(crate) fn sym_for_enter(registry: *const SymRegistry) -> *const SymRegistry {
+    SYM_FOR_DRIVER.with(|d| d.replace(registry))
 }
 
 /// Reset the `Symbol.for` registry (a fresh Engine starts a fresh agent, but ShadowRealms and
 /// synthesized realms inside one engine keep sharing it).
 pub(crate) fn sym_for_reset() {
-    SYM_FOR.with(|m| m.borrow_mut().clear());
+    with_sym_for(|m| m.borrow_mut().clear());
 }
 
 /// Look up a `Symbol.for` registry entry.
 pub(crate) fn sym_for_get(key: &str) -> Option<Rc<crate::value::SymbolData>> {
-    SYM_FOR.with(|m| m.borrow().get(key).cloned())
+    with_sym_for(|m| m.borrow().get(key).cloned())
 }
 
 /// Register a `Symbol.for` symbol.
 pub(crate) fn sym_for_insert(key: String, sym: Rc<crate::value::SymbolData>) {
-    SYM_FOR.with(|m| {
+    with_sym_for(|m| {
         m.borrow_mut().insert(key, sym);
     });
 }
 
 /// Whether `sym` is a registered `Symbol.for` symbol (Symbol.keyFor's check).
 pub(crate) fn sym_for_contains(sym: &Rc<crate::value::SymbolData>) -> bool {
-    SYM_FOR.with(|m| m.borrow().values().any(|r| Rc::ptr_eq(r, sym)))
+    with_sym_for(|m| m.borrow().values().any(|r| Rc::ptr_eq(r, sym)))
 }
 
 /// The registry key of a registered symbol, if any.
 pub(crate) fn sym_for_key_of(sym: &Rc<crate::value::SymbolData>) -> Option<String> {
-    SYM_FOR.with(|m| {
+    with_sym_for(|m| {
         m.borrow()
             .iter()
             .find(|(_, r)| Rc::ptr_eq(r, sym))
@@ -690,6 +728,14 @@ pub struct Interp {
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
     pub(crate) class_info: crate::fasthash::FastMap<usize, ClassInfo>,
+    /// Constructor templates of plain constructor functions, keyed by the `Function`'s address
+    /// (kept alive by the entry). See [`crate::bytecode::ctor_plan`].
+    pub(crate) ctor_plans: crate::fasthash::FastMap<
+        usize,
+        (Rc<Function>, Option<Rc<crate::bytecode::ctor_plan::CtorPlan>>),
+    >,
+    /// The last constructor whose plan was looked up (a weak handle: its address stays unique).
+    pub(crate) plan_cache: Option<(crate::value::WeakGc, Rc<crate::bytecode::ctor_plan::CtorPlan>)>,
     /// The global `eval` function object, so a *direct* eval call (`eval(src)` by that name) can be
     /// distinguished from an indirect one and run in the caller's scope.
     pub(crate) eval_fn: Option<Gc>,
@@ -747,6 +793,8 @@ pub struct Interp {
     pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
     /// Shape-keyed memo state for the language fast paths (`eval::fastpaths`).
     pub(crate) lang: crate::eval::fastpaths::LangCaches,
+    /// The TypedArray `length`/`byteLength`/`byteOffset`/`buffer` read guard (`ta_meta`).
+    pub(crate) ta_meta: ta_meta::TaMetaCaches,
     /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer.
     pub(crate) array_buffers: crate::fasthash::FastMap<usize, crate::bytebuf::ByteBuf>,
     /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
@@ -814,8 +862,6 @@ pub struct Interp {
     /// Each holds its own intrinsics; the shared side tables (proxies, buffers, …) and well-known
     /// symbols are common, so objects cross realm boundaries freely.
     pub(crate) realms: crate::fasthash::FastMap<usize, RealmState>,
-    /// Promise state keyed by the promise object's pointer.
-    pub(crate) promises: crate::fasthash::FastMap<usize, PromiseState>,
     /// Rejected promises with no handler attached at rejection time (ptr -> reason). Removed when a
     /// handler is later attached; whatever remains after a microtask checkpoint is a genuine
     /// unhandled rejection the embedder can report (see [`Engine::take_unhandled_rejections`]).
@@ -845,6 +891,10 @@ pub struct Interp {
     pub(crate) gc_tick: u32,
     /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point.
     pub(crate) interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Host deadline for a bounded run (`vm` `timeout`): while set, every polled safe point
+    /// throws a catchable error, until the host clears it. Unlike `interrupt` it never latches
+    /// `terminating`, so the realm lives on after the host converts the error.
+    pub(crate) script_timeout: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Latched once `interrupt` was seen set: from then on every safe point (not one in 256)
     /// throws, so a `catch` that swallows the termination reaches the next call or loop turn
     /// and is terminated again.
@@ -866,6 +916,23 @@ pub struct Interp {
     /// Live user-function activations, oldest first: (fn ptr, fn object, arguments object,
     /// strict). Backs the legacy SpiderMonkey `fn.caller` / `fn.arguments` reflection.
     pub(crate) fn_frames: Vec<FnFrame>,
+    /// Newest pending JIT direct-call record (a `jit::JitFrame` on a shadow stack; 0 = none):
+    /// frames native code called directly keep their `fn_frames` entry lazily, linked from
+    /// here, logically above every `fn_frames` entry. Push to `fn_frames` only after
+    /// `bytecode::jit::sync_frames`; read the whole stack through `jit::pending_frames` (or sync
+    /// first). See `bytecode/jit/call.rs`.
+    pub(crate) jit_frames: usize,
+    /// The innermost running native function's [`frames::NativeCtx`] (its address on the
+    /// dispatcher's Rust stack; 0 = none), for the builtin frames of a stack trace.
+    pub(crate) native_top: usize,
+    /// The call site the running code is at (a source position, or a [`frames::SITE_PC`]-tagged
+    /// pc; [`frames::NO_SITE`] before its first call): set by each tier right before it calls
+    /// out, saved into the callee's [`FnFrame::caller_site`] on entry and restored on exit — so
+    /// a stack trace reads every frame's position without any per-call bookkeeping beyond
+    /// that one store.
+    pub(crate) cur_site: u32,
+    /// Source names and line tables for stack traces (see `stack_trace::Sources`).
+    pub(crate) sources: RefCell<stack_trace::Sources>,
     /// Monotonic [[AsyncEvaluationOrder]] source for module evaluation.
     pub(crate) module_async_seq: u64,
     /// Set by `yield*` just before parking: the yielded value is the inner iterator's result
@@ -908,17 +975,14 @@ pub struct Interp {
     pub(crate) deferred_ns: crate::fasthash::FastMap<usize, String>,
     /// module key → its (single) deferred namespace object.
     pub(crate) deferred_ns_objs: crate::fasthash::FastMap<String, Value>,
-    /// Promise-state forwarding: when a native super() grafts a fresh promise's state onto the
-    /// subclass `this`, the original object's resolvers redirect here.
-    pub(crate) promise_forward: crate::fasthash::FastMap<usize, Value>,
     /// Mapped `arguments` objects: object ptr → (function scope, per-index parameter name — None
     /// once unmapped by delete/defineProperty). Reads/writes of still-mapped indices alias the
     /// parameter bindings.
     pub(crate) mapped_arguments: crate::fasthash::FastMap<usize, (Env, Vec<Option<String>>)>,
     /// Source-phase imports: canonical module key → its (cached) ModuleSource object.
     pub(crate) module_source_objs: crate::fasthash::FastMap<String, Value>,
-    /// FinalizationRegistry registrations (ptr → unregister tokens), for `unregister`'s result.
-    pub(crate) fr_tokens: crate::fasthash::FastMap<usize, Vec<Value>>,
+    /// WeakRef targets, FinalizationRegistry cells and the kept-alive list (`builtins::weakrefs`).
+    pub(crate) weak: crate::builtins::weakrefs::WeakState,
     /// Async generators mid-step (running or parked at an `await`): further next/return/throw
     /// requests queue here (the spec's AsyncGeneratorRequest queue) until the step completes.
     pub(crate) async_gen_busy: std::collections::HashSet<usize>,
@@ -934,25 +998,20 @@ pub struct Disposable {
     pub method_is_async: bool,
 }
 
-/// A queued microtask: running one promise reaction.
+/// A queued microtask: running one promise reaction (or another promise job, per `kind`; see
+/// `eval::promise_fast::JOB_*`).
 pub struct Job {
     pub handler: Value,
     pub result: Value,
     pub value: Value,
     pub fulfilled: bool,
+    /// Which job this is (`eval::promise_fast::JOB_*`; 0 = an ordinary reaction).
+    pub(crate) kind: u8,
+    /// A combinator element job's index.
+    pub(crate) idx: u32,
     /// The async context (see [`Interp::async_context`]) captured when the reaction was
     /// registered; the handler runs inside it.
     pub context: Value,
-}
-
-#[derive(Default)]
-pub struct PromiseState {
-    /// 0 = pending, 1 = fulfilled, 2 = rejected.
-    pub status: u8,
-
-    pub value: Value,
-    /// Pending reactions: `(onFulfilled, onRejected, resultPromise, asyncContext)`.
-    pub reactions: Vec<(Value, Value, Value, Value)>,
 }
 
 /// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
@@ -969,6 +1028,10 @@ pub struct ClassInfo {
     /// Instance private methods and accessors, stamped as own properties on each instance when
     /// `this` is created (before the fields run). Stamping twice is a TypeError.
     pub private_members: Vec<(String, crate::value::Property)>,
+    /// The compiled field initializer (see [`class_fields`]).
+    pub(crate) field_code: class_fields::FieldCode,
+    /// The constructor template (see [`crate::bytecode::ctor_plan`]).
+    pub(crate) plan: crate::bytecode::ctor_plan::PlanState,
 }
 
 /// One instance field: its key, optional initializer expression, and any decorator-supplied
@@ -1000,7 +1063,7 @@ pub const GC_TRIGGER: i64 = 100_000;
 /// Layered calls check allocation counters once per 256 calls.
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
 /// Scope-registry entry count that arms a registry prune.
-const SCOPE_GC_TRIGGER: usize = 65_536;
+const SCOPE_GC_TRIGGER: usize = 4_096;
 
 /// Memory safety valves. lumen has no garbage collector and several built-ins iterate/allocate in
 /// proportion to a user-controlled `length`, so without these a single adversarial test (e.g.
@@ -1269,6 +1332,8 @@ impl Interp {
             strict: false,
             depth: 0,
             class_info: Default::default(),
+            ctor_plans: Default::default(),
+            plan_cache: None,
             eval_fn: None,
             eval_realm_fns: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
@@ -1305,6 +1370,7 @@ impl Interp {
             map_data: Default::default(),
             extra_protos: Default::default(),
             lang: Default::default(),
+            ta_meta: Default::default(),
             array_buffers: Default::default(),
             shared_buffers: Default::default(),
             immutable_buffers: std::collections::HashSet::new(),
@@ -1327,7 +1393,6 @@ impl Interp {
             htmldda: Vec::new(),
             ctor_caller_realm: None,
             realms: Default::default(),
-            promises: Default::default(),
             unhandled_rejections: Default::default(),
             temporal: Default::default(),
             temporal_cal: Default::default(),
@@ -1338,6 +1403,7 @@ impl Interp {
             gc_next: GC_TRIGGER,
             gc_tick: 0,
             interrupt: None,
+            script_timeout: None,
             terminating: false,
             heap_limit_hit: false,
             live_limit: MAX_LIVE,
@@ -1345,6 +1411,10 @@ impl Interp {
             constructing: false,
             super_call_ok: false,
             fn_frames: Vec::new(),
+            jit_frames: 0,
+            native_top: 0,
+            cur_site: frames::NO_SITE,
+            sources: Default::default(),
             module_async_seq: 0,
             in_field_init_code: false,
             yield_raw_result: false,
@@ -1359,10 +1429,9 @@ impl Interp {
             annexb_fn_sync: Default::default(),
             deferred_ns: Default::default(),
             deferred_ns_objs: Default::default(),
-            promise_forward: Default::default(),
             mapped_arguments: Default::default(),
             module_source_objs: Default::default(),
-            fr_tokens: Default::default(),
+            weak: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
         };
@@ -1392,15 +1461,25 @@ impl Interp {
     // ----- error helpers ----------------------------------------------------------------------
 
     pub fn make_error(&self, kind: &str, message: impl Into<String>) -> Value {
+        self.make_error_skip(kind, message, None)
+    }
+
+    /// [`Interp::make_error`], its stack trace leaving out the frames up to and including the
+    /// innermost call of `skip` (see `stack_trace::capture_trace`).
+    pub(crate) fn make_error_skip(
+        &self,
+        kind: &str,
+        message: impl Into<String>,
+        skip: Option<(usize, bool)>,
+    ) -> Value {
         let proto = self
             .error_protos
             .get(kind)
             .cloned()
             .unwrap_or_else(|| self.error_protos["Error"].clone());
         let obj = Object::new(Some(proto));
-        let stack = self.capture_stack();
-        obj.borrow_mut()
-            .set_exotic(Exotic::Error, Some(Value::Str(stack.into())));
+        let stack = self.capture_trace(skip);
+        obj.borrow_mut().set_exotic(Exotic::Error, Some(stack));
         let msg = message.into();
         if !msg.is_empty() {
             obj.borrow_mut()
@@ -1409,30 +1488,39 @@ impl Interp {
         }
         Value::Obj(obj)
     }
-    /// Snapshot the current call stack as the `\n    at <fn>` lines for an error's `stack`.
-    /// Innermost frame first (Node order). We are a tree-walker without per-call source spans, so
-    /// frames carry the function name only (`<anonymous>` when unnamed); the `stack` getter adds
-    /// the `name: message` head. Bounded by the engine's own recursion guard (~128 frames).
-    fn capture_stack(&self) -> Rc<str> {
-        let mut out = String::new();
-        for frame in self.fn_frames.iter().rev() {
-            let callee = frame.callee();
-            let name = {
-                let b = callee.borrow();
-                match b.props.get("name").map(|p| p.value()) {
-                    Some(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
-                    _ => None,
-                }
-            }
-            .unwrap_or_else(|| "<anonymous>".to_string());
-            out.push_str("\n    at ");
-            out.push_str(&name);
-        }
-        Rc::from(out.as_str())
-    }
-
     pub fn throw(&self, kind: &str, message: impl Into<String>) -> Abrupt {
         Abrupt::Throw(self.make_error(kind, message))
+    }
+    /// The SyntaxError a TypeScript parse failure throws: Node's message, with its
+    /// `ERR_*_TYPESCRIPT_SYNTAX` code as the `code` property.
+    /// The SyntaxError for a rejected TypeScript source `src` (`file`): Node's `code`, and
+    /// Node's `stack` text (a code frame of the offending span, then
+    /// `SyntaxError [code]: message`), which an uncaught report prints as Node does.
+    pub(crate) fn throw_ts_syntax(
+        &self,
+        e: crate::parser::ParseError,
+        file: &str,
+        src: &str,
+    ) -> Abrupt {
+        let code = crate::typescript::error_code(&e.message);
+        let stack = crate::typescript::node_error_text(
+            file,
+            src,
+            crate::parser::ts_error_span(),
+            e.line,
+            &e.message,
+        );
+        let err = self.make_error("SyntaxError", e.message);
+        if let Value::Obj(o) = &err {
+            let mut o = o.borrow_mut();
+            o.props.insert(
+                "code",
+                Property::builtin(Value::from_string(code.to_string())),
+            );
+            o.props
+                .insert("stack", Property::builtin(Value::from_string(stack)));
+        }
+        Abrupt::Throw(err)
     }
     #[allow(dead_code)]
     pub fn type_err<T>(&self, message: impl Into<String>) -> Result<T, Abrupt> {
@@ -1733,8 +1821,7 @@ impl Interp {
     /// `(status, value)` of a promise (0 pending, 1 fulfilled, 2 rejected), for hosts that
     /// render promises the way Node's `util.inspect` does. `None` for a non-promise.
     pub fn promise_state_for_host(&self, v: &Value) -> Option<(u8, Value)> {
-        let ptr = self.object_addr(v)?;
-        self.promises.get(&ptr).map(|p| (p.status, p.value.clone()))
+        crate::eval::promise_fast::promise_state(v)
     }
 
     /// `(target, handler)` of a proxy, for `util.inspect(proxy, { showProxy: true })`.
@@ -2064,14 +2151,35 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Value> {
-        match call {
+        // Tag the call site while the native runs: a function it calls back sees a builtin
+        // caller (`fn.caller` is null, see `bytecode::reflect`), and link its frame record.
+        let site = self.cur_site;
+        let held = frames::hold_receiver(&this);
+        let ctx = frames::NativeCtx {
+            prev: self.native_top,
+            site,
+            construct: self.constructing,
+            hidden: std::cell::Cell::new(false),
+            id: match call {
+                Callable::Native(f) => *f as usize,
+                _ => 0,
+            },
+            recv_kind: frames::recv_kind(&this),
+            this: frames::held_ptr(&held),
+        };
+        self.native_top = &ctx as *const frames::NativeCtx as usize;
+        self.cur_site = site | frames::SITE_NATIVE;
+        let r = match call {
             Callable::Native(f) => f(self, this, args),
             Callable::NativeData(data) => {
                 let f = data.func.clone();
                 f(self, this, args)
             }
             _ => unreachable!("dispatch_native on a non-native callable"),
-        }
+        };
+        self.cur_site = site;
+        self.native_top = ctx.prev;
+        r
     }
 
     /// A function `Value` backed by a data-carrying native closure — the embedder API for host
@@ -2250,6 +2358,20 @@ impl Interp {
     }
 
     pub(crate) fn make_function(&self, func: Rc<Function>, env: Env) -> Value {
+        self.make_function_named(func, env, None).0
+    }
+
+    /// [`make_function`](Interp::make_function) with NamedEvaluation's inferred `name` folded
+    /// in where that is free: a fresh prototype-less closure of an unnamed function takes the
+    /// function's cached named template (the one [`set_fn_name`](Interp::set_fn_name) builds)
+    /// instead of the unnamed map it would immediately replace. The flag says whether the name
+    /// was applied; when it is `false` the caller still owes `set_fn_name(&v, name)`.
+    pub(crate) fn make_function_named(
+        &self,
+        func: Rc<Function>,
+        env: Env,
+        name: Option<&str>,
+    ) -> (Value, bool) {
         let is_arrow = func.is_arrow;
         let is_method = func.is_method;
         let is_generator = func.is_generator;
@@ -2276,7 +2398,9 @@ impl Interp {
         // touch the shape. A closure without a `prototype` has nothing to patch, so its clone
         // shares the template's entry block until (if ever) something writes to it.
         let crate::value::FnMaps {
-            fn_map, proto_map, ..
+            fn_map,
+            proto_map,
+            named,
         } = &**func.fn_maps.get_or_init(|| {
             let arity = func
                 .params
@@ -2293,6 +2417,12 @@ impl Interp {
                 crate::value::fn_key(1), // "name"
                 Property::data(Value::from_string(name), false, false, true),
             );
+            // A sloppy ordinary function's own legacy `arguments` / `caller` (V8's order).
+            if crate::bytecode::reflect::is_legacy(&func) {
+                for (k, prop) in crate::bytecode::reflect::own_props(self).into_iter().flatten() {
+                    p.insert(k, prop);
+                }
+            }
             if has_prototype {
                 p.insert(
                     crate::value::fn_key(2), // "prototype" (placeholder value; patched per clone)
@@ -2320,12 +2450,29 @@ impl Interp {
                 named: std::cell::OnceCell::new(),
             })
         });
-        let obj = Object::new_bare(Some(fn_proto));
-        {
-            let mut b = obj.borrow_mut();
-            b.call = Callable::user(func.clone(), env);
-            b.props = fn_map.clone();
-        }
+        let mut named_done = false;
+        let props = match name {
+            Some(n) if !has_prototype && func.name.as_deref().is_none_or(str::is_empty) => {
+                let (cached, p) = &**named.get_or_init(|| {
+                    let mut p = fn_map.clone();
+                    p.insert(
+                        crate::value::fn_key(1),
+                        Property::data(Value::str(n), false, false, true),
+                    );
+                    p.share_entries();
+                    Box::new((Rc::from(n), p))
+                });
+                if &**cached == n {
+                    named_done = true;
+                    p.clone()
+                } else {
+                    fn_map.clone()
+                }
+            }
+            _ => fn_map.clone(),
+        };
+        let obj = Object::new_with_parts(Some(fn_proto), props, Exotic::None);
+        obj.borrow_mut().call = Callable::user(func.clone(), env);
         if has_prototype {
             let proto_parent = match (is_generator, is_async) {
                 (true, false) => self.extra_protos.get("%GeneratorPrototype%").cloned(),
@@ -2344,16 +2491,25 @@ impl Interp {
                         .set_value(Value::Obj(obj.clone()));
                 }
             }
-            obj.borrow_mut()
-                .props
-                .entry_at_mut(2)
+            if !is_generator {
+                // The fn <-> prototype cycle: freed by refcount once both are unreachable.
+                Gc::mark_fn_proto_pair(&obj, &proto);
+            }
+            // `prototype` follows length, name and (legacy functions) arguments, caller.
+            let mut b = obj.borrow_mut();
+            let at = match b.props.entry_at_mut(2) {
+                Some(p) if p.accessor() => 4,
+                _ => 2,
+            };
+            b.props
+                .entry_at_mut(at)
                 .expect("prototype slot")
                 .set_value(Value::Obj(proto));
         }
         if !is_arrow && !is_method && !is_async && !is_generator {
             obj.borrow_mut().is_constructor = true;
         }
-        Value::Obj(obj)
+        (Value::Obj(obj), named_done || name.is_none())
     }
 
     // ----- property access --------------------------------------------------------------------
@@ -3022,8 +3178,10 @@ impl Interp {
         let Value::Str(lv) = &lval else {
             return Err(lval);
         };
-        if lv.len() + x.len() > MAX_STR_LEN {
-            return Err(lval); // the generic path raises the RangeError
+        // Too long: the generic path raises the RangeError. A smuggled high surrogate meeting a
+        // smuggled low must join canonically (`jstr::concat`), which a byte append would skip.
+        if lv.len() + x.len() > MAX_STR_LEN || crate::jstr::needs_join_fixup(lv, x) {
+            return Err(lval);
         }
         let mut b = o.borrow_mut();
         if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
@@ -3440,33 +3598,22 @@ impl Interp {
                         TaIndex::Exotic => return Ok(Value::Undefined),
                         TaIndex::Ordinary => {}
                     }
-                    // The meta keys live on %TypedArray.prototype% as accessors; an own property
-                    // (defineProperty on the instance) shadows them.
-                    let cur = self.ta_len(&info);
-                    if o.borrow().props.contains(key) {
-                        return self.get_from_chain(&o, key, &receiver);
-                    }
-                    match key {
-                        "length" => return Ok(Value::Num(cur.unwrap_or(0) as f64)),
-                        "byteLength" => {
-                            return Ok(Value::Num((cur.unwrap_or(0) * info.kind.elsize()) as f64))
-                        }
-                        "byteOffset" => {
-                            return Ok(Value::Num(if cur.is_none() {
-                                0.0
-                            } else {
-                                info.offset as f64
-                            }))
-                        }
-                        "BYTES_PER_ELEMENT" => return Ok(Value::Num(info.kind.elsize() as f64)),
-                        "buffer" => {
-                            return Ok(self
-                                .ta_buffer
-                                .get(&ptr)
-                                .cloned()
-                                .unwrap_or(Value::Undefined))
-                        }
-                        _ => {}
+                    // The meta keys live on %TypedArray.prototype% as accessors: compute them
+                    // directly only while the read would reach those intrinsic getters with this
+                    // object as the receiver (no own property, no shadowing prototype, no
+                    // replaced getter); otherwise it is an ordinary [[Get]].
+                    let meta = Interp::ta_meta_index(key).filter(|&k| {
+                        matches!(&receiver, Value::Obj(r) if Gc::ptr_eq(r, &o))
+                            && self.ta_meta_intrinsic(&o.borrow(), k)
+                    });
+                    if let Some(k) = meta {
+                        let cur = self.ta_len(&info);
+                        return Ok(match k {
+                            0 => Value::Num(cur.unwrap_or(0) as f64),
+                            1 => Value::Num((cur.unwrap_or(0) * info.kind.elsize()) as f64),
+                            2 => Value::Num(if cur.is_none() { 0.0 } else { info.offset as f64 }),
+                            _ => self.ta_buffer.get(&ptr).cloned().unwrap_or(Value::Undefined),
+                        });
                     }
                 }
                 self.get_from_chain(&o, key, &receiver)
@@ -3523,9 +3670,8 @@ impl Interp {
                     value,
                 };
                 if p.accessor {
-                    // Legacy `fn.caller` / `fn.arguments`: reading the poisoned
-                    // %Function.prototype% accessor through an ordinary sloppy function
-                    // yields undefined instead of throwing.
+                    // Legacy `fn.caller` / `fn.arguments` of a sloppy function that lacks the
+                    // own properties (see `bytecode::reflect`): not the poison pill.
                     if matches!(key, "caller" | "arguments")
                         && self.is_throw_type_error(&p.get)
                         && !Gc::ptr_eq(
@@ -3536,61 +3682,16 @@ impl Interp {
                             },
                         )
                     {
-                        if let Value::Obj(r) = receiver {
-                            let plain = match &r.borrow().call {
-                                Callable::User(user) => {
-                                    !user.func.is_strict
-                                        && !user.func.is_arrow
-                                        && !user.func.is_generator
-                                        && !user.func.is_async
-                                        && !user.func.is_method
-                                }
-                                _ => false,
-                            };
-                            if plain {
-                                // Legacy SpiderMonkey reflection: the youngest activation's
-                                // arguments object / calling function (null when inactive; a
-                                // strict caller is censored to null). Eval runs inline, so eval
-                                // frames are naturally skipped.
-                                let rptr = Gc::as_ptr(r) as usize;
-                                let top = self.fn_frames.iter().rposition(|fr| fr.fn_ptr == rptr);
-                                return Ok(match (key, top) {
-                                    (_, None) => Value::Null,
-                                    ("arguments", Some(k)) => {
-                                        // The activation skipped building its arguments object
-                                        // (the body never names it) — conjure it now.
-                                        let lazy = match self.fn_frames[k].extra.as_deref() {
-                                            Some(x) if matches!(x.args_obj, Value::Null) => {
-                                                x.lazy.clone().map(|l| (l, x.unmapped))
-                                            }
-                                            _ => None,
-                                        };
-                                        if let Some(((func, args, scope), unmapped)) = lazy {
-                                            let ao =
-                                                self.make_arguments_object(&func, &args, &scope, r);
-                                            if unmapped {
-                                                let p = Gc::as_ptr(&ao) as usize;
-                                                if self.mapped_arguments.remove(&p).is_some() {
-                                                    self.gc_pins.remove(&p);
-                                                }
-                                            }
-                                            if let Some(x) = self.fn_frames[k].extra.as_deref_mut()
-                                            {
-                                                x.args_obj = Value::Obj(ao);
-                                            }
-                                        }
-                                        match self.fn_frames[k].extra.as_deref() {
-                                            Some(x) => x.args_obj.clone(),
-                                            None => Value::Null,
-                                        }
-                                    }
-                                    (_, Some(k)) => match self.fn_frames[..k].last() {
-                                        None => Value::Null,
-                                        Some(fr) if fr.strict => Value::Null,
-                                        Some(fr) => Value::Obj(fr.callee()),
-                                    },
-                                });
-                            }
+                        let legacy = matches!(receiver, Value::Obj(r) if matches!(
+                            &r.borrow().call,
+                            Callable::User(u) if crate::bytecode::reflect::is_legacy(&u.func)
+                        ));
+                        if legacy {
+                            return Ok(if key == "arguments" {
+                                crate::bytecode::reflect::read_arguments(self, receiver)
+                            } else {
+                                crate::bytecode::reflect::read_caller(self, receiver)
+                            });
                         }
                     }
                     return match p.get {
@@ -4359,7 +4460,10 @@ impl Interp {
     #[inline]
     pub(crate) fn gc_check_amortized(&mut self) -> Result<(), Abrupt> {
         self.gc_tick = self.gc_tick.wrapping_add(1);
-        if self.gc_tick & GC_CALL_POLL_MASK == 0 || self.terminating {
+        if self.gc_tick & GC_CALL_POLL_MASK == 0
+            || self.terminating
+            || crate::bytebuf::gc_pressure()
+        {
             self.gc_check()
         } else {
             Ok(())
@@ -4374,11 +4478,14 @@ impl Interp {
             let live = scope_registry_prune();
             self.scope_gc_next = live.saturating_mul(2).max(SCOPE_GC_TRIGGER);
         }
-        if crate::value::live_objects() <= self.gc_next {
+        let before = crate::value::live_objects();
+        if before <= self.gc_next && !crate::bytebuf::gc_pressure() {
             return Ok(());
         }
         self.gc_collect();
+        crate::bytebuf::after_gc();
         let live = crate::value::live_objects();
+
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!("[gc] live={live}");
         }
@@ -4396,8 +4503,13 @@ impl Interp {
         // half, whichever is later. Doubling let a heap of 300k live objects carry 300k more of
         // cyclic garbage (closures and their scopes) before the next pass — about as much memory
         // again as the live set.
-        self.gc_next = (live + (live / 4).max(GC_TRIGGER)).clamp(GC_TRIGGER, self.live_limit);
+        // A pass that reclaimed under an eighth of the heap means the heap is growing with live
+        // data (a long promise chain, a big build-up): collecting again at +25% would rescan the
+        // same survivors every few allocations, so wait until live doubles instead.
+        let growth = if before - live < before / 8 { live } else { live / 4 };
+        self.gc_next = (live + growth.max(GC_TRIGGER)).clamp(GC_TRIGGER, self.live_limit);
         Ok(())
+
     }
 
     /// Throw the termination if the embedder asked this realm to stop. Cheap when it has not:
@@ -4409,10 +4521,25 @@ impl Interp {
                 Some(flag) if flag.load(std::sync::atomic::Ordering::Relaxed) => {
                     self.terminating = true;
                 }
-                _ => return Ok(()),
+                _ => {
+                    if let Some(deadline) = &self.script_timeout {
+                        if deadline.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(self.throw("Error", "Script execution timed out"));
+                        }
+                    }
+                    return Ok(());
+                }
             }
         }
         Err(self.termination())
+    }
+
+    /// The flag behind `script_timeout`, created on first use. A host thread sets it when a
+    /// deadline passes; the host clears it once the bounded run has unwound.
+    pub fn script_timeout_flag(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.script_timeout
+            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
     }
 
     /// The error a terminated realm throws. An ordinary `Error`, so native code that catches and
@@ -4470,10 +4597,21 @@ impl Interp {
     /// object's aliased parameter scope, and a class constructor's field-initializer environment.
     fn obj_scope_refs_into(&self, o: &Gc, out: &mut Vec<Env>) {
         out.clear();
-        if let Callable::User(user) = &o.borrow().call {
-            out.push(user.env.clone());
-        }
-        if self.mapped_arguments.is_empty() && self.class_info.is_empty() {
+        // Only a user function (a class constructor) can have `class_info`, and only an
+        // arguments exotic object `mapped_arguments`: the rest of the heap skips both probes.
+        let (user, arguments) = {
+            let b = o.borrow();
+            let user = if let Callable::User(user) = &b.call {
+                out.push(user.env.clone());
+                true
+            } else {
+                false
+            };
+            (user, matches!(b.exotic, Exotic::Arguments))
+        };
+        if !(user && !self.class_info.is_empty()
+            || arguments && !self.mapped_arguments.is_empty())
+        {
             return;
         }
         let ptr = Gc::as_ptr(o) as usize;
@@ -4485,8 +4623,10 @@ impl Interp {
         }
     }
 
+
     pub(crate) fn gc_collect(&mut self) {
         let live = crate::value::gc_snapshot();
+
         // Scopes are graph nodes too: a closure's captured environment references objects (its
         // bindings) and vice versa (`Callable::User`), so cycles routinely pass through them.
         let scopes = scope_snapshot();
@@ -4543,6 +4683,20 @@ impl Interp {
         for o in self.gc_pins.values() {
             o.borrow().gc_add_ref();
         }
+        // A Map/Set/WeakMap/WeakSet's entries are edges of the collection object (the table is
+        // its [[MapData]] slot), not external holders: a collection in a cycle, and whatever a
+        // weak collection holds, must not root its entries. Strong collections trace them when
+        // marked; weak ones as ephemerons (below).
+        for data in self.map_data.values() {
+            for (k, v) in data.iter() {
+                if let Value::Obj(o) = k {
+                    o.borrow().gc_add_ref();
+                }
+                if let Value::Obj(o) = v {
+                    o.borrow().gc_add_ref();
+                }
+            }
+        }
         // Roots: nodes with a reference from outside the heap graph (the Rust call stack, the
         // Interp's own fields, module/realm registries, coroutine threads). `strong_count`
         // includes exactly one clone held by the snapshot, so external refs == strong - internal - 1.
@@ -4595,7 +4749,10 @@ impl Interp {
                 }
             }
         }
-        // Mark everything reachable from the roots, across both node types.
+        // Mark everything reachable from the roots, across both node types. Live weak
+        // collections are gathered for the ephemeron pass: a WeakMap value (a WeakSet member)
+        // is reachable only while its key is, however the value refers back to the key.
+        let mut weak_live: Vec<usize> = Vec::new();
         loop {
             if let Some(o) = stack.pop() {
                 crate::value::gc_edges::object_refs_into(&o, &mut object_refs);
@@ -4603,6 +4760,26 @@ impl Interp {
                     if !p.borrow().gc_marked() {
                         p.borrow().gc_set_mark();
                         stack.push(p);
+                    }
+                }
+                if !self.map_data.is_empty() {
+                    let ptr = Gc::as_ptr(&o) as usize;
+                    if let Some(data) = self.map_data.get(&ptr) {
+                        use crate::builtins::collection_data::CollectionKind as K;
+                        if matches!(data.kind(), K::WeakMap | K::WeakSet) {
+                            weak_live.push(ptr);
+                        } else {
+                            for (k, v) in data.iter() {
+                                for x in [k, v] {
+                                    if let Value::Obj(p) = x {
+                                        if !p.borrow().gc_marked() {
+                                            p.borrow().gc_set_mark();
+                                            stack.push(p.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 self.obj_scope_refs_into(&o, &mut scope_refs);
@@ -4616,7 +4793,28 @@ impl Interp {
                 }
                 continue;
             }
-            let Some(e) = sstack.pop() else { break };
+            let Some(e) = sstack.pop() else {
+                // Ephemerons: mark the values of live weak collections whose keys are marked,
+                // then resume marking from them until nothing changes.
+                for ptr in &weak_live {
+                    for (k, v) in self.map_data[ptr].iter() {
+                        let key_live = match k {
+                            Value::Obj(ko) => ko.borrow().gc_marked(),
+                            _ => true,
+                        };
+                        if let (true, Value::Obj(vo)) = (key_live, v) {
+                            if !vo.borrow().gc_marked() {
+                                vo.borrow().gc_set_mark();
+                                stack.push(vo.clone());
+                            }
+                        }
+                    }
+                }
+                if stack.is_empty() {
+                    break;
+                }
+                continue;
+            };
             let b = e.borrow();
             if let Some(p) = &b.parent {
                 if let Some(&k) = sidx.get(&(Rc::as_ptr(p) as usize)) {
@@ -4650,6 +4848,20 @@ impl Interp {
             }
         }
 
+        // Entries of live weak collections whose key died go now: the key (and a value only
+        // it kept alive) is swept below, and nothing may observe it through the table.
+        for ptr in &weak_live {
+            let data = self.map_data.get_mut(ptr).unwrap();
+            let dead: Vec<Value> = data
+                .iter()
+                .filter(|(k, _)| matches!(k, Value::Obj(ko) if !ko.borrow().gc_marked()))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &dead {
+                data.remove_weak(k);
+            }
+        }
+
         // `gc_internal` is pure collection scratch (every collection starts with `gc_reset`),
         // so the marks are simply left in place for the sweep below.
 
@@ -4673,7 +4885,7 @@ impl Interp {
                         }
                     )*};
                 }
-                evict!(class_info, map_data, typed_arrays, data_views, regexps, proxies, promises, temporal, array_buffers, ta_buffer, shared_buffers, immutable_buffers, generators, async_gens, async_gen_busy, async_gen_queue, mapped_arguments, deferred_ns, promise_forward, gc_pins);
+                evict!(class_info, map_data, typed_arrays, data_views, regexps, proxies, temporal, array_buffers, ta_buffer, shared_buffers, immutable_buffers, generators, async_gens, async_gen_busy, async_gen_queue, mapped_arguments, deferred_ns, gc_pins);
                 let mut b = o.borrow_mut();
                 b.props.clear();
                 b.proto = None;
@@ -4695,6 +4907,8 @@ impl Interp {
         // platform pressure-relief call to phase changes, not ordinary generational churn.
         drop(live);
         drop(scopes);
+        // FinalizationRegistry targets may have died: the next checkpoint scans for them.
+        self.weak_note_collection();
         crate::value::gc_trim_heap();
         // Function bodies that ran (a module initialiser, a one-shot setup path) and then sat
         // untouched for a whole collection interval are released here and re-parsed if they
@@ -4721,6 +4935,10 @@ impl Interp {
     // ----- calling ----------------------------------------------------------------------------
 
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
+        if let Some(f) = self.leaf_native(&callee) {
+            drop(callee);
+            return self.call_native_fast(f, this, args);
+        }
         self.depth += 1;
         if self.depth > MAX_EVAL_DEPTH {
             self.depth -= 1;
@@ -4746,7 +4964,90 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
+                    // A strict tail caller: hidden from `fn.caller` (see `bytecode::tail_leave`).
+                    let site = self.cur_site;
+                    self.cur_site = site | frames::SITE_NATIVE;
                     r = self.call_inner(f, t, &a);
+                    self.cur_site = site;
+                }
+                None => break,
+            }
+        }
+        self.depth -= 1;
+        r
+    }
+
+    /// The bare `fn` behind `callee` when a call can skip the generic dispatch chain: a plain
+    /// native function (`Callable::Native`) in a single-realm engine. A proxy wrapping a
+    /// callable also carries a `Callable::Native` (its placeholder) but is never `ic_plain`, and
+    /// with one realm there is no realm switch and no foreign `eval` to intercept — exactly the
+    /// cases `call_inner` / `call_dispatch` handle before reaching a native.
+    #[inline(always)]
+    pub(crate) fn leaf_native(&self, callee: &Value) -> Option<crate::value::NativeFn> {
+        let Value::Obj(o) = callee else {
+            return None;
+        };
+        let b = o.borrow();
+        match b.call {
+            Callable::Native(f) if b.ic_plain.get() && !self.multi_realm() => Some(f),
+            _ => None,
+        }
+    }
+
+    /// [`call`](Interp::call) of a native `f` that [`leaf_native`](Interp::leaf_native)
+    /// accepted: the same depth / GC-poll / `constructing` / `new.target` bookkeeping as the
+    /// generic path (`call` → `call_inner` → `call_dispatch` → `dispatch_native`), without the
+    /// dispatch chain's callee and callable clones.
+    #[inline]
+    pub(crate) fn call_native_fast(
+        &mut self,
+        f: crate::value::NativeFn,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
+        self.depth += 1;
+        if self.depth > MAX_EVAL_DEPTH {
+            self.depth -= 1;
+            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+        }
+        if let Err(e) = self.gc_check_amortized() {
+            self.depth -= 1;
+            return Err(e);
+        }
+        let saved_ctor = std::mem::replace(&mut self.constructing, false);
+        let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+        // The builtin-caller tag and frame record (see `dispatch_native`).
+        let site = self.cur_site;
+        let held = frames::hold_receiver(&this);
+        let ctx = frames::NativeCtx {
+            prev: self.native_top,
+            site,
+            construct: false,
+            hidden: std::cell::Cell::new(false),
+            id: f as usize,
+            recv_kind: frames::recv_kind(&this),
+            this: frames::held_ptr(&held),
+        };
+        self.native_top = &ctx as *const frames::NativeCtx as usize;
+        self.cur_site = site | frames::SITE_NATIVE;
+        let mut r = f(self, this, args).map_err(Abrupt::Throw);
+        self.cur_site = site;
+        self.native_top = ctx.prev;
+        self.constructing = saved_ctor;
+        self.new_target = saved_nt;
+        // `call`'s trampoline (a native that ran a tail call through `call_inner`).
+        while r.is_ok() {
+            match self.pending_tail.take() {
+                Some(bx) => {
+                    let (g, t, a) = *bx;
+                    if let Err(e) = self.gc_check_amortized() {
+                        r = Err(e);
+                        break;
+                    }
+                    let site = self.cur_site;
+                    self.cur_site = site | frames::SITE_NATIVE;
+                    r = self.call_inner(g, t, &a);
+                    self.cur_site = site;
                 }
                 None => break,
             }
@@ -4928,7 +5229,9 @@ impl Interp {
             self.new_target = Value::Undefined;
         }
         let r = match call {
-            Callable::None => Err(self.throw("TypeError", "value is not a function")),
+            Callable::None | Callable::Promise(_) => {
+                Err(self.throw("TypeError", "value is not a function"))
+            }
             Callable::Native(_) | Callable::NativeData(_) => self
                 .dispatch_native(&call, this, args)
                 .map_err(Abrupt::Throw),
@@ -4951,6 +5254,10 @@ impl Interp {
                 let mut all = bound.args.clone();
                 all.extend_from_slice(args);
                 self.call(Value::Obj(bound.target), bound.this, &all)
+            }
+            Callable::Resolver(cell, fulfil) => {
+                self.call_promise_resolver(&cell, fulfil, args);
+                Ok(Value::Undefined)
             }
             Callable::WrappedShadow(shadow) => {
                 self.call_wrapped_shadow(shadow.realm, (*shadow.target).clone(), args)
@@ -5448,14 +5755,19 @@ impl Interp {
         is_construct: bool,
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
+        crate::bytecode::jit::sync_frames(self);
         self.fn_frames.push(FnFrame {
             fn_ptr: Gc::as_ptr(fn_obj) as usize,
             coro: self.cur_coro,
+            caller_site: std::mem::replace(&mut self.cur_site, frames::NO_SITE),
             strict: func.is_strict,
+            construct: is_construct,
             extra: None,
         });
         let r = self.call_user_inner(func, closure, this, args, is_construct, fn_obj);
-        self.fn_frames.pop();
+        if let Some(f) = self.fn_frames.pop() {
+            self.cur_site = f.caller_site;
+        }
         r
     }
 
@@ -5491,16 +5803,26 @@ impl Interp {
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
         // A body the parser skipped is parsed here, on the first call; a SyntaxError in it
-        // surfaces as a throw from that call rather than at load.
-        if let Err(e) = func.ensure_body() {
-            return Err(self.throw("SyntaxError", e.message));
+        // surfaces as a throw from that call rather than at load. An ahead-of-time body is
+        // decoded only if the function does not run on its precompiled chunk (below).
+        if !func.body_is_aot_deferred() {
+            if let Err(e) = func.ensure_body() {
+                return Err(self.throw("SyntaxError", e.message));
+            }
         }
         // A generator whose body compiles runs on a bytecode coroutine (`VmCoro`).
         if func.is_generator {
             if let Some(r) = self.call_compiled_generator(func, &closure, &this, args, fn_obj) {
                 return r;
             }
+        } else if func.is_async && !is_construct {
+            // Likewise an async body: no activation scope, a coroutine seeded from `args`.
+            if let Some(r) = self.call_compiled_async(func, &closure, &this, args, fn_obj) {
+
+                return r;
+            }
         }
+
         // Eligible synchronous bodies use compiled slots, with a real activation only when
         // capture analysis requires one. Compiler refusals retain the tree-walker fallback.
         // Plain and base-class constructor bodies qualify: run_constructor_on has already
@@ -5558,6 +5880,9 @@ impl Interp {
                 }
                 return r;
             }
+        }
+        if let Err(e) = func.ensure_body() {
+            return Err(self.throw("SyntaxError", e.message));
         }
         // Debug: `LUMEN_AST_HOT=1` reports functions whose bodies keep executing on the
         // tree-walker (each time the per-function call count crosses a power of ten).
@@ -5695,14 +6020,13 @@ impl Interp {
                 );
             }
             // The `arguments` exotic object is built only when the body (or a nested arrow, or a
-            // possible direct eval) can name it. Otherwise a plain sloppy function stashes what a
-            // reflective `fn.arguments` read would need to materialize it on demand.
+            // possible direct eval) can name it. A legacy function records what a reflective
+            // `fn.arguments` read needs once some source could perform one.
+            if crate::bytecode::reflect::enabled() && crate::bytecode::reflect::is_legacy(func) {
+                crate::bytecode::reflect::stash_tree(self, args, &scope);
+            }
             if scan & crate::ast::SCAN_ARGUMENTS != 0 {
                 let ao = self.make_arguments_object(func, args, &scope, fn_obj);
-                if let Some(frame) = self.fn_frames.last_mut() {
-                    frame.extra.get_or_insert_with(Default::default).args_obj =
-                        Value::Obj(ao.clone());
-                }
                 scope.borrow_mut().vars.insert(
                     "arguments".to_string(),
                     Binding {
@@ -5714,11 +6038,6 @@ impl Interp {
                         deletable: false,
                     },
                 );
-            } else if !func.is_strict && !func.is_generator && !func.is_async && !func.is_method {
-                if let Some(frame) = self.fn_frames.last_mut() {
-                    frame.extra.get_or_insert_with(Default::default).lazy =
-                        Some((func.clone(), Rc::from(args), scope.clone()));
-                }
             }
             // Methods and class constructors may reference `super.x` — including from a direct
             // eval in a nested arrow, which resolves this marker lexically long after the call.
@@ -5898,6 +6217,7 @@ impl Interp {
         gen_proto: Option<Value>,
     ) -> Result<Value, Abrupt> {
         let func = func.clone();
+        let frame_func = func.clone();
         let scope = scope.clone();
         let is_async = func.is_async;
         let body: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> = Box::new(move |i| {
@@ -5948,14 +6268,16 @@ impl Interp {
             outcome
         });
         let ptr = self as *mut Interp;
-        let coro = match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)) {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(Abrupt::Throw(
-                    self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG),
-                ))
-            }
-        };
+        let mut coro =
+            match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)) {
+                Ok(c) => c,
+                Err(_) => {
+                    return Err(Abrupt::Throw(
+                        self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG),
+                    ))
+                }
+            };
+        coro.set_frame(self.resume_frame_for(&frame_func, false));
         let obj = self.make_generator(is_async, gen_proto);
         if let Value::Obj(o) = &obj {
             self.gc_pin(o);
@@ -6001,7 +6323,7 @@ impl Interp {
         // Fast path: an async body that compiles runs on the bytecode VM, suspending at each `await`
         // without an OS-thread coroutine (see `bytecode::VmCoro`). Params seed straight into slots
         // from `args`; the activation scope is only the root for free-name resolution.
-        let coro = if let Some(chunk) = self.async_vm_chunk(func) {
+        let mut coro = if let Some(chunk) = self.async_vm_chunk(func) {
             let this_val = if chunk.uses_this() {
                 self.get_var("this", scope)?
             } else {
@@ -6017,17 +6339,18 @@ impl Interp {
         } else {
             self.spawn_async_thread(func, scope, param_seed)?
         };
+        // Resumes after the first (which runs right here, inside the call) need the frame.
+        coro.set_frame(self.resume_frame_for(func, true));
         let promise = self.new_promise();
         if let Value::Obj(o) = &promise {
-            self.gc_pin(o);
-            self.generators.insert(Gc::as_ptr(o) as usize, coro);
+            // The coroutine lives in the promise's slot (dropped with it). A thread coroutine
+            // is pinned outright: dropping one mid-body strands its worker.
+            if matches!(coro, crate::coroutine::Coroutine::Thread(_)) {
+                self.gc_pin(o);
+            }
         }
-        let key = match &promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
-            _ => unreachable!(),
-        };
+        self.park_async_coro(&promise, coro);
         self.drive_async(
-            key,
             promise.clone(),
             crate::coroutine::Resume::Next(Value::Undefined),
         );
@@ -6101,36 +6424,42 @@ impl Interp {
 
     /// Resume an async coroutine and react to how it parks: an `await` (Yield) attaches a microtask
     /// that re-drives it once the awaited value settles; completion settles the result promise.
-    pub(crate) fn drive_async(
-        &mut self,
-        key: usize,
-        promise: Value,
-        signal: crate::coroutine::Resume,
-    ) {
+    pub(crate) fn drive_async(&mut self, promise: Value, signal: crate::coroutine::Resume) {
         use crate::coroutine::Suspend;
-        let mut coro = match self.generators.remove(&key) {
+        // Resumed as the root of a drained microtask job: an `await` whose resumption would be
+        // the very next job may continue in place (see `await_direct`).
+        let job_root = self.take_await_job_root();
+        let mut coro = match Self::take_async_coro(&promise) {
             Some(c) => c,
             None => return,
         };
-        let suspend = coro.resume(self, signal);
+        let mut suspend = coro.resume(self, signal);
+        if job_root {
+            while let Suspend::Await(awaited) = &suspend {
+                match self.await_direct(awaited) {
+                    Some(signal) => suspend = coro.resume(self, signal),
+                    None => break,
+                }
+            }
+        }
         match suspend {
             Suspend::Await(awaited) => {
-                self.generators.insert(key, coro); // still running
-                                                   // Await → PromiseResolve(%Promise%, value); its abrupt (a poisoned `constructor`
-                                                   // getter) throws at the `await` itself.
-                let px = match self.promise_resolve_checked(awaited) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return self.drive_async(key, promise, crate::coroutine::Resume::Throw(e))
-                    }
-                };
-                let on_f = self.make_async_reaction(&promise, true);
-                let on_r = self.make_async_reaction(&promise, false);
-                self.promise_then(&px, on_f, on_r);
+                // Still running: park it again. Await → PromiseResolve(%Promise%, value); its
+                // abrupt (a poisoned `constructor` getter) throws at the `await` itself.
+                Self::park_async_box(&promise, coro);
+                if let Err(e) = self.await_subscribe(awaited, &promise) {
+                    self.drive_async(promise, crate::coroutine::Resume::Throw(e));
+                }
             }
             Suspend::Yield(v) => self.resolve_promise(&promise, v),
-            Suspend::Done(v) => self.resolve_promise(&promise, v),
-            Suspend::Throw(e) => self.reject_promise(&promise, e),
+            Suspend::Done(v) => {
+                self.unpin_async_thread(&promise, &coro);
+                self.resolve_promise(&promise, v)
+            }
+            Suspend::Throw(e) => {
+                self.unpin_async_thread(&promise, &coro);
+                self.reject_promise(&promise, e)
+            }
         }
     }
 
@@ -6276,15 +6605,7 @@ impl Interp {
 
     /// A `{ value, done }` iterator-result object.
     pub(crate) fn iter_result_obj(&mut self, value: Value, done: bool) -> Value {
-        let o = self.new_object();
-        {
-            let mut b = o.borrow_mut();
-            b.props
-                .insert("value", Property::data(value, true, true, true));
-            b.props
-                .insert("done", Property::data(Value::Bool(done), true, true, true));
-        }
-        Value::Obj(o)
+        crate::builtins::iter_result(self, value, done)
     }
 
     fn make_async_gen_reaction(&mut self, key: usize, r: &Value, fulfil: bool) -> Value {
@@ -6308,12 +6629,24 @@ impl Interp {
     /// poisoned getter surfaces as the returned error.
     pub(crate) fn promise_resolve_checked(&mut self, v: Value) -> Result<Value, Value> {
         if let Value::Obj(o) = &v {
-            if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
-                return match self.get_member(&v, "constructor") {
-                    Ok(_) => Ok(v),
-                    Err(Abrupt::Throw(e)) => Err(e),
-                    Err(_) => Err(Value::Undefined),
-                };
+            if crate::eval::promise_fast::is_promise_obj(o) {
+                // An inherited data `constructor` reads without running anything.
+                if self.promise_ctor_get_is_silent(o) {
+                    return Ok(v);
+                }
+
+                // PromiseResolve(%Promise%, v): v itself only when SameValue(v.constructor,
+                // %Promise%); otherwise a new promise resolved with v.
+                match self.get_member(&v, "constructor") {
+                    Ok(Value::Obj(c))
+                        if matches!(self.promise_intr(), Some(i) if Gc::ptr_eq(&c, &i.ctor)) =>
+                    {
+                        return Ok(v)
+                    }
+                    Ok(_) => {}
+                    Err(Abrupt::Throw(e)) => return Err(e),
+                    Err(_) => return Err(Value::Undefined),
+                }
             }
         }
         let p = self.new_promise();
@@ -6321,21 +6654,6 @@ impl Interp {
         Ok(p)
     }
 
-    /// A bound reaction that re-drives the async coroutine when the awaited promise settles.
-    fn make_async_reaction(&mut self, promise: &Value, fulfil: bool) -> Value {
-        let target = self.make_native(
-            "",
-            1,
-            if fulfil {
-                crate::builtins::async_react_fulfil
-            } else {
-                crate::builtins::async_react_reject
-            },
-        );
-        let bound = Object::new(Some(self.function_proto.clone()));
-        bound.borrow_mut().call = Callable::bound(target, promise.clone(), vec![promise.clone()]);
-        Value::Obj(bound)
-    }
 
     fn bind_params(&mut self, params: &[Param], args: &[Value], scope: &Env) -> Result<(), Abrupt> {
         // With parameter expressions, every parameter's binding is created (uninitialized) up front,
@@ -6535,6 +6853,17 @@ impl Interp {
                 r
             }
             Callable::User(user) => {
+                // A constructor template (no code runs), else a compiled class body as a frame.
+                if let Some(r) =
+                    crate::bytecode::ctor_plan::construct_with_plan(self, &callee, &new_target, args)
+                {
+                    return r;
+                }
+                if let Some(r) =
+                    crate::bytecode::class_fields::construct_class(self, &callee, &new_target, args)
+                {
+                    return r;
+                }
                 // Arrows, concise methods, getters/setters, generators and async functions have no
                 // [[Construct]].
                 if user.func.is_arrow
@@ -6603,6 +6932,8 @@ impl Interp {
                 self.construct_nt(Value::Obj(bound.target), &all, nt)
             }
             Callable::None
+            | Callable::Promise(_)
+            | Callable::Resolver(..)
             | Callable::WrappedShadow(_)
             | Callable::WrappedCross(_)
             | Callable::AccessorGet(_)

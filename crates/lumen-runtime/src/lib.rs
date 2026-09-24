@@ -30,6 +30,7 @@ mod console;
 mod esm;
 mod jsx;
 mod process;
+pub mod tsconfig;
 mod worker;
 
 pub use console::{describe_error, render_value, ConsoleOut};
@@ -67,7 +68,9 @@ impl SharedWriter {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -219,6 +222,7 @@ impl Runtime {
     }
 
     fn build(embedding: Option<Embedding>) -> Runtime {
+        let boot = lumen_host::startup_timing().then(Instant::now);
         let (tx, rx) = mpsc::channel();
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
         let mut engine = Engine::new();
@@ -226,7 +230,10 @@ impl Runtime {
         engine.ctx().op_state().put(pool.handle());
         // Dedicated-thread completions for unbounded-blocking work (child stdio) that must not
         // occupy a shared pool worker.
-        engine.ctx().op_state().put(CompletionSender::new(tx.clone()));
+        engine
+            .ctx()
+            .op_state()
+            .put(CompletionSender::new(tx.clone()));
         engine.ctx().op_state().put(TaskRegistry::default());
         // `#[op(async)]` / `Ctx::spawn_blocking` / `Ctx::completer` settle through the loop.
         engine.ctx().set_async_host(lumen_host::LoopAsyncHost {
@@ -319,6 +326,15 @@ impl Runtime {
                     return !!(p && typeof p.listenerCount === 'function' && p.listenerCount(event) > 0);
                 };
                 globalThis.__lumen_fire_error = function (error, origin = 'uncaughtException') {
+                    // node:domain: an error thrown inside a domain goes to its 'error' handler.
+                    const toDomain = globalThis.__lumen_domain_uncaught;
+                    if (typeof toDomain === 'function') {
+                        try {
+                            if (toDomain(error)) return true;
+                        } catch {
+                            return false;
+                        }
+                    }
                     if (processHas('uncaughtException')) {
                         try {
                             globalThis.process.emit('uncaughtException', error, origin);
@@ -396,6 +412,10 @@ impl Runtime {
                 false,
             )
             .expect("shim cleanup");
+        if let Some(t0) = boot {
+            eprintln!("[startup] runtime built    {:?}", t0.elapsed());
+        }
+        lumen::memstats::phase("runtime built");
         Runtime {
             engine,
             pool,
@@ -419,6 +439,7 @@ impl Runtime {
     /// `__filename`/`require` in scope), then loop to quiescence. `Err` is the rendered
     /// uncaught error. This is what the CLI uses for `lumen-cli file.js`.
     pub fn run_main(&mut self, path: &str) -> Result<(), String> {
+        let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         self.run_main_from(path, None)
     }
 
@@ -458,7 +479,11 @@ impl Runtime {
             Err(_) => {}
         }
         let global = self.engine.global_this();
-        let entry = if source.is_some() { "__runMainSource" } else { "__runMain" };
+        let entry = if source.is_some() {
+            "__runMainSource"
+        } else {
+            "__runMain"
+        };
         let run_main = self
             .engine
             .ctx()
@@ -468,8 +493,10 @@ impl Runtime {
         if let Some(source) = source {
             args.push(Value::from_string(source.to_string()));
         }
-        let result = self.engine.call_function(&run_main, Value::Undefined, &args);
-        self.engine.run_microtasks();
+        let result = self
+            .engine
+            .call_function(&run_main, Value::Undefined, &args);
+        self.checkpoint();
         result.map(|_| ()).map_err(StartError::Thrown)
     }
 
@@ -477,6 +504,7 @@ impl Runtime {
     /// (and the `node:` builtins), then the loop runs to quiescence so top-level `await`,
     /// timers, and I/O settle. `Err` is the rendered uncaught error.
     pub fn run_module(&mut self, path: &str) -> Result<(), String> {
+        let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         let source =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let source = import_source_text(source);
@@ -484,14 +512,23 @@ impl Runtime {
         let source = if path.ends_with(".jsx") {
             jsx::transform(&source).map_err(|e| format!("JSX transform failed for {path}: {e}"))?
         } else {
+            // A `.ts`/`.mts` entry is TypeScript: the engine parses it itself (the key keeps
+            // the extension), with Node's strip-only semantics and every offset kept.
             source
         };
         let key = lumen_host::canonicalize(path)
             .unwrap_or_else(|_| std::path::PathBuf::from(path))
             .to_string_lossy()
             .into_owned();
-        let loader = esm::make_loader(self.builtin_modules());
+        let (loader, cache) = esm::make_cached_loader(self.builtin_modules());
+        let t_eval = lumen_host::startup_timing().then(Instant::now);
         let result = self.engine.eval_module_attrs(&source, &key, loader);
+        // The static graph has loaded: its sources live in the engine now.
+        cache.forget_sources();
+        if let Some(t0) = t_eval {
+            report_load_stats("entry module evaluated", t0);
+        }
+        lumen::memstats::phase("entry module evaluated");
         match result {
             Ok(Completion::Value(_)) => {
                 self.run_to_completion();
@@ -520,9 +557,15 @@ impl Runtime {
     /// disk resolution (bare packages from the current directory's `node_modules`). `Err` is the
     /// rendered uncaught error.
     pub fn run_precompiled(&mut self, blob: &lumen::Precompiled) -> Result<(), String> {
+        let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         let loader = esm::make_loader(self.builtin_modules());
         self.engine.set_module_loader_attrs(loader);
-        match self.engine.load_precompiled(blob) {
+        let t_load = lumen_host::startup_timing().then(Instant::now);
+        let loaded = self.engine.load_precompiled(blob);
+        if let Some(t0) = t_load {
+            report_load_stats("precompiled program evaluated", t0);
+        }
+        match loaded {
             Ok(Completion::Value(_)) => {
                 self.run_to_completion();
                 Ok(())
@@ -558,8 +601,8 @@ impl Runtime {
         } else {
             self.engine.eval(source, false)
         };
-        // Drain the microtask checkpoint from top-level code, but not the macrotask loop.
-        self.engine.run_microtasks();
+        // Drain the checkpoint from top-level code, but not the macrotask loop.
+        self.checkpoint();
         match result {
             Ok(Completion::Value(_)) => Ok(()),
             Ok(Completion::Throw { name, message }) => Err(if name.is_empty() {
@@ -582,7 +625,7 @@ impl Runtime {
             if stop.load(Ordering::SeqCst) || self.interrupted() {
                 return;
             }
-            self.engine.run_microtasks();
+            self.checkpoint();
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
@@ -608,6 +651,9 @@ impl Runtime {
             }
             if stop.load(Ordering::SeqCst) || self.idle() {
                 return;
+            }
+            if self.ticks_pending() {
+                continue;
             }
             let wait = match self.next_timer_deadline() {
                 Some(deadline) => {
@@ -654,6 +700,7 @@ impl Runtime {
     /// Evaluate a script, then run the event loop until quiescent — timers fired, spawned
     /// work completed, promise queue empty.
     pub fn eval(&mut self, src: &str) -> Result<Completion, lumen_host::ParseError> {
+        let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         let result = self.engine.eval(src, false);
         self.run_to_completion();
         result
@@ -683,7 +730,7 @@ impl Runtime {
         loop {
             // Run everything already runnable. Each JS entry is followed by a microtask
             // checkpoint, matching the "after every macrotask" model.
-            self.engine.run_microtasks();
+            self.checkpoint();
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
@@ -716,6 +763,10 @@ impl Runtime {
 
             if self.halted() || self.idle() {
                 return;
+            }
+            // Ticks left behind by a throwing tick run at the next checkpoint, not after a wait.
+            if self.ticks_pending() {
+                continue;
             }
 
             self.idle_collect();
@@ -824,9 +875,12 @@ impl Runtime {
             let _ = self.engine.call_function(
                 &emit,
                 process.clone(),
-                &[Value::from_string("exit".to_string()), Value::Num(fatal as f64)],
+                &[
+                    Value::from_string("exit".to_string()),
+                    Value::Num(fatal as f64),
+                ],
             );
-            self.engine.run_microtasks();
+            self.checkpoint();
             return fatal;
         }
         // A 'beforeExit' listener may schedule more work; Node re-enters the loop until one
@@ -836,9 +890,12 @@ impl Runtime {
             let _ = self.engine.call_function(
                 &emit,
                 process.clone(),
-                &[Value::from_string("beforeExit".to_string()), Value::Num(c as f64)],
+                &[
+                    Value::from_string("beforeExit".to_string()),
+                    Value::Num(c as f64),
+                ],
             );
-            self.engine.run_microtasks();
+            self.checkpoint();
             if self.idle() {
                 break;
             }
@@ -850,8 +907,16 @@ impl Runtime {
             process.clone(),
             &[Value::from_string("exit".to_string()), Value::Num(c as f64)],
         );
-        self.engine.run_microtasks();
+        self.checkpoint();
         code(self)
+    }
+
+    fn ticks_pending(&mut self) -> bool {
+        self.engine
+            .ctx()
+            .op_state()
+            .get::<process::TickQueue>()
+            .is_some_and(|q| !q.queue.is_empty())
     }
 
     fn idle(&mut self) -> bool {
@@ -861,7 +926,10 @@ impl Runtime {
         let state = self.engine.ctx().op_state();
         let callbacks_queued = state
             .get::<CallbackQueue>()
-            .is_some_and(|q| !q.queue.is_empty());
+            .is_some_and(|q| !q.queue.is_empty())
+            || state
+                .get::<process::TickQueue>()
+                .is_some_and(|q| !q.queue.is_empty());
         let timers_pending = state
             .get::<lumen_timers::Timers>()
             .is_some_and(|t| t.has_pending());
@@ -918,8 +986,49 @@ impl Runtime {
             },
         }
         self.engine.ctx().set_async_context(outer);
-        self.engine.run_microtasks();
+        self.checkpoint();
         self.report_unhandled_rejections();
+    }
+
+    /// Node's tick checkpoint (`processTicksAndRejections`): run the nextTick queue (including
+    /// ticks queued by ticks), then the promise microtasks, and repeat until both are empty.
+    fn checkpoint(&mut self) {
+        loop {
+            loop {
+                if self.halted() {
+                    return;
+                }
+                let next = self
+                    .engine
+                    .ctx()
+                    .host_mut::<process::TickQueue>()
+                    .and_then(|q| q.queue.pop_front());
+                let Some((callback, args)) = next else {
+                    break;
+                };
+                if let Err(e) = self
+                    .engine
+                    .call_function(&callback, Value::Undefined, &args)
+                {
+                    // As in Node, a throwing tick unwinds the drain: once the error is handled,
+                    // the rest of the queue waits for the next checkpoint, so a tick that keeps
+                    // rescheduling a throw cannot starve the loop.
+                    self.report_uncaught(&e);
+                    self.engine.run_microtasks();
+                    return;
+                }
+            }
+            self.engine.run_microtasks();
+            let more = self
+                .engine
+                .ctx()
+                .op_state()
+                .get::<process::TickQueue>()
+                .is_some_and(|q| !q.queue.is_empty());
+            if !more {
+                return;
+            }
+        }
     }
 
     /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
@@ -927,7 +1036,7 @@ impl Runtime {
         if let Err(e) = self.engine.call_function(callback, Value::Undefined, args) {
             self.report_uncaught(&e);
         }
-        self.engine.run_microtasks();
+        self.checkpoint();
         self.report_unhandled_rejections();
     }
 
@@ -952,8 +1061,22 @@ impl Runtime {
         ) {
             return;
         }
-        let text = console::describe_error(self.engine.ctx(), error);
-        console::write_err_line(self.engine.ctx(), format!("{prefix} {text}"));
+        // A rejected TypeScript source prints as Node prints it (its `stack` and `code`).
+        let ctx = self.engine.ctx();
+        let member = |ctx: &mut lumen_host::Ctx, key: &str| match ctx.get_member(error, key) {
+            Ok(Value::Str(s)) => Some(s.to_string()),
+            _ => None,
+        };
+        let ts_text = member(ctx, "code")
+            .filter(|c| c.ends_with("_TYPESCRIPT_SYNTAX"))
+            .and_then(|code| {
+                member(ctx, "stack").map(|s| lumen::typescript::node_uncaught_text(&s, &code))
+            });
+        let line = match ts_text {
+            Some(t) => t,
+            None => format!("{prefix} {}", console::describe_error(ctx, error)),
+        };
+        console::write_err_line(self.engine.ctx(), line);
         self.fatal_exit.get_or_insert(1);
     }
 
@@ -989,6 +1112,13 @@ impl Runtime {
     /// The loop stops: a fatal error, or the embedder / `process.exit` asked the realm to end.
     fn halted(&self) -> bool {
         self.fatal_exit.is_some() || self.interrupted()
+    }
+
+    /// A worker realm's `terminate()` flag: the engine polls it at every call and loop turn, and
+    /// the loop treats it like an embedder's interrupt (a terminated realm reports nothing).
+    pub(crate) fn set_worker_interrupt(&mut self, flag: Arc<AtomicBool>) {
+        self.engine.set_interrupt(Arc::clone(&flag));
+        self.interrupt = Some(flag);
     }
 
     /// A handle that stops this realm from another thread. `None` unless embedded.
@@ -1052,3 +1182,13 @@ impl Runtime {
 mod crypto_asym_tests;
 #[cfg(test)]
 mod tests;
+
+/// `LUMEN_STARTUP_TIMING` report: wall time since `t0`, plus the module-load counters.
+fn report_load_stats(what: &str, t0: Instant) {
+    let (pms, pn, pb) = lumen::load_stats::get(&lumen::load_stats::PARSE);
+    let (fms, fn_, _) = lumen::load_stats::get(&lumen::load_stats::FETCH);
+    eprintln!(
+        "[startup] {what} {:?} (parse/decode {pms:.1} ms, {pn} modules, {pb} bytes; fetch {fms:.1} ms, {fn_} loads)",
+        t0.elapsed()
+    );
+}

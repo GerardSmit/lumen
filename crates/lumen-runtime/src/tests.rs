@@ -118,7 +118,7 @@ fn next_tick_and_set_immediate_run_before_timers() {
         process.nextTick((tag) => console.log("tick", tag), 42);
         "#,
     );
-    assert_eq!(out.lines(), ["immediate", "tick 42", "timer"]);
+    assert_eq!(out.lines(), ["tick 42", "immediate", "timer"]);
 }
 
 #[test]
@@ -171,7 +171,11 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
     assert_eq!(rt.finish_process(), 0);
     assert_eq!(
         out.lines(),
-        ["caught rejected unhandledRejection", "caught boom uncaughtException", "still running"]
+        [
+            "caught rejected unhandledRejection",
+            "caught boom uncaughtException",
+            "still running"
+        ]
     );
     assert_eq!(err.lines(), Vec::<String>::new());
 }
@@ -219,7 +223,7 @@ fn console_streams_and_renders_common_values() {
     );
     assert_eq!(
         out.lines(),
-        ["s 1.5 true null undefined Symbol(sym) 1,2 [object Object]"]
+        ["s 1.5 true null undefined Symbol(sym) [ 1, 2 ] { a: 1 }"]
     );
     assert_eq!(err.lines(), ["careful", "bad"]);
 }
@@ -233,7 +237,8 @@ fn process_basics() {
         console.log(typeof process.cwd(), process.cwd().length > 0);
         console.log(Array.isArray(process.argv), typeof process.argv[0]);
         console.log(typeof process.env, typeof process.platform);
-        console.log(typeof process.setuid, typeof process.setgid, Array.isArray(process.getgroups()));
+        console.log(typeof process.setuid, typeof process.setgid,
+          typeof process.getgroups === "function" && Array.isArray(process.getgroups()));
         "#,
     );
     assert_eq!(
@@ -242,7 +247,11 @@ fn process_basics() {
             "string true",
             "true string",
             "object string",
-            "function function true"
+            if cfg!(windows) {
+                "undefined undefined false"
+            } else {
+                "function function true"
+            }
         ]
     );
 }
@@ -306,7 +315,10 @@ fn process_execve_validates_and_reports_os_errors() {
         console.log(typeof process.execve);
         try { process.execve(1, [], {}); } catch (error) { console.log(error.name); }
         try { process.execve("/definitely/not/a/lumen/executable", ["missing"], {}); }
-        catch (error) { console.log(error.message.startsWith("execve failed:")); }
+        catch (error) {
+          console.log(error.message.startsWith(process.platform === "win32"
+            ? "process.execve is not supported" : "execve failed:"));
+        }
         "#,
     );
     assert_eq!(out.lines(), ["function", "TypeError", "true"]);
@@ -1315,7 +1327,7 @@ fn worker_drive(files: &[(&str, &str)], main_src: &str) -> Vec<String> {
         std::fs::write(dir.0.join(name), body).unwrap();
     }
     let (mut rt, out, _err) = test_runtime();
-    let src = main_src.replace("{DIR}", &dir.0.to_string_lossy());
+    let src = main_src.replace("{DIR}", &dir.0.to_string_lossy().replace('\\', "/"));
     rt.eval(&src)
         .expect("worker main parses and runs to quiescence");
     out.lines()
@@ -1726,7 +1738,11 @@ fn node_path_and_os_builtins() {
     );
     assert_eq!(
         out.lines(),
-        ["a/c .gz q", "/a/b true false", "string string true", "true",]
+        if cfg!(windows) {
+            ["a\\c .gz q", "\\a\\b true false", "string string true", "true"]
+        } else {
+            ["a/c .gz q", "/a/b true false", "string string true", "true"]
+        }
     );
 }
 
@@ -2019,7 +2035,8 @@ fn esm_imports_node_builtins_named_and_default() {
     .unwrap();
     let (mut rt, out, _err) = test_runtime();
     rt.run_module(&entry.to_string_lossy()).expect("runs");
-    assert_eq!(out.lines(), ["function function", "b.js x/y", "string"]);
+    let joined = if cfg!(windows) { "b.js x\\y" } else { "b.js x/y" };
+    assert_eq!(out.lines(), ["function function", joined, "string"]);
 }
 
 #[test]

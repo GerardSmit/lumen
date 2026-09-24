@@ -44,38 +44,41 @@ pub(crate) fn nf_math_imul(i: &mut Interp, _this: Value, a: &[Value]) -> Result<
 }
 
 pub(crate) fn nf_math_max(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
-    // ToNumber every argument first (side effects in order), then reduce. +0 is larger than -0.
-    let mut nums = Vec::with_capacity(a.len());
-    for v in a {
-        nums.push(ab(i.to_number(v))?);
-    }
+    // ToNumber every argument (side effects in order, even after a NaN), reducing as we go —
+    // no per-call buffer. +0 is larger than -0.
     let mut m = f64::NEG_INFINITY;
-    for &n in &nums {
+    let mut nan = false;
+    for v in a {
+        let n = match v {
+            Value::Num(n) => *n,
+            _ => ab(i.to_number(v))?,
+        };
         if n.is_nan() {
-            return Ok(Value::Num(f64::NAN));
-        }
-        if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative()) {
+            nan = true;
+        } else if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative())
+        {
             m = n;
         }
     }
-    Ok(Value::Num(m))
+    Ok(Value::Num(if nan { f64::NAN } else { m }))
 }
 
 pub(crate) fn nf_math_min(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
-    let mut nums = Vec::with_capacity(a.len());
-    for v in a {
-        nums.push(ab(i.to_number(v))?);
-    }
     let mut m = f64::INFINITY;
-    for &n in &nums {
+    let mut nan = false;
+    for v in a {
+        let n = match v {
+            Value::Num(n) => *n,
+            _ => ab(i.to_number(v))?,
+        };
         if n.is_nan() {
-            return Ok(Value::Num(f64::NAN));
-        }
-        if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive()) {
+            nan = true;
+        } else if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive())
+        {
             m = n;
         }
     }
-    Ok(Value::Num(m))
+    Ok(Value::Num(if nan { f64::NAN } else { m }))
 }
 
 /// The Math functions the loop JIT inlines, by property name, as the native fn pointers the

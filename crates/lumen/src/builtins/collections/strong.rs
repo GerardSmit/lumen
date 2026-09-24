@@ -183,7 +183,8 @@ pub(super) fn install_map_like(
         proto
             .borrow_mut()
             .props
-            .insert(Interp::sym_key(&sym), Property::builtin(f));
+            .insert(Interp::sym_key(&sym), Property::builtin(f.clone()));
+        crate::bytecode::iter_fast::remember_collection_intrinsics(it, is_set, &f);
     }
 
     let ctor = it.make_native(name, 0, ctor_fn);

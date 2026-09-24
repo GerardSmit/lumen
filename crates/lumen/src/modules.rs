@@ -33,6 +33,8 @@ pub enum NsBinding {
 /// evaluation status. Keyed by canonical specifier in `Interp::module_recs`.
 pub(crate) struct ModuleRec {
     body: Rc<Vec<Stmt>>,
+    /// The source the body was parsed from, for its stack-trace frame (see `stack_trace`).
+    src: Option<Rc<str>>,
     env: Env,
     pub ns: Value,
     meta: Value,
@@ -134,13 +136,10 @@ impl Interp {
         let mut stack = Vec::new();
         self.inner_module_evaluation_async(key, &mut stack, &mut 0);
         self.run_agent_event_loop();
-        if let Value::Obj(o) = &top {
-            if let Some(ps) = self.promises.get(&(Gc::as_ptr(o) as usize)) {
-                if ps.status == 2 {
-                    let reason = ps.value.clone();
-                    return Err(Abrupt::Throw(reason));
-                }
-            }
+        if let Some((crate::eval::promise_fast::REJECTED, reason)) =
+            crate::eval::promise_fast::promise_state(&top)
+        {
+            return Err(Abrupt::Throw(reason));
         }
         Ok(self.module_recs[key].ns.clone())
     }
@@ -229,11 +228,20 @@ impl Interp {
             None => return Err(self.throw("TypeError", format!("module not found: {key}"))),
         };
         // A module from a loaded precompiled bundle decodes its AST instead of parsing.
+        let t_parse = std::time::Instant::now();
         let body = match crate::precompiled::module_body(self, key) {
             Some(decoded) => decoded.map_err(|e| self.throw("SyntaxError", e))?,
+            // A `.ts`/`.mts`/`.cts` module is TypeScript (the parser's strip-only mode).
+            None if crate::typescript::is_ts_path(key) => crate::parser::parse_module_ts(&src)
+                .map_err(|e| self.throw_ts_syntax(e, &file_url(key), &src))?,
             None => crate::parser::parse_module(&src)
                 .map_err(|e| self.throw("SyntaxError", e.message))?,
         };
+        load_stats::add(&load_stats::PARSE, t_parse, src.len());
+        let module_src = self.adopt_parsed_source(
+            Some(&crate::interpreter::stack_trace::module_display_name(key)),
+            0,
+        );
         let body = Rc::new(body);
 
         // Resolve every dependency specifier to a canonical key up front (fetching its source), so
@@ -318,6 +326,7 @@ impl Interp {
             key.to_string(),
             ModuleRec {
                 body: body.clone(),
+                src: module_src,
                 env: env.clone(),
                 ns,
                 meta,
@@ -431,7 +440,10 @@ impl Interp {
             EsmHook::Redirect(s) => specifier = s,
             EsmHook::Module(key, source) => return Ok((key, source)),
         }
-        match loader(&specifier, referrer, attr_type) {
+        let t_fetch = std::time::Instant::now();
+        let r = loader(&specifier, referrer, attr_type);
+        load_stats::add(&load_stats::FETCH, t_fetch, 0);
+        match r {
             Some(pair) => Ok(pair),
             None => Err(self.throw(
                 "TypeError",
@@ -987,15 +999,15 @@ impl Interp {
             }
         }
 
-        let (body, env, meta) = {
+        let (body, env, meta, src) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone())
+            (rec.body.clone(), rec.env.clone(), rec.meta.clone(), rec.src.clone())
         };
         let saved_meta = self.import_meta.take();
         let saved_strict = self.strict;
         self.import_meta = Some(meta);
         self.strict = true;
-        let result = self.run_stmt_list(&body, &env);
+        let result = self.with_script_frame(src, false, |i| i.run_stmt_list(&body, &env));
         self.import_meta = saved_meta;
         self.strict = saved_strict;
 
@@ -1270,9 +1282,9 @@ impl Interp {
     /// completion runs the ancestor cascade; a synchronous body runs now.
     fn module_execute_async(&mut self, key: &str) {
         let top = self.module_recs[key].top_promise.clone();
-        let (body, env, meta) = {
+        let (body, env, meta, src) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone())
+            (rec.body.clone(), rec.env.clone(), rec.meta.clone(), rec.src.clone())
         };
         if body_has_tla(&body) {
             self.module_recs.get_mut(key).unwrap().evaluating = true;
@@ -1303,7 +1315,7 @@ impl Interp {
                 Some(t) => t,
                 None => self.new_promise(),
             };
-            let coro =
+            let mut coro =
                 match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(closure)) {
                     Ok(c) => c,
                     Err(_) => {
@@ -1313,15 +1325,10 @@ impl Interp {
                         return;
                     }
                 };
-            if let Value::Obj(o) = &top {
-                self.generators.insert(Gc::as_ptr(o) as usize, coro);
-            }
-            let top_key = match &top {
-                Value::Obj(o) => Gc::as_ptr(o) as usize,
-                _ => return,
-            };
+            // Every step of the body, the first included, runs under the module's frame.
+            coro.set_frame(Interp::resume_frame_script(src));
+            self.park_async_coro(&top, coro);
             self.drive_async(
-                top_key,
                 top,
                 crate::coroutine::Resume::Next(Value::Undefined),
             );
@@ -1332,7 +1339,7 @@ impl Interp {
         self.import_meta = Some(meta);
         self.strict = true;
         self.module_recs.get_mut(key).unwrap().evaluating = true;
-        let result = self.run_stmt_list(&body, &env);
+        let result = self.with_script_frame(src, false, |i| i.run_stmt_list(&body, &env));
         self.import_meta = saved_meta;
         self.strict = saved_strict;
         self.module_recs.get_mut(key).unwrap().evaluating = false;
@@ -1820,7 +1827,7 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
                         _ => false,
                     })
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 expr(callee)
                     || args.iter().any(|a| match a {
                         crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => {
@@ -1966,5 +1973,43 @@ fn exported_decl_names(inner: &Stmt) -> Vec<String> {
         Stmt::FuncDecl(f) => f.name.clone().into_iter().collect(),
         Stmt::ClassDecl(c) => c.name.clone().into_iter().collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Module-load counters (tooling: where a program's startup goes). Each is (nanoseconds, count,
+/// bytes) accumulated process-wide.
+#[doc(hidden)]
+pub mod load_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub struct Counter(pub AtomicU64, pub AtomicU64, pub AtomicU64);
+    pub static PARSE: Counter = Counter(AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    pub static FETCH: Counter = Counter(AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    pub(crate) fn add(c: &Counter, t: std::time::Instant, bytes: usize) {
+        c.0.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        c.1.fetch_add(1, Relaxed);
+        c.2.fetch_add(bytes as u64, Relaxed);
+    }
+    pub fn get(c: &Counter) -> (f64, u64, u64) {
+        (c.0.load(Relaxed) as f64 / 1e6, c.1.load(Relaxed), c.2.load(Relaxed))
+    }
+}
+
+/// A module key as the `file://` URL Node names an ES module by (`C:\a\b.mts` →
+/// `file:///C:/a/b.mts`); a key that already has a scheme is returned as is.
+fn file_url(key: &str) -> String {
+    let has_scheme = key
+        .split_once(':')
+        .is_some_and(|(s, _)| s.len() > 1 && s.chars().all(|c| c.is_ascii_alphanumeric()));
+    if has_scheme {
+        return key.to_string();
+    }
+    let path = key
+        .strip_prefix(r"\\?\")
+        .unwrap_or(key)
+        .replace('\\', "/");
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
     }
 }

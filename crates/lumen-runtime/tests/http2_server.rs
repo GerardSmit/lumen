@@ -34,13 +34,17 @@ fn server_handles_multiplexed_node_requests() {
             r#"
           const http2 = require("node:http2");
           const client = http2.connect("http://127.0.0.1:{port}");
+          // Failsafe: a protocol regression must fail the test, never hang it.
+          setTimeout(() => {{ console.error("client deadline"); process.exit(2); }}, 15000).unref();
+          client.on("error", error => {{ console.error(error); process.exit(3); }});
           let complete = 0;
           for (const [path, body] of [["/one", ""], ["/two", "payload"]]) {{
             const request = client.request({{ ":method": body ? "POST" : "GET", ":path": path }});
             let response = "";
             request.on("data", chunk => response += chunk);
             request.on("end", () => {{ console.log(path, response); if (++complete === 2) client.close(); }});
-            request.end(body);
+            // A GET's writable side is already ended by newer Node clients.
+            if (body) request.end(body); else if (!request.writableEnded) request.end();
           }}
         "#
         );
@@ -67,6 +71,11 @@ fn server_handles_multiplexed_node_requests() {
           }});
         }});
         server.on("stream", () => {{ streams++; if (streams === 2) console.log("streams", streams); }});
+        // Failsafe: if the client never completes (e.g. it rejected our framing), tear down so
+        // the event loop drains and the assertions below report the failure instead of hanging.
+        const sessions = new Set();
+        server.on("session", session => {{ sessions.add(session); session.on("close", () => sessions.delete(session)); }});
+        setTimeout(() => {{ server.close(); for (const session of sessions) session.destroy(); }}, 20000).unref();
         server.listen({port}, "127.0.0.1");
     "#
     );
@@ -101,6 +110,10 @@ fn server_handles_multiplexed_node_requests() {
 
 #[test]
 fn secure_server_negotiates_h2_with_node_client() {
+    // lumen-tls has no Windows backend yet.
+    if cfg!(windows) {
+        return;
+    }
     if Command::new("node").arg("--version").output().is_err()
         || Command::new("openssl").arg("version").output().is_err()
     {

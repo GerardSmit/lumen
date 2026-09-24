@@ -24,14 +24,22 @@ fn tty_streams_wrap_process_io_without_claiming_terminal_support() {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });
+    // Whether fd 0/1 are consoles depends on how the test binary is launched (terminal, IDE,
+    // piped CI), so the assertions only check shapes and invariants, never the detected values.
+    // The WriteStream's sink is swapped for a capture so nothing reaches the real stdout.
     let source = r#"
       const tty = require("node:tty"), stream = require("node:stream");
       const input = new tty.ReadStream(0), output = new tty.WriteStream(1);
-      console.log("shape", input instanceof stream.Readable, output instanceof stream.Writable, tty.isatty(1));
+      console.log("shape", input instanceof stream.Readable, output instanceof stream.Writable, typeof tty.isatty(1), tty.isatty(-1), tty.isatty(1.5));
       console.log("input", input.fd, input.isTTY, input.setRawMode(true) === input, input.isRaw);
-      console.log("output", output.fd, output.isTTY, output.getColorDepth(), output.hasColors(), output.getWindowSize().join("x"));
+      const depth = output.getColorDepth(), size = output.getWindowSize();
+      console.log("output", output.fd, output.isTTY, [1, 4, 8, 24].includes(depth), output.hasColors() === depth >= 4,
+        output.getColorDepth({ FORCE_COLOR: "3" }), output.hasColors(256, { TERM: "dumb" }), Array.isArray(size) && size.length === 2);
+      const written = [];
+      output._write = (chunk, encoding, callback) => { written.push(String(chunk)); callback(); };
       console.log("cursor", output.clearLine(0), output.clearScreenDown(), output.cursorTo(0), output.moveCursor(1, 1));
       output.end("tty-write\n");
+      console.log("written", JSON.stringify(written));
     "#;
     match runtime.eval(source).expect("source parses") {
         Completion::Value(_) => {}
@@ -43,11 +51,11 @@ fn tty_streams_wrap_process_io_without_claiming_terminal_support() {
             .lines()
             .collect::<Vec<_>>(),
         [
-            "shape true true false",
-            "input 0 false true true",
-            "output 1 false 1 false 80x24",
+            "shape true true boolean false false",
+            "input 0 true true true",
+            "output 1 true true true 24 false true",
             "cursor true true true true",
-            "tty-write"
+            r#"written ["\u001b[2K","\u001b[0J","\u001b[1G","\u001b[1C\u001b[1B","tty-write\n"]"#
         ]
     );
 }

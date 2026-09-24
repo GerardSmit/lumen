@@ -14,8 +14,10 @@
 // without an attached inspector — the honest behavior for a non-inspected process, matching Node.
 
 {
-  const util = __builtins.get("util");
-  const fmt = (args, opts) => util.formatWithOptions(opts || {}, ...args);
+  // node:util loads on first use (see build.rs `LAZY`): plain-string logging never needs it.
+  let utilMod;
+  const util = () => (utilMod ??= __builtins.get("util"));
+  const fmt = (args, opts) => util().formatWithOptions(opts || {}, ...args);
   const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
 
   // Internal state lives under symbols so it never shows up in `Object.keys` (Node's console
@@ -44,7 +46,7 @@
 
   // --- console.table ---------------------------------------------------------------------------
   function cellText(v) {
-    return util.inspect(v, { depth: 0, colors: false });
+    return util().inspect(v, { depth: 0, colors: false });
   }
   function renderTable(data, properties) {
     if (data === null || typeof data !== "object") return fmt([data]);
@@ -101,7 +103,7 @@
     dirxml(...args) { this[kOut](withIndent(this, fmt(args))); },
     error(...args) { this[kErr](withIndent(this, fmt(args))); },
     warn(...args) { this[kErr](withIndent(this, fmt(args))); },
-    dir(obj, options) { this[kOut](withIndent(this, util.inspect(obj, { colors: false, ...options }))); },
+    dir(obj, options) { this[kOut](withIndent(this, util().inspect(obj, { colors: false, ...options }))); },
     trace(...args) {
       const label = args.length ? ": " + fmt(args) : "";
       let frames = "";

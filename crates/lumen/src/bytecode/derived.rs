@@ -56,6 +56,8 @@ pub(super) fn super_call(
         let last = argv.pop().expect("spread super() has an argument");
         let items = if i.in_default_derived_ctor(env) {
             i.default_ctor_args(&last)?
+        } else if let Some(items) = super::iter_fast::values(i, &last) {
+            items
         } else {
             i.iterate(&last)?
         };
@@ -159,7 +161,7 @@ mod tests {
     #[test]
     fn derived_constructors_compile() {
         assert!(compiled(
-            "class A {} class B extends A { constructor(x){ super(); this.x = x; } } \
+            "class A {} class B extends A { constructor(x){ super(); this.x = +x; } } \
              globalThis.B = B; new B(1);",
             "B"
         ));

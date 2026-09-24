@@ -171,3 +171,40 @@ fn intersect(idom: &[Option<Block>], rpo_index: &[usize], mut a: Block, mut b: B
     }
     a
 }
+
+/// Block placement: move the cold blocks — those from which every path ends the function
+/// (a return or trap: in JIT code, the exits) — after all the others, keeping the relative
+/// order of each group. The hot path then runs through fewer taken jumps and the exits' code
+/// stays out of its way. Values a cold block defines are only used in blocks it dominates,
+/// which are cold too, so no hot block reads one.
+pub fn sink_cold(f: &Function, cfg: &Cfg, order: Vec<Block>) -> Vec<Block> {
+    use crate::ir::InstData;
+    let n = f.blocks.len();
+    let mut cold = vec![false; n];
+    for &b in &order {
+        if let Some(t) = f.terminator(b) {
+            if matches!(f.inst(t), InstData::Return { .. } | InstData::Trap { .. }) {
+                cold[b.index()] = true;
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for &b in order.iter().rev() {
+            let s = &cfg.succs[b.index()];
+            if !cold[b.index()] && !s.is_empty() && s.iter().all(|x| cold[x.index()]) {
+                cold[b.index()] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let entry = f.entry();
+    let (mut hot, rest): (Vec<Block>, Vec<Block>) = order
+        .into_iter()
+        .partition(|&b| b == entry || !cold[b.index()]);
+    hot.extend(rest);
+    hot
+}

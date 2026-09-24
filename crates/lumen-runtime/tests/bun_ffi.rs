@@ -116,6 +116,8 @@ fn run(src: &str) -> String {
 fn ffi_libc_calls_and_marshalling() {
     let libc = if cfg!(target_os = "macos") {
         "libSystem.B.dylib"
+    } else if cfg!(windows) {
+        "msvcrt.dll"
     } else {
         "libc.so.6"
     };
@@ -150,8 +152,8 @@ fn ffi_libc_calls_and_marshalling() {
         "#
     ));
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines.contains(&"strlen 5 bigint"), "got: {out}");
-    assert!(lines.contains(&"strlenTA 5"), "got: {out}");
+    assert!(lines.contains(&"strlen 5n bigint"), "got: {out}");
+    assert!(lines.contains(&"strlenTA 5n"), "got: {out}");
     assert!(lines.contains(&"atoi 42"), "got: {out}");
     assert!(
         lines.contains(&"cstring hi there 8 undefined true"),
@@ -252,7 +254,8 @@ fn ffi_cc_compiles_and_links_c_at_runtime() {
 fn ffi_honest_throws() {
     let out = run(r#"
         const { dlopen, FFIType: F, JSCallback, viewSource } = require("bun:ffi");
-        const libc = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6";
+        const libc = process.platform === "darwin" ? "libSystem.B.dylib"
+          : process.platform === "win32" ? "msvcrt.dll" : "libc.so.6";
         const lib = dlopen(libc, { strlen: { args: [F.ptr], returns: F.u64 } });
         const check = (label, fn) => { try { fn(); console.log(label, "NO-THROW"); } catch (e) { console.log(label, e.message); } };
         // string passed where a pointer is required (Bun parity)

@@ -113,25 +113,25 @@ impl Compiler {
             self.jump_into_finally(2);
             return Ok(());
         }
-        // A return crossing compiled for-of loops must IteratorClose them (the value evaluated
-        // first, spec order). One level is modeled exactly; more would need the spec's cascading
-        // throw-mode closes — bail to the tree-walker.
+        // A return crossing compiled for-of loops must IteratorClose them, innermost first (the
+        // value evaluated first, spec order). Each level pops the regions inside its body and
+        // its body handler, then closes: a close error propagates to the handlers still pushed
+        // — the enclosing loop's body pad closes *it* in throw mode (the spec's cascade), or a
+        // `try` between the loops catches it — replacing the return.
         let fors: Vec<(u16, u32)> = self
             .loops
             .iter()
+            .rev()
             .filter_map(|c| c.foreach_iter.map(|it| (it, c.body_try_depth)))
             .collect();
-        if fors.len() > 1 {
-            return Err(Bail);
-        }
-        if let Some(&(iter_s, body_depth)) = fors.first() {
-            // Pop the regions inside the loop body, its handler, then close — a close error
-            // propagates to handlers *outside* the loop, replacing the return.
-            for _ in body_depth..self.try_depth {
+        let mut depth_now = self.try_depth;
+        for (iter_s, body_depth) in fors {
+            for _ in body_depth..depth_now {
                 self.emit(Op::PopHandler);
             }
             self.emit(Op::PopHandler);
-            self.emit(Op::IterCloseL(iter_s));
+            self.emit_iter_close(iter_s);
+            depth_now = body_depth - 1;
         }
         self.emit(if self.derived {
             Op::DerivedReturn
@@ -169,7 +169,17 @@ impl Compiler {
             _ => unreachable!(),
         }
         self.scopes.push(Vec::new());
+        let depth = self.blk_envs.len();
         match param {
+            Some(Pattern::Ident(name)) if self.blk_names.contains(name) => {
+                // Captured: a block env per catch entry.
+                if let Err(b) = self.blk_open(&[(name.clone(), false)]) {
+                    self.scopes.pop();
+                    return Err(b);
+                }
+                let (c, n) = (*self.blk_envs.last().expect("just opened"), self.name_idx(name));
+                self.emit(Op::BlkInit(c, n));
+            }
             Some(Pattern::Ident(name)) => {
                 let slot = self.fresh_slot(name);
                 self.scope_bind(name, slot, false);
@@ -180,6 +190,7 @@ impl Compiler {
             }
         }
         let cr = self.block_body(catch_body);
+        self.blk_envs.truncate(depth);
         self.scopes.pop();
         cr?;
         self.patch(jmp_after);

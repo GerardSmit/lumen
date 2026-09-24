@@ -8,7 +8,7 @@ impl Props {
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).
     #[inline]
     pub(crate) fn mirror_invalidate(&mut self) {
-        if let Some(d) = self.elems.0.as_deref_mut() {
+        if let Some(d) = self.elems.as_deref_mut() {
             if d.mirror_flags & MIRROR_OK != 0 {
                 d.mirror_flags = 0;
                 d.mirror.clear();

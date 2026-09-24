@@ -21,5 +21,16 @@ lumen = { path = "../lumen", features = ["macros"] }
 [build-dependencies]
 lumen = { path = "../lumen" }
 
+# Optional builtins (all on by default). Embedders and mobile builds can turn them off with
+# `default-features = false` (through lumen-runtime's features of the same names).
+[features]
+default = ["bun", "http2", "cluster", "dgram", "wasi"]
+# Bun APIs: `bun`, `bun:ffi` (the native-call trampolines), `bun:sqlite`, `bun:jsc`, Bun.hash, …
+bun = []
+http2 = []
+cluster = []
+dgram = []
+wasi = []
+
 [lints]
 workspace = true

@@ -11,16 +11,30 @@ pub(crate) fn object_refs_into(object: &Gc, refs: &mut Vec<Gc>) {
     for property in object.props.values() {
         property.append_object_refs(refs);
     }
-    if let Callable::Bound(bound) = &object.call {
-        refs.push(bound.target.clone());
-        if let Value::Obj(object) = &bound.this {
-            refs.push(object.clone());
+    match &object.call {
+        Callable::Bound(bound) => {
+            refs.push(bound.target.clone());
+            if let Value::Obj(object) = &bound.this {
+                refs.push(object.clone());
+            }
+            for argument in &bound.args {
+                if let Value::Obj(object) = argument {
+                    refs.push(object.clone());
+                }
+            }
         }
-        for argument in &bound.args {
-            if let Value::Obj(object) = argument {
+        // A promise's result and pending reactions are heap edges (its suspended coroutine, if
+        // any, is not traced: what it holds counts as external, i.e. roots).
+        Callable::Promise(slot) => slot.object_refs(refs),
+        // The pair shares one cell: only the resolve function reports its edge, so the count
+        // never exceeds the promise's real reference count (a lone reject function leaves the
+        // promise looking externally held, which is conservative).
+        Callable::Resolver(cell, true) => {
+            if let Value::Obj(object) = &cell.promise {
                 refs.push(object.clone());
             }
         }
+        _ => {}
     }
 }
 

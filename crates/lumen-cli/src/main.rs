@@ -7,6 +7,7 @@
 //!   lumen-cli -e '<code>'              evaluate a string
 //!   lumen-cli -p '<code>'              evaluate a string and print its result (Node's --print)
 //!   lumen-cli -v | --version           print the version
+//!   lumen-cli typed [--report|--json|--facts|--strip] FILE...   typed-tier analysis (see typed.rs)
 //!   --tier=interp|bytecode, --tier-threshold=N   select the engine execution tier
 
 use std::io::{IsTerminal, Read};
@@ -14,6 +15,8 @@ use std::io::{IsTerminal, Read};
 use lumen_host::Completion;
 use lumen_repl::Repl;
 use lumen_runtime::Runtime;
+
+mod typed;
 
 /// The engine's size-class allocator: JS workloads are dominated by millions of short-lived
 /// same-sized blocks (objects, scopes, strings), where the system allocator is slowest.
@@ -50,6 +53,10 @@ fn real_main() {
     let mut exec_argv = Vec::new();
 
     let all_args: Vec<String> = std::env::args().collect();
+    // `lumen typed ...`: the typed tier's analyzer / Node-compatible type stripper.
+    if all_args.get(1).map(String::as_str) == Some("typed") {
+        std::process::exit(typed::main(all_args[2..].to_vec()));
+    }
     let argv0 = all_args
         .first()
         .cloned()
@@ -131,7 +138,13 @@ fn real_main() {
              m.filename = require('path').join(process.cwd(), '[eval]'); \
              if (typeof M._nodeModulePaths === 'function') m.paths = M._nodeModulePaths(process.cwd()); \
              globalThis.module = m; globalThis.exports = m.exports; } catch {} \
-             globalThis.__filename = '[eval]'; globalThis.__dirname = '.'; })();",
+             globalThis.__filename = '[eval]'; globalThis.__dirname = '.'; \
+             try { for (const name of require('module').builtinModules) { \
+               if (name.startsWith('_') || name.includes('/') || name in globalThis) continue; \
+               const setReal = (v) => Object.defineProperty(globalThis, name, { value: v, writable: true, enumerable: true, configurable: true }); \
+               Object.defineProperty(globalThis, name, { get() { const v = require(name); \
+                 Object.defineProperty(globalThis, name, { get: () => v, set: setReal, enumerable: false, configurable: true }); return v; }, \
+                 set: setReal, enumerable: false, configurable: true }); } } catch {} })();",
         );
         if print_result {
             // Node's -p: the script's completion value is console.log'd at process exit.
@@ -155,9 +168,14 @@ fn real_main() {
             runtime.run_main(&path)
         };
         if let Err(e) = result {
+            // A rejected TypeScript entry prints as Node prints it (no `Uncaught` prefix).
+            if lumen::typescript::is_node_uncaught_text(&e) {
+                die(1, &e);
+            }
             die(1, &format!("Uncaught {e}"));
         }
         let code = runtime.finish_process();
+        mem_report(&mut runtime);
         if code != 0 {
             std::process::exit(code);
         }
@@ -174,6 +192,13 @@ fn real_main() {
             die(2, "cannot read stdin");
         }
         run_source(&mut runtime, &src);
+    }
+}
+
+/// `LUMEN_MEM_STATS=1`: the memory breakdown at a normal exit (see `lumen::memstats`).
+fn mem_report(runtime: &mut Runtime) {
+    if lumen::memstats::enabled() {
+        runtime.engine().ctx().mem_report();
     }
 }
 
@@ -203,6 +228,7 @@ fn run_source(runtime: &mut Runtime, src: &str) {
     match runtime.eval(src) {
         Ok(Completion::Value(_)) => {
             let code = runtime.finish_process();
+            mem_report(runtime);
             if code != 0 {
                 std::process::exit(code);
             }
@@ -274,6 +300,8 @@ fn is_ignored_node_flag(a: &str) -> bool {
         "--unhandled-rejections=strict",
         "--unhandled-rejections=throw",
         "--jitless",
+        // Read back from process.execArgv by node:http (getOptionValue).
+        "--insecure-http-parser",
     ];
     EXACT.contains(&a)
         || a.starts_with("--max-old-space-size")
@@ -283,6 +311,7 @@ fn is_ignored_node_flag(a: &str) -> bool {
         || a.starts_with("--no-experimental-")
         || a.starts_with("--disable-warning")
         || a.starts_with("--title=")
+        || a.starts_with("--max-http-header-size=")
 }
 
 fn die(code: i32, message: &str) -> ! {

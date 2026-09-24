@@ -4,6 +4,7 @@
 
 use crate::token::{RegexTok, Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
 
+#[derive(Debug, Clone)]
 pub struct LexError {
     pub message: String,
     pub line: u32,
@@ -39,6 +40,15 @@ struct Lexer<'a> {
     /// Set when a `class` keyword is pushed: the next `{` is the class body, classified by
     /// whether the class was a declaration (statement position) or an expression.
     pending_class: Option<bool>,
+    /// TypeScript source: a postfix non-null `!` (`x!`) ends an expression, so a `/` after it is
+    /// a division.
+    ts: bool,
+    /// Where `/**` comments go (their char ranges), when the caller asked for them (the typed
+    /// tier's JSDoc side table). Only a JSDoc comment costs anything.
+    docs: Option<Vec<(u32, u32)>>,
+    /// The range starts in operator position: a leading `/` is a division (the parser re-lexing a
+    /// regex it met where an operator belongs).
+    start_div: bool,
 }
 
 /// Tokenize `src`. A lex error is reported as a SyntaxError by the caller.
@@ -51,12 +61,6 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
 pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexError> {
     let chars: Vec<char> = src.chars().collect();
     tokenize_chars(&chars, html_comments, 1)
-}
-
-/// [`tokenize_goal`] over an already-collected char buffer (the parser decodes a file once and
-/// drops the buffer when the parse ends).
-pub fn tokenize_goal_chars(chars: &[char], html_comments: bool) -> Result<Vec<Token>, LexError> {
-    tokenize_chars(chars, html_comments, 1)
 }
 
 /// Tokenize a range cut out of a larger source (a function body parsed lazily): `line` is the
@@ -73,6 +77,38 @@ pub fn tokenize_range(
 }
 
 fn tokenize_chars(chars: &[char], html_comments: bool, line: u32) -> Result<Vec<Token>, LexError> {
+    tokenize_opts(chars, html_comments, line, LexOpts::default()).map(|l| l.tokens)
+}
+
+/// What [`tokenize_opts`] produced.
+pub(crate) struct Lexed {
+    pub tokens: Vec<Token>,
+    /// Char ranges of the `/** */` comments, when asked for.
+    pub docs: Vec<(u32, u32)>,
+    /// TypeScript only: the error the lexer stopped at. The tokens end there (with an `Eof`), and
+    /// the parser reports it unless re-lexing a mis-guessed `/` from an earlier token gets past
+    /// it (a regex misread as a division can run into a string or template).
+    pub soft_err: Option<LexError>,
+}
+
+/// Lexer options beyond the goal (see [`tokenize_opts`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LexOpts {
+    /// TypeScript source (see `Lexer::ts`).
+    pub ts: bool,
+    /// Record the char ranges of `/** */` comments.
+    pub docs: bool,
+    /// A leading `/` is a division.
+    pub start_div: bool,
+}
+
+/// [`tokenize_range`] with [`LexOpts`]; also returns the recorded JSDoc comment ranges (chars).
+pub(crate) fn tokenize_opts(
+    chars: &[char],
+    html_comments: bool,
+    line: u32,
+    opts: LexOpts,
+) -> Result<Lexed, LexError> {
     let mut lx = Lexer {
         chars,
         pos: 0,
@@ -89,9 +125,24 @@ fn tokenize_chars(chars: &[char], html_comments: bool, line: u32) -> Result<Vec<
         last_close_block: false,
         pending_fn: Vec::new(),
         pending_class: None,
+        ts: opts.ts,
+        docs: opts.docs.then(Vec::new),
+        start_div: opts.start_div,
     };
-    lx.run()?;
-    Ok(lx.out)
+    let soft_err = match lx.run() {
+        Ok(()) => None,
+        Err(e) if lx.ts => {
+            lx.tok_start = lx.pos.min(chars.len());
+            lx.push(Tok::Eof);
+            Some(e)
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(Lexed {
+        tokens: lx.out,
+        docs: lx.docs.unwrap_or_default(),
+        soft_err,
+    })
 }
 
 impl Lexer<'_> {
@@ -127,7 +178,7 @@ impl Lexer<'_> {
     /// a `/` is division; otherwise it begins a regex.
     fn regex_allowed(&self) -> bool {
         match self.out.last().map(|t| &t.kind) {
-            None => true,
+            None => !self.start_div,
             Some(Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) | Tok::Regex(_)) => {
                 false
             }
@@ -142,9 +193,25 @@ impl Lexer<'_> {
             Some(Tok::Punct(p)) => match *p {
                 ")" | "]" => false,
                 "}" => self.last_close_block,
+                "!" if self.ts => !self.bang_is_postfix(),
                 _ => true,
             },
             Some(Tok::Eof) => false,
+        }
+    }
+
+    /// In TypeScript, whether the `!` just pushed is a non-null assertion (`x!`): it follows a
+    /// token that ends an operand on the same line, where a prefix `!` could not stand.
+    fn bang_is_postfix(&self) -> bool {
+        let n = self.out.len();
+        if n < 2 || self.out[n - 1].nl_before {
+            return false;
+        }
+        match &self.out[n - 2].kind {
+            Tok::Ident(_) | Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) => true,
+            Tok::Keyword(k) => matches!(*k, "this" | "super" | "null" | "true" | "false"),
+            Tok::Punct(p) => matches!(*p, ")" | "]" | "!"),
+            _ => false,
         }
     }
 
@@ -297,7 +364,18 @@ impl Lexer<'_> {
                 // Annex B: `-->` at the start of a line (or of the source) is a comment to EOL.
                 self.skip_line_comment();
             } else if c == '/' && self.regex_allowed() {
-                self.read_regex()?;
+                if self.ts {
+                    // A guess the parser may overturn: when no regex ends on this line, it is a
+                    // division (the parser re-lexes if a regex was meant after all).
+                    let (pos, line) = (self.pos, self.line);
+                    if self.read_regex().is_err() {
+                        self.pos = pos;
+                        self.line = line;
+                        self.read_punct()?;
+                    }
+                } else {
+                    self.read_regex()?;
+                }
             } else if c == '"' || c == '\'' {
                 self.read_string(c)?;
             } else if c == '`' {
@@ -327,6 +405,7 @@ impl Lexer<'_> {
     }
 
     fn skip_block_comment(&mut self) -> Result<(), LexError> {
+        let start = self.pos;
         self.bump();
         self.bump();
         loop {
@@ -334,6 +413,12 @@ impl Lexer<'_> {
                 None => return Err(self.err("unterminated block comment")),
                 Some('*') if self.peek() == Some('/') => {
                     self.bump();
+                    if let Some(docs) = &mut self.docs {
+                        // `/** ... */`, but not the empty `/**/`.
+                        if self.chars.get(start + 2) == Some(&'*') && self.pos - start > 4 {
+                            docs.push((start as u32, self.pos as u32));
+                        }
+                    }
                     return Ok(());
                 }
                 Some(c) if is_line_terminator(c) => self.nl_pending = true,

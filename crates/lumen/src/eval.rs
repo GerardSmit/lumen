@@ -3,6 +3,7 @@
 
 mod enumeration;
 pub(crate) mod fastpaths;
+pub(crate) mod promise_fast;
 
 use crate::ast::*;
 use crate::interpreter::*;
@@ -1548,8 +1549,11 @@ impl Interp {
                 }
                 let len = self.checked_array_len(o)?;
                 let mut out = Vec::with_capacity(len.min(1024));
-                for i in 0..len {
+                // The Array Iterator re-reads `length` each step: a getter may grow or shrink it.
+                let mut i = 0;
+                while i < self.array_length(o) {
                     out.push(self.get_member(v, &i.to_string())?);
+                    i += 1;
                 }
                 return Ok(out);
             }
@@ -1602,8 +1606,9 @@ impl Interp {
             return Err(self.throw("TypeError", "iterator.next is not a function"));
         }
         let mut out = Vec::new();
+        let mut next = crate::bytecode::PreparedCall::new(self, next, iter);
         loop {
-            let res = self.call(next.clone(), iter.clone(), &[])?;
+            let res = next.call(self, &mut [])?;
             if !matches!(res, Value::Obj(_)) {
                 return Err(self.throw("TypeError", "iterator result is not an object"));
             }
@@ -1616,6 +1621,7 @@ impl Interp {
                 return Err(self.throw("RangeError", "iterator produced too many values"));
             }
         }
+        next.finish(self);
         Ok(out)
     }
 
@@ -2119,7 +2125,7 @@ impl Interp {
                 let shown = private_display(name);
                 Err(self.throw(
                     "TypeError",
-                    format!("cannot read private member {shown} from an object whose class did not declare it"),
+                    format!("Cannot read private member {shown} from an object whose class did not declare it"),
                 ))
             }
         }
@@ -2135,7 +2141,7 @@ impl Interp {
             _ => {
                 return Err(self.throw(
                     "TypeError",
-                    format!("cannot write private member {shown} to an object whose class did not declare it"),
+                    format!("Cannot write private member {shown} to an object whose class did not declare it"),
                 ))
             }
         };
@@ -2164,7 +2170,7 @@ impl Interp {
             }
             None => Err(self.throw(
                 "TypeError",
-                format!("cannot write private member {shown} to an object whose class did not declare it"),
+                format!("Cannot write private member {shown} to an object whose class did not declare it"),
             )),
         }
     }
@@ -2444,62 +2450,7 @@ impl Interp {
                     Some(o) => Some(self.eval(o, env)?),
                     None => None,
                 };
-                // ToString abruptness rejects the promise (IfAbruptRejectPromise), not a sync throw.
-                let s = match self.to_string(&specifier) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let p = self.new_promise();
-                        let reason = crate::interpreter::abrupt_value(e);
-                        self.reject_promise(&p, reason);
-                        return Ok(p);
-                    }
-                };
-                match phase {
-                    // A Source Text Module Record's GetModuleSource always throws a SyntaxError, so
-                    // `import.source(x)` rejects once the specifier has been coerced — except for
-                    // the host-defined '<module source>' module, which has a ModuleSource object.
-                    ImportPhase::Source => {
-                        let p = self.new_promise();
-                        if s.as_str() == "<module source>" {
-                            let src_obj = self.module_source_of(&s);
-                            self.resolve_promise(&p, src_obj);
-                            return Ok(p);
-                        }
-                        let reason = crate::interpreter::abrupt_value(
-                            self.throw("SyntaxError", "source phase import is not available"),
-                        );
-                        self.reject_promise(&p, reason);
-                        Ok(p)
-                    }
-                    // `import.defer(x)` defers evaluation of the module; for specifier handling it
-                    // behaves like a plain dynamic import.
-                    ImportPhase::Evaluation | ImportPhase::Defer => {
-                        // `{ with: { type: ... } }` selects a JSON/text/bytes module. An abrupt
-                        // attributes validation rejects the promise like the specifier coercion.
-                        let mut attr_type = None;
-                        if let Some(o) = &opts_val {
-                            match self.import_attributes(o) {
-                                Ok(t) => attr_type = t,
-                                Err(e) => {
-                                    let p = self.new_promise();
-                                    let reason = crate::interpreter::abrupt_value(e);
-                                    self.reject_promise(&p, reason);
-                                    return Ok(p);
-                                }
-                            }
-                        }
-                        // Capture the importing module's `import.meta` lexically (the
-                        // `%importmeta%` binding), so the referrer is correct even when this
-                        // `import()` runs from an async continuation after `await`.
-                        let referrer = self.peek_binding("%importmeta%", env);
-                        Ok(self.dynamic_import(
-                            &s,
-                            attr_type.as_deref(),
-                            matches!(phase, ImportPhase::Defer),
-                            referrer,
-                        ))
-                    }
-                }
+                self.import_call_finish(specifier, opts_val, *phase, env)
             }
             Expr::PrivateIn { name, obj } => {
                 let o = self.eval(obj, env)?;
@@ -2603,16 +2554,18 @@ impl Interp {
                 callee,
                 args,
                 optional,
-            } => self.eval_call(callee, args, *optional, env),
+                pos,
+            } => self.eval_call(callee, args, *optional, *pos, env),
             Expr::TaggedTemplate {
                 tag,
                 quasis,
                 site,
                 subs,
             } => self.eval_tagged_template(tag, quasis, *site, subs, env),
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, pos } => {
                 let c = self.eval(callee, env)?;
                 let argv = self.eval_args(args, env)?;
+                self.cur_site = *pos;
                 self.construct(c, &argv)
             }
         }
@@ -2716,8 +2669,21 @@ impl Interp {
         let obj = self.new_object();
         // Methods/getters/setters carry a [[HomeObject]] (the literal itself) so `super.x` resolves
         // against the object's *current* prototype, evaluated dynamically at access time.
-        let home_env = new_scope(Some(env.clone()));
-        bind(&home_env, "%homeobject%", Value::Obj(obj.clone()));
+        // Built on first use: a literal whose methods can't reach their home object (no `super`,
+        // no direct `eval` — see `Function::may_use_home`) closes them over `env` and forms no
+        // literal <-> method cycle.
+        let mut home: Option<Env> = None;
+        let mut home_env = |func: &Rc<Function>| -> Env {
+            if !func.may_use_home() {
+                return env.clone();
+            }
+            home.get_or_insert_with(|| {
+                let h = new_scope(Some(env.clone()));
+                bind(&h, "%homeobject%", Value::Obj(obj.clone()));
+                h
+            })
+            .clone()
+        };
         for prop in props {
             match prop {
                 // A Cover reaching evaluation means the parse accepted it as part of a pattern
@@ -2734,21 +2700,21 @@ impl Interp {
                 }
                 PropDef::Method { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
-                    let f = self.make_function(func.clone(), home_env.clone());
+                    let f = self.make_function(func.clone(), home_env(func));
                     let name = self.fn_name_for_key(&k);
                     self.set_fn_name(&f, &name);
                     obj.borrow_mut().props.insert(k, Property::plain(f));
                 }
                 PropDef::Getter { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
-                    let f = self.make_function(func.clone(), home_env.clone());
+                    let f = self.make_function(func.clone(), home_env(func));
                     let name = self.fn_name_for_key(&k);
                     self.set_fn_name(&f, &format!("get {name}"));
                     self.define_accessor(&obj, &k, Some(f), None);
                 }
                 PropDef::Setter { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
-                    let f = self.make_function(func.clone(), home_env.clone());
+                    let f = self.make_function(func.clone(), home_env(func));
                     let name = self.fn_name_for_key(&k);
                     self.set_fn_name(&f, &format!("set {name}"));
                     self.define_accessor(&obj, &k, None, Some(f));
@@ -3098,6 +3064,7 @@ impl Interp {
             callee,
             args,
             optional: false,
+            ..
         } = e
         else {
             return Ok(None);
@@ -3185,11 +3152,14 @@ impl Interp {
         Ok(Some((func, this, argv)))
     }
 
+    /// `pos` is the call's source position: published as `cur_site` once the arguments are
+    /// evaluated, right before the callee runs (see `Interp::cur_site`).
     fn eval_call(
         &mut self,
         callee: &Expr,
         args: &[ArrayElem],
         optional: bool,
+        pos: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
         // Direct eval: `eval(src)` called by that exact name runs the code in the *caller's* scope
@@ -3203,6 +3173,7 @@ impl Interp {
                 {
                     if Gc::ptr_eq(&f, &ef) {
                         let argv = self.eval_args(args, env)?;
+                        self.cur_site = pos;
                         return self.direct_eval(argv.first(), env);
                     }
                 }
@@ -3219,6 +3190,7 @@ impl Interp {
                 }
                 _ => self.eval_args(args, env)?,
             };
+            self.cur_site = pos;
             return self.super_call_complete(env, parent, this, argv);
         }
         // `super.m(...)` / `super[k](...)`: method on the super prototype, called with current `this`.
@@ -3228,6 +3200,7 @@ impl Interp {
                 let f = self.get_member(&home, prop)?;
                 let this = self.get_var("this", env)?;
                 let argv = self.eval_args(args, env)?;
+                self.cur_site = pos;
                 return self.call(f, this, &argv);
             }
         }
@@ -3239,6 +3212,7 @@ impl Interp {
                 let f = self.get_member(&home, &key)?;
                 let this = self.get_var("this", env)?;
                 let argv = self.eval_args(args, env)?;
+                self.cur_site = pos;
                 return self.call(f, this, &argv);
             }
         }
@@ -3248,7 +3222,7 @@ impl Interp {
         if let Expr::OptionalChain(inner) = callee {
             let saved = self.short_circuit;
             self.short_circuit = false;
-            let r = self.eval_call(inner, args, optional, env);
+            let r = self.eval_call(inner, args, optional, pos, env);
             let short = std::mem::replace(&mut self.short_circuit, saved);
             if short && r.is_ok() {
                 self.eval_args(args, env)?;
@@ -3316,6 +3290,7 @@ impl Interp {
             return Ok(Value::Undefined);
         }
         let argv = self.eval_args(args, env)?;
+        self.cur_site = pos;
         if !func.is_callable() {
             let desc = describe_callee(callee);
             return Err(self.throw("TypeError", format!("{desc} is not a function")));
@@ -3327,10 +3302,8 @@ impl Interp {
     /// throw its reason). A non-promise is returned as-is. A still-pending promise yields undefined
     /// (lumen cannot truly suspend).
     pub(crate) fn await_value(&mut self, v: Value) -> Result<Value, Abrupt> {
-        let ptr = match &v {
-            Value::Obj(o) if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) => {
-                Gc::as_ptr(o) as usize
-            }
+        match &v {
+            Value::Obj(o) if crate::eval::promise_fast::is_promise_obj(o) => {}
             Value::Obj(_) => {
                 // Await of a plain object goes through the promise resolution procedure: a
                 // thenable is adopted (its `then` called once), anything else settles as-is.
@@ -3346,160 +3319,128 @@ impl Interp {
                 return Ok(v);
             }
             _ => return Ok(v),
-        };
+        }
         // Await → PromiseResolve(%Promise%, v): the `constructor` read on a native promise is
         // observable, and its abrupt completion is the await's.
         self.get_member(&v, "constructor")?;
         self.drain_microtasks();
-        match self.promises.get(&ptr) {
-            Some(s) if s.status == 1 => Ok(s.value.clone()),
-            Some(s) if s.status == 2 => Err(Abrupt::Throw(s.value.clone())),
+        use crate::eval::promise_fast::{FULFILLED, REJECTED};
+        match crate::eval::promise_fast::promise_state(&v) {
+            Some((FULFILLED, value)) => Ok(value),
+            Some((REJECTED, reason)) => Err(Abrupt::Throw(reason)),
             _ => Ok(Value::Undefined),
         }
     }
 
     // ----- promises ---------------------------------------------------------------------------
+    // State lives in the promise object (`Callable::Promise`, see `eval::promise_fast`).
 
     pub(crate) fn new_promise(&mut self) -> Value {
-        let obj = Object::new(self.extra_protos.get("Promise").cloned());
-        let p = Gc::as_ptr(&obj) as usize;
-        self.gc_pin(&obj);
-        self.promises.insert(p, PromiseState::default());
+        let obj = Object::new_bare(self.promise_proto());
+        obj.borrow_mut().call = Callable::Promise(crate::eval::promise_fast::PromiseSlot::boxed());
         Value::Obj(obj)
     }
 
-    /// One resolving function of a pair; both share `flag` — their [[AlreadyResolved]] record.
-    pub(crate) fn make_resolver_with(
-        &mut self,
-        promise: &Value,
-        fulfilling: bool,
-        flag: &crate::value::Gc,
-    ) -> Value {
-        let target = self.make_native(
-            if fulfilling { "resolve" } else { "reject" },
-            1,
-            if fulfilling {
-                promise_resolve_native
-            } else {
-                promise_reject_native
-            },
-        );
-        let bound = Object::new(Some(self.function_proto.clone()));
-        bound.borrow_mut().call =
-            Callable::bound(target, promise.clone(), vec![Value::Obj(flag.clone())]);
-        // A promise resolving function has `length` 1 and an empty `name`.
-        bound.borrow_mut().props.insert(
-            "length",
-            crate::value::Property::data(Value::Num(1.0), false, false, true),
-        );
-        bound.borrow_mut().props.insert(
-            "name",
-            crate::value::Property::data(Value::str(""), false, false, true),
-        );
-        Value::Obj(bound)
-    }
-
-    /// The standard resolver pair (shared [[AlreadyResolved]]).
-    pub(crate) fn make_resolver_pair(&mut self, promise: &Value) -> (Value, Value) {
-        let flag = Object::new(None);
-        (
-            self.make_resolver_with(promise, true, &flag),
-            self.make_resolver_with(promise, false, &flag),
-        )
+    /// The promise whose state `promise` holds: itself, or the subclass instance a native
+    /// `super()` grafted its state onto. `None`: not a promise, or not pending.
+    fn pending_promise_target(promise: &Value) -> Option<Gc> {
+        let Value::Obj(o) = promise else { return None };
+        let b = o.borrow();
+        match &b.call {
+            Callable::Promise(s) if s.status == crate::eval::promise_fast::PENDING => {
+                Some(o.clone())
+            }
+            Callable::Promise(s) if s.status == crate::eval::promise_fast::FORWARDED => {
+                let target = s.value.clone();
+                drop(b);
+                Self::pending_promise_target(&target)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn resolve_promise(&mut self, promise: &Value, value: Value) {
-        // Follow a subclass graft's forwarding link (see run_constructor_on's native arm).
-        let mut promise = promise.clone();
-        if let Value::Obj(o) = &promise {
-            if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
-                promise = f.clone();
-            }
-        }
-        let promise = &promise;
-        let ptr = match promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
-            _ => return,
-        };
-        if self.promises.get(&ptr).map(|s| s.status).unwrap_or(1) != 0 {
+        // Only a pending promise is affected (a subclass graft forwards to its target).
+        let Some(target) = Self::pending_promise_target(promise) else { return };
+        let Value::Obj(v) = &value else {
+            // A non-object settles at once.
+            self.settle(&target, value, true);
             return;
-        }
+        };
         // Resolving a promise with ITSELF is a TypeError rejection (chaining cycle).
-        if let (Value::Obj(p), Value::Obj(v)) = (promise, &value) {
-            if Gc::ptr_eq(p, v) {
-                let e = crate::interpreter::abrupt_value(
-                    self.throw("TypeError", "Chaining cycle detected for promise"),
-                );
-                self.reject_promise(promise, e);
-                return;
-            }
+        if Gc::ptr_eq(&target, v) {
+            let e = crate::interpreter::abrupt_value(
+                self.throw("TypeError", "Chaining cycle detected for promise"),
+            );
+            self.settle(&target, e, false);
+            return;
         }
         // Adopt a thenable's eventual state; a throwing `then` getter rejects. The `then` CALL
         // itself happens in a microtask (PromiseResolveThenableJob).
-        if matches!(value, Value::Obj(_)) {
-            match self.get_member(&value, "then") {
-                Ok(then) if then.is_callable() => {
-                    let (res, rej) = self.make_resolver_pair(promise);
-                    let runner =
-                        crate::builtins::make_thenable_job(self, then, value.clone(), res, rej);
-                    self.microtasks.push_back(crate::interpreter::Job {
-                        handler: runner,
-                        result: Value::Undefined,
-                        value: Value::Undefined,
-                        fulfilled: true,
-                        context: self.async_context.clone(),
-                    });
-                    return;
-                }
-                Ok(_) => {}
-                Err(Abrupt::Throw(e)) => {
-                    self.reject_promise(promise, e);
-                    return;
-                }
-                Err(_) => {}
+        match self.get_member(&value, "then") {
+            Ok(then) if then.is_callable() => {
+                // NewPromiseResolveThenableJob (its resolving functions are made when it runs:
+                // creating them is unobservable).
+                self.microtasks.push_back(crate::interpreter::Job {
+                    handler: then,
+                    result: Value::Obj(target),
+                    value,
+                    fulfilled: true,
+                    kind: crate::eval::promise_fast::JOB_THENABLE,
+                    idx: 0,
+                    context: self.async_context.clone(),
+                });
             }
+            Ok(_) => self.settle(&target, value, true),
+            Err(Abrupt::Throw(e)) => self.settle(&target, e, false),
+            Err(_) => {}
         }
-        self.settle(promise, value, true);
     }
 
     pub(crate) fn reject_promise(&mut self, promise: &Value, reason: Value) {
-        let mut promise = promise.clone();
-        if let Value::Obj(o) = &promise {
-            if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
-                promise = f.clone();
-            }
+        if let Some(target) = Self::pending_promise_target(promise) {
+            self.settle(&target, reason, false);
         }
-        self.settle(&promise, reason, false);
     }
 
-    fn settle(&mut self, promise: &Value, value: Value, fulfilled: bool) {
-        let ptr = match promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
-            _ => return,
-        };
-        let reactions = match self.promises.get_mut(&ptr) {
-            Some(s) if s.status == 0 => {
-                s.status = if fulfilled { 1 } else { 2 };
-                s.value = value.clone();
-                std::mem::take(&mut s.reactions)
+    fn settle(&mut self, promise: &Gc, value: Value, fulfilled: bool) {
+        let (first, rest) = {
+            let mut b = promise.borrow_mut();
+            let Callable::Promise(s) = &mut b.call else { return };
+            if s.status != crate::eval::promise_fast::PENDING {
+                return;
             }
-            _ => return,
+            s.status = if fulfilled {
+                crate::eval::promise_fast::FULFILLED
+            } else {
+                crate::eval::promise_fast::REJECTED
+            };
+            s.value = value.clone();
+            let first = s.first.take();
+            // A rejection with no reactions attached yet is (so far) unhandled — track it. A
+            // later `.then`/`.catch` clears it (see `promise_then_into`).
+            if !fulfilled && first.is_none() {
+                s.tracked = true;
+            }
+            let rest = if s.rest.is_empty() {
+                Vec::new()
+            } else {
+                std::mem::take(&mut s.rest)
+            };
+            (first, rest)
         };
-        // A rejection with no reactions attached yet is (so far) unhandled — track it. A later
-        // `.then`/`.catch` clears it (see `promise_then_into`).
-        if !fulfilled && reactions.is_empty() {
-            self.unhandled_rejections
-                .insert(ptr, (promise.clone(), value.clone()));
-        }
-        for (on_f, on_r, result, context) in reactions {
-            let handler = if fulfilled { on_f } else { on_r };
-            self.microtasks.push_back(Job {
-                handler,
-                result,
-                value: value.clone(),
-                fulfilled,
-                context,
-            });
+        let Some(first) = first else {
+            if !fulfilled {
+                self.unhandled_rejections.insert(
+                    Gc::as_ptr(promise) as usize,
+                    (Value::Obj(promise.clone()), value),
+                );
+            }
+            return;
+        };
+        for r in std::iter::once(first).chain(rest) {
+            let job = Self::reaction_job(r, fulfilled, value.clone());
+            self.microtasks.push_back(job);
         }
     }
 
@@ -3519,41 +3460,9 @@ impl Interp {
         on_r: Value,
         result: Value,
     ) {
-        let ptr = match promise {
-            Value::Obj(o) => Gc::as_ptr(o) as usize,
-            _ => return,
-        };
-        let status = self.promises.get(&ptr).map(|s| s.status).unwrap_or(0);
-        // Attaching a handler marks the rejection handled (HostPromiseRejectionTracker "handle").
-        self.unhandled_rejections.remove(&ptr);
-        match status {
-            0 => {
-                let context = self.async_context.clone();
-                if let Some(s) = self.promises.get_mut(&ptr) {
-                    s.reactions.push((on_f, on_r, result.clone(), context));
-                }
-            }
-            1 => {
-                let v = self.promises[&ptr].value.clone();
-                self.microtasks.push_back(Job {
-                    handler: on_f,
-                    result: result.clone(),
-                    value: v,
-                    fulfilled: true,
-                    context: self.async_context.clone(),
-                });
-            }
-            _ => {
-                let v = self.promises[&ptr].value.clone();
-                self.microtasks.push_back(Job {
-                    handler: on_r,
-                    result: result.clone(),
-                    value: v,
-                    fulfilled: false,
-                    context: self.async_context.clone(),
-                });
-            }
-        }
+        let Value::Obj(o) = promise else { return };
+        let context = self.async_context.clone();
+        self.perform_then(o, crate::eval::promise_fast::Reaction::then(on_f, on_r, result, context));
     }
 
     /// Drain the microtask queue (called after the main script). Bounded to avoid an unbounded loop.
@@ -3608,19 +3517,37 @@ impl Interp {
     /// is legitimate work, and a cap that clears the queue silently loses settlements the program
     /// is awaiting. A genuinely infinite microtask loop spins here, as it does in Node.
     pub(crate) fn drain_microtasks(&mut self) {
-        while let Some(job) = self.microtasks.pop_front() {
-            // A terminated realm runs no more reactions; the queue dies with it.
-            if self.terminating {
-                self.microtasks.clear();
-                return;
+        loop {
+            while let Some(job) = self.microtasks.pop_front() {
+                // A terminated realm runs no more reactions; the queue dies with it.
+                if self.terminating {
+                    self.microtasks.clear();
+                    return;
+                }
+                self.lang.promise.drain_job.set(true);
+                self.run_job(job);
+
             }
-            self.run_job(job);
+            // The checkpoint is quiescent: ClearKeptObjects, and queue any FinalizationRegistry
+            // cleanup jobs a collection made due.
+            if !self.weak_checkpoint() {
+                break;
+            }
         }
     }
 
     /// Run one promise-reaction job (settle `job.result` from the handler, or pass the
     /// settlement through when there is no handler).
     pub(crate) fn run_job(&mut self, job: crate::interpreter::Job) {
+        let from_drain = self.lang.promise.drain_job.replace(false);
+        match job.kind {
+            crate::eval::promise_fast::JOB_REACTION => {}
+            crate::eval::promise_fast::JOB_THENABLE => return self.run_thenable_job(job),
+            _ => return self.run_combinator_job(job),
+        }
+        if matches!(job.result, Value::Empty) {
+            return self.run_await_job(job, from_drain);
+        }
         if job.handler.is_callable() {
             let outer = std::mem::replace(&mut self.async_context, job.context.clone());
             let outcome = self.call(
@@ -3695,9 +3622,9 @@ impl Interp {
     ) -> Value {
         // source/flags/global/... are accessor getters on RegExp.prototype (computed from the
         // matcher); only `lastIndex` is an own writable data property.
-        let obj = Object::new_with_parts(proto, self.regexp_props(), Exotic::None);
+        let obj = self.new_regexp_object(proto);
         let ptr = Gc::as_ptr(&obj) as usize;
-        self.gc_pin(&obj);
+        self.regexp_weak_pin(&obj);
         self.regexps.insert(ptr, re);
         Value::Obj(obj)
     }
@@ -3789,6 +3716,8 @@ impl Interp {
             &private_names,
         )
         .map_err(|e| self.throw("SyntaxError", e.message))?;
+        // The eval code's own source: its stack-trace frame is `eval at <caller> (…)`.
+        let eval_src = crate::interpreter::stack_trace::take_parsed_source().map(|(s, _)| s);
         // A direct `eval` inherits the caller's super-call context: a `super(...)` in the eval is an
         // early SyntaxError unless the eval sits directly inside a derived constructor body. (Caught
         // here, before any of the eval body runs, so side effects preceding the `super()` don't.)
@@ -3880,7 +3809,7 @@ impl Interp {
 
         let saved = self.strict;
         self.strict = strict;
-        let result = self.run_eval_body(&body, &lex_env);
+        let result = self.with_script_frame(eval_src, true, |i| i.run_eval_body(&body, &lex_env));
         self.strict = saved;
         result
     }
@@ -4584,6 +4513,8 @@ impl Interp {
                 derived,
                 instance_initializers: instance_inits,
                 private_members: priv_members,
+                field_code: crate::interpreter::class_fields::FieldCode::new(),
+                plan: Default::default(),
             },
         );
 
@@ -4890,10 +4821,24 @@ impl Interp {
                 self.run_constructor_on(&Value::Obj(bound.target), this, &all)
             }
             Callable::User(user) => {
+                // A parent with a constructor template stamps it onto `this` (no code runs).
+                if let Some(r) = crate::bytecode::ctor_plan::run_plan_on(self, ctor, this, args) {
+                    return r;
+                }
+                if is_class {
+                    if let Some(r) =
+                        crate::bytecode::class_fields::run_class_ctor_on(self, ctor, this, args)
+                    {
+                        return r;
+                    }
+                }
                 // A base class initializes its fields before its body runs; a derived class does so
-                // inside its own `super()`.
+                // inside its own `super()`. (A construct inside an initializer must not consume
+                // the pending new.target.)
                 if is_class && !derived {
+                    let nt = std::mem::take(&mut self.pending_new_target);
                     self.init_instance_fields(ctor, this)?;
+                    self.pending_new_target = nt;
                 }
                 // A `super(...)` call is legal only directly within a *derived* constructor body.
                 let saved_super = self.super_call_ok;
@@ -4921,10 +4866,22 @@ impl Interp {
                         }
                         // A Function (or GeneratorFunction/AsyncFunction) subclass instance is
                         // itself callable: carry the built-in's [[Call]] behavior onto `this`.
-                        let src_call = src.borrow().call.clone();
-                        if !matches!(src_call, Callable::None)
+                        // A Promise subclass instance takes over the native promise's state;
+                        // the native ctor's resolvers are bound to `src`, which now forwards.
+                        if crate::eval::promise_fast::is_promise_obj(src)
                             && matches!(dst.borrow().call, Callable::None)
                         {
+                            let mut fwd = crate::eval::promise_fast::PromiseSlot::boxed();
+                            fwd.status = crate::eval::promise_fast::FORWARDED;
+                            fwd.value = this.clone();
+                            let slot = std::mem::replace(
+                                &mut src.borrow_mut().call,
+                                Callable::Promise(fwd),
+                            );
+                            dst.borrow_mut().call = slot;
+                        }
+                        let src_call = src.borrow().call.clone();
+                        if src_call.is_fn() && matches!(dst.borrow().call, Callable::None) {
                             let is_ctor = src.borrow().is_constructor;
                             let mut db = dst.borrow_mut();
                             db.call = src_call;
@@ -4966,11 +4923,6 @@ impl Interp {
                         }
                         if let Some(v) = self.regexps.remove(&sp) {
                             self.regexps.insert(dp, v);
-                        }
-                        if let Some(v) = self.promises.remove(&sp) {
-                            self.promises.insert(dp, v);
-                            // The native ctor's resolvers are bound to `src`; forward them.
-                            self.promise_forward.insert(sp, this.clone());
                         }
                         if let Some(v) = self.temporal.remove(&sp) {
                             self.temporal.insert(dp, v);
@@ -5063,7 +5015,10 @@ impl Interp {
         Ok(())
     }
 
-    fn init_instance_fields(&mut self, ctor: &Value, this: &Value) -> Result<(), Abrupt> {
+    pub(crate) fn init_instance_fields(&mut self, ctor: &Value, this: &Value) -> Result<(), Abrupt> {
+        if let Some(r) = self.init_instance_fields_compiled(ctor, this) {
+            return r;
+        }
         let obj = match ctor {
             Value::Obj(o) => o.clone(),
             _ => return Ok(()),
@@ -6534,7 +6489,7 @@ impl Interp {
     /// `prototype` appears on `O`'s prototype chain.
     pub(crate) fn ordinary_has_instance(&mut self, c: &Value, o: &Value) -> Result<bool, Abrupt> {
         let co = match c {
-            Value::Obj(x) if !matches!(x.borrow().call, Callable::None) => x.clone(),
+            Value::Obj(x) if x.borrow().call.is_fn() => x.clone(),
             _ => return Ok(false),
         };
         if let Callable::Bound(bound) = &co.borrow().call {
@@ -6941,6 +6896,7 @@ fn default_constructor(derived: bool) -> Function {
             callee: Box::new(Expr::Super),
             args: vec![ArrayElem::Spread(Expr::Ident(DEFAULT_CTOR_ARGS.to_string()))],
             optional: false,
+            pos: crate::ast::NO_POS,
         })]
     } else {
         Vec::new()
@@ -7059,7 +7015,7 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
     let e = |x: &Expr| expr_contains(x, pred);
     match x {
         Expr::Call { callee, args, .. } => e(callee) || call_args_contain(args, pred),
-        Expr::New { callee, args } => e(callee) || call_args_contain(args, pred),
+        Expr::New { callee, args, .. } => e(callee) || call_args_contain(args, pred),
         Expr::Unary { arg, .. }
         | Expr::Update { arg, .. }
         | Expr::Await(arg)
@@ -7168,7 +7124,7 @@ fn fi_expr(e: &Expr, args: bool) -> Option<&'static str> {
             }
             fi_expr(callee, args).or_else(|| fi_arr(a, args))
         }
-        Expr::New { callee, args: a } => fi_expr(callee, args).or_else(|| fi_arr(a, args)),
+        Expr::New { callee, args: a, .. } => fi_expr(callee, args).or_else(|| fi_arr(a, args)),
         Expr::Unary { arg, .. } | Expr::Update { arg, .. } | Expr::Await(arg) => fi_expr(arg, args),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
             fi_expr(left, args).or_else(|| fi_expr(right, args))
@@ -7294,39 +7250,7 @@ fn dec_add_initializer(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     Ok(Value::Undefined)
 }
 
-/// The resolver pair's shared [[AlreadyResolved]] cell (`args[0]`): true (and mark) on first use.
-fn promise_mark_already(flag: &Value) -> bool {
-    if let Value::Obj(o) = flag {
-        let used = o.borrow().props.contains("__called");
-        if used {
-            return false;
-        }
-        o.borrow_mut().props.insert(
-            "__called",
-            crate::value::Property::data(Value::Bool(true), true, false, true),
-        );
-        return true;
-    }
-    true
-}
 
-fn promise_resolve_native(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
-    if promise_mark_already(&arg_at(args, 0)) {
-        i.resolve_promise(&this, arg_at(args, 1));
-    }
-    Ok(Value::Undefined)
-}
-
-fn promise_reject_native(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
-    if promise_mark_already(&arg_at(args, 0)) {
-        i.reject_promise(&this, arg_at(args, 1));
-    }
-    Ok(Value::Undefined)
-}
-
-fn arg_at(args: &[Value], k: usize) -> Value {
-    args.get(k).cloned().unwrap_or(Value::Undefined)
-}
 
 fn describe_callee(callee: &Expr) -> String {
     match callee {
@@ -7826,4 +7750,74 @@ fn string_to_bigint(s: &str) -> Option<crate::bigint::JsBigInt> {
 enum TailEval {
     Tail(Value, Value, Vec<Value>),
     Val(Value),
+}
+
+impl Interp {
+    /// `import(spec, options)` after both operands evaluated (the tree-walker's `ImportCall`
+    /// arm and the bytecode tier's `Op::ImportCall` share it). `env` supplies the referrer's
+    /// `%importmeta%`.
+    pub(crate) fn import_call_finish(
+        &mut self,
+        specifier: Value,
+        opts_val: Option<Value>,
+        phase: ImportPhase,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        // ToString abruptness rejects the promise (IfAbruptRejectPromise), not a sync throw.
+        let s = match self.to_string(&specifier) {
+            Ok(s) => s,
+            Err(e) => {
+                let p = self.new_promise();
+                let reason = crate::interpreter::abrupt_value(e);
+                self.reject_promise(&p, reason);
+                return Ok(p);
+            }
+        };
+        match phase {
+            // A Source Text Module Record's GetModuleSource always throws a SyntaxError, so
+            // `import.source(x)` rejects once the specifier has been coerced — except for
+            // the host-defined '<module source>' module, which has a ModuleSource object.
+            ImportPhase::Source => {
+                let p = self.new_promise();
+                if s.as_str() == "<module source>" {
+                    let src_obj = self.module_source_of(&s);
+                    self.resolve_promise(&p, src_obj);
+                    return Ok(p);
+                }
+                let reason = crate::interpreter::abrupt_value(
+                    self.throw("SyntaxError", "source phase import is not available"),
+                );
+                self.reject_promise(&p, reason);
+                Ok(p)
+            }
+            // `import.defer(x)` defers evaluation of the module; for specifier handling it
+            // behaves like a plain dynamic import.
+            ImportPhase::Evaluation | ImportPhase::Defer => {
+                // `{ with: { type: ... } }` selects a JSON/text/bytes module. An abrupt
+                // attributes validation rejects the promise like the specifier coercion.
+                let mut attr_type = None;
+                if let Some(o) = &opts_val {
+                    match self.import_attributes(o) {
+                        Ok(t) => attr_type = t,
+                        Err(e) => {
+                            let p = self.new_promise();
+                            let reason = crate::interpreter::abrupt_value(e);
+                            self.reject_promise(&p, reason);
+                            return Ok(p);
+                        }
+                    }
+                }
+                // Capture the importing module's `import.meta` lexically (the
+                // `%importmeta%` binding), so the referrer is correct even when this
+                // `import()` runs from an async continuation after `await`.
+                let referrer = self.peek_binding("%importmeta%", env);
+                Ok(self.dynamic_import(
+                    &s,
+                    attr_type.as_deref(),
+                    matches!(phase, ImportPhase::Defer),
+                    referrer,
+                ))
+            }
+        }
+    }
 }

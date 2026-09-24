@@ -7,10 +7,20 @@
 // ---- checksums --------------------------------------------------------------------------------
 
 pub fn adler32(data: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
+    adler32_from(1, data)
+}
+
+/// Adler-32 continued from a prior checksum (`1` to start fresh), for streamed input.
+pub fn adler32_from(adler: u32, data: &[u8]) -> u32 {
+    let (mut a, mut b) = (adler & 0xffff, adler >> 16);
+    // 5552 bytes is the most that can be summed before `b` could overflow a u32 (zlib's NMAX).
+    for chunk in data.chunks(5552) {
+        for &byte in chunk {
+            a += byte as u32;
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
     }
     (b << 16) | a
 }
@@ -42,7 +52,8 @@ pub fn crc32(data: &[u8]) -> u32 {
 /// CRC-32 continued from a prior checksum `seed` (0 to start fresh) — the form `node:zlib.crc32`
 /// exposes so callers can chain checksums across chunks.
 pub fn crc32_from(seed: u32, data: &[u8]) -> u32 {
-    let table = crc32_table();
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(crc32_table);
     let mut crc = seed ^ 0xffff_ffff;
     for &byte in data {
         crc = table[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
@@ -265,6 +276,7 @@ fn read_dynamic_tables(reader: &mut BitReader) -> Result<(Huffman, Huffman), Str
 
 // ---- deflate encoder (fixed Huffman + greedy LZ77) --------------------------------------------
 
+#[derive(Default)]
 struct BitWriter {
     out: Vec<u8>,
     bit_buf: u32,
@@ -454,19 +466,44 @@ pub enum Flush {
     /// Buffer only; nothing is emitted.
     None,
     /// Close the current block and append an empty stored block, so everything written so far
-    /// is decodable and the output ends on a byte boundary (`Z_SYNC_FLUSH` / `Z_FULL_FLUSH`).
+    /// is decodable and the output ends on a byte boundary (`Z_SYNC_FLUSH`; zlib's
+    /// `Z_PARTIAL_FLUSH` / `Z_BLOCK` are served the same way — also decodable, just 4 bytes more).
     Sync,
+    /// [`Flush::Sync`], then forget the window: later output never references earlier bytes, so
+    /// a decoder may start from here (`Z_FULL_FLUSH`).
+    Full,
     /// Emit the final block (`Z_FINISH`).
     Finish,
 }
 
-/// Incremental raw-DEFLATE encoder: bytes accumulate across `write`s and are emitted as one
-/// fixed-Huffman block per flush. The last 32K of output stays as the match window, so a stream
-/// that is flushed per message (websocket permessage-deflate) still compresses across messages.
+impl Flush {
+    /// zlib's numeric flush constant (`Z_NO_FLUSH` = 0 … `Z_FINISH` = 4, `Z_BLOCK` = 5; Brotli's
+    /// and zstd's use other numbers and never reach here).
+    pub fn from_zlib(mode: u32) -> Option<Flush> {
+        Some(match mode {
+            0 => Flush::None,
+            1 | 2 | 5 => Flush::Sync,
+            3 => Flush::Full,
+            4 => Flush::Finish,
+            _ => return None,
+        })
+    }
+}
+
+/// Input a [`Deflater`] holds before it emits a block on its own (between explicit flushes), so
+/// a long stream produces output as it goes rather than all at its end.
+const STREAM_BLOCK: usize = 64 * 1024;
+
+/// Incremental raw-DEFLATE encoder: bytes accumulate across `write`s and are emitted as
+/// fixed-Huffman blocks — whenever [`STREAM_BLOCK`] bytes are pending, and at every flush. The
+/// bit stream carries across calls (a block need not end on a byte boundary), and the last 32K
+/// of input stays as the match window, so a stream flushed per message (websocket
+/// permessage-deflate) still compresses across messages.
 #[derive(Default)]
 pub struct Deflater {
     history: Vec<u8>,
     pending: Vec<u8>,
+    bits: BitWriter,
     finished: bool,
 }
 
@@ -475,40 +512,345 @@ impl Deflater {
         Self::default()
     }
 
+    /// Buffer `data`; nothing is encoded until the next flush.
     pub fn write(&mut self, data: &[u8]) {
         self.pending.extend_from_slice(data);
+    }
+
+    /// Buffer `data`, encoding full [`STREAM_BLOCK`]s as they fill; returns the output bytes
+    /// completed so far (a trailing partial byte stays behind for the next block).
+    pub fn write_eager(&mut self, data: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(data);
+        if self.finished || self.pending.len() < STREAM_BLOCK {
+            return Vec::new();
+        }
+        self.emit_block(false);
+        std::mem::take(&mut self.bits.out)
+    }
+
+    fn emit_block(&mut self, final_block: bool) {
+        let pending = std::mem::take(&mut self.pending);
+        deflate_block(&mut self.bits, &self.history, &pending, final_block);
+        self.history.extend_from_slice(&pending);
+        if self.history.len() > WINDOW_SIZE {
+            self.history.drain(..self.history.len() - WINDOW_SIZE);
+        }
     }
 
     pub fn flush(&mut self, mode: Flush) -> Result<Vec<u8>, String> {
         if self.finished {
             return Err("deflate: stream already finished".into());
         }
-        if mode == Flush::None {
-            return Ok(Vec::new());
+        match mode {
+            Flush::None => return Ok(std::mem::take(&mut self.bits.out)),
+            Flush::Finish => {
+                self.emit_block(true);
+                self.bits.align();
+                self.finished = true;
+            }
+            Flush::Sync | Flush::Full => {
+                if !self.pending.is_empty() {
+                    self.emit_block(false);
+                }
+                // Empty stored block: BFINAL=0, BTYPE=00, pad to a byte, LEN=0, NLEN=0xffff.
+                self.bits.write(0, 3);
+                self.bits.align();
+                self.bits.out.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+                if mode == Flush::Full {
+                    self.history.clear();
+                }
+            }
         }
-        let mut w = BitWriter::new();
-        let pending = std::mem::take(&mut self.pending);
-        let finish = mode == Flush::Finish;
-        if !pending.is_empty() || finish {
-            deflate_block(&mut w, &self.history, &pending, finish);
-        }
-        if !finish {
-            // Empty stored block: BFINAL=0, BTYPE=00, pad to a byte, LEN=0, NLEN=0xffff.
-            w.write(0, 3);
-            w.align();
-            w.out.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
-        }
-        self.history.extend_from_slice(&pending);
-        if self.history.len() > WINDOW_SIZE {
-            self.history.drain(..self.history.len() - WINDOW_SIZE);
-        }
-        self.finished = finish;
-        Ok(w.finish())
+        Ok(std::mem::take(&mut self.bits.out))
     }
 
     /// Forget the window (`zlib.reset()`): the next block cannot reference earlier output.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// The container around a DEFLATE stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Framing {
+    /// Bare DEFLATE (`DeflateRaw` / `InflateRaw`).
+    Raw,
+    /// RFC 1950: a 2-byte header and an Adler-32 trailer (`Deflate` / `Inflate`).
+    Zlib,
+    /// RFC 1952: a 10-byte header and a CRC-32 + length trailer (`Gzip` / `Gunzip`).
+    Gzip,
+    /// Decoding only: gzip or zlib, whichever the header is (`Unzip`).
+    Auto,
+}
+
+/// Incremental compressor with zlib/gzip framing over a [`Deflater`]: the header goes out with
+/// the first output, the checksum runs over the input as it arrives, and the trailer follows the
+/// final block.
+pub struct FramedDeflater {
+    framing: Framing,
+    inner: Deflater,
+    header_sent: bool,
+    check: u32,
+    size: u32,
+}
+
+impl FramedDeflater {
+    pub fn new(framing: Framing) -> Self {
+        FramedDeflater {
+            framing,
+            inner: Deflater::new(),
+            header_sent: false,
+            check: if framing == Framing::Zlib { 1 } else { 0 },
+            size: 0,
+        }
+    }
+
+    fn frame(&mut self, body: Vec<u8>) -> Vec<u8> {
+        if self.header_sent || body.is_empty() {
+            return body;
+        }
+        self.header_sent = true;
+        let mut out = match self.framing {
+            // CMF/FLG: deflate, 32K window, default level.
+            Framing::Zlib => vec![0x78, 0x9c],
+            // magic, method, flags, mtime, xfl, os (unknown) — what Node's zlib writes.
+            Framing::Gzip => vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0x0a],
+            Framing::Raw | Framing::Auto => Vec::new(),
+        };
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Feed input; returns whatever output is complete (possibly nothing).
+    pub fn write(&mut self, data: &[u8]) -> Vec<u8> {
+        match self.framing {
+            Framing::Zlib => self.check = adler32_from(self.check, data),
+            Framing::Gzip => self.check = crc32_from(self.check, data),
+            Framing::Raw | Framing::Auto => {}
+        }
+        self.size = self.size.wrapping_add(data.len() as u32);
+        let body = self.inner.write_eager(data);
+        self.frame(body)
+    }
+
+    pub fn flush(&mut self, mode: Flush) -> Result<Vec<u8>, String> {
+        let body = self.inner.flush(mode)?;
+        let mut out = self.frame(body);
+        if mode == Flush::Finish {
+            match self.framing {
+                Framing::Zlib => out.extend_from_slice(&self.check.to_be_bytes()),
+                Framing::Gzip => {
+                    out.extend_from_slice(&self.check.to_le_bytes());
+                    out.extend_from_slice(&self.size.to_le_bytes());
+                }
+                Framing::Raw | Framing::Auto => {}
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new(self.framing);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameState {
+    Header,
+    Body,
+    Trailer,
+    Done,
+}
+
+/// Incremental decompressor with zlib/gzip framing over an [`Inflater`]. Input may be split
+/// anywhere, including inside the header or trailer; the trailer's checksum (and gzip's length)
+/// is verified. Concatenated gzip members decode as one stream, as with Node's `Gunzip`; other
+/// bytes after the end are ignored.
+pub struct FramedInflater {
+    framing: Framing,
+    /// The framing the header turned out to be (for [`Framing::Auto`]).
+    actual: Framing,
+    state: FrameState,
+    buf: Vec<u8>,
+    inner: Inflater,
+    check: u32,
+    size: u32,
+    /// Bytes that were not another gzip member followed the end.
+    garbage: bool,
+}
+
+impl FramedInflater {
+    pub fn new(framing: Framing) -> Self {
+        FramedInflater {
+            framing,
+            actual: framing,
+            state: if framing == Framing::Raw {
+                FrameState::Body
+            } else {
+                FrameState::Header
+            },
+            buf: Vec::new(),
+            inner: Inflater::new(),
+            check: 0,
+            size: 0,
+            garbage: false,
+        }
+    }
+
+    /// Whether the stream (the last gzip member) ended, trailer included.
+    pub fn finished(&self) -> bool {
+        self.state == FrameState::Done
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new(self.framing);
+    }
+
+    /// The header's length once `buf` holds all of it; `Ok(None)` while it is incomplete.
+    fn parse_header(&mut self) -> Result<Option<usize>, String> {
+        let b = &self.buf;
+        if self.actual == Framing::Auto {
+            if b.is_empty() {
+                return Ok(None);
+            }
+            self.actual = if b[0] == 0x1f {
+                Framing::Gzip
+            } else {
+                Framing::Zlib
+            };
+        }
+        match self.actual {
+            Framing::Zlib => {
+                if b.len() < 2 {
+                    return Ok(None);
+                }
+                if b[0] & 0x0f != 8 || ((b[0] as u32) << 8 | b[1] as u32) % 31 != 0 {
+                    return Err("incorrect header check".into());
+                }
+                if b[1] & 0x20 != 0 {
+                    return Err("Missing dictionary".into());
+                }
+                Ok(Some(2))
+            }
+            Framing::Gzip => {
+                if b.len() < 10 {
+                    if b.first().is_some_and(|&x| x != 0x1f)
+                        || b.get(1).is_some_and(|&x| x != 0x8b)
+                    {
+                        return Err("incorrect header check".into());
+                    }
+                    return Ok(None);
+                }
+                if b[0] != 0x1f || b[1] != 0x8b {
+                    return Err("incorrect header check".into());
+                }
+                if b[2] != 8 {
+                    return Err("unknown compression method".into());
+                }
+                let flags = b[3];
+                let mut pos = 10;
+                if flags & 0x04 != 0 {
+                    if b.len() < pos + 2 {
+                        return Ok(None);
+                    }
+                    pos += 2 + (b[pos] as usize | (b[pos + 1] as usize) << 8);
+                }
+                for bit in [0x08, 0x10] {
+                    // FNAME / FCOMMENT: NUL-terminated.
+                    if flags & bit != 0 {
+                        match b.get(pos..).and_then(|t| t.iter().position(|&c| c == 0)) {
+                            Some(n) => pos += n + 1,
+                            None => return Ok(None),
+                        }
+                    }
+                }
+                if flags & 0x02 != 0 {
+                    pos += 2; // FHCRC
+                }
+                Ok((b.len() >= pos).then_some(pos))
+            }
+            Framing::Raw | Framing::Auto => Ok(Some(0)),
+        }
+    }
+
+    /// Feed input; returns the decompressed bytes it completed.
+    pub fn write(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        let mut input = data.to_vec();
+        loop {
+            match self.state {
+                FrameState::Header => {
+                    self.buf.extend_from_slice(&input);
+                    let Some(n) = self.parse_header()? else {
+                        return Ok(out);
+                    };
+                    input = self.buf.split_off(n);
+                    self.buf.clear();
+                    self.check = if self.actual == Framing::Zlib { 1 } else { 0 };
+                    self.size = 0;
+                    self.state = FrameState::Body;
+                }
+                FrameState::Body => {
+                    let produced = self.inner.write(&input)?;
+                    match self.actual {
+                        Framing::Zlib => self.check = adler32_from(self.check, &produced),
+                        Framing::Gzip => self.check = crc32_from(self.check, &produced),
+                        Framing::Raw | Framing::Auto => {}
+                    }
+                    self.size = self.size.wrapping_add(produced.len() as u32);
+                    out.extend_from_slice(&produced);
+                    if !self.inner.finished() {
+                        return Ok(out);
+                    }
+                    input = self.inner.take_remaining();
+                    self.state = FrameState::Trailer;
+                }
+                FrameState::Trailer => {
+                    self.buf.extend_from_slice(&input);
+                    let need = match self.actual {
+                        Framing::Zlib => 4,
+                        Framing::Gzip => 8,
+                        Framing::Raw | Framing::Auto => 0,
+                    };
+                    if self.buf.len() < need {
+                        return Ok(out);
+                    }
+                    let t = &self.buf[..need];
+                    match self.actual {
+                        Framing::Zlib => {
+                            if u32::from_be_bytes([t[0], t[1], t[2], t[3]]) != self.check {
+                                return Err("incorrect data check".into());
+                            }
+                        }
+                        Framing::Gzip => {
+                            if u32::from_le_bytes([t[0], t[1], t[2], t[3]]) != self.check {
+                                return Err("incorrect data check".into());
+                            }
+                            if u32::from_le_bytes([t[4], t[5], t[6], t[7]]) != self.size {
+                                return Err("incorrect length check".into());
+                            }
+                        }
+                        Framing::Raw | Framing::Auto => {}
+                    }
+                    input = self.buf.split_off(need);
+                    self.buf.clear();
+                    self.state = FrameState::Done;
+                }
+                FrameState::Done => {
+                    // Another gzip member follows: decode it into the same output. Anything
+                    // else after the end is ignored, and so is everything after that.
+                    let Some(&first) = input.first() else {
+                        return Ok(out);
+                    };
+                    if self.actual != Framing::Gzip || first != 0x1f || self.garbage {
+                        self.garbage = true;
+                        return Ok(out);
+                    }
+                    self.inner = Inflater::new();
+                    self.state = FrameState::Header;
+                }
+            }
+        }
     }
 }
 
@@ -581,6 +923,11 @@ impl Inflater {
 
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// After the final block: the input bytes that followed it (a container's trailer).
+    pub fn take_remaining(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
     }
 
     pub fn reset(&mut self) {
@@ -766,6 +1113,61 @@ mod tests {
         let out = enc.flush(Flush::Finish).unwrap();
         assert_eq!(inflate(&out).unwrap(), text.as_bytes());
         assert!(enc.flush(Flush::Sync).is_err());
+    }
+
+    #[test]
+    fn framed_streams_flush_partially_and_roundtrip() {
+        for framing in [Framing::Gzip, Framing::Zlib, Framing::Raw] {
+            let mut enc = FramedDeflater::new(framing);
+            let mut dec = FramedInflater::new(if framing == Framing::Raw {
+                Framing::Raw
+            } else {
+                Framing::Auto
+            });
+            for (i, m) in [&b"abc"[..], b"def", b"", b"ghi"].iter().enumerate() {
+                let mut frame = enc.write(m);
+                frame.extend(enc.flush(if i == 1 { Flush::Full } else { Flush::Sync }).unwrap());
+                // Every flush makes exactly what was written so far decodable, split anywhere.
+                let mut got = Vec::new();
+                for b in &frame {
+                    got.extend(dec.write(std::slice::from_ref(b)).unwrap());
+                }
+                assert_eq!(&got, m, "{framing:?} message {i}");
+            }
+            // Larger than one eager block: output appears before any flush.
+            let big: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+            let early = enc.write(&big);
+            assert!(!early.is_empty(), "{framing:?}: no eager output");
+            let mut stream = early;
+            stream.extend(enc.flush(Flush::Finish).unwrap());
+            let got = dec.write(&stream).unwrap();
+            assert_eq!(got, big, "{framing:?} big");
+            if framing != Framing::Raw {
+                assert!(dec.finished());
+            }
+        }
+        // A framed stream decodes with the one-shot decoders too.
+        let mut enc = FramedDeflater::new(Framing::Gzip);
+        let mut all = enc.write(b"hello ");
+        all.extend(enc.flush(Flush::Sync).unwrap());
+        all.extend(enc.write(b"world"));
+        all.extend(enc.flush(Flush::Finish).unwrap());
+        assert_eq!(gzip_decompress(&all).unwrap(), b"hello world");
+        // Concatenated gzip members, fed a byte at a time, decode as one stream.
+        let two = [gzip_compress(b"abc"), gzip_compress(b"def")].concat();
+        let mut dec = FramedInflater::new(Framing::Gzip);
+        let mut got = Vec::new();
+        for b in &two {
+            got.extend(dec.write(std::slice::from_ref(b)).unwrap());
+        }
+        assert_eq!(got, b"abcdef");
+        // A corrupted checksum is reported.
+        let mut bad = zlib_compress(b"payload");
+        let n = bad.len();
+        bad[n - 1] ^= 1;
+        let err = FramedInflater::new(Framing::Zlib).write(&bad).unwrap_err();
+        assert_eq!(err, "incorrect data check");
+        assert_eq!(adler32_from(adler32(b"Wiki"), b"pedia"), adler32(b"Wikipedia"));
     }
 
     #[test]

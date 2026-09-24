@@ -14,7 +14,6 @@ members = [
     "crates/lumen-runtime",
     "crates/lumen-timers",
     "crates/lumen-tls",
-    "crates/lumen-typescript",
     "crates/lumen-web",
     "crates/lumen-wasm",
     "crates/node-compat-runner",
@@ -43,3 +42,26 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# Fast-building optimized profile for day-to-day work and agents: `--profile fast`. Same
+# opt-level as release, but no LTO and parallel codegen, so a change to `lumen` rebuilds in a
+# fraction of the time. Binaries are a little slower than `release`; use `release` for final
+# benchmark numbers and A/B both sides with the same profile.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 64
+incremental = true
+
+# Size-focused release build for shipping (mobile, WASM, embedders): `--profile release-small`.
+# Everything is optimized for size except the engine core (`lumen`: interpreter, VM, builtins),
+# which stays at opt-level 3 — the hot paths live there. panic = "abort" is inherited (the
+# engine does not rely on unwinding). `strip` drops symbols from the binary (debug info for
+# crash symbolication is still available via separate PDB / split-debuginfo where supported).
+[profile.release-small]
+inherits = "release"
+opt-level = "s"
+strip = true
+
+[profile.release-small.package.lumen]
+opt-level = 3

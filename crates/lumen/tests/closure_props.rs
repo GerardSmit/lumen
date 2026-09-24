@@ -25,7 +25,7 @@ fn own_keys_and_descriptors() {
         function f(a, b) {}
         const g = (a) => a;
         const h = { h() {} }.h;
-        eq(Object.getOwnPropertyNames(f).join(), 'length,name,prototype', 'f keys');
+        eq(Object.getOwnPropertyNames(f).join(), 'length,name,arguments,caller,prototype', 'f keys (sloppy: legacy arguments/caller, as V8)');
         eq(Object.getOwnPropertyNames(g).join(), 'length,name', 'arrow keys');
         eq(Reflect.ownKeys(h).join(), 'length,name', 'method keys');
         eq(f.length, 2); eq(g.length, 1); eq(h.length, 0);
@@ -60,7 +60,7 @@ fn writes_do_not_leak_between_closures() {
         delete a.name;
         eq(a.name, '', 'deleted name falls back to Function.prototype.name');
         eq(b.name, 'inner', 'sibling keeps name');
-        eq(Object.getOwnPropertyNames(a).join(), 'length,prototype,x');
+        eq(Object.getOwnPropertyNames(a).join(), 'length,arguments,caller,prototype,x');
         Object.defineProperty(b, 'length', { value: 7 });
         eq(b.length, 7); eq(a.length, 3); eq(mk().length, 3, 'fresh closure keeps template');
         const c = mk();

@@ -87,6 +87,26 @@ function notSupported() {
   throw new Error("http2.performServerHandshake is not supported in lumen; use createServer or createSecureServer");
 }
 
+// Node's socketOnError: a reset after GOAWAY is the peer's right, so the session is destroyed
+// without an error (Windows reports the same teardown as ECONNABORTED).
+// Errors that are the peer's protocol violations (as opposed to exceptions from user listeners).
+const protocolErrors = new WeakSet();
+function protocolError(error) {
+  if (error !== null && typeof error === "object") protocolErrors.add(error);
+  return error;
+}
+function decodeHeaderBlock(hpack, block) {
+  try {
+    return hpack.decode(block);
+  } catch (error) {
+    throw protocolError(error);
+  }
+}
+
+function goawayReset(session, error) {
+  return session.closed && (error?.code === "ECONNRESET" || error?.code === "ECONNABORTED");
+}
+
 class ClientHttp2Stream extends Duplex {
   // Http2Stream#closed is the stream's own flag (the Duplex getter reads stream state).
   get closed() { return this._h2closed === true; }
@@ -166,7 +186,7 @@ class ClientHttp2Session extends EventEmitter {
       : { host: target.hostname, port };
     this.socket = options.createConnection ? options.createConnection(target, options) : transport.connect(socketOptions);
     this.socket.on("data", chunk => this._receive(chunk));
-    this.socket.on("error", error => this._fail(error));
+    this.socket.on("error", error => this._fail(goawayReset(this, error) ? undefined : error));
     this.socket.on("close", () => this._socketClosed());
     this.socket.once(this.encrypted ? "secureConnect" : "connect", () => {
       if (this.encrypted && this.socket.alpnProtocol !== "h2") {
@@ -234,7 +254,8 @@ class ClientHttp2Session extends EventEmitter {
   }
 
   _writeFrame(type, flags, streamId, payload) {
-    if (!this.destroyed) this.socket.write(codec.encodeFrame(type, flags, streamId, payload));
+    // Nothing more goes out once the session ended its side of the socket (after GOAWAY).
+    if (!this.destroyed && !this.socket.writableEnded) this.socket.write(codec.encodeFrame(type, flags, streamId, payload));
   }
 
   _receive(chunk) {
@@ -243,7 +264,13 @@ class ClientHttp2Session extends EventEmitter {
     catch (error) { this._fail(error); return; }
     for (const frame of frames) {
       try { this._handleFrame(frame); }
-      catch (error) { this._fail(error); return; }
+      catch (error) {
+        // A protocol violation ends the session; anything else was thrown by a listener
+        // ('stream', 'response', 'data', ...) and propagates as uncaught, as in Node.
+        if (!protocolErrors.has(error)) throw error;
+        this._fail(error);
+        return;
+      }
     }
   }
 
@@ -258,7 +285,7 @@ class ClientHttp2Session extends EventEmitter {
       return;
     }
     if (frame.type === 6) {
-      if (frame.payload.length !== 8) throw new Error("invalid HTTP/2 PING frame");
+      if (frame.payload.length !== 8) throw protocolError(new Error("invalid HTTP/2 PING frame"));
       if (!(frame.flags & 1)) this._writeFrame(6, 1, 0, frame.payload);
       else this.emit("ping", frame.payload);
       return;
@@ -274,10 +301,10 @@ class ClientHttp2Session extends EventEmitter {
     if (!clientStream) return;
     if (frame.type === 1 || frame.type === 9) {
       if (frame.type === 1) this._continuation = { streamId: frame.streamId, chunks: [] };
-      if (!this._continuation || this._continuation.streamId !== frame.streamId) throw new Error("invalid HTTP/2 CONTINUATION sequence");
+      if (!this._continuation || this._continuation.streamId !== frame.streamId) throw protocolError(new Error("invalid HTTP/2 CONTINUATION sequence"));
       this._continuation.chunks.push(frame.payload);
       if (frame.flags & 4) {
-        const headers = this._hpack.decode(Buffer.concat(this._continuation.chunks));
+        const headers = decodeHeaderBlock(this._hpack, Buffer.concat(this._continuation.chunks));
         this._continuation = null;
         clientStream.emit(clientStream._responded ? "trailers" : "response", headers, frame.flags);
         clientStream._responded = true;
@@ -417,9 +444,12 @@ class ServerHttp2Session extends EventEmitter {
     this._continuation = null;
     this._preface = Buffer.alloc(0);
     socket.on("data", chunk => this._receive(chunk));
-    socket.on("error", error => this._fail(error));
+    socket.on("error", error => this._fail(goawayReset(this, error) ? undefined : error));
     socket.on("close", () => this._socketClosed());
-    this._writeFrame(4, 0, 0, getPackedSettings(this.localSettings));
+    // SETTINGS_ENABLE_PUSH is a client-only setting: a server advertising it as 1 is a
+    // connection PROTOCOL_ERROR for the client (RFC 9113 §6.5.2), so it is never sent.
+    const { enablePush, ...advertised } = this.localSettings;
+    this._writeFrame(4, 0, 0, getPackedSettings(advertised));
   }
 
   _receive(chunk) {
@@ -436,7 +466,13 @@ class ServerHttp2Session extends EventEmitter {
     catch (error) { this._fail(error); return; }
     for (const frame of frames) {
       try { this._handleFrame(frame); }
-      catch (error) { this._fail(error); return; }
+      catch (error) {
+        // A protocol violation ends the session; anything else was thrown by a listener
+        // ('stream', 'response', 'data', ...) and propagates as uncaught, as in Node.
+        if (!protocolErrors.has(error)) throw error;
+        this._fail(error);
+        return;
+      }
     }
   }
 
@@ -450,7 +486,7 @@ class ServerHttp2Session extends EventEmitter {
       return;
     }
     if (frame.type === 6) {
-      if (frame.payload.length !== 8) throw new Error("invalid HTTP/2 PING frame");
+      if (frame.payload.length !== 8) throw protocolError(new Error("invalid HTTP/2 PING frame"));
       if (!(frame.flags & 1)) this._writeFrame(6, 1, 0, frame.payload);
       else this.emit("ping", frame.payload);
       return;
@@ -458,10 +494,10 @@ class ServerHttp2Session extends EventEmitter {
     if (frame.type === 7) { this.closed = true; this.socket.end(); return; }
     if (frame.type === 1 || frame.type === 9) {
       if (frame.type === 1) this._continuation = { streamId: frame.streamId, chunks: [], endStream: !!(frame.flags & 1) };
-      if (!this._continuation || this._continuation.streamId !== frame.streamId) throw new Error("invalid HTTP/2 CONTINUATION sequence");
+      if (!this._continuation || this._continuation.streamId !== frame.streamId) throw protocolError(new Error("invalid HTTP/2 CONTINUATION sequence"));
       this._continuation.chunks.push(frame.payload);
       if (frame.flags & 4) {
-        const headers = this._hpack.decode(Buffer.concat(this._continuation.chunks));
+        const headers = decodeHeaderBlock(this._hpack, Buffer.concat(this._continuation.chunks));
         const endStream = this._continuation.endStream;
         this._continuation = null;
         let serverStream = this._streams.get(frame.streamId);
@@ -511,7 +547,7 @@ class ServerHttp2Session extends EventEmitter {
     queueMicrotask(callback);
   }
 
-  _writeFrame(type, flags, streamId, payload) { if (!this.destroyed) this.socket.write(codec.encodeFrame(type, flags, streamId, payload)); }
+  _writeFrame(type, flags, streamId, payload) { if (!this.destroyed && !this.socket.writableEnded) this.socket.write(codec.encodeFrame(type, flags, streamId, payload)); }
   close(callback) { if (callback) this.once("close", callback); this.closed = true; this._writeFrame(7, 0, 0, Buffer.alloc(8)); this.socket.end(); return this; }
   destroy(error) { this._fail(error); return this; }
   ref() { this.socket.ref(); return this; }

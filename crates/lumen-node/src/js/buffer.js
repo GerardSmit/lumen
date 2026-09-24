@@ -807,10 +807,22 @@ function transcode(source, fromEnc, toEnc) {
   return adopt(bytesFromString(stringFromBytes(bytes, fromEnc), toEnc));
 }
 
-// lumen has no URL.createObjectURL registry, so every blob: id is unknown — which is exactly the
-// value Node returns for an unregistered/expired id.
-function resolveObjectURL(_id) {
-  return undefined;
+// Node's resolveObjectURL: "blob:nodedata:<id>" -> a new Blob over the registered one's data, or
+// undefined for anything unknown, revoked or malformed.
+function resolveObjectURL(url) {
+  url = `${url}`;
+  try {
+    const parsed = new URL(url);
+    const split = parsed.pathname.split(":");
+    if (split.length !== 2) return;
+    const [base, id] = split;
+    if (base !== "nodedata") return;
+    const blob = __objectURLs.get(id);
+    if (blob === undefined) return;
+    return blob.slice(0, blob.size, blob.type);
+  } catch {
+    // Ignored, as in Node.
+  }
 }
 
 const kMaxLength = 9007199254740991;
@@ -947,3 +959,35 @@ __builtins.set("buffer", {
   transcode,
   resolveObjectURL,
 });
+
+// Installed here, with the Blob registry it feeds, rather than in url.js: node:url loads on
+// first use (see build.rs `LAZY`), but the URL global has these methods from the start.
+// ---- URL.createObjectURL / revokeObjectURL (internal/url installObjectURLMethods) ------------
+
+{
+  const { ERR_INVALID_ARG_TYPE } = __errors;
+  function createObjectURL(obj) {
+    if (!(obj instanceof Blob)) throw new ERR_INVALID_ARG_TYPE("obj", "Blob", obj);
+    const id = crypto.randomUUID();
+    __objectURLs.set(id, obj);
+    return `blob:nodedata:${id}`;
+  }
+  // Node's C++ RevokeObjectURL: parse, require blob:nodedata:<id>, forget the id.
+  function revokeObjectURL(url) {
+    url = `${url}`;
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return;
+    }
+    if (parsed.protocol !== "blob:") return;
+    const path = parsed.pathname;
+    if (!path.startsWith("nodedata:")) return;
+    __objectURLs.delete(path.slice("nodedata:".length));
+  }
+  Object.defineProperties(URL, {
+    createObjectURL: { __proto__: null, configurable: true, writable: true, enumerable: true, value: createObjectURL },
+    revokeObjectURL: { __proto__: null, configurable: true, writable: true, enumerable: true, value: revokeObjectURL },
+  });
+}

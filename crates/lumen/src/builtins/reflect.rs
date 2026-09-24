@@ -241,6 +241,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         Ok(Value::Bool(ok))
     });
     it.def_method(&r, "apply", 3, |i, _t, a| {
+        crate::bytecode::reflect::native_transparent(i);
         // IsCallable(target) is checked before the argument list is read.
         if !arg(a, 0).is_callable() {
             return Err(i.make_error("TypeError", "Reflect.apply target is not callable"));
@@ -249,6 +250,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         ab(i.call(arg(a, 0), arg(a, 1), &args))
     });
     it.def_method(&r, "construct", 2, |i, _t, a| {
+        crate::bytecode::reflect::native_transparent(i);
         let target = arg(a, 0);
         if !is_constructor_value(&target) {
             return Err(i.make_error("TypeError", "Reflect.construct target is not a constructor"));

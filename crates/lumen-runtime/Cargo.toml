@@ -14,13 +14,22 @@ publish = false
 lumen = { path = "../lumen" }
 lumen-fs = { path = "../lumen-fs" }
 lumen-host = { path = "../lumen-host" }
-lumen-node = { path = "../lumen-node" }
+lumen-node = { path = "../lumen-node", default-features = false }
 lumen-timers = { path = "../lumen-timers" }
 lumen-web = { path = "../lumen-web" }
 
 [dev-dependencies]
 # tests/async_ops.rs binds its ops with #[lumen::op].
 lumen = { path = "../lumen", features = ["macros"] }
+
+# lumen-node's optional builtins (see its Cargo.toml), all on by default.
+[features]
+default = ["bun", "http2", "cluster", "dgram", "wasi"]
+bun = ["lumen-node/bun"]
+http2 = ["lumen-node/http2"]
+cluster = ["lumen-node/cluster"]
+dgram = ["lumen-node/dgram"]
+wasi = ["lumen-node/wasi"]
 
 [lints]
 workspace = true

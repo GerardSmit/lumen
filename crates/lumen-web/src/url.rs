@@ -1430,6 +1430,33 @@ pub(crate) fn domain_to_unicode(input: &str) -> String {
     domain_to_unicode_raw(u.hostname())
 }
 
+/// ada's raw `idna::to_ascii` (Node's `encoding_binding.toASCII`, which legacy `url.parse` uses):
+/// "" when the domain is invalid.
+pub(crate) fn idna_to_ascii(input: &str) -> String {
+    idna::to_ascii(input.as_bytes()).unwrap_or_default()
+}
+
+/// Node's `bindingUrl.format(href, hash, unicode, search, auth)` behind `url.format(URL, opts)`.
+pub(crate) fn format(href: &str, hash: bool, unicode: bool, search: bool, auth: bool) -> Option<String> {
+    let mut out = parse_url(href, None)?;
+    if !hash {
+        out.fragment = None;
+    }
+    if unicode {
+        if let Some(host) = &out.host {
+            out.host = Some(domain_to_unicode_raw(host));
+        }
+    }
+    if !search {
+        out.query = None;
+    }
+    if !auth {
+        out.username.clear();
+        out.password.clear();
+    }
+    Some(out.href())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

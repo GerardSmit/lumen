@@ -7,7 +7,81 @@
 
   const SCHED_NONE = 1;
   const SCHED_RR = 2;
-  const isWorkerProcess = () => process.env && process.env.LUMEN_CLUSTER_WORKER === "1";
+  // Decided once process.env is usable; the markers are then removed from the environment (as
+  // Node deletes NODE_UNIQUE_ID) so processes this worker forks are not cluster workers too.
+  let workerProcess;
+  let workerId = 0;
+  const isWorkerProcess = () => {
+    if (workerProcess === undefined && process.env) {
+      workerProcess = process.env.LUMEN_CLUSTER_WORKER === "1";
+      if (workerProcess) {
+        workerId = Number(process.env.NODE_UNIQUE_ID) || 0;
+        process._lumenClusterWorker = true;
+        delete process.env.LUMEN_CLUSTER_WORKER;
+        delete process.env.NODE_UNIQUE_ID;
+      }
+    }
+    return workerProcess === true;
+  };
+  // Worker -> primary notifications ride the IPC channel as marked messages, never surfaced as
+  // user 'message' events.
+  const INTERNAL = "__lumenCluster";
+
+  // Worker-side wiring. This file is evaluated with the bootstrap glue, before process.env is
+  // usable, so it runs on first use of the cluster API instead (every worker script asks
+  // cluster.isPrimary / isWorker / worker before doing anything).
+  let workerSideReady = false;
+  const setupWorkerSide = () => {
+    if (workerSideReady || !isWorkerProcess()) return;
+    workerSideReady = true;
+    // Listen to the channel so the worker notices its primary going away and exits. As in Node
+    // (whose cluster child holds a 'disconnect' listener), the connected channel keeps a worker
+    // alive until the primary disconnects or kills it.
+    void process.send;
+    process.once("disconnect", () => {});
+    // Each worker's server listens on its own socket (no handle sharing), but the primary still
+    // learns about it: 'listening' fires on the Worker and the cluster, as in Node.
+    const net = __builtins.get("net");
+    const listen = net && net.Server && net.Server.prototype.listen;
+    const servers = new Set();
+    // The primary's worker.disconnect(): like Node's worker._disconnect, close this worker's
+    // servers and stay alive only while something else holds the loop.
+    const closeWorkerSide = () => {
+      process._clusterExitedAfterDisconnect = true;
+      if (currentWorker) currentWorker.exitedAfterDisconnect = true;
+      for (const server of servers) { try { server.close(); } catch {} }
+      servers.clear();
+    };
+    process.on("internalMessage", message => {
+      if (message[INTERNAL] === "disconnect") closeWorkerSide();
+    });
+    // In a worker, process.disconnect() is cluster.worker.disconnect(): servers close too.
+    const disconnectChannel = process.disconnect;
+    if (typeof disconnectChannel === "function") {
+      process.disconnect = function disconnect() {
+        closeWorkerSide();
+        return disconnectChannel.apply(this, arguments);
+      };
+    }
+    if (typeof listen === "function") {
+      net.Server.prototype.listen = function (...args) {
+        servers.add(this);
+        this.once("close", () => servers.delete(this));
+        this.once("listening", () => {
+          const address = this.address();
+          const info = address && typeof address === "object"
+            ? { addressType: address.family === "IPv6" ? 6 : 4, address: address.address, port: address.port }
+            : { addressType: -1, address, port: undefined };
+          try { process.send({ [INTERNAL]: "listening", info }); } catch {}
+        });
+        return listen.apply(this, args);
+      };
+    }
+  };
+  const isWorkerSide = () => {
+    setupWorkerSide();
+    return isWorkerProcess();
+  };
 
   class Worker extends EventEmitter {
     constructor(id, child, childSide = false) {
@@ -17,6 +91,14 @@
       this.exitedAfterDisconnect = undefined;
       if (childSide) return;
       child.on("message", (message, handle) => {
+        if (message !== null && typeof message === "object" && message[INTERNAL] !== undefined) {
+          if (message[INTERNAL] === "listening") {
+            this.state = "listening";
+            this.emit("listening", message.info);
+            cluster.emit("listening", this, message.info);
+          }
+          return;
+        }
         this.emit("message", message, handle);
         cluster.emit("message", this, message, handle);
       });
@@ -38,6 +120,9 @@
     destroy(signal) { return this.kill(signal); }
     disconnect() {
       this.exitedAfterDisconnect = true;
+      if (this.process.connected) {
+        try { this.process.send({ [INTERNAL]: "disconnect" }); } catch {}
+      }
       this.process.disconnect();
       return this;
     }
@@ -50,15 +135,15 @@
   let currentWorker;
 
   Object.defineProperties(cluster, {
-    isPrimary: { enumerable: true, get: () => !isWorkerProcess() },
-    isMaster: { enumerable: true, get: () => !isWorkerProcess() },
-    isWorker: { enumerable: true, get: isWorkerProcess },
+    isPrimary: { enumerable: true, get: () => !isWorkerSide() },
+    isMaster: { enumerable: true, get: () => !isWorkerSide() },
+    isWorker: { enumerable: true, get: isWorkerSide },
     worker: {
       enumerable: false,
       get() {
-        if (!isWorkerProcess()) return undefined;
+        if (!isWorkerSide()) return undefined;
         if (!currentWorker) {
-          currentWorker = new Worker(Number(process.env.NODE_UNIQUE_ID) || 0, process, true);
+          currentWorker = new Worker(workerId, process, true);
           process.on("message", (message, handle) => currentWorker.emit("message", message, handle));
           process.on("disconnect", () => currentWorker.emit("disconnect"));
         }

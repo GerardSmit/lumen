@@ -53,6 +53,7 @@ pub const NET_OPS: &[OpDecl] = ops![
     "connectPath" (3) => op_connect_path,
     "read" (3) => op_read,
     "write" (4) => op_write,
+    "tryWrite" (2) => op_try_write,
     "endWritable" (1) => op_end_writable,
     "close" (1) => op_close,
     "setNoDelay" (2) => op_set_no_delay,
@@ -109,6 +110,9 @@ enum NetStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
+    /// A Windows named pipe: what a `net` path means on Windows.
+    #[cfg(windows)]
+    Pipe(crate::win_pipe::PipeStream),
 }
 
 impl NetStream {
@@ -117,6 +121,8 @@ impl NetStream {
             Self::Tcp(stream) => stream.local_addr().map(Some),
             #[cfg(unix)]
             Self::Unix(_) => Ok(None),
+            #[cfg(windows)]
+            Self::Pipe(_) => Ok(None),
         }
     }
 
@@ -125,6 +131,8 @@ impl NetStream {
             Self::Tcp(stream) => stream.peer_addr().map(Some),
             #[cfg(unix)]
             Self::Unix(_) => Ok(None),
+            #[cfg(windows)]
+            Self::Pipe(_) => Ok(None),
         }
     }
 
@@ -133,6 +141,17 @@ impl NetStream {
             Self::Tcp(stream) => stream.shutdown(how),
             #[cfg(unix)]
             Self::Unix(stream) => stream.shutdown(how),
+            // Named pipes have no half-close: ending the writable side closes the pipe after a
+            // short linger (see PipeStream::shutdown_write).
+            #[cfg(windows)]
+            Self::Pipe(pipe) => {
+                if how == Shutdown::Write {
+                    pipe.shutdown_write();
+                } else {
+                    pipe.close();
+                }
+                Ok(())
+            }
         }
     }
 
@@ -144,6 +163,11 @@ impl NetStream {
                 std::io::ErrorKind::Unsupported,
                 "TCP_NODELAY is not available for Unix sockets",
             )),
+            #[cfg(windows)]
+            Self::Pipe(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TCP_NODELAY is not available for pipes",
+            )),
         }
     }
 
@@ -152,6 +176,8 @@ impl NetStream {
             Self::Tcp(stream) => Some(stream),
             #[cfg(unix)]
             Self::Unix(_) => None,
+            #[cfg(windows)]
+            Self::Pipe(_) => None,
         }
     }
 }
@@ -162,6 +188,8 @@ impl Read for &NetStream {
             NetStream::Tcp(stream) => (&*stream).read(buf),
             #[cfg(unix)]
             NetStream::Unix(stream) => (&*stream).read(buf),
+            #[cfg(windows)]
+            NetStream::Pipe(pipe) => pipe.read(buf),
         }
     }
 }
@@ -172,6 +200,8 @@ impl Write for &NetStream {
             NetStream::Tcp(stream) => (&*stream).write(buf),
             #[cfg(unix)]
             NetStream::Unix(stream) => (&*stream).write(buf),
+            #[cfg(windows)]
+            NetStream::Pipe(pipe) => pipe.write(buf),
         }
     }
 
@@ -180,6 +210,8 @@ impl Write for &NetStream {
             NetStream::Tcp(stream) => (&*stream).flush(),
             #[cfg(unix)]
             NetStream::Unix(stream) => (&*stream).flush(),
+            #[cfg(windows)]
+            NetStream::Pipe(_) => Ok(()),
         }
     }
 }
@@ -188,6 +220,8 @@ enum NetListener {
     Tcp(TcpListener),
     #[cfg(unix)]
     Unix(UnixListener),
+    #[cfg(windows)]
+    Pipe(crate::win_pipe::PipeListener),
 }
 
 impl NetListener {
@@ -196,6 +230,8 @@ impl NetListener {
             Self::Tcp(listener) => listener.accept().map(|(stream, _)| NetStream::Tcp(stream)),
             #[cfg(unix)]
             Self::Unix(listener) => listener.accept().map(|(stream, _)| NetStream::Unix(stream)),
+            #[cfg(windows)]
+            Self::Pipe(listener) => listener.accept().map(NetStream::Pipe),
         }
     }
 }
@@ -205,6 +241,8 @@ enum ServerAddress {
     Tcp(SocketAddr),
     #[cfg(unix)]
     Unix(String),
+    #[cfg(windows)]
+    Pipe(String),
 }
 
 #[derive(Default)]
@@ -407,6 +445,8 @@ pub(crate) fn take_stream(ctx: &mut Ctx, id: u64) -> Result<TcpStream, Value> {
         NetStream::Unix(_) => {
             Err(ctx.make_error("Error", "Unix sockets cannot be upgraded to TLS"))
         }
+        #[cfg(windows)]
+        NetStream::Pipe(_) => Err(ctx.make_error("Error", "Pipes cannot be upgraded to TLS")),
     }
 }
 
@@ -452,7 +492,7 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
             };
             let mut last = None;
             for addr in addrs {
-                match TcpStream::connect(addr) {
+                match connect_tcp(addr) {
                     Ok(s) => return Ok(NetStream::Tcp(s)),
                     Err(e) => last = Some(e),
                 }
@@ -466,6 +506,166 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
         Box::new(result)
     });
     Ok(Value::Undefined)
+}
+
+/// `TcpStream::connect`, except that on Windows a loopback connect fails fast when nothing
+/// listens: like libuv, the socket is told not to retransmit its SYN (`SIO_TCP_INITIAL_RTO`), so
+/// ECONNREFUSED arrives at once instead of after Windows' ~2 s of retries.
+fn connect_tcp(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    #[cfg(windows)]
+    {
+        if addr.ip().is_loopback() {
+            return win_loopback::connect(addr);
+        }
+    }
+    TcpStream::connect(addr)
+}
+
+#[cfg(windows)]
+mod win_loopback {
+    use std::ffi::c_void;
+    use std::net::{SocketAddr, TcpStream};
+    use std::os::windows::io::FromRawSocket;
+
+    type Socket = usize;
+    const INVALID_SOCKET: Socket = !0;
+    const AF_INET: i32 = 2;
+    const AF_INET6: i32 = 23;
+    const SOCK_STREAM: i32 = 1;
+    const IPPROTO_TCP: i32 = 6;
+    const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+    const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+    // _WSAIOW(IOC_VENDOR, 17)
+    const SIO_TCP_INITIAL_RTO: u32 = 0x9800_0011;
+
+    #[repr(C)]
+    struct InitialRto {
+        rtt: u16,
+        max_syn_retransmissions: u8,
+    }
+
+    #[repr(C)]
+    struct SockaddrIn {
+        family: u16,
+        port: u16,
+        addr: [u8; 4],
+        zero: [u8; 8],
+    }
+
+    #[repr(C)]
+    struct SockaddrIn6 {
+        family: u16,
+        port: u16,
+        flowinfo: u32,
+        addr: [u8; 16],
+        scope_id: u32,
+    }
+
+    #[repr(C)]
+    struct WsaData {
+        _opaque: [u8; 512],
+    }
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAStartup(version: u16, data: *mut WsaData) -> i32;
+        fn WSASocketW(
+            af: i32,
+            ty: i32,
+            protocol: i32,
+            info: *mut c_void,
+            group: u32,
+            flags: u32,
+        ) -> Socket;
+        fn WSAIoctl(
+            s: Socket,
+            code: u32,
+            inbuf: *const c_void,
+            inlen: u32,
+            outbuf: *mut c_void,
+            outlen: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+            completion: *mut c_void,
+        ) -> i32;
+        #[link_name = "connect"]
+        fn wsa_connect(s: Socket, name: *const c_void, namelen: i32) -> i32;
+        fn closesocket(s: Socket) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    pub(super) fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
+        // SAFETY: plain Winsock calls on a socket this function owns until it is handed to
+        // `TcpStream` (or closed on failure); every buffer outlives the call it is passed to.
+        unsafe {
+            let mut data = WsaData { _opaque: [0; 512] };
+            WSAStartup(0x0202, &mut data);
+            let af = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
+            let s = WSASocketW(
+                af,
+                SOCK_STREAM,
+                IPPROTO_TCP,
+                std::ptr::null_mut(),
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+            );
+            if s == INVALID_SOCKET {
+                return Err(std::io::Error::from_raw_os_error(WSAGetLastError()));
+            }
+            let rto = InitialRto {
+                rtt: u16::MAX,                 // TCP_INITIAL_RTO_UNSPECIFIED_RTT
+                max_syn_retransmissions: 0xfe, // TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS
+            };
+            let mut returned = 0u32;
+            // Best effort, as in libuv: an older Windows without the ioctl still connects.
+            WSAIoctl(
+                s,
+                SIO_TCP_INITIAL_RTO,
+                (&rto as *const InitialRto).cast(),
+                std::mem::size_of::<InitialRto>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let rc = match addr {
+                SocketAddr::V4(v4) => {
+                    let sa = SockaddrIn {
+                        family: AF_INET as u16,
+                        port: v4.port().to_be(),
+                        addr: v4.ip().octets(),
+                        zero: [0; 8],
+                    };
+                    wsa_connect(
+                        s,
+                        (&sa as *const SockaddrIn).cast(),
+                        std::mem::size_of::<SockaddrIn>() as i32,
+                    )
+                }
+                SocketAddr::V6(v6) => {
+                    let sa = SockaddrIn6 {
+                        family: AF_INET6 as u16,
+                        port: v6.port().to_be(),
+                        flowinfo: v6.flowinfo(),
+                        addr: v6.ip().octets(),
+                        scope_id: v6.scope_id(),
+                    };
+                    wsa_connect(
+                        s,
+                        (&sa as *const SockaddrIn6).cast(),
+                        std::mem::size_of::<SockaddrIn6>() as i32,
+                    )
+                }
+            };
+            if rc != 0 {
+                let err = std::io::Error::from_raw_os_error(WSAGetLastError());
+                closesocket(s);
+                return Err(err);
+            }
+            Ok(TcpStream::from_raw_socket(s as u64))
+        }
+    }
 }
 
 fn decode_connect(
@@ -501,7 +701,22 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
         });
         Ok(Value::Undefined)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+            resolve,
+            Some(reject),
+            decode_connect,
+        );
+        completions(ctx).run_blocking(id, move || {
+            let result = crate::win_pipe::PipeStream::connect(&path)
+                .map(NetStream::Pipe)
+                .map_err(|error| path_err("connect", path, error));
+            Box::new(result)
+        });
+        Ok(Value::Undefined)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (resolve, reject);
         Err(ctx.make_error(
@@ -609,6 +824,103 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
+/// `(socketId, bytes)` — libuv's `uv_try_write`: write what the kernel takes right now without
+/// blocking, on the loop thread. Returns the byte count (0 when nothing could be written; errors
+/// are left to the async write that follows). The caller only uses it with no write in flight.
+fn op_try_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let sid = arg_u64(args, 0);
+    let stream = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get(&sid))
+        .map(|e| e.stream.clone());
+    let Some(stream) = stream else {
+        return Ok(Value::Num(0.0));
+    };
+    let data = ctx
+        .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
+        .ok_or_else(|| ctx.make_error("TypeError", "net tryWrite expects bytes"))?;
+    Ok(Value::Num(try_write(&stream, &data) as f64))
+}
+
+#[cfg(unix)]
+fn try_write(stream: &NetStream, data: &[u8]) -> usize {
+    use std::os::fd::AsRawFd;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const MSG_DONTWAIT: i32 = 0x40;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const MSG_DONTWAIT: i32 = 0x80;
+    extern "C" {
+        fn send(fd: i32, buf: *const std::ffi::c_void, len: usize, flags: i32) -> isize;
+    }
+    let fd = match stream {
+        NetStream::Tcp(s) => s.as_raw_fd(),
+        NetStream::Unix(s) => s.as_raw_fd(),
+    };
+    if data.is_empty() {
+        return 0;
+    }
+    // SAFETY: `fd` is an open socket owned by `stream`, and `data` is a live buffer of `len` bytes.
+    let n = unsafe { send(fd, data.as_ptr().cast(), data.len(), MSG_DONTWAIT) };
+    if n > 0 { n as usize } else { 0 }
+}
+
+/// Windows has no per-call non-blocking send; the socket stays blocking (its reader thread
+/// relies on that). A `select` with a zero timeout says whether the send buffer has room, and a
+/// write of at most one buffer's worth is then taken without blocking.
+#[cfg(windows)]
+fn try_write(stream: &NetStream, data: &[u8]) -> usize {
+    use std::os::windows::io::AsRawSocket;
+    const MAX_SYNC: usize = 64 * 1024;
+    #[repr(C)]
+    struct FdSet {
+        count: u32,
+        sockets: [usize; 64],
+    }
+    #[repr(C)]
+    struct TimeVal {
+        sec: i32,
+        usec: i32,
+    }
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn select(n: i32, r: *mut FdSet, w: *mut FdSet, e: *mut FdSet, t: *const TimeVal) -> i32;
+    }
+    let NetStream::Tcp(tcp) = stream else {
+        return 0;
+    };
+    if data.is_empty() {
+        return 0;
+    }
+    // Like uv_try_write, a large write takes a partial first slice synchronously; the rest is
+    // queued, so writeQueueSize shows progress (Socket#_onTimeout suppresses its timeout on it).
+    let data = &data[..data.len().min(MAX_SYNC)];
+    let mut set = FdSet {
+        count: 1,
+        sockets: [0; 64],
+    };
+    set.sockets[0] = tcp.as_raw_socket() as usize;
+    let zero = TimeVal { sec: 0, usec: 0 };
+    // SAFETY: `set` holds one open socket; the null sets and the zero timeout are valid.
+    let ready = unsafe {
+        select(
+            0,
+            std::ptr::null_mut(),
+            &mut set,
+            std::ptr::null_mut(),
+            &zero,
+        )
+    };
+    if ready != 1 {
+        return 0;
+    }
+    (&*tcp).write(data).unwrap_or(0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_write(_stream: &NetStream, _data: &[u8]) -> usize {
+    0
+}
+
 fn decode_write(
     ctx: &mut Ctx,
     payload: Box<dyn std::any::Any + Send>,
@@ -637,10 +949,18 @@ fn op_end_writable(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 /// `(socketId)` — full close: shut both halves (waking a blocked read) and drop the handle.
 fn op_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u64(args, 0);
-    if let Some(reg) = ctx.host_mut::<NetRegistry>() {
-        if let Some(e) = reg.sockets.remove(&sid) {
+    let pending = match ctx.host_mut::<NetRegistry>() {
+        Some(reg) => reg.sockets.remove(&sid).and_then(|e| {
             let _ = e.stream.shutdown(Shutdown::Both);
-        }
+            e.pending
+        }),
+        None => None,
+    };
+    // Closing cancels the in-flight read, as uv_close does: on Windows a recv blocked on a
+    // shut-down socket only returns once the peer closes too, and it must not hold the loop
+    // open (or run its callback) meanwhile.
+    if let (Some(id), Some(tasks)) = (pending, ctx.host_mut::<TaskRegistry>()) {
+        tasks.take(id);
     }
     Ok(Value::Undefined)
 }
@@ -793,7 +1113,31 @@ fn op_listen_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
         let _ = ctx.set_member(&object, "address", Value::from_string(path));
         Ok(object)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let listener = crate::win_pipe::PipeListener::bind(&path)
+            .map_err(|error| net_error_value(ctx, &path_err("listen", path.clone(), error)))?;
+        let reg = ctx
+            .host_mut::<NetRegistry>()
+            .expect("net registry installed");
+        let id = reg.next_server;
+        reg.next_server += 1;
+        reg.servers.insert(
+            id,
+            ServerEntry {
+                listener: Arc::new(NetListener::Pipe(listener)),
+                closed: Arc::new(AtomicBool::new(false)),
+                local_addr: ServerAddress::Pipe(path.clone()),
+                unref: false,
+                pending: None,
+            },
+        );
+        let object = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&object, "serverId", Value::Num(id as f64));
+        let _ = ctx.set_member(&object, "address", Value::from_string(path));
+        Ok(object)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(ctx.make_error(
             "Error",
@@ -870,8 +1214,8 @@ fn op_close_server(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     let target = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.servers.remove(&sid))
-        .map(|e| (e.closed, e.local_addr));
-    if let Some((closed, local_addr)) = target {
+        .map(|e| (e.closed, e.local_addr, e.listener));
+    if let Some((closed, local_addr, listener)) = target {
         closed.store(true, Ordering::SeqCst);
         match local_addr {
             ServerAddress::Tcp(local_addr) => {
@@ -885,14 +1229,22 @@ fn op_close_server(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
                 } else {
                     local_addr
                 };
-                let _ = TcpStream::connect(wake);
+                let _ = connect_tcp(wake);
             }
             #[cfg(unix)]
             ServerAddress::Unix(path) => {
                 let _ = UnixStream::connect(&path);
                 let _ = std::fs::remove_file(path);
             }
+            // A pipe listener cancels its own blocked accept.
+            #[cfg(windows)]
+            ServerAddress::Pipe(_) => {
+                if let NetListener::Pipe(pipe) = &*listener {
+                    pipe.close();
+                }
+            }
         }
+        drop(listener);
     }
     Ok(Value::Undefined)
 }
@@ -908,6 +1260,8 @@ fn op_server_address(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, 
         Some(ServerAddress::Tcp(a)) => addr_object(ctx, &a),
         #[cfg(unix)]
         Some(ServerAddress::Unix(path)) => Value::from_string(path),
+        #[cfg(windows)]
+        Some(ServerAddress::Pipe(path)) => Value::from_string(path),
         None => Value::Null,
     })
 }
@@ -1145,10 +1499,17 @@ fn decode_send(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
 /// `(socketId)` — close: flag it so the recv thread exits at its next poll, and drop the handle.
 fn op_udp_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u64(args, 0);
+    let mut pending = None;
     if let Some(reg) = ctx.host_mut::<DgramRegistry>() {
         if let Some(e) = reg.sockets.remove(&sid) {
             e.closed.store(true, Ordering::SeqCst);
+            pending = e.pending;
         }
+    }
+    // As with TCP (`op_close`): the in-flight receive is cancelled rather than left to notice
+    // the flag, so it neither holds the loop open nor runs its callback after the close.
+    if let (Some(id), Some(tasks)) = (pending, ctx.host_mut::<TaskRegistry>()) {
+        tasks.take(id);
     }
     Ok(Value::Undefined)
 }
@@ -1322,7 +1683,40 @@ fn set_multicast_interface(
     }
 }
 
-#[cfg(not(all(unix, any(target_os = "macos", target_os = "linux"))))]
+#[cfg(windows)]
+fn set_multicast_interface(
+    socket: &UdpSocket,
+    kind6: bool,
+    interface: &str,
+) -> std::io::Result<()> {
+    const IPPROTO_IP: i32 = 0;
+    const IPPROTO_IPV6: i32 = 41;
+    const IP_MULTICAST_IF: i32 = 9;
+    const IPV6_MULTICAST_IF: i32 = 9;
+    if kind6 {
+        let index = interface
+            .trim_start_matches('%')
+            .parse::<u32>()
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "IPv6 multicast interface must be a numeric index",
+                )
+            })?;
+        win_setsockopt(socket, IPPROTO_IPV6, IPV6_MULTICAST_IF, &index)
+    } else {
+        let address = interface.parse::<Ipv4Addr>().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "IPv4 multicast interface must be an IPv4 address",
+            )
+        })?;
+        let value = u32::from_ne_bytes(address.octets());
+        win_setsockopt(socket, IPPROTO_IP, IP_MULTICAST_IF, &value)
+    }
+}
+
+#[cfg(not(any(windows, all(unix, any(target_os = "macos", target_os = "linux")))))]
 fn set_multicast_interface(
     _socket: &UdpSocket,
     _kind6: bool,
@@ -1428,6 +1822,16 @@ fn set_source_membership(
     join: bool,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
+    // Linux orders `ip_mreq_source` as (multiaddr, interface, sourceaddr); macOS as
+    // (multiaddr, sourceaddr, interface).
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct IpMreqSource {
+        group: u32,
+        interface: u32,
+        source: u32,
+    }
+    #[cfg(target_os = "macos")]
     #[repr(C)]
     struct IpMreqSource {
         group: u32,
@@ -1478,7 +1882,65 @@ fn set_source_membership(
     }
 }
 
-#[cfg(not(all(unix, any(target_os = "macos", target_os = "linux"))))]
+/// Winsock's `ip_mreq_source` is (multiaddr, sourceaddr, interface).
+#[cfg(windows)]
+fn set_source_membership(
+    socket: &UdpSocket,
+    source: Ipv4Addr,
+    group: Ipv4Addr,
+    interface: Ipv4Addr,
+    join: bool,
+) -> std::io::Result<()> {
+    #[repr(C)]
+    struct IpMreqSource {
+        group: u32,
+        source: u32,
+        interface: u32,
+    }
+    const IPPROTO_IP: i32 = 0;
+    const IP_ADD_SOURCE_MEMBERSHIP: i32 = 15;
+    const IP_DROP_SOURCE_MEMBERSHIP: i32 = 16;
+    let request = IpMreqSource {
+        group: u32::from_ne_bytes(group.octets()),
+        source: u32::from_ne_bytes(source.octets()),
+        interface: u32::from_ne_bytes(interface.octets()),
+    };
+    let option = if join {
+        IP_ADD_SOURCE_MEMBERSHIP
+    } else {
+        IP_DROP_SOURCE_MEMBERSHIP
+    };
+    win_setsockopt(socket, IPPROTO_IP, option, &request)
+}
+
+/// `setsockopt` on a Winsock socket with a plain-data option value.
+#[cfg(windows)]
+fn win_setsockopt<T>(socket: &UdpSocket, level: i32, name: i32, value: &T) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn setsockopt(socket: usize, level: i32, name: i32, value: *const u8, length: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+    // SAFETY: the socket is live for the borrow; `value` points to a `T` of the given length.
+    let rc = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as usize,
+            level,
+            name,
+            value as *const T as *const u8,
+            std::mem::size_of::<T>() as i32,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        // SAFETY: reads this thread's last Winsock error.
+        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+    }
+}
+
+#[cfg(not(any(windows, all(unix, any(target_os = "macos", target_os = "linux")))))]
 fn set_source_membership(
     _socket: &UdpSocket,
     _source: Ipv4Addr,
@@ -1678,7 +2140,49 @@ fn set_socket_buffer_size(socket: &UdpSocket, receive: bool, size: i32) -> std::
     }
 }
 
-#[cfg(not(all(unix, any(target_os = "macos", target_os = "linux"))))]
+#[cfg(windows)]
+const WIN_SOL_SOCKET: i32 = 0xffff;
+#[cfg(windows)]
+const WIN_SO_SNDBUF: i32 = 0x1001;
+#[cfg(windows)]
+const WIN_SO_RCVBUF: i32 = 0x1002;
+
+#[cfg(windows)]
+fn socket_buffer_size(socket: &UdpSocket, receive: bool) -> std::io::Result<i32> {
+    use std::os::windows::io::AsRawSocket;
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn getsockopt(socket: usize, level: i32, name: i32, value: *mut u8, length: *mut i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+    let mut value = 0i32;
+    let mut length = std::mem::size_of::<i32>() as i32;
+    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    // SAFETY: the socket is live for the borrow; value/length describe a valid i32 buffer.
+    let rc = unsafe {
+        getsockopt(
+            socket.as_raw_socket() as usize,
+            WIN_SOL_SOCKET,
+            name,
+            &mut value as *mut i32 as *mut u8,
+            &mut length,
+        )
+    };
+    if rc == 0 {
+        Ok(value)
+    } else {
+        // SAFETY: reads this thread's last Winsock error.
+        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+    }
+}
+
+#[cfg(windows)]
+fn set_socket_buffer_size(socket: &UdpSocket, receive: bool, size: i32) -> std::io::Result<()> {
+    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    win_setsockopt(socket, WIN_SOL_SOCKET, name, &size)
+}
+
+#[cfg(not(any(windows, all(unix, any(target_os = "macos", target_os = "linux")))))]
 fn socket_buffer_size(_socket: &UdpSocket, _receive: bool) -> std::io::Result<i32> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1686,7 +2190,7 @@ fn socket_buffer_size(_socket: &UdpSocket, _receive: bool) -> std::io::Result<i3
     ))
 }
 
-#[cfg(not(all(unix, any(target_os = "macos", target_os = "linux"))))]
+#[cfg(not(any(windows, all(unix, any(target_os = "macos", target_os = "linux")))))]
 fn set_socket_buffer_size(_socket: &UdpSocket, _receive: bool, _size: i32) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1732,7 +2236,14 @@ fn set_ipv6_unicast_hops(socket: &UdpSocket, hops: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn set_ipv6_unicast_hops(socket: &UdpSocket, hops: i32) -> std::io::Result<()> {
+    const IPPROTO_IPV6: i32 = 41;
+    const IPV6_UNICAST_HOPS: i32 = 4;
+    win_setsockopt(socket, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn set_ipv6_unicast_hops(_socket: &UdpSocket, _hops: i32) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

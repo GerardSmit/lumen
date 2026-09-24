@@ -1,0 +1,4 @@
+héllo wörld → 1
+"function greet(name         /* ñ */, extra                )                    {\n  return `héllo ${name}`;\n}"
+"(x                     )      => \"→\""
+"class Größe                         {\n  wert                = undefined                 ;\n  größe()         { return 1; }\n}"

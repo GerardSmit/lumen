@@ -56,8 +56,8 @@ fn constrained_prime_generation_matches_node_options() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "ordinary 1 true",
-            "safe 11 true true",
+            "ordinary 1n true",
+            "safe 11n true true",
             "ignored true",
             "invalid RangeError",
         ]

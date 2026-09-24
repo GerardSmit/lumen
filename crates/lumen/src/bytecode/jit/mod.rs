@@ -65,33 +65,103 @@ use crate::interpreter::{Env, Interp};
 use crate::value::Value;
 
 /// The frame native region code runs against. Offsets are part of the contract (`FRAME_*`).
+///
+/// On 64-bit hosts every 16-byte-aligned field holds a value whose first byte stays at most 4
+/// on the returning path of a direct call (a tag of a taken exception, a budget of `1 << 12`,
+/// an exit depth of 0 or 1, a handler-set index of 0, never-written padding), so a directly
+/// called frame's header keeps the shadow stack's invariant (see [`Shadow`]) without clearing.
 #[repr(C)]
 pub(crate) struct JitFrame {
-    /// The chunk's frame slots (`&mut [Value]`, `chunk.n_slots` long).
-    pub slots: *mut Value,
-    /// `chunk.consts`.
-    pub consts: *const Value,
-    /// The region's operand-stack area, `max_stack` Values, all `Undefined` on entry.
-    pub stack: *mut Value,
-    pub interp: *mut Interp,
-    pub chunk: *const Chunk,
-    pub env: *const Env,
-    pub this_val: *const Value,
-    /// Live entries of `stack` at exit (written by native code).
-    pub exit_depth: u64,
     /// The pending exception after a helper returned `STATUS_THROW`.
     pub exception: Value,
     /// Loop turns left before the next safepoint: native code decrements it at every backedge
     /// and calls `Helper::Safepoint` when it drops to zero or below (GC and interrupts, like the
-    /// interpreter's amortized check at backward jumps). The helper resets it.
+    /// interpreter's amortized check at backward jumps). The helper resets it. (Read once at
+    /// entry: native code counts in a variable.)
     pub budget: i64,
+    /// The chunk's frame slots (`&mut [Value]`, `chunk.n_slots` long).
+    pub slots: *mut Value,
+    /// Live entries of `stack` at exit (written by native code).
+    pub exit_depth: u64,
+    /// `chunk.consts`.
+    pub consts: *const Value,
     /// At a resume exit inside a `try` region the loop itself pushed: 1 + the index of the
     /// region's handler set in [`Native::hsets`] (0 = none). See `enter`.
     pub exit_hset: u64,
+    /// The region's operand-stack area, `max_stack` Values, all `Undefined` on entry.
+    pub stack: *mut Value,
+    /// The running activation's engine call flags as a direct call site needs them (see
+    /// `build::call`'s `entry_flags`): 1 + `Interp::strict` when they are canonical, else 0.
+    /// Written by [`enter`] and by every direct call.
+    pub canon: u64,
+    pub interp: *mut Interp,
+    /// Which entry of function code to take: 0 = pc 0, `k` = the `k`-th resume point after an
+    /// `await` ([`Native::resumes`]). Written by [`enter`]; read only by code with resume
+    /// points (async functions, which are never called directly).
+    pub resume: u64,
+    pub chunk: *const Chunk,
+    pub pad2: u64,
+    pub env: *const Env,
+    pub pad3: u64,
+    pub this_val: *const Value,
+    pub pad4: u64,
     /// Out-parameters of `Helper::TaView`: the viewed bytes' address and element count.
     pub ta_data: *mut u8,
+    pub pad5: u64,
     pub ta_len: usize,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::offset_of as o;
+    assert!(o!(JitFrame, exception) % 16 == 0);
+    assert!(o!(JitFrame, budget) % 16 == 0 && SAFEPOINT_BUDGET & 0xff == 0);
+    assert!(o!(JitFrame, exit_depth) % 16 == 0);
+    assert!(o!(JitFrame, exit_hset) % 16 == 0);
+    assert!(o!(JitFrame, canon) % 16 == 0 && o!(JitFrame, resume) % 16 == 0);
+    assert!(o!(JitFrame, pad2) % 16 == 0 && o!(JitFrame, pad3) % 16 == 0);
+    assert!(o!(JitFrame, pad4) % 16 == 0 && o!(JitFrame, pad5) % 16 == 0);
+    assert!(std::mem::size_of::<JitFrame>() == 160);
+};
+
+/// The lazy call record of a directly called frame (see `build::call` and [`sync_frames`]),
+/// on the shadow stack right below the callee's frame. Both 16-byte-aligned words start with a
+/// zero byte whatever they hold (see [`Shadow`]'s invariant), so the record needs no clearing
+/// when the call returns.
+#[repr(C)]
+pub(crate) struct CallRec {
+    /// `REC_*` bits (shifted left by 8: the low byte is always 0).
+    pub flags: u32,
+    /// The caller's call site (the record's `FnFrame::caller_site`).
+    pub site: u32,
+    /// The previous pending record (`Interp::jit_frames` before the call).
+    pub link: usize,
+    /// (32-bit hosts: keeps `pad` 16-byte aligned, as on 64-bit.)
+    #[cfg(target_pointer_width = "32")]
+    pub pad0: u32,
+    /// Never written: its first byte (16-byte aligned) keeps whatever trivially droppable
+    /// tag byte the shadow stack held.
+    pub pad: u32,
+    /// The caller's `Interp::cur_coro`.
+    pub coro: u32,
+    /// The callee's `Gc::as_ptr`.
+    pub fn_ptr: usize,
+}
+
+/// Shadow-stack bytes of a [`CallRec`].
+pub(crate) const REC_BYTES: usize = 32;
+const _: () = assert!(std::mem::size_of::<CallRec>() <= REC_BYTES);
+pub(crate) const REC_FLAGS: i32 = std::mem::offset_of!(CallRec, flags) as i32;
+pub(crate) const REC_LINK: i32 = std::mem::offset_of!(CallRec, link) as i32;
+pub(crate) const REC_CORO: i32 = std::mem::offset_of!(CallRec, coro) as i32;
+pub(crate) const REC_FN: i32 = std::mem::offset_of!(CallRec, fn_ptr) as i32;
+const _: () = assert!(REC_FLAGS == 0 && REC_CORO == 20 && std::mem::offset_of!(CallRec, site) == 4);
+
+/// [`CallRec::flags`] bits (stored shifted left by 8).
+pub(crate) const REC_STRICT: u32 = 1 << 8;
+pub(crate) const REC_CONSTRUCT: u32 = 2 << 8;
+/// The record was copied into `Interp::fn_frames` (the call pops it there when it returns).
+pub(crate) const REC_SYNCED: u32 = 4 << 8;
 
 // Offsets differ between 64-bit hosts and wasm32 (4-byte pointers), so they are computed.
 pub(crate) const FRAME_SLOTS: i32 = std::mem::offset_of!(JitFrame, slots) as i32;
@@ -106,6 +176,8 @@ pub(crate) const FRAME_EXCEPTION: i32 = std::mem::offset_of!(JitFrame, exception
 pub(crate) const FRAME_BUDGET: i32 = std::mem::offset_of!(JitFrame, budget) as i32;
 pub(crate) const FRAME_EXIT_HSET: i32 = std::mem::offset_of!(JitFrame, exit_hset) as i32;
 pub(crate) const FRAME_TA_DATA: i32 = std::mem::offset_of!(JitFrame, ta_data) as i32;
+pub(crate) const FRAME_CANON: i32 = std::mem::offset_of!(JitFrame, canon) as i32;
+pub(crate) const FRAME_RESUME: i32 = std::mem::offset_of!(JitFrame, resume) as i32;
 pub(crate) const FRAME_TA_LEN: i32 = std::mem::offset_of!(JitFrame, ta_len) as i32;
 
 /// The IR type of a pointer on this target: I64 on 64-bit hosts, I32 on wasm32. Every address
@@ -232,9 +304,31 @@ pub(crate) struct ChunkJit {
     dentry: Cell<usize>,
     dsize: Cell<usize>,
     dcode: Cell<usize>,
+    /// What compiles learned about sites whose receiver only a compile that sees it can
+    /// resolve (a loop compiled while the locals hold it), by op pc, for later compiles (the
+    /// whole-function tier compiles at entry, before the locals are set). Every use is guarded
+    /// at run time, so a stale entry only costs a miss. See `build::call`.
+    site_fb: RefCell<Vec<(usize, Box<dyn std::any::Any>)>>,
 }
 
 impl ChunkJit {
+    /// The feedback of type `T` recorded for the site at `pc`.
+    pub(crate) fn fb_get<T: Clone + 'static>(&self, pc: usize) -> Option<T> {
+        let v = self.site_fb.borrow();
+        v.iter()
+            .find(|(q, _)| *q == pc)
+            .and_then(|(_, b)| b.downcast_ref::<T>().cloned())
+    }
+
+    /// Record feedback `v` for the site at `pc` (replacing any).
+    pub(crate) fn fb_put<T: 'static>(&self, pc: usize, v: T) {
+        let mut f = self.site_fb.borrow_mut();
+        f.retain(|(q, b)| *q != pc || !b.is::<T>());
+        if f.len() < 256 {
+            f.push((pc, Box::new(v)));
+        }
+    }
+
     fn set_direct(&self, chunk: &Chunk, n: Option<&std::rc::Rc<Native>>) {
         match n {
             Some(n) => {
@@ -265,9 +359,10 @@ pub(crate) const CHUNK_DCODE: usize =
 /// slots after it are 16-byte aligned.
 pub(crate) const FRAME_HDR: usize = (std::mem::size_of::<JitFrame>() + 15) & !15;
 
-/// Shadow-stack bytes of a directly called frame: header, slots, operand-stack area.
+/// Shadow-stack bytes of a directly called frame: call record, header, slots, operand-stack
+/// area.
 pub(crate) fn frame_bytes(n_slots: usize, max_stack: usize) -> usize {
-    FRAME_HDR + (n_slots + max_stack.max(1)) * VALUE_SIZE as usize
+    REC_BYTES + FRAME_HDR + (n_slots + max_stack.max(1)) * VALUE_SIZE as usize
 }
 
 /// The per-thread shadow stack directly called function code runs its frames on (see
@@ -287,9 +382,14 @@ pub(crate) struct Shadow {
 pub(crate) const SHADOW_TOP: i32 = std::mem::offset_of!(Shadow, top) as i32;
 pub(crate) const SHADOW_END: i32 = std::mem::offset_of!(Shadow, end) as i32;
 
-/// Shadow-stack bytes per thread.
-#[cfg(target_pointer_width = "64")]
+/// Shadow-stack bytes per thread. A call that would pass the end takes the generic (slow) call
+/// path, so this bounds only how deep JIT-to-JIT calls stay direct. On Windows the zeroed
+/// buffer is committed memory from the start (private bytes), so it is kept smaller there;
+/// elsewhere untouched pages cost nothing.
+#[cfg(all(target_pointer_width = "64", not(windows)))]
 const SHADOW_BYTES: usize = 4 << 20;
+#[cfg(all(target_pointer_width = "64", windows))]
+const SHADOW_BYTES: usize = 1 << 20;
 #[cfg(target_pointer_width = "32")]
 const SHADOW_BYTES: usize = 1 << 20;
 
@@ -314,6 +414,48 @@ pub(crate) fn shadow() -> *mut Shadow {
         }
         s.get()
     })
+}
+
+/// A direct call site's callee cache (see `build::call`): the callee last seen there — its
+/// payload word, `fn_frames` identity and the address of the environment it closes over (inside
+/// its callable record) — for the code's chunk `chunk`. `pin` keeps that callee alive so its
+/// address cannot be reused by another object while cached. Rebound by `Helper::SiteRebind`
+/// to any other function object with the same code (another closure of the same function).
+#[repr(C)]
+pub(crate) struct SiteCell {
+    pub word: usize,
+    pub fn_ptr: usize,
+    pub env: usize,
+    pub chunk: usize,
+    pub pin: Value,
+}
+
+pub(crate) const CELL_WORD: i32 = std::mem::offset_of!(SiteCell, word) as i32;
+pub(crate) const CELL_FN: i32 = std::mem::offset_of!(SiteCell, fn_ptr) as i32;
+pub(crate) const CELL_ENV: i32 = std::mem::offset_of!(SiteCell, env) as i32;
+
+/// The payload word of `v` as a `Value` stores it.
+pub(crate) fn value_word(v: &Value) -> usize {
+    // SAFETY: a `Value` is `VALUE_SIZE` bytes with its payload at `VALUE_PAYLOAD`.
+    unsafe {
+        *(v as *const Value as *const u8)
+            .add(VALUE_PAYLOAD as usize)
+            .cast::<usize>()
+    }
+}
+
+/// The address of the environment user function `v` closes over (stable while `v` lives), and
+/// its `Gc::as_ptr` identity.
+pub(crate) fn callee_env_addr(v: &Value) -> Option<(usize, usize)> {
+    let Value::Obj(o) = v else { return None };
+    let b = o.try_borrow().ok()?;
+    let crate::value::Callable::User(u) = &b.call else {
+        return None;
+    };
+    Some((
+        &u.env as *const Env as usize,
+        crate::value::Gc::as_ptr(o) as usize,
+    ))
 }
 
 /// The code `entry` of `chunk`'s function tier (current or retired), for a direct call's exit.
@@ -366,6 +508,9 @@ struct Native {
     kinds: Vec<Kind>,
     /// Start pcs of call sites guarded at every call (see [`build::Built::guarded`]).
     guarded: Vec<usize>,
+    /// Resume points `(pc, operand-stack depth)` of function code: the op after each `await`,
+    /// entered with `frame.resume` = 1 + the index (see [`on_resume`]).
+    resumes: Vec<(usize, usize)>,
 }
 
 fn log_enabled() -> bool {
@@ -454,6 +599,7 @@ fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native,
         _boxes: built.boxes,
         kinds: built.kinds,
         guarded: built.guarded,
+        resumes: built.resumes,
     })
 }
 
@@ -580,6 +726,12 @@ pub(super) fn on_backedge(
     // natively as soon as possible).
     let t = if eager() { 0 } else { jit.ticks.get() };
     if !stack.is_empty() || !jit_enabled() {
+        // A hot loop entered with operands pending (`s += a.map(x => …)`, see
+        // `bytecode::inline_callback`) can't enter here: compile the whole function at its
+        // next entry instead.
+        if !stack.is_empty() && jit_enabled() && t & TICK_MASK == 0 && jit.fstate.get() == FS_COLD {
+            jit.fstate.set(FS_PENDING);
+        }
         return Ok(None);
     }
     let native = {
@@ -627,7 +779,7 @@ pub(super) fn on_backedge(
         }
         l.code.clone().expect("compiled above")
     };
-    enter(i, chunk, env, slots, stack, pc, this_val, Some((header, backedge)), &native)
+    enter(i, chunk, env, slots, stack, pc, this_val, Some((header, backedge)), &native, 0)
 }
 
 /// The interpreter's inline check at a frame's entry (pc 0, empty operand stack): count the
@@ -705,7 +857,53 @@ pub(super) fn on_entry(
             }
         }
     };
-    enter(i, chunk, env, slots, stack, pc, this_val, None, &native)
+    enter(i, chunk, env, slots, stack, pc, this_val, None, &native, 0)
+}
+
+/// `LUMEN_JIT_RESUME`: give async function code resume points after its `await`s (see
+/// [`on_resume`]). Off by default: an entry of native code costs more than the interpreter
+/// spends on the short stretches between awaits of typical async code, and the settled values
+/// arrive Boxed (a loop after an await runs better in the loop tier, which specializes on them).
+pub(super) fn resume_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUMEN_JIT_RESUME").is_some())
+}
+
+/// Whether the driver of an async body continuing at `pc` (just after an `await`) may enter
+/// its function code there (see [`on_resume`]).
+#[inline(always)]
+pub(super) fn resume_due(chunk: &Chunk, pc: usize) -> bool {
+    chunk.jit.fstate.get() == FS_CODE
+        && pc > 0
+        && matches!(chunk.ops.get(pc - 1), Some(super::Op::Await))
+}
+
+/// Enter the function code of `chunk` at the resume point `*pc` after an `await`
+/// (async-design.md §4.6.2), with the frame's operand stack (the settled value on top) moved
+/// into the code's stack area. Returns like [`on_entry`]; `Ok(None)` also when the code has no
+/// such resume point or its entry guards fail (the interpreter continues).
+#[inline(never)]
+pub(super) fn on_resume(
+    i: &mut Interp,
+    chunk: &Chunk,
+    env: &Env,
+    slots: &mut [Value],
+    stack: &mut Vec<Value>,
+    pc: &mut usize,
+    this_val: &Value,
+) -> Result<Option<VmStep>, Abrupt> {
+    let native = match chunk.jit.func.borrow().code.clone() {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let Some(k) = native
+        .resumes
+        .iter()
+        .position(|&(r, d)| r == *pc && d == stack.len())
+    else {
+        return Ok(None);
+    };
+    enter(i, chunk, env, slots, stack, pc, this_val, None, &native, k as u64 + 1)
 }
 
 /// The function code of `chunk` when [`helpers`]' direct native call can run it: compiled,
@@ -718,11 +916,12 @@ fn native_code(chunk: &Chunk) -> Option<std::rc::Rc<Native>> {
     chunk.jit.func.borrow().code.clone()
 }
 
-/// The JIT's call helper's shortcut for a frame it just entered (pc 0, empty stack, no
-/// handlers): run the chunk's function code without the interpreter's driver. `None` when there
-/// is none, or when it exited part-way (the driver continues at `*pc`).
+/// The shortcut for a frame just entered (pc 0, empty stack, no handlers) of the JIT's call
+/// helper and of prepared calls: run the chunk's function code without the interpreter's
+/// driver. `None` when there is none, or when it exited part-way (the driver continues at
+/// `*pc`).
 #[inline(always)]
-fn run_entered(
+pub(super) fn run_entered(
     i: &mut Interp,
     chunk: &Chunk,
     env: &Env,
@@ -748,6 +947,23 @@ const INLINE_AREA: usize = 32;
 /// Run `native` against the frame: a loop region `Some((header, backedge))` entered at its
 /// header, or the chunk's function code (`None`) entered at pc 0.
 #[allow(clippy::too_many_arguments)]
+/// [`JitFrame::canon`] of an activation the interpreter enters: 1 + `strict` when the engine
+/// flags are exactly what a plain call of a function of that strictness sets up — `strict ==
+/// tco_ok`, not `constructing`, no `new.target`, no field-initializer / async-generator-body
+/// marker — else 0.
+fn canon_flags(i: &Interp) -> u64 {
+    let plain = i.strict == i.tco_ok
+        && !i.constructing
+        && matches!(i.new_target, Value::Undefined)
+        && !i.in_field_init_code
+        && !i.in_async_gen_body;
+    if plain {
+        1 + i.strict as u64
+    } else {
+        0
+    }
+}
+
 fn enter(
     i: &mut Interp,
     chunk: &Chunk,
@@ -758,8 +974,14 @@ fn enter(
     this_val: &Value,
     region: Option<(usize, usize)>,
     native: &Native,
+    resume: u64,
 ) -> Result<Option<VmStep>, Abrupt> {
     let n = native.max_stack.max(1);
+    // A resume entry takes over the frame's operand stack (its depth is the resume point's).
+    let moved = if resume != 0 { stack.len() } else { 0 };
+    if moved > n {
+        return Ok(None);
+    }
     // Only the `n` entries the code uses are initialized (and dropped, by `_own`).
     let mut small = [const { std::mem::MaybeUninit::<Value>::uninit() }; INLINE_AREA];
     let mut big: Vec<Value>;
@@ -782,6 +1004,9 @@ fn enter(
         }
     }
     let _own = (n <= INLINE_AREA).then(|| Own(area.as_mut_ptr(), n));
+    for (k, v) in stack.drain(..).enumerate().take(moved) {
+        area[k] = v;
+    }
     let mut frame = JitFrame {
         slots: slots.as_mut_ptr(),
         consts: chunk.consts.as_ptr(),
@@ -796,6 +1021,12 @@ fn enter(
         exit_hset: 0,
         ta_data: std::ptr::null_mut(),
         ta_len: 0,
+        canon: canon_flags(i),
+        resume,
+        pad2: 0,
+        pad3: 0,
+        pad4: 0,
+        pad5: 0,
     };
     // SAFETY: the frame points at live state for the whole call; native code follows the
     // contract above (it touches only `slots`, `area` and the frame, and calls helpers).
@@ -805,6 +1036,19 @@ fn enter(
     let depth = (frame.exit_depth as usize).min(area.len());
     let exception = std::mem::take(&mut frame.exception);
     match kind {
+        EXIT_ENTRY_FAIL if resume != 0 => {
+            if log_enabled() {
+                eprintln!("[jit] resume entry {resume} failed");
+            }
+            // The interpreter continues after the `await` (nothing to learn: the slots are
+            // what the suspended body left).
+            stack.extend(
+                area[..moved]
+                    .iter_mut()
+                    .map(|v| std::mem::replace(v, Value::Undefined)),
+            );
+            Ok(None)
+        }
         EXIT_ENTRY_FAIL => {
             match region {
                 Some((header, backedge)) => {
@@ -847,13 +1091,18 @@ fn enter(
                 // A guarded call site stopped holding (see `Helper::SlotGuard`): recompile the
                 // loop without it rather than exit there on every iteration.
                 Some((header, backedge))
-                    if kind == EXIT_RESUME && native.guarded.contains(&exit_pc) =>
+                    if kind == EXIT_RESUME
+                        && (native.guarded.contains(&exit_pc)
+                            || helpers::take_ta_exit(chunk, exit_pc)) =>
                 {
                     let mut loops = chunk.jit.loops.borrow_mut();
                     if let Some(l) = loops
                         .iter_mut()
                         .find(|l| l.header as usize == header && l.backedge as usize == backedge)
                     {
+                        if log_enabled() {
+                            eprintln!("[jit] loop {header}..={backedge} retired at {exit_pc}");
+                        }
                         l.code = None;
                     }
                 }
@@ -897,10 +1146,22 @@ fn fn_entry_failed(chunk: &Chunk, slots: &[Value], native: &Native) {
 /// recompile; exits no widening can remove (ops the translator leaves to the interpreter) are
 /// just counted.
 fn fn_deopt(chunk: &Chunk, pc: usize, native: &Native) {
+    // An `await` always exits (see `build`): nothing to learn from it.
+    if matches!(chunk.ops.get(pc), Some(super::Op::Await)) {
+        return;
+    }
     let jit = &chunk.jit;
     let mut fs = jit.func.borrow_mut();
-    if native.guarded.contains(&pc) && fs.code.as_ref().is_some_and(|c| std::ptr::eq(&**c, native)) {
-        // A guarded call site stopped holding: recompile without it.
+    let guarded = native.guarded.contains(&pc);
+    if (guarded || helpers::take_ta_exit(chunk, pc))
+        && fs.code.as_ref().is_some_and(|c| std::ptr::eq(&**c, native))
+    {
+        // A guarded call site stopped holding (or a typed-array site wants a view cache):
+        // recompile.
+        if log_enabled() {
+            let why = if guarded { "guard failed" } else { "typed-array site hot" };
+            eprintln!("[jit] function retired at {pc}: {why}");
+        }
         retire_fn(jit, &mut fs);
         return;
     }
@@ -991,7 +1252,11 @@ fn finish_handlers(
             Ok(VmStep::Done(Value::Empty)) => {}
             Ok(step) => return Ok(Some(step)),
             Err(Abrupt::Throw(e)) => {
-                let h = hs.pop().expect("non-empty");
+                // An op may drop every handler before throwing (`DerivedReturn`: [[Construct]]'s
+                // own TypeError is not catchable by the body); it then propagates.
+                let Some(h) = hs.pop() else {
+                    return Err(Abrupt::Throw(e));
+                };
                 stack.truncate(h.stack_depth);
                 stack.push(e);
                 *pc = h.catch_pc;
@@ -1000,4 +1265,96 @@ fn finish_handlers(
         }
     }
     Ok(None)
+}
+
+// ---- lazy call records of directly called frames ------------------------------------------------
+//
+// A call native code makes directly (see `build::call`) does not push an `Interp::fn_frames`
+// entry. It fills the record fields of its callee's `JitFrame` header and links it from
+// `Interp::jit_frames` (newest first); the call pops it by restoring the link. Pending records
+// are always logically *above* every `fn_frames` entry: anything that pushes to `fn_frames`
+// first calls [`sync_frames`], which copies the pending records in (oldest first) and marks
+// them `REC_SYNCED` (such a call pops its `fn_frames` entry when it returns). The full call
+// stack, oldest first, is therefore `fn_frames` followed by [`pending_frames`]. A stack trace
+// reads it that way; code that needs `&mut` access to a frame calls `sync_frames` first.
+
+/// Copy the pending direct-call records into `i.fn_frames` (see above). Call before pushing to
+/// `fn_frames`, and before reading it with `&mut` access (`f.caller` / `f.arguments`).
+#[inline(always)]
+pub(crate) fn sync_frames(i: &mut Interp) {
+    if i.jit_frames != 0 {
+        sync_frames_slow(i);
+    }
+}
+
+/// The pending records, newest first (stops at the first synced one: every record below it
+/// was synced too).
+fn pending_recs(i: &Interp) -> Vec<*mut CallRec> {
+    let mut v = Vec::new();
+    let mut p = i.jit_frames as *mut CallRec;
+    // SAFETY: every linked record belongs to a live directly called frame (a call unlinks its
+    // record before its frame is released).
+    unsafe {
+        while !p.is_null() && (*p).flags & REC_SYNCED == 0 {
+            v.push(p);
+            p = (*p).link as *mut CallRec;
+        }
+    }
+    v
+}
+
+fn rec_frame(p: *const CallRec) -> crate::interpreter::FnFrame {
+    // SAFETY: see `pending_recs`.
+    let r = unsafe { &*p };
+    crate::interpreter::FnFrame {
+        fn_ptr: r.fn_ptr,
+        coro: r.coro,
+        caller_site: r.site,
+        strict: r.flags & REC_STRICT != 0,
+        construct: r.flags & REC_CONSTRUCT != 0,
+        extra: None,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn sync_frames_slow(i: &mut Interp) {
+    let recs = pending_recs(i);
+    for &p in recs.iter().rev() {
+        i.fn_frames.push(rec_frame(p));
+        // SAFETY: see `pending_recs`.
+        unsafe { (*p).flags |= REC_SYNCED };
+    }
+}
+
+/// The pending direct-call records as frames, oldest first: they go on top of `i.fn_frames`
+/// (see above). Empty — and allocation-free — when there are none.
+pub(crate) fn pending_frames(i: &Interp) -> Vec<crate::interpreter::FnFrame> {
+    if i.jit_frames == 0 {
+        return Vec::new();
+    }
+    pending_recs(i).into_iter().rev().map(|p| rec_frame(p)).collect()
+}
+
+/// A coroutine body died (its worker is gone): unlink its pending records, like the
+/// `fn_frames` entries it owned.
+pub(crate) fn evict_coro_frames(i: &mut Interp, coro: u32) {
+    let mut keep = Vec::new();
+    let mut p = i.jit_frames as *mut CallRec;
+    // SAFETY: see `pending_recs` (a dead body's frames are parked, not released).
+    unsafe {
+        while !p.is_null() {
+            if (*p).coro != coro {
+                keep.push(p);
+            }
+            p = (*p).link as *mut CallRec;
+        }
+        for w in keep.windows(2) {
+            (*w[0]).link = w[1] as usize;
+        }
+        if let Some(&last) = keep.last() {
+            (*last).link = 0;
+        }
+    }
+    i.jit_frames = keep.first().map_or(0, |&p| p as usize);
 }

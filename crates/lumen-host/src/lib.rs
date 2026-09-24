@@ -68,6 +68,10 @@ pub struct Extension {
     /// dominant cold-start cost. A decode failure (version skew) falls back to `js_init`, so it
     /// is a pure optimization. `js_init` must still be set: it is the fallback source, and the
     /// text the snapshot's functions read their source ranges and unparsed bodies from.
+    ///
+    /// It may instead be an ahead-of-time blob (`lumen::precompiled::precompile_glue`, starting
+    /// `LUMENAOT`): the glue's AST, bytecode and (compressed) function text, loaded with
+    /// `Engine::load_precompiled` — then `js_init` may be `None` (it is only a fallback).
     pub js_init_snapshot: Option<&'static [u8]>,
 }
 
@@ -88,7 +92,23 @@ impl Extension {
 /// Install extensions into an engine: state first (an op may fire during install), then ops,
 /// then JS glue.
 pub fn install(engine: &mut Engine, extensions: &[Extension]) {
+    let timing = startup_timing();
+    lumen::memstats::phase("engine created");
+    if lumen::memstats::enabled() {
+        // Per-file checkpoints of a glue built with LUMEN_GLUE_MEM_MARKS=1 (see lumen-node's
+        // build.rs).
+        engine.define_global("__lumenMemMark", 1, |ctx, _this, args| {
+            let label = match args.first() {
+                Some(v) => ctx.coerce_string(v).map(|s| s.to_string()).unwrap_or_default(),
+                None => String::new(),
+            };
+            lumen::memstats::phase(&format!("    glue {label}"));
+            Ok(lumen::embed::Value::Undefined)
+        });
+    }
     for ext in extensions {
+        let _mem = lumen::memstats::enter(lumen::memstats::Cat::Glue);
+        let t0 = timing.then(std::time::Instant::now);
         if let Some(init) = ext.state_init {
             init(engine.ctx().op_state());
         }
@@ -100,7 +120,26 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
                 ops.iter().map(|o| (o.name, o.len, o.f)).collect();
             engine.define_namespace(ns, &table);
         }
-        if let Some(src) = ext.js_init {
+        let aot = ext
+            .js_init_snapshot
+            .filter(|b| b.starts_with(b"LUMENAOT"));
+        if let Some(blob) = aot {
+            let tier = engine.tier();
+            engine.set_tier(lumen::bytecode::Tier::Interp);
+            let loaded = engine.load_precompiled(&lumen::Precompiled::from_static(blob));
+            let completion = match (loaded, ext.js_init) {
+                (Err(_), Some(src)) => engine.eval(src, false),
+                (r, _) => r,
+            };
+            engine.set_tier(tier);
+            match completion {
+                Ok(Completion::Value(_)) => {}
+                Ok(Completion::Throw { name, message }) => {
+                    panic!("extension '{}' js_init threw {name}: {message}", ext.name)
+                }
+                Err(e) => panic!("extension '{}' js_init: {}", ext.name, e.message),
+            }
+        } else if let Some(src) = ext.js_init {
             // The glue's setup path runs once, in the tree-walker: compiling it would parse the
             // body of every function it defines (the capture scan needs them) for code that
             // never runs again. Functions it defines tier up on their own calls as usual.
@@ -126,7 +165,19 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
                 ),
             }
         }
+        if let Some(t0) = t0 {
+            eprintln!("[startup] install {:<8} {:?}", ext.name, t0.elapsed());
+        }
+        if lumen::memstats::enabled() {
+            lumen::memstats::phase(&format!("install {}", ext.name));
+        }
     }
+}
+
+/// Whether `LUMEN_STARTUP_TIMING` is set: startup phases then report their wall time on stderr.
+pub fn startup_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUMEN_STARTUP_TIMING").is_some())
 }
 
 /// Identifies an in-flight async task. The op that spawns work registers `TaskId -> JS
@@ -529,6 +580,8 @@ pub fn spawn_command(
     ctx: &mut Ctx,
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    std_handles_not_inheritable();
     let spawner = ctx
         .op_state()
         .get::<RealmProcess>()
@@ -537,6 +590,35 @@ pub fn spawn_command(
         Some(spawner) => spawner.spawn(command),
         None => command.spawn(),
     }
+}
+
+/// Windows `CreateProcess` (as std calls it) hands every *inheritable* handle to the child. Our
+/// own stdin/stdout/stderr usually arrived inheritable, so without this a child spawned with
+/// `stdio: "ignore"` (say a detached daemon) would still hold our stdout pipe open, and a parent
+/// reading that pipe would never see EOF (libuv avoids the leak the same way). Children that
+/// should inherit them still do: `Stdio::inherit` hands over an inheritable duplicate.
+#[cfg(windows)]
+fn std_handles_not_inheritable() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[link(name = "kernel32", kind = "raw-dylib")]
+        extern "system" {
+            fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
+            fn SetHandleInformation(handle: *mut core::ffi::c_void, mask: u32, flags: u32) -> i32;
+        }
+        const HANDLE_FLAG_INHERIT: u32 = 1;
+        // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE: (DWORD)-10, -11, -12.
+        for which in [-10i32, -11, -12] {
+            // SAFETY: GetStdHandle returns null / INVALID_HANDLE_VALUE or a live handle, and
+            // SetHandleInformation only fails (harmlessly) on the former.
+            unsafe {
+                let handle = GetStdHandle(which as u32);
+                if !handle.is_null() && handle as isize != -1 {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    });
 }
 
 /// Fill `buf` from the operating system's CSPRNG: `ProcessPrng` on Windows (what std itself

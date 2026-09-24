@@ -133,6 +133,8 @@ pub(super) fn install_function_proto(it: &mut Interp) {
     }
     it.extra_protos
         .insert("%ThrowTypeError%", throw_type_error.clone());
+    // The getters behind sloppy functions' own legacy `arguments` / `caller`.
+    crate::bytecode::reflect::install(it);
     // Function.prototype.caller / .arguments: accessor properties whose getter AND setter are
     // the single %ThrowTypeError% intrinsic (the spec requires the same function object).
     for name in ["caller", "arguments"] {
@@ -170,6 +172,7 @@ pub(crate) fn nf_function_call(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
+    crate::bytecode::reflect::native_transparent(i);
     let this_arg = arg(args, 0);
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
     ab(i.call(this, this_arg, rest))

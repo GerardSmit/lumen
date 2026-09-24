@@ -137,6 +137,13 @@ pub enum FnSource {
         start: u32,
         end: u32,
     },
+    /// A range into an ahead-of-time blob's kept function text, which stays compressed in the
+    /// binary until the first `toString` that needs it (see `crate::precompiled::KeptRef`).
+    Kept {
+        text: Rc<crate::precompiled::KeptRef>,
+        start: u32,
+        end: u32,
+    },
 }
 
 impl std::fmt::Debug for FnSource {
@@ -144,7 +151,7 @@ impl std::fmt::Debug for FnSource {
         match self {
             FnSource::None => f.write_str("None"),
             FnSource::Text(t) => f.debug_tuple("Text").field(t).finish(),
-            FnSource::Range { start, end, .. } => f
+            FnSource::Range { start, end, .. } | FnSource::Kept { start, end, .. } => f
                 .debug_struct("Range")
                 .field("start", start)
                 .field("end", end)
@@ -158,7 +165,7 @@ impl FnSource {
         match self {
             FnSource::None => None,
             FnSource::Text(s) => Some(s.clone()),
-            FnSource::Range { .. } => self.as_str().map(Rc::from),
+            FnSource::Range { .. } | FnSource::Kept { .. } => self.as_str().map(Rc::from),
         }
     }
     pub fn as_str(&self) -> Option<&str> {
@@ -166,6 +173,7 @@ impl FnSource {
             FnSource::None => None,
             FnSource::Text(s) => Some(s),
             FnSource::Range { src, start, end } => src.get(*start as usize..*end as usize),
+            FnSource::Kept { text, start, end } => text.slice(*start, *end),
         }
     }
     pub fn is_some(&self) -> bool {
@@ -188,6 +196,9 @@ pub struct LazyBody {
     /// The innermost class the body is written in (its private names, and its enclosing
     /// classes' through `parent`), for the body's private-name check.
     pub private_scope: Option<Rc<PrivateScope>>,
+    /// An ahead-of-time function's body: encoded statements in the blob, decoded (instead of
+    /// parsed from `src`, which is then empty) on first use — see `crate::precompiled`.
+    pub aot: Option<Rc<crate::precompiled::AotBody>>,
 }
 
 impl std::fmt::Debug for LazyBody {
@@ -391,14 +402,17 @@ pub enum Expr {
         cons: P<Expr>,
         alt: P<Expr>,
     },
+    /// `pos` is the call's source position for stack traces (see [`NO_POS`]).
     Call {
         callee: P<Expr>,
         args: Vec<ArrayElem>,
         optional: bool,
+        pos: u32,
     },
     New {
         callee: P<Expr>,
         args: Vec<ArrayElem>,
+        pos: u32,
     },
     Member {
         obj: P<Expr>,
@@ -572,6 +586,13 @@ pub enum HoistOp {
     AnnexB(String, Rc<Function>),
 }
 
+/// A call/`new` without a source position ([`Expr::Call`]/[`Expr::New`] `pos`; synthesized
+/// code). A position is otherwise a byte offset into the text the enclosing function (or
+/// script, module, eval) was parsed from — V8's convention: an identifier or property-name
+/// callee's first character (`f()`, `o.m()`), else the `(` (`o[k]()`, `(0, f)()`); `new` for
+/// `new C()`. Stack traces map it to a line and column lazily.
+pub const NO_POS: u32 = u32::MAX;
+
 pub const SCAN_DONE: u8 = 1;
 pub const SCAN_ARGUMENTS: u8 = 2;
 pub const SCAN_NEW_TARGET: u8 = 4;
@@ -581,6 +602,11 @@ pub const SCAN_THIS: u8 = 8;
 /// (a benchmark driver's `while (elapsed < 1000)`), so waiting for a call-count threshold leaves
 /// the hottest code on the tree-walker.
 pub const SCAN_HAS_LOOP: u8 = 16;
+/// `scan` bits owned by [`Function::may_use_home`] (independent of `SCAN_DONE`: a rescan that
+/// overwrites them only costs a recheck): bit 6 = checked, bit 7 = the method may reach its
+/// [[HomeObject]].
+pub const SCAN_HOME_CHECKED: u8 = 64;
+pub const SCAN_NEEDS_HOME: u8 = 128;
 
 impl Function {
     /// The body statements, parsed (or re-parsed after a release) on demand. Empty for a lazy
@@ -603,6 +629,13 @@ impl Function {
         self.body.borrow().clone()
     }
 
+    /// The body is not decoded yet and comes from an ahead-of-time blob (already validated at
+    /// build time, so decoding it can wait until something needs the statements).
+    pub fn body_is_aot_deferred(&self) -> bool {
+        self.body.borrow().is_none()
+            && self.lazy.borrow().as_ref().is_some_and(|l| l.aot.is_some())
+    }
+
     /// Parse a skipped body. A failed parse is remembered and returned again on every later
     /// call, as the SyntaxError the first call throws.
     pub fn ensure_body(&self) -> Result<(), crate::parser::ParseError> {
@@ -617,7 +650,17 @@ impl Function {
             *self.body.borrow_mut() = Some(Rc::new(Vec::new()));
             return Ok(());
         };
-        match crate::parser::parse_lazy_body(lazy, self) {
+        let parsed = match &lazy.aot {
+            Some(aot) => crate::precompiled::decode_body(aot).map_err(|message| {
+                crate::parser::ParseError {
+                    message,
+                    line: 0,
+                    at_eof: false,
+                }
+            }),
+            None => crate::parser::parse_lazy_body(lazy, self),
+        };
+        match parsed {
             Ok(stmts) => {
                 *self.body.borrow_mut() = Some(Rc::new(stmts));
                 Ok(())
@@ -648,7 +691,10 @@ impl Function {
         if self.lazy.borrow().is_none() || self.body.take().is_none() {
             return false;
         }
-        self.scan.set(0);
+        // The home-object bits are decided from the source text, which a release does not
+        // change (and re-deciding them reads it: for a precompiled function, decompressing kept
+        // text). The body facts are recomputed from the re-materialised body.
+        self.scan.set(self.scan.get() & (SCAN_HOME_CHECKED | SCAN_NEEDS_HOME));
         self.hoist.take();
         true
     }
@@ -661,6 +707,27 @@ impl Function {
     /// possible direct `eval`) can observe `arguments`, `new.target`, or `this`. Ordinary nested
     /// functions are opaque (they get their own); arrows are transparent. Conservative on the
     /// safe side: a false positive only costs an unused binding.
+    /// Whether this method's code can observe its [[HomeObject]] — only `super.x` (in the
+    /// params, the body or a nested arrow) and a possible direct `eval` can. Decided from the
+    /// source text, conservatively: any `super` / `eval` substring or any backslash (an escaped
+    /// identifier can spell `eval`) says yes, and so does a missing source. A method that can't
+    /// needs no per-closure home scope — which would otherwise form a literal <-> method cycle
+    /// only the collector can free.
+    pub fn may_use_home(&self) -> bool {
+        let s = self.scan.get();
+        if s & SCAN_HOME_CHECKED != 0 {
+            return s & SCAN_NEEDS_HOME != 0;
+        }
+        let needs = match self.source.as_str() {
+            None => true,
+            Some(t) => t.contains("super") || t.contains("eval") || t.contains('\\'),
+        };
+        self.scan.set(
+            self.scan.get() | SCAN_HOME_CHECKED | if needs { SCAN_NEEDS_HOME } else { 0 },
+        );
+        needs
+    }
+
     pub fn scan_flags(&self) -> u8 {
         let cached = self.scan.get();
         if cached & SCAN_DONE != 0 {
@@ -679,6 +746,7 @@ impl Function {
             flags |= SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS;
         }
         scan_stmts(&self.body(), &mut flags);
+        flags |= cached & (SCAN_HOME_CHECKED | SCAN_NEEDS_HOME);
         self.scan.set(flags);
         flags
     }
@@ -887,14 +955,14 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
             scan_expr(cons, flags);
             scan_expr(alt, flags);
         }
-        Expr::Call {
-            callee,
-            args,
-            optional: _,
-        } => {
+        Expr::Call { callee, args, .. } => {
             // A direct `eval` can name any of the three dynamically.
             if matches!(&**callee, Expr::Ident(n) if n == "eval") {
                 *flags |= SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS;
+            }
+            // `arr.map(x => …)` compiles to a loop (see `bytecode::inline_callback`).
+            if crate::bytecode::inline_callback::is_loop_call(callee, args) {
+                *flags |= SCAN_HAS_LOOP;
             }
             scan_expr(callee, flags);
             for a in args {
@@ -904,7 +972,7 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
                 }
             }
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, .. } => {
             scan_expr(callee, flags);
             for a in args {
                 match a {

@@ -762,30 +762,85 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     });
     apply_cwd(ctx, &mut command, cwd);
     apply_env(ctx, &mut command, &env_pairs)?;
+    // `timeout` (ms): past it the child is killed and the result says so (Node's ETIMEDOUT).
+    let timeout = args
+        .get(6)
+        .and_then(Value::as_num_opt)
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .map(|t| std::time::Duration::from_secs_f64(t / 1000.0));
     let mut child =
         lumen_host::spawn_command(ctx, &mut command).map_err(|e| spawn_failure(ctx, &cmd, &e))?;
-    if let Some(input) = input {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&input); // dropping stdin here signals EOF
+    // Feed stdin from its own thread (dropping it signals EOF): a child that fills its stdout
+    // pipe before draining stdin would otherwise deadlock against this write.
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
+    let pipes: [(u8, Option<Box<dyn Read + Send>>); 2] = [
+        (1, child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
+        (2, child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
+    ];
+    for (which, pipe) in pipes {
+        if let Some(mut pipe) = pipe {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                let _ = tx.send((which, buf));
+            });
         }
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| ctx.make_error("Error", format!("exec {cmd}: {e}")))?;
+    drop(tx);
+    let wait_error = |ctx: &mut Ctx, e: std::io::Error| ctx.make_error("Error", format!("exec {cmd}: {e}"));
+    let mut timed_out = false;
+    let status = match timeout {
+        None => child.wait().map_err(|e| wait_error(ctx, e))?,
+        Some(limit) => {
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().map_err(|e| wait_error(ctx, e))? {
+                    break status;
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= limit {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child.wait().map_err(|e| wait_error(ctx, e))?;
+                }
+                std::thread::sleep((limit - elapsed).min(std::time::Duration::from_millis(5)));
+            }
+        }
+    };
+    // After a timeout, a grandchild may still hold the pipes: take what arrived, don't wait.
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    loop {
+        let got = if timed_out {
+            rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
+        } else {
+            rx.recv().ok()
+        };
+        match got {
+            Some((1, bytes)) => stdout = bytes,
+            Some((_, bytes)) => stderr = bytes,
+            None => break,
+        }
+    }
 
     let o = Value::Obj(ctx.new_object());
-    let stdout = ctx.make_uint8array(&output.stdout)?;
-    let stderr = ctx.make_uint8array(&output.stderr)?;
+    let stdout = ctx.make_uint8array(&stdout)?;
+    let stderr = ctx.make_uint8array(&stderr)?;
     let _ = ctx.set_member(&o, "stdout", stdout);
     let _ = ctx.set_member(&o, "stderr", stderr);
     let _ = ctx.set_member(
         &o,
         "status",
-        output
-            .status
-            .code()
-            .map(|c| Value::Num(c as f64))
-            .unwrap_or(Value::Null),
+        match status.code() {
+            Some(c) if !timed_out => Value::Num(c as f64),
+            _ => Value::Null,
+        },
     );
+    let _ = ctx.set_member(&o, "timedOut", Value::Bool(timed_out));
     Ok(o)
 }

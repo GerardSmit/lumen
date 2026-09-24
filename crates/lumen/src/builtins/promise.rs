@@ -12,17 +12,32 @@ pub(super) fn install_promise(it: &mut Interp) {
         );
     }
     it.def_method(&proto, "then", 2, |i, this, a| {
-        if map_ptr(&this).map(|p| i.promises.contains_key(&p)) != Some(true) {
+        if !crate::eval::promise_fast::is_promise(&this) {
             return Err(i.make_error(
                 "TypeError",
                 "Promise.prototype.then called on a non-Promise",
             ));
         }
+        // SpeciesConstructor(this, %Promise%) on an unmodified promise is %Promise% with no
+        // observable step: the result is just a fresh promise.
+        if promise_then_is_silent(i, &this) {
+            let result = i.new_promise();
+            i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
+            return Ok(result);
+        }
         // The result promise is built by SpeciesConstructor(this, %Promise%) via NewPromiseCapability.
         let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "Promise"))?;
         let c = species_constructor(i, &this, &default_ctor)?;
+        // NewPromiseCapability(%Promise%) is unobservable (its executor and resolving functions
+        // never escape, and %Promise%.prototype is a non-writable, non-configurable data
+        // property): the result is just a fresh promise.
+        if is_intrinsic_promise_ctor(i, &c) {
+            let result = i.new_promise();
+            i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
+            return Ok(result);
+        }
         let (result, res_f, rej_f) = new_promise_capability_full(i, &c)?;
-        if map_ptr(&result).map(|p| i.promises.contains_key(&p)) == Some(true) {
+        if crate::eval::promise_fast::is_promise(&result) {
             i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
         } else {
             // The constructor produced a promise we don't manage: settle it through the
@@ -69,8 +84,11 @@ pub(super) fn install_promise(it: &mut Interp) {
             return Err(i.make_error("TypeError", "Promise resolver is not a function"));
         }
         let promise = i.new_promise();
-        // OrdinaryCreateFromConstructor: newTarget's prototype (its getter may throw).
-        if let (Value::Obj(p), nt @ Value::Obj(_)) = (&promise, &i.new_target.clone()) {
+        // OrdinaryCreateFromConstructor: newTarget's prototype (its getter may throw). For
+        // %Promise% itself that is its non-writable, non-configurable `prototype`: the realm's
+        // %Promise.prototype%, which `new_promise` already used.
+        let nt_is_ctor = is_intrinsic_promise_ctor(i, &i.new_target);
+        if let (Value::Obj(p), nt @ Value::Obj(_), false) = (&promise, &i.new_target.clone(), nt_is_ctor) {
             match ab(i.get_member(nt, "prototype"))? {
                 Value::Obj(proto) => p.borrow_mut().proto = Some(proto),
                 _ => {
@@ -91,6 +109,10 @@ pub(super) fn install_promise(it: &mut Interp) {
         "prototype",
         Property::data(Value::Obj(proto.clone()), false, false, false),
     );
+    it.extra_protos.insert("%PromiseCtor%", ctor.clone());
+    if let Some(Value::Obj(then)) = proto.borrow().props.get("then").map(|p| p.value()) {
+        it.extra_protos.insert("%Promise.prototype.then%", then);
+    }
     proto
         .borrow_mut()
         .props
@@ -118,12 +140,21 @@ pub(super) fn install_promise(it: &mut Interp) {
         if !matches!(t, Value::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.reject called on a non-object"));
         }
+        // NewPromiseCapability(%Promise%) is unobservable: reject a fresh promise directly.
+        if is_intrinsic_promise_ctor(i, &t) {
+            let p = i.new_promise();
+            i.reject_promise(&p, arg(a, 0));
+            return Ok(p);
+        }
         // NewPromiseCapability(C): rejection goes through the capability's own reject.
         let (promise, _resolve_fn, reject_fn) = new_promise_capability_full(i, &t)?;
         ab(i.call(reject_fn, Value::Undefined, &[arg(a, 0)]))?;
         Ok(promise)
     });
     it.def_method(&ctor, "all", 1, |i, t, a| {
+        if combinator_gate(i, &t)? {
+            return combinator_fast(i, &t, arg(a, 0), crate::eval::promise_fast::REACT_ALL);
+        }
         // NewPromiseCapability(C): resolve/reject route through C's own capability so a subclass or
         // foreign Promise constructor works, not just the native machinery.
         let (result, resolve_fn, reject_fn) = match new_promise_capability_full(i, &t) {
@@ -229,6 +260,9 @@ pub(super) fn install_promise(it: &mut Interp) {
         Ok(result)
     });
     it.def_method(&ctor, "race", 1, |i, t, a| {
+        if combinator_gate(i, &t)? {
+            return combinator_fast(i, &t, arg(a, 0), crate::eval::promise_fast::REACT_RACE);
+        }
         // Race settles the result promise with the first element to settle, through C's capability.
         let (result, resolve_fn, reject_fn) = match new_promise_capability_full(i, &t) {
             Ok(c) => c,
@@ -299,6 +333,9 @@ pub(super) fn install_promise(it: &mut Interp) {
         Ok(result)
     });
     it.def_method(&ctor, "allSettled", 1, |i, t, a| {
+        if combinator_gate(i, &t)? {
+            return combinator_fast(i, &t, arg(a, 0), crate::eval::promise_fast::REACT_ALL_SETTLED);
+        }
         let (result, resolve_fn, reject_fn) = match new_promise_capability_full(i, &t) {
             Ok(c) => c,
             Err(e) => return Err(e),
@@ -407,6 +444,9 @@ pub(super) fn install_promise(it: &mut Interp) {
         Ok(result)
     });
     it.def_method(&ctor, "any", 1, |i, t, a| {
+        if combinator_gate(i, &t)? {
+            return combinator_fast(i, &t, arg(a, 0), crate::eval::promise_fast::REACT_ANY);
+        }
         let (result, resolve_fn, reject_fn) = match new_promise_capability_full(i, &t) {
             Ok(c) => c,
             Err(e) => return Err(e),
@@ -529,6 +569,9 @@ pub(super) fn install_promise(it: &mut Interp) {
             }
         }
     });
+    if let Some(Value::Obj(resolve)) = ctor.borrow().props.get("resolve").map(|p| p.value()) {
+        it.extra_protos.insert("%Promise.resolve%", resolve);
+    }
     install_species(it, &ctor);
     set_builtin(&it.global, "Promise", Value::Obj(ctor));
 }
@@ -537,14 +580,276 @@ pub(super) fn install_promise(it: &mut Interp) {
 /// else resolves a fresh NewPromiseCapability(C) through the capability's own resolve.
 fn promise_resolve(i: &mut Interp, ctor: &Value, v: Value) -> Result<Value, Value> {
     if let Value::Obj(o) = &v {
-        if i.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
+        if crate::eval::promise_fast::is_promise_obj(o) {
+            // `constructor` inherited as a data property from an untouched %Promise.prototype%:
+            // the read runs no user code.
+            if let Some(intr) = i.promise_intr() {
+                if is_plain_native_promise(o, &intr) {
+                    if let Some(c) = proto_data(&intr.proto, "constructor") {
+                        if same_value(&c, ctor) {
+                            return Ok(v);
+                        }
+                    }
+                }
+            }
             let c = ab(i.get_member(&v, "constructor"))?;
             if same_value(&c, ctor) {
                 return Ok(v);
             }
         }
     }
+    // NewPromiseCapability(%Promise%) is unobservable (see `then`): resolve a fresh promise
+    // directly instead of through an executor and a resolving-function pair.
+    if is_intrinsic_promise_ctor(i, ctor) {
+        let p = i.new_promise();
+        i.resolve_promise(&p, v);
+        return Ok(p);
+    }
     let (promise, resolve_fn, _reject_fn) = new_promise_capability_full(i, ctor)?;
     ab(i.call(resolve_fn, Value::Undefined, &[v]))?;
     Ok(promise)
+}
+
+/// A data property's value on `o` (`None` when absent or an accessor).
+fn proto_data(o: &Gc, key: &str) -> Option<Value> {
+    match o.borrow().props.get(key) {
+        Some(p) if !p.accessor() => Some(p.value()),
+        _ => None,
+    }
+}
+
+/// Whether native promise `o` inherits straight from this realm's untouched-at-the-instance
+/// %Promise.prototype%: its prototype is that object and it has no own `then`/`constructor`.
+fn is_plain_native_promise(o: &Gc, intr: &crate::eval::promise_fast::PromiseIntr) -> bool {
+    let b = o.borrow();
+    matches!(b.call, Callable::Promise(_))
+        && matches!(&b.proto, Some(p) if Gc::ptr_eq(p, &intr.proto))
+        && !b.props.contains("then")
+        && !b.props.contains("constructor")
+}
+
+/// Whether %Promise%[@@species] is still the original getter (so SpeciesConstructor of a
+/// promise whose `constructor` is %Promise% is %Promise% with no user code).
+fn species_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr) -> bool {
+    let Some(key) = well_known_key(i, "species") else { return false };
+    let getter = match intr.ctor.borrow().props.get(&key) {
+        Some(p) if p.accessor() => p.getter().cloned(),
+        _ => None,
+    };
+    matches!(getter, Some(Value::Obj(g))
+        if matches!(g.borrow().call, Callable::Native(f) if f as usize == nf_species_getter as NativeFn as usize))
+}
+
+/// Whether %Promise.prototype% still has the original `then` and `constructor` as data
+/// properties and %Promise% the original species getter: `Invoke(p, "then", ...)` on a plain
+/// native promise `p` then runs exactly PerformPromiseThen with an unobservable derived promise.
+fn proto_then_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr) -> bool {
+    let (then_ok, ctor_ok) = {
+        let pb = intr.proto.borrow();
+        let then_ok = matches!(pb.props.get("then"),
+            Some(p) if !p.accessor() && matches!(p.value(), Value::Obj(f) if Gc::ptr_eq(&f, &intr.then)));
+        let ctor_ok = matches!(pb.props.get("constructor"),
+            Some(p) if !p.accessor() && matches!(p.value(), Value::Obj(c) if Gc::ptr_eq(&c, &intr.ctor)));
+        (then_ok, ctor_ok)
+    };
+    then_ok && ctor_ok && species_is_pristine(i, intr)
+}
+
+/// Whether SpeciesConstructor(`this`, %Promise%) is %Promise% without any observable step:
+/// `this` inherits `constructor` straight from an untouched %Promise.prototype% (a data
+/// property holding %Promise%), whose `@@species` is still the original getter.
+pub(crate) fn promise_then_is_silent(i: &Interp, this: &Value) -> bool {
+    let Value::Obj(o) = this else { return false };
+    let Some(intr) = i.promise_intr() else { return false };
+    {
+        let b = o.borrow();
+        if !matches!(&b.proto, Some(p) if Gc::ptr_eq(p, &intr.proto))
+            || b.props.contains("constructor")
+        {
+            return false;
+        }
+    }
+    let ctor_ok = matches!(proto_data(&intr.proto, "constructor"),
+        Some(Value::Obj(c)) if Gc::ptr_eq(&c, &intr.ctor));
+    ctor_ok && species_is_pristine(i, &intr)
+}
+
+/// Whether `c` is this realm's %Promise%.
+fn is_intrinsic_promise_ctor(i: &Interp, c: &Value) -> bool {
+    match (c, i.promise_intr()) {
+        (Value::Obj(c), Some(intr)) => Gc::ptr_eq(c, &intr.ctor),
+        _ => false,
+    }
+}
+
+/// `new AggregateError(errors)` (for `Promise.any`).
+pub(crate) fn make_aggregate_error_value(i: &mut Interp, errors: Value) -> Result<Value, Value> {
+    make_aggregate_error(i, errors)
+}
+
+/// `Promise.all` / `allSettled` / `any` / `race` when C is %Promise% and `C.resolve` is the
+/// original: NewPromiseCapability(%Promise%) is unobservable, so the result is a native promise
+/// carrying the combinator state (see `promise_fast::Combinator`). Each element that is a plain
+/// native promise (or a primitive) under an untouched %Promise.prototype% subscribes with a
+/// compact combinator reaction - no element function objects, no derived promise - since
+/// PromiseResolve and `Invoke(p, "then")` then run no user code and the element functions never
+/// escape. Any other element (a thenable, a patched promise) takes the full observable path
+/// with real element functions over the same state.
+fn combinator_fast(i: &mut Interp, t: &Value, iterable: Value, mode: u8) -> Result<Value, Value> {
+    use crate::eval::promise_fast::{Combinator, Reaction, REACT_ANY, REACT_RACE};
+    let result = i.new_promise();
+    if let Value::Obj(ro) = &result {
+        if let Callable::Promise(s) = &mut ro.borrow_mut().call {
+            s.comb = Some(Box::new(Combinator { remaining: 1, ..Default::default() }));
+        }
+    }
+    let (iter, next) = match i.get_iterator(&iterable) {
+        Ok(it) => it,
+        Err(e) => {
+            i.combinator_resolve(&result, false, crate::interpreter::abrupt_value(e));
+            return Ok(result);
+        }
+    };
+    let mut idx: u32 = 0;
+    loop {
+        let item = match i.iterator_step(&iter, &next) {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
+            Err(e) => {
+                // A throw from the iterator marks it done — no IteratorClose.
+                i.combinator_resolve(&result, false, crate::interpreter::abrupt_value(e));
+                return Ok(result);
+            }
+        };
+        if mode != REACT_RACE {
+            // Append an empty element and bump remainingElementsCount.
+            if let Value::Obj(ro) = &result {
+                if let Callable::Promise(s) = &mut ro.borrow_mut().call {
+                    if let Some(c) = s.comb.as_mut() {
+                        c.values.push(Value::Undefined);
+                        c.remaining += 1;
+                    }
+                }
+            }
+        }
+        let silent = match i.promise_intr() {
+            Some(intr) => {
+                let plain = match &item {
+                    Value::Obj(o) => is_plain_native_promise(o, &intr),
+                    _ => true,
+                };
+                plain && proto_then_is_pristine(i, &intr)
+            }
+            None => false,
+        };
+        if silent {
+            let reaction = Reaction {
+                on_f: Value::Undefined,
+                on_r: Value::Undefined,
+                result: result.clone(),
+                context: i.async_context.clone(),
+                kind: mode,
+                idx,
+            };
+            match &item {
+                Value::Obj(o) => i.perform_then(o, reaction),
+                // PromiseResolve made a fresh fulfilled promise: its reaction queues at once.
+                _ => {
+                    let job = Interp::reaction_job(reaction, true, item);
+                    i.microtasks.push_back(job);
+                }
+            }
+            idx += 1;
+            continue;
+        }
+        // The observable path: Call(C.resolve, C, «item»), then Invoke(p, "then", «on_f, on_r»).
+        if let Err(e) = combinator_slow_step(i, t, &result, mode, idx, item) {
+            i.iterator_close(&iter);
+            i.combinator_resolve(&result, false, e);
+            return Ok(result);
+        }
+        idx += 1;
+    }
+    if mode != REACT_RACE {
+        i.combinator_record(&result, mode == REACT_ANY, None);
+    }
+    Ok(result)
+}
+
+/// One element of [`combinator_fast`] through the observable path, with real element
+/// functions (the capability's resolve/reject carry no per-element [[AlreadyCalled]]).
+fn combinator_slow_step(
+    i: &mut Interp,
+    t: &Value,
+    result: &Value,
+    mode: u8,
+    idx: u32,
+    item: Value,
+) -> Result<(), Value> {
+    use crate::eval::promise_fast::{REACT_ALL, REACT_ANY, REACT_RACE};
+    let p = promise_resolve(i, t, item)?;
+    let flag = Value::Obj(Object::new_bare(None));
+    let none = Value::Undefined;
+    let elem = |i: &mut Interp, fulfil: bool, flag: &Value| {
+        make_bound(
+            i,
+            promise_comb_element,
+            vec![
+                result.clone(),
+                Value::Num(mode as f64),
+                Value::Bool(fulfil),
+                Value::Num(idx as f64),
+                flag.clone(),
+            ],
+        )
+    };
+    let (on_f, on_r) = match mode {
+        REACT_RACE => (elem(i, true, &none), elem(i, false, &none)),
+        REACT_ANY => (elem(i, true, &none), elem(i, false, &flag)),
+        REACT_ALL => (elem(i, true, &flag), elem(i, false, &none)),
+        _ => (elem(i, true, &flag), elem(i, false, &flag)),
+    };
+    let then = ab(i.get_member(&p, "then"))?;
+    ab(i.call(then, p, &[on_f, on_r]))?;
+    Ok(())
+}
+
+/// The element / capability function of the observable combinator path. Bound args:
+/// `[result, mode, fulfil, idx, alreadyCalled]` (`alreadyCalled` undefined for the capability
+/// functions, whose [[AlreadyResolved]] lives in the combinator state), then the value.
+fn promise_comb_element(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let result = arg(args, 0);
+    let mode = match arg(args, 1) {
+        Value::Num(n) => n as u8,
+        _ => return Ok(Value::Undefined),
+    };
+    let fulfil = matches!(arg(args, 2), Value::Bool(true));
+    let idx = match arg(args, 3) {
+        Value::Num(n) => n as u32,
+        _ => 0,
+    };
+    // [[AlreadyCalled]]: the private record's extensible bit.
+    if let Value::Obj(flag) = arg(args, 4) {
+        let mut b = flag.borrow_mut();
+        if !b.extensible {
+            return Ok(Value::Undefined);
+        }
+        b.extensible = false;
+    }
+    i.combinator_settle(&result, mode, fulfil, idx, arg(args, 5));
+    Ok(Value::Undefined)
+}
+
+/// The combinator fast path applies: `t` is %Promise% and `t.resolve` (read once, as
+/// GetPromiseResolve does) is the original. `Err`: the read threw; `Ok(None)`: take the
+/// general path.
+fn combinator_gate(i: &mut Interp, t: &Value) -> Result<bool, Value> {
+    if !is_intrinsic_promise_ctor(i, t) {
+        return Ok(false);
+    }
+    let Some(intr) = i.promise_intr() else { return Ok(false) };
+    // A data property holding the original: reading it is unobservable, and the general path
+    // would read it again (the read happens after NewPromiseCapability there, which is
+    // unobservable for %Promise%).
+    Ok(matches!(proto_data(&intr.ctor, "resolve"), Some(Value::Obj(r)) if Gc::ptr_eq(&r, &intr.resolve)))
 }

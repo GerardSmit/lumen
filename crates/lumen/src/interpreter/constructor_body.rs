@@ -144,7 +144,7 @@ mod tests {
     fn a_hot_compiled_class_still_requires_new() {
         run(
             r#"
-            class Base {constructor(value){this.value=value;}}
+            class Base {constructor(value){this.value=+value;}}
             globalThis.CompiledBase=Base;
             for(let n=0;n<200;n++)assert(new Base(n).value===n);
             const bound=Base.bind(null,17);

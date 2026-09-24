@@ -58,7 +58,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
             .map_err(|e| i.make_error("SyntaxError", e.message))?;
         // A script runs with full GlobalDeclarationInstantiation (clash checks, global-object
         // own properties for var/function declarations).
-        i.run_program(&body)
+        i.run_program_parsed(&body)
     });
     it.def_method(&host, "detachArrayBuffer", 1, |i, _t, args| {
         if let Value::Obj(o) = arg(args, 0) {

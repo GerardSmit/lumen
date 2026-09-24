@@ -12,22 +12,51 @@ impl Compiler {
         right: &Expr,
         body: &Stmt,
     ) -> CResult {
-        // Captured loop bindings require a fresh environment each iteration.
-        if self.env_names.contains_key(name) && !self.homed_lets.contains(name) {
-            return Err(Bail);
-        }
         let labels = std::mem::take(&mut self.pending_labels);
         self.scopes.push(Vec::new());
-        let result = self.for_in_scope(kind, name, right, body, labels);
+        let depth = self.blk_envs.len();
+        let result = if self.blk_names.contains(name) {
+            // Captured: a fresh block env per iteration (the first one is the TDZ env the
+            // right-hand side evaluates in).
+            self.for_in_blk(kind, name, right, body, labels)
+        } else if self.env_names.contains_key(name) && !self.homed_lets.contains(name) {
+            Err(Bail)
+        } else {
+            self.for_in_scope(kind, name, right, body, labels)
+        };
+        self.blk_envs.truncate(depth);
         self.scopes.pop();
         result
+    }
+
+    fn for_in_blk(
+        &mut self,
+        kind: DeclKind,
+        name: &str,
+        right: &Expr,
+        body: &Stmt,
+        labels: Vec<String>,
+    ) -> CResult {
+        let names = vec![(name.to_string(), kind == DeclKind::Const)];
+        let (slot, parent) = self.blk_open(&names)?;
+        self.expr(right)?;
+        let n = self.name_idx(name);
+        let store = vec![
+            Op::BlkNew(slot, parent),
+            Op::BlkDecl(slot, n, kind == DeclKind::Const),
+            Op::BlkInit(slot, n),
+        ];
+        self.for_in_loop(&store, body, labels)
     }
 
     /// `for (var x in o)` / `for (x in o)`: each key is written to the existing binding
     /// (hoisted var, outer local, captured name or global), as PutValue does.
     pub(super) fn for_in_assign(&mut self, name: &str, right: &Expr, body: &Stmt) -> CResult {
         let store = match self.home(name) {
-            Some(Home::Slot(_, true)) | Some(Home::Env(true)) => return Err(Bail),
+            Some(Home::Slot(_, true)) | Some(Home::Env(true)) | Some(Home::Blk(_, true)) => {
+                return Err(Bail)
+            }
+            Some(Home::Blk(c, false)) => Op::BlkStore(c, self.name_idx(name)),
             Some(Home::Slot(slot, false)) if !self.tdz_pending.contains(&slot) => {
                 Op::StoreLocal(slot)
             }
@@ -41,7 +70,7 @@ impl Compiler {
         };
         let labels = std::mem::take(&mut self.pending_labels);
         self.expr(right)?;
-        self.for_in_loop(store, body, labels)
+        self.for_in_loop(&[store], body, labels)
     }
 
     fn for_in_scope(
@@ -57,11 +86,11 @@ impl Compiler {
         self.tdz_slots.insert(binding);
         self.emit(Op::Tdz(binding)); // Head binding shadows outer names while RHS evaluates.
         self.expr(right)?;
-        self.for_in_loop(Op::StoreLocal(binding), body, labels)
+        self.for_in_loop(&[Op::StoreLocal(binding)], body, labels)
     }
 
     /// The enumeration loop over the object on the stack; `store` binds each key.
-    fn for_in_loop(&mut self, store: Op, body: &Stmt, labels: Vec<String>) -> CResult {
+    fn for_in_loop(&mut self, store: &[Op], body: &Stmt, labels: Vec<String>) -> CResult {
         let base = self.fresh_slot("%for-in-base%");
         let keys = self.fresh_slot("%for-in-keys%");
         let cursor = self.fresh_slot("%for-in-cursor%");
@@ -75,9 +104,11 @@ impl Compiler {
         let head = self.ops.len();
         self.emit(Op::ForInStepL(base, keys, cursor));
         let exit = self.emit(Op::JumpIfFalse(0));
-        self.emit(store);
-        if let Op::StoreLocal(s) = store {
-            self.tdz_pending.remove(&s); // a lexical head is initialized from here on
+        for &op in store {
+            self.emit(op);
+            if let Op::StoreLocal(s) = op {
+                self.tdz_pending.remove(&s); // a lexical head is initialized from here on
+            }
         }
         self.loops.push(LoopCtx {
             labels,

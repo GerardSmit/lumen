@@ -71,6 +71,14 @@ impl Props {
         if self.has_far.get() || !self.elem_mode.get() || n as usize != self.elems.len() {
             return Err(prop);
         }
+        if n == 0 && self.elementless() {
+            // The first element of an elementless array: start packed storage (one growable
+            // buffer; no per-index slot map or mirror bookkeeping on every later append).
+            self.note_structural();
+            self.install_empty_packed();
+            self.elems.packed_mut().unwrap().push(prop);
+            return Ok(());
+        }
         self.note_structural();
         let slot = self.entries.len();
         self.reserve_entry();
@@ -117,6 +125,43 @@ impl Props {
             self.mirror_grow(pads, slot);
         }
         Ok(())
+    }
+
+    /// Copy the run of own plain data elements `start..end` (stopping at the first hole,
+    /// accessor or index outside the dense storage) onto `out`, returning how many were copied.
+    /// A caller that proved element reads unobservable replaces that many per-index
+    /// HasProperty+Get steps with one pass (packed storage is one slice walk).
+    pub(crate) fn copy_dense_run(&self, start: u32, end: u32, out: &mut Vec<Value>) -> u32 {
+        if start >= end {
+            return 0;
+        }
+        if let Some(packed) = self.elems.packed_ref() {
+            let hi = (end as usize).min(packed.len());
+            let Some(run) = packed.get(start as usize..hi) else {
+                return 0;
+            };
+            out.reserve(run.len());
+            let before = out.len();
+            for p in run {
+                if p.accessor() {
+                    break;
+                }
+                match p.value() {
+                    Value::Empty => break,
+                    v => out.push(v),
+                }
+            }
+            return (out.len() - before) as u32;
+        }
+        let mut k = start;
+        while k < end {
+            match self.get_index(k) {
+                Some(p) if !p.accessor() => out.push(p.value()),
+                _ => break,
+            }
+            k += 1;
+        }
+        k - start
     }
 
     pub(crate) fn append_element(&mut self, n: u32, prop: Property) -> bool {

@@ -2,6 +2,12 @@
 //! `lumen-web/build.rs` for the rationale — parsing the static glue on every boot is the
 //! dominant cold-start cost). Assembles the same IIFE `lib.rs` used to `concat!` and writes the
 //! source + snapshot to `OUT_DIR`, the single source of truth.
+//!
+//! The snapshot is an ahead-of-time blob (`lumen::precompiled::precompile_glue`): the glue's
+//! AST, its bytecode, and its function text compressed (for `Function.prototype.toString`, which
+//! shows a builtin's source as Node's JS builtins do) — no plain glue text in the binary.
+//!
+//! Files of optional builtins are left out when their cargo feature is off (see [`GATED`]).
 
 use std::path::PathBuf;
 
@@ -75,6 +81,10 @@ const JS_FILES: &[GlueFile] = &[
         wrap: true,
     },
     GlueFile {
+        name: "url.js",
+        wrap: true,
+    },
+    GlueFile {
         name: "assert.js",
         wrap: true,
     },
@@ -82,6 +92,7 @@ const JS_FILES: &[GlueFile] = &[
         name: "stream.js",
         wrap: true,
     },
+    // net.js is Node's net/http/https stack (generated; see its header).
     GlueFile {
         name: "net.js",
         wrap: true,
@@ -89,10 +100,6 @@ const JS_FILES: &[GlueFile] = &[
     // fs.js runs Node's fs sources over `stream`/`events`/`url`/`os`, so it loads after them.
     GlueFile {
         name: "fs.js",
-        wrap: true,
-    },
-    GlueFile {
-        name: "http.js",
         wrap: true,
     },
     GlueFile {
@@ -204,6 +211,11 @@ const JS_FILES: &[GlueFile] = &[
         name: "typescript_strip.js",
         wrap: true,
     },
+    // The builtins' ESM export names, for module.js.
+    GlueFile {
+        name: "esm_exports.js",
+        wrap: false,
+    },
     GlueFile {
         name: "module.js",
         wrap: false,
@@ -216,16 +228,169 @@ const JS_FILES: &[GlueFile] = &[
     },
 ];
 
+/// Glue files that run on first use rather than at startup (see preamble.js `__lazyGlue`): the
+/// file becomes a closure, registered under the `__builtins`/`__internals` names it sets and the
+/// globals it defines, and runs when one of them is first looked up. A file qualifies when its
+/// top level only defines things and registers them — no patching of `process`, prototypes or
+/// globals other than the ones it defines. Each lazy file costs nothing (not even its decoded
+/// AST) until a program touches it, which is most of the node glue for most programs.
+const LAZY: &[&str] = &[
+    "trace_events.js",
+    "util.js",
+    "crypto.js",
+    "punycode.js",
+    "shims.js",
+    "url.js",
+    "assert.js",
+    "stream.js",
+    "net.js",
+    "fs.js",
+    "http2_huffman.js",
+    "http2_codec.js",
+    "http2.js",
+    "child_process.js",
+    "dns.js",
+    "tty.js",
+    "tls.js",
+    "worker_threads.js",
+    "vm.js",
+    "repl.js",
+    "cluster.js",
+    "dgram.js",
+    "wasi.js",
+    "constants.js",
+    "bun_ffi.js",
+    "bun_jsc.js",
+    "bun_sqlite.js",
+    "bun_postgres.js",
+    "bun_mysql.js",
+    "bun_sql.js",
+    "bun_redis.js",
+    "bun_cookies.js",
+    "bun_router.js",
+    "bun_s3.js",
+    "bun.js",
+];
+
+/// The names a lazy glue file registers, as `__lazyGlue` takes them: the `__builtins` names, the
+/// `__internals` names, and the globals it defines at (near) top level — space-separated.
+fn lazy_names(file: &str, body: &str) -> [String; 3] {
+    let literal_args = |call: &str| -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find(call) {
+            rest = &rest[at + call.len()..];
+            let arg = rest.trim_start();
+            let Some(arg) = arg.strip_prefix('"') else {
+                panic!("{file}: {call}…) needs a string-literal name to load lazily (see LAZY)");
+            };
+            let name = &arg[..arg.find('"').expect("unterminated name")];
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+        names
+    };
+    let builtins = literal_args("__builtins.set(");
+    let internals = literal_args("__internals.set(");
+    let mut globals: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let line = line.trim_start();
+        if indent > 2 {
+            continue;
+        }
+        let name = if let Some(rest) = line.strip_prefix("Object.defineProperty(globalThis, \"") {
+            rest.split('"').next()
+        } else if let Some(rest) = line.strip_prefix("globalThis.") {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(rest.len());
+            rest[end..].trim_start().strip_prefix('=').filter(|r| !r.starts_with('=')).map(|_| &rest[..end])
+        } else {
+            None
+        };
+        if let Some(name) = name {
+            if !globals.iter().any(|g| g == name) {
+                globals.push(name.to_string());
+            }
+        }
+    }
+    assert!(
+        !builtins.is_empty() || !internals.is_empty() || !globals.is_empty(),
+        "{file}: a lazy glue file must register something (see LAZY)"
+    );
+    [builtins.join(" "), internals.join(" "), globals.join(" ")]
+}
+
+/// Glue files that belong to an optional cargo feature (`CARGO_FEATURE_<NAME>`), left out of
+/// the glue when it is off.
+const GATED: &[(&str, &str)] = &[
+    ("http2_huffman.js", "HTTP2"),
+    ("http2_codec.js", "HTTP2"),
+    ("http2.js", "HTTP2"),
+    ("cluster.js", "CLUSTER"),
+    ("dgram.js", "DGRAM"),
+    ("wasi.js", "WASI"),
+    ("bun_ffi.js", "BUN"),
+    ("bun_jsc.js", "BUN"),
+    ("bun_sqlite.js", "BUN"),
+    ("bun_postgres.js", "BUN"),
+    ("bun_mysql.js", "BUN"),
+    ("bun_sql.js", "BUN"),
+    ("bun_redis.js", "BUN"),
+    ("bun_cookies.js", "BUN"),
+    ("bun_router.js", "BUN"),
+    ("bun_s3.js", "BUN"),
+    ("bun.js", "BUN"),
+];
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let src_dir = manifest.join("src/js");
 
     let mut glue = String::from("(() => {\n");
-    for file in JS_FILES {
+    for (index, file) in JS_FILES.iter().enumerate() {
+        let gate = GATED.iter().find(|(name, _)| *name == file.name);
+        if gate.is_some_and(|(_, f)| std::env::var_os(format!("CARGO_FEATURE_{f}")).is_none()) {
+            continue;
+        }
         let path = src_dir.join(file.name);
         println!("cargo:rerun-if-changed={}", path.display());
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // Node's lib modules (`defineModule(name, function (module, exports, …) {…})`) each run
+        // once too: mark them like the lazy files' bodies.
+        let body = body.replace(
+            "function (module, exports, require, internalBinding, primordials) {",
+            "function (module, exports, require, internalBinding, primordials) {\"lumen:run-once\";",
+        );
+        // A memory checkpoint after each file, for LUMEN_MEM_STATS (see lumen-host).
+        let mark = if std::env::var_os("LUMEN_GLUE_MEM_MARKS").is_some() {
+            format!(
+                "\nif (typeof __lumenMemMark === \"function\") __lumenMemMark({:?});\n",
+                file.name
+            )
+        } else {
+            String::new()
+        };
+        if LAZY.contains(&file.name) {
+            assert!(file.wrap, "{}: a lazy glue file must be wrapped", file.name);
+            let [builtins, internals, globals] = lazy_names(file.name, &body);
+            // The `"lumen:run-once"` directive (lumen's `serialize::RUN_ONCE`): the body runs
+            // once, on the tree-walker, and the collector can release it afterwards.
+            glue.push_str(&format!(
+                "__lazyGlue({index}, {builtins:?}, {internals:?}, {globals:?}, () => {{\n\"lumen:run-once\";\n"
+            ));
+            glue.push_str(&body);
+            glue.push_str(&mark);
+            glue.push_str("\n});\n");
+            continue;
+        }
+        if index > 0 {
+            // preamble.js (index 0) declares it.
+            glue.push_str(&format!("__glueIndex = {index};\n"));
+        }
         if file.wrap {
             glue.push_str("{\n");
             glue.push_str(&body);
@@ -233,20 +398,22 @@ fn main() {
         } else {
             glue.push_str(&body);
         }
+        glue.push_str(&mark);
     }
-    glue.push_str("\n})();");
+    // Registrations made after startup (by code the glue runs later) win over any lazy file's.
+    glue.push_str("\n__glueIndex = 1e9;\n})();");
 
-    // The snapshot's functions are byte ranges into `glue`, resolved at boot against the
-    // `include_str!` of node_glue.js — so the text written there must be exactly this string.
-    let snapshot = lumen::compile_snapshot(&glue)
-        .unwrap_or_else(|e| panic!("node glue failed to parse for snapshotting: {e}"));
+    let blob = lumen::precompiled::precompile_glue(&glue, "node-glue")
+        .unwrap_or_else(|e| panic!("node glue failed to precompile: {e}"));
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    // node_glue.js is for reference only (not linked).
     std::fs::write(out.join("node_glue.js"), &glue).unwrap();
-    std::fs::write(out.join("node_glue.snap"), &snapshot).unwrap();
+    std::fs::write(out.join("node_glue.aot"), &blob).unwrap();
 
     std::fs::write(out.join("ffi_trampolines.rs"), generate_ffi_trampolines()).unwrap();
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=LUMEN_GLUE_MEM_MARKS");
 }
 
 /// Maximum FFI argument count and the JSCallback thunk-pool size per arity. Kept in sync with the
@@ -284,14 +451,22 @@ fn generate_ffi_trampolines() -> String {
     let mut s = String::new();
     s.push_str("// @generated by build.rs — bun:ffi trampoline dispatch. Do not edit.\n\n");
 
+    // Win64 assigns argument registers by *position* (arg i -> RCX/RDX/R8/R9 or XMM0-3), so the
+    // class-independent reordering described above is wrong there: it gets a positional table.
+    let win64 = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64");
     for (fname, rt) in [
         ("call_int", "u64"),
         ("call_f32", "f32"),
         ("call_f64", "f64"),
     ] {
+        if win64 {
+            emit_win64_trampoline(&mut s, fname, rt);
+            continue;
+        }
         s.push_str(&format!(
             "/// Trampoline into a native function returning the `{rt}` register class.\n\
-             pub unsafe fn {fname}(f: *const core::ffi::c_void, ints: &[u64], floats: &[FArg]) -> {rt} {{\n\
+             pub unsafe fn {fname}(f: *const core::ffi::c_void, ints: &[u64], floats: &[FArg], _fpos: u32) -> {rt} {{\n\
              \x20   match (ints.len(), floats.len(), fmask(floats)) {{\n"
         ));
         for i in 0..=MAX_ARGS {
@@ -357,4 +532,47 @@ fn generate_ffi_trampolines() -> String {
     }
     s.push_str("        _ => core::ptr::null(),\n    }\n}\n");
     s
+}
+
+/// Emit a Win64 (x86-64 Microsoft ABI) trampoline. Each of the first four argument *positions*
+/// takes a GPR (RCX/RDX/R8/R9) or an XMM register (XMM0-3) by its own class; later arguments go
+/// to 8-byte stack slots in order whatever their class. So a shape is just the arity plus a
+/// 4-bit "is float" mask over the register positions: 95 shapes instead of the ~1000 SysV ones.
+///
+/// A float in a register position is passed as an `f64` carrying the argument's own bits (an
+/// `f32` zero-extended): a `float` callee reads only the low 32 bits of the XMM register, so no
+/// separate `f32`/`f64` shapes are needed. Stack-slot floats go as `u64` with the same bits (the
+/// callee reads the low 4 or all 8 bytes of the slot). `win64_slots` (`src/ffi.rs`) rebuilds the
+/// positional bit slots from the int/float streams and the float-position mask.
+fn emit_win64_trampoline(s: &mut String, fname: &str, rt: &str) {
+    s.push_str(&format!(
+        "/// Trampoline into a native function returning the `{rt}` register class (Win64).\n\
+         pub unsafe fn {fname}(f: *const core::ffi::c_void, ints: &[u64], floats: &[FArg], fpos: u32) -> {rt} {{\n\
+         \x20   let (n, a) = win64_slots(ints, floats, fpos);\n\
+         \x20   match (n, fpos & 15) {{\n"
+    ));
+    for n in 0..=MAX_ARGS {
+        for mask in 0u32..(1u32 << n.min(4)) {
+            let mut params = Vec::new();
+            let mut argx = Vec::new();
+            for p in 0..n {
+                if p < 4 && mask & (1 << p) != 0 {
+                    params.push("f64");
+                    argx.push(format!("f64::from_bits(a[{p}])"));
+                } else {
+                    params.push("u64");
+                    argx.push(format!("a[{p}]"));
+                }
+            }
+            s.push_str(&format!(
+                "        ({n}, {mask}) => {{ let g: extern \"C\" fn({}) -> {rt} = core::mem::transmute(f); g({}) }}\n",
+                params.join(", "),
+                argx.join(", "),
+            ));
+        }
+    }
+    s.push_str(
+        "        _ => unreachable!(\"ffi signature outside the supported register budget\"),\n",
+    );
+    s.push_str("    }\n}\n\n");
 }

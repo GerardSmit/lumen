@@ -57,7 +57,7 @@ fn try_dense_opt(
         return None;
     };
     // Shape-memoized proof that GetIterator/IteratorStep over `array` are the intrinsic ones.
-    if !i.pristine_array_iteration(array) {
+    if !super::iter_fast::array_ok(i, array) {
         return None;
     }
     let b = array.try_borrow().ok()?;

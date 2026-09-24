@@ -53,6 +53,10 @@ use super::helpers::{self, FastArg, Helper, MathFn};
 mod call;
 #[path = "inline.rs"]
 mod inline;
+#[path = "inline_this.rs"]
+mod inline_this;
+#[path = "new_plan.rs"]
+pub(super) mod new_plan;
 use super::layout;
 use super::*;
 use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
@@ -84,6 +88,8 @@ pub(crate) struct Built {
     /// The address of a `Cell<usize>` in `boxes` to receive the code's own entry address
     /// (read by direct self-calls that leave through the interpreter), or 0.
     pub self_entry: usize,
+    /// Resume points `(pc, depth)` after the `await`s of function code (see [`Tr::entry`]).
+    pub resumes: Vec<(usize, usize)>,
 }
 
 /// Translate the loop `[header, backedge]` of `chunk`, specializing on the current `slots`.
@@ -103,6 +109,18 @@ pub(crate) fn build(
     for s in 0..n_slots {
         if an.touched[s] {
             kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
+        }
+    }
+    // Iterator-state slots stay Boxed: a protocol-free for-of state is a Number in the
+    // iterator slot (see `bytecode::iter_fast`), stepped in memory by the helpers.
+    for op in &chunk.ops[header..=backedge.min(chunk.ops.len() - 1)] {
+        match *op {
+            Op::IterStepL(a, b) | Op::IterRestL(a, b) => {
+                kinds[a as usize] = Kind::Boxed;
+                kinds[b as usize] = Kind::Boxed;
+            }
+            Op::IterCloseL(s) | Op::IterAbortL(s) => kinds[s as usize] = Kind::Boxed,
+            _ => {}
         }
     }
     build_region(
@@ -193,7 +211,7 @@ fn fn_kinds(chunk: &Chunk, an: &Analysis, slots: &[Value], widen: &[bool]) -> (V
             | Op::ToPropKeyLocal(s)
             | Op::IterCloseL(s)
             | Op::IterAbortL(s) => cand[s as usize] = false,
-            Op::IterStepL(a, b) => {
+            Op::IterStepL(a, b) | Op::IterRestL(a, b) => {
                 cand[a as usize] = false;
                 cand[b as usize] = false;
             }
@@ -299,6 +317,13 @@ fn build_region(
 ) -> Result<Built, String> {
     let n_slots = chunk.n_slots;
     let mut kinds = kinds;
+    if chunk.reflect_args && crate::bytecode::reflect::enabled() {
+        // A reflective `f.arguments` read (from any call the code makes) sees the parameters'
+        // current values in the slots: keep them there.
+        for k in kinds.iter_mut().take(chunk.n_params) {
+            *k = Kind::Boxed;
+        }
+    }
     let defd = Defd::new(chunk, header, backedge, &an, &fresh, None);
     let tdz_ssa: Vec<bool> = (0..n_slots)
         .map(|s| an.tdz[s] && kinds[s] != Kind::Boxed)
@@ -306,6 +331,11 @@ fn build_region(
     let tdzd = Defd::new(chunk, header, backedge, &an, &tdz_ssa, Some(func_mode));
     let mut plan = plan(interp, env, chunk, header, backedge, slots, &an, &kinds, &defd, &tdzd);
     call::plan_direct(&mut plan, interp, env, chunk, header, backedge, slots, this_val, &an, &kinds, func_mode);
+    let mut an = an;
+    let resumes_out = an.resumes.clone();
+    let tail_loops = plan.tail_loops.len() as u32;
+    an.back[0] += tail_loops;
+    an.preds[0] += tail_loops;
     let pins = std::mem::take(&mut plan.pins);
     let mut boxes = std::mem::take(&mut plan.boxes);
     let externs = plan.externs.clone();
@@ -315,6 +345,8 @@ fn build_region(
         .filter(|(_, s)| s.slot.is_some())
         .map(|(&pc, _)| pc)
         .chain(plan.dname.keys().copied())
+        .chain(plan.dmethod.keys().copied())
+        .chain(plan.strm.keys().copied())
         .collect();
     let self_cell: Box<std::cell::Cell<usize>> = Box::new(std::cell::Cell::new(0));
     let self_entry = &*self_cell as *const std::cell::Cell<usize> as usize;
@@ -405,6 +437,8 @@ fn build_region(
             self_fn: None,
             self_sizes: Vec::new(),
             self_entry,
+            budget: None,
+            call_flags: None,
         };
         tr.entry(&an);
         tr.body(&an)?;
@@ -443,6 +477,7 @@ fn build_region(
         guarded,
         boxes,
         self_entry,
+        resumes: resumes_out,
     })
 }
 
@@ -466,13 +501,21 @@ struct Analysis {
     /// Region handlers live before the op, `(catch_pc, stack_depth)` outermost first (the
     /// handlers the interpreter had at entry are not included).
     hs: Vec<Vec<(usize, usize)>>,
+    /// Function code: the op after each reachable `await` and the stack depth there — entries
+    /// of the code (leaders with one more incoming edge, from the entry block).
+    resumes: Vec<(usize, usize)>,
 }
 
 /// Whether control can continue to `pc + 1`, and the jump target.
 fn successors(op: &Op) -> (bool, Option<usize>) {
     let falls = !matches!(
         op,
-        Op::Jump(_) | Op::Return | Op::ReturnUndef | Op::Throw | Op::IterAbortL(_)
+        Op::Jump(_)
+            | Op::Return
+            | Op::ReturnUndef
+            | Op::Throw
+            | Op::IterAbortL(_)
+            | Op::DerivedReturn
     );
     // A `PushHandler`'s catch pc is no jump: its throw edge is added separately (with the
     // exception pushed and the handler popped).
@@ -639,7 +682,7 @@ pub(crate) fn op_slots(op: &Op) -> Vec<u16> {
         | Op::ToPropKeyLocal(s)
         | Op::IterCloseL(s)
         | Op::IterAbortL(s) => vec![s],
-        Op::IterStepL(a, b) | Op::JumpIfNotCmpLL(_, a, b, _) => vec![a, b],
+        Op::IterStepL(a, b) | Op::IterRestL(a, b) | Op::JumpIfNotCmpLL(_, a, b, _) => vec![a, b],
         Op::JumpIfNotCmpLK(_, a, ..) => vec![a],
         Op::ArithLL(_, d, a, b) => vec![d, a, b],
         Op::ArithLK(_, d, a, _) => vec![d, a],
@@ -667,9 +710,6 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
     while let Some(pc) = work.pop() {
         let op = &ops[pc];
         match op {
-            Op::Await => {
-                return Err(format!("unsupported op {op:?} at {pc}"));
-            }
             // Function code leaves it to the interpreter (an exit before it).
             Op::ForInStepL(..) if !func => {
                 return Err(format!("iteration op {op:?} at {pc}"));
@@ -685,6 +725,12 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
         }
         let after = d - pops + pushes;
         let h = hs[pc - header].clone();
+        if matches!(op, Op::Await) && (!h.is_empty() || !func) {
+            // Under a region handler, the exit's handlers would be finished by a nested driver
+            // the suspension leaves. A loop would enter and exit its code once per iteration
+            // (until resume entries exist).
+            return Err(format!("await at {pc} inside a region handler or loop region"));
+        }
         let mut h_after = h.clone();
         // (successor pc, depth, handlers): the op's own edges, plus the throw edge of a region
         // handler to its catch pad.
@@ -777,6 +823,53 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
             preds[pc + 1 - header] += 1;
         }
     }
+    // An async body's code pays an entry and an exit per stretch it runs: only worth it when
+    // the stretch from pc 0 to the first `await` has a loop (ops reachable without passing an
+    // `await`; see also `resume_on`).
+    let awaits = func
+        && (header..=backedge).any(|pc| depth[pc - header].is_some() && matches!(ops[pc], Op::Await));
+    if awaits {
+        let mut seen = vec![false; n];
+        let mut work = vec![header];
+        let mut looped = false;
+        while let Some(pc) = work.pop() {
+            if std::mem::replace(&mut seen[pc - header], true) || matches!(ops[pc], Op::Await) {
+                continue;
+            }
+            let (falls, target) = successors(&ops[pc]);
+            for q in falls.then_some(pc + 1).into_iter().chain(target) {
+                if inr(q) {
+                    looped |= q <= pc;
+                    work.push(q);
+                }
+            }
+        }
+        if !looped {
+            return Err("async body without a loop before its first await".into());
+        }
+    }
+    // Resume points: the op after each `await` (no handler is live there, see above).
+    let mut resumes = Vec::new();
+    if awaits && resume_on() {
+        for pc in header..backedge {
+            if matches!(ops[pc], Op::Await) {
+                if let Some(d) = depth[pc + 1 - header] {
+                    leader[pc + 1 - header] = true;
+                    preds[pc + 1 - header] += 1;
+                    resumes.push((pc + 1, d));
+                }
+            }
+        }
+    }
+    // `InEnv` runs together with the op after it: nothing may enter between them.
+    for pc in header..=backedge {
+        if matches!(ops[pc], Op::InEnv(_))
+            && depth[pc - header].is_some()
+            && (!inr(pc + 1) || leader[pc + 1 - header])
+        {
+            return Err(format!("InEnv at {pc} split from its op"));
+        }
+    }
     Ok(Analysis {
         depth,
         leader,
@@ -785,6 +878,7 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
         touched,
         tdz,
         hs,
+        resumes,
     })
 }
 
@@ -838,8 +932,25 @@ struct Plan {
     /// Name loads producing a direct site's callee (guarded by identity at the load): load pc
     /// -> call pc.
     dname: HashMap<usize, usize>,
+    /// By-name callee producers whose name cache is in global-object mode at plan time: the
+    /// global object's box address (pinned in `boxes`), its shape and the entry slot.
+    dglobal: HashMap<usize, (usize, u32, u32)>,
+    /// `GetMethod`s producing a direct site's callee, validated inline: op pc -> call pc.
+    dmethod: HashMap<usize, usize>,
+    /// Direct method sites whose body is inlined (see [`inline_this`]), by call pc.
+    dthis: HashMap<usize, inline_this::ThisBody>,
+    /// Property reads resolved to an inlined getter, by op pc.
+    dget: HashMap<usize, inline_this::Getter>,
+    /// `new` sites built from their constructor's template (see [`new_plan`]), by pc.
+    dnew: HashMap<usize, new_plan::NewSite>,
+    /// Inline `String.prototype` intrinsic sites (`<string> GetMethod <Number>
+    /// CallWithThis(1)`): `GetMethod` pc -> call pc.
+    strm: HashMap<usize, usize>,
     /// Heap cells the direct sites' code embeds addresses of.
     boxes: Vec<Box<dyn std::any::Any>>,
+    /// Direct self tail-call sites translated as a jump back to pc 0 (see `Tr::self_tail`),
+    /// by call pc: each is a backward edge of the pc 0 leader.
+    tail_loops: HashSet<usize>,
 }
 
 /// What an inline call site computes.
@@ -1107,6 +1218,26 @@ fn plan(
         }
     }
 
+    // `<string>.charCodeAt(<Number>)`: an inline `String.prototype` intrinsic, its receiver
+    // and method guarded at the `GetMethod` (see `Tr::str_begin`).
+    for pc in header..=backedge {
+        if !reach(pc)
+            || helpers::math_site_failed(chunk, pc)
+            || p.math.contains_key(&pc.wrapping_sub(1))
+        {
+            continue;
+        }
+        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        if chunk.names.get(m as usize).and_then(|n| helpers::str_intrinsic(n)).is_none() {
+            continue;
+        }
+        if let Some((call, args)) = site_args(pc + 1, false) {
+            if args == [true] {
+                p.strm.insert(pc, call);
+            }
+        }
+    }
+
     // `i < <a>.length` loop tests: the array source and the index slot.
     for pc in header..=backedge {
         if !reach(pc) || !matches!(ops[pc], Op::JumpIfNotCmp(CmpKind::Lt, _)) {
@@ -1242,6 +1373,9 @@ enum Opnd {
 }
 
 struct Tr<'a, 'f> {
+    /// The safepoint budget, kept in a variable (`frame.budget` is read once at entry: only
+    /// this code and [`Helper::Safepoint`], which resets it, use it).
+    budget: Option<Variable>,
     /// Leaders whose last backward edge was requested by [`Tr::edge`]: sealed by
     /// [`Tr::flush_seals`] once the branch instruction itself exists (sealing earlier would
     /// complete the block's SSA parameters before that edge is a predecessor).
@@ -1302,6 +1436,9 @@ struct Tr<'a, 'f> {
     self_sizes: Vec<V>,
     /// See [`Built::self_entry`].
     self_entry: usize,
+    /// The engine's per-activation call flags read at entry, for direct calls (see
+    /// [`call`]'s `entry_flags`): `frame.canon`.
+    call_flags: Option<V>,
 }
 
 fn cmp_of(op: &Op) -> Option<CmpKind> {
@@ -1491,11 +1628,15 @@ impl<'a, 'f> Tr<'a, 'f> {
         let pops = pops.min(d);
         let math_part = self.plan.math.contains_key(&pc)
             || self.plan.math.values().any(|s| s.call == pc)
+            || self.plan.strm.values().any(|&c| c == pc)
             || self.site_get_method(pc)
-            || self.plan.dname.contains_key(&pc);
+            || self.plan.dname.contains_key(&pc)
+            || (self.plan.dmethod.contains_key(&pc)
+                && !matches!(self.stack.last(), Some(Entry::Num(_) | Entry::Bool(_))));
         // A direct call reads its operands in place (it runs JS: env Refs below still go).
         let ref_aware = math_part
             || self.plan.direct.contains_key(&pc)
+            || self.plan.dnew.contains_key(&pc)
             || matches!(
                 op,
                 Op::Pop
@@ -1532,6 +1673,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
         }
         let pure = math_part
+            || self.plan.strm.contains_key(&pc)
             || matches!(
                 op,
                 Op::Const(_)
@@ -1642,17 +1784,76 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
     }
 
-    /// Drop the Boxed value at `frame.stack[d]` (a helper call only for refcounted tags).
+    /// Drop the Boxed value at `frame.stack[d]` (leaving `undefined`): nothing for a trivially
+    /// droppable tag, an inline release of an object that stays alive, else a helper call.
     fn drop_at(&mut self, d: usize) {
-        let tag = self.stack_tag(d);
+        let o = self.soff(d);
+        let sp = self.stackp;
+        self.drop_mem(sp, o);
+    }
+
+    /// [`Tr::drop_at`] for the `Value` at `base + o` (a frame slot or stack entry).
+    fn drop_mem(&mut self, base: V, o: i32) {
+        let tag = self.fb.load(MemKind::I32U8, base, o);
         let four = self.i32c(TAG_NUM as i64);
         let big = self.fb.icmp(IntCC::Ugt, tag, four);
+        let ref_b = self.fb.create_block();
+        let obj_b = self.fb.create_block();
+        let dec_b = self.fb.create_block();
         let call_b = self.fb.create_block();
         let cont = self.fb.create_block();
-        self.fb.brif(big, call_b, &[], cont, &[]);
+        self.fb.brif(big, ref_b, &[], cont, &[]);
+        self.fb.seal_block(ref_b);
+        self.fb.switch_to_block(ref_b);
+        let objt = self.i32c(TAG_OBJ as i64);
+        let is_obj = self.fb.icmp(IntCC::Eq, tag, objt);
+        let rc_so = layout::rc_strong_offset();
+        let counted = match rc_so {
+            Some(_) => {
+                let strt = self.i32c(TAG_STR as i64);
+                let is_str = self.fb.icmp(IntCC::Eq, tag, strt);
+                self.fb.binary(BinaryOp::Bor, is_obj, is_str)
+            }
+            None => is_obj,
+        };
+        self.fb.brif(counted, obj_b, &[], call_b, &[]);
+        self.fb.seal_block(obj_b);
+        self.fb.switch_to_block(obj_b);
+        let gc = self.fb.load(PTR_MEM, base, o + VALUE_PAYLOAD);
+        let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
+        let strong = self.fb.load(PTR_MEM, gc, so);
+        let one = self.ptrc(1);
+        let live = self.fb.icmp(IntCC::Ugt, strong, one);
+        let chk_b = self.fb.create_block();
+        let pair_b = self.fb.create_block();
+        self.fb.brif(live, chk_b, &[], call_b, &[]);
+        self.fb.seal_block(chk_b);
+        self.fb.switch_to_block(chk_b);
+        // An object going down to one reference may be half of a function / `.prototype`
+        // pair the reference count frees (`Gc`'s drop): the Rust release checks.
+        let two = self.ptrc(2);
+        let is2 = self.fb.icmp(IntCC::Eq, strong, two);
+        let maybe = self.fb.binary(BinaryOp::Band, is2, is_obj);
+        self.fb.brif(maybe, pair_b, &[], dec_b, &[]);
+        self.fb.seal_block(pair_b);
+        self.fb.switch_to_block(pair_b);
+        let w = self.fb.load(PTR_MEM, gc, crate::value::GC_WEAK_OFFSET as i32);
+        let flag = self.ptrc(crate::value::FN_PAIR_FLAG as i64);
+        let fl = self.fb.binary(BinaryOp::Band, w, flag);
+        let zp = self.ptrc(0);
+        let paired = self.fb.icmp(IntCC::Ne, fl, zp);
+        self.fb.brif(paired, call_b, &[], dec_b, &[]);
+        self.fb.seal_block(dec_b);
         self.fb.seal_block(call_b);
+        self.fb.switch_to_block(dec_b);
+        let s1 = self.fb.binary(BinaryOp::Isub, strong, one);
+        self.fb.store(PTR_MEM, gc, s1, so);
+        let u = self.i32c(TAG_UNDEFINED as i64);
+        self.fb.store(MemKind::I32U8, base, u, o);
+        self.fb.jump(cont, &[]);
         self.fb.switch_to_block(call_b);
-        let p = self.sptr(d);
+        let oc = self.ptrc(o as i64);
+        let p = self.fb.binary(BinaryOp::Iadd, base, oc);
         self.call(Helper::Drop, &[p]);
         self.fb.jump(cont, &[]);
         self.fb.seal_block(cont);
@@ -1827,6 +2028,16 @@ impl<'a, 'f> Tr<'a, 'f> {
     }
 
     /// Exit before the op at `pc`: the interpreter runs it.
+    /// [`Helper::Call`]'s `CALL_AWAIT` flag for a call at `pc` whose result feeds straight into
+    /// an `await` (the interpreter's `Call; Await` fusion, see `Interp::note_await_call`).
+    pub(super) fn await_fused(&self, pc: usize) -> i64 {
+        if matches!(self.ops.get(pc + 1), Some(Op::Await)) {
+            helpers::CALL_AWAIT as i64
+        } else {
+            0
+        }
+    }
+
     fn exit_now(&mut self, pc: usize) {
         let st = self.stack.clone();
         self.emit_exit(pc, EXIT_RESUME, &st, st.len(), None);
@@ -1936,10 +2147,11 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// The loop safepoint at a backward jump to `to`: count the budget down and, when it runs
     /// out, let the collector / interrupt check run (it may throw).
     fn safepoint(&mut self, to: usize) {
-        let b = self.fb.load(MemKind::I64, self.frame, FRAME_BUDGET);
+        let bv = self.budget.expect("defined at entry");
+        let b = self.fb.use_var(bv);
         let one = self.fb.iconst(Type::I64, 1);
         let b1 = self.fb.binary(BinaryOp::Isub, b, one);
-        self.fb.store(MemKind::I64, self.frame, b1, FRAME_BUDGET);
+        self.fb.def_var(bv, b1);
         let zero = self.fb.iconst(Type::I64, 0);
         let low = self.fb.icmp(IntCC::Sle, b1, zero);
         let sp = self.fb.create_block();
@@ -1950,6 +2162,8 @@ impl<'a, 'f> Tr<'a, 'f> {
         let st = self.call_js(Helper::Safepoint, &[self.frame]);
         let stack = self.stack.clone();
         self.throw_if(st, to, &stack, stack.len());
+        let full = self.fb.iconst(Type::I64, SAFEPOINT_BUDGET);
+        self.fb.def_var(bv, full);
         self.fb.jump(cont, &[]);
         self.fb.seal_block(cont);
         self.fb.switch_to_block(cont);
@@ -1959,29 +2173,60 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// The entry block: guard and load the SSA locals, then enter the header.
     fn entry(&mut self, an: &Analysis) {
+        let bv = self.fb.declare_var(Type::I64);
+        let b = self.fb.load(MemKind::I64, self.frame, FRAME_BUDGET);
+        self.fb.def_var(bv, b);
+        self.budget = Some(bv);
         let fail = self.fb.create_block();
         for s in 0..self.kinds.len() {
-            let (ty, tag) = match self.kinds[s] {
-                Kind::Num => (Type::F64, TAG_NUM),
-                Kind::Bool => (Type::I32, TAG_BOOL),
+            let ty = match self.kinds[s] {
+                Kind::Num => Type::F64,
+                Kind::Bool => Type::I32,
                 Kind::Boxed => continue,
             };
+            self.vars[s] = Some(self.fb.declare_var(ty));
+            if self.fresh[s] {
+                self.undef[s] = Some(self.fb.declare_var(Type::I32));
+            }
+            if an.tdz[s] {
+                self.tdz[s] = Some(self.fb.declare_var(Type::I32));
+            }
+        }
+        // Function code with resume points dispatches on `frame.resume`: a resume entry
+        // reloads the SSA slots from what the suspended body left (see `resume_slots`).
+        let resume = (!an.resumes.is_empty()).then(|| {
+            let r = self.fb.load(MemKind::I64, self.frame, FRAME_RESUME);
+            let normal = self.fb.create_block();
+            let res = self.fb.create_block();
+            let join = self.fb.create_block();
+            let z = self.i64c(0);
+            let is0 = self.fb.icmp(IntCC::Eq, r, z);
+            self.fb.brif(is0, normal, &[], res, &[]);
+            self.fb.seal_block(normal);
+            self.fb.seal_block(res);
+            self.fb.switch_to_block(res);
+            self.resume_slots(an, fail);
+            self.fb.jump(join, &[]);
+            self.fb.switch_to_block(normal);
+            (r, join)
+        });
+        for s in 0..self.kinds.len() {
+            let tag = match self.kinds[s] {
+                Kind::Num => TAG_NUM,
+                Kind::Bool => TAG_BOOL,
+                Kind::Boxed => continue,
+            };
+            let var = self.vars[s].expect("declared");
+            if let Some(flag) = self.tdz[s] {
+                let z = self.i32c(0);
+                self.fb.def_var(flag, z);
+            }
             if self.fresh[s] {
                 // `undefined` at every entry: nothing to load or guard.
-                let var = self.fb.declare_var(ty);
                 let z = self.fb.f64const(0.0);
                 self.fb.def_var(var, z);
-                self.vars[s] = Some(var);
-                let flag = self.fb.declare_var(Type::I32);
                 let one = self.i32c(1);
-                self.fb.def_var(flag, one);
-                self.undef[s] = Some(flag);
-                if an.tdz[s] {
-                    let flag = self.fb.declare_var(Type::I32);
-                    let z = self.i32c(0);
-                    self.fb.def_var(flag, z);
-                    self.tdz[s] = Some(flag);
-                }
+                self.fb.def_var(self.undef[s].expect("declared"), one);
                 continue;
             }
             let off = s as i32 * VALUE_SIZE;
@@ -1996,15 +2241,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                 Kind::Num => self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD),
                 _ => self.fb.load(MemKind::I32U8, self.slots, off + VALUE_BOOL),
             };
-            let var = self.fb.declare_var(ty);
             self.fb.def_var(var, v);
-            self.vars[s] = Some(var);
-            if an.tdz[s] {
-                let flag = self.fb.declare_var(Type::I32);
-                let z = self.i32c(0);
-                self.fb.def_var(flag, z);
-                self.tdz[s] = Some(flag);
-            }
+        }
+        if let Some((_, join)) = resume {
+            self.fb.jump(join, &[]);
+            self.fb.seal_block(join);
+            self.fb.switch_to_block(join);
         }
         // Region caches start unknown; `Math` guards are checked here, so a replaced intrinsic
         // fails the entry (and after enough failures the loop recompiles without the site).
@@ -2047,7 +2289,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             // Element sites on a local keep a view cache even when the slot held no typed
             // array at compile time: a region compiled for Arrays and later fed typed arrays
             // (one function serving both) would otherwise take a fresh view per access.
-            if !local.map_or(any_ta, ta_slot) {
+            if !local.map_or(any_ta, ta_slot) && !helpers::ta_hot(self.chunk, pc) {
                 continue;
             }
             if elem {
@@ -2111,9 +2353,45 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.def_var(v, one);
             self.math_vars.insert(pc, v);
         }
+        // String intrinsic sites check at the site (the guard needs the receiver).
+        let mut strs: Vec<usize> = self.plan.strm.keys().copied().collect();
+        strs.sort_unstable();
+        for pc in strs {
+            let v = self.fb.declare_var(Type::I32);
+            let zero = self.i32c(0);
+            self.fb.def_var(v, zero);
+            self.math_vars.insert(pc, v);
+        }
+        if self.plan.direct.values().any(|s| !s.construct) {
+            self.call_flags = self.entry_flags();
+        }
         let header_block = self
             .edge(false, self.header)
             .expect("the header is a leader");
+        if let Some((r, _)) = resume {
+            for (k, &(rpc, d)) in an.resumes.iter().enumerate() {
+                let go = self.fb.create_block();
+                let next = self.fb.create_block();
+                let kv = self.i64c(k as i64 + 1);
+                let c = self.fb.icmp(IntCC::Eq, r, kv);
+                self.fb.brif(c, go, &[], next, &[]);
+                self.fb.seal_block(go);
+                self.fb.seal_block(next);
+                self.fb.switch_to_block(go);
+                // The frame's operand stack, moved into the stack area by `enter`.
+                self.stack = vec![Entry::Boxed; d];
+                self.max_stack = self.max_stack.max(d);
+                match self.edge(false, rpc) {
+                    Ok(b) => self.fb.jump(b, &[]),
+                    Err(e) => {
+                        self.err.get_or_insert(e);
+                        self.fb.jump(fail, &[]);
+                    }
+                }
+                self.stack.clear();
+                self.fb.switch_to_block(next);
+            }
+        }
         self.fb.jump(header_block, &[]);
         self.fb.seal_block(fail);
         self.fb.switch_to_block(fail);
@@ -2123,6 +2401,67 @@ impl<'a, 'f> Tr<'a, 'f> {
             .fb
             .iconst(Type::I64, exit(self.header, EXIT_ENTRY_FAIL) as i64);
         self.fb.ret(&[w]);
+    }
+
+    /// The SSA slots at a resume entry (after an `await`): each holds a value of its kind, or
+    /// — a fresh local still unassigned — `undefined`, or — one in its TDZ — `Empty`; anything
+    /// else fails the entry (the interpreter continues).
+    fn resume_slots(&mut self, an: &Analysis, fail: Block) {
+        for s in 0..self.kinds.len() {
+            let (num, tag) = match self.kinds[s] {
+                Kind::Num => (true, TAG_NUM),
+                Kind::Bool => (false, TAG_BOOL),
+                Kind::Boxed => continue,
+            };
+            let off = s as i32 * VALUE_SIZE;
+            let t = self.fb.load(MemKind::I32U8, self.slots, off);
+            let want = self.i32c(tag as i64);
+            let mut ok = self.fb.icmp(IntCC::Eq, t, want);
+            let und = self.i32c(TAG_UNDEFINED as i64);
+            let is_undef = self.fb.icmp(IntCC::Eq, t, und);
+            let emp = self.i32c(TAG_EMPTY as i64);
+            let is_empty = self.fb.icmp(IntCC::Eq, t, emp);
+            if self.fresh[s] {
+                ok = self.fb.binary(BinaryOp::Bor, ok, is_undef);
+            }
+            if an.tdz[s] {
+                ok = self.fb.binary(BinaryOp::Bor, ok, is_empty);
+            }
+            let next = self.fb.create_block();
+            self.fb.brif(ok, next, &[], fail, &[]);
+            self.fb.seal_block(next);
+            self.fb.switch_to_block(next);
+            let v = if num {
+                self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD)
+            } else {
+                self.fb.load(MemKind::I32U8, self.slots, off + VALUE_BOOL)
+            };
+            self.fb.def_var(self.vars[s].expect("declared"), v);
+            if let Some(f) = self.undef[s] {
+                self.fb.def_var(f, is_undef);
+            }
+            if let Some(f) = self.tdz[s] {
+                self.fb.def_var(f, is_empty);
+            }
+        }
+    }
+
+    /// The template of the `MakeObject(start, n, tidx)` literal when it instantiates in one
+    /// box ([`Props::fast_template`](crate::value::Props::fast_template)): its address (the
+    /// chunk keeps it). Initialized here as the interpreter's first run would
+    /// (`Interp::make_plain_object_templated`): template keys are distinct.
+    fn lit_template(&self, start: u32, n: usize, tidx: u32) -> Option<usize> {
+        let cell = self.chunk.obj_maps.get(tidx as usize)?;
+        let keys = self.chunk.names.get(start as usize..start as usize + n)?;
+        let map = cell.get_or_init(|| {
+            let mut p = crate::value::Props::new();
+            for k in keys {
+                p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
+            }
+            p
+        });
+        map.fast_template(crate::value::INLINE_PROPS_WIDE)
+            .then_some(map as *const crate::value::Props as usize)
     }
 
     fn body(&mut self, an: &Analysis) -> Result<(), String> {
@@ -2502,6 +2841,31 @@ impl<'a, 'f> Tr<'a, 'f> {
         let op = self.ops[pc];
         self.prepare(pc);
         let d = self.stack.len();
+        if let (true, Op::InEnv(s), Op::MakeClosure(k, n)) =
+            (pc > 0, self.ops[pc.saturating_sub(1)], op)
+        {
+            // `InEnv` + `MakeClosure`: the closure over the block env.
+            self.max_stack = self.max_stack.max(d + 1);
+            let (sv, kv, nv, dst) = (
+                self.i32c(s as i64),
+                self.i32c(k as i64),
+                self.i32c(n as i64),
+                self.sptr(d),
+            );
+            self.call(Helper::MakeClosureIn, &[self.frame, sv, kv, nv, dst]);
+            self.stack.push(Entry::Boxed);
+            return Ok(());
+        }
+        if pc > 0 && matches!(self.ops[pc - 1], Op::InEnv(_)) {
+            // `InEnv` and the closure-creating op after it, run as one generic op.
+            let (pops, pushes) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
+            self.box_from(d - pops);
+            self.max_stack = self.max_stack.max(d - pops + pushes);
+            self.call_generic(pc - 1, d - pops, d, pc - 1);
+            self.stack.truncate(d - pops);
+            self.stack.extend(std::iter::repeat_n(Entry::Boxed, pushes));
+            return Ok(());
+        }
         // The parts of an inline `Math` call.
         if self.plan.math.contains_key(&pc) {
             return self.math_begin(pc);
@@ -2511,6 +2875,12 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.set_stack_tag(d, TAG_UNDEFINED);
             self.stack.push(Entry::Boxed);
             return Ok(());
+        }
+        if self.plan.strm.contains_key(&pc) {
+            return self.str_begin(pc);
+        }
+        if self.plan.strm.values().any(|&c| c == pc) {
+            return self.str_call(pc);
         }
         if let Some(site) = self.plan.math.values().find(|s| s.call == pc).copied() {
             return match site.f {
@@ -2523,6 +2893,19 @@ impl<'a, 'f> Tr<'a, 'f> {
             // Region handlers are static (see `Analysis::hs`): nothing to emit.
             Op::PushHandler(_) | Op::PopHandler => {}
             Op::IterStepL(is, ns) => self.iter_step(pc, is as usize, ns as usize),
+            // Runs with the op after it (above).
+            Op::InEnv(_) => {}
+            // An async body suspends in the interpreter: native code runs up to the `await`
+            // (async-design.md §4.6, stage 1), whose operand is materialized on the stack. A
+            // loop region containing one re-enters at its header on the next backedge.
+            Op::Await => self.exit_now(pc),
+            Op::IterRestL(a, b) => {
+                if self.kinds[a as usize] == Kind::Boxed && self.kinds[b as usize] == Kind::Boxed {
+                    self.generic(pc);
+                } else {
+                    self.exit_now(pc);
+                }
+            }
             // Function code (the analysis rejects it in loop regions): the interpreter runs it.
             Op::ForInStepL(..) => self.exit_now(pc),
             Op::IterCloseL(s) => {
@@ -2610,24 +2993,45 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.stack.pop();
             }
             Op::UpdateCap(n, k) => self.update_cap(pc, n, k),
-            Op::Call(argc) | Op::CallWithThis(argc) if self.plan.direct.contains_key(&pc) => {
+            Op::New(argc) if self.plan.dnew.contains_key(&pc) => {
+                self.plan_new(pc, argc as usize);
+            }
+            Op::Call(argc) | Op::CallWithThis(argc) | Op::New(argc)
+                if self.plan.direct.contains_key(&pc) =>
+            {
                 self.direct_call(pc, argc as usize, matches!(op, Op::CallWithThis(_)));
             }
-            Op::Call(argc) | Op::CallWithThis(argc) => {
-                let with_this = matches!(op, Op::CallWithThis(_));
+            // A proper tail call: directly within `TAIL_NEST` frames, a self tail call as a loop
+            // where it can be. (Only a `this` method body that can neither call nor throw is
+            // inlined, see `inline_this`: no frame to release, nothing observable.)
+            Op::TailCall(argc, wt) if self.plan.tail_loops.contains(&pc) => {
+                self.self_tail(pc, argc as usize, wt);
+            }
+            Op::TailCall(argc, wt) if self.plan.direct.contains_key(&pc) => {
+                self.direct_call(pc, argc as usize, wt);
+            }
+            Op::Call(argc) | Op::CallWithThis(argc) | Op::TailCall(argc, _) => {
+                let with_this = matches!(op, Op::CallWithThis(_) | Op::TailCall(_, true));
+                let tail = if matches!(op, Op::TailCall(..)) {
+                    helpers::CALL_TAIL as i64
+                } else {
+                    0
+                };
                 let base = d - argc as usize - 1 - with_this as usize;
                 self.box_from(base);
                 let (bv, av, wv) = (
                     self.i32c(base as i64),
                     self.i32c(argc as i64),
-                    self.i32c(with_this as i64),
+                    self.i32c(with_this as i64 | self.await_fused(pc) | tail),
                 );
+                self.set_call_site(pc);
                 let st = self.call_js(Helper::Call, &[self.frame, bv, av, wv]);
                 let below = self.stack[..base].to_vec();
                 self.throw_if(st, pc, &below, base);
                 self.stack.truncate(base);
                 self.stack.push(Entry::Boxed);
             }
+            Op::GetMethod(..) if self.plan.dmethod.contains_key(&pc) && self.direct_method(pc) => {}
             Op::GetMethod(n, c) => {
                 self.box_from(d - 1);
                 let (nv, cv) = (self.i32c(n as i64), self.i32c(c as i64));
@@ -2658,6 +3062,43 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.set_stack_tag(d, TAG_UNDEFINED);
                 self.stack.push(Entry::Boxed);
             }
+            Op::MakeClosure(k, n) => {
+                self.max_stack = self.max_stack.max(d + 1);
+                let (kv, nv, dst) = (self.i32c(k as i64), self.i32c(n as i64), self.sptr(d));
+                self.call(Helper::MakeClosure, &[self.frame, kv, nv, dst]);
+                self.stack.push(Entry::Boxed);
+            }
+            Op::MakeArray(n) | Op::MakeObject(_, n, _) => {
+                // The literal from the operands in place (no generic op round trip).
+                let n = n as usize;
+                self.box_from(d - n);
+                self.max_stack = self.max_stack.max(d - n + 1);
+                let (bp, nv) = (self.sptr(d - n), self.i32c(n as i64));
+                match op {
+                    Op::MakeArray(_) => {
+                        self.call(Helper::AllocArr, &[self.frame, bp, nv]);
+                    }
+                    Op::MakeObject(start, _, tidx) if self.lit_template(start, n, tidx).is_some() => {
+                        let t = self.lit_template(start, n, tidx).expect("checked");
+                        let tp = self.ptrc(t as i64);
+                        self.call(Helper::AllocObj, &[self.frame, tp, bp, nv]);
+                    }
+                    _ => {
+                        let pv = self.i32c(pc as i64);
+                        self.call(Helper::MakeLit, &[self.frame, pv, bp, nv]);
+                    }
+                }
+                self.stack.truncate(d - n);
+                self.stack.push(Entry::Boxed);
+            }
+            Op::ArrayAppend => {
+                // One element onto the literal under it, in place (no generic op round trip).
+                self.box_from(d - 2);
+                let (ap, vp) = (self.sptr(d - 2), self.sptr(d - 1));
+                self.call(Helper::ArrayAppend, &[ap, vp]);
+                self.stack.truncate(d - 2);
+                self.stack.push(Entry::Boxed);
+            }
             Op::Dup => self.dup(d - 1),
             Op::Dup2 => {
                 self.dup(d - 2);
@@ -2686,9 +3127,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     return Err(format!("Tdz of SSA slot {s} without a flag"));
                 } else {
                     self.set_stack_tag(d, TAG_EMPTY);
-                    let p = self.sptr(d);
-                    let sc = self.i32c(s as i64);
-                    self.call(Helper::StoreLocal, &[self.frame, sc, p]);
+                    self.move_to_slot(s, d);
                 }
             }
             Op::UpdateLocal(s, k) => self.update_local(pc, s as usize, k),
@@ -2831,8 +3270,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.emit_exit(pc, EXIT_RETURN, &[], 1, None);
                 }
             }
-            // Let the interpreter throw (and find its handler).
-            Op::Throw => self.exit_now(pc),
+            // Let the interpreter throw (and find its handler) / apply the [[Construct]] rule.
+            Op::Throw | Op::DerivedReturn => self.exit_now(pc),
             Op::GetElem => match (self.stack[d - 2], self.stack[d - 1]) {
                 (Entry::Boxed, Entry::Num(key)) => {
                     let want = self.want_num(pc, d - 2);
@@ -2955,6 +3394,52 @@ impl<'a, 'f> Tr<'a, 'f> {
                         self.exit_if(other, pc, EXIT_RESUME, &st, d);
                     }
                 }
+            }
+            Op::BlkNew(dst, parent) => {
+                let (a, b) = (self.i32c(dst as i64), self.i32c(parent as i64));
+                self.call(Helper::BlkNew, &[self.frame, a, b]);
+            }
+            Op::BlkCopy(s) => {
+                let a = self.i32c(s as i64);
+                self.call(Helper::BlkCopy, &[self.frame, a]);
+            }
+            Op::BlkDecl(s, n, k) => {
+                let (a, b, c) = (self.i32c(s as i64), self.i32c(n as i64), self.i32c(k as i64));
+                self.call(Helper::BlkDecl, &[self.frame, a, b, c]);
+            }
+            Op::BlkLoad(s, n) => {
+                self.max_stack = self.max_stack.max(d + 1);
+                let (a, b, dst) = (self.i32c(s as i64), self.i32c(n as i64), self.sptr(d));
+                let st = self.call_status(Helper::BlkLoad, &[self.frame, a, b, dst]);
+                let below = self.stack.clone();
+                self.throw_if(st, pc, &below, d);
+                self.stack.push(Entry::Boxed);
+            }
+            Op::BlkUpdate(..) => {
+                let (_, pushes) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
+                self.max_stack = self.max_stack.max(d + pushes);
+                let (pv, dst) = (self.i32c(pc as i64), self.sptr(d));
+                if pushes > 0 {
+                    self.set_stack_tag(d, TAG_UNDEFINED);
+                }
+                let st = self.call_status(Helper::BlkUpdate, &[self.frame, pv, dst]);
+                let below = self.stack.clone();
+                self.throw_if(st, pc, &below, d);
+                self.stack.extend(std::iter::repeat_n(Entry::Boxed, pushes));
+            }
+            Op::BlkStore(s, n) | Op::BlkInit(s, n) => {
+                self.box_from(d - 1);
+                let init = matches!(op, Op::BlkInit(..));
+                let (a, b, src, iv) = (
+                    self.i32c(s as i64),
+                    self.i32c(n as i64),
+                    self.sptr(d - 1),
+                    self.i32c(init as i64),
+                );
+                let st = self.call_status(Helper::BlkStore, &[self.frame, a, b, src, iv]);
+                self.stack.truncate(d - 1);
+                let below = self.stack.clone();
+                self.throw_if(st, pc, &below, d - 1);
             }
             _ if helpers::generic_ok(&op) => self.generic(pc),
             _ => return Err(format!("unsupported op {op:?} at {pc}")),
@@ -3510,6 +3995,89 @@ impl<'a, 'f> Tr<'a, 'f> {
         Ok(())
     }
 
+    // ---- String intrinsics -------------------------------------------------------------------
+
+    /// The `GetMethod` of an inline `String.prototype` site: the receiver (materialized by
+    /// `prepare`) must be a String and the method the intrinsic, checked by
+    /// [`Helper::StrGuard`] when JS may have run since the last check or when the receiver is
+    /// not a String (the guard then fails: the site is remembered and the code retired). Exits
+    /// before the site on failure (the interpreter makes the call); then pushes the placeholder
+    /// callee.
+    fn str_begin(&mut self, pc: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        let var = *self
+            .math_vars
+            .get(&pc)
+            .ok_or_else(|| format!("no guard for the String site at {pc}"))?;
+        let st = self.stack.clone();
+        if st.last() != Some(&Entry::Boxed) {
+            // A Number or Boolean receiver: never the String method.
+            let pcv = self.i32c(pc as i64);
+            self.call(Helper::SiteFailed, &[self.frame, pcv]);
+            let yes = self.i32c(1);
+            self.exit_if(yes, pc, EXIT_RESUME, &st, d);
+        } else {
+            let recv = self.sptr(d - 1);
+            let tag = self.fb.load(MemKind::I32U8, recv, 0);
+            let str_tag = self.i32c(TAG_STR as i64);
+            let is_str = self.fb.icmp(IntCC::Eq, tag, str_tag);
+            let known = self.fb.use_var(var);
+            let zero = self.i32c(0);
+            let known = self.fb.icmp(IntCC::Ne, known, zero);
+            let fast = self.fb.binary(BinaryOp::Band, is_str, known);
+            let check = self.fb.create_block();
+            let cont = self.fb.create_block();
+            self.fb.brif(fast, cont, &[], check, &[]);
+            self.fb.seal_block(check);
+            self.fb.switch_to_block(check);
+            let pcv = self.i32c(pc as i64);
+            let g = self.call_status(Helper::StrGuard, &[self.frame, pcv, recv]);
+            let zero = self.i32c(0);
+            let bad = self.fb.icmp(IntCC::Eq, g, zero);
+            self.exit_if(bad, pc, EXIT_RESUME, &st, d);
+            let one = self.i32c(1);
+            self.fb.def_var(var, one);
+            self.fb.jump(cont, &[]);
+            self.fb.seal_block(cont);
+            self.fb.switch_to_block(cont);
+        }
+        self.set_stack_tag(d, TAG_UNDEFINED);
+        self.stack.push(Entry::Boxed);
+        Ok(())
+    }
+
+    /// The `CallWithThis(1)` of an inline `String.prototype.charCodeAt` site: the unit read
+    /// inline from an all-ASCII string, else by [`Helper::StrCodeAt`]; the receiver is dropped,
+    /// the callee is a placeholder.
+    fn str_call(&mut self, pc: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        let x = match self.stack.get(d.wrapping_sub(1)) {
+            Some(&Entry::Num(x)) if d >= 3 => x,
+            other => return Err(format!("String intrinsic argument {other:?} at {pc}")),
+        };
+        let recv = self.sptr(d - 3);
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let r = self.fb.append_block_param(join, Type::F64);
+        let hdr = self.fb.load(PTR_MEM, recv, VALUE_PAYLOAD);
+        let u = layout::str_ascii_unit(&mut self.fb, hdr, x, slow);
+        let f = self.fb.convert(ConvOp::FromSint, Type::F64, u);
+        self.fb.jump(join, &[f]);
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        let v = self
+            .call(Helper::StrCodeAt, &[self.frame, recv, x])
+            .expect("StrCodeAt returns a Number");
+        self.fb.jump(join, &[v]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack.truncate(d - 2);
+        self.drop_at(d - 3);
+        self.stack.pop();
+        self.stack.push(Entry::Num(r));
+        Ok(())
+    }
+
     // ---- bounds-check elimination ------------------------------------------------------------
 
     /// The in-bounds fact for `src[i]` when the element read at `pc` takes its key from
@@ -3606,13 +4174,23 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             (Kind::Boxed, _) => {
                 self.store_entry(d - 1, e);
-                let p = self.sptr(d - 1);
-                let sc = self.i32c(s as i64);
-                self.call(Helper::StoreLocal, &[self.frame, sc, p]);
+                self.move_to_slot(s, d - 1);
             }
         }
         self.clear_tdz(s);
         self.stack.pop();
+    }
+
+    /// Move the value at `frame.stack[d]` (left `undefined`) into Boxed slot `s`, releasing the
+    /// slot's old value inline (see [`Tr::drop_mem`]).
+    fn move_to_slot(&mut self, s: usize, d: usize) {
+        let off = s as i32 * VALUE_SIZE;
+        let sl = self.slots;
+        self.drop_mem(sl, off);
+        let so = self.soff(d);
+        let sp = self.stackp;
+        self.copy_value(sp, so, sl, off);
+        self.set_stack_tag(d, TAG_UNDEFINED);
     }
 
     fn update_local(&mut self, pc: usize, s: usize, k: UpdKind) {
@@ -3760,6 +4338,38 @@ impl<'a, 'f> Tr<'a, 'f> {
             return Ok(());
         }
         let d = self.stack.len();
+        // `s += y` on a string local: append in place (the slot's string is uniquely owned
+        // when only the local holds it) instead of copying it into the generic `+`.
+        let append = matches!((kind, a), (ArithKind::Add, Opnd::Slot(s)) if s as usize == dst)
+            && !matches!(b, Opnd::Slot(s) if s as usize == dst)
+            && self.kinds[dst] == Kind::Boxed
+            && self.vars[dst].is_none();
+        let done = if append {
+            let yp = match b {
+                Opnd::Const(k) => self.const_ptr(k as usize),
+                Opnd::Slot(s) if self.vars[s as usize].is_none() => self.slot_ptr(s as usize),
+                Opnd::Slot(s) => {
+                    self.tdz_guard(s as usize, pc);
+                    let e = self.ssa_entry(s as usize);
+                    self.store_entry(d + 1, e);
+                    self.sptr(d + 1)
+                }
+            };
+            let dv = self.i32c(dst as i64);
+            let r = self
+                .call(Helper::AppendLocal, &[self.frame, dv, yp])
+                .expect("AppendLocal returns a flag");
+            let z = self.i32c(0);
+            let hit = self.fb.icmp(IntCC::Ne, r, z);
+            let done = self.fb.create_block();
+            let gen = self.fb.create_block();
+            self.fb.brif(hit, done, &[], gen, &[]);
+            self.fb.seal_block(gen);
+            self.fb.switch_to_block(gen);
+            Some(done)
+        } else {
+            None
+        };
         self.opnds_to_scratch(pc, a, b);
         let code = self.i32c(bin_code(&arith_op(kind))? as i64);
         let (pa, pb, pr) = (self.sptr(d), self.sptr(d + 1), self.sptr(d + 2));
@@ -3770,6 +4380,11 @@ impl<'a, 'f> Tr<'a, 'f> {
             Kind::Boxed => {
                 let sc = self.i32c(dst as i64);
                 self.call(Helper::StoreLocal, &[self.frame, sc, pr]);
+                if let Some(done) = done {
+                    self.fb.jump(done, &[]);
+                    self.fb.seal_block(done);
+                    self.fb.switch_to_block(done);
+                }
             }
             k => {
                 // The op ran; a result of another kind goes into the slot and the interpreter
@@ -3811,15 +4426,58 @@ impl<'a, 'f> Tr<'a, 'f> {
             let x = self.opnd_num(a, pc).expect("static Num");
             let y = self.opnd_num(b, pc).expect("static Num");
             self.fb.fcmp(fcc(kind), x, y)
+        } else if let (Some(neg), Some(pa), Some(pb)) = (
+            match kind {
+                CmpKind::StrictEq => Some(false),
+                CmpKind::StrictNotEq => Some(true),
+                _ => None,
+            },
+            self.opnd_ptr(a),
+            self.opnd_ptr(b),
+        ) {
+            // `===` of memory operands, compared in place (no clones).
+            let r = self.str_eq_ref(pa, pb);
+            let two = self.i32c(2);
+            let tdz = self.fb.icmp(IntCC::Eq, r, two);
+            let join = self.fb.create_block();
+            let res = self.fb.append_block_param(join, Type::I32);
+            let gen = self.fb.create_block();
+            let fast = self.fb.create_block();
+            self.fb.brif(tdz, gen, &[], fast, &[]);
+            self.fb.seal_block(fast);
+            self.fb.switch_to_block(fast);
+            let r = if neg {
+                let one = self.i32c(1);
+                self.fb.binary(BinaryOp::Bxor, r, one)
+            } else {
+                r
+            };
+            self.fb.jump(join, &[r]);
+            self.fb.seal_block(gen);
+            self.fb.switch_to_block(gen);
+            let d = self.stack.len();
+            self.opnds_to_scratch(pc, a, b);
+            let (pa, pb) = (self.sptr(d), self.sptr(d + 1));
+            let r = self.strict_cmp(kind, d, pa, pb).expect("strict kind");
+            self.fb.jump(join, &[r]);
+            self.fb.seal_block(join);
+            self.fb.switch_to_block(join);
+            res
         } else {
             let d = self.stack.len();
             self.opnds_to_scratch(pc, a, b);
-            let code = self.i32c(bin_code(&cmp_op(kind))? as i64);
-            let (pa, pb, pr) = (self.sptr(d), self.sptr(d + 1), self.sptr(d + 2));
-            let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
-            let snap = self.stack.clone();
-            self.throw_if(st, pc, &snap, d);
-            self.call_status(Helper::ToBoolean, &[self.frame, pr])
+            let (pa, pb) = (self.sptr(d), self.sptr(d + 1));
+            match self.strict_cmp(kind, d, pa, pb) {
+                Some(r) => r,
+                None => {
+                    let code = self.i32c(bin_code(&cmp_op(kind))? as i64);
+                    let pr = self.sptr(d + 2);
+                    let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
+                    let snap = self.stack.clone();
+                    self.throw_if(st, pc, &snap, d);
+                    self.call_status(Helper::ToBoolean, &[self.frame, pr])
+                }
+            }
         };
         self.branch(pc, cond, pc + 1, target)
     }
@@ -3867,12 +4525,129 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn cmp_slow(&mut self, pc: usize, kind: CmpKind) -> Result<V, String> {
         let d = self.stack.len();
         self.box_from(d - 2);
+        let (pa, pb) = (self.sptr(d - 2), self.sptr(d - 1));
+        if let Some(r) = self.strict_cmp(kind, d - 2, pa, pb) {
+            self.stack.truncate(d - 2);
+            self.stack.extend([Entry::Boxed, Entry::Boxed]);
+            return Ok(r);
+        }
         let code = self.i32c(bin_code(&cmp_op(kind))? as i64);
-        let (pa, pb, pr) = (self.sptr(d - 2), self.sptr(d - 1), self.sptr(d));
+        let pr = self.sptr(d);
         let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
         let snap = self.stack[..d - 2].to_vec();
         self.throw_if(st, pc, &snap, d - 2);
         Ok(self.call_status(Helper::ToBoolean, &[self.frame, pr]))
+    }
+
+    /// The address of a fused local op's operand when it lives in memory (a constant, or a
+    /// slot the translator keeps in the frame).
+    fn opnd_ptr(&mut self, o: Opnd) -> Option<V> {
+        match o {
+            Opnd::Const(k) => Some(self.const_ptr(k as usize)),
+            Opnd::Slot(s) if self.vars[s as usize].is_none() && self.kinds[s as usize] == Kind::Boxed => {
+                Some(self.slot_ptr(s as usize))
+            }
+            Opnd::Slot(_) => None,
+        }
+    }
+
+    /// [`Helper::StrictEqRef`] of the borrowed values at `pa` / `pb` (0 / 1, or 2 for a TDZ
+    /// marker), deciding two Strings inline when it can: the same string, different byte
+    /// lengths, or one byte each.
+    fn str_eq_ref(&mut self, pa: V, pb: V) -> V {
+        let join = self.fb.create_block();
+        let r = self.fb.append_block_param(join, Type::I32);
+        let call = self.fb.create_block();
+        self.str_eq_inline(pa, pb, join, call);
+        self.fb.seal_block(call);
+        self.fb.switch_to_block(call);
+        let v = self
+            .call(Helper::StrictEqRef, &[self.frame, pa, pb])
+            .expect("StrictEqRef returns a flag");
+        self.fb.jump(join, &[v]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        r
+    }
+
+    /// Decide `===` of the values at `pa` / `pb` inline when both are Strings and it can: the
+    /// same string, different byte lengths, or one byte each. Jumps to `decided` (an I32 block
+    /// parameter: the truth) or to `undecided`; neither block is sealed here.
+    fn str_eq_inline(&mut self, pa: V, pb: V, decided: Block, undecided: Block) {
+        let (join, call) = (decided, undecided);
+        let strs = self.fb.create_block();
+        let ta = self.fb.load(MemKind::I32U8, pa, 0);
+        let tb = self.fb.load(MemKind::I32U8, pb, 0);
+        let st = self.i32c(TAG_STR as i64);
+        let a_str = self.fb.icmp(IntCC::Eq, ta, st);
+        let b_str = self.fb.icmp(IntCC::Eq, tb, st);
+        let both = self.fb.binary(BinaryOp::Band, a_str, b_str);
+        self.fb.brif(both, strs, &[], call, &[]);
+        self.fb.seal_block(strs);
+        self.fb.switch_to_block(strs);
+        let ha = self.fb.load(PTR_MEM, pa, VALUE_PAYLOAD);
+        let hb = self.fb.load(PTR_MEM, pb, VALUE_PAYLOAD);
+        let one = self.i32c(1);
+        let zero = self.i32c(0);
+        let same = self.fb.icmp(IntCC::Eq, ha, hb);
+        let lens = self.fb.create_block();
+        self.fb.brif(same, join, &[one], lens, &[]);
+        self.fb.seal_block(lens);
+        self.fb.switch_to_block(lens);
+        let len_off = crate::lstr::LSTR_LEN_OFFSET as i32;
+        let la = self.fb.load(MemKind::I32, ha, len_off);
+        let lb = self.fb.load(MemKind::I32, hb, len_off);
+        let differ = self.fb.icmp(IntCC::Ne, la, lb);
+        let short = self.fb.create_block();
+        self.fb.brif(differ, join, &[zero], short, &[]);
+        self.fb.seal_block(short);
+        self.fb.switch_to_block(short);
+        let is_one = self.fb.icmp(IntCC::Eq, la, one);
+        let bytes = self.fb.create_block();
+        self.fb.brif(is_one, bytes, &[], call, &[]);
+        self.fb.seal_block(bytes);
+        self.fb.switch_to_block(bytes);
+        let data = crate::lstr::LSTR_DATA_OFFSET as i32;
+        let ba = self.fb.load(MemKind::I32U8, ha, data);
+        let bb = self.fb.load(MemKind::I32U8, hb, data);
+        let eq = self.fb.icmp(IntCC::Eq, ba, bb);
+        self.fb.jump(join, &[eq]);
+    }
+
+    /// `===` / `!==` of the owned values at `pa` / `pb` (`frame.stack[da]` and `[da + 1]`,
+    /// consumed) as an I32 truth value —
+    /// never runs JS or throws; `None` for the other comparisons.
+    fn strict_cmp(&mut self, kind: CmpKind, da: usize, pa: V, pb: V) -> Option<V> {
+        let neg = match kind {
+            CmpKind::StrictEq => false,
+            CmpKind::StrictNotEq => true,
+            _ => return None,
+        };
+        let join = self.fb.create_block();
+        let r = self.fb.append_block_param(join, Type::I32);
+        let decided = self.fb.create_block();
+        let t = self.fb.append_block_param(decided, Type::I32);
+        let call = self.fb.create_block();
+        self.str_eq_inline(pa, pb, decided, call);
+        self.fb.seal_block(decided);
+        self.fb.switch_to_block(decided);
+        self.drop_at(da);
+        self.drop_at(da + 1);
+        self.fb.jump(join, &[t]);
+        self.fb.seal_block(call);
+        self.fb.switch_to_block(call);
+        let v = self
+            .call(Helper::StrictEq, &[self.frame, pa, pb])
+            .expect("StrictEq returns a flag");
+        self.fb.jump(join, &[v]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        Some(if neg {
+            let one = self.i32c(1);
+            self.fb.binary(BinaryOp::Bxor, r, one)
+        } else {
+            r
+        })
     }
 
     /// Stack arithmetic and comparisons.
@@ -3969,7 +4744,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         fact: Option<(Src, u16)>,
         src: Option<Src>,
     ) {
-        let ta_first = self.ta_first(src);
+        let ta_first = self.ta_first(src) || helpers::ta_hot(self.chunk, pc);
         let pre = self.stack.clone();
         let miss = self.fb.create_block();
         let join = self.fb.create_block();
@@ -4026,6 +4801,59 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(slow_b);
         self.fb.switch_to_block(slow_b);
         self.stack = pre.clone();
+        // Non-number elements (a string's characters, boxed array elements) through the
+        // interpreter's fast paths before the generic op.
+        if !want
+            && matches!(slow, Slow::Generic)
+            && matches!(self.ops[pc], Op::GetElem | Op::GetElemLocal(_))
+        {
+            // An object element, inline: a retained handle word.
+            let helper_b = self.fb.create_block();
+            let bits = layout::elem_get_word(&mut self.fb, obj, key, helper_b);
+            let (is_obj, is_str, w) = layout::word_counted(&mut self.fb, bits);
+            let rc_so = layout::rc_strong_offset();
+            let counted = match rc_so {
+                Some(_) => self.fb.binary(BinaryOp::Bor, is_obj, is_str),
+                None => is_obj,
+            };
+            let obj_b = self.fb.create_block();
+            self.fb.brif(counted, obj_b, &[], helper_b, &[]);
+            self.fb.seal_block(obj_b);
+            self.fb.switch_to_block(obj_b);
+            let gc = if PTR == Type::I64 {
+                w
+            } else {
+                self.fb.convert(ConvOp::Wrap, PTR, w)
+            };
+            let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
+            let strong = self.fb.load(PTR_MEM, gc, so);
+            let one = self.ptrc(1);
+            let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
+            self.fb.store(PTR_MEM, gc, s1, so);
+            if let Some(i) = drop {
+                self.drop_at(i);
+            }
+            let o = self.soff(at);
+            let to = self.i32c(TAG_OBJ as i64);
+            let ts = self.i32c(TAG_STR as i64);
+            let t = self.fb.select(is_obj, to, ts);
+            self.fb.store(MemKind::I32U8, self.stackp, t, o);
+            self.fb.store(PTR_MEM, self.stackp, gc, o + VALUE_PAYLOAD);
+            self.fb.jump(join, &[]);
+            self.fb.seal_block(helper_b);
+            self.fb.switch_to_block(helper_b);
+            let dst = self.sptr(at);
+            let cv = self.i32c(drop.is_some() as i64);
+            let r = self
+                .call(Helper::ElemGet, &[self.frame, obj, key, dst, cv])
+                .expect("ElemGet returns a flag");
+            let z = self.i32c(0);
+            let hit = self.fb.icmp(IntCC::Ne, r, z);
+            let gen = self.fb.create_block();
+            self.fb.brif(hit, join, &[], gen, &[]);
+            self.fb.seal_block(gen);
+            self.fb.switch_to_block(gen);
+        }
         if self.slow_path(pc, slow) {
             self.slow_to_join(pc, at, want, join);
         }
@@ -4053,7 +4881,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         slow: Slow,
         src: Option<Src>,
     ) {
-        let ta_first = self.ta_first(src);
+        let ta_first = self.ta_first(src) || helpers::ta_hot(self.chunk, pc);
         let d = self.stack.len();
         let pre = self.stack.clone();
         let slow_b = self.fb.create_block();
@@ -4174,10 +5002,29 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(refresh);
             self.fb.switch_to_block(refresh);
         }
-        let w = self.i32c(store.is_some() as i64);
+        // An uncached site passes its pc: fed typed arrays often, it asks for a recompile
+        // with a cache (exiting before the op).
+        let flags = match cache {
+            Some(_) => store.is_some() as i64,
+            None => store.is_some() as i64 | 2 | (pc as i64) << 2,
+        };
+        let w = self.i32c(flags);
         let k = self
             .call(Helper::TaView, &[self.frame, obj, w])
             .expect("TaView returns a kind");
+        if cache.is_none() {
+            let rc = self.i32c(tc::RECOMPILE as i64);
+            let hot = self.fb.icmp(IntCC::Eq, k, rc);
+            let ex = self.fb.create_block();
+            let cont = self.fb.create_block();
+            self.fb.brif(hot, ex, &[], cont, &[]);
+            self.fb.seal_block(ex);
+            self.fb.switch_to_block(ex);
+            let st = self.stack.clone();
+            self.emit_exit(pc, EXIT_RESUME, &st, st.len(), None);
+            self.fb.seal_block(cont);
+            self.fb.switch_to_block(cont);
+        }
         let data = self.fb.load(PTR_MEM, self.frame, FRAME_TA_DATA);
         let len = self.fb.load(PTR_MEM, self.frame, FRAME_TA_LEN);
         if let Some(t) = cache {
@@ -4294,6 +5141,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         slow: Slow,
         src: Option<Src>,
     ) -> Result<(), String> {
+        if let Some(g) = self.plan.dget.get(&pc).cloned() {
+            if self.inline_getter(pc, obj, drop, at, slow, &g) {
+                return Ok(());
+            }
+        }
         let is_len = &*self.chunk.names[n as usize] == "length";
         let ic = if is_len {
             None
@@ -4340,8 +5192,37 @@ impl<'a, 'f> Tr<'a, 'f> {
                 }
                 self.fb.jump(join, &[x]);
             }
+            Some(ic) if want => {
+                // A data property holding a non-Number: the slow path re-reads it (no getter
+                // can run: the IC only bakes data properties).
+                let f = layout::prop_get_num(&mut self.fb, obj, ic, miss);
+                self.seal_current();
+                if let Some(i) = drop {
+                    self.drop_at(i);
+                }
+                self.fb.jump(join, &[f]);
+            }
             Some(ic) => {
-                let (tag, payload) = layout::prop_get(&mut self.fb, obj, ic, miss);
+                // A refcounted value of a data property (not wanted as a Number): cloned out
+                // by `Helper::UnpackClone` into the result entry (which may be the receiver's).
+                let refc = (!want && drop.is_none_or(|i| i == at)).then(|| {
+                    let b = self.fb.create_block();
+                    let w = self.fb.append_block_param(b, Type::I64);
+                    (b, w)
+                });
+                let (tag, payload) = layout::prop_get(&mut self.fb, obj, ic, miss, refc.map(|r| r.0));
+                if let Some((b, w)) = refc {
+                    let cont = self.fb.create_block();
+                    self.fb.jump(cont, &[]);
+                    self.fb.seal_block(b);
+                    self.fb.switch_to_block(b);
+                    let dst = self.sptr(at);
+                    let cv = self.i32c(drop.is_some() as i64);
+                    self.call(Helper::UnpackClone, &[dst, w, cv]);
+                    self.fb.jump(join, &[]);
+                    self.fb.seal_block(cont);
+                    self.fb.switch_to_block(cont);
+                }
                 self.seal_current();
                 if want {
                     // A data property holding a non-Number: the slow path re-reads it (no

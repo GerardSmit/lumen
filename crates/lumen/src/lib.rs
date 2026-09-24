@@ -49,21 +49,30 @@ mod jstr;
 mod lexer;
 mod lstr;
 mod modules;
+#[doc(hidden)]
+pub use modules::load_stats;
 #[cfg(feature = "intl")]
 mod numbering;
+mod lzh;
+/// Opt-in memory accounting (`LUMEN_MEM_STATS=1`).
+pub mod memstats;
 mod parser;
 pub mod precompiled;
 mod regex;
 mod regex_emoji;
 mod regex_fold;
 mod snapshot;
+mod sync_callbacks;
 mod temporal;
 mod token;
 mod tz;
+pub mod typescript;
 #[rustfmt::skip]
 mod tzdata;
 #[rustfmt::skip]
 mod umalqura;
+#[cfg(feature = "intl")]
+mod cldr_pack;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_likely;
@@ -90,7 +99,7 @@ use value::Value;
 pub mod bench_api {
     pub use crate::ast::Stmt;
     pub use crate::lexer::tokenize;
-    pub use crate::parser::{parse_module, parse_script};
+    pub use crate::parser::{parse_module, parse_module_ts, parse_script};
     pub use crate::snapshot::{decode, encode};
 }
 
@@ -177,6 +186,7 @@ impl Default for Engine {
 impl Engine {
     pub fn new() -> Engine {
         interpreter::sym_for_reset();
+        let _mem = memstats::enter(memstats::Cat::Builtins);
         Engine {
             interp: Interp::new(),
         }
@@ -219,7 +229,7 @@ impl Engine {
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
         self.interp.strict = strict || directive_strict;
-        let result = self.interp.run_program(&body);
+        let result = self.interp.run_program_parsed(&body);
         // Run queued promise reactions (the microtask checkpoint after the script).
         self.interp.run_agent_event_loop();
         match result {
@@ -252,7 +262,7 @@ impl Engine {
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
         self.interp.strict = strict || directive_strict;
-        let result = self.interp.run_program(&body);
+        let result = self.interp.run_program_parsed(&body);
         self.interp.run_agent_event_loop();
         match result {
             Ok(v) => Ok(Completion::Value(self.render(&v))),
@@ -280,12 +290,15 @@ impl Engine {
             let body = unit
                 .decode()
                 .map_err(|e| bad(format!("{}: {e}", unit.key)))?;
+            if memstats::enabled() {
+                memstats::phase(&format!("  decoded {}", unit.key));
+            }
             let directive_strict = matches!(
                 body.first(),
                 Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
             );
             self.interp.strict = directive_strict;
-            let result = self.interp.run_program(&body);
+            let result = self.interp.run_program_named(&body, Some(&unit.key));
             self.interp.run_agent_event_loop();
             last = match result {
                 Ok(v) => Completion::Value(self.render(&v)),
@@ -425,6 +438,26 @@ impl Engine {
         std::mem::take(&mut self.interp.console)
     }
 
+    /// Node's uncaught report for a TypeScript SyntaxError (one with an
+    /// `ERR_…_TYPESCRIPT_SYNTAX` `code` and a string `stack`).
+    fn ts_uncaught_text(&mut self, thrown: &Value) -> Option<String> {
+        if !matches!(thrown, Value::Obj(_)) {
+            return None;
+        }
+        let code = match self.interp.get_member(thrown, "code") {
+            Ok(v @ Value::Str(_)) => self.render(&v),
+            _ => return None,
+        };
+        if !code.ends_with("_TYPESCRIPT_SYNTAX") {
+            return None;
+        }
+        let stack = match self.interp.get_member(thrown, "stack") {
+            Ok(v @ Value::Str(_)) => self.render(&v),
+            _ => return None,
+        };
+        Some(typescript::node_uncaught_text(&stack, &code))
+    }
+
     fn render(&mut self, v: &Value) -> String {
         self.interp
             .to_string(v)
@@ -433,6 +466,14 @@ impl Engine {
     }
 
     fn describe_throw(&mut self, thrown: Value) -> Completion {
+        // A rejected TypeScript source reports as Node prints it (its `stack` and `code`),
+        // with an empty name: callers print the message alone.
+        if let Some(text) = self.ts_uncaught_text(&thrown) {
+            return Completion::Throw {
+                name: String::new(),
+                message: text,
+            };
+        }
         // Pull the constructor name + message off an Error object; fall back to the rendered value.
         let name = match self.interp.get_member(&thrown, "name") {
             Ok(Value::Undefined) | Err(_) => {
@@ -480,6 +521,8 @@ pub mod embed {
         MemberDesc, MemberKind, OpDesc, OpError, OpResult, Promise, SendError, Settle, Slot, State,
         This,
     };
+    /// A sync non-escaping callback argument (`#[op]` parameter type).
+    pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};
     #[doc(hidden)]
     pub use crate::embed_convert::private as __private;
     /// The binding macros (feature `macros`), also at the crate root.
@@ -536,7 +579,7 @@ impl Engine {
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
         self.interp.strict = directive_strict;
-        Ok(match self.interp.run_program(&body) {
+        Ok(match self.interp.run_program_parsed(&body) {
             Ok(Value::Empty) => Ok(Value::Undefined),
             result => result,
         })

@@ -169,10 +169,14 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi, feat: &Features) -> Result<Lowe
 
     let entry = f.entry();
     let pre_entry = !cfg.preds[entry.index()].is_empty();
-    let order = rotate_loops(
+    let order = crate::cfg::sink_cold(
         f,
         cfg,
-        f.layout.iter().copied().filter(|&b| cfg.is_reachable(b)).collect(),
+        rotate_loops(
+            f,
+            cfg,
+            f.layout.iter().copied().filter(|&b| cfg.is_reachable(b)).collect(),
+        ),
     );
     let mut bmap = vec![usize::MAX; f.blocks.len()];
     for (i, &b) in order.iter().enumerate() {

@@ -2666,7 +2666,8 @@ impl<I: ReInput> Matcher<I> {
     fn rep_matches(&self, rep: &Rep, c: u32) -> bool {
         match rep {
             Rep::Char(ch) => self.eqc_uu(c, *ch),
-            Rep::Any => self.dotall() || c != '\n' as u32,
+            // `.` excludes every LineTerminator (\n, \r, U+2028, U+2029) unless `s`.
+            Rep::Any => self.dotall() || !is_line_terminator_u32(c),
             Rep::Class(cc) => cc.matches(c, self.icase(), self.unicode),
         }
     }

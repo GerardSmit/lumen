@@ -268,15 +268,24 @@ Object.defineProperty(globalThis, "__lumenEsmHook", { value: esmHook, writable: 
 // Compile CommonJS source into `module` via the wrapper — the shared back half of the `.js`
 // extension handler, split out so a registerHooks load hook can feed transformed source in.
 // With `detectEsm`, a source that does not parse as CommonJS returns false (nothing ran) so the
-// caller can load it as ESM instead; otherwise the parse error propagates.
-function compileCommonJS(module, filename, source, detectEsm = false) {
+// caller can load it as ESM instead; otherwise the parse error propagates. With `ts` the source
+// is TypeScript: the engine compiles it itself (strip-only semantics) with no synthesized
+// wrapper header, so every position is the file's.
+function compileCommonJS(module, filename, source, detectEsm = false, ts = false) {
   const dirname = path.dirname(filename);
-  // A leading #! shebang line is stripped, as Node does, before wrapping.
-  source = String(source).replace(/^#!.*/, "");
+  // A leading #! shebang line is neutralized, as Node does, before wrapping: `#!` becomes `//`
+  // so every offset in the file (and in its type table) stays put.
+  source = String(source).replace(/^#!/, "//");
   const require = makeRequire(dirname, module);
   let compiled;
   try {
-    compiled = new Function("exports", "require", "module", "__filename", "__dirname", source);
+    if (ts) {
+      compiled = __node.compileCommonJS(source, filename, true);
+    } else {
+      compiled = new Function("exports", "require", "module", "__filename", "__dirname", source);
+      // Stack traces name the module's frames after its file, positions relative to `source`.
+      __node.nameSource(compiled, filename);
+    }
   } catch (e) {
     if (detectEsm && e instanceof SyntaxError) return false;
     throw e;
@@ -598,11 +607,21 @@ const _extensions = {
   ".mjs": function (module, filename) {
     loadESM(module, filename);
   },
+  // TypeScript: the engine parses it (Node's strip-only semantics, every offset kept). `.ts`
+  // follows the package "type" (with syntax detection when there is none), like `.js`; `.mts`
+  // is always ESM, `.cts` always CommonJS.
   ".ts": function (module, filename) {
-    compileCommonJS(module, filename, stripTypeScriptTypes(__node.readText(filename), { sourceUrl: filename }));
+    const type = packageScopeType(filename);
+    if (type === "module") return loadESM(module, filename);
+    const source = __node.readText(filename);
+    const detect = type === undefined && ESM_SYNTAX.test(source);
+    if (!compileCommonJS(module, filename, source, detect, true)) loadESM(module, filename);
+  },
+  ".mts": function (module, filename) {
+    loadESM(module, filename);
   },
   ".cts": function (module, filename) {
-    compileCommonJS(module, filename, stripTypeScriptTypes(__node.readText(filename), { sourceUrl: filename }));
+    compileCommonJS(module, filename, __node.readText(filename), false, true);
   },
   ".json": function (module, filename) {
     module.exports = JSON.parse(__node.readText(filename));
@@ -864,10 +883,20 @@ const PROCESS_EXPORTS = [
   "allowedNodeEnvironmentFlags", "setSourceMapsEnabled",
 ];
 
-function makeBuiltinEsmSource(name) {
+// The export names come from esm_exports.js, not the module's keys: reading those would load
+// every builtin at startup (they load on first use; see build.rs `LAZY`).
+function builtinExportNames(name) {
+  if (name === "process") return PROCESS_EXPORTS;
+  if (!__builtins.has(name)) return [];
+  const listed = __ESM_EXPORTS[name];
+  if (listed !== undefined) return listed ? listed.split(" ") : [];
   const m = __builtins.get(name);
+  return m && (typeof m === "object" || typeof m === "function") ? Object.keys(m) : [];
+}
+
+function makeBuiltinEsmSource(name) {
   let src = `const __m = globalThis.__esmBuiltin(${JSON.stringify(name)});\nexport default __m;\n`;
-  const keys = name === "process" ? PROCESS_EXPORTS : m && (typeof m === "object" || typeof m === "function") ? Object.keys(m) : [];
+  const keys = builtinExportNames(name);
   for (const k of keys) {
     if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) && k !== "default") {
       src += `export const ${k} = __m[${JSON.stringify(k)}];\n`;

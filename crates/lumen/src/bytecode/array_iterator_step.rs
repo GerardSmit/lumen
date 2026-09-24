@@ -31,6 +31,13 @@ pub(super) fn try_yield(i: &Interp, iterator: &Value, captured_next: &Value) -> 
     }
 }
 
+/// A yielded array step taken without the iterator protocol by `iter_fast` (same observable
+/// contract as a `try_yield` success, so the tests below count both).
+#[cfg(test)]
+pub(super) fn note_success() {
+    SUCCESSES.with(|n| n.set(n.get() + 1));
+}
+
 #[cfg(test)]
 thread_local! { static SUCCESSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 

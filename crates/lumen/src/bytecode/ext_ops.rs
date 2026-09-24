@@ -158,14 +158,22 @@ pub(super) fn init_method(
     };
     let obj = literal_obj(stack);
     // The oracle's per-literal home scope; one per method is indistinguishable (it binds only
-    // the literal as `%homeobject%`).
-    let home_env = crate::interpreter::new_scope(Some(env.clone()));
-    crate::eval::bind(&home_env, "%homeobject%", Value::Obj(obj.clone()));
-    let f = i.make_function(func.clone(), home_env);
+    // the literal as `%homeobject%`). A method that can't reach its home object (no `super`,
+    // no direct `eval`) closes over `env` directly: no scope and no literal <-> method cycle.
+    let fenv = if func.may_use_home() {
+        let home_env = crate::interpreter::new_scope(Some(env.clone()));
+        crate::eval::bind(&home_env, "%homeobject%", Value::Obj(obj.clone()));
+        home_env
+    } else {
+        env.clone()
+    };
     let name = i.fn_name_for_key(&k);
+    let (f, named) = i.make_function_named(func.clone(), fenv, (kind == 0).then_some(&*name));
     match kind {
         0 => {
-            i.set_fn_name(&f, &name);
+            if !named {
+                i.set_fn_name(&f, &name);
+            }
             obj.borrow_mut()
                 .props
                 .insert(k, crate::value::Property::plain(f));
@@ -295,12 +303,30 @@ pub(super) fn array_append(
     let Some(Value::Obj(ao)) = stack.last() else {
         unreachable!("array literal under construction")
     };
+    append_to(ao, items, hole);
+}
+
+/// [`array_append`] on the array literal `ao` itself (the compiled code's `ArrayAppend`
+/// helper appends through here without an operand stack).
+pub(super) fn append_to(ao: &crate::value::Gc, items: impl IntoIterator<Item = Value>, hole: bool) {
     let mut o = ao.borrow_mut();
     let mut idx = match o.props.get("length").map(|p| p.value()) {
         Some(Value::Num(n)) => n as usize,
         _ => 0,
     };
-    for v in items {
+    // A run appended at the packed frontier lands in one reservation.
+    let items = items.into_iter();
+    let items = match u32::try_from(idx) {
+        Ok(n) => match o.props.try_extend_elements(n, items) {
+            Ok(added) => {
+                idx += added;
+                None
+            }
+            Err(items) => Some(items),
+        },
+        Err(_) => Some(items),
+    };
+    for v in items.into_iter().flatten() {
         // The literal under construction is an ordinary Array no code has seen: its elements
         // are exactly the dense run appended so far (plus holes), so the next index is the
         // dense frontier (or a bounded hole run past it) — no decimal key, no hashing.
@@ -390,8 +416,16 @@ fn class_time_expr_ok(e: &Expr) -> bool {
             }
             crate::ast::ArrayElem::Hole => true,
         }),
-        Expr::Func(f) => !f.is_arrow,
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+        // An arrow: its `this` flows through the env like the class's own (CaptureScan walks
+        // the class as an arrow chain); `arguments`, `super` and `new.target` would resolve
+        // against the compiled frame — refused by a conservative source-text check.
+        Expr::Func(f) => {
+            !f.is_arrow
+                || f.source().is_some_and(|src| {
+                    !src.contains("arguments") && !src.contains("super") && !src.contains("new.target")
+                })
+        }
+        Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
             !matches!(**callee, Expr::Super)
                 && !matches!(&**callee, Expr::Ident(n) if n == "eval")
                 && class_time_expr_ok(callee)
@@ -435,8 +469,14 @@ impl Compiler {
                     return Err(Bail);
                 }
                 let (load, store) = match self.home(name) {
-                    Some(Home::Slot(_, true)) | Some(Home::Env(true)) => return Err(Bail),
+                    Some(Home::Slot(_, true)) | Some(Home::Env(true)) | Some(Home::Blk(_, true)) => {
+                        return Err(Bail)
+                    }
                     Some(Home::Slot(slot, false)) => (Op::LoadLocal(slot), Op::StoreLocal(slot)),
+                    Some(Home::Blk(c, false)) => {
+                        let n = self.name_idx(name);
+                        (Op::BlkLoad(c, n), Op::BlkStore(c, n))
+                    }
                     Some(Home::Env(false)) => {
                         let n = self.name_idx(name);
                         (Op::LoadCap(n), Op::StoreCap(n))
@@ -517,7 +557,24 @@ impl Compiler {
     /// current env. `name` is the NamedEvaluation target for an anonymous class.
     pub(super) fn class_value(&mut self, c: &Rc<Class>, name: Option<&str>) -> CResult {
         if !class_ok(c) {
-            super::log_bail("class", "definition-time expression outside the subset");
+            if super::bail_log_enabled() {
+                let bad = c
+                    .superclass
+                    .iter()
+                    .map(|e| &**e)
+                    .chain(c.members.iter().filter_map(|m| match &m.key {
+                        PropKey::Computed(k) => Some(k),
+                        _ => None,
+                    }))
+                    .find(|e| !class_time_expr_ok(e));
+                match bad {
+                    Some(e) if c.decorators.is_empty() => super::log_bail(
+                        "class",
+                        &format!("definition-time expression {}", super::node_kind(e)),
+                    ),
+                    _ => super::log_bail("class", "decorators"),
+                }
+            }
             return Err(Bail);
         }
         // A computed key / heritage reading `this` resolves it through the env chain: the
@@ -528,6 +585,7 @@ impl Compiler {
             Some(n) if c.name.is_none() => self.name_idx(n),
             _ => u32::MAX,
         };
+        self.env_prefix();
         self.emit(Op::MakeClass(cidx, n));
         Ok(())
     }
@@ -588,6 +646,7 @@ impl Compiler {
                     };
                     let fidx = self.funcs.len() as u32;
                     self.funcs.push(func.clone());
+                    self.env_prefix();
                     self.emit(Op::InitMethod(fidx, n, kind));
                 }
                 PropDef::Spread(e) => {
@@ -603,3 +662,4 @@ impl Compiler {
         Ok(())
     }
 }
+

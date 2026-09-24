@@ -53,6 +53,7 @@
     return m ? new Ctor(m[2]) : new Error(String(text));
   }
 
+  let terminateCallbackWarned = false;
   class Worker extends EventEmitter {
     #id;
     #exited = false;
@@ -153,8 +154,17 @@
     }
     terminate(callback) {
       // Legacy callback form, still honored by Node alongside the promise.
-      if (typeof callback === "function") this.once("exit", (code) => callback(null, code));
+      if (typeof callback === "function") {
+        if (!terminateCallbackWarned) {
+          terminateCallbackWarned = true;
+          process.emitWarning("Passing a callback to worker.terminate() is deprecated. It returns a Promise instead.",
+            "DeprecationWarning", "DEP0132");
+        }
+        this.once("exit", (code) => callback(null, code));
+      }
       if (this.#exited) return Promise.resolve(this.#exitCode);
+      // The returned promise keeps the loop alive until the exit, even for an unref()'d worker.
+      getWorkerOps().setRef(this.#id, true);
       getWorkerOps().terminate(this.#id);
       return new Promise((resolve) => this.#exitResolvers.push(resolve));
     }
