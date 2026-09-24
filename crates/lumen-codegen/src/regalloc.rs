@@ -56,53 +56,87 @@ fn def_pos(i: usize) -> u32 {
 
 pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
     let nv = code.vreg_class.len();
-    let words = nv.div_ceil(64);
     let nb = code.blocks.len();
 
     // ----- per-block gen/kill and liveness -----
-    let mut gen = vec![vec![0u64; words]; nb];
-    let mut kill = vec![vec![0u64; words]; nb];
+    // Upward-exposed uses (gen) and defs (kill) per block, as lists. Only a value in some
+    // block's gen can be live into (and so out of) any block: liveness is solved over those
+    // "global" values alone, densely renumbered (most values are block-local).
     let mut ops = Vec::new();
-    let set = |s: &mut Vec<u64>, v: VReg| s[v.index() / 64] |= 1 << (v.index() % 64);
-    let has = |s: &Vec<u64>, v: VReg| s[v.index() / 64] & (1 << (v.index() % 64)) != 0;
+    let mut gen_l: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    let mut kill_l: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    let mut kill_at = vec![u32::MAX; nv];
+    let mut gen_at = vec![u32::MAX; nv];
     for (bi, b) in code.blocks.iter().enumerate() {
+        let bu = bi as u32;
         for &p in &b.params {
-            set(&mut kill[bi], p);
+            if kill_at[p.index()] != bu {
+                kill_at[p.index()] = bu;
+                kill_l[bi].push(p.0);
+            }
         }
         for i in b.start..b.end {
             ops.clear();
             code.insts[i].operands(&mut ops);
             for o in &ops {
-                if o.kind != OperandKind::Def && !has(&kill[bi], o.vreg) {
-                    set(&mut gen[bi], o.vreg);
+                let v = o.vreg.index();
+                if o.kind != OperandKind::Def && kill_at[v] != bu && gen_at[v] != bu {
+                    gen_at[v] = bu;
+                    gen_l[bi].push(o.vreg.0);
                 }
             }
             for o in &ops {
-                if o.kind != OperandKind::Use {
-                    set(&mut kill[bi], o.vreg);
+                let v = o.vreg.index();
+                if o.kind != OperandKind::Use && kill_at[v] != bu {
+                    kill_at[v] = bu;
+                    kill_l[bi].push(o.vreg.0);
                 }
             }
         }
     }
+    drop((kill_at, gen_at));
+    let mut gidx = vec![u32::MAX; nv];
+    let mut globals: Vec<u32> = Vec::new();
+    for &v in gen_l.iter().flatten() {
+        if gidx[v as usize] == u32::MAX {
+            gidx[v as usize] = globals.len() as u32;
+            globals.push(v);
+        }
+    }
+    let words = globals.len().div_ceil(64);
+    let mut gen = vec![vec![0u64; words]; nb];
+    let mut kill = vec![vec![0u64; words]; nb];
+    let set = |s: &mut Vec<u64>, g: u32| s[g as usize / 64] |= 1 << (g % 64);
+    for bi in 0..nb {
+        for &v in &gen_l[bi] {
+            set(&mut gen[bi], gidx[v as usize]);
+        }
+        for &v in &kill_l[bi] {
+            if gidx[v as usize] != u32::MAX {
+                set(&mut kill[bi], gidx[v as usize]);
+            }
+        }
+    }
+    drop((gen_l, kill_l, gidx));
     let mut live_in = vec![vec![0u64; words]; nb];
     let mut live_out = vec![vec![0u64; words]; nb];
     let mut changed = true;
+    let (mut out, mut inn) = (vec![0u64; words], vec![0u64; words]);
     while changed {
         changed = false;
         for bi in (0..nb).rev() {
-            let mut out = vec![0u64; words];
+            out.fill(0);
             for &s in &code.blocks[bi].succs {
-                for w in 0..words {
-                    out[w] |= live_in[s][w];
+                for (o, &l) in out.iter_mut().zip(&live_in[s]) {
+                    *o |= l;
                 }
             }
-            let mut inn = gen[bi].clone();
             for w in 0..words {
-                inn[w] |= out[w] & !kill[bi][w];
+                inn[w] = gen[bi][w] | (out[w] & !kill[bi][w]);
             }
             if inn != live_in[bi] || out != live_out[bi] {
-                live_in[bi] = inn;
-                live_out[bi] = out;
+                live_in[bi].copy_from_slice(&inn);
+                live_out[bi].copy_from_slice(&out);
                 changed = true;
             }
         }
@@ -135,12 +169,15 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
             touch(p, entry, &mut lo, &mut hi, &mut touched);
             weight[p.index()] += w;
         }
-        for v in 0..nv {
-            if live_in[bi][v / 64] & (1 << (v % 64)) != 0 {
-                touch(VReg(v as u32), entry, &mut lo, &mut hi, &mut touched);
-            }
-            if live_out[bi][v / 64] & (1 << (v % 64)) != 0 {
-                touch(VReg(v as u32), exit, &mut lo, &mut hi, &mut touched);
+        // (The set bits only: a word at a time.)
+        for (set, pos) in [(&live_in[bi], entry), (&live_out[bi], exit)] {
+            for (wi, &word) in set.iter().enumerate() {
+                let mut m = word;
+                while m != 0 {
+                    let v = globals[wi * 64 + m.trailing_zeros() as usize];
+                    m &= m - 1;
+                    touch(VReg(v), pos, &mut lo, &mut hi, &mut touched);
+                }
             }
         }
         for i in b.start..b.end {

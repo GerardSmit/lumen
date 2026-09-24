@@ -3,7 +3,7 @@ use crate::value::{Property, Value};
 pub(in crate::value) use entries::EntryVec;
 use shapes::SHAPE_EMPTY;
 use std::rc::Rc;
-pub(in crate::value) use storage::DenseStorage;
+pub(in crate::value) use storage::{DenseBuffers, DenseStorage, INLINE_PACKED_CAPACITY};
 mod access;
 mod array_builder;
 mod elements;
@@ -15,7 +15,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 pub(crate) use shapes::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
-pub(in crate::value) use shapes::{Shape, ShapeTable};
+pub(in crate::value) use shapes::{array_length_shape, Shape, ShapeTable};
 /// Sizes for a heap census (`LUMEN_HEAP_CENSUS`): entries used / reserved, how many of them are
 /// named (shape-keyed), whether a dense sidecar exists, and whether the shape is owned by this
 /// object alone (its key list is then per-object memory).
@@ -332,6 +332,42 @@ impl Props {
         }
     }
 
+    /// Whether [`crate::value::Object::alloc_from_template`] can instantiate this template:
+    /// a plain named map with no element sidecar, a shared (or empty) shape, and at most
+    /// `inline` entries.
+    #[inline]
+    pub(crate) fn fast_template(&self, inline: usize) -> bool {
+        self.entries.len() <= inline
+            && !self.elems.is_present()
+            && !self.elem_mode.get()
+            && !self.shape_rc.as_ref().is_some_and(|s| s.owned())
+    }
+
+    /// An instance map of a [`fast_template`](Props::fast_template) whose `len` entries are
+    /// already written at `buf` (a new box's inline slots, `cap` of them). Built by value
+    /// inside the box write, so every field is one direct store.
+    ///
+    /// # Safety
+    /// As [`EntryVec::inline_raw`]; `len` must equal this template's entry count.
+    #[inline(always)]
+    pub(in crate::value) unsafe fn instantiate_inline_raw(
+        &self,
+        buf: *mut crate::value::Property,
+        len: usize,
+        cap: usize,
+    ) -> Props {
+        Props {
+            entries: EntryVec::inline_raw(buf, len, cap),
+            proto_flag: std::cell::Cell::new(false),
+            shape: self.shape,
+            shape_rc: self.shape_rc.clone(),
+            elems: DenseStorage::default(),
+            has_far: std::cell::Cell::new(self.has_far.get()),
+            elem_mode: std::cell::Cell::new(false),
+            ctor_capacity: std::cell::Cell::new(0),
+        }
+    }
+
     /// Complete an [`instantiate_shell`](Props::instantiate_shell) map with its values, in
     /// shape order.
     #[inline]
@@ -436,7 +472,7 @@ impl Props {
     /// Final named-property count of a small ordinary instance, recorded after a successful
     /// construct so later allocations can reserve the right capacity.
     pub(crate) fn observed_instance_capacity(&self) -> usize {
-        if self.elems.0.is_none() && self.entries.len() <= 16 {
+        if !self.elems.is_present() && self.entries.len() <= 16 {
             self.entries.len()
         } else {
             0

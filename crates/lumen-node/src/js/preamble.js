@@ -60,52 +60,105 @@ if (typeof globalThis.global === "undefined") {
   globalThis.global = globalThis;
 }
 
-// V8's `Error.captureStackTrace` / `Error.prepareStackTrace` / CallSite API. The engine does not
-// implement these (grep confirms: no such symbol), and this preamble runs once — so we define them
-// outright rather than guarding on `typeof`. They are pervasive in the Node ecosystem: http-errors
-// and depd build Error subclasses with captureStackTrace, and depd reads *structured* frames
-// (a `prepareStackTrace` hook receiving CallSite objects it calls `.getFileName()`/`.getLineNumber()`
-// on). lumen has no per-frame source info, so we hand back placeholder CallSites — enough that the
-// deprecation machinery runs (with a `<lumen>` location) instead of crashing. `.stack` stays a
-// normal string when no custom `prepareStackTrace` hook is installed.
-Error.stackTraceLimit = 10;
-const makeCallSite = () => ({
-  getThis: () => undefined,
-  getTypeName: () => null,
-  getFunction: () => undefined,
-  getFunctionName: () => null,
-  getMethodName: () => null,
-  getFileName: () => "<lumen>",
-  getLineNumber: () => 0,
-  getColumnNumber: () => 0,
-  getEvalOrigin: () => undefined,
-  isToplevel: () => true,
-  isEval: () => false,
-  isNative: () => false,
-  isConstructor: () => false,
-  isAsync: () => false,
-  toString: () => "<lumen>:0:0",
-});
-Error.captureStackTrace = function (target, _ctorOpt) {
-  const sites = Array.from({ length: Error.stackTraceLimit || 10 }, makeCallSite);
-  Object.defineProperty(target, "stack", {
-    configurable: true,
-    get() {
-      const prepare = Error.prepareStackTrace;
-      if (typeof prepare === "function") return prepare(target, sites);
-      return `${target.name || "Error"}: ${target.message || ""}\n    at <lumen>:0:0`;
-    },
-    set(value) {
-      Object.defineProperty(target, "stack", { value, writable: true, configurable: true });
-    },
-  });
-  return target;
-};
+// Builtin files that load on first use. The glue build (lumen-node/build.rs `LAZY`) wraps each
+// such file in `__lazyGlue(index, builtins, internals, globals, init)`, naming what the file
+// registers; the first lookup of any of those names runs the file, so a program pays only for
+// the builtins it touches. `__glueIndex` is the glue-order position of the file running now:
+// when several files set one name, the value of the file that comes last in glue order wins,
+// whichever order they run in — the result every file running eagerly, in order, gave.
+let __glueIndex = 0;
+class __GlueRegistry extends Map {
+  constructor() {
+    super();
+    // name -> [pending lazy records that set it]; name -> glue index of the value held.
+    this.pending = new Map();
+    this.index = new Map();
+  }
+  get(key) {
+    const pending = this.pending.get(key);
+    if (pending !== undefined) for (const rec of [...pending]) __glueRun(rec);
+    return super.get(key);
+  }
+  has(key) {
+    return super.has(key) || this.pending.has(key);
+  }
+  set(key, value) {
+    const held = this.index.get(key);
+    if (held !== undefined && held > __glueIndex) return this;
+    this.index.set(key, __glueIndex);
+    return super.set(key, value);
+  }
+  // Every name, set or pending, in glue order (a lazy file's names where the file stands).
+  keys() {
+    const order = new Map();
+    for (const key of super.keys()) order.set(key, this.index.get(key));
+    for (const [key, recs] of this.pending) {
+      const at = Math.min(...recs.map((r) => r.index));
+      if (!order.has(key) || at < order.get(key)) order.set(key, at);
+    }
+    return [...order].sort((a, b) => a[1] - b[1]).map((e) => e[0])[Symbol.iterator]();
+  }
+}
+function __glueRun(rec) {
+  if (rec.state !== 0) return;
+  rec.state = 1;
+  const saved = __glueIndex;
+  __glueIndex = rec.index;
+  const init = rec.init;
+  // Run once: drop the closure so its code can be freed once the glue's own body is released.
+  rec.init = null;
+  try {
+    init();
+  } finally {
+    __glueIndex = saved;
+    rec.state = 2;
+    for (const [reg, name] of rec.names) {
+      const recs = reg.pending.get(name);
+      const at = recs.indexOf(rec);
+      if (at >= 0) recs.splice(at, 1);
+      if (recs.length === 0) reg.pending.delete(name);
+    }
+  }
+}
+function __lazyGlue(index, builtins, internals, globals, init) {
+  const rec = { index, init, state: 0, names: [] };
+  for (const [reg, list] of [[__builtins, builtins], [__internals, internals]]) {
+    for (const name of list.split(" ")) {
+      if (!name) continue;
+      const recs = reg.pending.get(name);
+      if (recs === undefined) reg.pending.set(name, [rec]);
+      else recs.push(rec);
+      rec.names.push([reg, name]);
+    }
+  }
+  // Globals the file defines: an accessor runs the file on first touch, and an assignment
+  // (the file's own, or a program's) replaces it with a plain data property.
+  for (const name of globals.split(" ")) {
+    if (!name) continue;
+    const get = () => {
+      __glueRun(rec);
+      const now = Object.getOwnPropertyDescriptor(globalThis, name);
+      if (now !== undefined && now.get === get) {
+        if (rec.state !== 2) return undefined;
+        delete globalThis[name];
+        return undefined;
+      }
+      return globalThis[name];
+    };
+    const set = (value) => {
+      Object.defineProperty(globalThis, name, { value, writable: true, enumerable: true, configurable: true });
+    };
+    Object.defineProperty(globalThis, name, { get, set, enumerable: false, configurable: true });
+  }
+}
 
 // A registry the module system fills in; each builtin registers itself as it is defined.
-const __builtins = new Map();
+const __builtins = new __GlueRegistry();
+// URL.createObjectURL's registry: "nodedata" id -> Blob (url.js registers, buffer.resolveObjectURL
+// reads).
+const __objectURLs = new Map();
 // Glue-internal values shared between the wrapped builtin files (never user-requirable).
-const __internals = new Map();
+const __internals = new __GlueRegistry();
 
 // libuv's error table (uv_err_name / uv_strerror): name -> description, and the negative errno
 // each platform's libuv reports (Windows uses libuv's own -40xx range; Unix negates errno). Names
@@ -237,8 +290,13 @@ const __errors = (() => {
   function E(key, msg, Base, ...otherBases) {
     const make = (B) => ({
       [key]: function (...args) {
-        const message = typeof msg === "function" ? msg(...args) : args.length ? format(msg, ...args) : msg;
-        return __nodeError(B, key, message);
+        // A message function may set properties on `this` (Node's host/port, …); they land on
+        // the error.
+        const props = {};
+        const message = typeof msg === "function" ? Reflect.apply(msg, props, args) : args.length ? format(msg, ...args) : msg;
+        const err = __nodeError(B, key, message);
+        for (const k of Object.keys(props)) err[k] = props[k];
+        return err;
       },
     })[key];
     codes[key] = make(Base);
@@ -313,7 +371,30 @@ const __errors = (() => {
   E("ERR_STREAM_CANNOT_PIPE", "Cannot pipe, not readable", Error);
   E("ERR_STREAM_PUSH_AFTER_EOF", "stream.push() after EOF", Error);
   E("ERR_STREAM_UNSHIFT_AFTER_END_EVENT", "stream.unshift() after end event", Error);
+  // Node's ERR_INVALID_URL keeps the message fixed and records the offending input (and base).
   E("ERR_INVALID_URL", "Invalid URL", TypeError);
+  {
+    const make = codes.ERR_INVALID_URL;
+    codes.ERR_INVALID_URL = function ERR_INVALID_URL(input, base = null) {
+      const err = make();
+      err.input = input;
+      if (base != null) err.base = base;
+      return err;
+    };
+  }
+  E("ERR_INVALID_URI", "URI malformed", URIError);
+  E("ERR_HTTP_BODY_NOT_ALLOWED", "Adding content for this request method or response status is not allowed.", Error);
+  E("ERR_HTTP_CONTENT_LENGTH_MISMATCH",
+    "Response body's content-length of %s byte(s) does not match the content-length of %s byte(s) set in header", Error);
+  E("ERR_HTTP_INVALID_STATUS_CODE", "Invalid status code: %s", RangeError);
+  E("ERR_HTTP_REQUEST_TIMEOUT", "Request timeout", Error);
+  E("ERR_HTTP_SOCKET_ASSIGNED", "ServerResponse has an already assigned socket", Error);
+  E("ERR_HTTP_SOCKET_ENCODING", "Changing the socket encoding is not allowed per RFC7230 Section 3.", Error);
+  E("ERR_HTTP_TRAILER_INVALID", "Trailers are invalid with this transfer encoding", Error);
+  E("ERR_INVALID_HANDLE_TYPE", "This handle type cannot be sent", TypeError);
+  E("ERR_INVALID_PROTOCOL", 'Protocol "%s" not supported. Expected "%s"', TypeError);
+  E("ERR_SOCKET_CLOSED_BEFORE_CONNECTION", "Socket closed before the connection was established", Error);
+  E("ERR_SOCKET_CONNECTION_TIMEOUT", "Socket connection timeout", Error);
   E("ERR_INVALID_URL_SCHEME", (expected) => {
     if (typeof expected === "string") expected = [expected];
     const res = expected.length === 2 ? `one of scheme ${expected[0]} or ${expected[1]}` : `of scheme ${expected[0]}`;
@@ -357,7 +438,11 @@ const __errors = (() => {
   E("ERR_SERVER_ALREADY_LISTEN", "Listen method has been called more than once without closing.", Error);
   E("ERR_USE_AFTER_CLOSE", "%s was closed", Error);
   E("ERR_IPC_CHANNEL_CLOSED", "Channel closed", Error);
-  E("ERR_INVALID_ADDRESS_FAMILY", (addressType, host, port) => `Invalid address family: ${addressType} ${host}:${port}`, RangeError);
+  E("ERR_INVALID_ADDRESS_FAMILY", function (addressType, host, port) {
+    this.host = host;
+    this.port = port;
+    return `Invalid address family: ${addressType} ${host}:${port}`;
+  }, RangeError);
   E("ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "%s maxBuffer length exceeded", RangeError);
   E("ERR_ASYNC_CALLBACK", "%s must be a function", TypeError);
   E("ERR_ASYNC_TYPE", 'Invalid name for async "type": %s', TypeError);

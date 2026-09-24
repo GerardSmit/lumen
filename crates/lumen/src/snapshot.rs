@@ -32,8 +32,19 @@ use crate::bigint::JsBigInt;
 use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
+/// The split ahead-of-time form (see [`encode_split`]).
+const MAGIC_SPLIT: u32 = 0x4c53_4e32; // "LSN2"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 5;
+
+/// A call/`new` source position (stack traces): LEB128 of `pos + 1`, 0 = none (`NO_POS`).
+fn enc_pos(w: &mut Writer, pos: u32) {
+    w.uv(pos.wrapping_add(1) as u64);
+}
+
+fn dec_pos(r: &mut Reader) -> R<u32> {
+    Ok((r.uv()? as u32).wrapping_sub(1))
+}
 
 /// FNV-1a over the source, eight bytes at a time: the header's check that the source handed to
 /// [`decode`] is the one the ranges were recorded against.
@@ -72,6 +83,25 @@ struct Writer {
     /// The unit's source, to tell its ranges from those into another text (see
     /// `enc_fnsource`), with a per-`Rc` verdict cache. `None`: every range is the unit's.
     unit_src: Option<(Rc<str>, HashMap<*const u8, bool>)>,
+    /// Split mode (see [`encode_split`]): each function is written where it occurs as its
+    /// local index, and its header and body go to buffers of their own.
+    split: Option<Split>,
+}
+
+/// The per-function output of split mode, by function index, plus the stream being written.
+/// A *stream* is where a function reference can occur: 0 = the unit's top level, `2i + 1` =
+/// the body of function `i`, `2i + 2` = the header (parameter list) of function `i`. A
+/// reference is the function's rank among the functions of its stream (its *local index*).
+#[derive(Default)]
+struct Split {
+    headers: Vec<Vec<u8>>,
+    bodies: Vec<Vec<u8>>,
+    /// Each function's stream (where it is referenced from) and the end of its descendants'
+    /// index range (its own index + 1 + its descendant count).
+    owners: Vec<u64>,
+    ends: Vec<u32>,
+    cur: u64,
+    next_local: HashMap<u64, u64>,
 }
 
 impl Writer {
@@ -178,6 +208,16 @@ struct Reader<'a> {
     /// When collecting: every decoded function by function index (a slot is reserved when the
     /// function is entered, filled once it is built — the writer's preorder numbering).
     funcs: Option<Vec<Option<Rc<Function>>>>,
+    /// Split form: the functions of the stream being decoded, by local index (a function
+    /// reference is an index into this), and the unit's kept text for `toString` ranges.
+    split: Option<SplitRead>,
+}
+
+struct SplitRead {
+    /// The function indices of the stream being read, by local index.
+    children: Vec<usize>,
+    unit: Rc<SplitUnit>,
+    kept: Option<Rc<crate::precompiled::KeptRef>>,
 }
 
 type R<T> = Result<T, String>;
@@ -276,6 +316,7 @@ pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
         keep: None,
         deps: None,
         unit_src: Some((Rc::from(src), HashMap::new())),
+        split: None,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -315,6 +356,7 @@ fn encode_stripped_inner(body: &[Stmt], collect: bool) -> (Vec<u8>, Option<Vec<R
         keep: None,
         deps: None,
         unit_src: None,
+        split: None,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -327,6 +369,8 @@ fn encode_stripped_inner(body: &[Stmt], collect: bool) -> (Vec<u8>, Option<Vec<R
 /// What [`encode_stripped_keep`] produces.
 pub(crate) struct StrippedUnit {
     pub ast: Vec<u8>,
+    /// Split form only: every function body, concatenated in function-index order.
+    pub bodies: Vec<u8>,
     pub funcs: Vec<Rc<Function>>,
     /// The kept function text the AST's source ranges point into (empty without `keep`). The
     /// AST decodes against exactly this string: `decode_with_functions(&ast, &kept)`.
@@ -341,9 +385,18 @@ pub(crate) struct StrippedUnit {
 /// function's `toString` range is remapped into it. `skip` excludes one range (a synthesized
 /// wrapper spanning the whole unit, whose own text must not be kept). Also collects the unit's
 /// literal `import("x")` / `require("x")` specifiers.
+#[allow(dead_code)] // tests; blobs use `encode_split`
 pub(crate) fn encode_stripped_keep(
     body: &[Stmt],
     keep: Option<(&str, Option<(u32, u32)>)>,
+) -> StrippedUnit {
+    encode_stripped_inner_keep(body, keep, false)
+}
+
+fn encode_stripped_inner_keep(
+    body: &[Stmt],
+    keep: Option<(&str, Option<(u32, u32)>)>,
+    split: bool,
 ) -> StrippedUnit {
     let mut kept = String::new();
     let mut map = None;
@@ -359,6 +412,7 @@ pub(crate) fn encode_stripped_keep(
             keep: None,
             deps: None,
             unit_src: unit_src.clone().map(|s| (s, HashMap::new())),
+            split: None,
         };
         enc_stmts(&mut w, body);
         let (m, text) = KeepMap::build(src, w.ranges.as_deref().unwrap_or(&[]), skip);
@@ -374,29 +428,89 @@ pub(crate) fn encode_stripped_keep(
         keep: map,
         deps: Some(Deps::default()),
         unit_src: unit_src.map(|s| (s, HashMap::new())),
+        split: split.then(Split::default),
     };
-    w.uv(MAGIC as u64);
-    w.uv(VERSION as u64);
-    w.uv(kept.len() as u64);
-    w.u64(source_hash(&kept));
+    if !split {
+        w.uv(MAGIC as u64);
+        w.uv(VERSION as u64);
+        w.uv(kept.len() as u64);
+        w.u64(source_hash(&kept));
+        enc_stmts(&mut w, body);
+        return StrippedUnit {
+            ast: w.buf,
+            bodies: Vec::new(),
+            funcs: w.funcs.unwrap_or_default(),
+            kept,
+            deps: w.deps.unwrap_or_default(),
+        };
+    }
     enc_stmts(&mut w, body);
+    let top = std::mem::take(&mut w.buf);
+    let sp = w.split.take().unwrap_or_default();
+    let n = sp.headers.len();
+    w.uv(MAGIC_SPLIT as u64);
+    w.uv(VERSION as u64);
+    w.uv(n as u64);
+    let u32le = |w: &mut Writer, v: usize| {
+        let v = u32::try_from(v).expect("split unit over 4 GiB");
+        w.buf.extend_from_slice(&v.to_le_bytes());
+    };
+    let (mut header_at, mut body_at) = (0, 0);
+    for i in 0..n {
+        u32le(&mut w, sp.owners[i] as usize);
+        u32le(&mut w, sp.ends[i] as usize);
+        u32le(&mut w, header_at);
+        u32le(&mut w, body_at);
+        header_at += sp.headers[i].len();
+        body_at += sp.bodies[i].len();
+    }
+    u32le(&mut w, header_at);
+    u32le(&mut w, body_at);
+    for h in &sp.headers {
+        w.buf.extend_from_slice(h);
+    }
+    w.buf.extend_from_slice(&top);
     StrippedUnit {
         ast: w.buf,
+        bodies: sp.bodies.concat(),
         funcs: w.funcs.unwrap_or_default(),
         kept,
         deps: w.deps.unwrap_or_default(),
     }
 }
 
+/// [`encode_stripped_keep`] in *split* form, the ahead-of-time blob's: [`StrippedUnit::ast`]
+/// is what a load decodes at once — the header of every function (name, parameters, flags,
+/// `toString` range, body facts) and the unit's top-level statements — and
+/// [`StrippedUnit::bodies`] the function bodies, each decoded only when its function first
+/// needs it (see [`SplitUnit`]).
+///
+/// Layout of `ast`: `MAGIC_SPLIT`, `VERSION`, `fn_count` (LEB128), then a fixed-width table
+/// of `fn_count` rows of four little-endian `u32`s — the function's owner stream (see
+/// `Split`), the end of its descendants' index range, and the offsets of its header and of its
+/// body (bodies are concatenated in function-index order) — then the headers' and bodies'
+/// total lengths (`u32` each), the headers in function-index order, and the top-level
+/// statements. The table lets a load decode a function's header only when something first
+/// refers to it (see [`SplitUnit`]).
+/// A header is: name, params, flags byte, `toString` source, [`Function::scan_flags`] byte.
+pub(crate) fn encode_split(
+    body: &[Stmt],
+    keep: Option<(&str, Option<(u32, u32)>)>,
+) -> StrippedUnit {
+    encode_stripped_inner_keep(body, keep, true)
+}
+
 /// Decode a snapshot blob back into a script body. `src` is the source it was encoded from; one
 /// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
 /// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
 pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
+    let _mem = crate::memstats::enter(crate::memstats::Cat::AstDecode);
     decode_inner(bytes, src, false).map(|(body, _)| body)
 }
 
 /// [`decode`], also returning every decoded function by function index (see
 /// [`encode_stripped_with_functions`]).
+#[allow(dead_code)] // the non-split form; blobs use `SplitUnit`
 pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Vec<Rc<Function>>)> {
     let (body, funcs) = decode_inner(bytes, src, true)?;
     let funcs = funcs
@@ -416,6 +530,7 @@ fn decode_inner(bytes: &[u8], src: &str, collect: bool) -> R<Decoded> {
         src: Rc::from(""),
         scopes: Vec::new(),
         funcs: collect.then(Vec::new),
+        split: None,
     };
     if r.uv()? != MAGIC as u64 {
         return Err("snapshot: bad magic".into());
@@ -428,7 +543,289 @@ fn decode_inner(bytes: &[u8], src: &str, collect: bool) -> R<Decoded> {
     }
     r.src = Rc::from(src);
     let body = dec_stmts(&mut r)?;
+    crate::interpreter::stack_trace::note_parsed_source(r.src.clone(), None);
     Ok((body, r.funcs))
+}
+
+/// Where a split unit's function bodies are: `(start, len)` within its body store, as bytes.
+pub(crate) type BodyBytes = Box<dyn Fn(usize, usize) -> R<std::borrow::Cow<'static, [u8]>>>;
+
+/// Called with each function the unit decodes, by function index, once (see
+/// [`SplitUnit::set_hook`]).
+pub(crate) type FunctionHook = Box<dyn Fn(usize, &Rc<Function>)>;
+
+/// One [`encode_split`] unit, decoded on demand: a function's header (name, parameters, flags)
+/// is decoded when something first refers to it — the unit's top level, the body of the
+/// function it is written in, or a precompiled chunk that creates its closure — and its body
+/// when it first needs one (see [`crate::precompiled::decode_body`]). A program that never
+/// reaches most of a large bundle never pays for most of its function nodes.
+pub(crate) struct SplitUnit {
+    ast: &'static [u8],
+    n: usize,
+    /// Byte offsets within `ast`: the per-function table, the headers, the top-level
+    /// statements.
+    table: usize,
+    headers: usize,
+    top: usize,
+    /// Total length of the unit's bodies.
+    bodies_len: usize,
+    bodies: BodyBytes,
+    /// The unit's source marker (every decoded function shares it: the key of its stack-trace
+    /// line table), and its kept function text for `toString` ranges.
+    pub(crate) src: Rc<str>,
+    kept: Option<Rc<crate::precompiled::KeptRef>>,
+    /// Decoded functions by index. Weak: a function lives as long as the AST or closures that
+    /// hold it; one that died is decoded again if referred to again.
+    funcs: RefCell<Vec<std::rc::Weak<Function>>>,
+    hook: RefCell<Option<Rc<dyn Fn(usize, &Rc<Function>)>>>,
+}
+
+impl SplitUnit {
+    /// Read a split unit's framing. `src` is the unit's (empty) source marker.
+    pub(crate) fn new(
+        ast: &'static [u8],
+        src: Rc<str>,
+        kept: Option<Rc<crate::precompiled::KeptRef>>,
+        bodies: BodyBytes,
+    ) -> R<Rc<SplitUnit>> {
+        let mut r = Reader {
+            buf: ast,
+            pos: 0,
+            src: src.clone(),
+            scopes: Vec::new(),
+            funcs: None,
+            split: None,
+        };
+        if r.uv()? != MAGIC_SPLIT as u64 {
+            return Err("snapshot: bad magic".into());
+        }
+        if r.uv()? != VERSION as u64 {
+            return Err("snapshot: version mismatch".into());
+        }
+        let n = r.uv()? as usize;
+        let table = r.pos;
+        let headers = n
+            .checked_mul(16)
+            .and_then(|t| t.checked_add(table + 8))
+            .filter(|&h| h <= ast.len())
+            .ok_or("snapshot: bad function count")?;
+        let u32_at = |at: usize| u32::from_le_bytes(ast[at..at + 4].try_into().unwrap()) as usize;
+        let top = headers
+            .checked_add(u32_at(headers - 8))
+            .filter(|&t| t <= ast.len())
+            .ok_or("snapshot: bad header length")?;
+        Ok(Rc::new(SplitUnit {
+            ast,
+            n,
+            table,
+            headers,
+            top,
+            bodies_len: u32_at(headers - 4),
+            bodies,
+            src,
+            kept,
+            funcs: RefCell::new((0..n).map(|_| std::rc::Weak::new()).collect()),
+            hook: RefCell::new(None),
+        }))
+    }
+
+    /// How many functions the unit has.
+    pub(crate) fn fn_count(&self) -> usize {
+        self.n
+    }
+
+    /// Row `i` of the function table: (owner stream, descendants' end, header offset, body
+    /// offset); row `n` holds the totals in the offset columns.
+    fn row(&self, i: usize) -> (u64, usize, usize, usize) {
+        let u = |at: usize| {
+            u32::from_le_bytes(self.ast[at..at + 4].try_into().unwrap()) as usize
+        };
+        if i == self.n {
+            return (0, self.n, u(self.headers - 8), self.bodies_len);
+        }
+        let at = self.table + 16 * i;
+        (u(at) as u64, u(at + 4), u(at + 8), u(at + 12))
+    }
+
+    /// The functions of stream `code` among indices `from..to`, in local-index order.
+    fn stream(&self, from: usize, to: usize, code: u64) -> R<Vec<usize>> {
+        if from > to || to > self.n {
+            return Err("snapshot: bad function range".into());
+        }
+        Ok((from..to).filter(|&j| self.row(j).0 == code).collect())
+    }
+
+    /// Install the hook every later-decoded function is passed to (the bytecode attach: see
+    /// `bytecode::serialize::attach_unit`), and pass it the functions decoded so far.
+    pub(crate) fn set_hook(&self, hook: FunctionHook) {
+        let hook: Rc<dyn Fn(usize, &Rc<Function>)> = Rc::from(hook);
+        *self.hook.borrow_mut() = Some(hook.clone());
+        let live: Vec<(usize, Rc<Function>)> = self
+            .funcs
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.upgrade().map(|f| (i, f)))
+            .collect();
+        for (i, f) in live {
+            hook(i, &f);
+        }
+    }
+
+    /// Whether function `i` is `f` (decoded and still alive as that node).
+    pub(crate) fn is(&self, i: usize, f: *const Function) -> bool {
+        self.funcs
+            .borrow()
+            .get(i)
+            .is_some_and(|w| w.strong_count() > 0 && w.as_ptr() == f)
+    }
+
+    /// Function `i`, decoding its header if it is not alive.
+    pub(crate) fn function(self: &Rc<Self>, i: usize) -> R<Rc<Function>> {
+        if let Some(f) = self.funcs.borrow().get(i).and_then(std::rc::Weak::upgrade) {
+            return Ok(f);
+        }
+        if i >= self.n {
+            return Err("snapshot: bad function index".into());
+        }
+        let f = self.decode_header(i)?;
+        self.funcs.borrow_mut()[i] = Rc::downgrade(&f);
+        let hook = self.hook.borrow().clone();
+        if let Some(hook) = hook {
+            hook(i, &f);
+        }
+        Ok(f)
+    }
+
+    /// Every function of the unit (tooling and tests; a load decodes on demand).
+    pub(crate) fn all_functions(self: &Rc<Self>) -> R<Vec<Rc<Function>>> {
+        (0..self.n).map(|i| self.function(i)).collect()
+    }
+
+    fn reader<'a>(self: &Rc<Self>, buf: &'a [u8], children: Vec<usize>) -> Reader<'a> {
+        Reader {
+            buf,
+            pos: 0,
+            src: self.src.clone(),
+            scopes: Vec::new(),
+            funcs: None,
+            split: Some(SplitRead {
+                children,
+                unit: self.clone(),
+                kept: self.kept.clone(),
+            }),
+        }
+    }
+
+    fn decode_header(self: &Rc<Self>, i: usize) -> R<Rc<Function>> {
+        let _mem = crate::memstats::enter(crate::memstats::Cat::AstDecode);
+        let (_, end, at, _) = self.row(i);
+        let (_, _, next, _) = self.row(i + 1);
+        let (start, stop) = (self.headers + at, self.headers + next);
+        if end <= i || end > self.n || start > stop || stop > self.top {
+            return Err("snapshot: bad function header".into());
+        }
+        let params_of = self.stream(i + 1, end, 2 * i as u64 + 2)?;
+        let mut r = self.reader(&self.ast[start..stop], params_of);
+        let name = dec_opt_str(&mut r)?;
+        let np = r.uv()? as usize;
+        let mut params = Vec::with_capacity(np.min(1 << 16));
+        for _ in 0..np {
+            params.push(Param {
+                pattern: dec_pattern(&mut r)?,
+                default: dec_opt_expr(&mut r)?,
+                rest: r.bool()?,
+            });
+        }
+        let flags = r.u8()?;
+        let source = dec_fnsource(&mut r)?;
+        let scan = r.u8()? | crate::ast::SCAN_DONE;
+        if r.pos != r.buf.len() {
+            return Err("snapshot: trailing data in a function header".into());
+        }
+        let lazy = LazyBody {
+            src: self.src.clone(),
+            start: 0,
+            end: 0,
+            line: 0,
+            html_comments: false,
+            ctx: LazyCtx {
+                strict: flags & 2 != 0,
+                in_generator: false,
+                in_async: false,
+                module: false,
+                allow_new_target: false,
+                super_prop_ok: false,
+                super_call_ok: false,
+                in_derived_class: false,
+                no_arguments_refs: false,
+                in_field_init: false,
+            },
+            private_scope: None,
+            aot: Some(Rc::new(crate::precompiled::AotBody {
+                unit: self.clone(),
+                idx: i,
+            })),
+        };
+        let f = Rc::new(Function {
+            name,
+            params,
+            body: RefCell::new(None),
+            lazy: RefCell::new(Some(Box::new(lazy))),
+            lazy_error: OnceCell::new(),
+            is_arrow: flags & 1 != 0,
+            is_strict: flags & 2 != 0,
+            expr_body: flags & 4 != 0,
+            is_generator: flags & 8 != 0,
+            is_async: flags & 16 != 0,
+            is_method: flags & 32 != 0,
+            is_fn_expr: flags & 64 != 0,
+            source,
+            scan: Cell::new(scan),
+            hoist: RefCell::new(None),
+            body_used: Cell::new(false),
+            calls: Cell::new(0),
+            code: OnceCell::new(),
+            fn_maps: OnceCell::new(),
+        });
+        // Like a parsed lazy function: the collector releases the body once it goes cold (it
+        // decodes again from the blob if the function runs again).
+        crate::value::register_lazy_function(&f);
+        Ok(f)
+    }
+
+    /// The unit's top-level statements.
+    pub(crate) fn decode_top(self: &Rc<Self>) -> R<Vec<Stmt>> {
+        let _mem = crate::memstats::enter(crate::memstats::Cat::AstDecode);
+        let top = self.stream(0, self.n, 0)?;
+        let mut r = self.reader(&self.ast[self.top..], top);
+        let body = dec_stmts(&mut r)?;
+        if r.pos != r.buf.len() {
+            return Err("snapshot: trailing data in split unit".into());
+        }
+        Ok(body)
+    }
+
+    /// The deferred body of function `i`.
+    pub(crate) fn decode_body(self: &Rc<Self>, i: usize) -> R<Vec<Stmt>> {
+        let _mem = crate::memstats::enter(crate::memstats::Cat::AstDecode);
+        if i >= self.n {
+            return Err("snapshot: bad function index".into());
+        }
+        let (_, end, _, start) = self.row(i);
+        let (_, _, _, stop) = self.row(i + 1);
+        if start > stop || stop > self.bodies_len || end <= i || end > self.n {
+            return Err("snapshot: bad function body".into());
+        }
+        let bytes = (self.bodies)(start, stop - start)?;
+        let children = self.stream(i + 1, end, 2 * i as u64 + 1)?;
+        let mut r = self.reader(&bytes, children);
+        let body = dec_stmts(&mut r)?;
+        if r.pos != r.buf.len() {
+            return Err("snapshot: trailing data in a function body".into());
+        }
+        Ok(body)
+    }
 }
 
 // ---- Vec / Option helpers (monomorphized by hand to keep the reader borrow simple) ------------
@@ -958,6 +1355,7 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             callee,
             args,
             optional,
+            pos,
         } => {
             if let (Some(deps), Expr::Ident(name), [ArrayElem::Item(Expr::Str(spec))]) =
                 (&mut w.deps, &**callee, args.as_slice())
@@ -970,11 +1368,13 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             enc_expr(w, callee);
             enc_array_elems(w, args);
             w.bool(*optional);
+            enc_pos(w, *pos);
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, pos } => {
             w.u8(25);
             enc_expr(w, callee);
             enc_array_elems(w, args);
+            enc_pos(w, *pos);
         }
         Expr::Member {
             obj,
@@ -1124,10 +1524,12 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
             callee: Box::new(dec_expr(r)?),
             args: dec_array_elems(r)?,
             optional: r.bool()?,
+            pos: dec_pos(r)?,
         },
         25 => Expr::New {
             callee: Box::new(dec_expr(r)?),
             args: dec_array_elems(r)?,
+            pos: dec_pos(r)?,
         },
         26 => Expr::Member {
             obj: Box::new(dec_expr(r)?),
@@ -1391,6 +1793,7 @@ fn enc_fnsource(w: &mut Writer, s: &FnSource) {
     // means nothing against the unit source, so its text is written out instead.
     let foreign = match s {
         FnSource::Range { src, .. } => !w.is_unit_src(src),
+        FnSource::Kept { .. } => true,
         _ => false,
     };
     if w.strip {
@@ -1434,12 +1837,21 @@ fn enc_fnsource(w: &mut Writer, s: &FnSource) {
             w.uv(*start as u64);
             w.uv(*end as u64);
         }
+        FnSource::Kept { .. } => unreachable!("a kept range is foreign"),
     }
 }
 fn dec_fnsource(r: &mut Reader) -> R<FnSource> {
     Ok(match r.u8()? {
         0 => FnSource::None,
         1 => FnSource::Text(r.rcstr()?),
+        2 if r.split.is_some() => {
+            // A range into kept text that is still compressed: checked when it is sliced.
+            let start = r.uv()? as u32;
+            let end = r.uv()? as u32;
+            let text = r.split.as_ref().and_then(|s| s.kept.clone());
+            let text = text.ok_or("snapshot: source range without kept text")?;
+            FnSource::Kept { text, start, end }
+        }
         2 => {
             let (start, end) = r.range()?;
             FnSource::Range {
@@ -1550,6 +1962,7 @@ fn dec_lazy(r: &mut Reader) -> R<LazyBody> {
         html_comments,
         ctx,
         private_scope: dec_scope(r)?,
+        aot: None,
     })
 }
 
@@ -1559,6 +1972,9 @@ fn dec_lazy(r: &mut Reader) -> R<LazyBody> {
 fn enc_function(w: &mut Writer, f: &Rc<Function>) {
     if let Some(funcs) = &mut w.funcs {
         funcs.push(f.clone());
+    }
+    if w.split.is_some() {
+        return enc_function_split(w, f);
     }
     enc_opt_str(w, &f.name);
     w.uv(f.params.len() as u64);
@@ -1593,7 +2009,75 @@ fn enc_function(w: &mut Writer, f: &Rc<Function>) {
         }
     }
 }
+/// Split mode: the reference here, the header and body into their own buffers.
+fn enc_function_split(w: &mut Writer, f: &Rc<Function>) {
+    let idx = w.funcs.as_ref().map_or(0, |v| v.len() - 1) as u64;
+    let sp = w.split.as_mut().expect("split mode");
+    let owner = sp.cur;
+    let slot = sp.next_local.entry(owner).or_insert(0);
+    let local = *slot;
+    *slot += 1;
+    sp.headers.push(Vec::new());
+    sp.bodies.push(Vec::new());
+    sp.owners.push(owner);
+    sp.ends.push(0);
+    sp.cur = 2 * idx + 2;
+    w.uv(local);
+    let outer = std::mem::take(&mut w.buf);
+    enc_opt_str(w, &f.name);
+    w.uv(f.params.len() as u64);
+    for p in &f.params {
+        enc_pattern(w, &p.pattern);
+        enc_opt_expr(w, &p.default);
+        w.bool(p.rest);
+    }
+    w.u8(fn_flags(f));
+    enc_fnsource(w, &f.source);
+    // The home-object check is decided here, from the source the build parsed: at run time a
+    // precompiled method has no source (or only compressed kept text), and deciding it then
+    // would either assume the worst (a home scope per method closure) or decompress the kept
+    // text of every method the program instantiates.
+    let home = crate::ast::SCAN_HOME_CHECKED
+        | if f.may_use_home() {
+            crate::ast::SCAN_NEEDS_HOME
+        } else {
+            0
+        };
+    w.u8(f.scan_flags() | home);
+    let header = std::mem::take(&mut w.buf);
+    if let Some(sp) = &mut w.split {
+        sp.cur = 2 * idx + 1;
+    }
+    enc_stmts(w, &f.body());
+    let body = std::mem::replace(&mut w.buf, outer);
+    let end = w.funcs.as_ref().map_or(0, |v| v.len()) as u32;
+    let sp = w.split.as_mut().expect("split mode");
+    sp.cur = owner;
+    sp.headers[idx as usize] = header;
+    sp.bodies[idx as usize] = body;
+    sp.ends[idx as usize] = end;
+}
+
+fn fn_flags(f: &Function) -> u8 {
+    (f.is_arrow as u8)
+        | (f.is_strict as u8) << 1
+        | (f.expr_body as u8) << 2
+        | (f.is_generator as u8) << 3
+        | (f.is_async as u8) << 4
+        | (f.is_method as u8) << 5
+        | (f.is_fn_expr as u8) << 6
+}
+
 fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
+    if r.split.is_some() {
+        let local = r.uv()? as usize;
+        let sp = r.split.as_ref().expect("split mode");
+        let i = *sp
+            .children
+            .get(local)
+            .ok_or("snapshot: bad function reference")?;
+        return sp.unit.function(i);
+    }
     let slot = r.funcs.as_mut().map(|funcs| {
         funcs.push(None);
         funcs.len() - 1

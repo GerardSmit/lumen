@@ -19,14 +19,62 @@ class TextDecoder {
     this.encoding = "utf-8";
     this.fatal = !!options.fatal;
     this.ignoreBOM = !!options.ignoreBOM;
+    this._pending = null; // an incomplete trailing sequence held back by a streaming decode
+    this._bomSeen = false; // the stream's first bytes have been decoded (BOM handled)
   }
-  decode(input) {
-    if (input === undefined) return "";
-    if (input instanceof ArrayBuffer) input = new Uint8Array(input);
-    let s = __encoding.decode(input, this.fatal);
-    if (!this.ignoreBOM && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
+  decode(input, options) {
+    const stream = !!(options && typeof options === "object" && options.stream);
+    let bytes;
+    if (input === undefined) bytes = new Uint8Array(0);
+    else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+    else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    else bytes = input;
+    if (this._pending !== null) {
+      const joined = new Uint8Array(this._pending.length + bytes.length);
+      joined.set(this._pending);
+      joined.set(bytes, this._pending.length);
+      bytes = joined;
+      this._pending = null;
+    }
+    if (stream) {
+      const keep = incompleteUtf8Tail(bytes);
+      if (keep > 0) {
+        this._pending = bytes.slice(bytes.length - keep);
+        bytes = bytes.subarray(0, bytes.length - keep);
+      }
+    }
+    let s = bytes.length === 0 ? "" : __encoding.decode(bytes, this.fatal);
+    if (!this._bomSeen && s.length !== 0) {
+      if (!this.ignoreBOM && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
+      this._bomSeen = true;
+    }
+    // A non-streaming call ends the stream: the next decode starts a new one.
+    if (!stream) this._bomSeen = false;
     return s;
   }
+}
+
+// The length of a trailing UTF-8 sequence that is a valid but incomplete prefix (0 if none).
+function incompleteUtf8Tail(bytes) {
+  const n = bytes.length;
+  for (let k = 1; k <= 3 && k <= n; k++) {
+    const lead = bytes[n - k];
+    if (lead >= 0x80 && lead <= 0xbf) continue; // a continuation byte: look further back
+    let need;
+    if (lead >= 0xc2 && lead <= 0xdf) need = 2;
+    else if (lead >= 0xe0 && lead <= 0xef) need = 3;
+    else if (lead >= 0xf0 && lead <= 0xf4) need = 4;
+    else return 0;
+    if (need <= k) return 0;
+    if (k >= 2) {
+      const second = bytes[n - k + 1];
+      const lo = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
+      const hi = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
+      if (second < lo || second > hi) return 0;
+    }
+    return k;
+  }
+  return 0;
 }
 
 const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -20,17 +20,31 @@
 mod activation;
 mod call_spread;
 pub(crate) mod array_destructure;
+pub(crate) mod class_fields;
+pub(crate) mod ctor_plan;
 pub(crate) mod array_iterator_step;
+pub(crate) mod iter_fast;
 mod derived;
+mod self_tail;
+mod block_env;
+mod for_await;
+mod destructure_assign;
+mod destructure_seq;
 pub(crate) mod reflect;
+pub(crate) mod inline_callback;
 mod ext_ops;
 mod finally;
 mod for_in;
 mod generator;
 pub(crate) mod jit;
 mod name_path;
+mod memsize;
+pub(crate) use memsize::ChunkBytes;
 mod object_literal;
 mod parameters;
+pub(crate) mod positions;
+mod prepared_call;
+pub(crate) use prepared_call::PreparedCall;
 pub(crate) mod serialize;
 mod switch;
 mod switch_table;
@@ -655,6 +669,15 @@ pub enum Op {
     ArrayAppendSpread,
     /// An elision: grows the array literal beneath by one, leaving the index absent.
     ArrayHole,
+    /// Inlined array callback guard (see [`inline_callback`]): `[O, F]` → `[O, F, ok]`,
+    /// ok = the method call may run as the inlined loop (`CbMethod` operand). Never throws.
+    ArrayCbGuard(u8),
+    /// Inlined callback element step after `Get` produced `undefined`: pops k and the array,
+    /// pushes HasProperty(array, k).
+    ArrayCbHas,
+    /// End of an inlined callback loop: publishes the method call's source position as the
+    /// frame's call site (as the returned builtin call would have).
+    ArrayCbDone(u32),
     /// A `switch` case chain's dispatch table (see [`switch_table`]): reads local `slot`, jumps
     /// to the matching case's body or past the chain's covered prefix, or falls through into
     /// the (unchanged) chain when the table can't decide. Operands: slot, table index into
@@ -681,6 +704,71 @@ pub enum Op {
     /// `yield*` over the inner iterator in slots `(it, it + 1)`: consumes `[received, mode]`,
     /// then finishes pushing `[value, returning]` or parks on itself (see [`generator`]).
     YieldDelegate(u16),
+    /// Push the running function object (the innermost `FnFrame`'s callee): a named function
+    /// expression's self-name binding, initialized in the prologue.
+    LoadCallee,
+    /// A class instance field's DefineField (see [`class_fields`]): pops the value and the
+    /// receiver, defines own data property `names[n]` (a resolved private name adds a private
+    /// field). The flag applies the anonymous-function naming.
+    DefineField(u32, bool),
+    /// Captured block-scoped bindings (see [`block_env`]): a fresh block env in slot `.0`
+    /// whose parent is the block env in slot `.1` (`u16::MAX` = the frame env).
+    BlkNew(u16, u16),
+    /// Declare binding `names[.1]` (in TDZ; `.2` = const) in the block env of slot `.0`.
+    BlkDecl(u16, u32, bool),
+    /// CreatePerIterationEnvironment for the block env in slot `.0`.
+    BlkCopy(u16),
+    /// Push block binding `names[.1]` of slot `.0`'s env (TDZ-checked).
+    BlkLoad(u16, u32),
+    /// Pop and assign block binding `names[.1]` (TDZ and const checked).
+    BlkStore(u16, u32),
+    /// Pop and initialize block binding `names[.1]`.
+    BlkInit(u16, u32),
+    /// `++`/`--` on block binding `names[.1]`.
+    BlkUpdate(u16, u32, UpdKind),
+    /// Run the next op (`MakeClosure` / `MakeClass` / `InitMethod`) with slot `.0`'s block env
+    /// as the created function's scope.
+    InEnv(u16),
+    /// A call in tail position of strict code (see [`self_tail`]): like `Call(n)` /
+    /// `CallWithThis(n)` (`.1`), always followed by `Return`. When the frame may tail-call
+    /// (`Interp::tco_ok`) the current frame is released before the callee runs — proper tail
+    /// calls in constant space.
+    TailCall(u16, bool),
+    /// [`Op::TailCall`] for `CallSpread(n)` / `CallSpreadThis(n)` (`.1`).
+    TailCallSpread(u16, bool),
+    /// `import(spec[, options])`: pops the options (when `.1`) and the specifier, pushes the
+    /// promise. `.0` is the phase (0 evaluation, 1 source, 2 defer).
+    ImportCall(u8, bool),
+    /// `for await` head (see [`for_await`]): pops the iterable, pushes iterator, `next`, state.
+    GetAsyncIter,
+    /// `for await` step: calls `next()` on the iterator/next/state slots, pushes the value the
+    /// following `Await` awaits.
+    AsyncIterNext(u16, u16, u16),
+    /// Pops the awaited step, pushes (value, has-value) like `IterStepL`. Operand: state slot.
+    AsyncIterResult(u16),
+    /// AsyncIteratorClose's call (iterator, state slots): pushes `false`, or the value to
+    /// await and `true`.
+    AsyncCloseCall(u16, u16),
+    /// Pops the awaited `return()` result and checks it (state slot).
+    AsyncCloseCheck(u16),
+    /// Async generator `yield*` (see [`generator`]): GetIterator(async) — pops the operand,
+    /// pushes iterator, `next`, from-sync flag.
+    AsyncDelegateInit,
+    /// Pops the received value and forwards it per the mode slot (iterator, mode, return-flag
+    /// slots): pushes the inner result and `true`, or a special completion's value and `false`.
+    AsyncDelegateCall(u16, u16, u16),
+    /// Pops the awaited inner result: records done (slot .1), pushes its value and the
+    /// from-sync flag (slot .0).
+    AsyncDelegateResult(u16, u16),
+    /// A from-sync value's rejection pad (iterator, done slots). Always abrupt.
+    AsyncDelegateCloseReject(u16, u16),
+    /// After the special path's await (mode slot; `true` = the rejection pad).
+    AsyncDelegateSpecial(u16, bool),
+    /// `new C(a, ...rest)`: like [`Op::CallSpread`] (the final argument is spread) for `New`.
+    NewSpread(u16),
+    /// Array-destructuring rest: pushes the remaining values of the iterator/next in the two
+    /// slots as a fresh array (see [`destructure_seq`]).
+    IterRestL(u16, u16),
 }
 
 /// An active `try` region on the VM's handler stack.
@@ -769,9 +857,19 @@ pub struct Chunk {
     /// A sloppy ordinary function (not an arrow, method, generator or async body): the legacy
     /// `f.arguments` / `f.caller` reflection sees its activations (see [`reflect`]).
     reflect_args: bool,
+    /// The source positions of the call sites, for stack traces (see [`positions`]).
+    positions: Box<[u8]>,
+    /// Inlined array-callback regions, scanned from `ops` on first use by a stack trace (see
+    /// [`inline_callback`]).
+    inline_cbs: std::cell::OnceCell<Box<[inline_callback::InlineRegion]>>,
 }
 
 impl Chunk {
+    /// The source position of the call op at `pc` (`ast::NO_POS` if none is known).
+    pub(crate) fn call_site_pos(&self, pc: usize) -> u32 {
+        positions::lookup(&self.ops, &self.positions, pc)
+    }
+
     /// Compiled in derived-constructor mode (see [`derived`]).
     pub(crate) fn is_derived(&self) -> bool {
         self.derived
@@ -786,8 +884,9 @@ impl Chunk {
     #[inline]
     fn seed_rest(&self, i: &Interp, slots: &mut [Value], args: &[Value]) {
         if let Some(s) = self.rest_slot {
-            let rest = args.get(self.n_params..).unwrap_or(&[]).to_vec();
-            slots[s as usize] = i.make_array(rest);
+            // One allocation (a single box for short lists) straight from the argument slice.
+            let rest = args.get(self.n_params..).unwrap_or(&[]);
+            slots[s as usize] = i.make_array_iter(rest.iter().cloned());
         }
     }
 
@@ -863,6 +962,11 @@ struct CaptureScan {
     const_candidates: std::collections::HashSet<String>,
     /// Names referenced somewhere they did NOT resolve to a scope (free/global uses).
     free_refs: std::collections::HashSet<String>,
+    /// A named function expression's self-name, and whether anything in the body (nested
+    /// functions included, shadowed or not) references that name: the tail-call guard (see
+    /// [`self_tail`]) applies only to a function that can name itself.
+    self_name: Option<String>,
+    self_named: bool,
     /// Innermost loop nesting at the current walk position (for-head scopes and every scope
     /// pushed inside a loop body are never homable).
     loop_depth: u32,
@@ -1001,11 +1105,19 @@ fn hoisted_vars_stmt(
 }
 
 impl CaptureScan {
-    /// Analyze `func`, returning (captured names, inner-arrow-reads-this) or `None` to bail.
+    /// Analyze `func`, returning (captured names, inner-arrow-reads-this, activation-homed block
+    /// lets, self-named, captured block-scoped names needing per-entry block envs) or `None` to
+    /// bail.
     #[allow(clippy::type_complexity)]
     fn run(
         func: &Function,
-    ) -> Option<(std::collections::HashSet<String>, bool, Vec<(String, bool)>)> {
+    ) -> Option<(
+        std::collections::HashSet<String>,
+        bool,
+        Vec<(String, bool)>,
+        bool,
+        std::collections::HashSet<String>,
+    )> {
         let mut sc = CaptureScan {
             scopes: Vec::new(),
             fn_depth: 0,
@@ -1016,6 +1128,8 @@ impl CaptureScan {
             captured_serials: Default::default(),
             const_candidates: Default::default(),
             free_refs: Default::default(),
+            self_name: func.name.clone().filter(|_| func.is_fn_expr),
+            self_named: false,
             loop_depth: 0,
             next_serial: 0,
             env_this: false,
@@ -1028,6 +1142,9 @@ impl CaptureScan {
         // DIFFERENT binding, which one activation slot can't express), which the compiler
         // homes activation-wide instead.
         let mut homed: Vec<String> = Vec::new();
+        // The rest need a fresh binding per block entry / loop iteration: every block-level
+        // declaration of such a name homes in a per-entry block env (see [`block_env`]).
+        let mut blk = std::collections::HashSet::new();
         for n in &sc.captured {
             if sc.depth0_inner_decls.contains(n) {
                 let ok = sc.candidates.get(n).is_some_and(|cs| {
@@ -1038,7 +1155,8 @@ impl CaptureScan {
                             .is_some_and(|set| set.len() == 1 && set.contains(cs))
                 });
                 if !ok {
-                    return None;
+                    blk.insert(n.clone());
+                    continue;
                 }
                 homed.push(n.clone());
             }
@@ -1057,7 +1175,7 @@ impl CaptureScan {
                 (n, k)
             })
             .collect::<Vec<_>>();
-        Some((sc.captured, sc.env_this, homed))
+        Some((sc.captured, sc.env_this, homed, sc.self_named, blk))
     }
 
     fn push_scope(&mut self, names: std::collections::HashSet<String>) {
@@ -1124,6 +1242,7 @@ impl CaptureScan {
         }
         let body = func.body();
         if !hoisted_vars(&body, true, func.is_strict, &mut names) {
+            note_bail_reason(|| "capture-scan: sloppy block function (annex B)".to_string());
             return None;
         }
         self.declare_lexicals(&body, &mut names);
@@ -1204,6 +1323,9 @@ impl CaptureScan {
     }
 
     fn reference(&mut self, name: &str) {
+        if !self.self_named && self.self_name.as_deref() == Some(name) {
+            self.self_named = true;
+        }
         for (scope, depth, serial) in self.scopes.iter().rev() {
             if scope.contains(name) {
                 if *depth == 0 && self.fn_depth > 0 {
@@ -1474,7 +1596,10 @@ impl CaptureScan {
             Stmt::Labeled { body, .. } => self.stmt(body),
             Stmt::ClassDecl(c) => self.class(c),
             // `with`, modules, and anything else unrecognized: unanalyzable.
-            _ => None,
+            other => {
+                note_bail_reason(|| format!("capture-scan: stmt {}", node_kind(other)));
+                None
+            }
         }
     }
 
@@ -1645,6 +1770,7 @@ impl CaptureScan {
             Expr::Call { callee, args, .. } => {
                 // Direct eval inside any nested function could name arbitrary outer locals.
                 if matches!(&**callee, Expr::Ident(n) if n == "eval") {
+                    note_bail_reason(|| "capture-scan: direct eval".to_string());
                     return None;
                 }
                 self.expr(callee)?;
@@ -1656,7 +1782,7 @@ impl CaptureScan {
                 }
                 Some(())
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 self.expr(callee)?;
                 for a in args {
                     match a {
@@ -1707,6 +1833,7 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
         return Some(chunk);
     }
     serialize::note_compile();
+    let _mem = crate::memstats::enter(crate::memstats::Cat::Compile);
     if !bail_log_enabled() {
         return compile_fresh(func);
     }
@@ -1761,15 +1888,14 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
     // Generators compile to a `VmCoro` body (`yield` suspends like `await`, see [`generator`]).
     // Async functions compile: `await` lowers to `Op::Await`, which suspends the `VmCoro` that
     // drives this body.
-    // A named function expression binds its own name inside the body — an env-side binding the
-    // slot model doesn't carry.
-    if func.is_fn_expr && func.name.is_some() {
-        log_bail("fn", "named function expression");
-        return None;
-    }
+    // A named function expression's own name binds to the callee (see the prologue below): the
+    // prologue's `LoadCallee` runs in an async body's first step, which `run_async` drives
+    // synchronously inside the call's own frame (params cannot `await`).
+
     // Capture analysis: which locals inner functions can name (they live in a real activation
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
-    let Some((captured, env_this, block_lets)) = CaptureScan::run(func) else {
+    let Some((captured, env_this, block_lets, _self_named, blk_names)) = CaptureScan::run(func)
+    else {
         let head: String = func
             .source()
             .as_deref()
@@ -1802,6 +1928,10 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
         derived,
         generator: func.is_generator,
         async_gen: func.is_generator && func.is_async,
+        blk_names,
+        // Strict code's calls in tail position are proper tail calls (see [`self_tail`]); an
+        // async or generator body completes through its coroutine after the call.
+        tail_calls: func.is_strict && !func.is_async && !func.is_generator,
         ..Compiler::default()
     };
     // Captured once-per-call block `let`s home in the activation (TDZ from entry, initialized
@@ -1845,19 +1975,30 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
     };
     let n_positional = func.params.len() - func.params.last().is_some_and(|p| p.rest) as usize;
     let mut pattern_params: Vec<(u16, &Pattern)> = Vec::new();
+    // A captured rest parameter: its seeded slot is copied into the activation binding.
+    let mut rest_cap: Option<(u16, u32)> = None;
     for (k, p) in func.params.iter().enumerate() {
         if p.rest {
             let Pattern::Ident(name) = &p.pattern else {
                 log_bail("params", "destructuring rest parameter");
                 return None;
             };
-            if captured.contains(name) || hoist_fn_names.contains(name) || p.default.is_some() {
-                log_bail("params", "captured rest parameter");
+            if hoist_fn_names.contains(name) || p.default.is_some() {
+                log_bail("params", "rest parameter shadowed by a function");
                 return None;
             }
             let slot = c.fresh_slot(name);
-            c.scope_bind(name, slot, false);
-            c.rest_slot = Some(slot);
+            // A rest array nothing can read is never built (see `parameters::rest_unused`).
+            if captured.contains(name) || !parameters::rest_unused(func, name) {
+                c.rest_slot = Some(slot);
+            }
+            if captured.contains(name) {
+                c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
+                c.env_bind(name, false);
+                rest_cap = Some((slot, c.name_idx(name)));
+            } else {
+                c.scope_bind(name, slot, false);
+            }
             continue;
         }
         let Pattern::Ident(name) = &p.pattern else {
@@ -1867,6 +2008,7 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
                 banned_owned.iter().map(|n| n.as_str()).collect();
             if let Some(d) = &p.default {
                 if !parameters::default_expr_safe(d, &banned) {
+                    log_bail_node("params-default", d, 100);
                     log_bail("params", "unsafe default expression");
                     return None;
                 }
@@ -1890,6 +2032,7 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
             let banned: std::collections::HashSet<&str> =
                 banned_owned.iter().map(|n| n.as_str()).collect();
             if !parameters::default_expr_safe(d, &banned) {
+                log_bail_node("params-default", d, 100);
                 log_bail("params", "unsafe default expression");
                 return None;
             }
@@ -1906,6 +2049,10 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
         }
     }
     c.n_params = n_positional;
+    if let Some((slot, n)) = rest_cap {
+        c.emit(Op::LoadLocal(slot));
+        c.emit(Op::StoreCap(n));
+    }
     // Destructuring-parameter leaves (after every positional slot).
     for (_, pat) in &pattern_params {
         let mut leaves = std::collections::HashSet::new();
@@ -1944,6 +2091,63 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
             c.emit(Op::StoreCap(n));
         } else {
             c.scope_bind("arguments", slot, false);
+        }
+    }
+    // A named function expression's self-name: an immutable binding of the callee, in its own
+    // scope outside the function's, so any parameter, var, function or top-level lexical of
+    // the same name shadows it. Bound before the parameter initializers (a default may name
+    // it). A captured one homes in the activation; its binding is strict-immutable there, so a
+    // sloppy body (where assigning the self-name is a silent no-op) stays in the oracle.
+    if func.is_fn_expr {
+        if let Some(name) = &func.name {
+            let mut shadow = std::collections::HashSet::new();
+            for p in &func.params {
+                pat_idents(&p.pattern, &mut shadow);
+            }
+            let body = func.body();
+            for op in crate::interpreter::collect_hoist_ops(&body, func.is_strict, &[]) {
+                match op {
+                    HoistOp::Var(n)
+                    | HoistOp::VarForce(n)
+                    | HoistOp::Fn(n, _)
+                    | HoistOp::AnnexB(n, _) => {
+                        shadow.insert(n);
+                    }
+                }
+            }
+            for s in body.iter() {
+                match s {
+                    Stmt::VarDecl { kind, decls } if !matches!(kind, DeclKind::Var) => {
+                        for (p, _) in decls {
+                            pat_idents(p, &mut shadow);
+                        }
+                    }
+                    Stmt::ClassDecl(k) => {
+                        if let Some(n) = &k.name {
+                            shadow.insert(n.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if name != "arguments" && !shadow.contains(name) {
+                c.emit(Op::LoadCallee);
+                if captured.contains(name) {
+                    if !func.is_strict {
+                        log_bail("fn", "captured self-name of a sloppy function expression");
+                        return None;
+                    }
+                    c.cap_inits
+                        .push(CapInit::Lexical(Rc::from(name.as_str()), true));
+                    c.env_bind(name, true);
+                    let n = c.name_idx(name);
+                    c.emit(Op::StoreCapInit(n));
+                } else {
+                    let slot = c.fresh_slot(name);
+                    c.scope_bind(name, slot, true);
+                    c.emit(Op::StoreLocal(slot));
+                }
+            }
         }
     }
     // Parameter initializers run in parameter order before anything else (spec order:
@@ -2061,6 +2265,7 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
     }
     let cap_cache_len = c.names.len();
     let activation_layout = activation::ActivationLayout::new(&c.cap_inits, c.env_this, &c.names);
+    let positions = positions::encode(&c.ops, &c.sites);
     Some(Rc::new(Chunk {
         ops: c.ops,
         consts: c.consts,
@@ -2098,6 +2303,8 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
             && !func.is_method
             && !func.is_generator
             && !func.is_async,
+        positions,
+        inline_cbs: Default::default(),
     }))
 }
 
@@ -2145,6 +2352,10 @@ struct Compiler {
     /// initialize instead of throwing — such assignments bail. (Uncaptured slots are only
     /// reachable in textual order, and re-entering a block re-runs its `Tdz`.)
     tdz_pending: std::collections::HashSet<u16>,
+    /// The source position (+1; 0 = none) of the call/`new` expression being compiled, and the
+    /// one recorded for every call-site op emitted, in order (see [`positions`]).
+    site: u32,
+    sites: Vec<u32>,
     /// Captured (env-homed) function-scope-wide names → is_const. Slot scopes shadow these.
     env_names: std::collections::HashMap<String, bool>,
     funcs: Vec<Rc<Function>>,
@@ -2160,6 +2371,25 @@ struct Compiler {
     generator: bool,
     /// An async generator body: `yield` and `return <expr>` await their operand.
     async_gen: bool,
+    /// Lowering a destructuring *assignment*: `destructure_store` leaves are PutValues (see
+    /// [`destructure_assign`]).
+    assign_mode: bool,
+    /// Captured block-scoped names (CaptureScan): every block-level declaration of one of these
+    /// homes in a per-entry block env (see [`block_env`]).
+    blk_names: std::collections::HashSet<String>,
+    /// Carrier slots of the block envs enclosing the emission point, innermost last.
+    blk_envs: Vec<u16>,
+    /// Emit proper tail calls (`Op::TailCall`) for `return f(…)` (see [`self_tail`]).
+    tail_calls: bool,
+    /// Captured block declarations collected while declaring a scope, waiting for
+    /// [`Compiler::blk_flush`] to open their block env.
+    pending_blk: Vec<(String, bool)>,
+    /// Destructuring into a just-created block env nothing can have captured yet (a for-of
+    /// head's per-iteration env): its leaves' initialization order is unobservable, so the
+    /// batched array walk may store them.
+    fresh_blk: bool,
+    /// Compiling an inlined arrow's block body: where its `return`s go (see [`inline_callback`]).
+    inline_ret: Option<inline_callback::InlineRet>,
 }
 
 /// Where a name resolves inside the compiled body.
@@ -2167,7 +2397,13 @@ enum Home {
     Slot(u16, bool),
     /// Captured: lives in the activation env; bool = is_const.
     Env(bool),
+    /// A captured block-scoped binding in the block env whose carrier is in slot `.0` (see
+    /// [`block_env`]); bool = is_const.
+    Blk(u16, bool),
 }
+
+/// Scope-entry marker: the entry's "slot" is a block-env carrier slot (see [`Home::Blk`]).
+const BLK_BIT: u16 = 0x8000;
 
 #[derive(Default)]
 struct LoopCtx {
@@ -2179,6 +2415,8 @@ struct LoopCtx {
     /// A for-of loop's iterator slot: crossing `break`s close it (`IterCloseL`); its own
     /// `continue`s don't (the loop keeps iterating).
     foreach_iter: Option<u16>,
+    /// A `for await` loop's state slot (see [`for_await`]): its closes await.
+    foreach_async: Option<u16>,
     /// For a for-of context: `try_depth` just after its per-iteration body handler pushed —
     /// exits emitted inside the body pop down to here before touching the handler itself.
     body_try_depth: u32,
@@ -2188,6 +2426,8 @@ struct LoopCtx {
     /// A `switch` context: an unlabelled `break` targets it, but `continue` skips past it to the
     /// innermost enclosing loop.
     is_switch: bool,
+    /// A labelled non-loop statement: only a `break` naming one of its labels targets it.
+    label_only: bool,
 }
 
 /// Debug (`LUMEN_TIER_LOG=1`): report the AST construct a compile bail came from.
@@ -2287,7 +2527,7 @@ fn no_assign_to(e: &Expr, name: &str) -> bool {
         }
         Expr::Member { obj, .. } => no_assign_to(obj, name),
         Expr::Index { obj, index, .. } => no_assign_to(obj, name) && no_assign_to(index, name),
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+        Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
             no_assign_to(callee, name)
                 && args.iter().all(|a| match a {
                     ArrayElem::Item(e) | ArrayElem::Spread(e) => no_assign_to(e, name),
@@ -2306,6 +2546,9 @@ impl Compiler {
     fn emit(&mut self, op: Op) -> usize {
         if let Op::Tdz(s) = op {
             self.tdz_pending.insert(s);
+        }
+        if positions::is_site(&op) {
+            self.sites.push(self.site.wrapping_sub(1));
         }
         self.ops.push(op);
         self.ops.len() - 1
@@ -2377,11 +2620,10 @@ impl Compiler {
                 for e in elems {
                     match e {
                         ArrayPatElem::Hole => {}
-                        ArrayPatElem::Elem {
-                            pattern,
-                            default: None,
-                        } => self.declare_body_pattern(pattern, is_const, captured)?,
-                        _ => return Err(Bail),
+                        // (Defaults / rest elements: the sequential walk, `destructure_seq`.)
+                        ArrayPatElem::Elem { pattern, .. } | ArrayPatElem::Rest(pattern) => {
+                            self.declare_body_pattern(pattern, is_const, captured)?
+                        }
                     }
                 }
                 Ok(())
@@ -2398,6 +2640,11 @@ impl Compiler {
                     // in TDZ since entry, no slot, no per-entry Tdz (the block runs at most
                     // once per call by construction). Consumed so any LATER same-name
                     // declaration (a nested for-of head, a sibling block) slot-shadows.
+                    return Ok(());
+                }
+                if self.blk_names.contains(name) {
+                    // Captured: homes in the scope's block env (opened by `blk_flush`).
+                    self.pending_blk.push((name.clone(), is_const));
                     return Ok(());
                 }
                 let slot = self.fresh_slot(name);
@@ -2419,11 +2666,10 @@ impl Compiler {
                 for e in elems {
                     match e {
                         ArrayPatElem::Hole => {}
-                        ArrayPatElem::Elem {
-                            pattern,
-                            default: None,
-                        } => self.declare_lexical_pattern(pattern, is_const)?,
-                        _ => return Err(Bail),
+                        // (Defaults / rest elements: the sequential walk, `destructure_seq`.)
+                        ArrayPatElem::Elem { pattern, .. } | ArrayPatElem::Rest(pattern) => {
+                            self.declare_lexical_pattern(pattern, is_const)?
+                        }
                     }
                 }
                 Ok(())
@@ -2456,6 +2702,7 @@ impl Compiler {
     /// The nullish guard throws the oracle's exact TypeError before any read.
     fn destructure_store(&mut self, pat: &Pattern, kind: DeclKind) -> CResult {
         match pat {
+            Pattern::Ident(name) if self.assign_mode => self.assign_leaf(name),
             Pattern::Ident(name) => {
                 let home = self.home(name).ok_or(Bail)?;
                 match home {
@@ -2471,6 +2718,14 @@ impl Compiler {
                             self.emit(Op::StoreCap(n));
                         } else {
                             self.emit(Op::StoreCapInit(n));
+                        }
+                    }
+                    Home::Blk(c, _) => {
+                        let n = self.name_idx(name);
+                        if matches!(kind, DeclKind::Var) {
+                            self.emit(Op::BlkStore(c, n));
+                        } else {
+                            self.emit(Op::BlkInit(c, n));
                         }
                     }
                 }
@@ -2537,14 +2792,19 @@ impl Compiler {
                 // leaf's initialization is visible to a later iterator step's next() per spec)
                 // and elements are flat idents/holes (a nested pattern's own reads would
                 // interleave with the steps), with no defaults (their evaluation interleaves).
+                // The reversed stores also need distinct names (`var [a, a] = [1, 2]` leaves 2).
+                let mut seen = std::collections::HashSet::new();
                 for e in elems.iter() {
                     match e {
                         ArrayPatElem::Hole => {}
                         ArrayPatElem::Elem {
                             pattern: Pattern::Ident(n),
                             default: None,
-                        } if matches!(self.home(n), Some(Home::Slot(..))) => {}
-                        _ => return Err(Bail),
+                        } if (matches!(self.home(n), Some(Home::Slot(..)))
+                            || self.fresh_blk && matches!(self.home(n), Some(Home::Blk(..))))
+                            && seen.insert(n.as_str()) => {}
+                        // Anything else steps the iterator one element at a time.
+                        _ => return self.destructure_array_seq(elems, kind),
                     }
                 }
                 self.emit(Op::DestructureArr(elems.len() as u16));
@@ -2630,9 +2890,10 @@ impl Compiler {
     /// Compile an optional chain (`a?.b.c`, `r?.m(args)`): each optional link peeks its base —
     /// nullish pops what the link would have consumed and jumps to a shared pad that pushes the
     /// chain's `undefined` result (skipping every later link, key expression, and argument, per
-    /// spec). Non-optional links compile as usual. Supported spine: Member/Index reads and
-    /// Member-callee method calls; anything else (optional `delete`, `?.()` on a plain callee,
-    /// private names, `super`) bails to the tree-walker.
+    /// spec). Non-optional links compile as usual. Supported spine: Member/Index/private reads,
+    /// method calls on Member/Index/private callees, calls of a free identifier (`f?.()`, with
+    /// its reference this value) or of any other chain value, spread in the last argument. Optional
+    /// `delete`, `super` links and `eval?.()` bail to the tree-walker.
     fn opt_chain(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
         match e {
             Expr::Member {
@@ -2666,10 +2927,12 @@ impl Compiler {
                 callee,
                 args,
                 optional: call_opt,
+                pos,
             } => {
                 if matches!(&**callee, Expr::Ident(n) if n == "eval") {
                     return Err(Bail); // `eval?.(x)` is an indirect eval, but keep it simple
                 }
+                let saved_site = std::mem::replace(&mut self.site, pos.wrapping_add(1));
                 match &**callee {
                     Expr::Member {
                         obj,
@@ -2747,6 +3010,7 @@ impl Compiler {
                         }
                     }
                 }
+                self.site = saved_site;
                 Ok(())
             }
             Expr::Member {
@@ -2834,6 +3098,9 @@ impl Compiler {
     /// captured block lexical bails compile, so every env name is function-scope-wide).
     fn home(&self, name: &str) -> Option<Home> {
         if let Some((slot, k)) = self.lookup(name) {
+            if slot & BLK_BIT != 0 {
+                return Some(Home::Blk(slot & !BLK_BIT, k));
+            }
             return Some(Home::Slot(slot, k));
         }
         self.env_names.get(name).map(|k| Home::Env(*k))
@@ -2989,17 +3256,60 @@ impl Compiler {
                     let Some(name) = &c.name else {
                         return Err(Bail);
                     };
+                    if self.blk_names.contains(name) {
+                        self.pending_blk.push((name.clone(), false));
+                        continue;
+                    }
                     let slot = self.fresh_slot(name);
                     self.scope_bind(name, slot, false);
                     self.tdz_slots.insert(slot);
                     self.emit(Op::Tdz(slot));
                 }
+                // A block-level function (strict code — sloppy Annex B bodies never compile): a
+                // mutable binding initialized at block entry (see `block_body_inner`).
+                Stmt::FuncDecl(f) => {
+                    let Some(name) = &f.name else {
+                        return Err(Bail);
+                    };
+                    if self.homed_pending.remove(name) {
+                        continue; // homed in the activation (in TDZ until block entry)
+                    }
+                    if self.blk_names.contains(name) {
+                        self.pending_blk.push((name.clone(), false));
+                        continue;
+                    }
+                    let slot = self.fresh_slot(name);
+                    self.scope_bind(name, slot, false);
+                }
                 Stmt::VarDecl {
                     kind: DeclKind::Using | DeclKind::AwaitUsing,
                     ..
-                }
-                | Stmt::FuncDecl(_) => return Err(Bail),
+                } => return Err(Bail),
                 _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Instantiate a block's function declarations (block entry, after its env exists).
+    fn init_block_functions(&mut self, stmts: &[Stmt]) -> CResult {
+        for s in stmts {
+            let Stmt::FuncDecl(f) = s else { continue };
+            let Some(name) = &f.name else {
+                return Err(Bail);
+            };
+            self.emit_closure(f, None);
+            match self.home(name) {
+                Some(Home::Slot(slot, _)) => self.init_slot(slot),
+                Some(Home::Env(_)) => {
+                    let n = self.name_idx(name);
+                    self.emit(Op::StoreCapInit(n));
+                }
+                Some(Home::Blk(c, _)) => {
+                    let n = self.name_idx(name);
+                    self.emit(Op::BlkInit(c, n));
+                }
+                None => return Err(Bail),
             }
         }
         Ok(())
@@ -3033,6 +3343,10 @@ impl Compiler {
                     Home::Env(_) => {
                         let n = self.name_idx(name);
                         self.emit(Op::StoreCapInit(n));
+                    }
+                    Home::Blk(c, _) => {
+                        let n = self.name_idx(name);
+                        self.emit(Op::BlkInit(c, n));
                     }
                 }
                 Ok(())
@@ -3078,10 +3392,19 @@ impl Compiler {
                                 self.emit(Op::StoreCapInit(n));
                             }
                         }
+                        Home::Blk(c, _) => {
+                            if matches!(kind, DeclKind::Var) {
+                                return Err(Bail);
+                            }
+                            let n = self.name_idx(name);
+                            self.emit(Op::BlkInit(c, n));
+                        }
                     }
                 }
                 Ok(())
             }
+            Stmt::Return(arg) if self.inline_ret.is_some() => self.inline_return(arg.as_ref()),
+            Stmt::Return(Some(e)) if self.tail_position() => self.tail_return(e),
             Stmt::Return(arg) => {
                 // For-of closes and crossed finally regions: see `emit_return_tail`.
                 match arg {
@@ -3181,17 +3504,23 @@ impl Compiler {
                 body,
             } => {
                 self.scopes.push(Vec::new());
+                let depth = self.blk_envs.len();
                 let r = self.for_loop(init.as_deref(), test.as_ref(), update.as_ref(), body);
+                self.blk_envs.truncate(depth);
                 self.scopes.pop();
                 r
             }
             Stmt::Break(None) => {
-                let idx = self.loops.len().checked_sub(1).ok_or(Bail)?;
+                let idx = self.loops.iter().rposition(|c| !c.label_only).ok_or(Bail)?;
                 self.emit_jump_exit(idx, false)
             }
             Stmt::Continue(None) => {
                 // `continue` skips switch contexts: it targets the innermost enclosing *loop*.
-                let idx = self.loops.iter().rposition(|c| !c.is_switch).ok_or(Bail)?;
+                let idx = self
+                    .loops
+                    .iter()
+                    .rposition(|c| !c.is_switch && !c.label_only)
+                    .ok_or(Bail)?;
                 self.emit_jump_exit(idx, true)
             }
             // Labelled break/continue: jump to the loop on the stack that carries the target label.
@@ -3211,7 +3540,9 @@ impl Compiler {
                 let idx = self
                     .loops
                     .iter()
-                    .rposition(|c| !c.is_switch && c.labels.iter().any(|l| l == name))
+                    .rposition(|c| {
+                        !c.is_switch && !c.label_only && c.labels.iter().any(|l| l == name)
+                    })
                     .ok_or(Bail)?;
                 self.emit_jump_exit(idx, true)
             }
@@ -3222,11 +3553,29 @@ impl Compiler {
                 | Stmt::DoWhile { .. }
                 | Stmt::For { .. }
                 | Stmt::Switch { .. }
+                | Stmt::ForInOf { .. }
                 | Stmt::Labeled { .. } => {
                     self.pending_labels.push(label.clone());
                     self.stmt(body)
                 }
-                _ => Err(Bail),
+                // Any other statement: a break-only target (`l: { … break l; … }`).
+                _ => {
+                    let mut labels = std::mem::take(&mut self.pending_labels);
+                    labels.push(label.clone());
+                    self.loops.push(LoopCtx {
+                        labels,
+                        entry_try_depth: self.try_depth,
+                        label_only: true,
+                        ..LoopCtx::default()
+                    });
+                    let r = self.stmt(body);
+                    let ctx = self.loops.pop().expect("just pushed");
+                    r?;
+                    for b in ctx.breaks {
+                        self.patch(b);
+                    }
+                    Ok(())
+                }
             },
             // `switch`: the discriminant lands in a hidden slot; case tests run in source order
             // (exactly the oracle's two-phase evaluation), then bodies are laid out contiguously
@@ -3270,9 +3619,10 @@ impl Compiler {
                 left,
                 right,
                 of: true,
-                is_await: false,
+                is_await,
                 body,
             } => {
+                let is_await = *is_await;
                 let labels = std::mem::take(&mut self.pending_labels);
                 // The loop variable: a declaration binds a fresh (uncaptured — else the
                 // per-iteration env freshness matters and we bail) slot scoped to the loop; a
@@ -3281,19 +3631,40 @@ impl Compiler {
                 // expression evaluates (`for (const x of [x])` throws a ReferenceError), so the
                 // scope and Tdz emit BEFORE `right`.
                 self.scopes.push(Vec::new());
+                let blk_depth = self.blk_envs.len();
                 enum Bind {
                     Slot(u16),
                     Cap(u32),
                     Name(u32),
+                    /// A captured lexical head: a fresh block env per iteration (carrier slot,
+                    /// its parent operand, the declaration).
+                    Blk(u16, u16, Vec<(String, bool)>),
+                    /// A `var`/assignment head naming a captured block binding.
+                    BlkStore(u16, u32),
                     /// Destructuring lexical head: bound by `destructure_store` INSIDE the
                     /// body's handler region (a binding throw must IteratorClose in throw mode,
-                    /// which is exactly what the body's abort pad does).
-                    Pattern(DeclKind),
+                    /// which is exactly what the body's abort pad does). Captured leaves live
+                    /// in a per-iteration block env (carrier, parent, declarations).
+                    Pattern(DeclKind, Option<(u16, u16, Vec<(String, bool)>)>),
                 }
                 let bind = match (left, decl) {
                     (_, Some(DeclKind::Using | DeclKind::AwaitUsing)) => {
                         self.scopes.pop();
                         return Err(Bail);
+                    }
+                    (Pattern::Ident(name), Some(kind @ (DeclKind::Let | DeclKind::Const)))
+                        if self.blk_names.contains(name) =>
+                    {
+                        // Captured: the TDZ env while `right` evaluates, then a fresh one per
+                        // iteration.
+                        let names = vec![(name.clone(), matches!(kind, DeclKind::Const))];
+                        match self.blk_open(&names) {
+                            Ok((slot, parent)) => Bind::Blk(slot, parent, names),
+                            Err(b) => {
+                                self.scopes.pop();
+                                return Err(b);
+                            }
+                        }
                     }
                     (Pattern::Ident(name), Some(kind @ (DeclKind::Let | DeclKind::Const))) => {
                         // An env-homed name blocks a head slot — except a homed block `let`
@@ -3317,17 +3688,25 @@ impl Compiler {
                         // the oracle.
                         let mut leaf_names = std::collections::HashSet::new();
                         pat_idents(pat, &mut leaf_names);
-                        if leaf_names
-                            .iter()
-                            .any(|n| self.env_names.contains_key(n) && !self.homed_lets.contains(n))
-                            || self
-                                .declare_lexical_pattern(pat, matches!(kind, DeclKind::Const))
-                                .is_err()
+                        if leaf_names.iter().any(|n| {
+                            self.env_names.contains_key(n)
+                                && !self.homed_lets.contains(n)
+                                && !self.blk_names.contains(n)
+                        }) || self
+                            .declare_lexical_pattern(pat, matches!(kind, DeclKind::Const))
+                            .is_err()
                         {
+                            self.pending_blk.clear();
                             self.scopes.pop();
                             return Err(Bail);
                         }
-                        Bind::Pattern(*kind)
+                        match self.blk_flush() {
+                            Ok(blk) => Bind::Pattern(*kind, blk),
+                            Err(b) => {
+                                self.scopes.pop();
+                                return Err(b);
+                            }
+                        }
                     }
                     (Pattern::Array(_) | Pattern::Object(_) | Pattern::Member(_), Some(DeclKind::Var)) => {
                         self.scopes.pop();
@@ -3336,6 +3715,11 @@ impl Compiler {
                     // A `var` head writes the hoisted function-scope binding, exactly like an
                     // assignment head.
                     (Pattern::Ident(name), None | Some(DeclKind::Var)) => match self.home(name) {
+                        Some(Home::Blk(c, false)) => Bind::BlkStore(c, self.name_idx(name)),
+                        Some(Home::Blk(_, true)) => {
+                            self.scopes.pop();
+                            return Err(Bail);
+                        }
                         Some(Home::Slot(slot, is_const)) => {
                             if is_const || self.tdz_pending.contains(&slot) {
                                 self.scopes.pop();
@@ -3360,22 +3744,41 @@ impl Compiler {
                 };
                 let er = self.expr(right);
                 if er.is_err() {
+                    self.blk_envs.truncate(blk_depth);
                     self.scopes.pop();
                     return er;
                 }
                 let iter_s = self.fresh_slot("%iter%");
                 let next_s = self.fresh_slot("%next%");
-                self.emit(Op::GetIter);
+                let async_st = if is_await {
+                    let st = self.fresh_slot("%ast%");
+                    self.emit(Op::GetAsyncIter);
+                    self.emit(Op::StoreLocal(st));
+                    Some(st)
+                } else {
+                    self.emit(Op::GetIter);
+                    None
+                };
                 self.emit(Op::StoreLocal(next_s));
                 self.emit(Op::StoreLocal(iter_s));
                 self.loops.push(LoopCtx {
                     labels,
                     entry_try_depth: self.try_depth,
                     foreach_iter: Some(iter_s),
+                    foreach_async: async_st,
                     ..Default::default()
                 });
                 let loop_head = self.ops.len();
-                self.emit(Op::IterStepL(iter_s, next_s));
+                match async_st {
+                    Some(st) => {
+                        self.emit(Op::AsyncIterNext(iter_s, next_s, st));
+                        self.emit(Op::Await);
+                        self.emit(Op::AsyncIterResult(st));
+                    }
+                    None => {
+                        self.emit(Op::IterStepL(iter_s, next_s));
+                    }
+                }
                 let jexit = self.emit(Op::JumpIfFalse(0));
                 match bind {
                     Bind::Slot(slot) => {
@@ -3387,18 +3790,33 @@ impl Compiler {
                     Bind::Name(n) => {
                         self.emit_store_name(n);
                     }
-                    Bind::Pattern(_) => {} // bound below, inside the handler region
+                    Bind::Blk(slot, parent, ref names) => {
+                        self.blk_renew(slot, parent, names);
+                        let n = self.name_idx(&names[0].0);
+                        self.emit(Op::BlkInit(slot, n));
+                    }
+                    Bind::BlkStore(c, n) => {
+                        self.emit(Op::BlkStore(c, n));
+                    }
+                    Bind::Pattern(..) => {} // bound below, inside the handler region
                 }
                 let push = self.emit(Op::PushHandler(0));
                 self.try_depth += 1;
                 self.loops.last_mut().expect("just pushed").body_try_depth = self.try_depth;
                 let r = match bind {
-                    Bind::Pattern(kind) => self
-                        .destructure_store(left, kind)
-                        .and_then(|()| self.stmt(body)),
+                    Bind::Pattern(kind, ref blk) => {
+                        if let Some((slot, parent, names)) = blk {
+                            self.blk_renew(*slot, *parent, names);
+                        }
+                        self.fresh_blk = true;
+                        let r = self.destructure_store(left, kind);
+                        self.fresh_blk = false;
+                        r.and_then(|()| self.stmt(body))
+                    }
                     _ => self.stmt(body),
                 };
                 let ctx = self.loops.pop().expect("just pushed");
+                self.blk_envs.truncate(blk_depth);
                 self.scopes.pop();
                 r?;
                 self.emit(Op::PopHandler);
@@ -3423,7 +3841,12 @@ impl Compiler {
                     Op::PushHandler(t) => *t = abort_pc,
                     _ => unreachable!(),
                 }
-                self.emit(Op::IterAbortL(iter_s));
+                match async_st {
+                    Some(st) => self.emit_async_abort(iter_s, st),
+                    None => {
+                        self.emit(Op::IterAbortL(iter_s));
+                    }
+                }
                 // Exhaustion lands here (the step's bool was false): drop the undefined
                 // placeholder the step pushed; no close on a completed iterator.
                 self.patch(jexit);
@@ -3448,30 +3871,27 @@ impl Compiler {
     /// Emit the bookkeeping a `break`/`continue` targeting `self.loops[target]` must run before
     /// its jump: pop every `try`/for-of-body handler region opened since the target's entry (a
     /// stale handler would catch unrelated throws later in the frame), and IteratorClose each
-    /// for-of iterator being abandoned — the target's own iterator too for a `break`, but not
-    /// for a `continue` (the loop keeps iterating). Crossing more than one for-of level bails:
-    /// the spec cascades close errors through the *outer* loop's throw-mode close, which this
-    /// flat emission doesn't model (the tree-walker gets it right by unwinding).
+    /// for-of iterator being abandoned, innermost first — the target's own iterator too for a
+    /// `break`, but not for a `continue` (the loop keeps iterating). A close error propagates
+    /// to the handlers still pushed: an enclosing abandoned loop's body pad closes that loop in
+    /// throw mode (the spec's cascade), or a `try` between the loops catches it.
     fn emit_exit_cleanup(&mut self, target: usize, is_continue: bool) -> CResult {
-        // For-of levels whose iterator is abandoned by this jump.
-        let closes: Vec<(usize, u16, u32)> = self
+        // For-of levels whose iterator is abandoned by this jump, innermost first.
+        let closes: Vec<(u16, u32)> = self
             .loops
             .iter()
-            .enumerate()
             .skip(if is_continue { target + 1 } else { target })
-            .filter_map(|(k, c)| c.foreach_iter.map(|it| (k, it, c.body_try_depth)))
+            .rev()
+            .filter_map(|c| c.foreach_iter.map(|it| (it, c.body_try_depth)))
             .collect();
-        if closes.len() > 1 {
-            return Err(Bail);
-        }
         let mut depth_now = self.try_depth;
-        if let Some(&(_, iter_s, body_depth)) = closes.last() {
+        for (iter_s, body_depth) in closes {
             // Pop the regions inside the for-of body, then its own body handler, then close.
             for _ in body_depth..depth_now {
                 self.emit(Op::PopHandler);
             }
             self.emit(Op::PopHandler);
-            self.emit(Op::IterCloseL(iter_s));
+            self.emit_iter_close(iter_s);
             depth_now = body_depth - 1;
         }
         // Remaining regions down to the target's entry (plain `try`s between the loops — and for
@@ -3484,7 +3904,16 @@ impl Compiler {
     }
 
     fn block_body(&mut self, body: &[Stmt]) -> CResult {
+        let depth = self.blk_envs.len();
+        let r = self.block_body_inner(body);
+        self.blk_envs.truncate(depth);
+        r
+    }
+
+    fn block_body_inner(&mut self, body: &[Stmt]) -> CResult {
         self.declare_block_lexicals(body)?;
+        self.blk_flush()?;
+        self.init_block_functions(body)?;
         for s in body {
             self.stmt(s)?;
         }
@@ -3501,38 +3930,72 @@ impl Compiler {
         // Claim any labels from an enclosing `Stmt::Labeled` before the head runs, so they land on
         // this loop's context (the head itself introduces no labelled break/continue targets).
         let labels = std::mem::take(&mut self.pending_labels);
+        // A captured `let` head: its block env is copied per iteration (CreatePerIterationEnvironment).
+        let mut per_iter: Option<u16> = None;
         match init {
             Some(ForInit::VarDecl { kind, decls }) => {
                 if matches!(kind, DeclKind::Using | DeclKind::AwaitUsing) {
                     return Err(Bail);
                 }
-                if matches!(kind, DeclKind::Let | DeclKind::Const) {
+                let lexical = matches!(kind, DeclKind::Let | DeclKind::Const);
+                if lexical {
+                    let is_const = matches!(kind, DeclKind::Const);
                     for (pat, _) in decls {
-                        let Pattern::Ident(name) = pat else {
-                            return Err(Bail);
-                        };
-                        let slot = self.fresh_slot(name);
-                        self.scope_bind(name, slot, matches!(kind, DeclKind::Const));
-                        self.tdz_slots.insert(slot);
-                        self.emit(Op::Tdz(slot));
+                        match pat {
+                            Pattern::Ident(name) if self.blk_names.contains(name) => {
+                                self.pending_blk.push((name.clone(), is_const));
+                            }
+                            Pattern::Ident(name) => {
+                                let slot = self.fresh_slot(name);
+                                self.scope_bind(name, slot, is_const);
+                                self.tdz_slots.insert(slot);
+                                self.emit(Op::Tdz(slot));
+                            }
+                            // Leaves: TDZ slots, or the head's block env when captured.
+                            _ => self.declare_lexical_pattern(pat, is_const)?,
+                        }
+                    }
+                    if let Some((slot, _, _)) = self.blk_flush()? {
+                        if !is_const {
+                            per_iter = Some(slot);
+                        }
                     }
                 }
                 for (pat, initv) in decls {
                     let Pattern::Ident(name) = pat else {
-                        return Err(Bail);
+                        let Some(e) = initv else {
+                            return Err(Bail);
+                        };
+                        self.expr(e)?;
+                        self.destructure_store(pat, *kind)?;
+                        continue;
                     };
-                    let (slot, _) = self.lookup(name).ok_or(Bail)?;
                     match initv {
-                        Some(e) => {
-                            self.expr(e)?;
+                        Some(e) => self.named_expr(e, name)?,
+                        None if lexical => {
+                            self.emit(Op::Undef);
+                        }
+                        None => continue,
+                    }
+                    match self.home(name) {
+                        // Initialized from here on: later assignments (`label = label.next`
+                        // in the update) need no TDZ guard.
+                        Some(Home::Slot(slot, _)) if lexical => self.init_slot(slot),
+                        Some(Home::Slot(slot, _)) => {
+                            if self.tdz_pending.contains(&slot) {
+                                return Err(Bail);
+                            }
                             self.emit(Op::StoreLocal(slot));
                         }
-                        None => {
-                            if !matches!(kind, DeclKind::Var) {
-                                self.emit(Op::Undef);
-                                self.emit(Op::StoreLocal(slot));
-                            }
+                        Some(Home::Env(_)) => {
+                            let n = self.name_idx(name);
+                            self.emit(if lexical { Op::StoreCapInit(n) } else { Op::StoreCap(n) });
                         }
+                        Some(Home::Blk(c, _)) => {
+                            let n = self.name_idx(name);
+                            self.emit(if lexical { Op::BlkInit(c, n) } else { Op::BlkStore(c, n) });
+                        }
+                        None => return Err(Bail),
                     }
                 }
             }
@@ -3540,6 +4003,9 @@ impl Compiler {
                 self.expr_stmt(e)?;
             }
             None => {}
+        }
+        if let Some(s) = per_iter {
+            self.emit(Op::BlkCopy(s));
         }
         let start = self.ops.len();
         let jf = match test {
@@ -3560,6 +4026,9 @@ impl Compiler {
                 Op::Jump(t) => *t = cont as u32,
                 _ => unreachable!(),
             }
+        }
+        if let Some(s) = per_iter {
+            self.emit(Op::BlkCopy(s));
         }
         if let Some(u) = update {
             self.expr_stmt(u)?;
@@ -3628,6 +4097,10 @@ impl Compiler {
         if matches!(op, "&&=" | "||=" | "??=") {
             return Ok(false);
         }
+        if op == "=" && matches!(target, Expr::Array(_) | Expr::Object(_)) {
+            self.destructure_assign(target, value, false)?;
+            return Ok(true);
+        }
         match target {
             Expr::Ident(name) => match self.home(name) {
                 Some(Home::Slot(slot, is_const)) => {
@@ -3657,6 +4130,18 @@ impl Compiler {
                         self.emit_compound(op)?;
                     }
                     self.emit(Op::StoreCap(n));
+                    Ok(true)
+                }
+                Some(Home::Blk(c, _)) => {
+                    let n = self.name_idx(name);
+                    if op == "=" {
+                        self.named_expr(value, name)?;
+                    } else {
+                        self.emit(Op::BlkLoad(c, n));
+                        self.expr(value)?;
+                        self.emit_compound(op)?;
+                    }
+                    self.emit(Op::BlkStore(c, n));
                     Ok(true)
                 }
                 None => {
@@ -3793,6 +4278,7 @@ impl Compiler {
             Some(n) if f.name.is_none() && !f.is_method => self.name_idx(n),
             _ => u32::MAX,
         };
+        self.env_prefix();
         self.emit(Op::MakeClosure(fidx, name_idx));
     }
 
@@ -3809,7 +4295,16 @@ impl Compiler {
     }
 
     fn expr(&mut self, e: &Expr) -> CResult {
+        let saved_site = match e {
+            Expr::Call { pos, .. } | Expr::New { pos, .. } => {
+                Some(std::mem::replace(&mut self.site, pos.wrapping_add(1)))
+            }
+            _ => None,
+        };
         let r = self.expr_inner(e);
+        if let Some(s) = saved_site {
+            self.site = s;
+        }
         if r.is_err() {
             note_bail_reason(|| {
                 let sub = match e {
@@ -3875,6 +4370,10 @@ impl Compiler {
                     Some(Home::Env(_)) => {
                         let i = self.name_idx(name);
                         self.emit(Op::LoadCap(i));
+                    }
+                    Some(Home::Blk(c, _)) => {
+                        let i = self.name_idx(name);
+                        self.emit(Op::BlkLoad(c, i));
                     }
                     None => {
                         let i = self.name_idx(name);
@@ -4086,10 +4585,14 @@ impl Compiler {
                 callee,
                 args,
                 optional: false,
+                ..
             } => {
                 // Direct eval can see the activation — bail the function.
                 if matches!(&**callee, Expr::Ident(n) if n == "eval") {
                     return Err(Bail);
+                }
+                if matches!(&**callee, Expr::Ident(n) if n == class_fields::DEFINE_FIELD) {
+                    return self.define_field_intrinsic(args);
                 }
                 match &**callee {
                     Expr::Member {
@@ -4097,6 +4600,9 @@ impl Compiler {
                         prop,
                         optional: false,
                     } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                        if self.inline_array_callback(obj, prop, args) {
+                            return Ok(());
+                        }
                         self.expr(obj)?;
                         let i = self.name_idx(prop);
                         let c = self.new_cache();
@@ -4186,15 +4692,13 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 self.expr(callee)?;
-                for a in args {
-                    let ArrayElem::Item(a) = a else {
-                        return Err(Bail);
-                    };
-                    self.expr(a)?;
+                if self.call_args(args)? {
+                    self.emit(Op::NewSpread(args.len() as u16));
+                } else {
+                    self.emit(Op::New(args.len() as u16));
                 }
-                self.emit(Op::New(args.len() as u16));
                 Ok(())
             }
             Expr::Regex { body, flags } => {
@@ -4271,6 +4775,23 @@ impl Compiler {
                 Ok(())
             }
             Expr::Class(c) => self.class_value(c, None),
+            Expr::ImportCall {
+                spec,
+                phase,
+                options,
+            } => {
+                self.expr(spec)?;
+                if let Some(o) = options {
+                    self.expr(o)?;
+                }
+                let phase = match phase {
+                    ImportPhase::Evaluation => 0,
+                    ImportPhase::Source => 1,
+                    ImportPhase::Defer => 2,
+                };
+                self.emit(Op::ImportCall(phase, options.is_some()));
+                Ok(())
+            }
             other => {
                 log_bail_node("expr", other, 60);
                 Err(Bail)
@@ -4293,6 +4814,11 @@ impl Compiler {
                     Ok(())
                 }
                 Some(Home::Slot(_, true)) | Some(Home::Env(true)) => Err(Bail),
+                Some(Home::Blk(c, _)) => {
+                    let n = self.name_idx(name);
+                    self.emit(Op::BlkUpdate(c, n, kind));
+                    Ok(())
+                }
                 None => {
                     let n = self.name_idx(name);
                     let c = self.new_name_cache();
@@ -4342,6 +4868,9 @@ impl Compiler {
         if matches!(op, "&&=" | "||=" | "??=") {
             return self.logical_assign(op, target, value);
         }
+        if op == "=" && matches!(target, Expr::Array(_) | Expr::Object(_)) {
+            return self.destructure_assign(target, value, true);
+        }
         match target {
             Expr::Ident(name) => match self.home(name) {
                 Some(Home::Slot(slot, is_const)) => {
@@ -4373,6 +4902,19 @@ impl Compiler {
                     }
                     self.emit(Op::Dup);
                     self.emit(Op::StoreCap(n));
+                    Ok(())
+                }
+                Some(Home::Blk(c, _)) => {
+                    let n = self.name_idx(name);
+                    if op == "=" {
+                        self.named_expr(value, name)?;
+                    } else {
+                        self.emit(Op::BlkLoad(c, n));
+                        self.expr(value)?;
+                        self.emit_compound(op)?;
+                    }
+                    self.emit(Op::Dup);
+                    self.emit(Op::BlkStore(c, n));
                     Ok(())
                 }
                 None => {
@@ -4529,8 +5071,7 @@ pub fn run(
         slots[s as usize] = Value::Obj(i.make_compiled_arguments_object(args, &env));
     }
     if chunk.reflect_args && reflect::enabled() {
-        let own = chunk.arguments_slot.map(|s| &slots[s as usize]);
-        reflect::stash(i, &env, args, own);
+        reflect::stash_compiled(i, args, &[], slots.as_ptr());
     }
     chunk.seed_rest(i, &mut slots, args);
     for &s in &chunk.var_force_resets {
@@ -4584,6 +5125,14 @@ fn drive_vm(
             Err(Abrupt::Throw(e)) => pending_throw = Some(e),
             Err(other) => return Err(other),
         }
+    } else if pending_throw.is_none() && handlers.is_empty() && jit::resume_due(chunk, *pc) {
+        // An async body resumed after an `await`: its function code continues there.
+        match jit::on_resume(i, chunk, env, slots, stack, pc, this_val) {
+            Ok(Some(step)) => return Ok(step),
+            Ok(None) => {}
+            Err(Abrupt::Throw(e)) => pending_throw = Some(e),
+            Err(other) => return Err(other),
+        }
     }
     // --- end whole-function JIT tier ---
     // Compiled callees the body calls run as inline frames on this same loop (see
@@ -4612,6 +5161,33 @@ fn drive_vm(
             Ok(VmStep::Done(v)) if frames.live != 0 => {
                 let v = construct_result(i, &mut frames, v);
                 leave_inline(i, &mut frames);
+                // Native code of the frame parked a proper tail call (see `TAIL_NEST`): the
+                // caller makes it.
+                let v = match i.pending_tail.take() {
+                    None => v,
+                    Some(bx) => {
+                        drop_value_fast(v);
+                        let (f, t, a) = *bx;
+                        // A strict tail caller: hidden from `fn.caller` (see `tail_leave`).
+                        let site = i.cur_site;
+                        i.cur_site = site | crate::interpreter::frames::SITE_NATIVE;
+                        let r = i.call(f, t, &a);
+                        i.cur_site = site;
+                        match r {
+                            Ok(v) => v,
+                            Err(Abrupt::Throw(e)) => {
+                                pending_throw = Some(e);
+                                continue;
+                            }
+                            Err(other) => {
+                                while frames.live != 0 {
+                                    leave_inline(i, &mut frames);
+                                }
+                                break Err(other);
+                            }
+                        }
+                    }
+                };
                 match frames.top() {
                     Some(caller) => caller.stack.push(v),
                     None => stack.push(v),
@@ -4739,6 +5315,9 @@ pub(crate) struct InlineCallee {
     env: Env,
     strict: bool,
     arrow: bool,
+    /// A base class constructor: its instance fields initialize on the new instance before the
+    /// frame is entered (see [`class_fields::inline_class_ctor`]).
+    class_fields: bool,
 }
 
 #[inline]
@@ -4776,13 +5355,14 @@ pub(crate) fn inline_callee(i: &Interp, callee: &Value) -> Option<InlineCallee> 
         env: u.env.clone(),
         strict: f.is_strict,
         arrow: f.is_arrow,
+        class_fields: false,
     })
 }
 
 /// [`inline_callee`] for `new`: an ordinary compiled constructor *function* (never a class —
 /// class construction runs field initializers and `super` machinery on the ordinary path).
 #[inline]
-fn inline_ctor(i: &Interp, callee: &Value) -> Option<InlineCallee> {
+pub(crate) fn inline_ctor(i: &Interp, callee: &Value) -> Option<InlineCallee> {
     let Value::Obj(o) = callee else {
         return None;
     };
@@ -4816,6 +5396,7 @@ fn inline_ctor(i: &Interp, callee: &Value) -> Option<InlineCallee> {
         env: u.env.clone(),
         strict: f.is_strict,
         arrow: false,
+        class_fields: false,
     })
 }
 
@@ -4864,7 +5445,11 @@ unsafe fn enter_inline(
     // [[Construct]] (construct_dispatch's user-function arm): OrdinaryCreateFromConstructor
     // with new.target = the callee itself.
     let instance = if construct {
-        let proto = match i.get_member(&stack[at - 1], "prototype") {
+        let own = match &stack[at - 1] {
+            Value::Obj(o) => class_fields::own_prototype(o),
+            _ => None,
+        };
+        let proto = match own.map_or_else(|| i.get_member(&stack[at - 1], "prototype"), Ok) {
             Ok(Value::Obj(p)) => p,
             Ok(_) => i.object_proto.clone(),
             Err(e) => {
@@ -4876,10 +5461,15 @@ unsafe fn enter_inline(
             unreachable!("inline constructor is a function object")
         };
         let capacity = i.learned_construct_capacity(ctor);
-        Some(crate::value::Object::new_with_capacity(
-            Some(proto),
-            capacity,
-        ))
+        let inst = crate::value::Object::new_with_capacity(Some(proto), capacity);
+        // A base class: InitializeInstanceElements precedes the body (and its parameters).
+        if c.class_fields {
+            if let Err(e) = i.init_instance_fields(&stack[at - 1], &Value::Obj(inst.clone())) {
+                i.depth -= 1;
+                return Err(e);
+            }
+        }
+        Some(inst)
     } else {
         None
     };
@@ -4965,10 +5555,13 @@ unsafe fn enter_frame(
         }
     };
     std::ptr::write(&mut f.callee, callee);
+    jit::sync_frames(i);
     i.fn_frames.push(crate::interpreter::FnFrame {
         fn_ptr,
         coro: i.cur_coro,
+        caller_site: std::mem::replace(&mut i.cur_site, crate::interpreter::frames::NO_SITE),
         strict: c.strict,
+        construct,
         extra: None,
     });
     let chunk = &*c.chunk;
@@ -4996,10 +5589,6 @@ unsafe fn enter_frame(
         Some(_) => Some(i.make_compiled_arguments_object(arg_slice, &env)),
         None => None,
     };
-    if chunk.reflect_args && reflect::enabled() {
-        let own = args_obj.clone().map(Value::Obj);
-        reflect::stash(i, &env, arg_slice, own.as_ref());
-    }
     let slots = &mut f.slots;
     let seed = chunk.n_params.min(argc);
     slots.reserve(chunk.n_slots);
@@ -5017,6 +5606,10 @@ unsafe fn enter_frame(
     if let (Some(s), Some(ao)) = (chunk.arguments_slot, args_obj) {
         slots[s as usize] = Value::Obj(ao);
     }
+    if chunk.reflect_args && reflect::enabled() {
+        // The leading arguments may have been moved into the slots (still unmodified).
+        reflect::stash_compiled(i, &slots[..seed], &arg_slice[seed..], slots.as_ptr());
+    }
     chunk.seed_rest(i, slots, arg_slice);
     for &s in &chunk.var_force_resets {
         slots[s as usize] = Value::Undefined;
@@ -5025,6 +5618,88 @@ unsafe fn enter_frame(
     std::ptr::write(&mut f.chunk, Some(c.chunk));
     f.pc = 0;
     seed
+}
+
+/// Tail calls that cannot release their frame in place — made by native code's generic
+/// call-out (`Op::TailCall` with `ONE`), or from a root frame to a callee that cannot run as an
+/// inline frame — run as ordinary calls up to this recursion depth, and through the caller's
+/// trampoline (`Interp::pending_tail`) beyond it: bounded native stack either way.
+pub(crate) const TAIL_NEST: u32 = crate::interpreter::MAX_EVAL_DEPTH / 16;
+
+/// PrepareForTailCall in the innermost [`InlineFrame`]: move its top `n` operand-stack entries
+/// (the call window) onto its caller's operand stack (the root's `root_stack` when it is the
+/// only live frame), then leave it.
+///
+/// SAFETY: `frames.live != 0`, the innermost record's stack is synced and holds `n` entries,
+/// and `root_stack` is the root frame's (synced) operand stack.
+#[inline(always)]
+unsafe fn tail_leave(
+    i: &mut Interp,
+    frames: &mut InlineFrames,
+    root_stack: *mut Vec<Value>,
+    n: usize,
+) {
+    let live = frames.live;
+    let recs = frames.recs.as_mut_ptr();
+    let cur = &mut (*recs.add(live - 1)).stack;
+    let caller: &mut Vec<Value> = if live >= 2 {
+        &mut (*recs.add(live - 2)).stack
+    } else {
+        &mut *root_stack
+    };
+    let from = cur.len() - n;
+    caller.reserve(n);
+    let len = caller.len();
+    std::ptr::copy_nonoverlapping(cur.as_ptr().add(from), caller.as_mut_ptr().add(len), n);
+    caller.set_len(len + n);
+    cur.set_len(from);
+    leave_inline(i, frames);
+    // The callee's caller (this strict frame) is gone: `fn.caller` reports null for it.
+    i.cur_site |= crate::interpreter::frames::SITE_NATIVE;
+}
+
+/// The call window on top of `stack` (callee, receiver when `has_this`, `argc` arguments),
+/// taken off as an `Interp::pending_tail` entry.
+fn tail_window(stack: &mut Vec<Value>, argc: usize, has_this: bool) -> Box<(Value, Value, Vec<Value>)> {
+    let args = stack.split_off(stack.len() - argc);
+    let callee = stack.pop().expect("tail call callee");
+    let this = if has_this {
+        stack.pop().expect("tail call receiver")
+    } else {
+        Value::Undefined
+    };
+    Box::new((callee, this, args))
+}
+
+/// A call op's error `e` (the op at `pc` of `chunk`, whose callee was `callee`): when the callee
+/// is not callable — so `e` is `Interp::call`'s generic "<type> is not a function" — the
+/// TypeError the tree-walker throws instead, naming the callee expression as written.
+#[cold]
+#[inline(never)]
+fn call_error(i: &mut Interp, chunk: &Chunk, pc: usize, callee: &Value, e: Abrupt) -> Abrupt {
+    if callee.is_callable() {
+        return e;
+    }
+    jit::sync_frames(i);
+    let desc = i.innermost_source().and_then(|src| {
+        crate::interpreter::stack_trace::describe_callee_text(&src, chunk.call_site_pos(pc))
+    });
+    match desc {
+        Some(d) => i.throw("TypeError", format!("{d} is not a function")),
+        None => e,
+    }
+}
+
+/// [`call_error`] for native code's generic call helper: the call op is the one
+/// `Interp::cur_site` names in `chunk`.
+#[cold]
+pub(crate) fn site_call_error(i: &mut Interp, chunk: &Chunk, callee: &Value, e: Abrupt) -> Abrupt {
+    use crate::interpreter::frames::{site_pos, NO_SITE, SITE_PC};
+    let site = site_pos(i.cur_site);
+    if site == NO_SITE || site & SITE_PC == 0 {
+        return e;
+    }
+    call_error(i, chunk, (site & !SITE_PC) as usize, callee, e)
 }
 
 /// Leave the innermost [`InlineFrame`] (returned or unwound) and give back its recursion depth.
@@ -5051,6 +5726,7 @@ fn leave_frame(i: &mut Interp, f: &mut InlineFrame) {
     // Pop the reflection frame reading only its `extra` word (the frame was written field by
     // field; a whole-record read would stall on store forwarding).
     let n = i.fn_frames.len() - 1;
+    i.cur_site = i.fn_frames[n].caller_site;
     if i.fn_frames[n].extra.is_some() {
         i.fn_frames.truncate(n);
     } else {
@@ -5118,6 +5794,23 @@ pub(crate) fn call_compiled(
         VmStep::Done(v) => Ok(v),
         VmStep::Await(_) => unreachable!("a synchronous bytecode function cannot await"),
     }
+}
+
+/// `Op::MakeClosure(fidx, name_n)`: the closure of `chunk.funcs[fidx]` over `env`, named
+/// `chunk.names[name_n]` by NamedEvaluation unless `name_n` is `u32::MAX`. The whole op, for
+/// the interpreter loop and for native code's call-out (it reads no slot and moves no pc).
+#[inline]
+pub(crate) fn make_closure(i: &mut Interp, chunk: &Chunk, fidx: u32, name_n: u32, env: &Env) -> Value {
+    let func = chunk.funcs[fidx as usize].clone();
+    if name_n == u32::MAX {
+        return i.make_function(func, env.clone());
+    }
+    let name = &chunk.names[name_n as usize];
+    let (v, named) = i.make_function_named(func, env.clone(), Some(name));
+    if !named {
+        i.set_fn_name(&v, name);
+    }
+    v
 }
 
 /// Drop a `Value`, skipping the out-of-line drop glue for the refcount-free variants (tags
@@ -5317,6 +6010,69 @@ fn run_vm_frames<const ONE: bool>(
             }
         };
     }
+    // `Op::TailCall` / `Op::TailCallSpread` with the call window on the stack (callee at
+    // `stack[len - $argc - 1]`, receiver below it when `$has_this`, `$argc` arguments on top);
+    // the op's `Return` follows. PrepareForTailCall when this frame may tail-call (strict, not
+    // `[[Construct]]`) and the callee is callable (a TypeError is this frame's): see
+    // [`self_tail`]. Otherwise, or where no frame can be released, an ordinary call.
+    macro_rules! tail_call {
+        ($argc:expr, $has_this:expr) => {{
+            let argc: usize = $argc;
+            let has_this: bool = $has_this;
+            let at = stack.len() - argc;
+            if !ONE && !frames.is_null() && i.tco_ok && stack[at - 1].is_callable() {
+                if unsafe { (*frames).live } != 0 {
+                    // An inline frame: the window moves to its caller's stack, the frame is
+                    // left, and the call is made from the caller's call site — inline again when
+                    // the callee qualifies, reusing the record: constant space.
+                    stack.sync();
+                    unsafe { tail_leave(i, &mut *frames, root_stack, argc + 1 + has_this as usize) };
+                    load_frame!();
+                    let at = stack.len() - argc;
+                    try_inline_call!(at, has_this);
+                    let callee = stack[at - 1].clone();
+                    let this = if has_this { stack[at - 2].clone() } else { Value::Undefined };
+                    let v = i.call(callee, this, &stack[at..])?;
+                    stack.truncate(at - 1 - has_this as usize);
+                    stack.push(v);
+                    continue;
+                }
+                // The root frame: an inline callee runs as the first inline frame (its own tail
+                // calls then replace it) while this frame waits in its `Return`.
+                try_inline_call!(at, has_this);
+                if i.depth > TAIL_NEST && i.leaf_native(&stack[at - 1]).is_none() {
+                    // Past `TAIL_NEST`, anything else but a plain native (which cannot come back
+                    // through this frame): the `Interp::call` trampoline (or the compiled-call
+                    // paths that mirror it) makes the call once this body has returned, so tail
+                    // recursion through such callees stays within `TAIL_NEST` native frames.
+                    // (Shallower, an ordinary call saves the hand-off.)
+                    i.pending_tail = Some(tail_window(stack.vec(), argc, has_this));
+                    unsafe { stack.reload() };
+                    return Ok(VmStep::Done(Value::Undefined));
+                }
+            } else if ONE && i.tco_ok && i.depth > TAIL_NEST && stack[at - 1].is_callable() {
+                // Native code's generic call-out (no frame to release here): an ordinary call
+                // while shallow; past `TAIL_NEST` the call is handed to the caller's trampoline
+                // (the pushed `undefined` is what the following `Return` returns), so unbounded
+                // tail recursion through compiled code stays within `TAIL_NEST` frames.
+                i.pending_tail = Some(tail_window(stack.vec(), argc, has_this));
+                unsafe { stack.reload() };
+                stack.push(Value::Undefined);
+                continue;
+            }
+            if !ONE && !i.tco_ok {
+                try_inline_call!(at, has_this);
+            }
+            let callee = stack[at - 1].clone();
+            let this = if has_this { stack[at - 2].clone() } else { Value::Undefined };
+            let v = i
+                .call(callee, this, &stack[at..])
+                .map_err(|e| call_error(i, chunk, *pc - 1, &stack[at - 1], e))?;
+            stack.truncate(at - 1 - has_this as usize);
+            stack.push(v);
+            continue;
+        }};
+    }
     let mut stepped = false;
     loop {
         if ONE {
@@ -5470,11 +6226,7 @@ fn run_vm_frames<const ONE: bool>(
                 step_and_store(i, &mut stack, kind, old, |i, v| i.assign_free_name(name, v, env))?;
             }
             Op::MakeClosure(fidx, name_n) => {
-                let v = i.make_function(chunk.funcs[fidx as usize].clone(), env.clone());
-                if name_n != u32::MAX {
-                    i.set_fn_name(&v, &chunk.names[name_n as usize]);
-                }
-                stack.push(v);
+                stack.push(make_closure(i, chunk, fidx, name_n, env));
             }
             Op::LoadName(n, c) => {
                 let v = chunk.load_name_ic(i, env, n, c)?;
@@ -5569,11 +6321,19 @@ fn run_vm_frames<const ONE: bool>(
             Op::DestructureArr(n) => {
                 let v = pop!();
                 if !array_destructure::try_dense(i, &v, n, |x| stack.push(x)) {
-                    let (it, nx) = i.get_iterator(&v)?;
+                    // A pristine Array/Map/Set walks an encoded state (see `iter_fast`).
+                    let (mut it, mut nx) = match iter_fast::open(i, &v) {
+                        Some(state) => (Value::Num(state), v.clone()),
+                        None => i.get_iterator(&v)?,
+                    };
                     let mut done = false;
                     for _ in 0..n {
                         if !done {
-                            match i.iterator_step(&it, &nx)? {
+                            let stepped = match iter_fast::step(i, &mut it, &mut nx) {
+                                Some(r) => r,
+                                None => i.iterator_step(&it, &nx)?,
+                            };
+                            match stepped {
                                 Some(x) => {
                                     stack.push(x);
                                     continue;
@@ -5583,7 +6343,7 @@ fn run_vm_frames<const ONE: bool>(
                         }
                         stack.push(Value::Undefined);
                     }
-                    if !done {
+                    if !done && !iter_fast::close_pair_is_noop(i, &mut it, &mut nx) {
                         i.iterator_close_normal(&it)?;
                     }
                 }
@@ -5614,8 +6374,24 @@ fn run_vm_frames<const ONE: bool>(
                 stack.push(v);
             }
             Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
                 let spread = pop!();
                 let at = stack.len() - (argc as usize - 1);
+                // A pristine Array spreads as a slice copy (see `iter_fast`): the window is then
+                // an ordinary `Call` / `CallWithThis` one, inlined like theirs.
+                if iter_fast::array_elems(i, &spread, |x| stack.push(x)) {
+                    drop(spread);
+                    let has_this = matches!(op, Op::CallSpreadThis(_));
+                    try_inline_call!(at, has_this);
+                    let callee = stack[at - 1].clone();
+                    let this = if has_this { stack[at - 2].clone() } else { Value::Undefined };
+                    let v = i
+                        .call(callee, this, &stack[at..])
+                        .map_err(|e| call_error(i, chunk, *pc - 1, &stack[at - 1], e))?;
+                    stack.truncate(at - 1 - has_this as usize);
+                    stack.push(v);
+                    continue;
+                }
                 let mut args: Vec<Value> = stack.split_off(at);
                 let (it, nx) = i.get_iterator(&spread)?;
                 while let Some(x) = i.iterator_step(&it, &nx)? {
@@ -5627,7 +6403,9 @@ fn run_vm_frames<const ONE: bool>(
                 } else {
                     Value::Undefined
                 };
-                let v = i.call(callee, this, &args)?;
+                let v = i
+                    .call(callee.clone(), this, &args)
+                    .map_err(|e| call_error(i, chunk, *pc - 1, &callee, e))?;
                 stack.push(v);
             }
             Op::AppendProp(n, c) => {
@@ -6131,10 +6909,20 @@ fn run_vm_frames<const ONE: bool>(
             // region is truncated away after the call. On a throw the stack is left long, which is
             // fine: the handler unwind (or function exit) truncates it.
             Op::Call(argc) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
                 let at = stack.len() - argc as usize;
                 try_inline_call!(at, false);
                 let callee = stack[at - 1].clone();
-                let v = i.call(callee, Value::Undefined, &stack[at..])?;
+                // `await f()`: an async callee may skip its promise (see `note_await_call`).
+                let fused = matches!(ops.get(*pc), Some(Op::Await));
+                if fused {
+                    i.note_await_call(&callee);
+                }
+                let v = i.call(callee, Value::Undefined, &stack[at..]);
+                if fused {
+                    i.clear_await_call();
+                }
+                let v = v.map_err(|e| call_error(i, chunk, *pc - 1, &stack[at - 1], e))?;
                 stack.truncate(at - 1);
                 stack.push(v);
             }
@@ -6154,18 +6942,39 @@ fn run_vm_frames<const ONE: bool>(
                 }
             }
             Op::CallWithThis(argc) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
                 let at = stack.len() - argc as usize;
                 try_inline_call!(at, true);
                 let m = stack[at - 1].clone();
                 let this = stack[at - 2].clone();
-                let v = i.call(m, this, &stack[at..])?;
+                let fused = matches!(ops.get(*pc), Some(Op::Await));
+                if fused {
+                    i.note_await_call(&m);
+                }
+                let v = i.call(m, this, &stack[at..]);
+                if fused {
+                    i.clear_await_call();
+                }
+                let v = v.map_err(|e| call_error(i, chunk, *pc - 1, &stack[at - 1], e))?;
                 stack.truncate(at - 2);
                 stack.push(v);
             }
             Op::New(argc) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
                 let at = stack.len() - argc as usize;
+                // A constructor template: the instance without running the body.
+                if let Some(r) =
+                    ctor_plan::construct_with_plan(i, &stack[at - 1], &stack[at - 1], &stack[at..])
+                {
+                    let v = r?;
+                    stack.truncate(at - 1);
+                    stack.push(v);
+                    continue;
+                }
                 if !ONE && !frames.is_null() {
-                    if let Some(c) = inline_ctor(i, &stack[at - 1]) {
+                    if let Some(c) = inline_ctor(i, &stack[at - 1])
+                        .or_else(|| class_fields::inline_class_ctor(i, &stack[at - 1]))
+                    {
                         stack.sync();
                         unsafe { (*frames).reserve_one(i) };
                         match unsafe { (*frames).top() } {
@@ -6197,8 +7006,9 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::MakeArray(n) => {
                 let at = stack.len() - n as usize;
-                let items: Vec<Value> = stack.split_off(at);
-                stack.push(i.make_array(items));
+                // Elements move straight from the stack into the new array (no temporary Vec).
+                let v = stack.with_vec(|s| i.make_array_iter(s.drain(at..)));
+                stack.push(v);
             }
             Op::MakeObject(start, count, tidx) => {
                 let at = stack.len() - count as usize;
@@ -6231,11 +7041,32 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::GetIter => {
                 let v = pop!();
-                let (it, nx) = i.get_iterator(&v)?;
-                stack.push(it);
-                stack.push(nx);
+                // A pristine Array/Map/Set: no iterator object (see `iter_fast`).
+                if let Some(state) = iter_fast::open(i, &v) {
+                    stack.push(Value::Num(state));
+                    stack.push(v);
+                } else {
+                    let (it, nx) = i.get_iterator(&v)?;
+                    stack.push(it);
+                    stack.push(nx);
+                }
             }
             Op::IterStepL(is, ns) => {
+                // An encoded protocol-free state (see `iter_fast`); `None` falls through to the
+                // protocol on the (possibly materialized) slots.
+                if let Some(stepped) = iter_fast::step_slots(i, slots, is, ns) {
+                    match stepped {
+                        Some(v) => {
+                            stack.push(v);
+                            stack.push(Value::Bool(true));
+                        }
+                        None => {
+                            stack.push(Value::Undefined);
+                            stack.push(Value::Bool(false));
+                        }
+                    }
+                    continue;
+                }
                 // The pure fast path borrows rooted slots; only fallback crosses a callback.
                 let stepped = match array_iterator_step::try_yield(
                     i,
@@ -6262,13 +7093,17 @@ fn run_vm_frames<const ONE: bool>(
                 }
             }
             Op::IterCloseL(s) => {
-                let it = slots[s as usize].clone();
-                i.iterator_close_normal(&it)?;
+                if !iter_fast::close_is_noop(i, slots, s) {
+                    let it = slots[s as usize].clone();
+                    i.iterator_close_normal(&it)?;
+                }
             }
             Op::IterAbortL(s) => {
                 let exc = pop!();
-                let it = slots[s as usize].clone();
-                i.iterator_close(&it);
+                if !iter_fast::close_is_noop(i, slots, s) {
+                    let it = slots[s as usize].clone();
+                    i.iterator_close(&it);
+                }
                 return Err(Abrupt::Throw(exc));
             }
             Op::Throw => {
@@ -6306,6 +7141,11 @@ fn run_vm_frames<const ONE: bool>(
                 stack.with_vec(|s| ext_ops::init_prop(i, &chunk.names[n as usize], named, s))?
             }
             Op::InitPropComputed(named) => stack.with_vec(|s| ext_ops::init_prop_computed(i, named, s))?,
+            Op::DefineField(n, named) => {
+                let v = pop!();
+                let this = pop!();
+                class_fields::define_field(i, this, &chunk.names[n as usize], named, v)?
+            }
             Op::InitMethod(fidx, n, kind) => {
                 let key = (n != u32::MAX).then(|| &*chunk.names[n as usize]);
                 stack.with_vec(|s| ext_ops::init_method(i, env, &chunk.funcs[fidx as usize], key, kind, s))?
@@ -6348,10 +7188,33 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::ArrayAppendSpread => {
                 let v = pop!();
-                let items = i.iterate(&v)?;
-                stack.with_vec(|s| ext_ops::array_append(s, items, false));
+                let items = match iter_fast::values(i, &v) {
+                    Some(items) => items,
+                    None => i.iterate(&v)?,
+                };
+                // Still empty (`[...xs]`, or the first spread of a literal): no code has seen
+                // the literal, so a fresh array built from the items in one piece replaces it.
+                let empty = matches!(stack.last(), Some(Value::Obj(a)) if matches!(
+                    a.borrow().props.length_property().map(|p| p.value()),
+                    Some(Value::Num(n)) if n == 0.0
+                ));
+                if empty && !items.is_empty() {
+                    let arr = i.make_array(items);
+                    drop(pop!());
+                    stack.push(arr);
+                } else {
+                    stack.with_vec(|s| ext_ops::array_append(s, items, false));
+                }
             }
             Op::ArrayHole => stack.with_vec(|s| ext_ops::array_append(s, std::iter::empty(), true)),
+            Op::ArrayCbGuard(k) => stack.with_vec(|s| inline_callback::guard(i, k, *pc - 1, s)),
+            Op::ArrayCbHas => {
+                let k = pop!();
+                let a = pop!();
+                let present = inline_callback::has(i, &a, &k)?;
+                stack.push_bool(present);
+            }
+            Op::ArrayCbDone(pos) => i.cur_site = pos,
             Op::SwitchLK(s, t) => {
                 let table = chunk.switch_tables[t as usize].get_or_init(|| {
                     switch_table::SwitchTable::build(&chunk.ops, *pc, s, &chunk.consts)
@@ -6362,9 +7225,11 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::SuperCtor => stack.with_vec(|s| derived::super_ctor(i, env, s))?,
             Op::SuperCall(n) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
                 stack.with_vec(|s| derived::super_call(i, env, s, n as usize, false))?
             }
             Op::SuperCallSpread(n) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
                 stack.with_vec(|s| derived::super_call(i, env, s, n as usize, true))?
             }
             Op::DerivedReturn => {
@@ -6386,12 +7251,155 @@ fn run_vm_frames<const ONE: bool>(
             Op::InitialYield => return Ok(VmStep::Await(Value::Undefined)),
             Op::Yield => return Ok(VmStep::Await(pop!())),
             Op::YieldDelegate(it) => {
+                iter_fast::materialize_slots(i, slots, it);
                 if let Some(result) =
                     stack.with_vec(|s| generator::delegate_step(i, slots, it, s))?
                 {
                     *pc -= 1; // park on the op itself: the resume re-runs it
                     return Ok(VmStep::Await(result));
                 }
+            }
+            Op::LoadCallee => {
+                jit::sync_frames(i);
+                let f = i
+                    .fn_frames
+                    .last()
+                    .expect("a function body runs inside its FnFrame")
+                    .callee();
+                stack.push(Value::Obj(f));
+            }
+            Op::BlkNew(dst, parent) => block_env::new_env(env, slots, dst, parent),
+            Op::BlkDecl(s, n, k) => block_env::declare(slots, s, &chunk.names[n as usize], k),
+            Op::BlkCopy(s) => block_env::copy(slots, s),
+            Op::BlkLoad(s, n) => {
+                let v = block_env::load(i, slots, s, &chunk.names[n as usize])?;
+                stack.push(v);
+            }
+            Op::BlkStore(s, n) => {
+                let v = pop!();
+                block_env::store(i, slots, s, &chunk.names[n as usize], v, false)?;
+            }
+            Op::BlkInit(s, n) => {
+                let v = pop!();
+                block_env::store(i, slots, s, &chunk.names[n as usize], v, true)?;
+            }
+            Op::BlkUpdate(s, n, kind) => {
+                block_env::update(i, &mut stack, slots, s, &chunk.names[n as usize], kind)?
+            }
+            Op::InEnv(s) => {
+                let benv = block_env::env_of(&slots[s as usize]);
+                let next = ops[*pc];
+                *pc += 1;
+                match next {
+                    Op::MakeClosure(fidx, name_n) => {
+                        let v = i.make_function(chunk.funcs[fidx as usize].clone(), benv);
+                        if name_n != u32::MAX {
+                            i.set_fn_name(&v, &chunk.names[name_n as usize]);
+                        }
+                        stack.push(v);
+                    }
+                    Op::InitMethod(fidx, n, kind) => {
+                        let key = (n != u32::MAX).then(|| &*chunk.names[n as usize]);
+                        stack.with_vec(|s| {
+                            ext_ops::init_method(i, &benv, &chunk.funcs[fidx as usize], key, kind, s)
+                        })?
+                    }
+                    Op::MakeClass(cidx, n) => {
+                        let name = (n != u32::MAX).then(|| &*chunk.names[n as usize]);
+                        stack.with_vec(|s| {
+                            ext_ops::make_class(i, &benv, &chunk.classes[cidx as usize], name, s)
+                        })?
+                    }
+                    _ => unreachable!("InEnv prefixes a closure-creating op"),
+                }
+            }
+            Op::TailCall(argc, has_this) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
+                tail_call!(argc as usize, has_this);
+            }
+            Op::TailCallSpread(argc, has_this) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
+                // Expand the spread onto the stack: the window becomes an ordinary one.
+                let spread = pop!();
+                let mut n = argc as usize - 1;
+                if !iter_fast::array_elems(i, &spread, |x| {
+                    stack.push(x);
+                    n += 1;
+                }) {
+                    let (it, nx) = i.get_iterator(&spread)?;
+                    while let Some(x) = i.iterator_step(&it, &nx)? {
+                        stack.push(x);
+                        n += 1;
+                    }
+                }
+                tail_call!(n, has_this);
+            }
+            Op::ImportCall(phase, has_opts) => {
+                let opts = if has_opts { Some(pop!()) } else { None };
+                let spec = pop!();
+                let phase = match phase {
+                    1 => crate::ast::ImportPhase::Source,
+                    2 => crate::ast::ImportPhase::Defer,
+                    _ => crate::ast::ImportPhase::Evaluation,
+                };
+                let v = i.import_call_finish(spec, opts, phase, env)?;
+                stack.push(v);
+            }
+            Op::GetAsyncIter => {
+                let rhs = pop!();
+                for_await::get_async_iter(i, &mut stack, rhs)?;
+            }
+            Op::AsyncIterNext(it, nx, st) => {
+                let v = for_await::next(i, slots, it, nx, st)?;
+                stack.push(v);
+            }
+            Op::AsyncIterResult(st) => {
+                let v = pop!();
+                for_await::result(i, &mut stack, slots, st, v)?;
+            }
+            Op::AsyncCloseCall(it, st) => for_await::close_call(i, &mut stack, slots, it, st)?,
+            Op::AsyncCloseCheck(st) => {
+                let v = pop!();
+                for_await::close_check(i, slots, st, v)?;
+            }
+            Op::AsyncDelegateInit => {
+                let v = pop!();
+                generator::async_init(i, &mut stack, v)?;
+            }
+            Op::AsyncDelegateCall(it, md, rt) => {
+                let v = pop!();
+                generator::async_call(i, &mut stack, slots, it, md, rt, v)?;
+            }
+            Op::AsyncDelegateResult(fs, dn) => {
+                let v = pop!();
+                generator::async_result(i, &mut stack, slots, fs, dn, v)?;
+            }
+            Op::AsyncDelegateCloseReject(it, dn) => {
+                let exc = pop!();
+                return Err(generator::async_close_reject(i, slots, it, dn, exc));
+            }
+            Op::AsyncDelegateSpecial(md, err) => {
+                let e = if err { Some(pop!()) } else { None };
+                generator::async_special(i, slots, md, e)?;
+            }
+            Op::IterRestL(it, nx) => {
+                let v = destructure_seq::rest(i, slots, it, nx)?;
+                stack.push(v);
+            }
+            Op::NewSpread(argc) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
+                let spread = pop!();
+                let at = stack.len() - (argc as usize - 1);
+                let mut args: Vec<Value> = stack.split_off(at);
+                if !iter_fast::array_elems(i, &spread, |x| args.push(x)) {
+                    let (it, nx) = i.get_iterator(&spread)?;
+                    while let Some(x) = i.iterator_step(&it, &nx)? {
+                        args.push(x);
+                    }
+                }
+                let callee = pop!();
+                let v = i.construct(callee, &args)?;
+                stack.push(v);
             }
         }
     }
@@ -6417,6 +7425,8 @@ pub struct VmCoro {
     /// A generator body's strictness, installed on the interpreter for each resume (a resume
     /// runs from `next()` in whatever context called it). `None` for async bodies.
     strict: Option<bool>,
+    /// The stack-trace frame each resume runs under (see `Coroutine::set_frame`).
+    pub(crate) frame: crate::interpreter::stack_trace::ResumeFrame,
 }
 
 /// Where a suspended [`VmCoro`] is parked (from the op at / before its pc).
@@ -6435,12 +7445,19 @@ enum Parked {
 impl VmCoro {
     /// Build an async coroutine for `chunk` with params seeded from `args`, parked before its first
     /// step (run on the first `resume`).
-    pub fn new(i: &Interp, chunk: Rc<Chunk>, env: Env, this_val: Value, args: &[Value]) -> VmCoro {
+    pub fn new(
+        i: &mut Interp,
+        chunk: Rc<Chunk>,
+        env: Env,
+        this_val: Value,
+        args: &[Value],
+    ) -> VmCoro {
         let env = chunk.make_run_env(i, &env, &this_val, args);
-        let mut slots = vec![Value::Undefined; chunk.n_slots];
-        for (k, a) in args.iter().take(chunk.n_params).enumerate() {
-            slots[k] = a.clone();
-        }
+        // Buffers come from the VM pool (see [`run`]) and go back when the body finishes.
+        let (mut slots, stack) = i.vm_pool.pop().unwrap_or_default();
+        let seed = chunk.n_params.min(args.len());
+        slots.extend_from_slice(&args[..seed]);
+        slots.resize(chunk.n_slots, Value::Undefined);
         chunk.seed_rest(i, &mut slots, args);
         for &s in &chunk.var_force_resets {
             slots[s as usize] = Value::Undefined;
@@ -6450,12 +7467,13 @@ impl VmCoro {
             env,
             this_val,
             slots,
-            stack: Vec::with_capacity(16),
+            stack,
             pc: 0,
             handlers: Vec::new(),
             done: false,
             started: false,
             strict: None,
+            frame: Default::default(),
         }
     }
 
@@ -6553,7 +7571,7 @@ impl VmCoro {
             Resume::Throw(e) if self.started => Some(e),
             Resume::Throw(e) => {
                 self.done = true;
-                self.release();
+                self.release_to(i);
                 return Suspend::Throw(e);
             }
             Resume::Return(v) if self.started && parked == Parked::Yield => {
@@ -6568,7 +7586,7 @@ impl VmCoro {
             }
             Resume::Return(v) => {
                 self.done = true;
-                self.release();
+                self.release_to(i);
                 return Suspend::Done(v);
             }
         };
@@ -6599,27 +7617,33 @@ impl VmCoro {
             },
             Ok(VmStep::Done(v)) => {
                 self.done = true;
-                self.release();
+                self.release_to(i);
                 Suspend::Done(v)
             }
             Err(Abrupt::Throw(e)) => {
                 self.done = true;
-                self.release();
+                self.release_to(i);
                 Suspend::Throw(e)
             }
             // Return/Break/Continue can't escape a function body; treat defensively as completion.
             Err(_) => {
                 self.done = true;
-                self.release();
+                self.release_to(i);
                 Suspend::Done(Value::Undefined)
             }
         }
     }
 
     /// A finished body keeps nothing alive (a done generator object may live on indefinitely).
-    fn release(&mut self) {
-        self.slots = Vec::new();
-        self.stack = Vec::new();
+    /// Its slot and stack buffers return to the VM pool.
+    fn release_to(&mut self, i: &mut Interp) {
+        let mut slots = std::mem::take(&mut self.slots);
+        let mut stack = std::mem::take(&mut self.stack);
+        slots.clear();
+        stack.clear();
+        if slots.capacity() != 0 && i.vm_pool.len() < 64 {
+            i.vm_pool.push((slots, stack));
+        }
         self.handlers = Vec::new();
         self.this_val = Value::Undefined;
     }
@@ -7200,6 +8224,10 @@ impl Chunk {
             Op::Call(argc) => (*argc as usize + 1, 1),
             Op::LoadNameForCall(..) => (0, 2),
             Op::CallWithThis(argc) => (*argc as usize + 2, 1),
+            // A generic call-out (see `Op::TailCall`'s `ONE` arm); the `Return` follows.
+            Op::TailCall(argc, this) | Op::TailCallSpread(argc, this) => {
+                (*argc as usize + 1 + *this as usize, 1)
+            }
             Op::New(argc) => (*argc as usize + 1, 1),
             Op::MakeRegExp(..) => (0, 1),
             Op::MakeArray(n) => (*n as usize, 1),
@@ -7215,6 +8243,7 @@ impl Chunk {
             Op::NewObject | Op::SuperBase => (0, 1),
             Op::MakeClass(..) => (0, 1),
             Op::InitProp(..) | Op::CopyDataProps | Op::SetProtoLit => (2, 1),
+            Op::DefineField(..) => (2, 0),
             Op::InitPropComputed(_) => (3, 1),
             Op::InitMethod(_, n, _) => (if *n == u32::MAX { 2 } else { 1 }, 1),
             Op::Nip => (2, 1),
@@ -7226,16 +8255,42 @@ impl Chunk {
             Op::NewArrayLit => (0, 1),
             Op::ArrayAppend | Op::ArrayAppendSpread => (2, 1),
             Op::ArrayHole => (1, 1),
+            Op::ArrayCbGuard(_) => (2, 3),
+            Op::ArrayCbHas => (2, 1),
+            Op::ArrayCbDone(_) => (0, 0),
             // A computed jump: the stack-depth analysis (and the JIT) stay off these chains.
             Op::SwitchLK(..) => return None,
-            // Derived-constructor and generator ops stay on the interpreter.
-            Op::SuperCtor
-            | Op::SuperCall(_)
-            | Op::SuperCallSpread(_)
-            | Op::DerivedReturn
-            | Op::InitialYield
+            // Derived-constructor ops: `super(…)` runs as a generic op, the return exits.
+            Op::SuperCtor => (0, 2),
+            Op::SuperCall(n) | Op::SuperCallSpread(n) => (*n as usize + 2, 1),
+            Op::DerivedReturn => (1, 0),
+            // The callee from the reflection frame (JIT direct calls sync theirs first).
+            Op::LoadCallee => (0, 1),
+            // Block envs: their carrier slots are touched by these ops only (the JIT leaves
+            // them in memory and runs the ops generically).
+            Op::BlkNew(..) | Op::BlkDecl(..) | Op::BlkCopy(_) => (0, 0),
+            Op::BlkLoad(..) => (0, 1),
+            Op::BlkStore(..) | Op::BlkInit(..) => (1, 0),
+            Op::BlkUpdate(_, _, k) => (0, upd(k)),
+            // A prefix: runs with the closure-creating op after it (whose effect counts).
+            Op::InEnv(_) => (0, 0),
+            Op::NewSpread(argc) => (*argc as usize + 1, 1),
+            Op::IterRestL(..) => (0, 1),
+            // Generator ops stay on the interpreter.
+            Op::InitialYield
             | Op::Yield
-            | Op::YieldDelegate(_) => return None,
+            | Op::YieldDelegate(_)
+            | Op::GetAsyncIter
+            | Op::AsyncIterNext(..)
+            | Op::AsyncIterResult(_)
+            | Op::AsyncCloseCall(..)
+            | Op::AsyncCloseCheck(_)
+            | Op::AsyncDelegateInit
+            | Op::AsyncDelegateCall(..)
+            | Op::AsyncDelegateResult(..)
+            | Op::AsyncDelegateCloseReject(..)
+            | Op::AsyncDelegateSpecial(..) => return None,
+            Op::ImportCall(_, opts) => (1 + *opts as usize, 1),
         })
     }
 }
@@ -7264,7 +8319,7 @@ fn tdz_check(
 /// string for an in-range integer index. `None` = generic path (out of range, non-integer,
 /// possibly non-ASCII content).
 #[inline]
-fn str_index_fast(s: &crate::lstr::LStr, n: f64) -> Option<Value> {
+pub(crate) fn str_index_fast(s: &crate::lstr::LStr, n: f64) -> Option<Value> {
     if !s.ascii_hint() || !(0.0..s.len() as f64).contains(&n) || n.fract() != 0.0 {
         return None;
     }
@@ -7278,7 +8333,7 @@ fn str_index_fast(s: &crate::lstr::LStr, n: f64) -> Option<Value> {
 /// [`crate::lstr::LStr::concat_grown`] when full) — the amortized-O(append) accumulator loop
 /// instead of copying the whole accumulation per step. `false` = not applicable, nothing touched.
 #[inline]
-fn append_to_slot(slots: &mut [Value], d: usize, y: &Value) -> bool {
+pub(crate) fn append_to_slot(slots: &mut [Value], d: usize, y: &Value) -> bool {
     let mut buf = [0u8; 32];
     let rhs: &str = match y {
         Value::Str(s) => s,

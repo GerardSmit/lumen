@@ -25,8 +25,8 @@ pub(super) struct Shape {
     /// Per pc: the operand-stack kinds when it starts a block (a jump target), else `None`.
     pub leaders: Vec<Option<Vec<bool>>>,
     pub reach: Vec<bool>,
-    /// The kind of the returned value.
-    pub ret: bool,
+    /// The kind of the returned value; `None` when the body returns `undefined`.
+    pub ret: Option<bool>,
 }
 
 /// A resolved callee that may be inlined.
@@ -39,7 +39,7 @@ pub(super) struct InlSite {
     pub expect: usize,
 }
 
-fn arith_of(op: &Op) -> Option<ArithKind> {
+pub(super) fn arith_of(op: &Op) -> Option<ArithKind> {
     Some(match op {
         Op::Add => ArithKind::Add,
         Op::Sub => ArithKind::Sub,
@@ -56,7 +56,7 @@ fn arith_of(op: &Op) -> Option<ArithKind> {
     })
 }
 
-fn cmp_of(op: &Op) -> Option<CmpKind> {
+pub(super) fn cmp_of(op: &Op) -> Option<CmpKind> {
     Some(match op {
         Op::Lt => CmpKind::Lt,
         Op::Gt => CmpKind::Gt,
@@ -122,7 +122,7 @@ fn shape(chunk: &Chunk, args: &[bool]) -> Option<Shape> {
     let mut inc: Vec<Option<(Vec<bool>, Vec<bool>)>> = vec![None; n + 1];
     let mut leaders: Vec<Option<Vec<bool>>> = vec![None; n];
     let mut reach = vec![false; n];
-    let mut ret: Option<bool> = None;
+    let mut ret: Option<Option<bool>> = None;
     let mut defined = vec![false; ns];
     defined[..args.len()].fill(true);
     inc[0] = Some((defined, Vec::new()));
@@ -273,10 +273,17 @@ fn shape(chunk: &Chunk, args: &[bool]) -> Option<Shape> {
                 }
                 Op::Return => {
                     let k = st.pop()?;
-                    if !st.is_empty() || ret.is_some_and(|r| r != k) {
+                    if !st.is_empty() || ret.is_some_and(|r| r != Some(k)) {
                         return None;
                     }
-                    ret = Some(k);
+                    ret = Some(Some(k));
+                    falls = false;
+                }
+                Op::ReturnUndef => {
+                    if !st.is_empty() || ret.is_some_and(|r| r.is_some()) {
+                        return None;
+                    }
+                    ret = Some(None);
                     falls = false;
                 }
                 _ => return None,
@@ -323,7 +330,7 @@ impl Tr<'_, '_> {
                 }
             }
         }
-        let (r, num) = self.inline_body(&site, &args)?;
+        let (r, kind) = self.inline_body(&site, &args)?;
         // The placeholders: receiver and callee, or just the callee of a local-callee site.
         let local = self
             .plan
@@ -331,11 +338,24 @@ impl Tr<'_, '_> {
             .values()
             .any(|s| s.call == pc && s.slot.is_some());
         self.stack.truncate(d - argc - if local { 1 } else { 2 });
-        self.stack.push(if num { Entry::Num(r) } else { Entry::Bool(r) });
+        match (r, kind) {
+            (Some(r), Some(true)) => self.stack.push(Entry::Num(r)),
+            (Some(r), Some(false)) => self.stack.push(Entry::Bool(r)),
+            _ => {
+                let at = self.stack.len();
+                self.set_stack_tag(at, TAG_UNDEFINED);
+                self.stack.push(Entry::Boxed);
+            }
+        }
         Ok(())
     }
 
-    fn inline_body(&mut self, site: &InlSite, args: &[(V, bool)]) -> Result<(V, bool), String> {
+    /// The inlined body's result and its kind (`None`: the body returns `undefined`).
+    fn inline_body(
+        &mut self,
+        site: &InlSite,
+        args: &[(V, bool)],
+    ) -> Result<(Option<V>, Option<bool>), String> {
         let chunk = &*site.chunk;
         let sh = &site.shape;
         let ty = |num: bool| if num { Type::F64 } else { Type::I32 };
@@ -362,7 +382,7 @@ impl Tr<'_, '_> {
             }
         }
         let done = self.fb.create_block();
-        let result = self.fb.append_block_param(done, ty(sh.ret));
+        let result = sh.ret.map(|k| self.fb.append_block_param(done, ty(k)));
         let mut st: Vec<(V, bool)> = Vec::new();
         let mut open = true;
         for pc in 0..n {
@@ -522,6 +542,10 @@ impl Tr<'_, '_> {
                     self.fb.jump(done, &[v]);
                     open = false;
                 }
+                Op::ReturnUndef => {
+                    self.fb.jump(done, &[]);
+                    open = false;
+                }
                 other => return Err(format!("inline op {other:?}")),
             }
             if let Some((cond, t)) = branch {
@@ -549,7 +573,7 @@ impl Tr<'_, '_> {
     }
 
     /// `x <k> y` on two Numbers, or (equality kinds) two Booleans.
-    fn inl_cmp(&mut self, k: CmpKind, x: V, y: V, num: bool) -> V {
+    pub(super) fn inl_cmp(&mut self, k: CmpKind, x: V, y: V, num: bool) -> V {
         if num {
             return self.fb.fcmp(fcc(k), x, y);
         }

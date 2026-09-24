@@ -12,6 +12,7 @@ proc-macro = true
 
 [dependencies]
 lumen = { path = "../../lumen", default-features = false }
+# `.ts`/`.mts`/`.cts` sources are type-stripped (offsets kept) before compiling.
 
 [lints]
 workspace = true

@@ -4,7 +4,7 @@
 // success.
 
 // ---- node:v8 ----------------------------------------------------------------------------------
-{
+__lazyGlue(__glueIndex, "v8", "", "", () => {
   const te = new TextEncoder();
   const td = new TextDecoder();
 
@@ -376,13 +376,13 @@
     getHeapSnapshot: notSupported("heap snapshots"),
     writeHeapSnapshot: notSupported("heap snapshots"),
   });
-}
+});
 
 // ---- node:inspector (and node:inspector/promises) ---------------------------------------------
 // No V8 inspector is attached; the correct state is "inert", not a pretend session. Session.post
 // reports the unavailability honestly (callback error / rejected promise); the module shape
 // otherwise mirrors Node's (open/close/url/waitForDebugger, the Network domain, `console`).
-{
+__lazyGlue(__glueIndex, "inspector inspector/promises", "", "", () => {
   const noop = () => {};
   const unavailable = () => new Error("node:inspector is not available in lumen");
   class Session {
@@ -422,15 +422,16 @@
     }
   }
   __builtins.set("inspector/promises", { ...base, Session: SessionPromises });
-}
+});
 
 // ---- node:sys ---------------------------------------------------------------------------------
 // The long-deprecated alias for node:util — the *same* object, exactly as Node's `sys` is.
-__builtins.set("sys", __builtins.get("util"));
+// Registered to load on first use, like node:util itself (see preamble.js `__lazyGlue`).
+__lazyGlue(__glueIndex, "sys", "", "", () => __builtins.set("sys", __builtins.get("util")));
 
 // ---- node:stream/consumers --------------------------------------------------------------------
 // Node's lib/stream/consumers.js: fully consume a stream / async-iterable into a single value.
-{
+__lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
   async function blob(stream) {
     const chunks = [];
     for await (const chunk of stream) chunks.push(chunk);
@@ -460,13 +461,13 @@ __builtins.set("sys", __builtins.get("util"));
     return JSON.parse(str);
   }
   __builtins.set("stream/consumers", { arrayBuffer, blob, buffer, json, text });
-}
+});
 
 // ---- node:readline ----------------------------------------------------------------------------
 // A real line reader over an input stream (the interactive cursor/history features a TTY would
 // provide are absent — lumen runs behind pipes — but line events, question(), and async iteration
 // all work).
-{
+__lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   const { EventEmitter } = __builtins.get("events");
   const kKeypressWired = Symbol("readline.keypressWired");
 
@@ -608,7 +609,7 @@ __builtins.set("sys", __builtins.get("util"));
     promises: promisesModule,
   });
   __builtins.set("readline/promises", promisesModule);
-}
+});
 
 // ---- node:process ----------------------------------------------------------------------------
 // Node's `process` is an EventEmitter (SIGINT/exit/beforeExit/…). lumen builds `process` in Rust
@@ -917,10 +918,19 @@ __builtins.set("sys", __builtins.get("util"));
   };
 
   // Modern Node throws for internal bindings; lumen exposes none.
-  proc.binding = function (name) {
+  const noBinding = function (name) {
     throw new Error("process.binding('" + name + "') is not supported in lumen");
   };
-  proc._linkedBinding = proc.binding;
+  // process.binding(): Node 20 still serves an allowlist of internal bindings (DEP0111, a warning
+  // only under --pending-deprecation). The ones net.js implements are served from there (loading
+  // node:net on first use).
+  const servedBindings = ["http_parser", "tcp_wrap", "pipe_wrap", "stream_wrap", "uv"];
+  proc.binding = function binding(name) {
+    name = `${name}`;
+    if (servedBindings.includes(name)) return __internals.get("internalBinding")(name);
+    return noBinding.call(this, name);
+  };
+  proc._linkedBinding = noBinding;
 
   // Not supported: replacing the process image / changing OS identity can't be done honestly
   // without the underlying syscall, and silently "succeeding" would misrepresent the result.
@@ -953,9 +963,13 @@ __builtins.set("sys", __builtins.get("util"));
   // and an unused stdin never holds the event loop open. The read in flight cannot be
   // cancelled, so a paused or destroyed stdin unrefs it instead of waiting for the writer to
   // close the pipe (Node lets the process exit in both cases).
-  const streamMod = __builtins.get("stream");
+  // Created on first access (as Node's is), so a script that never reads stdin does not load
+  // node:stream at startup.
+  let stdinStream;
+  const getStdin = () => (stdinStream ??= createStdin());
+  function createStdin() {
   const stdinIsTTY = typeof proc._isatty === "function" && proc._isatty(0);
-  const stdin = new streamMod.Readable({ highWaterMark: 64 * 1024 });
+  const stdin = new (__builtins.get("stream").Readable)({ highWaterMark: 64 * 1024 });
   {
     let pending = null;
     let wanted = true;
@@ -1007,15 +1021,22 @@ __builtins.set("sys", __builtins.get("util"));
     stdin.setRawMode = function (mode) { this.isRaw = !!mode; return this; };
   }
   stdin.fd = 0;
-  Object.defineProperty(proc, "stdin", { value: stdin, enumerable: true, configurable: true });
-  proc.openStdin = function () { stdin.resume(); return stdin; };
+  return stdin;
+  }
+  Object.defineProperty(proc, "stdin", {
+    enumerable: true, configurable: true,
+    get: getStdin,
+  });
+  proc.openStdin = function () { const stdin = getStdin(); stdin.resume(); return stdin; };
 
   // stdout / stderr: Writables over the runtime's synchronous sinks (which honour an embedder's
   // redirection) — tty.WriteStream on a terminal, else Node's SyncWriteStream shape. Created on
   // first access, as Node's are. `destroy()` only ends the JS stream: fd 1/2 stay open.
   const rawStdio = { 1: proc.stdout, 2: proc.stderr };
   __internals.set("stdio_raw", rawStdio);
-  class SyncWriteStream extends streamMod.Writable {
+  // Built on first use: the stream module loads only when a stdio stream is created.
+  let SyncWriteStreamClass;
+  const syncWriteStream = () => (SyncWriteStreamClass ??= class SyncWriteStream extends __builtins.get("stream").Writable {
     constructor(fd, raw) {
       super({ autoDestroy: true, decodeStrings: false });
       this.fd = fd;
@@ -1026,12 +1047,13 @@ __builtins.set("sys", __builtins.get("util"));
       try {
         this._raw.write(typeof chunk === "string" && encoding !== "utf8" && encoding !== "utf-8" ? Buffer.from(chunk, encoding) : chunk);
       } catch (e) {
+        if (e && e.code === "EPIPE" && e.errno === undefined) e.errno = __uvCodes.get("EPIPE");
         cb(e);
         return;
       }
       cb();
     }
-  }
+  });
   function dummyDestroy(err, cb) {
     cb(err);
     this._undestroy();
@@ -1041,7 +1063,7 @@ __builtins.set("sys", __builtins.get("util"));
     const tty = __builtins.get("tty");
     const stream = tty && proc._isatty && proc._isatty(fd)
       ? new tty.WriteStream(fd)
-      : new SyncWriteStream(fd, rawStdio[fd]);
+      : new (syncWriteStream())(fd, rawStdio[fd]);
     stream.fd = fd;
     stream._type = stream.isTTY ? "tty" : "fs";
     stream._isStdio = true;
@@ -1064,13 +1086,21 @@ __builtins.set("sys", __builtins.get("util"));
   const IPC_PREFIX = "\x1eLUMEN_IPC ";
   let forkIpcStarted = false;
   let forkConnected = false;
+  let forkDisconnected = false;
   let forkPending = "";
   const isForkChild = () => proc.env && proc.env.LUMEN_FORK_IPC === "1";
+  // Node's channel ref counting: the IPC channel keeps the child alive only while it is
+  // connected and 'message' / 'disconnect' listeners exist, so a child that only sends exits.
+  const updateForkRef = () => {
+    if (!forkIpcStarted) return;
+    const keep = forkConnected && (proc.listenerCount("message") > 0 || proc.listenerCount("disconnect") > 0);
+    if (keep) getStdin().ref(); else getStdin().unref();
+  };
   const startForkIpc = () => {
-    if (forkIpcStarted || !isForkChild()) return;
+    if (forkIpcStarted || forkDisconnected || !isForkChild()) return;
     forkIpcStarted = true;
     forkConnected = true;
-    stdin.on("data", (chunk) => {
+    getStdin().on("data", (chunk) => {
       forkPending += Buffer.from(chunk).toString("utf8");
       for (;;) {
         const newline = forkPending.indexOf("\n");
@@ -1079,17 +1109,26 @@ __builtins.set("sys", __builtins.get("util"));
         forkPending = forkPending.slice(newline + 1);
         if (!line.startsWith(IPC_PREFIX)) continue;
         try {
-          proc.emit("message", JSON.parse(line.slice(IPC_PREFIX.length)), null);
+          const message = JSON.parse(line.slice(IPC_PREFIX.length));
+          // cluster's own control messages never reach user 'message' listeners.
+          if (message !== null && typeof message === "object" && message.__lumenCluster !== undefined) proc.emit("internalMessage", message);
+          else proc.emit("message", message, null);
         } catch (error) {
           proc.emit("error", error);
         }
       }
     });
-    stdin.on("end", () => {
+    getStdin().on("end", () => {
       if (!forkConnected) return;
       forkConnected = false;
+      updateForkRef();
       proc.emit("disconnect");
+      // A cluster worker whose primary went away exits (Node's cluster child does the same), so
+      // a primary that dies never leaves orphaned workers running. A disconnect the primary asked
+      // for (worker.disconnect()) is different: the worker then exits under normal loop rules.
+      if ((proc._lumenClusterWorker || (proc.env && proc.env.LUMEN_CLUSTER_WORKER === "1")) && !proc._clusterExitedAfterDisconnect) proc.exit(0);
     });
+    updateForkRef();
   };
   const forkSend = (message, sendHandle, options, callback) => {
     if (typeof sendHandle === "function") callback = sendHandle;
@@ -1125,14 +1164,32 @@ __builtins.set("sys", __builtins.get("util"));
     get() { return isForkChild() ? forkConnected : undefined; },
   });
   proc.disconnect = function () {
-    if (!isForkChild() || !forkConnected) return;
+    if (!isForkChild() || forkDisconnected) return;
+    forkDisconnected = true;
     forkConnected = false;
+    updateForkRef();
+    try { proc.stdout.write("\x1eLUMEN_IPC_DISCONNECT\n"); } catch {}
     queueMicrotask(() => proc.emit("disconnect"));
   };
   const processOn = proc.on;
   proc.on = proc.addListener = function (event, listener) {
     if (event === "message" || event === "disconnect") startForkIpc();
-    return processOn.call(this, event, listener);
+    const result = processOn.call(this, event, listener);
+    if (event === "message" || event === "disconnect") updateForkRef();
+    return result;
+  };
+  const processOnce = proc.once;
+  proc.once = function (event, listener) {
+    if (event === "message" || event === "disconnect") startForkIpc();
+    const result = processOnce.call(this, event, listener);
+    if (event === "message" || event === "disconnect") updateForkRef();
+    return result;
+  };
+  const processOff = proc.removeListener;
+  proc.removeListener = proc.off = function (event, listener) {
+    const result = processOff.call(this, event, listener);
+    if (event === "message" || event === "disconnect") updateForkRef();
+    return result;
   };
 
   // Semi-internal underscore surface Node exposes as own keys. Honest no-ops / empty collectors;
@@ -1162,7 +1219,7 @@ __builtins.set("process", globalThis.process);
 // connection (connect/createServer/TLSSocket) throws. The pure pieces are real: the constants,
 // checkServerIdentity (RFC 6125 hostname/SAN matching), convertALPNProtocols (the length-prefixed
 // wire encoding), and getCiphers (the OpenSSL cipher enumeration).
-{
+__lazyGlue(__glueIndex, "tls", "", "", () => {
   const notSupported = function () {
     throw new Error("node:tls is not supported in lumen (TLS requires a crypto stack)");
   };
@@ -1265,13 +1322,14 @@ __builtins.set("process", globalThis.process);
     DEFAULT_MIN_VERSION: "TLSv1.2",
     DEFAULT_MAX_VERSION: "TLSv1.3",
   });
-}
+});
 
 // ---- node:test --------------------------------------------------------------------------------
 // The runner Node ships: tests and suites run one at a time in declaration order, hooks wrap
 // them, `t.after`/`t.mock` clean up, a spec-style report goes to stdout, and a failure sets the
 // exit code — so a `test/*.test.cjs` file behaves under lumen as it does under `node --test`.
-{
+// Loaded on first use (see preamble.js `__lazyGlue`).
+__lazyGlue(__glueIndex, "test", "", "", () => {
   const assert = __builtins.get("assert");
   const now = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
 
@@ -1592,4 +1650,4 @@ __builtins.set("process", globalThis.process);
   test.snapshot = { setDefaultSnapshotSerializers() {}, setResolveSnapshotPath() {} };
   test.assert = assert;
   __builtins.set("test", test);
-}
+});

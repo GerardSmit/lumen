@@ -1,0 +1,32 @@
+[
+ {
+  "path": "Vec",
+  "start": 7,
+  "end": 292
+ },
+ {
+  "path": "Vec#dot",
+  "start": 151,
+  "end": 216
+ },
+ {
+  "path": "Vec#scale",
+  "start": 219,
+  "end": 290
+ },
+ {
+  "path": "norm",
+  "start": 301,
+  "end": 364
+ },
+ {
+  "path": "sum",
+  "start": 373,
+  "end": 493
+ },
+ {
+  "path": "first",
+  "start": 595,
+  "end": 709
+ }
+]

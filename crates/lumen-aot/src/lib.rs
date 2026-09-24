@@ -49,7 +49,8 @@
 //!   `**` any number of segments, `*`/`?` within one, matched at any directory boundary of the
 //!   path relative to `CARGO_MANIFEST_DIR` (`"puppeteer-core/**"`); `true` = every file.
 //!   Only function/class text is kept — module-level code and comments between functions are
-//!   not — LZ-compressed. **Tradeoff:** kept text is recoverable from the binary; keep it only
+//!   not — compressed, and decompressed only on the first `toString` that reads it.
+//!   **Tradeoff:** kept text is recoverable from the binary; keep it only
 //!   where `toString` is needed (the user's own `evaluate` callbacks live in the user's
 //!   bundle, so its files need it too).
 //! - `exclude = ["glob", …]` — never bundle matching files (their imports go to the host

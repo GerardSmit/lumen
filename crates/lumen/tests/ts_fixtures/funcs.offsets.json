@@ -1,0 +1,142 @@
+[
+ {
+  "path": "add",
+  "start": 195,
+  "end": 257
+ },
+ {
+  "path": "later",
+  "start": 266,
+  "end": 332
+ },
+ {
+  "path": "count",
+  "start": 341,
+  "end": 437
+ },
+ {
+  "path": "double",
+  "start": 461,
+  "end": 489
+ },
+ {
+  "path": "asyncArrow",
+  "start": 517,
+  "end": 556
+ },
+ {
+  "path": "single",
+  "start": 580,
+  "end": 586
+ },
+ {
+  "path": "expr",
+  "start": 608,
+  "end": 662
+ },
+ {
+  "path": "Shape",
+  "start": 672,
+  "end": 1119
+ },
+ {
+  "path": "Shape#area",
+  "start": 744,
+  "end": 778
+ },
+ {
+  "path": "Shape#get label",
+  "start": 781,
+  "end": 828
+ },
+ {
+  "path": "Shape#set label",
+  "start": 831,
+  "end": 876
+ },
+ {
+  "path": "Shape.make",
+  "start": 886,
+  "end": 945
+ },
+ {
+  "path": "Shape#load",
+  "start": 948,
+  "end": 1000
+ },
+ {
+  "path": "Shape#items",
+  "start": 1003,
+  "end": 1049
+ },
+ {
+  "path": "Shape.stream",
+  "start": 1059,
+  "end": 1117
+ },
+ {
+  "path": "Circle",
+  "start": 1128,
+  "end": 1287
+ },
+ {
+  "path": "Circle#area",
+  "start": 1227,
+  "end": 1285
+ },
+ {
+  "path": "Empty",
+  "start": 1296,
+  "end": 1310
+ },
+ {
+  "path": "api.ping",
+  "start": 1335,
+  "end": 1368
+ },
+ {
+  "path": "api.get version",
+  "start": 1372,
+  "end": 1407
+ },
+ {
+  "path": "api.handler",
+  "start": 1420,
+  "end": 1445
+ },
+ {
+  "path": "api.fetch",
+  "start": 1449,
+  "end": 1502
+ },
+ {
+  "path": "outer",
+  "start": 1515,
+  "end": 1600
+ },
+ {
+  "path": "withDefault",
+  "start": 1609,
+  "end": 1706
+ },
+ {
+  "path": "rest",
+  "start": 1715,
+  "end": 1777
+ },
+ {
+  "path": "cast",
+  "start": 1786,
+  "end": 1851
+ },
+ {
+  "path": "nonNull",
+  "start": 1860,
+  "end": 1928
+ },
+ {
+  "path": "spaced",
+  "start": 1937,
+  "end": 2003
+ }
+]

@@ -1,21 +1,78 @@
 //! Array construction from owned builtin values.
 use super::Interp;
-use crate::value::{Exotic, Object, Property, Props, Value};
+use crate::value::{Exotic, Object, Property, Value};
 use std::sync::OnceLock;
 
 impl Interp {
     pub fn make_array(&self, items: Vec<Value>) -> Value {
-        static COMPACT: OnceLock<bool> = OnceLock::new();
-        if (1..=32).contains(&items.len())
-            && *COMPACT
-                .get_or_init(|| std::env::var_os("LUMEN_NO_COMPACT_BUILTIN_ARRAYS").is_none())
-        {
-            let props = Props::packed_array_from_values(items.into_iter());
-            let obj = Object::new_with_parts(Some(self.array_proto.clone()), props, Exotic::Array);
-            #[cfg(test)]
-            COMPACT_ARRAYS.with(|n| n.set(n.get() + 1));
-            return Value::Obj(obj);
+        if !compact_arrays() && !items.is_empty() {
+            return self.make_array_classic(items);
         }
+        if !items.is_empty() {
+            note_compact();
+        }
+        Value::Obj(Object::new_array_from_vec(Some(self.array_proto.clone()), items))
+    }
+
+    /// [`Interp::make_array`] from an exact-size run of owned values (an array literal's operand
+    /// stack slice): packed elements, the array one heap block when small.
+    pub(crate) fn make_array_iter(&self, items: impl ExactSizeIterator<Item = Value>) -> Value {
+        let len = items.len();
+        if len != 0 && !compact_arrays() {
+            return self.make_array_classic(items.collect());
+        }
+        if len != 0 {
+            note_compact();
+        }
+        Value::Obj(Object::new_array_from_iter(Some(self.array_proto.clone()), items))
+    }
+
+    /// [`Interp::make_array_iter`] of the `n` values at `vals`, *moved* out (the caller must
+    /// not drop them again): the JIT's array literals (one slab box up to ten elements, see
+    /// [`Object::alloc_array`]).
+    ///
+    /// # Safety
+    /// `vals` must point at `n` initialized values.
+    pub(crate) unsafe fn make_array_moved(&self, vals: *mut Value, n: usize) -> Value {
+        if n != 0 && !compact_arrays() {
+            return self.make_array_classic((0..n).map(|k| std::ptr::read(vals.add(k))).collect());
+        }
+        if n != 0 {
+            note_compact();
+        }
+        Value::Obj(Object::alloc_array(Some(self.array_proto.clone()), vals, n))
+    }
+
+    /// The `RegExp.prototype.exec` match array: packed captures and the `index` / `input` /
+    /// `groups` data properties, built in their final shape (no per-property transitions).
+    pub(crate) fn make_exec_result(
+        &self,
+        items: impl ExactSizeIterator<Item = Value>,
+        index: Value,
+        input: Value,
+        groups: Value,
+    ) -> Value {
+        if !compact_arrays() {
+            let arr = self.make_array_classic(items.collect());
+            if let Value::Obj(o) = &arr {
+                crate::value::set_data(o, "index", index);
+                crate::value::set_data(o, "input", input);
+                crate::value::set_data(o, "groups", groups);
+            }
+            return arr;
+        }
+        note_compact();
+        Value::Obj(Object::new_exec_result(
+            Some(self.array_proto.clone()),
+            items,
+            index,
+            input,
+            groups,
+        ))
+    }
+
+    /// The keyed element map (`LUMEN_NO_COMPACT_BUILTIN_ARRAYS=1`, for A/B comparison).
+    fn make_array_classic(&self, items: Vec<Value>) -> Value {
         let obj = Object::new(Some(self.array_proto.clone()));
         let len = items.len();
         let numeric = items.iter().all(|v| matches!(v, Value::Num(_)));
@@ -38,6 +95,17 @@ impl Interp {
         }
         Value::Obj(obj)
     }
+}
+
+fn compact_arrays() -> bool {
+    static COMPACT: OnceLock<bool> = OnceLock::new();
+    *COMPACT.get_or_init(|| std::env::var_os("LUMEN_NO_COMPACT_BUILTIN_ARRAYS").is_none())
+}
+
+#[inline(always)]
+fn note_compact() {
+    #[cfg(test)]
+    COMPACT_ARRAYS.with(|n| n.set(n.get() + 1));
 }
 
 #[cfg(test)]
@@ -74,7 +142,7 @@ mod tests {
                 let enabled = std::env::var_os("LUMEN_NO_COMPACT_BUILTIN_ARRAYS").is_none();
                 assert_eq!(
                     super::COMPACT_ARRAYS.with(|n| n.get()),
-                    usize::from(enabled && (1..=32).contains(&len))
+                    usize::from(enabled && len >= 1)
                 );
                 crate::value::set_data(&engine.interp.global, "a", value);
                 eval(
@@ -143,5 +211,47 @@ mod tests {
                 assert_eq!(hits, 0);
             }
         }
+    }
+    #[test]
+    fn in_box_packed_arrays_exec_results_and_appends() {
+        for tier in [Tier::Interp, Tier::Bytecode] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                r#"
+                function assert(v,m){if(!v)throw new Error(m);}
+                for(var k=0;k<200;k++){
+                    var a=[k,{v:k}];a.push(3);assert(a.length===3&&a[1].v===k&&a[2]===3,'push');
+                    var b=[1,2,3,4,5,6,7,8,9,10,11,12];b[20]=1;
+                    assert(b.length===21&&!(15 in b)&&b[11]===12,'grow');
+                    var c=[...b.slice(0,3),...'xy',...[]];assert(c.join()==='1,2,3,x,y','spread');
+                    var e=[];e.push(1,2);e.length=0;e.push(9);assert(e[0]===9&&e.length===1,'reuse');
+                    var f=[];f[0]='a';f[1]='b';assert(f.join()==='a,b'&&f.length===2,'index fill');
+                    var m=/(a)(?<n>b)?/.exec('xab');
+                    assert(Object.keys(m).join()==='0,1,2,index,input,groups','exec keys');
+                    assert(m.index===1&&m.input==='xab'&&m.groups.n==='b','exec values');
+                    m.index=7;delete m.input;m.push(0);
+                    assert(m.index===7&&!('input' in m)&&m.length===4,'exec mutable');
+                    var d=Object.getOwnPropertyDescriptor(m,'groups');
+                    assert(d.writable&&d.enumerable&&d.configurable,'exec descriptor');
+                    assert(Array.from([1,2,3]).concat([4],5).slice(1).join()==='2,3,4,5','bulk');
+                }
+                var o={s:'a\uD83D'};o.s+='\uDE00';assert(o.s==='a\u{1F600}','surrogate join');
+            "#,
+            );
+        }
+    }
+
+    #[test]
+    fn regexp_literals_die_by_refcount() {
+        let mut engine = Engine::new();
+        eval(&mut engine, "function f(s){return /a(b)/.test(s);}");
+        let before = crate::value::live_objects();
+        eval(&mut engine, "for(var k=0;k<20000;k++)f('ab');");
+        let grown = crate::value::live_objects() - before;
+        assert!(grown < 1000, "regex objects outlived their last reference: {grown}");
+        assert!(engine.interp.regexps.len() < 5000, "stale regexps entries were not pruned");
     }
 }

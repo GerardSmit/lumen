@@ -29,11 +29,23 @@ pub fn legalize(func: &mut Function, legal: Legal) {
         .flat_map(|&b| func.blocks[b.index()].insts.clone())
         .collect();
     work.reverse();
+    // The block each placed instruction was in (a hint: expansions move instructions, which
+    // `locate` then finds by a full scan).
+    let mut home: Vec<Option<Block>> = vec![None; func.insts.len()];
+    for &b in &func.layout {
+        for &i in &func.blocks[b.index()].insts {
+            home[i.index()] = Some(b);
+        }
+    }
     while let Some(inst) = work.pop() {
-        let Some((block, pos)) = locate(func, inst) else {
+        let data = func.inst(inst).clone();
+        if !needs_rewrite(&data, legal) {
+            continue;
+        }
+        let hint = home.get(inst.index()).copied().flatten();
+        let Some((block, pos)) = locate(func, inst, hint) else {
             continue;
         };
-        let data = func.inst(inst).clone();
         match data {
             InstData::Unary {
                 op: UnaryOp::Eqz,
@@ -168,7 +180,25 @@ pub fn legalize(func: &mut Function, legal: Legal) {
     func.resolve_aliases();
 }
 
-fn locate(func: &Function, inst: Inst) -> Option<(Block, usize)> {
+/// Whether `legalize` rewrites an instruction of this shape (its match arms' patterns).
+fn needs_rewrite(data: &InstData, legal: Legal) -> bool {
+    match data {
+        InstData::Unary { op: UnaryOp::Eqz, .. } => true,
+        InstData::Binary { op: BinaryOp::Srem, .. } => !legal.srem_min_neg1,
+        InstData::Binary { op: BinaryOp::Fcopysign, .. } => !legal.fcopysign,
+        InstData::Convert { op: ConvOp::FromUint, .. } => !legal.from_u64,
+        InstData::Convert { op: ConvOp::ToUint, .. } => !legal.to_uint,
+        InstData::Convert { op: ConvOp::ToSintSat | ConvOp::ToUintSat, .. } => !legal.to_int_sat,
+        _ => false,
+    }
+}
+
+fn locate(func: &Function, inst: Inst, hint: Option<Block>) -> Option<(Block, usize)> {
+    if let Some(b) = hint {
+        if let Some(p) = func.blocks[b.index()].insts.iter().position(|&i| i == inst) {
+            return Some((b, p));
+        }
+    }
     for &b in &func.layout {
         if let Some(p) = func.blocks[b.index()].insts.iter().position(|&i| i == inst) {
             return Some((b, p));
@@ -357,8 +387,12 @@ fn expand_sat(
 /// parameters always sit before an unconditional jump. The new block is placed right after its
 /// source, which keeps a loop latch's back edge a single taken jump.
 pub fn split_critical_edges(func: &mut Function) {
-    let layout = func.layout.clone();
+    // The new layout: each split block right after its branch's block (and any earlier split
+    // blocks of the same branch), built in one pass.
+    let layout = std::mem::take(&mut func.layout);
+    let mut out = Vec::with_capacity(layout.len());
     for b in layout {
+        out.push(b);
         let Some(term) = func.terminator(b) else {
             continue;
         };
@@ -366,16 +400,13 @@ pub fn split_critical_edges(func: &mut Function) {
         if nsucc < 2 {
             continue;
         }
-        let mut after = b;
         for slot in 0..nsucc {
             let call = func.inst(term).successors()[slot].clone();
             if call.args.is_empty() {
                 continue;
             }
             let s = func.create_block();
-            let at = func.layout.iter().position(|&x| x == after).unwrap();
-            func.layout.insert(at + 1, s);
-            after = s;
+            out.push(s);
             let j = func.make_inst(InstData::Jump { dest: call });
             func.blocks[s.index()].insts.push(j);
             *func.insts[term.index()].successors_mut()[slot] = BlockCall {
@@ -384,4 +415,5 @@ pub fn split_critical_edges(func: &mut Function) {
             };
         }
     }
+    func.layout = out;
 }

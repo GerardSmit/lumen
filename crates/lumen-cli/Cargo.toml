@@ -15,5 +15,12 @@ lumen-host = { path = "../lumen-host" }
 lumen-repl = { path = "../lumen-repl" }
 lumen-runtime = { path = "../lumen-runtime" }
 
+[features]
+default = ["typed"]
+# `lumen typed` analysis modes (the engine's typed-tier checker); `--strip` works without it.
+typed = ["lumen/typed"]
+# Exact allocator counters in the `LUMEN_MEM_STATS=1` report (costs a few atomics per allocation).
+mem-stats = ["lumen/mem-stats"]
+
 [lints]
 workspace = true

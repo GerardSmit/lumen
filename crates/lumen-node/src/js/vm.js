@@ -51,6 +51,19 @@
     return runner(proxyFor(sandbox));
   };
 
+  // `options.timeout`: run under a deadline (see vm_timeout.rs); past it the run throws
+  // ERR_SCRIPT_EXECUTION_TIMEOUT instead of spinning forever.
+  const bounded = (options, run) => {
+    const timeout = options !== null && typeof options === "object" ? options.timeout : undefined;
+    if (timeout === undefined) return run();
+    if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout <= 0 || timeout > 4294967295) {
+      const error = new RangeError(`The value of "options.timeout" is out of range. It must be >= 1 && <= 4294967295. Received ${String(timeout)}`);
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+    return __vm.runWithTimeout(timeout, run);
+  };
+
   const contextify = (sandbox) => {
     if (sandbox === undefined) sandbox = {};
     if (typeof sandbox !== "object" || sandbox === null) {
@@ -72,33 +85,42 @@
         if (e instanceof SyntaxError) throw e;
       }
     }
-    runInThisContext() {
-      return runInGlobal(this.code);
+    runInThisContext(options) {
+      return bounded(options, () => runInGlobal(this.code));
     }
-    runInContext(contextifiedObject) {
+    runInContext(contextifiedObject, options) {
       if (!contexts.has(contextifiedObject)) {
         throw new TypeError("The \"contextifiedObject\" argument must be a vm.Context.");
       }
-      return runWithSandbox(this.code, contextifiedObject);
+      return bounded(options, () => runWithSandbox(this.code, contextifiedObject));
     }
-    runInNewContext(sandbox) {
-      return runWithSandbox(this.code, contextify(sandbox));
+    runInNewContext(sandbox, options) {
+      const context = contextify(sandbox);
+      return bounded(options, () => runWithSandbox(this.code, context));
     }
     createCachedData() {
       throw new Error("vm.Script.createCachedData is not supported in lumen");
     }
   }
 
-  const runInThisContext = (code) => runInGlobal(String(code));
+  const runInThisContext = (code, options) => {
+    code = String(code);
+    return bounded(options, () => runInGlobal(code));
+  };
   const createContext = (sandbox) => contextify(sandbox);
   const isContext = (sandbox) => contexts.has(sandbox);
-  const runInContext = (code, contextifiedObject) => {
+  const runInContext = (code, contextifiedObject, options) => {
     if (!contexts.has(contextifiedObject)) {
       throw new TypeError("The \"contextifiedObject\" argument must be a vm.Context.");
     }
-    return runWithSandbox(String(code), contextifiedObject);
+    code = String(code);
+    return bounded(options, () => runWithSandbox(code, contextifiedObject));
   };
-  const runInNewContext = (code, sandbox) => runWithSandbox(String(code), contextify(sandbox));
+  const runInNewContext = (code, sandbox, options) => {
+    code = String(code);
+    const context = contextify(sandbox);
+    return bounded(options, () => runWithSandbox(code, context));
+  };
   const createScript = (code, options) => new Script(code, options);
 
   // `compileFunction(code, params, options)` — a real function compiled from the body + named

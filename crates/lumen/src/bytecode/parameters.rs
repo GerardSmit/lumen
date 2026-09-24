@@ -23,32 +23,15 @@ impl Compiler {
     }
 }
 
-pub(super) fn captured_default_safe(func: &Function, name: &str, expr: &Expr) -> bool {
-    // No parameter-environment closures, reads, coercions or callbacks. Empty containers
-    // still allocate freshly through the normal expression emitter on every defaulted call.
-    if !literal_default(expr) {
-        return false;
-    }
+pub(super) fn captured_default_safe(func: &Function, name: &str, _expr: &Expr) -> bool {
+    // The expression itself passes `default_expr_safe` (checked by the caller): no closures,
+    // so nothing can observe the activation binding before the default is stored into it —
+    // reads of earlier parameters see initialized bindings, later ones are banned.
     // Hoisted function bindings are seeded into the activation before bytecode runs. Do not
     // overwrite one with a default; supporting that case needs separate parameter/body scopes.
     !crate::interpreter::collect_hoist_ops(&func.body(), func.is_strict, &[])
         .iter()
         .any(|op| matches!(op, HoistOp::Fn(n, _) | HoistOp::AnnexB(n, _) if n == name))
-}
-
-fn literal_default(expr: &Expr) -> bool {
-    match expr {
-        Expr::Num(_)
-        | Expr::BigInt(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Null
-        | Expr::Undefined => true,
-        Expr::Array(items) => items.is_empty(),
-        Expr::Object(props) => props.is_empty(),
-        Expr::Paren(inner) => literal_default(inner),
-        _ => false,
-    }
 }
 
 /// [`default_expr_safe`] over every expression inside a destructuring parameter pattern
@@ -111,7 +94,7 @@ pub(super) fn default_expr_safe(e: &Expr, banned: &std::collections::HashSet<&st
         Expr::Index { obj, index, .. } => {
             default_expr_safe(obj, banned) && default_expr_safe(index, banned)
         }
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+        Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
             default_expr_safe(callee, banned)
                 && args.iter().all(|a| match a {
                     ArrayElem::Item(x) | ArrayElem::Spread(x) => default_expr_safe(x, banned),
@@ -157,9 +140,64 @@ mod tests {
     }
 
     #[test]
-    fn defaults_with_effects_or_hoist_conflicts_stay_in_the_oracle() {
-        assert!(compiled("function f(x=make()) { return () => x; }").is_none());
+    fn closure_defaults_or_hoist_conflicts_stay_in_the_oracle() {
+        // An effectful default cannot observe the activation binding it initializes (no
+        // closure in it can close over the parameter scope): it compiles.
+        assert!(compiled("function f(x=make()) { return () => x; }").is_some());
         assert!(compiled("function f(x={}) { function x() {} return () => x; }").is_none());
         assert!(compiled("function f(x=()=>1) { return () => x; }").is_none());
     }
+
+    #[test]
+    fn captured_effectful_defaults_and_rest_match_the_oracle() {
+        use crate::bytecode::Tier;
+        use crate::{Completion, Engine};
+        let src = "var n = 0; function make() { n++; return n; }
+            function f(a, x = make() + a, ...rest) { return () => [a, x, rest.length, n].join(); }
+            [f(1)(), f(1, 7)(), f(2, undefined, 3, 4)()].join('|')";
+        let mut out = Vec::new();
+        for tier in [Tier::Interp, Tier::Bytecode] {
+            let mut e = Engine::new();
+            e.interp.tier = tier;
+            e.interp.tier_threshold = 0;
+            out.push(match e.eval(src, false).expect("parse") {
+                Completion::Value(v) => v,
+                Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+            });
+        }
+        assert_eq!(out[0], "1,2,0,1|1,7,0,1|2,4,2,2");
+        assert_eq!(out[0], out[1]);
+    }
+}
+
+/// Whether the rest parameter `name` of `func` is provably never read, so its array need not
+/// be built: the only identifier-bounded mention of `name` in the function's source text is the
+/// declaration itself. Textual and conservative — any other mention (a property name, a string,
+/// a comment, a nested function) counts as a use — and no dynamic reach: no `eval` anywhere in
+/// the text, and no `\` (a unicode-escaped identifier could spell the name).
+pub(super) fn rest_unused(func: &Function, name: &str) -> bool {
+    // A precompiled function's text is compressed (kept only for `toString`); decompressing it
+    // for this would hold a whole store block for the process's life.
+    if matches!(func.source, crate::ast::FnSource::Kept { .. }) {
+        return false;
+    }
+    let Some(src) = func.source.as_str() else {
+        return false;
+    };
+    if src.contains("eval") || src.contains('\\') {
+        return false;
+    }
+    let is_id = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut mentions = 0;
+    for (at, _) in src.match_indices(name) {
+        let before = src[..at].chars().next_back();
+        let after = src[at + name.len()..].chars().next();
+        if !before.is_some_and(is_id) && !after.is_some_and(is_id) {
+            mentions += 1;
+            if mentions > 1 {
+                return false;
+            }
+        }
+    }
+    mentions == 1
 }

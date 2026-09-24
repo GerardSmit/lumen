@@ -3,7 +3,9 @@
 //! Native calls are made through monomorphized `extern "C"` function-pointer trampolines selected
 //! at runtime by the argument register classes; see `generate_ffi_trampolines` in `build.rs` for
 //! how the (int-count, float-width) dispatch table is generated and why reordering integer args
-//! ahead of float args is ABI-correct on x86-64 SysV and arm64 AAPCS.
+//! ahead of float args is ABI-correct on x86-64 SysV and arm64 AAPCS. Win64 assigns registers by
+//! argument position instead, so there the table is keyed on (arity, float-position mask) and
+//! [`win64_slots`] restores the original argument order.
 //!
 //! # What is real
 //! - `dlopen`/`dlsym` via [`crate::dylib::DynLib`] (the same loader N-API uses).
@@ -45,6 +47,7 @@ pub enum FArg {
     F64(f64),
 }
 
+#[cfg_attr(all(windows, target_arch = "x86_64"), allow(dead_code))]
 impl FArg {
     #[inline]
     fn f32v(self) -> f32 {
@@ -63,6 +66,7 @@ impl FArg {
 }
 
 /// Bitmask of which float arguments are `f64` (bit *i* set ⇒ argument *i* is `f64`).
+#[cfg_attr(all(windows, target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 fn fmask(floats: &[FArg]) -> u32 {
     let mut m = 0u32;
@@ -74,7 +78,31 @@ fn fmask(floats: &[FArg]) -> u32 {
     m
 }
 
-// The generated `call_int`/`call_f32`/`call_f64` dispatchers and the `JSCB_THUNKS` pool.
+/// Win64: rebuild the positional argument slots from the int/float streams. `fpos` bit *p* set
+/// means argument *p* is a float; a float slot holds its own bits (`f32` zero-extended), which is
+/// what both the XMM register and the 8-byte stack slot of that position must carry.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[inline]
+fn win64_slots(ints: &[u64], floats: &[FArg], fpos: u32) -> (usize, [u64; MAX_ARGS]) {
+    let n = ints.len() + floats.len();
+    let mut a = [0u64; MAX_ARGS];
+    let (mut i, mut f) = (ints.iter(), floats.iter());
+    for (p, slot) in a.iter_mut().enumerate().take(n) {
+        *slot = if fpos & (1 << p) != 0 {
+            match f.next() {
+                Some(FArg::F32(x)) => x.to_bits() as u64,
+                Some(FArg::F64(x)) => x.to_bits(),
+                None => 0,
+            }
+        } else {
+            i.next().copied().unwrap_or(0)
+        };
+    }
+    (n, a)
+}
+
+// The generated `call_int`/`call_f32`/`call_f64` dispatchers and the `JSCB_THUNKS` pool. Each takes
+// `fpos`, the bitmask of argument positions that are floats (used by the Win64 table only).
 include!(concat!(env!("OUT_DIR"), "/ffi_trampolines.rs"));
 
 /// Must match `build.rs`.
@@ -277,25 +305,27 @@ struct RawRet {
 }
 
 /// Run the trampoline for `(fnptr, ints, floats)` selecting the dispatcher by the return class.
+/// `fpos` has bit *p* set when argument *p* is a float.
 unsafe fn invoke_native(
     fnptr: *const c_void,
     ints: &[u64],
     floats: &[FArg],
+    fpos: u32,
     ret_code: u8,
 ) -> RawRet {
     match ret_code {
         T_F32 => RawRet {
             int: 0,
-            f32: call_f32(fnptr, ints, floats),
+            f32: call_f32(fnptr, ints, floats, fpos),
             f64: 0.0,
         },
         T_F64 => RawRet {
             int: 0,
             f32: 0.0,
-            f64: call_f64(fnptr, ints, floats),
+            f64: call_f64(fnptr, ints, floats, fpos),
         },
         _ => RawRet {
-            int: call_int(fnptr, ints, floats),
+            int: call_int(fnptr, ints, floats, fpos),
             f32: 0.0,
             f64: 0.0,
         },
@@ -436,18 +466,22 @@ pub fn op_call(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
 
     let mut ints: Vec<u64> = Vec::with_capacity(n);
     let mut floats: Vec<FArg> = Vec::with_capacity(n);
+    let mut fpos = 0u32;
     for i in 0..n {
         let code = ctx
             .member_get(&codes_v, &i.to_string())?
             .as_num_opt()
             .unwrap_or(0.0) as u8;
+        if is_float(code) {
+            fpos |= 1 << i;
+        }
         let v = ctx.member_get(&vals_v, &i.to_string())?;
         marshal_arg(ctx, code, &v, &mut ints, &mut floats)?;
     }
 
     // Publish the engine pointer so a JSCallback fired *during* this call can re-enter JS.
     let prev = CURRENT_CTX.with(|c| c.replace(ctx as *mut Ctx));
-    let raw = unsafe { invoke_native(fnptr, &ints, &floats, ret_code) };
+    let raw = unsafe { invoke_native(fnptr, &ints, &floats, fpos, ret_code) };
     CURRENT_CTX.with(|c| c.set(prev));
 
     Ok(marshal_return(raw, ret_code))
@@ -731,7 +765,7 @@ mod tests {
         let lib = libc();
         let f = sym(&lib, "strlen");
         let s = std::ffi::CString::new("hello, ffi").unwrap();
-        let n = unsafe { call_int(f, &[s.as_ptr() as u64], &[]) };
+        let n = unsafe { call_int(f, &[s.as_ptr() as u64], &[], 0) };
         assert_eq!(n, 10);
     }
 
@@ -743,7 +777,7 @@ mod tests {
             Some(p) => p as *const c_void,
             None => return, // platform without a directly-resolvable getpid: skip
         };
-        let pid = unsafe { call_int(f, &[], &[]) } as i32;
+        let pid = unsafe { call_int(f, &[], &[], 0) } as i32;
         assert_eq!(pid, std::process::id() as i32);
     }
 
@@ -751,17 +785,17 @@ mod tests {
     fn call_f64_pow_all_float() {
         let lib = libc();
         let f = sym(&lib, "pow");
-        let r = unsafe { call_f64(f, &[], &[FArg::F64(2.0), FArg::F64(10.0)]) };
+        let r = unsafe { call_f64(f, &[], &[FArg::F64(2.0), FArg::F64(10.0)], 0b11) };
         assert_eq!(r, 1024.0);
     }
 
     #[test]
     fn call_f64_ldexp_reorders_int_ahead_of_float() {
-        // ldexp(double x, int exp) mixes classes: canonical dispatch must place `exp` in an integer
-        // register and `x` in a float register regardless of their source order. ldexp(3.0, 4) = 48.
+        // ldexp(double x, int exp) mixes classes: `exp` must reach an integer register and `x` a
+        // float register (SysV/AAPCS by class count, Win64 by position). ldexp(3.0, 4) = 48.
         let lib = libc();
         let f = sym(&lib, "ldexp");
-        let r = unsafe { call_f64(f, &[4u64], &[FArg::F64(3.0)]) };
+        let r = unsafe { call_f64(f, &[4u64], &[FArg::F64(3.0)], 0b01) };
         assert_eq!(r, 48.0);
     }
 
@@ -770,8 +804,39 @@ mod tests {
         // labs(-5) -> 5 (i64). Verifies a signed integer return round-trips through the u64 path.
         let lib = libc();
         let f = sym(&lib, "labs");
-        let r = unsafe { call_int(f, &[(-5i64) as u64], &[]) } as i64;
+        let r = unsafe { call_int(f, &[(-5i64) as u64], &[], 0) } as i64;
         assert_eq!(r, 5);
+    }
+
+    extern "C" fn mixed7(a: f64, b: i32, c: f32, d: u64, e: f64, g: f32, h: i8) -> f64 {
+        a + b as f64 * 10.0 + c as f64 * 100.0 + d as f64 * 1e3 + e * 1e4 + g as f64 * 1e5 + h as f64 * 1e6
+    }
+    extern "C" fn mixed_f32(a: i32, b: f32, c: f32, d: i64, e: f32) -> f32 {
+        a as f32 + b * 2.0 + c * 4.0 + d as f32 * 8.0 + e * 16.0
+    }
+
+    #[test]
+    fn call_mixed_positions_widths_and_stack_slots() {
+        // Interleaved classes and widths across register and stack positions, called through the
+        // trampolines exactly as `op_call` does (int/float streams + float-position mask).
+        let r = unsafe {
+            call_f64(
+                mixed7 as *const c_void,
+                &[2, 4, (-1i64) as u64],
+                &[FArg::F64(1.0), FArg::F32(3.0), FArg::F64(5.0), FArg::F32(6.0)],
+                0b0110101,
+            )
+        };
+        assert_eq!(r, 1.0 + 20.0 + 300.0 + 4e3 + 5e4 + 6e5 - 1e6);
+        let r = unsafe {
+            call_f32(
+                mixed_f32 as *const c_void,
+                &[1, 3],
+                &[FArg::F32(0.5), FArg::F32(0.25), FArg::F32(2.0)],
+                0b10110,
+            )
+        };
+        assert_eq!(r, 1.0 + 1.0 + 1.0 + 24.0 + 32.0);
     }
 
     #[test]

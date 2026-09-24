@@ -36,7 +36,10 @@
       this._repeat = repeat ? delay : null;
       this._destroyed = false;
       this._refed = true;
-      this._id = repeat ? rawSetInterval(callback, delay, ...args) : rawSetTimeout(callback, delay, ...args);
+      // Node calls `timer._onTimeout()`: the callback's `this` is the Timeout (an interval
+      // callback commonly stops itself with `clearInterval(this)`).
+      this._fire = (...a) => this._onTimeout(...a);
+      this._id = repeat ? rawSetInterval(this._fire, delay, ...args) : rawSetTimeout(this._fire, delay, ...args);
     }
     ref() { if (!this._refed) { this._refed = true; timerSetRef(this._id, true); } return this; }
     unref() { if (this._refed) { this._refed = false; timerSetRef(this._id, false); } return this; }
@@ -46,8 +49,8 @@
       if (!timerRefresh(this._id)) {
         // Already fired: start it over with the same callback, delay and ref state.
         this._id = this._repeat !== null
-          ? rawSetInterval(this._onTimeout, this._idleTimeout, ...this._timerArgs)
-          : rawSetTimeout(this._onTimeout, this._idleTimeout, ...this._timerArgs);
+          ? rawSetInterval(this._fire, this._idleTimeout, ...this._timerArgs)
+          : rawSetTimeout(this._fire, this._idleTimeout, ...this._timerArgs);
         if (!this._refed) timerSetRef(this._id, false);
       }
       return this;

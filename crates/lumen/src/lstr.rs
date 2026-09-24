@@ -35,6 +35,11 @@ const HDR: usize = std::mem::size_of::<Header>();
 /// optimizing tier's inline `.length` (see `bytecode::jit::layout`).
 pub(crate) const LSTR_LEN_OFFSET: usize = std::mem::offset_of!(Header, len);
 pub(crate) const LSTR_CAP_OFFSET: usize = std::mem::offset_of!(Header, cap);
+/// Offset of the header's strong count (the JIT's inline retain / release of a string that
+/// stays alive).
+pub(crate) const LSTR_STRONG_OFFSET: usize = std::mem::offset_of!(Header, strong);
+/// Offset of the content bytes from the header (the JIT's inline `charCodeAt`).
+pub(crate) const LSTR_DATA_OFFSET: usize = HDR;
 
 /// Top bit of `cap`: the content is KNOWN all-ASCII (byte index == UTF-16 unit index, and every
 /// byte IS its unit). Purely a hint — never set for non-ASCII content, may be clear for ASCII

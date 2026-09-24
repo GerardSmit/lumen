@@ -17,7 +17,19 @@ publish = false
 [dependencies]
 lumen = { path = "../../lumen" }
 lumen-aot = { path = ".." }
-lumen-runtime = { path = "../../lumen-runtime" }
+lumen-runtime = { path = "../../lumen-runtime", default-features = false }
+
+# Puppeteer needs none of lumen-node's optional builtins (Bun APIs, http2, cluster, dgram, wasi):
+# `--no-default-features` leaves them out (smaller binary). On by default, like lumen-cli.
+[features]
+default = ["node-full"]
+node-full = [
+    "lumen-runtime/bun",
+    "lumen-runtime/http2",
+    "lumen-runtime/cluster",
+    "lumen-runtime/dgram",
+    "lumen-runtime/wasi",
+]
 
 [workspace]
 
@@ -40,4 +52,14 @@ codegen-units = 16
 incremental = true
 
 [profile.fast.build-override]
+opt-level = 3
+
+# Size-focused build (see the lumen workspace's `release-small`): `cargo build --profile
+# release-small [--no-default-features]`. The engine core stays at opt-level 3.
+[profile.release-small]
+inherits = "release"
+opt-level = "s"
+strip = true
+
+[profile.release-small.package.lumen]
 opt-level = 3

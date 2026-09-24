@@ -1,0 +1,50 @@
+export class Vec {
+  x        ;
+  y        ;
+           tag         = "v";
+  constructor(x        , y        ) {
+    this.x = x;
+    this.y = y;
+  }
+  dot(o     )         {
+    return this.x * o.x + this.y * o.y;
+  }
+  scale(k        )      {
+    return new Vec(this.x * k, this.y * k);
+  }
+}
+
+export function norm(v     )         {
+  return Math.sqrt(v.dot(v));
+}
+
+export function sum(a          )         {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) {
+    s += a[i];
+  }
+  return s;
+}
+
+function bad(x     )         {
+  return x.y;
+}
+
+const twice = (n        )         => n * 2;
+
+export function first(xs                 )         {
+  if (xs === null) return "";
+  const v = xs[0];
+  return v ?? "";
+}
+
+async function load(path        )                  {
+  return path;
+}
+
+function describe(v                 )         {
+  if (typeof v === "number") {
+    return v.toFixed(2);
+  }
+  return v;
+}

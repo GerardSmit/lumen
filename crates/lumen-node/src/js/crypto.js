@@ -896,8 +896,10 @@ function getDiffieHellman(name) { return new DiffieHellmanGroup(name); }
 
 const ED_P = (1n << 255n) - 19n;
 const ED_L = (1n << 252n) + 27742317777372353535851937790883648493n;
-const ED_D = amod(-121665n * modInv(121666n, ED_P), ED_P);
-const ED_SQRT_M1 = modPow(2n, (ED_P - 1n) / 4n, ED_P);
+// Precomputed (startup runs the glue in the tree-walker, where these BigInt modPow/modInv chains
+// cost milliseconds): ED_D = -121665/121666 mod p, ED_SQRT_M1 = 2^((p-1)/4) mod p.
+const ED_D = 37095705934669439343138083508754565189542113879843219016388785533085940283555n;
+const ED_SQRT_M1 = 19681161376707505956807079304988542015446066515923890162744021073123829784752n;
 function edRecoverX(y, sign) {
   const y2 = amod(y * y, ED_P);
   const uv = amod(amod(y2 - 1n, ED_P) * modInv(ED_D * y2 + 1n, ED_P), ED_P);
@@ -907,8 +909,9 @@ function edRecoverX(y, sign) {
   if ((x & 1n) !== sign) x = amod(-x, ED_P);
   return x;
 }
-const ED_BY = amod(4n * modInv(5n, ED_P), ED_P);
-const ED_BX = edRecoverX(ED_BY, 0n);
+// The base point (precomputed, see ED_D): ED_BY = 4/5 mod p, ED_BX = edRecoverX(ED_BY, 0n).
+const ED_BY = 46316835694926478169428394003475163141307993866256225615783033603165251855960n;
+const ED_BX = 15112221349535400772501151409588531511454012693041857206046113283949847762202n;
 const ED_B = [ED_BX, ED_BY, 1n, amod(ED_BX * ED_BY, ED_P)];
 function edAdd(P, Q) {
   const [X1, Y1, Z1, T1] = P;
@@ -1698,7 +1701,9 @@ function rsaPkcs1Encrypt(key, msg) {
 
 // ---- probable primes (Miller-Rabin over BigInt) -------------------------------------------------
 
-const SMALL_PRIMES = (() => {
+// Sieved on first use (key generation), not at startup.
+let SMALL_PRIMES_CACHE = null;
+const smallPrimes = () => SMALL_PRIMES_CACHE ||= (() => {
   const out = [];
   const sieve = new Uint8Array(4096);
   for (let i = 2; i < 4096; i++) {
@@ -1723,7 +1728,7 @@ function millerRabinRound(n, d, r, a) {
 }
 function isProbablePrime(n, rounds) {
   if (n < 2n) return false;
-  for (const sp of SMALL_PRIMES) {
+  for (const sp of smallPrimes()) {
     if (n === sp) return true;
     if (n % sp === 0n) return false;
   }
@@ -1739,8 +1744,35 @@ function isProbablePrime(n, rounds) {
   }
   return true;
 }
+// A safe prime p = 2q + 1 (p ≡ 3 mod 4, no add/rem constraint): walk p in steps of 4 from a random
+// start, tracking p's residues modulo the small primes as Numbers. p and q are both free of a small
+// factor s exactly when p mod s ∉ {0, 1}, so almost every candidate is rejected without BigInt
+// arithmetic; the survivors get a base-2 Miller-Rabin round on q, then the full tests.
+function randomSafePrime(bits) {
+  const primes = smallPrimes().slice(1).map(Number); // odd small primes
+  for (;;) {
+    let cand = randomBigIntBits(bits) | (1n << BigInt(bits - 1)) | 3n;
+    const residues = primes.map((s) => Number(cand % BigInt(s)));
+    for (let step = 0; step < 1 << 16; step++, cand += 4n) {
+      if (step !== 0) for (let i = 0; i < primes.length; i++) residues[i] = (residues[i] + 4) % primes[i];
+      let clean = true;
+      for (let i = 0; i < primes.length; i++) {
+        if (residues[i] <= 1 && cand !== BigInt(primes[i])) { clean = false; break; }
+      }
+      if (!clean) continue;
+      if (bitLength(cand) !== bits) break;
+      const q = cand >> 1n;
+      let d = q - 1n, r = 0n;
+      while ((d & 1n) === 0n) { d >>= 1n; r++; }
+      if (q > 3n && !millerRabinRound(q, d, r, 2n)) continue;
+      if (modPow(2n, cand - 1n, cand) !== 1n) continue; // Fermat on p before the full rounds
+      if (isProbablePrime(q, 8) && isProbablePrime(cand, 20)) return cand;
+    }
+  }
+}
 function randomPrime(bits, safe, add, rem) {
   if (!Number.isInteger(bits) || bits < 2) throw new RangeError("prime size must be an integer >= 2 bits");
+  if (safe && add === undefined && bits >= 16) return randomSafePrime(bits);
   for (;;) {
     let cand = randomBigIntBits(bits);
     cand |= 1n;

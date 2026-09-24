@@ -48,11 +48,13 @@ fn main() {
     }
     glue.push_str("\n})();");
 
-    let snapshot = lumen::compile_snapshot(&glue)
-        .unwrap_or_else(|e| panic!("web glue failed to parse for snapshotting: {e}"));
+    // An ahead-of-time blob: AST, bytecode and the compressed function text (for `toString`).
+    let blob = lumen::precompiled::precompile_glue(&glue, "web-glue")
+        .unwrap_or_else(|e| panic!("web glue failed to precompile: {e}"));
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    // web_glue.js is for reference only (not linked).
     std::fs::write(out.join("web_glue.js"), &glue).unwrap();
-    std::fs::write(out.join("web_glue.snap"), &snapshot).unwrap();
+    std::fs::write(out.join("web_glue.aot"), &blob).unwrap();
     println!("cargo:rerun-if-changed=build.rs");
 }

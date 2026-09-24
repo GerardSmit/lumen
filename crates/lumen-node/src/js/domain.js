@@ -7,6 +7,8 @@ const EventEmitter = __builtins.get("events");
 
 // The domain stack: the top of stack is the currently-active domain.
 const stack = [];
+// error -> the domain stack when it was thrown (see `_mark`).
+const thrownIn = new WeakMap();
 const domainModule = {};
 
 class Domain extends EventEmitter {
@@ -29,18 +31,21 @@ class Domain extends EventEmitter {
     process.domain = top ?? null;
   }
 
+  // As in Node, a throw inside run()/bind() is not caught here: it unwinds like any exception
+  // (a surrounding try/catch sees it), and once it reaches the top as uncaught, the domain it
+  // was thrown in gets it as 'error' (`__lumen_fire_error` → `domainModule._handleUncaught`).
   run(fn, ...args) {
     this.enter();
     try {
       return Reflect.apply(fn, this, args);
     } catch (err) {
-      this._handle(err);
+      this._mark(err);
+      throw err;
     } finally {
       this.exit();
     }
   }
 
-  // Wrap a callback so its synchronous throw is caught by the domain.
   bind(fn) {
     const self = this;
     return function bound(...args) {
@@ -48,7 +53,8 @@ class Domain extends EventEmitter {
       try {
         return Reflect.apply(fn, this, args);
       } catch (err) {
-        self._handle(err);
+        self._mark(err);
+        throw err;
       } finally {
         self.exit();
       }
@@ -85,6 +91,21 @@ class Domain extends EventEmitter {
     if (idx !== -1) this.members.splice(idx, 1);
   }
 
+  // Tag an error with the innermost domain it was thrown in, and remember the domains that were
+  // active then (outermost first): a throw from that domain's 'error' handler goes to the next
+  // one out, as Node's domain stack does.
+  _mark(err) {
+    try {
+      if (err !== null && typeof err === "object" && !err.domainThrown) {
+        err.domain = this;
+        err.domainThrown = true;
+        thrownIn.set(err, stack.slice());
+      }
+    } catch {
+      /* frozen or exotic error: leave it */
+    }
+  }
+
   _handle(err) {
     try {
       err.domain = this;
@@ -109,5 +130,40 @@ domainModule.create = create;
 domainModule.createDomain = create;
 domainModule.active = null;
 domainModule._stack = stack;
+// An uncaught error thrown inside a domain goes to that domain's 'error' listeners; true when
+// one took it.
+domainModule._handleUncaught = (err) => {
+  const domain = err !== null && typeof err === "object" && err.domainThrown ? err.domain : null;
+  if (!(domain instanceof Domain)) return false;
+  const chain = thrownIn.get(err) ?? [domain];
+  thrownIn.delete(err);
+  while (chain.length !== 0) {
+    const current = chain.pop();
+    if (current.listenerCount("error") === 0) return false;
+    try {
+      current.emit("error", err);
+      return true;
+    } catch (thrown) {
+      // The handler threw: the next domain out gets that error.
+      err = thrown;
+      try {
+        if (err !== null && typeof err === "object") {
+          err.domain = chain[chain.length - 1];
+          err.domainThrown = true;
+        }
+      } catch {
+        /* leave it */
+      }
+    }
+  }
+  throw err;
+};
+// The runtime's uncaught-error path (lumen-runtime `__lumen_fire_error`) asks this first.
+Object.defineProperty(globalThis, "__lumen_domain_uncaught", {
+  value: domainModule._handleUncaught,
+  configurable: true,
+  writable: true,
+  enumerable: false,
+});
 
 __builtins.set("domain", domainModule);

@@ -66,6 +66,9 @@ struct WorkerEntry {
     to_worker: Option<Sender<ToWorker>>,
     dispatch: Value,
     stop: Arc<AtomicBool>,
+    /// Set by `terminate()` only: the worker realm's engine interrupt, so running JS (a busy
+    /// loop, a microtask or nextTick storm) is stopped at its next safe point, not just the loop.
+    kill: Arc<AtomicBool>,
     /// Whether this worker's main-side inbox keeps the main loop alive (`worker.unref()` clears).
     keep_alive: bool,
     /// The currently armed inbox task, so `setRef` can re-mark it in flight.
@@ -135,6 +138,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
     let (to_worker_tx, to_worker_rx) = channel::<ToWorker>();
     let (to_main_tx, to_main_rx) = channel::<ToMain>();
     let stop = Arc::new(AtomicBool::new(false));
+    let kill = Arc::new(AtomicBool::new(false));
     let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
 
     let id = {
@@ -147,6 +151,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
                 to_worker: Some(to_worker_tx),
                 dispatch: dispatch.clone(),
                 stop: Arc::clone(&stop),
+                kill: Arc::clone(&kill),
                 keep_alive: true,
                 inbox_task: None,
             },
@@ -154,10 +159,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         id
     };
 
-    let embedding = ctx
-        .op_state()
-        .get::<crate::WorkerEmbedding>()
-        .cloned();
+    let embedding = ctx.op_state().get::<crate::WorkerEmbedding>().cloned();
     let spec = WorkerSpec {
         entry,
         is_module,
@@ -173,7 +175,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         // Same reasoning as the CLI's main thread: the engine recurses natively, and a debug
         // build's frames overflow the 2 MiB default long before the depth guard trips.
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_worker(spec, to_worker_rx, to_main_tx, worker_stop))
+        .spawn(move || run_worker(spec, to_worker_rx, to_main_tx, worker_stop, kill))
         .expect("spawn worker thread");
 
     arm_main_inbox(ctx, MainInbox { id, rx: to_main_rx });
@@ -214,6 +216,7 @@ pub(crate) fn op_worker_terminate(
     };
     if let Some(w) = registry(ctx).workers.get_mut(&id) {
         w.stop.store(true, Ordering::SeqCst);
+        w.kill.store(true, Ordering::SeqCst);
         w.to_worker = None; // drops the sender, unblocking the worker's inbox receive
     }
     Ok(Value::Undefined)
@@ -328,8 +331,15 @@ fn run_worker(
     to_worker_rx: Receiver<ToWorker>,
     to_main_tx: Sender<ToMain>,
     stop: Arc<AtomicBool>,
+    kill: Arc<AtomicBool>,
 ) {
+    // An embedded parent's workers share its interrupt (the embedder ends them together);
+    // otherwise `terminate()` interrupts this realm's JS directly.
+    let embedded = spec.embedding.is_some();
     let mut rt = Runtime::new_worker(spec.embedding.clone());
+    if !embedded {
+        rt.set_worker_interrupt(Arc::clone(&kill));
+    }
     lumen_host::install(rt.engine(), &[worker_scope_extension()]);
     rt.engine().ctx().op_state().put(WorkerSelf {
         to_main: to_main_tx.clone(),
@@ -399,6 +409,11 @@ fn run_worker(
         }
     };
     if let Err(e) = entry_result {
+        if kill.load(Ordering::SeqCst) {
+            // Terminated while the entry ran: its unwinding error is the termination.
+            let _ = to_main_tx.send(ToMain::Exited(1));
+            return;
+        }
         let _ = to_main_tx.send(ToMain::Error(e));
         if spec.is_node {
             // Node: an entry that throws kills the worker ('error', then 'exit' with code 1).

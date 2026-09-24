@@ -499,12 +499,169 @@ fn require_regexp_this(i: &mut Interp, this: &Value, name: &str) -> Result<(), V
     }
 }
 
+/// The keys whose lookup on a RegExp the pristine guard covers: `flags`, `exec` and the eight
+/// flag accessors (which the `flags` getter reads).
+const PRISTINE_KEYS: [&str; 10] = [
+    "flags",
+    "exec",
+    "hasIndices",
+    "global",
+    "ignoreCase",
+    "multiline",
+    "dotAll",
+    "unicode",
+    "unicodeSets",
+    "sticky",
+];
+
+/// The intrinsic each [`PRISTINE_KEYS`] entry must still hold on %RegExp.prototype%.
+fn pristine_intrinsic(k: usize) -> NativeFn {
+    match k {
+        0 => re_flags_get,
+        1 => regexp_exec,
+        2 => re_has_indices_get,
+        3 => re_global_get,
+        4 => re_ignore_case_get,
+        5 => re_multiline_get,
+        6 => re_dot_all_get,
+        7 => re_unicode_get,
+        8 => re_unicode_sets_get,
+        _ => re_sticky_get,
+    }
+}
+
+/// Per-thread shape memos for the pristine guard (shape ids are per-thread, so every realm and
+/// engine on the thread can share them: a hit only locates a slot, whose contents are re-read).
+#[derive(Default)]
+struct PristineCaches {
+    own: [crate::eval::fastpaths::SlotCache; 10],
+    proto: [crate::eval::fastpaths::SlotCache; 10],
+    /// A well-known symbol method: own (expected absent) / on the prototype.
+    sym_own: crate::eval::fastpaths::SlotCache,
+    sym_proto: crate::eval::fastpaths::SlotCache,
+}
+
+thread_local! {
+    static PRISTINE: PristineCaches = PristineCaches::default();
+}
+
+/// Whether `v` is a native function object whose code is `f`.
+#[inline]
+fn is_native(v: &Value, f: NativeFn) -> bool {
+    match v {
+        Value::Obj(o) => matches!(
+            o.try_borrow().map(|b| matches!(b.call, Callable::Native(g) if g as usize == f as usize)),
+            Ok(true)
+        ),
+        _ => false,
+    }
+}
+
+/// The pristine-RegExp guard (compare the TypedArray meta guard in `interpreter::ta_meta`):
+/// `this` is an ordinary RegExp of this realm whose `flags`, `exec` and flag-accessor lookups
+/// all resolve, without any own shadowing property, to %RegExp.prototype%'s unmodified
+/// intrinsics. Then reading `flags` (eight getter calls) is unobservable and equals the
+/// canonical flags in the internal slot, and `RegExpExec` is the built-in exec. Returns the
+/// matcher; `None` means take the ordinary observable steps.
+fn pristine_regexp(i: &Interp, this: &Value) -> Option<Rc<crate::regex::Regex>> {
+    let Value::Obj(o) = this else {
+        return None;
+    };
+    let re = i.regexps.get(&(Gc::as_ptr(o) as usize))?;
+    let proto = i.extra_protos.get("RegExp")?;
+    let b = o.try_borrow().ok()?;
+    if !matches!(b.exotic, Exotic::None) || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, proto)) {
+        return None;
+    }
+    let pb = proto.try_borrow().ok()?;
+    let ok = PRISTINE.with(|c| {
+        for (k, key) in PRISTINE_KEYS.iter().enumerate() {
+            if c.own[k].get(&b.props, key).is_some() {
+                return false;
+            }
+            let Some(p) = c.proto[k].get(&pb.props, key) else {
+                return false;
+            };
+            let holds = if k == 1 {
+                !p.accessor() && is_native(&p.value(), pristine_intrinsic(k))
+            } else {
+                p.accessor()
+                    && matches!(p.getter(), Some(g) if is_native(g, pristine_intrinsic(k)))
+            };
+            if !holds {
+                return false;
+            }
+        }
+        true
+    });
+    ok.then(|| re.clone())
+}
+
+/// `String.prototype.match(regexp)` on a [`pristine_regexp`] whose `@@match` is the intrinsic
+/// %RegExp.prototype%[@@match] (no own `@@match`): the method lookup is unobservable, so this
+/// runs [`re_sym_match`] directly. `None` = take the ordinary dispatch.
+pub(super) fn string_match_pristine(
+    i: &mut Interp,
+    this: &Value,
+    regexp: &Value,
+) -> Option<Result<Value, Value>> {
+    let key = well_known_key(i, "match")?;
+    let re = pristine_regexp(i, regexp)?;
+    let (Value::Obj(o), Some(proto)) = (regexp, i.extra_protos.get("RegExp")) else {
+        return None;
+    };
+    let (Ok(b), Ok(pb)) = (o.try_borrow(), proto.try_borrow()) else {
+        return None;
+    };
+    let intrinsic = PRISTINE.with(|c| {
+        c.sym_own.get(&b.props, &key).is_none()
+            && matches!(c.sym_proto.get(&pb.props, &key),
+                Some(p) if !p.accessor() && is_native(&p.value(), re_sym_match))
+    });
+    drop((b, pb));
+    if !intrinsic {
+        return None;
+    }
+    Some(match this {
+        // ToString of a string runs no user code: the guard still holds inside @@match.
+        Value::Str(s) => re_sym_match_with(i, regexp.clone(), s.clone(), Some(re)),
+        _ => re_sym_match(i, regexp.clone(), std::slice::from_ref(this)),
+    })
+}
+
+/// `ToString(Get(rx, "flags"))`, answered from the internal slot when [`pristine_regexp`] holds.
+fn regexp_flags_of(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value> {
+    if let Some(re) = pristine_regexp(i, this) {
+        return Ok(crate::lstr::LStr::from(re.flags.as_str()));
+    }
+    let flags_v = ab(i.get_member(this, "flags"))?;
+    ab(i.to_string(&flags_v))
+}
+
 pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.match]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
-    let flags = ab(i.get_member(&this, "flags"))?;
-    let flags = ab(i.to_string(&flags))?;
+    let pristine = pristine_regexp(i, &this);
+    re_sym_match_with(i, this, s, pristine)
+}
+
+/// `RegExp.prototype[@@match]` after `ToString(string)`; `pristine` is [`pristine_regexp`] of
+/// `this` as it stands now.
+fn re_sym_match_with(
+    i: &mut Interp,
+    this: Value,
+    s: crate::lstr::LStr,
+    pristine: Option<Rc<crate::regex::Regex>>,
+) -> Result<Value, Value> {
+    let flags = match &pristine {
+        Some(re) => crate::lstr::LStr::from(re.flags.as_str()),
+        None => regexp_flags_of(i, &this)?,
+    };
     if !flags.contains('g') {
+        // A pristine RegExp's `exec` is the intrinsic (reading its flags ran no user code).
+        if pristine.is_some() {
+            return regexp_exec(i, this, &[Value::Str(s)]);
+        }
         return regexp_exec_abstract(i, &this, s);
     }
     let unicode = flags.contains('u') || flags.contains('v');
@@ -582,8 +739,7 @@ fn re_sym_replace_impl(
         ab(i.to_string(&repl))?
     };
     // Globalness/unicodeness come from the `flags` string (whose getter Gets each flag prop).
-    let flags_v = ab(i.get_member(&this, "flags"))?;
-    let flags = ab(i.to_string(&flags_v))?;
+    let flags = regexp_flags_of(i, &this)?;
     let global = flags.contains('g');
     let unicode = flags.contains('u') || flags.contains('v');
     if global {
@@ -854,8 +1010,7 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     let s = ab(i.to_string(&arg(a, 0)))?;
     let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "RegExp"))?;
     let c = species_constructor(i, &this, &default_ctor)?;
-    let flags_v = ab(i.get_member(&this, "flags"))?;
-    let flags = ab(i.to_string(&flags_v))?;
+    let flags = regexp_flags_of(i, &this)?;
     let matcher = ab(i.construct(c, &[this.clone(), Value::Str(flags.clone())]))?;
     let li_v = ab(i.get_member(&this, "lastIndex"))?;
     let last = to_length_val(i, &li_v)?;
@@ -1050,6 +1205,7 @@ fn re_replace_direct(
     let mut out = String::with_capacity(s.len());
     let mut next = 0usize;
     let mut cbargs: Vec<Value> = Vec::new();
+    let mut f = functional.then(|| crate::bytecode::PreparedCall::new(i, repl.clone(), Value::Undefined));
     for caps in &all {
         let (a, b) = caps[0].expect("whole match");
         if plain_template {
@@ -1071,8 +1227,12 @@ fn re_replace_direct(
                 cbargs.extend(captures);
                 cbargs.push(Value::Num(position as f64));
                 cbargs.push(Value::Str(s.clone()));
-                let r = ab(i.call(repl.clone(), Value::Undefined, &cbargs))?;
-                ab(i.to_string(&r))?
+                let f = f.as_mut().expect("functional replacement");
+                let r = ab(f.call(i, &mut cbargs))?;
+                match r {
+                    Value::Str(r) => r,
+                    r => ab(i.to_string(&r))?,
+                }
             } else {
                 crate::lstr::LStr::from(get_substitution(
                     i,
@@ -1091,6 +1251,9 @@ fn re_replace_direct(
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
         next = b;
+    }
+    if let Some(f) = f {
+        f.finish(i);
     }
     push_elems(&mut out, s, &text, next, text.len());
     if out.is_ascii() {
@@ -1297,8 +1460,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     // SpeciesConstructor(rx, %RegExp%), then a sticky-flagged splitter constructed from it.
     let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "RegExp"))?;
     let c = species_constructor(i, &this, &default_ctor)?;
-    let flags_v = ab(i.get_member(&this, "flags"))?;
-    let flags = ab(i.to_string(&flags_v))?;
+    let flags = regexp_flags_of(i, &this)?;
     let unicode = flags.contains('u') || flags.contains('v');
     if let Some(done) = re_split_direct(i, &this, &c, &s, &flags, arg(a, 1)) {
         return done;

@@ -52,10 +52,24 @@ pub struct Bundle {
 
 fn read(path: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(match text.strip_prefix('\u{feff}') {
+    let text = match text.strip_prefix('\u{feff}') {
         Some(t) => t.to_string(),
         None => text,
-    })
+    };
+    // TypeScript: the engine's strip-only erasure (what it runs for a `.ts` file), every
+    // offset kept, so the precompiled bytecode is plain JavaScript.
+    if is_ts(path) {
+        return lumen::typescript::strip_types(&text)
+            .map_err(|e| format!("{}:{}:{}: {e}", path.display(), e.line, e.column));
+    }
+    Ok(text)
+}
+
+fn is_ts(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts" | "mts" | "cts")
+    )
 }
 
 /// `.`/`..` collapsed without touching the filesystem (so a missing file is reported by the
@@ -416,8 +430,8 @@ impl Resolver {
 
     fn classify(&mut self, file: &Path) -> FileKind {
         match file.extension().and_then(|e| e.to_str()) {
-            Some("mjs") => FileKind::Esm,
-            Some("cjs") => FileKind::Cjs,
+            Some("mjs" | "mts") => FileKind::Esm,
+            Some("cjs" | "cts") => FileKind::Cjs,
             Some("json") => FileKind::Json,
             _ => match self.package_type(file).as_deref() {
                 Some("module") => FileKind::Esm,
@@ -431,8 +445,8 @@ impl Resolver {
             return Some(p.to_path_buf());
         }
         let exts: &[&str] = match mode {
-            Mode::Import => &[".js", ".mjs", ".cjs", ".json"],
-            Mode::Require => &[".js", ".json", ".cjs", ".mjs"],
+            Mode::Import => &[".js", ".mjs", ".cjs", ".json", ".ts", ".mts", ".cts"],
+            Mode::Require => &[".js", ".json", ".cjs", ".mjs", ".ts", ".cts"],
         };
         exts.iter().map(|e| with_suffix(p, e)).find(|c| c.is_file())
     }
@@ -754,12 +768,12 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
             FileKind::Esm
         } else {
             match res.classify(&path) {
-                // Node's syntax detection: a `.js` file outside any package "type" is CommonJS
-                // unless it only parses as a module.
+                // Node's syntax detection: a `.js`/`.ts` file outside any package "type" is
+                // CommonJS unless it only parses as a module.
                 FileKind::Cjs
-                    if path.extension().is_some_and(|x| x == "js")
+                    if path.extension().is_some_and(|x| x == "js" || x == "ts")
                         && res.package_type(&path).is_none()
-                        && std::fs::read_to_string(&path).is_ok_and(|s| is_module_syntax(&s)) =>
+                        && read(&path).is_ok_and(|s| is_module_syntax(&s)) =>
                 {
                     FileKind::Esm
                 }

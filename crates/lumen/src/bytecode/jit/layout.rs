@@ -117,6 +117,9 @@ struct Layout {
     prop_meta: i32,
     str_len: i32,
     str_cap: i32,
+    str_data: i32,
+    /// `Object::proto` (`Option<Gc>`: a nullable handle word).
+    proto: i32,
 }
 
 /// `(pointer word, length word)` byte offsets inside a `Vec<T>`, measured on a vector whose
@@ -178,6 +181,8 @@ fn layout() -> Option<&'static Layout> {
                 prop_meta: i(PROPERTY_META_OFFSET)?,
                 str_len: i(crate::lstr::LSTR_LEN_OFFSET)?,
                 str_cap: i(crate::lstr::LSTR_CAP_OFFSET)?,
+                str_data: i(crate::lstr::LSTR_DATA_OFFSET)?,
+                proto: i(obj + std::mem::offset_of!(Object, proto))?,
             })
         })
         .as_ref()
@@ -448,6 +453,53 @@ pub(crate) fn elem_get_num(
     result
 }
 
+/// `v[index]`'s NaN-boxed word for a dense element of a plain array or ordinary object that
+/// is a data property holding anything but a hole (`index` F64; as [`elem_get_num`] otherwise).
+/// The word is borrowed from the element: nothing is retained.
+pub(crate) fn elem_get_word(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    index: IrValue,
+    miss: Block,
+) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(Type::I64, 0);
+    };
+    let gc = object(fb, l, v, miss, false);
+    exotic_is(fb, l, gc, &[Exotic::None, Exotic::Array], miss);
+    let i = index_ptr(fb, index, miss);
+    let d = dense(fb, l, gc, miss);
+    let (prop, _) = element_prop(fb, l, gc, d, i, miss, false);
+    let meta = fb.load(PTR_MEM, prop, l.prop_meta);
+    let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
+    let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
+    guard(fb, data, miss);
+    let bits = fb.load(MemKind::I64, prop, l.prop_packed);
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
+    let hole = cmp_imm(fb, IntCC::Ne, Type::I64, top, TOP_EMPTY);
+    guard(fb, hole, miss);
+    bits
+}
+
+/// The offset of the strong count behind both an object's and a string's handle word, when
+/// they agree (the JIT then retains / releases either inline).
+pub(crate) fn rc_strong_offset() -> Option<i32> {
+    (crate::value::GC_STRONG_OFFSET == crate::lstr::LSTR_STRONG_OFFSET)
+        .then(|| i32::try_from(crate::value::GC_STRONG_OFFSET).ok())
+        .flatten()
+}
+
+/// Whether the NaN-boxed word `bits` holds an object, and whether a string (I32 0 / 1 each),
+/// and its handle word.
+pub(crate) fn word_counted(fb: &mut FunctionBuilder, bits: IrValue) -> (IrValue, IrValue, IrValue) {
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
+    let is_obj = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_OBJ & 0xffff);
+    let is_str = cmp_imm(fb, IntCC::Eq, Type::I64, top, (PACK_STR >> 48) as i64);
+    let payload = bin_imm(fb, BinaryOp::Band, Type::I64, bits, 0x0000_ffff_ffff_ffff);
+    (is_obj, is_str, payload)
+}
+
 /// `v[index] = n` (n F64) overwriting an existing dense `Array` element that currently holds a
 /// trivially-droppable value, or storing into a numeric typed array (with the typed array's
 /// conversion). Misses on anything else (including appends, frozen arrays, holes).
@@ -557,6 +609,32 @@ pub(crate) fn length(fb: &mut FunctionBuilder, v: IrValue, miss: Block) -> IrVal
 /// element count and the F64 length. Same miss contract as [`length`]. (Used for bounds-check
 /// elimination; may simply call `length` for now.)
 ///
+/// The UTF-16 unit (I32) at F64 `index` of the string whose header is `hdr`, when the string
+/// is known all-ASCII (its bytes are its units) and `index` is an integer in range; else
+/// branch to `miss`.
+pub(crate) fn str_ascii_unit(
+    fb: &mut FunctionBuilder,
+    hdr: IrValue,
+    index: IrValue,
+    miss: Block,
+) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(Type::I32, 0);
+    };
+    let cap = fb.load(MemKind::I32, hdr, l.str_cap);
+    let ascii = bin_imm(fb, BinaryOp::Band, Type::I32, cap, crate::lstr::ASCII_HINT as i64);
+    let ascii = cmp_imm(fb, IntCC::Ne, Type::I32, ascii, 0);
+    guard(fb, ascii, miss);
+    let i = index_ptr(fb, index, miss);
+    let n = fb.load(PTR_U32, hdr, l.str_len);
+    // Unsigned: a negative index is out of range too.
+    let inb = fb.icmp(IntCC::Ult, i, n);
+    guard(fb, inb, miss);
+    let at = fb.binary(BinaryOp::Iadd, hdr, i);
+    fb.load(MemKind::I32U8, at, l.str_data)
+}
+
 /// Strings: the byte length when the all-ASCII hint is set (otherwise UTF-16 length differs
 /// from the UTF-8 byte count: miss). Arrays (`Exotic::Array`, ic-plain): the own `length` data
 /// property, found through the shape's `len_slot` memo like `Props::length_property`. Typed
@@ -665,6 +743,7 @@ pub(crate) fn prop_get(
     v: IrValue,
     ic: &PropIc,
     miss: Block,
+    refc: Option<Block>,
 ) -> (IrValue, IrValue) {
     let Some(l) = layout() else {
         always_miss(fb, miss);
@@ -672,6 +751,59 @@ pub(crate) fn prop_get(
         let p = fb.iconst(Type::I64, 0);
         return (t, p);
     };
+    let bits = prop_word_l(fb, l, v, ic, miss);
+    // Unpack the NaN-boxed word into the `Value` tag / payload of the four copyable kinds.
+    let is_num = is_num_bits(fb, bits);
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
+    let is_undef = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_UNDEFINED);
+    let is_null = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_NULL);
+    let is_bool = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_BOOL);
+    let ok = fb.binary(BinaryOp::Bor, is_num, is_undef);
+    let ok = fb.binary(BinaryOp::Bor, ok, is_null);
+    let ok = fb.binary(BinaryOp::Bor, ok, is_bool);
+    match refc {
+        None => guard(fb, ok, miss),
+        // A refcounted value (a string, object, symbol or BigInt): its word goes to `refc`,
+        // which takes the reference (reads only here).
+        Some(r) => {
+            let lo = cmp_imm(fb, IntCC::Uge, Type::I64, top, TOP_BIGINT);
+            let hi = cmp_imm(fb, IntCC::Ule, Type::I64, top, TOP_SYM);
+            let mid = fb.binary(BinaryOp::Band, lo, hi);
+            let obj = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_OBJ & 0xffff);
+            let is_ref = fb.binary(BinaryOp::Bor, mid, obj);
+            let cont = fb.create_block();
+            let other = fb.create_block();
+            fb.brif(ok, cont, &[], other, &[]);
+            fb.seal_block(other);
+            fb.switch_to_block(other);
+            fb.brif(is_ref, r, &[bits], miss, &[]);
+            fb.seal_block(cont);
+            fb.switch_to_block(cont);
+        }
+    }
+    let t_num = fb.iconst(Type::I32, super::TAG_NUM as i64);
+    let t_bool = fb.iconst(Type::I32, super::TAG_BOOL as i64);
+    let t_null = fb.iconst(Type::I32, super::TAG_NULL as i64);
+    let t_undef = fb.iconst(Type::I32, super::TAG_UNDEFINED as i64);
+    let t = fb.select(is_null, t_null, t_undef);
+    let t = fb.select(is_bool, t_bool, t);
+    let tag = fb.select(is_num, t_num, t);
+    let bit = bin_imm(fb, BinaryOp::Band, Type::I64, bits, 1);
+    let zero = fb.iconst(Type::I64, 0);
+    let p = fb.select(is_bool, bit, zero);
+    let payload = fb.select(is_num, bits, p);
+    (tag, payload)
+}
+
+/// The NaN-boxed word of `v.<prop>` via the baked IC: guard `v` is an object with one of the
+/// IC's shapes and the entry a data property.
+fn prop_word_l(
+    fb: &mut FunctionBuilder,
+    l: &Layout,
+    v: IrValue,
+    ic: &PropIc,
+    miss: Block,
+) -> IrValue {
     let gc = object(fb, l, v, miss, false);
     exotic_is(fb, l, gc, &[Exotic::None], miss);
     let shape = fb.load(MemKind::I32, gc, l.shape);
@@ -708,30 +840,19 @@ pub(crate) fn prop_get(
     }
     fb.jump(miss, &[]);
     fb.seal_block(got);
-
-    // Unpack the NaN-boxed word into the `Value` tag / payload of the four copyable kinds.
     fb.switch_to_block(got);
-    let is_num = is_num_bits(fb, bits);
-    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
-    let is_undef = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_UNDEFINED);
-    let is_null = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_NULL);
-    let is_bool = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_BOOL);
-    let ok = fb.binary(BinaryOp::Bor, is_num, is_undef);
-    let ok = fb.binary(BinaryOp::Bor, ok, is_null);
-    let ok = fb.binary(BinaryOp::Bor, ok, is_bool);
-    guard(fb, ok, miss);
-    let t_num = fb.iconst(Type::I32, super::TAG_NUM as i64);
-    let t_bool = fb.iconst(Type::I32, super::TAG_BOOL as i64);
-    let t_null = fb.iconst(Type::I32, super::TAG_NULL as i64);
-    let t_undef = fb.iconst(Type::I32, super::TAG_UNDEFINED as i64);
-    let t = fb.select(is_null, t_null, t_undef);
-    let t = fb.select(is_bool, t_bool, t);
-    let tag = fb.select(is_num, t_num, t);
-    let bit = bin_imm(fb, BinaryOp::Band, Type::I64, bits, 1);
-    let zero = fb.iconst(Type::I64, 0);
-    let p = fb.select(is_bool, bit, zero);
-    let payload = fb.select(is_num, bits, p);
-    (tag, payload)
+    bits
+}
+
+/// `v.<prop>` via the baked IC as a Number (F64): misses unless it is a data property holding
+/// one.
+pub(crate) fn prop_get_num(fb: &mut FunctionBuilder, v: IrValue, ic: &PropIc, miss: Block) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.f64const(0.0);
+    };
+    let bits = prop_word_l(fb, l, v, ic, miss);
+    word_num(fb, bits, miss)
 }
 
 /// The element storage `v`'s own elements can be read from directly, for bounds-check
@@ -930,4 +1051,347 @@ pub(crate) fn prop_set_num(
     let canon = fb.iconst(Type::I64, PACK_CANON_NAN as i64);
     let packed = fb.select(is_nan, canon, nbits);
     fb.store(MemKind::I64, prop, packed, l.prop_packed);
+}
+
+/// A method lookup `v.<name>` validated like the interpreter's shape IC (`ic_shape_probe`):
+/// `shapes` are the receiver's and each prototype's shape ids down to the holder (at most 4
+/// levels), all ordinary plain objects, followed through the live `proto` links; the holder's
+/// entry `slot` must be a data property whose NaN-boxed word is `want` (the expected function).
+/// Misses on anything else. Reads only.
+pub(crate) fn method_probe(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    shapes: &[u32],
+    slot: u32,
+    want: u64,
+    miss: Block,
+) {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return;
+    };
+    let Some(off) = (slot as i64)
+        .checked_mul(l.prop_size)
+        .and_then(|o| i32::try_from(o).ok())
+    else {
+        always_miss(fb, miss);
+        return;
+    };
+    let gc = object(fb, l, v, miss, false);
+    probe_chain(fb, l, gc, shapes, off, want, slot, miss);
+}
+
+/// [`method_probe`] on the object at `gc` (a live `Gc` box address the caller pins): its
+/// borrow flag, then the same chain / entry checks.
+pub(crate) fn gc_probe(
+    fb: &mut FunctionBuilder,
+    gc: IrValue,
+    shapes: &[u32],
+    slot: u32,
+    want: u64,
+    miss: Block,
+) {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return;
+    };
+    let Some(off) = (slot as i64)
+        .checked_mul(l.prop_size)
+        .and_then(|o| i32::try_from(o).ok())
+    else {
+        always_miss(fb, miss);
+        return;
+    };
+    let flag = fb.load(PTR_MEM, gc, l.borrow);
+    let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+    guard(fb, free, miss);
+    probe_chain(fb, l, gc, shapes, off, want, slot, miss);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_chain(
+    fb: &mut FunctionBuilder,
+    l: &Layout,
+    mut gc: IrValue,
+    shapes: &[u32],
+    off: i32,
+    want: u64,
+    slot: u32,
+    miss: Block,
+) {
+    for (k, &shape) in shapes.iter().enumerate() {
+        if k > 0 {
+            let p = fb.load(PTR_MEM, gc, l.proto);
+            let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
+            guard(fb, some, miss);
+            let flag = fb.load(PTR_MEM, p, l.borrow);
+            let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+            guard(fb, free, miss);
+            gc = p;
+        }
+        exotic_is(fb, l, gc, &[Exotic::None], miss);
+        let sh = fb.load(MemKind::I32, gc, l.shape);
+        let same = cmp_imm(fb, IntCC::Eq, Type::I32, sh, shape as i32 as i64);
+        guard(fb, same, miss);
+    }
+    let nent = fb.load(PTR_U32, gc, l.entries_len);
+    let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, slot as i64);
+    guard(fb, inb, miss);
+    let base = fb.load(PTR_MEM, gc, l.entries_ptr);
+    let meta = fb.load(PTR_MEM, base, off + l.prop_meta);
+    let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
+    let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
+    guard(fb, data, miss);
+    let b = fb.load(MemKind::I64, base, off + l.prop_packed);
+    let same = cmp_imm(fb, IntCC::Eq, Type::I64, b, want as i64);
+    guard(fb, same, miss);
+}
+
+// ----- shape-resolved own properties (inlined `this` bodies) ---------------------------------
+
+/// The byte offset of entry `slot`, when representable.
+fn entry_off(l: &Layout, slot: u32) -> Option<i32> {
+    (slot as i64)
+        .checked_mul(l.prop_size)
+        .and_then(|o| i32::try_from(o).ok())
+}
+
+/// Guard `v` (a `Value` address) holds an ordinary plain object of shape `shape` with more than
+/// `min_len` entries — for `write` also unborrowed with entries of its own (not a shared
+/// copy-on-write map) — and return its entries base pointer. A shape id pins the ordered key
+/// list, so every entry slot resolved against an object of that shape is valid on it.
+pub(crate) fn shaped_entries(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    shape: u32,
+    min_len: u32,
+    write: bool,
+    miss: Block,
+) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(PTR, 0);
+    };
+    let gc = object(fb, l, v, miss, write);
+    exotic_is(fb, l, gc, &[Exotic::None], miss);
+    let sh = fb.load(MemKind::I32, gc, l.shape);
+    let same = cmp_imm(fb, IntCC::Eq, Type::I32, sh, shape as i32 as i64);
+    guard(fb, same, miss);
+    if write {
+        let cap = fb.load(PTR_U32, gc, l.entries_cap);
+        let owned = cmp_imm(fb, IntCC::Ne, PTR, cap, 0);
+        guard(fb, owned, miss);
+    }
+    let nent = fb.load(PTR_U32, gc, l.entries_len);
+    let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, min_len as i64);
+    guard(fb, inb, miss);
+    fb.load(PTR_MEM, gc, l.entries_ptr)
+}
+
+/// The NaN-boxed word of entry `slot` (of [`shaped_entries`] `base`); misses on an accessor.
+pub(crate) fn entry_word(fb: &mut FunctionBuilder, base: IrValue, slot: u32, miss: Block) -> IrValue {
+    let Some((l, off)) = layout().and_then(|l| Some((l, entry_off(l, slot)?))) else {
+        always_miss(fb, miss);
+        return fb.iconst(Type::I64, 0);
+    };
+    let meta = fb.load(PTR_MEM, base, off + l.prop_meta);
+    let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
+    let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
+    guard(fb, data, miss);
+    fb.load(MemKind::I64, base, off + l.prop_packed)
+}
+
+/// Guard entry `slot` is a writable data property whose value is trivially droppable (an
+/// overwrite needs no release). Reads only.
+pub(crate) fn entry_writable(fb: &mut FunctionBuilder, base: IrValue, slot: u32, miss: Block) {
+    let Some((l, off)) = layout().and_then(|l| Some((l, entry_off(l, slot)?))) else {
+        always_miss(fb, miss);
+        return;
+    };
+    let meta = fb.load(PTR_MEM, base, off + l.prop_meta);
+    let attrs = bin_imm(
+        fb,
+        BinaryOp::Band,
+        PTR,
+        meta,
+        (PROP_ACCESSOR | PROP_WRITABLE) as i64,
+    );
+    let writable = cmp_imm(fb, IntCC::Eq, PTR, attrs, PROP_WRITABLE as i64);
+    guard(fb, writable, miss);
+    let old = fb.load(MemKind::I64, base, off + l.prop_packed);
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, old, 48);
+    let empty = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_EMPTY);
+    let ge = cmp_imm(fb, IntCC::Uge, Type::I64, top, TOP_BIGINT);
+    let le = cmp_imm(fb, IntCC::Ule, Type::I64, top, TOP_SYM);
+    let rc_prim = fb.binary(BinaryOp::Band, ge, le);
+    let obj = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_OBJ);
+    let bad = fb.binary(BinaryOp::Bor, empty, rc_prim);
+    let bad = fb.binary(BinaryOp::Bor, bad, obj);
+    let droppable = cmp_imm(fb, IntCC::Eq, Type::I32, bad, 0);
+    guard(fb, droppable, miss);
+}
+
+/// Overwrite entry `slot`'s value word with `word` (checked by [`entry_writable`]).
+pub(crate) fn entry_store(fb: &mut FunctionBuilder, base: IrValue, slot: u32, word: IrValue) {
+    if let Some((l, off)) = layout().and_then(|l| Some((l, entry_off(l, slot)?))) {
+        fb.store(MemKind::I64, base, word, off + l.prop_packed);
+    }
+}
+
+/// The number a NaN-boxed word holds, as F64; misses on any other kind.
+pub(crate) fn word_num(fb: &mut FunctionBuilder, bits: IrValue, miss: Block) -> IrValue {
+    let num = is_num_bits(fb, bits);
+    guard(fb, num, miss);
+    fb.convert(ConvOp::Bitcast, Type::F64, bits)
+}
+
+/// The NaN-boxed word of the number `n` (F64; NaN canonicalized as `PackedValue` stores it).
+pub(crate) fn num_word(fb: &mut FunctionBuilder, n: IrValue) -> IrValue {
+    let nbits = fb.convert(ConvOp::Bitcast, Type::I64, n);
+    let is_nan = fb.fcmp(FloatCC::Ne, n, n);
+    let canon = fb.iconst(Type::I64, PACK_CANON_NAN as i64);
+    fb.select(is_nan, canon, nbits)
+}
+
+/// The NaN-boxed word of the Boolean `b` (I32 0 / 1).
+pub(crate) fn bool_word(fb: &mut FunctionBuilder, b: IrValue) -> IrValue {
+    let w = fb.convert(ConvOp::Uext, Type::I64, b);
+    bin_imm(fb, BinaryOp::Bor, Type::I64, w, PACK_BOOL as i64)
+}
+
+/// A NaN-boxed word as a `Value`'s `(tag: I32, payload: I64)` when it is trivially copyable
+/// (a number, `undefined`, `null` or a Boolean; payload as [`prop_get`] returns it), and
+/// `refc` (I32 1) when it is a refcounted value instead. Misses on anything else (`Empty`).
+pub(crate) fn word_value(
+    fb: &mut FunctionBuilder,
+    bits: IrValue,
+    miss: Block,
+) -> (IrValue, IrValue, IrValue) {
+    let is_num = is_num_bits(fb, bits);
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
+    let is_undef = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_UNDEFINED);
+    let is_null = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_NULL);
+    let is_bool = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_BOOL);
+    let ok = fb.binary(BinaryOp::Bor, is_num, is_undef);
+    let ok = fb.binary(BinaryOp::Bor, ok, is_null);
+    let ok = fb.binary(BinaryOp::Bor, ok, is_bool);
+    let lo = cmp_imm(fb, IntCC::Uge, Type::I64, top, TOP_BIGINT);
+    let hi = cmp_imm(fb, IntCC::Ule, Type::I64, top, TOP_SYM);
+    let mid = fb.binary(BinaryOp::Band, lo, hi);
+    let obj = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_OBJ & 0xffff);
+    let is_ref = fb.binary(BinaryOp::Bor, mid, obj);
+    let any = fb.binary(BinaryOp::Bor, ok, is_ref);
+    guard(fb, any, miss);
+    let t_num = fb.iconst(Type::I32, super::TAG_NUM as i64);
+    let t_bool = fb.iconst(Type::I32, super::TAG_BOOL as i64);
+    let t_null = fb.iconst(Type::I32, super::TAG_NULL as i64);
+    let t_undef = fb.iconst(Type::I32, super::TAG_UNDEFINED as i64);
+    let t = fb.select(is_null, t_null, t_undef);
+    let t = fb.select(is_bool, t_bool, t);
+    let tag = fb.select(is_num, t_num, t);
+    let bit = bin_imm(fb, BinaryOp::Band, Type::I64, bits, 1);
+    let zero = fb.iconst(Type::I64, 0);
+    let p = fb.select(is_bool, bit, zero);
+    let payload = fb.select(is_num, bits, p);
+    (tag, payload, is_ref)
+}
+
+/// [`shaped_entries`] for a receiver `v` whose object, borrow state (for reads), kind and shape
+/// were just validated (by [`method_probe`], with nothing run since): only what that probe left
+/// out is checked.
+pub(crate) fn probed_entries(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    min_len: u32,
+    write: bool,
+    miss: Block,
+) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(PTR, 0);
+    };
+    let gc = fb.load(PTR_MEM, v, VALUE_PAYLOAD);
+    if write {
+        let flag = fb.load(PTR_MEM, gc, l.borrow);
+        let free = cmp_imm(fb, IntCC::Eq, PTR, flag, 0);
+        guard(fb, free, miss);
+        let cap = fb.load(PTR_U32, gc, l.entries_cap);
+        let owned = cmp_imm(fb, IntCC::Ne, PTR, cap, 0);
+        guard(fb, owned, miss);
+    }
+    let nent = fb.load(PTR_U32, gc, l.entries_len);
+    let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, min_len as i64);
+    guard(fb, inb, miss);
+    fb.load(PTR_MEM, gc, l.entries_ptr)
+}
+
+/// Like [`method_probe`], for an accessor: `shapes` lead from the receiver to the holder, whose
+/// entry `slot` must be an accessor property whose getter is the function object at `getter`
+/// (its `Gc` payload word). Misses on anything else. Reads only.
+pub(crate) fn getter_probe(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    shapes: &[u32],
+    slot: u32,
+    getter: u64,
+    miss: Block,
+) {
+    use crate::value::{Accessors, Value};
+    // `Some(v)` must be `v` bitwise (the tag's niche encodes `None`).
+    let get_off = std::mem::offset_of!(Accessors, get);
+    let bits_ok = std::mem::size_of::<Option<Value>>() == std::mem::size_of::<Value>()
+        && std::mem::size_of::<Value>() == 16
+        && VALUE_PAYLOAD == 8
+        && unsafe {
+            let v = Value::Num(1.5);
+            let o: Option<Value> = Some(Value::Num(1.5));
+            let a = std::slice::from_raw_parts(&v as *const Value as *const u8, 16);
+            let b = std::slice::from_raw_parts(&o as *const Option<Value> as *const u8, 16);
+            let same = a[0] == b[0] && a[8..16] == b[8..16];
+            std::mem::forget(o);
+            same
+        };
+    let (Some(l), true, Ok(get_off)) = (layout(), bits_ok, i32::try_from(get_off)) else {
+        always_miss(fb, miss);
+        return;
+    };
+    let Some(off) = entry_off(l, slot) else {
+        always_miss(fb, miss);
+        return;
+    };
+    let mut gc = object(fb, l, v, miss, false);
+    for (k, &shape) in shapes.iter().enumerate() {
+        if k > 0 {
+            let p = fb.load(PTR_MEM, gc, l.proto);
+            let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
+            guard(fb, some, miss);
+            let flag = fb.load(PTR_MEM, p, l.borrow);
+            let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+            guard(fb, free, miss);
+            gc = p;
+        }
+        exotic_is(fb, l, gc, &[Exotic::None], miss);
+        let sh = fb.load(MemKind::I32, gc, l.shape);
+        let same = cmp_imm(fb, IntCC::Eq, Type::I32, sh, shape as i32 as i64);
+        guard(fb, same, miss);
+    }
+    let nent = fb.load(PTR_U32, gc, l.entries_len);
+    let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, slot as i64);
+    guard(fb, inb, miss);
+    let base = fb.load(PTR_MEM, gc, l.entries_ptr);
+    let meta = fb.load(PTR_MEM, base, off + l.prop_meta);
+    let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
+    let is_acc = cmp_imm(fb, IntCC::Ne, PTR, acc, 0);
+    guard(fb, is_acc, miss);
+    let flags = (PROP_ACCESSOR | PROP_WRITABLE | crate::value::PROP_ENUMERABLE
+        | crate::value::PROP_CONFIGURABLE) as i64;
+    let boxp = bin_imm(fb, BinaryOp::Band, PTR, meta, !flags);
+    let some = cmp_imm(fb, IntCC::Ne, PTR, boxp, 0);
+    guard(fb, some, miss);
+    let tag = fb.load(MemKind::I32U8, boxp, get_off);
+    let is_obj = cmp_imm(fb, IntCC::Eq, Type::I32, tag, TAG_OBJ as i64);
+    guard(fb, is_obj, miss);
+    let pl = fb.load(PTR_MEM, boxp, get_off + VALUE_PAYLOAD);
+    let same = cmp_imm(fb, IntCC::Eq, PTR, pl, getter as i64);
+    guard(fb, same, miss);
 }

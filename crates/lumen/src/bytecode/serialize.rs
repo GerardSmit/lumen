@@ -193,6 +193,15 @@ impl Operand for u16 {
     }
 }
 
+impl Operand for u8 {
+    fn put(self, w: &mut Vec<u8>) {
+        w.push(self);
+    }
+    fn get(r: &mut Rd) -> R<Self> {
+        r.u8()
+    }
+}
+
 impl Operand for bool {
     fn put(self, w: &mut Vec<u8>) {
         w.push(self as u8);
@@ -401,13 +410,41 @@ op_codec! {
     134 => InitialYield;
     135 => Yield;
     136 => YieldDelegate(a: u16);
+    137 => LoadCallee;
+    138 => DefineField(a: u32, b: bool);
+    139 => BlkNew(a: u16, b: u16);
+    140 => BlkDecl(a: u16, b: u32, c: bool);
+    141 => BlkCopy(a: u16);
+    142 => BlkLoad(a: u16, b: u32);
+    143 => BlkStore(a: u16, b: u32);
+    144 => BlkInit(a: u16, b: u32);
+    145 => BlkUpdate(a: u16, b: u32, c: UpdKind);
+    146 => InEnv(a: u16);
+    147 => TailCall(a: u16, b: bool);
+    148 => ImportCall(a: u8, b: bool);
+    149 => GetAsyncIter;
+    150 => AsyncIterNext(a: u16, b: u16, c: u16);
+    151 => AsyncIterResult(a: u16);
+    152 => AsyncCloseCall(a: u16, b: u16);
+    153 => AsyncCloseCheck(a: u16);
+    154 => AsyncDelegateInit;
+    155 => AsyncDelegateCall(a: u16, b: u16, c: u16);
+    156 => AsyncDelegateResult(a: u16, b: u16);
+    157 => AsyncDelegateCloseReject(a: u16, b: u16);
+    158 => AsyncDelegateSpecial(a: u16, b: bool);
+    159 => NewSpread(a: u16);
+    160 => IterRestL(a: u16, b: u16);
+    161 => TailCallSpread(a: u16, b: bool);
+    162 => ArrayCbGuard(a: u8);
+    163 => ArrayCbHas;
+    164 => ArrayCbDone(a: u32);
 }
 
 /// The chunk fields this codec writes, in order (hand-maintained next to `enc_chunk`, whose
 /// exhaustive destructuring of `Chunk` forces a look here when a field is added).
 const CHUNK_SIG: &str = "ops consts(undef null false true num str bigint) names slot_names \
     n_params flags(uses_this env_this arguments_slot rest_slot derived reflect_args) var_force_resets funcs \
-    cap_inits(param var fn lexical) caches obj_maps name_caches";
+    cap_inits(param var fn lexical) caches obj_maps name_caches positions";
 
 const fn fnv(mut h: u64, s: &[u8]) -> u64 {
     let mut i = 0;
@@ -527,6 +564,8 @@ fn enc_chunk(
         switch_tables: _, // runtime state; sized from the SwitchLK ops on decode
         derived,
         reflect_args,
+        positions,
+        inline_cbs: _, // runtime state; rescanned from the ops
     } = chunk;
     if !classes.is_empty() {
         return Err("class definitions are not carried by the codec".into());
@@ -630,6 +669,9 @@ fn enc_chunk(
     uv(out, caches.len() as u64);
     uv(out, obj_maps.len() as u64);
     uv(out, name_caches.len() as u64);
+    // The call-site position table, already a compact byte string (see `positions`).
+    uv(out, positions.len() as u64);
+    out.extend_from_slice(positions);
     Ok(())
 }
 
@@ -734,6 +776,8 @@ fn dec_chunk(
     let n_caches = r.uv()? as usize;
     let n_obj_maps = r.uv()? as usize;
     let n_name_caches = r.uv()? as usize;
+    let n_positions = r.len()?;
+    let positions: Box<[u8]> = r.bytes(n_positions)?.into();
     if n_caches > u32::MAX as usize || n_obj_maps > u32::MAX as usize {
         return Err("bytecode: bad cache count".into());
     }
@@ -778,6 +822,8 @@ fn dec_chunk(
         switch_tables: (0..n_switch_tables).map(|_| OnceCell::new()).collect(),
         derived: flags & 16 != 0,
         reflect_args: flags & 32 != 0,
+        positions,
+        inline_cbs: Default::default(),
     })
 }
 
@@ -798,6 +844,16 @@ pub struct SectionStats {
 
 /// Compile every function of a unit (`funcs`: the unit's functions in function-index order,
 /// as the stripped AST encoder returns them) and serialize the results.
+/// The directive that marks a function as run-once (see [`encode_unit`]).
+pub const RUN_ONCE: &str = "lumen:run-once";
+
+/// Whether `f`'s body opens with the [`RUN_ONCE`] directive.
+fn is_run_once(f: &Function) -> bool {
+    f.parsed_body().is_some_and(|body| {
+        matches!(body.first(), Some(crate::ast::Stmt::Expr(crate::ast::Expr::Str(s))) if &**s == RUN_ONCE)
+    })
+}
+
 pub(crate) fn encode_unit(funcs: &[Rc<Function>]) -> (Vec<u8>, SectionStats) {
     let fn_index: HashMap<*const Function, u32> = funcs
         .iter()
@@ -812,7 +868,12 @@ pub(crate) fn encode_unit(funcs: &[Rc<Function>]) -> (Vec<u8>, SectionStats) {
     // (index, None = refused | Some(chunk bytes))
     let mut entries: Vec<(u32, Option<Vec<u8>>)> = Vec::new();
     for (i, f) in funcs.iter().enumerate() {
-        match super::compile(f) {
+        // A function whose body opens with the `"lumen:run-once"` directive (a lazily loaded
+        // glue file's body, a module factory) is left to the tree-walker: its chunk would stay
+        // attached to the function node for good, while a body the tree-walker ran is released
+        // again by the collector.
+        let run_once = is_run_once(f);
+        match if run_once { None } else { super::compile(f) } {
             None => {
                 stats.refused += 1;
                 entries.push((i as u32, None));
@@ -939,11 +1000,17 @@ struct LazyUnit {
     /// The string table: its byte range, parsed on the first decode.
     strings_at: std::ops::Range<usize>,
     strings: RefCell<Option<StrTable<'static>>>,
-    /// The unit's functions by index. Weak: registration must not keep a program's functions
-    /// alive; a parent chunk's inner functions are alive whenever the parent is (its body
-    /// holds them), which is the only time they are resolved.
-    funcs: Vec<Weak<Function>>,
+    /// The unit's AST, which resolves a chunk's inner functions by index (decoding their
+    /// headers if need be). Weak: the unit lives as long as any of its functions does, and a
+    /// chunk is only decoded for a live function.
+    ast: Weak<crate::snapshot::SplitUnit>,
+    /// Each function's entry, by function index: [`NO_ENTRY`], [`REFUSED`], or the chunk's
+    /// `(start, len)` within `section`.
+    entries: Box<[(u32, u32)]>,
 }
+
+const NO_ENTRY: (u32, u32) = (0, 0);
+const REFUSED: (u32, u32) = (u32::MAX, 0);
 
 struct LazyEntry {
     unit: Rc<LazyUnit>,
@@ -956,6 +1023,41 @@ thread_local! {
     /// live function's address: the unit's `Weak` keeps each registered allocation from being
     /// reused, so an address match is that very function.
     static LAZY: RefCell<LazyMap> = RefCell::new(LazyMap::default());
+    /// On a coroutine worker thread, the table of the thread driving it (see [`lazy_enter`]);
+    /// null elsewhere.
+    static LAZY_DRIVER: std::cell::Cell<*const RefCell<LazyMap>> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Run `f` on this thread's table of registered chunks: its own, or on a coroutine worker the
+/// driver's (a body running there decodes function headers, which register their chunks).
+fn with_lazy<T>(f: impl FnOnce(&RefCell<LazyMap>) -> T) -> T {
+    let driver = LAZY_DRIVER.with(|d| d.get());
+    if driver.is_null() {
+        LAZY.with(f)
+    } else {
+        // SAFETY: set by `lazy_enter` to the driving thread's table, which outlives the
+        // coroutine, and only this thread runs while the driver is parked (the coroutine
+        // handoff is strict ping-pong).
+        f(unsafe { &*driver })
+    }
+}
+
+/// The table this thread's code uses, for a coroutine body it hands to a worker thread
+/// (opaque; see [`lazy_enter`]).
+pub(crate) fn lazy_handle() -> *const () {
+    let driver = LAZY_DRIVER.with(|d| d.get());
+    if driver.is_null() {
+        with_lazy(|l| l as *const RefCell<LazyMap> as *const ())
+    } else {
+        driver as *const ()
+    }
+}
+
+/// Make this (coroutine worker) thread use `table` ([`lazy_handle`] of its driver), or its own
+/// again for null; returns the previous setting.
+pub(crate) fn lazy_enter(table: *const ()) -> *const () {
+    LAZY_DRIVER.with(|d| d.replace(table as *const RefCell<LazyMap>)) as *const ()
 }
 
 type LazyMap = HashMap<*const Function, LazyEntry, std::hash::BuildHasherDefault<PtrHasher>>;
@@ -979,83 +1081,95 @@ impl std::hash::Hasher for PtrHasher {
     }
 }
 
-/// Attach a unit's bytecode section to the functions of its freshly decoded AST (`funcs`, in
-/// function-index order). Recorded refusals always go straight into the code cache (the
-/// function stays on the tree-walker, no compile attempt). Chunks are decoded now into the
-/// code cache when `eager` (the first call runs on the VM), else registered and decoded when
-/// the function first tiers up (`compile` consults [`take_precompiled`]) — decoding every chunk
-/// of a large bundle costs far more than the few compiles a typical load performs. A function
-/// whose cache is already filled is left alone. Returns (chunks attached or registered,
-/// refusals attached).
+/// Attach a unit's bytecode section to its AST: every function the unit decodes (now or
+/// later — function headers decode on demand, see [`crate::snapshot::SplitUnit`]) is passed
+/// here. A recorded refusal goes straight into the function's code cache (it stays on the
+/// tree-walker, no compile attempt); a chunk is registered and decoded when the function first
+/// tiers up (`compile` consults [`take_precompiled`]) — decoding every chunk of a large bundle
+/// costs far more than the few compiles a typical load performs. A function whose cache is
+/// already filled is left alone.
 pub(crate) fn attach_unit(
     section: &'static [u8],
-    funcs: &[Rc<Function>],
-    eager: bool,
-) -> R<(usize, usize)> {
+    ast: &Rc<crate::snapshot::SplitUnit>,
+) -> R<()> {
+    let _mem = crate::memstats::enter(crate::memstats::Cat::ChunkDecode);
     let Section {
         strings: strings_at,
+        entries: list,
+    } = parse_section(section, ast.fn_count())?;
+    let mut entries = vec![NO_ENTRY; ast.fn_count()].into_boxed_slice();
+    for (idx, e) in list {
+        entries[idx] = match e {
+            None => REFUSED,
+            Some(range) => (range.start as u32, range.len() as u32),
+        };
+    }
+    let unit = Rc::new(LazyUnit {
+        section,
+        strings_at,
+        strings: RefCell::new(None),
+        ast: Rc::downgrade(ast),
         entries,
-    } = parse_section(section, funcs.len())?;
-    let (mut chunks, mut refusals) = (0, 0);
-    if eager {
-        let mut strings = parse_strings(&section[strings_at])?;
-        let lookup = |i: usize| funcs.get(i).cloned();
-        for (idx, e) in entries {
-            let f = &funcs[idx];
-            match e {
-                None => refusals += f.code.set(None).is_ok() as usize,
-                Some(range) => {
-                    let chunk = dec_chunk_at(&section[range], &mut strings, &lookup)?;
-                    chunks += f.code.set(Some(Rc::new(chunk))).is_ok() as usize;
-                }
+    });
+    with_lazy(|lazy| {
+        // Drop registrations whose function died (their allocations are only pinned by the
+        // unit's table), so reloading a program does not grow the table forever.
+        let mut lazy = lazy.borrow_mut();
+        if lazy.len() > 4096 {
+            lazy.retain(|&f, e| e.unit.ast.upgrade().is_some_and(|u| u.is(e.idx, f)));
+        }
+    });
+    ast.set_hook(Box::new(move |idx, f| register(&unit, idx, f)));
+    Ok(())
+}
+
+/// [`attach_unit`]'s per-function step.
+fn register(unit: &Rc<LazyUnit>, idx: usize, f: &Rc<Function>) {
+    match unit.entries.get(idx).copied().unwrap_or(NO_ENTRY) {
+        NO_ENTRY => {}
+        REFUSED => {
+            if f.code.set(None).is_ok() {
+                REFUSALS.fetch_add(1, Relaxed);
             }
         }
-        ATTACHED.fetch_add(chunks as u64, Relaxed);
-    } else {
-        let unit = Rc::new(LazyUnit {
-            section,
-            strings_at,
-            strings: RefCell::new(None),
-            funcs: funcs.iter().map(Rc::downgrade).collect(),
-        });
-        LAZY.with(|lazy| {
-            let mut lazy = lazy.borrow_mut();
-            lazy.reserve(entries.len());
-            // Drop registrations whose function died (their allocations are only pinned by
-            // the entry's unit), so reloading a program does not grow the table forever.
-            if lazy.len() > 4096 && lazy.len() >= funcs.len() {
-                lazy.retain(|_, e| e.unit.funcs[e.idx].strong_count() > 0);
+        (start, len) => {
+            if f.code.get().is_some() {
+                return;
             }
-            for (idx, e) in entries {
-                let f = &funcs[idx];
-                match e {
-                    None => refusals += f.code.set(None).is_ok() as usize,
-                    Some(bytes) if f.code.get().is_none() => {
-                        chunks += 1;
-                        lazy.insert(
-                            Rc::as_ptr(f),
-                            LazyEntry {
-                                unit: unit.clone(),
-                                idx,
-                                bytes,
-                            },
-                        );
-                    }
-                    Some(_) => {}
-                }
-            }
-        });
-        REGISTERED.fetch_add(chunks as u64, Relaxed);
+            // Tier up on the first call: the chunk is ready, and running the function on the
+            // tree-walker first would decode its (deferred) body.
+            f.calls.set(f.calls.get().max(u32::MAX - 1));
+            let entry = LazyEntry {
+                unit: unit.clone(),
+                idx,
+                bytes: start as usize..(start + len) as usize,
+            };
+            with_lazy(|lazy| lazy.borrow_mut().insert(Rc::as_ptr(f), entry));
+            REGISTERED.fetch_add(1, Relaxed);
+        }
     }
-    REFUSALS.fetch_add(refusals as u64, Relaxed);
-    Ok((chunks, refusals))
+}
+
+/// Decode `f`'s registered chunk into its code cache now (`LUMEN_AOT_EAGER`, verification).
+pub(crate) fn attach_now(f: &Rc<Function>) {
+    if f.code.get().is_none() {
+        if let Some(chunk) = take_precompiled(f) {
+            let _ = f.code.set(Some(chunk));
+        }
+    }
+}
+
+/// Precompiled chunks registered and not yet decoded (for the `LUMEN_MEM_STATS` report).
+pub(crate) fn lazy_registered() -> usize {
+    with_lazy(|l| l.borrow().len())
 }
 
 /// The precompiled chunk registered for `func`, decoded (consumed: the caller caches it in
 /// `func.code`). `None` = nothing registered, or its bytes failed to decode — the caller
 /// compiles as usual.
 pub(crate) fn take_precompiled(func: &Function) -> Option<Rc<Chunk>> {
-    let entry = LAZY.with(|lazy| {
+    let _mem = crate::memstats::enter(crate::memstats::Cat::ChunkDecode);
+    let entry = with_lazy(|lazy| {
         let mut lazy = lazy.borrow_mut();
         if lazy.is_empty() {
             return None;
@@ -1063,10 +1177,11 @@ pub(crate) fn take_precompiled(func: &Function) -> Option<Rc<Chunk>> {
         lazy.remove(&(func as *const Function))
     })?;
     let unit = &entry.unit;
-    if unit.funcs[entry.idx].as_ptr() != func as *const Function {
+    let ast = unit.ast.upgrade()?;
+    if !ast.is(entry.idx, func as *const Function) {
         return None;
     }
-    let lookup = |i: usize| unit.funcs.get(i).and_then(Weak::upgrade);
+    let lookup = |i: usize| ast.function(i).ok();
     let mut strings = unit.strings.borrow_mut();
     if strings.is_none() {
         *strings = Some(parse_strings(&unit.section[unit.strings_at.clone()]).ok()?);
@@ -1145,11 +1260,35 @@ mod tests {
         assert!(OP_SIG.contains("MakeClosure"));
     }
 
-    fn funcs_of(src: &str) -> (Vec<crate::ast::Stmt>, Vec<Rc<Function>>) {
+    /// `src`'s functions (in index order) and its split AST, as an ahead-of-time blob holds
+    /// them; the unit decodes a second, independent set of functions.
+    fn unit_of(src: &str) -> (Vec<Rc<Function>>, Rc<crate::snapshot::SplitUnit>) {
         let body =
             crate::parser::with_eager_bodies(|| crate::parser::parse_script(src, false)).unwrap();
-        let (_, funcs) = crate::snapshot::encode_stripped_with_functions(&body);
-        (body, funcs)
+        let unit = crate::snapshot::encode_split(&body, None);
+        let ast: &'static [u8] = Box::leak(unit.ast.into_boxed_slice());
+        let bodies: &'static [u8] = Box::leak(unit.bodies.into_boxed_slice());
+        let split = crate::snapshot::SplitUnit::new(
+            ast,
+            Rc::from(""),
+            None,
+            Box::new(move |start, len| Ok(std::borrow::Cow::Borrowed(&bodies[start..start + len]))),
+        )
+        .unwrap();
+        (unit.funcs, split)
+    }
+
+    /// Attach `section` to `unit` and decode all its functions: `(functions, chunks
+    /// registered, refusals attached)`.
+    fn attach_all(section: &'static [u8], unit: &Rc<crate::snapshot::SplitUnit>) -> (Vec<Rc<Function>>, usize, usize) {
+        attach_unit(section, unit).unwrap();
+        let funcs = unit.all_functions().unwrap();
+        let chunks = funcs
+            .iter()
+            .filter(|f| with_lazy(|l| l.borrow().contains_key(&Rc::as_ptr(f))))
+            .count();
+        let refusals = funcs.iter().filter(|f| matches!(f.code.get(), Some(None))).count();
+        (funcs, chunks, refusals)
     }
 
     #[test]
@@ -1167,15 +1306,15 @@ mod tests {
             function refused(o) { with (o) { return x; } }
             function sw(x) { switch (x) { case 1: return 'a'; default: return 'b'; } }
         "#;
-        let (_body, funcs) = funcs_of(src);
+        let (funcs, unit) = unit_of(src);
         let (section, stats) = encode_unit(&funcs);
         assert!(stats.chunks >= 7, "{stats:?}");
         assert!(stats.refused >= 1, "the `with` body is refused: {stats:?}");
         // Decode against a second, independent parse of the same program.
         let section: &'static [u8] = Box::leak(section.into_boxed_slice());
-        let (_body2, funcs2) = funcs_of(src);
-        let (chunks, refusals) = attach_unit(section, &funcs2, true).unwrap();
+        let (funcs2, chunks, refusals) = attach_all(section, &unit);
         assert_eq!((chunks, refusals), (stats.chunks, stats.refused));
+        funcs2.iter().for_each(attach_now);
         let (compared, confirmed) = verify_unit(&funcs2).unwrap();
         assert_eq!((compared, confirmed), (chunks, refusals));
     }
@@ -1183,11 +1322,10 @@ mod tests {
     #[test]
     fn lazily_registered_chunks_decode_on_first_compile() {
         let src = "function f(a) { let s = 0; for (const x of a) s += x; return s; } function g() { return () => f([1, 2]); } function* h() {}";
-        let (_b, funcs) = funcs_of(src);
+        let (funcs, unit) = unit_of(src);
         let (section, stats) = encode_unit(&funcs);
         let section: &'static [u8] = Box::leak(section.into_boxed_slice());
-        let (_b2, funcs2) = funcs_of(src);
-        let (chunks, refusals) = attach_unit(section, &funcs2, false).unwrap();
+        let (funcs2, chunks, refusals) = attach_all(section, &unit);
         assert_eq!((chunks, refusals), (stats.chunks, stats.refused));
         let fn_index: HashMap<*const Function, u32> = funcs2
             .iter()
@@ -1215,22 +1353,29 @@ mod tests {
     }
 
     #[test]
+    fn run_once_functions_are_left_to_the_tree_walker() {
+        let src = r#"var a = function () { "lumen:run-once"; for (;;) break; }; var b = function () { for (;;) break; };"#;
+        let (funcs, unit) = unit_of(src);
+        let (section, stats) = encode_unit(&funcs);
+        assert_eq!((stats.chunks, stats.refused), (1, 1), "{stats:?}");
+        let section: &'static [u8] = Box::leak(section.into_boxed_slice());
+        let (funcs2, chunks, refusals) = attach_all(section, &unit);
+        assert_eq!((chunks, refusals), (1, 1));
+        assert!(matches!(funcs2[0].code.get(), Some(None)));
+    }
+
+    #[test]
     fn corrupt_sections_are_errors_not_panics() {
-        let (_b, funcs) =
-            funcs_of("function f(a) { return a * 2 + 1; } function g() { return f(3); }");
+        let (funcs, unit) =
+            unit_of("function f(a) { return a * 2 + 1; } function g() { return f(3); }");
         let (section, _) = encode_unit(&funcs);
         let section: &'static [u8] = Box::leak(section.into_boxed_slice());
         for cut in 0..section.len() {
-            let (_b2, funcs2) =
-                funcs_of("function f(a) { return a * 2 + 1; } function g() { return f(3); }");
-            assert!(
-                attach_unit(&section[..cut], &funcs2, true).is_err(),
-                "cut at {cut}"
-            );
+            assert!(attach_unit(&section[..cut], &unit).is_err(), "cut at {cut}");
         }
-        let (_b3, other) = funcs_of("function f() {}");
+        let (_, other) = unit_of("function f() {}");
         assert!(
-            attach_unit(section, &other, true).is_err(),
+            attach_unit(section, &other).is_err(),
             "function count mismatch"
         );
     }

@@ -1,0 +1,1 @@
+ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX The angle-bracket syntax for type assertions, `<T>expr`, is not supported in type strip mode. Instead, use the 'as' syntax: `expr as T`.

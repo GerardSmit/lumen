@@ -36,7 +36,7 @@ const result: Numeric = (increment(add(start, 1)) as number) satisfies Numeric;
 return result;`;
         const stripped = stripTypeScriptTypes(typed, { sourceUrl: "fixture.ts" });
         console.log("shape", stripped.split("\n").length === typed.split("\n").length + 2,
-                    stripped.includes("//# sourceURL=fixture.ts;"));
+                    stripped.endsWith("//# sourceURL=fixture.ts"));
         console.log("result", new Function(stripped)());
         try { stripTypeScriptTypes("enum Direction { Up, Down }"); }
         catch (error) { console.log("enum", error.code); }

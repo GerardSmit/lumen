@@ -81,7 +81,8 @@ pub(crate) enum Helper {
     /// `(frame, n: u32, src, init: u32) -> status` — `StoreCap(n)` (`StoreCapInit` when `init`)
     /// of the consumed `src`.
     StoreCap,
-    /// `(frame, base: u32, argc: u32, with_this: u32) -> status` — `Call(argc)` (receiver
+    /// `(frame, base: u32, argc: u32, flags: u32) -> status` (flags: 1 = with `this`, plus
+    /// [`CALL_AWAIT`]) — `Call(argc)` (receiver
     /// `undefined`, callee at `stack[base]`) or `CallWithThis(argc)` (receiver at `stack[base]`,
     /// callee at `stack[base + 1]`), arguments following. Consumes all of them and leaves the
     /// result at `stack[base]` (`Undefined` there on a throw).
@@ -145,12 +146,92 @@ pub(crate) enum Helper {
     SiteFailed,
     /// `(p: *mut Value, n: u32)` — drop `n` values in place, leaving `Undefined`.
     DropN,
+    /// `(frame, cell: *mut SiteCell, callee: *const Value) -> 0/1` — rebind a direct call
+    /// site's cache to `callee` when it is another function object with the site's code. Pure.
+    SiteRebind,
+    /// `(frame, cell: *const SiteCell, out: *mut Value)` — `[[Construct]]` of a direct `new`
+    /// site's constructor (`cell.pin`): the new instance (OrdinaryCreateFromConstructor, the
+    /// learned capacity) into `out`, and `new.target` set to the constructor. Pure.
+    NewThis,
+    /// `(frame, cell, inst: *mut Value, res: *mut Value, status: u32)` — finish a direct `new`:
+    /// `new.target` back to `undefined`; on success the size hint is recorded and a non-object
+    /// `*res` replaced by the instance (consumed). Pure.
+    NewDone,
+    /// `(frame) -> status` — count a call for the amortized collector poll (and poll when due),
+    /// as `Interp::call` does: the `[[Construct]]` path does not count its calls, and a direct
+    /// `new` site whose poll is due waits on the count moving. Runs JS (finalizers, interrupts).
+    GcPoll,
+    /// `(frame, d: u32, y: *const Value) -> 0/1` — `slots[d] += y` for a string slot, appending
+    /// in place (the interpreter's `append_to_slot`); 0 when not applicable (nothing touched).
+    /// Pure.
+    AppendLocal,
+    /// `(frame, obj: *mut Value, key: f64, dst: *mut Value, consume: u32) -> 0/1` — `obj[key]`
+    /// through the interpreter's element fast paths (a one-unit string of an ASCII string, an
+    /// own data element of a plain object or array, a typed-array element): 1 with the value
+    /// in `dst` (and `obj` consumed when `consume`), 0 when not applicable (nothing touched).
+    /// Pure.
+    ElemGet,
+    /// `(frame, a: *mut Value, b: *mut Value) -> 0/1` — `a === b`, consuming both. Pure.
+    StrictEq,
+    /// `(frame, a: *const Value, b: *const Value) -> 0/1/2` — `a === b` of borrowed values; 2
+    /// when either is a TDZ marker (the ordinary path throws). Pure.
+    StrictEqRef,
+    /// `(dst: *mut Value, bits: u64, consume: u32)` — the `Value` of a refcounted NaN-boxed
+    /// property word (a new reference) into `dst`; with `consume`, `dst` holds the receiver it
+    /// was read from, dropped first (after the value is taken). Pure.
+    UnpackClone,
+    /// `(frame, pc: u32, base: *mut Value, n: u32)` — the `MakeArray(n)` / `MakeObject` literal
+    /// at `pc` from the `n` values at `base` (consumed), the result into `base`. Pure.
+    MakeLit,
+    /// `(frame, dst: *mut Value, src: *mut Value, n: u32)` — a rest parameter's array from the
+    /// `n` surplus arguments at `src` (consumed) into slot `dst` (trivially droppable). Pure.
+    MakeRest,
+    /// `(frame, cell: *const PlanCell, out: *mut Value, consume: u32) -> *mut Property` — see
+    /// `build::new_plan::new_plan_helper`. Pure.
+    NewPlan,
+    /// `(frame, pc: u32, recv: *const Value) -> 0/1` — whether the `GetMethod` at `pc` on
+    /// `recv` reads the intrinsic `String.prototype` method (see [`str_check`]); a failure is
+    /// remembered for the site. Pure.
+    StrGuard,
+    /// `(frame, s: *const Value, pos: f64) -> f64` — `s.charCodeAt(pos)` of a String `s`. Pure.
+    StrCodeAt,
+    /// `(frame, fidx: u32, name: u32, dst: *mut Value)` — `MakeClosure(fidx, name)` in the
+    /// frame's env into `dst` (a trivially droppable operand-stack entry). Pure.
+    MakeClosure,
+    /// `(frame, template: *const Props, base: *mut Value, n: u32)` — a `MakeObject` literal
+    /// whose template instantiates in one box ([`Props::fast_template`]): the `n` values at
+    /// `base` (consumed) as its properties, the object into `base`. Pure.
+    AllocObj,
+    /// `(frame, base: *mut Value, n: u32)` — a `MakeArray(n)` literal of the `n` values at
+    /// `base` (consumed), the array into `base`. Pure.
+    AllocArr,
+    /// `(frame, dst: u32, parent: u32)` — `BlkNew(dst, parent)`. Pure.
+    BlkNew,
+    /// `(frame, slot: u32)` — `BlkCopy(slot)`. Pure.
+    BlkCopy,
+    /// `(frame, slot: u32, name: u32, is_const: u32)` — `BlkDecl`. Pure.
+    BlkDecl,
+    /// `(frame, slot: u32, name: u32, dst: *mut Value) -> status` — `BlkLoad` into `dst`
+    /// (throws in the TDZ). Pure.
+    BlkLoad,
+    /// `(frame, slot: u32, name: u32, src: *mut Value, init: u32) -> status` — `BlkInit` /
+    /// `BlkStore` of the value at `src` (moved out; `undefined` left there). Pure.
+    BlkStore,
+    /// `(frame, slot: u32, fidx: u32, name: u32, dst: *mut Value)` — `InEnv(slot)` +
+    /// `MakeClosure(fidx, name)`: the closure over the block env in `slot`, into `dst`. Pure.
+    MakeClosureIn,
+    /// `(frame, pc: u32, dst: *mut Value) -> status` — the `BlkUpdate` at `pc`, its result (if
+    /// it pushes one) into `dst`. Pure.
+    BlkUpdate,
+    /// `(arr: *const Value, v: *mut Value)` — `ArrayAppend`: move `*v` (left `Undefined`) onto
+    /// the end of the array literal `*arr`. No frame, no status (never throws, runs no JS).
+    ArrayAppend,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 32] = [
+pub(crate) const ALL: [Helper; 57] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -183,6 +264,31 @@ pub(crate) const ALL: [Helper; 32] = [
     Helper::PopFnFrame,
     Helper::SiteFailed,
     Helper::DropN,
+    Helper::SiteRebind,
+    Helper::NewThis,
+    Helper::NewDone,
+    Helper::GcPoll,
+    Helper::AppendLocal,
+    Helper::ElemGet,
+    Helper::StrictEq,
+    Helper::StrictEqRef,
+    Helper::UnpackClone,
+    Helper::MakeLit,
+    Helper::MakeRest,
+    Helper::NewPlan,
+    Helper::StrGuard,
+    Helper::StrCodeAt,
+    Helper::MakeClosure,
+    Helper::AllocObj,
+    Helper::AllocArr,
+    Helper::BlkNew,
+    Helper::BlkCopy,
+    Helper::BlkDecl,
+    Helper::BlkLoad,
+    Helper::BlkStore,
+    Helper::MakeClosureIn,
+    Helper::BlkUpdate,
+    Helper::ArrayAppend,
 ];
 
 /// The IR signature of `h`.
@@ -220,6 +326,31 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::PopFnFrame => (&[P], &[]),
         Helper::SiteFailed => (&[P, I32], &[]),
         Helper::DropN => (&[P, I32], &[]),
+        Helper::SiteRebind => (&[P, P, P], &[I32]),
+        Helper::NewThis => (&[P, P, P], &[]),
+        Helper::NewPlan => (&[P, P, P, I32], &[P]),
+        Helper::NewDone => (&[P, P, P, P, I32], &[]),
+        Helper::GcPoll => (&[P], &[I32]),
+        Helper::AppendLocal => (&[P, I32, P], &[I32]),
+        Helper::ElemGet => (&[P, P, F64, P, I32], &[I32]),
+        Helper::StrictEq => (&[P, P, P], &[I32]),
+        Helper::StrictEqRef => (&[P, P, P], &[I32]),
+        Helper::UnpackClone => (&[P, I64, I32], &[]),
+        Helper::MakeLit => (&[P, I32, P, I32], &[]),
+        Helper::MakeRest => (&[P, P, P, I32], &[]),
+        Helper::StrGuard => (&[P, I32, P], &[I32]),
+        Helper::StrCodeAt => (&[P, P, F64], &[F64]),
+        Helper::MakeClosure => (&[P, I32, I32, P], &[]),
+        Helper::AllocObj => (&[P, P, P, I32], &[]),
+        Helper::AllocArr => (&[P, P, I32], &[]),
+        Helper::BlkNew => (&[P, I32, I32], &[]),
+        Helper::BlkCopy => (&[P, I32], &[]),
+        Helper::BlkDecl => (&[P, I32, I32, I32], &[]),
+        Helper::BlkLoad => (&[P, I32, I32, P], &[I32]),
+        Helper::BlkStore => (&[P, I32, I32, P, I32], &[I32]),
+        Helper::MakeClosureIn => (&[P, I32, I32, I32, P], &[]),
+        Helper::BlkUpdate => (&[P, I32, P], &[I32]),
+        Helper::ArrayAppend => (&[P, P], &[]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -260,7 +391,41 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::PopFnFrame => pop_fn_frame as *const () as usize,
         Helper::SiteFailed => site_failed as *const () as usize,
         Helper::DropN => drop_n as *const () as usize,
+        Helper::SiteRebind => site_rebind as *const () as usize,
+        Helper::NewThis => new_this as *const () as usize,
+        Helper::NewPlan => super::build::new_plan::new_plan_helper as *const () as usize,
+        Helper::StrGuard => str_guard as *const () as usize,
+        Helper::StrCodeAt => str_code_at as *const () as usize,
+        Helper::MakeClosure => make_closure as *const () as usize,
+        Helper::AllocObj => alloc_obj as *const () as usize,
+        Helper::AllocArr => alloc_arr as *const () as usize,
+        Helper::BlkNew => blk_new as *const () as usize,
+        Helper::BlkCopy => blk_copy as *const () as usize,
+        Helper::BlkDecl => blk_decl as *const () as usize,
+        Helper::BlkLoad => blk_load as *const () as usize,
+        Helper::BlkStore => blk_store as *const () as usize,
+        Helper::MakeClosureIn => make_closure_in as *const () as usize,
+        Helper::BlkUpdate => blk_update as *const () as usize,
+        Helper::NewDone => new_done as *const () as usize,
+        Helper::GcPoll => gc_poll as *const () as usize,
+        Helper::AppendLocal => append_local as *const () as usize,
+        Helper::ElemGet => elem_get as *const () as usize,
+        Helper::StrictEq => strict_eq as *const () as usize,
+        Helper::StrictEqRef => strict_eq_ref as *const () as usize,
+        Helper::UnpackClone => unpack_clone as *const () as usize,
+        Helper::MakeLit => make_lit as *const () as usize,
+        Helper::MakeRest => make_rest as *const () as usize,
+        Helper::ArrayAppend => array_append as *const () as usize,
     } as u64)
+}
+
+/// [`Helper::ArrayAppend`].
+unsafe extern "C" fn array_append(arr: *const Value, v: *mut Value) {
+    let v = std::ptr::replace(v, Value::Undefined);
+    match &*arr {
+        Value::Obj(ao) => crate::bytecode::ext_ops::append_to(ao, std::iter::once(v), false),
+        _ => unreachable!("array literal under construction"),
+    }
 }
 
 // Stable operator codes for `Helper::Binary`, independent of `Op`'s discriminants.
@@ -417,19 +582,47 @@ pub(crate) fn generic_ok(op: &Op) -> bool {
         | PushHandler(_)
         | PopHandler
         | SwitchLK(..)
-        | SuperCtor
-        | SuperCall(_)
-        | SuperCallSpread(_)
         | DerivedReturn
         | InitialYield
         | Yield
-        | YieldDelegate(_) => false,
+        | YieldDelegate(_)
+        | IterRestL(..)
+        | GetAsyncIter
+        | AsyncIterNext(..)
+        | AsyncIterResult(_)
+        | AsyncCloseCall(..)
+        | AsyncCloseCheck(_)
+        | AsyncDelegateInit
+        | AsyncDelegateCall(..)
+        | AsyncDelegateResult(..)
+        | AsyncDelegateCloseReject(..)
+        | AsyncDelegateSpecial(..) => false,
+        // The callee from the reflection frame (`LoadCallee` syncs the pending direct-call
+        // records first, see `super::sync_frames`).
+        LoadCallee => true,
+        // Block envs: a carrier slot is touched by these ops only (never modeled in SSA, see
+        // `build::op_slots`), so its memory is authoritative. `InEnv` runs together with the
+        // closure-creating op after it (see `build`).
+        BlkNew(..) | BlkDecl(..) | BlkCopy(_) | BlkLoad(..) | BlkStore(..) | BlkInit(..)
+        | BlkUpdate(..) | InEnv(_) => true,
+        // A proper tail call run as a generic call-out: an ordinary call, or (deep in tail
+        // recursion) `Interp::pending_tail` for the caller's trampoline, with the `Return`
+        // after it returning the pushed `undefined` (see `call`'s `DSite::tails`).
+        TailCall(..) | TailCallSpread(..) => true,
+        NewSpread(_) => true,
+        ImportCall(..) => true,
+        // Inlined array callbacks (see `bytecode::inline_callback`): stack-only.
+        ArrayCbGuard(_) | ArrayCbHas | ArrayCbDone(_) => true,
+        // `super(…)`: the parent construct runs as the interpreter's op.
+        SuperCtor | SuperCall(_) | SuperCallSpread(_) => true,
         // The widened subset (bytecode/ext_ops.rs): operand/env/this-only helpers.
         GetPrivate(_) | SetPrivate(_) | GetPrivateMethod(_) | PrivateIn(_)
         | UpdatePrivate(..) | NewObject | InitProp(..) | InitPropComputed(_)
         | InitMethod(..) | CopyDataProps | SetProtoLit | MakeClass(..) | Nip | SuperGet(_)
         | SuperGetElem | SuperBase | SuperMethod(..) | SuperMethodElem(_) | ObjRest(..)
         | NewArrayLit | ArrayAppend | ArrayAppendSpread | ArrayHole => true,
+        // Class field DefineField (bytecode/class_fields.rs): operands only.
+        DefineField(..) => true,
     }
 }
 
@@ -446,6 +639,7 @@ pub(crate) fn generic_slot_ok(op: &Op) -> bool {
             | SetElemLocalDrop(_)
             | ToPropKeyLocal(_)
             | IterCloseL(_)
+            | IterRestL(..)
     )
 }
 
@@ -522,6 +716,24 @@ pub(crate) unsafe extern "C" fn binary(
         if let Some(v) = binary_num(op, *x, *y) {
             std::ptr::write(dst, v);
             return STATUS_OK;
+        }
+    }
+    // Other primitives whose ToPrimitive / ToNumber is plain (`undefined`, `null`, booleans —
+    // `x + undefined` for a missing argument, say): the Number operation on their values.
+    // (Not the equality operators, which do not convert these.)
+    let prim = |v: &Value| match v {
+        Value::Num(x) => Some(*x),
+        Value::Undefined => Some(f64::NAN),
+        Value::Null => Some(0.0),
+        Value::Bool(b) => Some(*b as u8 as f64),
+        _ => None,
+    };
+    if !matches!(op, BIN_EQEQ | BIN_NOTEQ | BIN_STRICTEQ | BIN_STRICTNOTEQ) {
+        if let (Some(x), Some(y)) = (prim(&a), prim(&b)) {
+            if let Some(v) = binary_num(op, x, y) {
+                std::ptr::write(dst, v);
+                return STATUS_OK;
+            }
         }
     }
     let i = &mut *(*f).interp;
@@ -771,15 +983,23 @@ pub(crate) unsafe extern "C" fn store_cap(
     }
 }
 
+/// [`Helper::Call`]'s flag bit: the result feeds straight into an `await`.
+pub(crate) const CALL_AWAIT: u32 = 2;
+/// [`Helper::Call`]'s flag bit: the op is a proper tail call (`Op::TailCall`). Past
+/// `TAIL_NEST` in a frame that may tail-call, the call is parked in `Interp::pending_tail` for
+/// the caller's trampoline and `undefined` stands in for its result (the `Return` after the op
+/// returns it), as the interpreter's generic call-out of the op does.
+pub(crate) const CALL_TAIL: u32 = 4;
+
 pub(crate) unsafe extern "C" fn call(
     f: *mut JitFrame,
     base: u32,
     argc: u32,
-    with_this: u32,
+    flags: u32,
 ) -> u32 {
     let s = (*f).stack;
     let (base, argc) = (base as usize, argc as usize);
-    let (this, callee, at) = if with_this != 0 {
+    let (this, callee, at) = if flags & 1 != 0 {
         (
             std::ptr::replace(s.add(base), Value::Undefined),
             std::ptr::replace(s.add(base + 1), Value::Undefined),
@@ -793,16 +1013,62 @@ pub(crate) unsafe extern "C" fn call(
         )
     };
     let i = &mut *(*f).interp;
+    if flags & CALL_TAIL != 0
+        && i.tco_ok
+        && i.depth > crate::bytecode::TAIL_NEST
+        && callee.is_callable()
+        && i.leaf_native(&callee).is_none()
+    {
+        let args = (0..argc).map(|k| std::ptr::replace(s.add(at + k), Value::Undefined)).collect();
+        i.pending_tail = Some(Box::new((callee, this, args)));
+        std::ptr::write(s.add(base), Value::Undefined);
+        return STATUS_OK;
+    }
+    // A plain native: straight to it (`Interp::call`'s bookkeeping without its dispatch).
+    if let Some(nat) = i.leaf_native(&callee) {
+        let args = std::slice::from_raw_parts(s.add(at), argc);
+        let r = i.call_native_fast(nat, this, args);
+        drop(callee);
+        for k in 0..argc {
+            *s.add(at + k) = Value::Undefined;
+        }
+        return match r {
+            Ok(v) => {
+                std::ptr::write(s.add(base), v);
+                STATUS_OK
+            }
+            Err(e) => fail(f, e),
+        };
+    }
     let r = match crate::bytecode::inline_callee(i, &callee) {
         Some(c) => match super::native_code(&c.chunk) {
-            Some(native) => call_native(i, callee, this, s.add(at), argc, c, native),
-            None => call_frame(i, callee, this, s.add(at), argc, c),
+            // A sloppy callee whose `f.arguments` may be read runs as a frame, which records
+            // its activation (see `bytecode::reflect`).
+            Some(native) if !(c.chunk.reflect_args && crate::bytecode::reflect::enabled()) => {
+                call_native(i, callee, this, s.add(at), argc, c, native)
+            }
+            _ => call_frame(i, callee, this, s.add(at), argc, c),
         },
         None => {
             // The arguments stay owned by the frame's stack for the call (they root their
             // objects there, like the interpreter's operand stack does), then are dropped.
             let args = std::slice::from_raw_parts(s.add(at), argc);
-            let r = i.call(callee, this, args);
+            let r = if callee.is_callable() {
+                // `await f()`: an async callee may skip its promise (the interpreter's fusion).
+                let fused = flags & CALL_AWAIT != 0;
+                if fused {
+                    i.note_await_call(&callee);
+                }
+                let r = i.call(callee, this, args);
+                if fused {
+                    i.clear_await_call();
+                }
+                r
+            } else {
+                // The TypeError names the callee as written (`bytecode::call_error`).
+                i.call(callee.clone(), this, args)
+                    .map_err(|e| crate::bytecode::site_call_error(i, &*(*f).chunk, &callee, e))
+            };
             for k in 0..argc {
                 *s.add(at + k) = Value::Undefined;
             }
@@ -882,7 +1148,12 @@ unsafe fn call_frame(
         match i.pending_tail.take() {
             Some(bx) => {
                 let (g, t, a) = *bx;
+                // The strict tail caller is gone: hidden from `fn.caller` (like the
+                // interpreter's trampolines).
+                let site = i.cur_site;
+                i.cur_site = site | crate::interpreter::frames::SITE_NATIVE;
                 r = i.call(g, t, &a);
+                i.cur_site = site;
             }
             None => break,
         }
@@ -936,10 +1207,13 @@ unsafe fn call_native(
         Value::Obj(o) => crate::value::Gc::as_ptr(o) as usize,
         _ => unreachable!("inline callee is a function object"),
     };
+    super::sync_frames(i);
     i.fn_frames.push(crate::interpreter::FnFrame {
         fn_ptr,
         coro: i.cur_coro,
+        caller_site: std::mem::replace(&mut i.cur_site, crate::interpreter::frames::NO_SITE),
         strict: c.strict,
+        construct: false,
         extra: None,
     });
     let this_val = if chunk.uses_this() {
@@ -986,7 +1260,7 @@ unsafe fn call_native(
     // --- run ---
     let mut stack: Vec<Value> = Vec::new();
     let mut pc = 0usize;
-    let r = match super::enter(i, chunk, &env, slots, &mut stack, &mut pc, &this_val, None, &native)
+    let r = match super::enter(i, chunk, &env, slots, &mut stack, &mut pc, &this_val, None, &native, 0)
     {
         Ok(Some(step)) => Ok(step),
         Ok(None) => {
@@ -1008,6 +1282,7 @@ unsafe fn call_native(
     i.in_field_init_code = saved_field_init;
     i.in_async_gen_body = saved_agb;
     let top = i.fn_frames.len() - 1;
+    i.cur_site = i.fn_frames[top].caller_site;
     if i.fn_frames[top].extra.is_some() {
         i.fn_frames.truncate(top);
     } else {
@@ -1029,7 +1304,12 @@ unsafe fn call_native(
         match i.pending_tail.take() {
             Some(bx) => {
                 let (g, t, a) = *bx;
+                // The strict tail caller is gone: hidden from `fn.caller` (like the
+                // interpreter's trampolines).
+                let site = i.cur_site;
+                i.cur_site = site | crate::interpreter::frames::SITE_NATIVE;
                 r = i.call(g, t, &a);
+                i.cur_site = site;
             }
             None => break,
         }
@@ -1213,6 +1493,79 @@ pub(crate) unsafe extern "C" fn math_guard(f: *mut JitFrame, pc: u32) -> u32 {
     0
 }
 
+// ---- String intrinsics -------------------------------------------------------------------------
+
+/// The `String.prototype` method called `name` the translator emits inline.
+pub(crate) fn str_intrinsic(name: &str) -> Option<crate::value::NativeFn> {
+    match name {
+        "charCodeAt" => Some(crate::builtins::nf_char_code_at),
+        _ => None,
+    }
+}
+
+/// Whether `GetMethod(m, _)` at `pc` on `recv` reads the intrinsic method: `recv` is a
+/// primitive String (whose own properties are indices and `length`, so the lookup goes to
+/// `String.prototype`), one realm, and `String.prototype`'s own data property `m` holds the
+/// builtin.
+unsafe fn str_check(f: *mut JitFrame, pc: usize, recv: &Value) -> Option<()> {
+    if !matches!(recv, Value::Str(_)) {
+        return None;
+    }
+    let i = &*(*f).interp;
+    if i.multi_realm() {
+        return None;
+    }
+    let chunk = &*(*f).chunk;
+    let Op::GetMethod(m, _) = *chunk.ops.get(pc)? else {
+        return None;
+    };
+    let name = chunk.names.get(m as usize)?;
+    let want = str_intrinsic(name)?;
+    let fv = {
+        let sb = i.string_proto.try_borrow().ok()?;
+        // `String.prototype` is itself a String wrapper (of ""): its named properties are
+        // ordinary.
+        if !matches!(sb.exotic, crate::value::Exotic::None | crate::value::Exotic::StrWrap) {
+            return None;
+        }
+        let p = sb.props.entry_at(sb.props.slot_of(name)?)?;
+        if p.accessor() {
+            return None;
+        }
+        p.value()
+    };
+    let Value::Obj(fo) = fv else { return None };
+    let fb = fo.try_borrow().ok()?;
+    match fb.call {
+        crate::value::Callable::Native(fp) if fp as usize == want as usize => Some(()),
+        _ => None,
+    }
+}
+
+pub(crate) unsafe extern "C" fn str_guard(f: *mut JitFrame, pc: u32, recv: *const Value) -> u32 {
+    if str_check(f, pc as usize, &*recv).is_some() {
+        return 1;
+    }
+    let key = ((*f).chunk as usize, pc);
+    MATH_FAILED.with(|s| {
+        s.borrow_mut().insert(key);
+    });
+    0
+}
+
+/// `String.prototype.charCodeAt` on String `s` with Number `pos` (its ToNumber is itself).
+pub(crate) unsafe extern "C" fn str_code_at(f: *mut JitFrame, s: *const Value, pos: f64) -> f64 {
+    let Value::Str(s) = &*s else { return f64::NAN };
+    let idx = if pos.is_nan() { 0.0 } else { pos.trunc() };
+    if idx < 0.0 || !idx.is_finite() {
+        return f64::NAN;
+    }
+    match (*(*f).interp).unit_at(s, idx as usize) {
+        Some(u) => f64::from(u),
+        None => f64::NAN,
+    }
+}
+
 // ---- fast native ops, handlers and iteration ------------------------------------------------
 
 /// An unboxed argument / result kind of a `#[op(fast)]` entry (`embed::FastKind`, which only
@@ -1353,7 +1706,22 @@ pub(crate) unsafe extern "C" fn iter_step(f: *mut JitFrame, is: u32, ns: u32, ds
         return ITER_THREW;
     }
     let i = &mut *(*f).interp;
-    let (it, nx) = (&*(*f).slots.add(is), &*(*f).slots.add(ns));
+    let (it, nx) = (&mut *(*f).slots.add(is), &mut *(*f).slots.add(ns));
+    // A protocol-free for-of state (bytecode::iter_fast): no user code, nothing to invalidate.
+    if is != ns {
+        match crate::bytecode::iter_fast::step(i, it, nx) {
+            Some(Some(v)) => {
+                std::ptr::write(dst, v);
+                return 1;
+            }
+            Some(None) => {
+                std::ptr::write(dst, Value::Undefined);
+                return 0;
+            }
+            None => {}
+        }
+    }
+    let (it, nx) = (&*it, &*nx);
     // The pure fast path borrows the slots; the full protocol runs on owned clones (the
     // callbacks may reassign anything).
     if let Some(v) = crate::bytecode::array_iterator_step::try_yield(i, it, nx) {
@@ -1391,9 +1759,78 @@ pub(crate) mod ta_code {
     pub const F64: u32 = 9;
     /// One past the largest code.
     pub const END: u32 = 10;
+    /// A site without a view cache fed typed arrays often enough: exit before the op and
+    /// recompile it with a cache (see [`super::ta_hot`]).
+    pub const RECOMPILE: u32 = 0xfe;
+}
+
+/// Fresh typed-array views an element site without a view cache takes before it asks for a
+/// recompile with one.
+const TA_HOT_VIEWS: u32 = 128;
+
+thread_local! {
+    /// Fresh views taken per uncached element site `(chunk, pc)`; `u32::MAX` once the site
+    /// is hot (compiled with a view cache from then on).
+    static TA_VIEWS: std::cell::RefCell<std::collections::HashMap<(usize, u32), u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// The site whose [`ta_code::RECOMPILE`] exit is pending (taken by the exit handling).
+    static TA_EXIT: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, u32::MAX)) };
+}
+
+/// Whether element site `pc` of `chunk` was fed typed arrays through fresh views (no cache)
+/// often: it is compiled typed-array first, with a view cache.
+pub(crate) fn ta_hot(chunk: &Chunk, pc: usize) -> bool {
+    TA_VIEWS.with(|m| {
+        m.borrow()
+            .get(&(chunk as *const Chunk as usize, pc as u32))
+            .is_some_and(|&n| n == u32::MAX)
+    })
+}
+
+/// Whether the resume exit at `pc` is the [`ta_code::RECOMPILE`] exit of that site (then the
+/// code is retired and recompiled).
+pub(crate) fn take_ta_exit(chunk: &Chunk, pc: usize) -> bool {
+    let key = (chunk as *const Chunk as usize, pc as u32);
+    TA_EXIT.with(|c| {
+        if c.get() == key {
+            c.set((0, u32::MAX));
+            true
+        } else {
+            false
+        }
+    })
 }
 
 pub(crate) unsafe extern "C" fn ta_view(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
+    let code = ta_view_code(f, v, write & 1);
+    // An uncached site (`write` bit 1, its pc above): count the fresh views it takes.
+    if code != 0 && write & 2 != 0 {
+        let key = ((*f).chunk as usize, write >> 2);
+        let hot = TA_VIEWS.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= 1 << 16 && !m.contains_key(&key) {
+                return false;
+            }
+            let n = m.entry(key).or_insert(0);
+            if *n == u32::MAX {
+                return false;
+            }
+            *n += 1;
+            if *n < TA_HOT_VIEWS {
+                return false;
+            }
+            *n = u32::MAX;
+            true
+        });
+        if hot {
+            TA_EXIT.with(|c| c.set(key));
+            return ta_code::RECOMPILE;
+        }
+    }
+    code
+}
+
+unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
     use crate::value::TaKind;
     let Value::Obj(o) = &*v else { return 0 };
     let i = &mut *(*f).interp;
@@ -1443,9 +1880,9 @@ pub(crate) unsafe extern "C" fn ta_length(f: *mut JitFrame, v: *const Value) -> 
     let Some(info) = i.typed_arrays.get(&(crate::value::Gc::as_ptr(o) as usize)) else {
         return -1.0;
     };
-    // `Interp::get`'s typed-array case: an own `length` shadows the computed one.
+    // `Interp::get`'s typed-array case: only while `length` reaches the intrinsic getter.
     match o.try_borrow() {
-        Ok(b) if !b.props.contains("length") => i.ta_len(info).unwrap_or(0) as f64,
+        Ok(b) if i.ta_meta_intrinsic(&b, 0) => i.ta_len(info).unwrap_or(0) as f64,
         _ => -1.0,
     }
 }
@@ -1527,6 +1964,9 @@ pub(crate) unsafe extern "C" fn call_finish(
     for v in slots.iter_mut() {
         drop(std::mem::take(v));
     }
+    // The header's 16-byte-aligned words stay trivially droppable (see `JitFrame`).
+    (*nf).exit_depth = 0;
+    (*nf).exit_hset = 0;
     let mut r = match r {
         Ok(VmStep::Done(v)) => Ok(v),
         Ok(VmStep::Await(_)) => Err(i.throw("TypeError", "compiled code awaited in a call")),
@@ -1537,7 +1977,12 @@ pub(crate) unsafe extern "C" fn call_finish(
         match i.pending_tail.take() {
             Some(bx) => {
                 let (g, t, a) = *bx;
+                // The strict tail caller is gone: hidden from `fn.caller` (like the
+                // interpreter's trampolines).
+                let site = i.cur_site;
+                i.cur_site = site | crate::interpreter::frames::SITE_NATIVE;
                 r = i.call(g, t, &a);
+                i.cur_site = site;
             }
             None => break,
         }
@@ -1565,7 +2010,10 @@ pub(crate) unsafe extern "C" fn name_word(f: *mut JitFrame, n: u32, c: u32) -> u
 }
 
 pub(crate) unsafe extern "C" fn pop_fn_frame(f: *mut JitFrame) {
-    (*(*f).interp).fn_frames.pop();
+    let i = &mut *(*f).interp;
+    if let Some(fr) = i.fn_frames.pop() {
+        i.cur_site = fr.caller_site;
+    }
 }
 
 pub(crate) unsafe extern "C" fn site_failed(f: *mut JitFrame, pc: u32) {
@@ -1579,4 +2027,296 @@ pub(crate) unsafe extern "C" fn drop_n(p: *mut Value, n: u32) {
     for k in 0..n as usize {
         drop(std::ptr::replace(p.add(k), Value::Undefined));
     }
+}
+
+pub(crate) unsafe extern "C" fn site_rebind(
+    f: *mut JitFrame,
+    cell: *mut super::SiteCell,
+    v: *const Value,
+) -> u32 {
+    let i = &*(*f).interp;
+    let v = &*v;
+    let Some(ic) = crate::bytecode::inline_callee(i, v) else {
+        return 0;
+    };
+    if std::rc::Rc::as_ptr(&ic.chunk) as usize != (*cell).chunk {
+        return 0;
+    }
+    let Some((env, fn_ptr)) = super::callee_env_addr(v) else {
+        return 0;
+    };
+    (*cell).word = super::value_word(v);
+    (*cell).fn_ptr = fn_ptr;
+    (*cell).env = env;
+    (*cell).pin = v.clone();
+    1
+}
+
+pub(crate) unsafe extern "C" fn new_this(
+    f: *mut JitFrame,
+    cell: *const super::SiteCell,
+    out: *mut Value,
+) {
+    let i = &mut *(*f).interp;
+    let ctor = &(*cell).pin;
+    let Value::Obj(o) = ctor else {
+        std::ptr::write(out, Value::Undefined);
+        return;
+    };
+    // A user function's `prototype` is an own data property (non-configurable): read it in
+    // place rather than through a full `[[Get]]`.
+    let own = o
+        .try_borrow()
+        .ok()
+        .and_then(|b| b.props.get("prototype").filter(|p| !p.accessor()).map(|p| p.value()));
+    let proto = match own {
+        Some(v) => v,
+        None => i.get_member(ctor, "prototype").unwrap_or(Value::Undefined),
+    };
+    let proto = match proto {
+        Value::Obj(p) => p,
+        _ => i.object_proto.clone(),
+    };
+    let cap = i.learned_construct_capacity(o);
+    let inst = crate::value::Object::new_with_capacity(Some(proto), cap);
+    std::ptr::write(out, Value::Obj(inst));
+    let old = std::mem::replace(&mut i.new_target, ctor.clone());
+    drop(old);
+}
+
+pub(crate) unsafe extern "C" fn new_done(
+    f: *mut JitFrame,
+    cell: *const super::SiteCell,
+    inst: *mut Value,
+    res: *mut Value,
+    status: u32,
+) {
+    let i = &mut *(*f).interp;
+    let nt = std::mem::take(&mut i.new_target);
+    drop(nt);
+    let inst = std::ptr::replace(inst, Value::Undefined);
+    if status != STATUS_OK {
+        return;
+    }
+    if let (Value::Obj(c), Value::Obj(io)) = (&(*cell).pin, &inst) {
+        i.observe_construct_capacity(c, io);
+    }
+    if !matches!(*res, Value::Obj(_)) {
+        drop(std::ptr::replace(res, inst));
+    }
+}
+
+pub(crate) unsafe extern "C" fn gc_poll(f: *mut JitFrame) -> u32 {
+    match (*(*f).interp).gc_check_amortized() {
+        Ok(()) => STATUS_OK,
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn append_local(f: *mut JitFrame, d: u32, y: *const Value) -> u32 {
+    let chunk = &*(*f).chunk;
+    let d = d as usize;
+    if d >= chunk.n_slots {
+        return 0;
+    }
+    let slots = std::slice::from_raw_parts_mut((*f).slots, chunk.n_slots);
+    // `y` may be another slot: read it before the slots are borrowed mutably.
+    let y = (*y).clone();
+    crate::bytecode::append_to_slot(slots, d, &y) as u32
+}
+
+pub(crate) unsafe extern "C" fn elem_get(
+    f: *mut JitFrame,
+    obj: *mut Value,
+    key: f64,
+    dst: *mut Value,
+    consume: u32,
+) -> u32 {
+    let i = &mut *(*f).interp;
+    let v = match &*obj {
+        Value::Str(s) => crate::bytecode::str_index_fast(s, key),
+        Value::Obj(o) => i.fast_get_elem(o, key),
+        _ => None,
+    };
+    let Some(v) = v else { return 0 };
+    if consume != 0 {
+        drop(std::ptr::replace(obj, Value::Undefined));
+    }
+    std::ptr::write(dst, v);
+    1
+}
+
+pub(crate) unsafe extern "C" fn strict_eq(f: *mut JitFrame, a: *mut Value, b: *mut Value) -> u32 {
+    let a = std::ptr::replace(a, Value::Undefined);
+    let b = std::ptr::replace(b, Value::Undefined);
+    (*(*f).interp).strict_equals(&a, &b) as u32
+}
+
+pub(crate) unsafe extern "C" fn strict_eq_ref(
+    f: *mut JitFrame,
+    a: *const Value,
+    b: *const Value,
+) -> u32 {
+    let (a, b) = (&*a, &*b);
+    if matches!(a, Value::Empty) || matches!(b, Value::Empty) {
+        return 2;
+    }
+    (*(*f).interp).strict_equals(a, b) as u32
+}
+
+pub(crate) unsafe extern "C" fn unpack_clone(dst: *mut Value, bits: u64, consume: u32) {
+    // SAFETY: `bits` is a live property's word (`PackedValue` is a transparent `u64`); the
+    // `ManuallyDrop` keeps the property's own reference, `unpack` takes a new one.
+    let word = std::mem::ManuallyDrop::new(std::mem::transmute::<u64, crate::value::PackedValue>(bits));
+    let v = word.unpack();
+    if consume != 0 {
+        drop(std::ptr::replace(dst, Value::Undefined));
+    }
+    std::ptr::write(dst, v);
+}
+
+pub(crate) unsafe extern "C" fn make_lit(f: *mut JitFrame, pc: u32, base: *mut Value, n: u32) {
+    let i = &mut *(*f).interp;
+    let chunk = &*(*f).chunk;
+    let n = n as usize;
+    // The values move out (each slot left `Undefined`), in order.
+    let vals = (0..n).map(|k| std::ptr::replace(base.add(k), Value::Undefined));
+    let v = match chunk.ops.get(pc as usize) {
+        Some(&Op::MakeObject(start, count, tidx)) if count as usize == n => {
+            let keys = &chunk.names[start as usize..start as usize + n];
+            if tidx != u32::MAX {
+                i.make_plain_object_templated(&chunk.obj_maps[tidx as usize], keys, vals)
+            } else {
+                let values: Vec<Value> = vals.collect();
+                i.make_plain_object_vm(keys, values)
+            }
+        }
+        _ => i.make_array_iter(vals),
+    };
+    std::ptr::write(base, v);
+}
+
+pub(crate) unsafe extern "C" fn alloc_obj(
+    f: *mut JitFrame,
+    tpl: *const crate::value::Props,
+    base: *mut Value,
+    n: u32,
+) {
+    let i = &*(*f).interp;
+    let n = n as usize;
+    // SAFETY: the translator checked `fast_template` and the entry count (see `lit_template`).
+    let g = crate::value::Object::alloc_from_template(&*tpl, Some(i.object_proto.clone()), base, n);
+    for k in 1..n {
+        std::ptr::write(base.add(k), Value::Undefined);
+    }
+    std::ptr::write(base, Value::Obj(g));
+}
+
+pub(crate) unsafe extern "C" fn alloc_arr(f: *mut JitFrame, base: *mut Value, n: u32) {
+    let i = &*(*f).interp;
+    let n = n as usize;
+    let v = i.make_array_moved(base, n);
+    for k in 1..n {
+        std::ptr::write(base.add(k), Value::Undefined);
+    }
+    std::ptr::write(base, v);
+}
+
+unsafe fn frame_slots<'a>(f: *mut JitFrame) -> &'a mut [Value] {
+    std::slice::from_raw_parts_mut((*f).slots, (*(*f).chunk).n_slots)
+}
+
+pub(crate) unsafe extern "C" fn blk_new(f: *mut JitFrame, dst: u32, parent: u32) {
+    use crate::bytecode::block_env;
+    block_env::new_env(&*(*f).env, frame_slots(f), dst as u16, parent as u16);
+}
+
+pub(crate) unsafe extern "C" fn blk_copy(f: *mut JitFrame, s: u32) {
+    crate::bytecode::block_env::copy(frame_slots(f), s as u16);
+}
+
+pub(crate) unsafe extern "C" fn blk_decl(f: *mut JitFrame, s: u32, n: u32, k: u32) {
+    let name = &(&*(*f).chunk).names[n as usize];
+    crate::bytecode::block_env::declare(frame_slots(f), s as u16, name, k != 0);
+}
+
+pub(crate) unsafe extern "C" fn blk_load(f: *mut JitFrame, s: u32, n: u32, dst: *mut Value) -> u32 {
+    let name = &(&*(*f).chunk).names[n as usize];
+    let i = &mut *(*f).interp;
+    match crate::bytecode::block_env::load(i, frame_slots(f), s as u16, name) {
+        Ok(v) => {
+            std::ptr::write(dst, v);
+            STATUS_OK
+        }
+        Err(e) => {
+            std::ptr::write(dst, Value::Undefined);
+            fail(f, e)
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn blk_store(
+    f: *mut JitFrame,
+    s: u32,
+    n: u32,
+    src: *mut Value,
+    init: u32,
+) -> u32 {
+    let name = &(&*(*f).chunk).names[n as usize];
+    let i = &mut *(*f).interp;
+    let v = std::ptr::replace(src, Value::Undefined);
+    match crate::bytecode::block_env::store(i, frame_slots(f), s as u16, name, v, init != 0) {
+        Ok(()) => STATUS_OK,
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn blk_update(f: *mut JitFrame, pc: u32, dst: *mut Value) -> u32 {
+    let chunk = &*(*f).chunk;
+    let Some(&Op::BlkUpdate(s, n, kind)) = chunk.ops.get(pc as usize) else {
+        let e = (*(*f).interp).throw("TypeError", "compiled code ran an unsupported op");
+        return fail(f, e);
+    };
+    let i = &mut *(*f).interp;
+    let mut out: Vec<Value> = Vec::new();
+    let r = crate::bytecode::block_env::update(
+        i,
+        &mut out,
+        frame_slots(f),
+        s,
+        &chunk.names[n as usize],
+        kind,
+    );
+    if let Some(v) = out.pop() {
+        std::ptr::write(dst, v);
+    }
+    match r {
+        Ok(()) => STATUS_OK,
+        Err(e) => fail(f, e),
+    }
+}
+
+pub(crate) unsafe extern "C" fn make_closure_in(
+    f: *mut JitFrame,
+    s: u32,
+    fidx: u32,
+    name: u32,
+    dst: *mut Value,
+) {
+    let i = &mut *(*f).interp;
+    let env = crate::bytecode::block_env::env_of(&frame_slots(f)[s as usize]);
+    let v = crate::bytecode::make_closure(i, &*(*f).chunk, fidx, name, &env);
+    std::ptr::write(dst, v);
+}
+
+pub(crate) unsafe extern "C" fn make_closure(f: *mut JitFrame, fidx: u32, name: u32, dst: *mut Value) {
+    let i = &mut *(*f).interp;
+    let v = crate::bytecode::make_closure(i, &*(*f).chunk, fidx, name, &*(*f).env);
+    std::ptr::write(dst, v);
+}
+
+pub(crate) unsafe extern "C" fn make_rest(f: *mut JitFrame, dst: *mut Value, src: *mut Value, n: u32) {
+    let i = &*(*f).interp;
+    let vals = (0..n as usize).map(|k| std::ptr::replace(src.add(k), Value::Undefined));
+    std::ptr::write(dst, i.make_array_iter(vals));
 }

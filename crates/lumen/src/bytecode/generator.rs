@@ -20,14 +20,18 @@
 //!
 //! Suspension reuses [`VmStep::Await`](super::VmStep): `VmCoro` tells a yield from an await
 //! by the op it parked at.
-use super::{CResult, Compiler, Op};
+//!
+//! An async generator's `yield*` is an explicit loop of ordinary `Await`s and `Yield`s around
+//! a few `AsyncDelegate*` ops (see [`Compiler::async_yield_delegate`]), following the
+//! tree-walker's `Interp::yield_delegate_async` step for step.
+use super::{CResult, Compiler, Op, PushValue};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
 
 impl Compiler {
     /// `yield arg` / `yield* arg` (`yield*` in sync generators only).
     pub(super) fn yield_expr(&mut self, delegate: bool, arg: Option<&crate::ast::Expr>) -> CResult {
-        if !self.generator || (delegate && self.async_gen) {
+        if !self.generator {
             return Err(super::Bail);
         }
         match arg {
@@ -35,6 +39,9 @@ impl Compiler {
             None => {
                 self.emit(Op::Undef);
             }
+        }
+        if delegate && self.async_gen {
+            return self.async_yield_delegate();
         }
         if delegate {
             let it = self.fresh_slot("%deleg_iter%");
@@ -64,6 +71,224 @@ impl Compiler {
         self.emit_return_tail()?;
         self.patch(normal);
         Ok(())
+    }
+}
+
+impl Compiler {
+    /// `yield* v` in an async generator (14.4.14, async): the operand is on the stack; leaves
+    /// the delegation's result value. Hidden slots: iterator, `next`, from-sync flag, mode
+    /// (0 next / 1 throw / 2 return / 3 closing a throw-less iterator), return flag, done flag,
+    /// yielded value.
+    fn async_yield_delegate(&mut self) -> CResult {
+        let it = self.fresh_slot("%adeleg_iter%");
+        let nx = self.fresh_slot("%adeleg_next%");
+        debug_assert_eq!(nx, it + 1); // `AsyncDelegateCall` reads `next` from `it + 1`
+        let fs = self.fresh_slot("%adeleg_sync%");
+        let md = self.fresh_slot("%adeleg_mode%");
+        let rt = self.fresh_slot("%adeleg_ret%");
+        let dn = self.fresh_slot("%adeleg_done%");
+        let vs = self.fresh_slot("%adeleg_val%");
+        let k0 = self.const_idx(Value::Num(0.0));
+        let k1 = self.const_idx(Value::Num(1.0));
+        let k2 = self.const_idx(Value::Num(2.0));
+        self.emit(Op::AsyncDelegateInit);
+        self.emit(Op::StoreLocal(fs));
+        self.emit(Op::StoreLocal(nx));
+        self.emit(Op::StoreLocal(it));
+        self.emit(Op::Undef); // received
+        self.emit(Op::Const(k0));
+        self.emit(Op::StoreLocal(md));
+        let lp = self.ops.len() as u32;
+        // [received] → the inner call's result (true) or a special completion (false).
+        self.emit(Op::AsyncDelegateCall(it, md, rt));
+        let j_special = self.emit(Op::JumpIfFalse(0));
+        self.emit(Op::Await);
+        self.emit(Op::AsyncDelegateResult(fs, dn));
+        let j_nosync = self.emit(Op::JumpIfFalse(0));
+        let h_close = self.emit(Op::PushHandler(0));
+        self.emit(Op::Await);
+        self.emit(Op::PopHandler);
+        self.patch(j_nosync);
+        self.emit(Op::LoadLocal(dn));
+        let j_notdone = self.emit(Op::JumpIfFalse(0));
+        self.emit(Op::LoadLocal(rt));
+        let j_end = self.emit(Op::JumpIfFalse(0));
+        self.emit_return_tail()?;
+        // Not done: AsyncGeneratorYield(value) — unawaited; a return resumption is awaited
+        // (AsyncGeneratorUnwrapYieldResumption), its rejection a throw resumption.
+        self.patch(j_notdone);
+        self.emit(Op::StoreLocal(vs));
+        let h_throw = self.emit(Op::PushHandler(0));
+        self.emit(Op::LoadLocal(vs));
+        self.emit(Op::Yield);
+        let j_next = self.emit(Op::JumpIfFalse(0));
+        self.emit(Op::Await);
+        self.emit(Op::PopHandler);
+        self.emit(Op::Const(k2));
+        self.emit(Op::StoreLocal(md));
+        self.emit(Op::Jump(lp));
+        self.patch(j_next);
+        self.emit(Op::PopHandler);
+        self.emit(Op::Const(k0));
+        self.emit(Op::StoreLocal(md));
+        self.emit(Op::Jump(lp));
+        self.patch_handler(h_throw);
+        self.emit(Op::Const(k1));
+        self.emit(Op::StoreLocal(md));
+        self.emit(Op::Jump(lp));
+        // A from-sync value's rejection: close the sync iterator unless done, rethrow.
+        self.patch_handler(h_close);
+        self.emit(Op::AsyncDelegateCloseReject(it, dn));
+        // Special completions: a return with no inner `return` awaits the value and returns
+        // it; a throw with no inner `throw` awaited the close (errors ignored), then TypeError.
+        self.patch(j_special);
+        let h_te = self.emit(Op::PushHandler(0));
+        self.emit(Op::Await);
+        self.emit(Op::PopHandler);
+        self.emit(Op::AsyncDelegateSpecial(md, false));
+        self.emit_return_tail()?;
+        self.patch_handler(h_te);
+        self.emit(Op::AsyncDelegateSpecial(md, true));
+        self.patch(j_end);
+        Ok(())
+    }
+
+    fn patch_handler(&mut self, at: usize) {
+        let here = self.ops.len() as u32;
+        match &mut self.ops[at] {
+            Op::PushHandler(t) => *t = here,
+            _ => unreachable!("a handler push"),
+        }
+    }
+}
+
+const NO_THROW: &str = "the delegated iterator has no 'throw' method";
+
+/// `AsyncDelegateInit`: GetIterator(value, async) — the @@asyncIterator, else a sync iterator
+/// whose values are awaited. Pushes iterator, `next`, from-sync flag.
+pub(super) fn async_init(i: &mut Interp, stack: &mut impl PushValue, value: Value) -> Result<(), Abrupt> {
+    let akey = crate::builtins::async_iterator_key(i);
+    let amethod = match &akey {
+        Some(k) => i.get_member(&value, k)?,
+        None => Value::Undefined,
+    };
+    if !matches!(amethod, Value::Undefined | Value::Null) && !amethod.is_callable() {
+        return Err(i.throw("TypeError", "@@asyncIterator is not callable"));
+    }
+    let (it, nx, from_sync) = if amethod.is_callable() {
+        let it = i.call(amethod, value, &[])?;
+        if !matches!(it, Value::Obj(_)) {
+            return Err(i.throw("TypeError", "@@asyncIterator did not return an object"));
+        }
+        let n = i.get_member(&it, "next")?;
+        (it, n, false)
+    } else {
+        let (it, n) = i.get_iterator(&value)?;
+        (it, n, true)
+    };
+    stack.push_value(it);
+    stack.push_value(nx);
+    stack.push_value(Value::Bool(from_sync));
+    Ok(())
+}
+
+/// `AsyncDelegateCall(it, md, rt)`: forward the received value (popped) per the mode.
+pub(super) fn async_call(
+    i: &mut Interp,
+    stack: &mut impl PushValue,
+    slots: &mut [Value],
+    it: u16,
+    md: u16,
+    rt: u16,
+    received: Value,
+) -> Result<(), Abrupt> {
+    let iterator = slots[it as usize].clone();
+    let mode = match slots[md as usize] {
+        Value::Num(n) => n as u8,
+        _ => 0,
+    };
+    slots[rt as usize] = Value::Bool(false);
+    let result = match mode {
+        0 => {
+            let next = slots[it as usize + 1].clone();
+            i.call(next, iterator, &[received])?
+        }
+        1 => {
+            let throw = i.get_member(&iterator, "throw")?;
+            if !throw.is_callable() {
+                // No `throw`: close the iterator (awaiting the close, errors ignored), then a
+                // protocol TypeError.
+                let ret = i.get_member(&iterator, "return")?;
+                if ret.is_callable() {
+                    if let Ok(r) = i.call(ret, iterator, &[]) {
+                        slots[md as usize] = Value::Num(3.0);
+                        stack.push_value(r);
+                        stack.push_value(Value::Bool(false));
+                        return Ok(());
+                    }
+                }
+                return Err(i.throw("TypeError", NO_THROW));
+            }
+            i.call(throw, iterator, &[received])?
+        }
+        _ => {
+            let ret = i.get_member(&iterator, "return")?;
+            if !ret.is_callable() {
+                stack.push_value(received);
+                stack.push_value(Value::Bool(false));
+                return Ok(());
+            }
+            slots[rt as usize] = Value::Bool(true);
+            i.call(ret, iterator, &[received])?
+        }
+    };
+    stack.push_value(result);
+    stack.push_value(Value::Bool(true));
+    Ok(())
+}
+
+/// `AsyncDelegateResult(fs, dn)`: validate the awaited inner result (popped), record `done`,
+/// push its value and whether that value must be awaited too (a from-sync source).
+pub(super) fn async_result(
+    i: &mut Interp,
+    stack: &mut impl PushValue,
+    slots: &mut [Value],
+    fs: u16,
+    dn: u16,
+    r: Value,
+) -> Result<(), Abrupt> {
+    if !matches!(r, Value::Obj(_)) {
+        return Err(i.throw("TypeError", "iterator result is not an object"));
+    }
+    let done = i.get_member(&r, "done")?;
+    let done = i.to_boolean(&done);
+    slots[dn as usize] = Value::Bool(done);
+    let v = i.get_member(&r, "value")?;
+    stack.push_value(v);
+    stack.push_value(slots[fs as usize].clone());
+    Ok(())
+}
+
+/// `AsyncDelegateCloseReject(it, dn)`: a from-sync value rejected — close the sync iterator
+/// unless the step was done (closeOnRejection), rethrow.
+pub(super) fn async_close_reject(i: &mut Interp, slots: &[Value], it: u16, dn: u16, exc: Value) -> Abrupt {
+    if !matches!(slots[dn as usize], Value::Bool(true)) {
+        let iterator = slots[it as usize].clone();
+        i.iterator_close(&iterator);
+    }
+    Abrupt::Throw(exc)
+}
+
+/// `AsyncDelegateSpecial(md, err)`: after the special path's await (`err`: it rejected, the
+/// reason popped). Mode 3 (the throw-less close) always ends in the TypeError; mode 2 (the
+/// awaited return value, left on the stack) rethrows a rejection.
+pub(super) fn async_special(i: &mut Interp, slots: &[Value], md: u16, err: Option<Value>) -> Result<(), Abrupt> {
+    if matches!(slots[md as usize], Value::Num(n) if n == 3.0) {
+        return Err(i.throw("TypeError", NO_THROW));
+    }
+    match err {
+        Some(e) => Err(Abrupt::Throw(e)),
+        None => Ok(()),
     }
 }
 

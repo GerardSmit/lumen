@@ -1029,7 +1029,12 @@ fn normal_successor_pcs(op: &Op, pc: usize, len: usize, out: &mut Vec<usize>) {
                 out.push(pc + 1);
             }
         }
-        Op::Return | Op::ReturnUndef | Op::Throw | Op::IterAbortL(_) | Op::Await => {}
+        Op::Return
+        | Op::ReturnUndef
+        | Op::Throw
+        | Op::IterAbortL(_)
+        | Op::Await
+        | Op::DerivedReturn => {}
         _ if pc + 1 <= len => out.push(pc + 1),
         _ => {}
     }
@@ -1090,7 +1095,12 @@ fn analyze_stack(
                 work.push((target, next));
                 work.push((pc + 1, next));
             }
-            Op::Return | Op::ReturnUndef | Op::Throw | Op::IterAbortL(_) | Op::Await => {}
+            Op::Return
+        | Op::ReturnUndef
+        | Op::Throw
+        | Op::IterAbortL(_)
+        | Op::Await
+        | Op::DerivedReturn => {}
             Op::PushHandler(t) => {
                 let target = *t as usize;
                 validate_target(ops.len(), pc, target)?;

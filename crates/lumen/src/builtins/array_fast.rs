@@ -14,6 +14,7 @@
 //! the fresh array is not reachable from JS until returned — and materialized in one go.
 
 use super::*;
+use crate::bytecode::PreparedCall;
 
 /// The receiver's elements live in `props` with ordinary semantics.
 #[inline(always)]
@@ -282,6 +283,25 @@ impl Out {
         cdp_or_throw(i, &r, &k.to_string(), v)
     }
 
+    /// Bulk CreateDataPropertyOrThrow(A, k.., source[from..end]) for the leading run of the
+    /// source's own plain data elements (see `Props::copy_dense_run`), while the result is
+    /// still the unobservable fast vector and `k` its frontier. Returns how many elements were
+    /// copied; the caller continues per index from there.
+    #[inline]
+    pub(super) fn put_run(&mut self, k: usize, o: &Gc, from: usize, end: usize) -> usize {
+        if self.slow.is_some() || k != self.fast.len() {
+            return 0;
+        }
+        let (Ok(from), Ok(end)) = (u32::try_from(from), u32::try_from(end)) else {
+            return 0;
+        };
+        let b = o.borrow();
+        if !plain_elems(&b) {
+            return 0;
+        }
+        b.props.copy_dense_run(from, end, &mut self.fast) as usize
+    }
+
     /// The finished array; `explicit_len` is a trailing Set(A, "length", n, true).
     pub(super) fn finish(self, i: &mut Interp, explicit_len: Option<usize>) -> Result<Value, Value> {
         match self.slow {
@@ -317,11 +337,13 @@ pub(super) fn array_for_each(i: &mut Interp, this: Value, args: &[Value]) -> Res
     let len = len_of(i, &o)?;
     let (cb, cb_this) = callback(i, args, "Array.prototype.forEach")?;
     let ov = Value::Obj(o.clone());
+    let mut f = PreparedCall::new(i, cb, cb_this);
     for k in 0..len {
         if let Some(v) = has_get(i, &o, &ov, k)? {
-            ab(i.call(cb.clone(), cb_this.clone(), &[v, Value::Num(k as f64), ov.clone()]))?;
+            f.call3(i, v, Value::Num(k as f64), &ov)?;
         }
     }
+    f.finish(i);
     Ok(Value::Undefined)
 }
 
@@ -332,13 +354,14 @@ pub(super) fn array_map(i: &mut Interp, this: Value, args: &[Value]) -> Result<V
     let ov = Value::Obj(o.clone());
     let custom = species(i, &this, len)?;
     let mut out = Out::new(custom, len);
+    let mut f = PreparedCall::new(i, cb, cb_this);
     for k in 0..len {
         if let Some(v) = has_get(i, &o, &ov, k)? {
-            let mapped =
-                ab(i.call(cb.clone(), cb_this.clone(), &[v, Value::Num(k as f64), ov.clone()]))?;
+            let mapped = f.call3(i, v, Value::Num(k as f64), &ov)?;
             out.put(i, k, mapped)?;
         }
     }
+    f.finish(i);
     out.finish(i, None)
 }
 
@@ -350,19 +373,17 @@ pub(super) fn array_filter(i: &mut Interp, this: Value, args: &[Value]) -> Resul
     let custom = species(i, &this, 0)?;
     let mut out = Out::new(custom, 0);
     let mut to = 0usize;
+    let mut f = PreparedCall::new(i, cb, cb_this);
     for k in 0..len {
         if let Some(v) = has_get(i, &o, &ov, k)? {
-            let keep = ab(i.call(
-                cb.clone(),
-                cb_this.clone(),
-                &[v.clone(), Value::Num(k as f64), ov.clone()],
-            ))?;
+            let keep = f.call3(i, v.clone(), Value::Num(k as f64), &ov)?;
             if i.to_boolean(&keep) {
                 out.put(i, to, v)?;
                 to += 1;
             }
         }
     }
+    f.finish(i);
     out.finish(i, None)
 }
 
@@ -401,17 +422,15 @@ pub(super) fn array_reduce(
             }
         }
     };
+    let mut f = PreparedCall::new(i, cb, Value::Undefined);
     while s < len {
         let k = at(s);
         s += 1;
         if let Some(v) = has_get(i, &o, &ov, k)? {
-            acc = ab(i.call(
-                cb.clone(),
-                Value::Undefined,
-                &[acc, v, Value::Num(k as f64), ov.clone()],
-            ))?;
+            acc = ab(f.call(i, &mut [acc, v, Value::Num(k as f64), ov.clone()]))?;
         }
     }
+    f.finish(i);
     Ok(acc)
 }
 
@@ -430,18 +449,17 @@ pub(super) fn array_find_impl(
         return Err(i.make_error("TypeError", "predicate is not callable"));
     }
     let cb_this = arg(args, 1);
+    let mut f = PreparedCall::new(i, cb, cb_this);
     for step in 0..len {
         let k = if from_last { len - 1 - step } else { step };
         let v = get_elem(i, &o, &ov, k)?;
-        let r = ab(i.call(
-            cb.clone(),
-            cb_this.clone(),
-            &[v.clone(), Value::Num(k as f64), ov.clone()],
-        ))?;
+        let r = f.call3(i, v.clone(), Value::Num(k as f64), &ov)?;
         if i.to_boolean(&r) {
+            f.finish(i);
             return Ok(if want_value { v } else { Value::Num(k as f64) });
         }
     }
+    f.finish(i);
     Ok(if want_value {
         Value::Undefined
     } else {
@@ -463,16 +481,19 @@ pub(super) fn array_some_every_impl(
     }
     let cb_this = arg(args, 1);
     let ov = Value::Obj(o.clone());
+    let mut f = PreparedCall::new(i, cb, cb_this);
     for k in 0..len {
         let Some(v) = has_get(i, &o, &ov, k)? else {
             continue;
         };
-        let r = ab(i.call(cb.clone(), cb_this.clone(), &[v, Value::Num(k as f64), ov.clone()]))?;
+        let r = f.call3(i, v, Value::Num(k as f64), &ov)?;
         let b = i.to_boolean(&r);
         if every != b {
+            f.finish(i);
             return Ok(Value::Bool(b));
         }
     }
+    f.finish(i);
     Ok(Value::Bool(every))
 }
 
@@ -670,6 +691,12 @@ pub(super) fn array_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result
     let mut k = start;
     let mut to = 0usize;
     while k < end {
+        let run = out.put_run(to, &o, k as usize, end as usize);
+        if run != 0 {
+            k += run as i64;
+            to += run;
+            continue;
+        }
         // Preserve holes: only copy indices the source actually has (HasProperty).
         if let Some(v) = has_get(i, &o, &ov, k as usize)? {
             out.put(i, to, v)?;
@@ -707,10 +734,17 @@ pub(super) fn array_concat(i: &mut Interp, this: Value, args: &[Value]) -> Resul
             if n + len > 9007199254740991 {
                 return Err(i.make_error("TypeError", "concat result is too long"));
             }
-            for k in 0..len {
+            let mut k = 0;
+            while k < len {
+                let run = out.put_run((n + k) as usize, eo, k as usize, len as usize);
+                if run != 0 {
+                    k += run as u64;
+                    continue;
+                }
                 if let Some(elem) = has_get(i, eo, v, k as usize)? {
                     out.put(i, (n + k) as usize, elem)?;
                 }
+                k += 1;
             }
             n += len; // holes keep their positions
         } else {
@@ -946,9 +980,10 @@ pub(super) fn sort_values(i: &mut Interp, items: &mut Vec<Value>, cmp: &Value) -
         items.retain(|v| !matches!(v, Value::Undefined));
     }
     if cmp.is_callable() {
+        let mut f = PreparedCall::new(i, cmp.clone(), Value::Undefined);
         let mut cmp_fn = |i: &mut Interp, a: &Value, b: &Value| -> Result<bool, Value> {
             // `a` goes after `b` (strictly greater).
-            let r = ab(i.call(cmp.clone(), Value::Undefined, &[a.clone(), b.clone()]))?;
+            let r = ab(f.call(i, &mut [a.clone(), b.clone()]))?;
             let n = match r {
                 Value::Num(n) => n,
                 other => ab(i.to_number(&other))?,
@@ -1066,8 +1101,7 @@ pub(super) fn flatten_into_out(
     source_len: usize,
     start: usize,
     depth: i64,
-    mapper: Option<&Value>,
-    mapper_this: &Value,
+    mut mapper: Option<&mut PreparedCall>,
 ) -> Result<usize, Value> {
     let mut target_index = start;
     let so = match source {
@@ -1078,12 +1112,8 @@ pub(super) fn flatten_into_out(
         let Some(mut element) = has_get(i, &so, source, k)? else {
             continue; // FlattenIntoArray skips holes
         };
-        if let Some(m) = mapper {
-            element = ab(i.call(
-                m.clone(),
-                mapper_this.clone(),
-                &[element, Value::Num(k as f64), source.clone()],
-            ))?;
+        if let Some(m) = mapper.as_deref_mut() {
+            element = m.call3(i, element, Value::Num(k as f64), source)?;
         }
         if depth > 0 && json_is_array(i, &element)? {
             let el_len = match &element {
@@ -1101,7 +1131,6 @@ pub(super) fn flatten_into_out(
                 target_index,
                 depth - 1,
                 None,
-                &Value::Undefined,
             )?;
         } else {
             // Compared as u64: usize is 32-bit on wasm32, where 2^53 - 1 overflows the type.
@@ -1135,7 +1164,7 @@ pub(super) fn array_flat(i: &mut Interp, this: Value, args: &[Value]) -> Result<
     let custom = species(i, &this, 0)?;
     let mut out = Out::new(custom, 0);
     let ov = Value::Obj(o.clone());
-    flatten_into_out(i, &mut out, &ov, source_len, 0, depth, None, &Value::Undefined)?;
+    flatten_into_out(i, &mut out, &ov, source_len, 0, depth, None)?;
     out.finish(i, None)
 }
 
@@ -1150,6 +1179,8 @@ pub(super) fn array_flat_map(i: &mut Interp, this: Value, args: &[Value]) -> Res
     let custom = species(i, &this, 0)?;
     let mut out = Out::new(custom, 0);
     let ov = Value::Obj(o.clone());
-    flatten_into_out(i, &mut out, &ov, len, 0, 1, Some(&cb), &cb_this)?;
+    let mut f = PreparedCall::new(i, cb, cb_this);
+    flatten_into_out(i, &mut out, &ov, len, 0, 1, Some(&mut f))?;
+    f.finish(i);
     out.finish(i, None)
 }

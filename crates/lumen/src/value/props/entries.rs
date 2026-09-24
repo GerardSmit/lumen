@@ -110,6 +110,22 @@ impl EntryVec {
         self.check_inline_home();
     }
 
+    /// An inline-mode vector over `cap` slots at `buf` whose first `len` are already
+    /// initialized, built by value for a box under construction (the fast allocation paths
+    /// write it straight into the new box, so no home check runs here).
+    ///
+    /// # Safety
+    /// As [`adopt_inline`](Self::adopt_inline); the value must be written into the box that
+    /// owns `buf` before anything reads it.
+    #[inline(always)]
+    pub(in crate::value) const unsafe fn inline_raw(buf: *mut Property, len: usize, cap: usize) -> EntryVec {
+        EntryVec {
+            ptr: NonNull::new_unchecked(buf),
+            len: len as u32,
+            cap: cap as u32 | INLINE_FLAG,
+        }
+    }
+
     /// Move an owned buffer of at most `n` entries (or nothing at all) into `buf`, as
     /// [`adopt_inline`](Self::adopt_inline). Shared and larger vectors are left alone.
     ///
@@ -216,10 +232,16 @@ impl EntryVec {
     }
 
     /// Copy shared entries into an owned buffer with room for `extra` more.
+    #[inline(always)]
     fn unshare(&mut self, extra: usize) {
-        if !self.is_shared() {
-            return;
+        if self.is_shared() {
+            self.unshare_slow(extra);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unshare_slow(&mut self, extra: usize) {
         let len = self.len as usize;
         let src = self.ptr;
         let header = self.shared_header() as *const SharedHeader;
@@ -328,6 +350,21 @@ impl EntryVec {
             self.len -= 1;
             out
         }
+    }
+
+    /// Drop an inline vector's entries in place, for a dying object's fast teardown (see
+    /// `Object::drop_in_box`). Returns `false`, doing nothing, for owned or shared storage.
+    #[inline(always)]
+    pub(in crate::value) fn drop_inline_entries(&mut self) -> bool {
+        if !self.is_inline() {
+            return false;
+        }
+        let len = self.len as usize;
+        self.len = 0;
+        for i in 0..len {
+            unsafe { std::ptr::drop_in_place(self.ptr.as_ptr().add(i)) };
+        }
+        true
     }
 
     pub(in crate::value) fn clear(&mut self) {

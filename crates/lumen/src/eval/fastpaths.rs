@@ -96,6 +96,8 @@ struct Intrinsics {
 /// Per-interpreter memo state for the fast paths (see the module docs).
 #[derive(Default)]
 pub(crate) struct LangCaches {
+    /// The for-of / spread / destructuring protectors (see `bytecode::iter_fast`).
+    pub(crate) iter_proof: crate::bytecode::iter_fast::IterProof,
     /// See [`Intrinsics`]; `extra_protos` lookups hash their string keys.
     intrinsics: RefCell<Option<Intrinsics>>,
     /// `(SymbolData ptr, property key)` of the realm's `Symbol.iterator`.
@@ -120,7 +122,16 @@ pub(crate) struct LangCaches {
     /// Compiled programs by literal site: keyed by the chunk's source/flags name pointers
     /// (pinned by the stored clones, so a pointer can't be reused while cached).
     regexp_sites: RefCell<FastMap<(usize, usize), (Rc<str>, Rc<str>, Rc<crate::regex::Regex>)>>,
+    /// Weak handles of RegExp objects with a `regexps` entry (see [`Interp::regexp_weak_pin`]),
+    /// and the length at which the dead ones are pruned next.
+    regexp_weak: RefCell<Vec<crate::value::WeakGc>>,
+    regexp_weak_next: std::cell::Cell<usize>,
+    /// Promise side-table ownership and resolving-function parts (see `promise_fast`).
+    pub(crate) promise: super::promise_fast::PromiseCaches,
+    /// Inlined array callback guard memos (see `bytecode::inline_callback`).
+    pub(crate) array_cb: crate::bytecode::inline_callback::CbCache,
 }
+
 
 impl Interp {
     /// The property key of the realm's `Symbol.iterator`.
@@ -422,16 +433,8 @@ impl Interp {
         }
         let len = len as u32;
         let mut out = Vec::with_capacity(len as usize);
-        for n in 0..len {
-            let p = b.props.get_index(n)?;
-            if p.accessor() {
-                return None;
-            }
-            let v = p.value();
-            if matches!(v, Value::Empty) {
-                return None;
-            }
-            out.push(v);
+        if b.props.copy_dense_run(0, len, &mut out) != len {
+            return None;
         }
         Some(out)
     }
@@ -614,6 +617,36 @@ impl Interp {
         );
         *self.lang.regexp_template.borrow_mut() = Some(props.clone());
         props
+    }
+
+    /// A fresh RegExp object: its `lastIndex` template copied into the box's inline slots.
+    pub(crate) fn new_regexp_object(&self, proto: Option<Gc>) -> Gc {
+        if self.lang.regexp_template.borrow().is_none() {
+            drop(self.regexp_props());
+        }
+        let template = self.lang.regexp_template.borrow();
+        Object::new_inline_copy(proto, template.as_ref().expect("initialized above"))
+    }
+
+    /// Tie `obj`'s `regexps` entry to it without keeping it alive (unlike [`Interp::gc_pin`]):
+    /// the weak handle reserves the object's heap slot, so no later object can reuse the address
+    /// and inherit the entry, while the object itself dies by plain refcounting instead of
+    /// waiting for a collection (which pinning every regex literal made frequent). Entries of
+    /// dead objects are pruned in amortized batches.
+    pub(crate) fn regexp_weak_pin(&mut self, obj: &Gc) {
+        let mut pins = self.lang.regexp_weak.borrow_mut();
+        if pins.len() >= self.lang.regexp_weak_next.get() {
+            let regexps = &mut self.regexps;
+            pins.retain(|w| {
+                if w.strong_count() > 0 {
+                    return true;
+                }
+                regexps.remove(&(w.as_ptr() as usize));
+                false
+            });
+            self.lang.regexp_weak_next.set((pins.len() * 2).max(1024));
+        }
+        pins.push(Gc::downgrade(obj));
     }
 
     /// The compiled program for a regex literal site (`source`/`flags` are the chunk's name

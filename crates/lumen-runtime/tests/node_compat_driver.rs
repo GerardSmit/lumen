@@ -535,7 +535,7 @@ fn net_write_before_connect_waits_for_the_connection() {
         lines,
         [
             "connect failed: ECONNREFUSED",
-            "held write failed: ECONNREFUSED",
+            "held write failed: ERR_SOCKET_CLOSED_BEFORE_CONNECTION",
             "reply ok",
             "second written, connecting: false",
         ]

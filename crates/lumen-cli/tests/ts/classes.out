@@ -1,0 +1,7 @@
+> circle:circle:12.57
+> base:square:9.00
+2 8
+in c 0 3
+area()         {
+    return Math.PI * this.r ** 2;
+  }

@@ -370,6 +370,8 @@ pub(crate) struct ShapeTable {
     /// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals
     /// create this same one-property named map constantly.
     array_length: Option<Rc<Shape>>,
+    /// `{length, index, input, groups}`: the `RegExp.prototype.exec` match array's named map.
+    exec_result: Option<Rc<Shape>>,
 }
 
 impl ShapeTable {
@@ -379,6 +381,7 @@ impl ShapeTable {
             by_id: vec![Rc::new(Shape::root())],
             next_owned: u32::MAX - 1,
             array_length: None,
+            exec_result: None,
         }
     }
 
@@ -443,7 +446,7 @@ pub(super) fn fresh_owned_id() -> u32 {
 }
 
 /// The `{length}` shape every array's named map starts from.
-pub(super) fn array_length_shape() -> Rc<Shape> {
+pub(in crate::value) fn array_length_shape() -> Rc<Shape> {
     with_shapes(|t| {
         if let Some(s) = &t.array_length {
             return s.clone();
@@ -453,6 +456,20 @@ pub(super) fn array_length_shape() -> Rc<Shape> {
         t.array_length = Some(s.clone());
         s
     })
+}
+
+/// The `{length, index, input, groups}` shape of a `RegExp.prototype.exec` match array (the
+/// array's own `length`, then the three data properties RegExpBuiltinExec creates in order).
+pub(super) fn exec_result_shape() -> Rc<Shape> {
+    if let Some(s) = with_shapes(|t| t.exec_result.clone()) {
+        return s;
+    }
+    let mut s = array_length_shape();
+    for key in ["index", "input", "groups"] {
+        s = shape_transition(Some(&s), &Rc::from(key));
+    }
+    with_shapes(|t| t.exec_result = Some(s.clone()));
+    s
 }
 
 /// Shared-shape table sizes for the heap census (`LUMEN_HEAP_CENSUS`).

@@ -1,7 +1,7 @@
 //! Optional dense buffers and inline packed property ownership.
 use super::{MIRROR_ALL_I32, MIRROR_NO_HOLES, MIRROR_OK};
 use crate::value::{Property, Value};
-pub(super) const INLINE_PACKED_CAPACITY: usize = 10;
+pub(in crate::value) const INLINE_PACKED_CAPACITY: usize = 10;
 
 pub(super) struct InlinePacked {
     pub(in crate::value) len: u8,
@@ -14,6 +14,7 @@ impl InlinePacked {
         slots: [const { std::mem::MaybeUninit::uninit() }; INLINE_PACKED_CAPACITY],
     };
 
+    #[cfg(test)]
     pub(super) fn from_values(values: impl ExactSizeIterator<Item = Value>) -> InlinePacked {
         assert!(values.len() <= INLINE_PACKED_CAPACITY);
         let mut packed = InlinePacked::default();
@@ -69,7 +70,6 @@ impl Drop for InlinePacked {
     }
 }
 
-#[derive(Clone)]
 pub(in crate::value) struct DenseBuffers {
     pub(in crate::value) packed: Option<Box<Vec<Property>>>,
     pub(super) inline_packed: InlinePacked,
@@ -81,6 +81,24 @@ pub(in crate::value) struct DenseBuffers {
     /// Live hole count in `mirror` (descending array fills pad with holes and then fill them:
     /// `MIRROR_NO_HOLES` comes back when this returns to zero).
     pub(in crate::value) mirror_holes: u32,
+    /// These buffers live in their object's own heap box (`heap::SlotClass::Array`), not in a
+    /// separate allocation: see [`DenseStorage`].
+    pub(in crate::value) in_box: bool,
+}
+
+impl Clone for DenseBuffers {
+    /// A copy is always a separate allocation's contents (`in_box` clear).
+    fn clone(&self) -> Self {
+        DenseBuffers {
+            packed: self.packed.clone(),
+            inline_packed: self.inline_packed.clone(),
+            elems: self.elems.clone(),
+            mirror: self.mirror.clone(),
+            mirror_flags: self.mirror_flags,
+            mirror_holes: self.mirror_holes,
+            in_box: false,
+        }
+    }
 }
 
 pub(super) const MIRROR_DEFAULT: u8 = MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES;
@@ -94,6 +112,7 @@ impl Default for DenseBuffers {
             mirror: Vec::new(),
             mirror_flags: MIRROR_DEFAULT,
             mirror_holes: 0,
+            in_box: false,
         }
     }
 }
@@ -110,36 +129,170 @@ static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
     mirror: Vec::new(),
     mirror_flags: MIRROR_DEFAULT,
     mirror_holes: 0,
+    in_box: false,
 });
 
-#[derive(Clone, Default)]
+/// The nullable sidecar pointer. Usually it owns a boxed [`DenseBuffers`]; a small array
+/// literal's buffers instead live in the tail of its object's own heap box
+/// ([`DenseBuffers::in_box`], installed by [`DenseStorage::init_in_box`]), so the array is one
+/// allocation. Like inline entry storage (see `EntryVec`), in-box buffers belong to the box:
+/// the map holding them must stay inside that object — nothing moves a map out of a live
+/// object, and a clone copies the buffers into a fresh allocation.
 #[repr(transparent)]
-pub(in crate::value) struct DenseStorage(pub(in crate::value) Option<Box<DenseBuffers>>);
+#[derive(Default)]
+pub(in crate::value) struct DenseStorage(Option<std::ptr::NonNull<DenseBuffers>>);
 
 impl std::ops::Deref for DenseStorage {
     type Target = DenseBuffers;
     fn deref(&self) -> &DenseBuffers {
-        self.0.as_deref().unwrap_or(&EMPTY_DENSE_BUFFERS.0)
+        self.as_deref().unwrap_or(&EMPTY_DENSE_BUFFERS.0)
+    }
+}
+
+impl Clone for DenseStorage {
+    fn clone(&self) -> DenseStorage {
+        DenseStorage::from_box(self.as_deref().map(|d| Box::new(d.clone())))
+    }
+}
+
+impl Drop for DenseStorage {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
 impl DenseStorage {
+    #[inline]
+    pub(in crate::value) fn from_box(b: Option<Box<DenseBuffers>>) -> DenseStorage {
+        DenseStorage(b.map(|b| unsafe { std::ptr::NonNull::new_unchecked(Box::into_raw(b)) }))
+    }
+
+    /// Install packed buffers holding `values` at `slot` (as [`init_in_box`]), written in
+    /// place: up to [`INLINE_PACKED_CAPACITY`] elements in the buffers' own slots, a longer run
+    /// in one exactly-sized boxed vector.
+    ///
+    /// # Safety
+    /// As [`init_in_box`](DenseStorage::init_in_box).
+    #[inline]
+    pub(in crate::value) unsafe fn adopt_in_box_packed(
+        &mut self,
+        slot: *mut DenseBuffers,
+        values: impl ExactSizeIterator<Item = Value>,
+    ) {
+        let len = values.len();
+        if len > INLINE_PACKED_CAPACITY {
+            let mut packed = Vec::with_capacity(len);
+            packed.extend(values.map(Property::plain));
+            self.init_in_box(slot, Some(Box::new(packed)));
+            return;
+        }
+        self.init_in_box(slot, None);
+        // Adopted first, so the object's drop releases whatever landed if `values` panics.
+        let ip = std::ptr::addr_of_mut!((*slot).inline_packed);
+        for v in values.take(INLINE_PACKED_CAPACITY) {
+            let n = (*ip).len as usize;
+            (*ip).slots[n].write(Property::plain(v));
+            (*ip).len += 1;
+        }
+    }
+
+    /// A new box's in-box sidecar holding `values` (at most [`INLINE_PACKED_CAPACITY`]) as
+    /// its packed elements, written field by field at `slot`; returns the pointer to install
+    /// (by value, inside the box write). The fast array allocation's form of
+    /// [`adopt_in_box_packed`](DenseStorage::adopt_in_box_packed).
+    ///
+    /// # Safety
+    /// As [`init_in_box`](DenseStorage::init_in_box); `values.len() <= INLINE_PACKED_CAPACITY`.
+    #[inline(always)]
+    pub(in crate::value) unsafe fn write_in_box_packed(
+        slot: *mut DenseBuffers,
+        values: impl ExactSizeIterator<Item = Value>,
+    ) -> DenseStorage {
+        use std::ptr::addr_of_mut;
+        debug_assert!(values.len() <= INLINE_PACKED_CAPACITY);
+        let ip = addr_of_mut!((*slot).inline_packed.slots).cast::<Property>();
+        let mut n = 0;
+        for v in values.take(INLINE_PACKED_CAPACITY) {
+            ip.add(n).write(Property::plain(v));
+            n += 1;
+        }
+        addr_of_mut!((*slot).packed).write(None);
+        addr_of_mut!((*slot).inline_packed.len).write(n as u8);
+        addr_of_mut!((*slot).elems).write(Vec::new());
+        addr_of_mut!((*slot).mirror).write(Vec::new());
+        addr_of_mut!((*slot).mirror_flags).write(0);
+        addr_of_mut!((*slot).mirror_holes).write(0);
+        addr_of_mut!((*slot).in_box).write(true);
+        DenseStorage(Some(std::ptr::NonNull::new_unchecked(slot)))
+    }
+
+    /// Install empty buffers (plus the boxed packed vector `packed`, if any) at `slot`, field by
+    /// field: the inline element slots stay uninitialized instead of being copied around.
+    ///
+    /// # Safety
+    /// `slot` must be the uninitialized sidecar area of the heap box that contains `self`,
+    /// valid for as long as that box's object lives.
+    #[inline]
+    #[allow(clippy::box_collection)] // a thin pointer keeps `DenseBuffers` small
+    pub(in crate::value) unsafe fn init_in_box(
+        &mut self,
+        slot: *mut DenseBuffers,
+        packed: Option<Box<Vec<Property>>>,
+    ) {
+        use std::ptr::addr_of_mut;
+        self.release();
+        addr_of_mut!((*slot).packed).write(packed);
+        addr_of_mut!((*slot).inline_packed.len).write(0);
+        addr_of_mut!((*slot).elems).write(Vec::new());
+        addr_of_mut!((*slot).mirror).write(Vec::new());
+        addr_of_mut!((*slot).mirror_flags).write(0);
+        addr_of_mut!((*slot).mirror_holes).write(0);
+        addr_of_mut!((*slot).in_box).write(true);
+        self.0 = Some(std::ptr::NonNull::new_unchecked(slot));
+    }
+
+    /// Drop the sidecar (freeing it unless it lives in the object's box).
+    #[inline]
+    fn release(&mut self) {
+        if let Some(p) = self.0.take() {
+            unsafe {
+                if (*p.as_ptr()).in_box {
+                    std::ptr::drop_in_place(p.as_ptr());
+                } else {
+                    drop(Box::from_raw(p.as_ptr()));
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(in crate::value) fn as_deref(&self) -> Option<&DenseBuffers> {
+        self.0.map(|p| unsafe { &*p.as_ptr() })
+    }
+    #[inline]
+    pub(in crate::value) fn as_deref_mut(&mut self) -> Option<&mut DenseBuffers> {
+        self.0.map(|p| unsafe { &mut *p.as_ptr() })
+    }
+
     pub(in crate::value) fn is_present(&self) -> bool {
         self.0.is_some()
     }
     #[inline]
     pub(in crate::value) fn buffers_mut(&mut self) -> &mut DenseBuffers {
-        self.0.get_or_insert_with(Default::default)
+        if self.0.is_none() {
+            *self = DenseStorage::from_box(Some(Box::default()));
+        }
+        self.as_deref_mut().expect("sidecar installed above")
     }
     pub(in crate::value) fn packed_mut(&mut self) -> Option<&mut Vec<Property>> {
-        let dense = self.0.as_deref_mut()?;
+        let dense = self.as_deref_mut()?;
         if dense.packed.is_none() && dense.inline_packed.len != 0 {
             dense.packed = Some(Box::new(dense.inline_packed.into_vec()));
         }
         dense.packed.as_deref_mut()
     }
     pub(in crate::value) fn packed_ref(&self) -> Option<&[Property]> {
-        let dense = self.0.as_deref()?;
+        let dense = self.as_deref()?;
         match dense.packed.as_deref() {
             Some(packed) => Some(packed),
             None if dense.inline_packed.len != 0 => Some(dense.inline_packed.as_slice()),
@@ -154,22 +307,22 @@ impl DenseStorage {
             let dense = self.buffers_mut();
             dense.inline_packed = InlinePacked::default();
             dense.packed = packed;
-        } else if let Some(d) = self.0.as_deref_mut() {
+        } else if let Some(d) = self.as_deref_mut() {
             d.packed = None;
             d.inline_packed = InlinePacked::default();
         }
     }
     #[inline]
     pub(in crate::value) fn len(&self) -> usize {
-        self.0.as_deref().map_or(0, |d| d.elems.len())
+        self.as_deref().map_or(0, |d| d.elems.len())
     }
     #[inline]
     pub(in crate::value) fn get(&self, index: usize) -> Option<&u32> {
-        self.0.as_deref().and_then(|d| d.elems.get(index))
+        self.as_deref().and_then(|d| d.elems.get(index))
     }
     #[inline]
     pub(in crate::value) fn get_mut(&mut self, index: usize) -> Option<&mut u32> {
-        self.0.as_deref_mut().and_then(|d| d.elems.get_mut(index))
+        self.as_deref_mut().and_then(|d| d.elems.get_mut(index))
     }
     pub(in crate::value) fn reserve_exact(&mut self, additional: usize) {
         if additional != 0 {
@@ -182,13 +335,13 @@ impl DenseStorage {
     }
     #[inline]
     pub(in crate::value) fn pop(&mut self) -> Option<u32> {
-        self.0.as_deref_mut().and_then(|d| d.elems.pop())
+        self.as_deref_mut().and_then(|d| d.elems.pop())
     }
     pub(in crate::value) fn clear(&mut self) {
-        self.0 = None;
+        self.release();
     }
     pub(in crate::value) fn clear_elems(&mut self) {
-        if let Some(d) = self.0.as_deref_mut() {
+        if let Some(d) = self.as_deref_mut() {
             d.elems.clear();
             d.mirror.clear();
         }
@@ -203,23 +356,23 @@ impl DenseStorage {
         }
     }
     pub(in crate::value) fn mirror_len(&self) -> usize {
-        self.0.as_deref().map_or(0, |d| d.mirror.len())
+        self.as_deref().map_or(0, |d| d.mirror.len())
     }
     pub(in crate::value) fn mirror_get(&self, index: usize) -> Option<&f64> {
-        self.0.as_deref().and_then(|d| d.mirror.get(index))
+        self.as_deref().and_then(|d| d.mirror.get(index))
     }
     pub(in crate::value) fn mirror_get_mut(&mut self, index: usize) -> Option<&mut f64> {
-        self.0.as_deref_mut().and_then(|d| d.mirror.get_mut(index))
+        self.as_deref_mut().and_then(|d| d.mirror.get_mut(index))
     }
     pub(in crate::value) fn mirror_push(&mut self, value: f64) {
         self.buffers_mut().mirror.push(value);
     }
     pub(in crate::value) fn mirror_pop(&mut self) -> Option<f64> {
-        self.0.as_deref_mut().and_then(|d| d.mirror.pop())
+        self.as_deref_mut().and_then(|d| d.mirror.pop())
     }
     #[inline]
     pub(in crate::value) fn mirror_flags(&self) -> u8 {
-        self.0.as_deref().map_or(MIRROR_DEFAULT, |d| d.mirror_flags)
+        self.as_deref().map_or(MIRROR_DEFAULT, |d| d.mirror_flags)
     }
     /// Mutable flags; allocates the sidecar when absent (a caller clearing a vacuous mirror
     /// should use [`mirror_invalidate`](Props::mirror_invalidate) instead).
@@ -233,7 +386,7 @@ impl DenseStorage {
     }
     /// Reset the mirror to the coherent, hole-free, all-i32 state (after the elements went).
     pub(in crate::value) fn mirror_reset(&mut self) {
-        if let Some(d) = self.0.as_deref_mut() {
+        if let Some(d) = self.as_deref_mut() {
             d.mirror_flags = MIRROR_DEFAULT;
             d.mirror_holes = 0;
         }

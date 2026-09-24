@@ -58,28 +58,100 @@
 
   // ---- lookup (system resolver / getaddrinfo) ----
 
-  function normalizeLookupOptions(options) {
-    if (typeof options === "number") return { family: options };
-    return options || {};
+  const validFamilies = [0, 4, 6];
+  let invalidHostnameWarningEmitted = false;
+  function isIPFamily(s) {
+    const net = __builtins.get("net");
+    return net ? net.isIP(s) : 0;
   }
 
+  // Node's dns.lookup: the same argument validation, the IP-literal and empty-hostname shortcuts,
+  // then getaddrinfo (the system resolver) with the results in resolver order ("verbatim") or
+  // IPv4 first.
   function lookup(hostname, options, callback) {
+    const V = __validators;
+    let hints = 0;
+    let family = 0;
+    let all = false;
+    let verbatim = resultOrder === "verbatim";
+    if (hostname) V.validateString(hostname, "hostname");
     if (typeof options === "function") {
       callback = options;
-      options = {};
+      family = 0;
+    } else if (typeof options === "number") {
+      V.validateFunction(callback, "callback");
+      V.validateOneOf(options, "family", validFamilies);
+      family = options;
+    } else if (options !== undefined && typeof options !== "object") {
+      V.validateFunction(arguments.length === 2 ? options : callback, "callback");
+      throw new __errors.ERR_INVALID_ARG_TYPE("options", ["integer", "object"], options);
+    } else {
+      V.validateFunction(callback, "callback");
+      if (options?.hints != null) {
+        V.validateNumber(options.hints, "options.hints");
+        hints = options.hints >>> 0;
+        if ((hints & ~(LOOKUP_FLAGS.ADDRCONFIG | LOOKUP_FLAGS.ALL | LOOKUP_FLAGS.V4MAPPED)) !== 0) {
+          throw new __errors.ERR_INVALID_ARG_VALUE("hints", hints);
+        }
+      }
+      if (options?.family != null) {
+        switch (options.family) {
+          case "IPv4": family = 4; break;
+          case "IPv6": family = 6; break;
+          default:
+            V.validateOneOf(options.family, "options.family", validFamilies);
+            family = options.family;
+        }
+      }
+      if (options?.all != null) {
+        V.validateBoolean(options.all, "options.all");
+        all = options.all;
+      }
+      if (options?.verbatim != null) {
+        V.validateBoolean(options.verbatim, "options.verbatim");
+        verbatim = options.verbatim;
+      }
     }
-    options = normalizeLookupOptions(options);
-    const family = options.family === 6 ? 6 : options.family === 4 ? 4 : 0;
+    if (!hostname) {
+      if (!invalidHostnameWarningEmitted) {
+        process.emitWarning(`The provided hostname "${hostname}" is not a valid ` +
+          "hostname, and is supported in the dns module solely for compatibility.",
+          "DeprecationWarning", "DEP0118");
+        invalidHostnameWarningEmitted = true;
+      }
+      if (all) process.nextTick(callback, null, []);
+      else process.nextTick(callback, null, null, family === 6 ? 6 : 4);
+      return {};
+    }
+    const matchedFamily = isIPFamily(hostname);
+    if (matchedFamily) {
+      if (all) process.nextTick(callback, null, [{ address: hostname, family: matchedFamily }]);
+      else process.nextTick(callback, null, hostname, matchedFamily);
+      return {};
+    }
     __dns.lookup(
-      String(hostname),
+      hostname,
       family,
       (list) => {
-        if (options.all) return callback(null, list);
-        const first = list[0];
-        callback(null, first.address, first.family);
+        if (!verbatim) list = [...list.filter((e) => e.family === 4), ...list.filter((e) => e.family !== 4)];
+        if (list.length === 0) {
+          const err = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+          Object.assign(err, { errno: __uvCodes.get("EAI_NONAME"), code: "ENOTFOUND", syscall: "getaddrinfo", hostname });
+          return callback(err);
+        }
+        if (all) return callback(null, list);
+        callback(null, list[0].address, list[0].family);
       },
-      (err) => callback(err),
+      (err) => {
+        if (err && typeof err === "object") {
+          if (err.hostname === undefined) err.hostname = hostname;
+          if (err.syscall === undefined) err.syscall = "getaddrinfo";
+          if (err.errno === undefined && err.code === "ENOTFOUND") err.errno = __uvCodes.get("EAI_NONAME");
+        }
+        callback(err);
+      },
     );
+    return {};
   }
 
   // getnameinfo (reverse of a socket address to host + service) has no backing op → ENOTIMP.
@@ -171,10 +243,16 @@
       fn(...args, (err, ...vals) => (err ? rej(err) : res(vals.length > 1 ? vals : vals[0]))));
 
   const lookupPromise = (hostname, options) => {
-    const opts = normalizeLookupOptions(options);
-    return new Promise((res, rej) =>
+    const opts = typeof options === "number" ? { family: options } : options === undefined ? {} : options;
+    let promise;
+    const run = (res, rej) =>
       lookup(hostname, opts, (err, address, family) =>
-        err ? rej(err) : res(opts.all ? address : { address, family })));
+        err ? rej(err) : res(opts && opts.all ? address : { address, family }));
+    // Argument errors throw synchronously, as Node's promises.lookup does.
+    let settle;
+    promise = new Promise((res, rej) => { settle = [res, rej]; });
+    run(settle[0], settle[1]);
+    return promise;
   };
 
   // Promise-returning Resolver: wraps a callback Resolver so its own server list is independent.

@@ -104,11 +104,28 @@ pub enum Coroutine {
 }
 
 impl Coroutine {
+    /// Run the body to its next suspension. The body runs under its own stack-trace frame
+    /// (see [`Coroutine::set_frame`]), since a resume happens outside the call that created it.
     #[inline]
     pub(crate) fn resume(&mut self, i: &mut Interp, signal: Resume) -> Suspend {
-        match self {
+        let started = self.started();
+        let frame = match self {
+            Coroutine::Thread(c) => &c.frame,
+            Coroutine::Vm(c) => &c.frame,
+        };
+        let pushed = i.enter_resume_frame(frame, started);
+        let s = match self {
             Coroutine::Thread(c) => c.resume(i, signal),
             Coroutine::Vm(c) => c.resume(i, signal),
+        };
+        i.leave_resume_frame(pushed);
+        s
+    }
+    /// The frame (function or module body) the body's resumes run under.
+    pub(crate) fn set_frame(&mut self, frame: crate::interpreter::stack_trace::ResumeFrame) {
+        match self {
+            Coroutine::Thread(c) => c.frame = frame,
+            Coroutine::Vm(c) => c.frame = frame,
         }
     }
     /// Whether the body has finished (further resumes are no-ops).
@@ -142,6 +159,8 @@ pub struct ThreadCoro {
     /// frames — they may be interleaved with the driver's own frames across suspensions, so a
     /// watermark truncate cannot find them.
     pub(crate) id: u32,
+    /// The stack-trace frame each resume runs under (see [`Coroutine::set_frame`]).
+    pub(crate) frame: crate::interpreter::stack_trace::ResumeFrame,
 }
 
 impl Drop for ThreadCoro {
@@ -175,6 +194,9 @@ impl ThreadCoro {
         }
         self.started = true;
         let (saved_strict, saved_depth, saved_tco) = (i.strict, i.depth, i.tco_ok);
+        // The running-native chain links Rust stack records: a body that died mid-native must
+        // not leave its (unwound) ones linked.
+        let saved_natives = i.native_top;
         let saved_coro = std::mem::replace(&mut i.cur_coro, self.id);
         // The body mutates `*i` from its worker thread while we block (see `park`).
         std::hint::black_box(&mut *i as *mut Interp);
@@ -184,6 +206,7 @@ impl ThreadCoro {
         i.strict = saved_strict;
         i.depth = saved_depth;
         i.tco_ok = saved_tco;
+        i.native_top = saved_natives;
         match s {
             Ok(s) => {
                 if matches!(s, Suspend::Done(_) | Suspend::Throw(_)) {
@@ -200,6 +223,7 @@ impl ThreadCoro {
             // through one.
             Err(_) => {
                 i.fn_frames.retain(|f| f.coro != self.id);
+                crate::bytecode::jit::evict_coro_frames(i, self.id);
                 self.done = true;
                 Suspend::Done(Value::Undefined)
             }
@@ -268,10 +292,19 @@ struct Job {
     /// The driver's heap state: the body allocates into and tombstones out of the same registry
     /// as the interpreter that spawned it (see `value::GcState`).
     gc: std::sync::Arc<crate::value::GcState>,
+    /// The driver's `Symbol.for` registry and table of registered precompiled chunks (see
+    /// `interpreter::sym_for_enter`, `serialize::lazy_enter`).
+    syms: DriverTable,
+    lazy: DriverTable,
     body: SendBody,
     resume_rx: Receiver<Resume>,
     suspend_tx: Sender<Suspend>,
 }
+
+/// A driver's thread-local table (`Symbol.for` registry, registered precompiled chunks), used by
+/// the worker only while the driver is parked.
+struct DriverTable(*const ());
+unsafe impl Send for DriverTable {}
 
 /// Idle worker threads waiting for their next coroutine. Guarded by a plain `Mutex`: under the
 /// strict ping-pong exactly one thread touches the interpreter at a time, so contention is
@@ -302,6 +335,15 @@ fn worker_loop(job_rx: Receiver<Job>, self_tx: Sender<Job>) {
     }
 }
 
+struct RestoreDriverTables(*const (), *const ());
+
+impl Drop for RestoreDriverTables {
+    fn drop(&mut self) {
+        crate::interpreter::sym_for_enter(self.0 as *const _);
+        crate::bytecode::serialize::lazy_enter(self.1);
+    }
+}
+
 struct RestoreGcState(Option<std::sync::Arc<crate::value::GcState>>);
 
 impl Drop for RestoreGcState {
@@ -319,10 +361,18 @@ fn run_job(job: Job) {
     let Job {
         ptr,
         gc,
+        syms,
+        lazy,
         body,
         resume_rx,
         suspend_tx,
     } = job;
+    // The body's `Symbol.for` and precompiled-chunk lookups must see the driver's tables, not
+    // this thread's.
+    let _restore_syms = RestoreDriverTables(
+        crate::interpreter::sym_for_enter(syms.0 as *const _) as *const (),
+        crate::bytecode::serialize::lazy_enter(lazy.0),
+    );
     let SendBody(body) = body;
     // Everything this job drops — the captured closure on an undriven job, the values a body
     // leaves behind — belongs to the driver's registry, so route it there until the job is done.
@@ -383,6 +433,8 @@ pub fn spawn_coroutine(interp: *mut Interp, body: SendBody) -> std::io::Result<C
     let job = Job {
         ptr: InterpPtr(interp),
         gc: crate::value::gc_state_handle(),
+        syms: DriverTable(crate::interpreter::sym_for_handle() as *const ()),
+        lazy: DriverTable(crate::bytecode::serialize::lazy_handle()),
         body,
         resume_rx,
         suspend_tx,
@@ -398,5 +450,6 @@ pub fn spawn_coroutine(interp: *mut Interp, body: SendBody) -> std::io::Result<C
         suspend_rx,
         done: false,
         started: false,
+        frame: Default::default(),
     }))
 }

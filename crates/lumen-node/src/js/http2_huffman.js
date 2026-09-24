@@ -55,19 +55,26 @@
     30
   ];
 
-  const root = [null, null, -1];
-  for (let symbol = 0; symbol < CODES.length; symbol++) {
-    let node = root;
-    const code = CODES[symbol], length = LENGTHS[symbol];
-    for (let shift = length - 1; shift >= 0; shift--) {
-      const bit = Math.floor(code / Math.pow(2, shift)) & 1;
-      if (!node[bit]) node[bit] = [null, null, -1];
-      node = node[bit];
+  // The decoding tree, built on first decode (not at startup).
+  let tree = null;
+  function decodingTree() {
+    if (tree) return tree;
+    const root = [null, null, -1];
+    for (let symbol = 0; symbol < CODES.length; symbol++) {
+      let node = root;
+      const code = CODES[symbol], length = LENGTHS[symbol];
+      for (let shift = length - 1; shift >= 0; shift--) {
+        const bit = Math.floor(code / Math.pow(2, shift)) & 1;
+        if (!node[bit]) node[bit] = [null, null, -1];
+        node = node[bit];
+      }
+      node[2] = symbol;
     }
-    node[2] = symbol;
+    return (tree = root);
   }
 
   function decode(input) {
+    const root = decodingTree();
     const bytes = Buffer.from(input), output = [];
     let node = root, pendingBits = 0, pendingOnes = true;
     for (const byte of bytes) {

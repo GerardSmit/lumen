@@ -159,7 +159,20 @@ impl Timers {
             let due = (entry.callback.clone(), entry.args.clone());
             match entry.repeat {
                 Some(period) => {
-                    entry.deadline = deadline + period;
+                    // Keep the cadence, catching up on a short lag (the OS timer granularity makes
+                    // a 1 ms interval wake late), but never accumulate an unbounded backlog: an
+                    // interval whose callback runs longer than its period would otherwise stay
+                    // due forever and starve I/O completions. Past `MAX_INTERVAL_LAG` it re-arms
+                    // from the current loop time, as Node does. A zero period
+                    // (`setInterval(f, 0)`) is re-armed 1 ms out, so a pass terminates.
+                    const MAX_INTERVAL_LAG: Duration = Duration::from_millis(50);
+                    let period = period.max(Duration::from_millis(1));
+                    let next = deadline + period;
+                    entry.deadline = if now.saturating_duration_since(next) > MAX_INTERVAL_LAG {
+                        now + period
+                    } else {
+                        next
+                    };
                     self.heap.push(Reverse((entry.deadline, id)));
                 }
                 None => {

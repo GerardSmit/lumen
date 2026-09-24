@@ -23,6 +23,10 @@ impl Write for Captured {
 
 #[test]
 fn tls_server_accepts_verified_client_and_exchanges_data() {
+    // lumen-tls has no Windows backend yet.
+    if cfg!(windows) {
+        return;
+    }
     if Command::new("openssl").arg("version").output().is_err() {
         return;
     }
@@ -109,6 +113,10 @@ fn tls_server_accepts_verified_client_and_exchanges_data() {
 
 #[test]
 fn tls_client_upgrades_a_paused_tcp_socket() {
+    // lumen-tls has no Windows backend yet.
+    if cfg!(windows) {
+        return;
+    }
     if Command::new("openssl").arg("version").output().is_err() {
         return;
     }

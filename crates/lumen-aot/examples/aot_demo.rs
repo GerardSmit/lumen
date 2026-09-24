@@ -124,10 +124,7 @@ fn main() {
         bc_stats.chunks_attached >= 1,
         "the loop's chunk should be attached on its first call: {bc_stats:?}"
     );
-    assert!(
-        bc_stats.refusals_attached >= 1,
-        "the generator is a recorded refusal: {bc_stats:?}"
-    );
+    // Generators compile to bytecode now, so the bundle may carry no refusals at all.
     assert_eq!(
         bc_stats.compiles, 0,
         "loading and running the precompiled bundle must not compile anything"
@@ -136,18 +133,16 @@ fn main() {
         "ok  ran from precompiled bytecode: {} chunks registered, {} attached, {} refusals, 0 compiles",
         bc_stats.chunks_registered, bc_stats.chunks_attached, bc_stats.refusals_attached
     );
-    // A call-count tier-up (past the threshold of 8) also takes the precompiled chunk.
+    // A function with a precompiled chunk tiers up on its first call (its body stays in the
+    // blob), so calling it again attaches nothing new and compiles nothing.
     eval(&mut e, "for (let i = 0; i < 20; i++) prelude.scale(i); 0");
     let after = stats();
     assert_eq!(after.compiles, 0, "tier-up must use the chunk: {after:?}");
-    // (With LUMEN_AOT_EAGER every chunk was already attached at load.)
-    if std::env::var_os("LUMEN_AOT_EAGER").is_none() {
-        assert!(
-            after.chunks_attached > bc_stats.chunks_attached,
-            "the tier-up should attach a chunk: {after:?}"
-        );
-    }
-    println!("ok  hot function tiered up from its precompiled chunk: {after:?}");
+    assert!(
+        after.chunks_attached >= bc_stats.chunks_attached,
+        "attached chunks stay attached: {after:?}"
+    );
+    println!("ok  hot function runs on its precompiled chunk: {after:?}");
     let results = concat!(
         "JSON.stringify([out.sum, out.greeting, out.mulSrc, out.classSrc, out.metaUrl, ",
         "out.loop, out.closures, out.acc, out.gen])"
@@ -164,7 +159,7 @@ fn main() {
         "3,3,function,1000,true,dflt,1.5e-7",
     );
     check("class method", eval(&mut e, "out.acc"), "6");
-    check("generator (tree-walker)", eval(&mut e, "out.gen"), "1+2");
+    check("generator", eval(&mut e, "out.gen"), "1+2");
     check("sum across the cycle", eval(&mut e, "out.sum"), "66");
     check(
         "host bare import",

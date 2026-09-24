@@ -540,6 +540,21 @@ fn gen_wrapper(w: &WrapperSpec, fn_name: &str) -> Res<(u32, u32, String, String)
     if w.is_async {
         flags |= 4;
     }
+    // `SyncFn<'_>` parameters: sync non-escaping callbacks, one bit per JS argument from bit 8
+    // (`OP_SYNC_CB_SHIFT`), queried by the optimizing tier through the descriptor.
+    for p in &sig.params {
+        if let Kind::Js(k) = p.kind {
+            if base_name(&p.ty) == "SyncFn" {
+                if w.is_async {
+                    return Err((p.span, "a `SyncFn` callback cannot cross to an `async` op's worker thread".into()));
+                }
+                if k >= 24 {
+                    return Err((p.span, "`SyncFn` is supported on the first 24 JS arguments".into()));
+                }
+                flags |= 1u32 << (8 + k);
+            }
+        }
+    }
     // JS parameter names and `length`.
     let js: Vec<&Param> = sig.params.iter().filter(|p| matches!(p.kind, Kind::Js(_))).collect();
     let names = js

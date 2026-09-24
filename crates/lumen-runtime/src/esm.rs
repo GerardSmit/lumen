@@ -29,7 +29,9 @@ use std::path::{Path, PathBuf};
 /// generated in JS where the export names are known, and ferried here as plain strings.
 pub struct BuiltinModules(pub HashMap<String, String>);
 
-const EXTENSIONS: [&str; 5] = [".mjs", ".js", ".jsx", ".json", ".cjs"];
+const EXTENSIONS: [&str; 8] = [
+    ".mjs", ".js", ".jsx", ".json", ".cjs", ".ts", ".mts", ".cts",
+];
 
 /// Build the loader closure `eval_module` wants. It owns everything (`'static`); the engine
 /// caches results by the canonical key we return, so returning a stable realpath per file is
@@ -37,7 +39,168 @@ const EXTENSIONS: [&str; 5] = [".mjs", ".js", ".jsx", ".json", ".cjs"];
 pub fn make_loader(
     builtins: BuiltinModules,
 ) -> impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> {
-    move |specifier, referrer, attr_type| resolve(specifier, referrer, &builtins, attr_type)
+    make_cached_loader(builtins).0
+}
+
+/// [`make_loader`], plus a handle on its [`LoaderCache`] so the caller can drop the cached
+/// sources once the module graph they were fetched for has loaded.
+pub fn make_cached_loader(
+    builtins: BuiltinModules,
+) -> (
+    impl Fn(&str, &str, Option<&str>) -> Option<(String, String)>,
+    std::rc::Rc<LoaderCache>,
+) {
+    let cache = std::rc::Rc::new(LoaderCache::default());
+    let handle = std::rc::Rc::clone(&cache);
+    let loader = move |specifier: &str, referrer: &str, attr_type: Option<&str>| {
+        cache.resolve(specifier, referrer, attr_type, |s, r, a| {
+            resolve(s, r, &builtins, a)
+        })
+    };
+    (loader, handle)
+}
+
+/// Memoized resolution for one loader. The engine asks the loader for every import clause of
+/// every module it parses — also for dependencies it has already loaded, whose source it then
+/// ignores — so a module graph repeats the same resolutions many times (Puppeteer: ~630 loads for
+/// ~170 modules), each one filesystem probes, `package.json` reads and a file read. Resolutions
+/// are cached by (specifier, referrer directory, attribute) and sources by resolved key, for the
+/// loader's lifetime; the file system is assumed not to change under a loading module graph
+/// (Node's resolver caches the same way). A failed resolution is not cached.
+#[derive(Default)]
+pub struct LoaderCache {
+    /// (specifier, referrer directory, attribute type) -> resolved key.
+    keys: std::cell::RefCell<HashMap<(String, String, Option<String>), String>>,
+    /// (resolved key, attribute type) -> source.
+    sources: std::cell::RefCell<HashMap<(String, Option<String>), String>>,
+    /// Package types and canonical directories, for the resolver's helpers.
+    memo: std::cell::RefCell<FsMemo>,
+}
+
+/// Filesystem facts the resolver re-derives for nearly every module: the `"type"` of each
+/// directory's `package.json` (found by walking up from every resolved file) and each
+/// directory's canonical path. A [`LoaderCache`] keeps one and installs it in [`MEMO`] while it
+/// resolves, since the resolver's helpers are free functions; without one (no loader resolving)
+/// they query the filesystem directly.
+#[derive(Default)]
+struct FsMemo {
+    /// Directory -> `None` when it has no package.json, else that file's `"type"` field.
+    pkg_type: HashMap<PathBuf, Option<Option<String>>>,
+    /// Directory -> its canonical path.
+    canon_dirs: HashMap<PathBuf, PathBuf>,
+}
+
+thread_local! {
+    static MEMO: std::cell::RefCell<Option<FsMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The `package.json` in `dir`: `None` when there is none, else its `"type"` field.
+fn dir_package_type(dir: &Path) -> Option<Option<String>> {
+    let lookup = || {
+        let pkg = dir.join("package.json");
+        if !pkg.is_file() {
+            return None;
+        }
+        Some(
+            std::fs::read_to_string(pkg)
+                .ok()
+                .and_then(|t| json_string_field(&t, "type")),
+        )
+    };
+    MEMO.with(|m| match m.borrow_mut().as_mut() {
+        Some(memo) => memo
+            .pkg_type
+            .entry(dir.to_path_buf())
+            .or_insert_with(lookup)
+            .clone(),
+        None => lookup(),
+    })
+}
+
+/// A resolved file's module key: its canonical path. Under a [`FsMemo`] that is the file's
+/// directory canonicalized once per directory, plus its name — unless the file itself is a
+/// symlink, which is resolved in full like everything else without a memo.
+fn canonical_key(file: &Path) -> String {
+    let memoized = MEMO.with(|m| m.borrow().is_some());
+    let via_dir = || -> Option<PathBuf> {
+        let (dir, name) = (file.parent()?, file.file_name()?);
+        if dir.as_os_str().is_empty()
+            || !std::fs::symlink_metadata(file).is_ok_and(|m| !m.file_type().is_symlink())
+        {
+            return None;
+        }
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let memo = m.as_mut()?;
+            if let Some(c) = memo.canon_dirs.get(dir) {
+                return Some(c.join(name));
+            }
+            let c = lumen_host::canonicalize(dir).ok()?;
+            memo.canon_dirs.insert(dir.to_path_buf(), c.clone());
+            Some(c.join(name))
+        })
+    };
+    memoized
+        .then(via_dir)
+        .flatten()
+        .or_else(|| lumen_host::canonicalize(file).ok())
+        .unwrap_or_else(|| file.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl LoaderCache {
+    fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        attr_type: Option<&str>,
+        uncached: impl FnOnce(&str, &str, Option<&str>) -> Option<(String, String)>,
+    ) -> Option<(String, String)> {
+        // An `aot:` referrer resolves against the current directory, not its own location.
+        let base = if referrer.starts_with("aot:") {
+            None
+        } else {
+            let r = strip_file_scheme(referrer);
+            Some(
+                Path::new(r.as_ref())
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+        };
+        let attr = attr_type.map(str::to_owned);
+        if let Some(base) = &base {
+            let key = (specifier.to_owned(), base.clone(), attr.clone());
+            if let Some(resolved) = self.keys.borrow().get(&key) {
+                let sk = (resolved.clone(), attr.clone());
+                if let Some(src) = self.sources.borrow().get(&sk) {
+                    return Some((resolved.clone(), src.clone()));
+                }
+            }
+        }
+        let memo = std::mem::take(&mut *self.memo.borrow_mut());
+        let outer = MEMO.with(|m| m.replace(Some(memo)));
+        let result = uncached(specifier, referrer, attr_type);
+        let memo = MEMO.with(|m| m.replace(outer)).unwrap_or_default();
+        *self.memo.borrow_mut() = memo;
+        let (resolved, src) = result?;
+        if let Some(base) = base {
+            self.keys
+                .borrow_mut()
+                .insert((specifier.to_owned(), base, attr.clone()), resolved.clone());
+            self.sources
+                .borrow_mut()
+                .insert((resolved.clone(), attr), src.clone());
+        }
+        Some((resolved, src))
+    }
+
+    /// Drop the cached sources (resolutions are kept; a later import of a forgotten module
+    /// reads its file again).
+    pub fn forget_sources(&self) {
+        self.sources.borrow_mut().clear();
+    }
 }
 
 fn resolve(
@@ -102,10 +265,7 @@ fn resolve(
         } else {
             resolve_node_modules(specifier, Path::new(referrer).parent()?)?.0
         };
-        let key = lumen_host::canonicalize(&file)
-            .unwrap_or_else(|_| file.to_path_buf())
-            .to_string_lossy()
-            .into_owned();
+        let key = canonical_key(&file);
         return Some((key, read_raw(&file, attr_type)?));
     }
 
@@ -316,18 +476,13 @@ fn package_dir(parent: &Path, name: &str) -> PathBuf {
 }
 
 fn package_is_esm(pkg_dir: &Path) -> bool {
-    std::fs::read_to_string(pkg_dir.join("package.json"))
-        .ok()
-        .is_some_and(|t| json_string_field(&t, "type").as_deref() == Some("module"))
+    dir_package_type(pkg_dir).flatten().as_deref() == Some("module")
 }
 
 /// Turn a resolved file into `(canonical_key, source)`. `.mjs`/`.js` are real ESM; `.json`
 /// and (when `cjs_default`) `.cjs`/CJS packages get a synthetic default-export wrapper.
 fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
-    let key = lumen_host::canonicalize(file)
-        .unwrap_or_else(|_| file.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+    let key = canonical_key(file);
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
         "json" => {
@@ -350,11 +505,20 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
             Some((key, js))
         }
         "cjs" => Some((key.clone(), cjs_wrapper(&key, source_of(file)))),
+        // TypeScript: the engine parses it itself by the key's extension (Node's strip-only
+        // semantics, every offset kept; `require` of a `.cts`/CJS `.ts` goes through
+        // node:module, which compiles it the same way). Syntax it cannot run throws Node's
+        // SyntaxError when the module is parsed.
+        "mts" => Some((key, std::fs::read_to_string(file).ok()?)),
+        "cts" => Some((key.clone(), cjs_wrapper(&key, source_of(file)))),
         _ if cjs_default => {
             let text = source_of(file);
-            // Node's syntax detection: a `.js` file outside any package "type" that only parses
-            // as a module (it has `import`/`export`) is ESM after all.
-            if ext == "js" && package_type_of(file).is_none() && detect_module_syntax(&text) {
+            // Node's syntax detection: a `.js`/`.ts` file outside any package "type" that only
+            // parses as a module (it has `import`/`export`) is ESM after all.
+            if (ext == "js" || ext == "ts")
+                && package_type_of(file).is_none()
+                && detect_module_syntax(&text, ext == "ts")
+            {
                 return Some((key, text));
             }
             Some((key.clone(), cjs_wrapper(&key, text)))
@@ -366,17 +530,18 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
     }
 }
 
-/// Whether a resolved file loads as ESM: `.mjs` always, `.cjs` never, and `.js` per the nearest
-/// enclosing `package.json` `"type"` (absent ⇒ CommonJS, Node's default).
+/// Whether a resolved file loads as ESM: `.mjs`/`.mts` always, `.cjs`/`.cts` never, and
+/// `.js`/`.ts` per the nearest enclosing `package.json` `"type"` (absent ⇒ CommonJS, Node's
+/// default).
 fn file_is_esm(file: &Path) -> bool {
     match file.extension().and_then(|e| e.to_str()) {
-        Some("mjs") => true,
-        Some("cjs") => false,
+        Some("mjs" | "mts") => true,
+        Some("cjs" | "cts") => false,
         _ => {
             let mut dir = file.parent();
             while let Some(d) = dir {
-                if d.join("package.json").is_file() {
-                    return package_is_esm(d);
+                if let Some(ty) = dir_package_type(d) {
+                    return ty.as_deref() == Some("module");
                 }
                 dir = d.parent();
             }
@@ -389,11 +554,8 @@ fn file_is_esm(file: &Path) -> bool {
 fn package_type_of(file: &Path) -> Option<String> {
     let mut dir = file.parent();
     while let Some(d) = dir {
-        let pkg = d.join("package.json");
-        if pkg.is_file() {
-            return std::fs::read_to_string(pkg)
-                .ok()
-                .and_then(|t| json_string_field(&t, "type"));
+        if let Some(ty) = dir_package_type(d) {
+            return ty;
         }
         dir = d.parent();
     }
@@ -405,14 +567,21 @@ fn package_type_of(file: &Path) -> Option<String> {
 /// declaration or uses `import.meta` — keeps ordinary CommonJS to no extra parse at all; only a
 /// candidate is test-parsed as a script. (A file that is neither is left to the module parser,
 /// which reports its syntax error.)
-fn detect_module_syntax(src: &str) -> bool {
+fn detect_module_syntax(src: &str, ts: bool) -> bool {
     let candidate = src.lines().any(|line| {
         let l = line.trim_start();
         let after = |kw: &str| l.strip_prefix(kw).and_then(|r| r.chars().next());
-        matches!(after("import"), Some(' ' | '\t' | '{' | '*' | '"' | '\'' | '.'))
-            || matches!(after("export"), Some(' ' | '\t' | '{' | '*'))
+        matches!(
+            after("import"),
+            Some(' ' | '\t' | '{' | '*' | '"' | '\'' | '.')
+        ) || matches!(after("export"), Some(' ' | '\t' | '{' | '*'))
     });
-    candidate && lumen::compile_snapshot(src).is_err()
+    candidate
+        && if ts {
+            !lumen::typescript::parses_as_commonjs(src)
+        } else {
+            lumen::compile_snapshot(src).is_err()
+        }
 }
 
 /// Read a file's source (empty on failure — the wrapper still yields a working default export).

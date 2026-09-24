@@ -1,0 +1,3 @@
+value=41 82
+"function show(label        , n        )         { return `${label}=${n}`; }"
+object object true

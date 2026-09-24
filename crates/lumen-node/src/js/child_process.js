@@ -6,6 +6,8 @@
 
 const EventEmitter = __builtins.get("events");
 const IPC_PREFIX = "\x1eLUMEN_IPC ";
+// The child's `process.disconnect()` closes its end of the channel with this control line.
+const IPC_DISCONNECT = "\x1eLUMEN_IPC_DISCONNECT";
 
 // Normalize the stdio option to a list of "pipe" | "inherit" | "ignore" — three entries for the
 // standard fds, plus one per extra slot (`stdio[3]`...), which only "pipe" and "ignore" support.
@@ -16,11 +18,57 @@ function normalizeStdio(stdio) {
     const out = [];
     for (let i = 0; i < Math.max(3, stdio.length); i++) {
       const v = stdio[i];
-      out.push(i >= 3 ? (v === "pipe" ? "pipe" : "ignore") : v === "inherit" || v === "ignore" ? v : "pipe");
+      out.push(i >= 3 ? (v === "pipe" ? "pipe" : "ignore") : v === "inherit" || v === "ignore" || isOwnStdio(v, i) ? (v === "ignore" ? v : "inherit") : "pipe");
     }
     return out;
   }
   return ["pipe", "pipe", "pipe"];
+}
+
+// The parent's own fd `i` (the number or process.stdin/stdout/stderr) in stdio slot `i` is inherited.
+function isOwnStdio(v, i) {
+  if (v === i) return true;
+  const own = [process.stdin, process.stdout, process.stderr][i];
+  return v !== null && typeof v === "object" && v === own;
+}
+
+// Any other stream or fd in a standard slot: Node hands its handle to the child; lumen spawns a
+// pipe and relays it in JS, so the data still reaches the target (instead of a dead pipe).
+function stdioRelayTargets(stdio) {
+  if (!Array.isArray(stdio)) return null;
+  let targets = null;
+  for (let i = 0; i < 3; i++) {
+    const v = stdio[i];
+    if (v === null || v === undefined || typeof v === "string" || isOwnStdio(v, i)) continue;
+    if (typeof v !== "number" && typeof v !== "object") continue;
+    (targets ??= [])[i] = v;
+  }
+  return targets;
+}
+
+function relayStdio(child, targets) {
+  const fs = __builtins.get("fs");
+  const done = [];
+  const names = ["stdin", "stdout", "stderr"];
+  for (let i = 0; i < 3; i++) {
+    const target = targets[i];
+    const pipe = child.stdio[i];
+    if (target === undefined || !pipe) continue;
+    child.stdio[i] = null;
+    child[names[i]] = null;
+    if (i === 0) {
+      if (typeof target === "number") fs.createReadStream(null, { fd: target, autoClose: false }).pipe(pipe);
+      else if (typeof target.pipe === "function" && target.readable !== false) target.pipe(pipe);
+      else pipe.end();
+      continue;
+    }
+    if (typeof target === "number") pipe.on("data", chunk => fs.writeSync(target, chunk));
+    else if (typeof target.write === "function") pipe.pipe(target, { end: false });
+    else pipe.resume();
+    // 'close' waits for the relayed output, as Node's waits for the child's stdio to close.
+    done.push(new Promise(resolve => { pipe.once("end", resolve); pipe.once("close", resolve); pipe.once("error", resolve); }));
+  }
+  if (done.length) child._stdioRelays = (child._stdioRelays || []).concat(done);
 }
 
 const SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGABRT: 6, SIGKILL: 9, SIGUSR1: 10, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15 };
@@ -92,6 +140,8 @@ function makeReadable(childId, which, onIpcMessage) {
       if (chunk === null) {
         if (pending) stream.push(Buffer.from(pending));
         stream.push(null);
+        // The child's stdout closing is its channel closing (it exited or closed it).
+        if (onIpcMessage) onIpcMessage.close();
         return;
       }
       if (!onIpcMessage) {
@@ -104,12 +154,22 @@ function makeReadable(childId, which, onIpcMessage) {
         if (newline < 0) break;
         const line = pending.slice(0, newline);
         pending = pending.slice(newline + 1);
-        if (line.startsWith(IPC_PREFIX)) {
+        if (line === IPC_DISCONNECT) {
+          onIpcMessage.close();
+        } else if (line.startsWith(IPC_PREFIX)) {
+          let message;
           try {
-            onIpcMessage(JSON.parse(line.slice(IPC_PREFIX.length)));
+            message = JSON.parse(line.slice(IPC_PREFIX.length));
           } catch (error) {
             stream.destroy(error);
             return;
+          }
+          // A throwing 'message' listener is the program's uncaught exception, not a channel
+          // failure: swallowing it here left the parent running with the error lost.
+          try {
+            onIpcMessage(message);
+          } catch (error) {
+            process.nextTick(() => { throw error; });
           }
         } else {
           stream.push(Buffer.from(line + "\n"));
@@ -178,12 +238,20 @@ class ChildProcess extends EventEmitter {
     queueMicrotask(() => this.emit("spawn"));
     new Promise((resolve, reject) => __child.wait(childId, resolve, reject)).then(
       ([code, signalNumber]) => {
-        const signal = signalNumber === null ? null : SIGNAL_NAMES[signalNumber] ?? `SIG${signalNumber}`;
+        let signal = signalNumber === null ? null : SIGNAL_NAMES[signalNumber] ?? `SIG${signalNumber}`;
+        // Windows has no signals: libuv reports a process it killed by the signal it was sent.
+        if (signal === null && this._killSignal !== undefined && process.platform === "win32") {
+          code = null;
+          signal = this._killSignal;
+        }
         this.exitCode = code;
         this.signalCode = signal;
+        this._ipcClosed();
         this.emit("exit", code, signal);
         // 'close' should follow once stdio has flushed; a microtask is close enough here.
-        queueMicrotask(() => this.emit("close", code, signal));
+        const emitClose = () => this.emit("close", code, signal);
+        if (this._stdioRelays) Promise.all(this._stdioRelays).then(emitClose);
+        else queueMicrotask(emitClose);
       },
       (err) => this.emit("error", err),
     );
@@ -217,7 +285,11 @@ class ChildProcess extends EventEmitter {
   kill(signal) {
     if (this._id === null) return false;
     const ok = __child.kill(this._id, signalNumber(signal));
-    if (ok) this.killed = true;
+    if (ok) {
+      this.killed = true;
+      const number = signalNumber(signal === undefined || signal === null ? "SIGTERM" : signal);
+      if (number !== 0 && this.exitCode === null && this.signalCode === null) this._killSignal = SIGNAL_NAMES[number] ?? `SIG${number}`;
+    }
     return ok;
   }
   ref() {
@@ -262,6 +334,13 @@ class ChildProcess extends EventEmitter {
     if (this.stdin) this.stdin.end();
     queueMicrotask(() => this.emit("disconnect"));
   }
+  // The child closed the channel (process.disconnect(), or its stdout ended / it exited).
+  _ipcClosed() {
+    if (!this.connected) return;
+    this.connected = false;
+    if (this.stdin && !this.stdin.writableEnded) this.stdin.end();
+    this.emit("disconnect");
+  }
 }
 
 function spawn(command, args, options) {
@@ -286,33 +365,97 @@ function spawn(command, args, options) {
   const onIpcMessage = options._ipc
     ? (message) => child.emit("message", message, null)
     : undefined;
+  if (onIpcMessage) onIpcMessage.close = () => child._ipcClosed();
   child = new ChildProcess(info.childId, info.pid, stdio, onIpcMessage);
+  const relayTargets = stdioRelayTargets(options.stdio);
+  if (relayTargets) relayStdio(child, relayTargets);
+  if (options.signal !== undefined && options.signal !== null) abortChildOnSignal(child, options.signal, options.killSignal);
   return child;
 }
 
+// `options.signal`: aborting kills the child (with `killSignal`) and emits an AbortError.
+function abortChildOnSignal(child, signal, killSignal) {
+  if (typeof signal !== "object" || typeof signal.aborted !== "boolean") {
+    throw new __errors.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+  }
+  const onAbort = () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    if (child.kill(killSignal)) {
+      const { AbortError } = __builtins.get("events");
+      const error = AbortError
+        ? new AbortError(undefined, { cause: signal.reason })
+        : Object.assign(new Error("The operation was aborted", { cause: signal.reason }), { name: "AbortError", code: "ABORT_ERR" });
+      child.emit("error", error);
+    }
+  };
+  if (signal.aborted) {
+    process.nextTick(onAbort);
+  } else {
+    signal.addEventListener("abort", onAbort, { once: true });
+    child.once("exit", () => signal.removeEventListener("abort", onAbort));
+  }
+}
+
 // Collect a ChildProcess's stdout/stderr and invoke a Node-style callback.
-function collect(child, encoding, callback) {
+// exec/execFile's callback plumbing, with Node's `timeout`, `killSignal` and `maxBuffer`.
+function collect(child, options, callback, cmd) {
+  const encoding = options.encoding ?? "utf8";
+  const maxBuffer = options.maxBuffer ?? 1024 * 1024;
   const out = [];
   const err = [];
-  if (child.stdout) child.stdout.on("data", (c) => out.push(c));
-  if (child.stderr) child.stderr.on("data", (c) => err.push(c));
+  let outLength = 0, errLength = 0;
   let done = false;
-  const finish = (error, code) => {
+  let killed = false;
+  let failure = null;
+  let timer = null;
+  // Node's execFile kill(): drop our ends of the pipes and kill the child. A grandchild (say
+  // the program a shell started) may still hold the pipes, so once the child itself has exited
+  // it no longer keeps the event loop alive.
+  const kill = () => {
+    if (child.stdout) child.stdout.destroy();
+    if (child.stderr) child.stderr.destroy();
+    killed = true;
+    child.once("exit", () => child.unref());
+    try { child.kill(options.killSignal); } catch (e) { finish(e); }
+  };
+  const onData = (chunks, which) => (chunk) => {
+    if (done || killed) return;
+    const length = (which === 1 ? (outLength += chunk.length) : (errLength += chunk.length));
+    if (maxBuffer !== Infinity && length > maxBuffer) {
+      const name = which === 1 ? "stdout" : "stderr";
+      failure = new RangeError(`${name} maxBuffer length exceeded`);
+      failure.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+      chunks.push(chunk.subarray(0, chunk.length - (length - maxBuffer)));
+      kill();
+      return;
+    }
+    chunks.push(chunk);
+  };
+  if (child.stdout) child.stdout.on("data", onData(out, 1));
+  if (child.stderr) child.stderr.on("data", onData(err, 2));
+  const finish = (error, code, signal) => {
     if (done) return;
     done = true;
+    if (timer) clearTimeout(timer);
     const stdout = Buffer.concat(out);
     const stderr = Buffer.concat(err);
     const asText = (b) => (encoding && encoding !== "buffer" ? b.toString(encoding) : b);
-    if (error) return callback(error, asText(stdout), asText(stderr));
-    if (code !== 0) {
-      const e = new Error(`Command failed with exit code ${code}`);
-      e.code = code;
-      return callback(e, asText(stdout), asText(stderr));
+    if (!error && failure) error = failure;
+    if (!error && (code !== 0 || signal !== null)) {
+      error = new Error(`Command failed: ${cmd}\n${asText(stderr)}`);
+      error.code = code;
+      error.killed = child.killed || killed;
+      error.signal = signal;
+    }
+    if (error) {
+      if (error.cmd === undefined) error.cmd = cmd;
+      return callback(error, asText(stdout), asText(stderr));
     }
     callback(null, asText(stdout), asText(stderr));
   };
+  if (options.timeout > 0) timer = setTimeout(() => { timer = null; kill(); }, options.timeout);
   child.on("error", (e) => finish(e));
-  child.on("close", (code) => finish(null, code));
+  child.on("close", (code, signal) => finish(null, code, signal ?? null));
 }
 
 function exec(command, options, callback) {
@@ -322,7 +465,7 @@ function exec(command, options, callback) {
   }
   options = options || {};
   const child = spawn(command, { ...options, shell: options.shell || true });
-  if (callback) collect(child, options.encoding ?? "utf8", callback);
+  if (callback) collect(child, options, callback, command);
   return child;
 }
 
@@ -336,7 +479,7 @@ function execFile(file, args, options, callback) {
     options = {};
   }
   const child = spawn(file, args || [], options || {});
-  if (callback) collect(child, (options && options.encoding) ?? "utf8", callback);
+  if (callback) collect(child, options || {}, callback, [file, ...(args || [])].join(" "));
   return child;
 }
 
@@ -371,8 +514,21 @@ function spawnSync(command, args, options) {
   const { file, args: argv, verbatim } = resolveCommand(command, args, options);
   const input = options.input ? (Buffer.isBuffer(options.input) ? options.input : Buffer.from(options.input)) : null;
   try {
-    const res = __child.execSync(file, argv, input, options.cwd, envPairs(options.env || process.env), verbatim);
-    return syncResult(res, null, options.encoding);
+    const res = __child.execSync(file, argv, input, options.cwd, envPairs(options.env || process.env), verbatim, options.timeout);
+    const ret = syncResult(res, null, options.encoding);
+    if (res.timedOut) {
+      // Node: the child was killed with killSignal and the result carries ETIMEDOUT.
+      const error = new Error(`spawnSync ${file} ETIMEDOUT`);
+      error.errno = __uvCodes.get("ETIMEDOUT");
+      error.code = "ETIMEDOUT";
+      error.syscall = `spawnSync ${file}`;
+      error.path = file;
+      error.spawnargs = argv;
+      ret.error = error;
+      ret.status = null;
+      ret.signal = typeof options.killSignal === "string" ? options.killSignal : "SIGTERM";
+    }
+    return ret;
   } catch (e) {
     const error = spawnError(e, "spawnSync", file, argv);
     if (!error) throw e;
@@ -417,12 +573,28 @@ function fork(modulePath, args, options) {
   }
   options = options || {};
   const env = { ...process.env, ...(options.env || {}), LUMEN_FORK_IPC: "1" };
-  return spawn(process.execPath, [String(modulePath), ...(args || []).map(String)], {
+  // Node: `stdio` wins over `silent`; `silent` pipes all three, the default inherits them.
+  let stdio = options.stdio ?? (options.silent ? "pipe" : "inherit");
+  if (typeof stdio === "string") stdio = [stdio, stdio, stdio];
+  stdio = Array.from(stdio).filter(v => v !== "ipc");
+  // The IPC channel rides the child's stdin/stdout, so those two are always pipes here; what
+  // the caller asked for stdout is honoured by relaying its non-IPC output below.
+  const child = spawn(process.execPath, [String(modulePath), ...(args || []).map(String)], {
     ...options,
     env,
-    stdio: ["pipe", "pipe", options.silent ? "pipe" : "inherit"],
+    stdio: ["pipe", "pipe", stdio[2] ?? "pipe", ...stdio.slice(3)],
     _ipc: true,
   });
+  const out = stdio[1] ?? "pipe";
+  if (child.stdout && out !== "pipe") {
+    if (out === "ignore") {
+      child.stdout.resume();
+      child.stdout = child.stdio[1] = null;
+    } else {
+      relayStdio(child, [undefined, out === "inherit" ? process.stdout : out]);
+    }
+  }
+  return child;
 }
 
 // The child-side channel is installed by the process bootstrap in stdlib_extras.js.

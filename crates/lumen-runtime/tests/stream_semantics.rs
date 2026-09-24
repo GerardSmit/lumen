@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
 
-use lumen_runtime::{Completion, ConsoleOut, Runtime};
+use lumen_runtime::{ConsoleOut, RealmExit, Runtime};
 
 #[derive(Clone, Default)]
 struct Captured(Rc<RefCell<Vec<u8>>>);
@@ -26,11 +26,11 @@ fn streams_account_for_exact_reads_backpressure_and_corking() {
     });
     let source = r#"
       const { Readable, Writable, Duplex } = require("node:stream");
-      const readable = new Readable({ highWaterMark: 5 });
+      const readable = new Readable({ highWaterMark: 5, read() {} });
       console.log("push", readable.push(Buffer.from("abc")), readable.push(Buffer.from("def")), readable.readableLength, readable.readableHighWaterMark);
       console.log("read", readable.read(4).toString(), readable.readableLength, readable.read(2).toString(), readable.readableLength);
 
-      const first = { id: 1 }, objects = new Readable({ objectMode: true, highWaterMark: 2 });
+      const first = { id: 1 }, objects = new Readable({ objectMode: true, highWaterMark: 2, read() {} });
       console.log("objects", objects.push(first), objects.push({ id: 2 }), objects.readableLength, objects.read() === first, objects.readableObjectMode);
 
       const writes = [];
@@ -51,16 +51,20 @@ fn streams_account_for_exact_reads_backpressure_and_corking() {
       const duplex = new Duplex({ objectMode: true, read() {}, write(_chunk, _encoding, callback) { callback(); } });
       console.log("duplex", duplex.readableObjectMode, duplex.writableObjectMode);
 
-      const oneShot = new Readable();
+      const oneShot = new Readable({ read() {} });
       oneShot.once("data", chunk => console.log("once", chunk.toString()));
       oneShot.on("end", () => console.log("once-end"));
       oneShot.push(Buffer.from("fast"));
       oneShot.push(null);
     "#;
-    match runtime.eval(source).expect("source parses") {
-        Completion::Value(_) => {}
-        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
-    }
+    // Run it as Node runs a program: the CommonJS main module, whose `process.nextTick` queue
+    // drains before the microtask queue (a bare `Runtime::eval` checkpoints microtasks first).
+    assert!(matches!(
+        runtime.run_embedded_source("stream_semantics.js", source),
+        RealmExit::Exited(0)
+    ));
+    // Node 24 prints exactly these lines (no "drain": `end()` was called before the buffer
+    // emptied, so Writable skips the drain event).
     assert_eq!(
         String::from_utf8(out.0.borrow().clone())
             .unwrap()
@@ -72,10 +76,9 @@ fn streams_account_for_exact_reads_backpressure_and_corking() {
             "objects true false 2 true true",
             "pressure true false 4 3",
             "duplex true true",
+            "batch 1 one+two",
             "once fast",
             "once-end",
-            "drain 2",
-            "batch 1 one+two",
             "finish abcd",
         ]
     );

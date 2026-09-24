@@ -32,6 +32,12 @@
       this._closeEmitted = false;
       this._sawEof = false;
       this._serverSide = false;
+      // Writes (and end()) issued while the handshake runs wait here, as net.Socket's do.
+      this._pendingWrites = [];
+      this._pendingFinal = null;
+      this._timeoutMs = 0;
+      this._timer = null;
+      this._refed = true;
       if (wrappedSocket) this._upgrade(wrappedSocket, options);
     }
 
@@ -60,10 +66,11 @@
 
     _upgrade(socket, options, callback) {
       if (!socket || socket._id === null || !socket._deferRead) throw new Error("TLS socket upgrade requires a paused net.Socket");
-      const id = socket._id, servername = String(options.servername || options.host || "localhost");
+      const servername = String(options.servername || options.host || "localhost");
       const alpn = (options.ALPNProtocols || []).map(value => Buffer.isBuffer(value) ? value.toString() : String(value)).join(",");
       if (callback) this.once("secureConnect", callback);
-      socket._id = null; socket.destroyed = true; socket.readable = false; socket.writable = false;
+      // The net.Socket gives up its native connection (and closes without touching it).
+      const id = socket._detachNative();
       this.connecting = true; this.servername = servername; this._rejectUnauthorized = options.rejectUnauthorized !== false;
       new Promise((resolve, reject) => __tls.upgrade(id, servername, alpn, options.rejectUnauthorized !== false, (...descriptor) => resolve(descriptor), reject)).then(
         descriptor => { this._adopt(descriptor); this.emit("connect"); this.emit("secureConnect"); this.emit("ready"); },
@@ -87,6 +94,12 @@
       this.authorizationError = this.authorized ? null : "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
       this._serverSide = serverSide;
       this._pump();
+      const pending = this._pendingWrites;
+      this._pendingWrites = [];
+      for (const [chunk, encoding, callback] of pending) this._write(chunk, encoding, callback);
+      const final = this._pendingFinal;
+      this._pendingFinal = null;
+      if (final) this._final(final);
     }
 
     async _pump() {
@@ -101,18 +114,22 @@
           }
           const bytes = Buffer.from(chunk);
           this.bytesRead += bytes.length;
+          this._touch();
           this.push(bytes);
         }
       } catch (error) { this.destroy(error); }
     }
 
     _write(chunk, encoding, callback) {
+      if (this.connecting && this._id === null) { this._pendingWrites.push([chunk, encoding, callback]); return; }
+      this._touch();
       if (this._id === null) { callback(new Error("TLS socket is not connected")); return; }
       const bytes = chunk instanceof Uint8Array ? chunk : Buffer.from(String(chunk), encoding || "utf8");
       __tls.write(this._id, bytes, length => { this.bytesWritten += length; callback(); }, callback);
     }
 
     _final(callback) {
+      if (this.connecting && this._id === null) { this._pendingFinal = callback; return; }
       callback();
       if (this._serverSide) this._finishClose();
     }
@@ -120,6 +137,10 @@
     destroy(error) {
       if (this.destroyed) return this;
       this.destroyed = true;
+      this._clearTimer();
+      const pending = this._pendingWrites;
+      this._pendingWrites = [];
+      for (const entry of pending) entry[2](error || new Error("TLS socket is not connected"));
       this.connecting = false;
       const id = this._id;
       this._id = null;
@@ -134,6 +155,7 @@
     }
 
     _finishClose() {
+      this._clearTimer();
       if (this._closeEmitted) return;
       const id = this._id;
       this._id = null;
@@ -157,8 +179,53 @@
     setServername(name) { this.servername = String(name); }
     setMaxSendFragment() { return false; }
     disableRenegotiation() {}
-    ref() { return this; }
-    unref() { return this; }
+    // net.Socket's idle timeout: 'timeout' after `ms` without reads or writes.
+    setTimeout(ms, callback) {
+      ms = Number(ms);
+      if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`Invalid timeout ${ms}`);
+      this._timeoutMs = ms;
+      if (callback) {
+        if (ms === 0) this.removeListener("timeout", callback);
+        else this.once("timeout", callback);
+      }
+      this._touch();
+      return this;
+    }
+    get timeout() { return this._timeoutMs || undefined; }
+    _touch() {
+      this._clearTimer();
+      if (this._timeoutMs > 0 && !this.destroyed) {
+        this._timer = setTimeout(() => { this._timer = null; this.emit("timeout"); }, this._timeoutMs);
+        if (!this._refed && this._timer.unref) this._timer.unref();
+      }
+    }
+    _clearTimer() {
+      if (this._timer !== null) { clearTimeout(this._timer); this._timer = null; }
+    }
+    setNoDelay() { return this; }
+    setKeepAlive() { return this; }
+    destroySoon() {
+      if (this.writable) this.end();
+      if (this.writableFinished) this.destroy();
+      else this.once("finish", () => this.destroy());
+    }
+    get readyState() {
+      if (this.connecting) return "opening";
+      if (this.readable && this.writable) return "open";
+      if (this.readable && !this.writable) return "readOnly";
+      if (!this.readable && this.writable) return "writeOnly";
+      return "closed";
+    }
+    ref() {
+      this._refed = true;
+      if (this._timer && this._timer.ref) this._timer.ref();
+      return this;
+    }
+    unref() {
+      this._refed = false;
+      if (this._timer && this._timer.unref) this._timer.unref();
+      return this;
+    }
   }
 
   function normalizeConnectArgs(args) {
@@ -188,6 +255,12 @@
   class Server extends EventEmitter {
     constructor(options, listener) {
       super();
+      this._init(options, listener);
+    }
+    // The constructor body, callable on an object that already exists (Node's https.Server
+    // calls `tls.Server` on its own `this`).
+    _init(options, listener) {
+      if (!(this instanceof EventEmitter) || this._events === undefined) EventEmitter.call(this);
       if (typeof options === "function") { listener = options; options = {}; }
       this.options = options || {};
       this._id = null;
@@ -257,4 +330,6 @@
   Server = __legacyConstructor(Server);
 
   __builtins.set("tls", { ...base, connect, TLSSocket, Server, createServer, SecureContext, createSecureContext });
+  // node:https (net.js) is Node's lib/https.js over this module.
+  __builtins.set("https", __internals.get("loadHttps")());
 }

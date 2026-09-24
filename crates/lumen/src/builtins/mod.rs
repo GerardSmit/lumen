@@ -28,6 +28,7 @@ mod math;
 pub(crate) use math::jit_math_fns;
 mod primitives;
 mod promise;
+pub(crate) use promise::{make_aggregate_error_value, promise_then_is_silent};
 mod proxy;
 mod reflect;
 mod regexp;
@@ -35,8 +36,9 @@ mod shadowrealm;
 mod string_code_point;
 mod string_substring;
 pub(crate) use string_code_point::nf_code_point_at;
+pub(crate) use collections::make_collection_iterator;
 pub(crate) mod typedarray;
-mod weakrefs;
+pub(crate) mod weakrefs;
 
 /// `args[i]` or `undefined`.
 fn arg(args: &[Value], i: usize) -> Value {
@@ -69,6 +71,7 @@ pub(crate) fn nf_function_apply(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
+    crate::bytecode::reflect::native_transparent(i);
     let this_arg = arg(args, 0);
     let list = match arg(args, 1) {
         Value::Undefined | Value::Null => Vec::new(),
@@ -1523,7 +1526,7 @@ fn make_aggregate_error(i: &mut Interp, errors: Value) -> Result<Value, Value> {
 /// `Promise.resolve(x)` as a value helper (returns existing promises unchanged).
 fn promise_resolve_value(i: &mut Interp, v: Value) -> Value {
     if let Value::Obj(o) = &v {
-        if i.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
+        if crate::eval::promise_fast::is_promise_obj(o) {
             return v;
         }
     }
@@ -2017,14 +2020,6 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                 )?;
             }
             update_regexp_legacy_statics(i, &re, &caps, &text, &input);
-            let mut items = vec![Value::from_string(text.slice(start, end))];
-            for g in 1..=re.ngroups {
-                items.push(match caps[g] {
-                    Some((a, b)) => Value::from_string(text.slice(a, b)),
-                    None => Value::Undefined,
-                });
-            }
-            let result = i.make_array(items);
             // `groups`: a null-prototype object of named captures, or undefined if there are none.
             let groups = if re.names.is_empty() {
                 Value::Undefined
@@ -2094,13 +2089,15 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
             } else {
                 None
             };
-            if let Value::Obj(o) = &result {
-                set_data(o, "index", Value::Num(text.unit_index(start) as f64));
-                set_data(o, "input", Value::Str(input));
-                set_data(o, "groups", groups);
-                if let Some(ind) = indices {
-                    set_data(o, "indices", ind);
-                }
+            // The match array is built in its final {length, index, input, groups} shape.
+            let items = (0..re.ngroups + 1).map(|g| match caps[g] {
+                Some((a, b)) => Value::from_string(text.slice(a, b)),
+                None => Value::Undefined,
+            });
+            let index = Value::Num(text.unit_index(start) as f64);
+            let result = i.make_exec_result(items, index, Value::Str(input), groups);
+            if let (Value::Obj(o), Some(ind)) = (&result, indices) {
+                set_data(o, "indices", ind);
             }
             Ok(result)
         }
@@ -2400,6 +2397,7 @@ pub fn install(it: &mut Interp) {
     crate::temporal::install(it);
     #[cfg(feature = "intl")]
     crate::intl::install(it);
+    crate::sync_callbacks::record_builtins(it);
 }
 
 /// Whether a value is a constructor: a callable with an own `prototype` (built-in ctors / user
@@ -2588,7 +2586,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "Array"
             } else if matches!(b.exotic, Exotic::Arguments) {
                 "Arguments"
-            } else if !matches!(b.call, Callable::None) {
+            } else if b.call.is_fn() {
                 "Function"
             } else if matches!(b.exotic, Exotic::Error) {
                 "Error"
@@ -2725,29 +2723,6 @@ fn new_promise_capability(i: &mut Interp, ctor: &Value) -> Result<Value, Value> 
 /// NewPromiseCapability returning `(promise, resolve, reject)`. The resolve/reject are the
 /// constructor's own capability functions, so a combinator that resolves through them works with a
 /// subclass / foreign Promise constructor (not just the native machinery).
-/// PromiseResolveThenableJob: a microtask handler that invokes `then.call(thenable, res, rej)`,
-/// rejecting through `rej` if the call throws.
-pub(crate) fn make_thenable_job(
-    i: &mut Interp,
-    then: Value,
-    thenable: Value,
-    res: Value,
-    rej: Value,
-) -> Value {
-    make_bound(i, thenable_job_run, vec![then, thenable, res, rej])
-}
-
-fn thenable_job_run(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let then = arg(args, 0);
-    let thenable = arg(args, 1);
-    let res = arg(args, 2);
-    let rej = arg(args, 3);
-    if let Err(e) = ab(i.call(then, thenable, &[res, rej.clone()])) {
-        let _ = i.call(rej, Value::Undefined, &[e]);
-    }
-    Ok(Value::Undefined)
-}
-
 /// The combinators' final `Call(capability.[[Resolve]])`: an abrupt completion rejects the
 /// capability instead of being swallowed (IfAbruptRejectPromise).
 fn capability_resolve_or_reject(i: &mut Interp, resolve_fn: Value, reject_fn: Value, v: Value) {
@@ -4804,6 +4779,21 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         let source = arg(args, 0);
         let mapfn = arg(args, 1);
         let this_arg = arg(args, 2);
+        // `Array.from(pristineArrayMapOrSet)` into this realm's %Array%, unmapped: GetMethod,
+        // the iteration and the element defines run no user code — one bulk copy (see
+        // `bytecode::iter_fast`).
+        if matches!(mapfn, Value::Undefined)
+            && matches!(&this, Value::Obj(c) if {
+                let b = c.borrow();
+                matches!(b.call, Callable::Native(f) if f as usize == nf_array_ctor as NativeFn as usize)
+                    && matches!(b.props.get("prototype").map(|p| p.value()),
+                        Some(Value::Obj(p)) if Gc::ptr_eq(&p, &i.array_proto))
+            })
+        {
+            if let Some(out) = crate::bytecode::iter_fast::values(i, &source) {
+                return Ok(i.make_array(out));
+            }
+        }
         if !matches!(mapfn, Value::Undefined) && !mapfn.is_callable() {
             return Err(i.make_error("TypeError", "Array.from: mapFn is not callable"));
         }
@@ -4827,6 +4817,23 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
                 c.borrow().call,
                 Callable::Native(f) if f as usize == nf_array_ctor as NativeFn as usize
             ));
+            // A pristine dense Array into the default target, unmapped: iteration runs no JS
+            // (intrinsic @@iterator and `next`, plain data elements), so it is one bulk copy.
+            // (`this` must be *this* realm's %Array%: another realm's builds its own arrays.)
+            let own_realm_ctor = intrinsic_ctor
+                && matches!(&this, Value::Obj(c) if matches!(
+                    c.borrow().props.get("prototype").map(|p| p.value()),
+                    Some(Value::Obj(p)) if Gc::ptr_eq(&p, &i.array_proto)
+                ));
+            if (!use_ctor || own_realm_ctor) && !mapfn.is_callable() {
+                if let Value::Obj(so) = &source {
+                    if i.pristine_array_iteration(so) {
+                        if let Some(out) = i.dense_array_values(so) {
+                            return Ok(i.make_array(out));
+                        }
+                    }
+                }
+            }
             let arr = if use_ctor {
                 ab(i.construct(this, &[]))?
             } else {
@@ -4893,6 +4900,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
             };
             let mut out: Vec<Value> = Vec::new();
             let mut k = 0u64;
+            let mut mapper = crate::bytecode::PreparedCall::new(i, mapfn.clone(), this_arg.clone());
             loop {
                 let raw = match arr_next {
                     Some(f) => match array_iterator::step_with(i, f, &iter)? {
@@ -4915,11 +4923,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
                 };
                 let step = (|i: &mut Interp| -> Result<(), Value> {
                     let v = if mapfn.is_callable() {
-                        ab(i.call(
-                            mapfn.clone(),
-                            this_arg.clone(),
-                            &[raw, Value::Num(k as f64)],
-                        ))?
+                        ab(mapper.call(i, &mut [raw, Value::Num(k as f64)]))?
                     } else {
                         raw
                     };
@@ -4959,14 +4963,11 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
                 return Err(i.make_error("RangeError", "invalid array length"));
             }
             let mut out: Vec<Value> = Vec::with_capacity(len.min(1 << 16));
+            let mut mapper = crate::bytecode::PreparedCall::new(i, mapfn.clone(), this_arg.clone());
             for k in 0..len {
                 let raw = array_fast::get_elem(i, &o, &ov, k)?;
                 out.push(if mapfn.is_callable() {
-                    ab(i.call(
-                        mapfn.clone(),
-                        this_arg.clone(),
-                        &[raw, Value::Num(k as f64)],
-                    ))?
+                    ab(mapper.call(i, &mut [raw, Value::Num(k as f64)]))?
                 } else {
                     raw
                 });
@@ -4999,6 +5000,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
     });
     it.def_method(&ctor, "fromAsync", 1, array_from_async);
     install_species(it, &ctor);
+    crate::bytecode::inline_callback::record_intrinsics(it, ap, &ctor);
     set_builtin(&it.global, "Array", Value::Obj(ctor));
 }
 
@@ -5737,15 +5739,8 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
             return Ok(promise);
         }
     };
-    if let Value::Obj(o) = &promise {
-        let key = Gc::as_ptr(o) as usize;
-        i.generators.insert(key, coro);
-        i.drive_async(
-            key,
-            promise.clone(),
-            crate::coroutine::Resume::Next(Value::Undefined),
-        );
-    }
+    i.park_async_coro(&promise, coro);
+    i.drive_async(promise.clone(), crate::coroutine::Resume::Next(Value::Undefined));
     Ok(promise)
 }
 
@@ -6189,7 +6184,7 @@ fn iterator_proto_weird_set(
     }
 }
 
-fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
+pub(crate) fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
     // CreateIterResultObject: a fresh ordinary object with exactly `value` then `done` as plain
     // data properties — instantiated from one shared shape instead of two keyed inserts.
     thread_local! {
@@ -6204,10 +6199,11 @@ fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
             }
             p
         });
-        Value::Obj(Object::new_with_parts(
+        // Inline slots: the two values live in the object's own allocation.
+        Value::Obj(Object::new_from_template(
             Some(i.object_proto.clone()),
-            map.instantiate_plain([value, Value::Bool(done)].into_iter()),
-            Exotic::None,
+            map,
+            [value, Value::Bool(done)].into_iter(),
         ))
     })
 }
@@ -7126,37 +7122,6 @@ fn drive_generator(
     }
 }
 
-/// Microtask reaction: the awaited promise fulfilled with `args[1]`; resume the async coroutine
-/// (whose result promise is `args[0]`, also the coroutine key).
-pub(crate) fn async_react_fulfil(
-    i: &mut Interp,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    if let Value::Obj(o) = arg(args, 0) {
-        i.drive_async(
-            Gc::as_ptr(&o) as usize,
-            arg(args, 0),
-            crate::coroutine::Resume::Next(arg(args, 1)),
-        );
-    }
-    Ok(Value::Undefined)
-}
-/// Microtask reaction: the awaited promise rejected with `args[1]`; throw it at the suspended await.
-pub(crate) fn async_react_reject(
-    i: &mut Interp,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    if let Value::Obj(o) = arg(args, 0) {
-        i.drive_async(
-            Gc::as_ptr(&o) as usize,
-            arg(args, 0),
-            crate::coroutine::Resume::Throw(arg(args, 1)),
-        );
-    }
-    Ok(Value::Undefined)
-}
 
 pub(crate) fn generator_next(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     drive_generator(i, &this, crate::coroutine::Resume::Next(arg(args, 0)))
@@ -7682,6 +7647,10 @@ pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Resul
     }
     let regexp = arg(a, 0);
     if matches!(regexp, Value::Obj(_)) {
+        // A pristine RegExp's @@match lookup is unobservable: call the intrinsic directly.
+        if let Some(r) = regexp::string_match_pristine(i, &this, &regexp) {
+            return r;
+        }
         if let Some(key) = well_known_key(i, "match") {
             let matcher = ab(i.get_member(&regexp, &key))?;
             if !matches!(matcher, Value::Undefined | Value::Null) {

@@ -1,0 +1,90 @@
+// Functions of every kind, with erasable annotations the location-preserving strip blanks.
+                                        
+                          
+                          
+
+export function add(a        , b        )         {
+  return a + b;
+}
+
+export async function later(ms        )                  {
+  return ms;
+}
+
+export function* count(n        )                    {
+  for (let i         = 0; i < n; i++) yield i;
+}
+
+export const double = (n        )         => n * 2;
+export const asyncArrow = async (s        )                  => s;
+export const single = x => x;
+export const expr = function named(p       )         { return p.x + p.y; };
+
+export class Shape {
+  constructor(name        ) {
+    this.name = name;
+  }
+  area()         {
+    return 0;
+  }
+  get label()         {
+    return this.name;
+  }
+  set label(v        ) {
+    this.name = v;
+  }
+  static make(name        )        {
+    return new Shape(name);
+  }
+  async load(id    )              {
+    return id;
+  }
+  *items()                    {
+    yield 1;
+  }
+  static async *stream()                         {
+    yield 2;
+  }
+}
+
+export class Circle extends Shape {
+  constructor(r        ) {
+    super("circle");
+    this.r = r;
+  }
+  area()         {
+    return Math.PI * this.r * this.r;
+  }
+}
+
+export class Empty {}
+
+export const api = {
+  ping()         { return "pong"; },
+  get version()         { return 1; },
+  handler: (e       )         => e.x,
+  async fetch(u        )                  { return u; },
+};
+
+export function outer(k        )        {
+  const inner = ()         => k;
+  return inner;
+}
+
+export function withDefault(a        , b         = 2, c         )         {
+  return a + b + (c ?? 0);
+}
+
+export function rest(...xs          )         {
+  return xs.length;
+}
+
+export function cast(v         )         {
+  return (v          ) + 1;
+}
+
+export function nonNull(v               )         {
+  return v          ;
+}
+
+export function /* comment */ spaced  (a        )           { return a; }

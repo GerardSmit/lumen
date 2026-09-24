@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::time::Instant;
 
 use lumen_host::{
-    ops, CallbackQueue, CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId,
+    ops, CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId,
     TaskRegistry, Value,
 };
 
@@ -212,10 +212,7 @@ pub(crate) fn install_data_props(
         Some((argv, env)) => (argv.to_vec(), env.to_vec()),
         None => (std::env::args().collect(), std::env::vars().collect()),
     };
-    let argv0_str = args
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "lumen".to_string());
+    let argv0_str = args.first().cloned().unwrap_or_else(|| "lumen".to_string());
     let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
     let argv = ctx.make_array(argv);
     let _ = ctx.set_member(&process, "argv", argv);
@@ -365,7 +362,9 @@ fn op_stdin_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
         _ => return Ok(Value::Undefined),
     };
     let keep = args.get(1).map(|v| ctx.to_boolean(v)).unwrap_or(true);
-    let reg = ctx.host_mut::<TaskRegistry>().expect("runtime installs task registry");
+    let reg = ctx
+        .host_mut::<TaskRegistry>()
+        .expect("runtime installs task registry");
     if keep {
         reg.set_ref(id);
     } else {
@@ -407,7 +406,9 @@ fn op_isatty(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 fn op_tty_size(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let fd = args.first().and_then(|v| v.as_num_opt()).unwrap_or(1.0) as i32;
     match terminal_size(fd) {
-        Some((cols, rows)) => Ok(_ctx.make_array(vec![Value::Num(cols as f64), Value::Num(rows as f64)])),
+        Some((cols, rows)) => {
+            Ok(_ctx.make_array(vec![Value::Num(cols as f64), Value::Num(rows as f64)]))
+        }
         None => Ok(Value::Undefined),
     }
 }
@@ -428,7 +429,11 @@ fn terminal_size(fd: i32) -> Option<(u16, u16)> {
         fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
         fn GetConsoleScreenBufferInfo(h: *mut std::ffi::c_void, info: *mut Info) -> i32;
     }
-    let which = if fd == 2 { -12i32 as u32 } else { -11i32 as u32 };
+    let which = if fd == 2 {
+        -12i32 as u32
+    } else {
+        -11i32 as u32
+    };
     let mut info = Info::default();
     // SAFETY: GetStdHandle takes no pointers; `info` is a CONSOLE_SCREEN_BUFFER_INFO.
     let ok = unsafe { GetConsoleScreenBufferInfo(GetStdHandle(which), &mut info) };
@@ -484,9 +489,18 @@ fn write_raw(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Value
     } else {
         &mut sinks.out
     };
-    // A broken pipe shouldn't crash the runtime (matches console's behavior).
-    let _ = sink.write_all(&bytes);
-    let _ = sink.flush();
+    let written = sink.write_all(&bytes).and_then(|()| sink.flush());
+    // The reader went away: report it as Node's `write EPIPE`, so process.stdout emits 'error'
+    // (a program writing in a loop would otherwise spin forever into a closed pipe). Other
+    // failures stay silent, as console's do.
+    if let Err(e) = written {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            let err = ctx.make_error("Error", "write EPIPE");
+            let _ = ctx.set_member(&err, "code", Value::str("EPIPE"));
+            let _ = ctx.set_member(&err, "syscall", Value::str("write"));
+            return Err(err);
+        }
+    }
     Ok(Value::Undefined)
 }
 
@@ -634,16 +648,118 @@ fn system_memory(_rss: u64) -> (u64, u64) {
     (0, 0)
 }
 
-#[cfg(not(unix))]
+/// The same counters on Windows, from the sources libuv's `uv_getrusage` / `uv_resident_set_memory`
+/// use: process times, memory counters (page faults count as major faults, as in libuv) and I/O
+/// operation counts; free memory from `GlobalMemoryStatusEx`.
+#[cfg(windows)]
 fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(ctx.make_array(vec![Value::Num(0.0); 14]))
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        quota_peak_paged_pool: usize,
+        quota_paged_pool: usize,
+        quota_peak_non_paged_pool: usize,
+        quota_non_paged_pool: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_ops: u64,
+        write_ops: u64,
+        other_ops: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        other_bytes: u64,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemoryCounters, cb: u32) -> i32;
+        fn GetProcessIoCounters(process: isize, counters: *mut IoCounters) -> i32;
+        fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+    }
+    let (mut creation, mut exit, mut kernel, mut user) = Default::default();
+    let mut memory = MemoryCounters {
+        cb: std::mem::size_of::<MemoryCounters>() as u32,
+        ..Default::default()
+    };
+    let mut io = IoCounters::default();
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the pseudo-handle needs no closing; every out pointer is a live, correctly sized
+    // struct (the sized ones carry their size).
+    unsafe {
+        let process = GetCurrentProcess();
+        GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user);
+        K32GetProcessMemoryInfo(process, &mut memory, memory.cb);
+        GetProcessIoCounters(process, &mut io);
+        GlobalMemoryStatusEx(&mut status);
+    }
+    // FILETIME counts 100 ns units.
+    let micros = |t: &FileTime| ((u64::from(t.high) << 32) | u64::from(t.low)) / 10;
+    let values: [u64; 16] = [
+        memory.working_set as u64,
+        memory.peak_working_set as u64 / 1024,
+        micros(&user),
+        micros(&kernel),
+        0,
+        u64::from(memory.page_fault_count),
+        0,
+        io.read_ops,
+        io.write_ops,
+        0,
+        0,
+        0,
+        0,
+        0,
+        status.avail_phys,
+        0,
+    ];
+    Ok(ctx.make_array(values.iter().map(|&v| Value::Num(v as f64)).collect()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(ctx.make_array(vec![Value::Num(0.0); 16]))
 }
 
 fn op_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     if let Some(realm) = ctx.op_state().get::<RealmProcess>() {
-        return Ok(Value::from_string(
-            realm.cwd.to_string_lossy().into_owned(),
-        ));
+        return Ok(Value::from_string(realm.cwd.to_string_lossy().into_owned()));
     }
     match std::env::current_dir() {
         Ok(p) => Ok(Value::from_string(p.to_string_lossy().into_owned())),
@@ -664,6 +780,9 @@ fn op_exit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
 /// every safe point after this, so a `catch` around the call cannot keep the program running.
 fn end_realm_or_process(ctx: &mut Ctx, code: i32) -> Result<Value, Value> {
     let Some(realm) = ctx.host_mut::<RealmProcess>() else {
+        if lumen::memstats::enabled() {
+            ctx.mem_report();
+        }
         std::process::exit(code);
     };
     realm.exit_code.get_or_insert(code);
@@ -682,22 +801,39 @@ fn refuse_in_realm(ctx: &mut Ctx, what: &str) -> Result<(), Value> {
             "Error",
             format!("{what} is not available to a program embedded in a host process"),
         );
-        let _ = ctx.set_member(&err, "code", Value::str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"));
+        let _ = ctx.set_member(
+            &err,
+            "code",
+            Value::str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"),
+        );
         return Err(err);
     }
     Ok(())
 }
 
-/// Queued on the loop's callback queue: runs next turn, before timers. (Node runs nextTick
-/// callbacks even sooner — between microtask checkpoints — but "before any timer" is the
-/// part programs rely on; noted as a deliberate approximation.)
+/// Node's nextTick queue: drained at every tick checkpoint (after the main script, and after
+/// each loop callback), ahead of the promise microtasks, until both are empty — see
+/// `Runtime::checkpoint`.
+#[derive(Default)]
+pub(crate) struct TickQueue {
+    pub(crate) queue: std::collections::VecDeque<(Value, Vec<Value>)>,
+}
+
 fn op_next_tick(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let callback = match args.first() {
         Some(cb) if cb.is_callable() => cb.clone(),
         _ => return Err(ctx.make_error("TypeError", "process.nextTick expects a function")),
     };
     let extra: Vec<Value> = args.iter().skip(1).cloned().collect();
-    CallbackQueue::enqueue(ctx.op_state(), callback, extra);
+    let state = ctx.op_state();
+    if !state.has::<TickQueue>() {
+        state.put(TickQueue::default());
+    }
+    state
+        .get_mut::<TickQueue>()
+        .expect("just installed")
+        .queue
+        .push_back((callback, extra));
     Ok(Value::Undefined)
 }
 
@@ -734,8 +870,17 @@ fn op_abort(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value
     std::process::abort();
 }
 
-/// `(pid, signal)` — deliver `signal` to `pid` via libc `kill(2)`. Real on unix; a no-op that
-/// reports failure elsewhere (lumen ships unix-first). The JS wrapper maps signal names to numbers.
+/// Node's `kill` failure: `Error: kill ESRCH` with `code`, `errno` and `syscall`.
+fn kill_error(ctx: &mut Ctx, code: &str, errno: i32) -> Value {
+    let err = ctx.make_error("Error", format!("kill {code}"));
+    let _ = ctx.set_member(&err, "code", Value::from_string(code.to_string()));
+    let _ = ctx.set_member(&err, "errno", Value::Num(errno as f64));
+    let _ = ctx.set_member(&err, "syscall", Value::str("kill"));
+    err
+}
+
+/// `(pid, signal)` — deliver `signal` to `pid` via libc `kill(2)`. The JS wrapper maps signal
+/// names to numbers.
 #[cfg(unix)]
 fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
@@ -744,14 +889,93 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
     if pid <= 0 || pid as u32 == std::process::id() {
         refuse_in_realm(ctx, "process.kill of the host process")?;
     }
+    // SAFETY: kill(2) takes no pointers.
     let rc = unsafe { ffi::kill(pid, sig) };
     if rc == 0 {
-        Ok(Value::Undefined)
-    } else {
-        Err(ctx.make_error("Error", format!("kill {pid} failed (errno set)")))
+        return Ok(Value::Undefined);
     }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let code = match errno {
+        1 => "EPERM",
+        3 => "ESRCH",
+        22 => "EINVAL",
+        _ => "UNKNOWN",
+    };
+    Err(kill_error(ctx, code, -errno))
 }
-#[cfg(not(unix))]
+
+/// `(pid, signal)` on Windows, as libuv's `uv_kill`: signal 0 checks the process is alive;
+/// SIGTERM, SIGKILL, SIGINT and SIGQUIT terminate it (exit code 1); other signals are ENOSYS.
+#[cfg(windows)]
+fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn TerminateProcess(process: isize, code: u32) -> i32;
+        fn GetExitCodeProcess(process: isize, code: *mut u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    // libuv's error numbers on Windows.
+    const UV_ESRCH: i32 = -4040;
+    const UV_EPERM: i32 = -4048;
+    const UV_ENOSYS: i32 = -4054;
+    const UV_EINVAL: i32 = -4071;
+
+    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
+    let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
+    if pid <= 0 || pid as u32 == std::process::id() {
+        refuse_in_realm(ctx, "process.kill of the host process")?;
+    }
+    if !matches!(sig, 0 | 2 | 3 | 9 | 15) {
+        return Err(kill_error(ctx, "ENOSYS", UV_ENOSYS));
+    }
+    if pid < 0 {
+        return Err(kill_error(ctx, "EINVAL", UV_EINVAL));
+    }
+    let os_error = |ctx: &mut Ctx, e: i32| match e {
+        ERROR_INVALID_PARAMETER => kill_error(ctx, "ESRCH", UV_ESRCH),
+        ERROR_ACCESS_DENIED => kill_error(ctx, "EPERM", UV_EPERM),
+        _ => kill_error(ctx, "UNKNOWN", -4094),
+    };
+    // pid 0 means this process, as in libuv.
+    let pid = if pid == 0 { std::process::id() } else { pid as u32 };
+    let access = PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE;
+    // SAFETY: plain Win32 calls; the handle is closed on every path below.
+    let handle = unsafe { OpenProcess(access, 0, pid) };
+    if handle == 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(os_error(ctx, e));
+    }
+    let mut status = 0u32;
+    // SAFETY: `handle` is open; `status` is a valid out pointer.
+    let alive = unsafe { GetExitCodeProcess(handle, &mut status) } != 0 && status == STILL_ACTIVE;
+    let result = if sig == 0 {
+        if alive {
+            Ok(())
+        } else {
+            Err(kill_error(ctx, "ESRCH", UV_ESRCH))
+        }
+    } else if !alive {
+        Err(kill_error(ctx, "ESRCH", UV_ESRCH))
+    // SAFETY: `handle` is open with PROCESS_TERMINATE.
+    } else if unsafe { TerminateProcess(handle, 1) } != 0 {
+        Ok(())
+    } else {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        Err(os_error(ctx, e))
+    };
+    // SAFETY: `handle` came from OpenProcess and is not used afterwards.
+    unsafe { CloseHandle(handle) };
+    result.map(|()| Value::Undefined)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn op_kill(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Err(ctx.make_error("Error", "process.kill is not supported on this platform"))
 }

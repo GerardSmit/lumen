@@ -1,6 +1,11 @@
 //! Arbitrary-precision BigInt, from scratch: sign + little-endian u64 magnitude behind an `Rc`
-//! (clones are cheap; every operation allocates a fresh value). Conformance needs exactness far
-//! past 128 bits (e.g. comparing a 1024-bit literal with `Number.MAX_VALUE`), not speed.
+//! (clones are cheap; every operation allocates one fresh value).
+//!
+//! The magnitude kernels are sized for crypto-style code (`(a * b) % m` loops over 2048-bit
+//! values): schoolbook multiply with a dedicated squaring path, Karatsuba above
+//! [`KARATSUBA_LIMBS`], Knuth algorithm D for multi-limb division (remainder-only when the
+//! quotient is not wanted), a hardware 128/64 divide for the single-limb steps, and chunked
+//! radix conversion (one short division per `radix^k` chunk instead of per digit).
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -16,11 +21,26 @@ struct BigIntData {
     mag: Vec<u64>,
 }
 
+/// Operand size (limbs, of the shorter factor) from which multiplication switches to Karatsuba.
+const KARATSUBA_LIMBS: usize = 32;
+/// The same threshold for squaring (the schoolbook square does half the products, so it wins
+/// for longer).
+const KARATSUBA_SQR_LIMBS: usize = 48;
+
 fn trim(mut mag: Vec<u64>) -> Vec<u64> {
     while mag.last() == Some(&0) {
         mag.pop();
     }
     mag
+}
+
+/// `a` without its high zero limbs.
+fn trimmed(a: &[u64]) -> &[u64] {
+    let mut n = a.len();
+    while n > 0 && a[n - 1] == 0 {
+        n -= 1;
+    }
+    &a[..n]
 }
 
 fn mag_cmp(a: &[u64], b: &[u64]) -> Ordering {
@@ -37,96 +57,331 @@ fn mag_cmp(a: &[u64], b: &[u64]) -> Ordering {
 }
 
 fn mag_add(a: &[u64], b: &[u64]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
-    let mut carry = 0u128;
-    for i in 0..a.len().max(b.len()) {
-        let s = carry + *a.get(i).unwrap_or(&0) as u128 + *b.get(i).unwrap_or(&0) as u128;
-        out.push(s as u64);
-        carry = s >> 64;
-    }
-    if carry != 0 {
-        out.push(carry as u64);
+    let (a, b) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let mut out = Vec::with_capacity(a.len() + 1);
+    out.extend_from_slice(a);
+    let carry = add_into(&mut out, b);
+    if carry {
+        out.push(1);
     }
     out
 }
 
-/// `a - b` for `a >= b`.
-fn mag_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(a.len());
-    let mut borrow = 0i128;
-    for i in 0..a.len() {
-        let d = a[i] as i128 - *b.get(i).unwrap_or(&0) as i128 - borrow;
-        if d < 0 {
-            out.push((d + (1i128 << 64)) as u64);
-            borrow = 1;
-        } else {
-            out.push(d as u64);
-            borrow = 0;
+/// `acc += b` over `acc.len()` limbs (`acc.len() >= b.len()`); returns the carry out of the top.
+fn add_into(acc: &mut [u64], b: &[u64]) -> bool {
+    let mut carry = false;
+    let (lo, hi) = acc.split_at_mut(b.len());
+    for (x, &y) in lo.iter_mut().zip(b) {
+        let (s, c1) = x.overflowing_add(y);
+        let (s, c2) = s.overflowing_add(carry as u64);
+        *x = s;
+        carry = c1 | c2;
+    }
+    if carry {
+        for x in hi {
+            let (s, c) = x.overflowing_add(1);
+            *x = s;
+            if !c {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// `acc -= b` in place for `acc >= b`.
+fn sub_into(acc: &mut [u64], b: &[u64]) {
+    let mut borrow = false;
+    let (lo, hi) = acc.split_at_mut(b.len());
+    for (x, &y) in lo.iter_mut().zip(b) {
+        let (d, b1) = x.overflowing_sub(y);
+        let (d, b2) = d.overflowing_sub(borrow as u64);
+        *x = d;
+        borrow = b1 | b2;
+    }
+    if borrow {
+        for x in hi {
+            let (d, b) = x.overflowing_sub(1);
+            *x = d;
+            if !b {
+                break;
+            }
         }
     }
+}
+
+/// `a - b` for `a >= b`.
+fn mag_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = a.to_vec();
+    sub_into(&mut out, b);
     trim(out)
 }
 
+/// `out[..b.len()] += x * b`, returning the carry limb (to be stored at `out[b.len()]`).
+#[inline]
+fn mac_row(out: &mut [u64], b: &[u64], x: u64) -> u64 {
+    let mut carry = 0u64;
+    for (o, &y) in out.iter_mut().zip(b) {
+        let t = *o as u128 + x as u128 * y as u128 + carry as u128;
+        *o = t as u64;
+        carry = (t >> 64) as u64;
+    }
+    carry
+}
+
+/// Schoolbook product into a zeroed `out` of exactly `a.len() + b.len()` limbs.
+fn mul_school(a: &[u64], b: &[u64], out: &mut [u64]) {
+    for (i, &x) in a.iter().enumerate() {
+        if x != 0 {
+            out[i + b.len()] = mac_row(&mut out[i..], b, x);
+        }
+    }
+}
+
+/// Schoolbook square into a zeroed `out` of exactly `2 * a.len()` limbs: the off-diagonal
+/// products once, doubled by a one-bit shift, plus the diagonal squares.
+fn sqr_school(a: &[u64], out: &mut [u64]) {
+    let n = a.len();
+    for i in 0..n {
+        let x = a[i];
+        if x != 0 && i + 1 < n {
+            out[i + n] = mac_row(&mut out[2 * i + 1..], &a[i + 1..], x);
+        }
+    }
+    let mut top = 0u64;
+    for o in out.iter_mut() {
+        let v = *o;
+        *o = (v << 1) | top;
+        top = v >> 63;
+    }
+    let mut carry = 0u64;
+    for i in 0..n {
+        let sq = a[i] as u128 * a[i] as u128;
+        let t = out[2 * i] as u128 + (sq as u64) as u128 + carry as u128;
+        out[2 * i] = t as u64;
+        let t = out[2 * i + 1] as u128 + (sq >> 64) + (t >> 64);
+        out[2 * i + 1] = t as u64;
+        carry = (t >> 64) as u64;
+    }
+}
+
+/// Product of two magnitudes (any lengths, high zero limbs allowed), trimmed.
 fn mag_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let (a, b) = (trimmed(a), trimmed(b));
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
     let mut out = vec![0u64; a.len() + b.len()];
-    for (i, &x) in a.iter().enumerate() {
-        let mut carry = 0u128;
-        for (j, &y) in b.iter().enumerate() {
-            let cur = out[i + j] as u128 + x as u128 * y as u128 + carry;
-            out[i + j] = cur as u64;
-            carry = cur >> 64;
+    mul_into(a, b, &mut out);
+    trim(out)
+}
+
+/// `out = a * b` for a zeroed `out` of exactly `a.len() + b.len()` limbs.
+fn mul_into(a: &[u64], b: &[u64], out: &mut [u64]) {
+    let (a, b) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    if b.len() < KARATSUBA_LIMBS {
+        mul_school(a, b, out);
+    } else if a.len() >= 2 * b.len() {
+        // Unbalanced: multiply `b`-sized slices of `a` and accumulate.
+        let mut tmp = vec![0u64; 2 * b.len()];
+        let mut i = 0;
+        while i < a.len() {
+            let chunk = &a[i..(i + b.len()).min(a.len())];
+            let t = &mut tmp[..chunk.len() + b.len()];
+            t.fill(0);
+            mul_into(chunk, b, t);
+            add_into(&mut out[i..], trimmed(t));
+            i += b.len();
         }
-        let mut k = i + b.len();
-        while carry != 0 {
-            let cur = out[k] as u128 + carry;
-            out[k] = cur as u64;
-            carry = cur >> 64;
-            k += 1;
-        }
+    } else {
+        // Balanced Karatsuba: a = a1·B^m + a0, b = b1·B^m + b0 (b1 non-empty since b > a/2 ≥ m).
+        let m = a.len() / 2;
+        let (a0, a1) = (trimmed(&a[..m]), &a[m..]);
+        let (b0, b1) = (trimmed(&b[..m]), &b[m..]);
+        let z0 = mag_mul(a0, b0);
+        let z2 = mag_mul(a1, b1);
+        let mut z1 = mag_mul(&mag_add(a0, a1), &mag_add(b0, b1));
+        sub_into(&mut z1, &z0);
+        sub_into(&mut z1, &z2);
+        add_into(out, &z0);
+        add_into(&mut out[m..], trimmed(&z1));
+        add_into(&mut out[2 * m..], &z2);
+    }
+}
+
+/// `a * a`, trimmed.
+fn mag_sqr(a: &[u64]) -> Vec<u64> {
+    let a = trimmed(a);
+    if a.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![0u64; 2 * a.len()];
+    if a.len() < KARATSUBA_SQR_LIMBS {
+        sqr_school(a, &mut out);
+    } else {
+        let m = a.len() / 2;
+        let (a0, a1) = (trimmed(&a[..m]), &a[m..]);
+        let z0 = mag_sqr(a0);
+        let z2 = mag_sqr(a1);
+        let mut z1 = mag_sqr(&mag_add(a0, a1));
+        sub_into(&mut z1, &z0);
+        sub_into(&mut z1, &z2);
+        add_into(&mut out, &z0);
+        add_into(&mut out[m..], trimmed(&z1));
+        add_into(&mut out[2 * m..], &z2);
     }
     trim(out)
 }
 
-/// Schoolbook division: `(quotient, remainder)` of `a / b` with `b` non-zero.
-fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+/// `(hi·2^64 + lo) / d` and its remainder, for `hi < d` (so the quotient fits a limb).
+#[inline]
+fn div2by1(hi: u64, lo: u64, d: u64) -> (u64, u64) {
+    debug_assert!(hi < d);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (q, r): (u64, u64);
+        // SAFETY: `hi < d` guarantees the quotient fits in RAX, so `div` cannot fault.
+        unsafe {
+            core::arch::asm!(
+                "div {d}",
+                d = in(reg) d,
+                inout("rax") lo => q,
+                inout("rdx") hi => r,
+                options(pure, nomem, nostack)
+            );
+        }
+        (q, r)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let n = ((hi as u128) << 64) | lo as u128;
+        ((n / d as u128) as u64, (n % d as u128) as u64)
+    }
+}
+
+/// In-place short division of `a` by the limb `d` (non-zero); returns the remainder. `a` is left
+/// untrimmed.
+fn div_small_in_place(a: &mut [u64], d: u64) -> u64 {
+    let mut rem = 0u64;
+    for x in a.iter_mut().rev() {
+        let (q, r) = div2by1(rem, *x, d);
+        *x = q;
+        rem = r;
+    }
+    rem
+}
+
+/// `a << s` for `s < 64`, written into a new vector of `a.len() + extra` limbs.
+fn shl_bits(a: &[u64], s: u32, extra: usize) -> Vec<u64> {
+    let mut out = Vec::with_capacity(a.len() + extra);
+    if s == 0 {
+        out.extend_from_slice(a);
+        out.resize(a.len() + extra, 0);
+        return out;
+    }
+    let mut carry = 0u64;
+    for &x in a {
+        out.push((x << s) | carry);
+        carry = x >> (64 - s);
+    }
+    if extra > 0 {
+        out.push(carry);
+        out.resize(a.len() + extra, 0);
+    }
+    out
+}
+
+/// `(quotient, remainder)` of `a / b` with `b` non-zero (both trimmed). The quotient is only
+/// computed when `want_q` (otherwise it comes back empty).
+fn mag_divmod(a: &[u64], b: &[u64], want_q: bool) -> (Vec<u64>, Vec<u64>) {
     if mag_cmp(a, b) == Ordering::Less {
         return (Vec::new(), a.to_vec());
     }
     if b.len() == 1 {
-        let d = b[0] as u128;
-        let mut q = vec![0u64; a.len()];
-        let mut rem = 0u128;
-        for i in (0..a.len()).rev() {
-            let cur = (rem << 64) | a[i] as u128;
-            q[i] = (cur / d) as u64;
-            rem = cur % d;
-        }
-        return (trim(q), trim(vec![rem as u64]));
+        let mut q = a.to_vec();
+        let r = div_small_in_place(&mut q, b[0]);
+        let q = if want_q { trim(q) } else { Vec::new() };
+        return (q, if r == 0 { Vec::new() } else { vec![r] });
     }
-    // Bit-by-bit long division (slow but simple; conformance sizes are small).
-    let bits = a.len() * 64;
-    let mut q = vec![0u64; a.len()];
-    let mut rem: Vec<u64> = Vec::new();
-    for i in (0..bits).rev() {
-        // rem = rem << 1 | bit(a, i)
-        let mut carry = (a[i / 64] >> (i % 64)) & 1;
-        for limb in rem.iter_mut() {
-            let hi = *limb >> 63;
-            *limb = (*limb << 1) | carry;
-            carry = hi;
+    // Knuth, TAOCP vol. 2, 4.3.1 algorithm D, on base-2^64 digits.
+    let n = b.len();
+    let m = a.len() - n;
+    let s = b[n - 1].leading_zeros();
+    let v = shl_bits(b, s, 0);
+    let mut u = shl_bits(a, s, 1);
+    let mut q = if want_q { vec![0u64; m + 1] } else { Vec::new() };
+    let (vtop, vnext) = (v[n - 1], v[n - 2]);
+    for j in (0..=m).rev() {
+        let (u2, u1, u0) = (u[j + n], u[j + n - 1], u[j + n - 2]);
+        // Estimate q̂ from the top two limbs and refine it against the third (at most 2 off → 0/1).
+        let (mut qhat, mut rhat, mut refine) = if u2 >= vtop {
+            let (r, of) = u1.overflowing_add(vtop);
+            (u64::MAX, r, !of)
+        } else {
+            let (q, r) = div2by1(u2, u1, vtop);
+            (q, r, true)
+        };
+        while refine && qhat as u128 * vnext as u128 > ((rhat as u128) << 64 | u0 as u128) {
+            qhat -= 1;
+            let (r, of) = rhat.overflowing_add(vtop);
+            rhat = r;
+            refine = !of;
         }
-        if carry != 0 {
-            rem.push(carry);
+        // u[j..=j+n] -= q̂ · v
+        let mut mul_carry = 0u64;
+        let mut borrow = false;
+        for i in 0..n {
+            let p = qhat as u128 * v[i] as u128 + mul_carry as u128;
+            mul_carry = (p >> 64) as u64;
+            let (d, b1) = u[j + i].overflowing_sub(p as u64);
+            let (d, b2) = d.overflowing_sub(borrow as u64);
+            u[j + i] = d;
+            borrow = b1 | b2;
         }
-        if mag_cmp(&rem, b) != Ordering::Less {
-            rem = mag_sub(&rem, b);
-            q[i / 64] |= 1 << (i % 64);
+        let (d, b1) = u[j + n].overflowing_sub(mul_carry);
+        let (d, b2) = d.overflowing_sub(borrow as u64);
+        u[j + n] = d;
+        if b1 | b2 {
+            // q̂ was one too large: add v back.
+            qhat -= 1;
+            let c = add_into(&mut u[j..j + n], &v);
+            u[j + n] = u[j + n].wrapping_add(c as u64);
+        }
+        if want_q {
+            q[j] = qhat;
         }
     }
-    (trim(q), rem)
+    // Remainder: the low `n` limbs of `u`, shifted back down by `s`.
+    u.truncate(n);
+    if s != 0 {
+        for i in 0..n {
+            let hi = if i + 1 < n { u[i + 1] << (64 - s) } else { 0 };
+            u[i] = (u[i] >> s) | hi;
+        }
+    }
+    (if want_q { trim(q) } else { Vec::new() }, trim(u))
+}
+
+/// `acc = acc * m + c` in place; returns the carry limb out of the top.
+fn mac_small(acc: &mut [u64], m: u64, c: u64) -> u64 {
+    let mut carry = c;
+    for x in acc.iter_mut() {
+        let t = *x as u128 * m as u128 + carry as u128;
+        *x = t as u64;
+        carry = (t >> 64) as u64;
+    }
+    carry
+}
+
+/// Largest power of `radix` fitting in a limb, and its exponent (digits per chunk).
+fn radix_chunk(radix: u32) -> (u64, usize) {
+    let (mut p, mut k) = (radix as u64, 1usize);
+    while let Some(n) = p.checked_mul(radix as u64) {
+        p = n;
+        k += 1;
+    }
+    (p, k)
 }
 
 impl JsBigInt {
@@ -211,17 +466,30 @@ impl JsBigInt {
         }
     }
     pub fn sub(&self, o: &Self) -> Self {
-        self.add(&o.neg())
+        if self.0.neg != o.0.neg {
+            Self::make(self.0.neg, mag_add(&self.0.mag, &o.0.mag))
+        } else {
+            match mag_cmp(&self.0.mag, &o.0.mag) {
+                Ordering::Equal => Self::zero(),
+                Ordering::Greater => Self::make(self.0.neg, mag_sub(&self.0.mag, &o.0.mag)),
+                Ordering::Less => Self::make(!self.0.neg, mag_sub(&o.0.mag, &self.0.mag)),
+            }
+        }
     }
     pub fn mul(&self, o: &Self) -> Self {
-        Self::make(self.0.neg != o.0.neg, mag_mul(&self.0.mag, &o.0.mag))
+        let mag = if Rc::ptr_eq(&self.0, &o.0) || self.0.mag == o.0.mag {
+            mag_sqr(&self.0.mag)
+        } else {
+            mag_mul(&self.0.mag, &o.0.mag)
+        };
+        Self::make(self.0.neg != o.0.neg, mag)
     }
     /// Truncating division; `None` on division by zero.
     pub fn div(&self, o: &Self) -> Option<Self> {
         if o.is_zero() {
             return None;
         }
-        let (q, _) = mag_divmod(&self.0.mag, &o.0.mag);
+        let (q, _) = mag_divmod(&self.0.mag, &o.0.mag, true);
         Some(Self::make(self.0.neg != o.0.neg, q))
     }
     /// Remainder with the dividend's sign; `None` on division by zero.
@@ -229,7 +497,7 @@ impl JsBigInt {
         if o.is_zero() {
             return None;
         }
-        let (_, r) = mag_divmod(&self.0.mag, &o.0.mag);
+        let (_, r) = mag_divmod(&self.0.mag, &o.0.mag, false);
         Some(Self::make(self.0.neg, r))
     }
     /// Exponentiation; `None` for a negative exponent.
@@ -321,6 +589,14 @@ impl JsBigInt {
     }
     /// Bitwise op over two's-complement representations of arbitrary width.
     fn bitop(&self, o: &Self, f: fn(u64, u64) -> u64) -> Self {
+        if !self.0.neg && !o.0.neg {
+            // Both non-negative: the magnitudes are the two's-complement forms (zero-extended).
+            let (a, b) = (&self.0.mag, &o.0.mag);
+            let out: Vec<u64> = (0..a.len().max(b.len()))
+                .map(|i| f(*a.get(i).unwrap_or(&0), *b.get(i).unwrap_or(&0)))
+                .collect();
+            return Self::make(false, out);
+        }
         let n = self.0.mag.len().max(o.0.mag.len()) + 1;
         let a = self.twos(n);
         let b = o.twos(n);
@@ -456,16 +732,33 @@ impl JsBigInt {
 
     /// Parse from digits (no sign) in the given radix.
     pub fn parse_radix(text: &str, radix: u32) -> Option<Self> {
-        let mut acc = Self::zero();
-        let r = Self::from_u64(radix as u64);
-        let mut any = false;
+        // Accumulate `k` digits at a time into one limb, then `acc = acc * radix^k + chunk` in
+        // place.
+        let (_, k) = radix_chunk(radix);
+        let mut acc: Vec<u64> = Vec::new();
+        let (mut chunk, mut scale, mut n, mut any) = (0u64, 1u64, 0usize, false);
+        let flush = |acc: &mut Vec<u64>, scale: u64, chunk: u64| {
+            let carry = mac_small(acc, scale, chunk);
+            if carry != 0 {
+                acc.push(carry);
+            }
+        };
         for c in text.chars() {
             let d = c.to_digit(radix)?;
-            acc = acc.mul(&r).add(&Self::from_u64(d as u64));
+            chunk = chunk * radix as u64 + d as u64;
+            scale *= radix as u64;
+            n += 1;
             any = true;
+            if n == k {
+                flush(&mut acc, scale, chunk);
+                (chunk, scale, n) = (0, 1, 0);
+            }
+        }
+        if n > 0 {
+            flush(&mut acc, scale, chunk);
         }
         if any {
-            Some(acc)
+            Some(Self::make(false, acc))
         } else {
             None
         }
@@ -482,19 +775,29 @@ impl JsBigInt {
         if self.is_zero() {
             return "0".to_string();
         }
-        let mut digits = Vec::new();
+        // Peel off `k` digits per short division by `radix^k` (least significant chunk first).
+        let (big, k) = radix_chunk(radix);
+        let mut digits: Vec<u8> = Vec::with_capacity(self.bit_len() / 3 + k + 1);
         let mut cur = self.0.mag.clone();
-        let r = vec![radix as u64];
         while !cur.is_empty() {
-            let (q, rem) = mag_divmod(&cur, &r);
-            let d = *rem.first().unwrap_or(&0) as u32;
-            digits.push(std::char::from_digit(d, radix).unwrap());
-            cur = q;
+            let mut rem = div_small_in_place(&mut cur, big);
+            while cur.last() == Some(&0) {
+                cur.pop();
+            }
+            // Every chunk but the most significant is zero-padded to `k` digits.
+            let mut emitted = 0;
+            while rem != 0 || (!cur.is_empty() && emitted < k) {
+                let d = (rem % radix as u64) as u32;
+                digits.push(std::char::from_digit(d, radix).unwrap() as u8);
+                rem /= radix as u64;
+                emitted += 1;
+            }
         }
         if self.0.neg {
-            digits.push('-');
+            digits.push(b'-');
         }
-        digits.iter().rev().collect()
+        digits.reverse();
+        String::from_utf8(digits).expect("ASCII digits")
     }
 }
 
@@ -671,6 +974,47 @@ mod tests {
         );
         assert_eq!(big("-9007199254740992").to_f64(), -9007199254740992.0);
         assert_eq!(big("2").pow(&big("100")).unwrap().to_f64(), 2f64.powi(100));
+    }
+
+    #[test]
+    fn karatsuba_and_knuth_d_agree_with_schoolbook() {
+        // xorshift limbs, including all-ones / sparse patterns that stress q̂ correction.
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for round in 0..300 {
+            let la = 1 + (next() % 140) as usize;
+            let lb = 1 + (next() % 140) as usize;
+            let mut gen = |n: usize| -> Vec<u64> {
+                (0..n)
+                    .map(|i| match round % 4 {
+                        0 => u64::MAX,
+                        1 if i % 3 == 0 => 0,
+                        2 if i + 1 == n => 1 << 63,
+                        _ => next(),
+                    })
+                    .collect()
+            };
+            let a = super::trim(gen(la));
+            let b = super::trim(gen(lb));
+            if a.is_empty() || b.is_empty() {
+                continue;
+            }
+            let mut school = vec![0u64; a.len() + b.len()];
+            super::mul_school(&a, &b, &mut school);
+            let school = super::trim(school);
+            assert_eq!(super::mag_mul(&a, &b), school, "mul {la}x{lb}");
+            assert_eq!(super::mag_sqr(&a), super::mag_mul(&a, &a.clone()), "sqr {la}");
+            let (q, r) = super::mag_divmod(&a, &b, true);
+            assert_eq!(super::mag_cmp(&r, &b), Ordering::Less);
+            let back = super::mag_add(&super::mag_mul(&q, &b), &r);
+            assert_eq!(super::trim(back), a, "divmod {la}/{lb}");
+            assert_eq!(super::mag_divmod(&a, &b, false).1, r);
+        }
     }
 
     #[test]

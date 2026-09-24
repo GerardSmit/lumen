@@ -2,9 +2,15 @@
 //! tree. Any failure is a [`ParseError`], which the engine reports as a SyntaxError (parse phase).
 
 use crate::ast::*;
-use crate::lexer::tokenize_goal_chars;
+use crate::lexer::{tokenize_opts, LexOpts};
 use crate::token::{RegexTok, Tok, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
+
+mod ts;
+pub use ts::{error_code, side_table_for, ParamTy, SideFn, SideTable, Span as TsSpan};
+#[cfg(feature = "typed")]
+pub(crate) use ts::side_analysis;
+pub(crate) use ts::error_span as ts_error_span;
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -89,14 +95,115 @@ fn parse_script_inner(
     lazy: bool,
     eager_outermost: bool,
 ) -> Result<Vec<Stmt>, ParseError> {
+    parse_script_impl(
+        src,
+        strict,
+        allow_new_target,
+        allow_super,
+        private_names,
+        lazy,
+        eager_outermost,
+        false,
+        false,
+    )
+    .map(|r| r.0)
+}
+
+/// What lexing a whole source produced (see [`lex_source`]).
+struct Lexed {
+    tokens: Vec<Token>,
+    ts: Option<Box<ts::TsState>>,
+    docs: Vec<(u32, u32)>,
+}
+
+/// Lex a whole source for a parse, in TypeScript mode when `ts`. JSDoc comment spans are
+/// recorded only with the `typed` feature.
+fn lex_source(src: &str, html: bool, ts: bool) -> Result<Lexed, ParseError> {
     crate::bytecode::reflect::note_source(src);
     let chars: Vec<char> = src.chars().collect();
-    let tokens = tokenize_goal_chars(&chars, true).map_err(|e| ParseError {
+    let opts = LexOpts {
+        ts,
+        docs: cfg!(feature = "typed"),
+        start_div: false,
+    };
+    let lexed = tokenize_opts(&chars, html, 1, opts).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
         at_eof: e.at_eof,
     })?;
-    drop(chars);
+    let ts = ts.then(|| {
+        let mut st = ts::TsState::new(html);
+        st.soft_err = lexed.soft_err;
+        st
+    });
+    Ok(Lexed {
+        tokens: lexed.tokens,
+        ts,
+        docs: lexed.docs,
+    })
+}
+
+/// After a parse: a TypeScript parse is finished (see `Parser::ts_finish`); a JavaScript one
+/// registers its JSDoc spans.
+fn finish_parse(
+    p: &mut Parser,
+    docs: &[(u32, u32)],
+    result: Result<(), ParseError>,
+    want_text: bool,
+) -> Result<Option<String>, ParseError> {
+    if let Some(t) = p.ts.as_mut() {
+        // Where the parser's error was (the last one raised), for Node's code frame.
+        let parse_at = ts::error_span();
+        ts::set_error_offset(None);
+        // A lexer error ended the tokens early: report it, unless the parser failed first.
+        if let Some(le) = t.soft_err.take() {
+            let lex = ParseError {
+                message: le.message,
+                line: le.line,
+                at_eof: le.at_eof,
+            };
+            return Err(match result {
+                Err(pe) if pe.line < lex.line && pe.line != 0 => {
+                    ts::set_error_offset(parse_at.map(|s| s.0));
+                    pe
+                }
+                _ => lex,
+            });
+        }
+        if result.is_err() {
+            ts::set_error_offset(parse_at.map(|s| s.0));
+        }
+        result?;
+        let spans: Vec<(u32, u32)> = docs
+            .iter()
+            .filter_map(|&(s, e)| p.src.byte_range(s, e))
+            .collect();
+        p.ts.as_mut().expect("ts").docs = spans;
+        return p.ts_finish(want_text);
+    }
+    result?;
+    ts::note_js_docs(&p.src, docs);
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_script_impl(
+    src: &str,
+    strict: bool,
+    allow_new_target: bool,
+    allow_super: bool,
+    private_names: &[String],
+    lazy: bool,
+    eager_outermost: bool,
+    ts: bool,
+    cjs: bool,
+) -> Result<(Vec<Stmt>, Option<String>, bool), ParseError> {
+    let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
+    let Lexed {
+        tokens,
+        ts: ts_state,
+        docs,
+    } = lex_source(src, true, ts)?;
     let private_scope = (!private_names.is_empty()).then(|| {
         Rc::new(PrivateScope {
             names: std::cell::OnceCell::from(private_names.to_vec()),
@@ -119,8 +226,8 @@ fn parse_script_inner(
         no_in: false,
         last_for_await: false,
         module: false,
-        fn_depth: 0,
-        nonarrow_fn_depth: 0,
+        fn_depth: u32::from(cjs),
+        nonarrow_fn_depth: u32::from(cjs),
         iter_depth: 0,
         switch_depth: 0,
         labels: Vec::new(),
@@ -143,10 +250,18 @@ fn parse_script_inner(
         in_static_block: false,
         check_skipped: true,
         pending_private: Vec::new(),
+        ts: ts_state,
     };
     let strict_prologue = p.has_use_strict_prologue();
     p.strict = p.strict || strict_prologue;
-    let body = p.parse_stmts_until_eof()?;
+    let body = p.parse_stmts_until_eof();
+    let (body, text) = match body {
+        Ok(b) => (b, finish_parse(&mut p, &docs, Ok(()), ts)?),
+        Err(e) => {
+            finish_parse(&mut p, &docs, Err(e.clone()), ts)?;
+            return Err(e);
+        }
+    };
     p.resolve_pending_private()?;
     // A direct eval sees the private names visible where it was called.
     let mut st: Vec<Vec<String>> = Vec::new();
@@ -169,9 +284,11 @@ fn parse_script_inner(
             });
         }
     }
+    // The caller running this script names its stack-trace frames after this source.
+    crate::interpreter::stack_trace::note_parsed_source(p.src.src.clone(), None);
     drop(p);
     release_parse_scratch(src.len());
-    Ok(body)
+    Ok((body, text, strict_prologue))
 }
 
 /// A large parse leaves the token vector and char buffer (≈12 bytes per source byte) freed but
@@ -189,19 +306,98 @@ fn release_parse_scratch(src_len: usize) {
 /// Parse a module (always strict; `import`/`export` are allowed only here). Modules permit top-level
 /// `await`, so `await` is treated as a keyword at the module's top level.
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
-    crate::bytecode::reflect::note_source(src);
-    let chars: Vec<char> = src.chars().collect();
-    let tokens = tokenize_goal_chars(&chars, false).map_err(|e| ParseError {
-        at_eof: e.at_eof,
-        message: e.message,
-        line: e.line,
-    })?;
-    drop(chars);
+    parse_module_impl(src, false, false, lazy_bodies()).map(|r| r.0)
+}
+
+/// Parse a TypeScript module with Node's strip-only semantics (see `parser/ts.rs`). The
+/// erased TypeScript becomes whitespace in the functions' source text, so every position is
+/// the file's.
+pub fn parse_module_ts(src: &str) -> Result<Vec<Stmt>, ParseError> {
+    parse_module_impl(src, true, false, lazy_bodies()).map(|r| r.0)
+}
+
+/// A CommonJS module as the function `function (params…) { src }`, parsed with no synthesized
+/// header: the body is the file itself, so every position (function text, stack frames, type
+/// side table keys) is the file's. TypeScript when `ts`.
+pub fn parse_cjs_function(src: &str, params: &[&str], ts: bool) -> Result<Function, ParseError> {
+    let (body, _, strict) =
+        parse_script_impl(src, false, false, false, &[], lazy_bodies(), false, ts, true)?;
+    let params: Vec<Param> = params
+        .iter()
+        .map(|p| Param {
+            pattern: Pattern::Ident(p.to_string()),
+            default: None,
+            rest: false,
+        })
+        .collect();
+    if let Some(dup) = params_body_lexical_clash(&params, &body) {
+        return Err(ParseError {
+            message: format!("Identifier '{dup}' has already been declared"),
+            line: 0,
+            at_eof: false,
+        });
+    }
+    let source = crate::interpreter::stack_trace::take_parsed_source()
+        .map_or(FnSource::None, |(src, _)| {
+            let end = src.len() as u32;
+            FnSource::Range { src, start: 0, end }
+        });
+    Ok(Function {
+        scan: std::cell::Cell::new(0),
+        hoist: std::cell::RefCell::new(None),
+        body_used: std::cell::Cell::new(false),
+        calls: std::cell::Cell::new(0),
+        code: std::cell::OnceCell::new(),
+        fn_maps: std::cell::OnceCell::new(),
+        lazy_error: std::cell::OnceCell::new(),
+        name: None,
+        params,
+        body: std::cell::RefCell::new(Some(Rc::new(body))),
+        lazy: std::cell::RefCell::new(None),
+        is_arrow: false,
+        is_strict: strict,
+        expr_body: false,
+        is_generator: false,
+        is_async: false,
+        is_method: false,
+        is_fn_expr: true,
+        source,
+    })
+}
+
+/// Node's `stripTypeScriptTypes`: the source with its TypeScript erased. Parsed as a module that
+/// also allows a top-level `return` (as CommonJS code may have), else as a script. On failure,
+/// the error and the byte offset of the unsupported syntax, when that is the cause.
+pub fn strip_types(src: &str) -> Result<String, (ParseError, Option<(u32, u32)>)> {
+    match parse_module_impl(src, true, true, true) {
+        Ok((_, text)) => Ok(text.unwrap_or_default()),
+        Err(e) => {
+            let at = ts::error_span();
+            match parse_script_impl(src, false, false, false, &[], true, false, true, false) {
+                Ok((_, text, _)) => Ok(text.unwrap_or_default()),
+                Err(_) => Err((e, at)),
+            }
+        }
+    }
+}
+
+fn parse_module_impl(
+    src: &str,
+    ts: bool,
+    allow_return: bool,
+    lazy: bool,
+) -> Result<(Vec<Stmt>, Option<String>), ParseError> {
+    let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
+    let Lexed {
+        tokens,
+        ts: ts_state,
+        docs,
+    } = lex_source(src, false, ts)?;
     let mut p = Parser {
         toks: tokens,
         pos: 0,
         src: SrcMap::whole(src),
-        lazy: lazy_bodies(),
+        lazy,
         eager_outermost: false,
         private_scope: None,
         in_field_init: false,
@@ -213,7 +409,7 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         no_in: false,
         last_for_await: false,
         module: true,
-        fn_depth: 0,
+        fn_depth: u32::from(allow_return),
         nonarrow_fn_depth: 0,
         iter_depth: 0,
         switch_depth: 0,
@@ -237,18 +433,32 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         in_static_block: false,
         check_skipped: true,
         pending_private: Vec::new(),
+        ts: ts_state,
     };
-    let body = p.parse_stmts_until_eof()?;
+    let body = p.parse_stmts_until_eof();
+    let (body, text) = match body {
+        Ok(b) => (b, finish_parse(&mut p, &docs, Ok(()), ts)?),
+        Err(e) => {
+            finish_parse(&mut p, &docs, Err(e.clone()), ts)?;
+            return Err(e);
+        }
+    };
     p.resolve_pending_private()?;
-    validate_module(&body)?;
+    // Node's type stripper does not link: an `export { T }` naming an erased type is left to
+    // fail when the module runs.
+    if !(ts && allow_return) {
+        validate_module(&body)?;
+    }
     validate_private_names(&body).map_err(|message| ParseError {
         at_eof: false,
         message,
         line: 0,
     })?;
+    // The caller running this module names its stack-trace frames after this source.
+    crate::interpreter::stack_trace::note_parsed_source(p.src.src.clone(), None);
     drop(p);
     release_parse_scratch(src.len());
-    Ok(body)
+    Ok((body, text))
 }
 
 /// Module-level early errors: ExportedNames must be unique, top-level lexical+import bindings must be
@@ -410,6 +620,7 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 /// range, seed a parser from the context the body was written in, and run the body-dependent
 /// early errors the eager path would have reported at load.
 pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
+    let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
     let (s, e) = (lazy.start as usize, lazy.end as usize);
     let chars: Vec<char> = lazy.src[s..e].chars().collect();
     let tokens =
@@ -462,6 +673,7 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         in_static_block: false,
         check_skipped: false,
         pending_private: Vec::new(),
+        ts: None,
     };
     p.expect_punct("{")?;
     let body = p.parse_block_body()?;
@@ -498,6 +710,8 @@ const MAX_PARSE_DEPTH: u32 = 1200;
 struct SrcMap {
     src: Rc<str>,
     base: u32,
+    /// End of the lexed slice in `src`.
+    end: u32,
     /// Byte offset of each char index in the lexed slice, plus one past the last char; `None`
     /// when the slice is ASCII and the two coincide.
     bytes: Option<Vec<u32>>,
@@ -518,6 +732,7 @@ impl SrcMap {
         SrcMap {
             src,
             base: start,
+            end,
             bytes,
         }
     }
@@ -624,6 +839,8 @@ struct Parser {
     /// declares, with the class scope they must resolve in. Resolved once parsing finishes, when
     /// every enclosing class's names are known.
     pending_private: Vec<PendingPrivate>,
+    /// TypeScript mode (see [`ts`]); `None` for JavaScript, which it costs nothing.
+    ts: Option<Box<ts::TsState>>,
 }
 
 /// See [`Parser::pending_private`].
@@ -638,11 +855,14 @@ thread_local! {
     /// parsed from, its byte offset there, and a hash of its raw text. A tagged template inside
     /// a lazily-parsed body must present the same strings object after the body was released
     /// and parsed again (GetTemplateObject is per *site*), so the id derives from where the
-    /// site is, not from the node the parse produced. A freed source whose address is reused
-    /// by another can only collide with a site whose raw text matches — the same strings, so the
-    /// worst case is two identical sites sharing one frozen object.
-    static TEMPLATE_SITES: std::cell::RefCell<(crate::fasthash::FastMap<(usize, u32, u64), u32>, u32)> =
-        std::cell::RefCell::new((Default::default(), 0));
+    /// site is, not from the node the parse produced. Each entry keeps a weak handle on its
+    /// source: an entry whose source was freed (so no body can be parsed from it again) is stale,
+    /// and a new source reusing the address — say a second `eval` of the same text, whose sites
+    /// are distinct — gets fresh ids.
+    static TEMPLATE_SITES: std::cell::RefCell<(
+        crate::fasthash::FastMap<(usize, u32, u64), (std::rc::Weak<str>, u32)>,
+        u32,
+    )> = std::cell::RefCell::new((Default::default(), 0));
 }
 
 fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]) -> u32 {
@@ -654,10 +874,14 @@ fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]
     let key = (Rc::as_ptr(src) as *const u8 as usize, offset, h.finish());
     TEMPLATE_SITES.with(|t| {
         let (map, next) = &mut *t.borrow_mut();
-        *map.entry(key).or_insert_with(|| {
-            *next += 1;
-            *next
-        })
+        match map.get(&key) {
+            Some((live, id)) if live.strong_count() != 0 => *id,
+            _ => {
+                *next += 1;
+                map.insert(key, (Rc::downgrade(src), *next));
+                *next
+            }
+        }
     })
 }
 
@@ -733,6 +957,66 @@ impl Parser {
     fn cur_start(&self) -> u32 {
         self.toks.get(self.pos).map(|t| t.start).unwrap_or(0)
     }
+    /// The source position ([`NO_POS`] convention) of token `idx`: its byte offset in the file.
+    fn tok_pos(&self, idx: usize) -> u32 {
+        match self.toks.get(idx) {
+            Some(t) => self.src.byte_range(t.start, t.start).map_or(NO_POS, |(b, _)| b),
+            None => NO_POS,
+        }
+    }
+    /// The position of a call whose `(` is the current token: V8 reports an identifier-named
+    /// callee (`f()`, `o.m()`, `super()`) at that name, anything else at the parenthesis.
+    fn call_pos(&self) -> u32 {
+        // TypeScript type arguments (`f<T>()`) are not there once erased.
+        let at = if self.ts.is_some() {
+            self.ts_skip_erased_back(self.pos)
+        } else {
+            self.pos
+        };
+        let named = at > 0
+            && matches!(
+                self.toks[at - 1].kind,
+                Tok::Ident(_) | Tok::Keyword("super")
+            );
+        self.tok_pos(if named { at - 1 } else { self.pos })
+    }
+    /// The source map for a template substitution's own parser: the enclosing file's (so
+    /// positions, function text and lazy bodies inside it are in file coordinates) when the
+    /// substitution text is found verbatim at or after `cursor` inside the template token
+    /// `tpl`, else a standalone map of the text. Advances `cursor` past a match.
+    fn template_sub_map(&self, tpl: usize, cursor: &mut u32, sub: &str) -> SrcMap {
+        if let Some(t) = self.toks.get(tpl) {
+            if let Some((s, e)) = self.src.byte_range(t.start, t.end) {
+                let from = (*cursor).max(s) as usize;
+                if let Some(hay) = self.src.src.get(from..e as usize) {
+                    if let Some(k) = hay.find(sub) {
+                        let start = (from + k) as u32;
+                        let end = start + sub.len() as u32;
+                        *cursor = end;
+                        return SrcMap::new(self.src.src.clone(), start, end);
+                    }
+                }
+            }
+        }
+        SrcMap::whole(sub)
+    }
+    /// Tokens of a template substitution's text.
+    fn sub_tokens(&mut self, src: &str) -> Result<Vec<Token>, ParseError> {
+        let chars: Vec<char> = src.chars().collect();
+        let opts = LexOpts {
+            ts: self.ts.is_some(),
+            ..LexOpts::default()
+        };
+        let lexed = tokenize_opts(&chars, !self.module, 1, opts).map_err(|e| ParseError {
+            at_eof: false,
+            message: e.message,
+            line: e.line,
+        })?;
+        if let (Some(e), Some(t)) = (lexed.soft_err, self.ts.as_mut()) {
+            t.soft_err.get_or_insert(e);
+        }
+        Ok(lexed.tokens)
+    }
     fn prev_end(&self) -> u32 {
         if self.pos == 0 {
             0
@@ -791,6 +1075,9 @@ impl Parser {
     /// [`err_semantic`](Parser::err_semantic) instead: it may sit at Eof coincidentally, and a
     /// spurious `at_eof` traps a REPL in its continuation prompt.
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, ParseError> {
+        if self.ts.is_some() {
+            self.ts_note_error();
+        }
         Err(ParseError {
             message: msg.into(),
             line: self.line(),
@@ -801,6 +1088,9 @@ impl Parser {
     /// [`err`](Parser::err) for post-consumption semantic checks (duplicate bindings, `let` as
     /// a lexical name, ...): the input is complete — more of it can't fix the error.
     fn err_semantic<T>(&self, msg: impl Into<String>) -> Result<T, ParseError> {
+        if self.ts.is_some() {
+            self.ts_note_error();
+        }
         Err(ParseError {
             message: msg.into(),
             line: self.line(),
@@ -1020,6 +1310,13 @@ impl Parser {
     // ----- statements -------------------------------------------------------------------------
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        if self.ts.is_some() {
+            return self.ts_parse_stmt();
+        }
+        self.parse_stmt_js()
+    }
+
+    fn parse_stmt_js(&mut self) -> Result<Stmt, ParseError> {
         if matches!(self.cur(), Tok::Keyword(_)) && self.cur_escaped() {
             return self.err("keywords must not contain escape sequences");
         }
@@ -1376,7 +1673,11 @@ impl Parser {
     fn parse_var_declarators(&mut self) -> Result<Vec<(Pattern, Option<Expr>)>, ParseError> {
         let mut decls = Vec::new();
         loop {
+            let pat_idx = self.pos;
             let pat = self.parse_binding_pattern()?;
+            if self.ts.is_some() {
+                self.ts_binding_suffix(pat_idx)?;
+            }
             let init = if self.eat_punct("=") {
                 Some(self.parse_assign()?)
             } else {
@@ -1597,6 +1898,9 @@ impl Parser {
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         // A `for (let … )` head shares one lexical scope with the body.
         self.push_decl_scope();
+        // A nested `for` in the body overwrites `last_for_await`; each loop restores the
+        // enclosing loop's flag once it has checked its own.
+        let enclosing_await = self.last_for_await;
         let r = self.parse_for_inner();
         self.pop_decl_scope();
         // `for await` only exists in the for-of form: a C-style or for-in head is a SyntaxError.
@@ -1613,8 +1917,10 @@ impl Parser {
                 return self.err("'for await' is only valid with a for-of head");
             }
         }
+        self.last_for_await = enclosing_await;
         r
     }
+
 
     fn parse_for_inner(&mut self) -> Result<Stmt, ParseError> {
         self.advance();
@@ -1655,7 +1961,11 @@ impl Parser {
 
         if let Some(kind) = decl_kind {
             let is_using = matches!(kind, DeclKind::Using | DeclKind::AwaitUsing);
+            let first_idx = self.pos;
             let first = self.parse_binding_pattern()?;
+            if self.ts.is_some() {
+                self.ts_binding_suffix(first_idx)?;
+            }
             if self.is_kw("in") || (self.is_ident_word("of") && !self.cur_escaped()) {
                 let of = self.is_ident_word("of") && !self.cur_escaped();
                 // `using`/`await using` are only valid in a for-of head, never for-in.
@@ -1736,7 +2046,11 @@ impl Parser {
                 ]));
             }
             while self.eat_punct(",") {
+                let pat_idx = self.pos;
                 let pat = self.parse_binding_pattern()?;
+                if self.ts.is_some() {
+                    self.ts_binding_suffix(pat_idx)?;
+                }
                 let init = if self.eat_punct("=") {
                     // Every for-head initializer is [NoIn] — `for (var x, y = 3 in {};;)` is a
                     // SyntaxError (the exposed `in` fails the ';' expectation below).
@@ -2185,7 +2499,11 @@ impl Parser {
         let block = self.parse_block_body()?;
         let handler = if self.eat_kw("catch") {
             let param = if self.eat_punct("(") {
+                let p_idx = self.pos;
                 let p = self.parse_binding_pattern()?;
+                if self.ts.is_some() {
+                    self.ts_binding_suffix(p_idx)?;
+                }
                 self.expect_punct(")")?;
                 // A destructuring catch parameter must bind each name only once.
                 let mut names = Vec::new();
@@ -2526,7 +2844,15 @@ impl Parser {
         if self.eat_punct("?") {
             // The consequent is always `AssignmentExpression[+In]`; the alternative keeps the outer
             // `[?In]`, so a `for (a ? b in c : d ;;)` head allows `in` in the consequent branch.
-            let cons = self.parse_assign_allow_in()?;
+            let saved = self
+                .ts
+                .as_mut()
+                .map(|t| t.set_no_ret_arrow(true));
+            let cons = self.parse_assign_allow_in();
+            if let (Some(t), Some(v)) = (self.ts.as_mut(), saved) {
+                t.set_no_ret_arrow(v);
+            }
+            let cons = cons?;
             self.expect_punct(":")?;
             let alt = self.parse_assign()?;
             Ok(Expr::Cond {
@@ -2542,7 +2868,20 @@ impl Parser {
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary()?;
         let mut left_paren = self.last_paren;
-        while let Some((op, prec, right_assoc, logical)) = self.binary_op() {
+        loop {
+            if self.ts.is_some() {
+                if self.ts_as(min_prec)? {
+                    left_paren = false;
+                    self.last_paren = false;
+                    continue;
+                }
+                if matches!(self.cur(), Tok::Regex(_)) {
+                    self.ts_relex(false)?;
+                }
+            }
+            let Some((op, prec, right_assoc, logical)) = self.binary_op() else {
+                break;
+            };
             if prec < min_prec {
                 break;
             }
@@ -2677,6 +3016,9 @@ impl Parser {
             }
             return Ok(Expr::Await(Box::new(arg)));
         }
+        if self.ts.is_some() && self.is_punct("<") {
+            return self.ts_angle_assertion();
+        }
         let op = match self.cur() {
             Tok::Punct(p @ ("+" | "-" | "!" | "~")) => Some(*p),
             Tok::Keyword(k @ ("typeof" | "void" | "delete")) => Some(*k),
@@ -2758,12 +3100,17 @@ impl Parser {
         let mut expr = self.parse_member_expr()?;
         let mut had_optional = false;
         loop {
+            if self.ts.is_some() && self.ts_lhs_suffix()? {
+                continue;
+            }
             if self.is_punct("(") {
+                let pos = self.call_pos();
                 let args = self.parse_args()?;
                 expr = Expr::Call {
                     callee: Box::new(expr),
                     args,
                     optional: false,
+                    pos,
                 };
             } else if self.eat_punct(".") {
                 let name = self.parse_property_name_ident()?;
@@ -2794,11 +3141,13 @@ impl Parser {
             } else if self.eat_punct("?.") {
                 had_optional = true;
                 if self.is_punct("(") {
+                    let pos = self.call_pos();
                     let args = self.parse_args()?;
                     expr = Expr::Call {
                         callee: Box::new(expr),
                         args,
                         optional: true,
+                        pos,
                     };
                 } else if self.eat_punct("[") {
                     let index = self.parse_expr_allow_in()?;
@@ -2830,6 +3179,7 @@ impl Parser {
     /// MemberExpression without trailing calls — handles `new` and `.`/`[]` member tails.
     fn parse_member_expr(&mut self) -> Result<Expr, ParseError> {
         let mut base = if self.is_kw("new") {
+            let new_pos = self.tok_pos(self.pos);
             let new_escaped = self.cur_escaped();
             if new_escaped {
                 return self.err("'new' must not contain escape sequences");
@@ -2855,6 +3205,9 @@ impl Parser {
                     return self.err("'await' expression cannot be the operand of 'new'");
                 }
                 let callee = self.parse_member_expr()?;
+                if self.ts.is_some() {
+                    self.ts_new_type_args();
+                }
                 // `new import(...)` is a SyntaxError — an ImportCall (`import()`) is a
                 // CallExpression, so it can't be the MemberExpression base of `new` — but a
                 // parenthesized `new (import(...))` covers it into a valid PrimaryExpression.
@@ -2879,6 +3232,7 @@ impl Parser {
                 Expr::New {
                     callee: Box::new(callee),
                     args,
+                    pos: new_pos,
                 }
             }
         } else {
@@ -2956,6 +3310,13 @@ impl Parser {
         // Legacy octal numbers and octal/`\8`/`\9` string escapes are SyntaxErrors in strict mode.
         if self.strict && self.toks[self.pos].legacy_octal {
             return self.err("legacy octal literals are not allowed in strict mode");
+        }
+        if self.ts.is_some() && (self.is_punct("/") || self.is_punct("/=")) {
+            // The lexer took a regex for a division after TypeScript syntax.
+            self.ts_relex(true)?;
+            if !matches!(self.cur(), Tok::Regex(_)) {
+                return self.err("unexpected token '/'");
+            }
         }
         match self.cur().clone() {
             Tok::Ident(n) if n == "arguments" && self.no_arguments_refs => {
@@ -3160,6 +3521,8 @@ impl Parser {
     /// every `+` a string concatenation (which ToString-coerces each substitution).
     fn build_template(&mut self, parts: Vec<TplPart>) -> Result<Expr, ParseError> {
         let mut expr: Option<Expr> = None;
+        let tpl = self.pos.saturating_sub(1);
+        let mut cursor = 0u32;
         for part in parts {
             let piece = match part {
                 TplPart::Str { cooked, .. } => match cooked {
@@ -3170,17 +3533,11 @@ impl Parser {
                     }
                 },
                 TplPart::Sub(src) => {
-                    let tokens = crate::lexer::tokenize_goal(&src, !self.module).map_err(|e| {
-                        ParseError {
-                            at_eof: false,
-                            message: e.message,
-                            line: e.line,
-                        }
-                    })?;
+                    let tokens = self.sub_tokens(&src)?;
                     let mut sub = Parser {
                         toks: tokens,
                         pos: 0,
-                        src: SrcMap::whole(&src),
+                        src: self.template_sub_map(tpl, &mut cursor, &src),
                         lazy: self.lazy,
                         eager_outermost: false,
                         private_scope: self.private_scope.clone(),
@@ -3217,9 +3574,12 @@ impl Parser {
                         in_static_block: false,
                         check_skipped: self.check_skipped,
                         pending_private: Vec::new(),
+                        ts: self.ts.take(),
                     };
                     // A substitution is ToString'd (string hint), not concatenated raw.
-                    let e = sub.parse_expr()?;
+                    let e = sub.parse_expr();
+                    self.ts = sub.ts.take();
+                    let e = e?;
                     self.proto_dups.append(&mut sub.proto_dups);
                     self.pending_private.append(&mut sub.pending_private);
                     Expr::ToStr(Box::new(e))
@@ -3244,21 +3604,17 @@ impl Parser {
     ) -> Result<Expr, ParseError> {
         let mut quasis = Vec::new();
         let mut subs = Vec::new();
+        let tpl = self.pos.saturating_sub(1);
+        let mut cursor = 0u32;
         for part in parts {
             match part {
                 TplPart::Str { cooked, raw } => quasis.push((cooked, raw)),
                 TplPart::Sub(src) => {
-                    let tokens = crate::lexer::tokenize_goal(&src, !self.module).map_err(|e| {
-                        ParseError {
-                            at_eof: false,
-                            message: e.message,
-                            line: e.line,
-                        }
-                    })?;
+                    let tokens = self.sub_tokens(&src)?;
                     let mut sub = Parser {
                         toks: tokens,
                         pos: 0,
-                        src: SrcMap::whole(&src),
+                        src: self.template_sub_map(tpl, &mut cursor, &src),
                         lazy: self.lazy,
                         eager_outermost: false,
                         private_scope: self.private_scope.clone(),
@@ -3295,8 +3651,11 @@ impl Parser {
                         in_static_block: false,
                         check_skipped: self.check_skipped,
                         pending_private: Vec::new(),
+                        ts: self.ts.take(),
                     };
-                    let e = sub.parse_expr()?;
+                    let e = sub.parse_expr();
+                    self.ts = sub.ts.take();
+                    let e = e?;
                     self.proto_dups.append(&mut sub.proto_dups);
                     self.pending_private.append(&mut sub.pending_private);
                     subs.push(e);
@@ -3431,10 +3790,10 @@ impl Parser {
             let is_generator = self.eat_punct("*");
             let key = self.parse_prop_key()?;
             self.reject_private_key(&key)?;
-            if (is_async || is_generator) && !self.is_punct("(") {
+            if (is_async || is_generator) && !self.at_params() {
                 return self.err("expected a method after 'async'/'*' in an object literal");
             }
-            if self.is_punct("(") {
+            if self.at_params() {
                 // Method shorthand.
                 let func = if is_async || is_generator {
                     self.parse_method_function_kind(is_generator, is_async, member_start)?
@@ -3602,6 +3961,9 @@ impl Parser {
         let ssb = std::mem::replace(&mut self.in_static_block, false);
         let sargs = std::mem::replace(&mut self.no_arguments_refs, false);
         let sfi = std::mem::replace(&mut self.in_field_init, false);
+        if self.ts.is_some() {
+            self.ts_fn_start(start);
+        }
         let params = self.parse_params_fn()?;
         let (body, is_strict) =
             self.parse_function_body(!params_complex(&params), false, is_expr && call_prefix)?;
@@ -3708,20 +4070,44 @@ impl Parser {
                 optional: false,
             };
         }
+        if self.ts.is_some() && self.is_punct("<") {
+            self.ts_type_args()?;
+        }
         if self.is_punct("(") {
+            let pos = self.call_pos();
             let args = self.parse_args()?;
             expr = Expr::Call {
                 callee: Box::new(expr),
                 args,
                 optional: false,
+                pos,
             };
         }
         Ok(expr)
     }
 
     fn parse_class(&mut self) -> Result<Class, ParseError> {
-        let class_start = self.cur_start();
-        let decorators = self.parse_decorators()?;
+        let mut class_start = self.cur_start();
+        let first = self.pos;
+        let mut decorators = self.parse_decorators()?;
+        if self.ts.is_some()
+            && !decorators.is_empty()
+            && self.is_ident_word("abstract")
+            && first > 0
+            && matches!(self.toks[first - 1].kind, Tok::Keyword("export" | "default"))
+        {
+            // Node (swc) rejects `export @dec abstract class` (decorators go before `export`).
+            return self.err("Expected '{', got 'abstract'");
+        }
+        if self.ts.is_some() && decorators.is_empty() {
+            if let Some((d, at)) = self.ts_take_decorators() {
+                decorators = d;
+                class_start = at;
+            }
+        }
+        if self.ts.is_some() && self.is_ident_word("abstract") {
+            self.ts_erase_abstract();
+        }
         self.eat_kw("class");
         let name = if let Tok::Ident(n) = self.cur().clone() {
             self.advance();
@@ -3740,8 +4126,20 @@ impl Parser {
         // All class code — the heritage clause included — is strict mode.
         let saved = self.strict;
         self.strict = true;
+        if self.ts.is_some() {
+            let r = self.ts_class_heritage(false);
+            if r.is_err() {
+                self.strict = saved;
+            }
+            r?;
+        }
         let superclass = if self.eat_kw("extends") {
-            let sc = self.parse_lhs();
+            let mut sc = self.parse_lhs();
+            if sc.is_ok() && self.ts.is_some() {
+                if let Err(e) = self.ts_class_heritage(true) {
+                    sc = Err(e);
+                }
+            }
             if sc.is_err() {
                 self.strict = saved;
             }
@@ -3779,14 +4177,23 @@ impl Parser {
         self.expect_punct("}")?;
         // The class constructor's `toString` is the whole class's source text.
         let class_src = self.src_slice(class_start, self.prev_end());
+        let mut remap = None;
         for m in &mut members {
             if matches!(m.kind, MemberKind::Constructor) {
                 if let Some(f) = &mut m.func {
                     if let Some(fm) = Rc::get_mut(f) {
+                        if let (FnSource::Range { start: from, .. }, FnSource::Range { start: to, .. }) =
+                            (&fm.source, &class_src)
+                        {
+                            remap = Some((*from, *to));
+                        }
                         fm.source = class_src.clone();
                     }
                 }
             }
+        }
+        if let (Some((from, to)), true) = (remap, self.ts.is_some()) {
+            self.ts_remap_fn(from, to);
         }
         validate_class(&members).map_err(|m| ParseError {
             at_eof: false,
@@ -3808,12 +4215,20 @@ impl Parser {
         matches!(
             self.peek_kind(ahead),
             Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(";") | Tok::Punct("}")
-        )
+        ) || (self.ts.is_some() && matches!(self.peek_kind(ahead), Tok::Punct("?" | "!" | ":" | "<")))
+    }
+
+    /// A method's parameter list starts here (`(`, or TypeScript type parameters).
+    fn at_params(&self) -> bool {
+        self.is_punct("(") || (self.ts.is_some() && self.is_punct("<"))
     }
 
     fn parse_class_member(&mut self) -> Result<Vec<ClassMember>, ParseError> {
         if self.eat_punct(";") {
             return Ok(vec![]);
+        }
+        if self.ts.is_some() {
+            return self.ts_class_member();
         }
         let decorators = self.parse_decorators()?;
         let mut is_static = false;
@@ -3822,6 +4237,15 @@ impl Parser {
             self.advance();
             is_static = true;
         }
+        self.parse_class_member_rest(decorators, is_static)
+    }
+
+    /// A class member after its decorators and `static`.
+    fn parse_class_member_rest(
+        &mut self,
+        decorators: Vec<Expr>,
+        is_static: bool,
+    ) -> Result<Vec<ClassMember>, ParseError> {
         // `static { ... }` initialization block — a super-property context and function-like code
         // where `new.target` is valid (evaluates to undefined).
         // (get/set before a `*` is a *field* named get/set followed by a generator method.)
@@ -3887,7 +4311,11 @@ impl Parser {
         // setter that read/write it, reusing the ordinary class-element machinery.
         if self.is_ident_word("accessor") && !self.next_is_member_terminator(1) && !self.nl_at(1) {
             self.advance(); // `accessor`
+            let key_idx = self.pos;
             let key = self.parse_prop_key()?;
+            if self.ts.is_some() {
+                self.ts_member_after_key(key_idx)?;
+            }
             let init = if self.eat_punct("=") {
                 Some(self.parse_assign()?)
             } else {
@@ -3927,9 +4355,13 @@ impl Parser {
         }
         let is_generator = self.eat_punct("*");
 
+        let key_idx = self.pos;
         let key = self.parse_prop_key()?;
+        if self.ts.is_some() {
+            self.ts_member_after_key(key_idx)?;
+        }
 
-        if self.is_punct("(") {
+        if self.at_params() {
             // Only a derived class's `constructor` body is a SuperCall context.
             let is_ctor = kind == MemberKind::Method && !is_static && key_is(&key, "constructor");
             let scall =
@@ -4020,6 +4452,9 @@ impl Parser {
         let ssb = std::mem::replace(&mut self.in_static_block, false);
         let sargs = std::mem::replace(&mut self.no_arguments_refs, false);
         let sfi = std::mem::replace(&mut self.in_field_init, false);
+        if self.ts.is_some() {
+            self.ts_fn_start(start);
+        }
         let params = self.parse_params_fn()?;
         // A method has UniqueFormalParameters: duplicate parameter names are always an error.
         if let Some(dup) = duplicate_name(&param_names(&params)) {
@@ -4088,6 +4523,9 @@ impl Parser {
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
+        if self.ts.is_some() && self.is_punct("<") {
+            self.ts_type_params()?;
+        }
         self.expect_punct("(")?;
         let saved_in_params = self.in_params;
         self.in_params = true;
@@ -4108,6 +4546,9 @@ impl Parser {
     }
 
     fn parse_params_inner(&mut self) -> Result<Vec<Param>, ParseError> {
+        if self.ts.is_some() {
+            return self.ts_params_inner();
+        }
         let mut params = Vec::new();
         while !self.is_punct(")") {
             let rest = self.eat_punct("...");
@@ -4191,6 +4632,7 @@ impl Parser {
                         html_comments: !self.module,
                         ctx,
                         private_scope: self.private_scope.clone(),
+                        aot: None,
                     };
                     if !self.check_skipped {
                         self.pos = close + 1;
@@ -4285,6 +4727,11 @@ impl Parser {
     fn try_parse_arrow(&mut self) -> Result<Option<Expr>, ParseError> {
         let arrow_start = self.cur_start();
         let call_prefix = self.call_prefix_before(self.pos);
+        if self.ts.is_some() {
+            if let Some(e) = self.ts_try_arrow(arrow_start, call_prefix)? {
+                return Ok(Some(e));
+            }
+        }
         // Optional `async` prefix (on the same line) for an async arrow.
         let async_arrow = self.is_ident_word("async")
             && !self.cur_escaped()
@@ -5089,7 +5536,7 @@ fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
             pn_expr(callee, st)?;
             pn_args(args, st)?;
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, .. } => {
             pn_expr(callee, st)?;
             pn_args(args, st)?;
         }
@@ -5244,6 +5691,12 @@ fn is_strict_reserved_binding(name: &str) -> bool {
             | "static"
             | "yield"
     )
+}
+
+/// The destructuring pattern an assignment target literal (`[a, b]`, `{x, y: z}`) denotes, or
+/// `None` when it is not a valid simple pattern.
+pub(crate) fn destructuring_target(e: &Expr) -> Option<Pattern> {
+    expr_to_pattern(e)
 }
 
 fn expr_to_pattern(e: &Expr) -> Option<Pattern> {

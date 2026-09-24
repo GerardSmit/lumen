@@ -48,19 +48,18 @@ impl Interp {
         );
         self.in_field_init_code = saved_field_init;
         self.in_async_gen_body = saved_agb;
-        let coro = match coro {
-            Ok(c) => c,
+        let mut coro = match coro {
+            Ok(c) => crate::coroutine::Coroutine::Vm(c),
             Err(e) => return Some(Err(e)),
         };
+        // Every resume (from `next()`) runs outside this call: give it the function's frame.
+        coro.set_frame(self.resume_frame_for(func, false));
         // The generator object's [[Prototype]] comes from the function's own `.prototype`.
         let gen_proto = fn_obj.borrow().props.get("prototype").map(|p| p.value());
         let obj = self.make_generator(func.is_async, gen_proto);
         if let Value::Obj(o) = &obj {
             self.gc_pin(o);
-            self.generators.insert(
-                Gc::as_ptr(o) as usize,
-                crate::coroutine::Coroutine::Vm(coro),
-            );
+            self.generators.insert(Gc::as_ptr(o) as usize, coro);
             if func.is_async {
                 self.async_gens.insert(Gc::as_ptr(o) as usize);
             }

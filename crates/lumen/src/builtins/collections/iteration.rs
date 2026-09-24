@@ -1,7 +1,7 @@
 //! Live Map and Set iteration across mutation.
 
 use crate::builtins::collection_data::CollectionKind;
-use crate::builtins::{ab, arg, coll_ptr, coll_ptr_kind, iter_result, map_ptr, set_internal};
+use crate::builtins::{arg, coll_ptr, coll_ptr_kind, iter_result, map_ptr, set_internal};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, Gc, Object, Value};
 
@@ -33,13 +33,14 @@ pub(super) fn collection_for_each(
     // Iterate the LIVE backing list by index (positions are stable — deletes leave tombstones), so
     // entries appended during the callback are visited and deleted entries are skipped.
     let mut idx = 0usize;
+    let mut f = crate::bytecode::PreparedCall::new(i, cb, cb_this);
     loop {
         let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).cloned());
         let (k, v) = match entry {
             Some(kv) => kv,
             None => break,
         };
-        ab(i.call(cb.clone(), cb_this.clone(), &[v, k, this.clone()]))?;
+        f.call3(i, v, k, &this)?;
     }
     Ok(Value::Undefined)
 }
@@ -62,6 +63,40 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
     set_builtin(&obj, "__ci_index", Value::Num(0.0));
     set_builtin(&obj, "__ci_kind", Value::Num(kind as f64));
     Ok(Value::Obj(obj))
+}
+
+/// A Map/Set iterator over `coll` positioned at backing index `idx` (`done`: already
+/// exhausted) — what `collection_iter` builds, for a protocol-free for-of state that must turn
+/// into a real iterator object (see `bytecode::iter_fast`).
+pub(crate) fn make_collection_iterator(
+    i: &Interp,
+    coll: Value,
+    kind: u8,
+    idx: f64,
+    done: bool,
+) -> Value {
+    let is_set = coll
+        .as_obj()
+        .and_then(|o| i.map_data.get(&(Gc::as_ptr(o) as usize)))
+        .is_some_and(|d| d.kind() == CollectionKind::Set);
+    let key = if is_set {
+        "%SetIteratorPrototype%"
+    } else {
+        "%MapIteratorPrototype%"
+    };
+    let proto = i
+        .extra_protos
+        .get(key)
+        .cloned()
+        .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned());
+    let obj = Object::new(proto);
+    set_builtin(&obj, "__ci_coll", coll);
+    set_builtin(&obj, "__ci_index", Value::Num(idx));
+    set_builtin(&obj, "__ci_kind", Value::Num(kind as f64));
+    if done {
+        set_internal(&obj, "__ci_done", Value::Bool(true));
+    }
+    Value::Obj(obj)
 }
 
 /// `next()` for a Map/Set iterator: reads the live backing entries at the current index (so entries

@@ -1,0 +1,9 @@
+// Non-ASCII text before functions: offsets are UTF-8 bytes. Ünïcödé ✓ 🚀
+const greeting         = "héllo wörld 🌍";
+
+export function shout(s        )         {
+  return s.toUpperCase() + "！";
+}
+
+/* 日本語のコメント */
+export const len = (s        )         => s.length;

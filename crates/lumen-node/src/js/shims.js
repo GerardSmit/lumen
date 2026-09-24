@@ -212,249 +212,7 @@
   });
 }
 
-// ---- node:querystring -------------------------------------------------------------------------
-// Classic (non-percent-strict) parse/stringify. `qs`/body-parser can use `querystring` for simple
-// bodies; Express's default query parser is `qs` (its own package), so this is the fallback path.
-{
-  const qsUnescape = (s) => { try { return decodeURIComponent(s.replace(/\+/g, " ")); } catch { return s; } };
-  const qsEscape = (s) => encodeURIComponent(s);
-
-  function parse(str, sep = "&", eq = "=") {
-    const obj = Object.create(null);
-    if (typeof str !== "string" || str.length === 0) return obj;
-    for (const part of str.split(sep)) {
-      if (part === "") continue;
-      const idx = part.indexOf(eq);
-      let k, v;
-      if (idx < 0) { k = qsUnescape(part); v = ""; }
-      else { k = qsUnescape(part.slice(0, idx)); v = qsUnescape(part.slice(idx + eq.length)); }
-      if (k in obj) {
-        if (Array.isArray(obj[k])) obj[k].push(v);
-        else obj[k] = [obj[k], v];
-      } else obj[k] = v;
-    }
-    return obj;
-  }
-
-  function stringify(obj, sep = "&", eq = "=") {
-    if (obj === null || typeof obj !== "object") return "";
-    const pairs = [];
-    for (const k of Object.keys(obj)) {
-      const ek = qsEscape(k);
-      const v = obj[k];
-      if (Array.isArray(v)) for (const item of v) pairs.push(`${ek}${eq}${qsEscape(String(item))}`);
-      else pairs.push(`${ek}${eq}${qsEscape(v == null ? "" : String(v))}`);
-    }
-    return pairs.join(sep);
-  }
-
-  // Node's unescapeBuffer: %XX pairs become bytes, '+' becomes a space only when `decodeSpaces`,
-  // malformed escapes stay literal, and char codes are written raw (Uint8Array truncates >0xFF).
-  const hexVal = (c) =>
-    c >= 0x30 && c <= 0x39 ? c - 0x30 : c >= 0x41 && c <= 0x46 ? c - 0x37 : c >= 0x61 && c <= 0x66 ? c - 0x57 : -1;
-  function unescapeBuffer(s, decodeSpaces = false) {
-    s = String(s);
-    const out = Buffer.alloc(s.length);
-    let n = 0;
-    for (let i = 0; i < s.length; i++) {
-      const c = s.charCodeAt(i);
-      if (c === 0x2b /* + */ && decodeSpaces) { out[n++] = 0x20; continue; }
-      if (c === 0x25 /* % */ && i + 2 < s.length) {
-        const hi = hexVal(s.charCodeAt(i + 1));
-        const lo = hexVal(s.charCodeAt(i + 2));
-        if (hi >= 0 && lo >= 0) { out[n++] = (hi << 4) | lo; i += 2; continue; }
-      }
-      out[n++] = c;
-    }
-    return out.slice(0, n);
-  }
-
-  __builtins.set("querystring", { parse, stringify, decode: parse, encode: stringify, escape: qsEscape, unescape: qsUnescape, unescapeBuffer });
-}
-
-// ---- node:url ---------------------------------------------------------------------------------
-// The web `URL`/`URLSearchParams` globals, plus the legacy `url.parse()` that server middleware
-// (parseurl, serve-static) calls on request targets like "/path?query" (origin-form, no host).
-{
-  const querystring = __builtins.get("querystring");
-
-  function legacyParse(urlStr, parseQueryString = false, slashesDenoteHost = false) {
-    const url = { protocol: null, slashes: null, auth: null, host: null, port: null, hostname: null, hash: null, search: null, query: null, pathname: null, path: null, href: urlStr };
-    let rest = String(urlStr);
-
-    const hashIdx = rest.indexOf("#");
-    if (hashIdx >= 0) { url.hash = rest.slice(hashIdx); rest = rest.slice(0, hashIdx); }
-
-    const protoMatch = /^([a-z0-9.+-]+:)/i.exec(rest);
-    if (protoMatch) { url.protocol = protoMatch[1].toLowerCase(); rest = rest.slice(protoMatch[1].length); }
-
-    if ((url.protocol && rest.startsWith("//")) || (slashesDenoteHost && rest.startsWith("//"))) {
-      url.slashes = true;
-      rest = rest.slice(2);
-      let hostEnd = rest.length;
-      for (const ch of ["/", "?", "#"]) { const i = rest.indexOf(ch); if (i >= 0 && i < hostEnd) hostEnd = i; }
-      let host = rest.slice(0, hostEnd);
-      rest = rest.slice(hostEnd);
-      const at = host.lastIndexOf("@");
-      if (at >= 0) { url.auth = host.slice(0, at); host = host.slice(at + 1); }
-      url.host = host;
-      const colon = host.lastIndexOf(":");
-      if (colon >= 0) { url.hostname = host.slice(0, colon); url.port = host.slice(colon + 1); }
-      else url.hostname = host;
-    }
-
-    const qIdx = rest.indexOf("?");
-    if (qIdx >= 0) { url.search = rest.slice(qIdx); url.pathname = rest.slice(0, qIdx); }
-    else url.pathname = rest;
-    if (url.search) url.query = parseQueryString ? querystring.parse(url.search.slice(1)) : url.search.slice(1);
-    else url.query = parseQueryString ? Object.create(null) : null;
-    if (url.pathname === "" && url.host) url.pathname = "/";
-    url.path = url.pathname + (url.search || "");
-    return url;
-  }
-
-  function format(urlObj) {
-    if (typeof urlObj === "string") return urlObj;
-    if (urlObj instanceof URL) return urlObj.href;
-    let out = "";
-    if (urlObj.protocol) out += urlObj.protocol + (urlObj.slashes || urlObj.host ? "//" : "");
-    if (urlObj.auth) out += urlObj.auth + "@";
-    if (urlObj.host) out += urlObj.host;
-    else if (urlObj.hostname) out += urlObj.hostname + (urlObj.port ? ":" + urlObj.port : "");
-    out += urlObj.pathname || "";
-    out += urlObj.search || (urlObj.query && typeof urlObj.query === "object" ? "?" + querystring.stringify(urlObj.query) : "") || "";
-    out += urlObj.hash || "";
-    return out;
-  }
-
-  const resolve = (from, to) => new URL(to, new URL(from, "http://localhost")).href;
-
-  // Legacy resolveObject: resolve, then hand back a parse()-shaped object.
-  function resolveObject(source, relative) {
-    if (!source) return relative;
-    return legacyParse(resolve(typeof source === "string" ? source : format(source), relative));
-  }
-
-  // What http.request(new URL(...)) uses. Mirrors Node: bracket-free IPv6 hostname, numeric port
-  // (only when present), decoded `user:pass` auth.
-  function urlToHttpOptions(url) {
-    const options = {
-      protocol: url.protocol,
-      hostname: typeof url.hostname === "string" && url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname,
-      hash: url.hash,
-      search: url.search,
-      pathname: url.pathname,
-      path: `${url.pathname || ""}${url.search || ""}`,
-      href: url.href,
-    };
-    if (url.port !== "") options.port = Number(url.port);
-    if (url.username || url.password) options.auth = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
-    return options;
-  }
-
-  // Punycode-backed domain converters. Node's use full IDNA/UTS46; lowercasing first covers the
-  // mapping step that matters in practice.
-  const punycode = __builtins.get("punycode");
-
-  // fileURLToPath / pathToFileURL: Node's lib/internal/url.js algorithms (drive letters, UNC
-  // hosts, the percent-encoding of %, \, newlines, tabs, ? and #).
-  const isWindowsUrl = __os.info().platform === "win32";
-  const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_URL_SCHEME, ERR_INVALID_FILE_URL_PATH,
-    ERR_INVALID_FILE_URL_HOST } = __errors;
-  function isURLObject(self) {
-    return Boolean(self?.href && self.protocol && self.auth === undefined && self.path === undefined);
-  }
-  function getPathFromURLWin32(url) {
-    const hostname = url.hostname;
-    let pathname = url.pathname;
-    for (let n = 0; n < pathname.length; n++) {
-      if (pathname[n] === "%") {
-        const third = pathname.codePointAt(n + 2) | 0x20;
-        if ((pathname[n + 1] === "2" && third === 102) || (pathname[n + 1] === "5" && third === 99)) {
-          throw new ERR_INVALID_FILE_URL_PATH("must not include encoded \\ or / characters");
-        }
-      }
-    }
-    pathname = pathname.replace(/\//g, "\\");
-    pathname = decodeURIComponent(pathname);
-    if (hostname !== "") {
-      return `\\${punycode.toUnicode(hostname)}${pathname}`;
-    }
-    const letter = pathname.codePointAt(1) | 0x20;
-    const sep = pathname.charAt(2);
-    if (letter < 97 || letter > 122 || sep !== ":") {
-      throw new ERR_INVALID_FILE_URL_PATH("must be absolute");
-    }
-    return pathname.slice(1);
-  }
-  function getPathFromURLPosix(url) {
-    if (url.hostname !== "") {
-      throw new ERR_INVALID_FILE_URL_HOST(__os.info().platform);
-    }
-    const pathname = url.pathname;
-    for (let n = 0; n < pathname.length; n++) {
-      if (pathname[n] === "%") {
-        const third = pathname.codePointAt(n + 2) | 0x20;
-        if (pathname[n + 1] === "2" && third === 102) {
-          throw new ERR_INVALID_FILE_URL_PATH("must not include encoded / characters");
-        }
-      }
-    }
-    return decodeURIComponent(pathname);
-  }
-  function fileURLToPath(path) {
-    if (typeof path === "string") path = new URL(path);
-    else if (!isURLObject(path)) throw new ERR_INVALID_ARG_TYPE("path", ["string", "URL"], path);
-    if (path.protocol !== "file:") throw new ERR_INVALID_URL_SCHEME("file");
-    return isWindowsUrl ? getPathFromURLWin32(path) : getPathFromURLPosix(path);
-  }
-  function encodePathChars(filepath) {
-    if (filepath.includes("%")) filepath = filepath.replace(/%/g, "%25");
-    if (!isWindowsUrl && filepath.includes("\\")) filepath = filepath.replace(/\\/g, "%5C");
-    if (filepath.includes("\n")) filepath = filepath.replace(/\n/g, "%0A");
-    if (filepath.includes("\r")) filepath = filepath.replace(/\r/g, "%0D");
-    if (filepath.includes("\t")) filepath = filepath.replace(/\t/g, "%09");
-    return filepath;
-  }
-  function pathToFileURL(filepath) {
-    const pathMod = __builtins.get("path");
-    if (isWindowsUrl && filepath.startsWith("\\\\")) {
-      const outURL = new URL("file://");
-      const hostnameEndIndex = filepath.indexOf("\\", 2);
-      if (hostnameEndIndex === -1) throw new ERR_INVALID_ARG_VALUE("path", filepath, "Missing UNC resource path");
-      if (hostnameEndIndex === 2) throw new ERR_INVALID_ARG_VALUE("path", filepath, "Empty UNC servername");
-      const hostname = filepath.slice(2, hostnameEndIndex);
-      outURL.hostname = punycode.toASCII(hostname.toLowerCase());
-      outURL.pathname = encodePathChars(filepath.slice(hostnameEndIndex).replace(/\\/g, "/"));
-      return outURL;
-    }
-    let resolved = pathMod.resolve(filepath);
-    const filePathLast = filepath.charCodeAt(filepath.length - 1);
-    if ((filePathLast === 47 || (isWindowsUrl && filePathLast === 92)) && resolved[resolved.length - 1] !== pathMod.sep) {
-      resolved += "/";
-    }
-    resolved = encodePathChars(resolved);
-    if (resolved.includes("?")) resolved = resolved.replace(/\?/g, "%3F");
-    if (resolved.includes("#")) resolved = resolved.replace(/#/g, "%23");
-    return new URL(`file://${resolved}`);
-  }
-
-
-  __builtins.set("url", {
-    parse: legacyParse,
-    format,
-    resolve,
-    resolveObject,
-    urlToHttpOptions,
-    URL,
-    URLSearchParams,
-    Url: function Url() {},
-    domainToASCII: (d) => punycode.toASCII(String(d).toLowerCase()),
-    domainToUnicode: (d) => punycode.toUnicode(String(d).toLowerCase()),
-    fileURLToPath,
-    pathToFileURL,
-  });
-}
+// node:querystring and node:url live in url.js (Node's lib sources over lumen-web's URL).
 
 // node:net now lives in its own glue file (net.js) — its surface grew past the "small shim" bar
 // (BlockList, SocketAddress, auto-select-family flags).
@@ -663,15 +421,39 @@ __builtins.set("tty", {
   const zlib = {};
 
   const Z_NO_FLUSH = 0;
+  const Z_FULL_FLUSH = 3;
   const Z_FINISH = 4;
+  // The native incremental codec behind each stream class (`__zlib.streamOpen` kinds).
+  const STREAM_KINDS = {
+    deflateRaw: "deflate", inflateRaw: "inflate",
+    deflate: "zlib", inflate: "unzlib",
+    gzip: "gzip", gunzip: "gunzip",
+  };
+  // Native stream kinds that compress (the rest decompress).
+  const ENCODERS = new Set(["deflate", "zlib", "gzip"]);
+  // Node's error code/errno for a zlib failure message.
+  const zlibError = (e) => {
+    const m = String(e && e.message);
+    const [code, errno] = m === "unexpected end of file" ? ["Z_BUF_ERROR", -5]
+      : m === "Missing dictionary" ? ["Z_NEED_DICT", 2] : ["Z_DATA_ERROR", -3];
+    if (e && typeof e === "object" && e.code === undefined) {
+      e.code = code;
+      e.errno = errno;
+    }
+    return e;
+  };
 
-  // A Transform subclass over a codec. Raw deflate/inflate (`streamKind` set) run on a real
-  // incremental codec — input may be split anywhere, `flush()` emits a sync-flushed block and
-  // the 32K window carries across flushes, which websocket permessage-deflate depends on. The
-  // framed codecs (gzip/zlib/brotli/zstd) are one-shot: they buffer input and (de)compress it
-  // whole on end. `stream` (node:stream) is resolved lazily on first construction: shims.js loads
-  // before stream.js, so the class can't `extends Transform` until the user actually needs it.
+  // A Transform subclass over a codec. Deflate/inflate in all three framings (raw, zlib, gzip;
+  // `streamKind` set) run on a real incremental codec — input may be split anywhere, output
+  // appears as it is produced, `flush()` emits a sync- or full-flushed block, and the 32K window
+  // carries across flushes (websocket permessage-deflate depends on that). Brotli/zstd are
+  // one-shot: they buffer input and (de)compress it whole on end. `stream` (node:stream) is
+  // resolved lazily on first construction: shims.js loads before stream.js, so the class can't
+  // `extends Transform` until the user actually needs it.
   const defineStreamClass = (className, syncFn, streamKind) => {
+    const encoder = ENCODERS.has(streamKind);
+    // Framed decoders report input that stops short of the stream's end, as Node's do.
+    const checkEnd = streamKind === "gunzip" || streamKind === "unzlib" || streamKind === "unzip";
     Object.defineProperty(zlib, className, {
       enumerable: true,
       configurable: true,
@@ -683,27 +465,43 @@ __builtins.set("tty", {
             this._chunks = [];
             this._handle = streamKind ? __zlib.streamOpen(streamKind) : 0;
             this._closed = false;
+            this._sawInput = false;
+            // Input bytes handed to the codec so far (Node's `zlib.bytesWritten`).
+            this.bytesWritten = 0;
+            // `options.flush`: the flush every write gets (Z_NO_FLUSH: buffer freely).
+            const flush = options && options.flush;
+            this._writeFlush = typeof flush === "number" ? flush : Z_NO_FLUSH;
           }
           _transform(chunk, enc, next) {
             const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc);
+            this.bytesWritten += buf.length;
             if (!streamKind) {
               this._chunks.push(buf);
               return next();
             }
             if (this._closed) return next(new Error("zlib stream is closed"));
+            if (buf.length) this._sawInput = true;
             try {
-              const out = __zlib.streamWrite(this._handle, buf);
+              let out = __zlib.streamWrite(this._handle, buf);
+              if (encoder && this._writeFlush !== Z_NO_FLUSH) {
+                const tail = __zlib.streamFlush(this._handle, this._writeFlush);
+                if (tail.length) out = out.length ? Buffer.concat([out, tail]) : tail;
+              }
               next(null, out.length ? Buffer.from(out) : null);
             } catch (e) {
-              next(e);
+              next(zlibError(e));
             }
           }
           _flush(done) {
             try {
               if (streamKind) {
-                if (streamKind === "deflate" && !this._closed) {
-                  const out = __zlib.streamFlush(this._handle, true);
+                if (encoder && !this._closed && !this._finished) {
+                  this._finished = true;
+                  const out = __zlib.streamFlush(this._handle, Z_FINISH);
                   if (out.length) this.push(Buffer.from(out));
+                } else if (checkEnd && !this._closed && this._sawInput
+                    && !__zlib.streamFlush(this._handle)) {
+                  return done(zlibError(new Error("unexpected end of file")));
                 }
               } else {
                 this.push(syncFn(Buffer.concat(this._chunks)));
@@ -713,17 +511,20 @@ __builtins.set("tty", {
               done(e);
             }
           }
-          // zlib.flush([kind], cb): runs once the queued writes have gone through; a deflater
-          // emits what it holds as a sync-flushed (or, for Z_FINISH, final) block first.
+          // zlib.flush([kind], cb): runs once the queued writes have gone through; a compressor
+          // emits what it holds as a flushed block first — `kind` is zlib's flush constant
+          // (default Z_FULL_FLUSH, as in Node; Z_FINISH ends the stream).
           flush(kind, cb) {
             if (typeof kind === "function") { cb = kind; kind = undefined; }
+            if (kind === undefined) kind = Z_FULL_FLUSH;
             __builtins.get("stream")._afterWrites(this, () => {
-              if (streamKind === "deflate" && !this._closed && kind !== Z_NO_FLUSH) {
+              if (encoder && !this._closed && !this._finished && kind !== Z_NO_FLUSH) {
+                if (kind === Z_FINISH) this._finished = true;
                 try {
-                  const out = __zlib.streamFlush(this._handle, kind === Z_FINISH);
+                  const out = __zlib.streamFlush(this._handle, kind);
                   if (out.length) this.push(Buffer.from(out));
                 } catch (e) {
-                  this.emit("error", e);
+                  this.emit("error", zlibError(e));
                 }
               }
               // The 'data' events for that push have fired by now; the callback follows them.
@@ -733,6 +534,8 @@ __builtins.set("tty", {
           reset() {
             if (streamKind && !this._closed) __zlib.streamReset(this._handle);
             this._chunks = [];
+            this._finished = false;
+            this._sawInput = false;
           }
           _release() {
             if (this._closed) return;
@@ -768,14 +571,14 @@ __builtins.set("tty", {
     zlib[`${name}Sync`] = syncFn;
     zlib[name] = asyncOf(syncFn);
     // Gzip / Gunzip / Deflate / Inflate / DeflateRaw / InflateRaw (+ their create* factories).
-    const streamKind = name === "deflateRaw" ? "deflate" : name === "inflateRaw" ? "inflate" : null;
+    const streamKind = STREAM_KINDS[name] || null;
     defineStreamClass(cap, syncFn, streamKind);
     zlib[`create${cap}`] = (options) => new zlib[cap](options);
   }
   // Aliases Node exposes: `unzip` auto-detects gzip vs. zlib framing — our gunzip covers gzip.
   zlib.unzipSync = zlib.gunzipSync;
   zlib.unzip = zlib.gunzip;
-  defineStreamClass("Unzip", zlib.gunzipSync);
+  defineStreamClass("Unzip", zlib.gunzipSync, "unzip");
   zlib.createUnzip = (options) => new zlib.Unzip(options);
 
   // Real CRC-32 (Node's zlib.crc32(data[, value])), chainable via the optional seed.

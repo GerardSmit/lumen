@@ -264,11 +264,6 @@ impl VmStack {
         self.with_vec(|v| v.split_off(at))
     }
 
-    #[inline]
-    pub(super) fn extend(&mut self, it: impl IntoIterator<Item = Value>) {
-        self.with_vec(|v| v.extend(it))
-    }
-
     #[inline(always)]
     pub(super) fn as_slice(&self) -> &[Value] {
         unsafe { std::slice::from_raw_parts(self.base, self.len()) }

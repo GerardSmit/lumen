@@ -1,0 +1,27 @@
+[
+ {
+  "path": "dot",
+  "start": 170,
+  "end": 224
+ },
+ {
+  "path": "square",
+  "start": 285,
+  "end": 297
+ },
+ {
+  "path": "Particle",
+  "start": 307,
+  "end": 583
+ },
+ {
+  "path": "Particle#step",
+  "start": 518,
+  "end": 581
+ },
+ {
+  "path": "head",
+  "start": 662,
+  "end": 699
+ }
+]

@@ -5,6 +5,7 @@ use super::*;
 pub(super) fn install_json(it: &mut Interp) {
     let j = it.new_object();
     it.def_method(&j, "stringify", 3, |i, _t, args| {
+        crate::bytecode::reflect::caller_transparent(i);
         let value = arg(args, 0);
         let replacer = arg(args, 1);
         // The replacer is either a function, or an array PropertyList of keys (strings/numbers).
@@ -91,6 +92,7 @@ pub(super) fn install_json(it: &mut Interp) {
         }
     });
     it.def_method(&j, "parse", 2, |i, _t, args| {
+        crate::bytecode::reflect::caller_transparent(i);
         let text = ab(i.to_string(&arg(args, 0)))?;
         let reviver = arg(args, 1);
         if !reviver.is_callable() {
@@ -108,7 +110,11 @@ pub(super) fn install_json(it: &mut Interp) {
             }
             let root = i.new_object();
             set_data(&root, "", v);
-            return internalize_json_property(i, &Value::Obj(root), "", &reviver, Some(&record));
+            let mut reviver = crate::bytecode::PreparedCall::new(i, reviver, Value::Undefined);
+            let r =
+                internalize_json_property(i, &Value::Obj(root), "", &mut reviver, Some(&record));
+            reviver.finish(i);
+            return r;
         }
         let v = json_parse_value(i, &chars, &mut pos)?;
         json_skip_ws(&chars, &mut pos);
@@ -387,7 +393,7 @@ impl JsonSer<'_> {
                 Ok(true)
             }
             Value::Obj(ref o) => {
-                if !matches!(o.borrow().call, Callable::None) {
+                if o.borrow().call.is_fn() {
                     return Ok(false); // functions are omitted
                 }
                 let ptr = Gc::as_ptr(o) as usize;
@@ -547,7 +553,7 @@ fn internalize_json_property(
     i: &mut Interp,
     holder: &Value,
     name: &str,
-    reviver: &Value,
+    reviver: &mut crate::bytecode::PreparedCall,
     record: Option<&JsonRecord>,
 ) -> Result<Value, Value> {
     let val = ab(i.get_member(holder, name))?;
@@ -613,10 +619,10 @@ fn internalize_json_property(
             set_data(&context, "source", Value::from_string(src.clone()));
         }
     }
-    ab(i.call(
-        reviver.clone(),
+    ab(reviver.call_with_this(
+        i,
         holder.clone(),
-        &[
+        &mut [
             Value::from_string(name.to_string()),
             val,
             Value::Obj(context),
