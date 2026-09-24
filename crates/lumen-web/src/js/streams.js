@@ -265,15 +265,45 @@ class ReadableStream {
     const start = underlyingSource.start;
     if (typeof start === "function") start.call(underlyingSource, this._controller); // sync start only
   }
+  // ReadableStreamDefaultControllerCallPullIfNeeded: at most one pull in flight. A pull that
+  // returns a promise keeps `_pulling` set until it settles (an async source such as
+  // `async pull(c) { c.enqueue(await next()); if (eof) { await cleanup(); c.close(); } }` must not
+  // be re-entered while it is still awaiting); a read that arrives meanwhile sets `_pullAgain`
+  // and the pull is re-issued once the previous one settles. A rejected pull errors the stream.
   _maybePull() {
-    if (this._state !== "readable" || this._pulling) return;
+    if (this._state !== "readable") return;
     const pull = this._source.pull;
     if (typeof pull !== "function") return;
+    if (this._pulling) {
+      this._pullAgain = true;
+      return;
+    }
     this._pulling = true;
+    this._pullAgain = false;
+    let result;
     try {
-      pull.call(this._source, this._controller);
-    } finally {
+      result = pull.call(this._source, this._controller);
+    } catch (e) {
       this._pulling = false;
+      this._controller.error(e);
+      return;
+    }
+    const done = () => {
+      this._pulling = false;
+      if (this._pullAgain) {
+        this._pullAgain = false;
+        const r = this._reader;
+        if (this._state === "readable" && !this._chunks.length && r && r._readRequests.length) this._maybePull();
+      }
+    };
+    if (result !== null && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
+      Promise.resolve(result).then(done, (e) => {
+        this._pulling = false;
+        this._pullAgain = false;
+        this._controller.error(e);
+      });
+    } else {
+      done();
     }
   }
   _fulfillReads() {

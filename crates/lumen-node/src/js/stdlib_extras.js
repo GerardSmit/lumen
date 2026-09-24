@@ -428,36 +428,37 @@
 // The long-deprecated alias for node:util — the *same* object, exactly as Node's `sys` is.
 __builtins.set("sys", __builtins.get("util"));
 
-// ---- node:stream/promises ---------------------------------------------------------------------
-// Promise forms of stream.pipeline / stream.finished, over the existing node:stream module.
-{
-  const stream = __builtins.get("stream");
-  __builtins.set("stream/promises", {
-    finished: (s, opts) =>
-      new Promise((resolve, reject) => stream.finished(s, opts || {}, (err) => (err ? reject(err) : resolve()))),
-    pipeline: (...args) =>
-      new Promise((resolve, reject) => stream.pipeline(...args, (err) => (err ? reject(err) : resolve()))),
-  });
-}
-
 // ---- node:stream/consumers --------------------------------------------------------------------
-// Fully consume a stream / async-iterable / iterable into a single value.
+// Node's lib/stream/consumers.js: fully consume a stream / async-iterable into a single value.
 {
-  async function collect(src) {
+  async function blob(stream) {
     const chunks = [];
-    for await (const chunk of src) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk));
-    }
-    return Buffer.concat(chunks);
+    for await (const chunk of stream) chunks.push(chunk);
+    return new Blob(chunks);
   }
-  const text = async (src) => (await collect(src)).toString("utf8");
-  const buffer = async (src) => collect(src);
-  const json = async (src) => JSON.parse(await text(src));
-  const arrayBuffer = async (src) => {
-    const b = await collect(src);
-    return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
-  };
-  const blob = async (src) => new Blob([await collect(src)]);
+  async function arrayBuffer(stream) {
+    const ret = await blob(stream);
+    return ret.arrayBuffer();
+  }
+  async function buffer(stream) {
+    return Buffer.from(await arrayBuffer(stream));
+  }
+  async function text(stream) {
+    const dec = new TextDecoder();
+    let str = "";
+    for await (const chunk of stream) {
+      if (typeof chunk === "string") str += chunk;
+      else str += dec.decode(chunk, { stream: true });
+    }
+    // Flush the streaming TextDecoder so that any pending incomplete multibyte characters are
+    // handled.
+    str += dec.decode(undefined, { stream: false });
+    return str;
+  }
+  async function json(stream) {
+    const str = await text(stream);
+    return JSON.parse(str);
+  }
   __builtins.set("stream/consumers", { arrayBuffer, blob, buffer, json, text });
 }
 
@@ -649,7 +650,15 @@ __builtins.set("sys", __builtins.get("util"));
   proc.debugPort = 9229;
   proc.domain = null;
   proc.moduleLoadList = [];
-  proc.config = { target_defaults: {}, variables: {} };
+  // The subset of Node's build config that programs (and Node's test/common) probe.
+  proc.config = {
+    target_defaults: { default_configuration: "Release" },
+    variables: {
+      v8_enable_i18n_support: 1, icu_small: false, node_shared_openssl: false,
+      openssl_is_fips: false, openssl_quic: false, node_module_version: 115, napi_build_version: "9",
+      node_shared: false, node_use_openssl: true, asan: 0,
+    },
+  };
   proc.sourceMapsEnabled = false;
   proc.allowedNodeEnvironmentFlags = new Set();
 
@@ -685,31 +694,87 @@ __builtins.set("sys", __builtins.get("util"));
     enumerable: true, configurable: true, writable: true,
   });
 
-  // Real: print the Node-style warning line to stderr and emit a 'warning' event with an Error.
-  proc.emitWarning = function (warning, options) {
-    let type = "Warning", code, detail;
-    if (typeof options === "string") {
-      type = options;
-    } else if (options && typeof options === "object") {
-      if (options.type) type = options.type;
-      code = options.code;
-      detail = options.detail;
+  // Node's lib/internal/process/warning.js: emitWarning builds the warning and emits 'warning' on
+  // the next tick; the default 'warning' listener (absent under --no-warnings/NODE_NO_WARNINGS=1)
+  // prints it. --no-deprecation / --throw-deprecation / --trace-deprecation / --trace-warnings
+  // are honored from execArgv.
+  {
+    // execArgv is stamped after the glue runs, so the flag-backed properties resolve on first read.
+    const hasFlag = (f) => Array.isArray(proc.execArgv) && proc.execArgv.includes(f);
+    for (const [prop, flag] of [["noDeprecation", "--no-deprecation"], ["throwDeprecation", "--throw-deprecation"],
+      ["traceDeprecation", "--trace-deprecation"], ["traceProcessWarnings", "--trace-warnings"]]) {
+      Object.defineProperty(proc, prop, {
+        configurable: true, enumerable: false,
+        get() { return hasFlag(flag) ? true : undefined; },
+        set(v) { Object.defineProperty(proc, prop, { value: v, writable: true, configurable: true, enumerable: true }); },
+      });
     }
-    let err;
-    if (warning instanceof Error) {
-      err = warning;
-    } else {
-      err = new Error(String(warning));
-      err.name = type;
-    }
-    if (code !== undefined) err.code = code;
-    let line = "(node:" + proc.pid + ") ";
-    if (code !== undefined) line += "[" + code + "] ";
-    line += (err.name || type) + ": " + err.message;
-    proc.stderr.write(line + "\n");
-    if (detail) proc.stderr.write(String(detail) + "\n");
-    proc.emit("warning", err);
-  };
+    let traceWarningHelperShown = false;
+    const onWarning = function onWarning(warning) {
+      if (!(warning instanceof Error)) return;
+      const isDeprecation = warning.name === "DeprecationWarning";
+      if (isDeprecation && proc.noDeprecation) return;
+      const trace = proc.traceProcessWarnings || (isDeprecation && proc.traceDeprecation);
+      let msg = `(node:${proc.pid}) `;
+      if (warning.code) msg += `[${warning.code}] `;
+      if (trace && warning.stack) {
+        msg += `${warning.stack}`;
+      } else {
+        msg += typeof warning.toString === "function" ? `${warning.toString()}` : Error.prototype.toString.call(warning);
+      }
+      if (typeof warning.detail === "string") msg += `\n${warning.detail}`;
+      if (!trace && !traceWarningHelperShown) {
+        const flag = isDeprecation ? "--trace-deprecation" : "--trace-warnings";
+        msg += `\n(Use \`node ${flag} ...\` to show where the warning was created)`;
+        traceWarningHelperShown = true;
+      }
+      console.error(msg);
+    };
+    const createWarningObject = (warning, type, code, detail) => {
+      const err = new Error(warning);
+      err.name = String(type || "Warning");
+      if (code !== undefined) err.code = code;
+      if (detail !== undefined) err.detail = detail;
+      return err;
+    };
+    proc.emitWarning = function emitWarning(warning, type, code, ctor) {
+      let detail;
+      if (type !== null && typeof type === "object" && !Array.isArray(type)) {
+        ctor = type.ctor;
+        code = type.code;
+        if (typeof type.detail === "string") detail = type.detail;
+        type = type.type || "Warning";
+      } else if (typeof type === "function") {
+        ctor = type;
+        code = undefined;
+        type = "Warning";
+      }
+      if (type !== undefined) __validators.validateString(type, "type");
+      if (typeof code === "function") {
+        ctor = code;
+        code = undefined;
+      } else if (code !== undefined) {
+        __validators.validateString(code, "code");
+      }
+      if (typeof warning === "string") {
+        warning = createWarningObject(warning, type, code, detail);
+      } else if (!(warning instanceof Error)) {
+        throw new __errors.ERR_INVALID_ARG_TYPE("warning", ["Error", "string"], warning);
+      }
+      if (warning.name === "DeprecationWarning") {
+        if (proc.noDeprecation) return;
+        if (proc.throwDeprecation) {
+          // Delay throwing so that all former warnings are logged first.
+          return proc.nextTick(() => { throw warning; });
+        }
+      }
+      proc.nextTick(() => proc.emit("warning", warning));
+    };
+    proc.on("warning", function (warning) {
+      if (hasFlag("--no-warnings") || (proc.env && proc.env.NODE_NO_WARNINGS === "1")) return;
+      onWarning(warning);
+    });
+  }
 
   // Real: bridge to the builtin-module registry (getBuiltinModule('fs') === require('fs')).
   proc.getBuiltinModule = function (id) {
@@ -882,43 +947,45 @@ __builtins.set("sys", __builtins.get("util"));
   proc.ref = () => {};
   proc.unref = () => {};
 
-  // stdin: an on-demand Readable over the runtime's blocking stdin op. Reads begin only when the
-  // stream consumer asks for data, so an unused stdin never holds the event loop open.
+  // ---- process.stdin / stdout / stderr ----------------------------------------------------------
+  // stdin: a Readable over the runtime's non-blocking stdin op. Each `_read` issues one native
+  // read, so reading follows the consumer (backpressure; nothing is read until someone asks),
+  // and an unused stdin never holds the event loop open. The read in flight cannot be
+  // cancelled, so a paused or destroyed stdin unrefs it instead of waiting for the writer to
+  // close the pipe (Node lets the process exit in both cases).
   const streamMod = __builtins.get("stream");
-  let stdin;
-  if (streamMod && streamMod.Readable) {
-    stdin = new streamMod.Readable({ read() {} });
-    let pumping = false;
-    // The read in flight. It cannot be cancelled, so a paused or destroyed stdin unrefs it instead
-    // of waiting for the writer to close the pipe (Node lets the process exit in both cases).
+  const stdinIsTTY = typeof proc._isatty === "function" && proc._isatty(0);
+  const stdin = new streamMod.Readable({ highWaterMark: 64 * 1024 });
+  {
     let pending = null;
     let wanted = true;
+    let reading = false;
     const setRef = (keep) => {
       wanted = keep;
       if (pending !== null) proc._stdinRef(pending, keep);
     };
-    const pump = async () => {
-      try {
-        for (;;) {
-          const chunk = await new Promise((resolve, reject) => { pending = proc._readStdin(resolve, reject); if (!wanted) proc._stdinRef(pending, false); });
+    stdin._read = function () {
+      if (reading) return;
+      reading = true;
+      new Promise((resolve, reject) => {
+        pending = proc._readStdin(resolve, reject);
+        if (!wanted) proc._stdinRef(pending, false);
+      }).then(
+        (chunk) => {
           pending = null;
-          if (chunk === null) {
-            stdin.push(null);
-            return;
-          }
-          stdin.push(Buffer.from(chunk));
-        }
-      } catch (error) {
-        pending = null;
-        stdin.destroy(error);
-      }
+          reading = false;
+          if (chunk === null) stdin.push(null);
+          else stdin.push(Buffer.from(chunk));
+        },
+        (error) => {
+          pending = null;
+          reading = false;
+          stdin.destroy(error);
+        },
+      );
     };
     const resume = stdin.resume;
     stdin.resume = function () {
-      if (!pumping) {
-        pumping = true;
-        pump();
-      }
       setRef(true);
       return resume.call(this);
     };
@@ -933,16 +1000,64 @@ __builtins.set("sys", __builtins.get("util"));
     };
     stdin.ref = function () { setRef(true); return this; };
     stdin.unref = function () { setRef(false); return this; };
-  } else {
-    stdin = {
-      on: () => stdin, once: () => stdin, removeListener: () => stdin,
-      read: () => null, resume: () => stdin, pause: () => stdin, setEncoding: () => stdin,
-    };
   }
-  stdin.isTTY = false;
+  if (stdinIsTTY) {
+    stdin.isTTY = true;
+    stdin.isRaw = false;
+    stdin.setRawMode = function (mode) { this.isRaw = !!mode; return this; };
+  }
   stdin.fd = 0;
   Object.defineProperty(proc, "stdin", { value: stdin, enumerable: true, configurable: true });
-  proc.openStdin = function () { if (stdin.resume) stdin.resume(); return stdin; };
+  proc.openStdin = function () { stdin.resume(); return stdin; };
+
+  // stdout / stderr: Writables over the runtime's synchronous sinks (which honour an embedder's
+  // redirection) — tty.WriteStream on a terminal, else Node's SyncWriteStream shape. Created on
+  // first access, as Node's are. `destroy()` only ends the JS stream: fd 1/2 stay open.
+  const rawStdio = { 1: proc.stdout, 2: proc.stderr };
+  __internals.set("stdio_raw", rawStdio);
+  class SyncWriteStream extends streamMod.Writable {
+    constructor(fd, raw) {
+      super({ autoDestroy: true, decodeStrings: false });
+      this.fd = fd;
+      this._raw = raw;
+      this.readable = false;
+    }
+    _write(chunk, encoding, cb) {
+      try {
+        this._raw.write(typeof chunk === "string" && encoding !== "utf8" && encoding !== "utf-8" ? Buffer.from(chunk, encoding) : chunk);
+      } catch (e) {
+        cb(e);
+        return;
+      }
+      cb();
+    }
+  }
+  function dummyDestroy(err, cb) {
+    cb(err);
+    this._undestroy();
+    if (!this._writableState.emitClose) process.nextTick(() => this.emit("close"));
+  }
+  function createWritableStdioStream(fd) {
+    const tty = __builtins.get("tty");
+    const stream = tty && proc._isatty && proc._isatty(fd)
+      ? new tty.WriteStream(fd)
+      : new SyncWriteStream(fd, rawStdio[fd]);
+    stream.fd = fd;
+    stream._type = stream.isTTY ? "tty" : "fs";
+    stream._isStdio = true;
+    stream.destroySoon = stream.destroy;
+    stream._destroy = dummyDestroy;
+    return stream;
+  }
+  let stdoutStream, stderrStream;
+  Object.defineProperty(proc, "stdout", {
+    configurable: true, enumerable: true,
+    get() { return stdoutStream ??= createWritableStdioStream(1); },
+  });
+  Object.defineProperty(proc, "stderr", {
+    configurable: true, enumerable: true,
+    get() { return stderrStream ??= createWritableStdioStream(2); },
+  });
 
   // child_process.fork IPC. Lumen has no extra inherited fd, so fork reserves stdin and frames
   // messages with a control-prefixed JSON line; ordinary stdout lines remain ordinary stdout.

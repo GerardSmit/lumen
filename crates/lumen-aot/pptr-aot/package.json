@@ -1,0 +1,9 @@
+{
+  "name": "pptr-aot",
+  "private": true,
+  "description": "npm install here before building: the pptr-aot example bundles these packages into its binary",
+  "type": "commonjs",
+  "dependencies": {
+    "puppeteer-core": "25.12.0"
+  }
+}

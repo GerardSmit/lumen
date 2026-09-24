@@ -1,5 +1,5 @@
 //! Compiled for-in with uncaptured lexical heads and shared oracle enumeration.
-use super::{Bail, CResult, Compiler, LoopCtx, Op};
+use super::{Bail, CResult, Compiler, Home, LoopCtx, Op};
 use crate::ast::{DeclKind, Expr, Stmt};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
@@ -23,6 +23,27 @@ impl Compiler {
         result
     }
 
+    /// `for (var x in o)` / `for (x in o)`: each key is written to the existing binding
+    /// (hoisted var, outer local, captured name or global), as PutValue does.
+    pub(super) fn for_in_assign(&mut self, name: &str, right: &Expr, body: &Stmt) -> CResult {
+        let store = match self.home(name) {
+            Some(Home::Slot(_, true)) | Some(Home::Env(true)) => return Err(Bail),
+            Some(Home::Slot(slot, false)) if !self.tdz_pending.contains(&slot) => {
+                Op::StoreLocal(slot)
+            }
+            Some(Home::Slot(..)) => return Err(Bail),
+            Some(Home::Env(false)) => Op::StoreCap(self.name_idx(name)),
+            None => {
+                let n = self.name_idx(name);
+                let cache = self.new_name_cache();
+                Op::StoreNameCached(n, cache)
+            }
+        };
+        let labels = std::mem::take(&mut self.pending_labels);
+        self.expr(right)?;
+        self.for_in_loop(store, body, labels)
+    }
+
     fn for_in_scope(
         &mut self,
         kind: DeclKind,
@@ -36,6 +57,11 @@ impl Compiler {
         self.tdz_slots.insert(binding);
         self.emit(Op::Tdz(binding)); // Head binding shadows outer names while RHS evaluates.
         self.expr(right)?;
+        self.for_in_loop(Op::StoreLocal(binding), body, labels)
+    }
+
+    /// The enumeration loop over the object on the stack; `store` binds each key.
+    fn for_in_loop(&mut self, store: Op, body: &Stmt, labels: Vec<String>) -> CResult {
         let base = self.fresh_slot("%for-in-base%");
         let keys = self.fresh_slot("%for-in-keys%");
         let cursor = self.fresh_slot("%for-in-cursor%");
@@ -49,7 +75,10 @@ impl Compiler {
         let head = self.ops.len();
         self.emit(Op::ForInStepL(base, keys, cursor));
         let exit = self.emit(Op::JumpIfFalse(0));
-        self.emit(Op::StoreLocal(binding));
+        self.emit(store);
+        if let Op::StoreLocal(s) = store {
+            self.tdz_pending.remove(&s); // a lexical head is initialized from here on
+        }
         self.loops.push(LoopCtx {
             labels,
             entry_try_depth: self.try_depth,

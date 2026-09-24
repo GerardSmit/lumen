@@ -13,6 +13,9 @@ publish = false
 [dependencies]
 lumen-host = { path = "../lumen-host" }
 lumen-tls = { path = "../lumen-tls" }
+# The binding macros (#[lumen::op] / #[class]) name `::lumen::embed` paths, so the crate is a
+# direct dependency (lumen-host already links it).
+lumen = { path = "../lumen", features = ["macros"] }
 
 # Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
 [build-dependencies]

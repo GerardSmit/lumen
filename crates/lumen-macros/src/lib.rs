@@ -19,8 +19,12 @@
 //!
 //! Options: `name = "jsName"`, `fast` (also emit an unboxed `extern "C"` entry — only
 //! `f64`/`i32`/`u32`/`bool` parameters and result), `coerce` (JS ToNumber/ToString/ToBoolean
-//! instead of strict type checks), `async` (the result — or any thrown error — becomes a
-//! settled promise).
+//! instead of strict type checks), `async` (the fn runs off the JS thread, on the host's worker
+//! pool, and the op returns a promise of its result: arguments are converted on the JS thread —
+//! so they must be owned `Send` types such as `Vec<u8>`, `String`, numbers — and moved to the
+//! pool; the result (`IntoJs + Send`) is converted back on the JS thread when the event loop
+//! picks up the completion; an `Err`, or an argument error, rejects. Without a host event loop
+//! the fn runs inline and the promise is already settled. See `lumen::embed::AsyncHost`).
 //!
 //! Parameters are JS arguments converted with `lumen::embed::FromJs`, except these injected
 //! ones: `&mut Ctx` (the interpreter; also `&mut Interp`), `This<T>` (the receiver), and
@@ -509,6 +513,23 @@ fn gen_wrapper(w: &WrapperSpec, fn_name: &str) -> Res<(u32, u32, String, String)
             "`async fn` is not supported yet: use `#[op(async)]` on a sync fn, or return `Promise<T>` settled from the host's event loop via `Deferred`".into(),
         ));
     }
+    if w.is_async {
+        // The body runs on a worker thread: nothing tied to the JS thread may cross.
+        if sig.receiver.is_some() || has_ctx || states == 1 {
+            return Err((
+                sig.name_span,
+                "`async` ops run on a worker thread, so they cannot take a receiver, `&mut Ctx` or `State<T>`; do the JS-thread part in a sync op and return `ctx.spawn_blocking(..)` (a `Promise<T>`)".into(),
+            ));
+        }
+        for p in &sig.params {
+            if p.kind == Kind::This || p.ty.contains('&') || base_name(&p.ty) == "Cow" {
+                return Err((
+                    p.span,
+                    "`async` ops run on a worker thread: take owned `Send` arguments (`Vec<u8>`, `String`, numbers, ...), not borrows or `This`".into(),
+                ));
+            }
+        }
+    }
     let mut flags = 0;
     if w.coerce {
         flags |= 1;
@@ -571,7 +592,9 @@ fn gen_wrapper(w: &WrapperSpec, fn_name: &str) -> Res<(u32, u32, String, String)
         });
     }
     let call = format!("{}({})", w.call_path, call_args.join(", "));
-    let call = if has_ctx {
+    let call = if w.is_async {
+        format!("__cx.spawn_blocking(move || {call})?")
+    } else if has_ctx {
         format!("__cx.with_ctx(|__c| {call})")
     } else if states == 1 {
         format!("__cx.with_state(|__s| {call})?")
@@ -582,6 +605,8 @@ fn gen_wrapper(w: &WrapperSpec, fn_name: &str) -> Res<(u32, u32, String, String)
     if w.ctor {
         let ty = w.self_ty.unwrap();
         body.push_str(&format!("__cx.construct_ret::<{ty}, _>(__nt, __r)\n"));
+    } else if w.is_async {
+        body.push_str("::core::result::Result::Ok(__r)\n");
     } else {
         body.push_str("__cx.ret(__r)\n");
     }

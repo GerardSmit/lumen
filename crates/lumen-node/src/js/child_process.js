@@ -38,7 +38,7 @@ function signalNumber(signal) {
 }
 
 // libuv errno values (the table util.getSystemErrorName reads) for the ways a spawn can fail.
-const SPAWN_ERRNO = { ENOENT: -2, EACCES: -13, ENOTDIR: -20, EINVAL: -22 };
+const SPAWN_ERRNO = Object.fromEntries(["ENOENT", "EACCES", "ENOTDIR", "EINVAL"].map((c) => [c, __uvCodes.get(c)]));
 
 // A native spawn failure as Node reports it: `spawn foo ENOENT` with errno, syscall, path and
 // spawnargs (the arguments after the file). Anything else is rethrown unchanged.

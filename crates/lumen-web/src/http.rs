@@ -82,17 +82,17 @@ fn one_request(
 ) -> Result<HttpResponse, String> {
     let port = u.port.unwrap_or(if u.scheme == "https" { 443 } else { 80 });
     let host_header = match u.port {
-        Some(p) => format!("{}:{}", u.host, p),
-        None => u.host.clone(),
+        Some(p) => format!("{}:{}", u.hostname(), p),
+        None => u.hostname().to_string(),
     };
-    let stream = TcpStream::connect((u.host.trim_matches(['[', ']']), port))
+    let stream = TcpStream::connect((u.hostname().trim_matches(['[', ']']), port))
         .map_err(|e| format!("fetch '{}': connect: {e}", u.href()))?;
     stream.set_read_timeout(Some(TIMEOUT)).ok();
     stream.set_write_timeout(Some(TIMEOUT)).ok();
 
     let mut req = format!(
-        "{method} {}{} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n",
-        u.path, u.query
+        "{method} {} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n",
+        u.request_target()
     );
     let mut have_ua = false;
     for (k, v) in headers {
@@ -116,7 +116,7 @@ fn one_request(
 
     let mut stream: Box<dyn ReadWrite> = if u.scheme == "https" {
         Box::new(
-            lumen_tls::TlsStream::connect(stream, u.host.trim_matches(['[', ']']))
+            lumen_tls::TlsStream::connect(stream, u.hostname().trim_matches(['[', ']']))
                 .map_err(|error| format!("fetch '{}': {error}", u.href()))?,
         )
     } else {

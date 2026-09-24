@@ -535,6 +535,19 @@ impl<'s> ArgCx<'s> {
         }
     }
 
+    /// `#[op(async)]`: run `work` (the op body over its already-converted, owned arguments) on
+    /// the host's worker pool; returns the promise (see [`Interp::spawn_blocking`]).
+    pub fn spawn_blocking<R: IntoJs + Send + 'static>(
+        &self,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<Value, Value> {
+        self.before_js();
+        // SAFETY: no borrow derived from the context is live past this call.
+        let ctx = unsafe { self.interp_mut() };
+        let p = ctx.spawn_blocking(work);
+        p.into_js(ctx)
+    }
+
     /// Convert the op's result (the tail of every wrapper).
     #[inline]
     pub fn ret<R: IntoJs>(&self, r: R) -> Result<Value, Value> {
@@ -1570,6 +1583,226 @@ impl<T: IntoJs> IntoJs for Promise<T> {
 }
 
 // =============================================================================================
+// Async ops: work off the JS thread
+// =============================================================================================
+//
+// The engine is single-threaded: JS values (and so `Deferred`) never leave the JS thread. An
+// async op splits in two:
+//   1. on the JS thread it converts its arguments into owned `Send` data, creates a `Deferred`
+//      and registers it with the host's event loop, getting back a [`Completer`] (`Send`);
+//   2. the work runs elsewhere — a worker-pool thread ([`Interp::spawn_blocking`]), a dedicated
+//      thread, or whatever I/O completion the host drives — and finishes by handing the
+//      `Completer` a result. The loop wakes, and on the JS thread converts that result with
+//      `IntoJs` and settles the promise (reactions run in the loop's microtask checkpoint).
+//
+// The loop itself is the host's business ([`AsyncHost`], installed by lumen-runtime). Without
+// one, `spawn_blocking` runs the work inline and settles immediately (still a promise, still
+// asynchronous to JS), and completers queue their results until [`Interp::poll_async`].
+
+/// A finished async result on its way back to the JS thread: turns it into the settled value
+/// (`Err` rejects). Built by [`Completer::complete`]; run by the host on the JS thread.
+pub type Settle = Box<dyn FnOnce(&mut Interp) -> Result<Value, Value> + Send>;
+
+/// The event loop's side of async ops. lumen-runtime installs one per realm
+/// ([`Interp::set_async_host`]); an embedder with its own loop implements it the same way.
+pub trait AsyncHost: 'static {
+    /// Keep the loop alive for `deferred` until the returned completer delivers a [`Settle`];
+    /// the host then runs it on the JS thread and settles `deferred` with the outcome.
+    fn pending(&self, ctx: &mut Interp, deferred: Deferred) -> Completer;
+    /// Run `job` off the JS thread (a worker pool, or its own thread when `dedicated`: work that
+    /// may block for an unbounded time must not occupy a pool slot).
+    fn spawn(&self, job: Box<dyn FnOnce() + Send>, dedicated: bool);
+}
+
+struct AsyncHostSlot(Rc<dyn AsyncHost>);
+
+/// Settles one pending promise from any thread. Dropping it unsettled rejects the promise
+/// (an `Error: async operation was dropped`) rather than leaving the loop waiting forever.
+pub struct Completer {
+    send: Option<Box<dyn FnOnce(Settle) + Send>>,
+}
+
+impl Completer {
+    /// A completer delivering its [`Settle`] through `send` (for [`AsyncHost`] implementations).
+    pub fn new(send: impl FnOnce(Settle) + Send + 'static) -> Completer {
+        Completer {
+            send: Some(Box::new(send)),
+        }
+    }
+    /// Settle with `r`, converted on the JS thread: `Ok`/plain values fulfil, `Err` rejects
+    /// (`Result<T, E>` with `E: Into<OpError>`, e.g. `io::Error`, `String`, `OpError`).
+    pub fn complete<R: IntoJs + Send + 'static>(mut self, r: R) {
+        if let Some(send) = self.send.take() {
+            send(Box::new(move |ctx: &mut Interp| r.into_js(ctx)));
+        }
+    }
+    /// Settle with a hand-written conversion (runs on the JS thread).
+    pub fn settle_with(mut self, f: impl FnOnce(&mut Interp) -> Result<Value, Value> + Send + 'static) {
+        if let Some(send) = self.send.take() {
+            send(Box::new(f));
+        }
+    }
+}
+
+impl Drop for Completer {
+    fn drop(&mut self) {
+        if let Some(send) = self.send.take() {
+            send(Box::new(|ctx: &mut Interp| {
+                Err(ctx.make_error("Error", "async operation was dropped without completing"))
+            }));
+        }
+    }
+}
+
+/// Completions queued for [`Interp::poll_async`] when no [`AsyncHost`] is installed.
+#[derive(Default)]
+struct AsyncInbox {
+    next: u64,
+    pending: FastMap<u64, Deferred>,
+    ready: std::sync::Arc<std::sync::Mutex<Vec<(u64, Settle)>>>,
+}
+
+/// An `OpError` that crosses threads: the class/message/code of an error built off the JS thread.
+/// (`OpError` itself may carry a thrown JS value, which is not `Send`.)
+#[derive(Clone, Debug)]
+pub struct SendError {
+    pub class: &'static str,
+    pub message: String,
+    pub code: Option<Cow<'static, str>>,
+}
+
+impl SendError {
+    pub fn new(class: &'static str, message: impl Into<String>) -> SendError {
+        SendError {
+            class,
+            message: message.into(),
+            code: None,
+        }
+    }
+    pub fn with_code(mut self, c: impl Into<Cow<'static, str>>) -> SendError {
+        self.code = Some(c.into());
+        self
+    }
+}
+
+impl From<SendError> for OpError {
+    fn from(e: SendError) -> OpError {
+        let err = OpError::new(e.class, e.message);
+        match e.code {
+            Some(c) => err.with_code(c),
+            None => err,
+        }
+    }
+}
+
+impl Interp {
+    /// Install the realm's event loop hooks (see [`AsyncHost`]).
+    pub fn set_async_host(&mut self, host: impl AsyncHost) {
+        self.host_state.put(AsyncHostSlot(Rc::new(host)));
+    }
+
+    fn async_host(&self) -> Option<Rc<dyn AsyncHost>> {
+        self.host_state.get::<AsyncHostSlot>().map(|s| s.0.clone())
+    }
+
+    /// Register `deferred` with the event loop and get a `Send` handle that settles it from any
+    /// thread — the primitive under every async op (I/O completions, readiness callbacks,
+    /// worker threads). Without an [`AsyncHost`], settlements wait for [`Interp::poll_async`].
+    pub fn completer(&mut self, deferred: Deferred) -> Completer {
+        if let Some(host) = self.async_host() {
+            return host.pending(self, deferred);
+        }
+        if !self.host_state.has::<AsyncInbox>() {
+            self.host_state.put(AsyncInbox::default());
+        }
+        let inbox = self.host_state.get_mut::<AsyncInbox>().expect("just installed");
+        let id = inbox.next;
+        inbox.next += 1;
+        inbox.pending.insert(id, deferred);
+        let ready = std::sync::Arc::clone(&inbox.ready);
+        Completer::new(move |settle| {
+            ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((id, settle));
+        })
+    }
+
+    /// Settle whatever completers delivered so far when no [`AsyncHost`] is installed (a host
+    /// loop does this itself). Returns how many promises settled; run microtasks afterwards.
+    pub fn poll_async(&mut self) -> usize {
+        let Some(inbox) = self.host_state.get_mut::<AsyncInbox>() else {
+            return 0;
+        };
+        let ready = std::mem::take(
+            &mut *inbox
+                .ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut n = 0;
+        for (id, settle) in ready {
+            let Some(d) = self
+                .host_state
+                .get_mut::<AsyncInbox>()
+                .and_then(|inbox| inbox.pending.remove(&id))
+            else {
+                continue;
+            };
+            match settle(self) {
+                Ok(v) => self.resolve_promise(&d.promise, v),
+                Err(e) => self.reject_promise(&d.promise, e),
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// Whether completers created without an [`AsyncHost`] are still outstanding.
+    pub fn has_pending_async(&self) -> bool {
+        self.host_state
+            .get::<AsyncInbox>()
+            .is_some_and(|inbox| !inbox.pending.is_empty())
+    }
+
+    /// Run `work` on the host's worker pool and return a promise of its result (converted with
+    /// `IntoJs` back on the JS thread; an `Err` rejects). This is what `#[op(async)]` expands to.
+    /// Without an [`AsyncHost`] the work runs inline and the promise is already settled.
+    pub fn spawn_blocking<R: IntoJs + Send + 'static>(
+        &mut self,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> Promise<R> {
+        self.spawn_async(work, false)
+    }
+
+    /// [`Interp::spawn_blocking`] on a dedicated thread, for work that may block for an
+    /// unbounded time (waiting on a socket, a child process) and must not hold a pool slot.
+    pub fn spawn_thread<R: IntoJs + Send + 'static>(
+        &mut self,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> Promise<R> {
+        self.spawn_async(work, true)
+    }
+
+    fn spawn_async<R: IntoJs + Send + 'static>(
+        &mut self,
+        work: impl FnOnce() -> R + Send + 'static,
+        dedicated: bool,
+    ) -> Promise<R> {
+        let d = Deferred::new(self);
+        let p = Promise::pending(&d);
+        match self.async_host() {
+            Some(host) => {
+                let done = host.pending(self, d);
+                host.spawn(Box::new(move || done.complete(work())), dedicated);
+            }
+            None => d.resolve(self, work()),
+        }
+        p
+    }
+}
+
+// =============================================================================================
 // Classes
 // =============================================================================================
 
@@ -1942,9 +2175,12 @@ pub mod private {
         fn desc() -> &'static ClassDesc;
     }
 
-    /// `#[op(async)]`: turn the synchronous outcome (including argument errors) into a
-    /// settled promise.
+    /// `#[op(async)]`: the promise from [`ArgCx::spawn_blocking`] passes through; an argument
+    /// conversion error (thrown before any work was spawned) becomes a rejected promise.
     pub fn async_ret(ctx: &mut Interp, r: Result<Value, Value>) -> Result<Value, Value> {
+        if let Ok(p) = r {
+            return Ok(p);
+        }
         let d = Deferred::new(ctx);
         let p = d.promise();
         match r {

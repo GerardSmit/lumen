@@ -27,6 +27,9 @@ const STATUS_CODES = {
 const METHODS = ["ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD", "LINK", "LOCK", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL", "MOVE", "NOTIFY", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH", "PURGE", "PUT", "REBIND", "REPORT", "SEARCH", "SOURCE", "SUBSCRIBE", "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE"];
 
 class IncomingMessage extends Readable {
+  // Data is pushed as it arrives from the native side; there is nothing to pull.
+  _read() {}
+
   constructor(socket) {
     super();
     this.httpVersion = "1.1";

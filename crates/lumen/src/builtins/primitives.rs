@@ -32,6 +32,10 @@ pub(super) fn install_number(it: &mut Interp) {
             return Err(i.make_error("RangeError", "toString() radix must be between 2 and 36"));
         }
         if radix == 10.0 {
+            let mut out = String::new();
+            if super::num_fmt::fast_num_to_str(n, &mut out) {
+                return Ok(Value::from_string(out));
+            }
             Ok(Value::from_string(i.num_to_str(n)))
         } else {
             Ok(Value::from_string(to_radix_string(n, radix as u32)))
@@ -174,6 +178,27 @@ pub(super) fn install_number(it: &mut Interp) {
 /// is an exact tie and rounds up. We therefore expand `x` to its exact decimal digits and round
 /// half-up ourselves: round up iff the exact digit just past the cut is ≥ 5.
 fn to_fixed_magnitude(x: f64, digits: usize) -> String {
+    // Fast path: when x·10^digits is small enough that the product's rounding error (< 2^-13
+    // below 2^40) cannot move it across a rounding boundary, the nearest integer (ties can't
+    // be this close) is decided from the product directly.
+    if digits <= 22 {
+        let scaled = x * 10f64.powi(digits as i32);
+        if scaled < (1u64 << 40) as f64 {
+            let floor = scaled.floor();
+            let frac = scaled - floor;
+            if (frac - 0.5).abs() > 1e-3 {
+                let n = floor as u64 + u64::from(frac > 0.5);
+                let mut s = n.to_string();
+                if digits > 0 {
+                    while s.len() <= digits {
+                        s.insert(0, '0');
+                    }
+                    s.insert(s.len() - digits, '.');
+                }
+                return s;
+            }
+        }
+    }
     // The exact decimal expansion of a finite f64 terminates. Its number of fractional digits is
     // `-e2` where `x = significand × 2^e2` with an integer significand — bounded by 1074 (the
     // smallest subnormal). Formatting to at least that many places incurs no rounding, so the digit

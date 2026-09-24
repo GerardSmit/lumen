@@ -1,918 +1,9240 @@
-// node:fs — Node's shapes (sync, callback, and promises) over the runtime's `fs` global
-// (lumen-fs) plus the `__node` filesystem ops (real stat metadata, rm, rename, copy, …).
-// readFile returns a string with an encoding argument, else a Buffer.
+// node:fs — Node 20.10's lib/fs.js and lib/internal/fs/* run as-is over lumen's filesystem binding.
+//
+// The Node sources below are verbatim, each wrapped as a CommonJS-style module; the few edits are
+// marked `lumen:`. They reach the platform only through `internalBinding('fs')`, which this file
+// implements over the Rust ops in src/fsb.rs (`__node.fsBinding()`), so validation, argument
+// handling, error shapes, streams, FileHandle, Dir, cp, rm, and the promise API all behave as
+// Node's own code does.
+//
+// The binding follows Node's calling convention. Each method takes its arguments, then `req`,
+// then `ctx`:
+//   - `req === undefined`: synchronous. On failure it fills `ctx` (errno/syscall) when `ctx` is an
+//     object, and otherwise throws the uvException Node's C++ would build.
+//   - `req instanceof FSReqCallback`: the worker-pool op runs, then `req.oncomplete(err, result)`.
+//   - `req === kUsePromises`: returns a promise.
+// Errors carry libuv's names and errno values (see `__uvErrmap` in preamble.js). Stats travel as
+// the 18-slot Float64Array (or BigInt64Array) that Node's getStatsFromBinding reads.
 
-// Node's `Stats`. Built from the raw fields `__node.stat`/`lstat`/native fstat return.
-class Stats {
-  constructor(raw) {
-    this.dev = raw.dev; this.ino = raw.ino; this.mode = raw.mode; this.nlink = raw.nlink;
-    this.uid = raw.uid; this.gid = raw.gid; this.rdev = raw.rdev; this.size = raw.size;
-    this.blksize = raw.blksize; this.blocks = raw.blocks;
-    this.atimeMs = raw.atimeMs; this.mtimeMs = raw.mtimeMs;
-    this.ctimeMs = raw.ctimeMs; this.birthtimeMs = raw.birthtimeMs;
-    this.atime = new Date(raw.atimeMs); this.mtime = new Date(raw.mtimeMs);
-    this.ctime = new Date(raw.ctimeMs); this.birthtime = new Date(raw.birthtimeMs);
-    this._kind = raw.kind;
+const primordials = __primordials;
+const isWindows = process.platform === "win32";
+const fsb = __node.fsBinding();
+
+// ---- the module table -------------------------------------------------------------------------
+// `defineModule(id, fn)` registers a module body, which is evaluated on its first `require`.
+// Cycles resolve as in CommonJS: a module is cached before its body runs.
+const moduleDefs = new Map();
+const moduleCache = new Map();
+function defineModule(id, fn) {
+  moduleDefs.set(id, fn);
+}
+function require(id) {
+  const cached = moduleCache.get(id);
+  if (cached !== undefined) return cached.exports;
+  const fn = moduleDefs.get(id);
+  if (fn !== undefined) {
+    const module = { exports: {} };
+    moduleCache.set(id, module);
+    fn(module, module.exports, require, internalBinding, primordials);
+    return module.exports;
   }
-  isFile() { return this._kind === "file"; }
-  isDirectory() { return this._kind === "dir"; }
-  isSymbolicLink() { return this._kind === "symlink"; }
-  isBlockDevice() { return false; }
-  isCharacterDevice() { return false; }
-  isFIFO() { return false; }
-  isSocket() { return false; }
+  const value = builtinModule(id);
+  moduleCache.set(id, { exports: value });
+  return value;
 }
-
-function makeStats(raw) {
-  return new Stats(raw);
-}
-
-// A Dirent (readdir withFileTypes).
-class Dirent {
-  constructor(name, kind, parentPath) {
-    this.name = name;
-    this.parentPath = parentPath;
-    this.path = parentPath;
-    this._kind = kind;
+function builtinModule(id) {
+  switch (id) {
+    case "buffer": case "path": case "stream": case "string_decoder": case "timers": case "util":
+    case "util/types": case "url":
+      return __builtins.get(id);
+    case "events":
+      return __builtins.get("events");
+    case "internal/util/types":
+      return __builtins.get("util").types;
+    case "fs/promises":
+      return require("fs").promises;
   }
-  isFile() { return this._kind === "file"; }
-  isDirectory() { return this._kind === "dir"; }
-  isSymbolicLink() { return this._kind === "symlink"; }
-  isBlockDevice() { return false; }
-  isCharacterDevice() { return false; }
-  isFIFO() { return false; }
-  isSocket() { return false; }
+  throw new Error(`lumen fs: internal module '${id}' is not available`);
 }
 
-function makeDirent(name, kind, parentPath) {
-  return new Dirent(name, kind, parentPath);
+// ---- internal/errors --------------------------------------------------------------------------
+
+const kIsNodeError = Symbol("kIsNodeError");
+// Node's SystemError: `new ERR_X({ syscall, code, message, path, dest, errno })`.
+class SystemError extends Error {
+  constructor(key, prefix, context) {
+    super();
+    let message = `${prefix}: ${context.syscall} returned ${context.code} (${context.message})`;
+    if (context.path !== undefined) message += ` ${context.path}`;
+    if (context.dest !== undefined) message += ` => ${context.dest}`;
+    this.code = key;
+    Object.defineProperties(this, {
+      [kIsNodeError]: { value: true, enumerable: false, writable: false, configurable: true },
+      name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
+      message: { value: message, enumerable: false, writable: true, configurable: true },
+      info: { value: context, enumerable: true, configurable: true, writable: false },
+      errno: {
+        get() { return context.errno; },
+        set: (value) => { context.errno = value; },
+        enumerable: true, configurable: true,
+      },
+      syscall: {
+        get() { return context.syscall; },
+        set: (value) => { context.syscall = value; },
+        enumerable: true, configurable: true,
+      },
+    });
+    if (context.path !== undefined) {
+      Object.defineProperty(this, "path", {
+        get() { return context.path != null ? context.path.toString() : context.path; },
+        set: (value) => { context.path = value ? Buffer.from(value.toString()) : undefined; },
+        enumerable: true, configurable: true,
+      });
+    }
+    if (context.dest !== undefined) {
+      Object.defineProperty(this, "dest", {
+        get() { return context.dest != null ? context.dest.toString() : context.dest; },
+        set: (value) => { context.dest = value ? Buffer.from(value.toString()) : undefined; },
+        enumerable: true, configurable: true,
+      });
+    }
+    if (typeof this.stack === "string") {
+      const nl = this.stack.indexOf("\n");
+      this.stack = `SystemError [${key}]: ${message}${nl === -1 ? "" : this.stack.slice(nl)}`;
+    }
+  }
+  toString() {
+    return `${this.name} [${this.code}]: ${this.message}`;
+  }
+  [Symbol.for("nodejs.util.inspect.custom")](recurseTimes, ctx) {
+    return __builtins.get("util").inspect(this, { ...ctx, getters: true, customInspect: false });
+  }
+}
+const systemErrorCodes = {
+  ERR_FS_CP_DIR_TO_NON_DIR: "Cannot overwrite directory with non-directory",
+  ERR_FS_CP_EEXIST: "Target already exists",
+  ERR_FS_CP_EINVAL: "Invalid src or dest",
+  ERR_FS_CP_FIFO_PIPE: "Cannot copy a FIFO pipe",
+  ERR_FS_CP_NON_DIR_TO_DIR: "Cannot overwrite non-directory with directory",
+  ERR_FS_CP_SOCKET: "Cannot copy a socket file",
+  ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY: "Cannot overwrite symlink in subdirectory of self",
+  ERR_FS_CP_UNKNOWN: "Cannot copy an unknown file type",
+  ERR_FS_EISDIR: "Path is a directory",
+  ERR_SYSTEM_ERROR: "A system error occurred",
+};
+const codes = { __proto__: __errors };
+for (const key of Object.keys(systemErrorCodes)) {
+  const prefix = systemErrorCodes[key];
+  codes[key] = { [key]: class extends SystemError { constructor(ctx) { super(key, prefix, ctx); } } }[key];
+}
+function simpleCode(key, Base, format) {
+  codes[key] = {
+    [key]: function (...args) {
+      const err = new Base(format(...args));
+      err.code = key;
+      if (typeof err.stack === "string") {
+        err.stack = `${err.name} [${key}]${err.stack.slice(err.name.length)}`;
+      }
+      Object.defineProperty(err, "toString", {
+        value() { return `${this.name} [${key}]: ${this.message}`; },
+        enumerable: false, writable: true, configurable: true,
+      });
+      return err;
+    },
+  }[key];
+}
+if (!("ERR_FS_INVALID_SYMLINK_TYPE" in __errors)) {
+  simpleCode("ERR_FS_INVALID_SYMLINK_TYPE", Error,
+    (type) => `Symlink type must be one of "dir", "file", or "junction". Received "${type}"`);
+}
+if (!("ERR_INCOMPATIBLE_OPTION_PAIR" in __errors)) {
+  simpleCode("ERR_INCOMPATIBLE_OPTION_PAIR", TypeError,
+    (a, b) => `Option "${a}" cannot be used in combination with option "${b}"`);
+}
+if (!("ERR_INTERNAL_ASSERTION" in __errors)) {
+  simpleCode("ERR_INTERNAL_ASSERTION", Error, (message) => {
+    const suffix = "This is caused by either a bug in Node.js or incorrect usage of Node.js internals.\n" +
+      "Please open an issue with this stack trace at https://github.com/nodejs/node/issues\n";
+    return message === undefined ? suffix : `${message}\n${suffix}`;
+  });
 }
 
-const encOf = (options) => (typeof options === "string" ? options : options && options.encoding);
-
-// Node's fs accepts a path string, a Buffer, or a file: URL (string or URL object). Reduce any
-// of those to a filesystem path.
-function toPath(p) {
-  if (p instanceof URL) return __builtins.get("url").fileURLToPath(p);
-  const s = p instanceof Uint8Array ? Buffer.from(p).toString("utf8") : String(p);
-  return s.startsWith("file://") ? __builtins.get("url").fileURLToPath(s) : realmPath(s);
+class AbortError extends Error {
+  constructor(message = "The operation was aborted", options = undefined) {
+    if (options !== undefined && typeof options !== "object") {
+      throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+    }
+    super(message, options);
+    this.code = "ABORT_ERR";
+    this.name = "AbortError";
+  }
 }
 
-// A realm embedded in a host process has its own working directory; the OS one belongs to the
-// host. The ops resolve relative paths against the OS cwd, so resolve them here first. A path
-// that is already absolute (the common case) costs one check.
-function realmPath(s) {
-  const path = __builtins.get("path");
-  if (s === "" || path.isAbsolute(s)) return s;
-  const base = __node.realmCwd();
-  return base === undefined ? s : path.resolve(base, s);
+function aggregateTwoErrors(innerError, outerError) {
+  if (innerError && outerError && innerError !== outerError) {
+    if (Array.isArray(outerError.errors)) {
+      outerError.errors.push(innerError);
+      return outerError;
+    }
+    const err = new AggregateError([outerError, innerError], outerError.message);
+    err.code = outerError.code;
+    return err;
+  }
+  return innerError || outerError;
 }
 
-// Coerce write data (string | Buffer | TypedArray | DataView | ArrayBuffer) to a Buffer for the
-// byte ops. Buffer.from copies views/ArrayBuffers, so the returned Buffer owns its bytes.
-function toBuffer(data, encoding) {
-  if (typeof data === "string") return Buffer.from(data, encoding || "utf8");
-  return Buffer.from(data);
+function uvErrmapGet(errno) {
+  return __uvErrmap.get(errno);
 }
 
-// A synthesized errno-tagged Error, matching the shape `__node`'s ops produce.
-function fsError(code, syscall, path, extra) {
-  const msg = `${code}: ${extra || "operation failed"}, ${syscall}${path != null ? ` '${path}'` : ""}`;
-  const err = new Error(msg);
+// Node's uvException: `${code}: ${desc}, ${syscall} '${path}' -> '${dest}'`, with every other
+// ctx key copied onto the error.
+function uvException(ctx) {
+  const { 0: code, 1: uvmsg } = uvErrmapGet(ctx.errno) || ["UNKNOWN", "unknown error"];
+  let message = `${code}: ${ctx.message || uvmsg}, ${ctx.syscall}`;
+  let path;
+  let dest;
+  if (ctx.path) {
+    path = ctx.path.toString();
+    message += ` '${path}'`;
+  }
+  if (ctx.dest) {
+    dest = ctx.dest.toString();
+    message += ` -> '${dest}'`;
+  }
+  const err = new Error(message);
+  for (const prop of Object.keys(ctx)) {
+    if (prop === "message" || prop === "path" || prop === "dest") continue;
+    err[prop] = ctx[prop];
+  }
   err.code = code;
-  err.syscall = syscall;
-  if (path != null) err.path = path;
+  if (path) err.path = path;
+  if (dest) err.dest = dest;
   return err;
 }
 
-// Map a Node open-flags string (or numeric flag) to lumen-fs's r/w/a/r+/w+/a+ mode, with a
-// trailing 'x' for exclusive creation (O_EXCL: EEXIST if the file is already there). The sync
-// ('s') qualifier is accepted but not separately enforced.
-function flagToMode(flags) {
-  if (flags == null) return "r";
-  if (typeof flags === "number") {
-    const c = nodeFs.constants;
-    const rw = flags & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-    const x = flags & c.O_EXCL ? "x" : "";
-    if (flags & c.O_APPEND) return (rw === 0 ? "a" : "a+") + x;
-    if (flags & c.O_TRUNC || flags & c.O_CREAT) return (rw === 2 ? "w+" : "w") + x;
-    if (rw === 2) return "r+";
-    return "r";
-  }
-  switch (String(flags)) {
-    case "r": case "rs": return "r";
-    case "r+": case "rs+": return "r+";
-    case "w": return "w";
-    case "wx": case "xw": return "wx";
-    case "w+": return "w+";
-    case "wx+": case "xw+": return "w+x";
-    case "a": return "a";
-    case "ax": case "xa": return "ax";
-    case "a+": return "a+";
-    case "ax+": case "xa+": return "a+x";
-    default: return "r";
-  }
-}
-
-const nodeFs = {
-  readFileSync(path, options) {
-    // A numeric fd reads via the handle; a path reads the file.
-    if (typeof path === "number") {
-      const bytes = nodeFs.readvBytes(path);
-      const enc = encOf(options);
-      return enc ? bytes.toString(enc) : bytes;
-    }
-    const bytes = Buffer.from(__node.readBytes(toPath(path)));
-    const enc = encOf(options);
-    return enc ? bytes.toString(enc) : bytes;
-  },
-  writeFileSync(path, data, options) {
-    const enc = encOf(options);
-    const buf = toBuffer(data, enc);
-    if (typeof path === "number") { nodeFs.writeSync(path, buf, 0, undefined, null); return; }
-    // Write raw bytes via a handle so binary content is preserved (the string op re-encodes UTF-8).
-    const flag = (options && options.flag) || "w";
-    const mode = options && typeof options.mode === "number" ? options.mode : undefined;
-    const fd = __fs_native.openSync(toPath(path), flagToMode(flag), mode);
-    try { __fs_native.pwriteSync(fd, buf, -1); } finally { __fs_native.closeSync(fd); }
-  },
-  appendFileSync(path, data, options) {
-    const enc = encOf(options);
-    const buf = toBuffer(data, enc);
-    if (typeof path === "number") { nodeFs.writeSync(path, buf); return; }
-    const flag = (options && options.flag) || "a";
-    const mode = options && typeof options.mode === "number" ? options.mode : undefined;
-    const fd = __fs_native.openSync(toPath(path), flagToMode(flag), mode);
-    try { __fs_native.pwriteSync(fd, buf, -1); } finally { __fs_native.closeSync(fd); }
-  },
-  existsSync(path) {
-    try { return __fs_native.existsSync(toPath(path)); } catch { return false; }
-  },
-  mkdirSync(path, options) {
-    return __node.mkdir(toPath(path), !!(options && options.recursive));
-  },
-  rmdirSync(path, options) {
-    __node.rm(toPath(path), !!(options && options.recursive), false);
-  },
-  rmSync(path, options) {
-    __node.rm(toPath(path), !!(options && options.recursive), !!(options && options.force));
-  },
-  readdirSync(path, options) {
-    const p = toPath(path);
-    if (options && options.withFileTypes) {
-      return __node.readdirTypes(p).map(([name, kind]) => makeDirent(name, kind, p));
-    }
-    const names = __fs_native.readdirSync(p);
-    return encOf(options) === "buffer" ? names.map((n) => Buffer.from(n, "utf8")) : names;
-  },
-  unlinkSync(path) {
-    __fs_native.unlinkSync(toPath(path));
-  },
-  renameSync(from, to) {
-    __node.rename(toPath(from), toPath(to));
-  },
-  copyFileSync(from, to) {
-    __node.copyFile(toPath(from), toPath(to));
-  },
-  linkSync(existing, path) {
-    __node.link(toPath(existing), toPath(path));
-  },
-  statSync(path) {
-    return makeStats(__node.stat(toPath(path)));
-  },
-  lstatSync(path) {
-    return makeStats(__node.lstat(toPath(path)));
-  },
-  readlinkSync(path) {
-    return __node.readlink(toPath(path));
-  },
-  symlinkSync(target, path) {
-    __node.symlink(toPath(target), toPath(path));
-  },
-  accessSync(path, mode) {
-    __node.access(toPath(path));
-  },
-  chmodSync(path, mode) {
-    __node.chmod(toPath(path), Number(mode) || 0);
-  },
-  utimesSync(path, atime, mtime) {
-    __node.utimes(toPath(path), toUnixSeconds(atime), toUnixSeconds(mtime));
-  },
-  lutimesSync(path, atime, mtime) {
-    __node.lutimes(toPath(path), toUnixSeconds(atime), toUnixSeconds(mtime));
-  },
-  mkdtempSync(prefix, options) {
-    const dir = __node.mkdtemp(toPath(prefix));
-    return encOf(options) === "buffer" ? Buffer.from(dir, "utf8") : dir;
-  },
-  realpathSync(path) {
-    return __node.realpath(toPath(path));
-  },
-  statfsSync(path) {
-    return __node.statfs(toPath(path));
-  },
-
-  // ---- file-descriptor ops ----
-  openSync(path, flags, mode) {
-    return __fs_native.openSync(toPath(path), flagToMode(flags), typeof mode === "number" ? mode : undefined);
-  },
-  closeSync(fd) {
-    __fs_native.closeSync(fd);
-  },
-  fstatSync(fd) {
-    return makeStats(__fs_native.fstatSync(fd));
-  },
-  ftruncateSync(fd, len) {
-    __fs_native.ftruncateSync(fd, Number(len) || 0);
-  },
-  truncateSync(path, len) {
-    if (typeof path === "number") return nodeFs.ftruncateSync(path, len);
-    const fd = nodeFs.openSync(path, "r+");
-    try { nodeFs.ftruncateSync(fd, len); } finally { nodeFs.closeSync(fd); }
-  },
-  fsyncSync(fd) { __fs_native.fsyncSync(fd); },
-  fdatasyncSync(fd) { __fs_native.fdatasyncSync(fd); },
-  fchmodSync(fd, mode) { __fs_native.fchmodSync(fd, Number(mode) || 0); },
-  futimesSync(fd, atime, mtime) {
-    __fs_native.futimesSync(fd, toUnixSeconds(atime), toUnixSeconds(mtime));
-  },
-  // Read a whole file descriptor to a Buffer, from position 0 (helper for readFileSync(fd)).
-  readvBytes(fd) {
-    const chunks = [];
-    let total = 0;
-    let pos = 0;
-    while (true) {
-      const bytes = __fs_native.preadSync(fd, 65536, pos);
-      if (bytes.length === 0) break;
-      chunks.push(Buffer.from(bytes));
-      total += bytes.length;
-      pos += bytes.length;
-    }
-    return Buffer.concat(chunks, total);
-  },
-  readSync(fd, buffer, offset, length, position) {
-    // Options-object overload: readSync(fd, buffer, { offset, length, position }).
-    if (offset != null && typeof offset === "object") {
-      const o = offset;
-      offset = o.offset || 0;
-      length = o.length == null ? buffer.length - offset : o.length;
-      position = o.position == null ? null : o.position;
-    }
-    offset = offset || 0;
-    if (length == null) length = buffer.length - offset;
-    const pos = position == null ? -1 : position;
-    const bytes = __fs_native.preadSync(fd, length, pos);
-    buffer.set(bytes, offset);
-    return bytes.length;
-  },
-  writeSync(fd, data, a, b, c) {
-    if (typeof data === "string") {
-      const position = a == null ? -1 : a;
-      const bytes = Buffer.from(data, b || "utf8");
-      return __fs_native.pwriteSync(fd, bytes, position);
-    }
-    const buf = toBuffer(data);
-    let offset = a || 0;
-    let length = b == null ? buf.length - offset : b;
-    const position = c == null ? -1 : c;
-    const slice = buf.subarray(offset, offset + length);
-    return __fs_native.pwriteSync(fd, slice, position);
-  },
-  readvSync(fd, buffers, position) {
-    let total = 0;
-    let pos = position == null ? -1 : position;
-    for (const buf of buffers) {
-      const bytes = __fs_native.preadSync(fd, buf.length, pos);
-      if (bytes.length === 0) break;
-      buf.set(bytes, 0);
-      total += bytes.length;
-      if (pos >= 0) pos += bytes.length;
-    }
-    return total;
-  },
-  writevSync(fd, buffers, position) {
-    let total = 0;
-    let pos = position == null ? -1 : position;
-    for (const buf of buffers) {
-      const n = __fs_native.pwriteSync(fd, buf, pos);
-      total += n;
-      if (pos >= 0) pos += n;
-    }
-    return total;
-  },
-
-  chownSync(path, uid, gid) { __node.chown(toPath(path), Number(uid), Number(gid)); },
-  lchownSync(path, uid, gid) { __node.lchown(toPath(path), Number(uid), Number(gid)); },
-  fchownSync(fd, uid, gid) { __fs_native.fchownSync(fd, Number(uid), Number(gid)); },
-  lchmodSync(path, mode) { __node.lchmod(toPath(path), Number(mode) || 0); },
+const internalErrors = {
+  codes, AbortError, aggregateTwoErrors, uvErrmapGet, uvException, SystemError,
+  hideStackFrames: (fn) => fn,
 };
-nodeFs.realpathSync.native = nodeFs.realpathSync;
 
-// _toUnixTimestamp: seconds since epoch, from a number|string|Date (Node's internal helper).
-function toUnixSeconds(time) {
-  if (time == null) return Date.now() / 1000;
-  if (time instanceof Date) return time.getTime() / 1000;
-  if (typeof time === "number") return time > 1e11 ? time / 1000 : time;
-  const n = Number(time);
-  if (!Number.isNaN(n)) return n;
-  return new Date(time).getTime() / 1000;
+// ---- internal/validators ----------------------------------------------------------------------
+
+function isInt32(value) {
+  return value === (value | 0);
 }
-nodeFs._toUnixTimestamp = toUnixSeconds;
+function isUint32(value) {
+  return value === (value >>> 0);
+}
+const octalReg = /^[0-7]+$/;
+const modeDesc = "must be a 32-bit unsigned integer or an octal string";
+function parseFileMode(value, name, def) {
+  value ??= def;
+  if (typeof value === "string") {
+    if (octalReg.exec(value) === null) throw new codes.ERR_INVALID_ARG_VALUE(name, value, modeDesc);
+    value = Number.parseInt(value, 8);
+  }
+  __validators.validateUint32(value, name);
+  return value;
+}
+function validateEncoding(data, encoding) {
+  const normalized = typeof encoding === "string" ? encoding.toLowerCase() : encoding;
+  const length = data.length;
+  if (normalized === "hex" && length % 2 !== 0) {
+    throw new codes.ERR_INVALID_ARG_VALUE("encoding", encoding, `is invalid for data of length ${length}`);
+  }
+}
+const internalValidators = { ...__validators, isInt32, isUint32, parseFileMode, validateEncoding };
 
-// Callback style: run the sync op, deliver (err, result) on the next tick (Node never calls the
-// callback synchronously). A trailing options argument before the callback is tolerated.
-function callbackify(syncFn) {
+// ---- internal/util ----------------------------------------------------------------------------
+
+const kEmptyObject = Object.freeze({ __proto__: null });
+function once(callback) {
+  let called = false;
   return function (...args) {
-    const cb = args.pop();
-    if (typeof cb !== "function") throw new TypeError("callback is not a function");
-    process.nextTick(() => {
-      let result;
+    if (called) return;
+    called = true;
+    return Reflect.apply(callback, this, args);
+  };
+}
+function defineLazyProperties(target, id, keys, enumerable = true) {
+  const descriptors = { __proto__: null };
+  let mod;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    let lazyLoadedValue;
+    function set(value) {
+      Object.defineProperty(target, key, { __proto__: null, writable: true, value });
+    }
+    Object.defineProperty(set, "name", { __proto__: null, value: `set ${key}` });
+    function get() {
+      mod ??= require(id);
+      if (lazyLoadedValue === undefined) {
+        lazyLoadedValue = mod[key];
+        set(lazyLoadedValue);
+      }
+      return lazyLoadedValue;
+    }
+    Object.defineProperty(get, "name", { __proto__: null, value: `get ${key}` });
+    descriptors[key] = { __proto__: null, configurable: true, enumerable, get, set };
+  }
+  Object.defineProperties(target, descriptors);
+}
+function createDeferredPromise() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+// A blocking sleep (Node's is uv_sleep); rimrafSync backs off with it between retries.
+function sleep(msec) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, msec);
+  } catch {
+    const end = Date.now() + msec;
+    while (Date.now() < end);
+  }
+}
+const internalUtil = {
+  kEmptyObject,
+  once,
+  defineLazyProperties,
+  createDeferredPromise,
+  sleep,
+  get promisify() { return __builtins.get("util").promisify; },
+  get deprecate() { return __builtins.get("util").deprecate; },
+  get customPromisifyArgs() { return __internals.get("customPromisifyArgs"); },
+  SideEffectFreeRegExpPrototypeExec: (re, string) => RegExp.prototype.exec.call(re, string),
+  lazyDOMException: (message, name) => new DOMException(message, name),
+  emitExperimentalWarning(feature) {
+    process.emitWarning(`${feature} is an experimental feature and might change at any time`, "ExperimentalWarning");
+  },
+};
+
+// ---- the other internal modules the fs sources import -----------------------------------------
+
+// internal/url: a WHATWG URL (or a URL-shaped object) with the file: scheme becomes its path.
+function isURL(self) {
+  return Boolean(self?.href && self.protocol && self.auth === undefined && self.path === undefined);
+}
+function toPathIfFileURL(fileURLOrPath) {
+  if (!isURL(fileURLOrPath)) return fileURLOrPath;
+  return __builtins.get("url").fileURLToPath(fileURLOrPath);
+}
+
+function assert(value, message) {
+  if (!value) throw new codes.ERR_INTERNAL_ASSERTION(message);
+}
+assert.fail = (message) => {
+  throw new codes.ERR_INTERNAL_ASSERTION(message);
+};
+
+// internal/event_target: Node's mixin that gives a non-EventEmitter base class the emitter API.
+function EventEmitterMixin(Superclass) {
+  const EventEmitter = __builtins.get("events");
+  class MixedEventEmitter extends Superclass {
+    constructor(...args) {
+      super(...args);
+      Reflect.apply(EventEmitter, this, []);
+    }
+  }
+  const protoProps = Object.getOwnPropertyDescriptors(EventEmitter.prototype);
+  delete protoProps.constructor;
+  Object.defineProperties(MixedEventEmitter.prototype, protoProps);
+  return MixedEventEmitter;
+}
+
+// internal/webstreams/adapters: a byte-chunk ReadableStream over a FileHandle's fd.
+function newReadableStreamFromStreamBase(handle, strategy, options = kEmptyObject) {
+  const { ondone = () => {} } = options;
+  return new ReadableStream({
+    async pull(controller) {
+      let bytes;
       try {
-        result = syncFn(...args);
-      } catch (err) {
-        cb(err);
+        bytes = await fsb.readAsync(handle.fd, 65536, -1);
+      } catch (e) {
+        controller.error(bindingError(e, "read"));
+        ondone(e);
         return;
       }
-      cb(null, result);
-    });
-  };
-}
-
-nodeFs.readFile = callbackify(nodeFs.readFileSync);
-nodeFs.writeFile = callbackify(nodeFs.writeFileSync);
-nodeFs.appendFile = callbackify(nodeFs.appendFileSync);
-nodeFs.mkdir = callbackify(nodeFs.mkdirSync);
-nodeFs.rmdir = callbackify(nodeFs.rmdirSync);
-nodeFs.rm = callbackify(nodeFs.rmSync);
-nodeFs.readdir = callbackify(nodeFs.readdirSync);
-nodeFs.unlink = callbackify(nodeFs.unlinkSync);
-nodeFs.rename = callbackify(nodeFs.renameSync);
-nodeFs.copyFile = callbackify(nodeFs.copyFileSync);
-nodeFs.link = callbackify(nodeFs.linkSync);
-nodeFs.stat = callbackify(nodeFs.statSync);
-nodeFs.lstat = callbackify(nodeFs.lstatSync);
-nodeFs.fstat = callbackify(nodeFs.fstatSync);
-nodeFs.statfs = callbackify(nodeFs.statfsSync);
-nodeFs.readlink = callbackify(nodeFs.readlinkSync);
-nodeFs.symlink = callbackify(nodeFs.symlinkSync);
-nodeFs.access = callbackify(nodeFs.accessSync);
-nodeFs.chmod = callbackify(nodeFs.chmodSync);
-nodeFs.fchmod = callbackify(nodeFs.fchmodSync);
-nodeFs.lchmod = callbackify(nodeFs.lchmodSync);
-nodeFs.chown = callbackify(nodeFs.chownSync);
-nodeFs.lchown = callbackify(nodeFs.lchownSync);
-nodeFs.fchown = callbackify(nodeFs.fchownSync);
-nodeFs.utimes = callbackify(nodeFs.utimesSync);
-nodeFs.lutimes = callbackify(nodeFs.lutimesSync);
-nodeFs.futimes = callbackify(nodeFs.futimesSync);
-nodeFs.mkdtemp = callbackify(nodeFs.mkdtempSync);
-nodeFs.realpath = callbackify(nodeFs.realpathSync);
-nodeFs.realpath.native = nodeFs.realpath;
-nodeFs.close = callbackify(nodeFs.closeSync);
-nodeFs.truncate = callbackify(nodeFs.truncateSync);
-nodeFs.ftruncate = callbackify(nodeFs.ftruncateSync);
-nodeFs.fsync = callbackify(nodeFs.fsyncSync);
-nodeFs.fdatasync = callbackify(nodeFs.fdatasyncSync);
-
-// open takes (path, flags?, mode?, cb) — flags/mode are optional before the callback.
-nodeFs.open = function (path, flags, mode, cb) {
-  if (typeof flags === "function") { cb = flags; flags = "r"; mode = undefined; }
-  else if (typeof mode === "function") { cb = mode; mode = undefined; }
-  process.nextTick(() => {
-    try { cb(null, nodeFs.openSync(path, flags, mode)); } catch (e) { cb(e); }
-  });
-};
-nodeFs.exists = function (path, cb) {
-  process.nextTick(() => cb(nodeFs.existsSync(path)));
-};
-
-// read(fd, buffer, offset, length, position, cb) | read(fd, options, cb) | read(fd, cb).
-// Callback receives (err, bytesRead, buffer) — Node's non-standard 3-arg convention.
-nodeFs.read = function (fd, a, b, c, d, e) {
-  let buffer, offset, length, position, cb;
-  if (typeof a === "function") {
-    cb = a; buffer = Buffer.alloc(16384); offset = 0; length = buffer.length; position = null;
-  } else if (a != null && typeof a === "object" && !ArrayBuffer.isView(a)) {
-    const o = a; buffer = o.buffer || Buffer.alloc(16384);
-    offset = o.offset || 0; length = o.length == null ? buffer.length - offset : o.length;
-    position = o.position == null ? null : o.position; cb = b;
-  } else {
-    buffer = a; offset = b || 0; length = c == null ? buffer.length - offset : c;
-    position = d == null ? null : d; cb = e;
-  }
-  process.nextTick(() => {
-    try { const n = nodeFs.readSync(fd, buffer, offset, length, position); cb(null, n, buffer); }
-    catch (err) { cb(err); }
-  });
-};
-
-// write(fd, buffer, offset, length, position, cb) | write(fd, string, position, encoding, cb).
-// Callback receives (err, bytesWritten, buffer|string).
-nodeFs.write = function (fd, data, ...rest) {
-  const cb = typeof rest[rest.length - 1] === "function" ? rest.pop() : undefined;
-  process.nextTick(() => {
-    try { const n = nodeFs.writeSync(fd, data, rest[0], rest[1], rest[2]); if (cb) cb(null, n, data); }
-    catch (err) { if (cb) cb(err); }
-  });
-};
-
-nodeFs.readv = function (fd, buffers, position, cb) {
-  if (typeof position === "function") { cb = position; position = null; }
-  process.nextTick(() => {
-    try { const n = nodeFs.readvSync(fd, buffers, position); cb(null, n, buffers); } catch (e) { cb(e); }
-  });
-};
-nodeFs.writev = function (fd, buffers, position, cb) {
-  if (typeof position === "function") { cb = position; position = null; }
-  process.nextTick(() => {
-    try { const n = nodeFs.writevSync(fd, buffers, position); cb(null, n, buffers); } catch (e) { cb(e); }
-  });
-};
-
-// ---- cp / cpSync (recursive copy) ----
-const pathMod = () => __builtins.get("path");
-
-function cpSyncImpl(src, dest, opts) {
-  const o = opts || {};
-  const p = pathMod();
-  const srcStat = o.dereference ? nodeFs.statSync(src) : nodeFs.lstatSync(src);
-  if (srcStat.isDirectory()) {
-    if (!o.recursive) throw fsError("EISDIR", "cp", src, "recursive option not set for a directory");
-    nodeFs.mkdirSync(dest, { recursive: true });
-    for (const entry of __fs_native.readdirSync(toPath(src))) {
-      cpSyncImpl(p.join(toPath(src), entry), p.join(toPath(dest), entry), o);
-    }
-    return;
-  }
-  if (srcStat.isSymbolicLink() && !o.dereference) {
-    const target = nodeFs.readlinkSync(src);
-    try { nodeFs.unlinkSync(dest); } catch {}
-    nodeFs.symlinkSync(target, dest);
-    return;
-  }
-  if (o.filter && !o.filter(toPath(src), toPath(dest))) return;
-  const parent = p.dirname(toPath(dest));
-  if (parent && parent !== ".") { try { nodeFs.mkdirSync(parent, { recursive: true }); } catch {} }
-  if (o.errorOnExist && !o.force && nodeFs.existsSync(dest)) {
-    throw fsError("ERR_FS_CP_EEXIST", "cp", toPath(dest), "destination already exists");
-  }
-  if (!o.force && o.errorOnExist !== true && nodeFs.existsSync(dest) && o.force === false) return;
-  nodeFs.copyFileSync(src, dest);
-}
-nodeFs.cpSync = function (src, dest, options) { cpSyncImpl(src, dest, options); };
-nodeFs.cp = function (src, dest, options, cb) {
-  if (typeof options === "function") { cb = options; options = {}; }
-  process.nextTick(() => {
-    try { cpSyncImpl(src, dest, options); cb(null); } catch (e) { cb(e); }
-  });
-};
-
-// ---- glob / globSync ----
-// Translate a glob pattern to an anchored RegExp. '**' crosses path separators, '*' does not,
-// '?' is a single non-separator char, and '[...]' is a character class.
-function globToRegExp(glob) {
-  let re = "";
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === "*") {
-      if (glob[i + 1] === "*") {
-        i++;
-        if (glob[i + 1] === "/") { i++; re += "(?:[^/]*/)*"; }
-        else re += ".*";
-      } else re += "[^/]*";
-    } else if (c === "?") {
-      re += "[^/]";
-    } else if (c === "[") {
-      let j = i + 1;
-      let cls = "";
-      if (glob[j] === "!" || glob[j] === "^") { cls += "^"; j++; }
-      while (j < glob.length && glob[j] !== "]") { cls += glob[j] === "\\" ? "\\\\" : glob[j]; j++; }
-      if (j >= glob.length) { re += "\\["; } else { re += "[" + cls + "]"; i = j; }
-    } else if (".+^${}()|\\/".includes(c)) {
-      re += "\\" + c;
-    } else {
-      re += c;
-    }
-  }
-  return new RegExp("^" + re + "$");
-}
-
-function globSyncImpl(pattern, options) {
-  const o = options || {};
-  const p = pathMod();
-  const cwd = o.cwd ? toPath(o.cwd) : process.cwd();
-  const patterns = Array.isArray(pattern) ? pattern : [pattern];
-  const regexes = patterns.map(globToRegExp);
-  const excludes = typeof o.exclude === "function" ? o.exclude : null;
-  const withTypes = !!o.withFileTypes;
-  const results = [];
-  const walk = (absDir, rel) => {
-    let entries;
-    try { entries = __node.readdirTypes(absDir); } catch { return; }
-    for (const [name, kind] of entries) {
-      const relPath = rel ? rel + "/" + name : name;
-      const matched = regexes.some((r) => r.test(relPath));
-      if (matched && !(excludes && excludes(withTypes ? makeDirent(name, kind, absDir) : relPath))) {
-        results.push(withTypes ? makeDirent(name, kind, absDir) : relPath);
+      if (bytes.length === 0) {
+        controller.close();
+        ondone();
+        return;
       }
-      if (kind === "dir") walk(p.join(absDir, name), relPath);
-    }
+      controller.enqueue(bytes);
+    },
+    cancel() {
+      ondone();
+    },
+  }, strategy);
+}
+
+const shims = {
+  __proto__: null,
+  "internal/errors": internalErrors,
+  "internal/validators": internalValidators,
+  "internal/util": internalUtil,
+  "internal/url": { isURL, toPathIfFileURL, get fileURLToPath() { return __builtins.get("url").fileURLToPath; } },
+  "internal/constants": { CHAR_FORWARD_SLASH: 47, CHAR_BACKWARD_SLASH: 92, CHAR_DOT: 46, CHAR_COLON: 58 },
+  "internal/assert": assert,
+  "internal/async_hooks": {
+    defaultTriggerAsyncIdScope: (asyncId, fn, ...args) => Reflect.apply(fn, null, args),
+    symbols: { owner_symbol: Symbol("owner_symbol") },
+  },
+  "internal/event_target": {
+    EventEmitterMixin,
+    get kResistStopPropagation() { return __internals.get("streams").kResistStopPropagation; },
+  },
+  "internal/streams/destroy": { get errorOrDestroy() { return __internals.get("streams").errorOrDestroy; } },
+  "internal/streams/utils": { get isIterable() { return __internals.get("streams").isIterable; } },
+  "internal/process/permission": { isEnabled: () => false, has: () => true },
+  "internal/worker/js_transferable": {
+    JSTransferable: class JSTransferable {},
+    kDeserialize: Symbol("kDeserialize"),
+    kTransfer: Symbol("kTransfer"),
+    kTransferList: Symbol("kTransferList"),
+  },
+  "internal/webstreams/adapters": { newReadableStreamFromStreamBase },
+  "internal/webstreams/readablestream": {
+    get ReadableStream() { return globalThis.ReadableStream; },
+    readableStreamCancel(stream) {
+      if (!stream.locked) stream.cancel().catch(() => {});
+    },
+  },
+  "internal/readline/interface": { get Interface() { return __builtins.get("readline").Interface; } },
+  "internal/blob": {
+    createBlobFromFilePath(path, options) {
+      return new Blob([Buffer.from(bindingCall("open", () => fsb.readFile(P(path), 0), path))], options);
+    },
+  },
+};
+for (const id of Object.keys(shims)) moduleCache.set(id, { exports: shims[id] });
+
+// ---- internalBinding('constants') -------------------------------------------------------------
+
+const fsConstants = (() => {
+  const common = {
+    UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2, O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
+    UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2, UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4,
+    UV_DIRENT_SOCKET: 5, UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7,
+    EXTENSIONLESS_FORMAT_JAVASCRIPT: 0, EXTENSIONLESS_FORMAT_WASM: 1,
   };
-  walk(cwd, "");
-  return results;
-}
-nodeFs.globSync = function (pattern, options) { return globSyncImpl(pattern, options); };
-nodeFs.glob = function (pattern, options, cb) {
-  if (typeof options === "function") { cb = options; options = {}; }
-  process.nextTick(() => {
-    try { cb(null, globSyncImpl(pattern, options)); } catch (e) { cb(e); }
-  });
-};
+  const perms = {
+    S_IRWXU: 448, S_IRUSR: 256, S_IWUSR: 128, S_IXUSR: 64, S_IRWXG: 56, S_IRGRP: 32, S_IWGRP: 16,
+    S_IXGRP: 8, S_IRWXO: 7, S_IROTH: 4, S_IWOTH: 2, S_IXOTH: 1,
+  };
+  const tail = {
+    F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1,
+    UV_FS_COPYFILE_EXCL: 1, COPYFILE_EXCL: 1, UV_FS_COPYFILE_FICLONE: 2, COPYFILE_FICLONE: 2,
+    UV_FS_COPYFILE_FICLONE_FORCE: 4, COPYFILE_FICLONE_FORCE: 4,
+  };
+  if (isWindows) {
+    // Exactly Node's win32 table (no S_IFBLK/S_IFSOCK, no O_SYNC family).
+    return {
+      ...common, S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFCHR: 8192, S_IFIFO: 4096,
+      S_IFLNK: 40960, O_CREAT: 256, O_EXCL: 1024, UV_FS_O_FILEMAP: 536870912, O_TRUNC: 512,
+      O_APPEND: 8, S_IRUSR: 256, S_IWUSR: 128, ...tail,
+    };
+  }
+  const types = { S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFCHR: 8192, S_IFBLK: 24576, S_IFIFO: 4096, S_IFLNK: 40960, S_IFSOCK: 49152 };
+  if (process.platform === "darwin" || process.platform === "ios") {
+    return {
+      ...common, ...types, O_CREAT: 512, O_EXCL: 2048, UV_FS_O_FILEMAP: 0, O_NOCTTY: 131072,
+      O_TRUNC: 1024, O_APPEND: 8, O_DIRECTORY: 1048576, O_NOFOLLOW: 256, O_SYNC: 128,
+      O_DSYNC: 4194304, O_SYMLINK: 2097152, O_NONBLOCK: 4, ...perms, ...tail,
+    };
+  }
+  // Linux/Android. AArch64 swaps the O_DIRECTORY/O_NOFOLLOW/O_DIRECT bits.
+  const arm = process.arch === "arm64" || process.arch === "arm";
+  return {
+    ...common, ...types, O_CREAT: 64, O_EXCL: 128, UV_FS_O_FILEMAP: 0, O_NOCTTY: 256, O_TRUNC: 512,
+    O_APPEND: 1024, O_DIRECTORY: arm ? 16384 : 65536, O_NOATIME: 262144, O_NOFOLLOW: arm ? 32768 : 131072,
+    O_SYNC: 1052672, O_DSYNC: 4096, O_DIRECT: arm ? 65536 : 16384, O_NONBLOCK: 2048, ...perms, ...tail,
+  };
+})();
 
-// ---- opendir / Dir ----
-class Dir {
-  constructor(path, entries) {
-    this.path = path;
-    this._entries = entries;
-    this._i = 0;
-    this._closed = false;
-  }
-  readSync() {
-    if (this._i >= this._entries.length) return null;
-    return this._entries[this._i++];
-  }
-  read(cb) {
-    const next = this._i < this._entries.length ? this._entries[this._i++] : null;
-    if (cb) { process.nextTick(() => cb(null, next)); return; }
-    return Promise.resolve(next);
-  }
-  closeSync() { this._closed = true; }
-  close(cb) {
-    this._closed = true;
-    if (cb) { process.nextTick(() => cb(null)); return; }
-    return Promise.resolve();
-  }
-  async *[Symbol.asyncIterator]() {
-    let e;
-    while ((e = this.readSync()) !== null) yield e;
-  }
-}
-function opendirSyncImpl(path) {
-  const p = toPath(path);
-  const entries = __node.readdirTypes(p).map(([name, kind]) => makeDirent(name, kind, p));
-  return new Dir(p, entries);
-}
-nodeFs.opendirSync = function (path, options) { return opendirSyncImpl(path); };
-nodeFs.opendir = function (path, options, cb) {
-  if (typeof options === "function") { cb = options; options = {}; }
-  process.nextTick(() => {
-    try { cb(null, opendirSyncImpl(path)); } catch (e) { cb(e); }
-  });
-};
+// ---- internalBinding('fs') --------------------------------------------------------------------
 
-// ---- openAsBlob ----
-nodeFs.openAsBlob = function (path, options) {
+const kUsePromises = Symbol("fs_use_promises_symbol");
+const kFsStatsFieldsNumber = 18;
+function FSReqCallback(bigint) {
+  this.bigint = bigint;
+  this.oncomplete = null;
+  this.context = null;
+}
+const statValues = new Float64Array(kFsStatsFieldsNumber * 2);
+const bigintStatValues = new BigInt64Array(kFsStatsFieldsNumber * 2);
+
+// A path argument (string or Buffer; already namespaced on Windows) as the ops take it. A realm
+// embedded in a host process has its own working directory, so relative paths resolve there.
+function P(path) {
+  const s = typeof path === "string" ? path : Buffer.from(path).toString("utf8");
+  if (s === "" || isWindows) return s;
+  if (s.charCodeAt(0) === 47) return s;
+  const base = __node.realmCwd();
+  return base === undefined ? s : __builtins.get("path").resolve(base, s);
+}
+// How a path appears in an error message: Node reports it without the `\\?\` namespace prefix.
+function displayPath(path) {
+  if (path === undefined || path === null) return undefined;
+  const s = typeof path === "string" ? path : Buffer.from(path).toString("utf8");
+  if (!isWindows) return s;
+  if (s.startsWith("\\\\?\\UNC\\")) return `\\\\${s.slice(8)}`;
+  if (s.startsWith("\\\\?\\")) return s.slice(4);
+  return s;
+}
+// A binding failure (OpError with a libuv code) as Node's uvException.
+function bindingError(e, syscall, path, dest) {
+  const code = e?.code;
+  if (typeof code !== "string" || !__uvCodes.has(code)) return e;
+  const ctx = { errno: __uvCodes.get(code), code, syscall };
+  if (path !== undefined) ctx.path = displayPath(path);
+  if (dest !== undefined) ctx.dest = displayPath(dest);
+  return uvException(ctx);
+}
+function bindingCall(syscall, fn, path, dest) {
   try {
-    const bytes = __node.readBytes(toPath(path));
-    return Promise.resolve(new Blob([bytes], { type: (options && options.type) || "" }));
+    return fn();
   } catch (e) {
-    return Promise.reject(e);
+    throw bindingError(e, syscall, path, dest);
   }
-};
-
-// ---- watchFile / unwatchFile (real, polling; Node's watchFile is polling too) ----
-const fileWatchers = new Map();
-function zeroStats(kind) {
-  return makeStats({
-    dev: 0, ino: 0, mode: 0, nlink: 0, uid: 0, gid: 0, rdev: 0, size: 0,
-    blksize: 0, blocks: 0, atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0, kind,
-  });
 }
-function pollStat(p) {
-  try { return nodeFs.statSync(p); } catch { return zeroStats("other"); }
-}
-class StatWatcher extends __builtins.get("events") {
-  constructor() { super(); this._handle = null; }
-  start() {}
-  stop() {}
-  ref() { return this; }
-  unref() { return this; }
-}
-nodeFs.watchFile = function (filename, options, listener) {
-  if (typeof options === "function") { listener = options; options = {}; }
-  const interval = (options && options.interval) || 5007;
-  const p = toPath(filename);
-  let entry = fileWatchers.get(p);
-  if (!entry) {
-    const watcher = new StatWatcher();
-    entry = { watcher, listeners: new Set(), prev: pollStat(p) };
-    entry.timer = setInterval(() => {
-      const cur = pollStat(p);
-      if (cur.mtimeMs !== entry.prev.mtimeMs || cur.size !== entry.prev.size) {
-        const prev = entry.prev;
-        entry.prev = cur;
-        for (const l of entry.listeners) l(cur, prev);
-        entry.watcher.emit("change", cur, prev);
-      }
-    }, interval);
-    if (entry.timer && entry.timer.unref) entry.timer.unref();
-    fileWatchers.set(p, entry);
-  }
-  if (listener) { entry.listeners.add(listener); entry.watcher.on("change", listener); }
-  return entry.watcher;
-};
-nodeFs.unwatchFile = function (filename, listener) {
-  const p = toPath(filename);
-  const entry = fileWatchers.get(p);
-  if (!entry) return;
-  if (listener) entry.listeners.delete(listener);
-  else entry.listeners.clear();
-  if (entry.listeners.size === 0) {
-    if (entry.timer) clearInterval(entry.timer);
-    fileWatchers.delete(p);
-  }
-};
-// Event-based watch (inotify/FSEvents) has no host backend — throw honestly, never no-op.
-nodeFs.watch = function (filename, options, listener) {
-  throw fsError("ENOSYS", "watch", toPath(filename), "fs.watch requires a filesystem-event backend that is not available");
-};
-
-// ---- ReadStream / WriteStream (real, over the stream module + fd ops) ----
-const StreamMod = __builtins.get("stream");
-function normalizeStreamOpts(options) {
-  if (typeof options === "string") return { encoding: options };
-  return options || {};
-}
-
-class ReadStream extends StreamMod.Readable {
-  constructor(path, options) {
-    const o = normalizeStreamOpts(options);
-    super({ encoding: o.encoding, highWaterMark: o.highWaterMark });
-    this.path = path;
-    this.flags = o.flags || "r";
-    this.bytesRead = 0;
-    this.pos = o.start || 0;
-    this._end = o.end == null ? Infinity : o.end;
-    this._chunk = o.highWaterMark || 65536;
-    this._autoClose = o.autoClose !== false;
-    this._ownFd = o.fd == null;
-    try {
-      this.fd = o.fd != null ? o.fd : nodeFs.openSync(path, this.flags, o.mode);
-    } catch (e) {
-      this.fd = null;
-      process.nextTick(() => this.emit("error", e));
-      return;
-    }
+function complete(req, err, value) {
+  try {
+    if (err) Reflect.apply(req.oncomplete, req, [err]);
+    // Node passes the result only when there is one: a void op completes as oncomplete(null).
+    else Reflect.apply(req.oncomplete, req, value === undefined ? [null] : [null, value]);
+  } catch (e) {
     process.nextTick(() => {
-      if (this.fd == null) return;
-      this.emit("open", this.fd);
-      this.emit("ready");
-      this._pump();
+      throw e;
     });
-  }
-  _pump() {
-    try {
-      while (this.pos <= this._end) {
-        let want = this._chunk;
-        if (this._end !== Infinity) want = Math.min(want, this._end - this.pos + 1);
-        const bytes = __fs_native.preadSync(this.fd, want, this.pos);
-        if (bytes.length === 0) break;
-        this.pos += bytes.length;
-        this.bytesRead += bytes.length;
-        this.push(Buffer.from(bytes));
-      }
-      this.push(null);
-      this._closeStream(null);
-    } catch (e) {
-      this._closeStream(e);
-    }
-  }
-  _closeStream(err) {
-    if (this._ownFd && this._autoClose && this.fd != null) {
-      try { nodeFs.closeSync(this.fd); } catch {}
-    }
-    this.fd = null;
-    if (err) process.nextTick(() => this.emit("error", err));
-    process.nextTick(() => this.emit("close"));
-  }
-  close(cb) {
-    if (cb) this.once("close", cb);
-    if (this.fd != null && this._ownFd) { try { nodeFs.closeSync(this.fd); } catch {} this.fd = null; }
   }
 }
-
-class WriteStream extends StreamMod.Writable {
-  constructor(path, options) {
-    const o = normalizeStreamOpts(options);
-    super();
-    this.path = path;
-    this.flags = o.flags || "w";
-    this.bytesWritten = 0;
-    this.pos = o.start;
-    this._encoding = o.encoding || "utf8";
-    this._autoClose = o.autoClose !== false;
-    this._ownFd = o.fd == null;
+// Run one binding call in the mode `req`/`ctx` select (see the header comment).
+function dispatch(req, ctx, syscall, path, dest, sync, async, post) {
+  if (req === undefined) {
+    let result;
     try {
-      this.fd = o.fd != null ? o.fd : nodeFs.openSync(path, this.flags, o.mode);
+      result = sync();
     } catch (e) {
-      this.fd = null;
-      process.nextTick(() => this.emit("error", e));
-      return;
-    }
-    this.on("finish", () => {
-      if (this._autoClose) process.nextTick(() => this.emit("close"));
-    });
-    process.nextTick(() => {
-      if (this.fd == null) return;
-      this.emit("open", this.fd);
-      this.emit("ready");
-    });
-  }
-  _write(chunk, encoding, cb) {
-    try {
-      const buf = toBuffer(chunk, encoding || this._encoding);
-      const pos = this.pos == null ? -1 : this.pos;
-      const n = __fs_native.pwriteSync(this.fd, buf, pos);
-      this.bytesWritten += n;
-      if (this.pos != null) this.pos += n;
-      cb();
-    } catch (e) { cb(e); }
-  }
-  _final(cb) {
-    if (this._ownFd && this._autoClose && this.fd != null) {
-      try { nodeFs.closeSync(this.fd); this.fd = null; cb(); } catch (e) { cb(e); }
-    } else cb();
-  }
-  close(cb) {
-    if (cb) this.once("close", cb);
-    this.end();
-  }
-}
-
-nodeFs.createReadStream = function (path, options) { return new ReadStream(path, options); };
-nodeFs.createWriteStream = function (path, options) { return new WriteStream(path, options); };
-
-// Constants a few tools read (fs.constants / accessSync flags).
-nodeFs.constants = {
-  F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1,
-  O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
-  O_CREAT: 0x200, O_EXCL: 0x800, O_NOCTTY: 0x20000, O_TRUNC: 0x400, O_APPEND: 0x8,
-  O_DIRECTORY: 0x100000, O_NOFOLLOW: 0x100, O_SYNC: 0x80, O_DSYNC: 0x400000,
-  O_SYMLINK: 0x200000, O_NONBLOCK: 0x4,
-  S_IFMT: 0xf000, S_IFREG: 0x8000, S_IFDIR: 0x4000, S_IFCHR: 0x2000, S_IFBLK: 0x6000,
-  S_IFIFO: 0x1000, S_IFLNK: 0xa000, S_IFSOCK: 0xc000,
-  S_IRWXU: 0x1c0, S_IRUSR: 0x100, S_IWUSR: 0x80, S_IXUSR: 0x40,
-  S_IRWXG: 0x38, S_IRGRP: 0x20, S_IWGRP: 0x10, S_IXGRP: 0x8,
-  S_IRWXO: 0x7, S_IROTH: 0x4, S_IWOTH: 0x2, S_IXOTH: 0x1,
-  COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
-  UV_FS_O_FILEMAP: 0,
-};
-
-// Top-level access-mode constants (Node re-exports these on the module object).
-nodeFs.F_OK = nodeFs.constants.F_OK;
-nodeFs.R_OK = nodeFs.constants.R_OK;
-nodeFs.W_OK = nodeFs.constants.W_OK;
-nodeFs.X_OK = nodeFs.constants.X_OK;
-
-// Class exports.
-nodeFs.Stats = Stats;
-nodeFs.Dirent = Dirent;
-nodeFs.Dir = Dir;
-nodeFs.StatWatcher = StatWatcher;
-// Callable without `new`, as Node's constructors are (see __legacyConstructor).
-ReadStream = __legacyConstructor(ReadStream);
-WriteStream = __legacyConstructor(WriteStream);
-nodeFs.ReadStream = ReadStream;
-nodeFs.WriteStream = WriteStream;
-nodeFs.FileReadStream = ReadStream;
-nodeFs.FileWriteStream = WriteStream;
-
-// ---- Promises API ----
-// A FileHandle over an open fd, mirroring node:fs/promises' FileHandle.
-class FileHandle {
-  constructor(fd) { this.fd = fd; }
-  read(buffer, offset, length, position) {
-    return new Promise((resolve, reject) => {
-      try {
-        if (buffer != null && typeof buffer === "object" && !ArrayBuffer.isView(buffer)) {
-          const o = buffer; buffer = o.buffer || Buffer.alloc(16384);
-          offset = o.offset || 0; length = o.length == null ? buffer.length - offset : o.length;
-          position = o.position == null ? null : o.position;
+      if (ctx !== null && typeof ctx === "object") {
+        const code = e?.code;
+        if (typeof code === "string" && __uvCodes.has(code)) {
+          ctx.errno = __uvCodes.get(code);
+          ctx.code = code;
+          ctx.syscall = syscall;
+          return undefined;
         }
-        const bytesRead = nodeFs.readSync(this.fd, buffer, offset, length, position);
-        resolve({ bytesRead, buffer });
-      } catch (e) { reject(e); }
-    });
+      }
+      throw bindingError(e, syscall, path, dest);
+    }
+    return post === undefined ? result : post(result);
   }
-  write(buffer, offset, length, position) {
-    return new Promise((resolve, reject) => {
+  let promise;
+  try {
+    promise = async();
+  } catch (e) {
+    promise = Promise.reject(e);
+  }
+  if (req === kUsePromises) {
+    return promise.then(
+      post === undefined ? undefined : post,
+      (e) => { throw bindingError(e, syscall, path, dest); },
+    );
+  }
+  promise.then(
+    (result) => {
+      let value;
       try {
-        const bytesWritten = nodeFs.writeSync(this.fd, buffer, offset, length, position);
-        resolve({ bytesWritten, buffer });
-      } catch (e) { reject(e); }
-    });
-  }
-  readv(buffers, position) {
-    return new Promise((resolve, reject) => {
-      try { resolve({ bytesRead: nodeFs.readvSync(this.fd, buffers, position), buffers }); }
-      catch (e) { reject(e); }
-    });
-  }
-  writev(buffers, position) {
-    return new Promise((resolve, reject) => {
-      try { resolve({ bytesWritten: nodeFs.writevSync(this.fd, buffers, position), buffers }); }
-      catch (e) { reject(e); }
-    });
-  }
-  readFile(options) {
-    return new Promise((resolve, reject) => {
-      try {
-        const bytes = nodeFs.readvBytes(this.fd);
-        const enc = encOf(options);
-        resolve(enc ? bytes.toString(enc) : bytes);
-      } catch (e) { reject(e); }
-    });
-  }
-  writeFile(data, options) {
-    return new Promise((resolve, reject) => {
-      try { nodeFs.writeSync(this.fd, toBuffer(data, encOf(options)), 0, undefined, null); resolve(); }
-      catch (e) { reject(e); }
-    });
-  }
-  appendFile(data, options) {
-    return new Promise((resolve, reject) => {
-      try { nodeFs.writeSync(this.fd, toBuffer(data, encOf(options))); resolve(); }
-      catch (e) { reject(e); }
-    });
-  }
-  chmod(mode) { return promisedCall(() => nodeFs.fchmodSync(this.fd, mode)); }
-  chown(uid, gid) { return promisedCall(() => nodeFs.fchownSync(this.fd, uid, gid)); }
-  stat(options) { return promisedCall(() => nodeFs.fstatSync(this.fd)); }
-  truncate(len) { return promisedCall(() => nodeFs.ftruncateSync(this.fd, len || 0)); }
-  utimes(atime, mtime) { return promisedCall(() => nodeFs.futimesSync(this.fd, atime, mtime)); }
-  sync() { return promisedCall(() => nodeFs.fsyncSync(this.fd)); }
-  datasync() { return promisedCall(() => nodeFs.fdatasyncSync(this.fd)); }
-  close() { return promisedCall(() => { if (this.fd != null) { nodeFs.closeSync(this.fd); this.fd = null; } }); }
-  createReadStream(options) { return new ReadStream(null, { ...normalizeStreamOpts(options), fd: this.fd, autoClose: false }); }
-  createWriteStream(options) { return new WriteStream(null, { ...normalizeStreamOpts(options), fd: this.fd, autoClose: false }); }
-  [Symbol.asyncDispose]() { return this.close(); }
+        value = post === undefined ? result : post(result);
+      } catch (e) {
+        complete(req, e);
+        return;
+      }
+      complete(req, null, value);
+    },
+    (e) => complete(req, bindingError(e, syscall, path, dest)),
+  );
+  return undefined;
 }
 
-function promisedCall(fn) {
-  return new Promise((resolve, reject) => {
-    try { resolve(fn()); } catch (e) { reject(e); }
-  });
+function toStatArray(values, bigint) {
+  if (bigint) {
+    const out = new BigInt64Array(kFsStatsFieldsNumber);
+    for (let i = 0; i < kFsStatsFieldsNumber; i++) out[i] = BigInt(Math.trunc(values[i]));
+    bigintStatValues.set(out);
+    return out;
+  }
+  const out = new Float64Array(values);
+  statValues.set(out);
+  return out;
 }
-const promised = (syncFn) => (...args) => promisedCall(() => syncFn(...args));
+function encodeName(name, encoding) {
+  if (encoding === "buffer") return Buffer.from(name, "utf8");
+  if (!encoding || encoding === "utf8" || encoding === "utf-8") return name;
+  return Buffer.from(name, "utf8").toString(encoding);
+}
+function viewOf(buffer, offset, length) {
+  return new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length);
+}
+function pos(position) {
+  if (position === null || position === undefined) return -1;
+  // Validated positions reach 2 ** 63 - 1; past MAX_SAFE_INTEGER they are all beyond any file's
+  // end, and an f64 near 2 ** 63 would round to an offset the OS rejects as negative.
+  const n = typeof position === "bigint" ? Number(position) : position;
+  return n < 0 ? -1 : Math.min(n, Number.MAX_SAFE_INTEGER);
+}
+function concatBuffers(buffers) {
+  const views = buffers.map((b) => viewOf(b, 0, b.byteLength));
+  return Buffer.concat(views);
+}
+function scatter(buffers, bytes) {
+  let off = 0;
+  for (const b of buffers) {
+    if (off >= bytes.length) break;
+    const n = Math.min(b.byteLength, bytes.length - off);
+    viewOf(b, 0, n).set(bytes.subarray(off, off + n));
+    off += n;
+  }
+  return bytes.length;
+}
 
-const fsPromises = {
-  readFile: (path, options) =>
-    promisedCall(() => nodeFs.readFileSync(path instanceof FileHandle ? path.fd : path, options)),
-  writeFile: (path, data, options) =>
-    path instanceof FileHandle
-      ? path.writeFile(data, options)
-      : promisedCall(() => nodeFs.writeFileSync(path, data, options)),
-  appendFile: (path, data, options) =>
-    promisedCall(() => nodeFs.appendFileSync(path instanceof FileHandle ? path.fd : path, data, options)),
-  open: (path, flags, mode) => promisedCall(() => new FileHandle(nodeFs.openSync(path, flags, mode))),
-  mkdir: promised(nodeFs.mkdirSync),
-  rmdir: promised(nodeFs.rmdirSync),
-  rm: promised(nodeFs.rmSync),
-  readdir: promised(nodeFs.readdirSync),
-  unlink: promised(nodeFs.unlinkSync),
-  rename: promised(nodeFs.renameSync),
-  copyFile: promised(nodeFs.copyFileSync),
-  link: promised(nodeFs.linkSync),
-  cp: promised(nodeFs.cpSync),
-  stat: promised(nodeFs.statSync),
-  lstat: promised(nodeFs.lstatSync),
-  statfs: promised(nodeFs.statfsSync),
-  readlink: promised(nodeFs.readlinkSync),
-  symlink: promised(nodeFs.symlinkSync),
-  access: promised(nodeFs.accessSync),
-  chmod: promised(nodeFs.chmodSync),
-  lchmod: promised(nodeFs.lchmodSync),
-  chown: promised(nodeFs.chownSync),
-  lchown: promised(nodeFs.lchownSync),
-  utimes: promised(nodeFs.utimesSync),
-  lutimes: promised(nodeFs.lutimesSync),
-  truncate: promised(nodeFs.truncateSync),
-  mkdtemp: promised(nodeFs.mkdtempSync),
-  realpath: promised(nodeFs.realpathSync),
-  opendir: promised(opendirSyncImpl),
-  glob: (pattern, options) => {
-    const matches = globSyncImpl(pattern, options);
-    return (async function* () { for (const m of matches) yield m; })();
+// The native FileHandle: an fd whose close() is a promise.
+class NativeFileHandle {
+  constructor(fd) {
+    this.fd = fd;
+  }
+  getAsyncId() {
+    return -1;
+  }
+  close() {
+    const fd = this.fd;
+    this.fd = -1;
+    return fsb.closeAsync(fd).then(undefined, (e) => { throw bindingError(e, "close"); });
+  }
+  releaseFD() {
+    const fd = this.fd;
+    this.fd = -1;
+    return fd;
+  }
+}
+
+// uv_fs_poll: a stat every `interval` ms; `onchange(status, [current ... previous])` when any field
+// but atime changes, or the error status does.
+function StatWatcherHandle(bigint) {
+  this.bigint = bigint;
+  this.onchange = null;
+  this._timer = null;
+  this._prev = null;
+  this._busy = 0;
+  this._refed = true;
+}
+StatWatcherHandle.prototype.start = function (path, interval) {
+  const p = P(path);
+  const poll = () => {
+    let cur = null;
+    let status = 0;
+    try {
+      cur = fsb.stat(p);
+    } catch (e) {
+      status = __uvCodes.get(e?.code) ?? __uvCodes.get("UNKNOWN");
+    }
+    const zero = new Array(kFsStatsFieldsNumber).fill(0);
+    if (status !== 0) {
+      if (this._busy !== status) {
+        this._emit(status, zero, this._prev ?? zero);
+        this._busy = status;
+        this._prev = zero;
+      }
+      return;
+    }
+    if (this._busy !== 0 && (this._busy < 0 || !statEqual(this._prev, cur))) {
+      this._emit(0, cur, this._prev);
+    }
+    this._prev = cur;
+    this._busy = 1;
+  };
+  poll();
+  this._timer = setInterval(poll, Math.max(1, interval));
+  if (!this._refed) this._timer.unref();
+  return 0;
+};
+StatWatcherHandle.prototype._emit = function (status, cur, prev) {
+  const all = [...cur, ...prev];
+  const arr = this.bigint ? BigInt64Array.from(all, (v) => BigInt(Math.trunc(v))) : new Float64Array(all);
+  if (typeof this.onchange === "function") this.onchange(status, arr);
+};
+StatWatcherHandle.prototype.close = function () {
+  if (this._timer) clearInterval(this._timer);
+  this._timer = null;
+};
+StatWatcherHandle.prototype.ref = function () {
+  this._refed = true;
+  this._timer?.ref();
+};
+StatWatcherHandle.prototype.unref = function () {
+  this._refed = false;
+  this._timer?.unref();
+};
+StatWatcherHandle.prototype.getAsyncId = function () {
+  return -1;
+};
+function statEqual(a, b) {
+  // dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, then mtime/ctime/birthtime.
+  for (let i = 0; i < kFsStatsFieldsNumber; i++) {
+    if (i === 10 || i === 11) continue; // atime
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+const fsBinding = {
+  kUsePromises,
+  kFsStatsFieldsNumber,
+  FSReqCallback,
+  statValues,
+  bigintStatValues,
+  StatWatcher: StatWatcherHandle,
+  FileHandle: NativeFileHandle,
+
+  access(path, mode, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "access", path, undefined, () => fsb.access(p, mode), () => fsb.accessAsync(p, mode));
   },
-  watch: (filename, options) => {
-    throw fsError("ENOSYS", "watch", toPath(filename), "fs.watch requires a filesystem-event backend that is not available");
+  existsSync(path) {
+    try {
+      return fsb.exists(P(path));
+    } catch {
+      return false;
+    }
   },
-  FileHandle,
+  open(path, flags, mode, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "open", path, undefined, () => fsb.open(p, flags, mode), () => fsb.openAsync(p, flags, mode));
+  },
+  openFileHandle(path, flags, mode, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "open", path, undefined, () => fsb.open(p, flags, mode),
+      () => fsb.openAsync(p, flags, mode), (fd) => new NativeFileHandle(fd));
+  },
+  close(fd, req, ctx) {
+    return dispatch(req, ctx, "close", undefined, undefined, () => fsb.close(fd), () => fsb.closeAsync(fd), () => undefined);
+  },
+  read(fd, buffer, offset, length, position, req, ctx) {
+    const view = viewOf(buffer, offset, length);
+    const at = pos(position);
+    return dispatch(req, ctx, "read", undefined, undefined, () => fsb.read(fd, view, at),
+      () => fsb.readAsync(fd, length, at).then((bytes) => {
+        view.set(bytes);
+        return bytes.length;
+      }));
+  },
+  readBuffers(fd, buffers, position, req, ctx) {
+    let at = pos(position);
+    return dispatch(req, ctx, "read", undefined, undefined, () => {
+      let total = 0;
+      for (const b of buffers) {
+        const n = fsb.read(fd, viewOf(b, 0, b.byteLength), at);
+        total += n;
+        if (at >= 0) at += n;
+        if (n < b.byteLength) break;
+      }
+      return total;
+    }, () => {
+      const len = buffers.reduce((sum, b) => sum + b.byteLength, 0);
+      return fsb.readAsync(fd, len, at).then((bytes) => scatter(buffers, bytes));
+    });
+  },
+  writeBuffer(fd, buffer, offset, length, position, req, ctx) {
+    const view = viewOf(buffer, offset, length);
+    const at = pos(position);
+    return dispatch(req, ctx, "write", undefined, undefined, () => fsb.write(fd, view, at), () => fsb.writeAsync(fd, view, at));
+  },
+  writeBuffers(fd, buffers, position, req, ctx) {
+    const data = concatBuffers(buffers);
+    const at = pos(position);
+    return dispatch(req, ctx, "write", undefined, undefined, () => fsb.write(fd, data, at), () => fsb.writeAsync(fd, data, at));
+  },
+  writeString(fd, string, position, encoding, req, ctx) {
+    const data = Buffer.from(string, encoding || "utf8");
+    const at = pos(position);
+    return dispatch(req, ctx, "write", undefined, undefined, () => fsb.write(fd, data, at), () => fsb.writeAsync(fd, data, at));
+  },
+  rename(from, to, req, ctx) {
+    const a = P(from);
+    const b = P(to);
+    return dispatch(req, ctx, "rename", from, to, () => fsb.rename(a, b), () => fsb.renameAsync(a, b));
+  },
+  ftruncate(fd, len, req, ctx) {
+    const n = Number(len);
+    return dispatch(req, ctx, "ftruncate", undefined, undefined, () => fsb.ftruncate(fd, n), () => fsb.ftruncateAsync(fd, n));
+  },
+  rmdir(path, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "rmdir", path, undefined, () => fsb.rmdir(p), () => fsb.rmdirAsync(p));
+  },
+  mkdir(path, mode, recursive, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "mkdir", path, undefined, () => fsb.mkdir(p, mode, !!recursive),
+      () => fsb.mkdirAsync(p, mode, !!recursive), (first) => (recursive && first != null ? displayPath(first) : undefined));
+  },
+  readdir(path, encoding, withTypes, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "scandir", path, undefined, () => fsb.readdir(p), () => fsb.readdirAsync(p),
+      ([names, types]) => {
+        const encoded = names.map((n) => encodeName(n, encoding));
+        return withTypes ? [encoded, types] : encoded;
+      });
+  },
+  internalModuleStat(path) {
+    try {
+      const st = fsb.statMaybe(P(path), true);
+      if (st == null) return -2;
+      return (st[1] & 0o170000) === 0o040000 ? 1 : 0;
+    } catch {
+      return -2;
+    }
+  },
+  fstat(fd, bigint, req, ctx) {
+    return dispatch(req, ctx, "fstat", undefined, undefined, () => fsb.fstat(fd), () => fsb.fstatAsync(fd),
+      (v) => toStatArray(v, bigint));
+  },
+  lstat(path, bigint, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "lstat", path, undefined, () => fsb.lstat(p), () => fsb.lstatAsync(p),
+      (v) => toStatArray(v, bigint));
+  },
+  stat(path, bigint, req, ctxOrThrow) {
+    const p = P(path);
+    if (req === undefined && ctxOrThrow === false) {
+      const v = bindingCall("stat", () => fsb.statMaybe(p, true), path);
+      return v == null ? undefined : toStatArray(v, bigint);
+    }
+    return dispatch(req, ctxOrThrow, "stat", path, undefined, () => fsb.stat(p), () => fsb.statAsync(p),
+      (v) => toStatArray(v, bigint));
+  },
+  statfs(path, bigint, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "statfs", path, undefined, () => fsb.statfs(p), () => fsb.statfsAsync(p),
+      (v) => (bigint ? BigInt64Array.from(v, (x) => BigInt(Math.trunc(x))) : new Float64Array(v)));
+  },
+  readlink(path, encoding, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "readlink", path, undefined, () => fsb.readlink(p), () => fsb.readlinkAsync(p),
+      (s) => encodeName(displayPath(s), encoding));
+  },
+  symlink(target, path, flags, req, ctx) {
+    const t = typeof target === "string" ? target : Buffer.from(target).toString("utf8");
+    const p = P(path);
+    return dispatch(req, ctx, "symlink", target, path, () => fsb.symlink(t, p, flags ?? 0),
+      () => fsb.symlinkAsync(t, p, flags ?? 0));
+  },
+  link(existing, path, req, ctx) {
+    const a = P(existing);
+    const b = P(path);
+    return dispatch(req, ctx, "link", existing, path, () => fsb.link(a, b), () => fsb.linkAsync(a, b));
+  },
+  unlink(path, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "unlink", path, undefined, () => fsb.unlink(p), () => fsb.unlinkAsync(p));
+  },
+  chmod(path, mode, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "chmod", path, undefined, () => fsb.chmod(p, mode), () => fsb.chmodAsync(p, mode));
+  },
+  fchmod(fd, mode, req, ctx) {
+    return dispatch(req, ctx, "fchmod", undefined, undefined, () => fsb.fchmod(fd, mode), () => fsb.fchmodAsync(fd, mode));
+  },
+  chown(path, uid, gid, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "chown", path, undefined, () => fsb.chown(p, uid, gid, true), () => fsb.chownAsync(p, uid, gid, true));
+  },
+  lchown(path, uid, gid, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "lchown", path, undefined, () => fsb.chown(p, uid, gid, false), () => fsb.chownAsync(p, uid, gid, false));
+  },
+  fchown(fd, uid, gid, req, ctx) {
+    return dispatch(req, ctx, "fchown", undefined, undefined, () => fsb.fchown(fd, uid, gid), () => fsb.fchownAsync(fd, uid, gid));
+  },
+  utimes(path, atime, mtime, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "utime", path, undefined, () => fsb.utimes(p, atime, mtime, true),
+      () => fsb.utimesAsync(p, atime, mtime, true));
+  },
+  lutimes(path, atime, mtime, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "lutime", path, undefined, () => fsb.utimes(p, atime, mtime, false),
+      () => fsb.utimesAsync(p, atime, mtime, false));
+  },
+  futimes(fd, atime, mtime, req, ctx) {
+    return dispatch(req, ctx, "futime", undefined, undefined, () => fsb.futimes(fd, atime, mtime), () => fsb.futimesAsync(fd, atime, mtime));
+  },
+  fsync(fd, req, ctx) {
+    return dispatch(req, ctx, "fsync", undefined, undefined, () => fsb.fsync(fd, false), () => fsb.fsyncAsync(fd, false));
+  },
+  fdatasync(fd, req, ctx) {
+    return dispatch(req, ctx, "fdatasync", undefined, undefined, () => fsb.fsync(fd, true), () => fsb.fsyncAsync(fd, true));
+  },
+  mkdtemp(prefix, encoding, req, ctx) {
+    const p = P(prefix).replace(/XXXXXX$/, "");
+    const shown = `${displayPath(prefix)}XXXXXX`;
+    return dispatch(req, ctx, "mkdtemp", shown, undefined, () => fsb.mkdtemp(p), () => fsb.mkdtempAsync(p),
+      (s) => encodeName(displayPath(s), encoding));
+  },
+  realpath(path, encoding, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "realpath", path, undefined, () => fsb.realpath(p), () => fsb.realpathAsync(p),
+      (s) => encodeName(displayPath(s), encoding));
+  },
+  copyFile(src, dest, mode, req, ctx) {
+    const a = P(src);
+    const b = P(dest);
+    return dispatch(req, ctx, "copyfile", src, dest, () => fsb.copyFile(a, b, mode ?? 0), () => fsb.copyFileAsync(a, b, mode ?? 0));
+  },
+  readFileUtf8(path, flags) {
+    if (typeof path === "number") {
+      // An fd: read to the end from the current position.
+      const chunks = [];
+      for (;;) {
+        const chunk = Buffer.allocUnsafe(65536);
+        const n = bindingCall("read", () => fsb.read(path, chunk, -1));
+        if (n === 0) break;
+        chunks.push(chunk.subarray(0, n));
+      }
+      return Buffer.concat(chunks).toString("utf8");
+    }
+    const p = P(path);
+    return bindingCall("open", () => fsb.readFileUtf8(p, flags), path);
+  },
 };
 
-nodeFs.promises = fsPromises;
-fsPromises.constants = nodeFs.constants;
+// internalBinding('fs_dir'): opendir reads the listing once; read() hands it out in pages of
+// [name, type, name, type, ...], then null.
+class DirHandle {
+  constructor(names, types) {
+    this.names = names;
+    this.types = types;
+    this.index = 0;
+  }
+  read(encoding, bufferSize, req, ctx) {
+    const page = () => {
+      if (this.index >= this.names.length) return null;
+      const out = [];
+      const end = Math.min(this.names.length, this.index + Math.max(1, bufferSize | 0));
+      for (; this.index < end; this.index++) {
+        out.push(encodeName(this.names[this.index], encoding), this.types[this.index]);
+      }
+      return out;
+    };
+    return dispatch(req, ctx, "scandir", undefined, undefined, page, () => Promise.resolve().then(page));
+  }
+  close(req, ctx) {
+    this.names = [];
+    return dispatch(req, ctx, "closedir", undefined, undefined, () => undefined, () => Promise.resolve());
+  }
+}
+const fsDirBinding = {
+  opendir(path, encoding, req, ctx) {
+    const p = P(path);
+    return dispatch(req, ctx, "opendir", path, undefined, () => fsb.readdir(p), () => fsb.readdirAsync(p),
+      ([names, types]) => new DirHandle(names, types));
+  },
+  opendirSync(path) {
+    const p = P(path);
+    const [names, types] = bindingCall("opendir", () => fsb.readdir(p), path);
+    return new DirHandle(names, types);
+  },
+};
 
-__builtins.set("fs", nodeFs);
-// `node:fs/promises` is the promises API as its own module.
-__builtins.set("fs/promises", fsPromises);
+// internalBinding('fs_event_wrap'): fs.watch by polling. A directory reports entries that appear
+// or vanish as 'rename' and entries whose size or mtime moved as 'change' (with `recursive`, the
+// whole subtree, names relative to the root); a file reports itself by basename.
+const kWatchInterval = 50;
+function FSEvent() {
+  this.initialized = false;
+  this.onchange = null;
+  this._timer = null;
+  this._refed = true;
+}
+function snapshotOf(p, isDir, recursive, sep) {
+  const snap = new Map();
+  if (!isDir) {
+    try {
+      const st = fsb.stat(p);
+      snap.set("", `${st[8]}:${st[12]}:${st[13]}`);
+    } catch {
+      // gone: an empty snapshot
+    }
+    return snap;
+  }
+  const walk = (dir, prefix) => {
+    let listing;
+    try {
+      listing = fsb.readdir(dir);
+    } catch {
+      return;
+    }
+    const [names, types] = listing;
+    for (let i = 0; i < names.length; i++) {
+      const rel = prefix + names[i];
+      const full = dir + sep + names[i];
+      let sig = String(types[i]);
+      try {
+        const st = fsb.lstat(full);
+        // A directory's own mtime moves whenever an entry is added; watchers report the entry,
+        // not the directory, so only existence counts for directories.
+        sig = (st[1] & 0o170000) === 0o040000 ? "dir" : `${st[1]}:${st[8]}:${st[12]}:${st[13]}`;
+      } catch {
+        // raced with a delete
+      }
+      snap.set(rel, sig);
+      if (recursive && types[i] === 2) walk(full, rel + sep);
+    }
+  };
+  walk(p, "");
+  return snap;
+}
+FSEvent.prototype.start = function (path, persistent, recursive, encoding) {
+  const p = P(path);
+  let st;
+  try {
+    st = fsb.stat(p);
+  } catch (e) {
+    return __uvCodes.get(e?.code) ?? __uvCodes.get("UNKNOWN");
+  }
+  const pathMod = __builtins.get("path");
+  const sep = pathMod.sep;
+  const isDir = (st[1] & 0o170000) === 0o040000;
+  const base = pathMod.basename(displayPath(path));
+  let prev = snapshotOf(p, isDir, recursive, sep);
+  const emit = (eventType, name) => {
+    if (this._timer === null || typeof this.onchange !== "function") return;
+    const filename = encoding === "buffer" ? Buffer.from(name) :
+      encoding && encoding !== "utf8" && encoding !== "utf-8" ? Buffer.from(name).toString(encoding) : name;
+    this.onchange(0, eventType, filename);
+  };
+  this._timer = setInterval(() => {
+    const cur = snapshotOf(p, isDir, recursive, sep);
+    for (const [name, sig] of cur) {
+      const old = prev.get(name);
+      if (old === undefined) emit("rename", isDir ? name : base);
+      else if (old !== sig) emit("change", isDir ? name : base);
+    }
+    for (const name of prev.keys()) {
+      if (!cur.has(name)) emit("rename", isDir ? name : base);
+    }
+    prev = cur;
+  }, kWatchInterval);
+  if (!persistent) this._refed = false;
+  if (!this._refed) this._timer.unref();
+  this.initialized = true;
+  return 0;
+};
+FSEvent.prototype.close = function () {
+  if (this._timer) clearInterval(this._timer);
+  this._timer = null;
+  this.initialized = false;
+};
+FSEvent.prototype.ref = function () {
+  this._refed = true;
+  this._timer?.ref();
+};
+FSEvent.prototype.unref = function () {
+  this._refed = false;
+  this._timer?.unref();
+};
+FSEvent.prototype.getAsyncId = function () {
+  return -1;
+};
+
+function internalBinding(name) {
+  switch (name) {
+    case "fs":
+      return fsBinding;
+    case "fs_dir":
+      return fsDirBinding;
+    case "fs_event_wrap":
+      return { FSEvent };
+    case "constants":
+      return { fs: fsConstants, os: __builtins.get("os").constants };
+    case "uv":
+      return {
+        UV_ENOSPC: __uvCodes.get("ENOSPC"),
+        errname: (errno) => __uvErrmap.get(errno)?.[0],
+        getErrorMap: () => __uvErrmap,
+      };
+  }
+  throw new Error(`lumen fs: internalBinding('${name}') is not available`);
+}
+
+// ---- lib/fs.js (Node v20.10.0) --------------------------------------------------------------------
+defineModule("fs", function (module, exports, require, internalBinding, primordials) {
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+// Maintainers, keep in mind that ES1-style octal literals (`0666`) are not
+// allowed in strict mode. Use ES6-style octal literals instead (`0o666`).
+
+'use strict';
+
+const {
+  ArrayPrototypePush,
+  BigIntPrototypeToString,
+  Boolean,
+  MathMax,
+  Number,
+  ObjectDefineProperties,
+  ObjectDefineProperty,
+  Promise,
+  PromiseResolve,
+  ReflectApply,
+  SafeMap,
+  SafeSet,
+  StringPrototypeCharCodeAt,
+  StringPrototypeIndexOf,
+  StringPrototypeSlice,
+} = primordials;
+
+const { fs: constants } = internalBinding('constants');
+const {
+  S_IFIFO,
+  S_IFLNK,
+  S_IFMT,
+  S_IFREG,
+  S_IFSOCK,
+  F_OK,
+  R_OK,
+  W_OK,
+  X_OK,
+  O_WRONLY,
+  O_SYMLINK,
+} = constants;
+
+const pathModule = require('path');
+const { isArrayBufferView } = require('internal/util/types');
+
+const binding = internalBinding('fs');
+
+const { createBlobFromFilePath } = require('internal/blob');
+
+const { Buffer } = require('buffer');
+const {
+  aggregateTwoErrors,
+  codes: {
+    ERR_FS_FILE_TOO_LARGE,
+    ERR_INVALID_ARG_VALUE,
+  },
+  AbortError,
+  uvErrmapGet,
+  uvException,
+} = require('internal/errors');
+
+const {
+  FSReqCallback,
+  statValues,
+} = binding;
+const { toPathIfFileURL } = require('internal/url');
+const {
+  customPromisifyArgs: kCustomPromisifyArgsSymbol,
+  kEmptyObject,
+  promisify: {
+    custom: kCustomPromisifiedSymbol,
+  },
+  SideEffectFreeRegExpPrototypeExec,
+  defineLazyProperties,
+} = require('internal/util');
+const {
+  constants: {
+    kIoMaxLength,
+    kMaxUserId,
+  },
+  copyObject,
+  Dirent,
+  emitRecursiveRmdirWarning,
+  getDirent,
+  getDirents,
+  getOptions,
+  getValidatedFd,
+  getValidatedPath,
+  getValidMode,
+  handleErrorFromBinding,
+  possiblyTransformPath,
+  preprocessSymlinkDestination,
+  Stats,
+  getStatFsFromBinding,
+  getStatsFromBinding,
+  realpathCacheKey,
+  stringToFlags,
+  stringToSymlinkType,
+  toUnixTimestamp,
+  validateBufferArray,
+  validateCpOptions,
+  validateOffsetLengthRead,
+  validateOffsetLengthWrite,
+  validatePath,
+  validatePosition,
+  validateRmOptions,
+  validateRmOptionsSync,
+  validateRmdirOptions,
+  validateStringAfterArrayBufferView,
+  warnOnNonPortableTemplate,
+} = require('internal/fs/utils');
+const {
+  CHAR_FORWARD_SLASH,
+  CHAR_BACKWARD_SLASH,
+} = require('internal/constants');
+const {
+  isInt32,
+  parseFileMode,
+  validateBoolean,
+  validateBuffer,
+  validateEncoding,
+  validateFunction,
+  validateInteger,
+  validateObject,
+  validateString,
+  kValidateObjectAllowNullable,
+} = require('internal/validators');
+
+let truncateWarn = true;
+let fs;
+
+// Lazy loaded
+let cpFn;
+let cpSyncFn;
+let promises = null;
+let ReadStream;
+let WriteStream;
+let rimraf;
+let rimrafSync;
+let kResistStopPropagation;
+
+// These have to be separate because of how graceful-fs happens to do it's
+// monkeypatching.
+let FileReadStream;
+let FileWriteStream;
+
+const isWindows = process.platform === 'win32';
+const isOSX = process.platform === 'darwin';
+
+function showTruncateDeprecation() {
+  if (truncateWarn) {
+    process.emitWarning(
+      'Using fs.truncate with a file descriptor is deprecated. Please use ' +
+      'fs.ftruncate with a file descriptor instead.',
+      'DeprecationWarning', 'DEP0081');
+    truncateWarn = false;
+  }
+}
+
+function maybeCallback(cb) {
+  validateFunction(cb, 'cb');
+
+  return cb;
+}
+
+// Ensure that callbacks run in the global context. Only use this function
+// for callbacks that are passed to the binding layer, callbacks that are
+// invoked from JS already run in the proper scope.
+function makeCallback(cb) {
+  validateFunction(cb, 'cb');
+
+  return (...args) => ReflectApply(cb, this, args);
+}
+
+// Special case of `makeCallback()` that is specific to async `*stat()` calls as
+// an optimization, since the data passed back to the callback needs to be
+// transformed anyway.
+function makeStatsCallback(cb) {
+  validateFunction(cb, 'cb');
+
+  return (err, stats) => {
+    if (err) return cb(err);
+    cb(err, getStatsFromBinding(stats));
+  };
+}
+
+const isFd = isInt32;
+
+function isFileType(stats, fileType) {
+  // Use stats array directly to avoid creating an fs.Stats instance just for
+  // our internal use.
+  let mode = stats[1];
+  if (typeof mode === 'bigint')
+    mode = Number(mode);
+  return (mode & S_IFMT) === fileType;
+}
+
+/**
+ * Tests a user's permissions for the file or directory
+ * specified by `path`.
+ * @param {string | Buffer | URL} path
+ * @param {number} [mode]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function access(path, mode, callback) {
+  if (typeof mode === 'function') {
+    callback = mode;
+    mode = F_OK;
+  }
+
+  path = getValidatedPath(path);
+  mode = getValidMode(mode, 'access');
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.access(pathModule.toNamespacedPath(path), mode, req);
+}
+
+/**
+ * Synchronously tests a user's permissions for the file or
+ * directory specified by `path`.
+ * @param {string | Buffer | URL} path
+ * @param {number} [mode]
+ * @returns {void}
+ */
+function accessSync(path, mode) {
+  path = getValidatedPath(path);
+  mode = getValidMode(mode, 'access');
+
+  binding.access(pathModule.toNamespacedPath(path), mode);
+}
+
+/**
+ * Tests whether or not the given path exists.
+ * @param {string | Buffer | URL} path
+ * @param {(exists?: boolean) => any} callback
+ * @returns {void}
+ */
+function exists(path, callback) {
+  maybeCallback(callback);
+
+  function suppressedCallback(err) {
+    callback(err ? false : true);
+  }
+
+  try {
+    fs.access(path, F_OK, suppressedCallback);
+  } catch {
+    return callback(false);
+  }
+}
+
+ObjectDefineProperty(exists, kCustomPromisifiedSymbol, {
+  __proto__: null,
+  value: function exists(path) { // eslint-disable-line func-name-matching
+    return new Promise((resolve) => fs.exists(path, resolve));
+  },
+});
+
+// fs.existsSync never throws, it only returns true or false.
+// Since fs.existsSync never throws, users have established
+// the expectation that passing invalid arguments to it, even like
+// fs.existsSync(), would only get a false in return, so we cannot signal
+// validation errors to users properly out of compatibility concerns.
+// TODO(joyeecheung): deprecate the never-throw-on-invalid-arguments behavior
+/**
+ * Synchronously tests whether or not the given path exists.
+ * @param {string | Buffer | URL} path
+ * @returns {boolean}
+ */
+function existsSync(path) {
+  try {
+    path = getValidatedPath(path);
+  } catch {
+    return false;
+  }
+
+  return binding.existsSync(pathModule.toNamespacedPath(path));
+}
+
+function readFileAfterOpen(err, fd) {
+  const context = this.context;
+
+  if (err) {
+    context.callback(err);
+    return;
+  }
+
+  context.fd = fd;
+
+  const req = new FSReqCallback();
+  req.oncomplete = readFileAfterStat;
+  req.context = context;
+  binding.fstat(fd, false, req);
+}
+
+function readFileAfterStat(err, stats) {
+  const context = this.context;
+
+  if (err)
+    return context.close(err);
+
+  // TODO(BridgeAR): Check if allocating a smaller chunk is better performance
+  // wise, similar to the promise based version (less peak memory and chunked
+  // stringify operations vs multiple C++/JS boundary crossings).
+  const size = context.size = isFileType(stats, S_IFREG) ? stats[8] : 0;
+
+  if (size > kIoMaxLength) {
+    err = new ERR_FS_FILE_TOO_LARGE(size);
+    return context.close(err);
+  }
+
+  try {
+    if (size === 0) {
+      // TODO(BridgeAR): If an encoding is set, use the StringDecoder to concat
+      // the result and reuse the buffer instead of allocating a new one.
+      context.buffers = [];
+    } else {
+      context.buffer = Buffer.allocUnsafeSlow(size);
+    }
+  } catch (err) {
+    return context.close(err);
+  }
+  context.read();
+}
+
+function checkAborted(signal, callback) {
+  if (signal?.aborted) {
+    callback(new AbortError(undefined, { cause: signal?.reason }));
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Asynchronously reads the entire contents of a file.
+ * @param {string | Buffer | URL | number} path
+ * @param {{
+ *   encoding?: string | null;
+ *   flag?: string;
+ *   signal?: AbortSignal;
+ *   } | string} [options]
+ * @param {(
+ *   err?: Error,
+ *   data?: string | Buffer
+ *   ) => any} callback
+ * @returns {void}
+ */
+function readFile(path, options, callback) {
+  callback = maybeCallback(callback || options);
+  options = getOptions(options, { flag: 'r' });
+  const ReadFileContext = require('internal/fs/read/context');
+  const context = new ReadFileContext(callback, options.encoding);
+  context.isUserFd = isFd(path); // File descriptor ownership
+
+  if (options.signal) {
+    context.signal = options.signal;
+  }
+  if (context.isUserFd) {
+    process.nextTick(function tick(context) {
+      ReflectApply(readFileAfterOpen, { context }, [null, path]);
+    }, context);
+    return;
+  }
+
+  if (checkAborted(options.signal, callback))
+    return;
+
+  const flagsNumber = stringToFlags(options.flag, 'options.flag');
+  path = getValidatedPath(path);
+
+  const req = new FSReqCallback();
+  req.context = context;
+  req.oncomplete = readFileAfterOpen;
+  binding.open(pathModule.toNamespacedPath(path),
+               flagsNumber,
+               0o666,
+               req);
+}
+
+function tryStatSync(fd, isUserFd) {
+  const ctx = {};
+  const stats = binding.fstat(fd, false, undefined, ctx);
+  if (ctx.errno !== undefined && !isUserFd) {
+    fs.closeSync(fd);
+    throw uvException(ctx);
+  }
+  return stats;
+}
+
+function tryCreateBuffer(size, fd, isUserFd) {
+  let threw = true;
+  let buffer;
+  try {
+    if (size > kIoMaxLength) {
+      throw new ERR_FS_FILE_TOO_LARGE(size);
+    }
+    buffer = Buffer.allocUnsafe(size);
+    threw = false;
+  } finally {
+    if (threw && !isUserFd) fs.closeSync(fd);
+  }
+  return buffer;
+}
+
+function tryReadSync(fd, isUserFd, buffer, pos, len) {
+  let threw = true;
+  let bytesRead;
+  try {
+    bytesRead = fs.readSync(fd, buffer, pos, len);
+    threw = false;
+  } finally {
+    if (threw && !isUserFd) fs.closeSync(fd);
+  }
+  return bytesRead;
+}
+
+/**
+ * Synchronously reads the entire contents of a file.
+ * @param {string | Buffer | URL | number} path
+ * @param {{
+ *   encoding?: string | null;
+ *   flag?: string;
+ *   }} [options]
+ * @returns {string | Buffer}
+ */
+function readFileSync(path, options) {
+  options = getOptions(options, { flag: 'r' });
+
+  if (options.encoding === 'utf8' || options.encoding === 'utf-8') {
+    if (!isInt32(path)) {
+      path = pathModule.toNamespacedPath(getValidatedPath(path));
+    }
+    return binding.readFileUtf8(path, stringToFlags(options.flag));
+  }
+
+  const isUserFd = isFd(path); // File descriptor ownership
+  const fd = isUserFd ? path : fs.openSync(path, options.flag, 0o666);
+
+  const stats = tryStatSync(fd, isUserFd);
+  const size = isFileType(stats, S_IFREG) ? stats[8] : 0;
+  let pos = 0;
+  let buffer; // Single buffer with file data
+  let buffers; // List for when size is unknown
+
+  if (size === 0) {
+    buffers = [];
+  } else {
+    buffer = tryCreateBuffer(size, fd, isUserFd);
+  }
+
+  let bytesRead;
+
+  if (size !== 0) {
+    do {
+      bytesRead = tryReadSync(fd, isUserFd, buffer, pos, size - pos);
+      pos += bytesRead;
+    } while (bytesRead !== 0 && pos < size);
+  } else {
+    do {
+      // The kernel lies about many files.
+      // Go ahead and try to read some bytes.
+      buffer = Buffer.allocUnsafe(8192);
+      bytesRead = tryReadSync(fd, isUserFd, buffer, 0, 8192);
+      if (bytesRead !== 0) {
+        ArrayPrototypePush(buffers, buffer.slice(0, bytesRead));
+      }
+      pos += bytesRead;
+    } while (bytesRead !== 0);
+  }
+
+  if (!isUserFd)
+    fs.closeSync(fd);
+
+  if (size === 0) {
+    // Data was collected into the buffers list.
+    buffer = Buffer.concat(buffers, pos);
+  } else if (pos < size) {
+    buffer = buffer.slice(0, pos);
+  }
+
+  if (options.encoding) buffer = buffer.toString(options.encoding);
+  return buffer;
+}
+
+function defaultCloseCallback(err) {
+  if (err != null) throw err;
+}
+
+/**
+ * Closes the file descriptor.
+ * @param {number} fd
+ * @param {(err?: Error) => any} [callback]
+ * @returns {void}
+ */
+function close(fd, callback = defaultCloseCallback) {
+  fd = getValidatedFd(fd);
+  if (callback !== defaultCloseCallback)
+    callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.close(fd, req);
+}
+
+/**
+ * Synchronously closes the file descriptor.
+ * @param {number} fd
+ * @returns {void}
+ */
+function closeSync(fd) {
+  fd = getValidatedFd(fd);
+
+  return binding.close(fd);
+}
+
+/**
+ * Asynchronously opens a file.
+ * @param {string | Buffer | URL} path
+ * @param {string | number} [flags]
+ * @param {string | number} [mode]
+ * @param {(
+ *   err?: Error,
+ *   fd?: number
+ *   ) => any} callback
+ * @returns {void}
+ */
+function open(path, flags, mode, callback) {
+  path = getValidatedPath(path);
+  if (arguments.length < 3) {
+    callback = flags;
+    flags = 'r';
+    mode = 0o666;
+  } else if (typeof mode === 'function') {
+    callback = mode;
+    mode = 0o666;
+  } else {
+    mode = parseFileMode(mode, 'mode', 0o666);
+  }
+  const flagsNumber = stringToFlags(flags);
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+
+  binding.open(pathModule.toNamespacedPath(path),
+               flagsNumber,
+               mode,
+               req);
+}
+
+/**
+ * Synchronously opens a file.
+ * @param {string | Buffer | URL} path
+ * @param {string | number} [flags]
+ * @param {string | number} [mode]
+ * @returns {number}
+ */
+function openSync(path, flags, mode) {
+  path = getValidatedPath(path);
+
+  return binding.open(
+    pathModule.toNamespacedPath(path),
+    stringToFlags(flags),
+    parseFileMode(mode, 'mode', 0o666),
+  );
+}
+
+/**
+ * @param {string | Buffer | URL } path
+ * @param {{
+ *   type?: string;
+ *   }} [options]
+ * @returns {Promise<Blob>}
+ */
+function openAsBlob(path, options = kEmptyObject) {
+  validateObject(options, 'options');
+  const type = options.type || '';
+  validateString(type, 'options.type');
+  // The underlying implementation here returns the Blob synchronously for now.
+  // To give ourselves flexibility to maybe return the Blob asynchronously,
+  // this API returns a Promise.
+  path = getValidatedPath(path);
+  return PromiseResolve(createBlobFromFilePath(pathModule.toNamespacedPath(path), { type }));
+}
+
+/**
+ * Reads file from the specified `fd` (file descriptor).
+ * @param {number} fd
+ * @param {Buffer | TypedArray | DataView} buffer
+ * @param {number} offsetOrOptions
+ * @param {number} length
+ * @param {number | bigint | null} position
+ * @param {(
+ *   err?: Error,
+ *   bytesRead?: number,
+ *   buffer?: Buffer
+ *   ) => any} callback
+ * @returns {void}
+ */
+function read(fd, buffer, offsetOrOptions, length, position, callback) {
+  fd = getValidatedFd(fd);
+
+  let offset = offsetOrOptions;
+  let params = null;
+  if (arguments.length <= 4) {
+    if (arguments.length === 4) {
+      // This is fs.read(fd, buffer, options, callback)
+      validateObject(offsetOrOptions, 'options', kValidateObjectAllowNullable);
+      callback = length;
+      params = offsetOrOptions;
+    } else if (arguments.length === 3) {
+      // This is fs.read(fd, bufferOrParams, callback)
+      if (!isArrayBufferView(buffer)) {
+        // This is fs.read(fd, params, callback)
+        params = buffer;
+        ({ buffer = Buffer.alloc(16384) } = params ?? kEmptyObject);
+      }
+      callback = offsetOrOptions;
+    } else {
+      // This is fs.read(fd, callback)
+      callback = buffer;
+      buffer = Buffer.alloc(16384);
+    }
+
+    if (params !== undefined) {
+      validateObject(params, 'options', kValidateObjectAllowNullable);
+    }
+    ({
+      offset = 0,
+      length = buffer?.byteLength - offset,
+      position = null,
+    } = params ?? kEmptyObject);
+  }
+
+  validateBuffer(buffer);
+  callback = maybeCallback(callback);
+
+  if (offset == null) {
+    offset = 0;
+  } else {
+    validateInteger(offset, 'offset', 0);
+  }
+
+  length |= 0;
+
+  if (length === 0) {
+    return process.nextTick(function tick() {
+      callback(null, 0, buffer);
+    });
+  }
+
+  if (buffer.byteLength === 0) {
+    throw new ERR_INVALID_ARG_VALUE('buffer', buffer,
+                                    'is empty and cannot be written');
+  }
+
+  validateOffsetLengthRead(offset, length, buffer.byteLength);
+
+  if (position == null)
+    position = -1;
+
+  validatePosition(position, 'position');
+
+  function wrapper(err, bytesRead) {
+    // Retain a reference to buffer so that it can't be GC'ed too soon.
+    callback(err, bytesRead || 0, buffer);
+  }
+
+  const req = new FSReqCallback();
+  req.oncomplete = wrapper;
+
+  binding.read(fd, buffer, offset, length, position, req);
+}
+
+ObjectDefineProperty(read, kCustomPromisifyArgsSymbol,
+                     { __proto__: null, value: ['bytesRead', 'buffer'], enumerable: false });
+
+/**
+ * Synchronously reads the file from the
+ * specified `fd` (file descriptor).
+ * @param {number} fd
+ * @param {Buffer | TypedArray | DataView} buffer
+ * @param {{
+ *   offset?: number;
+ *   length?: number;
+ *   position?: number | bigint | null;
+ *   }} [offsetOrOptions]
+ * @returns {number}
+ */
+function readSync(fd, buffer, offsetOrOptions, length, position) {
+  fd = getValidatedFd(fd);
+
+  validateBuffer(buffer);
+
+  let offset = offsetOrOptions;
+  if (arguments.length <= 3 || typeof offsetOrOptions === 'object') {
+    if (offsetOrOptions !== undefined) {
+      validateObject(offsetOrOptions, 'options', kValidateObjectAllowNullable);
+    }
+
+    ({
+      offset = 0,
+      length = buffer.byteLength - offset,
+      position = null,
+    } = offsetOrOptions ?? kEmptyObject);
+  }
+
+  if (offset === undefined) {
+    offset = 0;
+  } else {
+    validateInteger(offset, 'offset', 0);
+  }
+
+  length |= 0;
+
+  if (length === 0) {
+    return 0;
+  }
+
+  if (buffer.byteLength === 0) {
+    throw new ERR_INVALID_ARG_VALUE('buffer', buffer,
+                                    'is empty and cannot be written');
+  }
+
+  validateOffsetLengthRead(offset, length, buffer.byteLength);
+
+  if (position == null)
+    position = -1;
+
+  validatePosition(position, 'position');
+
+  return binding.read(fd, buffer, offset, length, position);
+}
+
+/**
+ * Reads file from the specified `fd` (file descriptor)
+ * and writes to an array of `ArrayBufferView`s.
+ * @param {number} fd
+ * @param {ArrayBufferView[]} buffers
+ * @param {number | null} [position]
+ * @param {(
+ *   err?: Error,
+ *   bytesRead?: number,
+ *   buffers?: ArrayBufferView[];
+ *   ) => any} callback
+ * @returns {void}
+ */
+function readv(fd, buffers, position, callback) {
+  function wrapper(err, read) {
+    callback(err, read || 0, buffers);
+  }
+
+  fd = getValidatedFd(fd);
+  validateBufferArray(buffers);
+  callback = maybeCallback(callback || position);
+
+  const req = new FSReqCallback();
+  req.oncomplete = wrapper;
+
+  if (typeof position !== 'number')
+    position = null;
+
+  return binding.readBuffers(fd, buffers, position, req);
+}
+
+ObjectDefineProperty(readv, kCustomPromisifyArgsSymbol,
+                     { __proto__: null, value: ['bytesRead', 'buffers'], enumerable: false });
+
+/**
+ * Synchronously reads file from the
+ * specified `fd` (file descriptor) and writes to an array
+ * of `ArrayBufferView`s.
+ * @param {number} fd
+ * @param {ArrayBufferView[]} buffers
+ * @param {number | null} [position]
+ * @returns {number}
+ */
+function readvSync(fd, buffers, position) {
+  fd = getValidatedFd(fd);
+  validateBufferArray(buffers);
+
+  const ctx = {};
+
+  if (typeof position !== 'number')
+    position = null;
+
+  const result = binding.readBuffers(fd, buffers, position, undefined, ctx);
+  handleErrorFromBinding(ctx);
+  return result;
+}
+
+/**
+ * Writes `buffer` to the specified `fd` (file descriptor).
+ * @param {number} fd
+ * @param {Buffer | TypedArray | DataView | string} buffer
+ * @param {number | object} [offsetOrOptions]
+ * @param {number} [length]
+ * @param {number | null} [position]
+ * @param {(
+ *   err?: Error,
+ *   bytesWritten?: number;
+ *   buffer?: Buffer | TypedArray | DataView
+ *   ) => any} callback
+ * @returns {void}
+ */
+function write(fd, buffer, offsetOrOptions, length, position, callback) {
+  function wrapper(err, written) {
+    // Retain a reference to buffer so that it can't be GC'ed too soon.
+    callback(err, written || 0, buffer);
+  }
+
+  fd = getValidatedFd(fd);
+
+  let offset = offsetOrOptions;
+  if (isArrayBufferView(buffer)) {
+    callback = maybeCallback(callback || position || length || offset);
+
+    if (typeof offset === 'object') {
+      ({
+        offset = 0,
+        length = buffer.byteLength - offset,
+        position = null,
+      } = offsetOrOptions ?? kEmptyObject);
+    }
+
+    if (offset == null || typeof offset === 'function') {
+      offset = 0;
+    } else {
+      validateInteger(offset, 'offset', 0);
+    }
+    if (typeof length !== 'number')
+      length = buffer.byteLength - offset;
+    if (typeof position !== 'number')
+      position = null;
+    validateOffsetLengthWrite(offset, length, buffer.byteLength);
+
+    const req = new FSReqCallback();
+    req.oncomplete = wrapper;
+    return binding.writeBuffer(fd, buffer, offset, length, position, req);
+  }
+
+  validateStringAfterArrayBufferView(buffer, 'buffer');
+
+  if (typeof position !== 'function') {
+    if (typeof offset === 'function') {
+      position = offset;
+      offset = null;
+    } else {
+      position = length;
+    }
+    length = 'utf8';
+  }
+
+  const str = buffer;
+  validateEncoding(str, length);
+  callback = maybeCallback(position);
+
+  const req = new FSReqCallback();
+  req.oncomplete = wrapper;
+  return binding.writeString(fd, str, offset, length, req);
+}
+
+ObjectDefineProperty(write, kCustomPromisifyArgsSymbol,
+                     { __proto__: null, value: ['bytesWritten', 'buffer'], enumerable: false });
+
+/**
+ * Synchronously writes `buffer` to the
+ * specified `fd` (file descriptor).
+ * @param {number} fd
+ * @param {Buffer | TypedArray | DataView | string} buffer
+ * @param {{
+ *   offset?: number;
+ *   length?: number;
+ *   position?: number | null;
+ *   }} [offsetOrOptions]
+ * @returns {number}
+ */
+function writeSync(fd, buffer, offsetOrOptions, length, position) {
+  fd = getValidatedFd(fd);
+  const ctx = {};
+  let result;
+
+  let offset = offsetOrOptions;
+  if (isArrayBufferView(buffer)) {
+    if (typeof offset === 'object') {
+      ({
+        offset = 0,
+        length = buffer.byteLength - offset,
+        position = null,
+      } = offsetOrOptions ?? kEmptyObject);
+    }
+    if (position === undefined)
+      position = null;
+    if (offset == null) {
+      offset = 0;
+    } else {
+      validateInteger(offset, 'offset', 0);
+    }
+    if (typeof length !== 'number')
+      length = buffer.byteLength - offset;
+    validateOffsetLengthWrite(offset, length, buffer.byteLength);
+    result = binding.writeBuffer(fd, buffer, offset, length, position,
+                                 undefined, ctx);
+  } else {
+    validateStringAfterArrayBufferView(buffer, 'buffer');
+    validateEncoding(buffer, length);
+
+    if (offset === undefined)
+      offset = null;
+    result = binding.writeString(fd, buffer, offset, length,
+                                 undefined, ctx);
+  }
+  handleErrorFromBinding(ctx);
+  return result;
+}
+
+/**
+ * Writes an array of `ArrayBufferView`s to the
+ * specified `fd` (file descriptor).
+ * @param {number} fd
+ * @param {ArrayBufferView[]} buffers
+ * @param {number | null} [position]
+ * @param {(
+ *   err?: Error,
+ *   bytesWritten?: number,
+ *   buffers?: ArrayBufferView[]
+ *   ) => any} callback
+ * @returns {void}
+ */
+function writev(fd, buffers, position, callback) {
+  function wrapper(err, written) {
+    callback(err, written || 0, buffers);
+  }
+
+  fd = getValidatedFd(fd);
+  validateBufferArray(buffers);
+  callback = maybeCallback(callback || position);
+
+  if (buffers.length === 0) {
+    process.nextTick(callback, null, 0, buffers);
+    return;
+  }
+
+  const req = new FSReqCallback();
+  req.oncomplete = wrapper;
+
+  if (typeof position !== 'number')
+    position = null;
+
+  return binding.writeBuffers(fd, buffers, position, req);
+}
+
+ObjectDefineProperty(writev, kCustomPromisifyArgsSymbol, {
+  __proto__: null,
+  value: ['bytesWritten', 'buffer'],
+  enumerable: false,
+});
+
+/**
+ * Synchronously writes an array of `ArrayBufferView`s
+ * to the specified `fd` (file descriptor).
+ * @param {number} fd
+ * @param {ArrayBufferView[]} buffers
+ * @param {number | null} [position]
+ * @returns {number}
+ */
+function writevSync(fd, buffers, position) {
+  fd = getValidatedFd(fd);
+  validateBufferArray(buffers);
+
+  if (buffers.length === 0) {
+    return 0;
+  }
+
+  if (typeof position !== 'number')
+    position = null;
+
+  return binding.writeBuffers(fd, buffers, position);
+}
+
+/**
+ * Asynchronously renames file at `oldPath` to
+ * the pathname provided as `newPath`.
+ * @param {string | Buffer | URL} oldPath
+ * @param {string | Buffer | URL} newPath
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function rename(oldPath, newPath, callback) {
+  callback = makeCallback(callback);
+  oldPath = getValidatedPath(oldPath, 'oldPath');
+  newPath = getValidatedPath(newPath, 'newPath');
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.rename(pathModule.toNamespacedPath(oldPath),
+                 pathModule.toNamespacedPath(newPath),
+                 req);
+}
+
+
+/**
+ * Synchronously renames file at `oldPath` to
+ * the pathname provided as `newPath`.
+ * @param {string | Buffer | URL} oldPath
+ * @param {string | Buffer | URL} newPath
+ * @returns {void}
+ */
+function renameSync(oldPath, newPath) {
+  oldPath = getValidatedPath(oldPath, 'oldPath');
+  newPath = getValidatedPath(newPath, 'newPath');
+  binding.rename(
+    pathModule.toNamespacedPath(oldPath),
+    pathModule.toNamespacedPath(newPath),
+  );
+}
+
+/**
+ * Truncates the file.
+ * @param {string | Buffer | URL} path
+ * @param {number} [len]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function truncate(path, len, callback) {
+  if (typeof path === 'number') {
+    showTruncateDeprecation();
+    return fs.ftruncate(path, len, callback);
+  }
+  if (typeof len === 'function') {
+    callback = len;
+    len = 0;
+  } else if (len === undefined) {
+    len = 0;
+  }
+
+  validateInteger(len, 'len');
+  len = MathMax(0, len);
+  callback = maybeCallback(callback);
+  fs.open(path, 'r+', (er, fd) => {
+    if (er) return callback(er);
+    const req = new FSReqCallback();
+    req.oncomplete = function oncomplete(er) {
+      fs.close(fd, (er2) => {
+        callback(aggregateTwoErrors(er2, er));
+      });
+    };
+    binding.ftruncate(fd, len, req);
+  });
+}
+
+/**
+ * Synchronously truncates the file.
+ * @param {string | Buffer | URL} path
+ * @param {number} [len]
+ * @returns {void}
+ */
+function truncateSync(path, len) {
+  if (typeof path === 'number') {
+    // legacy
+    showTruncateDeprecation();
+    return fs.ftruncateSync(path, len);
+  }
+  if (len === undefined) {
+    len = 0;
+  }
+  // Allow error to be thrown, but still close fd.
+  const fd = fs.openSync(path, 'r+');
+  let ret;
+
+  try {
+    ret = fs.ftruncateSync(fd, len);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return ret;
+}
+
+/**
+ * Truncates the file descriptor.
+ * @param {number} fd
+ * @param {number} [len]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function ftruncate(fd, len = 0, callback) {
+  if (typeof len === 'function') {
+    callback = len;
+    len = 0;
+  }
+  fd = getValidatedFd(fd);
+  validateInteger(len, 'len');
+  len = MathMax(0, len);
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.ftruncate(fd, len, req);
+}
+
+/**
+ * Synchronously truncates the file descriptor.
+ * @param {number} fd
+ * @param {number} [len]
+ * @returns {void}
+ */
+function ftruncateSync(fd, len = 0) {
+  fd = getValidatedFd(fd);
+  validateInteger(len, 'len');
+  len = MathMax(0, len);
+  binding.ftruncate(fd, len);
+}
+
+function lazyLoadCp() {
+  if (cpFn === undefined) {
+    ({ cpFn } = require('internal/fs/cp/cp'));
+    cpFn = require('util').callbackify(cpFn);
+    ({ cpSyncFn } = require('internal/fs/cp/cp-sync'));
+  }
+}
+
+function lazyLoadRimraf() {
+  if (rimraf === undefined)
+    ({ rimraf, rimrafSync } = require('internal/fs/rimraf'));
+}
+
+/**
+ * Asynchronously removes a directory.
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   maxRetries?: number;
+ *   recursive?: boolean;
+ *   retryDelay?: number;
+ *   }} [options]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function rmdir(path, options, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = undefined;
+  }
+
+  callback = makeCallback(callback);
+  path = pathModule.toNamespacedPath(getValidatedPath(path));
+
+  if (options?.recursive) {
+    emitRecursiveRmdirWarning();
+    validateRmOptions(
+      path,
+      { ...options, force: false },
+      true,
+      (err, options) => {
+        if (err === false) {
+          const req = new FSReqCallback();
+          req.oncomplete = callback;
+          return binding.rmdir(path, req);
+        }
+        if (err) {
+          return callback(err);
+        }
+
+        lazyLoadRimraf();
+        rimraf(path, options, callback);
+      });
+  } else {
+    validateRmdirOptions(options);
+    const req = new FSReqCallback();
+    req.oncomplete = callback;
+    return binding.rmdir(path, req);
+  }
+}
+
+/**
+ * Synchronously removes a directory.
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   maxRetries?: number;
+ *   recursive?: boolean;
+ *   retryDelay?: number;
+ *   }} [options]
+ * @returns {void}
+ */
+function rmdirSync(path, options) {
+  path = getValidatedPath(path);
+
+  if (options?.recursive) {
+    emitRecursiveRmdirWarning();
+    options = validateRmOptionsSync(path, { ...options, force: false }, true);
+    if (options !== false) {
+      lazyLoadRimraf();
+      return rimrafSync(pathModule.toNamespacedPath(path), options);
+    }
+  } else {
+    validateRmdirOptions(options);
+  }
+
+  const ctx = { path };
+  binding.rmdir(pathModule.toNamespacedPath(path), undefined, ctx);
+  return handleErrorFromBinding(ctx);
+}
+
+/**
+ * Asynchronously removes files and
+ * directories (modeled on the standard POSIX `rm` utility).
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   force?: boolean;
+ *   maxRetries?: number;
+ *   recursive?: boolean;
+ *   retryDelay?: number;
+ *   }} [options]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function rm(path, options, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = undefined;
+  }
+  path = getValidatedPath(path);
+
+  validateRmOptions(path, options, false, (err, options) => {
+    if (err) {
+      return callback(err);
+    }
+    lazyLoadRimraf();
+    return rimraf(pathModule.toNamespacedPath(path), options, callback);
+  });
+}
+
+/**
+ * Synchronously removes files and
+ * directories (modeled on the standard POSIX `rm` utility).
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   force?: boolean;
+ *   maxRetries?: number;
+ *   recursive?: boolean;
+ *   retryDelay?: number;
+ *   }} [options]
+ * @returns {void}
+ */
+function rmSync(path, options) {
+  path = getValidatedPath(path);
+  options = validateRmOptionsSync(path, options, false);
+
+  lazyLoadRimraf();
+  return rimrafSync(pathModule.toNamespacedPath(path), options);
+}
+
+/**
+ * Forces all currently queued I/O operations associated
+ * with the file to the operating system's synchronized
+ * I/O completion state.
+ * @param {number} fd
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function fdatasync(fd, callback) {
+  fd = getValidatedFd(fd);
+  const req = new FSReqCallback();
+  req.oncomplete = makeCallback(callback);
+  binding.fdatasync(fd, req);
+}
+
+/**
+ * Synchronously forces all currently queued I/O operations
+ * associated with the file to the operating
+ * system's synchronized I/O completion state.
+ * @param {number} fd
+ * @returns {void}
+ */
+function fdatasyncSync(fd) {
+  fd = getValidatedFd(fd);
+  return binding.fdatasync(fd);
+}
+
+/**
+ * Requests for all data for the open file descriptor
+ * to be flushed to the storage device.
+ * @param {number} fd
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function fsync(fd, callback) {
+  fd = getValidatedFd(fd);
+  const req = new FSReqCallback();
+  req.oncomplete = makeCallback(callback);
+  binding.fsync(fd, req);
+}
+
+/**
+ * Synchronously requests for all data for the open
+ * file descriptor to be flushed to the storage device.
+ * @param {number} fd
+ * @returns {void}
+ */
+function fsyncSync(fd) {
+  fd = getValidatedFd(fd);
+  return binding.fsync(fd);
+}
+
+/**
+ * Asynchronously creates a directory.
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   recursive?: boolean;
+ *   mode?: string | number;
+ *   } | number} [options]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function mkdir(path, options, callback) {
+  let mode = 0o777;
+  let recursive = false;
+  if (typeof options === 'function') {
+    callback = options;
+  } else if (typeof options === 'number' || typeof options === 'string') {
+    mode = options;
+  } else if (options) {
+    if (options.recursive !== undefined)
+      recursive = options.recursive;
+    if (options.mode !== undefined)
+      mode = options.mode;
+  }
+  callback = makeCallback(callback);
+  path = getValidatedPath(path);
+
+  validateBoolean(recursive, 'options.recursive');
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.mkdir(pathModule.toNamespacedPath(path),
+                parseFileMode(mode, 'mode'), recursive, req);
+}
+
+/**
+ * Synchronously creates a directory.
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   recursive?: boolean;
+ *   mode?: string | number;
+ *   } | number} [options]
+ * @returns {string | void}
+ */
+function mkdirSync(path, options) {
+  let mode = 0o777;
+  let recursive = false;
+  if (typeof options === 'number' || typeof options === 'string') {
+    mode = options;
+  } else if (options) {
+    if (options.recursive !== undefined)
+      recursive = options.recursive;
+    if (options.mode !== undefined)
+      mode = options.mode;
+  }
+  path = getValidatedPath(path);
+  validateBoolean(recursive, 'options.recursive');
+
+  const result = binding.mkdir(
+    pathModule.toNamespacedPath(path),
+    parseFileMode(mode, 'mode'),
+    recursive,
+  );
+
+  if (recursive) {
+    return result;
+  }
+}
+
+/**
+ * An iterative algorithm for reading the entire contents of the `basePath` directory.
+ * This function does not validate `basePath` as a directory. It is passed directly to
+ * `binding.readdir`.
+ * @param {string} basePath
+ * @param {{ encoding: string, withFileTypes: boolean }} options
+ * @returns {string[] | Dirent[]}
+ */
+function readdirSyncRecursive(basePath, options) {
+  const withFileTypes = Boolean(options.withFileTypes);
+  const encoding = options.encoding;
+
+  const readdirResults = [];
+  const pathsQueue = [basePath];
+
+  function read(path) {
+    const readdirResult = binding.readdir(
+      pathModule.toNamespacedPath(path),
+      encoding,
+      withFileTypes,
+    );
+
+    if (readdirResult === undefined) {
+      return;
+    }
+
+    if (withFileTypes) {
+      // Calling `readdir` with `withFileTypes=true`, the result is an array of arrays.
+      // The first array is the names, and the second array is the types.
+      // They are guaranteed to be the same length; hence, setting `length` to the length
+      // of the first array within the result.
+      const length = readdirResult[0].length;
+      for (let i = 0; i < length; i++) {
+        const dirent = getDirent(path, readdirResult[0][i], readdirResult[1][i]);
+        ArrayPrototypePush(readdirResults, dirent);
+        if (dirent.isDirectory()) {
+          ArrayPrototypePush(pathsQueue, pathModule.join(dirent.path, dirent.name));
+        }
+      }
+    } else {
+      for (let i = 0; i < readdirResult.length; i++) {
+        const resultPath = pathModule.join(path, readdirResult[i]);
+        const relativeResultPath = pathModule.relative(basePath, resultPath);
+        const stat = binding.internalModuleStat(resultPath);
+        ArrayPrototypePush(readdirResults, relativeResultPath);
+        // 1 indicates directory
+        if (stat === 1) {
+          ArrayPrototypePush(pathsQueue, resultPath);
+        }
+      }
+    }
+  }
+
+  for (let i = 0; i < pathsQueue.length; i++) {
+    read(pathsQueue[i]);
+  }
+
+  return readdirResults;
+}
+
+/**
+ * Reads the contents of a directory.
+ * @param {string | Buffer | URL} path
+ * @param {string | {
+ *   encoding?: string;
+ *   withFileTypes?: boolean;
+ *   }} [options]
+ * @param {(
+ *   err?: Error,
+ *   files?: string[] | Buffer[] | Direct[];
+ *   ) => any} callback
+ * @returns {void}
+ */
+function readdir(path, options, callback) {
+  callback = makeCallback(typeof options === 'function' ? options : callback);
+  options = getOptions(options);
+  path = getValidatedPath(path);
+  if (options.recursive != null) {
+    validateBoolean(options.recursive, 'options.recursive');
+  }
+
+  if (options.recursive) {
+    callback(null, readdirSyncRecursive(path, options));
+    return;
+  }
+
+  const req = new FSReqCallback();
+  if (!options.withFileTypes) {
+    req.oncomplete = callback;
+  } else {
+    req.oncomplete = (err, result) => {
+      if (err) {
+        callback(err);
+        return;
+      }
+      getDirents(path, result, callback);
+    };
+  }
+  binding.readdir(pathModule.toNamespacedPath(path), options.encoding,
+                  !!options.withFileTypes, req);
+}
+
+/**
+ * Synchronously reads the contents of a directory.
+ * @param {string | Buffer | URL} path
+ * @param {string | {
+ *   encoding?: string;
+ *   withFileTypes?: boolean;
+ *   recursive?: boolean;
+ *   }} [options]
+ * @returns {string | Buffer[] | Dirent[]}
+ */
+function readdirSync(path, options) {
+  options = getOptions(options);
+  path = getValidatedPath(path);
+  if (options.recursive != null) {
+    validateBoolean(options.recursive, 'options.recursive');
+  }
+
+  if (options.recursive) {
+    return readdirSyncRecursive(path, options);
+  }
+
+  const result = binding.readdir(
+    pathModule.toNamespacedPath(path),
+    options.encoding,
+    !!options.withFileTypes,
+  );
+
+  return result !== undefined && options.withFileTypes ? getDirents(path, result) : result;
+}
+
+/**
+ * Invokes the callback with the `fs.Stats`
+ * for the file descriptor.
+ * @param {number} fd
+ * @param {{ bigint?: boolean; }} [options]
+ * @param {(
+ *   err?: Error,
+ *   stats?: Stats
+ *   ) => any} callback
+ * @returns {void}
+ */
+function fstat(fd, options = { bigint: false }, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = kEmptyObject;
+  }
+  fd = getValidatedFd(fd);
+  callback = makeStatsCallback(callback);
+
+  const req = new FSReqCallback(options.bigint);
+  req.oncomplete = callback;
+  binding.fstat(fd, options.bigint, req);
+}
+
+/**
+ * Retrieves the `fs.Stats` for the symbolic link
+ * referred to by the `path`.
+ * @param {string | Buffer | URL} path
+ * @param {{ bigint?: boolean; }} [options]
+ * @param {(
+ *   err?: Error,
+ *   stats?: Stats
+ *   ) => any} callback
+ * @returns {void}
+ */
+function lstat(path, options = { bigint: false }, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = kEmptyObject;
+  }
+  callback = makeStatsCallback(callback);
+  path = getValidatedPath(path);
+
+  const req = new FSReqCallback(options.bigint);
+  req.oncomplete = callback;
+  binding.lstat(pathModule.toNamespacedPath(path), options.bigint, req);
+}
+
+/**
+ * Asynchronously gets the stats of a file.
+ * @param {string | Buffer | URL} path
+ * @param {{ bigint?: boolean; }} [options]
+ * @param {(
+ *   err?: Error,
+ *   stats?: Stats
+ *   ) => any} callback
+ * @returns {void}
+ */
+function stat(path, options = { bigint: false }, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = kEmptyObject;
+  }
+  callback = makeStatsCallback(callback);
+  path = getValidatedPath(path);
+
+  const req = new FSReqCallback(options.bigint);
+  req.oncomplete = callback;
+  binding.stat(pathModule.toNamespacedPath(path), options.bigint, req);
+}
+
+function statfs(path, options = { bigint: false }, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = kEmptyObject;
+  }
+  callback = maybeCallback(callback);
+  path = getValidatedPath(path);
+  const req = new FSReqCallback(options.bigint);
+  req.oncomplete = (err, stats) => {
+    if (err) {
+      return callback(err);
+    }
+
+    callback(err, getStatFsFromBinding(stats));
+  };
+  binding.statfs(pathModule.toNamespacedPath(path), options.bigint, req);
+}
+
+function hasNoEntryError(ctx) {
+  if (ctx.errno) {
+    const uvErr = uvErrmapGet(ctx.errno);
+    return uvErr?.[0] === 'ENOENT';
+  }
+
+  if (ctx.error) {
+    return ctx.error.code === 'ENOENT';
+  }
+
+  return false;
+}
+
+/**
+ * Synchronously retrieves the `fs.Stats` for
+ * the file descriptor.
+ * @param {number} fd
+ * @param {{
+ *   bigint?: boolean;
+ *   }} [options]
+ * @returns {Stats}
+ */
+function fstatSync(fd, options = { bigint: false }) {
+  fd = getValidatedFd(fd);
+  const ctx = { fd };
+  const stats = binding.fstat(fd, options.bigint, undefined, ctx);
+  handleErrorFromBinding(ctx);
+  return getStatsFromBinding(stats);
+}
+
+/**
+ * Synchronously retrieves the `fs.Stats` for
+ * the symbolic link referred to by the `path`.
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   bigint?: boolean;
+ *   throwIfNoEntry?: boolean;
+ *   }} [options]
+ * @returns {Stats}
+ */
+function lstatSync(path, options = { bigint: false, throwIfNoEntry: true }) {
+  path = getValidatedPath(path);
+  const ctx = { path };
+  const stats = binding.lstat(pathModule.toNamespacedPath(path),
+                              options.bigint, undefined, ctx);
+  if (options.throwIfNoEntry === false && hasNoEntryError(ctx)) {
+    return undefined;
+  }
+  handleErrorFromBinding(ctx);
+  return getStatsFromBinding(stats);
+}
+
+/**
+ * Synchronously retrieves the `fs.Stats`
+ * for the `path`.
+ * @param {string | Buffer | URL} path
+ * @param {{
+ *   bigint?: boolean;
+ *   throwIfNoEntry?: boolean;
+ *   }} [options]
+ * @returns {Stats}
+ */
+function statSync(path, options = { bigint: false, throwIfNoEntry: true }) {
+  path = getValidatedPath(path);
+  const stats = binding.stat(
+    pathModule.toNamespacedPath(path),
+    options.bigint,
+    undefined,
+    options.throwIfNoEntry,
+  );
+  if (stats === undefined) {
+    return undefined;
+  }
+  return getStatsFromBinding(stats);
+}
+
+function statfsSync(path, options = { bigint: false }) {
+  path = getValidatedPath(path);
+  const stats = binding.statfs(pathModule.toNamespacedPath(path), options.bigint);
+  return getStatFsFromBinding(stats);
+}
+
+/**
+ * Reads the contents of a symbolic link
+ * referred to by `path`.
+ * @param {string | Buffer | URL} path
+ * @param {{ encoding?: string; } | string} [options]
+ * @param {(
+ *   err?: Error,
+ *   linkString?: string | Buffer
+ *   ) => any} callback
+ * @returns {void}
+ */
+function readlink(path, options, callback) {
+  callback = makeCallback(typeof options === 'function' ? options : callback);
+  options = getOptions(options);
+  path = getValidatedPath(path, 'oldPath');
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.readlink(pathModule.toNamespacedPath(path), options.encoding, req);
+}
+
+/**
+ * Synchronously reads the contents of a symbolic link
+ * referred to by `path`.
+ * @param {string | Buffer | URL} path
+ * @param {{ encoding?: string; } | string} [options]
+ * @returns {string | Buffer}
+ */
+function readlinkSync(path, options) {
+  options = getOptions(options);
+  path = getValidatedPath(path, 'oldPath');
+  return binding.readlink(
+    pathModule.toNamespacedPath(path),
+    options.encoding,
+  );
+}
+
+/**
+ * Creates the link called `path` pointing to `target`.
+ * @param {string | Buffer | URL} target
+ * @param {string | Buffer | URL} path
+ * @param {string | null} [type_]
+ * @param {(err?: Error) => any} callback_
+ * @returns {void}
+ */
+function symlink(target, path, type_, callback_) {
+  const type = (typeof type_ === 'string' ? type_ : null);
+  const callback = makeCallback(arguments[arguments.length - 1]);
+
+  target = getValidatedPath(target, 'target');
+  path = getValidatedPath(path);
+
+  if (isWindows && type === null) {
+    let absoluteTarget;
+    try {
+      // Symlinks targets can be relative to the newly created path.
+      // Calculate absolute file name of the symlink target, and check
+      // if it is a directory. Ignore resolve error to keep symlink
+      // errors consistent between platforms if invalid path is
+      // provided.
+      absoluteTarget = pathModule.resolve(path, '..', target);
+    } catch {
+      // Continue regardless of error.
+    }
+    if (absoluteTarget !== undefined) {
+      stat(absoluteTarget, (err, stat) => {
+        const resolvedType = !err && stat.isDirectory() ? 'dir' : 'file';
+        const resolvedFlags = stringToSymlinkType(resolvedType);
+        const destination = preprocessSymlinkDestination(target,
+                                                         resolvedType,
+                                                         path);
+
+        const req = new FSReqCallback();
+        req.oncomplete = callback;
+        binding.symlink(destination,
+                        pathModule.toNamespacedPath(path), resolvedFlags, req);
+      });
+      return;
+    }
+  }
+
+  const destination = preprocessSymlinkDestination(target, type, path);
+
+  const flags = stringToSymlinkType(type);
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.symlink(destination, pathModule.toNamespacedPath(path), flags, req);
+}
+
+/**
+ * Synchronously creates the link called `path`
+ * pointing to `target`.
+ * @param {string | Buffer | URL} target
+ * @param {string | Buffer | URL} path
+ * @param {string | null} [type]
+ * @returns {void}
+ */
+function symlinkSync(target, path, type) {
+  type = (typeof type === 'string' ? type : null);
+  if (isWindows && type === null) {
+    const absoluteTarget = pathModule.resolve(`${path}`, '..', `${target}`);
+    if (statSync(absoluteTarget, { throwIfNoEntry: false })?.isDirectory()) {
+      type = 'dir';
+    }
+  }
+  target = getValidatedPath(target, 'target');
+  path = getValidatedPath(path);
+
+  binding.symlink(
+    preprocessSymlinkDestination(target, type, path),
+    pathModule.toNamespacedPath(path),
+    stringToSymlinkType(type),
+  );
+}
+
+/**
+ * Creates a new link from the `existingPath`
+ * to the `newPath`.
+ * @param {string | Buffer | URL} existingPath
+ * @param {string | Buffer | URL} newPath
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function link(existingPath, newPath, callback) {
+  callback = makeCallback(callback);
+
+  existingPath = getValidatedPath(existingPath, 'existingPath');
+  newPath = getValidatedPath(newPath, 'newPath');
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+
+  binding.link(pathModule.toNamespacedPath(existingPath),
+               pathModule.toNamespacedPath(newPath),
+               req);
+}
+
+/**
+ * Synchronously creates a new link from the `existingPath`
+ * to the `newPath`.
+ * @param {string | Buffer | URL} existingPath
+ * @param {string | Buffer | URL} newPath
+ * @returns {void}
+ */
+function linkSync(existingPath, newPath) {
+  existingPath = getValidatedPath(existingPath, 'existingPath');
+  newPath = getValidatedPath(newPath, 'newPath');
+
+  binding.link(
+    pathModule.toNamespacedPath(existingPath),
+    pathModule.toNamespacedPath(newPath),
+  );
+}
+
+/**
+ * Asynchronously removes a file or symbolic link.
+ * @param {string | Buffer | URL} path
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function unlink(path, callback) {
+  callback = makeCallback(callback);
+  path = getValidatedPath(path);
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.unlink(pathModule.toNamespacedPath(path), req);
+}
+
+/**
+ * Synchronously removes a file or symbolic link.
+ * @param {string | Buffer | URL} path
+ * @returns {void}
+ */
+function unlinkSync(path) {
+  path = pathModule.toNamespacedPath(getValidatedPath(path));
+  return binding.unlink(path);
+}
+
+/**
+ * Sets the permissions on the file.
+ * @param {number} fd
+ * @param {string | number} mode
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function fchmod(fd, mode, callback) {
+  fd = getValidatedFd(fd);
+  mode = parseFileMode(mode, 'mode');
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.fchmod(fd, mode, req);
+}
+
+/**
+ * Synchronously sets the permissions on the file.
+ * @param {number} fd
+ * @param {string | number} mode
+ * @returns {void}
+ */
+function fchmodSync(fd, mode) {
+  binding.fchmod(
+    getValidatedFd(fd),
+    parseFileMode(mode, 'mode'),
+  );
+}
+
+/**
+ * Changes the permissions on a symbolic link.
+ * @param {string | Buffer | URL} path
+ * @param {number} mode
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function lchmod(path, mode, callback) {
+  callback = maybeCallback(callback);
+  mode = parseFileMode(mode, 'mode');
+  fs.open(path, O_WRONLY | O_SYMLINK, (err, fd) => {
+    if (err) {
+      callback(err);
+      return;
+    }
+    // Prefer to return the chmod error, if one occurs,
+    // but still try to close, and report closing errors if they occur.
+    fs.fchmod(fd, mode, (err) => {
+      fs.close(fd, (err2) => {
+        callback(aggregateTwoErrors(err2, err));
+      });
+    });
+  });
+}
+
+/**
+ * Synchronously changes the permissions on a symbolic link.
+ * @param {string | Buffer | URL} path
+ * @param {number} mode
+ * @returns {void}
+ */
+function lchmodSync(path, mode) {
+  const fd = fs.openSync(path, O_WRONLY | O_SYMLINK);
+
+  // Prefer to return the chmod error, if one occurs,
+  // but still try to close, and report closing errors if they occur.
+  let ret;
+  try {
+    ret = fs.fchmodSync(fd, mode);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return ret;
+}
+
+/**
+ * Asynchronously changes the permissions of a file.
+ * @param {string | Buffer | URL} path
+ * @param {string | number} mode
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function chmod(path, mode, callback) {
+  path = getValidatedPath(path);
+  mode = parseFileMode(mode, 'mode');
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.chmod(pathModule.toNamespacedPath(path), mode, req);
+}
+
+/**
+ * Synchronously changes the permissions of a file.
+ * @param {string | Buffer | URL} path
+ * @param {string | number} mode
+ * @returns {void}
+ */
+function chmodSync(path, mode) {
+  path = getValidatedPath(path);
+  mode = parseFileMode(mode, 'mode');
+
+  binding.chmod(
+    pathModule.toNamespacedPath(path),
+    mode,
+  );
+}
+
+/**
+ * Sets the owner of the symbolic link.
+ * @param {string | Buffer | URL} path
+ * @param {number} uid
+ * @param {number} gid
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function lchown(path, uid, gid, callback) {
+  callback = makeCallback(callback);
+  path = getValidatedPath(path);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.lchown(pathModule.toNamespacedPath(path), uid, gid, req);
+}
+
+/**
+ * Synchronously sets the owner of the symbolic link.
+ * @param {string | Buffer | URL} path
+ * @param {number} uid
+ * @param {number} gid
+ * @returns {void}
+ */
+function lchownSync(path, uid, gid) {
+  path = getValidatedPath(path);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+  binding.lchown(
+    pathModule.toNamespacedPath(path),
+    uid,
+    gid,
+  );
+}
+
+/**
+ * Sets the owner of the file.
+ * @param {number} fd
+ * @param {number} uid
+ * @param {number} gid
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function fchown(fd, uid, gid, callback) {
+  fd = getValidatedFd(fd);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.fchown(fd, uid, gid, req);
+}
+
+/**
+ * Synchronously sets the owner of the file.
+ * @param {number} fd
+ * @param {number} uid
+ * @param {number} gid
+ * @returns {void}
+ */
+function fchownSync(fd, uid, gid) {
+  fd = getValidatedFd(fd);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+
+  const ctx = {};
+  binding.fchown(fd, uid, gid, undefined, ctx);
+  handleErrorFromBinding(ctx);
+}
+
+/**
+ * Asynchronously changes the owner and group
+ * of a file.
+ * @param {string | Buffer | URL} path
+ * @param {number} uid
+ * @param {number} gid
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function chown(path, uid, gid, callback) {
+  callback = makeCallback(callback);
+  path = getValidatedPath(path);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.chown(pathModule.toNamespacedPath(path), uid, gid, req);
+}
+
+/**
+ * Synchronously changes the owner and group
+ * of a file.
+ * @param {string | Buffer | URL} path
+ * @param {number} uid
+ * @param {number} gid
+ * @returns {void}
+ */
+function chownSync(path, uid, gid) {
+  path = getValidatedPath(path);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+  binding.chown(
+    pathModule.toNamespacedPath(path),
+    uid,
+    gid,
+  );
+}
+
+/**
+ * Changes the file system timestamps of the object
+ * referenced by `path`.
+ * @param {string | Buffer | URL} path
+ * @param {number | string | Date} atime
+ * @param {number | string | Date} mtime
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function utimes(path, atime, mtime, callback) {
+  callback = makeCallback(callback);
+  path = getValidatedPath(path);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.utimes(pathModule.toNamespacedPath(path),
+                 toUnixTimestamp(atime),
+                 toUnixTimestamp(mtime),
+                 req);
+}
+
+/**
+ * Synchronously changes the file system timestamps
+ * of the object referenced by `path`.
+ * @param {string | Buffer | URL} path
+ * @param {number | string | Date} atime
+ * @param {number | string | Date} mtime
+ * @returns {void}
+ */
+function utimesSync(path, atime, mtime) {
+  path = getValidatedPath(path);
+  binding.utimes(
+    pathModule.toNamespacedPath(path),
+    toUnixTimestamp(atime),
+    toUnixTimestamp(mtime),
+  );
+}
+
+/**
+ * Changes the file system timestamps of the object
+ * referenced by the supplied `fd` (file descriptor).
+ * @param {number} fd
+ * @param {number | string | Date} atime
+ * @param {number | string | Date} mtime
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function futimes(fd, atime, mtime, callback) {
+  fd = getValidatedFd(fd);
+  atime = toUnixTimestamp(atime, 'atime');
+  mtime = toUnixTimestamp(mtime, 'mtime');
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.futimes(fd, atime, mtime, req);
+}
+
+/**
+ * Synchronously changes the file system timestamps
+ * of the object referenced by the
+ * supplied `fd` (file descriptor).
+ * @param {number} fd
+ * @param {number | string | Date} atime
+ * @param {number | string | Date} mtime
+ * @returns {void}
+ */
+function futimesSync(fd, atime, mtime) {
+  binding.futimes(
+    getValidatedFd(fd),
+    toUnixTimestamp(atime, 'atime'),
+    toUnixTimestamp(mtime, 'mtime'),
+  );
+}
+
+/**
+ * Changes the access and modification times of
+ * a file in the same way as `fs.utimes()`.
+ * @param {string | Buffer | URL} path
+ * @param {number | string | Date} atime
+ * @param {number | string | Date} mtime
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function lutimes(path, atime, mtime, callback) {
+  callback = makeCallback(callback);
+  path = getValidatedPath(path);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.lutimes(pathModule.toNamespacedPath(path),
+                  toUnixTimestamp(atime),
+                  toUnixTimestamp(mtime),
+                  req);
+}
+
+/**
+ * Synchronously changes the access and modification
+ * times of a file in the same way as `fs.utimesSync()`.
+ * @param {string | Buffer | URL} path
+ * @param {number | string | Date} atime
+ * @param {number | string | Date} mtime
+ * @returns {void}
+ */
+function lutimesSync(path, atime, mtime) {
+  path = getValidatedPath(path);
+  binding.lutimes(
+    pathModule.toNamespacedPath(path),
+    toUnixTimestamp(atime),
+    toUnixTimestamp(mtime),
+  );
+}
+
+function writeAll(fd, isUserFd, buffer, offset, length, signal, flush, callback) {
+  if (signal?.aborted) {
+    const abortError = new AbortError(undefined, { cause: signal?.reason });
+    if (isUserFd) {
+      callback(abortError);
+    } else {
+      fs.close(fd, (err) => {
+        callback(aggregateTwoErrors(err, abortError));
+      });
+    }
+    return;
+  }
+  // write(fd, buffer, offset, length, position, callback)
+  fs.write(fd, buffer, offset, length, null, (writeErr, written) => {
+    if (writeErr) {
+      if (isUserFd) {
+        callback(writeErr);
+      } else {
+        fs.close(fd, (err) => {
+          callback(aggregateTwoErrors(err, writeErr));
+        });
+      }
+    } else if (written === length) {
+      if (!flush) {
+        if (isUserFd) {
+          callback(null);
+        } else {
+          fs.close(fd, callback);
+        }
+      } else {
+        fs.fsync(fd, (syncErr) => {
+          if (syncErr) {
+            if (isUserFd) {
+              callback(syncErr);
+            } else {
+              fs.close(fd, (err) => {
+                callback(aggregateTwoErrors(err, syncErr));
+              });
+            }
+          } else if (isUserFd) {
+            callback(null);
+          } else {
+            fs.close(fd, callback);
+          }
+        });
+      }
+    } else {
+      offset += written;
+      length -= written;
+      writeAll(fd, isUserFd, buffer, offset, length, signal, flush, callback);
+    }
+  });
+}
+
+/**
+ * Asynchronously writes data to the file.
+ * @param {string | Buffer | URL | number} path
+ * @param {string | Buffer | TypedArray | DataView} data
+ * @param {{
+ *   encoding?: string | null;
+ *   mode?: number;
+ *   flag?: string;
+ *   signal?: AbortSignal;
+ *   flush?: boolean;
+ *   } | string} [options]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function writeFile(path, data, options, callback) {
+  callback = maybeCallback(callback || options);
+  options = getOptions(options, {
+    encoding: 'utf8',
+    mode: 0o666,
+    flag: 'w',
+    flush: false,
+  });
+  const flag = options.flag || 'w';
+  const flush = options.flush ?? false;
+
+  validateBoolean(flush, 'options.flush');
+
+  if (!isArrayBufferView(data)) {
+    validateStringAfterArrayBufferView(data, 'data');
+    data = Buffer.from(data, options.encoding || 'utf8');
+  }
+
+  if (isFd(path)) {
+    const isUserFd = true;
+    const signal = options.signal;
+    writeAll(path, isUserFd, data, 0, data.byteLength, signal, flush, callback);
+    return;
+  }
+
+  if (checkAborted(options.signal, callback))
+    return;
+
+  fs.open(path, flag, options.mode, (openErr, fd) => {
+    if (openErr) {
+      callback(openErr);
+    } else {
+      const isUserFd = false;
+      const signal = options.signal;
+      writeAll(fd, isUserFd, data, 0, data.byteLength, signal, flush, callback);
+    }
+  });
+}
+
+/**
+ * Synchronously writes data to the file.
+ * @param {string | Buffer | URL | number} path
+ * @param {string | Buffer | TypedArray | DataView} data
+ * @param {{
+ *   encoding?: string | null;
+ *   mode?: number;
+ *   flag?: string;
+ *   flush?: boolean;
+ *   } | string} [options]
+ * @returns {void}
+ */
+function writeFileSync(path, data, options) {
+  options = getOptions(options, {
+    encoding: 'utf8',
+    mode: 0o666,
+    flag: 'w',
+    flush: false,
+  });
+
+  const flush = options.flush ?? false;
+
+  validateBoolean(flush, 'options.flush');
+
+  if (!isArrayBufferView(data)) {
+    validateStringAfterArrayBufferView(data, 'data');
+    data = Buffer.from(data, options.encoding || 'utf8');
+  }
+
+  const flag = options.flag || 'w';
+
+  const isUserFd = isFd(path); // File descriptor ownership
+  const fd = isUserFd ? path : fs.openSync(path, flag, options.mode);
+
+  let offset = 0;
+  let length = data.byteLength;
+  try {
+    while (length > 0) {
+      const written = fs.writeSync(fd, data, offset, length);
+      offset += written;
+      length -= written;
+    }
+
+    if (flush) {
+      fs.fsyncSync(fd);
+    }
+  } finally {
+    if (!isUserFd) fs.closeSync(fd);
+  }
+}
+
+/**
+ * Asynchronously appends data to a file.
+ * @param {string | Buffer | URL | number} path
+ * @param {string | Buffer} data
+ * @param {{
+ *   encoding?: string | null;
+ *   mode?: number;
+ *   flag?: string;
+ *   } | string} [options]
+ * @param {(err?: Error) => any} callback
+ * @returns {void}
+ */
+function appendFile(path, data, options, callback) {
+  callback = maybeCallback(callback || options);
+  options = getOptions(options, { encoding: 'utf8', mode: 0o666, flag: 'a' });
+
+  // Don't make changes directly on options object
+  options = copyObject(options);
+
+  // Force append behavior when using a supplied file descriptor
+  if (!options.flag || isFd(path))
+    options.flag = 'a';
+
+  fs.writeFile(path, data, options, callback);
+}
+
+/**
+ * Synchronously appends data to a file.
+ * @param {string | Buffer | URL | number} path
+ * @param {string | Buffer} data
+ * @param {{
+ *   encoding?: string | null;
+ *   mode?: number;
+ *   flag?: string;
+ *   } | string} [options]
+ * @returns {void}
+ */
+function appendFileSync(path, data, options) {
+  options = getOptions(options, { encoding: 'utf8', mode: 0o666, flag: 'a' });
+
+  // Don't make changes directly on options object
+  options = copyObject(options);
+
+  // Force append behavior when using a supplied file descriptor
+  if (!options.flag || isFd(path))
+    options.flag = 'a';
+
+  fs.writeFileSync(path, data, options);
+}
+
+/**
+ * Watches for the changes on `filename`.
+ * @param {string | Buffer | URL} filename
+ * @param {string | {
+ *   persistent?: boolean;
+ *   recursive?: boolean;
+ *   encoding?: string;
+ *   signal?: AbortSignal;
+ *   }} [options]
+ * @param {(
+ *   eventType?: string,
+ *   filename?: string | Buffer
+ *   ) => any} [listener]
+ * @returns {watchers.FSWatcher}
+ */
+function watch(filename, options, listener) {
+  if (typeof options === 'function') {
+    listener = options;
+  }
+  options = getOptions(options);
+
+  // Don't make changes directly on options object
+  options = copyObject(options);
+
+  if (options.persistent === undefined) options.persistent = true;
+  if (options.recursive === undefined) options.recursive = false;
+
+  let watcher;
+  const watchers = require('internal/fs/watchers');
+  const path = possiblyTransformPath(filename);
+  // TODO(anonrig): Remove non-native watcher when/if libuv supports recursive.
+  // As of November 2022, libuv does not support recursive file watch on all platforms,
+  // e.g. Linux due to the limitations of inotify.
+  if (options.recursive && !isOSX && !isWindows) {
+    const nonNativeWatcher = require('internal/fs/recursive_watch');
+    watcher = new nonNativeWatcher.FSWatcher(options);
+    watcher[watchers.kFSWatchStart](path);
+  } else {
+    watcher = new watchers.FSWatcher();
+    watcher[watchers.kFSWatchStart](path,
+                                    options.persistent,
+                                    options.recursive,
+                                    options.encoding);
+  }
+
+  if (listener) {
+    watcher.addListener('change', listener);
+  }
+  if (options.signal) {
+    if (options.signal.aborted) {
+      process.nextTick(() => watcher.close());
+    } else {
+      const listener = () => watcher.close();
+      kResistStopPropagation ??= require('internal/event_target').kResistStopPropagation;
+      options.signal.addEventListener('abort', listener, { __proto__: null, [kResistStopPropagation]: true });
+      watcher.once('close', () => {
+        options.signal.removeEventListener('abort', listener);
+      });
+    }
+  }
+
+  return watcher;
+}
+
+
+const statWatchers = new SafeMap();
+
+/**
+ * Watches for changes on `filename`.
+ * @param {string | Buffer | URL} filename
+ * @param {{
+ *   bigint?: boolean;
+ *   persistent?: boolean;
+ *   interval?: number;
+ *   }} [options]
+ * @param {(
+ *   current?: Stats,
+ *   previous?: Stats
+ *   ) => any} listener
+ * @returns {watchers.StatWatcher}
+ */
+function watchFile(filename, options, listener) {
+  filename = getValidatedPath(filename);
+  filename = pathModule.resolve(filename);
+  let stat;
+
+  if (options === null || typeof options !== 'object') {
+    listener = options;
+    options = null;
+  }
+
+  options = {
+    // Poll interval in milliseconds. 5007 is what libev used to use. It's
+    // a little on the slow side but let's stick with it for now to keep
+    // behavioral changes to a minimum.
+    interval: 5007,
+    persistent: true,
+    ...options,
+  };
+
+  validateFunction(listener, 'listener');
+
+  stat = statWatchers.get(filename);
+  const watchers = require('internal/fs/watchers');
+  if (stat === undefined) {
+    stat = new watchers.StatWatcher(options.bigint);
+    stat[watchers.kFSStatWatcherStart](filename,
+                                       options.persistent, options.interval);
+    statWatchers.set(filename, stat);
+  } else {
+    stat[watchers.kFSStatWatcherAddOrCleanRef]('add');
+  }
+
+  stat.addListener('change', listener);
+  return stat;
+}
+
+/**
+ * Stops watching for changes on `filename`.
+ * @param {string | Buffer | URL} filename
+ * @param {() => any} [listener]
+ * @returns {void}
+ */
+function unwatchFile(filename, listener) {
+  filename = getValidatedPath(filename);
+  filename = pathModule.resolve(filename);
+  const stat = statWatchers.get(filename);
+
+  if (stat === undefined) return;
+  const watchers = require('internal/fs/watchers');
+  if (typeof listener === 'function') {
+    const beforeListenerCount = stat.listenerCount('change');
+    stat.removeListener('change', listener);
+    if (stat.listenerCount('change') < beforeListenerCount)
+      stat[watchers.kFSStatWatcherAddOrCleanRef]('clean');
+  } else {
+    stat.removeAllListeners('change');
+    stat[watchers.kFSStatWatcherAddOrCleanRef]('cleanAll');
+  }
+
+  if (stat.listenerCount('change') === 0) {
+    stat.stop();
+    statWatchers.delete(filename);
+  }
+}
+
+
+let splitRoot;
+if (isWindows) {
+  // Regex to find the device root on Windows (e.g. 'c:\\'), including trailing
+  // slash.
+  const splitRootRe = /^(?:[a-zA-Z]:|[\\/]{2}[^\\/]+[\\/][^\\/]+)?[\\/]*/;
+  splitRoot = function splitRoot(str) {
+    return SideEffectFreeRegExpPrototypeExec(splitRootRe, str)[0];
+  };
+} else {
+  splitRoot = function splitRoot(str) {
+    for (let i = 0; i < str.length; ++i) {
+      if (StringPrototypeCharCodeAt(str, i) !== CHAR_FORWARD_SLASH)
+        return StringPrototypeSlice(str, 0, i);
+    }
+    return str;
+  };
+}
+
+function encodeRealpathResult(result, options) {
+  if (!options || !options.encoding || options.encoding === 'utf8')
+    return result;
+  const asBuffer = Buffer.from(result);
+  if (options.encoding === 'buffer') {
+    return asBuffer;
+  }
+  return asBuffer.toString(options.encoding);
+}
+
+// Finds the next portion of a (partial) path, up to the next path delimiter
+let nextPart;
+if (isWindows) {
+  nextPart = function nextPart(p, i) {
+    for (; i < p.length; ++i) {
+      const ch = StringPrototypeCharCodeAt(p, i);
+
+      // Check for a separator character
+      if (ch === CHAR_BACKWARD_SLASH || ch === CHAR_FORWARD_SLASH)
+        return i;
+    }
+    return -1;
+  };
+} else {
+  nextPart = function nextPart(p, i) {
+    return StringPrototypeIndexOf(p, '/', i);
+  };
+}
+
+/**
+ * Returns the resolved pathname.
+ * @param {string | Buffer | URL} p
+ * @param {string | { encoding?: string | null; }} [options]
+ * @returns {string | Buffer}
+ */
+function realpathSync(p, options) {
+  options = getOptions(options);
+  p = toPathIfFileURL(p);
+  if (typeof p !== 'string') {
+    p += '';
+  }
+  validatePath(p);
+  p = pathModule.resolve(p);
+
+  const cache = options[realpathCacheKey];
+  const maybeCachedResult = cache?.get(p);
+  if (maybeCachedResult) {
+    return maybeCachedResult;
+  }
+
+  const seenLinks = new SafeMap();
+  const knownHard = new SafeSet();
+  const original = p;
+
+  // Current character position in p
+  let pos;
+  // The partial path so far, including a trailing slash if any
+  let current;
+  // The partial path without a trailing slash (except when pointing at a root)
+  let base;
+  // The partial path scanned in the previous round, with slash
+  let previous;
+
+  // Skip over roots
+  current = base = splitRoot(p);
+  pos = current.length;
+
+  // On windows, check that the root exists. On unix there is no need.
+  if (isWindows) {
+    const ctx = { path: base };
+    binding.lstat(pathModule.toNamespacedPath(base), false, undefined, ctx);
+    handleErrorFromBinding(ctx);
+    knownHard.add(base);
+  }
+
+  // Walk down the path, swapping out linked path parts for their real
+  // values
+  // NB: p.length changes.
+  while (pos < p.length) {
+    // find the next part
+    const result = nextPart(p, pos);
+    previous = current;
+    if (result === -1) {
+      const last = StringPrototypeSlice(p, pos);
+      current += last;
+      base = previous + last;
+      pos = p.length;
+    } else {
+      current += StringPrototypeSlice(p, pos, result + 1);
+      base = previous + StringPrototypeSlice(p, pos, result);
+      pos = result + 1;
+    }
+
+    // Continue if not a symlink, break if a pipe/socket
+    if (knownHard.has(base) || cache?.get(base) === base) {
+      if (isFileType(statValues, S_IFIFO) ||
+          isFileType(statValues, S_IFSOCK)) {
+        break;
+      }
+      continue;
+    }
+
+    let resolvedLink;
+    const maybeCachedResolved = cache?.get(base);
+    if (maybeCachedResolved) {
+      resolvedLink = maybeCachedResolved;
+    } else {
+      // Use stats array directly to avoid creating an fs.Stats instance just
+      // for our internal use.
+
+      const baseLong = pathModule.toNamespacedPath(base);
+      const ctx = { path: base };
+      const stats = binding.lstat(baseLong, true, undefined, ctx);
+      handleErrorFromBinding(ctx);
+
+      if (!isFileType(stats, S_IFLNK)) {
+        knownHard.add(base);
+        cache?.set(base, base);
+        continue;
+      }
+
+      // Read the link if it wasn't read before
+      // dev/ino always return 0 on windows, so skip the check.
+      let linkTarget = null;
+      let id;
+      if (!isWindows) {
+        const dev = BigIntPrototypeToString(stats[0], 32);
+        const ino = BigIntPrototypeToString(stats[7], 32);
+        id = `${dev}:${ino}`;
+        if (seenLinks.has(id)) {
+          linkTarget = seenLinks.get(id);
+        }
+      }
+      if (linkTarget === null) {
+        binding.stat(baseLong, false, undefined, true);
+        linkTarget = binding.readlink(baseLong, undefined);
+      }
+      resolvedLink = pathModule.resolve(previous, linkTarget);
+
+      cache?.set(base, resolvedLink);
+      if (!isWindows) seenLinks.set(id, linkTarget);
+    }
+
+    // Resolve the link, then start over
+    p = pathModule.resolve(resolvedLink, StringPrototypeSlice(p, pos));
+
+    // Skip over roots
+    current = base = splitRoot(p);
+    pos = current.length;
+
+    // On windows, check that the root exists. On unix there is no need.
+    if (isWindows && !knownHard.has(base)) {
+      const ctx = { path: base };
+      binding.lstat(pathModule.toNamespacedPath(base), false, undefined, ctx);
+      handleErrorFromBinding(ctx);
+      knownHard.add(base);
+    }
+  }
+
+  cache?.set(original, p);
+  return encodeRealpathResult(p, options);
+}
+
+/**
+ * Returns the resolved pathname.
+ * @param {string | Buffer | URL} path
+ * @param {string | { encoding?: string; }} [options]
+ * @returns {string | Buffer}
+ */
+realpathSync.native = (path, options) => {
+  options = getOptions(options);
+  path = getValidatedPath(path);
+  return binding.realpath(
+    pathModule.toNamespacedPath(path),
+    options.encoding,
+  );
+};
+
+/**
+ * Asynchronously computes the canonical pathname by
+ * resolving `.`, `..` and symbolic links.
+ * @param {string | Buffer | URL} p
+ * @param {string | { encoding?: string; }} [options]
+ * @param {(
+ *   err?: Error,
+ *   resolvedPath?: string | Buffer
+ *   ) => any} callback
+ * @returns {void}
+ */
+function realpath(p, options, callback) {
+  callback = typeof options === 'function' ? options : maybeCallback(callback);
+  options = getOptions(options);
+  p = toPathIfFileURL(p);
+
+  if (typeof p !== 'string') {
+    p += '';
+  }
+  validatePath(p);
+  p = pathModule.resolve(p);
+
+  const seenLinks = new SafeMap();
+  const knownHard = new SafeSet();
+
+  // Current character position in p
+  let pos;
+  // The partial path so far, including a trailing slash if any
+  let current;
+  // The partial path without a trailing slash (except when pointing at a root)
+  let base;
+  // The partial path scanned in the previous round, with slash
+  let previous;
+
+  current = base = splitRoot(p);
+  pos = current.length;
+
+  // On windows, check that the root exists. On unix there is no need.
+  if (isWindows && !knownHard.has(base)) {
+    fs.lstat(base, (err, stats) => {
+      if (err) return callback(err);
+      knownHard.add(base);
+      LOOP();
+    });
+  } else {
+    process.nextTick(LOOP);
+  }
+
+  // Walk down the path, swapping out linked path parts for their real
+  // values
+  function LOOP() {
+    // Stop if scanned past end of path
+    if (pos >= p.length) {
+      return callback(null, encodeRealpathResult(p, options));
+    }
+
+    // find the next part
+    const result = nextPart(p, pos);
+    previous = current;
+    if (result === -1) {
+      const last = StringPrototypeSlice(p, pos);
+      current += last;
+      base = previous + last;
+      pos = p.length;
+    } else {
+      current += StringPrototypeSlice(p, pos, result + 1);
+      base = previous + StringPrototypeSlice(p, pos, result);
+      pos = result + 1;
+    }
+
+    // Continue if not a symlink, break if a pipe/socket
+    if (knownHard.has(base)) {
+      if (isFileType(statValues, S_IFIFO) ||
+          isFileType(statValues, S_IFSOCK)) {
+        return callback(null, encodeRealpathResult(p, options));
+      }
+      return process.nextTick(LOOP);
+    }
+
+    return fs.lstat(base, { bigint: true }, gotStat);
+  }
+
+  function gotStat(err, stats) {
+    if (err) return callback(err);
+
+    // If not a symlink, skip to the next path part
+    if (!stats.isSymbolicLink()) {
+      knownHard.add(base);
+      return process.nextTick(LOOP);
+    }
+
+    // Stat & read the link if not read before.
+    // Call `gotTarget()` as soon as the link target is known.
+    // `dev`/`ino` always return 0 on windows, so skip the check.
+    let id;
+    if (!isWindows) {
+      const dev = BigIntPrototypeToString(stats.dev, 32);
+      const ino = BigIntPrototypeToString(stats.ino, 32);
+      id = `${dev}:${ino}`;
+      if (seenLinks.has(id)) {
+        return gotTarget(null, seenLinks.get(id));
+      }
+    }
+    fs.stat(base, (err) => {
+      if (err) return callback(err);
+
+      fs.readlink(base, (err, target) => {
+        if (!isWindows) seenLinks.set(id, target);
+        gotTarget(err, target);
+      });
+    });
+  }
+
+  function gotTarget(err, target) {
+    if (err) return callback(err);
+
+    gotResolvedLink(pathModule.resolve(previous, target));
+  }
+
+  function gotResolvedLink(resolvedLink) {
+    // Resolve the link, then start over
+    p = pathModule.resolve(resolvedLink, StringPrototypeSlice(p, pos));
+    current = base = splitRoot(p);
+    pos = current.length;
+
+    // On windows, check that the root exists. On unix there is no need.
+    if (isWindows && !knownHard.has(base)) {
+      fs.lstat(base, (err) => {
+        if (err) return callback(err);
+        knownHard.add(base);
+        LOOP();
+      });
+    } else {
+      process.nextTick(LOOP);
+    }
+  }
+}
+
+/**
+ * Asynchronously computes the canonical pathname by
+ * resolving `.`, `..` and symbolic links.
+ * @param {string | Buffer | URL} path
+ * @param {string | { encoding?: string; }} [options]
+ * @param {(
+ *   err?: Error,
+ *   resolvedPath?: string | Buffer
+ *   ) => any} callback
+ * @returns {void}
+ */
+realpath.native = (path, options, callback) => {
+  callback = makeCallback(callback || options);
+  options = getOptions(options);
+  path = getValidatedPath(path);
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  return binding.realpath(pathModule.toNamespacedPath(path), options.encoding, req);
+};
+
+/**
+ * Creates a unique temporary directory.
+ * @param {string | Buffer | URL} prefix
+ * @param {string | { encoding?: string; }} [options]
+ * @param {(
+ *   err?: Error,
+ *   directory?: string
+ *   ) => any} callback
+ * @returns {void}
+ */
+function mkdtemp(prefix, options, callback) {
+  callback = makeCallback(typeof options === 'function' ? options : callback);
+  options = getOptions(options);
+
+  prefix = getValidatedPath(prefix, 'prefix');
+  warnOnNonPortableTemplate(prefix);
+
+  let path;
+  if (typeof prefix === 'string') {
+    path = `${prefix}XXXXXX`;
+  } else {
+    path = Buffer.concat([prefix, Buffer.from('XXXXXX')]);
+  }
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.mkdtemp(path, options.encoding, req);
+}
+
+/**
+ * Synchronously creates a unique temporary directory.
+ * @param {string | Buffer | URL} prefix
+ * @param {string | { encoding?: string; }} [options]
+ * @returns {string}
+ */
+function mkdtempSync(prefix, options) {
+  options = getOptions(options);
+
+  prefix = getValidatedPath(prefix, 'prefix');
+  warnOnNonPortableTemplate(prefix);
+
+  let path;
+  if (typeof prefix === 'string') {
+    path = `${prefix}XXXXXX`;
+  } else {
+    path = Buffer.concat([prefix, Buffer.from('XXXXXX')]);
+  }
+
+  return binding.mkdtemp(path, options.encoding);
+}
+
+/**
+ * Asynchronously copies `src` to `dest`. By
+ * default, `dest` is overwritten if it already exists.
+ * @param {string | Buffer | URL} src
+ * @param {string | Buffer | URL} dest
+ * @param {number} [mode]
+ * @param {() => any} callback
+ * @returns {void}
+ */
+function copyFile(src, dest, mode, callback) {
+  if (typeof mode === 'function') {
+    callback = mode;
+    mode = 0;
+  }
+
+  src = getValidatedPath(src, 'src');
+  dest = getValidatedPath(dest, 'dest');
+
+  src = pathModule._makeLong(src);
+  dest = pathModule._makeLong(dest);
+  mode = getValidMode(mode, 'copyFile');
+  callback = makeCallback(callback);
+
+  const req = new FSReqCallback();
+  req.oncomplete = callback;
+  binding.copyFile(src, dest, mode, req);
+}
+
+/**
+ * Synchronously copies `src` to `dest`. By
+ * default, `dest` is overwritten if it already exists.
+ * @param {string | Buffer | URL} src
+ * @param {string | Buffer | URL} dest
+ * @param {number} [mode]
+ * @returns {void}
+ */
+function copyFileSync(src, dest, mode) {
+  src = getValidatedPath(src, 'src');
+  dest = getValidatedPath(dest, 'dest');
+
+  binding.copyFile(
+    pathModule.toNamespacedPath(src),
+    pathModule.toNamespacedPath(dest),
+    getValidMode(mode, 'copyFile'),
+  );
+}
+
+/**
+ * Asynchronously copies `src` to `dest`. `src` can be a file, directory, or
+ * symlink. The contents of directories will be copied recursively.
+ * @param {string | URL} src
+ * @param {string | URL} dest
+ * @param {object} [options]
+ * @param {() => any} callback
+ * @returns {void}
+ */
+function cp(src, dest, options, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = undefined;
+  }
+  callback = makeCallback(callback);
+  options = validateCpOptions(options);
+  src = pathModule.toNamespacedPath(getValidatedPath(src, 'src'));
+  dest = pathModule.toNamespacedPath(getValidatedPath(dest, 'dest'));
+  lazyLoadCp();
+  cpFn(src, dest, options, callback);
+}
+
+/**
+ * Synchronously copies `src` to `dest`. `src` can be a file, directory, or
+ * symlink. The contents of directories will be copied recursively.
+ * @param {string | URL} src
+ * @param {string | URL} dest
+ * @param {object} [options]
+ * @returns {void}
+ */
+function cpSync(src, dest, options) {
+  options = validateCpOptions(options);
+  src = pathModule.toNamespacedPath(getValidatedPath(src, 'src'));
+  dest = pathModule.toNamespacedPath(getValidatedPath(dest, 'dest'));
+  lazyLoadCp();
+  cpSyncFn(src, dest, options);
+}
+
+function lazyLoadStreams() {
+  if (!ReadStream) {
+    ({ ReadStream, WriteStream } = require('internal/fs/streams'));
+    FileReadStream = ReadStream;
+    FileWriteStream = WriteStream;
+  }
+}
+
+/**
+ * Creates a readable stream with a default `highWaterMark`
+ * of 64 KiB.
+ * @param {string | Buffer | URL} path
+ * @param {string | {
+ *   flags?: string;
+ *   encoding?: string;
+ *   fd?: number | FileHandle;
+ *   mode?: number;
+ *   autoClose?: boolean;
+ *   emitClose?: boolean;
+ *   start: number;
+ *   end?: number;
+ *   highWaterMark?: number;
+ *   fs?: object | null;
+ *   }} [options]
+ * @returns {ReadStream}
+ */
+function createReadStream(path, options) {
+  lazyLoadStreams();
+  return new ReadStream(path, options);
+}
+
+/**
+ * Creates a write stream.
+ * @param {string | Buffer | URL} path
+ * @param {string | {
+ *   flags?: string;
+ *   encoding?: string;
+ *   fd?: number | FileHandle;
+ *   mode?: number;
+ *   autoClose?: boolean;
+ *   emitClose?: boolean;
+ *   start: number;
+ *   fs?: object | null;
+ *   flush?: boolean;
+ *   }} [options]
+ * @returns {WriteStream}
+ */
+function createWriteStream(path, options) {
+  lazyLoadStreams();
+  return new WriteStream(path, options);
+}
+
+module.exports = fs = {
+  appendFile,
+  appendFileSync,
+  access,
+  accessSync,
+  chown,
+  chownSync,
+  chmod,
+  chmodSync,
+  close,
+  closeSync,
+  copyFile,
+  copyFileSync,
+  cp,
+  cpSync,
+  createReadStream,
+  createWriteStream,
+  exists,
+  existsSync,
+  fchown,
+  fchownSync,
+  fchmod,
+  fchmodSync,
+  fdatasync,
+  fdatasyncSync,
+  fstat,
+  fstatSync,
+  fsync,
+  fsyncSync,
+  ftruncate,
+  ftruncateSync,
+  futimes,
+  futimesSync,
+  lchown,
+  lchownSync,
+  lchmod: constants.O_SYMLINK !== undefined ? lchmod : undefined,
+  lchmodSync: constants.O_SYMLINK !== undefined ? lchmodSync : undefined,
+  link,
+  linkSync,
+  lstat,
+  lstatSync,
+  lutimes,
+  lutimesSync,
+  mkdir,
+  mkdirSync,
+  mkdtemp,
+  mkdtempSync,
+  open,
+  openSync,
+  openAsBlob,
+  readdir,
+  readdirSync,
+  read,
+  readSync,
+  readv,
+  readvSync,
+  readFile,
+  readFileSync,
+  readlink,
+  readlinkSync,
+  realpath,
+  realpathSync,
+  rename,
+  renameSync,
+  rm,
+  rmSync,
+  rmdir,
+  rmdirSync,
+  stat,
+  statfs,
+  statSync,
+  statfsSync,
+  symlink,
+  symlinkSync,
+  truncate,
+  truncateSync,
+  unwatchFile,
+  unlink,
+  unlinkSync,
+  utimes,
+  utimesSync,
+  watch,
+  watchFile,
+  writeFile,
+  writeFileSync,
+  write,
+  writeSync,
+  writev,
+  writevSync,
+  Dirent,
+  Stats,
+
+  get ReadStream() {
+    lazyLoadStreams();
+    return ReadStream;
+  },
+
+  set ReadStream(val) {
+    ReadStream = val;
+  },
+
+  get WriteStream() {
+    lazyLoadStreams();
+    return WriteStream;
+  },
+
+  set WriteStream(val) {
+    WriteStream = val;
+  },
+
+  // Legacy names... these have to be separate because of how graceful-fs
+  // (and possibly other) modules monkey patch the values.
+  get FileReadStream() {
+    lazyLoadStreams();
+    return FileReadStream;
+  },
+
+  set FileReadStream(val) {
+    FileReadStream = val;
+  },
+
+  get FileWriteStream() {
+    lazyLoadStreams();
+    return FileWriteStream;
+  },
+
+  set FileWriteStream(val) {
+    FileWriteStream = val;
+  },
+
+  // For tests
+  _toUnixTimestamp: toUnixTimestamp,
+};
+
+defineLazyProperties(
+  fs,
+  'internal/fs/dir',
+  ['Dir', 'opendir', 'opendirSync'],
+);
+
+ObjectDefineProperties(fs, {
+  F_OK: { __proto__: null, enumerable: true, value: F_OK || 0 },
+  R_OK: { __proto__: null, enumerable: true, value: R_OK || 0 },
+  W_OK: { __proto__: null, enumerable: true, value: W_OK || 0 },
+  X_OK: { __proto__: null, enumerable: true, value: X_OK || 0 },
+  constants: {
+    __proto__: null,
+    configurable: false,
+    enumerable: true,
+    value: constants,
+  },
+  promises: {
+    __proto__: null,
+    configurable: true,
+    enumerable: true,
+    get() {
+      promises ??= require('internal/fs/promises').exports;
+      return promises;
+    },
+  },
+});
+});
+
+// ---- lib/internal/fs/utils.js (Node v20.10.0) -----------------------------------------------------
+defineModule("internal/fs/utils", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+const {
+  ArrayIsArray,
+  BigInt,
+  Date,
+  DateNow,
+  DatePrototypeGetTime,
+  ErrorCaptureStackTrace,
+  FunctionPrototypeCall,
+  Number,
+  NumberIsFinite,
+  MathMin,
+  MathRound,
+  ObjectIs,
+  ObjectSetPrototypeOf,
+  ReflectApply,
+  ReflectOwnKeys,
+  RegExpPrototypeSymbolReplace,
+  StringPrototypeEndsWith,
+  StringPrototypeIncludes,
+  Symbol,
+  TypedArrayPrototypeAt,
+  TypedArrayPrototypeIncludes,
+  uncurryThis,
+} = primordials;
+
+const permission = require('internal/process/permission');
+
+const { Buffer } = require('buffer');
+const {
+  codes: {
+    ERR_FS_EISDIR,
+    ERR_FS_INVALID_SYMLINK_TYPE,
+    ERR_INCOMPATIBLE_OPTION_PAIR,
+    ERR_INVALID_ARG_TYPE,
+    ERR_INVALID_ARG_VALUE,
+    ERR_OUT_OF_RANGE,
+  },
+  hideStackFrames,
+  uvException,
+} = require('internal/errors');
+const {
+  isArrayBufferView,
+  isBigInt64Array,
+  isDate,
+  isUint8Array,
+} = require('internal/util/types');
+const {
+  kEmptyObject,
+  once,
+} = require('internal/util');
+const { toPathIfFileURL } = require('internal/url');
+const {
+  validateAbortSignal,
+  validateBoolean,
+  validateFunction,
+  validateInt32,
+  validateInteger,
+  validateObject,
+  validateUint32,
+} = require('internal/validators');
+const pathModule = require('path');
+const kType = Symbol('type');
+const kStats = Symbol('stats');
+const assert = require('internal/assert');
+
+const {
+  fs: {
+    F_OK = 0,
+    W_OK = 0,
+    R_OK = 0,
+    X_OK = 0,
+    COPYFILE_EXCL,
+    COPYFILE_FICLONE,
+    COPYFILE_FICLONE_FORCE,
+    O_APPEND,
+    O_CREAT,
+    O_EXCL,
+    O_RDONLY,
+    O_RDWR,
+    O_SYNC,
+    O_TRUNC,
+    O_WRONLY,
+    S_IFBLK,
+    S_IFCHR,
+    S_IFDIR,
+    S_IFIFO,
+    S_IFLNK,
+    S_IFMT,
+    S_IFREG,
+    S_IFSOCK,
+    UV_FS_SYMLINK_DIR,
+    UV_FS_SYMLINK_JUNCTION,
+    UV_DIRENT_UNKNOWN,
+    UV_DIRENT_FILE,
+    UV_DIRENT_DIR,
+    UV_DIRENT_LINK,
+    UV_DIRENT_FIFO,
+    UV_DIRENT_SOCKET,
+    UV_DIRENT_CHAR,
+    UV_DIRENT_BLOCK,
+  },
+  os: {
+    errno: {
+      EISDIR,
+    },
+  },
+} = internalBinding('constants');
+
+// The access modes can be any of F_OK, R_OK, W_OK or X_OK. Some might not be
+// available on specific systems. They can be used in combination as well
+// (F_OK | R_OK | W_OK | X_OK).
+const kMinimumAccessMode = MathMin(F_OK, W_OK, R_OK, X_OK);
+const kMaximumAccessMode = F_OK | W_OK | R_OK | X_OK;
+
+const kDefaultCopyMode = 0;
+// The copy modes can be any of COPYFILE_EXCL, COPYFILE_FICLONE or
+// COPYFILE_FICLONE_FORCE. They can be used in combination as well
+// (COPYFILE_EXCL | COPYFILE_FICLONE | COPYFILE_FICLONE_FORCE).
+const kMinimumCopyMode = MathMin(
+  kDefaultCopyMode,
+  COPYFILE_EXCL,
+  COPYFILE_FICLONE,
+  COPYFILE_FICLONE_FORCE,
+);
+const kMaximumCopyMode = COPYFILE_EXCL |
+                         COPYFILE_FICLONE |
+                         COPYFILE_FICLONE_FORCE;
+
+// Most platforms don't allow reads or writes >= 2 GiB.
+// See https://github.com/libuv/libuv/pull/1501.
+const kIoMaxLength = 2 ** 31 - 1;
+
+// Use 64kb in case the file type is not a regular file and thus do not know the
+// actual file size. Increasing the value further results in more frequent over
+// allocation for small files and consumes CPU time and memory that should be
+// used else wise.
+// Use up to 512kb per read otherwise to partition reading big files to prevent
+// blocking other threads in case the available threads are all in use.
+const kReadFileUnknownBufferLength = 64 * 1024;
+const kReadFileBufferLength = 512 * 1024;
+
+const kWriteFileMaxChunkSize = 512 * 1024;
+
+const kMaxUserId = 2 ** 32 - 1;
+
+const isWindows = process.platform === 'win32';
+
+let fs;
+function lazyLoadFs() {
+  if (!fs) {
+    fs = require('fs');
+  }
+  return fs;
+}
+
+function assertEncoding(encoding) {
+  if (encoding && !Buffer.isEncoding(encoding)) {
+    const reason = 'is invalid encoding';
+    throw new ERR_INVALID_ARG_VALUE(encoding, 'encoding', reason);
+  }
+}
+
+class Dirent {
+  constructor(name, type, path) {
+    this.name = name;
+    this.path = path;
+    this[kType] = type;
+  }
+
+  isDirectory() {
+    return this[kType] === UV_DIRENT_DIR;
+  }
+
+  isFile() {
+    return this[kType] === UV_DIRENT_FILE;
+  }
+
+  isBlockDevice() {
+    return this[kType] === UV_DIRENT_BLOCK;
+  }
+
+  isCharacterDevice() {
+    return this[kType] === UV_DIRENT_CHAR;
+  }
+
+  isSymbolicLink() {
+    return this[kType] === UV_DIRENT_LINK;
+  }
+
+  isFIFO() {
+    return this[kType] === UV_DIRENT_FIFO;
+  }
+
+  isSocket() {
+    return this[kType] === UV_DIRENT_SOCKET;
+  }
+}
+
+class DirentFromStats extends Dirent {
+  constructor(name, stats, path) {
+    super(name, null, path);
+    this[kStats] = stats;
+  }
+}
+
+for (const name of ReflectOwnKeys(Dirent.prototype)) {
+  if (name === 'constructor') {
+    continue;
+  }
+  DirentFromStats.prototype[name] = function() {
+    return this[kStats][name]();
+  };
+}
+
+function copyObject(source) {
+  const target = {};
+  for (const key in source)
+    target[key] = source[key];
+  return target;
+}
+
+const bufferSep = Buffer.from(pathModule.sep);
+
+function join(path, name) {
+  if ((typeof path === 'string' || isUint8Array(path)) &&
+      name === undefined) {
+    return path;
+  }
+
+  if (typeof path === 'string' && isUint8Array(name)) {
+    const pathBuffer = Buffer.from(pathModule.join(path, pathModule.sep));
+    return Buffer.concat([pathBuffer, name]);
+  }
+
+  if (typeof path === 'string' && typeof name === 'string') {
+    return pathModule.join(path, name);
+  }
+
+  if (isUint8Array(path) && isUint8Array(name)) {
+    return Buffer.concat([path, bufferSep, name]);
+  }
+
+  throw new ERR_INVALID_ARG_TYPE(
+    'path', ['string', 'Buffer'], path);
+}
+
+function getDirents(path, { 0: names, 1: types }, callback) {
+  let i;
+  if (typeof callback === 'function') {
+    const len = names.length;
+    let toFinish = 0;
+    callback = once(callback);
+    for (i = 0; i < len; i++) {
+      const type = types[i];
+      if (type === UV_DIRENT_UNKNOWN) {
+        const name = names[i];
+        const idx = i;
+        toFinish++;
+        let filepath;
+        try {
+          filepath = join(path, name);
+        } catch (err) {
+          callback(err);
+          return;
+        }
+        lazyLoadFs().lstat(filepath, (err, stats) => {
+          if (err) {
+            callback(err);
+            return;
+          }
+          names[idx] = new DirentFromStats(name, stats, path);
+          if (--toFinish === 0) {
+            callback(null, names);
+          }
+        });
+      } else {
+        names[i] = new Dirent(names[i], types[i], path);
+      }
+    }
+    if (toFinish === 0) {
+      callback(null, names);
+    }
+  } else {
+    const len = names.length;
+    for (i = 0; i < len; i++) {
+      names[i] = getDirent(path, names[i], types[i]);
+    }
+    return names;
+  }
+}
+
+function getDirent(path, name, type, callback) {
+  if (typeof callback === 'function') {
+    if (type === UV_DIRENT_UNKNOWN) {
+      let filepath;
+      try {
+        filepath = join(path, name);
+      } catch (err) {
+        callback(err);
+        return;
+      }
+      lazyLoadFs().lstat(filepath, (err, stats) => {
+        if (err) {
+          callback(err);
+          return;
+        }
+        callback(null, new DirentFromStats(name, stats, filepath));
+      });
+    } else {
+      callback(null, new Dirent(name, type, path));
+    }
+  } else if (type === UV_DIRENT_UNKNOWN) {
+    const filepath = join(path, name);
+    const stats = lazyLoadFs().lstatSync(filepath);
+    return new DirentFromStats(name, stats, path);
+  } else {
+    return new Dirent(name, type, path);
+  }
+}
+
+function getOptions(options, defaultOptions = kEmptyObject) {
+  if (options == null || typeof options === 'function') {
+    return defaultOptions;
+  }
+
+  if (typeof options === 'string') {
+    defaultOptions = { ...defaultOptions };
+    defaultOptions.encoding = options;
+    options = defaultOptions;
+  } else if (typeof options !== 'object') {
+    throw new ERR_INVALID_ARG_TYPE('options', ['string', 'Object'], options);
+  }
+
+  if (options.encoding !== 'buffer')
+    assertEncoding(options.encoding);
+
+  if (options.signal !== undefined) {
+    validateAbortSignal(options.signal, 'options.signal');
+  }
+
+  return options;
+}
+
+/**
+ * @param {InternalFSBinding.FSSyncContext} ctx
+ */
+function handleErrorFromBinding(ctx) {
+  if (ctx.errno !== undefined) {  // libuv error numbers
+    const err = uvException(ctx);
+    ErrorCaptureStackTrace(err, handleErrorFromBinding);
+    throw err;
+  }
+  if (ctx.error !== undefined) {  // Errors created in C++ land.
+    // TODO(joyeecheung): currently, ctx.error are encoding errors
+    // usually caused by memory problems. We need to figure out proper error
+    // code(s) for this.
+    ErrorCaptureStackTrace(ctx.error, handleErrorFromBinding);
+    throw ctx.error;
+  }
+}
+
+// Check if the path contains null types if it is a string nor Uint8Array,
+// otherwise return silently.
+const nullCheck = hideStackFrames((path, propName, throwError = true) => {
+  const pathIsString = typeof path === 'string';
+  const pathIsUint8Array = isUint8Array(path);
+
+  // We can only perform meaningful checks on strings and Uint8Arrays.
+  if ((!pathIsString && !pathIsUint8Array) ||
+      (pathIsString && !StringPrototypeIncludes(path, '\u0000')) ||
+      (pathIsUint8Array && !TypedArrayPrototypeIncludes(path, 0))) {
+    return;
+  }
+
+  const err = new ERR_INVALID_ARG_VALUE(
+    propName,
+    path,
+    'must be a string, Uint8Array, or URL without null bytes',
+  );
+  if (throwError) {
+    throw err;
+  }
+  return err;
+});
+
+function preprocessSymlinkDestination(path, type, linkPath) {
+  if (!isWindows) {
+    // No preprocessing is needed on Unix.
+    return path;
+  }
+  path = '' + path;
+  if (type === 'junction') {
+    // Junctions paths need to be absolute and \\?\-prefixed.
+    // A relative target is relative to the link's parent directory.
+    path = pathModule.resolve(linkPath, '..', path);
+    return pathModule.toNamespacedPath(path);
+  }
+  if (pathModule.isAbsolute(path)) {
+    // If the path is absolute, use the \\?\-prefix to enable long filenames
+    return pathModule.toNamespacedPath(path);
+  }
+  // Windows symlinks don't tolerate forward slashes.
+  return RegExpPrototypeSymbolReplace(/\//g, path, '\\');
+}
+
+// Constructor for file stats.
+function StatsBase(dev, mode, nlink, uid, gid, rdev, blksize,
+                   ino, size, blocks) {
+  this.dev = dev;
+  this.mode = mode;
+  this.nlink = nlink;
+  this.uid = uid;
+  this.gid = gid;
+  this.rdev = rdev;
+  this.blksize = blksize;
+  this.ino = ino;
+  this.size = size;
+  this.blocks = blocks;
+}
+
+StatsBase.prototype.isDirectory = function() {
+  return this._checkModeProperty(S_IFDIR);
+};
+
+StatsBase.prototype.isFile = function() {
+  return this._checkModeProperty(S_IFREG);
+};
+
+StatsBase.prototype.isBlockDevice = function() {
+  return this._checkModeProperty(S_IFBLK);
+};
+
+StatsBase.prototype.isCharacterDevice = function() {
+  return this._checkModeProperty(S_IFCHR);
+};
+
+StatsBase.prototype.isSymbolicLink = function() {
+  return this._checkModeProperty(S_IFLNK);
+};
+
+StatsBase.prototype.isFIFO = function() {
+  return this._checkModeProperty(S_IFIFO);
+};
+
+StatsBase.prototype.isSocket = function() {
+  return this._checkModeProperty(S_IFSOCK);
+};
+
+const kNsPerMsBigInt = 10n ** 6n;
+const kNsPerSecBigInt = 10n ** 9n;
+const kMsPerSec = 10 ** 3;
+const kNsPerMs = 10 ** 6;
+function msFromTimeSpec(sec, nsec) {
+  return sec * kMsPerSec + nsec / kNsPerMs;
+}
+
+function nsFromTimeSpecBigInt(sec, nsec) {
+  return sec * kNsPerSecBigInt + nsec;
+}
+
+// The Date constructor performs Math.floor() on the absolute value
+// of the timestamp: https://tc39.es/ecma262/#sec-timeclip
+// Since there may be a precision loss when the timestamp is
+// converted to a floating point number, we manually round
+// the timestamp here before passing it to Date().
+// Refs: https://github.com/nodejs/node/pull/12607
+// Refs: https://github.com/nodejs/node/pull/43714
+function dateFromMs(ms) {
+  // Coercing to number, ms can be bigint
+  return new Date(MathRound(Number(ms)));
+}
+
+function BigIntStats(dev, mode, nlink, uid, gid, rdev, blksize,
+                     ino, size, blocks,
+                     atimeNs, mtimeNs, ctimeNs, birthtimeNs) {
+  ReflectApply(StatsBase, this, [dev, mode, nlink, uid, gid, rdev, blksize,
+                                 ino, size, blocks]);
+
+  this.atimeMs = atimeNs / kNsPerMsBigInt;
+  this.mtimeMs = mtimeNs / kNsPerMsBigInt;
+  this.ctimeMs = ctimeNs / kNsPerMsBigInt;
+  this.birthtimeMs = birthtimeNs / kNsPerMsBigInt;
+  this.atimeNs = atimeNs;
+  this.mtimeNs = mtimeNs;
+  this.ctimeNs = ctimeNs;
+  this.birthtimeNs = birthtimeNs;
+  this.atime = dateFromMs(this.atimeMs);
+  this.mtime = dateFromMs(this.mtimeMs);
+  this.ctime = dateFromMs(this.ctimeMs);
+  this.birthtime = dateFromMs(this.birthtimeMs);
+}
+
+ObjectSetPrototypeOf(BigIntStats.prototype, StatsBase.prototype);
+ObjectSetPrototypeOf(BigIntStats, StatsBase);
+
+BigIntStats.prototype._checkModeProperty = function(property) {
+  if (isWindows && (property === S_IFIFO || property === S_IFBLK ||
+    property === S_IFSOCK)) {
+    return false;  // Some types are not available on Windows
+  }
+  return (this.mode & BigInt(S_IFMT)) === BigInt(property);
+};
+
+function Stats(dev, mode, nlink, uid, gid, rdev, blksize,
+               ino, size, blocks,
+               atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+  FunctionPrototypeCall(StatsBase, this, dev, mode, nlink, uid, gid, rdev,
+                        blksize, ino, size, blocks);
+  this.atimeMs = atimeMs;
+  this.mtimeMs = mtimeMs;
+  this.ctimeMs = ctimeMs;
+  this.birthtimeMs = birthtimeMs;
+  this.atime = dateFromMs(atimeMs);
+  this.mtime = dateFromMs(mtimeMs);
+  this.ctime = dateFromMs(ctimeMs);
+  this.birthtime = dateFromMs(birthtimeMs);
+}
+
+ObjectSetPrototypeOf(Stats.prototype, StatsBase.prototype);
+ObjectSetPrototypeOf(Stats, StatsBase);
+
+// HACK: Workaround for https://github.com/standard-things/esm/issues/821.
+// TODO(ronag): Remove this as soon as `esm` publishes a fixed version.
+Stats.prototype.isFile = StatsBase.prototype.isFile;
+
+Stats.prototype._checkModeProperty = function(property) {
+  if (isWindows && (property === S_IFIFO || property === S_IFBLK ||
+    property === S_IFSOCK)) {
+    return false;  // Some types are not available on Windows
+  }
+  return (this.mode & S_IFMT) === property;
+};
+
+/**
+ * @param {Float64Array | BigInt64Array} stats
+ * @param {number} offset
+ * @returns {BigIntStats | Stats}
+ */
+function getStatsFromBinding(stats, offset = 0) {
+  if (isBigInt64Array(stats)) {
+    return new BigIntStats(
+      stats[0 + offset], stats[1 + offset], stats[2 + offset],
+      stats[3 + offset], stats[4 + offset], stats[5 + offset],
+      stats[6 + offset], stats[7 + offset], stats[8 + offset],
+      stats[9 + offset],
+      nsFromTimeSpecBigInt(stats[10 + offset], stats[11 + offset]),
+      nsFromTimeSpecBigInt(stats[12 + offset], stats[13 + offset]),
+      nsFromTimeSpecBigInt(stats[14 + offset], stats[15 + offset]),
+      nsFromTimeSpecBigInt(stats[16 + offset], stats[17 + offset]),
+    );
+  }
+  return new Stats(
+    stats[0 + offset], stats[1 + offset], stats[2 + offset],
+    stats[3 + offset], stats[4 + offset], stats[5 + offset],
+    stats[6 + offset], stats[7 + offset], stats[8 + offset],
+    stats[9 + offset],
+    msFromTimeSpec(stats[10 + offset], stats[11 + offset]),
+    msFromTimeSpec(stats[12 + offset], stats[13 + offset]),
+    msFromTimeSpec(stats[14 + offset], stats[15 + offset]),
+    msFromTimeSpec(stats[16 + offset], stats[17 + offset]),
+  );
+}
+
+class StatFs {
+  constructor(type, bsize, blocks, bfree, bavail, files, ffree) {
+    this.type = type;
+    this.bsize = bsize;
+    this.blocks = blocks;
+    this.bfree = bfree;
+    this.bavail = bavail;
+    this.files = files;
+    this.ffree = ffree;
+  }
+}
+
+function getStatFsFromBinding(stats) {
+  return new StatFs(
+    stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6],
+  );
+}
+
+function stringToFlags(flags, name = 'flags') {
+  if (typeof flags === 'number') {
+    validateInt32(flags, name);
+    return flags;
+  }
+
+  if (flags == null) {
+    return O_RDONLY;
+  }
+
+  switch (flags) {
+    case 'r' : return O_RDONLY;
+    case 'rs' : // Fall through.
+    case 'sr' : return O_RDONLY | O_SYNC;
+    case 'r+' : return O_RDWR;
+    case 'rs+' : // Fall through.
+    case 'sr+' : return O_RDWR | O_SYNC;
+
+    case 'w' : return O_TRUNC | O_CREAT | O_WRONLY;
+    case 'wx' : // Fall through.
+    case 'xw' : return O_TRUNC | O_CREAT | O_WRONLY | O_EXCL;
+
+    case 'w+' : return O_TRUNC | O_CREAT | O_RDWR;
+    case 'wx+': // Fall through.
+    case 'xw+': return O_TRUNC | O_CREAT | O_RDWR | O_EXCL;
+
+    case 'a' : return O_APPEND | O_CREAT | O_WRONLY;
+    case 'ax' : // Fall through.
+    case 'xa' : return O_APPEND | O_CREAT | O_WRONLY | O_EXCL;
+    case 'as' : // Fall through.
+    case 'sa' : return O_APPEND | O_CREAT | O_WRONLY | O_SYNC;
+
+    case 'a+' : return O_APPEND | O_CREAT | O_RDWR;
+    case 'ax+': // Fall through.
+    case 'xa+': return O_APPEND | O_CREAT | O_RDWR | O_EXCL;
+    case 'as+': // Fall through.
+    case 'sa+': return O_APPEND | O_CREAT | O_RDWR | O_SYNC;
+  }
+
+  throw new ERR_INVALID_ARG_VALUE('flags', flags);
+}
+
+const stringToSymlinkType = hideStackFrames((type) => {
+  let flags = 0;
+  if (typeof type === 'string') {
+    switch (type) {
+      case 'dir':
+        flags |= UV_FS_SYMLINK_DIR;
+        break;
+      case 'junction':
+        flags |= UV_FS_SYMLINK_JUNCTION;
+        break;
+      case 'file':
+        break;
+      default:
+        throw new ERR_FS_INVALID_SYMLINK_TYPE(type);
+    }
+  }
+  return flags;
+});
+
+// converts Date or number to a fractional UNIX timestamp
+function toUnixTimestamp(time, name = 'time') {
+  // eslint-disable-next-line eqeqeq
+  if (typeof time === 'string' && +time == time) {
+    return +time;
+  }
+  if (NumberIsFinite(time)) {
+    if (time < 0) {
+      return DateNow() / 1000;
+    }
+    return time;
+  }
+  if (isDate(time)) {
+    // Convert to 123.456 UNIX timestamp
+    return DatePrototypeGetTime(time) / 1000;
+  }
+  throw new ERR_INVALID_ARG_TYPE(name, ['Date', 'Time in seconds'], time);
+}
+
+const validateOffsetLengthRead = hideStackFrames(
+  (offset, length, bufferLength) => {
+    if (offset < 0) {
+      throw new ERR_OUT_OF_RANGE('offset', '>= 0', offset);
+    }
+    if (length < 0) {
+      throw new ERR_OUT_OF_RANGE('length', '>= 0', length);
+    }
+    if (offset + length > bufferLength) {
+      throw new ERR_OUT_OF_RANGE('length',
+                                 `<= ${bufferLength - offset}`, length);
+    }
+  },
+);
+
+const validateOffsetLengthWrite = hideStackFrames(
+  (offset, length, byteLength) => {
+    if (offset > byteLength) {
+      throw new ERR_OUT_OF_RANGE('offset', `<= ${byteLength}`, offset);
+    }
+
+    if (length > byteLength - offset) {
+      throw new ERR_OUT_OF_RANGE('length', `<= ${byteLength - offset}`, length);
+    }
+
+    if (length < 0) {
+      throw new ERR_OUT_OF_RANGE('length', '>= 0', length);
+    }
+
+    validateInt32(length, 'length', 0);
+  },
+);
+
+const validatePath = hideStackFrames((path, propName = 'path') => {
+  if (typeof path !== 'string' && !isUint8Array(path)) {
+    throw new ERR_INVALID_ARG_TYPE(propName, ['string', 'Buffer', 'URL'], path);
+  }
+
+  const err = nullCheck(path, propName, false);
+
+  if (err !== undefined) {
+    throw err;
+  }
+});
+
+// TODO(rafaelgss): implement the path.resolve on C++ side
+// See: https://github.com/nodejs/node/pull/44004#discussion_r930958420
+// The permission model needs the absolute path for the fs_permission
+const resolvePath = pathModule.resolve;
+const { isBuffer: BufferIsBuffer, from: BufferFrom } = Buffer;
+const BufferToString = uncurryThis(Buffer.prototype.toString);
+function possiblyTransformPath(path) {
+  if (permission.isEnabled()) {
+    if (typeof path === 'string') {
+      return resolvePath(path);
+    }
+    assert(isUint8Array(path));
+    if (!BufferIsBuffer(path)) path = BufferFrom(path);
+    return BufferFrom(resolvePath(BufferToString(path)));
+  }
+  return path;
+}
+
+const getValidatedPath = hideStackFrames((fileURLOrPath, propName = 'path') => {
+  const path = toPathIfFileURL(fileURLOrPath);
+  validatePath(path, propName);
+  return possiblyTransformPath(path);
+});
+
+const getValidatedFd = hideStackFrames((fd, propName = 'fd') => {
+  if (ObjectIs(fd, -0)) {
+    return 0;
+  }
+
+  validateInt32(fd, propName, 0);
+
+  return fd;
+});
+
+const validateBufferArray = hideStackFrames((buffers, propName = 'buffers') => {
+  if (!ArrayIsArray(buffers))
+    throw new ERR_INVALID_ARG_TYPE(propName, 'ArrayBufferView[]', buffers);
+
+  for (let i = 0; i < buffers.length; i++) {
+    if (!isArrayBufferView(buffers[i]))
+      throw new ERR_INVALID_ARG_TYPE(propName, 'ArrayBufferView[]', buffers);
+  }
+
+  return buffers;
+});
+
+let nonPortableTemplateWarn = true;
+
+function warnOnNonPortableTemplate(template) {
+  // Template strings passed to the mkdtemp() family of functions should not
+  // end with 'X' because they are handled inconsistently across platforms.
+  if (nonPortableTemplateWarn &&
+    ((typeof template === 'string' && StringPrototypeEndsWith(template, 'X')) ||
+    (typeof template !== 'string' && TypedArrayPrototypeAt(template, -1) === 0x58))) {
+    process.emitWarning('mkdtemp() templates ending with X are not portable. ' +
+                        'For details see: https://nodejs.org/api/fs.html');
+    nonPortableTemplateWarn = false;
+  }
+}
+
+const defaultCpOptions = {
+  dereference: false,
+  errorOnExist: false,
+  filter: undefined,
+  force: true,
+  preserveTimestamps: false,
+  recursive: false,
+  verbatimSymlinks: false,
+};
+
+const defaultRmOptions = {
+  recursive: false,
+  force: false,
+  retryDelay: 100,
+  maxRetries: 0,
+};
+
+const defaultRmdirOptions = {
+  retryDelay: 100,
+  maxRetries: 0,
+  recursive: false,
+};
+
+const validateCpOptions = hideStackFrames((options) => {
+  if (options === undefined)
+    return { ...defaultCpOptions };
+  validateObject(options, 'options');
+  options = { ...defaultCpOptions, ...options };
+  validateBoolean(options.dereference, 'options.dereference');
+  validateBoolean(options.errorOnExist, 'options.errorOnExist');
+  validateBoolean(options.force, 'options.force');
+  validateBoolean(options.preserveTimestamps, 'options.preserveTimestamps');
+  validateBoolean(options.recursive, 'options.recursive');
+  validateBoolean(options.verbatimSymlinks, 'options.verbatimSymlinks');
+  options.mode = getValidMode(options.mode, 'copyFile');
+  if (options.dereference === true && options.verbatimSymlinks === true) {
+    throw new ERR_INCOMPATIBLE_OPTION_PAIR('dereference', 'verbatimSymlinks');
+  }
+  if (options.filter !== undefined) {
+    validateFunction(options.filter, 'options.filter');
+  }
+  return options;
+});
+
+const validateRmOptions = hideStackFrames((path, options, expectDir, cb) => {
+  options = validateRmdirOptions(options, defaultRmOptions);
+  validateBoolean(options.force, 'options.force');
+
+  lazyLoadFs().lstat(path, (err, stats) => {
+    if (err) {
+      if (options.force && err.code === 'ENOENT') {
+        return cb(null, options);
+      }
+      return cb(err, options);
+    }
+
+    if (expectDir && !stats.isDirectory()) {
+      return cb(false);
+    }
+
+    if (stats.isDirectory() && !options.recursive) {
+      return cb(new ERR_FS_EISDIR({
+        code: 'EISDIR',
+        message: 'is a directory',
+        path,
+        syscall: 'rm',
+        errno: EISDIR,
+      }));
+    }
+    return cb(null, options);
+  });
+});
+
+const validateRmOptionsSync = hideStackFrames((path, options, expectDir) => {
+  options = validateRmdirOptions(options, defaultRmOptions);
+  validateBoolean(options.force, 'options.force');
+
+  if (!options.force || expectDir || !options.recursive) {
+    const isDirectory = lazyLoadFs()
+      .lstatSync(path, { throwIfNoEntry: !options.force })?.isDirectory();
+
+    if (expectDir && !isDirectory) {
+      return false;
+    }
+
+    if (isDirectory && !options.recursive) {
+      throw new ERR_FS_EISDIR({
+        code: 'EISDIR',
+        message: 'is a directory',
+        path,
+        syscall: 'rm',
+        errno: EISDIR,
+      });
+    }
+  }
+
+  return options;
+});
+
+let recursiveRmdirWarned = process.noDeprecation;
+function emitRecursiveRmdirWarning() {
+  if (!recursiveRmdirWarned) {
+    process.emitWarning(
+      'In future versions of Node.js, fs.rmdir(path, { recursive: true }) ' +
+      'will be removed. Use fs.rm(path, { recursive: true }) instead',
+      'DeprecationWarning',
+      'DEP0147',
+    );
+    recursiveRmdirWarned = true;
+  }
+}
+
+const validateRmdirOptions = hideStackFrames(
+  (options, defaults = defaultRmdirOptions) => {
+    if (options === undefined)
+      return defaults;
+    validateObject(options, 'options');
+
+    options = { ...defaults, ...options };
+
+    validateBoolean(options.recursive, 'options.recursive');
+    validateInt32(options.retryDelay, 'options.retryDelay', 0);
+    validateUint32(options.maxRetries, 'options.maxRetries');
+
+    return options;
+  });
+
+const getValidMode = hideStackFrames((mode, type) => {
+  let min = kMinimumAccessMode;
+  let max = kMaximumAccessMode;
+  let def = F_OK;
+  if (type === 'copyFile') {
+    min = kMinimumCopyMode;
+    max = kMaximumCopyMode;
+    def = mode || kDefaultCopyMode;
+  } else {
+    assert(type === 'access');
+  }
+  if (mode == null) {
+    return def;
+  }
+  validateInteger(mode, 'mode', min, max);
+  return mode;
+});
+
+const validateStringAfterArrayBufferView = hideStackFrames((buffer, name) => {
+  if (typeof buffer !== 'string') {
+    throw new ERR_INVALID_ARG_TYPE(
+      name,
+      ['string', 'Buffer', 'TypedArray', 'DataView'],
+      buffer,
+    );
+  }
+});
+
+const validatePosition = hideStackFrames((position, name) => {
+  if (typeof position === 'number') {
+    validateInteger(position, name);
+  } else if (typeof position === 'bigint') {
+    if (!(position >= -(2n ** 63n) && position <= 2n ** 63n - 1n)) {
+      throw new ERR_OUT_OF_RANGE(name,
+                                 `>= ${-(2n ** 63n)} && <= ${2n ** 63n - 1n}`,
+                                 position);
+    }
+  } else {
+    throw new ERR_INVALID_ARG_TYPE(name, ['integer', 'bigint'], position);
+  }
+});
+
+module.exports = {
+  constants: {
+    kIoMaxLength,
+    kMaxUserId,
+    kReadFileBufferLength,
+    kReadFileUnknownBufferLength,
+    kWriteFileMaxChunkSize,
+  },
+  assertEncoding,
+  BigIntStats,  // for testing
+  copyObject,
+  Dirent,
+  emitRecursiveRmdirWarning,
+  getDirent,
+  getDirents,
+  getOptions,
+  getValidatedFd,
+  getValidatedPath,
+  getValidMode,
+  handleErrorFromBinding,
+  nullCheck,
+  possiblyTransformPath,
+  preprocessSymlinkDestination,
+  realpathCacheKey: Symbol('realpathCacheKey'),
+  getStatFsFromBinding,
+  getStatsFromBinding,
+  stringToFlags,
+  stringToSymlinkType,
+  Stats,
+  toUnixTimestamp,
+  validateBufferArray,
+  validateCpOptions,
+  validateOffsetLengthRead,
+  validateOffsetLengthWrite,
+  validatePath,
+  validatePosition,
+  validateRmOptions,
+  validateRmOptionsSync,
+  validateRmdirOptions,
+  validateStringAfterArrayBufferView,
+  warnOnNonPortableTemplate,
+};
+});
+
+// ---- lib/internal/fs/promises.js (Node v20.10.0) --------------------------------------------------
+defineModule("internal/fs/promises", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+const {
+  ArrayPrototypePush,
+  ArrayPrototypePop,
+  Error,
+  MathMax,
+  MathMin,
+  NumberIsSafeInteger,
+  Promise,
+  PromisePrototypeThen,
+  PromiseResolve,
+  PromiseReject,
+  SafeArrayIterator,
+  SafePromisePrototypeFinally,
+  Symbol,
+  SymbolAsyncDispose,
+  Uint8Array,
+  FunctionPrototypeBind,
+} = primordials;
+
+const { fs: constants } = internalBinding('constants');
+const {
+  F_OK,
+  O_SYMLINK,
+  O_WRONLY,
+  S_IFMT,
+  S_IFREG,
+} = constants;
+
+const binding = internalBinding('fs');
+const { Buffer } = require('buffer');
+
+const {
+  codes: {
+    ERR_FS_FILE_TOO_LARGE,
+    ERR_INVALID_ARG_VALUE,
+    ERR_INVALID_STATE,
+    ERR_METHOD_NOT_IMPLEMENTED,
+  },
+  AbortError,
+  aggregateTwoErrors,
+} = require('internal/errors');
+const { isArrayBufferView } = require('internal/util/types');
+const { rimrafPromises } = require('internal/fs/rimraf');
+const {
+  constants: {
+    kIoMaxLength,
+    kMaxUserId,
+    kReadFileBufferLength,
+    kReadFileUnknownBufferLength,
+    kWriteFileMaxChunkSize,
+  },
+  copyObject,
+  emitRecursiveRmdirWarning,
+  getDirents,
+  getOptions,
+  getStatFsFromBinding,
+  getStatsFromBinding,
+  getValidatedPath,
+  getValidMode,
+  preprocessSymlinkDestination,
+  stringToFlags,
+  stringToSymlinkType,
+  toUnixTimestamp,
+  validateBufferArray,
+  validateCpOptions,
+  validateOffsetLengthRead,
+  validateOffsetLengthWrite,
+  validateRmOptions,
+  validateRmdirOptions,
+  validateStringAfterArrayBufferView,
+  warnOnNonPortableTemplate,
+} = require('internal/fs/utils');
+const { opendir } = require('internal/fs/dir');
+const {
+  parseFileMode,
+  validateAbortSignal,
+  validateBoolean,
+  validateBuffer,
+  validateEncoding,
+  validateInteger,
+  validateObject,
+  validateString,
+  kValidateObjectAllowNullable,
+} = require('internal/validators');
+const pathModule = require('path');
+const {
+  kEmptyObject,
+  lazyDOMException,
+  promisify,
+} = require('internal/util');
+const { EventEmitterMixin } = require('internal/event_target');
+const { StringDecoder } = require('string_decoder');
+const { kFSWatchStart, watch } = require('internal/fs/watchers');
+const nonNativeWatcher = require('internal/fs/recursive_watch');
+const { isIterable } = require('internal/streams/utils');
+const assert = require('internal/assert');
+
+const kHandle = Symbol('kHandle');
+const kFd = Symbol('kFd');
+const kRefs = Symbol('kRefs');
+const kClosePromise = Symbol('kClosePromise');
+const kCloseResolve = Symbol('kCloseResolve');
+const kCloseReject = Symbol('kCloseReject');
+const kRef = Symbol('kRef');
+const kUnref = Symbol('kUnref');
+const kLocked = Symbol('kLocked');
+
+const { kUsePromises } = binding;
+// lumen: node:readline registers after node:fs, so Interface resolves on first use.
+let Interface;
+const {
+  JSTransferable, kDeserialize, kTransfer, kTransferList,
+} = require('internal/worker/js_transferable');
+
+const getDirectoryEntriesPromise = promisify(getDirents);
+const validateRmOptionsPromise = promisify(validateRmOptions);
+
+const isWindows = process.platform === 'win32';
+const isOSX = process.platform === 'darwin';
+
+let cpPromises;
+function lazyLoadCpPromises() {
+  return cpPromises ??= require('internal/fs/cp/cp').cpFn;
+}
+
+// Lazy loaded to avoid circular dependency.
+let fsStreams;
+function lazyFsStreams() {
+  return fsStreams ??= require('internal/fs/streams');
+}
+
+class FileHandle extends EventEmitterMixin(JSTransferable) {
+  /**
+   * @param {InternalFSBinding.FileHandle | undefined} filehandle
+   */
+  constructor(filehandle) {
+    super();
+    this[kHandle] = filehandle;
+    this[kFd] = filehandle ? filehandle.fd : -1;
+
+    this[kRefs] = 1;
+    this[kClosePromise] = null;
+  }
+
+  getAsyncId() {
+    return this[kHandle].getAsyncId();
+  }
+
+  get fd() {
+    return this[kFd];
+  }
+
+  appendFile(data, options) {
+    return fsCall(writeFile, this, data, options);
+  }
+
+  chmod(mode) {
+    return fsCall(fchmod, this, mode);
+  }
+
+  chown(uid, gid) {
+    return fsCall(fchown, this, uid, gid);
+  }
+
+  datasync() {
+    return fsCall(fdatasync, this);
+  }
+
+  sync() {
+    return fsCall(fsync, this);
+  }
+
+  read(buffer, offset, length, position) {
+    return fsCall(read, this, buffer, offset, length, position);
+  }
+
+  readv(buffers, position) {
+    return fsCall(readv, this, buffers, position);
+  }
+
+  readFile(options) {
+    return fsCall(readFile, this, options);
+  }
+
+  readLines(options = undefined) {
+    Interface ??= require('internal/readline/interface').Interface; // lumen: see above
+    return new Interface({
+      input: this.createReadStream(options),
+      crlfDelay: Infinity,
+    });
+  }
+
+  stat(options) {
+    return fsCall(fstat, this, options);
+  }
+
+  truncate(len = 0) {
+    return fsCall(ftruncate, this, len);
+  }
+
+  utimes(atime, mtime) {
+    return fsCall(futimes, this, atime, mtime);
+  }
+
+  write(buffer, offset, length, position) {
+    return fsCall(write, this, buffer, offset, length, position);
+  }
+
+  writev(buffers, position) {
+    return fsCall(writev, this, buffers, position);
+  }
+
+  writeFile(data, options) {
+    return fsCall(writeFile, this, data, options);
+  }
+
+  close = () => {
+    if (this[kFd] === -1) {
+      return PromiseResolve();
+    }
+
+    if (this[kClosePromise]) {
+      return this[kClosePromise];
+    }
+
+    this[kRefs]--;
+    if (this[kRefs] === 0) {
+      this[kFd] = -1;
+      this[kClosePromise] = SafePromisePrototypeFinally(
+        this[kHandle].close(),
+        () => { this[kClosePromise] = undefined; },
+      );
+    } else {
+      this[kClosePromise] = SafePromisePrototypeFinally(
+        new Promise((resolve, reject) => {
+          this[kCloseResolve] = resolve;
+          this[kCloseReject] = reject;
+        }), () => {
+          this[kClosePromise] = undefined;
+          this[kCloseReject] = undefined;
+          this[kCloseResolve] = undefined;
+        },
+      );
+    }
+
+    this.emit('close');
+    return this[kClosePromise];
+  };
+
+  async [SymbolAsyncDispose]() {
+    return this.close();
+  }
+
+  /**
+   * @typedef {import('../webstreams/readablestream').ReadableStream
+   * } ReadableStream
+   * @param {{
+   *   type?: string;
+   *   }} [options]
+   * @returns {ReadableStream}
+   */
+  readableWebStream(options = kEmptyObject) {
+    if (this[kFd] === -1)
+      throw new ERR_INVALID_STATE('The FileHandle is closed');
+    if (this[kClosePromise])
+      throw new ERR_INVALID_STATE('The FileHandle is closing');
+    if (this[kLocked])
+      throw new ERR_INVALID_STATE('The FileHandle is locked');
+    this[kLocked] = true;
+
+    if (options.type !== undefined) {
+      validateString(options.type, 'options.type');
+    }
+
+    let readable;
+
+    if (options.type !== 'bytes') {
+      const {
+        newReadableStreamFromStreamBase,
+      } = require('internal/webstreams/adapters');
+      readable = newReadableStreamFromStreamBase(
+        this[kHandle],
+        undefined,
+        { ondone: () => this[kUnref]() });
+    } else {
+      const {
+        ReadableStream,
+      } = require('internal/webstreams/readablestream');
+
+      const readFn = FunctionPrototypeBind(this.read, this);
+      const ondone = FunctionPrototypeBind(this[kUnref], this);
+
+      readable = new ReadableStream({
+        type: 'bytes',
+        autoAllocateChunkSize: 16384,
+
+        async pull(controller) {
+          const view = controller.byobRequest.view;
+          const { bytesRead } = await readFn(view, view.byteOffset, view.byteLength);
+
+          if (bytesRead === 0) {
+            ondone();
+            controller.close();
+          }
+
+          controller.byobRequest.respond(bytesRead);
+        },
+
+        cancel() {
+          ondone();
+        },
+      });
+    }
+
+    const {
+      readableStreamCancel,
+    } = require('internal/webstreams/readablestream');
+    this[kRef]();
+    this.once('close', () => {
+      readableStreamCancel(readable);
+    });
+
+    return readable;
+  }
+
+  /**
+   * @typedef {import('./streams').ReadStream
+   * } ReadStream
+   * @param {{
+   *   encoding?: string;
+   *   autoClose?: boolean;
+   *   emitClose?: boolean;
+   *   start: number;
+   *   end?: number;
+   *   highWaterMark?: number;
+   *   }} [options]
+   * @returns {ReadStream}
+   */
+  createReadStream(options = undefined) {
+    const { ReadStream } = lazyFsStreams();
+    return new ReadStream(undefined, { ...options, fd: this });
+  }
+
+  /**
+   * @typedef {import('./streams').WriteStream
+   * } WriteStream
+   * @param {{
+   *   encoding?: string;
+   *   autoClose?: boolean;
+   *   emitClose?: boolean;
+   *   start: number;
+   *   flush?: boolean;
+   *   }} [options]
+   * @returns {WriteStream}
+   */
+  createWriteStream(options = undefined) {
+    const { WriteStream } = lazyFsStreams();
+    return new WriteStream(undefined, { ...options, fd: this });
+  }
+
+  [kTransfer]() {
+    if (this[kClosePromise] || this[kRefs] > 1) {
+      throw lazyDOMException('Cannot transfer FileHandle while in use',
+                             'DataCloneError');
+    }
+
+    const handle = this[kHandle];
+    this[kFd] = -1;
+    this[kHandle] = null;
+    this[kRefs] = 0;
+
+    return {
+      data: { handle },
+      deserializeInfo: 'internal/fs/promises:FileHandle',
+    };
+  }
+
+  [kTransferList]() {
+    return [ this[kHandle] ];
+  }
+
+  [kDeserialize]({ handle }) {
+    this[kHandle] = handle;
+    this[kFd] = handle.fd;
+  }
+
+  [kRef]() {
+    this[kRefs]++;
+  }
+
+  [kUnref]() {
+    this[kRefs]--;
+    if (this[kRefs] === 0) {
+      this[kFd] = -1;
+      PromisePrototypeThen(
+        this[kHandle].close(),
+        this[kCloseResolve],
+        this[kCloseReject],
+      );
+    }
+  }
+}
+
+async function handleFdClose(fileOpPromise, closeFunc) {
+  return PromisePrototypeThen(
+    fileOpPromise,
+    (result) => PromisePrototypeThen(closeFunc(), () => result),
+    (opError) =>
+      PromisePrototypeThen(
+        closeFunc(),
+        () => PromiseReject(opError),
+        (closeError) => PromiseReject(aggregateTwoErrors(closeError, opError)),
+      ),
+  );
+}
+
+async function handleFdSync(fileOpPromise, handle) {
+  return PromisePrototypeThen(
+    fileOpPromise,
+    (result) => PromisePrototypeThen(
+      handle.sync(),
+      () => result,
+      (syncError) => PromiseReject(syncError),
+    ),
+    (opError) => PromiseReject(opError),
+  );
+}
+
+async function fsCall(fn, handle, ...args) {
+  assert(handle[kRefs] !== undefined,
+         'handle must be an instance of FileHandle');
+
+  if (handle.fd === -1) {
+    // eslint-disable-next-line no-restricted-syntax
+    const err = new Error('file closed');
+    err.code = 'EBADF';
+    err.syscall = fn.name;
+    throw err;
+  }
+
+  try {
+    handle[kRef]();
+    return await fn(handle, ...new SafeArrayIterator(args));
+  } finally {
+    handle[kUnref]();
+  }
+}
+
+function checkAborted(signal) {
+  if (signal?.aborted)
+    throw new AbortError(undefined, { cause: signal?.reason });
+}
+
+async function writeFileHandle(filehandle, data, signal, encoding) {
+  checkAborted(signal);
+  if (isCustomIterable(data)) {
+    for await (const buf of data) {
+      checkAborted(signal);
+      const toWrite =
+        isArrayBufferView(buf) ? buf : Buffer.from(buf, encoding || 'utf8');
+      let remaining = toWrite.byteLength;
+      while (remaining > 0) {
+        const writeSize = MathMin(kWriteFileMaxChunkSize, remaining);
+        const { bytesWritten } = await write(
+          filehandle, toWrite, toWrite.byteLength - remaining, writeSize);
+        remaining -= bytesWritten;
+        checkAborted(signal);
+      }
+    }
+    return;
+  }
+  data = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  let remaining = data.byteLength;
+  if (remaining === 0) return;
+  do {
+    checkAborted(signal);
+    const { bytesWritten } =
+      await write(filehandle, data, 0,
+                  MathMin(kWriteFileMaxChunkSize, data.byteLength));
+    remaining -= bytesWritten;
+    data = new Uint8Array(
+      data.buffer,
+      data.byteOffset + bytesWritten,
+      data.byteLength - bytesWritten,
+    );
+  } while (remaining > 0);
+}
+
+async function readFileHandle(filehandle, options) {
+  const signal = options?.signal;
+  const encoding = options?.encoding;
+  const decoder = encoding && new StringDecoder(encoding);
+
+  checkAborted(signal);
+
+  const statFields = await binding.fstat(filehandle.fd, false, kUsePromises);
+
+  checkAborted(signal);
+
+  let size = 0;
+  let length = 0;
+  if ((statFields[1/* mode */] & S_IFMT) === S_IFREG) {
+    size = statFields[8/* size */];
+    length = encoding ? MathMin(size, kReadFileBufferLength) : size;
+  }
+  if (length === 0) {
+    length = kReadFileUnknownBufferLength;
+  }
+
+  if (size > kIoMaxLength)
+    throw new ERR_FS_FILE_TOO_LARGE(size);
+
+  let totalRead = 0;
+  let buffer = Buffer.allocUnsafeSlow(length);
+  let result = '';
+  let offset = 0;
+  let buffers;
+  const chunkedRead = length > kReadFileBufferLength;
+
+  while (true) {
+    checkAborted(signal);
+
+    if (chunkedRead) {
+      length = MathMin(size - totalRead, kReadFileBufferLength);
+    }
+
+    const bytesRead = (await binding.read(filehandle.fd, buffer, offset,
+                                          length, -1, kUsePromises)) ?? 0;
+    totalRead += bytesRead;
+
+    if (bytesRead === 0 ||
+        totalRead === size ||
+        (bytesRead !== buffer.length && !chunkedRead)) {
+      const singleRead = bytesRead === totalRead;
+
+      const bytesToCheck = chunkedRead ? totalRead : bytesRead;
+
+      if (bytesToCheck !== buffer.length) {
+        buffer = buffer.subarray(0, bytesToCheck);
+      }
+
+      if (!encoding) {
+        if (size === 0 && !singleRead) {
+          ArrayPrototypePush(buffers, buffer);
+          return Buffer.concat(buffers, totalRead);
+        }
+        return buffer;
+      }
+
+      if (singleRead) {
+        return buffer.toString(encoding);
+      }
+      result += decoder.end(buffer);
+      return result;
+    }
+
+    if (encoding) {
+      result += decoder.write(buffer);
+    } else if (size !== 0) {
+      offset = totalRead;
+    } else {
+      buffers ??= [];
+      // Unknown file size requires chunks.
+      ArrayPrototypePush(buffers, buffer);
+      buffer = Buffer.allocUnsafeSlow(kReadFileUnknownBufferLength);
+    }
+  }
+}
+
+// All of the functions are defined as async in order to ensure that errors
+// thrown cause promise rejections rather than being thrown synchronously.
+async function access(path, mode = F_OK) {
+  path = getValidatedPath(path);
+
+  mode = getValidMode(mode, 'access');
+  return binding.access(pathModule.toNamespacedPath(path), mode,
+                        kUsePromises);
+}
+
+async function cp(src, dest, options) {
+  options = validateCpOptions(options);
+  src = pathModule.toNamespacedPath(getValidatedPath(src, 'src'));
+  dest = pathModule.toNamespacedPath(getValidatedPath(dest, 'dest'));
+  return lazyLoadCpPromises()(src, dest, options);
+}
+
+async function copyFile(src, dest, mode) {
+  src = getValidatedPath(src, 'src');
+  dest = getValidatedPath(dest, 'dest');
+  mode = getValidMode(mode, 'copyFile');
+  return binding.copyFile(pathModule.toNamespacedPath(src),
+                          pathModule.toNamespacedPath(dest),
+                          mode,
+                          kUsePromises);
+}
+
+// Note that unlike fs.open() which uses numeric file descriptors,
+// fsPromises.open() uses the fs.FileHandle class.
+async function open(path, flags, mode) {
+  path = getValidatedPath(path);
+  const flagsNumber = stringToFlags(flags);
+  mode = parseFileMode(mode, 'mode', 0o666);
+  return new FileHandle(
+    await binding.openFileHandle(pathModule.toNamespacedPath(path),
+                                 flagsNumber, mode, kUsePromises));
+}
+
+async function read(handle, bufferOrParams, offset, length, position) {
+  let buffer = bufferOrParams;
+  if (!isArrayBufferView(buffer)) {
+    // This is fh.read(params)
+    if (bufferOrParams !== undefined) {
+      validateObject(bufferOrParams, 'options', kValidateObjectAllowNullable);
+    }
+    ({
+      buffer = Buffer.alloc(16384),
+      offset = 0,
+      length = buffer.byteLength - offset,
+      position = null,
+    } = bufferOrParams ?? kEmptyObject);
+
+    validateBuffer(buffer);
+  }
+
+  if (offset !== null && typeof offset === 'object') {
+    // This is fh.read(buffer, options)
+    ({
+      offset = 0,
+      length = buffer.byteLength - offset,
+      position = null,
+    } = offset);
+  }
+
+  if (offset == null) {
+    offset = 0;
+  } else {
+    validateInteger(offset, 'offset', 0);
+  }
+
+  length |= 0;
+
+  if (length === 0)
+    return { __proto__: null, bytesRead: length, buffer };
+
+  if (buffer.byteLength === 0) {
+    throw new ERR_INVALID_ARG_VALUE('buffer', buffer,
+                                    'is empty and cannot be written');
+  }
+
+  validateOffsetLengthRead(offset, length, buffer.byteLength);
+
+  if (!NumberIsSafeInteger(position))
+    position = -1;
+
+  const bytesRead = (await binding.read(handle.fd, buffer, offset, length,
+                                        position, kUsePromises)) || 0;
+
+  return { __proto__: null, bytesRead, buffer };
+}
+
+async function readv(handle, buffers, position) {
+  validateBufferArray(buffers);
+
+  if (typeof position !== 'number')
+    position = null;
+
+  const bytesRead = (await binding.readBuffers(handle.fd, buffers, position,
+                                               kUsePromises)) || 0;
+  return { __proto__: null, bytesRead, buffers };
+}
+
+async function write(handle, buffer, offsetOrOptions, length, position) {
+  if (buffer?.byteLength === 0)
+    return { __proto__: null, bytesWritten: 0, buffer };
+
+  let offset = offsetOrOptions;
+  if (isArrayBufferView(buffer)) {
+    if (typeof offset === 'object') {
+      ({
+        offset = 0,
+        length = buffer.byteLength - offset,
+        position = null,
+      } = offsetOrOptions ?? kEmptyObject);
+    }
+
+    if (offset == null) {
+      offset = 0;
+    } else {
+      validateInteger(offset, 'offset', 0);
+    }
+    if (typeof length !== 'number')
+      length = buffer.byteLength - offset;
+    if (typeof position !== 'number')
+      position = null;
+    validateOffsetLengthWrite(offset, length, buffer.byteLength);
+    const bytesWritten =
+      (await binding.writeBuffer(handle.fd, buffer, offset,
+                                 length, position, kUsePromises)) || 0;
+    return { __proto__: null, bytesWritten, buffer };
+  }
+
+  validateStringAfterArrayBufferView(buffer, 'buffer');
+  validateEncoding(buffer, length);
+  const bytesWritten = (await binding.writeString(handle.fd, buffer, offset,
+                                                  length, kUsePromises)) || 0;
+  return { __proto__: null, bytesWritten, buffer };
+}
+
+async function writev(handle, buffers, position) {
+  validateBufferArray(buffers);
+
+  if (typeof position !== 'number')
+    position = null;
+
+  if (buffers.length === 0) {
+    return { __proto__: null, bytesWritten: 0, buffers };
+  }
+
+  const bytesWritten = (await binding.writeBuffers(handle.fd, buffers, position,
+                                                   kUsePromises)) || 0;
+  return { __proto__: null, bytesWritten, buffers };
+}
+
+async function rename(oldPath, newPath) {
+  oldPath = getValidatedPath(oldPath, 'oldPath');
+  newPath = getValidatedPath(newPath, 'newPath');
+  return binding.rename(pathModule.toNamespacedPath(oldPath),
+                        pathModule.toNamespacedPath(newPath),
+                        kUsePromises);
+}
+
+async function truncate(path, len = 0) {
+  const fd = await open(path, 'r+');
+  return handleFdClose(ftruncate(fd, len), fd.close);
+}
+
+async function ftruncate(handle, len = 0) {
+  validateInteger(len, 'len');
+  len = MathMax(0, len);
+  return binding.ftruncate(handle.fd, len, kUsePromises);
+}
+
+async function rm(path, options) {
+  path = pathModule.toNamespacedPath(getValidatedPath(path));
+  options = await validateRmOptionsPromise(path, options, false);
+  return rimrafPromises(path, options);
+}
+
+async function rmdir(path, options) {
+  path = pathModule.toNamespacedPath(getValidatedPath(path));
+  options = validateRmdirOptions(options);
+
+  if (options.recursive) {
+    emitRecursiveRmdirWarning();
+    const stats = await stat(path);
+    if (stats.isDirectory()) {
+      return rimrafPromises(path, options);
+    }
+  }
+
+  return binding.rmdir(path, kUsePromises);
+}
+
+async function fdatasync(handle) {
+  return binding.fdatasync(handle.fd, kUsePromises);
+}
+
+async function fsync(handle) {
+  return binding.fsync(handle.fd, kUsePromises);
+}
+
+async function mkdir(path, options) {
+  if (typeof options === 'number' || typeof options === 'string') {
+    options = { mode: options };
+  }
+  const {
+    recursive = false,
+    mode = 0o777,
+  } = options || kEmptyObject;
+  path = getValidatedPath(path);
+  validateBoolean(recursive, 'options.recursive');
+
+  return binding.mkdir(pathModule.toNamespacedPath(path),
+                       parseFileMode(mode, 'mode', 0o777), recursive,
+                       kUsePromises);
+}
+
+async function readdirRecursive(originalPath, options) {
+  const result = [];
+  const queue = [
+    [
+      originalPath,
+      await binding.readdir(
+        pathModule.toNamespacedPath(originalPath),
+        options.encoding,
+        !!options.withFileTypes,
+        kUsePromises,
+      ),
+    ],
+  ];
+
+
+  if (options.withFileTypes) {
+    while (queue.length > 0) {
+      // If we want to implement BFS make this a `shift` call instead of `pop`
+      const { 0: path, 1: readdir } = ArrayPrototypePop(queue);
+      for (const dirent of getDirents(path, readdir)) {
+        ArrayPrototypePush(result, dirent);
+        if (dirent.isDirectory()) {
+          const direntPath = pathModule.join(path, dirent.name);
+          ArrayPrototypePush(queue, [
+            direntPath,
+            await binding.readdir(
+              direntPath,
+              options.encoding,
+              true,
+              kUsePromises,
+            ),
+          ]);
+        }
+      }
+    }
+  } else {
+    while (queue.length > 0) {
+      const { 0: path, 1: readdir } = ArrayPrototypePop(queue);
+      for (const ent of readdir) {
+        const direntPath = pathModule.join(path, ent);
+        const stat = binding.internalModuleStat(direntPath);
+        ArrayPrototypePush(
+          result,
+          pathModule.relative(originalPath, direntPath),
+        );
+        if (stat === 1) {
+          ArrayPrototypePush(queue, [
+            direntPath,
+            await binding.readdir(
+              pathModule.toNamespacedPath(direntPath),
+              options.encoding,
+              false,
+              kUsePromises,
+            ),
+          ]);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+async function readdir(path, options) {
+  options = getOptions(options);
+  path = getValidatedPath(path);
+  if (options.recursive) {
+    return readdirRecursive(path, options);
+  }
+  const result = await binding.readdir(
+    pathModule.toNamespacedPath(path),
+    options.encoding,
+    !!options.withFileTypes,
+    kUsePromises,
+  );
+  return options.withFileTypes ?
+    getDirectoryEntriesPromise(path, result) :
+    result;
+}
+
+async function readlink(path, options) {
+  options = getOptions(options);
+  path = getValidatedPath(path, 'oldPath');
+  return binding.readlink(pathModule.toNamespacedPath(path),
+                          options.encoding, kUsePromises);
+}
+
+async function symlink(target, path, type_) {
+  let type = (typeof type_ === 'string' ? type_ : null);
+  if (isWindows && type === null) {
+    try {
+      const absoluteTarget = pathModule.resolve(`${path}`, '..', `${target}`);
+      type = (await stat(absoluteTarget)).isDirectory() ? 'dir' : 'file';
+    } catch {
+      // Default to 'file' if path is invalid or file does not exist
+      type = 'file';
+    }
+  }
+  target = getValidatedPath(target, 'target');
+  path = getValidatedPath(path);
+  return binding.symlink(preprocessSymlinkDestination(target, type, path),
+                         pathModule.toNamespacedPath(path),
+                         stringToSymlinkType(type),
+                         kUsePromises);
+}
+
+async function fstat(handle, options = { bigint: false }) {
+  const result = await binding.fstat(handle.fd, options.bigint, kUsePromises);
+  return getStatsFromBinding(result);
+}
+
+async function lstat(path, options = { bigint: false }) {
+  path = getValidatedPath(path);
+  const result = await binding.lstat(pathModule.toNamespacedPath(path),
+                                     options.bigint, kUsePromises);
+  return getStatsFromBinding(result);
+}
+
+async function stat(path, options = { bigint: false }) {
+  path = getValidatedPath(path);
+  const result = await binding.stat(pathModule.toNamespacedPath(path),
+                                    options.bigint, kUsePromises);
+  return getStatsFromBinding(result);
+}
+
+async function statfs(path, options = { bigint: false }) {
+  path = getValidatedPath(path);
+  const result = await binding.statfs(pathModule.toNamespacedPath(path),
+                                      options.bigint, kUsePromises);
+  return getStatFsFromBinding(result);
+}
+
+async function link(existingPath, newPath) {
+  existingPath = getValidatedPath(existingPath, 'existingPath');
+  newPath = getValidatedPath(newPath, 'newPath');
+  return binding.link(pathModule.toNamespacedPath(existingPath),
+                      pathModule.toNamespacedPath(newPath),
+                      kUsePromises);
+}
+
+async function unlink(path) {
+  path = getValidatedPath(path);
+  return binding.unlink(pathModule.toNamespacedPath(path), kUsePromises);
+}
+
+async function fchmod(handle, mode) {
+  mode = parseFileMode(mode, 'mode');
+  return binding.fchmod(handle.fd, mode, kUsePromises);
+}
+
+async function chmod(path, mode) {
+  path = getValidatedPath(path);
+  mode = parseFileMode(mode, 'mode');
+  return binding.chmod(pathModule.toNamespacedPath(path), mode, kUsePromises);
+}
+
+async function lchmod(path, mode) {
+  if (O_SYMLINK === undefined)
+    throw new ERR_METHOD_NOT_IMPLEMENTED('lchmod()');
+
+  const fd = await open(path, O_WRONLY | O_SYMLINK);
+  return handleFdClose(fchmod(fd, mode), fd.close);
+}
+
+async function lchown(path, uid, gid) {
+  path = getValidatedPath(path);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+  return binding.lchown(pathModule.toNamespacedPath(path),
+                        uid, gid, kUsePromises);
+}
+
+async function fchown(handle, uid, gid) {
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+  return binding.fchown(handle.fd, uid, gid, kUsePromises);
+}
+
+async function chown(path, uid, gid) {
+  path = getValidatedPath(path);
+  validateInteger(uid, 'uid', -1, kMaxUserId);
+  validateInteger(gid, 'gid', -1, kMaxUserId);
+  return binding.chown(pathModule.toNamespacedPath(path),
+                       uid, gid, kUsePromises);
+}
+
+async function utimes(path, atime, mtime) {
+  path = getValidatedPath(path);
+  return binding.utimes(pathModule.toNamespacedPath(path),
+                        toUnixTimestamp(atime),
+                        toUnixTimestamp(mtime),
+                        kUsePromises);
+}
+
+async function futimes(handle, atime, mtime) {
+  atime = toUnixTimestamp(atime, 'atime');
+  mtime = toUnixTimestamp(mtime, 'mtime');
+  return binding.futimes(handle.fd, atime, mtime, kUsePromises);
+}
+
+async function lutimes(path, atime, mtime) {
+  path = getValidatedPath(path);
+  return binding.lutimes(pathModule.toNamespacedPath(path),
+                         toUnixTimestamp(atime),
+                         toUnixTimestamp(mtime),
+                         kUsePromises);
+}
+
+async function realpath(path, options) {
+  options = getOptions(options);
+  path = getValidatedPath(path);
+  return binding.realpath(path, options.encoding, kUsePromises);
+}
+
+async function mkdtemp(prefix, options) {
+  options = getOptions(options);
+
+  prefix = getValidatedPath(prefix, 'prefix');
+  warnOnNonPortableTemplate(prefix);
+
+  let path;
+  if (typeof prefix === 'string') {
+    path = `${prefix}XXXXXX`;
+  } else {
+    path = Buffer.concat([prefix, Buffer.from('XXXXXX')]);
+  }
+
+  return binding.mkdtemp(path, options.encoding, kUsePromises);
+}
+
+async function writeFile(path, data, options) {
+  options = getOptions(options, {
+    encoding: 'utf8',
+    mode: 0o666,
+    flag: 'w',
+    flush: false,
+  });
+  const flag = options.flag || 'w';
+  const flush = options.flush ?? false;
+
+  validateBoolean(flush, 'options.flush');
+
+  if (!isArrayBufferView(data) && !isCustomIterable(data)) {
+    validateStringAfterArrayBufferView(data, 'data');
+    data = Buffer.from(data, options.encoding || 'utf8');
+  }
+
+  validateAbortSignal(options.signal);
+  if (path instanceof FileHandle)
+    return writeFileHandle(path, data, options.signal, options.encoding);
+
+  checkAborted(options.signal);
+
+  const fd = await open(path, flag, options.mode);
+  let writeOp = writeFileHandle(fd, data, options.signal, options.encoding);
+
+  if (flush) {
+    writeOp = handleFdSync(writeOp, fd);
+  }
+
+  return handleFdClose(writeOp, fd.close);
+}
+
+function isCustomIterable(obj) {
+  return isIterable(obj) && !isArrayBufferView(obj) && typeof obj !== 'string';
+}
+
+async function appendFile(path, data, options) {
+  options = getOptions(options, { encoding: 'utf8', mode: 0o666, flag: 'a' });
+  options = copyObject(options);
+  options.flag = options.flag || 'a';
+  return writeFile(path, data, options);
+}
+
+async function readFile(path, options) {
+  options = getOptions(options, { flag: 'r' });
+  const flag = options.flag || 'r';
+
+  if (path instanceof FileHandle)
+    return readFileHandle(path, options);
+
+  checkAborted(options.signal);
+
+  const fd = await open(path, flag, 0o666);
+  return handleFdClose(readFileHandle(fd, options), fd.close);
+}
+
+async function* _watch(filename, options = kEmptyObject) {
+  validateObject(options, 'options');
+
+  if (options.recursive != null) {
+    validateBoolean(options.recursive, 'options.recursive');
+
+    // TODO(anonrig): Remove non-native watcher when/if libuv supports recursive.
+    // As of November 2022, libuv does not support recursive file watch on all platforms,
+    // e.g. Linux due to the limitations of inotify.
+    if (options.recursive && !isOSX && !isWindows) {
+      const watcher = new nonNativeWatcher.FSWatcher(options);
+      await watcher[kFSWatchStart](filename);
+      yield* watcher;
+      return;
+    }
+  }
+
+  yield* watch(filename, options);
+}
+
+module.exports = {
+  exports: {
+    access,
+    copyFile,
+    cp,
+    open,
+    opendir: promisify(opendir),
+    rename,
+    truncate,
+    rm,
+    rmdir,
+    mkdir,
+    readdir,
+    readlink,
+    symlink,
+    lstat,
+    stat,
+    statfs,
+    link,
+    unlink,
+    chmod,
+    lchmod,
+    lchown,
+    chown,
+    utimes,
+    lutimes,
+    realpath,
+    mkdtemp,
+    writeFile,
+    appendFile,
+    readFile,
+    watch: !isOSX && !isWindows ? _watch : watch,
+    constants,
+  },
+
+  FileHandle,
+  kRef,
+  kUnref,
+};
+});
+
+// ---- lib/internal/fs/streams.js (Node v20.10.0) ---------------------------------------------------
+defineModule("internal/fs/streams", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+const {
+  Array,
+  FunctionPrototypeBind,
+  MathMin,
+  ObjectDefineProperty,
+  ObjectSetPrototypeOf,
+  PromisePrototypeThen,
+  ReflectApply,
+  Symbol,
+} = primordials;
+
+const {
+  ERR_INVALID_ARG_TYPE,
+  ERR_METHOD_NOT_IMPLEMENTED,
+  ERR_OUT_OF_RANGE,
+  ERR_STREAM_DESTROYED,
+  ERR_SYSTEM_ERROR,
+} = require('internal/errors').codes;
+const {
+  deprecate,
+  kEmptyObject,
+} = require('internal/util');
+const {
+  validateBoolean,
+  validateFunction,
+  validateInteger,
+} = require('internal/validators');
+const { errorOrDestroy } = require('internal/streams/destroy');
+const fs = require('fs');
+const { kRef, kUnref, FileHandle } = require('internal/fs/promises');
+const { Buffer } = require('buffer');
+const {
+  copyObject,
+  getOptions,
+  getValidatedFd,
+  validatePath,
+} = require('internal/fs/utils');
+const { Readable, Writable, finished } = require('stream');
+const { toPathIfFileURL } = require('internal/url');
+const kIoDone = Symbol('kIoDone');
+const kIsPerformingIO = Symbol('kIsPerformingIO');
+
+const kFs = Symbol('kFs');
+const kHandle = Symbol('kHandle');
+
+function _construct(callback) {
+  const stream = this;
+  if (typeof stream.fd === 'number') {
+    callback();
+    return;
+  }
+
+  if (stream.open !== openWriteFs && stream.open !== openReadFs) {
+    // Backwards compat for monkey patching open().
+    const orgEmit = stream.emit;
+    stream.emit = function(...args) {
+      if (args[0] === 'open') {
+        this.emit = orgEmit;
+        callback();
+        ReflectApply(orgEmit, this, args);
+      } else if (args[0] === 'error') {
+        this.emit = orgEmit;
+        callback(args[1]);
+      } else {
+        ReflectApply(orgEmit, this, args);
+      }
+    };
+    stream.open();
+  } else {
+    stream[kFs].open(stream.path, stream.flags, stream.mode, (er, fd) => {
+      if (er) {
+        callback(er);
+      } else {
+        stream.fd = fd;
+        callback();
+        stream.emit('open', stream.fd);
+        stream.emit('ready');
+      }
+    });
+  }
+}
+
+// This generates an fs operations structure for a FileHandle
+const FileHandleOperations = (handle) => {
+  return {
+    open: (path, flags, mode, cb) => {
+      throw new ERR_METHOD_NOT_IMPLEMENTED('open()');
+    },
+    close: (fd, cb) => {
+      handle[kUnref]();
+      PromisePrototypeThen(handle.close(),
+                           () => cb(), cb);
+    },
+    fsync: (fd, cb) => {
+      PromisePrototypeThen(handle.sync(), () => cb(), cb);
+    },
+    read: (fd, buf, offset, length, pos, cb) => {
+      PromisePrototypeThen(handle.read(buf, offset, length, pos),
+                           (r) => cb(null, r.bytesRead, r.buffer),
+                           (err) => cb(err, 0, buf));
+    },
+    write: (fd, buf, offset, length, pos, cb) => {
+      PromisePrototypeThen(handle.write(buf, offset, length, pos),
+                           (r) => cb(null, r.bytesWritten, r.buffer),
+                           (err) => cb(err, 0, buf));
+    },
+    writev: (fd, buffers, pos, cb) => {
+      PromisePrototypeThen(handle.writev(buffers, pos),
+                           (r) => cb(null, r.bytesWritten, r.buffers),
+                           (err) => cb(err, 0, buffers));
+    },
+  };
+};
+
+function close(stream, err, cb) {
+  if (!stream.fd) {
+    cb(err);
+  } else if (stream.flush) {
+    stream[kFs].fsync(stream.fd, (flushErr) => {
+      _close(stream, err || flushErr, cb);
+    });
+  } else {
+    _close(stream, err, cb);
+  }
+}
+
+function _close(stream, err, cb) {
+  stream[kFs].close(stream.fd, (er) => {
+    cb(er || err);
+  });
+  stream.fd = null;
+}
+
+function importFd(stream, options) {
+  if (typeof options.fd === 'number') {
+    // When fd is a raw descriptor, we must keep our fingers crossed
+    // that the descriptor won't get closed, or worse, replaced with
+    // another one
+    // https://github.com/nodejs/node/issues/35862
+    stream[kFs] = options.fs || fs;
+    return options.fd;
+  } else if (typeof options.fd === 'object' &&
+             options.fd instanceof FileHandle) {
+    // When fd is a FileHandle we can listen for 'close' events
+    if (options.fs) {
+      // FileHandle is not supported with custom fs operations
+      throw new ERR_METHOD_NOT_IMPLEMENTED('FileHandle with fs');
+    }
+    stream[kHandle] = options.fd;
+    stream[kFs] = FileHandleOperations(stream[kHandle]);
+    stream[kHandle][kRef]();
+    options.fd.on('close', FunctionPrototypeBind(stream.close, stream));
+    return options.fd.fd;
+  }
+
+  throw new ERR_INVALID_ARG_TYPE('options.fd',
+                                 ['number', 'FileHandle'], options.fd);
+}
+
+function ReadStream(path, options) {
+  if (!(this instanceof ReadStream))
+    return new ReadStream(path, options);
+
+  // A little bit bigger buffer and water marks by default
+  options = copyObject(getOptions(options, kEmptyObject));
+  if (options.highWaterMark === undefined)
+    options.highWaterMark = 64 * 1024;
+
+  if (options.autoDestroy === undefined) {
+    options.autoDestroy = false;
+  }
+
+  if (options.fd == null) {
+    this.fd = null;
+    this[kFs] = options.fs || fs;
+    validateFunction(this[kFs].open, 'options.fs.open');
+
+    // Path will be ignored when fd is specified, so it can be falsy
+    this.path = toPathIfFileURL(path);
+    this.flags = options.flags === undefined ? 'r' : options.flags;
+    this.mode = options.mode === undefined ? 0o666 : options.mode;
+
+    validatePath(this.path);
+  } else {
+    this.fd = getValidatedFd(importFd(this, options));
+  }
+
+  options.autoDestroy = options.autoClose === undefined ?
+    true : options.autoClose;
+
+  validateFunction(this[kFs].read, 'options.fs.read');
+
+  if (options.autoDestroy) {
+    validateFunction(this[kFs].close, 'options.fs.close');
+  }
+
+  this.start = options.start;
+  this.end = options.end;
+  this.pos = undefined;
+  this.bytesRead = 0;
+  this[kIsPerformingIO] = false;
+
+  if (this.start !== undefined) {
+    validateInteger(this.start, 'start', 0);
+
+    this.pos = this.start;
+  }
+
+
+  if (this.end === undefined) {
+    this.end = Infinity;
+  } else if (this.end !== Infinity) {
+    validateInteger(this.end, 'end', 0);
+
+    if (this.start !== undefined && this.start > this.end) {
+      throw new ERR_OUT_OF_RANGE(
+        'start',
+        `<= "end" (here: ${this.end})`,
+        this.start,
+      );
+    }
+  }
+
+  ReflectApply(Readable, this, [options]);
+}
+ObjectSetPrototypeOf(ReadStream.prototype, Readable.prototype);
+ObjectSetPrototypeOf(ReadStream, Readable);
+
+ObjectDefineProperty(ReadStream.prototype, 'autoClose', {
+  __proto__: null,
+  get() {
+    return this._readableState.autoDestroy;
+  },
+  set(val) {
+    this._readableState.autoDestroy = val;
+  },
+});
+
+const openReadFs = deprecate(function() {
+  // Noop.
+}, 'ReadStream.prototype.open() is deprecated', 'DEP0135');
+ReadStream.prototype.open = openReadFs;
+
+ReadStream.prototype._construct = _construct;
+
+ReadStream.prototype._read = function(n) {
+  n = this.pos !== undefined ?
+    MathMin(this.end - this.pos + 1, n) :
+    MathMin(this.end - this.bytesRead + 1, n);
+
+  if (n <= 0) {
+    this.push(null);
+    return;
+  }
+
+  const buf = Buffer.allocUnsafeSlow(n);
+
+  this[kIsPerformingIO] = true;
+  this[kFs]
+    .read(this.fd, buf, 0, n, this.pos, (er, bytesRead, buf) => {
+      this[kIsPerformingIO] = false;
+
+      // Tell ._destroy() that it's safe to close the fd now.
+      if (this.destroyed) {
+        this.emit(kIoDone, er);
+        return;
+      }
+
+      if (er) {
+        errorOrDestroy(this, er);
+      } else if (bytesRead > 0) {
+        if (this.pos !== undefined) {
+          this.pos += bytesRead;
+        }
+
+        this.bytesRead += bytesRead;
+
+        if (bytesRead !== buf.length) {
+          // Slow path. Shrink to fit.
+          // Copy instead of slice so that we don't retain
+          // large backing buffer for small reads.
+          const dst = Buffer.allocUnsafeSlow(bytesRead);
+          buf.copy(dst, 0, 0, bytesRead);
+          buf = dst;
+        }
+
+        this.push(buf);
+      } else {
+        this.push(null);
+      }
+    });
+};
+
+ReadStream.prototype._destroy = function(err, cb) {
+  // Usually for async IO it is safe to close a file descriptor
+  // even when there are pending operations. However, due to platform
+  // differences file IO is implemented using synchronous operations
+  // running in a thread pool. Therefore, file descriptors are not safe
+  // to close while used in a pending read or write operation. Wait for
+  // any pending IO (kIsPerformingIO) to complete (kIoDone).
+  if (this[kIsPerformingIO]) {
+    this.once(kIoDone, (er) => close(this, err || er, cb));
+  } else {
+    close(this, err, cb);
+  }
+};
+
+ReadStream.prototype.close = function(cb) {
+  if (typeof cb === 'function') finished(this, cb);
+  this.destroy();
+};
+
+ObjectDefineProperty(ReadStream.prototype, 'pending', {
+  __proto__: null,
+  get() { return this.fd === null; },
+  configurable: true,
+});
+
+function WriteStream(path, options) {
+  if (!(this instanceof WriteStream))
+    return new WriteStream(path, options);
+
+  options = copyObject(getOptions(options, kEmptyObject));
+
+  // Only buffers are supported.
+  options.decodeStrings = true;
+
+  if (options.fd == null) {
+    this.fd = null;
+    this[kFs] = options.fs || fs;
+    validateFunction(this[kFs].open, 'options.fs.open');
+
+    // Path will be ignored when fd is specified, so it can be falsy
+    this.path = toPathIfFileURL(path);
+    this.flags = options.flags === undefined ? 'w' : options.flags;
+    this.mode = options.mode === undefined ? 0o666 : options.mode;
+
+    validatePath(this.path);
+  } else {
+    this.fd = getValidatedFd(importFd(this, options));
+  }
+
+  options.autoDestroy = options.autoClose === undefined ?
+    true : options.autoClose;
+
+  if (!this[kFs].write && !this[kFs].writev) {
+    throw new ERR_INVALID_ARG_TYPE('options.fs.write', 'function',
+                                   this[kFs].write);
+  }
+
+  if (this[kFs].write) {
+    validateFunction(this[kFs].write, 'options.fs.write');
+  }
+
+  if (this[kFs].writev) {
+    validateFunction(this[kFs].writev, 'options.fs.writev');
+  }
+
+  if (options.autoDestroy) {
+    validateFunction(this[kFs].close, 'options.fs.close');
+  }
+
+  this.flush = options.flush;
+  if (this.flush == null) {
+    this.flush = false;
+  } else {
+    validateBoolean(this.flush, 'options.flush');
+    validateFunction(this[kFs].fsync, 'options.fs.fsync');
+  }
+
+  // It's enough to override either, in which case only one will be used.
+  if (!this[kFs].write) {
+    this._write = null;
+  }
+  if (!this[kFs].writev) {
+    this._writev = null;
+  }
+
+  this.start = options.start;
+  this.pos = undefined;
+  this.bytesWritten = 0;
+  this[kIsPerformingIO] = false;
+
+  if (this.start !== undefined) {
+    validateInteger(this.start, 'start', 0);
+
+    this.pos = this.start;
+  }
+
+  ReflectApply(Writable, this, [options]);
+
+  if (options.encoding)
+    this.setDefaultEncoding(options.encoding);
+}
+ObjectSetPrototypeOf(WriteStream.prototype, Writable.prototype);
+ObjectSetPrototypeOf(WriteStream, Writable);
+
+ObjectDefineProperty(WriteStream.prototype, 'autoClose', {
+  __proto__: null,
+  get() {
+    return this._writableState.autoDestroy;
+  },
+  set(val) {
+    this._writableState.autoDestroy = val;
+  },
+});
+
+const openWriteFs = deprecate(function() {
+  // Noop.
+}, 'WriteStream.prototype.open() is deprecated', 'DEP0135');
+WriteStream.prototype.open = openWriteFs;
+
+WriteStream.prototype._construct = _construct;
+
+function writeAll(data, size, pos, cb, retries = 0) {
+  this[kFs].write(this.fd, data, 0, size, pos, (er, bytesWritten, buffer) => {
+    // No data currently available and operation should be retried later.
+    if (er?.code === 'EAGAIN') {
+      er = null;
+      bytesWritten = 0;
+    }
+
+    if (this.destroyed || er) {
+      return cb(er || new ERR_STREAM_DESTROYED('write'));
+    }
+
+    this.bytesWritten += bytesWritten;
+
+    retries = bytesWritten ? 0 : retries + 1;
+    size -= bytesWritten;
+    pos += bytesWritten;
+
+    // Try writing non-zero number of bytes up to 5 times.
+    if (retries > 5) {
+      cb(new ERR_SYSTEM_ERROR('write failed'));
+    } else if (size) {
+      writeAll.call(this, buffer.slice(bytesWritten), size, pos, cb, retries);
+    } else {
+      cb();
+    }
+  });
+}
+
+function writevAll(chunks, size, pos, cb, retries = 0) {
+  this[kFs].writev(this.fd, chunks, this.pos, (er, bytesWritten, buffers) => {
+    // No data currently available and operation should be retried later.
+    if (er?.code === 'EAGAIN') {
+      er = null;
+      bytesWritten = 0;
+    }
+
+    if (this.destroyed || er) {
+      return cb(er || new ERR_STREAM_DESTROYED('writev'));
+    }
+
+    this.bytesWritten += bytesWritten;
+
+    retries = bytesWritten ? 0 : retries + 1;
+    size -= bytesWritten;
+    pos += bytesWritten;
+
+    // Try writing non-zero number of bytes up to 5 times.
+    if (retries > 5) {
+      cb(new ERR_SYSTEM_ERROR('writev failed'));
+    } else if (size) {
+      writevAll.call(this, [Buffer.concat(buffers).slice(bytesWritten)], size, pos, cb, retries);
+    } else {
+      cb();
+    }
+  });
+}
+
+WriteStream.prototype._write = function(data, encoding, cb) {
+  this[kIsPerformingIO] = true;
+  writeAll.call(this, data, data.length, this.pos, (er) => {
+    this[kIsPerformingIO] = false;
+    if (this.destroyed) {
+      // Tell ._destroy() that it's safe to close the fd now.
+      cb(er);
+      return this.emit(kIoDone, er);
+    }
+
+    cb(er);
+  });
+
+  if (this.pos !== undefined)
+    this.pos += data.length;
+};
+
+WriteStream.prototype._writev = function(data, cb) {
+  const len = data.length;
+  const chunks = new Array(len);
+  let size = 0;
+
+  for (let i = 0; i < len; i++) {
+    const chunk = data[i].chunk;
+
+    chunks[i] = chunk;
+    size += chunk.length;
+  }
+
+  this[kIsPerformingIO] = true;
+  writevAll.call(this, chunks, size, this.pos, (er) => {
+    this[kIsPerformingIO] = false;
+    if (this.destroyed) {
+      // Tell ._destroy() that it's safe to close the fd now.
+      cb(er);
+      return this.emit(kIoDone, er);
+    }
+
+    cb(er);
+  });
+
+  if (this.pos !== undefined)
+    this.pos += size;
+};
+
+WriteStream.prototype._destroy = function(err, cb) {
+  // Usually for async IO it is safe to close a file descriptor
+  // even when there are pending operations. However, due to platform
+  // differences file IO is implemented using synchronous operations
+  // running in a thread pool. Therefore, file descriptors are not safe
+  // to close while used in a pending read or write operation. Wait for
+  // any pending IO (kIsPerformingIO) to complete (kIoDone).
+  if (this[kIsPerformingIO]) {
+    this.once(kIoDone, (er) => close(this, err || er, cb));
+  } else {
+    close(this, err, cb);
+  }
+};
+
+WriteStream.prototype.close = function(cb) {
+  if (cb) {
+    if (this.closed) {
+      process.nextTick(cb);
+      return;
+    }
+    this.on('close', cb);
+  }
+
+  // If we are not autoClosing, we should call
+  // destroy on 'finish'.
+  if (!this.autoClose) {
+    this.on('finish', this.destroy);
+  }
+
+  // We use end() instead of destroy() because of
+  // https://github.com/nodejs/node/issues/2006
+  this.end();
+};
+
+// There is no shutdown() for files.
+WriteStream.prototype.destroySoon = WriteStream.prototype.end;
+
+ObjectDefineProperty(WriteStream.prototype, 'pending', {
+  __proto__: null,
+  get() { return this.fd === null; },
+  configurable: true,
+});
+
+module.exports = {
+  ReadStream,
+  WriteStream,
+};
+});
+
+// ---- lib/internal/fs/dir.js (Node v20.10.0) -------------------------------------------------------
+defineModule("internal/fs/dir", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+const {
+  ArrayPrototypePush,
+  ArrayPrototypeShift,
+  FunctionPrototypeBind,
+  ObjectDefineProperty,
+  PromiseReject,
+  Symbol,
+  SymbolAsyncIterator,
+} = primordials;
+
+const pathModule = require('path');
+const binding = internalBinding('fs');
+const dirBinding = internalBinding('fs_dir');
+const {
+  codes: {
+    ERR_DIR_CLOSED,
+    ERR_DIR_CONCURRENT_OPERATION,
+    ERR_MISSING_ARGS,
+  },
+} = require('internal/errors');
+
+const { FSReqCallback } = binding;
+const internalUtil = require('internal/util');
+const {
+  getDirent,
+  getOptions,
+  getValidatedPath,
+  handleErrorFromBinding,
+} = require('internal/fs/utils');
+const {
+  validateFunction,
+  validateUint32,
+} = require('internal/validators');
+
+const kDirHandle = Symbol('kDirHandle');
+const kDirPath = Symbol('kDirPath');
+const kDirBufferedEntries = Symbol('kDirBufferedEntries');
+const kDirClosed = Symbol('kDirClosed');
+const kDirOptions = Symbol('kDirOptions');
+const kDirReadImpl = Symbol('kDirReadImpl');
+const kDirReadPromisified = Symbol('kDirReadPromisified');
+const kDirClosePromisified = Symbol('kDirClosePromisified');
+const kDirOperationQueue = Symbol('kDirOperationQueue');
+
+class Dir {
+  constructor(handle, path, options) {
+    if (handle == null) throw new ERR_MISSING_ARGS('handle');
+    this[kDirHandle] = handle;
+    this[kDirBufferedEntries] = [];
+    this[kDirPath] = path;
+    this[kDirClosed] = false;
+
+    // Either `null` or an Array of pending operations (= functions to be called
+    // once the current operation is done).
+    this[kDirOperationQueue] = null;
+
+    this[kDirOptions] = {
+      bufferSize: 32,
+      ...getOptions(options, {
+        encoding: 'utf8',
+      }),
+    };
+
+    validateUint32(this[kDirOptions].bufferSize, 'options.bufferSize', true);
+
+    this[kDirReadPromisified] = FunctionPrototypeBind(
+      internalUtil.promisify(this[kDirReadImpl]), this, false);
+    this[kDirClosePromisified] = FunctionPrototypeBind(
+      internalUtil.promisify(this.close), this);
+  }
+
+  get path() {
+    return this[kDirPath];
+  }
+
+  read(callback) {
+    return this[kDirReadImpl](true, callback);
+  }
+
+  [kDirReadImpl](maybeSync, callback) {
+    if (this[kDirClosed] === true) {
+      throw new ERR_DIR_CLOSED();
+    }
+
+    if (callback === undefined) {
+      return this[kDirReadPromisified]();
+    }
+
+    validateFunction(callback, 'callback');
+
+    if (this[kDirOperationQueue] !== null) {
+      ArrayPrototypePush(this[kDirOperationQueue], () => {
+        this[kDirReadImpl](maybeSync, callback);
+      });
+      return;
+    }
+
+    if (this[kDirBufferedEntries].length > 0) {
+      try {
+        const dirent = ArrayPrototypeShift(this[kDirBufferedEntries]);
+
+        if (this[kDirOptions].recursive && dirent.isDirectory()) {
+          this.readSyncRecursive(dirent);
+        }
+
+        if (maybeSync)
+          process.nextTick(callback, null, dirent);
+        else
+          callback(null, dirent);
+        return;
+      } catch (error) {
+        return callback(error);
+      }
+    }
+
+    const req = new FSReqCallback();
+    req.oncomplete = (err, result) => {
+      process.nextTick(() => {
+        const queue = this[kDirOperationQueue];
+        this[kDirOperationQueue] = null;
+        for (const op of queue) op();
+      });
+
+      if (err || result === null) {
+        return callback(err, result);
+      }
+
+      try {
+        this.processReadResult(this[kDirPath], result);
+        const dirent = ArrayPrototypeShift(this[kDirBufferedEntries]);
+        if (this[kDirOptions].recursive && dirent.isDirectory()) {
+          this.readSyncRecursive(dirent);
+        }
+        callback(null, dirent);
+      } catch (error) {
+        callback(error);
+      }
+    };
+
+    this[kDirOperationQueue] = [];
+    this[kDirHandle].read(
+      this[kDirOptions].encoding,
+      this[kDirOptions].bufferSize,
+      req,
+    );
+  }
+
+  processReadResult(path, result) {
+    for (let i = 0; i < result.length; i += 2) {
+      ArrayPrototypePush(
+        this[kDirBufferedEntries],
+        getDirent(
+          path,
+          result[i],
+          result[i + 1],
+        ),
+      );
+    }
+  }
+
+  readSyncRecursive(dirent) {
+    const path = pathModule.join(dirent.path, dirent.name);
+    const ctx = { path };
+    const handle = dirBinding.opendir(
+      pathModule.toNamespacedPath(path),
+      this[kDirOptions].encoding,
+      undefined,
+      ctx,
+    );
+    handleErrorFromBinding(ctx);
+    const result = handle.read(
+      this[kDirOptions].encoding,
+      this[kDirOptions].bufferSize,
+      undefined,
+      ctx,
+    );
+
+    if (result) {
+      this.processReadResult(path, result);
+    }
+
+    handle.close(undefined, ctx);
+    handleErrorFromBinding(ctx);
+  }
+
+  readSync() {
+    if (this[kDirClosed] === true) {
+      throw new ERR_DIR_CLOSED();
+    }
+
+    if (this[kDirOperationQueue] !== null) {
+      throw new ERR_DIR_CONCURRENT_OPERATION();
+    }
+
+    if (this[kDirBufferedEntries].length > 0) {
+      const dirent = ArrayPrototypeShift(this[kDirBufferedEntries]);
+      if (this[kDirOptions].recursive && dirent.isDirectory()) {
+        this.readSyncRecursive(dirent);
+      }
+      return dirent;
+    }
+
+    const ctx = { path: this[kDirPath] };
+    const result = this[kDirHandle].read(
+      this[kDirOptions].encoding,
+      this[kDirOptions].bufferSize,
+      undefined,
+      ctx,
+    );
+    handleErrorFromBinding(ctx);
+
+    if (result === null) {
+      return result;
+    }
+
+    this.processReadResult(this[kDirPath], result);
+
+    const dirent = ArrayPrototypeShift(this[kDirBufferedEntries]);
+    if (this[kDirOptions].recursive && dirent.isDirectory()) {
+      this.readSyncRecursive(dirent);
+    }
+    return dirent;
+  }
+
+  close(callback) {
+    // Promise
+    if (callback === undefined) {
+      if (this[kDirClosed] === true) {
+        return PromiseReject(new ERR_DIR_CLOSED());
+      }
+      return this[kDirClosePromisified]();
+    }
+
+    // callback
+    validateFunction(callback, 'callback');
+
+    if (this[kDirClosed] === true) {
+      process.nextTick(callback, new ERR_DIR_CLOSED());
+      return;
+    }
+
+    if (this[kDirOperationQueue] !== null) {
+      ArrayPrototypePush(this[kDirOperationQueue], () => {
+        this.close(callback);
+      });
+      return;
+    }
+
+    this[kDirClosed] = true;
+    const req = new FSReqCallback();
+    req.oncomplete = callback;
+    this[kDirHandle].close(req);
+  }
+
+  closeSync() {
+    if (this[kDirClosed] === true) {
+      throw new ERR_DIR_CLOSED();
+    }
+
+    if (this[kDirOperationQueue] !== null) {
+      throw new ERR_DIR_CONCURRENT_OPERATION();
+    }
+
+    this[kDirClosed] = true;
+    const ctx = { path: this[kDirPath] };
+    const result = this[kDirHandle].close(undefined, ctx);
+    handleErrorFromBinding(ctx);
+    return result;
+  }
+
+  async* entries() {
+    try {
+      while (true) {
+        const result = await this[kDirReadPromisified]();
+        if (result === null) {
+          break;
+        }
+        yield result;
+      }
+    } finally {
+      await this[kDirClosePromisified]();
+    }
+  }
+}
+
+ObjectDefineProperty(Dir.prototype, SymbolAsyncIterator, {
+  __proto__: null,
+  value: Dir.prototype.entries,
+  enumerable: false,
+  writable: true,
+  configurable: true,
+});
+
+function opendir(path, options, callback) {
+  callback = typeof options === 'function' ? options : callback;
+  validateFunction(callback, 'callback');
+
+  path = getValidatedPath(path);
+  options = getOptions(options, {
+    encoding: 'utf8',
+  });
+
+  function opendirCallback(error, handle) {
+    if (error) {
+      callback(error);
+    } else {
+      callback(null, new Dir(handle, path, options));
+    }
+  }
+
+  const req = new FSReqCallback();
+  req.oncomplete = opendirCallback;
+
+  dirBinding.opendir(
+    pathModule.toNamespacedPath(path),
+    options.encoding,
+    req,
+  );
+}
+
+function opendirSync(path, options) {
+  path = getValidatedPath(path);
+  options = getOptions(options, { encoding: 'utf8' });
+
+  const handle = dirBinding.opendirSync(
+    pathModule.toNamespacedPath(path),
+  );
+
+  return new Dir(handle, path, options);
+}
+
+module.exports = {
+  Dir,
+  opendir,
+  opendirSync,
+};
+});
+
+// ---- lib/internal/fs/read/context.js (Node v20.10.0) ----------------------------------------------
+defineModule("internal/fs/read/context", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+const {
+  ArrayPrototypePush,
+  MathMin,
+  ReflectApply,
+} = primordials;
+
+const {
+  constants: {
+    kReadFileBufferLength,
+    kReadFileUnknownBufferLength,
+  },
+} = require('internal/fs/utils');
+
+const { Buffer } = require('buffer');
+
+const { FSReqCallback, close, read } = internalBinding('fs');
+
+const {
+  AbortError,
+  aggregateTwoErrors,
+} = require('internal/errors');
+
+function readFileAfterRead(err, bytesRead) {
+  const context = this.context;
+
+  if (err)
+    return context.close(err);
+
+  context.pos += bytesRead;
+
+  if (context.pos === context.size || bytesRead === 0) {
+    context.close();
+  } else {
+    if (context.size === 0) {
+      // Unknown size, just read until we don't get bytes.
+      const buffer = bytesRead === kReadFileUnknownBufferLength ?
+        context.buffer : context.buffer.slice(0, bytesRead);
+      ArrayPrototypePush(context.buffers, buffer);
+    }
+    context.read();
+  }
+}
+
+function readFileAfterClose(err) {
+  const context = this.context;
+  const callback = context.callback;
+  let buffer = null;
+
+  if (context.err || err)
+    return callback(aggregateTwoErrors(err, context.err));
+
+  try {
+    if (context.size === 0)
+      buffer = Buffer.concat(context.buffers, context.pos);
+    else if (context.pos < context.size)
+      buffer = context.buffer.slice(0, context.pos);
+    else
+      buffer = context.buffer;
+
+    if (context.encoding)
+      buffer = buffer.toString(context.encoding);
+  } catch (err) {
+    return callback(err);
+  }
+
+  callback(null, buffer);
+}
+
+class ReadFileContext {
+  constructor(callback, encoding) {
+    this.fd = undefined;
+    this.isUserFd = undefined;
+    this.size = 0;
+    this.callback = callback;
+    this.buffers = null;
+    this.buffer = null;
+    this.pos = 0;
+    this.encoding = encoding;
+    this.err = null;
+    this.signal = undefined;
+  }
+
+  read() {
+    let buffer;
+    let offset;
+    let length;
+
+    if (this.signal?.aborted) {
+      return this.close(
+        new AbortError(undefined, { cause: this.signal?.reason }));
+    }
+    if (this.size === 0) {
+      buffer = Buffer.allocUnsafeSlow(kReadFileUnknownBufferLength);
+      offset = 0;
+      length = kReadFileUnknownBufferLength;
+      this.buffer = buffer;
+    } else {
+      buffer = this.buffer;
+      offset = this.pos;
+      length = MathMin(kReadFileBufferLength, this.size - this.pos);
+    }
+
+    const req = new FSReqCallback();
+    req.oncomplete = readFileAfterRead;
+    req.context = this;
+
+    read(this.fd, buffer, offset, length, -1, req);
+  }
+
+  close(err) {
+    if (this.isUserFd) {
+      process.nextTick(function tick(context) {
+        ReflectApply(readFileAfterClose, { context }, [null]);
+      }, this);
+      return;
+    }
+
+    const req = new FSReqCallback();
+    req.oncomplete = readFileAfterClose;
+    req.context = this;
+    this.err = err;
+
+    close(this.fd, req);
+  }
+}
+
+module.exports = ReadFileContext;
+});
+
+// ---- lib/internal/fs/rimraf.js (Node v20.10.0) ----------------------------------------------------
+defineModule("internal/fs/rimraf", function (module, exports, require, internalBinding, primordials) {
+// This file is a modified version of the rimraf module on npm. It has been
+// modified in the following ways:
+// - Use of the assert module has been replaced with core's error system.
+// - All code related to the glob dependency has been removed.
+// - Bring your own custom fs module is not currently supported.
+// - Some basic code cleanup.
+'use strict';
+
+const {
+  ArrayPrototypeForEach,
+  Promise,
+  SafeSet,
+} = primordials;
+
+const { Buffer } = require('buffer');
+const fs = require('fs');
+const {
+  chmod,
+  chmodSync,
+  lstat,
+  lstatSync,
+  readdir,
+  readdirSync,
+  rmdir,
+  rmdirSync,
+  stat,
+  statSync,
+  unlink,
+  unlinkSync,
+} = fs;
+const { sep } = require('path');
+const { setTimeout } = require('timers');
+const { sleep } = require('internal/util');
+const notEmptyErrorCodes = new SafeSet(['ENOTEMPTY', 'EEXIST', 'EPERM']);
+const retryErrorCodes = new SafeSet(
+  ['EBUSY', 'EMFILE', 'ENFILE', 'ENOTEMPTY', 'EPERM']);
+const isWindows = process.platform === 'win32';
+const epermHandler = isWindows ? fixWinEPERM : _rmdir;
+const epermHandlerSync = isWindows ? fixWinEPERMSync : _rmdirSync;
+const readdirEncoding = 'buffer';
+const separator = Buffer.from(sep);
+
+
+function rimraf(path, options, callback) {
+  let retries = 0;
+
+  _rimraf(path, options, function CB(err) {
+    if (err) {
+      if (retryErrorCodes.has(err.code) && retries < options.maxRetries) {
+        retries++;
+        const delay = retries * options.retryDelay;
+        return setTimeout(_rimraf, delay, path, options, CB);
+      }
+
+      // The file is already gone.
+      if (err.code === 'ENOENT')
+        err = null;
+    }
+
+    callback(err);
+  });
+}
+
+
+function _rimraf(path, options, callback) {
+  // SunOS lets the root user unlink directories. Use lstat here to make sure
+  // it's not a directory.
+  lstat(path, (err, stats) => {
+    if (err) {
+      if (err.code === 'ENOENT')
+        return callback(null);
+
+      // Windows can EPERM on stat.
+      if (isWindows && err.code === 'EPERM')
+        return fixWinEPERM(path, options, err, callback);
+    } else if (stats.isDirectory()) {
+      return _rmdir(path, options, err, callback);
+    }
+
+    unlink(path, (err) => {
+      if (err) {
+        if (err.code === 'ENOENT')
+          return callback(null);
+        if (err.code === 'EISDIR')
+          return _rmdir(path, options, err, callback);
+        if (err.code === 'EPERM') {
+          return epermHandler(path, options, err, callback);
+        }
+      }
+
+      return callback(err);
+    });
+  });
+}
+
+
+function fixWinEPERM(path, options, originalErr, callback) {
+  chmod(path, 0o666, (err) => {
+    if (err)
+      return callback(err.code === 'ENOENT' ? null : originalErr);
+
+    stat(path, (err, stats) => {
+      if (err)
+        return callback(err.code === 'ENOENT' ? null : originalErr);
+
+      if (stats.isDirectory())
+        _rmdir(path, options, originalErr, callback);
+      else
+        unlink(path, callback);
+    });
+  });
+}
+
+
+function _rmdir(path, options, originalErr, callback) {
+  rmdir(path, (err) => {
+    if (err) {
+      if (notEmptyErrorCodes.has(err.code))
+        return _rmchildren(path, options, callback);
+      if (err.code === 'ENOTDIR')
+        return callback(originalErr);
+    }
+
+    callback(err);
+  });
+}
+
+
+function _rmchildren(path, options, callback) {
+  const pathBuf = Buffer.from(path);
+
+  readdir(pathBuf, readdirEncoding, (err, files) => {
+    if (err)
+      return callback(err);
+
+    let numFiles = files.length;
+
+    if (numFiles === 0)
+      return rmdir(path, callback);
+
+    let done = false;
+
+    ArrayPrototypeForEach(files, (child) => {
+      const childPath = Buffer.concat([pathBuf, separator, child]);
+
+      rimraf(childPath, options, (err) => {
+        if (done)
+          return;
+
+        if (err) {
+          done = true;
+          return callback(err);
+        }
+
+        numFiles--;
+        if (numFiles === 0)
+          rmdir(path, callback);
+      });
+    });
+  });
+}
+
+
+function rimrafPromises(path, options) {
+  return new Promise((resolve, reject) => {
+    rimraf(path, options, (err) => {
+      if (err)
+        return reject(err);
+
+      resolve();
+    });
+  });
+}
+
+
+function rimrafSync(path, options) {
+  let stats;
+
+  try {
+    stats = lstatSync(path);
+  } catch (err) {
+    if (err.code === 'ENOENT')
+      return;
+
+    // Windows can EPERM on stat.
+    if (isWindows && err.code === 'EPERM')
+      fixWinEPERMSync(path, options, err);
+  }
+
+  try {
+    // SunOS lets the root user unlink directories.
+    if (stats?.isDirectory())
+      _rmdirSync(path, options, null);
+    else
+      _unlinkSync(path, options);
+  } catch (err) {
+    if (err.code === 'ENOENT')
+      return;
+    if (err.code === 'EPERM')
+      return epermHandlerSync(path, options, err);
+    if (err.code !== 'EISDIR')
+      throw err;
+
+    _rmdirSync(path, options, err);
+  }
+}
+
+
+function _unlinkSync(path, options) {
+  const tries = options.maxRetries + 1;
+
+  for (let i = 1; i <= tries; i++) {
+    try {
+      return unlinkSync(path);
+    } catch (err) {
+      // Only sleep if this is not the last try, and the delay is greater
+      // than zero, and an error was encountered that warrants a retry.
+      if (retryErrorCodes.has(err.code) &&
+          i < tries &&
+          options.retryDelay > 0) {
+        sleep(i * options.retryDelay);
+      } else if (err.code === 'ENOENT') {
+        // The file is already gone.
+        return;
+      } else if (i === tries) {
+        throw err;
+      }
+    }
+  }
+}
+
+
+function _rmdirSync(path, options, originalErr) {
+  try {
+    rmdirSync(path);
+  } catch (err) {
+    if (err.code === 'ENOENT')
+      return;
+    if (err.code === 'ENOTDIR') {
+      throw originalErr || err;
+    }
+
+    if (notEmptyErrorCodes.has(err.code)) {
+      // Removing failed. Try removing all children and then retrying the
+      // original removal. Windows has a habit of not closing handles promptly
+      // when files are deleted, resulting in spurious ENOTEMPTY failures. Work
+      // around that issue by retrying on Windows.
+      const pathBuf = Buffer.from(path);
+
+      ArrayPrototypeForEach(readdirSync(pathBuf, readdirEncoding), (child) => {
+        const childPath = Buffer.concat([pathBuf, separator, child]);
+
+        rimrafSync(childPath, options);
+      });
+
+      const tries = options.maxRetries + 1;
+
+      for (let i = 1; i <= tries; i++) {
+        try {
+          return fs.rmdirSync(path);
+        } catch (err) {
+          // Only sleep if this is not the last try, and the delay is greater
+          // than zero, and an error was encountered that warrants a retry.
+          if (retryErrorCodes.has(err.code) &&
+              i < tries &&
+              options.retryDelay > 0) {
+            sleep(i * options.retryDelay);
+          } else if (err.code === 'ENOENT') {
+            // The file is already gone.
+            return;
+          } else if (i === tries) {
+            throw err;
+          }
+        }
+      }
+    }
+
+    throw originalErr || err;
+  }
+}
+
+
+function fixWinEPERMSync(path, options, originalErr) {
+  try {
+    chmodSync(path, 0o666);
+  } catch (err) {
+    if (err.code === 'ENOENT')
+      return;
+
+    throw originalErr;
+  }
+
+  let stats;
+
+  try {
+    stats = statSync(path, { throwIfNoEntry: false });
+  } catch {
+    throw originalErr;
+  }
+
+  if (stats === undefined) return;
+
+  if (stats.isDirectory())
+    _rmdirSync(path, options, originalErr);
+  else
+    _unlinkSync(path, options);
+}
+
+
+module.exports = { rimraf, rimrafPromises, rimrafSync };
+});
+
+// ---- lib/internal/fs/cp/cp.js (Node v20.10.0) -----------------------------------------------------
+defineModule("internal/fs/cp/cp", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+// This file is a modified version of the fs-extra's copy method.
+
+const {
+  ArrayPrototypeEvery,
+  ArrayPrototypeFilter,
+  Boolean,
+  PromisePrototypeThen,
+  PromiseReject,
+  SafePromiseAll,
+  StringPrototypeSplit,
+} = primordials;
+const {
+  codes: {
+    ERR_FS_CP_DIR_TO_NON_DIR,
+    ERR_FS_CP_EEXIST,
+    ERR_FS_CP_EINVAL,
+    ERR_FS_CP_FIFO_PIPE,
+    ERR_FS_CP_NON_DIR_TO_DIR,
+    ERR_FS_CP_SOCKET,
+    ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY,
+    ERR_FS_CP_UNKNOWN,
+    ERR_FS_EISDIR,
+  },
+} = require('internal/errors');
+const {
+  os: {
+    errno: {
+      EEXIST,
+      EISDIR,
+      EINVAL,
+      ENOTDIR,
+    },
+  },
+} = internalBinding('constants');
+const {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  opendir,
+  readlink,
+  stat,
+  symlink,
+  unlink,
+  utimes,
+} = require('fs/promises');
+const {
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  resolve,
+  sep,
+} = require('path');
+
+async function cpFn(src, dest, opts) {
+  // Warn about using preserveTimestamps on 32-bit node
+  if (opts.preserveTimestamps && process.arch === 'ia32') {
+    const warning = 'Using the preserveTimestamps option in 32-bit ' +
+      'node is not recommended';
+    process.emitWarning(warning, 'TimestampPrecisionWarning');
+  }
+  const stats = await checkPaths(src, dest, opts);
+  const { srcStat, destStat, skipped } = stats;
+  if (skipped) return;
+  await checkParentPaths(src, srcStat, dest);
+  return checkParentDir(destStat, src, dest, opts);
+}
+
+async function checkPaths(src, dest, opts) {
+  if (opts.filter && !(await opts.filter(src, dest))) {
+    return { __proto__: null, skipped: true };
+  }
+  const { 0: srcStat, 1: destStat } = await getStats(src, dest, opts);
+  if (destStat) {
+    if (areIdentical(srcStat, destStat)) {
+      throw new ERR_FS_CP_EINVAL({
+        message: 'src and dest cannot be the same',
+        path: dest,
+        syscall: 'cp',
+        errno: EINVAL,
+        code: 'EINVAL',
+      });
+    }
+    if (srcStat.isDirectory() && !destStat.isDirectory()) {
+      throw new ERR_FS_CP_DIR_TO_NON_DIR({
+        message: `cannot overwrite directory ${src} ` +
+            `with non-directory ${dest}`,
+        path: dest,
+        syscall: 'cp',
+        errno: EISDIR,
+        code: 'EISDIR',
+      });
+    }
+    if (!srcStat.isDirectory() && destStat.isDirectory()) {
+      throw new ERR_FS_CP_NON_DIR_TO_DIR({
+        message: `cannot overwrite non-directory ${src} ` +
+            `with directory ${dest}`,
+        path: dest,
+        syscall: 'cp',
+        errno: ENOTDIR,
+        code: 'ENOTDIR',
+      });
+    }
+  }
+
+  if (srcStat.isDirectory() && isSrcSubdir(src, dest)) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${src} to a subdirectory of self ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  return { __proto__: null, srcStat, destStat, skipped: false };
+}
+
+function areIdentical(srcStat, destStat) {
+  return destStat.ino && destStat.dev && destStat.ino === srcStat.ino &&
+    destStat.dev === srcStat.dev;
+}
+
+function getStats(src, dest, opts) {
+  const statFunc = opts.dereference ?
+    (file) => stat(file, { bigint: true }) :
+    (file) => lstat(file, { bigint: true });
+  return SafePromiseAll([
+    statFunc(src),
+    PromisePrototypeThen(statFunc(dest), undefined, (err) => {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    }),
+  ]);
+}
+
+async function checkParentDir(destStat, src, dest, opts) {
+  const destParent = dirname(dest);
+  const dirExists = await pathExists(destParent);
+  if (dirExists) return getStatsForCopy(destStat, src, dest, opts);
+  await mkdir(destParent, { recursive: true });
+  return getStatsForCopy(destStat, src, dest, opts);
+}
+
+function pathExists(dest) {
+  return PromisePrototypeThen(
+    stat(dest),
+    () => true,
+    (err) => (err.code === 'ENOENT' ? false : PromiseReject(err)));
+}
+
+// Recursively check if dest parent is a subdirectory of src.
+// It works for all file types including symlinks since it
+// checks the src and dest inodes. It starts from the deepest
+// parent and stops once it reaches the src parent or the root path.
+async function checkParentPaths(src, srcStat, dest) {
+  const srcParent = resolve(dirname(src));
+  const destParent = resolve(dirname(dest));
+  if (destParent === srcParent || destParent === parse(destParent).root) {
+    return;
+  }
+  let destStat;
+  try {
+    destStat = await stat(destParent, { bigint: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (areIdentical(srcStat, destStat)) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${src} to a subdirectory of self ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  return checkParentPaths(src, srcStat, destParent);
+}
+
+const normalizePathToArray = (path) =>
+  ArrayPrototypeFilter(StringPrototypeSplit(resolve(path), sep), Boolean);
+
+// Return true if dest is a subdir of src, otherwise false.
+// It only checks the path strings.
+function isSrcSubdir(src, dest) {
+  const srcArr = normalizePathToArray(src);
+  const destArr = normalizePathToArray(dest);
+  return ArrayPrototypeEvery(srcArr, (cur, i) => destArr[i] === cur);
+}
+
+async function getStatsForCopy(destStat, src, dest, opts) {
+  const statFn = opts.dereference ? stat : lstat;
+  const srcStat = await statFn(src);
+  if (srcStat.isDirectory() && opts.recursive) {
+    return onDir(srcStat, destStat, src, dest, opts);
+  } else if (srcStat.isDirectory()) {
+    throw new ERR_FS_EISDIR({
+      message: `${src} is a directory (not copied)`,
+      path: src,
+      syscall: 'cp',
+      errno: EISDIR,
+      code: 'EISDIR',
+    });
+  } else if (srcStat.isFile() ||
+            srcStat.isCharacterDevice() ||
+            srcStat.isBlockDevice()) {
+    return onFile(srcStat, destStat, src, dest, opts);
+  } else if (srcStat.isSymbolicLink()) {
+    return onLink(destStat, src, dest, opts);
+  } else if (srcStat.isSocket()) {
+    throw new ERR_FS_CP_SOCKET({
+      message: `cannot copy a socket file: ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  } else if (srcStat.isFIFO()) {
+    throw new ERR_FS_CP_FIFO_PIPE({
+      message: `cannot copy a FIFO pipe: ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  throw new ERR_FS_CP_UNKNOWN({
+    message: `cannot copy an unknown file type: ${dest}`,
+    path: dest,
+    syscall: 'cp',
+    errno: EINVAL,
+    code: 'EINVAL',
+  });
+}
+
+function onFile(srcStat, destStat, src, dest, opts) {
+  if (!destStat) return _copyFile(srcStat, src, dest, opts);
+  return mayCopyFile(srcStat, src, dest, opts);
+}
+
+async function mayCopyFile(srcStat, src, dest, opts) {
+  if (opts.force) {
+    await unlink(dest);
+    return _copyFile(srcStat, src, dest, opts);
+  } else if (opts.errorOnExist) {
+    throw new ERR_FS_CP_EEXIST({
+      message: `${dest} already exists`,
+      path: dest,
+      syscall: 'cp',
+      errno: EEXIST,
+      code: 'EEXIST',
+    });
+  }
+}
+
+async function _copyFile(srcStat, src, dest, opts) {
+  await copyFile(src, dest, opts.mode);
+  if (opts.preserveTimestamps) {
+    return handleTimestampsAndMode(srcStat.mode, src, dest);
+  }
+  return setDestMode(dest, srcStat.mode);
+}
+
+async function handleTimestampsAndMode(srcMode, src, dest) {
+  // Make sure the file is writable before setting the timestamp
+  // otherwise open fails with EPERM when invoked with 'r+'
+  // (through utimes call)
+  if (fileIsNotWritable(srcMode)) {
+    await makeFileWritable(dest, srcMode);
+    return setDestTimestampsAndMode(srcMode, src, dest);
+  }
+  return setDestTimestampsAndMode(srcMode, src, dest);
+}
+
+function fileIsNotWritable(srcMode) {
+  return (srcMode & 0o200) === 0;
+}
+
+function makeFileWritable(dest, srcMode) {
+  return setDestMode(dest, srcMode | 0o200);
+}
+
+async function setDestTimestampsAndMode(srcMode, src, dest) {
+  await setDestTimestamps(src, dest);
+  return setDestMode(dest, srcMode);
+}
+
+function setDestMode(dest, srcMode) {
+  return chmod(dest, srcMode);
+}
+
+async function setDestTimestamps(src, dest) {
+  // The initial srcStat.atime cannot be trusted
+  // because it is modified by the read(2) system call
+  // (See https://nodejs.org/api/fs.html#fs_stat_time_values)
+  const updatedSrcStat = await stat(src);
+  return utimes(dest, updatedSrcStat.atime, updatedSrcStat.mtime);
+}
+
+function onDir(srcStat, destStat, src, dest, opts) {
+  if (!destStat) return mkDirAndCopy(srcStat.mode, src, dest, opts);
+  return copyDir(src, dest, opts);
+}
+
+async function mkDirAndCopy(srcMode, src, dest, opts) {
+  await mkdir(dest);
+  await copyDir(src, dest, opts);
+  return setDestMode(dest, srcMode);
+}
+
+async function copyDir(src, dest, opts) {
+  const dir = await opendir(src);
+
+  for await (const { name } of dir) {
+    const srcItem = join(src, name);
+    const destItem = join(dest, name);
+    const { destStat, skipped } = await checkPaths(srcItem, destItem, opts);
+    if (!skipped) await getStatsForCopy(destStat, srcItem, destItem, opts);
+  }
+}
+
+async function onLink(destStat, src, dest, opts) {
+  let resolvedSrc = await readlink(src);
+  if (!opts.verbatimSymlinks && !isAbsolute(resolvedSrc)) {
+    resolvedSrc = resolve(dirname(src), resolvedSrc);
+  }
+  if (!destStat) {
+    return symlink(resolvedSrc, dest);
+  }
+  let resolvedDest;
+  try {
+    resolvedDest = await readlink(dest);
+  } catch (err) {
+    // Dest exists and is a regular file or directory,
+    // Windows may throw UNKNOWN error. If dest already exists,
+    // fs throws error anyway, so no need to guard against it here.
+    if (err.code === 'EINVAL' || err.code === 'UNKNOWN') {
+      return symlink(resolvedSrc, dest);
+    }
+    throw err;
+  }
+  if (!isAbsolute(resolvedDest)) {
+    resolvedDest = resolve(dirname(dest), resolvedDest);
+  }
+  if (isSrcSubdir(resolvedSrc, resolvedDest)) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${resolvedSrc} to a subdirectory of self ` +
+            `${resolvedDest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  // Do not copy if src is a subdir of dest since unlinking
+  // dest in this case would result in removing src contents
+  // and therefore a broken symlink would be created.
+  const srcStat = await stat(src);
+  if (srcStat.isDirectory() && isSrcSubdir(resolvedDest, resolvedSrc)) {
+    throw new ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY({
+      message: `cannot overwrite ${resolvedDest} with ${resolvedSrc}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  return copyLink(resolvedSrc, dest);
+}
+
+async function copyLink(resolvedSrc, dest) {
+  await unlink(dest);
+  return symlink(resolvedSrc, dest);
+}
+
+module.exports = {
+  areIdentical,
+  cpFn,
+  isSrcSubdir,
+};
+});
+
+// ---- lib/internal/fs/cp/cp-sync.js (Node v20.10.0) ------------------------------------------------
+defineModule("internal/fs/cp/cp-sync", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+// This file is a modified version of the fs-extra's copySync method.
+
+const { areIdentical, isSrcSubdir } = require('internal/fs/cp/cp');
+const { codes } = require('internal/errors');
+const {
+  os: {
+    errno: {
+      EEXIST,
+      EISDIR,
+      EINVAL,
+      ENOTDIR,
+    },
+  },
+} = internalBinding('constants');
+const {
+  ERR_FS_CP_DIR_TO_NON_DIR,
+  ERR_FS_CP_EEXIST,
+  ERR_FS_CP_EINVAL,
+  ERR_FS_CP_FIFO_PIPE,
+  ERR_FS_CP_NON_DIR_TO_DIR,
+  ERR_FS_CP_SOCKET,
+  ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY,
+  ERR_FS_CP_UNKNOWN,
+  ERR_FS_EISDIR,
+  ERR_INVALID_RETURN_VALUE,
+} = codes;
+const {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  opendirSync,
+  readlinkSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+} = require('fs');
+const {
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  resolve,
+} = require('path');
+const { isPromise } = require('util/types');
+
+function cpSyncFn(src, dest, opts) {
+  // Warn about using preserveTimestamps on 32-bit node
+  if (opts.preserveTimestamps && process.arch === 'ia32') {
+    const warning = 'Using the preserveTimestamps option in 32-bit ' +
+      'node is not recommended';
+    process.emitWarning(warning, 'TimestampPrecisionWarning');
+  }
+  const { srcStat, destStat, skipped } = checkPathsSync(src, dest, opts);
+  if (skipped) return;
+  checkParentPathsSync(src, srcStat, dest);
+  return checkParentDir(destStat, src, dest, opts);
+}
+
+function checkPathsSync(src, dest, opts) {
+  if (opts.filter) {
+    const shouldCopy = opts.filter(src, dest);
+    if (isPromise(shouldCopy)) {
+      throw new ERR_INVALID_RETURN_VALUE('boolean', 'filter', shouldCopy);
+    }
+    if (!shouldCopy) return { __proto__: null, skipped: true };
+  }
+  const { srcStat, destStat } = getStatsSync(src, dest, opts);
+
+  if (destStat) {
+    if (areIdentical(srcStat, destStat)) {
+      throw new ERR_FS_CP_EINVAL({
+        message: 'src and dest cannot be the same',
+        path: dest,
+        syscall: 'cp',
+        errno: EINVAL,
+        code: 'EINVAL',
+      });
+    }
+    if (srcStat.isDirectory() && !destStat.isDirectory()) {
+      throw new ERR_FS_CP_DIR_TO_NON_DIR({
+        message: `cannot overwrite directory ${src} ` +
+          `with non-directory ${dest}`,
+        path: dest,
+        syscall: 'cp',
+        errno: EISDIR,
+        code: 'EISDIR',
+      });
+    }
+    if (!srcStat.isDirectory() && destStat.isDirectory()) {
+      throw new ERR_FS_CP_NON_DIR_TO_DIR({
+        message: `cannot overwrite non-directory ${src} ` +
+          `with directory ${dest}`,
+        path: dest,
+        syscall: 'cp',
+        errno: ENOTDIR,
+        code: 'ENOTDIR',
+      });
+    }
+  }
+
+  if (srcStat.isDirectory() && isSrcSubdir(src, dest)) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${src} to a subdirectory of self ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  return { __proto__: null, srcStat, destStat, skipped: false };
+}
+
+function getStatsSync(src, dest, opts) {
+  let destStat;
+  const statFunc = opts.dereference ?
+    (file) => statSync(file, { bigint: true }) :
+    (file) => lstatSync(file, { bigint: true });
+  const srcStat = statFunc(src);
+  try {
+    destStat = statFunc(dest);
+  } catch (err) {
+    if (err.code === 'ENOENT') return { srcStat, destStat: null };
+    throw err;
+  }
+  return { srcStat, destStat };
+}
+
+function checkParentPathsSync(src, srcStat, dest) {
+  const srcParent = resolve(dirname(src));
+  const destParent = resolve(dirname(dest));
+  if (destParent === srcParent || destParent === parse(destParent).root) return;
+  let destStat;
+  try {
+    destStat = statSync(destParent, { bigint: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (areIdentical(srcStat, destStat)) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${src} to a subdirectory of self ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  return checkParentPathsSync(src, srcStat, destParent);
+}
+
+function checkParentDir(destStat, src, dest, opts) {
+  const destParent = dirname(dest);
+  if (!existsSync(destParent)) mkdirSync(destParent, { recursive: true });
+  return getStats(destStat, src, dest, opts);
+}
+
+function getStats(destStat, src, dest, opts) {
+  const statSyncFn = opts.dereference ? statSync : lstatSync;
+  const srcStat = statSyncFn(src);
+
+  if (srcStat.isDirectory() && opts.recursive) {
+    return onDir(srcStat, destStat, src, dest, opts);
+  } else if (srcStat.isDirectory()) {
+    throw new ERR_FS_EISDIR({
+      message: `${src} is a directory (not copied)`,
+      path: src,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EISDIR',
+    });
+  } else if (srcStat.isFile() ||
+           srcStat.isCharacterDevice() ||
+           srcStat.isBlockDevice()) {
+    return onFile(srcStat, destStat, src, dest, opts);
+  } else if (srcStat.isSymbolicLink()) {
+    return onLink(destStat, src, dest, opts);
+  } else if (srcStat.isSocket()) {
+    throw new ERR_FS_CP_SOCKET({
+      message: `cannot copy a socket file: ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  } else if (srcStat.isFIFO()) {
+    throw new ERR_FS_CP_FIFO_PIPE({
+      message: `cannot copy a FIFO pipe: ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  throw new ERR_FS_CP_UNKNOWN({
+    message: `cannot copy an unknown file type: ${dest}`,
+    path: dest,
+    syscall: 'cp',
+    errno: EINVAL,
+    code: 'EINVAL',
+  });
+}
+
+function onFile(srcStat, destStat, src, dest, opts) {
+  if (!destStat) return copyFile(srcStat, src, dest, opts);
+  return mayCopyFile(srcStat, src, dest, opts);
+}
+
+function mayCopyFile(srcStat, src, dest, opts) {
+  if (opts.force) {
+    unlinkSync(dest);
+    return copyFile(srcStat, src, dest, opts);
+  } else if (opts.errorOnExist) {
+    throw new ERR_FS_CP_EEXIST({
+      message: `${dest} already exists`,
+      path: dest,
+      syscall: 'cp',
+      errno: EEXIST,
+      code: 'EEXIST',
+    });
+  }
+}
+
+function copyFile(srcStat, src, dest, opts) {
+  copyFileSync(src, dest, opts.mode);
+  if (opts.preserveTimestamps) handleTimestamps(srcStat.mode, src, dest);
+  return setDestMode(dest, srcStat.mode);
+}
+
+function handleTimestamps(srcMode, src, dest) {
+  // Make sure the file is writable before setting the timestamp
+  // otherwise open fails with EPERM when invoked with 'r+'
+  // (through utimes call)
+  if (fileIsNotWritable(srcMode)) makeFileWritable(dest, srcMode);
+  return setDestTimestamps(src, dest);
+}
+
+function fileIsNotWritable(srcMode) {
+  return (srcMode & 0o200) === 0;
+}
+
+function makeFileWritable(dest, srcMode) {
+  return setDestMode(dest, srcMode | 0o200);
+}
+
+function setDestMode(dest, srcMode) {
+  return chmodSync(dest, srcMode);
+}
+
+function setDestTimestamps(src, dest) {
+  // The initial srcStat.atime cannot be trusted
+  // because it is modified by the read(2) system call
+  // (See https://nodejs.org/api/fs.html#fs_stat_time_values)
+  const updatedSrcStat = statSync(src);
+  return utimesSync(dest, updatedSrcStat.atime, updatedSrcStat.mtime);
+}
+
+function onDir(srcStat, destStat, src, dest, opts) {
+  if (!destStat) return mkDirAndCopy(srcStat.mode, src, dest, opts);
+  return copyDir(src, dest, opts);
+}
+
+function mkDirAndCopy(srcMode, src, dest, opts) {
+  mkdirSync(dest);
+  copyDir(src, dest, opts);
+  return setDestMode(dest, srcMode);
+}
+
+function copyDir(src, dest, opts) {
+  const dir = opendirSync(src);
+
+  try {
+    let dirent;
+
+    while ((dirent = dir.readSync()) !== null) {
+      const { name } = dirent;
+      const srcItem = join(src, name);
+      const destItem = join(dest, name);
+      const { destStat, skipped } = checkPathsSync(srcItem, destItem, opts);
+      if (!skipped) getStats(destStat, srcItem, destItem, opts);
+    }
+  } finally {
+    dir.closeSync();
+  }
+}
+
+function onLink(destStat, src, dest, opts) {
+  let resolvedSrc = readlinkSync(src);
+  if (!opts.verbatimSymlinks && !isAbsolute(resolvedSrc)) {
+    resolvedSrc = resolve(dirname(src), resolvedSrc);
+  }
+  if (!destStat) {
+    return symlinkSync(resolvedSrc, dest);
+  }
+  let resolvedDest;
+  try {
+    resolvedDest = readlinkSync(dest);
+  } catch (err) {
+    // Dest exists and is a regular file or directory,
+    // Windows may throw UNKNOWN error. If dest already exists,
+    // fs throws error anyway, so no need to guard against it here.
+    if (err.code === 'EINVAL' || err.code === 'UNKNOWN') {
+      return symlinkSync(resolvedSrc, dest);
+    }
+    throw err;
+  }
+  if (!isAbsolute(resolvedDest)) {
+    resolvedDest = resolve(dirname(dest), resolvedDest);
+  }
+  if (isSrcSubdir(resolvedSrc, resolvedDest)) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${resolvedSrc} to a subdirectory of self ` +
+          `${resolvedDest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  // Prevent copy if src is a subdir of dest since unlinking
+  // dest in this case would result in removing src contents
+  // and therefore a broken symlink would be created.
+  if (statSync(dest).isDirectory() && isSrcSubdir(resolvedDest, resolvedSrc)) {
+    throw new ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY({
+      message: `cannot overwrite ${resolvedDest} with ${resolvedSrc}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  return copyLink(resolvedSrc, dest);
+}
+
+function copyLink(resolvedSrc, dest) {
+  unlinkSync(dest);
+  return symlinkSync(resolvedSrc, dest);
+}
+
+module.exports = { cpSyncFn };
+});
+
+// ---- lib/internal/fs/watchers.js (Node v20.10.0) --------------------------------------------------
+defineModule("internal/fs/watchers", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+const {
+  FunctionPrototypeCall,
+  ObjectDefineProperty,
+  ObjectSetPrototypeOf,
+  Symbol,
+} = primordials;
+
+const {
+  AbortError,
+  uvException,
+  codes: {
+    ERR_INVALID_ARG_VALUE,
+  },
+} = require('internal/errors');
+const {
+  createDeferredPromise,
+  kEmptyObject,
+} = require('internal/util');
+
+const {
+  kFsStatsFieldsNumber,
+  StatWatcher: _StatWatcher,
+} = internalBinding('fs');
+
+const { FSEvent } = internalBinding('fs_event_wrap');
+const { UV_ENOSPC } = internalBinding('uv');
+const { EventEmitter } = require('events');
+
+const {
+  getStatsFromBinding,
+  getValidatedPath,
+} = require('internal/fs/utils');
+
+const {
+  defaultTriggerAsyncIdScope,
+  symbols: { owner_symbol },
+} = require('internal/async_hooks');
+
+const { toNamespacedPath } = require('path');
+
+const {
+  validateAbortSignal,
+  validateBoolean,
+  validateObject,
+  validateUint32,
+} = require('internal/validators');
+
+const {
+  Buffer: {
+    isEncoding,
+  },
+} = require('buffer');
+
+const assert = require('internal/assert');
+
+const kOldStatus = Symbol('kOldStatus');
+const kUseBigint = Symbol('kUseBigint');
+
+const kFSWatchStart = Symbol('kFSWatchStart');
+const kFSStatWatcherStart = Symbol('kFSStatWatcherStart');
+const KFSStatWatcherRefCount = Symbol('KFSStatWatcherRefCount');
+const KFSStatWatcherMaxRefCount = Symbol('KFSStatWatcherMaxRefCount');
+const kFSStatWatcherAddOrCleanRef = Symbol('kFSStatWatcherAddOrCleanRef');
+
+function emitStop(self) {
+  self.emit('stop');
+}
+
+function StatWatcher(bigint) {
+  FunctionPrototypeCall(EventEmitter, this);
+
+  this._handle = null;
+  this[kOldStatus] = -1;
+  this[kUseBigint] = bigint;
+  this[KFSStatWatcherRefCount] = 1;
+  this[KFSStatWatcherMaxRefCount] = 1;
+}
+ObjectSetPrototypeOf(StatWatcher.prototype, EventEmitter.prototype);
+ObjectSetPrototypeOf(StatWatcher, EventEmitter);
+
+function onchange(newStatus, stats) {
+  const self = this[owner_symbol];
+  if (self[kOldStatus] === -1 &&
+      newStatus === -1 &&
+      stats[2/* new nlink */] === stats[16/* old nlink */]) {
+    return;
+  }
+
+  self[kOldStatus] = newStatus;
+  self.emit('change', getStatsFromBinding(stats),
+            getStatsFromBinding(stats, kFsStatsFieldsNumber));
+}
+
+// At the moment if filename is undefined, we
+// 1. Throw an Error if it's the first
+//    time Symbol('kFSStatWatcherStart') is called
+// 2. Return silently if Symbol('kFSStatWatcherStart') has already been called
+//    on a valid filename and the wrap has been initialized
+// This method is a noop if the watcher has already been started.
+StatWatcher.prototype[kFSStatWatcherStart] = function(filename,
+                                                      persistent,
+                                                      interval) {
+  if (this._handle !== null)
+    return;
+
+  this._handle = new _StatWatcher(this[kUseBigint]);
+  this._handle[owner_symbol] = this;
+  this._handle.onchange = onchange;
+  if (!persistent)
+    this.unref();
+
+  // uv_fs_poll is a little more powerful than ev_stat but we curb it for
+  // the sake of backwards compatibility.
+  this[kOldStatus] = -1;
+
+  filename = getValidatedPath(filename, 'filename');
+  validateUint32(interval, 'interval');
+  const err = this._handle.start(toNamespacedPath(filename), interval);
+  if (err) {
+    const error = uvException({
+      errno: err,
+      syscall: 'watch',
+      path: filename,
+    });
+    error.filename = filename;
+    throw error;
+  }
+};
+
+// To maximize backward-compatibility for the end user,
+// a no-op stub method has been added instead of
+// totally removing StatWatcher.prototype.start.
+// This should not be documented.
+StatWatcher.prototype.start = () => {};
+
+// FIXME(joyeecheung): this method is not documented while there is
+// another documented fs.unwatchFile(). The counterpart in
+// FSWatcher is .close()
+// This method is a noop if the watcher has not been started.
+StatWatcher.prototype.stop = function() {
+  if (this._handle === null)
+    return;
+
+  defaultTriggerAsyncIdScope(this._handle.getAsyncId(),
+                             process.nextTick,
+                             emitStop,
+                             this);
+  this._handle.close();
+  this._handle = null;
+};
+
+// Clean up or add ref counters.
+StatWatcher.prototype[kFSStatWatcherAddOrCleanRef] = function(operate) {
+  if (operate === 'add') {
+    // Add a Ref
+    this[KFSStatWatcherRefCount]++;
+    this[KFSStatWatcherMaxRefCount]++;
+  } else if (operate === 'clean') {
+    // Clean up a single
+    this[KFSStatWatcherMaxRefCount]--;
+    this.unref();
+  } else if (operate === 'cleanAll') {
+    // Clean up all
+    this[KFSStatWatcherMaxRefCount] = 0;
+    this[KFSStatWatcherRefCount] = 0;
+    this._handle?.unref();
+  }
+};
+
+StatWatcher.prototype.ref = function() {
+  // Avoid refCount calling ref multiple times causing unref to have no effect.
+  if (this[KFSStatWatcherRefCount] === this[KFSStatWatcherMaxRefCount])
+    return this;
+  if (this._handle && this[KFSStatWatcherRefCount]++ === 0)
+    this._handle.ref();
+  return this;
+};
+
+StatWatcher.prototype.unref = function() {
+  // Avoid refCount calling unref multiple times causing ref to have no effect.
+  if (this[KFSStatWatcherRefCount] === 0) return this;
+  if (this._handle && --this[KFSStatWatcherRefCount] === 0)
+    this._handle.unref();
+  return this;
+};
+
+
+function FSWatcher() {
+  FunctionPrototypeCall(EventEmitter, this);
+
+  this._handle = new FSEvent();
+  this._handle[owner_symbol] = this;
+
+  this._handle.onchange = (status, eventType, filename) => {
+    // TODO(joyeecheung): we may check self._handle.initialized here
+    // and return if that is false. This allows us to avoid firing the event
+    // after the handle is closed, and to fire both UV_RENAME and UV_CHANGE
+    // if they are set by libuv at the same time.
+    if (status < 0) {
+      if (this._handle !== null) {
+        // We don't use this.close() here to avoid firing the close event.
+        this._handle.close();
+        this._handle = null;  // Make the handle garbage collectable.
+      }
+      const error = uvException({
+        errno: status,
+        syscall: 'watch',
+        path: filename,
+      });
+      error.filename = filename;
+      this.emit('error', error);
+    } else {
+      this.emit('change', eventType, filename);
+    }
+  };
+}
+ObjectSetPrototypeOf(FSWatcher.prototype, EventEmitter.prototype);
+ObjectSetPrototypeOf(FSWatcher, EventEmitter);
+
+// At the moment if filename is undefined, we
+// 1. Throw an Error if it's the first time Symbol('kFSWatchStart') is called
+// 2. Return silently if Symbol('kFSWatchStart') has already been called
+//    on a valid filename and the wrap has been initialized
+// 3. Return silently if the watcher has already been closed
+// This method is a noop if the watcher has already been started.
+FSWatcher.prototype[kFSWatchStart] = function(filename,
+                                              persistent,
+                                              recursive,
+                                              encoding) {
+  if (this._handle === null) {  // closed
+    return;
+  }
+  assert(this._handle instanceof FSEvent, 'handle must be a FSEvent');
+  if (this._handle.initialized) {  // already started
+    return;
+  }
+
+  filename = getValidatedPath(filename, 'filename');
+
+  const err = this._handle.start(toNamespacedPath(filename),
+                                 persistent,
+                                 recursive,
+                                 encoding);
+  if (err) {
+    const error = uvException({
+      errno: err,
+      syscall: 'watch',
+      path: filename,
+      message: err === UV_ENOSPC ?
+        'System limit for number of file watchers reached' : '',
+    });
+    error.filename = filename;
+    throw error;
+  }
+};
+
+// To maximize backward-compatibility for the end user,
+// a no-op stub method has been added instead of
+// totally removing FSWatcher.prototype.start.
+// This should not be documented.
+FSWatcher.prototype.start = () => {};
+
+// This method is a noop if the watcher has not been started or
+// has already been closed.
+FSWatcher.prototype.close = function() {
+  if (this._handle === null) {  // closed
+    return;
+  }
+  assert(this._handle instanceof FSEvent, 'handle must be a FSEvent');
+  if (!this._handle.initialized) {  // not started
+    return;
+  }
+  this._handle.close();
+  this._handle = null;  // Make the handle garbage collectable.
+  process.nextTick(emitCloseNT, this);
+};
+
+FSWatcher.prototype.ref = function() {
+  if (this._handle) this._handle.ref();
+  return this;
+};
+
+FSWatcher.prototype.unref = function() {
+  if (this._handle) this._handle.unref();
+  return this;
+};
+
+function emitCloseNT(self) {
+  self.emit('close');
+}
+
+// Legacy alias on the C++ wrapper object. This is not public API, so we may
+// want to runtime-deprecate it at some point. There's no hurry, though.
+ObjectDefineProperty(FSEvent.prototype, 'owner', {
+  __proto__: null,
+  get() { return this[owner_symbol]; },
+  set(v) { return this[owner_symbol] = v; },
+});
+
+let kResistStopPropagation;
+
+async function* watch(filename, options = kEmptyObject) {
+  const path = toNamespacedPath(getValidatedPath(filename));
+  validateObject(options, 'options');
+
+  const {
+    persistent = true,
+    recursive = false,
+    encoding = 'utf8',
+    signal,
+  } = options;
+
+  validateBoolean(persistent, 'options.persistent');
+  validateBoolean(recursive, 'options.recursive');
+  validateAbortSignal(signal, 'options.signal');
+
+  if (encoding && !isEncoding(encoding)) {
+    const reason = 'is invalid encoding';
+    throw new ERR_INVALID_ARG_VALUE(encoding, 'encoding', reason);
+  }
+
+  if (signal?.aborted)
+    throw new AbortError(undefined, { cause: signal?.reason });
+
+  const handle = new FSEvent();
+  let { promise, resolve, reject } = createDeferredPromise();
+  const oncancel = () => {
+    handle.close();
+    reject(new AbortError(undefined, { cause: signal?.reason }));
+  };
+
+  try {
+    if (signal) {
+      kResistStopPropagation ??= require('internal/event_target').kResistStopPropagation;
+      signal.addEventListener('abort', oncancel, { __proto__: null, once: true, [kResistStopPropagation]: true });
+    }
+    handle.onchange = (status, eventType, filename) => {
+      if (status < 0) {
+        const error = uvException({
+          errno: status,
+          syscall: 'watch',
+          path: filename,
+        });
+        error.filename = filename;
+        handle.close();
+        reject(error);
+        return;
+      }
+
+      resolve({ eventType, filename });
+    };
+
+    const err = handle.start(path, persistent, recursive, encoding);
+    if (err) {
+      const error = uvException({
+        errno: err,
+        syscall: 'watch',
+        path: filename,
+        message: err === UV_ENOSPC ?
+          'System limit for number of file watchers reached' : '',
+      });
+      error.filename = filename;
+      handle.close();
+      throw error;
+    }
+
+    while (!signal?.aborted) {
+      yield await promise;
+      ({ promise, resolve, reject } = createDeferredPromise());
+    }
+    throw new AbortError(undefined, { cause: signal?.reason });
+  } finally {
+    handle.close();
+    signal?.removeEventListener('abort', oncancel);
+  }
+}
+
+module.exports = {
+  FSWatcher,
+  StatWatcher,
+  kFSWatchStart,
+  kFSStatWatcherStart,
+  kFSStatWatcherAddOrCleanRef,
+  watch,
+};
+});
+
+// ---- lib/internal/fs/recursive_watch.js (Node v20.10.0) -------------------------------------------
+defineModule("internal/fs/recursive_watch", function (module, exports, require, internalBinding, primordials) {
+'use strict';
+
+const {
+  ArrayPrototypePush,
+  SafePromiseAllReturnVoid,
+  Promise,
+  PromisePrototypeThen,
+  SafeMap,
+  SafeSet,
+  StringPrototypeStartsWith,
+  SymbolAsyncIterator,
+} = primordials;
+
+const { EventEmitter } = require('events');
+const assert = require('internal/assert');
+const {
+  AbortError,
+  codes: {
+    ERR_INVALID_ARG_VALUE,
+  },
+} = require('internal/errors');
+const { getValidatedPath } = require('internal/fs/utils');
+const { kFSWatchStart, StatWatcher } = require('internal/fs/watchers');
+const { kEmptyObject } = require('internal/util');
+const { validateBoolean, validateAbortSignal } = require('internal/validators');
+const {
+  basename: pathBasename,
+  join: pathJoin,
+  relative: pathRelative,
+  resolve: pathResolve,
+} = require('path');
+
+let internalSync;
+let internalPromises;
+
+function lazyLoadFsPromises() {
+  internalPromises ??= require('fs/promises');
+  return internalPromises;
+}
+
+function lazyLoadFsSync() {
+  internalSync ??= require('fs');
+  return internalSync;
+}
+let kResistStopPropagation;
+
+async function traverse(dir, files = new SafeMap(), symbolicLinks = new SafeSet()) {
+  const { opendir } = lazyLoadFsPromises();
+
+  const filenames = await opendir(dir);
+  const subdirectories = [];
+
+  for await (const file of filenames) {
+    const f = pathJoin(dir, file.name);
+
+    files.set(f, file);
+
+    // Do not follow symbolic links
+    if (file.isSymbolicLink()) {
+      symbolicLinks.add(f);
+    } else if (file.isDirectory()) {
+      ArrayPrototypePush(subdirectories, traverse(f, files));
+    }
+  }
+
+  await SafePromiseAllReturnVoid(subdirectories);
+
+  return files;
+}
+
+class FSWatcher extends EventEmitter {
+  #options = null;
+  #closed = false;
+  #files = new SafeMap();
+  #symbolicFiles = new SafeSet();
+  #rootPath = pathResolve();
+  #watchingFile = false;
+
+  constructor(options = kEmptyObject) {
+    super();
+
+    assert(typeof options === 'object');
+
+    const { persistent, recursive, signal, encoding } = options;
+
+    // TODO(anonrig): Add non-recursive support to non-native-watcher for IBMi & AIX support.
+    if (recursive != null) {
+      validateBoolean(recursive, 'options.recursive');
+    }
+
+    if (persistent != null) {
+      validateBoolean(persistent, 'options.persistent');
+    }
+
+    if (signal != null) {
+      validateAbortSignal(signal, 'options.signal');
+    }
+
+    if (encoding != null) {
+      // This is required since on macOS and Windows it throws ERR_INVALID_ARG_VALUE
+      if (typeof encoding !== 'string') {
+        throw new ERR_INVALID_ARG_VALUE(encoding, 'options.encoding');
+      }
+    }
+
+    this.#options = { persistent, recursive, signal, encoding };
+  }
+
+  close() {
+    if (this.#closed) {
+      return;
+    }
+
+    const { unwatchFile } = lazyLoadFsSync();
+    this.#closed = true;
+
+    for (const file of this.#files.keys()) {
+      unwatchFile(file);
+    }
+
+    this.#files.clear();
+    this.#symbolicFiles.clear();
+    this.emit('close');
+  }
+
+  #unwatchFiles(file) {
+    const { unwatchFile } = lazyLoadFsSync();
+
+    this.#symbolicFiles.delete(file);
+
+    for (const filename of this.#files.keys()) {
+      if (StringPrototypeStartsWith(filename, file)) {
+        unwatchFile(filename);
+      }
+    }
+  }
+
+  async #watchFolder(folder) {
+    const { opendir } = lazyLoadFsPromises();
+
+    try {
+      const files = await opendir(folder);
+
+      for await (const file of files) {
+        if (this.#closed) {
+          break;
+        }
+
+        const f = pathJoin(folder, file.name);
+
+        if (!this.#files.has(f)) {
+          this.emit('change', 'rename', pathRelative(this.#rootPath, f));
+
+          if (file.isSymbolicLink()) {
+            this.#symbolicFiles.add(f);
+          }
+
+          this.#files.set(f, file);
+          if (file.isFile()) {
+            this.#watchFile(f);
+          } else if (file.isDirectory() && !file.isSymbolicLink()) {
+            await this.#watchFolder(f);
+          }
+        }
+      }
+    } catch (error) {
+      this.emit('error', error);
+    }
+  }
+
+  #watchFile(file) {
+    if (this.#closed) {
+      return;
+    }
+
+    const { watchFile } = lazyLoadFsSync();
+    const existingStat = this.#files.get(file);
+
+    watchFile(file, {
+      persistent: this.#options.persistent,
+    }, (currentStats, previousStats) => {
+      if (existingStat && !existingStat.isDirectory() &&
+        currentStats.nlink !== 0 && existingStat.mtimeMs === currentStats.mtimeMs) {
+        return;
+      }
+
+      this.#files.set(file, currentStats);
+
+      if (currentStats.birthtimeMs === 0 && previousStats.birthtimeMs !== 0) {
+        // The file is now deleted
+        this.#files.delete(file);
+        this.emit('change', 'rename', pathRelative(this.#rootPath, file));
+        this.#unwatchFiles(file);
+      } else if (file === this.#rootPath && this.#watchingFile) {
+        // This case will only be triggered when watching a file with fs.watch
+        this.emit('change', 'change', pathBasename(file));
+      } else if (this.#symbolicFiles.has(file)) {
+        // Stats from watchFile does not return correct value for currentStats.isSymbolicLink()
+        // Since it is only valid when using fs.lstat(). Therefore, check the existing symbolic files.
+        this.emit('change', 'rename', pathRelative(this.#rootPath, file));
+      } else if (currentStats.isDirectory()) {
+        this.#watchFolder(file);
+      } else {
+        // Watching a directory will trigger a change event for child files)
+        this.emit('change', 'change', pathRelative(this.#rootPath, file));
+      }
+    });
+  }
+
+  [kFSWatchStart](filename) {
+    filename = pathResolve(getValidatedPath(filename));
+
+    try {
+      const file = lazyLoadFsSync().statSync(filename);
+
+      this.#rootPath = filename;
+      this.#closed = false;
+      this.#watchingFile = file.isFile();
+
+      if (file.isDirectory()) {
+        this.#files.set(filename, file);
+
+        PromisePrototypeThen(
+          traverse(filename, this.#files, this.#symbolicFiles),
+          () => {
+            for (const f of this.#files.keys()) {
+              this.#watchFile(f);
+            }
+          },
+        );
+      } else {
+        this.#watchFile(filename);
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        error.filename = filename;
+        throw error;
+      }
+    }
+
+  }
+
+  ref() {
+    this.#files.forEach((file) => {
+      if (file instanceof StatWatcher) {
+        file.ref();
+      }
+    });
+  }
+
+  unref() {
+    this.#files.forEach((file) => {
+      if (file instanceof StatWatcher) {
+        file.unref();
+      }
+    });
+  }
+
+  [SymbolAsyncIterator]() {
+    const { signal } = this.#options;
+    const promiseExecutor = signal == null ?
+      (resolve) => {
+        this.once('change', (eventType, filename) => {
+          resolve({ __proto__: null, value: { eventType, filename } });
+        });
+      } : (resolve, reject) => {
+        const onAbort = () => reject(new AbortError(undefined, { cause: signal.reason }));
+        if (signal.aborted) return onAbort();
+        kResistStopPropagation ??= require('internal/event_target').kResistStopPropagation;
+        signal.addEventListener('abort', onAbort, { __proto__: null, once: true, [kResistStopPropagation]: true });
+        this.once('change', (eventType, filename) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve({ __proto__: null, value: { eventType, filename } });
+        });
+      };
+    return {
+      next: () => (this.#closed ?
+        { __proto__: null, done: true } :
+        new Promise(promiseExecutor)),
+      [SymbolAsyncIterator]() { return this; },
+    };
+  }
+}
+
+module.exports = {
+  FSWatcher,
+  kFSWatchStart,
+};
+});
+
+// ---- registration ------------------------------------------------------------------------------
+
+const fs = require("fs");
+__builtins.set("fs", fs);
+__builtins.set("fs/promises", fs.promises);

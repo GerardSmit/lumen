@@ -356,6 +356,90 @@
   // mapping step that matters in practice.
   const punycode = __builtins.get("punycode");
 
+  // fileURLToPath / pathToFileURL: Node's lib/internal/url.js algorithms (drive letters, UNC
+  // hosts, the percent-encoding of %, \, newlines, tabs, ? and #).
+  const isWindowsUrl = __os.info().platform === "win32";
+  const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_URL_SCHEME, ERR_INVALID_FILE_URL_PATH,
+    ERR_INVALID_FILE_URL_HOST } = __errors;
+  function isURLObject(self) {
+    return Boolean(self?.href && self.protocol && self.auth === undefined && self.path === undefined);
+  }
+  function getPathFromURLWin32(url) {
+    const hostname = url.hostname;
+    let pathname = url.pathname;
+    for (let n = 0; n < pathname.length; n++) {
+      if (pathname[n] === "%") {
+        const third = pathname.codePointAt(n + 2) | 0x20;
+        if ((pathname[n + 1] === "2" && third === 102) || (pathname[n + 1] === "5" && third === 99)) {
+          throw new ERR_INVALID_FILE_URL_PATH("must not include encoded \\ or / characters");
+        }
+      }
+    }
+    pathname = pathname.replace(/\//g, "\\");
+    pathname = decodeURIComponent(pathname);
+    if (hostname !== "") {
+      return `\\${punycode.toUnicode(hostname)}${pathname}`;
+    }
+    const letter = pathname.codePointAt(1) | 0x20;
+    const sep = pathname.charAt(2);
+    if (letter < 97 || letter > 122 || sep !== ":") {
+      throw new ERR_INVALID_FILE_URL_PATH("must be absolute");
+    }
+    return pathname.slice(1);
+  }
+  function getPathFromURLPosix(url) {
+    if (url.hostname !== "") {
+      throw new ERR_INVALID_FILE_URL_HOST(__os.info().platform);
+    }
+    const pathname = url.pathname;
+    for (let n = 0; n < pathname.length; n++) {
+      if (pathname[n] === "%") {
+        const third = pathname.codePointAt(n + 2) | 0x20;
+        if (pathname[n + 1] === "2" && third === 102) {
+          throw new ERR_INVALID_FILE_URL_PATH("must not include encoded / characters");
+        }
+      }
+    }
+    return decodeURIComponent(pathname);
+  }
+  function fileURLToPath(path) {
+    if (typeof path === "string") path = new URL(path);
+    else if (!isURLObject(path)) throw new ERR_INVALID_ARG_TYPE("path", ["string", "URL"], path);
+    if (path.protocol !== "file:") throw new ERR_INVALID_URL_SCHEME("file");
+    return isWindowsUrl ? getPathFromURLWin32(path) : getPathFromURLPosix(path);
+  }
+  function encodePathChars(filepath) {
+    if (filepath.includes("%")) filepath = filepath.replace(/%/g, "%25");
+    if (!isWindowsUrl && filepath.includes("\\")) filepath = filepath.replace(/\\/g, "%5C");
+    if (filepath.includes("\n")) filepath = filepath.replace(/\n/g, "%0A");
+    if (filepath.includes("\r")) filepath = filepath.replace(/\r/g, "%0D");
+    if (filepath.includes("\t")) filepath = filepath.replace(/\t/g, "%09");
+    return filepath;
+  }
+  function pathToFileURL(filepath) {
+    const pathMod = __builtins.get("path");
+    if (isWindowsUrl && filepath.startsWith("\\\\")) {
+      const outURL = new URL("file://");
+      const hostnameEndIndex = filepath.indexOf("\\", 2);
+      if (hostnameEndIndex === -1) throw new ERR_INVALID_ARG_VALUE("path", filepath, "Missing UNC resource path");
+      if (hostnameEndIndex === 2) throw new ERR_INVALID_ARG_VALUE("path", filepath, "Empty UNC servername");
+      const hostname = filepath.slice(2, hostnameEndIndex);
+      outURL.hostname = punycode.toASCII(hostname.toLowerCase());
+      outURL.pathname = encodePathChars(filepath.slice(hostnameEndIndex).replace(/\\/g, "/"));
+      return outURL;
+    }
+    let resolved = pathMod.resolve(filepath);
+    const filePathLast = filepath.charCodeAt(filepath.length - 1);
+    if ((filePathLast === 47 || (isWindowsUrl && filePathLast === 92)) && resolved[resolved.length - 1] !== pathMod.sep) {
+      resolved += "/";
+    }
+    resolved = encodePathChars(resolved);
+    if (resolved.includes("?")) resolved = resolved.replace(/\?/g, "%3F");
+    if (resolved.includes("#")) resolved = resolved.replace(/#/g, "%23");
+    return new URL(`file://${resolved}`);
+  }
+
+
   __builtins.set("url", {
     parse: legacyParse,
     format,
@@ -367,228 +451,97 @@
     Url: function Url() {},
     domainToASCII: (d) => punycode.toASCII(String(d).toLowerCase()),
     domainToUnicode: (d) => punycode.toUnicode(String(d).toLowerCase()),
-    fileURLToPath: (u) => (typeof u === "string" ? u : u.pathname).replace(/^file:\/\//, ""),
-    pathToFileURL: (p) => new URL("file://" + p),
+    fileURLToPath,
+    pathToFileURL,
   });
 }
 
 // node:net now lives in its own glue file (net.js) — its surface grew past the "small shim" bar
 // (BlockList, SocketAddress, auto-select-family flags).
 
-// ---- node:assert (and node:assert/strict) -----------------------------------------------------
-// Real recursive deep-equality (loose and strict), the throws/rejects matcher forms, and the
-// strict-mode view Node exports as `assert.strict` / `require('assert/strict')` — where `equal`
-// behaves as `strictEqual`, `deepEqual` as `deepStrictEqual`, etc.
-{
-  class AssertionError extends Error {
-    constructor(opts = {}) {
-      super(opts.message || "Assertion failed");
-      this.name = "AssertionError";
-      this.code = "ERR_ASSERTION";
-      this.actual = opts.actual;
-      this.expected = opts.expected;
-      this.operator = opts.operator;
-    }
-  }
-  const fail = (message) => {
-    if (message instanceof Error) throw message;
-    throw new AssertionError({ message: typeof message === "string" ? message : "Failed", operator: "fail" });
-  };
-
-  // Recursive equality. `strict` compares with SameValueZero + prototypes; loose uses `==` on
-  // primitives and ignores prototypes, like Node's deepEqual.
-  function deepEq(a, b, strict, seen) {
-    if (strict ? Object.is(a, b) : a === b) return true;
-    if (typeof a !== "object" || a === null || typeof b !== "object" || b === null) {
-      return strict ? Object.is(a, b) : a == b;
-    }
-    if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
-    if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
-    if (a instanceof RegExp && b instanceof RegExp) return a.source === b.source && a.flags === b.flags;
-    seen = seen || new Map();
-    if (seen.get(a) === b) return true;
-    seen.set(a, b);
-    if (Array.isArray(a) || Array.isArray(b)) {
-      if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    }
-    if (a instanceof Map && b instanceof Map) {
-      if (a.size !== b.size) return false;
-      for (const [k, v] of a) { if (!b.has(k) || !deepEq(v, b.get(k), strict, seen)) return false; }
-    }
-    if (a instanceof Set && b instanceof Set) {
-      if (a.size !== b.size) return false;
-      for (const v of a) { if (!b.has(v)) return false; }
-    }
-    if (ArrayBuffer.isView(a) && ArrayBuffer.isView(b) && !(a instanceof DataView)) {
-      if (a.length !== b.length) return false;
-      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-    }
-    const ka = Object.keys(a), kb = Object.keys(b);
-    if (ka.length !== kb.length) return false;
-    for (const k of ka) {
-      if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-      if (!deepEq(a[k], b[k], strict, seen)) return false;
-    }
-    return true;
-  }
-
-  // `expected` (a subset) deep-strict-matches the corresponding parts of `actual`.
-  function partialMatch(actual, expected, seen) {
-    if (Object.is(actual, expected)) return true;
-    if (typeof expected !== "object" || expected === null) return Object.is(actual, expected);
-    if (typeof actual !== "object" || actual === null) return false;
-    seen = seen || new Map();
-    if (seen.get(expected) === actual) return true;
-    seen.set(expected, actual);
-    for (const k of Object.keys(expected)) {
-      if (!(k in actual)) return false;
-      if (!partialMatch(actual[k], expected[k], seen)) return false;
-    }
-    return true;
-  }
-
-  const strictEqual = (a, b, m) => { if (!Object.is(a, b)) throw new AssertionError({ message: m, actual: a, expected: b, operator: "strictEqual" }); };
-  const notStrictEqual = (a, b, m) => { if (Object.is(a, b)) throw new AssertionError({ message: m, actual: a, expected: b, operator: "notStrictEqual" }); };
-  const equal = (a, b, m) => { if (a != b) throw new AssertionError({ message: m, actual: a, expected: b, operator: "==" }); };
-  const notEqual = (a, b, m) => { if (a == b) throw new AssertionError({ message: m, actual: a, expected: b, operator: "!=" }); };
-  const deepEqual = (a, b, m) => { if (!deepEq(a, b, false)) throw new AssertionError({ message: m, actual: a, expected: b, operator: "deepEqual" }); };
-  const notDeepEqual = (a, b, m) => { if (deepEq(a, b, false)) throw new AssertionError({ message: m, actual: a, expected: b, operator: "notDeepEqual" }); };
-  const deepStrictEqual = (a, b, m) => { if (!deepEq(a, b, true)) throw new AssertionError({ message: m, actual: a, expected: b, operator: "deepStrictEqual" }); };
-  const notDeepStrictEqual = (a, b, m) => { if (deepEq(a, b, true)) throw new AssertionError({ message: m, actual: a, expected: b, operator: "notDeepStrictEqual" }); };
-  const partialDeepStrictEqual = (a, b, m) => { if (!partialMatch(a, b)) throw new AssertionError({ message: m, actual: a, expected: b, operator: "partialDeepStrictEqual" }); };
-
-  const match = (str, re, m) => { if (!re.test(str)) throw new AssertionError({ message: m, actual: str, expected: re, operator: "match" }); };
-  const doesNotMatch = (str, re, m) => { if (re.test(str)) throw new AssertionError({ message: m, actual: str, expected: re, operator: "doesNotMatch" }); };
-
-  // Does a caught error satisfy `expected` (a constructor, RegExp, validation fn, or object of
-  // properties to deep-match)?
-  function matchError(err, expected) {
-    if (expected == null) return true;
-    if (typeof expected === "function") {
-      if (expected.prototype !== undefined && (err instanceof expected)) return true;
-      if (expected === Error || Error.isPrototypeOf(expected)) return err instanceof expected;
-      return expected(err) === true; // validation function
-    }
-    if (expected instanceof RegExp) return expected.test(String(err && err.message !== undefined ? err.message : err));
-    if (typeof expected === "object") {
-      for (const k of Object.keys(expected)) { if (!deepEq(err[k], expected[k], true)) return false; }
-      return true;
-    }
-    return false;
-  }
-
-  function throws(fn, expected, message) {
-    if (typeof expected === "string") { message = expected; expected = undefined; }
-    let err, thrown = false;
-    try { fn(); } catch (e) { thrown = true; err = e; }
-    if (!thrown) fail(message || "Missing expected exception.");
-    if (expected !== undefined && !matchError(err, expected)) {
-      throw new AssertionError({ message: message || "The error did not match the expected criteria.", actual: err, expected, operator: "throws" });
-    }
-  }
-  function doesNotThrow(fn, expected, message) {
-    if (typeof expected === "string") { message = expected; expected = undefined; }
-    try { fn(); } catch (e) {
-      if (expected === undefined || matchError(e, expected)) {
-        fail(new AssertionError({ message: `Got unwanted exception.${message ? " " + message : ""}`, actual: e, operator: "doesNotThrow" }));
-      }
-      throw e;
-    }
-  }
-  async function rejects(promiseOrFn, expected, message) {
-    if (typeof expected === "string") { message = expected; expected = undefined; }
-    let err, rejected = false;
-    try { await (typeof promiseOrFn === "function" ? promiseOrFn() : promiseOrFn); }
-    catch (e) { rejected = true; err = e; }
-    if (!rejected) fail(message || "Missing expected rejection.");
-    if (expected !== undefined && !matchError(err, expected)) {
-      throw new AssertionError({ message: message || "The error did not match the expected criteria.", actual: err, expected, operator: "rejects" });
-    }
-  }
-  async function doesNotReject(promiseOrFn, expected, message) {
-    if (typeof expected === "string") { message = expected; expected = undefined; }
-    try { await (typeof promiseOrFn === "function" ? promiseOrFn() : promiseOrFn); }
-    catch (e) {
-      if (expected === undefined || matchError(e, expected)) {
-        fail(new AssertionError({ message: `Got unwanted rejection.${message ? " " + message : ""}`, actual: e, operator: "doesNotReject" }));
-      }
-      throw e;
-    }
-  }
-
-  // Deprecated in Node, still exported: verifies functions are called an exact number of times.
-  class CallTracker {
-    constructor() { this._records = []; }
-    calls(fn, exact) {
-      if (typeof fn === "number") { exact = fn; fn = undefined; }
-      if (fn === undefined) fn = () => {};
-      if (exact === undefined) exact = 1;
-      const rec = { actual: 0, expected: exact, operator: fn.name || "<anonymous>" };
-      this._records.push(rec);
-      return (...args) => { rec.actual++; return fn(...args); };
-    }
-    report() {
-      return this._records
-        .filter((r) => r.actual !== r.expected)
-        .map((r) => ({ message: `Expected the ${r.operator} function to be executed ${r.expected} time(s) but was executed ${r.actual} time(s).`, actual: r.actual, expected: r.expected, operator: r.operator, stack: {} }));
-    }
-    getCalls() { return []; }
-    verify() {
-      const failed = this.report();
-      if (failed.length) throw new AssertionError({ message: failed.map((f) => f.message).join("\n"), operator: "verify" });
-    }
-    reset() { this._records = []; }
-  }
-
-  function assert(value, message) {
-    if (!value) throw new AssertionError({ message: message || "The expression evaluated to a falsy value:", actual: value, expected: true, operator: "==" });
-  }
-  Object.assign(assert, {
-    ok: assert, fail, strictEqual, notStrictEqual, equal, notEqual,
-    deepEqual, notDeepEqual, deepStrictEqual, notDeepStrictEqual, partialDeepStrictEqual,
-    match, doesNotMatch, throws, doesNotThrow, rejects, doesNotReject,
-    ifError: (err) => { if (err !== null && err !== undefined) throw new AssertionError({ message: `ifError got unwanted exception: ${err && err.message ? err.message : err}`, actual: err, expected: null, operator: "ifError" }); },
-    AssertionError, CallTracker,
-  });
-
-  // The strict view: same surface, but the loose comparators become their strict counterparts.
-  function strict(value, message) { return assert(value, message); }
-  Object.assign(strict, assert, {
-    equal: strictEqual,
-    notEqual: notStrictEqual,
-    deepEqual: deepStrictEqual,
-    notDeepEqual: notDeepStrictEqual,
-  });
-  strict.ok = strict;
-  strict.strict = strict;
-  assert.strict = strict;
-
-  __builtins.set("assert", assert);
-  __builtins.set("assert/strict", strict);
-}
+// node:assert lives in assert.js.
 
 // ---- node:string_decoder ----------------------------------------------------------------------
-// Streaming multibyte-safe decode (a chunk can split a UTF-8 sequence). Backed by TextDecoder's
-// own streaming mode for utf-8; other encodings fall back to Buffer.toString per-chunk.
+// Streaming decode that never splits a character across chunks: UTF-8 through TextDecoder's
+// streaming mode (WHATWG replacement semantics, as Node's decoder), UTF-16LE holding back an odd
+// byte or a lone high surrogate, base64/base64url holding back a partial 3-byte group (so each
+// chunk encodes on its own, as Node emits it), and the single-byte encodings chunk by chunk.
 {
+  const { ERR_INVALID_ARG_TYPE, ERR_UNKNOWN_ENCODING } = __errors;
+  function normalizeEncoding(enc) {
+    const raw = enc === undefined || enc === null ? "utf8" : `${enc}`;
+    switch (raw.toLowerCase()) {
+      case "": case "utf8": case "utf-8": return "utf8";
+      case "ucs2": case "ucs-2": case "utf16le": case "utf-16le": return "utf16le";
+      case "latin1": case "binary": return "latin1";
+      case "base64": return "base64";
+      case "base64url": return "base64url";
+      case "hex": return "hex";
+      case "ascii": return "ascii";
+    }
+    throw new ERR_UNKNOWN_ENCODING(enc);
+  }
+  function toBytes(buf) {
+    if (buf instanceof Uint8Array) return buf;
+    if (ArrayBuffer.isView(buf)) return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    throw new ERR_INVALID_ARG_TYPE("buf", ["Buffer", "TypedArray", "DataView"], buf);
+  }
   // A function constructor, NOT a class: iconv-lite inherits via `StringDecoder.call(this, enc)`
   // + `Child.prototype = StringDecoder.prototype`, which a class constructor rejects ("cannot be
   // invoked without new").
   function StringDecoder(encoding) {
-    this.encoding = String(encoding || "utf8").toLowerCase().replace("-", "");
-    this._utf8 = this.encoding === "utf8";
-    if (this._utf8) this._dec = new TextDecoder("utf-8");
+    this.encoding = normalizeEncoding(encoding);
+    this._dec = this.encoding === "utf8" ? new TextDecoder("utf-8") : null;
+    this._rest = null; // held-back bytes (utf16le / base64)
   }
-  StringDecoder.prototype.write = function (buffer) {
-    if (this._utf8) return this._dec.decode(buffer, { stream: true });
-    return Buffer.from(buffer).toString(this.encoding);
+  StringDecoder.prototype.write = function (buf) {
+    if (typeof buf === "string") return buf;
+    const bytes = toBytes(buf);
+    switch (this.encoding) {
+      case "utf8":
+        return this._dec.decode(bytes, { stream: true });
+      case "utf16le": {
+        let all = this._rest ? Buffer.concat([this._rest, bytes]) : Buffer.from(bytes);
+        let keep = all.length % 2;
+        // Hold back a high surrogate whose low half has not arrived.
+        if (all.length - keep >= 2) {
+          const last = all[all.length - keep - 1];
+          if (last >= 0xd8 && last <= 0xdb) keep += 2;
+        }
+        this._rest = keep ? all.subarray(all.length - keep) : null;
+        return all.subarray(0, all.length - keep).toString("utf16le");
+      }
+      case "base64":
+      case "base64url": {
+        const all = this._rest ? Buffer.concat([this._rest, bytes]) : Buffer.from(bytes);
+        const keep = all.length % 3;
+        this._rest = keep ? all.subarray(all.length - keep) : null;
+        return all.subarray(0, all.length - keep).toString(this.encoding);
+      }
+      default:
+        return Buffer.from(bytes).toString(this.encoding);
+    }
   };
-  StringDecoder.prototype.end = function (buffer) {
-    let out = "";
-    if (buffer && buffer.length) out += this.write(buffer);
-    if (this._utf8) out += this._dec.decode();
+  StringDecoder.prototype.end = function (buf) {
+    let out = buf === undefined ? "" : this.write(buf);
+    if (this._dec) {
+      out += this._dec.decode();
+    } else if (this._rest) {
+      out += this._rest.toString(this.encoding);
+      this._rest = null;
+    }
     return out;
   };
+  StringDecoder.prototype.text = function (buf, offset) {
+    this._rest = null;
+    if (this._dec) this._dec = new TextDecoder("utf-8");
+    return this.write(toBytes(buf).subarray(offset));
+  };
+  Object.defineProperties(StringDecoder.prototype, {
+    lastNeed: { get() { return this._rest ? (this.encoding === "utf16le" ? 2 : 3) - this._rest.length : 0; }, configurable: true },
+    lastTotal: { get() { return this._rest ? (this.encoding === "utf16le" ? 2 : 3) : 0; }, configurable: true },
+    lastChar: { get() { return Buffer.from(this._rest ?? []); }, configurable: true },
+  });
   __builtins.set("string_decoder", { StringDecoder });
 }
 

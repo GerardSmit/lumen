@@ -475,9 +475,10 @@ pub mod embed {
 
     // Typed bindings: conversion traits, op/class descriptors, promises (see `embed_convert`).
     pub use crate::embed_convert::{
-        ArgCx, ArrayElem, BigI64, BigU64, Class, ClassDesc, CtorReturn, Deferred, FastKind,
-        FastPtr, FastSig, FromJs, IntoJs, JsArrayBuffer, JsFunction, JsObject, MemberDesc,
-        MemberKind, OpDesc, OpError, OpResult, Promise, Slot, State, This,
+        ArgCx, ArrayElem, AsyncHost, BigI64, BigU64, Class, ClassDesc, Completer, CtorReturn,
+        Deferred, FastKind, FastPtr, FastSig, FromJs, IntoJs, JsArrayBuffer, JsFunction, JsObject,
+        MemberDesc, MemberKind, OpDesc, OpError, OpResult, Promise, SendError, Settle, Slot, State,
+        This,
     };
     #[doc(hidden)]
     pub use crate::embed_convert::private as __private;

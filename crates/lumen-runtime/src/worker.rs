@@ -390,7 +390,11 @@ fn run_worker(
         rt.start_main(&spec.entry)
     } else {
         match std::fs::read_to_string(&spec.entry) {
-            Ok(source) => rt.eval_worker_entry(&source, &spec.entry, spec.is_module),
+            Ok(source) => rt.eval_worker_entry(
+                &crate::import_source_text(source),
+                &spec.entry,
+                spec.is_module,
+            ),
             Err(e) => Err(format!("cannot load worker script {}: {e}", spec.entry)),
         }
     };

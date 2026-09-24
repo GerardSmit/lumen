@@ -14,6 +14,12 @@ pub(crate) fn nf_code_point_at(
         return Ok(Value::Undefined);
     }
     let idx = n as usize;
+    if s.ascii_hint() {
+        return Ok(s
+            .as_bytes()
+            .get(idx)
+            .map_or(Value::Undefined, |&b| Value::Num(b as f64)));
+    }
     Ok(match i.unit_at(&s, idx) {
         Some(u) if (0xD800..0xDC00).contains(&u) => match i.unit_at(&s, idx + 1) {
             Some(lo) if (0xDC00..0xE000).contains(&lo) => {

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use lumen_host::{ops, CompletionSender, Ctx, OpDecl, TaskId, TaskRegistry, Value};
@@ -25,9 +25,41 @@ struct ExtraPipe {
     writer: WriteStream,
 }
 
+/// A spawned process: std's `Child`, or (Windows, extra stdio slots) one created directly with
+/// `CreateProcessW` — see `win_spawn`.
+enum ProcHandle {
+    Std(Child),
+    #[cfg(windows)]
+    Raw(crate::win_spawn::RawChild),
+}
+
+impl ProcHandle {
+    #[cfg(unix)]
+    fn id(&self) -> u32 {
+        match self {
+            ProcHandle::Std(c) => c.id(),
+        }
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            ProcHandle::Std(c) => c.kill(),
+            #[cfg(windows)]
+            ProcHandle::Raw(c) => c.kill(),
+        }
+    }
+    /// `Some((code, signal))` once exited.
+    fn try_wait(&mut self) -> std::io::Result<Option<(Option<i32>, Option<i32>)>> {
+        match self {
+            ProcHandle::Std(c) => Ok(c.try_wait()?.map(|s| (s.code(), exit_signal(&s)))),
+            #[cfg(windows)]
+            ProcHandle::Raw(c) => Ok(c.try_wait()?.map(|code| (Some(code), None))),
+        }
+    }
+}
+
 struct ChildProc {
-    child: Arc<Mutex<Child>>,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    child: Arc<Mutex<ProcHandle>>,
+    stdin: WriteStream,
     stdout: ReadStream,
     stderr: ReadStream,
     extra: HashMap<u32, ExtraPipe>,
@@ -261,6 +293,13 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let cmd = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
+    #[cfg(windows)]
+    if args
+        .get(4)
+        .is_some_and(|v| read_string_array(ctx, v).is_ok_and(|s| s.iter().skip(3).any(|k| k == "pipe")))
+    {
+        return spawn_windows_extra(ctx, &cmd, args);
+    }
     let (mut command, stdio) = build_command(ctx, &cmd, args)?;
     command
         .stdin(stdio_for(&stdio[0]))
@@ -274,15 +313,20 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let pid = child.id();
     let stdout: Option<Box<dyn Read + Send>> = child.stdout.take().map(|s| Box::new(s) as _);
     let stderr: Option<Box<dyn Read + Send>> = child.stderr.take().map(|s| Box::new(s) as _);
+    let stdin: Option<Box<dyn Write + Send>> = child.stdin.take().map(|s| Box::new(s) as _);
     let proc = ChildProc {
-        stdin: Arc::new(Mutex::new(child.stdin.take())),
+        stdin: Arc::new(Mutex::new(stdin)),
         stdout: Arc::new(Mutex::new(stdout)),
         stderr: Arc::new(Mutex::new(stderr)),
         extra,
-        child: Arc::new(Mutex::new(child)),
+        child: Arc::new(Mutex::new(ProcHandle::Std(child))),
         unref: false,
         pending_tasks: Vec::new(),
     };
+    Ok(register_child(ctx, proc, pid))
+}
+
+fn register_child(ctx: &mut Ctx, proc: ChildProc, pid: u32) -> Value {
     let reg = ctx
         .host_mut::<ChildRegistry>()
         .expect("child registry installed");
@@ -293,7 +337,83 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let o = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&o, "childId", Value::Num(id as f64));
     let _ = ctx.set_member(&o, "pid", Value::Num(pid as f64));
-    Ok(o)
+    o
+}
+
+/// Windows spawn with extra stdio slots: `std::process::Command` cannot pass fds 3+, so the
+/// child is created directly and gets them through the C runtime's inheritance block, as
+/// libuv does (see `win_spawn`).
+#[cfg(windows)]
+fn spawn_windows_extra(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Value, Value> {
+    let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
+    let cwd = opt_string(ctx, args.get(2));
+    let env_pairs = args.get(3).cloned().unwrap_or(Value::Undefined);
+    let mut stdio = read_string_array(ctx, args.get(4).unwrap_or(&Value::Undefined))?;
+    while stdio.len() < 3 {
+        stdio.push("pipe".to_string());
+    }
+    let verbatim = matches!(args.get(5), Some(Value::Bool(true)));
+    // The same cwd rule as `apply_cwd`: the one asked for (relative to the realm's), else the
+    // realm's, else inherited.
+    let cwd = match ctx.op_state().get::<lumen_host::RealmProcess>() {
+        Some(realm) => Some(match &cwd {
+            Some(c) => realm.resolve(c),
+            None => realm.cwd.clone(),
+        }),
+        None => cwd.map(std::path::PathBuf::from),
+    };
+    let env = if env_pairs.as_obj().is_some() {
+        let mut pairs = Vec::new();
+        if let Ok(Value::Num(n)) = ctx.get_member(&env_pairs, "length") {
+            for i in 0..(n as usize) {
+                let pair = ctx
+                    .get_member(&env_pairs, &i.to_string())
+                    .unwrap_or(Value::Undefined);
+                let k = ctx.get_member(&pair, "0").unwrap_or(Value::Undefined);
+                let v = ctx.get_member(&pair, "1").unwrap_or(Value::Undefined);
+                pairs.push((
+                    ctx.coerce_string(&k)?.to_string(),
+                    ctx.coerce_string(&v)?.to_string(),
+                ));
+            }
+        }
+        Some(pairs)
+    } else {
+        None
+    };
+    let spec = crate::win_spawn::SpawnSpec {
+        program: cmd,
+        args: &arg_list,
+        verbatim,
+        cwd,
+        env,
+        stdio: &stdio,
+    };
+    let spawned = crate::win_spawn::spawn(&spec).map_err(|e| spawn_failure(ctx, cmd, &e))?;
+    let pid = spawned.child.id();
+    let extra = spawned
+        .extra
+        .into_iter()
+        .map(|(fd, r, w)| {
+            (
+                fd,
+                ExtraPipe {
+                    reader: Arc::new(Mutex::new(Some(r))),
+                    writer: Arc::new(Mutex::new(Some(w))),
+                },
+            )
+        })
+        .collect();
+    let proc = ChildProc {
+        stdin: Arc::new(Mutex::new(spawned.stdin)),
+        stdout: Arc::new(Mutex::new(spawned.stdout)),
+        stderr: Arc::new(Mutex::new(spawned.stderr)),
+        extra,
+        child: Arc::new(Mutex::new(ProcHandle::Raw(spawned.child))),
+        unref: false,
+        pending_tasks: Vec::new(),
+    };
+    Ok(register_child(ctx, proc, pid))
 }
 
 fn take_resolve_reject(
@@ -442,7 +562,7 @@ fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         let result: Result<(Option<i32>, Option<i32>), String> = loop {
             {
                 match handle.lock().expect("child lock").try_wait() {
-                    Ok(Some(status)) => break Ok((status.code(), exit_signal(&status))),
+                    Ok(Some(status)) => break Ok(status),
                     Ok(None) => {}
                     Err(e) => break Err(e.to_string()),
                 }
@@ -588,7 +708,7 @@ fn op_kill(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 #[cfg(unix)]
-fn send_signal(child: &Arc<Mutex<Child>>, signal: i32) -> bool {
+fn send_signal(child: &Arc<Mutex<ProcHandle>>, signal: i32) -> bool {
     let mut child = child.lock().expect("child lock");
     if signal == 9 {
         return child.kill().is_ok();
@@ -603,7 +723,7 @@ fn send_signal(child: &Arc<Mutex<Child>>, signal: i32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn send_signal(child: &Arc<Mutex<Child>>, _signal: i32) -> bool {
+fn send_signal(child: &Arc<Mutex<ProcHandle>>, _signal: i32) -> bool {
     child.lock().expect("child lock").kill().is_ok()
 }
 

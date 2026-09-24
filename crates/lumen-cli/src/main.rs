@@ -5,6 +5,7 @@
 //!   lumen-cli repl                     repl explicitly (even when piped — for scripting it)
 //!   lumen-cli <file.js> [args...]      run a script to loop quiescence
 //!   lumen-cli -e '<code>'              evaluate a string
+//!   lumen-cli -p '<code>'              evaluate a string and print its result (Node's --print)
 //!   lumen-cli -v | --version           print the version
 //!   --tier=interp|bytecode, --tier-threshold=N   select the engine execution tier
 
@@ -13,6 +14,12 @@ use std::io::{IsTerminal, Read};
 use lumen_host::Completion;
 use lumen_repl::Repl;
 use lumen_runtime::Runtime;
+
+/// The engine's size-class allocator: JS workloads are dominated by millions of short-lived
+/// same-sized blocks (objects, scopes, strings), where the system allocator is slowest.
+#[cfg(not(target_arch = "wasm32"))]
+#[global_allocator]
+static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;
 
 /// The interpreter, the regex backtracker and the JSON/structured-clone walkers all recurse on
 /// the native stack, and a debug build's frames are several KiB each — deep enough JS recursion
@@ -35,6 +42,7 @@ fn real_main() {
     let mut tier = None;
     let mut threshold = None;
     let mut eval_source = None;
+    let mut print_result = false;
     let mut file = None;
     let mut force_repl = false;
     let mut expose_gc = false;
@@ -64,6 +72,12 @@ fn real_main() {
                 Some(code) => eval_source = Some(code),
                 None => die(2, "-e expects code"),
             }
+        } else if a == "-p" || a == "--print" || a == "-pe" || a == "-ep" {
+            match args.next() {
+                Some(code) => eval_source = Some(code),
+                None => die(2, &format!("{a} expects code")),
+            }
+            print_result = true;
         } else if a == "repl" && file.is_none() {
             force_repl = true;
         } else if a == "-h" || a == "--help" {
@@ -111,7 +125,24 @@ fn real_main() {
     }
 
     if let Some(code) = eval_source {
-        run_source(&mut runtime, &code);
+        // Node's [eval] context: module/exports/__filename/__dirname are globals.
+        let _ = runtime.eval(
+            "(function () { try { const M = require('module'); const m = new M('[eval]'); \
+             m.filename = require('path').join(process.cwd(), '[eval]'); \
+             if (typeof M._nodeModulePaths === 'function') m.paths = M._nodeModulePaths(process.cwd()); \
+             globalThis.module = m; globalThis.exports = m.exports; } catch {} \
+             globalThis.__filename = '[eval]'; globalThis.__dirname = '.'; })();",
+        );
+        if print_result {
+            // Node's -p: the script's completion value is console.log'd at process exit.
+            let wrapped = format!(
+                "(function (r) {{ process.on(\"exit\", function () {{ console.log(r); }}); }})((0, eval)({}));",
+                js_string_literal(&code)
+            );
+            run_source(&mut runtime, &wrapped);
+        } else {
+            run_source(&mut runtime, &code);
+        }
     } else if let Some(path) = file {
         if !std::path::Path::new(&path).is_file() {
             die(2, &format!("cannot read {path}: not a file"));
@@ -144,6 +175,26 @@ fn real_main() {
         }
         run_source(&mut runtime, &src);
     }
+}
+
+/// `s` as a double-quoted JS string literal.
+fn js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Evaluate + loop to quiescence; uncaught top-level throws exit 1 (console output already

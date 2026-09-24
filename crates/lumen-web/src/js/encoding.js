@@ -67,61 +67,112 @@ function atob(data) {
   return out;
 }
 
-function structuredClone(value) {
-  // No transfer list yet; throws DataCloneError exactly where the spec does.
-  const seen = new Map();
-  const clone = (v) => {
-    if (typeof v === "function" || typeof v === "symbol") {
-      throw new DOMException("value could not be cloned", "DataCloneError");
+// HTML's StructuredSerializeWithTransfer + deserialize, done in one in-realm pass. Throws
+// DataCloneError exactly where the spec does; transferred ArrayBuffers are detached afterwards.
+const CLONE_ERROR_NAMES = new Set(["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError"]);
+const cloneAbByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+const cloneTypedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
+const cloneBrand = (fn, v) => { try { fn.call(v); return true; } catch { return false; } };
+const cloneIsArrayBuffer = (v) => cloneBrand(cloneAbByteLength, v);
+function cloneDataCloneError(message) {
+  return new DOMException(message, "DataCloneError");
+}
+
+function structuredClone(value, options) {
+  if (arguments.length === 0) throw new TypeError("The \"value\" argument must be specified");
+  let transfer = [];
+  if (options !== undefined && options !== null) {
+    if (typeof options !== "object" && typeof options !== "function") {
+      throw new TypeError("The \"options\" argument must be of type object.");
     }
+    if (options.transfer !== undefined) {
+      if (options.transfer === null || typeof options.transfer[Symbol.iterator] !== "function") {
+        throw new TypeError("The \"options.transfer\" property must be iterable.");
+      }
+      transfer = [...options.transfer];
+    }
+  }
+  const seen = new Map();
+  for (const t of transfer) {
+    if (!cloneIsArrayBuffer(t)) throw cloneDataCloneError("Found invalid value in transferList.");
+    if (seen.has(t)) throw cloneDataCloneError("ArrayBuffer at index 1 is a duplicate of an earlier ArrayBuffer. Duplicate array buffers are not allowed.");
+    if (t.detached) throw cloneDataCloneError("An ArrayBuffer is detached and could not be cloned.");
+    seen.set(t, t.slice(0));
+  }
+  const clone = (v) => {
+    if (typeof v === "function") throw cloneDataCloneError(`${Function.prototype.toString.call(v)} could not be cloned.`);
+    if (typeof v === "symbol") throw cloneDataCloneError(`${String(v)} could not be cloned.`);
     if (v === null || typeof v !== "object") return v;
     if (seen.has(v)) return seen.get(v);
-    if (v instanceof Date) return new Date(v.getTime());
-    if (v instanceof RegExp) return new RegExp(v.source, v.flags);
-    if (v instanceof Promise) {
-      throw new DOMException("a Promise cannot be cloned", "DataCloneError");
+    let out;
+    if (cloneBrand(Date.prototype.getTime, v)) {
+      out = new Date(Date.prototype.getTime.call(v));
+    } else if (cloneBrand(Boolean.prototype.valueOf, v)) {
+      out = Object(Boolean.prototype.valueOf.call(v));
+    } else if (cloneBrand(Number.prototype.valueOf, v)) {
+      out = Object(Number.prototype.valueOf.call(v));
+    } else if (cloneBrand(String.prototype.valueOf, v)) {
+      out = Object(String.prototype.valueOf.call(v));
+    } else if (cloneBrand(BigInt.prototype.valueOf, v)) {
+      out = Object(BigInt.prototype.valueOf.call(v));
+    } else if (cloneBrand(Symbol.prototype.valueOf, v)) {
+      throw cloneDataCloneError("Symbol object could not be cloned.");
+    } else if (v instanceof RegExp) {
+      out = new RegExp(v.source, v.flags);
+    } else if (v instanceof Promise || v instanceof WeakMap || v instanceof WeakSet || v instanceof WeakRef) {
+      throw cloneDataCloneError(`#<${v.constructor && v.constructor.name || "Object"}> could not be cloned.`);
+    } else if (cloneIsArrayBuffer(v)) {
+      if (v.detached) throw cloneDataCloneError("An ArrayBuffer is detached and could not be cloned.");
+      out = v.slice(0);
+    } else if (cloneTypedArrayTag.call(v) !== undefined) {
+      const Ctor = globalThis[cloneTypedArrayTag.call(v)];
+      out = new Ctor(clone(v.buffer), v.byteOffset, v.length);
+    } else if (v instanceof DataView) {
+      out = new DataView(clone(v.buffer), v.byteOffset, v.byteLength);
+    } else if (v instanceof Map) {
+      out = new Map();
+      seen.set(v, out);
+      for (const [k, val] of v) out.set(clone(k), clone(val));
+      return out;
+    } else if (v instanceof Set) {
+      out = new Set();
+      seen.set(v, out);
+      for (const item of v) out.add(clone(item));
+      return out;
+    } else if (v instanceof Error) {
+      let name = v.name;
+      if (!CLONE_ERROR_NAMES.has(name)) name = "Error";
+      const Ctor = globalThis[name];
+      out = Object.create(Ctor.prototype);
+      seen.set(v, out);
+      const msg = Object.getOwnPropertyDescriptor(v, "message");
+      if (msg && "value" in msg) {
+        Object.defineProperty(out, "message", { value: String(msg.value), writable: true, configurable: true, enumerable: false });
+      }
+      if (typeof v.stack === "string") {
+        Object.defineProperty(out, "stack", { value: v.stack, writable: true, configurable: true, enumerable: false });
+      }
+      if (Object.prototype.hasOwnProperty.call(v, "cause")) {
+        Object.defineProperty(out, "cause", { value: clone(v.cause), writable: true, configurable: true, enumerable: false });
+      }
+      return out;
+    } else if (Array.isArray(v)) {
+      out = new Array(v.length);
+      seen.set(v, out);
+      for (const k of Object.keys(v)) out[k] = clone(v[k]);
+      return out;
+    } else {
+      out = {};
+      seen.set(v, out);
+      for (const k of Object.keys(v)) out[k] = clone(v[k]);
+      return out;
     }
-    if (v instanceof ArrayBuffer) {
-      const c = v.slice(0);
-      seen.set(v, c);
-      return c;
-    }
-    if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
-      const c = new v.constructor(v);
-      seen.set(v, c);
-      return c;
-    }
-    if (v instanceof Map) {
-      const m = new Map();
-      seen.set(v, m);
-      for (const [k, val] of v) m.set(clone(k), clone(val));
-      return m;
-    }
-    if (v instanceof Set) {
-      const s = new Set();
-      seen.set(v, s);
-      for (const item of v) s.add(clone(item));
-      return s;
-    }
-    if (v instanceof Error) {
-      const ctor = typeof v.constructor === "function" ? v.constructor : Error;
-      const e = new ctor(v.message);
-      e.name = v.name;
-      seen.set(v, e);
-      return e;
-    }
-    if (Array.isArray(v)) {
-      const a = [];
-      seen.set(v, a);
-      for (let i = 0; i < v.length; i++) if (i in v) a[i] = clone(v[i]);
-      return a;
-    }
-    const o = {};
-    seen.set(v, o);
-    for (const k of Object.keys(v)) o[k] = clone(v[k]);
-    return o;
+    seen.set(v, out);
+    return out;
   };
-  return clone(value);
+  const result = clone(value);
+  for (const t of transfer) t.transfer(); // detach the originals
+  return result;
 }
 
 globalThis.TextEncoder = TextEncoder;

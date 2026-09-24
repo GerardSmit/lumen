@@ -7,6 +7,7 @@
 mod arrays;
 mod bindings;
 mod constructor_body;
+mod generator_body;
 mod this_binding;
 pub(crate) use bindings::BindingLayout;
 pub use bindings::VarMap;
@@ -703,11 +704,6 @@ pub struct Interp {
     /// the proof lapses. Every defineProperty / proto swap / structural change to a marked
     /// prototype bumps the epoch, forcing a re-verify.
     pub(crate) elems_protector: std::cell::Cell<(u32, bool)>,
-    /// Small final named-map sizes learned from successful ordinary construction, keyed and
-    /// weak-pinned by constructor identity, so fresh instances can reserve enough slots for
-    /// creation-IC appends.
-    pub(crate) construct_capacity_hints:
-        crate::fasthash::FastMap<usize, (crate::value::WeakGc, u8)>,
     /// `Symbol.iterator`, cached so the iterator protocol can look up `obj[@@iterator]` cheaply.
     pub(crate) iterator_sym: Option<Rc<SymbolData>>,
     /// Well-known symbols, minted once per Interp — additional realms (`$262.createRealm()`) reuse
@@ -749,6 +745,8 @@ pub struct Interp {
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
+    /// Shape-keyed memo state for the language fast paths (`eval::fastpaths`).
+    pub(crate) lang: crate::eval::fastpaths::LangCaches,
     /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer.
     pub(crate) array_buffers: crate::fasthash::FastMap<usize, crate::bytebuf::ByteBuf>,
     /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
@@ -1274,7 +1272,6 @@ impl Interp {
             eval_fn: None,
             eval_realm_fns: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
-            construct_capacity_hints: Default::default(),
             iterator_sym: None,
             wk_syms: Vec::new(),
             short_circuit: false,
@@ -1307,6 +1304,7 @@ impl Interp {
             regexp_last: None,
             map_data: Default::default(),
             extra_protos: Default::default(),
+            lang: Default::default(),
             array_buffers: Default::default(),
             shared_buffers: Default::default(),
             immutable_buffers: std::collections::HashSet::new(),
@@ -1730,6 +1728,19 @@ impl Interp {
     pub fn is_proxy_value(&self, v: &Value) -> bool {
         self.object_addr(v)
             .is_some_and(|ptr| self.proxies.contains_key(&ptr))
+    }
+
+    /// `(status, value)` of a promise (0 pending, 1 fulfilled, 2 rejected), for hosts that
+    /// render promises the way Node's `util.inspect` does. `None` for a non-promise.
+    pub fn promise_state_for_host(&self, v: &Value) -> Option<(u8, Value)> {
+        let ptr = self.object_addr(v)?;
+        self.promises.get(&ptr).map(|p| (p.status, p.value.clone()))
+    }
+
+    /// `(target, handler)` of a proxy, for `util.inspect(proxy, { showProxy: true })`.
+    pub fn proxy_parts_for_host(&self, v: &Value) -> Option<(Value, Value)> {
+        let ptr = self.object_addr(v)?;
+        self.proxies.get(&ptr).cloned()
     }
 
     /// End this realm now: every safe point from here on throws (see `Engine::set_interrupt`).
@@ -2309,7 +2320,7 @@ impl Interp {
                 named: std::cell::OnceCell::new(),
             })
         });
-        let obj = Object::new(Some(fn_proto));
+        let obj = Object::new_bare(Some(fn_proto));
         {
             let mut b = obj.borrow_mut();
             b.call = Callable::user(func.clone(), env);
@@ -2322,7 +2333,7 @@ impl Interp {
                 _ => None,
             }
             .or_else(|| Some(self.object_proto.clone()));
-            let proto = Object::new(proto_parent);
+            let proto = Object::new_bare(proto_parent);
             {
                 let mut pb = proto.borrow_mut();
                 pb.props = proto_map.as_ref().expect("prototype template").clone();
@@ -2433,6 +2444,10 @@ impl Interp {
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return None;
         }
+        if !o.borrow().ic_plain.get() {
+            // Side-table objects: only a TypedArray has an element fast path.
+            return self.fast_ta_get(o, n as usize);
+        }
         if !self.plain_for_elems(o) {
             return None;
         }
@@ -2448,6 +2463,100 @@ impl Interp {
         Some(p.value())
     }
 
+    /// The byte range and element count behind a non-BigInt TypedArray over an ordinary
+    /// (non-shared) ArrayBuffer: `Some((info, len))`, `len == 0` when the view is detached or out
+    /// of bounds (every index invalid). `None` = not such a TypedArray (take the generic path).
+    #[inline]
+    fn ta_fast_view(&self, o: &Gc) -> Option<(TaInfo, usize)> {
+        let info = *self.typed_arrays.get(&(Gc::as_ptr(o) as usize))?;
+        if info.kind.is_bigint()
+            || (!self.shared_buffers.is_empty() && self.shared_buffers.contains_key(&info.buffer))
+        {
+            return None;
+        }
+        let buflen = self.array_buffers.get(&info.buffer)?.len();
+        let es = info.kind.elsize();
+        let len = if info.track {
+            buflen.saturating_sub(info.offset) / es
+        } else if info.offset + info.len * es > buflen {
+            0
+        } else {
+            info.len
+        };
+        Some((info, len))
+    }
+
+    /// `ta[idx]` for an integer index on a Number-kind TypedArray (IntegerIndexedElementGet:
+    /// an invalid index reads `undefined` — never the prototype chain).
+    #[inline(never)]
+    pub(crate) fn fast_ta_get(&self, o: &Gc, idx: usize) -> Option<Value> {
+        let info = self.typed_arrays.get(&(Gc::as_ptr(o) as usize))?;
+        if info.kind.is_bigint()
+            || (!self.shared_buffers.is_empty() && self.shared_buffers.contains_key(&info.buffer))
+        {
+            return None;
+        }
+        let buf: &[u8] = self.array_buffers.get(&info.buffer)?;
+        let es = info.kind.elsize();
+        let len = if info.track {
+            buf.len().saturating_sub(info.offset) / es
+        } else if info.offset + info.len * es > buf.len() {
+            0
+        } else {
+            info.len
+        };
+        if idx >= len {
+            return Some(Value::Undefined);
+        }
+        let start = info.offset + idx * es;
+        Some(Value::Num(info.kind.read(&buf[start..start + es])))
+    }
+
+    /// `ta[idx] = v` for an integer index on a Number-kind TypedArray when `v` is already a
+    /// Number (so the spec's ToNumber is unobservable): TypedArraySetElement — an invalid index
+    /// is a silent no-op. Immutable buffers and anything else hand `v` back for the generic path.
+    #[inline(never)]
+    pub(crate) fn fast_ta_set(&mut self, o: &Gc, idx: usize, v: Value) -> Result<(), Value> {
+        let Value::Num(n) = v else {
+            return Err(v);
+        };
+        let Some((info, len)) = self.ta_fast_view(o) else {
+            return Err(v);
+        };
+        if !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&info.buffer) {
+            return Err(v);
+        }
+        if idx >= len {
+            return Ok(());
+        }
+        let es = info.kind.elsize();
+        let start = info.offset + idx * es;
+        let Some(buf) = self.array_buffers.get_mut(&info.buffer) else {
+            return Err(v);
+        };
+        let dst = &mut buf[start..start + es];
+        // The integer conversions of `TaKind::write`, without its `Vec`: modulo 2^32 (a plain
+        // `as i64` saturates at |n| >= 2^63, so 1e20 would store -1 instead of 0).
+        let int = |n: f64| {
+            if !n.is_finite() {
+                0
+            } else if n.abs() < 9223372036854775808.0 {
+                n.trunc() as i64
+            } else {
+                n.trunc().rem_euclid(4294967296.0) as i64
+            }
+        };
+        match info.kind {
+            TaKind::I8 | TaKind::U8 => dst[0] = int(n) as u8,
+            TaKind::I16 | TaKind::U16 => dst.copy_from_slice(&(int(n) as u16).to_le_bytes()),
+            TaKind::I32 | TaKind::U32 => dst.copy_from_slice(&(int(n) as u32).to_le_bytes()),
+            TaKind::F32 => dst.copy_from_slice(&(n as f32).to_le_bytes()),
+            TaKind::F64 => dst.copy_from_slice(&n.to_le_bytes()),
+            k => dst.copy_from_slice(&k.write(n)),
+        }
+        Ok(())
+    }
+
     /// `o[n] = v` write fast path: overwrite an existing own writable dense data element.
     /// Correct regardless of the prototype chain — an own writable data property always wins
     /// OrdinarySet. Returns the value back on miss so the caller runs the generic path.
@@ -2455,6 +2564,9 @@ impl Interp {
     pub(crate) fn fast_set_elem(&mut self, o: &Gc, n: f64, mut v: Value) -> Result<(), Value> {
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return Err(v);
+        }
+        if !o.borrow().ic_plain.get() {
+            return self.fast_ta_set(o, n as usize, v);
         }
         if (!self.module_ns.is_empty() || !self.deferred_ns.is_empty()) && {
             let ptr = Gc::as_ptr(o) as usize;
@@ -2958,9 +3070,21 @@ impl Interp {
         // Shape fast path (own writable data property), every way: a shape match means `slot`
         // still maps `name`; skip the key compare. `accessor`/`writable` are re-checked (an
         // in-place defineProperty could have flipped them without changing the shape).
+        //
+        // The same pass tries the creation ways (see IC_CREATE): a shared base constructor
+        // commonly initializes subclass instances that have the same empty shape but distinct
+        // prototypes. Shape + epoch + prototype identity re-prove the fill-time chain walk, and
+        // the recorded child shape makes the insert a plain append. Creation sites (every
+        // `this.x = v` in a constructor) must not pay the stub-cache probe below, whose table
+        // is a likely cache miss.
+        let shape = b.props.shape();
+        let mut creation = false;
         for k in 0..crate::bytecode::PROP_IC_WAYS {
             let st = self.ic_way(cache, k).get();
-            if st.depth == 0 && b.props.shape() == st.recv_shape {
+            if st.recv_shape != shape {
+                continue;
+            }
+            if st.depth == 0 {
                 if let Some(p) = b.props.entry_at(st.slot as usize) {
                     if !p.accessor() && p.writable() {
                         b.props
@@ -2970,34 +3094,11 @@ impl Interp {
                         return true;
                     }
                 }
+            } else if st.depth == crate::bytecode::IC_CREATE {
+                creation = true;
             }
         }
-        // Stub-cache probe (shared with the get path — a depth-0 entry means "this shape maps
-        // this name at this slot", and accessor/writable are re-checked live either way): a
-        // store site rotating through more shapes than its ways still resolves without the
-        // hashed existence scan below. Promote into way 1 like the get path does.
-        {
-            let shape = b.props.shape();
-            let e = self.stub_cache[stub_slot(shape, name)].get();
-            if e.name == name.as_ptr() as usize && e.st.recv_shape == shape && e.st.depth == 0 {
-                if let Some(p) = b.props.entry_at(e.st.slot as usize) {
-                    if !p.accessor() && p.writable() {
-                        b.props
-                            .entry_at_mut(e.st.slot as usize)
-                            .unwrap()
-                            .set_value(v.clone());
-                        self.ic_insert(cache, e.st);
-                        return true;
-                    }
-                }
-            }
-        }
-        // Creation fast path (see IC_CREATE), every polymorphic way: a shared base constructor
-        // commonly initializes subclass instances that have the same empty shape but distinct
-        // prototypes. Shape + epoch + prototype identity re-prove the fill-time chain walk, and
-        // the recorded child shape makes the insert a plain append.
-        if b.extensible {
-            let shape = b.props.shape();
+        if creation && b.extensible {
             let epoch = crate::value::proto_epoch();
             let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
             for way in 0..crate::bytecode::PROP_IC_WAYS {
@@ -3014,6 +3115,25 @@ impl Interp {
                             Property::plain(v.clone()),
                             st.holder_shape,
                         );
+                        return true;
+                    }
+                }
+            }
+        }
+        // Stub-cache probe (shared with the get path — a depth-0 entry means "this shape maps
+        // this name at this slot", and accessor/writable are re-checked live either way): a
+        // store site rotating through more shapes than its ways still resolves without the
+        // hashed existence scan below. Promote into way 1 like the get path does.
+        {
+            let e = self.stub_cache[stub_slot(shape, name)].get();
+            if e.name == name.as_ptr() as usize && e.st.recv_shape == shape && e.st.depth == 0 {
+                if let Some(p) = b.props.entry_at(e.st.slot as usize) {
+                    if !p.accessor() && p.writable() {
+                        b.props
+                            .entry_at_mut(e.st.slot as usize)
+                            .unwrap()
+                            .set_value(v.clone());
+                        self.ic_insert(cache, e.st);
                         return true;
                     }
                 }
@@ -3441,13 +3561,19 @@ impl Interp {
                                         // (the body never names it) — conjure it now.
                                         let lazy = match self.fn_frames[k].extra.as_deref() {
                                             Some(x) if matches!(x.args_obj, Value::Null) => {
-                                                x.lazy.clone()
+                                                x.lazy.clone().map(|l| (l, x.unmapped))
                                             }
                                             _ => None,
                                         };
-                                        if let Some((func, args, scope)) = lazy {
+                                        if let Some(((func, args, scope), unmapped)) = lazy {
                                             let ao =
                                                 self.make_arguments_object(&func, &args, &scope, r);
+                                            if unmapped {
+                                                let p = Gc::as_ptr(&ao) as usize;
+                                                if self.mapped_arguments.remove(&p).is_some() {
+                                                    self.gc_pins.remove(&p);
+                                                }
+                                            }
                                             if let Some(x) = self.fn_frames[k].extra.as_deref_mut()
                                             {
                                                 x.args_obj = Value::Obj(ao);
@@ -4347,6 +4473,9 @@ impl Interp {
         if let Callable::User(user) = &o.borrow().call {
             out.push(user.env.clone());
         }
+        if self.mapped_arguments.is_empty() && self.class_info.is_empty() {
+            return;
+        }
         let ptr = Gc::as_ptr(o) as usize;
         if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
             out.push(env.clone());
@@ -4521,9 +4650,8 @@ impl Interp {
             }
         }
 
-        // `gc_internal` doubles as the O(1) raw-registry slot outside collection. Restore it
-        // before the sweep clears any property/side-table edge that could drop an object.
-        crate::value::gc_restore_registry_slots();
+        // `gc_internal` is pure collection scratch (every collection starts with `gc_reset`),
+        // so the marks are simply left in place for the sweep below.
 
         // Sweep: clear unmarked (garbage) objects to break their cycles; once `live` drops, their
         // refcounts hit zero and they are freed. Also evict them from pointer-keyed side tables so a
@@ -4537,26 +4665,15 @@ impl Interp {
                     garbage += 1;
                 }
                 let ptr = Gc::as_ptr(o) as usize;
-                self.class_info.remove(&ptr);
-                self.map_data.remove(&ptr);
-                self.typed_arrays.remove(&ptr);
-                self.data_views.remove(&ptr);
-                self.regexps.remove(&ptr);
-                self.proxies.remove(&ptr);
-                self.promises.remove(&ptr);
-                self.temporal.remove(&ptr);
-                self.array_buffers.remove(&ptr);
-                self.ta_buffer.remove(&ptr);
-                self.shared_buffers.remove(&ptr);
-                self.immutable_buffers.remove(&ptr);
-                self.generators.remove(&ptr);
-                self.async_gens.remove(&ptr);
-                self.async_gen_busy.remove(&ptr);
-                self.async_gen_queue.remove(&ptr);
-                self.mapped_arguments.remove(&ptr);
-                self.deferred_ns.remove(&ptr);
-                self.promise_forward.remove(&ptr);
-                self.gc_pins.remove(&ptr);
+                // Most tables are empty in most programs: skip them without hashing.
+                macro_rules! evict {
+                    ($($t:ident),*) => {$(
+                        if !self.$t.is_empty() {
+                            self.$t.remove(&ptr);
+                        }
+                    )*};
+                }
+                evict!(class_info, map_data, typed_arrays, data_views, regexps, proxies, promises, temporal, array_buffers, ta_buffer, shared_buffers, immutable_buffers, generators, async_gens, async_gen_busy, async_gen_queue, mapped_arguments, deferred_ns, promise_forward, gc_pins);
                 let mut b = o.borrow_mut();
                 b.props.clear();
                 b.proto = None;
@@ -4592,8 +4709,11 @@ impl Interp {
         if std::env::var_os("LUMEN_HEAP_CENSUS").is_some() {
             self.heap_census();
         }
+        // Rate-limited: a steady cyclic-garbage churn collects every few milliseconds, and
+        // draining the allocator cache each time turned every later allocation into a system
+        // heap call until the cache refilled.
         #[cfg(not(target_arch = "wasm32"))]
-        if garbage >= 50_000 {
+        if garbage >= 50_000 && crate::value::gc_allocator_trim_due() {
             crate::fastalloc::trim();
         }
     }
@@ -5339,27 +5459,25 @@ impl Interp {
         r
     }
 
+    /// Slack tracking: the small final named-map size this constructor's instances reached
+    /// (stored on the constructor's own map, see `Props::construct_capacity_hint`).
+    #[inline]
     pub(crate) fn learned_construct_capacity(&self, constructor: &Gc) -> usize {
-        let key = Gc::as_ptr(constructor) as usize;
-        self.construct_capacity_hints
-            .get(&key)
-            .and_then(|(pin, capacity)| {
-                (pin.as_ptr() == Gc::as_ptr(constructor)).then_some(*capacity as usize)
-            })
-            .unwrap_or(0)
+        constructor
+            .try_borrow()
+            .map_or(0, |c| c.props.construct_capacity_hint())
     }
 
+    #[inline]
     pub(crate) fn observe_construct_capacity(&mut self, constructor: &Gc, instance: &Gc) {
-        let observed = instance.borrow().props.observed_instance_capacity();
+        let observed = instance
+            .try_borrow()
+            .map_or(0, |i| i.props.observed_instance_capacity());
         if observed == 0 {
             return;
         }
-        let key = Gc::as_ptr(constructor) as usize;
-        if let Some((_, capacity)) = self.construct_capacity_hints.get_mut(&key) {
-            *capacity = (*capacity).max(observed as u8);
-        } else if self.construct_capacity_hints.len() < 65536 {
-            self.construct_capacity_hints
-                .insert(key, (Gc::downgrade(constructor), observed as u8));
+        if let Ok(c) = constructor.try_borrow() {
+            c.props.note_construct_capacity(observed);
         }
     }
 
@@ -5377,6 +5495,12 @@ impl Interp {
         if let Err(e) = func.ensure_body() {
             return Err(self.throw("SyntaxError", e.message));
         }
+        // A generator whose body compiles runs on a bytecode coroutine (`VmCoro`).
+        if func.is_generator {
+            if let Some(r) = self.call_compiled_generator(func, &closure, &this, args, fn_obj) {
+                return r;
+            }
+        }
         // Eligible synchronous bodies use compiled slots, with a real activation only when
         // capture analysis requires one. Compiler refusals retain the tree-walker fallback.
         // Plain and base-class constructor bodies qualify: run_constructor_on has already
@@ -5388,10 +5512,12 @@ impl Interp {
         if !matches!(self.tier, crate::bytecode::Tier::Interp)
             && !func.is_generator
             && !func.is_async
-            && (!is_construct || self.constructor_body_can_compile(fn_obj))
             // Closures under a `with` scope stay on the tree-walker (see `Scope::under_with`).
             && !closure.borrow().under_with
         {
+            // A derived class construct runs only a chunk compiled in derived mode (TDZ `this`,
+            // super(), the derived return rule), and such a chunk runs nothing else.
+            let derived_construct = is_construct && !self.constructor_body_can_compile(fn_obj);
             if func.code.get().is_none() {
                 let n = func.calls.get().saturating_add(1);
                 func.calls.set(n);
@@ -5408,7 +5534,11 @@ impl Interp {
                     let _ = func.code.set(compiled);
                 }
             }
-            if let Some(Some(chunk)) = func.code.get() {
+            if let Some(Some(chunk)) = func
+                .code
+                .get()
+                .filter(|c| matches!(c, Some(c) if c.is_derived() == derived_construct))
+            {
                 let chunk = chunk.clone();
                 let this_val = self.bind_compiled_this(func, &chunk, this, is_construct);
                 // A construct consumes the pending new.target exactly like the slow path, so a
@@ -5501,11 +5631,13 @@ impl Interp {
             } else {
                 Value::Undefined
             };
-            // An ordinary function body is not class-field-initializer code, nor an async
-            // generator's own body (an arrow inherits both).
+            // An ordinary function body is not class-field-initializer code (an arrow inherits
+            // that).
             self.in_field_init_code = false;
-            self.in_async_gen_body = false;
         }
+        // No function body — not even an arrow's — is an async generator's own body: its
+        // `return <expr>` must not await (see `Stmt::Return`).
+        self.in_async_gen_body = false;
 
         if !func.is_arrow {
             let scan = func.scan_flags();

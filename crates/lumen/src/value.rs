@@ -37,16 +37,25 @@ pub struct WeakGc(std::ptr::NonNull<GcBox>);
 const WEAK_DANGLING: usize = usize::MAX;
 
 impl Gc {
-    /// Place a new object in `state`'s slab.
-    #[inline]
-    fn alloc(state: &GcState, cell: RefCell<Object>) -> Gc {
-        let p = state.heap.borrow_mut().alloc();
+    /// Place a new object in `state`'s slab. With [`heap::SlotClass::Inline`] the box is
+    /// followed by [`heap::INLINE_PROPS`] property slots, which the object's map adopts as its
+    /// entry storage when its entries fit.
+    #[inline(always)]
+    fn alloc(state: &GcState, cell: RefCell<Object>, class: heap::SlotClass) -> Gc {
+        let p = state.heap.borrow_mut().alloc(&state.live, class);
         unsafe {
             p.write(GcBox {
                 strong: Cell::new(1),
                 weak: Cell::new(1),
                 value: cell,
             });
+            if class == heap::SlotClass::Inline {
+                (*p).value
+                    .get_mut()
+                    .props
+                    .entries
+                    .move_to_inline(heap::inline_props(p), heap::INLINE_PROPS);
+            }
             Gc(std::ptr::NonNull::new_unchecked(p))
         }
     }
@@ -110,21 +119,6 @@ impl Gc {
             None
         }
     }
-    #[inline]
-    pub fn try_unwrap(this: Gc) -> Result<RefCell<Object>, Gc> {
-        if this.inner().strong.get() != 1 {
-            return Err(this);
-        }
-        let this = std::mem::ManuallyDrop::new(this);
-        unsafe {
-            let b = this.0.as_ptr();
-            (*b).strong.set(0);
-            let value = std::ptr::read(std::ptr::addr_of!((*b).value));
-            // Release the strong owners' implicit weak reference.
-            drop(WeakGc(this.0));
-            Ok(value)
-        }
-    }
 }
 
 impl Clone for Gc {
@@ -151,6 +145,8 @@ impl Drop for Gc {
 #[cold]
 #[inline(never)]
 unsafe fn gc_drop_slow(p: std::ptr::NonNull<GcBox>) {
+    // The live count sits behind the chunk header, so a drop needs no thread-local lookup.
+    heap::note_dead(p.as_ptr());
     std::ptr::drop_in_place(std::ptr::addr_of_mut!((*p.as_ptr()).value));
     drop(WeakGc(p));
 }
@@ -301,24 +297,19 @@ pub(crate) const PACK_OBJ: u64 = 0xfff9_0000_0000_0000;
 pub(crate) const PACK_CANON_NAN: u64 = 0x7ff8_0000_0000_0000;
 
 impl PackedValue {
-    #[inline]
+    #[inline(always)]
     fn tag(&self) -> u64 {
         self.0 & !PACK_PAYLOAD
     }
 
+    /// The payload word of a one-pointer handle (`Gc`, `LStr`, `Rc<_>`, `JsBigInt`), taking
+    /// ownership of it. Every such handle is exactly one pointer wide and its address fits the
+    /// 48-bit NaN-box payload (user-space pointers on every supported target).
+    #[inline(always)]
     unsafe fn into_word<T>(value: T) -> u64 {
-        assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
-        let value = std::mem::ManuallyDrop::new(value);
-        let mut word = 0usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &*value as *const T as *const u8,
-                &mut word as *mut usize as *mut u8,
-                std::mem::size_of::<T>(),
-            );
-        }
-        let word = word as u64;
-        assert_eq!(
+        const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<usize>()) };
+        let word = std::mem::transmute_copy::<T, usize>(&std::mem::ManuallyDrop::new(value)) as u64;
+        debug_assert_eq!(
             word & !PACK_PAYLOAD,
             0,
             "pointer does not fit NaN-box payload"
@@ -326,39 +317,26 @@ impl PackedValue {
         word
     }
 
+    /// Reinterpret the payload as a `T` that the caller takes ownership of.
+    #[inline(always)]
     unsafe fn read_word<T>(&self) -> T {
-        assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
+        const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<usize>()) };
         let word = (self.0 & PACK_PAYLOAD) as usize;
-        let mut value = std::mem::MaybeUninit::<T>::uninit();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &word as *const usize as *const u8,
-                value.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<T>(),
-            );
-            value.assume_init()
-        }
+        std::mem::transmute_copy::<usize, T>(&word)
     }
 
+    #[inline(always)]
     unsafe fn clone_word<T: Clone>(&self) -> T {
         let value = std::mem::ManuallyDrop::new(unsafe { self.read_word::<T>() });
         T::clone(&value)
     }
 
+    #[inline(always)]
     unsafe fn drop_word<T>(&mut self) {
-        assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
-        let word = (self.0 & PACK_PAYLOAD) as usize;
-        let mut value = std::mem::MaybeUninit::<T>::uninit();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &word as *const usize as *const u8,
-                value.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<T>(),
-            );
-            value.assume_init_drop();
-        }
+        drop(unsafe { self.read_word::<T>() });
     }
 
+    #[inline(always)]
     pub(crate) fn pack(value: Value) -> PackedValue {
         let bits = match value {
             Value::Undefined => PACK_UNDEFINED,
@@ -380,6 +358,7 @@ impl PackedValue {
         PackedValue(bits)
     }
 
+    #[inline(always)]
     pub(crate) fn unpack(&self) -> Value {
         match self.tag() {
             PACK_UNDEFINED => Value::Undefined,
@@ -396,6 +375,7 @@ impl PackedValue {
 
     /// Consume the packed owner without a refcount round trip. Pointer payload bits become the
     /// returned `Value`'s ownership; `ManuallyDrop` prevents this container from releasing them.
+    #[inline(always)]
     pub(crate) fn into_value(self) -> Value {
         let this = std::mem::ManuallyDrop::new(self);
         match this.tag() {
@@ -410,16 +390,36 @@ impl PackedValue {
             _ => Value::Num(f64::from_bits(this.0)),
         }
     }
+
+    /// Whether this word holds a counted reference (anything that needs a drop).
+    #[inline(always)]
+    fn is_ref(&self) -> bool {
+        // PACK_BIGINT/STR/SYM are 0x7ffd..=0x7fff in the top 16 bits; PACK_OBJ is 0xfff9.
+        let top = self.0 >> 48;
+        top >= (PACK_BIGINT >> 48) && top <= (PACK_SYM >> 48) || top == PACK_OBJ >> 48
+    }
 }
 
 impl Clone for PackedValue {
+    #[inline]
     fn clone(&self) -> Self {
         PackedValue::pack(self.unpack())
     }
 }
 
 impl Drop for PackedValue {
+    #[inline(always)]
     fn drop(&mut self) {
+        if !self.is_ref() {
+            return;
+        }
+        self.drop_ref();
+    }
+}
+
+impl PackedValue {
+    #[inline]
+    fn drop_ref(&mut self) {
         match self.tag() {
             PACK_BIGINT => unsafe { self.drop_word::<crate::bigint::JsBigInt>() },
             PACK_STR => unsafe { self.drop_word::<crate::lstr::LStr>() },
@@ -677,7 +677,7 @@ pub struct Object {
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
     /// GC scratch: the internal-reference count (low bits) and mark bit ([`GC_MARK`]) while
-    /// collection runs; zero between collections.
+    /// collection runs; stale between collections (each one starts by resetting it).
     gc_internal: Cell<u32>,
 }
 
@@ -704,11 +704,6 @@ impl Object {
     #[inline]
     pub(crate) fn gc_add_ref(&self) {
         self.gc_internal.set(self.gc_internal.get() + 1);
-    }
-    /// Drop the scratch reference count after collection, keeping the mark for the sweep.
-    #[inline]
-    fn gc_clear_refs(&self) {
-        self.gc_internal.set(self.gc_internal.get() & GC_MARK);
     }
 
     /// Give this object an exotic kind together with its internal-slot value.
@@ -801,16 +796,58 @@ impl Object {
     /// Allocate an ordinary object's named-property vector at its known final size. Constructor
     /// chunks derive a conservative straight-line field count, replacing the usual 1 → 2 → 4
     /// growth sequence with one exact allocation. The hint lives on shared code, not instances.
+    ///
+    /// Up to [`heap::INLINE_PROPS`] properties live in slots trailing the object's own box
+    /// (one allocation per small object, and its fields on the object's cache lines).
+    #[inline]
     pub(crate) fn new_with_capacity(proto: Option<Gc>, property_capacity: usize) -> Gc {
-        Self::new_with_parts(proto, Props::with_capacity(property_capacity), Exotic::None)
+        if property_capacity <= heap::INLINE_PROPS {
+            Self::alloc_in(proto, Props::new(), Exotic::None, heap::SlotClass::Inline)
+        } else {
+            Self::new_with_parts(proto, Props::with_capacity(property_capacity), Exotic::None)
+        }
+    }
+
+    /// A plain-data object instantiated from a compiler-proved literal template (see
+    /// [`Props::instantiate_plain`]), its values written straight into the object's inline
+    /// slots when they fit.
+    #[inline]
+    pub(crate) fn new_from_template<I>(proto: Option<Gc>, template: &Props, values: I) -> Gc
+    where
+        I: ExactSizeIterator<Item = Value>,
+    {
+        if values.len() <= heap::INLINE_PROPS && template.can_instantiate_inline() {
+            let obj = Self::alloc_in(
+                proto,
+                template.instantiate_shell(),
+                Exotic::None,
+                heap::SlotClass::Inline,
+            );
+            obj.borrow_mut().props.fill_plain(values);
+            obj
+        } else {
+            Self::new_with_parts(proto, template.instantiate_plain(values), Exotic::None)
+        }
+    }
+
+    /// An object with no own properties that is about to receive a whole map by assignment
+    /// (a function object taking its template map): no inline slots, which it would never use.
+    #[inline]
+    pub(crate) fn new_bare(proto: Option<Gc>) -> Gc {
+        Self::new_with_parts(proto, Props::new(), Exotic::None)
     }
 
     /// Allocate an object around an already-finalized property map. Literal fast paths can build
     /// the map from moved stack values before allocation, avoiding an empty map plus RefCell
     /// replacement on every object.
+    #[inline]
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
+        Self::alloc_in(proto, props, exotic, heap::SlotClass::Plain)
+    }
+
+    #[inline(always)]
+    fn alloc_in(proto: Option<Gc>, props: Props, exotic: Exotic, class: heap::SlotClass) -> Gc {
         with_gc_state(|state| {
-            state.live.set(state.live.get() + 1);
             Gc::alloc(
                 state,
                 RefCell::new(Object {
@@ -823,15 +860,9 @@ impl Object {
                     is_constructor: false,
                     gc_internal: Cell::new(0),
                 }),
+                class,
             )
         })
-    }
-}
-
-impl Drop for Object {
-    fn drop(&mut self) {
-        // `try_with` so a drop during thread-local teardown at process exit can't panic.
-        let _ = try_with_gc_state(|state| state.live.set(state.live.get() - 1));
     }
 }
 
@@ -879,30 +910,63 @@ impl GcState {
     }
 }
 
+/// Owner of the state a thread allocates into; clears the [`GC_CUR`] fast pointer when the
+/// thread's locals are torn down, so a late drop sees "no state" instead of a freed one.
+struct GcStateOwner(RefCell<Arc<GcState>>);
+
+impl Drop for GcStateOwner {
+    fn drop(&mut self) {
+        let _ = GC_CUR.try_with(|c| c.set(std::ptr::null()));
+    }
+}
+
 thread_local! {
     /// The state this thread allocates into. A driver thread owns its own; a coroutine worker
     /// points at its driver's for the duration of the job (`enter_gc_state`).
-    static GC_STATE: RefCell<Arc<GcState>> = RefCell::new(GcState::new());
+    static GC_STATE: GcStateOwner = GcStateOwner(RefCell::new(GcState::new()));
+    /// `Arc::as_ptr` of `GC_STATE`'s current state, or null before first use / after teardown.
+    /// A const-initialized, destructor-free local: reading it is a plain TLS load, which is what
+    /// every allocation and shape transition pays (the owning `GC_STATE` needs a lazy-init and
+    /// destructor-state check per access).
+    static GC_CUR: Cell<*const GcState> = const { Cell::new(std::ptr::null()) };
 }
 
+#[cold]
+#[inline(never)]
+fn gc_state_init() -> *const GcState {
+    GC_STATE.with(|s| {
+        let p = Arc::as_ptr(&s.0.borrow());
+        GC_CUR.with(|c| c.set(p));
+        p
+    })
+}
+
+#[inline(always)]
 pub(in crate::value) fn with_gc_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
-    GC_STATE.with(|s| f(&s.borrow()))
-}
-
-fn try_with_gc_state<R>(f: impl FnOnce(&GcState) -> R) -> Result<R, std::thread::AccessError> {
-    GC_STATE.try_with(|s| f(&s.borrow()))
+    let mut p = GC_CUR.with(|c| c.get());
+    if p.is_null() {
+        p = gc_state_init();
+    }
+    // SAFETY: `GC_CUR` always mirrors the `Arc` held by this thread's `GC_STATE` (updated by
+    // `enter_gc_state`, cleared by the owner's destructor), which keeps the state alive.
+    f(unsafe { &*p })
 }
 
 /// A handle to the state the current thread allocates into, for handing to a coroutine worker.
 pub(crate) fn gc_state_handle() -> Arc<GcState> {
-    GC_STATE.with(|s| s.borrow().clone())
+    GC_STATE.with(|s| s.0.borrow().clone())
 }
 
 /// Make `state` the current thread's heap state, returning the previous one so the caller can
 /// restore it. Only called at quiescent points (between coroutine jobs), when no object on this
 /// thread is being allocated or dropped.
 pub(crate) fn enter_gc_state(state: Arc<GcState>) -> Arc<GcState> {
-    GC_STATE.with(|s| std::mem::replace(&mut *s.borrow_mut(), state))
+    GC_STATE.with(|s| {
+        let p = Arc::as_ptr(&state);
+        let prev = std::mem::replace(&mut *s.0.borrow_mut(), state);
+        GC_CUR.with(|c| c.set(p));
+        prev
+    })
 }
 
 /// Number of live heap objects right now.
@@ -924,20 +988,42 @@ pub fn gc_snapshot() -> Vec<Gc> {
     })
 }
 
-/// Clear the scratch reference counts left in `gc_internal` by a collection, keeping the mark
-/// for the sweep. Collection calls this after marking.
-pub(crate) fn gc_restore_registry_slots() {
-    with_gc_state(|state| {
-        state.heap.borrow().for_each_live(|b| unsafe {
-            (*b).value.borrow().gc_clear_refs();
-        });
-    });
+/// Whether a collection that freed a lot may drain the allocator's thread cache now: at most
+/// once a second, so a program producing cyclic garbage continuously keeps its warm cache.
+pub(crate) fn gc_allocator_trim_due() -> bool {
+    thread_local! {
+        static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    }
+    once_a_second(&LAST)
 }
 
-/// Return empty slab chunks to the system (after a sweep).
-pub(crate) fn gc_trim_heap() {
-    with_gc_state(|state| state.heap.borrow_mut().trim());
+fn once_a_second(
+    last: &'static std::thread::LocalKey<Cell<Option<std::time::Instant>>>,
+) -> bool {
+    let now = std::time::Instant::now();
+    last.with(|l| match l.get() {
+        Some(t) if now.duration_since(t) < std::time::Duration::from_secs(1) => false,
+        _ => {
+            l.set(Some(now));
+            true
+        }
+    })
 }
+
+/// Return empty slab chunks to the system (after a sweep). A collection interval's worth of
+/// empty chunks (up to [`SPARE_CHUNKS`]) is kept for the next interval, since mapping and
+/// first-touch faulting fresh chunks every collection costs more than the sweep of a churning
+/// program; everything but one spare goes back at most once a second.
+pub(crate) fn gc_trim_heap() {
+    thread_local! {
+        static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    }
+    let keep = if once_a_second(&LAST) { 1 } else { SPARE_CHUNKS };
+    with_gc_state(|state| state.heap.borrow_mut().trim(keep));
+}
+
+/// Empty 256 KiB slab chunks a heap keeps between full trims (16 MiB).
+const SPARE_CHUNKS: usize = 64;
 
 /// Slab chunks currently mapped for this thread's heap.
 #[cfg(test)]
@@ -1088,9 +1174,18 @@ impl TaKind {
     /// Convert a Number to this element type's little-endian bytes (JS integer-conversion rules).
     pub(crate) fn write(self, n: f64) -> Vec<u8> {
         let int = |n: f64| if n.is_finite() { n.trunc() as i64 } else { 0 };
+        // ToInt8..ToUint32 reduce modulo 2^bits; reducing modulo 2^32 first keeps the right low
+        // bits for every width (a plain `as i64` saturates at |n| >= 2^63: 1e20 must store 0 in
+        // an Int8Array, not -1).
+        let bits32 = |n: f64| {
+            if n.is_finite() {
+                n.trunc().rem_euclid(4294967296.0) as u32
+            } else {
+                0
+            }
+        };
         match self {
-            TaKind::I8 => vec![int(n) as i8 as u8],
-            TaKind::U8 => vec![int(n) as u8],
+            TaKind::I8 | TaKind::U8 => vec![bits32(n) as u8],
             TaKind::U8Clamped => {
                 // ToUint8Clamp: round-half-to-even (0.5 → 0, 1.5 → 2, 2.5 → 2), clamped to [0,255].
                 let c = if n.is_nan() || n <= 0.0 {
@@ -1111,10 +1206,10 @@ impl TaKind {
                 };
                 vec![c as u8]
             }
-            TaKind::I16 => (int(n) as i16).to_le_bytes().to_vec(),
-            TaKind::U16 => (int(n) as u16).to_le_bytes().to_vec(),
-            TaKind::I32 => (int(n) as i32).to_le_bytes().to_vec(),
-            TaKind::U32 => (int(n) as u32).to_le_bytes().to_vec(),
+            TaKind::I16 => (bits32(n) as i16).to_le_bytes().to_vec(),
+            TaKind::U16 => (bits32(n) as u16).to_le_bytes().to_vec(),
+            TaKind::I32 => (bits32(n) as i32).to_le_bytes().to_vec(),
+            TaKind::U32 => (bits32(n) as u32).to_le_bytes().to_vec(),
             TaKind::F16 => f64_to_f16(n).to_le_bytes().to_vec(),
             TaKind::F32 => (n as f32).to_le_bytes().to_vec(),
             TaKind::F64 => n.to_le_bytes().to_vec(),

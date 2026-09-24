@@ -41,6 +41,7 @@ impl Props {
             proto_flag: Cell::new(false),
             has_far: Cell::new(false),
             elem_mode: Cell::new(true),
+            ctor_capacity: Cell::new(0),
         }
     }
 }

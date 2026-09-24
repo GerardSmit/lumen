@@ -6,6 +6,9 @@
   const EventEmitter = __builtins.get("events");
 
   class TLSSocket extends Duplex {
+    // Data is pushed as it arrives from the native side; there is nothing to pull.
+    _read() {}
+
     constructor(socket, options = {}) {
       const wrappedSocket = socket && typeof socket === "object" && typeof socket.write === "function" ? socket : null;
       super({});

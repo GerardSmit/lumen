@@ -2,8 +2,8 @@
 //! structs, bound with `#[lumen::op]`, `#[lumen::class]` and `#[lumen::methods]`.
 
 use lumen::embed::{
-    BigI64, BigU64, Ctx, Deferred, JsArrayBuffer, JsFunction, JsObject, OpError, Promise, State,
-    This, Value,
+    BigI64, BigU64, Ctx, Deferred, JsArrayBuffer, JsFunction, JsObject, OpError, Promise, SendError,
+    State, This, Value,
 };
 use lumen::Engine;
 use std::borrow::Cow;
@@ -321,15 +321,17 @@ impl Response {
     }
 }
 
-/// `fetch(url)` against an in-memory table; `async` turns the result (or the thrown error)
-/// into a settled promise.
+/// `fetch(url)` against an in-memory table. `async` runs the body on the host's worker pool (a
+/// runtime with an event loop, e.g. lumen-runtime) and settles the returned promise on the JS
+/// thread when it finishes; a bare `Engine` without an async host runs it inline. The arguments
+/// and result cross threads, hence owned `String` in and `SendError` (not `OpError`) out.
 #[lumen::op(async)]
-pub fn fetch(url: String) -> Result<Response, OpError> {
+pub fn fetch(url: String) -> Result<Response, SendError> {
     let (status, body) = match url.as_str() {
         "https://example.test/data.json" => (200, r#"{"answer":42,"list":[1,2,3]}"#),
         "https://example.test/hello" => (200, "hello world"),
         "https://example.test/missing" => (404, "not found"),
-        _ => return Err(OpError::type_error(format!("fetch failed: unknown host in {url}"))),
+        _ => return Err(SendError::new("TypeError", format!("fetch failed: unknown host in {url}"))),
     };
     Ok(Response {
         status,

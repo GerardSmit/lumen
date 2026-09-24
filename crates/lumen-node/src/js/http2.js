@@ -88,6 +88,12 @@ function notSupported() {
 }
 
 class ClientHttp2Stream extends Duplex {
+  // Http2Stream#closed is the stream's own flag (the Duplex getter reads stream state).
+  get closed() { return this._h2closed === true; }
+  set closed(v) { this._h2closed = v; }
+  // Data is pushed as it arrives from the native side; there is nothing to pull.
+  _read() {}
+
   constructor(session, id, headers, options = {}) {
     super({});
     this.session = session;
@@ -331,6 +337,12 @@ function connect(authority, options, listener) {
 }
 
 class ServerHttp2Stream extends Duplex {
+  // Http2Stream#closed is the stream's own flag (the Duplex getter reads stream state).
+  get closed() { return this._h2closed === true; }
+  set closed(v) { this._h2closed = v; }
+  // Data is pushed as it arrives from the native side; there is nothing to pull.
+  _read() {}
+
   constructor(session, id, headers) {
     super({});
     this.session = session;
@@ -509,6 +521,9 @@ class ServerHttp2Session extends EventEmitter {
 }
 
 class Http2ServerRequest extends Readable {
+  // Data is pushed as it arrives from the native side; there is nothing to pull.
+  _read() {}
+
   constructor(stream, headers) {
     super({});
     this.stream = stream;

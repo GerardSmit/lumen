@@ -136,9 +136,23 @@ fn parse_spec(input: TokenStream) -> Result<walk::Spec, String> {
                     v => return Err(format!("`bytecode` takes true/false, found `{v}`")),
                 }
             }
+            "node_modules" => {
+                spec.node_modules = match value.to_string().as_str() {
+                    "true" => true,
+                    "false" => false,
+                    v => return Err(format!("`node_modules` takes true/false, found `{v}`")),
+                }
+            }
+            "keep_source" => match value.to_string().as_str() {
+                "true" => spec.keep_source = vec!["**".to_string()],
+                "false" => spec.keep_source.clear(),
+                _ => spec.keep_source.extend(string_list(value)?),
+            },
+            "exclude" => spec.exclude.extend(string_list(value)?),
             k => {
                 return Err(format!(
-                    "unknown key `{k}` (expected script, entry, modules, root, walk, bytecode)"
+                    "unknown key `{k}` (expected script, entry, modules, root, walk, bytecode, \
+                     node_modules, keep_source, exclude)"
                 ))
             }
         }

@@ -212,14 +212,57 @@
   const g = globalThis.console;
   const nativeOut = typeof g.log === "function" ? g.log.bind(g) : () => {};
   const nativeErr = typeof g.error === "function" ? g.error.bind(g) : () => {};
-  Object.defineProperty(g, kOut, { value: (s) => nativeOut(s), configurable: true });
-  Object.defineProperty(g, kErr, { value: (s) => nativeErr(s), configurable: true });
+  // Node's global console writes through `process.stdout.write` / `process.stderr.write`, so a
+  // program (or test) that replaces those methods captures console output. Keep the native sinks
+  // (they honour embedder redirection) unless the stream's write was swapped out.
+  const stdoutWrite = process.stdout && process.stdout.write;
+  const stderrWrite = process.stderr && process.stderr.write;
+  // The native sink may stand in for the stream while the stream is the standard one (its write
+  // is the shared Writable write, or the runtime's raw one) and has nothing queued ahead.
+  const isNativeSink = (stream, rawWrite) => {
+    const w = stream && stream.write;
+    if (w === rawWrite) return true;
+    const S = __builtins.get("stream");
+    return !!S && w === S.Writable.prototype.write && stream._isStdio === true &&
+      !stream.writableCorked && !stream.writableLength;
+  };
+  const emitOut = (s) => {
+    const out = process.stdout;
+    if (!isNativeSink(out, stdoutWrite) && out && typeof out.write === "function") out.write(s + "\n");
+    else nativeOut(s);
+  };
+  const emitErr = (s) => {
+    const err = process.stderr;
+    if (!isNativeSink(err, stderrWrite) && err && typeof err.write === "function") err.write(s + "\n");
+    else nativeErr(s);
+  };
+  Object.defineProperty(g, kOut, { value: emitOut, configurable: true });
+  Object.defineProperty(g, kErr, { value: emitErr, configurable: true });
   Object.defineProperty(g, kIndent, { value: "", writable: true, configurable: true });
   const define = (name, value) =>
     Object.defineProperty(g, name, { value, writable: true, enumerable: true, configurable: true });
-  // Make the native log family enumerable (keeping the native functions untouched).
+  // The native log family renders each argument itself but knows nothing of printf-style
+  // format strings (`console.log('%s: %d', a, b)`) or group indentation. Keep the native path
+  // for the common case and route through `util.format` when either applies, as Node does.
   for (const name of NATIVE_KEEP) {
-    if (typeof g[name] === "function") Object.defineProperty(g, name, { enumerable: true, configurable: true, writable: true });
+    const native = g[name];
+    if (typeof native !== "function") continue;
+    const sink = name === "warn" || name === "error" ? kErr : kOut;
+    const wrapped = {
+      [name](...args) {
+        // Plain strings (no format directives) take the native path unchanged; everything else
+        // renders through util.format like Node's console.
+        let plain = !g[kIndent];
+        for (let i = 0; plain && i < args.length; i++) {
+          if (typeof args[i] !== "string" || (i === 0 && args.length > 1 && args[0].includes("%"))) plain = false;
+        }
+        if (plain && (sink === kOut ? isNativeSink(process.stdout, stdoutWrite) : isNativeSink(process.stderr, stderrWrite))) {
+          return native.apply(g, args);
+        }
+        g[sink](withIndent(g, fmt(args)));
+      },
+    }[name];
+    define(name, wrapped);
   }
   for (const name of Object.keys(methods)) if (!NATIVE_KEEP.has(name)) define(name, methods[name]);
   define("Console", Console);

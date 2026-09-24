@@ -93,6 +93,12 @@ pub struct Props {
     /// sequence only — elements must not churn it: a stable shape is what lets
     /// `arr.push(..)`/`arr.length` sites cache at all.
     pub(in crate::value) elem_mode: std::cell::Cell<bool>,
+    /// Slack tracking for `new`: when this map belongs to a constructor, the largest small
+    /// named-property count its instances finished construction with (0 = unknown). Fresh
+    /// instances reserve that many entry slots, so the creation-IC appends of `this.x = ...`
+    /// never regrow. Lives in the map's padding byte; per closure, like the object identity it
+    /// used to be keyed by.
+    pub(in crate::value) ctor_capacity: std::cell::Cell<u8>,
 }
 
 /// See [`Props::mirror`].
@@ -225,6 +231,7 @@ impl Clone for Props {
             elems: self.elems.clone(),
             has_far: std::cell::Cell::new(self.has_far.get()),
             elem_mode: std::cell::Cell::new(self.elem_mode.get()),
+            ctor_capacity: std::cell::Cell::new(0),
         }
     }
 }
@@ -270,6 +277,7 @@ impl Props {
             proto_flag: std::cell::Cell::new(false),
             has_far: std::cell::Cell::new(false),
             elem_mode: std::cell::Cell::new(false),
+            ctor_capacity: std::cell::Cell::new(0),
         }
     }
 
@@ -285,11 +293,7 @@ impl Props {
     {
         assert_eq!(values.len(), self.entries.len(), "object-template arity");
         let mut entries = EntryVec::with_capacity(self.entries.len());
-        for _ in 0..self.entries.len() {
-            entries.push(Property::plain(
-                values.next().expect("object-template value"),
-            ));
-        }
+        entries.extend_exact(values.by_ref().map(Property::plain));
         debug_assert!(values.next().is_none());
         let shape_rc = self.clone_shape_rc();
         Props {
@@ -300,7 +304,44 @@ impl Props {
             elems: self.elems.clone(),
             has_far: std::cell::Cell::new(self.has_far.get()),
             elem_mode: std::cell::Cell::new(self.elem_mode.get()),
+            ctor_capacity: std::cell::Cell::new(0),
         }
+    }
+
+    /// Whether [`crate::value::Object::new_from_template`] may build an instance of this
+    /// template in an object's inline slots: a plain named map with no element sidecar.
+    #[inline]
+    pub(crate) fn can_instantiate_inline(&self) -> bool {
+        !self.elems.is_present() && !self.elem_mode.get()
+    }
+
+    /// An instance of this template with its shape but no entries yet (see
+    /// [`Props::fill_plain`]).
+    #[inline]
+    pub(crate) fn instantiate_shell(&self) -> Props {
+        let shape_rc = self.clone_shape_rc();
+        Props {
+            entries: EntryVec::new(),
+            proto_flag: std::cell::Cell::new(false),
+            shape: shape_rc.as_ref().map_or(SHAPE_EMPTY, |s| s.id),
+            shape_rc,
+            elems: DenseStorage::default(),
+            has_far: std::cell::Cell::new(self.has_far.get()),
+            elem_mode: std::cell::Cell::new(false),
+            ctor_capacity: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Complete an [`instantiate_shell`](Props::instantiate_shell) map with its values, in
+    /// shape order.
+    #[inline]
+    pub(crate) fn fill_plain<I>(&mut self, values: I)
+    where
+        I: ExactSizeIterator<Item = Value>,
+    {
+        assert_eq!(values.len(), self.named_len(), "object-template arity");
+        assert_eq!(self.entries.len(), 0, "template instance already filled");
+        self.entries.extend_exact(values.map(Property::plain));
     }
 
     /// Grow tiny property maps exactly: `Vec`'s default first allocation has room for four
@@ -376,6 +417,20 @@ impl Props {
     #[inline]
     pub(super) fn named_len(&self) -> usize {
         self.shape_rc.as_ref().map_or(0, |s| s.len())
+    }
+
+    /// The instance capacity learned for this constructor's map (see `ctor_capacity`).
+    #[inline]
+    pub(crate) fn construct_capacity_hint(&self) -> usize {
+        self.ctor_capacity.get() as usize
+    }
+
+    /// Record an instance's final size (see [`Props::observed_instance_capacity`]).
+    #[inline]
+    pub(crate) fn note_construct_capacity(&self, observed: usize) {
+        if observed > self.ctor_capacity.get() as usize {
+            self.ctor_capacity.set(observed.min(u8::MAX as usize) as u8);
+        }
     }
 
     /// Final named-property count of a small ordinary instance, recorded after a successful

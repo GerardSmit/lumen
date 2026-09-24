@@ -9,6 +9,8 @@ use std::rc::Rc;
 
 // Per-object modules split out of this file (behavior-preserving). Shared helpers remain here and
 // are reachable from each submodule via `use super::*`.
+mod array_fast;
+mod num_fmt;
 mod array_iterator;
 mod atomics;
 pub(crate) mod collection_data;
@@ -110,6 +112,23 @@ pub(crate) fn regexp_realm_proto(i: &mut Interp, nt: &Value) -> Result<Option<Gc
 
 /// Set(O, P, V, true): perform [[Set]] and throw a TypeError if it returns false, matching the
 /// spec's `Set(..., Throw=true)` used by Array mutators regardless of the surrounding strict mode.
+/// Whether no object on `receiver`'s prototype chain has an own `key`, every one being a plain
+/// ordinary object or Array (so [[GetOwnProperty]] along the chain is the property table).
+fn set_creates_own(receiver: &Object, key: &str) -> bool {
+    let mut cur = receiver.proto.clone();
+    while let Some(p) = cur {
+        let b = p.borrow();
+        if !b.ic_plain.get()
+            || !matches!(b.exotic, Exotic::None | Exotic::Array)
+            || b.props.get(key).is_some()
+        {
+            return false;
+        }
+        cur = b.proto.clone();
+    }
+    true
+}
+
 fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<(), Value> {
     // Overwriting an existing own writable data property (the shape of every hot builtin write,
     // e.g. a RegExp's `lastIndex` after each exec) needs none of the [[Set]] machinery.
@@ -123,6 +142,11 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
                     p.set_value(value);
                     return Ok(());
                 }
+            } else if b.extensible && b.ic_plain.get() && set_creates_own(&b, key) {
+                // OrdinarySet finding no `key` along an all-ordinary chain: CreateDataProperty
+                // on the extensible receiver.
+                b.props.insert(key, Property::plain(value));
+                return Ok(());
             }
         }
     }
@@ -1219,38 +1243,6 @@ fn global_fn(it: &Interp, name: &str, len: usize, f: NativeFn) {
 // ---------------------------------------------------------------------------------------------
 // Function.prototype
 // ---------------------------------------------------------------------------------------------
-
-/// CreateDataPropertyOrThrow: like `json_create_data_prop` but a false [[DefineOwnProperty]]
-/// result (e.g. a non-extensible target) throws a TypeError instead of being ignored.
-fn json_create_data_prop_or_throw(
-    i: &mut Interp,
-    holder: &Value,
-    key: &str,
-    v: Value,
-) -> Result<(), Value> {
-    let desc = i.new_object();
-    set_data(&desc, "value", v);
-    set_data(&desc, "writable", Value::Bool(true));
-    set_data(&desc, "enumerable", Value::Bool(true));
-    set_data(&desc, "configurable", Value::Bool(true));
-    let ok = if let Some((target, handler)) = proxy_pair(i, holder) {
-        ab(proxy_define_property(
-            i,
-            &target,
-            &handler,
-            key,
-            &Value::Obj(desc),
-        ))?
-    } else if let Value::Obj(o) = holder {
-        ab(define_own_property(i, o, key, &Value::Obj(desc)))?
-    } else {
-        false
-    };
-    if !ok {
-        return Err(i.make_error("TypeError", "cannot create data property"));
-    }
-    Ok(())
-}
 
 /// OrdinarySet(target, key, value, receiver): walks target's prototype chain to find the controlling
 /// descriptor, then applies the result on `receiver` (which may differ from `target`). Returns the
@@ -2496,10 +2488,16 @@ fn make_sparse_array(i: &mut Interp, len: usize) -> Result<Value, Value> {
     Ok(arr)
 }
 
-fn array_species_create(i: &mut Interp, original: &Value, len: usize) -> Result<Value, Value> {
+/// ArraySpeciesCreate(originalArray, length), also reporting whether the default route (a fresh ordinary Array
+/// from `make_sparse_array`) was taken.
+fn array_species_create_ex(
+    i: &mut Interp,
+    original: &Value,
+    len: usize,
+) -> Result<(Value, bool), Value> {
     // IsArray pierces proxies (a proxy over an array is an array).
     if !json_is_array(i, original)? {
-        return make_sparse_array(i, len);
+        return Ok((make_sparse_array(i, len)?, true));
     }
     let mut c = ab(i.get_member(original, "constructor"))?;
     // A constructor that is another realm's %Array% counts as the default (its @@species is
@@ -2514,7 +2512,7 @@ fn array_species_create(i: &mut Interp, original: &Value, len: usize) -> Result<
                 )
             });
             if foreign_array {
-                return make_sparse_array(i, len);
+                return Ok((make_sparse_array(i, len)?, true));
             }
         }
     }
@@ -2527,18 +2525,18 @@ fn array_species_create(i: &mut Interp, original: &Value, len: usize) -> Result<
         }
     }
     if matches!(c, Value::Undefined) {
-        return make_sparse_array(i, len);
+        return Ok((make_sparse_array(i, len)?, true));
     }
     let array_ctor = i.global.borrow().props.get("Array").map(|p| p.value());
     if let (Value::Obj(s), Some(Value::Obj(ac))) = (&c, &array_ctor) {
         if Gc::ptr_eq(s, ac) {
-            return make_sparse_array(i, len);
+            return Ok((make_sparse_array(i, len)?, true));
         }
     }
     if !is_constructor_value(&c) {
         return Err(i.make_error("TypeError", "Array @@species is not a constructor"));
     }
-    ab(i.construct(c, &[Value::Num(len as f64)]))
+    Ok((ab(i.construct(c, &[Value::Num(len as f64)]))?, false))
 }
 
 /// Own enumerable string keys in spec [[OwnPropertyKeys]] order (array-index ascending first).
@@ -3659,10 +3657,16 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "assign", 2, |i, _this, args| {
         // ToObject(target) — throws a TypeError for null/undefined.
         let to = to_object_arg(i, arg(args, 0), "Object.assign")?;
-        let to_val = Value::Obj(to);
-        for src in args.iter().skip(1) {
+        let to_val = Value::Obj(to.clone());
+        for (n, src) in args.iter().skip(1).enumerate() {
             if matches!(src, Value::Undefined | Value::Null) {
                 continue;
+            }
+            // An empty ordinary target and a plain data-only source: one bulk copy.
+            if let (0, Value::Obj(so)) = (n, src) {
+                if i.assign_props_fast(&to, so) {
+                    continue;
+                }
             }
             let from = Value::Obj(to_object_arg(i, src.clone(), "Object.assign")?);
             if let Some((t, h)) = proxy_pair(i, &from) {
@@ -4514,382 +4518,20 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
 }
 
 fn install_array_rest(it: &mut Interp, ap: &Gc) {
-    it.def_method(&ap, "shift", 0, |i, this, _args| {
-        let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
-        let len = ab(i.checked_array_len(&o))?;
-        if len == 0 {
-            set_throw(i, &ov, "length", Value::Num(0.0))?;
-            return Ok(Value::Undefined);
-        }
-        let first = ab(i.get_member(&ov, "0"))?;
-        for k in 1..len {
-            let from = k.to_string();
-            let to = (k - 1).to_string();
-            if ab(i.js_has_property(&ov, &from))? {
-                let v = ab(i.get_member(&ov, &from))?;
-                set_throw(i, &ov, &to, v)?;
-            } else {
-                delete_or_throw(i, &ov, &to)?;
-            }
-        }
-        delete_or_throw(i, &ov, &(len - 1).to_string())?;
-        set_throw(i, &ov, "length", Value::Num((len - 1) as f64))?;
-        Ok(first)
-    });
-    it.def_method(&ap, "unshift", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
-        let len = ab(i.to_length(&o))? as u64;
-        let n = args.len() as u64;
-        if n > 0 {
-            if len + n > 9007199254740991 {
-                return Err(i.make_error("TypeError", "unshift result is too long"));
-            }
-            for k in (0..len).rev() {
-                let from = k.to_string();
-                let to = (k + n).to_string();
-                if ab(i.js_has_property(&ov, &from))? {
-                    let v = ab(i.get_member(&ov, &from))?;
-                    set_throw(i, &ov, &to, v)?;
-                } else {
-                    delete_or_throw(i, &ov, &to)?;
-                }
-            }
-            for (idx, a) in args.iter().enumerate() {
-                set_throw(i, &ov, &idx.to_string(), a.clone())?;
-            }
-        }
-        set_throw(i, &ov, "length", Value::Num((len + n) as f64))?;
-        Ok(Value::Num((len + n) as f64))
-    });
-    it.def_method(&ap, "slice", 2, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        // The total length may be near 2^53 for an array-like; only the copied span (end-start) is
-        // bounded by the engine's materialization cap.
-        let len = ab(i.to_length(&o))? as i64;
-        let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
-        let end = match arg(args, 1) {
-            Value::Undefined => len,
-            v => norm_index(ab(i.to_number(&v))?, len),
-        };
-        let count = (end - start).max(0) as usize;
-        let result = array_species_create(i, &this, count)?;
-        let ov = Value::Obj(o.clone());
-        let mut k = start;
-        let mut to = 0usize;
-        while k < end {
-            let key = k.to_string();
-            // Preserve holes: only copy indices the source actually has (HasProperty).
-            if ab(i.js_has_property(&ov, &key))? {
-                let v = ab(i.get_member(&this, &key))?;
-                cdp_or_throw(i, &result, &to.to_string(), v)?;
-            }
-            k += 1;
-            to += 1;
-        }
-        set_length_throw(i, &result, to as f64)?;
-        Ok(result)
-    });
-    it.def_method(&ap, "indexOf", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
-        if len == 0 {
-            // The length check precedes the fromIndex coercion.
-            return Ok(Value::Num(-1.0));
-        }
-        let target = arg(args, 0);
-        let from = match arg(args, 1) {
-            Value::Undefined => 0usize,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n == f64::INFINITY {
-                    return Ok(Value::Num(-1.0));
-                }
-                let n = if n.is_nan() { 0.0 } else { n.trunc() };
-                if n >= 0.0 {
-                    n as usize
-                } else {
-                    (len as f64 + n).max(0.0) as usize
-                }
-            }
-        };
-        let ov = Value::Obj(o.clone());
-        for k in from..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
-                continue; // indexOf skips holes
-            }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
-            if i.strict_equals(&v, &target) {
-                return Ok(Value::Num(k as f64));
-            }
-        }
-        Ok(Value::Num(-1.0))
-    });
-    it.def_method(&ap, "includes", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))? as i64;
-        if len == 0 {
-            // The length check precedes the fromIndex coercion.
-            return Ok(Value::Bool(false));
-        }
-        let target = arg(args, 0);
-        let mut k = match arg(args, 1) {
-            Value::Undefined => 0i64,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n == f64::INFINITY {
-                    return Ok(Value::Bool(false));
-                }
-                if n == f64::NEG_INFINITY || n.is_nan() {
-                    0
-                } else if n >= 0.0 {
-                    n.trunc() as i64
-                } else {
-                    (len + n.trunc() as i64).max(0)
-                }
-            }
-        };
-        let ov = Value::Obj(o.clone());
-        while k < len {
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
-            if same_value_zero(&v, &target) {
-                return Ok(Value::Bool(true));
-            }
-            k += 1;
-        }
-        Ok(Value::Bool(false))
-    });
-    it.def_method(&ap, "join", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
-        let len = ab(i.checked_array_len(&o))?;
-        let sep = match arg(args, 0) {
-            Value::Undefined => ",".to_string(),
-            v => ab(i.to_string(&v))?.to_string(),
-        };
-        let mut parts = Vec::with_capacity(len);
-        for k in 0..len {
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
-            parts.push(match v {
-                Value::Undefined | Value::Null => String::new(),
-                other => ab(i.to_string(&other))?.to_string(),
-            });
-        }
-        let out = parts.join(&sep);
-        Ok(Value::from_string(
-            crate::jstr::canonicalize(&out).unwrap_or(out),
-        ))
-    });
-    it.def_method(&ap, "concat", 1, |i, this, args| {
-        // ToObject(this): a primitive receiver is boxed (and spread/appended as its wrapper).
-        let recv = Value::Obj(arr_to_object(i, &this)?);
-        let result = array_species_create(i, &recv, 0)?;
-        let mut n = 0u64;
-        let items: Vec<Value> = std::iter::once(recv).chain(args.iter().cloned()).collect();
-        for v in &items {
-            // IsConcatSpreadable: @@isConcatSpreadable if defined, else IsArray.
-            let spreadable = if let Value::Obj(_) = v {
-                let key = well_known_key(i, "isConcatSpreadable");
-                let flag = match &key {
-                    Some(k) => ab(i.get_member(v, k))?,
-                    None => Value::Undefined,
-                };
-                match flag {
-                    Value::Undefined => json_is_array(i, v)?,
-                    other => i.to_boolean(&other),
-                }
-            } else {
-                false
-            };
-            if spreadable {
-                let len = ab(i.to_length(&match v {
-                    Value::Obj(o) => o.clone(),
-                    _ => unreachable!(),
-                }))? as u64;
-                if n + len > 9007199254740991 {
-                    return Err(i.make_error("TypeError", "concat result is too long"));
-                }
-                for k in 0..len {
-                    let key = k.to_string();
-                    if ab(i.js_has_property(v, &key))? {
-                        let elem = ab(i.get_member(v, &key))?;
-                        cdp_or_throw(i, &result, &n.to_string(), elem)?;
-                    }
-                    n += 1; // increment for holes too, preserving their position
-                }
-            } else {
-                if n >= 9007199254740991 {
-                    return Err(i.make_error("TypeError", "concat result is too long"));
-                }
-                cdp_or_throw(i, &result, &n.to_string(), v.clone())?;
-                n += 1;
-            }
-        }
-        set_length_throw(i, &result, n as f64)?;
-        Ok(result)
-    });
-    it.def_method(&ap, "forEach", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
-        let cb = arg(args, 0);
-        if !cb.is_callable() {
-            return Err(i.make_error(
-                "TypeError",
-                "Array.prototype.forEach callback is not callable",
-            ));
-        }
-        let cb_this = arg(args, 1);
-        let ov = Value::Obj(o.clone());
-        for k in 0..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
-                continue; // skip array holes
-            }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
-            ab(i.call(
-                cb.clone(),
-                cb_this.clone(),
-                &[v, Value::Num(k as f64), ov.clone()],
-            ))?;
-        }
-        Ok(Value::Undefined)
-    });
-    it.def_method(&ap, "map", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
-        let cb = arg(args, 0);
-        if !cb.is_callable() {
-            return Err(i.make_error("TypeError", "Array.prototype.map callback is not callable"));
-        }
-        let cb_this = arg(args, 1);
-        let ov = Value::Obj(o.clone());
-        let result = array_species_create(i, &this, len)?;
-        for k in 0..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
-                continue; // holes stay holes in the result
-            }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
-            let mapped = ab(i.call(
-                cb.clone(),
-                cb_this.clone(),
-                &[v, Value::Num(k as f64), ov.clone()],
-            ))?;
-            json_create_data_prop_or_throw(i, &result, &k.to_string(), mapped)?;
-        }
-        Ok(result)
-    });
-    it.def_method(&ap, "filter", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
-        let cb = arg(args, 0);
-        if !cb.is_callable() {
-            return Err(i.make_error(
-                "TypeError",
-                "Array.prototype.filter callback is not callable",
-            ));
-        }
-        let cb_this = arg(args, 1);
-        let ov = Value::Obj(o.clone());
-        let result = array_species_create(i, &this, 0)?;
-        let mut to = 0usize;
-        for k in 0..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
-                continue;
-            }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
-            let keep = ab(i.call(
-                cb.clone(),
-                cb_this.clone(),
-                &[v.clone(), Value::Num(k as f64), ov.clone()],
-            ))?;
-            if i.to_boolean(&keep) {
-                json_create_data_prop_or_throw(i, &result, &to.to_string(), v)?;
-                to += 1;
-            }
-        }
-        Ok(result)
-    });
+    it.def_method(&ap, "shift", 0, array_fast::array_shift);
+    it.def_method(&ap, "unshift", 1, array_fast::array_unshift);
+    it.def_method(&ap, "slice", 2, array_fast::array_slice);
+    it.def_method(&ap, "indexOf", 1, array_fast::array_index_of);
+    it.def_method(&ap, "includes", 1, array_fast::array_includes);
+    it.def_method(&ap, "join", 1, array_fast::array_join);
+    it.def_method(&ap, "concat", 1, array_fast::array_concat);
+    it.def_method(&ap, "forEach", 1, array_fast::array_for_each);
+    it.def_method(&ap, "map", 1, array_fast::array_map);
+    it.def_method(&ap, "filter", 1, array_fast::array_filter);
     it.def_method(&ap, "reduce", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
-        let cb = arg(args, 0);
-        if !cb.is_callable() {
-            return Err(i.make_error(
-                "TypeError",
-                "Array.prototype.reduce callback is not callable",
-            ));
-        }
-        let ov = Value::Obj(o.clone());
-        let mut k = 0;
-        let mut acc;
-        if args.len() >= 2 {
-            acc = arg(args, 1);
-        } else {
-            // Seed with the first present element (holes are skipped).
-            loop {
-                if k >= len {
-                    return Err(
-                        i.make_error("TypeError", "Reduce of empty array with no initial value")
-                    );
-                }
-                if ab(i.js_has_property(&ov, &k.to_string()))? {
-                    acc = ab(i.get_member(&ov, &k.to_string()))?;
-                    k += 1;
-                    break;
-                }
-                k += 1;
-            }
-        }
-        while k < len {
-            if ab(i.js_has_property(&ov, &k.to_string()))? {
-                let v = ab(i.get_member(&ov, &k.to_string()))?;
-                acc = ab(i.call(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[acc, v, Value::Num(k as f64), ov.clone()],
-                ))?;
-            }
-            k += 1;
-        }
-        Ok(acc)
+        array_fast::array_reduce(i, this, args, false)
     });
-    it.def_method(&ap, "reverse", 0, |i, this, _args| {
-        let o = arr_to_object(i, &this)?;
-        let ov = Value::Obj(o.clone());
-        let len = ab(i.to_length(&o))?;
-        for k in 0..len / 2 {
-            let lower = k.to_string();
-            let upper = (len - 1 - k).to_string();
-            // HasProperty/Get the two ends, then swap — preserving holes (a hole moves as a
-            // DeletePropertyOrThrow).
-            let lower_val = if ab(i.js_has_property(&ov, &lower))? {
-                Some(ab(i.get_member(&ov, &lower))?)
-            } else {
-                None
-            };
-            let upper_val = if ab(i.js_has_property(&ov, &upper))? {
-                Some(ab(i.get_member(&ov, &upper))?)
-            } else {
-                None
-            };
-            match (lower_val, upper_val) {
-                (Some(lv), Some(uv)) => {
-                    set_throw(i, &ov, &lower, uv)?;
-                    set_throw(i, &ov, &upper, lv)?;
-                }
-                (None, Some(uv)) => {
-                    set_throw(i, &ov, &lower, uv)?;
-                    delete_or_throw(i, &ov, &upper)?;
-                }
-                (Some(lv), None) => {
-                    delete_or_throw(i, &ov, &lower)?;
-                    set_throw(i, &ov, &upper, lv)?;
-                }
-                (None, None) => {}
-            }
-        }
-        Ok(ov)
-    });
+    it.def_method(&ap, "reverse", 0, array_fast::array_reverse);
     it.def_method(&ap, "toString", 0, |i, this, _args| {
         let ov = Value::Obj(arr_to_object(i, &this)?);
         let join = ab(i.get_member(&ov, "join"))?;
@@ -4936,18 +4578,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         }
         Ok(Value::from_string(out))
     });
-    it.def_method(&ap, "at", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.checked_array_len(&o))? as i64;
-        let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
-        if idx < 0 {
-            idx += len;
-        }
-        if idx < 0 || idx >= len {
-            return Ok(Value::Undefined);
-        }
-        ab(i.get_member(&Value::Obj(o.clone()), &idx.to_string()))
-    });
+    it.def_method(&ap, "at", 1, array_fast::array_at);
     it.def_method(&ap, "find", 1, |i, this, args| {
         array_find(i, this, args, true, false)
     });
@@ -4966,139 +4597,12 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
     it.def_method(&ap, "every", 1, |i, this, args| {
         array_some_every(i, this, args, true)
     });
-    it.def_method(&ap, "fill", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))? as i64;
-        let v = arg(args, 0);
-        let start = norm_index(ab(i.to_number(&arg(args, 1)))?, len);
-        let end = match arg(args, 2) {
-            Value::Undefined => len,
-            x => norm_index(ab(i.to_number(&x))?, len),
-        };
-        // A real Array's filled span is bounded by the engine cap (it materializes one property
-        // per index); a generic array-like iterates lazily — its accessors typically throw or
-        // the per-op caps stop runaway growth.
-        if matches!(o.borrow().exotic, Exotic::Array)
-            && (end - start).max(0) as usize > MAX_ARRAY_OP_LEN
-        {
-            return Err(i.make_error("RangeError", "array length exceeds engine limit"));
-        }
-        let ov = Value::Obj(o.clone());
-        for k in start..end {
-            set_throw(i, &ov, &k.to_string(), v.clone())?;
-        }
-        Ok(ov)
-    });
-    it.def_method(&ap, "lastIndexOf", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))? as i64;
-        if len == 0 {
-            return Ok(Value::Num(-1.0));
-        }
-        let target = arg(args, 0);
-        // fromIndex (default len-1): the highest index to search from, going backward.
-        let mut k = if args.len() > 1 {
-            let n = ab(i.to_number(&arg(args, 1)))?;
-            if n == f64::NEG_INFINITY {
-                return Ok(Value::Num(-1.0));
-            }
-            let n = if n.is_nan() { 0 } else { n.trunc() as i64 };
-            if n >= 0 {
-                n.min(len - 1)
-            } else {
-                len + n
-            }
-        } else {
-            len - 1
-        };
-        let ov = Value::Obj(o.clone());
-        while k >= 0 {
-            if ab(i.js_has_property(&ov, &k.to_string()))? {
-                let v = ab(i.get_member(&ov, &k.to_string()))?;
-                if i.strict_equals(&v, &target) {
-                    return Ok(Value::Num(k as f64));
-                }
-            }
-            k -= 1;
-        }
-        Ok(Value::Num(-1.0))
-    });
-    it.def_method(&ap, "flat", 0, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let source_len = ab(i.to_length(&o))?;
-        // ToIntegerOrInfinity(depth); undefined defaults to 1.
-        let depth = match arg(args, 0) {
-            Value::Undefined => 1i64,
-            v => {
-                let n = ab(i.to_number(&v))?;
-                if n.is_nan() || n <= 0.0 {
-                    0
-                } else if n == f64::INFINITY {
-                    i64::MAX
-                } else {
-                    n as i64
-                }
-            }
-        };
-        let a = array_species_create(i, &this, 0)?;
-        let ov = Value::Obj(o.clone());
-        flatten_into(i, &a, &ov, source_len, 0, depth, None, &Value::Undefined)?;
-        Ok(a)
-    });
-    it.def_method(&ap, "flatMap", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
-        let cb = arg(args, 0);
-        if !cb.is_callable() {
-            return Err(i.make_error(
-                "TypeError",
-                "Array.prototype.flatMap mapper is not callable",
-            ));
-        }
-        let cb_this = arg(args, 1);
-        let a = array_species_create(i, &this, 0)?;
-        let ov = Value::Obj(o.clone());
-        flatten_into(i, &a, &ov, len, 0, 1, Some(&cb), &cb_this)?;
-        Ok(a)
-    });
+    it.def_method(&ap, "fill", 1, array_fast::array_fill);
+    it.def_method(&ap, "lastIndexOf", 1, array_fast::array_last_index_of);
+    it.def_method(&ap, "flat", 0, array_fast::array_flat);
+    it.def_method(&ap, "flatMap", 1, array_fast::array_flat_map);
     it.def_method(&ap, "splice", 2, array_splice);
-    it.def_method(&ap, "sort", 1, |i, this, args| {
-        let cmp = arg(args, 0);
-        if !matches!(cmp, Value::Undefined) && !cmp.is_callable() {
-            return Err(i.make_error(
-                "TypeError",
-                "the comparator must be a function or undefined",
-            ));
-        }
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.checked_array_len(&o))?;
-        // SortIndexedProperties: read only the present indices (holes are skipped, not read).
-        let mut items = Vec::new();
-        for k in 0..len {
-            if ab(i.js_has_property(&this, &k.to_string()))? {
-                items.push(ab(i.get_member(&this, &k.to_string()))?);
-            }
-        }
-        let item_count = items.len();
-        merge_sort(i, &mut items, &cmp)?;
-        let ov = Value::Obj(o.clone());
-        // Set(O, k, v, true): a failed write (non-writable element) always throws.
-        for (k, v) in items.into_iter().enumerate() {
-            let ok = ab(i.set_member_recv(&ov, &k.to_string(), v, ov.clone()))?;
-            if !ok {
-                return Err(i.make_error(
-                    "TypeError",
-                    format!("cannot assign to read-only element {k}"),
-                ));
-            }
-        }
-        // Vacated trailing indices (originally holes, or beyond the present count) are deleted
-        // in ascending order through [[Delete]] (a proxy's deleteProperty trap observes each).
-        for k in item_count..len {
-            delete_or_throw(i, &ov, &k.to_string())?;
-        }
-        Ok(ov)
-    });
+    it.def_method(&ap, "sort", 1, array_fast::array_sort);
     // ----- change-array-by-copy (return a new Array, leave the receiver untouched) -----
     it.def_method(&ap, "toReversed", 0, |i, this, _| {
         let o = arr_to_object(i, &this)?;
@@ -5188,48 +4692,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         Ok(i.make_array(items))
     });
     it.def_method(&ap, "reduceRight", 1, |i, this, args| {
-        let o = arr_to_object(i, &this)?;
-        let len = ab(i.to_length(&o))?;
-        let cb = arg(args, 0);
-        if !cb.is_callable() {
-            return Err(i.make_error(
-                "TypeError",
-                "Array.prototype.reduceRight callback is not callable",
-            ));
-        }
-        let ov = Value::Obj(o.clone());
-        let mut acc;
-        let mut k = len as i64 - 1;
-        if args.len() >= 2 {
-            acc = arg(args, 1);
-        } else {
-            // Seed with the last present element (holes are skipped).
-            loop {
-                if k < 0 {
-                    return Err(
-                        i.make_error("TypeError", "Reduce of empty array with no initial value")
-                    );
-                }
-                if ab(i.js_has_property(&ov, &k.to_string()))? {
-                    acc = ab(i.get_member(&ov, &k.to_string()))?;
-                    k -= 1;
-                    break;
-                }
-                k -= 1;
-            }
-        }
-        while k >= 0 {
-            if ab(i.js_has_property(&ov, &k.to_string()))? {
-                let v = ab(i.get_member(&ov, &k.to_string()))?;
-                acc = ab(i.call(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[acc, v, Value::Num(k as f64), ov.clone()],
-                ))?;
-            }
-            k -= 1;
-        }
-        Ok(acc)
+        array_fast::array_reduce(i, this, args, true)
     });
     it.def_method(&ap, "copyWithin", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
@@ -5359,6 +4822,10 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
             // Iterator path: the target is constructed BEFORE iteration (constructor errors
             // propagate as-is), then elements are defined one at a time; a map/define failure
             // closes the iterator.
+            let intrinsic_ctor = matches!(&this, Value::Obj(c) if matches!(
+                c.borrow().call,
+                Callable::Native(f) if f as usize == nf_array_ctor as NativeFn as usize
+            ));
             let arr = if use_ctor {
                 ab(i.construct(this, &[]))?
             } else {
@@ -5366,17 +4833,85 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
             };
             let iter = ab(i.call(iter_method, source.clone(), &[]))?;
             let next = ab(i.get_member(&iter, "next"))?;
+            // A Map/Set iterator driven by its intrinsic `next`: step it in place instead of
+            // allocating (and immediately unpacking) a result object per element. A default
+            // array target is fresh and unreachable, so its elements are built natively.
+            let coll_iter = match (&iter, &next) {
+                (Value::Obj(it_obj), Value::Obj(nf))
+                    if matches!(
+                        nf.borrow().call,
+                        Callable::Native(f)
+                            if f as usize == collections::map_set_iter_next as NativeFn as usize
+                    ) && it_obj.borrow().props.get("__ci_coll").is_some() =>
+                {
+                    Some(it_obj.clone())
+                }
+                _ => None,
+            };
+            let fresh_default = match &arr {
+                Value::Obj(a) => {
+                    let b = a.borrow();
+                    (!use_ctor || intrinsic_ctor)
+                        && matches!(b.exotic, Exotic::Array)
+                        && b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
+                        && b.props.get_index(0).is_none()
+                }
+                _ => false,
+            };
+            if let (Some(it_obj), true) = (coll_iter, fresh_default) {
+                if !mapfn.is_callable() {
+                    let out = collections::map_set_iter_drain(i, &it_obj);
+                    return Ok(i.make_array(out));
+                }
+                let mut out: Vec<Value> = Vec::new();
+                while let Some(raw) = collections::map_set_iter_step(i, &it_obj) {
+                    let v = if mapfn.is_callable() {
+                        let k = out.len();
+                        let r = i.call(mapfn.clone(), this_arg.clone(), &[raw, Value::Num(k as f64)]);
+                        match ab(r) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                i.iterator_close(&iter);
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        raw
+                    };
+                    out.push(v);
+                }
+                return Ok(i.make_array(out));
+            }
+            // An intrinsic Array Iterator `next` is stepped without its result object.
+            let arr_next = match &next {
+                Value::Obj(nf) => match nf.borrow().call {
+                    Callable::Native(f) if array_iterator::is_next(f) => Some(f),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let mut out: Vec<Value> = Vec::new();
             let mut k = 0u64;
             loop {
-                let res = ab(i.call(next.clone(), iter.clone(), &[]))?;
-                if !matches!(res, Value::Obj(_)) {
-                    return Err(i.make_error("TypeError", "iterator result is not an object"));
-                }
-                let done = ab(i.get_member(&res, "done"))?;
-                if i.to_boolean(&done) {
-                    break;
-                }
-                let raw = ab(i.get_member(&res, "value"))?;
+                let raw = match arr_next {
+                    Some(f) => match array_iterator::step_with(i, f, &iter)? {
+                        Some(v) => v,
+                        None => break,
+                    },
+                    None => {
+                        let res = ab(i.call(next.clone(), iter.clone(), &[]))?;
+                        if !matches!(res, Value::Obj(_)) {
+                            return Err(
+                                i.make_error("TypeError", "iterator result is not an object")
+                            );
+                        }
+                        let done = ab(i.get_member(&res, "done"))?;
+                        if i.to_boolean(&done) {
+                            break;
+                        }
+                        ab(i.get_member(&res, "value"))?
+                    }
+                };
                 let step = (|i: &mut Interp| -> Result<(), Value> {
                     let v = if mapfn.is_callable() {
                         ab(i.call(
@@ -5387,13 +4922,22 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
                     } else {
                         raw
                     };
-                    cdp_or_throw(i, &arr, &k.to_string(), v)
+                    if fresh_default {
+                        // The target is unreachable until returned: build it at the end.
+                        out.push(v);
+                        Ok(())
+                    } else {
+                        cdp_or_throw(i, &arr, &k.to_string(), v)
+                    }
                 })(i);
                 if let Err(e) = step {
                     i.iterator_close(&iter);
                     return Err(e);
                 }
                 k += 1;
+            }
+            if fresh_default {
+                return Ok(i.make_array(out));
             }
             set_length_throw(i, &arr, k as f64)?;
             return Ok(arr);
@@ -5403,6 +4947,31 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         let o = to_object_arg(i, source.clone(), "Array.from")?;
         let ov = Value::Obj(o.clone());
         let len = ab(i.to_length(&o))?;
+        let intrinsic_ctor = matches!(&this, Value::Obj(c) if matches!(
+            c.borrow().call,
+            Callable::Native(f) if f as usize == nf_array_ctor as NativeFn as usize
+        ));
+        if !use_ctor || intrinsic_ctor {
+            // The default target: `new Array(len)` / ArrayCreate(len) is unobservable apart from
+            // its RangeError, and it stays unreachable until returned.
+            if len as u64 > 4294967295 {
+                return Err(i.make_error("RangeError", "invalid array length"));
+            }
+            let mut out: Vec<Value> = Vec::with_capacity(len.min(1 << 16));
+            for k in 0..len {
+                let raw = array_fast::get_elem(i, &o, &ov, k)?;
+                out.push(if mapfn.is_callable() {
+                    ab(i.call(
+                        mapfn.clone(),
+                        this_arg.clone(),
+                        &[raw, Value::Num(k as f64)],
+                    ))?
+                } else {
+                    raw
+                });
+            }
+            return Ok(i.make_array(out));
+        }
         let arr = if use_ctor {
             ab(i.construct(this, &[Value::Num(len as f64)]))?
         } else {
@@ -5468,31 +5037,7 @@ fn array_find(
     want_value: bool,
     from_last: bool,
 ) -> Result<Value, Value> {
-    let o = arr_to_object(i, &this)?;
-    let ov = Value::Obj(o.clone());
-    let len = ab(i.to_length(&o))?;
-    let cb = arg(args, 0);
-    if !cb.is_callable() {
-        return Err(i.make_error("TypeError", "predicate is not callable"));
-    }
-    let cb_this = arg(args, 1);
-    for step in 0..len {
-        let k = if from_last { len - 1 - step } else { step };
-        let v = ab(i.get_member(&ov, &k.to_string()))?;
-        let r = ab(i.call(
-            cb.clone(),
-            cb_this.clone(),
-            &[v.clone(), Value::Num(k as f64), ov.clone()],
-        ))?;
-        if i.to_boolean(&r) {
-            return Ok(if want_value { v } else { Value::Num(k as f64) });
-        }
-    }
-    Ok(if want_value {
-        Value::Undefined
-    } else {
-        Value::Num(-1.0)
-    })
+    array_fast::array_find_impl(i, this, args, want_value, from_last)
 }
 
 fn array_some_every(
@@ -5501,216 +5046,15 @@ fn array_some_every(
     args: &[Value],
     every: bool,
 ) -> Result<Value, Value> {
-    let o = arr_to_object(i, &this)?;
-    let len = ab(i.to_length(&o))?;
-    let cb = arg(args, 0);
-    if !cb.is_callable() {
-        return Err(i.make_error("TypeError", "predicate is not callable"));
-    }
-    let cb_this = arg(args, 1);
-    let ov = Value::Obj(o.clone());
-    for k in 0..len {
-        if !ab(i.js_has_property(&ov, &k.to_string()))? {
-            continue; // skip holes
-        }
-        let v = ab(i.get_member(&ov, &k.to_string()))?;
-        let r = ab(i.call(
-            cb.clone(),
-            cb_this.clone(),
-            &[v, Value::Num(k as f64), ov.clone()],
-        ))?;
-        let b = i.to_boolean(&r);
-        if every && !b {
-            return Ok(Value::Bool(false));
-        }
-        if !every && b {
-            return Ok(Value::Bool(true));
-        }
-    }
-    Ok(Value::Bool(every))
-}
-
-/// FlattenIntoArray: write `source`'s (mapped, one-level-per-depth flattened) elements onto
-/// `target` starting at `start`, via CreateDataPropertyOrThrow. Returns the next target index.
-#[allow(clippy::too_many_arguments)]
-fn flatten_into(
-    i: &mut Interp,
-    target: &Value,
-    source: &Value,
-    source_len: usize,
-    start: usize,
-    depth: i64,
-    mapper: Option<&Value>,
-    mapper_this: &Value,
-) -> Result<usize, Value> {
-    let mut target_index = start;
-    for k in 0..source_len {
-        if !ab(i.js_has_property(source, &k.to_string()))? {
-            continue; // FlattenIntoArray skips holes
-        }
-        let mut element = ab(i.get_member(source, &k.to_string()))?;
-        if let Some(m) = mapper {
-            element = ab(i.call(
-                m.clone(),
-                mapper_this.clone(),
-                &[element, Value::Num(k as f64), source.clone()],
-            ))?;
-        }
-        if depth > 0 && json_is_array(i, &element)? {
-            let len_val = ab(i.get_member(&element, "length"))?;
-            let el_len = to_length_val(i, &len_val)?;
-            target_index = flatten_into(
-                i,
-                target,
-                &element,
-                el_len,
-                target_index,
-                depth - 1,
-                None,
-                &Value::Undefined,
-            )?;
-        } else {
-            // Compared as u64: usize is 32-bit on wasm32, where 2^53 - 1 overflows the type.
-            if target_index as u64 >= 9_007_199_254_740_991 {
-                return Err(i.make_error("TypeError", "flattened array length exceeds 2^53 - 1"));
-            }
-            json_create_data_prop_or_throw(i, target, &target_index.to_string(), element)?;
-            target_index += 1;
-        }
-    }
-    Ok(target_index)
+    array_fast::array_some_every_impl(i, this, args, every)
 }
 
 fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
-    let o = arr_to_object(i, &this)?;
-    let ov = Value::Obj(o.clone());
-    // The total length may be near 2^53 for an array-like; only the elements actually moved are
-    // bounded by the engine's materialization cap.
-    let len = ab(i.to_length(&o))? as i64;
-    let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
-    let delete_count = if args.is_empty() {
-        0
-    } else if args.len() < 2 {
-        len - start
-    } else {
-        (ab(i.to_number(&arg(args, 1)))? as i64).clamp(0, len - start)
-    };
-    let items: Vec<Value> = if args.len() > 2 {
-        args[2..].to_vec()
-    } else {
-        Vec::new()
-    };
-    // A result length past 2^53-1 is a TypeError (before any mutation or species construction).
-    if (len - delete_count + items.len() as i64) as u64 > 9007199254740991 {
-        return Err(i.make_error("TypeError", "splice result is too long"));
-    }
-    // The removed array (ArraySpeciesCreate) preserves holes via HasProperty.
-    let removed = array_species_create(i, &this, delete_count.max(0) as usize)?;
-    for k in 0..delete_count {
-        let from = (start + k).to_string();
-        if ab(i.js_has_property(&ov, &from))? {
-            let v = ab(i.get_member(&ov, &from))?;
-            json_create_data_prop_or_throw(i, &removed, &k.to_string(), v)?;
-        }
-    }
-    ab(i.set_member(&removed, "length", Value::Num(delete_count as f64)))?;
-    let item_count = items.len() as i64;
-    // Shift the trailing elements (preserving holes) to open or close the gap.
-    if item_count < delete_count {
-        for k in start..(len - delete_count) {
-            let from = (k + delete_count).to_string();
-            let to = (k + item_count).to_string();
-            if ab(i.js_has_property(&ov, &from))? {
-                let v = ab(i.get_member(&ov, &from))?;
-                set_throw(i, &ov, &to, v)?;
-            } else {
-                delete_or_throw(i, &ov, &to)?;
-            }
-        }
-        for k in ((len - delete_count + item_count)..len).rev() {
-            delete_or_throw(i, &ov, &k.to_string())?;
-        }
-    } else if item_count > delete_count {
-        for k in ((start + 1)..=(len - delete_count)).rev() {
-            let from = (k + delete_count - 1).to_string();
-            let to = (k + item_count - 1).to_string();
-            if ab(i.js_has_property(&ov, &from))? {
-                let v = ab(i.get_member(&ov, &from))?;
-                set_throw(i, &ov, &to, v)?;
-            } else {
-                delete_or_throw(i, &ov, &to)?;
-            }
-        }
-    }
-    for (off, v) in items.iter().enumerate() {
-        set_throw(i, &ov, &(start + off as i64).to_string(), v.clone())?;
-    }
-    set_throw(
-        i,
-        &ov,
-        "length",
-        Value::Num((len - delete_count + item_count) as f64),
-    )?;
-    Ok(removed)
+    array_fast::array_splice_impl(i, this, args)
 }
 
-fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Value> {
-    let n = items.len();
-    if n <= 1 {
-        return Ok(());
-    }
-    let mid = n / 2;
-    let mut left = items[..mid].to_vec();
-    let mut right = items[mid..].to_vec();
-    merge_sort(i, &mut left, cmp)?;
-    merge_sort(i, &mut right, cmp)?;
-    let (mut a, mut b, mut k) = (0, 0, 0);
-    while a < left.len() && b < right.len() {
-        if compare_values(i, cmp, &left[a], &right[b])? != Ordering::Greater {
-            items[k] = left[a].clone();
-            a += 1;
-        } else {
-            items[k] = right[b].clone();
-            b += 1;
-        }
-        k += 1;
-    }
-    while a < left.len() {
-        items[k] = left[a].clone();
-        a += 1;
-        k += 1;
-    }
-    while b < right.len() {
-        items[k] = right[b].clone();
-        b += 1;
-        k += 1;
-    }
-    Ok(())
-}
-
-fn compare_values(i: &mut Interp, cmp: &Value, a: &Value, b: &Value) -> Result<Ordering, Value> {
-    // `undefined` always sorts to the end.
-    match (matches!(a, Value::Undefined), matches!(b, Value::Undefined)) {
-        (true, true) => return Ok(Ordering::Equal),
-        (true, false) => return Ok(Ordering::Greater),
-        (false, true) => return Ok(Ordering::Less),
-        _ => {}
-    }
-    if cmp.is_callable() {
-        let r = ab(i.call(cmp.clone(), Value::Undefined, &[a.clone(), b.clone()]))?;
-        let n = ab(i.to_number(&r))?;
-        Ok(if n < 0.0 {
-            Ordering::Less
-        } else if n > 0.0 {
-            Ordering::Greater
-        } else {
-            Ordering::Equal
-        })
-    } else {
-        let sa = ab(i.to_string(a))?;
-        let sb = ab(i.to_string(b))?;
-        Ok(sa.as_ref().cmp(sb.as_ref()))
-    }
+fn merge_sort(i: &mut Interp, items: &mut Vec<Value>, cmp: &Value) -> Result<(), Value> {
+    array_fast::sort_values(i, items, cmp)
 }
 
 /// A native that returns its `this` — the `@@iterator` of an iterator object is itself.
@@ -6845,10 +6189,26 @@ fn iterator_proto_weird_set(
 }
 
 fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
-    let o = i.new_object();
-    set_data(&o, "value", value);
-    set_data(&o, "done", Value::Bool(done));
-    Value::Obj(o)
+    // CreateIterResultObject: a fresh ordinary object with exactly `value` then `done` as plain
+    // data properties — instantiated from one shared shape instead of two keyed inserts.
+    thread_local! {
+        static TEMPLATE: (std::cell::OnceCell<crate::value::Props>, [Rc<str>; 2]) =
+            (std::cell::OnceCell::new(), [Rc::from("value"), Rc::from("done")]);
+    }
+    TEMPLATE.with(|(tmpl, keys)| {
+        let map = tmpl.get_or_init(|| {
+            let mut p = crate::value::Props::new();
+            for k in keys {
+                p.insert(k.clone(), Property::plain(Value::Undefined));
+            }
+            p
+        });
+        Value::Obj(Object::new_with_parts(
+            Some(i.object_proto.clone()),
+            map.instantiate_plain([value, Value::Bool(done)].into_iter()),
+            Exotic::None,
+        ))
+    })
 }
 
 /// `Iterator.zip` / `Iterator.zipKeyed`: validate options, open every input iterator eagerly
@@ -7645,6 +7005,30 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
 
 /// Build an Array Iterator over `target`. `kind`: 0 = values, 1 = keys, 2 = [key, value] entries.
 /// State lives in non-enumerable internal slots so `next` can advance it.
+/// One intrinsic Array Iterator step (`next()` without its result object) when `f` is the
+/// intrinsic `%ArrayIteratorPrototype%.next`; `None` for any other native.
+pub(crate) fn array_iterator_step_with(
+    i: &mut Interp,
+    f: NativeFn,
+    this: &Value,
+) -> Option<Result<Option<Value>, Value>> {
+    array_iterator::is_next(f).then(|| array_iterator::step_with(i, f, this))
+}
+
+/// [`make_array_iterator`] for the language fast paths (`eval::fastpaths`).
+pub(crate) fn make_array_iterator_pub(i: &Interp, target: Value, kind: u8) -> Value {
+    let proto = i
+        .extra_protos
+        .get("%ArrayIteratorPrototype%")
+        .cloned()
+        .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned());
+    let obj = Object::new(proto);
+    set_internal(&obj, "__ai_target", target);
+    set_internal(&obj, "__ai_index", Value::Num(0.0));
+    set_internal(&obj, "__ai_kind", Value::Num(kind as f64));
+    Value::Obj(obj)
+}
+
 fn make_array_iterator(i: &mut Interp, target: Value, kind: u8) -> Value {
     let proto = i
         .extra_protos
@@ -8183,6 +7567,22 @@ fn is_js_ws(c: char) -> bool {
     c.is_whitespace() || c == '\u{FEFF}'
 }
 
+/// TrimString: the receiver itself when nothing is trimmed (no copy).
+fn trimmed(s: &crate::lstr::LStr, start: bool, end: bool) -> Value {
+    let mut t: &str = s;
+    if start {
+        t = t.trim_start_matches(is_js_ws);
+    }
+    if end {
+        t = t.trim_end_matches(is_js_ws);
+    }
+    if t.len() == s.len() {
+        Value::Str(s.clone())
+    } else {
+        Value::str(t)
+    }
+}
+
 /// IsRegExp(arg): true if it has a truthy `@@match`, or (fallback) is a compiled RegExp object.
 fn arg_is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
     if let Value::Obj(o) = v {
@@ -8248,20 +7648,25 @@ pub(crate) fn nf_string_replace(
             }
         }
     }
-    let s = this_string(i, &this)?.to_string();
+    let subject = this_string(i, &this)?;
+    let s: &str = &subject;
     let pat = ab(i.to_string(&arg(args, 0)))?;
     let repl = prep_repl(i, &arg(args, 1))?;
     match s.find(pat.as_ref()) {
-        None => Ok(Value::from_string(s)),
+        None => Ok(Value::Str(subject.clone())),
         Some(pos) => {
             let matched = &s[pos..pos + pat.len()];
-            let rep = string_replacement(i, &repl, matched, &s, pos)?;
-            Ok(Value::from_string(format!(
-                "{}{}{}",
-                &s[..pos],
-                rep,
-                &s[pos + pat.len()..]
-            )))
+            let rep = string_replacement(i, &repl, matched, s, pos)?;
+            let mut out = String::with_capacity(s.len() - pat.len() + rep.len());
+            out.push_str(&s[..pos]);
+            out.push_str(&rep);
+            out.push_str(&s[pos + pat.len()..]);
+            if out.is_ascii() {
+                return Ok(Value::from_string(out));
+            }
+            Ok(Value::from_string(
+                crate::jstr::canonicalize(&out).unwrap_or(out),
+            ))
         }
     }
 }
@@ -8329,7 +7734,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
         Value::Undefined => u32::MAX as usize,
         v => {
             let n = ab(i.to_number(&v))?;
-            (if n.is_finite() { n as i64 as u32 } else { 0 }) as usize
+            crate::eval::to_int32(n) as u32 as usize
         }
     };
     let is_live_regexp =
@@ -8438,6 +7843,28 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "lastIndexOf", 1, |i, this, args| {
         let s = this_string(i, &this)?;
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        if s.ascii_hint() {
+            // Byte index == unit index; a non-ASCII needle simply can't occur.
+            let len = s.len();
+            let limit = match arg(args, 1) {
+                Value::Undefined => len,
+                v => {
+                    let p = ab(i.to_number(&v))?;
+                    if p.is_nan() {
+                        len
+                    } else {
+                        (p.max(0.0) as usize).min(len)
+                    }
+                }
+            };
+            if !needle.is_ascii() || needle.len() > len {
+                return Ok(Value::Num(-1.0));
+            }
+            let end = (limit + needle.len()).min(len);
+            return Ok(Value::Num(
+                s[..end].rfind(&*needle).map_or(-1.0, |k| k as f64),
+            ));
+        }
         // Optional `position`: search for the last occurrence starting at or before it.
         let chars = i.units_full(&s);
         let nchars = i.units_full(&needle);
@@ -8494,6 +7921,10 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("TypeError", "argument must not be a regular expression"));
         }
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        if s.ascii_hint() {
+            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
+            return Ok(Value::Bool(needle.is_ascii() && s[pos..].contains(&*needle)));
+        }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -8508,6 +7939,13 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("TypeError", "argument must not be a regular expression"));
         }
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        if s.ascii_hint() {
+            let pos = match args.get(1) {
+                None | Some(Value::Undefined) => 0,
+                v => str_clamp_pos(i, v, s.len() as i64)?,
+            };
+            return Ok(Value::Bool(s.as_bytes()[pos..].starts_with(needle.as_bytes())));
+        }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -8522,6 +7960,15 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("TypeError", "argument must not be a regular expression"));
         }
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        if s.ascii_hint() {
+            let end = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => {
+                    str_clamp_pos(i, Some(v), s.len() as i64)?
+                }
+                _ => s.len(),
+            };
+            return Ok(Value::Bool(s.as_bytes()[..end].ends_with(needle.as_bytes())));
+        }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         // endsWith's optional argument is the END position (default = length).
@@ -8614,10 +8061,24 @@ fn install_string(it: &mut Interp) {
         create_html(i, t, "sup", "", &Value::Undefined)
     });
     it.def_method(&sp, "toUpperCase", 0, |i, this, _| {
-        Ok(Value::from_string(this_string(i, &this)?.to_uppercase()))
+        let s = this_string(i, &this)?;
+        if s.ascii_hint() {
+            if !s.bytes().any(|b| b.is_ascii_lowercase()) {
+                return Ok(Value::Str(s));
+            }
+            return Ok(Value::from_string(s.to_ascii_uppercase()));
+        }
+        Ok(Value::from_string(s.to_uppercase()))
     });
     it.def_method(&sp, "toLowerCase", 0, |i, this, _| {
-        Ok(Value::from_string(this_string(i, &this)?.to_lowercase()))
+        let s = this_string(i, &this)?;
+        if s.ascii_hint() {
+            if !s.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Ok(Value::Str(s));
+            }
+            return Ok(Value::from_string(s.to_ascii_lowercase()));
+        }
+        Ok(Value::from_string(s.to_lowercase()))
     });
     // lumen strings are valid UTF-8, so they're always well-formed.
     it.def_method(&sp, "isWellFormed", 0, |i, this, _| {
@@ -8642,9 +8103,8 @@ fn install_string(it: &mut Interp) {
         Ok(Value::from_string(fixed))
     });
     it.def_method(&sp, "trim", 0, |i, this, _| {
-        Ok(Value::from_string(
-            this_string(i, &this)?.trim_matches(is_js_ws).to_string(),
-        ))
+        let s = this_string(i, &this)?;
+        Ok(trimmed(&s, true, true))
     });
     it.def_method(&sp, "localeCompare", 1, |i, this, args| {
         // RequireObjectCoercible + ToString this, then delegate to Intl.Collator.
@@ -8690,6 +8150,19 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "split", 2, nf_string_split);
     it.def_method(&sp, "at", 1, |i, this, args| {
         let s = this_string(i, &this)?;
+        if s.ascii_hint() {
+            let len = s.len() as i64;
+            let n = ab(i.to_number(&arg(args, 0)))?;
+            let mut idx = if n.is_nan() { 0 } else { n.trunc().clamp(-1e18, 1e18) as i64 };
+            if idx < 0 {
+                idx += len;
+            }
+            return Ok(if idx < 0 || idx >= len {
+                Value::Undefined
+            } else {
+                Value::Str(crate::jstr::unit_lstr(s.as_bytes()[idx as usize] as u16))
+            });
+        }
         let len = i.str_len(&s) as i64;
         let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
         if idx < 0 {
@@ -8706,18 +8179,12 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "codePointAt", 1, nf_code_point_at);
     it.def_method(&sp, "trimStart", 0, |i, this, _| {
-        Ok(Value::from_string(
-            this_string(i, &this)?
-                .trim_start_matches(is_js_ws)
-                .to_string(),
-        ))
+        let s = this_string(i, &this)?;
+        Ok(trimmed(&s, true, false))
     });
     it.def_method(&sp, "trimEnd", 0, |i, this, _| {
-        Ok(Value::from_string(
-            this_string(i, &this)?
-                .trim_end_matches(is_js_ws)
-                .to_string(),
-        ))
+        let s = this_string(i, &this)?;
+        Ok(trimmed(&s, false, true))
     });
     // Annex B aliases: trimLeft/trimRight ARE trimStart/trimEnd (same function objects).
     for (alias, target) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
@@ -8905,6 +8372,17 @@ fn install_string(it: &mut Interp) {
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
     it.def_method(&ctor, "fromCharCode", 1, |i, _this, args| {
+        // One ASCII unit: the shared single-character string.
+        if let [Value::Num(n)] = args {
+            let u = if n.is_finite() {
+                n.trunc().rem_euclid(65536.0) as u16
+            } else {
+                0
+            };
+            if u < 0x80 {
+                return Ok(Value::Str(crate::jstr::unit_lstr(u)));
+            }
+        }
         let mut units: Vec<u16> = Vec::with_capacity(args.len());
         for a in args {
             // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.
@@ -9062,20 +8540,45 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
 }
 
 fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Result<Value, Value> {
-    let s = this_string(i, &this)?.to_string();
+    let subject = this_string(i, &this)?;
     let target = ab(i.to_number(&arg(args, 0)))? as usize;
-    let cur = crate::jstr::unit_len(&s);
+    let cur = if subject.ascii_hint() {
+        subject.len()
+    } else {
+        crate::jstr::unit_len(&subject)
+    };
     if cur >= target {
-        return Ok(Value::from_string(s));
+        return Ok(Value::Str(subject));
     }
     let pad = match arg(args, 1) {
         Value::Undefined => " ".to_string(),
         v => ab(i.to_string(&v))?.to_string(),
     };
     if pad.is_empty() {
-        return Ok(Value::from_string(s));
+        return Ok(Value::Str(subject));
     }
     let need = target - cur;
+    if need > MAX_STR_LEN {
+        return Err(i.make_error("RangeError", "Invalid string length"));
+    }
+    if pad.is_ascii() {
+        // Units are bytes: repeat the filler and cut it at `need`.
+        let mut fill = String::with_capacity(need);
+        while fill.len() < need {
+            let take = (need - fill.len()).min(pad.len());
+            fill.push_str(&pad[..take]);
+        }
+        let mut out = String::with_capacity(need + subject.len());
+        if at_start {
+            out.push_str(&fill);
+            out.push_str(&subject);
+        } else {
+            out.push_str(&subject);
+            out.push_str(&fill);
+        }
+        return Ok(Value::from_string(out));
+    }
+    let s = subject.to_string();
     let pad_units = crate::jstr::units(&pad);
     let fill_units: Vec<u16> = pad_units.iter().copied().cycle().take(need).collect();
     let fill = crate::jstr::from_units(&fill_units);
@@ -9141,6 +8644,9 @@ fn string_replacement(
             Repl::Text(t) => t.clone(),
             Repl::Fn(_) => unreachable!(),
         };
+        if !template.contains('$') {
+            return Ok(template.to_string());
+        }
         // GetSubstitution for a string match: $$ → $, $& → match, $` → preceding, $' → following.
         // (No captures, so $n and $<name> stay literal.) Growth past the engine's string
         // ceiling dies as a RangeError, not an OOM.

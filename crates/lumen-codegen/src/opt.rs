@@ -15,6 +15,17 @@ pub fn optimize(func: &mut Function) {
     gvn(func);
     remove_unreachable(func);
     simplify_params(func);
+    // Small constant-trip loops: unroll fully, then fold their induction values.
+    if crate::unroll::unroll(func) {
+        simplify_params(func);
+        gvn(func);
+        remove_unreachable(func);
+        simplify_params(func);
+    }
+    // Parameters simplified away can expose constant branch conditions: fold them too.
+    gvn(func);
+    remove_unreachable(func);
+    simplify_params(func);
     dce(func);
     debug_assert!(
         crate::verify::verify(func).is_ok(),

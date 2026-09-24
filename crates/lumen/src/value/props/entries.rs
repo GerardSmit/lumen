@@ -6,6 +6,15 @@
 //! (copy-on-write). Closures use it: every instance of one function shares its template's
 //! `length`/`name` entries, so the ordinary closure allocates no entry storage at all. Owned
 //! mode is a plain vector.
+//!
+//! Inline mode (`cap & INLINE_FLAG`): `ptr` points at the property slots trailing the object's
+//! own heap box (`heap::SlotClass::Inline`), so a small object's entries need no allocation.
+//! The storage belongs to the box, not to this vector: an inline `EntryVec` (and the `Props`
+//! holding it) must stay inside that object. It is only ever installed by `Object`
+//! construction, and nothing moves a map out of a live object (maps are replaced by
+//! assignment, which drops the old one in place). Growing past the inline slots moves the
+//! entries to an ordinary heap buffer. The JIT only needs `cap != 0` ("owned, writable in
+//! place"), which inline mode satisfies.
 use crate::value::Property;
 use std::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
 use std::cell::Cell;
@@ -26,6 +35,11 @@ pub(in crate::value) struct EntryVec {
     len: u32,
     cap: u32,
 }
+
+/// `cap` bit marking inline storage (see the module docs); the low bits are the slot count.
+const INLINE_FLAG: u32 = 1 << 31;
+/// Largest distance from an inline `EntryVec` to its storage: both live in one heap box.
+const INLINE_REACH: usize = 256;
 
 /// Field offsets for the optimizing tier's inline reads (see `Props`' `jit_props_layout`).
 pub(in crate::value) const ENTRY_VEC_PTR: usize = std::mem::offset_of!(EntryVec, ptr);
@@ -62,6 +76,62 @@ impl EntryVec {
         self.cap == 0 && self.len != 0
     }
 
+    #[inline(always)]
+    fn is_inline(&self) -> bool {
+        self.cap & INLINE_FLAG != 0
+    }
+
+    /// Slot count of the owned or inline buffer.
+    #[inline(always)]
+    fn cap_slots(&self) -> usize {
+        (self.cap & !INLINE_FLAG) as usize
+    }
+
+    /// Guard against the one misuse inline mode cannot survive: this vector having been moved
+    /// out of the object whose box holds its storage.
+    #[inline(always)]
+    fn check_inline_home(&self) {
+        let d = (self.ptr.as_ptr() as usize).wrapping_sub(self as *const EntryVec as usize);
+        assert!(d < INLINE_REACH, "inline property storage moved out of its object");
+    }
+
+    /// Use `n` uninitialized property slots at `buf` as this vector's storage. Only on a vector
+    /// that owns nothing yet (empty, not shared); see the module docs for the contract.
+    ///
+    /// # Safety
+    /// `buf` must be the inline area of the heap box that contains `self`, valid for `n`
+    /// properties for as long as that box's object lives.
+    #[inline(always)]
+    pub(in crate::value) unsafe fn adopt_inline(&mut self, buf: *mut Property, n: usize) {
+        debug_assert!(self.len == 0 && self.cap == 0);
+        debug_assert!(n > 0 && n < INLINE_FLAG as usize);
+        self.ptr = NonNull::new_unchecked(buf);
+        self.cap = n as u32 | INLINE_FLAG;
+        self.check_inline_home();
+    }
+
+    /// Move an owned buffer of at most `n` entries (or nothing at all) into `buf`, as
+    /// [`adopt_inline`](Self::adopt_inline). Shared and larger vectors are left alone.
+    ///
+    /// # Safety
+    /// As [`adopt_inline`](Self::adopt_inline).
+    pub(in crate::value) unsafe fn move_to_inline(&mut self, buf: *mut Property, n: usize) {
+        if self.is_shared() || self.is_inline() || self.len as usize > n {
+            return;
+        }
+        let len = self.len as usize;
+        if self.cap != 0 {
+            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), buf, len);
+            dealloc(
+                self.ptr.as_ptr().cast(),
+                Self::owned_layout(self.cap as usize),
+            );
+        }
+        self.ptr = NonNull::new_unchecked(buf);
+        self.cap = n as u32 | INLINE_FLAG;
+        self.check_inline_home();
+    }
+
     #[inline]
     fn shared_header(&self) -> &SharedHeader {
         debug_assert!(self.is_shared());
@@ -92,10 +162,12 @@ impl EntryVec {
             });
             let entries = block.add(HEADER).cast::<Property>();
             std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), entries, len);
-            dealloc(
-                self.ptr.as_ptr().cast(),
-                Self::owned_layout(self.cap as usize),
-            );
+            if !self.is_inline() {
+                dealloc(
+                    self.ptr.as_ptr().cast(),
+                    Self::owned_layout(self.cap as usize),
+                );
+            }
             self.ptr = NonNull::new_unchecked(entries);
         }
         self.cap = 0;
@@ -107,6 +179,24 @@ impl EntryVec {
         debug_assert!(cap >= self.len as usize);
         let cap_u32: u32 = cap.try_into().expect("entry vector exceeds u32 capacity");
         let new_layout = Self::owned_layout(cap);
+        if self.is_inline() {
+            // Outgrew the object's inline slots: move to a heap buffer.
+            self.check_inline_home();
+            let p = unsafe { alloc(new_layout) };
+            if p.is_null() {
+                handle_alloc_error(new_layout);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.ptr.as_ptr(),
+                    p.cast::<Property>(),
+                    self.len as usize,
+                )
+            };
+            self.ptr = unsafe { NonNull::new_unchecked(p.cast()) };
+            self.cap = cap_u32;
+            return;
+        }
         let p = unsafe {
             if self.cap == 0 {
                 alloc(new_layout)
@@ -168,28 +258,50 @@ impl EntryVec {
         self.len as usize
     }
 
-    /// Owned capacity (zero while shared).
+    /// Owned capacity (zero while shared; the slot count in inline mode).
     #[inline]
     pub(in crate::value) fn capacity(&self) -> usize {
-        self.cap as usize
+        self.cap_slots()
     }
 
+    /// Whether the entries live in the object's inline slots (census).
+    pub(in crate::value) fn is_inline_storage(&self) -> bool {
+        self.is_inline()
+    }
+
+    #[inline]
     pub(in crate::value) fn reserve_exact(&mut self, additional: usize) {
         if self.is_shared() {
             self.unshare(additional);
             return;
         }
         let need = self.len as usize + additional;
-        if need > self.cap as usize {
+        if need > self.cap_slots() {
             self.grow_to(need);
         }
     }
 
+    /// Append every property of an exact-size iterator after one capacity check.
+    #[inline]
+    pub(in crate::value) fn extend_exact<I>(&mut self, props: I)
+    where
+        I: ExactSizeIterator<Item = Property>,
+    {
+        let n = props.len();
+        self.reserve_exact(n);
+        let base = self.ptr.as_ptr();
+        for p in props.take(n) {
+            unsafe { base.add(self.len as usize).write(p) };
+            self.len += 1;
+        }
+    }
+
+    #[inline]
     pub(in crate::value) fn push(&mut self, prop: Property) {
         if self.is_shared() {
             self.unshare(1);
-        } else if self.len == self.cap {
-            let cap = self.cap as usize;
+        } else if self.len as usize == self.cap_slots() {
+            let cap = self.cap_slots();
             self.grow_to(if cap < 2 { cap + 1 } else { cap * 2 });
         }
         unsafe { self.ptr.as_ptr().add(self.len as usize).write(prop) };
@@ -322,7 +434,9 @@ impl Clone for EntryVec {
 impl Drop for EntryVec {
     fn drop(&mut self) {
         self.clear();
-        if self.cap != 0 {
+        if self.is_inline() {
+            self.check_inline_home();
+        } else if self.cap != 0 {
             unsafe {
                 dealloc(
                     self.ptr.as_ptr().cast(),

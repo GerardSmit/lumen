@@ -44,8 +44,9 @@
 //! names          uv count, uv string index each (interned like the compiler interns them)
 //! slot_names     uv count, uv string index each (n_slots is their count)
 //! n_params       uv
-//! flags          u8: 1 uses_this, 2 env_this, 4 has arguments_slot
+//! flags          u8: 1 uses_this, 2 env_this, 4 has arguments_slot, 8 has rest_slot
 //! arguments_slot uv (only with flag 4)
+//! rest_slot      uv (only with flag 8)
 //! var_force_resets  uv count, uv each
 //! funcs          uv count, uv unit function index each
 //! cap_inits      uv count, u8 tag (0 Param(k,name) 1 Var(name) 2 Fn(k,name) 3 Lexical(name,
@@ -369,12 +370,43 @@ op_codec! {
     103 => Await;
     104 => PushHandler(a: u32);
     105 => PopHandler;
+    106 => GetPrivate(a: u32);
+    107 => SetPrivate(a: u32);
+    108 => GetPrivateMethod(a: u32);
+    109 => PrivateIn(a: u32);
+    110 => UpdatePrivate(a: u32, b: UpdKind);
+    111 => NewObject;
+    112 => InitProp(a: u32, b: bool);
+    113 => InitPropComputed(a: bool);
+    114 => InitMethod(a: u32, b: u32, c: u16);
+    115 => CopyDataProps;
+    116 => SetProtoLit;
+    117 => MakeClass(a: u32, b: u32);
+    118 => Nip;
+    119 => SuperGet(a: u32);
+    120 => SuperGetElem;
+    121 => SuperBase;
+    122 => SuperMethod(a: u32, b: bool);
+    123 => SuperMethodElem(a: bool);
+    124 => ObjRest(a: u32, b: u16);
+    125 => NewArrayLit;
+    126 => ArrayAppend;
+    127 => ArrayAppendSpread;
+    128 => ArrayHole;
+    129 => SwitchLK(a: u16, b: u32);
+    130 => SuperCtor;
+    131 => SuperCall(a: u16);
+    132 => SuperCallSpread(a: u16);
+    133 => DerivedReturn;
+    134 => InitialYield;
+    135 => Yield;
+    136 => YieldDelegate(a: u16);
 }
 
 /// The chunk fields this codec writes, in order (hand-maintained next to `enc_chunk`, whose
 /// exhaustive destructuring of `Chunk` forces a look here when a field is added).
 const CHUNK_SIG: &str = "ops consts(undef null false true num str bigint) names slot_names \
-    n_params flags(uses_this env_this arguments_slot) var_force_resets funcs \
+    n_params flags(uses_this env_this arguments_slot rest_slot derived reflect_args) var_force_resets funcs \
     cap_inits(param var fn lexical) caches obj_maps name_caches";
 
 const fn fnv(mut h: u64, s: &[u8]) -> u64 {
@@ -479,6 +511,8 @@ fn enc_chunk(
         var_force_resets,
         uses_this,
         funcs,
+        classes,
+        rest_slot,
         cap_inits,
         activation_layout: _, // recomputed from cap_inits/env_this/names
         env_this,
@@ -490,7 +524,13 @@ fn enc_chunk(
         name_pins,
         cap_caches,
         cap_pins,
+        switch_tables: _, // runtime state; sized from the SwitchLK ops on decode
+        derived,
+        reflect_args,
     } = chunk;
+    if !classes.is_empty() {
+        return Err("class definitions are not carried by the codec".into());
+    }
     if *n_slots != slot_names.len()
         || name_paths.len() != name_caches.len()
         || name_pins.borrow().len() != name_caches.len()
@@ -538,8 +578,18 @@ fn enc_chunk(
         uv(out, strings.idx(n) as u64);
     }
     uv(out, *n_params as u64);
-    out.push((*uses_this as u8) | (*env_this as u8) << 1 | (arguments_slot.is_some() as u8) << 2);
+    out.push(
+        (*uses_this as u8)
+            | (*env_this as u8) << 1
+            | (arguments_slot.is_some() as u8) << 2
+            | (rest_slot.is_some() as u8) << 3
+            | (*derived as u8) << 4
+            | (*reflect_args as u8) << 5,
+    );
     if let Some(s) = arguments_slot {
+        uv(out, *s as u64);
+    }
+    if let Some(s) = rest_slot {
         uv(out, *s as u64);
     }
     uv(out, var_force_resets.len() as u64);
@@ -639,6 +689,11 @@ fn dec_chunk(
     } else {
         None
     };
+    let rest_slot = if flags & 8 != 0 {
+        Some(u16::get(r)?)
+    } else {
+        None
+    };
     let n = r.len()?;
     let mut var_force_resets = Vec::with_capacity(n);
     for _ in 0..n {
@@ -685,6 +740,14 @@ fn dec_chunk(
     let env_this = flags & 2 != 0;
     // Runtime state below: built exactly as `compile` builds it.
     let cap_cache_len = names.len();
+    let n_switch_tables = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::SwitchLK(_, t) => Some(*t as usize + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
     let activation_layout = activation::ActivationLayout::new(&cap_inits, env_this, &names);
     Ok(Chunk {
         ops,
@@ -697,6 +760,8 @@ fn dec_chunk(
         var_force_resets,
         uses_this: flags & 1 != 0,
         funcs,
+        classes: Vec::new(),
+        rest_slot,
         cap_inits,
         activation_layout,
         env_this,
@@ -710,6 +775,9 @@ fn dec_chunk(
             .collect(),
         cap_caches: vec![Cell::new(NameIc::EMPTY); cap_cache_len],
         cap_pins: RefCell::new(vec![None; cap_cache_len]),
+        switch_tables: (0..n_switch_tables).map(|_| OnceCell::new()).collect(),
+        derived: flags & 16 != 0,
+        reflect_args: flags & 32 != 0,
     })
 }
 
@@ -1095,12 +1163,14 @@ mod tests {
             function args() { return arguments.length; }
             async function aw(p) { try { return await p; } catch (e) { throw e; } }
             function* gen() { yield 1; }
+            async function* agen() { yield 1; }
+            function refused(o) { with (o) { return x; } }
             function sw(x) { switch (x) { case 1: return 'a'; default: return 'b'; } }
         "#;
         let (_body, funcs) = funcs_of(src);
         let (section, stats) = encode_unit(&funcs);
         assert!(stats.chunks >= 7, "{stats:?}");
-        assert!(stats.refused >= 1, "the generator is refused: {stats:?}");
+        assert!(stats.refused >= 1, "the `with` body is refused: {stats:?}");
         // Decode against a second, independent parse of the same program.
         let section: &'static [u8] = Box::leak(section.into_boxed_slice());
         let (_body2, funcs2) = funcs_of(src);

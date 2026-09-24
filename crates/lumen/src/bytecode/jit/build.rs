@@ -47,7 +47,12 @@
 //! that fact holds loads the element directly ([`layout::view_elem_num`]); the fact dies when
 //! `i` or `a` is written or JS runs.
 
-use super::helpers::{self, Helper, MathFn};
+use super::helpers::{self, FastArg, Helper, MathFn};
+
+#[path = "call.rs"]
+mod call;
+#[path = "inline.rs"]
+mod inline;
 use super::layout;
 use super::*;
 use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
@@ -66,18 +71,33 @@ pub(crate) struct Built {
     /// The representation chosen for each slot (`chunk.n_slots` long); `Num`/`Bool` slots are
     /// guarded at entry.
     pub kinds: Vec<Kind>,
+    /// Region handler sets referenced by `frame.exit_hset` (see the contract in [`super`]).
+    pub hsets: Vec<Vec<(usize, usize)>>,
+    /// Values the code's identity guards compare against (kept alive with the code).
+    pub pins: Vec<Value>,
+    /// External addresses, import id `EXT_BASE + index`.
+    pub externs: Vec<u64>,
+    /// Start pcs of the call sites guarded at every call (their guard exits there).
+    pub guarded: Vec<usize>,
+    /// Heap cells whose addresses the code embeds (see [`call`]).
+    pub boxes: Vec<Box<dyn std::any::Any>>,
+    /// The address of a `Cell<usize>` in `boxes` to receive the code's own entry address
+    /// (read by direct self-calls that leave through the interpreter), or 0.
+    pub self_entry: usize,
 }
 
 /// Translate the loop `[header, backedge]` of `chunk`, specializing on the current `slots`.
 /// `Err` (with a reason for `LUMEN_TIER_LOG`) when the region uses something unsupported.
 pub(crate) fn build(
+    interp: &Interp,
+    env: &Env,
     chunk: &Chunk,
     header: usize,
     backedge: usize,
     slots: &[Value],
+    this_val: &Value,
 ) -> Result<Built, String> {
-    let an = analyze(chunk, header, backedge)?;
-
+    let an = analyze(chunk, header, backedge, false)?;
     let n_slots = chunk.n_slots;
     let mut kinds = vec![Kind::Boxed; n_slots];
     for s in 0..n_slots {
@@ -85,12 +105,230 @@ pub(crate) fn build(
             kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
         }
     }
-    let plan = plan(chunk, header, backedge, &an, &kinds);
+    build_region(
+        interp,
+        env,
+        chunk,
+        header,
+        backedge,
+        slots,
+        an,
+        kinds,
+        vec![false; n_slots],
+        false,
+        this_val,
+    )
+}
+
+/// Translate the whole of `chunk` as function code entered at pc 0 (the whole-function tier):
+/// the region is every op, the operand stack is empty and no handler is live at entry, and
+/// `slots` holds the arguments of the call being entered. Slots that hold a value at entry
+/// (parameters, `arguments`, the rest array) are specialized on it and guarded like a loop's
+/// locals; locals that start out `undefined` are speculated per [`fn_kinds`]. `widen` forces
+/// slots Boxed (an earlier speculation on them failed). Ops the translator does not handle
+/// exit to the interpreter, which finishes the call.
+/// Ops beyond which a function is left to the loop tier (compile time and code size).
+const MAX_FN_OPS: usize = 4000;
+
+pub(crate) fn build_fn(
+    interp: &Interp,
+    env: &Env,
+    chunk: &Chunk,
+    slots: &[Value],
+    widen: &[bool],
+    this_val: &Value,
+) -> Result<Built, String> {
+    let n = chunk.ops.len();
+    if n == 0 {
+        return Err("empty chunk".into());
+    }
+    if n > MAX_FN_OPS {
+        return Err(format!("function too large ({n} ops)"));
+    }
+    let an = analyze(chunk, 0, n - 1, true)?;
+    let (kinds, fresh) = fn_kinds(chunk, &an, slots, widen);
+    build_region(interp, env, chunk, 0, n - 1, slots, an, kinds, fresh, true, this_val)
+}
+
+/// Function mode: the representation of each slot, and which `Num` slots start out
+/// `undefined` (tracked by an [`Tr::undef`] flag instead of an entry guard).
+///
+/// Slots below `n_params` (and `arguments` / the rest array) hold their value at entry and take
+/// its kind. Other locals are `undefined` at every entry; one is speculated `Num` when every
+/// write stores a value that is likely a Number (a Number constant, arithmetic, an update, a
+/// load of another such slot, an element / property read or a call result) and no op needs it
+/// in memory. A wrong guess costs resume exits at the writes, after which the function
+/// recompiles with the slot widened.
+fn fn_kinds(chunk: &Chunk, an: &Analysis, slots: &[Value], widen: &[bool]) -> (Vec<Kind>, Vec<bool>) {
+    let n_slots = chunk.n_slots;
+    let ops = &chunk.ops;
+    let widened = |s: usize| widen.get(s).copied().unwrap_or(false);
+    let mut kinds = vec![Kind::Boxed; n_slots];
+    let mut cand = vec![false; n_slots];
+    for s in 0..n_slots {
+        if !an.touched[s] || widened(s) {
+            continue;
+        }
+        let at_entry = s < chunk.n_params
+            || chunk.arguments_slot == Some(s as u16)
+            || chunk.rest_slot == Some(s as u16);
+        if at_entry {
+            kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
+        } else {
+            cand[s] = true;
+        }
+    }
+    let reach = |pc: usize| an.depth[pc].is_some();
+    // Slots only memory-backed ops may touch.
+    for pc in 0..ops.len() {
+        if !reach(pc) {
+            continue;
+        }
+        match ops[pc] {
+            Op::GetPropLocal(s, ..)
+            | Op::SetPropLocalDrop(s, ..)
+            | Op::GetElemLocal(s)
+            | Op::SetElemLocal(s)
+            | Op::SetElemLocalDrop(s)
+            | Op::ToPropKeyLocal(s)
+            | Op::IterCloseL(s)
+            | Op::IterAbortL(s) => cand[s as usize] = false,
+            Op::IterStepL(a, b) => {
+                cand[a as usize] = false;
+                cand[b as usize] = false;
+            }
+            Op::ForInStepL(a, b, c) => {
+                cand[a as usize] = false;
+                cand[b as usize] = false;
+                cand[c as usize] = false;
+            }
+            _ => {}
+        }
+    }
+    let num_slot = |cand: &[bool], s: u16| cand[s as usize] || kinds[s as usize] == Kind::Num;
+    loop {
+        let mut changed = false;
+        for pc in 0..ops.len() {
+            if !reach(pc) {
+                continue;
+            }
+            let (dst, ok) = match ops[pc] {
+                Op::StoreLocal(s) if cand[s as usize] => {
+                    // The producer of the stored value, in the same basic block.
+                    let mut q = pc;
+                    let ok = loop {
+                        if q == 0 || an.leader[q] {
+                            break false;
+                        }
+                        q -= 1;
+                        break match ops[q] {
+                            Op::Dup => continue,
+                            Op::Const(k) => matches!(chunk.consts[k as usize], Value::Num(_)),
+                            Op::Add
+                            | Op::Sub
+                            | Op::Mul
+                            | Op::Div
+                            | Op::Mod
+                            | Op::BitAnd
+                            | Op::BitOr
+                            | Op::BitXor
+                            | Op::Shl
+                            | Op::Shr
+                            | Op::UShr
+                            | Op::Neg
+                            | Op::Plus
+                            | Op::BitNot
+                            | Op::GetElem
+                            | Op::GetElemLocal(_)
+                            | Op::GetProp(..)
+                            | Op::GetPropThis(..)
+                            | Op::GetPropLocal(..)
+                            | Op::Call(_)
+                            | Op::CallWithThis(_) => true,
+                            Op::UpdateLocal(_, k) => {
+                                !matches!(k, UpdKind::IncDiscard | UpdKind::DecDiscard)
+                            }
+                            Op::LoadLocal(t) => num_slot(&cand, t),
+                            _ => false,
+                        };
+                    };
+                    (s, ok)
+                }
+                Op::ArithLL(k, d, a, b) if cand[d as usize] => (
+                    d,
+                    k != ArithKind::Add || (num_slot(&cand, a) && num_slot(&cand, b)),
+                ),
+                Op::ArithLK(k, d, a, c) if cand[d as usize] => (
+                    d,
+                    k != ArithKind::Add
+                        || (num_slot(&cand, a)
+                            && matches!(chunk.consts[c as usize], Value::Num(_))),
+                ),
+                _ => continue,
+            };
+            if !ok {
+                cand[dst as usize] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for s in 0..n_slots {
+        if cand[s] {
+            kinds[s] = Kind::Num;
+        }
+    }
+    (kinds, cand)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_region(
+    interp: &Interp,
+    env: &Env,
+    chunk: &Chunk,
+    header: usize,
+    backedge: usize,
+    slots: &[Value],
+    an: Analysis,
+    kinds: Vec<Kind>,
+    fresh: Vec<bool>,
+    func_mode: bool,
+    this_val: &Value,
+) -> Result<Built, String> {
+    let n_slots = chunk.n_slots;
+    let mut kinds = kinds;
+    let defd = Defd::new(chunk, header, backedge, &an, &fresh, None);
+    let tdz_ssa: Vec<bool> = (0..n_slots)
+        .map(|s| an.tdz[s] && kinds[s] != Kind::Boxed)
+        .collect();
+    let tdzd = Defd::new(chunk, header, backedge, &an, &tdz_ssa, Some(func_mode));
+    let mut plan = plan(interp, env, chunk, header, backedge, slots, &an, &kinds, &defd, &tdzd);
+    call::plan_direct(&mut plan, interp, env, chunk, header, backedge, slots, this_val, &an, &kinds, func_mode);
+    let pins = std::mem::take(&mut plan.pins);
+    let mut boxes = std::mem::take(&mut plan.boxes);
+    let externs = plan.externs.clone();
+    let guarded: Vec<usize> = plan
+        .math
+        .iter()
+        .filter(|(_, s)| s.slot.is_some())
+        .map(|(&pc, _)| pc)
+        .chain(plan.dname.keys().copied())
+        .collect();
+    let self_cell: Box<std::cell::Cell<usize>> = Box::new(std::cell::Cell::new(0));
+    let self_entry = &*self_cell as *const std::cell::Cell<usize> as usize;
+    boxes.push(self_cell);
 
     let mut func = Function::new(
-        format!("loop_{header}_{backedge}"),
+        if func_mode {
+            format!("fn_{}", chunk.ops.len())
+        } else {
+            format!("loop_{header}_{backedge}")
+        },
         Signature::new(vec![PTR], vec![Type::I64]),
     );
+    let hsets;
     let max_stack = {
         let mut fb = FunctionBuilder::new(&mut func);
         let entry = fb.create_entry_block();
@@ -114,6 +352,7 @@ pub(crate) fn build(
                         None
                     },
                     edges: 0,
+                    visited: false,
                     back_left: an.back[i],
                     has_back: an.back[i] > 0,
                 })
@@ -136,6 +375,11 @@ pub(crate) fn build(
             kinds,
             vars: vec![None; n_slots],
             tdz: vec![None; n_slots],
+            undef: vec![None; n_slots],
+            fresh,
+            defd,
+            tdzd,
+            func_mode,
             helpers: vec![None; helpers::ALL.len()],
             leaders,
             stack: Vec::new(),
@@ -145,23 +389,60 @@ pub(crate) fn build(
             arr_vars: HashMap::new(),
             idx_vars: HashMap::new(),
             math_vars: HashMap::new(),
+            ta_vars: HashMap::new(),
+            ta_len_vars: HashMap::new(),
+            ta_slots: (0..n_slots)
+                .map(|s| match slots.get(s) {
+                    Some(Value::Obj(o)) => interp
+                        .typed_arrays
+                        .contains_key(&(crate::value::Gc::as_ptr(o) as usize)),
+                    _ => false,
+                })
+                .collect(),
+            hs_cur: Vec::new(),
+            hsets: Vec::new(),
+            err: None,
+            self_fn: None,
+            self_sizes: Vec::new(),
+            self_entry,
         };
         tr.entry(&an);
         tr.body(&an)?;
+        if let Some(e) = tr.err.take() {
+            return Err(e);
+        }
         let Tr {
             fb,
             max_stack,
             kinds: k,
+            hsets: h,
+            self_sizes,
             ..
         } = tr;
         fb.finish();
         kinds = k;
+        hsets = h;
+        // Direct self-calls reserve this code's own frame size, known only now.
+        let size = frame_bytes(n_slots, max_stack) as i64;
+        for v in self_sizes {
+            if let lumen_codegen::ir::ValueDef::Result(inst, _) = func.values[v.index()].def {
+                if let lumen_codegen::ir::InstData::Iconst { imm, .. } = &mut func.insts[inst.index()] {
+                    *imm = size;
+                }
+            }
+        }
         max_stack
     };
     Ok(Built {
         func,
         max_stack,
         kinds,
+        hsets,
+        pins,
+        externs,
+        guarded,
+        boxes,
+        self_entry,
     })
 }
 
@@ -182,6 +463,9 @@ struct Analysis {
     touched: Vec<bool>,
     /// Per slot: put into its TDZ by a reachable `Tdz`.
     tdz: Vec<bool>,
+    /// Region handlers live before the op, `(catch_pc, stack_depth)` outermost first (the
+    /// handlers the interpreter had at entry are not included).
+    hs: Vec<Vec<(usize, usize)>>,
 }
 
 /// Whether control can continue to `pc + 1`, and the jump target.
@@ -190,11 +474,158 @@ fn successors(op: &Op) -> (bool, Option<usize>) {
         op,
         Op::Jump(_) | Op::Return | Op::ReturnUndef | Op::Throw | Op::IterAbortL(_)
     );
-    (falls, crate::jit_ir::jump_target(op))
+    // A `PushHandler`'s catch pc is no jump: its throw edge is added separately (with the
+    // exception pushed and the handler popped).
+    let target = match op {
+        Op::PushHandler(_) => None,
+        _ => crate::jit_ir::jump_target(op),
+    };
+    (falls, target)
+}
+
+/// Function mode: for each pc, the `fresh` slots (see [`fn_kinds`]) definitely written before
+/// it on every path from the entry — their `undefined` flag is known clear there, so reads need
+/// no check. Catch pads know nothing (conservative). Every translated use of a fresh (`Num`)
+/// slot either writes it or exits unless it is written, so each such op defines it.
+struct Defd {
+    /// Bit index of each slot (`usize::MAX` = not fresh).
+    idx: Vec<usize>,
+    /// Per region pc (offset by `header`), the definitely-written bit set.
+    sets: Vec<Vec<u64>>,
+    header: usize,
+}
+
+impl Defd {
+    /// `tdz`: track TDZ flags instead — a `Tdz` op sets the slot's flag, and in function mode
+    /// every flag starts clear (slots hold `undefined` at entry).
+    fn new(
+        chunk: &Chunk,
+        header: usize,
+        backedge: usize,
+        an: &Analysis,
+        fresh: &[bool],
+        tdz: Option<bool>,
+    ) -> Defd {
+        let mut idx = vec![usize::MAX; fresh.len()];
+        let mut nf = 0;
+        for (s, &f) in fresh.iter().enumerate() {
+            if f {
+                idx[s] = nf;
+                nf += 1;
+            }
+        }
+        if nf == 0 {
+            return Defd {
+                idx,
+                sets: Vec::new(),
+                header,
+            };
+        }
+        let words = nf.div_ceil(64);
+        let n = backedge - header + 1;
+        let ops = &chunk.ops;
+        let inr = |q: usize| q >= header && q <= backedge && an.depth[q - header].is_some();
+        let mut catch = vec![false; n];
+        for pc in header..=backedge {
+            if let Op::PushHandler(t) = ops[pc] {
+                if inr(t as usize) {
+                    catch[t as usize - header] = true;
+                }
+            }
+        }
+        let mut sets: Vec<Option<Vec<u64>>> = vec![None; n];
+        let mut queued = vec![false; n];
+        let mut work = vec![header];
+        sets[0] = Some(if tdz == Some(true) {
+            vec![u64::MAX; words]
+        } else {
+            vec![0; words]
+        });
+        queued[0] = true;
+        while let Some(pc) = work.pop() {
+            queued[pc - header] = false;
+            let mut out = sets[pc - header].clone().expect("queued pcs have a set");
+            if let (Op::Tdz(sl), Some(_)) = (ops[pc], tdz) {
+                let k = idx.get(sl as usize).copied().unwrap_or(usize::MAX);
+                if k != usize::MAX {
+                    out[k / 64] &= !(1 << (k % 64));
+                }
+            } else if !matches!(ops[pc], Op::Tdz(_)) {
+                for sl in op_slots(&ops[pc]) {
+                    let k = idx.get(sl as usize).copied().unwrap_or(usize::MAX);
+                    if k != usize::MAX {
+                        out[k / 64] |= 1 << (k % 64);
+                    }
+                }
+            }
+            let (falls, target) = successors(&ops[pc]);
+            let mut succ: Vec<(usize, bool)> = falls
+                .then_some(pc + 1)
+                .into_iter()
+                .chain(target)
+                .map(|q| (q, false))
+                .collect();
+            // A catch pad is entered by throws: it knows nothing.
+            if let Op::PushHandler(t) = ops[pc] {
+                succ.push((t as usize, true));
+            }
+            for (q, _) in succ {
+                if !inr(q) {
+                    continue;
+                }
+                let r = q - header;
+                let changed = if catch[r] {
+                    if sets[r].is_none() {
+                        sets[r] = Some(vec![0; words]);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    match &mut sets[r] {
+                        None => {
+                            sets[r] = Some(out.clone());
+                            true
+                        }
+                        Some(cur) => {
+                            let mut ch = false;
+                            for (c, o) in cur.iter_mut().zip(&out) {
+                                let v = *c & *o;
+                                ch |= v != *c;
+                                *c = v;
+                            }
+                            ch
+                        }
+                    }
+                };
+                if changed && !queued[r] {
+                    queued[r] = true;
+                    work.push(q);
+                }
+            }
+        }
+        Defd {
+            idx,
+            sets: sets.into_iter().map(|s| s.unwrap_or_default()).collect(),
+            header,
+        }
+    }
+
+    /// Whether fresh slot `s` may still hold its entry `undefined` before the op at `pc`.
+    fn maybe_undef(&self, s: usize, pc: usize) -> bool {
+        let k = self.idx.get(s).copied().unwrap_or(usize::MAX);
+        if k == usize::MAX {
+            return false;
+        }
+        match self.sets.get(pc.wrapping_sub(self.header)) {
+            Some(set) if !set.is_empty() => set[k / 64] & (1 << (k % 64)) == 0,
+            _ => true,
+        }
+    }
 }
 
 /// The slots `op` reads or writes.
-fn op_slots(op: &Op) -> Vec<u16> {
+pub(crate) fn op_slots(op: &Op) -> Vec<u16> {
     match *op {
         Op::LoadLocal(s)
         | Op::StoreLocal(s)
@@ -217,12 +648,12 @@ fn op_slots(op: &Op) -> Vec<u16> {
     }
 }
 
-fn analyze(chunk: &Chunk, header: usize, backedge: usize) -> Result<Analysis, String> {
+fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<Analysis, String> {
     let ops = &chunk.ops;
     if header > backedge || backedge >= ops.len() {
         return Err(format!("bad region {header}..={backedge}"));
     }
-    if !matches!(ops[backedge], Op::Jump(t) if t as usize == header) {
+    if !func && !matches!(ops[backedge], Op::Jump(t) if t as usize == header) {
         return Err(format!(
             "op at {backedge} is not the backward jump to {header}"
         ));
@@ -230,15 +661,17 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize) -> Result<Analysis, St
     let inr = |pc: usize| pc >= header && pc <= backedge;
     let n = backedge - header + 1;
     let mut depth: Vec<Option<usize>> = vec![None; n];
+    let mut hs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     depth[0] = Some(0);
     let mut work = vec![header];
     while let Some(pc) = work.pop() {
         let op = &ops[pc];
         match op {
-            Op::PushHandler(_) | Op::PopHandler | Op::Await => {
+            Op::Await => {
                 return Err(format!("unsupported op {op:?} at {pc}"));
             }
-            Op::ForInStepL(..) | Op::IterStepL(..) | Op::IterCloseL(_) | Op::IterAbortL(_) => {
+            // Function code leaves it to the interpreter (an exit before it).
+            Op::ForInStepL(..) if !func => {
                 return Err(format!("iteration op {op:?} at {pc}"));
             }
             _ => {}
@@ -251,22 +684,49 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize) -> Result<Analysis, St
             return Err(format!("stack underflow at {pc}"));
         }
         let after = d - pops + pushes;
+        let h = hs[pc - header].clone();
+        let mut h_after = h.clone();
+        // (successor pc, depth, handlers): the op's own edges, plus the throw edge of a region
+        // handler to its catch pad.
+        let mut edges: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
+        match *op {
+            Op::PushHandler(t) => {
+                h_after.push((t as usize, d));
+                edges.push((t as usize, d + 1, h.clone()));
+            }
+            Op::PopHandler => {
+                if h_after.pop().is_none() {
+                    return Err(format!("PopHandler at {pc} pops a handler from outside the loop"));
+                }
+            }
+            _ => {}
+        }
         let (falls, target) = successors(op);
         for q in falls.then_some(pc + 1).into_iter().chain(target) {
+            edges.push((q, after, h_after.clone()));
+        }
+        for (q, dq, hq) in edges {
             if !inr(q) {
                 continue;
             }
             match depth[q - header] {
                 None => {
-                    depth[q - header] = Some(after);
+                    depth[q - header] = Some(dq);
+                    hs[q - header] = hq;
                     work.push(q);
                 }
-                Some(e) if e != after => {
+                Some(e) if e != dq => {
                     return Err(format!("inconsistent stack depth at {q}"));
+                }
+                Some(_) if hs[q - header] != hq => {
+                    return Err(format!("inconsistent handlers at {q}"));
                 }
                 Some(_) => {}
             }
         }
+    }
+    if !hs[0].is_empty() {
+        return Err("handlers at the loop header".into());
     }
 
     let mut leader = vec![false; n];
@@ -291,6 +751,17 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize) -> Result<Analysis, St
                 tdz[s] = true;
             }
         }
+        if let Op::PushHandler(t) = *op {
+            // A catch pad in the region: entered by throws (any number), always Boxed.
+            let t = t as usize;
+            if inr(t) {
+                if t <= pc {
+                    return Err(format!("catch pad {t} before its try at {pc}"));
+                }
+                leader[t - header] = true;
+                preds[t - header] += 2;
+            }
+        }
         let (falls, target) = successors(op);
         if let Some(t) = target.filter(|&t| inr(t)) {
             leader[t - header] = true;
@@ -313,6 +784,7 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize) -> Result<Analysis, St
         back,
         touched,
         tdz,
+        hs,
     })
 }
 
@@ -327,6 +799,9 @@ enum Src {
     Cap(u32),
     /// `frame.this_val`: valid for the whole region.
     This,
+    /// A callee `Value` the code itself keeps alive (a direct call site's resolved callee, see
+    /// [`call`]): valid for the code's lifetime.
+    Pin,
 }
 
 impl Src {
@@ -347,8 +822,59 @@ struct Plan {
     arr_srcs: Vec<Src>,
     /// `(array, index slot)` pairs with an in-bounds fact.
     idx_facts: Vec<(Src, u16)>,
-    /// Inline `Math` calls: `LoadName(Math)` pc → (function, `CallWithThis` pc).
-    math: HashMap<usize, (MathFn, usize)>,
+    /// Inline call sites (`Math` intrinsics and direct `#[op(fast)]` calls): first pc of the
+    /// callee part → the site.
+    math: HashMap<usize, Site>,
+    /// Direct fast calls, by [`Intr::Fast`] index.
+    fast: Vec<FastSite>,
+    /// Inlined callees, by [`Intr::Inline`] index.
+    inl: Vec<inline::InlSite>,
+    /// Callees the fast sites' guards compare against.
+    pins: Vec<Value>,
+    /// Fast entries' addresses (import id `EXT_BASE + index`).
+    externs: Vec<u64>,
+    /// Direct call sites, by call pc (see [`call`]).
+    direct: HashMap<usize, call::DSite>,
+    /// Name loads producing a direct site's callee (guarded by identity at the load): load pc
+    /// -> call pc.
+    dname: HashMap<usize, usize>,
+    /// Heap cells the direct sites' code embeds addresses of.
+    boxes: Vec<Box<dyn std::any::Any>>,
+}
+
+/// What an inline call site computes.
+#[derive(Clone, Copy, Debug)]
+enum Intr {
+    Math(MathFn),
+    /// Index into [`Plan::fast`].
+    Fast(usize),
+    /// Index into [`Plan::inl`].
+    Inline(usize),
+}
+
+/// An inline call site: `LoadName GetMethod <args> CallWithThis` (`lfc == false`) or
+/// `LoadNameForCall <args> CallWithThis` (`lfc`), the arguments pure unboxed operations, so no
+/// placeholder of the callee part is ever materialized.
+#[derive(Clone, Copy, Debug)]
+struct Site {
+    f: Intr,
+    /// The `CallWithThis` pc.
+    call: usize,
+    lfc: bool,
+    /// `LoadLocal(slot) <args> Call`: an inlined callee held in a (Boxed) local, guarded at
+    /// every call (see [`Helper::SlotGuard`]).
+    slot: Option<u16>,
+}
+
+/// A direct call of a `#[op(fast)]` entry.
+#[derive(Clone, Debug)]
+struct FastSite {
+    args: Vec<FastArg>,
+    ret: FastArg,
+    /// The callee's object address (guarded, see [`Helper::FastGuard`]).
+    expect: usize,
+    /// Index into [`Plan::externs`].
+    ext: usize,
 }
 
 /// Whether name cache `c` currently resolves through a scope binding (the modes
@@ -363,7 +889,18 @@ fn name_scope_mode(chunk: &Chunk, c: u32) -> bool {
         })
 }
 
-fn plan(chunk: &Chunk, header: usize, backedge: usize, an: &Analysis, kinds: &[Kind]) -> Plan {
+fn plan(
+    interp: &Interp,
+    env: &Env,
+    chunk: &Chunk,
+    header: usize,
+    backedge: usize,
+    slots: &[Value],
+    an: &Analysis,
+    kinds: &[Kind],
+    defd: &Defd,
+    tdzd: &Defd,
+) -> Plan {
     let ops = &chunk.ops;
     let reach = |pc: usize| an.depth[pc - header].is_some();
     let lead = |pc: usize| an.leader[pc - header];
@@ -376,32 +913,35 @@ fn plan(chunk: &Chunk, header: usize, backedge: usize, an: &Analysis, kinds: &[K
         }
     };
 
-    // An inline `Math.f(args)`: `LoadName GetMethod <pure Number ops> CallWithThis(arity)` in
-    // one basic block, where nothing between can exit (the two receiver/callee entries are
-    // placeholders that must never be materialized).
-    let math_site = |pc: usize| -> Option<(MathFn, usize)> {
-        let (Op::LoadName(..), Some(Op::GetMethod(m, _))) = (ops[pc], ops.get(pc + 1).copied())
-        else {
-            return None;
-        };
-        if pc + 1 > backedge || lead(pc + 1) {
-            return None;
-        }
-        let f = helpers::math_intrinsic(chunk.names.get(m as usize)?)?;
-        if helpers::math_site_failed(chunk, pc) {
-            return None;
-        }
-        let mut depth = 0usize;
-        for q in pc + 2..=backedge {
+    // The arguments of an inline call site: pure unboxed operations in one basic block from
+    // `from`, up to the `CallWithThis`. Returns the call pc and the argument kinds (true = Num,
+    // false = Bool) when the whole window qualifies.
+    // `plain`: the window ends in a `Call` (a callee without receiver) instead.
+    let site_args = |from: usize, plain: bool| -> Option<(usize, Vec<bool>)> {
+        let mut st: Vec<bool> = Vec::new();
+        for q in from..=backedge {
             if lead(q) {
                 return None;
             }
             match ops[q] {
-                Op::CallWithThis(argc) => {
-                    return (argc as usize == depth && depth == f.arity()).then_some((f, q));
+                Op::CallWithThis(argc) if !plain => {
+                    return (argc as usize == st.len()).then_some((q, st));
                 }
-                Op::LoadLocal(s) if num_slot(s) && !an.tdz[s as usize] => depth += 1,
-                Op::Const(k) if matches!(chunk.consts[k as usize], Value::Num(_)) => depth += 1,
+                Op::Call(argc) if plain => {
+                    return (argc as usize == st.len()).then_some((q, st));
+                }
+                Op::LoadLocal(s)
+                    if !tdzd.maybe_undef(s as usize, q)
+                        && !defd.maybe_undef(s as usize, q)
+                        && kinds[s as usize] != Kind::Boxed =>
+                {
+                    st.push(num_slot(s))
+                }
+                Op::Const(k) => match chunk.consts[k as usize] {
+                    Value::Num(_) => st.push(true),
+                    Value::Bool(_) => st.push(false),
+                    _ => return None,
+                },
                 Op::Add
                 | Op::Sub
                 | Op::Mul
@@ -413,15 +953,128 @@ fn plan(chunk: &Chunk, header: usize, backedge: usize, an: &Analysis, kinds: &[K
                 | Op::Shl
                 | Op::Shr
                 | Op::UShr
-                    if depth >= 2 =>
+                    if st.len() >= 2 && st[st.len() - 1] && st[st.len() - 2] =>
                 {
-                    depth -= 1
+                    st.pop();
                 }
-                Op::Neg | Op::Plus | Op::BitNot if depth >= 1 => {}
+                Op::Neg | Op::Plus | Op::BitNot if st.last() == Some(&true) => {}
                 _ => return None,
             }
         }
         None
+    };
+    // An inline `Math.f(args)` (`LoadName GetMethod <Number args> CallWithThis(arity)`) or a
+    // direct call of a `#[op(fast)]` function resolved from a name (`ns.f(args)` or `f(args)`)
+    // whose arguments match its unboxed signature, in one basic block, where nothing between
+    // can exit (the receiver/callee entries are placeholders that must never be materialized).
+    let site = |p: &mut Plan, pc: usize| -> Option<Site> {
+        if helpers::math_site_failed(chunk, pc) {
+            return None;
+        }
+        let lfc = match (ops[pc], ops.get(pc + 1).copied()) {
+            (Op::LoadName(..), Some(Op::GetMethod(..))) if pc + 1 <= backedge && !lead(pc + 1) => {
+                false
+            }
+            (Op::LoadNameForCall(..), _) => true,
+            _ => return None,
+        };
+        let (call, args) = site_args(pc + if lfc { 1 } else { 2 }, false)?;
+        if let (false, Op::GetMethod(m, _)) = (lfc, ops[pc + 1]) {
+            if let Some(f) = helpers::math_intrinsic(chunk.names.get(m as usize)?) {
+                return (args.len() == f.arity() && args.iter().all(|&n| n)).then_some(Site {
+                    f: Intr::Math(f),
+                    call,
+                    lfc,
+                    slot: None,
+                });
+            }
+        }
+        let callee = helpers::site_callee(interp, chunk, env, pc)?;
+        let Some((sig_args, ret, addr)) = helpers::fast_sig(interp, &callee) else {
+            // A small pure user function: inline its body.
+            let (ichunk, shape) = inline::candidate(interp, &callee, &args)?;
+            let Value::Obj(o) = &callee else { return None };
+            let expect = crate::value::Gc::as_ptr(o) as usize;
+            p.pins.push(callee);
+            p.inl.push(inline::InlSite {
+                chunk: ichunk,
+                shape,
+                argc: args.len(),
+                expect,
+            });
+            return Some(Site {
+                f: Intr::Inline(p.inl.len() - 1),
+                call,
+                lfc,
+                slot: None,
+            });
+        };
+        if sig_args.len() != args.len()
+            || sig_args.iter().zip(&args).any(|(k, &num)| match k {
+                FastArg::F64 | FastArg::I32 | FastArg::U32 => !num,
+                FastArg::Bool => num,
+                FastArg::Void => true,
+            })
+        {
+            return None;
+        }
+        let Value::Obj(o) = &callee else { return None };
+        let expect = crate::value::Gc::as_ptr(o) as usize;
+        let ext = match p.externs.iter().position(|&a| a == addr) {
+            Some(k) => k,
+            None => {
+                p.externs.push(addr);
+                p.externs.len() - 1
+            }
+        };
+        p.pins.push(callee);
+        p.fast.push(FastSite {
+            args: sig_args,
+            ret,
+            expect,
+            ext,
+        });
+        Some(Site {
+            f: Intr::Fast(p.fast.len() - 1),
+            call,
+            lfc,
+            slot: None,
+        })
+    };
+
+    // `LoadLocal(s) <args> Call(argc)` with a small pure function in Boxed local `s` now: inline
+    // it, guarded at every call on the local still holding a function with that body.
+    let slot_site = |p: &mut Plan, pc: usize, s: u16| -> Option<Site> {
+        let s = s as usize;
+        if helpers::math_site_failed(chunk, pc) || kinds.get(s) != Some(&Kind::Boxed) {
+            return None;
+        }
+        let callee = slots.get(s)?;
+        if !matches!(callee, Value::Obj(_)) {
+            return None;
+        }
+        let (call, args) = site_args(pc + 1, true)?;
+        let (ichunk, shape) = inline::candidate(interp, callee, &args)?;
+        // The payload word as stored in the slot (the fast identity check compares it).
+        // SAFETY: a `Value` is `VALUE_SIZE` bytes with its payload at `VALUE_PAYLOAD`.
+        let expect = unsafe {
+            *(callee as *const Value as *const u8)
+                .add(VALUE_PAYLOAD as usize)
+                .cast::<u64>()
+        } as usize;
+        p.pins.push(callee.clone());
+        p.inl.push(inline::InlSite {
+            chunk: ichunk,
+            shape,
+            argc: args.len(),
+            expect,
+        });
+        Some(Site {
+            f: Intr::Inline(p.inl.len() - 1),
+            call,
+            lfc: false,
+            slot: Some(s as u16),
+        })
     };
 
     for pc in header..=backedge {
@@ -429,8 +1082,18 @@ fn plan(chunk: &Chunk, header: usize, backedge: usize, an: &Analysis, kinds: &[K
             continue;
         }
         match ops[pc] {
+            Op::LoadLocal(s) => {
+                if let Some(m) = slot_site(&mut p, pc, s) {
+                    p.math.insert(pc, m);
+                }
+            }
+            Op::LoadNameForCall(..) => {
+                if let Some(m) = site(&mut p, pc) {
+                    p.math.insert(pc, m);
+                }
+            }
             Op::LoadName(n, c) => {
-                if let Some(m) = math_site(pc) {
+                if let Some(m) = site(&mut p, pc) {
                     p.math.insert(pc, m);
                 } else if name_scope_mode(chunk, c) {
                     p.name_ref.insert(pc);
@@ -512,6 +1175,28 @@ struct ArrVars {
     kind: Variable,
     base: Variable,
     count: Variable,
+    /// The F64 `length` read next to the view; valid while `kind` is nonzero.
+    len: Variable,
+}
+
+/// The IR variables of an element site's typed-array view cache ([`Helper::TaView`]): the
+/// `Gc` handle word it was taken for, its [`helpers::ta_code`] (0 = none), element 0's address
+/// and the length. Reset by [`Tr::invalidate_js`].
+#[derive(Clone, Copy)]
+struct TaVars {
+    obj: Variable,
+    kind: Variable,
+    data: Variable,
+    len: Variable,
+}
+
+/// A `length` read site's typed-array length cache: the `Gc` handle word, the length, and
+/// whether it is set (I32). Reset by [`Tr::invalidate_js`].
+#[derive(Clone, Copy)]
+struct TaLenVars {
+    obj: Variable,
+    len: Variable,
+    ok: Variable,
 }
 
 /// An IR block starting a bytecode basic block.
@@ -522,6 +1207,8 @@ struct Leader {
     state: Option<Vec<Entry>>,
     /// Edges emitted so far.
     edges: u32,
+    /// The translator reached the block (edges added later would be missed by its seal).
+    visited: bool,
     /// Backward edges not yet emitted; the block is sealed when it drops to zero.
     back_left: u32,
     has_back: bool,
@@ -573,6 +1260,17 @@ struct Tr<'a, 'f> {
     vars: Vec<Option<Variable>>,
     /// For SSA slots the region puts into their TDZ: an I32 flag, 1 while the slot is `Empty`.
     tdz: Vec<Option<Variable>>,
+    /// For SSA slots that start out `undefined` (function mode, see [`fn_kinds`]): an I32 flag,
+    /// 1 until the first write. Reads exit while it is set; write-backs store `undefined`.
+    undef: Vec<Option<Variable>>,
+    /// The slots with an `undef` flag.
+    fresh: Vec<bool>,
+    /// Where the fresh slots are definitely assigned (their `undef` flag is known clear).
+    defd: Defd,
+    /// Where the SSA slots with a TDZ flag are known initialized (the flag is known clear).
+    tdzd: Defd,
+    /// Whole-function code (see [`build_fn`]) rather than a loop region.
+    func_mode: bool,
     helpers: Vec<Option<FuncRef>>,
     leaders: Vec<Option<Leader>>,
     stack: Vec<Entry>,
@@ -586,6 +1284,24 @@ struct Tr<'a, 'f> {
     idx_vars: HashMap<(Src, u16), Variable>,
     /// Passed `Math` guards (I32), per [`Plan::math`] site.
     math_vars: HashMap<usize, Variable>,
+    /// Typed-array views, per element-access pc.
+    ta_vars: HashMap<usize, TaVars>,
+    /// Slots holding a typed array when the region was compiled (see [`Tr::ta_first`]).
+    ta_slots: Vec<bool>,
+    /// Typed-array length caches, per `length` read pc.
+    ta_len_vars: HashMap<usize, TaLenVars>,
+    /// Region handlers live at the op being translated (see [`Analysis::hs`]).
+    hs_cur: Vec<(usize, usize)>,
+    /// Handler sets named by resume exits (`frame.exit_hset - 1`).
+    hsets: Vec<Vec<(usize, usize)>>,
+    /// A translation failure found while emitting something that cannot return an error.
+    err: Option<String>,
+    /// The import of this code itself (direct self-calls).
+    self_fn: Option<FuncRef>,
+    /// Frame-size constants of direct self-calls, patched once `max_stack` is known.
+    self_sizes: Vec<V>,
+    /// See [`Built::self_entry`].
+    self_entry: usize,
 }
 
 fn cmp_of(op: &Op) -> Option<CmpKind> {
@@ -704,6 +1420,8 @@ impl<'a, 'f> Tr<'a, 'f> {
             .chain(self.arr_vars.values().map(|a| (a.kind, Type::I32)))
             .chain(self.idx_vars.values().map(|&v| (v, Type::I32)))
             .chain(self.math_vars.values().map(|&v| (v, Type::I32)))
+            .chain(self.ta_vars.values().map(|t| (t.kind, Type::I32)))
+            .chain(self.ta_len_vars.values().map(|t| (t.ok, Type::I32)))
             .collect();
         self.reset_vars(&vars);
     }
@@ -772,9 +1490,12 @@ impl<'a, 'f> Tr<'a, 'f> {
         let d = self.stack.len();
         let pops = pops.min(d);
         let math_part = self.plan.math.contains_key(&pc)
-            || self.plan.math.values().any(|&(_, q)| q == pc)
-            || (pc > 0 && self.plan.math.contains_key(&(pc - 1)));
+            || self.plan.math.values().any(|s| s.call == pc)
+            || self.site_get_method(pc)
+            || self.plan.dname.contains_key(&pc);
+        // A direct call reads its operands in place (it runs JS: env Refs below still go).
         let ref_aware = math_part
+            || self.plan.direct.contains_key(&pc)
             || matches!(
                 op,
                 Op::Pop
@@ -976,6 +1697,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 Kind::Boxed => continue,
             };
             let mut t = self.i32c(tag as i64);
+            if let Some(flag) = self.undef[s] {
+                let f = self.fb.use_var(flag);
+                let u = self.i32c(TAG_UNDEFINED as i64);
+                t = self.fb.select(f, u, t);
+            }
             if let Some(flag) = self.tdz[s] {
                 let f = self.fb.use_var(flag);
                 let e = self.i32c(TAG_EMPTY as i64);
@@ -997,10 +1723,32 @@ impl<'a, 'f> Tr<'a, 'f> {
         depth: usize,
         store: Option<(usize, usize)>,
     ) {
+        if kind == EXIT_THROW {
+            if let Some(&(catch, hd)) = self.hs_cur.last() {
+                self.catch_throw(stack, depth, catch, hd);
+                return;
+            }
+        }
+        if kind == EXIT_RESUME && !self.hs_cur.is_empty() {
+            let set = self.hs_cur.clone();
+            let k = match self.hsets.iter().position(|h| *h == set) {
+                Some(k) => k,
+                None => {
+                    self.hsets.push(set);
+                    self.hsets.len() - 1
+                }
+            };
+            let id = self.fb.iconst(Type::I64, k as i64 + 1);
+            self.fb.store(MemKind::I64, self.frame, id, FRAME_EXIT_HSET);
+        }
         for (i, &e) in stack.iter().enumerate() {
             self.store_entry(i, e);
         }
-        self.write_back(store.map(|s| s.0));
+        // Function code that returns or throws out of the call leaves nothing that reads its
+        // slots again (closures capture through the environment).
+        if !(self.func_mode && kind != EXIT_RESUME) {
+            self.write_back(store.map(|s| s.0));
+        }
         if let Some((s, d)) = store {
             let p = self.sptr(d);
             let sc = self.i32c(s as i64);
@@ -1011,6 +1759,52 @@ impl<'a, 'f> Tr<'a, 'f> {
             .store(MemKind::I64, self.frame, dep, FRAME_EXIT_DEPTH);
         let w = self.fb.iconst(Type::I64, exit(pc, kind) as i64);
         self.fb.ret(&[w]);
+    }
+
+    /// A throw (the exception in `frame.exception`) under the region handler `(catch, hd)`:
+    /// `stack` / `depth` describe the operand stack as for an `EXIT_THROW` exit. Drop the
+    /// entries above the handler's depth, move the exception on top and continue at the catch
+    /// pad — in the region, or through a resume exit at it.
+    fn catch_throw(&mut self, stack: &[Entry], depth: usize, catch: usize, hd: usize) {
+        for k in hd..depth.max(stack.len()) {
+            if matches!(stack.get(k), Some(Entry::Boxed) | None) {
+                self.drop_at(k);
+            }
+        }
+        let dst = self.sptr(hd);
+        self.call(Helper::TakeException, &[self.frame, dst]);
+        let mut st: Vec<Entry> = (0..hd)
+            .map(|k| stack.get(k).copied().unwrap_or(Entry::Boxed))
+            .collect();
+        st.push(Entry::Boxed);
+        let saved_h = self.hs_cur.clone();
+        self.hs_cur.pop();
+        let mut done = false;
+        if self.in_region(catch) {
+            match self.leaders[catch - self.header].as_ref() {
+                Some(l) if !l.visited => {
+                    let saved = std::mem::replace(&mut self.stack, st.clone());
+                    match self.edge(false, catch) {
+                        Ok(b) => {
+                            self.fb.jump(b, &[]);
+                            done = true;
+                        }
+                        Err(e) => {
+                            self.err.get_or_insert(e);
+                        }
+                    }
+                    self.stack = saved;
+                }
+                _ => {
+                    self.err
+                        .get_or_insert(format!("throw reaches catch pad {catch} after its block"));
+                }
+            }
+        }
+        if !done {
+            self.emit_exit(catch, EXIT_RESUME, &st, hd + 1, None);
+        }
+        self.hs_cur = saved_h;
     }
 
     /// Exit when `cond` is nonzero; continue in a fresh block otherwise.
@@ -1038,17 +1832,28 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.emit_exit(pc, EXIT_RESUME, &st, st.len(), None);
     }
 
-    /// Exit before the op at `pc` when SSA slot `s` is in its TDZ (the interpreter throws).
+    /// Exit before the op at `pc` when SSA slot `s` is in its TDZ (the interpreter throws) or
+    /// still holds its initial `undefined` (the interpreter reads it).
     fn tdz_guard(&mut self, s: usize, pc: usize) {
-        if let Some(flag) = self.tdz[s] {
-            let f = self.fb.use_var(flag);
+        let undef = self.undef[s].filter(|_| self.defd.maybe_undef(s, pc));
+        let tdz = self.tdz[s].filter(|_| self.tdzd.maybe_undef(s, pc));
+        let f = match (tdz, undef) {
+            (Some(a), Some(b)) => {
+                let a = self.fb.use_var(a);
+                let b = self.fb.use_var(b);
+                Some(self.fb.binary(BinaryOp::Bor, a, b))
+            }
+            (Some(a), None) | (None, Some(a)) => Some(self.fb.use_var(a)),
+            (None, None) => None,
+        };
+        if let Some(f) = f {
             let st = self.stack.clone();
             self.exit_if(f, pc, EXIT_RESUME, &st, st.len());
         }
     }
 
     fn clear_tdz(&mut self, s: usize) {
-        if let Some(flag) = self.tdz[s] {
+        for flag in [self.tdz[s], self.undef[s]].into_iter().flatten() {
             let z = self.i32c(0);
             self.fb.def_var(flag, z);
         }
@@ -1161,6 +1966,24 @@ impl<'a, 'f> Tr<'a, 'f> {
                 Kind::Bool => (Type::I32, TAG_BOOL),
                 Kind::Boxed => continue,
             };
+            if self.fresh[s] {
+                // `undefined` at every entry: nothing to load or guard.
+                let var = self.fb.declare_var(ty);
+                let z = self.fb.f64const(0.0);
+                self.fb.def_var(var, z);
+                self.vars[s] = Some(var);
+                let flag = self.fb.declare_var(Type::I32);
+                let one = self.i32c(1);
+                self.fb.def_var(flag, one);
+                self.undef[s] = Some(flag);
+                if an.tdz[s] {
+                    let flag = self.fb.declare_var(Type::I32);
+                    let z = self.i32c(0);
+                    self.fb.def_var(flag, z);
+                    self.tdz[s] = Some(flag);
+                }
+                continue;
+            }
             let off = s as i32 * VALUE_SIZE;
             let t = self.fb.load(MemKind::I32U8, self.slots, off);
             let want = self.i32c(tag as i64);
@@ -1197,22 +2020,86 @@ impl<'a, 'f> Tr<'a, 'f> {
                 kind: self.fb.declare_var(Type::I32),
                 base: self.fb.declare_var(PTR),
                 count: self.fb.declare_var(PTR),
+                len: self.fb.declare_var(Type::F64),
             };
             self.fb.def_var(a.kind, z32);
             self.fb.def_var(a.base, zp);
             self.fb.def_var(a.count, zp);
+            let zf = self.fb.f64const(0.0);
+            self.fb.def_var(a.len, zf);
             self.arr_vars.insert(src, a);
+        }
+        // Typed-array caches only where the slots showed typed arrays at compile time (each is
+        // a few loop-carried variables); other sites take a fresh view per access.
+        let any_ta = self.ta_slots.iter().any(|&b| b);
+        let ta_slot = |s: u16| self.ta_slots.get(s as usize).copied().unwrap_or(false);
+        let mut elem_sites = Vec::new();
+        let mut len_sites = Vec::new();
+        for pc in self.header..=self.backedge {
+            let op = self.ops[pc];
+            let (elem, local) = match op {
+                Op::GetElem | Op::SetElem | Op::SetElemDrop => (true, None),
+                Op::GetElemLocal(s) | Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => (true, Some(s)),
+                Op::GetProp(..) | Op::GetPropThis(..) => (false, None),
+                Op::GetPropLocal(s, ..) => (false, Some(s)),
+                _ => continue,
+            };
+            // Element sites on a local keep a view cache even when the slot held no typed
+            // array at compile time: a region compiled for Arrays and later fed typed arrays
+            // (one function serving both) would otherwise take a fresh view per access.
+            if !local.map_or(any_ta, ta_slot) {
+                continue;
+            }
+            if elem {
+                elem_sites.push(pc);
+            } else if let Op::GetProp(n, _) | Op::GetPropThis(n, _) | Op::GetPropLocal(_, n, _) = op {
+                if self.chunk.names.get(n as usize).is_some_and(|x| &**x == "length") {
+                    len_sites.push(pc);
+                }
+            }
+        }
+        for pc in elem_sites {
+            {
+                let t = TaVars {
+                    obj: self.fb.declare_var(PTR),
+                    kind: self.fb.declare_var(Type::I32),
+                    data: self.fb.declare_var(PTR),
+                    len: self.fb.declare_var(PTR),
+                };
+                for (v, z) in [(t.obj, zp), (t.kind, z32), (t.data, zp), (t.len, zp)] {
+                    self.fb.def_var(v, z);
+                }
+                self.ta_vars.insert(pc, t);
+            }
+        }
+        for pc in len_sites {
+            let t = TaLenVars {
+                obj: self.fb.declare_var(PTR),
+                len: self.fb.declare_var(Type::F64),
+                ok: self.fb.declare_var(Type::I32),
+            };
+            let zf = self.fb.f64const(0.0);
+            self.fb.def_var(t.obj, zp);
+            self.fb.def_var(t.len, zf);
+            self.fb.def_var(t.ok, z32);
+            self.ta_len_vars.insert(pc, t);
         }
         for &key in &self.plan.idx_facts.clone() {
             let v = self.fb.declare_var(Type::I32);
             self.fb.def_var(v, z32);
             self.idx_vars.insert(key, v);
         }
-        let mut sites: Vec<usize> = self.plan.math.keys().copied().collect();
+        // (Local-callee sites check at every call instead: the local may change.)
+        let mut sites: Vec<usize> = self
+            .plan
+            .math
+            .iter()
+            .filter(|(_, s)| s.slot.is_none())
+            .map(|(&pc, _)| pc)
+            .collect();
         sites.sort_unstable();
         for pc in sites {
-            let pcv = self.i32c(pc as i64);
-            let ok = self.call_status(Helper::MathGuard, &[self.frame, pcv]);
+            let ok = self.site_guard(pc);
             let zero = self.i32c(0);
             let bad = self.fb.icmp(IntCC::Eq, ok, zero);
             let next = self.fb.create_block();
@@ -1249,6 +2136,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.flush_seals();
                 }
                 let l = self.leaders[i].as_mut().expect("leader");
+                l.visited = true;
                 if l.edges == 0 && !l.has_back {
                     // No edge reached it (its predecessors all exited): dead code.
                     dead = true;
@@ -1275,6 +2163,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 an.depth[i],
                 "abstract depth at {pc}"
             );
+            self.hs_cur.clone_from(&an.hs[i]);
             self.op(pc)?;
         }
         Ok(())
@@ -1429,6 +2318,37 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// `x - 2^32 * floor(x / 2^32)` (exact) brings it into [0, 2^32) first. NaN and ±Infinity
     /// come out of that reduction as NaN, which saturates to 0 — ToInt32's answer.
     fn to_int32(&mut self, x: V) -> V {
+        // |x| < 2^63: the truncation to I64 is exact and its low 32 bits are ToInt32 (native
+        // targets use the plain conversion, as in `to_index`; wasm32's traps, so it saturates).
+        // Otherwise (huge, infinite, NaN) reduce modulo 2^32 first, out of line.
+        let ax = self.fb.unary(UnaryOp::Fabs, x);
+        let lim = self.fb.f64const(9223372036854775808.0);
+        let small = self.fb.fcmp(FloatCC::Lt, ax, lim);
+        let fast = self.fb.create_block();
+        let big = self.fb.create_block();
+        let done = self.fb.create_block();
+        let r = self.fb.append_block_param(done, Type::I32);
+        self.fb.brif(small, fast, &[], big, &[]);
+        self.fb.seal_block(fast);
+        self.fb.seal_block(big);
+        self.fb.switch_to_block(fast);
+        #[cfg(target_arch = "wasm32")]
+        let op = ConvOp::ToSintSat;
+        #[cfg(not(target_arch = "wasm32"))]
+        let op = ConvOp::ToSint;
+        let t = self.fb.convert(op, Type::I64, x);
+        let w = self.fb.convert(ConvOp::Wrap, Type::I32, t);
+        self.fb.jump(done, &[w]);
+        self.fb.switch_to_block(big);
+        let w = self.to_int32_big(x);
+        self.fb.jump(done, &[w]);
+        self.fb.seal_block(done);
+        self.fb.switch_to_block(done);
+        r
+    }
+
+    /// ToInt32 of any F64 (the modular reduction).
+    fn to_int32_big(&mut self, x: V) -> V {
         let ax = self.fb.unary(UnaryOp::Fabs, x);
         let lim = self.fb.f64const(9223372036854775808.0);
         let small = self.fb.fcmp(FloatCC::Lt, ax, lim);
@@ -1440,6 +2360,18 @@ impl<'a, 'f> Tr<'a, 'f> {
         let y = self.fb.select(small, x, m);
         let t = self.fb.convert(ConvOp::ToSintSat, Type::I64, y);
         self.fb.convert(ConvOp::Wrap, Type::I32, t)
+    }
+
+    /// A PTR-typed integer from F64 `x`, only meaningful when `x` is an integer in range (the
+    /// callers check the round trip). Native targets use the plain truncation (x86-64 yields
+    /// the "integer indefinite" out of range, which never round-trips; AArch64 saturates);
+    /// wasm32 must saturate (its plain truncation traps).
+    fn to_index(&mut self, x: V) -> V {
+        #[cfg(target_arch = "wasm32")]
+        let op = ConvOp::ToSintSat;
+        #[cfg(not(target_arch = "wasm32"))]
+        let op = ConvOp::ToSint;
+        self.fb.convert(op, PTR, x)
     }
 
     /// `js_mod` through [`Helper::Binary`] (which computes Number ⊕ Number exactly like
@@ -1574,16 +2506,42 @@ impl<'a, 'f> Tr<'a, 'f> {
         if self.plan.math.contains_key(&pc) {
             return self.math_begin(pc);
         }
-        if pc > 0 && self.plan.math.contains_key(&(pc - 1)) {
+        if self.site_get_method(pc) {
             // `GetMethod`: the placeholder receiver stays, a placeholder callee joins it.
             self.set_stack_tag(d, TAG_UNDEFINED);
             self.stack.push(Entry::Boxed);
             return Ok(());
         }
-        if let Some(&(f, _)) = self.plan.math.values().find(|&&(_, q)| q == pc) {
-            return self.math_call(pc, f);
+        if let Some(site) = self.plan.math.values().find(|s| s.call == pc).copied() {
+            return match site.f {
+                Intr::Math(f) => self.math_call(pc, f),
+                Intr::Fast(k) => self.fast_call(pc, k),
+                Intr::Inline(k) => self.inline_call(pc, k),
+            };
         }
         match op {
+            // Region handlers are static (see `Analysis::hs`): nothing to emit.
+            Op::PushHandler(_) | Op::PopHandler => {}
+            Op::IterStepL(is, ns) => self.iter_step(pc, is as usize, ns as usize),
+            // Function code (the analysis rejects it in loop regions): the interpreter runs it.
+            Op::ForInStepL(..) => self.exit_now(pc),
+            Op::IterCloseL(s) => {
+                if self.kinds[s as usize] == Kind::Boxed {
+                    self.generic(pc);
+                } else {
+                    self.exit_now(pc);
+                }
+            }
+            // Always abrupt (close in throw mode, rethrow): the interpreter runs it.
+            Op::IterAbortL(_) => self.exit_now(pc),
+            Op::Throw if !self.hs_cur.is_empty() => {
+                // Caught by a region handler: hand the value over as the pending exception.
+                self.box_from(d - 1);
+                let src = self.sptr(d - 1);
+                self.call(Helper::SetException, &[self.frame, src]);
+                let below = self.stack[..d - 1].to_vec();
+                self.emit_exit(pc, EXIT_THROW, &below, d - 1, None);
+            }
             Op::Const(k) => self.push_const(k as usize),
             Op::LoadThis => {
                 let p = self.fb.load(PTR_MEM, self.frame, FRAME_THIS);
@@ -1593,6 +2551,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let p = self.src_ptr(Src::Cap(n), None);
                 self.ptr_or_exit(p, pc);
                 self.stack.push(Entry::Ref(p, Src::Cap(n)));
+            }
+            Op::LoadName(n, c) | Op::LoadNameForCall(n, c) if self.plan.dname.contains_key(&pc) => {
+                self.direct_name(pc, n, c, matches!(op, Op::LoadNameForCall(..)));
             }
             Op::LoadName(n, c) if self.plan.name_ref.contains(&pc) => {
                 let p = self.src_ptr(Src::Name(n), Some(c));
@@ -1649,6 +2610,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.stack.pop();
             }
             Op::UpdateCap(n, k) => self.update_cap(pc, n, k),
+            Op::Call(argc) | Op::CallWithThis(argc) if self.plan.direct.contains_key(&pc) => {
+                self.direct_call(pc, argc as usize, matches!(op, Op::CallWithThis(_)));
+            }
             Op::Call(argc) | Op::CallWithThis(argc) => {
                 let with_this = matches!(op, Op::CallWithThis(_));
                 let base = d - argc as usize - 1 - with_this as usize;
@@ -1873,12 +2837,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                 (Entry::Boxed, Entry::Num(key)) => {
                     let want = self.want_num(pc, d - 2);
                     let obj = self.sptr(d - 2);
-                    self.elem_read(pc, obj, key, Some(d - 2), d - 2, want, Slow::Generic, None);
+                    self.elem_read(pc, obj, key, Some(d - 2), d - 2, want, Slow::Generic, None, None);
                 }
                 (Entry::Ref(obj, src), Entry::Num(key)) => {
                     let want = self.want_num(pc, d - 2);
                     let fact = self.idx_fact_at(pc, src);
-                    self.elem_read(pc, obj, key, None, d - 2, want, Slow::Generic, fact);
+                    self.elem_read(pc, obj, key, None, d - 2, want, Slow::Generic, fact, Some(src));
                 }
                 _ => self.generic(pc),
             },
@@ -1892,7 +2856,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                         let want = self.want_num(pc, d - 1);
                         let obj = self.slot_ptr(s as usize);
                         let fact = self.idx_fact_at(pc, Src::Slot(s));
-                        self.elem_read(pc, obj, key, None, d - 1, want, Slow::Generic, fact);
+                        self.elem_read(pc, obj, key, None, d - 1, want, Slow::Generic, fact, Some(Src::Slot(s)));
                     }
                     _ => self.generic(pc),
                 }
@@ -1902,10 +2866,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                 match (self.stack[d - 3], self.stack[d - 2], self.stack[d - 1]) {
                     (Entry::Boxed, Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..))) => {
                         let obj = self.sptr(d - 3);
-                        self.elem_write(pc, obj, key, v, Some(d - 3), keep, d - 3, Slow::Generic);
+                        self.elem_write(pc, obj, key, v, Some(d - 3), keep, d - 3, Slow::Generic, None);
                     }
-                    (Entry::Ref(obj, _), Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..))) => {
-                        self.elem_write(pc, obj, key, v, None, keep, d - 3, Slow::Generic);
+                    (Entry::Ref(obj, src), Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..))) => {
+                        self.elem_write(pc, obj, key, v, None, keep, d - 3, Slow::Generic, Some(src));
                     }
                     _ => self.generic(pc),
                 }
@@ -1919,7 +2883,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 match (self.stack[d - 2], self.stack[d - 1]) {
                     (Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed)) => {
                         let obj = self.slot_ptr(s as usize);
-                        self.elem_write(pc, obj, key, v, None, keep, d - 2, Slow::Generic);
+                        self.elem_write(pc, obj, key, v, None, keep, d - 2, Slow::Generic, Some(Src::Slot(s)));
                     }
                     _ => self.generic(pc),
                 }
@@ -2096,6 +3060,10 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             Src::Slot(s) => self.slot_ptr(s as usize),
             Src::This => self.fb.load(PTR_MEM, self.frame, FRAME_THIS),
+            Src::Pin => {
+                self.err.get_or_insert_with(|| "pinned callee resolved as a binding".into());
+                self.ptrc(0)
+            }
         }
     }
 
@@ -2275,6 +3243,10 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(join);
         self.fb.switch_to_block(join);
         self.stack.truncate(base);
+        // A property store (even an inline one) may be an array's `length`: drop the views.
+        let views: Vec<(Variable, Type)> =
+            self.arr_vars.values().map(|a| (a.kind, Type::I32)).collect();
+        self.reset_vars(&views);
         Ok(())
     }
 
@@ -2284,6 +3256,9 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// since the last check (exit before the site when it fails: the interpreter makes the
     /// call), then push the placeholder receiver.
     fn math_begin(&mut self, pc: usize) -> Result<(), String> {
+        if let Some(site) = self.plan.math.get(&pc).copied().filter(|s| s.slot.is_some()) {
+            return self.slot_site_begin(pc, site);
+        }
         let var = *self
             .math_vars
             .get(&pc)
@@ -2296,8 +3271,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.brif(unknown, check, &[], cont, &[]);
         self.fb.seal_block(check);
         self.fb.switch_to_block(check);
-        let pcv = self.i32c(pc as i64);
-        let g = self.call_status(Helper::MathGuard, &[self.frame, pcv]);
+        let g = self.site_guard(pc);
         let zero = self.i32c(0);
         let bad = self.fb.icmp(IntCC::Eq, g, zero);
         let st = self.stack.clone();
@@ -2310,7 +3284,179 @@ impl<'a, 'f> Tr<'a, 'f> {
         let d = self.stack.len();
         self.set_stack_tag(d, TAG_UNDEFINED);
         self.stack.push(Entry::Boxed);
+        if self.plan.math.get(&pc).is_some_and(|s| s.lfc) {
+            // `LoadNameForCall`: receiver and callee placeholders at once.
+            self.set_stack_tag(d + 1, TAG_UNDEFINED);
+            self.stack.push(Entry::Boxed);
+        }
         Ok(())
+    }
+
+    /// `LoadLocal(s)` of an inlined local-callee site: check the local still holds the function
+    /// (by identity, else by body through [`Helper::SlotGuard`]) — exit before the site when it
+    /// does not (the interpreter makes the call) — then push the placeholder callee.
+    fn slot_site_begin(&mut self, pc: usize, site: Site) -> Result<(), String> {
+        let s = site.slot.expect("local-callee site") as usize;
+        let Intr::Inline(k) = site.f else {
+            return Err(format!("local-callee site at {pc} is not inlined"));
+        };
+        let (expect, chunk_ptr) = {
+            let inl = &self.plan.inl[k];
+            (inl.expect, std::rc::Rc::as_ptr(&inl.chunk) as usize)
+        };
+        let off = s as i32 * VALUE_SIZE;
+        let tag = self.fb.load(MemKind::I32U8, self.slots, off);
+        let obj = self.i32c(TAG_OBJ as i64);
+        let is_obj = self.fb.icmp(IntCC::Eq, tag, obj);
+        let payload = self.fb.load(MemKind::I64, self.slots, off + VALUE_PAYLOAD);
+        let want = self.fb.iconst(Type::I64, expect as i64);
+        let same = self.fb.icmp(IntCC::Eq, payload, want);
+        let hit = self.fb.binary(BinaryOp::Band, is_obj, same);
+        let slow = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(hit, cont, &[], slow, &[]);
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        let pcv = self.i32c(pc as i64);
+        let sv = self.i32c(s as i64);
+        let cp = self.ptrc(chunk_ptr as i64);
+        let ok = self.call_status(Helper::SlotGuard, &[self.frame, pcv, sv, cp]);
+        let zero = self.i32c(0);
+        let bad = self.fb.icmp(IntCC::Eq, ok, zero);
+        let st = self.stack.clone();
+        self.exit_if(bad, pc, EXIT_RESUME, &st, st.len());
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        let d = self.stack.len();
+        self.set_stack_tag(d, TAG_UNDEFINED);
+        self.stack.push(Entry::Boxed);
+        Ok(())
+    }
+
+    /// Whether the op at `pc` is the `GetMethod` of an inline `LoadName GetMethod` site.
+    fn site_get_method(&self, pc: usize) -> bool {
+        pc > 0
+            && self
+                .plan
+                .math
+                .get(&(pc - 1))
+                .is_some_and(|s| !s.lfc && s.slot.is_none())
+    }
+
+    /// The guard of the inline call site starting at `pc` (I32, nonzero = still valid).
+    fn site_guard(&mut self, pc: usize) -> V {
+        let pcv = self.i32c(pc as i64);
+        match self.plan.math.get(&pc).map(|s| s.f) {
+            Some(Intr::Fast(k)) => {
+                let e = self.ptrc(self.plan.fast[k].expect as i64);
+                self.call_status(Helper::FastGuard, &[self.frame, pcv, e])
+            }
+            Some(Intr::Inline(k)) => {
+                let e = self.ptrc(self.plan.inl[k].expect as i64);
+                self.call_status(Helper::FastGuard, &[self.frame, pcv, e])
+            }
+            _ => self.call_status(Helper::MathGuard, &[self.frame, pcv]),
+        }
+    }
+
+    /// The `CallWithThis` of a direct `#[op(fast)]` call site: the unboxed arguments (the
+    /// planner matched their kinds to the signature) go straight to the entry; receiver and
+    /// callee are placeholders. The op cannot throw or run JS.
+    fn fast_call(&mut self, pc: usize, k: usize) -> Result<(), String> {
+        use FastArg as FastKind;
+        let fs = self.plan.fast[k].clone();
+        let d = self.stack.len();
+        let argc = fs.args.len();
+        let mut params = Vec::with_capacity(argc);
+        let mut args = Vec::with_capacity(argc);
+        for (e, kind) in self.stack[d - argc..].to_vec().into_iter().zip(fs.args.iter().copied()) {
+            let v = match (e, kind) {
+                (Entry::Num(x), FastKind::F64) => {
+                    params.push(Type::F64);
+                    x
+                }
+                (Entry::Num(x), FastKind::I32 | FastKind::U32) => {
+                    params.push(Type::I32);
+                    self.to_int32(x)
+                }
+                (Entry::Bool(b), FastKind::Bool) => {
+                    params.push(Type::I32);
+                    b
+                }
+                (other, kind) => {
+                    return Err(format!("fast call argument {other:?} at {pc} is not {kind:?}"))
+                }
+            };
+            args.push(v);
+        }
+        let ret: Vec<Type> = match fs.ret {
+            FastKind::F64 => vec![Type::F64],
+            FastKind::Void => vec![],
+            _ => vec![Type::I32],
+        };
+        let f = self.fb.func.import_function(
+            Signature::new(params, ret),
+            EXT_BASE + fs.ext as u32,
+        );
+        let r = self.fb.call_fn(f, &args).first().copied();
+        self.stack.truncate(d - argc - 2);
+        let at = self.stack.len();
+        let e = match (fs.ret, r) {
+            (FastKind::F64, Some(x)) => Entry::Num(x),
+            (FastKind::I32, Some(x)) => Entry::Num(self.fb.convert(ConvOp::FromSint, Type::F64, x)),
+            (FastKind::U32, Some(x)) => {
+                let w = self.fb.convert(ConvOp::Uext, Type::I64, x);
+                Entry::Num(self.fb.convert(ConvOp::FromSint, Type::F64, w))
+            }
+            (FastKind::Bool, Some(x)) => {
+                // Exactly 0 or 1 by contract; normalize anyway (a stray byte must not leak into
+                // a `Bool` payload).
+                let z = self.i32c(0);
+                Entry::Bool(self.fb.icmp(IntCC::Ne, x, z))
+            }
+            _ => {
+                self.set_stack_tag(at, TAG_UNDEFINED);
+                Entry::Boxed
+            }
+        };
+        self.stack.push(e);
+        Ok(())
+    }
+
+    // ---- iteration ---------------------------------------------------------------------------
+
+    /// `IterStepL(is, ns)`: [`Helper::IterStep`] (a pristine array iterator steps without
+    /// running JS; anything else runs the full protocol), pushing the value and the has-value
+    /// flag as an unboxed Bool for the loop's `JumpIfFalse`.
+    fn iter_step(&mut self, pc: usize, is: usize, ns: usize) {
+        if self.kinds[is] != Kind::Boxed || self.kinds[ns] != Kind::Boxed {
+            self.exit_now(pc);
+            return;
+        }
+        let d = self.stack.len();
+        self.soff(d + 1);
+        let (iv, nv, dst) = (self.i32c(is as i64), self.i32c(ns as i64), self.sptr(d));
+        let r = self.call_status(Helper::IterStep, &[self.frame, iv, nv, dst]);
+        let t = self.i32c(helpers::ITER_THREW as i64);
+        let threw = self.fb.icmp(IntCC::Eq, r, t);
+        let snap = self.stack.clone();
+        self.exit_if(threw, pc, EXIT_THROW, &snap, d);
+        let two = self.i32c(2);
+        let slow = self.fb.binary(BinaryOp::Band, r, two);
+        let inv = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(slow, inv, &[], cont, &[]);
+        self.fb.seal_block(inv);
+        self.fb.switch_to_block(inv);
+        self.invalidate_js();
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        let one = self.i32c(1);
+        let has = self.fb.binary(BinaryOp::Band, r, one);
+        self.stack.push(Entry::Boxed);
+        self.stack.push(Entry::Bool(has));
     }
 
     /// The `CallWithThis` of an inline `Math.f(..)` site: the Number arguments (the planner
@@ -2413,7 +3559,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         };
         let kind = self.fb.use_var(a.kind);
         let count = self.fb.use_var(a.count);
-        let ii = self.fb.convert(ConvOp::ToSintSat, PTR, x);
+        let ii = self.to_index(x);
         let back = self.fb.convert(ConvOp::FromSint, Type::F64, ii);
         let exact = self.fb.fcmp(FloatCC::Eq, back, x);
         let inb = self.fb.icmp(IntCC::Ult, ii, count);
@@ -2821,7 +3967,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         want: bool,
         slow: Slow,
         fact: Option<(Src, u16)>,
+        src: Option<Src>,
     ) {
+        let ta_first = self.ta_first(src);
         let pre = self.stack.clone();
         let miss = self.fb.create_block();
         let join = self.fb.create_block();
@@ -2837,7 +3985,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.switch_to_block(fast);
             let kind = self.fb.use_var(a.kind);
             let base = self.fb.use_var(a.base);
-            let ii = self.fb.convert(ConvOp::ToSintSat, PTR, key);
+            let ii = self.to_index(key);
             let x = layout::view_elem_num(&mut self.fb, kind, base, ii, checked);
             self.seal_current();
             if let Some(i) = drop {
@@ -2852,19 +4000,31 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(checked);
             self.fb.switch_to_block(checked);
         }
+        // The typed-array path (`ic_plain` clear, which every ordinary path requires set) goes
+        // first when the receiver is one now, else after the ordinary path missed.
+        let slow_b = if ta_first { miss } else { self.fb.create_block() };
+        if ta_first {
+            let ord = self.fb.create_block();
+            if let Some(x) = self.ta_access(pc, obj, key, None, ord, slow_b) {
+                self.read_hit(drop, want, at, join, x);
+            }
+            self.fb.seal_block(ord);
+            self.fb.switch_to_block(ord);
+            self.stack = pre.clone();
+        }
         let x = layout::elem_get_num(&mut self.fb, obj, key, miss);
         self.seal_current();
-        if let Some(i) = drop {
-            self.drop_at(i);
+        self.read_hit(drop, want, at, join, x);
+        if !ta_first {
+            self.fb.seal_block(miss);
+            self.fb.switch_to_block(miss);
+            self.stack = pre.clone();
+            if let Some(x) = self.ta_access(pc, obj, key, None, slow_b, slow_b) {
+                self.read_hit(drop, want, at, join, x);
+            }
         }
-        if want {
-            self.fb.jump(join, &[x]);
-        } else {
-            self.store_entry(at, Entry::Num(x));
-            self.fb.jump(join, &[]);
-        }
-        self.fb.seal_block(miss);
-        self.fb.switch_to_block(miss);
+        self.fb.seal_block(slow_b);
+        self.fb.switch_to_block(slow_b);
         self.stack = pre.clone();
         if self.slow_path(pc, slow) {
             self.slow_to_join(pc, at, want, join);
@@ -2891,23 +4051,39 @@ impl<'a, 'f> Tr<'a, 'f> {
         keep: bool,
         base: usize,
         slow: Slow,
+        src: Option<Src>,
     ) {
+        let ta_first = self.ta_first(src);
         let d = self.stack.len();
         let pre = self.stack.clone();
-        let miss = self.fb.create_block();
+        let slow_b = self.fb.create_block();
         let join = self.fb.create_block();
-        let vf = self.num_or_slow(v, d - 1, miss);
+        let vf = self.num_or_slow(v, d - 1, slow_b);
+        let boxed = matches!(v, Entry::Boxed | Entry::Ref(..));
+        // Typed arrays first or after the ordinary path (see `elem_read`).
+        if ta_first {
+            let ord = self.fb.create_block();
+            if self.ta_access(pc, obj, key, Some(vf), ord, slow_b).is_some() {
+                self.write_hit(drop, keep && boxed, base, join, vf);
+            }
+            self.fb.seal_block(ord);
+            self.fb.switch_to_block(ord);
+            self.stack = pre.clone();
+        }
+        let miss = if ta_first { slow_b } else { self.fb.create_block() };
         layout::elem_set_num(&mut self.fb, obj, key, vf, miss);
         self.seal_current();
-        if let Some(i) = drop {
-            self.drop_at(i);
+        self.write_hit(drop, keep && boxed, base, join, vf);
+        if !ta_first {
+            self.fb.seal_block(miss);
+            self.fb.switch_to_block(miss);
+            self.stack = pre.clone();
+            if self.ta_access(pc, obj, key, Some(vf), slow_b, slow_b).is_some() {
+                self.write_hit(drop, keep && boxed, base, join, vf);
+            }
         }
-        if keep && matches!(v, Entry::Boxed | Entry::Ref(..)) {
-            self.store_entry(base, Entry::Num(vf));
-        }
-        self.fb.jump(join, &[]);
-        self.fb.seal_block(miss);
-        self.fb.switch_to_block(miss);
+        self.fb.seal_block(slow_b);
+        self.fb.switch_to_block(slow_b);
         self.stack = pre.clone();
         if self.slow_path(pc, slow) {
             self.fb.jump(join, &[]);
@@ -2922,6 +4098,187 @@ impl<'a, 'f> Tr<'a, 'f> {
                 e => e,
             });
         }
+    }
+
+    /// Whether an element site whose receiver is `src` tries the typed-array path first: the
+    /// receiver slot held a typed array when the region was compiled.
+    fn ta_first(&self, src: Option<Src>) -> bool {
+        matches!(src, Some(Src::Slot(s)) if self.ta_slots.get(s as usize).copied().unwrap_or(false))
+    }
+
+    /// An element read's fast path produced `x`: drop the consumed receiver, deliver `x`.
+    fn read_hit(&mut self, drop: Option<usize>, want: bool, at: usize, join: Block, x: V) {
+        if let Some(i) = drop {
+            self.drop_at(i);
+        }
+        if want {
+            self.fb.jump(join, &[x]);
+        } else {
+            self.store_entry(at, Entry::Num(x));
+            self.fb.jump(join, &[]);
+        }
+    }
+
+    /// An element write's fast path stored `vf`: drop the consumed receiver, and when `put`
+    /// leave the (Boxed) value's Number as the op's result.
+    fn write_hit(&mut self, drop: Option<usize>, put: bool, base: usize, join: Block, vf: V) {
+        if let Some(i) = drop {
+            self.drop_at(i);
+        }
+        if put {
+            self.store_entry(base, Entry::Num(vf));
+        }
+        self.fb.jump(join, &[]);
+    }
+
+    /// A typed-array element access at element site `pc`: `obj[key]` (returns the F64 element)
+    /// or, with `store`, `obj[key] = store` with the element kind's conversion (returns a
+    /// dummy). Jumps to `other` unless `obj` is an object with `ic_plain` clear (the ordinary
+    /// paths need it set), then misses to `slow` unless it is a typed array [`Helper::TaView`]
+    /// accepts and `key` an integer in bounds. The view is cached per site until JS runs; the
+    /// cached handle is only trusted together with `ic_plain` being clear (a freed typed
+    /// array's address can only be reused without JS by an ordinary object, which has it
+    /// set). Sites without a cache ([`Tr::ta_vars`]) take a fresh view every time. Always
+    /// `Some` (kept for the callers' shape).
+    fn ta_access(
+        &mut self,
+        pc: usize,
+        obj: V,
+        key: V,
+        store: Option<V>,
+        other: Block,
+        slow: Block,
+    ) -> Option<V> {
+        use helpers::ta_code as tc;
+        let cache = self.ta_vars.get(&pc).copied();
+        let gc = layout::side_table_object(&mut self.fb, obj, other);
+        self.seal_current();
+        // The cached view, or a fresh one.
+        let have = self.fb.create_block();
+        let hk = self.fb.append_block_param(have, Type::I32);
+        let hd = self.fb.append_block_param(have, PTR);
+        let hl = self.fb.append_block_param(have, PTR);
+        if let Some(t) = cache {
+            let refresh = self.fb.create_block();
+            let (ck, co, cd, cl) = (
+                self.fb.use_var(t.kind),
+                self.fb.use_var(t.obj),
+                self.fb.use_var(t.data),
+                self.fb.use_var(t.len),
+            );
+            let z = self.i32c(0);
+            let kset = self.fb.icmp(IntCC::Ne, ck, z);
+            let same = self.fb.icmp(IntCC::Eq, gc, co);
+            let hit = self.fb.binary(BinaryOp::Band, kset, same);
+            self.fb.brif(hit, have, &[ck, cd, cl], refresh, &[]);
+            self.fb.seal_block(refresh);
+            self.fb.switch_to_block(refresh);
+        }
+        let w = self.i32c(store.is_some() as i64);
+        let k = self
+            .call(Helper::TaView, &[self.frame, obj, w])
+            .expect("TaView returns a kind");
+        let data = self.fb.load(PTR_MEM, self.frame, FRAME_TA_DATA);
+        let len = self.fb.load(PTR_MEM, self.frame, FRAME_TA_LEN);
+        if let Some(t) = cache {
+            self.fb.def_var(t.kind, k);
+            self.fb.def_var(t.obj, gc);
+            self.fb.def_var(t.data, data);
+            self.fb.def_var(t.len, len);
+        }
+        let z = self.i32c(0);
+        let none = self.fb.icmp(IntCC::Eq, k, z);
+        self.fb.brif(none, slow, &[], have, &[k, data, len]);
+        self.fb.seal_block(have);
+        self.fb.switch_to_block(have);
+        // An integer index in bounds (negative ones wrap above any length).
+        let i = self.to_index(key);
+        let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
+        let exact = self.fb.fcmp(FloatCC::Eq, back, key);
+        let inb = self.fb.icmp(IntCC::Ult, i, hl);
+        let ok = self.fb.binary(BinaryOp::Band, exact, inb);
+        let go = self.fb.create_block();
+        self.fb.brif(ok, go, &[], slow, &[]);
+        self.fb.seal_block(go);
+        self.fb.switch_to_block(go);
+        let done = self.fb.create_block();
+        let res = store.is_none().then(|| self.fb.append_block_param(done, Type::F64));
+        let blocks: Vec<Block> = (1..tc::END).map(|_| self.fb.create_block()).collect();
+        let mut targets = vec![(slow, Vec::new())];
+        targets.extend(blocks.iter().map(|&b| (b, Vec::new())));
+        self.fb.br_table(hk, &targets, (slow, &[]));
+        for (n, &b) in blocks.iter().enumerate() {
+            let code = n as u32 + 1;
+            self.fb.seal_block(b);
+            self.fb.switch_to_block(b);
+            let (mk, es) = match code {
+                tc::I8 => (MemKind::I32S8, 1),
+                tc::U8 | tc::U8C => (MemKind::I32U8, 1),
+                tc::I16 => (MemKind::I32S16, 2),
+                tc::U16 => (MemKind::I32U16, 2),
+                tc::I32 => (MemKind::I32, 4),
+                tc::U32 => (MemKind::I64U32, 4),
+                tc::F32 => (MemKind::F32, 4),
+                _ => (MemKind::F64, 8),
+            };
+            let at = if es == 1 {
+                self.fb.binary(BinaryOp::Iadd, hd, i)
+            } else {
+                let c = self.fb.iconst(PTR, es);
+                let off = self.fb.binary(BinaryOp::Imul, i, c);
+                self.fb.binary(BinaryOp::Iadd, hd, off)
+            };
+            match store {
+                None => {
+                    let x = self.fb.load(mk, at, 0);
+                    let f = match code {
+                        tc::F64 => x,
+                        tc::F32 => self.fb.convert(ConvOp::Promote, Type::F64, x),
+                        _ => self.fb.convert(ConvOp::FromSint, Type::F64, x),
+                    };
+                    self.fb.jump(done, &[f]);
+                }
+                Some(n) => {
+                    match code {
+                        tc::F64 => self.fb.store(MemKind::F64, at, n, 0),
+                        tc::F32 => {
+                            let x = self.fb.convert(ConvOp::Demote, Type::F32, n);
+                            self.fb.store(MemKind::F32, at, x, 0);
+                        }
+                        tc::U8C => {
+                            // ToUint8Clamp: NaN and <= 0 give 0, >= 255 gives 255, else round
+                            // half to even.
+                            let zf = self.fb.f64const(0.0);
+                            let top = self.fb.f64const(255.0);
+                            let pos = self.fb.fcmp(FloatCC::Gt, n, zf);
+                            let c = self.fb.select(pos, n, zf);
+                            let lt = self.fb.fcmp(FloatCC::Lt, c, top);
+                            let c = self.fb.select(lt, c, top);
+                            let r = self.fb.unary(UnaryOp::Nearest, c);
+                            let x = self.fb.convert(ConvOp::ToSintSat, Type::I32, r);
+                            self.fb.store(MemKind::I32U8, at, x, 0);
+                        }
+                        _ => {
+                            // ToInt32, then keep the low bits (ToInt8 / ToUint16 / ... wrap).
+                            let x = self.to_int32(n);
+                            let mk = match es {
+                                1 => MemKind::I32U8,
+                                2 => MemKind::I32U16,
+                                _ => MemKind::I32,
+                            };
+                            self.fb.store(mk, at, x, 0);
+                        }
+                    }
+                    self.fb.jump(done, &[]);
+                }
+            }
+        }
+        self.fb.seal_block(done);
+        self.fb.switch_to_block(done);
+        Some(match res {
+            Some(r) => r,
+            None => self.fb.f64const(0.0),
+        })
     }
 
     /// `obj.<names[n]>` through the site's IC (or `length`) with the result at `at`.
@@ -2953,14 +4310,30 @@ impl<'a, 'f> Tr<'a, 'f> {
         let param = want.then(|| self.fb.append_block_param(join, Type::F64));
         match &ic {
             None => {
+                let tracked = src.and_then(|k| self.arr_vars.get(&k).copied());
+                if let (Some(a), None) = (tracked, drop) {
+                    // The view (and the length next to it) is still valid when nothing that
+                    // could have changed the array's length or storage ran since it was taken:
+                    // no JS, no write of its binding, no property store (element stores keep
+                    // it: the inline path never appends). Loop-invariant in a JS-free loop.
+                    let kind = self.fb.use_var(a.kind);
+                    let len = self.fb.use_var(a.len);
+                    let zero = self.i32c(0);
+                    let valid = self.fb.icmp(IntCC::Ne, kind, zero);
+                    let fresh = self.fb.create_block();
+                    self.fb.brif(valid, join, &[len], fresh, &[]);
+                    self.fb.seal_block(fresh);
+                    self.fb.switch_to_block(fresh);
+                }
                 let x = layout::length(&mut self.fb, obj, miss);
                 self.seal_current();
                 // A tracked array: refresh its element-storage view next to its length.
-                if let Some(a) = src.and_then(|k| self.arr_vars.get(&k).copied()) {
+                if let Some(a) = tracked {
                     let (kind, base, count) = layout::array_view(&mut self.fb, obj);
                     self.fb.def_var(a.kind, kind);
                     self.fb.def_var(a.base, base);
                     self.fb.def_var(a.count, count);
+                    self.fb.def_var(a.len, x);
                 }
                 if let Some(i) = drop {
                     self.drop_at(i);
@@ -3005,6 +4378,49 @@ impl<'a, 'f> Tr<'a, 'f> {
             // No view on the slow path.
             if let Some(a) = src.and_then(|k| self.arr_vars.get(&k).copied()) {
                 self.reset_vars(&[(a.kind, Type::I32)]);
+            }
+            // A typed array's `length` ([`Helper::TaLength`]), cached per site until JS runs
+            // (only JS can resize or detach its buffer or give it an own `length`); the cached
+            // handle is trusted only with `ic_plain` clear, as in `ta_access`.
+            {
+                let cache = self.ta_len_vars.get(&pc).copied();
+                let slow_b = self.fb.create_block();
+                let gc = layout::side_table_object(&mut self.fb, obj, slow_b);
+                self.seal_current();
+                let hit = self.fb.create_block();
+                let hl = self.fb.append_block_param(hit, Type::F64);
+                if let Some(t) = cache {
+                    let refresh = self.fb.create_block();
+                    let (ok, co, cl) = (
+                        self.fb.use_var(t.ok),
+                        self.fb.use_var(t.obj),
+                        self.fb.use_var(t.len),
+                    );
+                    let same = self.fb.icmp(IntCC::Eq, gc, co);
+                    let good = self.fb.binary(BinaryOp::Band, ok, same);
+                    self.fb.brif(good, hit, &[cl], refresh, &[]);
+                    self.fb.seal_block(refresh);
+                    self.fb.switch_to_block(refresh);
+                }
+                let n = self
+                    .call(Helper::TaLength, &[self.frame, obj])
+                    .expect("TaLength returns a length");
+                let zf = self.fb.f64const(0.0);
+                let got = self.fb.fcmp(FloatCC::Ge, n, zf);
+                if let Some(t) = cache {
+                    self.fb.def_var(t.ok, got);
+                    self.fb.def_var(t.obj, gc);
+                    self.fb.def_var(t.len, n);
+                }
+                self.fb.brif(got, hit, &[n], slow_b, &[]);
+                self.fb.seal_block(hit);
+                self.fb.switch_to_block(hit);
+                if let Some(i) = drop {
+                    self.drop_at(i);
+                }
+                self.fb.jump(join, &[hl]);
+                self.fb.seal_block(slow_b);
+                self.fb.switch_to_block(slow_b);
             }
         }
         self.stack = pre.clone();

@@ -176,7 +176,7 @@ impl Shape {
 
     /// The parent chain from `self` down to (excluding) the root; each shape's `key`.
     #[inline]
-    fn chain(&self) -> impl Iterator<Item = (&Shape, &Rc<str>)> {
+    pub(super) fn chain(&self) -> impl Iterator<Item = (&Shape, &Rc<str>)> {
         let mut cur = Some(self);
         std::iter::from_fn(move || {
             let s = cur?;
@@ -219,7 +219,7 @@ impl Shape {
     }
 
     /// Whether the ordered list has been materialised (census).
-    fn flat_built(&self) -> bool {
+    pub(super) fn flat_built(&self) -> bool {
         matches!(&self.keys, Keys::Chain { flat, .. } if flat.get().is_some())
     }
 

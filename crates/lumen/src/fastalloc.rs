@@ -32,12 +32,24 @@ const NUM_CLASSES: usize = MAX_CLASS / STEP;
 /// This bounds the complete thread-local cache to 16 MiB while preserving a deeper free list for
 /// the small, hot allocation classes.
 const BYTES_PER_CLASS: usize = 256 * 1024;
+/// The classes up to [`SMALL_CLASS_BYTES`] (property-entry blocks of one to eight properties,
+/// small strings, scope maps) get a deeper list: a cycle collection frees one block per garbage
+/// object in a burst of 100k+, and a shallow cap sent all but the first few thousand back to the
+/// system heap only for the next interval to allocate them from it again. Adds at most 8 x 4 MiB
+/// per thread; `trim` still drains everything after a large collection (rate-limited).
+const SMALL_CLASS_BYTES: usize = 128;
+const BYTES_PER_SMALL_CLASS: usize = 4 * 1024 * 1024;
 
 const fn class_caps() -> [usize; NUM_CLASSES] {
     let mut caps = [0; NUM_CLASSES];
     let mut class = 0;
     while class < NUM_CLASSES {
-        caps[class] = BYTES_PER_CLASS / ((class + 1) * STEP);
+        let size = (class + 1) * STEP;
+        caps[class] = if size <= SMALL_CLASS_BYTES {
+            BYTES_PER_SMALL_CLASS / size
+        } else {
+            BYTES_PER_CLASS / size
+        };
         class += 1;
     }
     caps
@@ -48,19 +60,47 @@ const CLASS_CAPS: [usize; NUM_CLASSES] = class_caps();
 struct Cache {
     heads: [Cell<*mut u8>; NUM_CLASSES],
     counts: [Cell<usize>; NUM_CLASSES],
+    /// [`GUARD_NONE`] until the first cached free registers the teardown guard, then
+    /// [`GUARD_LIVE`]; [`GUARD_DEAD`] once the guard drained the lists at thread exit (later
+    /// frees go straight to the system).
+    guard: Cell<u8>,
 }
 
-impl Drop for Cache {
+const GUARD_NONE: u8 = 0;
+const GUARD_LIVE: u8 = 1;
+const GUARD_DEAD: u8 = 2;
+
+/// Drains [`CACHE`] when the thread's locals are destroyed. Kept separate so the cache itself
+/// is a const-initialized, destructor-free local: every allocation reads it with a plain TLS
+/// load instead of a lazy-init / destructor-state check.
+struct Guard;
+
+impl Drop for Guard {
     fn drop(&mut self) {
-        drain(self);
+        let _ = CACHE.try_with(|c| {
+            c.guard.set(GUARD_DEAD);
+            drain(c);
+        });
     }
 }
 
 thread_local! {
-    static CACHE: Cache = Cache {
-        heads: [const { Cell::new(std::ptr::null_mut()) }; NUM_CLASSES],
-        counts: [const { Cell::new(0) }; NUM_CLASSES],
+    static CACHE: Cache = const {
+        Cache {
+            heads: [const { Cell::new(std::ptr::null_mut()) }; NUM_CLASSES],
+            counts: [const { Cell::new(0) }; NUM_CLASSES],
+            guard: Cell::new(GUARD_NONE),
+        }
     };
+    static GUARD: Guard = const { Guard };
+}
+
+#[cold]
+#[inline(never)]
+fn register_guard(c: &Cache) {
+    // Mark first: registering the destructor may itself allocate and free.
+    c.guard.set(GUARD_LIVE);
+    let _ = GUARD.try_with(|_| {});
 }
 
 #[inline]
@@ -132,6 +172,12 @@ unsafe impl GlobalAlloc for ClassAlloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if let Some(class) = class_of(layout.size(), layout.align()) {
             let cached = CACHE.with(|c| {
+                if c.guard.get() != GUARD_LIVE {
+                    if c.guard.get() == GUARD_DEAD {
+                        return false;
+                    }
+                    register_guard(c);
+                }
                 if c.counts[class].get() < CLASS_CAPS[class] {
                     unsafe { *(ptr as *mut *mut u8) = c.heads[class].get() };
                     c.heads[class].set(ptr);

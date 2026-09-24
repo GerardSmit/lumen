@@ -1634,6 +1634,15 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
             ));
         }
         let offset = offset_n as usize;
+        // Same element type: SetTypedArrayFromTypedArray transfers the raw bytes (step 24), so
+        // copy them in one go. The read snapshots the source, which also makes an overlapping
+        // same-buffer copy read pre-write values.
+        if src_info.kind == info.kind {
+            if let Some(bytes) = i.ta_read_bytes(&src_info, 0, src_len) {
+                i.ta_write_bytes(&info, offset, &bytes);
+            }
+            return Ok(Value::Undefined);
+        }
         // Snapshot the source first so an overlapping same-buffer copy reads pre-write values.
         let vals: Vec<Value> = (0..src_len).map(|k| i.ta_read(&src_info, k)).collect();
         for (k, v) in vals.iter().enumerate() {
