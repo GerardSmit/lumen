@@ -1,0 +1,17 @@
+# Binding macros for lumen embedders: `#[op]` (a Rust fn as a JS function), `#[class]` +
+# `#[methods]` (a Rust struct as a JS class). Use them through `lumen` (feature `macros`), which
+# re-exports them as `lumen::op` / `lumen::class` / `lumen::methods`; the generated code only
+# names public `::lumen::embed` paths. No dependencies: the fn/impl signatures are parsed by hand
+# from the raw token stream.
+[package]
+name = "lumen-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true

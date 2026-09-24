@@ -28,6 +28,9 @@ mod builtins;
 pub mod bytebuf;
 pub mod bytecode;
 mod coroutine;
+/// Typed Rust <-> JS conversions and the runtime of the binding macros (see [`embed`]).
+#[cfg(feature = "embed")]
+mod embed_convert;
 mod eval;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
 /// per JS object/scope) run 15-30% faster than on the system allocator. NOT registered here: a
@@ -469,6 +472,32 @@ pub mod embed {
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
     /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
     pub use crate::value::{NativeClosure, NativeFn, Value};
+
+    // Typed bindings: conversion traits, op/class descriptors, promises (see `embed_convert`).
+    pub use crate::embed_convert::{
+        ArgCx, ArrayElem, BigI64, BigU64, Class, ClassDesc, CtorReturn, Deferred, FastKind,
+        FastPtr, FastSig, FromJs, IntoJs, JsArrayBuffer, JsFunction, JsObject, MemberDesc,
+        MemberKind, OpDesc, OpError, OpResult, Promise, Slot, State, This,
+    };
+    #[doc(hidden)]
+    pub use crate::embed_convert::private as __private;
+    /// The binding macros (feature `macros`), also at the crate root.
+    #[cfg(feature = "macros")]
+    pub use lumen_macros::{class, methods, op};
+}
+
+/// `#[op]` / `#[class]` / `#[methods]` (feature `macros`): see `lumen_macros`.
+#[cfg(feature = "macros")]
+pub use lumen_macros::{class, methods, op};
+
+/// `lumen::ops![a, b, path::c]` — the `&'static OpDesc` list of `#[op]` fns, for
+/// [`Engine::define_ops`].
+#[cfg(feature = "embed")]
+#[macro_export]
+macro_rules! ops {
+    ($($($p:ident)::+),* $(,)?) => {
+        &[$(&$($p)::+::DESC),*]
+    };
 }
 
 /// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`
