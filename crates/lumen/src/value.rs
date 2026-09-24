@@ -243,7 +243,7 @@ pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, V
 /// The engine value. `repr(u8)` with fixed discriminants gives it a *defined* layout — tag byte
 /// at offset 0, payload at offset 8. Tags 0..=4 are the trivially-copyable variants (no
 /// refcount).
-#[derive(Clone, Default)]
+#[derive(Default)]
 #[repr(u8)]
 pub enum Value {
     #[default]
@@ -261,6 +261,26 @@ pub enum Value {
     Str(crate::lstr::LStr) = 6,
     Sym(Rc<SymbolData>) = 7,
     Obj(Gc) = 8,
+}
+
+/// Bump the payload's refcount, then copy the whole 16-byte value in one move. The derived
+/// clone writes the tag byte and the payload separately, and the next full-width load of the
+/// copy (a push onto the VM stack, then a pop) stalls on store forwarding.
+impl Clone for Value {
+    #[inline(always)]
+    fn clone(&self) -> Value {
+        match self {
+            Value::BigInt(b) => std::mem::forget(b.clone()),
+            Value::Str(s) => std::mem::forget(s.clone()),
+            Value::Sym(s) => std::mem::forget(s.clone()),
+            Value::Obj(o) => std::mem::forget(o.clone()),
+            Value::Undefined | Value::Empty | Value::Null | Value::Bool(_) | Value::Num(_) => {}
+        }
+        // SAFETY: every payload's `clone` is a refcount increment returning the same pointer
+        // (`JsBigInt`/`Sym` are `Rc`, `LStr` and `Gc` bump their header), so a bitwise copy is
+        // exactly the clone, and the increment above is the one it owns.
+        unsafe { std::ptr::read(self) }
+    }
 }
 
 // NaN-boxed storage used for long-lived property values. Execution still uses the ergonomic
