@@ -11,6 +11,9 @@ license.workspace = true
 
 [dependencies]
 lumen-codegen = { path = "../lumen-codegen" }
+# The binding macros (`#[lumen::op]`, `#[lumen::class]`, `#[lumen::methods]`); a no-deps
+# proc-macro crate, only pulled in by the `macros` feature.
+lumen-macros = { path = "../lumen-macros", optional = true }
 
 [features]
 default = ["intl"]
@@ -23,6 +26,9 @@ intl = []
 # hooks) used by the lumen-host/lumen-runtime crates. Off by default: everything under it is a
 # public-API commitment on a published crate, gated until it stabilizes with those crates.
 embed = []
+# `#[lumen::op]`, `#[lumen::class]`, `#[lumen::methods]` over the `embed` surface (see
+# `lumen::embed::FromJs` / `IntoJs`). Implies `embed`.
+macros = ["embed", "dep:lumen-macros"]
 # Exposes internal compilation stages (`lumen::bench_api`) for the `internals` benchmark. Not a
 # stability commitment — for measurement only.
 bench = []

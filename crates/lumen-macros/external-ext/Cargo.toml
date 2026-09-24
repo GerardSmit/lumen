@@ -1,0 +1,22 @@
+# A third-party lumen extension, built OUTSIDE the lumen workspace (its own `[workspace]`), that
+# depends on `lumen` exactly as an external crate would: one dependency, feature `macros`. It
+# proves the binding macros only name public `::lumen::embed` paths.
+#
+#   cargo run --release                      # conversions / classes / promises demo (asserts)
+#   cargo run --release --bin ops_bench      # macro wrapper vs hand-written NativeFn
+[package]
+name = "lumen-ext-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lumen = { path = "../../lumen", features = ["macros"] }
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
