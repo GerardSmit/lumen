@@ -1076,10 +1076,13 @@ pub struct FieldInit {
     pub transforms: Vec<Value>,
 }
 
-/// Recursion ceiling for the interpreter. Paired with the large worker-thread stacks the runner
-/// uses; beyond this we raise "Maximum call stack size exceeded" (a RangeError).
+/// Recursion ceiling for the interpreter. Paired with the large thread stacks the CLI (256 MiB),
+/// runners, workers and coroutines (64 MiB) run on; beyond this we raise "Maximum call stack size
+/// exceeded" (a RangeError). Measured in a release build, one unit of depth costs at most about
+/// 7 KiB of native stack (an async function recursing on a coroutine thread; JIT'd recursion
+/// about 3 KiB), so 7,000 stays well inside 64 MiB. node allows about 10,400 simple frames.
 #[cfg(not(target_arch = "wasm32"))]
-pub const MAX_EVAL_DEPTH: u32 = 1500;
+pub const MAX_EVAL_DEPTH: u32 = 7_000;
 /// On wasm32 the ceiling is the engine's *host* call stack (V8's, not raisable from content):
 /// measured in Chrome, the simplest interpreted frame overflows it near depth ~220, and heavier
 /// frames die sooner — 128 keeps the guard firing as a clean RangeError before the host stack
@@ -1087,9 +1090,14 @@ pub const MAX_EVAL_DEPTH: u32 = 1500;
 #[cfg(target_arch = "wasm32")]
 pub const MAX_EVAL_DEPTH: u32 = 128;
 
-/// Live-object ceiling (≈ a few hundred MB). When a safe point sees this many *live* objects, the
-/// cycle collector runs; if it can't get back under, a RangeError is thrown rather than exhausting
-/// RAM. This bounds genuine retention; transient cyclic garbage is reclaimed and doesn't count.
+/// Live-object ceiling (about 3.4 GB at ~170 bytes per small object, near node's default heap
+/// limit). When a safe point sees this many *live* objects, the cycle collector runs; if it can't
+/// get back under, a RangeError is thrown rather than exhausting RAM. This bounds genuine
+/// retention; transient cyclic garbage is reclaimed and doesn't count.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_LIVE: i64 = 20_000_000;
+/// wasm32: a 4 GiB address space at most.
+#[cfg(target_arch = "wasm32")]
 pub const MAX_LIVE: i64 = 3_000_000;
 
 /// Live-object count at which the collector first runs; the threshold then floats (see `gc_check`).
@@ -4600,6 +4608,10 @@ impl Interp {
                 self.terminating = true;
                 return Err(self.termination());
             }
+            // Headroom for the handler: without it the next safe point (the `catch` block's
+            // first allocation) is still over the ceiling and throws again, so no handler could
+            // ever run. The retention a handler drops is reclaimed by the next collection.
+            self.gc_next = live + GC_TRIGGER;
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
         // Re-arm: collect again after another GC_TRIGGER objects, or once live has grown by

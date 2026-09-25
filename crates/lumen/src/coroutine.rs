@@ -319,7 +319,7 @@ fn get_worker() -> std::io::Result<Sender<Job>> {
     let (job_tx, job_rx) = channel::<Job>();
     let self_tx = job_tx.clone();
     std::thread::Builder::new()
-        // Generous stack: the tree-walker recurses up to MAX_EVAL_DEPTH (1500) frames.
+        // Generous stack: execution recurses up to MAX_EVAL_DEPTH units (see its sizing).
         .stack_size(64 * 1024 * 1024)
         .spawn(move || worker_loop(job_rx, self_tx))?;
     Ok(job_tx)

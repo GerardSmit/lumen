@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn non_tail_positions_keep_their_frames() {
         std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
+            .stack_size(256 * 1024 * 1024)
             .spawn(non_tail_positions_body)
             .expect("spawn test thread")
             .join()
