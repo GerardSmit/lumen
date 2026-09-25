@@ -2,7 +2,7 @@
 //! streaming buys nothing) and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
 
-use crate::token::{RegexTok, Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
+use crate::token::{RegexTok, Tok, Token, TplPart};
 
 #[derive(Debug, Clone)]
 pub struct LexError {
@@ -440,6 +440,22 @@ impl Lexer<'_> {
         // The first code point must be IdentifierStart; the rest IdentifierPart. This holds for an
         // escaped code point too — so `#x` (escaped `#`) and a leading combining mark are errors.
         let mut first = true;
+        // The ASCII run in one go (an ASCII IdentifierStart: digits went to `read_number`).
+        if self.peek().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') {
+            let from = self.pos;
+            let mut end = from;
+            while let Some(&c) = self.chars.get(end) {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            s.reserve(end - from);
+            s.extend(&self.chars[from..end]);
+            self.pos = end;
+            first = false;
+        }
         loop {
             match self.peek() {
                 Some('\\') if self.peek2() == Some('u') => {
@@ -473,7 +489,7 @@ impl Lexer<'_> {
         // A reserved word is always a keyword — even spelled with a `\u` escape. An escaped reserved
         // word can't be an Identifier (the parser rejects a keyword there), but it still works as a
         // property name (keywords are accepted in those positions).
-        if let Some(kw) = KEYWORDS.iter().find(|k| **k == s) {
+        if let Some(kw) = keyword(&s) {
             self.push(Tok::Keyword(kw));
             if had_escape {
                 self.mark_escaped();
@@ -1189,12 +1205,10 @@ impl Lexer<'_> {
     }
 
     fn read_punct(&mut self) -> Result<(), LexError> {
-        let rest: String = self.chars[self.pos..(self.pos + 4).min(self.chars.len())]
-            .iter()
-            .collect();
         // `?.` followed by a digit is `?` then `.` (a conditional like `x ? .5 : .3`), not optional
         // chaining.
-        if rest.starts_with("?.")
+        if self.peek() == Some('?')
+            && self.peek2() == Some('.')
             && self
                 .chars
                 .get(self.pos + 2)
@@ -1204,19 +1218,81 @@ impl Lexer<'_> {
             self.push(Tok::Punct("?"));
             return Ok(());
         }
-        for p in PUNCTUATORS {
-            if rest.starts_with(p) {
-                for _ in 0..p.chars().count() {
-                    self.bump();
-                }
-                self.push(Tok::Punct(p));
-                return Ok(());
+        // The longest punctuator at `pos` (the same maximal munch as scanning `PUNCTUATORS`,
+        // which lists longer spellings first).
+        let at = |k: usize| self.chars.get(self.pos + k).copied().unwrap_or('\0');
+        let (c0, c1, c2, c3) = (at(0), at(1), at(2), at(3));
+        let p: &'static str = match (c0, c1, c2, c3) {
+            ('>', '>', '>', '=') => ">>>=",
+            ('.', '.', '.', _) => "...",
+            ('=', '=', '=', _) => "===",
+            ('!', '=', '=', _) => "!==",
+            ('*', '*', '=', _) => "**=",
+            ('<', '<', '=', _) => "<<=",
+            ('>', '>', '=', _) => ">>=",
+            ('>', '>', '>', _) => ">>>",
+            ('&', '&', '=', _) => "&&=",
+            ('|', '|', '=', _) => "||=",
+            ('?', '?', '=', _) => "??=",
+            ('=', '>', _, _) => "=>",
+            ('=', '=', _, _) => "==",
+            ('!', '=', _, _) => "!=",
+            ('<', '=', _, _) => "<=",
+            ('>', '=', _, _) => ">=",
+            ('&', '&', _, _) => "&&",
+            ('|', '|', _, _) => "||",
+            ('?', '?', _, _) => "??",
+            ('?', '.', _, _) => "?.",
+            ('+', '+', _, _) => "++",
+            ('-', '-', _, _) => "--",
+            ('+', '=', _, _) => "+=",
+            ('-', '=', _, _) => "-=",
+            ('*', '=', _, _) => "*=",
+            ('/', '=', _, _) => "/=",
+            ('%', '=', _, _) => "%=",
+            ('&', '=', _, _) => "&=",
+            ('|', '=', _, _) => "|=",
+            ('^', '=', _, _) => "^=",
+            ('*', '*', _, _) => "**",
+            ('<', '<', _, _) => "<<",
+            ('>', '>', _, _) => ">>",
+            ('{', ..) => "{",
+            ('}', ..) => "}",
+            ('(', ..) => "(",
+            (')', ..) => ")",
+            ('[', ..) => "[",
+            (']', ..) => "]",
+            ('.', ..) => ".",
+            (';', ..) => ";",
+            (',', ..) => ",",
+            ('<', ..) => "<",
+            ('>', ..) => ">",
+            ('+', ..) => "+",
+            ('-', ..) => "-",
+            ('*', ..) => "*",
+            ('/', ..) => "/",
+            ('%', ..) => "%",
+            ('&', ..) => "&",
+            ('|', ..) => "|",
+            ('^', ..) => "^",
+            ('!', ..) => "!",
+            ('~', ..) => "~",
+            ('?', ..) => "?",
+            (':', ..) => ":",
+            ('=', ..) => "=",
+            ('@', ..) => "@",
+            _ => {
+                return Err(self.err(format!(
+                    "unexpected character {:?}",
+                    self.peek().unwrap_or('\0')
+                )))
             }
+        };
+        for _ in 0..p.len() {
+            self.bump();
         }
-        Err(self.err(format!(
-            "unexpected character {:?}",
-            self.peek().unwrap_or('\0')
-        )))
+        self.push(Tok::Punct(p));
+        Ok(())
     }
 }
 
@@ -1251,6 +1327,49 @@ fn prop_has(name: &str, c: char) -> bool {
         })
         .unwrap_or(false)
 }
+/// The reserved word spelled `s` (one of `token::KEYWORDS`).
+fn keyword(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "break" => "break",
+        "case" => "case",
+        "catch" => "catch",
+        "class" => "class",
+        "const" => "const",
+        "continue" => "continue",
+        "debugger" => "debugger",
+        "default" => "default",
+        "delete" => "delete",
+        "do" => "do",
+        "else" => "else",
+        "enum" => "enum",
+        "export" => "export",
+        "extends" => "extends",
+        "false" => "false",
+        "finally" => "finally",
+        "for" => "for",
+        "function" => "function",
+        "if" => "if",
+        "import" => "import",
+        "in" => "in",
+        "instanceof" => "instanceof",
+        "new" => "new",
+        "null" => "null",
+        "return" => "return",
+        "super" => "super",
+        "switch" => "switch",
+        "this" => "this",
+        "throw" => "throw",
+        "true" => "true",
+        "try" => "try",
+        "typeof" => "typeof",
+        "var" => "var",
+        "void" => "void",
+        "while" => "while",
+        "with" => "with",
+        _ => return None,
+    })
+}
+
 fn is_ident_start(c: char) -> bool {
     // IdentifierStart = ID_Start ∪ {$, _} (plus `\u` escapes, handled by the caller).
     if c.is_ascii() {
@@ -1264,4 +1383,38 @@ fn is_ident_part(c: char) -> bool {
         return c == '_' || c == '$' || c.is_ascii_alphanumeric();
     }
     c == '\u{200C}' || c == '\u{200D}' || prop_has("ID_Continue", c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::{KEYWORDS, PUNCTUATORS};
+
+    #[test]
+    fn keyword_match_covers_the_table() {
+        for k in KEYWORDS {
+            assert_eq!(keyword(k), Some(*k));
+        }
+        assert_eq!(keyword("let"), None);
+        assert_eq!(keyword("functions"), None);
+    }
+
+    #[test]
+    fn punctuators_lex_by_maximal_munch() {
+        for p in PUNCTUATORS {
+            // A trailing space ends the token; `/` alone would start a regex in this position.
+            let src = format!("x {p} ");
+            let toks = tokenize(&src).unwrap();
+            assert!(matches!(toks[1].kind, Tok::Punct(q) if q == *p), "{p}");
+        }
+        let toks = tokenize("a>>>=b?.5:.3").unwrap();
+        let puncts: Vec<&str> = toks
+            .iter()
+            .filter_map(|t| match t.kind {
+                Tok::Punct(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(puncts, [">>>=", "?", ":"]);
+    }
 }
