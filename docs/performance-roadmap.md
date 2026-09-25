@@ -139,9 +139,28 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      - `fn_call`'s remaining cost is the global `LoadName` of `f` (item 5).
      - then_chain is dominated by collector passes over the growing live chain, about 200 ns per traced object (item 13).
      - JIT resume after `await` (`LUMEN_JIT_RESUME`) is still off.
-4. **Skip building `arguments` and rest arrays (M).**
+4. ✅ **Done: skip building `arguments` and rest arrays (M).**
    - What: read `a.length` and `a[k]` straight from the frame when the object doesn't escape.
-   - Closes: arguments 1387× (1.09 µs per call) and rest params 88×.
+   - Built:
+     - A virtual `arguments` / rest object (`Chunk::virt_base`) is used when the body only reads `.length` and `[k]` and writes no parameter.
+       - The compiler widens `n_params` by a window of 8 hidden parameter slots.
+       - The object's slot holds only the element count.
+       - `ArgsLen` / `ArgsGet` read the count and the slots.
+     - Fallbacks:
+       - Any other use, or a parameter write, recompiles with a real object.
+       - A call with more arguments than the window materializes the object at entry.
+       - A non-index or out-of-range key materializes it on demand.
+     - Sloppy functions with simple parameters that use `arguments` used to run on the tree-walker. They now compile whenever the virtual form applies: with no parameter written, mapping is unobservable.
+     - JIT:
+       - Inline count and element reads, with the generic op as the slow path. The slots are kept in memory.
+       - Direct calls seed the count, including rest-parameter callees.
+   - Release results:
+
+     | Case | Before | Now | Node |
+     |---|---|---|---|
+     | `arguments.length + arguments[0]` | 1146 ns | 27.7 ns | 1.0 ns |
+     | `(...a) => a.length` | 63 ns | 23.8 ns | 0.87 ns |
+   - Left: what remains is the direct call itself. Node inlines these; our inliner still rejects callees with `arguments` or a rest parameter.
 5. **Global inline cache (S).**
    - What: a property cell with a shape guard for unqualified `LoadName` and `StoreName`.
    - Closes: global write 718×, global read 82×, and top-level `fib` in plain `lumen` (111 vs 55 ms).

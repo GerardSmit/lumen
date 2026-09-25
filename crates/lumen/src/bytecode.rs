@@ -511,6 +511,13 @@ pub enum Op {
     /// cannot reassign the base local (see `Compiler::fused_elem_slot`) and the slot can never
     /// TDZ-throw.
     GetElemLocal(u16),
+    /// `.length` of the virtual `arguments` object / rest array in slot `.0` (see
+    /// [`Chunk::virt_base`]): the element count the slot holds, or the materialized object's.
+    /// `.1` is the first element's slot, plus [`VIRT_REST`] for a rest array.
+    ArgsLen(u16, u16),
+    /// Pops a key and pushes that element of the virtual object in slot `.0` (operands as
+    /// [`Op::ArgsLen`]): an in-range index reads its slot, any other key materializes the object.
+    ArgsGet(u16, u16),
     /// `x[k] = v` with `x` a never-TDZ local slot (see [`Op::GetElemLocal`]), keeping `v`.
     SetElemLocal(u16),
     /// `x[k] = v` in statement position with `x` a never-TDZ local slot.
@@ -814,6 +821,13 @@ pub struct Chunk {
     classes: Vec<Rc<Class>>,
     /// The rest parameter's slot: seeded with an array of the arguments past `n_params`.
     rest_slot: Option<u16>,
+    /// A virtual `arguments` object (with `arguments_slot`) or rest array (with `rest_slot`):
+    /// the body only reads its `length` and elements ([`Op::ArgsLen`], [`Op::ArgsGet`]) and
+    /// writes no parameter, so the arguments stay in the parameter slots — `n_params` is widened
+    /// by a window of hidden ones — and the object's slot holds just the element count, whose
+    /// elements start at this slot. A call with more arguments than `n_params` materializes the
+    /// object into the slot instead.
+    pub(crate) virt_base: Option<u16>,
     /// Captured bindings to seed into a fresh activation env at entry; empty = no activation
     /// needed (closures, if any, capture the definition env directly).
     cap_inits: Vec<CapInit>,
@@ -881,7 +895,23 @@ impl Chunk {
 
     /// Seed the rest parameter's slot (if any) from the arguments past the positional ones.
     #[inline]
-    fn seed_rest(&self, i: &Interp, slots: &mut [Value], args: &[Value]) {
+    fn seed_rest(&self, i: &mut Interp, slots: &mut [Value], args: &[Value]) {
+        if let Some(base) = self.virt_base {
+            let s = self.arguments_slot.or(self.rest_slot).expect("virtual object slot");
+            let p = self.n_params;
+            slots[s as usize] = if args.len() <= p {
+                Value::Num(args.len().saturating_sub(base as usize) as f64)
+            } else {
+                // The leading arguments may have been moved into the slots (still unmodified).
+                let vals: Vec<Value> = slots[base as usize..p]
+                    .iter()
+                    .chain(&args[p..])
+                    .cloned()
+                    .collect();
+                virt_materialize(i, self.rest_slot.is_some(), &vals)
+            };
+            return;
+        }
         if let Some(s) = self.rest_slot {
             // One allocation (a single box for short lists) straight from the argument slice.
             let rest = args.get(self.n_params..).unwrap_or(&[]);
@@ -1846,6 +1876,16 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
 }
 
 fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
+    let mut escaped = false;
+    let out = compile_fresh_with(func, true, &mut escaped);
+    if escaped {
+        // The virtual `arguments` / rest object is used some other way: a real one.
+        return compile_fresh_with(func, false, &mut escaped);
+    }
+    out
+}
+
+fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Option<Rc<Chunk>> {
     if func.ensure_body().is_err() {
         return None;
     }
@@ -1866,14 +1906,11 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
         .params
         .iter()
         .all(|p| !p.rest && p.default.is_none() && matches!(p.pattern, Pattern::Ident(_)));
-    if uses_arguments
-        && (func.is_arrow
-            || func.is_async
-            || (!func.params.is_empty() && simple_params && !func.is_strict))
-    {
-        log_bail("fn", "arguments with arrow/async/parameters");
+    if uses_arguments && (func.is_arrow || func.is_async) {
+        log_bail("fn", "arguments with arrow/async");
         return None;
     }
+    let mapped = !func.params.is_empty() && simple_params && !func.is_strict;
     // A parameter named `arguments` shadows the object (none is created).
     if uses_arguments {
         let mut pnames = std::collections::HashSet::new();
@@ -1912,6 +1949,23 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
         return None;
     };
 
+    // A mapped `arguments` aliases the parameters, which slots cannot; a virtual one (see
+    // `Chunk::virt_base`) is only read while no parameter is ever written, where aliasing is
+    // unobservable.
+    let virt_args = virt_ok
+        && uses_arguments
+        && !func.is_generator
+        && !captured.contains("arguments")
+        && func.params.iter().all(|p| !p.rest)
+        && (!mapped
+            || func.params.iter().all(|p| match &p.pattern {
+                Pattern::Ident(n) => !captured.contains(n),
+                _ => false,
+            }));
+    if uses_arguments && mapped && !virt_args {
+        log_bail("fn", "mapped arguments");
+        return None;
+    }
     // A body calling `super(…)` is a derived class constructor: `this` becomes a TDZ binding in
     // the activation (read lexically everywhere), see [`derived`].
     let derived = !func.is_arrow
@@ -1986,10 +2040,31 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
                 log_bail("params", "rest parameter shadowed by a function");
                 return None;
             }
+            let used = captured.contains(name) || !parameters::rest_unused(func, name);
+            let virt = virt_ok
+                && used
+                && !captured.contains(name)
+                && !uses_arguments
+                && !func.is_generator
+                && c.slot_names.len() == k;
+            if virt {
+                for _ in 0..VIRT_WINDOW {
+                    c.fresh_slot("%arg");
+                }
+            }
             let slot = c.fresh_slot(name);
             // A rest array nothing can read is never built (see `parameters::rest_unused`).
-            if captured.contains(name) || !parameters::rest_unused(func, name) {
+            if used {
                 c.rest_slot = Some(slot);
+            }
+            if virt {
+                c.virt = Some(VirtC {
+                    slot,
+                    base: k as u16,
+                    rest: true,
+                    end: (k + VIRT_WINDOW) as u16,
+                    escaped: false,
+                });
             }
             if captured.contains(name) {
                 c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
@@ -2048,6 +2123,17 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
         }
     }
     c.n_params = n_positional;
+    if let Some(v) = &c.virt {
+        c.n_params = v.end as usize;
+    }
+    // A virtual `arguments`' hidden parameter window (see `Chunk::virt_base`).
+    let virt_args = virt_args && c.slot_names.len() == n_positional;
+    if virt_args {
+        while c.slot_names.len() < n_positional.max(VIRT_WINDOW) {
+            c.fresh_slot("%arg");
+        }
+        c.n_params = c.slot_names.len();
+    }
     if let Some((slot, n)) = rest_cap {
         c.emit(Op::LoadLocal(slot));
         c.emit(Op::StoreCap(n));
@@ -2078,6 +2164,15 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
     if uses_arguments {
         let slot = c.fresh_slot("arguments");
         c.arguments_slot = Some(slot);
+        if virt_args {
+            c.virt = Some(VirtC {
+                slot,
+                base: 0,
+                rest: false,
+                end: c.n_params as u16,
+                escaped: false,
+            });
+        }
         if captured.contains("arguments") {
             // An inner arrow names it: home the object in the activation.
             if hoist_fn_names.contains("arguments") {
@@ -2247,6 +2342,13 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
             return None;
         }
     }
+    // A for-head `var` reset of a parameter rewrites an `arguments` element too.
+    if c.virt.as_ref().is_some_and(|v| {
+        v.escaped || (!v.rest && c.var_force_resets.iter().any(|&s| s < v.end))
+    }) {
+        *escaped = true;
+        return None;
+    }
     if c.derived {
         c.emit(Op::Undef);
         c.emit(Op::DerivedReturn);
@@ -2278,6 +2380,7 @@ fn compile_fresh(func: &Function) -> Option<Rc<Chunk>> {
         funcs: c.funcs,
         classes: c.classes,
         rest_slot: c.rest_slot,
+        virt_base: c.virt.as_ref().map(|v| v.base),
         cap_inits: c.cap_inits,
         activation_layout,
         env_this: c.env_this,
@@ -2360,6 +2463,8 @@ struct Compiler {
     funcs: Vec<Rc<Function>>,
     classes: Vec<Rc<Class>>,
     rest_slot: Option<u16>,
+    /// The virtual `arguments` / rest object being compiled (see [`Chunk::virt_base`]).
+    virt: Option<VirtC>,
     /// Enclosing `try`/`finally` regions being compiled, innermost last (see `try_finally`).
     finallys: Vec<finally::FinallyCtx>,
     cap_inits: Vec<CapInit>,
@@ -2545,6 +2650,9 @@ impl Compiler {
     fn emit(&mut self, op: Op) -> usize {
         if let Op::Tdz(s) = op {
             self.tdz_pending.insert(s);
+        }
+        if let Some(v) = &mut self.virt {
+            v.escaped |= v.escapes(&op);
         }
         if positions::is_site(&op) {
             self.sites.push(self.site.wrapping_sub(1));
@@ -4413,6 +4521,13 @@ impl Compiler {
                     }
                     Expr::Ident(name) => {
                         if let Some(Home::Slot(slot, _)) = self.home(name) {
+                            if let Some(v) = self.virt.as_ref().filter(|v| v.slot == slot) {
+                                if prop == "length" {
+                                    let tag = v.tag();
+                                    self.emit(Op::ArgsLen(slot, tag));
+                                    return Ok(());
+                                }
+                            }
                             let i = self.name_idx(prop);
                             let c = self.new_cache();
                             self.emit(Op::GetPropLocal(slot, i, c));
@@ -4432,6 +4547,15 @@ impl Compiler {
                 index,
                 optional: false,
             } if !matches!(**obj, Expr::Super) => {
+                if let Expr::Ident(name) = &**obj {
+                    if let Some(Home::Slot(slot, _)) = self.home(name) {
+                        if let Some(tag) = self.virt.as_ref().filter(|v| v.slot == slot).map(VirtC::tag) {
+                            self.expr(index)?;
+                            self.emit(Op::ArgsGet(slot, tag));
+                            return Ok(());
+                        }
+                    }
+                }
                 if let Some(slot) = self.fused_elem_slot(obj, &[index.as_ref()]) {
                     self.expr(index)?;
                     self.emit(Op::GetElemLocal(slot));
@@ -5066,7 +5190,7 @@ pub fn run(
     let seed = chunk.n_params.min(args.len());
     slots.extend_from_slice(&args[..seed]);
     slots.resize(chunk.n_slots, Value::Undefined);
-    if let Some(s) = chunk.arguments_slot {
+    if let (Some(s), None) = (chunk.arguments_slot, chunk.virt_base) {
         slots[s as usize] = Value::Obj(i.make_compiled_arguments_object(args, &env));
     }
     if chunk.reflect_args && reflect::enabled() {
@@ -5585,8 +5709,10 @@ unsafe fn enter_frame(
         None => c.env,
     };
     let args_obj = match chunk.arguments_slot {
-        Some(_) => Some(i.make_compiled_arguments_object(arg_slice, &env)),
-        None => None,
+        Some(_) if chunk.virt_base.is_none() => {
+            Some(i.make_compiled_arguments_object(arg_slice, &env))
+        }
+        _ => None,
     };
     let slots = &mut f.slots;
     let seed = chunk.n_params.min(argc);
@@ -6487,6 +6613,15 @@ fn run_vm_frames<const ONE: bool>(
                 }
                 let k = i.to_property_key(&key)?;
                 i.set_member(&obj, &k, v)?;
+            }
+            Op::ArgsLen(s, tag) => {
+                let v = virt_len(i, slots, s, tag)?;
+                stack.push(v);
+            }
+            Op::ArgsGet(s, tag) => {
+                let key = pop!();
+                let v = virt_get(i, slots, s, tag, key)?;
+                stack.push(v);
             }
             Op::GetElemLocal(s) => {
                 let key = pop!();
@@ -7493,7 +7628,7 @@ impl VmCoro {
     ) -> Result<VmCoro, Abrupt> {
         let mut coro = VmCoro::new(i, chunk, env, this_val, args);
         coro.strict = Some(strict);
-        if let Some(s) = coro.chunk.arguments_slot {
+        if let (Some(s), None) = (coro.chunk.arguments_slot, coro.chunk.virt_base) {
             coro.slots[s as usize] = Value::Obj(i.make_compiled_arguments_object(args, &coro.env));
         }
         let saved = (i.strict, i.tco_ok);
@@ -8182,6 +8317,8 @@ impl Chunk {
             Op::IterCloseL(_) => (0, 0),
             Op::IterAbortL(_) => (1, 0),
             Op::GetElemLocal(_) => (1, 1),
+            Op::ArgsLen(..) => (0, 1),
+            Op::ArgsGet(..) => (1, 1),
             Op::SetElemLocal(_) => (2, 1),
             Op::SetElemLocalDrop(_) => (2, 0),
             Op::ToPropKey => (2, 2),
@@ -8568,4 +8705,103 @@ fn intern_name(name: &str) -> Rc<str> {
         names.insert(n.clone());
         n
     })
+}
+
+/// The hidden parameter window of a virtual `arguments` / rest object (see
+/// [`Chunk::virt_base`]): calls with up to this many arguments (past the positional ones, for
+/// a rest array) never build it.
+const VIRT_WINDOW: usize = 8;
+
+/// The rest-array bit of [`Op::ArgsLen`] / [`Op::ArgsGet`]'s element-base operand.
+pub(crate) const VIRT_REST: u16 = 0x8000;
+
+/// The compiler's view of a virtual `arguments` / rest object (see [`Chunk::virt_base`]).
+#[derive(Clone)]
+struct VirtC {
+    /// The object's slot (holding the element count).
+    slot: u16,
+    /// The first element's slot.
+    base: u16,
+    rest: bool,
+    /// The end of the parameter window a write to which would break the object's reads:
+    /// every parameter of an `arguments` object (whose elements they are), none of a rest
+    /// array's (whose elements are all hidden).
+    end: u16,
+    /// Used some other way than `.length` / `[k]` reads, or a parameter is written.
+    escaped: bool,
+}
+
+impl VirtC {
+    fn tag(&self) -> u16 {
+        self.base | if self.rest { VIRT_REST } else { 0 }
+    }
+
+    fn escapes(&self, op: &Op) -> bool {
+        let s = self.slot;
+        if jit::build::op_slots(op).contains(&s) || matches!(*op, Op::SwitchLK(t, _) if t == s) {
+            return true;
+        }
+        if self.rest {
+            return false;
+        }
+        let w = |t: u16| t < self.end;
+        match *op {
+            Op::StoreLocal(t) | Op::UpdateLocal(t, _) => w(t),
+            Op::ArithLL(_, d, ..) | Op::ArithLK(_, d, ..) => w(d),
+            Op::IterStepL(a, b) | Op::IterRestL(a, b) => w(a) || w(b),
+            Op::ForInStepL(a, b, c) => w(a) || w(b) || w(c),
+            _ => false,
+        }
+    }
+}
+
+/// A virtual object's real form over its `vals`: the rest array, or the (unmapped: no
+/// parameter is ever written) `arguments` object of the current function frame.
+fn virt_materialize(i: &mut Interp, rest: bool, vals: &[Value]) -> Value {
+    if rest {
+        i.make_array_iter(vals.iter().cloned())
+    } else {
+        jit::sync_frames(i);
+        Value::Obj(i.make_compiled_arguments_unaliased(vals))
+    }
+}
+
+/// The virtual object of slot `s` (see [`Op::ArgsLen`]) as a real object.
+fn virt_object(i: &mut Interp, slots: &[Value], s: u16, tag: u16) -> Value {
+    match &slots[s as usize] {
+        Value::Num(n) => {
+            let base = (tag & !VIRT_REST) as usize;
+            let vals = &slots[base..base + *n as usize];
+            virt_materialize(i, tag & VIRT_REST != 0, vals)
+        }
+        v => v.clone(),
+    }
+}
+
+/// [`Op::ArgsLen`].
+pub(crate) fn virt_len(i: &mut Interp, slots: &[Value], s: u16, tag: u16) -> Result<Value, Abrupt> {
+    if let Value::Num(n) = slots[s as usize] {
+        return Ok(Value::Num(n));
+    }
+    let o = virt_object(i, slots, s, tag);
+    i.get_member(&o, "length")
+}
+
+/// [`Op::ArgsGet`].
+pub(crate) fn virt_get(
+    i: &mut Interp,
+    slots: &[Value],
+    s: u16,
+    tag: u16,
+    key: Value,
+) -> Result<Value, Abrupt> {
+    if let (Value::Num(n), Value::Num(k)) = (&slots[s as usize], &key) {
+        if *k >= 0.0 && *k < *n && k.fract() == 0.0 {
+            let base = (tag & !VIRT_REST) as usize;
+            return Ok(slots[base + *k as usize].clone());
+        }
+    }
+    let o = virt_object(i, slots, s, tag);
+    let k = i.to_property_key(&key)?;
+    i.get_member(&o, &k)
 }

@@ -438,12 +438,14 @@ op_codec! {
     162 => ArrayCbGuard(a: u8);
     163 => ArrayCbHas;
     164 => ArrayCbDone(a: u32);
+    165 => ArgsLen(a: u16, b: u16);
+    166 => ArgsGet(a: u16, b: u16);
 }
 
 /// The chunk fields this codec writes, in order (hand-maintained next to `enc_chunk`, whose
 /// exhaustive destructuring of `Chunk` forces a look here when a field is added).
 const CHUNK_SIG: &str = "ops consts(undef null false true num str bigint) names slot_names \
-    n_params flags(uses_this env_this arguments_slot rest_slot derived reflect_args) var_force_resets funcs \
+    n_params flags(uses_this env_this arguments_slot rest_slot derived reflect_args virt_base) var_force_resets funcs \
     cap_inits(param var fn lexical) caches obj_maps name_caches positions";
 
 const fn fnv(mut h: u64, s: &[u8]) -> u64 {
@@ -550,6 +552,7 @@ fn enc_chunk(
         funcs,
         classes,
         rest_slot,
+        virt_base,
         cap_inits,
         activation_layout: _, // recomputed from cap_inits/env_this/names
         env_this,
@@ -623,12 +626,16 @@ fn enc_chunk(
             | (arguments_slot.is_some() as u8) << 2
             | (rest_slot.is_some() as u8) << 3
             | (*derived as u8) << 4
-            | (*reflect_args as u8) << 5,
+            | (*reflect_args as u8) << 5
+            | (virt_base.is_some() as u8) << 6,
     );
     if let Some(s) = arguments_slot {
         uv(out, *s as u64);
     }
     if let Some(s) = rest_slot {
+        uv(out, *s as u64);
+    }
+    if let Some(s) = virt_base {
         uv(out, *s as u64);
     }
     uv(out, var_force_resets.len() as u64);
@@ -736,6 +743,11 @@ fn dec_chunk(
     } else {
         None
     };
+    let virt_base = if flags & 64 != 0 {
+        Some(u16::get(r)?)
+    } else {
+        None
+    };
     let n = r.len()?;
     let mut var_force_resets = Vec::with_capacity(n);
     for _ in 0..n {
@@ -806,6 +818,7 @@ fn dec_chunk(
         funcs,
         classes: Vec::new(),
         rest_slot,
+        virt_base,
         cap_inits,
         activation_layout,
         env_this,

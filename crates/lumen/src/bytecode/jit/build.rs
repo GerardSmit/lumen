@@ -324,6 +324,16 @@ fn build_region(
             *k = Kind::Boxed;
         }
     }
+    if let Some(base) = chunk.virt_base {
+        // A virtual `arguments` / rest object's count and elements are read by index from
+        // memory (never written: see `Chunk::virt_base`).
+        let s = chunk.arguments_slot.or(chunk.rest_slot).map_or(0, |s| s as usize);
+        for k in (base as usize..chunk.n_params).chain([s]) {
+            if let Some(k) = kinds.get_mut(k) {
+                *k = Kind::Boxed;
+            }
+        }
+    }
     let defd = Defd::new(chunk, header, backedge, &an, &fresh, None);
     let tdz_ssa: Vec<bool> = (0..n_slots)
         .map(|s| an.tdz[s] && kinds[s] != Kind::Boxed)
@@ -3357,6 +3367,67 @@ impl<'a, 'f> Tr<'a, 'f> {
                 }
                 _ => self.generic(pc),
             },
+            Op::ArgsLen(s, _) if self.kinds[s as usize] == Kind::Boxed => {
+                // The count (a Number) in the slot; a materialized object's `length` in the
+                // interpreter.
+                let p = self.slot_ptr(s as usize);
+                let tag = self.fb.load(MemKind::I32U8, p, 0);
+                let tn = self.i32c(TAG_NUM as i64);
+                let other = self.fb.icmp(IntCC::Ne, tag, tn);
+                let st = self.stack.clone();
+                self.exit_if(other, pc, EXIT_RESUME, &st, d);
+                let n = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
+                self.stack.push(Entry::Num(n));
+            }
+            Op::ArgsGet(s, tag) if self.kinds[s as usize] == Kind::Boxed => {
+                let Entry::Num(k) = self.stack[d - 1] else {
+                    self.generic(pc);
+                    return Ok(());
+                };
+                // An integer key below the count reads its parameter slot.
+                let base = (tag & !crate::bytecode::VIRT_REST) as i64;
+                let p = self.slot_ptr(s as usize);
+                let slow = self.fb.create_block();
+                let join = self.fb.create_block();
+                let chk = self.fb.create_block();
+                let t = self.fb.load(MemKind::I32U8, p, 0);
+                let tn = self.i32c(TAG_NUM as i64);
+                let is_num = self.fb.icmp(IntCC::Eq, t, tn);
+                self.fb.brif(is_num, chk, &[], slow, &[]);
+                self.fb.seal_block(chk);
+                self.fb.switch_to_block(chk);
+                let n = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
+                let z = self.fb.f64const(0.0);
+                let ge = self.fb.fcmp(FloatCC::Ge, k, z);
+                let lt = self.fb.fcmp(FloatCC::Lt, k, n);
+                let inr = self.fb.binary(BinaryOp::Band, ge, lt);
+                let fast = self.fb.create_block();
+                let idx_b = self.fb.create_block();
+                self.fb.brif(inr, idx_b, &[], slow, &[]);
+                self.fb.seal_block(idx_b);
+                self.fb.switch_to_block(idx_b);
+                let ki = self.to_index(k);
+                let back = self.fb.convert(ConvOp::FromSint, Type::F64, ki);
+                let int = self.fb.fcmp(FloatCC::Eq, back, k);
+                self.fb.brif(int, fast, &[], slow, &[]);
+                self.fb.seal_block(fast);
+                self.fb.seal_block(slow);
+                self.fb.switch_to_block(fast);
+                let vs = self.ptrc(VALUE_SIZE as i64);
+                let off = self.fb.binary(BinaryOp::Imul, ki, vs);
+                let bo = self.ptrc(base * VALUE_SIZE as i64);
+                let off = self.fb.binary(BinaryOp::Iadd, off, bo);
+                let src = self.fb.binary(BinaryOp::Iadd, self.slots, off);
+                let dst = self.sptr(d - 1);
+                self.clone_mem(dst, src);
+                self.fb.jump(join, &[]);
+                self.fb.switch_to_block(slow);
+                self.generic(pc);
+                self.fb.jump(join, &[]);
+                self.fb.seal_block(join);
+                self.fb.switch_to_block(join);
+            }
+            Op::ArgsLen(..) | Op::ArgsGet(..) => self.exit_now(pc),
             Op::GetElemLocal(s) => {
                 if self.kinds[s as usize] != Kind::Boxed {
                     self.exit_now(pc);
