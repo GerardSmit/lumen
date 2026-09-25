@@ -2635,10 +2635,71 @@ impl Interp {
     /// stringifying or hashing the index. `None` means "take the generic path" (miss, accessor,
     /// exotic receiver, non-index number) — never "absent".
     #[inline]
+    /// `o[key]` for a String `key` that is not an array index, when `o` and every object on
+    /// its prototype chain up to the one holding `key` are plain (no exotic behavior, no side
+    /// table) and the property found is a data property. `None` = take the generic path.
+    ///
+    /// Own hits are memoized by (shape id, key string identity) in a small direct-mapped
+    /// table ([`STR_KEY_IC`]) that holds the key alive, so its address can't be reused.
+    pub(crate) fn fast_get_str(&self, o: &Gc, lkey: &crate::lstr::LStr) -> Option<Value> {
+        let key = lkey.as_str();
+        if key.as_bytes().first().is_none_or(|b| b.is_ascii_digit() || *b == 0) {
+            return None; // maybe an index (or an internal symbol key)
+        }
+        {
+            let b = o.try_borrow().ok()?;
+            if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
+                return None;
+            }
+            let shape = b.props.shape();
+            let h = (shape as usize ^ (lkey.as_ptr() as usize >> 4)) % STR_KEY_IC_LEN;
+            let hit = STR_KEY_IC.with(|c| match &c.borrow()[h] {
+                Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
+                    Some(*slot)
+                }
+                _ => None,
+            });
+            let slot = match hit {
+                Some(s) => Some(s as usize),
+                None => {
+                    let s = b.props.slot_of(key);
+                    if let Some(s) = s {
+                        // A non-index key's slot is a named one, pinned by the shape.
+                        STR_KEY_IC.with(|c| c.borrow_mut()[h] = Some((shape, lkey.clone(), s as u32)));
+                    }
+                    s
+                }
+            };
+            if let Some(slot) = slot {
+                let p = b.props.entry_at(slot)?;
+                return (!p.accessor()).then(|| p.value());
+            }
+        }
+        let mut cur = o.clone();
+        loop {
+            let next = {
+                let b = cur.try_borrow().ok()?;
+                if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
+                    return None;
+                }
+                if let Some(slot) = b.props.slot_of(key) {
+                    let p = b.props.entry_at(slot)?;
+                    return (!p.accessor()).then(|| p.value());
+                }
+                match &b.proto {
+                    Some(p) => p.clone(),
+                    None => return Some(Value::Undefined),
+                }
+            };
+            cur = next;
+        }
+    }
+
     pub(crate) fn fast_get_elem(&mut self, o: &Gc, n: f64) -> Option<Value> {
         if let Some(value) = self.fast_typed_array_get(o, n) {
             return Some(value);
         }
+        // (See `fast_get_str`.)
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return None;
         }
@@ -7691,4 +7752,12 @@ mod gc_tests {
             crate::Completion::Value(result) if result == "true"
         ));
     }
+}
+
+const STR_KEY_IC_LEN: usize = 64;
+
+thread_local! {
+    /// [`Interp::fast_get_str`]'s own-property memo: `(shape id, key, slot)`.
+    static STR_KEY_IC: std::cell::RefCell<[Option<(u32, crate::lstr::LStr, u32)>; STR_KEY_IC_LEN]> =
+        const { std::cell::RefCell::new([const { None }; STR_KEY_IC_LEN]) };
 }

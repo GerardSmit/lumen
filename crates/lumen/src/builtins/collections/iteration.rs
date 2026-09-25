@@ -177,7 +177,7 @@ pub(crate) fn map_set_iter_step(i: &mut Interp, obj: &Gc) -> Option<Value> {
             None
         }
     };
-    let Some((coll, mut idx, kind)) = state else {
+    let Some((coll, idx, kind)) = state else {
         let r = map_set_iter_step_slow(i, obj);
         learn_iter_layout(obj);
         return r;

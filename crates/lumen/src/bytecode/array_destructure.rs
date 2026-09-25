@@ -45,6 +45,16 @@ pub(super) fn try_dense(
     try_dense_opt(i, input, count, push).is_some()
 }
 
+/// The protector half of [`try_dense`] for a walk that stops at or before the end (`count <=
+/// length`, checked by the caller): iterating `input` is the intrinsic Array Iterator and
+/// closing it is a no-op. The JIT then reads the elements natively.
+pub(crate) fn dense_ok(i: &Interp, input: &Value) -> bool {
+    let Value::Obj(array) = input else {
+        return false;
+    };
+    super::iter_fast::array_ok(i, array) && i.array_iter_return_absent()
+}
+
 fn try_dense_opt(
     i: &Interp,
     input: &Value,

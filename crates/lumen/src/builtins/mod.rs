@@ -3350,6 +3350,9 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "keys", 1, |i, _this, args| {
         let o = to_object_arg(i, arg(args, 0), "Object.keys")?;
+        if let Some(keys) = i.object_keys_fast(&o) {
+            return Ok(i.make_array(keys));
+        }
         ab(i.defer_trigger(&o, None))?;
         if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
             let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;

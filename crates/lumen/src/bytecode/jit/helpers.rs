@@ -82,6 +82,23 @@ pub(crate) enum Helper {
     /// owned value through `Interp::fast_set_elem` (an existing element's overwrite or a
     /// dense append; runs no JS): 1 with `*v` consumed, else 0 with `*v` untouched.
     ElemSetBoxed,
+    /// `(frame, obj: *mut Value, key: *mut Value, dst: *mut Value, consume: u32) -> u32` —
+    /// `obj[key]` with a String `key` through `Interp::fast_get_str` (runs no JS): 1 with the
+    /// key (and the object when `consume`) released and the value written to `dst`, else 0
+    /// with nothing touched.
+    ElemGetStr,
+    /// `(frame, p: *const Value) -> u32` — `array_destructure::dense_ok` (runs no JS).
+    DestructProbe,
+    /// `(frame, p: *mut Value) -> u32` — `ToString` in place of a primitive other than a
+    /// Symbol (runs no JS): 1, else 0 with `*p` untouched.
+    ToStrPrim,
+    /// `(frame, base: *mut Value, n: u32) -> u32` — `Op::Concat(n)` of the Strings at
+    /// `base..` when no seam needs a surrogate rejoin and the result fits: 1 with the result
+    /// at `base` (the parts consumed), else 0 with nothing touched.
+    ConcatStr,
+    /// `(frame, pc: u32, dst: *mut Value) -> u32` — the RegExp literal `MakeRegExp` at `pc`
+    /// (runs no JS): 1 with it written to `dst`, else 0 (the generic op then throws).
+    MakeRegExp,
     /// `(frame, n: u32) -> *mut Value` — the address of captured binding `names[n]`'s value in
     /// the activation env, or null while it is in its TDZ. Pure, like [`Helper::NamePtr`].
     CapPtr,
@@ -266,7 +283,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 66] = [
+pub(crate) const ALL: [Helper; 71] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -281,6 +298,11 @@ pub(crate) const ALL: [Helper; 66] = [
     Helper::GlobPtr,
     Helper::DestructDense,
     Helper::ElemSetBoxed,
+    Helper::ElemGetStr,
+    Helper::DestructProbe,
+    Helper::ToStrPrim,
+    Helper::ConcatStr,
+    Helper::MakeRegExp,
     Helper::CapPtr,
     Helper::LoadName,
     Helper::LoadNameForCall,
@@ -352,6 +374,10 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::NamePtr | Helper::NamePtrW | Helper::GlobPtr => (&[P, I32, I32], &[P]),
         Helper::DestructDense => (&[P, I32, P], &[I32]),
         Helper::ElemSetBoxed => (&[P, P, F64, P], &[I32]),
+        Helper::ElemGetStr => (&[P, P, P, P, I32], &[I32]),
+        Helper::DestructProbe | Helper::ToStrPrim => (&[P, P], &[I32]),
+        Helper::ConcatStr => (&[P, P, I32], &[I32]),
+        Helper::MakeRegExp => (&[P, I32, P], &[I32]),
         Helper::CapPtr => (&[P, I32], &[P]),
         Helper::LoadName | Helper::LoadNameForCall => (&[P, I32, I32, P], &[I32]),
         Helper::StoreName => (&[P, I32, I32, P], &[I32]),
@@ -424,6 +450,11 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::GlobPtr => glob_ptr as *const () as usize,
         Helper::DestructDense => destruct_dense as *const () as usize,
         Helper::ElemSetBoxed => elem_set_boxed as *const () as usize,
+        Helper::ElemGetStr => elem_get_str as *const () as usize,
+        Helper::DestructProbe => destruct_probe as *const () as usize,
+        Helper::ToStrPrim => to_str_prim as *const () as usize,
+        Helper::ConcatStr => concat_str as *const () as usize,
+        Helper::MakeRegExp => make_regexp as *const () as usize,
         Helper::CapPtr => cap_ptr as *const () as usize,
         Helper::LoadName => load_name as *const () as usize,
         Helper::LoadNameForCall => load_name_for_call as *const () as usize,
@@ -681,6 +712,8 @@ pub(crate) fn generic_ok(op: &Op) -> bool {
         // The callee from the reflection frame (`LoadCallee` syncs the pending direct-call
         // records first, see `super::sync_frames`).
         LoadCallee | LoadNewTarget => true,
+        // A template literal's join: operands only.
+        Concat(_) => true,
         // Block envs: a carrier slot is touched by these ops only (never modeled in SSA, see
         // `build::op_slots`), so its memory is authoritative. `InEnv` runs together with the
         // closure-creating op after it (see `build`).
@@ -1050,6 +1083,74 @@ pub(crate) unsafe extern "C" fn elem_set_boxed(
             0
         }
     }
+}
+
+pub(crate) unsafe extern "C" fn elem_get_str(
+    f: *mut JitFrame,
+    obj: *mut Value,
+    key: *mut Value,
+    dst: *mut Value,
+    consume: u32,
+) -> u32 {
+    let i = &*(*f).interp;
+    let v = match (&*obj, &*key) {
+        (Value::Obj(o), Value::Str(k)) => i.fast_get_str(o, k),
+        _ => None,
+    };
+    let Some(v) = v else { return 0 };
+    drop(std::ptr::replace(key, Value::Undefined));
+    if consume != 0 {
+        drop(std::ptr::replace(obj, Value::Undefined));
+    }
+    std::ptr::write(dst, v);
+    1
+}
+
+pub(crate) unsafe extern "C" fn to_str_prim(f: *mut JitFrame, p: *mut Value) -> u32 {
+    let i = &mut *(*f).interp;
+    let v = &*p;
+    match v {
+        Value::Str(_) => 1,
+        Value::Num(_) | Value::Bool(_) | Value::Undefined | Value::Null => match i.to_string(v) {
+            Ok(s) => {
+                *p = Value::Str(s);
+                1
+            }
+            Err(_) => 0,
+        },
+        _ => 0,
+    }
+}
+
+pub(crate) unsafe extern "C" fn concat_str(_f: *mut JitFrame, base: *mut Value, n: u32) -> u32 {
+    let parts = std::slice::from_raw_parts_mut(base, n as usize);
+    let Some(v) = crate::bytecode::concat_strs_fast(parts) else {
+        return 0;
+    };
+    for p in parts.iter_mut() {
+        *p = Value::Undefined;
+    }
+    std::ptr::write(base, v);
+    1
+}
+
+pub(crate) unsafe extern "C" fn make_regexp(f: *mut JitFrame, pc: u32, dst: *mut Value) -> u32 {
+    let i = &mut *(*f).interp;
+    let chunk = &*(*f).chunk;
+    let Some(&Op::MakeRegExp(body, flags)) = chunk.ops.get(pc as usize) else {
+        return 0;
+    };
+    match i.make_regexp_literal(&chunk.names[body as usize], &chunk.names[flags as usize]) {
+        Ok(v) => {
+            std::ptr::write(dst, v);
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+pub(crate) unsafe extern "C" fn destruct_probe(f: *mut JitFrame, p: *const Value) -> u32 {
+    crate::bytecode::array_destructure::dense_ok(&*(*f).interp, &*p) as u32
 }
 
 pub(crate) unsafe extern "C" fn cap_ptr(f: *mut JitFrame, n: u32) -> *mut Value {

@@ -266,7 +266,7 @@ fn index_ptr(fb: &mut FunctionBuilder, index: IrValue, miss: Block) -> IrValue {
 }
 
 /// I32 1 when the NaN-boxed word `bits` is a number.
-fn is_num_bits(fb: &mut FunctionBuilder, bits: IrValue) -> IrValue {
+pub(crate) fn is_num_bits(fb: &mut FunctionBuilder, bits: IrValue) -> IrValue {
     let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
     let top = bin_imm(fb, BinaryOp::Band, Type::I64, top, 0x7fff);
     cmp_imm(fb, IntCC::Ult, Type::I64, top, TOP_UNDEFINED)
@@ -359,6 +359,62 @@ fn element_prop(
     fb.seal_block(join);
     fb.switch_to_block(join);
     (prop, in_entries)
+}
+
+/// The address of element 0's `Property` of the object in `v` when its elements are packed
+/// storage (boxed or inline) holding at least `n` entries (so its `length` is at least `n`);
+/// else branch to `miss`. Read the entries with [`packed_word`].
+pub(crate) fn packed_prefix(fb: &mut FunctionBuilder, v: IrValue, n: usize, miss: Block) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(PTR, 0);
+    };
+    let gc = object(fb, l, v, miss, false);
+    exotic_is(fb, l, gc, &[Exotic::Array], miss);
+    let d = dense(fb, l, gc, miss);
+    let join = fb.create_block();
+    let base = fb.append_block_param(join, PTR);
+    let boxed = fb.create_block();
+    let not_boxed = fb.create_block();
+    let packed = fb.load(PTR_MEM, d, l.dense_packed);
+    let is_boxed = cmp_imm(fb, IntCC::Ne, PTR, packed, 0);
+    fb.brif(is_boxed, boxed, &[], not_boxed, &[]);
+    fb.seal_block(boxed);
+    fb.seal_block(not_boxed);
+    fb.switch_to_block(boxed);
+    let len = fb.load(PTR_MEM, packed, l.packed_len);
+    let enough = cmp_imm(fb, IntCC::Uge, PTR, len, n as i64);
+    guard(fb, enough, miss);
+    let p = fb.load(PTR_MEM, packed, l.packed_ptr);
+    fb.jump(join, &[p]);
+    fb.switch_to_block(not_boxed);
+    let ilen = fb.load(PTR_U8, d, l.dense_inline_len);
+    let enough = cmp_imm(fb, IntCC::Uge, PTR, ilen, n as i64);
+    guard(fb, enough, miss);
+    let p = bin_imm(fb, BinaryOp::Iadd, PTR, d, l.dense_inline_slots as i64);
+    fb.jump(join, &[p]);
+    fb.seal_block(join);
+    fb.switch_to_block(join);
+    base
+}
+
+/// The NaN-boxed word of packed entry `j` from [`packed_prefix`]'s `base`, guarded a data
+/// property and not a hole.
+pub(crate) fn packed_word(fb: &mut FunctionBuilder, base: IrValue, j: usize, miss: Block) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(Type::I64, 0);
+    };
+    let off = (j as i64 * l.prop_size) as i32;
+    let meta = fb.load(PTR_MEM, base, off + l.prop_meta);
+    let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
+    let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
+    guard(fb, data, miss);
+    let bits = fb.load(MemKind::I64, base, off + l.prop_packed);
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
+    let hole = cmp_imm(fb, IntCC::Ne, Type::I64, top, TOP_EMPTY);
+    guard(fb, hole, miss);
+    bits
 }
 
 /// Guard `prop` is a data property (no accessor) holding a number; return it as F64.

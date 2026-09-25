@@ -944,6 +944,10 @@ struct Plan {
     /// Inline call sites (`Math` intrinsics and direct `#[op(fast)]` calls): first pc of the
     /// callee part → the site.
     math: HashMap<usize, Site>,
+    /// `Math.f(..)` sites nested in another site's arguments (`Math.floor(Math.sqrt(x))`):
+    /// inner site pc -> outer site pc. The outer site's guard also checks the inner one, so
+    /// the inner site never exits (the outer placeholders are on the stack).
+    nested: HashMap<usize, usize>,
     /// Direct fast calls, by [`Intr::Fast`] index.
     fast: Vec<FastSite>,
     /// Inlined callees, by [`Intr::Inline`] index.
@@ -1054,18 +1058,42 @@ fn plan(
     // `from`, up to the `CallWithThis`. Returns the call pc and the argument kinds (true = Num,
     // false = Bool) when the whole window qualifies.
     // `plain`: the window ends in a `Call` (a callee without receiver) instead.
-    let site_args = |from: usize, plain: bool| -> Option<(usize, Vec<bool>)> {
+    // `nest`: the arguments may hold `Math.g(<Number args>)` sites (one level deep), each
+    // collected into the third result by its `LoadName` pc.
+    let site_args_n = |from: usize, plain: bool, nest: bool| -> Option<(usize, Vec<bool>, Vec<usize>)> {
         let mut st: Vec<bool> = Vec::new();
-        for q in from..=backedge {
+        let mut outer: Option<(Vec<bool>, usize, usize)> = None;
+        let mut inner: Vec<usize> = Vec::new();
+        let mut q = from;
+        while q <= backedge {
             if lead(q) {
                 return None;
             }
             match ops[q] {
-                Op::CallWithThis(argc) if !plain => {
-                    return (argc as usize == st.len()).then_some((q, st));
+                Op::LoadName(..) if nest && outer.is_none() && q + 1 <= backedge && !lead(q + 1) => {
+                    let Op::GetMethod(m, _) = ops[q + 1] else { return None };
+                    let f = helpers::math_intrinsic(chunk.names.get(m as usize)?)?;
+                    if helpers::math_site_failed(chunk, q) {
+                        return None;
+                    }
+                    outer = Some((std::mem::take(&mut st), q, f.arity()));
+                    q += 2;
+                    continue;
                 }
-                Op::Call(argc) if plain => {
-                    return (argc as usize == st.len()).then_some((q, st));
+                Op::CallWithThis(argc) if outer.is_some() => {
+                    let (prev, at, arity) = outer.take().expect("nested site");
+                    if argc as usize != st.len() || st.len() != arity || !st.iter().all(|&n| n) {
+                        return None;
+                    }
+                    st = prev;
+                    st.push(true);
+                    inner.push(at);
+                }
+                Op::CallWithThis(argc) if !plain => {
+                    return (argc as usize == st.len()).then_some((q, st, inner));
+                }
+                Op::Call(argc) if plain && outer.is_none() => {
+                    return (argc as usize == st.len()).then_some((q, st, inner));
                 }
                 Op::LoadLocal(s)
                     if !tdzd.maybe_undef(s as usize, q)
@@ -1097,8 +1125,12 @@ fn plan(
                 Op::Neg | Op::Plus | Op::BitNot if st.last() == Some(&true) => {}
                 _ => return None,
             }
+            q += 1;
         }
         None
+    };
+    let site_args = |from: usize, plain: bool| -> Option<(usize, Vec<bool>)> {
+        site_args_n(from, plain, false).map(|(c, st, _)| (c, st))
     };
     // An inline `Math.f(args)` (`LoadName GetMethod <Number args> CallWithThis(arity)`) or a
     // direct call of a `#[op(fast)]` function resolved from a name (`ns.f(args)` or `f(args)`)
@@ -1115,7 +1147,18 @@ fn plan(
             (Op::LoadNameForCall(..), _) => true,
             _ => return None,
         };
-        let (call, args) = site_args(pc + if lfc { 1 } else { 2 }, false)?;
+        let (call, args, inner) = site_args_n(pc + if lfc { 1 } else { 2 }, false, true)?;
+        if !inner.is_empty() {
+            // Nested sites: only for an outer `Math` intrinsic (its guard checks them too).
+            let (false, Op::GetMethod(m, _)) = (lfc, ops[pc + 1]) else { return None };
+            let f = helpers::math_intrinsic(chunk.names.get(m as usize)?)?;
+            if args.len() != f.arity() || !args.iter().all(|&n| n) {
+                return None;
+            }
+            for q in inner {
+                p.nested.insert(q, pc);
+            }
+        }
         if let (false, Op::GetMethod(m, _)) = (lfc, ops[pc + 1]) {
             if let Some(f) = helpers::math_intrinsic(chunk.names.get(m as usize)?) {
                 return (args.len() == f.arity() && args.iter().all(|&n| n)).then_some(Site {
@@ -1262,6 +1305,22 @@ fn plan(
             }
             _ => {}
         }
+    }
+
+    // A nested site must itself be an inline `Math` site; else its outer site goes too.
+    let bad: Vec<usize> = p
+        .nested
+        .iter()
+        .filter(|(q, _)| {
+            !p.math
+                .get(q)
+                .is_some_and(|s| matches!(s.f, Intr::Math(_)) && !s.lfc && s.slot.is_none())
+        })
+        .map(|(_, &o)| o)
+        .collect();
+    for o in bad {
+        p.math.remove(&o);
+        p.nested.retain(|_, v| *v != o);
     }
 
     // `<string>.charCodeAt(<Number>)`: an inline `String.prototype` intrinsic, its receiver
@@ -2815,7 +2874,53 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// `js_mod` through [`Helper::Binary`] (which computes Number ⊕ Number exactly like
     /// `run_vm`; never throws for two Numbers), using scratch entries above the stack.
+    ///
+    /// Two int32 operands with a nonzero divisor take an integer remainder inline: a zero
+    /// remainder is `x * 0` (-0 for a negative or -0 dividend, like `js_mod`), and a divisor
+    /// of -1 is taken as 1 (same result; no `i32::MIN % -1` trap).
     fn num_mod(&mut self, x: V, y: V) -> Result<V, String> {
+        #[cfg(target_arch = "wasm32")]
+        let cv = ConvOp::ToSintSat;
+        #[cfg(not(target_arch = "wasm32"))]
+        let cv = ConvOp::ToSint;
+        let xi = self.fb.convert(cv, Type::I32, x);
+        let yi = self.fb.convert(cv, Type::I32, y);
+        let xb = self.fb.convert(ConvOp::FromSint, Type::F64, xi);
+        let yb = self.fb.convert(ConvOp::FromSint, Type::F64, yi);
+        let xok = self.fb.fcmp(FloatCC::Eq, xb, x);
+        let yok = self.fb.fcmp(FloatCC::Eq, yb, y);
+        let zero = self.i32c(0);
+        let ynz = self.fb.icmp(IntCC::Ne, yi, zero);
+        let ok = self.fb.binary(BinaryOp::Band, xok, yok);
+        let ok = self.fb.binary(BinaryOp::Band, ok, ynz);
+        let fast = self.fb.create_block();
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let r = self.fb.append_block_param(join, Type::F64);
+        self.fb.brif(ok, fast, &[], slow, &[]);
+        self.fb.seal_block(fast);
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(fast);
+        let m1 = self.i32c(-1);
+        let one = self.i32c(1);
+        let is_m1 = self.fb.icmp(IntCC::Eq, yi, m1);
+        let yd = self.fb.select(is_m1, one, yi);
+        let ri = self.fb.binary(BinaryOp::Srem, xi, yd);
+        let rf = self.fb.convert(ConvOp::FromSint, Type::F64, ri);
+        let fz = self.fb.f64const(0.0);
+        let xz = self.fb.binary(BinaryOp::Fmul, x, fz);
+        let rz = self.fb.icmp(IntCC::Eq, ri, zero);
+        let res = self.fb.select(rz, xz, rf);
+        self.fb.jump(join, &[res]);
+        self.fb.switch_to_block(slow);
+        let res = self.num_mod_slow(x, y)?;
+        self.fb.jump(join, &[res]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        Ok(r)
+    }
+
+    fn num_mod_slow(&mut self, x: V, y: V) -> Result<V, String> {
         let d = self.stack.len();
         self.store_entry(d, Entry::Num(x));
         self.store_entry(d + 1, Entry::Num(y));
@@ -3427,6 +3532,31 @@ impl<'a, 'f> Tr<'a, 'f> {
                     let fact = self.idx_fact_at(pc, src);
                     self.elem_read(pc, obj, key, None, d - 2, want, Slow::Generic, fact, Some(src));
                 }
+                (o @ (Entry::Boxed | Entry::Ref(..)), Entry::Boxed) => {
+                    // A String key on a plain object: a data property natively.
+                    let (obj, consume) = match o {
+                        Entry::Ref(p, _) => (p, 0),
+                        _ => (self.sptr(d - 2), 1),
+                    };
+                    let (kp, dst) = (self.sptr(d - 1), self.sptr(d - 2));
+                    let cv = self.i32c(consume);
+                    let r = self
+                        .call(Helper::ElemGetStr, &[self.frame, obj, kp, dst, cv])
+                        .expect("ElemGetStr returns a flag");
+                    let z = self.i32c(0);
+                    let hit = self.fb.icmp(IntCC::Ne, r, z);
+                    let gen = self.fb.create_block();
+                    let join = self.fb.create_block();
+                    self.fb.brif(hit, join, &[], gen, &[]);
+                    self.fb.seal_block(gen);
+                    self.fb.switch_to_block(gen);
+                    self.generic(pc);
+                    self.fb.jump(join, &[]);
+                    self.fb.seal_block(join);
+                    self.fb.switch_to_block(join);
+                    self.stack.truncate(d - 2);
+                    self.stack.push(Entry::Boxed);
+                }
                 _ => self.generic(pc),
             },
             Op::ArgsLen(s, _) if self.kinds[s as usize] == Kind::Boxed => {
@@ -3490,10 +3620,40 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.switch_to_block(join);
             }
             Op::ArgsLen(..) | Op::ArgsGet(..) => self.exit_now(pc),
+            Op::MakeRegExp(..) => {
+                self.soff(d + 1);
+                let (pcv, dst) = (self.i32c(pc as i64), self.sptr(d));
+                let r = self
+                    .call(Helper::MakeRegExp, &[self.frame, pcv, dst])
+                    .expect("MakeRegExp returns a flag");
+                self.hit_or_generic(pc, r);
+            }
+            Op::ToStr => {
+                // A primitive other than a Symbol in place; anything else through the generic op.
+                self.box_from(d - 1);
+                let p = self.sptr(d - 1);
+                let r = self
+                    .call(Helper::ToStrPrim, &[self.frame, p])
+                    .expect("ToStrPrim returns a flag");
+                self.hit_or_generic(pc, r);
+            }
+            Op::Concat(n) => {
+                let n = n as usize;
+                self.box_from(d - n);
+                let (base, nv) = (self.sptr(d - n), self.i32c(n as i64));
+                let r = self
+                    .call(Helper::ConcatStr, &[self.frame, base, nv])
+                    .expect("ConcatStr returns a flag");
+                self.hit_or_generic(pc, r);
+            }
             Op::DestructureArr(n) => {
                 // A pristine dense Array natively; anything else through the generic op.
                 self.box_from(d - 1);
                 self.max_stack = self.max_stack.max(d - 1 + n as usize);
+                if (1..=8).contains(&n) {
+                    self.destructure_inline(pc, d, n as usize);
+                    return Ok(());
+                }
                 let p = self.sptr(d - 1);
                 let nv = self.i32c(n as i64);
                 let r = self
@@ -4255,6 +4415,109 @@ impl<'a, 'f> Tr<'a, 'f> {
         Ok(())
     }
 
+    /// After a helper that did the op at `pc` when its flag `r` is nonzero: the generic op
+    /// otherwise. The result is one Boxed entry in place of the op's operands.
+    fn hit_or_generic(&mut self, pc: usize, r: V) {
+        let (pops, _) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
+        let d = self.stack.len();
+        let z = self.i32c(0);
+        let hit = self.fb.icmp(IntCC::Ne, r, z);
+        let gen = self.fb.create_block();
+        let join = self.fb.create_block();
+        self.fb.brif(hit, join, &[], gen, &[]);
+        self.fb.seal_block(gen);
+        self.fb.switch_to_block(gen);
+        self.generic(pc);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack.truncate(d - pops);
+        self.stack.push(Entry::Boxed);
+    }
+
+    /// `DestructureArr(n)` of the Boxed value at `d - 1`: when [`Helper::DestructProbe`] holds
+    /// and the first `n` elements are dense data elements (`n <= length`), they are read
+    /// natively into `d - 1 ..`; else `DestructDense`, then the generic op.
+    fn destructure_inline(&mut self, pc: usize, d: usize, n: usize) {
+        // The array moves to a scratch entry above the outputs while they are written.
+        self.max_stack = self.max_stack.max(d + n);
+        let p = self.sptr(d - 1);
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let fast = self.fb.create_block();
+        let r = self
+            .call(Helper::DestructProbe, &[self.frame, p])
+            .expect("DestructProbe returns a flag");
+        let z = self.i32c(0);
+        let ok = self.fb.icmp(IntCC::Ne, r, z);
+        self.fb.brif(ok, fast, &[], slow, &[]);
+        self.fb.seal_block(fast);
+        self.fb.switch_to_block(fast);
+        let base = layout::packed_prefix(&mut self.fb, p, n, slow);
+        let mut elems = Vec::with_capacity(n);
+        let mut all_num = None;
+        for j in 0..n {
+            let bits = layout::packed_word(&mut self.fb, base, j, slow);
+            let num = layout::is_num_bits(&mut self.fb, bits);
+            all_num = Some(match all_num {
+                Some(a) => self.fb.binary(BinaryOp::Band, a, num),
+                None => num,
+            });
+            elems.push(bits);
+        }
+        let all_num = all_num.expect("n >= 1");
+        // Every check passed: nothing below can miss.
+        let (from, to) = (self.soff(d - 1), self.soff(d - 1 + n));
+        let w0 = self.fb.load(MemKind::I64, self.stackp, from);
+        let w1 = self.fb.load(MemKind::I64, self.stackp, from + 8);
+        self.fb.store(MemKind::I64, self.stackp, w0, to);
+        self.fb.store(MemKind::I64, self.stackp, w1, to + 8);
+        // Straight-line writes, only the words kept live (a branch per element, or a decoded
+        // tag and payload per element, costs more than the writes): all Numbers stored
+        // directly, else every element (any non-hole word) through `UnpackClone`.
+        let refb = self.fb.create_block();
+        let plain = self.fb.create_block();
+        let done = self.fb.create_block();
+        self.fb.brif(all_num, plain, &[], refb, &[]);
+        self.fb.seal_block(refb);
+        self.fb.seal_block(plain);
+        self.fb.switch_to_block(refb);
+        for (j, &bits) in elems.iter().enumerate() {
+            let dst = self.sptr(d - 1 + j);
+            let zero = self.i32c(0);
+            self.call(Helper::UnpackClone, &[dst, bits, zero]);
+        }
+        self.fb.jump(done, &[]);
+        self.fb.switch_to_block(plain);
+        let four = self.i32c(TAG_NUM as i64);
+        for (j, &bits) in elems.iter().enumerate() {
+            let dst = self.sptr(d - 1 + j);
+            self.fb.store(MemKind::I32U8, dst, four, 0);
+            self.fb.store(MemKind::I64, dst, bits, VALUE_PAYLOAD);
+        }
+        self.fb.jump(done, &[]);
+        self.fb.seal_block(done);
+        self.fb.switch_to_block(done);
+        self.drop_at(d - 1 + n);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        let nv = self.i32c(n as i64);
+        let r = self
+            .call(Helper::DestructDense, &[self.frame, nv, p])
+            .expect("DestructDense returns a flag");
+        let z = self.i32c(0);
+        let hit = self.fb.icmp(IntCC::Ne, r, z);
+        let gen = self.fb.create_block();
+        self.fb.brif(hit, join, &[], gen, &[]);
+        self.fb.seal_block(gen);
+        self.fb.switch_to_block(gen);
+        self.generic(pc);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+    }
+
     // ---- Math intrinsics ---------------------------------------------------------------------
 
     /// `LoadName(Math)` of an inline `Math.f(..)` site: re-check the guard if JS may have run
@@ -4263,6 +4526,13 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn math_begin(&mut self, pc: usize) -> Result<(), String> {
         if let Some(site) = self.plan.math.get(&pc).copied().filter(|s| s.slot.is_some()) {
             return self.slot_site_begin(pc, site);
+        }
+        if self.plan.nested.contains_key(&pc) {
+            // Checked with its outer site, and nothing between can run JS.
+            let d = self.stack.len();
+            self.set_stack_tag(d, TAG_UNDEFINED);
+            self.stack.push(Entry::Boxed);
+            return Ok(());
         }
         let var = *self
             .math_vars
@@ -4276,7 +4546,14 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.brif(unknown, check, &[], cont, &[]);
         self.fb.seal_block(check);
         self.fb.switch_to_block(check);
-        let g = self.site_guard(pc);
+        let mut g = self.site_guard(pc);
+        let mut inner: Vec<usize> =
+            self.plan.nested.iter().filter(|(_, &o)| o == pc).map(|(&q, _)| q).collect();
+        inner.sort_unstable();
+        for q in inner {
+            let gi = self.site_guard(q);
+            g = self.fb.binary(BinaryOp::Band, g, gi);
+        }
         let zero = self.i32c(0);
         let bad = self.fb.icmp(IntCC::Eq, g, zero);
         let st = self.stack.clone();

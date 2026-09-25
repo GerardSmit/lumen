@@ -718,6 +718,9 @@ pub enum Op {
     /// current value, which every call path sets on entry (the constructor on a construct,
     /// `undefined` on a call) and restores on exit.
     LoadNewTarget,
+    /// A template literal's concatenation: pops `n` Strings (its literal chunks and ToStr'd
+    /// substitutions, in order), pushes their concatenation.
+    Concat(u16),
     /// A class instance field's DefineField (see [`class_fields`]): pops the value and the
     /// receiver, defines own data property `names[n]` (a resolved private name adds a private
     /// field). The flag applies the anonymous-function naming.
@@ -4585,6 +4588,28 @@ impl Compiler {
                 }
                 Ok(())
             }
+            Expr::Binary { op: "+", left, right } if template_chain(left, right).is_some() => {
+                let parts = template_chain(left, right).expect("checked");
+                let mut n = 0u16;
+                for p in parts {
+                    if matches!(p, Expr::Str(s) if s.is_empty()) {
+                        continue;
+                    }
+                    self.expr(p)?;
+                    n += 1;
+                }
+                match n {
+                    0 => {
+                        let i = self.const_idx(Value::Str(crate::lstr::LStr::from("")));
+                        self.emit(Op::Const(i));
+                    }
+                    1 => {}
+                    _ => {
+                        self.emit(Op::Concat(n));
+                    }
+                }
+                Ok(())
+            }
             Expr::Binary { op, left, right } => {
                 if let Some((arg, kind, negated)) = typeof_test(op, left, right) {
                     // `typeof freeName` must not throw for an unresolvable name; that path keeps
@@ -6584,6 +6609,12 @@ fn run_vm_frames<const ONE: bool>(
                             continue;
                         }
                     }
+                    (Value::Obj(o), Value::Str(k)) => {
+                        if let Some(v) = i.fast_get_str(o, k) {
+                            stack.push(v);
+                            continue;
+                        }
+                    }
                     _ => {}
                 }
                 if matches!(obj, Value::Undefined | Value::Null) {
@@ -7416,6 +7447,15 @@ fn run_vm_frames<const ONE: bool>(
                 }
             }
             Op::LoadNewTarget => stack.push(i.new_target.clone()),
+            Op::Concat(n) => {
+                let at = stack.len() - n as usize;
+                let v = stack.with_vec(|s| {
+                    let r = concat_strs(i, &s[at..]);
+                    s.truncate(at);
+                    r
+                })?;
+                stack.push(v);
+            }
             Op::LoadCallee => {
                 jit::sync_frames(i);
                 let f = i
@@ -8460,6 +8500,7 @@ impl Chunk {
             Op::DerivedReturn => (1, 0),
             // The callee from the reflection frame (JIT direct calls sync theirs first).
             Op::LoadCallee | Op::LoadNewTarget => (0, 1),
+            Op::Concat(n) => (*n as usize, 1),
             // Block envs: their carrier slots are touched by these ops only (the JIT leaves
             // them in memory and runs the ops generically).
             Op::BlkNew(..) | Op::BlkDecl(..) | Op::BlkCopy(_) => (0, 0),
@@ -8859,4 +8900,71 @@ pub(crate) fn virt_get(
     let o = virt_object(i, slots, s, tag);
     let k = i.to_property_key(&key)?;
     i.get_member(&o, &k)
+}
+
+/// The pieces of a template literal's desugared `+` chain (see `Parser::build_template`): a
+/// left-leaning chain whose leaves are all string literals or `ToStr` substitutions, at least
+/// one of them a substitution (only template desugaring builds a `ToStr`). Every `+` in it is
+/// then a string concatenation, and the pieces evaluate left to right.
+fn template_chain<'a>(left: &'a Expr, right: &'a Expr) -> Option<Vec<&'a Expr>> {
+    let leaf = |e: &Expr| matches!(e, Expr::Str(_) | Expr::ToStr(_));
+    let mut rev = vec![right];
+    let mut cur = left;
+    loop {
+        match cur {
+            Expr::Binary { op: "+", left, right } if leaf(right) => {
+                rev.push(right);
+                cur = left;
+            }
+            e => {
+                rev.push(e);
+                break;
+            }
+        }
+    }
+    if !rev.iter().all(|e| leaf(e)) || !rev.iter().any(|e| matches!(e, Expr::ToStr(_))) {
+        return None;
+    }
+    rev.reverse();
+    Some(rev)
+}
+
+/// `Op::Concat`: the Strings concatenated (a surrogate pair split across a seam is rejoined).
+pub(crate) fn concat_strs_fast(parts: &[Value]) -> Option<Value> {
+    let mut strs: Vec<&str> = Vec::with_capacity(parts.len());
+    for p in parts {
+        match p {
+            Value::Str(s) => strs.push(s.as_str()),
+            _ => return None,
+        }
+    }
+    let total: usize = strs.iter().map(|s| s.len()).sum();
+    if total > crate::interpreter::MAX_STR_LEN
+        || strs.windows(2).any(|w| crate::jstr::needs_join_fixup(w[0], w[1]))
+    {
+        return None;
+    }
+    Some(Value::Str(crate::lstr::LStr::concat_n(&strs)))
+}
+
+fn concat_strs(i: &mut Interp, parts: &[Value]) -> Result<Value, Abrupt> {
+    let mut strs: Vec<&str> = Vec::with_capacity(parts.len());
+    for p in parts {
+        match p {
+            Value::Str(s) => strs.push(s.as_str()),
+            _ => return Err(i.throw("TypeError", "internal: template part is not a string")),
+        }
+    }
+    let total: usize = strs.iter().map(|s| s.len()).sum();
+    if total > crate::interpreter::MAX_STR_LEN {
+        return Err(i.throw("RangeError", "Invalid string length"));
+    }
+    if strs.windows(2).any(|w| crate::jstr::needs_join_fixup(w[0], w[1])) {
+        let mut acc = String::new();
+        for s in strs {
+            acc = crate::jstr::concat(&acc, s);
+        }
+        return Ok(Value::Str(acc.into()));
+    }
+    Ok(Value::Str(crate::lstr::LStr::concat_n(&strs)))
 }
