@@ -449,6 +449,8 @@ fn build_region(
                 })
                 .collect(),
             hs_cur: Vec::new(),
+            skip: None,
+            chaining: false,
             hsets: Vec::new(),
             err: None,
             self_fn: None,
@@ -919,6 +921,9 @@ enum Src {
     Glob(u32),
     /// `frame.this_val`: valid for the whole region.
     This,
+    /// An object read out of a property without taking a reference, in the stack entry that
+    /// holds it (see [`Tr::chain_read`]): valid until anything but its one consumer runs.
+    Borrow,
     /// A callee `Value` the code itself keeps alive (a direct call site's resolved callee, see
     /// [`call`]): valid for the code's lifetime.
     Pin,
@@ -927,7 +932,10 @@ enum Src {
 impl Src {
     /// Whether JS running elsewhere can change or move the value.
     fn in_env(self) -> bool {
-        matches!(self, Src::Name(_) | Src::Cap(_) | Src::NameW(_) | Src::Glob(_))
+        matches!(
+            self,
+            Src::Name(_) | Src::Cap(_) | Src::NameW(_) | Src::Glob(_) | Src::Borrow
+        )
     }
 }
 
@@ -1644,6 +1652,11 @@ struct Tr<'a, 'f> {
     push_vars: HashMap<usize, Variable>,
     /// Region handlers live at the op being translated (see [`Analysis::hs`]).
     hs_cur: Vec<(usize, usize)>,
+    /// The op a chained read already emitted (see [`Tr::chain_read`]): skipped by `body`.
+    skip: Option<usize>,
+    /// A chained read's consumer is being emitted: it does not chain in turn (its own skip
+    /// would be lost, and each level would double the code).
+    chaining: bool,
     /// Handler sets named by resume exits (`frame.exit_hset - 1`).
     hsets: Vec<Vec<(usize, usize)>>,
     /// A translation failure found while emitting something that cannot return an error.
@@ -1833,7 +1846,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn force(&mut self, i: usize) {
         if let Entry::Ref(p, _) = self.stack[i] {
             let dst = self.sptr(i);
-            self.call(Helper::Clone, &[dst, p]);
+            self.clone_mem(dst, p);
             self.stack[i] = Entry::Boxed;
         }
     }
@@ -1866,9 +1879,13 @@ impl<'a, 'f> Tr<'a, 'f> {
             || (self.plan.dmethod.contains_key(&pc)
                 && !matches!(self.stack.last(), Some(Entry::Num(_) | Entry::Bool(_))));
         // A direct call reads its operands in place (it runs JS: env Refs below still go).
+        // A plain property store writes through a borrowed receiver (see `Tr::ref_receiver`).
         let ref_aware = math_part
             || self.plan.direct.contains_key(&pc)
             || self.plan.dnew.contains_key(&pc)
+            || (matches!(op, Op::AppendProp(..) | Op::SetPropDrop(..))
+                && !self.plan.dacc.contains_key(&pc)
+                && !self.plan.dset.contains_key(&pc))
             || matches!(
                 op,
                 Op::Pop
@@ -2013,7 +2030,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             // An owned clone (exits and merges, where the entry itself is left behind).
             Entry::Ref(p, _) => {
                 let dst = self.sptr(d);
-                self.call(Helper::Clone, &[dst, p]);
+                self.clone_mem(dst, p);
             }
         }
     }
@@ -2736,6 +2753,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                 }
                 self.stack = st;
             }
+            if self.skip == Some(pc) {
+                self.skip = None;
+                continue;
+            }
             if dead || self.fb.is_filled() || an.depth[i].is_none() {
                 continue;
             }
@@ -3388,7 +3409,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.prop_read(pc, obj, n, c, None, d, slow, None)?;
             }
             Op::SetPropDrop(n, c) => {
-                let obj = self.sptr(d - 2);
+                let obj = self.ref_receiver(d - 2);
                 self.prop_write(pc, n, c, obj, Some(d - 2))?;
             }
             Op::SetPropThisDrop(n, c) => {
@@ -3471,7 +3492,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.def_var(flag, one);
                 } else if self.vars[s].is_some() {
                     return Err(format!("Tdz of SSA slot {s} without a flag"));
-                } else {
+                } else if !self.tdz_dead(pc, s) {
                     self.set_stack_tag(d, TAG_EMPTY);
                     self.move_to_slot(s, d);
                 }
@@ -3838,7 +3859,13 @@ impl<'a, 'f> Tr<'a, 'f> {
                             PropObj::Ptr(obj)
                         },
                     };
-                    self.prop_read(pc, obj, n, c, None, d - 1, slow, Some(src))?;
+                    if self.chains(pc, n, c) {
+                        self.chain_read(pc, obj, c, d - 1, |t| {
+                            t.prop_read(pc, obj, n, c, None, d - 1, slow, Some(src))
+                        })?;
+                    } else {
+                        self.prop_read(pc, obj, n, c, None, d - 1, slow, Some(src))?;
+                    }
                 }
                 _ => self.generic(pc),
             },
@@ -3862,7 +3889,13 @@ impl<'a, 'f> Tr<'a, 'f> {
                     c,
                     obj: PropObj::Slot(obj),
                 };
-                self.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))?;
+                if self.chains(pc, n, c) {
+                    self.chain_read(pc, obj, c, d, |t| {
+                        t.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))
+                    })?;
+                } else {
+                    self.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))?;
+                }
             }
             Op::ToPropKey => {
                 // As `ToPropKeyLocal`, with the base on the stack (forced by `prepare`).
@@ -4122,8 +4155,8 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             Src::Slot(s) => self.slot_ptr(s as usize),
             Src::This => self.fb.load(PTR_MEM, self.frame, FRAME_THIS),
-            Src::Pin => {
-                self.err.get_or_insert_with(|| "pinned callee resolved as a binding".into());
+            Src::Pin | Src::Borrow => {
+                self.err.get_or_insert_with(|| "pinned or lent value resolved as a binding".into());
                 self.ptrc(0)
             }
         }
@@ -4373,6 +4406,193 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.prop_write_pops(pc, n, c, obj, consume, pops)
     }
 
+    /// Whether the `Tdz(s)` at `pc` is dead: `StoreLocal(s)` follows in the same basic block
+    /// (`const v = a.b` in a loop body) with only ops between that neither touch slot `s` nor
+    /// yield, and no handler is live. Nothing can then read the uninitialized binding: a frame
+    /// slot is not visible to other code, an exit resumes before the store (which still
+    /// happens), and a throw leaves the frame. The store releases the old value instead.
+    fn tdz_dead(&self, pc: usize, s: usize) -> bool {
+        if !self.hs_cur.is_empty() {
+            return false;
+        }
+        let other = |x: u16| x as usize != s;
+        let mut q = pc + 1;
+        while q <= self.backedge && !self.is_leader(q) {
+            match self.ops[q] {
+                Op::StoreLocal(x) if x as usize == s => return true,
+                Op::LoadLocal(x) | Op::GetPropLocal(x, ..) if other(x) => {}
+                Op::GetProp(..)
+                | Op::GetPropThis(..)
+                | Op::GetElem
+                | Op::Const(_)
+                | Op::Undef
+                | Op::LoadThis
+                | Op::LoadCap(_)
+                | Op::Dup
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Neg
+                | Op::Plus => {}
+                _ => return false,
+            }
+            q += 1;
+        }
+        false
+    }
+
+    /// Whether the property read at `pc` (on a receiver it does not own) feeds straight into a
+    /// plain property read of its result (`a.b.c`), so [`Tr::chain_read`] can lend it.
+    fn chains(&self, pc: usize, n: u32, c: u32) -> bool {
+        let q = pc + 1;
+        !self.chaining
+            && q <= self.backedge
+            && !self.is_leader(q)
+            && matches!(self.ops[q], Op::GetProp(..))
+            && &*self.chunk.names[n as usize] != "length"
+            && !self.plan.dget.contains_key(&pc)
+            && !self.plan.dacc.contains_key(&pc)
+            && layout::prop_ic(self.chunk, c).is_some()
+    }
+
+    /// A property read at `pc`, result at entry `at`, whose one consumer is the plain property
+    /// read at `pc + 1` (see [`Tr::chains`]): when the inline cache finds an object, it is lent
+    /// to the consumer — stored in the entry without taking a reference, as a [`Src::Borrow`]
+    /// Ref the consumer reads in place (its slow path takes a reference first) — which saves
+    /// the reference count's increment and the release after the read. Anything else reads
+    /// the usual way (`owned`), then runs the consumer on that. Both paths emit the consumer;
+    /// `body` skips it.
+    fn chain_read(
+        &mut self,
+        pc: usize,
+        obj: V,
+        c: u32,
+        at: usize,
+        owned: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let ic = layout::prop_ic(self.chunk, c).ok_or("chained read without a cache")?;
+        let pre = self.stack.clone();
+        let other = self.fb.create_block();
+        let p = layout::prop_obj(&mut self.fb, obj, &ic, other);
+        self.seal_current();
+        let dst = self.sptr(at);
+        let objt = self.i32c(TAG_OBJ as i64);
+        self.fb.store(MemKind::I32U8, dst, objt, 0);
+        self.fb.store(MemKind::I64, dst, p, VALUE_PAYLOAD);
+        self.stack.truncate(at);
+        self.stack.push(Entry::Ref(dst, Src::Borrow));
+        self.chaining = true;
+        let r = self.op(pc + 1);
+        self.chaining = false;
+        r?;
+        // A result the consumer keeps unboxed leaves the lent object's bits in the entry: stack
+        // memory above the depth must stay trivially droppable.
+        if !self.fb.is_filled() && self.stack.get(at) != Some(&Entry::Boxed) {
+            self.set_stack_tag(at, TAG_UNDEFINED);
+        }
+        let lent = (self.fb.current_block(), self.stack.clone());
+        self.fb.seal_block(other);
+        self.fb.switch_to_block(other);
+        self.stack = pre;
+        owned(self)?;
+        if !self.fb.is_filled() {
+            self.chaining = true;
+            let r = self.op(pc + 1);
+            self.chaining = false;
+            r?;
+        }
+        let plain = (self.fb.current_block(), self.stack.clone());
+        self.merge_paths(vec![lent, plain])?;
+        self.skip = Some(pc + 1);
+        Ok(())
+    }
+
+    /// Join straight-line paths (each its end block and stack state) into one: entries equal
+    /// on every live path stay, Numbers and Booleans become block parameters, anything else is
+    /// boxed into its stack slot. A path whose block already ended (it exited) is left out.
+    fn merge_paths(&mut self, paths: Vec<(Option<Block>, Vec<Entry>)>) -> Result<(), String> {
+        let mut live: Vec<(Block, Vec<Entry>)> = Vec::new();
+        for (b, st) in paths {
+            let Some(b) = b else { continue };
+            self.fb.switch_to_block(b);
+            if !self.fb.is_filled() {
+                live.push((b, st));
+            }
+        }
+        let Some((_, first)) = live.first() else {
+            // Every path exited: a filled block stays current (`body` skips to the next leader).
+            return Ok(());
+        };
+        let len = first.len();
+        if live.iter().any(|(_, st)| st.len() != len) {
+            return Err("chained read paths disagree on the stack depth".into());
+        }
+        #[derive(Clone, Copy, PartialEq)]
+        enum How {
+            Same,
+            Num,
+            Bool,
+            Boxed,
+        }
+        let hows: Vec<How> = (0..len)
+            .map(|k| {
+                let e0 = live[0].1[k];
+                if live.iter().all(|(_, st)| st[k] == e0) {
+                    How::Same
+                } else if live.iter().all(|(_, st)| matches!(st[k], Entry::Num(_))) {
+                    How::Num
+                } else if live.iter().all(|(_, st)| matches!(st[k], Entry::Bool(_))) {
+                    How::Bool
+                } else {
+                    How::Boxed
+                }
+            })
+            .collect();
+        let join = self.fb.create_block();
+        let mut merged = live[0].1.clone();
+        for (k, h) in hows.iter().enumerate() {
+            match h {
+                How::Num => merged[k] = Entry::Num(self.fb.append_block_param(join, Type::F64)),
+                How::Bool => merged[k] = Entry::Bool(self.fb.append_block_param(join, Type::I32)),
+                How::Boxed => merged[k] = Entry::Boxed,
+                How::Same => {}
+            }
+        }
+        for (b, st) in &live {
+            self.fb.switch_to_block(*b);
+            self.stack = st.clone();
+            let mut args = Vec::new();
+            for (k, h) in hows.iter().enumerate() {
+                match (h, st[k]) {
+                    (How::Num, Entry::Num(x)) | (How::Bool, Entry::Bool(x)) => args.push(x),
+                    (How::Boxed, e) => self.store_entry(k, e),
+                    _ => {}
+                }
+            }
+            self.fb.jump(join, &args);
+        }
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack = merged;
+        Ok(())
+    }
+
+    /// The receiver of a plain property store at entry `i`: a borrowed (Ref) receiver is
+    /// written through in place — the inline store runs no JS, so the value it borrows stays
+    /// put, and the slow path takes an owned clone first ([`Tr::prop_write_plain`]) — which
+    /// saves the clone and release of the receiver around every store.
+    fn ref_receiver(&mut self, i: usize) -> V {
+        match self.stack[i] {
+            Entry::Ref(p, _) => p,
+            _ => {
+                self.force(i);
+                self.sptr(i)
+            }
+        }
+    }
+
     /// `obj.name += v` (`AppendProp`, stack `obj, lval, v`): with two Numbers it is exactly
     /// `Add` + `SetPropDrop` (a string append needs a string operand), so the sum goes through
     /// the property store's inline cache; anything else runs the fused op generically.
@@ -4393,7 +4613,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         // Number operands own nothing: dropping them is a no-op.
         self.stack.truncate(d - 2);
         self.stack.push(Entry::Num(r));
-        let obj = self.sptr(d - 3);
+        let obj = self.ref_receiver(d - 3);
         self.prop_write_pops(pc, n, c, obj, Some(d - 3), 2)?;
         self.fb.jump(done, &[]);
         self.fb.seal_block(miss);
@@ -4489,8 +4709,10 @@ impl<'a, 'f> Tr<'a, 'f> {
             let x = self.num_or_slow(v, d - 1, miss);
             layout::prop_set_num(&mut self.fb, obj, ic, x, miss);
             self.seal_current();
-            if let Some(i) = consume {
-                self.drop_at(i);
+            match consume {
+                // A borrowed receiver owns nothing.
+                Some(i) if !matches!(pre[i], Entry::Ref(..)) => self.drop_at(i),
+                _ => {}
             }
             self.fb.jump(join, &[]);
             self.fb.seal_block(miss);

@@ -5808,8 +5808,10 @@ unsafe fn enter_frame(
 /// Tail calls that cannot release their frame in place — made by native code's generic
 /// call-out (`Op::TailCall` with `ONE`), or from a root frame to a callee that cannot run as an
 /// inline frame — run as ordinary calls up to this recursion depth, and through the caller's
-/// trampoline (`Interp::pending_tail`) beyond it: bounded native stack either way.
-pub(crate) const TAIL_NEST: u32 = crate::interpreter::MAX_EVAL_DEPTH / 16;
+/// trampoline (`Interp::pending_tail`) beyond it: bounded native stack either way. Fixed rather
+/// than a share of `MAX_EVAL_DEPTH`: tail recursion must fit any thread's stack (a 2 MB test
+/// thread included), whatever the ceiling for ordinary recursion.
+pub(crate) const TAIL_NEST: u32 = 96;
 
 /// PrepareForTailCall in the innermost [`InlineFrame`]: move its top `n` operand-stack entries
 /// (the call window) onto its caller's operand stack (the root's `root_stack` when it is the

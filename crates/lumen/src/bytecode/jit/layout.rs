@@ -850,6 +850,19 @@ pub(crate) fn prop_get(
     (tag, payload)
 }
 
+/// The object `v.<prop>` holds via the baked IC: its `Gc` pointer, with no reference taken
+/// (the property keeps it alive). Any other value, or a miss, goes to `miss`.
+pub(crate) fn prop_obj(fb: &mut FunctionBuilder, v: IrValue, ic: &PropIc, miss: Block) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(Type::I64, 0);
+    };
+    let bits = prop_word_l(fb, l, v, ic, miss);
+    let (is_obj, _, payload) = word_counted(fb, bits);
+    guard(fb, is_obj, miss);
+    payload
+}
+
 /// The NaN-boxed word of `v.<prop>` via the baked IC: guard `v` is an object with one of the
 /// IC's shapes and the entry a data property.
 fn prop_word_l(
