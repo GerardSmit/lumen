@@ -149,6 +149,19 @@ pub(crate) enum Helper {
     /// `(frame, cell: *mut SiteCell, callee: *const Value) -> 0/1` — rebind a direct call
     /// site's cache to `callee` when it is another function object with the site's code. Pure.
     SiteRebind,
+    /// `(frame, cell: *mut SiteCell, callee: *const Value, need_obj: u32) -> *const Value` — the
+    /// bound `this` of `callee` when it is a bound function without bound arguments whose
+    /// target is the site's function (rebinding the cell as [`Helper::SiteRebind`] does), and
+    /// with `need_obj`, an object `this`; null otherwise. Pure.
+    BoundThis,
+    /// `(frame, v: *const Value) -> 0/1` — `v` is an `apply` argument list whose elements
+    /// [`Helper::ApplySeed`] may read without running code: `undefined`, `null`, or an ordinary
+    /// Array (not a mapped `arguments`) whose indices below its length are all data
+    /// properties. Pure.
+    ApplyOk,
+    /// `(v: *const Value, slots: *mut Value, n: u32)` — clone the first `n` elements of an
+    /// [`Helper::ApplyOk`] list into `slots` (which hold `undefined`). Pure.
+    ApplySeed,
     /// `(frame, cell: *const SiteCell, out: *mut Value)` — `[[Construct]]` of a direct `new`
     /// site's constructor (`cell.pin`): the new instance (OrdinaryCreateFromConstructor, the
     /// learned capacity) into `out`, and `new.target` set to the constructor. Pure.
@@ -238,7 +251,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 59] = [
+pub(crate) const ALL: [Helper; 62] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -272,6 +285,9 @@ pub(crate) const ALL: [Helper; 59] = [
     Helper::SiteFailed,
     Helper::DropN,
     Helper::SiteRebind,
+    Helper::BoundThis,
+    Helper::ApplyOk,
+    Helper::ApplySeed,
     Helper::NewThis,
     Helper::NewDone,
     Helper::GcPoll,
@@ -336,6 +352,9 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::SiteFailed => (&[P, I32], &[]),
         Helper::DropN => (&[P, I32], &[]),
         Helper::SiteRebind => (&[P, P, P], &[I32]),
+        Helper::BoundThis => (&[P, P, P, I32], &[P]),
+        Helper::ApplyOk => (&[P, P], &[I32]),
+        Helper::ApplySeed => (&[P, P, I32], &[]),
         Helper::NewThis => (&[P, P, P], &[]),
         Helper::NewPlan => (&[P, P, P, I32], &[P]),
         Helper::NewDone => (&[P, P, P, P, I32], &[]),
@@ -403,6 +422,9 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::SiteFailed => site_failed as *const () as usize,
         Helper::DropN => drop_n as *const () as usize,
         Helper::SiteRebind => site_rebind as *const () as usize,
+        Helper::BoundThis => bound_this as *const () as usize,
+        Helper::ApplyOk => apply_ok as *const () as usize,
+        Helper::ApplySeed => apply_seed as *const () as usize,
         Helper::NewThis => new_this as *const () as usize,
         Helper::NewPlan => super::build::new_plan::new_plan_helper as *const () as usize,
         Helper::StrGuard => str_guard as *const () as usize,
@@ -996,6 +1018,124 @@ pub(crate) unsafe extern "C" fn store_cap(
     }
 }
 
+/// Arguments an unwrapped call adaptor (see [`unwrap_adaptor`]) may pass without allocating.
+const ARGBUF: usize = 8;
+
+/// The argument list of an unwrapped call adaptor: `len` initialized values.
+struct ArgBuf {
+    vals: [std::mem::MaybeUninit<Value>; ARGBUF],
+    len: usize,
+}
+
+impl ArgBuf {
+    #[inline(always)]
+    fn new() -> ArgBuf {
+        ArgBuf { vals: [const { std::mem::MaybeUninit::uninit() }; ARGBUF], len: 0 }
+    }
+    #[inline]
+    fn push(&mut self, v: Value) {
+        self.vals[self.len].write(v);
+        self.len += 1;
+    }
+    fn as_mut_ptr(&mut self) -> *mut Value {
+        self.vals.as_mut_ptr().cast()
+    }
+}
+
+impl Drop for ArgBuf {
+    fn drop(&mut self) {
+        for v in &mut self.vals[..self.len] {
+            // SAFETY: the first `len` are initialized (callees leave them `Undefined`).
+            unsafe { v.assume_init_drop() };
+        }
+    }
+}
+
+/// The call that `f.call(t, ...a)`, `f.apply(t, list)` or a bound function makes, with its
+/// arguments moved (or, for `apply`, copied) into `buf`: the adaptor's own native frame and
+/// `Interp::call` round trip are skipped (none of them has a stack-trace frame, see
+/// `reflect::native_transparent`). Only exact cases unwrap: a callable target, a small
+/// argument list, and for `apply` an `undefined`/`null` list or an ordinary Array whose
+/// elements are all own data properties (reading them runs no code). On `Some` the argument
+/// window is consumed (left `Undefined`); on `None` it is untouched.
+unsafe fn unwrap_adaptor(
+    i: &Interp,
+    callee: &Value,
+    this: &Value,
+    args: *mut Value,
+    argc: usize,
+    buf: &mut ArgBuf,
+) -> Option<(Value, Value)> {
+    use crate::value::Callable;
+    let Value::Obj(o) = callee else { return None };
+    let b = o.try_borrow().ok()?;
+    if !b.ic_plain.get() {
+        return None;
+    }
+    let take = |k: usize| std::ptr::replace(args.add(k), Value::Undefined);
+    match &b.call {
+        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_call as usize => {
+            if argc > ARGBUF + 1 || !this.is_callable() {
+                return None;
+            }
+            let t = if argc > 0 { take(0) } else { Value::Undefined };
+            for k in 1..argc {
+                buf.push(take(k));
+            }
+            Some((this.clone(), t))
+        }
+        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_apply as usize => {
+            if argc > 2 || !this.is_callable() {
+                return None;
+            }
+            if argc == 2 {
+                match &*args.add(1) {
+                    Value::Undefined | Value::Null => {}
+                    Value::Obj(a) => {
+                        if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(a) as usize)
+                            || i.mapped_arguments.contains_key(&(crate::value::Gc::as_ptr(a) as usize))
+                        {
+                            return None;
+                        }
+                        let ab = a.try_borrow().ok()?;
+                        if !matches!(ab.exotic, crate::value::Exotic::Array) {
+                            return None;
+                        }
+                        let len = ab.props.length_property()?.num_value()?;
+                        if !(0.0..=ARGBUF as f64).contains(&len) || len.fract() != 0.0 {
+                            return None;
+                        }
+                        let len = len as u32;
+                        if (0..len).any(|k| ab.props.get_index(k).is_none_or(|p| p.accessor())) {
+                            return None;
+                        }
+                        for k in 0..len {
+                            buf.push(ab.props.get_index(k).expect("checked").value());
+                        }
+                    }
+                    _ => return None,
+                }
+                drop(take(1));
+            }
+            let t = if argc > 0 { take(0) } else { Value::Undefined };
+            Some((this.clone(), t))
+        }
+        Callable::Bound(bc) => {
+            if bc.args.len() + argc > ARGBUF {
+                return None;
+            }
+            for a in &bc.args {
+                buf.push(a.clone());
+            }
+            for k in 0..argc {
+                buf.push(take(k));
+            }
+            Some((Value::Obj(bc.target.clone()), bc.this.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// [`Helper::Call`]'s flag bit: the result feeds straight into an `await`.
 pub(crate) const CALL_AWAIT: u32 = 2;
 /// [`Helper::Call`]'s flag bit: the op is a proper tail call (`Op::TailCall`). Past
@@ -1037,13 +1177,18 @@ pub(crate) unsafe extern "C" fn call(
         std::ptr::write(s.add(base), Value::Undefined);
         return STATUS_OK;
     }
+    let mut buf = ArgBuf::new();
+    let (callee, this, argp, argc) = match unwrap_adaptor(i, &callee, &this, s.add(at), argc, &mut buf) {
+        Some((target, t)) => (target, t, buf.as_mut_ptr(), buf.len),
+        None => (callee, this, s.add(at), argc),
+    };
     // A plain native: straight to it (`Interp::call`'s bookkeeping without its dispatch).
     if let Some(nat) = i.leaf_native(&callee) {
-        let args = std::slice::from_raw_parts(s.add(at), argc);
+        let args = std::slice::from_raw_parts(argp, argc);
         let r = i.call_native_fast(nat, this, args);
         drop(callee);
         for k in 0..argc {
-            *s.add(at + k) = Value::Undefined;
+            *argp.add(k) = Value::Undefined;
         }
         return match r {
             Ok(v) => {
@@ -1058,14 +1203,14 @@ pub(crate) unsafe extern "C" fn call(
             // A sloppy callee whose `f.arguments` may be read runs as a frame, which records
             // its activation (see `bytecode::reflect`).
             Some(native) if !(c.chunk.reflect_args && crate::bytecode::reflect::enabled()) => {
-                call_native(i, callee, this, s.add(at), argc, c, native)
+                call_native(i, callee, this, argp, argc, c, native)
             }
-            _ => call_frame(i, callee, this, s.add(at), argc, c),
+            _ => call_frame(i, callee, this, argp, argc, c),
         },
         None => {
             // The arguments stay owned by the frame's stack for the call (they root their
             // objects there, like the interpreter's operand stack does), then are dropped.
-            let args = std::slice::from_raw_parts(s.add(at), argc);
+            let args = std::slice::from_raw_parts(argp, argc);
             let r = if callee.is_callable() {
                 // `await f()`: an async callee may skip its promise (the interpreter's fusion).
                 let fused = flags & CALL_AWAIT != 0;
@@ -1083,7 +1228,7 @@ pub(crate) unsafe extern "C" fn call(
                     .map_err(|e| crate::bytecode::site_call_error(i, &*(*f).chunk, &callee, e))
             };
             for k in 0..argc {
-                *s.add(at + k) = Value::Undefined;
+                *argp.add(k) = Value::Undefined;
             }
             r
         }
@@ -1953,16 +2098,50 @@ pub(crate) unsafe extern "C" fn call_finish(
     word: u64,
     entry: *const (),
 ) -> u32 {
-    use crate::bytecode::{drive_vm, VmStep};
     let i = &mut *(*f).interp;
+    let mut r = finish_exit(i, nf, word, entry as usize);
+    // A proper tail call unwound out of the callee (`Interp::call`'s trampoline).
+    while r.is_ok() {
+        match i.pending_tail.take() {
+            Some(bx) => {
+                let (g, t, a) = *bx;
+                // The strict tail caller is gone: hidden from `fn.caller` (like the
+                // interpreter's trampolines).
+                let site = i.cur_site;
+                i.cur_site = site | crate::interpreter::frames::SITE_NATIVE;
+                r = i.call(g, t, &a);
+                i.cur_site = site;
+            }
+            None => break,
+        }
+    }
+    match r {
+        Ok(v) => {
+            std::ptr::write((*nf).stack, v);
+            STATUS_OK
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+/// The result of a directly called frame `nf` whose code exited with `word` (entered at
+/// `entry`): the interpreter finishes the call on the frame's slots, which are then dropped
+/// (a pending proper tail call is the caller's to run).
+pub(crate) unsafe fn finish_exit(
+    i: &mut Interp,
+    nf: *mut JitFrame,
+    word: u64,
+    entry: usize,
+) -> Result<Value, Abrupt> {
+    use crate::bytecode::{drive_vm, VmStep};
     let chunk = &*(*nf).chunk;
     let env = &*(*nf).env;
     let this_val = &*(*nf).this_val;
     let slots = std::slice::from_raw_parts_mut((*nf).slots, chunk.n_slots);
     let area = (*nf).stack;
-    let native = super::find_native(chunk, entry as usize);
+    let native = super::find_native(chunk, entry);
     // Exits of replaced code are not counted against the current code.
-    let current = chunk.jit.dentry.get() == entry as usize;
+    let current = chunk.jit.dentry.get() == entry;
     let kind = word & 0xff;
     let exit_pc = (word >> 8) as usize;
     let depth = (*nf).exit_depth as usize;
@@ -2025,32 +2204,10 @@ pub(crate) unsafe extern "C" fn call_finish(
     // The header's 16-byte-aligned words stay trivially droppable (see `JitFrame`).
     (*nf).exit_depth = 0;
     (*nf).exit_hset = 0;
-    let mut r = match r {
+    match r {
         Ok(VmStep::Done(v)) => Ok(v),
         Ok(VmStep::Await(_)) => Err(i.throw("TypeError", "compiled code awaited in a call")),
         Err(e) => Err(e),
-    };
-    // A proper tail call unwound out of the callee (`Interp::call`'s trampoline).
-    while r.is_ok() {
-        match i.pending_tail.take() {
-            Some(bx) => {
-                let (g, t, a) = *bx;
-                // The strict tail caller is gone: hidden from `fn.caller` (like the
-                // interpreter's trampolines).
-                let site = i.cur_site;
-                i.cur_site = site | crate::interpreter::frames::SITE_NATIVE;
-                r = i.call(g, t, &a);
-                i.cur_site = site;
-            }
-            None => break,
-        }
-    }
-    match r {
-        Ok(v) => {
-            std::ptr::write(area, v);
-            STATUS_OK
-        }
-        Err(e) => fail(f, e),
     }
 }
 
@@ -2108,6 +2265,66 @@ pub(crate) unsafe extern "C" fn site_rebind(
     (*cell).env = env;
     (*cell).pin = v.clone();
     1
+}
+
+pub(crate) unsafe extern "C" fn bound_this(
+    f: *mut JitFrame,
+    cell: *mut super::SiteCell,
+    v: *const Value,
+    need_obj: u32,
+) -> *const Value {
+    let Value::Obj(o) = &*v else { return std::ptr::null() };
+    let Ok(b) = o.try_borrow() else { return std::ptr::null() };
+    let crate::value::Callable::Bound(bc) = &b.call else { return std::ptr::null() };
+    if !bc.args.is_empty() || (need_obj != 0 && !matches!(bc.this, Value::Obj(_))) {
+        return std::ptr::null();
+    }
+    let target = crate::value::Gc::as_ptr(&bc.target) as usize;
+    if target != (*cell).fn_ptr && site_rebind(f, cell, &Value::Obj(bc.target.clone())) == 0 {
+        return std::ptr::null();
+    }
+    // The bound callable is boxed: its address is stable while `v` lives.
+    &bc.this as *const Value
+}
+
+/// The Array an `apply` list names when its elements `0..length` are all own data properties
+/// (reading them runs no code), with that length.
+fn apply_list(i: &Interp, v: &Value) -> Option<(crate::value::Gc, u32)> {
+    let Value::Obj(a) = v else { return None };
+    let p = crate::value::Gc::as_ptr(a) as usize;
+    if !i.ordinary_get_ptr(p) || i.mapped_arguments.contains_key(&p) {
+        return None;
+    }
+    let ab = a.try_borrow().ok()?;
+    if !matches!(ab.exotic, crate::value::Exotic::Array) {
+        return None;
+    }
+    let len = ab.props.length_property()?.num_value()?;
+    if !(0.0..=65536.0).contains(&len) || len.fract() != 0.0 {
+        return None;
+    }
+    let len = len as u32;
+    if (0..len).any(|k| ab.props.get_index(k).is_none_or(|p| p.accessor())) {
+        return None;
+    }
+    drop(ab);
+    Some((a.clone(), len))
+}
+
+pub(crate) unsafe extern "C" fn apply_ok(f: *mut JitFrame, v: *const Value) -> u32 {
+    let v = &*v;
+    (matches!(v, Value::Undefined | Value::Null) || apply_list(&*(*f).interp, v).is_some()) as u32
+}
+
+pub(crate) unsafe extern "C" fn apply_seed(v: *const Value, slots: *mut Value, n: u32) {
+    let Value::Obj(a) = &*v else { return };
+    let Ok(ab) = a.try_borrow() else { return };
+    for k in 0..n {
+        match ab.props.get_index(k) {
+            Some(p) => std::ptr::write(slots.add(k as usize), p.value()),
+            None => break,
+        }
+    }
 }
 
 pub(crate) unsafe extern "C" fn new_this(

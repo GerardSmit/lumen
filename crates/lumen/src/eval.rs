@@ -3550,11 +3550,11 @@ impl Interp {
         }
         if job.handler.is_callable() {
             let outer = std::mem::replace(&mut self.async_context, job.context.clone());
-            let outcome = self.call(
-                job.handler.clone(),
-                Value::Undefined,
-                std::slice::from_ref(&job.value),
-            );
+            let outcome =
+                match crate::bytecode::call_once_direct(self, &job.handler, job.value) {
+                    Ok(r) => r,
+                    Err(v) => self.call(job.handler.clone(), Value::Undefined, &[v]),
+                };
             self.async_context = outer;
             match outcome {
                 Ok(r) => self.resolve_promise(&job.result, r),

@@ -44,7 +44,7 @@ mod object_literal;
 mod parameters;
 pub(crate) mod positions;
 mod prepared_call;
-pub(crate) use prepared_call::PreparedCall;
+pub(crate) use prepared_call::{call_once_direct, PreparedCall};
 pub(crate) mod serialize;
 mod switch;
 mod switch_table;

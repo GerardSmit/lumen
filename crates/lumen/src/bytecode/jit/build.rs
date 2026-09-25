@@ -943,6 +943,10 @@ struct Plan {
     dthis: HashMap<usize, inline_this::ThisBody>,
     /// Property reads resolved to an inlined getter, by op pc.
     dget: HashMap<usize, inline_this::Getter>,
+    /// Property stores resolved to an inlined setter, by op pc.
+    dset: HashMap<usize, inline_this::Getter>,
+    /// Property reads and stores resolved to a direct accessor call, by op pc.
+    dacc: HashMap<usize, call::AccSite>,
     /// `new` sites built from their constructor's template (see [`new_plan`]), by pc.
     dnew: HashMap<usize, new_plan::NewSite>,
     /// Inline `String.prototype` intrinsic sites (`<string> GetMethod <Number>
@@ -2420,7 +2424,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.def_var(v, zero);
             self.math_vars.insert(pc, v);
         }
-        if self.plan.direct.values().any(|s| !s.construct) {
+        if self.plan.direct.values().any(|s| !s.construct) || !self.plan.dacc.is_empty() {
             self.call_flags = self.entry_flags();
         }
         let header_block = self
@@ -2667,7 +2671,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                 return true;
             }
             Slow::Prop { n, c, obj } => {
-                let at = d - pops;
+                // The result is the op's last push (`GetMethod` keeps its receiver below it).
+                let at = d - pops + pushes - 1;
                 self.box_from(at);
                 let (objp, consume) = match obj {
                     PropObj::Stack(i) => {
@@ -3097,13 +3102,16 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             Op::GetMethod(..) if self.plan.dmethod.contains_key(&pc) && self.direct_method(pc) => {}
             Op::GetMethod(n, c) => {
+                // A property read that keeps its receiver (`Helper::GetMethod` is `GetProp`
+                // on a borrowed receiver): the inline cache, else that helper.
                 self.box_from(d - 1);
-                let (nv, cv) = (self.i32c(n as i64), self.i32c(c as i64));
-                let (obj, dst) = (self.sptr(d - 1), self.sptr(d));
-                let st = self.call_js(Helper::GetMethod, &[self.frame, nv, cv, obj, dst]);
-                let snap = self.stack.clone();
-                self.throw_if(st, pc, &snap, d);
-                self.stack.push(Entry::Boxed);
+                let obj = self.sptr(d - 1);
+                let slow = Slow::Prop {
+                    n,
+                    c,
+                    obj: PropObj::Ptr(obj),
+                };
+                self.prop_read(pc, obj, n, c, None, d, slow, None)?;
             }
             Op::SetPropDrop(n, c) => {
                 let obj = self.sptr(d - 2);
@@ -3866,6 +3874,64 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// [`Self::prop_write`] for a store whose value and object are the top `pops` entries.
     fn prop_write_pops(
+        &mut self,
+        pc: usize,
+        n: u32,
+        c: u32,
+        obj: V,
+        consume: Option<usize>,
+        pops: usize,
+    ) -> Result<(), String> {
+        if let Some(a) = self.plan.dacc.get(&pc).cloned() {
+            // A setter called directly (see `call::AccSite`).
+            let d = self.stack.len();
+            let base = d - pops;
+            let pre = self.stack.clone();
+            let miss = self.fb.create_block();
+            let done = self.fb.create_block();
+            layout::accessor_probe(&mut self.fb, obj, &a.shapes, a.slot, a.word as u64, true, miss);
+            let arg = match pre[d - 1] {
+                Entry::Boxed => Entry::Ref(self.sptr(d - 1), Src::Pin),
+                e => e,
+            };
+            self.accessor_call(pc, obj, Some(arg));
+            let r = self.stack.len() - 1;
+            self.drop_at(r);
+            self.stack.pop();
+            if pre[d - 1] == Entry::Boxed {
+                self.drop_at(d - 1);
+            }
+            if let Some(i) = consume {
+                self.drop_at(i);
+            }
+            self.fb.jump(done, &[]);
+            self.fb.seal_block(miss);
+            self.fb.switch_to_block(miss);
+            self.stack = pre;
+            self.prop_write_plain(pc, n, c, obj, consume, pops)?;
+            self.fb.jump(done, &[]);
+            self.fb.seal_block(done);
+            self.fb.switch_to_block(done);
+            self.stack.truncate(base);
+            return Ok(());
+        }
+        if let Some(g) = self.plan.dset.get(&pc).cloned() {
+            let done = self.fb.create_block();
+            if self.inline_setter(obj, consume, &g, done) {
+                let base = self.stack.len() - pops;
+                self.prop_write_plain(pc, n, c, obj, consume, pops)?;
+                self.fb.jump(done, &[]);
+                self.fb.seal_block(done);
+                self.fb.switch_to_block(done);
+                self.stack.truncate(base);
+                return Ok(());
+            }
+        }
+        self.prop_write_plain(pc, n, c, obj, consume, pops)
+    }
+
+    /// [`Self::prop_write_pops`] without an inlined setter.
+    fn prop_write_plain(
         &mut self,
         pc: usize,
         n: u32,
@@ -5415,6 +5481,39 @@ impl<'a, 'f> Tr<'a, 'f> {
             if self.inline_getter(pc, obj, drop, at, slow, &g) {
                 return Ok(());
             }
+        }
+        // A getter called directly (see `call::AccSite`): not on a receiver borrowed from an
+        // environment, which could move while it runs.
+        if let (Some(a), false) = (
+            self.plan.dacc.get(&pc).cloned(),
+            src.is_some_and(|s| s.in_env()),
+        ) {
+            let pre = self.stack.clone();
+            let d = pre.len();
+            let miss = self.fb.create_block();
+            let join = self.fb.create_block();
+            layout::accessor_probe(&mut self.fb, obj, &a.shapes, a.slot, a.word as u64, false, miss);
+            self.accessor_call(pc, obj, None);
+            if let Some(i) = drop {
+                self.drop_at(i);
+            }
+            if at != d {
+                let (so, dof) = (self.soff(d), self.soff(at));
+                let sp = self.stackp;
+                self.copy_value(sp, so, sp, dof);
+            }
+            self.fb.jump(join, &[]);
+            self.fb.seal_block(miss);
+            self.fb.switch_to_block(miss);
+            self.stack = pre.clone();
+            if self.slow_path(pc, slow) {
+                self.slow_to_join(pc, at, false, join);
+            }
+            self.fb.seal_block(join);
+            self.fb.switch_to_block(join);
+            self.stack = pre[..at].to_vec();
+            self.stack.push(Entry::Boxed);
+            return Ok(());
         }
         let is_len = &*self.chunk.names[n as usize] == "length";
         let ic = if is_len {
