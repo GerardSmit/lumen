@@ -712,10 +712,14 @@ struct SrcMap {
     base: u32,
     /// End of the lexed slice in `src`.
     end: u32,
-    /// Byte offset of each char index in the lexed slice, plus one past the last char; `None`
-    /// when the slice is ASCII and the two coincide.
+    /// Byte offset (in the lexed slice) of every [`SRC_MAP_STEP`]th char index; `None` when the
+    /// slice is ASCII and char and byte offsets coincide. Offsets in between walk the chars from
+    /// the checkpoint below.
     bytes: Option<Vec<u32>>,
 }
+
+/// Chars per [`SrcMap`] checkpoint.
+const SRC_MAP_STEP: usize = 64;
 
 impl SrcMap {
     fn whole(src: &str) -> Self {
@@ -725,8 +729,16 @@ impl SrcMap {
     fn new(src: Rc<str>, start: u32, end: u32) -> Self {
         let slice = &src[start as usize..end as usize];
         let bytes = (!slice.is_ascii()).then(|| {
-            let mut v: Vec<u32> = slice.char_indices().map(|(i, _)| i as u32).collect();
-            v.push(slice.len() as u32);
+            let mut v: Vec<u32> = slice
+                .char_indices()
+                .step_by(SRC_MAP_STEP)
+                .map(|(i, _)| i as u32)
+                .collect();
+            // The end offset (one past the last char) when it starts a checkpoint of its own.
+            if slice.chars().count() % SRC_MAP_STEP == 0 {
+                v.push(slice.len() as u32);
+            }
+            v.shrink_to_fit();
             v
         });
         SrcMap {
@@ -744,7 +756,20 @@ impl SrcMap {
         let at = |ch: u32| -> Option<u32> {
             match &self.bytes {
                 None => (ch as usize <= self.src.len() - self.base as usize).then_some(ch),
-                Some(b) => b.get(ch as usize).copied(),
+                Some(b) => {
+                    let ch = ch as usize;
+                    let from = *b.get(ch / SRC_MAP_STEP)? as usize;
+                    let slice = &self.src[self.base as usize..self.end as usize];
+                    let mut rest = slice[from..].char_indices().map(|(i, _)| from + i);
+                    // `nth` past the last char is the slice end (one past the last char).
+                    match rest.nth(ch % SRC_MAP_STEP) {
+                        Some(i) => Some(i as u32),
+                        None => {
+                            let n = slice[from..].chars().count();
+                            (ch % SRC_MAP_STEP == n).then_some(slice.len() as u32)
+                        }
+                    }
+                }
             }
         };
         Some((self.base + at(start)?, self.base + at(end)?))
@@ -1062,12 +1087,10 @@ impl Parser {
     fn at_eof(&self) -> bool {
         matches!(self.cur(), Tok::Eof)
     }
-    fn advance(&mut self) -> Tok {
-        let t = self.toks[self.pos].kind.clone();
+    fn advance(&mut self) {
         if self.pos + 1 < self.toks.len() {
             self.pos += 1;
         }
-        t
     }
     /// A parse error at the current token. `at_eof` (the "more input could fix this" signal a
     /// REPL keys on) is set when that token is Eof — right for expectation failures ("expected
@@ -5784,5 +5807,31 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
             optional: false, ..
         } => Some(Pattern::Member(Box::new(e.clone()))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod src_map_tests {
+    use super::SrcMap;
+
+    #[test]
+    fn checkpoints_map_every_char_offset() {
+        for n in [0, 1, 63, 64, 65, 127, 128, 129, 300] {
+            let text: String = (0..n).map(|k| if k % 3 == 0 { 'é' } else { 'a' }).collect();
+            let src = format!("ab{text}cd");
+            let (base, end) = (2u32, (src.len() - 2) as u32);
+            let map = SrcMap::new(std::rc::Rc::from(src.as_str()), base, end);
+            let slice = &src[base as usize..end as usize];
+            let mut want: Vec<u32> = slice.char_indices().map(|(i, _)| i as u32).collect();
+            want.push(slice.len() as u32);
+            for (ch, &b) in want.iter().enumerate() {
+                let (s, e) = map.byte_range(ch as u32, ch as u32).unwrap();
+                assert_eq!((s, e), (base + b, base + b), "n={n} ch={ch}");
+            }
+            if n > 0 {
+                // Past the end of a non-ASCII slice.
+                assert!(map.byte_range(0, want.len() as u32).is_none(), "n={n}");
+            }
+        }
     }
 }

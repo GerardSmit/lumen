@@ -353,9 +353,24 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       - The first run of each benchmark is about 3× its steady state. Every fresh block comes from the system heap, because the size-class cache only recycles freed blocks.
       - A call to a closure the JIT cannot bind directly costs about 100 ns through `helpers::call` → `call_native` → `enter`. This overlaps item 17.
       - `Promise.resolve(x)` still costs about 157 ns: the call path, plus allocating the object and its `PromiseSlot`.
-14. **Parser (L).**
+14. ✅ **Parser (L).** *(Partly done.)*
     - What: smaller AST nodes (Function 184 B, Stmt 128 B, Param 112 B), an arena, and memory for the token vector.
     - Closes: parse 3.7–6.6× and a 7–11 MB peak from temporary fragmentation.
+    - Finding: the lexer dominated, not the AST.
+      - Every punctuator built a `String` and scanned the 60-entry punctuator list.
+      - Every identifier was scanned against the keyword list.
+      - `Parser::advance` cloned the token it stepped over (a `String` for every identifier and string literal), and no caller used the clone.
+    - Built:
+      - Punctuators lex through one `match` on the next four chars.
+      - Identifiers take their ASCII run in one step, and keywords resolve through a `match`.
+      - `advance` no longer clones.
+      - The parser's char→byte offset map for non-ASCII sources keeps one checkpoint per 64 chars instead of one `u32` per char: 4 MB → 64 KB for a 1 MB bundle.
+    - Release, `new Function(src)` on the 1 MB puppeteer-core browser bundle: 52 ms → 32–35 ms (node 14.6 ms on its first compile).
+    - Left:
+      - The lexer still works on a `Vec<char>` copy of the source (4 bytes per char).
+      - Identifier and string tokens own `String`s that the parser clones in `match self.cur().clone()`.
+      - Bodies of lazily parsed functions are still lexed with the rest of the file.
+      - The AST node sizes and an arena, as planned.
 15. **Limits (S).**
     - `MAX_LIVE` (3M live objects) throws a RangeError that escapes try/catch; node handles 5M.
     - `MAX_EVAL_DEPTH` allows 1,500 frames, against about 10.4k in node.
