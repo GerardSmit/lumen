@@ -714,6 +714,10 @@ pub enum Op {
     /// Push the running function object (the innermost `FnFrame`'s callee): a named function
     /// expression's self-name binding, initialized in the prologue.
     LoadCallee,
+    /// Push `new.target` of the running (non-arrow, synchronous) function: the engine's
+    /// current value, which every call path sets on entry (the constructor on a construct,
+    /// `undefined` on a call) and restores on exit.
+    LoadNewTarget,
     /// A class instance field's DefineField (see [`class_fields`]): pops the value and the
     /// receiver, defines own data property `names[n]` (a resolved private name adds a private
     /// field). The flag applies the anonymous-function naming.
@@ -1718,8 +1722,16 @@ impl CaptureScan {
             | Expr::Null
             | Expr::Undefined
             | Expr::Regex { .. }
-            | Expr::NewTarget
             | Expr::ImportMeta => Some(()),
+            // Read from an inner arrow chain, `new.target` is the outer function's even after
+            // it returned: the activation would have to carry it (not modeled).
+            Expr::NewTarget => {
+                if self.fn_depth > 0 && self.arrow_path[1..].iter().all(|a| *a) {
+                    note_bail_reason(|| "capture-scan: new.target in an arrow".to_string());
+                    return None;
+                }
+                Some(())
+            }
             // `super.x` / `super.m()` read the `this` binding too (and `super()` binds it).
             Expr::This | Expr::Super => {
                 // `this` read through an unbroken arrow chain from the outer function observes
@@ -1895,7 +1907,9 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
     // we do not model. Parameterless synchronous ordinary functions can materialize an unmapped
     // arguments object into a dedicated slot (the common variadic-helper shape).
     let scan = func.scan_flags();
-    if scan & SCAN_NEW_TARGET != 0 {
+    // `new.target` is the engine's current value in a synchronous non-arrow body (see
+    // `Op::LoadNewTarget`); an arrow's is lexical, and a resumed body runs under its resumer's.
+    if scan & SCAN_NEW_TARGET != 0 && (func.is_arrow || func.is_async || func.is_generator) {
         log_bail("fn", "new.target");
         return None;
     }
@@ -4493,6 +4507,10 @@ impl Compiler {
             }
             Expr::This => {
                 self.emit_this();
+                Ok(())
+            }
+            Expr::NewTarget => {
+                self.emit(Op::LoadNewTarget);
                 Ok(())
             }
             Expr::Paren(inner) => self.expr(inner),
@@ -7397,6 +7415,7 @@ fn run_vm_frames<const ONE: bool>(
                     return Ok(VmStep::Await(result));
                 }
             }
+            Op::LoadNewTarget => stack.push(i.new_target.clone()),
             Op::LoadCallee => {
                 jit::sync_frames(i);
                 let f = i
@@ -8440,7 +8459,7 @@ impl Chunk {
             Op::SuperCall(n) | Op::SuperCallSpread(n) => (*n as usize + 2, 1),
             Op::DerivedReturn => (1, 0),
             // The callee from the reflection frame (JIT direct calls sync theirs first).
-            Op::LoadCallee => (0, 1),
+            Op::LoadCallee | Op::LoadNewTarget => (0, 1),
             // Block envs: their carrier slots are touched by these ops only (the JIT leaves
             // them in memory and runs the ops generically).
             Op::BlkNew(..) | Op::BlkDecl(..) | Op::BlkCopy(_) => (0, 0),

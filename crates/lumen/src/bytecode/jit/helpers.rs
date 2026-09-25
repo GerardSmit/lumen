@@ -647,7 +647,7 @@ pub(crate) fn generic_ok(op: &Op) -> bool {
         | AsyncDelegateSpecial(..) => false,
         // The callee from the reflection frame (`LoadCallee` syncs the pending direct-call
         // records first, see `super::sync_frames`).
-        LoadCallee => true,
+        LoadCallee | LoadNewTarget => true,
         // Block envs: a carrier slot is touched by these ops only (never modeled in SSA, see
         // `build::op_slots`), so its memory is authoritative. `InEnv` runs together with the
         // closure-creating op after it (see `build`).
