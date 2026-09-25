@@ -57,6 +57,9 @@ pub(super) struct DSite {
     pub reflect: bool,
     /// The callee's rest parameter slot (seeded with the surplus arguments).
     pub rest: Option<u16>,
+    /// The callee's virtual `arguments` / rest object: its slot, seeded with the element
+    /// count past the base (see `Chunk::virt_base`; the site passes at most `n_params`).
+    pub virt: Option<(u16, u16)>,
     pub n_slots: usize,
     pub n_params: usize,
     /// A recursive call of the code being compiled.
@@ -389,7 +392,8 @@ fn accessor_dsite(p: &mut Plan, interp: &Interp, chunk: &Chunk, f: &Value, nargs
     let cc_rc = ic.chunk.clone();
     let cc: &Chunk = &cc_rc;
     if cc.activation_layout.is_some()
-        || cc.arguments_slot.is_some()
+        || (cc.arguments_slot.is_some() && cc.virt_base.is_none())
+        || (cc.virt_base.is_some() && nargs > cc.n_params)
         || cc.derived
         || cc.n_slots > MAX_DIRECT_SLOTS
         || cc.var_force_resets.iter().any(|&s| (s as usize) < cc.n_params.min(nargs))
@@ -416,7 +420,8 @@ fn accessor_dsite(p: &mut Plan, interp: &Interp, chunk: &Chunk, f: &Value, nargs
         arrow: ic.arrow,
         uses_this: cc.uses_this(),
         reflect: cc.reflect_args,
-        rest: cc.rest_slot,
+        rest: cc.rest_slot.filter(|_| cc.virt_base.is_none()),
+        virt: virt_site(cc),
         n_slots: cc.n_slots,
         n_params: cc.n_params,
         self_call: false,
@@ -687,7 +692,9 @@ pub(super) fn plan_direct(
         let callee_weak = callee.as_obj().map(crate::value::Gc::downgrade);
         let cc: &Chunk = &cc_rc;
         if cc.activation_layout.is_some()
-            || cc.arguments_slot.is_some()
+            || (cc.arguments_slot.is_some() && cc.virt_base.is_none())
+            || (cc.virt_base.is_some()
+                && (nargs > cc.n_params || matches!(adaptor, Adaptor::Apply(..))))
             || cc.derived
             || cc.n_slots > MAX_DIRECT_SLOTS
             || (!strict && cc.uses_this() && wt == 0 && !construct && adaptor != Adaptor::Bound)
@@ -732,7 +739,8 @@ pub(super) fn plan_direct(
             arrow,
             uses_this: cc.uses_this(),
             reflect: cc.reflect_args,
-            rest: cc.rest_slot,
+            rest: cc.rest_slot.filter(|_| cc.virt_base.is_none()),
+            virt: virt_site(cc),
             n_slots: cc.n_slots,
             n_params: cc.n_params,
             self_call,
@@ -750,6 +758,7 @@ pub(super) fn plan_direct(
         if site.tail
             && self_call
             && site.rest.is_none()
+            && site.virt.is_none()
             && !site.reflect
             && !site.uses_this
             && adaptor == Adaptor::None
@@ -1800,6 +1809,14 @@ impl Tr<'_, '_> {
             let nv = self.i32c(site.n_params as i64);
             self.call(Helper::ApplySeed, &[lp, slots_p, nv]);
         }
+        if let Some((s, base)) = site.virt {
+            let n = nargs.saturating_sub(base as usize) as f64;
+            let off = s as i32 * VALUE_SIZE;
+            let t = self.i32c(TAG_NUM as i64);
+            self.fb.store(MemKind::I32U8, slots_p, t, off);
+            let x = self.fb.f64const(n);
+            self.fb.store(MemKind::F64, slots_p, x, off + VALUE_PAYLOAD);
+        }
         match site.rest {
             Some(r) => {
                 let extra = nargs.saturating_sub(site.n_params);
@@ -2015,4 +2032,10 @@ fn global_name(interp: &Interp, chunk: &Chunk, pp: usize, op: Op, p: &mut Plan) 
     p.dglobal
         .insert(pp, (gp, (ic.binding >> 32) as u32, ic.binding as u32));
     p.boxes.push(Box::new(interp.global.clone()));
+}
+
+/// [`DSite::virt`] of callee chunk `cc`.
+fn virt_site(cc: &Chunk) -> Option<(u16, u16)> {
+    let base = cc.virt_base?;
+    Some((cc.arguments_slot.or(cc.rest_slot)?, base))
 }

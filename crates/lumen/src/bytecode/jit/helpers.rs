@@ -588,6 +588,8 @@ pub(crate) fn generic_ok(op: &Op) -> bool {
         | MakeRegExp(..) | MakeArray(_) | MakeObject(..) | Throw => true,
         // Slot readers/writers, control flow, and handler bookkeeping.
         LoadLocal(_)
+        | ArgsLen(..)
+        | ArgsGet(..)
         | StoreLocal(_)
         | UpdateLocal(..)
         | Tdz(_)
@@ -675,6 +677,8 @@ pub(crate) fn generic_slot_ok(op: &Op) -> bool {
             | ToPropKeyLocal(_)
             | IterCloseL(_)
             | IterRestL(..)
+            | ArgsLen(..)
+            | ArgsGet(..)
     )
 }
 
@@ -1394,8 +1398,10 @@ unsafe fn call_native(
         None => c.env.clone(),
     };
     let args_obj = match chunk.arguments_slot {
-        Some(_) => Some(i.make_compiled_arguments_object(arg_slice, &env)),
-        None => None,
+        Some(_) if chunk.virt_base.is_none() => {
+            Some(i.make_compiled_arguments_object(arg_slice, &env))
+        }
+        _ => None,
     };
     let n = chunk.n_slots;
     let mut store = [const { std::mem::MaybeUninit::<Value>::uninit() }; NATIVE_SLOTS];

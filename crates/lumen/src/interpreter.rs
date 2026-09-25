@@ -5641,6 +5641,18 @@ impl Interp {
         scope: &Env,
         fn_obj: &Gc,
     ) -> Gc {
+        self.make_arguments_object_in(func, args, Some(scope), fn_obj)
+    }
+
+    /// [`Interp::make_arguments_object`]; `scope: None` maps no index (a sloppy one still
+    /// carries `callee`).
+    fn make_arguments_object_in(
+        &mut self,
+        func: &Rc<Function>,
+        args: &[Value],
+        scope: Option<&Env>,
+        fn_obj: &Gc,
+    ) -> Gc {
         let ao = Object::new(Some(self.object_proto.clone()));
         ao.borrow_mut().exotic = crate::value::Exotic::Arguments;
         for (idx, v) in args.iter().enumerate() {
@@ -5709,6 +5721,7 @@ impl Interp {
                     }
                 }
             }
+            let Some(scope) = scope else { return ao };
             if names.iter().any(Option::is_some) {
                 self.gc_pin(&ao);
                 self.mapped_arguments
@@ -5732,6 +5745,21 @@ impl Interp {
             _ => unreachable!("compiled arguments object belongs to a user function"),
         };
         self.make_arguments_object(&func, args, scope, &fn_obj)
+    }
+
+    /// [`Interp::make_compiled_arguments_object`] with no index mapped: a virtual `arguments`
+    /// materialized (see `Chunk::virt_base`), whose parameters are never written.
+    pub(crate) fn make_compiled_arguments_unaliased(&mut self, args: &[Value]) -> Gc {
+        let fn_obj = self
+            .fn_frames
+            .last()
+            .expect("compiled arguments object requires an active function frame")
+            .callee();
+        let func = match &fn_obj.borrow().call {
+            Callable::User(user) => user.func.clone(),
+            _ => unreachable!("compiled arguments object belongs to a user function"),
+        };
+        self.make_arguments_object_in(&func, args, None, &fn_obj)
     }
 
     /// OrdinaryCallBindThis for a compiled body, computed only when the body reads `this`. A
