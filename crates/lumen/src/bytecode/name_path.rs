@@ -61,6 +61,58 @@ pub(super) struct NamePath {
 }
 
 impl NamePath {
+    /// The scope the path ends in, when every guard on the way still holds.
+    fn resolve(&self, env: &Env) -> Option<*const RefCell<Scope>> {
+        let mut pointer = Rc::as_ptr(env);
+        for (index, guard) in self.guards.iter().enumerate() {
+            let scope = unsafe { &*pointer }.try_borrow().ok()?;
+            if !guard.matches(pointer, &scope) {
+                return None;
+            }
+            if index + 1 == self.guards.len() {
+                return Some(pointer);
+            }
+            pointer = Rc::as_ptr(scope.parent.as_ref()?);
+        }
+        None
+    }
+
+    /// The binding a scope-holder path resolves to, when it is initialized, no import, and (for
+    /// `write`) mutable. Its address is stable until JS runs (only JS restructures a scope).
+    fn binding_ptr(&self, env: &Env, write: bool) -> Option<*mut Binding> {
+        let pointer = self.resolve(env)?;
+        let b: *mut Binding = match &self.holder {
+            Holder::Binding(p) => *p as *mut Binding,
+            Holder::Slot(slot) => {
+                let mut scope = unsafe { &*pointer }.try_borrow_mut().ok()?;
+                let layout = scope.vars.template_layout()?.clone();
+                scope.vars.layout_binding_mut(&layout, *slot)? as *mut Binding
+            }
+            Holder::Global { .. } => return None,
+        };
+        let bd = unsafe { &*b };
+        (bd.initialized && bd.import_ref.is_none() && (!write || bd.mutable)).then_some(b)
+    }
+
+    /// The global object's entry slot a global-holder path resolves to, while it is a data
+    /// property at the recorded shape.
+    fn global_slot(&self, interp: &Interp, env: &Env) -> Option<usize> {
+        let Holder::Global {
+            object,
+            shape,
+            slot,
+        } = &self.holder
+        else {
+            return None;
+        };
+        let pointer = self.resolve(env)?;
+        if pointer != Rc::as_ptr(&interp.global_env) || object.as_ptr() != Gc::as_ptr(&interp.global) {
+            return None;
+        }
+        global_value(interp, &interp.global, *shape, *slot)?;
+        Some(*slot)
+    }
+
     fn read(&self, interp: &Interp, env: &Env) -> Option<Value> {
         // The caller's strong env handle owns the entire parent chain. No JS, GC or scope
         // mutation occurs during this walk, so borrowed pointers avoid per-hop Rc churn.
@@ -160,7 +212,77 @@ fn global_value(interp: &Interp, object: &Gc, shape: u32, slot: usize) -> Option
     (!property.accessor()).then(|| property.value())
 }
 
+/// Write `value` to the global object's entry `slot` when it is a writable data property of an
+/// ordinary global; `Err(value)` otherwise.
+pub(super) fn global_store(interp: &Interp, slot: usize, value: Value) -> Result<(), Value> {
+    if !interp.ordinary_get_ptr(Gc::as_ptr(&interp.global) as usize) {
+        return Err(value);
+    }
+    let Ok(mut g) = interp.global.try_borrow_mut() else {
+        return Err(value);
+    };
+    if !matches!(g.exotic, Exotic::None) {
+        return Err(value);
+    }
+    match g.props.entry_at_mut(slot) {
+        Some(p) if !p.accessor() && p.writable() => {
+            p.set_value(value);
+            Ok(())
+        }
+        _ => Err(value),
+    }
+}
+
 impl Chunk {
+    /// A cached free-name write through the guarded path (see [`Chunk::name_path_hit`]);
+    /// `Err(value)` when the path does not prove a plain writable target.
+    pub(super) fn name_path_store(
+        &self,
+        interp: &Interp,
+        env: &Env,
+        cache: u32,
+        value: Value,
+    ) -> Result<(), Value> {
+        let paths = self.name_paths[cache as usize].borrow();
+        let Some(path) = paths.as_ref() else {
+            return Err(value);
+        };
+        if let Some(b) = path.binding_ptr(env, true) {
+            drop(paths);
+            // SAFETY: the path's guards prove the binding live and unmoved.
+            unsafe { (*b).value = value };
+            return Ok(());
+        }
+        match path.global_slot(interp, env) {
+            Some(slot) => {
+                drop(paths);
+                global_store(interp, slot, value)
+            }
+            None => Err(value),
+        }
+    }
+
+    /// [`NamePath::binding_ptr`] of cache `cache`'s path.
+    pub(crate) fn name_path_binding(
+        &self,
+        env: &Env,
+        cache: u32,
+        write: bool,
+    ) -> Option<*mut Binding> {
+        self.name_paths.get(cache as usize)?.borrow().as_ref()?.binding_ptr(env, write)
+    }
+
+    /// [`NamePath::global_slot`] of cache `cache`'s path.
+    pub(crate) fn name_path_global(&self, interp: &Interp, env: &Env, cache: u32) -> Option<usize> {
+        self.name_paths.get(cache as usize)?.borrow().as_ref()?.global_slot(interp, env)
+    }
+
+    /// Whether cache `cache` holds a path, and whether it ends at the global object.
+    pub(crate) fn name_path_kind(&self, cache: u32) -> Option<bool> {
+        let paths = self.name_paths.get(cache as usize)?.borrow();
+        Some(matches!(paths.as_ref()?.holder, Holder::Global { .. }))
+    }
+
     pub(super) fn name_path_hit(&self, interp: &Interp, env: &Env, cache: u32) -> Option<Value> {
         self.name_paths[cache as usize]
             .borrow()

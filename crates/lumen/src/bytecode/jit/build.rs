@@ -903,6 +903,11 @@ enum Src {
     Name(u32),
     /// Captured binding `names[n]` in the activation env: valid until JS runs.
     Cap(u32),
+    /// [`Src::Name`] proven mutable (a store target): valid until JS runs.
+    NameW(u32),
+    /// The global object's data property free name `names[n]` resolves to (a `Property`
+    /// address, never a `Ref`): valid until JS runs.
+    Glob(u32),
     /// `frame.this_val`: valid for the whole region.
     This,
     /// A callee `Value` the code itself keeps alive (a direct call site's resolved callee, see
@@ -913,7 +918,7 @@ enum Src {
 impl Src {
     /// Whether JS running elsewhere can change or move the value.
     fn in_env(self) -> bool {
-        matches!(self, Src::Name(_) | Src::Cap(_))
+        matches!(self, Src::Name(_) | Src::Cap(_) | Src::NameW(_) | Src::Glob(_))
     }
 }
 
@@ -922,6 +927,14 @@ impl Src {
 struct Plan {
     /// `LoadName` sites translated as a borrowed binding address.
     name_ref: HashSet<usize>,
+    /// `LoadName` sites read inline from a global object property ([`Src::Glob`]).
+    glob_ref: HashSet<usize>,
+    /// The `glob_ref` sites whose property held a Number at translation: read as one (any
+    /// other value exits).
+    glob_num: HashSet<usize>,
+    /// `StoreNameCached` sites stored inline: to a binding ([`Src::NameW`]) or a global object
+    /// property ([`Src::Glob`]).
+    name_store: HashMap<usize, Src>,
     /// Name / capture addresses cached in region variables.
     ptr_srcs: Vec<Src>,
     /// Arrays whose element storage view is tracked (bounds-check elimination).
@@ -1010,13 +1023,7 @@ struct FastSite {
 /// Whether name cache `c` currently resolves through a scope binding (the modes
 /// [`Helper::NamePtr`] can return an address for).
 fn name_scope_mode(chunk: &Chunk, c: u32) -> bool {
-    chunk
-        .name_caches
-        .get(c as usize)
-        .is_some_and(|ic| {
-            let ic = ic.get();
-            ic.env != 0 && ic.env & 1 == 0
-        })
+    chunk.name_site_kind(c) == Some(false)
 }
 
 fn plan(
@@ -1228,7 +1235,27 @@ fn plan(
                 } else if name_scope_mode(chunk, c) {
                     p.name_ref.insert(pc);
                     add_ptr(&mut p, Src::Name(n));
+                } else if chunk.name_site_kind(c) == Some(true) {
+                    p.glob_ref.insert(pc);
+                    add_ptr(&mut p, Src::Glob(n));
+                    let num = chunk.name_global_slot(interp, env, c).is_some_and(|s| {
+                        interp.global.try_borrow().is_ok_and(|g| {
+                            g.props.entry_at(s).is_some_and(|e| matches!(e.value(), Value::Num(_)))
+                        })
+                    });
+                    if num {
+                        p.glob_num.insert(pc);
+                    }
                 }
+            }
+            Op::StoreNameCached(n, c) => {
+                let src = match chunk.name_site_kind(c) {
+                    Some(false) => Src::NameW(n),
+                    Some(true) => Src::Glob(n),
+                    None => continue,
+                };
+                p.name_store.insert(pc, src);
+                add_ptr(&mut p, src);
             }
             Op::LoadCap(n) | Op::UpdateCap(n, _) | Op::StoreCap(n) => {
                 add_ptr(&mut p, Src::Cap(n));
@@ -3022,37 +3049,72 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.ptr_or_exit(p, pc);
                 self.stack.push(Entry::Ref(p, Src::Name(n)));
             }
+            Op::LoadName(n, c) if self.plan.glob_num.contains(&pc) => {
+                let p = self.src_ptr(Src::Glob(n), Some(c));
+                self.ptr_or_exit(p, pc);
+                let miss = self.fb.create_block();
+                let bits = layout::entry_word(&mut self.fb, p, 0, miss);
+                let f = layout::word_num(&mut self.fb, bits, miss);
+                let cont = self.fb.create_block();
+                self.fb.jump(cont, &[]);
+                self.fb.seal_block(miss);
+                self.fb.switch_to_block(miss);
+                self.exit_now(pc);
+                self.fb.seal_block(cont);
+                self.fb.switch_to_block(cont);
+                self.stack.push(Entry::Num(f));
+            }
+            Op::LoadName(n, c) if self.plan.glob_ref.contains(&pc) => {
+                // The property's value word, copied (or retained) straight into the entry.
+                let p = self.src_ptr(Src::Glob(n), Some(c));
+                let slow = self.fb.create_block();
+                let join = self.fb.create_block();
+                let z = self.ptrc(0);
+                let nonnull = self.fb.icmp(IntCC::Ne, p, z);
+                let ok = self.fb.create_block();
+                self.fb.brif(nonnull, ok, &[], slow, &[]);
+                self.fb.seal_block(ok);
+                self.fb.switch_to_block(ok);
+                let bits = layout::entry_word(&mut self.fb, p, 0, slow);
+                let (tag, payload, is_ref) = layout::word_value(&mut self.fb, bits, slow);
+                let dst = self.sptr(d);
+                let refb = self.fb.create_block();
+                let plain = self.fb.create_block();
+                self.fb.brif(is_ref, refb, &[], plain, &[]);
+                self.fb.seal_block(refb);
+                self.fb.seal_block(plain);
+                self.fb.switch_to_block(refb);
+                let zero = self.i32c(0);
+                self.call(Helper::UnpackClone, &[dst, bits, zero]);
+                self.fb.jump(join, &[]);
+                self.fb.switch_to_block(plain);
+                self.fb.store(MemKind::I32U8, dst, tag, 0);
+                let byte = self.fb.convert(ConvOp::Wrap, Type::I32, payload);
+                self.fb.store(MemKind::I32U8, dst, byte, VALUE_BOOL);
+                self.fb.store(MemKind::I64, dst, payload, VALUE_PAYLOAD);
+                self.fb.jump(join, &[]);
+                self.fb.seal_block(slow);
+                self.fb.switch_to_block(slow);
+                self.load_name_helper(pc, n, c, Helper::LoadName);
+                self.fb.jump(join, &[]);
+                self.fb.seal_block(join);
+                self.fb.switch_to_block(join);
+                self.stack.push(Entry::Boxed);
+            }
             Op::LoadName(n, c) | Op::LoadNameForCall(n, c) => {
                 let h = if matches!(op, Op::LoadName(..)) {
                     Helper::LoadName
                 } else {
                     Helper::LoadNameForCall
                 };
-                let (nv, cv, dst) = (self.i32c(n as i64), self.i32c(c as i64), self.sptr(d));
-                if h == Helper::LoadNameForCall {
-                    self.soff(d + 1);
-                }
-                let st = self.call_status(h, &[self.frame, nv, cv, dst]);
-                let snap = self.stack.clone();
-                let one = self.i32c(STATUS_THROW as i64);
-                let threw = self.fb.icmp(IntCC::Eq, st, one);
-                self.exit_if(threw, pc, EXIT_THROW, &snap, d);
-                // The full lookup may have run a getter: caches are stale then.
-                let slow = self.i32c(helpers::STATUS_OK_SLOW as i64);
-                let ran = self.fb.icmp(IntCC::Eq, st, slow);
-                let inv = self.fb.create_block();
-                let cont = self.fb.create_block();
-                self.fb.brif(ran, inv, &[], cont, &[]);
-                self.fb.seal_block(inv);
-                self.fb.switch_to_block(inv);
-                self.invalidate_js();
-                self.fb.jump(cont, &[]);
-                self.fb.seal_block(cont);
-                self.fb.switch_to_block(cont);
+                self.load_name_helper(pc, n, c, h);
                 self.stack.push(Entry::Boxed);
                 if h == Helper::LoadNameForCall {
                     self.stack.push(Entry::Boxed);
                 }
+            }
+            Op::StoreNameCached(n, c) if self.plan.name_store.contains_key(&pc) => {
+                self.store_name_inline(pc, n, c, self.plan.name_store[&pc]);
             }
             Op::StoreNameCached(n, c) => {
                 self.store_entry(d - 1, self.stack[d - 1]);
@@ -3762,6 +3824,16 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.call(Helper::CapPtr, &[self.frame, nv])
                     .expect("CapPtr returns an address")
             }
+            Src::NameW(n) | Src::Glob(n) => {
+                let h = if matches!(src, Src::Glob(_)) {
+                    Helper::GlobPtr
+                } else {
+                    Helper::NamePtrW
+                };
+                let nv = self.i32c(n as i64);
+                let cv = self.i32c(cache.unwrap_or(u32::MAX) as i64);
+                self.call(h, &[self.frame, nv, cv]).expect("returns an address")
+            }
             Src::Slot(s) => self.slot_ptr(s as usize),
             Src::This => self.fb.load(PTR_MEM, self.frame, FRAME_THIS),
             Src::Pin => {
@@ -3769,6 +3841,110 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.ptrc(0)
             }
         }
+    }
+
+    /// `LoadName(n, c)` / `LoadNameForCall(n, c)` through helper `h` into the entries at the
+    /// stack top (not pushed).
+    fn load_name_helper(&mut self, pc: usize, n: u32, c: u32, h: Helper) {
+        let d = self.stack.len();
+        let (nv, cv, dst) = (self.i32c(n as i64), self.i32c(c as i64), self.sptr(d));
+        if h == Helper::LoadNameForCall {
+            self.soff(d + 1);
+        }
+        let st = self.call_status(h, &[self.frame, nv, cv, dst]);
+        let snap = self.stack.clone();
+        let one = self.i32c(STATUS_THROW as i64);
+        let threw = self.fb.icmp(IntCC::Eq, st, one);
+        self.exit_if(threw, pc, EXIT_THROW, &snap, d);
+        // The full lookup may have run a getter: caches are stale then.
+        let slow = self.i32c(helpers::STATUS_OK_SLOW as i64);
+        let ran = self.fb.icmp(IntCC::Eq, st, slow);
+        let inv = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(ran, inv, &[], cont, &[]);
+        self.fb.seal_block(inv);
+        self.fb.switch_to_block(inv);
+        self.invalidate_js();
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+    }
+
+    /// `StoreNameCached(n, c)` in place: into a mutable binding holding a trivially droppable
+    /// value ([`Src::NameW`]), or a Number / Boolean into a writable global data property
+    /// holding one ([`Src::Glob`]); else [`Helper::StoreName`].
+    fn store_name_inline(&mut self, pc: usize, n: u32, c: u32, src: Src) {
+        let d = self.stack.len();
+        let e = self.stack[d - 1];
+        let glob = matches!(src, Src::Glob(_));
+        let fast = !glob || matches!(e, Entry::Num(_) | Entry::Bool(_));
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        if fast {
+            let p = self.src_ptr(src, Some(c));
+            let z = self.ptrc(0);
+            let nonnull = self.fb.icmp(IntCC::Ne, p, z);
+            let ok1 = self.fb.create_block();
+            self.fb.brif(nonnull, ok1, &[], slow, &[]);
+            self.fb.seal_block(ok1);
+            self.fb.switch_to_block(ok1);
+            if glob {
+                layout::entry_writable(&mut self.fb, p, 0, slow);
+                let w = match e {
+                    Entry::Num(x) => layout::num_word(&mut self.fb, x),
+                    Entry::Bool(b) => layout::bool_word(&mut self.fb, b),
+                    _ => unreachable!(),
+                };
+                layout::entry_store(&mut self.fb, p, 0, w);
+            } else {
+                let tag = self.fb.load(MemKind::I32U8, p, 0);
+                let four = self.i32c(TAG_NUM as i64);
+                let trivial = self.fb.icmp(IntCC::Ule, tag, four);
+                let ok2 = self.fb.create_block();
+                self.fb.brif(trivial, ok2, &[], slow, &[]);
+                self.fb.seal_block(ok2);
+                self.fb.switch_to_block(ok2);
+                match e {
+                    Entry::Num(x) => {
+                        let t = self.i32c(TAG_NUM as i64);
+                        self.fb.store(MemKind::I32U8, p, t, 0);
+                        self.fb.store(MemKind::F64, p, x, VALUE_PAYLOAD);
+                    }
+                    Entry::Bool(b) => {
+                        let t = self.i32c(TAG_BOOL as i64);
+                        self.fb.store(MemKind::I32U8, p, t, 0);
+                        self.fb.store(MemKind::I32U8, p, b, VALUE_BOOL);
+                    }
+                    _ => {
+                        // Move the owned value in bitwise; its old home becomes trivially
+                        // droppable.
+                        self.store_entry(d - 1, e);
+                        let o = self.soff(d - 1);
+                        let a = self.fb.load(MemKind::I64, self.stackp, o);
+                        let b = self.fb.load(MemKind::I64, self.stackp, o + 8);
+                        self.fb.store(MemKind::I64, p, a, 0);
+                        self.fb.store(MemKind::I64, p, b, 8);
+                        self.set_stack_tag(d - 1, TAG_UNDEFINED);
+                    }
+                }
+            }
+            self.fb.jump(join, &[]);
+        } else {
+            self.fb.jump(slow, &[]);
+        }
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        self.store_entry(d - 1, e);
+        let (nv, cv, sp) = (self.i32c(n as i64), self.i32c(c as i64), self.sptr(d - 1));
+        let st = self.call_js(Helper::StoreName, &[self.frame, nv, cv, sp]);
+        let below = self.stack[..d - 1].to_vec();
+        self.throw_if(st, pc, &below, d - 1);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.invalidate_src(Src::Name(n));
+        self.invalidate_src(src);
+        self.stack.pop();
     }
 
     /// Exit before the op at `pc` when `p` is null (the interpreter does the full lookup).

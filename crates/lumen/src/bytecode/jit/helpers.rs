@@ -67,6 +67,13 @@ pub(crate) enum Helper {
     /// Pure: never runs JS, never throws. The address stays valid until JS runs (only JS
     /// restructures a scope or reassigns a binding).
     NamePtr,
+    /// `(frame, n: u32, c: u32) -> *mut Value` — [`Helper::NamePtr`] for a write: also null
+    /// for an immutable binding.
+    NamePtrW,
+    /// `(frame, n: u32, c: u32) -> *mut Property` — the global object's data property the free
+    /// name `names[n]` (name cache `c`) resolves to (filling the cache first on a miss); null
+    /// otherwise. Pure; the address stays valid until JS runs (only JS reshapes the global).
+    GlobPtr,
     /// `(frame, n: u32) -> *mut Value` — the address of captured binding `names[n]`'s value in
     /// the activation env, or null while it is in its TDZ. Pure, like [`Helper::NamePtr`].
     CapPtr,
@@ -251,7 +258,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 62] = [
+pub(crate) const ALL: [Helper; 64] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -262,6 +269,8 @@ pub(crate) const ALL: [Helper; 62] = [
     Helper::Generic,
     Helper::Safepoint,
     Helper::NamePtr,
+    Helper::NamePtrW,
+    Helper::GlobPtr,
     Helper::CapPtr,
     Helper::LoadName,
     Helper::LoadNameForCall,
@@ -330,7 +339,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::ToBoolean => (&[P, P], &[I32]),
         Helper::Generic => (&[P, I32, I32, I32], &[I32]),
         Helper::Safepoint => (&[P], &[I32]),
-        Helper::NamePtr => (&[P, I32, I32], &[P]),
+        Helper::NamePtr | Helper::NamePtrW | Helper::GlobPtr => (&[P, I32, I32], &[P]),
         Helper::CapPtr => (&[P, I32], &[P]),
         Helper::LoadName | Helper::LoadNameForCall => (&[P, I32, I32, P], &[I32]),
         Helper::StoreName => (&[P, I32, I32, P], &[I32]),
@@ -399,6 +408,8 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::Generic => generic as *const () as usize,
         Helper::Safepoint => safepoint as *const () as usize,
         Helper::NamePtr => name_ptr as *const () as usize,
+        Helper::NamePtrW => name_ptr_w as *const () as usize,
+        Helper::GlobPtr => glob_ptr as *const () as usize,
         Helper::CapPtr => cap_ptr as *const () as usize,
         Helper::LoadName => load_name as *const () as usize,
         Helper::LoadNameForCall => load_name_for_call as *const () as usize,
@@ -916,9 +927,55 @@ pub(crate) unsafe extern "C" fn name_ptr(f: *mut JitFrame, n: u32, c: u32) -> *c
             b = name_binding(chunk, env, c as usize);
         }
     }
+    let b = b.or_else(|| chunk.name_path_binding(env, c, false));
     match b {
         Some(bd) if (*bd).initialized && (*bd).import_ref.is_none() => &(*bd).value,
         _ => std::ptr::null(),
+    }
+}
+
+pub(crate) unsafe extern "C" fn name_ptr_w(f: *mut JitFrame, n: u32, c: u32) -> *mut Value {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    if c as usize >= chunk.name_caches.len() || n as usize >= chunk.names.len() {
+        return std::ptr::null_mut();
+    }
+    let b = name_binding(chunk, env, c as usize).or_else(|| chunk.name_path_binding(env, c, true));
+    match b {
+        Some(bd) if (*bd).initialized && (*bd).mutable && (*bd).import_ref.is_none() => {
+            &mut (*bd).value
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+pub(crate) unsafe extern "C" fn glob_ptr(
+    f: *mut JitFrame,
+    n: u32,
+    c: u32,
+) -> *mut crate::value::Property {
+    let chunk = &*(*f).chunk;
+    let env = &*(*f).env;
+    let i = &*(*f).interp;
+    if c as usize >= chunk.name_caches.len() || n as usize >= chunk.names.len() {
+        return std::ptr::null_mut();
+    }
+    let mut slot = chunk.name_global_slot(i, env, c);
+    if slot.is_none() && chunk.name_ic_fill(i, env, n, c).is_some() {
+        slot = chunk.name_global_slot(i, env, c);
+    }
+    let Some(slot) = slot else {
+        return std::ptr::null_mut();
+    };
+    if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
+        return std::ptr::null_mut();
+    }
+    let Ok(mut g) = i.global.try_borrow_mut() else {
+        return std::ptr::null_mut();
+    };
+    match g.props.entry_at_mut(slot) {
+        Some(p) if !p.accessor() => p,
+        _ => std::ptr::null_mut(),
     }
 }
 
