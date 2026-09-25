@@ -409,7 +409,7 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
     - Also: shorten the inline-cache guard chain of dependent loads for a repeated receiver, and avoid byte-store/word-load store-forwarding stalls in the emitted code.
     - Evidence: `b.v.x -= c` takes 21 ns vs 1.2 ns, and `const v = b.v` 12 ns vs 0.75 ns. Nearly all of nbody's time is inside JIT code.
 
-18. **Method calls on primitive strings (M).** *(Added during item 11.)*
+18. ✅ **Method calls on primitive strings (M).** *(Added during item 11. Partly done.)*
     - Finding: any non-intrinsic String.prototype method costs 115–150 ns per call from JIT code (node: 11–20 ns). Examples: `at` 115 ns, `startsWith` 131 ns, `indexOf` 151 ns.
     - The time is spread across four steps:
       - the `GetMethod` helper resolving through the String.prototype IC;
@@ -417,6 +417,22 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       - `this_string`;
       - the arguments' ToString.
     - What: extend the `strm` plan (today only `charCodeAt`) to call any String.prototype builtin's native entry directly. Guard the receiver's type and the prototype's method identity at the `GetMethod`, and pass `this` and the arguments without the generic call frame.
+    - Built:
+      - Fused sites (`strn` plan): `<recv>.m(args)` where `m` is a native `String.prototype` method and the arguments are pure loads or Number arithmetic. The `GetMethod` only checks that the receiver is a String; a non-String receiver exits once and the next compile leaves the site to the generic path.
+      - At the call, one helper (`str_method`) reads the method, calls the native directly, and writes the result. The read uses a String.prototype slot cached by shape; the value is re-checked on every call. Because the arguments cannot run JS, reading the method after them is unobservable. A patched or getter method takes the ordinary `GetMethod` + call steps.
+      - Shared fast paths (`builtins::str_fast`) for `at`, `charAt`, `startsWith`, `endsWith`, `includes`, `indexOf`, `slice`, `trim*` and ASCII `toUpperCase`/`toLowerCase`. They apply when the receiver is ASCII and the arguments are Strings and Numbers, so nothing can run JS or throw. The natives use them too, and the JIT helper calls them without the native-call bookkeeping. A short needle is searched with a plain scan.
+    - Release, per call in a JIT loop:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | `at` | 105 ns | 55 ns | 11 ns |
+      | `startsWith` | 107 ns | 46 ns | 7 ns |
+      | `indexOf` | 138 ns | 67 ns | 1 ns |
+      | `slice` | 127 ns | 62 ns | 10 ns |
+      | `charAt` | 109 ns | 53 ns | 4 ns |
+      | `toUpperCase` | 124 ns | 76 ns | 1 ns |
+
+    - Left: about 22 ns is the floor of any helper call from a JIT loop (boxing, `call_js` invalidation, the status check). Closing the rest needs these methods inline in the emitted code, as `charCodeAt` is, or node-style hoisting of loop-invariant calls.
 
 ## Open items
 

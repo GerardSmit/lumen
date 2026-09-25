@@ -7521,6 +7521,9 @@ pub(crate) fn nf_char_at(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::CharAt, &this, args) {
+        return Ok(v);
+    }
     let s = this_string(i, &this)?;
     let n = ab(i.to_number(&arg(args, 0)))?;
     let idx = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -7530,6 +7533,361 @@ pub(crate) fn nf_char_at(
     Ok(match i.unit_at(&s, idx as usize) {
         Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
         None => Value::str(""),
+    })
+}
+
+/// `String.prototype.indexOf`.
+pub(crate) fn nf_str_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::IndexOf, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    let needle = ab(i.to_string(&arg(args, 0)))?;
+    if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
+        // Byte index == unit index; a non-ASCII needle simply can't occur.
+        let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?.min(s.len());
+        let r = s[pos..].find(&*needle).map(|k| (pos + k) as f64);
+        return Ok(Value::Num(r.unwrap_or(-1.0)));
+    }
+    let chars = i.units_full(&s);
+    let nchars = i.units_full(&needle);
+    let len = chars.len() as i64;
+    let pos = str_clamp_pos(i, args.get(1), len)?;
+    let nlen = nchars.len();
+    let result = (pos..=chars.len())
+        .find(|&start| start + nlen <= chars.len() && chars[start..start + nlen] == nchars[..]);
+    Ok(Value::Num(result.map(|r| r as f64).unwrap_or(-1.0)))
+}
+
+/// `String.prototype.includes`.
+pub(crate) fn nf_str_includes(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::Includes, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    if arg_is_regexp(i, &arg(args, 0))? {
+        return Err(i.make_error("TypeError", "argument must not be a regular expression"));
+    }
+    let needle = ab(i.to_string(&arg(args, 0)))?;
+    if s.ascii_hint() {
+        let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
+        return Ok(Value::Bool(needle.is_ascii() && s[pos..].contains(&*needle)));
+    }
+    let chars = i.units_full(&s);
+    let len = chars.len() as i64;
+    let pos = str_clamp_pos(i, args.get(1), len)?;
+    let nchars = i.units_full(&needle);
+    let found = (pos..=chars.len())
+        .any(|k| k + nchars.len() <= chars.len() && chars[k..k + nchars.len()] == nchars[..]);
+    Ok(Value::Bool(found))
+}
+
+/// `String.prototype.startsWith`.
+pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::StartsWith, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    if arg_is_regexp(i, &arg(args, 0))? {
+        return Err(i.make_error("TypeError", "argument must not be a regular expression"));
+    }
+    let needle = ab(i.to_string(&arg(args, 0)))?;
+    if s.ascii_hint() {
+        let pos = match args.get(1) {
+            None | Some(Value::Undefined) => 0,
+            v => str_clamp_pos(i, v, s.len() as i64)?,
+        };
+        return Ok(Value::Bool(s.as_bytes()[pos..].starts_with(needle.as_bytes())));
+    }
+    let chars = i.units_full(&s);
+    let len = chars.len() as i64;
+    let pos = str_clamp_pos(i, args.get(1), len)?;
+    let nchars = i.units_full(&needle);
+    Ok(Value::Bool(
+        pos + nchars.len() <= chars.len() && chars[pos..pos + nchars.len()] == nchars[..],
+    ))
+}
+
+/// `String.prototype.endsWith`.
+pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::EndsWith, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    if arg_is_regexp(i, &arg(args, 0))? {
+        return Err(i.make_error("TypeError", "argument must not be a regular expression"));
+    }
+    let needle = ab(i.to_string(&arg(args, 0)))?;
+    if s.ascii_hint() {
+        let end = match args.get(1) {
+            Some(v) if !matches!(v, Value::Undefined) => {
+                str_clamp_pos(i, Some(v), s.len() as i64)?
+            }
+            _ => s.len(),
+        };
+        return Ok(Value::Bool(s.as_bytes()[..end].ends_with(needle.as_bytes())));
+    }
+    let chars = i.units_full(&s);
+    let len = chars.len() as i64;
+    // endsWith's optional argument is the END position (default = length).
+    let end = match args.get(1) {
+        Some(v) if !matches!(v, Value::Undefined) => str_clamp_pos(i, Some(v), len)?,
+        _ => len as usize,
+    };
+    let nchars = i.units_full(&needle);
+    Ok(Value::Bool(
+        end >= nchars.len() && chars[end - nchars.len()..end] == nchars[..],
+    ))
+}
+
+/// `String.prototype.toUpperCase`.
+pub(crate) fn nf_str_to_upper_case(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::ToUpperCase, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    if s.ascii_hint() {
+        if !s.bytes().any(|b| b.is_ascii_lowercase()) {
+            return Ok(Value::Str(s));
+        }
+        return Ok(Value::from_string(s.to_ascii_uppercase()));
+    }
+    Ok(Value::from_string(s.to_uppercase()))
+}
+
+/// `String.prototype.toLowerCase`.
+pub(crate) fn nf_str_to_lower_case(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::ToLowerCase, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    if s.ascii_hint() {
+        if !s.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Ok(Value::Str(s));
+        }
+        return Ok(Value::from_string(s.to_ascii_lowercase()));
+    }
+    Ok(Value::from_string(s.to_lowercase()))
+}
+
+/// `String.prototype.trim`.
+pub(crate) fn nf_str_trim(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::Trim, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    Ok(trimmed(&s, true, true))
+}
+
+/// `String.prototype.at`.
+pub(crate) fn nf_str_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::At, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    if s.ascii_hint() {
+        let len = s.len() as i64;
+        let n = ab(i.to_number(&arg(args, 0)))?;
+        let mut idx = if n.is_nan() { 0 } else { n.trunc().clamp(-1e18, 1e18) as i64 };
+        if idx < 0 {
+            idx += len;
+        }
+        return Ok(if idx < 0 || idx >= len {
+            Value::Undefined
+        } else {
+            Value::Str(crate::jstr::unit_lstr(s.as_bytes()[idx as usize] as u16))
+        });
+    }
+    let len = i.str_len(&s) as i64;
+    let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
+    if idx < 0 {
+        idx += len;
+    }
+    Ok(if idx < 0 || idx >= len {
+        Value::Undefined
+    } else {
+        match i.unit_at(&s, idx as usize) {
+            Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
+            None => Value::Undefined,
+        }
+    })
+}
+
+/// `String.prototype.trimStart`.
+pub(crate) fn nf_str_trim_start(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::TrimStart, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    Ok(trimmed(&s, true, false))
+}
+
+/// `String.prototype.trimEnd`.
+pub(crate) fn nf_str_trim_end(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::TrimEnd, &this, args) {
+        return Ok(v);
+    }
+    let s = this_string(i, &this)?;
+    Ok(trimmed(&s, false, true))
+}
+
+// ---- String fast paths -----------------------------------------------------------------------
+
+/// The `String.prototype` methods with a pure fast path ([`str_fast`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StrFast {
+    At,
+    CharAt,
+    StartsWith,
+    EndsWith,
+    Includes,
+    IndexOf,
+    Slice,
+    Trim,
+    TrimStart,
+    TrimEnd,
+    ToUpperCase,
+    ToLowerCase,
+}
+
+/// Which fast path, if any, native code `f` is (the optimizing tier calls [`str_fast`] for a
+/// site whose method is still the builtin, skipping the native call).
+pub(crate) fn str_fast_of(f: crate::value::NativeFn) -> Option<StrFast> {
+    let table: [(crate::value::NativeFn, StrFast); 12] = [
+        (nf_str_at, StrFast::At),
+        (nf_char_at, StrFast::CharAt),
+        (nf_str_starts_with, StrFast::StartsWith),
+        (nf_str_ends_with, StrFast::EndsWith),
+        (nf_str_includes, StrFast::Includes),
+        (nf_str_index_of, StrFast::IndexOf),
+        (nf_string_slice, StrFast::Slice),
+        (nf_str_trim, StrFast::Trim),
+        (nf_str_trim_start, StrFast::TrimStart),
+        (nf_str_trim_end, StrFast::TrimEnd),
+        (nf_str_to_upper_case, StrFast::ToUpperCase),
+        (nf_str_to_lower_case, StrFast::ToLowerCase),
+    ];
+    table.iter().find(|(g, _)| *g as usize == f as usize).map(|&(_, k)| k)
+}
+
+/// The first index of `n` in `h`: a plain scan for a short search (`str::find`'s two-way
+/// searcher costs more to set up than that takes), else that searcher.
+fn find_str(h: &str, n: &str) -> Option<usize> {
+    if n.len() > 8 || h.len() > 256 {
+        return h.find(n);
+    }
+    let (h, n) = (h.as_bytes(), n.as_bytes());
+    let Some((&first, rest)) = n.split_first() else { return Some(0) };
+    let last = h.len().checked_sub(n.len())?;
+    (0..=last).find(|&k| h[k] == first && &h[k + 1..k + n.len()] == rest)
+}
+
+fn str_fast_this(k: StrFast, this: &Value, args: &[Value]) -> Option<Value> {
+    match this {
+        Value::Str(s) => str_fast(k, s, args),
+        _ => None,
+    }
+}
+
+/// ToIntegerOrInfinity of a position argument whose conversion is pure: absent or `undefined`
+/// (NaN, so 0) or a Number. `None` for anything else (its conversion may run JS or throw).
+fn fast_int_arg(args: &[Value], k: usize) -> Option<f64> {
+    match args.get(k) {
+        None | Some(Value::Undefined) => Some(0.0),
+        Some(Value::Num(n)) if n.is_nan() => Some(0.0),
+        Some(Value::Num(n)) => Some(n.trunc()),
+        Some(_) => None,
+    }
+}
+
+/// `s.<k>(...args)` for a primitive String `s` when no argument needs a conversion that could
+/// run JS or throw (String needles, Number positions) and `s` is all-ASCII where positions are
+/// involved: exactly the method's result, with no observable step skipped. `None` defers to
+/// the full method.
+pub(crate) fn str_fast(k: StrFast, s: &crate::lstr::LStr, args: &[Value]) -> Option<Value> {
+    let len = s.len() as i64;
+    let clamp = |n: f64| n.clamp(0.0, len as f64) as usize;
+    let needle = || match args.first() {
+        Some(Value::Str(n)) => Some(n),
+        _ => None,
+    };
+    Some(match k {
+        StrFast::Trim => trimmed(s, true, true),
+        StrFast::TrimStart => trimmed(s, true, false),
+        StrFast::TrimEnd => trimmed(s, false, true),
+        _ if !s.ascii_hint() => return None,
+        StrFast::At => {
+            let n = fast_int_arg(args, 0)?;
+            let idx = if n < 0.0 { n + len as f64 } else { n };
+            if idx < 0.0 || idx >= len as f64 {
+                Value::Undefined
+            } else {
+                Value::Str(crate::jstr::unit_lstr(s.as_bytes()[idx as usize] as u16))
+            }
+        }
+        StrFast::CharAt => {
+            let n = fast_int_arg(args, 0)?;
+            if n < 0.0 || n >= len as f64 {
+                Value::str("")
+            } else {
+                Value::Str(crate::jstr::unit_lstr(s.as_bytes()[n as usize] as u16))
+            }
+        }
+        StrFast::StartsWith => {
+            let n = needle()?;
+            let pos = clamp(fast_int_arg(args, 1)?);
+            Value::Bool(s.as_bytes()[pos..].starts_with(n.as_bytes()))
+        }
+        StrFast::EndsWith => {
+            let n = needle()?;
+            let end = match args.get(1) {
+                None | Some(Value::Undefined) => s.len(),
+                Some(_) => clamp(fast_int_arg(args, 1)?),
+            };
+            Value::Bool(s.as_bytes()[..end].ends_with(n.as_bytes()))
+        }
+        StrFast::Includes => {
+            let n = needle()?;
+            let pos = clamp(fast_int_arg(args, 1)?);
+            Value::Bool(n.is_ascii() && find_str(&s[pos..], n).is_some())
+        }
+        StrFast::IndexOf => {
+            let n = needle()?;
+            let pos = clamp(fast_int_arg(args, 1)?);
+            let at = find_str(&s[pos..], n);
+            Value::Num(at.map_or(-1.0, |k| (pos + k) as f64))
+        }
+        StrFast::Slice => {
+            let start = match args.first() {
+                None | Some(Value::Undefined) => 0,
+                Some(Value::Num(n)) => norm_index(*n, len),
+                Some(_) => return None,
+            };
+            let end = match args.get(1) {
+                None | Some(Value::Undefined) => len,
+                Some(Value::Num(n)) => norm_index(*n, len),
+                Some(_) => return None,
+            };
+            if start < end {
+                Value::str(&s[start as usize..end as usize])
+            } else {
+                Value::str("")
+            }
+        }
+        StrFast::ToUpperCase => {
+            if s.bytes().any(|b| b.is_ascii_lowercase()) {
+                Value::from_string(s.to_ascii_uppercase())
+            } else {
+                Value::Str(s.clone())
+            }
+        }
+        StrFast::ToLowerCase => {
+            if s.bytes().any(|b| b.is_ascii_uppercase()) {
+                Value::from_string(s.to_ascii_lowercase())
+            } else {
+                Value::Str(s.clone())
+            }
+        }
     })
 }
 
@@ -7813,24 +8171,7 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "valueOf", 0, |i, this, _| string_this_value(i, &this));
     it.def_method(&sp, "charAt", 1, nf_char_at);
     it.def_method(&sp, "charCodeAt", 1, nf_char_code_at);
-    it.def_method(&sp, "indexOf", 1, |i, this, args| {
-        let s = this_string(i, &this)?;
-        let needle = ab(i.to_string(&arg(args, 0)))?;
-        if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
-            // Byte index == unit index; a non-ASCII needle simply can't occur.
-            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?.min(s.len());
-            let r = s[pos..].find(&*needle).map(|k| (pos + k) as f64);
-            return Ok(Value::Num(r.unwrap_or(-1.0)));
-        }
-        let chars = i.units_full(&s);
-        let nchars = i.units_full(&needle);
-        let len = chars.len() as i64;
-        let pos = str_clamp_pos(i, args.get(1), len)?;
-        let nlen = nchars.len();
-        let result = (pos..=chars.len())
-            .find(|&start| start + nlen <= chars.len() && chars[start..start + nlen] == nchars[..]);
-        Ok(Value::Num(result.map(|r| r as f64).unwrap_or(-1.0)))
-    });
+    it.def_method(&sp, "indexOf", 1, nf_str_index_of);
     it.def_method(&sp, "lastIndexOf", 1, |i, this, args| {
         let s = this_string(i, &this)?;
         let needle = ab(i.to_string(&arg(args, 0)))?;
@@ -7906,72 +8247,9 @@ fn install_string(it: &mut Interp) {
         let out = crate::unicode_norm_impl::normalize(&cps, &form);
         Ok(Value::from_string(crate::jstr::from_code_points(&out)))
     });
-    it.def_method(&sp, "includes", 1, |i, this, args| {
-        let s = this_string(i, &this)?;
-        if arg_is_regexp(i, &arg(args, 0))? {
-            return Err(i.make_error("TypeError", "argument must not be a regular expression"));
-        }
-        let needle = ab(i.to_string(&arg(args, 0)))?;
-        if s.ascii_hint() {
-            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
-            return Ok(Value::Bool(needle.is_ascii() && s[pos..].contains(&*needle)));
-        }
-        let chars = i.units_full(&s);
-        let len = chars.len() as i64;
-        let pos = str_clamp_pos(i, args.get(1), len)?;
-        let nchars = i.units_full(&needle);
-        let found = (pos..=chars.len())
-            .any(|k| k + nchars.len() <= chars.len() && chars[k..k + nchars.len()] == nchars[..]);
-        Ok(Value::Bool(found))
-    });
-    it.def_method(&sp, "startsWith", 1, |i, this, args| {
-        let s = this_string(i, &this)?;
-        if arg_is_regexp(i, &arg(args, 0))? {
-            return Err(i.make_error("TypeError", "argument must not be a regular expression"));
-        }
-        let needle = ab(i.to_string(&arg(args, 0)))?;
-        if s.ascii_hint() {
-            let pos = match args.get(1) {
-                None | Some(Value::Undefined) => 0,
-                v => str_clamp_pos(i, v, s.len() as i64)?,
-            };
-            return Ok(Value::Bool(s.as_bytes()[pos..].starts_with(needle.as_bytes())));
-        }
-        let chars = i.units_full(&s);
-        let len = chars.len() as i64;
-        let pos = str_clamp_pos(i, args.get(1), len)?;
-        let nchars = i.units_full(&needle);
-        Ok(Value::Bool(
-            pos + nchars.len() <= chars.len() && chars[pos..pos + nchars.len()] == nchars[..],
-        ))
-    });
-    it.def_method(&sp, "endsWith", 1, |i, this, args| {
-        let s = this_string(i, &this)?;
-        if arg_is_regexp(i, &arg(args, 0))? {
-            return Err(i.make_error("TypeError", "argument must not be a regular expression"));
-        }
-        let needle = ab(i.to_string(&arg(args, 0)))?;
-        if s.ascii_hint() {
-            let end = match args.get(1) {
-                Some(v) if !matches!(v, Value::Undefined) => {
-                    str_clamp_pos(i, Some(v), s.len() as i64)?
-                }
-                _ => s.len(),
-            };
-            return Ok(Value::Bool(s.as_bytes()[..end].ends_with(needle.as_bytes())));
-        }
-        let chars = i.units_full(&s);
-        let len = chars.len() as i64;
-        // endsWith's optional argument is the END position (default = length).
-        let end = match args.get(1) {
-            Some(v) if !matches!(v, Value::Undefined) => str_clamp_pos(i, Some(v), len)?,
-            _ => len as usize,
-        };
-        let nchars = i.units_full(&needle);
-        Ok(Value::Bool(
-            end >= nchars.len() && chars[end - nchars.len()..end] == nchars[..],
-        ))
-    });
+    it.def_method(&sp, "includes", 1, nf_str_includes);
+    it.def_method(&sp, "startsWith", 1, nf_str_starts_with);
+    it.def_method(&sp, "endsWith", 1, nf_str_ends_with);
     it.def_method(&sp, "slice", 2, nf_string_slice);
     string_substring::install(it, &sp);
     // Annex B B.2.3.1 String.prototype.substr(start, length).
@@ -8051,26 +8329,8 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "sup", 0, |i, t, _| {
         create_html(i, t, "sup", "", &Value::Undefined)
     });
-    it.def_method(&sp, "toUpperCase", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        if s.ascii_hint() {
-            if !s.bytes().any(|b| b.is_ascii_lowercase()) {
-                return Ok(Value::Str(s));
-            }
-            return Ok(Value::from_string(s.to_ascii_uppercase()));
-        }
-        Ok(Value::from_string(s.to_uppercase()))
-    });
-    it.def_method(&sp, "toLowerCase", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        if s.ascii_hint() {
-            if !s.bytes().any(|b| b.is_ascii_uppercase()) {
-                return Ok(Value::Str(s));
-            }
-            return Ok(Value::from_string(s.to_ascii_lowercase()));
-        }
-        Ok(Value::from_string(s.to_lowercase()))
-    });
+    it.def_method(&sp, "toUpperCase", 0, nf_str_to_upper_case);
+    it.def_method(&sp, "toLowerCase", 0, nf_str_to_lower_case);
     // lumen strings are valid UTF-8, so they're always well-formed.
     it.def_method(&sp, "isWellFormed", 0, |i, this, _| {
         let s = this_string(i, &this)?;
@@ -8093,10 +8353,7 @@ fn install_string(it: &mut Interp) {
             .collect();
         Ok(Value::from_string(fixed))
     });
-    it.def_method(&sp, "trim", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        Ok(trimmed(&s, true, true))
-    });
+    it.def_method(&sp, "trim", 0, nf_str_trim);
     it.def_method(&sp, "localeCompare", 1, |i, this, args| {
         // RequireObjectCoercible + ToString this, then delegate to Intl.Collator.
         let a = this_string(i, &this)?;
@@ -8150,44 +8407,10 @@ fn install_string(it: &mut Interp) {
         ))
     });
     it.def_method(&sp, "split", 2, nf_string_split);
-    it.def_method(&sp, "at", 1, |i, this, args| {
-        let s = this_string(i, &this)?;
-        if s.ascii_hint() {
-            let len = s.len() as i64;
-            let n = ab(i.to_number(&arg(args, 0)))?;
-            let mut idx = if n.is_nan() { 0 } else { n.trunc().clamp(-1e18, 1e18) as i64 };
-            if idx < 0 {
-                idx += len;
-            }
-            return Ok(if idx < 0 || idx >= len {
-                Value::Undefined
-            } else {
-                Value::Str(crate::jstr::unit_lstr(s.as_bytes()[idx as usize] as u16))
-            });
-        }
-        let len = i.str_len(&s) as i64;
-        let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
-        if idx < 0 {
-            idx += len;
-        }
-        Ok(if idx < 0 || idx >= len {
-            Value::Undefined
-        } else {
-            match i.unit_at(&s, idx as usize) {
-                Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
-                None => Value::Undefined,
-            }
-        })
-    });
+    it.def_method(&sp, "at", 1, nf_str_at);
     it.def_method(&sp, "codePointAt", 1, nf_code_point_at);
-    it.def_method(&sp, "trimStart", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        Ok(trimmed(&s, true, false))
-    });
-    it.def_method(&sp, "trimEnd", 0, |i, this, _| {
-        let s = this_string(i, &this)?;
-        Ok(trimmed(&s, false, true))
-    });
+    it.def_method(&sp, "trimStart", 0, nf_str_trim_start);
+    it.def_method(&sp, "trimEnd", 0, nf_str_trim_end);
     // Annex B aliases: trimLeft/trimRight ARE trimStart/trimEnd (same function objects).
     for (alias, target) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
         let p = sp.borrow().props.get(target).cloned();
@@ -8446,6 +8669,9 @@ fn install_string(it: &mut Interp) {
 
 /// Named entry so the bytecode call cache can recognize and specialize ASCII string slicing.
 pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(v) = str_fast_this(StrFast::Slice, &this, args) {
+        return Ok(v);
+    }
     let s = this_string(i, &this)?;
     if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
         let len = s.len() as i64;

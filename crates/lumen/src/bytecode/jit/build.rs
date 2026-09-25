@@ -361,6 +361,7 @@ fn build_region(
         .chain(plan.dname.keys().copied())
         .chain(plan.dmethod.keys().copied())
         .chain(plan.strm.keys().copied())
+        .chain(plan.strn.keys().copied())
         .chain(plan.arrm.keys().copied())
         .collect();
     let self_cell: Box<std::cell::Cell<usize>> = Box::new(std::cell::Cell::new(0));
@@ -987,6 +988,10 @@ struct Plan {
     /// Inline `String.prototype` intrinsic sites (`<string> GetMethod <Number>
     /// CallWithThis(1)`): `GetMethod` pc -> call pc.
     strm: HashMap<usize, usize>,
+    /// Fused `String.prototype` method sites (`<string> GetMethod <pure args>
+    /// CallWithThis(n)`, see `Tr::strn_begin`): `GetMethod` pc -> (call pc, address of the
+    /// site's `Cell<helpers::StrSite>` in `boxes`).
+    strn: HashMap<usize, (usize, usize)>,
     /// Inline `Array.prototype.push` sites (`<array> GetMethod(push) <value>
     /// CallWithThis(1)`): `GetMethod` pc -> call pc.
     arrm: HashMap<usize, usize>,
@@ -1353,6 +1358,69 @@ fn plan(
             if args == [true] {
                 p.strm.insert(pc, call);
             }
+        }
+    }
+
+    // `<string>.<method>(<args>)` for any other native `String.prototype` method, its
+    // arguments pure loads: the receiver checked a String at the `GetMethod`, the method read
+    // and called by one helper at the call (see `Tr::strn_begin`, `helpers::str_method`).
+    for pc in header..=backedge {
+        if !reach(pc)
+            || p.strm.contains_key(&pc)
+            || helpers::math_site_failed(chunk, pc)
+            || p.math.contains_key(&pc.wrapping_sub(1))
+        {
+            continue;
+        }
+        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        if !chunk
+            .names
+            .get(m as usize)
+            .is_some_and(|n| helpers::str_native_method(interp, n))
+        {
+            continue;
+        }
+        // Each argument entry: whether it is known a Number (Number arithmetic runs no JS).
+        let mut st: Vec<bool> = Vec::new();
+        let mut q = pc + 1;
+        let call = loop {
+            if q > backedge || lead(q) || st.len() > 4 {
+                break None;
+            }
+            match ops[q] {
+                Op::CallWithThis(n) => break (n as usize == st.len()).then_some(q),
+                Op::LoadLocal(s)
+                    if !tdzd.maybe_undef(s as usize, q) && !defd.maybe_undef(s as usize, q) =>
+                {
+                    st.push(num_slot(s))
+                }
+                Op::Const(k) => st.push(matches!(chunk.consts[k as usize], Value::Num(_))),
+                Op::Undef => st.push(false),
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+                    if st.len() >= 2 && st[st.len() - 1] && st[st.len() - 2] =>
+                {
+                    st.pop();
+                }
+                Op::Neg | Op::Plus | Op::BitNot if st.last() == Some(&true) => {}
+                _ => break None,
+            }
+            q += 1;
+        };
+        if let Some(call) = call {
+            let cell: Box<std::cell::Cell<helpers::StrSite>> = Box::default();
+            let addr = &*cell as *const std::cell::Cell<helpers::StrSite> as usize;
+            p.boxes.push(cell);
+            p.strn.insert(pc, (call, addr));
         }
     }
 
@@ -1838,6 +1906,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         let pure = math_part
             || self.plan.strm.contains_key(&pc)
+            || self.plan.strn.contains_key(&pc)
             || self.plan.arrm.contains_key(&pc)
             || matches!(
                 op,
@@ -3105,6 +3174,12 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         if self.plan.strm.values().any(|&c| c == pc) {
             return self.str_call(pc);
+        }
+        if self.plan.strn.contains_key(&pc) {
+            return self.strn_begin(pc);
+        }
+        if let Some((&g, &(_, cell))) = self.plan.strn.iter().find(|(_, v)| v.0 == pc) {
+            return self.strn_call(pc, g, cell);
         }
         if self.plan.arrm.contains_key(&pc) {
             return self.arr_begin(pc);
@@ -4950,6 +5025,64 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.drop_at(d - 3);
         self.stack.pop();
         self.stack.push(Entry::Num(r));
+        Ok(())
+    }
+
+    /// The `GetMethod` of a fused `String.prototype` method site: a receiver that is not a
+    /// String exits before the site (the interpreter makes the call; the site is remembered, so
+    /// the next compile leaves it to the generic path). Pushes the `undefined` placeholder
+    /// callee, which the call's helper replaces by reading the method itself.
+    fn strn_begin(&mut self, pc: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        let st = self.stack.clone();
+        let pcv = self.i32c(pc as i64);
+        if st.last() != Some(&Entry::Boxed) {
+            self.call(Helper::SiteFailed, &[self.frame, pcv]);
+            let yes = self.i32c(1);
+            self.exit_if(yes, pc, EXIT_RESUME, &st, d);
+        } else {
+            let recv = self.sptr(d - 1);
+            let tag = self.fb.load(MemKind::I32U8, recv, 0);
+            let str_tag = self.i32c(TAG_STR as i64);
+            let is_str = self.fb.icmp(IntCC::Eq, tag, str_tag);
+            let bad = self.fb.create_block();
+            let cont = self.fb.create_block();
+            self.fb.brif(is_str, cont, &[], bad, &[]);
+            self.fb.seal_block(bad);
+            self.fb.switch_to_block(bad);
+            self.call(Helper::SiteFailed, &[self.frame, pcv]);
+            let yes = self.i32c(1);
+            self.exit_if(yes, pc, EXIT_RESUME, &st, d);
+            self.fb.jump(cont, &[]);
+            self.fb.seal_block(cont);
+            self.fb.switch_to_block(cont);
+        }
+        self.set_stack_tag(d, TAG_UNDEFINED);
+        self.stack.push(Entry::Boxed);
+        Ok(())
+    }
+
+    /// The `CallWithThis(argc)` of a fused `String.prototype` method site: the arguments
+    /// boxed, then [`Helper::StrMethod`] reads the method and calls it.
+    fn strn_call(&mut self, pc: usize, get: usize, cell: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        let Op::CallWithThis(argc) = self.ops[pc] else {
+            return Err(format!("no call for the String method site at {pc}"));
+        };
+        let base = d - argc as usize - 2;
+        self.box_from(base);
+        let (gv, bv, av) = (
+            self.i32c(get as i64),
+            self.i32c(base as i64),
+            self.i32c(argc as i64),
+        );
+        let cv = self.ptrc(cell as i64);
+        self.set_call_site(pc);
+        let st = self.call_js(Helper::StrMethod, &[self.frame, gv, bv, av, cv]);
+        let below = self.stack[..base].to_vec();
+        self.throw_if(st, pc, &below, base);
+        self.stack.truncate(base);
+        self.stack.push(Entry::Boxed);
         Ok(())
     }
 

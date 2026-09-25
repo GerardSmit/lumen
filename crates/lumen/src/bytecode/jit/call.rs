@@ -535,7 +535,10 @@ pub(super) fn plan_direct(
             Op::New(a) => (a as usize, 0, true),
             _ => continue,
         };
-        if p.math.values().any(|s| s.call == q) || p.strm.values().any(|&c| c == q) {
+        if p.math.values().any(|s| s.call == q)
+            || p.strm.values().any(|&c| c == q)
+            || p.strn.values().any(|&(c, _)| c == q)
+        {
             continue;
         }
         let Some(base) = d.checked_sub(argc + 1 + wt) else { continue };
