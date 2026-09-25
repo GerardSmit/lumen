@@ -5676,6 +5676,42 @@ impl<'a, 'f> Tr<'a, 'f> {
                 Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
             ) if !matches!(op, Op::Mod) =>
             {
+                // Ops whose result is a Number unless an operand is a BigInt: the join takes it
+                // unboxed (the slow path exits on the rare other result), so later ops see a Num.
+                let numeric = matches!(
+                    op,
+                    Op::Sub
+                        | Op::Mul
+                        | Op::Div
+                        | Op::BitAnd
+                        | Op::BitOr
+                        | Op::BitXor
+                        | Op::Shl
+                        | Op::Shr
+                        | Op::UShr
+                );
+                if numeric {
+                    let pre = self.stack.clone();
+                    let slow = self.fb.create_block();
+                    let join = self.fb.create_block();
+                    let param = self.fb.append_block_param(join, Type::F64);
+                    let x = self.num_or_slow(a, d - 2, slow);
+                    let y = self.num_or_slow(b, d - 1, slow);
+                    let Entry::Num(r) = compute(self, x, y)? else {
+                        unreachable!("arithmetic yields a Number")
+                    };
+                    self.fb.jump(join, &[r]);
+                    self.fb.seal_block(slow);
+                    self.fb.switch_to_block(slow);
+                    self.stack = pre.clone();
+                    self.generic(pc);
+                    self.slow_to_join(pc, d - 2, true, join);
+                    self.fb.seal_block(join);
+                    self.fb.switch_to_block(join);
+                    self.stack = pre[..d - 2].to_vec();
+                    self.stack.push(Entry::Num(param));
+                    return Ok(());
+                }
                 let pre = self.stack.clone();
                 let slow = self.fb.create_block();
                 let join = self.fb.create_block();

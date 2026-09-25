@@ -2286,6 +2286,8 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
     }
     // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
     let body = func.body();
+    // Captured names only `var`s have bound so far (still undefined at entry).
+    let mut var_only = std::collections::HashSet::new();
     for op in crate::interpreter::collect_hoist_ops(&body, func.is_strict, &[]) {
         match op {
             HoistOp::Var(name) => {
@@ -2293,6 +2295,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
                     if !c.env_has(&name) {
                         c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
                         c.env_bind(&name, false);
+                        var_only.insert(name);
                     }
                 } else if c.lookup(&name).is_none() {
                     let slot = c.fresh_slot(&name);
@@ -2301,7 +2304,19 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
             }
             HoistOp::VarForce(name) => {
                 if captured.contains(&name) {
-                    return None; // for-head reset of a captured param — stay in the oracle
+                    // Nothing bound yet (no parameter or earlier hoist of the name): the reset
+                    // to undefined is a plain `var` binding.
+                    if var_only.contains(&name) {
+                        continue;
+                    }
+                    if c.env_has(&name) || c.lookup(&name).is_some() {
+                        log_bail("fn", "for-head var resetting a captured parameter");
+                        return None;
+                    }
+                    c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
+                    c.env_bind(&name, false);
+                    var_only.insert(name);
+                    continue;
                 }
                 let slot = match c.lookup(&name) {
                     Some((s, _)) => s,
@@ -2319,6 +2334,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
                 }
             }
             HoistOp::Fn(name, f) => {
+                var_only.remove(&name);
                 let fidx = c.funcs.len() as u16;
                 c.funcs.push(f.clone());
                 if captured.contains(&name) {
@@ -7480,7 +7496,12 @@ fn run_vm_frames<const ONE: bool>(
                 block_env::store(i, slots, s, &chunk.names[n as usize], v, true)?;
             }
             Op::BlkUpdate(s, n, kind) => {
-                block_env::update(i, &mut stack, slots, s, &chunk.names[n as usize], kind)?
+                let name = &chunk.names[n as usize];
+                match block_env::update_num(slots, s, name, kind) {
+                    Some(Some(v)) => stack.push(Value::Num(v)),
+                    Some(None) => {}
+                    None => block_env::update(i, &mut stack, slots, s, name, kind)?,
+                }
             }
             Op::InEnv(s) => {
                 let benv = block_env::env_of(&slots[s as usize]);

@@ -2760,14 +2760,17 @@ pub(crate) unsafe extern "C" fn blk_decl(f: *mut JitFrame, s: u32, n: u32, k: u3
 
 pub(crate) unsafe extern "C" fn blk_load(f: *mut JitFrame, s: u32, n: u32, dst: *mut Value) -> u32 {
     let name = &(&*(*f).chunk).names[n as usize];
-    let i = &mut *(*f).interp;
-    match crate::bytecode::block_env::load(i, frame_slots(f), s as u16, name) {
-        Ok(v) => {
+    match crate::bytecode::block_env::load_opt(frame_slots(f), s as u16, name) {
+        Some(v) => {
             std::ptr::write(dst, v);
             STATUS_OK
         }
-        Err(e) => {
+        None => {
             std::ptr::write(dst, Value::Undefined);
+            let i = &mut *(*f).interp;
+            let e = crate::bytecode::block_env::load(i, frame_slots(f), s as u16, name)
+                .err()
+                .expect("a TDZ binding");
             fail(f, e)
         }
     }
@@ -2795,6 +2798,15 @@ pub(crate) unsafe extern "C" fn blk_update(f: *mut JitFrame, pc: u32, dst: *mut 
         let e = (*(*f).interp).throw("TypeError", "compiled code ran an unsupported op");
         return fail(f, e);
     };
+    match crate::bytecode::block_env::update_num(frame_slots(f), s, &chunk.names[n as usize], kind)
+    {
+        Some(Some(v)) => {
+            std::ptr::write(dst, Value::Num(v));
+            return STATUS_OK;
+        }
+        Some(None) => return STATUS_OK,
+        None => {}
+    }
     let i = &mut *(*f).interp;
     let mut out: Vec<Value> = Vec::new();
     let r = crate::bytecode::block_env::update(
