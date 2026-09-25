@@ -240,6 +240,10 @@ pub(crate) enum Helper {
     StrGuard,
     /// `(frame, s: *const Value, pos: f64) -> f64` — `s.charCodeAt(pos)` of a String `s`. Pure.
     StrCodeAt,
+    /// `(frame, pc: u32, base: u32, argc: u32, cell: *const Cell<StrSite>) -> status` — the
+    /// call of a fused `<string>.<method>(args)` site whose `GetMethod` is at `pc` (see
+    /// [`str_method`]). Runs JS.
+    StrMethod,
     /// `(frame, fidx: u32, name: u32, dst: *mut Value)` — `MakeClosure(fidx, name)` in the
     /// frame's env into `dst` (a trivially droppable operand-stack entry). Pure.
     MakeClosure,
@@ -283,7 +287,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 71] = [
+pub(crate) const ALL: [Helper; 72] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -342,6 +346,7 @@ pub(crate) const ALL: [Helper; 71] = [
     Helper::NewPlan,
     Helper::StrGuard,
     Helper::StrCodeAt,
+    Helper::StrMethod,
     Helper::MakeClosure,
     Helper::AllocObj,
     Helper::AllocArr,
@@ -415,6 +420,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::MakeRest => (&[P, P, P, I32], &[]),
         Helper::StrGuard => (&[P, I32, P], &[I32]),
         Helper::StrCodeAt => (&[P, P, F64], &[F64]),
+        Helper::StrMethod => (&[P, I32, I32, I32, P], &[I32]),
         Helper::MakeClosure => (&[P, I32, I32, P], &[]),
         Helper::AllocObj => (&[P, P, P, I32], &[]),
         Helper::AllocArr => (&[P, P, I32], &[]),
@@ -485,6 +491,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::NewPlan => super::build::new_plan::new_plan_helper as *const () as usize,
         Helper::StrGuard => str_guard as *const () as usize,
         Helper::StrCodeAt => str_code_at as *const () as usize,
+        Helper::StrMethod => str_method as *const () as usize,
         Helper::MakeClosure => make_closure as *const () as usize,
         Helper::AllocObj => alloc_obj as *const () as usize,
         Helper::AllocArr => alloc_arr as *const () as usize,
@@ -2003,6 +2010,134 @@ pub(crate) unsafe extern "C" fn str_code_at(f: *mut JitFrame, s: *const Value, p
     match (*(*f).interp).unit_at(s, idx as usize) {
         Some(u) => f64::from(u),
         None => f64::NAN,
+    }
+}
+
+/// The resolution a fused `<string>.<method>(args)` site caches (see [`str_method`]): the
+/// `String.prototype` shape it was made under (which pins the method's slot), that slot, and
+/// the fast path of the native code last found there.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StrSite {
+    shape: Option<u32>,
+    slot: u32,
+    native: usize,
+    fast: Option<crate::builtins::StrFast>,
+}
+
+/// Whether `name` on a primitive String reads a native `String.prototype` method now (a
+/// planning hint: [`str_method`] checks again at every call).
+pub(crate) fn str_native_method(i: &Interp, name: &str) -> bool {
+    let Ok(sb) = i.string_proto.try_borrow() else { return false };
+    let Some(p) = sb.props.slot_of(name).and_then(|k| sb.props.entry_at(k)) else {
+        return false;
+    };
+    if p.accessor() {
+        return false;
+    }
+    let Value::Obj(fo) = p.value() else { return false };
+    let native = fo
+        .try_borrow()
+        .is_ok_and(|fb| matches!(fb.call, crate::value::Callable::Native(_)));
+    native
+}
+
+/// The native code `GetMethod(name)` on a primitive String reads, when that read is a plain
+/// data property of an ordinary `String.prototype` holding a leaf native (see
+/// `Interp::leaf_native`) in a one-realm engine: calling that code is then exactly what the
+/// `GetMethod` + `CallWithThis` pair does. The slot is cached by shape; the value is read at
+/// every call.
+fn str_site_native(i: &Interp, cell: &std::cell::Cell<StrSite>, name: &str) -> Option<crate::value::NativeFn> {
+    if i.multi_realm() {
+        return None;
+    }
+    let sb = i.string_proto.try_borrow().ok()?;
+    if !matches!(sb.exotic, crate::value::Exotic::None | crate::value::Exotic::StrWrap) {
+        return None;
+    }
+    let mut c = cell.get();
+    let shape = sb.props.shape();
+    if c.shape != Some(shape) {
+        c.slot = sb.props.slot_of(name)? as u32;
+        c.shape = Some(shape);
+        cell.set(c);
+    }
+    let p = sb.props.entry_at(c.slot as usize)?;
+    if p.accessor() {
+        return None;
+    }
+    let Value::Obj(fo) = p.value() else { return None };
+    let fb = fo.try_borrow().ok()?;
+    match fb.call {
+        crate::value::Callable::Native(fp) if fb.ic_plain.get() => Some(fp),
+        _ => None,
+    }
+}
+
+/// The call of a fused `<string>.<method>(args)` site: `stack[base]` is the String receiver
+/// (checked at the `GetMethod`), `stack[base + 1]` an `undefined` placeholder for the method,
+/// the `argc` arguments follow. The arguments are pure loads (see `build::plan`), so reading
+/// the method here rather than before them is unobservable. A native method is called
+/// straight; anything else takes the `GetMethod` + call steps. The result lands in
+/// `stack[base]`.
+pub(crate) unsafe extern "C" fn str_method(
+    f: *mut JitFrame,
+    pc: u32,
+    base: u32,
+    argc: u32,
+    cell: *const std::cell::Cell<StrSite>,
+) -> u32 {
+    let s = (*f).stack;
+    let (base, argc) = (base as usize, argc as usize);
+    let at = s.add(base + 2);
+    let i = &mut *(*f).interp;
+    let chunk = &*(*f).chunk;
+    let Some(Op::GetMethod(n, c)) = chunk.ops.get(pc as usize).copied() else {
+        let e = i.throw("TypeError", "compiled code used a bad method site");
+        return fail(f, e);
+    };
+    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize)) else {
+        let e = i.throw("TypeError", "compiled code used a bad property cache");
+        return fail(f, e);
+    };
+    let this = std::ptr::replace(s.add(base), Value::Undefined);
+    let args = std::slice::from_raw_parts(at, argc);
+    let r = match str_site_native(i, &*cell, name) {
+        Some(nat) => {
+            let cell = &*cell;
+            let mut c = cell.get();
+            if c.native != nat as usize {
+                c.native = nat as usize;
+                c.fast = crate::builtins::str_fast_of(nat);
+                cell.set(c);
+            }
+            // A builtin whose arguments need no conversion: its result without the call (no JS
+            // runs and nothing throws, so the native frame is unobservable).
+            let quick = match (c.fast, &this) {
+                (Some(k), Value::Str(s)) => crate::builtins::str_fast(k, s, args),
+                _ => None,
+            };
+            match quick {
+                Some(v) => Ok(v),
+                None => i.call_native_fast(nat, this, args),
+            }
+        }
+        None => match i.get_prop_ic(&this, name, cache) {
+            Ok(callee) if callee.is_callable() => i.call(callee, this, args),
+            Ok(callee) => i
+                .call(callee.clone(), this, args)
+                .map_err(|e| crate::bytecode::site_call_error(i, chunk, &callee, e)),
+            Err(e) => Err(e),
+        },
+    };
+    for k in 0..argc {
+        *at.add(k) = Value::Undefined;
+    }
+    match r {
+        Ok(v) => {
+            std::ptr::write(s.add(base), v);
+            STATUS_OK
+        }
+        Err(e) => fail(f, e),
     }
 }
 

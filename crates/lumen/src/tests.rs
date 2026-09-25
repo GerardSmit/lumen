@@ -5484,6 +5484,34 @@ fn jit_math_sqrt_intrinsic_preserves_fallbacks_and_identity_guards() {
 }
 
 #[test]
+fn jit_string_method_sites_follow_patches_getters_and_other_receivers() {
+    // Fused `<string>.<method>(args)` sites (the method read at the call): a patched method,
+    // a getter installed mid-loop, a non-String receiver and a throwing method all behave as
+    // the separate `GetMethod` and call would.
+    assert_eq!(
+        run_bytecode(
+            "var s='hello', out=[];
+             for(var i=0;i<600;i++){
+               if(i===300) String.prototype.slice=function(a){return 'P'+a;};
+               out.push(s.slice(i&3));
+             }
+             var orig=String.prototype.at;
+             for(var i=0;i<600;i++){
+               if(i===300) Object.defineProperty(String.prototype,'at',
+                 {get:function(){return function(){return 'G';};},configurable:true});
+               out.push(s.at(i&7));
+             }
+             var rs=['abcb',[1,'b'],{indexOf:function(){return 42;}}];
+             for(var k=0;k<3;k++) for(var i=0;i<300;i++) out.push(rs[k].indexOf('b'));
+             var caught='';
+             for(var i=0;i<300;i++){ try { s.normalize(i<299?'NFC':'bad'); } catch(e){ caught=e.name; } }
+             [out[0],out[299],out[300],out[600],out[601],out[900],out[1200],out[1500],out[1800],caught].join(':')"
+        ),
+        "hello:lo:P0:h:e:G:1:1:42:RangeError"
+    );
+}
+
+#[test]
 fn global_value_property_descriptors() {
     for name in ["undefined", "NaN", "Infinity"] {
         let src = format!(
