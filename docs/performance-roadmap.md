@@ -390,9 +390,19 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       - The 1e6-objects case is unchanged at 403 ms / 169 MB (node 67 ms / 135 MB).
       - About half of that is the cycle collector. Each pass is a full trial deletion over every live object at 100k, 200k, 400k and 800k live objects, about 120 ns per object.
       - A generational or incremental scheme, or skipping objects that cannot be part of a cycle, is the next step.
-16. **module.js (M).**
+16. ✅ **module.js (M).** *(Partly done.)*
     - What: generate the 52 builtin ESM wrappers on demand. Move the CJS resolver into Rust and share it with `esm.rs`, which gains `exports` subpath patterns.
     - Saves: about 0.8 MB of startup memory.
+    - Built: the node glue no longer builds every builtin's synthetic ESM source at startup. It hands the runtime each builtin's export-name list (`__esmExportLists`), and the loader builds a `node:x` source from its list when `node:x` is first imported (`esm::builtin_source`).
+    - Result (empty script, mem-stats build):
+
+      | | Before | Now |
+      |---|---|---|
+      | private memory | 8,664 KB | 7,712 KB |
+      | allocator live | 5,536 KB | 5,056 KB |
+      | allocations | 119,212 | 92,847 |
+
+    - Left: the CJS resolver move. It is a compatibility refactor (shared resolution, `exports` subpath patterns) rather than a memory or speed win, so it is listed under Node compat.
 
 17. **JIT values in registers (L).** *(Added during item 2.)*
     - What: keep object references loaded from properties in SSA instead of boxing them through stack memory, and elide retain/release pairs whose lifetimes nest (for example `const v = b.v` releases and re-takes the same count every iteration).
@@ -455,6 +465,7 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
 - Slower with the JIT on: typedarray deepEqual, http-pipeline, and http2 memory-leak.
 - `promises-unhandled-rejections` still fails.
 - Planned: lumen-http2 on `h2`, and lumen-tls on `rustls`.
+- The CommonJS resolver lives in module.js and supports only the `"."` entry of package `exports`, while `esm.rs` resolves separately without subpath patterns (`"./*"`). Moving the resolver into Rust and sharing it would fix both (left from item 16).
 - `passing.txt` is out of date:
   - 890 passing tests are not listed;
   - 3 listed tests now fail: http-pause-no-dump, process-constrained-memory, net-listen-shared-ports.

@@ -868,8 +868,8 @@ globalThis.__runMain = runMain;
 globalThis.__runMainSource = runMainSource;
 
 // --- ESM interop: synthetic re-export modules for the builtins ---
-// The runtime's module loader (Rust) can't enumerate a builtin's keys, so we precompute one
-// ESM source per builtin here — where Object.keys works — and the loader ferries the strings.
+// The runtime's module loader (Rust) builds each builtin's ESM source from the export lists
+// below; the source reads the module object through `__esmBuiltin`.
 globalThis.__esmBuiltin = (name) => __builtins.get(name);
 
 // `process` is populated (env/argv/…) by the runtime *after* this glue runs, so enumerating its
@@ -883,27 +883,13 @@ const PROCESS_EXPORTS = [
   "allowedNodeEnvironmentFlags", "setSourceMapsEnabled",
 ];
 
-// The export names come from esm_exports.js, not the module's keys: reading those would load
-// every builtin at startup (they load on first use; see build.rs `LAZY`).
-function builtinExportNames(name) {
-  if (name === "process") return PROCESS_EXPORTS;
-  if (!__builtins.has(name)) return [];
-  const listed = __ESM_EXPORTS[name];
-  if (listed !== undefined) return listed ? listed.split(" ") : [];
-  const m = __builtins.get(name);
-  return m && (typeof m === "object" || typeof m === "function") ? Object.keys(m) : [];
-}
-
-function makeBuiltinEsmSource(name) {
-  let src = `const __m = globalThis.__esmBuiltin(${JSON.stringify(name)});\nexport default __m;\n`;
-  const keys = builtinExportNames(name);
-  for (const k of keys) {
-    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) && k !== "default") {
-      src += `export const ${k} = __m[${JSON.stringify(k)}];\n`;
-    }
-  }
-  return src;
-}
+// The export names of each builtin, for the runtime's module loader: it builds a builtin's
+// synthetic ESM source (`export default …; export const readFile = …`) on first import
+// (lumen-runtime `esm::builtin_source`). The names come from esm_exports.js, not the modules'
+// keys: reading those would load every builtin at startup (they load on first use; see build.rs
+// `LAZY`).
+__ESM_EXPORTS.process = PROCESS_EXPORTS.join(" ");
+globalThis.__esmExportLists = __ESM_EXPORTS;
 
 // The clean builtin base names (skip the "node:module" alias key). Order is cosmetic here.
 const __BUILTIN_NAMES = [
@@ -919,10 +905,4 @@ const __BUILTIN_NAMES = [
   "diagnostics_channel", "domain", "trace_events",
   "vm", "repl", "cluster", "dgram", "wasi",
 ];
-const __esmBuiltinSources = {};
-for (const name of __BUILTIN_NAMES) {
-  const source = makeBuiltinEsmSource(name);
-  __esmBuiltinSources["node:" + name] = source;
-}
-globalThis.__esmBuiltinSources = __esmBuiltinSources;
 globalThis.__builtinNames = __BUILTIN_NAMES.join(",");
