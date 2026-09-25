@@ -5512,6 +5512,30 @@ fn jit_string_method_sites_follow_patches_getters_and_other_receivers() {
 }
 
 #[test]
+fn jit_chained_property_reads_and_ref_receiver_stores() {
+    // `a.b.c` reads lend the intermediate object to the next read; three-level chains, odd
+    // intermediates (primitives, getters, proxies, null) and stores through borrowed
+    // receivers all behave as plain reads and writes.
+    assert_eq!(
+        run_bytecode(
+            "function rd(b){ return b.v.x; }
+             function rd3(b){ return b.a.b.c; }
+             function wr(b,k){ b.v.x=k; b.w+=1; return b.w; }
+             var objs=[], s=0, out=[];
+             for(var i=0;i<300;i++) objs.push({v:{x:i},w:0,a:{b:{c:i}}});
+             for(var r=0;r<5;r++) for(var j=0;j<objs.length;j++){ s+=rd(objs[j])+rd3(objs[j]); wr(objs[j],r); }
+             out.push(s, objs[7].v.x, objs[7].w);
+             out.push(String(rd({v:5})), rd({v:{get x(){return 'g';}}}),
+                      rd({v:new Proxy({},{get:function(t,k){return 'p'+k;}})}),
+                      rd({v:Object.create({x:'proto'})}));
+             try { rd3({a:{b:null}}); } catch(e){ out.push(e.name); }
+             out.join(':')"
+        ),
+        "270900:4:5:undefined:g:px:proto:TypeError"
+    );
+}
+
+#[test]
 fn global_value_property_descriptors() {
     for name in ["undefined", "NaN", "Infinity"] {
         let src = format!(

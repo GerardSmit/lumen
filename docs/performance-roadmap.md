@@ -386,6 +386,8 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       | 5M live objects | uncaught RangeError | 1,970 ms / 780 MB | 212 ms / 362 MB |
       | recursion depth | 1,500 | 6,994 | 10,420 |
 
+    - Tail calls are no longer tied to the ceiling. `TAIL_NEST` was `MAX_EVAL_DEPTH / 16`, so raising the ceiling let tail recursion run about 440 ordinary native frames before the trampoline took over. That overflowed a 2 MB test thread (a spread tail call). It is now a fixed 96.
+
     - Left:
       - The 1e6-objects case is unchanged at 403 ms / 169 MB (node 67 ms / 135 MB).
       - About half of that is the cycle collector. Each pass is a full trial deletion over every live object at 100k, 200k, 400k and 800k live objects, about 120 ns per object.
@@ -404,10 +406,30 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
 
     - Left: the CJS resolver move. It is a compatibility refactor (shared resolution, `exports` subpath patterns) rather than a memory or speed win, so it is listed under Node compat.
 
-17. **JIT values in registers (L).** *(Added during item 2.)*
+17. ✅ **JIT values in registers (L).** *(Added during item 2. Partly done.)*
     - What: keep object references loaded from properties in SSA instead of boxing them through stack memory, and elide retain/release pairs whose lifetimes nest (for example `const v = b.v` releases and re-takes the same count every iteration).
     - Also: shorten the inline-cache guard chain of dependent loads for a repeated receiver, and avoid byte-store/word-load store-forwarding stalls in the emitted code.
     - Evidence: `b.v.x -= c` takes 21 ns vs 1.2 ns, and `const v = b.v` 12 ns vs 0.75 ns. Nearly all of nbody's time is inside JIT code.
+    - Built:
+      - Chained reads (`a.b.c`): when a property read feeds straight into another plain read, the inline cache's object is lent to the second read without taking a reference (a `Src::Borrow` entry). Anything else (a miss, a getter, a primitive) reads the usual way; both paths join after the second read. Chains do not nest, so code size stays linear.
+      - Borrowed receivers for plain stores (`b.w += 1`, `b.v.x = k`): the store writes through the receiver where it lives instead of first cloning it onto the stack.
+      - Forcing a borrowed value onto the stack clones it inline instead of calling the `Clone` helper.
+      - A `let`/`const` slot's TDZ marker is not written when its initialising store follows in the same block with nothing in between that can observe it.
+    - Release, per iteration in a JIT loop (nbody: 200k steps):
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | `b.v.x` read | 12.7 ns | 7.3 ns | 0.78 ns |
+      | `b.w += 1` | 17.1 ns | 12.1 ns | 1.36 ns |
+      | `v.x+v.y+v.z` | 37.0 ns | 34.8 ns | 0.83 ns |
+      | `b.v.x -= c` | 20.7 ns | 20.7 ns | 1.33 ns |
+      | `const v = b.v` | 13.8 ns | 13.4 ns | 0.78 ns |
+      | nbody | 492 ms | 427 ms | 27 ms |
+
+    - Left:
+      - Every property access still runs the full guard chain: tag, borrow flag, exotic check, shape, entry count and the accessor check.
+      - A per-slot cache of the validated receiver and shape, dropped at slot writes and calls into JS, would let repeated accesses on one receiver skip it.
+      - `const v = b.v` still takes and releases a reference per iteration.
 
 18. ✅ **Method calls on primitive strings (M).** *(Added during item 11. Partly done.)*
     - Finding: any non-intrinsic String.prototype method costs 115–150 ns per call from JIT code (node: 11–20 ns). Examples: `at` 115 ns, `startsWith` 131 ns, `indexOf` 151 ns.
