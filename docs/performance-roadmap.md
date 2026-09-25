@@ -238,14 +238,38 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      - An allocate-and-discard of `{x, y}` costs about 17 ns to allocate and 7 ns to drop, plus the helper calls.
      - Native box initialization from JIT code (an image copy of the template's `RefCell<Object>`, with pointer and refcount fix-ups) would save only the call overhead. The heap state can also switch between coroutine jobs, so the JIT would have to load it per region.
      - arr_1_discard (48 ns vs 0.8) needs escape analysis.
-9. **Small lowerings (S each):**
-   - keyed string IC (11.6×);
-   - int32 `%` (18×, about 40 vs 3.9 ns);
-   - Math intrinsic on non-simple operands (sqrt_floor 77×);
-   - plain-array destructuring without the iterator protocol (63×);
-   - cached key lists for `Object.keys` (28×);
-   - a template-literal builder (21×);
-   - regex literal per call site (17×).
+9. ✅ **Done: small lowerings (S each).**
+   - Built:
+     - Keyed string reads: `Interp::fast_get_str` gives `obj[str]` a fast path on plain objects and their plain prototypes.
+       - Own hits are memoized per (shape id, key string identity) in a 64-entry table that holds the key, so its address can't be reused.
+       - Used by the VM's `GetElem` and by the JIT's `ElemGetStr` helper.
+     - Int32 `%`: two int32 operands with a nonzero divisor take `srem` inline. A zero remainder is `x * 0`, which keeps `-0`, and a divisor of -1 is taken as 1.
+     - Nested Math: `Math.f(Math.g(x))` is one inline site. The outer site's guard also checks the inner one, so the inner call can't exit with placeholders on the stack.
+     - Array destructuring (`DestructureArr(n ≤ 8)`):
+       - A `DestructProbe` helper checks the protectors. `array_iter_return_absent` is now memoized on the proto epoch, with the iterator chain marked as prototypes.
+       - The elements are then read natively from packed storage (`layout::packed_prefix` / `packed_word`).
+       - All-Number arrays are written straight; anything else goes through `UnpackClone`.
+       - Decoding and branching per element cost more than the writes, so both paths are straight-line code.
+     - `Object.keys` of a plain object without elements returns the per-shape key list shared with for-in, with no key strings built.
+     - Template literals compile to one `Op::Concat(n)`: one allocation, and empty chunks are dropped. In the JIT, `ToStrPrim` and `ConcatStr` helpers replace the generic ops.
+     - `MakeRegExp` in the JIT calls a direct helper instead of the generic op.
+   - Release results:
+
+     | Case | Before | Now |
+     |---|---|---|
+     | keyed_string | 184 ns | 42 ns |
+     | modulo | 26.8 ns | 3.2 ns |
+     | sqrt_floor | 175 ns | 2.5 ns |
+     | destructure_3 | 96 ns | 35 ns |
+     | object_keys | 491 ns | 245 ns |
+     | template_literal | 590 ns | 161 ns |
+     | literal_creation | 128 ns | 100 ns |
+
+   - Left:
+     - keyed_string is now dominated by refcount traffic on the two global loads.
+     - destructure_3 still pays about 15 ns for the protector probe on each iteration.
+     - object_keys pays for the generic native call and the array allocation.
+     - literal_creation pays for the RegExp side table.
 10. **Scopes and closures (M).**
     - What: block scopes with a fixed layout, instead of a hashed var map plus a full copy per iteration. A lazy `.prototype` on function expressions.
     - Closes: arrow_capture_let 22× (310 → about 120 ns) and function_expr 21× (about 300 vs 92 ns for an arrow).

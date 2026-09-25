@@ -110,6 +110,10 @@ pub(crate) struct LangCaches {
     aip_next: SlotCache,
     /// `return` along `%ArrayIteratorPrototype%`'s prototype chain, one memo per level.
     ret: [SlotCache; 4],
+    /// `(proto epoch, Array.prototype address)` at which [`Interp::array_iter_return_absent`]
+    /// last held; the chain's objects were marked as prototypes then, so any structural change
+    /// on them (a new `return`), a prototype swap or a `defineProperty` moves the epoch.
+    ret_absent: std::cell::Cell<(u32, usize)>,
     /// A fresh Array Iterator's property map (`__ai_target`/`__ai_index`/`__ai_kind`), and the
     /// slots of those three keys under its shape.
     iter_template: RefCell<Option<(Props, [u32; 3])>>,
@@ -218,6 +222,12 @@ impl Interp {
     /// Whether an Array Iterator fresh from [`Interp::new_array_iterator`] (no own `return`)
     /// has no `return` method anywhere on its prototype chain — IteratorClose is then a no-op.
     pub(crate) fn array_iter_return_absent(&self) -> bool {
+        let epoch = crate::value::proto_epoch();
+        // The realm (`iter_intrinsics` keys its memo by `Array.prototype` too).
+        let realm = Gc::as_ptr(&self.array_proto) as usize;
+        if epoch != u32::MAX && self.lang.ret_absent.get() == (epoch, realm) {
+            return true;
+        }
         let Some((_, _, aip)) = self.iter_intrinsics() else {
             return false;
         };
@@ -237,9 +247,11 @@ impl Interp {
             if self.lang.ret[depth].get(&b.props, "return").is_some() {
                 return false;
             }
+            b.props.mark_proto();
             cur = b.proto.as_ref();
             depth += 1;
         }
+        self.lang.ret_absent.set((epoch, realm));
         true
     }
 
@@ -482,6 +494,22 @@ impl Interp {
             }
             return Some(out);
         }
+        self.named_enum_keys(&b)
+    }
+
+    /// `Object.keys(o)` of a plain ordinary object without elements: its own enumerable string
+    /// keys from the per-shape key list (no key strings built). `None` = generic path.
+    pub(crate) fn object_keys_fast(&self, o: &Gc) -> Option<Vec<Value>> {
+        let b = o.try_borrow().ok()?;
+        if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) || has_elements(&b.props) {
+            return None;
+        }
+        self.named_enum_keys(&b)
+    }
+
+    /// The enumerable string-keyed named properties of `b` (no elements), in order, from the
+    /// per-shape `(slot, key)` list. `None` when a named key is an integer (it sorts first).
+    fn named_enum_keys(&self, b: &crate::value::Object) -> Option<Vec<Value>> {
         let shape = b.props.shape();
         let list = {
             let hit = self.lang.for_in.borrow().get(&shape).cloned();

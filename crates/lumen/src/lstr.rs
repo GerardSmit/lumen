@@ -101,6 +101,24 @@ impl LStr {
         s
     }
 
+    /// The parts concatenated in one allocation (plain byte concatenation: the caller has
+    /// ruled out surrogate halves meeting at a seam).
+    pub fn concat_n(parts: &[&str]) -> LStr {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
+        let mut at = 0;
+        unsafe {
+            let data = (s.p.as_ptr() as *mut u8).add(HDR);
+            for p in parts {
+                std::ptr::copy_nonoverlapping(p.as_ptr(), data.add(at), p.len());
+                at += p.len();
+            }
+            s.hdr().len.set(total as u32);
+        }
+        s.and_ascii(parts.iter().all(|p| p.is_ascii()));
+        s
+    }
+
     #[inline]
     fn hdr(&self) -> &Header {
         unsafe { self.p.as_ref() }
