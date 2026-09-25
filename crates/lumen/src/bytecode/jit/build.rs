@@ -3437,6 +3437,24 @@ impl<'a, 'f> Tr<'a, 'f> {
                 };
                 self.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))?;
             }
+            Op::ToPropKey => {
+                // As `ToPropKeyLocal`, with the base on the stack (forced by `prepare`).
+                match self.stack[d - 1] {
+                    Entry::Num(_) => {}
+                    Entry::Bool(_) | Entry::Ref(..) => self.exit_now(pc),
+                    Entry::Boxed => {
+                        let tag = self.stack_tag(d - 1);
+                        let four = self.i32c(TAG_NUM as i64);
+                        let six = self.i32c(TAG_STR as i64);
+                        let a = self.fb.icmp(IntCC::Ne, tag, four);
+                        let b = self.fb.icmp(IntCC::Ne, tag, six);
+                        let other = self.fb.binary(BinaryOp::Band, a, b);
+                        let st = self.stack.clone();
+                        self.exit_if(other, pc, EXIT_RESUME, &st, d);
+                    }
+                }
+            }
+            Op::AppendProp(n, c) => self.append_prop(pc, n, c)?,
             Op::ToPropKeyLocal(s) => {
                 // Num and Str keys pass through untouched; anything else needs the coercion
                 // (and the base check): the interpreter does it.
@@ -3540,9 +3558,67 @@ impl<'a, 'f> Tr<'a, 'f> {
         let e = self.stack[i];
         if e == Entry::Boxed {
             let (dst, src) = (self.sptr(d), self.sptr(i));
-            self.call(Helper::Clone, &[dst, src]);
+            self.clone_mem(dst, src);
         }
         self.stack.push(e);
+    }
+
+    /// Clone the `Value` at `src` into (uninitialized) `dst`: primitives are a two-word copy,
+    /// an object (or a string, whose count sits where an object's does) takes its reference
+    /// inline, and a BigInt or Symbol goes through [`Helper::Clone`].
+    fn clone_mem(&mut self, dst: V, src: V) {
+        let tag = self.fb.load(MemKind::I32U8, src, 0);
+        let four = self.i32c(TAG_NUM as i64);
+        let big = self.fb.icmp(IntCC::Ugt, tag, four);
+        let copy_b = self.fb.create_block();
+        let ref_b = self.fb.create_block();
+        let inc_b = self.fb.create_block();
+        let call_b = self.fb.create_block();
+        let done = self.fb.create_block();
+        self.fb.brif(big, ref_b, &[], copy_b, &[]);
+        self.fb.seal_block(ref_b);
+        self.fb.seal_block(copy_b);
+
+        self.fb.switch_to_block(ref_b);
+        let objt = self.i32c(TAG_OBJ as i64);
+        let is_obj = self.fb.icmp(IntCC::Eq, tag, objt);
+        let rc_so = layout::rc_strong_offset();
+        let counted = match rc_so {
+            Some(_) => {
+                let strt = self.i32c(TAG_STR as i64);
+                let is_str = self.fb.icmp(IntCC::Eq, tag, strt);
+                self.fb.binary(BinaryOp::Bor, is_obj, is_str)
+            }
+            None => is_obj,
+        };
+        self.fb.brif(counted, inc_b, &[], call_b, &[]);
+        self.fb.seal_block(inc_b);
+        self.fb.seal_block(call_b);
+
+        self.fb.switch_to_block(inc_b);
+        let gc = self.fb.load(PTR_MEM, src, VALUE_PAYLOAD);
+        let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
+        let strong = self.fb.load(PTR_MEM, gc, so);
+        let one = self.ptrc(1);
+        let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
+        self.fb.store(PTR_MEM, gc, s1, so);
+        self.fb.jump(copy_b, &[]);
+
+        // Field by field (tag byte, a Boolean's byte, payload word): the tag was typically
+        // just stored as a byte, and a wider reload of it can't be store-forwarded.
+        self.fb.switch_to_block(copy_b);
+        let b1 = self.fb.load(MemKind::I32U8, src, 1);
+        let w1 = self.fb.load(MemKind::I64, src, VALUE_PAYLOAD);
+        self.fb.store(MemKind::I32U8, dst, tag, 0);
+        self.fb.store(MemKind::I32U8, dst, b1, 1);
+        self.fb.store(MemKind::I64, dst, w1, VALUE_PAYLOAD);
+        self.fb.jump(done, &[]);
+
+        self.fb.switch_to_block(call_b);
+        self.call(Helper::Clone, &[dst, src]);
+        self.fb.jump(done, &[]);
+        self.fb.seal_block(done);
+        self.fb.switch_to_block(done);
     }
 
     fn ssa_entry(&mut self, s: usize) -> Entry {
@@ -3751,8 +3827,54 @@ impl<'a, 'f> Tr<'a, 'f> {
         obj: V,
         consume: Option<usize>,
     ) -> Result<(), String> {
-        let d = self.stack.len();
         let (pops, _) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
+        self.prop_write_pops(pc, n, c, obj, consume, pops)
+    }
+
+    /// `obj.name += v` (`AppendProp`, stack `obj, lval, v`): with two Numbers it is exactly
+    /// `Add` + `SetPropDrop` (a string append needs a string operand), so the sum goes through
+    /// the property store's inline cache; anything else runs the fused op generically.
+    fn append_prop(&mut self, pc: usize, n: u32, c: u32) -> Result<(), String> {
+        let d = self.stack.len();
+        let (lval, v) = (self.stack[d - 2], self.stack[d - 1]);
+        let numeric = |e: Entry| matches!(e, Entry::Num(_) | Entry::Boxed | Entry::Ref(..));
+        if !numeric(lval) || !numeric(v) {
+            self.generic(pc);
+            return Ok(());
+        }
+        let pre = self.stack.clone();
+        let miss = self.fb.create_block();
+        let done = self.fb.create_block();
+        let a = self.num_or_slow(lval, d - 2, miss);
+        let b = self.num_or_slow(v, d - 1, miss);
+        let r = self.fb.binary(BinaryOp::Fadd, a, b);
+        // Number operands own nothing: dropping them is a no-op.
+        self.stack.truncate(d - 2);
+        self.stack.push(Entry::Num(r));
+        let obj = self.sptr(d - 3);
+        self.prop_write_pops(pc, n, c, obj, Some(d - 3), 2)?;
+        self.fb.jump(done, &[]);
+        self.fb.seal_block(miss);
+        self.fb.switch_to_block(miss);
+        self.stack = pre;
+        self.generic(pc);
+        self.fb.jump(done, &[]);
+        self.fb.seal_block(done);
+        self.fb.switch_to_block(done);
+        Ok(())
+    }
+
+    /// [`Self::prop_write`] for a store whose value and object are the top `pops` entries.
+    fn prop_write_pops(
+        &mut self,
+        pc: usize,
+        n: u32,
+        c: u32,
+        obj: V,
+        consume: Option<usize>,
+        pops: usize,
+    ) -> Result<(), String> {
+        let d = self.stack.len();
         let base = d - pops;
         let v = self.stack[d - 1];
         let pre = self.stack.clone();
@@ -5365,6 +5487,35 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.seal_block(b);
                     self.fb.switch_to_block(b);
                     let dst = self.sptr(at);
+                    // An object (or string) takes its reference inline, before the receiver
+                    // in the same entry is released; a BigInt or Symbol goes to the helper.
+                    let (is_obj, is_str, payload) = layout::word_counted(&mut self.fb, w);
+                    let rc_so = layout::rc_strong_offset();
+                    let counted = match rc_so {
+                        Some(_) => self.fb.binary(BinaryOp::Bor, is_obj, is_str),
+                        None => is_obj,
+                    };
+                    let inc_b = self.fb.create_block();
+                    let call_b = self.fb.create_block();
+                    self.fb.brif(counted, inc_b, &[], call_b, &[]);
+                    self.fb.seal_block(inc_b);
+                    self.fb.seal_block(call_b);
+                    self.fb.switch_to_block(inc_b);
+                    let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
+                    let strong = self.fb.load(PTR_MEM, payload, so);
+                    let one = self.ptrc(1);
+                    let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
+                    self.fb.store(PTR_MEM, payload, s1, so);
+                    if drop.is_some() {
+                        self.drop_at(at);
+                    }
+                    let objt = self.i32c(TAG_OBJ as i64);
+                    let strt = self.i32c(TAG_STR as i64);
+                    let tag = self.fb.select(is_obj, objt, strt);
+                    self.fb.store(MemKind::I32U8, dst, tag, 0);
+                    self.fb.store(MemKind::I64, dst, payload, VALUE_PAYLOAD);
+                    self.fb.jump(join, &[]);
+                    self.fb.switch_to_block(call_b);
                     let cv = self.i32c(drop.is_some() as i64);
                     self.call(Helper::UnpackClone, &[dst, w, cv]);
                     self.fb.jump(join, &[]);

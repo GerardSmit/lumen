@@ -96,10 +96,23 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      | map | 82 ns | 51 ns | 15 ns |
      | filter | 51 ns | 36 ns | 15 ns |
    - Left: push still makes one helper call plus a receiver clone per call; an inline IR append would close the rest.
-2. **Compound member assignment in the JIT (S).**
+2. ✅ **Done: compound member assignment in the JIT (S).**
    - What: lower `o.x += v` and `o[i] op= v` through the property IC.
-   - Why: it takes the generic one-op fallback today, at 75–100 ns.
-   - Closes: most of nbody 69× and scheduler 14×.
+   - Why: it took the generic one-op fallback, at 75–100 ns.
+   - Built:
+     - `AppendProp` (the fused `o.x += v`) is a number add plus the IC store when both operands are numbers, and the generic op otherwise.
+     - `ToPropKey` is lowered, so `a[k] op= v` stays in JIT code.
+     - Object and string retains are inline in `Dup` and in refcounted property reads.
+   - Release results, lumen (node):
+
+     | Case | Before | Now | Node |
+     |---|---|---|---|
+     | `o.x += i` | 85 ns | 17.5 ns | 1.3 ns |
+     | `a[i & 7] *= c` | 178 ns | 24.7 ns | 1.4 ns |
+     | `this.v += i` | 86 ns | 18 ns | 12 ns |
+     | nbody_200k | 1807 ms | 1157 ms | 27 ms |
+     | scheduler_200k | 1176 ms | 864 ms | 88 ms |
+   - Not closed: nbody and scheduler are now limited by general JIT code quality (item 17) and global reads (item 5), not by compound assignment.
 3. **Cheaper re-entry into JS (L).**
    - What: push a frame directly for setters, `fn.call`, `apply`, bound functions and promise jobs, instead of going through `Interp::call` (about 200 ns). Cut native entry into JIT code from 40–60 ns.
    - Also unlocks JIT resume after `await`, which is off today behind `LUMEN_JIT_RESUME` because it is a net loss.
@@ -151,6 +164,11 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
 16. **module.js (M).**
     - What: generate the 52 builtin ESM wrappers on demand. Move the CJS resolver into Rust and share it with `esm.rs`, which gains `exports` subpath patterns.
     - Saves: about 0.8 MB of startup memory.
+
+17. **JIT values in registers (L).** *(Added during item 2.)*
+    - What: keep object references loaded from properties in SSA instead of boxing them through stack memory, and elide retain/release pairs whose lifetimes nest (for example `const v = b.v` releases and re-takes the same count every iteration).
+    - Also: shorten the inline-cache guard chain of dependent loads for a repeated receiver, and avoid byte-store/word-load store-forwarding stalls in the emitted code.
+    - Evidence: `b.v.x -= c` takes 21 ns vs 1.2 ns, and `const v = b.v` 12 ns vs 0.75 ns. Nearly all of nbody's time is inside JIT code.
 
 ## Open items
 
