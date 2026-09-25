@@ -109,7 +109,7 @@ struct Layout {
     mirror_ptr: i32,
     mirror_len: i32,
     mirror_flags: i32,
-    /// `Vec<Property>` pointer / length words, relative to the boxed vector.
+    /// `PackedVec` first-element pointer / length words, relative to the boxed buffer.
     packed_ptr: i32,
     packed_len: i32,
     prop_size: i64,
@@ -152,7 +152,6 @@ fn layout() -> Option<&'static Layout> {
             let p = crate::value::jit_props_layout()?;
             let (u32_ptr, u32_len) = vec_layout::<u32>(7)?;
             let (f64_ptr, f64_len) = vec_layout::<f64>(7.0)?;
-            let (prop_ptr, prop_len) = vec_layout(Property::plain(crate::value::Value::Undefined))?;
             let props = obj + std::mem::offset_of!(Object, props);
             let i = |x: usize| i32::try_from(x).ok();
             Some(Layout {
@@ -174,8 +173,8 @@ fn layout() -> Option<&'static Layout> {
                 mirror_ptr: i(p.dense_mirror + f64_ptr)?,
                 mirror_len: i(p.dense_mirror + f64_len)?,
                 mirror_flags: i(p.dense_mirror_flags)?,
-                packed_ptr: i(prop_ptr)?,
-                packed_len: i(prop_len)?,
+                packed_ptr: i(p.packed_ptr)?,
+                packed_len: i(p.packed_len)?,
                 prop_size: std::mem::size_of::<Property>() as i64,
                 prop_packed: i(PROPERTY_PACKED_OFFSET)?,
                 prop_meta: i(PROPERTY_META_OFFSET)?,
@@ -307,7 +306,7 @@ fn element_prop(
     fb.seal_block(boxed);
     fb.seal_block(not_boxed);
 
-    // Boxed packed: `Box<Vec<Property>>`, indexed directly.
+    // Boxed packed: `Box<PackedVec>`, indexed directly.
     fb.switch_to_block(boxed);
     let len = fb.load(PTR_MEM, packed, l.packed_len);
     let inb = fb.icmp(IntCC::Ult, i, len);

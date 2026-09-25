@@ -7183,7 +7183,10 @@ fn run_vm_frames<const ONE: bool>(
             Op::NewArrayLit => stack.push(i.make_array(Vec::new())),
             Op::ArrayAppend => {
                 let v = pop!();
-                stack.with_vec(|s| ext_ops::array_append(s, std::iter::once(v), false));
+                stack.with_vec(|s| match s.last() {
+                    Some(Value::Obj(ao)) => ext_ops::append_one(ao, v),
+                    _ => unreachable!("array literal under construction"),
+                });
             }
             Op::ArrayAppendSpread => {
                 let v = pop!();

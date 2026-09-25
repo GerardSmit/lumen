@@ -1,5 +1,6 @@
 //! Optional dense buffers and inline packed property ownership.
 use super::{MIRROR_ALL_I32, MIRROR_NO_HOLES, MIRROR_OK};
+use super::PackedVec;
 use crate::value::{Property, Value};
 pub(in crate::value) const INLINE_PACKED_CAPACITY: usize = 10;
 
@@ -71,7 +72,7 @@ impl Drop for InlinePacked {
 }
 
 pub(in crate::value) struct DenseBuffers {
-    pub(in crate::value) packed: Option<Box<Vec<Property>>>,
+    pub(in crate::value) packed: Option<Box<PackedVec>>,
     pub(super) inline_packed: InlinePacked,
     pub(in crate::value) elems: Vec<u32>,
     pub(in crate::value) mirror: Vec<f64>,
@@ -183,7 +184,7 @@ impl DenseStorage {
         if len > INLINE_PACKED_CAPACITY {
             let mut packed = Vec::with_capacity(len);
             packed.extend(values.map(Property::plain));
-            self.init_in_box(slot, Some(Box::new(packed)));
+            self.init_in_box(slot, Some(Box::new(PackedVec::from(packed))));
             return;
         }
         self.init_in_box(slot, None);
@@ -237,7 +238,7 @@ impl DenseStorage {
     pub(in crate::value) unsafe fn init_in_box(
         &mut self,
         slot: *mut DenseBuffers,
-        packed: Option<Box<Vec<Property>>>,
+        packed: Option<Box<PackedVec>>,
     ) {
         use std::ptr::addr_of_mut;
         self.release();
@@ -284,10 +285,11 @@ impl DenseStorage {
         }
         self.as_deref_mut().expect("sidecar installed above")
     }
-    pub(in crate::value) fn packed_mut(&mut self) -> Option<&mut Vec<Property>> {
+    #[inline]
+    pub(in crate::value) fn packed_mut(&mut self) -> Option<&mut PackedVec> {
         let dense = self.as_deref_mut()?;
         if dense.packed.is_none() && dense.inline_packed.len != 0 {
-            dense.packed = Some(Box::new(dense.inline_packed.into_vec()));
+            dense.packed = Some(Box::new(PackedVec::from(dense.inline_packed.into_vec())));
         }
         dense.packed.as_deref_mut()
     }
@@ -299,10 +301,20 @@ impl DenseStorage {
             None => None,
         }
     }
+    /// The boxed packed buffer's remembered all-plain proof (inline storage has none).
+    /// The boxed packed buffer (not inline storage), if any.
+    #[inline]
+    pub(in crate::value) fn packed_boxed(&self) -> Option<&PackedVec> {
+        self.as_deref().and_then(|d| d.packed.as_deref())
+    }
+
+    pub(in crate::value) fn packed_known_plain(&self) -> bool {
+        self.as_deref().and_then(|d| d.packed.as_deref()).is_some_and(PackedVec::known_plain)
+    }
     pub(in crate::value) fn packed_is_some(&self) -> bool {
         self.packed_ref().is_some()
     }
-    pub(in crate::value) fn set_packed(&mut self, packed: Option<Box<Vec<Property>>>) {
+    pub(in crate::value) fn set_packed(&mut self, packed: Option<Box<PackedVec>>) {
         if packed.is_some() {
             let dense = self.buffers_mut();
             dense.inline_packed = InlinePacked::default();

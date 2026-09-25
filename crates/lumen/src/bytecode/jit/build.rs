@@ -347,6 +347,7 @@ fn build_region(
         .chain(plan.dname.keys().copied())
         .chain(plan.dmethod.keys().copied())
         .chain(plan.strm.keys().copied())
+        .chain(plan.arrm.keys().copied())
         .collect();
     let self_cell: Box<std::cell::Cell<usize>> = Box::new(std::cell::Cell::new(0));
     let self_entry = &*self_cell as *const std::cell::Cell<usize> as usize;
@@ -423,6 +424,7 @@ fn build_region(
             math_vars: HashMap::new(),
             ta_vars: HashMap::new(),
             ta_len_vars: HashMap::new(),
+            push_vars: HashMap::new(),
             ta_slots: (0..n_slots)
                 .map(|s| match slots.get(s) {
                     Some(Value::Obj(o)) => interp
@@ -946,6 +948,9 @@ struct Plan {
     /// Inline `String.prototype` intrinsic sites (`<string> GetMethod <Number>
     /// CallWithThis(1)`): `GetMethod` pc -> call pc.
     strm: HashMap<usize, usize>,
+    /// Inline `Array.prototype.push` sites (`<array> GetMethod(push) <value>
+    /// CallWithThis(1)`): `GetMethod` pc -> call pc.
+    arrm: HashMap<usize, usize>,
     /// Heap cells the direct sites' code embeds addresses of.
     boxes: Vec<Box<dyn std::any::Any>>,
     /// Direct self tail-call sites translated as a jump back to pc 0 (see `Tr::self_tail`),
@@ -1238,6 +1243,33 @@ fn plan(
         }
     }
 
+    // `<array>.push(<value>)`: the intrinsic push, receiver and method guarded at the
+    // `GetMethod` (see `Tr::arr_begin`); the one argument is a pure value (it runs after the
+    // guard, so it can't invalidate it).
+    for pc in header..=backedge {
+        if !reach(pc) || helpers::math_site_failed(chunk, pc) || p.math.contains_key(&pc.wrapping_sub(1)) {
+            continue;
+        }
+        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        if chunk.names.get(m as usize).map(|n| &**n) != Some("push") {
+            continue;
+        }
+        let call = match site_args(pc + 1, false) {
+            Some((call, args)) if args.len() == 1 => Some(call),
+            _ if pc + 2 <= backedge && !lead(pc + 1) && !lead(pc + 2) && matches!(ops[pc + 2], Op::CallWithThis(1)) => {
+                match ops[pc + 1] {
+                    Op::LoadLocal(s) if !tdzd.maybe_undef(s as usize, pc + 1) && !defd.maybe_undef(s as usize, pc + 1) => Some(pc + 2),
+                    Op::Const(_) | Op::Undef => Some(pc + 2),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(call) = call {
+            p.arrm.insert(pc, call);
+        }
+    }
+
     // `i < <a>.length` loop tests: the array source and the index slot.
     for pc in header..=backedge {
         if !reach(pc) || !matches!(ops[pc], Op::JumpIfNotCmp(CmpKind::Lt, _)) {
@@ -1424,6 +1456,9 @@ struct Tr<'a, 'f> {
     ta_slots: Vec<bool>,
     /// Typed-array length caches, per `length` read pc.
     ta_len_vars: HashMap<usize, TaLenVars>,
+    /// The receiver (payload word, 0 = none) that last passed a push site's guard, per
+    /// [`Plan::arrm`] site: the same array needs no re-check until JS runs.
+    push_vars: HashMap<usize, Variable>,
     /// Region handlers live at the op being translated (see [`Analysis::hs`]).
     hs_cur: Vec<(usize, usize)>,
     /// Handler sets named by resume exits (`frame.exit_hset - 1`).
@@ -1559,6 +1594,19 @@ impl<'a, 'f> Tr<'a, 'f> {
             .chain(self.math_vars.values().map(|&v| (v, Type::I32)))
             .chain(self.ta_vars.values().map(|t| (t.kind, Type::I32)))
             .chain(self.ta_len_vars.values().map(|t| (t.ok, Type::I32)))
+            .chain(self.push_vars.values().map(|&v| (v, PTR)))
+            .collect();
+        self.reset_vars(&vars);
+    }
+
+    /// Reset the element-storage views and in-bounds facts only (an array grew or shrank
+    /// natively; no JS ran).
+    fn invalidate_elems(&mut self) {
+        let vars: Vec<(Variable, Type)> = self
+            .arr_vars
+            .values()
+            .map(|a| (a.kind, Type::I32))
+            .chain(self.idx_vars.values().map(|&v| (v, Type::I32)))
             .collect();
         self.reset_vars(&vars);
     }
@@ -1629,6 +1677,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let math_part = self.plan.math.contains_key(&pc)
             || self.plan.math.values().any(|s| s.call == pc)
             || self.plan.strm.values().any(|&c| c == pc)
+            || self.plan.arrm.values().any(|&c| c == pc)
             || self.site_get_method(pc)
             || self.plan.dname.contains_key(&pc)
             || (self.plan.dmethod.contains_key(&pc)
@@ -1674,6 +1723,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         let pure = math_part
             || self.plan.strm.contains_key(&pc)
+            || self.plan.arrm.contains_key(&pc)
             || matches!(
                 op,
                 Op::Const(_)
@@ -2353,6 +2403,14 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.def_var(v, one);
             self.math_vars.insert(pc, v);
         }
+        let mut pushes: Vec<usize> = self.plan.arrm.keys().copied().collect();
+        pushes.sort_unstable();
+        for pc in pushes {
+            let v = self.fb.declare_var(PTR);
+            let zp = self.ptrc(0);
+            self.fb.def_var(v, zp);
+            self.push_vars.insert(pc, v);
+        }
         // String intrinsic sites check at the site (the guard needs the receiver).
         let mut strs: Vec<usize> = self.plan.strm.keys().copied().collect();
         strs.sort_unstable();
@@ -2881,6 +2939,12 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         if self.plan.strm.values().any(|&c| c == pc) {
             return self.str_call(pc);
+        }
+        if self.plan.arrm.contains_key(&pc) {
+            return self.arr_begin(pc);
+        }
+        if self.plan.arrm.values().any(|&c| c == pc) {
+            return self.arr_call(pc);
         }
         if let Some(site) = self.plan.math.values().find(|s| s.call == pc).copied() {
             return match site.f {
@@ -4075,6 +4139,90 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.drop_at(d - 3);
         self.stack.pop();
         self.stack.push(Entry::Num(r));
+        Ok(())
+    }
+
+    // ---- Array.prototype.push ----------------------------------------------------------------
+
+    /// The `GetMethod(push)` of an inline push site: [`Helper::ArrPushGuard`] proves the
+    /// receiver a plain Array reading the intrinsic push, else the code exits before the site
+    /// (the interpreter makes the call; the site is remembered). Pushes the placeholder callee.
+    fn arr_begin(&mut self, pc: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        let st = self.stack.clone();
+        if st.last() != Some(&Entry::Boxed) {
+            let pcv = self.i32c(pc as i64);
+            self.call(Helper::SiteFailed, &[self.frame, pcv]);
+            let yes = self.i32c(1);
+            self.exit_if(yes, pc, EXIT_RESUME, &st, d);
+        } else {
+            let var = *self
+                .push_vars
+                .get(&pc)
+                .ok_or_else(|| format!("no guard for the push site at {pc}"))?;
+            let recv = self.sptr(d - 1);
+            let tag = self.fb.load(MemKind::I32U8, recv, 0);
+            let obj_tag = self.i32c(TAG_OBJ as i64);
+            let is_obj = self.fb.icmp(IntCC::Eq, tag, obj_tag);
+            let payload = self.fb.load(PTR_MEM, recv, VALUE_PAYLOAD);
+            let known = self.fb.use_var(var);
+            let same = self.fb.icmp(IntCC::Eq, payload, known);
+            let fast = self.fb.binary(BinaryOp::Band, is_obj, same);
+            let check = self.fb.create_block();
+            let cont = self.fb.create_block();
+            self.fb.brif(fast, cont, &[], check, &[]);
+            self.fb.seal_block(check);
+            self.fb.switch_to_block(check);
+            let pcv = self.i32c(pc as i64);
+            let g = self.call_status(Helper::ArrPushGuard, &[self.frame, pcv, recv]);
+            let zero = self.i32c(0);
+            let bad = self.fb.icmp(IntCC::Eq, g, zero);
+            self.exit_if(bad, pc, EXIT_RESUME, &st, d);
+            self.fb.def_var(var, payload);
+            self.fb.jump(cont, &[]);
+            self.fb.seal_block(cont);
+            self.fb.switch_to_block(cont);
+        }
+        self.set_stack_tag(d, TAG_UNDEFINED);
+        self.stack.push(Entry::Boxed);
+        Ok(())
+    }
+
+    /// The `CallWithThis(1)` of an inline push site: [`Helper::ArrPush`] appends (or runs the
+    /// builtin when the dense append doesn't apply) and leaves the new length in the receiver's
+    /// slot.
+    fn arr_call(&mut self, pc: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        if d < 3 {
+            return Err(format!("push site stack at {pc}"));
+        }
+        self.box_from(d - 1);
+        let (recv, arg) = (self.sptr(d - 3), self.sptr(d - 1));
+        self.set_call_site(pc);
+        let st = self.call_status(Helper::ArrPush, &[self.frame, recv, arg]);
+        let below = self.stack[..d - 3].to_vec();
+        let one = self.i32c(STATUS_THROW as i64);
+        let threw = self.fb.icmp(IntCC::Eq, st, one);
+        self.exit_if(threw, pc, EXIT_THROW, &below, d - 3);
+        // The native append ran no JS: only element views of the (grown) array are stale.
+        let slow = self.i32c(helpers::STATUS_OK_SLOW as i64);
+        let ran = self.fb.icmp(IntCC::Eq, st, slow);
+        let inv = self.fb.create_block();
+        let fast = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(ran, inv, &[], fast, &[]);
+        self.fb.seal_block(inv);
+        self.fb.switch_to_block(inv);
+        self.invalidate_js();
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(fast);
+        self.fb.switch_to_block(fast);
+        self.invalidate_elems();
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        self.stack.truncate(d - 3);
+        self.stack.push(Entry::Boxed);
         Ok(())
     }
 

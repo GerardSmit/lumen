@@ -226,12 +226,19 @@ pub(crate) enum Helper {
     /// `(arr: *const Value, v: *mut Value)` — `ArrayAppend`: move `*v` (left `Undefined`) onto
     /// the end of the array literal `*arr`. No frame, no status (never throws, runs no JS).
     ArrayAppend,
+    /// `(f, pc: u32, recv: *const Value) -> u32`: 1 when `GetMethod(push)` at `pc` on `recv`
+    /// reads the intrinsic `Array.prototype.push` of a plain Array (else the site is marked
+    /// failed and 0 is returned).
+    ArrPushGuard,
+    /// `(f, recv: *mut Value, arg: *mut Value) -> status`: `recv.push(arg)` for a guarded site;
+    /// the new length replaces `recv`.
+    ArrPush,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 57] = [
+pub(crate) const ALL: [Helper; 59] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -289,6 +296,8 @@ pub(crate) const ALL: [Helper; 57] = [
     Helper::MakeClosureIn,
     Helper::BlkUpdate,
     Helper::ArrayAppend,
+    Helper::ArrPushGuard,
+    Helper::ArrPush,
 ];
 
 /// The IR signature of `h`.
@@ -351,6 +360,8 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::MakeClosureIn => (&[P, I32, I32, I32, P], &[]),
         Helper::BlkUpdate => (&[P, I32, P], &[I32]),
         Helper::ArrayAppend => (&[P, P], &[]),
+        Helper::ArrPushGuard => (&[P, I32, P], &[I32]),
+        Helper::ArrPush => (&[P, P, P], &[I32]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -416,14 +427,16 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::MakeLit => make_lit as *const () as usize,
         Helper::MakeRest => make_rest as *const () as usize,
         Helper::ArrayAppend => array_append as *const () as usize,
+        Helper::ArrPushGuard => arr_push_guard as *const () as usize,
+        Helper::ArrPush => arr_push as *const () as usize,
     } as u64)
 }
 
 /// [`Helper::ArrayAppend`].
 unsafe extern "C" fn array_append(arr: *const Value, v: *mut Value) {
-    let v = std::ptr::replace(v, Value::Undefined);
+    let v = crate::value::take_value_words(v);
     match &*arr {
-        Value::Obj(ao) => crate::bytecode::ext_ops::append_to(ao, std::iter::once(v), false),
+        Value::Obj(ao) => crate::bytecode::ext_ops::append_one(ao, v),
         _ => unreachable!("array literal under construction"),
     }
 }
@@ -1491,6 +1504,51 @@ pub(crate) unsafe extern "C" fn math_guard(f: *mut JitFrame, pc: u32) -> u32 {
         s.borrow_mut().insert(key);
     });
     0
+}
+
+// ---- Array.prototype.push ---------------------------------------------------------------------
+
+/// Whether `recv.push` reads the realm's intrinsic `Array.prototype.push`: `recv` is an
+/// ordinary Array without an own `push` whose prototype is `Array.prototype`, one realm, and
+/// `Array.prototype`'s own data property `push` holds the builtin.
+unsafe fn arr_push_check(f: *mut JitFrame, recv: &Value) -> Option<()> {
+    let Value::Obj(o) = recv else { return None };
+    let i = &*(*f).interp;
+    (!i.multi_realm() && crate::bytecode::iter_fast::array_push_ok(i, o, crate::builtins::nf_array_push))
+        .then_some(())
+}
+
+pub(crate) unsafe extern "C" fn arr_push_guard(f: *mut JitFrame, pc: u32, recv: *const Value) -> u32 {
+    if arr_push_check(f, &*recv).is_some() {
+        return 1;
+    }
+    let key = ((*f).chunk as usize, pc);
+    MATH_FAILED.with(|s| {
+        s.borrow_mut().insert(key);
+    });
+    0
+}
+
+pub(crate) unsafe extern "C" fn arr_push(f: *mut JitFrame, recv: *mut Value, arg: *mut Value) -> u32 {
+    let i = &mut *(*f).interp;
+    let this = crate::value::take_value_words(recv);
+    let v = crate::value::take_value_words(arg);
+    let Value::Obj(o) = &this else { unreachable!("guarded push receiver") };
+    let v = match crate::builtins::array_push_one(i, o, v) {
+        Ok(n) => {
+            std::ptr::write(recv, Value::Num(n));
+            return STATUS_OK;
+        }
+        Err(v) => v,
+    };
+    // The generic builtin may run setters or proxy traps: the caller's caches go stale.
+    match i.call_native_fast(crate::builtins::nf_array_push, this, std::slice::from_ref(&v)) {
+        Ok(r) => {
+            std::ptr::write(recv, r);
+            STATUS_OK_SLOW
+        }
+        Err(e) => fail(f, e),
+    }
 }
 
 // ---- String intrinsics -------------------------------------------------------------------------

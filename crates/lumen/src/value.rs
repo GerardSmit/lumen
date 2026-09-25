@@ -333,6 +333,54 @@ pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 /// an N-API C callback together with its `void*` and module handle.
 pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
+/// A `Value` from its two words: the tag byte (plus a `Bool`'s byte 1) and the payload.
+///
+/// # Safety
+/// `tag`/`payload` must spell a valid `Value` whose payload handle (if any) the caller owns.
+#[inline(always)]
+pub(crate) unsafe fn value_from_words(tag: u64, payload: u64) -> Value {
+    const { assert!(cfg!(target_endian = "little") && std::mem::size_of::<Value>() == 16) };
+    std::mem::transmute::<[u64; 2], Value>([tag, payload])
+}
+
+/// Move the `Value` out of `*p` (leaving `undefined`) with two word loads. JIT code stores a
+/// value's tag and payload separately, and a single 16-byte reload of such a slot can't be
+/// store-forwarded (see [`push_value`]); two 8-byte loads can.
+///
+/// # Safety
+/// `p` must point to a valid, owned `Value`.
+#[inline(always)]
+pub(crate) unsafe fn take_value_words(p: *mut Value) -> Value {
+    let w = p as *mut u64;
+    let (tag, payload) = (std::ptr::read_volatile(w), std::ptr::read_volatile(w.add(1)));
+    std::ptr::write_volatile(w, 0);
+    value_from_words(tag, payload)
+}
+
+/// `out.push(v)` as one full-width store. `Vec::push` keeps the value in a stack temporary
+/// across its grow check and then copies it with one 16-byte load, which can't be forwarded
+/// from the separate tag and payload stores that built it: every push stalls for the stores to
+/// retire (about 7 ns). Moving the bits out first lets them stay in registers.
+#[inline(always)]
+pub(crate) fn push_value(out: &mut Vec<Value>, v: Value) {
+    const _: () = assert!(std::mem::size_of::<Value>() == 16);
+    let bits: std::mem::MaybeUninit<[u64; 2]> = unsafe { std::mem::transmute(v) };
+    if out.len() == out.capacity() {
+        grow_values(out);
+    }
+    unsafe {
+        let n = out.len();
+        out.as_mut_ptr().add(n).cast::<std::mem::MaybeUninit<[u64; 2]>>().write(bits);
+        out.set_len(n + 1);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn grow_values(out: &mut Vec<Value>) {
+    out.reserve(1);
+}
+
 /// The engine value. `repr(u8)` with fixed discriminants gives it a *defined* layout — tag byte
 /// at offset 0, payload at offset 8. Tags 0..=4 are the trivially-copyable variants (no
 /// refcount).
@@ -455,19 +503,49 @@ impl PackedValue {
         PackedValue(bits)
     }
 
+    /// The number held, if any (no handle is touched).
+    #[inline(always)]
+    pub(crate) fn as_num(&self) -> Option<f64> {
+        match self.tag() {
+            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL | PACK_BOOL | PACK_BIGINT | PACK_STR | PACK_SYM
+            | PACK_OBJ => None,
+            _ => Some(f64::from_bits(self.0)),
+        }
+    }
+
+    /// Whether this holds exactly the object `g` (no refcount traffic).
+    #[inline(always)]
+    pub(crate) fn is_obj(&self, g: &Gc) -> bool {
+        self.tag() == PACK_OBJ
+            && self.0 & PACK_PAYLOAD == unsafe { std::mem::transmute_copy::<Gc, usize>(g) } as u64
+    }
+
     #[inline(always)]
     pub(crate) fn unpack(&self) -> Value {
-        match self.tag() {
-            PACK_UNDEFINED => Value::Undefined,
-            PACK_EMPTY => Value::Empty,
-            PACK_NULL => Value::Null,
-            PACK_BOOL => Value::Bool(self.0 & 1 != 0),
-            PACK_BIGINT => Value::BigInt(unsafe { self.clone_word() }),
-            PACK_STR => Value::Str(unsafe { self.clone_word() }),
-            PACK_SYM => Value::Sym(unsafe { self.clone_word() }),
-            PACK_OBJ => Value::Obj(unsafe { self.clone_word() }),
-            _ => Value::Num(f64::from_bits(self.0)),
-        }
+        // Built as two words and converted at once: a per-variant enum construction stores
+        // the tag byte and the payload separately into a temporary, and the 16-byte copy out
+        // of it then stalls on store forwarding (see `push_value`).
+        let (tag, payload) = match self.tag() {
+            PACK_UNDEFINED => (0, 0),
+            PACK_EMPTY => (1, 0),
+            PACK_NULL => (2, 0),
+            PACK_BOOL => (3 | (self.0 & 1) << 8, 0),
+            PACK_BIGINT => (5, unsafe { self.clone_bits::<crate::bigint::JsBigInt>() }),
+            PACK_STR => (6, unsafe { self.clone_bits::<crate::lstr::LStr>() }),
+            PACK_SYM => (7, unsafe { self.clone_bits::<Rc<SymbolData>>() }),
+            PACK_OBJ => (8, unsafe { self.clone_bits::<Gc>() }),
+            _ => (4, self.0),
+        };
+        // SAFETY: `Value` is `repr(u8)` with the tag byte at 0 (discriminants fixed above) and
+        // every payload at 8 (a `bool` at byte 1); the payload word is an owned handle.
+        unsafe { value_from_words(tag, payload) }
+    }
+
+    /// The payload handle after a refcount increment, as its bit pattern (owned by the caller).
+    #[inline(always)]
+    unsafe fn clone_bits<T: Clone>(&self) -> u64 {
+        let value = std::mem::ManuallyDrop::new(unsafe { self.clone_word::<T>() });
+        std::mem::transmute_copy::<T, usize>(&value) as u64
     }
 
     /// Consume the packed owner without a refcount round trip. Pointer payload bits become the
@@ -475,17 +553,19 @@ impl PackedValue {
     #[inline(always)]
     pub(crate) fn into_value(self) -> Value {
         let this = std::mem::ManuallyDrop::new(self);
-        match this.tag() {
-            PACK_UNDEFINED => Value::Undefined,
-            PACK_EMPTY => Value::Empty,
-            PACK_NULL => Value::Null,
-            PACK_BOOL => Value::Bool(this.0 & 1 != 0),
-            PACK_BIGINT => Value::BigInt(unsafe { this.read_word() }),
-            PACK_STR => Value::Str(unsafe { this.read_word() }),
-            PACK_SYM => Value::Sym(unsafe { this.read_word() }),
-            PACK_OBJ => Value::Obj(unsafe { this.read_word() }),
-            _ => Value::Num(f64::from_bits(this.0)),
-        }
+        let (tag, payload) = match this.tag() {
+            PACK_UNDEFINED => (0, 0),
+            PACK_EMPTY => (1, 0),
+            PACK_NULL => (2, 0),
+            PACK_BOOL => (3 | (this.0 & 1) << 8, 0),
+            PACK_BIGINT => (5, this.0 & PACK_PAYLOAD),
+            PACK_STR => (6, this.0 & PACK_PAYLOAD),
+            PACK_SYM => (7, this.0 & PACK_PAYLOAD),
+            PACK_OBJ => (8, this.0 & PACK_PAYLOAD),
+            _ => (4, this.0),
+        };
+        // SAFETY: as `unpack`; the payload's ownership moves out of `this`.
+        unsafe { value_from_words(tag, payload) }
     }
 
     /// Whether this word holds a counted reference (anything that needs a drop).
@@ -498,9 +578,19 @@ impl PackedValue {
 }
 
 impl Clone for PackedValue {
-    #[inline]
+    /// The same bits, after the payload handle's refcount increment (if it has one).
+    #[inline(always)]
     fn clone(&self) -> Self {
-        PackedValue::pack(self.unpack())
+        unsafe {
+            match self.tag() {
+                PACK_BIGINT => std::mem::forget(self.clone_word::<crate::bigint::JsBigInt>()),
+                PACK_STR => std::mem::forget(self.clone_word::<crate::lstr::LStr>()),
+                PACK_SYM => std::mem::forget(self.clone_word::<Rc<SymbolData>>()),
+                PACK_OBJ => std::mem::forget(self.clone_word::<Gc>()),
+                _ => {}
+            }
+        }
+        PackedValue(self.0)
     }
 }
 
@@ -1106,6 +1196,26 @@ impl Object {
         let len = values.len();
         let packed: Vec<Property> = values.into_iter().map(Property::plain).collect();
         Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot| unsafe {
+            d.init_in_box(slot, Some(Box::new(props::PackedVec::from(packed))))
+        })
+    }
+
+    /// A new plain Array holding a copy of `src`'s packed plain elements `start..end`, or `None`
+    /// when that run isn't all plain data elements in packed storage.
+    pub(crate) fn slice_packed(src: &Object, start: usize, end: usize, proto: Gc) -> Option<Gc> {
+        let run = src.props.clone_packed_run(start, end)?;
+        Some(Self::new_array_from_packed(Some(proto), run))
+    }
+
+    /// A plain Array owning `packed` (plain data elements) as its storage, with no per-element
+    /// conversion: the copy form of [`Object::new_array_from_vec`] for runs cloned straight out
+    /// of another array's packed storage.
+    fn new_array_from_packed(proto: Option<Gc>, packed: props::PackedVec) -> Gc {
+        let len = packed.len();
+        if len <= props::INLINE_PACKED_CAPACITY {
+            return Self::new_array_from_iter(proto, packed.iter().map(Property::value).collect::<Vec<_>>().into_iter());
+        }
+        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot| unsafe {
             d.init_in_box(slot, Some(Box::new(packed)))
         })
     }
@@ -1635,6 +1745,7 @@ pub(crate) const PROP_CONFIGURABLE: usize = 8;
 const PROP_FLAG_MASK: usize = 15;
 
 impl Clone for Property {
+    #[inline]
     fn clone(&self) -> Self {
         let flags = self.meta & PROP_FLAG_MASK;
         let ptr = self.meta & !PROP_FLAG_MASK;
@@ -1651,6 +1762,30 @@ impl Clone for Property {
         Property {
             packed: self.packed.clone(),
             meta,
+        }
+    }
+}
+
+impl Property {
+    /// Whether dropping this property does anything: an accessor box, or a value holding a
+    /// reference count. Bulk element drops skip the rest without a call each.
+    #[inline(always)]
+    pub(crate) fn needs_drop(&self) -> bool {
+        self.meta & !PROP_FLAG_MASK != 0
+            || matches!(self.packed.tag(), PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ)
+    }
+}
+
+/// Drop `len` properties at `ptr`, calling the drop glue only for those that need it.
+///
+/// # Safety
+/// As `std::ptr::drop_in_place` on the slice.
+#[inline]
+pub(crate) unsafe fn drop_properties(ptr: *mut Property, len: usize) {
+    for k in 0..len {
+        let p = ptr.add(k);
+        if (*p).needs_drop() {
+            std::ptr::drop_in_place(p);
         }
     }
 }
@@ -1692,6 +1827,7 @@ unsafe fn drop_accessors(ptr: usize) {
 }
 
 impl Property {
+    #[inline]
     pub(crate) fn data(
         value: Value,
         writable: bool,
@@ -1789,6 +1925,23 @@ impl Property {
         self.packed.unpack()
     }
     #[inline]
+    /// The number held by a data property, if any (no clone).
+    #[inline]
+    pub(crate) fn num_value(&self) -> Option<f64> {
+        if self.accessor() { None } else { self.packed.as_num() }
+    }
+    /// Whether this data property holds exactly the object `g` (no clone).
+    #[inline]
+    pub(crate) fn holds_obj(&self, g: &Gc) -> bool {
+        !self.accessor() && self.packed.is_obj(g)
+    }
+    /// Overwrite a data property that holds a number with the number `n` (no drop needed).
+    #[inline]
+    pub(crate) fn set_num_over_num(&mut self, n: f64) {
+        debug_assert!(self.packed.as_num().is_some() && !n.is_nan());
+        self.packed = PackedValue(n.to_bits());
+    }
+    #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
         self.packed = PackedValue::pack(value);
     }
@@ -1834,6 +1987,7 @@ impl Property {
         }
     }
     /// A default plain data property: writable, enumerable, configurable.
+    #[inline]
     pub(crate) fn plain(value: Value) -> Property {
         Property::data(value, true, true, true)
     }
