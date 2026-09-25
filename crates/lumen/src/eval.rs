@@ -6288,8 +6288,12 @@ impl Interp {
     }
 
     fn compare(&mut self, op: &str, l: Value, r: Value) -> Result<Value, Abrupt> {
-        let lp = self.to_primitive(&l, Hint::Number)?;
-        let rp = self.to_primitive(&r, Hint::Number)?;
+        let (lp, rp) = if let (Value::Obj(_), _) | (_, Value::Obj(_)) = (&l, &r) {
+            let lp = self.to_primitive(&l, Hint::Number)?;
+            (lp, self.to_primitive(&r, Hint::Number)?)
+        } else {
+            (l, r)
+        };
         if let (Value::Str(a), Value::Str(b)) = (&lp, &rp) {
             // String relational comparison is per UTF-16 code unit (which differs from `str`
             // byte order once supplementary-plane characters are involved).

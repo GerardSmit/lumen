@@ -2223,6 +2223,47 @@ thread_local! {
     static TA_EXIT: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, u32::MAX)) };
 }
 
+/// Exits a Number-speculating site takes before it is compiled without the speculation.
+const NUM_EXIT_LIMIT: u32 = 16;
+
+thread_local! {
+    /// Non-Number exits per speculating site `(chunk, pc)`; `u32::MAX` once it stopped
+    /// speculating.
+    static NUM_EXITS: std::cell::RefCell<std::collections::HashMap<(usize, u32), u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether site `pc` of `chunk` stopped speculating a Number result (see [`note_num_exit`]).
+pub(crate) fn no_num(chunk: &Chunk, pc: usize) -> bool {
+    NUM_EXITS.with(|m| {
+        m.borrow()
+            .get(&(chunk as *const Chunk as usize, pc as u32))
+            .is_some_and(|&n| n == u32::MAX)
+    })
+}
+
+/// Count a non-Number exit of the speculating site `pc`: true once it reached the limit (the
+/// caller retires the code, which then recompiles without the speculation).
+pub(crate) fn note_num_exit(chunk: &Chunk, pc: usize) -> bool {
+    let key = (chunk as *const Chunk as usize, pc as u32);
+    NUM_EXITS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 1 << 16 && !m.contains_key(&key) {
+            return false;
+        }
+        let n = m.entry(key).or_insert(0);
+        if *n == u32::MAX {
+            return false;
+        }
+        *n += 1;
+        if *n >= NUM_EXIT_LIMIT {
+            *n = u32::MAX;
+            return true;
+        }
+        false
+    })
+}
+
 /// Whether element site `pc` of `chunk` was fed typed arrays through fresh views (no cache)
 /// often: it is compiled typed-array first, with a view cache.
 pub(crate) fn ta_hot(chunk: &Chunk, pc: usize) -> bool {

@@ -511,6 +511,8 @@ struct Native {
     /// Resume points `(pc, operand-stack depth)` of function code: the op after each `await`,
     /// entered with `frame.resume` = 1 + the index (see [`on_resume`]).
     resumes: Vec<(usize, usize)>,
+    /// See [`build::Built::num_exits`].
+    num_exits: Vec<usize>,
 }
 
 fn log_enabled() -> bool {
@@ -600,6 +602,7 @@ fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native,
         kinds: built.kinds,
         guarded: built.guarded,
         resumes: built.resumes,
+        num_exits: built.num_exits,
     })
 }
 
@@ -1093,7 +1096,9 @@ fn enter(
                 Some((header, backedge))
                     if kind == EXIT_RESUME
                         && (native.guarded.contains(&exit_pc)
-                            || helpers::take_ta_exit(chunk, exit_pc)) =>
+                            || helpers::take_ta_exit(chunk, exit_pc)
+                            || (native.num_exits.contains(&exit_pc)
+                                && helpers::note_num_exit(chunk, exit_pc - 1))) =>
                 {
                     let mut loops = chunk.jit.loops.borrow_mut();
                     if let Some(l) = loops
@@ -1152,7 +1157,8 @@ fn fn_deopt(chunk: &Chunk, pc: usize, native: &Native) {
     }
     let jit = &chunk.jit;
     let mut fs = jit.func.borrow_mut();
-    let guarded = native.guarded.contains(&pc);
+    let guarded = native.guarded.contains(&pc)
+        || (native.num_exits.contains(&pc) && helpers::note_num_exit(chunk, pc - 1));
     if (guarded || helpers::take_ta_exit(chunk, pc))
         && fs.code.as_ref().is_some_and(|c| std::ptr::eq(&**c, native))
     {

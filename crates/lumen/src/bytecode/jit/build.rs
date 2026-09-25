@@ -90,6 +90,9 @@ pub(crate) struct Built {
     pub self_entry: usize,
     /// Resume points `(pc, depth)` after the `await`s of function code (see [`Tr::entry`]).
     pub resumes: Vec<(usize, usize)>,
+    /// Exit pcs (op pc + 1) of ops that speculated a Number result for their consumer (see
+    /// [`Tr::want_num`]) and exit on anything else.
+    pub num_exits: Vec<usize>,
 }
 
 /// Translate the loop `[header, backedge]` of `chunk`, specializing on the current `slots`.
@@ -346,6 +349,7 @@ fn build_region(
     let tail_loops = plan.tail_loops.len() as u32;
     an.back[0] += tail_loops;
     an.preds[0] += tail_loops;
+    let mut num_exits = Vec::new();
     let pins = std::mem::take(&mut plan.pins);
     let mut boxes = std::mem::take(&mut plan.boxes);
     let externs = plan.externs.clone();
@@ -451,6 +455,7 @@ fn build_region(
             self_entry,
             budget: None,
             call_flags: None,
+            num_exits: Vec::new(),
         };
         tr.entry(&an);
         tr.body(&an)?;
@@ -463,8 +468,10 @@ fn build_region(
             kinds: k,
             hsets: h,
             self_sizes,
+            num_exits: ne,
             ..
         } = tr;
+        num_exits = ne;
         fb.finish();
         kinds = k;
         hsets = h;
@@ -490,6 +497,7 @@ fn build_region(
         boxes,
         self_entry,
         resumes: resumes_out,
+        num_exits,
     })
 }
 
@@ -1505,6 +1513,8 @@ enum Opnd {
 }
 
 struct Tr<'a, 'f> {
+    /// See [`Built::num_exits`].
+    num_exits: Vec<usize>,
     /// The safepoint budget, kept in a variable (`frame.budget` is read once at entry: only
     /// this code and [`Helper::Safepoint`], which resets it, use it).
     budget: Option<Variable>,
@@ -2672,6 +2682,10 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// wants a Number (so the producer speculates Num and exits after itself on anything else),
     /// looking ahead within the basic block.
     fn want_num(&self, pc: usize, at: usize) -> bool {
+        // The site kept producing non-Numbers (see `helpers::note_num_exit`).
+        if helpers::no_num(self.chunk, pc) {
+            return false;
+        }
         let mut depth = at + 1;
         let mut q = pc + 1;
         while q <= self.backedge && !self.is_leader(q) {
@@ -5669,6 +5683,21 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.stack.truncate(d - 2);
                 self.stack.push(Entry::Bool(r));
             }
+            // A Boolean operand is ToNumber'd to 0/1 by arithmetic, relational and loose-equality
+            // operators alike (strict equality never equates it with a Number).
+            (Entry::Num(_) | Entry::Bool(_), Entry::Num(_) | Entry::Bool(_))
+                if !matches!(op, Op::StrictEq | Op::StrictNotEq) =>
+            {
+                let num = |tr: &mut Self, e: Entry| match e {
+                    Entry::Num(x) => x,
+                    Entry::Bool(x) => tr.fb.convert(ConvOp::FromSint, Type::F64, x),
+                    _ => unreachable!("Num or Bool"),
+                };
+                let (x, y) = (num(self, a), num(self, b));
+                self.stack.truncate(d - 2);
+                let r = compute(self, x, y)?;
+                self.stack.push(r);
+            }
             // A Boxed operand that holds a Number at run time still takes the inline path; the
             // result then lives in memory (Boxed) so both paths agree on the entry's kind.
             (
@@ -5712,6 +5741,31 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.stack.push(Entry::Num(param));
                     return Ok(());
                 }
+                // Relational and equality operators always produce a Boolean: the slow path's
+                // result joins unboxed too.
+                if cmp.is_some() {
+                    let pre = self.stack.clone();
+                    let slow = self.fb.create_block();
+                    let join = self.fb.create_block();
+                    let param = self.fb.append_block_param(join, Type::I32);
+                    let x = self.num_or_slow(a, d - 2, slow);
+                    let y = self.num_or_slow(b, d - 1, slow);
+                    let Entry::Bool(r) = compute(self, x, y)? else {
+                        unreachable!("comparison yields a Boolean")
+                    };
+                    self.fb.jump(join, &[r]);
+                    self.fb.seal_block(slow);
+                    self.fb.switch_to_block(slow);
+                    self.stack = pre.clone();
+                    self.generic(pc);
+                    let r = self.stack_bool(d - 2);
+                    self.fb.jump(join, &[r]);
+                    self.fb.seal_block(join);
+                    self.fb.switch_to_block(join);
+                    self.stack = pre[..d - 2].to_vec();
+                    self.stack.push(Entry::Bool(param));
+                    return Ok(());
+                }
                 let pre = self.stack.clone();
                 let slow = self.fb.create_block();
                 let join = self.fb.create_block();
@@ -5742,6 +5796,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// `at`: forward it to `join` (as F64 when `want`, exiting after the op otherwise).
     fn slow_to_join(&mut self, pc: usize, at: usize, want: bool, join: Block) {
         if want {
+            self.num_exits.push(pc + 1);
             let post = self.stack.clone();
             let tag = self.stack_tag(at);
             let four = self.i32c(TAG_NUM as i64);
