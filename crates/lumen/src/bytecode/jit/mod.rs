@@ -1278,6 +1278,188 @@ fn finish_handlers(
 // stack, oldest first, is therefore `fn_frames` followed by [`pending_frames`]. A stack trace
 // reads it that way; code that needs `&mut` access to a frame calls `sync_frames` first.
 
+/// Parameter values for a directly entered frame (see [`call_direct`]): at most `cap` are
+/// kept, surplus ones dropped.
+pub(crate) struct Seed {
+    p: *mut Value,
+    n: usize,
+    cap: usize,
+}
+
+impl Seed {
+    #[inline(always)]
+    pub(crate) fn push(&mut self, v: Value) {
+        if self.n < self.cap {
+            // SAFETY: `p[..cap]` are the frame's (uninitialized) parameter slots.
+            unsafe { self.p.add(self.n).write(v) };
+            self.n += 1;
+        } else {
+            super::drop_value_fast(v);
+        }
+    }
+
+    /// Whether another parameter would be kept.
+    #[inline(always)]
+    pub(crate) fn wants(&self) -> bool {
+        self.n < self.cap
+    }
+}
+
+/// Run `seed` into `p` (room for `chunk`'s parameters): the number of values written.
+///
+/// # Safety
+/// `p` has room for `min(n_params, n_slots)` values.
+pub(crate) unsafe fn seed_raw(p: *mut Value, chunk: &Chunk, seed: impl FnOnce(&mut Seed)) -> usize {
+    let mut s = Seed {
+        p,
+        n: 0,
+        cap: chunk.n_params.min(chunk.n_slots),
+    };
+    seed(&mut s);
+    s.n
+}
+
+/// Whether [`call_direct`] can run `chunk` now: it has function code and the shadow stack has
+/// room for its frame.
+#[inline(always)]
+pub(crate) fn direct_ready(chunk: &Chunk) -> bool {
+    let entry = chunk.jit.dentry.get();
+    // SAFETY: the shadow stack is this thread's and outlives it.
+    entry != 0 && unsafe {
+        let sh = shadow();
+        (*sh).top + chunk.jit.dsize.get() <= (*sh).end
+    }
+}
+
+/// A call of `chunk`'s function code straight from Rust (a prepared callback, see
+/// `bytecode::prepared_call`), made as a direct call site makes it (see `build::call`): the
+/// frame on the shadow stack, the code entered at its direct entry, a lazy call record for
+/// `fn_frames`, and any exit other than a return finished by the interpreter on the same slots
+/// (`helpers::finish_exit`). The caller checked [`direct_ready`] and did `Interp::call`'s
+/// entry work (the recursion depth, the GC poll) and does its exit work (a pending proper tail
+/// call, the depth). `seed` writes the arguments.
+///
+/// # Safety
+/// `chunk`, `env`, `fn_ptr` and the flags are those of a live compiled function (see
+/// `prepared_call::Compiled`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn call_direct(
+    i: &mut Interp,
+    chunk: &Chunk,
+    env: &Env,
+    fn_ptr: usize,
+    strict: bool,
+    arrow: bool,
+    this: &Value,
+    seed: impl FnOnce(&mut Seed),
+) -> Result<Value, Abrupt> {
+    let entry = chunk.jit.dentry.get();
+    let sh = shadow();
+    let top0 = (*sh).top;
+    (*sh).top = top0 + chunk.jit.dsize.get();
+    // --- enter_frame (an ordinary call) ---
+    let saved_ctor = std::mem::replace(&mut i.constructing, false);
+    let saved_nt = if !arrow && !matches!(i.new_target, Value::Undefined) {
+        Some(std::mem::replace(&mut i.new_target, Value::Undefined))
+    } else {
+        None
+    };
+    let this_val = if chunk.uses_this() {
+        i.bind_compiled_this_flags(strict, chunk, this.clone(), false)
+    } else {
+        Value::Undefined
+    };
+    let saved_strict = std::mem::replace(&mut i.strict, strict);
+    let saved_tco = std::mem::replace(&mut i.tco_ok, strict);
+    let saved_field_init = i.in_field_init_code;
+    let saved_agb = i.in_async_gen_body;
+    if !arrow {
+        i.in_field_init_code = false;
+        i.in_async_gen_body = false;
+    }
+    // [record | header | slots | operand-stack area] (the area needs no clearing, see `Shadow`)
+    let rec = top0 as *mut CallRec;
+    let nf = (top0 + REC_BYTES) as *mut JitFrame;
+    let slots = (top0 + REC_BYTES + FRAME_HDR) as *mut Value;
+    let n = chunk.n_slots;
+    let mut s = Seed {
+        p: slots,
+        n: 0,
+        cap: chunk.n_params.min(n),
+    };
+    seed(&mut s);
+    for k in s.n..n {
+        slots.add(k).write(Value::Undefined);
+    }
+    for &k in &chunk.var_force_resets {
+        super::drop_value_fast(std::ptr::replace(slots.add(k as usize), Value::Undefined));
+    }
+    nf.write(JitFrame {
+        exception: Value::Undefined,
+        budget: SAFEPOINT_BUDGET,
+        slots,
+        exit_depth: 0,
+        consts: chunk.consts.as_ptr(),
+        exit_hset: 0,
+        stack: slots.add(n),
+        canon: canon_flags(i),
+        interp: i as *mut Interp,
+        resume: 0,
+        chunk: chunk as *const Chunk,
+        pad2: 0,
+        env: env as *const Env,
+        pad3: 0,
+        this_val: &this_val as *const Value,
+        pad4: 0,
+        ta_data: std::ptr::null_mut(),
+        pad5: 0,
+        ta_len: 0,
+    });
+    // (The record's `pad` keeps its byte, see `CallRec`.)
+    (*rec).flags = if strict { REC_STRICT } else { 0 };
+    (*rec).site = std::mem::replace(&mut i.cur_site, crate::interpreter::frames::NO_SITE);
+    (*rec).link = i.jit_frames;
+    (*rec).coro = i.cur_coro;
+    (*rec).fn_ptr = fn_ptr;
+    i.jit_frames = rec as usize;
+    // --- run ---
+    let code: NativeFn = std::mem::transmute::<usize, NativeFn>(entry);
+    let word = code(nf);
+    let r = if word & 0xff == EXIT_RETURN {
+        let v = std::ptr::replace((*nf).stack, Value::Undefined);
+        for k in 0..n {
+            super::drop_value_fast(std::ptr::replace(slots.add(k), Value::Undefined));
+        }
+        Ok(v)
+    } else {
+        helpers::finish_exit(i, nf, word, entry)
+    };
+    // --- leave_frame ---
+    if (*rec).flags & REC_SYNCED != 0 {
+        i.fn_frames.pop();
+    }
+    i.jit_frames = (*rec).link;
+    i.cur_site = (*rec).site;
+    if cfg!(target_pointer_width = "32") {
+        let mut off = 0;
+        while off < FRAME_HDR {
+            *(nf as *mut u8).add(off) = 0;
+            off += 16;
+        }
+    }
+    (*sh).top = top0;
+    super::drop_value_fast(this_val);
+    i.strict = saved_strict;
+    i.tco_ok = saved_tco;
+    i.in_field_init_code = saved_field_init;
+    i.in_async_gen_body = saved_agb;
+    i.constructing = saved_ctor;
+    if let Some(nt) = saved_nt {
+        super::drop_value_fast(std::mem::replace(&mut i.new_target, nt));
+    }
+    r
+}
+
 /// Copy the pending direct-call records into `i.fn_frames` (see above). Call before pushing to
 /// `fn_frames`, and before reading it with `&mut` access (`f.caller` / `f.arguments`).
 #[inline(always)]

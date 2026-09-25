@@ -1924,7 +1924,6 @@ impl Property {
     pub(crate) fn value(&self) -> Value {
         self.packed.unpack()
     }
-    #[inline]
     /// The number held by a data property, if any (no clone).
     #[inline]
     pub(crate) fn num_value(&self) -> Option<f64> {

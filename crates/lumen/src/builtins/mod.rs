@@ -21,6 +21,7 @@ mod date;
 mod disposable;
 mod errors;
 mod function_proto;
+pub(crate) use function_proto::nf_function_call;
 mod globals;
 mod host;
 mod json;

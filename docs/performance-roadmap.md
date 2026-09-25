@@ -113,10 +113,32 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      | nbody_200k | 1807 ms | 1157 ms | 27 ms |
      | scheduler_200k | 1176 ms | 864 ms | 88 ms |
    - Not closed: nbody and scheduler are now limited by general JIT code quality (item 17) and global reads (item 5), not by compound assignment.
-3. **Cheaper re-entry into JS (L).**
+3. ✅ **Done: cheaper re-entry into JS (L).**
    - What: push a frame directly for setters, `fn.call`, `apply`, bound functions and promise jobs, instead of going through `Interp::call` (about 200 ns). Cut native entry into JIT code from 40–60 ns.
-   - Also unlocks JIT resume after `await`, which is off today behind `LUMEN_JIT_RESUME` because it is a net loss.
-   - Closes: setter 630×, fn.call and bound 24×, apply 19×, the `then` and Promise costs, and non-inlined callbacks.
+   - Built:
+     - JIT direct call sites take adaptors:
+       - `f.call(t, …)` and `f.apply(t, arr)` call `f`'s code directly. The `GetMethod` is validated like a method site, and apply's array is checked and spread into the slots by helpers.
+       - A bound function calls its target, guarded on the target rather than the bound object, so a fresh `bind` per call still hits.
+     - Accessors:
+       - Setters with an inlinable body are inlined, like getters were.
+       - Other getters and setters become direct calls behind the shape/holder probe.
+     - Sloppy↔strict calls switch strictness around the call, instead of always falling back to `Interp::call`.
+     - Native → JS: `jit::call_direct` enters the callee's JIT code on the shadow stack with no `Vec` frame. It is used by `PreparedCall` (map, forEach, sort comparators, replace callbacks, …) and by promise reaction jobs.
+   - Release results:
+
+     | Case | Before | Now | Node |
+     |---|---|---|---|
+     | setter | 273 ns | 7.7 ns | 0.5 ns |
+     | non-inlinable getter / setter | 130 / 126 ns | 31 / 26 ns | — |
+     | `f.call(o, …)` | 210 ns | 35.5 ns | 8.9 ns |
+     | `f.apply(o, arr)` | 332 ns | 76 ns | 18 ns |
+     | bound call | 229 ns | 24.8 ns | 10.7 ns |
+     | sort 1e5 with comparator | 136 ms | 101 ms | 36 ms |
+     | then_chain | 698 ns | 638 ns | 242 ns |
+   - Left:
+     - `fn_call`'s remaining cost is the global `LoadName` of `f` (item 5).
+     - then_chain is dominated by collector passes over the growing live chain, about 200 ns per traced object (item 13).
+     - JIT resume after `await` (`LUMEN_JIT_RESUME`) is still off.
 4. **Skip building `arguments` and rest arrays (M).**
    - What: read `a.length` and `a[k]` straight from the frame when the object doesn't escape.
    - Closes: arguments 1387× (1.09 µs per call) and rest params 88×.

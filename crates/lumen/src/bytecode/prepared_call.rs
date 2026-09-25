@@ -59,14 +59,14 @@ impl PreparedCall {
     #[inline]
     pub(crate) fn call(&mut self, i: &mut Interp, args: &mut [Value]) -> Result<Value, Abrupt> {
         match &mut self.kind {
-            Kind::Compiled(c) if compiled_ok(i, c) => {
-                call_compiled_prepared(i, c, &self.this, |slots, n| {
-                    let seed = n.min(args.len());
-                    for v in &mut args[..seed] {
-                        slots.push(std::mem::take(v));
+            Kind::Compiled(c) if compiled_ok(i, c) => call_compiled_prepared(i, c, &self.this, |s| {
+                for v in args.iter_mut() {
+                    if !s.wants() {
+                        break;
                     }
-                })
-            }
+                    s.push(std::mem::take(v));
+                }
+            }),
             Kind::Native(f) if i.depth < MAX_EVAL_DEPTH && !i.multi_realm() => {
                 let f = *f;
                 call_native_prepared(i, f, &self.this, args)
@@ -87,19 +87,11 @@ impl PreparedCall {
     ) -> Result<Value, Value> {
         let r = match &mut self.kind {
             Kind::Compiled(c) if compiled_ok(i, c) => {
-                call_compiled_prepared(i, c, &self.this, |slots, n| {
-                    if n >= 1 {
-                        slots.push(a);
-                    } else {
-                        drop_value_fast(a);
-                    }
-                    if n >= 2 {
-                        slots.push(b);
-                    } else {
-                        drop_value_fast(b);
-                    }
-                    if n >= 3 {
-                        slots.push(obj.clone());
+                call_compiled_prepared(i, c, &self.this, |s| {
+                    s.push(a);
+                    s.push(b);
+                    if s.wants() {
+                        s.push(obj.clone());
                     }
                 })
             }
@@ -135,6 +127,57 @@ impl PreparedCall {
             }
         }
     }
+}
+
+/// A single call `callee(arg)` with `this` undefined (a reaction job's handler) as a direct
+/// call of the callee's function code, when [`resolve`] would prepare it and it has some; `None`
+/// (nothing done, `arg` handed back) otherwise, and the caller takes [`Interp::call`].
+pub(crate) fn call_once_direct(
+    i: &mut Interp,
+    callee: &Value,
+    arg: Value,
+) -> Result<Result<Value, Abrupt>, Value> {
+    let Value::Obj(o) = callee else { return Err(arg) };
+    if matches!(i.tier, Tier::Interp) || i.depth >= MAX_EVAL_DEPTH || i.multi_realm() {
+        return Err(arg);
+    }
+    let key = Gc::as_ptr(o) as usize;
+    if !i.proxies.is_empty() && i.proxies.contains_key(&key) {
+        return Err(arg);
+    }
+    let (chunk, env, strict, arrow) = {
+        let b = o.borrow();
+        let Callable::User(u) = &b.call else { return Err(arg) };
+        let f = &u.func;
+        let Some(Some(chunk)) = f.code.get() else { return Err(arg) };
+        if f.is_generator
+            || f.is_async
+            || (!i.class_info.is_empty() && i.class_info.contains_key(&key))
+            || u.env.borrow().under_with
+            || chunk.activation_layout.is_some()
+            || chunk.arguments_slot.is_some()
+            || chunk.rest_slot.is_some()
+            || (chunk.reflect_args && reflect::enabled())
+            || !crate::bytecode::jit::direct_ready(chunk)
+        {
+            return Err(arg);
+        }
+        (chunk.clone(), u.env.clone(), f.is_strict, f.is_arrow)
+    };
+    i.depth += 1;
+    if let Err(e) = i.gc_check_amortized() {
+        i.depth -= 1;
+        return Ok(Err(e));
+    }
+    // SAFETY: a live compiled function (the checks above are `resolve`'s).
+    let r = unsafe {
+        crate::bytecode::jit::call_direct(i, &chunk, &env, key, strict, arrow, &Value::Undefined, |s| {
+            if s.wants() {
+                s.push(arg);
+            }
+        })
+    };
+    Ok(finish_call(i, r))
 }
 
 fn resolve(i: &mut Interp, callee: &Value) -> Kind {
@@ -189,14 +232,15 @@ fn resolve(i: &mut Interp, callee: &Value) -> Kind {
 }
 
 /// `Interp::call` → `call_compiled` → `enter_frame` / [`drive_vm`] / `leave_frame` for a
-/// [`Kind::Compiled`] callee, in the same order, on the prepared buffers. `seed` pushes the
-/// parameter values (at most `n_params`, its second argument) onto the empty slot vector.
+/// [`Kind::Compiled`] callee, in the same order, on the prepared buffers — or, when the callee
+/// has function code, as a direct call of it (`jit::call_direct`). `seed` writes the parameter
+/// values (surplus ones are dropped).
 #[inline]
 fn call_compiled_prepared(
     i: &mut Interp,
     c: &mut Compiled,
     this: &Value,
-    seed: impl FnOnce(&mut Vec<Value>, usize),
+    seed: impl FnOnce(&mut crate::bytecode::jit::Seed),
 ) -> Result<Value, Abrupt> {
     i.depth += 1;
     if let Err(e) = i.gc_check_amortized() {
@@ -204,6 +248,13 @@ fn call_compiled_prepared(
         return Err(e);
     }
     let chunk: &Chunk = &c.chunk;
+    if crate::bytecode::jit::direct_ready(chunk) {
+        // SAFETY: `c` is a live compiled function (see `resolve`).
+        let r = unsafe {
+            crate::bytecode::jit::call_direct(i, chunk, &c.env, c.fn_ptr, c.strict, c.arrow, this, seed)
+        };
+        return finish_call(i, r);
+    }
     // call_dispatch: a plain call is never constructing, and clears new.target (an arrow
     // inherits it).
     let saved_ctor = std::mem::replace(&mut i.constructing, false);
@@ -235,8 +286,14 @@ fn call_compiled_prepared(
         i.in_async_gen_body = false;
     }
     let slots = &mut c.slots;
+    slots.clear();
     slots.reserve(chunk.n_slots);
-    seed(slots, chunk.n_params);
+    // SAFETY: the seed writes at most `min(n_params, n_slots)` values into the reserved
+    // capacity, which then become the vector's first elements.
+    unsafe {
+        let n = crate::bytecode::jit::seed_raw(slots.as_mut_ptr(), chunk, seed);
+        slots.set_len(n);
+    }
     while slots.len() < chunk.n_slots {
         slots.push(Value::Undefined);
     }

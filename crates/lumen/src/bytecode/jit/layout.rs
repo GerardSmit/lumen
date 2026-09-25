@@ -1335,9 +1335,26 @@ pub(crate) fn getter_probe(
     getter: u64,
     miss: Block,
 ) {
+    accessor_probe(fb, v, shapes, slot, getter, false, miss)
+}
+
+/// [`getter_probe`] for the accessor's setter (`set`) or getter.
+pub(crate) fn accessor_probe(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    shapes: &[u32],
+    slot: u32,
+    getter: u64,
+    set: bool,
+    miss: Block,
+) {
     use crate::value::{Accessors, Value};
     // `Some(v)` must be `v` bitwise (the tag's niche encodes `None`).
-    let get_off = std::mem::offset_of!(Accessors, get);
+    let get_off = if set {
+        std::mem::offset_of!(Accessors, set)
+    } else {
+        std::mem::offset_of!(Accessors, get)
+    };
     let bits_ok = std::mem::size_of::<Option<Value>>() == std::mem::size_of::<Value>()
         && std::mem::size_of::<Value>() == 16
         && VALUE_PAYLOAD == 8

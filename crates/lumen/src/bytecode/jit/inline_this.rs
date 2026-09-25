@@ -602,6 +602,48 @@ impl Tr<'_, '_> {
         true
     }
 
+    /// A property store `obj.<name> = v` (at `pc`, the value on top of the stack; `consume`:
+    /// the receiver's stack index when the store consumes it) that the planner resolved to a
+    /// setter with an inlinable body: the setter's identity is checked along the receiver's
+    /// lookup chain, then its body runs inline with `v` as its argument, and the operands are
+    /// released. Leaves the translation in the block where anything else continues (with the
+    /// stack as before), after emitting a jump to `done` for the inline case; `false` (nothing
+    /// emitted) when the body does not fit.
+    pub(super) fn inline_setter(
+        &mut self,
+        obj: V,
+        consume: Option<usize>,
+        g: &Getter,
+        done: Block,
+    ) -> bool {
+        let d = self.stack.len();
+        let kind = match self.stack[d - 1] {
+            Entry::Num(_) => K::Num,
+            Entry::Bool(_) => K::Bool,
+            Entry::Boxed | Entry::Ref(..) => K::Mem,
+        };
+        if dry(&g.body, &|k| if k == 0 { kind } else { K::Undef }).is_none() {
+            return false;
+        }
+        let pre = self.stack.clone();
+        let miss = self.fb.create_block();
+        layout::accessor_probe(&mut self.fb, obj, &g.shapes, g.slot, g.getter as u64, true, miss);
+        let eb = layout::probed_entries(&mut self.fb, obj, g.body.max_slot, g.body.writes, miss);
+        let (_, stored) = self.this_emit(&g.body, eb, &pre, d - 1, 1, false, miss);
+        self.this_commit(eb, &stored);
+        if pre[d - 1] == Entry::Boxed {
+            self.drop_at(d - 1);
+        }
+        if let Some(i) = consume {
+            self.drop_at(i);
+        }
+        self.fb.jump(done, &[]);
+        self.fb.seal_block(miss);
+        self.fb.switch_to_block(miss);
+        self.stack = pre;
+        true
+    }
+
     /// Operand `v` of an inlined body as a Number (F64), branching to `miss` when it is not one.
     fn this_num(&mut self, v: Av, entries: &[Entry], ab: usize, miss: Block) -> V {
         match v {
@@ -637,14 +679,15 @@ impl Tr<'_, '_> {
     }
 }
 
-/// A property read resolved to an inlinable getter (see [`Tr::inline_getter`]).
+/// A property read (or store) resolved to an inlinable getter (setter), see
+/// [`Tr::inline_getter`] and [`Tr::inline_setter`].
 #[derive(Clone)]
 pub(super) struct Getter {
     /// The receiver's and prototypes' shape ids down to the holder.
     pub shapes: Vec<u32>,
     /// The holder's entry slot of the accessor.
     pub slot: u32,
-    /// The getter's payload word, as a `Value` stores it.
+    /// The getter's (setter's) payload word, as a `Value` stores it.
     pub getter: usize,
     pub body: ThisBody,
 }
@@ -653,6 +696,16 @@ pub(super) struct Getter {
 /// the lookup is a chain of ordinary plain objects of shared shapes (at most 4 levels); with
 /// the getter function (for the plan to keep alive).
 pub(super) fn getter_site(i: &Interp, recv: &Value, name: &str) -> Option<(Getter, Value)> {
+    accessor_site(i, recv, name, false)
+}
+
+/// [`getter_site`] for a store: the setter `recv.<name> = v` calls, when its body (of one
+/// parameter) is inlinable on `recv`.
+pub(super) fn setter_site(i: &Interp, recv: &Value, name: &str) -> Option<(Getter, Value)> {
+    accessor_site(i, recv, name, true)
+}
+
+fn accessor_site(i: &Interp, recv: &Value, name: &str, set: bool) -> Option<(Getter, Value)> {
     let Value::Obj(o) = recv else { return None };
     let mut cur = o.clone();
     let mut shapes = Vec::new();
@@ -674,7 +727,7 @@ pub(super) fn getter_site(i: &Interp, recv: &Value, name: &str) -> Option<(Gette
                 if !p.accessor() {
                     return None;
                 }
-                let g = p.getter()?.clone();
+                let g = if set { p.setter() } else { p.getter() }?.clone();
                 if !matches!(g, Value::Obj(_)) {
                     return None;
                 }
@@ -682,11 +735,11 @@ pub(super) fn getter_site(i: &Interp, recv: &Value, name: &str) -> Option<(Gette
                 let slot = u32::try_from(slot).ok()?;
                 drop(b);
                 let ic = crate::bytecode::inline_callee(i, &g)?;
-                if ic.arrow || ic.chunk.n_params > 0 {
+                if ic.arrow || ic.chunk.n_params != set as usize {
                     return None;
                 }
                 let body = this_body(&ic.chunk, recv, shapes[0], &private_keys(i, &g))?;
-                if body.writes {
+                if body.writes && !set {
                     return None;
                 }
                 return Some((
