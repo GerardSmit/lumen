@@ -14,7 +14,7 @@ mod num_fmt;
 mod array_iterator;
 mod atomics;
 pub(crate) mod collection_data;
-mod collections;
+pub(crate) mod collections;
 use collections::brand::{coll_ptr, coll_ptr_kind};
 mod dataview;
 mod date;

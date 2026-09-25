@@ -193,10 +193,30 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      | ctor_new_target | 1363 ns | 123 ns | 9.5 ns |
 
    - Left: the plain-constructor allocation cost, which item 8 covers.
-7. **Iterators in the JIT (M).**
-   - What: direct `IterStep` lowering for Map, Set, entries/keys and generator iterators. Fix the handler-region lowering, so a for-of body isn't compiled through generic helpers.
-   - Why: the JIT is currently slower than the interpreter for for-of (119 vs 55 ns).
-   - Closes: map_keys 124×, map_entries 42×, map for-of 26×, for_of 9.4×.
+7. ✅ **Done: iterators in the JIT (M).**
+   - Why: the JIT was slower than the interpreter for for-of (119 vs 55 ns).
+   - Built:
+     - The JIT loses to the interpreter because of Boxed arithmetic, not the iterator: `s += v` with a Boxed `v` went through two helpers.
+       - `arith_local` now does `+ - * /` inline when both operands are Numbers at run time, for an in-memory destination.
+       - `binary_num` no longer computes ToInt32 (an `fmod`) for non-bitwise ops.
+     - An encoded Array for-of state is stepped inline: index < length, dense data element.
+     - Map/Set iterator objects (`keys()` / `values()` / `entries()`) under the intrinsic `next` are stepped in place in `iterator_step`, with no call and no result object.
+       - The iterator's internal slots are read by a shape-cached layout, with no per-step key lookups or `Rc<str>` allocations.
+       - The JIT helper reports such a step as "no JS ran".
+     - `DestructureArr` of a pristine dense Array in JIT code calls `try_dense` directly instead of the generic op.
+   - Release results:
+
+     | Case | Before | Now | Node |
+     |---|---|---|---|
+     | for_of | 119 ns | 19 ns | 12.7 ns |
+     | set_iter | 101 ns | 32 ns | 3.5 ns |
+     | map_keys | 432 ns | 71 ns | 3.6 ns |
+     | map_entries | 410 ns | 128 ns | 9.7 ns |
+     | map for-of `[k, v]` | 261 ns | 152 ns | 10 ns |
+
+   - Left:
+     - Map/Set entries still allocate the `[k, v]` pair, and each allocation costs about 50 ns; item 8 covers this.
+     - Set states and generators still step through the helper.
 8. **Inline slab allocation from JIT code (M).**
    - What: pop the free list and initialize the box natively.
    - Needs: the heap to expose each size class's free-list head and the box layout.
