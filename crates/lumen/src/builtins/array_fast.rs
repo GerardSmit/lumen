@@ -39,6 +39,33 @@ pub(super) fn own_elem(o: &Gc, k: usize) -> Option<Value> {
     }
 }
 
+/// Scan the packed plain elements `from..len` of `o` under one borrow for the first `hit`:
+/// `Some(found)` when the whole range was read natively (no holes or accessors, which need the
+/// generic per-index steps), `None` to fall back. Reading them runs no user code.
+fn dense_find(o: &Gc, from: usize, len: usize, mut hit: impl FnMut(&Value) -> bool) -> Option<Option<usize>> {
+    let b = o.borrow();
+    if !plain_elems(&b) {
+        return None;
+    }
+    let packed = b.props.packed_elements()?;
+    if packed.len() < len {
+        return None;
+    }
+    for (k, p) in packed.get(from..len)?.iter().enumerate() {
+        if p.accessor() {
+            return None;
+        }
+        let v = p.value();
+        if matches!(v, Value::Empty) {
+            return None;
+        }
+        if hit(&v) {
+            return Some(Some(from + k));
+        }
+    }
+    Some(None)
+}
+
 /// HasProperty(O, k) and, when present, Get(O, k).
 #[inline]
 pub(super) fn has_get(
@@ -268,7 +295,7 @@ impl Out {
     #[inline]
     pub(super) fn put(&mut self, i: &mut Interp, k: usize, v: Value) -> Result<(), Value> {
         if self.slow.is_none() && k == self.fast.len() {
-            self.fast.push(v);
+            crate::value::push_value(&mut self.fast, v);
             return Ok(());
         }
         if self.slow.is_none() {
@@ -537,6 +564,11 @@ pub(super) fn array_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Res
         target,
         Value::Num(_) | Value::Str(_) | Value::Obj(_) | Value::Undefined | Value::Null | Value::Bool(_)
     );
+    if simple {
+        if let Some(r) = dense_find(&o, from, len, |v| strict_eq(v, &target)) {
+            return Ok(Value::Num(r.map_or(-1.0, |k| k as f64)));
+        }
+    }
     let ov = Value::Obj(o.clone());
     for k in from..len {
         let v = match own_elem(&o, k) {
@@ -615,6 +647,9 @@ pub(super) fn array_includes(i: &mut Interp, this: Value, args: &[Value]) -> Res
             }
         }
     };
+    if let Some(r) = dense_find(&o, k as usize, len as usize, |v| same_value_zero(v, &target)) {
+        return Ok(Value::Bool(r.is_some()));
+    }
     let ov = Value::Obj(o.clone());
     while k < len {
         let v = get_elem(i, &o, &ov, k as usize)?;
@@ -674,6 +709,10 @@ pub(super) fn array_join(i: &mut Interp, this: Value, args: &[Value]) -> Result<
     Ok(Value::from_string(out))
 }
 
+/// Short slices go through the generic `Out` path (its small-array allocation is already one
+/// block); longer ones clone the packed run directly.
+const INLINE_SLICE_MAX: usize = 16;
+
 pub(super) fn array_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
     // The total length may be near 2^53 for an array-like; only the copied span (end-start) is
@@ -686,6 +725,18 @@ pub(super) fn array_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result
     };
     let count = (end - start).max(0) as usize;
     let custom = species(i, &this, count)?;
+    // Dense fast path: clone the packed run property by property into the result's storage.
+    if custom.is_none() && count > INLINE_SLICE_MAX {
+        let copy = {
+            let b = o.borrow();
+            plain_elems(&b)
+                .then(|| crate::value::Object::slice_packed(&b, start as usize, end as usize, i.array_proto.clone()))
+                .flatten()
+        };
+        if let Some(a) = copy {
+            return Ok(Value::Obj(a));
+        }
+    }
     let mut out = Out::new(custom, count);
     let ov = Value::Obj(o.clone());
     let mut k = start;
@@ -783,6 +834,26 @@ pub(super) fn array_splice_impl(
     }
     // The removed array (ArraySpeciesCreate) preserves holes via HasProperty.
     let custom = species(i, &this, delete_count.max(0) as usize)?;
+    // Dense fast path: a packed array of plain elements splices its buffer directly (when it
+    // grows, the new indices must not reach a prototype setter).
+    let item_count = items.len() as i64;
+    if custom.is_none()
+        && matches!(o.borrow().exotic, Exotic::Array)
+        && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
+        && (item_count <= delete_count || (o.borrow().extensible && i.array_append_unshadowed(&o)))
+    {
+        let mut b = o.borrow_mut();
+        let new_len = len - delete_count + item_count;
+        if plain_len(&b) == Some(len as u32) && new_len <= u32::MAX as i64 {
+            if let Some(removed) =
+                b.props.splice_packed(len as u32, start as usize, delete_count as usize, items)
+            {
+                store_len(&mut b, new_len as u32);
+                drop(b);
+                return Ok(i.make_array(removed));
+            }
+        }
+    }
     let mut removed = Out::new(custom, delete_count.max(0) as usize);
     for k in 0..delete_count {
         if let Some(v) = has_get(i, &o, &ov, (start + k) as usize)? {
@@ -790,7 +861,6 @@ pub(super) fn array_splice_impl(
         }
     }
     let removed = removed.finish(i, Some(delete_count as usize))?;
-    let item_count = items.len() as i64;
     // Shift the trailing elements (preserving holes) to open or close the gap.
     if item_count < delete_count {
         for k in start..(len - delete_count) {
@@ -821,8 +891,34 @@ pub(super) fn array_splice_impl(
     Ok(removed)
 }
 
+/// The array's own writable data `length` as a `u32`, for the dense fast paths.
+fn plain_len(o: &crate::value::Object) -> Option<u32> {
+    match o.props.length_property() {
+        Some(p) if !p.accessor() && p.writable() => match p.value() {
+            Value::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => Some(n as u32),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn store_len(o: &mut crate::value::Object, n: u32) {
+    let s = o.props.slot_of("length").unwrap();
+    o.props.entry_at_mut(s).unwrap().set_value(Value::Num(n as f64));
+}
+
 pub(super) fn array_shift(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    // Dense fast path: a packed array of plain elements drops its first slot in O(1).
+    if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize) {
+        let mut b = o.borrow_mut();
+        if let Some(len) = plain_len(&b).filter(|&n| n > 0) {
+            if let Some(v) = b.props.shift_packed(len) {
+                store_len(&mut b, len - 1);
+                return Ok(v);
+            }
+        }
+    }
     let ov = Value::Obj(o.clone());
     let len = checked_len_of(i, &o)?;
     if len == 0 {
@@ -843,6 +939,23 @@ pub(super) fn array_shift(i: &mut Interp, this: Value, _args: &[Value]) -> Resul
 
 pub(super) fn array_unshift(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    // Dense fast path: the new indices can't reach a setter (no elements on the array
+    // prototypes), so prepending into front slack is the whole effect.
+    if !args.is_empty()
+        && matches!(o.borrow().exotic, Exotic::Array)
+        && o.borrow().extensible
+        && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
+        && i.array_append_unshadowed(&o)
+    {
+        let mut b = o.borrow_mut();
+        if let Some(len) = plain_len(&b) {
+            let n = len as u64 + args.len() as u64;
+            if n <= u32::MAX as u64 && b.props.unshift_packed(len, args) {
+                store_len(&mut b, n as u32);
+                return Ok(Value::Num(n as f64));
+            }
+        }
+    }
     let ov = Value::Obj(o.clone());
     let len = len_of(i, &o)? as u64;
     let n = args.len() as u64;

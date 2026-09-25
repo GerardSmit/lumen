@@ -77,6 +77,8 @@ pub(crate) struct IterProof {
     arr: RefCell<Option<Proof>>,
     /// Map, Set.
     coll: [RefCell<Option<Proof>>; 2],
+    /// `Array.prototype.push` (see [`array_push_ok`]).
+    push: RefCell<Option<Proof>>,
 }
 
 /// Whether `o` is a data property slot `slot` of `holder` holding exactly `f`.
@@ -87,9 +89,7 @@ fn holds_at(holder: &Gc, slot: usize, f: &Gc) -> bool {
         return false;
     };
     b.ic_plain.get()
-        && b.props.entry_at(slot).is_some_and(|p| {
-            !p.accessor() && matches!(p.value(), Value::Obj(v) if Gc::ptr_eq(&v, f))
-        })
+        && b.props.entry_at(slot).is_some_and(|p| p.holds_obj(f))
 }
 
 /// The protector for Arrays: iterating `o` is exactly the intrinsic Array Iterator, with no
@@ -135,8 +135,55 @@ fn array_ok_slow(i: &Interp, o: &Gc, shape: u32) -> bool {
         Some(Value::Obj(f)) => f,
         _ => return true,
     };
-    remember(&i.lang.iter_proof.arr, ap, aip, &key, values, next, shape);
+    remember(&i.lang.iter_proof.arr, ap, aip, &key, "next", values, next, shape);
     true
+}
+
+/// Whether `o.push` reads the intrinsic `Array.prototype.push`: `o` is a plain Array whose
+/// prototype is `Array.prototype`, it has no own `push`, and `Array.prototype`'s own data
+/// property `push` holds `push`. The proof is memoized like the iteration protectors (its
+/// `ip`/`next` half repeats the `push` slot, since there is no second object to watch).
+#[inline]
+pub(crate) fn array_push_ok(i: &Interp, o: &Gc, push: crate::value::NativeFn) -> bool {
+    // SAFETY: a pure read; nothing below can borrow mutably.
+    let shape = {
+        let Ok(b) = (unsafe { o.try_borrow_unguarded() }) else {
+            return false;
+        };
+        if !matches!(b.exotic, Exotic::Array)
+            || !b.ic_plain.get()
+            || !matches!(&b.proto, Some(p) if Gc::ptr_eq(p, &i.array_proto))
+        {
+            return false;
+        }
+        b.props.shape()
+    };
+    if let Some(p) = &*i.lang.iter_proof.push.borrow() {
+        if p.holds(&i.array_proto, shape) {
+            return true;
+        }
+    }
+    array_push_ok_slow(i, o, shape, push)
+}
+
+#[cold]
+fn array_push_ok_slow(i: &Interp, o: &Gc, shape: u32, push: crate::value::NativeFn) -> bool {
+    if o.borrow().props.slot_of("push").is_some() {
+        return false;
+    }
+    let ap = i.array_proto.clone();
+    let f = match ap.borrow().props.get("push") {
+        Some(p) if !p.accessor() => match p.value() {
+            Value::Obj(f) => f,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let native = matches!(f.borrow().call, crate::value::Callable::Native(fp) if fp as usize == push as usize);
+    if native {
+        remember(&i.lang.iter_proof.push, ap.clone(), ap, "push", "push", f.clone(), f, shape);
+    }
+    native
 }
 
 fn iter_key(i: &Interp) -> Option<String> {
@@ -149,6 +196,7 @@ fn remember(
     proto: Gc,
     ip: Gc,
     key: &str,
+    ip_key: &str,
     iter_fn: Gc,
     next: Gc,
     shape: u32,
@@ -160,7 +208,7 @@ fn remember(
         return;
     }
     let (Some(proto_slot), Some(ip_slot)) =
-        (proto.borrow().props.slot_of(key), ip.borrow().props.slot_of("next"))
+        (proto.borrow().props.slot_of(key), ip.borrow().props.slot_of(ip_key))
     else {
         return;
     };
@@ -236,6 +284,7 @@ fn coll_ok_slow(i: &Interp, o: &Gc, idx: usize, proto_key: &str, proto: &Gc, sha
         proto.clone(),
         ip.clone(),
         &key,
+        "next",
         iter_fn.clone(),
         next.clone(),
         shape,

@@ -74,11 +74,28 @@ Ratio means lumen time divided by node time, using the minimum of the timed runs
 
 Effort: **S** means a day or less, **M** a few days, **L** a week or more.
 
-1. **Array front-slack (M).**
+1. ✅ **Done: array front-slack (M).**
    - What: keep the first-element offset separate from the allocation start, so shift, unshift and `splice(0, …)` are O(1) amortized.
    - Also fix the push path in the same change: a native in-capacity append in the JIT, and an integer length field instead of the string-keyed length sync.
-   - Why: today these run the spec's per-index loop in `array_fast.rs` at about 32 ns per element.
-   - Closes: queue push+shift 3559×, unshift+pop 176×, splice 38×, push 18× (123 vs 7 ns), and the map/filter result append.
+   - Why: these used to run the spec's per-index loop in `array_fast.rs` at about 32 ns per element.
+   - Built:
+     - `PackedVec` has front slack, and shift, unshift and `splice` have fast paths.
+     - A JIT `push` intrinsic whose guard is cached per receiver.
+     - A single-borrow append that finds `length` once.
+     - A "flat" proof (no heap handles), so copying and dropping such arrays is a `memcpy` and a free.
+     - Fixed along the way: `push` on a non-extensible array now throws, as in node.
+   - Release results, lumen vs node:
+
+     | Case | Before | Now | Node |
+     |---|---|---|---|
+     | queue push+shift | 3559× | 167 ns | 94 ns |
+     | unshift+pop | 176× | 254 ns (lumen faster) | 1892 ns |
+     | splice | 38× | 997 ns | 897 ns |
+     | push | 123 ns | 38 ns | 7.8 ns |
+     | slice_1k | ~12 µs | 644 ns | 392 ns |
+     | map | 82 ns | 51 ns | 15 ns |
+     | filter | 51 ns | 36 ns | 15 ns |
+   - Left: push still makes one helper call plus a receiver clone per call; an inline IR append would close the rest.
 2. **Compound member assignment in the JIT (S).**
    - What: lower `o.x += v` and `o[i] op= v` through the property IC.
    - Why: it takes the generic one-op fallback today, at 75–100 ns.

@@ -138,7 +138,7 @@ fn packed_elements(values: impl ExactSizeIterator<Item = Value>) -> Option<Dense
         let mut packed = Vec::with_capacity(len);
         packed.extend(values.map(Property::plain));
         assert_eq!(packed.len(), len, "incorrect exact iterator length");
-        Some(packed_buffers(InlinePacked::default(), Some(Box::new(packed))))
+        Some(packed_buffers(InlinePacked::default(), Some(Box::new(packed.into()))))
     }
 }
 
@@ -149,7 +149,7 @@ fn array_length_prop(len: usize) -> Property {
 
 #[cfg(test)]
 #[allow(clippy::box_collection)]
-fn packed_buffers(inline_packed: InlinePacked, packed: Option<Box<Vec<Property>>>) -> DenseBuffers {
+fn packed_buffers(inline_packed: InlinePacked, packed: Option<Box<super::PackedVec>>) -> DenseBuffers {
     DenseBuffers {
         packed,
         inline_packed,

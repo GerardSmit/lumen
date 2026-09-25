@@ -43,6 +43,19 @@ impl Property {
         self.packed.tag() == PACK_EMPTY
     }
 
+    /// [`Clone::clone`] for a data property (no accessor box).
+    #[inline(always)]
+    pub(super) fn clone_plain(&self) -> Property {
+        debug_assert!(!self.accessor());
+        Property { packed: self.packed.clone(), meta: self.meta }
+    }
+
+    /// A present, writable, enumerable, configurable data property.
+    pub(super) fn is_plain_element(&self) -> bool {
+        self.meta == super::PROP_WRITABLE | super::PROP_ENUMERABLE | super::PROP_CONFIGURABLE
+            && !self.is_empty()
+    }
+
     fn append_object_refs(&self, refs: &mut Vec<Gc>) {
         if self.packed.tag() == PACK_OBJ {
             // PACK_OBJ is installed only by packing an owned Gc. Clone that owner while

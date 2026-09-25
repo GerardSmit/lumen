@@ -97,7 +97,7 @@ impl Props {
     #[inline]
     pub(crate) fn set_index_value(&mut self, n: u32, v: Value) -> Result<(), Value> {
         if let Some(packed) = self.elems.packed_mut() {
-            let Some(p) = packed.get_mut(n as usize) else {
+            let Some(p) = packed.get_value_mut(n as usize) else {
                 return Err(v);
             };
             if matches!(p.value(), Value::Empty) || p.accessor() || !p.writable() {

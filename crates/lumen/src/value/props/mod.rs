@@ -3,6 +3,7 @@ use crate::value::{Property, Value};
 pub(in crate::value) use entries::EntryVec;
 use shapes::SHAPE_EMPTY;
 use std::rc::Rc;
+pub(in crate::value) use packed_vec::PackedVec;
 pub(in crate::value) use storage::{DenseBuffers, DenseStorage, INLINE_PACKED_CAPACITY};
 mod access;
 mod array_builder;
@@ -10,6 +11,7 @@ mod elements;
 mod entries;
 mod mirror;
 mod mutation;
+mod packed_vec;
 mod shapes;
 mod storage;
 #[cfg(test)]
@@ -139,7 +141,7 @@ pub(crate) struct PropsLayout {
     pub shape_len_slot: usize,
     /// The sidecar: one word, null = no `DenseBuffers`.
     pub elems: usize,
-    /// `Option<Box<Vec<Property>>>`: one word, null = not boxed-packed.
+    /// `Option<Box<PackedVec>>`: one word, null = not boxed-packed.
     pub dense_packed: usize,
     /// `InlinePacked`'s `u8` length and its slot array.
     pub dense_inline_len: usize,
@@ -149,13 +151,16 @@ pub(crate) struct PropsLayout {
     pub dense_mirror: usize,
     /// `u8` mirror flags.
     pub dense_mirror_flags: usize,
+    /// `PackedVec`'s first-element pointer and length words, relative to the boxed buffer.
+    pub packed_ptr: usize,
+    pub packed_len: usize,
 }
 
 const _: () = {
     // Each is one nullable pointer word.
     assert!(std::mem::size_of::<Option<Rc<Shape>>>() == std::mem::size_of::<usize>());
     assert!(std::mem::size_of::<DenseStorage>() == std::mem::size_of::<usize>());
-    assert!(std::mem::size_of::<Option<Box<Vec<Property>>>>() == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<Option<Box<PackedVec>>>() == std::mem::size_of::<usize>());
 };
 
 /// See [`PropsLayout`]. `None` when the `Rc<Shape>` probe is inconclusive.
@@ -189,6 +194,8 @@ pub(crate) fn jit_props_layout() -> Option<PropsLayout> {
         dense_elems: offset_of!(storage::DenseBuffers, elems),
         dense_mirror: offset_of!(storage::DenseBuffers, mirror),
         dense_mirror_flags: offset_of!(storage::DenseBuffers, mirror_flags),
+        packed_ptr: packed_vec::PACKED_PTR,
+        packed_len: packed_vec::PACKED_LEN,
     })
 }
 

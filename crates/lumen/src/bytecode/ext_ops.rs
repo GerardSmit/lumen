@@ -306,6 +306,16 @@ pub(super) fn array_append(
     append_to(ao, items, hole);
 }
 
+/// Append one value to the array literal `ao` (see [`append_to`]): the common single-element
+/// case appends at the packed frontier with one `length` lookup.
+#[inline]
+pub(super) fn append_one(ao: &crate::value::Gc, v: Value) {
+    let r = ao.borrow_mut().props.push_array_element(v);
+    if let Err(v) = r {
+        append_to(ao, std::iter::once(v), false);
+    }
+}
+
 /// [`array_append`] on the array literal `ao` itself (the compiled code's `ArrayAppend`
 /// helper appends through here without an operand stack).
 pub(super) fn append_to(ao: &crate::value::Gc, items: impl IntoIterator<Item = Value>, hole: bool) {

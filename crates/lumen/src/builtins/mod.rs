@@ -4390,12 +4390,29 @@ fn install_array(it: &mut Interp) {
     install_array_rest(it, &ap);
 }
 
+/// `arr.push(v)` for one value when it is the whole effect of the call: an extensible
+/// ordinary Array with a writable whole-number `length` at its dense frontier and no elements
+/// on the array prototypes. Returns the new length, or hands `v` back (nothing changed).
+pub(crate) fn array_push_one(i: &Interp, o: &Gc, v: Value) -> Result<f64, Value> {
+    let Ok(mut b) = o.try_borrow_mut() else { return Err(v) };
+    if !matches!(b.exotic, Exotic::Array)
+        || !b.extensible
+        || !b.ic_plain.get()
+        || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
+        || !i.array_prototypes_unshadowed()
+    {
+        return Err(v);
+    }
+    b.props.push_array_element(v)
+}
+
 pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
     // Dense fast path: a plain array whose `length` is a writable own data property and
     // whose tail is exactly the dense frontier appends in place — no key strings, no
     // existence scans, no observable coercions (a whole-number own `length` needs none).
     if matches!(o.borrow().exotic, Exotic::Array)
+        && o.borrow().extensible
         && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         && i.array_append_unshadowed(&o)
     {

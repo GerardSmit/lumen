@@ -13,7 +13,7 @@ impl Props {
         if (1..=32).contains(&len) {
             self.entries.reserve_exact(1); // own `length`
             self.elems
-                .set_packed(Some(Box::new(Vec::with_capacity(len))));
+                .set_packed(Some(Box::new(super::PackedVec::with_capacity(len))));
             *self.elems.mirror_flags_mut() = 0;
         } else {
             self.entries.reserve_exact(len.saturating_add(1));
@@ -38,6 +38,38 @@ impl Props {
         Some(&self.entries[slot])
     }
 
+    /// Append `v` at index `length` of a plain array whose own `length` is a writable data
+    /// property holding a whole number below 2^32 - 1, and bump `length`: the storage half of
+    /// `push(v)` (the caller has proved extensibility and that no prototype has elements).
+    /// Hands `v` back when this array isn't that simple.
+    #[inline]
+    pub(crate) fn push_array_element(&mut self, v: Value) -> Result<f64, Value> {
+        let Some(slot) = self.find("length") else { return Err(v) };
+        let lp = &self.entries[slot];
+        let len = match lp.num_value() {
+            // `as u32` saturates (NaN and negatives to 0): the round trip proves a whole
+            // number in range without a libm `trunc` call.
+            Some(n) if lp.writable() && (n as u32) as f64 == n && n < u32::MAX as f64 => n as u32,
+            _ => return Err(v),
+        };
+        let packed = match self.elems.as_deref_mut().and_then(|d| d.packed.as_deref_mut()) {
+            Some(p) if p.len() == len as usize && !self.has_far.get() && self.elem_mode.get() => p,
+            _ => {
+                if let Err(p) = self.try_append_element(len, Property::plain(v)) {
+                    return Err(p.into_value());
+                }
+                let n = len as f64 + 1.0;
+                self.entries[slot].set_num_over_num(n);
+                return Ok(n);
+            }
+        };
+        packed.push(Property::plain(v));
+        self.note_structural();
+        let n = len as f64 + 1.0;
+        self.entries[slot].set_num_over_num(n);
+        Ok(n)
+    }
+
     /// The own property for canonical index `n`, without hashing. `None` only means "not in the
     /// dense map" — the caller must fall back to the string-keyed path, not conclude absence.
     #[inline]
@@ -59,6 +91,7 @@ impl Props {
     /// whole existence scan and key-string hashing of [`Props::insert`] can be skipped. Array
     /// (`elem_mode`) maps only: the shape is untouched. Returns `false` (nothing changed) when
     /// the gates don't hold; the caller runs the generic path.
+    #[inline]
     pub(crate) fn try_append_element(&mut self, n: u32, prop: Property) -> Result<(), Property> {
         if let Some(packed) = self.elems.packed_ref() {
             if self.has_far.get() || !self.elem_mode.get() || n as usize != packed.len() {
@@ -140,28 +173,47 @@ impl Props {
             let Some(run) = packed.get(start as usize..hi) else {
                 return 0;
             };
-            out.reserve(run.len());
-            let before = out.len();
-            for p in run {
-                if p.accessor() {
-                    break;
-                }
-                match p.value() {
-                    Value::Empty => break,
-                    v => out.push(v),
-                }
-            }
-            return (out.len() - before) as u32;
+            // The run ends at the first accessor or hole; one exact-size extend copies it
+            // (each value one full-width store, see `push_value`).
+            let n = run
+                .iter()
+                .position(|p| p.accessor() || p.is_empty())
+                .unwrap_or(run.len());
+            out.extend(run[..n].iter().map(Property::value));
+            return n as u32;
         }
         let mut k = start;
         while k < end {
             match self.get_index(k) {
-                Some(p) if !p.accessor() => out.push(p.value()),
+                Some(p) if !p.accessor() => crate::value::push_value(out, p.value()),
                 _ => break,
             }
             k += 1;
         }
         k - start
+    }
+
+    /// A copy of packed elements `start..end` when every one of them is a plain data element
+    /// (no holes or accessors): each property is cloned as it stands (a refcount bump at most).
+    pub(in crate::value) fn clone_packed_run(&self, start: usize, end: usize) -> Option<super::PackedVec> {
+        if let Some(pv) = self.elems.packed_boxed() {
+            if start <= end && end <= pv.len() && pv.all_flat() {
+                return Some(pv.copy_flat(start, end));
+            }
+        }
+        let run = self.elems.packed_ref()?.get(start..end)?;
+        if !self.elems.packed_known_plain() && !run.iter().all(Property::is_plain_element) {
+            return None;
+        }
+        // Plain data properties: the clone is the value's (no accessor box to share).
+        let copy: Vec<Property> = run.iter().map(Property::clone_plain).collect();
+        Some(super::PackedVec::from_plain(copy))
+    }
+
+    /// The packed element slice, when this map uses packed storage.
+    #[inline]
+    pub(crate) fn packed_elements(&self) -> Option<&[Property]> {
+        self.elems.packed_ref()
     }
 
     pub(crate) fn append_element(&mut self, n: u32, prop: Property) -> bool {
@@ -226,6 +278,77 @@ impl Props {
             }
         }
         Some(p.into_value())
+    }
+
+    /// `shift` on a packed array of `len` plain elements (no holes, accessors or read-only
+    /// slots) and no far keys: the spec's move-every-element loop leaves exactly the tail's
+    /// values in plain slots, so dropping the first element is the whole effect. O(1).
+    /// `None` = gates failed, nothing changed.
+    pub(crate) fn shift_packed(&mut self, len: u32) -> Option<Value> {
+        if self.has_far.get() || !self.elem_mode.get() || len == 0 {
+            return None;
+        }
+        if self.elems.packed_ref()?.len() != len as usize {
+            return None;
+        }
+        let packed = self.elems.packed_mut()?;
+        if !packed.all_plain() {
+            return None;
+        }
+        self.note_structural();
+        self.elems.packed_mut()?.pop_front().map(Property::into_value)
+    }
+
+    /// `unshift(...items)` on a packed array of `len` plain elements with no far keys. The
+    /// caller has proved the new indices can't reach a prototype setter and that the array is
+    /// extensible. O(items) amortized.
+    pub(crate) fn unshift_packed(&mut self, len: u32, items: &[Value]) -> bool {
+        if self.has_far.get() || !self.elem_mode.get() {
+            return false;
+        }
+        match self.elems.packed_ref() {
+            Some(p) if p.len() == len as usize => {}
+            None if len == 0 && self.elementless() => {
+                self.note_structural();
+                self.install_empty_packed();
+            }
+            _ => return false,
+        }
+        let Some(packed) = self.elems.packed_mut() else { return false };
+        if !packed.all_plain() {
+            return false;
+        }
+        self.note_structural();
+        self.elems
+            .packed_mut()
+            .unwrap()
+            .prepend(items.iter().cloned().map(Property::plain));
+        true
+    }
+
+    /// `splice(start, del, ...items)` on a packed array of `len` plain elements with no far
+    /// keys; returns the removed values. The caller has proved (when the array grows) that new
+    /// indices can't reach a prototype setter and that the array is extensible.
+    pub(crate) fn splice_packed(
+        &mut self,
+        len: u32,
+        start: usize,
+        del: usize,
+        items: &[Value],
+    ) -> Option<Vec<Value>> {
+        if self.has_far.get() || !self.elem_mode.get() || start + del > len as usize {
+            return None;
+        }
+        if self.elems.packed_ref()?.len() != len as usize || !self.elems.packed_mut()?.all_plain() {
+            return None;
+        }
+        self.note_structural();
+        let removed = self.elems.packed_mut()?.splice(
+            start,
+            del,
+            items.iter().cloned().map(Property::plain),
+        );
+        Some(removed.into_iter().map(Property::into_value).collect())
     }
 
     /// Append the next dense element while *building a fresh array in order*: element index ==
