@@ -161,6 +161,108 @@ pub(crate) fn map_set_iter_drain(i: &mut Interp, obj: &Gc) -> Vec<Value> {
 /// state exactly as `next()` does, so a caller that would immediately unpack the fresh result
 /// object may use this instead.
 pub(crate) fn map_set_iter_step(i: &mut Interp, obj: &Gc) -> Option<Value> {
+    // The common case: a live iterator of the learned layout, stepped by slot.
+    let (shape, cs, is, ks) = ITER_LAYOUT.with(std::cell::Cell::get);
+    let state = {
+        let b = obj.borrow();
+        if b.props.shape() == shape {
+            let get = |s: usize| b.props.entry_at(s).map(|p| p.value());
+            match (get(cs), get(is), get(ks)) {
+                (Some(Value::Obj(c)), Some(Value::Num(idx)), Some(Value::Num(kind))) => {
+                    Some((c, idx as usize, kind as u8))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+    let Some((coll, mut idx, kind)) = state else {
+        let r = map_set_iter_step_slow(i, obj);
+        learn_iter_layout(obj);
+        return r;
+    };
+    step_at(i, obj, coll, idx, kind, is)
+}
+
+/// [`map_set_iter_step`] for an object that may not be a Map/Set iterator: `None` when it
+/// lacks the brand.
+pub(crate) fn map_set_iter_try_step(i: &mut Interp, obj: &Gc) -> Option<Option<Value>> {
+    let (shape, cs, is, ks) = ITER_LAYOUT.with(std::cell::Cell::get);
+    let state = {
+        let b = obj.borrow();
+        if b.props.shape() == shape {
+            let get = |s: usize| b.props.entry_at(s).map(|p| p.value());
+            match (get(cs), get(is), get(ks)) {
+                (Some(Value::Obj(c)), Some(Value::Num(idx)), Some(Value::Num(kind))) => {
+                    Some((c, idx as usize, kind as u8))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+    match state {
+        Some((coll, idx, kind)) => Some(step_at(i, obj, coll, idx, kind, is)),
+        None if obj.borrow().props.get("__ci_coll").is_some() => Some(map_set_iter_step(i, obj)),
+        None => None,
+    }
+}
+
+fn step_at(i: &mut Interp, obj: &Gc, coll: Gc, mut idx: usize, kind: u8, is: usize) -> Option<Value> {
+    let entry = i
+        .map_data
+        .get(&(Gc::as_ptr(&coll) as usize))
+        .and_then(|e| e.next(&mut idx))
+        .map(|(k, v)| match kind {
+            1 => (k.clone(), None),
+            2 => (k.clone(), Some(v.clone())),
+            _ => (v.clone(), None),
+        });
+    let set_idx = |idx: usize| {
+        if let Some(p) = obj.borrow_mut().props.entry_at_mut(is) {
+            p.set_value(Value::Num(idx as f64));
+        }
+    };
+    match entry {
+        Some((a, None)) => {
+            set_idx(idx);
+            Some(a)
+        }
+        Some((k, Some(v))) => {
+            set_idx(idx);
+            Some(i.make_array(vec![k, v]))
+        }
+        None => {
+            set_idx(idx);
+            set_internal(obj, "__ci_done", Value::Bool(true));
+            None
+        }
+    }
+}
+
+thread_local! {
+    /// A live (not exhausted) Map/Set iterator object's layout: its shape and the slots of
+    /// `__ci_coll`, `__ci_index` and `__ci_kind` (a shape pins its key order).
+    static ITER_LAYOUT: std::cell::Cell<(u32, usize, usize, usize)> =
+        const { std::cell::Cell::new((u32::MAX, 0, 0, 0)) };
+}
+
+fn learn_iter_layout(obj: &Gc) {
+    let b = obj.borrow();
+    let p = &b.props;
+    if p.slot_of("__ci_done").is_some() {
+        return;
+    }
+    if let (Some(cs), Some(is), Some(ks)) =
+        (p.slot_of("__ci_coll"), p.slot_of("__ci_index"), p.slot_of("__ci_kind"))
+    {
+        ITER_LAYOUT.with(|l| l.set((p.shape(), cs, is, ks)));
+    }
+}
+
+fn map_set_iter_step_slow(i: &mut Interp, obj: &Gc) -> Option<Value> {
     let (coll, done, mut idx, kind) = {
         let b = obj.borrow();
         let num = |k: &str| -> f64 {

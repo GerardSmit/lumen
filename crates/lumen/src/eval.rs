@@ -1488,6 +1488,9 @@ impl Interp {
                     }
                 }
             }
+            if let Some(step) = self.coll_iter_step(iter, next) {
+                return Ok(step);
+            }
         }
         let res = self.call(next.clone(), iter.clone(), &[])?;
         if !matches!(res, Value::Obj(_)) {
@@ -1499,6 +1502,23 @@ impl Interp {
         } else {
             Ok(Some(self.get_member(&res, "value")?))
         }
+    }
+    /// IteratorStep of a Map/Set iterator driven by the intrinsic Map/Set Iterator `next`: the
+    /// same step in place, without the call or its result object (runs no JS). `None` when
+    /// `iter` / `next` are anything else.
+    pub(crate) fn coll_iter_step(&mut self, iter: &Value, next: &Value) -> Option<Option<Value>> {
+        let (Value::Obj(it), Value::Obj(nf)) = (iter, next) else {
+            return None;
+        };
+        let coll_next = matches!(
+            nf.borrow().call,
+            Callable::Native(f) if f as usize
+                == crate::builtins::collections::map_set_iter_next as NativeFn as usize
+        );
+        if !coll_next {
+            return None;
+        }
+        crate::builtins::collections::map_set_iter_try_step(self, it)
     }
     /// IteratorClose: call `return()` if present (swallowing its result/most errors).
     pub(crate) fn iterator_close(&mut self, iter: &Value) {

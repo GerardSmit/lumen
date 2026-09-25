@@ -3490,6 +3490,27 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.switch_to_block(join);
             }
             Op::ArgsLen(..) | Op::ArgsGet(..) => self.exit_now(pc),
+            Op::DestructureArr(n) => {
+                // A pristine dense Array natively; anything else through the generic op.
+                self.box_from(d - 1);
+                self.max_stack = self.max_stack.max(d - 1 + n as usize);
+                let p = self.sptr(d - 1);
+                let nv = self.i32c(n as i64);
+                let r = self
+                    .call(Helper::DestructDense, &[self.frame, nv, p])
+                    .expect("DestructDense returns a flag");
+                let z = self.i32c(0);
+                let hit = self.fb.icmp(IntCC::Ne, r, z);
+                let slow = self.fb.create_block();
+                let join = self.fb.create_block();
+                self.fb.brif(hit, join, &[], slow, &[]);
+                self.fb.seal_block(slow);
+                self.fb.switch_to_block(slow);
+                self.generic(pc);
+                self.fb.jump(join, &[]);
+                self.fb.seal_block(join);
+                self.fb.switch_to_block(join);
+            }
             Op::GetElemLocal(s) => {
                 if self.kinds[s as usize] != Kind::Boxed {
                     self.exit_now(pc);
@@ -4420,6 +4441,50 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         let d = self.stack.len();
         self.soff(d + 1);
+        // An encoded Array state (`iter_fast`: the index in the iterator slot, the array in the
+        // `next` slot) below the length, over a dense data element: stepped inline. (A
+        // Map/Set state's target has no `length` here, and a done state's index is +inf.)
+        let join = self.fb.create_block();
+        let has_p = self.fb.append_block_param(join, Type::I32);
+        let slow = self.fb.create_block();
+        let ip = self.slot_ptr(is);
+        let np = self.slot_ptr(ns);
+        let t = self.fb.load(MemKind::I32U8, ip, 0);
+        let four = self.i32c(TAG_NUM as i64);
+        let is_num = self.fb.icmp(IntCC::Eq, t, four);
+        self.guard_to(is_num, slow);
+        let k = self.fb.load(MemKind::F64, ip, VALUE_PAYLOAD);
+        let len = layout::length(&mut self.fb, np, slow);
+        let inb = self.fb.fcmp(FloatCC::Lt, k, len);
+        self.guard_to(inb, slow);
+        let bits = layout::elem_get_word(&mut self.fb, np, k, slow);
+        let (tag, payload, is_ref) = layout::word_value(&mut self.fb, bits, slow);
+        let dst = self.sptr(d);
+        let refb = self.fb.create_block();
+        let plain = self.fb.create_block();
+        let stepped = self.fb.create_block();
+        self.fb.brif(is_ref, refb, &[], plain, &[]);
+        self.fb.seal_block(refb);
+        self.fb.seal_block(plain);
+        self.fb.switch_to_block(refb);
+        let zero = self.i32c(0);
+        self.call(Helper::UnpackClone, &[dst, bits, zero]);
+        self.fb.jump(stepped, &[]);
+        self.fb.switch_to_block(plain);
+        self.fb.store(MemKind::I32U8, dst, tag, 0);
+        let byte = self.fb.convert(ConvOp::Wrap, Type::I32, payload);
+        self.fb.store(MemKind::I32U8, dst, byte, VALUE_BOOL);
+        self.fb.store(MemKind::I64, dst, payload, VALUE_PAYLOAD);
+        self.fb.jump(stepped, &[]);
+        self.fb.seal_block(stepped);
+        self.fb.switch_to_block(stepped);
+        let one = self.fb.f64const(1.0);
+        let k1 = self.fb.binary(BinaryOp::Fadd, k, one);
+        self.fb.store(MemKind::F64, ip, k1, VALUE_PAYLOAD);
+        let yes = self.i32c(1);
+        self.fb.jump(join, &[yes]);
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
         let (iv, nv, dst) = (self.i32c(is as i64), self.i32c(ns as i64), self.sptr(d));
         let r = self.call_status(Helper::IterStep, &[self.frame, iv, nv, dst]);
         let t = self.i32c(helpers::ITER_THREW as i64);
@@ -4439,8 +4504,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.switch_to_block(cont);
         let one = self.i32c(1);
         let has = self.fb.binary(BinaryOp::Band, r, one);
+        self.fb.jump(join, &[has]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
         self.stack.push(Entry::Boxed);
-        self.stack.push(Entry::Bool(has));
+        self.stack.push(Entry::Bool(has_p));
     }
 
     /// The `CallWithThis` of an inline `Math.f(..)` site: the Number arguments (the planner
@@ -4841,6 +4909,32 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
     }
 
+    /// Whether [`Tr::quick_num`] can read `o`: a Number SSA slot or constant, or an in-memory
+    /// slot (checked at run time).
+    fn quick_num_ok(&self, o: Opnd) -> bool {
+        match o {
+            Opnd::Slot(s) => self.kinds[s as usize] == Kind::Num || self.vars[s as usize].is_none(),
+            Opnd::Const(k) => matches!(self.chunk.consts[k as usize], Value::Num(_)),
+        }
+    }
+
+    /// `o` as a Number, to `miss` when an in-memory slot holds anything else (a TDZ slot
+    /// included).
+    fn quick_num(&mut self, o: Opnd, pc: usize, miss: Block) -> V {
+        if let Some(x) = self.opnd_num(o, pc) {
+            return x;
+        }
+        let Opnd::Slot(s) = o else {
+            unreachable!("quick_num_ok admitted a non-Number constant")
+        };
+        let p = self.slot_ptr(s as usize);
+        let t = self.fb.load(MemKind::I32U8, p, 0);
+        let four = self.i32c(TAG_NUM as i64);
+        let is = self.fb.icmp(IntCC::Eq, t, four);
+        self.guard_to(is, miss);
+        self.fb.load(MemKind::F64, p, VALUE_PAYLOAD)
+    }
+
     fn opnd_static_num(&self, o: Opnd) -> bool {
         match o {
             Opnd::Slot(s) => self.kinds[s as usize] == Kind::Num,
@@ -4920,6 +5014,36 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             return Ok(());
         }
+        // A Boxed (in-memory) destination with both operands Numbers at run time: the op
+        // inline, its Number stored over the slot's trivially droppable old value.
+        let quick = if self.kinds[dst] == Kind::Boxed
+            && self.vars[dst].is_none()
+            && matches!(
+                kind,
+                ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::Div
+            )
+            && self.quick_num_ok(a)
+            && self.quick_num_ok(b)
+        {
+            let slow = self.fb.create_block();
+            let x = self.quick_num(a, pc, slow);
+            let y = self.quick_num(b, pc, slow);
+            let p = self.slot_ptr(dst);
+            let t = self.fb.load(MemKind::I32U8, p, 0);
+            let four = self.i32c(TAG_NUM as i64);
+            let trivial = self.fb.icmp(IntCC::Ule, t, four);
+            self.guard_to(trivial, slow);
+            let r = self.num_arith(kind, x, y)?;
+            self.fb.store(MemKind::I32U8, p, four, 0);
+            self.fb.store(MemKind::F64, p, r, VALUE_PAYLOAD);
+            let done = self.fb.create_block();
+            self.fb.jump(done, &[]);
+            self.fb.seal_block(slow);
+            self.fb.switch_to_block(slow);
+            Some(done)
+        } else {
+            None
+        };
         let d = self.stack.len();
         // `s += y` on a string local: append in place (the slot's string is uniquely owned
         // when only the local holds it) instead of copying it into the generic `+`.
@@ -4967,6 +5091,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.jump(done, &[]);
                     self.fb.seal_block(done);
                     self.fb.switch_to_block(done);
+                }
+                if let Some(q) = quick {
+                    self.fb.jump(q, &[]);
+                    self.fb.seal_block(q);
+                    self.fb.switch_to_block(q);
                 }
             }
             k => {

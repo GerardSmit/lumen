@@ -74,6 +74,10 @@ pub(crate) enum Helper {
     /// name `names[n]` (name cache `c`) resolves to (filling the cache first on a miss); null
     /// otherwise. Pure; the address stays valid until JS runs (only JS reshapes the global).
     GlobPtr,
+    /// `(frame, n: u32, p: *mut Value) -> u32` — `DestructureArr(n)` of the value at `p` when
+    /// it is a pristine dense Array (see `array_destructure::try_dense`): the `n` elements
+    /// written from `p` on, 1; else 0 with `p` untouched. Runs no JS.
+    DestructDense,
     /// `(frame, n: u32) -> *mut Value` — the address of captured binding `names[n]`'s value in
     /// the activation env, or null while it is in its TDZ. Pure, like [`Helper::NamePtr`].
     CapPtr,
@@ -258,7 +262,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 64] = [
+pub(crate) const ALL: [Helper; 65] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -271,6 +275,7 @@ pub(crate) const ALL: [Helper; 64] = [
     Helper::NamePtr,
     Helper::NamePtrW,
     Helper::GlobPtr,
+    Helper::DestructDense,
     Helper::CapPtr,
     Helper::LoadName,
     Helper::LoadNameForCall,
@@ -340,6 +345,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::Generic => (&[P, I32, I32, I32], &[I32]),
         Helper::Safepoint => (&[P], &[I32]),
         Helper::NamePtr | Helper::NamePtrW | Helper::GlobPtr => (&[P, I32, I32], &[P]),
+        Helper::DestructDense => (&[P, I32, P], &[I32]),
         Helper::CapPtr => (&[P, I32], &[P]),
         Helper::LoadName | Helper::LoadNameForCall => (&[P, I32, I32, P], &[I32]),
         Helper::StoreName => (&[P, I32, I32, P], &[I32]),
@@ -410,6 +416,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::NamePtr => name_ptr as *const () as usize,
         Helper::NamePtrW => name_ptr_w as *const () as usize,
         Helper::GlobPtr => glob_ptr as *const () as usize,
+        Helper::DestructDense => destruct_dense as *const () as usize,
         Helper::CapPtr => cap_ptr as *const () as usize,
         Helper::LoadName => load_name as *const () as usize,
         Helper::LoadNameForCall => load_name_for_call as *const () as usize,
@@ -553,19 +560,38 @@ fn binary_op_str(code: u32) -> Option<&'static str> {
 /// `bin_cmp` / its `UShr` arm), bit for bit.
 fn binary_num(code: u32, x: f64, y: f64) -> Option<Value> {
     use crate::eval::{js_mod, to_int32};
-    let (ix, iy) = (to_int32(x), to_int32(y));
+    // (ToInt32 only for the bitwise ops: it costs an `fmod` on large inputs.)
+    let i32s = || (to_int32(x), to_int32(y));
     Some(match code {
         BIN_ADD => Value::Num(x + y),
         BIN_SUB => Value::Num(x - y),
         BIN_MUL => Value::Num(x * y),
         BIN_DIV => Value::Num(x / y),
         BIN_MOD => Value::Num(js_mod(x, y)),
-        BIN_BITAND => Value::Num((ix & iy) as f64),
-        BIN_BITOR => Value::Num((ix | iy) as f64),
-        BIN_BITXOR => Value::Num((ix ^ iy) as f64),
-        BIN_SHL => Value::Num(ix.wrapping_shl(iy as u32 & 31) as f64),
-        BIN_SHR => Value::Num((ix >> (iy as u32 & 31)) as f64),
-        BIN_USHR => Value::Num(((ix as u32) >> (iy as u32 & 31)) as f64),
+        BIN_BITAND => {
+            let (ix, iy) = i32s();
+            Value::Num((ix & iy) as f64)
+        }
+        BIN_BITOR => {
+            let (ix, iy) = i32s();
+            Value::Num((ix | iy) as f64)
+        }
+        BIN_BITXOR => {
+            let (ix, iy) = i32s();
+            Value::Num((ix ^ iy) as f64)
+        }
+        BIN_SHL => {
+            let (ix, iy) = i32s();
+            Value::Num(ix.wrapping_shl(iy as u32 & 31) as f64)
+        }
+        BIN_SHR => {
+            let (ix, iy) = i32s();
+            Value::Num((ix >> (iy as u32 & 31)) as f64)
+        }
+        BIN_USHR => {
+            let (ix, iy) = i32s();
+            Value::Num(((ix as u32) >> (iy as u32 & 31)) as f64)
+        }
         BIN_LT => Value::Bool(x < y),
         BIN_GT => Value::Bool(x > y),
         BIN_LE => Value::Bool(x <= y),
@@ -976,6 +1002,24 @@ pub(crate) unsafe extern "C" fn glob_ptr(
     match g.props.entry_at_mut(slot) {
         Some(p) if !p.accessor() => p,
         _ => std::ptr::null_mut(),
+    }
+}
+
+pub(crate) unsafe extern "C" fn destruct_dense(f: *mut JitFrame, n: u32, p: *mut Value) -> u32 {
+    let i = &*(*f).interp;
+    let v = std::ptr::read(p);
+    let mut k = 0usize;
+    // The value moved out of `p`: its slot and the ones above are free for the outputs.
+    let hit = crate::bytecode::array_destructure::try_dense(i, &v, n as u16, |x| {
+        std::ptr::write(p.add(k), x);
+        k += 1;
+    });
+    if hit {
+        drop(v);
+        1
+    } else {
+        std::ptr::write(p, v);
+        0
     }
 }
 
@@ -1995,6 +2039,12 @@ pub(crate) unsafe extern "C" fn iter_step(f: *mut JitFrame, is: u32, ns: u32, ds
         return 1;
     }
     let (it, nx) = (it.clone(), nx.clone());
+    // A Map/Set iterator under its intrinsic `next`: no JS runs either.
+    if let Some(step) = i.coll_iter_step(&it, &nx) {
+        let has = step.is_some();
+        std::ptr::write(dst, step.unwrap_or(Value::Undefined));
+        return has as u32;
+    }
     match i.iterator_step(&it, &nx) {
         Ok(Some(v)) => {
             std::ptr::write(dst, v);
