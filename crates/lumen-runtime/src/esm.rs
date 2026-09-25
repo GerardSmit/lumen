@@ -25,9 +25,26 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Synthetic ESM source for each builtin (`"node:fs"` -> `export default …; export const …`),
-/// generated in JS where the export names are known, and ferried here as plain strings.
+/// The named exports of each builtin (`"node:fs"` -> `"appendFile appendFileSync …"`, from the
+/// node glue's `esm_exports.js`). A builtin's synthetic ESM source is built from its list when it
+/// is first imported ([`builtin_source`]), not for every builtin at startup.
 pub struct BuiltinModules(pub HashMap<String, String>);
+
+/// The synthetic ESM form of a builtin: the module object as the default export, and each listed
+/// name that is a plain identifier as a named export read from it at import time.
+pub fn builtin_source(name: &str, exports: &str) -> String {
+    // Builtin names (`fs/promises`) and identifiers need no escaping inside a string literal.
+    let mut src = format!("const __m = globalThis.__esmBuiltin(\"{name}\");\nexport default __m;\n");
+    for k in exports.split(' ') {
+        let mut chars = k.chars();
+        let ident = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        if ident && k != "default" {
+            src.push_str(&format!("export const {k} = __m[\"{k}\"];\n"));
+        }
+    }
+    src
+}
 
 const EXTENSIONS: [&str; 8] = [
     ".mjs", ".js", ".jsx", ".json", ".cjs", ".ts", ".mts", ".cts",
@@ -211,8 +228,10 @@ fn resolve(
 ) -> Option<(String, String)> {
     // Builtins: `node:fs` or a bare `fs`/`path`/… name.
     let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
-    if let Some(src) = builtins.0.get(&format!("node:{bare}")) {
-        return Some((format!("node:{bare}"), src.clone()));
+    let key = format!("node:{bare}");
+    if let Some(exports) = builtins.0.get(&key) {
+        let src = builtin_source(bare, exports);
+        return Some((key, src));
     }
 
     // A module of an ahead-of-time blob (`aot:/…`, see `Runtime::run_precompiled`). The engine

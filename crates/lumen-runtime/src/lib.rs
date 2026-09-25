@@ -674,8 +674,9 @@ impl Runtime {
         }
     }
 
-    /// Pull the JS-precomputed synthetic ESM source for each `node:` builtin out of the engine
-    /// (the loader can't enumerate a builtin's exports from Rust; see the node module glue).
+    /// Pull each `node:` builtin's list of named exports out of the engine (the loader can't
+    /// enumerate a builtin's exports from Rust; see the node module glue). The loader builds a
+    /// builtin's ESM source from its list on first import.
     fn builtin_modules(&mut self) -> esm::BuiltinModules {
         let global = self.engine.global_this();
         let ctx = self.engine.ctx();
@@ -686,15 +687,17 @@ impl Runtime {
             .and_then(|v| ctx.coerce_string(&v).ok())
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let sources = ctx.get_member(&global, "__esmBuiltinSources").ok();
-        if let Some(sources) = sources {
+        let lists = ctx.get_member(&global, "__esmExportLists").ok();
+        if let Some(lists) = lists {
             for name in names.split(',').filter(|s| !s.is_empty()) {
-                let key = format!("node:{name}");
-                if let Ok(src) = ctx.get_member(&sources, &key) {
-                    if let Ok(src) = ctx.coerce_string(&src) {
-                        map.insert(key, src.to_string());
-                    }
-                }
+                let exports = match ctx.get_member(&lists, name) {
+                    Ok(v) if !matches!(v, Value::Undefined) => ctx
+                        .coerce_string(&v)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                map.insert(format!("node:{name}"), exports);
             }
         }
         esm::BuiltinModules(map)

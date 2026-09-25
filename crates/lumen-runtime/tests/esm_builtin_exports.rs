@@ -37,9 +37,9 @@ fn esm_export_lists_match_builtin_keys() {
         const m = require("node:" + name);
         const actual = (m && (typeof m === "object" || typeof m === "function") ? Object.keys(m) : [])
           .filter(ident).sort();
-        const src = globalThis.__esmBuiltinSources["node:" + name];
-        if (src === undefined) { console.log("unlisted", name); continue; }
-        const expected = [...src.matchAll(/^export const ([^ ]+) =/gm)].map((x) => x[1]).sort();
+        const list = globalThis.__esmExportLists[name];
+        if (list === undefined) { console.log("unlisted", name); continue; }
+        const expected = (list ? list.split(" ") : []).filter(ident).sort();
         const missing = actual.filter((k) => !expected.includes(k));
         const extra = expected.filter((k) => !actual.includes(k));
         if (missing.length || extra.length)
