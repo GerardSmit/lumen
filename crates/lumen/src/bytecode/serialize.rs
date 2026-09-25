@@ -440,6 +440,7 @@ op_codec! {
     164 => ArrayCbDone(a: u32);
     165 => ArgsLen(a: u16, b: u16);
     166 => ArgsGet(a: u16, b: u16);
+    167 => LoadNewTarget;
 }
 
 /// The chunk fields this codec writes, in order (hand-maintained next to `enc_chunk`, whose

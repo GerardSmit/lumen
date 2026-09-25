@@ -295,10 +295,11 @@ fn build(
     }
     func.ensure_body().ok()?;
     let body = func.body();
-    // (A directive prologue — or any constant expression statement — does nothing.)
-    let mut stmts = body
-        .iter()
-        .filter(|s| !matches!(s, Stmt::Expr(e) if const_value(e).is_some()));
+    // (A directive prologue — or any constant expression statement — does nothing; nor does a
+    // call-guard `if (!new.target) …`: under a construct `new.target` is an object.)
+    let mut stmts = body.iter().filter(|s| {
+        !matches!(s, Stmt::Expr(e) if const_value(e).is_some()) && !new_target_guard(s)
+    });
     let mut parts = Parts {
         slots: Vec::new(),
         set_keys: Vec::new(),
@@ -758,5 +759,29 @@ mod tests {
         for src in cases {
             run(src);
         }
+    }
+}
+
+/// `if (<test>) …` (no `else`) whose side-effect-free test is false whenever `new.target` is an
+/// object: `!new.target`, `new.target == null`, `new.target === undefined` (either operand order).
+fn new_target_guard(s: &Stmt) -> bool {
+    let Stmt::If {
+        test,
+        alt: None,
+        ..
+    } = s
+    else {
+        return false;
+    };
+    match test {
+        Expr::Unary { op: "!", arg } => matches!(**arg, Expr::NewTarget),
+        Expr::Binary { op, left, right } if matches!(*op, "==" | "===") => {
+            let nullish = |e: &Expr| {
+                matches!(e, Expr::Undefined) || (*op == "==" && matches!(e, Expr::Null))
+            };
+            (matches!(**left, Expr::NewTarget) && nullish(right))
+                || (matches!(**right, Expr::NewTarget) && nullish(left))
+        }
+        _ => false,
     }
 }

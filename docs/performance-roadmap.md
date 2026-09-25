@@ -178,9 +178,21 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      | `globalThis.gv` write | 371 ns | 3.7 ns |
      | script `var` / `let` write | 12 ns | 2.4 ns |
      | top-level `fib(30)` | 111 ms | 59 ms (node 55) |
-6. **`new.target` in the bytecode compiler (S).**
-   - Why: functions that use it are rejected by the compiler and run on the tree-walker.
-   - Closes: ctor_new_target 143×.
+6. ✅ **Done: `new.target` in the bytecode compiler (S).**
+   - Why: functions that use it were rejected by the compiler and ran on the tree-walker.
+   - Built:
+     - `Op::LoadNewTarget` pushes the engine's current `new.target`. Every call path already sets it on entry (the constructor on a construct, `undefined` on a call) and restores it on exit, so it is exact in a synchronous non-arrow body.
+     - Still on the tree-walker:
+       - arrows, async functions and generators that read `new.target`;
+       - functions whose inner arrows read it (the capture scan bails).
+     - Constructor templates (`ctor_plan`) skip a call guard `if (!new.target) …` (or `== null` / `=== undefined`): under a construct it is dead.
+   - Release results:
+
+     | Case | Before | Now | Node |
+     |---|---|---|---|
+     | ctor_new_target | 1363 ns | 123 ns | 9.5 ns |
+
+   - Left: the plain-constructor allocation cost, which item 8 covers.
 7. **Iterators in the JIT (M).**
    - What: direct `IterStep` lowering for Map, Set, entries/keys and generator iterators. Fix the handler-region lowering, so a for-of body isn't compiled through generic helpers.
    - Why: the JIT is currently slower than the interpreter for for-of (119 vs 55 ns).
