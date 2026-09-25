@@ -318,10 +318,19 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       | `s += k < 5000` | 82 ns | 1.9 ns | – |
 
     - Left: what remains is the cost of calling any String.prototype method on a primitive receiver (item 18).
-12. **Recursive calls (M).**
+12. ✅ **Recursive calls (M).** *(Partly done.)*
     - What: a direct self-call in the JIT and int32 specialization.
-    - Why: each recursion is a full `LoadNameForCall` + `CallWithThis`.
-    - Closes: fib 5.8×.
+    - Finding: the JIT already calls itself directly (shadow stack, lazy frame records), so recursion never reaches `LoadNameForCall` + `CallWithThis`. All of fib's time is inside JIT code. A bare call costs 27.8 ns vs 5.5 ns in node.
+    - Built: the direct call clones object arguments and releases a small callee frame (≤ 6 slots) inline, instead of calling a clone helper and `DropN`.
+    - Release results:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | `sum(a, i)` with `a.length` and `a[i]` | 49 ns/call | 43.5 ns/call | – |
+      | fib(30) | 60 ms | 58 ms | 14 ms |
+
+    - Left: the machine cost of the call sequence itself (frame record, flag stores, prologue). This overlaps item 17.
+    - `ack(2, 2000)` exceeds the 1,500-frame depth limit (item 15).
 13. **Promise path (M).**
     - What: lighter reaction records, and no `promise_then_is_silent` string lookups.
     - Closes: then chain 3×, Promise.all 6.7×, resolve 10.8×, queueMicrotask 17.5×.
