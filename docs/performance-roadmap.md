@@ -299,7 +299,25 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       - function_expr (258 ns vs arrow 90 ns, node 17 ns) is the `.prototype` object, the fn↔prototype pair marking and release, and the legacy `arguments`/`caller` accessors on sloppy functions. A lazy `.prototype` needs every own-property path to materialize it first, and there are over 1,000 direct `props` accesses across 81 files. It needs a props-level design, not a patch.
       - A closure's `UserCallable` is a separate `Rc` allocation. Storing it inline would add 8 bytes to every object.
       - Per-iteration envs still allocate a `Scope` plus a binding vector, and register a weak entry for the cycle collector.
-11. **localeCompare fast path for ASCII and root collation (S).** Closes 436× (5 µs per compare).
+11. ✅ **localeCompare fast path for ASCII and root collation (S).**
+    - Finding: every call constructed an `Intl.Collator`, read its options back as strings, then decomposed both strings into per-character vectors.
+    - Built:
+      - With no locales or options, `localeCompare` compares directly with the default (`en`) collation.
+      - `collate` has an ASCII path, used also by `Intl.Collator#compare`: lowercased bytes, then case bits, with no allocation.
+      - Found while measuring:
+        - A JIT'd element read feeding `<` speculated a Number and exited to the VM on every iteration when the elements were strings. Such exits are now counted per site; after 16 the site stops speculating and the code recompiles.
+        - Number/Boolean operands of arithmetic and non-strict comparisons now convert inline in the JIT (`s += a < b` took the generic op).
+        - A comparison with Boxed operands now joins as an unboxed Boolean.
+        - String `<` compares bytes up to an ASCII difference.
+    - Release results:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | localeCompare micro | 5 µs | 155 ns | 12 ns |
+      | `s += w[i] < w[j]` (strings) | 372 ns | 117 ns | 12 ns |
+      | `s += k < 5000` | 82 ns | 1.9 ns | – |
+
+    - Left: what remains is the cost of calling any String.prototype method on a primitive receiver (item 18).
 12. **Recursive calls (M).**
     - What: a direct self-call in the JIT and int32 specialization.
     - Why: each recursion is a full `LoadNameForCall` + `CallWithThis`.
@@ -322,6 +340,15 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
     - What: keep object references loaded from properties in SSA instead of boxing them through stack memory, and elide retain/release pairs whose lifetimes nest (for example `const v = b.v` releases and re-takes the same count every iteration).
     - Also: shorten the inline-cache guard chain of dependent loads for a repeated receiver, and avoid byte-store/word-load store-forwarding stalls in the emitted code.
     - Evidence: `b.v.x -= c` takes 21 ns vs 1.2 ns, and `const v = b.v` 12 ns vs 0.75 ns. Nearly all of nbody's time is inside JIT code.
+
+18. **Method calls on primitive strings (M).** *(Added during item 11.)*
+    - Finding: any non-intrinsic String.prototype method costs 115–150 ns per call from JIT code (node: 11–20 ns). Examples: `at` 115 ns, `startsWith` 131 ns, `indexOf` 151 ns.
+    - The time is spread across four steps:
+      - the `GetMethod` helper resolving through the String.prototype IC;
+      - the generic `call` helper and `call_native_fast`;
+      - `this_string`;
+      - the arguments' ToString.
+    - What: extend the `strm` plan (today only `charCodeAt`) to call any String.prototype builtin's native entry directly. Guard the receiver's type and the prototype's method identity at the `GetMethod`, and pass `this` and the arguments without the generic call frame.
 
 ## Open items
 

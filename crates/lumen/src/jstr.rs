@@ -128,6 +128,15 @@ pub fn unit_lstr(unit: u16) -> crate::lstr::LStr {
 /// The spec's code-unit-wise string comparison (differs from `str` byte order for strings mixing
 /// supplementary-plane characters with U+E000..U+FFFF, and for smuggled surrogates).
 pub fn cmp_units(a: &str, b: &str) -> std::cmp::Ordering {
+    // Byte order is code-unit order up to the first difference when that difference is between
+    // two ASCII bytes, or when one string is a prefix of the other (it ends on a character
+    // boundary, so its units are a prefix too).
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    match x.iter().zip(y).position(|(p, q)| p != q) {
+        None => return x.len().cmp(&y.len()),
+        Some(k) if x[k] < 0x80 && y[k] < 0x80 => return x[k].cmp(&y[k]),
+        Some(_) => {}
+    }
     let mut ia = UnitIter::new(a);
     let mut ib = UnitIter::new(b);
     loop {

@@ -8098,8 +8098,19 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "localeCompare", 1, |i, this, args| {
         // RequireObjectCoercible + ToString this, then delegate to Intl.Collator.
-        let a = Value::Str(this_string(i, &this)?);
-        let b = Value::Str(ab(i.to_string(&arg(args, 0)))?);
+        let a = this_string(i, &this)?;
+        let b = ab(i.to_string(&arg(args, 0)))?;
+        #[cfg(feature = "intl")]
+        if matches!(arg(args, 1), Value::Undefined) && matches!(arg(args, 2), Value::Undefined) {
+            return Ok(Value::Num(
+                match crate::intl::collator::compare_default(a.as_str(), b.as_str()) {
+                    std::cmp::Ordering::Less => -1.0,
+                    std::cmp::Ordering::Equal => 0.0,
+                    std::cmp::Ordering::Greater => 1.0,
+                },
+            ));
+        }
+        let (a, b) = (Value::Str(a), Value::Str(b));
         intl_delegate(
             i,
             "Collator",

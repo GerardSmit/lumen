@@ -282,6 +282,9 @@ fn is_collation_ignorable(cp: u32) -> bool {
 /// optional numeric mode that compares digit runs by value at the primary level.
 fn collate(a: &str, b: &str, opts: &CollateOpts) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    if !opts.numeric && !opts.ignore_punct && a.is_ascii() && b.is_ascii() {
+        return collate_ascii(a.as_bytes(), b.as_bytes(), &opts.sensitivity, opts.upper_first);
+    }
     let ea = elements(a, opts);
     let eb = elements(b, opts);
     // Primary.
@@ -313,6 +316,39 @@ fn collate(a: &str, b: &str, opts: &CollateOpts) -> std::cmp::Ordering {
         }
     }
     Ordering::Equal
+}
+
+/// [`collate`] for two ASCII strings without numeric or ignorePunctuation: every character
+/// is its own element with no marks (ASCII is its own NFD, all combining classes 0), so the
+/// primary level is the lowercased bytes and the tertiary level their case bits.
+fn collate_ascii(a: &[u8], b: &[u8], sensitivity: &str, upper_first: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let prim = a
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .cmp(b.iter().map(u8::to_ascii_lowercase));
+    if prim != Ordering::Equal || !matches!(sensitivity, "case" | "variant") {
+        return prim;
+    }
+    // Equal primaries: same length, differing (if at all) only in case.
+    let w = |c: &u8| c.is_ascii_uppercase() != upper_first;
+    a.iter().map(w).cmp(b.iter().map(w))
+}
+
+/// `String.prototype.localeCompare(that)` with no locales or options: the default (`en`)
+/// Collator's comparison, without constructing one.
+pub(crate) fn compare_default(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        return collate_ascii(a.as_bytes(), b.as_bytes(), "variant", false);
+    }
+    let opts = CollateOpts {
+        sensitivity: "variant".to_string(),
+        numeric: false,
+        ignore_punct: false,
+        upper_first: false,
+        expand_umlaut: false,
+    };
+    collate(a, b, &opts)
 }
 
 fn cmp_primary_numeric(a: &[El], b: &[El]) -> std::cmp::Ordering {

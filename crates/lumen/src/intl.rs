@@ -7,7 +7,7 @@ use crate::interpreter::Interp;
 use crate::value::{set_builtin, Gc, Object, Property, Value};
 use std::rc::Rc;
 
-mod collator;
+pub(crate) mod collator;
 mod data;
 mod datetimeformat;
 mod displaynames;
