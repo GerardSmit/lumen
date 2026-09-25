@@ -15,16 +15,6 @@ enum ScopeGuard {
     },
 }
 
-struct ExactGuard {
-    scope: Weak<RefCell<Scope>>,
-    generation: u32,
-}
-
-struct ExactPath {
-    guards: Box<[ExactGuard]>,
-    binding: *const Binding,
-}
-
 impl ScopeGuard {
     fn new(env: &Env, scope: &Scope) -> Self {
         match scope.vars.template_layout() {
@@ -65,57 +55,64 @@ enum Holder {
     },
 }
 
-struct GuardedPath {
+pub(super) struct NamePath {
     guards: Vec<ScopeGuard>,
     holder: Holder,
 }
 
-pub(super) struct NamePath(PathKind);
-
-enum PathKind {
-    Exact(ExactPath),
-    Guarded(GuardedPath),
-}
-
-impl ExactPath {
-    fn read(&self, env: &Env) -> Option<Value> {
-        if self
-            .guards
-            .first()
-            .is_none_or(|guard| Rc::as_ptr(env) != guard.scope.as_ptr())
-        {
-            return None;
-        }
-        // Parent links are immutable while a live child owns the chain. Borrowing the cached
-        // exact scopes directly avoids rebuilding that chain's raw pointers on every hit; the
-        // weak owners keep every allocation address ABA-safe, and live generations still reject
-        // any insertion/removal that could change resolution.
-        for guard in &self.guards {
-            // SAFETY: matching the first guard proves the original child is live. Every later
-            // guard is one of its immutable ancestors, so the child chain keeps that allocation
-            // alive; each cached Weak additionally prevents address reuse between invocations.
-            let scope = unsafe { &*guard.scope.as_ptr() }.borrow();
-            if scope.with_obj.is_some() || scope.vars.generation() != guard.generation {
+impl NamePath {
+    /// The scope the path ends in, when every guard on the way still holds.
+    fn resolve(&self, env: &Env) -> Option<*const RefCell<Scope>> {
+        let mut pointer = Rc::as_ptr(env);
+        for (index, guard) in self.guards.iter().enumerate() {
+            let scope = unsafe { &*pointer }.try_borrow().ok()?;
+            if !guard.matches(pointer, &scope) {
                 return None;
             }
+            if index + 1 == self.guards.len() {
+                return Some(pointer);
+            }
+            pointer = Rc::as_ptr(scope.parent.as_ref()?);
         }
-        let binding = unsafe { &*self.binding };
-        let value =
-            (binding.initialized && binding.import_ref.is_none()).then(|| binding.value.clone());
-        #[cfg(test)]
-        if value.is_some() {
-            EXACT_HITS.with(|hits| hits.set(hits.get() + 1));
-        }
-        value
+        None
     }
-}
 
-#[cfg(test)]
-thread_local! {
-    static EXACT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+    /// The binding a scope-holder path resolves to, when it is initialized, no import, and (for
+    /// `write`) mutable. Its address is stable until JS runs (only JS restructures a scope).
+    fn binding_ptr(&self, env: &Env, write: bool) -> Option<*mut Binding> {
+        let pointer = self.resolve(env)?;
+        let b: *mut Binding = match &self.holder {
+            Holder::Binding(p) => *p as *mut Binding,
+            Holder::Slot(slot) => {
+                let mut scope = unsafe { &*pointer }.try_borrow_mut().ok()?;
+                let layout = scope.vars.template_layout()?.clone();
+                scope.vars.layout_binding_mut(&layout, *slot)? as *mut Binding
+            }
+            Holder::Global { .. } => return None,
+        };
+        let bd = unsafe { &*b };
+        (bd.initialized && bd.import_ref.is_none() && (!write || bd.mutable)).then_some(b)
+    }
 
-impl GuardedPath {
+    /// The global object's entry slot a global-holder path resolves to, while it is a data
+    /// property at the recorded shape.
+    fn global_slot(&self, interp: &Interp, env: &Env) -> Option<usize> {
+        let Holder::Global {
+            object,
+            shape,
+            slot,
+        } = &self.holder
+        else {
+            return None;
+        };
+        let pointer = self.resolve(env)?;
+        if pointer != Rc::as_ptr(&interp.global_env) || object.as_ptr() != Gc::as_ptr(&interp.global) {
+            return None;
+        }
+        global_value(interp, &interp.global, *shape, *slot)?;
+        Some(*slot)
+    }
+
     fn read(&self, interp: &Interp, env: &Env) -> Option<Value> {
         // The caller's strong env handle owns the entire parent chain. No JS, GC or scope
         // mutation occurs during this walk, so borrowed pointers avoid per-hop Rc churn.
@@ -157,15 +154,6 @@ impl GuardedPath {
         };
         (binding.initialized && binding.import_ref.is_none()).then(|| binding.value.clone())
     }
-}
-
-impl NamePath {
-    fn read(&self, interp: &Interp, env: &Env) -> Option<Value> {
-        match self {
-            Self(PathKind::Exact(path)) => path.read(env),
-            Self(PathKind::Guarded(path)) => path.read(interp, env),
-        }
-    }
 
     fn build(interp: &Interp, env: &Env, name: &str) -> Option<(Self, Value)> {
         let mut guards = Vec::new();
@@ -186,28 +174,7 @@ impl NamePath {
                     Some(layout) => Holder::Slot(layout.slot(name)?),
                     None => Holder::Binding(binding as *const Binding),
                 };
-                let value = binding.value.clone();
-                if let Holder::Binding(binding) = holder {
-                    if guards
-                        .iter()
-                        .all(|guard| matches!(guard, ScopeGuard::Exact { .. }))
-                    {
-                        let guards = guards
-                            .into_iter()
-                            .map(|guard| match guard {
-                                ScopeGuard::Exact { scope, generation } => {
-                                    ExactGuard { scope, generation }
-                                }
-                                ScopeGuard::Layout(_) => unreachable!("checked exact guards"),
-                            })
-                            .collect();
-                        return Some((Self(PathKind::Exact(ExactPath { guards, binding })), value));
-                    }
-                }
-                return Some((
-                    Self(PathKind::Guarded(GuardedPath { guards, holder })),
-                    value,
-                ));
+                return Some((Self { guards, holder }, binding.value.clone()));
             }
             if Rc::ptr_eq(&current, &interp.global_env) {
                 if depth == 0 {
@@ -223,10 +190,7 @@ impl NamePath {
                     shape,
                     slot,
                 };
-                return Some((
-                    Self(PathKind::Guarded(GuardedPath { guards, holder })),
-                    value,
-                ));
+                return Some((Self { guards, holder }, value));
             }
             let parent = scope.parent.clone()?;
             drop(scope);
@@ -248,7 +212,77 @@ fn global_value(interp: &Interp, object: &Gc, shape: u32, slot: usize) -> Option
     (!property.accessor()).then(|| property.value())
 }
 
+/// Write `value` to the global object's entry `slot` when it is a writable data property of an
+/// ordinary global; `Err(value)` otherwise.
+pub(super) fn global_store(interp: &Interp, slot: usize, value: Value) -> Result<(), Value> {
+    if !interp.ordinary_get_ptr(Gc::as_ptr(&interp.global) as usize) {
+        return Err(value);
+    }
+    let Ok(mut g) = interp.global.try_borrow_mut() else {
+        return Err(value);
+    };
+    if !matches!(g.exotic, Exotic::None) {
+        return Err(value);
+    }
+    match g.props.entry_at_mut(slot) {
+        Some(p) if !p.accessor() && p.writable() => {
+            p.set_value(value);
+            Ok(())
+        }
+        _ => Err(value),
+    }
+}
+
 impl Chunk {
+    /// A cached free-name write through the guarded path (see [`Chunk::name_path_hit`]);
+    /// `Err(value)` when the path does not prove a plain writable target.
+    pub(super) fn name_path_store(
+        &self,
+        interp: &Interp,
+        env: &Env,
+        cache: u32,
+        value: Value,
+    ) -> Result<(), Value> {
+        let paths = self.name_paths[cache as usize].borrow();
+        let Some(path) = paths.as_ref() else {
+            return Err(value);
+        };
+        if let Some(b) = path.binding_ptr(env, true) {
+            drop(paths);
+            // SAFETY: the path's guards prove the binding live and unmoved.
+            unsafe { (*b).value = value };
+            return Ok(());
+        }
+        match path.global_slot(interp, env) {
+            Some(slot) => {
+                drop(paths);
+                global_store(interp, slot, value)
+            }
+            None => Err(value),
+        }
+    }
+
+    /// [`NamePath::binding_ptr`] of cache `cache`'s path.
+    pub(crate) fn name_path_binding(
+        &self,
+        env: &Env,
+        cache: u32,
+        write: bool,
+    ) -> Option<*mut Binding> {
+        self.name_paths.get(cache as usize)?.borrow().as_ref()?.binding_ptr(env, write)
+    }
+
+    /// [`NamePath::global_slot`] of cache `cache`'s path.
+    pub(crate) fn name_path_global(&self, interp: &Interp, env: &Env, cache: u32) -> Option<usize> {
+        self.name_paths.get(cache as usize)?.borrow().as_ref()?.global_slot(interp, env)
+    }
+
+    /// Whether cache `cache` holds a path, and whether it ends at the global object.
+    pub(crate) fn name_path_kind(&self, cache: u32) -> Option<bool> {
+        let paths = self.name_paths.get(cache as usize)?.borrow();
+        Some(matches!(paths.as_ref()?.holder, Holder::Global { .. }))
+    }
+
     pub(super) fn name_path_hit(&self, interp: &Interp, env: &Env, cache: u32) -> Option<Value> {
         self.name_paths[cache as usize]
             .borrow()
@@ -271,55 +305,13 @@ impl Chunk {
 
 #[cfg(test)]
 mod tests {
-    use super::{NamePath, PathKind};
+    use super::NamePath;
     use crate::interpreter::{
         new_scope, new_var_scope_with_bindings, Binding, BindingLayout, VarMap,
     };
     use crate::value::Value;
     use crate::Engine;
     use std::rc::Rc;
-
-    #[test]
-    fn exact_paths_read_live_bindings_and_reject_chain_changes() {
-        let engine = Engine::new();
-        let parent = new_scope(Some(engine.interp.global_env.clone()));
-        parent
-            .borrow_mut()
-            .vars
-            .insert("x", Binding::data(Value::Num(7.0), true, true));
-        let middle = new_scope(Some(parent.clone()));
-        let child = new_scope(Some(middle.clone()));
-        let (path, value) = NamePath::build(&engine.interp, &child, "x").unwrap();
-        assert!(matches!(path, NamePath(PathKind::Exact(_))));
-        assert!(matches!(value, Value::Num(7.0)));
-        parent.borrow_mut().vars.get_mut("x").unwrap().value = Value::Num(9.0);
-        assert!(matches!(
-            path.read(&engine.interp, &child),
-            Some(Value::Num(9.0))
-        ));
-
-        let other = new_scope(Some(middle.clone()));
-        assert!(path.read(&engine.interp, &other).is_none());
-        parent.borrow_mut().vars.get_mut("x").unwrap().initialized = false;
-        assert!(path.read(&engine.interp, &child).is_none());
-        parent.borrow_mut().vars.get_mut("x").unwrap().initialized = true;
-        parent.borrow_mut().vars.get_mut("x").unwrap().import_ref =
-            Some((engine.interp.global_env.clone(), "x".to_string()));
-        assert!(path.read(&engine.interp, &child).is_none());
-        parent.borrow_mut().vars.get_mut("x").unwrap().import_ref = None;
-        middle.borrow_mut().with_obj = Some(Value::Undefined);
-        assert!(path.read(&engine.interp, &child).is_none());
-        middle.borrow_mut().with_obj = None;
-        assert!(matches!(
-            path.read(&engine.interp, &child),
-            Some(Value::Num(9.0))
-        ));
-        middle
-            .borrow_mut()
-            .vars
-            .insert("x", Binding::data(Value::Num(11.0), true, true));
-        assert!(path.read(&engine.interp, &child).is_none());
-    }
 
     #[test]
     fn paths_follow_live_values_and_reject_shadowing_and_different_ancestors() {

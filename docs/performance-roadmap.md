@@ -161,9 +161,23 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      | `arguments.length + arguments[0]` | 1146 ns | 27.7 ns | 1.0 ns |
      | `(...a) => a.length` | 63 ns | 23.8 ns | 0.87 ns |
    - Left: what remains is the direct call itself. Node inlines these; our inliner still rejects callees with `arguments` or a rest parameter.
-5. **Global inline cache (S).**
+5. ✅ **Done: global inline cache (S).**
    - What: a property cell with a shape guard for unqualified `LoadName` and `StoreName`.
-   - Closes: global write 718×, global read 82×, and top-level `fib` in plain `lumen` (111 vs 55 ms).
+   - Built:
+     - Interpreter: a free-name store now hits the guarded `NamePath` (script-scope binding or global-object data property) instead of re-resolving every write.
+     - JIT:
+       - Global-object properties are read and written in place through a cached `Property` address (`Src::Glob`, `Helper::GlobPtr`). It stays valid until JS runs.
+       - A read speculates Number when the property held one at translation, and exits otherwise.
+       - A write stores a Number or Boolean over a writable data property holding a droppable value.
+       - Script-scope `let` / `var` bindings reached through a `NamePath` get binding addresses too (`Src::NameW` for writes).
+   - Release results:
+
+     | Case | Before | Now |
+     |---|---|---|
+     | `globalThis.gv` read | 31 ns | 3.0 ns |
+     | `globalThis.gv` write | 371 ns | 3.7 ns |
+     | script `var` / `let` write | 12 ns | 2.4 ns |
+     | top-level `fib(30)` | 111 ms | 59 ms (node 55) |
 6. **`new.target` in the bytecode compiler (S).**
    - Why: functions that use it are rejected by the compiler and run on the tree-walker.
    - Closes: ctor_new_target 143×.

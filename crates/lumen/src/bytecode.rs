@@ -8244,9 +8244,44 @@ impl Chunk {
         } else {
             value
         };
+        let value = match self.name_path_store(i, env, c, value) {
+            Ok(()) => return Ok(()),
+            Err(v) => v,
+        };
         i.assign_free_name(&self.names[n as usize], value, env)?;
         let _ = self.name_ic_fill(i, env, n, c);
         Ok(())
+    }
+
+    /// Where free name cache `c` resolves, for native code: `Some(false)` a scope binding,
+    /// `Some(true)` a global-object property, `None` not cached.
+    pub(crate) fn name_site_kind(&self, c: u32) -> Option<bool> {
+        let ic = self.name_caches.get(c as usize)?.get();
+        if ic.env != 0 {
+            return Some(ic.env & 1 != 0);
+        }
+        self.name_path_kind(c)
+    }
+
+    /// The global object's entry slot free name cache `c` resolves to from `env`, while the
+    /// resolution still holds and the entry is a data property.
+    pub(crate) fn name_global_slot(&self, i: &Interp, env: &Env, c: u32) -> Option<usize> {
+        let ic = self.name_caches.get(c as usize)?.get();
+        let raw = Rc::as_ptr(env) as usize;
+        if ic.env == raw | 1 {
+            if env.try_borrow().ok()?.vars.generation() != ic.gen {
+                return None;
+            }
+            let g = i.global.try_borrow().ok()?;
+            if !matches!(g.exotic, crate::value::Exotic::None)
+                || g.props.shape() != (ic.binding >> 32) as u32
+                || g.props.entry_at(ic.binding as u32 as usize)?.accessor()
+            {
+                return None;
+            }
+            return Some(ic.binding as u32 as usize);
+        }
+        self.name_path_global(i, env, c)
     }
     pub(crate) fn jit_frame(&self) -> (usize, usize) {
         (self.n_params, self.n_slots)
