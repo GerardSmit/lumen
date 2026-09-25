@@ -3563,6 +3563,7 @@ impl Interp {
         match job.kind {
             crate::eval::promise_fast::JOB_REACTION => {}
             crate::eval::promise_fast::JOB_THENABLE => return self.run_thenable_job(job),
+            crate::eval::promise_fast::JOB_TASK => return self.run_task_job(job),
             _ => return self.run_combinator_job(job),
         }
         if matches!(job.result, Value::Empty) {
@@ -3585,6 +3586,29 @@ impl Interp {
             self.resolve_promise(&job.result, job.value);
         } else {
             self.reject_promise(&job.result, job.value);
+        }
+    }
+
+    /// Enqueue `cb` as a microtask (`queueMicrotask`); the caller checks it is callable.
+    pub fn queue_microtask(&mut self, cb: Value) {
+        self.microtasks.push_back(crate::interpreter::Job {
+            handler: cb,
+            result: Value::Undefined,
+            value: Value::Undefined,
+            fulfilled: true,
+            kind: crate::eval::promise_fast::JOB_TASK,
+            idx: 0,
+            context: self.async_context.clone(),
+        });
+    }
+
+    fn run_task_job(&mut self, job: crate::interpreter::Job) {
+        let outer = std::mem::replace(&mut self.async_context, job.context);
+        let outcome = self.call(job.handler, Value::Undefined, &[]);
+        self.async_context = outer;
+        if let Err(Abrupt::Throw(e)) = outcome {
+            let p = self.new_promise();
+            self.reject_promise(&p, e);
         }
     }
 

@@ -6406,9 +6406,8 @@ fn run_vm_frames<const ONE: bool>(
                 step_and_store(i, &mut stack, kind, old, |i, v| i.assign_free_name(name, v, env))?;
             }
             Op::UpdateNameCached(n, c, kind) => {
-                let name = &chunk.names[n as usize];
                 let old = chunk.load_name_ic(i, env, n, c)?;
-                step_and_store(i, &mut stack, kind, old, |i, v| i.assign_free_name(name, v, env))?;
+                step_and_store(i, &mut stack, kind, old, |i, v| chunk.store_name_ic(i, env, n, c, v))?;
             }
             Op::MakeClosure(fidx, name_n) => {
                 stack.push(make_closure(i, chunk, fidx, name_n, env));
