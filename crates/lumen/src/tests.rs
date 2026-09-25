@@ -11361,3 +11361,24 @@ fn lazy_and_eager_parses_agree() {
     assert!(matches!(f.source, crate::ast::FnSource::Range { .. }));
     assert!(f.source().unwrap().starts_with("function outer(a, b) {"));
 }
+
+/// Crossing the live-object ceiling is a RangeError a `catch` can handle: the handler gets
+/// headroom instead of tripping the same ceiling at its first allocation.
+#[test]
+fn live_object_ceiling_is_catchable() {
+    let mut e = Engine::new();
+    e.set_live_object_limit(150_000);
+    let src = "let a = [], r;
+        try { for (;;) a.push({ n: a.length }); } catch (err) {
+            // The handler allocates while the retention that tripped the ceiling is still live.
+            const seen = []; for (let i = 0; i < 1000; i++) seen.push({ i });
+            r = err.name + ':' + (a.length > 100000) + ':' + seen.length;
+        }
+        a = null;
+        const b = []; for (let i = 0; i < 1000; i++) b.push({ i });
+        r + ':' + b.length";
+    match e.eval(src, false).expect("parse") {
+        Completion::Value(v) => assert_eq!(v, "RangeError:true:1000:1000"),
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}

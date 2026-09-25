@@ -371,10 +371,25 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       - Identifier and string tokens own `String`s that the parser clones in `match self.cur().clone()`.
       - Bodies of lazily parsed functions are still lexed with the rest of the file.
       - The AST node sizes and an arena, as planned.
-15. **Limits (S).**
+15. ✅ **Limits (S).** *(Partly done.)*
     - `MAX_LIVE` (3M live objects) throws a RangeError that escapes try/catch; node handles 5M.
     - `MAX_EVAL_DEPTH` allows 1,500 frames, against about 10.4k in node.
     - The 1e6-objects case also takes 462 ms / 178 MB vs 142 ms / 141 MB.
+    - Built:
+      - `MAX_LIVE` is 20M on native targets, about 3.4 GB at the measured ~170 bytes per small object. wasm32 keeps 3M.
+      - The RangeError is catchable. It escaped because the handler's first allocation hit the same ceiling and threw again. The collector now leaves 100k allocations of headroom after throwing.
+      - `MAX_EVAL_DEPTH` is 7,000. Measured in release with the ceiling lifted, one unit of depth costs at most about 7 KiB of native stack: an async function recursing on a 64 MiB coroutine thread. JIT'd recursion costs about 3 KiB, and tree-walker `map` recursion about 4.5 KiB. 7,000 therefore stays inside the smallest (64 MiB) engine thread.
+    - Release results:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | 5M live objects | uncaught RangeError | 1,970 ms / 780 MB | 212 ms / 362 MB |
+      | recursion depth | 1,500 | 6,994 | 10,420 |
+
+    - Left:
+      - The 1e6-objects case is unchanged at 403 ms / 169 MB (node 67 ms / 135 MB).
+      - About half of that is the cycle collector. Each pass is a full trial deletion over every live object at 100k, 200k, 400k and 800k live objects, about 120 ns per object.
+      - A generational or incremental scheme, or skipping objects that cannot be part of a cycle, is the next step.
 16. **module.js (M).**
     - What: generate the 52 builtin ESM wrappers on demand. Move the CJS resolver into Rust and share it with `esm.rs`, which gains `exports` subpath patterns.
     - Saves: about 0.8 MB of startup memory.
