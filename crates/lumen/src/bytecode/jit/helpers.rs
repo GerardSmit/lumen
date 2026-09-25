@@ -78,6 +78,10 @@ pub(crate) enum Helper {
     /// it is a pristine dense Array (see `array_destructure::try_dense`): the `n` elements
     /// written from `p` on, 1; else 0 with `p` untouched. Runs no JS.
     DestructDense,
+    /// `(frame, obj: *const Value, key: f64, v: *mut Value) -> u32` — `obj[key] = v` of an
+    /// owned value through `Interp::fast_set_elem` (an existing element's overwrite or a
+    /// dense append; runs no JS): 1 with `*v` consumed, else 0 with `*v` untouched.
+    ElemSetBoxed,
     /// `(frame, n: u32) -> *mut Value` — the address of captured binding `names[n]`'s value in
     /// the activation env, or null while it is in its TDZ. Pure, like [`Helper::NamePtr`].
     CapPtr,
@@ -262,7 +266,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 65] = [
+pub(crate) const ALL: [Helper; 66] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -276,6 +280,7 @@ pub(crate) const ALL: [Helper; 65] = [
     Helper::NamePtrW,
     Helper::GlobPtr,
     Helper::DestructDense,
+    Helper::ElemSetBoxed,
     Helper::CapPtr,
     Helper::LoadName,
     Helper::LoadNameForCall,
@@ -346,6 +351,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::Safepoint => (&[P], &[I32]),
         Helper::NamePtr | Helper::NamePtrW | Helper::GlobPtr => (&[P, I32, I32], &[P]),
         Helper::DestructDense => (&[P, I32, P], &[I32]),
+        Helper::ElemSetBoxed => (&[P, P, F64, P], &[I32]),
         Helper::CapPtr => (&[P, I32], &[P]),
         Helper::LoadName | Helper::LoadNameForCall => (&[P, I32, I32, P], &[I32]),
         Helper::StoreName => (&[P, I32, I32, P], &[I32]),
@@ -417,6 +423,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::NamePtrW => name_ptr_w as *const () as usize,
         Helper::GlobPtr => glob_ptr as *const () as usize,
         Helper::DestructDense => destruct_dense as *const () as usize,
+        Helper::ElemSetBoxed => elem_set_boxed as *const () as usize,
         Helper::CapPtr => cap_ptr as *const () as usize,
         Helper::LoadName => load_name as *const () as usize,
         Helper::LoadNameForCall => load_name_for_call as *const () as usize,
@@ -1020,6 +1027,28 @@ pub(crate) unsafe extern "C" fn destruct_dense(f: *mut JitFrame, n: u32, p: *mut
     } else {
         std::ptr::write(p, v);
         0
+    }
+}
+
+pub(crate) unsafe extern "C" fn elem_set_boxed(
+    f: *mut JitFrame,
+    obj: *const Value,
+    key: f64,
+    v: *mut Value,
+) -> u32 {
+    let Value::Obj(o) = &*obj else {
+        return 0;
+    };
+    let i = &mut *(*f).interp;
+    match i.fast_set_elem(o, key, std::ptr::read(v)) {
+        Ok(()) => {
+            std::ptr::write(v, Value::Undefined);
+            1
+        }
+        Err(back) => {
+            std::ptr::write(v, back);
+            0
+        }
     }
 }
 

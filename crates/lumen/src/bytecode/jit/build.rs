@@ -5625,6 +5625,30 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(slow_b);
         self.fb.switch_to_block(slow_b);
         self.stack = pre.clone();
+        if (matches!(v, Entry::Boxed) && !keep) || matches!(v, Entry::Num(_)) {
+            // An owned value (a Number is a copy): a plain overwrite, a hole fill or a dense
+            // append natively.
+            self.store_entry(d - 1, v);
+            let vp = self.sptr(d - 1);
+            let r = self
+                .call(Helper::ElemSetBoxed, &[self.frame, obj, key, vp])
+                .expect("ElemSetBoxed returns a flag");
+            let z = self.i32c(0);
+            let hit = self.fb.icmp(IntCC::Ne, r, z);
+            let hit_b = self.fb.create_block();
+            let gen_b = self.fb.create_block();
+            self.fb.brif(hit, hit_b, &[], gen_b, &[]);
+            self.fb.seal_block(hit_b);
+            self.fb.seal_block(gen_b);
+            self.fb.switch_to_block(hit_b);
+            // The storage may have grown (an append), and the old value was released.
+            self.invalidate_elems();
+            if let Some(i) = drop {
+                self.drop_at(i);
+            }
+            self.fb.jump(join, &[]);
+            self.fb.switch_to_block(gen_b);
+        }
         if self.slow_path(pc, slow) {
             self.fb.jump(join, &[]);
         }
