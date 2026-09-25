@@ -37,6 +37,10 @@ use std::sync::OnceLock;
 /// Slots a directly called function may have (the site stores each one).
 const MAX_DIRECT_SLOTS: usize = 64;
 
+/// Callee frames up to this many slots are released inline after a direct call's return;
+/// larger ones through [`Helper::DropN`].
+const DROP_INLINE_SLOTS: usize = 6;
+
 /// A direct call site (see the module docs).
 #[derive(Clone, Debug)]
 pub(super) struct DSite {
@@ -1801,7 +1805,7 @@ impl Tr<'_, '_> {
                 Entry::Ref(p, _) => {
                     let kc = self.ptrc(off as i64);
                     let dst = self.fb.binary(BinaryOp::Iadd, slots_p, kc);
-                    self.call(Helper::Clone, &[dst, p]);
+                    self.clone_mem(dst, p);
                 }
             }
         }
@@ -1902,7 +1906,12 @@ impl Tr<'_, '_> {
         let sp = self.stackp;
         self.copy_value(stack_p, 0, sp, bo);
         self.fb.store(MemKind::I32U8, stack_p, z, 0);
-        if site.n_slots > 0 {
+        if (1..=DROP_INLINE_SLOTS).contains(&site.n_slots) {
+            // Few slots: each released inline (a reference count step for an object or string).
+            for k in 0..site.n_slots {
+                self.drop_mem(slots_p, k as i32 * VALUE_SIZE);
+            }
+        } else if site.n_slots > 0 {
             let four = self.i32c(TAG_NUM as i64);
             let mut any = None;
             for k in 0..site.n_slots {
