@@ -295,19 +295,22 @@ impl Runtime {
                 err: Box::new(stderr),
             });
         }
-        // queueMicrotask, via the promise queue the engine already has. Close enough to spec
-        // for v0 (a thrown callback error becomes an unhandled rejection, not a reported
-        // exception); a native microtask hook can replace it if that gap ever matters.
-        engine
-            .eval(
-                "globalThis.queueMicrotask = (cb) => {
-                    if (typeof cb !== 'function')
-                        throw new TypeError('queueMicrotask expects a function');
-                    Promise.resolve().then(cb);
-                };",
-                false,
-            )
-            .expect("shim parses");
+        // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
+        // unhandled rejection, not a reported exception.
+        {
+            let ctx = engine.ctx();
+            let f = ctx.make_native("queueMicrotask", 1, |i, _this, args| {
+                match args.first() {
+                    Some(cb) if cb.is_callable() => {
+                        i.queue_microtask(cb.clone());
+                        Ok(Value::Undefined)
+                    }
+                    _ => Err(i.make_error("TypeError", "queueMicrotask expects a function")),
+                }
+            });
+            let global = engine.global_this();
+            let _ = engine.ctx().set_member(&global, "queueMicrotask", Value::Obj(f));
+        }
         // The HTML error-reporting globals (WinterTC Minimum Common API §5.2): `onerror` /
         // `onunhandledrejection` global event-handler properties and `reportError`. The fire
         // helpers return whether the default report is suppressed (`onerror` returning `true`;

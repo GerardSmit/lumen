@@ -349,7 +349,7 @@ fn build_region(
     let tail_loops = plan.tail_loops.len() as u32;
     an.back[0] += tail_loops;
     an.preds[0] += tail_loops;
-    let mut num_exits = Vec::new();
+    let num_exits;
     let pins = std::mem::take(&mut plan.pins);
     let mut boxes = std::mem::take(&mut plan.boxes);
     let externs = plan.externs.clone();
@@ -1307,6 +1307,11 @@ fn plan(
                 };
                 p.name_store.insert(pc, src);
                 add_ptr(&mut p, src);
+            }
+            // `++name` on a scope binding: in place through the writable binding pointer.
+            Op::UpdateNameCached(n, c, _) if chunk.name_site_kind(c) == Some(false) => {
+                p.name_store.insert(pc, Src::NameW(n));
+                add_ptr(&mut p, Src::NameW(n));
             }
             Op::LoadCap(n) | Op::UpdateCap(n, _) | Op::StoreCap(n) => {
                 add_ptr(&mut p, Src::Cap(n));
@@ -3252,7 +3257,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.throw_if(st, pc, &below, d - 1);
                 self.stack.pop();
             }
-            Op::UpdateCap(n, k) => self.update_cap(pc, n, k),
+            Op::UpdateCap(n, k) => self.update_ptr(pc, Src::Cap(n), None, k),
+            Op::UpdateNameCached(n, c, k) if self.plan.name_store.contains_key(&pc) => {
+                self.update_ptr(pc, Src::NameW(n), Some(c), k)
+            }
             Op::New(argc) if self.plan.dnew.contains_key(&pc) => {
                 self.plan_new(pc, argc as usize);
             }
@@ -3570,6 +3578,14 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.switch_to_block(join);
                     self.stack.truncate(d - 2);
                     self.stack.push(Entry::Boxed);
+                }
+                _ => self.generic(pc),
+            },
+            // `obj[key](...)`: the element read leaves the receiver in place under the method.
+            Op::GetMethodElem => match (self.stack[d - 2], self.stack[d - 1]) {
+                (Entry::Boxed, Entry::Num(key)) => {
+                    let obj = self.sptr(d - 2);
+                    self.elem_read(pc, obj, key, None, d - 1, false, Slow::Generic, None, None);
                 }
                 _ => self.generic(pc),
             },
@@ -4208,11 +4224,12 @@ impl<'a, 'f> Tr<'a, 'f> {
         Ok(())
     }
 
-    /// `UpdateCap(n, k)`: in place on a Number, else the interpreter's op.
-    fn update_cap(&mut self, pc: usize, n: u32, k: UpdKind) {
+    /// `UpdateCap` / `UpdateNameCached` through `src`: in place on a Number, else the
+    /// interpreter's op.
+    fn update_ptr(&mut self, pc: usize, src: Src, cache: Option<u32>, k: UpdKind) {
         let d = self.stack.len();
         let pushes = !matches!(k, UpdKind::IncDiscard | UpdKind::DecDiscard);
-        let p = self.src_ptr(Src::Cap(n), None);
+        let p = self.src_ptr(src, cache);
         let slow = self.fb.create_block();
         let join = self.fb.create_block();
         let param = pushes.then(|| self.fb.append_block_param(join, Type::F64));
@@ -4258,7 +4275,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         self.fb.seal_block(join);
         self.fb.switch_to_block(join);
-        self.invalidate_src(Src::Cap(n));
+        self.invalidate_src(src);
         self.stack = pre;
         if let Some(r) = param {
             self.stack.push(Entry::Num(r));
@@ -5885,7 +5902,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         // interpreter's fast paths before the generic op.
         if !want
             && matches!(slow, Slow::Generic)
-            && matches!(self.ops[pc], Op::GetElem | Op::GetElemLocal(_))
+            && matches!(self.ops[pc], Op::GetElem | Op::GetElemLocal(_) | Op::GetMethodElem)
         {
             // An object element, inline: a retained handle word.
             let helper_b = self.fb.create_block();

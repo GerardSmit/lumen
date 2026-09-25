@@ -44,6 +44,9 @@ pub(crate) const JOB_REACTION: u8 = 0;
 /// PromiseResolveThenableJob: `handler` is the `then` function, `value` the thenable,
 /// `result` the promise being resolved.
 pub(crate) const JOB_THENABLE: u8 = 1;
+/// `queueMicrotask(cb)`: call `handler` with no arguments; a throw becomes an unhandled
+/// rejection, as it did when the host shim was `Promise.resolve().then(cb)`.
+pub(crate) const JOB_TASK: u8 = 255;
 /// Combinator element settlements are `JOB_COMB_BASE + REACT_*` (see
 /// [`Interp::combinator_settle`]).
 pub(crate) const JOB_COMB_BASE: u8 = 2;
@@ -199,6 +202,21 @@ pub(crate) struct PromiseIntr {
     /// The original `Promise.prototype.then` and `Promise.resolve`.
     pub(crate) then: Gc,
     pub(crate) resolve: Gc,
+    /// Where the pristine checks (`builtins::promise`) found `constructor`, `then` and
+    /// `@@species` last time.
+    pub(crate) slots: Cell<PristineSlots>,
+}
+
+/// Property slots of %Promise.prototype% (`constructor`, `then`) and %Promise% (`@@species`),
+/// each trusted only while its object still has the recorded shape: a shape pins which key a
+/// slot holds, not its value, so the value is still checked on every use.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PristineSlots {
+    pub(crate) proto_shape: Option<u32>,
+    pub(crate) ctor_slot: u32,
+    pub(crate) then_slot: u32,
+    pub(crate) ctor_shape: Option<u32>,
+    pub(crate) species_slot: u32,
 }
 
 #[derive(Default)]
@@ -235,6 +253,7 @@ impl Interp {
             ctor: e.get("%PromiseCtor%")?.clone(),
             then: e.get("%Promise.prototype.then%")?.clone(),
             resolve: e.get("%Promise.resolve%")?.clone(),
+            slots: Cell::default(),
         });
         *self.lang.promise.intr.borrow_mut() = Some(intr.clone());
         Some(intr)

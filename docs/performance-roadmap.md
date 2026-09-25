@@ -331,9 +331,28 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
 
     - Left: the machine cost of the call sequence itself (frame record, flag stores, prologue). This overlaps item 17.
     - `ack(2, 2000)` exceeds the 1,500-frame depth limit (item 15).
-13. **Promise path (M).**
+13. ✅ **Promise path (M).** *(Partly done.)*
     - What: lighter reaction records, and no `promise_then_is_silent` string lookups.
-    - Closes: then chain 3×, Promise.all 6.7×, resolve 10.8×, queueMicrotask 17.5×.
+    - Built:
+      - `queueMicrotask` is a native function that enqueues a job directly. It used to be a JS shim around `Promise.resolve().then(cb)`, which cost two promises and a reaction per call. A throw still becomes an unhandled rejection.
+      - The pristine checks behind `then`, `Promise.all` and `Promise.resolve` read `constructor`, `then` and `@@species` from slots cached against each object's shape, instead of hashing the keys on every call.
+      - Found while measuring:
+        - `++x` inside a closure, on a variable of an enclosing scope (`UpdateNameCached`), wrote back through the uncached `assign_free_name` in the VM and took the generic op in the JIT. It now stores through the name cache, and the JIT updates a Number in place through the binding pointer.
+        - `obj[i](...)` (`GetMethodElem`) now reads the element natively in the JIT.
+    - Release results:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | queueMicrotask | 1,700 ns | 680 ns | 116 ns |
+      | `() => { ++c }` called in a loop | 170 ns | 20 ns | 2 ns |
+      | `fs[0]()` | 175 ns | 120 ns | 4 ns |
+      | then chain (first run / steady build + drain) | 2,400 ns / 630 ns | 2,200 ns / 600 ns | 229 ns / 57 ns |
+      | Promise.all | 787 ns | 700 ns | 260 ns |
+
+    - Left, and why:
+      - The first run of each benchmark is about 3× its steady state. Every fresh block comes from the system heap, because the size-class cache only recycles freed blocks.
+      - A call to a closure the JIT cannot bind directly costs about 100 ns through `helpers::call` → `call_native` → `enter`. This overlaps item 17.
+      - `Promise.resolve(x)` still costs about 157 ns: the call path, plus allocating the object and its `PromiseSlot`.
 14. **Parser (L).**
     - What: smaller AST nodes (Function 184 B, Stmt 128 B, Param 112 B), an arena, and memory for the token vector.
     - Closes: parse 3.7–6.6× and a 7–11 MB peak from temporary fragmentation.

@@ -631,11 +631,21 @@ fn is_plain_native_promise(o: &Gc, intr: &crate::eval::promise_fast::PromiseIntr
 /// Whether %Promise%[@@species] is still the original getter (so SpeciesConstructor of a
 /// promise whose `constructor` is %Promise% is %Promise% with no user code).
 fn species_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr) -> bool {
-    let Some(key) = well_known_key(i, "species") else { return false };
-    let getter = match intr.ctor.borrow().props.get(&key) {
+    let mut c = intr.slots.get();
+    let cb = intr.ctor.borrow();
+    let shape = cb.props.shape();
+    if c.ctor_shape != Some(shape) {
+        let Some(key) = well_known_key(i, "species") else { return false };
+        let Some(slot) = cb.props.slot_of(&key) else { return false };
+        c.species_slot = slot as u32;
+        c.ctor_shape = Some(shape);
+        intr.slots.set(c);
+    }
+    let getter = match cb.props.entry_at(c.species_slot as usize) {
         Some(p) if p.accessor() => p.getter().cloned(),
         _ => None,
     };
+    drop(cb);
     matches!(getter, Some(Value::Obj(g))
         if matches!(g.borrow().call, Callable::Native(f) if f as usize == nf_species_getter as NativeFn as usize))
 }
@@ -644,15 +654,31 @@ fn species_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr
 /// properties and %Promise% the original species getter: `Invoke(p, "then", ...)` on a plain
 /// native promise `p` then runs exactly PerformPromiseThen with an unobservable derived promise.
 fn proto_then_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr) -> bool {
-    let (then_ok, ctor_ok) = {
-        let pb = intr.proto.borrow();
-        let then_ok = matches!(pb.props.get("then"),
-            Some(p) if !p.accessor() && matches!(p.value(), Value::Obj(f) if Gc::ptr_eq(&f, &intr.then)));
-        let ctor_ok = matches!(pb.props.get("constructor"),
-            Some(p) if !p.accessor() && matches!(p.value(), Value::Obj(c) if Gc::ptr_eq(&c, &intr.ctor)));
-        (then_ok, ctor_ok)
+    let Some((ctor, then)) = proto_slots(intr) else { return false };
+    let pb = intr.proto.borrow();
+    let holds = |slot: u32, want: &Gc| {
+        matches!(pb.props.entry_at(slot as usize),
+            Some(p) if !p.accessor() && matches!(p.value(), Value::Obj(f) if Gc::ptr_eq(&f, want)))
     };
-    then_ok && ctor_ok && species_is_pristine(i, intr)
+    let ok = holds(ctor, &intr.ctor) && holds(then, &intr.then);
+    drop(pb);
+    ok && species_is_pristine(i, intr)
+}
+
+/// The slots of `constructor` and `then` on %Promise.prototype% (see [`PristineSlots`]).
+///
+/// [`PristineSlots`]: crate::eval::promise_fast::PristineSlots
+fn proto_slots(intr: &crate::eval::promise_fast::PromiseIntr) -> Option<(u32, u32)> {
+    let mut c = intr.slots.get();
+    let pb = intr.proto.borrow();
+    let shape = pb.props.shape();
+    if c.proto_shape != Some(shape) {
+        c.ctor_slot = pb.props.slot_of("constructor")? as u32;
+        c.then_slot = pb.props.slot_of("then")? as u32;
+        c.proto_shape = Some(shape);
+        intr.slots.set(c);
+    }
+    Some((c.ctor_slot, c.then_slot))
 }
 
 /// Whether SpeciesConstructor(`this`, %Promise%) is %Promise% without any observable step:
@@ -669,8 +695,9 @@ pub(crate) fn promise_then_is_silent(i: &Interp, this: &Value) -> bool {
             return false;
         }
     }
-    let ctor_ok = matches!(proto_data(&intr.proto, "constructor"),
-        Some(Value::Obj(c)) if Gc::ptr_eq(&c, &intr.ctor));
+    let Some((ctor, _)) = proto_slots(&intr) else { return false };
+    let ctor_ok = matches!(intr.proto.borrow().props.entry_at(ctor as usize),
+        Some(p) if !p.accessor() && matches!(p.value(), Value::Obj(c) if Gc::ptr_eq(&c, &intr.ctor)));
     ctor_ok && species_is_pristine(i, &intr)
 }
 
