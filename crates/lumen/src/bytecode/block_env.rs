@@ -44,6 +44,18 @@ fn carrier(env: Env) -> Value {
     Value::Obj(o)
 }
 
+/// `f` with the block env a carrier slot holds, borrowed (no refcount traffic).
+#[inline]
+fn with_env<R>(v: &Value, f: impl FnOnce(&Env) -> R) -> R {
+    match v {
+        Value::Obj(o) => match &o.borrow().call {
+            Callable::User(u) => f(&u.env),
+            _ => unreachable!("block env slot holds a carrier"),
+        },
+        _ => unreachable!("block env slot holds a carrier"),
+    }
+}
+
 /// The block env a carrier slot holds.
 #[inline]
 pub(super) fn env_of(v: &Value) -> Env {
@@ -63,7 +75,25 @@ pub(super) fn new_env(frame_env: &Env, slots: &mut [Value], dst: u16, parent: u1
     } else {
         env_of(&slots[parent as usize])
     };
-    slots[dst as usize] = carrier(new_scope(Some(parent)));
+    set_env(&mut slots[dst as usize], new_scope(Some(parent)));
+}
+
+/// Point the carrier in `slot` at `env`: in place when the slot already holds a carrier (from
+/// an earlier entry of the same block; it never escapes to JS), else a new one.
+fn set_env(slot: &mut Value, env: Env) {
+    if let Value::Obj(o) = slot {
+        let mut ob = o.borrow_mut();
+        if let Callable::User(u) = &mut ob.call {
+            let is_carrier = CARRIER_FN.with(|f| Rc::ptr_eq(f, &u.func));
+            if let Some(u) = Rc::get_mut(u).filter(|_| is_carrier) {
+                let old = std::mem::replace(&mut u.env, env);
+                drop(ob);
+                drop(old);
+                return;
+            }
+        }
+    }
+    *slot = carrier(env);
 }
 
 /// `BlkDecl(slot, name, is_const)`: an uninitialized (TDZ) binding.
@@ -77,21 +107,22 @@ pub(super) fn declare(slots: &[Value], slot: u16, name: &Rc<str>, is_const: bool
 /// `BlkCopy(slot)`: CreatePerIterationEnvironment — a fresh sibling env (same parent) holding a
 /// copy of every binding.
 pub(super) fn copy(slots: &mut [Value], slot: u16) {
-    let old = env_of(&slots[slot as usize]);
-    let fresh = {
+    // Nothing else holds the env (no closure, child env or suspended frame captured it this
+    // iteration): a copy would be indistinguishable from it, so it serves the next one too.
+    if with_env(&slots[slot as usize], |e| Rc::strong_count(e) == 1) {
+        return;
+    }
+    let fresh = with_env(&slots[slot as usize], |old| {
         let b = old.borrow();
         let e = new_scope(b.parent.clone());
-        {
-            let mut nb = e.borrow_mut();
-            for (k, v) in b.vars.iter() {
-                nb.vars.insert(k.clone(), v.clone());
-            }
-        }
+        e.borrow_mut().vars = b.vars.copy_all();
         e
-    };
-    slots[slot as usize] = carrier(fresh);
+    });
+    set_env(&mut slots[slot as usize], fresh);
 }
 
+#[cold]
+#[inline(never)]
 fn tdz(i: &mut Interp, name: &str) -> Abrupt {
     i.throw(
         "ReferenceError",
@@ -100,15 +131,22 @@ fn tdz(i: &mut Interp, name: &str) -> Abrupt {
 }
 
 /// `BlkLoad(slot, name)`.
+#[inline]
 pub(super) fn load(i: &mut Interp, slots: &[Value], slot: u16, name: &Rc<str>) -> Result<Value, Abrupt> {
-    let env = env_of(&slots[slot as usize]);
-    let b = env.borrow();
-    let bd = b.vars.get(name).expect("block binding declared");
-    if !bd.initialized {
-        drop(b);
-        return Err(tdz(i, name));
+    match load_opt(slots, slot, name) {
+        Some(v) => Ok(v),
+        None => Err(tdz(i, name)),
     }
-    Ok(bd.value.clone())
+}
+
+/// The binding's value, `None` in its TDZ.
+#[inline]
+pub(super) fn load_opt(slots: &[Value], slot: u16, name: &Rc<str>) -> Option<Value> {
+    with_env(&slots[slot as usize], |env| {
+        let b = env.borrow();
+        let bd = b.vars.get_rc(name).expect("block binding declared");
+        bd.initialized.then(|| bd.value.clone())
+    })
 }
 
 /// `BlkStore(slot, name)` (assignment: TDZ is a ReferenceError, a `const` a TypeError) and
@@ -121,24 +159,63 @@ pub(super) fn store(
     v: Value,
     init: bool,
 ) -> Result<(), Abrupt> {
-    let env = env_of(&slots[slot as usize]);
-    let mut b = env.borrow_mut();
-    let bd = b.vars.get_mut(name).expect("block binding declared");
-    if init {
-        bd.value = v;
-        bd.initialized = true;
-        return Ok(());
+    // 0 = stored, 1 = TDZ, 2 = const. The old value drops after the borrows end.
+    let (r, old) = with_env(&slots[slot as usize], |env| {
+        let mut b = env.borrow_mut();
+        let bd = b.vars.get_rc_mut(name).expect("block binding declared");
+        if init {
+            bd.initialized = true;
+            return (0, Some(std::mem::replace(&mut bd.value, v)));
+        }
+        if !bd.initialized {
+            return (1, None);
+        }
+        if !bd.mutable {
+            return (2, None);
+        }
+        (0, Some(std::mem::replace(&mut bd.value, v)))
+    });
+    drop(old);
+    match r {
+        0 => Ok(()),
+        1 => Err(tdz(i, name)),
+        _ => Err(const_assign(i)),
     }
-    if !bd.initialized {
-        drop(b);
-        return Err(tdz(i, name));
-    }
-    if !bd.mutable {
-        drop(b);
-        return Err(i.throw("TypeError", "Assignment to constant variable."));
-    }
-    bd.value = v;
-    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn const_assign(i: &mut Interp) -> Abrupt {
+    i.throw("TypeError", "Assignment to constant variable.")
+}
+
+/// `BlkUpdate` on an initialized, mutable Number binding, in place: `Some(result)` (the value
+/// the expression produces, `None` for a discarded one), or `None` when the general path must
+/// run (TDZ, `const`, a non-Number).
+#[inline]
+pub(super) fn update_num(
+    slots: &[Value],
+    slot: u16,
+    name: &Rc<str>,
+    kind: super::UpdKind,
+) -> Option<Option<f64>> {
+    use super::UpdKind as K;
+    with_env(&slots[slot as usize], |env| {
+        let mut b = env.borrow_mut();
+        let bd = b.vars.get_rc_mut(name)?;
+        let Value::Num(x) = bd.value else { return None };
+        if !bd.initialized || !bd.mutable {
+            return None;
+        }
+        let inc = matches!(kind, K::PreInc | K::PostInc | K::IncDiscard);
+        let y = if inc { x + 1.0 } else { x - 1.0 };
+        bd.value = Value::Num(y);
+        Some(match kind {
+            K::PreInc | K::PreDec => Some(y),
+            K::PostInc | K::PostDec => Some(x),
+            K::IncDiscard | K::DecDiscard => None,
+        })
+    })
 }
 
 /// `BlkUpdate(slot, name, kind)`: `++`/`--` on a (mutable) block binding.
@@ -151,15 +228,20 @@ pub(super) fn update(
     kind: super::UpdKind,
 ) -> Result<(), Abrupt> {
     let old = load(i, slots, slot, name)?;
-    let env = env_of(&slots[slot as usize]);
+    let carrier = &slots[slot as usize];
     step_and_store(i, stack, kind, old, |i, v| {
-        let mut b = env.borrow_mut();
-        let bd = b.vars.get_mut(&*name).expect("block binding declared");
-        if !bd.mutable {
-            drop(b);
-            return Err(i.throw("TypeError", "Assignment to constant variable."));
+        let (ok, old) = with_env(carrier, |env| {
+            let mut b = env.borrow_mut();
+            let bd = b.vars.get_rc_mut(name).expect("block binding declared");
+            if !bd.mutable {
+                return (false, None);
+            }
+            (true, Some(std::mem::replace(&mut bd.value, v)))
+        });
+        drop(old);
+        if !ok {
+            return Err(const_assign(i));
         }
-        bd.value = v;
         Ok(())
     })
 }
@@ -280,3 +362,4 @@ mod tests {
         assert_eq!(r, "done|100000|1|;00|B,A|1,2,9,3,4|1,2,3|2");
     }
 }
+

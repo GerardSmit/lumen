@@ -256,6 +256,47 @@ impl VarMap {
             VarStorage::Template(layout, values) => layout.slot(k).map(|slot| &values[slot]),
         }
     }
+    /// A copy of every binding (CreatePerIterationEnvironment): the small representation clones
+    /// its entry vector wholesale.
+    pub(crate) fn copy_all(&self) -> VarMap {
+        if let VarStorage::Small(entries) = &self.map {
+            return VarMap {
+                map: VarStorage::Small(entries.clone()),
+                generation: std::cell::Cell::new(1),
+            };
+        }
+        let mut m = VarMap::with_capacity(0);
+        for (k, v) in self.iter() {
+            m.insert(k.clone(), v.clone());
+        }
+        m
+    }
+    /// [`VarMap::get`] by the interned name the binding was declared with: a pointer
+    /// comparison per entry first, the string comparison only on a miss.
+    #[inline]
+    pub fn get_rc(&self, k: &Rc<str>) -> Option<&Binding> {
+        if let VarStorage::Small(entries) = &self.map {
+            if let Some((_, b)) = entries.iter().find(|(name, _)| Rc::ptr_eq(name, k)) {
+                return Some(b);
+            }
+        }
+        self.get(k)
+    }
+    /// [`VarMap::get_mut`] by the interned name (see [`VarMap::get_rc`]).
+    #[inline]
+    pub fn get_rc_mut(&mut self, k: &Rc<str>) -> Option<&mut Binding> {
+        match &mut self.map {
+            VarStorage::Small(entries) => {
+                let i = entries
+                    .iter()
+                    .position(|(name, _)| Rc::ptr_eq(name, k))
+                    .or_else(|| entries.iter().position(|(name, _)| **name == **k))?;
+                Some(&mut entries[i].1)
+            }
+            VarStorage::Large(entries) => entries.get_mut(&**k),
+            VarStorage::Template(layout, values) => layout.slot(k).map(|slot| &mut values[slot]),
+        }
+    }
     pub fn contains_key(&self, k: &str) -> bool {
         self.get(k).is_some()
     }

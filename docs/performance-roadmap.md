@@ -270,9 +270,35 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
      - destructure_3 still pays about 15 ns for the protector probe on each iteration.
      - object_keys pays for the generic native call and the array allocation.
      - literal_creation pays for the RegExp side table.
-10. **Scopes and closures (M).**
-    - What: block scopes with a fixed layout, instead of a hashed var map plus a full copy per iteration. A lazy `.prototype` on function expressions.
-    - Closes: arrow_capture_let 22× (310 → about 120 ns) and function_expr 21× (about 300 vs 92 ns for an arrow).
+10. ✅ **Partly done: scopes and closures (M).**
+    - Findings:
+      - A function whose `for (var …)` head variable was captured by a closure never compiled to bytecode. The capture scan bailed on the head's reset, with no bail reason logged, so the whole function ran on the tree-walker.
+      - A block-binding read cost about 20 ns in JIT code. It cloned the env `Rc`, and the inlined TDZ error path made the helper's code much worse.
+      - `i++` on a block binding went through the generic step-and-store with a temporary `Vec`.
+      - `x & 1023` with a Boxed operand merged its slow path as Boxed, so the element store that used it as a key fell back to the generic op.
+    - Built:
+      - A captured `for (var …)` head now binds like a plain `var` unless it would reset a parameter or a function declaration.
+      - Block envs:
+        - Access is borrowed, with no `Rc` traffic.
+        - Names are looked up by pointer first (they are interned).
+        - Reads use a TDZ-free `load_opt`.
+        - `++`/`--` on a Number updates in place.
+        - `BlkCopy` reuses the env when nothing captured it, and otherwise clones the binding vector wholesale.
+        - `BlkNew` and `BlkCopy` retarget the existing carrier instead of allocating a new one.
+      - JIT: `- * / & | ^ << >> >>>` with a Boxed operand now produce an unboxed Number; the rare other result exits.
+    - Release results:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | arrow_var (capture of a `for (var …)` counter) | 430 ns | 99 ns | 11.8 ns |
+      | arrow_let | 316 ns | 207 ns | 16.5 ns |
+      | block env, no capture this iteration | 173 ns | 48 ns | – |
+      | block_const (`{ const k = i; … () => k }`) | ~225 ns | 192 ns | – |
+
+    - Left:
+      - function_expr (258 ns vs arrow 90 ns, node 17 ns) is the `.prototype` object, the fn↔prototype pair marking and release, and the legacy `arguments`/`caller` accessors on sloppy functions. A lazy `.prototype` needs every own-property path to materialize it first, and there are over 1,000 direct `props` accesses across 81 files. It needs a props-level design, not a patch.
+      - A closure's `UserCallable` is a separate `Rc` allocation. Storing it inline would add 8 bytes to every object.
+      - Per-iteration envs still allocate a `Scope` plus a binding vector, and register a weak entry for the cycle collector.
 11. **localeCompare fast path for ASCII and root collation (S).** Closes 436× (5 µs per compare).
 12. **Recursive calls (M).**
     - What: a direct self-call in the JIT and int32 specialization.
