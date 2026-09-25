@@ -217,11 +217,27 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
    - Left:
      - Map/Set entries still allocate the `[k, v]` pair, and each allocation costs about 50 ns; item 8 covers this.
      - Set states and generators still step through the helper.
-8. **Inline slab allocation from JIT code (M).**
-   - What: pop the free list and initialize the box natively.
-   - Needs: the heap to expose each size class's free-list head and the box layout.
-   - Expected: `{…}`, `[]` and `new` from 35–85 ns down to 8–15 ns.
-   - Closes: alloc 9–13×, new_class 13×, the arr_1_discard 55× case, idx_write_new_array 36×.
+8. ✅ **Partly done: allocation-heavy loops (M).**
+   - Finding: the allocation micros store each new object into a ring array (`r[i & 1023] = {…}`). That element store, not the allocator, was the biggest cost.
+     - Any non-Number value (and a Number written into a hole) took the generic op through `run_vm`: 40–50 ns per store.
+   - Built:
+     - `Helper::ElemSetBoxed` calls `Interp::fast_set_elem` directly. It covers overwriting an existing element (releasing the old value), filling a hole and a dense append, for owned values and Numbers.
+     - The generic op remains the fallback for accessors, frozen arrays, proxies and the like.
+   - Release results:
+
+     | Case | Before | Now | Node |
+     |---|---|---|---|
+     | obj_empty | 89 ns | 51 ns | 9.6 ns |
+     | obj_xy | 93 ns | 56 ns | 9.3 ns |
+     | arr_2 | 101 ns | 66 ns | 10.6 ns |
+     | new_class | 125 ns | 85 ns | 9.4 ns |
+     | idx_write_new_array | 87 ns | 51 ns | 2.4 ns |
+
+   - Left: the allocator itself.
+     - It is already a free-list slab with a const TLS pointer and an inline-props drop.
+     - An allocate-and-discard of `{x, y}` costs about 17 ns to allocate and 7 ns to drop, plus the helper calls.
+     - Native box initialization from JIT code (an image copy of the template's `RefCell<Object>`, with pointer and refcount fix-ups) would save only the call overhead. The heap state can also switch between coroutine jobs, so the JIT would have to load it per region.
+     - arr_1_discard (48 ns vs 0.8) needs escape analysis.
 9. **Small lowerings (S each):**
    - keyed string IC (11.6×);
    - int32 `%` (18×, about 40 vs 3.9 ns);
