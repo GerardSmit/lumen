@@ -1294,14 +1294,14 @@ fn entry_off(l: &Layout, slot: u32) -> Option<i32> {
 }
 
 /// Guard `v` (a `Value` address) holds an ordinary plain object of shape `shape` with more than
-/// `min_len` entries — for `write` also unborrowed with entries of its own (not a shared
+/// `min_len` entries (any number for `None`) — for `write` also unborrowed with entries of its own (not a shared
 /// copy-on-write map) — and return its entries base pointer. A shape id pins the ordered key
 /// list, so every entry slot resolved against an object of that shape is valid on it.
 pub(crate) fn shaped_entries(
     fb: &mut FunctionBuilder,
     v: IrValue,
     shape: u32,
-    min_len: u32,
+    min_len: Option<u32>,
     write: bool,
     miss: Block,
 ) -> IrValue {
@@ -1319,9 +1319,11 @@ pub(crate) fn shaped_entries(
         let owned = cmp_imm(fb, IntCC::Ne, PTR, cap, 0);
         guard(fb, owned, miss);
     }
-    let nent = fb.load(PTR_U32, gc, l.entries_len);
-    let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, min_len as i64);
-    guard(fb, inb, miss);
+    if let Some(min_len) = min_len {
+        let nent = fb.load(PTR_U32, gc, l.entries_len);
+        let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, min_len as i64);
+        guard(fb, inb, miss);
+    }
     fb.load(PTR_MEM, gc, l.entries_ptr)
 }
 
@@ -1439,7 +1441,7 @@ pub(crate) fn word_value(
 pub(crate) fn probed_entries(
     fb: &mut FunctionBuilder,
     v: IrValue,
-    min_len: u32,
+    min_len: Option<u32>,
     write: bool,
     miss: Block,
 ) -> IrValue {
@@ -1456,9 +1458,11 @@ pub(crate) fn probed_entries(
         let owned = cmp_imm(fb, IntCC::Ne, PTR, cap, 0);
         guard(fb, owned, miss);
     }
-    let nent = fb.load(PTR_U32, gc, l.entries_len);
-    let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, min_len as i64);
-    guard(fb, inb, miss);
+    if let Some(min_len) = min_len {
+        let nent = fb.load(PTR_U32, gc, l.entries_len);
+        let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, min_len as i64);
+        guard(fb, inb, miss);
+    }
     fb.load(PTR_MEM, gc, l.entries_ptr)
 }
 

@@ -126,6 +126,10 @@ pub const PROP_IC_WAYS: usize = 4;
 /// the probes which exotic gate the holder must pass. Only meaningful while `depth < 0x80`
 /// (`IC_CREATE`/`IC_EMPTY` have the bit set but are filtered by range first).
 pub const IC_ARR_KEYCHK: u8 = 0x40;
+/// Flag bit OR'd into `IcState::depth` when the resolved entry is an accessor with a getter:
+/// the read calls it (`Interp::get_prop_ic`). The data probes, and every JIT reader of the
+/// states (which want exact depths), ignore such states. Only meaningful while `depth < 0x80`.
+pub const IC_GETTER: u8 = 0x20;
 /// Deepest prototype hop the IC will record; hotter sites deeper than this stay on the slow path.
 pub const IC_MAX_DEPTH: u8 = 4;
 /// `IcState::depth` marker for a property-*creation* cache (constructor `this.x = v` on a fresh
@@ -5966,7 +5970,7 @@ pub(crate) fn call_compiled(
             stack,
             handlers,
             ..
-        } = &mut rec;
+        } = &mut *rec;
         // SAFETY: `enter_frame` filled both.
         let (chunk, env) = unsafe {
             (

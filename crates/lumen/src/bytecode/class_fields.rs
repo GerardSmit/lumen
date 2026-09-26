@@ -163,7 +163,7 @@ fn run_class_body(
             stack,
             handlers,
             ..
-        } = &mut rec;
+        } = &mut *rec;
         // SAFETY: `enter_frame` filled both.
         let (chunk, env) = unsafe {
             (

@@ -33,8 +33,8 @@ pub(super) struct ThisBody {
     pub shape: u32,
     /// Per op: the receiver's entry slot a `GetPropThis` / `SetPropThisDrop` names.
     slots: Vec<u32>,
-    /// The largest slot used.
-    max_slot: u32,
+    /// The largest slot used; `None` when the body touches no slot (nothing to bound-check).
+    max_slot: Option<u32>,
     /// Whether the body stores a property.
     writes: bool,
     /// The number of ops up to and including the first return.
@@ -87,7 +87,7 @@ pub(super) fn this_body(
         return None;
     }
     let mut slots = vec![u32::MAX; chunk.ops.len()];
-    let mut max_slot = 0;
+    let mut max_slot: Option<u32> = None;
     let mut writes = false;
     let mut depth: usize = 0;
     // Per stack position: holds the receiver (`LoadThis`), which only a private access or a
@@ -114,7 +114,7 @@ pub(super) fn this_body(
                 }
                 let slot = u32::try_from(slot).ok()?;
                 slots[pc] = slot;
-                max_slot = max_slot.max(slot);
+                max_slot = max_slot.max(Some(slot));
                 writes |= set;
                 if set {
                     (2, 1)
@@ -132,7 +132,7 @@ pub(super) fn this_body(
                 }
                 let slot = u32::try_from(slot).ok()?;
                 slots[pc] = slot;
-                max_slot = max_slot.max(slot);
+                max_slot = max_slot.max(Some(slot));
                 if matches!(op, Op::SetPropThisDrop(..)) {
                     writes = true;
                     (1, 0)
