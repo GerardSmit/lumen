@@ -18,6 +18,9 @@ pub(crate) use layout::BindingLayout;
 pub struct VarMap {
     map: VarStorage,
     generation: std::cell::Cell<u32>,
+    /// Set once a per-site name resolution walked through this map (see
+    /// `interpreter::name_cache`): from then on its structural mutations bump the scope epoch.
+    observed: std::cell::Cell<bool>,
 }
 
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
@@ -33,6 +36,7 @@ impl Default for VarMap {
         Self {
             map: VarStorage::Small(Vec::new()),
             generation: std::cell::Cell::new(0),
+            observed: std::cell::Cell::new(false),
         }
     }
 }
@@ -120,6 +124,7 @@ impl VarMap {
         Self {
             map: VarStorage::Template(layout, values),
             generation: std::cell::Cell::new(0),
+            observed: std::cell::Cell::new(false),
         }
     }
 
@@ -161,6 +166,7 @@ impl VarMap {
                 ))
             },
             generation: std::cell::Cell::new(0),
+            observed: std::cell::Cell::new(false),
         }
     }
 
@@ -171,7 +177,9 @@ impl VarMap {
     }
     #[inline]
     fn bump(&self) {
-        crate::value::bump_scope_epoch();
+        if self.observed.get() {
+            crate::value::bump_scope_epoch();
+        }
         // Zero is reserved for pristine compiled layouts. Once structural mutation has
         // invalidated an activation's native binding base, wrapping must never revive it.
         self.generation
@@ -264,6 +272,7 @@ impl VarMap {
             return VarMap {
                 map: VarStorage::Small(entries.clone()),
                 generation: std::cell::Cell::new(1),
+                observed: std::cell::Cell::new(false),
             };
         }
         let mut m = VarMap::with_capacity(0);
@@ -297,6 +306,15 @@ impl VarMap {
             VarStorage::Large(entries) => entries.get_mut(&**k),
             VarStorage::Template(layout, values) => layout.slot(k).map(|slot| &mut values[slot]),
         }
+    }
+    /// Mark this map as walked by a cached name resolution (see the `observed` field).
+    #[inline]
+    pub(crate) fn observe(&self) {
+        self.observed.set(true);
+    }
+    /// The address of `k`'s binding (see [`VarMap::entry_ptrs`]).
+    pub(crate) fn binding_ptr(&mut self, k: &str) -> Option<*mut Binding> {
+        self.get_mut(k).map(|binding| binding as *mut Binding)
     }
     /// The addresses of `k`'s key and binding, for a per-site name cache. They stay valid until
     /// the next structural mutation of this map, which bumps the scope epoch.

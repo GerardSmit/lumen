@@ -116,7 +116,6 @@ pub(super) fn copy(slots: &mut [Value], slot: u16) {
         let b = old.borrow();
         let e = new_scope(b.parent.clone());
         e.borrow_mut().vars = b.vars.copy_all();
-        crate::value::bump_scope_epoch();
         e
     });
     set_env(&mut slots[slot as usize], fresh);

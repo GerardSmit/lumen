@@ -3,10 +3,12 @@
 //! Resolving a name walks the scope chain with a string/hash lookup per scope. Within one scope
 //! instance (a loop body, a call's activation) the same identifier resolves to the same binding
 //! every time, as long as the chain's structure is unchanged — which the scope epoch
-//! ([`crate::value::scope_epoch`]) certifies: every scope creation and every structural binding
-//! map mutation bumps it, so while it holds no scope can have gained (shadowed) or lost the name
-//! and no binding can have moved. A site keyed by its AST node address therefore reuses the
-//! binding address it found last time when both the epoch and the environment match.
+//! ([`crate::value::scope_epoch`]) certifies: a resolution marks every binding map it walks
+//! (`VarMap::observe`), and any later structural mutation of a marked map bumps the epoch, so
+//! while it holds no walked scope can have gained (shadowed) or lost the name and no binding can
+//! have moved. A site keyed by its AST node address therefore reuses the binding address it found
+//! last time when the epoch, the environment and the environment's serial all match. Scope
+//! creation does not bump the epoch, so a loop that calls functions keeps its entries.
 //!
 //! Chains with a `with` object before the binding are never cached (the object's properties can
 //! change without touching any binding map). A name no scope declares is cached as "unscoped", so
@@ -23,26 +25,32 @@ pub(crate) type ScopeCell = RefCell<Scope>;
 struct NameSite {
     node: usize,
     env: *const ScopeCell,
+    /// `env`'s serial: a later scope reusing the address is a different environment.
+    serial: u64,
     epoch: u64,
-    /// Null for a name no scope on the chain declares (see `unscoped`).
+    /// Null for a name no scope on the chain declares.
     scope: *const ScopeCell,
-    key: *const Rc<str>,
     binding: *mut Binding,
-    /// For an unscoped entry: the name's bytes (names up to 16 bytes are cached this way), so a
-    /// reused node address cannot alias it.
-    unscoped: [u8; 16],
-    unscoped_len: u8,
+    /// The binding's key, kept only for a name longer than `name` holds.
+    key: *const Rc<str>,
+    /// The name's bytes when it fits (`name_len > 0`), so a reused node address cannot alias
+    /// the entry. Longer names compare against `key` instead; unscoped ones are not cached.
+    name: [u8; NAME_BYTES],
+    name_len: u8,
 }
+
+const NAME_BYTES: usize = 16;
 
 const EMPTY_SITE: NameSite = NameSite {
     node: 0,
     env: std::ptr::null(),
+    serial: 0,
     epoch: 0,
     scope: std::ptr::null(),
     key: std::ptr::null(),
     binding: std::ptr::null_mut(),
-    unscoped: [0; 16],
-    unscoped_len: 0,
+    name: [0; NAME_BYTES],
+    name_len: 0,
 };
 
 /// How a site's name resolves against the scope chain.
@@ -77,19 +85,26 @@ impl Interp {
         let env_ptr = Rc::as_ptr(env);
         let idx = (node.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) & (NAME_SITES - 1);
         let site = &self.name_sites.0[idx];
-        if site.node == node && site.env == env_ptr && site.epoch == epoch {
-            if !site.scope.is_null() {
-                // SAFETY: an unchanged epoch means the map holding `key` has not been mutated or
-                // freed since the fill (its scope is an ancestor of the live `env`).
-                if same_name(unsafe { &**site.key }, name) {
-                    return NameRes::Binding(site.scope, site.binding);
-                }
-            } else if same_name(&site.unscoped[..site.unscoped_len as usize], name) {
+        // SAFETY: `env` is live; the serial is written once, at creation.
+        let serial = unsafe { (*(*env_ptr).as_ptr()).serial };
+        if site.node == node && site.env == env_ptr && site.epoch == epoch && site.serial == serial
+        {
+            let same = if site.name_len > 0 {
+                same_name(&site.name[..site.name_len as usize], name)
+            } else {
+                // SAFETY: an unchanged epoch means the map holding `key` has not been mutated
+                // or freed since the fill (its scope is an ancestor of the live `env`).
+                same_name(unsafe { &**site.key }, name)
+            };
+            if !same {
+                return NameRes::Unknown;
+            }
+            if site.scope.is_null() {
                 return NameRes::Unscoped;
             }
-            return NameRes::Unknown;
+            return NameRes::Binding(site.scope, site.binding);
         }
-        self.fill_name_site(node, name, env, epoch, idx)
+        self.fill_name_site(node, name, env, serial, epoch, idx)
     }
 
     /// [`Interp::resolve_name`] narrowed to scope bindings.
@@ -106,15 +121,22 @@ impl Interp {
         }
     }
 
+    /// Resolve by walking the chain, marking each map walked. The entry is only filled the
+    /// second time the site runs in the same environment: a site that runs once per activation
+    /// (the common case in call-heavy code) would never hit, so it records just its environment.
     #[inline(never)]
     fn fill_name_site(
         &mut self,
         node: usize,
         name: &str,
         env: &Env,
+        serial: u64,
         epoch: u64,
         idx: usize,
     ) -> NameRes {
+        let short = name.len() <= NAME_BYTES;
+        let mut key = std::ptr::null();
+        let mut res = NameRes::Unscoped;
         // Every scope on the walk is kept alive by `env` through the `parent` links.
         let mut cur: *const ScopeCell = Rc::as_ptr(env);
         loop {
@@ -124,38 +146,54 @@ impl Interp {
             if b.with_obj.is_some() {
                 return NameRes::Unknown;
             }
-            if let Some((key, binding)) = b.vars.entry_ptrs(name) {
-                self.name_sites.0[idx] = NameSite {
-                    node,
-                    env: Rc::as_ptr(env),
-                    epoch,
-                    scope: cur,
-                    key,
-                    binding,
-                    ..EMPTY_SITE
-                };
-                return NameRes::Binding(cur, binding);
+            // From now on a structural change to this map bumps the epoch, which is what keeps
+            // the result valid for a caller that runs code before using it.
+            b.vars.observe();
+            let found = if short {
+                b.vars.binding_ptr(name).map(|binding| (std::ptr::null(), binding))
+            } else {
+                b.vars.entry_ptrs(name)
+            };
+            if let Some((k, binding)) = found {
+                key = k;
+                res = NameRes::Binding(cur, binding);
+                break;
             }
             match b.parent.as_ref() {
                 Some(p) => cur = Rc::as_ptr(p),
                 None => break,
             }
         }
-        if name.len() <= 16 {
-            let mut unscoped = [0; 16];
-            unscoped[..name.len()].copy_from_slice(name.as_bytes());
-            self.name_sites.0[idx] = NameSite {
-                node,
-                env: Rc::as_ptr(env),
-                epoch,
-                unscoped,
-                unscoped_len: name.len() as u8,
-                ..EMPTY_SITE
-            };
+        let env_ptr = Rc::as_ptr(env);
+        let site = &mut self.name_sites.0[idx];
+        let revisit = site.node == node && site.env == env_ptr && site.serial == serial;
+        site.node = node;
+        site.env = env_ptr;
+        site.serial = serial;
+        site.epoch = PENDING;
+        if !revisit {
+            return res;
         }
-        NameRes::Unscoped
+        let (scope, binding) = match res {
+            NameRes::Binding(scope, binding) => (scope, binding),
+            _ if short => (std::ptr::null(), std::ptr::null_mut()),
+            _ => return res,
+        };
+        site.scope = scope;
+        site.binding = binding;
+        site.key = key;
+        site.name_len = 0;
+        if short {
+            site.name[..name.len()].copy_from_slice(name.as_bytes());
+            site.name_len = name.len() as u8;
+        }
+        site.epoch = epoch;
+        res
     }
 }
+
+/// An epoch value the scope epoch never reaches: the entry holds only its environment.
+const PENDING: u64 = u64::MAX;
 
 /// Identifier equality without a `memcmp` call: names are short.
 #[inline(always)]
