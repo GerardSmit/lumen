@@ -171,6 +171,7 @@ impl VarMap {
     }
     #[inline]
     fn bump(&self) {
+        crate::value::bump_scope_epoch();
         // Zero is reserved for pristine compiled layouts. Once structural mutation has
         // invalidated an activation's native binding base, wrapping must never revive it.
         self.generation
@@ -295,6 +296,23 @@ impl VarMap {
             }
             VarStorage::Large(entries) => entries.get_mut(&**k),
             VarStorage::Template(layout, values) => layout.slot(k).map(|slot| &mut values[slot]),
+        }
+    }
+    /// The addresses of `k`'s key and binding, for a per-site name cache. They stay valid until
+    /// the next structural mutation of this map, which bumps the scope epoch.
+    pub(crate) fn entry_ptrs(&mut self, k: &str) -> Option<(*const Rc<str>, *mut Binding)> {
+        match &mut self.map {
+            VarStorage::Small(entries) => entries
+                .iter_mut()
+                .find(|(name, _)| &**name == k)
+                .map(|(name, binding)| (name as *const Rc<str>, binding as *mut Binding)),
+            VarStorage::Large(entries) => {
+                let name = entries.get_key_value(k)?.0 as *const Rc<str>;
+                Some((name, entries.get_mut(k)? as *mut Binding))
+            }
+            VarStorage::Template(layout, values) => layout.slot(k).map(|slot| {
+                (&layout.names[slot] as *const Rc<str>, &mut values[slot] as *mut Binding)
+            }),
         }
     }
     pub fn contains_key(&self, k: &str) -> bool {

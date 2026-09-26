@@ -10,6 +10,7 @@ mod bindings;
 pub(crate) mod class_fields;
 mod constructor_body;
 mod generator_body;
+pub(crate) mod name_cache;
 mod this_binding;
 pub(crate) mod ta_meta;
 pub(crate) use bindings::BindingLayout;
@@ -897,6 +898,8 @@ pub struct Interp {
     pub(crate) gc_next: i64,
     /// Call counter for [`Interp::gc_check_amortized`]: calls poll every 256 calls.
     pub(crate) gc_tick: u32,
+    /// Per-site identifier resolutions (see [`name_cache`]).
+    pub(crate) name_sites: name_cache::NameSites,
     /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point.
     pub(crate) interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Host deadline for a bounded run (`vm` `timeout`): while set, every polled safe point
@@ -1427,6 +1430,7 @@ impl Interp {
             generators: Default::default(),
             gc_next: GC_TRIGGER,
             gc_tick: 0,
+            name_sites: Default::default(),
             interrupt: None,
             script_timeout: None,
             terminating: false,
@@ -2687,7 +2691,7 @@ impl Interp {
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return None;
         }
-        if !o.borrow().ic_plain.get() {
+        if !plain {
             // A split view reads its own elements without touching the property map (a miss
             // past its length takes the generic path: the prototype chain).
             if let Some(v) = crate::split_view::fast_get(o, n as usize) {
