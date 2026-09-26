@@ -245,7 +245,8 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
     let mut l = Lower {
         f,
         abi,
-        vc: VCode::new(),
+        // About one and a half machine instructions per IR instruction.
+        vc: VCode::with_capacity(f.insts.len() + f.insts.len() / 2 + 16),
         vregs: vec![None; nv],
         alias,
         sunk,

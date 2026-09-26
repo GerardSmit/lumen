@@ -249,6 +249,15 @@ impl<I: MachInst> VCode<I> {
             vreg_class: Vec::new(),
         }
     }
+    /// Room for about `insts` instructions: a large function's code would otherwise be copied
+    /// on growth, both copies alive at once.
+    pub fn with_capacity(insts: usize) -> VCode<I> {
+        VCode {
+            insts: Vec::with_capacity(insts),
+            blocks: Vec::new(),
+            vreg_class: Vec::new(),
+        }
+    }
     pub fn new_vreg(&mut self, class: RegClass) -> VReg {
         self.vreg_class.push(class);
         VReg(self.vreg_class.len() as u32 - 1)

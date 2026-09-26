@@ -402,9 +402,9 @@ pub(crate) const SHADOW_TOP: i32 = std::mem::offset_of!(Shadow, top) as i32;
 pub(crate) const SHADOW_END: i32 = std::mem::offset_of!(Shadow, end) as i32;
 
 /// Shadow-stack bytes per thread. A call that would pass the end takes the generic (slow) call
-/// path, so this bounds only how deep JIT-to-JIT calls stay direct. On Windows the zeroed
-/// buffer is committed memory from the start (private bytes), so it is kept smaller there;
-/// elsewhere untouched pages cost nothing.
+/// path, so this bounds only how deep JIT-to-JIT calls stay direct. On Windows the buffer is
+/// committed from the start (private bytes, though not working set), so it is kept smaller
+/// there; elsewhere untouched pages cost nothing.
 #[cfg(all(target_pointer_width = "64", not(windows)))]
 const SHADOW_BYTES: usize = 4 << 20;
 #[cfg(all(target_pointer_width = "64", windows))]
@@ -424,8 +424,13 @@ thread_local! {
 pub(crate) fn shadow() -> *mut Shadow {
     SHADOW.with(|s| {
         if s.get().is_null() {
-            let buf: &'static mut [u128] = Box::leak(vec![0u128; SHADOW_BYTES / 16].into_boxed_slice());
-            let base = buf.as_mut_ptr() as usize;
+            // OS pages: untouched ones (a shallow call depth) cost no memory.
+            let mut base = lumen_codegen::jitmem::alloc_pages(SHADOW_BYTES) as usize;
+            if base == 0 {
+                let buf: &'static mut [u128] =
+                    Box::leak(vec![0u128; SHADOW_BYTES / 16].into_boxed_slice());
+                base = buf.as_mut_ptr() as usize;
+            }
             s.set(Box::into_raw(Box::new(Shadow {
                 top: base,
                 end: base + SHADOW_BYTES,
@@ -677,14 +682,15 @@ fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native,
         eprintln!("{func}");
     }
     let t2 = stats_start();
-    let (keep, entry) = emit(&func, &built.externs, header, backedge)?;
+    let n1 = (func.insts.len(), func.blocks.len());
+    let (keep, entry) = emit(func, &built.externs, header, backedge)?;
     if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
         eprintln!(
             "[jit-stats]   ir {} insts/{} blocks -> {} insts/{} blocks; verify {} us, opt {} us, emit {} us",
             n0.0,
             n0.1,
-            func.insts.len(),
-            func.blocks.len(),
+            n1.0,
+            n1.1,
             (t1 - t0).as_micros(),
             (t2 - t1).as_micros(),
             t2.elapsed().as_micros()
@@ -732,7 +738,7 @@ fn import_address(externs: &[u64], id: u32) -> Option<u64> {
     all(target_arch = "aarch64", not(target_os = "ios"))
 ))]
 fn emit(
-    func: &lumen_codegen::Function,
+    func: lumen_codegen::Function,
     externs: &[u64],
     header: usize,
     backedge: usize,
@@ -742,7 +748,7 @@ fn emit(
     #[cfg(target_arch = "aarch64")]
     use lumen_codegen::aarch64 as native;
     let cfg = native::Config::host(None);
-    let compiled = native::compile(func, &cfg)?;
+    let compiled = native::compile_owned(func, &cfg)?;
     let (mem, addrs) = native::load(&[compiled], |id, addrs| {
         if id == SELF_ID {
             addrs.first().copied()
@@ -767,13 +773,13 @@ fn emit(
 /// Helpers are called the same way: their Rust function pointers are their table indices.
 #[cfg(target_arch = "wasm32")]
 fn emit(
-    func: &lumen_codegen::Function,
+    func: lumen_codegen::Function,
     externs: &[u64],
     _header: usize,
     _backedge: usize,
 ) -> Result<(Box<dyn std::any::Any>, NativeFn), String> {
     let cfg = lumen_codegen::wasm::Config { ptr32: true };
-    let bytes = lumen_codegen::wasm::compile_module(std::slice::from_ref(func), &cfg, |id| {
+    let bytes = lumen_codegen::wasm::compile_module(std::slice::from_ref(&func), &cfg, |id| {
         import_address(externs, id).map(|a| a as u32)
     })?;
     let host = crate::WASM_JIT_HOST.get().ok_or("no wasm JIT host")?;
@@ -790,7 +796,7 @@ fn emit(
     all(target_arch = "aarch64", not(target_os = "ios"))
 )))]
 fn emit(
-    _func: &lumen_codegen::Function,
+    _func: lumen_codegen::Function,
     _externs: &[u64],
     _header: usize,
     _backedge: usize,
