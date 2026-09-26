@@ -683,8 +683,9 @@ pub struct Interp {
     /// Recycled inline-frame stacks for `bytecode::drive_vm` (bytecode→bytecode calls run as
     /// frames on the caller's loop), so a root run doesn't allocate one per call tree.
     pub(crate) vm_frame_pool: Vec<Vec<crate::bytecode::InlineFrame>>,
-    /// Recycled single frame records for `bytecode::call_compiled` (`Interp::call`'s shortcut).
-    pub(crate) vm_frame_one: Vec<crate::bytecode::InlineFrame>,
+    /// Recycled single frame records for `bytecode::call_compiled` (`Interp::call`'s shortcut),
+    /// boxed so taking and returning one moves a pointer rather than the record.
+    pub(crate) vm_frame_one: Vec<Box<crate::bytecode::InlineFrame>>,
     /// Megamorphic stub cache: a global open-addressed table keyed by (receiver shape, site name
     /// pointer) holding the last derived [`crate::bytecode::IcState`] for that pair. Probed when
     /// both of a site's ways miss, so a site rotating through more receiver shapes than it has
@@ -1082,8 +1083,11 @@ const SCOPE_GC_TRIGGER: usize = 4_096;
 /// proportion to a user-controlled `length`, so without these a single adversarial test (e.g.
 /// `Array(4e9).join()` or `s += s` doubling a string) can exhaust all RAM. Operations that would
 /// materialize more than these bounds raise a RangeError instead. They are generous relative to
-/// real test262 tests but small enough that one runaway test stays bounded.
-pub const MAX_ARRAY_OP_LEN: usize = 1 << 20; // ~1M elements
+/// real test262 tests but small enough that one runaway test stays bounded. The array bound is
+/// V8's own practical limit (its largest `FixedArray`): real programs split multi-megabyte
+/// texts and build arrays of millions of elements, while runaway lengths (`Array(4e9)`,
+/// 2^32 - 1) still stop at once.
+pub const MAX_ARRAY_OP_LEN: usize = 1 << 27; // ~134M elements
 
 /// Byte ceiling for a single ArrayBuffer/SharedArrayBuffer allocation (real programs allocate
 /// tens of MB; runaway growth is still stopped well below the process heap cap).
@@ -1091,6 +1095,7 @@ pub const MAX_BUFFER_BYTES: usize = 1 << 28; // 256 MiB
                                              // Large enough for suite tests that build 2^24-char escape strings, small enough that runaway
                                              // string growth still dies as a RangeError rather than an OOM.
 pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
+const _: () = assert!(MAX_STR_LEN < MAX_ARRAY_OP_LEN, "split relies on it");
 
 /// A realm's intrinsics: the global object, its environment, and the per-realm prototypes/constructors
 /// installed by `builtins::install`. Well-known symbols and the engine side tables are shared, not here.
@@ -2877,6 +2882,10 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         match base {
             Value::Obj(o) => {
+                // A getter resolved by an earlier read at this site: call it directly.
+                if let Some(g) = self.try_ic_getter(o, name, cache) {
+                    return self.call(g, base.clone(), &[]);
+                }
                 if let Some(v) = self.try_ic_get(o, name, cache) {
                     return Ok(v);
                 }
@@ -2935,14 +2944,14 @@ impl Interp {
         // stub cache (unbounded polymorphism), then re-derive into way 1 with the older ways
         // demoted.
         for k in 0..crate::bytecode::PROP_IC_WAYS {
-            if let Some(v) = self.ic_shape_probe(head, name, self.ic_way(cache, k).get()) {
+            if let Some(v) = self.ic_shape_probe(head, name, self.ic_way(cache, k).get(), false) {
                 return Some(v);
             }
         }
         let shape = unsafe { (*head).borrow().props.shape() };
         let e = self.stub_cache[stub_slot(shape, name)].get();
         if e.name == name.as_ptr() as usize && e.st.recv_shape == shape {
-            if let Some(v) = self.ic_shape_probe(head, name, e.st) {
+            if let Some(v) = self.ic_shape_probe(head, name, e.st, false) {
                 // Promote into the site (demoting the other ways): the next access hits
                 // way-first.
                 self.ic_insert(cache, e.st);
@@ -2950,6 +2959,27 @@ impl Interp {
             }
         }
         self.ic_get_rederive(o, name, cache)
+    }
+
+    /// The getter function a getter state ([`crate::bytecode::IC_GETTER`]) of the site resolves
+    /// `o.<name>` to, validated like a data hit. `None`: no such state, or it no longer holds.
+    #[inline(always)]
+    fn try_ic_getter(
+        &self,
+        o: &Gc,
+        name: &str,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Option<Value> {
+        let head = Gc::as_ptr(o);
+        for k in 0..crate::bytecode::PROP_IC_WAYS {
+            let st = self.ic_way(cache, k).get();
+            if st.depth < 0x80 && st.depth & crate::bytecode::IC_GETTER != 0 {
+                if let Some(g) = self.ic_shape_probe(head, name, st, true) {
+                    return Some(g);
+                }
+            }
+        }
+        None
     }
 
     /// Cache way `k` of a property site (sites allocate `PROP_IC_WAYS` consecutive cells — see
@@ -2987,18 +3017,29 @@ impl Interp {
     /// live and every hop's shape re-checked, so a proto swap or hop mutation is caught.
     /// `None` = miss (no side effects): arrays-as-holders, deeper chains, accessors.
     #[inline(always)]
+    ///
+    /// `getter`: probe a getter state instead (the result is the getter function to call).
     fn ic_shape_probe(
         &self,
         head: *const std::cell::RefCell<Object>,
         name: &str,
         st: crate::bytecode::IcState,
+        getter: bool,
     ) -> Option<Value> {
-        use crate::bytecode::{IC_ABSENT, IC_ARR_KEYCHK, IC_EMPTY};
+        use crate::bytecode::{IC_ABSENT, IC_ARR_KEYCHK, IC_EMPTY, IC_GETTER};
         let _ = IC_EMPTY;
+        // The entry's value (a data hit) or its getter (a getter state).
+        let read = |p: &crate::value::Property| -> Option<Value> {
+            match (getter, p.accessor()) {
+                (false, false) => Some(p.value()),
+                (true, true) => p.getter().cloned(),
+                _ => None,
+            }
+        };
         // Cached absence: re-walk the live chain, validating each level's shape (and the same
         // plainness/exotic gates a rederive would demand). All shapes matching proves the key
         // is still absent everywhere — the read is `undefined` with no entry scan at all.
-        if st.depth == IC_ABSENT {
+        if st.depth == IC_ABSENT && !getter {
             let shapes = [st.recv_shape, st.mid_shape, st.mid2_shape, st.holder_shape];
             let levels = st.slot as usize;
             if levels == 0 || levels > 4 {
@@ -3033,11 +3074,11 @@ impl Interp {
         }
         // Array-holder entries (see `IC_ARR_KEYCHK`): decode the flag off the depth. The
         // `< 0x80` range check filters `IC_CREATE`/`IC_EMPTY`.
-        if st.depth >= 0x80 {
+        if st.depth >= 0x80 || (st.depth & IC_GETTER != 0) != getter {
             return None;
         }
         let keychk = st.depth & IC_ARR_KEYCHK != 0;
-        let depth = st.depth & !IC_ARR_KEYCHK;
+        let depth = st.depth & !(IC_ARR_KEYCHK | IC_GETTER);
         if !(depth <= 1 || (depth == 2 && st.mid_ok & 1 != 0) || (depth == 3 && st.mid_ok & 3 == 3))
         {
             return None;
@@ -3058,9 +3099,7 @@ impl Interp {
             if recv_shape_ok && rb.ic_plain.get() && rb.props.shape() == st.recv_shape {
                 if depth == 0 {
                     if let Some(p) = rb.props.entry_at(st.slot as usize) {
-                        if !p.accessor() {
-                            return Some(p.value());
-                        }
+                        return read(p);
                     }
                 } else if let Some(pr) = rb.proto.as_ref() {
                     let mut hp = Gc::as_ptr(pr);
@@ -3089,9 +3128,7 @@ impl Interp {
                     if holder_exotic_ok && hb.ic_plain.get() && hb.props.shape() == st.holder_shape
                     {
                         if let Some(p) = hb.props.entry_at(st.slot as usize) {
-                            if !p.accessor() {
-                                return Some(p.value());
-                            }
+                            return read(p);
                         }
                     }
                 }
@@ -3148,17 +3185,18 @@ impl Interp {
                 absent_exotic |= exotic;
                 if let Some(slot) = b.props.slot_of(name) {
                     let p = b.props.entry_at(slot).unwrap();
-                    if p.accessor() {
-                        return None; // getter — must run through [[Get]]
+                    let is_getter = p.accessor();
+                    if is_getter && !p.getter().is_some_and(|g| matches!(g, Value::Obj(_))) {
+                        return None; // no getter: [[Get]] answers `undefined`
                     }
-                    let v = p.value();
+                    let v = if is_getter { Value::Undefined } else { p.value() };
                     // An Array HOLDER's named slots are shape-pinned like any object's, but its
                     // exotic gate differs: flag the entry (`IC_ARR_KEYCHK`) so the probes admit
                     // an Array holder. Digit names stay uncached (element reads have their own
                     // paths, and a digit key may live in the element region).
                     let keychk = !matches!(b.exotic, Exotic::None | Exotic::StrWrap);
                     if keychk && name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
-                        return Some(v);
+                        return (!is_getter).then_some(v);
                     }
                     let mid_shape = if depth >= 2 { mid } else { None };
                     let mid2_shape = if depth == 3 { mid2 } else { None };
@@ -3171,6 +3209,11 @@ impl Interp {
                                 crate::bytecode::IC_ARR_KEYCHK
                             } else {
                                 0
+                            }
+                            | if is_getter {
+                                crate::bytecode::IC_GETTER
+                            } else {
+                                0
                             },
                         slot: slot as u32,
                         recv_shape,
@@ -3180,6 +3223,11 @@ impl Interp {
                         mid2_shape: mid2_shape.unwrap_or(0),
                     };
                     self.ic_insert(cache, st);
+                    if is_getter {
+                        // The caller's full [[Get]] calls it this time; later reads hit
+                        // `try_ic_getter` (the stub cache keeps data resolutions only).
+                        return None;
+                    }
                     // Mirror into the stub cache so OTHER shapes rotating through this
                     // site don't evict this resolution for good.
                     self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {

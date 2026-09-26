@@ -1676,7 +1676,7 @@ unsafe fn call_frame(
             stack,
             handlers,
             ..
-        } = &mut rec;
+        } = &mut *rec;
         // SAFETY: `enter_frame` filled both.
         let (chunk, env) = (
             chunk.as_deref().unwrap_unchecked(),
