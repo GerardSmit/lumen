@@ -8089,6 +8089,66 @@ impl Chunk {
         }
         None
     }
+    /// [`Chunk::name_ic_hit`] of an object value, as its `Gc::as_ptr` (no clone): the JIT's
+    /// call-site guards compare it with the callee they were compiled for. `None` = a miss or
+    /// any other value (the caller takes the full path).
+    pub(crate) fn name_ic_obj_ptr(
+        &self,
+        i: &Interp,
+        env: &Env,
+        c: u32,
+    ) -> Option<*const std::cell::RefCell<crate::value::Object>> {
+        if c as usize >= self.name_caches.len() {
+            return None;
+        }
+        if let Some(p) = self.name_path_obj_ptr(i, env, c) {
+            return Some(p);
+        }
+        let ic = self.name_caches[c as usize].get();
+        let raw = Rc::as_ptr(env) as usize;
+        let bind = |bd: &crate::interpreter::Binding| match &bd.value {
+            Value::Obj(o) if bd.initialized => Some(crate::value::Gc::as_ptr(o)),
+            _ => None,
+        };
+        if ic.env == raw {
+            let b = env.borrow();
+            if b.vars.generation() != ic.gen {
+                return None;
+            }
+            // SAFETY: as in `name_ic_hit` (the generation proves the pointer live).
+            return bind(unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) });
+        }
+        if ic.env == raw | 1 {
+            if env.borrow().vars.generation() != ic.gen {
+                return None;
+            }
+            let g = i.global.borrow();
+            if !matches!(g.exotic, crate::value::Exotic::None)
+                || g.props.shape() != (ic.binding >> 32) as u32
+            {
+                return None;
+            }
+            return g.props.entry_at(ic.binding as u32 as usize)?.obj_ptr();
+        }
+        if ic.env & 2 != 0 {
+            let b = env.borrow();
+            if b.vars.generation() != ic.act_gen {
+                return None;
+            }
+            let p = b.parent.as_ref()?;
+            if Rc::as_ptr(p) as usize | 2 != ic.env {
+                return None;
+            }
+            let pb = p.borrow();
+            if pb.vars.generation() != ic.gen {
+                return None;
+            }
+            // SAFETY: as in `name_ic_hit`.
+            return bind(unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) });
+        }
+        None
+    }
+
     /// Depth-0 cache fill: the name resolves directly in `env` as a plain initialized binding —
     /// no `with` object on the scope, no live import redirect. When `env` *is* the global scope
     /// and misses, an own data property of the ordinary global object fills the global mode
