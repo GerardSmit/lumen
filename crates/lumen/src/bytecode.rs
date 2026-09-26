@@ -7245,6 +7245,11 @@ fn run_vm_frames<const ONE: bool>(
                 if let Some(state) = iter_fast::open(i, &v) {
                     stack.push(Value::Num(state));
                     stack.push(v);
+                } else if let Some((state, coll)) = iter_fast::open_coll_iter(i, &v) {
+                    // A fresh `m.keys()`-style iterator only this operand holds.
+                    drop(v);
+                    stack.push(Value::Num(state));
+                    stack.push(coll);
                 } else {
                     let (it, nx) = i.get_iterator(&v)?;
                     stack.push(it);

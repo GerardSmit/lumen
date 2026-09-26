@@ -5081,7 +5081,7 @@ fn merge_sort(i: &mut Interp, items: &mut Vec<Value>, cmp: &Value) -> Result<(),
 }
 
 /// A native that returns its `this` — the `@@iterator` of an iterator object is itself.
-fn return_this(_i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn return_this(_i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(this)
 }
 

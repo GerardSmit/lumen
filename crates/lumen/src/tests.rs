@@ -5564,6 +5564,31 @@ fn jit_inlines_captures_virtual_arguments_and_calls_activations_directly() {
 }
 
 #[test]
+fn jit_destructure_guard_spread_calls_and_collection_iterators() {
+    // Object destructuring reads a lent source, spread calls gather into the call helper, and a
+    // fresh `m.keys()` / `m.values()` iterator only the loop holds runs as an encoded state.
+    assert_eq!(
+        run_bytecode(
+            "function f3(a, b, c) { return a + b + c; }
+             var m = new Map([[1, 10], [2, 20], [3, 30]]), o = { x: 1, y: 2 }, A = [1, 2, 3], out = [], s = 0, t = 0, u = 0, w = 0;
+             for (var i = 0; i < 400; i++) {
+               var { x, y } = o; s += x + y;
+               var [p, , q] = A; t += p + q;
+               u += f3(...A) + Math.max(0, ...A);
+               for (var k of m.keys()) w += k;
+               for (var v of m.values()) w += v;
+             }
+             out.push(s, t, u, w);
+             try { for (var i = 0; i < 400; i++) { var z = i < 399 ? o : null; var { x } = z; } } catch (e) { out.push(e.name); }
+             var it = m.keys(); it.next(); var rest = []; for (var k of it) rest.push(k); out.push(rest.join('.'));
+             out.push(f3(...'abc'), f3(...new Set([4, 5, 6])));
+             out.join(':')"
+        ),
+        "1200:1600:3600:26400:TypeError:2.3:abc:15"
+    );
+}
+
+#[test]
 fn jit_fused_map_set_method_sites() {
     // `recv.get/has/set/add(args)` sites run the intrinsic Map/Set methods inline, and still
     // call user methods, subclass overrides, own properties and patched prototypes.

@@ -1961,12 +1961,14 @@ impl<'a, 'f> Tr<'a, 'f> {
             || (matches!(op, Op::AppendProp(..) | Op::SetPropDrop(..))
                 && !self.plan.dacc.contains_key(&pc)
                 && !self.plan.dset.contains_key(&pc))
+            || matches!(op, Op::DestructureArr(n) if (1..=8).contains(&n))
             || matches!(
                 op,
                 Op::Pop
                     | Op::Void
                     | Op::Dup
                     | Op::Dup2
+                    | Op::DestructureGuard
                     | Op::GetElem
                     | Op::GetProp(..)
                     | Op::SetElem
@@ -2010,6 +2012,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     | Op::LoadThis
                     | Op::Dup
                     | Op::Dup2
+                    | Op::DestructureGuard
                     | Op::Pop
                     | Op::Void
                     | Op::UpdateLocal(..)
@@ -3477,6 +3480,22 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.stack.truncate(base);
                 self.stack.push(Entry::Boxed);
             }
+            Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
+                let with_this = matches!(op, Op::CallSpreadThis(_));
+                let base = d - argc as usize - 1 - with_this as usize;
+                self.box_from(base);
+                let (bv, av, wv) = (
+                    self.i32c(base as i64),
+                    self.i32c(argc as i64),
+                    self.i32c(with_this as i64 | self.await_fused(pc)),
+                );
+                self.set_call_site(pc);
+                let st = self.call_js(Helper::CallSpread, &[self.frame, bv, av, wv]);
+                let below = self.stack[..base].to_vec();
+                self.throw_if(st, pc, &below, base);
+                self.stack.truncate(base);
+                self.stack.push(Entry::Boxed);
+            }
             Op::GetMethod(..) if self.plan.dmethod.contains_key(&pc) && self.direct_method(pc) => {}
             Op::GetMethod(n, c) => {
                 // A property read that keeps its receiver (`Helper::GetMethod` is `GetProp`
@@ -3549,6 +3568,22 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.stack.push(Entry::Boxed);
             }
             Op::Dup => self.dup(d - 1),
+            // Numbers and Booleans destructure; `undefined` / `null` (tags below Bool, with the
+            // hole marker) exit so the interpreter throws.
+            Op::DestructureGuard => match self.stack[d - 1] {
+                Entry::Num(_) | Entry::Bool(_) => {}
+                Entry::Boxed | Entry::Ref(..) => {
+                    let p = match self.stack[d - 1] {
+                        Entry::Ref(p, _) => p,
+                        _ => self.sptr(d - 1),
+                    };
+                    let tag = self.fb.load(MemKind::I32U8, p, 0);
+                    let lim = self.i32c(TAG_BOOL as i64);
+                    let bad = self.fb.icmp(IntCC::Ult, tag, lim);
+                    let st = self.stack.clone();
+                    self.exit_if(bad, pc, EXIT_RESUME, &st, d);
+                }
+            },
             Op::Dup2 => {
                 self.dup(d - 2);
                 self.dup(d - 1);
@@ -3856,12 +3891,19 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             Op::DestructureArr(n) => {
                 // A pristine dense Array natively; anything else through the generic op.
-                self.box_from(d - 1);
                 self.max_stack = self.max_stack.max(d - 1 + n as usize);
                 if (1..=8).contains(&n) {
-                    self.destructure_inline(pc, d, n as usize);
+                    let lent = match self.stack[d - 1] {
+                        Entry::Ref(p, _) => Some(p),
+                        _ => {
+                            self.box_from(d - 1);
+                            None
+                        }
+                    };
+                    self.destructure_inline(pc, d, n as usize, lent);
                     return Ok(());
                 }
+                self.box_from(d - 1);
                 let p = self.sptr(d - 1);
                 let nv = self.i32c(n as i64);
                 let r = self
@@ -4847,11 +4889,12 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// `DestructureArr(n)` of the Boxed value at `d - 1`: when [`Helper::DestructProbe`] holds
     /// and the first `n` elements are dense data elements (`n <= length`), they are read
-    /// natively into `d - 1 ..`; else `DestructDense`, then the generic op.
-    fn destructure_inline(&mut self, pc: usize, d: usize, n: usize) {
-        // The array moves to a scratch entry above the outputs while they are written.
+    /// natively into `d - 1 ..`; else `DestructDense`, then the generic op. A `lent` array (a
+    /// Ref entry's address) is read in place, and cloned onto the stack only for the slow path.
+    fn destructure_inline(&mut self, pc: usize, d: usize, n: usize, lent: Option<V>) {
+        // An owned array moves to a scratch entry above the outputs while they are written.
         self.max_stack = self.max_stack.max(d + n);
-        let p = self.sptr(d - 1);
+        let p = lent.unwrap_or_else(|| self.sptr(d - 1));
         let slow = self.fb.create_block();
         let join = self.fb.create_block();
         let fast = self.fb.create_block();
@@ -4877,11 +4920,13 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         let all_num = all_num.expect("n >= 1");
         // Every check passed: nothing below can miss.
-        let (from, to) = (self.soff(d - 1), self.soff(d - 1 + n));
-        let w0 = self.fb.load(MemKind::I64, self.stackp, from);
-        let w1 = self.fb.load(MemKind::I64, self.stackp, from + 8);
-        self.fb.store(MemKind::I64, self.stackp, w0, to);
-        self.fb.store(MemKind::I64, self.stackp, w1, to + 8);
+        if lent.is_none() {
+            let (from, to) = (self.soff(d - 1), self.soff(d - 1 + n));
+            let w0 = self.fb.load(MemKind::I64, self.stackp, from);
+            let w1 = self.fb.load(MemKind::I64, self.stackp, from + 8);
+            self.fb.store(MemKind::I64, self.stackp, w0, to);
+            self.fb.store(MemKind::I64, self.stackp, w1, to + 8);
+        }
         // Straight-line writes, only the words kept live (a branch per element, or a decoded
         // tag and payload per element, costs more than the writes): all Numbers stored
         // directly, else every element (any non-hole word) through `UnpackClone`.
@@ -4908,10 +4953,21 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.jump(done, &[]);
         self.fb.seal_block(done);
         self.fb.switch_to_block(done);
-        self.drop_at(d - 1 + n);
+        if lent.is_none() {
+            self.drop_at(d - 1 + n);
+        }
         self.fb.jump(join, &[]);
         self.fb.seal_block(slow);
         self.fb.switch_to_block(slow);
+        let p = match lent {
+            Some(src) => {
+                let dst = self.sptr(d - 1);
+                self.clone_mem(dst, src);
+                self.stack[d - 1] = Entry::Boxed;
+                dst
+            }
+            None => p,
+        };
         let nv = self.i32c(n as i64);
         let r = self
             .call(Helper::DestructDense, &[self.frame, nv, p])

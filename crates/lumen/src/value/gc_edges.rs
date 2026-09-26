@@ -51,7 +51,7 @@ impl Property {
     }
 
     /// A present, writable, enumerable, configurable data property.
-    pub(super) fn is_plain_element(&self) -> bool {
+    pub(crate) fn is_plain_element(&self) -> bool {
         self.meta == super::PROP_WRITABLE | super::PROP_ENUMERABLE | super::PROP_CONFIGURABLE
             && !self.is_empty()
     }

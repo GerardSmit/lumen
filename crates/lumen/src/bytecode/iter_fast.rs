@@ -325,6 +325,93 @@ pub(crate) fn open(i: &Interp, v: &Value) -> Option<f64> {
     }
 }
 
+/// GetIterator on a fresh Map/Set iterator (`m.keys()`, `m.values()`, `m.entries()`, `s.values()`
+/// …) that nothing else references: the encoded state at the iterator's position plus the
+/// iterated collection (for the `next` slot). The iterator object is consumed unobservably —
+/// the operand holds its only reference — so the loop may run on the encoded state instead,
+/// provided GetIterator would run no user code: the object carries only its three internal
+/// slots, its prototype is the realm's Map/Set iterator prototype with the intrinsic `next`,
+/// and `@@iterator` resolves to `%IteratorPrototype%`'s intrinsic (returns `this`).
+pub(crate) fn open_coll_iter(i: &Interp, v: &Value) -> Option<(f64, Value)> {
+    if disabled() {
+        return None;
+    }
+    let Value::Obj(o) = v else {
+        return None;
+    };
+    if Gc::strong_count(o) != 1 {
+        return None;
+    }
+    let b = o.try_borrow().ok()?;
+    if !matches!(b.exotic, Exotic::None) || !b.ic_plain.get() {
+        return None;
+    }
+    let coll = match b.props.get("__ci_coll")?.value() {
+        Value::Obj(c) => c,
+        _ => return None,
+    };
+    let idx = match b.props.get("__ci_index")?.value() {
+        Value::Num(n) if n >= 0.0 && n < STRIDE => n,
+        _ => return None,
+    };
+    let kind = match b.props.get("__ci_kind")?.value() {
+        Value::Num(k) if k == 0.0 || k == 1.0 || k == 2.0 => k as u8,
+        _ => return None,
+    };
+    if b.props.get("__ci_done").is_some() || b.props.keys().len() != 3 {
+        return None;
+    }
+    let ip_key = match i.map_data.get(&(Gc::as_ptr(&coll) as usize))?.kind() {
+        CollectionKind::Map => "%MapIteratorPrototype%",
+        CollectionKind::Set => "%SetIteratorPrototype%",
+        _ => return None,
+    };
+    let proto = b.proto.as_ref()?;
+    if !Gc::ptr_eq(proto, i.extra_protos.get(ip_key)?) {
+        return None;
+    }
+    let key = iter_key(i)?;
+    let native_is = |p: Option<&crate::value::Property>, f: crate::value::NativeFn| -> bool {
+        let Some(p) = p else { return false };
+        if p.accessor() {
+            return false;
+        }
+        match p.value() {
+            Value::Obj(g) => matches!(
+                g.try_borrow().map(|gb| match gb.call {
+                    crate::value::Callable::Native(h) => h as usize == f as usize,
+                    _ => false,
+                }),
+                Ok(true)
+            ),
+            _ => false,
+        }
+    };
+    let pb = proto.try_borrow().ok()?;
+    if !matches!(pb.exotic, Exotic::None)
+        || !pb.ic_plain.get()
+        || pb.props.get(&key).is_some()
+        || !native_is(
+            pb.props.get("next"),
+            crate::builtins::collections::map_set_iter_next,
+        )
+    {
+        return None;
+    }
+    let root = pb.proto.as_ref()?;
+    if !Gc::ptr_eq(root, i.extra_protos.get("%IteratorPrototype%")?) {
+        return None;
+    }
+    let rb = root.try_borrow().ok()?;
+    if !matches!(rb.exotic, Exotic::None)
+        || !rb.ic_plain.get()
+        || !native_is(rb.props.get(&key), crate::builtins::return_this)
+    {
+        return None;
+    }
+    Some((idx + f64::from(kind) * STRIDE, Value::Obj(coll)))
+}
+
 fn disabled() -> bool {
     thread_local! {
         static OFF: bool = std::env::var_os("LUMEN_NO_ITER_FAST").is_some();
@@ -621,6 +708,31 @@ fn pristine_len<'a>(i: &Interp, v: &'a Value) -> Option<(&'a Gc, u32)> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// [`array_elems`] for a pristine Array of at most `max` packed plain data elements (no holes,
+/// no accessors); `false` = nothing was pushed.
+#[inline]
+pub(crate) fn array_packed(i: &Interp, v: &Value, max: usize, mut push: impl FnMut(Value)) -> bool {
+    let Some((o, len)) = pristine_len(i, v) else {
+        return false;
+    };
+    if len as usize > max {
+        return false;
+    }
+    // SAFETY: a pure read.
+    let Ok(b) = (unsafe { o.try_borrow_unguarded() }) else {
+        return false;
+    };
+    match b.props.packed_elements().and_then(|e| e.get(..len as usize)) {
+        Some(run) if run.iter().all(|p| p.is_plain_element()) => {
+            for p in run {
+                push(p.value());
+            }
+            true
+        }
+        _ => false,
     }
 }
 

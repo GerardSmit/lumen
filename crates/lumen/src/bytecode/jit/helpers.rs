@@ -292,12 +292,15 @@ pub(crate) enum Helper {
     /// `(frame, pc: u32, base: u32, argc: u32, cell: *const Cell<CollSite>) -> status` — the
     /// call of a fused `<object>.<get|has|set|add>(args)` site (see [`coll_method`]).
     CollMethod,
+    /// `(frame, base: u32, argc: u32, flags: u32) -> status` — `CallSpread(argc)` /
+    /// `CallSpreadThis(argc)`, laid out as [`Helper::Call`]'s with the last argument spread.
+    CallSpread,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 75] = [
+pub(crate) const ALL: [Helper; 76] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -373,6 +376,7 @@ pub(crate) const ALL: [Helper; 75] = [
     Helper::ActEnv,
     Helper::DropEnv,
     Helper::CollMethod,
+    Helper::CallSpread,
 ];
 
 /// The IR signature of `h`.
@@ -450,6 +454,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::ActEnv => (&[P, P, P, P, P, P], &[]),
         Helper::DropEnv => (&[P], &[]),
         Helper::CollMethod => (&[P, I32, I32, I32, P], &[I32]),
+        Helper::CallSpread => (&[P, I32, I32, I32], &[I32]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -533,6 +538,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::ActEnv => act_env as *const () as usize,
         Helper::DropEnv => drop_env as *const () as usize,
         Helper::CollMethod => coll_method as *const () as usize,
+        Helper::CallSpread => call_spread as *const () as usize,
     } as u64)
 }
 
@@ -1438,10 +1444,28 @@ pub(crate) unsafe extern "C" fn call(
         std::ptr::write(s.add(base), Value::Undefined);
         return STATUS_OK;
     }
+    dispatch_call(f, base, callee, this, s.add(at), argc, flags)
+}
+
+/// [`call`]'s dispatch once the callee, receiver and argument window (`argc` values at
+/// `args`, left all `Undefined` or dropped by the caller) are known; the result lands in
+/// `stack[base]`.
+#[inline(always)]
+unsafe fn dispatch_call(
+    f: *mut JitFrame,
+    base: usize,
+    callee: Value,
+    this: Value,
+    args: *mut Value,
+    argc: usize,
+    flags: u32,
+) -> u32 {
+    let s = (*f).stack;
+    let i = &mut *(*f).interp;
     let mut buf = ArgBuf::new();
-    let (callee, this, argp, argc) = match unwrap_adaptor(i, &callee, &this, s.add(at), argc, &mut buf) {
+    let (callee, this, argp, argc) = match unwrap_adaptor(i, &callee, &this, args, argc, &mut buf) {
         Some((target, t)) => (target, t, buf.as_mut_ptr(), buf.len),
-        None => (callee, this, s.add(at), argc),
+        None => (callee, this, args, argc),
     };
     // A plain native: straight to it (`Interp::call`'s bookkeeping without its dispatch).
     if let Some(nat) = i.leaf_native(&callee) {
@@ -1500,6 +1524,71 @@ pub(crate) unsafe extern "C" fn call(
             STATUS_OK
         }
         Err(e) => fail(f, e),
+    }
+}
+
+/// `CallSpread(argc)` / `CallSpreadThis(argc)` (flags as [`call`]'s): the last of the `argc`
+/// operands is spread. The arguments gather into a buffer: a pristine Array's elements as a
+/// copy (see `iter_fast::array_elems`), anything else through the iterator protocol. Then the
+/// call dispatches as a plain `Call` does.
+pub(crate) unsafe extern "C" fn call_spread(
+    f: *mut JitFrame,
+    base: u32,
+    argc: u32,
+    flags: u32,
+) -> u32 {
+    let s = (*f).stack;
+    let (base, argc) = (base as usize, argc as usize);
+    let at = base + 1 + (flags & 1) as usize;
+    let i = &mut *(*f).interp;
+    let spread = std::ptr::replace(s.add(at + argc - 1), Value::Undefined);
+    // Up to `ARGBUF` arguments stay in `small`; more move to `big`.
+    let mut small = ArgBuf::new();
+    let mut big: Vec<Value> = Vec::new();
+    let mut push = |x: Value| {
+        if big.is_empty() && small.len < ARGBUF {
+            small.push(x);
+        } else {
+            if big.is_empty() {
+                big.reserve(small.len + 8);
+                for k in 0..small.len {
+                    big.push(small.vals[k].assume_init_read());
+                }
+                small.len = 0;
+            }
+            big.push(x);
+        }
+    };
+    for k in 0..argc - 1 {
+        push(std::ptr::replace(s.add(at + k), Value::Undefined));
+    }
+    let room = ARGBUF - (argc - 1);
+    if !crate::bytecode::iter_fast::array_packed(i, &spread, room, &mut push)
+        && !crate::bytecode::iter_fast::array_elems(i, &spread, &mut push)
+    {
+        let r = i.get_iterator(&spread).and_then(|(it, nx)| {
+            while let Some(x) = i.iterator_step(&it, &nx)? {
+                push(x);
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            return fail(f, e);
+        }
+    }
+    drop(spread);
+    let callee = std::ptr::replace(s.add(at - 1), Value::Undefined);
+    let this = if flags & 1 != 0 {
+        std::ptr::replace(s.add(base), Value::Undefined)
+    } else {
+        Value::Undefined
+    };
+    if big.is_empty() {
+        let n = small.len;
+        dispatch_call(f, base, callee, this, small.as_mut_ptr(), n, flags)
+    } else {
+        let n = big.len();
+        dispatch_call(f, base, callee, this, big.as_mut_ptr(), n, flags)
     }
 }
 
