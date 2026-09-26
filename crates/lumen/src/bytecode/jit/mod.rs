@@ -284,12 +284,17 @@ const MAX_ENTRY_FAILS: u32 = 16;
 const MAX_COMPILES: u32 = 3;
 /// Calls between looks at compiling a whole function (a power of two).
 const CALL_MASK: u32 = (1 << 10) - 1;
+/// Calls per bytecode op a function makes before its first compile. Compiling costs tens of
+/// microseconds per op (inlined callees included) while interpreting one costs tens of
+/// nanoseconds: a large function, which runs only part of its ops per call, needs proportionally
+/// more calls before the compile pays for itself. Functions of up to `1024 / FN_CALLS_PER_OP`
+/// ops keep the plain `CALL_MASK + 1` threshold.
+const FN_CALLS_PER_OP: u32 = 16;
 /// Resume exits at one pc of function code before its speculation there is widened (the
 /// function recompiles with the slots involved kept in memory).
 const DEOPT_LIMIT: u32 = 32;
 
 /// Function-tier states ([`ChunkJit::fstate`]).
-#[allow(dead_code)] // the zero state, spelled for readers
 const FS_COLD: u8 = 0;
 /// Native code exists: every entry runs it.
 const FS_CODE: u8 = 1;
@@ -573,8 +578,11 @@ fn compile(
     this_val: &Value,
 ) -> Result<Native, String> {
     dump_ops(chunk);
-    let built = build::build(i, env, chunk, header, backedge, slots, this_val)?;
-    finish(built, header, backedge)
+    let t = stats_start();
+    let r = build::build(i, env, chunk, header, backedge, slots, this_val)
+        .and_then(|built| finish(built, header, backedge));
+    stats_end(t, "loop", &r);
+    r
 }
 
 /// Compile the whole of `chunk`, entered at pc 0 with the current `slots` (see [`on_entry`]).
@@ -587,8 +595,40 @@ fn compile_fn(
     this_val: &Value,
 ) -> Result<Native, String> {
     dump_ops(chunk);
-    let built = build::build_fn(i, env, chunk, slots, widen, this_val)?;
-    finish(built, 0, chunk.ops.len().saturating_sub(1))
+    let t = stats_start();
+    let r = build::build_fn(i, env, chunk, slots, widen, this_val)
+        .and_then(|built| finish(built, 0, chunk.ops.len().saturating_sub(1)));
+    stats_end(t, "fn", &r);
+    r
+}
+
+/// `LUMEN_JIT_STATS`: one stderr line per compile attempt with its time and the running totals.
+fn stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUMEN_JIT_STATS").is_some())
+}
+
+fn stats_start() -> Option<std::time::Instant> {
+    stats_enabled().then(std::time::Instant::now)
+}
+
+fn stats_end(t: Option<std::time::Instant>, kind: &str, r: &Result<Native, String>) {
+    let Some(t) = t else { return };
+    thread_local! {
+        static TOTAL: Cell<(u32, u32, u128)> = const { Cell::new((0, 0, 0)) };
+    }
+    let us = t.elapsed().as_micros();
+    let (ok, err, sum) = TOTAL.get();
+    let (ok, err) = if r.is_ok() { (ok + 1, err) } else { (ok, err + 1) };
+    TOTAL.set((ok, err, sum + us));
+    let what = match r {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("bail: {}", e.chars().take(60).collect::<String>()),
+    };
+    eprintln!(
+        "[jit-stats] {kind} {us} us {what} | total {} us, {ok} ok, {err} bailed",
+        sum + us
+    );
 }
 
 fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native, String> {
@@ -837,6 +877,14 @@ pub(super) fn on_entry(
         FS_DEAD => return Ok(None),
         _ => {
             if !jit_enabled() || *pc != 0 || !stack.is_empty() {
+                return Ok(None);
+            }
+            // A cold large function waits until it has made enough calls (a pending one was
+            // asked for by a hot loop, or retired and wants its recompile now).
+            if jit.fstate.get() == FS_COLD
+                && !eager()
+                && jit.calls.get() / FN_CALLS_PER_OP < chunk.ops.len() as u32
+            {
                 return Ok(None);
             }
             let mut fs = jit.func.borrow_mut();

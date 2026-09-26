@@ -949,6 +949,8 @@ impl Src {
 /// What the translator decides before emitting anything (see [`plan`]).
 #[derive(Default)]
 struct Plan {
+    /// `GetPropLocal` sites seen producing a non-Number at translation (see [`Tr::want_num`]).
+    not_num: HashSet<usize>,
     /// `LoadName` sites translated as a borrowed binding address.
     name_ref: HashSet<usize>,
     /// `LoadName` sites read inline from a global object property ([`Src::Glob`]).
@@ -1574,6 +1576,19 @@ fn plan(
             }
             if !p.arr_srcs.contains(&src) {
                 p.arr_srcs.push(src);
+            }
+        }
+    }
+    // `GetPropLocal` sites whose receiver's own data property holds a non-Number now: no Number
+    // speculation for their consumer (it would exit, then recompile the whole unit per site).
+    for pc in header..=backedge.min(ops.len() - 1) {
+        if let Op::GetPropLocal(s, n, _) = ops[pc] {
+            if reach(pc)
+                && slots.get(s as usize).zip(chunk.names.get(n as usize)).is_some_and(|(o, name)| {
+                    helpers::own_data(interp, o, name).is_some_and(|v| !matches!(v, Value::Num(_)))
+                })
+            {
+                p.not_num.insert(pc);
             }
         }
     }
@@ -2859,7 +2874,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// looking ahead within the basic block.
     fn want_num(&self, pc: usize, at: usize) -> bool {
         // The site kept producing non-Numbers (see `helpers::note_num_exit`).
-        if helpers::no_num(self.chunk, pc) {
+        if helpers::no_num(self.chunk, pc) || self.plan.not_num.contains(&pc) {
             return false;
         }
         let mut depth = at + 1;

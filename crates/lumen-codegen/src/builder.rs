@@ -16,6 +16,8 @@ pub struct Variable(pub u32);
 
 struct BlockState {
     sealed: bool,
+    /// Whether the block is in the layout yet (`switch_to_block` appends it once).
+    laid_out: bool,
     /// Predecessor edges as (block, terminator); one entry per terminator even if it targets
     /// this block twice.
     preds: Vec<(Block, Inst)>,
@@ -31,6 +33,7 @@ impl BlockState {
     fn new() -> BlockState {
         BlockState {
             sealed: false,
+            laid_out: false,
             preds: Vec::new(),
             defs: Vec::new(),
             incomplete: Vec::new(),
@@ -97,7 +100,9 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Continue emitting into `block` (appended to the layout on first use).
     pub fn switch_to_block(&mut self, block: Block) {
-        if !self.func.layout.contains(&block) {
+        let st = &mut self.blocks[block.index()];
+        if !st.laid_out {
+            st.laid_out = true;
             self.func.layout.push(block);
         }
         self.cur = Some(block);

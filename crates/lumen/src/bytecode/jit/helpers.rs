@@ -2460,7 +2460,7 @@ pub(crate) fn name_value(i: &Interp, chunk: &Chunk, env: &Env, n: u32, c: u32) -
 
 /// The own data property `name` of `obj` when `obj` is an ordinary object (no proxy, typed
 /// array or namespace behavior, no exotic kind) — reading it runs no JS.
-fn own_data(i: &Interp, obj: &Value, name: &str) -> Option<Value> {
+pub(crate) fn own_data(i: &Interp, obj: &Value, name: &str) -> Option<Value> {
     let Value::Obj(o) = obj else { return None };
     if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(o) as usize) {
         return None;
