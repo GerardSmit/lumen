@@ -20,7 +20,7 @@ use std::sync::mpsc;
 
 pub use lumen::bytecode::Tier;
 pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
-pub use lumen::{Completion, Engine, ParseError};
+pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 
 /// DEFLATE/zlib/gzip codec (std-only), shared by web CompressionStream and node:zlib.
 pub mod deflate;

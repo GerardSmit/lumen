@@ -15,7 +15,7 @@
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
 //!   `lumen_host::fill_random`, no crates), `crypto.subtle.digest` (SHA-256 only)
 //! - [x] `fetch` / `Headers` / `Request` / `Response` — HTTP and certificate-verified HTTPS
-//!   through the dynamically loaded system OpenSSL backend
+//!   through lumen-tls (system OpenSSL on Unix, rustls on Windows)
 //! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
 //!   `serve((request) => Response)` convention of Deno/Bun/Workers). v1 is single-accept,
 //!   `Connection: close`, buffered bodies, http only — see `server.rs` for what's deferred.
@@ -203,7 +203,7 @@ fn op_time_origin(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value,
 
 fn op_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
-    let bytes = s.as_bytes().to_vec();
+    let bytes = lumen_host::well_formed_utf8(&s).as_bytes().to_vec();
     ctx.make_uint8array(&bytes)
 }
 

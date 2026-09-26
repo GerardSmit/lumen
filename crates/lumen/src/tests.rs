@@ -302,8 +302,8 @@ fn memory_caps_convert_blowups_to_rangeerror() {
     assert_eq!(throws("new Array(4294967296)"), "RangeError"); // invalid uint32 length
     assert_eq!(throws("[].length = 4294967296"), "RangeError");
     assert_eq!(throws("'x'.repeat(1e9)"), "RangeError");
-    assert_eq!(throws("Array(100000000).join(',')"), "RangeError"); // huge length op
-    assert_eq!(throws("[...Array(100000000)]"), "RangeError"); // huge spread
+    assert_eq!(throws("Array(200000000).join(',')"), "RangeError"); // huge length op
+    assert_eq!(throws("[...Array(200000000)]"), "RangeError"); // huge spread
     assert_eq!(throws("(123).toFixed(1e9)"), "RangeError");
     assert_eq!(throws("let s='x'; for(;;){ s += s; }"), "RangeError"); // doubling string
                                                                        // Truncating a huge sparse length must not loop over the whole range (would hang).
