@@ -349,6 +349,8 @@ fn build_region(
         let (direct, dmethod) = (&plan.direct, &plan.dmethod);
         plan.colm
             .retain(|g, &mut (c, _)| !direct.contains_key(&c) && !dmethod.contains_key(g));
+        plan.dvm
+            .retain(|g, &mut (c, _)| !direct.contains_key(&c) && !dmethod.contains_key(g));
     }
     let mut an = an;
     let resumes_out = an.resumes.clone();
@@ -369,6 +371,7 @@ fn build_region(
         .chain(plan.strm.keys().copied())
         .chain(plan.strn.keys().copied())
         .chain(plan.colm.keys().copied())
+        .chain(plan.dvm.keys().copied())
         .chain(plan.arrm.keys().copied())
         .collect();
     let self_cell: Box<std::cell::Cell<usize>> = Box::new(std::cell::Cell::new(0));
@@ -457,6 +460,8 @@ fn build_region(
             math_vars: HashMap::new(),
             ta_vars: HashMap::new(),
             ta_len_vars: HashMap::new(),
+            dv_vars: HashMap::new(),
+            bl_vars: HashMap::new(),
             push_vars: HashMap::new(),
             ta_slots: (0..n_slots)
                 .map(|s| match slots.get(s) {
@@ -1024,6 +1029,10 @@ struct Plan {
     /// Fused Map/Set method sites (`<object>.<get|has|set|add>(<pure args>)`, see
     /// `Tr::colm_begin`): `GetMethod` pc -> (call pc, address of the site's `CollSite` cell).
     colm: HashMap<usize, (usize, usize)>,
+    /// Fused DataView get/set sites (`<object>.<getUint32|setFloat64|...>(<pure args>)`, see
+    /// `Tr::dv_call`): `GetMethod` pc -> (call pc, address of the site's `CollSite` cell for
+    /// the generic path).
+    dvm: HashMap<usize, (usize, usize)>,
     /// Inline `Array.prototype.push` sites (`<array> GetMethod(push) <value>
     /// CallWithThis(1)`): `GetMethod` pc -> call pc.
     arrm: HashMap<usize, usize>,
@@ -1456,6 +1465,74 @@ fn plan(
         }
     }
 
+    // `<object>.<getUint32|setFloat64|...>(<args>)` (DataView methods), its arguments pure
+    // loads: the receiver checked an object at the `GetMethod`; at the call a DataView reading
+    // the intrinsic method accesses its bytes inline (Number arguments), anything else goes
+    // through the generic fused call (see `Tr::dv_call`).
+    for pc in header..=backedge {
+        if !reach(pc)
+            || p.strm.contains_key(&pc)
+            || p.strn.contains_key(&pc)
+            || helpers::math_site_failed(chunk, pc)
+            || p.math.contains_key(&pc.wrapping_sub(1))
+        {
+            continue;
+        }
+        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        let Some((_, set)) = chunk
+            .names
+            .get(m as usize)
+            .and_then(|n| crate::builtins::dataview::dv_inline_method(n))
+        else {
+            continue;
+        };
+        let mut st: Vec<bool> = Vec::new();
+        let mut q = pc + 1;
+        let call = loop {
+            if q > backedge || lead(q) || st.len() > 3 {
+                break None;
+            }
+            match ops[q] {
+                Op::CallWithThis(n) => {
+                    let n = n as usize;
+                    let ok = n == st.len() && if set { (2..=3).contains(&n) } else { (1..=2).contains(&n) };
+                    break ok.then_some(q);
+                }
+                Op::LoadLocal(s)
+                    if !tdzd.maybe_undef(s as usize, q) && !defd.maybe_undef(s as usize, q) =>
+                {
+                    st.push(num_slot(s))
+                }
+                Op::Const(k) => st.push(matches!(chunk.consts[k as usize], Value::Num(_))),
+                Op::Undef => st.push(false),
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+                    if st.len() >= 2 && st[st.len() - 1] && st[st.len() - 2] =>
+                {
+                    st.pop();
+                }
+                Op::Neg | Op::Plus | Op::BitNot if st.last() == Some(&true) => {}
+                _ => break None,
+            }
+            q += 1;
+        };
+        if let Some(call) = call {
+            let cell: Box<std::cell::Cell<helpers::CollSite>> = Box::default();
+            let addr = &*cell as *const std::cell::Cell<helpers::CollSite> as usize;
+            p.boxes.push(cell);
+            p.dvm.insert(pc, (call, addr));
+        }
+    }
+
     // `<object>.<get|has|set|add>(<args>)` (Map / Set methods), its arguments pure loads: the
     // receiver checked an object at the `GetMethod`, the method read and (for the intrinsic
     // collection methods) run inline by one helper at the call (see `Tr::colm_begin`,
@@ -1644,6 +1721,18 @@ struct TaVars {
     len: Variable,
 }
 
+/// A fused DataView method site's view cache ([`Helper::DvView`]): the `Gc` handle word it was
+/// taken for, whether it is set (I32), the view's byte 0 address and byte length, and the
+/// [`crate::interpreter::GC_EPOCH`] it was taken in. Reset by [`Tr::invalidate_js`].
+#[derive(Clone, Copy)]
+struct DvVars {
+    obj: Variable,
+    ok: Variable,
+    data: Variable,
+    len: Variable,
+    epoch: Variable,
+}
+
 /// A `length` read site's typed-array length cache: the `Gc` handle word, the length, and
 /// whether it is set (I32). Reset by [`Tr::invalidate_js`].
 #[derive(Clone, Copy)]
@@ -1755,6 +1844,12 @@ struct Tr<'a, 'f> {
     ta_slots: Vec<bool>,
     /// Typed-array length caches, per `length` read pc.
     ta_len_vars: HashMap<usize, TaLenVars>,
+    /// DataView view caches, per [`Plan::dvm`] call pc.
+    dv_vars: HashMap<usize, DvVars>,
+    /// `byteLength` read caches (see [`Tr::byte_len_read`]), per read pc: the `Gc` handle
+    /// word, the length (F64), whether set, and the collection epoch (the `obj`, `data`, `ok`
+    /// and `epoch` of a [`DvVars`]; `len` unused).
+    bl_vars: HashMap<usize, (DvVars, Variable)>,
     /// The receiver (payload word, 0 = none) that last passed a push site's guard, per
     /// [`Plan::arrm`] site: the same array needs no re-check until JS runs.
     push_vars: HashMap<usize, Variable>,
@@ -1898,6 +1993,8 @@ impl<'a, 'f> Tr<'a, 'f> {
             .chain(self.math_vars.values().map(|&v| (v, Type::I32)))
             .chain(self.ta_vars.values().map(|t| (t.kind, Type::I32)))
             .chain(self.ta_len_vars.values().map(|t| (t.ok, Type::I32)))
+            .chain(self.dv_vars.values().map(|t| (t.ok, Type::I32)))
+            .chain(self.bl_vars.values().map(|t| (t.0.ok, Type::I32)))
             .chain(self.push_vars.values().map(|&v| (v, PTR)))
             .collect();
         self.reset_vars(&vars);
@@ -2037,6 +2134,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             || self.plan.strm.contains_key(&pc)
             || self.plan.strn.contains_key(&pc)
             || self.plan.colm.contains_key(&pc)
+            || self.plan.dvm.contains_key(&pc)
             || self.plan.arrm.contains_key(&pc)
             || matches!(
                 op,
@@ -2743,6 +2841,45 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.def_var(v, one);
             self.math_vars.insert(pc, v);
         }
+        let mut dvs: Vec<usize> = self.plan.dvm.values().map(|&(c, _)| c).collect();
+        dvs.sort_unstable();
+        for pc in dvs {
+            let t = DvVars {
+                obj: self.fb.declare_var(PTR),
+                ok: self.fb.declare_var(Type::I32),
+                data: self.fb.declare_var(PTR),
+                len: self.fb.declare_var(PTR),
+                epoch: self.fb.declare_var(Type::I32),
+            };
+            let (zp, z32) = (self.ptrc(0), self.i32c(0));
+            for (v, z) in [(t.obj, zp), (t.ok, z32), (t.data, zp), (t.len, zp), (t.epoch, z32)] {
+                self.fb.def_var(v, z);
+            }
+            self.dv_vars.insert(pc, t);
+        }
+        for pc in self.header..=self.backedge {
+            let n = match self.ops[pc] {
+                Op::GetProp(n, _) | Op::GetPropThis(n, _) | Op::GetPropLocal(_, n, _) => n,
+                _ => continue,
+            };
+            if self.chunk.names.get(n as usize).is_none_or(|x| &**x != "byteLength") {
+                continue;
+            }
+            let t = DvVars {
+                obj: self.fb.declare_var(PTR),
+                ok: self.fb.declare_var(Type::I32),
+                data: self.fb.declare_var(PTR),
+                len: self.fb.declare_var(PTR),
+                epoch: self.fb.declare_var(Type::I32),
+            };
+            let lv = self.fb.declare_var(Type::F64);
+            let (zp, z32, zf) = (self.ptrc(0), self.i32c(0), self.fb.f64const(0.0));
+            for (v, z) in [(t.obj, zp), (t.ok, z32), (t.epoch, z32)] {
+                self.fb.def_var(v, z);
+            }
+            self.fb.def_var(lv, zf);
+            self.bl_vars.insert(pc, (t, lv));
+        }
         let mut pushes: Vec<usize> = self.plan.arrm.keys().copied().collect();
         pushes.sort_unstable();
         for pc in pushes {
@@ -3428,8 +3565,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         if let Some((&g, &(_, cell))) = self.plan.strn.iter().find(|(_, v)| v.0 == pc) {
             return self.strn_call(pc, g, cell, Helper::StrMethod);
         }
-        if self.plan.colm.contains_key(&pc) {
+        if self.plan.colm.contains_key(&pc) || self.plan.dvm.contains_key(&pc) {
             return self.colm_begin(pc);
+        }
+        if let Some((&g, &(_, cell))) = self.plan.dvm.iter().find(|(_, v)| v.0 == pc) {
+            return self.dv_call(pc, g, cell);
         }
         if let Some((&g, &(_, cell))) = self.plan.colm.iter().find(|(_, v)| v.0 == pc) {
             return self.strn_call(pc, g, cell, Helper::CollMethod);
@@ -5717,6 +5857,316 @@ impl<'a, 'f> Tr<'a, 'f> {
         Ok(())
     }
 
+    // ---- DataView get/set ----------------------------------------------------------------------
+
+    /// The instruction defining `v`, when it is an instruction result.
+    fn def_data(&self, v: V) -> Option<lumen_codegen::InstData> {
+        let f = &*self.fb.func;
+        match f.values[f.resolve(v).index()].def {
+            lumen_codegen::ValueDef::Result(inst, 0) => Some(f.inst(inst).clone()),
+            _ => None,
+        }
+    }
+
+    /// The I32 `x` when F64 `v` is `x` converted (then ToInt32(v) is `x`).
+    fn int32_of(&self, v: V) -> Option<V> {
+        match self.def_data(v)? {
+            lumen_codegen::InstData::Convert { op: ConvOp::FromSint, arg, .. }
+                if self.fb.func.value_type(arg) == Type::I32 =>
+            {
+                Some(arg)
+            }
+            _ => None,
+        }
+    }
+
+    /// ToInt32 of F64 `v`, reusing the integer it was converted from.
+    fn to_int32_fast(&mut self, v: V) -> V {
+        match self.int32_of(v) {
+            Some(x) => x,
+            None => self.to_int32(v),
+        }
+    }
+
+    /// Reverse the bytes of the low `bytes` (2, 4 or 8) bytes of `x` (I32, or I64 for 8); for 2
+    /// the result is zero-extended.
+    fn bswap(&mut self, x: V, bytes: u32) -> V {
+        let ty = if bytes == 8 { Type::I64 } else { Type::I32 };
+        let c = |t: &mut Self, v: i64| t.fb.iconst(ty, v);
+        if bytes == 2 {
+            let (s8, ff) = (c(self, 8), c(self, 0xff));
+            let hi = self.fb.binary(BinaryOp::Ushr, x, s8);
+            let hi = self.fb.binary(BinaryOp::Band, hi, ff);
+            let lo = self.fb.binary(BinaryOp::Band, x, ff);
+            let lo = self.fb.binary(BinaryOp::Ishl, lo, s8);
+            return self.fb.binary(BinaryOp::Bor, hi, lo);
+        }
+        // Swap the bytes of each 16-bit lane, then (for 8) the lanes of each 32-bit half, then
+        // rotate the halves into place.
+        let lanes = |t: &mut Self, x: V, sh: i64, mask: i64| {
+            let (s, m) = (c(t, sh), c(t, mask));
+            let a = t.fb.binary(BinaryOp::Ushr, x, s);
+            let a = t.fb.binary(BinaryOp::Band, a, m);
+            let b = t.fb.binary(BinaryOp::Band, x, m);
+            let b = t.fb.binary(BinaryOp::Ishl, b, s);
+            t.fb.binary(BinaryOp::Bor, a, b)
+        };
+        if bytes == 4 {
+            let y = lanes(self, x, 8, 0x00ff_00ff);
+            let r = c(self, 16);
+            return self.fb.binary(BinaryOp::Rotl, y, r);
+        }
+        let y = lanes(self, x, 8, 0x00ff_00ff_00ff_00ff);
+        let y = lanes(self, y, 16, 0x0000_ffff_0000_ffff);
+        let r = c(self, 32);
+        self.fb.binary(BinaryOp::Rotl, y, r)
+    }
+
+    /// `x` in the byte order `little` asks for (a constant I32 0/1 picks statically; absent is
+    /// big-endian).
+    fn dv_order(&mut self, x: V, bytes: u32, little: Option<V>) -> V {
+        if bytes == 1 {
+            return x;
+        }
+        let known = match little {
+            None => Some(false),
+            Some(l) => match self.def_data(l) {
+                Some(lumen_codegen::InstData::Iconst { imm, .. }) => Some(imm != 0),
+                _ => None,
+            },
+        };
+        match known {
+            Some(true) => x,
+            Some(false) => self.bswap(x, bytes),
+            None => {
+                let sw = self.bswap(x, bytes);
+                self.fb.select(little.expect("dynamic order"), x, sw)
+            }
+        }
+    }
+
+    /// The `CallWithThis` of a fused DataView method site (see [`Plan::dvm`]): with a Number
+    /// offset (and value), and a Boolean / Number / absent `littleEndian`, a DataView reading
+    /// the intrinsic method ([`Helper::DvView`], cached per site until JS runs or a collection)
+    /// with the access in bounds loads or stores inline; everything else (including every
+    /// throwing case) makes the call through [`Helper::CollMethod`].
+    fn dv_call(&mut self, pc: usize, get: usize, cell: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        let Op::CallWithThis(argc) = self.ops[pc] else {
+            return Err(format!("no call for the DataView site at {pc}"));
+        };
+        let argc = argc as usize;
+        let Op::GetMethod(m, _) = self.ops[get] else {
+            return Err(format!("no GetMethod for the DataView site at {pc}"));
+        };
+        let Some((kind, set)) = self
+            .chunk
+            .names
+            .get(m as usize)
+            .and_then(|n| crate::builtins::dataview::dv_inline_method(n))
+        else {
+            return Err(format!("not a DataView method at {get}"));
+        };
+        let base = d - argc - 2;
+        let args = self.stack[base + 2..].to_vec();
+        let li = if set { 2 } else { 1 };
+        let fast = matches!(args[0], Entry::Num(_))
+            && (!set || matches!(args.get(1), Some(Entry::Num(_))))
+            && matches!(args.get(li), None | Some(Entry::Num(_) | Entry::Bool(_)));
+        let t = match self.dv_vars.get(&pc).copied() {
+            Some(t) if fast => t,
+            _ => return self.strn_call(pc, get, cell, Helper::CollMethod),
+        };
+        let Entry::Num(off) = args[0] else {
+            return Err(format!("DataView offset at {pc}"));
+        };
+        let val = match args.get(1) {
+            Some(&Entry::Num(v)) if set => Some(v),
+            _ => None,
+        };
+        let little = match args.get(li) {
+            Some(&Entry::Bool(b)) => Some(b),
+            Some(&Entry::Num(n)) => {
+                let z = self.fb.f64const(0.0);
+                let nz = self.fb.fcmp(FloatCC::Ne, n, z);
+                let ord = self.fb.fcmp(FloatCC::Eq, n, n);
+                Some(self.fb.binary(BinaryOp::Band, nz, ord))
+            }
+            _ => None,
+        };
+        let want = !set && self.want_num(pc, base);
+        let pre = self.stack.clone();
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let param = want.then(|| self.fb.append_block_param(join, Type::F64));
+
+        // The view: cached for this receiver, or fresh.
+        let recv = self.sptr(base);
+        let gc = self.fb.load(PTR_MEM, recv, VALUE_PAYLOAD);
+        let epa = self.ptrc(&crate::interpreter::GC_EPOCH as *const _ as i64);
+        let ep = self.fb.load(MemKind::I32, epa, 0);
+        let have = self.fb.create_block();
+        let hd = self.fb.append_block_param(have, PTR);
+        let hl = self.fb.append_block_param(have, PTR);
+        let refresh = self.fb.create_block();
+        {
+            let (ok, co, ce, cd, cl) = (
+                self.fb.use_var(t.ok),
+                self.fb.use_var(t.obj),
+                self.fb.use_var(t.epoch),
+                self.fb.use_var(t.data),
+                self.fb.use_var(t.len),
+            );
+            let same = self.fb.icmp(IntCC::Eq, gc, co);
+            let same_ep = self.fb.icmp(IntCC::Eq, ep, ce);
+            let hit = self.fb.binary(BinaryOp::Band, ok, same);
+            let hit = self.fb.binary(BinaryOp::Band, hit, same_ep);
+            self.fb.brif(hit, have, &[cd, cl], refresh, &[]);
+        }
+        self.fb.seal_block(refresh);
+        self.fb.switch_to_block(refresh);
+        let gv = self.i32c(get as i64);
+        let r = self
+            .call(Helper::DvView, &[self.frame, recv, gv])
+            .expect("DvView returns a flag");
+        let data = self.fb.load(PTR_MEM, self.frame, FRAME_TA_DATA);
+        let len = self.fb.load(PTR_MEM, self.frame, FRAME_TA_LEN);
+        self.fb.def_var(t.ok, r);
+        self.fb.def_var(t.obj, gc);
+        self.fb.def_var(t.epoch, ep);
+        self.fb.def_var(t.data, data);
+        self.fb.def_var(t.len, len);
+        let z = self.i32c(0);
+        let none = self.fb.icmp(IntCC::Eq, r, z);
+        self.fb.brif(none, slow, &[], have, &[data, len]);
+        self.fb.seal_block(have);
+        self.fb.switch_to_block(have);
+
+        // An integer offset with the element inside the view (a negative one wraps above).
+        let es = kind.elsize() as i64;
+        let i = self.to_index(off);
+        let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
+        let exact = self.fb.fcmp(FloatCC::Eq, back, off);
+        let esc = self.ptrc(es);
+        let fits = self.fb.icmp(IntCC::Uge, hl, esc);
+        let lim = self.fb.binary(BinaryOp::Isub, hl, esc);
+        let inb = self.fb.icmp(IntCC::Ule, i, lim);
+        let ok = self.fb.binary(BinaryOp::Band, exact, fits);
+        let ok = self.fb.binary(BinaryOp::Band, ok, inb);
+        let go = self.fb.create_block();
+        self.fb.brif(ok, go, &[], slow, &[]);
+        self.fb.seal_block(go);
+        self.fb.switch_to_block(go);
+        let at = self.fb.binary(BinaryOp::Iadd, hd, i);
+        use crate::value::TaKind as K;
+        let bytes = es as u32;
+        match val {
+            None => {
+                let x = match kind {
+                    K::I8 => {
+                        let x = self.fb.load(MemKind::I32S8, at, 0);
+                        self.fb.convert(ConvOp::FromSint, Type::F64, x)
+                    }
+                    K::U8 => {
+                        let x = self.fb.load(MemKind::I32U8, at, 0);
+                        self.fb.convert(ConvOp::FromSint, Type::F64, x)
+                    }
+                    K::I16 | K::U16 => {
+                        let x = self.fb.load(MemKind::I32U16, at, 0);
+                        let x = self.dv_order(x, 2, little);
+                        let x = if kind == K::I16 { self.fb.unary(UnaryOp::Sext16, x) } else { x };
+                        self.fb.convert(ConvOp::FromSint, Type::F64, x)
+                    }
+                    K::I32 => {
+                        let x = self.fb.load(MemKind::I32, at, 0);
+                        let x = self.dv_order(x, 4, little);
+                        self.fb.convert(ConvOp::FromSint, Type::F64, x)
+                    }
+                    K::U32 => {
+                        let x = self.fb.load(MemKind::I32, at, 0);
+                        let x = self.dv_order(x, 4, little);
+                        let x = self.fb.convert(ConvOp::Uext, Type::I64, x);
+                        self.fb.convert(ConvOp::FromSint, Type::F64, x)
+                    }
+                    K::F32 => {
+                        let x = self.fb.load(MemKind::I32, at, 0);
+                        let x = self.dv_order(x, 4, little);
+                        let x = self.fb.convert(ConvOp::Bitcast, Type::F32, x);
+                        self.fb.convert(ConvOp::Promote, Type::F64, x)
+                    }
+                    _ => {
+                        let x = self.fb.load(MemKind::I64, at, 0);
+                        let x = self.dv_order(x, 8, little);
+                        self.fb.convert(ConvOp::Bitcast, Type::F64, x)
+                    }
+                };
+                self.drop_at(base);
+                match param {
+                    Some(_) => self.fb.jump(join, &[x]),
+                    None => {
+                        self.store_entry(base, Entry::Num(x));
+                        self.fb.jump(join, &[]);
+                    }
+                }
+            }
+            Some(v) => {
+                match kind {
+                    K::F32 => {
+                        let x = self.fb.convert(ConvOp::Demote, Type::F32, v);
+                        let x = self.fb.convert(ConvOp::Bitcast, Type::I32, x);
+                        let x = self.dv_order(x, 4, little);
+                        self.fb.store(MemKind::I32, at, x, 0);
+                    }
+                    K::F64 => {
+                        let x = self.fb.convert(ConvOp::Bitcast, Type::I64, v);
+                        let x = self.dv_order(x, 8, little);
+                        self.fb.store(MemKind::I64, at, x, 0);
+                    }
+                    _ => {
+                        let x = self.to_int32_fast(v);
+                        let x = self.dv_order(x, bytes, little);
+                        let mk = match bytes {
+                            1 => MemKind::I32U8,
+                            2 => MemKind::I32U16,
+                            _ => MemKind::I32,
+                        };
+                        self.fb.store(mk, at, x, 0);
+                    }
+                }
+                self.drop_at(base);
+                self.fb.jump(join, &[]);
+            }
+        }
+
+        // The call.
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        self.stack = pre.clone();
+        self.box_from(base);
+        let (gv, bv, av) = (
+            self.i32c(get as i64),
+            self.i32c(base as i64),
+            self.i32c(argc as i64),
+        );
+        let cv = self.ptrc(cell as i64);
+        self.set_call_site(pc);
+        let st = self.call_js(Helper::CollMethod, &[self.frame, gv, bv, av, cv]);
+        let below = self.stack[..base].to_vec();
+        self.throw_if(st, pc, &below, base);
+        self.stack.truncate(base);
+        self.stack.push(Entry::Boxed);
+        self.slow_to_join(pc, base, want, join);
+
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack = pre[..base].to_vec();
+        self.stack.push(match param {
+            Some(p) => Entry::Num(p),
+            None => Entry::Boxed,
+        });
+        Ok(())
+    }
+
     // ---- Array.prototype.push ----------------------------------------------------------------
 
     /// The `GetMethod(push)` of an inline push site: [`Helper::ArrPushGuard`] proves the
@@ -7340,6 +7790,89 @@ impl<'a, 'f> Tr<'a, 'f> {
         })
     }
 
+    /// `obj.byteLength` with the result at `at`: the intrinsic ArrayBuffer / DataView getter's
+    /// result ([`Helper::ByteLength`]), cached per site until JS runs or a collection (only JS
+    /// can resize, transfer or detach a buffer or change a prototype chain); else the slow path.
+    #[allow(clippy::too_many_arguments)]
+    fn byte_len_read(
+        &mut self,
+        pc: usize,
+        obj: V,
+        drop: Option<usize>,
+        at: usize,
+        slow: Slow,
+        t: DvVars,
+        lv: Variable,
+    ) -> Result<(), String> {
+        let want = self.want_num(pc, at);
+        let pre = self.stack.clone();
+        let slow_b = self.fb.create_block();
+        let join = self.fb.create_block();
+        let param = want.then(|| self.fb.append_block_param(join, Type::F64));
+        let tag = self.fb.load(MemKind::I32U8, obj, 0);
+        let ot = self.i32c(TAG_OBJ as i64);
+        let is_obj = self.fb.icmp(IntCC::Eq, tag, ot);
+        let cont = self.fb.create_block();
+        self.fb.brif(is_obj, cont, &[], slow_b, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        let gc = self.fb.load(PTR_MEM, obj, VALUE_PAYLOAD);
+        let epa = self.ptrc(&crate::interpreter::GC_EPOCH as *const _ as i64);
+        let ep = self.fb.load(MemKind::I32, epa, 0);
+        let hit_b = self.fb.create_block();
+        let hl = self.fb.append_block_param(hit_b, Type::F64);
+        let refresh = self.fb.create_block();
+        let (ok, co, ce, cl) = (
+            self.fb.use_var(t.ok),
+            self.fb.use_var(t.obj),
+            self.fb.use_var(t.epoch),
+            self.fb.use_var(lv),
+        );
+        let same = self.fb.icmp(IntCC::Eq, gc, co);
+        let same_ep = self.fb.icmp(IntCC::Eq, ep, ce);
+        let hit = self.fb.binary(BinaryOp::Band, ok, same);
+        let hit = self.fb.binary(BinaryOp::Band, hit, same_ep);
+        self.fb.brif(hit, hit_b, &[cl], refresh, &[]);
+        self.fb.seal_block(refresh);
+        self.fb.switch_to_block(refresh);
+        let n = self
+            .call(Helper::ByteLength, &[self.frame, obj])
+            .expect("ByteLength returns a length");
+        let zf = self.fb.f64const(0.0);
+        let got = self.fb.fcmp(FloatCC::Ge, n, zf);
+        self.fb.def_var(t.ok, got);
+        self.fb.def_var(t.obj, gc);
+        self.fb.def_var(t.epoch, ep);
+        self.fb.def_var(lv, n);
+        self.fb.brif(got, hit_b, &[n], slow_b, &[]);
+        self.fb.seal_block(hit_b);
+        self.fb.switch_to_block(hit_b);
+        if let Some(i) = drop {
+            self.drop_at(i);
+        }
+        match param {
+            Some(_) => self.fb.jump(join, &[hl]),
+            None => {
+                self.store_entry(at, Entry::Num(hl));
+                self.fb.jump(join, &[]);
+            }
+        }
+        self.fb.seal_block(slow_b);
+        self.fb.switch_to_block(slow_b);
+        self.stack = pre.clone();
+        if self.slow_path(pc, slow) {
+            self.slow_to_join(pc, at, want, join);
+        }
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack = pre[..at].to_vec();
+        self.stack.push(match param {
+            Some(p) => Entry::Num(p),
+            None => Entry::Boxed,
+        });
+        Ok(())
+    }
+
     /// `obj.<names[n]>` through the site's IC (or `length`) with the result at `at`.
     #[allow(clippy::too_many_arguments)]
     fn prop_read(
@@ -7390,6 +7923,9 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.stack = pre[..at].to_vec();
             self.stack.push(Entry::Boxed);
             return Ok(());
+        }
+        if let Some((t, lv)) = self.bl_vars.get(&pc).copied() {
+            return self.byte_len_read(pc, obj, drop, at, slow, t, lv);
         }
         let is_len = &*self.chunk.names[n as usize] == "length";
         let ic = if is_len {

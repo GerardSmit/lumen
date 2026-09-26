@@ -290,6 +290,24 @@ fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
     (Value::Obj(obj), p)
 }
 
+/// `get ArrayBuffer.prototype.byteLength`.
+pub(crate) fn ab_bytelength_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
+    if let Value::Obj(o) = &this {
+        if i.shared_buffers.contains_key(&(Gc::as_ptr(o) as usize)) {
+            return Err(i.make_error("TypeError", "requires a non-shared ArrayBuffer"));
+        }
+    }
+    let p = this
+        .as_obj()
+        .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
+        .map(|o| Gc::as_ptr(o) as usize)
+        .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
+    // Detached (absent from the side table) → 0.
+    Ok(Value::Num(
+        i.array_buffers.get(&p).map(|b| b.len()).unwrap_or(0) as f64,
+    ))
+}
+
 pub(super) fn install_array_buffer(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
     it.extra_protos.insert("ArrayBuffer", proto.clone());
@@ -312,18 +330,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             Property::accessor_prop(Some(Value::Obj(g)), None, false, true),
         );
     };
-    ab_getter(it, &proto, "byteLength", |i, this, _| {
-        reject_shared_buffer(i, &this)?;
-        let p = this
-            .as_obj()
-            .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
-            .map(|o| Gc::as_ptr(o) as usize)
-            .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
-        // Detached (absent from the side table) → 0.
-        Ok(Value::Num(
-            i.array_buffers.get(&p).map(|b| b.len()).unwrap_or(0) as f64,
-        ))
-    });
+    ab_getter(it, &proto, "byteLength", ab_bytelength_get);
     ab_getter(it, &proto, "maxByteLength", |i, this, _| {
         reject_shared_buffer(i, &this)?;
         match this.as_obj().and_then(|o| {

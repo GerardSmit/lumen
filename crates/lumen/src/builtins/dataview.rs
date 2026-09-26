@@ -210,6 +210,167 @@ fn dv_set_big(i: &mut Interp, this: &Value, args: &[Value]) -> Result<Value, Val
     Ok(Value::Undefined)
 }
 
+macro_rules! dv_natives {
+    ($(($get:ident, $set:ident, $kind:expr)),* $(,)?) => {
+        $(
+            fn $get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+                dv_get(i, &this, a, $kind)
+            }
+            fn $set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+                dv_set(i, &this, a, $kind)
+            }
+        )*
+    };
+}
+dv_natives!(
+    (dv_get_i8, dv_set_i8, TaKind::I8),
+    (dv_get_u8, dv_set_u8, TaKind::U8),
+    (dv_get_i16, dv_set_i16, TaKind::I16),
+    (dv_get_u16, dv_set_u16, TaKind::U16),
+    (dv_get_i32, dv_set_i32, TaKind::I32),
+    (dv_get_u32, dv_set_u32, TaKind::U32),
+    (dv_get_f32, dv_set_f32, TaKind::F32),
+    (dv_get_f64, dv_set_f64, TaKind::F64),
+);
+
+/// The `DataView.prototype` get/set methods compiled code runs inline (every numeric kind but
+/// Float16): name, native code, element kind, whether it stores.
+const DV_METHODS: &[(&str, crate::value::NativeFn, TaKind, bool)] = &[
+    ("getInt8", dv_get_i8, TaKind::I8, false),
+    ("setInt8", dv_set_i8, TaKind::I8, true),
+    ("getUint8", dv_get_u8, TaKind::U8, false),
+    ("setUint8", dv_set_u8, TaKind::U8, true),
+    ("getInt16", dv_get_i16, TaKind::I16, false),
+    ("setInt16", dv_set_i16, TaKind::I16, true),
+    ("getUint16", dv_get_u16, TaKind::U16, false),
+    ("setUint16", dv_set_u16, TaKind::U16, true),
+    ("getInt32", dv_get_i32, TaKind::I32, false),
+    ("setInt32", dv_set_i32, TaKind::I32, true),
+    ("getUint32", dv_get_u32, TaKind::U32, false),
+    ("setUint32", dv_set_u32, TaKind::U32, true),
+    ("getFloat32", dv_get_f32, TaKind::F32, false),
+    ("setFloat32", dv_set_f32, TaKind::F32, true),
+    ("getFloat64", dv_get_f64, TaKind::F64, false),
+    ("setFloat64", dv_set_f64, TaKind::F64, true),
+];
+
+/// For a method name compiled code may run inline (see [`DV_METHODS`]): its element kind and
+/// whether it stores.
+pub(crate) fn dv_inline_method(name: &str) -> Option<(TaKind, bool)> {
+    DV_METHODS
+        .iter()
+        .find(|m| m.0 == name)
+        .map(|&(_, _, k, set)| (k, set))
+}
+
+/// The bytes compiled code may access for `obj.<name>(...)` where `name` is one of
+/// [`DV_METHODS`]: when `obj` is a DataView over an unshared (for a store, also mutable),
+/// attached buffer, in bounds, and reading `name` on it finds the intrinsic method as a plain
+/// data property of an ordinary prototype (none on `obj` itself) in a one-realm engine — then
+/// calling the method with a Number offset in bounds (and a Number value) is exactly a load or
+/// store at the view. Returns the address of the view's byte 0 and its byte length. Pure. The
+/// view stays valid until JS runs (only JS can detach, resize or transfer the buffer, or change
+/// the prototype chain) or the object is collected.
+pub(crate) fn dv_jit_view(i: &mut Interp, obj: &Gc, name: &str) -> Option<(*mut u8, usize)> {
+    if i.multi_realm() {
+        return None;
+    }
+    let &(_, want, _, set) = DV_METHODS.iter().find(|m| m.0 == name)?;
+    let &(buf, off, len, track) = i.data_views.get(&(Gc::as_ptr(obj) as usize))?;
+    if !i.shared_buffers.is_empty() && i.shared_buffers.contains_key(&buf) {
+        return None;
+    }
+    if set && !i.immutable_buffers.is_empty() && i.immutable_buffers.contains(&buf) {
+        return None;
+    }
+    // The method: an inherited data property holding the intrinsic native.
+    let mut cur = obj.clone();
+    let mut own = true;
+    loop {
+        let next = {
+            let b = cur.try_borrow().ok()?;
+            if !matches!(b.exotic, crate::value::Exotic::None) {
+                return None;
+            }
+            if let Some(k) = b.props.slot_of(name) {
+                if own {
+                    return None;
+                }
+                let p = b.props.entry_at(k)?;
+                if p.accessor() {
+                    return None;
+                }
+                let Value::Obj(fo) = p.value() else { return None };
+                let fb = fo.try_borrow().ok()?;
+                match fb.call {
+                    crate::value::Callable::Native(fp) if fp as usize == want as usize => break,
+                    _ => return None,
+                }
+            }
+            b.proto.clone()?
+        };
+        cur = next;
+        own = false;
+    }
+    let vlen = dv_view_len(i, buf, off, len, track)?;
+    let bytes: &mut [u8] = i.array_buffers.get_mut(&buf)?;
+    if off.checked_add(vlen).is_none_or(|e| e > bytes.len()) {
+        return None;
+    }
+    // SAFETY: `off + vlen <= bytes.len()`.
+    Some((unsafe { bytes.as_mut_ptr().add(off) }, vlen))
+}
+
+/// `obj.byteLength` without running JS, when reading it calls the intrinsic ArrayBuffer or
+/// DataView getter (an inherited accessor of an ordinary prototype chain, none on `obj` itself,
+/// in a one-realm engine) and that getter returns without throwing. Pure. Only JS can change the
+/// result (resize, transfer, detach, or a prototype change).
+pub(crate) fn jit_byte_length(i: &Interp, obj: &Gc) -> Option<usize> {
+    if i.multi_realm() {
+        return None;
+    }
+    let mut cur = obj.clone();
+    let mut own = true;
+    let fp = loop {
+        let next = {
+            let b = cur.try_borrow().ok()?;
+            if !matches!(b.exotic, crate::value::Exotic::None) {
+                return None;
+            }
+            if let Some(k) = b.props.slot_of("byteLength") {
+                if own {
+                    return None;
+                }
+                let p = b.props.entry_at(k)?;
+                if !p.accessor() {
+                    return None;
+                }
+                let Some(Value::Obj(g)) = p.getter() else { return None };
+                let gb = g.try_borrow().ok()?;
+                match gb.call {
+                    crate::value::Callable::Native(fp) => break fp as usize,
+                    _ => return None,
+                }
+            }
+            b.proto.clone()?
+        };
+        cur = next;
+        own = false;
+    };
+    let p = Gc::as_ptr(obj) as usize;
+    if fp == super::typedarray::ab_bytelength_get as usize {
+        if i.shared_buffers.contains_key(&p) || !obj.try_borrow().ok()?.props.contains("__abMaxByteLength") {
+            return None;
+        }
+        Some(i.array_buffers.get(&p).map_or(0, |b| b.len()))
+    } else if fp == dv_bytelength_get as usize {
+        let &(buf, off, len, track) = i.data_views.get(&p)?;
+        dv_view_len(i, buf, off, len, track)
+    } else {
+        None
+    }
+}
+
 pub(super) fn install_dataview(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
     it.extra_protos.insert("DataView", proto.clone());
@@ -231,21 +392,11 @@ pub(super) fn install_dataview(it: &mut Interp) {
     }
     // DataView.prototype[@@toStringTag] = "DataView" (non-writable, non-enumerable, configurable).
     set_to_string_tag(it, &proto, "DataView");
-    macro_rules! dvm {
-        ($getname:expr, $setname:expr, $kind:expr) => {
-            it.def_method(&proto, $getname, 1, |i, this, a| dv_get(i, &this, a, $kind));
-            it.def_method(&proto, $setname, 2, |i, this, a| dv_set(i, &this, a, $kind));
-        };
+    for &(name, f, _, set) in DV_METHODS {
+        it.def_method(&proto, name, if set { 2 } else { 1 }, f);
     }
-    dvm!("getInt8", "setInt8", TaKind::I8);
-    dvm!("getUint8", "setUint8", TaKind::U8);
-    dvm!("getInt16", "setInt16", TaKind::I16);
-    dvm!("getUint16", "setUint16", TaKind::U16);
-    dvm!("getInt32", "setInt32", TaKind::I32);
-    dvm!("getUint32", "setUint32", TaKind::U32);
-    dvm!("getFloat16", "setFloat16", TaKind::F16);
-    dvm!("getFloat32", "setFloat32", TaKind::F32);
-    dvm!("getFloat64", "setFloat64", TaKind::F64);
+    it.def_method(&proto, "getFloat16", 1, |i, this, a| dv_get(i, &this, a, TaKind::F16));
+    it.def_method(&proto, "setFloat16", 2, |i, this, a| dv_set(i, &this, a, TaKind::F16));
     it.def_method(&proto, "getBigInt64", 1, |i, this, a| {
         dv_get_big(i, &this, a, true)
     });

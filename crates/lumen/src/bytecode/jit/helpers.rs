@@ -298,12 +298,21 @@ pub(crate) enum Helper {
     /// `(frame, base: u32, argc: u32, flags: u32) -> status` — `CallSpread(argc)` /
     /// `CallSpreadThis(argc)`, laid out as [`Helper::Call`]'s with the last argument spread.
     CallSpread,
+    /// `(frame, v: *const Value, pc: u32) -> u32` — 1 when the fused DataView method site whose
+    /// `GetMethod` is at `pc` may access `*v`'s bytes directly (see
+    /// `builtins::dataview::dv_jit_view`), with the view's byte 0 address in `frame.ta_data`
+    /// and its byte length in `frame.ta_len`; else 0. Pure.
+    DvView,
+    /// `(frame, v: *const Value) -> f64` — `v.byteLength` when that read calls the intrinsic
+    /// ArrayBuffer or DataView getter and it returns (see
+    /// `builtins::dataview::jit_byte_length`); else -1. Pure.
+    ByteLength,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 77] = [
+pub(crate) const ALL: [Helper; 79] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -381,6 +390,8 @@ pub(crate) const ALL: [Helper; 77] = [
     Helper::DropEnv,
     Helper::CollMethod,
     Helper::CallSpread,
+    Helper::DvView,
+    Helper::ByteLength,
 ];
 
 /// The IR signature of `h`.
@@ -460,6 +471,8 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::DropEnv => (&[P], &[]),
         Helper::CollMethod => (&[P, I32, I32, I32, P], &[I32]),
         Helper::CallSpread => (&[P, I32, I32, I32], &[I32]),
+        Helper::DvView => (&[P, P, I32], &[I32]),
+        Helper::ByteLength => (&[P, P], &[F64]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -545,6 +558,8 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::DropEnv => drop_env as *const () as usize,
         Helper::CollMethod => coll_method as *const () as usize,
         Helper::CallSpread => call_spread as *const () as usize,
+        Helper::DvView => dv_view as *const () as usize,
+        Helper::ByteLength => byte_length as *const () as usize,
     } as u64)
 }
 
@@ -2768,6 +2783,31 @@ unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
     (*f).ta_data = bytes.as_mut_ptr().add(info.offset);
     (*f).ta_len = len;
     code
+}
+
+pub(crate) unsafe extern "C" fn dv_view(f: *mut JitFrame, v: *const Value, pc: u32) -> u32 {
+    let Value::Obj(o) = &*v else { return 0 };
+    let chunk = &*(*f).chunk;
+    let Some(Op::GetMethod(n, _)) = chunk.ops.get(pc as usize).copied() else {
+        return 0;
+    };
+    let Some(name) = chunk.names.get(n as usize) else { return 0 };
+    match crate::builtins::dataview::dv_jit_view(&mut *(*f).interp, o, name) {
+        Some((data, len)) => {
+            (*f).ta_data = data;
+            (*f).ta_len = len;
+            1
+        }
+        None => 0,
+    }
+}
+
+pub(crate) unsafe extern "C" fn byte_length(f: *mut JitFrame, v: *const Value) -> f64 {
+    let Value::Obj(o) = &*v else { return -1.0 };
+    match crate::builtins::dataview::jit_byte_length(&*(*f).interp, o) {
+        Some(n) => n as f64,
+        None => -1.0,
+    }
 }
 
 pub(crate) unsafe extern "C" fn ta_length(f: *mut JitFrame, v: *const Value) -> f64 {
