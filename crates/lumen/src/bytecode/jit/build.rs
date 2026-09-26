@@ -4695,6 +4695,26 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.call(Helper::CapPtr, &[self.frame, nv])
                     .expect("CapPtr returns an address")
             }
+            Src::Glob(n) if cache.is_some() => {
+                let slow = self.fb.create_block();
+                let join = self.fb.create_block();
+                let pv = self.fb.append_block_param(join, PTR);
+                match self.glob_entry(cache.unwrap_or(0), slow) {
+                    Some(p) => self.fb.jump(join, &[p]),
+                    None => self.fb.jump(slow, &[]),
+                }
+                self.fb.seal_block(slow);
+                self.fb.switch_to_block(slow);
+                let nv = self.i32c(n as i64);
+                let cv = self.i32c(cache.unwrap_or(u32::MAX) as i64);
+                let p = self
+                    .call(Helper::GlobPtr, &[self.frame, nv, cv])
+                    .expect("returns an address");
+                self.fb.jump(join, &[p]);
+                self.fb.seal_block(join);
+                self.fb.switch_to_block(join);
+                pv
+            }
             Src::NameW(n) | Src::Glob(n) => {
                 let h = if matches!(src, Src::Glob(_)) {
                     Helper::GlobPtr
@@ -5256,6 +5276,11 @@ impl<'a, 'f> Tr<'a, 'f> {
     ) -> Result<(), String> {
         let d = self.stack.len();
         let base = d - pops;
+        // A creation site moves the value into the new entry: an owned one.
+        let creates = layout::create_ic(self.chunk, c);
+        if !creates.is_empty() {
+            self.force(d - 1);
+        }
         let v = self.stack[d - 1];
         let pre = self.stack.clone();
         let join = self.fb.create_block();
@@ -5271,6 +5296,29 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.seal_current();
             match consume {
                 // A borrowed receiver owns nothing.
+                Some(i) if !matches!(pre[i], Entry::Ref(..)) => self.drop_at(i),
+                _ => {}
+            }
+            self.fb.jump(join, &[]);
+            self.fb.seal_block(miss);
+            self.fb.switch_to_block(miss);
+        }
+        if !creates.is_empty() {
+            self.stack = pre.clone();
+            let miss = self.fb.create_block();
+            let w = match v {
+                Entry::Num(x) => layout::num_word(&mut self.fb, x),
+                Entry::Bool(b) => layout::bool_word(&mut self.fb, b),
+                _ => {
+                    let p = self.sptr(d - 1);
+                    self.value_packed(p)
+                }
+            };
+            layout::prop_create(&mut self.fb, obj, &creates, w, miss);
+            if v == Entry::Boxed {
+                self.set_stack_tag(d - 1, TAG_UNDEFINED);
+            }
+            match consume {
                 Some(i) if !matches!(pre[i], Entry::Ref(..)) => self.drop_at(i),
                 _ => {}
             }

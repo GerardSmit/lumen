@@ -762,6 +762,9 @@ fn emit(
         let bytes = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem.len()) };
         let _ = std::fs::write(path, bytes);
     }
+    if stats_enabled() {
+        eprintln!("[jit-stats]   code {:#x} {} bytes", mem.as_ptr() as usize, mem.len());
+    }
     // SAFETY: the code was generated for exactly this signature.
     let entry = unsafe { std::mem::transmute::<usize, NativeFn>(addrs[0] as usize) };
     Ok((Box::new(mem), entry))

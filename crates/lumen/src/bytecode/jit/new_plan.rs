@@ -141,7 +141,7 @@ const _: () = assert!(
 
 impl Tr<'_, '_> {
     /// The NaN-boxed word of the `Value` at `p` (ownership moves to the word).
-    fn value_packed(&mut self, p: V) -> V {
+    pub(super) fn value_packed(&mut self, p: V) -> V {
         let tag = self.fb.load(MemKind::I32U8, p, 0);
         // (A handle is pointer-sized: only its bytes are the payload.)
         let pl = self.fb.load(PTR_MEM, p, VALUE_PAYLOAD);

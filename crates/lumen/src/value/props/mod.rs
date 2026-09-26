@@ -17,6 +17,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 pub(crate) use shapes::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
+pub(crate) use shapes::{jit_shared_shape, proto_epoch_addr};
 pub(in crate::value) use shapes::{array_length_shape, Shape, ShapeTable};
 /// Sizes for a heap census (`LUMEN_HEAP_CENSUS`): entries used / reserved, how many of them are
 /// named (shape-keyed), whether a dense sidecar exists, and whether the shape is owned by this
@@ -133,12 +134,18 @@ pub(crate) struct PropsLayout {
     pub entries_ptr: usize,
     pub entries_len: usize,
     pub entries_cap: usize,
+    /// The capacity word's slot-count bits (the rest flag inline storage).
+    pub cap_slots: u32,
     /// The `u32` shape id.
     pub shape: usize,
     /// `Option<Rc<Shape>>`: one word, null = the empty shape.
     pub shape_rc: usize,
     /// From the `Rc<Shape>` handle word to the shape's `u32` `len_slot` memo.
     pub shape_len_slot: usize,
+    /// From the `Rc<Shape>` handle word to its strong count (a `usize`).
+    pub shape_strong: usize,
+    /// The `bool` byte `proto_flag`.
+    pub proto_flag: usize,
     /// The sidecar: one word, null = no `DenseBuffers`.
     pub elems: usize,
     /// `Option<Box<PackedVec>>`: one word, null = not boxed-packed.
@@ -178,13 +185,32 @@ pub(crate) fn jit_props_layout() -> Option<PropsLayout> {
     if shape_len_slot > 4096 {
         return None;
     }
+    // The strong count: the one word before the value that follows a clone.
+    let shape_strong = {
+        let read = |o: usize| unsafe { ((word + o) as *const usize).read() };
+        let value = Rc::as_ptr(rc) as usize - word;
+        let n = Rc::strong_count(rc);
+        let extra = rc.clone();
+        let c: Vec<usize> = (0..value)
+            .step_by(std::mem::size_of::<usize>())
+            .filter(|&o| read(o) == n + 1)
+            .collect();
+        drop(extra);
+        match c[..] {
+            [o] if read(o) == n => o,
+            _ => return None,
+        }
+    };
     Some(PropsLayout {
         entries_ptr: offset_of!(Props, entries) + entries::ENTRY_VEC_PTR,
         entries_len: offset_of!(Props, entries) + entries::ENTRY_VEC_LEN,
         entries_cap: offset_of!(Props, entries) + entries::ENTRY_VEC_CAP,
+        cap_slots: !entries::INLINE_FLAG,
         shape: offset_of!(Props, shape),
         shape_rc: offset_of!(Props, shape_rc),
         shape_len_slot,
+        shape_strong,
+        proto_flag: offset_of!(Props, proto_flag),
         elems: offset_of!(Props, elems),
         dense_packed: offset_of!(storage::DenseBuffers, packed),
         dense_inline_len: offset_of!(storage::DenseBuffers, inline_packed)
