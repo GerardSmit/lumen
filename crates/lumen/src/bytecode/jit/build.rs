@@ -3190,26 +3190,28 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.truthy(Entry::Boxed, idx, true)
             }
             Entry::Ref(p, _) => {
+                let slow = self.fb.create_block();
+                let join = self.fb.create_block();
+                let r = self.fb.append_block_param(join, Type::I32);
+                self.truthy_inline(p, None, join, slow);
+                self.fb.seal_block(slow);
+                self.fb.switch_to_block(slow);
                 let scratch = self.stack.len();
                 let dst = self.sptr(scratch);
                 self.call(Helper::Clone, &[dst, p]);
                 let t = self.call_status(Helper::ToBoolean, &[self.frame, dst]);
-                t
+                self.fb.jump(join, &[t]);
+                self.fb.seal_block(join);
+                self.fb.switch_to_block(join);
+                r
             }
             Entry::Boxed => {
-                let tag = self.stack_tag(idx);
-                let three = self.i32c(TAG_BOOL as i64);
-                let isb = self.fb.icmp(IntCC::Eq, tag, three);
-                let fast = self.fb.create_block();
                 let slow = self.fb.create_block();
                 let join = self.fb.create_block();
                 let r = self.fb.append_block_param(join, Type::I32);
-                self.fb.brif(isb, fast, &[], slow, &[]);
-                self.fb.seal_block(fast);
+                let p = self.sptr(idx);
+                self.truthy_inline(p, consume.then_some(idx), join, slow);
                 self.fb.seal_block(slow);
-                self.fb.switch_to_block(fast);
-                let byte = self.stack_bool(idx);
-                self.fb.jump(join, &[byte]);
                 self.fb.switch_to_block(slow);
                 let p = if consume {
                     self.sptr(idx)
@@ -3224,6 +3226,91 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.seal_block(join);
                 self.fb.switch_to_block(join);
                 r
+            }
+        }
+    }
+
+    /// ToBoolean of the `Value` at `p` for the common kinds, inline: jumps to `join` (an I32
+    /// block parameter) with the truth, or to `slow` (a BigInt, a Symbol, an object whose
+    /// `ic_plain` is clear — which covers the one falsy object, `[[IsHTMLDDA]]`). A reference the
+    /// value holds is released on the way when `drop_idx` names its stack entry. Seals the
+    /// blocks it creates, not `join` / `slow`.
+    fn truthy_inline(&mut self, p: V, drop_idx: Option<usize>, join: Block, slow: Block) {
+        let tag = self.fb.load(MemKind::I32U8, p, 0);
+        let zero = self.i32c(0);
+        let one = self.i32c(1);
+        let test = |tr: &mut Self, t: u8| {
+            let c = tr.i32c(t as i64);
+            tr.fb.icmp(IntCC::Eq, tag, c)
+        };
+        let (b_bool, n1) = (self.fb.create_block(), self.fb.create_block());
+        let isb = test(self, TAG_BOOL);
+        self.fb.brif(isb, b_bool, &[], n1, &[]);
+        self.fb.seal_block(b_bool);
+        self.fb.seal_block(n1);
+        self.fb.switch_to_block(b_bool);
+        let byte = self.fb.load(MemKind::I32U8, p, VALUE_BOOL);
+        self.fb.jump(join, &[byte]);
+
+        self.fb.switch_to_block(n1);
+        let (b_num, n2) = (self.fb.create_block(), self.fb.create_block());
+        let isn = test(self, TAG_NUM);
+        self.fb.brif(isn, b_num, &[], n2, &[]);
+        self.fb.seal_block(b_num);
+        self.fb.seal_block(n2);
+        self.fb.switch_to_block(b_num);
+        let x = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
+        let z = self.fb.f64const(0.0);
+        let nz = self.fb.fcmp(FloatCC::Ne, x, z);
+        let ord = self.fb.fcmp(FloatCC::Eq, x, x);
+        let t = self.fb.binary(BinaryOp::Band, nz, ord);
+        self.fb.jump(join, &[t]);
+
+        self.fb.switch_to_block(n2);
+        let n3 = self.fb.create_block();
+        let isu = test(self, TAG_UNDEFINED);
+        let isl = test(self, TAG_NULL);
+        let nullish = self.fb.binary(BinaryOp::Bor, isu, isl);
+        self.fb.brif(nullish, join, &[zero], n3, &[]);
+        self.fb.seal_block(n3);
+
+        self.fb.switch_to_block(n3);
+        let (b_str, n4) = (self.fb.create_block(), self.fb.create_block());
+        let iss = test(self, TAG_STR);
+        self.fb.brif(iss, b_str, &[], n4, &[]);
+        self.fb.seal_block(b_str);
+        self.fb.seal_block(n4);
+        self.fb.switch_to_block(b_str);
+        let h = self.fb.load(PTR_MEM, p, VALUE_PAYLOAD);
+        let len = self.fb.load(MemKind::I32, h, crate::lstr::LSTR_LEN_OFFSET as i32);
+        let t = self.fb.icmp(IntCC::Ne, len, zero);
+        if let Some(i) = drop_idx {
+            self.drop_at(i);
+            self.set_stack_tag(i, TAG_UNDEFINED);
+        }
+        self.fb.jump(join, &[t]);
+
+        self.fb.switch_to_block(n4);
+        match layout::ic_plain_offset() {
+            Some(off) => {
+                let (b_obj, b_plain) = (self.fb.create_block(), self.fb.create_block());
+                let iso = test(self, TAG_OBJ);
+                self.fb.brif(iso, b_obj, &[], slow, &[]);
+                self.fb.seal_block(b_obj);
+                self.fb.switch_to_block(b_obj);
+                let gc = self.fb.load(PTR_MEM, p, VALUE_PAYLOAD);
+                let plain = self.fb.load(MemKind::I32U8, gc, off);
+                self.fb.brif(plain, b_plain, &[], slow, &[]);
+                self.fb.seal_block(b_plain);
+                self.fb.switch_to_block(b_plain);
+                if let Some(i) = drop_idx {
+                    self.drop_at(i);
+                    self.set_stack_tag(i, TAG_UNDEFINED);
+                }
+                self.fb.jump(join, &[one]);
+            }
+            None => {
+                self.fb.jump(slow, &[]);
             }
         }
     }
@@ -3646,6 +3733,18 @@ impl<'a, 'f> Tr<'a, 'f> {
             | Op::NotEq
             | Op::StrictEq
             | Op::StrictNotEq => self.binop(pc, op)?,
+            // `key in obj`: straight to `Interp::binary` (the generic route runs a one-op VM).
+            Op::GenBin(n) if &*self.chunk.names[n as usize] == "in" => {
+                self.box_from(d - 2);
+                let (pa, pb, pr) = (self.sptr(d - 2), self.sptr(d - 1), self.sptr(d));
+                let code = self.i32c(helpers::BIN_IN as i64);
+                let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
+                let snap = self.stack[..d - 2].to_vec();
+                self.throw_if(st, pc, &snap, d - 2);
+                let r = self.call_status(Helper::ToBoolean, &[self.frame, pr]);
+                self.stack.truncate(d - 2);
+                self.stack.push(Entry::Bool(r));
+            }
             Op::Neg | Op::Plus | Op::BitNot => match self.stack[d - 1] {
                 Entry::Num(x) => {
                     let r = match op {
@@ -3659,6 +3758,27 @@ impl<'a, 'f> Tr<'a, 'f> {
                         }
                     };
                     self.stack[d - 1] = Entry::Num(r);
+                }
+                // `+x` / `-x` of a boxed value: straight to ToNumber / the negation (the generic
+                // route runs a one-op VM). `+x` always yields a Number.
+                _ if matches!(op, Op::Neg | Op::Plus) => {
+                    self.box_from(d - 1);
+                    let plus = matches!(op, Op::Plus);
+                    let code = if plus { helpers::BIN_PLUS } else { helpers::BIN_NEG };
+                    let code = self.i32c(code as i64);
+                    // The result lands in the operand's slot (the helper moves the operand out
+                    // first).
+                    let pa = self.sptr(d - 1);
+                    let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pa, pa]);
+                    let snap = self.stack[..d - 1].to_vec();
+                    self.throw_if(st, pc, &snap, d - 1);
+                    self.stack.truncate(d - 1);
+                    if plus {
+                        let r = self.stack_num(d - 1);
+                        self.stack.push(Entry::Num(r));
+                    } else {
+                        self.stack.push(Entry::Boxed);
+                    }
                 }
                 _ => self.generic(pc),
             },
@@ -4578,7 +4698,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             && &*self.chunk.names[n as usize] != "length"
             && !self.plan.dget.contains_key(&pc)
             && !self.plan.dacc.contains_key(&pc)
-            && layout::prop_ic(self.chunk, c).is_some()
+            && layout::prop_ic(self.chunk, c).is_some_and(|ic| ic.has_own())
     }
 
     /// A property read at `pc`, result at entry `at`, whose one consumer is the plain property
@@ -4824,7 +4944,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let pre = self.stack.clone();
         let join = self.fb.create_block();
         let ic = if matches!(v, Entry::Num(_) | Entry::Boxed) {
-            layout::prop_ic(self.chunk, c)
+            layout::prop_ic(self.chunk, c).filter(|ic| ic.has_own())
         } else {
             None
         };
@@ -6050,6 +6170,40 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(join);
             self.fb.switch_to_block(join);
             res
+        } else if let (Some(neg), Some(p)) = (
+            match kind {
+                CmpKind::EqEq => Some(false),
+                CmpKind::NotEq => Some(true),
+                _ => None,
+            },
+            if self.opnd_nullish(b) {
+                self.opnd_ptr(a)
+            } else if self.opnd_nullish(a) {
+                self.opnd_ptr(b)
+            } else {
+                None
+            },
+        ) {
+            // `x == null` / `x != null` of a memory operand, decided by its tag in place.
+            let join = self.fb.create_block();
+            let res = self.fb.append_block_param(join, Type::I32);
+            let slow = self.fb.create_block();
+            self.nullish_inline(p, neg, None, join, slow);
+            self.fb.seal_block(slow);
+            self.fb.switch_to_block(slow);
+            let d = self.stack.len();
+            self.opnds_to_scratch(pc, a, b);
+            let (pa, pb) = (self.sptr(d), self.sptr(d + 1));
+            let code = self.i32c(bin_code(&cmp_op(kind))? as i64);
+            let pr = self.sptr(d + 2);
+            let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
+            let snap = self.stack.clone();
+            self.throw_if(st, pc, &snap, d);
+            let t = self.call_status(Helper::ToBoolean, &[self.frame, pr]);
+            self.fb.jump(join, &[t]);
+            self.fb.seal_block(join);
+            self.fb.switch_to_block(join);
+            res
         } else {
             let d = self.stack.len();
             self.opnds_to_scratch(pc, a, b);
@@ -6118,12 +6272,143 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.stack.extend([Entry::Boxed, Entry::Boxed]);
             return Ok(r);
         }
+        // `x == null` / `x != null` with the constant pushed right before: decided by the tag
+        // of `x` (the constant owns nothing; `x` is released on the inline paths).
+        let pushed_nullish = pc > 0
+            && !self.is_leader(pc - 1)
+            && match self.ops[pc - 1] {
+                Op::Undef => true,
+                Op::Const(k) => self.opnd_nullish(Opnd::Const(k)),
+                _ => false,
+            };
+        let loose = match kind {
+            CmpKind::EqEq => Some(false),
+            CmpKind::NotEq => Some(true),
+            _ => None,
+        };
+        let (join, res) = match (loose, pushed_nullish) {
+            (Some(neg), true) => {
+                let join = self.fb.create_block();
+                let res = self.fb.append_block_param(join, Type::I32);
+                let slow = self.fb.create_block();
+                self.nullish_inline(pa, neg, Some(d - 2), join, slow);
+                self.fb.seal_block(slow);
+                self.fb.switch_to_block(slow);
+                (Some(join), Some(res))
+            }
+            _ => (None, None),
+        };
+        // Loose equality of two values of one type is strict equality (no conversions).
+        let (join, res) = match loose {
+            Some(neg) => {
+                let (join, res) = match (join, res) {
+                    (Some(j), Some(r)) => (j, r),
+                    _ => {
+                        let j = self.fb.create_block();
+                        let r = self.fb.append_block_param(j, Type::I32);
+                        (j, r)
+                    }
+                };
+                let ta = self.fb.load(MemKind::I32U8, pa, 0);
+                let tb = self.fb.load(MemKind::I32U8, pb, 0);
+                let same = self.fb.icmp(IntCC::Eq, ta, tb);
+                let e = self.i32c(TAG_EMPTY as i64);
+                let real = self.fb.icmp(IntCC::Ne, ta, e);
+                let ok = self.fb.binary(BinaryOp::Band, same, real);
+                let (b_same, b_gen) = (self.fb.create_block(), self.fb.create_block());
+                self.fb.brif(ok, b_same, &[], b_gen, &[]);
+                self.fb.seal_block(b_same);
+                self.fb.seal_block(b_gen);
+                self.fb.switch_to_block(b_same);
+                let sk = if neg { CmpKind::StrictNotEq } else { CmpKind::StrictEq };
+                let r = self.strict_cmp(sk, d - 2, pa, pb).expect("strict kind");
+                self.fb.jump(join, &[r]);
+                self.fb.switch_to_block(b_gen);
+                (Some(join), Some(res))
+            }
+            None => (join, res),
+        };
         let code = self.i32c(bin_code(&cmp_op(kind))? as i64);
         let pr = self.sptr(d);
         let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
         let snap = self.stack[..d - 2].to_vec();
         self.throw_if(st, pc, &snap, d - 2);
-        Ok(self.call_status(Helper::ToBoolean, &[self.frame, pr]))
+        let t = self.call_status(Helper::ToBoolean, &[self.frame, pr]);
+        Ok(match (join, res) {
+            (Some(join), Some(res)) => {
+                self.fb.jump(join, &[t]);
+                self.fb.seal_block(join);
+                self.fb.switch_to_block(join);
+                res
+            }
+            _ => t,
+        })
+    }
+
+    /// Whether operand `o` is the constant `null` or `undefined`.
+    fn opnd_nullish(&self, o: Opnd) -> bool {
+        matches!(o, Opnd::Const(k)
+            if matches!(self.chunk.consts.get(k as usize), Some(Value::Null | Value::Undefined)))
+    }
+
+    /// `v == null` for the `Value` at `p`, inline (negated when `neg`): jumps to `join` (an I32
+    /// block parameter) with the result for `undefined`, `null`, the primitives and an object
+    /// with `ic_plain` set, or to `slow` (a TDZ marker, or an object that might be
+    /// `[[IsHTMLDDA]]`). When `drop_idx` names the stack entry at `p`, the value is released on
+    /// the inline paths. Seals the blocks it creates, not `join` / `slow`.
+    fn nullish_inline(&mut self, p: V, neg: bool, drop_idx: Option<usize>, join: Block, slow: Block) {
+        let tag = self.fb.load(MemKind::I32U8, p, 0);
+        let yes = self.i32c(!neg as i64);
+        let no = self.i32c(neg as i64);
+        let u = self.i32c(TAG_UNDEFINED as i64);
+        let nl = self.i32c(TAG_NULL as i64);
+        let isu = self.fb.icmp(IntCC::Eq, tag, u);
+        let isl = self.fb.icmp(IntCC::Eq, tag, nl);
+        let nullish = self.fb.binary(BinaryOp::Bor, isu, isl);
+        let n1 = self.fb.create_block();
+        self.fb.brif(nullish, join, &[yes], n1, &[]);
+        self.fb.seal_block(n1);
+        self.fb.switch_to_block(n1);
+        // Booleans, Numbers, BigInts, Strings, Symbols (tags 3..=7) are never loosely null.
+        let lo = self.i32c(TAG_BOOL as i64);
+        let hi = self.i32c(TAG_SYM as i64);
+        let ge = self.fb.icmp(IntCC::Uge, tag, lo);
+        let le = self.fb.icmp(IntCC::Ule, tag, hi);
+        let prim = self.fb.binary(BinaryOp::Band, ge, le);
+        let (b_prim, n2) = (self.fb.create_block(), self.fb.create_block());
+        self.fb.brif(prim, b_prim, &[], n2, &[]);
+        self.fb.seal_block(b_prim);
+        self.fb.seal_block(n2);
+        self.fb.switch_to_block(b_prim);
+        if let Some(i) = drop_idx {
+            self.drop_at(i);
+            self.set_stack_tag(i, TAG_UNDEFINED);
+        }
+        self.fb.jump(join, &[no]);
+        self.fb.switch_to_block(n2);
+        match layout::ic_plain_offset() {
+            Some(off) => {
+                let o = self.i32c(TAG_OBJ as i64);
+                let iso = self.fb.icmp(IntCC::Eq, tag, o);
+                let (b_obj, b_plain) = (self.fb.create_block(), self.fb.create_block());
+                self.fb.brif(iso, b_obj, &[], slow, &[]);
+                self.fb.seal_block(b_obj);
+                self.fb.switch_to_block(b_obj);
+                let gc = self.fb.load(PTR_MEM, p, VALUE_PAYLOAD);
+                let plain = self.fb.load(MemKind::I32U8, gc, off);
+                self.fb.brif(plain, b_plain, &[], slow, &[]);
+                self.fb.seal_block(b_plain);
+                self.fb.switch_to_block(b_plain);
+                if let Some(i) = drop_idx {
+                    self.drop_at(i);
+                    self.set_stack_tag(i, TAG_UNDEFINED);
+                }
+                self.fb.jump(join, &[no]);
+            }
+            None => {
+                self.fb.jump(slow, &[]);
+            }
+        }
     }
 
     /// The address of a fused local op's operand when it lives in memory (a constant, or a

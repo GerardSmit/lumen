@@ -3040,10 +3040,14 @@ impl Interp {
             if levels == 0 || levels > 4 {
                 return None;
             }
+            // `IC_ABSENT_EXOTIC`: the fill saw a name no Array / String wrapper answers outside
+            // its entries, so those levels are shape-pinned too.
+            let exotic_ok = st.mid_ok & crate::bytecode::IC_ABSENT_EXOTIC != 0;
             let mut cur = head;
             for (k, &shape) in shapes.iter().take(levels).enumerate() {
                 let b = unsafe { (*cur).borrow() };
-                if !(matches!(b.exotic, Exotic::None)
+                if !((matches!(b.exotic, Exotic::None)
+                    || (exotic_ok && matches!(b.exotic, Exotic::Array | Exotic::StrWrap)))
                     && b.ic_plain.get()
                     && b.props.shape() == shape)
                 {
@@ -3160,6 +3164,11 @@ impl Interp {
         // their entries — a wrapper's `length` — so absence-of-entry proves nothing there).
         let mut absent_shapes: [u32; 4] = [0; 4];
         let mut absent_ok = true;
+        // Arrays and String wrappers answer only canonical indices (and a wrapper `length`)
+        // outside their entries: for any other name, a level of theirs proves absence by shape
+        // like an ordinary object.
+        let named = name != "length" && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
+        let mut absent_exotic = false;
         unsafe {
             for depth in 0..=IC_MAX_DEPTH {
                 let b = (*cur).borrow();
@@ -3169,7 +3178,10 @@ impl Interp {
                 if (depth as usize) < 4 {
                     absent_shapes[depth as usize] = b.props.shape();
                 }
-                absent_ok = absent_ok && matches!(b.exotic, Exotic::None);
+                let exotic = !matches!(b.exotic, Exotic::None);
+                absent_ok = absent_ok
+                    && (!exotic || (named && matches!(b.exotic, Exotic::Array | Exotic::StrWrap)));
+                absent_exotic |= exotic;
                 if let Some(slot) = b.props.slot_of(name) {
                     let p = b.props.entry_at(slot).unwrap();
                     if p.accessor() {
@@ -3231,7 +3243,11 @@ impl Interp {
                                 slot: levels as u32,
                                 recv_shape: absent_shapes[0],
                                 holder_shape: absent_shapes[3],
-                                mid_ok: 0,
+                                mid_ok: if absent_exotic {
+                                    crate::bytecode::IC_ABSENT_EXOTIC
+                                } else {
+                                    0
+                                },
                                 mid_shape: absent_shapes[1],
                                 mid2_shape: absent_shapes[2],
                             };

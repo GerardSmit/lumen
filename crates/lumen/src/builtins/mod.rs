@@ -3051,6 +3051,18 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
 fn install_object(it: &mut Interp) {
     let op = it.object_proto.clone();
     it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
+        // A string key on an ordinary object or array (no proxy, namespace or typed array —
+        // those clear `ic_plain`): the own entries decide, with no key copy.
+        if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
+            if let Ok(b) = o.try_borrow() {
+                if matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array)
+                    && b.ic_plain.get()
+                    && !Interp::is_private_key(k)
+                {
+                    return Ok(Value::Bool(b.props.contains(k)));
+                }
+            }
+        }
         let key = ab(i.to_property_key(&arg(args, 0)))?;
         // A private-name slot (`#x`) is never an observable own property.
         if Interp::is_private_key(&key) {

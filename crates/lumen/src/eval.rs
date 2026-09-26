@@ -2282,9 +2282,29 @@ impl Interp {
     /// ordinary own-property + prototype walk.
     pub(crate) fn js_has_property(&mut self, obj: &Value, key: &str) -> Result<bool, Abrupt> {
         let o = match obj {
-            Value::Obj(o) => o.clone(),
+            Value::Obj(o) => o,
             _ => return Ok(false),
         };
+        // Ordinary objects and arrays all the way (no proxy, namespace, typed array, wrapper —
+        // those clear `ic_plain` or are exotic): [[HasProperty]] is the entries walk alone.
+        // Walked by raw pointer: every level is kept alive by `o` for the duration.
+        {
+            let mut cur: *const std::cell::RefCell<crate::value::Object> = Gc::as_ptr(o);
+            loop {
+                let Ok(b) = (unsafe { (*cur).try_borrow() }) else { break };
+                if !(matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array) && b.ic_plain.get()) {
+                    break;
+                }
+                if b.props.contains(key) {
+                    return Ok(true);
+                }
+                match b.proto.as_ref() {
+                    Some(p) => cur = Gc::as_ptr(p),
+                    None => return Ok(false),
+                }
+            }
+        }
+        let o = o.clone();
         // A deferred namespace evaluates on [[HasProperty]] with a string key.
         self.defer_trigger(&o, Some(key))?;
         let ptr = Gc::as_ptr(&o) as usize;
@@ -6235,6 +6255,10 @@ impl Interp {
             "instanceof" => self.instanceof(&l, &r),
             "in" => {
                 if matches!(&r, Value::Obj(_)) {
+                    // A string key is its own property key: no ToPrimitive, no copy.
+                    if let Value::Str(s) = &l {
+                        return Ok(Value::Bool(self.js_has_property(&r, s)?));
+                    }
                     let key = self.to_property_key(&l)?;
                     Ok(Value::Bool(self.js_has_property(&r, &key)?))
                 } else {
@@ -6642,7 +6666,13 @@ impl Interp {
             Value::Undefined | Value::Empty => crate::lstr::LStr::from("undefined"),
             Value::Null => crate::lstr::LStr::from("null"),
             Value::Bool(b) => crate::lstr::LStr::from(if *b { "true" } else { "false" }),
-            Value::Num(n) => crate::lstr::LStr::from(self.num_to_str(*n).as_str()),
+            Value::Num(n) => match int_str(*n) {
+                Some((buf, at)) => {
+                    // SAFETY: `int_str` writes ASCII digits (and a sign) only.
+                    crate::lstr::LStr::from(unsafe { std::str::from_utf8_unchecked(&buf[at..]) })
+                }
+                None => crate::lstr::LStr::from(self.num_to_str(*n).as_str()),
+            },
             Value::BigInt(n) => crate::lstr::LStr::from(n.to_string().as_str()),
             Value::Str(s) => s.clone(),
             Value::Sym(_) => {
@@ -7362,7 +7392,44 @@ pub(crate) fn to_int32(n: f64) -> i32 {
 
 /// Parse a string to a Number per the (simplified) StringToNumber grammar: trimmed, empty → 0,
 /// supports decimals, `Infinity`, and `0x`/`0o`/`0b` radix prefixes.
+/// The decimal digits of an integral `n` below 2^53 in magnitude, right-aligned in the buffer
+/// from the returned index (ToString(Number) without the formatting machinery or a temporary
+/// `String`). `None` for anything else; `-0` prints as `0`.
+#[inline]
+pub(crate) fn int_str(n: f64) -> Option<([u8; 20], usize)> {
+    if !(n.trunc() == n && n.abs() <= 9_007_199_254_740_992.0) {
+        return None;
+    }
+    let neg = n < 0.0;
+    let mut v = n.abs() as u64;
+    let mut buf = [0u8; 20];
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if neg {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    Some((buf, at))
+}
+
+/// ToNumber of a String.
+pub(crate) fn str_to_number(s: &str) -> f64 {
+    parse_number(s)
+}
+
 fn parse_number(s: &str) -> f64 {
+    // Plain decimal digits (ids, ports, counts): exact below 2^53, no trimming or validation.
+    let b = s.as_bytes();
+    if !b.is_empty() && b.len() <= 15 && b.iter().all(u8::is_ascii_digit) {
+        return b.iter().fold(0u64, |acc, &d| acc * 10 + (d - b'0') as u64) as f64;
+    }
     // StrWhiteSpace includes U+FEFF (which Rust's char::is_whitespace omits).
     let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
     if t.is_empty() {

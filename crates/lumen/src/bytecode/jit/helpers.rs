@@ -571,6 +571,11 @@ const BIN_EQEQ: u32 = 15;
 const BIN_NOTEQ: u32 = 16;
 const BIN_STRICTEQ: u32 = 17;
 const BIN_STRICTNOTEQ: u32 = 18;
+/// `key in obj` (a `GenBin` op: see [`build`](super::build)'s arm for it).
+pub(crate) const BIN_IN: u32 = 19;
+/// Unary `+a` / `-a` (`b` is not read).
+pub(crate) const BIN_PLUS: u32 = 20;
+pub(crate) const BIN_NEG: u32 = 21;
 
 /// The operator code [`Helper::Binary`] takes for a binary bytecode op (`Add`..`StrictNotEq`,
 /// `InstanceOf` excluded), or `None`. `GenBin` is excluded too: its operator lives in the chunk's
@@ -618,6 +623,7 @@ fn binary_op_str(code: u32) -> Option<&'static str> {
         BIN_GT => ">",
         BIN_LE => "<=",
         BIN_GE => ">=",
+        BIN_IN => "in",
         BIN_EQEQ => "==",
         BIN_NOTEQ => "!=",
         BIN_STRICTEQ => "===",
@@ -858,7 +864,36 @@ pub(crate) unsafe extern "C" fn binary(
     dst: *mut Value,
 ) -> u32 {
     let a = std::ptr::replace(a, Value::Undefined);
+    if matches!(op, BIN_PLUS | BIN_NEG) {
+        let i = &mut *(*f).interp;
+        let r = match (op, &a) {
+            (BIN_PLUS, Value::Str(s)) => Ok(Value::Num(crate::eval::str_to_number(s))),
+            (BIN_PLUS, _) => i.eval_unary_vm("+", a),
+            _ => i.eval_unary_vm("-", a),
+        };
+        return match r {
+            Ok(v) => {
+                std::ptr::write(dst, v);
+                STATUS_OK
+            }
+            Err(e) => fail(f, e),
+        };
+    }
     let b = std::ptr::replace(b, Value::Undefined);
+    if op == BIN_IN {
+        let i = &mut *(*f).interp;
+        let r = match (&a, &b) {
+            (Value::Str(k), Value::Obj(_)) => i.js_has_property(&b, k).map(Value::Bool),
+            _ => i.binary("in", a, b),
+        };
+        return match r {
+            Ok(v) => {
+                std::ptr::write(dst, v);
+                STATUS_OK
+            }
+            Err(e) => fail(f, e),
+        };
+    }
     // The interpreter's inline Number fast paths first, so results match `run_vm` exactly.
     if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
         if let Some(v) = binary_num(op, *x, *y) {

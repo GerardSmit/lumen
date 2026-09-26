@@ -112,6 +112,9 @@ pub const IC_EMPTY: u8 = u8::MAX;
 /// `undefined`. Shape-only proof is sound for absence: a shape pins the exact key set of a
 /// non-elem-mode map, and every level's exotic/side-table gates are re-checked live.
 pub const IC_ABSENT: u8 = 0xFC;
+/// `mid_ok` flag of an `IC_ABSENT` state: some level is an Array or a String wrapper (the
+/// site's name is neither `length` nor digit-led, so their entries alone decide it).
+pub const IC_ABSENT_EXOTIC: u8 = 4;
 /// Way count of a property IC site: `Compiler::new_cache` allocates this many consecutive
 /// cells and the probes walk all of them (a 3-4 shape site — one dispatch loop over a class
 /// hierarchy — otherwise thrashes 2 ways and re-derives forever).
