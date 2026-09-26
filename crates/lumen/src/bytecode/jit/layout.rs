@@ -97,8 +97,15 @@ struct Layout {
     entries_len: i32,
     entries_cap: i32,
     shape: i32,
+    /// The `u32` capacity's slot-count bits.
+    cap_slots: u32,
     shape_rc: i32,
     shape_len_slot: i32,
+    /// From the `Rc<Shape>` handle word to its strong count.
+    shape_strong: i32,
+    /// `Props::proto_flag` and `Object::extensible` (bool bytes).
+    proto_flag: i32,
+    extensible: i32,
     elems: i32,
     dense_packed: i32,
     dense_inline_len: i32,
@@ -164,6 +171,10 @@ fn layout() -> Option<&'static Layout> {
                 shape: i(props + p.shape)?,
                 shape_rc: i(props + p.shape_rc)?,
                 shape_len_slot: i(p.shape_len_slot)?,
+                shape_strong: i(p.shape_strong)?,
+                cap_slots: p.cap_slots,
+                proto_flag: i(props + p.proto_flag)?,
+                extensible: i(obj + std::mem::offset_of!(Object, extensible))?,
                 elems: i(props + p.elems)?,
                 dense_packed: i(p.dense_packed)?,
                 dense_inline_len: i(p.dense_inline_len)?,
@@ -792,13 +803,16 @@ pub(crate) fn array_len_i64(
 
 /// A snapshot of a property inline cache, taken at compile time from `chunk.caches[cache]`.
 ///
-/// Only own-property (`depth == 0`) states on ordinary receivers are baked: one `(receiver
-/// shape id, entries slot)` pair per IC way. A shape id pins the ordered named-key list of an
+/// Own-property (`depth == 0`) states on ordinary receivers are baked as one `(receiver shape
+/// id, entries slot)` pair per IC way. A shape id pins the ordered named-key list of an
 /// `Exotic::None` map, so the slot is valid on every object of that shape (the interpreter's
-/// `ic_shape_probe` relies on the same fact). Prototype hits (methods) are left out: their
-/// values are objects, which [`prop_get`] could not return anyway.
+/// `ic_shape_probe` relies on the same fact). Prototype hits (`depth` 1-3) are baked for reads
+/// only, as the shapes of every level from the receiver to the holder: a match of each
+/// intermediate level proves it still lacks the name.
 pub(crate) struct PropIc {
     ways: Vec<(u32, u32)>,
+    /// Prototype hits: `(shapes, receiver first and holder last; the holder's entry slot)`.
+    proto: Vec<(Vec<u32>, u32)>,
     /// Cached absences (`IC_ABSENT`): the shapes of every level of a prototype chain (receiver
     /// first, ending in `null`) on which the name is missing — the read is `undefined`. Only
     /// reads use these.
@@ -820,12 +834,27 @@ impl PropIc {
 /// consecutive cells: a neighbouring site's cell would name a different property.
 pub(crate) fn prop_ic(chunk: &Chunk, cache: u32) -> Option<PropIc> {
     let mut ways: Vec<(u32, u32)> = Vec::new();
+    let mut proto: Vec<(Vec<u32>, u32)> = Vec::new();
     let mut absent: Vec<(Vec<u32>, bool)> = Vec::new();
     for k in 0..PROP_IC_WAYS {
         let st = chunk.caches.get(cache as usize + k)?.get();
-        // Exactly 0: no `IC_ARR_KEYCHK` (array holder), and not EMPTY / ABSENT / CREATE.
+        // Exactly 0-3: no `IC_ARR_KEYCHK` (array holder) or `IC_GETTER`, and not EMPTY /
+        // ABSENT / CREATE.
+        let mids = match st.depth {
+            1 => Some(0),
+            2 if st.mid_ok & 1 != 0 => Some(1),
+            3 if st.mid_ok & 3 == 3 => Some(2),
+            _ => None,
+        };
         if st.depth == 0 && !ways.iter().any(|&(s, _)| s == st.recv_shape) {
             ways.push((st.recv_shape, st.slot));
+        } else if let Some(m) = mids {
+            let mut chain = vec![st.recv_shape];
+            chain.extend_from_slice(&[st.mid_shape, st.mid2_shape][..m]);
+            chain.push(st.holder_shape);
+            if !proto.iter().any(|(c, _)| c[0] == st.recv_shape) {
+                proto.push((chain, st.slot));
+            }
         } else if st.depth == crate::bytecode::IC_ABSENT && (1..=4).contains(&st.slot) {
             let levels = [st.recv_shape, st.mid_shape, st.mid2_shape, st.holder_shape];
             let exotic = st.mid_ok & crate::bytecode::IC_ABSENT_EXOTIC != 0;
@@ -835,7 +864,11 @@ pub(crate) fn prop_ic(chunk: &Chunk, cache: u32) -> Option<PropIc> {
             }
         }
     }
-    (!ways.is_empty() || !absent.is_empty()).then_some(PropIc { ways, absent })
+    (!ways.is_empty() || !proto.is_empty() || !absent.is_empty()).then_some(PropIc {
+        ways,
+        proto,
+        absent,
+    })
 }
 
 /// `v.<prop>` via the baked IC: guard `v` is an object with the IC's shape and read the data
@@ -965,6 +998,43 @@ fn prop_word_l(
 
         fb.switch_to_block(next);
     }
+    // A prototype hit: every level from the receiver to the holder still has the shape the fill
+    // saw, and the holder's entry is a data property.
+    for (chain, slot) in &ic.proto {
+        let Some(off) = (*slot as i64)
+            .checked_mul(l.prop_size)
+            .and_then(|o| i32::try_from(o).ok())
+        else {
+            continue;
+        };
+        let hit = fb.create_block();
+        let next = fb.create_block();
+        let same = cmp_imm(fb, IntCC::Eq, Type::I32, shape, chain[0] as i32 as i64);
+        fb.brif(same, hit, &[], next, &[]);
+        fb.seal_block(hit);
+        fb.seal_block(next);
+
+        fb.switch_to_block(hit);
+        if relaxed {
+            exotic_is(fb, l, gc, PLAIN, miss);
+        }
+        let mut cur = gc;
+        for &level in &chain[1..] {
+            cur = proto_hop(fb, l, cur, level, PLAIN, miss);
+        }
+        let n = fb.load(PTR_U32, cur, l.entries_len);
+        let inb = cmp_imm(fb, IntCC::Ugt, PTR, n, *slot as i64);
+        guard(fb, inb, miss);
+        let base = fb.load(PTR_MEM, cur, l.entries_ptr);
+        let meta = fb.load(PTR_MEM, base, off + l.prop_meta);
+        let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
+        let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
+        guard(fb, data, miss);
+        let b = fb.load(MemKind::I64, base, off + l.prop_packed);
+        fb.jump(got, &[b]);
+
+        fb.switch_to_block(next);
+    }
     // A cached absence: the receiver and every prototype up to `null` still have the shapes the
     // fill saw (each proves the name is still missing there), so the read is `undefined`.
     for (chain, exotic) in &ic.absent {
@@ -982,17 +1052,7 @@ fn prop_word_l(
         }
         let mut cur = gc;
         for &level in &chain[1..] {
-            let p = fb.load(PTR_MEM, cur, l.proto);
-            let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
-            guard(fb, some, miss);
-            let flag = fb.load(PTR_MEM, p, l.borrow);
-            let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
-            guard(fb, free, miss);
-            exotic_is(fb, l, p, kinds, miss);
-            let sh = fb.load(MemKind::I32, p, l.shape);
-            let ok = cmp_imm(fb, IntCC::Eq, Type::I32, sh, level as i32 as i64);
-            guard(fb, ok, miss);
-            cur = p;
+            cur = proto_hop(fb, l, cur, level, kinds, miss);
         }
         let end = fb.load(PTR_MEM, cur, l.proto);
         let none = cmp_imm(fb, IntCC::Eq, PTR, end, 0);
@@ -1006,6 +1066,29 @@ fn prop_word_l(
     fb.seal_block(got);
     fb.switch_to_block(got);
     bits
+}
+
+/// The prototype of the object at `gc`: present, not mutably borrowed, one of `kinds`, ic-plain
+/// and of shape `shape`; misses otherwise.
+fn proto_hop(
+    fb: &mut FunctionBuilder,
+    l: &Layout,
+    gc: IrValue,
+    shape: u32,
+    kinds: &[Exotic],
+    miss: Block,
+) -> IrValue {
+    let p = fb.load(PTR_MEM, gc, l.proto);
+    let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
+    guard(fb, some, miss);
+    let flag = fb.load(PTR_MEM, p, l.borrow);
+    let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+    guard(fb, free, miss);
+    exotic_is(fb, l, p, kinds, miss);
+    let sh = fb.load(MemKind::I32, p, l.shape);
+    let ok = cmp_imm(fb, IntCC::Eq, Type::I32, sh, shape as i32 as i64);
+    guard(fb, ok, miss);
+    p
 }
 
 /// `v.<prop>` via the baked IC as a Number (F64): misses unless it is a data property holding
@@ -1142,6 +1225,172 @@ pub(crate) fn view_elem_num(
     result
 }
 
+/// A property-creation way of a set IC (`IC_CREATE`), baked for an inline append: objects of
+/// shared shape `recv` gain the name at entry `slot` (the shape's key count) and move to the
+/// shared child shape `child` (`child_rc`: its `Rc` handle word, held by the shape table
+/// forever). The rest of the fill's proof (the receiver's prototype and the proto epoch) is
+/// re-read from the way's cache cell `cell` on every use, so a refill keeps the code valid.
+pub(crate) struct CreateWay {
+    cell: usize,
+    recv: u32,
+    child: u32,
+    slot: u32,
+    child_rc: usize,
+}
+
+/// The creation ways of set IC `cache` at compile time (see [`CreateWay`]).
+pub(crate) fn create_ic(chunk: &Chunk, cache: u32) -> Vec<CreateWay> {
+    let mut ways: Vec<CreateWay> = Vec::new();
+    for k in 0..PROP_IC_WAYS {
+        let Some(cell) = chunk.caches.get(cache as usize + k) else { break };
+        let st = cell.get();
+        if st.depth != crate::bytecode::IC_CREATE || ways.iter().any(|w| w.recv == st.recv_shape) {
+            continue;
+        }
+        let (Some((_, n)), Some((child_rc, m))) = (
+            crate::value::jit_shared_shape(st.recv_shape),
+            crate::value::jit_shared_shape(st.holder_shape),
+        ) else {
+            continue;
+        };
+        if m != n + 1 {
+            continue;
+        }
+        ways.push(CreateWay {
+            cell: cell as *const _ as usize,
+            recv: st.recv_shape,
+            child: st.holder_shape,
+            slot: n,
+            child_rc,
+        });
+    }
+    ways
+}
+
+/// `v.<prop> = word` creating the property through one of the baked creation `ways`
+/// (`Interp::try_ic_set`'s creation hit and `Props::append_new`, inline): `v` an unborrowed,
+/// extensible, ic-plain ordinary object that is no prototype, of a way's receiver shape, whose
+/// prototype and the proto epoch are the way's, with no element entries and a free entry slot.
+/// The entry is appended as a plain data property holding `word` (the NaN-boxed value, whose
+/// reference moves in) and the object moves to the child shape. Every guard precedes the first
+/// store.
+pub(crate) fn prop_create(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    ways: &[CreateWay],
+    word: IrValue,
+    miss: Block,
+) {
+    use crate::bytecode::IcState;
+    use std::mem::offset_of;
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return;
+    };
+    let plain_meta = {
+        let p = Property::plain(crate::value::Value::Undefined);
+        let at = (&p as *const Property as *const u8).wrapping_add(PROPERTY_META_OFFSET);
+        unsafe { (at as *const usize).read_unaligned() }
+    };
+    let gc = object(fb, l, v, miss, true);
+    exotic_is(fb, l, gc, &[Exotic::None], miss);
+    let ext = fb.load(MemKind::I32U8, gc, l.extensible);
+    let pf = fb.load(MemKind::I32U8, gc, l.proto_flag);
+    let not_proto = cmp_imm(fb, IntCC::Eq, Type::I32, pf, 0);
+    let ok = fb.binary(BinaryOp::Band, not_proto, ext);
+    guard(fb, ok, miss);
+    let shape = fb.load(MemKind::I32, gc, l.shape);
+    let len = fb.load(MemKind::I32, gc, l.entries_len);
+    let cap = fb.load(MemKind::I32, gc, l.entries_cap);
+    let cap = bin_imm(fb, BinaryOp::Band, Type::I32, cap, l.cap_slots as i32 as i64);
+    // The prototype as the fill records it (`Gc::as_ptr`, 0 for none).
+    let proto = fb.load(PTR_MEM, gc, l.proto);
+    let z = fb.iconst(PTR, 0);
+    let none = fb.icmp(IntCC::Eq, proto, z);
+    let cellp = bin_imm(fb, BinaryOp::Iadd, PTR, proto, crate::value::GC_VALUE_OFFSET as i64);
+    let proto = fb.select(none, z, cellp);
+    let epa = fb.iconst(PTR, crate::value::proto_epoch_addr() as i64);
+    let epoch = fb.load(MemKind::I32, epa, 0);
+    let o = |x: usize| x as i32;
+
+    let done = fb.create_block();
+    for w in ways {
+        let Some(off) = (w.slot as i64)
+            .checked_mul(l.prop_size)
+            .and_then(|o| i32::try_from(o).ok())
+        else {
+            continue;
+        };
+        let hit = fb.create_block();
+        let next = fb.create_block();
+        let same = cmp_imm(fb, IntCC::Eq, Type::I32, shape, w.recv as i32 as i64);
+        fb.brif(same, hit, &[], next, &[]);
+        fb.seal_block(hit);
+        fb.seal_block(next);
+
+        fb.switch_to_block(hit);
+        // The way still records this creation, for this prototype, at this epoch.
+        let c = fb.iconst(PTR, w.cell as i64);
+        let depth = fb.load(MemKind::I32U8, c, o(offset_of!(IcState, depth)));
+        let ok = cmp_imm(fb, IntCC::Eq, Type::I32, depth, crate::bytecode::IC_CREATE as i64);
+        let rs = fb.load(MemKind::I32, c, o(offset_of!(IcState, recv_shape)));
+        let ok2 = cmp_imm(fb, IntCC::Eq, Type::I32, rs, w.recv as i32 as i64);
+        let ok = fb.binary(BinaryOp::Band, ok, ok2);
+        let hs = fb.load(MemKind::I32, c, o(offset_of!(IcState, holder_shape)));
+        let ok2 = cmp_imm(fb, IntCC::Eq, Type::I32, hs, w.child as i32 as i64);
+        let ok = fb.binary(BinaryOp::Band, ok, ok2);
+        let ce = fb.load(MemKind::I32, c, o(offset_of!(IcState, mid_shape)));
+        let ok2 = fb.icmp(IntCC::Eq, ce, epoch);
+        let ok = fb.binary(BinaryOp::Band, ok, ok2);
+        guard(fb, ok, miss);
+        let lo = fb.load(MemKind::I64U32, c, o(offset_of!(IcState, slot)));
+        let hi = fb.load(MemKind::I64U32, c, o(offset_of!(IcState, mid2_shape)));
+        let hi = bin_imm(fb, BinaryOp::Ishl, Type::I64, hi, 32);
+        let pp = fb.binary(BinaryOp::Bor, hi, lo);
+        let ok = fb.icmp(IntCC::Eq, pp, proto);
+        guard(fb, ok, miss);
+        // No element entries after the named prefix, and room for one more.
+        let ok = cmp_imm(fb, IntCC::Eq, Type::I32, len, w.slot as i64);
+        let ok2 = cmp_imm(fb, IntCC::Ugt, Type::I32, cap, w.slot as i64);
+        let ok = fb.binary(BinaryOp::Band, ok, ok2);
+        guard(fb, ok, miss);
+
+        let base = fb.load(PTR_MEM, gc, l.entries_ptr);
+        fb.store(MemKind::I64, base, word, off + l.prop_packed);
+        let meta = fb.iconst(PTR, plain_meta as i64);
+        fb.store(PTR_MEM, base, meta, off + l.prop_meta);
+        let n = fb.iconst(Type::I32, w.slot as i64 + 1);
+        fb.store(MemKind::I32, gc, n, l.entries_len);
+        let id = fb.iconst(Type::I32, w.child as i32 as i64);
+        fb.store(MemKind::I32, gc, id, l.shape);
+        // Release the old shape (a shared one: the table keeps it alive), take the child.
+        let old = fb.load(PTR_MEM, gc, l.shape_rc);
+        let some = fb.icmp(IntCC::Ne, old, z);
+        let rel = fb.create_block();
+        let set = fb.create_block();
+        fb.brif(some, rel, &[], set, &[]);
+        fb.seal_block(rel);
+        fb.switch_to_block(rel);
+        let s = fb.load(PTR_MEM, old, l.shape_strong);
+        let s = bin_imm(fb, BinaryOp::Isub, PTR, s, 1);
+        fb.store(PTR_MEM, old, s, l.shape_strong);
+        fb.jump(set, &[]);
+        fb.seal_block(set);
+        fb.switch_to_block(set);
+        let child = fb.iconst(PTR, w.child_rc as i64);
+        let s = fb.load(PTR_MEM, child, l.shape_strong);
+        let s = bin_imm(fb, BinaryOp::Iadd, PTR, s, 1);
+        fb.store(PTR_MEM, child, s, l.shape_strong);
+        fb.store(PTR_MEM, gc, child, l.shape_rc);
+        fb.jump(done, &[]);
+
+        fb.switch_to_block(next);
+    }
+    fb.jump(miss, &[]);
+    fb.seal_block(done);
+    fb.switch_to_block(done);
+}
+
 /// `v.<prop> = n` (n F64) through the baked IC: overwrite an existing own writable data
 /// property of an ordinary object holding a trivially-droppable value. Misses otherwise
 /// (setters, frozen / non-writable, shared copy-on-write entries, new properties...). Every
@@ -1270,6 +1519,40 @@ pub(crate) fn gc_probe(
     let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
     guard(fb, free, miss);
     probe_chain(fb, l, gc, shapes, off, want, slot, miss);
+}
+
+/// The address of data entry `slot` (a `PTR` entry number) of the object at `gc` (a live `Gc`
+/// box address), validated like `Chunk::name_global_slot`: not borrowed at all (the address is
+/// written through), an ordinary plain object whose shape id is `shape` (I32), the entry in
+/// bounds and not an accessor. Misses on anything else.
+pub(crate) fn gc_data_entry(
+    fb: &mut FunctionBuilder,
+    gc: IrValue,
+    shape: IrValue,
+    slot: IrValue,
+    miss: Block,
+) -> IrValue {
+    let Some(l) = layout() else {
+        always_miss(fb, miss);
+        return fb.iconst(PTR, 0);
+    };
+    let flag = fb.load(PTR_MEM, gc, l.borrow);
+    let free = cmp_imm(fb, IntCC::Eq, PTR, flag, 0);
+    guard(fb, free, miss);
+    exotic_is(fb, l, gc, &[Exotic::None], miss);
+    let sh = fb.load(MemKind::I32, gc, l.shape);
+    let same = fb.icmp(IntCC::Eq, sh, shape);
+    guard(fb, same, miss);
+    let nent = fb.load(PTR_U32, gc, l.entries_len);
+    let inb = fb.icmp(IntCC::Ugt, nent, slot);
+    guard(fb, inb, miss);
+    let base = fb.load(PTR_MEM, gc, l.entries_ptr);
+    let p = scaled(fb, base, slot, l.prop_size);
+    let meta = fb.load(PTR_MEM, p, l.prop_meta);
+    let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
+    let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
+    guard(fb, data, miss);
+    p
 }
 
 #[allow(clippy::too_many_arguments)]

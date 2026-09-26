@@ -37,7 +37,7 @@ pub(in crate::value) struct EntryVec {
 }
 
 /// `cap` bit marking inline storage (see the module docs); the low bits are the slot count.
-const INLINE_FLAG: u32 = 1 << 31;
+pub(in crate::value) const INLINE_FLAG: u32 = 1 << 31;
 /// Largest distance from an inline `EntryVec` to its storage: both live in one heap box.
 const INLINE_REACH: usize = 256;
 

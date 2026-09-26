@@ -165,6 +165,8 @@ struct Offs {
     jit_frames: i32,
     /// `Interp::cur_site` (stack-trace positions).
     cur_site: i32,
+    /// `Interp::global` (the global object's handle word).
+    global: i32,
 }
 
 fn offs() -> Option<&'static Offs> {
@@ -187,6 +189,7 @@ fn offs() -> Option<&'static Offs> {
             pending_tail: i(offset_of!(I, pending_tail))?,
             jit_frames: i(offset_of!(I, jit_frames))?,
             cur_site: i(offset_of!(I, cur_site))?,
+            global: i(offset_of!(I, global))?,
         })
     })
     .as_ref()
@@ -1240,6 +1243,43 @@ impl Tr<'_, '_> {
         self.stack.push(Entry::Ref(p, Src::Pin));
     }
 
+    /// The address of the global object entry name cache `c` resolves in its global-object
+    /// mode (`Chunk::name_global_slot`), checked inline: the frame's scope is the (global) scope
+    /// the cache names, still without the name (its generation), and the global object has the
+    /// cached shape with a data entry at the cached slot. `None` when the check can't be
+    /// emitted; else the address, or a jump to `miss`.
+    pub(super) fn glob_entry(&mut self, c: u32, miss: Block) -> Option<V> {
+        if cfg!(target_arch = "wasm32") || !cfg!(target_pointer_width = "64") {
+            return None;
+        }
+        let (so, o) = (scope_offs()?, offs()?);
+        let cell = self.chunk.name_caches.get(c as usize)?;
+        let icp = self.ptrc(cell as *const _ as usize as i64);
+        let ic_env = self.fb.load(PTR_MEM, icp, so.ic_env);
+        let envp = self.fb.load(PTR_MEM, self.frame, FRAME_ENV);
+        let rc = self.fb.load(PTR_MEM, envp, 0);
+        let off = self.ptrc(so.rc_value + 1);
+        let tagged = self.fb.binary(BinaryOp::Iadd, rc, off);
+        let ok = self.fb.icmp(IntCC::Eq, ic_env, tagged);
+        self.guard_to(ok, miss);
+        let off = self.ptrc(so.rc_value);
+        let scope = self.fb.binary(BinaryOp::Iadd, rc, off);
+        let flag = self.fb.load(PTR_MEM, scope, so.borrow);
+        let z = self.ptrc(0);
+        let ok = self.fb.icmp(IntCC::Sge, flag, z);
+        self.guard_to(ok, miss);
+        let g = self.fb.load(MemKind::I32, scope, so.gen);
+        let icg = self.fb.load(MemKind::I32, icp, so.ic_gen);
+        let ok = self.fb.icmp(IntCC::Eq, g, icg);
+        self.guard_to(ok, miss);
+        // The binding word packs the shape id (high half) over the entry slot (low half).
+        let slot = self.fb.load(MemKind::I64U32, icp, so.ic_binding);
+        let shape = self.fb.load(MemKind::I32, icp, so.ic_binding + 4);
+        let interp = self.fb.load(PTR_MEM, self.frame, FRAME_INTERP);
+        let gp = self.fb.load(PTR_MEM, interp, o.global);
+        Some(layout::gc_data_entry(&mut self.fb, gp, shape, slot, miss))
+    }
+
     /// The `GetMethod` producing a direct site's callee: validate the lookup inline (exit
     /// before the op otherwise, and leave the site out of the next compile) and push the pinned
     /// method, leaving the receiver entry as it is. `false` when the receiver entry is unboxed
@@ -1693,29 +1733,19 @@ impl Tr<'_, '_> {
         } as i64);
         let ok = self.fb.icmp(IntCC::Ult, depth, lim);
         self.guard_to(ok, slow);
-        // A plain call from a canonical activation of the callee's strictness changes no engine
-        // flag (see `entry_flags`); anything else takes the ordinary path.
-        // (Canonical for the other strictness, only `strict` and `tco_ok` differ: they are
-        // switched to the callee's for the call and back after it.)
-        let plain = match (construct, self.call_flags) {
-            (false, Some(canon)) => {
-                let z = self.i32c(0);
-                let ok = self.fb.icmp(IntCC::Ne, canon, z);
-                self.guard_to(ok, slow);
-                true
-            }
-            _ => false,
-        };
-        if !site.arrow && !plain {
-            let nt = self.fb.load(MemKind::I32U8, interp, o.new_target);
+        // The engine flags are switched to the callee's for the call and back after it: `strict`
+        // and `tco_ok` to its strictness, `constructing` clear and — for a plain function, which
+        // may be called from a constructor's body, a class field initializer or an async
+        // generator's body — `new.target` and those markers clear too (moved out and back, as
+        // `call_native` does). An arrow keeps them (its `new.target` is its scope's).
+        let marks = (!site.arrow).then(|| {
+            let nt_tag = self.fb.load(MemKind::I32U8, interp, o.new_target);
+            let nt_bool = self.fb.load(MemKind::I32U8, interp, o.new_target + VALUE_BOOL);
+            let nt_word = self.fb.load(MemKind::I64, interp, o.new_target + VALUE_PAYLOAD);
             let fi = self.fb.load(MemKind::I32U8, interp, o.field_init);
             let agb = self.fb.load(MemKind::I32U8, interp, o.agb);
-            let a = self.fb.binary(BinaryOp::Bor, nt, fi);
-            let a = self.fb.binary(BinaryOp::Bor, a, agb);
-            let z = self.i32c(0);
-            let ok = self.fb.icmp(IntCC::Eq, a, z);
-            self.guard_to(ok, slow);
-        }
+            (nt_tag, nt_bool, nt_word, fi, agb)
+        });
         let tick = self.fb.load(MemKind::I32, interp, o.gc_tick);
         let one = self.i32c(1);
         let tick1 = self.fb.binary(BinaryOp::Iadd, tick, one);
@@ -1796,19 +1826,18 @@ impl Tr<'_, '_> {
         // Stack-trace bookkeeping: this call's pc is the caller's site (see `Interp::cur_site`).
         let here = self.i32c((crate::interpreter::frames::SITE_PC | pc as u32) as i32 as i64);
         let z = self.i32c(0);
-        let saved = if plain {
-            self.fb.store(MemKind::I32U8, interp, strict, o.strict);
-            self.fb.store(MemKind::I32U8, interp, strict, o.tco);
-            None
-        } else {
-            let s_strict = self.fb.load(MemKind::I32U8, interp, o.strict);
-            let s_tco = self.fb.load(MemKind::I32U8, interp, o.tco);
-            let s_ctor = self.fb.load(MemKind::I32U8, interp, o.ctor);
-            self.fb.store(MemKind::I32U8, interp, strict, o.strict);
-            self.fb.store(MemKind::I32U8, interp, strict, o.tco);
-            self.fb.store(MemKind::I32U8, interp, z, o.ctor);
-            Some((s_strict, s_tco, s_ctor))
-        };
+        if marks.is_some() {
+            // (`Undefined` has no payload: the tag alone clears it.)
+            self.fb.store(MemKind::I32U8, interp, z, o.new_target);
+            self.fb.store(MemKind::I32U8, interp, z, o.field_init);
+            self.fb.store(MemKind::I32U8, interp, z, o.agb);
+        }
+        let s_strict = self.fb.load(MemKind::I32U8, interp, o.strict);
+        let s_tco = self.fb.load(MemKind::I32U8, interp, o.tco);
+        let s_ctor = self.fb.load(MemKind::I32U8, interp, o.ctor);
+        self.fb.store(MemKind::I32U8, interp, strict, o.strict);
+        self.fb.store(MemKind::I32U8, interp, strict, o.tco);
+        self.fb.store(MemKind::I32U8, interp, z, o.ctor);
         self.fb.store(PTR_MEM, sh, ntop, SHADOW_TOP);
         if construct {
             self.call(Helper::NewThis, &[self.frame, cellp, top0]);
@@ -1830,10 +1859,17 @@ impl Tr<'_, '_> {
         let envp = self.fb.load(PTR_MEM, cellp, CELL_ENV);
         self.fb.store(PTR_MEM, nf, envp, FRAME_ENV);
         self.fb.store(PTR_MEM, nf, this_p, FRAME_THIS);
-        // The callee's flags are canonical after a plain call, or after one that set them up
-        // (a plain function called from elsewhere: `new.target` and the markers checked clear).
-        let canon = !construct && (plain || !site.arrow);
-        let cv = self.i32c(if canon { 1 + site.strict as i64 } else { 0 });
+        // The callee's flags are canonical after the switch (see `entry_flags`), except in a
+        // constructor, and in an arrow called from an activation whose were not.
+        let one_s = self.i32c(1 + site.strict as i64);
+        let cv = match (construct, site.arrow, self.call_flags) {
+            (true, ..) | (_, true, None) => z,
+            (false, false, _) => one_s,
+            (false, true, Some(canon)) => {
+                let is = self.fb.icmp(IntCC::Ne, canon, z);
+                self.fb.select(is, one_s, z)
+            }
+        };
         self.fb.store(MemKind::I32U8, nf, cv, FRAME_CANON);
         // The lazy call record (see `super::sync_frames`), linked as the newest pending one.
         let fnp = match fentry {
@@ -2056,16 +2092,17 @@ impl Tr<'_, '_> {
             }
         }
         self.fb.store(PTR_MEM, sh, top0, SHADOW_TOP);
-        if let Some((s_strict, s_tco, s_ctor)) = saved {
-            self.fb.store(MemKind::I32U8, interp, s_strict, o.strict);
-            self.fb.store(MemKind::I32U8, interp, s_tco, o.tco);
-            self.fb.store(MemKind::I32U8, interp, s_ctor, o.ctor);
-        } else if let Some(canon) = self.call_flags {
-            let one = self.i32c(1);
-            let s0 = self.fb.binary(BinaryOp::Isub, canon, one);
-            self.fb.store(MemKind::I32U8, interp, s0, o.strict);
-            self.fb.store(MemKind::I32U8, interp, s0, o.tco);
+        if let Some((nt_tag, nt_bool, nt_word, fi, agb)) = marks {
+            // (The callee left `new.target` `undefined`: a `new` it made took its own back.)
+            self.fb.store(MemKind::I32U8, interp, nt_tag, o.new_target);
+            self.fb.store(MemKind::I32U8, interp, nt_bool, o.new_target + VALUE_BOOL);
+            self.fb.store(MemKind::I64, interp, nt_word, o.new_target + VALUE_PAYLOAD);
+            self.fb.store(MemKind::I32U8, interp, fi, o.field_init);
+            self.fb.store(MemKind::I32U8, interp, agb, o.agb);
         }
+        self.fb.store(MemKind::I32U8, interp, s_strict, o.strict);
+        self.fb.store(MemKind::I32U8, interp, s_tco, o.tco);
+        self.fb.store(MemKind::I32U8, interp, s_ctor, o.ctor);
         let d1 = self.fb.load(MemKind::I32, interp, o.depth);
         let d0 = self.fb.binary(BinaryOp::Isub, d1, one);
         self.fb.store(MemKind::I32, interp, d0, o.depth);
@@ -2129,10 +2166,11 @@ fn global_name(interp: &Interp, chunk: &Chunk, pp: usize, op: Op, p: &mut Plan) 
     if ic.env != std::rc::Rc::as_ptr(&interp.global_env) as usize | 1 {
         return;
     }
-    let gp = crate::value::Gc::as_ptr(&interp.global) as usize;
-    if !interp.ordinary_get_ptr(gp) {
+    if !interp.ordinary_get_ptr(crate::value::Gc::as_ptr(&interp.global) as usize) {
         return;
     }
+    // The probe reads the object through its handle word, like a `Value` payload.
+    let gp = crate::value::Gc::word(&interp.global);
     p.dglobal
         .insert(pp, (gp, (ic.binding >> 32) as u32, ic.binding as u32));
     p.boxes.push(Box::new(interp.global.clone()));

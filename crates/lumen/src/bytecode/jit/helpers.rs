@@ -978,6 +978,11 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, de
         let e = (*(*f).interp).throw("TypeError", "compiled code ran an unsupported op");
         return fail(f, e);
     }
+    if let (Some(&Op::ApplyArgs(s, tag)), true) = (chunk.ops.get(pc), depth == base + 3) {
+        if let Some(st) = apply_args(f, chunk, pc, base, s, tag) {
+            return st;
+        }
+    }
     let i = &mut *(*f).interp;
     let env = &*(*f).env;
     let this_val = &*(*f).this_val;
@@ -1587,6 +1592,45 @@ unsafe fn dispatch_call(
         }
         Err(e) => fail(f, e),
     }
+}
+
+/// `ApplyArgs(s, tag)` over `[f, apply, t]` at `stack[base..]` (see `bytecode::virt_apply`)
+/// when `apply` is the intrinsic, `f` is callable and the virtual `arguments` still sits in
+/// its parameter window: the call `f.apply(t, arguments)` makes, dispatched as a plain `Call`
+/// with the window's values (`apply` has no stack-trace frame of its own). `None` (nothing
+/// done) otherwise.
+unsafe fn apply_args(
+    f: *mut JitFrame,
+    chunk: &Chunk,
+    pc: usize,
+    base: usize,
+    s: u16,
+    tag: u16,
+) -> Option<u32> {
+    let st = (*f).stack;
+    let slots = std::slice::from_raw_parts((*f).slots, chunk.n_slots);
+    let intrinsic = match &*st.add(base + 1) {
+        Value::Obj(o) => o.try_borrow().is_ok_and(|b| {
+            matches!(&b.call, crate::value::Callable::Native(fp)
+                if *fp as usize == crate::builtins::nf_function_apply as usize)
+        }),
+        _ => false,
+    };
+    let Some(&Value::Num(n)) = slots.get(s as usize) else { return None };
+    let first = (tag & !crate::bytecode::VIRT_REST) as usize;
+    let n = n as usize;
+    if !intrinsic || !(*st.add(base)).is_callable() || n > ARGBUF || first + n > slots.len() {
+        return None;
+    }
+    let mut buf = ArgBuf::new();
+    for v in &slots[first..first + n] {
+        buf.push(v.clone());
+    }
+    let callee = std::ptr::replace(st.add(base), Value::Undefined);
+    drop(std::ptr::replace(st.add(base + 1), Value::Undefined));
+    let this = std::ptr::replace(st.add(base + 2), Value::Undefined);
+    (*(*f).interp).cur_site = crate::interpreter::frames::SITE_PC | pc as u32;
+    Some(dispatch_call(f, base, callee, this, buf.as_mut_ptr(), n, 0))
 }
 
 /// `CallSpread(argc)` / `CallSpreadThis(argc)` (flags as [`call`]'s): the last of the `argc`

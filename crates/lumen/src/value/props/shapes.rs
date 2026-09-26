@@ -423,6 +423,20 @@ pub(super) fn shape_transition(parent: Option<&Rc<Shape>>, key: &Rc<str>) -> Rc<
     })
 }
 
+/// The shared shape with id `id` as its `Rc` handle word and key count, for compiled code that
+/// switches an object to it (the table holds shared shapes forever). `None` for an owned id.
+pub(crate) fn jit_shared_shape(id: u32) -> Option<(usize, u32)> {
+    with_shapes(|t| {
+        let s = t.by_id.get(id as usize)?;
+        Some((unsafe { *(s as *const Rc<Shape> as *const usize) }, s.len))
+    })
+}
+
+/// The address of the creation-IC epoch (a `u32`, see [`PROTO_EPOCH`]), for compiled code.
+pub(crate) fn proto_epoch_addr() -> usize {
+    PROTO_EPOCH.as_ptr() as usize
+}
+
 /// The shared shape with id `id` (a creation IC's recorded child). Panics on an owned id — the
 /// fills that record ids only ever record shared ones.
 pub(super) fn shape_by_id(id: u32) -> Rc<Shape> {

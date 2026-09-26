@@ -27,7 +27,7 @@ pub(in crate::value) struct GcBox {
 }
 
 /// Byte offset from the stored handle word to the object cell.
-const GC_VALUE_OFFSET: usize = std::mem::offset_of!(GcBox, value);
+pub(crate) const GC_VALUE_OFFSET: usize = std::mem::offset_of!(GcBox, value);
 /// Byte offset from the stored handle word to the strong count (for the JIT's inline
 /// retain / release: a handle whose count stays above zero needs nothing else).
 pub(crate) const GC_STRONG_OFFSET: usize = std::mem::offset_of!(GcBox, strong);
@@ -76,6 +76,12 @@ impl Gc {
     #[inline]
     pub fn as_ptr(this: &Gc) -> *const RefCell<Object> {
         unsafe { std::ptr::addr_of!((*this.0.as_ptr()).value) }
+    }
+    /// The handle word (the box address a `Value` payload holds; the JIT's layout offsets are
+    /// relative to it).
+    #[inline]
+    pub(crate) fn word(this: &Gc) -> usize {
+        this.0.as_ptr() as usize
     }
     #[inline]
     pub fn downgrade(this: &Gc) -> WeakGc {
@@ -2169,6 +2175,7 @@ pub(crate) use props::FnMaps;
 pub use props::Props;
 pub(crate) use props::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
 pub(crate) use props::{jit_props_layout, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK};
+pub(crate) use props::{jit_shared_shape, proto_epoch_addr};
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).
 #[inline(always)]
