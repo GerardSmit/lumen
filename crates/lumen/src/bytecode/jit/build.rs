@@ -1668,6 +1668,13 @@ fn plan(
         } else {
             None
         };
+        // Not for a local holding a typed array (its `length` has its own cache; the Array
+        // view would only add loop-carried variables).
+        let fact = fact.filter(|&(src, _)| match src {
+            Src::Slot(s) => !matches!(slots.get(s as usize), Some(Value::Obj(o))
+                if interp.typed_arrays.contains_key(&(crate::value::Gc::as_ptr(o) as usize))),
+            _ => true,
+        });
         if let Some((src, i)) = fact {
             if !p.idx_facts.contains(&(src, i)) {
                 p.idx_facts.push((src, i));
@@ -7706,15 +7713,20 @@ impl<'a, 'f> Tr<'a, 'f> {
         };
         let gc = layout::side_table_object(&mut self.fb, obj, other);
         self.seal_current();
-        // The index: an int32 key as is, else an F64 checked integral (negative ones wrap above
-        // any length).
+        // The index: an int32 key as is, else an F64 checked integral right away (negative
+        // ones wrap above any length; a flag kept live across the refresh call would spill).
         let (i, exact) = match self.int32_of(key) {
             Some(x) if PTR == Type::I64 => (self.fb.convert(ConvOp::Sext, PTR, x), None),
             Some(x) => (x, None),
             None => {
                 let i = self.to_index(key);
                 let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
-                (i, Some(self.fb.fcmp(FloatCC::Eq, back, key)))
+                let ok = self.fb.fcmp(FloatCC::Eq, back, key);
+                let go = self.fb.create_block();
+                self.fb.brif(ok, go, &[], slow, &[]);
+                self.fb.seal_block(go);
+                self.fb.switch_to_block(go);
+                (i, None)
             }
         };
         // The generic view (any kind) and the specialized one.
