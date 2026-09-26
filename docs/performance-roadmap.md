@@ -482,6 +482,26 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
     - Fast profile, per call in a JIT loop: `get` 91 → 56 ns, `has` 85 → 49 ns, `set` 98 → 61 ns. A user class with `get`/`set` methods is unchanged (35 ns).
     - Left: the same helper-call floor as item 18. A key that is not a pure load (`m.get(a[i])`, `m.get(s + x)`) still takes the generic path.
 
+21. ✅ **Destructuring, spread calls, collection iterators (S).** *(Added after the second report, weighted by what puppeteer-core uses: 143 object destructurings, 115 spread calls, 27 array destructurings, 12 `for…of` over `.keys()` / `.values()` / `.entries()`.)*
+    - Built:
+      - **`DestructureGuard` in the JIT.** It was a generic-helper op, and it forced its operand boxed, so every `const {a, b} = o` cloned and dropped `o` and made a helper call. It is now one tag check (exit for `undefined` / `null`), reading a lent source in place.
+      - **Array destructuring of a lent array.** The inline `DestructureArr` path reads a borrowed array in place, and clones it only for the slow path.
+      - **Spread calls in the JIT (`Helper::CallSpread`).** `f(...a)` / `o.m(...a)` used the generic op (the interpreter's call chain plus a fresh VM drive). The helper gathers the arguments into a stack buffer (a pristine packed Array as a straight copy, anything else by the iterator protocol) and then dispatches as `Helper::Call` does, including the direct entry into compiled callees.
+      - **Fresh Map/Set iterators run encoded.** `GetIter` on a `m.keys()`-style iterator that nothing else references (refcount 1, only its internal slots, intrinsic `next` and `@@iterator`) swaps it for the encoded state already used for `for (x of set)`. The object is unobservable, so nothing can tell the difference.
+    - Fast profile, per operation:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | `const {x, z} = o` | 54.9 ns | 7.7 ns | 0.7 ns |
+      | `const [a, b, c] = A3` | 26.0 ns | 20.2 ns | 2.7 ns |
+      | `f3(...A3)` | 320 ns | 170–190 ns | 20 ns |
+      | `for (k of m.keys())`, per key | 64.3 ns | 30.3 ns | 4.8 ns |
+
+    - Left:
+      - The generic call floor. `Math.max(1, 2, 3)` costs 110 ns: about 40 ns re-resolving the global `Math` after each call (the JIT's cached binding address is invalidated by any call), and the rest is native-call bookkeeping. A spread call pays the same floor.
+      - Array destructuring still proves Array iteration pristine through a helper on every run.
+      - `for (const [k, v] of map)` allocates an entry array per step (about 100 ns per entry).
+
 ## Open items
 
 ### Engine
