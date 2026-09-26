@@ -677,6 +677,56 @@ fn web_url_and_search_params() {
     );
 }
 
+/// The native parser answers with Node's URLContext record, not an object of parts; every getter
+/// has to read that record. When it did not, `protocol` was "undefined:" for every URL and the
+/// browser driver refused http, https and about:blank alike.
+#[test]
+fn web_url_reads_the_native_record() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        for (const s of ["https://example.com", "http://localhost", "about:blank", "HTTP://EX.com"]) {
+          const u = new URL(s);
+          console.log(u.protocol, JSON.stringify(u.host), u.pathname, u.href);
+        }
+        const u = new URL("https://us:pw@ex.com:8443/p/q?a=1#h");
+        console.log(u.username, u.password, u.hostname, u.port, u.host, u.origin);
+        console.log(u.pathname, u.search, u.hash);
+        console.log(new URL("http://ex.com:80/").port === "", new URL("file:///c/d").origin);
+        console.log(new URL("blob:https://ex.com/id").origin, new URL("data:,x").origin);
+        try { new URL("not a url"); } catch (e) { console.log(e.name, e.code); }
+        u.hostname = "other.org"; u.port = "9"; u.pathname = "/z"; u.search = "b=2"; u.hash = "k";
+        console.log(u.href);
+        u.protocol = "http"; u.search = ""; u.hash = "";
+        console.log(u.href);
+        const w = new URL("http://ex.com/?x=1");
+        w.searchParams.append("y", "2");
+        console.log(w.href, w.search);
+        w.href = "https://new.example/";
+        console.log(w.protocol, w.searchParams.toString() === "");
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "https: \"example.com\" / https://example.com/",
+            "http: \"localhost\" / http://localhost/",
+            "about: \"\" blank about:blank",
+            "http: \"ex.com\" / http://ex.com/",
+            "us pw ex.com 8443 ex.com:8443 https://ex.com:8443",
+            "/p/q ?a=1 #h",
+            "true null",
+            "https://ex.com null",
+            "TypeError ERR_INVALID_URL",
+            "https://us:pw@other.org:9/z?b=2#k",
+            "http://us:pw@other.org:9/z",
+            "http://ex.com/?x=1&y=2 ?x=1&y=2",
+            "https: true",
+        ]
+    );
+}
+
 #[test]
 fn web_response_status_defaults() {
     // An explicit `undefined` status/statusText counts as absent (WebIDL) and takes the default,
