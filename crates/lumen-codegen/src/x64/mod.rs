@@ -130,7 +130,11 @@ pub fn load(
 
 /// Compile `func` (which must verify) to position-independent code.
 pub fn compile(func: &Function, cfg: &Config) -> Result<Compiled, String> {
-    let mut f = func.clone();
+    compile_owned(func.clone(), cfg)
+}
+
+/// [`compile`], consuming `f` (no copy; the IR is freed once lowered).
+pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> {
     legalize(
         &mut f,
         Legal {
@@ -145,13 +149,16 @@ pub fn compile(func: &Function, cfg: &Config) -> Result<Compiled, String> {
     split_critical_edges(&mut f);
     let graph = Cfg::new(&f);
     let lowered = lower::lower(&f, &graph, &cfg.abi, &cfg.features)?;
+    // The IR is no longer needed: free it before the allocator's tables are built.
+    let ctx_first = f.sig.params.first() == Some(&Type::I64);
+    drop((graph, f));
     let alloc = crate::regalloc::allocate(&lowered.vcode, &cfg.abi.reg_info());
     let needs_ctx = lowered.has_traps || cfg.traps.is_some_and(|t| t.stack_limit.is_some());
     if needs_ctx {
         if cfg.traps.is_none() {
             return Err("x64: function traps but no TrapConfig was given".into());
         }
-        if f.sig.params.first() != Some(&Type::I64) {
+        if !ctx_first {
             return Err("x64: trapping functions take the context pointer first".into());
         }
     }

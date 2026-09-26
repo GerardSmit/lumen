@@ -47,6 +47,12 @@ pub struct FunctionBuilder<'a> {
     cur: Option<Block>,
     var_types: Vec<Type>,
     blocks: Vec<BlockState>,
+    /// Constants defined so far, each once at the top of the entry block (which dominates every
+    /// use). The backends rematerialize constants at their uses, so sharing one definition
+    /// costs no register pressure and keeps large functions' IR small.
+    consts: std::collections::HashMap<(Type, u64), Value>,
+    /// How many of the entry block's first instructions are pooled constants.
+    n_consts: usize,
 }
 
 impl<'a> FunctionBuilder<'a> {
@@ -58,6 +64,8 @@ impl<'a> FunctionBuilder<'a> {
             cur: None,
             var_types: Vec::new(),
             blocks,
+            consts: std::collections::HashMap::new(),
+            n_consts: 0,
         }
     }
 
@@ -286,22 +294,43 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
+    /// The pooled constant `data` (of type `ty`, bits `bits`): defined once in the entry block.
+    fn konst(&mut self, ty: Type, bits: u64, data: InstData) -> Value {
+        if let Some(&v) = self.consts.get(&(ty, bits)) {
+            return v;
+        }
+        let Some(&entry) = self.func.layout.first() else {
+            return self.push1(data);
+        };
+        let inst = self.func.make_inst(data);
+        self.func.blocks[entry.index()].insts.insert(self.n_consts, inst);
+        self.n_consts += 1;
+        let v = self.func.results(inst)[0];
+        self.consts.insert((ty, bits), v);
+        v
+    }
     pub fn iconst(&mut self, ty: Type, imm: i64) -> Value {
+        debug_assert!(ty.is_int());
+        let imm = if ty == Type::I32 { imm as i32 as i64 } else { imm };
+        self.konst(ty, imm as u64, InstData::Iconst { ty, imm })
+    }
+    /// An integer constant of its own (not pooled): for a placeholder patched after building.
+    pub fn iconst_unique(&mut self, ty: Type, imm: i64) -> Value {
         debug_assert!(ty.is_int());
         let imm = if ty == Type::I32 { imm as i32 as i64 } else { imm };
         self.push1(InstData::Iconst { ty, imm })
     }
     pub fn f32const(&mut self, v: f32) -> Value {
-        self.push1(InstData::F32const { bits: v.to_bits() })
+        self.f32const_bits(v.to_bits())
     }
     pub fn f64const(&mut self, v: f64) -> Value {
-        self.push1(InstData::F64const { bits: v.to_bits() })
+        self.f64const_bits(v.to_bits())
     }
     pub fn f32const_bits(&mut self, bits: u32) -> Value {
-        self.push1(InstData::F32const { bits })
+        self.konst(Type::F32, bits as u64, InstData::F32const { bits })
     }
     pub fn f64const_bits(&mut self, bits: u64) -> Value {
-        self.push1(InstData::F64const { bits })
+        self.konst(Type::F64, bits, InstData::F64const { bits })
     }
     pub fn unary(&mut self, op: UnaryOp, arg: Value) -> Value {
         self.push1(InstData::Unary { op, arg })

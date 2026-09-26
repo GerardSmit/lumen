@@ -1737,7 +1737,8 @@ impl Tr<'_, '_> {
             top0
         };
         let size = if site.self_call {
-            let v = self.ptrc(0);
+            // Patched once the frame size is known: its own constant (see `build`).
+            let v = self.fb.iconst_unique(PTR, 0);
             self.self_sizes.push(v);
             v
         } else {

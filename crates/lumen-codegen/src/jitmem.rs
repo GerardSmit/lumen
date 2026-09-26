@@ -42,6 +42,13 @@ impl ExecMemory {
     }
 }
 
+/// `len` bytes of zeroed, never-freed read-write memory straight from the OS (null where there
+/// is none). Pages cost physical memory only once touched, unlike a zeroed heap block.
+pub fn alloc_pages(len: usize) -> *mut u8 {
+    // SAFETY: a fresh anonymous mapping; nothing else refers to it.
+    unsafe { sys::alloc_data(len) }
+}
+
 impl Drop for ExecMemory {
     fn drop(&mut self) {
         unsafe { sys::free_exec(self.ptr, self.len) }
@@ -65,6 +72,16 @@ mod sys {
             return std::ptr::null_mut();
         }
         pthread_jit_write_protect_np(0);
+        mem
+    }
+
+    pub unsafe fn alloc_data(len: usize) -> *mut u8 {
+        const PROT_RW: i32 = 0x1 | 0x2;
+        const MAP_PRIVATE_ANON: i32 = 0x0002 | 0x1000;
+        let mem = mmap(std::ptr::null_mut(), len, PROT_RW, MAP_PRIVATE_ANON, -1, 0);
+        if mem as isize == -1 {
+            return std::ptr::null_mut();
+        }
         mem
     }
 
@@ -124,6 +141,10 @@ mod sys {
         mem
     }
 
+    pub unsafe fn alloc_data(len: usize) -> *mut u8 {
+        alloc(len)
+    }
+
     pub unsafe fn make_exec(mem: *mut u8, len: usize) -> bool {
         flush_icache(mem, len);
         mprotect(mem, len, PROT_READ | PROT_EXEC) == 0
@@ -153,6 +174,10 @@ mod sys {
         VirtualAlloc(std::ptr::null_mut(), len, MEM_COMMIT_RESERVE, PAGE_READWRITE)
     }
 
+    pub unsafe fn alloc_data(len: usize) -> *mut u8 {
+        alloc(len)
+    }
+
     pub unsafe fn make_exec(mem: *mut u8, len: usize) -> bool {
         let mut old = 0;
         VirtualProtect(mem, len, PAGE_EXECUTE_READ, &mut old) != 0
@@ -169,6 +194,9 @@ mod sys {
 #[cfg(not(any(unix, windows)))]
 mod sys {
     pub unsafe fn alloc(_len: usize) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn alloc_data(_len: usize) -> *mut u8 {
         std::ptr::null_mut()
     }
     pub unsafe fn make_exec(_mem: *mut u8, _len: usize) -> bool {
