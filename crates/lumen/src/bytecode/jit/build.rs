@@ -2082,10 +2082,14 @@ impl<'a, 'f> Tr<'a, 'f> {
             || self.site_get_method(pc)
             || self.plan.dname.contains_key(&pc)
             || (self.plan.dmethod.contains_key(&pc)
-                && !matches!(self.stack.last(), Some(Entry::Num(_) | Entry::Bool(_))));
+                && !matches!(self.stack.last(), Some(Entry::Num(_) | Entry::Bool(_))))
+            || self.plan.dvm.contains_key(&pc);
         // A direct call reads its operands in place (it runs JS: env Refs below still go).
         // A plain property store writes through a borrowed receiver (see `Tr::ref_receiver`).
+        // A fused DataView call reads a borrowed receiver (its slow path boxes the operands
+        // before any JS runs).
         let ref_aware = math_part
+            || self.plan.dvm.values().any(|&(c, _)| c == pc)
             || self.plan.direct.contains_key(&pc)
             || self.plan.dnew.contains_key(&pc)
             || (matches!(op, Op::AppendProp(..) | Op::SetPropDrop(..))
@@ -3565,8 +3569,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         if let Some((&g, &(_, cell))) = self.plan.strn.iter().find(|(_, v)| v.0 == pc) {
             return self.strn_call(pc, g, cell, Helper::StrMethod);
         }
-        if self.plan.colm.contains_key(&pc) || self.plan.dvm.contains_key(&pc) {
+        if self.plan.colm.contains_key(&pc) {
             return self.colm_begin(pc);
+        }
+        if self.plan.dvm.contains_key(&pc) {
+            return self.dv_begin(pc);
         }
         if let Some((&g, &(_, cell))) = self.plan.dvm.iter().find(|(_, v)| v.0 == pc) {
             return self.dv_call(pc, g, cell);
@@ -5945,6 +5952,35 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
     }
 
+    /// The `GetMethod` of a fused DataView method site: as [`Tr::tagged_begin`] for an object,
+    /// but the receiver may stay borrowed (a Ref).
+    fn dv_begin(&mut self, pc: usize) -> Result<(), String> {
+        let d = self.stack.len();
+        let recv = match self.stack.last() {
+            Some(&Entry::Ref(p, _)) => p,
+            _ => return self.tagged_begin(pc, TAG_OBJ),
+        };
+        let st = self.stack.clone();
+        let pcv = self.i32c(pc as i64);
+        let tag = self.fb.load(MemKind::I32U8, recv, 0);
+        let ot = self.i32c(TAG_OBJ as i64);
+        let is_obj = self.fb.icmp(IntCC::Eq, tag, ot);
+        let bad = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(is_obj, cont, &[], bad, &[]);
+        self.fb.seal_block(bad);
+        self.fb.switch_to_block(bad);
+        self.call(Helper::SiteFailed, &[self.frame, pcv]);
+        let yes = self.i32c(1);
+        self.exit_if(yes, pc, EXIT_RESUME, &st, d);
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        self.set_stack_tag(d, TAG_UNDEFINED);
+        self.stack.push(Entry::Boxed);
+        Ok(())
+    }
+
     /// The `CallWithThis` of a fused DataView method site (see [`Plan::dvm`]): with a Number
     /// offset (and value), and a Boolean / Number / absent `littleEndian`, a DataView reading
     /// the intrinsic method ([`Helper::DvView`], cached per site until JS runs or a collection)
@@ -6001,7 +6037,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         let param = want.then(|| self.fb.append_block_param(join, Type::F64));
 
         // The view: cached for this receiver, or fresh.
-        let recv = self.sptr(base);
+        let borrowed = matches!(pre[base], Entry::Ref(..));
+        let recv = match pre[base] {
+            Entry::Ref(p, _) => p,
+            _ => self.sptr(base),
+        };
         let gc = self.fb.load(PTR_MEM, recv, VALUE_PAYLOAD);
         let epa = self.ptrc(&crate::interpreter::GC_EPOCH as *const _ as i64);
         let ep = self.fb.load(MemKind::I32, epa, 0);
@@ -6100,7 +6140,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                         self.fb.convert(ConvOp::Bitcast, Type::F64, x)
                     }
                 };
-                self.drop_at(base);
+                if !borrowed {
+                    self.drop_at(base);
+                }
                 match param {
                     Some(_) => self.fb.jump(join, &[x]),
                     None => {
@@ -6133,7 +6175,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                         self.fb.store(mk, at, x, 0);
                     }
                 }
-                self.drop_at(base);
+                // The result is `undefined` (a borrowed receiver's entry holds nothing live).
+                if borrowed {
+                    self.set_stack_tag(base, TAG_UNDEFINED);
+                } else {
+                    self.drop_at(base);
+                }
                 self.fb.jump(join, &[]);
             }
         }
