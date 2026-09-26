@@ -361,6 +361,8 @@ pub fn new_catch_scope(parent: Env) -> Env {
 
 /// A `with (obj)` environment: identifier lookups consult `obj` before the enclosing scope.
 pub fn new_with_scope(parent: Env, obj: Value) -> Env {
+    // Binding lookups read the object's property map: a split view becomes an Array first.
+    crate::split_view::unview_val(&obj);
     let e = Rc::new(RefCell::new(Scope {
         vars: Default::default(),
         parent: Some(parent),
@@ -2723,6 +2725,11 @@ impl Interp {
             return None;
         }
         if !o.borrow().ic_plain.get() {
+            // A split view reads its own elements without touching the property map (a miss
+            // past its length takes the generic path: the prototype chain).
+            if let Some(v) = crate::split_view::fast_get(o, n as usize) {
+                return Some(v);
+            }
             // Side-table objects: only a TypedArray has an element fast path.
             return self.fast_ta_get(o, n as usize);
         }
@@ -2930,6 +2937,12 @@ impl Interp {
                 }
                 if let Some(v) = self.try_ic_get(o, name, cache) {
                     return Ok(v);
+                }
+                // A split view misses every IC; its `length` is the stored own data property.
+                if name == "length" {
+                    if let Some(v) = crate::split_view::view_length(o) {
+                        return Ok(v);
+                    }
                 }
             }
             // Primitive receivers: named non-index reads (`"x".replace`, `(1).toFixed`) resolve
@@ -3836,6 +3849,14 @@ impl Interp {
             // Property — data reads are the hot path and were paying for three Rc bumps.
             let prop = {
                 let b = obj.borrow();
+                // A split view's elements are sliced out of its source on read.
+                if b.exotic == Exotic::SplitView {
+                    if let Callable::SplitView(v) = &b.call {
+                        if let Some(k) = crate::split_view::index_of_key(v, key) {
+                            return Ok(Value::Str(v.piece(k)));
+                        }
+                    }
+                }
                 b.props.get(key).map(|p| {
                     if p.accessor() {
                         (true, p.getter().cloned(), Value::Undefined)
@@ -4049,6 +4070,7 @@ impl Interp {
                 };
                 let mut cur = proto;
                 while let Some(o) = cur {
+                    crate::split_view::unview(&o);
                     // A proxy on the chain (or any accessor) takes over with the original receiver.
                     if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
                         return self.set_member_recv(&Value::Obj(o), key, value, receiver);
@@ -4091,6 +4113,8 @@ impl Interp {
             }
         };
 
+        // A split view becomes an ordinary Array before any write (see `crate::split_view`).
+        crate::split_view::unview(&obj);
         let ptr = Gc::as_ptr(&obj) as usize;
         // A module namespace exotic object's [[Set]] always fails: in strict code (all module code
         // is strict) the assignment throws a TypeError; a sloppy caller sees an inert no-op. The
@@ -4161,6 +4185,7 @@ impl Interp {
         // Walk the chain for an accessor or read-only data property.
         let mut cur = Some(obj.clone());
         while let Some(o) = cur {
+            crate::split_view::unview(&o);
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&o, Some(key))?;
             // A proxy on the chain handles the write itself (with the original receiver).
@@ -4272,6 +4297,7 @@ impl Interp {
         // probing the binding first so a TDZ export surfaces ReferenceError.
         let obj = match &receiver {
             Value::Obj(r) if !Gc::ptr_eq(r, &obj) => {
+                crate::split_view::unview(r);
                 // A deferred-namespace receiver evaluates before its own properties are consulted.
                 self.defer_trigger(r, Some(key))?;
                 let rptr = Gc::as_ptr(r) as usize;
@@ -5425,7 +5451,7 @@ impl Interp {
             self.new_target = Value::Undefined;
         }
         let r = match call {
-            Callable::None | Callable::Promise(_) => {
+            Callable::None | Callable::Promise(_) | Callable::SplitView(_) => {
                 Err(self.throw("TypeError", "value is not a function"))
             }
             Callable::Native(_) | Callable::NativeData(_) => self
@@ -7203,6 +7229,7 @@ impl Interp {
             }
             Callable::None
             | Callable::Promise(_)
+            | Callable::SplitView(_)
             | Callable::Resolver(..)
             | Callable::WrappedShadow(_)
             | Callable::WrappedCross(_)

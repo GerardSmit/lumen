@@ -186,6 +186,16 @@ impl Interp {
     /// `%ArrayIteratorPrototype%.next` is the intrinsic `next` (a fresh iterator has no own
     /// `next`). Pure: reads only, never calls out.
     pub(crate) fn pristine_array_iteration(&self, arr: &Gc) -> bool {
+        self.pristine_iteration(arr, false)
+    }
+
+    /// [`Interp::pristine_array_iteration`] for a lazy split view (see `crate::split_view`):
+    /// iterating it yields exactly its pieces, in order, running no user code.
+    pub(crate) fn pristine_view_iteration(&self, arr: &Gc) -> bool {
+        self.pristine_iteration(arr, true)
+    }
+
+    fn pristine_iteration(&self, arr: &Gc, view: bool) -> bool {
         let Some((values, next, aip)) = self.iter_intrinsics() else {
             return false;
         };
@@ -197,8 +207,12 @@ impl Interp {
             Ok(b) => b,
             Err(_) => return false,
         };
-        if !b.ic_plain.get()
-            || !matches!(b.exotic, Exotic::Array)
+        let kind_ok = if view {
+            b.exotic == Exotic::SplitView
+        } else {
+            b.ic_plain.get() && matches!(b.exotic, Exotic::Array)
+        };
+        if !kind_ok
             || !matches!(&b.proto, Some(p) if Gc::ptr_eq(p, &self.array_proto))
             || self.lang.own_iter.get(&b.props, &key).is_some()
         {

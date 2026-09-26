@@ -488,7 +488,9 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         }
         return Ok(true);
     }
-    // Ordinary [[SetPrototypeOf]].
+    // Ordinary [[SetPrototypeOf]]. A split view (either side) becomes an ordinary Array first.
+    crate::split_view::unview(&o);
+    crate::split_view::unview_val(proto);
     let cur = o
         .borrow()
         .proto
@@ -603,6 +605,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
                 return Ok(false);
             }
         }
+        crate::split_view::unview(o);
         o.borrow_mut().extensible = false;
     }
     Ok(true)
@@ -719,7 +722,10 @@ pub(crate) fn has_own_property_trapped(
             Value::Undefined
         ));
     }
-    Ok(matches!(v, Value::Obj(o) if o.borrow().props.contains(key)))
+    Ok(matches!(v, Value::Obj(o) if {
+        let b = o.borrow();
+        crate::split_view::has_own_elem_obj(&b, key) || b.props.contains(key)
+    }))
 }
 
 pub(crate) fn proxy_gopd_value(
@@ -1110,8 +1116,17 @@ fn ta_info(i: &Interp, o: &Gc) -> Option<crate::value::TaInfo> {
 }
 
 /// ToObject for an `Object.*` argument: an object is returned as-is, a primitive is boxed to its
-/// wrapper object, and null/undefined throw a TypeError.
+/// wrapper object, and null/undefined throw a TypeError. A split view comes back materialized
+/// (these callers read or write the property map directly — see `crate::split_view`).
 fn to_object_arg(i: &mut Interp, v: Value, method: &str) -> Result<Gc, Value> {
+    let o = to_object_arg_lazy(i, v, method)?;
+    crate::split_view::unview(&o);
+    Ok(o)
+}
+
+/// [`to_object_arg`] leaving a split view lazy: for callers that only [[Get]] / [[HasProperty]]
+/// through the generic (view-aware) paths or handle the view themselves.
+fn to_object_arg_lazy(i: &mut Interp, v: Value, method: &str) -> Result<Gc, Value> {
     match v {
         Value::Obj(o) => Ok(o),
         Value::Undefined | Value::Null => {
@@ -1128,7 +1143,7 @@ fn to_object_arg(i: &mut Interp, v: Value, method: &str) -> Result<Gc, Value> {
 /// ToObject for a generic `Array.prototype` method receiver: primitives are boxed (so the method
 /// reads the inherited array-like properties), null/undefined throw.
 fn arr_to_object(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
-    to_object_arg(i, this.clone(), "Array.prototype method")
+    to_object_arg_lazy(i, this.clone(), "Array.prototype method")
 }
 
 /// Set(to, key, value) with Throw=true, for Object.assign: a non-writable data property or a
@@ -1147,7 +1162,7 @@ fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
         }
         return json_is_array(i, &target);
     }
-    Ok(matches!(v, Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array)))
+    Ok(matches!(v, Value::Obj(o) if o.borrow().exotic.is_array()))
 }
 
 /// EnumerableOwnProperties for Object.values/entries: for each own string key (in order), do
@@ -1269,6 +1284,7 @@ fn reflect_ordinary_set(
     }
     let mut current = target.clone();
     loop {
+        crate::split_view::unview_val(&current);
         if proxy_pair(i, &current).is_some() {
             // A proxy's [[Set]] returns its own success boolean (via the trap or a forwarded [[Set]]).
             return ab(i.set_member_recv(&current, key, value, receiver.clone()));
@@ -1384,6 +1400,7 @@ pub(crate) fn reflect_define_on_receiver(
         Value::Obj(o) => o.clone(),
         _ => return Ok(false),
     };
+    crate::split_view::unview(&ro);
     // A TypedArray receiver's integer index is written through its exotic [[DefineOwnProperty]]
     // (CreateDataProperty semantics), not stored as an ordinary property.
     if let Some(info) = ta_info(i, &ro) {
@@ -1462,6 +1479,9 @@ pub(crate) fn reflect_ordinary_get(
                 TaIndex::Ordinary => {}
             }
         }
+        if let Some(v) = crate::split_view::own_elem(&obj, key) {
+            return Ok(v);
+        }
         let own = obj.borrow().props.get(key).cloned();
         match own {
             Some(p) if p.accessor() => {
@@ -1493,6 +1513,7 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
         return Ok(());
     }
     if let Value::Obj(o) = holder {
+        crate::split_view::unview(o);
         let present = o.borrow().props.contains(key);
         if !present {
             return Ok(());
@@ -2407,7 +2428,7 @@ fn is_constructor_value(v: &Value) -> bool {
     matches!(v, Value::Obj(o) if {
         let b = o.borrow();
         match &b.call {
-            Callable::None => false,
+            Callable::None | Callable::SplitView(_) => false,
             // A user function's constructability is determined by its shape: arrows, methods,
             // generators and async functions are never constructors (a generator still has a
             // `prototype` property, so the fallback below would misclassify it).
@@ -2583,7 +2604,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
         Value::Bool(_) => "Boolean",
         Value::Obj(o) => {
             let b = o.borrow();
-            if matches!(b.exotic, Exotic::Array) {
+            if b.exotic.is_array() {
                 "Array"
             } else if matches!(b.exotic, Exotic::Arguments) {
                 "Arguments"
@@ -3068,7 +3089,10 @@ fn install_object(it: &mut Interp) {
         if Interp::is_private_key(&key) {
             return Ok(Value::Bool(false));
         }
-        let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
+        let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
+        if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
+            return Ok(Value::Bool(true));
+        }
         // A TypedArray index in range is an own property even though it isn't in the property map;
         // a canonical-numeric non-index is never an own property.
         if let Some(info) = ta_info(i, &o) {
@@ -3155,6 +3179,7 @@ fn install_object(it: &mut Interp) {
                     return ab(i.get_member(&desc, if is_get { "get" } else { "set" }));
                 }
             } else if let Value::Obj(co) = &cur {
+                crate::split_view::unview(co);
                 if let Some(p) = co.borrow().props.get(&key) {
                     if p.accessor() {
                         let f = if is_get {
@@ -3506,7 +3531,10 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "create", 2, |i, _this, args| {
         let proto = match arg(args, 0) {
-            Value::Obj(o) => Some(o),
+            Value::Obj(o) => {
+                crate::split_view::unview(&o);
+                Some(o)
+            }
             Value::Null => None,
             _ => {
                 return Err(i.make_error("TypeError", "Object.create proto must be object or null"));
@@ -3778,7 +3806,10 @@ pub(crate) fn nf_object_has_own(
         _ => return Err(i.make_error("TypeError", "Object.hasOwn called on non-object")),
     };
     let key = ab(i.to_property_key(&arg(args, 1)))?;
-    let has = o.borrow().props.contains(&key);
+    let has = {
+        let b = o.borrow();
+        crate::split_view::has_own_elem_obj(&b, &key) || b.props.contains(&key)
+    };
     Ok(Value::Bool(has))
 }
 
@@ -4038,6 +4069,8 @@ fn define_own_property_ordinary(
     // structural change: conservatively invalidate the property-creation inline caches, whose
     // fill-time chain walks assumed no such shadow could appear (the op is rare).
     crate::value::bump_proto_epoch();
+    // A split view becomes an ordinary Array before any define.
+    crate::split_view::unview(o);
     let d = d.clone();
     // Module namespace [[DefineOwnProperty]]: a String key is only redefinable to a descriptor that
     // matches the export's fixed shape (writable, enumerable, non-configurable, same value); adding
@@ -4424,6 +4457,7 @@ pub(crate) fn array_push_one(i: &Interp, o: &Gc, v: Value) -> Result<f64, Value>
 
 pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    crate::split_view::unview(&o);
     // Dense fast path: a plain array whose `length` is a writable own data property and
     // whose tail is exactly the dense frontier appends in place — no key strings, no
     // existence scans, no observable coercions (a whole-number own `length` needs none).
@@ -4488,6 +4522,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
 
 pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    crate::split_view::unview(&o);
     // Dense fast path (mirror of push's): take the last element straight off the entries
     // tail — no key strings, no hash lookups, and crucially NO shape reset, so the array's
     // inline caches survive a pop (stack-discipline arrays live on push/pop).
@@ -4705,6 +4740,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
     });
     it.def_method(&ap, "copyWithin", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
+        crate::split_view::unview(&o);
         let ov = Value::Obj(o.clone());
         let len = ab(i.to_length(&o))? as i64;
         let target = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
@@ -4770,7 +4806,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         let mut v = arg(args, 0);
         loop {
             match &v {
-                Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {
+                Value::Obj(o) if o.borrow().exotic.is_array() => {
                     return Ok(Value::Bool(true));
                 }
                 Value::Obj(_) => match proxy_pair(i, &v) {
@@ -4860,6 +4896,12 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
                 ));
             if (!use_ctor || own_realm_ctor) && !mapfn.is_callable() {
                 if let Value::Obj(so) = &source {
+                    // A pristine split view: the copy is another view of the same pieces.
+                    if i.pristine_view_iteration(so) {
+                        if let Some(v) = crate::split_view::view_of(so) {
+                            return Ok(crate::split_view::make_view(&i.array_proto, v.slice(0, v.len())));
+                        }
+                    }
                     if i.pristine_array_iteration(so) {
                         if let Some(out) = i.dense_array_values(so) {
                             return Ok(i.make_array(out));
@@ -4982,7 +5024,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         }
         // Array-like path: ToObject, read length, construct with «len», then per-index Get
         // (lazily, so mutations during mapping are observed).
-        let o = to_object_arg(i, source.clone(), "Array.from")?;
+        let o = to_object_arg_lazy(i, source.clone(), "Array.from")?;
         let ov = Value::Obj(o.clone());
         let len = ab(i.to_length(&o))?;
         let intrinsic_ctor = matches!(&this, Value::Obj(c) if matches!(
@@ -8143,6 +8185,13 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
         Some(sep) => {
             // Splitting on "" yields one piece per UTF-16 code unit (a surrogate pair
             // becomes its two lone halves).
+            // A large split on a plain separator comes back as a lazy view over `s` (see
+            // `crate::split_view`): same pieces, one u32 each until read.
+            if !sep.is_empty() {
+                if let Some(view) = crate::split_view::split_offsets(&s, &sep, limit) {
+                    return Ok(crate::split_view::make_view(&i.array_proto, view));
+                }
+            }
             let mut parts: Vec<Value> = if sep.is_empty() {
                 crate::jstr::units(&s)
                     .into_iter()

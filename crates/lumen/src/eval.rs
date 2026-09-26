@@ -1561,6 +1561,12 @@ impl Interp {
                     .map(|c| Value::from_string(c.to_string()))
                     .collect());
             }
+            // A pristine split view iterates as its pieces.
+            Value::Obj(o) if self.pristine_view_iteration(o) => {
+                if let Some(v) = crate::split_view::view_of(o) {
+                    return Ok((0..v.len()).map(|k| Value::Str(v.piece(k))).collect());
+                }
+            }
             // A pristine Array iterates as its own elements (holes read through [[Get]], which
             // is what the intrinsic iterator does); any other Array uses the protocol.
             Value::Obj(o) if self.pristine_array_iteration(o) => {
@@ -2358,7 +2364,7 @@ impl Interp {
                 }
             }
         }
-        if o.borrow().props.contains(key) {
+        if o.borrow().props.contains(key) || crate::split_view::has_own_elem_obj(&o.borrow(), key) {
             return Ok(true);
         }
         let proto = o.borrow().proto.clone();
@@ -5041,6 +5047,8 @@ impl Interp {
             }
             return Ok(());
         }
+        // The key walk below reads the source's property map: a split view becomes an Array.
+        crate::split_view::unview_val(value);
         match value {
             Value::Obj(src) if excluded.is_empty() && self.copy_data_props_fast(rest, src) => {}
             Value::Obj(src) => {
@@ -5458,6 +5466,7 @@ impl Interp {
             {
                 if let Value::Obj(o) = &base {
                     self.defer_trigger(o, Some(prop))?;
+                    crate::split_view::unview(o);
                     let ptr = Gc::as_ptr(o) as usize;
                     if let Some((target, handler)) = self.proxy_at(ptr) {
                         let ok = self.proxy_delete(target, handler, prop)?;
@@ -5553,6 +5562,7 @@ impl Interp {
                         // an inherited one is untouched and reports true per OrdinaryDelete).
                         let (wobj, o) = (wobj.clone(), o.clone());
                         if self.with_has_binding(&wobj, name)? {
+                            crate::split_view::unview(&o);
                             let configurable = o
                                 .borrow()
                                 .props
@@ -5601,6 +5611,7 @@ impl Interp {
                 if let Some((t2, h2)) = self.proxies.get(&tptr).cloned() {
                     return self.proxy_delete(t2, h2, key);
                 }
+                crate::split_view::unview(t);
                 let configurable = t
                     .borrow()
                     .props

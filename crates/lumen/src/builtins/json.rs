@@ -450,6 +450,7 @@ impl JsonSer<'_> {
                             &owned
                         }
                         None => {
+                            crate::split_view::unview(o);
                             owned = match ta_info(i, o) {
                                 // A TypedArray's enumerable own keys: its indices, then string
                                 // expandos.
@@ -508,6 +509,7 @@ fn json_delete_prop(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Val
         return Ok(());
     }
     if let Value::Obj(o) = holder {
+        crate::split_view::unview(o);
         let configurable = o
             .borrow()
             .props
@@ -592,7 +594,10 @@ fn internalize_json_property(
                     .collect()
             } else {
                 val.as_obj()
-                    .map(|o| ordered_enum_keys(o).iter().map(|k| k.to_string()).collect())
+                    .map(|o| {
+                        crate::split_view::unview(o);
+                        ordered_enum_keys(o).iter().map(|k| k.to_string()).collect()
+                    })
                     .unwrap_or_default()
             };
             for k in keys {

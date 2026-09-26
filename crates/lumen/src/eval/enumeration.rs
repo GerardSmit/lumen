@@ -44,6 +44,8 @@ impl Interp {
             _ => None,
         };
         while let Some(o) = cur {
+            // Key enumeration reads the property map: a split view becomes an Array first.
+            crate::split_view::unview(&o);
             let ov = Value::Obj(o.clone());
             // A proxy level enumerates via its [[OwnPropertyKeys]] filtered by [[GetOwnProperty]]'s
             // enumerable flag, then walks its [[GetPrototypeOf]].

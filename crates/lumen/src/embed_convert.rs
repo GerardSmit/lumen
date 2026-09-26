@@ -953,7 +953,7 @@ impl<'a, T: FromJs<'a>> FromJs<'a> for Option<T> {
 impl<'a, T: FromJs<'a> + ArrayElem> FromJs<'a> for Vec<T> {
     /// A JS Array, element by element (reads go through `[[Get]]`, so getters run).
     fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        let is_array = matches!(v, Value::Obj(o) if o.borrow().exotic == Exotic::Array);
+        let is_array = matches!(v, Value::Obj(o) if o.borrow().exotic.is_array());
         if !is_array {
             return Err(cx.type_error(at, "must be an array"));
         }
