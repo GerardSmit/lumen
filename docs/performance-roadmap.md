@@ -568,7 +568,26 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       | Puppeteer AOT peak private memory | 42.1 MB | 37.4 MB (34.5 MB without the JIT) |
       | V8 suite score (fast build, two runs) | 725 / 731 | 824 / 805 (NavierStokes 1,541 → 2,900) |
 
-    - Left: IR volume. Every property read re-checks the tag, borrow flag, plain-object flag and shape, even on an object already checked in the same block with no call in between. Every exit materializes its state inline. Redundant-check elimination and shared exit stubs would cut both compile time and code size.
+    - IR volume, second pass:
+      - **Chained reads miss once.** `a.b.c` read through `chain_read` emitted the whole inline read a second time on its miss path. The miss now takes the slow path for both reads; only a `.length` consumer stays inline there, because a string's length is common.
+      - **Shared exit tails.** Every exit wrote back all the SSA locals, stored the operand depth and returned inline. Exits now store only their stack entries and jump to one of two shared tail blocks per unit (with or without the write-back), passing the depth and exit word as block parameters.
+      - **Branch-free function/`.prototype` pair check** in the inline release (`drop_mem`): 5 blocks instead of 7 at every drop.
+      - **No TDZ checks on slots that no `Tdz` op touches.** Only `Op::Tdz` makes a slot `Empty`, so reads of other slots skip the check.
+      - Measured on the V8 suite (fast build, every compile of the run):
+
+        | | Before | Now |
+        |---|---|---|
+        | optimized IR instructions | 823,645 | 691,832 |
+        | IR blocks | 173,442 | 147,043 |
+        | machine code | 3.02 MB | 2.41 MB |
+        | compile time, all 404–408 compiles | 2.00 s | 1.82 s |
+        | score | about 815–898 | 878–898 (noise) |
+
+      - Puppeteer AOT: 11 compiles in 12.9 ms (was 13.6 ms). Peak private memory is 36.8 MB (was 37.4 MB).
+      - Compile time is about 4% of the V8 suite's CPU time in a sampled profile. The gap to node there is in the generated code, not in compiling it.
+    - Left:
+      - Redundant shape guards. Reusing a guard across two reads of the same object needs the first read's miss path to exit rather than rejoin, since its slow path can run a getter that changes the object. Today the miss rejoins, so each read re-checks.
+      - Call sites clone arguments twice, once on the direct path and once on the slow path, and then release them with the full inline release.
 
 ## Open items
 

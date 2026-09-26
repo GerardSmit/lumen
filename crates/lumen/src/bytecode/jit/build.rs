@@ -435,6 +435,17 @@ fn build_region(
             defd,
             tdzd,
             func_mode,
+            tdz_slots: {
+                let mut t = vec![false; n_slots];
+                for op in &chunk.ops {
+                    if let Op::Tdz(s) = *op {
+                        if let Some(f) = t.get_mut(s as usize) {
+                            *f = true;
+                        }
+                    }
+                }
+                t
+            },
             helpers: vec![None; helpers::ALL.len()],
             leaders,
             stack: Vec::new(),
@@ -466,6 +477,7 @@ fn build_region(
             budget: None,
             call_flags: None,
             num_exits: Vec::new(),
+            exit_tails: [None, None],
         };
         tr.entry(&an);
         tr.body(&an)?;
@@ -1686,6 +1698,9 @@ enum Opnd {
 struct Tr<'a, 'f> {
     /// See [`Built::num_exits`].
     num_exits: Vec<usize>,
+    /// The shared ends of exits (see [`Tr::exit_tail`]): `[without, with]` the write-back of
+    /// the SSA locals.
+    exit_tails: [Option<Block>; 2],
     /// The safepoint budget, kept in a variable (`frame.budget` is read once at entry: only
     /// this code and [`Helper::Safepoint`], which resets it, use it).
     budget: Option<Variable>,
@@ -1718,6 +1733,9 @@ struct Tr<'a, 'f> {
     tdzd: Defd,
     /// Whole-function code (see [`build_fn`]) rather than a loop region.
     func_mode: bool,
+    /// The slots some `Tdz` op of the chunk puts into their TDZ: no other slot is ever
+    /// `Empty`, so its reads need no TDZ check.
+    tdz_slots: Vec<bool>,
     helpers: Vec<Option<FuncRef>>,
     leaders: Vec<Option<Leader>>,
     stack: Vec<Entry>,
@@ -2170,26 +2188,22 @@ impl<'a, 'f> Tr<'a, 'f> {
         let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
         let strong = self.fb.load(PTR_MEM, gc, so);
         let one = self.ptrc(1);
-        let live = self.fb.icmp(IntCC::Ugt, strong, one);
-        let chk_b = self.fb.create_block();
-        let pair_b = self.fb.create_block();
-        self.fb.brif(live, chk_b, &[], call_b, &[]);
-        self.fb.seal_block(chk_b);
-        self.fb.switch_to_block(chk_b);
+        let last = self.fb.icmp(IntCC::Ule, strong, one);
         // An object going down to one reference may be half of a function / `.prototype`
-        // pair the reference count frees (`Gc`'s drop): the Rust release checks.
+        // pair the reference count frees (`Gc`'s drop): the Rust release checks. Branch-free:
+        // the word after a string's count (its length and capacity) is readable too, and
+        // `is_obj` masks it out.
         let two = self.ptrc(2);
         let is2 = self.fb.icmp(IntCC::Eq, strong, two);
-        let maybe = self.fb.binary(BinaryOp::Band, is2, is_obj);
-        self.fb.brif(maybe, pair_b, &[], dec_b, &[]);
-        self.fb.seal_block(pair_b);
-        self.fb.switch_to_block(pair_b);
         let w = self.fb.load(PTR_MEM, gc, crate::value::GC_WEAK_OFFSET as i32);
         let flag = self.ptrc(crate::value::FN_PAIR_FLAG as i64);
         let fl = self.fb.binary(BinaryOp::Band, w, flag);
         let zp = self.ptrc(0);
         let paired = self.fb.icmp(IntCC::Ne, fl, zp);
-        self.fb.brif(paired, call_b, &[], dec_b, &[]);
+        let maybe = self.fb.binary(BinaryOp::Band, is2, is_obj);
+        let pair = self.fb.binary(BinaryOp::Band, maybe, paired);
+        let slow = self.fb.binary(BinaryOp::Bor, last, pair);
+        self.fb.brif(slow, call_b, &[], dec_b, &[]);
         self.fb.seal_block(dec_b);
         self.fb.seal_block(call_b);
         self.fb.switch_to_block(dec_b);
@@ -2294,8 +2308,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         // Function code that returns or throws out of the call leaves nothing that reads its
         // slots again (closures capture through the environment).
-        if !(self.func_mode && kind != EXIT_RESUME) {
+        let mut wb = !(self.func_mode && kind != EXIT_RESUME);
+        if wb && store.is_some() {
+            // The moved slot must not be written back: this exit writes back itself.
             self.write_back(store.map(|s| s.0));
+            wb = false;
         }
         if let Some((s, d)) = store {
             let p = self.sptr(d);
@@ -2303,10 +2320,36 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.call(Helper::StoreLocal, &[self.frame, sc, p]);
         }
         let dep = self.fb.iconst(Type::I64, depth as i64);
+        let w = self.fb.iconst(Type::I64, exit(pc, kind) as i64);
+        let tail = self.exit_tail(wb);
+        self.fb.jump(tail, &[dep, w]);
+    }
+
+    /// The block every exit ends in (`wb`: after writing back the SSA locals): it stores the
+    /// operand depth and returns the exit word, both its parameters. One copy per unit instead
+    /// of one per exit — a local whose value is the same at every exit needs no parameter at
+    /// all (the builder's trivial-parameter removal) — so exits cost their stack stores and a
+    /// jump. Sealed when the translation finishes (`FunctionBuilder::finish`).
+    fn exit_tail(&mut self, wb: bool) -> Block {
+        if let Some(b) = self.exit_tails[wb as usize] {
+            return b;
+        }
+        let tail = self.fb.create_block();
+        let dep = self.fb.append_block_param(tail, Type::I64);
+        let w = self.fb.append_block_param(tail, Type::I64);
+        let cur = self.fb.current_block();
+        self.fb.switch_to_block(tail);
+        if wb {
+            self.write_back(None);
+        }
         self.fb
             .store(MemKind::I64, self.frame, dep, FRAME_EXIT_DEPTH);
-        let w = self.fb.iconst(Type::I64, exit(pc, kind) as i64);
         self.fb.ret(&[w]);
+        if let Some(c) = cur {
+            self.fb.switch_to_block(c);
+        }
+        self.exit_tails[wb as usize] = Some(tail);
+        tail
     }
 
     /// A throw (the exception in `frame.exception`) under the region handler `(catch, hd)`:
@@ -3627,7 +3670,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                     return Ok(());
                 }
                 let obj = self.slot_ptr(s as usize);
-                self.slot_tdz_exit(obj, pc);
+                if self.tdz_slots[s as usize] {
+                    self.slot_tdz_exit(obj, pc);
+                }
                 self.prop_write(pc, n, c, obj, None)?;
             }
             Op::Undef => {
@@ -4126,9 +4171,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                         },
                     };
                     if self.chains(pc, n, c) {
-                        self.chain_read(pc, obj, c, d - 1, |t| {
-                            t.prop_read(pc, obj, n, c, None, d - 1, slow, Some(src))
-                        })?;
+                        self.chain_read(pc, obj, c, d - 1, slow)?;
                     } else {
                         self.prop_read(pc, obj, n, c, None, d - 1, slow, Some(src))?;
                     }
@@ -4153,12 +4196,14 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let slow = Slow::Prop {
                     n,
                     c,
-                    obj: PropObj::Slot(obj),
+                    obj: if self.tdz_slots[s as usize] {
+                        PropObj::Slot(obj)
+                    } else {
+                        PropObj::Ptr(obj)
+                    },
                 };
                 if self.chains(pc, n, c) {
-                    self.chain_read(pc, obj, c, d, |t| {
-                        t.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))
-                    })?;
+                    self.chain_read(pc, obj, c, d, slow)?;
                 } else {
                     self.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))?;
                 }
@@ -4367,7 +4412,9 @@ impl<'a, 'f> Tr<'a, 'f> {
             // Borrow the slot (the TDZ error comes from the interpreter).
             let _ = d;
             let p = self.slot_ptr(s);
-            self.slot_tdz_exit(p, pc);
+            if self.tdz_slots[s] {
+                self.slot_tdz_exit(p, pc);
+            }
             self.stack.push(Entry::Ref(p, Src::Slot(s as u16)));
         }
     }
@@ -4729,17 +4776,12 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// read at `pc + 1` (see [`Tr::chains`]): when the inline cache finds an object, it is lent
     /// to the consumer — stored in the entry without taking a reference, as a [`Src::Borrow`]
     /// Ref the consumer reads in place (its slow path takes a reference first) — which saves
-    /// the reference count's increment and the release after the read. Anything else reads
-    /// the usual way (`owned`), then runs the consumer on that. Both paths emit the consumer;
-    /// `body` skips it.
-    fn chain_read(
-        &mut self,
-        pc: usize,
-        obj: V,
-        c: u32,
-        at: usize,
-        owned: impl FnOnce(&mut Self) -> Result<(), String>,
-    ) -> Result<(), String> {
+    /// the reference count's increment and the release after the read. Anything else (a
+    /// shape the cache has not seen, or a value that is not an object) takes `slow` for the
+    /// read and the consumer's slow path too — the inline paths just failed, so emitting them
+    /// again would only duplicate code — except a `.length` consumer, which stays inline (a
+    /// string's length). `body` skips the consumer.
+    fn chain_read(&mut self, pc: usize, obj: V, c: u32, at: usize, slow: Slow) -> Result<(), String> {
         let ic = layout::prop_ic(self.chunk, c).ok_or("chained read without a cache")?;
         let pre = self.stack.clone();
         let other = self.fb.create_block();
@@ -4764,12 +4806,23 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(other);
         self.fb.switch_to_block(other);
         self.stack = pre;
-        owned(self)?;
-        if !self.fb.is_filled() {
-            self.chaining = true;
-            let r = self.op(pc + 1);
-            self.chaining = false;
-            r?;
+        if self.slow_path(pc, slow) && !self.fb.is_filled() {
+            let Op::GetProp(n2, c2) = self.ops[pc + 1] else {
+                return Err("chained read without a property consumer".into());
+            };
+            if &*self.chunk.names[n2 as usize] == "length" {
+                self.chaining = true;
+                let r = self.op(pc + 1);
+                self.chaining = false;
+                r?;
+            } else {
+                let slow2 = Slow::Prop {
+                    n: n2,
+                    c: c2,
+                    obj: PropObj::Stack(at),
+                };
+                self.slow_path(pc + 1, slow2);
+            }
         }
         let plain = (self.fb.current_block(), self.stack.clone());
         self.merge_paths(vec![lent, plain])?;
