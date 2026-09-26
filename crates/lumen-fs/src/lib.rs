@@ -324,7 +324,9 @@ fn op_read_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 fn op_write_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let data = arg_string(ctx, args, 1)?;
     if let Some(fd) = std_fd(args) {
-        write_std(ctx, fd, data.as_bytes(), "writeSync")?;
+        // Lone surrogates as U+FFFD, like Node's utf8 (see `lumen_host::well_formed_utf8`).
+        let text = lumen_host::well_formed_utf8(&data);
+        write_std(ctx, fd, text.as_bytes(), "writeSync")?;
         return Ok(Value::Undefined);
     }
     let handle = fd_handle(ctx, args)?;
@@ -387,7 +389,7 @@ fn op_pwrite_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let bytes = match args.get(1) {
         Some(v) => match ctx.typed_array_bytes(v) {
             Some(b) => b,
-            None => ctx.coerce_string(v)?.as_bytes().to_vec(),
+            None => lumen_host::well_formed_utf8(&ctx.coerce_string(v)?).as_bytes().to_vec(),
         },
         None => Vec::new(),
     };

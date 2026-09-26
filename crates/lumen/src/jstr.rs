@@ -333,3 +333,14 @@ pub fn from_code_points(cps: &[u32]) -> String {
     }
     from_units(&units)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn well_formed_undoes_smuggling() {
+        // U+10FFFF and U+10F800 (stored as smuggled pairs), a lone low and a lone high surrogate.
+        let s = super::from_units(&[0x78, 0xDBFF, 0xDFFF, 0xDBFE, 0xDC00, 0xDC00, 0xD800, 0x79]);
+        assert_eq!(super::well_formed(&s), "x\u{10FFFF}\u{10F800}\u{FFFD}\u{FFFD}y");
+        assert!(matches!(super::well_formed("plain é"), std::borrow::Cow::Borrowed(_)));
+    }
+}

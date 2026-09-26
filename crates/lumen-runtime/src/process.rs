@@ -479,7 +479,8 @@ fn write_raw(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Value
     let arg = args.first().unwrap_or(&Value::Undefined);
     let bytes = match ctx.typed_array_bytes(arg) {
         Some(b) => b,
-        None => ctx.coerce_string(arg)?.as_bytes().to_vec(),
+        // Lone surrogates as U+FFFD, like Node's utf8 (see `lumen_host::well_formed_utf8`).
+        None => lumen_host::well_formed_utf8(&ctx.coerce_string(arg)?).as_bytes().to_vec(),
     };
     let sinks = ctx
         .host_mut::<ConsoleOut>()
