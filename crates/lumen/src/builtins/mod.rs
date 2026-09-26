@@ -16,7 +16,7 @@ mod atomics;
 pub(crate) mod collection_data;
 pub(crate) mod collections;
 use collections::brand::{coll_ptr, coll_ptr_kind};
-mod dataview;
+pub(crate) mod dataview;
 mod date;
 mod disposable;
 mod errors;

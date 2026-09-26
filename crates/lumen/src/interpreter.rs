@@ -158,6 +158,11 @@ pub type Env = Rc<RefCell<Scope>>;
 /// V8's wording for a property read on `null`/`undefined`, which code in the wild matches on
 /// (`/Cannot read properties of null/`). The key is named when it is already a primitive; a key
 /// that would need coercion is left out, since ToObject(base) throws before ToPropertyKey runs.
+/// Bumped by every collection (on any thread): compiled code that caches an object's address
+/// across operations that may collect but run no JS (see `jit::build`'s DataView sites) checks
+/// it did not change, as a freed object's address can be reused.
+pub(crate) static GC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 impl Interp {
     /// The current async context (see the field).
     pub fn async_context(&self) -> Value {
@@ -4836,6 +4841,7 @@ impl Interp {
 
 
     pub(crate) fn gc_collect(&mut self) {
+        GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut scratch = std::mem::take(&mut self.gc_scratch);
         crate::value::gc_snapshot_into(&mut scratch.live);
         // Scopes are graph nodes too: a closure's captured environment references objects (its
