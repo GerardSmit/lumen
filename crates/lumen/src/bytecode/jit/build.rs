@@ -104,14 +104,31 @@ pub(crate) fn build(
     header: usize,
     backedge: usize,
     slots: &[Value],
+    widen: &[bool],
+    undef_ok: &[bool],
     this_val: &Value,
 ) -> Result<Built, String> {
     let an = analyze(chunk, header, backedge, false)?;
     let n_slots = chunk.n_slots;
     let mut kinds = vec![Kind::Boxed; n_slots];
+    // `Num` slots entered holding `undefined` too (see `Tr::entry`): after entry guards failed
+    // on such a slot, every local of the loop (a recursive function enters its loops with the
+    // locals of each new call unset, while a compile mid-loop saw them assigned).
+    let mut fresh = vec![false; n_slots];
+    let lenient = undef_ok.iter().any(|&u| u);
     for s in 0..n_slots {
-        if an.touched[s] {
+        if an.touched[s] && !widen.get(s).copied().unwrap_or(false) {
             kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
+            let local = s >= chunk.n_params
+                && chunk.arguments_slot != Some(s as u16)
+                && chunk.rest_slot != Some(s as u16);
+            if (undef_ok.get(s).copied().unwrap_or(false) || (lenient && local))
+                && matches!(slots.get(s), Some(Value::Num(_) | Value::Undefined))
+                && (kinds[s] == Kind::Num || undef_ok.get(s).copied().unwrap_or(false))
+            {
+                kinds[s] = Kind::Num;
+                fresh[s] = true;
+            }
         }
     }
     // Iterator-state slots stay Boxed: a protocol-free for-of state is a Number in the
@@ -121,8 +138,13 @@ pub(crate) fn build(
             Op::IterStepL(a, b) | Op::IterRestL(a, b) => {
                 kinds[a as usize] = Kind::Boxed;
                 kinds[b as usize] = Kind::Boxed;
+                fresh[a as usize] = false;
+                fresh[b as usize] = false;
             }
-            Op::IterCloseL(s) | Op::IterAbortL(s) => kinds[s as usize] = Kind::Boxed,
+            Op::IterCloseL(s) | Op::IterAbortL(s) => {
+                kinds[s as usize] = Kind::Boxed;
+                fresh[s as usize] = false;
+            }
             _ => {}
         }
     }
@@ -135,7 +157,7 @@ pub(crate) fn build(
         slots,
         an,
         kinds,
-        vec![false; n_slots],
+        fresh,
         false,
         this_val,
     )
@@ -149,7 +171,7 @@ pub(crate) fn build(
 /// slots Boxed (an earlier speculation on them failed). Ops the translator does not handle
 /// exit to the interpreter, which finishes the call.
 /// Ops beyond which a function is left to the loop tier (compile time and code size).
-const MAX_FN_OPS: usize = 4000;
+pub(crate) const MAX_FN_OPS: usize = 4000;
 
 pub(crate) fn build_fn(
     interp: &Interp,
@@ -157,6 +179,8 @@ pub(crate) fn build_fn(
     chunk: &Chunk,
     slots: &[Value],
     widen: &[bool],
+    not_num: &[bool],
+    guess: bool,
     this_val: &Value,
 ) -> Result<Built, String> {
     let n = chunk.ops.len();
@@ -167,8 +191,23 @@ pub(crate) fn build_fn(
         return Err(format!("function too large ({n} ops)"));
     }
     let an = analyze(chunk, 0, n - 1, true)?;
-    let (kinds, fresh) = fn_kinds(chunk, &an, slots, widen);
+    let (kinds, fresh) = fn_kinds(chunk, &an, slots, widen, not_num, guess);
     build_region(interp, env, chunk, 0, n - 1, slots, an, kinds, fresh, true, this_val)
+}
+
+/// Whether the method-lookup inline cache `cache` (a `GetMethod`'s ways) resolved the name on
+/// an object receiver. A string receiver's lookup caches `String.prototype` itself as the
+/// receiver (depth 0); any other way means the site's receivers are not (only) strings, so a
+/// `String.prototype` method plan chosen by name alone (`v.normalize()` on a vector class)
+/// would fail its guard.
+fn ic_saw_object(interp: &Interp, chunk: &Chunk, cache: u32) -> bool {
+    let sp = interp.string_proto.borrow().props.shape();
+    (0..crate::bytecode::PROP_IC_WAYS).any(|k| {
+        chunk.caches.get(cache as usize + k).is_some_and(|c| {
+            let st = c.get();
+            st.depth != crate::bytecode::IC_EMPTY && (st.depth != 0 || st.recv_shape != sp)
+        })
+    })
 }
 
 /// Function mode: the representation of each slot, and which `Num` slots start out
@@ -179,8 +218,18 @@ pub(crate) fn build_fn(
 /// write stores a value that is likely a Number (a Number constant, arithmetic, an update, a
 /// load of another such slot, an element / property read or a call result) and no op needs it
 /// in memory. A wrong guess costs resume exits at the writes, after which the function
-/// recompiles with the slot widened.
-fn fn_kinds(chunk: &Chunk, an: &Analysis, slots: &[Value], widen: &[bool]) -> (Vec<Kind>, Vec<bool>) {
+/// recompiles with the slot widened. Without `guess` (a guess already failed in this function),
+/// element / property reads and call results no longer count as likely Numbers: code that stores
+/// objects from calls into several locals would otherwise spend one recompile per local.
+/// `not_num` marks locals a loop compile of the chunk saw holding something else: never guessed.
+fn fn_kinds(
+    chunk: &Chunk,
+    an: &Analysis,
+    slots: &[Value],
+    widen: &[bool],
+    not_num: &[bool],
+    guess: bool,
+) -> (Vec<Kind>, Vec<bool>) {
     let n_slots = chunk.n_slots;
     let ops = &chunk.ops;
     let widened = |s: usize| widen.get(s).copied().unwrap_or(false);
@@ -196,7 +245,7 @@ fn fn_kinds(chunk: &Chunk, an: &Analysis, slots: &[Value], widen: &[bool]) -> (V
         if at_entry {
             kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
         } else {
-            cand[s] = true;
+            cand[s] = !not_num.get(s).copied().unwrap_or(false);
         }
     }
     let reach = |pc: usize| an.depth[pc].is_some();
@@ -258,14 +307,14 @@ fn fn_kinds(chunk: &Chunk, an: &Analysis, slots: &[Value], widen: &[bool]) -> (V
                             | Op::UShr
                             | Op::Neg
                             | Op::Plus
-                            | Op::BitNot
-                            | Op::GetElem
+                            | Op::BitNot => true,
+                            Op::GetElem
                             | Op::GetElemLocal(_)
                             | Op::GetProp(..)
                             | Op::GetPropThis(..)
                             | Op::GetPropLocal(..)
                             | Op::Call(_)
-                            | Op::CallWithThis(_) => true,
+                            | Op::CallWithThis(_) => guess,
                             Op::UpdateLocal(_, k) => {
                                 !matches!(k, UpdKind::IncDiscard | UpdKind::DecDiscard)
                             }
@@ -1400,8 +1449,10 @@ fn plan(
         {
             continue;
         }
-        let Op::GetMethod(m, _) = ops[pc] else { continue };
-        if chunk.names.get(m as usize).and_then(|n| helpers::str_intrinsic(n)).is_none() {
+        let Op::GetMethod(m, c) = ops[pc] else { continue };
+        if chunk.names.get(m as usize).and_then(|n| helpers::str_intrinsic(n)).is_none()
+            || ic_saw_object(interp, chunk, c)
+        {
             continue;
         }
         if let Some((call, args)) = site_args(pc + 1, false) {
@@ -1422,11 +1473,12 @@ fn plan(
         {
             continue;
         }
-        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        let Op::GetMethod(m, c) = ops[pc] else { continue };
         if !chunk
             .names
             .get(m as usize)
             .is_some_and(|n| helpers::str_native_method(interp, n))
+            || ic_saw_object(interp, chunk, c)
         {
             continue;
         }
@@ -2729,6 +2781,29 @@ impl<'a, 'f> Tr<'a, 'f> {
             if let Some(flag) = self.tdz[s] {
                 let z = self.i32c(0);
                 self.fb.def_var(flag, z);
+            }
+            if self.fresh[s] && !self.func_mode {
+                // Loop code: a Number, or `undefined` (the undef flag set) — anything else fails.
+                let off = s as i32 * VALUE_SIZE;
+                let t = self.fb.load(MemKind::I32U8, self.slots, off);
+                let want = self.i32c(TAG_NUM as i64);
+                let is_num = self.fb.icmp(IntCC::Eq, t, want);
+                let und = self.i32c(TAG_UNDEFINED as i64);
+                let is_und = self.fb.icmp(IntCC::Eq, t, und);
+                let ok = self.fb.binary(BinaryOp::Bor, is_num, is_und);
+                let next = self.fb.create_block();
+                self.fb.brif(ok, next, &[], fail, &[]);
+                self.fb.seal_block(next);
+                self.fb.switch_to_block(next);
+                let p = self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD);
+                let z = self.fb.f64const(0.0);
+                let v = self.fb.select(is_num, p, z);
+                self.fb.def_var(var, v);
+                let one = self.i32c(1);
+                let zero = self.i32c(0);
+                let f = self.fb.select(is_und, one, zero);
+                self.fb.def_var(self.undef[s].expect("declared"), f);
+                continue;
             }
             if self.fresh[s] {
                 // `undefined` at every entry: nothing to load or guard.
@@ -4211,7 +4286,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.seal_block(join);
                 self.fb.switch_to_block(join);
             }
-            Op::ArgsLen(..) | Op::ArgsGet(..) => self.exit_now(pc),
+            // A call: the interpreter's op (see `bytecode::virt_apply`) reads the slots.
+            Op::ApplyArgs(s, _) if self.kinds[s as usize] == Kind::Boxed => self.generic(pc),
+            Op::ArgsLen(..) | Op::ArgsGet(..) | Op::ApplyArgs(..) => self.exit_now(pc),
             Op::MakeRegExp(..) => {
                 self.soff(d + 1);
                 let (pcv, dst) = (self.i32c(pc as i64), self.sptr(d));

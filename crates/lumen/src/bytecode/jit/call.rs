@@ -41,6 +41,28 @@ const MAX_DIRECT_SLOTS: usize = 64;
 /// larger ones through [`Helper::DropN`].
 const DROP_INLINE_SLOTS: usize = 6;
 
+/// Whether the method-lookup inline cache `cache` (a `GetMethod`'s `PROP_IC_WAYS` ways) has
+/// seen receivers of more than one shape. A direct method site guards one receiver chain, so
+/// it would exit on the others and cost a recompile each (a loop over shapes of different
+/// classes calling `shape.intersect(ray)`): such a site is called through the generic path.
+fn method_ic_poly(chunk: &Chunk, cache: u32) -> bool {
+    let mut seen = None;
+    for k in 0..crate::bytecode::PROP_IC_WAYS {
+        let Some(st) = chunk.caches.get(cache as usize + k).map(|c| c.get()) else {
+            break;
+        };
+        if st.depth == crate::bytecode::IC_EMPTY {
+            continue;
+        }
+        match seen {
+            None => seen = Some(st.recv_shape),
+            Some(s) if s != st.recv_shape => return true,
+            Some(_) => {}
+        }
+    }
+    false
+}
+
 /// A direct call site (see the module docs).
 #[derive(Clone, Debug)]
 pub(super) struct DSite {
@@ -537,6 +559,47 @@ pub(super) fn plan_direct(
         None
     };
     let name = |n: u32| chunk.names.get(n as usize).map(|x| &**x);
+    // The current value of a name / `this` / Boxed local followed by data-property reads
+    // (`Flog.RayTracer.Color`): what a site's callee or receiver would be now. Only a planning
+    // hint: the call checks the callee (or the method lookup) at run time.
+    let chain_value = |mut pc: usize| -> Option<Value> {
+        let mut names: Vec<&str> = Vec::new();
+        let base = loop {
+            if names.len() > 6 {
+                return None;
+            }
+            match ops[pc] {
+                Op::GetProp(n, _) => {
+                    names.push(name(n)?);
+                    let t = an.depth[pc - header]?.checked_sub(1)?;
+                    let (rp, k) = producer(pc, t)?;
+                    if k != 0 {
+                        return None;
+                    }
+                    pc = rp;
+                }
+                Op::GetPropThis(n, _) => {
+                    names.push(name(n)?);
+                    break this_val.clone();
+                }
+                Op::GetPropLocal(s, n, _) if kinds.get(s as usize) == Some(&Kind::Boxed) => {
+                    names.push(name(n)?);
+                    break slots.get(s as usize)?.clone();
+                }
+                Op::LoadName(n, c) => break helpers::name_value(interp, chunk, env, n, c)?,
+                Op::LoadThis => break this_val.clone(),
+                Op::LoadLocal(s) if kinds.get(s as usize) == Some(&Kind::Boxed) => {
+                    break slots.get(s as usize)?.clone()
+                }
+                _ => return None,
+            }
+        };
+        let mut v = base;
+        for nm in names.iter().rev() {
+            v = method_value(interp, &v, nm)?;
+        }
+        Some(v)
+    };
     for q in header..=backedge {
         let Some(d) = an.depth[q - header] else { continue };
         let (argc, wt, construct) = match ops[q] {
@@ -563,7 +626,8 @@ pub(super) fn plan_direct(
         }
         // A producer whose inline validation failed is translated as usual (its callee is
         // then checked at the call).
-        let failed = helpers::math_site_failed(chunk, pp);
+        let failed = helpers::math_site_failed(chunk, pp)
+            || matches!(ops[pp], Op::GetMethod(_, c) if method_ic_poly(chunk, c));
         let mut adaptor = Adaptor::None;
         // The adaptor function (pinned: its word is compared).
         let mut adaptor_pin: Option<Value> = None;
@@ -580,6 +644,9 @@ pub(super) fn plan_direct(
             Op::LoadLocal(s) if pos == 0 && kinds.get(s as usize) == Some(&Kind::Boxed) => {
                 (slots.get(s as usize).cloned(), false)
             }
+            Op::GetProp(..) | Op::GetPropThis(..) | Op::GetPropLocal(..) if wt == 0 && pos == 0 => {
+                (chain_value(pp), false)
+            }
             Op::GetMethod(m, _) if wt == 1 && pos == 1 => {
                 let recv = match producer(pp, base) {
                     Some((rp, 0)) => match ops[rp] {
@@ -588,7 +655,7 @@ pub(super) fn plan_direct(
                         }
                         Op::LoadThis => Some(this_val.clone()),
                         Op::LoadName(n, c) => helpers::name_value(interp, chunk, env, n, c),
-                        _ => None,
+                        _ => chain_value(rp),
                     },
                     _ => None,
                 };
