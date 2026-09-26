@@ -1,8 +1,8 @@
 //! TLS transport for the runtime's `https`, `tls`, `fetch` and WebSocket clients.
 //!
-//! Unix loads the system OpenSSL at runtime (see `openssl`). Other targets have no backend yet:
-//! [`TlsStream`] exists so the runtime builds, and every connect or accept fails with a plain
-//! error the JS side reports like any failed connection.
+//! Unix loads the system OpenSSL at runtime (see `openssl`). Other targets (Windows) use rustls
+//! on the ring provider, trusting the operating system's certificate store (see `rustls`). Both
+//! backends expose the same [`TlsStream`] surface.
 
 #[cfg(unix)]
 mod openssl;
@@ -10,6 +10,6 @@ mod openssl;
 pub use openssl::TlsStream;
 
 #[cfg(not(unix))]
-mod unavailable;
+mod rustls;
 #[cfg(not(unix))]
-pub use unavailable::TlsStream;
+pub use self::rustls::TlsStream;

@@ -141,10 +141,6 @@ fn redis_convenience_methods_encode_arguments_and_convert_results() {
 
 #[test]
 fn redis_client_connects_over_tls() {
-    // lumen-tls has no Windows backend yet; the node server would wait forever for a client.
-    if cfg!(windows) {
-        return;
-    }
     if Command::new("openssl").arg("version").output().is_err()
         || Command::new("node").arg("--version").output().is_err()
     {
