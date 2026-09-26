@@ -569,6 +569,10 @@ fn ssl_candidates() -> &'static [&'static str] {
     {
         &["libssl.so.3", "libssl.so"]
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        &[]
+    }
 }
 fn crypto_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
@@ -582,6 +586,10 @@ fn crypto_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "linux")]
     {
         &["libcrypto.so.3", "libcrypto.so"]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        &[]
     }
 }
 
