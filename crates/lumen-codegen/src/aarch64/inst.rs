@@ -70,6 +70,17 @@ pub enum CallTarget {
 /// An argument passed on the stack: `(value, offset from the first stack slot, bytes)`.
 pub type StackArg = (VReg, i32, u8);
 
+/// A call's operands, boxed: calls are rare, and inline they would size every [`MInst`].
+#[derive(Clone, Debug)]
+pub struct CallInfo {
+    pub target: CallTarget,
+    pub reg_args: Vec<(VReg, PReg)>,
+    /// Outgoing stack arguments at `[sp + offset]`.
+    pub stack_args: Vec<StackArg>,
+    pub rets: Vec<(VReg, PReg)>,
+    pub clobbers: RegSet,
+}
+
 #[derive(Clone, Debug)]
 pub enum MInst {
     /// Function entry: parameters arrive in fixed registers or incoming stack slots
@@ -239,14 +250,7 @@ pub enum MInst {
         dst: VReg,
         src: VReg,
     },
-    Call {
-        target: CallTarget,
-        reg_args: Vec<(VReg, PReg)>,
-        /// Outgoing stack arguments at `[sp + offset]`.
-        stack_args: Vec<StackArg>,
-        rets: Vec<(VReg, PReg)>,
-        clobbers: RegSet,
-    },
+    Call(Box<CallInfo>),
     Jmp {
         target: usize,
         args: Vec<VReg>,
@@ -369,13 +373,14 @@ impl MachInst for MInst {
                 }
             }
             FCmp { a, b, .. } => uses(out, &[*a, *b]),
-            Call {
-                target,
-                reg_args,
-                stack_args,
-                rets,
-                ..
-            } => {
+            Call(c) => {
+                let CallInfo {
+                    target,
+                    reg_args,
+                    stack_args,
+                    rets,
+                    ..
+                } = &**c;
                 if let CallTarget::Reg(v) = target {
                     out.push(Operand {
                         late: true,
@@ -411,7 +416,7 @@ impl MachInst for MInst {
 
     fn clobbers(&self) -> RegSet {
         match self {
-            MInst::Call { clobbers, .. } => *clobbers,
+            MInst::Call(c) => c.clobbers,
             _ => RegSet::EMPTY,
         }
     }
@@ -429,7 +434,7 @@ impl MachInst for MInst {
     }
 
     fn is_call(&self) -> bool {
-        matches!(self, MInst::Call { .. })
+        matches!(self, MInst::Call(_))
     }
 
     fn jump_args(&self) -> Option<(usize, &[VReg])> {

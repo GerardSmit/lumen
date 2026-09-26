@@ -788,13 +788,14 @@ impl<'a> Emitter<'a> {
                     m => self.a.mov_load(size.w(), d, m),
                 }
             }
-            MInst::Call {
-                target,
-                reg_args,
-                stack_args,
-                rets,
-                ..
-            } => {
+            MInst::Call(c) => {
+                let CallInfo {
+                    target,
+                    reg_args,
+                    stack_args,
+                    rets,
+                    ..
+                } = &**c;
                 for &(v, off) in stack_args {
                     let dst = RM::mem(asm::RSP, off);
                     match (self.code.class(v), self.loc(v)) {
