@@ -463,6 +463,15 @@ fn build_region(
             dv_vars: HashMap::new(),
             bl_vars: HashMap::new(),
             push_vars: HashMap::new(),
+            ta_kinds: (0..n_slots)
+                .map(|s| match slots.get(s) {
+                    Some(Value::Obj(o)) => interp
+                        .typed_arrays
+                        .get(&(crate::value::Gc::as_ptr(o) as usize))
+                        .map_or(0, |t| helpers::ta_code_of(t.kind)),
+                    _ => 0,
+                })
+                .collect(),
             ta_slots: (0..n_slots)
                 .map(|s| match slots.get(s) {
                     Some(Value::Obj(o)) => interp
@@ -1842,6 +1851,8 @@ struct Tr<'a, 'f> {
     ta_vars: HashMap<usize, TaVars>,
     /// Slots holding a typed array when the region was compiled (see [`Tr::ta_first`]).
     ta_slots: Vec<bool>,
+    /// The [`helpers::ta_code`] of the typed array each slot held at compile time (0 = none).
+    ta_kinds: Vec<u32>,
     /// Typed-array length caches, per `length` read pc.
     ta_len_vars: HashMap<usize, TaLenVars>,
     /// DataView view caches, per [`Plan::dvm`] call pc.
@@ -1991,7 +2002,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             .chain(self.arr_vars.values().map(|a| (a.kind, Type::I32)))
             .chain(self.idx_vars.values().map(|&v| (v, Type::I32)))
             .chain(self.math_vars.values().map(|&v| (v, Type::I32)))
-            .chain(self.ta_vars.values().map(|t| (t.kind, Type::I32)))
+            .chain(self.ta_vars.values().map(|t| (t.obj, PTR)))
             .chain(self.ta_len_vars.values().map(|t| (t.ok, Type::I32)))
             .chain(self.dv_vars.values().map(|t| (t.ok, Type::I32)))
             .chain(self.bl_vars.values().map(|t| (t.0.ok, Type::I32)))
@@ -7398,7 +7409,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let slow_b = if ta_first { miss } else { self.fb.create_block() };
         if ta_first {
             let ord = self.fb.create_block();
-            if let Some(x) = self.ta_access(pc, obj, key, None, ord, slow_b) {
+            if let Some(x) = self.ta_access(pc, obj, key, None, ord, slow_b, src) {
                 self.read_hit(drop, want, at, join, x);
             }
             self.fb.seal_block(ord);
@@ -7422,7 +7433,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(miss);
             self.fb.switch_to_block(miss);
             self.stack = pre.clone();
-            if let Some(x) = self.ta_access(pc, obj, key, None, slow_b, slow_b) {
+            if let Some(x) = self.ta_access(pc, obj, key, None, slow_b, slow_b, src) {
                 self.read_hit(drop, want, at, join, x);
             }
         }
@@ -7576,7 +7587,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         // Typed arrays first or after the ordinary path (see `elem_read`).
         if ta_first {
             let ord = self.fb.create_block();
-            if self.ta_access(pc, obj, key, Some(vf), ord, slow_b).is_some() {
+            if self.ta_access(pc, obj, key, Some(vf), ord, slow_b, src).is_some() {
                 self.write_hit(drop, keep && boxed, base, join, vf);
             }
             self.fb.seal_block(ord);
@@ -7591,7 +7602,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(miss);
             self.fb.switch_to_block(miss);
             self.stack = pre.clone();
-            if self.ta_access(pc, obj, key, Some(vf), slow_b, slow_b).is_some() {
+            if self.ta_access(pc, obj, key, Some(vf), slow_b, slow_b, src).is_some() {
                 self.write_hit(drop, keep && boxed, base, join, vf);
             }
         }
@@ -7675,8 +7686,11 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// accepts and `key` an integer in bounds. The view is cached per site until JS runs; the
     /// cached handle is only trusted together with `ic_plain` being clear (a freed typed
     /// array's address can only be reused without JS by an ordinary object, which has it
-    /// set). Sites without a cache ([`Tr::ta_vars`]) take a fresh view every time. Always
-    /// `Some` (kept for the callers' shape).
+    /// set). Sites without a cache ([`Tr::ta_vars`]) take a fresh view every time. A receiver
+    /// local that held a typed array at compile time specializes the site to that element
+    /// kind (other kinds dispatch on the fresh view). Always `Some` (kept for the callers'
+    /// shape).
+    #[allow(clippy::too_many_arguments)]
     fn ta_access(
         &mut self,
         pc: usize,
@@ -7685,16 +7699,38 @@ impl<'a, 'f> Tr<'a, 'f> {
         store: Option<V>,
         other: Block,
         slow: Block,
+        src: Option<Src>,
     ) -> Option<V> {
         use helpers::ta_code as tc;
         let cache = self.ta_vars.get(&pc).copied();
+        let want = match (src, cache) {
+            (Some(Src::Slot(s)), Some(_)) => self.ta_kinds.get(s as usize).copied().unwrap_or(0),
+            _ => 0,
+        };
         let gc = layout::side_table_object(&mut self.fb, obj, other);
         self.seal_current();
-        // The cached view, or a fresh one.
+        // The index: an int32 key as is, else an F64 checked integral (negative ones wrap above
+        // any length).
+        let (i, exact) = match self.int32_of(key) {
+            Some(x) if PTR == Type::I64 => (self.fb.convert(ConvOp::Sext, PTR, x), None),
+            Some(x) => (x, None),
+            None => {
+                let i = self.to_index(key);
+                let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
+                (i, Some(self.fb.fcmp(FloatCC::Eq, back, key)))
+            }
+        };
+        // The generic view (any kind) and the specialized one.
         let have = self.fb.create_block();
         let hk = self.fb.append_block_param(have, Type::I32);
         let hd = self.fb.append_block_param(have, PTR);
         let hl = self.fb.append_block_param(have, PTR);
+        let fast = (want != 0).then(|| {
+            let b = self.fb.create_block();
+            let d = self.fb.append_block_param(b, PTR);
+            let l = self.fb.append_block_param(b, PTR);
+            (b, d, l)
+        });
         if let Some(t) = cache {
             let refresh = self.fb.create_block();
             let (ck, co, cd, cl) = (
@@ -7703,11 +7739,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.use_var(t.data),
                 self.fb.use_var(t.len),
             );
-            let z = self.i32c(0);
-            let kset = self.fb.icmp(IntCC::Ne, ck, z);
-            let same = self.fb.icmp(IntCC::Eq, gc, co);
-            let hit = self.fb.binary(BinaryOp::Band, kset, same);
-            self.fb.brif(hit, have, &[ck, cd, cl], refresh, &[]);
+            // The cached handle is 0 while unset (and, specialized, for another kind).
+            let hit = self.fb.icmp(IntCC::Eq, gc, co);
+            match fast {
+                Some((fb_, _, _)) => self.fb.brif(hit, fb_, &[cd, cl], refresh, &[]),
+                None => self.fb.brif(hit, have, &[ck, cd, cl], refresh, &[]),
+            }
             self.fb.seal_block(refresh);
             self.fb.switch_to_block(refresh);
         }
@@ -7736,98 +7773,51 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         let data = self.fb.load(PTR_MEM, self.frame, FRAME_TA_DATA);
         let len = self.fb.load(PTR_MEM, self.frame, FRAME_TA_LEN);
+        let z = self.i32c(0);
         if let Some(t) = cache {
+            let good = match want {
+                0 => self.fb.icmp(IntCC::Ne, k, z),
+                w => {
+                    let wc = self.i32c(w as i64);
+                    self.fb.icmp(IntCC::Eq, k, wc)
+                }
+            };
+            let zp = self.ptrc(0);
+            let co = self.fb.select(good, gc, zp);
             self.fb.def_var(t.kind, k);
-            self.fb.def_var(t.obj, gc);
+            self.fb.def_var(t.obj, co);
             self.fb.def_var(t.data, data);
             self.fb.def_var(t.len, len);
+            if let Some((fb_, _, _)) = fast {
+                let other_kind = self.fb.create_block();
+                self.fb.brif(good, fb_, &[data, len], other_kind, &[]);
+                self.fb.seal_block(other_kind);
+                self.fb.switch_to_block(other_kind);
+            }
         }
-        let z = self.i32c(0);
         let none = self.fb.icmp(IntCC::Eq, k, z);
         self.fb.brif(none, slow, &[], have, &[k, data, len]);
-        self.fb.seal_block(have);
-        self.fb.switch_to_block(have);
-        // An integer index in bounds (negative ones wrap above any length).
-        let i = self.to_index(key);
-        let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
-        let exact = self.fb.fcmp(FloatCC::Eq, back, key);
-        let inb = self.fb.icmp(IntCC::Ult, i, hl);
-        let ok = self.fb.binary(BinaryOp::Band, exact, inb);
-        let go = self.fb.create_block();
-        self.fb.brif(ok, go, &[], slow, &[]);
-        self.fb.seal_block(go);
-        self.fb.switch_to_block(go);
         let done = self.fb.create_block();
         let res = store.is_none().then(|| self.fb.append_block_param(done, Type::F64));
+        // The specialized access.
+        if let Some((fb_, fd, fl)) = fast {
+            self.fb.seal_block(fb_);
+            self.fb.switch_to_block(fb_);
+            self.ta_bounds(i, exact, fl, slow);
+            self.ta_elem(want, fd, i, store, done);
+        }
+        // Any kind: dispatch on it.
+        self.fb.seal_block(have);
+        self.fb.switch_to_block(have);
+        self.ta_bounds(i, exact, hl, slow);
         let blocks: Vec<Block> = (1..tc::END).map(|_| self.fb.create_block()).collect();
         let mut targets = vec![(slow, Vec::new())];
         targets.extend(blocks.iter().map(|&b| (b, Vec::new())));
         self.fb.br_table(hk, &targets, (slow, &[]));
         for (n, &b) in blocks.iter().enumerate() {
-            let code = n as u32 + 1;
             self.fb.seal_block(b);
             self.fb.switch_to_block(b);
-            let (mk, es) = match code {
-                tc::I8 => (MemKind::I32S8, 1),
-                tc::U8 | tc::U8C => (MemKind::I32U8, 1),
-                tc::I16 => (MemKind::I32S16, 2),
-                tc::U16 => (MemKind::I32U16, 2),
-                tc::I32 => (MemKind::I32, 4),
-                tc::U32 => (MemKind::I64U32, 4),
-                tc::F32 => (MemKind::F32, 4),
-                _ => (MemKind::F64, 8),
-            };
-            let at = if es == 1 {
-                self.fb.binary(BinaryOp::Iadd, hd, i)
-            } else {
-                let c = self.fb.iconst(PTR, es);
-                let off = self.fb.binary(BinaryOp::Imul, i, c);
-                self.fb.binary(BinaryOp::Iadd, hd, off)
-            };
-            match store {
-                None => {
-                    let x = self.fb.load(mk, at, 0);
-                    let f = match code {
-                        tc::F64 => x,
-                        tc::F32 => self.fb.convert(ConvOp::Promote, Type::F64, x),
-                        _ => self.fb.convert(ConvOp::FromSint, Type::F64, x),
-                    };
-                    self.fb.jump(done, &[f]);
-                }
-                Some(n) => {
-                    match code {
-                        tc::F64 => self.fb.store(MemKind::F64, at, n, 0),
-                        tc::F32 => {
-                            let x = self.fb.convert(ConvOp::Demote, Type::F32, n);
-                            self.fb.store(MemKind::F32, at, x, 0);
-                        }
-                        tc::U8C => {
-                            // ToUint8Clamp: NaN and <= 0 give 0, >= 255 gives 255, else round
-                            // half to even.
-                            let zf = self.fb.f64const(0.0);
-                            let top = self.fb.f64const(255.0);
-                            let pos = self.fb.fcmp(FloatCC::Gt, n, zf);
-                            let c = self.fb.select(pos, n, zf);
-                            let lt = self.fb.fcmp(FloatCC::Lt, c, top);
-                            let c = self.fb.select(lt, c, top);
-                            let r = self.fb.unary(UnaryOp::Nearest, c);
-                            let x = self.fb.convert(ConvOp::ToSintSat, Type::I32, r);
-                            self.fb.store(MemKind::I32U8, at, x, 0);
-                        }
-                        _ => {
-                            // ToInt32, then keep the low bits (ToInt8 / ToUint16 / ... wrap).
-                            let x = self.to_int32(n);
-                            let mk = match es {
-                                1 => MemKind::I32U8,
-                                2 => MemKind::I32U16,
-                                _ => MemKind::I32,
-                            };
-                            self.fb.store(mk, at, x, 0);
-                        }
-                    }
-                    self.fb.jump(done, &[]);
-                }
-            }
+            self.ta_elem(n as u32 + 1, hd, i, store, done);
         }
         self.fb.seal_block(done);
         self.fb.switch_to_block(done);
@@ -7835,6 +7825,99 @@ impl<'a, 'f> Tr<'a, 'f> {
             Some(r) => r,
             None => self.fb.f64const(0.0),
         })
+    }
+
+    /// Continue when index `i` (with `exact`, whether the F64 key was integral) is below `len`;
+    /// else to `slow`.
+    fn ta_bounds(&mut self, i: V, exact: Option<V>, len: V, slow: Block) {
+        let inb = self.fb.icmp(IntCC::Ult, i, len);
+        let ok = match exact {
+            Some(e) => self.fb.binary(BinaryOp::Band, e, inb),
+            None => inb,
+        };
+        let go = self.fb.create_block();
+        self.fb.brif(ok, go, &[], slow, &[]);
+        self.fb.seal_block(go);
+        self.fb.switch_to_block(go);
+    }
+
+    /// Element `i` of kind `code` at `data`: loaded (F64, to `done`'s parameter) or, with
+    /// `store`, stored with the kind's conversion; then jumps to `done`.
+    fn ta_elem(&mut self, code: u32, data: V, i: V, store: Option<V>, done: Block) {
+        use helpers::ta_code as tc;
+        let (mk, es) = match code {
+            tc::I8 => (MemKind::I32S8, 1),
+            tc::U8 | tc::U8C => (MemKind::I32U8, 1),
+            tc::I16 => (MemKind::I32S16, 2),
+            tc::U16 => (MemKind::I32U16, 2),
+            tc::I32 => (MemKind::I32, 4),
+            tc::U32 => (MemKind::I64U32, 4),
+            tc::F32 => (MemKind::F32, 4),
+            _ => (MemKind::F64, 8),
+        };
+        let at = if es == 1 {
+            self.fb.binary(BinaryOp::Iadd, data, i)
+        } else {
+            let c = self.fb.iconst(PTR, es);
+            let off = self.fb.binary(BinaryOp::Imul, i, c);
+            self.fb.binary(BinaryOp::Iadd, data, off)
+        };
+        match store {
+            None => {
+                let x = self.fb.load(mk, at, 0);
+                let f = match code {
+                    tc::F64 => x,
+                    tc::F32 => self.fb.convert(ConvOp::Promote, Type::F64, x),
+                    _ => self.fb.convert(ConvOp::FromSint, Type::F64, x),
+                };
+                self.fb.jump(done, &[f]);
+            }
+            Some(n) => {
+                match code {
+                    tc::F64 => self.fb.store(MemKind::F64, at, n, 0),
+                    tc::F32 => {
+                        let x = self.fb.convert(ConvOp::Demote, Type::F32, n);
+                        self.fb.store(MemKind::F32, at, x, 0);
+                    }
+                    tc::U8C => {
+                        let x = match self.int32_of(n) {
+                            // An int32: clamp as integers.
+                            Some(x) => {
+                                let (z, top) = (self.i32c(0), self.i32c(255));
+                                let pos = self.fb.icmp(IntCC::Sgt, x, z);
+                                let c = self.fb.select(pos, x, z);
+                                let lt = self.fb.icmp(IntCC::Slt, c, top);
+                                self.fb.select(lt, c, top)
+                            }
+                            None => {
+                                // ToUint8Clamp: NaN and <= 0 give 0, >= 255 gives 255, else
+                                // round half to even.
+                                let zf = self.fb.f64const(0.0);
+                                let top = self.fb.f64const(255.0);
+                                let pos = self.fb.fcmp(FloatCC::Gt, n, zf);
+                                let c = self.fb.select(pos, n, zf);
+                                let lt = self.fb.fcmp(FloatCC::Lt, c, top);
+                                let c = self.fb.select(lt, c, top);
+                                let r = self.fb.unary(UnaryOp::Nearest, c);
+                                self.fb.convert(ConvOp::ToSintSat, Type::I32, r)
+                            }
+                        };
+                        self.fb.store(MemKind::I32U8, at, x, 0);
+                    }
+                    _ => {
+                        // ToInt32, then keep the low bits (ToInt8 / ToUint16 / ... wrap).
+                        let x = self.to_int32_fast(n);
+                        let mk = match es {
+                            1 => MemKind::I32U8,
+                            2 => MemKind::I32U16,
+                            _ => MemKind::I32,
+                        };
+                        self.fb.store(mk, at, x, 0);
+                    }
+                }
+                self.fb.jump(done, &[]);
+            }
+        }
     }
 
     /// `obj.byteLength` with the result at `at`: the intrinsic ArrayBuffer / DataView getter's
