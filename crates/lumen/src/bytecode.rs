@@ -18,7 +18,6 @@
 //! `--tier`, or `Engine::set_tier`.
 
 mod activation;
-mod call_spread;
 pub(crate) mod array_destructure;
 pub(crate) mod class_fields;
 pub(crate) mod ctor_plan;

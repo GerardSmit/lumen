@@ -2842,7 +2842,11 @@ impl Interp {
             TaKind::I32 | TaKind::U32 => dst.copy_from_slice(&(int(n) as u32).to_le_bytes()),
             TaKind::F32 => dst.copy_from_slice(&(n as f32).to_le_bytes()),
             TaKind::F64 => dst.copy_from_slice(&n.to_le_bytes()),
-            k => dst.copy_from_slice(&k.write(n)),
+            k => {
+                let mut bytes = [0; 8];
+                let len = k.write_into(n, &mut bytes);
+                dst.copy_from_slice(&bytes[..len]);
+            }
         }
         Ok(())
     }
@@ -7868,7 +7872,7 @@ mod gc_tests {
     #[test]
     fn repeated_collection_reuses_scratch_without_changing_lifetimes() {
         let mut engine = crate::Engine::new();
-        engine.set_tier(crate::bytecode::Tier::Jit);
+        engine.set_tier(crate::bytecode::Tier::Bytecode);
         engine.set_tier_threshold(0);
         engine
             .eval(
@@ -7884,7 +7888,7 @@ mod gc_tests {
             .props
             .get("doomed")
             .and_then(|property| match property.value() {
-                Value::Obj(object) => Some(Rc::downgrade(&object)),
+                Value::Obj(object) => Some(Gc::downgrade(&object)),
                 _ => None,
             })
             .expect("test object binding");

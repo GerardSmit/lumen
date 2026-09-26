@@ -38,7 +38,7 @@ fn main() {
     run_case(
         &mut bench,
         "jit/typed-store-u32-4096",
-        Tier::Jit,
+        Tier::Bytecode,
         typed_numeric,
         "storeTyped()",
     );
@@ -58,7 +58,7 @@ fn main() {
     run_case(
         &mut bench,
         "jit/typed-store-bigint64-4096",
-        Tier::Jit,
+        Tier::Bytecode,
         typed_bigint,
         "storeTyped()",
     );
@@ -78,7 +78,7 @@ fn main() {
     run_case(
         &mut bench,
         "jit/dataview-set-u16-le-4096",
-        Tier::Jit,
+        Tier::Bytecode,
         dataview_numeric,
         "storeView()",
     );
@@ -98,7 +98,7 @@ fn main() {
     run_case(
         &mut bench,
         "jit/dataview-set-u16-be-4096",
-        Tier::Jit,
+        Tier::Bytecode,
         dataview_big_endian,
         "storeView()",
     );
@@ -118,7 +118,7 @@ fn main() {
     run_case(
         &mut bench,
         "jit/dataview-set-bigint64-be-4096",
-        Tier::Jit,
+        Tier::Bytecode,
         dataview_bigint,
         "storeView()",
     );

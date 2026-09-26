@@ -179,7 +179,7 @@ mod tests {
             assert(recursive.next.next.next.value===0);
             let threw=false;
             try{new Empty(-1);}catch(e){
-                threw=e.message==='negative' && e.stack.includes('at Empty');
+                threw=e.message==='negative' && e.stack.includes('at new Empty');
             }
             assert(threw && new Empty(1).next.value===0);
         "#,

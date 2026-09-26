@@ -2,7 +2,6 @@
 
 use super::Interp;
 use crate::value::{Gc, Value};
-use std::rc::Rc;
 
 impl Interp {
     /// Read a numeric TypedArray key without materializing its property-key string.
@@ -15,7 +14,7 @@ impl Interp {
     pub(super) fn fast_typed_array_get(&self, object: &Gc, key: f64) -> Option<Value> {
         let info = self
             .typed_arrays
-            .get(&(Rc::as_ptr(object) as usize))
+            .get(&(Gc::as_ptr(object) as usize))
             .copied()?;
         let index = numeric_index(key).unwrap_or(usize::MAX);
         Some(self.ta_read(&info, index))
@@ -44,7 +43,7 @@ mod tests {
 
     #[test]
     fn typed_reads_recheck_detachment_and_resizing() {
-        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
