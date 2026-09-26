@@ -263,6 +263,10 @@ fn rotate_loops(f: &Function, cfg: &Cfg, mut order: Vec<Block>) -> Vec<Block> {
         .collect();
     for h in headers {
         let pos = |order: &[Block], b: Block| order.iter().position(|&x| x == b);
+        // Only a loop header has a latch: skip the linear searches for every other branch.
+        if !cfg.preds[h.index()].iter().any(|&p| cfg.dominates(h, p)) {
+            continue;
+        }
         let Some(hp) = pos(&order, h) else { continue };
         // The back edge from the latest block in layout (a latch the header dominates).
         let latch = cfg.preds[h.index()]

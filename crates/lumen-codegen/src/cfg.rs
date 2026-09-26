@@ -111,6 +111,11 @@ impl Cfg {
         if !self.is_reachable(b) {
             return true;
         }
+        // A dominator precedes what it dominates in reverse postorder: this answers nearly every
+        // query (forward edges, unrelated blocks) without walking a possibly deep idom chain.
+        if self.rpo_index[a.index()] > self.rpo_index[b.index()] {
+            return false;
+        }
         loop {
             if a == b {
                 return true;
@@ -137,21 +142,31 @@ impl Cfg {
         // A back edge p -> h has h dominating p; the loop body is everything reaching p without
         // passing h.
         let mut depth = vec![0u32; self.idom.len()];
+        // `mark[b] == stamp` while `b` is in the body being collected (one stamp per back edge).
+        let mut mark = vec![0u32; self.idom.len()];
+        let mut stamp = 0u32;
+        let mut body = Vec::new();
+        let mut work = Vec::new();
         for &h in &self.rpo {
             for &p in &self.preds[h.index()] {
                 if !self.dominates(h, p) {
                     continue;
                 }
-                let mut body = vec![h];
-                let mut work = vec![p];
+                stamp += 1;
+                body.clear();
+                body.push(h);
+                mark[h.index()] = stamp;
+                work.clear();
+                work.push(p);
                 while let Some(x) = work.pop() {
-                    if body.contains(&x) {
+                    if mark[x.index()] == stamp {
                         continue;
                     }
+                    mark[x.index()] = stamp;
                     body.push(x);
                     work.extend(self.preds[x.index()].iter().copied());
                 }
-                for b in body {
+                for &b in &body {
                     depth[b.index()] += 1;
                 }
             }

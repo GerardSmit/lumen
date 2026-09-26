@@ -61,7 +61,7 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
     // ----- per-block gen/kill and liveness -----
     // Upward-exposed uses (gen) and defs (kill) per block, as lists. Only a value in some
     // block's gen can be live into (and so out of) any block: liveness is solved over those
-    // "global" values alone, densely renumbered (most values are block-local).
+    // "global" values alone (most values are block-local).
     let mut ops = Vec::new();
     let mut gen_l: Vec<Vec<u32>> = vec![Vec::new(); nb];
     let mut kill_l: Vec<Vec<u32>> = vec![Vec::new(); nb];
@@ -95,52 +95,69 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
         }
     }
     drop((kill_at, gen_at));
-    let mut gidx = vec![u32::MAX; nv];
-    let mut globals: Vec<u32> = Vec::new();
-    for &v in gen_l.iter().flatten() {
-        if gidx[v as usize] == u32::MAX {
-            gidx[v as usize] = globals.len() as u32;
-            globals.push(v);
+    // Liveness per global value by path exploration: from each block where it is upward-exposed,
+    // walk predecessors (live out of each) until a block that defines it. Linear in the total
+    // size of the live ranges, where dense per-block bitsets were blocks x globals per pass.
+    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    for (bi, b) in code.blocks.iter().enumerate() {
+        for &s in &b.succs {
+            preds[s].push(bi as u32);
         }
     }
-    let words = globals.len().div_ceil(64);
-    let mut gen = vec![vec![0u64; words]; nb];
-    let mut kill = vec![vec![0u64; words]; nb];
-    let set = |s: &mut Vec<u64>, g: u32| s[g as usize / 64] |= 1 << (g % 64);
-    for bi in 0..nb {
-        for &v in &gen_l[bi] {
-            set(&mut gen[bi], gidx[v as usize]);
+    let mut gen_of: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    let mut globals: Vec<u32> = Vec::new();
+    for (bi, l) in gen_l.iter().enumerate() {
+        for &v in l {
+            if gen_of[v as usize].is_empty() {
+                globals.push(v);
+            }
+            gen_of[v as usize].push(bi as u32);
         }
-        for &v in &kill_l[bi] {
-            if gidx[v as usize] != u32::MAX {
-                set(&mut kill[bi], gidx[v as usize]);
+    }
+    let mut kill_of: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    for (bi, l) in kill_l.iter().enumerate() {
+        for &v in l {
+            if !gen_of[v as usize].is_empty() {
+                kill_of[v as usize].push(bi as u32);
             }
         }
     }
-    drop((gen_l, kill_l, gidx));
-    let mut live_in = vec![vec![0u64; words]; nb];
-    let mut live_out = vec![vec![0u64; words]; nb];
-    let mut changed = true;
-    let (mut out, mut inn) = (vec![0u64; words], vec![0u64; words]);
-    while changed {
-        changed = false;
-        for bi in (0..nb).rev() {
-            out.fill(0);
-            for &s in &code.blocks[bi].succs {
-                for (o, &l) in out.iter_mut().zip(&live_in[s]) {
-                    *o |= l;
+    drop((gen_l, kill_l));
+    let mut live_in: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    let mut live_out: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    // `mark[b] == stamp` flags for the value being walked (one stamp per value).
+    let (mut in_mark, mut out_mark) = (vec![0u32; nb], vec![0u32; nb]);
+    let mut kill_mark = vec![0u32; nb];
+    let mut work: Vec<u32> = Vec::new();
+    for (gi, &v) in globals.iter().enumerate() {
+        let stamp = gi as u32 + 1;
+        for &b in &kill_of[v as usize] {
+            kill_mark[b as usize] = stamp;
+        }
+        for &b in &gen_of[v as usize] {
+            if in_mark[b as usize] != stamp {
+                in_mark[b as usize] = stamp;
+                live_in[b as usize].push(v);
+                work.push(b);
+            }
+        }
+        while let Some(b) = work.pop() {
+            for &p in &preds[b as usize] {
+                let pi = p as usize;
+                if out_mark[pi] == stamp {
+                    continue;
+                }
+                out_mark[pi] = stamp;
+                live_out[pi].push(v);
+                if kill_mark[pi] != stamp && in_mark[pi] != stamp {
+                    in_mark[pi] = stamp;
+                    live_in[pi].push(v);
+                    work.push(p);
                 }
             }
-            for w in 0..words {
-                inn[w] = gen[bi][w] | (out[w] & !kill[bi][w]);
-            }
-            if inn != live_in[bi] || out != live_out[bi] {
-                live_in[bi].copy_from_slice(&inn);
-                live_out[bi].copy_from_slice(&out);
-                changed = true;
-            }
         }
     }
+    drop((gen_of, kill_of, preds, in_mark, out_mark, kill_mark));
 
     // ----- intervals: per-block live segments (lifetime holes) -----
     let mut segs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
@@ -169,15 +186,9 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
             touch(p, entry, &mut lo, &mut hi, &mut touched);
             weight[p.index()] += w;
         }
-        // (The set bits only: a word at a time.)
         for (set, pos) in [(&live_in[bi], entry), (&live_out[bi], exit)] {
-            for (wi, &word) in set.iter().enumerate() {
-                let mut m = word;
-                while m != 0 {
-                    let v = globals[wi * 64 + m.trailing_zeros() as usize];
-                    m &= m - 1;
-                    touch(VReg(v), pos, &mut lo, &mut hi, &mut touched);
-                }
+            for &v in set {
+                touch(VReg(v), pos, &mut lo, &mut hi, &mut touched);
             }
         }
         for i in b.start..b.end {

@@ -543,6 +543,33 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
         - `apply` over an `arguments` object takes the generic array-like path (about 430 ns).
       - **Allocation.** `{}` costs about 46 ns (node: 11 ns): `make_lit` → `make_plain_object_vm`, `Object::new`, the element store through `elem_set_boxed`, and `gc_drop_slow` for the replaced value. An arrow function costs 80 ns and a `function` expression 268 ns, the latter because of its eager `prototype`.
 
+23. ✅ **Compile cost: the JIT made Puppeteer slower (S).** *(Added when the Puppeteer AOT run turned out to use more CPU with the JIT than without it.)*
+    - Found:
+      - With the JIT, the Puppeteer AOT run used about 125 ms more CPU than with `LUMEN_NO_JIT=1` (547 vs 422 ms, interleaved runs). It also used 7.6 MB more private memory.
+      - `LUMEN_JIT_STATS` (new: one line per compile with its time and running totals) showed 18 compiles taking 85 ms. Five functions took 10–19 ms each and none ran often enough to repay it.
+      - Compile time was about 1.6–3.4 µs per IR instruction, and the translator emits about 40 IR instructions and 8 blocks per bytecode op. A 1,046-op function became 8,400 blocks and 195 KB of code in about 125 ms.
+    - Built:
+      - **Codegen quadratics.** Each of these was linear per block or per branch, so quadratic over the function:
+        - `FunctionBuilder::switch_to_block` scanned the layout.
+        - Loop detection used `Vec::contains` on the body.
+        - `Cfg::dominates` walked the idom chain even for forward edges. It now answers from the RPO index first.
+        - `rotate_loops` searched positions for every branch block on x64 and AArch64.
+        - Register allocation solved liveness over dense blocks × globals bitsets. It now walks backward per value from its upward-exposed uses (path exploration), which is linear in the live ranges.
+      - **No Number speculation on property reads that hold a non-Number.** `m.p + 1` speculated a Number from the constant operand, exited on the string, and retired the whole function. That repeated once per such site, up to `MAX_COMPILES`. The planner now peeks at the receiver's current own data property (`helpers::own_data`, which runs no JS) and skips speculation there.
+      - **Size-scaled function tier-up.** A cold function compiles once it has made at least `FN_CALLS_PER_OP` (16) calls per bytecode op. Functions of up to 64 ops keep the 1,024-call threshold, and loops are unchanged. Compiling costs tens of µs per op, while interpreting one costs tens of ns, so a large function that runs only part of its ops per call needs proportionally more calls to repay its compile.
+    - Results:
+
+      | | Before | Now |
+      |---|---|---|
+      | 60 generated 40-branch functions × 1,100 calls (fast build) | 25.9 s (0.84 s without the JIT) | 0.84–0.89 s |
+      | the same, one function: compiles × time | 3 × 125 ms | 1 × 85 ms |
+      | Puppeteer AOT compiles | 18, 85 ms | 11, 13.6 ms |
+      | Puppeteer AOT CPU, JIT on / off (median of 15 interleaved) | 547 / 422 ms | 469 / 500 ms |
+      | Puppeteer AOT peak private memory | 42.1 MB | 37.4 MB (34.5 MB without the JIT) |
+      | V8 suite score (fast build, two runs) | 725 / 731 | 824 / 805 (NavierStokes 1,541 → 2,900) |
+
+    - Left: IR volume. Every property read re-checks the tag, borrow flag, plain-object flag and shape, even on an object already checked in the same block with no call in between. Every exit materializes its state inline. Redundant-check elimination and shared exit stubs would cut both compile time and code size.
+
 ## Open items
 
 ### Engine
