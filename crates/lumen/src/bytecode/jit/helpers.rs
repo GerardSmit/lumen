@@ -282,12 +282,19 @@ pub(crate) enum Helper {
     /// `(f, recv: *mut Value, arg: *mut Value) -> status`: `recv.push(arg)` for a guarded site;
     /// the new length replaces `recv`.
     ArrPush,
+    /// `(frame, cell: *const SiteCell, chunk: *const Chunk, this: *const Value, slots: *const
+    /// Value, dst: *mut Env)` — the activation environment of a direct call into `chunk` (which
+    /// has an activation layout) under the site's callee environment, seeded from the callee's
+    /// parameter slots, written (owned) to `dst`. Runs no JS.
+    ActEnv,
+    /// `(env: *mut Env)` — drop the owned environment at `env` ([`Helper::ActEnv`]'s).
+    DropEnv,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 72] = [
+pub(crate) const ALL: [Helper; 74] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -360,6 +367,8 @@ pub(crate) const ALL: [Helper; 72] = [
     Helper::ArrayAppend,
     Helper::ArrPushGuard,
     Helper::ArrPush,
+    Helper::ActEnv,
+    Helper::DropEnv,
 ];
 
 /// The IR signature of `h`.
@@ -434,6 +443,8 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::ArrayAppend => (&[P, P], &[]),
         Helper::ArrPushGuard => (&[P, I32, P], &[I32]),
         Helper::ArrPush => (&[P, P, P], &[I32]),
+        Helper::ActEnv => (&[P, P, P, P, P, P], &[]),
+        Helper::DropEnv => (&[P], &[]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -514,6 +525,8 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::ArrayAppend => array_append as *const () as usize,
         Helper::ArrPushGuard => arr_push_guard as *const () as usize,
         Helper::ArrPush => arr_push as *const () as usize,
+        Helper::ActEnv => act_env as *const () as usize,
+        Helper::DropEnv => drop_env as *const () as usize,
     } as u64)
 }
 
@@ -3013,6 +3026,29 @@ pub(crate) unsafe extern "C" fn make_closure_in(
     let env = crate::bytecode::block_env::env_of(&frame_slots(f)[s as usize]);
     let v = crate::bytecode::make_closure(i, &*(*f).chunk, fidx, name, &env);
     std::ptr::write(dst, v);
+}
+
+pub(crate) unsafe extern "C" fn act_env(
+    f: *mut JitFrame,
+    cell: *const super::SiteCell,
+    chunk: *const Chunk,
+    this: *const Value,
+    slots: *const Value,
+    dst: *mut crate::interpreter::Env,
+) {
+    let i = &*(*f).interp;
+    let chunk = &*chunk;
+    let parent = &*((*cell).env as *const crate::interpreter::Env);
+    let layout = chunk
+        .activation_layout
+        .as_ref()
+        .expect("direct activation site");
+    let args = std::slice::from_raw_parts(slots, chunk.n_params.min(chunk.n_slots));
+    std::ptr::write(dst, layout.make_env(chunk, i, parent, &*this, args));
+}
+
+pub(crate) unsafe extern "C" fn drop_env(env: *mut crate::interpreter::Env) {
+    std::ptr::drop_in_place(env);
 }
 
 pub(crate) unsafe extern "C" fn make_closure(f: *mut JitFrame, fidx: u32, name: u32, dst: *mut Value) {

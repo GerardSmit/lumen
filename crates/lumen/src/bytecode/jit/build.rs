@@ -4857,6 +4857,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         if self.plan.nested.contains_key(&pc) {
             // Checked with its outer site, and nothing between can run JS.
+            self.inl_caps_check(pc);
             let d = self.stack.len();
             self.set_stack_tag(d, TAG_UNDEFINED);
             self.stack.push(Entry::Boxed);
@@ -4891,6 +4892,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.jump(cont, &[]);
         self.fb.seal_block(cont);
         self.fb.switch_to_block(cont);
+        self.inl_caps_check(pc);
         let d = self.stack.len();
         self.set_stack_tag(d, TAG_UNDEFINED);
         self.stack.push(Entry::Boxed);
@@ -4910,9 +4912,13 @@ impl<'a, 'f> Tr<'a, 'f> {
         let Intr::Inline(k) = site.f else {
             return Err(format!("local-callee site at {pc} is not inlined"));
         };
-        let (expect, chunk_ptr) = {
+        let (expect, chunk_ptr, caps) = {
             let inl = &self.plan.inl[k];
-            (inl.expect, std::rc::Rc::as_ptr(&inl.chunk) as usize)
+            (
+                inl.expect,
+                std::rc::Rc::as_ptr(&inl.chunk) as usize,
+                !inl.shape.caps.is_empty(),
+            )
         };
         let off = s as i32 * VALUE_SIZE;
         let tag = self.fb.load(MemKind::I32U8, self.slots, off);
@@ -4928,6 +4934,19 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(slow);
         self.fb.switch_to_block(slow);
         let pcv = self.i32c(pc as i64);
+        if caps {
+            // The captured bindings are the planned closure's own: another closure of the same
+            // code (e.g. one per loop iteration) closes over other bindings. Retire the site.
+            self.call(Helper::SiteFailed, &[self.frame, pcv]);
+            self.exit_now(pc);
+            self.fb.seal_block(cont);
+            self.fb.switch_to_block(cont);
+            self.inl_caps_check(pc);
+            let d = self.stack.len();
+            self.set_stack_tag(d, TAG_UNDEFINED);
+            self.stack.push(Entry::Boxed);
+            return Ok(());
+        }
         let sv = self.i32c(s as i64);
         let cp = self.ptrc(chunk_ptr as i64);
         let ok = self.call_status(Helper::SlotGuard, &[self.frame, pcv, sv, cp]);
@@ -4938,10 +4957,53 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.jump(cont, &[]);
         self.fb.seal_block(cont);
         self.fb.switch_to_block(cont);
+        self.inl_caps_check(pc);
         let d = self.stack.len();
         self.set_stack_tag(d, TAG_UNDEFINED);
         self.stack.push(Entry::Boxed);
         Ok(())
+    }
+
+    /// The captured variables of the inlined callee at site `pc` still read in place with the
+    /// planned kinds (see [`inline`]'s module docs): its closure scope is structurally
+    /// unchanged (generation), and each binding is initialized and holds a value of its planned
+    /// kind. Checked at every execution (an in-place store may change a kind without running
+    /// JS); a miss retires the site and exits before it.
+    fn inl_caps_check(&mut self, pc: usize) {
+        let Some(Intr::Inline(k)) = self.plan.math.get(&pc).map(|s| s.f) else {
+            return;
+        };
+        let sh = self.plan.inl[k].shape.clone();
+        if sh.caps.is_empty() {
+            return;
+        }
+        let so = call::scope_offs().expect("planned with scope offsets");
+        let fail = self.fb.create_block();
+        let scope = self.ptrc(sh.scope as i64);
+        let g = self.fb.load(MemKind::I32, scope, so.gen);
+        let want = self.i32c(sh.gen as i64);
+        let ok = self.fb.icmp(IntCC::Eq, g, want);
+        self.guard_to(ok, fail);
+        for c in &sh.caps {
+            let bd = self.ptrc(c.binding as i64);
+            let init = self.fb.load(MemKind::I32U8, bd, so.b_init);
+            let tag = self.fb.load(MemKind::I32U8, bd, so.b_value);
+            let t = self.i32c(if c.num { TAG_NUM } else { TAG_BOOL } as i64);
+            let same = self.fb.icmp(IntCC::Eq, tag, t);
+            let z = self.i32c(0);
+            let live = self.fb.icmp(IntCC::Ne, init, z);
+            let ok = self.fb.binary(BinaryOp::Band, same, live);
+            self.guard_to(ok, fail);
+        }
+        let cont = self.fb.create_block();
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(fail);
+        self.fb.switch_to_block(fail);
+        let pcv = self.i32c(pc as i64);
+        self.call(Helper::SiteFailed, &[self.frame, pcv]);
+        self.exit_now(pc);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
     }
 
     /// Whether the op at `pc` is the `GetMethod` of an inline `LoadName GetMethod` site.

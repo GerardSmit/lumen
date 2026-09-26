@@ -146,15 +146,27 @@ pub(crate) struct CallRec {
     pub coro: u32,
     /// The callee's `Gc::as_ptr`.
     pub fn_ptr: usize,
+    /// (32-bit hosts: keeps `pad2` 16-byte aligned.)
+    #[cfg(target_pointer_width = "32")]
+    pub pad1: u32,
+    /// Never written (like `pad`).
+    pub pad2: u32,
+    #[cfg(target_pointer_width = "64")]
+    pub pad3: u32,
+    /// A callee with an activation layout: its owned activation environment for the call (the
+    /// frame's `env` points here; dropped when the call returns). Unused otherwise.
+    pub env: usize,
 }
 
 /// Shadow-stack bytes of a [`CallRec`].
-pub(crate) const REC_BYTES: usize = 32;
+pub(crate) const REC_BYTES: usize = 48;
 const _: () = assert!(std::mem::size_of::<CallRec>() <= REC_BYTES);
 pub(crate) const REC_FLAGS: i32 = std::mem::offset_of!(CallRec, flags) as i32;
 pub(crate) const REC_LINK: i32 = std::mem::offset_of!(CallRec, link) as i32;
 pub(crate) const REC_CORO: i32 = std::mem::offset_of!(CallRec, coro) as i32;
 pub(crate) const REC_FN: i32 = std::mem::offset_of!(CallRec, fn_ptr) as i32;
+pub(crate) const REC_ENV: i32 = std::mem::offset_of!(CallRec, env) as i32;
+const _: () = assert!(std::mem::offset_of!(CallRec, pad2) == 32);
 const _: () = assert!(REC_FLAGS == 0 && REC_CORO == 20 && std::mem::offset_of!(CallRec, site) == 4);
 
 /// [`CallRec::flags`] bits (stored shifted left by 8).

@@ -456,6 +456,26 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
 
     - Left: about 22 ns is the floor of any helper call from a JIT loop (boxing, `call_js` invalidation, the status check). Closing the rest needs these methods inline in the emitted code, as `charCodeAt` is, or node-style hoisting of loop-invariant calls.
 
+19. ✅ **Calls to closures (M).** *(Added after the second report. Partly done.)*
+    - Finding: the largest remaining gaps were call-shaped. Node inlines small callees; lumen paid a full call (about 20 ns) whenever the callee read a captured variable, `arguments` or a rest parameter. A callee that needs an activation scope (any function whose locals are captured) skipped the direct call path entirely and went through the generic helper call.
+    - Built:
+      - **Captured reads in inlined callees.** An inlined body may read captured variables (`LoadName`) that resolve in the callee's own closure scope, holding a Number or Boolean. The site checks the scope's generation, the binding's TDZ flag and its value's kind before the body, on every execution: an in-place store can change a kind without running JS. The body then reads the value in place. A miss retires the site. A local-callee site with captures requires the exact planned closure, because another closure of the same code (for example one per loop iteration) closes over other bindings.
+      - **Virtual `arguments` / rest in inlined callees.** When the compiler already keeps them virtual (only `.length` and `[k]` reads), the call site knows the argument count. `.length` becomes a constant and `[k]` with a constant `k` becomes the argument itself.
+      - **Direct calls into callees with an activation.** The call record gained a third 16-byte unit that holds the call's owned activation environment. `Helper::ActEnv` builds it from the seeded parameter slots, the frame's `env` points at it, and `Helper::DropEnv` releases it after the call on every path. `LUMEN_NO_DIRECT_ACT` turns this off.
+    - Fast profile, per call in a JIT loop:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | `add(s)`, `add = mk()` capturing `const k` | 24.8 ns | 3.1 ns | 0.9 ns |
+      | `restf(i,i)` + `argsf(i,i)` + `restg(i,1,2)` | 94.6 ns | 3.9 ns | 2.2 ns |
+      | `mk(i)`, returning `() => x` | 286 ns | 148 ns | 9.3 ns |
+      | `mk2(i)`, two captured locals | 336 ns | 188 ns | 11 ns |
+
+    - Left:
+      - A capturing call still makes four allocations: the scope, its binding vector, the function object and its `UserCallable`.
+      - A function expression also builds its `prototype` object eagerly (node does this lazily).
+      - A `let` captured in a loop body allocates a scope per iteration (about 140 ns).
+
 ## Open items
 
 ### Engine
