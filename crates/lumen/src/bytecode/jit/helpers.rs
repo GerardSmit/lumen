@@ -724,6 +724,7 @@ pub(crate) fn generic_ok(op: &Op) -> bool {
         LoadLocal(_)
         | ArgsLen(..)
         | ArgsGet(..)
+        | ApplyArgs(..)
         | StoreLocal(_)
         | UpdateLocal(..)
         | Tdz(_)
@@ -815,6 +816,7 @@ pub(crate) fn generic_slot_ok(op: &Op) -> bool {
             | IterRestL(..)
             | ArgsLen(..)
             | ArgsGet(..)
+            | ApplyArgs(..)
     )
 }
 

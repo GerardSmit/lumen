@@ -19,6 +19,7 @@ pub(crate) fn is_site(op: &Op) -> bool {
         op,
         Op::Call(_)
             | Op::CallWithThis(_)
+            | Op::ApplyArgs(..)
             | Op::CallSpread(_)
             | Op::CallSpreadThis(_)
             | Op::New(_)

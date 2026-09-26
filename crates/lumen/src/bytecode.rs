@@ -525,6 +525,12 @@ pub enum Op {
     /// Pops a key and pushes that element of the virtual object in slot `.0` (operands as
     /// [`Op::ArgsLen`]): an in-range index reads its slot, any other key materializes the object.
     ArgsGet(u16, u16),
+    /// `f.apply(t, arguments)` with `arguments` the virtual object in slot `.0` (operands as
+    /// [`Op::ArgsLen`]): pops `[f, apply, t]` (the `GetMethod` receiver and method, then `t`)
+    /// and pushes the result. The intrinsic `apply` on a callable `f` calls it with the
+    /// arguments straight from their slots; anything else materializes the object and calls
+    /// `apply` as written.
+    ApplyArgs(u16, u16),
     /// `x[k] = v` with `x` a never-TDZ local slot (see [`Op::GetElemLocal`]), keeping `v`.
     SetElemLocal(u16),
     /// `x[k] = v` in statement position with `x` a never-TDZ local slot.
@@ -2976,6 +2982,30 @@ impl Compiler {
     /// the caller must emit a `CallSpread` op (evaluate-then-expand only matches the spec's
     /// interleaved order when nothing evaluates after the spread part, so any other spread
     /// position bails).
+    /// After `GetMethod(apply)`: `f.apply(t, arguments)` forwarding the virtual `arguments`
+    /// becomes [`Op::ApplyArgs`] (the object is never built). `false` (nothing emitted) for any
+    /// other call.
+    fn apply_args(&mut self, prop: &str, args: &[ArrayElem]) -> Result<bool, Bail> {
+        let (true, [ArrayElem::Item(t), ArrayElem::Item(Expr::Ident(a))]) = (prop == "apply", args)
+        else {
+            return Ok(false);
+        };
+        let Some(Home::Slot(slot, _)) = self.home(a) else {
+            return Ok(false);
+        };
+        let Some(tag) = self
+            .virt
+            .as_ref()
+            .filter(|v| v.slot == slot && !v.rest)
+            .map(VirtC::tag)
+        else {
+            return Ok(false);
+        };
+        self.expr(t)?;
+        self.emit(Op::ApplyArgs(slot, tag));
+        Ok(true)
+    }
+
     fn call_args(&mut self, args: &[ArrayElem]) -> Result<bool, Bail> {
         let spread_at = args.iter().position(|a| !matches!(a, ArrayElem::Item(_)));
         if let Some(k) = spread_at {
@@ -3101,6 +3131,10 @@ impl Compiler {
                             // `a.b?.(args)`: the method value is peeked; nullish drops
                             // [obj, method].
                             self.opt_link(2, shorts);
+                        }
+                        if !*call_opt && self.apply_args(prop, args)? {
+                            self.site = saved_site;
+                            return Ok(());
                         }
                         if self.call_args(args)? {
                             self.emit(Op::CallSpreadThis(args.len() as u16));
@@ -4796,7 +4830,9 @@ impl Compiler {
                         let i = self.name_idx(prop);
                         let c = self.new_cache();
                         self.emit(Op::GetMethod(i, c));
-                        if self.call_args(args)? {
+                        if self.apply_args(prop, args)? {
+                            // (Emitted the call.)
+                        } else if self.call_args(args)? {
                             self.emit(Op::CallSpreadThis(args.len() as u16));
                         } else {
                             self.emit(Op::CallWithThis(args.len() as u16));
@@ -6696,6 +6732,14 @@ fn run_vm_frames<const ONE: bool>(
                 let v = virt_get(i, slots, s, tag, key)?;
                 stack.push(v);
             }
+            Op::ApplyArgs(s, tag) => {
+                i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
+                let at = stack.len() - 3;
+                let v = virt_apply(i, slots, s, tag, &stack[at..])
+                    .map_err(|e| call_error(i, chunk, *pc - 1, &stack[at + 1], e))?;
+                stack.truncate(at);
+                stack.push(v);
+            }
             Op::GetElemLocal(s) => {
                 let key = pop!();
                 match (&slots[s as usize], &key) {
@@ -8507,6 +8551,7 @@ impl Chunk {
             Op::GetElemLocal(_) => (1, 1),
             Op::ArgsLen(..) => (0, 1),
             Op::ArgsGet(..) => (1, 1),
+            Op::ApplyArgs(..) => (3, 1),
             Op::SetElemLocal(_) => (2, 1),
             Op::SetElemLocalDrop(_) => (2, 0),
             Op::ToPropKey => (2, 2),
@@ -8993,6 +9038,31 @@ pub(crate) fn virt_get(
     let o = virt_object(i, slots, s, tag);
     let k = i.to_property_key(&key)?;
     i.get_member(&o, &k)
+}
+
+/// [`Op::ApplyArgs`] over `[f, apply, t]`.
+pub(crate) fn virt_apply(
+    i: &mut Interp,
+    slots: &[Value],
+    s: u16,
+    tag: u16,
+    fat: &[Value],
+) -> Result<Value, Abrupt> {
+    let (f, apply, t) = (&fat[0], &fat[1], &fat[2]);
+    let intrinsic = match apply {
+        Value::Obj(o) => o.try_borrow().is_ok_and(|b| {
+            matches!(&b.call, crate::value::Callable::Native(fp)
+                if *fp as usize == crate::builtins::nf_function_apply as usize)
+        }),
+        _ => false,
+    };
+    if let (true, Value::Num(n)) = (intrinsic && f.is_callable(), &slots[s as usize]) {
+        let base = (tag & !VIRT_REST) as usize;
+        let vals: Vec<Value> = slots[base..base + *n as usize].to_vec();
+        return i.call(f.clone(), t.clone(), &vals);
+    }
+    let o = virt_object(i, slots, s, tag);
+    i.call(apply.clone(), f.clone(), &[t.clone(), o])
 }
 
 /// The pieces of a template literal's desugared `+` chain (see `Parser::build_template`): a

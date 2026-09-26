@@ -442,6 +442,7 @@ op_codec! {
     166 => ArgsGet(a: u16, b: u16);
     167 => LoadNewTarget;
     168 => Concat(a: u16);
+    169 => ApplyArgs(a: u16, b: u16);
 }
 
 /// The chunk fields this codec writes, in order (hand-maintained next to `enc_chunk`, whose

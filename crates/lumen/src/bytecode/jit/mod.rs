@@ -282,6 +282,8 @@ const TICK_MASK: u32 = (1 << 10) - 1;
 const MAX_ENTRY_FAILS: u32 = 16;
 /// Compilations a loop gets before it stays interpreted.
 const MAX_COMPILES: u32 = 3;
+/// Backedges per call below which a hot loop leaves its function to the whole-function tier.
+const FEW_TRIPS: u32 = 8;
 /// Calls between looks at compiling a whole function (a power of two).
 const CALL_MASK: u32 = (1 << 10) - 1;
 /// Calls per bytecode op a function makes before its first compile. Compiling costs tens of
@@ -493,6 +495,12 @@ struct FuncState {
     entry_fails: u32,
     /// Slots kept Boxed on the next compile (their speculated kind failed).
     widen: Vec<bool>,
+    /// A local speculated `Num` from its writes alone (see `build::fn_kinds`) was widened:
+    /// later compiles guess only from arithmetic.
+    guess_failed: bool,
+    /// Locals seen holding a non-Number, non-`undefined` value when a loop of the chunk compiled
+    /// (not guessed `Num` by the function tier, see `build::fn_kinds`).
+    not_num: Vec<bool>,
     /// Resume exits per pc since the last compile, `(pc, count)`.
     deopts: Vec<(u32, u32)>,
     /// Retired code (see [`retire_fn`]).
@@ -505,6 +513,12 @@ struct LoopState {
     code: Option<std::rc::Rc<Native>>,
     compiles: u32,
     entry_fails: u32,
+    /// Slots kept Boxed on the next compile: they failed the entry guards (a recursive function
+    /// entering its loop with locals of another kind than the compile saw mid-loop).
+    widen: Vec<bool>,
+    /// `Num` slots that failed the entry guards holding `undefined` (a local the body assigns,
+    /// unset on a new call's first entry): the next compile accepts either at entry.
+    undef_ok: Vec<bool>,
 }
 
 struct Native {
@@ -575,12 +589,22 @@ fn compile(
     header: usize,
     backedge: usize,
     slots: &[Value],
+    widen: &[bool],
+    undef_ok: &[bool],
     this_val: &Value,
 ) -> Result<Native, String> {
     dump_ops(chunk);
+    if stats_enabled() {
+        eprintln!(
+            "[jit-stats] loop [{header}, {backedge}] of {} ops",
+            chunk.ops.len()
+        );
+    }
     let t = stats_start();
-    let r = build::build(i, env, chunk, header, backedge, slots, this_val)
-        .and_then(|built| finish(built, header, backedge));
+    let r = build::build(
+        i, env, chunk, header, backedge, slots, widen, undef_ok, this_val,
+    )
+    .and_then(|built| finish(built, header, backedge));
     stats_end(t, "loop", &r);
     r
 }
@@ -592,11 +616,16 @@ fn compile_fn(
     chunk: &Chunk,
     slots: &[Value],
     widen: &[bool],
+    not_num: &[bool],
+    guess: bool,
     this_val: &Value,
 ) -> Result<Native, String> {
     dump_ops(chunk);
+    if stats_enabled() {
+        eprintln!("[jit-stats] fn of {} ops", chunk.ops.len());
+    }
     let t = stats_start();
-    let r = build::build_fn(i, env, chunk, slots, widen, this_val)
+    let r = build::build_fn(i, env, chunk, slots, widen, not_num, guess, this_val)
         .and_then(|built| finish(built, 0, chunk.ops.len().saturating_sub(1)));
     stats_end(t, "fn", &r);
     r
@@ -625,21 +654,42 @@ fn stats_end(t: Option<std::time::Instant>, kind: &str, r: &Result<Native, Strin
         Ok(_) => "ok".to_string(),
         Err(e) => format!("bail: {}", e.chars().take(60).collect::<String>()),
     };
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let at = T0
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis();
     eprintln!(
-        "[jit-stats] {kind} {us} us {what} | total {} us, {ok} ok, {err} bailed",
+        "[jit-stats] {kind} {us} us {what} | total {} us, {ok} ok, {err} bailed (at {at} ms)",
         sum + us
     );
 }
 
 fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native, String> {
     let mut func = built.func;
+    let t0 = stats_start();
+    let n0 = (func.insts.len(), func.blocks.len());
     // Cheap next to compilation, and a malformed function must never reach the backend.
     lumen_codegen::verify::verify(&func).map_err(|e| format!("verify: {e}"))?;
+    let t1 = stats_start();
     lumen_codegen::opt::optimize(&mut func);
     if dump_enabled() {
         eprintln!("{func}");
     }
+    let t2 = stats_start();
     let (keep, entry) = emit(&func, &built.externs, header, backedge)?;
+    if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+        eprintln!(
+            "[jit-stats]   ir {} insts/{} blocks -> {} insts/{} blocks; verify {} us, opt {} us, emit {} us",
+            n0.0,
+            n0.1,
+            func.insts.len(),
+            func.blocks.len(),
+            (t1 - t0).as_micros(),
+            (t2 - t1).as_micros(),
+            t2.elapsed().as_micros()
+        );
+    }
     if built.self_entry != 0 {
         // SAFETY: `self_entry` is the address of a `Cell<usize>` owned by `built.boxes`.
         unsafe { (*(built.self_entry as *const Cell<usize>)).set(entry as usize) };
@@ -803,6 +853,8 @@ pub(super) fn on_backedge(
                     code: None,
                     compiles: 0,
                     entry_fails: 0,
+                    widen: Vec::new(),
+                    undef_ok: Vec::new(),
                 });
                 loops.len() - 1
             }
@@ -813,8 +865,42 @@ pub(super) fn on_backedge(
             if l.compiles >= MAX_COMPILES || t & TICK_MASK != 0 {
                 return Ok(None);
             }
+            {
+                let mut fs = jit.func.borrow_mut();
+                if fs.not_num.len() < slots.len() {
+                    fs.not_num.resize(slots.len(), false);
+                }
+                for (s, v) in slots.iter().enumerate() {
+                    if !matches!(v, Value::Num(_) | Value::Undefined) {
+                        fs.not_num[s] = true;
+                    }
+                }
+            }
+            // Few iterations per call (a loop over a handful of lights in a function called
+            // per pixel): the whole-function tier serves every call with one compile, where
+            // loop code would only run from the backedge on and recompile as calls enter the
+            // loop with other locals.
+            let st = jit.fstate.get();
+            if (st == FS_COLD || st == FS_PENDING)
+                && !eager()
+                && chunk.ops.len() <= build::MAX_FN_OPS
+                && u64::from(jit.calls.get()) * u64::from(FEW_TRIPS) > u64::from(t)
+            {
+                jit.fstate.set(FS_PENDING);
+                return Ok(None);
+            }
             l.compiles += 1;
-            match compile(i, env, chunk, header, backedge, slots, this_val) {
+            match compile(
+                i,
+                env,
+                chunk,
+                header,
+                backedge,
+                slots,
+                &l.widen,
+                &l.undef_ok,
+                this_val,
+            ) {
                 Ok(n) => {
                     if log_enabled() {
                         eprintln!("[jit] compiled loop {header}..={backedge}");
@@ -893,7 +979,16 @@ pub(super) fn on_entry(
                 return Ok(None);
             }
             fs.compiles += 1;
-            match compile_fn(i, env, chunk, slots, &fs.widen, this_val) {
+            match compile_fn(
+                i,
+                env,
+                chunk,
+                slots,
+                &fs.widen,
+                &fs.not_num,
+                !fs.guess_failed,
+                this_val,
+            ) {
                 Ok(n) => {
                     if log_enabled() {
                         eprintln!(
@@ -1122,7 +1217,28 @@ fn enter(
                     {
                         l.entry_fails += 1;
                         if l.entry_fails >= MAX_ENTRY_FAILS {
-                            // The locals' kinds moved on: recompile at the next tick boundary.
+                            // The locals' kinds moved on: recompile at the next tick boundary,
+                            // with the slots that failed kept Boxed (entries keep alternating
+                            // between kinds otherwise, each recompile guessing one of them).
+                            let n = native.kinds.len();
+                            if l.widen.len() < n {
+                                l.widen.resize(n, false);
+                                l.undef_ok.resize(n, false);
+                            }
+                            for (s, &k) in native.kinds.iter().enumerate() {
+                                match slots.get(s) {
+                                    Some(Value::Undefined) if k == Kind::Num && !l.undef_ok[s] => {
+                                        l.undef_ok[s] = true
+                                    }
+                                    Some(v) if k != Kind::Boxed && Kind::of(v) != k => {
+                                        l.widen[s] = true
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if log_enabled() {
+                                eprintln!("[jit] loop {header}..={backedge} entry guards keep failing: recompiling");
+                            }
                             l.code = None;
                         }
                     }
@@ -1211,6 +1327,24 @@ fn fn_entry_failed(chunk: &Chunk, slots: &[Value], native: &Native) {
 /// recompile; exits no widening can remove (ops the translator leaves to the interpreter) are
 /// just counted.
 fn fn_deopt(chunk: &Chunk, pc: usize, native: &Native) {
+    if stats_enabled() {
+        thread_local! {
+            static EXITS: RefCell<std::collections::HashMap<(usize, usize), u64>> = RefCell::new(Default::default());
+        }
+        EXITS.with(|e| {
+            let mut e = e.borrow_mut();
+            let c = e.entry((chunk as *const Chunk as usize, pc)).or_default();
+            *c += 1;
+            if c.is_power_of_two() && *c >= 1024 {
+                eprintln!(
+                    "[jit-exits] fn of {} ops exits at {pc} ({:?}; before: {:?}) x{c}",
+                    chunk.ops.len(),
+                    chunk.ops.get(pc),
+                    pc.checked_sub(1).and_then(|q| chunk.ops.get(q))
+                );
+            }
+        });
+    }
     // An `await` always exits (see `build`): nothing to learn from it.
     if matches!(chunk.ops.get(pc), Some(super::Op::Await)) {
         return;
@@ -1259,6 +1393,12 @@ fn fn_deopt(chunk: &Chunk, pc: usize, native: &Native) {
             if native.kinds.get(s).is_some_and(|&k| k != Kind::Boxed) && !fs.widen[s] {
                 fs.widen[s] = true;
                 widened = true;
+                let at_entry = s < chunk.n_params
+                    || chunk.arguments_slot == Some(s as u16)
+                    || chunk.rest_slot == Some(s as u16);
+                if !at_entry {
+                    fs.guess_failed = true;
+                }
             }
         }
     }
