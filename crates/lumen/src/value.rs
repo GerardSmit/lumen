@@ -513,6 +513,16 @@ impl PackedValue {
         }
     }
 
+    /// The object this holds, as [`Gc::as_ptr`] gives it (no refcount traffic).
+    #[inline(always)]
+    pub(crate) fn obj_ptr(&self) -> Option<*const RefCell<Object>> {
+        (self.tag() == PACK_OBJ).then(|| {
+            // SAFETY: an object payload is a live `Gc` word; the handle is only borrowed.
+            let g = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
+            Gc::as_ptr(&g)
+        })
+    }
+
     /// Whether this holds exactly the object `g` (no refcount traffic).
     #[inline(always)]
     pub(crate) fn is_obj(&self, g: &Gc) -> bool {
@@ -1929,6 +1939,15 @@ impl Property {
     pub(crate) fn num_value(&self) -> Option<f64> {
         if self.accessor() { None } else { self.packed.as_num() }
     }
+    /// The object this data property holds, as [`Gc::as_ptr`] gives it (no clone).
+    #[inline]
+    pub(crate) fn obj_ptr(&self) -> Option<*const RefCell<Object>> {
+        if self.accessor() {
+            return None;
+        }
+        self.packed.obj_ptr()
+    }
+
     /// Whether this data property holds exactly the object `g` (no clone).
     #[inline]
     pub(crate) fn holds_obj(&self, g: &Gc) -> bool {

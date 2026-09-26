@@ -2497,6 +2497,12 @@ pub(crate) unsafe extern "C" fn fast_guard(f: *mut JitFrame, pc: u32, expect: *c
     let chunk = &*(*f).chunk;
     let env = &*(*f).env;
     let i = &*(*f).interp;
+    // The common free-name callee, compared in place (no clone of the function object).
+    if let Some(&Op::LoadNameForCall(_, c)) = chunk.ops.get(pc as usize) {
+        if chunk.name_ic_obj_ptr(i, env, c).is_some_and(|p| p as usize == expect as usize) {
+            return 1;
+        }
+    }
     if let Some(Value::Obj(o)) = site_callee(i, chunk, env, pc as usize) {
         if crate::value::Gc::as_ptr(&o) as usize == expect as usize {
             return 1;

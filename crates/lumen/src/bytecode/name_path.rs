@@ -130,6 +130,49 @@ impl NamePath {
         None
     }
 
+    /// [`NamePath::read`] of an object value, as its [`Gc::as_ptr`] (no clone); `None` for a
+    /// miss or any other value.
+    fn read_obj_ptr(&self, interp: &Interp, env: &Env) -> Option<*const RefCell<crate::value::Object>> {
+        let mut pointer = Rc::as_ptr(env);
+        for (index, guard) in self.guards.iter().enumerate() {
+            let scope = unsafe { &*pointer }.borrow();
+            if !guard.matches(pointer, &scope) {
+                return None;
+            }
+            if index + 1 == self.guards.len() {
+                let binding = match &self.holder {
+                    Holder::Binding(p) => unsafe { &**p },
+                    Holder::Slot(slot) => scope.vars.template_binding(*slot)?,
+                    Holder::Global {
+                        object,
+                        shape,
+                        slot,
+                    } => {
+                        if pointer != Rc::as_ptr(&interp.global_env)
+                            || object.as_ptr() != Gc::as_ptr(&interp.global)
+                            || !interp.ordinary_get_ptr(Gc::as_ptr(&interp.global) as usize)
+                        {
+                            return None;
+                        }
+                        let g = interp.global.borrow();
+                        if !matches!(g.exotic, Exotic::None) || g.props.shape() != *shape {
+                            return None;
+                        }
+                        return g.props.entry_at(*slot)?.obj_ptr();
+                    }
+                };
+                return match &binding.value {
+                    Value::Obj(o) if binding.initialized && binding.import_ref.is_none() => {
+                        Some(Gc::as_ptr(o))
+                    }
+                    _ => None,
+                };
+            }
+            pointer = Rc::as_ptr(scope.parent.as_ref()?);
+        }
+        None
+    }
+
     fn read_holder(
         &self,
         interp: &Interp,
@@ -288,6 +331,18 @@ impl Chunk {
             .borrow()
             .as_ref()?
             .read(interp, env)
+    }
+
+    pub(super) fn name_path_obj_ptr(
+        &self,
+        interp: &Interp,
+        env: &Env,
+        cache: u32,
+    ) -> Option<*const RefCell<crate::value::Object>> {
+        self.name_paths[cache as usize]
+            .borrow()
+            .as_ref()?
+            .read_obj_ptr(interp, env)
     }
 
     pub(super) fn name_path_fill(

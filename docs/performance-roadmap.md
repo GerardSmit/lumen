@@ -502,6 +502,47 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       - Array destructuring still proves Array iteration pristine through a helper on every run.
       - `for (const [k, v] of map)` allocates an entry array per step (about 100 ns per entry).
 
+22. ✅ **Guards, tests and small builtins that were still generic (S).** *(Added after the third ranking: the largest remaining ratios among operations common in Puppeteer and VS Code extension code.)*
+    - Built:
+      - **Absent-property IC.** A read that misses has an inline shape chain that ends at `null`: a feature test like `if (o.x)`, an options default, or an absent method on an array or string wrapper (a non-index name other than `length`). The IC used to take the full lookup every time.
+      - **`in` and `hasOwnProperty`.**
+        - A string key against an ordinary object or array takes a raw-pointer walk of own properties and prototypes (`Interp::js_has_property`).
+        - `hasOwnProperty` checks the props map directly.
+        - The JIT calls `Helper::Binary` with `BIN_IN` instead of the generic op.
+      - **Unary `+` / `-` on a non-Number** go through `Helper::Binary` (`BIN_PLUS` / `BIN_NEG`). A string operand goes straight to `str_to_number`, with an all-digits fast path for strings of up to 15 characters.
+      - **Integer ToString.** `String(n)`, `"" + n` and template substitutions of an integral Number below 2^53 write digits into a stack buffer (`eval::int_str`), with no formatter and no temporary `String`.
+      - **Inline truthiness.**
+        - `if (v)` on a Boxed value decides Boolean, Number, `undefined`/`null`, String (by length) and objects with `ic_plain` from the tag. Only BigInt, Symbol and possible `[[IsHTMLDDA]]` objects call `ToBoolean`.
+        - `JumpIfFalse` and `TypeofIs` read a borrowed local in place, without a clone and release.
+      - **Loose equality.**
+        - `x == null` / `x != null` is decided by the tag, both for a memory operand and for a `null` constant pushed just before.
+        - Two operands of the same type compare strictly.
+      - **`typeof x === "…"`** is decided by the tag for every primitive. An object goes through a small `Helper::TypeofIs`, which checks function-ness and `[[IsHTMLDDA]]`, instead of the one-op VM.
+      - **Element reads with a Boxed result** do one element lookup that decodes any element kind. Previously a Number lookup ran first, and every non-number element repeated the walk.
+      - **Dead TDZ markers.** `const v = a[i % n]` in a loop body no longer writes and releases its slot twice per iteration: `tdz_dead` now accepts `GetElemLocal` and local arithmetic between the marker and the store.
+      - **`arguments` objects** are cloned from a per-argument-count template, one per realm, mapped or unmapped. Each call patches only the values and a mapped object's `callee`. The old builder allocated one key string per index and walked shape transitions for every property.
+      - **Call-site guards of inlined free-name callees** compare the binding's object pointer in place (`Chunk::name_ic_obj_ptr`). They no longer clone and release the function object on every call.
+    - Fast profile, per operation in a JIT loop:
+
+      | Case | Before | Now | Node |
+      |---|---|---|---|
+      | `o.missing` (plain / array / string wrapper) | 36 / 145 / 112 ns | 14 / 17 / 30 ns | — |
+      | `'a' in o` | 166 ns | 48 ns | — |
+      | `o.hasOwnProperty(k)` | 199 ns | 126 ns | — |
+      | `+str` | 108 ns | 38 ns | 7 ns |
+      | `x == null` | 75 ns | 33 ns | 2 ns |
+      | `typeof v === "string"` / `"object"` | 91 / 92 ns | 25 / 25 ns | 3 / 4 ns |
+      | `const v = a[i % 7]; if (v) c++` (objects) | 35 ns | 22 ns | 4.6 ns |
+      | `w(1, 2, 3)` doing `f3.apply(this, arguments)` | 1689 ns | 890 ns | 1.3 ns |
+      | `w3(i, 1, 2)` calling a global `f3` | 40 ns | 34 ns | 1.3 ns |
+
+    - Left:
+      - **Non-leaf calls.** A callee that itself calls cannot be inlined, so it pays the direct-call floor plus a per-call guard for each inlined callee inside it. The guard re-validates the callee's global binding through the name cache in the callee's own frame. Hoisting it needs an invalidation epoch on binding writes. This is the largest remaining gap on call-heavy code: Richards, DeltaBlue, event emitters.
+      - **Rest and `arguments` forwarding.**
+        - `(...args) => f(...args)` still builds the rest array, because a spread use makes a virtual rest escape: 295 ns vs 1.7 ns in node.
+        - `apply` over an `arguments` object takes the generic array-like path (about 430 ns).
+      - **Allocation.** `{}` costs about 46 ns (node: 11 ns): `make_lit` → `make_plain_object_vm`, `Object::new`, the element store through `elem_set_boxed`, and `gc_drop_slow` for the replaced value. An arrow function costs 80 ns and a `function` expression 268 ns, the latter because of its eager `prototype`.
+
 ## Open items
 
 ### Engine
