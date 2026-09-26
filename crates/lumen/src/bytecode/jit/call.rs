@@ -37,10 +37,6 @@ use std::sync::OnceLock;
 /// Slots a directly called function may have (the site stores each one).
 const MAX_DIRECT_SLOTS: usize = 64;
 
-/// Callee frames up to this many slots are released inline after a direct call's return;
-/// larger ones through [`Helper::DropN`].
-const DROP_INLINE_SLOTS: usize = 6;
-
 /// Whether the method-lookup inline cache `cache` (a `GetMethod`'s `PROP_IC_WAYS` ways) has
 /// seen receivers of more than one shape. A direct method site guards one receiver chain, so
 /// it would exit on the others and cost a recompile each (a loop over shapes of different
@@ -2037,33 +2033,26 @@ impl Tr<'_, '_> {
         let sp = self.stackp;
         self.copy_value(stack_p, 0, sp, bo);
         self.fb.store(MemKind::I32U8, stack_p, z, 0);
-        if (1..=DROP_INLINE_SLOTS).contains(&site.n_slots) {
-            // Few slots: each released inline (a reference count step for an object or string).
-            for k in 0..site.n_slots {
-                self.drop_mem(slots_p, k as i32 * VALUE_SIZE);
-            }
-        } else if site.n_slots > 0 {
-            let four = self.i32c(TAG_NUM as i64);
-            let mut any = None;
-            for k in 0..site.n_slots {
-                let t = self.fb.load(MemKind::I32U8, slots_p, k as i32 * VALUE_SIZE);
-                let big = self.fb.icmp(IntCC::Ugt, t, four);
-                any = Some(match any {
-                    None => big,
-                    Some(a) => self.fb.binary(BinaryOp::Bor, a, big),
-                });
-            }
-            let any = any.expect("at least one slot");
-            let drop_b = self.fb.create_block();
-            let cont = self.fb.create_block();
-            self.fb.brif(any, drop_b, &[], cont, &[]);
-            self.fb.seal_block(drop_b);
-            self.fb.switch_to_block(drop_b);
-            let nv = self.i32c(site.n_slots as i64);
-            self.call(Helper::DropN, &[slots_p, nv]);
-            self.fb.jump(cont, &[]);
-            self.fb.seal_block(cont);
-            self.fb.switch_to_block(cont);
+        if site.n_slots == 1 {
+            self.drop_mem(slots_p, 0);
+        } else if site.n_slots > 1 {
+            // Each slot released inline (a reference count step for an object or string), by a
+            // loop over the slots holding one copy of the release sequence.
+            let span = self.ptrc(site.n_slots as i64 * VALUE_SIZE as i64);
+            let end = self.fb.binary(BinaryOp::Iadd, slots_p, span);
+            let head = self.fb.create_block();
+            let p = self.fb.append_block_param(head, PTR);
+            let out = self.fb.create_block();
+            self.fb.jump(head, &[slots_p]);
+            self.fb.switch_to_block(head);
+            self.drop_mem(p, 0);
+            let step = self.ptrc(VALUE_SIZE as i64);
+            let next = self.fb.binary(BinaryOp::Iadd, p, step);
+            let more = self.fb.icmp(IntCC::Ne, next, end);
+            self.fb.brif(more, head, &[next], out, &[]);
+            self.fb.seal_block(head);
+            self.fb.seal_block(out);
+            self.fb.switch_to_block(out);
         }
         // Pop the call record: out of `fn_frames` when a sync copied it there, and unlinked.
         let rf = self.fb.load(MemKind::I32, rec, REC_FLAGS);

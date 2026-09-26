@@ -2475,7 +2475,14 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.store(MemKind::I64, self.frame, id, FRAME_EXIT_HSET);
         }
         for (i, &e) in stack.iter().enumerate() {
-            self.store_entry(i, e);
+            match e {
+                // Exits are cold: a Ref's clone is a helper call, not the inline sequence.
+                Entry::Ref(p, _) => {
+                    let dst = self.sptr(i);
+                    self.call(Helper::Clone, &[dst, p]);
+                }
+                _ => self.store_entry(i, e),
+            }
         }
         // Function code that returns or throws out of the call leaves nothing that reads its
         // slots again (closures capture through the environment).
@@ -8279,6 +8286,14 @@ impl<'a, 'f> Tr<'a, 'f> {
                     (b, w)
                 });
                 let (tag, payload) = layout::prop_get(&mut self.fb, obj, ic, miss, refc.map(|r| r.0));
+                // Both paths releasing the receiver: one shared copy of the release and the
+                // result stores, entered with the result's tag and payload.
+                let fin = (refc.is_some() && drop.is_some()).then(|| {
+                    let b = self.fb.create_block();
+                    let t = self.fb.append_block_param(b, Type::I32);
+                    let p = self.fb.append_block_param(b, Type::I64);
+                    (b, t, p)
+                });
                 if let Some((b, w)) = refc {
                     let cont = self.fb.create_block();
                     self.fb.jump(cont, &[]);
@@ -8304,15 +8319,16 @@ impl<'a, 'f> Tr<'a, 'f> {
                     let one = self.ptrc(1);
                     let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
                     self.fb.store(PTR_MEM, payload, s1, so);
-                    if drop.is_some() {
-                        self.drop_at(at);
-                    }
                     let objt = self.i32c(TAG_OBJ as i64);
                     let strt = self.i32c(TAG_STR as i64);
                     let tag = self.fb.select(is_obj, objt, strt);
-                    self.fb.store(MemKind::I32U8, dst, tag, 0);
-                    self.fb.store(MemKind::I64, dst, payload, VALUE_PAYLOAD);
-                    self.fb.jump(join, &[]);
+                    if let Some((f, ..)) = fin {
+                        self.fb.jump(f, &[tag, payload]);
+                    } else {
+                        self.fb.store(MemKind::I32U8, dst, tag, 0);
+                        self.fb.store(MemKind::I64, dst, payload, VALUE_PAYLOAD);
+                        self.fb.jump(join, &[]);
+                    }
                     self.fb.switch_to_block(call_b);
                     let cv = self.i32c(drop.is_some() as i64);
                     self.call(Helper::UnpackClone, &[dst, w, cv]);
@@ -8336,6 +8352,15 @@ impl<'a, 'f> Tr<'a, 'f> {
                     let f = self.fb.convert(ConvOp::Bitcast, Type::F64, payload);
                     self.fb.jump(join, &[f]);
                 } else {
+                    let (tag, payload) = match fin {
+                        Some((f, t, p)) => {
+                            self.fb.jump(f, &[tag, payload]);
+                            self.fb.seal_block(f);
+                            self.fb.switch_to_block(f);
+                            (t, p)
+                        }
+                        None => (tag, payload),
+                    };
                     if let Some(i) = drop {
                         self.drop_at(i);
                     }
