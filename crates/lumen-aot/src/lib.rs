@@ -15,6 +15,14 @@
 //! engine.load_precompiled(&APP)?;
 //! ```
 //!
+//! Install lumen's allocator in the binary, as the `lumen` shell does: on the system allocator
+//! the V8 v7 benchmarks run up to 13% slower.
+//!
+//! ```ignore
+//! #[global_allocator]
+//! static ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;
+//! ```
+//!
 //! # `include_js!`
 //! Paths are relative to the invoking crate's `CARGO_MANIFEST_DIR`. Forms:
 //! - `include_js!("app.js")` — one classic script.
