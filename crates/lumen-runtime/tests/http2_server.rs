@@ -110,10 +110,6 @@ fn server_handles_multiplexed_node_requests() {
 
 #[test]
 fn secure_server_negotiates_h2_with_node_client() {
-    // lumen-tls has no Windows backend yet.
-    if cfg!(windows) {
-        return;
-    }
     if Command::new("node").arg("--version").output().is_err()
         || Command::new("openssl").arg("version").output().is_err()
     {

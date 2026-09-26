@@ -1,7 +1,7 @@
 //! A blocking HTTP/1.1 client on `std::net::TcpStream`, run on the threadpool by the fetch
 //! op. `Connection: close` per request (no pooling), Content-Length and chunked bodies,
-//! redirects followed up to 5 hops. HTTPS uses lumen-tls's dynamically loaded system OpenSSL
-//! backend with CA and hostname verification; no TLS crate is linked into the workspace.
+//! redirects followed up to 5 hops. HTTPS goes through lumen-tls (the dynamically loaded system
+//! OpenSSL on Unix, rustls on Windows) with CA and hostname verification.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
