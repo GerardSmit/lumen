@@ -675,7 +675,7 @@ fn re_sym_match_with(
             .iter()
             .map(|caps| {
                 let (a, b) = caps[0].expect("whole match");
-                Value::from_string(text.slice(a, b))
+                Value::Str(text.slice_str(a, b))
             })
             .collect();
         return Ok(i.make_array(items));
@@ -1217,7 +1217,7 @@ fn re_replace_direct(
             let mut captures: Vec<Value> = Vec::with_capacity(re.ngroups);
             for g in 1..=re.ngroups {
                 captures.push(match caps[g] {
-                    Some((x, y)) => Value::from_string(text.slice(x, y)),
+                    Some((x, y)) => Value::Str(text.slice_str(x, y)),
                     None => Value::Undefined,
                 });
             }
@@ -1426,7 +1426,7 @@ fn re_split_run(
                 q = ms + 1;
                 continue;
             }
-            out.push(Value::from_string(text.slice(p, ms)));
+            out.push(Value::Str(text.slice_str(p, ms)));
             if out.len() == limit {
                 last = Some(caps);
                 break 'run out;
@@ -1434,7 +1434,7 @@ fn re_split_run(
             p = e;
             for g in 1..=re.ngroups {
                 out.push(match caps[g] {
-                    Some((a, b)) => Value::from_string(text.slice(a, b)),
+                    Some((a, b)) => Value::Str(text.slice_str(a, b)),
                     None => Value::Undefined,
                 });
                 if out.len() == limit {
@@ -1445,7 +1445,7 @@ fn re_split_run(
             last = Some(caps);
             q = p;
         }
-        out.push(Value::from_string(text.slice(p, size_e)));
+        out.push(Value::Str(text.slice_str(p, size_e)));
         out
     };
     if let Some(caps) = last {

@@ -664,6 +664,14 @@ impl ReText {
     }
 
     /// The canonical string for elements `a..b` (surrogate halves recombine).
+    /// [`ReText::slice`] as an engine string: a view of an ASCII subject (see `LStr::sub`).
+    pub fn slice_str(&self, a: usize, b: usize) -> crate::lstr::LStr {
+        match &self.ascii_src {
+            Some(src) => src.sub(&src[a..b]),
+            None => self.slice(a, b).into(),
+        }
+    }
+
     pub fn slice(&self, a: usize, b: usize) -> String {
         // ASCII subject: element index == byte index — copy straight from the source.
         if let Some(src) = &self.ascii_src {

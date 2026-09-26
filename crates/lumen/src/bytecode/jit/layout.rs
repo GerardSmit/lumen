@@ -691,8 +691,27 @@ pub(crate) fn str_ascii_unit(
     // Unsigned: a negative index is out of range too.
     let inb = fb.icmp(IntCC::Ult, i, n);
     guard(fb, inb, miss);
-    let at = fb.binary(BinaryOp::Iadd, hdr, i);
-    fb.load(MemKind::I32U8, at, l.str_data)
+    // A view's bytes are behind its data pointer; a plain string's follow the header.
+    let view = bin_imm(fb, BinaryOp::Band, Type::I32, cap, crate::lstr::VIEW as i64);
+    let view = cmp_imm(fb, IntCC::Ne, Type::I32, view, 0);
+    let (vb, pb, join) = (fb.create_block(), fb.create_block(), fb.create_block());
+    let base = fb.append_block_param(join, PTR);
+    fb.brif(view, vb, &[], pb, &[]);
+    fb.seal_block(vb);
+    fb.seal_block(pb);
+    fb.switch_to_block(vb);
+    let root = fb.load(PTR_MEM, hdr, crate::lstr::VIEW_ROOT_OFFSET as i32);
+    let off = fb.load(PTR_U32, hdr, crate::lstr::VIEW_OFF_OFFSET as i32);
+    let rd = fb.binary(BinaryOp::Iadd, root, off);
+    let vd = bin_imm(fb, BinaryOp::Iadd, PTR, rd, l.str_data as i64);
+    fb.jump(join, &[vd]);
+    fb.switch_to_block(pb);
+    let pd = bin_imm(fb, BinaryOp::Iadd, PTR, hdr, l.str_data as i64);
+    fb.jump(join, &[pd]);
+    fb.seal_block(join);
+    fb.switch_to_block(join);
+    let at = fb.binary(BinaryOp::Iadd, base, i);
+    fb.load(MemKind::I32U8, at, 0)
 }
 
 /// Strings: the byte length when the all-ASCII hint is set (otherwise UTF-16 length differs
