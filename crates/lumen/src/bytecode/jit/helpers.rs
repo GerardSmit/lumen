@@ -289,12 +289,15 @@ pub(crate) enum Helper {
     ActEnv,
     /// `(env: *mut Env)` — drop the owned environment at `env` ([`Helper::ActEnv`]'s).
     DropEnv,
+    /// `(frame, pc: u32, base: u32, argc: u32, cell: *const Cell<CollSite>) -> status` — the
+    /// call of a fused `<object>.<get|has|set|add>(args)` site (see [`coll_method`]).
+    CollMethod,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 74] = [
+pub(crate) const ALL: [Helper; 75] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -369,6 +372,7 @@ pub(crate) const ALL: [Helper; 74] = [
     Helper::ArrPush,
     Helper::ActEnv,
     Helper::DropEnv,
+    Helper::CollMethod,
 ];
 
 /// The IR signature of `h`.
@@ -445,6 +449,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::ArrPush => (&[P, P, P], &[I32]),
         Helper::ActEnv => (&[P, P, P, P, P, P], &[]),
         Helper::DropEnv => (&[P], &[]),
+        Helper::CollMethod => (&[P, I32, I32, I32, P], &[I32]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -527,6 +532,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::ArrPush => arr_push as *const () as usize,
         Helper::ActEnv => act_env as *const () as usize,
         Helper::DropEnv => drop_env as *const () as usize,
+        Helper::CollMethod => coll_method as *const () as usize,
     } as u64)
 }
 
@@ -2134,6 +2140,121 @@ pub(crate) unsafe extern "C" fn str_method(
                 None => i.call_native_fast(nat, this, args),
             }
         }
+        None => match i.get_prop_ic(&this, name, cache) {
+            Ok(callee) if callee.is_callable() => i.call(callee, this, args),
+            Ok(callee) => i
+                .call(callee.clone(), this, args)
+                .map_err(|e| crate::bytecode::site_call_error(i, chunk, &callee, e)),
+            Err(e) => Err(e),
+        },
+    };
+    for k in 0..argc {
+        *at.add(k) = Value::Undefined;
+    }
+    match r {
+        Ok(v) => {
+            std::ptr::write(s.add(base), v);
+            STATUS_OK
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+/// A fused Map/Set method site's cache: the receiver's and its prototype's shapes (and the
+/// prototype) under which the receiver has no own property of the method's name and the
+/// prototype holds it at `slot`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CollSite {
+    ok: bool,
+    shape: u32,
+    pshape: u32,
+    proto: usize,
+    slot: u32,
+}
+
+/// The native code `GetMethod(name)` on object `this` reads, when that read is a plain data
+/// property of `this`'s ordinary prototype (none on `this` itself) holding a leaf native in a
+/// one-realm engine. Validated by shapes (cached in `cell`); the value is read at every call.
+fn coll_site_native(
+    i: &Interp,
+    cell: &std::cell::Cell<CollSite>,
+    this: &Value,
+    name: &str,
+) -> Option<crate::value::NativeFn> {
+    if i.multi_realm() {
+        return None;
+    }
+    let Value::Obj(o) = this else { return None };
+    let b = o.try_borrow().ok()?;
+    if !matches!(b.exotic, crate::value::Exotic::None) || !b.props.shape_is_shared() {
+        return None;
+    }
+    let proto = b.proto.as_ref()?;
+    let pb = proto.try_borrow().ok()?;
+    if !matches!(pb.exotic, crate::value::Exotic::None) || !pb.props.shape_is_shared() {
+        return None;
+    }
+    let pp = crate::value::Gc::as_ptr(proto) as usize;
+    let (shape, pshape) = (b.props.shape(), pb.props.shape());
+    let mut c = cell.get();
+    if !(c.ok && c.shape == shape && c.pshape == pshape && c.proto == pp) {
+        if b.props.slot_of(name).is_some() {
+            return None;
+        }
+        c = CollSite {
+            ok: true,
+            shape,
+            pshape,
+            proto: pp,
+            slot: pb.props.slot_of(name)? as u32,
+        };
+        cell.set(c);
+    }
+    let p = pb.props.entry_at(c.slot as usize)?;
+    if p.accessor() {
+        return None;
+    }
+    let Value::Obj(fo) = p.value() else { return None };
+    let fb = fo.try_borrow().ok()?;
+    match fb.call {
+        crate::value::Callable::Native(fp) if fb.ic_plain.get() => Some(fp),
+        _ => None,
+    }
+}
+
+/// The call of a fused `<object>.<get|has|set|add>(args)` site: `stack[base]` is the object
+/// receiver (checked at the `GetMethod`), `stack[base + 1]` an `undefined` placeholder, the
+/// `argc` arguments follow (pure loads, so reading the method here is unobservable). The
+/// intrinsic Map/Set methods on a collection of their kind run inline
+/// ([`crate::builtins::collections::lookup::coll_fast`]); any other native is called straight,
+/// anything else takes the `GetMethod` + call steps. The result lands in `stack[base]`.
+pub(crate) unsafe extern "C" fn coll_method(
+    f: *mut JitFrame,
+    pc: u32,
+    base: u32,
+    argc: u32,
+    cell: *const std::cell::Cell<CollSite>,
+) -> u32 {
+    let s = (*f).stack;
+    let (base, argc) = (base as usize, argc as usize);
+    let at = s.add(base + 2);
+    let i = &mut *(*f).interp;
+    let chunk = &*(*f).chunk;
+    let Some(Op::GetMethod(n, c)) = chunk.ops.get(pc as usize).copied() else {
+        let e = i.throw("TypeError", "compiled code used a bad method site");
+        return fail(f, e);
+    };
+    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize)) else {
+        let e = i.throw("TypeError", "compiled code used a bad property cache");
+        return fail(f, e);
+    };
+    let this = std::ptr::replace(s.add(base), Value::Undefined);
+    let args = std::slice::from_raw_parts(at, argc);
+    let r = match coll_site_native(i, &*cell, &this, name) {
+        Some(nat) => match crate::builtins::collections::lookup::coll_fast(i, nat, &this, args) {
+            Some(v) => Ok(v),
+            None => i.call_native_fast(nat, this, args),
+        },
         None => match i.get_prop_ic(&this, name, cache) {
             Ok(callee) if callee.is_callable() => i.call(callee, this, args),
             Ok(callee) => i

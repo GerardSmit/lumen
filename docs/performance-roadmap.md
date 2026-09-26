@@ -476,6 +476,12 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       - A function expression also builds its `prototype` object eagerly (node does this lazily).
       - A `let` captured in a loop body allocates a scope per iteration (about 140 ns).
 
+20. ✅ **Map / Set method sites (S).** *(Added after the second report.)*
+    - Finding: `Map.prototype.get` is the third most called builtin in a Puppeteer session, and `get`/`has`/`set` ran 15× slower than node: a generic `GetMethod`, then a native call with its bookkeeping, then the hash lookup.
+    - Built: fused sites (`colm` plan, like item 18's `strn`) for `<object>.get|has|set|add(args)`, where the arguments are pure loads or Number arithmetic. The `GetMethod` checks only that the receiver is an object. At the call, one helper (`coll_method`) reads the method through the receiver's and prototype's shapes (cached per site; the value is re-read every call). When that method is the intrinsic Map/Set native and the receiver holds that kind of collection, the lookup or insert runs inline (`collections::lookup::coll_fast`). Any other native is called directly; user methods, getters, own properties and patched prototypes take the ordinary steps. A site that the planner already turned into a direct JS call (a user class's `get`) keeps that path.
+    - Fast profile, per call in a JIT loop: `get` 91 → 56 ns, `has` 85 → 49 ns, `set` 98 → 61 ns. A user class with `get`/`set` methods is unchanged (35 ns).
+    - Left: the same helper-call floor as item 18. A key that is not a pure load (`m.get(a[i])`, `m.get(s + x)`) still takes the generic path.
+
 ## Open items
 
 ### Engine

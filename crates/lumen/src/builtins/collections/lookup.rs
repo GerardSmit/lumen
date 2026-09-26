@@ -54,6 +54,42 @@ pub(super) fn set_has(i: &mut Interp, this: Value, args: &[Value]) -> Result<Val
     read(i, &this, args.first().unwrap_or(&Value::Undefined), SET_HAS)
 }
 
+/// `this.<method>(args)` for the Map/Set natives `get`, `has`, `set`, `add` when `nat` is one
+/// of them and `this` is a collection of its kind: the result, computed without the native
+/// call's bookkeeping (none of them runs JS or throws then). `None` when that doesn't apply.
+pub(crate) fn coll_fast(
+    i: &mut Interp,
+    nat: crate::value::NativeFn,
+    this: &Value,
+    args: &[Value],
+) -> Option<Value> {
+    let key = args.first().unwrap_or(&Value::Undefined);
+    let object = this.as_obj()?;
+    let data = i.map_data.get_mut(&(Gc::as_ptr(object) as usize))?;
+    let n = nat as usize;
+    let is = |f: crate::value::NativeFn| n == f as usize;
+    match data.kind() {
+        CollectionKind::Map if is(map_get) => Some(data.lookup(key).cloned().unwrap_or(Value::Undefined)),
+        CollectionKind::Map if is(map_has) => Some(Value::Bool(data.contains(key))),
+        CollectionKind::Set if is(set_has) => Some(Value::Bool(data.contains(key))),
+        CollectionKind::Map if is(super::insert::map_set) => {
+            data.insert(key.clone(), args.get(1).cloned().unwrap_or(Value::Undefined));
+            Some(this.clone())
+        }
+        CollectionKind::Set if is(super::insert::set_add) => {
+            let key = super::canonicalize_map_key(key.clone());
+            data.insert(key.clone(), key);
+            Some(this.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Whether `name` is a Map/Set method [`coll_fast`] may handle (a planning hint).
+pub(crate) fn coll_fast_name(name: &str) -> bool {
+    matches!(name, "get" | "has" | "set" | "add")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{bytecode::Tier, Completion, Engine};
