@@ -1013,6 +1013,11 @@ pub struct Interp {
     /// once unmapped by delete/defineProperty). Reads/writes of still-mapped indices alias the
     /// parameter bindings.
     pub(crate) mapped_arguments: crate::fasthash::FastMap<usize, (Env, Vec<Option<String>>)>,
+    /// Finished `arguments` maps by `2 * argc + unmapped` (small counts): indices, `length`,
+    /// `@@iterator` and `callee` laid out once; each activation clones one and patches the
+    /// argument values (and a mapped one's `callee`, at the recorded slot) in place. Tagged with
+    /// the realm (its `Array.prototype` address) whose intrinsics they hold.
+    pub(crate) args_tpls: Vec<Option<(crate::value::Props, usize, usize)>>,
     /// Source-phase imports: canonical module key → its (cached) ModuleSource object.
     pub(crate) module_source_objs: crate::fasthash::FastMap<String, Value>,
     /// WeakRef targets, FinalizationRegistry cells and the kept-alive list (`builtins::weakrefs`).
@@ -1473,6 +1478,7 @@ impl Interp {
             deferred_ns: Default::default(),
             deferred_ns_objs: Default::default(),
             mapped_arguments: Default::default(),
+            args_tpls: Vec::new(),
             module_source_objs: Default::default(),
             weak: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
@@ -5742,52 +5748,54 @@ impl Interp {
         scope: Option<&Env>,
         fn_obj: &Gc,
     ) -> Gc {
-        let ao = Object::new(Some(self.object_proto.clone()));
-        ao.borrow_mut().exotic = crate::value::Exotic::Arguments;
-        for (idx, v) in args.iter().enumerate() {
-            ao.borrow_mut().props.insert(
-                idx.to_string().as_str(),
-                Property::data(v.clone(), true, true, true),
-            );
-        }
-        ao.borrow_mut().props.insert(
-            "length",
-            Property::data(Value::Num(args.len() as f64), true, false, true),
-        );
-        if let Some(sym) = self.iterator_sym.clone() {
-            let values = self
-                .array_proto
-                .borrow()
-                .props
-                .get("values")
-                .map(|p| p.value());
-            if let Some(v) = values {
-                ao.borrow_mut()
-                    .props
-                    .insert(Self::sym_key(&sym), Property::builtin(v));
-            }
-        }
         let simple_params = func
             .params
             .iter()
             .all(|p| !p.rest && p.default.is_none() && matches!(p.pattern, Pattern::Ident(_)));
-        if func.is_strict || !simple_params {
-            if let Some(tte) = self.extra_protos.get("%ThrowTypeError%").cloned() {
-                ao.borrow_mut().props.insert(
-                    "callee",
-                    crate::value::Property::accessor_prop(
-                        Some(Value::Obj(tte.clone())),
-                        Some(Value::Obj(tte)),
-                        false,
-                        false,
-                    ),
-                );
+        let unmapped = func.is_strict || !simple_params;
+        const TPL_MAX: usize = 8;
+        let props = if args.len() <= TPL_MAX {
+            let k = 2 * args.len() + unmapped as usize;
+            if self.args_tpls.len() <= k {
+                self.args_tpls.resize_with(2 * TPL_MAX + 2, || None);
+            }
+            let realm = Gc::as_ptr(&self.array_proto) as usize;
+            if self.args_tpls[k].as_ref().is_none_or(|t| t.2 != realm) {
+                let holes = vec![Value::Undefined; args.len()];
+                let mut p = self.arguments_props(&holes, unmapped, fn_obj);
+                let slot = p.slot_of("callee").unwrap_or(usize::MAX);
+                // The template must not keep the first activation's function alive.
+                if let Some(c) = p.entry_at_mut(slot).filter(|c| !c.accessor()) {
+                    c.set_value(Value::Undefined);
+                }
+                self.args_tpls[k] = Some((p, slot, realm));
+            }
+            let (tpl, slot, _) = self.args_tpls[k].as_ref().expect("template built above");
+            let (mut p, slot) = (tpl.clone(), *slot);
+            let mut ok = true;
+            for (idx, v) in args.iter().enumerate() {
+                ok &= p.set_index_value(idx as u32, v.clone()).is_ok();
+            }
+            if !unmapped {
+                match p.entry_at_mut(slot) {
+                    Some(c) if !c.accessor() => c.set_value(Value::Obj(fn_obj.clone())),
+                    _ => ok = false,
+                }
+            }
+            if ok {
+                p
+            } else {
+                self.arguments_props(args, unmapped, fn_obj)
             }
         } else {
-            ao.borrow_mut().props.insert(
-                "callee",
-                crate::value::Property::data(Value::Obj(fn_obj.clone()), true, false, true),
-            );
+            self.arguments_props(args, unmapped, fn_obj)
+        };
+        let ao = Object::new_with_parts(
+            Some(self.object_proto.clone()),
+            props,
+            crate::value::Exotic::Arguments,
+        );
+        if !unmapped {
             // Mapped: indices alias the parameter bindings (which live in `scope`). With
             // duplicate parameter names only the LAST occurrence is mapped — earlier indices
             // stay plain data properties holding the original argument values.
@@ -5818,6 +5826,50 @@ impl Interp {
             }
         }
         ao
+    }
+
+    /// The own properties of an `arguments` object over `args` (see
+    /// [`Interp::make_arguments_object_in`]): the indices, `length`, `@@iterator` and `callee`
+    /// (the %ThrowTypeError% accessor pair when `unmapped`, else `fn_obj`).
+    fn arguments_props(&self, args: &[Value], unmapped: bool, fn_obj: &Gc) -> crate::value::Props {
+        let mut p = crate::value::Props::new();
+        for (idx, v) in args.iter().enumerate() {
+            p.insert(idx.to_string().as_str(), Property::data(v.clone(), true, true, true));
+        }
+        p.insert(
+            "length",
+            Property::data(Value::Num(args.len() as f64), true, false, true),
+        );
+        if let Some(sym) = self.iterator_sym.clone() {
+            let values = self
+                .array_proto
+                .borrow()
+                .props
+                .get("values")
+                .map(|p| p.value());
+            if let Some(v) = values {
+                p.insert(Self::sym_key(&sym), Property::builtin(v));
+            }
+        }
+        if unmapped {
+            if let Some(tte) = self.extra_protos.get("%ThrowTypeError%").cloned() {
+                p.insert(
+                    "callee",
+                    crate::value::Property::accessor_prop(
+                        Some(Value::Obj(tte.clone())),
+                        Some(Value::Obj(tte)),
+                        false,
+                        false,
+                    ),
+                );
+            }
+        } else {
+            p.insert(
+                "callee",
+                crate::value::Property::data(Value::Obj(fn_obj.clone()), true, false, true),
+            );
+        }
+        p
     }
 
     /// Materialize the dedicated arguments slot of a compiled parameterless function. The active
