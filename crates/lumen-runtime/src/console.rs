@@ -72,7 +72,8 @@ fn write_line(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Valu
         &mut sinks.out
     };
     // A broken pipe shouldn't take the whole runtime down; console errors are swallowed.
-    let _ = writeln!(sink, "{line}");
+    // Lone surrogates print as U+FFFD, like Node (see `lumen_host::well_formed_utf8`).
+    let _ = writeln!(sink, "{}", lumen_host::well_formed_utf8(&line));
     let _ = sink.flush();
     Ok(Value::Undefined)
 }
@@ -131,6 +132,6 @@ pub(crate) fn write_err_line(ctx: &mut Ctx, line: String) {
     let sinks = ctx
         .host_mut::<ConsoleOut>()
         .expect("console state installed");
-    let _ = writeln!(sinks.err, "{line}");
+    let _ = writeln!(sinks.err, "{}", lumen_host::well_formed_utf8(&line));
     let _ = sinks.err.flush();
 }
