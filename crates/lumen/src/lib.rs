@@ -625,9 +625,18 @@ impl Engine {
             .map_err(interpreter::abrupt_value)
     }
 
-    /// Drain the microtask (promise-reaction) queue to quiescence.
+    /// Drain the microtask (promise-reaction) queue to quiescence, then compact the string
+    /// buffers only views of them still use (`lstr::compact_views`: safe here, with no JS or
+    /// native frame running that could hold a borrowed string).
     pub fn run_microtasks(&mut self) {
         self.interp.drain_microtasks();
+        crate::lstr::compact_views();
+    }
+
+    /// `(roots, views, root bytes)` of the string-view registry (see `lstr`), for tests and
+    /// memory diagnostics.
+    pub fn string_view_stats(&self) -> (usize, usize, usize) {
+        crate::lstr::view_stats()
     }
 
     /// Drain and return the reasons of promises rejected without a handler (after a microtask

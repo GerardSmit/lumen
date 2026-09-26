@@ -42,7 +42,7 @@ fn substring<const ASCII: bool>(
         None => {
             #[cfg(test)]
             ASCII_CALLS.with(|calls| calls.set(calls.get() + 1));
-            Ok(Value::str(&s[a as usize..b as usize]))
+            Ok(Value::Str(s.sub(&s[a as usize..b as usize])))
         }
         Some(chars) => {
             #[cfg(test)]

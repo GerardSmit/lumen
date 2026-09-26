@@ -2040,7 +2040,7 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                         .iter()
                         .filter(|(n, _)| n == name)
                         .find_map(|(_, idx)| caps.get(*idx).copied().flatten())
-                        .map(|(a, b)| Value::from_string(text.slice(a, b)))
+                        .map(|(a, b)| Value::Str(text.slice_str(a, b)))
                         .unwrap_or(Value::Undefined);
                     set_data(&g, name, v);
                 }
@@ -2092,7 +2092,7 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
             };
             // The match array is built in its final {length, index, input, groups} shape.
             let items = (0..re.ngroups + 1).map(|g| match caps[g] {
-                Some((a, b)) => Value::from_string(text.slice(a, b)),
+                Some((a, b)) => Value::Str(text.slice_str(a, b)),
                 None => Value::Undefined,
             });
             let index = Value::Num(text.unit_index(start) as f64);
@@ -7880,7 +7880,7 @@ pub(crate) fn str_fast(k: StrFast, s: &crate::lstr::LStr, args: &[Value]) -> Opt
                 Some(_) => return None,
             };
             if start < end {
-                Value::str(&s[start as usize..end as usize])
+                Value::Str(s.sub(&s[start as usize..end as usize]))
             } else {
                 Value::str("")
             }
@@ -7932,11 +7932,7 @@ fn trimmed(s: &crate::lstr::LStr, start: bool, end: bool) -> Value {
     if end {
         t = t.trim_end_matches(is_js_ws);
     }
-    if t.len() == s.len() {
-        Value::Str(s.clone())
-    } else {
-        Value::str(t)
-    }
+    Value::Str(s.sub(t))
 }
 
 /// IsRegExp(arg): true if it has a truthy `@@match`, or (fallback) is a compiled RegExp object.
@@ -8119,13 +8115,13 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 if a == b && (b == 0 || a >= text.len()) {
                     continue;
                 }
-                parts.push(Value::from_string(text.slice(last, a)));
+                parts.push(Value::Str(text.slice_str(last, a)));
                 if parts.len() >= limit {
                     break;
                 }
                 for g in 1..=re.ngroups {
                     parts.push(match caps[g] {
-                        Some((x, y)) => Value::from_string(text.slice(x, y)),
+                        Some((x, y)) => Value::Str(text.slice_str(x, y)),
                         None => Value::Undefined,
                     });
                     if parts.len() >= limit {
@@ -8135,7 +8131,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 last = b;
             }
             if parts.len() < limit {
-                parts.push(Value::from_string(text.slice(last, text.len())));
+                parts.push(Value::Str(text.slice_str(last, text.len())));
             }
             parts.truncate(limit);
             return Ok(i.make_array(parts));
@@ -8153,7 +8149,8 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                     .collect()
             } else {
                 s.split(sep.as_ref())
-                    .map(|p| Value::from_string(p.to_string()))
+                    .take(limit)
+                    .map(|p| Value::Str(s.sub(p)))
                     .collect()
             };
             parts.truncate(limit);
@@ -8691,7 +8688,7 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
             v => norm_index(ab(i.to_number(&v))?, len),
         };
         return Ok(if start < end {
-            Value::str(&s[start as usize..end as usize])
+            Value::Str(s.sub(&s[start as usize..end as usize]))
         } else {
             Value::str("")
         });
