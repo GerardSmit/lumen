@@ -1992,6 +1992,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                     | Op::StrictEq
                     | Op::StrictNotEq
                     | Op::JumpIfNotCmp(..)
+                    | Op::JumpIfFalse(_)
+                    | Op::TypeofIs(..)
             );
         if !ref_aware {
             for k in d - pops..d {
@@ -3801,7 +3803,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                         let r = self.i32c((k != neg) as i64);
                         self.stack[d - 1] = Entry::Bool(r);
                     }
-                    None => self.generic(pc),
+                    None => {
+                        let r = self.typeof_is(kind, neg);
+                        self.stack[d - 1] = Entry::Bool(r);
+                    }
                 }
             }
             Op::Jump(t) => {
@@ -3821,7 +3826,9 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             Op::JumpIfFalse(t) => {
                 let e = self.stack.pop().expect("depth checked");
-                let c = self.truthy(e, d - 1, true);
+                // A borrowed operand is read in place (nothing to release).
+                let consume = !matches!(e, Entry::Ref(..));
+                let c = self.truthy(e, d - 1, consume);
                 self.branch(pc, c, pc + 1, t as usize)?;
             }
             Op::JumpIfFalsePeek(t) | Op::JumpIfTruePeek(t) => {
@@ -4664,7 +4671,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         while q <= self.backedge && !self.is_leader(q) {
             match self.ops[q] {
                 Op::StoreLocal(x) if x as usize == s => return true,
-                Op::LoadLocal(x) | Op::GetPropLocal(x, ..) if other(x) => {}
+                Op::LoadLocal(x) | Op::GetPropLocal(x, ..) | Op::GetElemLocal(x) if other(x) => {}
+                Op::ArithLL(_, x, a, b) if other(x) && other(a) && other(b) => {}
+                Op::ArithLK(_, x, a, _) if other(x) && other(a) => {}
                 Op::GetProp(..)
                 | Op::GetPropThis(..)
                 | Op::GetElem
@@ -6345,6 +6354,101 @@ impl<'a, 'f> Tr<'a, 'f> {
         })
     }
 
+    /// `typeof v === "<kind>"` (negated when `neg`) for the Boxed or Ref entry on top, decided
+    /// by the tag inline for every primitive (and, for `"undefined"`, an object with `ic_plain`
+    /// set, which is not `[[IsHTMLDDA]]`); other objects (and a TDZ marker) through `Helper::TypeofIs`. Consumes
+    /// the entry and returns the result; the caller records it as `Entry::Bool`.
+    fn typeof_is(&mut self, kind: crate::bytecode::TypeofKind, neg: bool) -> V {
+        use crate::bytecode::TypeofKind as K;
+        let d = self.stack.len();
+        let (p, owned) = match self.stack[d - 1] {
+            Entry::Ref(p, _) => (p, false),
+            _ => (self.sptr(d - 1), true),
+        };
+        let tag = self.fb.load(MemKind::I32U8, p, 0);
+        let join = self.fb.create_block();
+        let res = self.fb.append_block_param(join, Type::I32);
+        let slow = self.fb.create_block();
+        let empty = self.i32c(TAG_EMPTY as i64);
+        let objt = self.i32c(TAG_OBJ as i64);
+        let not_empty = self.fb.icmp(IntCC::Ne, tag, empty);
+        let prim_kind = matches!(kind, K::Boolean | K::Number | K::BigInt | K::String | K::Symbol);
+        let dec = if prim_kind {
+            not_empty
+        } else {
+            let not_obj = self.fb.icmp(IntCC::Ne, tag, objt);
+            self.fb.binary(BinaryOp::Band, not_empty, not_obj)
+        };
+        let want = match kind {
+            K::Boolean => Some(TAG_BOOL),
+            K::Number => Some(TAG_NUM),
+            K::BigInt => Some(TAG_BIGINT),
+            K::String => Some(TAG_STR),
+            K::Symbol => Some(TAG_SYM),
+            K::Undefined => Some(TAG_UNDEFINED),
+            K::Object => Some(TAG_NULL),
+            K::Function => None,
+        };
+        let r = match want {
+            Some(t) => {
+                let c = self.i32c(t as i64);
+                self.fb.icmp(if neg { IntCC::Ne } else { IntCC::Eq }, tag, c)
+            }
+            None => self.i32c(neg as i64),
+        };
+        let (b_fast, n1) = (self.fb.create_block(), self.fb.create_block());
+        self.fb.brif(dec, b_fast, &[], n1, &[]);
+        self.fb.seal_block(b_fast);
+        self.fb.seal_block(n1);
+        self.fb.switch_to_block(b_fast);
+        if owned {
+            self.drop_at(d - 1);
+        }
+        self.fb.jump(join, &[r]);
+        self.fb.switch_to_block(n1);
+        match (kind, layout::ic_plain_offset()) {
+            (K::Undefined, Some(off)) => {
+                let iso = self.fb.icmp(IntCC::Eq, tag, objt);
+                let (b_obj, b_plain) = (self.fb.create_block(), self.fb.create_block());
+                self.fb.brif(iso, b_obj, &[], slow, &[]);
+                self.fb.seal_block(b_obj);
+                self.fb.switch_to_block(b_obj);
+                let gc = self.fb.load(PTR_MEM, p, VALUE_PAYLOAD);
+                let plain = self.fb.load(MemKind::I32U8, gc, off);
+                self.fb.brif(plain, b_plain, &[], slow, &[]);
+                self.fb.seal_block(b_plain);
+                self.fb.switch_to_block(b_plain);
+                if owned {
+                    self.drop_at(d - 1);
+                }
+                let no = self.i32c(neg as i64);
+                self.fb.jump(join, &[no]);
+            }
+            _ => {
+                self.fb.jump(slow, &[]);
+            }
+        }
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        let kc = self.i32c(kind as i64);
+        let b = self
+            .call(Helper::TypeofIs, &[self.frame, p, kc])
+            .expect("TypeofIs returns a flag");
+        let b = if neg {
+            let one = self.i32c(1);
+            self.fb.binary(BinaryOp::Bxor, b, one)
+        } else {
+            b
+        };
+        if owned {
+            self.drop_at(d - 1);
+        }
+        self.fb.jump(join, &[b]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        res
+    }
+
     /// Whether operand `o` is the constant `null` or `undefined`.
     fn opnd_nullish(&self, o: Opnd) -> bool {
         matches!(o, Opnd::Const(k)
@@ -6736,9 +6840,19 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.switch_to_block(ord);
             self.stack = pre.clone();
         }
-        let x = layout::elem_get_num(&mut self.fb, obj, key, miss);
-        self.seal_current();
-        self.read_hit(drop, want, at, join, x);
+        // A Boxed result: one lookup decodes any element kind (a Number lookup first would repeat
+        // the walk for every non-number element).
+        let word_first = !want
+            && matches!(slow, Slow::Generic)
+            && matches!(self.ops[pc], Op::GetElem | Op::GetElemLocal(_) | Op::GetMethodElem);
+        if word_first {
+            let bits = layout::elem_get_word(&mut self.fb, obj, key, miss);
+            self.word_hit(bits, drop, at, join, miss);
+        } else {
+            let x = layout::elem_get_num(&mut self.fb, obj, key, miss);
+            self.seal_current();
+            self.read_hit(drop, want, at, join, x);
+        }
         if !ta_first {
             self.fb.seal_block(miss);
             self.fb.switch_to_block(miss);
@@ -6758,6 +6872,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         {
             // An object element, inline: a retained handle word.
             let helper_b = self.fb.create_block();
+            if word_first {
+                self.fb.jump(helper_b, &[]);
+            } else {
             let bits = layout::elem_get_word(&mut self.fb, obj, key, helper_b);
             let (is_obj, is_str, w) = layout::word_counted(&mut self.fb, bits);
             let rc_so = layout::rc_strong_offset();
@@ -6789,6 +6906,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.store(MemKind::I32U8, self.stackp, t, o);
             self.fb.store(PTR_MEM, self.stackp, gc, o + VALUE_PAYLOAD);
             self.fb.jump(join, &[]);
+            }
             self.fb.seal_block(helper_b);
             self.fb.switch_to_block(helper_b);
             let dst = self.sptr(at);
@@ -6813,6 +6931,59 @@ impl<'a, 'f> Tr<'a, 'f> {
             Some(p) => Entry::Num(p),
             None => Entry::Boxed,
         });
+    }
+
+    /// Store the element word `bits` as the Boxed result at stack index `at` (retaining an object
+    /// or a string inline), releasing the consumed receiver `drop`, and jump to `join`; a BigInt
+    /// or a Symbol goes to `miss`. Seals the blocks it creates (and the current one).
+    fn word_hit(&mut self, bits: V, drop: Option<usize>, at: usize, join: Block, miss: Block) {
+        let (tag, payload, is_ref) = layout::word_value(&mut self.fb, bits, miss);
+        self.seal_current();
+        let (refb, plain) = (self.fb.create_block(), self.fb.create_block());
+        self.fb.brif(is_ref, refb, &[], plain, &[]);
+        self.fb.seal_block(refb);
+        self.fb.seal_block(plain);
+        self.fb.switch_to_block(plain);
+        if let Some(i) = drop {
+            self.drop_at(i);
+        }
+        let dst = self.sptr(at);
+        self.fb.store(MemKind::I32U8, dst, tag, 0);
+        let byte = self.fb.convert(ConvOp::Wrap, Type::I32, payload);
+        self.fb.store(MemKind::I32U8, dst, byte, VALUE_BOOL);
+        self.fb.store(MemKind::I64, dst, payload, VALUE_PAYLOAD);
+        self.fb.jump(join, &[]);
+        self.fb.switch_to_block(refb);
+        let (is_obj, is_str, w) = layout::word_counted(&mut self.fb, bits);
+        let rc_so = layout::rc_strong_offset();
+        let counted = match rc_so {
+            Some(_) => self.fb.binary(BinaryOp::Bor, is_obj, is_str),
+            None => is_obj,
+        };
+        let obj_b = self.fb.create_block();
+        self.fb.brif(counted, obj_b, &[], miss, &[]);
+        self.fb.seal_block(obj_b);
+        self.fb.switch_to_block(obj_b);
+        let gc = if PTR == Type::I64 {
+            w
+        } else {
+            self.fb.convert(ConvOp::Wrap, PTR, w)
+        };
+        let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
+        let strong = self.fb.load(PTR_MEM, gc, so);
+        let one = self.ptrc(1);
+        let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
+        self.fb.store(PTR_MEM, gc, s1, so);
+        if let Some(i) = drop {
+            self.drop_at(i);
+        }
+        let o = self.soff(at);
+        let to = self.i32c(TAG_OBJ as i64);
+        let ts = self.i32c(TAG_STR as i64);
+        let t = self.fb.select(is_obj, to, ts);
+        self.fb.store(MemKind::I32U8, self.stackp, t, o);
+        self.fb.store(PTR_MEM, self.stackp, gc, o + VALUE_PAYLOAD);
+        self.fb.jump(join, &[]);
     }
 
     /// `obj[key] = v` (`v` Num, or Boxed guarded to hold a Number); `base` is the stack index
