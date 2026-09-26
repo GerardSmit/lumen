@@ -241,7 +241,7 @@ impl TypeofKind {
         })
     }
 
-    fn of(i: &crate::interpreter::Interp, v: &Value) -> Self {
+    pub(crate) fn of(i: &crate::interpreter::Interp, v: &Value) -> Self {
         match v {
             Value::Obj(_) if i.is_htmldda(v) => Self::Undefined,
             Value::Undefined | Value::Empty => Self::Undefined,

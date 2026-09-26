@@ -50,6 +50,9 @@ pub(crate) enum Helper {
     Binary,
     /// `(frame, v: *mut Value) -> u32` — ToBoolean of `*v` (consumed), 0/1. Never throws.
     ToBoolean,
+    /// `(frame, v: *const Value, kind: u32) -> u32` — whether `typeof *v` is the
+    /// [`crate::bytecode::TypeofKind`] `kind` (as its discriminant), 0/1. Never throws.
+    TypeofIs,
     /// `(frame, pc: u32, base: u32, depth: u32) -> status` — the generic fallback: run the
     /// single interpreter op at `pc` with `frame.stack[base..depth]` (all Boxed; `base` at or
     /// below the op's operands) as its operand stack; the results are left at
@@ -300,7 +303,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 76] = [
+pub(crate) const ALL: [Helper; 77] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -308,6 +311,7 @@ pub(crate) const ALL: [Helper; 76] = [
     Helper::Clone,
     Helper::Binary,
     Helper::ToBoolean,
+    Helper::TypeofIs,
     Helper::Generic,
     Helper::Safepoint,
     Helper::NamePtr,
@@ -391,6 +395,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::Clone => (&[P, P], &[]),
         Helper::Binary => (&[P, I32, P, P, P], &[I32]),
         Helper::ToBoolean => (&[P, P], &[I32]),
+        Helper::TypeofIs => (&[P, P, I32], &[I32]),
         Helper::Generic => (&[P, I32, I32, I32], &[I32]),
         Helper::Safepoint => (&[P], &[I32]),
         Helper::NamePtr | Helper::NamePtrW | Helper::GlobPtr => (&[P, I32, I32], &[P]),
@@ -470,6 +475,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::Clone => clone_value as *const () as usize,
         Helper::Binary => binary as *const () as usize,
         Helper::ToBoolean => to_boolean as *const () as usize,
+        Helper::TypeofIs => typeof_is as *const () as usize,
         Helper::Generic => generic as *const () as usize,
         Helper::Safepoint => safepoint as *const () as usize,
         Helper::NamePtr => name_ptr as *const () as usize,
@@ -936,6 +942,10 @@ pub(crate) unsafe extern "C" fn binary(
 pub(crate) unsafe extern "C" fn to_boolean(f: *mut JitFrame, v: *mut Value) -> u32 {
     let v = std::ptr::replace(v, Value::Undefined);
     (*(*f).interp).to_boolean(&v) as u32
+}
+
+pub(crate) unsafe extern "C" fn typeof_is(f: *mut JitFrame, v: *const Value, kind: u32) -> u32 {
+    (crate::bytecode::TypeofKind::of(&*(*f).interp, &*v) as u32 == kind) as u32
 }
 
 pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, depth: u32) -> u32 {
