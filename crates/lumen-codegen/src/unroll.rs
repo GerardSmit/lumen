@@ -279,8 +279,8 @@ fn apply(func: &mut Function, cfg: &Cfg, plan: &Plan) {
                     }
                 }
                 let ni = func.make_inst(data);
-                let olds = func.inst_results[inst.index()].clone();
-                let news = func.inst_results[ni.index()].clone();
+                let olds = func.results(inst).to_vec();
+                let news = func.results(ni).to_vec();
                 for (o, nv) in olds.into_iter().zip(news) {
                     copies[k].1.insert(o, nv);
                 }
@@ -325,7 +325,7 @@ fn apply(func: &mut Function, cfg: &Cfg, plan: &Plan) {
             m.insert(p, last[&p]);
         }
         for &i in &func.blocks[h.index()].insts {
-            for &r in &func.inst_results[i.index()] {
+            for &r in func.results(i) {
                 m.insert(r, last[&r]);
             }
         }

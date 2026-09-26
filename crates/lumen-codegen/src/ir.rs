@@ -599,7 +599,10 @@ pub struct Function {
     pub name: String,
     pub sig: Signature,
     pub insts: Vec<InstData>,
-    pub inst_results: Vec<Vec<Value>>,
+    /// Where each instruction's results start in `result_pool` (they run to the next
+    /// instruction's start): one flat array instead of a vector per instruction.
+    inst_results: Vec<u32>,
+    result_pool: Vec<Value>,
     pub values: Vec<ValueData>,
     pub blocks: Vec<BlockData>,
     /// Blocks in layout order; the first is the entry, whose parameters are the function's.
@@ -626,7 +629,9 @@ impl Function {
     }
 
     pub fn results(&self, inst: Inst) -> &[Value] {
-        &self.inst_results[inst.index()]
+        let i = inst.index();
+        let end = self.inst_results.get(i + 1).map_or(self.result_pool.len(), |&e| e as usize);
+        &self.result_pool[self.inst_results[i] as usize..end]
     }
 
     pub fn inst(&self, inst: Inst) -> &InstData {
@@ -690,12 +695,11 @@ impl Function {
         let tys = self.result_types(&data);
         let inst = Inst(self.insts.len() as u32);
         self.insts.push(data);
-        let results = tys
-            .into_iter()
-            .enumerate()
-            .map(|(i, t)| self.make_value(t, ValueDef::Result(inst, i as u32)))
-            .collect();
-        self.inst_results.push(results);
+        self.inst_results.push(self.result_pool.len() as u32);
+        for (i, t) in tys.into_iter().enumerate() {
+            let v = self.make_value(t, ValueDef::Result(inst, i as u32));
+            self.result_pool.push(v);
+        }
         inst
     }
 
@@ -774,7 +778,7 @@ impl fmt::Display for Function {
             }
             writeln!(f, "):")?;
             for &inst in &data.insts {
-                let results = &self.inst_results[inst.index()];
+                let results = self.results(inst);
                 write!(f, "    ")?;
                 if !results.is_empty() {
                     let names: Vec<String> = results.iter().map(|v| v.to_string()).collect();

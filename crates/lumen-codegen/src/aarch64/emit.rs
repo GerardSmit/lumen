@@ -649,13 +649,14 @@ impl<'a> Emitter<'a> {
                 let (d, s) = (self.r(*dst), self.r(*src));
                 self.a.fcvt_int(FInt::ToGpr, size.w(), size.w(), d, s);
             }
-            MInst::Call {
-                target,
-                reg_args,
-                stack_args,
-                rets,
-                ..
-            } => {
+            MInst::Call(c) => {
+                let CallInfo {
+                    target,
+                    reg_args,
+                    stack_args,
+                    rets,
+                    ..
+                } = &**c;
                 for &(v, off, bytes) in stack_args {
                     let off = off as i64;
                     let (iop, fop) = if bytes == 4 {

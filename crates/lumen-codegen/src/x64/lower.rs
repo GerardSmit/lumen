@@ -564,13 +564,13 @@ impl Lower<'_> {
                 rets.push((dst, ret_reg(t)));
             }
         }
-        self.push(MInst::Call {
+        self.push(MInst::Call(Box::new(CallInfo {
             target,
             reg_args,
             stack_args,
             rets,
             clobbers: self.abi.call_clobbers,
-        });
+        })));
         if let Some(m) = post {
             self.push(m);
         }
