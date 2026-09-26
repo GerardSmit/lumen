@@ -29,6 +29,12 @@ pub(super) fn own_elem(o: &Gc, k: usize) -> Option<Value> {
     let n = u32::try_from(k).ok()?;
     let b = o.borrow();
     if !plain_elems(&b) {
+        // A split view's elements are own plain data elements sliced out of its source.
+        if b.exotic == Exotic::SplitView {
+            if let Callable::SplitView(v) = &b.call {
+                return v.get(k);
+            }
+        }
         return None;
     }
     let p = b.props.get_index(n)?;
@@ -146,7 +152,8 @@ pub(super) fn delete_elem(i: &mut Interp, o: &Gc, ov: &Value, k: usize) -> Resul
 pub(super) fn len_of(i: &mut Interp, o: &Gc) -> Result<usize, Value> {
     {
         let b = o.borrow();
-        if b.ic_plain.get() && matches!(b.exotic, Exotic::Array) {
+        // (A split view's `length` is the same kind of own data property.)
+        if (b.ic_plain.get() && matches!(b.exotic, Exotic::Array)) || b.exotic == Exotic::SplitView {
             if let Some(p) = b.props.length_property() {
                 if !p.accessor() {
                     if let Value::Num(n) = p.value() {
@@ -242,8 +249,8 @@ pub(super) fn species(i: &mut Interp, original: &Value, len: usize) -> Result<Op
     if let Value::Obj(o) = original {
         let fast = {
             let b = o.borrow();
-            b.ic_plain.get()
-                && matches!(b.exotic, Exotic::Array)
+            // (A split view's property map holds only `length`.)
+            ((b.ic_plain.get() && matches!(b.exotic, Exotic::Array)) || b.exotic == Exotic::SplitView)
                 && b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
                 && b.props.get("constructor").is_none()
         };
@@ -398,6 +405,11 @@ pub(super) fn array_filter(i: &mut Interp, this: Value, args: &[Value]) -> Resul
     let (cb, cb_this) = callback(i, args, "Array.prototype.filter")?;
     let ov = Value::Obj(o.clone());
     let custom = species(i, &this, 0)?;
+    if custom.is_none() {
+        if let Some(snap) = crate::split_view::view_of(&o) {
+            return filter_view(i, &o, snap, len, cb, cb_this);
+        }
+    }
     let mut out = Out::new(custom, 0);
     let mut to = 0usize;
     let mut f = PreparedCall::new(i, cb, cb_this);
@@ -412,6 +424,54 @@ pub(super) fn array_filter(i: &mut Interp, this: Value, args: &[Value]) -> Resul
     }
     f.finish(i);
     out.finish(i, None)
+}
+
+/// `filter` over a split view with the default species: the kept pieces become a view of the
+/// same source (one offset pair each). If the callback materializes the receiver, the rest of
+/// the walk is the generic one and the result an ordinary Array.
+fn filter_view(
+    i: &mut Interp,
+    o: &Gc,
+    snap: std::rc::Rc<crate::split_view::SplitView>,
+    len: usize,
+    cb: Value,
+    cb_this: Value,
+) -> Result<Value, Value> {
+    let ov = Value::Obj(o.clone());
+    let mut kept: Vec<u32> = Vec::new();
+    let mut eager: Option<Vec<Value>> = None;
+    let mut f = PreparedCall::new(i, cb, cb_this);
+    for k in 0..len {
+        let lazy = eager.is_none() && crate::split_view::is_same_view(o, &snap);
+        let v = if lazy {
+            Value::Str(snap.piece(k))
+        } else {
+            match has_get(i, o, &ov, k)? {
+                Some(v) => v,
+                None => continue,
+            }
+        };
+        let keep = f.call3(i, v.clone(), Value::Num(k as f64), &ov)?;
+        if i.to_boolean(&keep) {
+            if lazy {
+                kept.push(k as u32);
+            } else {
+                eager
+                    .get_or_insert_with(|| kept.iter().map(|&j| Value::Str(snap.piece(j as usize))).collect())
+                    .push(v);
+            }
+        } else if !lazy && eager.is_none() {
+            eager = Some(kept.iter().map(|&j| Value::Str(snap.piece(j as usize))).collect());
+        }
+    }
+    f.finish(i);
+    Ok(match eager {
+        Some(vals) => i.make_array(vals),
+        None if !kept.is_empty() && kept.len() >= crate::split_view::min_pieces() => {
+            crate::split_view::make_view(&i.array_proto, snap.subset(&kept))
+        }
+        None => i.make_array(kept.iter().map(|&j| Value::Str(snap.piece(j as usize))).collect()),
+    })
 }
 
 pub(super) fn array_reduce(
@@ -725,6 +785,12 @@ pub(super) fn array_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result
     };
     let count = (end - start).max(0) as usize;
     let custom = species(i, &this, count)?;
+    // A split view's slice is a view of the same source (the offsets of the sliced run).
+    if custom.is_none() && count > 0 && count >= crate::split_view::min_pieces() {
+        if let Some(v) = crate::split_view::view_of(&o) {
+            return Ok(crate::split_view::make_view(&i.array_proto, v.slice(start as usize, end as usize)));
+        }
+    }
     // Dense fast path: clone the packed run property by property into the result's storage.
     if custom.is_none() && count > INLINE_SLICE_MAX {
         let copy = {
@@ -815,6 +881,9 @@ pub(super) fn array_splice_impl(
     args: &[Value],
 ) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    // A mutator: a split view receiver becomes an ordinary Array first (unobservable), so
+    // the dense paths below apply.
+    crate::split_view::unview(&o);
     let ov = Value::Obj(o.clone());
     let len = len_of(i, &o)? as i64;
     let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
@@ -909,6 +978,7 @@ fn store_len(o: &mut crate::value::Object, n: u32) {
 
 pub(super) fn array_shift(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    crate::split_view::unview(&o);
     // Dense fast path: a packed array of plain elements drops its first slot in O(1).
     if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize) {
         let mut b = o.borrow_mut();
@@ -939,6 +1009,7 @@ pub(super) fn array_shift(i: &mut Interp, this: Value, _args: &[Value]) -> Resul
 
 pub(super) fn array_unshift(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    crate::split_view::unview(&o);
     // Dense fast path: the new indices can't reach a setter (no elements on the array
     // prototypes), so prepending into front slack is the whole effect.
     if !args.is_empty()
@@ -980,6 +1051,7 @@ pub(super) fn array_unshift(i: &mut Interp, this: Value, args: &[Value]) -> Resu
 
 pub(super) fn array_reverse(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    crate::split_view::unview(&o);
     let ov = Value::Obj(o.clone());
     let len = len_of(i, &o)?;
     for lower in 0..len / 2 {
@@ -1009,6 +1081,7 @@ pub(super) fn array_reverse(i: &mut Interp, this: Value, _args: &[Value]) -> Res
 
 pub(super) fn array_fill(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
+    crate::split_view::unview(&o);
     let len = len_of(i, &o)? as i64;
     let v = arg(args, 0);
     let start = norm_index(ab(i.to_number(&arg(args, 1)))?, len);
@@ -1049,6 +1122,7 @@ pub(super) fn array_sort(i: &mut Interp, this: Value, args: &[Value]) -> Result<
         return Err(i.make_error("TypeError", "the comparator must be a function or undefined"));
     }
     let o = arr_to_object(i, &this)?;
+    crate::split_view::unview(&o);
     let ov = Value::Obj(o.clone());
     let len = checked_len_of(i, &o)?;
     // SortIndexedProperties: read only the present indices (holes are skipped, not read).

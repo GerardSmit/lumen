@@ -24,6 +24,19 @@ impl Props {
         }
     }
 
+    /// Install `elems` as the packed dense elements `0..elems.len()` of an array map that has
+    /// its own `length` and no elements yet (a split view materializing in place: see
+    /// `crate::split_view`). The same storage a compact builtin array of that length gets.
+    pub(crate) fn adopt_packed_elements(&mut self, elems: Vec<Property>) {
+        debug_assert!(self.elem_mode.get() && self.elems.packed_ref().is_none_or(|p| p.is_empty()) && self.elems.len() == 0);
+        if elems.is_empty() {
+            return;
+        }
+        self.elems
+            .set_packed(Some(Box::new(super::PackedVec::from(elems))));
+        *self.elems.mirror_flags_mut() = 0;
+    }
+
     /// Mark this map as an array's (see `elem_mode`). One-way, set when the owning object
     /// becomes `Exotic::Array`.
     #[inline]

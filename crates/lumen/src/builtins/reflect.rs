@@ -104,6 +104,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         if Interp::is_private_key(&key) {
             return Ok(Value::Undefined); // private-name slot is not an own property
         }
+        crate::split_view::unview(&o);
         // A mapped arguments index reports the live parameter value.
         if let Some(v) = i.mapped_arg_value(Gc::as_ptr(&o) as usize, &key) {
             if let Some(p) = o.borrow_mut().props.get_mut(&key) {
@@ -144,6 +145,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
             }
+            crate::split_view::unview(&o);
             // A TypedArray integer index can't be deleted; a canonical-numeric non-index reports true.
             if let Some(info) = ta_info(i, &o) {
                 match i.ta_index_kind(&info, &key) {
@@ -176,6 +178,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             let keys = proxy_own_keys(i, &target, &handler)?;
             return Ok(i.make_array(keys));
         }
+        crate::split_view::unview(&o);
         // A TypedArray's integer indices come first (ascending), then string keys, then symbols.
         let mut out: Vec<Value> = if let Some(info) = ta_info(i, &o) {
             (0..i.ta_len(&info).unwrap_or(0))

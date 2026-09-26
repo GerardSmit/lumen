@@ -62,6 +62,7 @@ mod regex;
 mod regex_emoji;
 mod regex_fold;
 mod snapshot;
+mod split_view;
 mod sync_callbacks;
 mod temporal;
 mod token;

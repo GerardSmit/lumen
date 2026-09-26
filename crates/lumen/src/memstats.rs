@@ -564,6 +564,14 @@ impl crate::interpreter::Interp {
             fmt_bytes(w.prop_cap * p),
             fmt_bytes((w.prop_cap - w.prop_len) * p)
         );
+        if w.split_views > 0 {
+            eprintln!(
+                "[mem]   split views {}: offsets {}, distinct sources {}",
+                w.split_views,
+                fmt_bytes(w.split_view_offsets),
+                fmt_bytes(w.split_view_src)
+            );
+        }
         eprintln!(
             "[mem]   scopes {} = {}; shapes {} = {}",
             w.scopes,

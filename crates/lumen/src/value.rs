@@ -778,6 +778,9 @@ pub enum Callable {
     /// A promise resolving function (`true`: resolve, `false`: reject); the pair shares the
     /// cell, which holds the promise and the [[AlreadyResolved]] flag.
     Resolver(Rc<crate::eval::promise_fast::ResolverCell>, bool),
+    /// Not callable: a lazy split result's source string and piece offsets (see
+    /// [`Exotic::SplitView`]).
+    SplitView(Rc<crate::split_view::SplitView>),
 }
 
 /// Cold payloads boxed out of [`Callable`], so every non-callable ordinary object does not pay
@@ -816,7 +819,7 @@ impl Callable {
     /// Whether this is a function behavior (neither `None` nor a non-callable slot variant).
     #[inline]
     pub(crate) fn is_fn(&self) -> bool {
-        !matches!(self, Callable::None | Callable::Promise(_))
+        !matches!(self, Callable::None | Callable::Promise(_) | Callable::SplitView(_))
     }
 
     pub(crate) fn user(func: Rc<Function>, env: Env) -> Callable {
@@ -864,6 +867,21 @@ pub enum Exotic {
     /// An `arguments` exotic object (mapped index/parameter aliasing lives in
     /// `Interp::mapped_arguments`).
     Arguments,
+    /// A lazy `String.prototype.split` result (see [`crate::split_view`]): an Array from the
+    /// outside whose elements are sliced out of the source string on read. Its state lives in
+    /// `call` ([`Callable::SplitView`]); its props hold only `length`. `ic_plain` is false and
+    /// every `Exotic::Array` fast path misses it; any mutation or direct-props consumer first
+    /// materializes it in place into an ordinary `Exotic::Array`.
+    SplitView,
+}
+
+impl Exotic {
+    /// The spec's IsArray for a non-proxy object: an Array exotic object, including a lazy split
+    /// view (which is one from the outside).
+    #[inline]
+    pub(crate) fn is_array(self) -> bool {
+        matches!(self, Exotic::Array | Exotic::SplitView)
+    }
 }
 
 /// The hidden own entry holding an exotic object's internal-slot value (see [`Exotic`]).
@@ -951,7 +969,7 @@ impl Object {
     /// The internal-slot value of a wrapper / error object (see [`Exotic`]).
     pub(crate) fn exotic_payload(&self) -> Option<Value> {
         match self.exotic {
-            Exotic::None | Exotic::Array | Exotic::Arguments => None,
+            Exotic::None | Exotic::Array | Exotic::Arguments | Exotic::SplitView => None,
             _ => self.props.get(EXOTIC_SLOT).map(|p| p.value()),
         }
     }

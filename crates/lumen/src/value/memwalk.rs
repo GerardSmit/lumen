@@ -34,6 +34,11 @@ pub(crate) struct HeapWalk {
     /// Parameters of the walked function nodes (count, and their vectors' capacity).
     pub params: usize,
     pub params_cap: usize,
+    /// Lazy `split` results (see [`crate::split_view`]): count, offset-table bytes, and the
+    /// bytes of their distinct source strings.
+    pub split_views: usize,
+    pub split_view_offsets: usize,
+    pub split_view_src: usize,
 }
 
 pub(crate) fn walk() -> HeapWalk {
@@ -45,8 +50,17 @@ pub(crate) fn walk() -> HeapWalk {
     w.objects = objs.len();
     let mut nodes: std::collections::HashSet<*const crate::ast::Function> = Default::default();
     let mut fns: Vec<Rc<crate::ast::Function>> = Vec::new();
+    let mut view_srcs: std::collections::HashSet<*const u8> = Default::default();
     for o in &objs {
         let b = o.borrow();
+        if let Callable::SplitView(v) = &b.call {
+            w.split_views += 1;
+            w.split_view_offsets += v.offsets_bytes();
+            let s = v.source().as_str();
+            if view_srcs.insert(s.as_ptr()) {
+                w.split_view_src += s.len();
+            }
+        }
         let c = b.props.census();
         if !c.entries_shared {
             w.prop_len += c.entries_len;

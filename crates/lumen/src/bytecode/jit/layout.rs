@@ -758,7 +758,15 @@ pub(crate) fn array_len_i64(
 
     fb.switch_to_block(other);
     let gc = object(fb, l, v, miss, false);
-    exotic_is(fb, l, gc, &[Exotic::Array], miss);
+    // An ic-plain Array, or a split view (not ic-plain, but its map is an array map holding
+    // the own `length` data property the same way; its elements are never read inline).
+    let ex = fb.load(MemKind::I32U8, gc, l.exotic);
+    let is_arr = cmp_imm(fb, IntCC::Eq, Type::I32, ex, Exotic::Array as u8 as i64);
+    let plain = fb.load(MemKind::I32U8, gc, l.ic_plain);
+    let arr_ok = fb.binary(BinaryOp::Band, is_arr, plain);
+    let is_view = cmp_imm(fb, IntCC::Eq, Type::I32, ex, Exotic::SplitView as u8 as i64);
+    let ok = fb.binary(BinaryOp::Bor, arr_ok, is_view);
+    guard(fb, ok, miss);
     let shape = fb.load(PTR_MEM, gc, l.shape_rc);
     let has_shape = cmp_imm(fb, IntCC::Ne, PTR, shape, 0);
     guard(fb, has_shape, miss);
