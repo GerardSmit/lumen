@@ -64,6 +64,9 @@ pub(super) struct DSite {
     /// The callee's virtual `arguments` / rest object: its slot, seeded with the element
     /// count past the base (see `Chunk::virt_base`; the site passes at most `n_params`).
     pub virt: Option<(u16, u16)>,
+    /// The callee has an activation layout: the call builds its activation environment
+    /// ([`Helper::ActEnv`]) in the call record and drops it after the call.
+    pub act: bool,
     pub n_slots: usize,
     pub n_params: usize,
     /// A recursive call of the code being compiled.
@@ -170,23 +173,23 @@ fn offs() -> Option<&'static Offs> {
 /// Where a name cache's scope-mode resolution lives (see `Chunk::name_ic_hit`), for the
 /// inline check at direct sites' name loads. Offsets relative to the `RefCell<Scope>` unless
 /// noted; measured on this target.
-struct ScopeOffs {
+pub(super) struct ScopeOffs {
     /// `Rc::as_ptr(env)` minus the `Env`'s stored pointer word.
-    rc_value: i64,
+    pub(super) rc_value: i64,
     /// The cell's borrow counter (an `isize`).
-    borrow: i32,
+    pub(super) borrow: i32,
     /// `scope.vars`' generation (a `u32`).
-    gen: i32,
+    pub(super) gen: i32,
     /// `NameIc` fields, relative to the cache cell.
-    ic_env: i32,
-    ic_binding: i32,
-    ic_gen: i32,
+    pub(super) ic_env: i32,
+    pub(super) ic_binding: i32,
+    pub(super) ic_gen: i32,
     /// `Binding` fields.
-    b_value: i32,
-    b_init: i32,
+    pub(super) b_value: i32,
+    pub(super) b_init: i32,
 }
 
-fn scope_offs() -> Option<&'static ScopeOffs> {
+pub(super) fn scope_offs() -> Option<&'static ScopeOffs> {
     use crate::interpreter::{Binding, Scope, VarMap};
     use std::mem::{offset_of, size_of};
     static OFFS: OnceLock<Option<ScopeOffs>> = OnceLock::new();
@@ -388,6 +391,13 @@ fn accessor_chain(i: &Interp, recv: &Value, name: &str, set: bool) -> Option<(Ve
     None
 }
 
+/// Whether a callee with an activation layout can be called directly: its activation is
+/// built by [`Helper::ActEnv`] (see [`DSite::act`]); off with `LUMEN_NO_DIRECT_ACT`.
+fn act_ok(cc: &Chunk) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUMEN_NO_DIRECT_ACT").is_none()) && !cc.derived
+}
+
 /// A direct call site for accessor `f` called with `nargs` arguments and a receiver.
 fn accessor_dsite(p: &mut Plan, interp: &Interp, chunk: &Chunk, f: &Value, nargs: usize) -> Option<DSite> {
     let ic = crate::bytecode::inline_callee(interp, f)?;
@@ -395,7 +405,7 @@ fn accessor_dsite(p: &mut Plan, interp: &Interp, chunk: &Chunk, f: &Value, nargs
     let word = super::value_word(f);
     let cc_rc = ic.chunk.clone();
     let cc: &Chunk = &cc_rc;
-    if cc.activation_layout.is_some()
+    if (cc.activation_layout.is_some() && !act_ok(cc))
         || (cc.arguments_slot.is_some() && cc.virt_base.is_none())
         || (cc.virt_base.is_some() && nargs > cc.n_params)
         || cc.derived
@@ -426,6 +436,7 @@ fn accessor_dsite(p: &mut Plan, interp: &Interp, chunk: &Chunk, f: &Value, nargs
         reflect: cc.reflect_args,
         rest: cc.rest_slot.filter(|_| cc.virt_base.is_none()),
         virt: virt_site(cc),
+        act: cc.activation_layout.is_some(),
         n_slots: cc.n_slots,
         n_params: cc.n_params,
         self_call: false,
@@ -698,7 +709,7 @@ pub(super) fn plan_direct(
         let (cc_rc, strict, arrow, word, fn_ptr, env_addr, callee) = resolved;
         let callee_weak = callee.as_obj().map(crate::value::Gc::downgrade);
         let cc: &Chunk = &cc_rc;
-        if cc.activation_layout.is_some()
+        if (cc.activation_layout.is_some() && !act_ok(cc))
             || (cc.arguments_slot.is_some() && cc.virt_base.is_none())
             || (cc.virt_base.is_some()
                 && (nargs > cc.n_params || matches!(adaptor, Adaptor::Apply(..))))
@@ -748,6 +759,7 @@ pub(super) fn plan_direct(
             reflect: cc.reflect_args,
             rest: cc.rest_slot.filter(|_| cc.virt_base.is_none()),
             virt: virt_site(cc),
+            act: cc.activation_layout.is_some(),
             n_slots: cc.n_slots,
             n_params: cc.n_params,
             self_call,
@@ -1841,6 +1853,13 @@ impl Tr<'_, '_> {
                 }
             }
         }
+        if site.act {
+            // The activation environment, owned by the call record; the frame reads it there.
+            let eo = self.ptrc(REC_ENV as i64);
+            let envw = self.fb.binary(BinaryOp::Iadd, rec, eo);
+            self.call(Helper::ActEnv, &[self.frame, cellp, cp, this_p, slots_p, envw]);
+            self.fb.store(PTR_MEM, nf, envw, FRAME_ENV);
+        }
         // ---- the call ----
         let word = match entry {
             None => {
@@ -1898,6 +1917,11 @@ impl Tr<'_, '_> {
         // ---- after the call ----
         if construct {
             self.call(Helper::NewDone, &[self.frame, cellp, top0, stack_p, st_post]);
+        }
+        if site.act {
+            let eo = self.ptrc(REC_ENV as i64);
+            let envw = self.fb.binary(BinaryOp::Iadd, rec, eo);
+            self.call(Helper::DropEnv, &[envw]);
         }
         // The callee, receiver and adaptor operands below the arguments.
         for k in base..ab {

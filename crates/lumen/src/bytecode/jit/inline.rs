@@ -8,6 +8,12 @@
 //! site's identity guard holds, the inlined copy computes exactly what the call would, and no
 //! interpreter frame ever needs to exist for it (no deopt state to materialize). Anything else
 //! (calls, property access, `this`, `arguments`, loops, other types) keeps the ordinary call.
+//!
+//! The body may also read captured variables (`LoadName`) that resolve in the callee's own
+//! closure scope — fixed once the identity guard holds. The planner records each binding's
+//! address and the scope's generation; the site re-checks the generation, the binding's TDZ
+//! flag and its value's kind before the body (a miss retires the site), and the body reads the
+//! value in place.
 
 use super::*;
 use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
@@ -27,6 +33,20 @@ pub(super) struct Shape {
     pub reach: Vec<bool>,
     /// The kind of the returned value; `None` when the body returns `undefined`.
     pub ret: Option<bool>,
+    /// The captured variables the body reads, all bindings of the closure scope `scope` (the
+    /// `RefCell<Scope>` address) as of generation `gen`.
+    pub caps: Vec<Cap>,
+    pub scope: usize,
+    pub gen: u32,
+}
+
+/// A captured variable an inlined body reads: name `n`'s binding (its address) and the kind
+/// its value had when planned (`true` = Number).
+#[derive(Clone, Debug)]
+pub(super) struct Cap {
+    pub n: u32,
+    pub binding: usize,
+    pub num: bool,
 }
 
 /// A resolved callee that may be inlined.
@@ -97,19 +117,76 @@ pub(super) fn candidate(
     let chunk = c.chunk;
     if chunk.ops.len() > MAX_INLINE_OPS
         || chunk.activation_layout.is_some()
-        || chunk.arguments_slot.is_some()
-        || chunk.rest_slot.is_some()
+        || chunk.makes_env()
+        || (chunk.arguments_slot.is_some() || chunk.rest_slot.is_some())
+            && chunk.virt_base.is_none()
         || chunk.uses_this()
-        || args.len() < chunk.n_params
     {
         return None;
     }
-    let shape = shape(&chunk, &args[..chunk.n_params])?;
+    // A virtual `arguments` / rest object (only `.length` and `[k]` reads) stays virtual while
+    // the arguments fit the hidden parameter window: its reads are the static count and the
+    // argument entries themselves.
+    let argc = if chunk.virt_base.is_some() {
+        if args.len() > chunk.n_params {
+            return None;
+        }
+        args.len()
+    } else if args.len() < chunk.n_params {
+        return None;
+    } else {
+        chunk.n_params
+    };
+    let shape = shape(&chunk, &args[..argc], &c.env)?;
     Some((chunk, shape))
 }
 
+/// Name `name`'s binding in `env` itself when a compiled body may read it in place: a plain
+/// initialized data binding (no `with` object, no live import) holding a Number or Boolean.
+/// Its address and kind.
+fn cap_binding(env: &crate::interpreter::Env, name: &str) -> Option<(usize, bool)> {
+    if cfg!(target_arch = "wasm32") || super::call::scope_offs().is_none() {
+        return None;
+    }
+    let b = env.try_borrow().ok()?;
+    if b.with_obj.is_some() || b.under_with {
+        return None;
+    }
+    let bd = b.vars.get(name)?;
+    if !bd.initialized || bd.import_ref.is_some() {
+        return None;
+    }
+    let num = match bd.value {
+        Value::Num(_) => true,
+        Value::Bool(_) => false,
+        _ => return None,
+    };
+    Some((bd as *const crate::interpreter::Binding as usize, num))
+}
+
+/// The argument slot `ArgsGet(_, tag)` at `pc` reads when its key is the constant pushed just
+/// before (an array index below `argc`, the call's argument count).
+fn virt_elem(chunk: &Chunk, pc: usize, tag: u16, argc: usize) -> Option<usize> {
+    let Op::Const(k) = *chunk.ops.get(pc.checked_sub(1)?)? else {
+        return None;
+    };
+    let Value::Num(x) = *chunk.consts.get(k as usize)? else {
+        return None;
+    };
+    if !(x >= 0.0 && x.fract() == 0.0 && x < argc as f64) {
+        return None;
+    }
+    let s = (tag & !crate::bytecode::VIRT_REST) as usize + x as usize;
+    (s < argc).then_some(s)
+}
+
+/// The static `.length` of `ArgsLen(_, tag)` in a body called with `argc` arguments.
+fn virt_len(tag: u16, argc: usize) -> f64 {
+    argc.saturating_sub((tag & !crate::bytecode::VIRT_REST) as usize) as f64
+}
+
 /// Abstract interpretation of the body over kinds (see [`Shape`]).
-fn shape(chunk: &Chunk, args: &[bool]) -> Option<Shape> {
+fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<Shape> {
     let ops = &chunk.ops;
     let n = ops.len();
     let ns = chunk.n_slots;
@@ -123,6 +200,20 @@ fn shape(chunk: &Chunk, args: &[bool]) -> Option<Shape> {
     let mut leaders: Vec<Option<Vec<bool>>> = vec![None; n];
     let mut reach = vec![false; n];
     let mut ret: Option<Option<bool>> = None;
+    let mut caps: Vec<Cap> = Vec::new();
+    let mut targets = vec![false; n + 1];
+    for op in ops {
+        if let Op::Jump(t)
+        | Op::JumpIfFalse(t)
+        | Op::JumpIfFalsePeek(t)
+        | Op::JumpIfTruePeek(t)
+        | Op::JumpIfNotCmp(_, t)
+        | Op::JumpIfNotCmpLL(_, _, _, t)
+        | Op::JumpIfNotCmpLK(_, _, _, t) = *op
+        {
+            targets[(t as usize).min(n)] = true;
+        }
+    }
     let mut defined = vec![false; ns];
     defined[..args.len()].fill(true);
     inc[0] = Some((defined, Vec::new()));
@@ -171,6 +262,25 @@ fn shape(chunk: &Chunk, args: &[bool]) -> Option<Shape> {
         } else {
             match op {
                 Op::Const(k) => st.push(const_kind(chunk, k)?),
+                Op::LoadName(n, _) => match caps.iter().find(|c| c.n == n) {
+                    Some(c) => st.push(c.num),
+                    None => {
+                        let (binding, num) = cap_binding(env, chunk.names.get(n as usize)?)?;
+                        caps.push(Cap { n, binding, num });
+                        st.push(num);
+                    }
+                },
+                Op::ArgsLen(..) => st.push(true),
+                Op::ArgsGet(_, tag) => {
+                    if !st.pop()? || targets[pc] {
+                        return None;
+                    }
+                    let s = virt_elem(chunk, pc, tag, args.len())?;
+                    if !d[s] {
+                        return None;
+                    }
+                    st.push(kind[s]?);
+                }
                 Op::Dup => st.push(*st.last()?),
                 Op::Pop => {
                     st.pop()?;
@@ -305,11 +415,15 @@ fn shape(chunk: &Chunk, args: &[bool]) -> Option<Shape> {
         }
     }
     // A leader's stack kinds are the merged ones (checked equal on every edge).
+    let gen = if caps.is_empty() { 0 } else { env.try_borrow().ok()?.vars.generation() };
     Some(Shape {
         locals: kind,
         leaders,
         reach,
         ret: ret?,
+        caps,
+        scope: std::rc::Rc::as_ptr(env) as usize,
+        gen,
     })
 }
 
@@ -427,6 +541,24 @@ impl Tr<'_, '_> {
                     Value::Bool(b) => st.push((self.i32c(b as i64), false)),
                     _ => return Err("inline constant".into()),
                 },
+                Op::ArgsLen(_, tag) => st.push((self.fb.f64const(virt_len(tag, site.argc)), true)),
+                Op::ArgsGet(_, tag) => {
+                    st.pop();
+                    let s = virt_elem(chunk, pc, tag, site.argc).expect("shaped element");
+                    let v = self.fb.use_var(vars[s].expect("shaped slot"));
+                    st.push((v, sh.locals[s] == Some(true)));
+                }
+                Op::LoadName(n, _) => {
+                    let c = sh.caps.iter().find(|c| c.n == n).expect("shaped capture");
+                    let so = super::call::scope_offs().expect("planned with scope offsets");
+                    let bd = self.ptrc(c.binding as i64);
+                    let v = if c.num {
+                        self.fb.load(MemKind::F64, bd, so.b_value + VALUE_PAYLOAD)
+                    } else {
+                        self.fb.load(MemKind::I32U8, bd, so.b_value + VALUE_BOOL)
+                    };
+                    st.push((v, c.num));
+                }
                 Op::Dup => st.push(*st.last().expect("shaped")),
                 Op::Pop => {
                     st.pop();

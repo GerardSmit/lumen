@@ -5536,6 +5536,34 @@ fn jit_chained_property_reads_and_ref_receiver_stores() {
 }
 
 #[test]
+fn jit_inlines_captures_virtual_arguments_and_calls_activations_directly() {
+    // Inlined callees reading captured variables (whose kinds and values change underneath,
+    // and whose closures differ per loop iteration), virtual `arguments` / rest reads, and
+    // direct calls into callees that build an activation all behave as ordinary calls.
+    assert_eq!(
+        run_bytecode(
+            "function mk(){ var k=1; return [function(x){ return x+k; }, function(v){ k=v; }]; }
+             var p=mk(), f=p[0], set=p[1], s=0, out=[];
+             for(var i=0;i<600;i++){ if(i===400) set(0.5); s=f(s); }
+             set('z'); out.push(s, f(1));
+             var t=[];
+             for(let j=0;j<600;j++){ const g=function(){ return j; }; t.push(g()*2); }
+             out.push(t[1], t[599]);
+             function a1(){ return arguments.length+arguments[0]; }
+             function r1(x){ var r=[].slice.call(arguments,1); return r.length; }
+             function r2(x,...r){ return x+r.length+r[0]; }
+             var u=0; for(var i=0;i<600;i++) u+=a1(i,i)+r2(i,1,2);
+             out.push(u, String(a1()), r2(1));
+             function act(x){ var y=x+1; return function(){ return y++; }; }
+             var w=0, keep=[]; for(var i=0;i<600;i++){ var c=act(i); w+=c()+c(); if(i%100===0) keep.push(c); }
+             out.push(w, keep[3](), keep.length);
+             out.join(':')"
+        ),
+        "500:1z:2:1198:362400:NaN:NaN:361200:303:6"
+    );
+}
+
+#[test]
 fn global_value_property_descriptors() {
     for name in ["undefined", "NaN", "Infinity"] {
         let src = format!(
