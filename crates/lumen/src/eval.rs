@@ -2416,9 +2416,48 @@ impl Interp {
                 index,
                 optional: false,
             } if !matches!(**obj, Expr::Super) => self.eval_index(obj, index, env),
+            Expr::This => self.eval_this(expr, env),
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                self.eval_member(obj, prop, env)
+            }
+            Expr::Call {
+                callee,
+                args,
+                optional,
+                pos,
+            } => self.eval_call(callee, args, *optional, *pos, env),
+            Expr::Assign { op, target, value } => self.eval_assign(op, target, value, env),
+            Expr::Update { op, prefix, arg } => self.eval_update(op, *prefix, arg, env),
+            Expr::Unary { op, arg } => self.eval_unary(op, arg, env),
             Expr::Paren(inner) => self.eval(inner, env),
             _ => self.eval_node(expr, env),
         }
+    }
+
+    #[inline(never)]
+    fn eval_this(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, "this", env) {
+            // SAFETY: the epoch was current at the lookup and nothing ran since.
+            let bd = unsafe { &*bd };
+            if bd.initialized && bd.import_ref.is_none() {
+                return Ok(bd.value.clone());
+            }
+        }
+        self.lexical_this(env)
+    }
+
+    /// `obj.prop` (not optional, not `super`, not private).
+    #[inline(never)]
+    fn eval_member(&mut self, obj: &Expr, prop: &str, env: &Env) -> Result<Value, Abrupt> {
+        let base = self.eval(obj, env)?;
+        if self.short_circuit {
+            return Ok(Value::Undefined); // an earlier `?.` link short-circuited
+        }
+        self.get_member(&base, prop)
     }
 
     #[inline(never)]
@@ -2499,16 +2538,7 @@ impl Interp {
                 }
                 self.get_var(name, env)
             }
-            Expr::This => {
-                if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, "this", env)
-                {
-                    let bd = unsafe { &*bd };
-                    if bd.initialized && bd.import_ref.is_none() {
-                        return Ok(bd.value.clone());
-                    }
-                }
-                self.lexical_this(env)
-            }
+            Expr::This => self.eval_this(expr, env),
             Expr::Regex { body, flags } => self.make_regexp(body, flags),
             Expr::Array(elems) => self.eval_array(elems, env),
             Expr::Object(props) => self.eval_object(props, env),
@@ -3319,6 +3349,7 @@ impl Interp {
 
     /// `pos` is the call's source position: published as `cur_site` once the arguments are
     /// evaluated, right before the callee runs (see `Interp::cur_site`).
+    #[inline(never)]
     fn eval_call(
         &mut self,
         callee: &Expr,
@@ -5407,6 +5438,7 @@ impl Interp {
         Value::Obj(obj)
     }
 
+    #[inline(never)]
     fn eval_unary(&mut self, op: &str, arg: &Expr, env: &Env) -> Result<Value, Abrupt> {
         if op == "typeof" {
             // typeof on an unresolved identifier yields "undefined" rather than throwing.
@@ -5806,6 +5838,7 @@ impl Interp {
         None
     }
 
+    #[inline(never)]
     fn eval_update(
         &mut self,
         op: &str,
@@ -5859,6 +5892,7 @@ impl Interp {
         Ok(Value::Num(if prefix { new } else { n }))
     }
 
+    #[inline(never)]
     fn eval_assign(
         &mut self,
         op: &str,

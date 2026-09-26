@@ -3,6 +3,7 @@ use super::{Abrupt, Env, Interp};
 use crate::value::Value;
 
 impl Interp {
+    #[inline(never)]
     pub(crate) fn lexical_this(&mut self, env: &Env) -> Result<Value, Abrupt> {
         // A TDZ read (derived constructor before super()) must surface as a
         // ReferenceError; only a genuinely absent binding reads undefined. Single walk:

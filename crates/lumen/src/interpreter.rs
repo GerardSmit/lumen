@@ -246,6 +246,9 @@ pub struct Scope {
     /// body scope holds both hoisted vars and body-level lexicals; a sloppy direct eval's
     /// var/lexical conflict check needs to tell them apart.
     pub lexical_names: ScopeNames,
+    /// Unique per scope allocation (see `value::register_scope`): lets the per-site name cache
+    /// tell a live environment from a later one reusing its address.
+    pub serial: u64,
 }
 
 /// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
@@ -314,6 +317,7 @@ pub fn new_scope(parent: Option<Env>) -> Env {
         var_boundary: false,
         catch_param: false,
         lexical_names: ScopeNames::default(),
+        serial: 0,
     }));
     register_scope(&e);
     e
@@ -339,6 +343,7 @@ pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> 
         var_boundary: true,
         catch_param: false,
         lexical_names: ScopeNames::default(),
+        serial: 0,
     }));
     register_scope(&e);
     e
@@ -356,6 +361,7 @@ pub fn new_catch_scope(parent: Env) -> Env {
         var_boundary: false,
         catch_param: true,
         lexical_names: ScopeNames::default(),
+        serial: 0,
     }));
     register_scope(&e);
     e
@@ -373,6 +379,7 @@ pub fn new_with_scope(parent: Env, obj: Value) -> Env {
         var_boundary: false,
         catch_param: false,
         lexical_names: ScopeNames::default(),
+        serial: 0,
     }));
     register_scope(&e);
     e
