@@ -7,6 +7,58 @@ class TextEncoder {
   encode(input = "") {
     return __encoding.encode(String(input));
   }
+  // Encoding §8.1.2: as much of `source` as fits, whole UTF-8 sequences only; `read` counts
+  // UTF-16 code units (a lone surrogate encodes as U+FFFD).
+  encodeInto(source, destination) {
+    if (!(destination instanceof Uint8Array)) {
+      throw new TypeError("TextEncoder.encodeInto: destination must be a Uint8Array");
+    }
+    const s = String(source);
+    const n = destination.length;
+    if (s.length <= n) {
+      const b = __encoding.encode(s);
+      if (b.length <= n) {
+        destination.set(b);
+        return { read: s.length, written: b.length };
+      }
+    }
+    let read = 0;
+    let written = 0;
+    while (read < s.length) {
+      let c = s.charCodeAt(read);
+      let units = 1;
+      if (c >= 0xd800 && c <= 0xdfff) {
+        const d = read + 1 < s.length ? s.charCodeAt(read + 1) : 0;
+        if (c <= 0xdbff && d >= 0xdc00 && d <= 0xdfff) {
+          c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
+          units = 2;
+        } else {
+          c = 0xfffd;
+        }
+      }
+      if (c < 0x80) {
+        if (written + 1 > n) break;
+        destination[written++] = c;
+      } else if (c < 0x800) {
+        if (written + 2 > n) break;
+        destination[written++] = 0xc0 | (c >> 6);
+        destination[written++] = 0x80 | (c & 0x3f);
+      } else if (c < 0x10000) {
+        if (written + 3 > n) break;
+        destination[written++] = 0xe0 | (c >> 12);
+        destination[written++] = 0x80 | ((c >> 6) & 0x3f);
+        destination[written++] = 0x80 | (c & 0x3f);
+      } else {
+        if (written + 4 > n) break;
+        destination[written++] = 0xf0 | (c >> 18);
+        destination[written++] = 0x80 | ((c >> 12) & 0x3f);
+        destination[written++] = 0x80 | ((c >> 6) & 0x3f);
+        destination[written++] = 0x80 | (c & 0x3f);
+      }
+      read += units;
+    }
+    return { read, written };
+  }
 }
 
 class TextDecoder {

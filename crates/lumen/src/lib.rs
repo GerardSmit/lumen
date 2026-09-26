@@ -147,6 +147,12 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 
 pub use parser::with_eager_bodies;
 
+/// A JS string's text as well-formed UTF-8 (lone surrogates become U+FFFD): what encoders
+/// such as `TextEncoder` write, as opposed to the engine's internal form.
+pub fn well_formed_utf8(s: &str) -> std::borrow::Cow<'_, str> {
+    jstr::well_formed(s)
+}
+
 /// Ahead-of-time compilation (see [`Engine::load_precompiled`] and the `lumen-aot` crate):
 /// [`precompile`] / [`precompiled::PrecompileBundle`] run at build time and produce a
 /// source-free blob; [`Precompiled`] wraps one linked into the binary.

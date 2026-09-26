@@ -206,6 +206,28 @@ pub fn has_lone_surrogate(s: &str) -> bool {
     false
 }
 
+/// `s` as well-formed UTF-8, what a JS string encodes to on the wire (`TextEncoder`): each lone
+/// surrogate becomes U+FFFD and a smuggled high+low pair its real character.
+pub fn well_formed(s: &str) -> std::borrow::Cow<'_, str> {
+    // Every smuggled scalar encodes with a leading F4 byte; most text has none.
+    if !s.as_bytes().contains(&0xF4) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(real) = chars.peek().and_then(|&n| paired_char(c, n)) {
+            out.push(real);
+            chars.next();
+        } else if smuggled(c).is_some() {
+            out.push('\u{FFFD}');
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// If `a` and `b` are a smuggled high+low pair, the real character they encode.
 pub fn paired_char(a: char, b: char) -> Option<char> {
     let hi = smuggled_high(a)?;

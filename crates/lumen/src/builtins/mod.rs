@@ -8085,10 +8085,9 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
             }
         }
     }
+    // No bound of its own: a string holds at most `MAX_STR_LEN` units, so the result has at
+    // most that many pieces plus one, below `MAX_ARRAY_OP_LEN`.
     let s = this_string(i, &this)?;
-    if s.len() > MAX_ARRAY_OP_LEN {
-        return Err(i.make_error("RangeError", "string too large to split in this engine"));
-    }
     // `limit` (ToUint32) caps the number of pieces; 0 → empty result — but ToString of the
     // separator is observable BEFORE the zero-limit shortcut.
     let limit = match arg(args, 1) {
