@@ -344,6 +344,12 @@ fn build_region(
     let tdzd = Defd::new(chunk, header, backedge, &an, &tdz_ssa, Some(func_mode));
     let mut plan = plan(interp, env, chunk, header, backedge, slots, &an, &kinds, &defd, &tdzd);
     call::plan_direct(&mut plan, interp, env, chunk, header, backedge, slots, this_val, &an, &kinds, func_mode);
+    // A `get` / `set` / ... site that became a direct JS call is a user method: keep that.
+    {
+        let (direct, dmethod) = (&plan.direct, &plan.dmethod);
+        plan.colm
+            .retain(|g, &mut (c, _)| !direct.contains_key(&c) && !dmethod.contains_key(g));
+    }
     let mut an = an;
     let resumes_out = an.resumes.clone();
     let tail_loops = plan.tail_loops.len() as u32;
@@ -362,6 +368,7 @@ fn build_region(
         .chain(plan.dmethod.keys().copied())
         .chain(plan.strm.keys().copied())
         .chain(plan.strn.keys().copied())
+        .chain(plan.colm.keys().copied())
         .chain(plan.arrm.keys().copied())
         .collect();
     let self_cell: Box<std::cell::Cell<usize>> = Box::new(std::cell::Cell::new(0));
@@ -1000,6 +1007,9 @@ struct Plan {
     /// CallWithThis(n)`, see `Tr::strn_begin`): `GetMethod` pc -> (call pc, address of the
     /// site's `Cell<helpers::StrSite>` in `boxes`).
     strn: HashMap<usize, (usize, usize)>,
+    /// Fused Map/Set method sites (`<object>.<get|has|set|add>(<pure args>)`, see
+    /// `Tr::colm_begin`): `GetMethod` pc -> (call pc, address of the site's `CollSite` cell).
+    colm: HashMap<usize, (usize, usize)>,
     /// Inline `Array.prototype.push` sites (`<array> GetMethod(push) <value>
     /// CallWithThis(1)`): `GetMethod` pc -> call pc.
     arrm: HashMap<usize, usize>,
@@ -1429,6 +1439,71 @@ fn plan(
             let addr = &*cell as *const std::cell::Cell<helpers::StrSite> as usize;
             p.boxes.push(cell);
             p.strn.insert(pc, (call, addr));
+        }
+    }
+
+    // `<object>.<get|has|set|add>(<args>)` (Map / Set methods), its arguments pure loads: the
+    // receiver checked an object at the `GetMethod`, the method read and (for the intrinsic
+    // collection methods) run inline by one helper at the call (see `Tr::colm_begin`,
+    // `helpers::coll_method`).
+    for pc in header..=backedge {
+        if !reach(pc)
+            || p.strm.contains_key(&pc)
+            || p.strn.contains_key(&pc)
+            || helpers::math_site_failed(chunk, pc)
+            || p.math.contains_key(&pc.wrapping_sub(1))
+        {
+            continue;
+        }
+        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        if !chunk
+            .names
+            .get(m as usize)
+            .is_some_and(|n| crate::builtins::collections::lookup::coll_fast_name(n))
+        {
+            continue;
+        }
+        // Each argument entry: whether it is known a Number (Number arithmetic runs no JS).
+        let mut st: Vec<bool> = Vec::new();
+        let mut q = pc + 1;
+        let call = loop {
+            if q > backedge || lead(q) || st.len() > 2 {
+                break None;
+            }
+            match ops[q] {
+                Op::CallWithThis(n) => break (n as usize == st.len() && n > 0).then_some(q),
+                Op::LoadLocal(s)
+                    if !tdzd.maybe_undef(s as usize, q) && !defd.maybe_undef(s as usize, q) =>
+                {
+                    st.push(num_slot(s))
+                }
+                Op::Const(k) => st.push(matches!(chunk.consts[k as usize], Value::Num(_))),
+                Op::Undef => st.push(false),
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+                    if st.len() >= 2 && st[st.len() - 1] && st[st.len() - 2] =>
+                {
+                    st.pop();
+                }
+                Op::Neg | Op::Plus | Op::BitNot if st.last() == Some(&true) => {}
+                _ => break None,
+            }
+            q += 1;
+        };
+        if let Some(call) = call {
+            let cell: Box<std::cell::Cell<helpers::CollSite>> = Box::default();
+            let addr = &*cell as *const std::cell::Cell<helpers::CollSite> as usize;
+            p.boxes.push(cell);
+            p.colm.insert(pc, (call, addr));
         }
     }
 
@@ -1924,6 +1999,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let pure = math_part
             || self.plan.strm.contains_key(&pc)
             || self.plan.strn.contains_key(&pc)
+            || self.plan.colm.contains_key(&pc)
             || self.plan.arrm.contains_key(&pc)
             || matches!(
                 op,
@@ -3200,7 +3276,13 @@ impl<'a, 'f> Tr<'a, 'f> {
             return self.strn_begin(pc);
         }
         if let Some((&g, &(_, cell))) = self.plan.strn.iter().find(|(_, v)| v.0 == pc) {
-            return self.strn_call(pc, g, cell);
+            return self.strn_call(pc, g, cell, Helper::StrMethod);
+        }
+        if self.plan.colm.contains_key(&pc) {
+            return self.colm_begin(pc);
+        }
+        if let Some((&g, &(_, cell))) = self.plan.colm.iter().find(|(_, v)| v.0 == pc) {
+            return self.strn_call(pc, g, cell, Helper::CollMethod);
         }
         if self.plan.arrm.contains_key(&pc) {
             return self.arr_begin(pc);
@@ -5317,6 +5399,18 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// the next compile leaves it to the generic path). Pushes the `undefined` placeholder
     /// callee, which the call's helper replaces by reading the method itself.
     fn strn_begin(&mut self, pc: usize) -> Result<(), String> {
+        self.tagged_begin(pc, TAG_STR)
+    }
+
+    /// The `GetMethod` of a fused Map/Set method site (see [`Tr::strn_begin`]): the receiver
+    /// must be an object.
+    fn colm_begin(&mut self, pc: usize) -> Result<(), String> {
+        self.tagged_begin(pc, TAG_OBJ)
+    }
+
+    /// A fused method site's `GetMethod`: a receiver without tag `want` exits before the site
+    /// (remembered as failed); then the `undefined` placeholder callee is pushed.
+    fn tagged_begin(&mut self, pc: usize, want: u8) -> Result<(), String> {
         let d = self.stack.len();
         let st = self.stack.clone();
         let pcv = self.i32c(pc as i64);
@@ -5327,7 +5421,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         } else {
             let recv = self.sptr(d - 1);
             let tag = self.fb.load(MemKind::I32U8, recv, 0);
-            let str_tag = self.i32c(TAG_STR as i64);
+            let str_tag = self.i32c(want as i64);
             let is_str = self.fb.icmp(IntCC::Eq, tag, str_tag);
             let bad = self.fb.create_block();
             let cont = self.fb.create_block();
@@ -5348,7 +5442,7 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// The `CallWithThis(argc)` of a fused `String.prototype` method site: the arguments
     /// boxed, then [`Helper::StrMethod`] reads the method and calls it.
-    fn strn_call(&mut self, pc: usize, get: usize, cell: usize) -> Result<(), String> {
+    fn strn_call(&mut self, pc: usize, get: usize, cell: usize, h: Helper) -> Result<(), String> {
         let d = self.stack.len();
         let Op::CallWithThis(argc) = self.ops[pc] else {
             return Err(format!("no call for the String method site at {pc}"));
@@ -5362,7 +5456,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         );
         let cv = self.ptrc(cell as i64);
         self.set_call_site(pc);
-        let st = self.call_js(Helper::StrMethod, &[self.frame, gv, bv, av, cv]);
+        let st = self.call_js(h, &[self.frame, gv, bv, av, cv]);
         let below = self.stack[..base].to_vec();
         self.throw_if(st, pc, &below, base);
         self.stack.truncate(base);

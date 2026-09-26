@@ -5572,6 +5572,28 @@ fn jit_inlines_captures_virtual_arguments_and_calls_activations_directly() {
 }
 
 #[test]
+fn jit_fused_map_set_method_sites() {
+    // `recv.get/has/set/add(args)` sites run the intrinsic Map/Set methods inline, and still
+    // call user methods, subclass overrides, own properties and patched prototypes.
+    assert_eq!(
+        run_bytecode(
+            "class Cache { constructor(){ this.d={}; } get(k){ return this.d[k] === undefined ? -1 : this.d[k]; } set(k,v){ this.d[k]=v; return this; } has(k){ return k in this.d; } }
+             class MyMap extends Map { get(k){ return (super.get(k) || 0) + 1000; } }
+             function run(o,n){ var s=0; for(var i=0;i<n;i++){ o.set(i&7,i); s+=o.get(i&7); if(o.has(i&3)) s++; } return s; }
+             var out=[run(new Map(),600), run(new Cache(),600), run(new MyMap(),600)];
+             var m=new Map(); out.push(run(m,600)); m.get=function(){ return 5; }; out.push(run(m,600));
+             var st=new Set(); var c=0; for(var i=0;i<600;i++){ st.add(i&15); if(st.has(i&31)) c++; } out.push(c, st.size);
+             var saved=Map.prototype.get, mm=new Map([[1,2]]), t=0;
+             for(var i=0;i<600;i++){ if(i===300) Map.prototype.get=function(){ return 100; }; t+=mm.get(1); }
+             Map.prototype.get=saved; out.push(t);
+             try { var o={get:saved}; for(var i=0;i<600;i++) o.get(1); } catch(e){ out.push(e.name); }
+             out.join(':')"
+        ),
+        "180300:180300:780300:180300:3600:304:16:30600:TypeError"
+    );
+}
+
+#[test]
 fn global_value_property_descriptors() {
     for name in ["undefined", "NaN", "Infinity"] {
         let src = format!(
