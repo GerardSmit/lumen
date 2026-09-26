@@ -6,6 +6,7 @@ pub(crate) mod fastpaths;
 pub(crate) mod promise_fast;
 
 use crate::ast::*;
+use crate::interpreter::name_cache::NameRes;
 use crate::interpreter::*;
 use crate::value::*;
 use std::rc::Rc;
@@ -532,6 +533,12 @@ impl Interp {
                             // the initializer deletes the property).
                             if let Some(e) = init {
                                 if let Pattern::Ident(n) = pat {
+                                    if let Some((scope, bd)) =
+                                        self.cached_binding(pat as *const Pattern as usize, n, env)
+                                    {
+                                        self.assign_cached(n, scope, bd, e, env)?;
+                                        continue;
+                                    }
                                     if matches!(e, Expr::Class(c) if c.name.is_none()) {
                                         self.pending_fn_name = Some(n.clone());
                                     }
@@ -1919,6 +1926,12 @@ impl Interp {
                 None => break,
             }
         }
+        Ok((self.get_unscoped(name)?, None))
+    }
+
+    /// Read a name no scope on the chain declares (and no `with` object has): a property of the
+    /// global object, or a ReferenceError.
+    pub(crate) fn get_unscoped(&mut self, name: &str) -> Result<Value, Abrupt> {
         // Fast path: an own data property of an ordinary global (the overwhelmingly common
         // resolution for builtins and script-level bindings) — one hash lookup, no trap walk.
         if self.ordinary_get_ptr(Gc::as_ptr(&self.global) as usize) {
@@ -1928,7 +1941,7 @@ impl Interp {
                     if !p.accessor() {
                         let v = p.value();
                         drop(b);
-                        return Ok((v, None));
+                        return Ok(v);
                     }
                 }
             }
@@ -1937,7 +1950,7 @@ impl Interp {
         // full trap-aware [[HasProperty]]: the global's prototype may be (or contain) a proxy.
         let g = Value::Obj(self.global.clone());
         if self.js_has_property(&g, name)? {
-            return Ok((self.get_member(&g, name)?, None));
+            return self.get_member(&g, name);
         }
         Err(self.throw("ReferenceError", format!("{name} is not defined")))
     }
@@ -2376,7 +2389,95 @@ impl Interp {
 
     // ----- expressions ------------------------------------------------------------------------
 
+    /// Evaluate an expression. The operand-level node kinds that dominate arithmetic loops
+    /// (literals, identifiers, number arithmetic, element reads) are handled here, in a function
+    /// small enough that each recursive step pays a short prologue; everything else goes to
+    /// [`Interp::eval_node`].
     pub(crate) fn eval(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        match expr {
+            Expr::Num(n) => Ok(Value::Num(*n)),
+            Expr::Ident(name) => {
+                match self.resolve_name(expr as *const Expr as usize, name, env) {
+                    NameRes::Binding(_, bd) => {
+                        // SAFETY: the epoch was current at the lookup and nothing ran since.
+                        let bd = unsafe { &*bd };
+                        if bd.initialized && bd.import_ref.is_none() {
+                            return Ok(bd.value.clone());
+                        }
+                    }
+                    NameRes::Unscoped => return self.get_unscoped(name),
+                    NameRes::Unknown => {}
+                }
+                self.get_var_slow(name, env)
+            }
+            Expr::Binary { op, left, right } => self.eval_binary(op, left, right, env),
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) => self.eval_index(obj, index, env),
+            Expr::Paren(inner) => self.eval(inner, env),
+            _ => self.eval_node(expr, env),
+        }
+    }
+
+    #[inline(never)]
+    fn eval_binary(
+        &mut self,
+        op: &str,
+        left: &Expr,
+        right: &Expr,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let l = self.eval(left, env)?;
+        let r = self.eval(right, env)?;
+        if let (Value::Num(a), Value::Num(b)) = (&l, &r) {
+            let (a, b) = (*a, *b);
+            // Numbers own nothing: skip the out-of-line drop glue.
+            std::mem::forget(l);
+            std::mem::forget(r);
+            if let Some(v) = num_binary(op, a, b) {
+                return Ok(v);
+            }
+            return self.binary_generic(op, Value::Num(a), Value::Num(b));
+        }
+        self.binary_generic(op, l, r)
+    }
+
+    /// `obj[index]` (not optional, not `super`).
+    #[inline(never)]
+    fn eval_index(&mut self, obj: &Expr, index: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        let base = self.eval(obj, env)?;
+        if self.short_circuit {
+            return Ok(Value::Undefined);
+        }
+        let idx = self.eval(index, env)?;
+        if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
+            if let Some(v) = self.fast_get_elem(o, *n) {
+                return Ok(v);
+            }
+        }
+        self.get_index_slow(base, idx)
+    }
+
+    #[inline(never)]
+    fn get_var_slow(&mut self, name: &str, env: &Env) -> Result<Value, Abrupt> {
+        self.get_var(name, env)
+    }
+
+    /// `base[idx]` after both operands are evaluated, past the element fast path.
+    #[inline(never)]
+    fn get_index_slow(&mut self, base: Value, idx: Value) -> Result<Value, Abrupt> {
+        // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
+        if matches!(base, Value::Undefined | Value::Null) {
+            return Err(self.throw("TypeError", self.null_read_message(&base, Some(&idx))));
+        }
+        let key = self.to_property_key(&idx)?;
+        self.get_member(&base, &key)
+    }
+
+    #[inline(never)]
+    fn eval_node(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
             Expr::BigInt(n) => Ok(Value::BigInt(n.clone())),
@@ -2388,8 +2489,26 @@ impl Interp {
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
-            Expr::Ident(name) => self.get_var(name, env),
-            Expr::This => self.lexical_this(env),
+            Expr::Ident(name) => {
+                if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, name, env) {
+                    // SAFETY: the epoch was current at the lookup and nothing ran since.
+                    let bd = unsafe { &*bd };
+                    if bd.initialized && bd.import_ref.is_none() {
+                        return Ok(bd.value.clone());
+                    }
+                }
+                self.get_var(name, env)
+            }
+            Expr::This => {
+                if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, "this", env)
+                {
+                    let bd = unsafe { &*bd };
+                    if bd.initialized && bd.import_ref.is_none() {
+                        return Ok(bd.value.clone());
+                    }
+                }
+                self.lexical_this(env)
+            }
             Expr::Regex { body, flags } => self.make_regexp(body, flags),
             Expr::Array(elems) => self.eval_array(elems, env),
             Expr::Object(props) => self.eval_object(props, env),
@@ -5697,6 +5816,17 @@ impl Interp {
         // Numeric update of an ordinary binding: read and write it in place (one scope walk, no
         // Reference allocation) — the ubiquitous `i++` of every loop.
         if let Expr::Ident(name) = arg {
+            if let Some((_, bd)) = self.cached_binding(arg as *const Expr as usize, name, env) {
+                // SAFETY: nothing ran since the lookup; the binding is updated in place.
+                let bd = unsafe { &mut *bd };
+                if bd.initialized && bd.mutable && bd.import_ref.is_none() {
+                    if let Value::Num(n) = bd.value {
+                        let new = if op == "++" { n + 1.0 } else { n - 1.0 };
+                        bd.value = Value::Num(new);
+                        return Ok(Value::Num(if prefix { new } else { n }));
+                    }
+                }
+            }
             if let Some(scope) = self.plain_binding_scope(name, env) {
                 let old = scope
                     .borrow()
@@ -5741,6 +5871,30 @@ impl Interp {
         // deleted the binding (direct eval tricks), PutValue falls back to the Reference path.
         if op != "=" && !matches!(op, "&&=" | "||=" | "??=") {
             if let Expr::Ident(name) = target {
+                if let Some((scope, bd)) =
+                    self.cached_binding(target as *const Expr as usize, name, env)
+                {
+                    let b = unsafe { &*bd };
+                    if b.initialized && b.mutable && b.import_ref.is_none() {
+                        let old = b.value.clone();
+                        let epoch = crate::value::scope_epoch();
+                        let rhs = self.eval(value, env)?;
+                        let result = self.binary(&op[..op.len() - 1], old, rhs)?;
+                        // Unchanged epoch: the binding has not moved (in-place flag changes
+                        // are re-checked).
+                        if crate::value::scope_epoch() == epoch {
+                            let b = unsafe { &mut *bd };
+                            if b.mutable && b.initialized && b.import_ref.is_none() {
+                                b.value = result.clone();
+                                return Ok(result);
+                            }
+                        }
+                        let scope = crate::interpreter::name_cache::scope_handle(scope);
+                        let mut lref = Reference::Var(RefBase::Scope(scope), name.clone());
+                        self.put_reference(&mut lref, result.clone())?;
+                        return Ok(result);
+                    }
+                }
                 if let Some(scope) = self.plain_binding_scope(name, env) {
                     let old = scope
                         .borrow()
@@ -5768,6 +5922,13 @@ impl Interp {
                 let v = self.eval(value, env)?;
                 self.assign_to_target(target, v.clone(), env)?;
                 return Ok(v);
+            }
+            if let Expr::Ident(n) = target {
+                if let Some((scope, bd)) =
+                    self.cached_binding(target as *const Expr as usize, n, env)
+                {
+                    return self.assign_cached(n, scope, bd, value, env);
+                }
             }
             // A simple target evaluates its Reference (base + computed key expression) BEFORE the
             // RHS; ToPropertyKey and the base's RequireObjectCoercible are deferred to PutValue.
@@ -5820,6 +5981,41 @@ impl Interp {
         let result = self.binary(bin_op, cur, rhs)?;
         self.put_reference(&mut lref, result.clone())?;
         Ok(result)
+    }
+
+    /// `name = value` where `name` resolved (through the site cache) to `bd` in `scope`: the
+    /// Reference is that scope binding, fixed before the RHS runs. The write goes straight to the
+    /// binding when the epoch shows it has not moved; anything else (TDZ, const, import, a
+    /// structural change during the RHS) takes PutValue on the scope reference.
+    fn assign_cached(
+        &mut self,
+        name: &str,
+        scope: *const crate::interpreter::name_cache::ScopeCell,
+        bd: *mut Binding,
+        value: &Expr,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let epoch = crate::value::scope_epoch();
+        if matches!(value, Expr::Class(c) if c.name.is_none()) {
+            self.pending_fn_name = Some(name.to_string());
+        }
+        let v = self.eval(value, env)?;
+        self.pending_fn_name = None;
+        if is_anonymous_fn(value) {
+            self.set_fn_name(&v, name);
+        }
+        if crate::value::scope_epoch() == epoch {
+            // SAFETY: an unchanged epoch keeps the binding at this address.
+            let b = unsafe { &mut *bd };
+            if b.mutable && b.initialized && b.import_ref.is_none() {
+                b.value = v.clone();
+                return Ok(v);
+            }
+        }
+        let scope = crate::interpreter::name_cache::scope_handle(scope);
+        let mut lref = Reference::Var(RefBase::Scope(scope), name.to_string());
+        self.put_reference(&mut lref, v.clone())?;
+        Ok(v)
     }
 
     fn assign_to_target(&mut self, target: &Expr, value: Value, env: &Env) -> Result<(), Abrupt> {
@@ -6067,7 +6263,18 @@ impl Interp {
 
     // ----- operators --------------------------------------------------------------------------
 
+    #[inline]
     pub(crate) fn binary(&mut self, op: &str, l: Value, r: Value) -> Result<Value, Abrupt> {
+        if let (Value::Num(a), Value::Num(b)) = (&l, &r) {
+            if let Some(v) = num_binary(op, *a, *b) {
+                return Ok(v);
+            }
+        }
+        self.binary_generic(op, l, r)
+    }
+
+    #[inline(never)]
+    fn binary_generic(&mut self, op: &str, l: Value, r: Value) -> Result<Value, Abrupt> {
         // Hot path: number ⊕ number has no observable coercion steps (no ToPrimitive hooks, no
         // BigInt mixing) — compute directly. Rust f64 comparisons share JS NaN semantics (all
         // false), and +0 == -0 holds, so the comparison arms are exact.
@@ -7375,6 +7582,7 @@ fn block_declares_lexical(s: &Stmt) -> bool {
     )
 }
 
+#[inline(never)]
 pub(crate) fn js_mod(a: f64, b: f64) -> f64 {
     if b == 0.0 || a.is_nan() || b.is_nan() || a.is_infinite() {
         return f64::NAN;
@@ -7385,10 +7593,60 @@ pub(crate) fn js_mod(a: f64, b: f64) -> f64 {
     if a == 0.0 {
         return a;
     }
+    // Integral operands in the int32 range: integer remainder (the sign follows the dividend,
+    // so a zero result from a negative dividend is -0).
+    let (ai, bi) = (a as i32, b as i32);
+    if ai as f64 == a && bi as f64 == b && bi != 0 {
+        let r = (ai as i64) % (bi as i64);
+        return if r == 0 && a < 0.0 { -0.0 } else { r as f64 };
+    }
     a % b
 }
 
+/// Number ⊕ Number for the operators with no coercion steps, dispatched on the operator's bytes
+/// (a length switch, then at most two byte compares) rather than a chain of string compares.
+#[inline(always)]
+pub(crate) fn num_binary(op: &str, a: f64, b: f64) -> Option<Value> {
+    Some(match op.as_bytes() {
+        [b'+'] => Value::Num(a + b),
+        [b'-'] => Value::Num(a - b),
+        [b'*'] => Value::Num(a * b),
+        [b'/'] => Value::Num(a / b),
+        [b'%'] => Value::Num(js_mod(a, b)),
+        [b'&'] => Value::Num((to_int32(a) & to_int32(b)) as f64),
+        [b'|'] => Value::Num((to_int32(a) | to_int32(b)) as f64),
+        [b'^'] => Value::Num((to_int32(a) ^ to_int32(b)) as f64),
+        [b'<'] => Value::Bool(a < b),
+        [b'>'] => Value::Bool(a > b),
+        [b'<', b'<'] => Value::Num(to_int32(a).wrapping_shl(to_int32(b) as u32 & 31) as f64),
+        [b'>', b'>'] => Value::Num((to_int32(a) >> (to_int32(b) as u32 & 31)) as f64),
+        [b'<', b'='] => Value::Bool(a <= b),
+        [b'>', b'='] => Value::Bool(a >= b),
+        [b'=', b'='] | [b'=', b'=', b'='] => Value::Bool(a == b),
+        [b'!', b'='] | [b'!', b'=', b'='] => Value::Bool(a != b),
+        [b'>', b'>', b'>'] => {
+            Value::Num(((to_int32(a) as u32) >> (to_int32(b) as u32 & 31)) as f64)
+        }
+        _ => return None,
+    })
+}
+
+#[inline]
 pub(crate) fn to_int32(n: f64) -> i32 {
+    // Truncation toward zero is exact below 2^31 in magnitude (NaN fails the compare); up to
+    // 2^63 the low 32 bits of the truncated i64 are the modular reduction.
+    let m = n.abs();
+    if m < 2147483648.0 {
+        return n as i32;
+    }
+    if m < 9223372036854775808.0 {
+        return n as i64 as i32;
+    }
+    to_int32_slow(n)
+}
+
+#[inline(never)]
+fn to_int32_slow(n: f64) -> i32 {
     if !n.is_finite() || n == 0.0 {
         return 0;
     }
@@ -7563,6 +7821,14 @@ impl Interp {
     fn resolve_reference(&mut self, target: &Expr, env: &Env) -> Result<Reference, Abrupt> {
         match target {
             Expr::Ident(name) => {
+                match self.resolve_name(target as *const Expr as usize, name, env) {
+                    NameRes::Binding(scope, _) => {
+                        let scope = crate::interpreter::name_cache::scope_handle(scope);
+                        return Ok(Reference::Var(RefBase::Scope(scope), name.clone()));
+                    }
+                    NameRes::Unscoped => return self.unscoped_reference(name),
+                    NameRes::Unknown => {}
+                }
                 let mut cur = Some(env.clone());
                 while let Some(s) = cur {
                     let (has_binding, with_obj, parent) = {
@@ -7583,10 +7849,7 @@ impl Interp {
                     }
                     cur = parent;
                 }
-                if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
-                    return Ok(Reference::Var(RefBase::Global, name.clone()));
-                }
-                Ok(Reference::Var(RefBase::Unresolvable, name.clone()))
+                self.unscoped_reference(name)
             }
             Expr::Member { obj, prop, .. } => {
                 if matches!(**obj, Expr::Super) {
@@ -7631,6 +7894,14 @@ impl Interp {
             // Other targets never reach compound/logical assignment (a SyntaxError at parse).
             _ => Err(self.throw("ReferenceError", "invalid assignment target")),
         }
+    }
+
+    /// The Reference for a name no scope declares: a global object property, or unresolvable.
+    fn unscoped_reference(&mut self, name: &str) -> Result<Reference, Abrupt> {
+        if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
+            return Ok(Reference::Var(RefBase::Global, name.to_string()));
+        }
+        Ok(Reference::Var(RefBase::Unresolvable, name.to_string()))
     }
 
     /// Coerce a reference key via `ToPropertyKey`, caching the result so it runs at most once.

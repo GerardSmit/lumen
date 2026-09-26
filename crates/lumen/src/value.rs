@@ -1381,6 +1381,10 @@ pub(crate) struct GcState {
     /// The object-shape transition tree for this heap (see [`props::ShapeTable`]): objects flow
     /// between the driver and its coroutine workers, so their shapes must resolve on either.
     pub(in crate::value) shapes: RefCell<props::ShapeTable>,
+    /// Bumped by every scope creation and every structural binding-map mutation (see
+    /// [`scope_epoch`]). Lives here, not in its own thread-local, because coroutine workers
+    /// create scopes on their driver's behalf.
+    scope_epoch: Cell<u64>,
 }
 
 // See the type-level comment: exclusivity comes from the coroutine handoff, not from these cells.
@@ -1395,6 +1399,7 @@ impl GcState {
             scopes: RefCell::new(Vec::new()),
             lazy_fns: RefCell::new(Vec::new()),
             shapes: RefCell::new(props::ShapeTable::new()),
+            scope_epoch: Cell::new(0),
         })
     }
 }
@@ -1528,7 +1533,24 @@ pub(crate) fn gc_heap_chunks() -> usize {
 }
 
 pub(crate) fn register_scope(e: &crate::interpreter::Env) {
-    with_gc_state(|state| state.scopes.borrow_mut().push(Rc::downgrade(e)));
+    with_gc_state(|state| {
+        state.scopes.borrow_mut().push(Rc::downgrade(e));
+        state.scope_epoch.set(state.scope_epoch.get() + 1);
+    });
+}
+
+/// The scope-structure epoch: unchanged between two reads only if no scope was created and no
+/// binding map was structurally mutated (insert/remove/clear/replace) in between. While it holds,
+/// a scope chain resolves every name to the same binding at the same address, which is what the
+/// tree-walker's per-site name caches validate against.
+#[inline]
+pub(crate) fn scope_epoch() -> u64 {
+    with_gc_state(|state| state.scope_epoch.get())
+}
+
+#[inline]
+pub(crate) fn bump_scope_epoch() {
+    with_gc_state(|state| state.scope_epoch.set(state.scope_epoch.get() + 1));
 }
 
 /// Registered scope entries (live + not-yet-purged dead weaks).
