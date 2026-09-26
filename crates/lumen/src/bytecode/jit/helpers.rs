@@ -2741,18 +2741,10 @@ pub(crate) unsafe extern "C" fn ta_view(f: *mut JitFrame, v: *const Value, write
     code
 }
 
-unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
+/// The [`ta_code`] of an element kind (0 for the kinds native code does not access).
+pub(crate) fn ta_code_of(kind: crate::value::TaKind) -> u32 {
     use crate::value::TaKind;
-    let Value::Obj(o) = &*v else { return 0 };
-    let i = &mut *(*f).interp;
-    let Some(info) = i
-        .typed_arrays
-        .get(&(crate::value::Gc::as_ptr(o) as usize))
-        .copied()
-    else {
-        return 0;
-    };
-    let code = match info.kind {
+    match kind {
         TaKind::I8 => ta_code::I8,
         TaKind::U8 => ta_code::U8,
         TaKind::U8Clamped => ta_code::U8C,
@@ -2762,8 +2754,24 @@ unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
         TaKind::U32 => ta_code::U32,
         TaKind::F32 => ta_code::F32,
         TaKind::F64 => ta_code::F64,
-        _ => return 0,
+        _ => 0,
+    }
+}
+
+unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
+    let Value::Obj(o) = &*v else { return 0 };
+    let i = &mut *(*f).interp;
+    let Some(info) = i
+        .typed_arrays
+        .get(&(crate::value::Gc::as_ptr(o) as usize))
+        .copied()
+    else {
+        return 0;
     };
+    let code = ta_code_of(info.kind);
+    if code == 0 {
+        return 0;
+    }
     if !i.shared_buffers.is_empty() && i.shared_buffers.contains_key(&info.buffer) {
         return 0;
     }

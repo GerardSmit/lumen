@@ -360,12 +360,12 @@ pub(crate) fn jit_byte_length(i: &Interp, obj: &Gc) -> Option<usize> {
         own = false;
     };
     let p = Gc::as_ptr(obj) as usize;
-    if fp == super::typedarray::ab_bytelength_get as usize {
+    if fp == super::typedarray::ab_bytelength_get as crate::value::NativeFn as usize {
         if i.shared_buffers.contains_key(&p) || !obj.try_borrow().ok()?.props.contains("__abMaxByteLength") {
             return None;
         }
         Some(i.array_buffers.get(&p).map_or(0, |b| b.len()))
-    } else if fp == dv_bytelength_get as usize {
+    } else if fp == dv_bytelength_get as crate::value::NativeFn as usize {
         let &(buf, off, len, track) = i.data_views.get(&p)?;
         dv_view_len(i, buf, off, len, track)
     } else {
