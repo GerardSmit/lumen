@@ -236,6 +236,11 @@ fn object(fb: &mut FunctionBuilder, l: &Layout, v: IrValue, miss: Block, write: 
     gc
 }
 
+/// The offset of `Object::ic_plain` from an object's `Gc` handle word (`None`: layout unknown).
+pub(crate) fn ic_plain_offset() -> Option<i32> {
+    layout().map(|l| l.ic_plain)
+}
+
 /// Guard the object's `exotic` byte is `kind` and its `ic_plain` byte is set.
 fn exotic_is(fb: &mut FunctionBuilder, l: &Layout, gc: IrValue, kinds: &[Exotic], miss: Block) {
     let ex = fb.load(MemKind::I32U8, gc, l.exotic);
@@ -767,6 +772,17 @@ pub(crate) fn array_len_i64(
 /// values are objects, which [`prop_get`] could not return anyway.
 pub(crate) struct PropIc {
     ways: Vec<(u32, u32)>,
+    /// Cached absences (`IC_ABSENT`): the shapes of every level of a prototype chain (receiver
+    /// first, ending in `null`) on which the name is missing — the read is `undefined`. Only
+    /// reads use these.
+    absent: Vec<(Vec<u32>, bool)>,
+}
+
+impl PropIc {
+    /// Whether some way resolves to an own data property (what writers and lenders use).
+    pub(crate) fn has_own(&self) -> bool {
+        !self.ways.is_empty()
+    }
 }
 
 /// Read the property IC `cache` of the chunk at compile time. `None` when the IC is not in a
@@ -777,14 +793,22 @@ pub(crate) struct PropIc {
 /// consecutive cells: a neighbouring site's cell would name a different property.
 pub(crate) fn prop_ic(chunk: &Chunk, cache: u32) -> Option<PropIc> {
     let mut ways: Vec<(u32, u32)> = Vec::new();
+    let mut absent: Vec<(Vec<u32>, bool)> = Vec::new();
     for k in 0..PROP_IC_WAYS {
         let st = chunk.caches.get(cache as usize + k)?.get();
         // Exactly 0: no `IC_ARR_KEYCHK` (array holder), and not EMPTY / ABSENT / CREATE.
         if st.depth == 0 && !ways.iter().any(|&(s, _)| s == st.recv_shape) {
             ways.push((st.recv_shape, st.slot));
+        } else if st.depth == crate::bytecode::IC_ABSENT && (1..=4).contains(&st.slot) {
+            let levels = [st.recv_shape, st.mid_shape, st.mid2_shape, st.holder_shape];
+            let exotic = st.mid_ok & crate::bytecode::IC_ABSENT_EXOTIC != 0;
+            let chain = (levels[..st.slot as usize].to_vec(), exotic);
+            if !absent.contains(&chain) {
+                absent.push(chain);
+            }
         }
     }
-    (!ways.is_empty()).then_some(PropIc { ways })
+    (!ways.is_empty() || !absent.is_empty()).then_some(PropIc { ways, absent })
 }
 
 /// `v.<prop>` via the baked IC: guard `v` is an object with the IC's shape and read the data
@@ -872,8 +896,13 @@ fn prop_word_l(
     ic: &PropIc,
     miss: Block,
 ) -> IrValue {
+    const PLAIN: &[Exotic] = &[Exotic::None];
+    const NAMED: &[Exotic] = &[Exotic::None, Exotic::Array, Exotic::StrWrap];
+    // An absence cached over an Array / String wrapper admits those receivers; own-slot ways
+    // still demand an ordinary one.
+    let relaxed = ic.absent.iter().any(|&(_, x)| x);
     let gc = object(fb, l, v, miss, false);
-    exotic_is(fb, l, gc, &[Exotic::None], miss);
+    exotic_is(fb, l, gc, if relaxed { NAMED } else { PLAIN }, miss);
     let shape = fb.load(MemKind::I32, gc, l.shape);
     let nent = fb.load(PTR_U32, gc, l.entries_len);
 
@@ -894,6 +923,9 @@ fn prop_word_l(
         fb.seal_block(next);
 
         fb.switch_to_block(hit);
+        if relaxed {
+            exotic_is(fb, l, gc, PLAIN, miss);
+        }
         let inb = cmp_imm(fb, IntCC::Ugt, PTR, nent, slot as i64);
         guard(fb, inb, miss);
         let base = fb.load(PTR_MEM, gc, l.entries_ptr);
@@ -903,6 +935,43 @@ fn prop_word_l(
         guard(fb, data, miss);
         let b = fb.load(MemKind::I64, base, off + l.prop_packed);
         fb.jump(got, &[b]);
+
+        fb.switch_to_block(next);
+    }
+    // A cached absence: the receiver and every prototype up to `null` still have the shapes the
+    // fill saw (each proves the name is still missing there), so the read is `undefined`.
+    for (chain, exotic) in &ic.absent {
+        let kinds = if *exotic { NAMED } else { PLAIN };
+        let hit = fb.create_block();
+        let next = fb.create_block();
+        let same = cmp_imm(fb, IntCC::Eq, Type::I32, shape, chain[0] as i32 as i64);
+        fb.brif(same, hit, &[], next, &[]);
+        fb.seal_block(hit);
+        fb.seal_block(next);
+
+        fb.switch_to_block(hit);
+        if relaxed && !*exotic {
+            exotic_is(fb, l, gc, PLAIN, miss);
+        }
+        let mut cur = gc;
+        for &level in &chain[1..] {
+            let p = fb.load(PTR_MEM, cur, l.proto);
+            let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
+            guard(fb, some, miss);
+            let flag = fb.load(PTR_MEM, p, l.borrow);
+            let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+            guard(fb, free, miss);
+            exotic_is(fb, l, p, kinds, miss);
+            let sh = fb.load(MemKind::I32, p, l.shape);
+            let ok = cmp_imm(fb, IntCC::Eq, Type::I32, sh, level as i32 as i64);
+            guard(fb, ok, miss);
+            cur = p;
+        }
+        let end = fb.load(PTR_MEM, cur, l.proto);
+        let none = cmp_imm(fb, IntCC::Eq, PTR, end, 0);
+        guard(fb, none, miss);
+        let undef = fb.iconst(Type::I64, PACK_UNDEFINED as i64);
+        fb.jump(got, &[undef]);
 
         fb.switch_to_block(next);
     }
