@@ -1742,13 +1742,12 @@ struct DvVars {
     epoch: Variable,
 }
 
-/// A `length` read site's typed-array length cache: the `Gc` handle word, the length, and
-/// whether it is set (I32). Reset by [`Tr::invalidate_js`].
+/// A `length` read site's typed-array length cache: the `Gc` handle word (0 while unset) and
+/// the length. Reset by [`Tr::invalidate_js`].
 #[derive(Clone, Copy)]
 struct TaLenVars {
     obj: Variable,
     len: Variable,
-    ok: Variable,
 }
 
 /// An IR block starting a bytecode basic block.
@@ -2003,7 +2002,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             .chain(self.idx_vars.values().map(|&v| (v, Type::I32)))
             .chain(self.math_vars.values().map(|&v| (v, Type::I32)))
             .chain(self.ta_vars.values().map(|t| (t.obj, PTR)))
-            .chain(self.ta_len_vars.values().map(|t| (t.ok, Type::I32)))
+            .chain(self.ta_len_vars.values().map(|t| (t.obj, PTR)))
             .chain(self.dv_vars.values().map(|t| (t.ok, Type::I32)))
             .chain(self.bl_vars.values().map(|t| (t.0.ok, Type::I32)))
             .chain(self.push_vars.values().map(|&v| (v, PTR)))
@@ -2821,12 +2820,10 @@ impl<'a, 'f> Tr<'a, 'f> {
             let t = TaLenVars {
                 obj: self.fb.declare_var(PTR),
                 len: self.fb.declare_var(Type::F64),
-                ok: self.fb.declare_var(Type::I32),
             };
             let zf = self.fb.f64const(0.0);
             self.fb.def_var(t.obj, zp);
             self.fb.def_var(t.len, zf);
-            self.fb.def_var(t.ok, z32);
             self.ta_len_vars.insert(pc, t);
         }
         for &key in &self.plan.idx_facts.clone() {
@@ -8071,6 +8068,29 @@ impl<'a, 'f> Tr<'a, 'f> {
         let miss = self.fb.create_block();
         let join = self.fb.create_block();
         let param = want.then(|| self.fb.append_block_param(join, Type::F64));
+        // A local that held a typed array at compile time: its cached length first (the
+        // Array path would miss on it every time), then the usual order.
+        let ta_first = is_len
+            && matches!(src, Some(Src::Slot(s)) if self.ta_kinds.get(s as usize).is_some_and(|&k| k != 0))
+            && self.ta_len_vars.contains_key(&pc);
+        if ta_first {
+            let t = self.ta_len_vars[&pc];
+            let arr = self.fb.create_block();
+            let gc = layout::side_table_object(&mut self.fb, obj, arr);
+            self.seal_current();
+            let (co, cl) = (self.fb.use_var(t.obj), self.fb.use_var(t.len));
+            let same = self.fb.icmp(IntCC::Eq, gc, co);
+            let hit = self.fb.create_block();
+            self.fb.brif(same, hit, &[], arr, &[]);
+            self.fb.seal_block(hit);
+            self.fb.switch_to_block(hit);
+            if let Some(i) = drop {
+                self.drop_at(i);
+            }
+            self.fb.jump(join, &[cl]);
+            self.fb.seal_block(arr);
+            self.fb.switch_to_block(arr);
+        }
         match &ic {
             None => {
                 let tracked = src.and_then(|k| self.arr_vars.get(&k).copied());
@@ -8210,16 +8230,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.seal_current();
                 let hit = self.fb.create_block();
                 let hl = self.fb.append_block_param(hit, Type::F64);
-                if let Some(t) = cache {
+                if let Some(t) = cache.filter(|_| !ta_first) {
                     let refresh = self.fb.create_block();
-                    let (ok, co, cl) = (
-                        self.fb.use_var(t.ok),
-                        self.fb.use_var(t.obj),
-                        self.fb.use_var(t.len),
-                    );
+                    let (co, cl) = (self.fb.use_var(t.obj), self.fb.use_var(t.len));
                     let same = self.fb.icmp(IntCC::Eq, gc, co);
-                    let good = self.fb.binary(BinaryOp::Band, ok, same);
-                    self.fb.brif(good, hit, &[cl], refresh, &[]);
+                    self.fb.brif(same, hit, &[cl], refresh, &[]);
                     self.fb.seal_block(refresh);
                     self.fb.switch_to_block(refresh);
                 }
@@ -8229,8 +8244,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let zf = self.fb.f64const(0.0);
                 let got = self.fb.fcmp(FloatCC::Ge, n, zf);
                 if let Some(t) = cache {
-                    self.fb.def_var(t.ok, got);
-                    self.fb.def_var(t.obj, gc);
+                    let zp = self.ptrc(0);
+                    let co = self.fb.select(got, gc, zp);
+                    self.fb.def_var(t.obj, co);
                     self.fb.def_var(t.len, n);
                 }
                 self.fb.brif(got, hit, &[n], slow_b, &[]);
