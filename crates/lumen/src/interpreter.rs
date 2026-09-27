@@ -2698,7 +2698,7 @@ impl Interp {
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return None;
         }
-        if !plain {
+        if !o.borrow().ic_plain.get() {
             // A split view reads its own elements without touching the property map (a miss
             // past its length takes the generic path: the prototype chain).
             if let Some(v) = crate::split_view::fast_get(o, n as usize) {
