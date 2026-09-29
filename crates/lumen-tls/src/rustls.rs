@@ -1,4 +1,4 @@
-//! TLS over rustls (ring provider) for targets without the system-OpenSSL backend (Windows).
+//! TLS over rustls (ring provider) for Android and Windows.
 //!
 //! Same surface and I/O semantics as `openssl`: the handshake completes inside `connect`/`accept`,
 //! reads block on the socket, a socket read timeout surfaces as `ErrorKind::Interrupted` (the
