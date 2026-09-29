@@ -4594,7 +4594,6 @@ impl<'a, 'f> Tr<'a, 'f> {
         let done = self.fb.create_block();
         self.fb.brif(big, ref_b, &[], copy_b, &[]);
         self.fb.seal_block(ref_b);
-        self.fb.seal_block(copy_b);
 
         self.fb.switch_to_block(ref_b);
         let objt = self.i32c(TAG_OBJ as i64);
@@ -4620,6 +4619,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
         self.fb.store(PTR_MEM, gc, s1, so);
         self.fb.jump(copy_b, &[]);
+        self.fb.seal_block(copy_b);
 
         // Field by field (tag byte, a Boolean's byte, payload word): the tag was typically
         // just stored as a byte, and a wider reload of it can't be store-forwarded.
