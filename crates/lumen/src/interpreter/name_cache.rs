@@ -83,7 +83,8 @@ impl Interp {
     pub(crate) fn resolve_name(&mut self, node: usize, name: &str, env: &Env) -> NameRes {
         let epoch = crate::value::scope_epoch();
         let env_ptr = Rc::as_ptr(env);
-        let idx = (node.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) & (NAME_SITES - 1);
+        let idx =
+            ((node as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & (NAME_SITES - 1);
         let site = &self.name_sites.0[idx];
         // SAFETY: `env` is live; the serial is written once, at creation.
         let serial = unsafe { (*(*env_ptr).as_ptr()).serial };
@@ -150,7 +151,9 @@ impl Interp {
             // the result valid for a caller that runs code before using it.
             b.vars.observe();
             let found = if short {
-                b.vars.binding_ptr(name).map(|binding| (std::ptr::null(), binding))
+                b.vars
+                    .binding_ptr(name)
+                    .map(|binding| (std::ptr::null(), binding))
             } else {
                 b.vars.entry_ptrs(name)
             };
