@@ -827,6 +827,8 @@ impl Interp {
         }
         ns.borrow_mut().extensible = false;
         ns.borrow().ic_plain.set(false);
+        // Pointer-keyed metadata owns a pin until collection evicts both together.
+        self.gc_pin(ns);
         self.module_ns.insert(Gc::as_ptr(ns) as usize, live);
         Ok(())
     }
@@ -863,6 +865,7 @@ impl Interp {
         }
         if let Some(live) = self.module_ns.get(&(Gc::as_ptr(base_o) as usize)).cloned() {
             dns.borrow().ic_plain.set(false);
+            self.gc_pin(&dns);
             self.module_ns.insert(Gc::as_ptr(&dns) as usize, live);
         }
         dns.borrow().ic_plain.set(false);
@@ -919,6 +922,7 @@ impl Interp {
                             self.module_ns.get(&(Gc::as_ptr(base_o) as usize)).cloned()
                         {
                             stub.borrow().ic_plain.set(false);
+                            self.gc_pin(&stub);
                             self.module_ns.insert(Gc::as_ptr(&stub) as usize, live);
                         }
                     }
@@ -2011,5 +2015,61 @@ fn file_url(key: &str) -> String {
         format!("file://{path}")
     } else {
         format!("file:///{path}")
+    }
+}
+
+#[cfg(test)]
+mod namespace_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn namespace_metadata_pins_until_collection_then_retires() {
+        let mut interp = Interp::new();
+        interp
+            .parse_and_register("lifetime", Some("export const answer = 42;".into()))
+            .ok()
+            .expect("parse module");
+        interp.link_module("lifetime").ok().expect("link module");
+        let ns = interp.module_recs["lifetime"].ns.clone();
+        let ptr = Gc::as_ptr(ns.as_obj().unwrap()) as usize;
+        assert!(interp.is_namespace(ptr));
+        assert!(
+            interp.gc_pins.contains_key(&ptr),
+            "pointer metadata must keep its object alive until sweep"
+        );
+        interp.module_recs.remove("lifetime");
+        interp.modules.remove("lifetime");
+        drop(ns);
+        interp.gc_collect();
+        assert!(
+            !interp.is_namespace(ptr),
+            "dead namespace metadata must be evicted before address reuse"
+        );
+        assert!(!interp.gc_pins.contains_key(&ptr));
+        let ordinary = Value::Obj(Object::new(None));
+        interp.strict = true;
+        assert!(
+            interp
+                .set_member(&ordinary, "PATH", Value::str("fixture"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn retained_namespace_survives_collection_and_stays_read_only() {
+        let mut interp = Interp::new();
+        let ns = interp
+            .load_module("retained", "export let answer = 42;")
+            .ok()
+            .expect("load module");
+        let ptr = Gc::as_ptr(ns.as_obj().unwrap()) as usize;
+        interp.gc_collect();
+        assert!(interp.is_namespace(ptr));
+        assert!(matches!(
+            interp.get_member(&ns, "answer").ok().expect("read export"),
+            Value::Num(42.0)
+        ));
+        interp.strict = true;
+        assert!(interp.set_member(&ns, "answer", Value::Num(7.0)).is_err());
     }
 }

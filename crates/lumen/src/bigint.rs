@@ -441,6 +441,7 @@ impl JsBigInt {
     pub fn is_zero(&self) -> bool {
         self.0.mag.is_empty()
     }
+    pub fn words(&self) -> (bool, &[u64]) { (self.0.neg, &self.0.mag) }
     pub fn is_negative(&self) -> bool {
         self.0.neg
     }

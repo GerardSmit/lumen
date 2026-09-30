@@ -36,6 +36,13 @@ pub struct AgentChannels {
 /// Process-global backing store for SharedArrayBuffer memory, keyed by a unique id so it can be
 /// shared across agent threads (each agent runs its own single-threaded `Interp`).
 pub type SharedMem = Arc<Mutex<Vec<u8>>>;
+/// An opaque, thread-safe shared-memory capability. Only a context that already owns a
+/// genuine SharedArrayBuffer can export one; importing it aliases that exact backing store.
+#[derive(Clone)]
+pub struct SharedBufferHandle {
+    id: u64,
+    backing: SharedMem,
+}
 pub fn shared_mem_registry() -> &'static Mutex<HashMap<u64, SharedMem>> {
     static R: OnceLock<Mutex<HashMap<u64, SharedMem>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(Default::default()))
@@ -70,23 +77,16 @@ fn wait_table() -> &'static Mutex<HashMap<(u64, usize), Vec<Waiter>>> {
     static T: OnceLock<Mutex<HashMap<(u64, usize), Vec<Waiter>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Default::default()))
 }
-/// Add a waiter to the list for `(id, index)` without blocking. `Atomics.waitAsync` registers
-/// synchronously (so a notify later in the same job sees it) and blocks on a helper thread.
-pub fn futex_register(id: u64, index: usize) -> Waiter {
+/// Check the expected memory value and register while holding the waiter-list lock.
+/// A concurrent notification cannot slip between the check and registration.
+pub fn futex_register_if(id: u64, index: usize, matches: impl FnOnce() -> bool) -> Option<Waiter> {
     let waiter: Waiter = Arc::new((Mutex::new(false), Condvar::new()));
-    wait_table()
-        .lock()
-        .unwrap()
-        .entry((id, index))
-        .or_default()
-        .push(waiter.clone());
-    waiter
-}
-/// Block on `(id, index)` until notified or `timeout` elapses. Returns `true` if notified (woken),
-/// `false` if it timed out.
-pub fn futex_wait(id: u64, index: usize, timeout: Option<std::time::Duration>) -> bool {
-    let waiter = futex_register(id, index);
-    futex_block(&waiter, id, index, timeout)
+    let mut table = wait_table().lock().unwrap();
+    if !matches() {
+        return None;
+    }
+    table.entry((id, index)).or_default().push(waiter.clone());
+    Some(waiter)
 }
 /// Block on an already-registered waiter.
 pub fn futex_block(
@@ -2114,6 +2114,23 @@ impl Interp {
         }
     }
 
+    /// Intrinsic property definition for host addons, preserving descriptors, symbols and
+    /// ordinary/proxy invariants independently of mutable JavaScript Object methods.
+    pub fn define_property_value(
+        &mut self, target: &Value, key: Value, descriptor: &Value,
+    ) -> Result<(), Value> {
+        crate::builtins::object_define_property(self, target.clone(), key, descriptor.clone()).map(|_| ())
+    }
+
+    /// Intrinsic own-property query, including symbol keys and proxy invariants.
+    pub fn has_own_property_value(&mut self, target: &Value, key: &Value) -> Result<bool, Value> {
+        let key = self.to_property_key(key).map_err(abrupt_value)?;
+        crate::builtins::has_own_property_trapped(self, target, &key)
+    }
+    /// Array brand query for native API conversions (proxies follow IsArray).
+    pub fn is_array_value(&mut self, value: &Value) -> Result<bool, Value> {
+        crate::builtins::json_is_array(self, value)
+    }
     /// Define an accessor (getter/setter) property on `target`. For host addons registering class
     /// accessors (`napi_define_class` with getter/setter descriptors).
     pub fn define_accessor_value(
@@ -2178,6 +2195,12 @@ impl Interp {
         }
         .or_else(|| Some(self.object_proto.clone()));
         Value::Obj(Object::new(proto))
+    }
+
+    /// Execute a thread-affine host call on the realm's owning native thread. Async
+    /// coroutine workers hand off exclusively; nested workers forward through their drivers.
+    pub fn on_driver(&mut self, call: impl FnOnce(&mut Self) -> Result<Value, Value> + 'static) -> Result<Value, Value> {
+        crate::coroutine::driver_call(self, Box::new(call))
     }
 
     /// Invoke a native callable (bare `fn` or data-carrying closure) — the shared body for the
@@ -2366,6 +2389,56 @@ impl Interp {
         crate::builtins::typedarray::array_buffer_from_vec(self, bytes)
     }
 
+    /// Export a genuine fixed-length SharedArrayBuffer without exposing its process-global id.
+    /// A plain object (including one with forged internal-looking properties) returns `None`.
+    /// Growable shared buffers are refused until cross-realm length tracking is implemented.
+    pub fn export_shared_array_buffer(
+        &self,
+        value: &Value,
+    ) -> Result<Option<SharedBufferHandle>, Value> {
+        let Some(object) = value.as_obj() else {
+            return Ok(None);
+        };
+        let pointer = Gc::as_ptr(object) as usize;
+        let Some(&id) = self.shared_buffers.get(&pointer) else {
+            return Ok(None);
+        };
+        if matches!(
+            object.borrow().props.get("__abResizable").map(|p| p.value()),
+            Some(Value::Bool(true))
+        ) {
+            return Err(self.make_error(
+                "DataCloneError",
+                "Growable SharedArrayBuffer worker sharing is not supported",
+            ));
+        }
+        let backing = shared_mem_get(id).ok_or_else(|| {
+            self.make_error("DataCloneError", "SharedArrayBuffer backing store is unavailable")
+        })?;
+        Ok(Some(SharedBufferHandle { id, backing }))
+    }
+
+    /// Construct this realm's own SharedArrayBuffer wrapper around an admitted native capability.
+    pub fn import_shared_array_buffer(&mut self, handle: &SharedBufferHandle) -> Value {
+        let length = handle.backing.lock().unwrap().len();
+        let object = Object::new(self.extra_protos.get("SharedArrayBuffer").cloned());
+        let pointer = Gc::as_ptr(&object) as usize;
+        self.gc_pin(&object);
+        self.array_buffers.insert(pointer, vec![0u8; length].into());
+        for (name, value) in [
+            ("__abMaxByteLength", Value::Num(length as f64)),
+            ("__abResizable", Value::Bool(false)),
+            ("__sab_id", Value::Num(handle.id as f64)),
+        ] {
+            object
+                .borrow_mut()
+                .props
+                .insert(name, Property::data(value, false, false, false));
+        }
+        self.shared_buffers.insert(pointer, handle.id);
+        Value::Obj(object)
+    }
+
     /// A fresh fixed-length `ArrayBuffer` viewing `len` bytes at `ptr`, kept alive by `owner`
     /// (no copy: JS and the embedder share the bytes).
     ///
@@ -2392,6 +2465,23 @@ impl Interp {
         if let Some(o) = v.as_obj() {
             self.array_buffers.remove(&(Gc::as_ptr(o) as usize));
         }
+    }
+
+    /// Whether a value owns an attached, mutable, fixed-length ordinary ArrayBuffer backing store.
+    /// This is an intrinsic side-table check: no user getter/prototype runs, and a SAB
+    /// or an object impersonating an ArrayBuffer cannot be detached through this API.
+    pub fn is_transferable_array_buffer(&self, value: &Value) -> bool {
+        let Some(object) = value.as_obj() else {
+            return false;
+        };
+        let pointer = Gc::as_ptr(object) as usize;
+        self.array_buffers.contains_key(&pointer)
+            && !self.shared_buffers.contains_key(&pointer)
+            && !self.immutable_buffers.contains(&pointer)
+            && !matches!(
+                object.borrow().props.get("__abResizable").map(|p| p.value()),
+                Some(Value::Bool(true))
+            )
     }
 
     pub(crate) fn make_function(&self, func: Rc<Function>, env: Env) -> Value {
@@ -5071,7 +5161,7 @@ impl Interp {
                         }
                     )*};
                 }
-                evict!(class_info, map_data, typed_arrays, data_views, regexps, proxies, temporal, array_buffers, ta_buffer, shared_buffers, immutable_buffers, generators, async_gens, async_gen_busy, async_gen_queue, mapped_arguments, deferred_ns, gc_pins);
+                evict!(class_info, map_data, typed_arrays, data_views, regexps, proxies, temporal, array_buffers, ta_buffer, shared_buffers, immutable_buffers, generators, async_gens, async_gen_busy, async_gen_queue, mapped_arguments, deferred_ns, module_ns, gc_pins);
                 let mut b = o.borrow_mut();
                 b.props.clear();
                 b.proto = None;

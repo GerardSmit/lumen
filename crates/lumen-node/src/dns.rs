@@ -14,7 +14,7 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
-use lumen_host::{Ctx, TaskRegistry, Value};
+use lumen_host::{Ctx, Value};
 
 use crate::spawn_handle;
 
@@ -36,10 +36,7 @@ pub fn op_lookup(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     let hostname = arg_str(ctx, args, 0)?;
     let family = arg_num(args, 1) as u8;
     let (resolve, reject) = settle_pair(ctx, args, 2, "__dns.lookup")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_addr_list);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_addr_list);
     spawn_handle(ctx).spawn_blocking(id, move || Box::new(system_lookup(&hostname, family)));
     Ok(Value::Undefined)
 }
@@ -97,10 +94,7 @@ pub fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let name = arg_str(ctx, args, 0)?;
     let rrtype = arg_str(ctx, args, 1)?;
     let (resolve, reject) = settle_pair(ctx, args, 2, "__dns.resolve")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_records);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_records);
     spawn_handle(ctx).spawn_blocking(id, move || Box::new(udp_resolve(&name, &rrtype)));
     Ok(Value::Undefined)
 }

@@ -20,6 +20,10 @@ function isCoreSpecifier(spec) {
   return CORE.has(bare) ? bare : null;
 }
 
+function isRelativeSpecifier(specifier) {
+  return specifier === "." || specifier === ".." || specifier.startsWith("./") || specifier.startsWith("../");
+}
+
 function readIfFile(p) {
   return __node.isFile(p) ? p : null;
 }
@@ -31,39 +35,93 @@ function loadAsFile(p) {
   return null;
 }
 
-// A subset of package.json "exports": string, or the "." entry, resolving the
-// require/node/default conditions. Subpath patterns and deep conditional trees are not handled
-// yet (they fall through to "main").
-function resolveExports(exports) {
-  if (typeof exports === "string") return exports;
-  if (exports && typeof exports === "object") {
-    const dot = "." in exports ? exports["."] : exports;
-    if (typeof dot === "string") return dot;
-    if (dot && typeof dot === "object") {
-      for (const cond of ["require", "node", "default"]) {
-        if (typeof dot[cond] === "string") return dot[cond];
+// Exact package exports, with declaration-ordered node/require/default conditions.
+// undefined means no matching condition; null blocks a branch. Arrays skip both while
+// retaining the last blocked/invalid result. Single-star subpaths use Node key precedence.
+const INVALID_EXPORT_TARGET = Symbol("invalid package export target");
+function relativePackageTarget(target) {
+  return target.startsWith("./") && !target.split("/").slice(1).some(part => {
+    const lower = part.toLowerCase(), dots = lower.replace(/%2e/g, ".");
+    return dots === "." || dots === ".." || lower === "node_modules"
+      || lower.includes("%2f") || lower.includes("%5c") || lower.includes("\\");
+  });
+}
+function resolveExportTarget(target) {
+  if (typeof target === "string") {
+    if (!relativePackageTarget(target)) return INVALID_EXPORT_TARGET;
+    return target;
+  }
+  if (target === null) return null;
+  if (Array.isArray(target)) {
+    if (target.length === 0) return null;
+    let last;
+    for (const item of target) {
+      const resolved = resolveExportTarget(item);
+      if (resolved === undefined) continue;
+      if (typeof resolved === "string") return resolved;
+      last = resolved;
+    }
+    return last;
+  }
+  if (target && typeof target === "object") {
+    for (const condition of Object.keys(target)) {
+      if (condition === "node" || condition === "require" || condition === "default") {
+        const resolved = resolveExportTarget(target[condition]);
+        if (resolved !== undefined) return resolved;
       }
     }
+    return undefined;
   }
-  return null;
+  return INVALID_EXPORT_TARGET;
+}
+function resolveExports(exports, key = ".") {
+  let target = exports;
+  let capture;
+  if (exports && typeof exports === "object" && !Array.isArray(exports)
+      && Object.keys(exports).some(key => key.startsWith("."))) {
+    if (Object.prototype.hasOwnProperty.call(exports, key)) target = exports[key];
+    else {
+      let bestPrefix = -1, bestLength = -1;
+      target = undefined;
+      for (const pattern of Object.keys(exports)) {
+        const star = pattern.indexOf("*");
+        if (star < 0 || pattern.indexOf("*", star + 1) >= 0) continue;
+        const prefix = pattern.slice(0, star), suffix = pattern.slice(star + 1);
+        if (key.length < prefix.length + suffix.length
+            || !key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+        if (prefix.length < bestPrefix
+            || (prefix.length === bestPrefix && pattern.length <= bestLength)) continue;
+        bestPrefix = prefix.length; bestLength = pattern.length;
+        capture = key.slice(prefix.length, key.length - suffix.length);
+        target = exports[pattern];
+      }
+      if (target === undefined) return null;
+    }
+  } else if (key !== ".") return null;
+  const resolved = resolveExportTarget(target);
+  if (typeof resolved !== "string") return null;
+  const mapped = capture === undefined ? resolved : resolved.split("*").join(capture);
+  return relativePackageTarget(mapped) ? mapped : null;
+}
+
+function readPackage(dir) {
+  const pkgPath = path.join(dir, "package.json");
+  if (!__node.isFile(pkgPath)) return null;
+  try { return JSON.parse(__node.readText(pkgPath)); }
+  catch (e) { throw new Error(`invalid package.json in ${dir}: ${e.message}`); }
 }
 
 function loadAsDirectory(dir) {
-  const pkgPath = path.join(dir, "package.json");
-  if (__node.isFile(pkgPath)) {
-    let pkg;
-    try {
-      pkg = JSON.parse(__node.readText(pkgPath));
-    } catch (e) {
-      throw new Error(`invalid package.json in ${dir}: ${e.message}`);
-    }
-    const fromExports = pkg.exports ? resolveExports(pkg.exports) : null;
-    const entry = fromExports || pkg.main;
+  const pkg = readPackage(dir);
+  if (pkg) {
+    const hasExports = Object.prototype.hasOwnProperty.call(pkg, "exports");
+    const entry = hasExports ? resolveExports(pkg.exports) : pkg.main;
     if (entry) {
       const target = path.resolve(dir, entry);
       const found = loadAsFile(target) || loadAsFile(path.join(target, "index"));
       if (found) return found;
     }
+    if (hasExports) return null;
   }
   return loadAsFile(path.join(dir, "index"));
 }
@@ -73,6 +131,16 @@ function loadNodeModules(name, start) {
   let dir = start;
   while (true) {
     if (path.basename(dir) !== "node_modules") {
+      const parts = name.split("/");
+      const packageParts = name.startsWith("@") ? 2 : 1;
+      const packageName = parts.slice(0, packageParts).join("/");
+      const packageDir = path.join(dir, "node_modules", packageName);
+      const pkg = readPackage(packageDir);
+      if (pkg && Object.prototype.hasOwnProperty.call(pkg, "exports")) {
+        const subpath = parts.slice(packageParts).join("/");
+        const target = resolveExports(pkg.exports, subpath ? "./" + subpath : ".");
+        return target ? loadAsFile(path.resolve(packageDir, target)) : null;
+      }
       const candidate = path.join(dir, "node_modules", name);
       const found = loadAsFile(candidate) || loadAsDirectory(candidate);
       if (found) return found;
@@ -111,14 +179,14 @@ function defaultResolveFilename(specifier, fromDir, parentFilename) {
   if (aotKey !== undefined) return aotKey;
   if (isAotKey(fromDir) || isAotKey(specifier)) {
     // Not in the blob: nothing on disk is relative to an `aot:/` module.
-    if (isAotKey(specifier) || specifier.startsWith("./") || specifier.startsWith("../")) {
+    if (isAotKey(specifier) || isRelativeSpecifier(specifier)) {
       const e = new Error(`Cannot find module '${specifier}' from '${parentFilename || fromDir}'`);
       e.code = "MODULE_NOT_FOUND";
       throw e;
     }
     fromDir = process.cwd();
   }
-  if (specifier.startsWith("./") || specifier.startsWith("../") || path.isAbsolute(specifier)) {
+  if (isRelativeSpecifier(specifier) || path.isAbsolute(specifier)) {
     const base = path.resolve(fromDir, specifier);
     const found = loadAsFile(base) || loadAsDirectory(base);
     if (found) return __node.realpath(found);
@@ -232,7 +300,13 @@ function resolveFilename(specifier, fromDir, parentFilename) {
 // a default step that hands the decision back to the native loader: a hook that defers on both
 // resolve and load answers `undefined`, one that redirects to a file answers `{ specifier }`,
 // and one that short-circuits both with a module answers `{ key, source }`.
+// require(esm) must execute the exact source returned by its synchronous load hook.
+// This temporary handoff lasts only through loadESM's synchronous import/microtask drain;
+// dependencies still resolve through their ordinary hooks and package scopes.
+const requireEsmSources = new Map();
 function esmHook(specifier, referrer, attrType) {
+  const supplied = requireEsmSources.get(specifier);
+  if (supplied !== undefined) return { key: pathToFileUrl(specifier), source: supplied };
   if (!hasHook("resolve") && !hasHook("load")) return undefined;
   const parentURL = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(referrer) ? referrer : pathToFileUrl(referrer);
   const importAttributes = attrType ? { type: attrType } : {};
@@ -331,12 +405,29 @@ function loadViaHooks(module, filename) {
     module.exports = JSON.parse(source);
     return true;
   }
-  if (result.format === undefined || result.format === "commonjs") {
+  if (result.format === "module") {
+    loadHookESM(module, filename, source);
+    return true;
+  }
+  if (result.format === undefined) {
+    const ext = path.extname(filename);
+    const scoped = ext === ".js" || ext === ".ts";
+    const type = scoped ? packageScopeType(filename) : undefined;
+    if (ext === ".mjs" || ext === ".mts" || (scoped && type === "module")) {
+      loadHookESM(module, filename, source);
+    } else {
+      const detect = scoped && type === undefined && ESM_SYNTAX.test(source);
+      const ts = ext === ".ts" || ext === ".cts";
+      if (!compileCommonJS(module, filename, source, detect, ts)) loadHookESM(module, filename, source);
+    }
+    return true;
+  }
+  if (result.format === "commonjs") {
     compileCommonJS(module, filename, source);
     return true;
   }
   throw new Error(
-    `registerHooks: load format '${result.format}' is not supported in lumen (commonjs and json are)`,
+    `registerHooks: load format '${result.format}' is not supported in lumen (module, commonjs and json are)`,
   );
 }
 
@@ -406,6 +497,14 @@ function makeRequire(fromDir, parentModule) {
   // Node v22.16 quirk, mirrored deliberately: require.resolve() does NOT consult registerHooks
   // (only actual loads do) — verified against `node -e`.
   require.resolve = (specifier) => defaultResolveFilename(String(specifier), fromDir, parentFilename);
+  require.resolve.paths = (specifier) => {
+    if (typeof specifier !== "string") throw new TypeError("specifier must be a string");
+    if (isCoreSpecifier(specifier) || specifier.startsWith("node:")) return null;
+    if (isRelativeSpecifier(specifier)) return [fromDir];
+    // This resolver currently searches local ancestor node_modules only. Report those
+    // actual lookup directories rather than advertising unimplemented global searches.
+    return nodeModulePaths(fromDir);
+  };
   require.cache = cache;
   require.main = mainModule;
   return require;
@@ -547,6 +646,14 @@ function packageScopeType(filename) {
 // only settling the returned promise in a reaction job, so draining the microtask queue here
 // observes the settled namespace. A graph still pending after the drain is suspended at a
 // top-level await, which require() cannot wait for: ERR_REQUIRE_ASYNC_MODULE, as in Node.
+function loadHookESM(module, filename, source) {
+  requireEsmSources.set(filename, source);
+  try {
+    loadESM(module, filename);
+  } finally {
+    requireEsmSources.delete(filename);
+  }
+}
 function loadESM(module, filename) {
   let state = 0;
   let value;
@@ -597,6 +704,10 @@ const ESM_SYNTAX = /(^|[\s;})])(import\s*[{*\w"']|export\s*[{*\w]|import\.meta\b
 // Node's per-extension loaders. loadModule() above dispatches through these, so replacing or
 // wrapping an entry (as ts-node / pirates do) actually takes effect — real behavior, not a stub.
 const _extensions = {
+  // An explicit .cjs file stays CommonJS even inside a type:module package.
+  ".cjs": function (module, filename) {
+    compileCommonJS(module, filename, __node.readText(filename), false);
+  },
   ".js": function (module, filename) {
     const type = packageScopeType(filename);
     if (type === "module") return loadESM(module, filename);
@@ -894,7 +1005,7 @@ globalThis.__esmExportLists = __ESM_EXPORTS;
 // The clean builtin base names (skip the "node:module" alias key). Order is cosmetic here.
 const __BUILTIN_NAMES = [
   "buffer", "path", "os", "fs", "module",
-  "events", "util", "sys", "console", "timers", "timers/promises",
+  "events", "sqlite", "util", "util/types", "sys", "console", "timers", "timers/promises",
   "crypto", "querystring", "url", "net", "assert", "assert/strict",
   "string_decoder", "tty", "async_hooks", "zlib", "stream", "stream/web",
   "stream/promises", "stream/consumers", "http", "https", "http2",

@@ -875,19 +875,30 @@ struct PendingPrivate {
     line: u32,
 }
 
-thread_local! {
-    /// Template-site ids for `Expr::TaggedTemplate::site`, keyed by the source the site was
-    /// parsed from, its byte offset there, and a hash of its raw text. A tagged template inside
-    /// a lazily-parsed body must present the same strings object after the body was released
-    /// and parsed again (GetTemplateObject is per *site*), so the id derives from where the
-    /// site is, not from the node the parse produced. Each entry keeps a weak handle on its
-    /// source: an entry whose source was freed (so no body can be parsed from it again) is stale,
-    /// and a new source reusing the address — say a second `eval` of the same text, whose sites
-    /// are distinct — gets fresh ids.
-    static TEMPLATE_SITES: std::cell::RefCell<(
+/// Template identities belong to a driver, including lazy parsing on its coroutine workers.
+/// Thread-local counters would let worker site 1 alias driver site 1 in GetTemplateObject.
+#[derive(Default)]
+pub(crate) struct TemplateSites {
+    state: std::cell::RefCell<(
         crate::fasthash::FastMap<(usize, u32, u64), (std::rc::Weak<str>, u32)>,
         u32,
-    )> = std::cell::RefCell::new((Default::default(), 0));
+    )>,
+}
+// The driver and its coroutine access this registry exclusively under the existing handoff;
+// like GcState, the Rc/Weak handles must never be touched by both threads concurrently.
+unsafe impl Send for TemplateSites {}
+unsafe impl Sync for TemplateSites {}
+thread_local! {
+    static TEMPLATE_SITES: std::cell::RefCell<std::sync::Arc<TemplateSites>> =
+        std::cell::RefCell::new(std::sync::Arc::new(TemplateSites::default()));
+}
+pub(crate) fn template_sites_handle() -> std::sync::Arc<TemplateSites> {
+    TEMPLATE_SITES.with(|current| current.borrow().clone())
+}
+pub(crate) fn enter_template_sites(
+    state: std::sync::Arc<TemplateSites>,
+) -> std::sync::Arc<TemplateSites> {
+    TEMPLATE_SITES.with(|current| std::mem::replace(&mut *current.borrow_mut(), state))
 }
 
 fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]) -> u32 {
@@ -898,7 +909,8 @@ fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]
     }
     let key = (Rc::as_ptr(src) as *const u8 as usize, offset, h.finish());
     TEMPLATE_SITES.with(|t| {
-        let (map, next) = &mut *t.borrow_mut();
+        let registry = t.borrow();
+        let (map, next) = &mut *registry.state.borrow_mut();
         match map.get(&key) {
             Some((live, id)) if live.strong_count() != 0 => *id,
             _ => {
@@ -914,7 +926,8 @@ fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]
 /// released).
 pub(crate) fn fresh_template_site() -> u32 {
     TEMPLATE_SITES.with(|t| {
-        let (_, next) = &mut *t.borrow_mut();
+        let registry = t.borrow();
+        let (_, next) = &mut *registry.state.borrow_mut();
         *next += 1;
         *next
     })

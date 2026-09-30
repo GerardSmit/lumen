@@ -16,7 +16,7 @@
 //!   Bun's exact "Password verification failed with error \"...\"" messages.
 
 
-use lumen_host::{ops, Ctx, OpDecl, TaskRegistry, Value};
+use lumen_host::{ops, Ctx, OpDecl, Value};
 
 mod constants;
 
@@ -951,10 +951,7 @@ fn op_hash_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> 
     let alg = arg_str(ctx, a, 1)?;
     let (m, t, cost) = (arg_u32(a, 2), arg_u32(a, 3), arg_u32(a, 4));
     let (resolve, reject) = settle_args(ctx, a, 5, "__password.hash")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_hash);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_hash);
     crate::spawn_handle(ctx)
         .spawn_blocking(id, move || Box::new(hash_password(&pw, &alg, m, t, cost)));
     Ok(Value::Undefined)
@@ -964,10 +961,7 @@ fn op_verify_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value
     let pw = arg_bytes(ctx, a, 0, "__password.verify")?;
     let hash = arg_str(ctx, a, 1)?;
     let (resolve, reject) = settle_args(ctx, a, 2, "__password.verify")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_verify);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_verify);
     crate::spawn_handle(ctx).spawn_blocking(id, move || {
         Box::new(verify_password(&pw, &hash).map_err(|e| e.message().to_string()))
     });
@@ -1004,10 +998,7 @@ fn op_argon2_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value>
 fn op_argon2_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let (message, nonce, params) = argon2_args(ctx, a, "crypto.argon2")?;
     let (resolve, reject) = settle_args(ctx, a, 9, "crypto.argon2")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_argon2);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_argon2);
     crate::spawn_handle(ctx)
         .spawn_blocking(id, move || Box::new(argon2_hash(&message, &nonce, &params)));
     Ok(Value::Undefined)

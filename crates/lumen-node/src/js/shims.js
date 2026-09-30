@@ -6,7 +6,7 @@
 // PerformanceObserver. lumen's global `performance` has now()/timeOrigin but no user-timing API, so
 // we add mark/measure/getEntries here and wire them to observers — marks and measures are real.
 // The observer machinery for entry types lumen cannot produce (gc, http, resource…) simply never
-// fires, which is the honest behavior for a runtime that emits no such entries.
+// fires; explicit resource timing from Node HTTP clients is recorded below.
 {
   const perf = globalThis.performance;
   const now = () => perf.now();
@@ -38,8 +38,30 @@
     }
   }
   class PerformanceResourceTiming extends PerformanceEntry {
-    constructor(name, startTime, duration) {
-      super(name, "resource", startTime ?? 0, duration ?? 0);
+    constructor(name, timing, initiatorType, cacheMode, responseStatus, deliveryType) {
+      super(name, "resource", timing.startTime, timing.endTime - timing.startTime);
+      this.initiatorType = initiatorType;
+      const fields = { workerStart: "finalServiceWorkerStartTime", redirectStart: "redirectStartTime",
+        redirectEnd: "redirectEndTime", fetchStart: "postRedirectStartTime",
+        requestStart: "finalNetworkRequestStartTime", responseStart: "finalNetworkResponseStartTime",
+        responseEnd: "endTime", encodedBodySize: "encodedBodySize", decodedBodySize: "decodedBodySize" };
+      for (const [key, source] of Object.entries(fields)) this[key] = timing[source];
+      const connection = timing.finalConnectionTimingInfo;
+      for (const [key, source] of Object.entries({domainLookupStart:"domainLookupStartTime",
+        domainLookupEnd:"domainLookupEndTime", connectStart:"connectionStartTime",
+        connectEnd:"connectionEndTime", secureConnectionStart:"secureConnectionStartTime",
+        nextHopProtocol:"ALPNNegotiatedProtocol"})) this[key] = connection?.[source];
+      this.transferSize = cacheMode === "local" ? 0 : timing.encodedBodySize + 300;
+      this.responseStatus = responseStatus;
+      this.deliveryType = deliveryType;
+    }
+    toJSON() {
+      const result = super.toJSON();
+      for (const key of ["initiatorType","nextHopProtocol","workerStart","redirectStart","redirectEnd",
+        "fetchStart","domainLookupStart","domainLookupEnd","connectStart","connectEnd",
+        "secureConnectionStart","requestStart","responseStart","responseEnd","transferSize",
+        "encodedBodySize","decodedBodySize","deliveryType","responseStatus"]) result[key] = this[key];
+      return result;
     }
   }
 
@@ -138,6 +160,23 @@
       for (let i = buffer.length - 1; i >= 0; i--) if (buffer[i].entryType === "resource") buffer.splice(i, 1);
     };
   }
+
+  // Explicit client measurements only: no fabricated DNS/TLS/network timestamps. Resource
+  // retention is bounded independently of observer delivery (default Node buffer size: 250).
+  let resourceLimit = 250;
+  perf.setResourceTimingBufferSize = function setResourceTimingBufferSize(size) {
+    if (!Number.isInteger(size) || size < 0 || size > 4096) throw new RangeError("Resource timing buffer size must be between 0 and 4096");
+    resourceLimit = size;
+  };
+  perf.markResourceTiming = function markResourceTiming(timingInfo, requestedUrl, initiatorType,
+    global, cacheMode, bodyInfo, responseStatus, deliveryType = "") {
+    if (cacheMode !== "" && cacheMode !== "local") throw new TypeError("cache must be an empty string or 'local'");
+    const entry = new PerformanceResourceTiming(requestedUrl, timingInfo, initiatorType,
+      cacheMode, responseStatus, deliveryType);
+    if (buffer.filter((e) => e.entryType === "resource").length < resourceLimit) buffer.push(entry);
+    for (const observer of observers) if (observer._types.has("resource")) observer._deliver(entry);
+    return entry;
+  };
 
   function resolveMark(nameOrTime) {
     if (typeof nameOrTime === "number") return nameOrTime;

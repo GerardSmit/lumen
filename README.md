@@ -2,8 +2,8 @@
 
 A from-scratch JavaScript **engine** in Rust — std only, zero dependencies — and a
 **runtime** being built on top of it, the way Node/Deno/Bun wrap a JS engine with an event
-loop and host APIs. Every crate in the workspace is std-only: no `tokio`, `mio`, `libc`,
-`rustyline`, `serde`, or any other third-party dependency, anywhere.
+loop and host APIs. The engine remains std-only. The Node runtime uses `libc` on Unix for portable kernel
+file-descriptor interoperability; it does not use `tokio`, `mio`, `rustyline` or `serde`.
 
 ## The engine (`crates/lumen`)
 
@@ -35,7 +35,8 @@ the largest single contributor to binary size (~3 MB of the release binary). Bui
 `--no-default-features` for a small engine: the `Intl` global is absent and the `toLocale*`
 methods degrade to their locale-independent forms, the way engines built without i18n do.
 
-On dependencies and `unsafe`: the workspace stays std-only. `unsafe` is concentrated in the
+On dependencies and `unsafe`: the engine stays std-only; the Node runtime has a narrow Unix
+`libc` dependency for descriptor ABI constants and operations. `unsafe` is concentrated in the
 object heap and its inline-cache fast paths, and in the N-API addon loader's `dlopen` bridge.
 
 **Passes 100% of [tc39/test262](https://github.com/tc39/test262): 53,577/53,577** (including
@@ -57,7 +58,9 @@ On top of that:
   work runs on a std thread pool and completes back over `mpsc`. No epoll/kqueue reactor
   (that would need raw syscalls); the thread-pool-plus-completion model is libuv's own fs
   strategy. Each turn drains microtasks, queued callbacks, due timers, and I/O completions,
-  then blocks until the next event.
+  then blocks until the next event. Native task registration captures the admitting immutable
+  async-context frame and restores it for decoder/callback delivery, so raw I/O callbacks
+  retain AsyncLocalStorage state just as promise continuations do.
 - **Timers** (`lumen-timers`) — `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`/
   `setImmediate`, plus `queueMicrotask`.
 - **`console` and `process`** — streaming `console.*`; `process.argv`/`env`/`platform`/
@@ -68,7 +71,7 @@ On top of that:
   `writeFile` on the thread pool.
 - **Web platform** (`lumen-web`) — a growing slice of the WinterTC Minimum Common API:
   `Event`/`EventTarget`/`CustomEvent`/`AbortController`/`AbortSignal`/`DOMException`,
-  `TextEncoder`/`TextDecoder`, `atob`/`btoa`, `structuredClone`, `URL`/`URLSearchParams`,
+  `TextEncoder`/`TextDecoder` (UTF-8 and WHATWG Windows-1252 labels), `atob`/`btoa`, `structuredClone`, `URL`/`URLSearchParams`,
   `performance.now()`, `crypto.getRandomValues`/`randomUUID`/`subtle.digest` (SHA-256), and
   `fetch`/`Headers`/`Request`/`Response`. See the checklist at the top of
   `crates/lumen-web/src/lib.rs` for what's implemented vs. deferred (streams, `Blob`/
@@ -84,24 +87,115 @@ On top of that:
   (see `crates/lumen-web/src/server.rs`). Cold-start and usage: `examples/hono-app`.
 
 - **Modules — both CommonJS and ESM.** `lumen-cli` picks the module kind the way Node does:
-  `.mjs` is ESM, `.cjs` is CommonJS, `.js` follows the nearest `package.json` `"type"`. ES
-  modules run through the engine's real module graph (linking, top-level `await`); `import`
+  `.mjs` is ESM, `.cjs` is CommonJS, `.js` follows the nearest `package.json` `"type"`.
+  The CommonJS loader also keeps `.cjs` dependencies CommonJS inside `"type": "module"`
+  packages, including callable `module.exports` with attached factory methods (as Jiti uses).
+  ES modules run through the engine's real module graph (linking, top-level `await`); `import`
   specifiers resolve against disk and `node_modules`, `node:` builtins are importable
   (named imports included), and CommonJS packages interop by default export. CommonJS files
   run as the program entry with `require.main === module`.
+  Package metadata reads root fields; exact ESM export subpaths and root exports stay separate.
+  Exact relative package-private `#` imports support ordered `node`/`import`/`default`
+  conditions: unmatched nested conditions continue to later siblings; null blocks resolution.
+  Explicit exports suppress legacy entry fallback. Ordered arrays skip unmatched/null/invalid
+  targets, without retrying later targets for missing files. ESM and CommonJS package subpaths
+  support exact keys and single-star exports with exact-key and most-specific-pattern precedence.
+  Pattern private imports and external private targets remain deferred.
+  `require.resolve.paths()` reports the actual local ancestor lookup directories, returns null
+  for builtins and the require's base directory for relative requests; global lookup directories
+  are not advertised because this resolver does not search them.
 
 - **`node:` compatibility** (`lumen-node`) — a CommonJS `require` with `node_modules`
   resolution and the module wrapper, `package.json` `main`/`exports`, the `node:path`/
   `node:os`/`node:fs` builtins, and `Buffer`, so packages written against the `node:` surface
   run. See the checklist at the top of `crates/lumen-node/src/lib.rs` for the deferred pieces
-  (subpath-pattern exports, the full N-API surface).
+  (full export validation, the full N-API surface).
+
+  `fs.globSync` walks real directories with a scoped cwd, pattern arrays, exclusions and
+  Dirent results. It reuses the path matcher for wildcards, whole-segment globstars,
+  character classes and same-segment brace alternatives; hidden paths require explicit
+  dot segments. Extglobs, braces spanning directories and extra options throw unsupported
+  errors; exclude callbacks currently require a globstar pattern. Symlink directories
+  found during traversal are never descended, while explicit literal prefixes follow the
+  ordinary filesystem lookup. Results use memory proportional to
+  matches plus pending directory entries; no persistent scan cache is retained.
+
+  `worker_threads.MessageChannel` uses native endpoint queues, Node/EventTarget listeners,
+  synchronous `receiveMessageOnPort`, ref/unref/hasRef and close events. Worker messages
+  transfer exclusive MessagePort ownership and share genuine SharedArrayBuffer backing via
+  native capability envelopes; queued messages survive transfer. Fixed-size ordinary ArrayBuffers
+  transfer through owned byte payloads and detach their sender backing only after validation;
+  Buffer/subclass views decode to their intrinsic typed-array kind, preserving offsets and aliases.
+  Numeric wire indexes only
+  access capabilities admitted with that message, and each envelope caps attachments at 1024.
+  Shared Atomics wait/notify checks and waiter registration prevent lost wakeups. Unsupported
+  transfer types, resizable ordinary buffers and growable shared buffers throw. Ref state uses real timer handles;
+  active ports poll at one millisecond, and close/transfer releases those handles. Queues,
+  port handles awaiting explicit close and the engine's existing global shared-buffer registry
+  have no automatic resource quota or finalizer: production resource limits remain necessary.
+
+  String views created by pooled coroutine threads register with their owning driver,
+  so return/drop/compaction uses one registry. Microtask drains defer moving view bytes while
+  a started OS coroutine can retain parked native stack borrows; completion permits compaction.
+  Lazy tagged-template identities also follow the driver, preventing a worker's cached template
+  from aliasing an unrelated driver template. Module namespace metadata pins its object and
+  retires with it during collection. Node `.js` worker entries honor package `type: module`,
+  including suspended top-level await. `URL.parse()` follows the
+  [URL Standard](https://url.spec.whatwg.org/#dom-url-parse), returning a live URL or null while
+  preserving argument coercion errors.
+  `worker_threads.SHARE_ENV` explicitly shares realm-owned environment backing with a child;
+  ordinary workers keep copied state and nested sharing remains within its parent group.
+  It never writes the embedder's OS environment. Each backing caps 16384 keys and 16 MiB;
+  writes/deletions/enumeration and property descriptors see the same synchronized store.
+  Local `structuredClone` transfers Node ports through native attachments, validates before
+  getters and commits ownership only after successful serialization. Local shared-buffer
+  clones retain genuine shared backing. Port polling drains queued messages before peer close.
+
+  Synchronous `module.registerHooks` load hooks preserve CommonJS/ESM filename policy when
+  their format is unspecified. An explicit `module` format and a transformed ESM source run
+  through the module loader with relative imports and live namespace exports intact.
+
+  `node:sqlite` supplies the core synchronous `DatabaseSync`/`StatementSync` API over the real
+  native SQLite backend, including named/positional bindings, BigInt reads, iteration and native
+  transaction state, location and column metadata. Double-quoted string literals and defensive
+  mode use native connection flags. `LUMEN_SQLITE_LIBRARY` explicitly selects a library before the first open;
+  its reported SQLite version is never overridden. Scalar `DatabaseSync.function` registrations
+  retain their native API and JS callback until replacement/close, support BigInt arguments,
+  varargs, deterministic/direct-only flags, and preserve thrown JS values. Registry admission
+  caps at 256 name/arity entries per database; executing statements cannot be reentered or
+  freed, while nested independent queries are supported. Callback engine pointers are bound
+  at each step/exec, including after runtime moves. Authorizers, aggregate functions, sessions,
+  backup, custom limits and enabling/loading extensions are not implemented; explicit unsupported
+  constructor requests are rejected. `enableLoadExtension(false)` disables the real native
+  connection API (or requires native proof that extension loading was compiled out), and
+  databases created without extension permission reject attempts to enable/load extensions. Statements remain native-owned until
+  the database closes; automatic statement finalization is not yet provided.
 
   **Native addons** load too: `require('./addon.node')` dlopens the compiled library and runs its
   N-API registration, resolving the addon's `napi_*` symbols against the lumen executable — the
   same mechanism the `node` binary uses. The N-API surface is implemented from scratch (values,
   properties, functions, callbacks, errors, references, object wrap, classes, promises, buffers,
   typed arrays, async work); the loader reaches `dlopen`/`dlsym` through raw `extern "C"`
-  declarations, so no third-party crate is added. See `examples/native-addon`.
+  declarations. A realm owns one stable environment; calls refresh its engine pointer and
+  delimit temporary handles. Registration and addon callbacks run on the realm driver thread,
+  including calls made from nested pooled async/generator coroutines. Cleanup hooks run in
+  reverse order before library unload. Threadsafe functions queue native payloads for owner-loop
+  delivery with ref/unref and abort/backpressure: at most 128 per realm and 4096 queued payload
+  pointers each. Native producers must join in cleanup; a producer surviving teardown prevents
+  its context finalizer from running. Object-wrap GC finalizers and the full N-API surface remain
+  incomplete; async-work execution is currently inline. Native addons have ambient machine-code
+  authority and require external isolation for untrusted use. See `examples/native-addon`.
+
+  Unix filesystem operations accept addon-opened descriptors through temporary CLOEXEC duplicates;
+  only an explicit close takes ownership of closing the original. Standard streams retain realm
+  routing. Same-runtime Unix subprocesses support a dedicated duplex IPC fd with JSON or
+  structured-clone serialization, separate from stdout; frames cap at 8 MiB. This Lumen wire
+  format is not Node's IPC wire format and is unavailable for foreign executables/Windows.
+
+  `performance.markResourceTiming` records actual caller-supplied fetch measurements and
+  notifies resource observers. Its resource buffer defaults to 250 and caps at 4096 entries;
+  buffer-full event/overflow queue behavior remains unsupported. `process.getActiveResourcesInfo`
+  remains a stub; require normal subprocess exit when checking cleanup.
 
   **`vite build` runs on lumen** (`examples/vite-app`): a full Vite production build, bundling
   through Rollup's native N-API addon, transforming with esbuild's service subprocess, over

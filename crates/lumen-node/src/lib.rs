@@ -9,8 +9,11 @@
 //! - [x] CommonJS `require`: core modules, relative/absolute, `node_modules` walk, the module
 //!   wrapper via `new Function`, `require.cache`/`require.resolve`/`require.main`, `.js`/
 //!   `.json`/`.cjs`
-//! - [x] `package.json` `main`; a practical `exports` subset (string, `"."` key,
-//!   `require`/`node`/`default` conditions) — [ ] subpath patterns, full conditional exports
+//! - [x] `package.json` `main`; exact/single-star exports, ordered
+//!   `require`/`node`/`default` conditions and array targets — [ ] full export validation
+//! - [x] `node:sqlite` core synchronous database/statements over native SQLite, with native
+//!   transaction/location/column metadata and connection flags — [ ] authorizers, user
+//!   functions, sessions, backup, extensions, custom limits, automatic statement finalization
 //! - [x] `node:path` (posix + win32), `node:os`, `node:fs` (sync + callback + `.promises`)
 //! - [x] `Buffer` (from/alloc/concat, utf8·hex·base64·latin1·ascii, slice/write/compare, the
 //!   common read/write-int accessors) — [ ] every codec + accessor variant
@@ -1389,3 +1392,6 @@ fn op_realm_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, V
         .map(|realm| Value::from_string(realm.cwd.to_string_lossy().into_owned()))
         .unwrap_or(Value::Undefined))
 }
+
+/// Finalize native addon producers while the owning realm remains alive.
+pub fn shutdown_native_addons(ctx: &mut Ctx) { napi::shutdown(ctx); }

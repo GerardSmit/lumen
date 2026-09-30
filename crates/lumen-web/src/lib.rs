@@ -6,7 +6,7 @@
 //! - [x] `console`, timers, `queueMicrotask` (lumen-runtime/lumen-timers)
 //! - [x] `DOMException`, `Event`, `CustomEvent`, `EventTarget`, `AbortController`,
 //!   `AbortSignal` (incl. `abort()`/`timeout()` statics) — flat target, no capture phase
-//! - [x] `TextEncoder` / `TextDecoder` (utf-8 only; `fatal` supported)
+//! - [x] `TextEncoder` / `TextDecoder` (UTF-8 and Windows-1252 labels; `fatal` supported)
 //! - [x] `atob` / `btoa`
 //! - [x] `structuredClone` (objects/arrays/cycles, Date, RegExp, Map, Set, Error,
 //!   ArrayBuffer, typed arrays; no transfer list)
@@ -28,7 +28,7 @@
 
 use std::time::Instant;
 
-use lumen_host::{ops, Ctx, Extension, OpState, SpawnHandle, TaskRegistry, Value};
+use lumen_host::{ops, Ctx, Extension, OpState, SpawnHandle, Value};
 
 mod http;
 mod server;
@@ -453,10 +453,7 @@ fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         }
         _ => return Err(ctx.make_error("TypeError", "__http.request expects (resolve, reject)")),
     };
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_http);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_http);
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()

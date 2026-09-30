@@ -102,28 +102,25 @@ class MessagePort extends EventTarget {
     const data = transfer.length ? structuredClone(message, { transfer }) : structuredClone(message);
     const target = this._other;
     if (!target || target._closed) return;
-    setTimeout(() => target._deliver(data), 0);
+    target._queue.push(data);
+    target._schedule();
   }
   start() {
     if (this._started || this._closed) return;
     this._started = true;
-    const queued = this._queue.splice(0);
-    for (const data of queued) {
-      setTimeout(() => this._dispatch(data), 0);
-    }
+    this._schedule();
   }
   close() {
     this._closed = true;
+    this._queue.length = 0;
     if (this._other) this._other._other = null;
     this._other = null;
   }
-  _deliver(data) {
-    if (this._closed) return;
-    if (!this._started) {
-      this._queue.push(data);
-      return;
-    }
-    this._dispatch(data);
+  _schedule() { setTimeout(() => this._flush(), 0); }
+  _flush() {
+    if (this._closed || !this._started || !this._queue.length) return;
+    this._dispatch(this._queue.shift());
+    if (this._queue.length && !this._closed) this._schedule();
   }
   _dispatch(data) {
     if (this._closed) return;

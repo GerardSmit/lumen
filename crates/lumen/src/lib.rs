@@ -515,6 +515,7 @@ pub mod embed {
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
     pub use crate::interpreter::Interp as Ctx;
+    pub use crate::interpreter::SharedBufferHandle;
     /// JS values. Matching/constructing the primitive variants is supported API; object
     /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
@@ -631,7 +632,11 @@ impl Engine {
     /// native frame running that could hold a borrowed string).
     pub fn run_microtasks(&mut self) {
         self.interp.drain_microtasks();
-        crate::lstr::compact_views();
+        // A parked OS coroutine can retain a Rust native stack frame borrowing view
+        // bytes. Its driver is active, but moving those bytes would invalidate the borrow.
+        // This registry count includes both generators and ordinary async coroutines
+        // retained by promise data; no heap scan or generator-only ownership assumption.
+        if crate::lstr::views_can_compact() { crate::lstr::compact_views(); }
     }
 
     /// `(roots, views, root bytes)` of the string-view registry (see `lstr`), for tests and

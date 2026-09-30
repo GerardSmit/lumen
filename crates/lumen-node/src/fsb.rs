@@ -222,7 +222,33 @@ fn insert(file: File) -> i32 {
 }
 
 fn get(fd: i32) -> R<Arc<Entry>> {
-    lock_table().map.get(&fd).cloned().ok_or(UvErr("EBADF"))
+    if let Some(entry) = lock_table().map.get(&fd).cloned() {
+        return Ok(entry);
+    }
+    #[cfg(unix)]
+    {
+        // Native addons may return descriptors opened outside our table. Duplicate through
+        // the kernel rather than assuming ownership of the caller's descriptor. The
+        // temporary entry closes only the duplicate and retains the same open-file offset.
+        if is_std(fd) {
+            return Err(UvErr("EBADF"));
+        }
+        // Atomic CLOEXEC prevents leaking this temporary fd into a concurrently spawned
+        // child. Invalid or already closed descriptors are rejected by the kernel.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        use std::os::unix::io::FromRawFd;
+        // SAFETY: dup returned a fresh owned descriptor; only this File closes it.
+        let file = unsafe { File::from_raw_fd(duplicate) };
+        Ok(Arc::new(Entry {
+            file,
+            lock: Mutex::new(()),
+        }))
+    }
+    #[cfg(not(unix))]
+    Err(UvErr("EBADF"))
 }
 
 fn remove(fd: i32) -> R<()> {
@@ -233,7 +259,19 @@ fn remove(fd: i32) -> R<()> {
             t.free.insert(fd);
             Ok(())
         }
-        None => Err(UvErr("EBADF")),
+        None => {
+            #[cfg(unix)]
+            {
+                // fs.close owns the caller's explicit close request, including addon fds.
+                if unsafe { libc::close(fd) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error().into())
+                }
+            }
+            #[cfg(not(unix))]
+            Err(UvErr("EBADF"))
+        }
     }
 }
 
@@ -1644,4 +1682,63 @@ pub fn op_fs_binding(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Val
         let _ = ctx.set_member(&ns, op.name, f);
     }
     Ok(ns)
+}
+
+
+#[cfg(all(test, unix))]
+mod native_descriptor_tests {
+    use super::*;
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
+
+    #[test]
+    fn native_descriptor_metadata_and_reads_preserve_owner_and_shared_offset() {
+        let path = std::env::temp_dir().join(format!(
+            "lumen-native-fd-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        (&file).write_all(b"native").unwrap();
+        use std::io::{Seek, SeekFrom};
+        (&file).seek(SeekFrom::Start(0)).unwrap();
+        let fd = file.as_raw_fd();
+        assert!(!lock_table().map.contains_key(&fd));
+        let entry = get(fd).ok().expect("borrow native descriptor");
+        assert_ne!(entry.file.as_raw_fd(), fd);
+        assert_ne!(
+            unsafe { libc::fcntl(entry.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(fstat_impl(fd).ok().expect("stat")[8], 6.0);
+        let mut bytes = [0; 3];
+        assert_eq!(read_entry(&entry, &mut bytes, -1.0).ok(), Some(3));
+        assert_eq!(&bytes, b"nat");
+        drop(entry);
+        assert_eq!(file.metadata().unwrap().len(), 6);
+        assert_eq!((&file).read(&mut bytes).unwrap(), 3);
+        assert_eq!(&bytes, b"ive");
+        assert!(!lock_table().map.contains_key(&fd));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_native_close_rejects_invalid_descriptors_and_closes_only_requested_fd() {
+        let file = File::open(std::env::temp_dir()).unwrap();
+        let fd = file.into_raw_fd();
+        assert!(remove(fd).is_ok());
+        // Check immediately: no intervening open may reuse the descriptor number.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(get(-1).err().expect("bad descriptor").0, "EBADF");
+        assert_eq!(remove(-1).err().expect("bad close").0, "EBADF");
+        assert_eq!(get(0).err().expect("realm stdin").0, "EBADF");
+    }
 }

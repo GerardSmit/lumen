@@ -30,11 +30,22 @@ mod console;
 mod esm;
 mod jsx;
 mod process;
+mod process_env;
 pub mod tsconfig;
 mod worker;
+mod ports;
+mod clone_transfer;
 
 pub use console::{describe_error, render_value, ConsoleOut};
 pub use lumen_host::{Completion, Ctx, RealmProcess, Spawner};
+
+/// The package's own module type, excluding identically named nested metadata fields.
+pub fn package_type_from_json(source: &str) -> Option<String> {
+    match tsconfig::parse_jsonc(source).ok()?.get("type")? {
+        tsconfig::Json::Str(value) => Some(value.clone()),
+        _ => None,
+    }
+}
 
 /// A realm that runs inside a host process instead of owning one (an editor running extensions on
 /// a thread). Everything a Node program treats as process-wide comes from here, so the program
@@ -187,6 +198,12 @@ enum StartError {
     Thrown(Value),
 }
 
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        lumen_node::shutdown_native_addons(self.engine.ctx());
+    }
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
@@ -277,11 +294,14 @@ impl Runtime {
                 lumen_timers::extension(),
                 console::extension(),
                 process::extension(),
+                process_env::extension(),
                 lumen_fs::extension(),
                 lumen_web::extension(),
                 // Last: node's glue wraps the fs global, Buffer uses TextEncoder (web), and
                 // require() calls process.cwd().
                 lumen_node::extension(),
+                clone_transfer::extension(),
+                ports::extension(),
                 worker::extension(),
             ],
         );
@@ -721,12 +741,7 @@ impl Runtime {
         callback: Value,
         decode: TaskDecoder,
     ) {
-        let registry = self
-            .engine
-            .ctx()
-            .host_mut::<TaskRegistry>()
-            .expect("installed in new()");
-        let id = registry.register(callback, None, decode);
+        let id = lumen_host::register_task(self.engine.ctx(), callback, None, decode);
         self.pool.spawn_blocking(id, work);
     }
 
@@ -980,10 +995,9 @@ impl Runtime {
         let Some(entry) = entry else {
             return; // cancelled while in flight
         };
-        // A host completion is a fresh turn of the loop: it runs in no async context. Ops that
-        // settle a promise get the right context back through the reaction (captured at `then`
-        // time), which is how `await __op()` inside an `AsyncLocalStorage.run` keeps its store.
-        let outer = self.engine.ctx().set_async_context(Value::Undefined);
+        // Native resources retain their admitting scope even for raw callbacks (sockets,
+        // subprocesses, workers). Promise reactions additionally keep their own scope.
+        let outer = self.engine.ctx().set_async_context(entry.context);
         match (entry.decode)(self.engine.ctx(), done.result) {
             Ok(args) => self.fire(&entry.on_ok, &args),
             Err(e) => match &entry.on_err {

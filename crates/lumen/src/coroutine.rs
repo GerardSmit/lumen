@@ -66,9 +66,17 @@ unsafe impl Send for InterpPtr {}
 pub struct SendBody(pub Box<dyn FnOnce(&mut Interp) -> Suspend>);
 unsafe impl Send for SendBody {}
 
+// Internal handoffs are consumed by ThreadCoro::resume, never exposed as JS suspension.
+enum WorkerMessage {
+    Suspend(Suspend),
+    DriverCall(Box<dyn FnOnce(&mut Interp) -> Result<Value, Value>>),
+}
+// Same exclusive ping-pong ownership as Suspend; no captured value is used concurrently.
+unsafe impl Send for WorkerMessage {}
+
 /// The generator-thread side of the channels, kept in the worker thread's TLS.
 struct Yielder {
-    suspend_tx: Sender<Suspend>,
+    suspend_tx: Sender<WorkerMessage>,
     resume_rx: Receiver<Resume>,
 }
 
@@ -149,11 +157,12 @@ impl Coroutine {
 /// An OS-thread-backed coroutine (a pooled worker runs the body; see [`spawn_coroutine`]).
 pub struct ThreadCoro {
     resume_tx: Sender<Resume>,
-    suspend_rx: Receiver<Suspend>,
+    suspend_rx: Receiver<WorkerMessage>,
     /// Set once the body has finished (Done/Throw); further resumes are no-ops.
     pub done: bool,
     /// Set on the first resume — distinguishes "suspendedStart" from a suspended yield.
     pub started: bool,
+    views: std::sync::Arc<crate::lstr::ViewRegistry>,
     /// Frame-ownership tag: `FnFrame`s pushed while this coroutine's body runs carry this id
     /// (via `Interp::cur_coro`), so a worker-thread panic can evict exactly the dead body's
     /// frames — they may be interleaved with the driver's own frames across suspensions, so a
@@ -169,7 +178,8 @@ impl Drop for ThreadCoro {
     /// them on the worker while the driver keeps running (a collection sweeping dead generators,
     /// say) races the refcounts and the object registry. A started body needs no wait — a
     /// finished one released everything before its last handoff, and a suspended one parks for
-    /// good without touching the heap again (see `park`).
+    /// good without touching the heap again (see `park`). Its native-stack count remains
+    /// retained by that parked job: borrowed string-view bytes still cannot safely move.
     fn drop(&mut self) {
         if !self.started {
             drop(std::mem::replace(&mut self.resume_tx, channel().0));
@@ -192,16 +202,35 @@ impl ThreadCoro {
         if self.done {
             return Suspend::Done(Value::Undefined);
         }
-        self.started = true;
+        if !self.started {
+            self.views.start_native_stack();
+            self.started = true;
+        }
         let (saved_strict, saved_depth, saved_tco) = (i.strict, i.depth, i.tco_ok);
         // The running-native chain links Rust stack records: a body that died mid-native must
         // not leave its (unwound) ones linked.
         let saved_natives = i.native_top;
         let saved_coro = std::mem::replace(&mut i.cur_coro, self.id);
-        // The body mutates `*i` from its worker thread while we block (see `park`).
+        // The body mutates `*i` from its worker thread while we block (see `park_message`).
         std::hint::black_box(&mut *i as *mut Interp);
         let _ = self.resume_tx.send(signal);
-        let s = self.suspend_rx.recv();
+        let s = loop {
+            match self.suspend_rx.recv() {
+                Ok(WorkerMessage::DriverCall(call)) => {
+                    // A nested coroutine may have another coroutine as its driver. Forward
+                    // until the realm's owning native thread executes the call.
+                    let reply = match driver_call(i, call) {
+                        Ok(value) => Resume::Next(value),
+                        Err(error) => Resume::Throw(error),
+                    };
+                    if self.resume_tx.send(reply).is_err() {
+                        break Err(std::sync::mpsc::RecvError);
+                    }
+                }
+                Ok(WorkerMessage::Suspend(s)) => break Ok(s),
+                Err(error) => break Err(error),
+            }
+        };
         i.cur_coro = saved_coro;
         i.strict = saved_strict;
         i.depth = saved_depth;
@@ -211,6 +240,7 @@ impl ThreadCoro {
             Ok(s) => {
                 if matches!(s, Suspend::Done(_) | Suspend::Throw(_)) {
                     self.done = true;
+                    self.views.finish_native_stack();
                 }
                 s
             }
@@ -225,6 +255,7 @@ impl ThreadCoro {
                 i.fn_frames.retain(|f| f.coro != self.id);
                 crate::bytecode::jit::evict_coro_frames(i, self.id);
                 self.done = true;
+                self.views.finish_native_stack();
                 Suspend::Done(Value::Undefined)
             }
         }
@@ -233,7 +264,7 @@ impl ThreadCoro {
 
 /// Park the running coroutine, hand `msg` (a `Yield` or `Await`) to the driver, and block until
 /// resumed. Restores the body's scalar context (which the driver mutated while it ran).
-fn park(i: &mut Interp, msg: Suspend) -> Resume {
+fn park_message(i: &mut Interp, msg: WorkerMessage) -> Resume {
     let (gen_strict, gen_depth, gen_tco) = (i.strict, i.depth, i.tco_ok);
     // The resumer runs arbitrary code in between (it may itself be another generator body).
     let gen_agb = i.in_async_gen_body;
@@ -268,14 +299,24 @@ fn park(i: &mut Interp, msg: Suspend) -> Resume {
     }
 }
 
+/// Run a thread-affine host call on the realm's driver while the coroutine is parked.
+pub(crate) fn driver_call(i: &mut Interp, call: Box<dyn FnOnce(&mut Interp) -> Result<Value, Value>>) -> Result<Value, Value> {
+    if !in_coroutine() { return call(i); }
+    match park_message(i, WorkerMessage::DriverCall(call)) {
+        Resume::Next(value) => Ok(value),
+        Resume::Throw(error) => Err(error),
+        Resume::Return(_) => unreachable!("driver host call received generator return"),
+    }
+}
+
 /// `yield value` — park producing a generator value.
 pub fn coroutine_yield(i: &mut Interp, value: Value) -> Resume {
-    park(i, Suspend::Yield(value))
+    park_message(i, WorkerMessage::Suspend(Suspend::Yield(value)))
 }
 
 /// `await value` — park waiting for `value` to settle.
 pub fn coroutine_await(i: &mut Interp, value: Value) -> Resume {
-    park(i, Suspend::Await(value))
+    park_message(i, WorkerMessage::Suspend(Suspend::Await(value)))
 }
 
 /// Thrown as a JS `Error` when a coroutine cannot start (wasm32 has no OS threads, so
@@ -292,13 +333,15 @@ struct Job {
     /// The driver's heap state: the body allocates into and tombstones out of the same registry
     /// as the interpreter that spawned it (see `value::GcState`).
     gc: std::sync::Arc<crate::value::GcState>,
+    templates: std::sync::Arc<crate::parser::TemplateSites>,
+    views: std::sync::Arc<crate::lstr::ViewRegistry>,
     /// The driver's `Symbol.for` registry and table of registered precompiled chunks (see
     /// `interpreter::sym_for_enter`, `serialize::lazy_enter`).
     syms: DriverTable,
     lazy: DriverTable,
     body: SendBody,
     resume_rx: Receiver<Resume>,
-    suspend_tx: Sender<Suspend>,
+    suspend_tx: Sender<WorkerMessage>,
 }
 
 /// A driver's thread-local table (`Symbol.for` registry, registered precompiled chunks), used by
@@ -354,6 +397,24 @@ impl Drop for RestoreGcState {
     }
 }
 
+struct RestoreViewRegistry(Option<std::sync::Arc<crate::lstr::ViewRegistry>>);
+impl Drop for RestoreViewRegistry {
+    fn drop(&mut self) {
+        if let Some(own) = self.0.take() {
+            crate::lstr::enter_view_registry(own);
+        }
+    }
+}
+
+struct RestoreTemplateSites(Option<std::sync::Arc<crate::parser::TemplateSites>>);
+impl Drop for RestoreTemplateSites {
+    fn drop(&mut self) {
+        if let Some(own) = self.0.take() {
+            crate::parser::enter_template_sites(own);
+        }
+    }
+}
+
 /// Set up this thread's coroutine TLS, run the body from its first drive to completion, and hand
 /// the outcome to the driver. Resets the per-thread coroutine state a reused worker would otherwise
 /// inherit from its previous job.
@@ -361,6 +422,8 @@ fn run_job(job: Job) {
     let Job {
         ptr,
         gc,
+        templates,
+        views,
         syms,
         lazy,
         body,
@@ -376,6 +439,10 @@ fn run_job(job: Job) {
     let SendBody(body) = body;
     // Everything this job drops — the captured closure on an undriven job, the values a body
     // leaves behind — belongs to the driver's registry, so route it there until the job is done.
+    let own_templates = crate::parser::enter_template_sites(templates);
+    let _restore_templates = RestoreTemplateSites(Some(own_templates));
+    let own_views = crate::lstr::enter_view_registry(views);
+    let _restore_views = RestoreViewRegistry(Some(own_views));
     let own_gc = crate::value::enter_gc_state(gc);
     let _restore = RestoreGcState(Some(own_gc));
     // A plain async body never sets ASYNC_GEN, so it must not inherit a previous async-generator
@@ -396,7 +463,7 @@ fn run_job(job: Job) {
             // else runs, then let the driver go.
             YIELDER.with(|y| *y.borrow_mut() = None);
             drop(body);
-            let _ = suspend_tx.send(Suspend::Done(Value::Undefined));
+            let _ = suspend_tx.send(WorkerMessage::Suspend(Suspend::Done(Value::Undefined)));
             return;
         }
         // The first `next(v)`'s argument is unobservable; release it before the body runs, not
@@ -419,7 +486,7 @@ fn run_job(job: Job) {
             Suspend::Throw(e)
         }
     };
-    let _ = suspend_tx.send(outcome);
+    let _ = suspend_tx.send(WorkerMessage::Suspend(outcome));
     // Clear the TLS so the next job starts clean and `in_coroutine()` reads false between jobs.
     YIELDER.with(|y| *y.borrow_mut() = None);
 }
@@ -428,11 +495,13 @@ fn run_job(job: Job) {
 /// `Err` when the platform cannot spawn threads (wasm32).
 pub fn spawn_coroutine(interp: *mut Interp, body: SendBody) -> std::io::Result<Coroutine> {
     let (resume_tx, resume_rx) = channel::<Resume>();
-    let (suspend_tx, suspend_rx) = channel::<Suspend>();
+    let (suspend_tx, suspend_rx) = channel::<WorkerMessage>();
     let worker = get_worker()?;
     let job = Job {
         ptr: InterpPtr(interp),
         gc: crate::value::gc_state_handle(),
+        templates: crate::parser::template_sites_handle(),
+        views: crate::lstr::view_registry_handle(),
         syms: DriverTable(crate::interpreter::sym_for_handle() as *const ()),
         lazy: DriverTable(crate::bytecode::serialize::lazy_handle()),
         body,
@@ -450,6 +519,7 @@ pub fn spawn_coroutine(interp: *mut Interp, body: SendBody) -> std::io::Result<C
         suspend_rx,
         done: false,
         started: false,
+        views: crate::lstr::view_registry_handle(),
         frame: Default::default(),
     }))
 }

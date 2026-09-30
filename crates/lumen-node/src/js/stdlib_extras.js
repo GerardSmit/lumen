@@ -76,6 +76,9 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
         err.code = "ERR_CANNOT_TRANSFER_OBJECT";
         throw err;
       }
+      if ((typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) || globalThis.__lumenPortClone?.isPort(value)) {
+        throw new Error("Shared memory and MessagePort require native message transport");
+      }
       if (this._ref(value)) return;
       if (Array.isArray(value)) {
         this._byte(TAG.ARRAY);
@@ -1089,10 +1092,67 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   let forkDisconnected = false;
   let forkPending = "";
   const isForkChild = () => proc.env && proc.env.LUMEN_FORK_IPC === "1";
+  let dedicatedIpc;
+  function openDedicatedIpc(fd) {
+    const __ipcWire=__builtins.get("child_process")._ipcWire;
+    __child.ipcOpen(fd);
+    const decoder = new (__builtins.get("string_decoder").StringDecoder)("utf8");
+    let pending = "", queuedBytes = 0, closed = false, ending = false;
+    const queue = [];
+    const updateRef = () => {
+      if (closed) return;
+      if (queue.length || forkConnected && (proc.listenerCount("message") || proc.listenerCount("disconnect"))) timer.ref(); else timer.unref();
+    };
+    function close(error) {
+      if (closed) return;
+      closed = true; clearInterval(timer); forkConnected = false; forkDisconnected = true;
+      try { __child.ipcClose(fd); } catch {}
+      for (const item of queue.splice(0)) if (item.callback) item.callback(error || new Error("IPC channel closed"));
+      queuedBytes = 0; proc.emit("disconnect");
+      if (error) proc.emit("error", error);
+    }
+    function flush() {
+      let writes=0;
+      while (queue.length && writes++ < 16) {
+        const item=queue[0], count=__child.ipcWrite(fd,item.bytes.subarray(item.offset,item.offset+65536));
+        if (!count) break;
+        item.offset+=count;queuedBytes-=count;
+        if (item.offset===item.bytes.length) {queue.shift();if(item.callback) queueMicrotask(()=>item.callback(null));}
+      }
+      if (ending && queue.length===0) close(); else updateRef();
+    }
+    function send(bytes, callback) {
+      if (closed || ending) { if(callback) queueMicrotask(()=>callback(new Error("IPC channel closed"))); return false; }
+      if (queuedBytes+bytes.length > __ipcWire.limit) throw new RangeError("IPC queued messages exceed 8 MiB");
+      queue.push({bytes,offset:0,callback});queuedBytes+=bytes.length;
+      try { flush(); } catch(error) {close(error);}
+      return queuedBytes < 65536;
+    }
+    const timer=setInterval(()=>{
+      try {
+        flush(); if(closed) return;
+        for(let reads=0;reads<16;reads++) {
+          const chunk=__child.ipcRead(fd);if(chunk===null) break;
+          if(chunk.length===0) {close();break;}
+          pending+=decoder.write(Buffer.from(chunk));
+          if(pending.length > __ipcWire.limit) throw new RangeError("IPC frame exceeds 8 MiB");
+          for(;;) {
+            const end=pending.indexOf("\n");if(end<0) break;
+            const line=pending.slice(0,end);pending=pending.slice(end+1);
+            if(line==="\x1eLUMEN_IPC_DISCONNECT") {close();return;}
+            proc.emit("message",__ipcWire.decode(line),null);
+          }
+        }
+      } catch(error) {close(error);}
+    },1);
+    timer.unref();
+    return {updateRef,send,disconnect(){send(Buffer.from("\x1eLUMEN_IPC_DISCONNECT\n"));ending=true;flush()}};
+  }
   // Node's channel ref counting: the IPC channel keeps the child alive only while it is
   // connected and 'message' / 'disconnect' listeners exist, so a child that only sends exits.
   const updateForkRef = () => {
     if (!forkIpcStarted) return;
+    if (dedicatedIpc) {dedicatedIpc.updateRef();return;}
     const keep = forkConnected && (proc.listenerCount("message") > 0 || proc.listenerCount("disconnect") > 0);
     if (keep) getStdin().ref(); else getStdin().unref();
   };
@@ -1100,6 +1160,8 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
     if (forkIpcStarted || forkDisconnected || !isForkChild()) return;
     forkIpcStarted = true;
     forkConnected = true;
+    const ipcFd = Number(proc.env.LUMEN_FORK_IPC_FD);
+    if (Number.isInteger(ipcFd) && ipcFd >= 3) {dedicatedIpc=openDedicatedIpc(ipcFd);return;}
     getStdin().on("data", (chunk) => {
       forkPending += Buffer.from(chunk).toString("utf8");
       for (;;) {
@@ -1141,6 +1203,7 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
     startForkIpc();
     if (!forkConnected) return false;
     try {
+      if (dedicatedIpc) return dedicatedIpc.send(__builtins.get("child_process")._ipcWire.encode(message,proc.env.LUMEN_FORK_IPC_MODE === "advanced"),callback);
       proc.stdout.write(IPC_PREFIX + JSON.stringify(message === undefined ? null : message) + "\n");
       if (callback) queueMicrotask(() => callback(null));
       return true;
@@ -1165,6 +1228,7 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   });
   proc.disconnect = function () {
     if (!isForkChild() || forkDisconnected) return;
+    if (dedicatedIpc) {dedicatedIpc.disconnect();return;}
     forkDisconnected = true;
     forkConnected = false;
     updateForkRef();

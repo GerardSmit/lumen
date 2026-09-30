@@ -2099,7 +2099,7 @@ fn esm_prefers_exports_import_over_cjs_main() {
             "exports": { ".": {
                 "import": "./dist/index.js",
                 "require": "./dist/cjs/index.js"
-            } }
+            }, "./dist/named.js": "./dist/named.js" }
         }"#,
     )
     .unwrap();
@@ -2115,7 +2115,7 @@ fn esm_prefers_exports_import_over_cjs_main() {
         "module.exports = { Widget: null, kind: 'cjs' };",
     )
     .unwrap();
-    // A bare *subpath* import of a `.js` file must inherit the package's `type:module`.
+    // An explicitly exported subpath must inherit the package's `type:module`.
     fs::write(
         pkg.join("dist").join("named.js"),
         "export const sub = 'subpath-esm';",

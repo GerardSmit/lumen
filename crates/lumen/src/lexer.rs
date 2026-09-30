@@ -33,6 +33,10 @@ struct Lexer<'a> {
     /// Classification of the most recently closed `}` (`true` = a block). A `/` after a block-closing
     /// `}` begins a regex; after an object-literal-closing `}` it is division.
     last_close_block: bool,
+    /// Parenthesized control headers end at statement position; call/grouping parentheses
+    /// produce values. A following slash must distinguish those before scanning a regex body.
+    paren_stack: Vec<bool>,
+    last_close_control: bool,
     /// One entry per `function` keyword whose body has not opened yet: `true` if the function is an
     /// *expression* (so its body `}` is followed by division), `false` if a *declaration* (its `}`
     /// ends a statement, so a `/` after it is a regex).
@@ -123,6 +127,8 @@ pub(crate) fn tokenize_opts(
         brace_stack: Vec::new(),
         tok_start: 0,
         last_close_block: false,
+        paren_stack: Vec::new(),
+        last_close_control: false,
         pending_fn: Vec::new(),
         pending_class: None,
         ts: opts.ts,
@@ -188,10 +194,11 @@ impl Lexer<'_> {
             // division right after a bare `await`/`yield` *identifier* is vanishingly rare.
             Some(Tok::Ident(w)) => matches!(w.as_str(), "await" | "yield"),
             Some(Tok::Keyword(k)) => !matches!(*k, "this" | "super" | "true" | "false" | "null"),
-            // A `/` after `)` or `]` is division; after `}` it depends on whether the `}` closed a
-            // block (statement → regex) or an object literal (value → division).
+            // Calls/grouping and brackets produce values; a control header ends a statement
+            // prefix. Braces distinguish a block (regex) from an object literal (division).
             Some(Tok::Punct(p)) => match *p {
-                ")" | "]" => false,
+                ")" => self.last_close_control,
+                "]" => false,
                 "}" => self.last_close_block,
                 "!" if self.ts => !self.bang_is_postfix(),
                 _ => true,
@@ -272,6 +279,22 @@ impl Lexer<'_> {
 
     fn push(&mut self, kind: Tok) {
         match &kind {
+            Tok::Punct("(") => {
+                let last = self.out.last().map(|t| &t.kind);
+                let before = self.out.iter().rev().nth(1).map(|t| &t.kind);
+                let control = matches!(
+                    last,
+                    Some(Tok::Keyword(
+                        "if" | "for" | "while" | "with" | "switch" | "catch"
+                    ))
+                ) && !matches!(before, Some(Tok::Punct("." | "?.")))
+                    || matches!(last, Some(Tok::Ident(word)) if word == "await")
+                        && matches!(before, Some(Tok::Keyword("for")));
+                self.paren_stack.push(control);
+            }
+            Tok::Punct(")") => {
+                self.last_close_control = self.paren_stack.pop().unwrap_or(false);
+            }
             Tok::Keyword(k) if *k == "function" => {
                 let is_expr = !self.function_is_declaration();
                 self.pending_fn.push(is_expr);
@@ -573,6 +596,12 @@ impl Lexer<'_> {
     }
 
     fn read_template(&mut self) -> Result<(), LexError> {
+        let parts = self.read_template_parts()?;
+        self.push(Tok::Template(parts));
+        Ok(())
+    }
+
+    fn read_template_parts(&mut self) -> Result<Vec<TplPart>, LexError> {
         self.bump(); // opening backtick
         let mut parts: Vec<TplPart> = Vec::new();
         let mut cooked = String::new();
@@ -653,8 +682,7 @@ impl Lexer<'_> {
                 }
             }
         }
-        self.push(Tok::Template(parts));
-        Ok(())
+        Ok(parts)
     }
 
     /// Read the raw source inside a `${ ... }` hole, returning it verbatim for the parser to
@@ -719,24 +747,13 @@ impl Lexer<'_> {
                     last_sig = Some(')'); // string is a value
                 }
                 Some('`') => {
-                    src.push('`');
-                    // Nested template: copy verbatim to its closing backtick (one level).
-                    loop {
-                        match self.bump() {
-                            None => return Err(self.err("unterminated nested template")),
-                            Some('\\') => {
-                                src.push('\\');
-                                if let Some(c) = self.bump() {
-                                    src.push(c);
-                                }
-                            }
-                            Some('`') => {
-                                src.push('`');
-                                break;
-                            }
-                            Some(c) => src.push(c),
-                        }
-                    }
+                    // Parse nested templates recursively: a substitution can itself contain
+                    // templates, quoted strings and regexes with backticks. Preserve its exact
+                    // source for the substitution parser without adding tokens to this lexer.
+                    let start = self.pos - 1;
+                    self.pos = start;
+                    self.read_template_parts()?;
+                    src.extend(self.chars[start..self.pos].iter());
                     last_sig = Some(')');
                 }
                 Some(c) => {

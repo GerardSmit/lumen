@@ -24,7 +24,9 @@
 //!   finishes it first (no preemption — the engine has no interrupt point). Pending timers are
 //!   dropped on stop. Likewise `process.exit()` in a worker stops at the next loop poll rather
 //!   than instantly.
-//! - **No `SharedArrayBuffer` sharing, no transfer list** (messages are always copied).
+//! - Native capability envelopes share `SharedArrayBuffer` backing and transfer MessagePort
+//!   ownership; fixed-length ordinary ArrayBuffers use byte transport and true sender detachment.
+//!   Other transferable types/resizable buffers remain explicitly unsupported.
 //! - Reuses the full [`Runtime`] per worker (own 4-thread pool). Heavy but correct.
 
 use std::collections::HashMap;
@@ -34,6 +36,7 @@ use std::sync::Arc;
 
 use lumen_host::{ops, CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
 
+use crate::clone_transfer::{self, CloneMessage};
 use crate::Runtime;
 
 /// Node-visible thread ids: the main thread is 0, workers count up from 1 (process-wide, so ids
@@ -43,12 +46,12 @@ static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 // ---- cross-thread messages (all Send) ---------------------------------------------------------
 
 enum ToWorker {
-    Data(Vec<u8>),
+    Data(CloneMessage),
 }
 
 enum ToMain {
     Online,
-    Message(Vec<u8>),
+    Message(CloneMessage),
     Error(String),
     Exited(i32),
 }
@@ -100,11 +103,12 @@ struct WorkerSpec {
     is_node: bool,
     is_eval: bool,
     /// Structured-clone bytes of `{ workerData, argv, env, envData, entry }` (node mode).
-    init: Option<Vec<u8>>,
+    init: Option<CloneMessage>,
     thread_id: u64,
     /// The parent's embedding, when the parent realm runs inside a host process: a worker must
     /// not fall back to the host's own cwd, stdio and process.
     embedding: Option<crate::WorkerEmbedding>,
+    shared_env: Option<crate::process_env::RealmEnvironment>,
 }
 
 /// `__worker.spawn(path, isModule, dispatch, opts?)` → `{ id, threadId }`. Spawns the worker
@@ -135,6 +139,12 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         None
     };
 
+    let shared_env = if is_node && opt_bool(ctx, "shareEnv") {
+        Some(crate::process_env::backing(ctx))
+    } else {
+        None
+    };
+    let init = init.map(|bytes| clone_transfer::take_message(ctx, bytes));
     let (to_worker_tx, to_worker_rx) = channel::<ToWorker>();
     let (to_main_tx, to_main_rx) = channel::<ToMain>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -168,6 +178,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         init,
         thread_id,
         embedding,
+        shared_env,
     };
     let worker_stop = Arc::clone(&stop);
     std::thread::Builder::new()
@@ -194,9 +205,10 @@ pub(crate) fn op_worker_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result
     let bytes = ctx
         .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", "post: expected a Uint8Array"))?;
+    let message = clone_transfer::take_message(ctx, bytes);
     if let Some(w) = registry(ctx).workers.get(&id) {
         if let Some(tx) = &w.to_worker {
-            let _ = tx.send(ToWorker::Data(bytes));
+            let _ = tx.send(ToWorker::Data(message));
         }
     }
     Ok(Value::Undefined)
@@ -253,10 +265,10 @@ fn arm_main_inbox(ctx: &mut Ctx, inbox: MainInbox) {
         Some(w) => (w.dispatch.clone(), w.keep_alive),
         None => return, // already gone
     };
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_main_inbox);
     let reg = ctx
         .host_mut::<TaskRegistry>()
         .expect("task registry installed");
-    let task = reg.register(dispatch, None, decode_main_inbox);
     if !keep_alive {
         reg.set_unref(task);
     }
@@ -291,7 +303,8 @@ fn decode_main_inbox(
     }
     match event {
         ToMain::Online => Ok(vec![Value::from_string("online".into())]),
-        ToMain::Message(bytes) => {
+        ToMain::Message(message) => {
+            let bytes = clone_transfer::install_message(ctx, message);
             let arr = ctx.make_uint8array(&bytes)?;
             Ok(vec![Value::from_string("message".into()), arr])
         }
@@ -327,7 +340,7 @@ struct WorkerSelf {
 /// The worker thread's whole lifecycle: build a realm, run the entry, then pump the loop until
 /// stopped (or, node mode, idle), bridging messages both ways.
 fn run_worker(
-    spec: WorkerSpec,
+    mut spec: WorkerSpec,
     to_worker_rx: Receiver<ToWorker>,
     to_main_tx: Sender<ToMain>,
     stop: Arc<AtomicBool>,
@@ -337,6 +350,9 @@ fn run_worker(
     // otherwise `terminate()` interrupts this realm's JS directly.
     let embedded = spec.embedding.is_some();
     let mut rt = Runtime::new_worker(spec.embedding.clone());
+    if let Some(environment) = spec.shared_env.take() {
+        crate::process_env::bind(rt.engine().ctx(), environment);
+    }
     if !embedded {
         rt.set_worker_interrupt(Arc::clone(&kill));
     }
@@ -360,8 +376,9 @@ fn run_worker(
             "__lumenWorkerThreadId",
             Value::Num(spec.thread_id as f64),
         );
-        if let Some(bytes) = &spec.init {
-            match ctx.make_uint8array(bytes) {
+        if let Some(message) = spec.init.take() {
+            let bytes = clone_transfer::install_message(ctx, message);
+            match ctx.make_uint8array(&bytes) {
                 Ok(arr) => {
                     let _ = ctx.set_member(&global, "__lumenWorkerInit", arr);
                 }
@@ -384,6 +401,10 @@ fn run_worker(
 
     let _ = to_main_tx.send(ToMain::Online);
 
+    // Node worker entries follow the same extension/package scope policy as imports.
+    // Requiring a type:module .js entry would reject a legitimately suspended TLA graph.
+    let is_module = spec.is_module
+        || (spec.is_node && !spec.is_eval && crate::esm::file_is_esm(std::path::Path::new(&spec.entry)));
     let entry_result = if spec.is_eval {
         // `eval: true` — the entry IS the source, run as a classic script (global `require` in
         // scope, like Node's eval workers). Imports resolve against the cwd.
@@ -395,7 +416,7 @@ fn run_worker(
             .map(|d| d.join("[worker eval]").to_string_lossy().into_owned())
             .unwrap_or_else(|_| "[worker eval]".to_string());
         rt.eval_worker_entry(&spec.entry, &base, false)
-    } else if spec.is_node && !spec.is_module {
+    } else if spec.is_node && !is_module {
         // A node CJS worker file is the realm's main module (require.main, __filename, ...).
         rt.start_main(&spec.entry)
     } else {
@@ -403,7 +424,7 @@ fn run_worker(
             Ok(source) => rt.eval_worker_entry(
                 &crate::import_source_text(source),
                 &spec.entry,
-                spec.is_module,
+                is_module,
             ),
             Err(e) => Err(format!("cannot load worker script {}: {e}", spec.entry)),
         }
@@ -442,7 +463,7 @@ struct WorkerInbox {
 }
 
 struct WorkerInboxResult {
-    bytes: Option<Vec<u8>>,
+    bytes: Option<CloneMessage>,
     inbox: Option<WorkerInbox>,
 }
 
@@ -458,10 +479,10 @@ fn arm_worker_inbox(ctx: &mut Ctx, inbox: WorkerInbox) {
         .get::<WorkerSelf>()
         .map(|w| w.keep_alive)
         .unwrap_or(true);
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_worker_inbox);
     let reg = ctx
         .host_mut::<TaskRegistry>()
         .expect("task registry installed");
-    let task = reg.register(dispatch, None, decode_worker_inbox);
     if !keep_alive {
         reg.set_unref(task);
     }
@@ -496,8 +517,9 @@ fn decode_worker_inbox(
         arm_worker_inbox(ctx, inbox);
     }
     match bytes {
-        Some(b) => {
-            let arr = ctx.make_uint8array(&b)?;
+        Some(message) => {
+            let bytes = clone_transfer::install_message(ctx, message);
+            let arr = ctx.make_uint8array(&bytes)?;
             Ok(vec![arr])
         }
         // Channel closed (terminate): fire nothing; the loop exits via the stop flag.
@@ -510,8 +532,9 @@ fn op_wself_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
     let bytes = ctx
         .typed_array_bytes(args.first().unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", "post: expected a Uint8Array"))?;
+    let message = clone_transfer::take_message(ctx, bytes);
     if let Some(w) = ctx.host_mut::<WorkerSelf>() {
-        let _ = w.to_main.send(ToMain::Message(bytes));
+        let _ = w.to_main.send(ToMain::Message(message));
     }
     Ok(Value::Undefined)
 }
@@ -621,7 +644,7 @@ const WORKER_JS: &str = r#"
   Object.defineProperty(globalThis, "__lumenWorkerOps", {
     value: __worker, configurable: true, enumerable: false, writable: false,
   });
-  const serialize = globalThis.__serializeForClone;
+  const serialize = (value, transfer) => globalThis.__serializeForClone(value, transfer, true);
   const deserialize = globalThis.__deserializeClone;
 
   class Worker extends EventTarget {
@@ -688,7 +711,7 @@ const WORKER_SCOPE_JS: &str = r#"
   const closeSelf = __wself.close;
   const report = __wself.report;
   delete globalThis.__wself;
-  const serialize = globalThis.__serializeForClone;
+  const serialize = (value, transfer) => globalThis.__serializeForClone(value, transfer, true);
   const deserialize = globalThis.__deserializeClone;
 
   // The global scope acts as an EventTarget for message/messageerror/error.

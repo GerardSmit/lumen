@@ -274,15 +274,9 @@ fn nearest_package_type_is_module(file: &std::path::Path) -> bool {
     false
 }
 
-/// Minimal scan for `"type": "..."` — the workspace ships no JSON crate.
+/// Share the runtime's root-field lookup; repository metadata can also contain `type`.
 fn json_type_field(json: &str) -> Option<String> {
-    let mut rest = &json[json.find("\"type\"")? + 6..];
-    rest = rest
-        .trim_start()
-        .strip_prefix(':')?
-        .trim_start()
-        .strip_prefix('"')?;
-    rest.find('"').map(|end| rest[..end].to_string())
+    lumen_runtime::package_type_from_json(json)
 }
 
 /// Node flags that tune V8 or Node internals lumen does not have: accepted and ignored so a

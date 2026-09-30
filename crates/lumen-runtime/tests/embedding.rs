@@ -35,10 +35,8 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!(
-            "lumen-embedding-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("lumen-embedding-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir.canonicalize().unwrap())
     }
@@ -79,6 +77,337 @@ struct Ran {
     exit: RealmExit,
     stdout: String,
     stderr: String,
+}
+
+#[test]
+fn cjs_dependency_in_module_package_preserves_callable_exports() {
+    let scratch = Scratch::new("cjs-module-package");
+    scratch.file("package.json", r#"{"type":"module"}"#);
+    scratch.file(
+        "factory.cjs",
+        "function factory() { return 'loaded'; } module.exports = factory; module.exports.create = factory;",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const factory = require('./factory.cjs'); console.log(typeof factory, factory === factory.create, factory.create());",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "function true loaded\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn esm_package_type_is_not_shadowed_by_repository_metadata() {
+    let scratch = Scratch::new("esm-package-metadata");
+    scratch.file(
+        "package.json",
+        r#"{"repository":{"type":"git"},"type":"module"}"#,
+    );
+    scratch.file("helper.js", "export const value = 42;");
+    scratch.file(
+        "entry.mjs",
+        "import { value } from './helper.js'; console.log(value);",
+    );
+    let ran = Realm::default().run(&scratch, "import('./entry.mjs');");
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "42\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn esm_private_imports_use_own_package_and_node_condition() {
+    let scratch = Scratch::new("esm-private-imports");
+    scratch.file("package.json", r##"{"type":"module","imports":{"#plain":"./plain.js","#conditional":{"node":"./node.js","default":"./browser.js"}}}"##);
+    scratch.file("plain.js", "export const plain = 'plain';");
+    scratch.file("node.js", "export const platform = 'node';");
+    scratch.file("browser.js", "throw new Error('wrong condition');");
+    scratch.file("entry.mjs", "import { plain } from '#plain'; import { platform } from '#conditional'; console.log(plain, platform);");
+    let ran = Realm::default().run(&scratch, "import('./entry.mjs');");
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "plain node\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn esm_blocked_root_exports_do_not_load_main_or_index() {
+    let scratch = Scratch::new("esm-blocked-root");
+    std::fs::create_dir_all(scratch.0.join("node_modules/blocked")).unwrap();
+    scratch.file(
+        "node_modules/blocked/package.json",
+        r#"{"type":"module","exports":{".":null},"main":"./legacy.js"}"#,
+    );
+    scratch.file(
+        "node_modules/blocked/legacy.js",
+        "throw new Error('legacy main bypassed exports');",
+    );
+    scratch.file(
+        "node_modules/blocked/index.js",
+        "throw new Error('legacy index bypassed exports');",
+    );
+    scratch.file("entry.mjs", "try { await import('blocked'); console.log('unexpected import'); } catch (error) { console.log(error.name); }");
+    let ran = Realm::default().run(&scratch, "import('./entry.mjs');");
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "TypeError\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn esm_export_arrays_choose_first_target_without_missing_file_fallback() {
+    let scratch = Scratch::new("esm-export-arrays");
+    for name in ["ordered", "missing"] {
+        std::fs::create_dir_all(scratch.0.join("node_modules").join(name)).unwrap();
+    }
+    scratch.file("node_modules/ordered/package.json", r#"{"type":"module","exports":[{"require":"./wrong.cjs"},null,{"import":"./first.js"},"./second.js"]}"#);
+    scratch.file("node_modules/ordered/first.js", "export default 'first';");
+    scratch.file(
+        "node_modules/ordered/second.js",
+        "throw new Error('second array target executed');",
+    );
+    scratch.file(
+        "node_modules/missing/package.json",
+        r#"{"type":"module","exports":["./absent.js","./fallback.js"]}"#,
+    );
+    scratch.file(
+        "node_modules/missing/fallback.js",
+        "throw new Error('missing file triggered array fallback');",
+    );
+    scratch.file("entry.mjs", "import value from 'ordered'; console.log(value); try { await import('missing'); console.log('unexpected import'); } catch (error) { console.log(error.name); }");
+    let ran = Realm::default().run(&scratch, "import('./entry.mjs');");
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "first\nTypeError\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn require_resolves_exact_scoped_exports_before_literal_subpaths() {
+    let scratch = Scratch::new("require-scoped-exports");
+    std::fs::create_dir_all(scratch.0.join("node_modules/@scope/safe/dist")).unwrap();
+    scratch.file("node_modules/@scope/safe/package.json", r#"{"type":"module","exports":{"./temp":{"types":"./dist/temp.d.ts","default":"./dist/temp.js"},"./ordered":{"node":{"import":"./wrong.js"},"default":[null,{"require":"./dist/temp.js"}]},"./blocked":null}}"#);
+    scratch.file(
+        "node_modules/@scope/safe/dist/temp.js",
+        "export const value = 'actual';",
+    );
+    scratch.file(
+        "node_modules/@scope/safe/blocked.js",
+        "throw new Error('blocked subpath bypassed exports');",
+    );
+    let ran = Realm::default().run(&scratch, "console.log(require('@scope/safe/temp').value, require('@scope/safe/ordered').value); try { require('@scope/safe/blocked'); } catch (error) { console.log(error.code); }");
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "actual actual\nMODULE_NOT_FOUND\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn esm_and_require_map_scoped_export_patterns_to_their_own_conditions() {
+    let scratch = Scratch::new("scoped-export-patterns");
+    std::fs::create_dir_all(scratch.0.join("node_modules/@scope/sdk/dist")).unwrap();
+    scratch.file("node_modules/@scope/sdk/package.json", r#"{"type":"module","exports":{"./*":{"import":"./dist/esm-*.js","require":"./dist/cjs-*.cjs"},"./blocked":null}}"#);
+    scratch.file(
+        "node_modules/@scope/sdk/dist/esm-types.js",
+        "export const value = 'esm';",
+    );
+    scratch.file(
+        "node_modules/@scope/sdk/dist/cjs-types.cjs",
+        "exports.value = 'cjs';",
+    );
+    scratch.file(
+        "entry.mjs",
+        "import {value} from '@scope/sdk/types'; console.log(value);",
+    );
+    let ran = Realm::default().run(&scratch, "console.log(require('@scope/sdk/types').value); try { require('@scope/sdk/blocked'); } catch (error) { console.log(error.code); } import('./entry.mjs');");
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "cjs\nMODULE_NOT_FOUND\nesm\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn node_sqlite_uses_real_storage_binding_and_transaction_state() {
+    let scratch = Scratch::new("node-sqlite");
+    let ran = Realm::default().run(&scratch, r#"
+        const { DatabaseSync } = require('node:sqlite');
+        const db = new DatabaseSync('state.sqlite');
+        console.log(db.location() === require('path').resolve('state.sqlite'));
+        db.exec("ATTACH DATABASE ':memory:' AS mem"); console.log(db.location('mem'));
+        db.prepare('ATTACH DATABASE ? AS disk').run(require('path').resolve('attached.sqlite'));
+        console.log(db.location('disk') === require('path').resolve('attached.sqlite'));
+        try { db.prepare('SELECT "unsupported string"').get(); } catch(error) { console.log(error.code); }
+        db.exec('CREATE TABLE values_test(id INTEGER PRIMARY KEY, value TEXT)');
+        const columns = db.prepare('SELECT value AS label, 42 AS calculated FROM values_test').columns();
+        console.log(columns.map(column => column.name).join(','), columns[0].type, columns[1].type);
+        console.log(db.isOpen, db.isTransaction);
+        db.exec('BEGIN'); console.log(db.isTransaction);
+        const insert = db.prepare('INSERT INTO values_test(value) VALUES($value)');
+        console.log(insert.run({value:'retained'}).changes);
+        db.exec('COMMIT'); console.log(db.isTransaction);
+        const large = db.prepare('SELECT 9007199254740993 AS value');
+        large.setReadBigInts(true); console.log(String(large.get().value));
+        db.exec('BEGIN; INSERT INTO values_test(value) VALUES(\'rolled back\'); ROLLBACK');
+        db.close(); console.log(db.isOpen);
+        const reopened = new DatabaseSync('state.sqlite', {readOnly:true});
+        console.log(reopened.prepare('SELECT value FROM values_test').get().value);
+        try { reopened.exec('DELETE FROM values_test'); } catch(error) { console.log(error.code); }
+        reopened.close();
+        const quoted = new DatabaseSync(':memory:', {enableDoubleQuotedStringLiterals:true});
+        console.log(quoted.prepare('SELECT "enabled string" AS value').get().value);
+        quoted.close();
+        try { new DatabaseSync(':memory:', {allowExtension:true}); } catch(error) { console.log(error.message); }
+    "#);
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "true\nnull\ntrue\nERR_SQLITE_ERROR\nlabel,calculated TEXT null\ntrue false\ntrue\n1\nfalse\n9007199254740993\nfalse\nretained\nERR_SQLITE_ERROR\nenabled string\nnode:sqlite extension loading is not implemented\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn text_decoder_windows_1252_matches_node_all_bytes_views_and_streams() {
+    let scratch = Scratch::new("windows1252");
+    let ran = Realm::default().run(&scratch, r#"
+        const assert = require('node:assert/strict');
+        const { createHash } = require('node:crypto');
+        const all = Uint8Array.from({ length: 256 }, (_, i) => i);
+        // Node 26 oracle: all 256 bytes decoded in fatal mode, then hashed as UTF-8.
+        const decoded = new TextDecoder('latin1', { fatal: true }).decode(all);
+        assert.equal(createHash('sha256').update(decoded).digest('hex'), 'cc916e51644a12e8de4ad160910c171a58621ee5dc3a6da6f8b00f8684085f33');
+        for (const label of ['ascii', 'cp1252', 'cp819', 'csisolatin1', 'ibm819', 'iso-8859-1', 'iso-ir-100', 'iso88591', 'l1', 'us-ascii', 'x-cp1252', ' \tWINDOWS-1252\r\n']) {
+            assert.equal(new TextDecoder(label).encoding, 'windows-1252');
+        }
+        const bytes = Uint8Array.from([0x41, 0x80, 0x81, 0x9f, 0x42]);
+        const decoder = new TextDecoder('latin1', { fatal: true });
+        assert.deepEqual([...decoder.decode(new DataView(bytes.buffer, 1, 3))].map(c => c.codePointAt(0)), [0x20ac, 0x81, 0x178]);
+        assert.equal(decoder.decode(bytes.subarray(1, 2), { stream: true }), '\u20ac');
+        assert.equal(decoder.decode(), '');
+        assert.equal(decoder.decode(Uint8Array.of(0xff)), '\u00ff');
+        for (const ignoreBOM of [false, true]) {
+            assert.deepEqual([...new TextDecoder('latin1', { ignoreBOM }).decode(Uint8Array.of(0xef, 0xbb, 0xbf))].map(c => c.charCodeAt(0)), [0xef, 0xbb, 0xbf]);
+        }
+        assert.throws(() => decoder.decode([]), TypeError);
+        assert.throws(() => new TextDecoder('\u00a0latin1'), RangeError);
+        assert.throws(() => new TextDecoder('shift-jis'), RangeError);
+        const utf8 = new TextDecoder(' unicode20utf8 ', { fatal: true });
+        assert.equal(utf8.decode(Uint8Array.of(0xe2, 0x82), { stream: true }), '');
+        assert.equal(utf8.decode(Uint8Array.of(0xac)), '\u20ac');
+        console.log('whatwg windows1252 passed');
+    "#);
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "whatwg windows1252 passed\n");
+}
+
+#[test]
+fn fs_glob_sync_reads_real_scoped_files_and_exclusions() {
+    let scratch = Scratch::new("fs-glob");
+    std::fs::create_dir_all(scratch.0.join("src/nested")).unwrap();
+    std::fs::create_dir_all(scratch.0.join("src/.hidden/.deep")).unwrap();
+    scratch.file("src/main.ts", "main");
+    scratch.file("src/nested/lib.rs", "lib");
+    scratch.file("src/nested/notes.txt", "notes");
+    scratch.file("src/.secret.ts", "secret");
+    scratch.file("src/.hidden/inside.ts", "inside");
+    scratch.file("src/.hidden/.secret.ts", "hidden file");
+    scratch.file("src/.hidden/.deep/deep.ts", "hidden directory");
+    let ran = Realm::default().run(&scratch, r#"
+        const assert = require('node:assert/strict');
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const cwd = path.resolve('src');
+        assert.deepEqual(fs.globSync('**/*.{ts,rs}', { cwd }).sort(), ['main.ts', path.join('nested', 'lib.rs')].sort());
+        assert.deepEqual(fs.globSync(['*.ts', '**/*.ts'], { cwd }), ['main.ts']);
+        assert.deepEqual(fs.globSync('nested/*', { cwd, exclude: ['**/*.txt'] }), [path.join('nested', 'lib.rs')]);
+        assert.deepEqual(fs.globSync('**/*.rs', { cwd, exclude: p => p.includes('nested') }), []);
+        assert.deepEqual(fs.globSync('nested', { cwd }), ['nested']);
+        assert.deepEqual(fs.globSync('nested/**', { cwd }).sort(), ['nested', path.join('nested', 'lib.rs'), path.join('nested', 'notes.txt')].sort());
+        assert.deepEqual(fs.globSync('**', { cwd }).sort(), ['.', 'main.ts', 'nested', path.join('nested', 'lib.rs'), path.join('nested', 'notes.txt')].sort());
+        let excludedType;
+        fs.globSync('**/*.rs', { cwd, withFileTypes: true, exclude: entry => { excludedType = entry instanceof fs.Dirent; return false; } });
+        assert.equal(excludedType, true);
+        assert.throws(() => fs.globSync('*', { cwd, exclude: () => true }), /not supported/);
+        assert.deepEqual(fs.globSync('.hidden/*.ts', { cwd }), [path.join('.hidden', 'inside.ts')]);
+        assert.deepEqual(fs.globSync('.hidden/**/*.ts', { cwd }), [path.join('.hidden', 'inside.ts')]);
+        const [entry] = fs.globSync('nested/*.rs', { cwd, withFileTypes: true });
+        assert.equal(entry.name, 'lib.rs');
+        assert.equal(entry.isFile(), true);
+        assert.equal(entry.parentPath, path.join(cwd, 'nested'));
+        assert.deepEqual(fs.globSync(path.join(cwd, '*.ts')), [path.join(cwd, 'main.ts')]);
+        assert.throws(() => fs.globSync('@(a|b)'), /not supported/);
+        assert.throws(() => fs.globSync('*', { followSymlinks: true }), /not supported/);
+        assert.equal(path.matchesGlob('.secret.ts', '*.ts'), false);
+        assert.equal(path.matchesGlob('main.ts', '*.{ts,rs}'), true);
+        if (process.platform !== 'win32') {
+            fs.symlinkSync('nested', path.join(cwd, 'link'), 'dir');
+            fs.symlinkSync('..', path.join(cwd, 'nested', 'loop'), 'dir');
+            assert.deepEqual(fs.globSync('**/*.rs', { cwd }), [path.join('nested', 'lib.rs')]);
+            assert.deepEqual(fs.globSync('link/*.rs', { cwd }), [path.join('link', 'lib.rs')]);
+            const [link] = fs.globSync('link/**', { cwd, withFileTypes: true });
+            assert.equal(link.isSymbolicLink(), true);
+        }
+        console.log('real fs glob passed');
+    "#);
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "real fs glob passed\n");
+}
+
+#[test]
+fn require_load_hooks_preserve_esm_source_and_filename_policy() {
+    let scratch = Scratch::new("hook-esm");
+    std::fs::create_dir_all(scratch.0.join("esm")).unwrap();
+    scratch.file("esm/package.json", r#"{"type":"module"}"#);
+    scratch.file("esm/index.js", "export const value = 'original';");
+    scratch.file("esm/dep.mjs", "export const dep = 'dependency';");
+    scratch.file("esm/kept.cjs", "module.exports = 'kept-commonjs';");
+    scratch.file("untyped.js", "export const value = 'detected';");
+    scratch.file(
+        "explicit.cjs",
+        "throw new Error('original must not execute');",
+    );
+    let ran = Realm::default().run(&scratch, r#"
+        const assert = require('node:assert/strict');
+        const { registerHooks } = require('node:module');
+        const hooks = registerHooks({ load(url, context, next) {
+            const loaded = next(url, context);
+            if (url.endsWith('/esm/index.js')) return { ...loaded,
+                source: "import { dep } from './dep.mjs'; export const value = dep + '-transformed';" };
+            if (url.endsWith('/explicit.cjs')) return { ...loaded, format: 'module',
+                source: "export const value = 'explicit-module';" };
+            return loaded;
+        }});
+        assert.equal(require('./esm/index.js').value, 'dependency-transformed');
+        assert.equal(require('./esm/kept.cjs'), 'kept-commonjs');
+        assert.equal(require('./untyped.js').value, 'detected');
+        assert.equal(require('./explicit.cjs').value, 'explicit-module');
+        hooks.deregister();
+        console.log('hook esm source passed');
+    "#);
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "hook esm source passed\n");
+}
+
+#[test]
+fn require_resolve_paths_reports_real_local_lookup_directories() {
+    let scratch = Scratch::new("require-lookup-paths");
+    std::fs::create_dir_all(scratch.0.join("nested/node_modules/pkg")).unwrap();
+    scratch.file(
+        "nested/node_modules/pkg/index.js",
+        "module.exports = 'resolved';",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        r#"
+        const path = require('node:path'), Module = require('node:module');
+        const base = path.resolve('nested');
+        const scoped = Module.createRequire(path.join(base, 'entry.cjs'));
+        console.log(scoped.resolve.paths('node:fs'), scoped.resolve.paths('fs'));
+        console.log(scoped.resolve.paths('./relative')[0] === base);
+        const lookup = scoped.resolve.paths('pkg');
+        console.log(JSON.stringify(lookup) === JSON.stringify(Module._nodeModulePaths(base)));
+        console.log(scoped.resolve('pkg') === path.join(lookup[0], 'pkg/index.js'), scoped('pkg'));
+        console.log(scoped.resolve.paths('/absolute')[0] === lookup[0]);
+        try { scoped.resolve.paths(42); } catch(error) { console.log(error.name); }
+    "#,
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(
+        ran.stdout,
+        "null null\ntrue\ntrue\ntrue resolved\ntrue\nTypeError\n"
+    );
+    std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
 impl Realm {
@@ -148,7 +477,10 @@ fn exit_ends_the_realm_not_the_host() {
     );
     assert_eq!(ran.exit, RealmExit::Exited(3));
     assert_eq!(ran.stdout, "before\n");
-    assert_eq!(ran.stderr, "", "the termination is not reported as an error");
+    assert_eq!(
+        ran.stderr, "",
+        "the termination is not reported as an error"
+    );
 }
 
 #[test]
@@ -284,8 +616,11 @@ fn a_program_runs_from_memory_and_requires_beside_its_path() {
          console.log(require('./helper.cjs'), path.basename(__filename), require.main === module);",
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert_eq!(ran.stdout, "helped bundle.cjs true
-");
+    assert_eq!(
+        ran.stdout,
+        "helped bundle.cjs true
+"
+    );
     assert!(!scratch.0.join("bundle.cjs").exists());
 }
 
@@ -346,11 +681,106 @@ fn subprocesses_start_through_the_spawner_in_the_realm_cwd() {
     .run(&scratch, &script);
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
     assert_eq!(spawner.0.load(Ordering::SeqCst), 1);
-    let printed = ran.stdout.trim().strip_prefix("0 ").unwrap_or("").to_string();
+    let printed = ran
+        .stdout
+        .trim()
+        .strip_prefix("0 ")
+        .unwrap_or("")
+        .to_string();
     assert_eq!(
         Path::new(&printed).canonicalize().ok(),
         Some(scratch.0.clone()),
         "stdout: {}",
         ran.stdout
     );
+}
+
+#[test]
+fn node_sqlite_disables_native_extension_loading_and_enforces_constructor_policy() {
+    let mut runtime = lumen_runtime::Runtime::new();
+    let source = r#"
+ const assert=require('node:assert/strict');const {DatabaseSync}=require('node:sqlite');
+ const options={allowExtension:false};const db=new DatabaseSync(':memory:',options);
+ options.allowExtension=true;
+ assert.equal(db.enableLoadExtension(false),undefined);
+ assert.throws(()=>db.enableLoadExtension(true),{code:'ERR_INVALID_STATE'});
+ assert.throws(()=>db.enableLoadExtension(0),{code:'ERR_INVALID_ARG_TYPE'});
+ assert.throws(()=>db.loadExtension('/does/not/exist'),{code:'ERR_INVALID_STATE'});
+ assert.throws(()=>db.prepare("SELECT load_extension('/does/not/exist')").get(),/not authorized|no such function/);
+ db.close();assert.throws(()=>db.enableLoadExtension(false),/not open/);
+ assert.throws(()=>new DatabaseSync(':memory:',{allowExtension:true}),/not implemented/);
+ "#;
+    match runtime.eval(source).expect("source parses") {
+        lumen_runtime::Completion::Value(_) => {}
+        lumen_runtime::Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+}
+
+#[test]
+fn node_worker_uses_package_module_type_for_js_entry_with_top_level_await() {
+    let scratch = Scratch::new("worker-package-module");
+    scratch.file("package.json", r#"{"type":"module"}"#);
+    scratch.file("worker.js", "import {parentPort} from 'node:worker_threads'; const answer = await new Promise(resolve=>setTimeout(()=>resolve(42), 10)); parentPort.postMessage(answer); parentPort.close();");
+    let ran = Realm::default().run(&scratch, "const {Worker}=require('node:worker_threads'); const worker=new Worker('./worker.js'); worker.on('message', value=>console.log(value)); worker.on('error', error=>{console.error(error.message);process.exitCode=1;});");
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "42\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn share_env_exchanges_live_writes_deletions_and_descriptors_without_host_mutation() {
+    let scratch = Scratch::new("share-env-live");
+    let key = "LUMEN_EMBEDDING_SHARE_ENV_TEST";
+    let host_before = std::env::var_os(key);
+    let mut realm = Realm::default();
+    realm.env = vec![(key.into(), "initial".into()), ("DELETE_ME".into(), "old".into())];
+    let ran = realm.run(&scratch, r#"
+        const {Worker,SHARE_ENV}=require('node:worker_threads');
+        const kept=process.env;
+        const worker=new Worker(`
+            const {parentPort}=require('node:worker_threads');
+            parentPort.on('message',()=>{
+                const read=process.env.LUMEN_EMBEDDING_SHARE_ENV_TEST;
+                process.env.LUMEN_EMBEDDING_SHARE_ENV_TEST=42;
+                delete process.env.DELETE_ME;
+                process.env.FROM_WORKER='new';
+                parentPort.postMessage(read);
+                parentPort.close();
+            });
+        `,{eval:true,env:SHARE_ENV});
+        worker.on('online',()=>{process.env.LUMEN_EMBEDDING_SHARE_ENV_TEST='updated';worker.postMessage('go');});
+        worker.on('message',read=>console.log(JSON.stringify([
+            read,kept.LUMEN_EMBEDDING_SHARE_ENV_TEST,typeof kept.LUMEN_EMBEDDING_SHARE_ENV_TEST,
+            !('DELETE_ME' in kept),Object.keys(kept).includes('FROM_WORKER'),
+            Object.getOwnPropertyDescriptor(kept,'FROM_WORKER').value
+        ])));
+        worker.on('error',e=>{console.error(e.stack);process.exitCode=1;});
+    "#);
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "[\"updated\",\"42\",\"string\",true,true,\"new\"]\n");
+    assert_eq!(std::env::var_os(key), host_before);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn copied_worker_environment_remains_isolated_and_nested_sharing_stays_in_its_group() {
+    let scratch = Scratch::new("share-env-nested");
+    let mut realm = Realm::default();
+    realm.env = vec![("GROUP".into(), "root".into())];
+    let ran = realm.run(&scratch, r#"
+        const {Worker}=require('node:worker_threads');
+        const child=new Worker(`
+            const {Worker,SHARE_ENV,parentPort}=require('node:worker_threads');
+            process.env.GROUP='child';
+            const nested=new Worker("process.env.GROUP='nested';",{eval:true,env:SHARE_ENV});
+            nested.on('exit',()=>{parentPort.postMessage([process.env.GROUP,process.env.ONLY_ROOT===undefined]);parentPort.close();});
+            nested.on('error',e=>{throw e;});
+        `,{eval:true,env:{GROUP:'copy'}});
+        process.env.ONLY_ROOT='root-only';
+        child.on('message',value=>console.log(JSON.stringify([value,process.env.GROUP])));
+        child.on('error',e=>{console.error(e.stack);process.exitCode=1;});
+    "#);
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "[[\"nested\",true],\"root\"]\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
 }

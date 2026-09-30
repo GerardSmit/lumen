@@ -9,6 +9,22 @@ const IPC_PREFIX = "\x1eLUMEN_IPC ";
 // The child's `process.disconnect()` closes its end of the channel with this control line.
 const IPC_DISCONNECT = "\x1eLUMEN_IPC_DISCONNECT";
 
+const __ipcWire = {
+  limit: 8 * 1024 * 1024,
+  encode(value, advanced) {
+    const text = advanced ? "\x1eLUMEN_IPC_ADV " + __builtins.get("v8").serialize(value).toString("base64")
+      : IPC_PREFIX + JSON.stringify(value === undefined ? null : value);
+    const bytes = Buffer.from(text + "\n");
+    if (bytes.length > this.limit) throw new RangeError("IPC frame exceeds 8 MiB");
+    return bytes;
+  },
+  decode(line) {
+    if (line.startsWith("\x1eLUMEN_IPC_ADV ")) return __builtins.get("v8").deserialize(Buffer.from(line.slice(15), "base64"));
+    if (line.startsWith(IPC_PREFIX)) return JSON.parse(line.slice(IPC_PREFIX.length));
+    throw new Error("Invalid Lumen IPC frame");
+  },
+};
+
 // Normalize the stdio option to a list of "pipe" | "inherit" | "ignore" — three entries for the
 // standard fds, plus one per extra slot (`stdio[3]`...), which only "pipe" and "ignore" support.
 function normalizeStdio(stdio) {
@@ -310,7 +326,7 @@ class ChildProcess extends EventEmitter {
       else throw error;
       return false;
     }
-    if (!this.connected || !this.stdin) {
+    if (!this.connected || !(this._ipcPipe || this.stdin)) {
       const error = new Error("IPC channel is closed");
       error.code = "ERR_IPC_CHANNEL_CLOSED";
       if (callback) queueMicrotask(() => callback(error));
@@ -319,19 +335,19 @@ class ChildProcess extends EventEmitter {
     }
     let frame;
     try {
-      frame = IPC_PREFIX + JSON.stringify(message === undefined ? null : message) + "\n";
+      frame = __ipcWire.encode(message, this._ipcAdvanced);
     } catch (error) {
       if (callback) queueMicrotask(() => callback(error));
       else throw error;
       return false;
     }
-    this.stdin.write(frame, callback);
-    return true;
+    return (this._ipcPipe || this.stdin).write(frame, callback);
   }
   disconnect() {
     if (!this.connected) return;
     this.connected = false;
-    if (this.stdin) this.stdin.end();
+    if (this._ipcPipe) this._ipcPipe.end(Buffer.from(IPC_DISCONNECT + "\n"));
+    else if (this.stdin) this.stdin.end();
     queueMicrotask(() => this.emit("disconnect"));
   }
   // The child closed the channel (process.disconnect(), or its stdout ended / it exited).
@@ -351,11 +367,19 @@ function spawn(command, args, options) {
   options = options || {};
   const { file, args: argv, verbatim } = resolveCommand(command, args, options);
   const stdio = normalizeStdio(options.stdio);
+  const ipcFd = Array.isArray(options.stdio) ? options.stdio.indexOf("ipc") : -1;
+  if (ipcFd >= 0) {
+    if (ipcFd < 3 || options.stdio.lastIndexOf("ipc") !== ipcFd) throw new TypeError("Exactly one IPC slot of at least fd 3 is required");
+    if (file !== process.execPath || process.platform === "win32") throw new Error("Dedicated IPC requires a Lumen subprocess on Unix");
+    stdio[ipcFd] = "pipe";
+  }
+  const childEnv = { ...(options.env || process.env) };
+  if (ipcFd >= 0) Object.assign(childEnv, { LUMEN_FORK_IPC: "1", LUMEN_FORK_IPC_FD: String(ipcFd), LUMEN_FORK_IPC_MODE: options.serialization || "json" });
   let info;
   try {
     // Node hands a child `process.env` when no env is given: the live object, not the OS table
     // (they differ once the program edits it, and always for a realm embedded in a host).
-    info = __child.spawn(file, argv, options.cwd, envPairs(options.env || process.env), stdio, verbatim);
+    info = __child.spawn(file, argv, options.cwd, envPairs(childEnv), stdio, verbatim);
   } catch (e) {
     const error = spawnError(e, "spawn", file, argv);
     if (!error) throw e;
@@ -367,6 +391,24 @@ function spawn(command, args, options) {
     : undefined;
   if (onIpcMessage) onIpcMessage.close = () => child._ipcClosed();
   child = new ChildProcess(info.childId, info.pid, stdio, onIpcMessage);
+  if (ipcFd >= 0) {
+    const pipe = child.stdio[ipcFd]; child.stdio[ipcFd] = null;
+    child._ipcPipe = pipe; child._ipcAdvanced = options.serialization === "advanced";
+    child.connected = true;
+    let pending = "";
+    const decoder = new (__builtins.get("string_decoder").StringDecoder)("utf8");
+    pipe.on("data", chunk => {
+      pending += decoder.write(Buffer.from(chunk));
+      if (pending.length > __ipcWire.limit) {pipe.destroy(new RangeError("IPC frame exceeds 8 MiB")); return;}
+      for (;;) {
+        const end=pending.indexOf("\n");if(end<0) break;
+        const line=pending.slice(0,end);pending=pending.slice(end+1);
+        if(line===IPC_DISCONNECT) { child._ipcClosed(); pipe.end(); break; }
+        child.emit("message", __ipcWire.decode(line), null);
+      }
+    });
+    pipe.on("end",()=>child._ipcClosed());pipe.on("error",error=>{child._ipcClosed();child.emit("error",error)});
+  }
   const relayTargets = stdioRelayTargets(options.stdio);
   if (relayTargets) relayStdio(child, relayTargets);
   if (options.signal !== undefined && options.signal !== null) abortChildOnSignal(child, options.signal, options.killSignal);
@@ -609,5 +651,6 @@ __builtins.set("child_process", {
   spawnSync,
   fork,
   _forkChild,
+  _ipcWire: __ipcWire,
   ChildProcess,
 });

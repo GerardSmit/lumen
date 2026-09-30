@@ -1,4 +1,4 @@
-// TextEncoder/TextDecoder over the native utf-8 ops, base64 globals, structuredClone.
+// TextEncoder/TextDecoder: native UTF-8 and WHATWG Windows-1252, base64 globals, structuredClone.
 
 class TextEncoder {
   get encoding() {
@@ -61,14 +61,30 @@ class TextEncoder {
   }
 }
 
+// Encoding Standard labels and single-byte index. All 256 Windows-1252 bytes have
+// mappings, including C1 control bytes 81/8D/8F/90/9D; fatal mode does not reject them.
+const WINDOWS_1252_LABELS = new Set([
+  "ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819", "iso-8859-1",
+  "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "l1",
+  "latin1", "us-ascii", "windows-1252", "x-cp1252",
+]);
+const WINDOWS_1252_C1 = [
+  0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021,
+  0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f,
+  0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+  0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178,
+];
 class TextDecoder {
   constructor(label = "utf-8", options = {}) {
-    const l = String(label).toLowerCase();
-    if (l !== "utf-8" && l !== "utf8" && l !== "unicode-1-1-utf-8") {
-      throw new RangeError(`TextDecoder: unsupported encoding '${label}' (utf-8 only for now)`);
+    const l = String(label).replace(/^[\x09\x0a\x0c\x0d\x20]+|[\x09\x0a\x0c\x0d\x20]+$/g, "").toLowerCase();
+    if (["utf-8", "utf8", "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "x-unicode20utf8"].includes(l)) {
+      this.encoding = "utf-8";
+    } else if (WINDOWS_1252_LABELS.has(l)) {
+      this.encoding = "windows-1252";
+    } else {
+      throw new RangeError(`TextDecoder: unsupported encoding '${label}' (UTF-8 and Windows-1252 are supported)`);
     }
     options = options && typeof options === "object" ? options : {};
-    this.encoding = "utf-8";
     this.fatal = !!options.fatal;
     this.ignoreBOM = !!options.ignoreBOM;
     this._pending = null; // an incomplete trailing sequence held back by a streaming decode
@@ -78,9 +94,18 @@ class TextDecoder {
     const stream = !!(options && typeof options === "object" && options.stream);
     let bytes;
     if (input === undefined) bytes = new Uint8Array(0);
-    else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+    else if (input instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && input instanceof SharedArrayBuffer)) bytes = new Uint8Array(input);
     else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-    else bytes = input;
+    else throw new TypeError("TextDecoder.decode expects a BufferSource");
+    if (this.encoding === "windows-1252") {
+      let result = "";
+      for (let j = 0; j < bytes.length; j++) {
+        const byte = bytes[j];
+        result += String.fromCharCode(byte >= 0x80 && byte <= 0x9f ? WINDOWS_1252_C1[byte - 0x80] : byte);
+      }
+      // A single-byte encoding has no pending multibyte tail or BOM to remove.
+      return result;
+    }
     if (this._pending !== null) {
       const joined = new Uint8Array(this._pending.length + bytes.length);
       joined.set(this._pending);
@@ -192,6 +217,12 @@ function structuredClone(value, options) {
       transfer = [...options.transfer];
     }
   }
+  // Native Node ports need ownership attachments even for an in-realm clone. All transfer
+  // validation and getters run before the native serializer commits detachment.
+  if (globalThis.__cloneTransfer && transfer.some(t => globalThis.__lumenPortClone?.isPort(t))) {
+    const bytes=globalThis.__serializeForClone(value, transfer, true);
+    return globalThis.__deserializeClone(globalThis.__cloneTransfer.local(bytes));
+  }
   const seen = new Map();
   for (const t of transfer) {
     if (!cloneIsArrayBuffer(t)) throw cloneDataCloneError("Found invalid value in transferList.");
@@ -204,7 +235,12 @@ function structuredClone(value, options) {
     if (typeof v === "symbol") throw cloneDataCloneError(`${String(v)} could not be cloned.`);
     if (v === null || typeof v !== "object") return v;
     if (seen.has(v)) return seen.get(v);
+    if (globalThis.__lumenPortClone?.isPort(v)) throw cloneDataCloneError("MessagePort must be listed in transferList.");
     let out;
+    if (globalThis.__cloneTransfer && (out=globalThis.__cloneTransfer.cloneShared(v)) !== undefined) {
+      seen.set(v,out);
+      return out;
+    }
     if (cloneBrand(Date.prototype.getTime, v)) {
       out = new Date(Date.prototype.getTime.call(v));
     } else if (cloneBrand(Boolean.prototype.valueOf, v)) {

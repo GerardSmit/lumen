@@ -25,7 +25,8 @@
 //! A root whose only references are its views, and whose views cover little of it, is
 //! *compacted* ([`compact_views`]): the bytes the views use are copied into one tight buffer,
 //! the views are repointed at it, and the root is freed. Every root with views is in a
-//! per-thread registry with the list of its views for this. Compaction moves view bytes, so it
+//! driver-owned registry with the list of its views for this (coroutine threads use their
+//! driver’s registry under the exclusive handoff). Compaction moves view bytes, so it
 //! runs only where nothing can hold a `&str` borrowed from one: between host tasks.
 
 use std::alloc::{alloc, dealloc, Layout};
@@ -115,9 +116,43 @@ fn views_on() -> bool {
     }
 }
 
+/// Driver-owned view registry shared only under coroutine's exclusive ping-pong handoff.
+/// Views can be created on a pooled coroutine thread and dropped/compacted by its driver.
+#[derive(Default)]
+pub(crate) struct ViewRegistry {
+    roots: std::cell::RefCell<crate::fasthash::FastMap<usize, Root>>,
+    native_stacks: Cell<usize>,
+}
+impl ViewRegistry {
+    pub(crate) fn start_native_stack(&self) {
+        self.native_stacks.set(self.native_stacks.get() + 1);
+    }
+    pub(crate) fn finish_native_stack(&self) {
+        self.native_stacks.set(self.native_stacks.get() - 1);
+    }
+}
+pub(crate) fn views_can_compact() -> bool {
+    ROOTS.with(|state| state.borrow().native_stacks.get() == 0)
+}
+// Like value::GcState, access is exclusive because the driver parks while a coroutine runs.
+unsafe impl Send for ViewRegistry {}
+unsafe impl Sync for ViewRegistry {}
 thread_local! {
-    static ROOTS: std::cell::RefCell<crate::fasthash::FastMap<usize, Root>> =
-        std::cell::RefCell::new(Default::default());
+    static ROOTS: std::cell::RefCell<std::sync::Arc<ViewRegistry>> =
+        std::cell::RefCell::new(std::sync::Arc::new(ViewRegistry::default()));
+}
+pub(crate) fn view_registry_handle() -> std::sync::Arc<ViewRegistry> {
+    ROOTS.with(|state| state.borrow().clone())
+}
+pub(crate) fn enter_view_registry(
+    state: std::sync::Arc<ViewRegistry>,
+) -> std::sync::Arc<ViewRegistry> {
+    ROOTS.with(|current| std::mem::replace(&mut *current.borrow_mut(), state))
+}
+fn with_roots<R>(
+    f: impl FnOnce(&std::cell::RefCell<crate::fasthash::FastMap<usize, Root>>) -> R,
+) -> R {
+    ROOTS.with(|state| f(&state.borrow().roots))
 }
 
 fn layout(cap: u32) -> Layout {
@@ -239,11 +274,12 @@ impl LStr {
         unsafe {
             let v = alloc(Layout::new::<ViewHdr>()) as *mut ViewHdr;
             let v = NonNull::new(v).expect("allocation failed");
-            let slot = ROOTS.with(|r| {
+            let slot = with_roots(|r| {
                 let mut r = r.borrow_mut();
-                let e = r
-                    .entry(root.as_ptr() as usize)
-                    .or_insert_with(|| Root { views: Vec::new(), bytes: 0 });
+                let e = r.entry(root.as_ptr() as usize).or_insert_with(|| Root {
+                    views: Vec::new(),
+                    bytes: 0,
+                });
                 e.views.push(v);
                 e.bytes += piece.len();
                 (e.views.len() - 1) as u32
@@ -273,7 +309,7 @@ impl LStr {
     unsafe fn drop_view(&mut self) {
         let v = self.p.as_ptr() as *mut ViewHdr;
         let (root, slot, len) = ((*v).root, (*v).slot as usize, (*v).h.len.get() as usize);
-        ROOTS.with(|r| {
+        with_roots(|r| {
             let mut r = r.borrow_mut();
             let key = root.as_ptr() as usize;
             if let Some(e) = r.get_mut(&key) {
@@ -483,7 +519,7 @@ impl From<LStr> for std::rc::Rc<str> {
 /// a view is alive (it runs between host tasks).
 #[cfg_attr(not(feature = "embed"), allow(dead_code))]
 pub fn compact_views() -> usize {
-    let keys: Vec<usize> = ROOTS.with(|r| {
+    let keys: Vec<usize> = with_roots(|r| {
         r.borrow()
             .iter()
             .filter(|(&k, e)| unsafe {
@@ -495,7 +531,7 @@ pub fn compact_views() -> usize {
     });
     let mut freed = 0;
     for k in keys {
-        let Some(mut e) = ROOTS.with(|r| r.borrow_mut().remove(&k)) else {
+        let Some(mut e) = with_roots(|r| r.borrow_mut().remove(&k)) else {
             continue;
         };
         unsafe {
@@ -533,7 +569,8 @@ pub fn compact_views() -> usize {
             }
             let nh = new.hdr();
             nh.len.set(total as u32);
-            nh.cap.set(total as u32 | ((*old).cap.get() & ASCII_HINT) | ROOT);
+            nh.cap
+                .set(total as u32 | ((*old).cap.get() & ASCII_HINT) | ROOT);
             nh.strong.set(e.views.len());
             for v in &e.views {
                 let at = off(v);
@@ -546,8 +583,12 @@ pub fn compact_views() -> usize {
             let nk = new.p.as_ptr() as usize;
             std::mem::forget(new);
             e.views.shrink_to_fit();
-            e.bytes = e.views.iter().map(|v| (*v.as_ptr()).h.len.get() as usize).sum();
-            ROOTS.with(|r| r.borrow_mut().insert(nk, e));
+            e.bytes = e
+                .views
+                .iter()
+                .map(|v| (*v.as_ptr()).h.len.get() as usize)
+                .sum();
+            with_roots(|r| r.borrow_mut().insert(nk, e));
         }
     }
     freed
@@ -556,7 +597,7 @@ pub fn compact_views() -> usize {
 /// `(roots, views, root bytes)` of the view registry (memory accounting and tests).
 #[cfg_attr(not(feature = "embed"), allow(dead_code))]
 pub fn view_stats() -> (usize, usize, usize) {
-    ROOTS.with(|r| {
+    with_roots(|r| {
         let r = r.borrow();
         let views = r.values().map(|e| e.views.len()).sum();
         let bytes = r
@@ -573,7 +614,9 @@ mod tests {
 
     #[test]
     fn views_share_and_compact() {
-        let text: String = (0..200).map(|i| format!("line number {i:04} of the long list é\n")).collect();
+        let text: String = (0..200)
+            .map(|i| format!("line number {i:04} of the long list é\n"))
+            .collect();
         let root = LStr::from(text.as_str());
         let lines: Vec<LStr> = root.split('\n').map(|l| root.sub(l)).collect();
         assert!(lines[3].is_view() && &*lines[3] == "line number 0003 of the long list é");

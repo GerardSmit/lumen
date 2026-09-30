@@ -7,12 +7,11 @@
 // with the exit code), worker.ref()/unref(), threadId, parentPort (postMessage/'message'/ref/
 // unref/close with Node's keep-alive-while-listening semantics), isMainThread, workerData,
 // get/setEnvironmentData (snapshot inherited by new workers), receiveMessageOnPort, and the
-// same-realm MessageChannel/MessagePort pair. process.exit(code) in a worker stops only that
+// native transferable MessageChannel/MessagePort pair and shared ArrayBuffer backing. process.exit(code) in a worker stops only that
 // worker; an uncaught exception emits 'error' on the parent and exits the worker with code 1.
 //
 // Honest throws (semantics lumen cannot honor): SHARE_ENV (realms snapshot the env; there is no
-// shared store), a non-empty transferList (messages are always copied — no SharedArrayBuffer or
-// port transfer), the stdin/stdout/stderr capture options (workers share the process stdio),
+// shared store), unsupported transfer types/resizable buffers, stdin/stdout/stderr capture options (workers share the process stdio),
 // moveMessagePortToContext, postMessageToThread. BroadcastChannel is the same-realm web one.
 {
   const EventEmitter = __builtins.get("events");
@@ -20,8 +19,10 @@
 
   const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
   const environmentData = new Map();
+  const untransferable = new WeakSet();
+  const uncloneable = new WeakSet();
 
-  const ser = (v) => globalThis.__serializeForClone(v);
+  const ser = (v, transfer) => globalThis.__serializeForClone(v, transfer, true);
   const deser = (b) => globalThis.__deserializeClone(b);
 
   // The runtime's worker extension installs after this glue and stashes its ops in a hidden
@@ -33,17 +34,6 @@
       throw new Error("worker_threads Worker requires the lumen runtime (worker ops not installed)");
     }
     return workerOps;
-  }
-
-  function checkTransferList(transfer) {
-    const list = Array.isArray(transfer)
-      ? transfer
-      : transfer && typeof transfer === "object" && Array.isArray(transfer.transfer)
-        ? transfer.transfer
-        : [];
-    if (list.length > 0) {
-      throw new Error("worker_threads transferList is not supported in lumen (messages are always copied)");
-    }
   }
 
   // Worker-side uncaught errors travel as "Name: message" text; rebuild a matching Error here.
@@ -68,9 +58,7 @@
           throw new Error(`worker_threads option '${opt}' is not supported in lumen (workers share the process stdio)`);
         }
       }
-      if (options.env === SHARE_ENV) {
-        throw new Error("worker_threads SHARE_ENV is not supported in lumen (realms snapshot the environment)");
-      }
+      const shareEnv = options.env === SHARE_ENV;
       let entry;
       let isModule = false;
       if (options.eval) {
@@ -94,10 +82,10 @@
         entry = p;
       }
       // Snapshot the environment (Node copies the parent's process.env unless overridden).
-      const envSrc = options.env == null ? process.env : options.env;
+      const envSrc = options.env == null || shareEnv ? process.env : options.env;
       if (typeof envSrc !== "object") throw new TypeError("options.env must be an object");
-      const env = {};
-      for (const k of Object.keys(envSrc)) {
+      const env = shareEnv ? null : {};
+      if (!shareEnv) for (const k of Object.keys(envSrc)) {
         const v = envSrc[k];
         if (v !== undefined) env[k] = String(v);
       }
@@ -110,10 +98,11 @@
         env,
         envData: environmentData,
         entry: options.eval ? "[worker eval]" : entry,
-      });
+      }, options.transferList);
       const res = ops.spawn(entry, isModule, (kind, a) => this.#onEvent(kind, a), {
         node: true,
         eval: !!options.eval,
+        shareEnv,
         init,
       });
       this.#id = res.id;
@@ -148,9 +137,8 @@
       }
     }
     postMessage(value, transferList) {
-      checkTransferList(transferList);
       if (this.#exited) return;
-      getWorkerOps().post(this.#id, ser(value));
+      getWorkerOps().post(this.#id, ser(value, transferList));
     }
     terminate(callback) {
       // Legacy callback form, still honored by Node alongside the promise.
@@ -184,14 +172,85 @@
     }
   }
 
-  // Real for the same-realm MessageChannel ports (messages queue on the receiving port until it
-  // starts): a queued message pops synchronously, exactly Node's contract.
-  function receiveMessageOnPort(port) {
-    if (!port || typeof port !== "object" || !Array.isArray(port._queue)) {
-      throw new TypeError("receiveMessageOnPort expects a MessagePort");
+  const WebPort = globalThis.MessagePort;
+  const portState = new WeakMap();
+  const localPorts = new Map();
+  function portOps() { return globalThis.__lumenPorts; }
+  class NodeMessagePort extends WebPort {
+    constructor() { throw new TypeError("Illegal constructor"); }
+    postMessage(value, transferList) {
+      const state = portState.get(this);
+      if (!state || state.closed || state.detached) return;
+      if (transferList?.includes(this)) throw new DOMException("Cannot transfer the source port", "DataCloneError");
+      const bytes = ser(value, transferList);
+      portOps().post(state.id, bytes);
     }
-    return port._queue.length > 0 ? { message: port._queue.shift() } : undefined;
+    addEventListener(type, callback, options) {
+      EventTarget.prototype.addEventListener.call(this,type,callback,options);
+      if (type === "message" && callback != null) { this.start(); this.ref(); }
+    }
+    removeEventListener(type, callback, options) {
+      EventTarget.prototype.removeEventListener.call(this,type,callback,options);
+      if(type === "message" && this.listenerCount("message")===0 && !(this._listeners.get("message")?.length)) this.unref();
+    }
+    start() { const state=portState.get(this);if(state)state.started=true;this._arm(); }
+    _arm() {
+      const state = portState.get(this);
+      if (!state || state.closed || state.detached || state.timer !== null) return;
+      state.timer = setInterval(() => {
+        // A peer close follows its already-queued messages. Poll drains the queue before
+        // returning the close sentinel; observing the closed flag first would lose receipts.
+        if(!state.started){if(portOps().isClosed(state.id))this._finishClose();return;}
+        const bytes = portOps().poll(state.id);
+        if (bytes === false) { this._finishClose(); return; }
+        if (bytes === undefined) return;
+        let data;
+        try { data = deser(bytes); } catch(error) { this.emit("messageerror", error); return; }
+        this.dispatchEvent(new MessageEvent("message", {data}));
+        this.emit("message", data);
+      }, 1);
+      if (!state.ref) state.timer.unref();
+    }
+    ref() { const state=portState.get(this); if (state && !state.closed && !state.detached) {state.ref=true;this._arm();state.timer?.ref();} return this; }
+    unref() { const state=portState.get(this); if (state) {state.ref=false;state.timer?.unref();} return this; }
+    hasRef() { const state=portState.get(this); return !!state && !state.closed && !state.detached && state.ref; }
+    _finishClose() { const state=portState.get(this); if(!state || state.closed)return;state.closed=true;portOps().detach(state.id);localPorts.delete(state.id);if(state.timer!==null)clearInterval(state.timer);state.timer=null;queueMicrotask(()=>this.emit("close")); }
+    close() { const state=portState.get(this); if(!state||state.closed||state.detached)return;const peer=portOps().close(state.id);this._finishClose();localPorts.get(peer)?._arm(); }
   }
+  for (const name of ["on", "addListener", "once", "off", "removeListener", "removeAllListeners", "prependListener", "prependOnceListener", "emit", "listeners", "rawListeners", "listenerCount", "eventNames", "setMaxListeners", "getMaxListeners"]) {
+    Object.defineProperty(NodeMessagePort.prototype,name,{configurable:true,writable:true,value:function(...args){
+      const result=EventEmitter.prototype[name].apply(this,args);
+      if (["on","addListener","once","prependListener","prependOnceListener"].includes(name)) {if(args[0]==="message"){this.start();this.ref();}else if(args[0]==="close")this._arm();}
+      else if (["off","removeListener","removeAllListeners"].includes(name)&&this.listenerCount("message")===0)this.unref();
+      return result;
+    }});
+  }
+  function nodePort(id) {
+    const port=new EventTarget();
+    Object.setPrototypeOf(port,NodeMessagePort.prototype);
+    EventEmitter.call(port);
+    portState.set(port,{id,timer:null,closed:false,detached:false,ref:false,started:false});
+    localPorts.set(id,port);
+    return port;
+  }
+  class NodeMessageChannel {constructor(){const pair=portOps().pair();this.port1=nodePort(pair.a);this.port2=nodePort(pair.b);}}
+  function receiveMessageOnPort(port) {
+    const state=portState.get(port);
+    if(!state)throw new TypeError("receiveMessageOnPort expects a MessagePort");
+    if(state.closed||state.detached)return undefined;
+    const bytes=portOps().poll(state.id);
+    if(bytes===false){port._finishClose();return undefined;}
+    return bytes===undefined?undefined:{message:deser(bytes)};
+  }
+  Object.defineProperty(globalThis,"__lumenPortClone",{value:{
+    isPort:value=>portState.has(value),
+    isUntransferable:value=>untransferable.has(value),
+    isUncloneable:value=>uncloneable.has(value),
+    validate:port=>{const state=portState.get(port);if(!state || state.closed || state.detached || portOps().isClosed(state.id))throw new DOMException("MessagePort is detached or closed", "DataCloneError");},
+    export:port=>{const state=portState.get(port);if(state.closed||state.detached)throw new DOMException("MessagePort is detached", "DataCloneError");return portOps().export(state.id);},
+    detach:port=>{const state=portState.get(port);portOps().detach(state.id);state.detached=true;localPorts.delete(state.id);if(state.timer!==null)clearInterval(state.timer);state.timer=null;queueMicrotask(()=>port.emit("close"));},
+    import:index=>nodePort(portOps().import(index)),
+  },configurable:true});
 
   const notSupported = (name) =>
     function () {
@@ -207,14 +266,13 @@
     SHARE_ENV,
     resourceLimits: {},
     Worker,
-    // The same-realm entangled pair from the web glue; transferring a port across threads is what
-    // the non-empty-transferList throw above refuses.
-    MessageChannel: globalThis.MessageChannel,
-    MessagePort: globalThis.MessagePort,
+    // Native queues and exclusive transferred endpoint ownership across real worker realms.
+    MessageChannel: NodeMessageChannel,
+    MessagePort: NodeMessagePort,
     BroadcastChannel: globalThis.BroadcastChannel,
-    markAsUntransferable: () => {},
-    isMarkedAsUntransferable: () => false,
-    markAsUncloneable: () => {},
+    markAsUntransferable: value => { if(value !== null && (typeof value === "object" || typeof value === "function")) untransferable.add(value); },
+    isMarkedAsUntransferable: value => untransferable.has(value),
+    markAsUncloneable: value => { if(value !== null && (typeof value === "object" || typeof value === "function")) uncloneable.add(value); },
     moveMessagePortToContext: notSupported("moveMessagePortToContext"),
     postMessageToThread: notSupported("postMessageToThread"),
     receiveMessageOnPort,
@@ -247,7 +305,8 @@
       if (init.envData instanceof Map) {
         for (const [k, v] of init.envData) environmentData.set(k, v);
       }
-      if (init.env && typeof init.env === "object") process.env = init.env;
+      if (init.env && typeof init.env === "object") globalThis.__lumenResetWorkerEnvironment(init.env);
+      delete globalThis.__lumenResetWorkerEnvironment;
       process.argv = [
         process.execPath,
         init.entry ?? "[worker]",
@@ -283,9 +342,8 @@
           });
         }
         postMessage(value, transferList) {
-          checkTransferList(transferList);
           if (this.#closed) return;
-          wself.post(ser(value));
+          wself.post(ser(value, transferList));
         }
         // Node's MessagePort is also an EventTarget; alias the listener API.
         addEventListener(type, fn) {

@@ -859,6 +859,16 @@
       return this.#context.href;
     }
 
+    static parse(url, base = undefined) {
+      if (arguments.length === 0) throw errMissingArgs("url");
+      // Convert outside parsing: user coercion errors must propagate, rather than become null.
+      const input = toUSVString(`${url}`);
+      const parsed = base === undefined
+        ? __url.parse(input)
+        : __url.parse(input, toUSVString(`${base}`));
+      return parsed === null ? null : new URL(parsed[0]);
+    }
+
     static canParse(url, base = undefined) {
       if (arguments.length === 0) throw errMissingArgs("url");
       url = `${url}`;
@@ -886,6 +896,7 @@
   });
 
   Object.defineProperties(URL, {
+    parse: { __proto__: null, configurable: true, writable: true, enumerable: true },
     canParse: { __proto__: null, configurable: true, writable: true, enumerable: true },
   });
 

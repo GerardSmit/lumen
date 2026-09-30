@@ -659,9 +659,13 @@ StatWatcherHandle.prototype.start = function (path, interval) {
     this._prev = cur;
     this._busy = 1;
   };
-  poll();
   this._timer = setInterval(poll, Math.max(1, interval));
   if (!this._refed) this._timer.unref();
+  // libuv's first stat is asynchronous as well: run synchronously here, its ENOENT report fired
+  // before watchFile() had attached the listener and was never repeated.
+  process.nextTick(() => {
+    if (this._timer !== null) poll();
+  });
   return 0;
 };
 StatWatcherHandle.prototype._emit = function (status, cur, prev) {

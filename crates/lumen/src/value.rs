@@ -715,6 +715,10 @@ impl Value {
             _ => None,
         }
     }
+    /// Exact little-endian magnitude words and sign for the native BigInt bridge.
+    pub fn bigint_words(&self) -> Option<(bool, &[u64])> {
+        match self { Value::BigInt(value) => Some(value.words()), _ => None }
+    }
     pub fn as_obj(&self) -> Option<&Gc> {
         match self {
             Value::Obj(o) => Some(o),

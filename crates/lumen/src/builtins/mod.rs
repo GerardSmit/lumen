@@ -1155,7 +1155,7 @@ fn assign_set(i: &mut Interp, to: &Value, key: &str, value: Value) -> Result<(),
 }
 
 /// IsArray, seeing through proxies (a Proxy whose target is an Array is itself an Array).
-fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
+pub(crate) fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
     if let Some((target, handler)) = proxy_pair(i, v) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "Cannot perform IsArray on a revoked Proxy"));
@@ -3548,31 +3548,7 @@ fn install_object(it: &mut Interp) {
         Ok(Value::Obj(obj))
     });
     it.def_method(&ctor, "defineProperty", 3, |i, _this, args| {
-        let o = match arg(args, 0) {
-            Value::Obj(o) => o,
-            _ => {
-                return Err(i.make_error("TypeError", "Object.defineProperty called on non-object"));
-            }
-        };
-        let key = ab(i.to_property_key(&arg(args, 1)))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            if !ab(proxy_define_property(
-                i,
-                &target,
-                &handler,
-                &key,
-                &arg(args, 2),
-            ))? {
-                return Err(
-                    i.make_error("TypeError", "proxy defineProperty returned a falsish value")
-                );
-            }
-            return Ok(Value::Obj(o));
-        }
-        if !ab(define_own_property(i, &o, &key, &arg(args, 2)))? {
-            return Err(i.make_error("TypeError", "Cannot redefine property"));
-        }
-        Ok(Value::Obj(o))
+        object_define_property(i, arg(args, 0), arg(args, 1), arg(args, 2))
     });
     it.def_method(&ctor, "getOwnPropertyDescriptor", 2, |i, _this, args| {
         // ToObject coerces a primitive target (and throws for null/undefined).
@@ -4009,6 +3985,38 @@ fn to_precision(n: f64, p: usize) -> String {
     } else {
         body
     }
+}
+
+/// Intrinsic Object.defineProperty, also used by native host property definitions.
+pub(crate) fn object_define_property(
+    i: &mut Interp,
+    target: Value,
+    property: Value,
+    descriptor: Value,
+) -> Result<Value, Value> {
+    let o = match target {
+        Value::Obj(o) => o,
+        _ => {
+            return Err(i.make_error("TypeError", "Object.defineProperty called on non-object"));
+        }
+    };
+    let key = ab(i.to_property_key(&property))?;
+    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        if !ab(proxy_define_property(
+            i,
+            &target,
+            &handler,
+            &key,
+            &descriptor,
+        ))? {
+            return Err(i.make_error("TypeError", "proxy defineProperty returned a falsish value"));
+        }
+        return Ok(Value::Obj(o));
+    }
+    if !ab(define_own_property(i, &o, &key, &descriptor))? {
+        return Err(i.make_error("TypeError", "Cannot redefine property"));
+    }
+    Ok(Value::Obj(o))
 }
 
 fn opt_norm(v: Option<Value>) -> Option<Value> {

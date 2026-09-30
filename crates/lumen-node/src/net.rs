@@ -471,7 +471,8 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
     let port = arg_u64(args, 1) as u16;
     let (resolve, reject) = take_resolve_reject(ctx, args.get(2), args.get(3))?;
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+    let id = lumen_host::register_task(
+        ctx,
         resolve,
         Some(reject),
         decode_connect,
@@ -688,7 +689,8 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
     #[cfg(unix)]
     {
-        let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+        let id = lumen_host::register_task(
+        ctx,
             resolve,
             Some(reject),
             decode_connect,
@@ -703,7 +705,8 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     }
     #[cfg(windows)]
     {
-        let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+        let id = lumen_host::register_task(
+        ctx,
             resolve,
             Some(reject),
             decode_connect,
@@ -743,8 +746,8 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         }
     };
 
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
     let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_read);
     if unref {
         reg.set_unref(id);
     }
@@ -808,7 +811,8 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         return Ok(Value::Undefined);
     };
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+    let id = lumen_host::register_task(
+        ctx,
         resolve,
         Some(reject),
         decode_write,
@@ -1165,8 +1169,8 @@ fn op_accept(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         }
     };
 
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_accept);
     let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_accept);
     if unref {
         reg.set_unref(id);
     }
@@ -1363,8 +1367,8 @@ fn op_udp_recv(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
         }
     };
 
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_recv);
     let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_recv);
     if unref {
         reg.set_unref(id);
     }
@@ -1459,7 +1463,8 @@ fn op_udp_send(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
         return Ok(Value::Undefined);
     };
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+    let id = lumen_host::register_task(
+        ctx,
         resolve,
         Some(reject),
         decode_send,

@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// `Atomics` over integer TypedArrays. lumen is single-threaded, so the read-modify-write ops are
-/// plain operations; `wait`/`notify` are no-ops.
+/// `Atomics` over integer TypedArrays. Shared backing stores synchronize read-modify-write
+/// operations and real agent wait/notify through the process-wide waiter table.
 pub(super) fn install_atomics(it: &mut Interp) {
     let atomics = Object::new(Some(it.object_proto.clone()));
 
@@ -176,7 +176,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
                 return Err(i.make_error(
                     "TypeError",
                     "Atomics.wait requires a SharedArrayBuffer-backed array",
-                ))
+                ));
             }
         };
         let (info, idx) = target(i, a)?;
@@ -195,11 +195,14 @@ pub(super) fn install_atomics(it: &mut Interp) {
                 "Atomics.wait: the calling agent cannot be suspended",
             ));
         }
-        if read_i128(i, &info, idx) != expected {
-            return Ok(Value::str("not-equal"));
-        }
         let byte_index = info.offset + idx * info.kind.elsize();
-        let woken = crate::interpreter::futex_wait(id, byte_index, timeout);
+        let waiter = crate::interpreter::futex_register_if(id, byte_index, || {
+            wrap_bits(info.kind, read_i128(i, &info, idx)) == wrap_bits(info.kind, expected)
+        });
+        let Some(waiter) = waiter else {
+            return Ok(Value::str("not-equal"));
+        };
+        let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
         Ok(Value::str(if woken { "ok" } else { "timed-out" }))
     });
     it.def_method(&atomics, "notify", 3, |i, _t, a| {
@@ -239,7 +242,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
                 return Err(i.make_error(
                     "TypeError",
                     "Atomics.waitAsync requires a SharedArrayBuffer-backed array",
-                ))
+                ));
             }
         };
         let (info, idx) = target(i, a)?;
@@ -253,7 +256,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         };
         let result = i.new_object();
         // The value already differs ⇒ resolved synchronously (not async).
-        if read_i128(i, &info, idx) != expected {
+        if wrap_bits(info.kind, read_i128(i, &info, idx)) != wrap_bits(info.kind, expected) {
             set_data(&result, "async", Value::Bool(false));
             set_data(&result, "value", Value::str("not-equal"));
             return Ok(Value::Obj(result));
@@ -269,7 +272,14 @@ pub(super) fn install_atomics(it: &mut Interp) {
         let byte_index = info.offset + idx * info.kind.elsize();
         // The waiter joins the wait list synchronously (a notify later in this same job must see
         // it); only the blocking happens on the helper thread.
-        let waiter = crate::interpreter::futex_register(id, byte_index);
+        let waiter = crate::interpreter::futex_register_if(id, byte_index, || {
+            wrap_bits(info.kind, read_i128(i, &info, idx)) == wrap_bits(info.kind, expected)
+        });
+        let Some(waiter) = waiter else {
+            set_data(&result, "async", Value::Bool(false));
+            set_data(&result, "value", Value::str("not-equal"));
+            return Ok(Value::Obj(result));
+        };
         let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
         std::thread::spawn(move || {
             let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
@@ -290,7 +300,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
                 return Err(i.make_error(
                     "TypeError",
                     "Atomics.pause iterationNumber must be an integer",
-                ))
+                ));
             }
         }
         Ok(Value::Undefined)

@@ -17,6 +17,9 @@ lumen-tls = { path = "../lumen-tls" }
 # direct dependency (lumen-host already links it).
 lumen = { path = "../lumen", features = ["macros"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
 [build-dependencies]
 lumen = { path = "../lumen" }

@@ -172,6 +172,10 @@ const JS_FILES: &[GlueFile] = &[
         wrap: true,
     },
     GlueFile {
+        name: "node_sqlite.js",
+        wrap: true,
+    },
+    GlueFile {
         name: "bun_sqlite.js",
         wrap: true,
     },
@@ -261,6 +265,7 @@ const LAZY: &[&str] = &[
     "constants.js",
     "bun_ffi.js",
     "bun_jsc.js",
+    "node_sqlite.js",
     "bun_sqlite.js",
     "bun_postgres.js",
     "bun_mysql.js",

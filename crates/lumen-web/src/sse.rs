@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use lumen_host::{Ctx, SpawnHandle, TaskRegistry, Value};
+use lumen_host::{Ctx, SpawnHandle, Value};
 
 use crate::url;
 
@@ -112,10 +112,7 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         id
     };
 
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(dispatch, None, decode_connect);
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()
@@ -286,10 +283,7 @@ fn arm_read(ctx: &mut Ctx, id: u64, reader: StreamReader) {
         Some(e) if !e.dead => e.dispatch.clone(),
         _ => return,
     };
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(dispatch, None, decode_read);
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_read);
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()

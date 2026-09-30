@@ -368,10 +368,7 @@ pub struct LoopAsyncHost {
 impl lumen::embed::AsyncHost for LoopAsyncHost {
     fn pending(&self, ctx: &mut Ctx, deferred: lumen::embed::Deferred) -> lumen::embed::Completer {
         let (resolve, reject) = deferred.resolving_functions(ctx);
-        let id = ctx
-            .host_mut::<TaskRegistry>()
-            .expect("the runtime installs the task registry with its async host")
-            .register(resolve, Some(reject), decode_settle);
+        let id = crate::register_task(ctx, resolve, Some(reject), decode_settle);
         let completions = self.completions.clone();
         lumen::embed::Completer::new(move |settle| completions.send(id, Box::new(settle)))
     }
@@ -413,6 +410,8 @@ pub struct TaskEntry {
     pub on_ok: Value,
     pub on_err: Option<Value>,
     pub decode: TaskDecoder,
+    /// Immutable async-context frame captured when the native operation was admitted.
+    pub context: Value,
     /// An `unref`'d task still settles when it completes, but does not by itself keep the event
     /// loop alive (Node's `child.unref()` — e.g. esbuild's persistent service child).
     pub unref: bool,
@@ -429,6 +428,7 @@ impl TaskRegistry {
                 on_ok,
                 on_err,
                 decode,
+                context: Value::Undefined,
                 unref: false,
             },
         );
@@ -458,6 +458,23 @@ impl TaskRegistry {
     pub fn has_ref_pending(&self) -> bool {
         self.map.values().any(|e| !e.unref)
     }
+}
+
+/// Register native I/O with its admitting async context. Raw callbacks, decoders and promise
+/// settlement all run inside this frame; reactions retain their own captured context as usual.
+pub fn register_task(
+    ctx: &mut Ctx,
+    on_ok: Value,
+    on_err: Option<Value>,
+    decode: TaskDecoder,
+) -> TaskId {
+    let context = ctx.async_context();
+    let registry = ctx
+        .host_mut::<TaskRegistry>()
+        .expect("runtime task registry");
+    let id = registry.register(on_ok, on_err, decode);
+    registry.map.get_mut(&id).unwrap().context = context;
+    id
 }
 
 impl Drop for ThreadPool {

@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use lumen_host::{ops, Ctx, Extension, SpawnHandle, TaskRegistry, Value};
+use lumen_host::{ops, Ctx, Extension, SpawnHandle, Value};
 
 pub fn extension() -> Extension {
     Extension {
@@ -629,10 +629,7 @@ extern "C" {
 fn op_read_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let path = arg_string(ctx, args, 0)?;
     let (resolve, reject) = settle_args(ctx, args, "__fs_async.read")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_read);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
     let spawn = spawn_handle(ctx);
     spawn.spawn_blocking(id, move || {
         Box::new(
@@ -649,10 +646,7 @@ fn op_write_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let path = arg_string(ctx, args, 0)?;
     let data = arg_string(ctx, args, 1)?;
     let (resolve, reject) = settle_args(ctx, &args[1..], "__fs_async.write")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_write);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
     let spawn = spawn_handle(ctx);
     spawn.spawn_blocking(id, move || {
         Box::new(std::fs::write(&path, data).map_err(|e| format!("writeFile '{path}': {e}")))

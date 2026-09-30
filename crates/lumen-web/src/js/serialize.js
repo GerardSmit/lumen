@@ -31,6 +31,8 @@ const T_ERROR = 17;
 const T_BOOLOBJ = 18;
 const T_NUMOBJ = 19;
 const T_STROBJ = 20;
+const T_SHARED = 21;
+const T_PORT = 22;
 
 // TypedArray kinds by constructor name — index is the wire byte.
 const TA_KINDS = [
@@ -38,9 +40,27 @@ const TA_KINDS = [
   "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
   "BigInt64Array", "BigUint64Array",
 ];
+const TA_BRAND = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
 const ERROR_NAMES = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "EvalError", "URIError"];
 
-function serializeForClone(value) {
+function serializeForClone(value, transfer = [], transport = false) {
+  const list = Array.isArray(transfer) ? transfer : transfer?.transfer ?? [];
+  if (!Array.isArray(list)) throw new TypeError("transferList must be an array");
+  const ports = globalThis.__lumenPortClone;
+  const listed = new Set();
+  for (const port of list) {
+    if (ports?.isUntransferable(port) || listed.has(port)) throw new DOMException("Unsupported or duplicate transferable", "DataCloneError");
+    if (ports?.isPort(port)) ports.validate(port);
+    else if (!transport || !globalThis.__cloneTransfer?.isTransferableBuffer(port)) throw new DOMException("Unsupported or detached transferable", "DataCloneError");
+    listed.add(port);
+  }
+  if (transport) globalThis.__cloneTransfer?.begin();
+  try {
+  const portIndices = new Map();
+  for (const port of list) {
+    if(!transport) throw new DOMException("MessagePort requires native message transport", "DataCloneError");
+    if(ports?.isPort(port))portIndices.set(port, ports.export(port));
+  }
   // A growable Uint8Array sink (capacity doubling) — orders of magnitude faster than pushing
   // numbers into a plain Array and `Uint8Array.from`-ing at the end.
   let buf = new Uint8Array(64);
@@ -80,6 +100,7 @@ function serializeForClone(value) {
     if (t === "function" || t === "symbol") {
       throw new DOMException("value could not be cloned", "DataCloneError");
     }
+    if (ports?.isUncloneable(v)) throw new DOMException("Object marked uncloneable", "DataCloneError");
     // Objects: a repeat emits a back-ref.
     if (memory.has(v)) { u8(T_REF); return u32(memory.get(v)); }
     const ref = memory.size;
@@ -88,6 +109,14 @@ function serializeForClone(value) {
     if (v instanceof RegExp) { u8(T_REGEXP); str(v.source); return str(v.flags); }
     if (v instanceof Promise) {
       throw new DOMException("a Promise cannot be cloned", "DataCloneError");
+    }
+    if (ports?.isPort(v)) {
+      if (!listed.has(v)) throw new DOMException("MessagePort must be listed in transferList", "DataCloneError");
+      memory.set(v, ref); u8(T_PORT); return u32(portIndices.get(v));
+    }
+    if (typeof SharedArrayBuffer === "function" && v instanceof SharedArrayBuffer) {
+      if (!transport || !globalThis.__cloneTransfer) throw new DOMException("SharedArrayBuffer sharing requires runtime", "DataCloneError");
+      memory.set(v, ref); u8(T_SHARED); return u32(globalThis.__cloneTransfer.exportShared(v));
     }
     if (v instanceof ArrayBuffer) {
       memory.set(v, ref);
@@ -102,7 +131,7 @@ function serializeForClone(value) {
       return write(v.buffer);
     }
     if (ArrayBuffer.isView(v)) {
-      const kind = TA_KINDS.indexOf(v.constructor.name);
+      const kind = TA_KINDS.indexOf(TA_BRAND.call(v));
       if (kind === -1) throw new DOMException("unsupported typed array", "DataCloneError");
       memory.set(v, ref);
       u8(T_TYPEDARRAY);
@@ -156,7 +185,18 @@ function serializeForClone(value) {
   };
 
   write(value);
+  // Getters may have transferred an outer buffer/port in a nested message. Revalidate
+  // the complete list before detaching any sender-owned resources.
+  for (const item of list) {
+    if(ports?.isPort(item))ports.validate(item);
+    else if(!globalThis.__cloneTransfer.isTransferableBuffer(item))throw new DOMException("Transferable was detached during serialization", "DataCloneError");
+  }
+  for (const item of list) {
+    if(ports?.isPort(item))ports.detach(item);
+    else globalThis.__cloneTransfer.detachBuffer(item);
+  }
   return buf.subarray(0, len);
+  } catch(error) { if(transport) globalThis.__cloneTransfer?.abort(); throw error; }
 }
 
 function deserializeClone(buf) {
@@ -196,6 +236,8 @@ function deserializeClone(buf) {
       case T_REF: return memory[u32()];
       case T_DATE: return new Date(f64());
       case T_REGEXP: { const source = str(); return new RegExp(source, str()); }
+      case T_SHARED: {const value=globalThis.__cloneTransfer.importShared(u32());memory.push(value);return value;}
+      case T_PORT: {const value=globalThis.__lumenPortClone.import(u32());memory.push(value);return value;}
       case T_ARRAYBUFFER: {
         const len = u32();
         const ab = new ArrayBuffer(len);
@@ -207,8 +249,9 @@ function deserializeClone(buf) {
       case T_DATAVIEW: {
         const byteOffset = u32();
         const byteLength = u32();
+        const index=memory.length;memory.push(undefined);
         const dv = new DataView(read(), byteOffset, byteLength);
-        memory.push(dv);
+        memory[index]=dv;
         return dv;
       }
       case T_TYPEDARRAY: {
@@ -216,8 +259,9 @@ function deserializeClone(buf) {
         const byteOffset = u32();
         const length = u32();
         const ctor = globalThis[TA_KINDS[kind]];
+        const index=memory.length;memory.push(undefined);
         const ta = new ctor(read(), byteOffset, length);
-        memory.push(ta);
+        memory[index]=ta;
         return ta;
       }
       case T_MAP: {
@@ -262,7 +306,7 @@ function deserializeClone(buf) {
         throw new DOMException("malformed clone data", "DataCloneError");
     }
   };
-  return read();
+  try { return read(); } finally { globalThis.__cloneTransfer?.finish(); }
 }
 
 // Exposed for the Worker bridge (worker.js) — not global API.

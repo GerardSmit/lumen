@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use lumen_host::{Ctx, SpawnHandle, TaskRegistry, Value};
+use lumen_host::{Ctx, SpawnHandle, Value};
 
 use crate::http::read_chunked;
 use crate::read_header_pairs;
@@ -191,10 +191,7 @@ pub(crate) fn op_server_respond(
 
     let bytes = build_response(status, &status_text, &headers, &body);
 
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_write);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()
@@ -331,10 +328,7 @@ fn arm_accept(
     local_addr: SocketAddr,
     dispatch: Value,
 ) {
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(dispatch, None, decode_accept);
+    let id = lumen_host::register_task(ctx, dispatch, None, decode_accept);
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()

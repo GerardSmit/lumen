@@ -238,12 +238,7 @@ pub(crate) fn install_data_props(
         .to_string();
     let _ = ctx.set_member(&process, "title", Value::from_string(title));
 
-    let env = ctx.new_object();
-    let env = Value::Obj(env);
-    for (k, v) in vars {
-        let _ = ctx.set_member(&env, &k, Value::from_string(v));
-    }
-    let _ = ctx.set_member(&process, "env", env);
+    crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("startup environment exceeds realm limits"));
 
     let platform = match std::env::consts::OS {
         // Node's names for them; programs branch on `process.platform === "win32"`.
@@ -269,31 +264,35 @@ pub(crate) fn install_data_props(
 }
 
 const ENV_PROXY: &str = r#"(() => {
-  const target = process.env;
-  if (target === null || typeof target !== "object") return;
-  const win = process.platform === "win32";
-  const has = Object.prototype.hasOwnProperty;
-  const find = (key) => {
-    if (!win || typeof key !== "string" || has.call(target, key)) return key;
-    const upper = key.toUpperCase();
-    for (const k of Object.keys(target)) if (k.toUpperCase() === upper) return k;
+  const env = globalThis.__env;
+  delete globalThis.__env;
+  const target = {};
+  const requireKey = key => {
+    if (typeof key === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
     return key;
   };
   process.env = new Proxy(target, {
-    get: (t, key) => Reflect.get(t, find(key)),
-    set: (t, key, value) => {
-      t[find(key)] = `${value}`;
+    get: (t, key) => typeof key === "symbol" ? Reflect.get(t,key) : env.get(key) ?? Reflect.get(t,key),
+    set: (t, key, value) => { env.set(requireKey(key), `${value}`); return true; },
+    has: (t, key) => typeof key === "symbol" ? Reflect.has(t,key) : env.get(key) !== undefined || Reflect.has(t,key),
+    deleteProperty: (t, key) => { env.delete(requireKey(key)); return true; },
+    ownKeys: () => env.keys(),
+    getOwnPropertyDescriptor: (t, key) => {
+      if (typeof key === "symbol") return Reflect.getOwnPropertyDescriptor(t,key);
+      const value=env.get(key);
+      return value === undefined ? undefined : {value,writable:true,configurable:true,enumerable:true};
+    },
+    defineProperty: (t, key, desc) => {
+      if (!("value" in desc) || !desc.writable || !desc.configurable || !desc.enumerable) {
+        throw new TypeError("process.env descriptors must contain value, writable, enumerable and configurable");
+      }
+      env.set(requireKey(key), `${desc.value}`);
       return true;
     },
-    has: (t, key) => Reflect.has(t, find(key)),
-    deleteProperty: (t, key) => {
-      delete t[find(key)];
-      return true;
-    },
-    getOwnPropertyDescriptor: (t, key) => Reflect.getOwnPropertyDescriptor(t, find(key)),
-    defineProperty: (t, key, desc) =>
-      Reflect.defineProperty(t, find(key), "value" in desc ? { ...desc, value: `${desc.value}` } : desc),
+    preventExtensions: () => false,
   });
+  // Worker bootstrap resets only a copied environment; SHARE_ENV binds the backing natively.
+  Object.defineProperty(globalThis,"__lumenResetWorkerEnvironment",{value:snapshot=>env.reset(Object.entries(snapshot)),configurable:true});
 })();"#;
 
 /// `(chunk)` — write raw bytes to stdout (no trailing newline, unlike `console.log`). A typed
@@ -318,10 +317,7 @@ fn op_read_stdin(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
             ))
         }
     };
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs task registry")
-        .register(resolve, Some(reject), decode_stdin_read);
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_stdin_read);
     let sender = ctx
         .op_state()
         .get::<CompletionSender>()

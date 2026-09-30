@@ -11,16 +11,16 @@
 //!   default-export wrapper (`.cjs` bridges through the global CommonJS `require`).
 //! - bare package -> the `node_modules` walk; an ESM entry (`.mjs`, or `package.json`
 //!   `type:module` / `exports` import condition / `module`) loads as real ESM, else it's
-//!   default-only CJS interop via `require`. A bare subpath (`hono/logger`) resolves as a
-//!   literal file first, then via the package's `exports` map (`"./logger"` -> its
-//!   `import`/`default` target).
+//!   default-only CJS interop via `require`. A bare subpath (`hono/logger`) resolves through
+//!   its package's `exports` map first (`"./logger"` -> its `import`/`default` target); a
+//!   literal file is considered only when there is no map.
 //!
 //! - `aot:/…` referrer (a module of a precompiled blob) -> the engine resolves the blob's own
 //!   units and bundled packages first; only what the blob lacks arrives here, and a bare
 //!   package then resolves from the current directory's `node_modules`.
 //!
 //! Deferred (documented, not silently wrong): named imports from a CommonJS *package* (Node
-//! uses source static-analysis we don't), subpath-*pattern* `exports` (`"./*"`), import maps.
+//! uses additional source static-analysis patterns), import maps.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,7 +34,8 @@ pub struct BuiltinModules(pub HashMap<String, String>);
 /// name that is a plain identifier as a named export read from it at import time.
 pub fn builtin_source(name: &str, exports: &str) -> String {
     // Builtin names (`fs/promises`) and identifiers need no escaping inside a string literal.
-    let mut src = format!("const __m = globalThis.__esmBuiltin(\"{name}\");\nexport default __m;\n");
+    let mut src =
+        format!("const __m = globalThis.__esmBuiltin(\"{name}\");\nexport default __m;\n");
     for k in exports.split(' ') {
         let mut chars = k.chars();
         let ident = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
@@ -121,7 +122,7 @@ fn dir_package_type(dir: &Path) -> Option<Option<String>> {
         Some(
             std::fs::read_to_string(pkg)
                 .ok()
-                .and_then(|t| json_string_field(&t, "type")),
+                .and_then(|t| crate::package_type_from_json(&t)),
         )
     };
     MEMO.with(|m| match m.borrow_mut().as_mut() {
@@ -261,6 +262,13 @@ fn resolve(
     let specifier_path = strip_file_scheme(specifier);
     let referrer: &str = &referrer_path;
     let specifier: &str = &specifier_path;
+
+    // Package-private imports belong to the nearest package scope, not node_modules.
+    if specifier.starts_with('#') {
+        let from = Path::new(referrer).parent()?;
+        let file = resolve_package_import(specifier, from)?;
+        return load_as_module(&file, !file_is_esm(&file));
+    }
 
     // An absolute filesystem path (`C:\x\y.js` on Windows — which `starts_with('/')` misses and
     // the bare-package walk would reject — or `/x/y.js`) names the file directly; the referrer
@@ -425,6 +433,14 @@ fn resolve_directory(dir: &Path) -> Option<PathBuf> {
                     return Some(f);
                 }
             }
+            // An explicit exports map owns the entry even when blocked, unmatched or absent
+            // on disk. Legacy index fallback must not reopen that package root.
+            if crate::tsconfig::parse_jsonc(&text)
+                .ok()
+                .is_some_and(|json| json.get("exports").is_some())
+            {
+                return None;
+            }
         }
     }
     resolve_file(&dir.join("index"))
@@ -439,6 +455,20 @@ fn resolve_node_modules(name: &str, start: &Path) -> Option<(PathBuf, bool)> {
             dir = d.parent();
             continue;
         }
+        // An exports map owns every package subpath, including one with a legacy file
+        // of the same name. Check it before probing physical files/directories.
+        if let Some(subpath) = package_subpath(name) {
+            let pkg_dir = package_dir(d, name);
+            if let Ok(text) = std::fs::read_to_string(pkg_dir.join("package.json")) {
+                if crate::tsconfig::parse_jsonc(&text).ok().is_some_and(|json| json.get("exports").is_some()) {
+                    let entry = exports_subpath(&text, &subpath)?;
+                    let mapped = normalize(&pkg_dir.join(entry));
+                    if !mapped.is_file() { return None; }
+                    let esm = file_is_esm(&mapped);
+                    return Some((mapped, esm));
+                }
+            }
+        }
         let target = d.join("node_modules").join(name);
         if target.is_dir() {
             if let Some(f) = resolve_directory(&target) {
@@ -447,32 +477,47 @@ fn resolve_node_modules(name: &str, start: &Path) -> Option<(PathBuf, bool)> {
                 let esm = file_is_esm(&f);
                 return Some((f, esm));
             }
+            if package_subpath(name).is_none() && target.join("package.json").is_file() {
+                return None;
+            }
         }
         // A bare specifier can also point straight at a file (`pkg/sub.js`).
         if let Some(f) = resolve_file(&target) {
             let esm = file_is_esm(&f);
             return Some((f, esm));
         }
-        // A subpath that isn't a literal file may be mapped by the package's `exports`
-        // (`hono/logger` -> `"./logger": { "import": "./dist/middleware/logger/index.js" }`).
-        // Only the common non-pattern case; pattern subpaths (`"./*"`) stay deferred.
-        if let Some(subpath) = package_subpath(name) {
-            let pkg_dir = package_dir(d, name);
-            if let Some(entry) = std::fs::read_to_string(pkg_dir.join("package.json"))
-                .ok()
-                .and_then(|t| exports_subpath(&t, &subpath))
-            {
-                let mapped = normalize(&pkg_dir.join(&entry));
-                if let Some(f) =
-                    resolve_file(&mapped).or_else(|| resolve_file(&mapped.join("index")))
-                {
-                    // Resolved through the `import`/`default` condition, which names the ES
-                    // module build regardless of the file's extension.
-                    return Some((f, true));
-                }
-            }
-        }
         dir = d.parent();
+    }
+    None
+}
+
+fn resolve_package_import(name: &str, start: &Path) -> Option<PathBuf> {
+    use crate::tsconfig::parse_jsonc;
+    if name == "#" || name.starts_with("#/") {
+        return None;
+    }
+    let mut dir = Some(start);
+    while let Some(scope) = dir {
+        let manifest = scope.join("package.json");
+        if manifest.is_file() {
+            let json = parse_jsonc(&std::fs::read_to_string(manifest).ok()?).ok()?;
+            let entry = json.get("imports")?.get(name)?;
+            let entry = package_esm_target(entry).target()?;
+            // Relative exact targets cover package-private ESM dependencies such as Chalk.
+            // Do not reinterpret unmapped names as arbitrary filesystem paths.
+            if !entry.starts_with("./")
+                || entry
+                    .split('/')
+                    .any(|part| part == ".." || part == "node_modules")
+            {
+                return None;
+            }
+            return resolve_file(&scope.join(entry));
+        }
+        if scope.file_name().is_some_and(|name| name == "node_modules") {
+            return None;
+        }
+        dir = scope.parent();
     }
     None
 }
@@ -492,10 +537,6 @@ fn package_dir(parent: &Path, name: &str) -> PathBuf {
         }
     }
     parent.join("node_modules").join(pkg)
-}
-
-fn package_is_esm(pkg_dir: &Path) -> bool {
-    dir_package_type(pkg_dir).flatten().as_deref() == Some("module")
 }
 
 /// Turn a resolved file into `(canonical_key, source)`. `.mjs`/`.js` are real ESM; `.json`
@@ -552,7 +593,7 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
 /// Whether a resolved file loads as ESM: `.mjs`/`.mts` always, `.cjs`/`.cts` never, and
 /// `.js`/`.ts` per the nearest enclosing `package.json` `"type"` (absent ⇒ CommonJS, Node's
 /// default).
-fn file_is_esm(file: &Path) -> bool {
+pub(crate) fn file_is_esm(file: &Path) -> bool {
     match file.extension().and_then(|e| e.to_str()) {
         Some("mjs" | "mts") => true,
         Some("cjs" | "cts") => false,
@@ -940,33 +981,77 @@ fn is_reserved_word(name: &str) -> bool {
     )
 }
 
-/// The ESM entry from `package.json`: the `exports` `import`/`default` condition, else the
-/// `module` field, else `main`. A zero-dep scan of a practical `exports` subset — a bare string,
-/// or the first `import`/`default` string condition (covers the common `"."` object shape). Real
-/// subpath-pattern `exports` are still deferred.
-fn pkg_entry(pkg_json: &str) -> Option<String> {
-    if let Some(entry) = exports_entry(pkg_json) {
-        return Some(entry);
-    }
-    if let Some(module) = json_string_field(pkg_json, "module") {
-        return Some(module);
-    }
-    json_string_field(pkg_json, "main")
+/// Relative targets only; external private targets remain unsupported.
+#[derive(Debug, PartialEq)]
+enum PackageEsmTarget<'a> {
+    Target(&'a str),
+    Blocked,
+    NoMatch,
+    Unsupported,
 }
 
-/// The `exports` field's ESM target: a bare `"exports": "./x.js"` string, or the first
-/// `import`/`default` string condition inside its object form.
-fn exports_entry(pkg_json: &str) -> Option<String> {
-    let start = pkg_json.find("\"exports\"")?;
-    let after = pkg_json[start + "\"exports\"".len()..].trim_start();
-    let after = after.strip_prefix(':')?.trim_start();
-    if after.starts_with('"') {
-        return parse_string(after);
+impl<'a> PackageEsmTarget<'a> {
+    fn target(self) -> Option<&'a str> {
+        match self {
+            Self::Target(target) => Some(target),
+            _ => None,
+        }
     }
-    // Object form: prefer the `import` condition, then `default`.
-    ["import", "default"]
+}
+
+/// Preserve declaration order; unmatched nested conditions allow later active siblings,
+/// while an explicit null blocks the target rather than falling through.
+fn package_esm_target(value: &crate::tsconfig::Json) -> PackageEsmTarget<'_> {
+    use crate::tsconfig::Json;
+    match value {
+        Json::Str(value) if relative_package_target(value) => PackageEsmTarget::Target(value),
+        Json::Null => PackageEsmTarget::Blocked,
+        Json::Arr(targets) => {
+            if targets.is_empty() {
+                return PackageEsmTarget::Blocked;
+            }
+            // Node arrays skip unmatched conditions, nulls and invalid targets in order.
+            // A null resets the remembered invalid result; without a valid target, the
+            // last null/invalid result wins. Missing files do not trigger array fallback.
+            let mut last = PackageEsmTarget::NoMatch;
+            for target in targets {
+                match package_esm_target(target) {
+                    resolved @ PackageEsmTarget::Target(_) => return resolved,
+                    PackageEsmTarget::NoMatch => {}
+                    resolved => last = resolved,
+                }
+            }
+            last
+        }
+        Json::Obj(conditions) => {
+            for (condition, value) in conditions {
+                if matches!(condition.as_str(), "node" | "import" | "default") {
+                    let resolved = package_esm_target(value);
+                    if resolved != PackageEsmTarget::NoMatch {
+                        return resolved;
+                    }
+                }
+            }
+            PackageEsmTarget::NoMatch
+        }
+        _ => PackageEsmTarget::Unsupported,
+    }
+}
+
+/// Legacy root module/main fields apply only when the package has no exports field.
+fn pkg_entry(pkg_json: &str) -> Option<String> {
+    let json = crate::tsconfig::parse_jsonc(pkg_json).ok()?;
+    if let Some(exports) = json.get("exports") {
+        return package_esm_target(exports.get(".").unwrap_or(exports))
+            .target()
+            .map(str::to_string);
+    }
+    ["module", "main"]
         .into_iter()
-        .find_map(|cond| json_string_field(after, cond))
+        .find_map(|field| match json.get(field)? {
+            crate::tsconfig::Json::Str(value) => Some(value.clone()),
+            _ => None,
+        })
 }
 
 /// The subpath of a bare specifier, if any: `hono/logger` -> `logger`, `@sc/pkg/a/b` -> `a/b`,
@@ -984,20 +1069,57 @@ fn package_subpath(name: &str) -> Option<String> {
     parts.next().map(str::to_string)
 }
 
-/// The `exports` target for one subpath key (`"./logger"`): its bare string, or the first
-/// `import`/`default` string condition of its object form. Non-pattern keys only.
+/// Exact subpaths take precedence; single-star patterns prefer the longest static prefix,
+/// then the longest key (Node's pattern-key precedence). Star captures can contain slashes.
 fn exports_subpath(pkg_json: &str, subpath: &str) -> Option<String> {
-    let start = pkg_json.find("\"exports\"")?;
-    let region = &pkg_json[start..];
-    let key = format!("\"./{subpath}\"");
-    let after = region[region.find(&key)? + key.len()..].trim_start();
-    let after = after.strip_prefix(':')?.trim_start();
-    if after.starts_with('"') {
-        return parse_string(after);
+    use crate::tsconfig::Json;
+    let json = crate::tsconfig::parse_jsonc(pkg_json).ok()?;
+    let exports = json.get("exports")?;
+    let key = format!("./{subpath}");
+    if let Some(target) = exports.get(&key) {
+        return package_esm_target(target).target().map(str::to_string);
     }
-    ["import", "default"]
-        .into_iter()
-        .find_map(|cond| json_string_field(after, cond))
+    let Json::Obj(entries) = exports else {
+        return None;
+    };
+    let mut matched = None;
+    for (pattern, target) in entries {
+        let Some(star) = pattern.find('*') else {
+            continue;
+        };
+        if pattern[star + 1..].contains('*') {
+            continue;
+        }
+        let (prefix, suffix) = (&pattern[..star], &pattern[star + 1..]);
+        if key.len() < prefix.len() + suffix.len()
+            || !key.starts_with(prefix)
+            || !key.ends_with(suffix)
+        {
+            continue;
+        }
+        let rank = (prefix.len(), pattern.len());
+        if matched.as_ref().is_some_and(|(best, _, _)| *best >= rank) {
+            continue;
+        }
+        matched = Some((rank, target, &key[prefix.len()..key.len() - suffix.len()]));
+    }
+    let (_, target, capture) = matched?;
+    let resolved = package_esm_target(target).target()?.replace('*', capture);
+    relative_package_target(&resolved).then_some(resolved)
+}
+
+fn relative_package_target(value: &str) -> bool {
+    value.starts_with("./")
+        && !value.split('/').skip(1).any(|part| {
+            let lower = part.to_ascii_lowercase();
+            let dots = lower.replace("%2e", ".");
+            dots == "."
+                || dots == ".."
+                || lower == "node_modules"
+                || lower.contains("%2f")
+                || lower.contains("%5c")
+                || lower.contains('\\')
+        })
 }
 
 /// Lexically resolve `.`/`..` without touching the filesystem (the target may not exist yet).
@@ -1019,6 +1141,7 @@ fn normalize(p: &Path) -> PathBuf {
 /// we read, without a JSON dependency (the workspace is zero-dep). Matches the field as a *key*
 /// (a `"field"` followed by `:`), so it skips occurrences of the same text used as a value — e.g.
 /// the `"module"` in `"type": "module"` is not mistaken for a `"module"` key.
+#[cfg(test)]
 fn json_string_field(json: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\"");
     let mut from = 0;
@@ -1035,6 +1158,7 @@ fn json_string_field(json: &str, field: &str) -> Option<String> {
 }
 
 /// Parse a JSON string literal from `s` (leading whitespace allowed, then the opening `"`).
+#[cfg(test)]
 fn parse_string(s: &str) -> Option<String> {
     let rest = s.trim_start().strip_prefix('"')?;
     let mut out = String::new();
@@ -1066,6 +1190,105 @@ fn js_string(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn export_patterns_preserve_exact_blocks_specificity_and_boundaries() {
+        let manifest = r#"{"exports":{"./*":{"import":"./dist/esm/*","require":"./dist/cjs/*"},"./feature/*":"./feature/*","./feature/*.js":"./specific/*.mjs","./blocked.js":null,"./internal/*":null}}"#;
+        assert_eq!(
+            super::exports_subpath(manifest, "types.js").as_deref(),
+            Some("./dist/esm/types.js")
+        );
+        assert_eq!(
+            super::exports_subpath(manifest, "feature/a.js").as_deref(),
+            Some("./specific/a.mjs")
+        );
+        for subpath in [
+            "blocked.js",
+            "internal/private.js",
+            "../secret.js",
+            "%2e%2e/secret.js",
+            "node_modules/secret.js",
+            "a%2fb.js",
+        ] {
+            assert_eq!(super::exports_subpath(manifest, subpath), None, "{subpath}");
+        }
+    }
+
+    #[test]
+    fn explicit_root_exports_do_not_fall_back_to_legacy_entries() {
+        for exports in ["null", r#"{".":null}"#, r#"{".":{"require":"./cjs.js"}}"#] {
+            let manifest =
+                format!(r#"{{"exports":{exports},"module":"./legacy.mjs","main":"./legacy.js"}}"#);
+            assert_eq!(super::pkg_entry(&manifest), None);
+        }
+        assert_eq!(
+            super::pkg_entry(r#"{"main":"./legacy.js"}"#).as_deref(),
+            Some("./legacy.js")
+        );
+    }
+
+    #[test]
+    fn nested_unmatched_condition_continues_but_null_blocks() {
+        let manifest =
+            r#"{"exports":{"node":{"require":"./wrong.cjs"},"default":"./fallback.mjs"}}"#;
+        assert_eq!(
+            super::pkg_entry(manifest).as_deref(),
+            Some("./fallback.mjs")
+        );
+        let blocked =
+            r#"{"exports":{"node":{"import":null},"default":"./wrong.mjs"},"main":"./legacy.js"}"#;
+        assert_eq!(super::pkg_entry(blocked), None);
+        let ordered = r#"{"exports":{"default":"./first.mjs","node":{"import":"./second.mjs"}}}"#;
+        assert_eq!(super::pkg_entry(ordered).as_deref(), Some("./first.mjs"));
+        assert_eq!(
+            super::pkg_entry(r#"{"exports":["./array.mjs"],"main":"./legacy.js"}"#),
+            Some("./array.mjs".to_string())
+        );
+    }
+
+    #[test]
+    fn exports_arrays_use_ordered_fallback_for_acorn_and_nulls() {
+        let acorn = r#"{"exports":{".":[{"import":"./dist/acorn.mjs","require":"./dist/acorn.js","default":"./dist/acorn.js"},"./dist/acorn.js"]}}"#;
+        assert_eq!(super::pkg_entry(acorn).as_deref(), Some("./dist/acorn.mjs"));
+        let fallback = r#"{"exports":[{"require":"./wrong.cjs"},null,false,"../outside.js",[null,"./first.mjs"],"./second.mjs"]}"#;
+        assert_eq!(super::pkg_entry(fallback).as_deref(), Some("./first.mjs"));
+        let blocked_branch = r#"{"exports":{"node":[null,{"require":"./unused.cjs"}],"default":"./wrong.mjs"},"main":"./legacy.js"}"#;
+        assert_eq!(super::pkg_entry(blocked_branch), None);
+        let unmatched =
+            r#"{"exports":{"node":[{"require":"./unused.cjs"}],"default":"./fallback.mjs"}}"#;
+        assert_eq!(
+            super::pkg_entry(unmatched).as_deref(),
+            Some("./fallback.mjs")
+        );
+    }
+
+    #[test]
+    fn exports_array_terminal_status_matches_node() {
+        use super::{package_esm_target, PackageEsmTarget};
+        for (source, expected) in [
+            ("[]", PackageEsmTarget::Blocked),
+            ("[false,null]", PackageEsmTarget::Blocked),
+            ("[null,false]", PackageEsmTarget::Unsupported),
+            (r#"[{"require":"./unused.cjs"}]"#, PackageEsmTarget::NoMatch),
+        ] {
+            let json = crate::tsconfig::parse_jsonc(source).unwrap();
+            assert_eq!(package_esm_target(&json), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn package_root_export_ignores_earlier_subpaths() {
+        let manifest = r#"{"repository":{"type":"git"},"type":"module","exports":{
+            "./compile":{"import":"./compile.mjs"},
+            ".":{"import":"./index.mjs"},
+            "./blocked":{"node":null,"default":"./wrong.mjs"}
+        }}"#;
+        assert_eq!(super::pkg_entry(manifest).as_deref(), Some("./index.mjs"));
+        assert_eq!(
+            super::exports_subpath(manifest, "compile").as_deref(),
+            Some("./compile.mjs")
+        );
+        assert_eq!(super::exports_subpath(manifest, "blocked"), None);
+    }
     use super::*;
 
     #[test]
@@ -1079,6 +1302,20 @@ mod tests {
             Some("lib/i.js")
         );
         assert_eq!(json_string_field(r#"{"a":1}"#, "type"), None);
+    }
+
+    #[test]
+    fn package_type_reads_only_the_root_field() {
+        assert_eq!(
+            crate::package_type_from_json(r#"{"repository":{"type":"git"},"type":"module"}"#)
+                .as_deref(),
+            Some("module")
+        );
+        assert_eq!(
+            crate::package_type_from_json(r#"{"repository":{"type":"module"}}"#),
+            None
+        );
+        assert_eq!(crate::package_type_from_json(r#"{"type":null}"#), None);
     }
 
     #[test]
@@ -1189,4 +1426,19 @@ mod tests {
     fn js_string_escapes() {
         assert_eq!(js_string(r#"a"b\c"#), r#""a\"b\\c""#);
     }
+    #[test]
+    fn subpath_exports_own_legacy_files_and_refuse_blocked_disk_fallback() {
+        let dir=std::env::temp_dir().join(format!("lumen-exports-shadow-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let pkg=dir.join("node_modules/shadow");std::fs::create_dir_all(pkg.join("dist")).unwrap();
+        std::fs::write(pkg.join("package.json"),r#"{"type":"module","exports":{"./stream":{"import":"./dist/stream.js","require":"./dist/stream.cjs"},"./cjs":"./dist/stream.cjs","./blocked":null}}"#).unwrap();
+        for path in ["stream.js","blocked.js","dist/stream.js","dist/stream.cjs"] {std::fs::write(pkg.join(path),"").unwrap();}
+        let (path,esm)=super::resolve_node_modules("shadow/stream",&dir).expect("mapped module");
+        assert_eq!(path,pkg.join("dist/stream.js"));assert!(esm);
+        let (path,esm)=super::resolve_node_modules("shadow/cjs",&dir).expect("mapped cjs");
+        assert_eq!(path,pkg.join("dist/stream.cjs"));assert!(!esm);
+        assert!(super::resolve_node_modules("shadow/blocked",&dir).is_none());
+        assert!(super::resolve_node_modules("shadow/stream.js",&dir).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }

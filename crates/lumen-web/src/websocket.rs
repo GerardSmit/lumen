@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lumen_host::{Ctx, SpawnHandle, TaskRegistry, Value};
+use lumen_host::{Ctx, SpawnHandle, Value};
 
 use crate::sha1::sha1;
 use crate::url;
@@ -425,10 +425,7 @@ pub(crate) fn op_ws_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         id
     };
 
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(dispatch, None, decode_connect);
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()
@@ -577,10 +574,7 @@ fn arm_read(ctx: &mut Ctx, id: u64, mut reader: WsReader) {
         Some(e) if !e.dead => e.dispatch.clone(),
         _ => return,
     };
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(dispatch, None, decode_read);
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_read);
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()

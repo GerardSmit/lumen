@@ -175,22 +175,6 @@ function makePath(sep, isWin) {
       if (/^[\\/][\\/]/.test(p)) return "\\\\?\\UNC\\" + p.slice(2);
       return p;
     },
-    matchesGlob(p, pattern) {
-      p = String(p);
-      pattern = String(pattern);
-      if (isWin) { p = p.replace(/\\/g, "/"); pattern = pattern.replace(/\\/g, "/"); }
-      let re = "";
-      for (let i = 0; i < pattern.length; i++) {
-        const c = pattern[i];
-        if (c === "*") {
-          if (pattern[i + 1] === "*") { re += ".*"; i++; if (pattern[i + 1] === "/") i++; }
-          else re += "[^/]*";
-        } else if (c === "?") re += "[^/]";
-        else if ("\\^$.|+()[]{}".includes(c)) re += "\\" + c;
-        else re += c;
-      }
-      return new RegExp("^" + re + "$").test(p);
-    },
   };
   path._makeLong = path.toNamespacedPath; // legacy alias Node still exports
   return path;

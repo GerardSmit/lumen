@@ -88,7 +88,68 @@ pub const CHILD_OPS: &[OpDecl] = ops![
     "writeFd" (5) => op_write_fd,
     "closeFd" (2) => op_close_fd,
     "execSync" (5) => op_exec_sync,
+    "ipcOpen" (1) => op_ipc_open,
+    "ipcRead" (1) => op_ipc_read,
+    "ipcWrite" (2) => op_ipc_write,
+    "ipcClose" (1) => op_ipc_close,
 ];
+
+// Dedicated inherited IPC descriptors are socketpairs. Keep the child event loop
+// nonblocking; JS controls channel ref/unref and bounds queued serialized messages.
+fn ipc_fd(ctx: &mut Ctx, args: &[Value]) -> Result<i32, Value> {
+    match args.first().and_then(Value::as_num_opt) {
+        Some(fd) if fd >= 3.0 && fd <= i32::MAX as f64 && fd.fract() == 0.0 => Ok(fd as i32),
+        _ => Err(ctx.make_error("TypeError", "IPC descriptor must be an integer of at least 3")),
+    }
+}
+fn ipc_failure(ctx: &mut Ctx) -> Value {
+    let error=std::io::Error::last_os_error();
+    let value=ctx.make_error("Error",format!("IPC descriptor: {error}"));
+    let _=ctx.set_member(&value,"code",Value::str(crate::fsb::uv_code(&error)));value
+}
+fn op_ipc_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let fd=ipc_fd(ctx,args)?;
+    #[cfg(unix)] {
+        let flags=unsafe {libc::fcntl(fd,libc::F_GETFL)};
+        if flags<0 || unsafe {libc::fcntl(fd,libc::F_SETFL,flags|libc::O_NONBLOCK)}<0 { return Err(ipc_failure(ctx)); }
+        Ok(Value::Undefined)
+    }
+    #[cfg(not(unix))] {let _=fd;Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
+}
+fn op_ipc_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let fd=ipc_fd(ctx,args)?;
+    #[cfg(unix)] {
+        let mut bytes=[0u8;65536];let count=unsafe {libc::read(fd,bytes.as_mut_ptr().cast(),bytes.len())};
+        if count<0 {
+            let error=std::io::Error::last_os_error();
+            if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) {return Ok(Value::Null);}
+            return Err(ipc_failure(ctx));
+        }
+        ctx.make_uint8array(&bytes[..count as usize])
+    }
+    #[cfg(not(unix))] {let _=fd;Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
+}
+fn op_ipc_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let fd=ipc_fd(ctx,args)?;
+    let bytes=args.get(1).and_then(|value|ctx.typed_array_bytes(value)).ok_or_else(||ctx.make_error("TypeError","IPC write requires bytes"))?;
+    #[cfg(unix)] {
+        // send suppresses SIGPIPE on Linux/Android; macOS socket setup uses SO_NOSIGPIPE.
+        #[cfg(any(target_os="linux",target_os="android"))] let count=unsafe {libc::send(fd,bytes.as_ptr().cast(),bytes.len(),libc::MSG_NOSIGNAL)};
+        #[cfg(not(any(target_os="linux",target_os="android")))] let count=unsafe {libc::write(fd,bytes.as_ptr().cast(),bytes.len())};
+        if count<0 {
+            let error=std::io::Error::last_os_error();
+            if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) {return Ok(Value::Num(0.0));}
+            return Err(ipc_failure(ctx));
+        }
+        Ok(Value::Num(count as f64))
+    }
+    #[cfg(not(unix))] {let _=(fd,bytes);Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
+}
+fn op_ipc_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let fd=ipc_fd(ctx,args)?;
+    #[cfg(unix)] {if unsafe {libc::close(fd)}<0 {return Err(ipc_failure(ctx));}Ok(Value::Undefined)}
+    #[cfg(not(unix))] {let _=fd;Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
+}
 
 // ---- helpers ----------------------------------------------------------------------------------
 
@@ -215,6 +276,10 @@ fn wire_extra_stdio(command: &mut Command, stdio: &[String]) -> std::io::Result<
             continue;
         }
         let (parent, child) = UnixStream::pair()?;
+        #[cfg(any(target_os="macos",target_os="ios"))] {
+            let enabled:libc::c_int=1;
+            if unsafe {libc::setsockopt(child.as_raw_fd(),libc::SOL_SOCKET,libc::SO_NOSIGPIPE,(&enabled as *const libc::c_int).cast(),std::mem::size_of_val(&enabled) as libc::socklen_t)}<0 { return Err(std::io::Error::last_os_error()); }
+        }
         let reader: Box<dyn Read + Send> = Box::new(parent.try_clone()?);
         let writer: Box<dyn Write + Send> = Box::new(parent);
         extra.insert(
@@ -457,8 +522,8 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         })
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process or stdio slot"))?;
 
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
     let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_read);
     // The task inherits the child's current ref state; `child.ref()`/`unref()` can toggle it later.
     if unref {
         reg.set_unref(id);
@@ -510,7 +575,8 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .map(|p| p.stdin.clone())
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+    let id = lumen_host::register_task(
+        ctx,
         resolve,
         Some(reject),
         decode_ok,
@@ -550,8 +616,8 @@ fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .map(|p| (p.child.clone(), p.unref))
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_exit);
     let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_exit);
     if unref {
         reg.set_unref(id);
     }
@@ -661,7 +727,8 @@ fn op_write_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
         .map(|e| e.writer.clone())
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process or stdio slot"))?;
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
+    let id = lumen_host::register_task(
+        ctx,
         resolve,
         Some(reject),
         decode_ok,
