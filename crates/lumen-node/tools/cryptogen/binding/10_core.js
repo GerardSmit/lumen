@@ -176,7 +176,15 @@ class RandomBytesJob extends CryptoJob {
   }
 
   _run() {
-    __rc.randomFill(this.target);
+    const target = this.target;
+    if (typeof SharedArrayBuffer === "function" && target.buffer instanceof SharedArrayBuffer) {
+      // The native op takes exclusive (non-shared) memory: fill a private copy, then store it.
+      const bytes = new Uint8Array(target.byteLength);
+      __rc.randomFill(bytes);
+      target.set(bytes);
+    } else {
+      __rc.randomFill(target);
+    }
     return undefined;
   }
 }
