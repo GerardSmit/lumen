@@ -272,18 +272,17 @@ fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
             assert_eq!(&***key, names[OWNED_THRESHOLD - 1 - depth].as_str());
         }
     }
-    let indexed: Vec<usize> = (INDEX_THRESHOLD + 1..=OWNED_THRESHOLD).rev().collect();
+    // Each shape past the scan threshold answered three lookups by walking its chain; the next
+    // insert's absence probe was its fourth and indexed it. The leaf has seen only three.
+    let indexed: Vec<usize> = (INDEX_THRESHOLD + 1..OWNED_THRESHOLD).rev().collect();
     assert_eq!(
         flat_lists(&p),
         indexed,
-        "only shapes past the scan threshold, for their index"
+        "only probed-past-budget shapes past the scan threshold, for their index"
     );
     assert_eq!(keys(&p), names);
-    assert_eq!(
-        flat_lists(&p),
-        indexed,
-        "iterating reuses the indexed leaf's list"
-    );
+    let listed: Vec<usize> = (INDEX_THRESHOLD + 1..=OWNED_THRESHOLD).rev().collect();
+    assert_eq!(flat_lists(&p), listed, "iterating materialises the leaf's list");
     // The materialised list answers the same lookups.
     for (i, k) in names.iter().enumerate() {
         assert_eq!(p.slot_of(k), Some(i));

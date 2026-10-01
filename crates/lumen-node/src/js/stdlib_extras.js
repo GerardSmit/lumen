@@ -1050,7 +1050,7 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
       try {
         this._raw.write(typeof chunk === "string" && encoding !== "utf8" && encoding !== "utf-8" ? Buffer.from(chunk, encoding) : chunk);
       } catch (e) {
-        if (e && e.code === "EPIPE" && e.errno === undefined) e.errno = __uvCodes.get("EPIPE");
+        if (e && e.code === "EPIPE" && e.errno === undefined) e.errno = __uvCodes().get("EPIPE");
         cb(e);
         return;
       }

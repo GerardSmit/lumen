@@ -154,16 +154,15 @@ function __lazyGlue(index, builtins, internals, globals, init) {
 
 // A registry the module system fills in; each builtin registers itself as it is defined.
 const __builtins = new __GlueRegistry();
-// URL.createObjectURL's registry: "nodedata" id -> Blob (url.js registers, buffer.resolveObjectURL
-// reads).
-const __objectURLs = new Map();
 // Glue-internal values shared between the wrapped builtin files (never user-requirable).
 const __internals = new __GlueRegistry();
 
 // libuv's error table (uv_err_name / uv_strerror): name -> description, and the negative errno
 // each platform's libuv reports (Windows uses libuv's own -40xx range; Unix negates errno). Names
 // missing from a platform's override list use libuv's portable value (the Windows column).
-const __uvErrmap = (() => {
+let __uvErrmapCache;
+function __uvErrmap() {
+  if (__uvErrmapCache !== undefined) return __uvErrmapCache;
   const desc = {E2BIG:"argument list too long",EACCES:"permission denied",EADDRINUSE:"address already in use",EADDRNOTAVAIL:"address not available",EAFNOSUPPORT:"address family not supported",EAGAIN:"resource temporarily unavailable",EAI_ADDRFAMILY:"address family not supported",EAI_AGAIN:"temporary failure",EAI_BADFLAGS:"bad ai_flags value",EAI_BADHINTS:"invalid value for hints",EAI_CANCELED:"request canceled",EAI_FAIL:"permanent failure",EAI_FAMILY:"ai_family not supported",EAI_MEMORY:"out of memory",EAI_NODATA:"no address",EAI_NONAME:"unknown node or service",EAI_OVERFLOW:"argument buffer overflow",EAI_PROTOCOL:"resolved protocol is unknown",EAI_SERVICE:"service not available for socket type",EAI_SOCKTYPE:"socket type not supported",EALREADY:"connection already in progress",EBADF:"bad file descriptor",EBUSY:"resource busy or locked",ECANCELED:"operation canceled",ECHARSET:"invalid Unicode character",ECONNABORTED:"software caused connection abort",ECONNREFUSED:"connection refused",ECONNRESET:"connection reset by peer",EDESTADDRREQ:"destination address required",EEXIST:"file already exists",EFAULT:"bad address in system call argument",EFBIG:"file too large",EHOSTUNREACH:"host is unreachable",EINTR:"interrupted system call",EINVAL:"invalid argument",EIO:"i/o error",EISCONN:"socket is already connected",EISDIR:"illegal operation on a directory",ELOOP:"too many symbolic links encountered",EMFILE:"too many open files",EMSGSIZE:"message too long",ENAMETOOLONG:"name too long",ENETDOWN:"network is down",ENETUNREACH:"network is unreachable",ENFILE:"file table overflow",ENOBUFS:"no buffer space available",ENODEV:"no such device",ENOENT:"no such file or directory",ENOMEM:"not enough memory",ENONET:"machine is not on the network",ENOPROTOOPT:"protocol not available",ENOSPC:"no space left on device",ENOSYS:"function not implemented",ENOTCONN:"socket is not connected",ENOTDIR:"not a directory",ENOTEMPTY:"directory not empty",ENOTSOCK:"socket operation on non-socket",ENOTSUP:"operation not supported on socket",EOVERFLOW:"value too large for defined data type",EPERM:"operation not permitted",EPIPE:"broken pipe",EPROTO:"protocol error",EPROTONOSUPPORT:"protocol not supported",EPROTOTYPE:"protocol wrong type for socket",ERANGE:"result too large",EROFS:"read-only file system",ESHUTDOWN:"cannot send after transport endpoint shutdown",ESPIPE:"invalid seek",ESRCH:"no such process",ETIMEDOUT:"connection timed out",ETXTBSY:"text file is busy",EXDEV:"cross-device link not permitted",UNKNOWN:"unknown error",EOF:"end of file",ENXIO:"no such device or address",EMLINK:"too many links",EHOSTDOWN:"host is down",EREMOTEIO:"remote I/O error",ENOTTY:"inappropriate ioctl for device",EFTYPE:"inappropriate file type or format",EILSEQ:"illegal byte sequence",ESOCKTNOSUPPORT:"socket type not supported",ENODATA:"no data available",EUNATCH:"protocol driver not attached"};
   const base = {E2BIG:-4093,EACCES:-4092,EADDRINUSE:-4091,EADDRNOTAVAIL:-4090,EAFNOSUPPORT:-4089,EAGAIN:-4088,EAI_ADDRFAMILY:-3000,EAI_AGAIN:-3001,EAI_BADFLAGS:-3002,EAI_BADHINTS:-3013,EAI_CANCELED:-3003,EAI_FAIL:-3004,EAI_FAMILY:-3005,EAI_MEMORY:-3006,EAI_NODATA:-3007,EAI_NONAME:-3008,EAI_OVERFLOW:-3009,EAI_PROTOCOL:-3014,EAI_SERVICE:-3010,EAI_SOCKTYPE:-3011,EALREADY:-4084,EBADF:-4083,EBUSY:-4082,ECANCELED:-4081,ECHARSET:-4080,ECONNABORTED:-4079,ECONNREFUSED:-4078,ECONNRESET:-4077,EDESTADDRREQ:-4076,EEXIST:-4075,EFAULT:-4074,EFBIG:-4036,EHOSTUNREACH:-4073,EINTR:-4072,EINVAL:-4071,EIO:-4070,EISCONN:-4069,EISDIR:-4068,ELOOP:-4067,EMFILE:-4066,EMSGSIZE:-4065,ENAMETOOLONG:-4064,ENETDOWN:-4063,ENETUNREACH:-4062,ENFILE:-4061,ENOBUFS:-4060,ENODEV:-4059,ENOENT:-4058,ENOMEM:-4057,ENONET:-4056,ENOPROTOOPT:-4035,ENOSPC:-4055,ENOSYS:-4054,ENOTCONN:-4053,ENOTDIR:-4052,ENOTEMPTY:-4051,ENOTSOCK:-4050,ENOTSUP:-4049,EOVERFLOW:-4026,EPERM:-4048,EPIPE:-4047,EPROTO:-4046,EPROTONOSUPPORT:-4045,EPROTOTYPE:-4044,ERANGE:-4034,EROFS:-4043,ESHUTDOWN:-4042,ESPIPE:-4041,ESRCH:-4040,ETIMEDOUT:-4039,ETXTBSY:-4038,EXDEV:-4037,UNKNOWN:-4094,EOF:-4095,ENXIO:-4033,EMLINK:-4032,EHOSTDOWN:-4031,EREMOTEIO:-4030,ENOTTY:-4029,EFTYPE:-4028,EILSEQ:-4027,ESOCKTNOSUPPORT:-4025,ENODATA:-4024,EUNATCH:-4023};
   const darwin = {E2BIG:-7,EACCES:-13,EADDRINUSE:-48,EADDRNOTAVAIL:-49,EAFNOSUPPORT:-47,EAGAIN:-35,EALREADY:-37,EBADF:-9,EBUSY:-16,ECANCELED:-89,ECONNABORTED:-53,ECONNREFUSED:-61,ECONNRESET:-54,EDESTADDRREQ:-39,EEXIST:-17,EFAULT:-14,EFBIG:-27,EHOSTUNREACH:-65,EINTR:-4,EINVAL:-22,EIO:-5,EISCONN:-56,EISDIR:-21,ELOOP:-62,EMFILE:-24,EMSGSIZE:-40,ENAMETOOLONG:-63,ENETDOWN:-50,ENETUNREACH:-51,ENFILE:-23,ENOBUFS:-55,ENODEV:-19,ENOENT:-2,ENOMEM:-12,ENOPROTOOPT:-42,ENOSPC:-28,ENOSYS:-78,ENOTCONN:-57,ENOTDIR:-20,ENOTEMPTY:-66,ENOTSOCK:-38,ENOTSUP:-45,EOVERFLOW:-84,EPERM:-1,EPIPE:-32,EPROTO:-100,EPROTONOSUPPORT:-43,EPROTOTYPE:-41,ERANGE:-34,EROFS:-30,ESHUTDOWN:-58,ESPIPE:-29,ESRCH:-3,ETIMEDOUT:-60,ETXTBSY:-26,EXDEV:-18,ENXIO:-6,EMLINK:-31,EHOSTDOWN:-64,ENOTTY:-25,EFTYPE:-79,EILSEQ:-92,ESOCKTNOSUPPORT:-44,ENODATA:-96};
@@ -172,9 +171,12 @@ const __uvErrmap = (() => {
   const over = platform === "win32" ? {} : platform === "linux" || platform === "android" ? linux : darwin;
   const map = new Map();
   for (const name of Object.keys(base)) map.set(over[name] ?? base[name], [name, desc[name]]);
-  return map;
-})();
-const __uvCodes = new Map([...__uvErrmap].map(([errno, [name]]) => [name, errno]));
+  return (__uvErrmapCache = map);
+}
+let __uvCodesCache;
+function __uvCodes() {
+  return (__uvCodesCache ??= new Map([...__uvErrmap()].map(([errno, [name]]) => [name, errno])));
+}
 
 // ---- Node-style coded errors ------------------------------------------------------------------
 

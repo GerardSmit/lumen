@@ -1,7 +1,10 @@
 //! Object shapes (hidden classes): the ordered key list every object of a shape shares, the
 //! transition tree that makes structurally-identical objects converge on one shape, prototype
 //! epochs, and common property keys.
-use std::{cell::OnceCell, rc::Rc};
+use std::{
+    cell::{Cell, OnceCell},
+    rc::Rc,
+};
 /// The empty-object shape id: every `Props` starts here (as a `None` shape pointer) and all empty
 /// objects share it, so adding the same first key to two of them lands on the same child shape.
 pub(super) const SHAPE_EMPTY: u32 = 0;
@@ -42,6 +45,11 @@ pub(super) const INDEX_THRESHOLD: usize = 8;
 /// insert.
 pub(super) const OWNED_THRESHOLD: usize = 32;
 
+/// Chain-walk lookups a shared shape past [`INDEX_THRESHOLD`] keys answers before it builds its
+/// key list and hash index.
+const PROBES_BEFORE_INDEX: u8 = 3;
+const _: () = assert!(std::mem::align_of::<SlotIndex>() > PROBES_BEFORE_INDEX as usize);
+
 /// `Shape::len_slot` / `proto_slot` "no such key".
 pub(super) const NO_SLOT: u32 = u32::MAX;
 
@@ -74,7 +82,63 @@ pub(crate) struct Shape {
     keys: Keys,
     /// Built lazily on first lookup once `len > INDEX_THRESHOLD` (shared shapes), or
     /// maintained eagerly on mutation (owned shapes).
-    index: OnceCell<Box<SlotIndex>>,
+    index: IndexCell,
+}
+
+/// A shape's optional [`SlotIndex`] in one word, so the probe counter [`Shape::find`] keeps
+/// before indexing costs no extra field: values up to [`PROBES_BEFORE_INDEX`] count chain-walk
+/// lookups, anything larger is the address of the boxed index.
+struct IndexCell(Cell<usize>);
+
+impl IndexCell {
+    const fn new() -> Self {
+        IndexCell(Cell::new(0))
+    }
+
+    fn from(index: Box<SlotIndex>) -> Self {
+        IndexCell(Cell::new(Box::into_raw(index) as usize))
+    }
+
+    #[inline(always)]
+    fn get(&self) -> Option<&SlotIndex> {
+        let word = self.0.get();
+        // SAFETY: a word past the probe range is a live `Box<SlotIndex>` owned by this cell,
+        // replaced only through `&mut self` or while no index is set.
+        (word > PROBES_BEFORE_INDEX as usize).then(|| unsafe { &*(word as *const SlotIndex) })
+    }
+
+    fn get_mut(&mut self) -> Option<&mut SlotIndex> {
+        let word = self.0.get();
+        // SAFETY: as in `get`, and `&mut self` makes the borrow unique.
+        (word > PROBES_BEFORE_INDEX as usize).then(|| unsafe { &mut *(word as *mut SlotIndex) })
+    }
+
+    fn get_or_init(&self, make: impl FnOnce() -> Box<SlotIndex>) -> &SlotIndex {
+        if self.get().is_none() {
+            self.0.set(Box::into_raw(make()) as usize);
+        }
+        self.get().expect("just set")
+    }
+
+    /// Count one chain-walk lookup; false once the budget is spent.
+    fn take_probe(&self) -> bool {
+        let word = self.0.get();
+        let spare = word < PROBES_BEFORE_INDEX as usize;
+        if spare {
+            self.0.set(word + 1);
+        }
+        spare
+    }
+}
+
+impl Drop for IndexCell {
+    fn drop(&mut self) {
+        let word = self.0.get();
+        if word > PROBES_BEFORE_INDEX as usize {
+            // SAFETY: see `get`; the cell is going away, so nothing borrows the index.
+            drop(unsafe { Box::from_raw(word as *mut SlotIndex) });
+        }
+    }
 }
 
 /// A shape's key → slot hash index: open addressing with linear probing over `u64` buckets, each
@@ -180,7 +244,7 @@ impl Shape {
                 key: Rc::from(""),
                 flat: OnceCell::new(),
             },
-            index: OnceCell::new(),
+            index: IndexCell::new(),
         }
     }
 
@@ -202,7 +266,7 @@ impl Shape {
                 key,
                 flat: OnceCell::new(),
             },
-            index: OnceCell::new(),
+            index: IndexCell::new(),
         }
     }
 
@@ -214,7 +278,7 @@ impl Shape {
             len_slot: NO_SLOT,
             proto_slot: NO_SLOT,
             keys: Keys::Owned(keys),
-            index: OnceCell::new(),
+            index: IndexCell::new(),
         };
         shape.remember_special_slots();
         if shape.len as usize > INDEX_THRESHOLD {
@@ -302,7 +366,7 @@ impl Shape {
     }
 
     fn build_index(&mut self) {
-        self.index = OnceCell::from(self.make_index());
+        self.index = IndexCell::from(self.make_index());
     }
 
     /// The slot of `key`, or `None`.
@@ -319,6 +383,18 @@ impl Shape {
             return index.get(self.keys(), key);
         }
         if self.len as usize > INDEX_THRESHOLD {
+            // A shape an object grows through (an object literal or constructor adding its
+            // ninth key and on) is probed once, to find the key absent, and then never again:
+            // walking its chain for the first few lookups spares it a key list and a hash index
+            // that nothing would read.
+            if let Keys::Chain { flat, .. } = &self.keys {
+                if flat.get().is_none() && self.index.take_probe() {
+                    return self
+                        .chain()
+                        .find(|(_, k)| key_eq(k, key))
+                        .map(|(s, _)| s.len - 1);
+                }
+            }
             return self
                 .index
                 .get_or_init(|| self.make_index())

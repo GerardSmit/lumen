@@ -102,7 +102,7 @@ function signalNumber(signal) {
 }
 
 // libuv errno values (the table util.getSystemErrorName reads) for the ways a spawn can fail.
-const SPAWN_ERRNO = Object.fromEntries(["ENOENT", "EACCES", "ENOTDIR", "EINVAL"].map((c) => [c, __uvCodes.get(c)]));
+const SPAWN_ERRNO = Object.fromEntries(["ENOENT", "EACCES", "ENOTDIR", "EINVAL"].map((c) => [c, __uvCodes().get(c)]));
 
 // A native spawn failure as Node reports it: `spawn foo ENOENT` with errno, syscall, path and
 // spawnargs (the arguments after the file). Anything else is rethrown unchanged.
@@ -561,7 +561,7 @@ function spawnSync(command, args, options) {
     if (res.timedOut) {
       // Node: the child was killed with killSignal and the result carries ETIMEDOUT.
       const error = new Error(`spawnSync ${file} ETIMEDOUT`);
-      error.errno = __uvCodes.get("ETIMEDOUT");
+      error.errno = __uvCodes().get("ETIMEDOUT");
       error.code = "ETIMEDOUT";
       error.syscall = `spawnSync ${file}`;
       error.path = file;

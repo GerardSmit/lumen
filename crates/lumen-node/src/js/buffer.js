@@ -817,7 +817,7 @@ function resolveObjectURL(url) {
     if (split.length !== 2) return;
     const [base, id] = split;
     if (base !== "nodedata") return;
-    const blob = __objectURLs.get(id);
+    const blob = URL[Symbol.for("lumen.url.internals")].objectURLs.get(id);
     if (blob === undefined) return;
     return blob.slice(0, blob.size, blob.type);
   } catch {
@@ -949,45 +949,27 @@ __builtins.set("buffer", {
     __validators.validateNumber(val, "INSPECT_MAX_BYTES", 0);
     INSPECT_MAX_BYTES = val;
   },
-  // Reuse the web globals by identity rather than redefining them (lumen-web installs these).
-  atob: globalThis.atob,
-  btoa: globalThis.btoa,
-  Blob: globalThis.Blob,
-  File: globalThis.File,
+  atob: undefined,
+  btoa: undefined,
+  Blob: undefined,
+  File: undefined,
   isAscii,
   isUtf8,
   transcode,
   resolveObjectURL,
 });
 
-// Installed here, with the Blob registry it feeds, rather than in url.js: node:url loads on
-// first use (see build.rs `LAZY`), but the URL global has these methods from the start.
-// ---- URL.createObjectURL / revokeObjectURL (internal/url installObjectURLMethods) ------------
-
+// Reuse the web globals by identity rather than redefining them. lumen-web loads each on first
+// use, so they are read on first use here too.
 {
-  const { ERR_INVALID_ARG_TYPE } = __errors;
-  function createObjectURL(obj) {
-    if (!(obj instanceof Blob)) throw new ERR_INVALID_ARG_TYPE("obj", "Blob", obj);
-    const id = crypto.randomUUID();
-    __objectURLs.set(id, obj);
-    return `blob:nodedata:${id}`;
+  const exports = __builtins.get("buffer");
+  for (const name of ["atob", "btoa", "Blob", "File"]) {
+    Object.defineProperty(exports, name, {
+      __proto__: null,
+      get() { return globalThis[name]; },
+      set(value) { Object.defineProperty(this, name, { value, writable: true, enumerable: true, configurable: true }); },
+      enumerable: true,
+      configurable: true,
+    });
   }
-  // Node's C++ RevokeObjectURL: parse, require blob:nodedata:<id>, forget the id.
-  function revokeObjectURL(url) {
-    url = `${url}`;
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      return;
-    }
-    if (parsed.protocol !== "blob:") return;
-    const path = parsed.pathname;
-    if (!path.startsWith("nodedata:")) return;
-    __objectURLs.delete(path.slice("nodedata:".length));
-  }
-  Object.defineProperties(URL, {
-    createObjectURL: { __proto__: null, configurable: true, writable: true, enumerable: true, value: createObjectURL },
-    revokeObjectURL: { __proto__: null, configurable: true, writable: true, enumerable: true, value: revokeObjectURL },
-  });
 }

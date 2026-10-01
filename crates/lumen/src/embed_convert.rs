@@ -29,7 +29,7 @@ use crate::bytebuf::ByteBuf;
 use crate::fasthash::FastMap;
 use crate::interpreter::{abrupt_value, Interp};
 use crate::lstr::LStr;
-use crate::value::{Callable, Exotic, Gc, NativeFn, Object, Property, TaInfo, TaKind, Value, WeakGc};
+use crate::value::{Callable, Gc, NativeFn, Object, Property, TaInfo, TaKind, Value, WeakGc};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell, UnsafeCell};

@@ -663,8 +663,9 @@ const WORKER_JS: &str = r#"
     value: __worker, configurable: true, enumerable: false, writable: false,
   });
   const serialize = (value, transfer) => globalThis.__serializeForClone(value, transfer, true);
-  const deserialize = globalThis.__deserializeClone;
+  const deserialize = (bytes) => globalThis.__deserializeClone(bytes);
 
+  const defineWorker = () => {
   class Worker extends EventTarget {
     #id;
     #terminated = false;
@@ -716,7 +717,14 @@ const WORKER_JS: &str = r#"
       configurable: true, enumerable: true, writable: true, value: null,
     });
   }
-  globalThis.Worker = Worker;
+  Object.defineProperty(globalThis, "Worker", { value: Worker, writable: true, enumerable: true, configurable: true });
+  };
+  // The class extends EventTarget, so it is built when first used (see lumen-web's `__lazyWeb`).
+  Object.defineProperty(globalThis, "Worker", {
+    get() { defineWorker(); return globalThis.Worker; },
+    set(value) { Object.defineProperty(globalThis, "Worker", { value, writable: true, enumerable: true, configurable: true }); },
+    enumerable: true, configurable: true,
+  });
 })();
 "#;
 
@@ -730,13 +738,18 @@ const WORKER_SCOPE_JS: &str = r#"
   const report = __wself.report;
   delete globalThis.__wself;
   const serialize = (value, transfer) => globalThis.__serializeForClone(value, transfer, true);
-  const deserialize = globalThis.__deserializeClone;
+  const deserialize = (bytes) => globalThis.__deserializeClone(bytes);
 
   // The global scope acts as an EventTarget for message/messageerror/error.
-  const target = new EventTarget();
-  globalThis.addEventListener = target.addEventListener.bind(target);
-  globalThis.removeEventListener = target.removeEventListener.bind(target);
-  globalThis.dispatchEvent = target.dispatchEvent.bind(target);
+  let scopeTarget;
+  const target = {
+    addEventListener: (...args) => (scopeTarget ??= new EventTarget()).addEventListener(...args),
+    removeEventListener: (...args) => (scopeTarget ??= new EventTarget()).removeEventListener(...args),
+    dispatchEvent: (event) => (scopeTarget ??= new EventTarget()).dispatchEvent(event),
+  };
+  globalThis.addEventListener = target.addEventListener;
+  globalThis.removeEventListener = target.removeEventListener;
+  globalThis.dispatchEvent = target.dispatchEvent;
 
   globalThis.postMessage = (message, _transfer) => { post(serialize(message)); };
   globalThis.close = () => closeSelf();

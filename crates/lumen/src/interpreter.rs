@@ -711,15 +711,44 @@ impl Default for StubEntry {
     }
 }
 
-/// Stub-cache capacity (power of two). 4096 × 24-byte entries = 96 KiB.
-const STUB_CACHE_SIZE: usize = 4096;
+/// Stub-cache capacities (powers of two): the starting size and the cap, 4096 entries = 128 KiB.
+const STUB_CACHE_MIN: usize = 256;
+const STUB_CACHE_MAX: usize = 4096;
 
 /// The table index for a (receiver shape, name pointer) pair. The name pointer's low bits are
 /// alignment zeros; shift them off before mixing so they contribute entropy.
 #[inline(always)]
-fn stub_slot(shape: u32, name: &str) -> usize {
+fn stub_slot(shape: u32, name: &str, len: usize) -> usize {
     let n = name.as_ptr() as usize >> 3;
-    (shape as usize ^ n ^ (n >> 7)) & (STUB_CACHE_SIZE - 1)
+    (shape as usize ^ n ^ (n >> 7)) & (len - 1)
+}
+
+impl Interp {
+    #[inline(always)]
+    fn stub_entry(&self, shape: u32, name: &str) -> StubEntry {
+        let table = self.stub_cache.borrow();
+        table[stub_slot(shape, name, table.len())].get()
+    }
+
+    /// Record a derived entry. The table starts small and grows (dropping its entries, which
+    /// are only a cache) once the stores since the last growth outnumber its slots several
+    /// times over, so a realm that rarely goes megamorphic never pays for the full table.
+    fn stub_store(&self, shape: u32, name: &str, entry: StubEntry) {
+        let stores = self.stub_stores.get() + 1;
+        let len = {
+            let table = self.stub_cache.borrow();
+            table[stub_slot(shape, name, table.len())].set(entry);
+            table.len()
+        };
+        if len >= STUB_CACHE_MAX || (stores as usize) < len * 4 {
+            self.stub_stores.set(stores);
+            return;
+        }
+        let grown = vec![std::cell::Cell::new(StubEntry::default()); len * 4].into_boxed_slice();
+        grown[stub_slot(shape, name, grown.len())].set(entry);
+        *self.stub_cache.borrow_mut() = grown;
+        self.stub_stores.set(0);
+    }
 }
 
 pub struct Interp {
@@ -762,7 +791,9 @@ pub struct Interp {
     /// of re-walking the chain with hashed key lookups. Entries are validated by the same live
     /// shape probe as the per-site ways, so stale entries are misses, never wrong hits — the
     /// table needs no invalidation.
-    pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
+    pub(crate) stub_cache: std::cell::RefCell<Box<[std::cell::Cell<StubEntry>]>>,
+    /// Stores into [`Interp::stub_cache`] since it last grew.
+    stub_stores: std::cell::Cell<u32>,
     /// Prototype pins for property-*creation* inline caches (see
     /// [`crate::bytecode::IC_CREATE`]), keyed by prototype identity. Creation states rotate
     /// through a site's normal polymorphic ways, so tying a pin to a physical cache cell would
@@ -1468,7 +1499,10 @@ impl Interp {
             vm_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
             vm_frame_one: Vec::new(),
-            stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
+            stub_cache: std::cell::RefCell::new(
+                vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_MIN].into_boxed_slice(),
+            ),
+            stub_stores: std::cell::Cell::new(0),
             creation_pins: Default::default(),
             cur_coro: 0,
             inline_ic_safe: std::cell::Cell::new(true),
@@ -3301,7 +3335,7 @@ impl Interp {
             }
         }
         let shape = unsafe { (*head).borrow().props.shape() };
-        let e = self.stub_cache[stub_slot(shape, name)].get();
+        let e = self.stub_entry(shape, name);
         if e.name == name.as_ptr() as usize && e.st.recv_shape == shape {
             if let Some(v) = self.ic_shape_probe(head, name, e.st, false) {
                 // Promote into the site (demoting the other ways): the next access hits
@@ -3582,7 +3616,7 @@ impl Interp {
                     }
                     // Mirror into the stub cache so OTHER shapes rotating through this
                     // site don't evict this resolution for good.
-                    self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
+                    self.stub_store(recv_shape, name, StubEntry {
                         name: name.as_ptr() as usize,
                         st,
                     });
@@ -3616,7 +3650,7 @@ impl Interp {
                                 mid2_shape: absent_shapes[2],
                             };
                             self.ic_insert(cache, st);
-                            self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
+                            self.stub_store(recv_shape, name, StubEntry {
                                 name: name.as_ptr() as usize,
                                 st,
                             });
@@ -3783,7 +3817,7 @@ impl Interp {
         // store site rotating through more shapes than its ways still resolves without the
         // hashed existence scan below. Promote into way 1 like the get path does.
         {
-            let e = self.stub_cache[stub_slot(shape, name)].get();
+            let e = self.stub_entry(shape, name);
             if e.name == name.as_ptr() as usize && e.st.recv_shape == shape && e.st.depth == 0 {
                 if let Some(p) = b.props.entry_at(e.st.slot as usize) {
                     if !p.accessor() && p.writable() {
@@ -3816,7 +3850,7 @@ impl Interp {
                 };
                 self.ic_insert(cache, st);
                 // Mirror into the stub cache (see the probe above).
-                self.stub_cache[stub_slot(shape, name)].set(StubEntry {
+                self.stub_store(shape, name, StubEntry {
                     name: name.as_ptr() as usize,
                     st,
                 });

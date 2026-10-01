@@ -900,6 +900,40 @@
     canParse: { __proto__: null, configurable: true, writable: true, enumerable: true },
   });
 
+  // URL.createObjectURL / revokeObjectURL (internal/url installObjectURLMethods). The registry
+  // ("nodedata" id -> Blob) is shared with buffer.resolveObjectURL through the internals below.
+  const objectURLs = new Map();
+  function createObjectURL(obj) {
+    if (!(obj instanceof Blob)) {
+      throw nodeError(
+        TypeError,
+        "ERR_INVALID_ARG_TYPE",
+        `The "obj" argument must be an instance of Blob.${describeReceived(obj)}`,
+      );
+    }
+    const id = crypto.randomUUID();
+    objectURLs.set(id, obj);
+    return `blob:nodedata:${id}`;
+  }
+  // Node's C++ RevokeObjectURL: parse, require blob:nodedata:<id>, forget the id.
+  function revokeObjectURL(url) {
+    url = `${url}`;
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return;
+    }
+    if (parsed.protocol !== "blob:") return;
+    const path = parsed.pathname;
+    if (!path.startsWith("nodedata:")) return;
+    objectURLs.delete(path.slice("nodedata:".length));
+  }
+  Object.defineProperties(URL, {
+    createObjectURL: { __proto__: null, configurable: true, writable: true, enumerable: true, value: createObjectURL },
+    revokeObjectURL: { __proto__: null, configurable: true, writable: true, enumerable: true, value: revokeObjectURL },
+  });
+
   // Node's internal/url helpers the node: glue builds `url` on (hidden from user code).
   Object.defineProperty(URL, Symbol.for("lumen.url.internals"), {
     __proto__: null,
@@ -910,6 +944,7 @@
       idnaToUnicode: (domain) => __url.toUnicode(toUSVString(domain)),
       format: (href, hash, unicode, search, auth) => __url.format(href, hash, unicode, search, auth),
       isURL,
+      objectURLs,
       toUSVString,
       encodeStr,
       hexTable,

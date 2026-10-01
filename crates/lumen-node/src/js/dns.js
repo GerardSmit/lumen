@@ -136,7 +136,7 @@
         if (!verbatim) list = [...list.filter((e) => e.family === 4), ...list.filter((e) => e.family !== 4)];
         if (list.length === 0) {
           const err = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
-          Object.assign(err, { errno: __uvCodes.get("EAI_NONAME"), code: "ENOTFOUND", syscall: "getaddrinfo", hostname });
+          Object.assign(err, { errno: __uvCodes().get("EAI_NONAME"), code: "ENOTFOUND", syscall: "getaddrinfo", hostname });
           return callback(err);
         }
         if (all) return callback(null, list);
@@ -146,7 +146,7 @@
         if (err && typeof err === "object") {
           if (err.hostname === undefined) err.hostname = hostname;
           if (err.syscall === undefined) err.syscall = "getaddrinfo";
-          if (err.errno === undefined && err.code === "ENOTFOUND") err.errno = __uvCodes.get("EAI_NONAME");
+          if (err.errno === undefined && err.code === "ENOTFOUND") err.errno = __uvCodes().get("EAI_NONAME");
         }
         callback(err);
       },

@@ -505,6 +505,10 @@ pub fn phase(label: &str) {
             fmt_bytes(live),
             fmt_bytes(cached)
         ));
+        if let Some(cats) = categories() {
+            let slab = cats[Cat::Slab as usize].max(0) as usize;
+            line.push_str(&format!(" excl. slab chunks {:>9}", fmt_bytes(live.saturating_sub(slab))));
+        }
     }
     eprintln!("{line}");
     gnu_heap_report();
@@ -688,7 +692,7 @@ impl crate::interpreter::Interp {
         eprintln!(
             "[mem]   module records {}; stub cache {}",
             self.module_recs.len(),
-            fmt_bytes(self.stub_cache.len() * std::mem::size_of_val(&self.stub_cache[0]))
+            fmt_bytes(std::mem::size_of_val(&**self.stub_cache.borrow()))
         );
         let [retained, unevaluated, evaluating, completed, len, cap, source] =
             self.module_program_memory();

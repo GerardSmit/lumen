@@ -1492,7 +1492,7 @@ function codedError(Ctor, code, message) {
 // ---- system error names -----------------------------------------------------------------------
 // libuv's negative errno table for this platform (preamble.js `__uvErrmap`).
 
-const sysErrorMap = __uvErrmap;
+const sysErrorMap = () => __uvErrmap();
 
 function validateErrno(err) {
   if (typeof err !== "number") throw new TypeError('The "err" argument must be of type number.');
@@ -1502,16 +1502,16 @@ function validateErrno(err) {
 }
 function getSystemErrorName(err) {
   validateErrno(err);
-  const entry = sysErrorMap.get(err);
+  const entry = sysErrorMap().get(err);
   return entry ? entry[0] : `Unknown system error ${err}`;
 }
 function getSystemErrorMessage(err) {
   validateErrno(err);
-  const entry = sysErrorMap.get(err);
+  const entry = sysErrorMap().get(err);
   return entry ? entry[1] : `Unknown system error ${err}`;
 }
 function getSystemErrorMap() {
-  return new Map(sysErrorMap);
+  return new Map(sysErrorMap());
 }
 
 function _errnoException(err, syscall, original) {

@@ -65,10 +65,10 @@ const { codes } = { codes: __errors };
 
 const uvUnmappedError = ["UNKNOWN", "unknown error"];
 function uvErrmapGet(errno) {
-  return __uvErrmap.get(errno);
+  return __uvErrmap().get(errno);
 }
 function getSystemErrorName(errno) {
-  const entry = __uvErrmap.get(errno);
+  const entry = __uvErrmap().get(errno);
   return entry ? entry[0] : `Unknown system error ${errno}`;
 }
 function uvException(ctx) {
@@ -134,7 +134,7 @@ function dnsException(code, syscall, hostname) {
   let errno;
   if (typeof code === "number") {
     errno = code;
-    if (code === __uvCodes.get("EAI_NODATA") || code === __uvCodes.get("EAI_NONAME")) code = "ENOTFOUND";
+    if (code === __uvCodes().get("EAI_NODATA") || code === __uvCodes().get("EAI_NONAME")) code = "ENOTFOUND";
     else code = getSystemErrorName(code);
   }
   const ex = new Error(`${syscall} ${code}${hostname ? ` ${hostname}` : ""}`);
@@ -305,8 +305,8 @@ for (const id of Object.keys(shims)) moduleCache.set(id, { exports: shims[id] })
 
 // ---- internalBinding('uv') --------------------------------------------------------------------
 
-const uvBinding = { errname: getSystemErrorName, getErrorMap: () => __uvErrmap };
-for (const [errno, [name]] of __uvErrmap) uvBinding[`UV_${name}`] = errno;
+const uvBinding = { errname: getSystemErrorName, getErrorMap: () => __uvErrmap() };
+for (const [errno, [name]] of __uvErrmap()) uvBinding[`UV_${name}`] = errno;
 const UV_EOF = uvBinding.UV_EOF;
 const UV_EBADF = uvBinding.UV_EBADF;
 const UV_ENOTCONN = uvBinding.UV_ENOTCONN;
@@ -317,9 +317,9 @@ const UV_ENOTSUP = uvBinding.UV_ENOTSUP;
 function errnoOf(error) {
   const code = error && error.code;
   if (typeof code === "string") {
-    const errno = __uvCodes.get(code);
+    const errno = __uvCodes().get(code);
     if (errno !== undefined) return errno;
-    if (code === "ENOTFOUND") return __uvCodes.get("EAI_NONAME");
+    if (code === "ENOTFOUND") return __uvCodes().get("EAI_NONAME");
   }
   return uvBinding.UV_UNKNOWN;
 }
