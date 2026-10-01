@@ -46,7 +46,7 @@ function builtinModule(id) {
     case "async_hooks": case "diagnostics_channel": case "path": case "cluster":
       return __builtins.get(id);
     case "internal/util/types":
-      return __builtins.get("util").types;
+      return __builtins.get("util/types");
     case "internal/util/inspect":
       return { inspect: __builtins.get("util").inspect };
     case "internal/url": {

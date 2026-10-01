@@ -6628,6 +6628,11 @@ impl Interp {
             let frame = self.using_stack.pop().unwrap_or_default();
             result = self.dispose_frame(frame, result);
         }
+        // A run-once body (a lazily loaded glue file's) is not needed again: release it now
+        // rather than at a collection.
+        if crate::bytecode::serialize::opens_run_once(&stmts) {
+            func.release_body();
+        }
         // [[Construct]]: a non-object return yields the *current* `this` binding — which a
         // derived constructor's super() may have rebound to a base constructor's returned object.
         // A derived constructor may only return an object or undefined (TypeError otherwise),

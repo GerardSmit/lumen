@@ -1,5 +1,6 @@
 // Small node: builtins the Express stack pulls in. Each is the practical subset its consumers
-// use, not a full implementation; gaps throw clearly rather than silently misbehaving.
+// use, not a full implementation; gaps throw clearly rather than silently misbehaving. Each one is
+// built on its first `__builtins.get` (see `__lazyValue`), so touching one does not build the rest.
 
 // ---- node:perf_hooks --------------------------------------------------------------------------
 // The web `performance` global, extended with a real mark/measure entry buffer that dispatches to
@@ -7,7 +8,8 @@
 // we add mark/measure/getEntries here and wire them to observers — marks and measures are real.
 // The observer machinery for entry types lumen cannot produce (gc, http, resource…) simply never
 // fires; explicit resource timing from Node HTTP clients is recorded below.
-{
+__builtins.set("perf_hooks", __lazyValue(() => {
+"lumen:run-once";
   const perf = globalThis.performance;
   const now = () => perf.now();
 
@@ -231,7 +233,7 @@
     NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE: 64,
   };
 
-  __builtins.set("perf_hooks", {
+  return {
     performance: perf,
     Performance: perf.constructor,
     PerformanceEntry,
@@ -248,8 +250,8 @@
       const h = makeHistogram();
       return h;
     },
-  });
-}
+  };
+}));
 
 // node:querystring and node:url live in url.js (Node's lib sources over lumen-web's URL).
 
@@ -263,7 +265,8 @@
 // streaming mode (WHATWG replacement semantics, as Node's decoder), UTF-16LE holding back an odd
 // byte or a lone high surrogate, base64/base64url holding back a partial 3-byte group (so each
 // chunk encodes on its own, as Node emits it), and the single-byte encodings chunk by chunk.
-{
+__builtins.set("string_decoder", __lazyValue(() => {
+"lumen:run-once";
   const { ERR_INVALID_ARG_TYPE, ERR_UNKNOWN_ENCODING } = __errors;
   function normalizeEncoding(enc) {
     const raw = enc === undefined || enc === null ? "utf8" : `${enc}`;
@@ -339,23 +342,16 @@
     lastTotal: { get() { return this._rest ? (this.encoding === "utf16le" ? 2 : 3) : 0; }, configurable: true },
     lastChar: { get() { return Buffer.from(this._rest ?? []); }, configurable: true },
   });
-  __builtins.set("string_decoder", { StringDecoder });
-}
-
-// ---- node:tty ---------------------------------------------------------------------------------
-// We run behind pipes, never a terminal — isatty is always false (debug uses it for colors).
-__builtins.set("tty", {
-  isatty: () => false,
-  ReadStream: function () { throw new Error("node:tty streams are not supported"); },
-  WriteStream: function () { throw new Error("node:tty streams are not supported"); },
-});
+  return { StringDecoder };
+}));
 
 // ---- node:async_hooks -------------------------------------------------------------------------
 // AsyncLocalStorage and AsyncResource over the engine's async context (see preamble.js): a
 // context is an immutable Map from storage to store, propagated along promise reactions by the
 // engine and bound into timers/nextTick by the glue. The async_hooks *hook* API (createHook,
 // executionAsyncId) stays a no-op surface: there is no async-id graph to report.
-{
+__builtins.set("async_hooks", __lazyValue(() => {
+"lumen:run-once";
   let nextId = 1;
   class AsyncResource {
     constructor(type) {
@@ -404,7 +400,7 @@ __builtins.set("tty", {
       return (fn, ...args) => __runInAsyncContext(context, fn, undefined, args);
     }
   }
-  __builtins.set("async_hooks", {
+  return {
     AsyncResource,
     // Node's async_wrap provider table (v22). The ids are static names, not live counters, so
     // exposing the real list keeps feature-detecting consumers working.
@@ -429,13 +425,14 @@ __builtins.set("tty", {
     executionAsyncResource: () => ({}),
     createHook: () => ({ enable() { return this; }, disable() { return this; } }),
     AsyncLocalStorage,
-  });
-}
+  };
+}));
 
 // ---- node:zlib --------------------------------------------------------------------------------
 // Real gzip/deflate/Brotli/Zstd/crc32 over shared native codec ops: sync, async-callback, and
 // Transform-stream forms, plus the full constants/codes tables.
-{
+__builtins.set("zlib", __lazyValue(() => {
+"lumen:run-once";
   const codecs = {
     gzip: __zlib.gzip, gunzip: __zlib.gunzip,
     deflate: __zlib.deflate, inflate: __zlib.inflate,
@@ -703,5 +700,5 @@ __builtins.set("tty", {
     Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6,
   };
 
-  __builtins.set("zlib", zlib);
-}
+  return zlib;
+}));

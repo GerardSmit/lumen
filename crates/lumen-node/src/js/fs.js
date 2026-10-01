@@ -51,7 +51,7 @@ function builtinModule(id) {
     case "events":
       return __builtins.get("events");
     case "internal/util/types":
-      return __builtins.get("util").types;
+      return __builtins.get("util/types");
     case "fs/promises":
       return require("fs").promises;
   }
@@ -299,13 +299,18 @@ function sleep(msec) {
     while (Date.now() < end);
   }
 }
+// `promisify.custom` is all fs reads of it while loading; util loads when something promisifies.
+function promisify(original) {
+  return __builtins.get("util").promisify(original);
+}
+promisify.custom = Symbol.for("nodejs.util.promisify.custom");
 const internalUtil = {
+  promisify,
   kEmptyObject,
   once,
   defineLazyProperties,
   createDeferredPromise,
   sleep,
-  get promisify() { return __builtins.get("util").promisify; },
   get deprecate() { return __builtins.get("util").deprecate; },
   get customPromisifyArgs() { return __internals.get("customPromisifyArgs"); },
   SideEffectFreeRegExpPrototypeExec: (re, string) => RegExp.prototype.exec.call(re, string),
@@ -9328,4 +9333,4 @@ fs.globSync = function globSync(pattern, options = {}) {
 };
 
 __builtins.set("fs", fs);
-__builtins.set("fs/promises", fs.promises);
+__builtins.set("fs/promises", __lazyValue(() => fs.promises));

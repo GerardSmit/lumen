@@ -88,4 +88,4 @@ fs.globSync = function globSync(pattern, options = {}) {
 };
 
 __builtins.set("fs", fs);
-__builtins.set("fs/promises", fs.promises);
+__builtins.set("fs/promises", __lazyValue(() => fs.promises));

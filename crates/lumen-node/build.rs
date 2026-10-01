@@ -61,6 +61,10 @@ const JS_FILES: &[GlueFile] = &[
         wrap: true,
     },
     GlueFile {
+        name: "util_types.js",
+        wrap: true,
+    },
+    GlueFile {
         name: "console.js",
         wrap: true,
     },
@@ -248,6 +252,7 @@ const LAZY: &[&str] = &[
     "typescript_strip.js",
     "trace_events.js",
     "util.js",
+    "util_types.js",
     "crypto.js",
     "punycode.js",
     "shims.js",
