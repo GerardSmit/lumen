@@ -432,7 +432,7 @@ class HmacJob extends CryptoJob {
     this.hash = hash;
     this.key = secretBytes(key);
     this.data = new Uint8Array(bytesOf(data));
-    this.signature = signature === undefined ? undefined : bytesOf(signature);
+    this.signature = signature === undefined ? undefined : new Uint8Array(bytesOf(signature));
   }
 
   _run() {
@@ -618,6 +618,14 @@ class KeyObjectHandle {
   }
 
   initJwk(jwk, namedCurve) {
+    if (jwk.kty === "oct") {
+      if (typeof jwk.k !== "string") {
+        throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK secret key format");
+      }
+      this._type = cryptoBinding.kKeyTypeSecret;
+      this._data = new Uint8Array(Buffer.from(jwk.k, "base64"));
+      return this._type;
+    }
     const fields = [];
     for (const key of Object.keys(jwk)) {
       if (typeof jwk[key] === "string") fields.push(key, jwk[key]);
@@ -674,7 +682,7 @@ class KeyObjectHandle {
   }
 
   export(format, type, cipher, passphrase) {
-    if (this._type === cryptoBinding.kKeyTypeSecret) return Buffer.from(this._data);
+    if (this._type === cryptoBinding.kKeyTypeSecret) return Buffer.from(this._data.slice().buffer);
     const encoding = type === undefined ? (this._type === cryptoBinding.kKeyTypePrivate ? 1 : 2) : type;
     let out;
     try {
@@ -4529,6 +4537,7 @@ defineModule("internal/crypto/hkdf", function (module, exports, require, interna
     normalizeHashName,
     toBuf,
     validateByteSource,
+    kHandle,
     kKeyObject,
   } = require('internal/crypto/util');
 
@@ -4616,7 +4625,7 @@ defineModule("internal/crypto/hkdf", function (module, exports, require, interna
 
     validateFunction(callback, 'callback');
 
-    const job = new HKDFJob(kCryptoJobAsync, hash, key, salt, info, length);
+    const job = new HKDFJob(kCryptoJobAsync, hash, key[kHandle], salt, info, length);
 
     job.ondone = (error, bits) => {
       if (error) return FunctionPrototypeCall(callback, job, error);
@@ -4635,7 +4644,7 @@ defineModule("internal/crypto/hkdf", function (module, exports, require, interna
       length,
     } = validateParameters(hash, key, salt, info, length));
 
-    const job = new HKDFJob(kCryptoJobSync, hash, key, salt, info, length);
+    const job = new HKDFJob(kCryptoJobSync, hash, key[kHandle], salt, info, length);
     const { 0: err, 1: bits } = job.run();
     if (err !== undefined)
       throw err;

@@ -844,7 +844,7 @@ function parseIPv6(s) {
   if (tail4 !== null) n = (n & ~0xffffffffn) | tail4;
   return n;
 }
-function formatIPv6(n) {
+function formatIPv6Value(n) {
   const groups = [];
   for (let i = 7; i >= 0; i--) groups.push(Number((n >> BigInt(i * 16)) & 0xffffn));
   let bestStart = -1, bestLen = 0;
@@ -868,7 +868,7 @@ class SocketAddressHandle {
     this._valid = value !== null;
     this._family = type;
     this._value = value;
-    this._address = value === null ? "" : type === AF_INET ? address : formatIPv6(value);
+    this._address = value === null ? "" : type === AF_INET ? address : formatIPv6Value(value);
     this._port = port | 0;
     this._flowlabel = flowlabel >>> 0;
   }
@@ -2886,6 +2886,11 @@ defineModule("internal/socketaddress", function (module, exports, require, inter
         family: undefined,
         flowlabel: undefined,
       });
+      if (this[kDetail] === undefined) {
+        const err = new Error('Invalid socket address');
+        err.code = 'ERR_INVALID_ADDRESS';
+        throw err;
+      }
     }
 
     get address() {
