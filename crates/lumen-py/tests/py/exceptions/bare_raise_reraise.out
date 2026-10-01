@@ -1,0 +1,21 @@
+caught once
+outer orig
+inner
+KeyError ('k',)
+nested bare a
+top a
+no active: RuntimeError
+v
+NameError e
+e was deleted
+in finally
+propagated in finally outer
+finally bare raise ('first',)
+unwind 0
+unwind 1
+unwind 2
+unwind 3
+done bottom
+raise e a
+second iter
+no leak

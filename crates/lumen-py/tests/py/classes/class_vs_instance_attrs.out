@@ -1,0 +1,31 @@
+[1, 2] [1, 2] [1, 2] True
+1 0 0
+[('count', 1)] []
+1 10 10
+[1, 2, 3] True
+[1, 2, 3] [1, 2, 3, 4] True
+[1] []
+class class
+instance class instance
+class
+AttributeError on del
+added later
+patched
+1 None
+2
+no c
+False
+['a', 'b']
+unset slot
+False
+1 2 [('z', 2)]
+base derived
+new base derived
+[1, 2] 2
+[('n', 3)]
+['_all', 'last']
+True
+[('a', 2), ('z', 1)] 1
+Plain Plain True
+default True
+5

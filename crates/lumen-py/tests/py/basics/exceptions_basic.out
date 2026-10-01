@@ -1,0 +1,21 @@
+ZeroDivisionError
+IndexError
+KeyError
+ValueError
+AttributeError
+NameError
+TypeError
+TypeError
+StopIteration
+ValueError
+boom ('boom',) ValueError('boom')
+Sub code 7 7 True
+wrapped KeyError KeyError('k')
+ZeroDivisionError
+['try', 'except', 'finally']
+in finally
+1
+2
+assert msg
+True True
+no active No active exception to reraise

@@ -1,0 +1,39 @@
+name      |  qty|   price
+-------------------------
+apple     |    3|    0.50
+banana    |   12|    0.25
+cherry    |  100|   12.12
+Total: 1217.000
+
+Line one: apple
+Line two: 112
+Line three: yes
+
+'\nLine one: apple\nLine two: 112\nLine three: yes\n'
+a=2 b=xxx plain {not_interpolated} c=[0, 1, 2]
+       1|1       |   *    |
+       2|4       |   **   |
+       3|9       |  ***   |
+24
+outer inner 3
+1
+    5|
+1 2
+a
+b
+\ '\t'
+multiline
+3
+a
+x=1, y=2
+['0:0', '1:1', '2:4', '3:9']
+{'k0': '00', 'k1': '01', 'k2': '02'}
+  mid  | **mid**|
+3.142     42
+1-2 3-4 'z-2'
+True
+lam
+abc
+3 lines: <a>, <b>, <c>
+triple
+deep

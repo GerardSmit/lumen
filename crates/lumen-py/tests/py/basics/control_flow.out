@@ -1,0 +1,32 @@
+i 0
+i 2
+i 4
+i 6
+for-else ran 2
+n 1
+n 2
+n 4
+n 5
+while-else 5
+-1
+big
+3
+a 0 2 0 z
+True False True True
+True False True
+['neg', 'zero', 'pos']
+3
+7
+1 a
+2 b
+3 c
+[(0, 'x'), (1, 'y'), (2, 'z')]
+11 10
+m 5
+body 0
+finally 0
+finally 1
+body 2
+finally 2
+cleanup
+0

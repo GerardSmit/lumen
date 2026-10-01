@@ -1,0 +1,16 @@
+caught deep
+propagated deep
+result ['start', 'after yield', 'finally']
+error after cleanup ['cleanup']
+['start', 'finally']
+closed unstarted []
+got GeneratorExit
+throw propagated 'thrown in'
+recovered
+two ValueError('one')
+closed fresh coroutine
+RuntimeError closed
+RuntimeError ('bad',)
+None
+['ValueError', 1, None]
+('final',)

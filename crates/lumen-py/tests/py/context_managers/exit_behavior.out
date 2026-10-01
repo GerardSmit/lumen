@@ -1,0 +1,13 @@
+suppressed key
+suppressed index
+not suppressed
+clean exit raise: from exit None
+from exit ValueError body
+ValueError('old')
+1 2 3 3
+0
+truthy swallowed
+falsy kept
+none kept n
+args True True True
+['+a', '+b', '+c', 'body', '-c', '-b', '-a']

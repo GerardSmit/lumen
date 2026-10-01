@@ -1,0 +1,25 @@
+000  PUSH 1071
+001  PUSH 462
+002  DUP
+003  JZ 8
+004  SWAP
+005  OVER
+006  MOD
+007  JMP 2
+008  POP
+009  PRINT
+010  HALT
+factorial  ok   steps=119   out=[3628800]
+squares    ok   steps=101   out=[1, 4, 9, 16, 25, 36, 49]
+gcd        ok   steps=25    out=[21]
+primes     ok   steps=1957  out=[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+[(0, 50), (1, 7)]
+underflow  FAIL steps=1     stack underflow at pc=0
+divzero    FAIL steps=3     division by zero at pc=2
+badret     FAIL steps=1     return with empty call stack
+runaway    FAIL steps=500   step limit exceeded
+falloff    FAIL steps=1     pc out of range: 1
+assemble error: unknown mnemonic frobnicate
+assemble error: push needs an argument
+bigmul     ok   steps=463   out=[20397882081197443358640281739902897356800000000]
+True

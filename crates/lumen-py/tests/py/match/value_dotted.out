@@ -1,0 +1,19 @@
+['unknown', 'red', 'green-or-blue', 'green-or-blue', 'unknown']
+limit name ?
+pi inf other
+('whole', [1, 2])
+('num', 5)
+('num', 2.5)
+('inner', 0, [3, 4], 7)
+('kv', 2)
+None
+('x-str', 'xyz')
+None
+big medium small
+[('g1', 20), ('g1', 7), ('g2', 7), ('g1', 1), ('g2', 1), ('last', 1)]
+desc asc equal bad
+one fell out
+r wild
+here
+plane 1 2
+v 0

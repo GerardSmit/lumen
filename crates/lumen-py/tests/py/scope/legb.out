@@ -1,0 +1,15 @@
+local-x global-y
+enclosing-x
+enclosing-x
+global-x
+shadowed
+3
+global-x!
+modified
+2 3 3
+(6, 6)
+42
+UnboundLocalError
+1
+UnboundLocalError augassign
+(1, 'modified')

@@ -1,0 +1,87 @@
+{"name": "lumen", "tags": ["a", "b"], "nested": {"z": 1, "a": [1, 2.5, null, true, false]}, "empty": {}, "list": []}
+{"empty": {}, "list": [], "name": "lumen", "nested": {"a": [1, 2.5, null, true, false], "z": 1}, "tags": ["a", "b"]}
+{
+  "empty": {},
+  "list": [],
+  "name": "lumen",
+  "nested": {
+    "a": [
+      1,
+      2.5,
+      null,
+      true,
+      false
+    ],
+    "z": 1
+  },
+  "tags": [
+    "a",
+    "b"
+  ]
+}
+{
+	"empty": {},
+	"list": [],
+	"name": "lumen",
+	"nested": {
+		"a": [
+			1,
+			2.5,
+			null,
+			true,
+			false
+		],
+		"z": 1
+	},
+	"tags": [
+		"a",
+		"b"
+	]
+}
+{"empty":{},"list":[],"name":"lumen","nested":{"a":[1,2.5,null,true,false],"z":1},"tags":["a","b"]}
+[
+ 1,
+ [
+  2,
+  [
+   3
+  ]
+ ]
+]
+{
+"k": 1
+}
+"h\u00e9llo \"q\" \\ \n\t\u2603" "héllo ☃"
+"\ud83d\ude00" "\u0000\u001f"
+null true 1.0 1e+100 -0.5 10000000000000000000000000
+{"1": "c", "2.5": "b", "null": "d"}
+[1, 2] [] {} ""
+{'a': [1, 2, {'b': None}], 'c': 'é\n', 'd': 1500.0, 'e': -7, 'f': True, 'big': 123456789012345678901234567890} float int 246913578024691357802469135780
+[1, 2, 3] x 3 None True
+True 100.0 0 0.1
+{'a': 2} [] {} {'k': {'k': {'k': []}}}
+True True
+[0, -1, 1.5, 1e-07, 3.14159, 1180591620717411303424, 1e+22] True
+JSONDecodeError '' 0 True
+JSONDecodeError '{' 1 True
+JSONDecodeError '[1,]' 2 True
+JSONDecodeError "{'a': 1}" 1 True
+JSONDecodeError '{"a" 1}' 5 True
+JSONDecodeError 'nul' 0 True
+JSONDecodeError '[1 2]' 3 True
+JSONDecodeError '{"a": }' 6 True
+JSONDecodeError '01' 1 True
+JSONDecodeError '"unterminated' 0 True
+JSONDecodeError '[1] x' 4 True
+JSONDecodeError 'NaN1' 3 True
+TypeError unserializable
+TypeError unserializable
+TypeError unserializable
+TypeError unserializable
+{"s": [1, 2]} "ab"
+ValueError nan
+NaN Infinity True inf
+ValueError circular
+['b', 'a']
+[10, 20] 1.5!
+['z', 'y', 'x'] [('z', 1), ('y', 2)]

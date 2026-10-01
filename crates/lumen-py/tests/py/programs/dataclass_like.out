@@ -1,0 +1,24 @@
+Point(x=3, y=0) Point(x=1, y=2) Point(x=4, y=5)
+True False False
+(3, 0) {'x': 7, 'y': 8}
+x ['x', 'y']
+Point unhashable
+Point(x=10, y=0)
+[Version(major=0, minor=9, patch=9, label='beta'), Version(major=1, minor=0, patch=0, label=''), Version(major=1, minor=2, patch=3, label=''), Version(major=1, minor=2, patch=3, label='rc'), Version(major=2, minor=0, patch=0, label='')]
+True
+True True True
+Version(major=2, minor=0, patch=0, label='') Version(major=0, minor=9, patch=9, label='beta')
+Point has no ordering
+Color(r=255, g=128, b=0) #ff8000
+FrozenInstanceError: cannot assign to field 'r'
+AttributeError: cannot delete field 'g'
+orange True
+Bag(name='a', items=[1]) Bag(name='b', items=[]) s3
+Point3(x=1, y=2, z=3) ['x', 'y', 'z']
+True False
+TypeError: missing required argument: 'x'
+TypeError: __init__() takes 3 positional arguments but 4 were given
+TypeError: unexpected keyword argument 'z'
+TypeError: got multiple values for argument 'x'
+TypeError: non-default argument 'b' follows default argument
+True

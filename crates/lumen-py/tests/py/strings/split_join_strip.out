@@ -1,0 +1,21 @@
+['hello', 'world', 'foo', 'bar'] ['', '', 'hello', 'world', '', 'foo\tbar\n'] ['hello', 'world  foo\tbar\n'] ['  hello world  foo', 'bar']
+['a', 'b', '', 'c'] ['a', 'b,,c'] ['a,b,', 'c'] [''] [] ['', '']
+['a', 'b', 'c'] ['', ''] ['a', 'a', ''] ['', '', 'x', '']
+['line1', 'line2', 'line3', 'line4'] ['a\n', 'b\n'] [] ['']
+a,b,c xxx a-b-c 0, 1, 2, 3  y
+'pad' 'pad  ' '  pad' 'hi' 'hi' 'abc'
+'x' 'example.com' 'file.'
+('a', ' ', 'b c') ('a b', ' ', 'c') ('abc', '', '') ('', '', 'abc') ('', 'abc', '')
+llo hel hello hello
+***abc*** **abc*** abc abc... ...abc 000042 -00042 +004 abc
+a   b   c ab      c a
+b c
+hELLO wORLD Hello World hello HELLO Hello world hello They'Re Bob'S
+a+b_c d bb bbbbaa -a-b-c- ac x
+['one', 'two', '', 'three'] one two three
+['a', 'b', 'c', 'd']
+['The', 'Quick', 'Brown', 'Fox'] quick ['brown', 'fox', 'quick', 'the'] ['fox', 'the', 'brown', 'quick']
+True False True False True True False True True True False
+True False True True False True True True False
+xxx ababab   ababab
+True False True True True True True False

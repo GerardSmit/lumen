@@ -1,0 +1,7 @@
+['aa', 'bbb', 'c']
+['a0', 'b0', 'c0', 'a1', 'b1', 'b2']
+tt
+ValueError boom
+['ValueError', 'str']
+1 1
+main-done

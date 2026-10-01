@@ -1,0 +1,44 @@
+--- Counter
+[('a', 5), ('b', 2), ('c', 1), ('d', 1), ('r', 2)]
+[('a', 5), ('b', 2), ('r', 2)] 5 0 5
+8 0 ['a', 'a', 'a', 'a', 'a']
+[('x', 4), ('y', 1), ('z', 2)] [('a', 1)]
+[('a', 1), ('b', 1), ('c', 1)] [('a', 2), ('b', 2)]
+True 5 []
+[('quick', 1), ('the', 3)] ['brown', 'dog', 'end', 'fox'] 11
+--- defaultdict
+[(3, ['the', 'fox', 'the', 'dog', 'the', 'end']), (4, ['over', 'lazy']), (5, ['quick', 'brown', 'jumps'])]
+[] True 4
+[('i', 4), ('m', 1), ('p', 2), ('s', 4)] True
+{'a': {'x': 2, 'y': 1}, 'b': {'x': 5}}
+KeyError with no factory
+None False [] [3, 4, 5]
+--- deque
+deque([0, 1, 2, 3, 4]) [0, 1, 2, 3, 4] 5 0 4
+4 0 deque([1, 2, 3])
+[-2, -1, 1, 2, 3, 7, 8]
+[7, 8, -2, -1, 1, 2, 3]
+[-1, 1, 2, 3, 7, 8, -2] 1 5
+[-2, 8, 7, 3, 2, 1, -1]
+deque([3, 4, 5], maxlen=3) 3
+[99, 3, 4]
+0 False
+IndexError on empty pop
+True [3, 2, 1] True
+[(0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2), (2, 1), (1, 2), (2, 2)]
+--- OrderedDict
+['one', 'two', 'three'] [('one', 1), ('two', 2), ('three', 3)]
+['two', 'three', 'one']
+['three', 'two', 'one']
+('one', 1) ('three', 3) ['two']
+False False
+True
+OrderedDict({'k': 1})
+--- namedtuple
+Point(x=3, y=4) 3 4 ('x', 'y') True
+Point(x=10, y=4) Point(x=5, y=6) (3, 4) 2
+7 True True True
+Emp(name='ann', dept='eng', salary=0) 0 {'salary': 0} [Emp(name='a', dept='y', salary=3), Emp(name='b', dept='x', salary=2)]
+AttributeError immutable
+TypeError missing arg
+Point(x=2, y=1) True Point

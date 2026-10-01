@@ -1,0 +1,23 @@
+a b c
+multi ['enter a', 'enter b', 'enter c', 'exit c None', 'exit b None', 'exit a None']
+p q
+paren ['enter p', 'enter q', 'exit q None', 'exit p None']
+x y
+paren3 ['enter x', 'enter y', 'enter z', 'exit z None', 'exit y None', 'exit x None']
+caught enter b
+fail enter ['enter a', 'enter b', 'exit a RuntimeError']
+caught body
+body error ['enter a', 'enter b', 'enter c', 'exit c ValueError', 'exit b ValueError', 'exit a ValueError']
+caught OSError exit b ValueError
+exit error ['enter a', 'enter b', 'enter c', 'exit c ValueError', 'exit b ValueError', 'exit a OSError']
+after swallow
+swallow ['enter a', 'enter b', 'enter c', 'exit c ValueError', 'exit b ValueError', 'exit a None']
+swallow no error ['enter a', 'enter b', 'exit b None', 'exit a None']
+caught 'deep'
+nested ['enter outer', 'enter inner', 'exit inner KeyError', 'exit outer KeyError']
+handled inside
+handled ['enter a', 'enter b', 'exit b ValueError', 'exit a None']
+caught exit a
+both exit fail ['enter a', 'enter b', 'exit b None', 'exit a OSError']
+ab
+sum ['enter a', 'enter b', 'exit b None', 'exit a None']

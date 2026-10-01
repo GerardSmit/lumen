@@ -1,0 +1,19 @@
+__main__
+Module docstring.
+1
+True
+Function doc. None Class doc. Method doc. Method doc.
+f f C.m __main__ __main__
+running as script
+in main
+rc 0
+Ellipsis Ellipsis ellipsis True True
+True True NoneType True False
+2 0 1 False True
+ababab ---------- xxx | | [1, 2, 1, 2] (0, 0, 0)
+=====>  <
+None None
+else branch
+True True list
+True True True
+__main__ True True

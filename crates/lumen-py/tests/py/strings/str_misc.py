@@ -1,0 +1,21 @@
+print("{} {}".format("a", "b"), "{1} {0} {1}".format("a", "b"), "{x}-{y}".format(x=1, y=2), "{0[1]} {1[k]} {2.real}".format([1, 2], {"k": "v"}, 5))
+print("{!r} {!s} {!a}".format("é", "é", "é"), "{{}} {{{}}}".format(7), "{:>5}|{:<5}|{:^5}|".format(1, 2, 3))
+print("%d items" % 3, "%s-%s" % ("a", "b"), "%5.1f|%-6s|%06d" % (3.14159, "ab", 42), "%%", "%c%c" % (72, "i"), "%x %X %o %e" % (255, 255, 8, 12345.678))
+print("%(a)s %(b)d" % {"a": "x", "b": 2}, "%s" % None, "%s" % [1], "%s" % (1,), "%r" % "x", "%5s|%-5s|" % ("ab", "cd"), "%.2s" % "abcdef", "%*d" % (5, 42))
+print(str.upper("a"), str.join("-", ["a", "b"]), str.split("a b"), str.strip("  x "), str.format("{}", 1), str.__name__)
+print("a" + "b" * 2 + "c", "abc" * 2 + "d", "ab".join(["1", "2", "3"]), "x" in "xyz", "xz" in "xyz", "abc".index("c"))
+s = "hello"
+t = s
+s += " world"
+print(s, t, s is t, s == "hello world", s != t, s > t, hash("a") == hash("a"), hash(s) == hash("hello world"))
+print(sorted("hello"), list("héy"), tuple("ab"), set("aab") == {"a", "b"}, reversed("abc") is not None, "".join(reversed("abc")), "abc"[::-1] == "".join(reversed("abc")))
+print(min("hello"), max("hello"), sum(1 for c in "hello" if c == "l"), "hello".count("l"), len(set("hello")), any(c.isdigit() for c in "ab1"), all(c.isalpha() for c in "ab1"))
+print(list(enumerate("ab")), list(zip("ab", "xyz")), dict(zip("abc", range(3))), [c * 2 for c in "abc"], {c: ord(c) for c in "ab"}, "".join(c for c in "a1b2" if c.isalpha()))
+table = str.maketrans("abc", "xyz", "d")
+print("aabbccdd".translate(table), str.maketrans("a", "b"), "hello".translate({104: "J", 101: None, 108: "LL"}))
+print("Hello".ljust(8) + "|", "%-8s|" % "Hello", "{:8}|".format("Hello"), "{:>8}|".format("Hello"), "{:*^9}|".format("Hello"))
+print("a b".split(" ", -1), "a  b".split(" ", 1), "abc".split("b", 0), "a b c d".split(None, 2), "  a b  c ".rsplit(None, 2), " a b ".rsplit(None, 5))
+print("ab".isupper(), "AB".isupper(), "A1".isupper(), "1".isupper(), "a1".islower(), "Hello World".istitle(), "hello world".istitle(), "HELLO".istitle(), "".istitle())
+print(" ".isspace(), "\t\n\r\x0b\x0c".isspace(), " ".isspace(), " ".isspace(), "a b".isspace(), "٣".isdigit(), "٣".isdecimal(), "½".isdigit(), "½".isnumeric(), "Ⅷ".isnumeric())
+print("ab\tc".split("\t"), "a  b\n c".split(), "\x1c\x1d\x1e\x1fx".split() if False else "ok", "a b c".split())
+print("abc".startswith(""), "".startswith(""), "abc" "def", "x".join(["a"]), "end")

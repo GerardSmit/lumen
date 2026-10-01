@@ -1,0 +1,26 @@
+[278, 231, 753, 673, 545, 219, 864, 764, 739, 686]
+True [40, 75, 98, 173, 195, 209, 219, 231] [951, 962, 972]
+9 True [9, 7, 5, 3, 1] False
+IndexError: pop from empty heap
+[(1, 'a'), (1, 'd'), (1, 'g'), (2, 'b'), (2, 'c'), (2, 'f'), (3, 'e')]
+t= 0 compile  +2
+t= 2 lint     +2
+t= 4 compile  +2
+t= 6 compile  +1
+t= 7 test     +2
+t= 9 docs     +2
+t=11 test     +2
+t=13 docs     +2
+t=15 docs     +2
+t=17 deploy   +2
+t=19 deploy   +1
+t=40 late     +1
+lint     done at  4 (turnaround 2)
+compile  done at  7 (turnaround 7)
+test     done at 13 (turnaround 12)
+docs     done at 17 (turnaround 13)
+deploy   done at 20 (turnaround 17)
+late     done at 41 (turnaround 1)
+total busy: 21 switches: 12
+True 0 1000
+[0, 1, 2, 3, 4] True

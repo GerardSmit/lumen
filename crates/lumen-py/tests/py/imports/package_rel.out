@@ -1,0 +1,14 @@
+init _pkg _pkg
+init _pkg.sub _pkg.sub _pkg
+init _pkg.inner _pkg.inner
+init _pkg.inner.deep _pkg.inner.deep
+---
+_pkg _pkg.sub _pkg.inner _pkg.inner.deep
+8 10 sub-tag pkg-const
+9 inner-value 10 deep-value
+True True
+_pkg _pkg.inner _pkg.inner _pkg
+True 16
+True False
+True
+module module

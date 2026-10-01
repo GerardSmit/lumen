@@ -1,0 +1,13 @@
+[3, 2, 1]
+4
+['a', 'b', 'c']
+1 2 3 
+callable_iterator 5 6
+[0, 10, 20, 30]
+0,10,20,30,
+[3, 2, 1] ['c', 'b', 'a'] [3, 2, 1, 0]
+[2, 1]
+['z', 'y', 'x']
+['custom', 'reversed']
+dict items reversible
+TypeError

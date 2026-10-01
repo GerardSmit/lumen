@@ -1,0 +1,28 @@
+False
+init _helpers
+load util _helpers.util
+True True
+True True True
+_helpers.util
+0
+2 2
+100 101
+101
+101 102
+init sub _helpers.sub
+load deep _helpers.sub.deep
+['_helpers', '_helpers.sub', '_helpers.sub.deep', '_helpers.util']
+_helpers.sub.deep _helpers.sub
+ModuleNotFoundError no_such_module_xyz
+True
+ModuleNotFoundError _helpers.nothing_here
+ImportError
+ModuleNotFoundError no_such_pkg
+ModuleNotFoundError
+False
+True
+added from outside
+True math
+True 102
+2 2
+True __main__

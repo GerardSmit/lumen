@@ -1,0 +1,13 @@
+class-y global ('class', 'class')
+6 1 6
+enclosing classz
+2 global
+qq deleted
+1 2 2 2
+100 2 2
+[1, 2] True
+body runs once __main__
+H
+['meth', 'name']
+H H meth
+6 5 I.Inner

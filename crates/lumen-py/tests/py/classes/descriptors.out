@@ -1,0 +1,35 @@
+set_name Model a
+get a
+unset
+set a 5
+get a
+5
+[('_a', 5)]
+delete a
+get a
+unset
+nondata:b
+shadow
+[('b', 'shadow')]
+nondata:b
+get a
+unset
+class access a Model
+Data
+True
+1 1
+set a 9
+get a
+9
+class access a Child
+class access a Model
+True
+ann 30
+age must be int
+30 ['_t_age', '_t_name']
+3
+read-only
+42 42 1
+True
+function method
+m m

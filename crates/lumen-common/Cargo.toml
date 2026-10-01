@@ -1,0 +1,13 @@
+[package]
+name = "lumen-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Hash-flooding test helpers (`fasthash::tests`) shared with the engine's own tests.
+test-support = []
+
+[lints]
+workspace = true

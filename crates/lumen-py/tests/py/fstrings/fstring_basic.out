@@ -1,0 +1,20 @@
+Hello, World! 42 43 84 'World' World '\xe9' {literal} {42}
+[1, 2, 3] 1 3 [2, 3] 3 v 7 WORLD wo
+3.14    3.142| 3.1       |    42| 42   |   42   | 00042 +42 2a 0x2a 101010 52 4.200000e+01
+1,000,000 1_000_000 50.000000% 12.3% 1,234.50 0b11111111 -0005    +3
+     World|World     |  World   |***World***|---World|Wor|Wor       |
+     3.142|     World|0000000042|  World   |3.14159265
+n=42 name='World' n + 1=43 items=[1, 2, 3] pi=3.14 name = 'World' n=42
+a 8 [0, 1, 4, 9] 10 yes
+    42| {{}} ab      | None True 1.0 10000000000.0 1e-05 1180591620717411303424
+3.0 3.5e+20 -0.0 inf    nan 0.3333333333333333 nested {x} dq
+555   55  |    5   'a'   25   -5    5
+a	b\n5
+--- AB5 56plain \n5 5\t
+multi
+line 5
+  'World'
+xxx pct fmt     5|  5.00|
+0x0061 a 13 2.67 3 2 001 2
+C<> C<abc> str-C repr-C C<>|    repr-C|
+tricky: } a:b 'v' 1 (1, 2) {1, 2} {}

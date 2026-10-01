@@ -1,0 +1,19 @@
+LRUCache(['c', 'b', 'a'])
+97 LRUCache(['a', 'c', 'b'])
+LRUCache(['d', 'a', 'c']) evicted: ['b']
+None dflt
+LRUCache(['c', 'd', 'a']) 999
+LRUCache(['f', 'e', 'c']) evicted: ['b', 'a', 'd']
+3 False True
+hits=2 misses=2 rate=50%
+final: [5, 4, 3, 7]
+evicted: [2, 3, 4, 5, 2, 6, 1]
+hits=3 misses=11 rate=21%
+832040 hits=28 misses=31 rate=47% 8
+fib
+slow calls: 5 [(3,), (2,)]
+[(2,), (3,), (1,)]
+ValueError: capacity must be positive
+LRUCache(['y']) ['x']
+hits=2049 misses=2951 rate=40% 50 2901
+3262 [109, 1, 87, 75, 95]

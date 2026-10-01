@@ -1,0 +1,13 @@
+3 ['x']
+3
+2
+["a:(1,)[('key', 'v')]", "b:(1,)[('key', 'v')]", "c:(1,)[('key', 'v')]", 'a:(2,)', 'b:(2,)']
+1 ['b:(3,)']
+0 []
+['high', 'once-high', 'default1', 'default2', 'low', 'high', 'default1', 'default2', 'low']
+['ok 1', 'after 1', 'handled ValueError', 'after 2']
+[('job', 'ValueError', 'too big: 2')]
+raised unhandled
+['first ann', 'hello ann', 'first bob'] hello
+{'n': 4}
+['a', 'b', 'c'] 1 ['a', 'c']

@@ -1,0 +1,25 @@
+([1, 2, 3, 4, 'else'], 5)
+aenter a
+aenter b
+body A B
+aexit b None
+aexit a None
+aenter c
+aexit c ValueError
+after c
+aenter d
+aexit d KeyError
+caught 'k'
+('ok', 8)
+agen finally
+([0, 1, 4, 9], 4)
+(4, 3)
+agen finally
+agen finally
+(([0, 1, 4], [0, 4, 16]), 8)
+agen finally
+((0, 1), 2)
+(['ready', 'echo:1', 'echo:2'], 0)
+agen finally
+('stopped', 1)
+async_generator coroutine

@@ -1,0 +1,15 @@
+4 ['greet']
+[None, 3]
+['first', 'hello', 3]
+["once ann ['punct']", 'late ann?', 'first bob', 'hello bob', 'late bob!']
+1 0 2
+['first cy', 'hello cy']
+[3]
+[]
+['handled RuntimeError', 'handled RuntimeError', 'handled ZeroDivisionError']
+[('greet', 'TypeError', "first() got an unexpected keyword argument 'punct'"), ('greet', 'TypeError', "hello() got an unexpected keyword argument 'punct'"), ('divide', 'RuntimeError', 'boom 7/2'), ('divide', 'RuntimeError', 'boom 7/0'), ('divide', 'ZeroDivisionError', 'division by zero')]
+[]
+2 0 ['error', 'greet']
+11 [(0, 3), (3, 10), 'big', (10, 11)]
+[('static', 1), (1, 1), ('static', 2), ('static', 100)]
+1

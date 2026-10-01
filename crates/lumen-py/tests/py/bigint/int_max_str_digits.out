@@ -1,0 +1,54 @@
+4300 4300
+4300 640
+set -1 ValueError maxdigits must be >= 640 or 0 for unlimited
+set 5 ValueError maxdigits must be >= 640 or 0 for unlimited
+set 639 ValueError maxdigits must be >= 640 or 0 for unlimited
+set 'a' TypeError 'str' object cannot be interpreted as an integer
+set 1.5 TypeError 'float' object cannot be interpreted as an integer
+set None TypeError 'NoneType' object cannot be interpreted as an integer
+640 640
+10**639 ok 640
+-10**639 ok 641
+10**640 ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+-10**640 ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+repr ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+format ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+format _ ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+fstring ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+percent ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+percent s ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+str.format ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+list repr ValueError Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+hex ok 534
+oct ok 711
+bin ok 2129
+format x ok 532
+int 640 ok True
+int 641 ValueError Exceeds the limit (640 digits) for integer string conversion: value has 641 digits; use sys.set_int_max_str_digits() to increase the limit
+int spaces ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+int leading zeros ValueError Exceeds the limit (640 digits) for integer string conversion: value has 1000 digits; use sys.set_int_max_str_digits() to increase the limit
+int sign ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+int underscores ok True
+int bytes ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+int base 0 ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+int base 0 hex ok True
+int base 2 ok True
+int base 3 ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+int base 4 ok True
+int base 7 ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+int base 8 ok True
+int base 10 ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+int base 16 ok True
+int base 32 ok True
+int base 36 ValueError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit
+float ok True
+literal SyntaxError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit - Consider hexadecimal for huge integer literals to avoid decimal conversion limits.
+literal 640 ok True
+hex literal ok True
+exec SyntaxError Exceeds the limit (640 digits) for integer string conversion: value has 700 digits; use sys.set_int_max_str_digits() to increase the limit - Consider hexadecimal for huge integer literals to avoid decimal conversion limits.
+700 700
+700 ok 700
+700+1 ValueError Exceeds the limit (700 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+0 0
+unlimited ok 4226
+unlimited int ok 6000

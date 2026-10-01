@@ -1,0 +1,31 @@
+<html>
+inside html
+</html>
+<a>
+<b>
+nested
+</b>
+</a>
+open g1
+got G1
+close g1
+open g2
+swallowed ValueError oops
+close g2
+after g2
+open g3
+close g3
+outer 'passes'
+rolled back
+fail {'a': 1}
+{'a': 1, 'c': 4}
+<early>
+</early>
+value
+generator didn't yield
+generator didn't stop
+<loop0>
+</loop0>
+<loop1>
+body
+</loop1>

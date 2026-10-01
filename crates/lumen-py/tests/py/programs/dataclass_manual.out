@@ -1,0 +1,17 @@
+Point(x=1, y=2) Point(x=5, y=0) Point(x=3, y=4)
+True False False True
+{'x': 1, 'y': 2} 0
+Point(x=1, y=10) Point(x=1, y=2)
+None
+[Version(major=0, minor=9, patch=9, label='old'), Version(major=1, minor=0, patch=0, label=''), Version(major=1, minor=2, patch=3, label=''), Version(major=1, minor=2, patch=3, label='dup'), Version(major=2, minor=0, patch=0, label='')]
+True False True Version(major=2, minor=0, patch=0, label='')
+Bag(name='Alice', items=[1, 2]) Bag(name='Bob', items=[]) False
+hunter2
+Coord(lat=1, lon=2) True here
+AttributeError: cannot assign to field 'lat'
+TypeError: Point() missing required argument: 'x'
+TypeError: Point() takes 2 positional arguments but 3 were given
+TypeError: Point() got multiple values for argument 'x'
+TypeError: Point() got an unexpected keyword argument 'z'
+[Point(x=1, y=1), Point(x=3, y=1)]
+2 Point Point

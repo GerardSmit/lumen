@@ -11,9 +11,13 @@ license.workspace = true
 
 [dependencies]
 lumen-codegen = { path = "../lumen-codegen" }
+lumen-common = { path = "../lumen-common" }
 # The binding macros (`#[lumen::op]`, `#[lumen::class]`, `#[lumen::methods]`); a no-deps
 # proc-macro crate, only pulled in by the `macros` feature.
 lumen-macros = { path = "../lumen-macros", optional = true }
+
+[dev-dependencies]
+lumen-common = { path = "../lumen-common", features = ["test-support"] }
 
 [features]
 default = ["intl", "typed"]

@@ -1,0 +1,30 @@
+True True True False True True
+True True True True
+True True True True True
+ababab ababab   ----------
+abc abc 
+cde abc hij hij abcdefg fgh
+jihgfedcba jhfdb ige jih fedc True
+adgj beh  ab abcdefghij True
+abcdefghij ceg
+j a
+abab
+c a ['a', 'b', 'c'] ['a', 'b', 'c'] ('a', 'b')
+True False False
+True True True False
+True 3 abcd abab
+True True a
+2
+['a', 'b', 'c'] ['aa', 'bb', 'cc'] {'a': 0, 'b': 1, 'c': 2}
+aBcDeF
+True False
+True False
+12 xxyy
+['c', 'b', 'a'] [(0, 'a'), (1, 'b')] [('a', 'x'), ('b', 'y')]
+TypeError can only concatenate str (not "int") to str
+TypeError can't multiply sequence by non-int of type 'str'
+TypeError '<' not supported between instances of 'str' and 'int'
+TypeError 'in <string>' requires string as left operand, not int
+TypeError 'str' object does not support item assignment
+TypeError string indices must be integers, not 'str'
+ValueError slice step cannot be zero

@@ -1,0 +1,44 @@
+Savings('alice', $1,000.00) Checking('bob', $50.00) Checking('carol', $0.00)
+0 ok
+1 ok
+2 insufficient: bob: need 10000 cents, have 5000 5000
+3 ok
+4 invalid: amount must be positive, got -5 True
+5 invalid: amount must be int cents, got 1.5 True
+6 invalid: amount must be int cents, got True True
+7 bank error: duplicate account alice
+8 ok
+9 frozen: carol is frozen
+10 frozen: carol is frozen
+11 ok
+12 ok
+interest 1874 0 0
+[Checking('bob', -$150.00), Checking('carol', $449.99), Savings('alice', $768.73)]
+alice bob
+== alice $768.73 avail $768.73
+   #001 deposit     $1,000.00     $1,000.00  opening
+   #003 withdraw      $250.00       $750.00  to bob
+   #008 deposit         $0.01       $750.01  from carol
+   #010 withdraw        $0.01       $750.00  
+   #011 withdraw        $0.01       $749.99  
+   #012 deposit        $18.74       $768.73  interest
+== bob -$150.00 avail $50.00
+   #002 deposit        $50.00        $50.00  opening
+   #004 deposit       $250.00       $300.00  from alice
+   #005 withdraw      $450.00      -$150.00  to carol
+== carol $449.99 avail $449.99
+   #006 deposit       $450.00       $450.00  from bob
+   #007 withdraw        $0.01       $449.99  to alice
+ok transfer alice->bob $250.00
+transfer attempted
+ok transfer bob->carol $450.00
+transfer attempted
+FAILED transfer bob->carol $100.00: bob: need 10000 cents, have 5000
+transfer attempted
+ok transfer carol->alice $0.01
+transfer attempted
+FAILED transfer alice->carol $1.00: carol is frozen
+transfer attempted
+total $1,068.72
+-$1,234.56 $0.00 $0.05 $1,000,000.00
+['InvalidAmount', 'BankError', 'ValueError', 'Exception', 'BaseException', 'object']

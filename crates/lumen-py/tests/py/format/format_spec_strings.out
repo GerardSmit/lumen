@@ -1,0 +1,46 @@
+'' ['abc', '']
+'s' ['abc']
+'10' ['abc       ', 'abcdefghijklmnop']
+'>10' ['       abc']
+'<10' ['abc       ']
+'^10' ['   abc    ', '   abcd   ']
+'*^10' ['***abc****']
+'-<10' ['abc-------']
+'0>10' ['0000000abc']
+'.2' ['ab']
+'10.2' ['ab        ']
+'>10.2' ['        ab']
+'.0' ['']
+'1' ['abc']
+'3' ['é€😀']
+'^7' ['  é€😀  ']
+'d' ['ValueError']
+'+' ['ValueError']
+'=5' ['ValueError']
+'05' ['abc00']
+',' ['ValueError']
+'x' ['ValueError']
+'c' ['ValueError']
+'<' ['ab']
+'^3' ['ab ']
+    ab|cd    |  ef  |
+    ab|ab    |  ab  |
+a  |   b|
+abcdef  |     abc
+     'é'|é       | '\xe9' |
+   p|q   |  a  |b|
+5|2.0|int
+val|20|  val
+123 312 xx
+skip e 1
+'{' ValueError
+'}' ValueError
+'{0' ValueError
+'{}{1}' ValueError
+'{x}' KeyError
+'{0.nope}' AttributeError
+'{0[5]}' TypeError
+'{:z}' ValueError
+'{!x}' ValueError
+'{:{}}' IndexError
+  x 5 5 x 1.5 True None [1] (1, 2)

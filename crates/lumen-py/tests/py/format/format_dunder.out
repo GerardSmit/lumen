@@ -1,0 +1,25 @@
+100C 100C 212.0F   100.00
+100C 212.0F Temp(str) Temp(repr)  100.0| 100C 212.0F Temp(repr)
+Temp(str) Temp(repr) Temp(str) Temp(repr)
+ValueError bad spec zzz
+only-str <__main__ only-repr only-repr
+only-str only-repr only-str only-repr <__main__
+only-str [only-repr]
+TypeError unsupported format string passed to OnlyStr.__format__
+[   ab] [ab   ] [  ab  ] [abc]
+True False 1     1      1 000
+None None None None   None
+True True 1 0 x None
+5 5 5 -5 1.0 1e+100 1e-100
+s [1, 'a'] (1, 'a') {'a': 1} {1} range(0, 3) b'a'
+True True True
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+005   a 1.500 5  ab |
+True str
+$12.34     $12.34 $12.34**** Money(1234) [Money(1234)] (Money(1234),) {'k': Money(1234)}
+[Money(1234)] (Money(1234), Money(1234))

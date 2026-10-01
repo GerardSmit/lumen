@@ -1,0 +1,27 @@
+finally f1
+try
+finally
+fin f3
+except
+fin f4
+else
+body 0
+fin 0
+fin 1
+body 2
+fin 2
+fin6 0
+fin6 1
+fin6 2
+2
+swallowed
+1
+inner finally
+caught inner
+outer finally
+after break
+TypeError b ValueError
+['try', 'except', 'finally']
+else runs
+cont fin 0
+cont fin 1

@@ -1,0 +1,37 @@
+range(0, 10) 10 0 9 3 [2, 3, 4]
+range(2, 10, 3) 3 [2, 5, 8]
+range(10, 0, -3) [10, 7, 4, 1] 4
+0 0 0 []
+range(1, 4) range(0, 10, 2) range(9, -1, -1) range(8, 2, -2)
+[9, 6, 3, 0] range(2, 10, 2) range(10, 10)
+3
+[4, 3, 2, 1, 0] [9, 5, 1]
+True False False True False
+True True False
+True False
+True True True
+False True
+2 6 1 0
+0 10 1 3
+10 1000000000000000000 1000000000000000009 True
+10000000000 500000000000000000000 999999999900000000000000000000
+20
+18446744073709551615 True
+5050 4 2 [1, 2, 3]
+False True
+[0, 1, 4, 9, 16]
+[-3, -2, -1, 0, 1, 2] [3, 1, -1, -3]
+(0, 1, 2) True
+[(0, 'a'), (1, 'b'), (2, 'c')]
+ValueError range() arg 3 must not be zero
+IndexError range object index out of range
+TypeError
+TypeError
+TypeError
+ValueError
+ValueError
+0 1 2 done
+True
+True range
+1 0
+3 2 1 

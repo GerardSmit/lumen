@@ -1,0 +1,27 @@
+tuple:ConfigError
+tuple:Timeout
+net
+app
+other
+('port', 'bad config') port bad config
+('port', 'bad config')
+ConfigError('port', 'bad config')
+504 500 NetError<host> Timeout('host')
+ Plain()
+x Plain('x')
+('x', 1) Plain('x', 1)
+5 Plain(5)
+True True True
+True False
+['Timeout', 'NetError', 'AppError', 'Exception', 'BaseException', 'object']
+NetError
+('a', 'b') NetError<a>
+Plain() ()
+{'a': 1} ({'a': 1},)
+'missing' KeyError('missing')
+(1, 2)
+('x',) ()
+caught one
+dyn KeyError
+right
+bad except spec

@@ -1,0 +1,15 @@
+import re
+
+m = re.match(r"(\d+)-(\w+)", "123-abc rest")
+print(m.group(0), m.group(1), m.group(2), m.groups(), m.span(), m.start(2), m.end())
+print(re.match(r"\d+", "abc"), re.search(r"\d+", "abc 42 x").group(), re.fullmatch(r"a+", "aaa") is not None, re.fullmatch(r"a", "ab"))
+print(re.findall(r"\d+", "a1 b22 c333"), re.findall(r"(\w)(\d)", "a1 b2"), re.findall(r"x", "abc"))
+print(re.sub(r"\s+", " ", "a   b \t c"), re.sub(r"(\w+)@(\w+)", r"\2 at \1", "me@host"), re.sub("a", "b", "aaa", count=2))
+print(re.sub(r"\d", lambda m: str(int(m.group()) * 2), "a1b2c3"), re.subn(r"o", "0", "foo boo"))
+print(re.split(r"[,;]\s*", "a, b;c,d"), re.split(r"(\d)", "a1b2c"), re.split(r"x", "abc"), re.split(r"\s", "a b c", maxsplit=1))
+pat = re.compile(r"(?P<key>\w+)=(?P<val>\d+)")
+mm = pat.search("  alpha=10 beta=20")
+print(mm.group("key"), mm.groupdict(), [x.groups() for x in pat.finditer("a=1 b=2")])
+print(re.match(r"^hello$", "Hello", re.IGNORECASE) is not None, re.findall(r"^\w", "a\nb", re.M), re.search(r"a.b", "a\nb"), re.search(r"a.b", "a\nb", re.S) is not None)
+print(re.escape("a.b*c"), bool(re.match(r"[a-c]{2,3}?", "abc")), re.match(r"(a)|(b)", "b").groups())
+print(re.findall(r"\b\w{3}\b", "the cat sat down"), re.match(r"(?:ab)+", "ababab").group(), re.search(r"(?<=\$)\d+", "cost $45").group())

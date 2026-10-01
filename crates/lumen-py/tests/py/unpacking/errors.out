@@ -1,0 +1,32 @@
+too many ValueError too many values to unpack (expected 2, got 3)
+too many 4 ValueError too many values to unpack (expected 2, got 4)
+too few ValueError not enough values to unpack (expected 2, got 1)
+too few empty ValueError not enough values to unpack (expected 2, got 0)
+three few ValueError not enough values to unpack (expected 3, got 2)
+three many ValueError too many values to unpack (expected 3)
+exact ok
+str many ValueError too many values to unpack (expected 2)
+str few ValueError not enough values to unpack (expected 2, got 1)
+star few ValueError not enough values to unpack (expected at least 2, got 1)
+star exact ok
+star many ok
+nested ValueError too many values to unpack (expected 2, got 3)
+nested few ValueError not enough values to unpack (expected 2, got 1)
+not iter TypeError cannot unpack non-iterable int object
+none TypeError cannot unpack non-iterable NoneType object
+dict ValueError too many values to unpack (expected 2, got 3)
+dict ok ok
+set few ValueError not enough values to unpack (expected 2, got 1)
+gen ValueError too many values to unpack (expected 2)
+gen few ValueError not enough values to unpack (expected 2, got 1)
+bytes ValueError too many values to unpack (expected 2)
+int TypeError cannot unpack non-iterable int object
+float TypeError cannot unpack non-iterable float object
+gen raises RuntimeError boom
+ValueError too many values to unpack (expected 2, got 3)
+ValueError not enough values to unpack (expected 4, got 2)
+ValueError not enough values to unpack (expected 2, got 0)
+ValueError too many values to unpack (expected 1, got 2)
+ValueError not enough values to unpack (expected at least 2, got 0)
+1 2
+ValueError not enough values to unpack (expected 2, got 1)

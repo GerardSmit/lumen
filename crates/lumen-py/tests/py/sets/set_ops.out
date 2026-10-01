@@ -1,0 +1,32 @@
+{1, 2, 3, 4, 5, 6} {3, 4} {1, 2} {5, 6} {1, 2, 5, 6} {1, 2, 3, 4, 5, 6} {3, 4} {1, 2} {1, 2, 5, 6}
+{1, 2, 3, 4, 9, 10} {1} {3, 4} {0, 1, 2, 3, 4}
+[1, 2, 3, 4, 5, 6] 6 2 True False True
+False True True False True True False True True True
+True True True False True True
+{2} 2 None None {2}
+{2, 5, 6, 7}
+None {2, 6, 7}
+KeyError 99
+True 2
+set() False set() 0
+{10, 4}
+{10, 4}
+{4}
+{5}
+True ['e', 'h', 'l', 'o'] 4 {1} {0, 1, 2} {1, 2} {1}
+True True {1} {0} {(1, 2)} {1180591620717411303424}
+{0, 9, 3, 6} {0, 1, 2, 3} {0, 9, 4, 1}
+frozenset({1, 2, 3}) frozenset({1, 2, 3, 4}) frozenset({3}) frozenset({1, 2}) frozenset({1, 2, 4}) True 1 True frozenset set
+frozenset() set() frozenset({1}) 3 True [1, 2, 3] True
+a {frozenset({1, 2})} {(1, frozenset({1}))}
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+AttributeError
+6 5 2 [3, 2, 1] False False 3
+True True True True
+[0, 15, 30, 45, 60, 75, 90] 500 7450

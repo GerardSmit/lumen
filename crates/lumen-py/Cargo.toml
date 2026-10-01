@@ -1,0 +1,19 @@
+# lumen-py: a from-scratch Python 3 implementation (lexer, parser, bytecode compiler, VM).
+# Std-only, like the JS engine.
+[package]
+name = "lumen-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "lumen-py"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+lumen-common = { path = "../lumen-common" }

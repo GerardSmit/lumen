@@ -1,0 +1,20 @@
+enter a
+inside A
+exit a None
+enter b
+enter c
+both B C
+exit c None
+exit b None
+enter swallow
+exit swallow ValueError
+after swallow
+enter prop
+exit prop KeyError
+propagated KeyError
+[10, 20, 30]
+[10, 20, 30, 40]
+[20, 40]
+else ran
+30
+[0, 1, 4]

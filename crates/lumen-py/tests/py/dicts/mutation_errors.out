@@ -1,0 +1,30 @@
+RuntimeError dictionary changed size during iteration
+True
+RuntimeError dictionary changed size during iteration
+{'b': 2, 'c': 3}
+RuntimeError dictionary changed size during iteration
+RuntimeError dictionary changed size during iteration
+{'a': 10, 'b': 20, 'c': 30}
+{'a': 10}
+{'a': 1, 'c': 3}
+{'a': 3}
+a
+RuntimeError dictionary changed size during iteration
+a b
+RuntimeError dictionary changed size during iteration
+{'b': 2}
+KeyError 'missing'
+KeyError 2
+KeyError 'b'
+KeyError 'popitem(): dictionary is empty'
+KeyError (2, 1)
+KeyError('x') ('x',) 'x'
+('k',)
+'popitem(): dictionary is empty'
+'a'
+1 zzzz None 1 False
+{'a': 2, 'b': 1, 'c': 1}
+TypeError
+TypeError
+ValueError dictionary update sequence element #0 has length 3; 2 is required
+TypeError
