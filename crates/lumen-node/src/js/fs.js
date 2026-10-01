@@ -9353,3 +9353,8 @@ fs.globSync = function globSync(pattern, options = {}) {
 
 __builtins.set("fs", fs);
 __builtins.set("fs/promises", __lazyValue(() => fs.promises));
+// A later Node API (22+): available, but not one of the enumerable keys Node 20 exposes.
+Object.defineProperty(fs, "globSync", { enumerable: false });
+// The originals, so the module loader can tell when a program patched them (module.js).
+__internals.set("fs_readFileSync", fs.readFileSync);
+__internals.set("fs_realpathSync", fs.realpathSync);

@@ -1178,6 +1178,10 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
   // node:stream at startup.
   let stdinStream;
   const getStdin = () => (stdinStream ??= createStdin());
+      // Node checks write permission up front: on the named file, else on the working directory.
+      const permission = __internals.get("permission");
+      if (target) permission.check("FileSystemWrite", String(target));
+      else permission.check("FileSystemWrite", proc.cwd());
   function createStdin() {
   const stdinIsTTY = typeof proc._isatty === "function" && proc._isatty(0);
   const stdin = new (__builtins.get("stream").Readable)({ highWaterMark: 64 * 1024 });
