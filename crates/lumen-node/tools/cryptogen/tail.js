@@ -1,6 +1,8 @@
 // ---- registration ------------------------------------------------------------------------------
 
 __builtins.set("crypto", require("crypto"));
+__internals.set("cryptoRequire", (id) => require(id));
+__internals.set("cryptoBinding", cryptoBinding);
 __internals.set("cloneModule:internal/crypto",
                 (id, name) => (name === "keyObjectFromClone" ? keyObjectFromClone : require(id)[name]));
 

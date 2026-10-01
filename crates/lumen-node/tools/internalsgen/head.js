@@ -41,9 +41,26 @@ for (const [table, ids] of [
     "internal/fs/recursive_watch"],
   ["http2Require", "internal/http2/util internal/http2/compat internal/http2/core"],
   ["tlsRequire", "internal/js_stream_socket internal/tls/secure-context internal/tls/secure-pair"],
+  ["readlineRequire", "internal/readline/utils internal/readline/callbacks internal/readline/interface " +
+    "internal/readline/emitKeypressEvents internal/readline/promises"],
+  ["testRunnerRequire", "internal/error_serdes internal/watch_mode/files_watcher internal/test_runner/tests_stream " +
+    "internal/test_runner/utils internal/test_runner/test internal/test_runner/harness internal/test_runner/runner " +
+    "internal/test_runner/coverage internal/test_runner/mock/mock internal/test_runner/mock/mock_timers " +
+    "internal/test_runner/reporter/dot internal/test_runner/reporter/junit internal/test_runner/reporter/lcov " +
+    "internal/test_runner/reporter/spec internal/test_runner/reporter/tap internal/test_runner/reporter/v8-serializer"],
+  ["urlRequire", "internal/url internal/querystring"],
+  ["cryptoRequire", "internal/crypto/aes internal/crypto/argon2 internal/crypto/certificate internal/crypto/cfrg " +
+    "internal/crypto/cipher internal/crypto/diffiehellman internal/crypto/ec internal/crypto/hash " +
+    "internal/crypto/hashnames internal/crypto/hkdf internal/crypto/keygen internal/crypto/keys " +
+    "internal/crypto/mac internal/crypto/pbkdf2 internal/crypto/random internal/crypto/rsa internal/crypto/scrypt " +
+    "internal/crypto/sig internal/crypto/util internal/crypto/webcrypto internal/crypto/webidl internal/crypto/x509"],
+  ["builtinInternals", "internal/child_process internal/cluster/round_robin_handle " +
+    "internal/cluster/shared_handle internal/cluster/worker internal/cluster/utils"],
 ]) {
   for (const id of ids.split(" ")) foreignModules.set(id, table);
 }
+
+__internals.set("builtinInternals", (id) => __builtins.get(id));
 
 function require(id) {
   const cached = moduleCache.get(id);
@@ -98,6 +115,7 @@ for (const name of ["uv", "tcp_wrap", "pipe_wrap", "stream_wrap", "udp_wrap", "b
 bindingMakers.tls_wrap = () => __internals.get("tlsBinding")("tls_wrap");
 bindingMakers.js_stream = () => __internals.get("tlsBinding")("js_stream");
 bindingMakers.http2 = () => __internals.get("http2Binding")("http2");
+bindingMakers.crypto = () => __internals.get("cryptoBinding");
 bindingMakers.trace_events = () => __internals.get("trace_events").binding;
 
 const nullProto = (object) => Object.assign({ __proto__: null }, object);
@@ -314,17 +332,314 @@ bindingMakers.config = () => ({
   fipsMode: false,
 });
 
+bindingMakers.contextify = () => ({
+  startSigintWatchdog: () => __node.sigintWatchdogStart(),
+  stopSigintWatchdog: () => __node.sigintWatchdogStop(),
+  watchdogHasPendingSigint: () => __node.sigintWatchdogPending(),
+});
+
+// Node's src/signal_wrap.cc: a handle that delivers one signal to `onsignal`.
+bindingMakers.signal_wrap = () => {
+  const names = new Map(Object.entries(__builtins.get("os").constants.signals).map(([name, number]) => [number, name]));
+  const kEINVAL = -22;
+  class Signal {
+    #key;
+    #refed = true;
+    #closed = false;
+    static #check(self) {
+      if (typeof self !== "object" || self === null || !(#refed in self)) throw new TypeError("Illegal invocation");
+    }
+    start(signum) {
+      Signal.#check(this);
+      const name = names.get(signum);
+      if (name === undefined || this.#closed) return kEINVAL;
+      this.#stop();
+      try {
+        this.#key = __node.signalWatch(name, (number) => this.onsignal?.(number));
+      } catch {
+        return kEINVAL;
+      }
+      return 0;
+    }
+    #stop() {
+      if (this.#key !== undefined) __node.signalUnwatch(this.#key);
+      this.#key = undefined;
+    }
+    stop() {
+      Signal.#check(this);
+      this.#stop();
+      return 0;
+    }
+    close(callback) {
+      Signal.#check(this);
+      this.#stop();
+      this.#closed = true;
+      if (typeof callback === "function") process.nextTick(callback);
+    }
+    ref() {
+      Signal.#check(this);
+      this.#refed = true;
+    }
+    unref() {
+      Signal.#check(this);
+      this.#refed = false;
+    }
+    hasRef() {
+      Signal.#check(this);
+      return this.#refed;
+    }
+    getAsyncId() {
+      Signal.#check(this);
+      return 0;
+    }
+  }
+  return { Signal };
+};
+
 // The options as the command line set them (lumen-cli parses Node's grammar into
 // `process[Symbol.for("lumen.options")]`).
 function cliOptions() {
   return process[Symbol.for("lumen.options")] || {};
 }
 
+bindingMakers.timers = () => {
+  const start = performance.now();
+  return {
+    getLibuvNow: () => Math.floor(performance.now() - start),
+    setupTimers() {},
+    scheduleTimer() {},
+    toggleTimerRef() {},
+    toggleImmediateRef() {},
+    immediateInfo: new Uint32Array(3),
+    timerInfo: new Int32Array(1),
+  };
+};
+
+bindingMakers.async_wrap = () => {
+  return {
+    queueDestroyAsyncId: (id) => __internals.get("asyncHookRuntime").destroy(id),
+    async_hook_fields: new Uint32Array(8),
+    async_id_fields: new Float64Array(4),
+    async_ids_stack: new Float64Array(32),
+    execution_async_resources: [],
+    constants: { kInit: 0, kBefore: 1, kAfter: 2, kDestroy: 3, kPromiseResolve: 4, kTotals: 5, kCheck: 6,
+      kStackLength: 7, kUsesExecutionAsyncResource: 8, kExecutionAsyncId: 0, kTriggerAsyncId: 1,
+      kAsyncIdCounter: 2, kDefaultTriggerAsyncId: 3 },
+  };
+};
+
+// The StreamBase accessors throw on a receiver that is not a handle, yet stay visible to
+// getOwnPropertyDescriptor.
+bindingMakers.tty_wrap = () => {
+  class LibuvStreamWrap {
+    #handle = true;
+    static #check(self) {
+      if (typeof self !== "object" || self === null || !(#handle in self)) throw new TypeError("Illegal invocation");
+    }
+    static {
+      for (const name of ["bytesRead", "fd", "_externalStream"]) {
+        Object.defineProperty(LibuvStreamWrap.prototype, name, {
+          configurable: true,
+          get() {
+            LibuvStreamWrap.#check(this);
+            return name === "fd" ? this.fdValue : 0;
+          },
+        });
+      }
+    }
+  }
+  class TTY extends LibuvStreamWrap {
+    constructor(fd) {
+      super();
+      this.fdValue = fd;
+    }
+  }
+  return { TTY, isTTY: (fd) => __builtins.get("tty").isatty(fd) };
+};
+
 // ---- adapters ---------------------------------------------------------------------------------
+
+defineModule("internal/worker/js_transferable", function (module) {
+  const kClone = Symbol.for("lumen.transferable.clone");
+  const kDeserialize = Symbol.for("lumen.transferable.deserialize");
+  class JSTransferable {
+    // Node's is a native class: objects it deserializes are not instances of it.
+    static [Symbol.hasInstance](value) {
+      return this !== JSTransferable && Function.prototype[Symbol.hasInstance].call(this, value);
+    }
+  }
+  module.exports = {
+    JSTransferable,
+    kClone,
+    kDeserialize,
+    kTransfer: Symbol("kTransfer"),
+    kTransferList: Symbol("kTransferList"),
+    kDisallowCloneAndTransfer: Symbol("kDisallowCloneAndTransfer"),
+    makeTransferable: (object) => object,
+    markTransferMode() {},
+    setup() {},
+  };
+});
+
+__internals.set("cloneModule:internal/test", (id, name) => require(id)[name]);
+defineModule("internal/test/transfer", function (module) {
+  const { JSTransferable, kClone, kDeserialize } = require("internal/worker/js_transferable");
+  class E extends JSTransferable {
+    constructor(b) {
+      super();
+      this.b = b;
+    }
+    [kClone]() {
+      return { data: { b: this.b }, deserializeInfo: "internal/test/transfer:E" };
+    }
+    [kDeserialize]({ b }) {
+      this.b = b;
+    }
+  }
+  class F extends E {
+    [kClone]() {
+      return { data: { b: this.b }, deserializeInfo: "internal/test/transfer:F" };
+    }
+  }
+  module.exports = { E, F };
+});
 
 defineModule("internal/test/binding", function (module) {
   process.emitWarning("These APIs are for internal testing only. Do not use them.", "internal/test/binding");
   module.exports = { internalBinding, primordials };
+});
+
+defineModule("internal/event_target", function (module) {
+  const e = __eventTargetInternals;
+  module.exports = {
+    Event: e.Event,
+    CustomEvent: e.CustomEvent,
+    EventTarget: e.EventTarget,
+    NodeEventTarget: e.NodeEventTarget,
+    defineEventHandler: e.defineEventHandler,
+    initEventTarget: e.initEventTarget,
+    initNodeEventTarget: e.initEventTarget,
+    isEventTarget: (value) => e.isEventTarget(value),
+    kCreateEvent: e.kCreateEvent,
+    kEvents: e.kEvents,
+    kHybridDispatch: e.kHybridDispatch,
+    kIsNodeStyleListener: e.kIsNodeStyleListener,
+    kMaxEventTargetListeners: e.kMaxEventTargetListeners,
+    kMaxEventTargetListenersWarned: e.kMaxEventTargetListenersWarned,
+    kNewListener: e.kNewListener,
+    kRemoveListener: e.kRemoveListener,
+    kResistStopPropagation: e.kResistStopPropagation,
+    kTrustEvent: e.kTrustEvent,
+    kWeakHandler: e.kWeakHandler,
+  };
+});
+
+defineModule("internal/webidl", function (module) {
+  const kEmptyObject = Object.freeze({ __proto__: null });
+  const censorNegativeZero = (x) => (x === 0 ? 0 : x);
+  const integerPart = (n) => censorNegativeZero(Math.trunc(n));
+  function evenRound(x) {
+    if ((x > 0 && (x % 1) === 0.5 && (x & 1) === 0) || (x < 0 && (x % 1) === -0.5 && (x & 1) === 1)) {
+      return censorNegativeZero(Math.floor(x));
+    }
+    return censorNegativeZero(Math.round(x));
+  }
+  function convertToInt(name, value, bitLength, options = kEmptyObject) {
+    const { signed = false, enforceRange = false, clamp = false } = options;
+    let upperBound;
+    let lowerBound;
+    if (bitLength === 64) {
+      upperBound = Number.MAX_SAFE_INTEGER;
+      lowerBound = signed ? Number.MIN_SAFE_INTEGER : 0;
+    } else if (!signed) {
+      lowerBound = 0;
+      upperBound = 2 ** bitLength - 1;
+    } else {
+      lowerBound = -(2 ** (bitLength - 1));
+      upperBound = 2 ** (bitLength - 1) - 1;
+    }
+    const { codes: { ERR_INVALID_ARG_VALUE } } = require("internal/errors");
+    let x = censorNegativeZero(Number(value));
+    if (enforceRange) {
+      if (!Number.isFinite(x)) throw new ERR_INVALID_ARG_VALUE(name, value, "is not a finite number");
+      x = integerPart(x);
+      if (x < lowerBound || x > upperBound) {
+        throw new ERR_INVALID_ARG_VALUE(name, value, `is outside the accepted range of ${lowerBound} to ${upperBound}`);
+      }
+      return x;
+    }
+    if (!Number.isNaN(x) && clamp) {
+      x = Math.min(Math.max(x, lowerBound), upperBound);
+      return censorNegativeZero(evenRound(x));
+    }
+    if (!Number.isFinite(x) || x === 0) return 0;
+    x = integerPart(x);
+    if (x >= lowerBound && x <= upperBound) return x;
+    x = ((x % 2 ** bitLength) + 2 ** bitLength) % 2 ** bitLength;
+    if (signed && x >= 2 ** (bitLength - 1)) return x - 2 ** bitLength;
+    return x;
+  }
+  module.exports = { convertToInt, evenRound, integerPart, censorNegativeZero };
+});
+
+defineModule("internal/console/constructor", function (module) {
+  const pad = (value) => String(value).padStart(2, "0");
+  function formatTime(ms) {
+    let hours = 0;
+    let minutes = 0;
+    let seconds = 0;
+    if (ms >= 1000) {
+      if (ms >= 60000) {
+        if (ms >= 3600000) {
+          hours = Math.floor(ms / 3600000);
+          ms %= 3600000;
+        }
+        minutes = Math.floor(ms / 60000);
+        ms %= 60000;
+      }
+      seconds = ms / 1000;
+    }
+    if (hours !== 0 || minutes !== 0) {
+      [seconds, ms] = seconds.toFixed(3).split(".");
+      const res = hours !== 0 ? `${hours}:${pad(minutes)}` : minutes;
+      return `${res}:${pad(seconds)}.${ms} (${hours !== 0 ? "h:m" : ""}m:ss.mmm)`;
+    }
+    if (seconds !== 0) return `${seconds.toFixed(3)}s`;
+    return `${Number(ms.toFixed(3))}ms`;
+  }
+  module.exports = { formatTime, Console: console.Console };
+});
+
+defineModule("internal/fs/sync_write_stream", function (module) {
+  const { Writable } = __builtins.get("stream");
+  const fs = __builtins.get("fs");
+  function SyncWriteStream(fd, options) {
+    Reflect.apply(Writable, this, [{ autoDestroy: true }]);
+    options = options || {};
+    this.fd = fd;
+    this.readable = false;
+    this.autoClose = options.autoClose === undefined ? true : options.autoClose;
+  }
+  Object.setPrototypeOf(SyncWriteStream.prototype, Writable.prototype);
+  Object.setPrototypeOf(SyncWriteStream, Writable);
+  SyncWriteStream.prototype._write = function (chunk, encoding, cb) {
+    try {
+      fs.writeSync(this.fd, chunk);
+    } catch (error) {
+      cb(error);
+      return;
+    }
+    cb();
+    return true;
+  };
+  SyncWriteStream.prototype._destroy = function (err, cb) {
+    if (this.fd === null) return cb(err);
+    if (this.autoClose) fs.closeSync(this.fd);
+    this.fd = null;
+    cb(err);
+  };
+  SyncWriteStream.prototype.destroySoon = SyncWriteStream.prototype.destroy;
+  module.exports = SyncWriteStream;
 });
 
 defineModule("internal/util/inspect", function (module) {

@@ -152,6 +152,7 @@ const hookRuntime = {
   after: emitAfter,
   destroy: emitDestroy,
 };
+__internals.set("asyncHookRuntime", hookRuntime);
 
 // Promises: ids are assigned on first sight (init, or a hook seeing a promise made earlier).
 const promiseIds = new WeakMap();
