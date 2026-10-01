@@ -15,7 +15,8 @@
 //!
 //! Caveat, documented on purpose: quiescence-before-prompt means an unbounded `setInterval`
 //! holds the prompt hostage until cleared (Ctrl-C kills the process; there is no per-line
-//! signal handling in pure std).
+//! signal handling in pure std). A SIGINT while a line is evaluating stops that evaluation
+//! instead, like Node's REPL; the session and its bindings carry on.
 
 use lumen_host::Value;
 use lumen_runtime::{describe_error, render_value, Runtime};
@@ -37,6 +38,25 @@ pub enum Step {
     Exit,
 }
 
+const INTERRUPTED: &str =
+    "Uncaught Error [ERR_SCRIPT_EXECUTION_INTERRUPTED]: Script execution was interrupted by `SIGINT`";
+
+/// Node's REPL names every builtin module as a lazily loaded global the program may reassign.
+const AUTOLIBS: &str = "(() => {
+    if (typeof require !== 'function') return;
+    for (const name of require('module').builtinModules) {
+        if (name.startsWith('_') || name.includes('/') || Object.hasOwn(globalThis, name)) continue;
+        const define = (value) => Object.defineProperty(globalThis, name, {
+            value, writable: true, configurable: true, enumerable: false,
+        });
+        Object.defineProperty(globalThis, name, {
+            get() { const lib = require(name); define(lib); return lib; },
+            set: define,
+            configurable: true,
+        });
+    }
+})()";
+
 const HELP: &str = "\
 .help   this text
 .exit   leave the repl
@@ -44,7 +64,8 @@ _       the last result
 await   allowed at the top level (expression form)";
 
 impl Repl {
-    pub fn new(runtime: Runtime) -> Repl {
+    pub fn new(mut runtime: Runtime) -> Repl {
+        let _ = runtime.engine().eval(AUTOLIBS, false);
         Repl {
             runtime,
             buffer: String::new(),
@@ -78,7 +99,18 @@ impl Repl {
         self.buffer.push('\n');
         let src = self.buffer.clone();
 
-        match self.runtime.engine().eval_value(&src) {
+        let (evaluated, interrupted) = self.runtime.with_sigint_break(|runtime| {
+            let evaluated = runtime.engine().eval_value(&src);
+            if matches!(evaluated, Ok(_)) {
+                runtime.run_to_completion();
+            }
+            evaluated
+        });
+        if interrupted {
+            self.buffer.clear();
+            return Step::Done(INTERRUPTED.into());
+        }
+        match evaluated {
             Err(e) if e.at_eof => Step::More, // incomplete: keep the buffer
             Err(e) => {
                 self.buffer.clear();
@@ -91,7 +123,6 @@ impl Repl {
             }
             Ok(completion) => {
                 self.buffer.clear();
-                self.runtime.run_to_completion();
                 match completion {
                     Ok(v) => self.finish_value(v),
                     Err(e) => self.finish_thrown(&e),

@@ -45,13 +45,15 @@
   // argument). A listener that throws is an uncaught exception, as in Node.
 
   const ET = EventTarget.prototype;
+  const internals = __eventTargetInternals;
+  const kEvents = internals.kEvents;
   const nodeStyle = new WeakMap(); // registered wrapper -> the user's listener
   const onceRemoved = new WeakMap(); // `once` listener -> the target's listener-removed hook
   const portState = new WeakMap();
   let receivedPorts = null; // ports created by the deserialization running now
 
   function listenerList(target, type) {
-    return target._listeners.get(String(type));
+    return target[kEvents].get(String(type));
   }
   function rethrowAsync(error) {
     process.nextTick(() => {
@@ -75,10 +77,8 @@
         } else {
           if (event === undefined) {
             event = makeEvent();
-            try {
-              event.target = target;
-              event.currentTarget = target;
-            } catch {}
+            event[internals.kTarget] = target;
+            event[internals.kDispatching] = true;
           }
           if (typeof entry.callback === "function") Reflect.apply(entry.callback, target, [event]);
           else entry.callback.handleEvent(event);
@@ -86,13 +86,9 @@
       } catch (error) {
         rethrowAsync(error);
       }
-      if (event !== undefined && event._immediateStopped) break;
+      if (event !== undefined && event[internals.kStop]) break;
     }
-    if (event !== undefined) {
-      try {
-        event.currentTarget = null;
-      } catch {}
-    }
+    if (event !== undefined) event[internals.kDispatching] = false;
     return true;
   }
   function validateListener(fn) {
@@ -147,9 +143,9 @@
         });
       },
       removeAllListeners(type) {
-        const types = type === undefined ? [...this._listeners.keys()] : [String(type)];
+        const types = type === undefined ? [...this[kEvents].keys()] : [String(type)];
         for (const t of types) {
-          const list = this._listeners.get(t);
+          const list = this[kEvents].get(t);
           if (!list) continue;
           for (const entry of [...list]) ET.removeEventListener.call(this, t, entry.callback, { capture: entry.capture });
           onRemove(this, t);
@@ -163,7 +159,7 @@
         return (listenerList(this, type) ?? []).map((e) => nodeStyle.get(e.callback) ?? e.callback);
       },
       eventNames() {
-        return [...this._listeners].filter(([, list]) => list.length > 0).map(([t]) => t);
+        return [...this[kEvents]].filter(([, list]) => list.length > 0).map(([t]) => t);
       },
       setMaxListeners(n) {
         portStateOf(this).maxListeners = n;
@@ -265,7 +261,7 @@
       if (state === undefined) return this;
       const shown = state.destroyed ? { active: false } : { active: true, refed: this.hasRef() };
       for (const key of Object.keys(this)) shown[key] = this[key];
-      if (depth < 0) return this.constructor.name;
+      if (depth < 0) return this;
       const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
       return `${this.constructor.name} [EventTarget] ${lazyUtil().inspect(shown, opts)}`;
     }
@@ -428,7 +424,6 @@
 
   function createPort(id, hooks = true) {
     const port = Reflect.construct(EventTarget, [], MessagePort);
-    Object.defineProperty(port, "_listeners", { value: port._listeners, writable: true, configurable: true, enumerable: false });
     portState.set(port, {
       id, refed: false, started: false, closing: false, closingLocal: false, destroyed: false, detached: false,
     });
@@ -530,7 +525,6 @@
     constructor(name) {
       if (arguments.length === 0) throw new __errors.ERR_MISSING_ARGS("name");
       super();
-      Object.defineProperty(this, "_listeners", { value: this._listeners, writable: true, configurable: true, enumerable: false });
       const state = { name: `${name}`, port: null, refed: true };
       broadcastState.set(this, state);
       const port = createPort(ops().broadcast(state.name), false);
@@ -665,14 +659,22 @@
   // ---- Worker (parent side) -----------------------------------------------------------------------
 
   const kResourceLimitKeys = ["maxYoungGenerationSizeMb", "maxOldGenerationSizeMb", "codeRangeSizeMb", "stackSizeMb"];
+  const kDefaultResourceLimits = {
+    maxYoungGenerationSizeMb: 48, maxOldGenerationSizeMb: 2048, codeRangeSizeMb: 0, stackSizeMb: 4,
+  };
+  // The limits a worker runs with: what the caller gave (Node keeps the old generation at 2 MiB
+  // or more), the defaults for the rest, and the subset the engine enforces.
   function parseResourceLimits(limits) {
-    const out = {};
-    if (limits === undefined || limits === null || typeof limits !== "object") return out;
-    for (const key of kResourceLimitKeys) {
-      const v = limits[key];
-      if (typeof v === "number" && v > 0) out[key] = v;
+    const given = {};
+    if (limits !== undefined && limits !== null && typeof limits === "object") {
+      for (const key of kResourceLimitKeys) {
+        if (typeof limits[key] === "number") given[key] = limits[key];
+      }
+      if (given.maxOldGenerationSizeMb !== undefined) {
+        given.maxOldGenerationSizeMb = Math.max(given.maxOldGenerationSizeMb, 2);
+      }
     }
-    return out;
+    return { given, effective: { ...kDefaultResourceLimits, ...given } };
   }
 
   // Node's worker execArgv/NODE_OPTIONS check: per-process options are not allowed in a worker.
@@ -817,7 +819,7 @@
           throw nodeError(Error, "ERR_WORKER_INVALID_EXEC_ARGV", `Initiated Worker with invalid NODE_OPTIONS env variable: ${bad.join(", ")}`);
         }
       }
-      const resourceLimits = parseResourceLimits(options.resourceLimits);
+      const { given: givenLimits, effective: resourceLimits } = parseResourceLimits(options.resourceLimits);
       const preload = [];
       for (let i = 0; i < execArgv.length; i++) {
         const arg = execArgv[i];
@@ -847,7 +849,10 @@
         entry,
         mode === "module-eval" || (mode === "file" && entry.endsWith(".mjs")),
         (kind, a) => this.#onEvent(kind, a),
-        { node: true, eval: mode === "eval", moduleEval: mode === "module-eval", shareEnv, init },
+        {
+          node: true, eval: mode === "eval", moduleEval: mode === "module-eval", shareEnv, init,
+          maxOldMb: givenLimits.maxOldGenerationSizeMb, stackMb: givenLimits.stackSizeMb,
+        },
       );
 
       const handle = {
@@ -980,6 +985,8 @@
       if (kind === "online") {
         state.online = true;
         this.emit("online");
+      } else if (kind === "oom") {
+        state.oom = true;
       } else if (kind === "error") {
         // A failure before the worker's own error reporting was in place (its bootstrap).
         this.emit("error", reviveError(a));
@@ -1177,6 +1184,10 @@
       process.argv = [process.execPath, init.entry ?? "[worker eval]", ...(Array.isArray(init.argv) ? init.argv : [])];
       process.execArgv = Array.isArray(init.execArgv) ? init.execArgv : [];
       if (process.execArgv.includes("--trace-warnings")) process.traceProcessWarnings = true;
+      for (const arg of process.execArgv) {
+        const nearLimit = /^--heapsnapshot-near-heap-limit=(\d+)$/.exec(arg);
+        if (nearLimit !== null) __builtins.get("v8").setHeapSnapshotNearHeapLimit(Number(nearLimit[1]));
+      }
       if (Array.isArray(init.trace)) {
         __internals.get("trace_events").startInWorker(init.trace, wt.threadId, (events) => {
           internal.postMessage({ type: "trace", events });

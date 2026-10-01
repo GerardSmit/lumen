@@ -290,6 +290,8 @@ pub struct Runtime {
     child_realms: Option<Arc<child_realm::ChildRealms>>,
     /// A signal's default action stopped the realm (see `deliver_signal`).
     signal_exit: Option<i32>,
+    /// A tick threw and its error was handled: the queue behind it drains before the next callback.
+    tick_recovery: bool,
     /// Wakes the loop when it is blocked on completions.
     wake: mpsc::Sender<TaskCompletion>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -547,6 +549,7 @@ impl Runtime {
             interrupt,
             child_realms,
             signal_exit: None,
+            tick_recovery: false,
             wake: tx,
             completions: rx,
             fire_error,
@@ -972,6 +975,12 @@ impl Runtime {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
+                if self.tick_recovery && !self.halted() {
+                    self.tick_recovery = false;
+                    progressed = true;
+                    self.checkpoint();
+                    self.report_unhandled_rejections();
+                }
                 let now = Instant::now();
                 while let Some((cb, args)) = self.take_next_due_timer(now) {
                     if self.halted() {
@@ -1368,10 +1377,11 @@ impl Runtime {
                     .call_function(&callback, Value::Undefined, &args)
                 {
                     // As in Node, a throwing tick unwinds the drain: once the error is handled,
-                    // the rest of the queue waits for the next checkpoint, so a tick that keeps
-                    // rescheduling a throw cannot starve the loop.
+                    // the rest of the queue and the pending microtasks wait for the next
+                    // checkpoint, so a tick that keeps rescheduling a throw cannot starve the
+                    // loop, and queued ticks still run before the promise jobs.
                     self.report_uncaught(&e);
-                    self.run_microtasks();
+                    self.tick_recovery = true;
                     return;
                 }
             }
@@ -1408,6 +1418,9 @@ impl Runtime {
 
     /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
     fn fire(&mut self, callback: &Value, args: &[Value]) {
+        if std::mem::take(&mut self.tick_recovery) {
+            self.checkpoint();
+        }
         if let Err(e) = self.engine.call_function(callback, Value::Undefined, args) {
             self.report_uncaught(&e);
         }
@@ -1555,7 +1568,7 @@ impl Runtime {
 
     /// The loop stops: a fatal error, or the embedder / `process.exit` asked the realm to end.
     fn halted(&self) -> bool {
-        self.fatal_exit.is_some() || self.interrupted()
+        self.fatal_exit.is_some() || self.interrupted() || self.engine.is_terminated()
     }
 
     /// A worker realm's `terminate()` flag: the engine polls it at every call and loop turn, and
@@ -1591,6 +1604,21 @@ impl Runtime {
     pub fn set_deadline(&mut self, limit: Duration) {
         let handle = self.interrupt_handle();
         self.deadline = Some(Deadline::start(limit, handle));
+    }
+
+    /// Run `f` so that SIGINT stops the JS it runs (as `vm`'s `breakOnSigint` does) instead of
+    /// killing the process; the flag says whether it was the signal that stopped it. The realm
+    /// stays usable afterwards.
+    pub fn with_sigint_break<R>(&mut self, f: impl FnOnce(&mut Runtime) -> R) -> (R, bool) {
+        let raised = self.engine.ctx().script_timeout_flag();
+        let guard = lumen_node::SigintBreak::new(Arc::clone(&raised));
+        let result = f(self);
+        let fired = guard.fired();
+        drop(guard);
+        if fired {
+            raised.store(false, Ordering::SeqCst);
+        }
+        (result, fired)
     }
 
     /// Whether the realm has been interrupted.

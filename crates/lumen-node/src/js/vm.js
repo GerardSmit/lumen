@@ -93,7 +93,7 @@
   };
 
   const runBounded = (args, run) =>
-    args.timeout === -1 ? run() : __vm.runWithTimeout(args.timeout, run);
+    args.timeout === -1 && !args.breakOnSigint ? run() : __vm.runWithTimeout(args.timeout, run, args.breakOnSigint);
 
   // A code cache stand-in: lumen compiles from source, so the "cache" records only what V8's
   // sanity check does (a magic, the source length and hash) and is accepted iff it matches.

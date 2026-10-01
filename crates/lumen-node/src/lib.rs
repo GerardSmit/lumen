@@ -83,6 +83,8 @@ fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
         .clone()
 }
 
+pub use signals::SigintBreak;
+
 pub fn extension() -> Extension {
     let dev_glue = glue_dev::source();
     Extension {
@@ -118,8 +120,12 @@ pub fn extension() -> Extension {
                     "signalWatch" (2) => signals::op_signal_watch,
                     "signalUnwatch" (1) => signals::op_signal_unwatch,
                     "signalRaise" (1) => signals::op_signal_raise,
+                    "sigintWatchdogStart" (0) => signals::op_sigint_watchdog_start,
+                    "sigintWatchdogStop" (0) => signals::op_sigint_watchdog_stop,
+                    "sigintWatchdogPending" (0) => signals::op_sigint_watchdog_pending,
                     "v8SetFlags" (1) => op_v8_set_flags,
                     "heapSnapshot" (1) => op_heap_snapshot,
+                    "setNearHeapLimit" (3) => op_set_near_heap_limit,
                     "perfTiming" (0) => op_perf_timing,
                     "memoryStats" (0) => op_memory_stats,
                     "gcObserve" (1) => op_gc_observe,
@@ -337,6 +343,61 @@ fn op_heap_snapshot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
             ctx.make_uint8array(&out)
         }
     }
+}
+
+/// `(times, threadId, dir?)` — write a heap snapshot the first `times` times the realm reaches its
+/// memory ceiling (Node's `v8.setHeapSnapshotNearHeapLimit`); `0` stops. The realm then runs on
+/// with a slightly higher ceiling, and the last crossing is the limit for good.
+fn op_set_near_heap_limit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let times = args.first().and_then(Value::as_num_opt).unwrap_or(0.0).max(0.0) as u32;
+    let thread_id = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
+    let dir = match args.get(2) {
+        Some(Value::Str(d)) if !d.to_string().is_empty() => Some(std::path::PathBuf::from(d.to_string())),
+        _ => None,
+    };
+    ctx.set_near_limit_hook(
+        times,
+        Box::new(move |interp| {
+            static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let name = format!(
+                "Heap.{}.{}.{thread_id}.{seq:03}.heapsnapshot",
+                local_stamp(),
+                std::process::id()
+            );
+            let path = dir.as_ref().map_or_else(|| std::path::PathBuf::from(&name), |d| d.join(&name));
+            let _ = std::fs::File::create(&path).and_then(|f| {
+                let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
+                interp.write_heap_snapshot(&mut out)
+            });
+        }),
+    );
+    Ok(Value::Undefined)
+}
+
+/// `YYYYMMDD.HHMMSS` in local time, as Node's diagnostic file names carry it.
+fn local_stamp() -> String {
+    #[cfg(unix)]
+    // SAFETY: localtime_r fills the zeroed `tm` it is given from a valid `time_t`.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&now, &mut tm).is_null() {
+            return format!(
+                "{:04}{:02}{:02}.{:02}{:02}{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            );
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    format!("{}.{:06}", secs / 86_400, secs % 86_400)
 }
 
 /// `(flags)` — apply the V8 flags lumen implements from a `v8.setFlagsFromString` string

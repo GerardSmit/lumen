@@ -3,6 +3,9 @@
 //! first listener) reads it and wakes every realm listening for that signal through its event
 //! loop. Nothing is installed until a program listens for a signal.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use lumen_host::{CompletionSender, Ctx, TaskId, TaskRegistry, Value};
 
 /// The signal number for a Node signal name (`"SIGTERM"`), on this platform.
@@ -81,7 +84,7 @@ pub(crate) fn op_signal_number(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod imp {
     use super::*;
-    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Mutex, Once};
 
     static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -97,6 +100,23 @@ mod imp {
 
     /// Every realm's signal listeners, process-wide (a worker's realm has its own loop).
     static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
+
+    struct Target {
+        key: u64,
+        raised: Arc<AtomicBool>,
+        fired: Arc<AtomicBool>,
+    }
+
+    /// SIGINT watchdog state, as Node's SigintWatchdogHelper keeps it: while `depth > 0` a SIGINT
+    /// breaks the registered runs instead of reaching `process.on('SIGINT')` listeners.
+    struct Watch {
+        depth: usize,
+        pending: bool,
+        targets: Vec<Target>,
+    }
+
+    static WATCH: Mutex<Watch> = Mutex::new(Watch { depth: 0, pending: false, targets: Vec::new() });
+    static WATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
     extern "C" fn on_signal(sig: libc::c_int) {
         let fd = WRITE_FD.load(Ordering::Relaxed);
@@ -157,8 +177,11 @@ mod imp {
                         if n == 0 {
                             return;
                         }
-                        let listeners = LISTENERS.lock().unwrap();
                         for &sig in &buf[..n as usize] {
+                            if sig as i32 == libc::SIGINT && break_runs() {
+                                continue;
+                            }
+                            let listeners = LISTENERS.lock().unwrap();
                             for l in listeners.iter().filter(|l| l.sig == sig as i32) {
                                 l.sender.send(l.task, Box::new(sig as i32));
                             }
@@ -170,6 +193,20 @@ mod imp {
             }
         });
         WRITE_FD.load(Ordering::Relaxed) >= 0
+    }
+
+    /// Break every registered run when the watchdog is active; whether it was.
+    fn break_runs() -> bool {
+        let mut watch = WATCH.lock().unwrap();
+        if watch.depth == 0 {
+            return false;
+        }
+        watch.pending = true;
+        for t in &watch.targets {
+            t.fired.store(true, Ordering::SeqCst);
+            t.raised.store(true, Ordering::SeqCst);
+        }
+        true
     }
 
     fn set_handler(sig: i32, install: bool) -> bool {
@@ -202,12 +239,55 @@ mod imp {
         Some(key)
     }
 
+    pub(super) fn watchdog_start() -> bool {
+        if !start_watcher() {
+            return false;
+        }
+        let mut watch = WATCH.lock().unwrap();
+        watch.depth += 1;
+        WATCH_DEPTH.store(watch.depth, Ordering::SeqCst);
+        if watch.depth == 1 {
+            set_handler(libc::SIGINT, true);
+        }
+        true
+    }
+
+    /// Leave one watchdog level; whether a SIGINT arrived since the last stop.
+    pub(super) fn watchdog_stop() -> bool {
+        let mut watch = WATCH.lock().unwrap();
+        let had = watch.pending;
+        watch.pending = false;
+        if watch.depth > 0 {
+            watch.depth -= 1;
+            WATCH_DEPTH.store(watch.depth, Ordering::SeqCst);
+            if watch.depth == 0 && !LISTENERS.lock().unwrap().iter().any(|l| l.sig == libc::SIGINT) {
+                set_handler(libc::SIGINT, false);
+            }
+        }
+        had
+    }
+
+    pub(super) fn watchdog_pending() -> bool {
+        WATCH.lock().unwrap().pending
+    }
+
+    pub(super) fn break_register(raised: Arc<AtomicBool>, fired: Arc<AtomicBool>) -> u64 {
+        let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+        WATCH.lock().unwrap().targets.push(Target { key, raised, fired });
+        key
+    }
+
+    pub(super) fn break_unregister(key: u64) {
+        WATCH.lock().unwrap().targets.retain(|t| t.key != key);
+    }
+
     /// Raise `sig` on the calling thread when this process handles it: the handler then runs
     /// before the call returns, so signals a program sends itself are neither delayed nor merged
     /// with an identical pending one (as a process-directed `kill` landing on another thread
     /// may be).
     pub(super) fn raise_watched(sig: i32) -> bool {
-        if !LISTENERS.lock().unwrap().iter().any(|l| l.sig == sig) {
+        let watchdog = sig == libc::SIGINT && WATCH_DEPTH.load(Ordering::SeqCst) > 0;
+        if !watchdog && !LISTENERS.lock().unwrap().iter().any(|l| l.sig == sig) {
             return false;
         }
         // SAFETY: raise(3) takes no pointers.
@@ -220,7 +300,8 @@ mod imp {
         let mut listeners = LISTENERS.lock().unwrap();
         let i = listeners.iter().position(|l| l.key == key)?;
         let l = listeners.remove(i);
-        if !listeners.iter().any(|o| o.sig == l.sig) {
+        let watched = l.sig == libc::SIGINT && WATCH_DEPTH.load(Ordering::SeqCst) > 0;
+        if !watched && !listeners.iter().any(|o| o.sig == l.sig) {
             set_handler(l.sig, false);
         }
         Some(l.task)
@@ -295,5 +376,71 @@ pub(crate) fn op_signal_raise(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> R
         return Ok(Value::Bool(imp::raise_watched(*sig as i32)));
     }
     let _ = args;
+    Ok(Value::Bool(false))
+}
+
+/// A run that a SIGINT breaks (`vm` `breakOnSigint`, the REPL's evaluation): while the guard
+/// lives, SIGINT raises `raised` instead of reaching `process.on('SIGINT')` listeners or killing
+/// the process, and `fired` tells the run afterwards that it was the signal that stopped it.
+pub struct SigintBreak {
+    fired: Arc<AtomicBool>,
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    key: Option<u64>,
+}
+
+impl SigintBreak {
+    pub fn new(raised: Arc<AtomicBool>) -> SigintBreak {
+        let fired = Arc::new(AtomicBool::new(false));
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            let key = imp::watchdog_start().then(|| imp::break_register(raised, Arc::clone(&fired)));
+            SigintBreak { fired, key }
+        }
+        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        {
+            let _ = raised;
+            SigintBreak { fired }
+        }
+    }
+
+    pub fn fired_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fired)
+    }
+
+    pub fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for SigintBreak {
+    fn drop(&mut self) {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        if let Some(key) = self.key {
+            imp::break_unregister(key);
+            imp::watchdog_stop();
+        }
+    }
+}
+
+/// `()` — Node's `startSigintWatchdog`.
+pub(crate) fn op_sigint_watchdog_start(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    imp::watchdog_start();
+    Ok(Value::Undefined)
+}
+
+/// `()` — Node's `stopSigintWatchdog`: whether a SIGINT arrived while it was watching.
+pub(crate) fn op_sigint_watchdog_stop(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    return Ok(Value::Bool(imp::watchdog_stop()));
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    Ok(Value::Bool(false))
+}
+
+/// `()` — Node's `watchdogHasPendingSigint`.
+pub(crate) fn op_sigint_watchdog_pending(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    return Ok(Value::Bool(imp::watchdog_pending()));
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
     Ok(Value::Bool(false))
 }
