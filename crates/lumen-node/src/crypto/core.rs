@@ -163,6 +163,67 @@ fn scrypt_check(n: f64, r: u32, p: u32, maxmem: f64) -> bool {
     mem <= maxmem as u128 && ::scrypt::Params::new(n.trailing_zeros() as u8, r, p, 64).is_ok()
 }
 
+fn argon2_derive(
+    kind: u32,
+    message: &[u8],
+    nonce: &[u8],
+    parallelism: u32,
+    tag_length: u32,
+    memory: u32,
+    passes: u32,
+    secret: &[u8],
+    associated_data: &[u8],
+) -> Result<Vec<u8>, String> {
+    use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
+    let algorithm = match kind {
+        0 => Algorithm::Argon2d,
+        1 => Algorithm::Argon2i,
+        _ => Algorithm::Argon2id,
+    };
+    let mut builder = ParamsBuilder::new();
+    builder.m_cost(memory).t_cost(passes).p_cost(parallelism).output_len(tag_length as usize);
+    if !associated_data.is_empty() {
+        builder.data(AssociatedData::new(associated_data).map_err(|e| e.to_string())?);
+    }
+    let params = builder.build().map_err(|e| e.to_string())?;
+    let argon = Argon2::new_with_secret(secret, algorithm, Version::V0x13, params).map_err(|e| e.to_string())?;
+    let mut out = vec![0u8; tag_length as usize];
+    argon.hash_password_into(message, nonce, &mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+#[lumen::op(name = "argon2")]
+fn argon2_sync(
+    kind: u32,
+    message: &[u8],
+    nonce: &[u8],
+    parallelism: u32,
+    tag_length: u32,
+    memory: u32,
+    passes: u32,
+    secret: &[u8],
+    associated_data: &[u8],
+) -> Result<Vec<u8>, OpError> {
+    argon2_derive(kind, message, nonce, parallelism, tag_length, memory, passes, secret, associated_data)
+        .map_err(OpError::error)
+}
+
+#[lumen::op(async, name = "argon2Async")]
+fn argon2_async(
+    kind: u32,
+    message: Vec<u8>,
+    nonce: Vec<u8>,
+    parallelism: u32,
+    tag_length: u32,
+    memory: u32,
+    passes: u32,
+    secret: Vec<u8>,
+    associated_data: Vec<u8>,
+) -> Result<Vec<u8>, SendError> {
+    argon2_derive(kind, &message, &nonce, parallelism, tag_length, memory, passes, &secret, &associated_data)
+        .map_err(|e| SendError::new("Error", e))
+}
+
 /// Fill a view with CSPRNG bytes.
 #[lumen::op(name = "randomFill")]
 fn random_fill(buf: &mut [u8]) -> Result<(), OpError> {
@@ -195,6 +256,8 @@ pub const OPS: &[&OpDesc] = lumen::ops![
     scrypt,
     scrypt_async,
     scrypt_check,
+    argon2_sync,
+    argon2_async,
     random_fill,
     timing_safe_equal,
 ];

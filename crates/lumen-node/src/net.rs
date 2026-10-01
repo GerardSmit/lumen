@@ -1971,10 +1971,18 @@ fn op_udp_set_broadcast(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Valu
 
 fn op_udp_set_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u64(args, 0);
-    let ttl = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0) as u32;
+    let ttl = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0);
     // std's set_ttl sets IP_TTL, which is invalid on an IPv6 socket; Node sets
     // IPV6_UNICAST_HOPS there, so do the same via setsockopt.
     with_udp(ctx, sid, "setTTL", |s, kind6| {
+        // libuv rejects anything outside 1..=255 before reaching the socket.
+        if !(1.0..=255.0).contains(&ttl) {
+            #[cfg(unix)]
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            #[cfg(not(unix))]
+            return Err(std::io::Error::from_raw_os_error(10022));
+        }
+        let ttl = ttl as u32;
         if kind6 {
             set_ipv6_unicast_hops(s, ttl as i32)
         } else {

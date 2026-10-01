@@ -179,7 +179,7 @@ const shims = {
   "internal/options": { getOptionValue },
   "internal/assert": internalAssert,
   "internal/buffer": { FastBuffer: function FastBuffer(arrayBuffer, byteOffset, length) {
-    return Buffer.from(arrayBuffer, byteOffset, length);
+    return typeof arrayBuffer === 'number' ? Buffer.alloc(arrayBuffer) : Buffer.from(arrayBuffer, byteOffset, length);
   } },
   "internal/encoding": { get TextDecoder() { return globalThis.TextDecoder; }, get TextEncoder() { return globalThis.TextEncoder; } },
   "internal/worker": { ownsProcessState: true },

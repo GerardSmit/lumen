@@ -22,7 +22,7 @@
 use lumen::embed::{OpDesc, OpError};
 pub use lumen::embed::SendError;
 
-mod asn1;
+pub(crate) mod asn1;
 mod curves;
 mod dh_groups;
 mod gen;
@@ -32,6 +32,7 @@ mod pem;
 
 pub use curves::{with_ec_curve, EcCurve};
 pub use dh_groups::dh_group;
+pub use gen::safe_prime;
 pub use model::{okp_public, pss_hash, x448_mul, AsymKey, DhKey, DsaKey, EcKey, OkpKey, PssParams, RsaKey, RsaPrivateParts};
 pub use pem::{import_private, import_public, KeyCipher};
 

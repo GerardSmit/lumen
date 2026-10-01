@@ -80,7 +80,7 @@ fn x509_parses_and_verifies_openssl_certificate() {
         [
             "C=GB|O=Lumen Test|CN=example.test",
             "false true true true",
-            "www.example.org undefined",
+            "*.example.org undefined",
             "test@example.test 127.0.0.1",
             "32 true",
         ]

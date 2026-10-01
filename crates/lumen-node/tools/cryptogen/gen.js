@@ -29,6 +29,65 @@ function patch(text, find, replace, file) {
   return text.slice(0, first) + replace + text.slice(first + find.length);
 }
 
+function patchCrypto(text) {
+  const file = 'crypto.js';
+  text = patch(text, "const {\n  Cipher,\n  Cipheriv,\n  Decipher,\n  Decipheriv,\n  privateDecrypt,",
+    "const {\n  Cipheriv,\n  Decipheriv,\n  privateDecrypt,", file);
+  text = patch(text, "const {\n  Hash,\n  Hmac,\n} = require('internal/crypto/hash');",
+    "const {\n  Hash,\n  Hmac,\n} = require('internal/crypto/hash');\n" +
+    "const { argon2, argon2Sync } = require('internal/crypto/argon2');\n" +
+    "const {\n  validateObject,\n  validateString,\n  validateUint32,\n} = require('internal/validators');\n" +
+    "const { isArrayBufferView } = require('internal/util/types');\n" +
+    "const { normalizeEncoding } = require('internal/util');\n" +
+    "const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE } = require('internal/errors').codes;", file);
+  text = patch(text, "function createCipher(cipher, password, options) {\n  return new Cipher(cipher, password, options);\n}\n\n", '', file);
+  text = patch(text, "function createDecipher(cipher, password, options) {\n  return new Decipher(cipher, password, options);\n}\n\n", '', file);
+  text = patch(text, "  createCipher: {\n    __proto__: null,\n    enumerable: false,\n    value: deprecate(createCipher,\n" +
+    "                     'crypto.createCipher is deprecated.', 'DEP0106'),\n  },\n  createDecipher: {\n    __proto__: null,\n" +
+    "    enumerable: false,\n    value: deprecate(createDecipher,\n                     'crypto.createDecipher is deprecated.', 'DEP0106'),\n  },\n", '', file);
+  text = patch(text, "  Certificate,\n  Cipher,\n  Cipheriv,\n  Decipher,\n  Decipheriv,", "  Certificate,\n  Cipheriv,\n  Decipheriv,", file);
+  text = patch(text, "  checkPrime,\n  checkPrimeSync,\n  createCipheriv,", "  argon2,\n  argon2Sync,\n  hash,\n  checkPrime,\n  checkPrimeSync,\n  createCipheriv,", file);
+  text = patch(text, "function getFips() {", `// lumen: crypto.hash(), the one-shot digest of Node 26's lib/crypto.js.
+function hash(algorithm, input, options) {
+  validateString(algorithm, 'algorithm');
+  if (typeof input !== 'string' && !isArrayBufferView(input)) {
+    throw new ERR_INVALID_ARG_TYPE('input', ['Buffer', 'TypedArray', 'DataView', 'string'], input);
+  }
+  let outputEncoding;
+  let outputLength;
+  if (typeof options === 'string') {
+    outputEncoding = options;
+  } else if (options !== undefined) {
+    validateObject(options, 'options');
+    outputLength = options.outputLength;
+    outputEncoding = options.outputEncoding;
+  }
+  outputEncoding ??= 'hex';
+  let normalized = outputEncoding;
+  if (normalized !== 'hex') {
+    validateString(outputEncoding, 'outputEncoding');
+    normalized = normalizeEncoding(outputEncoding);
+    if (normalized === undefined) {
+      if (outputEncoding.toLowerCase() === 'buffer') {
+        normalized = 'buffer';
+      } else {
+        throw new ERR_INVALID_ARG_VALUE('outputEncoding', outputEncoding);
+      }
+    }
+  }
+  if (outputLength !== undefined) {
+    validateUint32(outputLength, 'outputLength');
+    outputLength += 0;
+  }
+  const hasher = new Hash(algorithm, outputLength === undefined ? undefined : { outputLength });
+  hasher.update(input);
+  return normalized === 'buffer' ? hasher.digest() : hasher.digest(normalized);
+}
+
+function getFips() {`, file);
+  return text;
+}
+
 let out = read(path.join(here, 'head.js'));
 for (const f of fs.readdirSync(path.join(here, 'binding')).filter((n) => n.endsWith('.js')).sort()) {
   out += read(path.join(here, 'binding', f)) + '\n';
@@ -39,6 +98,6 @@ for (const f of fs.readdirSync(node).filter((n) => n.startsWith('internal_crypto
   const id = 'internal/crypto/' + f.slice('internal_crypto_'.length, -3);
   out += mod(id, stripLicense(src(f)));
 }
-out += mod('crypto', stripLicense(src('crypto.js')));
+out += mod('crypto', patchCrypto(stripLicense(src('crypto.js'))));
 out += read(path.join(here, 'tail.js'));
 fs.writeFileSync(process.argv[2], out);

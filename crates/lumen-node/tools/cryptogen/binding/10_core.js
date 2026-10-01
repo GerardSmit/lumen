@@ -150,6 +150,24 @@ class HKDFJob extends CryptoJob {
   }
 }
 
+class Argon2Job extends CryptoJob {
+  constructor(mode, message, nonce, parallelism, tagLength, memory, passes, secret, associatedData, type) {
+    super(mode);
+    const empty = new Uint8Array(0);
+    this.args = [type, new Uint8Array(bytesOf(message)), new Uint8Array(bytesOf(nonce)), parallelism, tagLength,
+                 memory, passes, secret === undefined ? empty : new Uint8Array(bytesOf(secret)),
+                 associatedData === undefined ? empty : new Uint8Array(bytesOf(associatedData))];
+  }
+
+  _run() {
+    return toArrayBuffer(__rc.argon2(...this.args));
+  }
+
+  _runAsync() {
+    return __rc.argon2Async(...this.args).then(toArrayBuffer);
+  }
+}
+
 class RandomBytesJob extends CryptoJob {
   constructor(mode, buffer, offset, size) {
     super(mode);
@@ -182,6 +200,7 @@ Object.assign(cryptoBinding, {
   PBKDF2Job,
   ScryptJob,
   HKDFJob,
+  Argon2Job,
   RandomBytesJob,
   timingSafeEqual,
   getHashes: () => hashNames.slice(),
