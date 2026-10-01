@@ -1167,3 +1167,38 @@ fn spawn_sync_of_exec_path_runs_a_child_realm() {
     assert!(ran.stdout.contains("ETIMEDOUT SIGTERM"), "{}", ran.stdout);
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
+
+#[test]
+fn module_graph_that_fails_to_link_is_rejected_every_time() {
+    let scratch = Scratch::new("esm-failed-link");
+    scratch.file("a.mjs", "import { b } from './b.mjs'; globalThis.ranA = true; export const a = b;");
+    scratch.file("b.mjs", "import { gone } from './c.mjs'; export const b = gone;");
+    scratch.file("c.mjs", "export const present = 1;");
+    let ran = Realm::default().run(
+        &scratch,
+        r#"
+        const attempt = () => import('./a.mjs').then(() => 'loaded', e => e.constructor.name);
+        attempt().then(first => attempt().then(second => console.log(first, second, globalThis.ranA === true)));
+        "#,
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "SyntaxError SyntaxError false\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn failed_module_graph_can_be_imported_again() {
+    let scratch = Scratch::new("esm-failed-graph");
+    scratch.file("a.mjs", "import { b } from './b.mjs'; export const a = b;");
+    scratch.file("b.mjs", "import { gone } from './missing.mjs'; export const b = gone;");
+    let ran = Realm::default().run(
+        &scratch,
+        r#"
+        const attempt = () => import('./a.mjs').then(() => 'loaded', e => e.constructor.name);
+        attempt().then(first => attempt().then(second => console.log(first, second)));
+        "#,
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "TypeError TypeError\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}

@@ -119,9 +119,9 @@ impl Interp {
     /// returning its namespace object.
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
         // Phase 1: parse the whole graph (so every module's export tables exist before any linking).
-        self.parse_and_register(key, Some(src.to_string()))?;
-        // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first.
-        self.link_module(key)?;
+        // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first. A graph
+        // that fails to parse or link registers nothing, so importing it again fails again.
+        self.parse_and_link(key, Some(src.to_string()))?;
         // Phase 3: evaluate module bodies depth-first. A graph containing top-level await
         // evaluates through the async machinery (awaits interleave with the job queue, an async
         // module doesn't block siblings, ancestors run in [[AsyncEvaluationOrder]]); a fully
@@ -227,6 +227,43 @@ impl Interp {
     /// namespace object, and export tables. No user code runs and no linking happens yet, so a later
     /// ResolveExport can see the whole graph. Idempotent per key.
     fn parse_and_register(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
+        let mut added = Vec::new();
+        let result = self.parse_and_register_graph(key, src, &mut added);
+        if result.is_err() {
+            self.discard_modules(added);
+        }
+        result
+    }
+
+    /// Parse and link as one unit: a failure in either phase discards every record the call
+    /// registered, so none stays marked linked with imports that were never wired.
+    fn parse_and_link(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
+        let mut added = Vec::new();
+        let result = self
+            .parse_and_register_graph(key, src, &mut added)
+            .and_then(|()| self.link_module(key));
+        if result.is_err() {
+            self.discard_modules(added);
+        }
+        result
+    }
+
+    /// A record is registered before its dependencies are parsed (so cycles resolve), so a
+    /// failure deeper in the graph would otherwise leave records naming unregistered
+    /// dependencies, and a later import of them would link against missing keys.
+    fn discard_modules(&mut self, keys: Vec<String>) {
+        for k in keys {
+            self.module_recs.remove(&k);
+            self.modules.remove(&k);
+        }
+    }
+
+    fn parse_and_register_graph(
+        &mut self,
+        key: &str,
+        src: Option<String>,
+        added: &mut Vec<String>,
+    ) -> Result<(), Abrupt> {
         if self.module_recs.contains_key(key) {
             return Ok(());
         }
@@ -364,9 +401,11 @@ impl Interp {
             },
         );
 
+        added.push(key.to_string());
+
         // Recurse: parse each dependency (fetched during specifier resolution above).
         for (canon, dsrc) in dep_srcs {
-            self.parse_and_register(&canon, Some(dsrc))?;
+            self.parse_and_register_graph(&canon, Some(dsrc), added)?;
         }
         Ok(())
     }
@@ -381,7 +420,16 @@ impl Interp {
             return Ok(());
         }
         self.module_recs.get_mut(key).unwrap().linked = true;
+        let result = self.link_module_graph(key);
+        if result.is_err() {
+            if let Some(rec) = self.module_recs.get_mut(key) {
+                rec.linked = false;
+            }
+        }
+        result
+    }
 
+    fn link_module_graph(&mut self, key: &str) -> Result<(), Abrupt> {
         let (body, env, ns) = {
             let rec = &self.module_recs[key];
             (rec.body.clone(), rec.env.clone(), rec.ns.clone())
@@ -1562,8 +1610,7 @@ impl Interp {
                 _ => canon,
             };
             let src = typed_module_source(src, attr_type);
-            self.parse_and_register(&canon, Some(src))?;
-            self.link_module(&canon)?;
+            self.parse_and_link(&canon, Some(src))?;
             Ok(canon)
         })();
         match result {
