@@ -411,14 +411,16 @@ const __errors = __lazyObject(() => {
   }, TypeError);
   E("ERR_INVALID_RETURN_VALUE", (input, name, value) => {
     let type;
-    if (value && value.constructor && value.constructor.name) type = `instance of ${value.constructor.name}`;
-    else type = `type ${typeof value}`;
+    if (value?.constructor?.name) type = `an instance of ${value.constructor.name}`;
+    else type = __builtins.get("util").inspect(value, { colors: false });
     return `Expected ${input} to be returned from the "${name}" function but got ${type}.`;
   }, TypeError, RangeError);
   E("ERR_AMBIGUOUS_ARGUMENT", 'The "%s" argument is ambiguous. %s', TypeError);
   E("ERR_INVALID_THIS", 'Value of "this" must be of type %s', TypeError);
   E("ERR_INVALID_STATE", "Invalid state: %s", Error, TypeError, RangeError);
   E("ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor", TypeError);
+  E("ERR_CONSOLE_WRITABLE_STREAM", "Console expects a writable stream instance for %s", TypeError);
+  E("ERR_INCOMPATIBLE_OPTION_PAIR", 'Option "%s" cannot be used in combination with option "%s"', TypeError);
   E("ERR_METHOD_NOT_IMPLEMENTED", "The %s method is not implemented", Error);
   E("ERR_MISSING_OPTION", "%s is required", TypeError);
   E("ERR_UNKNOWN_ENCODING", "Unknown encoding: %s", TypeError);

@@ -1997,6 +1997,12 @@ impl Interp {
     }
 
     /// `(target, handler)` of a proxy, for `util.inspect(proxy, { showProxy: true })`.
+    /// The remaining entries of a Map/Set iterator without advancing it, see
+    /// [`crate::builtins::collections::map_set_iter_preview`].
+    pub fn preview_entries_for_host(&self, v: &Value) -> Option<(Vec<Value>, bool)> {
+        crate::builtins::collections::map_set_iter_preview(self, v.as_obj()?)
+    }
+
     pub fn proxy_parts_for_host(&self, v: &Value) -> Option<(Value, Value)> {
         let ptr = self.object_addr(v)?;
         self.proxies.get(&ptr).cloned()

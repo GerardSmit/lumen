@@ -110,6 +110,7 @@ pub fn extension() -> Extension {
                     "nameSource" (2) => op_name_source,
                     "promiseState" (1) => op_promise_state,
                     "proxyParts" (1) => op_proxy_parts,
+                    "previewEntries" (2) => op_preview_entries,
                     "collectGarbage" (0) => op_collect_garbage,
                     "asyncContextGet" (0) => op_async_context_get,
                     "asyncContextSet" (1) => op_async_context_set,
@@ -279,6 +280,21 @@ fn op_proxy_parts(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(match ctx.proxy_parts_for_host(&v) {
         Some((target, handler)) => ctx.make_array(vec![target, handler]),
         None => Value::Undefined,
+    })
+}
+
+/// `(iterator, isKeyValue)` — V8's `previewEntries`: a Map/Set iterator's remaining entries
+/// without advancing it; `[entries, isKeyValue]` when `isKeyValue` is true, else `entries`.
+fn op_preview_entries(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let Some((entries, key_value)) = ctx.preview_entries_for_host(&v) else {
+        return Ok(Value::Undefined);
+    };
+    let list = ctx.make_array(entries);
+    Ok(if matches!(args.get(1), Some(Value::Bool(true))) {
+        ctx.make_array(vec![list, Value::Bool(key_value)])
+    } else {
+        list
     })
 }
 
