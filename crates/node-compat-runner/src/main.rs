@@ -355,7 +355,7 @@ fn run_test(options: &Options, test_dir: &Path, test: &TestCase, serial_id: usiz
     let outcome = match command.spawn() {
         Ok(child) => {
             let tree = tree::ProcessTree::new(&child);
-            wait_with_timeout(child, tree, options.timeout)
+            wait_with_timeout(child, tree, options.timeout, dump_path(&test.name))
         }
         Err(e) => Outcome::Fail {
             code: None,
@@ -374,6 +374,7 @@ fn wait_with_timeout(
     mut child: std::process::Child,
     tree: tree::ProcessTree,
     timeout: Duration,
+    dump: Option<PathBuf>,
 ) -> Outcome {
     // Drain both pipes on their own threads so a chatty test cannot block on a full pipe.
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -430,6 +431,12 @@ fn wait_with_timeout(
         }
     }
 
+    if let Some(path) = dump {
+        if !status.is_some_and(|s| s.success()) {
+            let _ = std::fs::write(path, &*output.lock().unwrap());
+        }
+    }
+
     match status {
         None => Outcome::Timeout,
         // `common.skip(reason)` prints `1..0 # Skipped: <reason>` and exits 0 — the test decided
@@ -464,6 +471,13 @@ fn wait_with_timeout(
             }
         }
     }
+}
+
+/// Where `NODE_COMPAT_DUMP=<dir>` keeps a failing test's whole captured output.
+fn dump_path(name: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("NODE_COMPAT_DUMP")?);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{}.txt", name.replace('/', "_"))))
 }
 
 /// The flags on the file's first `// Flags:` line, as Node's test.py reads them.
