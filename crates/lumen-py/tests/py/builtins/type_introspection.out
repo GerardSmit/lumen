@@ -1,0 +1,39 @@
+int str float NoneType bool
+list tuple dict set bytes
+function builtin_function_or_method function type type
+True False True True
+True False True
+True True False False
+True False False True
+True False True True True
+True
+True False True True
+True True True
+TypeError
+TypeError
+True True False True False True False
+True True True False
+1 dflt None 1
+AttributeError
+3 True False True True
+False
+AttributeError
+42 42 42
+False
+['cls_attr', 'cm', 'method', 'sm']
+['a', 'b', 'cls_attr', 'cm', 'extra', 'method', 'sm']
+['cls_attr', 'cm', 'extra', 'method', 'sm']
+{'a': 1, 'b': 2} [('a', 1), ('b', 2)]
+['extra']
+True True
+9
+Base Child Base func func
+method Base.method Child Base sm
+True Child type type
+True True True
+['Child', 'Base', 'object']
+int str NoneType
+__main__ __main__ None None
+inner outer.<locals>.inner Local outer.<locals>.Local
+K 7 1 True K
+X

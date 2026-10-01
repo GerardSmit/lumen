@@ -1,0 +1,15 @@
+loading _helper_mod as _helper_mod
+42 42 42 True
+hello world hello x
+Box(3) Box(4)
+_helper_mod __main__ Helper module.
+hidden ['a', 'b']
+1 2 2 0
+7 42 7
+added True False
+module True True True
+7 dflt
+ImportError ModuleNotFoundError
+ImportError from
+2 True
+1 2

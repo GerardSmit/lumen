@@ -1,0 +1,33 @@
+--- partial
+49 80 1024 40
+p: x
+True () {'exp': 2} None
+[5, 15] [3, 2, 1]
+--- reduce
+55 5040
+0 9 >abc
+{'a': 1, 'b': 2}
+TypeError empty reduce
+--- lru_cache
+102334155 41
+38 41 None 41
+0 5 fib
+[1, 4, 1, 9, 1] [('sq', 1), ('sq', 2), ('sq', 3)]
+CacheInfo(hits=2, misses=3, maxsize=2, currsize=2)
+15511210043330985984000000 120
+--- wraps
+call add (1,) [('b', 2)] -> 3
+3 add Add numbers. 10
+inner None
+--- cmp_to_key
+['fig', 'date', 'kiwi', 'pear', 'plum', 'apple', 'banana']
+[3, 2, 1] banana
+[(0, 'z'), (1, 'b'), (1, 'a')]
+--- total_ordering
+True True True True True True
+[V0.9, V1.2, V1.10, V2] V1.10 V1.2
+--- misc
+[1, 2, 3]
+computing
+42 42
+True 2

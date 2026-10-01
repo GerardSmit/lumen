@@ -1,0 +1,48 @@
+A.__add__ A
+A(3)
+A.__add__ int
+A(6)
+A.__radd__ int
+A(6)
+A.__rsub__ int
+A(7)
+B.__radd__ A
+B(99)
+A.__add__ A
+A(3)
+B.__rsub__ A
+B(-1)
+skip
+A.__add__ A
+A.__add__ A
+A(3)
+A.__radd__ int
+A.__add__ A
+A(3)
+A.__sub__
+TypeError
+TypeError
+TypeError
+A.__radd__ list
+TypeError
+Acc.__iadd__
+True [1]
+Acc.__add__
+False [1, 2] [1]
+N(-3) N(1003) N(-4) N(4)
+bool
+bool
+bool
+False True True
+False True False
+40 c [1, 2, 3]
+0xff 0b101 0o10 range(0, 3)
+('matmul', 3, 2) ('rmatmul', 2, 3)
+('divmod', 3, 2) ('rdivmod', 2, 3)
+('pow', 3, 2, None) ('pow', 3, 2, 5) ('pow', 3, 2, None) ('rpow', 2, 3)
+('fd', 3, 2) ('mod', 3, 2) ('lshift', 3, 1) ('and', 3, 1) ('xor', 3, 1) ('or', 3, 1)
+len
+99
+bool
+bool
+y x

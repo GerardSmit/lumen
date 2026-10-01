@@ -1,0 +1,29 @@
+1 + 2 * 3                      = 7
+(1 + 2) * 3                    = 9
+2 ** 3 ** 2                    = 512
+-2 ** 2                        = -4
+10 / 4                         = 2.5
+10 % 4 + 7 % 3                 = 3
+sqrt(16) + abs(-3)             = 7
+max(1, 5, 3) - min(4, 2)       = 3
+floor(3.7) + ceil(3.2)         = 7
+x * x + y                      = 51
+1.5 * 4                        = 6
+.5 + .25                       = 0.75
+2 * pi                         = 6.28319
+round(2.567, 2)                = 2.57
+pow(2, 10)                     = 1024
+((((1))))                      = 1
+--3                            = 3
+1 +                            ! unexpected end at 3 [unexpected end|3]
+2 * (3 + 4                     ! expected ) at 10 [expected )|10]
+foo(1)                         ! unknown function foo at 0 [unknown function foo|0]
+bar + 1                        ! unknown name bar at 0 [unknown name bar|0]
+5 / (2 - 2)                    ! division by zero at 4 [division by zero|4]
+3 $ 4                          ! unexpected character '$' at 2 [unexpected character '$'|2]
+1 2                            ! unexpected token 2 at 2 [unexpected token 2|2]
+2 ^ 10                         = 1024
+100000000000 * 100000000000    = 10000000000000000000000
+["Token(id, 'a1', 0)", "Token(op, '+', 2)", 'Token(num, 22.5, 3)', 'Token(eof, None, 7)']
+sum triangular 4495.0
+True

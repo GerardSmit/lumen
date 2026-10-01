@@ -1,0 +1,13 @@
+global local global
+unbound
+ag 1
+([10, 11, 12], {0: 10, 1: 10})
+[0, 1, 2] 100
+5
+2
+deleted
+[2, 2, 2]
+__main__
+3 1
+dict True
+[('a', 1), ('b', 2)]

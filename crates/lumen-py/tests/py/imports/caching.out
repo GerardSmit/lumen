@@ -1,0 +1,16 @@
+before False
+executing _count_mod
+after first True
+[1] True True
+[1, 2]
+False
+init _pkg _pkg
+init _pkg.sub _pkg.sub _pkg
+True True False
+True True
+True True True
+__main__
+executing _count_mod
+False []
+True
+1

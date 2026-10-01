@@ -1,0 +1,23 @@
+simple asserts passed
+caught AssertionError '' ()
+caught AssertionError one is not two ('one is not two',)
+(42,) 42
+(('a', 1),) ('a', 1)
+[1, 2]
+custom message
+[True]
+evaluated message [True, False, 'evaluated message']
+6
+x must be positive, got -1
+AssertionError x must be positive, got 0
+True True
+AssertionError ('x',) 
+manual
+2
+15
+True
+has non-positive
+missing a
+finally runs
+outer inner
+ab2

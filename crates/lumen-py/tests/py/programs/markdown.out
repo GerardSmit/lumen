@@ -1,0 +1,34 @@
+<h1>Title with <em>emphasis</em></h1>
+<p>Intro paragraph with <strong>bold</strong>, <em>italic</em>, and <code>code &lt;b&gt;</code>. It continues on a second line &amp; has entities &lt; &gt; &quot;quotes&quot;.</p>
+<h2>Lists</h2>
+<ul>
+<li>first item</li>
+<li>second <strong>bold</strong> item</li>
+<li>third item</li>
+</ul>
+<ol>
+<li>one</li>
+<li>two</li>
+<li>three with <a href="http://example.com?a=1&amp;b=2">a link</a></li>
+</ol>
+<h3>Code</h3>
+<pre><code class="lang-python">def f(x):
+    return x &lt; 3 and y &gt; 2</code></pre>
+<blockquote>quoted text across lines</blockquote>
+<hr>
+<p>Escaped *star* and unmatched <em> star, trailing </em>*bold. ####### not a heading</p>
+<h4>Level four</h4>
+-----
+20 lines; 6 list items
+'plain' -> plain
+'**b**' -> <strong>b</strong>
+'*i*' -> <em>i</em>
+'***both***' -> <strong>*both</strong>*
+'a * b' -> a * b
+'`x`' -> <code>x</code>
+'[x](y)' -> <a href="y">x</a>
+'[x]' -> [x]
+'snake_case_name' -> snake<em>case</em>name
+'&<>' -> &amp;&lt;&gt;
+
+''

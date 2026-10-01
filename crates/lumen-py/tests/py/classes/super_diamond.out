@@ -1,0 +1,27 @@
+['D', 'B', 'C', 'A', 'object']
+['B', 'A', 'object']
+D.__init__
+B.__init__
+C.__init__
+A.__init__
+['D', 'B', 'C', 'A']
+B.__init__
+A.__init__
+['B', 'A']
+['B', 'A', 'object']
+Both ['a']
+Left ['a']
+Right ['a']
+['Both', 'Left', 'Right', 'object']
+['SubSub', 'Sub', 'SubSub']
+['Sub', 'Sub']
+mixin:base
+['Mixed', 'Mixin', 'Base', 'object']
+MRO conflict TypeError
+MRO conflict 2
+['Z', 'B', 'A', 'object']
+11 Q>P.prop
+['B', 'C', 'A']
+['C', 'A']
+True True
+True True

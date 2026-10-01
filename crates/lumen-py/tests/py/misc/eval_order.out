@@ -1,0 +1,34 @@
+call ['a', 'b', 'd', 'c', 'e']
+arith ['x', 'y', 'z']
+ternary ['c', 'l']
+shortcircuit ['a', 'c']
+dict ['k1', 'v1', 'k2', 'v2']
+collections ['e1', 'e2', 't1', 't2', 's1', 's2']
+subscript assign ['rhs', 'i']
+[5, 20, 30]
+chained ['a', 'b', 'c', 'a', 'b']
+{'a': 2} {1: 'y'}
+[1, 1] [1, 1]
+def time ['default_eval']
+([1], 5)
+([1, 2], 5)
+call time []
+0 7
+[2, 2, 2]
+[0, 1, 2]
+[12, 12, 12]
+[110, 110, 110]
+['late', 'late', 'late']
+1 2 1 3
+[99, 0, 3]
+2 11
+L! ['L', 'R']
+64 ['p', 'q', 'r']
+True ['a', 'b']
+dict assign ['value', 'key']
+class ['class body']
+1-2 ['f1', 'f2']
+True ['n']
+[1, 2, 3] [3, 1, 2, 'key3', 'key1', 'key2']
+True ['p1', 'p2', 'p3']
+True ['g0', 'g1']

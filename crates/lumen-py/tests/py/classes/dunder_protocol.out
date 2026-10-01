@@ -1,0 +1,43 @@
+6 11 True False
+[6, 7]
+True False no
+and or True
+3 False True
+True 0
+getitem 0
+iter a
+getitem 1
+iter b
+getitem 2
+getitem 0
+getitem 1
+getitem 2
+[1, 2]
+getitem 0
+getitem 1
+True
+getitem 0
+getitem 1
+getitem 2
+getitem 3
+9
+getitem 0
+getitem 1
+getitem 2
+p q
+[1, 2, 3] [1, 2, 3] 6
+contains 42
+contains 7
+contains 7
+True False True
+Rep() Rep() Rep() Str!
+[Rep(), Rep()]
+Str! Rep()
+Str! Rep()
+Str! Rep()
+1 tuple key True False
+KeyError 'a'
+True True False
+2 1
+unhashable
+Num(3) Num(6) Num(6) Num(-3) 7 Num(3)

@@ -1,0 +1,24 @@
+(+ 1 2 3 4)                                          => 10
+(define (fact n) (if (<= n 1) 1 (* n (fact (- n 1)   => 2432902008176640000
+(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fi   => 610
+(define (map f l) (if (null? l) '() (cons (f (car    => (1 4 9 16 25)
+(define (filter p l) (cond ((null? l) '()) ((p (ca   => (2 4 6 8)
+(define (make-counter) (let ((n 0)) (lambda () (se   => 1 | 2 | 3
+(define (compose f g) (lambda (x) (f (g x)))) ((co   => 22
+(define (loop i acc) (if (= i 0) acc (loop (- i 1)   => 12502500
+(let ((x 2) (y 3)) (let ((x 10)) (* x y)))           => 30
+(define (reduce f init l) (if (null? l) init (redu   => 55
+(/ 10 4) (/ 10 5) (- 7)                              => 2.5 | 2 | -7
+(and 1 2 #f 3) (or #f #f 7) (and) (or)               => #f | 7 | #t | #f
+(append '(1 2) '(3) '() '(4 5))                      => (1 2 3 4 5)
+(define (range a b) (if (>= a b) '() (cons a (rang   => 100
+(car '())                                            !! IndexError
+(undefined-fn 1)                                     !! LispError: unbound symbol: undefined-fn
+(fact 1 2)                                           !! LispError: fact expects 1 args, got 2
+(1 2 3)                                              !! LispError: not a procedure: 1
+(+ 1                                                 !! LispError: missing )
+"hello"                                              => "hello"
+(cond (#f 1) (#f 2))                                 => (no value)
+symbols interned: 55
+['a', 'acc', 'and', 'append', 'b', 'begin', 'c', 'car', 'cdr', 'compose', 'cond', 'cons']
+['(', 'a', "'", 'b', '"s t"', 'c', ')']

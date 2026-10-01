@@ -1,0 +1,18 @@
+KeyError 'zz'
+IndexError list index out of range
+ValueError invalid literal for int() with base 10: 'abc'
+TypeError can only concatenate str (not "int") to str
+AttributeError 'NoneType' object has no attribute 'x'
+NameError name 'undefined_name' is not defined
+ValueError too many values to unpack (expected 2, got 3)
+ValueError not enough values to unpack (expected 3, got 2)
+TypeError args() missing 1 required positional argument: 'b'
+ZeroDivisionError division by zero
+IndexError pop from empty list
+TypeError object of type 'int' has no len()
+ValueError substring not found
+ValueError list.index(x): x not in list
+KeyError 'k'
+AttributeError 'int' object has no attribute 'foo'
+TypeError cannot use 'list' as a set element (unhashable type: 'list')
+StopIteration 

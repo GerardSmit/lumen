@@ -1,0 +1,20 @@
+Point(x=3, y=4) 25 Point(x=1, y=0) Point(x=1, y=2)
+True False True
+Point(x=10, y=4)
+Inventory(owner='ann', items=['sword'], tags={}, cached=0) Inventory(owner='ann', items=[], tags={}, cached=0) False hidden
+True
+Money(amount=5, currency='USD') Money(amount=12, currency='USD') 1 True
+FrozenInstanceError
+[Version(major=0, minor=9, patch=9), Version(major=1, minor=0, patch=0), Version(major=1, minor=2, patch=3), Version(major=2, minor=0, patch=0)]
+True True Version(major=2, minor=0, patch=0)
+[Job(priority=1, name='z'), Job(priority=1, name='a'), Job(priority=2, name='m'), Job(priority=3, name='c')] True
+['x', 'y'] ['id', 'kind', 'extra']
+[('owner', 'str'), ('items', 'list'), ('tags', 'dict'), ('secret', 'str'), ('cached', 'int')]
+Point(x=10, y=-1) Money(amount=5, currency='EUR') Point(x=10, y=4)
+Derived(id=7, kind='base', extra=1.5) 7 base 1.5 True
+WithPost(a=21, b=42) 42
+TypeError missing x
+TypeError too many
+TypeError unordered
+True True True
+unhashable mutable dataclass

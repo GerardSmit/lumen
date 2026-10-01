@@ -1,0 +1,26 @@
+0 zero
+1 one-or-two
+2 one-or-two
+3 three-to-five:3
+5 three-to-five:5
+6 int:6
+-1 minus one
+1.5 float 1.5
+'hello' greeting
+'a' a-or-b
+'b' a-or-b
+'c' other
+None none
+1000 big:1000
+b'bytes' bytes
+[] other
+2.5 other
+one-or-two zero
+['neg', 'zero', 'odd 1', 'even', 'odd 3', 'even']
+('captured', 7) ('captured', 's')
+one wild wild
+five
+x
+no match falls through
+go north quit unknown
+[2]

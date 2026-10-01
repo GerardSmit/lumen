@@ -1,0 +1,17 @@
+a b b a b 1-2 2 v 5
+'é' é '\xe9' {} {7}     1|2    |  3  |
+3 items a-b   3.1|ab    |000042 %% Hi ff FF 10 1.234568e+04
+x 2 None [1] 1 'x'    ab|cd   | ab    42
+A a-b ['a', 'b'] x 1 str
+abbc abcabcd 1ab2ab3 True False 2
+hello world hello False True True True True True
+['e', 'h', 'l', 'l', 'o'] ['h', 'é', 'y'] ('a', 'b') True True cba True
+e o 2 2 4 True False
+[(0, 'a'), (1, 'b')] [('a', 'x'), ('b', 'y')] {'a': 0, 'b': 1, 'c': 2} ['aa', 'bb', 'cc'] {'a': 97, 'b': 98} ab
+xxyyzz {97: 98} JLLLLo
+Hello   | Hello   | Hello   |    Hello| **Hello**|
+['a', 'b'] ['a', ' b'] ['abc'] ['a', 'b', 'c d'] ['  a', 'b', 'c'] ['a', 'b']
+False True True False True True False False False
+True True True True False True True False True True
+['ab', 'c'] ['a', 'b', 'c'] ok ['a', 'b', 'c']
+True True abcdef a end

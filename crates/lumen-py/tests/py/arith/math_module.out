@@ -1,0 +1,26 @@
+3.141592653589793 2.718281828459045 6.283185307179586 inf True
+4.0 1.4142135623730951 9 10000000000 3.0
+2 -3 3 -2 -2 2
+int 5 False
+3.0 -3.0 1.0 -1.0 1.0
+6 5 2 0 12 0
+1 120 15511210043330985984000000
+10 2598960 20 120
+1.0 2.718281828459045 0.0 1.0 3.0 10.0 3.0 0.0
+0.0 1.0 0.0 0.7853981633974483 True
+0.5 0.5 180.0 3.141592653589793
+5.0 1.4142135623730951 1024.0 1.4142135623730951 0.0
+True True True False
+True False True True
+1.0 1.0 24 1 5.0
+(0.5, 4) 8.0 (0.75, 3.0) (-0.75, -3.0)
+0.0 1.0 0.0 1.5707963267948966 0.0
+5.0 -1.0 True
+math.sqrt(-1) ValueError
+math.log(0) ValueError
+math.log(-1) ValueError
+math.factorial(-1) ValueError
+math.acos(2) ValueError
+math.exp(1000) OverflowError
+math.isqrt(-1) ValueError
+math.fmod(1, 0) ValueError

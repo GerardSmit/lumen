@@ -1,0 +1,49 @@
+ab      |      ab|   ab   |***ab***|      42|
++5 5  5 -5 -5
+11111111 377 ff FF 255 A
+0b11111111 0o377 0xff 0XFF -0xff
+00000101 0x000000ff -00005 500000   5   |
+1,234,567 1_234_567 1,234,567.5 ab_cdef 1,234
+3.141590e+00 3.141590E+00 3.14e+00 3.142E+04 0.000000e+00
+3.141590 3.141590 3      3.142 -00003.142
+3.14159 3.14159 1e+20 1E-20 1.23457e+08 1.234e-05
+50.000000% 12.35% 200.000000%    50.0% +150%
+inf -inf nan INF NAN
+0000000inf    nan +inf
+abc abc   abc a   ab    xxabcxx
+42 4.5 True None [1, 2] (1,)
+1234 12.5 0.1 1e+20
+True A     |
+1,180,591,620,717,411,303,424 400000000000000000 100_0000_000 -1_180_591_620_717_411_303_424
+1000000000000000.000000 1000000000000000.00 1.500000e+300 4.940656e-324
+1e+02 1.e+02 0 100 -0
+2 2 0.12 0.38 0.000
+aba 12 12 xy
+5 0 v int
+a    |     3.14 a   | a  |
+'é' é '\xe9'    'a' 1.0
+{} {1} {0}
+   abc|
+12,345 12_345 +12,345 0.50 999 1,000
+-003.142 +003.142  003.142 1.500   |
+0x0 0o0 0b0 0x00ff -1 -11
+abc abc True
+3.14 1.23e+03   0.000123 0.05
+    1|2    |    3|  4  | a    |b    |    c|  d  |
+  ab  |  ab   | 1.2 | ***+3.14
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+IndexError Replacement index 0 out of range for positional args tuple
+KeyError 'a'
+AttributeError
+ValueError Single '{' encountered in format string
+ValueError Single '}' encountered in format string

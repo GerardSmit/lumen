@@ -1,0 +1,16 @@
+False True
+1
+[2]
+True
+exhausted
+start
+1
+cleanup
+closed
+stop after close
+closed unstarted
+got GeneratorExit
+RuntimeError generator ignored GeneratorExit
+42 (42,)
+fin1
+end

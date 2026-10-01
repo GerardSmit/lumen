@@ -1,0 +1,35 @@
+b''  True
+b'f' Zg== True
+b'fo' Zm8= True
+b'foo' Zm9v True
+b'foob' Zm9vYg== True
+b'fooba' Zm9vYmE= True
+b'foobar' Zm9vYmFy True
+b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\t' AAECAwQFBgcICQ== True
+b'Many hands make light work.' TWFueSBoYW5kcyBtYWtlIGxpZ2h0IHdvcmsu True
+aMOpbGxvIHfDtnJsZA==
+héllo
+ValueError: bad length
+ValueError: bad char '$'
+b''
+'' '' True
+'a' 'a' True
+'aaabccdddd' '3ab2c4d' True
+'abc' 'abc' True
+'zzzzzzzzzzzz' '12z' True
+'aabbaabb' '2a2b2a2b' True
+[84, 79, 66, 69, 79, 82, 78, 79, 84, 256, 258, 260, 265, 259, 261, 263] True
+240 64 True
+0000  54 68 65 20 71 75 69 63  |The quic|
+0008  6b 20 62 72 6f 77 6e 20  |k brown |
+0010  66 6f 78 09 6a 75 6d 70  |fox.jump|
+0018  73 0a 20 6f 76 65 72 20  |s. over |
+0020  31 33 20 6c 61 7a 79 20  |13 lazy |
+0028  64 6f 67 73 21           |dogs!|
+cbf43926 00000000 fa3234cd
+Khoor, Zruog! Hello, World!
+b'Hi' bytearray(b'abcd') 98 b'bc' [104, 105]
+[b'a', b'b', b'', b'c'] b'pad' b'1x2x3'
+b'\xc3\xa9' Ã© 3 9
+1 b'\x01\x02' ff
+b'Hello' 48656c6c6f

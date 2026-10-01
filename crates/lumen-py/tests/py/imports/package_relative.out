@@ -1,0 +1,17 @@
+init _helpers
+load util _helpers.util
+init sub _helpers.sub
+load deep _helpers.sub.deep
+load sibling _helpers.sibling
+1.0 True
+Box(9)
+10
+('1.0', 2, '_helpers.sub')
+2 10
+True
+True
+True
+True
+_helpers.sub.deep _helpers.sub
+_helpers.sibling _helpers
+['sibling', 'sub', 'util']

@@ -1,0 +1,23 @@
+body
+else
+finally
+body
+except x
+finally
+cleanup
+try
+finally
+swallowed
+fin-else
+else
+[0, ('f', 0), 1, ('f', 1), 2, ('f', 2), ('f', 3)]
+[0, ('f', 0), ('f', 1), 2, ('f', 2), ('f', 3)]
+('after loop', 0)
+3
+inner finally
+outer caught ('inner',)
+mid finally
+outer got b
+1
+handled second
+still first

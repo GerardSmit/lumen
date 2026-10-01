@@ -773,6 +773,7 @@ name = "lumen"
 version = "0.1.3"
 dependencies = [
  "lumen-codegen",
+ "lumen-common",
  "lumen-macros",
 ]
 
@@ -804,6 +805,10 @@ dependencies = [
 
 [[package]]
 name = "lumen-codegen"
+version = "0.1.3"
+
+[[package]]
+name = "lumen-common"
 version = "0.1.3"
 
 [[package]]
@@ -904,6 +909,13 @@ dependencies = [
  "subtle",
  "x25519-dalek",
  "x509-cert",
+]
+
+[[package]]
+name = "lumen-py"
+version = "0.1.3"
+dependencies = [
+ "lumen-common",
 ]
 
 [[package]]

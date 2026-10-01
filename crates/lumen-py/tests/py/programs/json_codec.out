@@ -1,0 +1,74 @@
+{"name": "Widget \"Pro\"", "tags": ["a", "b\\c", "tab\there", "nl\nx"], "price": 12.5, "stock": 0, "ratio": 1e-07, "big": 12345678901234567890, "nested": {"deep": [[1, 2], [3, [4, [5]]], {}], "empty": []}, "unicode": "caf\u00e9 \u4e2d\u6587 \ud83d\ude00", "flags": [true, false, null]}
+{
+  "big": 12345678901234567890,
+  "flags": [
+    true,
+    false,
+    null
+  ],
+  "name": "Widget \"Pro\"",
+  "nested": {
+    "deep": [
+      [
+        1,
+        2
+      ],
+      [
+        3,
+        [
+          4,
+          [
+            5
+          ]
+        ]
+      ],
+      {}
+    ],
+    "empty": []
+  },
+  "price": 12.5,
+  "ratio": 1e-07,
+  "stock": 0,
+  "tags": [
+    "a",
+    "b\\c",
+    "tab\there",
+    "nl\nx"
+  ],
+  "unicode": "caf\u00e9 \u4e2d\u6587 \ud83d\ude00"
+}
+roundtrip equal: True
+pretty roundtrip: True
+True
+'  [1, 2.5, -3, 1e3, 2E-2, -0.5]  ' -> [1, 2.5, -3, 1000.0, 0.02, -0.5]
+'{"a": {"b": {"c": []}}}' -> {'a': {'b': {'c': []}}}
+'""' -> ''
+'0' -> 0
+'-0' -> 0
+'true' -> True
+' null ' -> None
+'[[],[[]]]' -> [[], [[]]]
+'' error: unexpected end (pos 0, line 1)
+'[1,' error: unexpected end (pos 3, line 1)
+'[1 2]' error: expected , or ] (pos 3, line 1)
+'{"a" 1}' error: expected : (pos 5, line 1)
+'{a: 1}' error: expected string key (pos 1, line 1)
+'"abc' error: unterminated string (pos 4, line 1)
+'01' error: leading zero (pos 2, line 1)
+'1.' error: bad fraction (pos 2, line 1)
+'-' error: bad number (pos 1, line 1)
+'[1,]' error: unexpected ']' (pos 3, line 1)
+'{"a":1,}' error: expected string key (pos 7, line 1)
+'tru' error: unexpected 't' (pos 0, line 1)
+'"\\x"' error: bad escape \x (pos 2, line 1)
+'"\\u12"' error: bad unicode escape (pos 2, line 1)
+'[1] x' error: extra data (pos 4, line 1)
+'"a\nb"' error: control character in string (pos 2, line 1)
+'1e' error: bad exponent (pos 2, line 1)
+'{"a":}' error: unexpected '}' (pos 5, line 1)
+encode error: keys must be strings, got int
+encode error: cannot encode set
+encode error: cannot encode non-finite float
+encode error: cannot encode type
+"é" "\u00e9"
+[1.0, 2.5e+20, 1e-05, 123456789.125]

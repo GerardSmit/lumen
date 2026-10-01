@@ -1,0 +1,32 @@
+n=1 solutions=1 first=(0,)
+n=4 solutions=2 first=(1, 3, 0, 2)
+n=5 solutions=10 first=(0, 2, 4, 1, 3)
+n=6 solutions=4 first=(1, 3, 5, 0, 2, 4)
+n=8 solutions=92 first=(0, 4, 7, 5, 2, 6, 1, 3)
+.Q....
+...Q..
+.....Q
+Q.....
+..Q...
+....Q.
+(0, 4, 7, 5, 2, 6, 1, 3) (7, 3, 0, 2, 5, 1, 6, 4)
+True
+[('a', 'b', 'c'), ('a', 'c', 'b'), ('b', 'a', 'c'), ('b', 'c', 'a'), ('c', 'a', 'b'), ('c', 'b', 'a')]
+720 (3, 1, 2)
+['abcd', 'abdc', 'acbd', 'acdb', 'adbc', 'adcb', 'bacd']
+[()]
+(1, 2, 3) (1, 3, 2) [(2, 1, 3), (2, 3, 1), (3, 1, 2), (3, 2, 1)]
+[('a', 'b', 'c'), ('a', 'b', 'd'), ('a', 'b', 'e'), ('a', 'c', 'd'), ('a', 'c', 'e'), ('a', 'd', 'e'), ('b', 'c', 'd'), ('b', 'c', 'e'), ('b', 'd', 'e'), ('c', 'd', 'e')]
+210 [()] []
+[(3, 4, 2), (4, 5)]
+[(1, 2, 3, 4, 5), (1, 2, 3, 9), (1, 2, 4, 8), (1, 2, 5, 7), (1, 3, 4, 7)] 45
+[]
+'GTAB' 'abcd' ''
+42
+kitten sitting 3
+flaw lawn 2
+ abc 3
+same same 0
+intention execution 5
+(510, ['banana', 'compass', 'glucose', 'map', 'sandwich', 'tin'])
+(150, ['map']) (0, [])

@@ -1,0 +1,21 @@
+r1 ['r1'] ['r2', 'r3']
+[] ['r2', 'r3', 'r1']
+r2 r3 ['r2', 'r3']
+[] ['r1', 'r3', 'r2']
+committed
+{'a': 1, 'b': 2}
+rolled back ValueError
+{'a': 1, 'b': 2}
+rolled back KeyError
+{'a': 1, 'b': 2}
+top
+  one
+    two
+  one again
+top again
+True
+False
+5 True
+True
+closed
+closed

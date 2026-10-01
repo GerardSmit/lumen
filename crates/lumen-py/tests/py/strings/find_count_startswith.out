@@ -1,0 +1,28 @@
+0 13 -1 0 -1 7 -1
+13 17 4 -1 24
+6 13
+ValueError substring not found
+ValueError substring not found
+2 5 2 25 3 2 2 1
+True True True True False True True True True
+False False True True
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+97 65 48 10 233 8364 128512 0
+a A € 😀 '\x00' '\n' '\x7f' '\xa0' True
+[97, 90, 48, 57, 32] IBM ABCDEFGHIJKLMNOPQRSTUVWXYZ
+ValueError chr
+ValueError chr2
+TypeError ord
+a c bc ab cba ace bd  ab
+IndexError string index out of range
+immutable
+0 3 1 1 1 1 2 2
+b'abc' b'\xc3\xa9' b'\xe2\x82\xac' b'\xf0\x9f\x98\x80' é abc c3a9 3
+b'\xe9' b'abc' hi b'hllo' b'h?llo' b'h\\xe9llo'
+UnicodeEncodeError
+UnicodeDecodeError
+True ab

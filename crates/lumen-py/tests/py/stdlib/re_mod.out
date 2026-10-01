@@ -1,0 +1,10 @@
+123-abc 123 abc ('123', 'abc') (0, 7) 4 7
+None 42 True None
+['1', '22', '333'] [('a', '1'), ('b', '2')] []
+a b c host at me bba
+a2b4c6 ('f00 b00', 4)
+['a', 'b', 'c', 'd'] ['a', '1', 'b', '2', 'c'] ['abc'] ['a', 'b c']
+alpha {'key': 'alpha', 'val': '10'} [('a', '1'), ('b', '2')]
+True ['a', 'b'] None True
+a\.b\*c True (None, 'b')
+['the', 'cat', 'sat'] ababab 45

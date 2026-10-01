@@ -1,0 +1,22 @@
+True False True True
+True True False
+True False True
+True True
+True [1, 2, 3]
+False [3, 2]
+False [1, 0]
+x 1 None
+0 x 3 0
+
+True
+0 [0]
+2 [0, 2]
+default
+True
+True True True
+True
+False
+2 5 7
+1
+in
+False True

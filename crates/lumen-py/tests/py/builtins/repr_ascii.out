@@ -1,0 +1,20 @@
+'hi' "it's" 'say "x"' 'both \' and "' 'tab\tnl\n\\'
+'é' '\xe9' '\u20ac \U0001f600' 'plain' '\x00\x1f\x7f'
+1 1.5 None True [1, 'a'] (1,) () {'k': [1]}
+{1, 2} set() fs {} []
+b'ab\x00\xff' bytearray(b'hi') b"it's" b'"'
+x 5 [1, 'a'] ('a',) None b'x'
+range(0, 3) slice(1, 2, None) (3+4j) 1j (1-1j)
+Ellipsis NotImplemented <built-in function l <class 'int'>
+P() P() [P(), P()] Q-str R-str R-repr R-str
+[R-repr, 'x'] {'a': R-repr} (R-repr,)
+'x' '\xe9'      1.5|  ab  |ab***|+42|0xff|11111111|1_234_567
+'a' a '\xe9'     1|2    |00003 ff 10 A
+a 'b'    c xyx 1
+[1, [...]] [1, [...]]
+{'self': {...}}
+1e+100 1000000000000000000000000000000 -0.0 True
+'aaa' 'multi\nline' multi
+line
+'\n' True • 1
+'\u200b' '\xa0' '\ud7ff'

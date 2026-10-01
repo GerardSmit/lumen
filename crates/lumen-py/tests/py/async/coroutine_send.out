@@ -1,0 +1,22 @@
+coroutine
+StopIteration 42 (42,)
+42
+5
+(3, 13)
+first
+second
+(('resumed', 'A'), ('resumed', 'B'))
+99
+0
+1
+2
+stop [('resumed', 'p'), ('resumed', 'q'), ('resumed', 'r')]
+x
+done
+RuntimeError
+cannot reuse awaited coroutine
+non-None send to fresh coroutine
+inner
+8
+1
+sent
