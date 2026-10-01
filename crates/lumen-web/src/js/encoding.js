@@ -288,12 +288,14 @@ function incompleteUtf8Tail(bytes) {
 }
 
 function btoa(data) {
+  if (arguments.length === 0) throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "input" argument must be specified');
   const out = __encoding.btoa(data);
   if (out === null) throw new DOMException("btoa: character beyond latin1 range", "InvalidCharacterError");
   return out;
 }
 
 function atob(data) {
+  if (arguments.length === 0) throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "input" argument must be specified');
   const out = __encoding.atob(data);
   if (out === null) throw new DOMException("atob: invalid base64", "InvalidCharacterError");
   return out;
@@ -311,17 +313,18 @@ function cloneDataCloneError(message) {
 }
 
 function structuredClone(value, options) {
-  if (arguments.length === 0) throw new TypeError("The \"value\" argument must be specified");
+  if (arguments.length === 0) throw codedError(TypeError, "ERR_MISSING_ARGS", "The \"value\" argument must be specified");
   let transfer = [];
   if (options !== undefined && options !== null) {
     if (typeof options !== "object" && typeof options !== "function") {
-      throw new TypeError("The \"options\" argument must be of type object.");
+      throw codedError(TypeError, "ERR_INVALID_ARG_TYPE", "The \"options\" argument must be of type object.");
     }
-    if (options.transfer !== undefined) {
-      if (options.transfer === null || typeof options.transfer[Symbol.iterator] !== "function") {
-        throw new TypeError("The \"options.transfer\" property must be iterable.");
+    const list = options.transfer;
+    if (list !== undefined && list !== null) {
+      if ((typeof list !== "object" && typeof list !== "function") || typeof list[Symbol.iterator] !== "function") {
+        throw codedError(TypeError, "ERR_INVALID_ARG_TYPE", "The \"options.transfer\" property must be of type object.");
       }
-      transfer = [...options.transfer];
+      transfer = [...list];
     }
   }
   // Native Node ports need ownership attachments even for an in-realm clone. All transfer
@@ -332,8 +335,9 @@ function structuredClone(value, options) {
   }
   const seen = new Map();
   for (const t of transfer) {
-    if (t instanceof AbortSignal && t[kTransferableSignal] === true) {
-      seen.set(t, cloneTransferableSignal(t));
+    if (t !== null && typeof t === "object" && t[Symbol.for("nodejs.untransferable")] === true) continue;
+    if (t instanceof AbortSignal && t[Symbol.for("nodejs.abortsignal.transferable")] === true) {
+      seen.set(t, globalThis.__cloneTransferableSignal(t));
       continue;
     }
     if (!cloneIsArrayBuffer(t)) throw cloneDataCloneError("Found invalid value in transferList.");
@@ -389,6 +393,9 @@ function structuredClone(value, options) {
       seen.set(v, out);
       for (const item of v) out.add(clone(item));
       return out;
+    } else if (typeof v[Symbol.for("lumen.transferable.clone")] === "function") {
+      const { data, deserializeInfo } = v[Symbol.for("lumen.transferable.clone")]();
+      out = globalThis.__reviveHostObject(deserializeInfo)(clone(data));
     } else if (v instanceof Error) {
       let name = v.name;
       if (!CLONE_ERROR_NAMES.has(name)) name = "Error";

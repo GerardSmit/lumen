@@ -529,6 +529,7 @@ function bindingCall(syscall, fn, path, dest) {
   }
 }
 function complete(req, err, value) {
+  __activeResources.requests.delete(req);
   try {
     if (err) Reflect.apply(req.oncomplete, req, [err]);
     // Node passes the result only when there is one: a void op completes as oncomplete(null).
@@ -538,9 +539,43 @@ function complete(req, err, value) {
       throw e;
     });
   }
+  process._tickCallback();
 }
+// libuv's request names, where Node's sync trace events use the syscall's own name.
+const syncTraceNames = { scandir: "readdir", utime: "utimes", futime: "futimes", lutime: "lutimes" };
+let traceAsyncId = 0;
 // Run one binding call in the mode `req`/`ctx` select (see the header comment).
 function dispatch(req, ctx, syscall, path, dest, sync, async, post) {
+  if (__traceEvent === null) return dispatchRun(req, ctx, syscall, path, dest, sync, async, post);
+  const dir = syscall === "opendir" || syscall === "closedir";
+  const data = path === undefined ? undefined : { path: displayPath(path) };
+  if (req === undefined) {
+    const category = "node,node.fs,node.fs.sync";
+    const name = `fs.sync.${syncTraceNames[syscall] ?? syscall}`;
+    __traceEvent(category, "B", name, undefined, data);
+    try {
+      return dispatchRun(req, ctx, syscall, path, dest, sync, async, post);
+    } finally {
+      __traceEvent(category, "E", name);
+    }
+  }
+  const category = dir ? "node,node.fs_dir,node.fs_dir.async" : "node,node.fs,node.fs.async";
+  const id = ++traceAsyncId;
+  __traceEvent(category, "b", syscall, id, data);
+  const end = () => __traceEvent(category, "e", syscall, id);
+  const traced = () => {
+    try {
+      const promise = async();
+      promise.then(end, end);
+      return promise;
+    } catch (e) {
+      end();
+      throw e;
+    }
+  };
+  return dispatchRun(req, ctx, syscall, path, dest, sync, traced, post);
+}
+function dispatchRun(req, ctx, syscall, path, dest, sync, async, post) {
   if (req === undefined) {
     let result;
     try {
@@ -571,6 +606,7 @@ function dispatch(req, ctx, syscall, path, dest, sync, async, post) {
       (e) => { throw bindingError(e, syscall, path, dest); },
     );
   }
+  __activeResources.requests.add(req);
   promise.then(
     (result) => {
       let value;
@@ -9350,6 +9386,13 @@ fs.globSync = function globSync(pattern, options = {}) {
   }
   return results;
 };
+// A later Node API (22+): available, but not one of the enumerable keys Node 20 exposes.
+Object.defineProperty(fs, "globSync", { enumerable: false });
 
 __builtins.set("fs", fs);
+// The originals, so the module loader can tell when a program patched them (module.js).
+__internals.set("fs_readFileSync", fs.readFileSync);
+__internals.set("fs_realpathSync", fs.realpathSync);
 __builtins.set("fs/promises", __lazyValue(() => fs.promises));
+// The module table, for --expose-internals (internals.js).
+__internals.set("fsRequire", require);

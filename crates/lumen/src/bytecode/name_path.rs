@@ -218,7 +218,7 @@ impl NamePath {
                 return Some((Self { guards, holder }, binding.value.clone()));
             }
             if Rc::ptr_eq(&current, &interp.global_env) {
-                if depth == 0 {
+                if depth == 0 || interp.global_proxy.is_some() {
                     return None;
                 }
                 let global = interp.global.borrow();

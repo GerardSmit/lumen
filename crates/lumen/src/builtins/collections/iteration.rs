@@ -306,3 +306,43 @@ fn map_set_iter_step_slow(i: &mut Interp, obj: &Gc) -> Option<Value> {
         }
     }
 }
+
+/// V8's `previewEntries` for a Map/Set iterator: its remaining entries without advancing it.
+/// An entries iterator yields flat `[k0, v0, k1, v1, …]` and `true`; otherwise the values and
+/// `false`. `None` when `obj` is not a Map/Set iterator.
+pub(crate) fn map_set_iter_preview(i: &Interp, obj: &Gc) -> Option<(Vec<Value>, bool)> {
+    let (coll, done, mut idx, kind) = {
+        let b = obj.borrow();
+        let num = |k: &str| -> f64 {
+            match b.props.get(k).map(|p| p.value()) {
+                Some(Value::Num(n)) => n,
+                _ => 0.0,
+            }
+        };
+        (
+            b.props.get("__ci_coll").map(|p| p.value())?,
+            matches!(
+                b.props.get("__ci_done").map(|p| p.value()),
+                Some(Value::Bool(true))
+            ),
+            num("__ci_index") as usize,
+            num("__ci_kind") as u8,
+        )
+    };
+    let mut out = Vec::new();
+    if !done {
+        if let Some(data) = map_ptr(&coll).and_then(|p| i.map_data.get(&p)) {
+            while let Some((k, v)) = data.next(&mut idx) {
+                match kind {
+                    1 => out.push(k.unpack()),
+                    2 => {
+                        out.push(k.unpack());
+                        out.push(v.unpack());
+                    }
+                    _ => out.push(v.unpack()),
+                }
+            }
+        }
+    }
+    Some((out, kind == 2))
+}

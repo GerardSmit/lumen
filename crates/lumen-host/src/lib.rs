@@ -28,6 +28,8 @@ pub mod codec;
 
 /// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
 /// `Date.now()`), where `std::time::Instant::now()` panics.
+/// The process clock behind `performance` and the event loop's milestone and idle counters.
+pub mod perf;
 pub mod sysfs;
 pub mod time;
 

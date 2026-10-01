@@ -40,6 +40,7 @@ mod eval;
 /// `#[global_allocator] static A: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;`
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;
+pub mod gc_log;
 use lumen_common::fasthash;
 mod host;
 mod interpreter;
@@ -70,6 +71,7 @@ mod sync_callbacks;
 mod temporal;
 mod token;
 mod tz;
+mod local_tz;
 pub mod typescript;
 #[rustfmt::skip]
 mod tzdata;
@@ -86,6 +88,9 @@ mod cldr_dates;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_units;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod tznames;
 #[rustfmt::skip]
 mod units;
 use lumen_common::unicode_norm_impl;
@@ -115,6 +120,32 @@ static HOST_CLOCK: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new()
 /// milliseconds since the Unix epoch.
 pub fn set_host_clock(f: fn() -> f64) {
     let _ = HOST_CLOCK.set(f);
+}
+
+pub(crate) static TAIL_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn proper tail calls (ES2015 PrepareForTailCall) off for this process. V8 has none, and
+/// hosts that mirror its stack traces need every caller's frame to stay visible.
+pub fn set_tail_calls(on: bool) {
+    TAIL_CALLS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set the process-wide local time zone (V8 keeps one per process too): the zone of `Date`'s
+/// local-time methods and `toString`, the default `Intl.DateTimeFormat` time zone and
+/// `Temporal.Now.timeZoneId`. `name` is an IANA zone (`"Europe/Paris"`; POSIX `TZ` spellings such
+/// as `":Europe/Paris"` or a `.../zoneinfo/Europe/Paris` path work too); `None` means UTC, the
+/// default. Takes effect for every later call. Returns false, and uses UTC, if `name` is unknown.
+pub fn set_local_time_zone(name: Option<&str>) -> bool {
+    local_tz::set(name)
+}
+
+/// The current local time zone's identifier ("UTC" unless [`set_local_time_zone`] chose another).
+pub fn local_time_zone() -> &'static str {
+    local_tz::id()
+}
+
+pub(crate) fn tail_calls_enabled() -> bool {
+    TAIL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Install the WebAssembly JIT host (first call wins; meaningful on wasm32 only). On wasm32 the
@@ -177,6 +208,7 @@ pub fn well_formed_utf8(s: &str) -> std::borrow::Cow<'_, str> {
 /// Ahead-of-time compilation (see [`Engine::load_precompiled`] and the `lumen-aot` crate):
 /// [`precompile`] / [`precompiled::PrecompileBundle`] run at build time and produce a
 /// source-free blob; [`Precompiled`] wraps one linked into the binary.
+pub use interpreter::{AtomicsWaitEvent, AtomicsWaitPhase};
 pub use precompiled::{precompile, Precompiled, SourceKind};
 
 /// A parse-phase failure. test262 reports these as a `SyntaxError` thrown during parsing.
@@ -287,6 +319,11 @@ impl Engine {
     /// Whether this agent may block in `Atomics.wait` (test262's CanBlockIsTrue flag).
     pub fn set_can_block(&mut self, b: bool) {
         self.interp.can_block = b;
+    }
+
+    /// Observe every synchronous `Atomics.wait` of this realm.
+    pub fn set_atomics_wait_hook(&mut self, hook: Option<Box<dyn Fn(&AtomicsWaitEvent)>>) {
+        self.interp.atomics_wait_hook = hook;
     }
 
     pub fn run_as_agent(
@@ -777,6 +814,35 @@ impl Engine {
             .into_iter()
             .map(|(promise, reason, _)| (promise, reason))
             .collect()
+    }
+
+    /// Start recording rejections that get a handler after being reported unhandled (see
+    /// [`Engine::take_late_handled_rejections`]).
+    pub fn track_late_handled_rejections(&mut self) {
+        self.interp.late_handled_rejections.get_or_insert_with(Vec::new);
+    }
+
+    /// Promises reported by [`Engine::take_unhandled_rejections_full`] that have since been
+    /// handled (Node's `rejectionHandled`), in handling order.
+    pub fn take_late_handled_rejections(&mut self) -> Vec<embed::Value> {
+        match self.interp.late_handled_rejections.as_mut() {
+            Some(list) => std::mem::take(list),
+            None => Vec::new(),
+        }
+    }
+
+    /// Report `queueMicrotask` callback throws through [`Engine::take_task_errors`] instead of
+    /// as unhandled rejections.
+    pub fn report_task_errors(&mut self) {
+        self.interp.task_errors.get_or_insert_with(Vec::new);
+    }
+
+    /// Errors thrown by `queueMicrotask` callbacks since the last call.
+    pub fn take_task_errors(&mut self) -> Vec<embed::Value> {
+        match self.interp.task_errors.as_mut() {
+            Some(list) => std::mem::take(list),
+            None => Vec::new(),
+        }
     }
 
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is

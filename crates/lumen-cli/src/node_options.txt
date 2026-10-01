@@ -856,6 +856,7 @@
 --trace-detached-contexts b 1 v8
 --trace-duplicate-threshold-kb v 1 v8
 --trace-elements-transitions b 1 v8
+--trace-atomics-wait b 1
 --trace-env b 1
 --trace-env-js-stack b 1
 --trace-env-native-stack b 1

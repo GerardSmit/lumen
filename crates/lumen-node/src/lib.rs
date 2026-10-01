@@ -59,10 +59,12 @@ mod native;
 mod net;
 mod password;
 mod pathops;
+mod signals;
 #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod sqlite;
 #[cfg(not(target_arch = "wasm32"))]
 mod tls;
+mod vm_context;
 #[cfg(not(target_arch = "wasm32"))]
 mod vm_timeout;
 mod zlib;
@@ -110,9 +112,23 @@ pub fn extension() -> Extension {
                     "nameSource" (2) => op_name_source,
                     "promiseState" (1) => op_promise_state,
                     "proxyParts" (1) => op_proxy_parts,
+                    "previewEntries" (2) => op_preview_entries,
                     "collectGarbage" (0) => op_collect_garbage,
+                    "signalNumber" (1) => signals::op_signal_number,
+                    "signalWatch" (2) => signals::op_signal_watch,
+                    "signalUnwatch" (1) => signals::op_signal_unwatch,
+                    "signalRaise" (1) => signals::op_signal_raise,
+                    "v8SetFlags" (1) => op_v8_set_flags,
+                    "heapSnapshot" (1) => op_heap_snapshot,
+                    "perfTiming" (0) => op_perf_timing,
+                    "memoryStats" (0) => op_memory_stats,
+                    "gcObserve" (1) => op_gc_observe,
+                    "gcTake" (0) => op_gc_take,
                     "asyncContextGet" (0) => op_async_context_get,
                     "asyncContextSet" (1) => op_async_context_set,
+                    "setPromiseHooks" (4) => op_set_promise_hooks,
+                    "reportTaskError" (1) => op_report_task_error,
+                    "setMultipleResolvesHook" (1) => op_set_multiple_resolves_hook,
                     "heapObjectCount" (0) => op_heap_object_count,
                     "drainMicrotasks" (0) => op_drain_microtasks,
                     "transformJsx" (1) => op_transform_jsx,
@@ -144,6 +160,7 @@ pub fn extension() -> Extension {
                 ops![
                     "info" (0) => op_os_info,
                     "hostname" (0) => op_hostname,
+                    "sysinfo" (0) => op_os_sysinfo,
                     "getPriority" (1) => op_os_getpriority,
                     "setPriority" (2) => op_os_setpriority,
                 ],
@@ -197,6 +214,7 @@ pub fn extension() -> Extension {
             ),
             ("__child", child::CHILD_OPS),
             ("__vm", vm_timeout::VM_OPS),
+            ("__vmc", vm_context::VM_CONTEXT_OPS),
             ("__net", net::NET_OPS),
             ("__udp", net::UDP_OPS),
             ("__tls", tls::TLS_OPS),
@@ -282,7 +300,87 @@ fn op_proxy_parts(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     })
 }
 
+/// `(iterator, isKeyValue)` — V8's `previewEntries`: a Map/Set iterator's remaining entries
+/// without advancing it; `[entries, isKeyValue]` when `isKeyValue` is true, else `entries`.
+fn op_preview_entries(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let Some((entries, key_value)) = ctx.preview_entries_for_host(&v) else {
+        return Ok(Value::Undefined);
+    };
+    let list = ctx.make_array(entries);
+    Ok(if matches!(args.get(1), Some(Value::Bool(true))) {
+        ctx.make_array(vec![list, Value::Bool(key_value)])
+    } else {
+        list
+    })
+}
+
+/// `(path?)` — a V8 heap snapshot of this realm's heap: written to `path`, or returned as a
+/// `Uint8Array` of its JSON.
+fn op_heap_snapshot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    match args.first() {
+        Some(Value::Str(path)) => {
+            let path = path.to_string();
+            let written = std::fs::File::create(&path).and_then(|f| {
+                let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
+                ctx.write_heap_snapshot(&mut out)
+            });
+            match written {
+                Ok(()) => Ok(Value::Undefined),
+                Err(e) => Err(ctx.make_error("Error", format!("cannot write heap snapshot '{path}': {e}"))),
+            }
+        }
+        _ => {
+            let mut out = Vec::new();
+            ctx.write_heap_snapshot(&mut out)
+                .map_err(|e| ctx.make_error("Error", format!("heap snapshot: {e}")))?;
+            ctx.make_uint8array(&out)
+        }
+    }
+}
+
+/// `(flags)` — apply the V8 flags lumen implements from a `v8.setFlagsFromString` string
+/// (`--allow-natives-syntax` and its `--no` form); the rest have no lumen counterpart.
+fn op_v8_set_flags(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(Value::Str(flags)) = args.first() else {
+        return Ok(Value::Undefined);
+    };
+    for flag in flags.to_string().split_whitespace() {
+        let flag = flag.trim_start_matches('-').replace('_', "-");
+        let (on, name) = match flag.strip_prefix("no-").or_else(|| flag.strip_prefix("no")) {
+            Some(rest) if rest == "allow-natives-syntax" => (false, rest),
+            _ => (true, flag.as_str()),
+        };
+        if name == "allow-natives-syntax" {
+            ctx.set_natives_syntax(on);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
 /// `()` — the current async context value (see `Interp::async_context`).
+/// `(init, before, after, settled)` — install V8-style promise hooks (`v8.promiseHooks`,
+/// async_hooks); all four non-callable removes them.
+fn op_set_promise_hooks(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Undefined);
+    ctx.set_promise_hooks(Some([arg(0), arg(1), arg(2), arg(3)]));
+    Ok(Value::Undefined)
+}
+
+/// `(error)` — report `error` as an uncaught exception after the current microtask checkpoint
+/// (Node's triggerUncaughtException from a hook or microtask); `false` when unsupported.
+fn op_report_task_error(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let error = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(Value::Bool(ctx.report_task_error(error)))
+}
+
+/// `(hook)` — call `hook(type, promise, value)` when a settled promise is resolved again
+/// (process 'multipleResolves'); a non-function removes it.
+fn op_set_multiple_resolves_hook(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    ctx.set_multiple_resolves_hook(args.first().cloned().unwrap_or(Value::Undefined));
+    Ok(Value::Undefined)
+}
+
 fn op_async_context_get(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(ctx.async_context())
 }
@@ -294,6 +392,55 @@ fn op_async_context_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 
 fn op_collect_garbage(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Num(ctx.collect_garbage_for_host() as f64))
+}
+
+/// `[nodeStart, v8Start, environment, bootstrapComplete, loopStart, loopExit, idleTime]` in
+/// milliseconds on the `performance.now()` clock (-1: not reached yet).
+fn op_perf_timing(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let values = lumen_host::perf::snapshot().into_iter().map(Value::Num).collect();
+    Ok(ctx.make_array(values))
+}
+
+/// `[liveHeapObjects, arrayBufferBytes]` for `process.memoryUsage()`.
+fn op_memory_stats(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let objects = Value::Num(ctx.live_object_count() as f64);
+    let buffers = Value::Num(lumen::bytebuf::tracked_bytes() as f64);
+    Ok(ctx.make_array(vec![objects, buffers]))
+}
+
+/// `(callback | null)` — log every collection and queue `callback` as a microtask after it;
+/// `null` stops.
+fn op_gc_observe(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    match args.first() {
+        Some(callback) if callback.is_callable() => {
+            let mut observer = lumen::gc_log::GcObserver::new(callback.clone());
+            observer.epoch_ms = lumen_host::perf::now_ms();
+            ctx.op_state().put(observer);
+        }
+        _ => {
+            ctx.op_state().take::<lumen::gc_log::GcObserver>();
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+/// `()` — the logged collections as a flat `[startTime, duration, forced, ...]` array (ms, on
+/// the `performance.now()` clock), clearing the log.
+fn op_gc_take(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let (events, base_ms) = match ctx.op_state().get_mut::<lumen::gc_log::GcObserver>() {
+        Some(observer) => {
+            observer.queued = false;
+            (std::mem::take(&mut observer.events), observer.epoch_ms)
+        }
+        None => (Vec::new(), 0.0),
+    };
+    let mut flat = Vec::with_capacity(events.len() * 3);
+    for event in events {
+        flat.push(Value::Num(base_ms + event.start.as_secs_f64() * 1000.0));
+        flat.push(Value::Num(event.duration.as_secs_f64() * 1000.0));
+        flat.push(Value::Bool(event.forced));
+    }
+    Ok(ctx.make_array(flat))
 }
 
 fn op_heap_object_count(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -1307,6 +1454,125 @@ pub fn shutdown_native_resources(ctx: &mut Ctx) {
 
 /// Wake child realms blocked on their stdio pipes (see `child::close_child_pipes`).
 pub fn close_child_pipes(ctx: &mut Ctx) { child::close_child_pipes(ctx); }
+
+/// Live facts for `os.uptime/loadavg/freemem/userInfo`: `{ uptime, load1/5/15, freemem, uid, gid,
+/// username, shell, homedir }`, read fresh on each call.
+fn op_os_sysinfo(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let obj = Value::Obj(ctx.new_object());
+    let (uptime, freemem) = uptime_and_freemem();
+    let _ = ctx.set_member(&obj, "uptime", Value::Num(uptime));
+    let _ = ctx.set_member(&obj, "freemem", Value::Num(freemem));
+    let load = loadavg();
+    for (key, n) in ["load1", "load5", "load15"].into_iter().zip(load) {
+        let _ = ctx.set_member(&obj, key, Value::Num(n));
+    }
+    let user = passwd_user();
+    let _ = ctx.set_member(&obj, "uid", Value::Num(user.uid as f64));
+    let _ = ctx.set_member(&obj, "gid", Value::Num(user.gid as f64));
+    let _ = ctx.set_member(&obj, "username", Value::from_string(user.name));
+    let _ = ctx.set_member(&obj, "shell", user.shell.map(Value::from_string).unwrap_or(Value::Null));
+    let _ = ctx.set_member(&obj, "homedir", Value::from_string(user.dir));
+    Ok(obj)
+}
+
+struct PasswdUser {
+    uid: i64,
+    gid: i64,
+    name: String,
+    dir: String,
+    shell: Option<String>,
+}
+
+#[cfg(unix)]
+fn passwd_user() -> PasswdUser {
+    use std::ffi::CStr;
+    let text = |p: *const std::os::raw::c_char| {
+        (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    };
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let entry = unsafe { libc::getpwuid(uid) };
+    let (name, dir, shell) = if entry.is_null() {
+        (None, None, None)
+    } else {
+        unsafe { (text((*entry).pw_name), text((*entry).pw_dir), text((*entry).pw_shell)) }
+    };
+    PasswdUser {
+        uid: uid as i64,
+        gid: gid as i64,
+        name: name.unwrap_or_default(),
+        dir: dir.or_else(passwd_home_dir).unwrap_or_default(),
+        shell: shell.filter(|s| !s.is_empty()),
+    }
+}
+
+#[cfg(not(unix))]
+fn passwd_user() -> PasswdUser {
+    PasswdUser { uid: -1, gid: -1, name: String::new(), dir: passwd_home_dir().unwrap_or_default(), shell: None }
+}
+
+#[cfg(unix)]
+fn loadavg() -> [f64; 3] {
+    let mut out = [0f64; 3];
+    let n = unsafe { libc::getloadavg(out.as_mut_ptr(), 3) };
+    if n < 3 {
+        return [0.0; 3];
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn loadavg() -> [f64; 3] {
+    [0.0; 3]
+}
+
+#[cfg(target_os = "macos")]
+fn uptime_and_freemem() -> (f64, f64) {
+    fn sysctl<T: Default>(name: &str) -> Option<T> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let mut value = T::default();
+        let mut len = std::mem::size_of::<T>();
+        let rc = unsafe {
+            libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        (rc == 0).then_some(value)
+    }
+    let uptime = sysctl::<libc::timeval>("kern.boottime")
+        .map(|boot| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            (now - boot.tv_sec as f64 - boot.tv_usec as f64 / 1e6).max(0.0)
+        })
+        .unwrap_or(0.0);
+    let free_pages = sysctl::<u32>("vm.page_free_count").unwrap_or(0) as f64;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as f64;
+    (uptime, free_pages * page)
+}
+
+#[cfg(target_os = "linux")]
+fn uptime_and_freemem() -> (f64, f64) {
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|t| t.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()))
+        .unwrap_or(0.0);
+    let free = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|t| {
+            t.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| {
+                l.split_whitespace().nth(1).and_then(|n| n.parse::<f64>().ok())
+            })
+        })
+        .map(|kb| kb * 1024.0)
+        .unwrap_or(0.0);
+    (uptime, free)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn uptime_and_freemem() -> (f64, f64) {
+    (0.0, 0.0)
+}
 
 #[cfg(unix)]
 fn passwd_home_dir() -> Option<String> {

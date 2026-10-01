@@ -850,3 +850,8 @@ Object.defineProperty(EventEmitter, "EventEmitterAsyncResource", {
 
 __builtins.set("events", EventEmitter);
 __internals.set("events_symbols", { kFirstEventParam });
+// process's prototype inherits from EventEmitter.prototype, which exists from here on.
+{
+  const processPrototype = __internals.get("process_prototype");
+  if (processPrototype !== undefined) Object.setPrototypeOf(processPrototype, EventEmitter.prototype);
+}

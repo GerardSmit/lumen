@@ -101,7 +101,7 @@ pub fn op_getaddrinfo(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 
 #[cfg(unix)]
 fn gai_lookup(hostname: &str, family: u8, flags: i32) -> Result<Vec<(String, u8)>, &'static str> {
-    use std::ffi::{CStr, CString};
+    use std::ffi::CString;
     let host = CString::new(hostname).map_err(|_| "EAI_NONAME")?;
     // SAFETY: an all-zero addrinfo is the documented "no hints" starting point.
     let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };

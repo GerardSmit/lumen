@@ -196,10 +196,24 @@ pub(super) fn install_atomics(it: &mut Interp) {
             ));
         }
         let byte_index = info.offset + idx * info.kind.elsize();
+        let timeout_ms = if q.is_nan() { f64::INFINITY } else { q.max(0.0) };
+        let report = |i: &Interp, phase| {
+            if let Some(hook) = &i.atomics_wait_hook {
+                hook(&crate::interpreter::AtomicsWaitEvent {
+                    phase,
+                    buffer: id,
+                    byte_index,
+                    value: expected,
+                    timeout_ms,
+                });
+            }
+        };
+        report(i, crate::interpreter::AtomicsWaitPhase::Started);
         let waiter = crate::interpreter::futex_register_if(id, byte_index, || {
             wrap_bits(info.kind, read_i128(i, &info, idx)) == wrap_bits(info.kind, expected)
         });
         let Some(waiter) = waiter else {
+            report(i, crate::interpreter::AtomicsWaitPhase::NotEqual);
             return Ok(Value::str("not-equal"));
         };
         let interrupt = i.interrupt.clone();
@@ -208,6 +222,14 @@ pub(super) fn install_atomics(it: &mut Interp) {
         if !woken {
             ab(i.poll_interrupt())?;
         }
+        report(
+            i,
+            if woken {
+                crate::interpreter::AtomicsWaitPhase::Woken
+            } else {
+                crate::interpreter::AtomicsWaitPhase::TimedOut
+            },
+        );
         Ok(Value::str(if woken { "ok" } else { "timed-out" }))
     });
     it.def_method(&atomics, "notify", 3, |i, _t, a| {

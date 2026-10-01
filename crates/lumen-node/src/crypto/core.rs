@@ -33,6 +33,8 @@ fn digest_async(name: String, data: Vec<u8>) -> Result<JsArrayBuffer, SendError>
 pub struct CryptoHash {
     h: Option<Hasher>,
     xof_len: usize,
+    // Node's handle keeps its digest: a second `digest()` returns it again.
+    done: Option<Vec<u8>>,
 }
 
 #[lumen::methods]
@@ -43,13 +45,19 @@ impl CryptoHash {
     }
 
     fn digest(&mut self) -> Result<Vec<u8>, OpError> {
+        if let Some(done) = &self.done {
+            return Ok(done.clone());
+        }
         let len = self.xof_len;
-        Ok(self.h.take().ok_or_else(finalized)?.finish_len(len))
+        let out = self.h.take().ok_or_else(finalized)?.finish_len(len);
+        self.done = Some(out.clone());
+        Ok(out)
     }
 
     fn copy(&self, xof_len: Option<u32>) -> Result<CryptoHash, OpError> {
         let h = self.h.clone().ok_or_else(finalized)?;
-        Ok(CryptoHash { xof_len: xof_len.map_or(self.xof_len, |l| l as usize), h: Some(h) })
+        let xof_len = xof_len.map_or(h.algo().out_len(), |l| l as usize);
+        Ok(CryptoHash { xof_len, h: Some(h), done: None })
     }
 }
 
@@ -69,7 +77,7 @@ fn hash_new(name: &str, xof_len: Option<u32>) -> Result<CryptoHash, OpError> {
         Some(l) => l as usize,
         None => a.out_len(),
     };
-    Ok(CryptoHash { h: Some(Hasher::new(a)), xof_len: len })
+    Ok(CryptoHash { h: Some(Hasher::new(a)), xof_len: len, done: None })
 }
 
 #[lumen::class(name = "CryptoHmac")]

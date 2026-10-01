@@ -4,9 +4,11 @@
 // and error messages need.
 
 function inherits(ctor, superCtor) {
-  if (ctor === undefined || ctor === null) throw new TypeError('The "ctor" argument must be a function');
-  if (superCtor === undefined || superCtor === null) throw new TypeError('The "superCtor" argument must be a function');
-  if (superCtor.prototype === undefined) throw new TypeError('The "superCtor.prototype" property must not be undefined');
+  if (ctor === undefined || ctor === null) throw new __errors.ERR_INVALID_ARG_TYPE("ctor", "Function", ctor);
+  if (superCtor === undefined || superCtor === null) throw new __errors.ERR_INVALID_ARG_TYPE("superCtor", "Function", superCtor);
+  if (superCtor.prototype === undefined) {
+    throw new __errors.ERR_INVALID_ARG_TYPE("superCtor.prototype", "Object", superCtor.prototype);
+  }
   Object.defineProperty(ctor, "super_", { value: superCtor, writable: true, configurable: true });
   Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
 }
@@ -687,12 +689,12 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
     } else if (typeof value === "function") {
       base = getFunctionBase(value, constructor, tag);
       if (keys.length === 0 && protoProps === undefined) return ctx.stylize(base, "special");
-    } else if (valueTag === "RegExp") {
+    } else if (types.isRegExp(value)) {
       base = RegExp.prototype.toString.call(constructor !== null ? value : new RegExp(value));
       const prefix = getPrefix(constructor, tag, "RegExp");
       if (prefix !== "RegExp ") base = `${prefix}${base}`;
       if (keys.length === 0 && protoProps === undefined || (recurseTimes > ctx.depth && ctx.depth !== null)) return ctx.stylize(base, "regexp");
-    } else if (valueTag === "Date") {
+    } else if (types.isDate(value)) {
       const time = Date.prototype.getTime.call(value);
       base = Number.isNaN(time) ? Date.prototype.toString.call(value) : Date.prototype.toISOString.call(value);
       const prefix = getPrefix(constructor, tag, "Date");
@@ -701,8 +703,8 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
     } else if (isErrorValue(value)) {
       base = formatError(value, constructor, tag, ctx, keys);
       if (keys.length === 0 && protoProps === undefined) return base;
-    } else if (valueTag === "ArrayBuffer" || valueTag === "SharedArrayBuffer") {
-      const prefix = getPrefix(constructor, tag, valueTag);
+    } else if (types.isAnyArrayBuffer(value)) {
+      const prefix = getPrefix(constructor, tag, types.isSharedArrayBuffer(value) ? "SharedArrayBuffer" : "ArrayBuffer");
       if (typedArray === undefined) {
         formatter = formatArrayBuffer;
       } else if (keys.length === 0 && protoProps === undefined) {
@@ -710,16 +712,16 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
       }
       braces[0] = `${prefix}{`;
       keys.unshift("byteLength");
-    } else if (valueTag === "DataView") {
+    } else if (types.isDataView(value)) {
       braces[0] = `${getPrefix(constructor, tag, "DataView")}{`;
       keys.unshift("byteLength", "byteOffset", "buffer");
     } else if (valueTag === "Promise" && __node.promiseState(value) !== undefined) {
       braces[0] = `${getPrefix(constructor, tag, "Promise")}{`;
       formatter = formatPromise;
-    } else if (valueTag === "WeakSet") {
+    } else if (types.isWeakSet(value)) {
       braces[0] = `${getPrefix(constructor, tag, "WeakSet")}{`;
       formatter = formatWeakCollection;
-    } else if (valueTag === "WeakMap") {
+    } else if (types.isWeakMap(value)) {
       braces[0] = `${getPrefix(constructor, tag, "WeakMap")}{`;
       formatter = formatWeakCollection;
     } else if (valueTag === "Module") {
@@ -1233,8 +1235,8 @@ function formatWithOptionsInternal(inspectOptions, args) {
           switch (nextChar) {
             case 115: { // 's'
               const tempArg = args[++a];
-              if (typeof tempArg === "number") tempStr = formatNumber(stylizeNoColor, tempArg, false);
-              else if (typeof tempArg === "bigint") tempStr = formatBigInt(stylizeNoColor, tempArg, false);
+              if (typeof tempArg === "number") tempStr = formatNumber(stylizeNoColor, tempArg, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
+              else if (typeof tempArg === "bigint") tempStr = formatBigInt(stylizeNoColor, tempArg, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               else if (typeof tempArg !== "object" || tempArg === null || !hasBuiltInToString(tempArg)) tempStr = String(tempArg);
               else tempStr = inspect(tempArg, { ...inspectOptions, depth: 0, colors: false, compact: 3 });
               break;
@@ -1244,9 +1246,9 @@ function formatWithOptionsInternal(inspectOptions, args) {
               break;
             case 100: { // 'd'
               const tempNum = args[++a];
-              if (typeof tempNum === "bigint") tempStr = formatBigInt(stylizeNoColor, tempNum, false);
+              if (typeof tempNum === "bigint") tempStr = formatBigInt(stylizeNoColor, tempNum, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               else if (typeof tempNum === "symbol") tempStr = "NaN";
-              else tempStr = formatNumber(stylizeNoColor, Number(tempNum), false);
+              else tempStr = formatNumber(stylizeNoColor, Number(tempNum), (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               break;
             }
             case 79: // 'O'
@@ -1257,15 +1259,15 @@ function formatWithOptionsInternal(inspectOptions, args) {
               break;
             case 105: { // 'i'
               const tempInteger = args[++a];
-              if (typeof tempInteger === "bigint") tempStr = formatBigInt(stylizeNoColor, tempInteger, false);
+              if (typeof tempInteger === "bigint") tempStr = formatBigInt(stylizeNoColor, tempInteger, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               else if (typeof tempInteger === "symbol") tempStr = "NaN";
-              else tempStr = formatNumber(stylizeNoColor, Number.parseInt(tempInteger), false);
+              else tempStr = formatNumber(stylizeNoColor, Number.parseInt(tempInteger), (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               break;
             }
             case 102: { // 'f'
               const tempFloat = args[++a];
               if (typeof tempFloat === "symbol") tempStr = "NaN";
-              else tempStr = formatNumber(stylizeNoColor, Number.parseFloat(tempFloat), false);
+              else tempStr = formatNumber(stylizeNoColor, Number.parseFloat(tempFloat), (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               break;
             }
             case 99: // 'c'
@@ -1378,15 +1380,27 @@ function promisify(original) {
 }
 promisify.custom = kCustomPromisify;
 
+function callbackifyOnRejected(reason, cb) {
+  if (!reason) reason = new __errors.ERR_FALSY_VALUE_REJECTION(reason);
+  return cb(reason);
+}
+
 function callbackify(original) {
-  if (typeof original !== "function") throw new TypeError('The "original" argument must be of type function');
-  return function (...args) {
-    const cb = args.pop();
-    original.apply(this, args).then(
-      (value) => queueMicrotask(() => cb(null, value)),
-      (err) => queueMicrotask(() => cb(err || new Error("Promise was rejected with a falsy value"))),
+  if (typeof original !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("original", "Function", original);
+  function callbackified(...args) {
+    const maybeCb = args.pop();
+    if (typeof maybeCb !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("last argument", "Function", maybeCb);
+    const cb = maybeCb.bind(this);
+    Reflect.apply(original, this, args).then(
+      (ret) => process.nextTick(cb, null, ret),
+      (rej) => process.nextTick(callbackifyOnRejected, rej, cb),
     );
-  };
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(original);
+  if (typeof descriptors.length.value === "number") descriptors.length.value++;
+  if (typeof descriptors.name.value === "string") descriptors.name.value += "Callbackified";
+  Object.defineProperties(callbackified, descriptors);
+  return callbackified;
 }
 
 // ---- util/types: see util_types.js ------------------------------------------------------------
@@ -1416,10 +1430,8 @@ function codedError(Ctor, code, message) {
 const sysErrorMap = () => __uvErrmap();
 
 function validateErrno(err) {
-  if (typeof err !== "number") throw new TypeError('The "err" argument must be of type number.');
-  if (err >= 0 || !Number.isInteger(err)) {
-    throw new RangeError(`The value of "err" is out of range. It must be a negative integer. Received ${err}`);
-  }
+  if (typeof err !== "number") throw new __errors.ERR_INVALID_ARG_TYPE("err", "number", err);
+  if (err >= 0 || !Number.isSafeInteger(err)) throw new __errors.ERR_OUT_OF_RANGE("err", "a negative integer", err);
 }
 function getSystemErrorName(err) {
   validateErrno(err);
@@ -1973,6 +1985,11 @@ function diff(actual, expected) {
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~A-Za-z0-9]+$/;
 const NEEDS_QUOTE = /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/;
 
+function mimeInvalid(production, str, re) {
+  const m = re.exec(str);
+  return new __errors.ERR_INVALID_MIME_SYNTAX(production, str, m ? m.index : -1);
+}
+
 function serializeParamValue(value) {
   if (value.length === 0 || NEEDS_QUOTE.test(value)) {
     return `"${value.replace(/["\\]/g, "\\$&")}"`;
@@ -1994,8 +2011,9 @@ class MIMEParams {
     name = `${name}`;
     value = `${value}`;
     if (!HTTP_TOKEN.test(name)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME parameter name "${name}" is invalid`);
+      throw mimeInvalid("parameter name", name, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     }
+    if (/[^\t\u0020-\u007e\u0080-\u00ff]/.test(value)) throw mimeInvalid("parameter value", value, /[^\t\u0020-\u007e\u0080-\u00ff]/);
     this.#data.set(name, value);
   }
   delete(name) {
@@ -2022,6 +2040,12 @@ class MIMEParams {
     for (const [name, value] of this.#data) out += `;${name}=${serializeParamValue(value)}`;
     return out;
   }
+  toString() {
+    return this._serialize().slice(1);
+  }
+  toJSON() {
+    return this.toString();
+  }
 }
 
 class MIMEType {
@@ -2030,10 +2054,10 @@ class MIMEType {
   #params = new MIMEParams();
 
   constructor(input) {
-    input = `${input}`.trim();
+    input = `${input}`.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
     const slash = input.indexOf("/");
     if (slash === -1) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME syntax for "${input}" is invalid: missing "/"`);
+      throw new __errors.ERR_INVALID_MIME_SYNTAX("type", input, -1);
     }
     const type = input.slice(0, slash).toLowerCase();
     let rest = input.slice(slash + 1);
@@ -2045,47 +2069,59 @@ class MIMEType {
     } else {
       rest = "";
     }
-    subtype = subtype.trim().toLowerCase();
-    if (!HTTP_TOKEN.test(type) || !HTTP_TOKEN.test(subtype)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME syntax for "${input}" is invalid`);
-    }
+    subtype = subtype.replace(/[ \t\r\n]+$/, "").toLowerCase();
+    if (!HTTP_TOKEN.test(type)) throw mimeInvalid("type", type, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
+    if (!HTTP_TOKEN.test(subtype)) throw mimeInvalid("subtype", subtype, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     this.#type = type;
     this.#subtype = subtype;
     this.#parseParams(rest);
   }
 
   #parseParams(str) {
-    let i = 0;
     const n = str.length;
+    const ws = (c) => c === " " || c === "\t" || c === "\r" || c === "\n";
+    let i = 0;
     while (i < n) {
-      while (i < n && (str[i] === ";" || str[i] === " " || str[i] === "\t")) i++;
-      if (i >= n) break;
+      while (i < n && ws(str[i])) i++;
       let name = "";
       while (i < n && str[i] !== "=" && str[i] !== ";") name += str[i++];
-      name = name.trim().toLowerCase();
-      if (str[i] !== "=") {
-        while (i < n && str[i] !== ";") i++;
+      name = name.toLowerCase();
+      if (i >= n) break;
+      if (str[i] === ";") {
+        i++;
         continue;
       }
-      i++; // skip '='
+      i++;
+      if (i >= n) break;
       let value = "";
+      let quoted = false;
       if (str[i] === '"') {
+        quoted = true;
         i++;
-        while (i < n && str[i] !== '"') {
-          if (str[i] === "\\" && i + 1 < n) {
-            value += str[i + 1];
-            i += 2;
-            continue;
-          }
-          value += str[i++];
+        while (i < n) {
+          const c = str[i++];
+          if (c === '"') break;
+          if (c === "\\") {
+            if (i >= n) {
+              value += c;
+              break;
+            }
+            value += str[i++];
+          } else value += c;
         }
-        i++; // closing quote
         while (i < n && str[i] !== ";") i++;
       } else {
         while (i < n && str[i] !== ";") value += str[i++];
-        value = value.trim();
+        value = value.replace(/[ \t\r\n]+$/, "");
+        if (value === "") {
+          i++;
+          continue;
+        }
       }
-      if (name && HTTP_TOKEN.test(name) && !this.#params.has(name)) this.#params._setRaw(name, value);
+      i++;
+      if (name && HTTP_TOKEN.test(name) && /^[\t\u0020-\u007e\u0080-\u00ff]*$/.test(value) && !this.#params.has(name)) {
+        this.#params._setRaw(name, value);
+      }
     }
   }
 
@@ -2095,7 +2131,7 @@ class MIMEType {
   set type(value) {
     value = `${value}`.toLowerCase();
     if (!HTTP_TOKEN.test(value)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME type "${value}" is invalid`);
+      throw mimeInvalid("type", value, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     }
     this.#type = value;
   }
@@ -2105,7 +2141,7 @@ class MIMEType {
   set subtype(value) {
     value = `${value}`.toLowerCase();
     if (!HTTP_TOKEN.test(value)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME subtype "${value}" is invalid`);
+      throw mimeInvalid("subtype", value, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     }
     this.#subtype = value;
   }

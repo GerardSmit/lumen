@@ -1,34 +1,29 @@
-// node:async_hooks — async ids, the hook API and AsyncLocalStorage/AsyncResource over the engine's
-// async context (see preamble.js). A context is an immutable Map: AsyncLocalStorage instances key
-// their stores in it, and one extra entry (`kFrame`) records the async resource that is executing
-// (id, trigger id, resource). The engine carries the context along promise reactions; timers,
-// nextTick and immediates bind it at scheduling time through `__bindAsyncContext`, which — only
-// while hooks are enabled — also emits init/before/after/destroy for those resources.
+// node:async_hooks — async ids, the hook API, v8.promiseHooks and AsyncLocalStorage/AsyncResource.
+// Ids and the execution stack live in preamble.js (`__asyncTracking` turns them on when this file
+// loads). Promises take part through the engine's promise hooks, installed only while a hook is
+// enabled (or a v8.promiseHooks callback is registered). AsyncLocalStorage keys its stores in the
+// engine's async context (an immutable Map the engine carries along promise reactions).
 
 const {
-  ERR_ASYNC_CALLBACK, ERR_ASYNC_TYPE, ERR_INVALID_ASYNC_ID,
+  ERR_ASYNC_CALLBACK, ERR_ASYNC_TYPE, ERR_INVALID_ASYNC_ID, ERR_INVALID_ARG_TYPE,
 } = __errors;
 const { validateString, validateFunction } = __validators;
 
-const kFrame = Symbol("asyncFrame");
-// Id 1 is the main script's execution; resources get ids from 2.
-let idCounter = 1;
-const newAsyncId = () => ++idCounter;
+__asyncTracking = true;
 const topLevelResource = {};
 
-function currentFrame() {
-  const context = __asyncContextGet();
-  return context === undefined ? undefined : context.get(kFrame);
-}
 function executionAsyncId() {
-  return currentFrame()?.id ?? 1;
+  return __executionAsyncId();
 }
 function triggerAsyncId() {
-  return currentFrame()?.trigger ?? 0;
+  const n = __asyncTriggers.length;
+  return n === 0 ? 0 : __asyncTriggers[n - 1];
 }
 function executionAsyncResource() {
-  return currentFrame()?.resource ?? topLevelResource;
+  const n = __asyncResources.length;
+  return n === 0 ? topLevelResource : __asyncResources[n - 1];
 }
+const newAsyncId = () => ++__asyncIdCounter;
 
 // Node's async_wrap provider table (v22). The ids are static names, not live counters.
 const asyncWrapProviders = Object.freeze({
@@ -48,12 +43,177 @@ const asyncWrapProviders = Object.freeze({
   TLSWRAP: 62, VERIFYREQUEST: 63,
 });
 
+// ---- v8.promiseHooks ---------------------------------------------------------------------------
+// Each hook kind keeps a list; the engine gets one dispatcher per non-empty list. A throwing hook
+// does not stop the others: its error is raised as an uncaught exception from a tick.
+const promiseHookLists = { init: [], before: [], after: [], settled: [] };
+
+function promiseHookDispatcher(list) {
+  if (list.length === 0) return undefined;
+  return function promiseHook(promise, parent) {
+    for (const hook of list.slice()) {
+      try {
+        hook(promise, parent);
+      } catch (error) {
+        process.nextTick(() => {
+          throw error;
+        });
+      }
+    }
+  };
+}
+function updatePromiseHooks() {
+  __node.setPromiseHooks(
+    promiseHookDispatcher(promiseHookLists.init),
+    promiseHookDispatcher(promiseHookLists.before),
+    promiseHookDispatcher(promiseHookLists.after),
+    promiseHookDispatcher(promiseHookLists.settled),
+  );
+}
+const isPlainFunction = (value) => {
+  if (typeof value !== "function") return false;
+  const tag = Object.prototype.toString.call(value);
+  return tag !== "[object AsyncFunction]" && tag !== "[object AsyncGeneratorFunction]";
+};
+function usePromiseHook(name, hook) {
+  if (!isPlainFunction(hook)) throw new ERR_INVALID_ARG_TYPE(`${name}Hook`, "function", hook);
+  const list = promiseHookLists[name];
+  list.push(hook);
+  updatePromiseHooks();
+  return function stop() {
+    const index = list.indexOf(hook);
+    if (index >= 0) {
+      list.splice(index, 1);
+      updatePromiseHooks();
+    }
+  };
+}
+const promiseHooks = {
+  onInit: (hook) => usePromiseHook("init", hook),
+  onBefore: (hook) => usePromiseHook("before", hook),
+  onAfter: (hook) => usePromiseHook("after", hook),
+  onSettled: (hook) => usePromiseHook("settled", hook),
+  createHook({ init, before, after, settled } = {}) {
+    const stops = [];
+    if (init) stops.push(usePromiseHook("init", init));
+    if (before) stops.push(usePromiseHook("before", before));
+    if (after) stops.push(usePromiseHook("after", after));
+    if (settled) stops.push(usePromiseHook("settled", settled));
+    return () => {
+      for (const stop of stops) stop();
+    };
+  },
+};
+__internals.set("promiseHooks", promiseHooks);
+
 // ---- hooks ---------------------------------------------------------------------------------
 let active = [];
-const resourceIds = new WeakMap();
+const has = (name) => active.some((hook) => hook[name] !== undefined);
 
+// An exception in a hook callback is fatal (Node's async_hooks fatalError).
+function fatalError(error) {
+  let stack;
+  if (typeof error?.stack === "string") {
+    stack = error.stack;
+  } else {
+    const o = { message: error };
+    Error.captureStackTrace(o, fatalError);
+    stack = typeof o.stack === "string" && !o.stack.startsWith("Error: [object")
+      ? o.stack
+      : `Error: ${String(error)}`;
+  }
+  process._rawDebug(stack);
+  if (process.execArgv.includes("--abort-on-uncaught-exception")) process.abort();
+  process.exit(1);
+}
+function emit(name, ...args) {
+  for (const hook of active) {
+    const fn = hook[name];
+    if (fn === undefined) continue;
+    try {
+      Reflect.apply(fn, hook, args);
+    } catch (error) {
+      fatalError(error);
+    }
+  }
+}
+const emitInit = (id, type, trigger, resource) => emit("init", id, type, trigger, resource);
+const emitBefore = (id) => emit("before", id);
+const emitAfter = (id) => emit("after", id);
+function emitDestroy(id) {
+  if (!has("destroy")) return;
+  __internals.get("rawQueueMicrotask")(() => emit("destroy", id));
+}
+
+// What preamble.js calls while any hook is enabled (`__asyncHooks`).
+const hookRuntime = {
+  init: emitInit,
+  before: emitBefore,
+  after: emitAfter,
+  destroy: emitDestroy,
+};
+
+// Promises: ids are assigned on first sight (init, or a hook seeing a promise made earlier).
+const promiseIds = new WeakMap();
+function trackPromise(promise, parent) {
+  let info = promiseIds.get(promise);
+  if (info === undefined) {
+    const trigger = parent === undefined ? __executionAsyncId() : trackPromise(parent, undefined).id;
+    info = { id: newAsyncId(), trigger };
+    promiseIds.set(promise, info);
+  }
+  return info;
+}
+const promiseDestroyRegistry = new FinalizationRegistry((id) => emitDestroy(id));
+function promiseInitHook(promise, parent) {
+  const info = trackPromise(promise, parent);
+  if (has("init")) emitInit(info.id, "PROMISE", info.trigger, promise);
+  if (has("destroy")) promiseDestroyRegistry.register(promise, info.id);
+}
+function promiseBeforeHook(promise) {
+  const info = trackPromise(promise, undefined);
+  __asyncIds.push(info.id);
+  __asyncTriggers.push(info.trigger);
+  __asyncResources.push(promise);
+  emitBefore(info.id);
+}
+function promiseAfterHook(promise) {
+  const info = trackPromise(promise, undefined);
+  emitAfter(info.id);
+  // Not on the stack when the hooks were enabled during the reaction.
+  const at = __asyncIds.length - 1;
+  if (at >= 0 && __asyncResources[at] === promise) {
+    __asyncIds.length = at;
+    __asyncTriggers.length = at;
+    __asyncResources.length = at;
+  }
+}
+function promiseResolveHook(promise) {
+  const info = trackPromise(promise, undefined);
+  emit("promiseResolve", info.id);
+}
+
+let stopAsyncPromiseHooks = null;
+function stopPromiseHooksIfUnused() {
+  if (active.length === 0 && stopAsyncPromiseHooks !== null) {
+    stopAsyncPromiseHooks();
+    stopAsyncPromiseHooks = null;
+  }
+}
 function syncHooks() {
   __setAsyncHooks(active.length === 0 ? null : hookRuntime);
+  if (active.length === 0) {
+    // Later: a promise reaction running now still gets its `after`, which pops its frame.
+    __internals.get("rawQueueMicrotask")(stopPromiseHooksIfUnused);
+    return;
+  }
+  if (stopAsyncPromiseHooks !== null) stopAsyncPromiseHooks();
+  stopAsyncPromiseHooks = promiseHooks.createHook({
+    init: has("init") || has("destroy") ? promiseInitHook : undefined,
+    before: promiseBeforeHook,
+    after: promiseAfterHook,
+    settled: has("promiseResolve") ? promiseResolveHook : undefined,
+  });
 }
 
 class AsyncHook {
@@ -96,80 +256,7 @@ function createHook(fns) {
   return new AsyncHook(fns);
 }
 
-function emitInit(id, type, trigger, resource) {
-  for (const hook of active) {
-    if (hook.init !== undefined) hook.init(id, type, trigger, resource);
-  }
-}
-function emitBefore(id) {
-  for (const hook of active) {
-    if (hook.before !== undefined) hook.before(id);
-  }
-}
-function emitAfter(id) {
-  for (const hook of active) {
-    if (hook.after !== undefined) hook.after(id);
-  }
-}
-function destroyHooksExist() {
-  return active.some((hook) => hook.destroy !== undefined);
-}
-function emitDestroy(id) {
-  if (!destroyHooksExist()) return;
-  queueMicrotask(() => {
-    for (const hook of active) {
-      if (hook.destroy !== undefined) hook.destroy(id);
-    }
-  });
-}
-
-function runScope(context, frame, id, fn, thisArg, args) {
-  const next = new Map(context);
-  next.set(kFrame, frame);
-  const previous = __asyncContextSet(next);
-  emitBefore(id);
-  try {
-    return Reflect.apply(fn, thisArg, args);
-  } catch (error) {
-    __noteThrown(error);
-    throw error;
-  } finally {
-    emitAfter(id);
-    __asyncContextSet(previous);
-  }
-}
-
-// What preamble.js calls while any hook is enabled (`__asyncHooks`).
-const hookRuntime = {
-  wrap(fn, type, resource, repeat) {
-    const id = newAsyncId();
-    const trigger = executionAsyncId();
-    if (resource !== undefined) resourceIds.set(resource, id);
-    emitInit(id, type, trigger, resource);
-    const context = __asyncContextGet();
-    const frame = { id, trigger, resource };
-    return function boundWithAsyncHooks(...args) {
-      try {
-        return runScope(context, frame, id, fn, this, args);
-      } finally {
-        if (!repeat) {
-          if (resource !== undefined) resourceIds.delete(resource);
-          emitDestroy(id);
-        }
-      }
-    };
-  },
-  destroyOf(resource) {
-    const id = resourceIds.get(resource);
-    if (id === undefined) return;
-    resourceIds.delete(resource);
-    emitDestroy(id);
-  },
-};
-
 // ---- AsyncResource -------------------------------------------------------------------------
-const kAsyncId = Symbol("asyncId");
-const kTriggerId = Symbol("triggerAsyncId");
 const kDestroyed = Symbol("destroyed");
 const kContext = Symbol("asyncContext");
 
@@ -190,14 +277,14 @@ class AsyncResource {
       throw new ERR_INVALID_ASYNC_ID("triggerAsyncId", triggerId);
     }
     const id = newAsyncId();
-    this[kAsyncId] = id;
-    this[kTriggerId] = triggerId;
+    this[__asyncIdSymbol] = id;
+    this[__triggerIdSymbol] = triggerId;
     this[kContext] = __asyncContextGet();
-    if (active.some((hook) => hook.init !== undefined)) {
+    if (has("init")) {
       if (type.length === 0) throw new ERR_ASYNC_TYPE(type);
       emitInit(id, type, triggerId, this);
     }
-    if (!requireManualDestroy && destroyHooksExist()) {
+    if (!requireManualDestroy && has("destroy")) {
       const destroyed = { destroyed: false };
       this[kDestroyed] = destroyed;
       destroyRegistry.register(this, { id, destroyed });
@@ -205,22 +292,21 @@ class AsyncResource {
   }
 
   runInAsyncScope(fn, thisArg, ...args) {
-    const frame = { id: this[kAsyncId], trigger: this[kTriggerId], resource: this };
-    return runScope(this[kContext], frame, this[kAsyncId], fn, thisArg, args);
+    return __runAsyncCallback(this, this[kContext], fn, thisArg, args);
   }
 
   emitDestroy() {
     if (this[kDestroyed] !== undefined) this[kDestroyed].destroyed = true;
-    emitDestroy(this[kAsyncId]);
+    emitDestroy(this[__asyncIdSymbol]);
     return this;
   }
 
   asyncId() {
-    return this[kAsyncId];
+    return this[__asyncIdSymbol];
   }
 
   triggerAsyncId() {
-    return this[kTriggerId];
+    return this[__triggerIdSymbol];
   }
 
   bind(fn, thisArg) {

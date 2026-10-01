@@ -165,8 +165,8 @@ internalAssert.fail = (message) => {
 };
 
 // Objects that structuredClone / MessagePort transfer rebuild from their `kClone` data.
-const kClone = Symbol("kClone");
-const kDeserialize = Symbol("kDeserialize");
+const kClone = Symbol.for("lumen.transferable.clone");
+const kDeserialize = Symbol.for("lumen.transferable.deserialize");
 class JSTransferable {}
 function makeTransferable(obj) {
   return obj;
@@ -313,6 +313,7 @@ function opensslError(hex, library, reason, code, Base = Error) {
 // Base of every CryptoJob: `run()` is synchronous (returns [err, result]) or schedules `ondone`.
 // Subclasses implement `_run()` (a result or a throw) and may implement `_runAsync()` returning a
 // Promise when the work belongs on the native worker pool.
+let threadpoolTraceId = 0;
 class CryptoJob {
   constructor(mode) {
     this.mode = mode;
@@ -327,20 +328,31 @@ class CryptoJob {
         return [err, undefined];
       }
     }
-    const pending = typeof this._runAsync === "function" ?
+    const traceId = __traceEvent === null ? 0 : ++threadpoolTraceId;
+    if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "b", "crypto", traceId);
+    const native = typeof this._runAsync === "function";
+    if (traceId !== 0 && native) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "B", "crypto");
+    const pending = native ?
       this._runAsync() :
       new Promise((resolve, reject) => {
         setImmediate(() => {
           try {
+            if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "B", "crypto");
             resolve(this._run());
           } catch (err) {
             reject(err);
+          } finally {
+            if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "E", "crypto");
           }
         });
       });
+    const finish = () => {
+      if (traceId !== 0 && native) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "E", "crypto");
+      if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "e", "crypto", traceId);
+    };
     pending.then(
-      (result) => process.nextTick(() => this.ondone(undefined, result)),
-      (err) => process.nextTick(() => this.ondone(err, undefined)),
+      (result) => { finish(); process.nextTick(() => this.ondone(undefined, result)); },
+      (err) => { finish(); process.nextTick(() => this.ondone(err, undefined)); },
     );
   }
 }
@@ -358,6 +370,7 @@ function cryptoError(Base, code, message) {
 // Bytes of a secret key argument: a secret KeyObjectHandle or a BufferSource.
 function secretBytes(key) {
   if (key instanceof KeyObjectHandle) return key._data;
+  if (key instanceof NativeKeyObject) return key[kNativeKeyHandle]._data;
   return bytesOf(key);
 }
 
@@ -414,7 +427,7 @@ class HashJob extends CryptoJob {
     super(mode);
     if (__rc.hashInfo(algorithm) === null) throw invalidDigest(algorithm);
     this.algorithm = algorithm;
-    this.data = bytesOf(data);
+    this.data = new Uint8Array(bytesOf(data));
     this.length = length;
   }
 
@@ -431,8 +444,8 @@ class HmacJob extends CryptoJob {
     this.signMode = signMode;
     this.hash = hash;
     this.key = secretBytes(key);
-    this.data = bytesOf(data);
-    this.signature = signature === undefined ? undefined : bytesOf(signature);
+    this.data = new Uint8Array(bytesOf(data));
+    this.signature = signature === undefined ? undefined : new Uint8Array(bytesOf(signature));
   }
 
   _run() {
@@ -447,7 +460,7 @@ class PBKDF2Job extends CryptoJob {
     super(mode);
     const info = __rc.hashInfo(digest);
     if (info === null || info[2]) throw invalidDigest(digest);
-    this.args = [digest, bytesOf(password), bytesOf(salt), iterations, keylen];
+    this.args = [digest, new Uint8Array(bytesOf(password)), new Uint8Array(bytesOf(salt)), iterations, keylen];
   }
 
   _run() {
@@ -465,7 +478,7 @@ class ScryptJob extends CryptoJob {
     if (!__rc.scryptCheck(N, r, p, maxmem)) {
       throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS", "Invalid scrypt params: memory limit exceeded");
     }
-    this.args = [bytesOf(password), bytesOf(salt), N, r, p, keylen];
+    this.args = [new Uint8Array(bytesOf(password)), new Uint8Array(bytesOf(salt)), N, r, p, keylen];
   }
 
   _run() {
@@ -485,7 +498,7 @@ class HKDFJob extends CryptoJob {
     if (length > 255 * hi[0]) {
       throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length");
     }
-    this.args = [hash, secretBytes(key), bytesOf(salt), bytesOf(info), length];
+    this.args = [hash, new Uint8Array(secretBytes(key)), new Uint8Array(bytesOf(salt)), new Uint8Array(bytesOf(info)), length];
   }
 
   _run() {
@@ -522,7 +535,15 @@ class RandomBytesJob extends CryptoJob {
   }
 
   _run() {
-    __rc.randomFill(this.target);
+    const target = this.target;
+    if (typeof SharedArrayBuffer === "function" && target.buffer instanceof SharedArrayBuffer) {
+      // The native op takes exclusive (non-shared) memory: fill a private copy, then store it.
+      const bytes = new Uint8Array(target.byteLength);
+      __rc.randomFill(bytes);
+      target.set(bytes);
+    } else {
+      __rc.randomFill(target);
+    }
     return undefined;
   }
 }
@@ -618,6 +639,14 @@ class KeyObjectHandle {
   }
 
   initJwk(jwk, namedCurve) {
+    if (jwk.kty === "oct") {
+      if (typeof jwk.k !== "string") {
+        throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK secret key format");
+      }
+      this._type = cryptoBinding.kKeyTypeSecret;
+      this._data = new Uint8Array(Buffer.from(jwk.k, "base64"));
+      return this._type;
+    }
     const fields = [];
     for (const key of Object.keys(jwk)) {
       if (typeof jwk[key] === "string") fields.push(key, jwk[key]);
@@ -658,6 +687,10 @@ class KeyObjectHandle {
   }
 
   keyDetail(target) {
+    if (this._type === cryptoBinding.kKeyTypeSecret) {
+      target.length = this._data.byteLength * 8;
+      return target;
+    }
     const flat = __rc.keyDetail(this._type, this._data);
     for (let i = 0; i < flat.length; i += 2) {
       const name = flat[i];
@@ -670,7 +703,7 @@ class KeyObjectHandle {
   }
 
   export(format, type, cipher, passphrase) {
-    if (this._type === cryptoBinding.kKeyTypeSecret) return Buffer.from(this._data);
+    if (this._type === cryptoBinding.kKeyTypeSecret) return Buffer.from(this._data.slice().buffer);
     const encoding = type === undefined ? (this._type === cryptoBinding.kKeyTypePrivate ? 1 : 2) : type;
     let out;
     try {
@@ -896,13 +929,34 @@ class RSAKeyExportJob extends CryptoJob {
   }
 }
 
-function createNativeKeyObjectClass(callback) {
-  class NativeKeyObject {
-    constructor(handle) {
-      this.handle = handle;
-    }
+// The base of KeyObject. Like Node's C++ NativeKeyObject it holds the handle out of sight and
+// clones across threads (structured clone rebuilds it with `keyObjectFromClone`).
+const kNativeKeyHandle = Symbol("kNativeKeyHandle");
+let keyObjectClasses;
+class NativeKeyObject {
+  constructor(handle) {
+    Object.defineProperty(this, kNativeKeyHandle, { value: handle });
   }
-  return callback(NativeKeyObject);
+
+  [kClone]() {
+    const handle = this[kNativeKeyHandle];
+    return {
+      data: { kind: handle._type, bytes: handle._data },
+      deserializeInfo: "internal/crypto/keys:keyObjectFromClone",
+    };
+  }
+}
+
+function createNativeKeyObjectClass(callback) {
+  keyObjectClasses = callback(NativeKeyObject);
+  return keyObjectClasses;
+}
+
+function keyObjectFromClone({ kind, bytes }) {
+  const handle = handleOf(kind, bytes);
+  if (kind === cryptoBinding.kKeyTypeSecret) return new keyObjectClasses[1](handle);
+  if (kind === cryptoBinding.kKeyTypePublic) return new keyObjectClasses[2](handle);
+  return new keyObjectClasses[3](handle);
 }
 
 Object.assign(cryptoBinding, {
@@ -1320,8 +1374,9 @@ class DiffieHellman extends DiffieHellmanBase {
     }
     let p;
     if (typeof sizeOrKey === "number") {
-      if (sizeOrKey < 2) {
-        throw opensslError("01800076", "bignum routines", "bits too small", "ERR_OSSL_BN_BITS_TOO_SMALL");
+      // OpenSSL 3 refuses to generate a prime below DH_MIN_MODULUS_BITS.
+      if (sizeOrKey < 512) {
+        throw opensslError("0280007E", "Diffie-Hellman routines", "modulus too small", "ERR_OSSL_DH_MODULUS_TOO_SMALL");
       }
       const small = g.length === 1 ? g[0] : 0;
       p = new Uint8Array(__rc.dhGenPrime(sizeOrKey, small));
@@ -1655,7 +1710,7 @@ function parseX509(buffer) {
 
 function spkacResult(fn, buffer) {
   const out = fn(bytesOf(buffer));
-  return out === null ? Buffer.alloc(0) : asBuffer(out);
+  return out === null ? "" : asBuffer(out);
 }
 
 Object.assign(cryptoBinding, {
@@ -10802,6 +10857,8 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
 // ---- registration ------------------------------------------------------------------------------
 
 __builtins.set("crypto", require("crypto"));
+__internals.set("cloneModule:internal/crypto",
+                (id, name) => (name === "keyObjectFromClone" ? keyObjectFromClone : require(id)[name]));
 
 // The WebCrypto globals, as accessors like Node's own that an assignment replaces.
 function lazyGlobal(name, get) {

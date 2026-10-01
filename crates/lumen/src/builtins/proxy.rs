@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Value> {
+pub(crate) fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Value> {
     if !matches!(target, Value::Obj(_)) || !matches!(handler, Value::Obj(_)) {
         return Err(i.make_error(
             "TypeError",

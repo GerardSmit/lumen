@@ -374,7 +374,13 @@ impl<'s> ArgCx<'s> {
         let i = self.interp();
         if let Some(&id) = i.shared_buffers.get(&key) {
             if mutable {
-                return Err(self.type_error(at, "must not be a SharedArrayBuffer view (&mut [u8])"));
+                let mem = crate::interpreter::shared_mem_get(id)
+                    .ok_or_else(|| self.type_error(at, "SharedArrayBuffer memory is gone"))?;
+                let mut m = mem.lock().unwrap();
+                let Some(window) = m.get_mut(off..off + len) else {
+                    return Err(self.type_error(at, "view is out of range of its SharedArrayBuffer"));
+                };
+                return Ok((window.as_mut_ptr(), window.len()));
             }
             let copy: Box<[u8]> = crate::interpreter::shared_mem_get(id)
                 .map(|m| {
@@ -741,7 +747,7 @@ fn resolve_view(i: &Interp, v: &Value) -> Result<(usize, usize, usize), ViewErr>
     if let Some(b) = i.array_buffers.get(&p) {
         return Ok((p, 0, b.len()));
     }
-    if o.borrow().props.contains("__abMaxByteLength") {
+    if o.borrow().props.contains("\u{0}ab_max_byte_length") {
         return Err(ViewErr::Detached);
     }
     Err(ViewErr::NotView)

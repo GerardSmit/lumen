@@ -66,6 +66,10 @@
   // Seconds (fractional) since process start, from the same monotonic clock hrtime uses.
   process.uptime = () => { const t = raw(); return t[0] + t[1] / 1e9; };
 
+  const tagDesc = (value) => ({ __proto__: null, value, writable: false, enumerable: false, configurable: true });
+  Object.defineProperty(process, Symbol.toStringTag, tagDesc("process"));
+  Object.defineProperty(globalThis, Symbol.toStringTag, tagDesc("global"));
+
   process.version = "v20.11.0";
   // The component versions Node 20.11.0 reports. Packages and Node's own test/common probe
   // these (`hasCrypto` is `Boolean(process.versions.openssl)`); lumen implements the matching
@@ -81,6 +85,12 @@
 
   // Real OS-identity / control surface over the native ops. These need the (about-to-be-deleted)
   // `__proc` namespace, so they are wired here rather than in the lumen-node JS glue.
+  let title;
+  Object.defineProperty(process, "title", {
+    get() { return title ?? proc.startupTitle() ?? process.argv0; },
+    set(value) { title = `${value}`; proc.setTitle(title); },
+    enumerable: true, configurable: true,
+  });
   process.chdir = proc.chdir;
   process.abort = proc.abort;
   process.umask = proc.umask;

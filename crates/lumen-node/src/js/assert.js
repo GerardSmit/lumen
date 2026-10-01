@@ -6,9 +6,8 @@
 // error-matching rules for throws/rejects (constructor, RegExp, validation function or an object
 // of properties whose RegExp values match string properties), the same argument validation, and
 // the same generated messages (`Expected values to be strictly equal:` with the +/- line diff),
-// since both test suites and tooling compare those. `assert.ok` cannot quote the failing source
-// expression (lumen's stack frames carry no source positions), so it reports Node's fallback
-// message instead.
+// since both test suites and tooling compare those. `assert.ok` quotes the failing call by
+// re-reading the caller's source from the stack frame's position.
 
 const util = __builtins.get("util");
 const { inspect } = util;
@@ -17,8 +16,8 @@ const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_AMBIGUOUS_ARGUMENT, ERR
 const objectToString = (v) => Object.prototype.toString.call(v);
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const isEnumerable = (o, k) => Object.prototype.propertyIsEnumerable.call(o, k);
-const isRegExp = (v) => objectToString(v) === "[object RegExp]";
-const isDate = (v) => objectToString(v) === "[object Date]";
+const isRegExp = (v) => util.types.isRegExp(v);
+const isDate = (v) => util.types.isDate(v);
 const isSet = (v) => {
   try { Reflect.apply(Object.getOwnPropertyDescriptor(Set.prototype, "size").get, v, []); return true; } catch { return false; }
 };
@@ -386,7 +385,7 @@ const kReadableOperator = {
   notStrictEqual: 'Expected "actual" to be strictly unequal to:',
   notStrictEqualObject: 'Expected "actual" not to be reference-equal to "expected":',
   notDeepEqual: 'Expected "actual" not to be loosely deep-equal to:',
-  notIdentical: "Values identical but not reference-equal:",
+  notIdentical: "Values have same structure but are not reference-equal:",
   notDeepEqualUnequal: "Expected values not to be loosely deep-equal:",
 };
 
@@ -395,7 +394,7 @@ const kMaxShortLength = 12;
 
 function copyError(source) {
   const target = Object.assign({ __proto__: Object.getPrototypeOf(source) }, source);
-  Object.defineProperty(target, "message", { value: source.message });
+  Object.defineProperty(target, "message", { __proto__: null, value: source.message });
   return target;
 }
 
@@ -599,7 +598,8 @@ class AssertionError extends Error {
     if (options === null || typeof options !== "object") {
       throw new ERR_INVALID_ARG_TYPE("options", "Object", options);
     }
-    const { message, operator, stackStartFn, details } = options;
+    const { message, operator, stackStartFn: startFn, stackStartFunction, details } = options;
+    const stackStartFn = startFn || stackStartFunction;
     let { actual, expected } = options;
 
     if (message != null) {
@@ -660,6 +660,7 @@ class AssertionError extends Error {
 
     this.generatedMessage = !message;
     Object.defineProperty(this, "name", {
+      __proto__: null,
       value: "AssertionError [ERR_ASSERTION]",
       enumerable: false,
       writable: true,
@@ -702,7 +703,15 @@ class AssertionError extends Error {
     // Long strings should not be fully inspected.
     const tmpActual = this.actual;
     const tmpExpected = this.expected;
-    const truncate = (s) => (typeof s === "string" && s.length > 512 ? `${s.slice(0, 512)}...` : s);
+    // Node keeps the tail past 512 characters (not the head) when it shortens a long string.
+    const truncate = (s) => {
+      const lines = s.split("\n", 11);
+      if (lines.length > 10) {
+        lines.length = 10;
+        return `${lines.join("\n")}\n...`;
+      }
+      return s.length > 512 ? `${s.slice(512)}...` : s;
+    };
     if (typeof this.actual === "string") this.actual = truncate(this.actual);
     if (typeof this.expected === "string") this.expected = truncate(this.expected);
     // This limits the `actual` and `expected` property default inspection to the minimum depth.
@@ -758,6 +767,175 @@ function fail(actual, expected, message, operator, stackStartFn) {
   throw err;
 }
 
+// ---- source quoting for `assert.ok(falsy)` ----------------------------------------------------
+
+const kIdChar = /[\p{ID_Continue}$#\u200c\u200d]/u;
+const kRegexPrefix = "(,=:[!&|?{};+-*%<>~^";
+
+function scanString(src, i) {
+  const q = src[i];
+  i++;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "\\") i += 2;
+    else if (c === q) return i + 1;
+    else if (q !== "`") { if (c === "\n") return i; i++; }
+    else if (c === "$" && src[i + 1] === "{") {
+      i = matchBracket(src, i + 1);
+      if (i < 0) return -1;
+    } else i++;
+  }
+  return -1;
+}
+
+// Index just past the bracket group opening at `i` (`(`, `[` or `{`), or -1.
+function matchBracket(src, i) {
+  const stack = [];
+  let prev = "";
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "(" || c === "[" || c === "{") {
+      stack.push(c === "(" ? ")" : c === "[" ? "]" : "}");
+      prev = c;
+      i++;
+    } else if (c === ")" || c === "]" || c === "}") {
+      if (stack.pop() !== c) return -1;
+      i++;
+      if (stack.length === 0) return i;
+      prev = c;
+    } else if (c === "'" || c === '"' || c === "`") {
+      i = scanString(src, i);
+      if (i < 0) return -1;
+      prev = c;
+    } else if (c === "/" && src[i + 1] === "/") {
+      const nl = src.indexOf("\n", i);
+      if (nl < 0) return -1;
+      i = nl;
+    } else if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      if (end < 0) return -1;
+      i = end + 2;
+    } else if (c === "/" && (prev === "" || kRegexPrefix.includes(prev))) {
+      i++;
+      let inClass = false;
+      while (i < src.length) {
+        const d = src[i];
+        if (d === "\\") i += 2;
+        else if (d === "\n") return -1;
+        else if (d === "[") { inClass = true; i++; }
+        else if (d === "]") { inClass = false; i++; }
+        else if (d === "/" && !inClass) { i++; break; }
+        else i++;
+      }
+      prev = "a";
+    } else {
+      if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") prev = c;
+      i++;
+    }
+  }
+  return -1;
+}
+
+// Where the call's callee expression starts, no earlier than the call's own line (Node re-parses
+// from the start of that line). `end` is the index just past the callee.
+function calleeStart(src, end, lineStart) {
+  let best = end;
+  let i = end;
+  for (;;) {
+    let j = i - 1;
+    while (j >= 0 && /\s/.test(src[j])) j--;
+    let start;
+    if (src[j] === ")" || src[j] === "]") {
+      const close = src[j];
+      const open = close === ")" ? "(" : "[";
+      let depth = 0;
+      for (; j >= 0; j--) {
+        if (src[j] === close) depth++;
+        else if (src[j] === open && --depth === 0) break;
+      }
+      if (j < 0) break;
+      start = j;
+      let p = j - 1;
+      while (p >= 0 && /\s/.test(src[p])) p--;
+      if (p >= 0 && (kIdChar.test(src[p]) || src[p] === ")" || src[p] === "]")) {
+        i = start;
+        if (start >= lineStart) best = Math.min(best, start);
+        continue;
+      }
+    } else if (j >= 0 && kIdChar.test(src[j])) {
+      let k = j;
+      while (k >= 0 && kIdChar.test(src[k])) k--;
+      start = k + 1;
+    } else if (j >= 0 && (src[j] === "'" || src[j] === '"' || src[j] === "`")) {
+      const q = src[j];
+      let k = j - 1;
+      while (k >= 0 && src[k] !== q) k--;
+      start = k;
+    } else break;
+    if (start >= lineStart) best = Math.min(best, start);
+    let d = start - 1;
+    while (d >= 0 && /\s/.test(src[d])) d--;
+    if (src[d] !== ".") break;
+    d--;
+    if (src[d] === "?") d--;
+    i = d + 1;
+  }
+  return best;
+}
+
+function quoteCallSource(src, line, column) {
+  let lineStart = 0;
+  for (let n = 1; n < line; n++) {
+    const nl = src.indexOf("\n", lineStart);
+    if (nl < 0) return undefined;
+    lineStart = nl + 1;
+  }
+  const pos = lineStart + column - 1;
+  let calleeEnd = pos;
+  if (src[pos] !== "(") {
+    while (calleeEnd < src.length && kIdChar.test(src[calleeEnd])) calleeEnd++;
+  }
+  let open = calleeEnd;
+  while (open < src.length && /\s/.test(src[open])) open++;
+  if (src[open] === "?" && src[open + 1] === ".") open += 2;
+  while (open < src.length && /\s/.test(src[open])) open++;
+  if (src[open] !== "(") return undefined;
+  const end = matchBracket(src, open);
+  if (end < 0) return undefined;
+  const from = calleeStart(src, calleeEnd, lineStart);
+  return { text: src.slice(from, end), column: from - (src.lastIndexOf("\n", from - 1) + 1) };
+}
+
+function getErrMessage(fn) {
+  const holder = {};
+  const limit = Error.stackTraceLimit;
+  Error.stackTraceLimit = 1;
+  try { Error.captureStackTrace(holder, fn); } finally { Error.stackTraceLimit = limit; }
+  const stack = typeof holder.stack === "string" ? holder.stack : "";
+  const frame = stack.split("\n").find((l) => l.trimStart().startsWith("at "));
+  if (frame === undefined) return undefined;
+  const m = /^(.*?):(\d+):(\d+)\)?$/.exec(frame.trim().replace(/^at\s+/, "").replace(/^.*? \(/, ""));
+  if (m === null) return undefined;
+  let filename = m[1];
+  if (!filename || filename.startsWith("node:") || filename.startsWith("node-glue") || filename.startsWith("<")) return undefined;
+  if (filename.startsWith("file://")) filename = __builtins.get("url").fileURLToPath(filename);
+  let src;
+  try { src = __builtins.get("fs").readFileSync(filename, "utf8"); } catch { return undefined; }
+  const quoted = quoteCallSource(src, +m[2], +m[3]);
+  if (quoted === undefined) return undefined;
+  let text = quoted.text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  if (text.includes("\n")) {
+    const frames = text.replace(/\r\n/g, "\n").split("\n");
+    text = frames.shift();
+    for (const f of frames) {
+      let p = 0;
+      while (p < quoted.column && (f[p] === " " || f[p] === "\t")) p++;
+      text += "\n  " + f.slice(p);
+    }
+  }
+  return `The expression evaluated to a falsy value:\n\n  ${text}\n`;
+}
+
 function innerOk(fn, argLen, value, message) {
   if (!value) {
     let generatedMessage = false;
@@ -766,7 +944,7 @@ function innerOk(fn, argLen, value, message) {
       message = "No value argument passed to `assert.ok()`";
     } else if (message == null) {
       generatedMessage = true;
-      message = undefined;
+      message = getErrMessage(fn);
     } else if (message instanceof Error) {
       throw message;
     }
@@ -1151,9 +1329,10 @@ class CallTracker {
     const context = { expected, actual: 0, name: fn.name || "calls", stackTrace: new Error(), calls: [] };
     this.#callChecks.add(context);
     const tracked = new Proxy(fn, {
+      __proto__: null,
       apply(target, thisArg, argList) {
         context.actual++;
-        context.calls.push({ thisArg, arguments: argList });
+        context.calls.push({ __proto__: null, thisArg, arguments: argList });
         return Reflect.apply(target, thisArg, argList);
       },
     });
@@ -1164,7 +1343,12 @@ class CallTracker {
   getCalls(fn) {
     const context = this.#tracked.get(fn);
     if (!context) throw new ERR_INVALID_ARG_VALUE("fn", fn, "is not a tracked function");
-    return context.calls.map((c) => ({ ...c }));
+    const out = [];
+    for (let i = 0; i < context.calls.length; i++) {
+      const c = context.calls[i];
+      out.push(Object.freeze({ thisArg: c.thisArg, arguments: Object.freeze(Array.prototype.slice.call(c.arguments)) }));
+    }
+    return Object.freeze(out);
   }
   reset(fn) {
     if (fn === undefined) {

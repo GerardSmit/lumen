@@ -197,6 +197,18 @@ fn read_string_array(ctx: &mut Ctx, v: &Value) -> Result<Vec<String>, Value> {
 
 /// `["pipe"|"inherit"|"ignore", ...]` → the Stdio for one fd.
 fn stdio_for(name: &str) -> Stdio {
+    // `fd:N`: the child gets (a duplicate of) this process's descriptor N.
+    #[cfg(unix)]
+    if let Some(fd) = name.strip_prefix("fd:").and_then(|n| n.parse::<i32>().ok()) {
+        use std::os::fd::FromRawFd;
+        // SAFETY: F_DUPFD_CLOEXEC on a descriptor number; a failure leaves the slot empty.
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if dup < 0 {
+            return Stdio::null();
+        }
+        // SAFETY: `dup` is a fresh descriptor owned by nobody else.
+        return Stdio::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) });
+    }
     match name {
         "inherit" => Stdio::inherit(),
         "ignore" => Stdio::null(),
@@ -288,18 +300,38 @@ extern "C" {
 /// fork. Both ends are CLOEXEC, so the child sees only the numbered fd and the parent's end is
 /// not leaked into it. Returns the parent halves keyed by fd.
 #[cfg(unix)]
-fn wire_extra_stdio(command: &mut Command, stdio: &[String]) -> std::io::Result<HashMap<u32, ExtraPipe>> {
+fn wire_extra_stdio(command: &mut Command, stdio: &[String], ipc_fd: &mut Option<i32>) -> std::io::Result<HashMap<u32, ExtraPipe>> {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
 
     let mut extra = HashMap::new();
     let mut child_ends = Vec::new();
+    let mut inherited = Vec::new();
     for (fd, kind) in stdio.iter().enumerate().skip(3) {
-        if kind != "pipe" {
+        if let Some(src) = kind.strip_prefix("fd:").and_then(|n| n.parse::<std::os::raw::c_int>().ok()) {
+            inherited.push((src, fd as std::os::raw::c_int));
+            continue;
+        }
+        if kind != "pipe" && kind != "ipc" {
             continue;
         }
         let (parent, child) = UnixStream::pair()?;
+        if kind == "ipc" {
+            // The parent's end of the IPC channel goes to JS as a raw descriptor (net's
+            // adoptFd), so handles can travel over it as SCM_RIGHTS.
+            use std::os::fd::IntoRawFd;
+            #[cfg(any(target_os="macos",target_os="ios"))] {
+                let enabled:libc::c_int=1;
+                for sock in [parent.as_raw_fd(), child.as_raw_fd()] {
+                    // SAFETY: setsockopt on a live socket with a c_int option.
+                    unsafe {libc::setsockopt(sock,libc::SOL_SOCKET,libc::SO_NOSIGPIPE,(&enabled as *const libc::c_int).cast(),std::mem::size_of_val(&enabled) as libc::socklen_t)};
+                }
+            }
+            *ipc_fd = Some(parent.into_raw_fd());
+            child_ends.push((child, fd as std::os::raw::c_int));
+            continue;
+        }
         #[cfg(any(target_os="macos",target_os="ios"))] {
             let enabled:libc::c_int=1;
             if unsafe {libc::setsockopt(child.as_raw_fd(),libc::SOL_SOCKET,libc::SO_NOSIGPIPE,(&enabled as *const libc::c_int).cast(),std::mem::size_of_val(&enabled) as libc::socklen_t)}<0 { return Err(std::io::Error::last_os_error()); }
@@ -315,13 +347,21 @@ fn wire_extra_stdio(command: &mut Command, stdio: &[String]) -> std::io::Result<
         );
         child_ends.push((child, fd as std::os::raw::c_int));
     }
-    if !child_ends.is_empty() {
-        // SAFETY: runs in the forked child before exec; dup2 is async-signal-safe and the
+    if !child_ends.is_empty() || !inherited.is_empty() {
+        // SAFETY: runs in the forked child before exec; dup2/fcntl are async-signal-safe and the
         // sockets it renumbers are kept alive by the closure until exec replaces the image.
         unsafe {
             command.pre_exec(move || {
                 for (sock, fd) in &child_ends {
                     if dup2(sock.as_raw_fd(), *fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                for (src, fd) in &inherited {
+                    if src == fd {
+                        let flags = libc::fcntl(*fd, libc::F_GETFD);
+                        libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                    } else if dup2(*src, *fd) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
@@ -333,7 +373,7 @@ fn wire_extra_stdio(command: &mut Command, stdio: &[String]) -> std::io::Result<
 }
 
 #[cfg(not(unix))]
-fn wire_extra_stdio(_command: &mut Command, stdio: &[String]) -> std::io::Result<HashMap<u32, ExtraPipe>> {
+fn wire_extra_stdio(_command: &mut Command, stdio: &[String], _ipc_fd: &mut Option<i32>) -> std::io::Result<HashMap<u32, ExtraPipe>> {
     if stdio.iter().skip(3).any(|k| k == "pipe") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -441,11 +481,21 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .stdin(stdio_for(&stdio[0]))
         .stdout(stdio_for(&stdio[1]))
         .stderr(stdio_for(&stdio[2]));
-    let extra = wire_extra_stdio(&mut command, &stdio)
+    let mut ipc_fd = None;
+    let extra = wire_extra_stdio(&mut command, &stdio, &mut ipc_fd)
         .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
 
-    let mut child =
-        lumen_host::spawn_command(ctx, &mut command).map_err(|e| spawn_failure(ctx, &cmd, &e))?;
+    let mut child = match lumen_host::spawn_command(ctx, &mut command) {
+        Ok(child) => child,
+        Err(e) => {
+            #[cfg(unix)]
+            if let Some(fd) = ipc_fd {
+                // SAFETY: the parent's end of the channel, owned here and never handed out.
+                unsafe { libc::close(fd) };
+            }
+            return Err(spawn_failure(ctx, &cmd, &e));
+        }
+    };
     let pid = child.id();
     let stdout: Option<Box<dyn Read + Send>> = child.stdout.take().map(|s| Box::new(s) as _);
     let stderr: Option<Box<dyn Read + Send>> = child.stderr.take().map(|s| Box::new(s) as _);
@@ -460,7 +510,11 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         pending_tasks: Vec::new(),
         pipes: Vec::new(),
     };
-    Ok(register_child(ctx, proc, pid))
+    let info = register_child(ctx, proc, pid);
+    if let Some(fd) = ipc_fd {
+        let _ = ctx.set_member(&info, "ipcFd", Value::Num(fd as f64));
+    }
+    Ok(info)
 }
 
 fn register_child(ctx: &mut Ctx, proc: ChildProc, pid: u32) -> Value {
@@ -1418,6 +1472,7 @@ struct Wired {
     parent_stderr: Option<Box<dyn Read + Send>>,
     extra: HashMap<u32, ExtraPipe>,
     pipes: Vec<mem_pipe::Handle>,
+    ipc_fd: Option<i32>,
 }
 
 /// Build what a child realm runs with from a `spawn(process.execPath, args, ...)`: the script
@@ -1498,32 +1553,43 @@ fn wire_child_realm(
     let mut extra = HashMap::new();
     let mut owned_fds = Vec::new();
     let mut resources: Vec<Box<dyn Send>> = Vec::new();
+    let mut ipc_fd = None;
     for (slot, kind) in stdio.iter().enumerate().skip(3) {
-        if kind != "pipe" {
+        if kind != "pipe" && kind != "ipc" {
             continue;
         }
         #[cfg(unix)]
         {
             let (parent, child) = socket_pair().map_err(|e| e.to_string())?;
-            let reader: Box<dyn Read + Send> =
-                Box::new(parent.try_clone().map_err(|e| e.to_string())?);
-            extra.insert(
-                slot as u32,
-                ExtraPipe {
-                    reader: Arc::new(Mutex::new(Some(reader))),
-                    writer: Arc::new(Mutex::new(Some(Box::new(parent)))),
-                },
-            );
+            if kind == "ipc" {
+                // As for an OS child: the parent's end goes to JS as a raw descriptor (net's adoptFd).
+                ipc_fd = Some(std::os::fd::IntoRawFd::into_raw_fd(parent));
+            } else {
+                let reader: Box<dyn Read + Send> =
+                    Box::new(parent.try_clone().map_err(|e| e.to_string())?);
+                extra.insert(
+                    slot as u32,
+                    ExtraPipe {
+                        reader: Arc::new(Mutex::new(Some(reader))),
+                        writer: Arc::new(Mutex::new(Some(Box::new(parent)))),
+                    },
+                );
+            }
             let raw = std::os::unix::io::AsRawFd::as_raw_fd(&child);
             owned_fds.push(raw);
-            if ipc_slot == Some(slot) {
+            if ipc_slot == Some(slot) || kind == "ipc" {
                 for (key, value) in env.iter_mut() {
                     if key == "LUMEN_FORK_IPC_FD" || key == "NODE_CHANNEL_FD" {
                         *value = raw.to_string();
                     }
                 }
             }
-            resources.push(Box::new(child));
+            if kind == "ipc" {
+                // The child realm adopts this end (net's adoptFd) and closes it with its channel.
+                let _ = std::os::fd::IntoRawFd::into_raw_fd(child);
+            } else {
+                resources.push(Box::new(child));
+            }
         }
         #[cfg(not(unix))]
         {
@@ -1548,6 +1614,7 @@ fn wire_child_realm(
         parent_stderr,
         extra,
         pipes,
+        ipc_fd,
     })
 }
 
@@ -1571,6 +1638,7 @@ fn spawn_child_realm(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Option<
         parent_stderr,
         extra,
         pipes,
+        ipc_fd,
     } = wired;
     let realm = site
         .launcher
@@ -1587,7 +1655,11 @@ fn spawn_child_realm(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Option<
         pending_tasks: Vec::new(),
         pipes,
     };
-    Ok(Some(register_child(ctx, proc, pid)))
+    let info = register_child(ctx, proc, pid);
+    if let Some(fd) = ipc_fd {
+        let _ = ctx.set_member(&info, "ipcFd", Value::Num(fd as f64));
+    }
+    Ok(Some(info))
 }
 
 /// How a synchronous `spawnSync` / `execSync` of `process.execPath` is run.

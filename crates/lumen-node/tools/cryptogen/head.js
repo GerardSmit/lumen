@@ -165,8 +165,8 @@ internalAssert.fail = (message) => {
 };
 
 // Objects that structuredClone / MessagePort transfer rebuild from their `kClone` data.
-const kClone = Symbol("kClone");
-const kDeserialize = Symbol("kDeserialize");
+const kClone = Symbol.for("lumen.transferable.clone");
+const kDeserialize = Symbol.for("lumen.transferable.deserialize");
 class JSTransferable {}
 function makeTransferable(obj) {
   return obj;

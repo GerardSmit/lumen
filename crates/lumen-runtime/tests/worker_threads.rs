@@ -163,7 +163,7 @@ fn failed_port_clone_preserves_ownership_and_marks_are_enforced() {
  assert.throws(()=>carrier.port1.postMessage({port:pair.port2,fn(){ }},[pair.port2]),{name:'DataCloneError'});
  pair.port1.postMessage(42);
  assert.deepEqual(receiveMessageOnPort(pair.port2),{message:42});
- assert.throws(()=>carrier.port1.postMessage({port:pair.port2}),{name:'DataCloneError'});
+ assert.throws(()=>carrier.port1.postMessage({port:pair.port2}),{code:'ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST'});
  assert.throws(()=>carrier.port1.postMessage({port:pair.port2},[pair.port2,pair.port2]),{name:'DataCloneError'});
  markAsUntransferable(pair.port2);assert(isMarkedAsUntransferable(pair.port2));
  assert.throws(()=>carrier.port1.postMessage({port:pair.port2},[pair.port2]),{name:'DataCloneError'});

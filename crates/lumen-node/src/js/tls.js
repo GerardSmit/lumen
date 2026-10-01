@@ -4199,3 +4199,6 @@ defineModule("tls", function (module, exports, require, internalBinding, primord
   __builtins.set("_tls_wrap", require("_tls_wrap"));
   __builtins.set("https", netRequire("https"));
 }
+// The module table and bindings, for --expose-internals (internals.js).
+__internals.set("tlsRequire", require);
+__internals.set("tlsBinding", internalBinding);

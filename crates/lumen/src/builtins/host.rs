@@ -134,9 +134,9 @@ fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.array_buffers.insert(p, vec![0u8; len].into()); // length placeholder; bytes live in the registry
-    set_internal(&obj, "__abMaxByteLength", Value::Num(len as f64));
-    set_internal(&obj, "__abResizable", Value::Bool(false));
-    set_internal(&obj, "__sab_id", Value::Num(id as f64));
+    set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(len as f64));
+    set_internal(&obj, "\u{0}ab_resizable", Value::Bool(false));
+    set_internal(&obj, "\u{0}sab_id", Value::Num(id as f64));
     i.shared_buffers.insert(p, id);
     Value::Obj(obj)
 }

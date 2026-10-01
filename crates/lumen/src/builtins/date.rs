@@ -12,28 +12,7 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
+use crate::local_tz::{civil_from_days, days_from_civil};
 
 /// (year, month0, day, hour, minute, second, millisecond, weekday[0=Sun]).
 const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -53,7 +32,7 @@ fn date_str_part(t: f64) -> Option<String> {
     if !t.is_finite() {
         return None;
     }
-    let (y, mo, d, _, _, _, _, wd) = ms_to_parts(t);
+    let (y, mo, d, _, _, _, _, wd) = ms_to_parts(t + crate::local_tz::offset_ms(t));
     Some(format!(
         "{} {} {:02} {}",
         WDAYS[wd as usize],
@@ -66,9 +45,14 @@ fn time_str_part(t: f64) -> Option<String> {
     if !t.is_finite() {
         return None;
     }
-    let (_, _, _, h, mi, s, _, _) = ms_to_parts(t);
+    let off = crate::local_tz::offset_ms(t);
+    let (_, _, _, h, mi, s, _, _) = ms_to_parts(t + off);
+    let off_min = (off / 60_000.0).trunc() as i64;
+    let sign = if off_min < 0 { '-' } else { '+' };
+    let (oh, om) = (off_min.abs() / 60, off_min.abs() % 60);
     Some(format!(
-        "{h:02}:{mi:02}:{s:02} GMT+0000 (Coordinated Universal Time)"
+        "{h:02}:{mi:02}:{s:02} GMT{sign}{oh:02}{om:02} ({})",
+        crate::local_tz::long_name(t)
     ))
 }
 fn utc_string(t: f64) -> Option<String> {
@@ -154,20 +138,25 @@ fn parts_to_ms(y: i64, mo0: i64, d: i64, h: i64, mi: i64, s: i64, ml: i64) -> f6
 fn date_ms(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisTimeValue: the receiver must be a Date (carry the internal time slot), else TypeError.
     match this {
-        Value::Obj(o) if o.borrow().props.contains("__date_ms") => {}
+        Value::Obj(o) if o.borrow().props.contains("\u{0}date_ms") => {}
         _ => return Err(i.make_error("TypeError", "this is not a Date object")),
     }
-    Ok(match ab(i.get_member(this, "__date_ms"))? {
+    Ok(match ab(i.get_member(this, "\u{0}date_ms"))? {
         Value::Num(n) => n,
         _ => f64::NAN,
     })
 }
 
-fn date_get(i: &mut Interp, this: &Value, sel: u8) -> Result<Value, Value> {
+fn date_get(i: &mut Interp, this: &Value, sel: u8, local: bool) -> Result<Value, Value> {
     let t = date_ms(i, this)?;
     if t.is_nan() {
         return Ok(Value::Num(f64::NAN));
     }
+    let t = if local {
+        t + crate::local_tz::offset_ms(t)
+    } else {
+        t
+    };
     let (y, mo, d, h, mi, s, ml, wd) = ms_to_parts(t);
     let v = match sel {
         0 => y,
@@ -192,6 +181,7 @@ fn date_set_multi(
     start_sel: u8,
     args: &[Value],
     n_max: usize,
+    local: bool,
 ) -> Result<Value, Value> {
     const ORDER: [u8; 7] = [0, 1, 2, 4, 5, 6, 7];
     let start_idx = ORDER.iter().position(|&f| f == start_sel).unwrap();
@@ -210,7 +200,13 @@ fn date_set_multi(
         return Ok(Value::Num(f64::NAN));
     }
     let mut any_nan = t.is_nan() && !nan_to_zero;
-    let base = if t.is_nan() { 0.0 } else { t };
+    let base = if t.is_nan() {
+        0.0
+    } else if local {
+        t + crate::local_tz::offset_ms(t)
+    } else {
+        t
+    };
     let (py, pmo, pd, ph, pmi, ps, pml, _) = ms_to_parts(base);
     // Fields default to their current value, held as f64 so an out-of-range assignment overflows
     // to a non-finite MakeDay/MakeTime intermediate (NaN) rather than wrapping an i64.
@@ -236,11 +232,13 @@ fn date_set_multi(
     let time = f[3] * 3_600_000.0 + f[4] * 60_000.0 + f[5] * 1000.0 + f[6];
     let ms = if any_nan {
         f64::NAN
+    } else if local {
+        time_clip(crate::local_tz::local_to_utc(make_date(day, time)))
     } else {
         time_clip(make_date(day, time))
     };
     if let Value::Obj(o) = this {
-        set_internal(o, "__date_ms", Value::Num(ms));
+        set_internal(o, "\u{0}date_ms", Value::Num(ms));
     }
     Ok(Value::Num(ms))
 }
@@ -255,15 +253,47 @@ fn parse_rfc(s: &str) -> f64 {
     let (mut year, mut month, mut day): (Option<i64>, Option<i64>, Option<i64>) =
         (None, None, None);
     let (mut hh, mut mm, mut ss) = (0i64, 0i64, 0i64);
-    let mut offset: i64 = 0; // minutes east of UTC
+    // Minutes east of UTC; without an explicit zone the string is local time.
+    let mut offset: Option<i64> = None;
     let mut got_time = false;
-    for tok in s.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')')) {
+    // Parenthesized text (a zone comment such as "(Central European Summer Time)") is ignored.
+    let mut depth = 0u32;
+    let text: String = s
+        .chars()
+        .map(|c| {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    return ' ';
+                }
+                _ => {}
+            }
+            if depth > 0 {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    for tok in text.split(|c: char| c.is_whitespace() || c == ',') {
         let tok = tok.trim();
         if tok.is_empty() {
             continue;
         }
         let low = tok.to_lowercase();
-        if let Some(idx) = MONTHS.iter().position(|m| low.starts_with(m)) {
+        let named = match low.as_str() {
+            "z" | "ut" | "utc" | "gmt" => Some(0),
+            "edt" => Some(-240),
+            "est" | "cdt" => Some(-300),
+            "cst" | "mdt" => Some(-360),
+            "mst" | "pdt" => Some(-420),
+            "pst" => Some(-480),
+            _ => None,
+        };
+        if named.is_some() {
+            offset = named;
+        } else if let Some(idx) = MONTHS.iter().position(|m| low.starts_with(m)) {
             month = Some(idx as i64);
         } else if tok.contains(':') && !got_time {
             let mut p = tok.split(':');
@@ -287,13 +317,19 @@ fn parse_rfc(s: &str) -> f64 {
                 let oh: i64 = digits[..2].parse().unwrap_or(0);
                 let om: i64 = digits[2..4].parse().unwrap_or(0);
                 let mag = oh * 60 + om;
-                offset = if sign == Some('-') { -mag } else { mag };
+                offset = Some(if sign == Some('-') { -mag } else { mag });
+            } else if rest.is_empty() {
+                offset = Some(0);
             }
         }
     }
     match (year, month, day) {
         (Some(y), Some(mo), Some(d)) => {
-            parts_to_ms(y, mo, d, hh, mm, ss, 0) - (offset as f64) * 60000.0
+            let t = parts_to_ms(y, mo, d, hh, mm, ss, 0);
+            match offset {
+                Some(off) => t - (off as f64) * 60000.0,
+                None => crate::local_tz::local_to_utc(t),
+            }
         }
         _ => f64::NAN,
     }
@@ -449,8 +485,10 @@ fn parse_iso(s: &str) -> f64 {
         offset_min = zone;
     }
     let base = parts_to_ms(y, mo - 1, d, h, mi, sec, ml);
+    // A date-only form is UTC; a date-time without an offset is local time.
     let adjusted = match offset_min {
         Some(mins) => base - (mins as f64) * 60_000.0,
+        None if time_part.is_some() => crate::local_tz::local_to_utc(base),
         None => base,
     };
     time_clip(adjusted)
@@ -473,8 +511,8 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
         0 => now_ms(),
         1 => match &args[0] {
             // A Date argument clones its time value directly (no valueOf call).
-            Value::Obj(o) if o.borrow().props.contains("__date_ms") => {
-                match o.borrow().props.get("__date_ms").map(|p| p.value()) {
+            Value::Obj(o) if o.borrow().props.contains("\u{0}date_ms") => {
+                match o.borrow().props.get("\u{0}date_ms").map(|p| p.value()) {
                     Some(Value::Num(n)) => n,
                     _ => f64::NAN,
                 }
@@ -506,11 +544,14 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
             let mi = read(i, 4, 0.0)?;
             let sec = read(i, 5, 0.0)?;
             let ml = read(i, 6, 0.0)?;
-            time_clip(make_date(make_day(y, mo, d), make_time(h, mi, sec, ml)))
+            time_clip(crate::local_tz::local_to_utc(make_date(
+                make_day(y, mo, d),
+                make_time(h, mi, sec, ml),
+            )))
         }
     };
     let obj = new_from_ctor(i, "Date")?;
-    set_internal(&obj, "__date_ms", Value::Num(ms));
+    set_internal(&obj, "\u{0}date_ms", Value::Num(ms));
     Ok(Value::Obj(obj))
 }
 
@@ -547,20 +588,24 @@ pub(super) fn install_date(it: &mut Interp) {
         date_ms(i, &this)?; // thisTimeValue brand check
         let v = time_clip(ab(i.to_number(&arg(a, 0)))?);
         if let Value::Obj(o) = &this {
-            set_internal(o, "__date_ms", Value::Num(v));
+            set_internal(o, "\u{0}date_ms", Value::Num(v));
         }
         Ok(Value::Num(v))
     });
     it.def_method(&proto, "getTimezoneOffset", 0, |i, this, _| {
         let t = date_ms(i, &this)?;
-        Ok(Value::Num(if t.is_nan() { f64::NAN } else { 0.0 }))
+        Ok(Value::Num(if t.is_nan() {
+            f64::NAN
+        } else {
+            // Whole minutes, like V8 (an LMT offset's seconds are dropped).
+            (-crate::local_tz::offset_ms(t) / 60_000.0).trunc() + 0.0
+        }))
     });
     it.def_method(&proto, "toTemporalInstant", 0, |i, this, _| {
         // RequireInternalSlot([[DateValue]]) then a Temporal.Instant at ms×10^6 ns.
         let ms = date_ms(i, &this)?;
         crate::temporal::instant_from_epoch_ms(i, ms)
     });
-    // Local and UTC accessors are identical (offset 0).
     for (name, sel) in [
         ("getFullYear", 0u8),
         ("getMonth", 1),
@@ -574,41 +619,41 @@ pub(super) fn install_date(it: &mut Interp) {
         let utc = format!("getUTC{}", &name[3..]);
         match sel {
             0 => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 0));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 0));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 0, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 0, false));
             }
             1 => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 1));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 1));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 1, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 1, false));
             }
             2 => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 2));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 2));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 2, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 2, false));
             }
             3 => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 3));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 3));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 3, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 3, false));
             }
             4 => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 4));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 4));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 4, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 4, false));
             }
             5 => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 5));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 5));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 5, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 5, false));
             }
             6 => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 6));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 6));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 6, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 6, false));
             }
             _ => {
-                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 7));
-                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 7));
+                it.def_method(&proto, name, 0, |i, this, _| date_get(i, &this, 7, true));
+                it.def_method(&proto, &utc, 0, |i, this, _| date_get(i, &this, 7, false));
             }
         }
     }
     it.def_method(&proto, "setFullYear", 3, |i, this, a| {
-        date_set_multi(i, &this, 0, a, 3)
+        date_set_multi(i, &this, 0, a, 3, true)
     });
     // Annex B legacy getYear/setYear (years offset from 1900).
     it.def_method(&proto, "getYear", 0, |i, this, _| {
@@ -629,49 +674,48 @@ pub(super) fn install_date(it: &mut Interp) {
                 y
             }
         };
-        date_set_multi(i, &this, 0, &[Value::Num(full)], 1)?;
+        date_set_multi(i, &this, 0, &[Value::Num(full)], 1, true)?;
         // TimeClip: setYear reports the stored (possibly NaN) time value.
         date_ms(i, &this).map(Value::Num)
     });
     it.def_method(&proto, "setMonth", 2, |i, this, a| {
-        date_set_multi(i, &this, 1, a, 2)
+        date_set_multi(i, &this, 1, a, 2, true)
     });
     it.def_method(&proto, "setDate", 1, |i, this, a| {
-        date_set_multi(i, &this, 2, a, 1)
+        date_set_multi(i, &this, 2, a, 1, true)
     });
     it.def_method(&proto, "setHours", 4, |i, this, a| {
-        date_set_multi(i, &this, 4, a, 4)
+        date_set_multi(i, &this, 4, a, 4, true)
     });
     it.def_method(&proto, "setMinutes", 3, |i, this, a| {
-        date_set_multi(i, &this, 5, a, 3)
+        date_set_multi(i, &this, 5, a, 3, true)
     });
     it.def_method(&proto, "setSeconds", 2, |i, this, a| {
-        date_set_multi(i, &this, 6, a, 2)
+        date_set_multi(i, &this, 6, a, 2, true)
     });
     it.def_method(&proto, "setMilliseconds", 1, |i, this, a| {
-        date_set_multi(i, &this, 7, a, 1)
+        date_set_multi(i, &this, 7, a, 1, true)
     });
-    // UTC setters mirror the local ones (offset 0).
     it.def_method(&proto, "setUTCFullYear", 3, |i, this, a| {
-        date_set_multi(i, &this, 0, a, 3)
+        date_set_multi(i, &this, 0, a, 3, false)
     });
     it.def_method(&proto, "setUTCMonth", 2, |i, this, a| {
-        date_set_multi(i, &this, 1, a, 2)
+        date_set_multi(i, &this, 1, a, 2, false)
     });
     it.def_method(&proto, "setUTCDate", 1, |i, this, a| {
-        date_set_multi(i, &this, 2, a, 1)
+        date_set_multi(i, &this, 2, a, 1, false)
     });
     it.def_method(&proto, "setUTCHours", 4, |i, this, a| {
-        date_set_multi(i, &this, 4, a, 4)
+        date_set_multi(i, &this, 4, a, 4, false)
     });
     it.def_method(&proto, "setUTCMinutes", 3, |i, this, a| {
-        date_set_multi(i, &this, 5, a, 3)
+        date_set_multi(i, &this, 5, a, 3, false)
     });
     it.def_method(&proto, "setUTCSeconds", 2, |i, this, a| {
-        date_set_multi(i, &this, 6, a, 2)
+        date_set_multi(i, &this, 6, a, 2, false)
     });
     it.def_method(&proto, "setUTCMilliseconds", 1, |i, this, a| {
-        date_set_multi(i, &this, 7, a, 1)
+        date_set_multi(i, &this, 7, a, 1, false)
     });
     it.def_method(&proto, "toISOString", 0, |i, this, _| {
         let t = date_ms(i, &this)?;

@@ -199,6 +199,7 @@ impl Lexer<'_> {
         c
     }
     fn err(&self, message: impl Into<String>) -> LexError {
+        crate::parser::set_error_span(self.pos as u32, self.pos as u32 + 1);
         LexError {
             message: message.into(),
             line: self.line,

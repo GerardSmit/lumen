@@ -16,6 +16,7 @@ mod weak;
 pub(crate) use iteration::map_set_iter_next;
 pub(crate) use iteration::{map_set_iter_drain, map_set_iter_step, map_set_iter_try_step};
 pub(crate) use iteration::make_collection_iterator;
+pub(crate) use iteration::map_set_iter_preview;
 use set_methods::install_set_methods;
 use strong::{install_map_like, install_map_methods};
 use weak::install_weak;

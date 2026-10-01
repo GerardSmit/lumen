@@ -1043,7 +1043,8 @@ fn only_the_ipc_slot_gets_the_channel_descriptor() {
          child.send('hi');",
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert!(ran.stdout.contains(r#"{"echo":"hi","fd":true}"#), "{}", ran.stdout);
+    // Like Node, the child consumes NODE_CHANNEL_FD while opening the channel.
+    assert!(ran.stdout.contains(r#"{"echo":"hi","fd":false}"#), "{}", ran.stdout);
     assert!(ran.stdout.contains("close 0"), "{}", ran.stdout);
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }

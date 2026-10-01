@@ -39,8 +39,15 @@ pub(crate) const REACT_ANY: u8 = 3;
 /// A `Promise.race` element: either settlement settles `result`.
 pub(crate) const REACT_RACE: u8 = 4;
 
+/// An `await` subscribed while promise hooks are installed: `on_f` is the async function's
+/// promise and `result` V8's "throwaway" promise, which exists only so the hooks see one.
+pub(crate) const REACT_AWAIT: u8 = 5;
+
 /// [`Job::kind`]: run a reaction handler (or pass the settlement through, or resume an await).
 pub(crate) const JOB_REACTION: u8 = 0;
+/// The job of a [`REACT_AWAIT`] reaction: `handler` is the async function's promise, `result`
+/// the throwaway promise the before/after hooks receive.
+pub(crate) const JOB_AWAIT_HOOKED: u8 = 254;
 /// PromiseResolveThenableJob: `handler` is the `then` function, `value` the thenable,
 /// `result` the promise being resolved.
 pub(crate) const JOB_THENABLE: u8 = 1;
@@ -50,6 +57,24 @@ pub(crate) const JOB_TASK: u8 = 255;
 /// Combinator element settlements are `JOB_COMB_BASE + REACT_*` (see
 /// [`Interp::combinator_settle`]).
 pub(crate) const JOB_COMB_BASE: u8 = 2;
+
+/// The host's promise lifecycle hooks (V8's context promise hooks): `init(promise, parent)`,
+/// `before(promise)` / `after(promise)` around a reaction job, `resolve(promise)` when a promise
+/// is resolved or rejected. A non-callable entry is skipped.
+pub struct PromiseHooks {
+    pub(crate) init: Value,
+    pub(crate) before: Value,
+    pub(crate) after: Value,
+    pub(crate) resolve: Value,
+    /// Set while a hook runs: promises a hook creates or settles report nothing, so a hook
+    /// cannot recurse into itself.
+    pub(crate) running: Cell<bool>,
+}
+
+pub(crate) const HOOK_INIT: u8 = 0;
+pub(crate) const HOOK_BEFORE: u8 = 1;
+pub(crate) const HOOK_AFTER: u8 = 2;
+pub(crate) const HOOK_RESOLVE: u8 = 3;
 
 /// One PromiseReaction pair (fulfil and reject handlers share the result and context).
 #[derive(Clone)]
@@ -342,6 +367,11 @@ impl Interp {
     /// A call of a resolving function: the first call of either one of a pair settles.
     pub(crate) fn call_promise_resolver(&mut self, cell: &ResolverCell, fulfil: bool, args: &[Value]) {
         if cell.already.replace(true) {
+            if let Some(hook) = self.multiple_resolves_hook.clone() {
+                let kind = Value::str(if fulfil { "resolve" } else { "reject" });
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                let _ = self.call(hook, Value::Undefined, &[kind, cell.promise.clone(), v]);
+            }
             return;
         }
         let v = args.first().cloned().unwrap_or(Value::Undefined);
@@ -357,6 +387,7 @@ impl Interp {
     pub(crate) fn reaction_job(r: Reaction, fulfilled: bool, value: Value) -> Job {
         let (handler, kind) = match r.kind {
             REACT_THEN => (if fulfilled { r.on_f } else { r.on_r }, JOB_REACTION),
+            REACT_AWAIT => (r.on_f, JOB_AWAIT_HOOKED),
             k => (Value::Undefined, JOB_COMB_BASE + k),
         };
         Job {
@@ -384,7 +415,7 @@ impl Interp {
             if s.tracked {
                 s.tracked = false;
                 drop(b);
-                self.unhandled_rejections.remove(&(Gc::as_ptr(p) as usize));
+                self.note_rejection_handled(p);
                 b = p.borrow_mut();
             }
             let Callable::Promise(s) = &b.call else { return };
@@ -538,6 +569,9 @@ impl Interp {
         awaited: Value,
         async_promise: &Value,
     ) -> Result<(), Value> {
+        if self.promise_hooks.is_some() {
+            return self.await_subscribe_hooked(awaited, async_promise);
+        }
         if !matches!(awaited, Value::Obj(_)) {
             // PromiseResolve of a non-object is a fresh fulfilled promise; PerformPromiseThen on
             // it queues the reaction at once. Queue it directly.
@@ -630,7 +664,7 @@ impl Interp {
     /// settled native promise whose `constructor` read is silent. Returns the resume signal,
     /// or `None` to take the ordinary suspend-and-subscribe path.
     pub(crate) fn await_direct(&mut self, awaited: &Value) -> Option<crate::coroutine::Resume> {
-        if !self.microtasks.is_empty() || self.terminating {
+        if !self.microtasks.is_empty() || self.terminating || self.promise_hooks.is_some() {
             return None;
         }
         // The skipped job would have been a safe point (see `run_await_job`).
@@ -656,7 +690,7 @@ impl Interp {
                         if let Callable::Promise(s) = &mut o.borrow_mut().call {
                             s.tracked = false;
                         }
-                        self.unhandled_rejections.remove(&(Gc::as_ptr(o) as usize));
+                        self.note_rejection_handled(o);
                     }
                     Some(crate::coroutine::Resume::Throw(value))
                 }
@@ -683,5 +717,135 @@ impl Interp {
         self.drive_async(job.handler, signal);
         self.lang.promise.job_root.set(false);
         self.async_context = outer;
+    }
+
+    /// A tracked (unhandled) rejection of `p` got a handler: drop it from the pending report,
+    /// or, when it was already reported, record it for the embedder's `rejectionHandled`.
+    pub(crate) fn note_rejection_handled(&mut self, p: &Gc) {
+        if self.unhandled_rejections.remove(&(Gc::as_ptr(p) as usize)).is_none() {
+            if let Some(list) = self.late_handled_rejections.as_mut() {
+                list.push(Value::Obj(p.clone()));
+            }
+        }
+    }
+
+    /// Install (`Some`) or remove the host's promise hooks.
+    pub fn set_promise_hooks(&mut self, hooks: Option<[Value; 4]>) {
+        // Replaced from inside a hook: the new set is just as busy.
+        let running = self.promise_hooks.as_ref().is_some_and(|h| h.running.get());
+        self.promise_hooks = hooks.and_then(|[init, before, after, resolve]| {
+            if [&init, &before, &after, &resolve].iter().all(|f| !f.is_callable()) {
+                return None;
+            }
+            Some(Box::new(PromiseHooks {
+                init,
+                before,
+                after,
+                resolve,
+                running: Cell::new(running),
+            }))
+        });
+    }
+
+    /// Call promise hook `which` (`HOOK_*`) for `promise`; `parent` is `init`'s second argument.
+    /// A throwing hook is ignored here: the host's hook functions report their own errors.
+    #[cold]
+    pub(crate) fn run_promise_hook(&mut self, which: u8, promise: &Value, parent: &Value) {
+        let Some(h) = self.promise_hooks.as_ref() else { return };
+        let f = match which {
+            HOOK_INIT => &h.init,
+            HOOK_BEFORE => &h.before,
+            HOOK_AFTER => &h.after,
+            _ => &h.resolve,
+        };
+        if h.running.get() || !f.is_callable() {
+            return;
+        }
+        let f = f.clone();
+        self.call_promise_hook(f, which, promise, parent);
+    }
+
+    fn call_promise_hook(&mut self, f: Value, which: u8, promise: &Value, parent: &Value) {
+        if let Some(h) = self.promise_hooks.as_ref() {
+            h.running.set(true);
+        }
+        let _ = if which == HOOK_INIT {
+            self.call(f, Value::Undefined, &[promise.clone(), parent.clone()])
+        } else {
+            self.call(f, Value::Undefined, &[promise.clone()])
+        };
+        if let Some(h) = self.promise_hooks.as_ref() {
+            h.running.set(false);
+        }
+    }
+
+    /// A fresh pending promise whose `init` hook names `parent` (the promise `then` was called
+    /// on, or an awaited value's wrapper).
+    pub(crate) fn new_promise_with_parent(&mut self, parent: &Value) -> Value {
+        let p = Value::Obj(Object::new_bare(self.promise_proto()));
+        if let Value::Obj(o) = &p {
+            o.borrow_mut().call = Callable::Promise(PromiseSlot::boxed());
+        }
+        if self.promise_hooks.is_some() {
+            self.run_promise_hook(HOOK_INIT, &p, parent);
+        }
+        p
+    }
+
+    /// [`Interp::run_job`] while promise hooks are installed: a reaction, await or thenable job
+    /// runs between `before` and `after` of the promise it settles (the await's throwaway).
+    #[cold]
+    pub(crate) fn run_job_hooked(&mut self, mut job: Job) {
+        let hooked = match job.kind {
+            JOB_REACTION | JOB_THENABLE | JOB_AWAIT_HOOKED => is_promise(&job.result),
+            _ => false,
+        };
+        if !hooked {
+            return self.run_job_unhooked(job);
+        }
+        let promise = job.result.clone();
+        let context = job.context.get().clone();
+        let outer = std::mem::replace(&mut self.async_context, context.clone());
+        self.run_promise_hook(HOOK_BEFORE, &promise, &Value::Undefined);
+        self.async_context = outer;
+        if job.kind == JOB_AWAIT_HOOKED {
+            job.kind = JOB_REACTION;
+            job.result = Value::Empty;
+            let from_drain = self.lang.promise.drain_job.replace(false);
+            self.run_await_job(job, from_drain);
+        } else {
+            self.run_job_unhooked(job);
+        }
+        if self.promise_hooks.is_some() {
+            let outer = std::mem::replace(&mut self.async_context, context);
+            self.run_promise_hook(HOOK_AFTER, &promise, &Value::Undefined);
+            self.async_context = outer;
+        }
+    }
+
+    /// `await` with promise hooks installed, as V8 does it then: a non-promise is wrapped in a
+    /// promise whose parent is the async function's promise, and the reaction gets a throwaway
+    /// result promise (parent: the awaited promise) for the before/after hooks.
+    #[cold]
+    fn await_subscribe_hooked(&mut self, awaited: Value, async_promise: &Value) -> Result<(), Value> {
+        let px = if is_promise(&awaited) {
+            self.promise_resolve_checked(awaited)?
+        } else {
+            let wrapper = self.new_promise_with_parent(async_promise);
+            self.resolve_promise(&wrapper, awaited);
+            wrapper
+        };
+        let throwaway = self.new_promise_with_parent(&px);
+        let Value::Obj(o) = &px else { return Ok(()) };
+        let reaction = Reaction {
+            on_f: async_promise.clone(),
+            on_r: async_promise.clone(),
+            result: throwaway,
+            context: crate::value::PackedValue::pack(self.async_context.clone()),
+            kind: REACT_AWAIT,
+            idx: 0,
+        };
+        self.perform_then(o, reaction);
+        Ok(())
     }
 }
