@@ -637,9 +637,16 @@ class StreamHandle {
   fchmod() { return 0; }
   open(_fd) { return UV_ENOTSUP; }
 
-  _connectWith(req, start) {
+  _connectWith(req, start, traceData) {
+    const traced = __traceEvent !== null;
+    const traceId = traced ? ++nativeTraceId : 0;
+    if (traced) __traceEvent("node,node.net,node.net.native", "b", "connect", traceId, traceData);
+    const traceEnd = () => {
+      if (traced) __traceEvent("node,node.net,node.net.native", "e", "connect", traceId);
+    };
     start(
       (...desc) => {
+        traceEnd();
         if (this._closed) {
           __net.close(desc[0]);
           return;
@@ -648,6 +655,7 @@ class StreamHandle {
         req.oncomplete(0, this, req, true, true);
       },
       (error) => {
+        traceEnd();
         if (this._closed) return;
         req.oncomplete(errnoOf(error), this, req, false, false);
       },
@@ -681,6 +689,7 @@ class StreamHandle {
 }
 
 const TCPConstants = { SOCKET: 0, SERVER: 1, UV_TCP_IPV6ONLY: 1 };
+let nativeTraceId = 0;
 class TCP extends StreamHandle {
   constructor(type) {
     super(type);
@@ -760,7 +769,7 @@ class TCP extends StreamHandle {
     return 0;
   }
   connect(req, address, port) {
-    return this._connectWith(req, (ok, fail) => __net.connect(address, port, this._connectBindAddress ?? "", this._connectBindPort | 0, ok, fail));
+    return this._connectWith(req, (ok, fail) => __net.connect(address, port, this._connectBindAddress ?? "", this._connectBindPort | 0, ok, fail), { ip: address, port });
   }
   connect6(req, address, port) {
     return this.connect(req, address, port);
@@ -797,7 +806,7 @@ class Pipe extends StreamHandle {
       } catch (error) {
         fail(Object.assign(error, { code: error.code || "ENOTSUP" }));
       }
-    });
+    }, { path });
   }
   setPendingInstances() {}
 }
@@ -1158,7 +1167,14 @@ const bindings = {
   // Only the fd-socket sync write path (makeSyncWrite) reaches this; lumen wraps no raw fds.
   fs: { writeBuffer() { throw new Error("lumen net: synchronous fd writes are not supported"); } },
   constants: { get os() { return { __proto__: __builtins.get("os").constants, UV_UDP_REUSEADDR: UDPConstants.UV_UDP_REUSEADDR }; } },
-  trace_events: { trace() {}, isTraceCategoryEnabled: () => false, getCategoryEnabledBuffer: () => new Uint8Array(1) },
+  trace_events: {
+    trace(phase, category, name, id, data) {
+      if (__traceEvent !== null) __traceEvent(category, String.fromCharCode(phase), name, id, data);
+    },
+    isTraceCategoryEnabled: (category) =>
+      __traceEvent !== null && __internals.get("trace_events").binding.isTraceCategoryEnabled(category),
+    getCategoryEnabledBuffer: () => new Uint8Array(1),
+  },
   // http_parser is defined further down (after the llhttp port).
 };
 function internalBinding(name) {

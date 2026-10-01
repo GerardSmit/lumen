@@ -538,9 +538,43 @@ function complete(req, err, value) {
       throw e;
     });
   }
+  process._tickCallback();
 }
+// libuv's request names, where Node's sync trace events use the syscall's own name.
+const syncTraceNames = { scandir: "readdir", utime: "utimes", futime: "futimes", lutime: "lutimes" };
+let traceAsyncId = 0;
 // Run one binding call in the mode `req`/`ctx` select (see the header comment).
 function dispatch(req, ctx, syscall, path, dest, sync, async, post) {
+  if (__traceEvent === null) return dispatchRun(req, ctx, syscall, path, dest, sync, async, post);
+  const dir = syscall === "opendir" || syscall === "closedir";
+  const data = path === undefined ? undefined : { path: displayPath(path) };
+  if (req === undefined) {
+    const category = "node,node.fs,node.fs.sync";
+    const name = `fs.sync.${syncTraceNames[syscall] ?? syscall}`;
+    __traceEvent(category, "B", name, undefined, data);
+    try {
+      return dispatchRun(req, ctx, syscall, path, dest, sync, async, post);
+    } finally {
+      __traceEvent(category, "E", name);
+    }
+  }
+  const category = dir ? "node,node.fs_dir,node.fs_dir.async" : "node,node.fs,node.fs.async";
+  const id = ++traceAsyncId;
+  __traceEvent(category, "b", syscall, id, data);
+  const end = () => __traceEvent(category, "e", syscall, id);
+  const traced = () => {
+    try {
+      const promise = async();
+      promise.then(end, end);
+      return promise;
+    } catch (e) {
+      end();
+      throw e;
+    }
+  };
+  return dispatchRun(req, ctx, syscall, path, dest, sync, traced, post);
+}
+function dispatchRun(req, ctx, syscall, path, dest, sync, async, post) {
   if (req === undefined) {
     let result;
     try {

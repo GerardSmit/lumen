@@ -718,6 +718,8 @@ function spawn(file, args, options) {
   const killSignal = sanitizeKillSignal(options.killSignal);
   const child = new ChildProcess();
   child.spawn(options);
+  const channel = __builtins.get("diagnostics_channel").channel("child_process");
+  if (channel.hasSubscribers) channel.publish({ process: child });
   if (options.timeout > 0) {
     let timeoutId = setTimeout(() => {
       if (timeoutId) {
