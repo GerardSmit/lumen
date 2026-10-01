@@ -11,7 +11,7 @@ use crate::value::{Object, Value};
 fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
     // Requires a real Set [[SetData]] slot — a Map (which shares the map_data table) is rejected.
     let p = coll_ptr_kind(i, this, Some("Set"))?;
-    Ok(i.map_data[&p].iter().map(|(k, _)| k.clone()).collect())
+    Ok(i.map_data[&p].iter().map(|(k, _)| k.unpack()).collect())
 }
 /// Build a fresh Set from `values` (deduped via SameValueZero).
 fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
@@ -154,7 +154,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // and re-append entries, and the walk observes that (appended entries are visited).
             let mut idx = 0usize;
             loop {
-                let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).cloned());
+                let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
                 let (k, _) = match entry {
                     Some(kv) => kv,
                     None => break,
@@ -233,7 +233,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         }
         let mut idx = 0usize;
         loop {
-            let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).cloned());
+            let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
             let (k, _) = match entry {
                 Some(kv) => kv,
                 None => break,
@@ -270,7 +270,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // Walk this Set LIVE by index (the `has` callback may mutate it), probing the other.
             let mut idx = 0usize;
             loop {
-                let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).cloned());
+                let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
                 let (k, _) = match entry {
                     Some(kv) => kv,
                     None => break,

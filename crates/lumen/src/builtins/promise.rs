@@ -774,7 +774,7 @@ fn combinator_fast(i: &mut Interp, t: &Value, iterable: Value, mode: u8) -> Resu
                 on_f: Value::Undefined,
                 on_r: Value::Undefined,
                 result: result.clone(),
-                context: i.async_context.clone(),
+                context: crate::value::PackedValue::pack(i.async_context.clone()),
                 kind: mode,
                 idx,
             };

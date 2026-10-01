@@ -242,7 +242,7 @@ pub(crate) fn side_analysis(
     Some(made)
 }
 
-/// Record JSDoc comment spans (chars in the lexed text) for a JavaScript source.
+/// Record JSDoc comment spans (bytes in the lexed text) for a JavaScript source.
 pub(super) fn note_js_docs(src: &SrcMap, docs: &[(u32, u32)]) {
     if docs.is_empty() {
         return;
@@ -285,7 +285,6 @@ pub(super) struct TsState {
     last_params: (usize, bool),
     pub html: bool,
     pub soft_err: Option<LexError>,
-    chars: Option<(u32, Vec<char>)>,
     // Side table (spans into the source until `finish`).
     fns: Vec<SideFn>,
     vars: Vec<(u32, Span)>,
@@ -656,7 +655,8 @@ impl Parser {
         };
         while t.undo.len() > s.undo {
             let (idx, tok) = t.undo.pop().expect("undo entry");
-            self.toks[idx] = tok;
+            Rc::make_mut(&mut self.toks)[idx] = tok;
+            self.bracket_tables = Default::default();
         }
         t.split_gt = s.split_gt;
         t.erase.truncate(s.erase);
@@ -716,30 +716,19 @@ impl Parser {
             let t = &self.toks[self.pos];
             (t.start as usize, t.line, t.nl_before)
         };
-        let (base, end) = (self.src.base, self.src.end);
-        let cached = matches!(&self.tss().chars, Some((b, _)) if *b == base);
-        if !cached {
-            let chars: Vec<char> = self.src.src[base as usize..end as usize].chars().collect();
-            self.tss().chars = Some((base, chars));
-        }
+        let (base, end) = (self.src.base as usize, self.src.end as usize);
         let html = self.tss().html;
         let lexed = {
-            let chars = &self
-                .ts
-                .as_ref()
-                .expect("ts")
-                .chars
-                .as_ref()
-                .expect("chars")
-                .1;
+            let src = self.src.src.clone();
             tokenize_opts(
-                chars.get(c..).unwrap_or(&[]),
+                src.get(base + c..end).unwrap_or(""),
                 html,
                 line,
                 LexOpts {
                     ts: true,
                     docs: false,
                     start_div: !regex,
+                    offset: c as u32,
                 },
             )
         }
@@ -748,16 +737,13 @@ impl Parser {
             line: e.line,
             at_eof: e.at_eof,
         })?;
-        let mut toks = lexed.tokens;
-        for t in &mut toks {
-            t.start += c as u32;
-            t.end += c as u32;
-        }
+        let mut toks = lexed.tokens.into_vec();
         if let Some(t) = toks.first_mut() {
             t.nl_before = nl;
         }
-        self.toks.truncate(self.pos);
-        self.toks.extend(toks);
+        let pos = self.pos;
+        self.toks_mut().truncate(pos);
+        self.toks_mut().extend(toks);
         self.tss().soft_err = lexed.soft_err;
         Ok(())
     }
@@ -781,7 +767,7 @@ impl Parser {
         let idx = self.pos;
         let gt_end = self.tb(idx).0 + 1;
         let orig = self.toks[idx].clone();
-        let tail = &mut self.toks[idx];
+        let tail = &mut self.toks_mut()[idx];
         tail.kind = Tok::Punct(rest);
         tail.start += 1;
         tail.nl_before = false;
@@ -1757,7 +1743,7 @@ impl Parser {
             let (s, _) = self.tb(i);
             let (_, e) = self.tb(end - 1);
             self.erase(s, e);
-            self.toks.drain(i..end);
+            self.toks_mut().splice(i..end, None);
             close -= end - i;
         }
     }
@@ -1830,7 +1816,8 @@ impl Parser {
                 let (s, e) = self.tb(self.pos + 2);
                 self.erase(s, e);
                 self.ts_note_abstract_quirk((s, e));
-                self.toks.remove(self.pos + 2);
+                let at = self.pos + 2;
+                self.toks_mut().remove(at);
                 return Ok(None);
             }
             if self.pw(2, "function") || (self.pw(2, "async") && self.pw(3, "function")) {
@@ -1843,7 +1830,8 @@ impl Parser {
                 let (s, e) = self.tb(self.pos + 1);
                 self.erase(s, e);
                 self.ts_note_abstract_quirk((s, e));
-                self.toks.remove(self.pos + 1);
+                let at = self.pos + 1;
+                self.toks_mut().remove(at);
                 Ok(None)
             }
             Some(kind) => {
@@ -1896,7 +1884,7 @@ impl Parser {
     }
 
     /// Set the key the next parameter list's types are recorded under (a function's source
-    /// start, in the lexed slice's chars).
+    /// start, in the lexed slice's bytes).
     pub(super) fn ts_fn_start(&mut self, start: u32) {
         let b = self.src.byte_range(start, start).map_or(0, |r| r.0);
         self.tss().fn_start = b;
@@ -2012,7 +2000,7 @@ impl Parser {
             });
             params.push(Param {
                 pattern,
-                default,
+                default: default.map(Box::new),
                 rest,
             });
             if rest || !self.eat_punct(",") {

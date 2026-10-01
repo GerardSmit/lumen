@@ -1,0 +1,81 @@
+name: Fuzz and sanitize
+
+# Scheduled hardening for untrusted-input paths (WASM decoder, snapshot decoder, JSON/RegExp/JS
+# parsers) and for memory bugs / Rc-cycle leaks:
+#   * asan: nightly Rust + AddressSanitizer over a smoke subset of the tests, and a lumen-cli
+#     build with the `system-allocator` feature so individual allocations are visible to ASan.
+#   * fuzz: each cargo-fuzz target in fuzz/ for ~5 minutes.
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      RUSTDOCFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: WASM decoder tests under ASan
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -p lumen-web wasm
+      - name: Realm cleanup tests under ASan
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -p lumen --lib realm_cleanup
+      - name: Build lumen-cli with the system allocator under ASan
+        run: cargo build -Zbuild-std --target x86_64-unknown-linux-gnu -p lumen-cli --features system-allocator
+      - name: Smoke-run the ASan build
+        run: |
+          bin=target/x86_64-unknown-linux-gnu/debug/lumen-cli
+          "$bin" -e 'JSON.parse(JSON.stringify({a:[1,2,{b:3}]})); new RegExp("(a|b)+c").test("ababc"); WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0]))'
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm_decode, json_parse, regexp_compile, js_parse, snapshot_decode]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10 -rss_limit_mb=4096
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

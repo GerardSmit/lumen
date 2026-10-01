@@ -185,8 +185,11 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         .name(format!("lumen-worker-{thread_id}"))
         // Same reasoning as the CLI's main thread: the engine recurses natively, and a debug
         // build's frames overflow the 2 MiB default long before the depth guard trips.
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_worker(spec, to_worker_rx, to_main_tx, worker_stop, kill))
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(move || {
+            lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
+            run_worker(spec, to_worker_rx, to_main_tx, worker_stop, kill)
+        })
         .expect("spawn worker thread");
 
     arm_main_inbox(ctx, MainInbox { id, rx: to_main_rx });

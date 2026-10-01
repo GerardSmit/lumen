@@ -36,15 +36,13 @@ use std::time::Duration;
 
 use lumen_host::{Ctx, SpawnHandle, Value};
 
-use crate::http::read_chunked;
+use crate::http::{read_body_exact, read_capped_line, read_chunked};
 use crate::read_header_pairs;
 
 /// A slow or idle client must not pin a pool worker forever: bound the header/body read.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Request-line + headers size cap (a hostile client can't balloon the worker).
-const MAX_HEADER_BYTES: usize = 64 << 10;
-/// Request-body cap, matching the client's response cap in `http.rs`.
-const MAX_BODY: u64 = 32 << 20;
+const MAX_HEADER_BYTES: usize = crate::http::MAX_HEADER_BYTES;
 
 /// Live servers, keyed by the id handed to JS. Lives in `OpState`; the accept decoder reads it
 /// to re-arm and the `close` op flips the `closed` flag. JS values (`dispatch`) are `!Send` and
@@ -367,7 +365,12 @@ fn accept_one(listener: &TcpListener, closed: &AtomicBool, fallback_host: &str) 
                 })
             }
             Err(msg) => {
-                let _ = write_simple(&stream, 400, "Bad Request", msg.as_bytes());
+                let (code, text) = if msg.contains("headers too large") {
+                    (431, "Request Header Fields Too Large")
+                } else {
+                    (400, "Bad Request")
+                };
+                let _ = write_simple(&stream, code, text, msg.as_bytes());
                 // Keep serving: fall through to accept the next connection.
             }
         }
@@ -383,11 +386,10 @@ fn read_request(
 ) -> Result<(String, String, Vec<(String, String)>, Vec<u8>), String> {
     let mut reader = BufReader::new(stream);
 
-    let mut request_line = String::new();
-    let n = reader
-        .read_line(&mut request_line)
+    let mut header_budget = MAX_HEADER_BYTES;
+    let request_line = read_capped_line(&mut reader, &mut header_budget)
         .map_err(|e| format!("read request line: {e}"))?;
-    if n == 0 {
+    if request_line.is_empty() {
         return Err("empty request".to_string());
     }
     let mut parts = request_line.trim_end().split(' ');
@@ -398,18 +400,11 @@ fn read_request(
     }
 
     let mut headers = Vec::new();
-    let mut header_bytes = request_line.len();
     loop {
-        let mut line = String::new();
-        let hn = reader
-            .read_line(&mut line)
+        let line = read_capped_line(&mut reader, &mut header_budget)
             .map_err(|e| format!("read headers: {e}"))?;
-        if hn == 0 {
+        if line.is_empty() {
             break; // EOF before the blank line: tolerate it
-        }
-        header_bytes += hn;
-        if header_bytes > MAX_HEADER_BYTES {
-            return Err("request headers too large".to_string());
         }
         let line = line.trim_end();
         if line.is_empty() {
@@ -447,11 +442,7 @@ fn read_request_body(
         return read_chunked(reader).map_err(|e| format!("chunked body: {e}"));
     }
     match header(headers, "content-length").and_then(|v| v.parse::<u64>().ok()) {
-        Some(len) => {
-            let mut body = vec![0u8; len.min(MAX_BODY) as usize];
-            std::io::Read::read_exact(reader, &mut body).map_err(|e| format!("read body: {e}"))?;
-            Ok(body)
-        }
+        Some(len) => read_body_exact(reader, len).map_err(|e| format!("read body: {e}")),
         // No framing on a request means no body (unlike a response, there is no read-to-EOF).
         None => Ok(Vec::new()),
     }

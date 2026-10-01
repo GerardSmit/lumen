@@ -445,12 +445,24 @@ __builtins.set("tty", {
   };
 
   const toBuf = (input, enc) => (input instanceof Uint8Array ? input : Buffer.from(input, enc));
-  const sync = (fn) => (input) => Buffer.from(fn(toBuf(input)));
+  // `maxOutputLength` caps a decompressed result (the codec stops as soon as it passes it).
+  const maxOutput = (opts) => {
+    const n = opts == null ? undefined : opts.maxOutputLength;
+    if (n === undefined) return undefined;
+    if (typeof n !== "number" || !(n >= 1 && n <= 9007199254740991) || !Number.isInteger(n)) {
+      const e = new RangeError(
+        `The value of "options.maxOutputLength" is out of range. It must be >= 1 and <= 9007199254740991. Received ${n}`);
+      e.code = "ERR_OUT_OF_RANGE";
+      throw e;
+    }
+    return n;
+  };
+  const sync = (fn) => (input, opts) => Buffer.from(fn(toBuf(input), maxOutput(opts)));
   const asyncOf = (syncFn) => (input, opts, cb) => {
-    if (typeof opts === "function") cb = opts;
+    if (typeof opts === "function") { cb = opts; opts = undefined; }
     queueMicrotask(() => {
       try {
-        cb(null, syncFn(input));
+        cb(null, syncFn(input, opts));
       } catch (e) {
         cb(e);
       }

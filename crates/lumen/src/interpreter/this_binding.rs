@@ -13,7 +13,7 @@ impl Interp {
             let parent = {
                 let b = scope.borrow();
                 if let Some(bd) = b.vars.get("this") {
-                    if bd.initialized && bd.import_ref.is_none() {
+                    if bd.initialized && !bd.import {
                         return Ok(bd.value.clone());
                     }
                     drop(b);

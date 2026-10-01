@@ -59,7 +59,7 @@ pub(crate) struct Reaction {
     /// The derived promise, `Value::Undefined` for none, or `Value::Empty` for an `await`
     /// resumption (`on_f` is then the suspended async function's promise).
     pub(crate) result: Value,
-    pub(crate) context: Value,
+    pub(crate) context: crate::value::PackedValue,
     /// `REACT_*`.
     pub(crate) kind: u8,
     /// A combinator element's index.
@@ -69,7 +69,14 @@ pub(crate) struct Reaction {
 impl Reaction {
     #[inline]
     pub(crate) fn then(on_f: Value, on_r: Value, result: Value, context: Value) -> Reaction {
-        Reaction { on_f, on_r, result, context, kind: REACT_THEN, idx: 0 }
+        Reaction {
+            on_f,
+            on_r,
+            result,
+            context: crate::value::PackedValue::pack(context),
+            kind: REACT_THEN,
+            idx: 0,
+        }
     }
 }
 
@@ -98,12 +105,17 @@ pub struct PromiseSlot {
     pub(crate) value: Value,
     /// The first pending reaction inline (most promises get at most one), the rest spilled.
     pub(crate) first: Option<Reaction>,
-    pub(crate) rest: Vec<Reaction>,
+    pub(crate) rest: Option<Box<Vec<Reaction>>>,
     /// The suspended coroutine of the async function this promise belongs to.
     pub(crate) coro: Option<Box<crate::coroutine::Coroutine>>,
     /// The combinator state when this is a `Promise.all`/`allSettled`/`any` result promise.
     pub(crate) comb: Option<Box<Combinator>>,
 }
+
+// Per pending promise / suspended async body / queued job: one small allocation class each.
+const _: () = assert!(std::mem::size_of::<PromiseSlot>() <= 112);
+const _: () = assert!(std::mem::size_of::<crate::interpreter::Job>() <= 64);
+const _: () = assert!(std::mem::size_of::<crate::coroutine::Coroutine>() <= 112);
 
 impl Clone for PromiseSlot {
     /// Cloning copies the observable state only; a coroutine is never duplicated.
@@ -128,7 +140,7 @@ impl PromiseSlot {
             tracked: false,
             value: Value::Undefined,
             first: None,
-            rest: Vec::new(),
+            rest: None,
             coro: None,
             comb: None,
         })
@@ -139,10 +151,7 @@ impl PromiseSlot {
         if self.first.is_none() {
             self.first = Some(r);
         } else {
-            if self.rest.capacity() == 0 {
-                self.rest.reserve_exact(1);
-            }
-            self.rest.push(r);
+            self.rest.get_or_insert_with(Default::default).push(r);
         }
     }
 
@@ -154,11 +163,15 @@ impl PromiseSlot {
             }
         };
         push(&self.value);
-        for r in self.first.iter().chain(self.rest.iter()) {
+        for r in self
+            .first
+            .iter()
+            .chain(self.rest.iter().flat_map(|v| v.iter()))
+        {
             push(&r.on_f);
             push(&r.on_r);
             push(&r.result);
-            push(&r.context);
+            push(&r.context.get());
         }
         if let Some(c) = &self.comb {
             for v in &c.values {
@@ -487,14 +500,14 @@ impl Interp {
     /// instead (no function objects, no derived promise). Otherwise call `then` for real.
     pub(crate) fn run_thenable_job(&mut self, job: Job) {
         let (then, thenable, promise) = (job.handler, job.value, job.result);
-        let outer = std::mem::replace(&mut self.async_context, job.context);
+        let outer = std::mem::replace(&mut self.async_context, job.context.into_value());
         if let Value::Obj(t) = &thenable {
             if self.is_intrinsic_then(&then) && crate::builtins::promise_then_is_silent(self, &thenable) {
                 let reaction = Reaction {
                     on_f: Value::Undefined,
                     on_r: Value::Undefined,
                     result: promise,
-                    context: self.async_context.clone(),
+                    context: crate::value::PackedValue::pack(self.async_context.clone()),
                     kind: REACT_THEN,
                     idx: 0,
                 };
@@ -535,7 +548,7 @@ impl Interp {
                 fulfilled: true,
                 kind: JOB_REACTION,
                 idx: 0,
-                context: self.async_context.clone(),
+                context: crate::value::PackedValue::pack(self.async_context.clone()),
             });
             return Ok(());
         }
@@ -660,7 +673,7 @@ impl Interp {
         if self.gc_check_amortized().is_err() {
             return;
         }
-        let outer = std::mem::replace(&mut self.async_context, job.context);
+        let outer = std::mem::replace(&mut self.async_context, job.context.into_value());
         let signal = if job.fulfilled {
             crate::coroutine::Resume::Next(job.value)
         } else {

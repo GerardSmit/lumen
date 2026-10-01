@@ -1736,13 +1736,13 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         it.def_method(&ta_proto, name, len, *f);
     }
     // %TypedArray%.prototype.toString is the very same function object as %Array.prototype.toString%.
-    if let Some(p) = it.array_proto.borrow().props.get("toString").cloned() {
+    if let Some(p) = it.array_proto.borrow().props.get("toString").map(|p| p.clone()) {
         ta_proto.borrow_mut().props.insert("toString", p);
     }
     // %TypedArray%.prototype[@@iterator] is the same function object as its own `values`.
     if let Some(sym) = it.iterator_sym.clone() {
         let k = Interp::sym_key(&sym);
-        let values_prop = ta_proto.borrow().props.get("values").cloned();
+        let values_prop = ta_proto.borrow().props.get("values").map(|p| p.clone());
         if let Some(p) = values_prop {
             ta_proto.borrow_mut().props.insert(k, p);
         }

@@ -11,7 +11,7 @@ use super::{with_gc_state, Callable, Property};
 #[derive(Default, Debug)]
 pub(crate) struct HeapWalk {
     /// Per slot class: `(chunks, used slots, slots ever handed out, slot size)`.
-    pub slab: [(usize, usize, usize, usize); 4],
+    pub slab: [(usize, usize, usize, usize); super::heap::CLASSES],
     pub objects: usize,
     pub user_fns: usize,
     /// Owned property entries (len, capacity) — shared template blocks excluded.

@@ -90,6 +90,7 @@ pub(crate) unsafe extern "C" fn new_plan_helper(
     if !cell.plan.guards_ok() {
         return 0;
     }
+    i.materialize_fn(c);
     let proto = match crate::bytecode::class_fields::own_prototype(c) {
         Some(Value::Obj(p)) => p,
         // (Single realm: GetFunctionRealm is the current one.)

@@ -51,9 +51,8 @@ fn collection_inside_a_coroutine_sees_the_whole_heap() {
     }
 }
 
-/// Backtracking recursion is capped so a pathological pattern cannot overflow the stack, but a
-/// benign pattern over a long input (a 60 KB base64 body, a CDP message) needs one frame per
-/// character. The matcher retries on a thread with a deep stack instead of returning "no match".
+/// A benign pattern over a long input (a 60 KB base64 body, a CDP message) must match, while a
+/// pathological one exhausts the backtracking budget and throws instead of answering wrong.
 #[test]
 fn regex_retries_long_inputs_on_a_deep_stack() {
     // The capped attempt alone needs more than a test thread's 2 MiB; the CLI runs on a bigger
@@ -74,7 +73,9 @@ fn regex_long_inputs() {
         const m = /^(?:x|y)+$/.exec("xy".repeat(20_000));
         assert(m && m[0].length === 40_000, "alternation over a long input");
         assert("q".repeat(50_000).replace(/(q)/g, "$1$1").length === 100_000, "global replace");
-        assert(/^(a+)+b$/.test("a".repeat(40)) === false, "pathological pattern still terminates");
+        let threw = null;
+        try { /^(a+)+b$/.test("a".repeat(40)); } catch (e) { threw = e; }
+        assert(threw instanceof RangeError, "pathological pattern throws instead of answering wrong");
     "#,
     );
 }

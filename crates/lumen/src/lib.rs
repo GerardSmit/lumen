@@ -7,7 +7,7 @@
 //!
 //! ## Shape
 //! - [`lexer`] tokenizes, [`parser`] builds the [`ast`], [`interpreter`] + `eval` walk it.
-//! - [`value`] is the prototype-based object model (`Rc<RefCell<Object>>`, reference-counted — no
+//! - [`value`] is the prototype-based object model (`Gc` (`ObjCell`), reference-counted — no
 //!   real GC yet, so reference cycles leak; fine for the per-test runner).
 //! - [`builtins`] installs the realm (`globalThis`, `Object`/`Array`/`Function`/`Math`, the error
 //!   constructors, global functions).
@@ -63,6 +63,8 @@ mod regex_emoji;
 mod regex_fold;
 mod snapshot;
 mod split_view;
+mod str_index;
+mod stack;
 mod sync_callbacks;
 mod temporal;
 mod token;
@@ -147,6 +149,7 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 }
 
 pub use parser::with_eager_bodies;
+pub use stack::{set_thread_stack_size, THREAD_STACK_SIZE};
 
 /// A JS string's text as well-formed UTF-8 (lone surrogates become U+FFFD): what encoders
 /// such as `TextEncoder` write, as opposed to the engine's internal form.
@@ -206,7 +209,11 @@ pub fn collect_disposed_realms() {
 }
 
 #[cfg(test)]
+mod limits_tests;
+#[cfg(test)]
 mod realm_cleanup_tests;
+#[cfg(test)]
+mod stack_tests;
 
 impl Default for Engine {
     fn default() -> Self {
@@ -214,10 +221,34 @@ impl Default for Engine {
     }
 }
 
+thread_local! {
+    static LIVE_ENGINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Dropping the last engine on a thread collects the cycles its realm leaves behind (closures,
+/// prototypes, the intrinsics themselves), as [`collect_disposed_realms`] does. While another
+/// engine on the thread is alive it may be mid-evaluation, so collection waits for the last one.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let last = LIVE_ENGINES
+            .try_with(|n| {
+                n.set(n.get().saturating_sub(1));
+                n.get() == 0
+            })
+            .unwrap_or(false);
+        if !last || std::thread::panicking() || !value::gc_state_alive() {
+            return;
+        }
+        drop(std::mem::replace(&mut self.interp, Interp::uninitialized()));
+        self.interp.gc_collect();
+    }
+}
+
 impl Engine {
     pub fn new() -> Engine {
         interpreter::sym_for_reset();
         let _mem = memstats::enter(memstats::Cat::Builtins);
+        let _ = LIVE_ENGINES.try_with(|n| n.set(n.get() + 1));
         Engine {
             interp: Interp::new(),
         }
@@ -434,6 +465,7 @@ impl Engine {
     /// promise reactions run.
     pub fn set_interrupt(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.interp.interrupt = Some(flag);
+        self.interp.sync_regex_poll();
     }
 
     /// Lower this realm's live-object ceiling (default [`interpreter::MAX_LIVE`]). With an
@@ -444,12 +476,36 @@ impl Engine {
         self.interp.gc_next = self.interp.gc_next.min(self.interp.live_limit);
     }
 
+    /// Cap the bytes the process holds through [`fastalloc::ClassAlloc`] (0 removes the cap).
+    /// Past it, the next safe point (a call, a loop turn, every few thousand turns of a native
+    /// loop, or a large allocation request) first collects, then throws a catchable
+    /// `RangeError: JavaScript heap out of memory` and grants a headroom (an eighth of the
+    /// limit, at least 16 MiB) for the handler; exceeding the headroom too throws again, or
+    /// terminates the realm when an interrupt is set (see [`Engine::heap_limit_hit`]).
+    ///
+    /// The count is process-wide (every realm and thread allocating through `ClassAlloc`) and
+    /// only works when `ClassAlloc` is the `#[global_allocator]`; see [`Engine::heap_bytes`].
+    pub fn set_heap_limit(&mut self, bytes: usize) {
+        self.interp.heap_limit = bytes;
+        self.interp.heap_ceiling = bytes;
+        self.interp.sync_regex_poll();
+    }
+
+    /// Bytes currently allocated through [`fastalloc::ClassAlloc`] by the whole process, or
+    /// `None` when it is not the global allocator (a heap limit then has no effect).
+    pub fn heap_bytes() -> Option<usize> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return fastalloc::heap_bytes();
+        #[cfg(target_arch = "wasm32")]
+        None
+    }
+
     /// Whether this realm has been terminated (interrupt or live-object ceiling).
     pub fn is_terminated(&self) -> bool {
         self.interp.terminating
     }
 
-    /// Whether the termination came from the live-object ceiling.
+    /// Whether the termination came from the live-object ceiling or the heap limit.
     pub fn heap_limit_hit(&self) -> bool {
         self.interp.heap_limit_hit
     }
@@ -685,8 +741,13 @@ impl Engine {
         if self.interp.unhandled_rejections.is_empty() {
             return Vec::new();
         }
-        std::mem::take(&mut self.interp.unhandled_rejections)
+        let mut rejections: Vec<_> = std::mem::take(&mut self.interp.unhandled_rejections)
             .into_values()
+            .collect();
+        rejections.sort_unstable_by_key(|r| r.2);
+        rejections
+            .into_iter()
+            .map(|(promise, reason, _)| (promise, reason))
             .collect()
     }
 

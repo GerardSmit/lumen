@@ -536,7 +536,10 @@ pub(super) fn install_bigint(it: &mut Interp) {
                 r as u32
             }
         };
-        Ok(Value::from_string(n.to_string_radix(radix)))
+        match ab(i.bigint_to_string(&n, radix))? {
+            Some(s) => Ok(Value::from_string(s)),
+            None => Err(i.make_error("RangeError", "Invalid string length")),
+        }
     });
     it.def_method(&proto, "valueOf", 0, |i, this, _| {
         Ok(Value::BigInt(this_bigint(i, &this)?))
@@ -583,45 +586,16 @@ pub(super) fn install_bigint(it: &mut Interp) {
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
     it.def_method(&ctor, "asIntN", 2, |i, _t, a| {
-        use crate::bigint::JsBigInt;
         let bits = to_index(i, &arg(a, 0))? as u64;
         let n = to_bigint(i, &arg(a, 1))?;
-        if bits == 0 {
-            return Ok(Value::BigInt(JsBigInt::zero()));
-        }
-        // A width beyond any plausible magnitude: the value is already in range (or the result
-        // would be too large to represent).
-        if bits > (1 << 26) {
-            if (n.bit_len() as u64) < bits {
-                return Ok(Value::BigInt(n));
-            }
-            return Err(i.make_error("RangeError", "BigInt is too large to allocate"));
-        }
-        // n mod 2^bits via two's-complement masking, then subtract 2^bits if the sign bit is set.
-        let m = JsBigInt::from_u64(1).shl(bits);
-        let r = n.bitand(&m.sub(&JsBigInt::from_u64(1)));
-        let half = JsBigInt::from_u64(1).shl(bits - 1);
-        Ok(Value::BigInt(if r.cmp(&half).is_lt() {
-            r
-        } else {
-            r.sub(&m)
-        }))
+        Ok(Value::BigInt(n.as_int_n(bits)))
     });
     it.def_method(&ctor, "asUintN", 2, |i, _t, a| {
-        use crate::bigint::JsBigInt;
         let bits = to_index(i, &arg(a, 0))? as u64;
         let n = to_bigint(i, &arg(a, 1))?;
-        if bits == 0 {
-            return Ok(Value::BigInt(JsBigInt::zero()));
-        }
-        if bits > (1 << 26) {
-            if !n.is_negative() && (n.bit_len() as u64) <= bits {
-                return Ok(Value::BigInt(n));
-            }
-            return Err(i.make_error("RangeError", "BigInt is too large to allocate"));
-        }
-        let mask = JsBigInt::from_u64(1).shl(bits).sub(&JsBigInt::from_u64(1));
-        Ok(Value::BigInt(n.bitand(&mask)))
+        n.as_uint_n(bits)
+            .map(Value::BigInt)
+            .map_err(|e| i.make_error("RangeError", e.message()))
     });
     set_builtin(&it.global, "BigInt", Value::Obj(ctor));
 

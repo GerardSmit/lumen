@@ -38,6 +38,9 @@ pub struct VmCtx {
     mem_addr: Option<usize>,
     error: Option<String>,
     depth: u32,
+    /// The store call depth of the innermost native entry, so calls back into the store through
+    /// [`h_call_slow`] keep counting toward the store's limit.
+    call_depth: usize,
 }
 
 const _: () = {
@@ -184,6 +187,7 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
         mem_addr: inst.mem_addrs.first().copied(),
         error: None,
         depth: 0,
+        call_depth: 0,
     });
     let vmp = &mut *vm as *mut VmCtx as u64;
     let slots = addrs[..nfuncs]
@@ -192,10 +196,12 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
         .collect();
     let bridge_slots = generic
         .iter()
-        .map(|g| g.map(|i| FuncSlot {
-            code: addrs[i],
-            vmctx: vmp,
-        }))
+        .map(|g| {
+            g.map(|i| FuncSlot {
+                code: addrs[i],
+                vmctx: vmp,
+            })
+        })
         .collect();
     if log() {
         let n = is_body.iter().filter(|&&b| b).count();
@@ -221,7 +227,12 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
         slots,
         bridge_slots,
         _globals: globals,
-        by_addr: inst.func_addrs.iter().enumerate().map(|(i, &a)| (a, i)).collect(),
+        by_addr: inst
+            .func_addrs
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| (a, i))
+            .collect(),
         tramps: HashMap::new(),
     }))
 }
@@ -236,6 +247,7 @@ pub fn invoke(
     func_addr: usize,
     args: &[Val],
     host: &mut dyn Host,
+    depth: usize,
 ) -> Option<Result<Vec<Val>, String>> {
     let ni: *mut NativeInstance = &mut **store.native.get_mut(inst_idx)?.as_mut()?;
     let store: *mut Store = store;
@@ -263,8 +275,9 @@ pub fn invoke(
     slots.extend(args.iter().map(|v| v.to_bits()));
     let rc = unsafe {
         let v = &mut *vm;
-        let saved = (v.store, v.host);
+        let saved = (v.store, v.host, v.call_depth);
         v.store = store;
+        v.call_depth = depth;
         v.host = &mut host as *mut &mut dyn Host as *mut ();
         if v.depth == 0 {
             v.stack_limit = stack_limit();
@@ -277,7 +290,7 @@ pub fn invoke(
         guard::restore_target(prev);
         let v = &mut *vm;
         v.depth -= 1;
-        (v.store, v.host) = saved;
+        (v.store, v.host, v.call_depth) = saved;
         rc
     };
     let ty = &ni.types[f];
@@ -311,7 +324,8 @@ unsafe fn sync_mem(vm: &mut VmCtx) {
     }
 }
 
-/// Run `f` so a panic cannot unwind through native frames: it becomes a helper trap.
+/// Run `f` so a panic cannot unwind through native frames: it becomes a helper trap. Release
+/// builds abort on panic, so helpers must not rely on this: they bounds-check everything.
 fn guarded<R>(vm: *mut VmCtx, fail: R, f: impl FnOnce(&mut VmCtx, &mut Store) -> R) -> R {
     let r = catch_unwind(AssertUnwindSafe(|| unsafe {
         let vm = &mut *vm;
@@ -360,20 +374,31 @@ extern "C" fn h_fill(vm: *mut VmCtx, d: i32, v: i32, n: i32) -> i32 {
 
 extern "C" fn h_resolve(vm: *mut VmCtx, type_idx: i32, table: i32, elem: i32) -> i64 {
     guarded(vm, trap::HELPER as i64, |vm, store| {
-        let inst = &store.instances[vm.inst];
-        let Some(&ta) = inst.table_addrs.get(table as usize) else {
+        let Some(inst) = store.instances.get(vm.inst) else {
+            return trap::HELPER as i64;
+        };
+        let Some(&ta) = inst.table_addrs.get(table as u32 as usize) else {
             return trap::TABLE_OOB as i64;
         };
-        let Some(e) = store.tables[ta].elems.get(elem as u32 as usize) else {
+        let Some(e) = store
+            .tables
+            .get(ta)
+            .and_then(|t| t.elems.get(elem as u32 as usize))
+        else {
             return trap::TABLE_OOB as i64;
         };
         let Some(fa) = *e else {
             return trap::NULL_ELEMENT as i64;
         };
-        let expected = &inst.module.types[type_idx as usize];
-        let (actual, target_inst) = match &store.funcs[fa] {
-            FuncEntity::Wasm { compiled, instance } => (&compiled.ty, Some(*instance)),
-            FuncEntity::Host { ty, .. } => (ty, None),
+        let type_idx = type_idx as u32 as usize;
+        let Some(expected) = inst.module.types.get(type_idx) else {
+            vm.error = Some("wasm: bad type index".into());
+            return trap::HELPER as i64;
+        };
+        let (actual, target_inst) = match store.funcs.get(fa) {
+            Some(FuncEntity::Wasm { compiled, instance }) => (&compiled.ty, Some(*instance)),
+            Some(FuncEntity::Host { ty, .. }) => (ty, None),
+            None => return trap::TABLE_OOB as i64,
         };
         if actual.params != expected.params || actual.results != expected.results {
             return trap::SIGNATURE_MISMATCH as i64;
@@ -381,12 +406,19 @@ extern "C" fn h_resolve(vm: *mut VmCtx, type_idx: i32, table: i32, elem: i32) ->
         if let Some(ti) = target_inst {
             if let Some(Some(nt)) = store.native.get(ti) {
                 if let Some(&local) = nt.by_addr.get(&fa) {
-                    return &nt.slots[local] as *const FuncSlot as i64;
+                    if let Some(slot) = nt.slots.get(local) {
+                        return slot as *const FuncSlot as i64;
+                    }
                 }
             }
         }
-        let caller = store.native[vm.inst].as_ref().expect("native caller");
-        match &caller.bridge_slots[type_idx as usize] {
+        let bridge = store
+            .native
+            .get(vm.inst)
+            .and_then(|c| c.as_ref())
+            .and_then(|c| c.bridge_slots.get(type_idx))
+            .and_then(|s| s.as_ref());
+        match bridge {
             Some(slot) => {
                 vm.pending = fa as u64;
                 slot as *const FuncSlot as i64
@@ -402,22 +434,33 @@ extern "C" fn h_resolve(vm: *mut VmCtx, type_idx: i32, table: i32, elem: i32) ->
 extern "C" fn h_call_slow(vm: *mut VmCtx) -> i32 {
     guarded(vm, 1, |vm, store| {
         let callee = vm.pending as usize;
-        let ty = store.funcs[callee].ty();
+        let Some(ty) = store.funcs.get(callee).map(|f| f.ty()) else {
+            vm.error = Some("wasm: bad function index".into());
+            return 1;
+        };
+        if ty.params.len().max(ty.results.len()) > vm.args.len() {
+            vm.error = Some("wasm: too many parameters for a bridge".into());
+            return 1;
+        }
         let args = ty
             .params
             .iter()
-            .enumerate()
-            .map(|(i, &t)| Val::from_bits(t, vm.args[i]))
+            .zip(&vm.args)
+            .map(|(&t, &b)| Val::from_bits(t, b))
             .collect();
         let host = unsafe { &mut *(vm.host as *mut &mut dyn Host) };
-        let r = store.invoke(callee, args, *host, 0);
+        let r = store.invoke(callee, args, *host, vm.call_depth + 1);
         unsafe { sync_mem(vm) };
         match r {
-            Ok(vals) => {
-                for (i, v) in vals.iter().enumerate() {
-                    vm.args[i] = v.to_bits();
+            Ok(vals) if vals.len() <= vm.args.len() => {
+                for (slot, v) in vm.args.iter_mut().zip(&vals) {
+                    *slot = v.to_bits();
                 }
                 0
+            }
+            Ok(_) => {
+                vm.error = Some("wasm: too many results for a bridge".into());
+                1
             }
             Err(e) => {
                 vm.error = Some(e);

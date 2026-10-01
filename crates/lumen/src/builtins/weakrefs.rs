@@ -145,7 +145,7 @@ impl Interp {
                 fulfilled: true,
                 kind: 0,
                 idx: 0,
-                context: Value::Undefined,
+                context: crate::value::PackedValue::pack(Value::Undefined),
             });
             queued = true;
         }

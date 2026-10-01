@@ -36,7 +36,7 @@ fn read(i: &Interp, this: &Value, key: &Value, id: u8) -> Result<Value, Value> {
         },
     )?;
     Ok(if id == MAP_GET {
-        entries.lookup(key).cloned().unwrap_or(Value::Undefined)
+        entries.lookup(key).unwrap_or(Value::Undefined)
     } else {
         Value::Bool(entries.contains(key))
     })
@@ -69,7 +69,7 @@ pub(crate) fn coll_fast(
     let n = nat as usize;
     let is = |f: crate::value::NativeFn| n == f as usize;
     match data.kind() {
-        CollectionKind::Map if is(map_get) => Some(data.lookup(key).cloned().unwrap_or(Value::Undefined)),
+        CollectionKind::Map if is(map_get) => Some(data.lookup(key).unwrap_or(Value::Undefined)),
         CollectionKind::Map if is(map_has) => Some(Value::Bool(data.contains(key))),
         CollectionKind::Set if is(set_has) => Some(Value::Bool(data.contains(key))),
         CollectionKind::Map if is(super::insert::map_set) => {

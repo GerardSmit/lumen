@@ -2,7 +2,7 @@
 use super::{ab, map_ptr};
 use crate::{
     interpreter::Interp,
-    value::{Exotic, Property, Value},
+    value::{Exotic, Value},
 };
 
 pub(super) fn fast(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -31,7 +31,7 @@ fn own_state(this: &Value) -> Option<State> {
         b.props
             .get(key)
             .filter(|p| !p.accessor())
-            .map(Property::value)
+            .map(|p| p.value())
     };
     let target = data("__ai_target")?;
     if matches!(target, Value::Undefined) {
@@ -193,7 +193,7 @@ fn target_len(i: &mut Interp, target: &Value) -> Result<usize, Value> {
                         n.min(9007199254740991.0) as usize
                     }
                 }
-                Value::Str(s) => crate::jstr::unit_len(s),
+                Value::Str(s) => i.str_len(s),
                 _ => 0,
             }
         },

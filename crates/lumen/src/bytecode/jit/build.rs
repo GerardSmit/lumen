@@ -2069,6 +2069,19 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.reset_vars(&vars);
     }
 
+    /// Reset the typed-array view caches: a closure whose `.prototype` is still lazy clears
+    /// `ic_plain` too, so a fresh one at a swept typed array's address must not match a cached
+    /// handle.
+    fn invalidate_ta(&mut self) {
+        let vars: Vec<(Variable, Type)> = self
+            .ta_vars
+            .values()
+            .map(|t| (t.obj, PTR))
+            .chain(self.ta_len_vars.values().map(|t| (t.obj, PTR)))
+            .collect();
+        self.reset_vars(&vars);
+    }
+
     /// Reset the element-storage views and in-bounds facts only (an array grew or shrank
     /// natively; no JS ran).
     fn invalidate_elems(&mut self) {
@@ -2328,6 +2341,18 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.drop_mem(sp, o);
     }
 
+    /// Take a reference on the object or string at `gc` (its `u32` strong count at `so`); a
+    /// saturated count stays put.
+    fn retain_inline(&mut self, gc: V, so: i32) {
+        let strong = self.fb.load(MemKind::I32, gc, so);
+        let one = self.i32c(1);
+        let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
+        let zero = self.i32c(0);
+        let wrapped = self.fb.icmp(IntCC::Eq, s1, zero);
+        let kept = self.fb.select(wrapped, strong, s1);
+        self.fb.store(MemKind::I32, gc, kept, so);
+    }
+
     /// [`Tr::drop_at`] for the `Value` at `base + o` (a frame slot or stack entry).
     fn drop_mem(&mut self, base: V, o: i32) {
         let tag = self.fb.load(MemKind::I32U8, base, o);
@@ -2357,20 +2382,23 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.switch_to_block(obj_b);
         let gc = self.fb.load(PTR_MEM, base, o + VALUE_PAYLOAD);
         let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
-        let strong = self.fb.load(PTR_MEM, gc, so);
-        let one = self.ptrc(1);
-        let last = self.fb.icmp(IntCC::Ule, strong, one);
+        let strong = self.fb.load(MemKind::I32, gc, so);
+        // Slow for the last reference (0 / 1) and for a saturated count (`u32::MAX`, which
+        // never changes): all three sit at the top of the range after subtracting 2.
+        let two = self.i32c(2);
+        let s2 = self.fb.binary(BinaryOp::Isub, strong, two);
+        let edge = self.i32c(u32::MAX as i64 - 2);
+        let last = self.fb.icmp(IntCC::Uge, s2, edge);
         // An object going down to one reference may be half of a function / `.prototype`
         // pair the reference count frees (`Gc`'s drop): the Rust release checks. Branch-free:
-        // the word after a string's count (its length and capacity) is readable too, and
-        // `is_obj` masks it out.
-        let two = self.ptrc(2);
-        let is2 = self.fb.icmp(IntCC::Eq, strong, two);
-        let w = self.fb.load(PTR_MEM, gc, crate::value::GC_WEAK_OFFSET as i32);
-        let flag = self.ptrc(crate::value::FN_PAIR_FLAG as i64);
+        // the word after a string's count (its length) is readable too, and `is_obj` masks it
+        // out.
+        let zero = self.i32c(0);
+        let is2 = self.fb.icmp(IntCC::Eq, s2, zero);
+        let w = self.fb.load(MemKind::I32, gc, crate::value::GC_WEAK_OFFSET as i32);
+        let flag = self.i32c(crate::value::FN_PAIR_FLAG as i64);
         let fl = self.fb.binary(BinaryOp::Band, w, flag);
-        let zp = self.ptrc(0);
-        let paired = self.fb.icmp(IntCC::Ne, fl, zp);
+        let paired = self.fb.icmp(IntCC::Ne, fl, zero);
         let maybe = self.fb.binary(BinaryOp::Band, is2, is_obj);
         let pair = self.fb.binary(BinaryOp::Band, maybe, paired);
         let slow = self.fb.binary(BinaryOp::Bor, last, pair);
@@ -2378,8 +2406,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(dec_b);
         self.fb.seal_block(call_b);
         self.fb.switch_to_block(dec_b);
+        let one = self.i32c(1);
         let s1 = self.fb.binary(BinaryOp::Isub, strong, one);
-        self.fb.store(PTR_MEM, gc, s1, so);
+        self.fb.store(MemKind::I32, gc, s1, so);
         let u = self.i32c(TAG_UNDEFINED as i64);
         self.fb.store(MemKind::I32U8, base, u, o);
         self.fb.jump(cont, &[]);
@@ -3631,6 +3660,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.sptr(d),
             );
             self.call(Helper::MakeClosureIn, &[self.frame, sv, kv, nv, dst]);
+            self.invalidate_ta();
             self.stack.push(Entry::Boxed);
             return Ok(());
         }
@@ -3927,6 +3957,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.max_stack = self.max_stack.max(d + 1);
                 let (kv, nv, dst) = (self.i32c(k as i64), self.i32c(n as i64), self.sptr(d));
                 self.call(Helper::MakeClosure, &[self.frame, kv, nv, dst]);
+                self.invalidate_ta();
                 self.stack.push(Entry::Boxed);
             }
             Op::MakeArray(n) | Op::MakeObject(_, n, _) => {
@@ -4614,10 +4645,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.switch_to_block(inc_b);
         let gc = self.fb.load(PTR_MEM, src, VALUE_PAYLOAD);
         let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
-        let strong = self.fb.load(PTR_MEM, gc, so);
-        let one = self.ptrc(1);
-        let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
-        self.fb.store(PTR_MEM, gc, s1, so);
+        self.retain_inline(gc, so);
         self.fb.jump(copy_b, &[]);
         self.fb.seal_block(copy_b);
 
@@ -7604,10 +7632,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.convert(ConvOp::Wrap, PTR, w)
             };
             let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
-            let strong = self.fb.load(PTR_MEM, gc, so);
-            let one = self.ptrc(1);
-            let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
-            self.fb.store(PTR_MEM, gc, s1, so);
+            self.retain_inline(gc, so);
             if let Some(i) = drop {
                 self.drop_at(i);
             }
@@ -7682,10 +7707,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.convert(ConvOp::Wrap, PTR, w)
         };
         let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
-        let strong = self.fb.load(PTR_MEM, gc, so);
-        let one = self.ptrc(1);
-        let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
-        self.fb.store(PTR_MEM, gc, s1, so);
+        self.retain_inline(gc, so);
         if let Some(i) = drop {
             self.drop_at(i);
         }
@@ -8315,10 +8337,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.seal_block(call_b);
                     self.fb.switch_to_block(inc_b);
                     let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
-                    let strong = self.fb.load(PTR_MEM, payload, so);
-                    let one = self.ptrc(1);
-                    let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
-                    self.fb.store(PTR_MEM, payload, s1, so);
+                    self.retain_inline(payload, so);
                     let objt = self.i32c(TAG_OBJ as i64);
                     let strt = self.i32c(TAG_STR as i64);
                     let tag = self.fb.select(is_obj, objt, strt);

@@ -1,0 +1,56 @@
+name: CI
+
+# Workspace-wide checks: tests for every crate (jit.yml additionally runs the engine tests across
+# the OS/arch matrix) and clippy. Complements fuzz.yml (scheduled fuzzing + AddressSanitizer).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenSSL headers (lumen-tls links the system OpenSSL on Unix)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Download V8 benchmark test fixtures
+        env:
+          V8_BENCHMARK_REV: 0e2160885d0ca693577d54f1bbbe572f052282c6
+        run: |
+          mkdir -p v8-v7
+          for fixture in base.js richards.js; do
+            curl --fail --silent --show-error --location \
+              "https://raw.githubusercontent.com/mozilla/arewefastyet/${V8_BENCHMARK_REV}/benchmarks/v8-v7/${fixture}" \
+              --output "v8-v7/${fixture}"
+          done
+      # test262-runner and node-compat-runner drive the external test262 / node test suites, which
+      # are cloned on demand by scripts/ and are not available in CI.
+      - run: cargo test --workspace --exclude test262-runner --exclude node-compat-runner
+
+  clippy:
+    runs-on: ubuntu-latest
+    # The workspace does not yet pass `clippy -D warnings` (about 120 warnings). Report them
+    # without blocking; once the count reaches zero, drop continue-on-error and add `-- -D warnings`.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: cargo clippy --workspace --all-targets

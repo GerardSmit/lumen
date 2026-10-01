@@ -1,8 +1,9 @@
-//! Hand-written tokenizer. Produces the full `Vec<Token>` up front (scripts are small enough that
-//! streaming buys nothing) and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
+//! Hand-written tokenizer over the UTF-8 source (token offsets are bytes). Produces the full
+//! token list up front and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
 
-use crate::token::{RegexTok, Tok, Token, TplPart};
+use crate::token::{Name, RegexTok, SubToks, Tok, TokVec, Token, TplPart};
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub struct LexError {
@@ -14,10 +15,12 @@ pub struct LexError {
 }
 
 struct Lexer<'a> {
-    chars: &'a [char],
+    src: &'a str,
+    bytes: &'a [u8],
+    /// Byte offset of the cursor in `src`.
     pos: usize,
     line: u32,
-    out: Vec<Token>,
+    out: TokVec,
     nl_pending: bool,
     /// Script goal: Annex B HTML-like comments are recognised. Off for modules.
     html_comments: bool,
@@ -28,7 +31,7 @@ struct Lexer<'a> {
     /// One entry per open `{`: `true` if it opened a block/function body (statement position),
     /// `false` if an object literal (expression position). Used to disambiguate a `/` after `}`.
     brace_stack: Vec<bool>,
-    /// Char offset where the token currently being scanned began.
+    /// Byte offset where the token currently being scanned began.
     tok_start: usize,
     /// Classification of the most recently closed `}` (`true` = a block). A `/` after a block-closing
     /// `}` begins a regex; after an object-literal-closing `}` it is division.
@@ -47,47 +50,42 @@ struct Lexer<'a> {
     /// TypeScript source: a postfix non-null `!` (`x!`) ends an expression, so a `/` after it is
     /// a division.
     ts: bool,
-    /// Where `/**` comments go (their char ranges), when the caller asked for them (the typed
+    /// Where `/**` comments go (their byte ranges), when the caller asked for them (the typed
     /// tier's JSDoc side table). Only a JSDoc comment costs anything.
     docs: Option<Vec<(u32, u32)>>,
     /// The range starts in operator position: a leading `/` is a division (the parser re-lexing a
     /// regex it met where an operator belongs).
     start_div: bool,
+    /// Identifier names seen so far (see `Tok::Ident`).
+    idents: crate::fasthash::FastSet<Name>,
+    /// See [`LexOpts::offset`].
+    offset: u32,
 }
 
 /// Tokenize `src`. A lex error is reported as a SyntaxError by the caller.
 pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_goal(src, true)
+    tokenize_goal(src, true).map(TokVec::into_vec)
 }
 
 /// Tokenize with an explicit goal: `html_comments` is true for Scripts (Annex B `<!--`/`-->`
 /// comments apply) and false for Modules (where they are ordinary punctuation, i.e. errors).
-pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexError> {
-    let chars: Vec<char> = src.chars().collect();
-    tokenize_chars(&chars, html_comments, 1)
+pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<TokVec, LexError> {
+    tokenize_range(src, html_comments, 1)
 }
 
 /// Tokenize a range cut out of a larger source (a function body parsed lazily): `line` is the
 /// line its first char is on, so the tokens carry the same lines they would have had in a
-/// whole-file tokenization. Token offsets are chars into `chars`; the parser maps them back
+/// whole-file tokenization. Token offsets are bytes into `src`; the parser maps them back
 /// to byte offsets in the whole file. The range must start at a token boundary where no
 /// regex/division ambiguity carries over — a body's `{` does.
-pub fn tokenize_range(
-    chars: &[char],
-    html_comments: bool,
-    line: u32,
-) -> Result<Vec<Token>, LexError> {
-    tokenize_chars(chars, html_comments, line)
-}
-
-fn tokenize_chars(chars: &[char], html_comments: bool, line: u32) -> Result<Vec<Token>, LexError> {
-    tokenize_opts(chars, html_comments, line, LexOpts::default()).map(|l| l.tokens)
+pub fn tokenize_range(src: &str, html_comments: bool, line: u32) -> Result<TokVec, LexError> {
+    tokenize_opts(src, html_comments, line, LexOpts::default()).map(|l| l.tokens)
 }
 
 /// What [`tokenize_opts`] produced.
 pub(crate) struct Lexed {
-    pub tokens: Vec<Token>,
-    /// Char ranges of the `/** */` comments, when asked for.
+    pub tokens: TokVec,
+    /// Byte ranges of the `/** */` comments, when asked for.
     pub docs: Vec<(u32, u32)>,
     /// TypeScript only: the error the lexer stopped at. The tokens end there (with an `Eof`), and
     /// the parser reports it unless re-lexing a mis-guessed `/` from an earlier token gets past
@@ -100,26 +98,28 @@ pub(crate) struct Lexed {
 pub(crate) struct LexOpts {
     /// TypeScript source (see `Lexer::ts`).
     pub ts: bool,
-    /// Record the char ranges of `/** */` comments.
+    /// Record the byte ranges of `/** */` comments.
     pub docs: bool,
     /// A leading `/` is a division.
     pub start_div: bool,
+    /// Added to every token's byte offsets (the range starts this far into the parser's source).
+    pub offset: u32,
 }
 
-/// [`tokenize_range`] with [`LexOpts`]; also returns the recorded JSDoc comment ranges (chars).
+/// [`tokenize_range`] with [`LexOpts`]; also returns the recorded JSDoc comment ranges.
 pub(crate) fn tokenize_opts(
-    chars: &[char],
+    src: &str,
     html_comments: bool,
     line: u32,
     opts: LexOpts,
 ) -> Result<Lexed, LexError> {
     let mut lx = Lexer {
-        chars,
+        src,
+        bytes: src.as_bytes(),
         pos: 0,
         line,
-        // About one token per six chars of minified or ordinary source; sized up front so the
-        // vector does not overshoot by doubling on a multi-megabyte bundle.
-        out: Vec::with_capacity(chars.len() / 6 + 16),
+        // About one token per six bytes of ordinary source.
+        out: TokVec::with_capacity(src.len() / 6 + 16),
         nl_pending: false,
         html_comments,
         pending_legacy: false,
@@ -134,11 +134,13 @@ pub(crate) fn tokenize_opts(
         ts: opts.ts,
         docs: opts.docs.then(Vec::new),
         start_div: opts.start_div,
+        idents: Default::default(),
+        offset: opts.offset,
     };
     let soft_err = match lx.run() {
         Ok(()) => None,
         Err(e) if lx.ts => {
-            lx.tok_start = lx.pos.min(chars.len());
+            lx.tok_start = lx.pos.min(src.len());
             lx.push(Tok::Eof);
             Some(e)
         }
@@ -152,19 +154,44 @@ pub(crate) fn tokenize_opts(
 }
 
 impl Lexer<'_> {
+    /// The token `k` places before the last one pushed (`0` = the last).
+    fn tok_back(&self, k: usize) -> Option<&Token> {
+        self.out.get(self.out.len().checked_sub(k + 1)?)
+    }
+    #[inline]
+    fn char_at(&self, at: usize) -> Option<char> {
+        let b = *self.bytes.get(at)?;
+        if b < 0x80 {
+            Some(b as char)
+        } else {
+            self.src[at..].chars().next()
+        }
+    }
+    /// The byte at `pos + k` as a char: exact for ASCII, and never ASCII for a byte of a
+    /// multi-byte char — for matching ASCII syntax a few bytes ahead.
+    #[inline]
+    fn byte_at(&self, k: usize) -> Option<char> {
+        self.bytes.get(self.pos + k).map(|&b| b as char)
+    }
+    #[inline]
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+        self.char_at(self.pos)
     }
     fn peek2(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
+        self.peek_at(1)
     }
     fn peek_at(&self, ahead: usize) -> Option<char> {
-        self.chars.get(self.pos + ahead).copied()
+        let mut at = self.pos;
+        for _ in 0..ahead {
+            at += self.char_at(at)?.len_utf8();
+        }
+        self.char_at(at)
     }
+    #[inline]
     fn bump(&mut self) -> Option<char> {
-        let c = self.chars.get(self.pos).copied();
+        let c = self.peek();
         if let Some(c) = c {
-            self.pos += 1;
+            self.pos += c.len_utf8();
             if c == '\n' {
                 self.line += 1;
             }
@@ -175,7 +202,7 @@ impl Lexer<'_> {
         LexError {
             message: message.into(),
             line: self.line,
-            at_eof: self.pos >= self.chars.len(),
+            at_eof: self.pos >= self.bytes.len(),
         }
     }
 
@@ -183,7 +210,7 @@ impl Lexer<'_> {
     /// start of an expression). After a value-producing token (`)`, `]`, identifier, number, etc.)
     /// a `/` is division; otherwise it begins a regex.
     fn regex_allowed(&self) -> bool {
-        match self.out.last().map(|t| &t.kind) {
+        match self.tok_back(0).map(|t| &t.kind) {
             None => !self.start_div,
             Some(Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) | Tok::Regex(_)) => {
                 false
@@ -192,7 +219,7 @@ impl Lexer<'_> {
             // generator bodies) they prefix an expression, so a following `/` starts a regex. They
             // are `Ident` tokens here since the lexer lacks that context; allow the regex form —
             // division right after a bare `await`/`yield` *identifier* is vanishingly rare.
-            Some(Tok::Ident(w)) => matches!(w.as_str(), "await" | "yield"),
+            Some(Tok::Ident(w)) => matches!(&**w, "await" | "yield"),
             Some(Tok::Keyword(k)) => !matches!(*k, "this" | "super" | "true" | "false" | "null"),
             // Calls/grouping and brackets produce values; a control header ends a statement
             // prefix. Braces distinguish a block (regex) from an object literal (division).
@@ -210,11 +237,13 @@ impl Lexer<'_> {
     /// In TypeScript, whether the `!` just pushed is a non-null assertion (`x!`): it follows a
     /// token that ends an operand on the same line, where a prefix `!` could not stand.
     fn bang_is_postfix(&self) -> bool {
-        let n = self.out.len();
-        if n < 2 || self.out[n - 1].nl_before {
+        let (Some(last), Some(before)) = (self.tok_back(0), self.tok_back(1)) else {
+            return false;
+        };
+        if last.nl_before {
             return false;
         }
-        match &self.out[n - 2].kind {
+        match &before.kind {
             Tok::Ident(_) | Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) => true,
             Tok::Keyword(k) => matches!(*k, "this" | "super" | "null" | "true" | "false"),
             Tok::Punct(p) => matches!(*p, ")" | "]" | "!"),
@@ -226,7 +255,7 @@ impl Lexer<'_> {
     /// (a block, control body, or function *declaration* body → a following `/` is a regex) or at
     /// value position (an object literal or function *expression* body → division)?
     fn brace_ends_statement(&mut self) -> bool {
-        let prev_is_paren = matches!(self.out.last().map(|t| &t.kind), Some(Tok::Punct(")")));
+        let prev_is_paren = matches!(self.tok_back(0).map(|t| &t.kind), Some(Tok::Punct(")")));
         if prev_is_paren {
             // A body after `)` — either a function body (classified by `pending_fn`) or a control
             // block / method (statement position).
@@ -235,7 +264,7 @@ impl Lexer<'_> {
                 None => true,
             };
         }
-        match self.out.last().map(|t| &t.kind) {
+        match self.tok_back(0).map(|t| &t.kind) {
             None => true,
             Some(Tok::Punct(p)) => matches!(*p, ";" | "{" | "}" | "=>"),
             Some(Tok::Keyword(k)) => matches!(*k, "else" | "do" | "try" | "finally"),
@@ -246,7 +275,7 @@ impl Lexer<'_> {
     /// Whether a `class` keyword (about to be pushed) sits in statement position (a declaration —
     /// so its body's closing `}` ends a statement and a following `/` starts a regex).
     fn class_is_declaration(&self) -> bool {
-        match self.out.last().map(|t| &t.kind) {
+        match self.tok_back(0).map(|t| &t.kind) {
             None => true,
             Some(Tok::Punct(p)) => match *p {
                 ";" | "{" => true,
@@ -263,7 +292,7 @@ impl Lexer<'_> {
     /// Whether a `function` keyword (about to be pushed) sits in statement position (a declaration)
     /// rather than expression position.
     fn function_is_declaration(&self) -> bool {
-        match self.out.last().map(|t| &t.kind) {
+        match self.tok_back(0).map(|t| &t.kind) {
             None => true,
             Some(Tok::Punct(p)) => match *p {
                 ";" | "{" => true,
@@ -280,15 +309,15 @@ impl Lexer<'_> {
     fn push(&mut self, kind: Tok) {
         match &kind {
             Tok::Punct("(") => {
-                let last = self.out.last().map(|t| &t.kind);
-                let before = self.out.iter().rev().nth(1).map(|t| &t.kind);
+                let last = self.tok_back(0).map(|t| &t.kind);
+                let before = self.tok_back(1).map(|t| &t.kind);
                 let control = matches!(
                     last,
                     Some(Tok::Keyword(
                         "if" | "for" | "while" | "with" | "switch" | "catch"
                     ))
                 ) && !matches!(before, Some(Tok::Punct("." | "?.")))
-                    || matches!(last, Some(Tok::Ident(word)) if word == "await")
+                    || matches!(last, Some(Tok::Ident(word)) if &**word == "await")
                         && matches!(before, Some(Tok::Keyword("for")));
                 self.paren_stack.push(control);
             }
@@ -321,8 +350,8 @@ impl Lexer<'_> {
         self.out.push(Token {
             kind,
             line: self.line,
-            start: self.tok_start as u32,
-            end: self.pos as u32,
+            start: self.tok_start as u32 + self.offset,
+            end: self.pos as u32 + self.offset,
             nl_before: nl,
             legacy_octal: false,
             escaped: false,
@@ -359,62 +388,69 @@ impl Lexer<'_> {
             }
         }
         while let Some(c) = self.peek() {
-            self.tok_start = self.pos;
-            if is_line_terminator(c) {
-                self.nl_pending = true;
-                self.bump();
-            } else if c.is_whitespace() || c == '\u{FEFF}' {
-                // ZWNBSP (U+FEFF) is JS whitespace anywhere in the source, not just as a BOM.
-                self.bump();
-            } else if c == '/' && self.peek2() == Some('/') {
-                self.skip_line_comment();
-            } else if c == '/' && self.peek2() == Some('*') {
-                self.skip_block_comment()?;
-            } else if c == '<'
-                && self.html_comments
-                && self.peek_at(1) == Some('!')
-                && self.peek_at(2) == Some('-')
-                && self.peek_at(3) == Some('-')
-            {
-                // Annex B HTML-like comment: `<!--` opens a single-line comment.
-                self.skip_line_comment();
-            } else if c == '-'
-                && self.html_comments
-                && self.peek_at(1) == Some('-')
-                && self.peek_at(2) == Some('>')
-                && (self.nl_pending || self.out.is_empty())
-            {
-                // Annex B: `-->` at the start of a line (or of the source) is a comment to EOL.
-                self.skip_line_comment();
-            } else if c == '/' && self.regex_allowed() {
-                if self.ts {
-                    // A guess the parser may overturn: when no regex ends on this line, it is a
-                    // division (the parser re-lexes if a regex was meant after all).
-                    let (pos, line) = (self.pos, self.line);
-                    if self.read_regex().is_err() {
-                        self.pos = pos;
-                        self.line = line;
-                        self.read_punct()?;
-                    }
-                } else {
-                    self.read_regex()?;
-                }
-            } else if c == '"' || c == '\'' {
-                self.read_string(c)?;
-            } else if c == '`' {
-                self.read_template()?;
-            } else if c.is_ascii_digit()
-                || (c == '.' && self.peek2().is_some_and(|d| d.is_ascii_digit()))
-            {
-                self.read_number()?;
-            } else if is_ident_start(c) || c == '#' || (c == '\\' && self.peek2() == Some('u')) {
-                self.read_ident()?;
-            } else {
-                self.read_punct()?;
-            }
+            self.step(c)?;
         }
         self.tok_start = self.pos;
         self.push(Tok::Eof);
+        Ok(())
+    }
+
+    /// Scan one token (or skip one whitespace char / comment) starting with `c`.
+    #[inline]
+    fn step(&mut self, c: char) -> Result<(), LexError> {
+        self.tok_start = self.pos;
+        if is_line_terminator(c) {
+            self.nl_pending = true;
+            self.bump();
+        } else if c.is_whitespace() || c == '\u{FEFF}' {
+            // ZWNBSP (U+FEFF) is JS whitespace anywhere in the source, not just as a BOM.
+            self.bump();
+        } else if c == '/' && self.peek2() == Some('/') {
+            self.skip_line_comment();
+        } else if c == '/' && self.peek2() == Some('*') {
+            self.skip_block_comment()?;
+        } else if c == '<'
+            && self.html_comments
+            && self.peek_at(1) == Some('!')
+            && self.peek_at(2) == Some('-')
+            && self.peek_at(3) == Some('-')
+        {
+            // Annex B HTML-like comment: `<!--` opens a single-line comment.
+            self.skip_line_comment();
+        } else if c == '-'
+            && self.html_comments
+            && self.peek_at(1) == Some('-')
+            && self.peek_at(2) == Some('>')
+            && (self.nl_pending || self.out.is_empty())
+        {
+            // Annex B: `-->` at the start of a line (or of the source) is a comment to EOL.
+            self.skip_line_comment();
+        } else if c == '/' && self.regex_allowed() {
+            if self.ts {
+                // A guess the parser may overturn: when no regex ends on this line, it is a
+                // division (the parser re-lexes if a regex was meant after all).
+                let (pos, line) = (self.pos, self.line);
+                if self.read_regex().is_err() {
+                    self.pos = pos;
+                    self.line = line;
+                    self.read_punct()?;
+                }
+            } else {
+                self.read_regex()?;
+            }
+        } else if c == '"' || c == '\'' {
+            self.read_string(c)?;
+        } else if c == '`' {
+            self.read_template()?;
+        } else if c.is_ascii_digit()
+            || (c == '.' && self.peek2().is_some_and(|d| d.is_ascii_digit()))
+        {
+            self.read_number()?;
+        } else if is_ident_start(c) || c == '#' || (c == '\\' && self.peek2() == Some('u')) {
+            self.read_ident()?;
+        } else {
+            self.read_punct()?;
+        }
         Ok(())
     }
 
@@ -438,7 +474,7 @@ impl Lexer<'_> {
                     self.bump();
                     if let Some(docs) = &mut self.docs {
                         // `/** ... */`, but not the empty `/**/`.
-                        if self.chars.get(start + 2) == Some(&'*') && self.pos - start > 4 {
+                        if self.bytes.get(start + 2) == Some(&b'*') && self.pos - start > 4 {
                             docs.push((start as u32, self.pos as u32));
                         }
                     }
@@ -467,16 +503,27 @@ impl Lexer<'_> {
         if self.peek().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') {
             let from = self.pos;
             let mut end = from;
-            while let Some(&c) = self.chars.get(end) {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+            while let Some(&c) = self.bytes.get(end) {
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
                     end += 1;
                 } else {
                     break;
                 }
             }
-            s.reserve(end - from);
-            s.extend(&self.chars[from..end]);
             self.pos = end;
+            if !self.bytes.get(end).is_some_and(|&b| b == b'\\' || b >= 0x80) {
+                // The whole identifier was that run: no copy beyond the interned name.
+                let text = &self.src[self.tok_start..end];
+                match keyword(text) {
+                    Some(kw) => self.push(Tok::Keyword(kw)),
+                    None => {
+                        let name = self.intern(text);
+                        self.push(Tok::Ident(name));
+                    }
+                }
+                return Ok(());
+            }
+            s.push_str(&self.src[from..end]);
             first = false;
         }
         loop {
@@ -519,11 +566,21 @@ impl Lexer<'_> {
             }
             return Ok(());
         }
-        self.push(Tok::Ident(s));
+        let name = self.intern(&s);
+        self.push(Tok::Ident(name));
         if had_escape {
             self.mark_escaped();
         }
         Ok(())
+    }
+
+    fn intern(&mut self, name: &str) -> Name {
+        if let Some(n) = self.idents.get(name) {
+            return n.clone();
+        }
+        let n = Name(Rc::from(name));
+        self.idents.insert(n.clone());
+        n
     }
 
     /// Read the body of a `\u` identifier/string escape (already consumed `\u`): either `{HEX+}` or
@@ -579,7 +636,7 @@ impl Lexer<'_> {
                 Some(c) => s.push(c),
             }
         }
-        self.push(Tok::Str(s));
+        self.push(Tok::Str(Rc::from(s)));
         // A directive prologue string that used escapes never matches "use strict".
         if had_escape {
             self.mark_escaped();
@@ -596,8 +653,11 @@ impl Lexer<'_> {
     }
 
     fn read_template(&mut self) -> Result<(), LexError> {
+        let (start, nl) = (self.tok_start, std::mem::take(&mut self.nl_pending));
         let parts = self.read_template_parts()?;
-        self.push(Tok::Template(parts));
+        self.tok_start = start;
+        self.nl_pending = nl;
+        self.push(Tok::Template(Box::new(parts)));
         Ok(())
     }
 
@@ -611,26 +671,16 @@ impl Lexer<'_> {
         let mut raw_start = self.pos; // raw source of the current chunk starts here
         loop {
             // The template's raw value normalizes line terminators: <CR><LF> and <CR> → <LF>.
-            let raw_of = |chars: &[char]| -> String {
-                let mut out = String::with_capacity(chars.len());
-                let mut k = 0;
-                while k < chars.len() {
-                    if chars[k] == '\r' {
-                        out.push('\n');
-                        if chars.get(k + 1) == Some(&'\n') {
-                            k += 1;
-                        }
-                    } else {
-                        out.push(chars[k]);
-                    }
-                    k += 1;
+            let raw_of = |text: &str| -> String {
+                if !text.contains('\r') {
+                    return text.to_string();
                 }
-                out
+                text.replace("\r\n", "\n").replace('\r', "\n")
             };
             match self.peek() {
                 None => return Err(self.err("unterminated template literal")),
                 Some('`') => {
-                    let raw = raw_of(&self.chars[raw_start..self.pos]);
+                    let raw = raw_of(&self.src[raw_start..self.pos]);
                     self.bump();
                     parts.push(TplPart::Str {
                         cooked: (!std::mem::take(&mut invalid))
@@ -639,8 +689,8 @@ impl Lexer<'_> {
                     });
                     break;
                 }
-                Some('$') if self.chars.get(self.pos + 1) == Some(&'{') => {
-                    let raw = raw_of(&self.chars[raw_start..self.pos]);
+                Some('$') if self.bytes.get(self.pos + 1) == Some(&b'{') => {
+                    let raw = raw_of(&self.src[raw_start..self.pos]);
                     parts.push(TplPart::Str {
                         cooked: (!std::mem::take(&mut invalid))
                             .then(|| std::mem::take(&mut cooked)),
@@ -649,7 +699,7 @@ impl Lexer<'_> {
                     cooked.clear();
                     self.bump(); // '$'
                     self.bump(); // '{'
-                    parts.push(TplPart::Sub(self.read_template_sub()?));
+                    parts.push(self.read_template_sub()?);
                     raw_start = self.pos;
                 }
                 Some('\\') => {
@@ -685,153 +735,53 @@ impl Lexer<'_> {
         Ok(parts)
     }
 
-    /// Read the raw source inside a `${ ... }` hole, returning it verbatim for the parser to
-    /// sub-parse. Tracks `{}` nesting and skips over string/template literals so their braces and
-    /// backticks don't confuse the matching.
-    fn read_template_sub(&mut self) -> Result<String, LexError> {
-        let mut src = String::new();
-        let mut depth = 0i32;
-        // Last non-whitespace char emitted, to disambiguate `/` (regex vs division) the same way the
-        // main lexer does — so quotes/braces inside a regex literal don't confuse the brace scan.
-        let mut last_sig: Option<char> = None;
-        loop {
-            // Comments: copy verbatim (their `'"{}` are inert).
-            if self.peek() == Some('/') && self.peek2() == Some('/') {
-                while let Some(c) = self.peek() {
-                    if is_line_terminator(c) {
-                        break;
-                    }
-                    src.push(c);
+    /// Lex the inside of a `${ ... }` hole in place, up to its closing `}`, into a token list of
+    /// its own ending with an `Eof` there. Nested templates recurse.
+    fn read_template_sub(&mut self) -> Result<TplPart, LexError> {
+        if crate::stack::exhausted() {
+            return Err(self.err("template literal nesting too deep"));
+        }
+        let saved = (
+            std::mem::replace(&mut self.out, TokVec::with_capacity(16)),
+            std::mem::take(&mut self.brace_stack),
+            std::mem::take(&mut self.paren_stack),
+            std::mem::take(&mut self.pending_fn),
+            self.pending_class.take(),
+            self.last_close_block,
+            self.last_close_control,
+            std::mem::take(&mut self.start_div),
+        );
+        let r = loop {
+            match self.peek() {
+                None => break Err(self.err("unterminated template substitution")),
+                Some('}') if self.brace_stack.is_empty() => {
+                    self.tok_start = self.pos;
+                    self.push(Tok::Eof);
                     self.bump();
-                }
-                continue;
-            }
-            if self.peek() == Some('/') && self.peek2() == Some('*') {
-                src.push_str("/*");
-                self.bump();
-                self.bump();
-                loop {
-                    match self.bump() {
-                        None => return Err(self.err("unterminated comment in template")),
-                        Some('*') if self.peek() == Some('/') => {
-                            src.push_str("*/");
-                            self.bump();
-                            break;
-                        }
-                        Some(c) => src.push(c),
-                    }
-                }
-                continue;
-            }
-            // Regex literal: copy verbatim (its `'"{}` are inert).
-            if self.peek() == Some('/') && regex_allowed_after(last_sig) {
-                self.copy_regex(&mut src)?;
-                last_sig = Some(')'); // a regex is a value: a following `/` is division
-                continue;
-            }
-            match self.bump() {
-                None => return Err(self.err("unterminated template substitution")),
-                Some('}') if depth == 0 => return Ok(src),
-                Some('}') => {
-                    depth -= 1;
-                    src.push('}');
-                    last_sig = Some('}');
-                }
-                Some('{') => {
-                    depth += 1;
-                    src.push('{');
-                    last_sig = Some('{');
-                }
-                Some(q @ ('"' | '\'')) => {
-                    self.copy_quoted(q, &mut src)?;
-                    last_sig = Some(')'); // string is a value
-                }
-                Some('`') => {
-                    // Parse nested templates recursively: a substitution can itself contain
-                    // templates, quoted strings and regexes with backticks. Preserve its exact
-                    // source for the substitution parser without adding tokens to this lexer.
-                    let start = self.pos - 1;
-                    self.pos = start;
-                    self.read_template_parts()?;
-                    src.extend(self.chars[start..self.pos].iter());
-                    last_sig = Some(')');
+                    break Ok(());
                 }
                 Some(c) => {
-                    src.push(c);
-                    if !c.is_whitespace() {
-                        last_sig = Some(c);
+                    if let Err(e) = self.step(c) {
+                        break Err(e);
                     }
                 }
             }
-        }
-    }
-
-    /// Copy a string literal (already past the opening `quote` is NOT consumed — we push it) into
-    /// `out`, respecting escapes, up to and including the matching quote.
-    fn copy_quoted(&mut self, quote: char, out: &mut String) -> Result<(), LexError> {
-        out.push(quote);
-        loop {
-            match self.bump() {
-                None => return Err(self.err("unterminated string in template")),
-                Some('\\') => {
-                    out.push('\\');
-                    if let Some(c) = self.bump() {
-                        out.push(c);
-                    }
-                }
-                Some(c) if c == quote => {
-                    out.push(c);
-                    return Ok(());
-                }
-                Some(c) => out.push(c),
-            }
-        }
-    }
-
-    /// Copy a regex literal `/body/flags` verbatim into `out` (the leading `/` is at the cursor).
-    fn copy_regex(&mut self, out: &mut String) -> Result<(), LexError> {
-        out.push('/');
-        self.bump(); // opening /
-        let mut in_class = false;
-        loop {
-            match self.bump() {
-                None => return Err(self.err("unterminated regex in template")),
-                Some('\\') => {
-                    out.push('\\');
-                    if let Some(c) = self.bump() {
-                        out.push(c);
-                    }
-                }
-                Some('[') => {
-                    in_class = true;
-                    out.push('[');
-                }
-                Some(']') => {
-                    in_class = false;
-                    out.push(']');
-                }
-                Some('/') if !in_class => {
-                    out.push('/');
-                    break;
-                }
-                Some(c) => out.push(c),
-            }
-        }
-        while let Some(c) = self.peek() {
-            if is_ident_part(c) {
-                out.push(c);
-                self.bump();
-            } else {
-                break;
-            }
-        }
-        Ok(())
+        };
+        let toks = std::mem::replace(&mut self.out, saved.0);
+        self.brace_stack = saved.1;
+        self.paren_stack = saved.2;
+        self.pending_fn = saved.3;
+        self.pending_class = saved.4;
+        self.last_close_block = saved.5;
+        self.last_close_control = saved.6;
+        self.start_div = saved.7;
+        r.map(|()| TplPart::Sub(SubToks(Rc::new(toks))))
     }
 
     /// Whether the escape starting at the current `\` is valid in a template's cooked string:
     /// no octal / `\8` / `\9`, `\x` needs two hex digits, `\u` four (or a braced code point).
     fn template_escape_ok(&self) -> bool {
-        let at = |k: usize| self.chars.get(self.pos + k).copied();
+        let at = |k: usize| self.byte_at(k);
         let hex = |c: Option<char>| c.is_some_and(|c| c.is_ascii_hexdigit());
         match at(1) {
             Some('0') => !matches!(at(2), Some(c) if c.is_ascii_digit()),
@@ -1038,13 +988,13 @@ impl Lexer<'_> {
 
     /// A numeric separator `_` is only legal immediately between two digits of the given radix.
     fn validate_seps(&self, lo: usize, hi: usize, radix: u32) -> Result<(), LexError> {
-        let s = &self.chars[lo..hi];
+        let s = &self.bytes[lo..hi];
         for (i, &c) in s.iter().enumerate() {
-            if c == '_' {
+            if c == b'_' {
                 let prev = i.checked_sub(1).and_then(|j| s.get(j));
                 let next = s.get(i + 1);
-                let ok = prev.is_some_and(|p| p.is_digit(radix))
-                    && next.is_some_and(|n| n.is_digit(radix));
+                let ok = prev.is_some_and(|&p| (p as char).is_digit(radix))
+                    && next.is_some_and(|&n| (n as char).is_digit(radix));
                 if !ok {
                     return Err(self.err("invalid use of numeric separator"));
                 }
@@ -1088,9 +1038,9 @@ impl Lexer<'_> {
                 }
             }
             self.validate_seps(digits_start, self.pos, radix)?;
-            let digits: String = self.chars[digits_start..self.pos]
-                .iter()
-                .filter(|c| **c != '_')
+            let digits: String = self.src[digits_start..self.pos]
+                .chars()
+                .filter(|c| *c != '_')
                 .collect();
             if self.peek() == Some('n') {
                 self.bump();
@@ -1110,17 +1060,17 @@ impl Lexer<'_> {
         }
         // Legacy octal (`010`) / non-octal-decimal (`08`): a leading-zero integer with no fraction,
         // exponent, or `n` suffix. Octal value in sloppy mode; the parser rejects it in strict.
-        if self.chars[start] == '0'
+        if self.bytes[start] == b'0'
             && self.pos - start > 1
             && !matches!(self.peek(), Some('.' | 'e' | 'E' | 'n' | '_'))
         {
             // A leading-zero integer (legacy octal / non-octal decimal) admits no separators.
-            if self.chars[start..self.pos].contains(&'_') {
+            if self.src[start..self.pos].contains('_') {
                 return Err(self.err("numeric separator not allowed in legacy literal"));
             }
-            let text: String = self.chars[start..self.pos].iter().collect();
+            let text = &self.src[start..self.pos];
             if text.chars().all(|c| ('0'..='7').contains(&c)) {
-                let n = i64::from_str_radix(&text, 8).unwrap_or(0);
+                let n = i64::from_str_radix(text, 8).unwrap_or(0);
                 self.push(Tok::Num(n as f64));
                 self.mark_legacy_octal();
                 return Ok(());
@@ -1134,13 +1084,13 @@ impl Lexer<'_> {
         // A BigInt literal is an integer immediately followed by `n` (no fraction/exponent).
         if self.peek() == Some('n') {
             // A leading-zero integer (legacy octal / non-octal decimal) admits no BigInt suffix.
-            if self.chars[start] == '0' && self.pos - start > 1 {
+            if self.bytes[start] == b'0' && self.pos - start > 1 {
                 return Err(self.err("invalid BigInt literal (leading zero)"));
             }
             self.validate_seps(start, self.pos, 10)?;
-            let text: String = self.chars[start..self.pos]
-                .iter()
-                .filter(|c| **c != '_')
+            let text: String = self.src[start..self.pos]
+                .chars()
+                .filter(|c| *c != '_')
                 .collect();
             self.bump(); // n
             let n = crate::bigint::JsBigInt::parse_radix(&text, 10)
@@ -1164,9 +1114,9 @@ impl Lexer<'_> {
             }
         }
         self.validate_seps(start, self.pos, 10)?;
-        let text: String = self.chars[start..self.pos]
-            .iter()
-            .filter(|c| **c != '_')
+        let text: String = self.src[start..self.pos]
+            .chars()
+            .filter(|c| *c != '_')
             .collect();
         let n: f64 = text
             .parse()
@@ -1227,7 +1177,7 @@ impl Lexer<'_> {
         if self.peek() == Some('?')
             && self.peek2() == Some('.')
             && self
-                .chars
+                .bytes
                 .get(self.pos + 2)
                 .is_some_and(|c| c.is_ascii_digit())
         {
@@ -1237,7 +1187,7 @@ impl Lexer<'_> {
         }
         // The longest punctuator at `pos` (the same maximal munch as scanning `PUNCTUATORS`,
         // which lists longer spellings first).
-        let at = |k: usize| self.chars.get(self.pos + k).copied().unwrap_or('\0');
+        let at = |k: usize| self.byte_at(k).unwrap_or('\0');
         let (c0, c1, c2, c3) = (at(0), at(1), at(2), at(3));
         let p: &'static str = match (c0, c1, c2, c3) {
             ('>', '>', '>', '=') => ">>>=",
@@ -1310,15 +1260,6 @@ impl Lexer<'_> {
         }
         self.push(Tok::Punct(p));
         Ok(())
-    }
-}
-
-/// Whether a `/` following `last` (the previous significant char) starts a regex rather than being
-/// a division operator. A value-terminator (identifier char, `)`, `]`, `}`) means division.
-fn regex_allowed_after(last: Option<char>) -> bool {
-    match last {
-        None => true,
-        Some(c) => !(c.is_alphanumeric() || matches!(c, '_' | '$' | ')' | ']' | '}')),
     }
 }
 

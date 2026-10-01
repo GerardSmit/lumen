@@ -642,7 +642,7 @@ function fork(modulePath, args, options) {
 // The child-side channel is installed by the process bootstrap in stdlib_extras.js.
 function _forkChild() {}
 
-__builtins.set("child_process", {
+const __childProcessExports = {
   spawn,
   exec,
   execFile,
@@ -651,6 +651,7 @@ __builtins.set("child_process", {
   spawnSync,
   fork,
   _forkChild,
-  _ipcWire: __ipcWire,
   ChildProcess,
-});
+};
+Object.defineProperty(__childProcessExports, "_ipcWire", { value: __ipcWire, configurable: true });
+__builtins.set("child_process", __childProcessExports);

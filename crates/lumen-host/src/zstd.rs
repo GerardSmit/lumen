@@ -887,7 +887,12 @@ fn decode_compressed_block(
     Ok(())
 }
 
-fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize, String> {
+fn decode_frame(
+    data: &[u8],
+    mut pos: usize,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<usize, String> {
     let frame_out_start = out.len();
     let byte = |pos: &mut usize| -> Result<u8, String> {
         let b = *data.get(*pos).ok_or("zstd: truncated frame header")?;
@@ -967,6 +972,9 @@ fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize,
             1 => {
                 let b = *data.get(pos).ok_or("zstd: truncated RLE block")?;
                 pos += 1;
+                if out.len() + bsize > limit {
+                    return Err(crate::deflate::OUTPUT_LIMIT.into());
+                }
                 out.resize(out.len() + bsize, b);
             }
             2 => {
@@ -977,6 +985,9 @@ fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize,
                 pos += bsize;
             }
             _ => return Err("zstd: reserved block type".into()),
+        }
+        if out.len() > limit {
+            return Err(crate::deflate::OUTPUT_LIMIT.into());
         }
         if last {
             break;
@@ -1003,6 +1014,12 @@ fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize,
 
 /// Decompress one or more concatenated Zstandard frames (skippable frames are skipped).
 pub fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    zstd_decompress_limited(data, usize::MAX)
+}
+
+/// [`zstd_decompress`], failing with [`crate::deflate::OUTPUT_LIMIT`] once the output passes
+/// `limit` bytes (checked per block, at most 128 KiB each).
+pub fn zstd_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     if data.is_empty() {
         return Err("zstd: empty input".into());
     }
@@ -1029,7 +1046,7 @@ pub fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
         if magic != ZSTD_MAGIC {
             return Err("zstd: bad magic number".into());
         }
-        pos = decode_frame(data, pos, &mut out)?;
+        pos = decode_frame(data, pos, &mut out, limit)?;
     }
     Ok(out)
 }

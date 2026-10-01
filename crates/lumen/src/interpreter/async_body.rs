@@ -19,7 +19,7 @@ impl Interp {
         args: &[Value],
         fn_obj: &Gc,
     ) -> Option<Result<Value, Abrupt>> {
-        if matches!(self.tier, crate::bytecode::Tier::Interp) || closure.borrow().under_with {
+        if matches!(self.tier, crate::bytecode::Tier::Interp) || closure.borrow().under_with() {
             return None;
         }
         if func.code.get().is_none() {

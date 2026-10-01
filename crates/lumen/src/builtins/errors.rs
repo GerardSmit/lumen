@@ -99,7 +99,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             // Set(this, "stack", v) with Throw=true.
             if let Some((t, h)) = proxy_pair(i, &this) {
                 // Surface the proxy [[Set]] result: a falsy trap return throws under Throw=true.
-                let trap = ab(i.get_member(&h, "set"))?;
+                let trap = ab(i.proxy_trap(&h, "set"))?;
                 if trap.is_callable() {
                     let res = ab(i.call(
                         trap,

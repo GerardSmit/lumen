@@ -22,6 +22,40 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 /// Response-body cap so a hostile server can't balloon the worker (32 MiB).
 const MAX_BODY: u64 = 32 << 20;
+/// Cap on the status/request line plus headers (and on chunked trailers).
+pub(crate) const MAX_HEADER_BYTES: usize = 64 << 10;
+const MAX_CHUNK_SIZE_LINE: usize = 4096;
+const INITIAL_BODY_CAPACITY: u64 = 64 << 10;
+
+/// Read one line without ever buffering more than `*budget` bytes; errors once the line would
+/// exceed what is left of the budget. Returns an empty string at EOF.
+pub(crate) fn read_capped_line(
+    reader: &mut impl BufRead,
+    budget: &mut usize,
+) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(*budget as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
+    if n > *budget {
+        return Err(std::io::Error::other("headers too large"));
+    }
+    *budget -= n;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read `len` bytes (capped at `MAX_BODY`), growing the buffer as data arrives rather than
+/// trusting the declared length for the allocation.
+pub(crate) fn read_body_exact(reader: &mut impl BufRead, len: u64) -> std::io::Result<Vec<u8>> {
+    let want = len.min(MAX_BODY);
+    let mut body = Vec::with_capacity(want.min(INITIAL_BODY_CAPACITY) as usize);
+    reader.by_ref().take(want).read_to_end(&mut body)?;
+    if (body.len() as u64) < want {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(body)
+}
 
 pub(crate) fn request(
     method: &str,
@@ -128,9 +162,8 @@ fn one_request(
         .map_err(|e| format!("fetch '{}': write: {e}", u.href()))?;
 
     let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
+    let mut header_budget = MAX_HEADER_BYTES;
+    let status_line = read_capped_line(&mut reader, &mut header_budget)
         .map_err(|e| format!("fetch '{}': read: {e}", u.href()))?;
     // "HTTP/1.1 200 OK"
     let mut parts = status_line.trim_end().splitn(3, ' ');
@@ -145,9 +178,7 @@ fn one_request(
 
     let mut headers_out = Vec::new();
     loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
+        let line = read_capped_line(&mut reader, &mut header_budget)
             .map_err(|e| format!("fetch '{}': read headers: {e}", u.href()))?;
         let line = line.trim_end();
         if line.is_empty() {
@@ -185,9 +216,7 @@ fn read_body(
         return read_chunked(reader);
     }
     if let Some(len) = header(headers, "content-length").and_then(|v| v.parse::<u64>().ok()) {
-        let mut body = vec![0u8; len.min(MAX_BODY) as usize];
-        reader.read_exact(&mut body)?;
-        return Ok(body);
+        return read_body_exact(reader, len);
     }
     // No framing: Connection: close means read to EOF.
     let mut body = Vec::new();
@@ -198,8 +227,8 @@ fn read_body(
 pub(crate) fn read_chunked(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line)?;
+        let mut line_budget = MAX_CHUNK_SIZE_LINE;
+        let size_line = read_capped_line(reader, &mut line_budget)?;
         let size = usize::from_str_radix(
             size_line.trim_end().split(';').next().unwrap_or("").trim(),
             16,
@@ -207,9 +236,10 @@ pub(crate) fn read_chunked(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>
         .map_err(|_| std::io::Error::other(format!("bad chunk size {size_line:?}")))?;
         if size == 0 {
             // Trailer section (usually just the final CRLF).
+            let mut trailer_budget = MAX_HEADER_BYTES;
             loop {
-                let mut trailer = String::new();
-                if reader.read_line(&mut trailer)? == 0 || trailer.trim_end().is_empty() {
+                let trailer = read_capped_line(reader, &mut trailer_budget)?;
+                if trailer.is_empty() || trailer.trim_end().is_empty() {
                     return Ok(body);
                 }
             }
@@ -218,8 +248,10 @@ pub(crate) fn read_chunked(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>
             return Err(std::io::Error::other("response body too large"));
         }
         let start = body.len();
-        body.resize(start + size, 0);
-        reader.read_exact(&mut body[start..])?;
+        reader.by_ref().take(size as u64).read_to_end(&mut body)?;
+        if body.len() - start < size {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf)?;
     }
@@ -234,6 +266,57 @@ mod tests {
         let raw = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
         let mut r = std::io::BufReader::new(&raw[..]);
         assert_eq!(read_chunked(&mut r).unwrap(), b"Wikipedia");
+    }
+
+    #[test]
+    fn endless_header_line_is_rejected_at_the_cap() {
+        struct Endless(usize);
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                buf.fill(b'a');
+                Ok(buf.len())
+            }
+        }
+        let mut reader = BufReader::new(Endless(0));
+        let mut budget = MAX_HEADER_BYTES;
+        assert!(read_capped_line(&mut reader, &mut budget).is_err());
+        assert!(reader.get_ref().0 <= MAX_HEADER_BYTES + 2 * 8192);
+    }
+
+    #[test]
+    fn header_budget_is_shared_across_lines() {
+        let raw = b"aaaa\r\nbbbb\r\n";
+        let mut r = std::io::Cursor::new(&raw[..]);
+        let mut budget = 10;
+        assert_eq!(read_capped_line(&mut r, &mut budget).unwrap(), "aaaa\r\n");
+        assert!(read_capped_line(&mut r, &mut budget).is_err());
+    }
+
+    #[test]
+    fn oversized_chunk_size_line_is_rejected() {
+        let mut raw = vec![b'1'; 100_000];
+        raw.extend_from_slice(b"\r\n");
+        let mut r = std::io::Cursor::new(raw);
+        assert!(read_chunked(&mut r).is_err());
+    }
+
+    #[test]
+    fn huge_content_length_with_small_body_does_not_preallocate() {
+        struct Probe<'a>(std::io::Cursor<&'a [u8]>);
+        impl Read for Probe<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        let mut reader = BufReader::new(Probe(std::io::Cursor::new(b"tiny")));
+        let err = read_body_exact(&mut reader, u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        let mut cursor = std::io::Cursor::new(b"hello world".to_vec());
+        let body = read_body_exact(&mut cursor, 5).unwrap();
+        assert_eq!(body, b"hello");
+        assert!(body.capacity() <= INITIAL_BODY_CAPACITY as usize);
     }
 
     #[test]

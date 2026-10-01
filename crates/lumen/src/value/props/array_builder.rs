@@ -1,9 +1,7 @@
 //! Shared packed-array construction from owned values.
 use super::shapes::{array_length_shape, Shape};
 use super::storage::{DenseBuffers, DenseStorage};
-#[cfg(test)]
-use super::storage::{InlinePacked, INLINE_PACKED_CAPACITY};
-use super::{EntryVec, Props};
+use super::{EntryVec, PackedVec, Props};
 use crate::value::{Property, Value};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -15,9 +13,12 @@ impl Props {
     pub(crate) fn packed_array_from_values(values: impl ExactSizeIterator<Item = Value>) -> Props {
         let len = values.len();
         let mut props = Props::array_shell();
-        props.elems = DenseStorage::from_box(Some(Box::new(
-            packed_elements(values).unwrap_or_else(|| packed_buffers(InlinePacked::default(), None)),
-        )));
+        if len != 0 {
+            let mut packed = Vec::with_capacity(len);
+            packed.extend(values.map(crate::value::PackedValue::pack));
+            assert_eq!(packed.len(), len, "incorrect exact iterator length");
+            props.elems.install_packed(PackedVec::from(packed));
+        }
         props.entries = std::iter::once(array_length_prop(len)).collect();
         props
     }
@@ -99,14 +100,14 @@ impl Props {
         let packed = self.elems.packed_mut().expect("packed storage installed above");
         let before = packed.len();
         packed.reserve(values.size_hint().0);
-        packed.extend(values.map(Property::plain));
+        packed.extend(values.map(crate::value::PackedValue::pack));
         Ok(packed.len() - before)
     }
 
-    /// No element storage at all: no sidecar, or an empty classic one, and no element-region
-    /// entries.
+    /// No element storage at all: no sidecar, empty packed storage, or an empty classic one,
+    /// and no element-region entries.
     pub(super) fn elementless(&self) -> bool {
-        !self.elems.packed_is_some()
+        self.elems.packed_ref().is_none_or(|p| p.is_empty())
             && self.elems.len() == 0
             && self.elems.mirror_len() == 0
             && self.entries.len() == self.named_len()
@@ -114,51 +115,25 @@ impl Props {
 
     /// Switch an [`elementless`](Props::elementless) array map to (empty) packed storage.
     pub(super) fn install_empty_packed(&mut self) {
-        let d = self.elems.buffers_mut();
-        d.elems = Vec::new();
-        d.mirror = Vec::new();
-        d.mirror_flags = 0;
-        d.mirror_holes = 0;
-        d.packed = Some(Box::default());
+        self.elems.install_packed(PackedVec::default());
     }
-}
 
-/// Packed element buffers holding `values` (see `DenseStorage::adopt_in_box_packed`, the
-/// in-place form the object constructors use).
-#[cfg(test)]
-fn packed_elements(values: impl ExactSizeIterator<Item = Value>) -> Option<DenseBuffers> {
-    let len = values.len();
-    if len == 0 {
-        None
-    } else if len <= INLINE_PACKED_CAPACITY {
-        let inline = InlinePacked::from_values(values);
-        assert_eq!(inline.as_slice().len(), len, "incorrect exact iterator length");
-        Some(packed_buffers(inline, None))
-    } else {
-        let mut packed = Vec::with_capacity(len);
-        packed.extend(values.map(Property::plain));
-        assert_eq!(packed.len(), len, "incorrect exact iterator length");
-        Some(packed_buffers(InlinePacked::default(), Some(Box::new(packed.into()))))
+    /// A fresh array's empty packed storage gives way to the classic slot map when its first
+    /// element lands past index 0 (a descending fill), as an elementless array's does: holes
+    /// there are mirror pads, not packed `Empty` slots every fill then has to go generic for.
+    /// Returns whether it did.
+    pub(super) fn unpack_for_sparse_fill(&mut self, n: u32) -> bool {
+        if n == 0 || !self.elems.packed_ref().is_some_and(|p| p.is_empty()) || !self.elementless() {
+            return false;
+        }
+        self.elems.drop_packed();
+        true
     }
 }
 
 #[cfg(test)]
 fn array_length_prop(len: usize) -> Property {
     Property::data(Value::Num(len as f64), true, false, false)
-}
-
-#[cfg(test)]
-#[allow(clippy::box_collection)]
-fn packed_buffers(inline_packed: InlinePacked, packed: Option<Box<super::PackedVec>>) -> DenseBuffers {
-    DenseBuffers {
-        packed,
-        inline_packed,
-        elems: Vec::new(),
-        mirror: Vec::new(),
-        mirror_flags: 0,
-        mirror_holes: 0,
-        in_box: false,
-    }
 }
 
 #[cfg(test)]
@@ -171,17 +146,12 @@ mod tests {
         let mut shape = None;
         for len in [0, 1, 10, 11, 32] {
             let props = Props::packed_array_from_values((0..len).map(|n| Value::Num(n as f64)));
-            let buffers = props.elems.as_deref().unwrap();
-            assert_eq!(buffers.packed.is_none(), len <= INLINE_PACKED_CAPACITY);
-            assert_eq!(
-                buffers.inline_packed.as_slice().len(),
-                if len <= 10 { len } else { 0 }
-            );
+            assert_eq!(props.elems.packed_ref().map(<[_]>::len), (len != 0).then_some(len));
             let length = props.get("length").unwrap();
             assert!(length.writable() && !length.enumerable() && !length.configurable());
             assert!(matches!(length.value(), Value::Num(n) if n == len as f64));
             assert_eq!(props.entries.len(), 1);
-            assert_eq!(props.elems.mirror_flags(), 0);
+            assert!(props.elems.as_deref().is_none_or(|d| d.classic.is_none()));
             assert_eq!(*shape.get_or_insert(props.shape), props.shape);
             for index in 0..len {
                 assert!(

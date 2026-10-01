@@ -196,17 +196,8 @@ pub(crate) mod frames;
 pub(crate) mod stack_trace;
 pub use frames::FnFrame;
 
-/// Cached UTF-16 view of one string, keyed by `Rc<str>` identity (see `Interp::str_units`).
-/// JS string semantics are code units but the engine stores UTF-8 `str`; without a cache every
-/// `charCodeAt`/`[i]`/`.length` is O(len) (a full `is_ascii` scan or unit walk), which turns a
-/// scanner loop — a JS parser reading a megabytes-long source one char at a time — into O(n²).
-#[derive(Clone)]
-pub(crate) enum StrUnits {
-    /// Pure ASCII: unit `i` is byte `i` — index the `str` directly.
-    Ascii,
-    /// The materialized code units.
-    Units(Rc<[u16]>),
-}
+/// Non-ASCII strings shorter than this are walked from the start instead of indexed.
+const STR_INDEX_MIN: usize = 64;
 
 /// Raw state of the last successful regex match, deferred for the legacy `RegExp.$1` statics.
 /// `ctor` is the %RegExp% constructor the statics belong to (the realm active at match time).
@@ -225,50 +216,130 @@ pub(crate) struct RegexpLastMatch {
 pub struct Scope {
     pub vars: VarMap,
     pub parent: Option<Env>,
-    /// For a `with (obj)` block: identifier resolution checks `obj`'s properties before the parent.
-    pub with_obj: Option<Value>,
-    /// `true` when this scope or ANY ancestor is a `with` scope (propagated at construction).
-    /// Compiled tiers refuse to run a body whose closure chain is under a `with`: the VM's
-    /// free-name ops re-resolve at execution time, but a with-object binding can appear or
-    /// vanish between the spec's reference resolution and the store (e.g. `x = (delete env.x,
-    /// 0)`) — the tree-walker models that; the ops don't.
-    pub under_with: bool,
-    /// `true` if this is a *variable* environment (a function body scope, the global scope, or an
-    /// `eval` scope) — the target for `var`/function hoisting. Block, `with`, and function *parameter*
-    /// scopes are `false`, so a sloppy direct `eval` hoists its vars past them into the nearest
-    /// enclosing variable environment (see EvalDeclarationInstantiation).
-    pub var_boundary: bool,
-    /// `true` for a `catch` clause's parameter environment. A sloppy direct `eval`'s
-    /// EvalDeclarationInstantiation walk skips it, so `eval("var e")` inside `catch (e) { … }` is
-    /// allowed (the web-compatibility carve-out for VariableStatements in catch blocks).
-    pub catch_param: bool,
-    /// Names declared *lexically* at this scope's own level (let/const/using/class). A function
-    /// body scope holds both hoisted vars and body-level lexicals; a sloppy direct eval's
-    /// var/lexical conflict check needs to tell them apart.
-    pub lexical_names: ScopeNames,
+    /// State only `with`, direct eval and module imports need, kept off the common allocation.
+    rare: Option<Box<ScopeRare>>,
     /// Unique per scope allocation (see `value::register_scope`): lets the per-site name cache
     /// tell a live environment from a later one reusing its address.
     pub serial: u64,
 }
 
-/// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
-/// Keep the common empty case to one nullable pointer and materialize the Vec on first use.
 #[derive(Default)]
-#[repr(transparent)]
-pub struct ScopeNames(Option<Box<Vec<Rc<str>>>>);
+struct ScopeRare {
+    /// For a `with (obj)` block: identifier resolution checks `obj`'s properties before the parent.
+    with_obj: Option<Value>,
+    /// Names declared *lexically* at this scope's own level (let/const/using/class), recorded by
+    /// direct eval: a function body scope holds both hoisted vars and body-level lexicals, and a
+    /// sloppy direct eval's var/lexical conflict check needs to tell them apart.
+    lexical_names: Vec<Rc<str>>,
+    /// Live module imports: reads/writes of a binding flagged `import` redirect to
+    /// `(exporter scope, local name)`.
+    imports: Vec<(Rc<str>, (Env, String))>,
+}
 
-impl ScopeNames {
+/// [`Scope`] flags, stored in the spare bytes of its [`VarMap`].
+pub(crate) const SCOPE_UNDER_WITH: u8 = 1;
+pub(crate) const SCOPE_VAR_BOUNDARY: u8 = 2;
+pub(crate) const SCOPE_CATCH_PARAM: u8 = 4;
+
+impl Scope {
+    fn new(vars: VarMap, parent: Option<Env>, flags: u8, rare: Option<Box<ScopeRare>>) -> Scope {
+        let mut s = Scope {
+            vars,
+            parent,
+            rare,
+            serial: 0,
+        };
+        s.vars.set_scope_flags(flags);
+        s
+    }
+
+    fn rare_mut(&mut self) -> &mut ScopeRare {
+        self.rare.get_or_insert_with(Default::default)
+    }
+
+    /// The object of a `with (obj)` scope.
+    #[inline]
+    pub fn with_obj(&self) -> Option<&Value> {
+        self.rare.as_ref()?.with_obj.as_ref()
+    }
+
+    pub(crate) fn clear_with_obj(&mut self) {
+        if let Some(r) = &mut self.rare {
+            r.with_obj = None;
+        }
+    }
+
+    /// `true` when this scope or ANY ancestor is a `with` scope (propagated at construction).
+    /// Compiled tiers refuse to run a body whose closure chain is under a `with`: the VM's
+    /// free-name ops re-resolve at execution time, but a with-object binding can appear or
+    /// vanish between the spec's reference resolution and the store (e.g. `x = (delete env.x,
+    /// 0)`) — the tree-walker models that; the ops don't.
+    #[inline]
+    pub fn under_with(&self) -> bool {
+        self.vars.scope_flags() & SCOPE_UNDER_WITH != 0
+    }
+
+    /// `true` if this is a *variable* environment (a function body scope, the global scope, or an
+    /// `eval` scope) — the target for `var`/function hoisting. Block, `with`, and function
+    /// *parameter* scopes are `false`, so a sloppy direct `eval` hoists its vars past them into
+    /// the nearest enclosing variable environment (see EvalDeclarationInstantiation).
+    #[inline]
+    pub fn var_boundary(&self) -> bool {
+        self.vars.scope_flags() & SCOPE_VAR_BOUNDARY != 0
+    }
+
+    /// `true` for a `catch` clause's parameter environment. A sloppy direct `eval`'s
+    /// EvalDeclarationInstantiation walk skips it, so `eval("var e")` inside `catch (e) { … }` is
+    /// allowed (the web-compatibility carve-out for VariableStatements in catch blocks).
+    #[inline]
+    pub fn catch_param(&self) -> bool {
+        self.vars.scope_flags() & SCOPE_CATCH_PARAM != 0
+    }
+
+    /// Replace the binding map, keeping the scope's flags.
+    pub(crate) fn set_vars(&mut self, vars: VarMap) {
+        let flags = self.vars.scope_flags();
+        self.vars = vars;
+        self.vars.set_scope_flags(flags);
+    }
+
+    pub fn lexical_names(&self) -> std::slice::Iter<'_, Rc<str>> {
+        self.rare
+            .as_ref()
+            .map_or(&[][..], |r| &r.lexical_names[..])
+            .iter()
+    }
+
     /// `name` is the same `Rc` the binding is keyed by, so the list costs a pointer per name.
-    pub fn push(&mut self, name: Rc<str>) {
-        let names = self.0.get_or_insert_with(Default::default);
+    pub fn push_lexical_name(&mut self, name: Rc<str>) {
+        let names = &mut self.rare_mut().lexical_names;
         if names.len() == names.capacity() {
             names.reserve_exact(1);
         }
         names.push(name);
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Rc<str>> {
-        self.0.as_deref().map_or(&[][..], Vec::as_slice).iter()
+    /// The `(exporter scope, local name)` a binding flagged `import` reads through to.
+    pub(crate) fn import_of(&self, name: &str) -> Option<&(Env, String)> {
+        let r = self.rare.as_ref()?;
+        r.imports.iter().find(|(n, _)| &**n == name).map(|(_, t)| t)
+    }
+
+    /// Every live import target (for the cycle collector).
+    pub(crate) fn import_envs(&self) -> impl Iterator<Item = &Env> {
+        self.rare
+            .iter()
+            .flat_map(|r| r.imports.iter().map(|(_, (e, _))| e))
+    }
+
+    /// Bind `name` as a live import of `local` in `src_env`.
+    pub(crate) fn link_import(&mut self, name: &str, src_env: Env, local: String) {
+        let imports = &mut self.rare_mut().imports;
+        imports.retain(|(n, _)| &**n != name);
+        imports.push((Rc::from(name), (src_env, local)));
+        let mut b = Binding::data(Value::Undefined, false, true);
+        b.import = true;
+        self.vars.insert(name, b);
     }
 }
 
@@ -278,9 +349,8 @@ pub struct Binding {
     pub mutable: bool,
     /// `false` while a `let`/`const` is in its temporal dead zone.
     pub initialized: bool,
-    /// A live module import: reads/writes redirect to `(exporter scope, local name)`. Boxed so
-    /// the `None` every ordinary binding carries costs a pointer, not the pair.
-    pub import_ref: Option<Box<(Env, String)>>,
+    /// A live module import: reads/writes redirect to the scope's [`Scope::import_of`] entry.
+    pub import: bool,
     /// `true` for a `var`/function binding created by a sloppy `eval` (CreateMutableBinding with
     /// `deletable` set): `delete <name>` may remove it, unlike ordinary declarations.
     pub deletable: bool,
@@ -291,13 +361,17 @@ pub struct Binding {
     pub strict_immutable: bool,
 }
 
+const _: () = assert!(std::mem::size_of::<Binding>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Scope>() == 56);
+
 impl Binding {
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
         Binding {
             value,
             mutable,
             initialized,
-            import_ref: None,
+            import: false,
             deletable: false,
             // An immutable binding created through this helper (const/TDZ) is strict by default.
             strict_immutable: !mutable,
@@ -307,20 +381,23 @@ impl Binding {
 
 use crate::value::{register_scope, scope_registry_len, scope_registry_prune, scope_snapshot};
 
-pub fn new_scope(parent: Option<Env>) -> Env {
-    let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    let e = Rc::new(RefCell::new(Scope {
-        vars: Default::default(),
-        parent,
-        with_obj: None,
-        under_with,
-        var_boundary: false,
-        catch_param: false,
-        lexical_names: ScopeNames::default(),
-        serial: 0,
-    }));
+fn alloc_scope(scope: Scope) -> Env {
+    let e = Rc::new(RefCell::new(scope));
     register_scope(&e);
     e
+}
+
+fn inherited_with(parent: &Option<Env>) -> u8 {
+    if parent.as_ref().is_some_and(|p| p.borrow().under_with()) {
+        SCOPE_UNDER_WITH
+    } else {
+        0
+    }
+}
+
+pub fn new_scope(parent: Option<Env>) -> Env {
+    let flags = inherited_with(&parent);
+    alloc_scope(Scope::new(Default::default(), parent, flags, None))
 }
 
 /// A *variable* environment: the hoisting target for `var`/function declarations (function body,
@@ -334,55 +411,32 @@ pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) 
 }
 
 pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> Env {
-    let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    let e = Rc::new(RefCell::new(Scope {
-        vars,
-        parent,
-        with_obj: None,
-        under_with,
-        var_boundary: true,
-        catch_param: false,
-        lexical_names: ScopeNames::default(),
-        serial: 0,
-    }));
-    register_scope(&e);
-    e
+    let flags = inherited_with(&parent) | SCOPE_VAR_BOUNDARY;
+    alloc_scope(Scope::new(vars, parent, flags, None))
 }
 
 /// A `catch (e)` parameter environment: like a block scope, but flagged so a sloppy direct `eval`'s
 /// var-hoisting walk skips it (see [`Scope::catch_param`]).
 pub fn new_catch_scope(parent: Env) -> Env {
-    let under_with = parent.borrow().under_with;
-    let e = Rc::new(RefCell::new(Scope {
-        vars: Default::default(),
-        parent: Some(parent),
-        with_obj: None,
-        under_with,
-        var_boundary: false,
-        catch_param: true,
-        lexical_names: ScopeNames::default(),
-        serial: 0,
-    }));
-    register_scope(&e);
-    e
+    let parent = Some(parent);
+    let flags = inherited_with(&parent) | SCOPE_CATCH_PARAM;
+    alloc_scope(Scope::new(Default::default(), parent, flags, None))
 }
 
 /// A `with (obj)` environment: identifier lookups consult `obj` before the enclosing scope.
 pub fn new_with_scope(parent: Env, obj: Value) -> Env {
     // Binding lookups read the object's property map: a split view becomes an Array first.
     crate::split_view::unview_val(&obj);
-    let e = Rc::new(RefCell::new(Scope {
-        vars: Default::default(),
-        parent: Some(parent),
+    let rare = Box::new(ScopeRare {
         with_obj: Some(obj),
-        under_with: true,
-        var_boundary: false,
-        catch_param: false,
-        lexical_names: ScopeNames::default(),
-        serial: 0,
-    }));
-    register_scope(&e);
-    e
+        ..Default::default()
+    });
+    alloc_scope(Scope::new(
+        Default::default(),
+        Some(parent),
+        SCOPE_UNDER_WITH,
+        Some(rare),
+    ))
 }
 
 /// Walk up from `env` to the nearest variable environment (function body, global, or `eval` scope) —
@@ -390,7 +444,7 @@ pub fn new_with_scope(parent: Env, obj: Value) -> Env {
 pub fn nearest_var_env(env: &Env) -> Env {
     let mut cur = env.clone();
     loop {
-        if cur.borrow().var_boundary {
+        if cur.borrow().var_boundary() {
             return cur;
         }
         let parent = cur.borrow().parent.clone();
@@ -721,10 +775,11 @@ pub struct Interp {
     /// Realm-wide proof that no Proxy has been created. Raw prototype-chain walks read it live;
     /// side-table exotics are guarded per receiver by `Object::ic_plain`.
     pub(crate) inline_ic_safe: std::cell::Cell<bool>,
-    /// Recently indexed strings' UTF-16 views, keyed by string identity (the held `Rc` pins the
-    /// pointer) — see [`StrUnits`]. Small LRU: the hot case is one big source string being
-    /// scanned a unit at a time.
-    pub(crate) str_units: Vec<(crate::lstr::LStr, StrUnits)>,
+    /// Recently indexed non-ASCII strings' UTF-16 position indexes (see [`crate::str_index`]),
+    /// keyed by string identity: the held `LStr` pins the pointer and keeps the string shared,
+    /// so it is never appended to in place under its index. Small LRU (the hot case is one big
+    /// source string scanned a unit at a time), emptied by every collection.
+    pub(crate) str_units: Vec<(crate::lstr::LStr, crate::str_index::UnitIndex)>,
     /// Prepared regex subjects keyed by string identity and Unicode mode. The retained `LStr`
     /// pins each pointer, making the integer key ABA-safe. This cache is deliberately larger
     /// than the tiny UTF-16 indexing LRU: web workloads commonly prepare thousands of immutable
@@ -740,6 +795,10 @@ pub struct Interp {
     /// Live interpreter recursion depth (expression eval + calls). Bounded by [`MAX_EVAL_DEPTH`]
     /// so runaway recursion throws a RangeError instead of overflowing the native stack.
     pub(crate) depth: u32,
+    /// The depth at which fast call paths (and JIT direct calls, which have no native stack
+    /// check) defer to [`Interp::call`]; refreshed there from the native stack headroom (see
+    /// [`Interp::stack_guard`]). 0 forces the next call through the checked path.
+    pub(crate) depth_limit: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
@@ -883,7 +942,7 @@ pub struct Interp {
     /// unhandled rejection the embedder can report (see [`Engine::take_unhandled_rejections`]).
     /// Keyed by the promise object's pointer; holds `(promise, reason)` so the runtime can hand
     /// both to a global `unhandledrejection` handler.
-    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (Value, Value)>,
+    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (Value, Value, u64)>,
     /// Temporal object internal slots, keyed by the object's pointer.
     pub(crate) temporal: crate::fasthash::FastMap<usize, crate::temporal::Temporal>,
     /// The calendar id of a Temporal date-bearing object (default "iso8601"), keyed by object ptr.
@@ -921,6 +980,11 @@ pub struct Interp {
     pub(crate) heap_limit_hit: bool,
     /// Live-object ceiling for this realm: `MAX_LIVE` unless the embedder lowers it.
     pub(crate) live_limit: i64,
+    /// Allocated-bytes ceiling (see `Engine::set_heap_limit`); 0 = none.
+    pub(crate) heap_limit: usize,
+    /// The ceiling checks compare against: `heap_limit`, raised by a headroom once an
+    /// out-of-memory error was thrown so its handler can run (see [`Interp::heap_over`]).
+    pub(crate) heap_ceiling: usize,
     /// Prune the scope registry once its entry count passes this floating threshold.
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
@@ -1037,7 +1101,7 @@ pub struct Job {
     pub(crate) idx: u32,
     /// The async context (see [`Interp::async_context`]) captured when the reaction was
     /// registered; the handler runs inside it.
-    pub context: Value,
+    pub(crate) context: crate::value::PackedValue,
 }
 
 /// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
@@ -1096,6 +1160,10 @@ pub const MAX_LIVE: i64 = 3_000_000;
 pub const GC_TRIGGER: i64 = 100_000;
 /// Layered calls check allocation counters once per 256 calls.
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
+/// Native long loops poll the interrupt and heap limit every this many iterations (a power of 2).
+pub(crate) const NATIVE_POLL_STRIDE: usize = 4096;
+/// Smallest headroom granted past the heap limit once its RangeError was thrown.
+const HEAP_HEADROOM_MIN: usize = 16 << 20;
 /// Scope-registry entry count that arms a registry prune.
 const SCOPE_GC_TRIGGER: usize = 4_096;
 
@@ -1241,7 +1309,7 @@ impl Interp {
                 mutable: false,
                 strict_immutable: true,
                 initialized: true,
-                import_ref: None,
+                import: false,
                 deletable: false,
             },
         );
@@ -1371,6 +1439,7 @@ impl Interp {
             console: Vec::new(),
             strict: false,
             depth: 0,
+            depth_limit: 0,
             class_info: Default::default(),
             ctor_plans: Default::default(),
             plan_cache: None,
@@ -1448,6 +1517,8 @@ impl Interp {
             terminating: false,
             heap_limit_hit: false,
             live_limit: MAX_LIVE,
+            heap_limit: 0,
+            heap_ceiling: 0,
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
             super_call_ok: false,
@@ -1492,7 +1563,7 @@ impl Interp {
                 mutable: false,
                 strict_immutable: true,
                 initialized: true,
-                import_ref: None,
+                import: false,
                 deletable: false,
             },
         );
@@ -2534,8 +2605,14 @@ impl Interp {
         // maps and patches the two identity-dependent values in place — value writes never
         // touch the shape. A closure without a `prototype` has nothing to patch, so its clone
         // shares the template's entry block until (if ever) something writes to it.
+        // An ordinary function's `.prototype` is created on first observation instead (see
+        // [`Interp::materialize`]): until then the closure shares the template's entry block
+        // like a prototype-less one. Only while a single realm exists, so materializing never
+        // has to ask which realm's %Object.prototype% to use for a closure made elsewhere.
+        let lazy_kind = has_prototype && !is_generator;
         let crate::value::FnMaps {
             fn_map,
+            eager_map,
             proto_map,
             named,
         } = &**func.fn_maps.get_or_init(|| {
@@ -2560,11 +2637,18 @@ impl Interp {
                     p.insert(k, prop);
                 }
             }
+            let mut eager = None;
             if has_prototype {
-                p.insert(
+                let mut e = p.clone();
+                e.insert(
                     crate::value::fn_key(2), // "prototype" (placeholder value; patched per clone)
                     Property::data(Value::Undefined, true, false, false),
                 );
+                if lazy_kind {
+                    eager = Some(e);
+                } else {
+                    p = e;
+                }
             }
             let pp = if has_prototype {
                 let mut q = crate::value::Props::new();
@@ -2578,18 +2662,23 @@ impl Interp {
                 }
                 Some(q)
             } else {
-                p.share_entries();
                 None
             };
+            if !has_prototype || lazy_kind {
+                p.share_entries();
+            }
             Box::new(crate::value::FnMaps {
                 fn_map: p,
+                eager_map: eager,
                 proto_map: pp,
                 named: std::cell::OnceCell::new(),
             })
         });
+        let lazy = lazy_kind && !self.multi_realm();
+        let eager = has_prototype && !lazy;
         let mut named_done = false;
         let props = match name {
-            Some(n) if !has_prototype && func.name.as_deref().is_none_or(str::is_empty) => {
+            Some(n) if !eager && func.name.as_deref().is_none_or(str::is_empty) => {
                 let (cached, p) = &**named.get_or_init(|| {
                     let mut p = fn_map.clone();
                     p.insert(
@@ -2606,47 +2695,175 @@ impl Interp {
                     fn_map.clone()
                 }
             }
-            _ => fn_map.clone(),
+            _ => match eager_map {
+                Some(e) if eager => e.clone(),
+                _ => fn_map.clone(),
+            },
         };
         let obj = Object::new_with_parts(Some(fn_proto), props, Exotic::None);
         obj.borrow_mut().call = Callable::user(func.clone(), env);
-        if has_prototype {
+        if lazy {
+            // Every inline cache and fast path misses a non-plain object, so the missing
+            // `prototype` is only ever observed through a path that materializes it first.
+            obj.borrow().ic_plain.set(false);
+        } else if has_prototype {
             let proto_parent = match (is_generator, is_async) {
                 (true, false) => self.extra_protos.get("%GeneratorPrototype%").cloned(),
                 (true, true) => self.extra_protos.get("%AsyncGeneratorPrototype%").cloned(),
                 _ => None,
             }
-            .or_else(|| Some(self.object_proto.clone()));
-            let proto = Object::new_bare(proto_parent);
-            {
-                let mut pb = proto.borrow_mut();
-                pb.props = proto_map.as_ref().expect("prototype template").clone();
-                if !is_generator {
-                    pb.props
-                        .entry_at_mut(0)
-                        .expect("constructor slot")
-                        .set_value(Value::Obj(obj.clone()));
-                }
-            }
-            if !is_generator {
-                // The fn <-> prototype cycle: freed by refcount once both are unreachable.
-                Gc::mark_fn_proto_pair(&obj, &proto);
-            }
-            // `prototype` follows length, name and (legacy functions) arguments, caller.
-            let mut b = obj.borrow_mut();
-            let at = match b.props.entry_at_mut(2) {
-                Some(p) if p.accessor() => 4,
-                _ => 2,
-            };
-            b.props
-                .entry_at_mut(at)
-                .expect("prototype slot")
-                .set_value(Value::Obj(proto));
+            .unwrap_or_else(|| self.object_proto.clone());
+            Self::attach_fn_prototype(&obj, proto_map.as_ref(), proto_parent, !is_generator);
         }
         if !is_arrow && !is_method && !is_async && !is_generator {
             obj.borrow_mut().is_constructor = true;
         }
         (Value::Obj(obj), named_done || name.is_none())
+    }
+
+    /// Give function `f`, whose map holds the `prototype` placeholder, a fresh `.prototype` on
+    /// `parent` built from `proto_map`, whose `constructor` points back at `f` when `ctor`.
+    fn attach_fn_prototype(f: &Gc, proto_map: Option<&crate::value::Props>, parent: Gc, ctor: bool) {
+        let proto = Object::new_bare(Some(parent));
+        {
+            let mut pb = proto.borrow_mut();
+            pb.props = proto_map.expect("prototype template").clone();
+            if ctor {
+                pb.props
+                    .entry_at_mut(0)
+                    .expect("constructor slot")
+                    .set_value(Value::Obj(f.clone()));
+            }
+        }
+        if ctor {
+            // The fn <-> prototype cycle: freed by refcount once both are unreachable.
+            Gc::mark_fn_proto_pair(f, &proto);
+        }
+        let mut b = f.borrow_mut();
+        let at = b.props.prototype_slot().expect("prototype slot") as usize;
+        b.props
+            .entry_at_mut(at)
+            .expect("prototype slot")
+            .set_value(Value::Obj(proto));
+    }
+
+    /// Bring a lazily represented object into its ordinary form before a path that reads or
+    /// writes its property map directly: a split view becomes its Array (see
+    /// `crate::split_view`), and a function whose `.prototype` was deferred (see
+    /// [`Interp::make_function_named`]) gets it, at V8's key position. Neither is observable.
+    /// Both kinds clear `ic_plain`, so everything else pays one byte test. The object must not
+    /// be borrowed.
+    #[inline]
+    pub(crate) fn materialize(&self, o: &Gc) {
+        if matches!(o.try_borrow(), Ok(b) if !b.ic_plain.get()) {
+            self.materialize_slow(o);
+        }
+    }
+
+    /// [`Interp::materialize`] for a value.
+    #[inline]
+    pub(crate) fn materialize_val(&self, v: &Value) {
+        if let Value::Obj(o) = v {
+            self.materialize(o);
+        }
+    }
+
+    /// [`Interp::materialize`] for a lazy function only, for the read paths that serve a split
+    /// view's elements in place.
+    /// Whether it did.
+    #[inline]
+    pub(crate) fn materialize_fn(&self, o: &Gc) -> bool {
+        matches!(o.try_borrow(), Ok(b) if !b.ic_plain.get() && matches!(b.call, Callable::User(_)))
+            && self.materialize_fn_slow(o)
+    }
+
+    /// [`Interp::materialize_fn`] for a value.
+    #[inline]
+    pub(crate) fn materialize_fn_val(&self, v: &Value) {
+        if let Value::Obj(o) = v {
+            self.materialize_fn(o);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn materialize_slow(&self, o: &Gc) {
+        crate::split_view::unview(o);
+        self.materialize_fn_slow(o);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn materialize_fn_slow(&self, o: &Gc) -> bool {
+        let parent = self
+            .multi_realm()
+            .then(|| self.callee_realm_global(o))
+            .flatten()
+            .and_then(|g| self.realms.get(&g))
+            .map_or_else(|| self.object_proto.clone(), |r| r.object_proto.clone());
+        // A caller up the stack still holding a borrow of `o` (reading through it) leaves the
+        // function lazy for now; the next access retries.
+        let Ok(mut b) = o.try_borrow_mut() else {
+            return false;
+        };
+        let func = match &b.call {
+            Callable::User(u) => u.func.clone(),
+            _ => return false,
+        };
+        let Some(maps) = func.fn_maps.get() else {
+            return false;
+        };
+        let Some(eager) = maps.eager_map.as_ref() else {
+            return false;
+        };
+        let at = eager.prototype_slot().expect("prototype slot") as usize;
+        let props = if b.props.shares_entries_with(&maps.fn_map) {
+            eager.clone()
+        } else if b.props.shape() == maps.fn_map.shape() {
+            // The template's keys (only `name` may have been given a value since).
+            let mut p = eager.clone();
+            let mut k = 0;
+            while let Some(prop) = b.props.entry_at(k) {
+                *p.entry_at_mut(k).expect("template slot") = prop.clone();
+                k += 1;
+            }
+            p
+        } else if b.props.contains("prototype") {
+            // A class constructor's map gets its own `prototype` when the class is built.
+            b.ic_plain.set(true);
+            return true;
+        } else {
+            // Keys added without materializing follow `prototype`, as they would have.
+            let mut p = crate::value::Props::new();
+            for (k, (key, prop)) in b.props.iter().enumerate() {
+                if k == at {
+                    p.insert(crate::value::fn_key(2), eager.entry_at(at).unwrap().clone());
+                }
+                p.insert(key, prop.clone());
+            }
+            if !p.contains("prototype") {
+                p.insert(crate::value::fn_key(2), eager.entry_at(at).unwrap().clone());
+            }
+            p
+        };
+        let proto = Object::new_bare(Some(parent));
+        {
+            let mut pb = proto.borrow_mut();
+            pb.props = maps.proto_map.as_ref().expect("prototype template").clone();
+            pb.props
+                .entry_at_mut(0)
+                .expect("constructor slot")
+                .set_value(Value::Obj(o.clone()));
+        }
+        b.props = props;
+        b.props
+            .entry_at_mut(at)
+            .expect("prototype slot")
+            .set_value(Value::Obj(proto.clone()));
+        b.ic_plain.set(true);
+        drop(b);
+        Gc::mark_fn_proto_pair(o, &proto);
+        true
     }
 
     // ----- property access --------------------------------------------------------------------
@@ -3012,6 +3229,12 @@ impl Interp {
                 if let Some(v) = self.try_ic_get(o, name, cache) {
                     return Ok(v);
                 }
+                // A lazy function misses every IC until its `.prototype` exists.
+                if self.materialize_fn(o) {
+                    if let Some(v) = self.try_ic_get(o, name, cache) {
+                        return Ok(v);
+                    }
+                }
                 // A split view misses every IC; its `length` is the stored own data property.
                 if name == "length" {
                     if let Some(v) = crate::split_view::view_length(o) {
@@ -3150,7 +3373,7 @@ impl Interp {
     /// `getter`: probe a getter state instead (the result is the getter function to call).
     fn ic_shape_probe(
         &self,
-        head: *const std::cell::RefCell<Object>,
+        head: *const crate::value::ObjCell,
         name: &str,
         st: crate::bytecode::IcState,
         getter: bool,
@@ -3275,7 +3498,7 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Option<Value> {
         use crate::bytecode::{IcState, IC_MAX_DEPTH};
-        type ObjCell = std::cell::RefCell<Object>;
+        type ObjCell = crate::value::ObjCell;
         let head = Gc::as_ptr(o);
         // Re-derive: walk the chain by raw pointer (every object is kept alive transitively by
         // `o`, nothing mutates during the read). On a plain data hit within reach record
@@ -3418,7 +3641,9 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<(), Abrupt> {
         if let Value::Obj(o) = base {
-            if self.try_ic_set(o, name, &v, cache) {
+            if self.try_ic_set(o, name, &v, cache)
+                || (self.materialize_fn(o) && self.try_ic_set(o, name, &v, cache))
+            {
                 return Ok(());
             }
         }
@@ -3536,11 +3761,18 @@ impl Interp {
                 {
                     let cached_proto = (((st.mid2_shape as u64) << 32) | st.slot as u64) as usize;
                     if cached_proto == proto_ptr {
-                        b.props.append_new(
+                        let hit = b.props.append_new(
                             name.clone(),
                             Property::plain(v.clone()),
                             st.holder_shape,
                         );
+                        // The recorded child shape was reclaimed: record the one it re-minted.
+                        if !hit && b.props.shape_is_shared() {
+                            self.ic_way(cache, way).set(crate::bytecode::IcState {
+                                holder_shape: b.props.shape(),
+                                ..st
+                            });
+                        }
                         return true;
                     }
                 }
@@ -3602,7 +3834,7 @@ impl Interp {
     fn try_ic_create(
         &mut self,
         _o: &Gc,
-        mut b: std::cell::RefMut<'_, crate::value::Object>,
+        mut b: crate::value::RefMut<'_>,
         name: &Rc<str>,
         v: &Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
@@ -3836,7 +4068,7 @@ impl Interp {
                 // Proxy: invoke the `get` trap, or forward to the target.
                 if !self.proxies.is_empty() {
                     if let Some((target, handler)) = self.proxy_at(ptr) {
-                        let trap = self.get_member(&handler, "get")?;
+                        let trap = self.proxy_trap(&handler, "get")?;
                         if matches!(trap, Value::Undefined | Value::Null) {
                             // Forward to the target's [[Get]], preserving the original Receiver.
                             return self.get_member_recv(&target, key, receiver);
@@ -3894,13 +4126,15 @@ impl Interp {
         while let Some(obj) = cur {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&obj, Some(key))?;
+            // A lazy function gets its `.prototype` (any read: its caches then hit again).
+            self.materialize_fn(&obj);
             // A proxy anywhere on the chain handles the read itself (with the original receiver).
             let ptr = Gc::as_ptr(&obj) as usize;
             if let Some((target, handler)) = self.proxy_at(ptr) {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
                 }
-                let trap = self.get_member(&handler, "get")?;
+                let trap = self.proxy_trap(&handler, "get")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     return self.get_member_recv(&target, key, receiver.clone());
                 }
@@ -4108,9 +4342,7 @@ impl Interp {
                         // Update the own property's value in place — its attributes (e.g. a
                         // configurable:false from defineProperty) must survive.
                         let mut b = o.borrow_mut();
-                        if let Some(p) = b.props.get_mut(key) {
-                            p.set_value(value);
-                        } else {
+                        if !b.props.set_existing_value(key, value.clone()) {
                             b.props
                                 .insert(key, crate::value::Property::data(value, true, true, true));
                         }
@@ -4144,12 +4376,12 @@ impl Interp {
                 };
                 let mut cur = proto;
                 while let Some(o) = cur {
-                    crate::split_view::unview(&o);
+                    self.materialize(&o);
                     // A proxy on the chain (or any accessor) takes over with the original receiver.
                     if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
                         return self.set_member_recv(&Value::Obj(o), key, value, receiver);
                     }
-                    let prop = o.borrow().props.get(key).cloned();
+                    let prop = o.borrow().props.get(key).map(|p| p.clone());
                     if let Some(p) = prop {
                         if p.accessor() {
                             return match p.setter().cloned() {
@@ -4188,7 +4420,7 @@ impl Interp {
         };
 
         // A split view becomes an ordinary Array before any write (see `crate::split_view`).
-        crate::split_view::unview(&obj);
+        self.materialize(&obj);
         let ptr = Gc::as_ptr(&obj) as usize;
         // A module namespace exotic object's [[Set]] always fails: in strict code (all module code
         // is strict) the assignment throws a TypeError; a sloppy caller sees an inert no-op. The
@@ -4208,7 +4440,7 @@ impl Interp {
         // Proxy: invoke the `set` trap, or forward to the target.
         if !self.proxies.is_empty() {
             if let Some((target, handler)) = self.proxy_at(ptr) {
-                let trap = self.get_member(&handler, "set")?;
+                let trap = self.proxy_trap(&handler, "set")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     // Forward to the target's [[Set]], preserving the original Receiver.
                     return self.set_member_recv(&target, key, value, receiver);
@@ -4259,7 +4491,7 @@ impl Interp {
         // Walk the chain for an accessor or read-only data property.
         let mut cur = Some(obj.clone());
         while let Some(o) = cur {
-            crate::split_view::unview(&o);
+            self.materialize(&o);
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&o, Some(key))?;
             // A proxy on the chain handles the write itself (with the original receiver).
@@ -4268,7 +4500,7 @@ impl Interp {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'set' on a revoked proxy"));
                 }
-                let trap = self.get_member(&handler, "set")?;
+                let trap = self.proxy_trap(&handler, "set")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     return self.set_member_recv(&target, key, value, receiver);
                 }
@@ -4320,7 +4552,7 @@ impl Interp {
                     }
                 }
             }
-            let prop = o.borrow().props.get(key).cloned();
+            let prop = o.borrow().props.get(key).map(|p| p.clone());
             if let Some(p) = prop {
                 if p.accessor() {
                     return match p.setter().cloned() {
@@ -4371,7 +4603,7 @@ impl Interp {
         // probing the binding first so a TDZ export surfaces ReferenceError.
         let obj = match &receiver {
             Value::Obj(r) if !Gc::ptr_eq(r, &obj) => {
-                crate::split_view::unview(r);
+                self.materialize(r);
                 // A deferred-namespace receiver evaluates before its own properties are consulted.
                 self.defer_trigger(r, Some(key))?;
                 let rptr = Gc::as_ptr(r) as usize;
@@ -4428,9 +4660,7 @@ impl Interp {
                     }
                     return Ok(false);
                 }
-                if let Some(p) = obj.borrow_mut().props.get_mut(key) {
-                    p.set_value(value);
-                }
+                obj.borrow_mut().props.set_existing_value(key, value);
             } else {
                 if !obj.borrow().extensible {
                     if self.strict {
@@ -4544,9 +4774,7 @@ impl Interp {
         }
         // An existing element keeps its attributes; [[Set]] only updates the value.
         if obj.borrow().props.contains(key) {
-            if let Some(p) = obj.borrow_mut().props.get_mut(key) {
-                p.set_value(value);
-            }
+            obj.borrow_mut().props.set_existing_value(key, value);
         } else {
             obj.borrow_mut().props.insert(key, Property::plain(value));
         }
@@ -4658,83 +4886,112 @@ impl Interp {
 
     // ----- garbage collection -----------------------------------------------------------------
 
-    /// Allocation safe point. When live objects pass the floating threshold, run the cycle
-    /// collector; if genuine retention still exceeds `MAX_LIVE`, throw rather than exhaust RAM.
-    /// The cached UTF-16 view of `s` (see [`StrUnits`]): first access per string is O(len),
-    /// every later one O(1) — pointer-compared against a small LRU. Short strings skip the
-    /// cache entirely (the O(len) walk is trivial; caching them would just churn the LRU under
-    /// code that touches thousands of small strings once each).
-    pub(crate) fn units_of(&mut self, s: &crate::lstr::LStr) -> StrUnits {
-        if s.len() < 64 {
-            return if s.is_ascii() {
-                StrUnits::Ascii
-            } else {
-                StrUnits::Units(crate::jstr::units(s).into())
-            };
+    /// The position index of a non-ASCII string of at least [`STR_INDEX_MIN`] bytes.
+    #[inline]
+    fn str_index(&mut self, s: &crate::lstr::LStr) -> &crate::str_index::UnitIndex {
+        let n = self.str_units.len();
+        if n > 0 && crate::lstr::LStr::ptr_eq(&self.str_units[n - 1].0, s) {
+            return &self.str_units[n - 1].1;
         }
+        self.str_index_slow(s)
+    }
+
+    #[cold]
+    fn str_index_slow(&mut self, s: &crate::lstr::LStr) -> &crate::str_index::UnitIndex {
         if let Some(k) = self
             .str_units
             .iter()
             .position(|(k, _)| crate::lstr::LStr::ptr_eq(k, s))
         {
-            let hit = self.str_units[k].1.clone();
             // Keep the hot entry last (evictions pop from the front).
             let n = self.str_units.len();
             self.str_units.swap(k, n - 1);
-            return hit;
+            return &self.str_units[n - 1].1;
         }
-        let u = if s.is_ascii() {
-            StrUnits::Ascii
+        let ix = crate::str_index::UnitIndex::new(s);
+        if ix.len == s.len() {
+            s.mark_ascii();
+        }
+        if self.str_units.len() >= 8 {
+            self.str_units.remove(0);
+        }
+        self.str_units.push((s.clone(), ix));
+        &self.str_units.last().unwrap().1
+    }
+
+    /// Position `(byte, mid)` of UTF-16 unit `t` (at most the length) of `s`: the char at
+    /// `byte` holds it, `mid` = it is the low half of that char's surrogate pair.
+    pub(crate) fn unit_pos(&mut self, s: &crate::lstr::LStr, t: usize) -> (usize, bool) {
+        if s.ascii_hint() {
+            (t.min(s.len()), false)
+        } else if s.len() < STR_INDEX_MIN {
+            crate::str_index::locate_scan(s, t)
         } else {
-            StrUnits::Units(crate::jstr::units(s).into())
-        };
-        if self.str_units.len() >= 8 {
-            self.str_units.remove(0);
+            self.str_index(s).locate(s, t)
         }
-        self.str_units.push((s.clone(), u.clone()));
-        u
     }
 
-    /// Code unit `idx` of `s`, through the cache. `None` = out of range.
+    /// UTF-16 offset of the char boundary `byte` of `s`.
+    pub(crate) fn unit_of_byte(&mut self, s: &crate::lstr::LStr, byte: usize) -> usize {
+        if s.ascii_hint() {
+            byte
+        } else if s.len() < STR_INDEX_MIN {
+            crate::str_index::unit_of_byte_scan(s, byte)
+        } else {
+            self.str_index(s).unit_of_byte(s, byte)
+        }
+    }
+
+    /// Code unit `idx` of `s`. `None` = out of range.
     pub(crate) fn unit_at(&mut self, s: &crate::lstr::LStr, idx: usize) -> Option<u16> {
-        match self.units_of(s) {
-            StrUnits::Ascii => s.as_bytes().get(idx).map(|&b| b as u16),
-            StrUnits::Units(u) => u.get(idx).copied(),
+        if s.ascii_hint() {
+            return s.as_bytes().get(idx).map(|&b| b as u16);
         }
-    }
-
-    /// The fully materialized unit vector (for range/search operations): an ASCII entry is
-    /// promoted in place, so the copy happens once per string, not per call.
-    pub(crate) fn units_full(&mut self, s: &crate::lstr::LStr) -> Rc<[u16]> {
-        if s.len() < 64 {
-            return crate::jstr::units(s).into();
-        }
-        if let Some(k) = self
-            .str_units
-            .iter()
-            .position(|(k, _)| crate::lstr::LStr::ptr_eq(k, s))
-        {
-            if let StrUnits::Units(u) = &self.str_units[k].1 {
-                return u.clone();
+        if s.len() < STR_INDEX_MIN {
+            if idx >= crate::str_index::unit_len(s) {
+                return None;
             }
-            let u: Rc<[u16]> = crate::jstr::units(s).into();
-            self.str_units[k].1 = StrUnits::Units(u.clone());
-            return u;
+            let (b, mid) = crate::str_index::locate_scan(s, idx);
+            return Some(crate::str_index::unit_at_pos(s, b, mid));
         }
-        let u: Rc<[u16]> = crate::jstr::units(s).into();
-        if self.str_units.len() >= 8 {
-            self.str_units.remove(0);
-        }
-        self.str_units.push((s.clone(), StrUnits::Units(u.clone())));
-        u
+        self.str_index(s).unit_at(s, idx)
     }
 
-    /// `s.length` (UTF-16 units), through the cache.
+    /// `s.length` (UTF-16 units).
     pub(crate) fn str_len(&mut self, s: &crate::lstr::LStr) -> usize {
-        match self.units_of(s) {
-            StrUnits::Ascii => s.len(),
-            StrUnits::Units(u) => u.len(),
+        if s.ascii_hint() {
+            s.len()
+        } else if s.len() < STR_INDEX_MIN {
+            crate::str_index::unit_len(s)
+        } else {
+            self.str_index(s).len
         }
+    }
+
+    /// `s` from UTF-16 unit `a` to `b` (`b <= length`): a view or copy of the bytes, with a
+    /// surrogate pair cut at either end contributing its lone half.
+    pub(crate) fn unit_slice(&mut self, s: &crate::lstr::LStr, a: usize, b: usize) -> Value {
+        if a >= b {
+            return Value::str("");
+        }
+        let (ba, ma) = self.unit_pos(s, a);
+        let (bb, mb) = self.unit_pos(s, b);
+        if !ma && !mb {
+            return Value::Str(s.sub(&s[ba..bb]));
+        }
+        let mut out = String::with_capacity(bb - ba + 8);
+        let mut from = ba;
+        if ma {
+            out.push(crate::jstr::smuggle(crate::str_index::unit_at_pos(s, ba, true)));
+            from = ba + 4;
+        }
+        if from < bb {
+            out.push_str(&s[from..bb]);
+        }
+        if mb {
+            out.push(crate::jstr::smuggle(crate::str_index::unit_at_pos(s, bb, false)));
+        }
+        Value::from_string(out)
     }
 
     /// [`gc_check`] amortized for calls.
@@ -4751,14 +5008,18 @@ impl Interp {
         }
     }
 
+    /// Allocation safe point. When live objects pass the floating threshold, run the cycle
+    /// collector; if genuine retention still exceeds `MAX_LIVE`, throw rather than exhaust RAM.
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
         self.poll_interrupt()?;
+        self.check_heap(0)?;
         // Scope churn is tracked separately: call-heavy code can retire millions of scopes while
         // allocating few objects, and each dead weak registry entry pins its allocation.
         if scope_registry_len() > self.scope_gc_next {
             let live = scope_registry_prune();
             self.scope_gc_next = live.saturating_mul(2).max(SCOPE_GC_TRIGGER);
         }
+        crate::value::gc_trim_emptied();
         let before = crate::value::live_objects();
         if before <= self.gc_next && !crate::bytebuf::gc_pressure() {
             return Ok(());
@@ -4797,6 +5058,85 @@ impl Interp {
 
     }
 
+    /// Poll for every `STRIDE`th `k` of a native loop that may run for a very long time (an
+    /// array-like method over `{length: 2**53 - 1}`): the interrupt, the script deadline and the
+    /// heap limit, as a loop turn in script code would.
+    #[inline(always)]
+    pub(crate) fn poll_native(&mut self, k: usize) -> Result<(), Abrupt> {
+        if k & (NATIVE_POLL_STRIDE - 1) == 0 && k != 0 {
+            self.poll_native_now()
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn poll_native_now(&mut self) -> Result<(), Abrupt> {
+        self.poll_interrupt()?;
+        self.check_heap(0)
+    }
+
+    /// Before pushing onto `v`: when the push would reallocate a large buffer (doubling it),
+    /// check the heap limit against the growth first, so one doubling cannot overshoot it.
+    #[inline(always)]
+    pub(crate) fn check_grow<T>(&mut self, v: &Vec<T>) -> Result<(), Abrupt> {
+        if self.heap_limit != 0 && v.len() == v.capacity() && v.len() >= 1 << 16 {
+            self.check_heap(v.len() * std::mem::size_of::<T>())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Throw "JavaScript heap out of memory" if the process's allocated bytes plus `extra` (a
+    /// large allocation about to happen) exceed the heap limit, after trying a collection.
+    #[inline]
+    pub(crate) fn check_heap(&mut self, extra: usize) -> Result<(), Abrupt> {
+        if self.heap_limit == 0 {
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(used) = crate::fastalloc::heap_bytes() {
+            if used.saturating_add(extra) > self.heap_ceiling {
+                return self.heap_over(extra);
+            }
+            if self.heap_ceiling != self.heap_limit && used <= self.heap_limit {
+                self.heap_ceiling = self.heap_limit;
+            }
+        }
+        let _ = extra;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn heap_over(&mut self, extra: usize) -> Result<(), Abrupt> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.gc_collect();
+            crate::bytebuf::after_gc();
+            let used = crate::fastalloc::heap_bytes().unwrap_or(0);
+            if used.saturating_add(extra) <= self.heap_ceiling {
+                return Ok(());
+            }
+            if used > self.heap_limit {
+                if self.heap_ceiling == self.heap_limit {
+                    // Headroom for the handler, as with `live_limit`: the `catch` block's own
+                    // allocations must not throw again before it can drop what it retains.
+                    self.heap_ceiling = self
+                        .heap_limit
+                        .saturating_add((self.heap_limit / 8).max(HEAP_HEADROOM_MIN));
+                } else if self.interrupt.is_some() {
+                    self.heap_limit_hit = true;
+                    self.terminating = true;
+                    return Err(self.termination());
+                }
+            }
+        }
+        let _ = extra;
+        Err(self.throw("RangeError", "JavaScript heap out of memory"))
+    }
+
     /// Throw the termination if the embedder asked this realm to stop. Cheap when it has not:
     /// one branch on `terminating`, one relaxed load.
     #[inline]
@@ -4819,12 +5159,55 @@ impl Interp {
         Err(self.termination())
     }
 
+    /// Run a long native BigInt computation so the interrupt and script deadline can stop it.
+    pub(crate) fn big_guard<T>(&mut self, f: impl FnOnce() -> T) -> Result<T, Abrupt> {
+        match crate::bigint::interruptible(&self.interrupt, &self.script_timeout, f) {
+            Some(v) => Ok(v),
+            None => {
+                self.poll_interrupt()?;
+                Err(self.throw("Error", "realm terminated"))
+            }
+        }
+    }
+
+    pub(crate) fn sync_regex_poll(&self) {
+        crate::regex::set_host_poll(
+            self.interrupt.clone(),
+            self.script_timeout.clone(),
+            self.heap_limit,
+        );
+    }
+
+    /// The error for a regex `exec` the matcher aborted: the realm's termination, the script
+    /// timeout, or the heap limit.
+    pub(crate) fn regex_abort_error(&mut self, abort: crate::regex::Abort) -> Value {
+        use crate::regex::Abort;
+        match abort {
+            Abort::Interrupt => {
+                self.terminating = true;
+                self.make_error("Error", "realm terminated")
+            }
+            Abort::Deadline => self.make_error("Error", "Script execution timed out"),
+            _ => {
+                if self.interrupt.is_some() {
+                    self.heap_limit_hit = true;
+                    self.terminating = true;
+                    return self.make_error("Error", "realm terminated");
+                }
+                self.make_error("RangeError", "JavaScript heap out of memory")
+            }
+        }
+    }
+
     /// The flag behind `script_timeout`, created on first use. A host thread sets it when a
     /// deadline passes; the host clears it once the bounded run has unwound.
     pub fn script_timeout_flag(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        self.script_timeout
+        let flag = self
+            .script_timeout
             .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-            .clone()
+            .clone();
+        self.sync_regex_poll();
+        flag
     }
 
     /// The error a terminated realm throws. An ordinary `Error`, so native code that catches and
@@ -4910,6 +5293,7 @@ impl Interp {
 
 
     pub(crate) fn gc_collect(&mut self) {
+        self.str_units.clear();
         GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let live = crate::value::gc_snapshot();
 
@@ -4949,17 +5333,17 @@ impl Interp {
                     s_internal[k] += 1;
                 }
             }
-            if let Some(Value::Obj(o)) = &b.with_obj {
+            if let Some(Value::Obj(o)) = b.with_obj() {
                 o.borrow().gc_add_ref();
             }
             for bind in b.vars.values() {
                 if let Value::Obj(o) = &bind.value {
                     o.borrow().gc_add_ref();
                 }
-                if let Some((ie, _)) = bind.import_ref.as_deref() {
-                    if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
-                        s_internal[k] += 1;
-                    }
+            }
+            for ie in b.import_envs() {
+                if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
+                    s_internal[k] += 1;
                 }
             }
         }
@@ -4974,11 +5358,13 @@ impl Interp {
         // weak collection holds, must not root its entries. Strong collections trace them when
         // marked; weak ones as ephemerons (below).
         for data in self.map_data.values() {
+            // A Set holds one reference per entry: its value is the key itself.
+            let values = data.has_values();
             for (k, v) in data.iter() {
-                if let Value::Obj(o) = k {
+                if let Value::Obj(o) = &*k.get() {
                     o.borrow().gc_add_ref();
                 }
-                if let Value::Obj(o) = v {
+                if let (true, Value::Obj(o)) = (values, &*v.get()) {
                     o.borrow().gc_add_ref();
                 }
             }
@@ -5057,7 +5443,7 @@ impl Interp {
                         } else {
                             for (k, v) in data.iter() {
                                 for x in [k, v] {
-                                    if let Value::Obj(p) = x {
+                                    if let Value::Obj(p) = &*x.get() {
                                         if !p.borrow().gc_marked() {
                                             p.borrow().gc_set_mark();
                                             stack.push(p.clone());
@@ -5084,11 +5470,11 @@ impl Interp {
                 // then resume marking from them until nothing changes.
                 for ptr in &weak_live {
                     for (k, v) in self.map_data[ptr].iter() {
-                        let key_live = match k {
+                        let key_live = match &*k.get() {
                             Value::Obj(ko) => ko.borrow().gc_marked(),
                             _ => true,
                         };
-                        if let (true, Value::Obj(vo)) = (key_live, v) {
+                        if let (true, Value::Obj(vo)) = (key_live, &*v.get()) {
                             if !vo.borrow().gc_marked() {
                                 vo.borrow().gc_set_mark();
                                 stack.push(vo.clone());
@@ -5110,7 +5496,7 @@ impl Interp {
                     }
                 }
             }
-            if let Some(Value::Obj(o)) = &b.with_obj {
+            if let Some(Value::Obj(o)) = b.with_obj() {
                 if !o.borrow().gc_marked() {
                     o.borrow().gc_set_mark();
                     stack.push(o.clone());
@@ -5123,12 +5509,12 @@ impl Interp {
                         stack.push(o.clone());
                     }
                 }
-                if let Some((ie, _)) = bind.import_ref.as_deref() {
-                    if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
-                        if !s_mark[k] {
-                            s_mark[k] = true;
-                            sstack.push(ie.clone());
-                        }
+            }
+            for ie in b.import_envs() {
+                if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
+                    if !s_mark[k] {
+                        s_mark[k] = true;
+                        sstack.push(ie.clone());
                     }
                 }
             }
@@ -5140,11 +5526,11 @@ impl Interp {
             let data = self.map_data.get_mut(ptr).unwrap();
             let dead: Vec<Value> = data
                 .iter()
-                .filter(|(k, _)| matches!(k, Value::Obj(ko) if !ko.borrow().gc_marked()))
-                .map(|(k, _)| k.clone())
+                .filter(|(k, _)| matches!(&*k.get(), Value::Obj(ko) if !ko.borrow().gc_marked()))
+                .map(|(k, _)| k.unpack())
                 .collect();
             for k in &dead {
-                data.remove_weak(k);
+                data.remove(k);
             }
         }
 
@@ -5185,7 +5571,7 @@ impl Interp {
                 let mut b = e.borrow_mut();
                 b.vars.clear();
                 b.parent = None;
-                b.with_obj = None;
+                b.clear_with_obj();
             }
         }
         // Release the snapshot handles first: only then do swept objects and their property
@@ -5231,7 +5617,7 @@ impl Interp {
             return self.call_native_fast(f, this, args);
         }
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -5268,6 +5654,38 @@ impl Interp {
         r
     }
 
+    /// Whether the native stack is nearly exhausted; otherwise refreshes `depth_limit` from the
+    /// remaining headroom.
+    #[inline]
+    pub(crate) fn stack_guard(&mut self) -> bool {
+        match crate::stack::headroom() {
+            Some(room) => {
+                self.depth_limit = crate::stack::depth_cap(self.depth, room, MAX_EVAL_DEPTH);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// A RangeError ("Maximum call stack size exceeded") when the native stack is nearly
+    /// exhausted — for recursive natives (JSON, RegExp) that recurse without calling back in.
+    #[inline]
+    pub(crate) fn check_native_stack(&mut self) -> Result<(), Abrupt> {
+        if crate::stack::exhausted() {
+            Err(self.throw("RangeError", "Maximum call stack size exceeded"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// GetMethod(handler, name) for a proxy internal method. Every proxy forwarding step goes
+    /// through here, so a chain of trap-less proxies hits the stack guard instead of overflowing.
+    #[inline]
+    pub(crate) fn proxy_trap(&mut self, handler: &Value, name: &str) -> Result<Value, Abrupt> {
+        self.check_native_stack()?;
+        self.get_member(handler, name)
+    }
+
     /// The bare `fn` behind `callee` when a call can skip the generic dispatch chain: a plain
     /// native function (`Callable::Native`) in a single-realm engine. A proxy wrapping a
     /// callable also carries a `Callable::Native` (its placeholder) but is never `ic_plain`, and
@@ -5297,7 +5715,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -5478,7 +5896,7 @@ impl Interp {
         if !self.proxies.is_empty() {
             if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&obj) as usize)).cloned()
             {
-                let trap = self.get_member(&handler, "apply")?;
+                let trap = self.proxy_trap(&handler, "apply")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     return self.call(target, this, args);
                 }
@@ -6200,7 +6618,7 @@ impl Interp {
             && !func.is_generator
             && !func.is_async
             // Closures under a `with` scope stay on the tree-walker (see `Scope::under_with`).
-            && !closure.borrow().under_with
+            && !closure.borrow().under_with()
         {
             // A derived class construct runs only a chunk compiled in derived mode (TDZ `this`,
             // super(), the derived return rule), and such a chunk runs nothing else.
@@ -6288,7 +6706,7 @@ impl Interp {
                         value: Value::Obj(fn_obj.clone()),
                         mutable: false,
                         initialized: true,
-                        import_ref: None,
+                        import: false,
                         deletable: false,
                         // Non-strict immutable: reassignment is a silent no-op in sloppy code.
                         strict_immutable: false,
@@ -6343,7 +6761,7 @@ impl Interp {
                         mutable: false,
                         strict_immutable: false,
                         initialized: true,
-                        import_ref: None,
+                        import: false,
                         deletable: false,
                     },
                 );
@@ -6379,7 +6797,7 @@ impl Interp {
                         mutable: false,
                         strict_immutable: true,
                         initialized: !derived_tdz,
-                        import_ref: None,
+                        import: false,
                         deletable: false,
                     },
                 );
@@ -6399,7 +6817,7 @@ impl Interp {
                         mutable: true,
                         strict_immutable: false,
                         initialized: true,
-                        import_ref: None,
+                        import: false,
                         deletable: false,
                     },
                 );
@@ -7110,7 +7528,7 @@ impl Interp {
         new_target: Value,
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -7172,7 +7590,7 @@ impl Interp {
         if !self.proxies.is_empty() {
             if let Some((target, handler)) = self.proxies.get(&(Gc::as_ptr(&obj) as usize)).cloned()
             {
-                let trap = self.get_member(&handler, "construct")?;
+                let trap = self.proxy_trap(&handler, "construct")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     // Forward to the target's [[Construct]] with the original new.target.
                     return self.construct_inner(target, args, new_target);
@@ -7321,7 +7739,7 @@ impl Interp {
         result: &Value,
     ) -> Result<(), Abrupt> {
         let prop = match target {
-            Value::Obj(t) => t.borrow().props.get(key).cloned(),
+            Value::Obj(t) => t.borrow().props.get(key).map(|p| p.clone()),
             _ => None,
         };
         if let Some(p) = prop {
@@ -7352,7 +7770,7 @@ impl Interp {
         value: &Value,
     ) -> Result<(), Abrupt> {
         let prop = match target {
-            Value::Obj(t) => t.borrow().props.get(key).cloned(),
+            Value::Obj(t) => t.borrow().props.get(key).map(|p| p.clone()),
             _ => None,
         };
         if let Some(p) = prop {
@@ -7377,7 +7795,10 @@ impl Interp {
         // GlobalDeclarationInstantiation early checks, before any binding is created. A probe
         // hoist into a throwaway scope yields this script's VarDeclaredNames.
         let probe = new_scope(None);
-        self.hoist(body, &probe, &[]);
+        let hoist_ops = collect_hoist_ops(body, self.strict, &[]);
+        self.apply_hoist_ops(&hoist_ops, &probe);
+        // In hoisting order: the probe's map iterates in (seeded) hash order.
+        let var_names = hoisted_names(&hoist_ops);
         let mut lex_names: Vec<String> = Vec::new();
         for s in body {
             match unwrap_export(s) {
@@ -7416,7 +7837,12 @@ impl Interp {
             }
         }
         let extensible = self.global.borrow().extensible;
-        for (name, binding) in probe.borrow().vars.iter() {
+        for name in &var_names {
+            let is_func = probe
+                .borrow()
+                .vars
+                .get(name)
+                .is_some_and(|b| !matches!(b.value, Value::Undefined));
             if self.global_env.borrow().vars.contains_key(name) {
                 return Err(self.make_error(
                     "SyntaxError",
@@ -7427,9 +7853,9 @@ impl Interp {
                 .global
                 .borrow()
                 .props
-                .get(&**name)
+                .get(name.as_str())
                 .map(|p| (p.configurable(), p.accessor(), p.writable(), p.enumerable()));
-            if !matches!(binding.value, Value::Undefined) {
+            if is_func {
                 // CanDeclareGlobalFunction.
                 let ok = match existing {
                     Some((true, ..)) => true,
@@ -7452,7 +7878,7 @@ impl Interp {
                 ));
             }
         }
-        let new_vars: Vec<String> = probe.borrow().vars.keys().map(|k| k.to_string()).collect();
+        let new_vars = var_names;
         self.global_var_names.extend(new_vars.iter().cloned());
         self.hoist(body, &self.global_env.clone(), &[]);
         // The global Environment Record is object-backed: this script's `var`/`function` bindings
@@ -7552,7 +7978,7 @@ impl Interp {
     }
 
     /// Replay a hoisting plan against `scope` (see [`HoistOp`] for the op semantics).
-    fn apply_hoist_ops(&mut self, ops: &[HoistOp], scope: &Env) {
+    pub(crate) fn apply_hoist_ops(&mut self, ops: &[HoistOp], scope: &Env) {
         for op in ops {
             match op {
                 HoistOp::Var(name) => {
@@ -7581,7 +8007,7 @@ impl Interp {
                             mutable: true,
                             strict_immutable: false,
                             initialized: true,
-                            import_ref: None,
+                            import: false,
                             deletable: false,
                         },
                     );
@@ -7616,9 +8042,23 @@ fn undef_var_binding() -> Binding {
         mutable: true,
         strict_immutable: false,
         initialized: true,
-        import_ref: None,
+        import: false,
         deletable: false,
     }
+}
+
+/// The names a hoisting plan binds, in the order it first binds them.
+pub(crate) fn hoisted_names(ops: &[HoistOp]) -> Vec<String> {
+    let mut seen = crate::fasthash::FastSet::default();
+    ops.iter()
+        .filter_map(|op| {
+            let (HoistOp::Var(name)
+            | HoistOp::VarForce(name)
+            | HoistOp::Fn(name, _)
+            | HoistOp::AnnexB(name, _)) = op;
+            seen.insert(name.as_str()).then(|| name.clone())
+        })
+        .collect()
 }
 
 /// Build the hoisting plan for a statement list: `var` names in traversal order, then function
@@ -7741,7 +8181,7 @@ fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
             for s in block {
                 collect_hoist_stmt(s, out);
             }
-            if let Some((_, h)) = handler {
+            if let Some((_, h)) = handler.as_deref() {
                 for s in h {
                     collect_hoist_stmt(s, out);
                 }
@@ -7877,7 +8317,7 @@ fn collect_annexb_funcs(
                 }
                 blocked.truncate(blocked.len() - pushed);
             }
-            if let Some((param, h)) = handler {
+            if let Some((param, h)) = handler.as_deref() {
                 // A destructuring catch parameter blocks same-named function hoisting out of
                 // the handler; a simple `catch (f)` does not (the B.3.5 legacy var exemption).
                 let mut added = block_lexical_names(h);

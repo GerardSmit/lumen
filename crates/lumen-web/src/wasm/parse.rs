@@ -1,7 +1,7 @@
 //! WebAssembly binary-format decoder (the MVP + a few post-MVP proposals: multi-value results,
 //! sign-extension, non-trapping conversions, bulk memory). Produces a [`Module`] the interpreter in
-//! `exec.rs` runs. Structural validation only (well-formed binary, section order, index ranges);
-//! full stack-type validation is not performed.
+//! `exec.rs` runs. Decoding ends with full validation (`validate.rs`), so every module the
+//! interpreter and the native tier see is well-typed.
 
 use std::rc::Rc;
 
@@ -149,30 +149,53 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
     pub fn u32(&mut self) -> R<u32> {
-        Ok(self.u64_leb()? as u32)
+        Ok(self.uleb(32)? as u32)
     }
     /// Unsigned LEB128.
     pub fn u64_leb(&mut self) -> R<u64> {
+        self.uleb(64)
+    }
+    /// Signed LEB128.
+    pub fn i64_leb(&mut self) -> R<i64> {
+        self.sleb(64)
+    }
+    pub fn i32(&mut self) -> R<i32> {
+        Ok(self.sleb(32)? as i32)
+    }
+    /// A block type's signed 33-bit type index.
+    pub fn s33(&mut self) -> R<i64> {
+        self.sleb(33)
+    }
+    /// Unsigned LEB128 of at most `bits` bits: at most ceil(bits / 7) bytes, unused bits zero.
+    fn uleb(&mut self, bits: u32) -> R<u64> {
         let mut result = 0u64;
         let mut shift = 0;
         loop {
             let b = self.byte()?;
+            let left = bits - shift;
+            if left < 7 && (b & 0x80 != 0 || (b & 0x7f) >> left != 0) {
+                return Err("wasm: integer representation too long".into());
+            }
             result |= ((b & 0x7f) as u64) << shift;
             if b & 0x80 == 0 {
                 return Ok(result);
             }
             shift += 7;
-            if shift >= 64 {
-                return Err("wasm: LEB128 overflow".into());
-            }
         }
     }
-    /// Signed LEB128.
-    pub fn i64_leb(&mut self) -> R<i64> {
+    /// Signed LEB128 of at most `bits` bits; the unused bits of the last byte must sign-extend.
+    fn sleb(&mut self, bits: u32) -> R<i64> {
         let mut result = 0i64;
         let mut shift = 0;
         loop {
             let b = self.byte()?;
+            let left = bits - shift;
+            if left < 7 {
+                let mask = ((0x7fu32 << (left - 1)) & 0x7f) as u8;
+                if b & 0x80 != 0 || (b & mask != 0 && b & mask != mask) {
+                    return Err("wasm: integer representation too long".into());
+                }
+            }
             result |= ((b & 0x7f) as i64) << shift;
             shift += 7;
             if b & 0x80 == 0 {
@@ -181,13 +204,7 @@ impl<'a> Reader<'a> {
                 }
                 return Ok(result);
             }
-            if shift >= 64 {
-                return Err("wasm: LEB128 overflow".into());
-            }
         }
-    }
-    pub fn i32(&mut self) -> R<i32> {
-        Ok(self.i64_leb()? as i32)
     }
     pub fn f32(&mut self) -> R<f32> {
         Ok(f32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
@@ -214,24 +231,56 @@ fn val_type(b: u8) -> Result<ValType, String> {
     }
 }
 
+/// The most pages a 32-bit memory can have (4 GiB).
+pub const MAX_MEMORY_PAGES: u32 = 65536;
+/// The largest initial table size accepted (V8's `kV8MaxWasmTableInitEntries`).
+pub const MAX_TABLE_SIZE: u32 = 10_000_000;
+/// The most locals (parameters included) a function may declare (V8's `kV8MaxWasmFunctionLocals`).
+pub const MAX_FUNCTION_LOCALS: u64 = 50_000;
+
 fn limits(r: &mut Reader) -> Result<Limits, String> {
     let flag = r.byte()?;
+    if flag > 1 {
+        return Err(format!("wasm: unsupported limits flag {flag}"));
+    }
     let min = r.u32()?;
     let max = if flag & 1 != 0 { Some(r.u32()?) } else { None };
+    if max.is_some_and(|max| max < min) {
+        return Err("wasm: limits maximum is below the minimum".into());
+    }
     Ok(Limits { min, max })
+}
+
+fn memory_limits(r: &mut Reader) -> Result<Limits, String> {
+    let l = limits(r)?;
+    if l.min > MAX_MEMORY_PAGES || l.max.is_some_and(|max| max > MAX_MEMORY_PAGES) {
+        return Err("wasm: memory size must be at most 65536 pages (4GiB)".into());
+    }
+    Ok(l)
 }
 
 fn table_type(r: &mut Reader) -> Result<TableType, String> {
     let elem = val_type(r.byte()?)?;
-    Ok(TableType {
-        elem,
-        limits: limits(r)?,
-    })
+    if !matches!(elem, ValType::FuncRef | ValType::ExternRef) {
+        return Err("wasm: table element type must be a reference type".into());
+    }
+    let limits = limits(r)?;
+    if limits.min > MAX_TABLE_SIZE {
+        return Err(format!(
+            "wasm: initial table size {} exceeds the limit of {MAX_TABLE_SIZE} elements",
+            limits.min
+        ));
+    }
+    Ok(TableType { elem, limits })
 }
 
 fn global_type(r: &mut Reader) -> Result<GlobalType, String> {
     let val = val_type(r.byte()?)?;
-    let mutable = r.byte()? != 0;
+    let mutable = match r.byte()? {
+        0 => false,
+        1 => true,
+        _ => return Err("wasm: bad global mutability".into()),
+    };
     Ok(GlobalType { val, mutable })
 }
 
@@ -243,7 +292,7 @@ fn read_const_expr(r: &mut Reader) -> Result<Vec<u8>, String> {
         let op = r.byte()?;
         match op {
             0x41 => {
-                r.i64_leb()?;
+                r.i32()?;
             } // i32.const
             0x42 => {
                 r.i64_leb()?;
@@ -275,8 +324,7 @@ fn read_const_expr(r: &mut Reader) -> Result<Vec<u8>, String> {
     Ok(r.data[start..r.pos].to_vec())
 }
 
-/// Skip past an instruction's immediate operands during a section scan (unused here but kept for
-/// clarity of the const-expr reader's structure).
+/// Decode and validate a module binary.
 pub fn decode(data: &[u8]) -> Result<Rc<Module>, String> {
     let mut r = Reader::new(data);
     if r.bytes(4)? != b"\0asm" {
@@ -325,7 +373,7 @@ pub fn decode(data: &[u8]) -> Result<Rc<Module>, String> {
             }
             5 => {
                 for _ in 0..r.u32()? {
-                    m.memories.push(limits(&mut r)?);
+                    m.memories.push(memory_limits(&mut r)?);
                 }
             }
             6 => decode_globals(&mut r, &mut m)?,
@@ -344,6 +392,10 @@ pub fn decode(data: &[u8]) -> Result<Rc<Module>, String> {
     if data_count.is_some_and(|count| count as usize != m.data.len()) {
         return Err("wasm: data count does not match data segments".into());
     }
+    if m.code.len() != m.func_types.len() {
+        return Err("wasm: code/function count mismatch".into());
+    }
+    super::validate::module(&m, data_count)?;
     Ok(Rc::new(m))
 }
 
@@ -376,6 +428,9 @@ fn decode_imports(r: &mut Reader, m: &mut Module) -> Result<(), String> {
         let kind = match r.byte()? {
             0x00 => {
                 let t = r.u32()?;
+                if t as usize >= m.types.len() {
+                    return Err("wasm: imported function type index out of range".into());
+                }
                 m.imported_func_count += 1;
                 ImportKind::Func(t)
             }
@@ -385,7 +440,7 @@ fn decode_imports(r: &mut Reader, m: &mut Module) -> Result<(), String> {
             }
             0x02 => {
                 m.imported_mem_count += 1;
-                ImportKind::Memory(limits(r)?)
+                ImportKind::Memory(memory_limits(r)?)
             }
             0x03 => {
                 m.imported_global_count += 1;
@@ -454,7 +509,9 @@ fn decode_elems(r: &mut Reader, m: &mut Module) -> Result<(), String> {
             2 => {
                 let table = r.u32()?;
                 let offset = read_const_expr(r)?;
-                let _elemkind = r.byte()?;
+                if r.byte()? != 0x00 {
+                    return Err("wasm: unsupported element kind".into());
+                }
                 let mut func_indices = Vec::new();
                 for _ in 0..r.u32()? {
                     func_indices.push(r.u32()?);
@@ -472,30 +529,45 @@ fn decode_elems(r: &mut Reader, m: &mut Module) -> Result<(), String> {
 }
 
 fn decode_code(r: &mut Reader, m: &mut Module) -> Result<(), String> {
-    for _ in 0..r.u32()? {
+    let count = r.u32()?;
+    if count as usize != m.func_types.len() {
+        return Err("wasm: code/function count mismatch".into());
+    }
+    for i in 0..count as usize {
         let size = r.u32()? as usize;
-        let body_end = r.pos + size;
-        let mut locals = Vec::new();
-        for _ in 0..r.u32()? {
-            let count = r.u32()?;
-            let ty = val_type(r.byte()?)?;
-            for _ in 0..count {
-                locals.push(ty);
+        // Locals and instructions are read from the body alone, so they cannot overrun it.
+        let mut body = Reader::new(r.bytes(size).map_err(|_| "wasm: bad code body")?);
+        let params = m
+            .types
+            .get(m.func_types[i] as usize)
+            .map_or(0, |t| t.params.len() as u64);
+        let mut groups = Vec::new();
+        let mut total = params;
+        for _ in 0..body.u32()? {
+            let n = body.u32()?;
+            let ty = val_type(body.byte()?)?;
+            total += n as u64;
+            if total > MAX_FUNCTION_LOCALS {
+                return Err("wasm: too many locals".into());
             }
+            groups.push((n, ty));
+        }
+        let mut locals = Vec::with_capacity((total - params) as usize);
+        for (n, ty) in groups {
+            locals.extend(std::iter::repeat_n(ty, n as usize));
         }
         // Remaining bytes (minus the trailing `end`) are the instruction stream.
-        if body_end == 0 || body_end > r.data.len() {
-            return Err("wasm: bad code body".into());
-        }
-        let code = r.data[r.pos..body_end - 1].to_vec();
-        if r.data[body_end - 1] != 0x0b {
+        let rest = &body.data[body.pos..];
+        let Some((&last, code)) = rest.split_last() else {
+            return Err("wasm: function body not terminated by end".into());
+        };
+        if last != 0x0b {
             return Err("wasm: function body not terminated by end".into());
         }
-        r.pos = body_end;
-        m.code.push(FuncBody { locals, code });
-    }
-    if m.code.len() != m.func_types.len() {
-        return Err("wasm: code/function count mismatch".into());
+        m.code.push(FuncBody {
+            locals,
+            code: code.to_vec(),
+        });
     }
     Ok(())
 }
@@ -537,24 +609,7 @@ fn decode_data(r: &mut Reader, m: &mut Module) -> Result<(), String> {
     Ok(())
 }
 
-/// Structural validation: decode succeeds and export indices are in range.
+/// Whether `data` is a valid module (`WebAssembly.validate`).
 pub fn validate(data: &[u8]) -> bool {
-    match decode(data) {
-        Ok(m) => {
-            let total_funcs = m.imported_func_count as usize + m.func_types.len();
-            m.exports.iter().all(|e| match e.kind {
-                ExportKind::Func => (e.index as usize) < total_funcs,
-                ExportKind::Global => {
-                    (e.index as usize) < m.imported_global_count as usize + m.globals.len()
-                }
-                ExportKind::Memory => {
-                    (e.index as usize) < m.imported_mem_count as usize + m.memories.len()
-                }
-                ExportKind::Table => {
-                    (e.index as usize) < m.imported_table_count as usize + m.tables.len()
-                }
-            })
-        }
-        Err(_) => false,
-    }
+    decode(data).is_ok()
 }

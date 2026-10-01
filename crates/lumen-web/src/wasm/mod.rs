@@ -7,6 +7,9 @@ pub mod exec;
 pub mod native;
 pub mod parse;
 pub mod translate;
+pub mod validate;
+#[cfg(test)]
+mod test_util;
 #[cfg(test)]
 mod translate_tests;
 

@@ -37,9 +37,7 @@ fn weak_delete<const SET: bool>(
     };
     let ptr = weak_brand_ptr(i, &this, kind)?;
     let key = args.first().unwrap_or(&Value::Undefined);
-    Ok(Value::Bool(
-        i.map_data.get_mut(&ptr).unwrap().remove_weak(key),
-    ))
+    Ok(Value::Bool(i.map_data.get_mut(&ptr).unwrap().remove(key)))
 }
 
 pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ctor_fn: NativeFn) {
@@ -80,7 +78,7 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             let key = arg(a, 0);
             Ok(i.map_data
                 .get(&ptr)
-                .and_then(|e| e.lookup(&key).cloned())
+                .and_then(|e| e.lookup(&key))
                 .unwrap_or(Value::Undefined))
         });
         // Upsert proposal: getOrInsert(key, value) / getOrInsertComputed(key, callbackfn).

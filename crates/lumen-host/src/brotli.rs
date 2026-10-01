@@ -542,6 +542,12 @@ impl BlockState {
 
 /// Decode a complete brotli stream.
 pub fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    brotli_decompress_limited(data, usize::MAX)
+}
+
+/// [`brotli_decompress`], failing with [`crate::deflate::OUTPUT_LIMIT`] before decoding a
+/// meta-block that would take the output past `limit` bytes.
+pub fn brotli_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut r = BitReader::new(data);
 
     // WBITS (RFC 7932 9.1).
@@ -612,6 +618,9 @@ pub fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
             mlen |= v << (4 * i);
         }
         mlen += 1;
+        if out.len() + mlen > limit {
+            return Err(crate::deflate::OUTPUT_LIMIT.into());
+        }
         if !is_last && r.take(1)? == 1 {
             // Uncompressed meta-block: byte-aligned raw copy.
             r.align()?;

@@ -1,7 +1,20 @@
 //! Call forwarding preserves target, receiver, environment and throw semantics.
 use lumen::{bytecode::Tier, Completion, Engine};
 
+/// Runs on a CLI-sized stack: a cold (not yet compiled) forwarded call costs ~100 KiB of native
+/// stack per level in debug builds, so even the 20-deep recursion below outgrows a 2 MiB test
+/// thread.
 fn check(source: &str) {
+    let source = source.to_owned();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || check_on_this_thread(&source))
+        .expect("spawn test thread")
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+}
+
+fn check_on_this_thread(source: &str) {
     for tier in [Tier::Interp, Tier::Bytecode] {
         let mut e = Engine::new();
         e.set_tier(tier);

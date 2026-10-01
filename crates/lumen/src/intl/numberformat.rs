@@ -51,8 +51,10 @@ fn range_endpoints(
 
 fn format_range(i: &mut Interp, this: &Value, x: &Value, y: &Value) -> Result<Value, Value> {
     let (o, a, b) = range_endpoints(i, this, x, y)?;
-    let sa = assemble_number_exact(i, &o, a, exact_of(x));
-    let sb = assemble_number_exact(i, &o, b, exact_of(y));
+    let exact = exact_of(i, x);
+    let sa = assemble_number_exact(i, &o, a, exact);
+    let exact = exact_of(i, y);
+    let sb = assemble_number_exact(i, &o, b, exact);
     // Endpoints that FORMAT identically collapse to a single approximate value.
     if sa == sb {
         return Ok(Value::from_string(format!("~{sa}")));
@@ -116,8 +118,10 @@ fn format_range_to_parts(
             out.push(Value::Obj(ob));
         }
     };
-    let sa = assemble_number_exact(i, &o, a, exact_of(x));
-    let sb = assemble_number_exact(i, &o, b, exact_of(y));
+    let exact = exact_of(i, x);
+    let sa = assemble_number_exact(i, &o, a, exact);
+    let exact = exact_of(i, y);
+    let sb = assemble_number_exact(i, &o, b, exact);
     if sa == sb {
         let approx = i.new_object();
         set_data(&approx, "type", Value::str("approximatelySign"));
@@ -1008,10 +1012,10 @@ impl ExactDec {
 }
 
 /// The exact value a format argument carries, when it has one.
-pub(crate) fn exact_of(x: &Value) -> Option<ExactDec> {
+pub(crate) fn exact_of(i: &mut Interp, x: &Value) -> Option<ExactDec> {
     match x {
         Value::BigInt(b) => Some(ExactDec {
-            int: b.to_string_radix(10).trim_start_matches('-').to_string(),
+            int: i.bigint_to_string(b, 10).ok().flatten()?.trim_start_matches('-').to_string(),
             frac: String::new(),
         }),
         Value::Str(s) => ExactDec::parse(s),
@@ -1548,7 +1552,8 @@ pub(crate) fn xlate_digits(s: &str, nu: &str) -> String {
 fn format_number(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value> {
     let o = instance(i, this)?;
     let n = to_intl_number(i, x)?;
-    let s = assemble_number_exact(i, &o, n, exact_of(x));
+    let exact = exact_of(i, x);
+    let s = assemble_number_exact(i, &o, n, exact);
     Ok(Value::from_string(xlate_digits(
         &s,
         &get_str(&o, "__nf_nu"),
@@ -1579,7 +1584,8 @@ fn to_intl_number(i: &mut Interp, x: &Value) -> Result<f64, Value> {
 fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value> {
     let o = instance(i, this)?;
     let n = to_intl_number(i, x)?;
-    let whole = assemble_number_exact(i, &o, n, exact_of(x));
+    let exact = exact_of(i, x);
+    let whole = assemble_number_exact(i, &o, n, exact);
     let nu = get_str(&o, "__nf_nu");
     let (dec, grp) = loc_seps(&o);
     // Unit style: rebuild from the CLDR pattern so a unit prefix/suffix (e.g. ko "시속 {0}킬로미터")

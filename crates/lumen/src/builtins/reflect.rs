@@ -31,7 +31,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if matches!(handler, Value::Null) {
                 return Err(i.make_error("TypeError", "proxy is revoked"));
             }
-            let trap = ab(i.get_member(&handler, "set"))?;
+            let trap = ab(i.proxy_trap(&handler, "set"))?;
             if trap.is_callable() {
                 let receiver = if a.len() > 3 {
                     arg(a, 3)
@@ -104,7 +104,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         if Interp::is_private_key(&key) {
             return Ok(Value::Undefined); // private-name slot is not an own property
         }
-        crate::split_view::unview(&o);
+        i.materialize(&o);
         // A mapped arguments index reports the live parameter value.
         if let Some(v) = i.mapped_arg_value(Gc::as_ptr(&o) as usize, &key) {
             if let Some(p) = o.borrow_mut().props.get_mut(&key) {
@@ -133,7 +133,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
                 return Ok(descriptor_from_prop(i, ab(res)?));
             }
         }
-        let prop = o.borrow().props.get(&key).cloned();
+        let prop = o.borrow().props.get(&key).map(|p| p.clone());
         Ok(prop
             .map(|p| descriptor_from_prop(i, p))
             .unwrap_or(Value::Undefined))
@@ -145,7 +145,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
             }
-            crate::split_view::unview(&o);
+            i.materialize(&o);
             // A TypedArray integer index can't be deleted; a canonical-numeric non-index reports true.
             if let Some(info) = ta_info(i, &o) {
                 match i.ta_index_kind(&info, &key) {
@@ -178,7 +178,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             let keys = proxy_own_keys(i, &target, &handler)?;
             return Ok(i.make_array(keys));
         }
-        crate::split_view::unview(&o);
+        i.materialize(&o);
         // A TypedArray's integer indices come first (ascending), then string keys, then symbols.
         let mut out: Vec<Value> = if let Some(info) = ta_info(i, &o) {
             (0..i.ta_len(&info).unwrap_or(0))

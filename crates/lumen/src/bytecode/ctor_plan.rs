@@ -284,6 +284,9 @@ fn value_src(e: &Expr, params: &[&str]) -> Option<PlanSrc> {
 /// through the leading `super(…)` call; `parent` is (parent plan, class, parent constructor));
 /// then `fields` (key, constant-or-absent initializer); then the constructor body `func`'s
 /// assignments. `private_key` resolves a `#name` in the body.
+/// The most derived-class links one plan spans.
+const MAX_PLAN_CHAIN: usize = 32;
+
 fn build(
     parent: Option<(&CtorPlan, &Gc, &Gc)>,
     fields: &[(Rc<str>, Option<&Expr>)],
@@ -326,6 +329,11 @@ fn build(
         }
     }
     if let Some((pp, class, parent_ctor)) = parent {
+        // Each link copies its parent's guards, so plans stop at a bounded chain depth (else a
+        // long `class extends` chain costs quadratic memory and per-construct guard checks).
+        if pp.guards.len() >= MAX_PLAN_CHAIN {
+            return None;
+        }
         // The leading `super(…)`: the parent's slots with its arguments mapped.
         let Some(Stmt::Expr(Expr::Call {
             callee,
@@ -470,6 +478,11 @@ fn class_plan(i: &mut Interp, c: &Gc, ptr: usize, func: &Function) -> Option<Cto
     // live [[GetPrototypeOf]], re-checked on every use (`CtorPlan::guards_ok`). (A parent with a
     // plan is a user function that is a constructor.)
     let parent = if derived {
+        // Planning recurses up the parent chain (bounded by MAX_PLAN_CHAIN only once the
+        // parents have plans): no plan rather than overflowing the native stack.
+        if crate::stack::exhausted() {
+            return None;
+        }
         let pc = c.borrow().proto.clone()?;
         let pp = plan_for(i, &pc)?;
         Some((pp, pc))
@@ -660,6 +673,7 @@ pub(crate) fn construct_with_plan(
     if !Gc::ptr_eq(c, nt) && !matches!(nt.borrow().call, Callable::User(_)) {
         return None;
     }
+    i.materialize_fn(nt);
     let proto = match super::class_fields::own_prototype(nt)? {
         Value::Obj(p) => p,
         // (Single realm: GetFunctionRealm is the current one.)
@@ -702,6 +716,41 @@ mod tests {
         let v = e.interp.global.borrow().props.get(name).unwrap().value();
         let c = v.as_obj().unwrap().clone();
         super::plan_for(&mut e.interp, &c).is_some()
+    }
+
+    #[test]
+    fn long_extends_chain_plans_stay_bounded() {
+        std::thread::Builder::new()
+            .stack_size(crate::stack::THREAD_STACK_SIZE)
+            .spawn(long_extends_chain)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn long_extends_chain() {
+        let src = "let C = class { constructor() { this.a = 1; } }; globalThis.C5 = null; \
+                   for (let i = 0; i < 100; i++) { C = class extends C {}; if (i === 4) C5 = C; } \
+                   globalThis.Top = C; new C().a";
+        let mut e = Engine::new();
+        e.set_tier_threshold(0);
+        match e.eval(src, false).unwrap() {
+            Completion::Value(v) => assert_eq!(v, "1"),
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+        let get = |e: &Engine, n: &str| e.interp.global.borrow().props.get(n).unwrap().value();
+        let c5 = get(&e, "C5").as_obj().unwrap().clone();
+        let p5 = super::plan_for(&mut e.interp, &c5).expect("short chain is planned");
+        assert_eq!(p5.guards.len(), 5);
+        let top = get(&e, "Top").as_obj().unwrap().clone();
+        assert!(super::plan_for(&mut e.interp, &top).is_none());
+        let mut cur = Some(top);
+        while let Some(c) = cur {
+            if let Some(p) = super::plan_for(&mut e.interp, &c) {
+                assert!(p.guards.len() <= super::MAX_PLAN_CHAIN);
+            }
+            cur = c.borrow().proto.clone();
+        }
     }
 
     #[test]

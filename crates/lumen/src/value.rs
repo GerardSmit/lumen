@@ -1,10 +1,10 @@
-//! Runtime values and the object model. Objects are `Rc<RefCell<Object>>` ([`Gc`]); there is no
+//! Runtime values and the object model. Objects are `Gc` (`ObjCell`) ([`Gc`]); there is no
 //! real garbage collector yet (reference counting, so cycles leak — acceptable for the test262
 //! loop). Properties are stored in insertion order in a small map.
 
 use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,20 +19,158 @@ use std::sync::Arc;
 #[repr(transparent)]
 pub struct Gc(std::ptr::NonNull<GcBox>);
 
+/// The object box: an 8-byte header — `u32` strong count, `u16` weak count (with
+/// [`FN_PAIR_FLAG`]) and `u16` borrow state — followed by the [`Object`]. It doubles as the
+/// object's cell: [`ObjCell::borrow`] / [`ObjCell::borrow_mut`] work like `RefCell`'s, with the
+/// borrow flag living in the header instead of a word of its own.
 #[repr(C)]
-pub(in crate::value) struct GcBox {
-    pub(in crate::value) strong: Cell<usize>,
-    pub(in crate::value) weak: Cell<usize>,
-    value: RefCell<Object>,
+pub struct ObjCell {
+    pub(in crate::value) strong: Cell<u32>,
+    pub(in crate::value) weak: Cell<u16>,
+    borrow: Cell<u16>,
+    value: UnsafeCell<Object>,
 }
+use ObjCell as GcBox;
 
-/// Byte offset from the stored handle word to the object cell.
+/// A strong count at this value never changes again: an object with 2^32 references is
+/// immortal rather than wrapping into a premature free.
+pub(crate) const STRONG_STICKY: u32 = u32::MAX;
+/// Weak count bits of [`ObjCell::weak`]; a count at the mask never changes again (the box is
+/// never freed rather than freed under a live weak handle).
+pub(crate) const WEAK_MASK: u16 = 0x7fff;
+/// The borrow state of a mutably borrowed cell; shared borrows count up from 1.
+pub(crate) const BORROW_MUT: u16 = 0x8000;
+const BORROW_MAX: u16 = BORROW_MUT - 1;
+
+/// Byte offset from the stored handle word to the object.
 pub(crate) const GC_VALUE_OFFSET: usize = std::mem::offset_of!(GcBox, value);
-/// Byte offset from the stored handle word to the strong count (for the JIT's inline
+/// Byte offset from the stored handle word to the strong count (a `u32`; the JIT's inline
 /// retain / release: a handle whose count stays above zero needs nothing else).
 pub(crate) const GC_STRONG_OFFSET: usize = std::mem::offset_of!(GcBox, strong);
-/// The weak count's offset (it carries [`FN_PAIR_FLAG`]; the JIT's inline release checks it).
+/// The weak count's offset (a `u16` carrying [`FN_PAIR_FLAG`]; the JIT's inline release
+/// checks it).
 pub(crate) const GC_WEAK_OFFSET: usize = std::mem::offset_of!(GcBox, weak);
+/// The borrow state's offset (a `u16`: 0 free, [`BORROW_MUT`] mutably borrowed, else the
+/// number of shared borrows).
+pub(crate) const GC_BORROW_OFFSET: usize = std::mem::offset_of!(GcBox, borrow);
+const _: () = assert!(std::mem::size_of::<GcBox>() == 8 + std::mem::size_of::<Object>());
+
+/// Returned by [`ObjCell::try_borrow`] when the object is mutably borrowed.
+#[derive(Debug)]
+pub struct BorrowError;
+/// Returned by [`ObjCell::try_borrow_mut`] when the object is borrowed.
+#[derive(Debug)]
+pub struct BorrowMutError;
+
+/// A shared borrow of an object, released on drop.
+pub struct Ref<'a>(&'a ObjCell);
+/// A mutable borrow of an object, released on drop.
+pub struct RefMut<'a>(&'a ObjCell);
+
+impl ObjCell {
+    #[inline(always)]
+    fn new(o: Object) -> ObjCell {
+        ObjCell {
+            strong: Cell::new(1),
+            weak: Cell::new(1),
+            borrow: Cell::new(0),
+            value: UnsafeCell::new(o),
+        }
+    }
+    #[inline]
+    pub fn try_borrow(&self) -> Result<Ref<'_>, BorrowError> {
+        let b = self.borrow.get();
+        if b >= BORROW_MAX {
+            return Err(BorrowError);
+        }
+        self.borrow.set(b + 1);
+        Ok(Ref(self))
+    }
+    #[inline]
+    #[track_caller]
+    pub fn borrow(&self) -> Ref<'_> {
+        match self.try_borrow() {
+            Ok(r) => r,
+            Err(_) => borrow_panic(),
+        }
+    }
+    #[inline]
+    pub fn try_borrow_mut(&self) -> Result<RefMut<'_>, BorrowMutError> {
+        if self.borrow.get() != 0 {
+            return Err(BorrowMutError);
+        }
+        self.borrow.set(BORROW_MUT);
+        Ok(RefMut(self))
+    }
+    #[inline]
+    #[track_caller]
+    pub fn borrow_mut(&self) -> RefMut<'_> {
+        match self.try_borrow_mut() {
+            Ok(r) => r,
+            Err(_) => borrow_mut_panic(),
+        }
+    }
+    /// # Safety
+    /// The returned reference must not outlive a mutable borrow of the object.
+    #[inline]
+    pub unsafe fn try_borrow_unguarded(&self) -> Result<&Object, BorrowError> {
+        if self.borrow.get() >= BORROW_MUT {
+            return Err(BorrowError);
+        }
+        Ok(&*self.value.get())
+    }
+    /// The object, unchecked (the caller upholds the borrow rules).
+    #[inline]
+    pub fn as_ptr(&self) -> *mut Object {
+        self.value.get()
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn borrow_panic() -> ! {
+    panic!("object already mutably borrowed")
+}
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn borrow_mut_panic() -> ! {
+    panic!("object already borrowed")
+}
+
+impl std::ops::Deref for Ref<'_> {
+    type Target = Object;
+    #[inline(always)]
+    fn deref(&self) -> &Object {
+        unsafe { &*self.0.value.get() }
+    }
+}
+impl Drop for Ref<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.borrow.set(self.0.borrow.get() - 1);
+    }
+}
+impl std::ops::Deref for RefMut<'_> {
+    type Target = Object;
+    #[inline(always)]
+    fn deref(&self) -> &Object {
+        unsafe { &*self.0.value.get() }
+    }
+}
+impl std::ops::DerefMut for RefMut<'_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Object {
+        unsafe { &mut *self.0.value.get() }
+    }
+}
+impl Drop for RefMut<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.borrow.set(0);
+    }
+}
 
 /// A non-owning [`Gc`]: upgrades while the object is alive. `WeakGc::new()` holds a dangling
 /// sentinel (never dereferenced), as `std::rc::Weak::new` does.
@@ -42,21 +180,15 @@ pub struct WeakGc(std::ptr::NonNull<GcBox>);
 const WEAK_DANGLING: usize = usize::MAX;
 
 impl Gc {
-    /// Place a new object in `state`'s slab. With [`heap::SlotClass::Inline`] the box is
-    /// followed by [`heap::INLINE_PROPS`] property slots, which the object's map adopts as its
-    /// entry storage when its entries fit.
+    /// Place a new object in `state`'s slab. An inline class's box is followed by its property
+    /// slots, which the object's map adopts as its entry storage when its entries fit.
     #[inline(always)]
-    fn alloc(state: &GcState, cell: RefCell<Object>, class: heap::SlotClass) -> Gc {
+    fn alloc(state: &GcState, obj: Object, class: heap::SlotClass) -> Gc {
         let p = state.heap.alloc(&state.live, class);
         unsafe {
-            p.write(GcBox {
-                strong: Cell::new(1),
-                weak: Cell::new(1),
-                value: cell,
-            });
+            p.write(ObjCell::new(obj));
             if class != heap::SlotClass::Plain {
-                (*p).value
-                    .get_mut()
+                (*(*p).value.get())
                     .props
                     .entries
                     .move_to_inline(heap::inline_props(p), class.inline_cap());
@@ -74,8 +206,8 @@ impl Gc {
     }
     /// The address of the object cell — stable for the object's lifetime, usable as an identity.
     #[inline]
-    pub fn as_ptr(this: &Gc) -> *const RefCell<Object> {
-        unsafe { std::ptr::addr_of!((*this.0.as_ptr()).value) }
+    pub fn as_ptr(this: &Gc) -> *const ObjCell {
+        this.0.as_ptr()
     }
     /// The handle word (the box address a `Value` payload holds; the JIT's layout offsets are
     /// relative to it).
@@ -85,17 +217,16 @@ impl Gc {
     }
     #[inline]
     pub fn downgrade(this: &Gc) -> WeakGc {
-        let b = this.inner();
-        b.weak.set(b.weak.get() + 1);
+        weak_bump(this.inner());
         WeakGc(this.0)
     }
     #[inline]
     pub fn strong_count(this: &Gc) -> usize {
-        this.inner().strong.get()
+        this.inner().strong.get() as usize
     }
     /// Consume the handle into a raw cell pointer (see [`Gc::from_raw`]).
     #[inline]
-    pub fn into_raw(this: Gc) -> *const RefCell<Object> {
+    pub fn into_raw(this: Gc) -> *const ObjCell {
         let p = Gc::as_ptr(&this);
         std::mem::forget(this);
         p
@@ -103,29 +234,26 @@ impl Gc {
     /// # Safety
     /// `ptr` must come from [`Gc::into_raw`] (or [`Gc::as_ptr`] with a matching strong count).
     #[inline]
-    pub unsafe fn from_raw(ptr: *const RefCell<Object>) -> Gc {
-        let base = (ptr as *const u8).sub(GC_VALUE_OFFSET) as *mut GcBox;
-        Gc(std::ptr::NonNull::new_unchecked(base))
+    pub unsafe fn from_raw(ptr: *const ObjCell) -> Gc {
+        Gc(std::ptr::NonNull::new_unchecked(ptr as *mut ObjCell))
     }
     /// # Safety
     /// `ptr` must point at a live object cell obtained from [`Gc::as_ptr`] / [`Gc::into_raw`].
     #[inline]
-    pub unsafe fn increment_strong_count(ptr: *const RefCell<Object>) {
-        let g = std::mem::ManuallyDrop::new(Gc::from_raw(ptr));
-        let b = g.inner();
-        b.strong.set(b.strong.get() + 1);
+    pub unsafe fn increment_strong_count(ptr: *const ObjCell) {
+        strong_bump(&*ptr);
     }
     /// # Safety
     /// As [`Gc::increment_strong_count`], and the count being released must be owned.
     #[inline]
-    pub unsafe fn decrement_strong_count(ptr: *const RefCell<Object>) {
+    pub unsafe fn decrement_strong_count(ptr: *const ObjCell) {
         drop(Gc::from_raw(ptr));
     }
     #[inline]
-    pub fn get_mut(this: &mut Gc) -> Option<&mut RefCell<Object>> {
+    pub fn get_mut(this: &mut Gc) -> Option<&mut ObjCell> {
         let b = this.inner();
         if b.strong.get() == 1 && b.weak.get() == 1 {
-            Some(unsafe { &mut (*this.0.as_ptr()).value })
+            Some(unsafe { &mut *this.0.as_ptr() })
         } else {
             None
         }
@@ -135,8 +263,7 @@ impl Gc {
 impl Clone for Gc {
     #[inline]
     fn clone(&self) -> Gc {
-        let b = self.inner();
-        b.strong.set(b.strong.get() + 1);
+        strong_bump(self.inner());
         Gc(self.0)
     }
 }
@@ -145,7 +272,11 @@ impl Drop for Gc {
     #[inline]
     fn drop(&mut self) {
         let b = self.inner();
-        let s = b.strong.get() - 1;
+        let s = b.strong.get();
+        if s == STRONG_STICKY {
+            return;
+        }
+        let s = s - 1;
         b.strong.set(s);
         if s == 0 {
             unsafe { gc_drop_slow(self.0) };
@@ -155,31 +286,75 @@ impl Drop for Gc {
     }
 }
 
+/// Nesting of [`gc_drop_slow`] beyond which a dying object's teardown is queued rather than run
+/// in place, so freeing a deeply nested structure (`a = [a]` a million times) takes bounded
+/// native stack.
+const DROP_NEST: u32 = 64;
+
+thread_local! {
+    static DROP_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static DROP_PENDING: RefCell<Vec<std::ptr::NonNull<GcBox>>> = const { RefCell::new(Vec::new()) };
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn gc_drop_slow(p: std::ptr::NonNull<GcBox>) {
+    // During thread teardown the queue may be gone: fall back to dropping in place.
+    let Ok(depth) = DROP_DEPTH.try_with(Cell::get) else {
+        return gc_drop_box(p);
+    };
+    if depth >= DROP_NEST && DROP_PENDING.try_with(|q| q.borrow_mut().push(p)).is_ok() {
+        return;
+    }
+    DROP_DEPTH.set(depth + 1);
+    gc_drop_box(p);
+    if depth == 0 {
+        while let Some(q) = DROP_PENDING.try_with(|q| q.borrow_mut().pop()).ok().flatten() {
+            gc_drop_box(q);
+        }
+    }
+    DROP_DEPTH.set(depth);
+}
+
+unsafe fn gc_drop_box(p: std::ptr::NonNull<GcBox>) {
     // The live count sits behind the chunk header, so a drop needs no thread-local lookup.
     heap::note_dead(p.as_ptr());
-    let obj = (*p.as_ptr()).value.as_ptr();
+    let obj = (*p.as_ptr()).value.get();
     if !Object::drop_in_box(obj) {
-        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*p.as_ptr()).value));
+        std::ptr::drop_in_place(obj);
     }
     // Release the strong owners' implicit weak reference. The pair flag lives in the weak
     // word; clearing it here lets the count reach zero (the slot's free mark).
     let b = &*p.as_ptr();
-    let w = (b.weak.get() & !FN_PAIR_FLAG) - 1;
-    if w == 0 {
+    let w = b.weak.get() & WEAK_MASK;
+    if w == WEAK_MASK {
+        b.weak.set(WEAK_MASK);
+    } else if w == 1 {
         heap::free(p.as_ptr());
     } else {
-        b.weak.set(w);
+        b.weak.set(w - 1);
     }
 }
 
-/// Top bit of [`GcBox::weak`]: the box is one half of a function / fresh-`.prototype` pair
-/// (see [`Gc::mark_fn_proto_pair`]). A weak count never comes near it, a live box's weak word
-/// is never zero either way (so the slab's free-slot test is unaffected), and
-/// [`gc_drop_slow`] clears it before the implicit weak is released.
-pub(crate) const FN_PAIR_FLAG: usize = 1 << (usize::BITS - 1);
+#[inline(always)]
+fn strong_bump(b: &ObjCell) {
+    let s = b.strong.get();
+    b.strong.set(s + (s != STRONG_STICKY) as u32);
+}
+
+#[inline(always)]
+fn weak_bump(b: &ObjCell) {
+    let w = b.weak.get();
+    if w & WEAK_MASK != WEAK_MASK {
+        b.weak.set(w + 1);
+    }
+}
+
+/// Top bit of [`ObjCell::weak`]: the box is one half of a function / fresh-`.prototype` pair
+/// (see [`Gc::mark_fn_proto_pair`]). A live box's weak word is never zero either way (so the
+/// slab's free-slot test is unaffected), and [`gc_drop_box`] clears it before the implicit
+/// weak is released.
+pub(crate) const FN_PAIR_FLAG: u16 = 1 << 15;
 
 impl Gc {
     /// Flag a function object `f` and its freshly made `.prototype` `p` (whose `constructor`
@@ -198,7 +373,7 @@ impl Gc {
 }
 
 /// The boxed object a data property's value refers to, without touching its count.
-fn prop_obj_box(p: Option<&Property>) -> Option<*mut GcBox> {
+fn prop_obj_box(p: Option<PropRef<'_>>) -> Option<*mut GcBox> {
     let p = p?;
     if p.accessor() || p.packed.tag() != PACK_OBJ {
         return None;
@@ -213,7 +388,7 @@ fn prop_obj_box(p: Option<&Property>) -> Option<*mut GcBox> {
 unsafe fn fn_pair_release(p: std::ptr::NonNull<GcBox>) {
     let p = p.as_ptr();
     let unflag = |b: *mut GcBox| (*b).weak.set((*b).weak.get() & !FN_PAIR_FLAG);
-    let Ok(pb) = (*p).value.try_borrow_mut() else {
+    let Ok(pb) = (*p).try_borrow_mut() else {
         return;
     };
     let is_fn = matches!(pb.call, Callable::User(_));
@@ -232,7 +407,7 @@ unsafe fn fn_pair_release(p: std::ptr::NonNull<GcBox>) {
         unflag(p);
         return;
     }
-    let Ok(qb) = (*q).value.try_borrow_mut() else {
+    let Ok(qb) = (*q).try_borrow_mut() else {
         return;
     };
     if prop_obj_box(qb.props.get(to_back)) != Some(p) {
@@ -246,7 +421,7 @@ unsafe fn fn_pair_release(p: std::ptr::NonNull<GcBox>) {
         return;
     }
     let f = if is_fn { p } else { q };
-    let cut = match (*f).value.try_borrow_mut() {
+    let cut = match (*f).try_borrow_mut() {
         Ok(mut fb) => fb.props.get_mut("prototype").map(|pr| pr.take_value()),
         Err(_) => None,
     };
@@ -255,10 +430,10 @@ unsafe fn fn_pair_release(p: std::ptr::NonNull<GcBox>) {
 }
 
 impl std::ops::Deref for Gc {
-    type Target = RefCell<Object>;
+    type Target = ObjCell;
     #[inline]
-    fn deref(&self) -> &RefCell<Object> {
-        &self.inner().value
+    fn deref(&self) -> &ObjCell {
+        self.inner()
     }
 }
 
@@ -278,19 +453,15 @@ impl WeakGc {
     #[inline]
     pub fn upgrade(&self) -> Option<Gc> {
         let b = self.inner()?;
-        let s = b.strong.get();
-        if s == 0 {
+        if b.strong.get() == 0 {
             return None;
         }
-        b.strong.set(s + 1);
+        strong_bump(b);
         Some(Gc(self.0))
     }
     #[inline]
-    pub fn as_ptr(&self) -> *const RefCell<Object> {
-        if self.0.as_ptr() as usize == WEAK_DANGLING {
-            return WEAK_DANGLING as *const RefCell<Object>;
-        }
-        unsafe { std::ptr::addr_of!((*self.0.as_ptr()).value) }
+    pub fn as_ptr(&self) -> *const ObjCell {
+        self.0.as_ptr()
     }
     #[inline]
     pub fn ptr_eq(&self, other: &WeakGc) -> bool {
@@ -298,7 +469,7 @@ impl WeakGc {
     }
     #[inline]
     pub fn strong_count(&self) -> usize {
-        self.inner().map_or(0, |b| b.strong.get())
+        self.inner().map_or(0, |b| b.strong.get() as usize)
     }
 }
 
@@ -306,7 +477,7 @@ impl Clone for WeakGc {
     #[inline]
     fn clone(&self) -> WeakGc {
         if let Some(b) = self.inner() {
-            b.weak.set(b.weak.get() + 1);
+            weak_bump(b);
         }
         WeakGc(self.0)
     }
@@ -316,9 +487,12 @@ impl Drop for WeakGc {
     #[inline]
     fn drop(&mut self) {
         let Some(b) = self.inner() else { return };
-        let w = b.weak.get() - 1;
-        b.weak.set(w);
-        if w == 0 {
+        let w = b.weak.get();
+        if w & WEAK_MASK == WEAK_MASK {
+            return;
+        }
+        b.weak.set(w - 1);
+        if w == 1 {
             unsafe { heap::free(self.0.as_ptr()) };
         }
     }
@@ -521,7 +695,7 @@ impl PackedValue {
 
     /// The object this holds, as [`Gc::as_ptr`] gives it (no refcount traffic).
     #[inline(always)]
-    pub(crate) fn obj_ptr(&self) -> Option<*const RefCell<Object>> {
+    pub(crate) fn obj_ptr(&self) -> Option<*const ObjCell> {
         (self.tag() == PACK_OBJ).then(|| {
             // SAFETY: an object payload is a live `Gc` word; the handle is only borrowed.
             let g = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
@@ -590,6 +764,87 @@ impl PackedValue {
         // PACK_BIGINT/STR/SYM are 0x7ffd..=0x7fff in the top 16 bits; PACK_OBJ is 0xfff9.
         let top = self.0 >> 48;
         top >= (PACK_BIGINT >> 48) && top <= (PACK_SYM >> 48) || top == PACK_OBJ >> 48
+    }
+
+    #[inline(always)]
+    pub(crate) fn bits(&self) -> u64 {
+        self.0
+    }
+
+    /// Whether this is the `Empty` marker (a packed element hole).
+    #[inline(always)]
+    pub(crate) fn is_hole(&self) -> bool {
+        self.0 == PACK_EMPTY
+    }
+
+    /// Whether dropping this word releases a handle.
+    #[inline(always)]
+    pub(crate) fn needs_drop(&self) -> bool {
+        self.is_ref()
+    }
+
+    /// The word `pack` would produce for `value`, leaving `value` the owner of its handle.
+    #[inline(always)]
+    pub(crate) fn bits_of(value: &Value) -> u64 {
+        // SAFETY: `pack` moves the bitwise copy's handle into the word without a refcount
+        // change, and `ManuallyDrop` keeps that duplicate from being released.
+        std::mem::ManuallyDrop::new(Self::pack(unsafe { std::ptr::read(value) })).0
+    }
+
+    /// A `Value` view of this slot that borrows its handle rather than counting a reference.
+    #[inline(always)]
+    pub(crate) fn get(&self) -> PackedRef<'_> {
+        PackedRef(
+            std::mem::ManuallyDrop::new(PackedValue(self.0).into_value()),
+            std::marker::PhantomData,
+        )
+    }
+}
+
+/// A borrowed view of a property as [`Property`]: either an entry itself or a packed element
+/// word dressed as the plain data property it stands for. Nothing is counted or released;
+/// cloning through the `Deref` yields an owned `Property` as usual.
+pub(crate) struct PropRef<'a>(
+    std::mem::ManuallyDrop<Property>,
+    std::marker::PhantomData<&'a Property>,
+);
+
+impl<'a> PropRef<'a> {
+    #[inline(always)]
+    pub(crate) fn of(p: &'a Property) -> PropRef<'a> {
+        // SAFETY: a bitwise copy that is never dropped, borrowed no longer than `p`.
+        PropRef(std::mem::ManuallyDrop::new(unsafe { std::ptr::read(p) }), std::marker::PhantomData)
+    }
+
+    /// The plain data element held in packed word `w`.
+    #[inline(always)]
+    pub(crate) fn elem(w: &'a PackedValue) -> PropRef<'a> {
+        PropRef(
+            std::mem::ManuallyDrop::new(Property { packed: PackedValue(w.0), meta: PROP_PLAIN }),
+            std::marker::PhantomData,
+        )
+    }
+}
+
+impl std::ops::Deref for PropRef<'_> {
+    type Target = Property;
+    #[inline(always)]
+    fn deref(&self) -> &Property {
+        &self.0
+    }
+}
+
+/// See [`PackedValue::get`]. Cloning through the `Deref` counts a reference as usual.
+pub(crate) struct PackedRef<'a>(
+    std::mem::ManuallyDrop<Value>,
+    std::marker::PhantomData<&'a PackedValue>,
+);
+
+impl std::ops::Deref for PackedRef<'_> {
+    type Target = Value;
+    #[inline(always)]
+    fn deref(&self) -> &Value {
+        &self.0
     }
 }
 
@@ -666,6 +921,41 @@ mod packed_value_tests {
             };
             assert!(n.is_nan() && out.is_nan() || n.to_bits() == out.to_bits());
         }
+    }
+
+    #[test]
+    fn saturated_counts_stick() {
+        let obj = Object::new(None);
+        obj.strong.set(STRONG_STICKY - 1);
+        let a = obj.clone();
+        assert_eq!(obj.strong.get(), STRONG_STICKY);
+        let b = obj.clone();
+        drop(a);
+        drop(b);
+        assert_eq!(obj.strong.get(), STRONG_STICKY);
+        obj.weak.set(WEAK_MASK - 1);
+        let w1 = Gc::downgrade(&obj);
+        let w2 = w1.clone();
+        drop(w1);
+        drop(w2);
+        assert_eq!(obj.weak.get() & WEAK_MASK, WEAK_MASK);
+    }
+
+    #[test]
+    fn borrow_state_tracks_guards() {
+        let obj = Object::new(None);
+        {
+            let _a = obj.borrow();
+            let _b = obj.borrow();
+            assert!(obj.try_borrow_mut().is_err());
+            assert!(obj.try_borrow().is_ok());
+        }
+        {
+            let _w = obj.borrow_mut();
+            assert!(obj.try_borrow().is_err());
+            assert!(obj.try_borrow_mut().is_err());
+        }
+        assert_eq!(obj.borrow.get(), 0);
     }
 
     #[test]
@@ -763,7 +1053,7 @@ pub enum Callable {
     /// A native function carrying captured state (see [`NativeClosure`]).
     NativeData(Rc<NativeCallable>),
     /// An interpreted function: its AST plus the lexical environment it closed over.
-    User(Rc<UserCallable>),
+    User(Box<UserCallable>),
     /// The result of `Function.prototype.bind`.
     Bound(Box<BoundCallable>),
     /// A ShadowRealm wrapped function: `target` is a callable inside the sub-realm identified by
@@ -833,7 +1123,7 @@ impl Callable {
     }
 
     pub(crate) fn user(func: Rc<Function>, env: Env) -> Callable {
-        Callable::User(Rc::new(UserCallable { func, env }))
+        Callable::User(Box::new(UserCallable { func, env }))
     }
 
     pub(crate) fn wrapped_shadow(realm: usize, target: Value) -> Callable {
@@ -1075,7 +1365,7 @@ impl Object {
                 proto,
                 template.instantiate_shell(),
                 Exotic::None,
-                heap::SlotClass::Inline,
+                heap::SlotClass::inline_for(values.len()),
             );
             obj.borrow_mut().props.fill_plain(values);
             obj
@@ -1136,28 +1426,24 @@ impl Object {
                 k += 1;
             }
             debug_assert_eq!(k, n);
-            p.write(GcBox {
-                strong: Cell::new(1),
-                weak: Cell::new(1),
-                value: RefCell::new(Object {
-                    proto,
-                    props: template.instantiate_inline_raw(slots, k, class.inline_cap()),
-                    call: Callable::None,
-                    exotic: Exotic::None,
-                    extensible: true,
-                    ic_plain: Cell::new(true),
-                    is_constructor: false,
-                    gc_internal: Cell::new(0),
-                }),
-            });
+            p.write(ObjCell::new(Object {
+                proto,
+                props: template.instantiate_inline_raw(slots, k, class.inline_cap()),
+                call: Callable::None,
+                exotic: Exotic::None,
+                extensible: true,
+                ic_plain: Cell::new(true),
+                is_constructor: false,
+                gc_internal: Cell::new(0),
+            }));
             Gc(std::ptr::NonNull::new_unchecked(p))
         })
     }
 
     /// **Fast allocation entry (JIT-callable).** A fresh packed Array of the `n` values at
     /// `vals`, on `proto` (consumed; pass a clone of the realm's `Array.prototype`). With
-    /// `n <= props::INLINE_PACKED_CAPACITY` (10) the array is one slab box: `length` in its
-    /// inline slots and the elements in its in-box sidecar, all direct stores. Longer arrays
+    /// `n <= heap::ARRAY_SLOTS_MAX` (4) the array is one slab box: `length` in its inline
+    /// slot and the elements in its in-box element slots, all direct stores. Longer arrays
     /// take the general path. The values are *moved* out of `vals`, as in
     /// [`Object::alloc_from_template`].
     ///
@@ -1170,40 +1456,29 @@ impl Object {
     }
 
     /// The one-box array of [`Object::alloc_array`] over an exact-size iterator of at most
-    /// [`props::INLINE_PACKED_CAPACITY`] values.
+    /// [`heap::ARRAY_SLOTS_MAX`] values.
     #[inline]
     fn alloc_array_iter(proto: Option<Gc>, values: impl ExactSizeIterator<Item = Value>) -> Gc {
         let len = values.len();
-        assert!(len <= props::INLINE_PACKED_CAPACITY);
+        assert!(len <= heap::ARRAY_SLOTS_MAX);
         let shape = props::array_length_shape();
         with_gc_state(|state| unsafe {
-            let class = if len != 0 {
-                heap::SlotClass::Array
-            } else {
-                heap::SlotClass::Inline
-            };
+            let class = heap::SlotClass::array_for(len);
             let p = state.heap.alloc(&state.live, class);
             let named = heap::inline_props(p);
             named.write(array_length(len));
-            let elems = if len != 0 {
-                props::DenseStorage::write_in_box_packed(heap::inline_dense(p), values)
-            } else {
-                props::DenseStorage::default()
-            };
-            p.write(GcBox {
-                strong: Cell::new(1),
-                weak: Cell::new(1),
-                value: RefCell::new(Object {
-                    proto,
-                    props: Props::array_inline_raw(shape, named, heap::INLINE_PROPS, elems),
-                    call: Callable::None,
-                    exotic: Exotic::Array,
-                    extensible: true,
-                    ic_plain: Cell::new(true),
-                    is_constructor: false,
-                    gc_internal: Cell::new(0),
-                }),
-            });
+            let elems =
+                props::DenseStorage::write_in_box(heap::inline_dense(p), class.array_slots(), values);
+            p.write(ObjCell::new(Object {
+                proto,
+                props: Props::array_inline_raw(shape, named, heap::ARRAY_NAMED, elems),
+                call: Callable::None,
+                exotic: Exotic::Array,
+                extensible: true,
+                ic_plain: Cell::new(true),
+                is_constructor: false,
+                gc_internal: Cell::new(0),
+            }));
             Gc(std::ptr::NonNull::new_unchecked(p))
         })
     }
@@ -1215,26 +1490,24 @@ impl Object {
         values: impl ExactSizeIterator<Item = Value>,
     ) -> Gc {
         let len = values.len();
-        if len <= props::INLINE_PACKED_CAPACITY {
+        if len <= heap::ARRAY_SLOTS_MAX {
             return Self::alloc_array_iter(proto, values);
         }
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot| unsafe {
-            d.adopt_in_box_packed(slot, values)
+        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, k| unsafe {
+            d.adopt_in_box(slot, k, values)
         })
     }
 
-    /// [`Object::new_array_from_iter`] over an owned vector (whose allocation a long array
-    /// reuses for its elements: `Value` and `Property` share a layout, so the conversion
-    /// collects in place).
+    /// [`Object::new_array_from_iter`] over an owned vector.
     #[inline]
     pub(crate) fn new_array_from_vec(proto: Option<Gc>, values: Vec<Value>) -> Gc {
-        if values.len() <= props::INLINE_PACKED_CAPACITY {
+        if values.len() <= heap::ARRAY_SLOTS_MAX {
             return Self::new_array_from_iter(proto, values.into_iter());
         }
         let len = values.len();
-        let packed: Vec<Property> = values.into_iter().map(Property::plain).collect();
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot| unsafe {
-            d.init_in_box(slot, Some(Box::new(props::PackedVec::from(packed))))
+        let packed: Vec<PackedValue> = values.into_iter().map(PackedValue::pack).collect();
+        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, _| unsafe {
+            d.install_in_box(slot, props::PackedVec::from(packed))
         })
     }
 
@@ -1250,11 +1523,11 @@ impl Object {
     /// of another array's packed storage.
     fn new_array_from_packed(proto: Option<Gc>, packed: props::PackedVec) -> Gc {
         let len = packed.len();
-        if len <= props::INLINE_PACKED_CAPACITY {
-            return Self::new_array_from_iter(proto, packed.iter().map(Property::value).collect::<Vec<_>>().into_iter());
+        if len <= heap::ARRAY_SLOTS_MAX {
+            return Self::new_array_from_iter(proto, packed.iter().map(PackedValue::unpack).collect::<Vec<_>>().into_iter());
         }
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot| unsafe {
-            d.init_in_box(slot, Some(Box::new(packed)))
+        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, _| unsafe {
+            d.install_in_box(slot, packed)
         })
     }
 
@@ -1274,37 +1547,31 @@ impl Object {
             Property::plain(input),
             Property::plain(groups),
         ];
-        Self::new_array_parts(proto, Props::exec_result_shell(), len, named, |d, slot| unsafe {
-            d.adopt_in_box_packed(slot, values)
+        Self::new_array_parts(proto, Props::exec_result_shell(), len, named, |d, slot, k| unsafe {
+            d.adopt_in_box(slot, k, values)
         })
     }
 
     /// An Array around a shell map (see [`Props::array_shell`]): its named entries (in shape
-    /// order) go into the box's inline slots and `fill` writes its `len` elements into the
-    /// box's sidecar area, so a small array is one heap block. No elements: no sidecar.
+    /// order) go into the box's inline slot (more spill to the heap) and `fill` installs its
+    /// `len` elements in the box's sidecar area (followed by the given number of element
+    /// slots), so a small array is one heap block.
     #[inline(always)]
     fn new_array_parts<const N: usize>(
         proto: Option<Gc>,
         shell: Props,
         len: usize,
         named: [Property; N],
-        fill: impl FnOnce(&mut props::DenseStorage, *mut props::DenseBuffers),
+        fill: impl FnOnce(&mut props::DenseStorage, *mut props::DenseBuffers, usize),
     ) -> Gc {
-        const { assert!(N <= heap::INLINE_PROPS) };
-        let class = if len != 0 {
-            heap::SlotClass::Array
-        } else {
-            heap::SlotClass::Inline
-        };
+        let class = heap::SlotClass::array_for(len);
         let obj = Self::alloc_in(proto, shell, Exotic::Array, class);
         let bx = obj.0.as_ptr();
         {
             let mut b = obj.borrow_mut();
             b.props.entries.extend_exact(named.into_iter());
-            if len != 0 {
-                // An `Array`-class box: its sidecar area is unused until now.
-                fill(&mut b.props.elems, heap::inline_dense(bx));
-            }
+            // An array-class box: its sidecar area is unused until now.
+            fill(&mut b.props.elems, heap::inline_dense(bx), class.array_slots());
         }
         obj
     }
@@ -1313,14 +1580,15 @@ impl Object {
     /// inline slots — e.g. a RegExp's `lastIndex` — instead of cloning an entry buffer.
     #[inline]
     pub(crate) fn new_inline_copy(proto: Option<Gc>, template: &Props) -> Gc {
-        if template.entries.len() > heap::INLINE_PROPS || !template.can_instantiate_inline() {
+        let n = template.entries.len();
+        if n > heap::INLINE_PROPS || !template.can_instantiate_inline() {
             return Self::new_with_parts(proto, template.clone(), Exotic::None);
         }
         let obj = Self::alloc_in(
             proto,
             template.instantiate_shell(),
             Exotic::None,
-            heap::SlotClass::Inline,
+            heap::SlotClass::inline_for(n),
         );
         obj.borrow_mut()
             .props
@@ -1349,7 +1617,7 @@ impl Object {
         with_gc_state(|state| {
             Gc::alloc(
                 state,
-                RefCell::new(Object {
+                Object {
                     proto,
                     props,
                     call: Callable::None,
@@ -1358,7 +1626,7 @@ impl Object {
                     ic_plain: Cell::new(true),
                     is_constructor: false,
                     gc_internal: Cell::new(0),
-                }),
+                },
                 class,
             )
         })
@@ -1388,6 +1656,8 @@ pub(crate) struct GcState {
     /// the bodies that went cold (see `Function::release_cold_body`). Dead entries are pruned by
     /// that pass; a `Weak` pins only the node's allocation, never a body.
     lazy_fns: RefCell<Vec<std::rc::Weak<crate::ast::Function>>>,
+    /// `lazy_fns` length past which a registration prunes dead entries first.
+    lazy_fns_next: Cell<usize>,
     /// The object-shape transition tree for this heap (see [`props::ShapeTable`]): objects flow
     /// between the driver and its coroutine workers, so their shapes must resolve on either.
     pub(in crate::value) shapes: RefCell<props::ShapeTable>,
@@ -1409,6 +1679,7 @@ impl GcState {
             live: Cell::new(0),
             scopes: RefCell::new(Vec::new()),
             lazy_fns: RefCell::new(Vec::new()),
+            lazy_fns_next: Cell::new(LAZY_FNS_PRUNE_MIN),
             shapes: RefCell::new(props::ShapeTable::new()),
             scope_epoch: Cell::new(0),
             scope_serial: Cell::new(0),
@@ -1458,6 +1729,11 @@ pub(in crate::value) fn with_gc_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
     f(unsafe { &*p })
 }
 
+/// Whether this thread's heap state is still reachable (false during thread-local teardown).
+pub(crate) fn gc_state_alive() -> bool {
+    GC_CUR.try_with(|_| ()).is_ok() && GC_STATE.try_with(|_| ()).is_ok()
+}
+
 /// A handle to the state the current thread allocates into, for handing to a coroutine worker.
 pub(crate) fn gc_state_handle() -> Arc<GcState> {
     GC_STATE.with(|s| s.0.borrow().clone())
@@ -1486,7 +1762,7 @@ pub fn gc_snapshot() -> Vec<Gc> {
     with_gc_state(|state| {
         let mut live = Vec::with_capacity(state.live.get().max(0) as usize);
         state.heap.for_each_live(|b| unsafe {
-            (*b).strong.set((*b).strong.get() + 1);
+            strong_bump(&*b);
             live.push(Gc(std::ptr::NonNull::new_unchecked(b)));
         });
         live
@@ -1527,8 +1803,25 @@ pub(crate) fn gc_trim_heap() {
     with_gc_state(|state| state.heap.trim(keep));
 }
 
+/// Return empty slab chunks to the system once objects dying by reference count (no sweep,
+/// e.g. a big array dropped) have left more than [`SPARE_CHUNKS`] of them empty for a while
+/// (see `ObjHeap::trim_if_emptied`). Polled from the interpreter's safe points.
+#[inline]
+pub(crate) fn gc_trim_emptied() {
+    if with_gc_state(|state| state.heap.trim_if_emptied(SPARE_CHUNKS)) {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::fastalloc::release_free_pages();
+    }
+}
+
 /// Empty 256 KiB slab chunks a heap keeps between full trims (16 MiB).
 const SPARE_CHUNKS: usize = 64;
+
+/// Make a pending purge of empty slab chunks due now.
+#[cfg(test)]
+pub(crate) fn gc_expire_purge_delay() {
+    with_gc_state(|state| state.heap.expire_purge_delay());
+}
 
 /// Slab chunks currently mapped for this thread's heap.
 #[cfg(test)]
@@ -1593,8 +1886,23 @@ pub(crate) fn scope_snapshot() -> Vec<crate::interpreter::Env> {
     })
 }
 
+/// Floor for the registry size that triggers a prune on registration.
+const LAZY_FNS_PRUNE_MIN: usize = 4096;
+
+/// A dead `Weak` pins its node's allocation, and code that mints functions without allocating
+/// many objects (`new Function` / `eval` in a loop) may never trigger the collection whose flush
+/// pass prunes them: registration prunes too, once the registry doubled since the last prune.
 pub(crate) fn register_lazy_function(f: &Rc<crate::ast::Function>) {
-    with_gc_state(|state| state.lazy_fns.borrow_mut().push(Rc::downgrade(f)));
+    with_gc_state(|state| {
+        let mut reg = state.lazy_fns.borrow_mut();
+        if reg.len() >= state.lazy_fns_next.get() {
+            reg.retain(|w| w.strong_count() > 0);
+            state
+                .lazy_fns_next
+                .set(reg.len().saturating_mul(2).max(LAZY_FNS_PRUNE_MIN));
+        }
+        reg.push(Rc::downgrade(f));
+    });
 }
 
 /// Release every registered function's body that no read touched since the previous pass, and
@@ -1615,6 +1923,9 @@ pub(crate) fn flush_cold_lazy_bodies() -> usize {
             }
             None => false,
         });
+        state
+            .lazy_fns_next
+            .set(reg.len().saturating_mul(2).max(LAZY_FNS_PRUNE_MIN));
         released
     })
 }
@@ -1809,6 +2120,8 @@ pub(crate) const PROP_WRITABLE: usize = 2;
 pub(crate) const PROP_ENUMERABLE: usize = 4;
 pub(crate) const PROP_CONFIGURABLE: usize = 8;
 const PROP_FLAG_MASK: usize = 15;
+/// A writable, enumerable, configurable data property (what every packed element is).
+pub(crate) const PROP_PLAIN: usize = PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE;
 
 impl Clone for Property {
     #[inline]
@@ -1828,30 +2141,6 @@ impl Clone for Property {
         Property {
             packed: self.packed.clone(),
             meta,
-        }
-    }
-}
-
-impl Property {
-    /// Whether dropping this property does anything: an accessor box, or a value holding a
-    /// reference count. Bulk element drops skip the rest without a call each.
-    #[inline(always)]
-    pub(crate) fn needs_drop(&self) -> bool {
-        self.meta & !PROP_FLAG_MASK != 0
-            || matches!(self.packed.tag(), PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ)
-    }
-}
-
-/// Drop `len` properties at `ptr`, calling the drop glue only for those that need it.
-///
-/// # Safety
-/// As `std::ptr::drop_in_place` on the slice.
-#[inline]
-pub(crate) unsafe fn drop_properties(ptr: *mut Property, len: usize) {
-    for k in 0..len {
-        let p = ptr.add(k);
-        if (*p).needs_drop() {
-            std::ptr::drop_in_place(p);
         }
     }
 }
@@ -1997,7 +2286,7 @@ impl Property {
     }
     /// The object this data property holds, as [`Gc::as_ptr`] gives it (no clone).
     #[inline]
-    pub(crate) fn obj_ptr(&self) -> Option<*const RefCell<Object>> {
+    pub(crate) fn obj_ptr(&self) -> Option<*const ObjCell> {
         if self.accessor() {
             return None;
         }
@@ -2008,6 +2297,22 @@ impl Property {
     #[inline]
     pub(crate) fn holds_obj(&self, g: &Gc) -> bool {
         !self.accessor() && self.packed.is_obj(g)
+    }
+    /// The packed element word of a plain data property (holes included), or the property
+    /// back when it needs its descriptor bits.
+    #[inline]
+    pub(crate) fn into_elem(self) -> Result<PackedValue, Property> {
+        if self.meta != PROP_PLAIN {
+            return Err(self);
+        }
+        let me = std::mem::ManuallyDrop::new(self);
+        Ok(PackedValue(me.packed.0))
+    }
+
+    /// The plain data property for packed element word `w`.
+    #[inline]
+    pub(crate) fn from_elem(w: PackedValue) -> Property {
+        Property { packed: w, meta: PROP_PLAIN }
     }
     /// Overwrite a data property that holds a number with the number `n` (no drop needed).
     #[inline]
@@ -2075,7 +2380,7 @@ pub(crate) mod gc_edges;
 mod heap;
 pub(crate) mod memwalk;
 /// The widest inline slot class (see [`Props::fast_template`]).
-pub(crate) use heap::INLINE_PROPS_WIDE;
+pub(crate) use heap::{CLASS_NAMES as SLOT_CLASS_NAMES, INLINE_PROPS_WIDE};
 mod props;
 pub(crate) use props::FnMaps;
 pub use props::Props;
@@ -2195,48 +2500,6 @@ pub fn f64_to_f16(value: f64) -> u16 {
 pub(crate) const PROPERTY_PACKED_OFFSET: usize = std::mem::offset_of!(Property, packed);
 /// Byte offset of a [`Property`]'s flag / accessor-pointer word.
 pub(crate) const PROPERTY_META_OFFSET: usize = std::mem::offset_of!(Property, meta);
-
-/// `(object, borrow flag)`: byte offsets from a `Gc` handle word (the `GcBox` address) to the
-/// `Object` inside its `RefCell` and to that `RefCell`'s borrow counter (an `isize`: 0 = free,
-/// > 0 = shared borrows, < 0 = mutably borrowed). std's `RefCell` field order is not public, so
-/// both are measured once from a real cell; `None` when the probe is inconclusive.
-pub(crate) fn jit_gc_offsets() -> Option<(usize, usize)> {
-    static OFFSETS: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
-    *OFFSETS.get_or_init(|| {
-        // Never dropped: `Object::drop` would decrement a live count this object never joined.
-        // Its parts own no allocation (empty props, no call target), so nothing leaks.
-        let cell = std::mem::ManuallyDrop::new(RefCell::new(Object {
-            proto: None,
-            props: Props::new(),
-            call: Callable::None,
-            exotic: Exotic::None,
-            extensible: true,
-            ic_plain: Cell::new(true),
-            is_constructor: false,
-            gc_internal: Cell::new(0),
-        }));
-        let base = &*cell as *const RefCell<Object> as usize;
-        let value = cell.as_ptr() as usize - base;
-        const W: usize = std::mem::size_of::<isize>();
-        let words = std::mem::size_of::<RefCell<Object>>() / W;
-        let read = |w: usize| unsafe { std::ptr::read_volatile((base + w * W) as *const isize) };
-        let outside =
-            |w: usize| w * W + W <= value || w * W >= value + std::mem::size_of::<Object>();
-        let free: Vec<usize> = (0..words).filter(|&w| outside(w) && read(w) == 0).collect();
-        let shared: Vec<usize> = {
-            let _r = cell.borrow();
-            free.iter().copied().filter(|&w| read(w) == 1).collect()
-        };
-        let excl: Vec<usize> = {
-            let _w = cell.borrow_mut();
-            shared.iter().copied().filter(|&w| read(w) < 0).collect()
-        };
-        match excl[..] {
-            [w] => Some((GC_VALUE_OFFSET + value, GC_VALUE_OFFSET + w * W)),
-            _ => None,
-        }
-    })
-}
 
 /// An Array's own `length` data property (writable, non-enumerable, non-configurable).
 #[inline]

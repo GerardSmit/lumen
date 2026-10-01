@@ -15,10 +15,10 @@
 //! Every address is [`PTR`]-typed and loaded with [`PTR_MEM`] (pointers are 32-bit on wasm32);
 //! every offset and size comes from `offset_of!` / `size_of` or a probe on this target.
 //!
-//! - `Value::Obj(Gc)`: the payload word is the `GcBox` address; the `Object` sits inside the
-//!   box's `RefCell` at a measured offset ([`crate::value::jit_gc_offsets`]), next to the
-//!   cell's `isize` borrow counter. Reads require no live mutable borrow (counter >= 0), writes
-//!   require no borrow at all (counter == 0) — a borrow held across a JIT call anywhere up the
+//! - `Value::Obj(Gc)`: the payload word is the `ObjCell` address; the `Object` sits at
+//!   `GC_VALUE_OFFSET`, with a `u16` borrow state in the box header (`GC_BORROW_OFFSET`). Reads
+//!   require no live mutable borrow (state below `BORROW_MUT`), writes require no borrow at all
+//!   (state == 0) — a borrow held across a JIT call anywhere up the
 //!   stack only costs a miss, never an aliasing violation.
 //! - `Object::exotic` is `repr(u8)` with declared discriminants; `Object::ic_plain` is a
 //!   `Cell<bool>` byte, cleared on every object whose behavior lives in an interpreter side
@@ -26,8 +26,9 @@
 //!   `Interp::plain_for_elems`' namespace hash lookups.
 //! - `Props` (`value::props::PropsLayout`): the `EntryVec` (pointer, `u32` len, `u32` cap),
 //!   the `u32` shape id, `Option<Rc<Shape>>` (one nullable word; `len_slot` at a measured
-//!   distance), and the nullable sidecar `Box<DenseBuffers>` with the boxed / inline packed
-//!   element storage, the `Vec<u32>` slot map, the `Vec<f64>` numeric mirror and its flags.
+//!   distance), and the nullable, tagged sidecar `DenseBuffers` pointer: the packed elements'
+//!   pointer and `u32` length (in-box slots or a heap buffer alike), and the nullable classic
+//!   storage box with the `Vec<u32>` slot map, the `Vec<f64>` numeric mirror and its flags.
 //!   `Vec`'s field order is private to std and measured per element type (`vec_layout`).
 //! - `Property`: NaN-boxed value word (`PACK_*` tags in the top 16 bits, numbers as raw f64
 //!   bits with NaN canonicalized) plus a meta word whose low bits are the descriptor flags.
@@ -45,18 +46,14 @@ use crate::bytecode::{Chunk, PROP_IC_WAYS};
 use crate::value::{
     Exotic, Object, Property, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK, PACK_BIGINT, PACK_BOOL,
     PACK_CANON_NAN, PACK_EMPTY, PACK_NULL, PACK_OBJ, PACK_STR, PACK_SYM, PACK_UNDEFINED,
-    PROPERTY_META_OFFSET, PROPERTY_PACKED_OFFSET, PROP_ACCESSOR, PROP_WRITABLE,
+    PROPERTY_META_OFFSET, PROPERTY_PACKED_OFFSET, PROP_ACCESSOR, PROP_PLAIN, PROP_WRITABLE,
 };
 use lumen_codegen::{
     BinaryOp, Block, ConvOp, FloatCC, FunctionBuilder, IntCC, MemKind, Type, Value as IrValue,
 };
 use std::sync::OnceLock;
 
-// Zero-extending loads of a `u8` / `u32` field into a pointer-typed (`PTR`) IR value.
-#[cfg(target_pointer_width = "64")]
-const PTR_U8: MemKind = MemKind::I64U8;
-#[cfg(target_pointer_width = "32")]
-const PTR_U8: MemKind = MemKind::I32U8;
+// Zero-extending load of a `u32` field into a pointer-typed (`PTR`) IR value.
 #[cfg(target_pointer_width = "64")]
 const PTR_U32: MemKind = MemKind::I64U32;
 #[cfg(target_pointer_width = "32")]
@@ -107,18 +104,20 @@ struct Layout {
     proto_flag: i32,
     extensible: i32,
     elems: i32,
-    dense_packed: i32,
-    dense_inline_len: i32,
-    dense_inline_slots: i32,
-    /// `dense_elems` + the `Vec<u32>` pointer / length word.
+    /// Tag bits of the sidecar word (masked off before use).
+    elems_tag: i64,
+    /// Packed first-element pointer (null = not packed) / `u32` length, in the sidecar.
+    packed_ptr: i32,
+    packed_len: i32,
+    /// The sidecar's nullable `Box<Classic>` word.
+    classic: i32,
+    /// Relative to the `Classic`: the `Vec<u32>` pointer / length words, the `Vec<f64>`
+    /// mirror's, and the `u8` mirror flags.
     elems_ptr: i32,
     elems_len: i32,
     mirror_ptr: i32,
     mirror_len: i32,
     mirror_flags: i32,
-    /// `PackedVec` first-element pointer / length words, relative to the boxed buffer.
-    packed_ptr: i32,
-    packed_len: i32,
     prop_size: i64,
     prop_packed: i32,
     prop_meta: i32,
@@ -155,7 +154,10 @@ fn layout() -> Option<&'static Layout> {
     static LAYOUT: OnceLock<Option<Layout>> = OnceLock::new();
     LAYOUT
         .get_or_init(|| {
-            let (obj, borrow) = crate::value::jit_gc_offsets()?;
+            let (obj, borrow) = (
+                crate::value::GC_VALUE_OFFSET,
+                crate::value::GC_BORROW_OFFSET,
+            );
             let p = crate::value::jit_props_layout()?;
             let (u32_ptr, u32_len) = vec_layout::<u32>(7)?;
             let (f64_ptr, f64_len) = vec_layout::<f64>(7.0)?;
@@ -176,16 +178,15 @@ fn layout() -> Option<&'static Layout> {
                 proto_flag: i(props + p.proto_flag)?,
                 extensible: i(obj + std::mem::offset_of!(Object, extensible))?,
                 elems: i(props + p.elems)?,
-                dense_packed: i(p.dense_packed)?,
-                dense_inline_len: i(p.dense_inline_len)?,
-                dense_inline_slots: i(p.dense_inline_slots)?,
-                elems_ptr: i(p.dense_elems + u32_ptr)?,
-                elems_len: i(p.dense_elems + u32_len)?,
-                mirror_ptr: i(p.dense_mirror + f64_ptr)?,
-                mirror_len: i(p.dense_mirror + f64_len)?,
-                mirror_flags: i(p.dense_mirror_flags)?,
+                elems_tag: p.elems_tag as i64,
                 packed_ptr: i(p.packed_ptr)?,
                 packed_len: i(p.packed_len)?,
+                classic: i(p.dense_classic)?,
+                elems_ptr: i(p.classic_elems + u32_ptr)?,
+                elems_len: i(p.classic_elems + u32_len)?,
+                mirror_ptr: i(p.classic_mirror + f64_ptr)?,
+                mirror_len: i(p.classic_mirror + f64_len)?,
+                mirror_flags: i(p.classic_mirror_flags)?,
                 prop_size: std::mem::size_of::<Property>() as i64,
                 prop_packed: i(PROPERTY_PACKED_OFFSET)?,
                 prop_meta: i(PROPERTY_META_OFFSET)?,
@@ -199,6 +200,9 @@ fn layout() -> Option<&'static Layout> {
 }
 
 // ----- IR helpers ------------------------------------------------------------------------------
+
+/// Bytes per packed element: one NaN-boxed word.
+const ELEM_SIZE: i64 = std::mem::size_of::<crate::value::PackedValue>() as i64;
 
 /// Continue in a fresh block when `ok` (I32) is non-zero, else branch to `miss`.
 fn guard(fb: &mut FunctionBuilder, ok: IrValue, miss: Block) {
@@ -240,9 +244,12 @@ fn object(fb: &mut FunctionBuilder, l: &Layout, v: IrValue, miss: Block, write: 
     let is_obj = cmp_imm(fb, IntCC::Eq, Type::I32, tag, TAG_OBJ as i64);
     guard(fb, is_obj, miss);
     let gc = fb.load(PTR_MEM, v, VALUE_PAYLOAD);
-    let flag = fb.load(PTR_MEM, gc, l.borrow);
-    let cc = if write { IntCC::Eq } else { IntCC::Sge };
-    let free = cmp_imm(fb, cc, PTR, flag, 0);
+    let flag = fb.load(MemKind::I32U16, gc, l.borrow);
+    let free = if write {
+        cmp_imm(fb, IntCC::Eq, Type::I32, flag, 0)
+    } else {
+        cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64)
+    };
     guard(fb, free, miss);
     gc
 }
@@ -288,19 +295,21 @@ pub(crate) fn is_num_bits(fb: &mut FunctionBuilder, bits: IrValue) -> IrValue {
     cmp_imm(fb, IntCC::Ult, Type::I64, top, TOP_UNDEFINED)
 }
 
-/// The sidecar `DenseBuffers` pointer, guarded non-null (no sidecar = no elements).
+/// The sidecar `DenseBuffers` pointer, guarded non-null (no sidecar = no elements), with its
+/// tag bits masked off.
 fn dense(fb: &mut FunctionBuilder, l: &Layout, gc: IrValue, miss: Block) -> IrValue {
     let d = fb.load(PTR_MEM, gc, l.elems);
     let present = cmp_imm(fb, IntCC::Ne, PTR, d, 0);
     guard(fb, present, miss);
-    d
+    bin_imm(fb, BinaryOp::Band, PTR, d, !l.elems_tag)
 }
 
-/// Address of own dense element `i`'s `Property` — `Props::get_index`'s lookup: boxed packed
-/// storage, else inline packed storage, else the `elems` slot map into `entries`. Misses when
-/// the element is not in the dense storage (a hole, out of range, a sparse "far" key). With
+/// Own dense element `i` — `Props::get_index`'s lookup: packed storage, else the classic
+/// `elems` slot map into `entries`. Misses when the element is not in the dense storage (out
+/// of range, a classic hole, a sparse "far" key); a packed hole is an `Empty` word. With
 /// `owned`, the `entries` route also requires an owned (mutable, not copy-on-write shared)
-/// entry block. Returns `(property address, I32 1 if it lives in entries / 0 if packed)`.
+/// entry block. Returns `(address of the NaN-boxed value word, descriptor meta word, I32 1 if
+/// it lives in entries / 0 if packed)`: a packed element is a plain data property.
 fn element_prop(
     fb: &mut FunctionBuilder,
     l: &Layout,
@@ -309,58 +318,44 @@ fn element_prop(
     i: IrValue,
     miss: Block,
     owned: bool,
-) -> (IrValue, IrValue) {
+) -> (IrValue, IrValue, IrValue) {
     let join = fb.create_block();
-    let prop = fb.append_block_param(join, PTR);
+    let word = fb.append_block_param(join, PTR);
+    let meta = fb.append_block_param(join, PTR);
     let in_entries = fb.append_block_param(join, Type::I32);
 
-    let boxed = fb.create_block();
-    let not_boxed = fb.create_block();
-    let packed = fb.load(PTR_MEM, d, l.dense_packed);
-    let is_boxed = cmp_imm(fb, IntCC::Ne, PTR, packed, 0);
-    fb.brif(is_boxed, boxed, &[], not_boxed, &[]);
-    fb.seal_block(boxed);
-    fb.seal_block(not_boxed);
-
-    // Boxed packed: `Box<PackedVec>`, indexed directly.
-    fb.switch_to_block(boxed);
-    let len = fb.load(PTR_MEM, packed, l.packed_len);
-    let inb = fb.icmp(IntCC::Ult, i, len);
-    guard(fb, inb, miss);
-    let base = fb.load(PTR_MEM, packed, l.packed_ptr);
-    let p = scaled(fb, base, i, l.prop_size);
-    let zero = fb.iconst(Type::I32, 0);
-    fb.jump(join, &[p, zero]);
-
-    // Inline packed: a non-zero `u8` length selects it.
-    fb.switch_to_block(not_boxed);
-    let inline = fb.create_block();
+    let packed = fb.create_block();
     let classic = fb.create_block();
-    let ilen = fb.load(PTR_U8, d, l.dense_inline_len);
-    let is_inline = cmp_imm(fb, IntCC::Ne, PTR, ilen, 0);
-    fb.brif(is_inline, inline, &[], classic, &[]);
-    fb.seal_block(inline);
+    let base = fb.load(PTR_MEM, d, l.packed_ptr);
+    let is_packed = cmp_imm(fb, IntCC::Ne, PTR, base, 0);
+    fb.brif(is_packed, packed, &[], classic, &[]);
+    fb.seal_block(packed);
     fb.seal_block(classic);
 
-    fb.switch_to_block(inline);
-    let inb = fb.icmp(IntCC::Ult, i, ilen);
+    // Packed (in-box slots or a heap buffer), indexed directly.
+    fb.switch_to_block(packed);
+    let len = fb.load(PTR_U32, d, l.packed_len);
+    let inb = fb.icmp(IntCC::Ult, i, len);
     guard(fb, inb, miss);
-    let slots = bin_imm(fb, BinaryOp::Iadd, PTR, d, l.dense_inline_slots as i64);
-    let p = scaled(fb, slots, i, l.prop_size);
+    let p = scaled(fb, base, i, ELEM_SIZE);
+    let plain = fb.iconst(PTR, PROP_PLAIN as i64);
     let zero = fb.iconst(Type::I32, 0);
-    fb.jump(join, &[p, zero]);
+    fb.jump(join, &[p, plain, zero]);
 
     // Classic: `elems[i]` is the entries slot, or `NO_SLOT` for a hole.
     fb.switch_to_block(classic);
+    let c = fb.load(PTR_MEM, d, l.classic);
+    let has = cmp_imm(fb, IntCC::Ne, PTR, c, 0);
+    guard(fb, has, miss);
     if owned {
         let cap = fb.load(PTR_U32, gc, l.entries_cap);
         let is_owned = cmp_imm(fb, IntCC::Ne, PTR, cap, 0);
         guard(fb, is_owned, miss);
     }
-    let elen = fb.load(PTR_MEM, d, l.elems_len);
+    let elen = fb.load(PTR_MEM, c, l.elems_len);
     let inb = fb.icmp(IntCC::Ult, i, elen);
     guard(fb, inb, miss);
-    let eptr = fb.load(PTR_MEM, d, l.elems_ptr);
+    let eptr = fb.load(PTR_MEM, c, l.elems_ptr);
     let at = scaled(fb, eptr, i, 4);
     let slot = fb.load(PTR_U32, at, 0);
     // Also rejects `NO_SLOT` (u32::MAX), which is never below a u32 entry count.
@@ -369,17 +364,19 @@ fn element_prop(
     guard(fb, inb, miss);
     let base = fb.load(PTR_MEM, gc, l.entries_ptr);
     let p = scaled(fb, base, slot, l.prop_size);
+    let m = fb.load(PTR_MEM, p, l.prop_meta);
+    let w = bin_imm(fb, BinaryOp::Iadd, PTR, p, l.prop_packed as i64);
     let one = fb.iconst(Type::I32, 1);
-    fb.jump(join, &[p, one]);
+    fb.jump(join, &[w, m, one]);
 
     fb.seal_block(join);
     fb.switch_to_block(join);
-    (prop, in_entries)
+    (word, meta, in_entries)
 }
 
 /// The address of element 0's `Property` of the object in `v` when its elements are packed
-/// storage (boxed or inline) holding at least `n` entries (so its `length` is at least `n`);
-/// else branch to `miss`. Read the entries with [`packed_word`].
+/// storage holding at least `n` entries (so its `length` is at least `n`); else branch to
+/// `miss`. Read the entries with [`packed_word`].
 pub(crate) fn packed_prefix(fb: &mut FunctionBuilder, v: IrValue, n: usize, miss: Block) -> IrValue {
     let Some(l) = layout() else {
         always_miss(fb, miss);
@@ -388,45 +385,22 @@ pub(crate) fn packed_prefix(fb: &mut FunctionBuilder, v: IrValue, n: usize, miss
     let gc = object(fb, l, v, miss, false);
     exotic_is(fb, l, gc, &[Exotic::Array], miss);
     let d = dense(fb, l, gc, miss);
-    let join = fb.create_block();
-    let base = fb.append_block_param(join, PTR);
-    let boxed = fb.create_block();
-    let not_boxed = fb.create_block();
-    let packed = fb.load(PTR_MEM, d, l.dense_packed);
-    let is_boxed = cmp_imm(fb, IntCC::Ne, PTR, packed, 0);
-    fb.brif(is_boxed, boxed, &[], not_boxed, &[]);
-    fb.seal_block(boxed);
-    fb.seal_block(not_boxed);
-    fb.switch_to_block(boxed);
-    let len = fb.load(PTR_MEM, packed, l.packed_len);
+    let base = fb.load(PTR_MEM, d, l.packed_ptr);
+    let is_packed = cmp_imm(fb, IntCC::Ne, PTR, base, 0);
+    guard(fb, is_packed, miss);
+    let len = fb.load(PTR_U32, d, l.packed_len);
     let enough = cmp_imm(fb, IntCC::Uge, PTR, len, n as i64);
     guard(fb, enough, miss);
-    let p = fb.load(PTR_MEM, packed, l.packed_ptr);
-    fb.jump(join, &[p]);
-    fb.switch_to_block(not_boxed);
-    let ilen = fb.load(PTR_U8, d, l.dense_inline_len);
-    let enough = cmp_imm(fb, IntCC::Uge, PTR, ilen, n as i64);
-    guard(fb, enough, miss);
-    let p = bin_imm(fb, BinaryOp::Iadd, PTR, d, l.dense_inline_slots as i64);
-    fb.jump(join, &[p]);
-    fb.seal_block(join);
-    fb.switch_to_block(join);
     base
 }
 
-/// The NaN-boxed word of packed entry `j` from [`packed_prefix`]'s `base`, guarded a data
-/// property and not a hole.
+/// The NaN-boxed word of packed entry `j` from [`packed_prefix`]'s `base`, guarded not a hole.
 pub(crate) fn packed_word(fb: &mut FunctionBuilder, base: IrValue, j: usize, miss: Block) -> IrValue {
-    let Some(l) = layout() else {
+    if layout().is_none() {
         always_miss(fb, miss);
         return fb.iconst(Type::I64, 0);
-    };
-    let off = (j as i64 * l.prop_size) as i32;
-    let meta = fb.load(PTR_MEM, base, off + l.prop_meta);
-    let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
-    let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
-    guard(fb, data, miss);
-    let bits = fb.load(MemKind::I64, base, off + l.prop_packed);
+    }
+    let bits = fb.load(MemKind::I64, base, (j as i64 * ELEM_SIZE) as i32);
     let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
     let hole = cmp_imm(fb, IntCC::Ne, Type::I64, top, TOP_EMPTY);
     guard(fb, hole, miss);
@@ -436,10 +410,16 @@ pub(crate) fn packed_word(fb: &mut FunctionBuilder, base: IrValue, j: usize, mis
 /// Guard `prop` is a data property (no accessor) holding a number; return it as F64.
 fn data_num(fb: &mut FunctionBuilder, l: &Layout, prop: IrValue, miss: Block) -> IrValue {
     let meta = fb.load(PTR_MEM, prop, l.prop_meta);
+    let word = bin_imm(fb, BinaryOp::Iadd, PTR, prop, l.prop_packed as i64);
+    meta_word_num(fb, word, meta, miss)
+}
+
+/// [`data_num`] for the value word at `word` with descriptor `meta` (see [`element_prop`]).
+fn meta_word_num(fb: &mut FunctionBuilder, word: IrValue, meta: IrValue, miss: Block) -> IrValue {
     let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
     let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
     guard(fb, data, miss);
-    let bits = fb.load(MemKind::I64, prop, l.prop_packed);
+    let bits = fb.load(MemKind::I64, word, 0);
     let num = is_num_bits(fb, bits);
     guard(fb, num, miss);
     fb.convert(ConvOp::Bitcast, Type::F64, bits)
@@ -487,24 +467,31 @@ pub(crate) fn elem_get_num(
 
     let done = fb.create_block();
     let result = fb.append_block_param(done, Type::F64);
+    let flags_b = fb.create_block();
     let mirror = fb.create_block();
     let mirror_load = fb.create_block();
     let classic = fb.create_block();
 
     // While `MIRROR_OK`, a non-hole `mirror[i]` IS element i's Num value (see `Props::mirror`).
-    let flags = fb.load(MemKind::I32U8, d, l.mirror_flags);
+    let c = fb.load(PTR_MEM, d, l.classic);
+    let has = cmp_imm(fb, IntCC::Ne, PTR, c, 0);
+    fb.brif(has, flags_b, &[], classic, &[]);
+    fb.seal_block(flags_b);
+
+    fb.switch_to_block(flags_b);
+    let flags = fb.load(MemKind::I32U8, c, l.mirror_flags);
     let ok = bin_imm(fb, BinaryOp::Band, Type::I32, flags, MIRROR_OK as i64);
     fb.brif(ok, mirror, &[], classic, &[]);
     fb.seal_block(mirror);
 
     fb.switch_to_block(mirror);
-    let mlen = fb.load(PTR_MEM, d, l.mirror_len);
+    let mlen = fb.load(PTR_MEM, c, l.mirror_len);
     let inb = fb.icmp(IntCC::Ult, i, mlen);
     fb.brif(inb, mirror_load, &[], classic, &[]);
     fb.seal_block(mirror_load);
 
     fb.switch_to_block(mirror_load);
-    let mptr = fb.load(PTR_MEM, d, l.mirror_ptr);
+    let mptr = fb.load(PTR_MEM, c, l.mirror_ptr);
     let at = scaled(fb, mptr, i, 8);
     let bits = fb.load(MemKind::I64, at, 0);
     let hole = fb.iconst(Type::I64, MIRROR_HOLE as i64);
@@ -515,8 +502,8 @@ pub(crate) fn elem_get_num(
 
     // The mirror can't answer (off, short, or a hole): read the property itself.
     fb.switch_to_block(classic);
-    let (prop, _) = element_prop(fb, l, gc, d, i, miss, false);
-    let f = data_num(fb, l, prop, miss);
+    let (word, meta, _) = element_prop(fb, l, gc, d, i, miss, false);
+    let f = meta_word_num(fb, word, meta, miss);
     fb.jump(done, &[f]);
 
     fb.seal_block(done);
@@ -541,12 +528,11 @@ pub(crate) fn elem_get_word(
     exotic_is(fb, l, gc, &[Exotic::None, Exotic::Array], miss);
     let i = index_ptr(fb, index, miss);
     let d = dense(fb, l, gc, miss);
-    let (prop, _) = element_prop(fb, l, gc, d, i, miss, false);
-    let meta = fb.load(PTR_MEM, prop, l.prop_meta);
+    let (word, meta, _) = element_prop(fb, l, gc, d, i, miss, false);
     let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
     let data = cmp_imm(fb, IntCC::Eq, PTR, acc, 0);
     guard(fb, data, miss);
-    let bits = fb.load(MemKind::I64, prop, l.prop_packed);
+    let bits = fb.load(MemKind::I64, word, 0);
     let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
     let hole = cmp_imm(fb, IntCC::Ne, Type::I64, top, TOP_EMPTY);
     guard(fb, hole, miss);
@@ -594,10 +580,9 @@ pub(crate) fn elem_set_num(
     exotic_is(fb, l, gc, &[Exotic::None, Exotic::Array], miss);
     let i = index_ptr(fb, index, miss);
     let d = dense(fb, l, gc, miss);
-    let (prop, in_entries) = element_prop(fb, l, gc, d, i, miss, true);
+    let (word, meta, in_entries) = element_prop(fb, l, gc, d, i, miss, true);
 
     // Writable data property.
-    let meta = fb.load(PTR_MEM, prop, l.prop_meta);
     let attrs = bin_imm(
         fb,
         BinaryOp::Band,
@@ -609,7 +594,7 @@ pub(crate) fn elem_set_num(
     guard(fb, writable, miss);
 
     // The old value needs no drop and is not a packed hole (`Empty`).
-    let old = fb.load(MemKind::I64, prop, l.prop_packed);
+    let old = fb.load(MemKind::I64, word, 0);
     let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, old, 48);
     let empty = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_EMPTY);
     let ge = cmp_imm(fb, IntCC::Uge, Type::I64, top, TOP_BIGINT);
@@ -621,14 +606,20 @@ pub(crate) fn elem_set_num(
     let droppable = cmp_imm(fb, IntCC::Eq, Type::I32, bad, 0);
     guard(fb, droppable, miss);
 
-    // Mirror maintenance applies to `entries`-backed elements while the mirror is on (packed
-    // storage has no mirror; `set_index_value` doesn't touch it there either).
-    let flags = fb.load(MemKind::I32U8, d, l.mirror_flags);
-    let on = bin_imm(fb, BinaryOp::Band, Type::I32, flags, MIRROR_OK as i64);
-    let track = fb.binary(BinaryOp::Band, on, in_entries);
+    // Mirror maintenance applies to `entries`-backed elements (which imply classic storage)
+    // while the mirror is on (packed storage has no mirror; `set_index_value` doesn't touch it
+    // there either).
+    let classic = fb.create_block();
     let mirror = fb.create_block();
     let store = fb.create_block();
-    fb.brif(track, mirror, &[], store, &[]);
+    fb.brif(in_entries, classic, &[], store, &[]);
+    fb.seal_block(classic);
+
+    fb.switch_to_block(classic);
+    let c = fb.load(PTR_MEM, d, l.classic);
+    let flags = fb.load(MemKind::I32U8, c, l.mirror_flags);
+    let on = bin_imm(fb, BinaryOp::Band, Type::I32, flags, MIRROR_OK as i64);
+    fb.brif(on, mirror, &[], store, &[]);
     fb.seal_block(mirror);
 
     fb.switch_to_block(mirror);
@@ -638,10 +629,10 @@ pub(crate) fn elem_set_num(
     let not_hole = fb.icmp(IntCC::Ne, nbits, hole);
     guard(fb, not_hole, miss);
     // Lockstep (`mirror.len() == elems.len()`) holds whenever the flag does; guard anyway.
-    let mlen = fb.load(PTR_MEM, d, l.mirror_len);
+    let mlen = fb.load(PTR_MEM, c, l.mirror_len);
     let inb = fb.icmp(IntCC::Ult, i, mlen);
     guard(fb, inb, miss);
-    let mptr = fb.load(PTR_MEM, d, l.mirror_ptr);
+    let mptr = fb.load(PTR_MEM, c, l.mirror_ptr);
     let at = scaled(fb, mptr, i, 8);
     fb.store(MemKind::F64, at, n, 0);
     // `f64_exact_i32`: bit-identical through an i32 round trip (excludes -0.0 and NaN).
@@ -657,7 +648,7 @@ pub(crate) fn elem_set_num(
         !(MIRROR_ALL_I32 as i64),
     );
     let new_flags = fb.select(exact, flags, cleared);
-    fb.store(MemKind::I32U8, d, new_flags, l.mirror_flags);
+    fb.store(MemKind::I32U8, c, new_flags, l.mirror_flags);
     fb.jump(store, &[]);
     fb.seal_block(store);
 
@@ -667,7 +658,7 @@ pub(crate) fn elem_set_num(
     let is_nan = fb.fcmp(FloatCC::Ne, n, n);
     let canon = fb.iconst(Type::I64, PACK_CANON_NAN as i64);
     let packed = fb.select(is_nan, canon, nbits);
-    fb.store(MemKind::I64, prop, packed, l.prop_packed);
+    fb.store(MemKind::I64, word, packed, 0);
 }
 
 /// `v.length` for an `Array`, a string or a typed array, as F64. Misses otherwise.
@@ -1081,8 +1072,8 @@ fn proto_hop(
     let p = fb.load(PTR_MEM, gc, l.proto);
     let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
     guard(fb, some, miss);
-    let flag = fb.load(PTR_MEM, p, l.borrow);
-    let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+    let flag = fb.load(MemKind::I32U16, p, l.borrow);
+    let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
     guard(fb, free, miss);
     exotic_is(fb, l, p, kinds, miss);
     let sh = fb.load(MemKind::I32, p, l.shape);
@@ -1124,52 +1115,45 @@ pub(crate) fn array_view(fb: &mut FunctionBuilder, v: IrValue) -> (IrValue, IrVa
         exotic_is(fb, l, gc, &[Exotic::None, Exotic::Array], none);
         let d = dense(fb, l, gc, none);
 
+        let flags_b = fb.create_block();
         let mirror = fb.create_block();
         let mirror_ok = fb.create_block();
         let packed_b = fb.create_block();
-        let flags = fb.load(MemKind::I32U8, d, l.mirror_flags);
+        let c = fb.load(PTR_MEM, d, l.classic);
+        let has = cmp_imm(fb, IntCC::Ne, PTR, c, 0);
+        fb.brif(has, flags_b, &[], packed_b, &[]);
+        fb.seal_block(flags_b);
+
+        fb.switch_to_block(flags_b);
+        let flags = fb.load(MemKind::I32U8, c, l.mirror_flags);
         let ok = bin_imm(fb, BinaryOp::Band, Type::I32, flags, MIRROR_OK as i64);
         fb.brif(ok, mirror, &[], packed_b, &[]);
         fb.seal_block(mirror);
 
         fb.switch_to_block(mirror);
-        let mlen = fb.load(PTR_MEM, d, l.mirror_len);
+        let mlen = fb.load(PTR_MEM, c, l.mirror_len);
         let some = cmp_imm(fb, IntCC::Ne, PTR, mlen, 0);
         fb.brif(some, mirror_ok, &[], packed_b, &[]);
         fb.seal_block(mirror_ok);
         fb.seal_block(packed_b);
 
         fb.switch_to_block(mirror_ok);
-        let mptr = fb.load(PTR_MEM, d, l.mirror_ptr);
+        let mptr = fb.load(PTR_MEM, c, l.mirror_ptr);
         let two = fb.iconst(Type::I32, 2);
         fb.jump(join, &[two, mptr, mlen]);
 
+        // Packed storage (in-box slots or a heap buffer); a null pointer: no packed view.
         fb.switch_to_block(packed_b);
-        let boxed = fb.create_block();
-        let not_boxed = fb.create_block();
-        let packed = fb.load(PTR_MEM, d, l.dense_packed);
-        let is_boxed = cmp_imm(fb, IntCC::Ne, PTR, packed, 0);
-        fb.brif(is_boxed, boxed, &[], not_boxed, &[]);
-        fb.seal_block(boxed);
-        fb.seal_block(not_boxed);
+        let packed = fb.create_block();
+        let ptr = fb.load(PTR_MEM, d, l.packed_ptr);
+        let is_packed = cmp_imm(fb, IntCC::Ne, PTR, ptr, 0);
+        fb.brif(is_packed, packed, &[], none, &[]);
+        fb.seal_block(packed);
 
-        fb.switch_to_block(boxed);
-        let len = fb.load(PTR_MEM, packed, l.packed_len);
-        let ptr = fb.load(PTR_MEM, packed, l.packed_ptr);
+        fb.switch_to_block(packed);
+        let len = fb.load(PTR_U32, d, l.packed_len);
         let one = fb.iconst(Type::I32, 1);
         fb.jump(join, &[one, ptr, len]);
-
-        // Inline packed storage: a non-zero `u8` length selects it (zero: no packed view).
-        fb.switch_to_block(not_boxed);
-        let inline = fb.create_block();
-        let ilen = fb.load(PTR_U8, d, l.dense_inline_len);
-        let is_inline = cmp_imm(fb, IntCC::Ne, PTR, ilen, 0);
-        fb.brif(is_inline, inline, &[], none, &[]);
-        fb.seal_block(inline);
-        fb.switch_to_block(inline);
-        let slots = bin_imm(fb, BinaryOp::Iadd, PTR, d, l.dense_inline_slots as i64);
-        let one = fb.iconst(Type::I32, 1);
-        fb.jump(join, &[one, slots, ilen]);
     } else {
         fb.jump(none, &[]);
     }
@@ -1193,10 +1177,10 @@ pub(crate) fn view_elem_num(
     ii: IrValue,
     miss: Block,
 ) -> IrValue {
-    let Some(l) = layout() else {
+    if layout().is_none() {
         always_miss(fb, miss);
         return fb.f64const(0.0);
-    };
+    }
     let done = fb.create_block();
     let result = fb.append_block_param(done, Type::F64);
     let mirror = fb.create_block();
@@ -1216,8 +1200,11 @@ pub(crate) fn view_elem_num(
     fb.jump(done, &[f]);
 
     fb.switch_to_block(packed);
-    let prop = scaled(fb, base, ii, l.prop_size);
-    let f = data_num(fb, l, prop, miss);
+    let word = scaled(fb, base, ii, ELEM_SIZE);
+    let bits = fb.load(MemKind::I64, word, 0);
+    let num = is_num_bits(fb, bits);
+    guard(fb, num, miss);
+    let f = fb.convert(ConvOp::Bitcast, Type::F64, bits);
     fb.jump(done, &[f]);
 
     fb.seal_block(done);
@@ -1306,9 +1293,6 @@ pub(crate) fn prop_create(
     // The prototype as the fill records it (`Gc::as_ptr`, 0 for none).
     let proto = fb.load(PTR_MEM, gc, l.proto);
     let z = fb.iconst(PTR, 0);
-    let none = fb.icmp(IntCC::Eq, proto, z);
-    let cellp = bin_imm(fb, BinaryOp::Iadd, PTR, proto, crate::value::GC_VALUE_OFFSET as i64);
-    let proto = fb.select(none, z, cellp);
     let epa = fb.iconst(PTR, crate::value::proto_epoch_addr() as i64);
     let epoch = fb.load(MemKind::I32, epa, 0);
     let o = |x: usize| x as i32;
@@ -1515,8 +1499,8 @@ pub(crate) fn gc_probe(
         always_miss(fb, miss);
         return;
     };
-    let flag = fb.load(PTR_MEM, gc, l.borrow);
-    let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+    let flag = fb.load(MemKind::I32U16, gc, l.borrow);
+    let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
     guard(fb, free, miss);
     probe_chain(fb, l, gc, shapes, off, want, slot, miss);
 }
@@ -1536,8 +1520,8 @@ pub(crate) fn gc_data_entry(
         always_miss(fb, miss);
         return fb.iconst(PTR, 0);
     };
-    let flag = fb.load(PTR_MEM, gc, l.borrow);
-    let free = cmp_imm(fb, IntCC::Eq, PTR, flag, 0);
+    let flag = fb.load(MemKind::I32U16, gc, l.borrow);
+    let free = cmp_imm(fb, IntCC::Eq, Type::I32, flag, 0);
     guard(fb, free, miss);
     exotic_is(fb, l, gc, &[Exotic::None], miss);
     let sh = fb.load(MemKind::I32, gc, l.shape);
@@ -1571,8 +1555,8 @@ fn probe_chain(
             let p = fb.load(PTR_MEM, gc, l.proto);
             let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
             guard(fb, some, miss);
-            let flag = fb.load(PTR_MEM, p, l.borrow);
-            let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+            let flag = fb.load(MemKind::I32U16, p, l.borrow);
+            let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
             guard(fb, free, miss);
             gc = p;
         }
@@ -1761,8 +1745,8 @@ pub(crate) fn probed_entries(
     };
     let gc = fb.load(PTR_MEM, v, VALUE_PAYLOAD);
     if write {
-        let flag = fb.load(PTR_MEM, gc, l.borrow);
-        let free = cmp_imm(fb, IntCC::Eq, PTR, flag, 0);
+        let flag = fb.load(MemKind::I32U16, gc, l.borrow);
+        let free = cmp_imm(fb, IntCC::Eq, Type::I32, flag, 0);
         guard(fb, free, miss);
         let cap = fb.load(PTR_U32, gc, l.entries_cap);
         let owned = cmp_imm(fb, IntCC::Ne, PTR, cap, 0);
@@ -1833,8 +1817,8 @@ pub(crate) fn accessor_probe(
             let p = fb.load(PTR_MEM, gc, l.proto);
             let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
             guard(fb, some, miss);
-            let flag = fb.load(PTR_MEM, p, l.borrow);
-            let free = cmp_imm(fb, IntCC::Sge, PTR, flag, 0);
+            let flag = fb.load(MemKind::I32U16, p, l.borrow);
+            let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
             guard(fb, free, miss);
             gc = p;
         }

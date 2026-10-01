@@ -1094,7 +1094,7 @@ pub(crate) unsafe extern "C" fn name_ptr(f: *mut JitFrame, n: u32, c: u32) -> *c
     }
     let b = b.or_else(|| chunk.name_path_binding(env, c, false));
     match b {
-        Some(bd) if (*bd).initialized && (*bd).import_ref.is_none() => &(*bd).value,
+        Some(bd) if (*bd).initialized && !(*bd).import => &(*bd).value,
         _ => std::ptr::null(),
     }
 }
@@ -1107,9 +1107,7 @@ pub(crate) unsafe extern "C" fn name_ptr_w(f: *mut JitFrame, n: u32, c: u32) -> 
     }
     let b = name_binding(chunk, env, c as usize).or_else(|| chunk.name_path_binding(env, c, true));
     match b {
-        Some(bd) if (*bd).initialized && (*bd).mutable && (*bd).import_ref.is_none() => {
-            &mut (*bd).value
-        }
+        Some(bd) if (*bd).initialized && (*bd).mutable && !(*bd).import => &mut (*bd).value,
         _ => std::ptr::null_mut(),
     }
 }
@@ -1502,7 +1500,7 @@ pub(crate) unsafe extern "C" fn call(
     let i = &mut *(*f).interp;
     if flags & CALL_TAIL != 0
         && i.tco_ok
-        && i.depth > crate::bytecode::TAIL_NEST
+        && crate::bytecode::tail_nest_exceeded(i)
         && callee.is_callable()
         && i.leaf_native(&callee).is_none()
     {
@@ -3127,6 +3125,7 @@ pub(crate) unsafe extern "C" fn new_this(
     };
     // A user function's `prototype` is an own data property (non-configurable): read it in
     // place rather than through a full `[[Get]]`.
+    i.materialize_fn(o);
     let own = o
         .try_borrow()
         .ok()
@@ -3196,7 +3195,8 @@ pub(crate) unsafe extern "C" fn elem_get(
 ) -> u32 {
     let i = &mut *(*f).interp;
     let v = match &*obj {
-        Value::Str(s) => crate::bytecode::str_index_fast(s, key),
+        Value::Str(s) => crate::bytecode::str_index_fast(s, key)
+            .or_else(|| crate::bytecode::str_index_units(i, s, key)),
         Value::Obj(o) => i.fast_get_elem(o, key),
         _ => None,
     };

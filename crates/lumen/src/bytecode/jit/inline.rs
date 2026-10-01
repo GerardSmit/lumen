@@ -149,11 +149,11 @@ fn cap_binding(env: &crate::interpreter::Env, name: &str) -> Option<(usize, bool
         return None;
     }
     let b = env.try_borrow().ok()?;
-    if b.with_obj.is_some() || b.under_with {
+    if b.with_obj().is_some() || b.under_with() {
         return None;
     }
     let bd = b.vars.get(name)?;
-    if !bd.initialized || bd.import_ref.is_some() {
+    if !bd.initialized || bd.import {
         return None;
     }
     let num = match bd.value {

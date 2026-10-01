@@ -27,7 +27,7 @@ impl ScopeGuard {
     }
 
     fn matches(&self, pointer: *const RefCell<Scope>, scope: &Scope) -> bool {
-        if scope.with_obj.is_some() {
+        if scope.with_obj().is_some() {
             return false;
         }
         match self {
@@ -91,7 +91,7 @@ impl NamePath {
             Holder::Global { .. } => return None,
         };
         let bd = unsafe { &*b };
-        (bd.initialized && bd.import_ref.is_none() && (!write || bd.mutable)).then_some(b)
+        (bd.initialized && !bd.import && (!write || bd.mutable)).then_some(b)
     }
 
     /// The global object's entry slot a global-holder path resolves to, while it is a data
@@ -132,7 +132,7 @@ impl NamePath {
 
     /// [`NamePath::read`] of an object value, as its [`Gc::as_ptr`] (no clone); `None` for a
     /// miss or any other value.
-    fn read_obj_ptr(&self, interp: &Interp, env: &Env) -> Option<*const RefCell<crate::value::Object>> {
+    fn read_obj_ptr(&self, interp: &Interp, env: &Env) -> Option<*const crate::value::ObjCell> {
         let mut pointer = Rc::as_ptr(env);
         for (index, guard) in self.guards.iter().enumerate() {
             let scope = unsafe { &*pointer }.borrow();
@@ -162,9 +162,7 @@ impl NamePath {
                     }
                 };
                 return match &binding.value {
-                    Value::Obj(o) if binding.initialized && binding.import_ref.is_none() => {
-                        Some(Gc::as_ptr(o))
-                    }
+                    Value::Obj(o) if binding.initialized && !binding.import => Some(Gc::as_ptr(o)),
                     _ => None,
                 };
             }
@@ -195,7 +193,7 @@ impl NamePath {
                 return global_value(interp, &interp.global, *shape, *slot);
             }
         };
-        (binding.initialized && binding.import_ref.is_none()).then(|| binding.value.clone())
+        (binding.initialized && !binding.import).then(|| binding.value.clone())
     }
 
     fn build(interp: &Interp, env: &Env, name: &str) -> Option<(Self, Value)> {
@@ -203,14 +201,14 @@ impl NamePath {
         let mut current = env.clone();
         for depth in 0..MAX_DEPTH {
             let scope = current.borrow();
-            if scope.with_obj.is_some() {
+            if scope.with_obj().is_some() {
                 return None;
             }
             guards.push(ScopeGuard::new(&current, &scope));
             if let Some(binding) = scope.vars.get(name) {
                 // Direct bindings already have a native NameIc path. This is the fallback for
                 // deeper resolutions, including depth one when the reader has no activation.
-                if depth == 0 || !binding.initialized || binding.import_ref.is_some() {
+                if depth == 0 || !binding.initialized || binding.import {
                     return None;
                 }
                 let holder = match scope.vars.template_layout() {
@@ -338,7 +336,7 @@ impl Chunk {
         interp: &Interp,
         env: &Env,
         cache: u32,
-    ) -> Option<*const RefCell<crate::value::Object>> {
+    ) -> Option<*const crate::value::ObjCell> {
         self.name_paths[cache as usize]
             .borrow()
             .as_ref()?

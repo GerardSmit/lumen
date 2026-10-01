@@ -3,7 +3,7 @@
 
 use crate::ast::*;
 use crate::lexer::{tokenize_opts, LexOpts};
-use crate::token::{RegexTok, Tok, Token, TplPart, KEYWORDS};
+use crate::token::{RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
 
 mod ts;
@@ -111,7 +111,7 @@ fn parse_script_inner(
 
 /// What lexing a whole source produced (see [`lex_source`]).
 struct Lexed {
-    tokens: Vec<Token>,
+    tokens: TokVec,
     ts: Option<Box<ts::TsState>>,
     docs: Vec<(u32, u32)>,
 }
@@ -120,13 +120,13 @@ struct Lexed {
 /// recorded only with the `typed` feature.
 fn lex_source(src: &str, html: bool, ts: bool) -> Result<Lexed, ParseError> {
     crate::bytecode::reflect::note_source(src);
-    let chars: Vec<char> = src.chars().collect();
     let opts = LexOpts {
         ts,
         docs: cfg!(feature = "typed"),
         start_div: false,
+        offset: 0,
     };
-    let lexed = tokenize_opts(&chars, html, 1, opts).map_err(|e| ParseError {
+    let lexed = tokenize_opts(src, html, 1, opts).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
         at_eof: e.at_eof,
@@ -211,7 +211,8 @@ fn parse_script_impl(
         })
     });
     let mut p = Parser {
-        toks: tokens,
+        toks: Rc::new(tokens),
+        bracket_tables: Default::default(),
         pos: 0,
         src: SrcMap::whole(src),
         lazy,
@@ -220,6 +221,7 @@ fn parse_script_impl(
         in_field_init: false,
         strict,
         depth: 0,
+        chain: 0,
         in_generator: false,
         in_async: false,
         in_params: false,
@@ -249,6 +251,7 @@ fn parse_script_impl(
         single_stmt: false,
         in_static_block: false,
         check_skipped: true,
+        checking: false,
         pending_private: Vec::new(),
         ts: ts_state,
     };
@@ -291,8 +294,8 @@ fn parse_script_impl(
     Ok((body, text, strict_prologue))
 }
 
-/// A large parse leaves the token vector and char buffer (≈12 bytes per source byte) freed but
-/// resident; hand the pages back so a bundle load does not set the process's high-water mark.
+/// A large parse leaves the token vector (≈7 bytes per source byte) freed but resident; hand the
+/// pages back so a bundle load does not set the process's high-water mark.
 #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 fn release_parse_scratch(src_len: usize) {
     const BIG_PARSE: usize = 256 * 1024;
@@ -394,7 +397,8 @@ fn parse_module_impl(
         docs,
     } = lex_source(src, false, ts)?;
     let mut p = Parser {
-        toks: tokens,
+        toks: Rc::new(tokens),
+        bracket_tables: Default::default(),
         pos: 0,
         src: SrcMap::whole(src),
         lazy,
@@ -403,6 +407,7 @@ fn parse_module_impl(
         in_field_init: false,
         strict: true,
         depth: 0,
+        chain: 0,
         in_generator: false,
         in_async: true,
         in_params: false,
@@ -432,6 +437,7 @@ fn parse_module_impl(
         single_stmt: false,
         in_static_block: false,
         check_skipped: true,
+        checking: false,
         pending_private: Vec::new(),
         ts: ts_state,
     };
@@ -622,19 +628,18 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
     let (s, e) = (lazy.start as usize, lazy.end as usize);
-    let chars: Vec<char> = lazy.src[s..e].chars().collect();
     let tokens =
-        crate::lexer::tokenize_range(&chars, lazy.html_comments, lazy.line).map_err(|e| {
-            ParseError {
+        crate::lexer::tokenize_range(&lazy.src[s..e], lazy.html_comments, lazy.line).map_err(
+            |e| ParseError {
                 message: e.message,
                 line: e.line,
                 at_eof: false,
-            }
-        })?;
-    drop(chars);
+            },
+        )?;
     let ctx = lazy.ctx;
     let mut p = Parser {
-        toks: tokens,
+        toks: Rc::new(tokens),
+        bracket_tables: Default::default(),
         pos: 0,
         src: SrcMap::new(lazy.src.clone(), lazy.start, lazy.end),
         lazy: true,
@@ -643,6 +648,7 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         in_field_init: ctx.in_field_init,
         strict: ctx.strict,
         depth: 0,
+        chain: 0,
         in_generator: ctx.in_generator,
         in_async: ctx.in_async,
         in_params: false,
@@ -672,6 +678,7 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         single_stmt: false,
         in_static_block: false,
         check_skipped: false,
+        checking: false,
         pending_private: Vec::new(),
         ts: None,
     };
@@ -700,6 +707,9 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         message,
         line: lazy.line,
     })?;
+    // A bundle's wrapper function body is the whole bundle, parsed here on first call.
+    drop(p);
+    release_parse_scratch(e - s);
     Ok(body)
 }
 
@@ -707,23 +717,23 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
 /// overflow the native stack on pathologically nested input (test262 has deeply-nested fixtures).
 const MAX_PARSE_DEPTH: u32 = 1200;
 
+/// Upper bound on the native stack a later AST pass spends per level of expression nesting (see
+/// [`Parser::chain_link`]).
+#[cfg(not(debug_assertions))]
+const CHAIN_LINK_BYTES: usize = 1024;
+#[cfg(debug_assertions)]
+const CHAIN_LINK_BYTES: usize = 4 * 1024;
+
 /// The source a parser records function text against: the whole file (shared by every function
-/// and lazy body parsed from it, however deeply nested) plus the mapping from the char offsets
-/// the tokens carry to byte offsets in that file. A lazily parsed body lexes only its own
-/// `{ ... }` slice, so its tokens count chars from `base`.
+/// and lazy body parsed from it, however deeply nested) plus where the lexed slice starts in it.
+/// A lazily parsed body lexes only its own `{ ... }` slice, so its tokens' byte offsets count
+/// from `base`.
 struct SrcMap {
     src: Rc<str>,
     base: u32,
     /// End of the lexed slice in `src`.
     end: u32,
-    /// Byte offset (in the lexed slice) of every [`SRC_MAP_STEP`]th char index; `None` when the
-    /// slice is ASCII and char and byte offsets coincide. Offsets in between walk the chars from
-    /// the checkpoint below.
-    bytes: Option<Vec<u32>>,
 }
-
-/// Chars per [`SrcMap`] checkpoint.
-const SRC_MAP_STEP: usize = 64;
 
 impl SrcMap {
     fn whole(src: &str) -> Self {
@@ -731,57 +741,26 @@ impl SrcMap {
         Self::new(Rc::from(src), 0, len)
     }
     fn new(src: Rc<str>, start: u32, end: u32) -> Self {
-        let slice = &src[start as usize..end as usize];
-        let bytes = (!slice.is_ascii()).then(|| {
-            let mut v: Vec<u32> = slice
-                .char_indices()
-                .step_by(SRC_MAP_STEP)
-                .map(|(i, _)| i as u32)
-                .collect();
-            // The end offset (one past the last char) when it starts a checkpoint of its own.
-            if slice.chars().count() % SRC_MAP_STEP == 0 {
-                v.push(slice.len() as u32);
-            }
-            v.shrink_to_fit();
-            v
-        });
         SrcMap {
             src,
             base: start,
             end,
-            bytes,
         }
     }
-    /// The byte range in `src` of a char range in the lexed slice.
+    /// The byte range in `src` of a byte range in the lexed slice.
     fn byte_range(&self, start: u32, end: u32) -> Option<(u32, u32)> {
-        if start > end {
+        if start > end || end > self.end - self.base {
             return None;
         }
-        let at = |ch: u32| -> Option<u32> {
-            match &self.bytes {
-                None => (ch as usize <= self.src.len() - self.base as usize).then_some(ch),
-                Some(b) => {
-                    let ch = ch as usize;
-                    let from = *b.get(ch / SRC_MAP_STEP)? as usize;
-                    let slice = &self.src[self.base as usize..self.end as usize];
-                    let mut rest = slice[from..].char_indices().map(|(i, _)| from + i);
-                    // `nth` past the last char is the slice end (one past the last char).
-                    match rest.nth(ch % SRC_MAP_STEP) {
-                        Some(i) => Some(i as u32),
-                        None => {
-                            let n = slice[from..].chars().count();
-                            (ch % SRC_MAP_STEP == n).then_some(slice.len() as u32)
-                        }
-                    }
-                }
-            }
-        };
-        Some((self.base + at(start)?, self.base + at(end)?))
+        Some((self.base + start, self.base + end))
     }
 }
 
 struct Parser {
-    toks: Vec<Token>,
+    /// Shared with the template token a substitution's parser was made from (see `TplPart::Sub`).
+    toks: Rc<TokVec>,
+    /// See [`Parser::bracket_match`]: `[mixed brackets, braces only]`.
+    bracket_tables: [std::cell::OnceCell<Vec<u32>>; 2],
     pos: usize,
     /// The source, for slicing function text by token offsets.
     src: SrcMap,
@@ -795,6 +774,8 @@ struct Parser {
     in_field_init: bool,
     strict: bool,
     depth: u32,
+    /// Open links of loop-built chains on the current path (see [`Parser::chain_link`]).
+    chain: u32,
     /// Whether the body currently being parsed is a generator / async function — controls whether
     /// `yield` / `await` are keywords here.
     in_generator: bool,
@@ -864,6 +845,9 @@ struct Parser {
     /// [`Parser::parse_function_body`]). Off in [`parse_lazy_body`], whose skipped bodies were
     /// checked with it when the enclosing source was parsed.
     check_skipped: bool,
+    /// Parsing a body only for its early errors: the AST is dropped statement by statement, so
+    /// the functions built here are never registered for cold-body release.
+    checking: bool,
     /// Private names referenced in checked-then-skipped bodies that no class inside the body
     /// declares, with the class scope they must resolve in. Resolved once parsing finishes, when
     /// every enclosing class's names are known.
@@ -937,28 +921,30 @@ pub(crate) fn fresh_template_site() -> u32 {
     })
 }
 
-/// Wrap a parsed function node. Bodies with reload metadata register with the collector,
-/// which releases their AST once cold (see `Function::release_cold_body`). Explicit eager
-/// mode provides no reload metadata and keeps its parsed bodies.
-fn rc_fn(mut f: Function) -> Rc<Function> {
-    // Parsing grows this vector geometrically. Once shared, its parameter list is
-    // immutable: avoid retaining four 112-byte slots for every one-parameter export
-    // in a large module graph.
-    f.params.shrink_to_fit();
-    let f = Rc::new(f);
-    if f.lazy.borrow().is_some() {
-        crate::value::register_lazy_function(&f);
+impl Parser {
+    /// Wrap a parsed function node. Bodies with reload metadata register with the collector,
+    /// which releases their AST once cold (see `Function::release_cold_body`). Explicit eager
+    /// mode provides no reload metadata and keeps its parsed bodies.
+    fn rc_fn(&mut self, mut f: Function) -> Rc<Function> {
+        // Parsing grows this vector geometrically. Once shared, its parameter list is
+        // immutable: avoid retaining three spare slots for every one-parameter export
+        // in a large module graph.
+        f.params.shrink_to_fit();
+        let f = Rc::new(f);
+        if !self.checking && f.lazy.borrow().is_some() {
+            crate::value::register_lazy_function(&f);
+        }
+        f
     }
-    f
 }
 
-/// A parsed function body, or one skipped for [`parse_lazy_body`]. A skipped body may carry the
-/// throwaway parse it was checked with, kept only until the function node is built.
+/// A parsed function body, or one skipped for [`parse_lazy_body`]. A skipped body checked for
+/// early errors carries its top-level lexical names (those a parameter may not share).
 /// Immediately called and dynamic functions keep their first parse, but can reload it after GC.
 enum Body {
     Eager(Vec<Stmt>),
     Reloadable(LazyBody, Vec<Stmt>),
-    Lazy(LazyBody, Option<Vec<Stmt>>),
+    Lazy(LazyBody, Option<Vec<String>>),
 }
 
 impl Body {
@@ -966,8 +952,10 @@ impl Body {
     /// it when parsed.
     fn params_lexical_clash(&self, params: &[Param]) -> Option<String> {
         match self {
-            Body::Eager(b) | Body::Reloadable(_, b) | Body::Lazy(_, Some(b)) => {
-                params_body_lexical_clash(params, b)
+            Body::Eager(b) | Body::Reloadable(_, b) => params_body_lexical_clash(params, b),
+            Body::Lazy(_, Some(lexical)) => {
+                let pnames = param_names(params);
+                lexical.iter().find(|l| pnames.contains(l)).cloned()
             }
             Body::Lazy(_, None) => None,
         }
@@ -1034,43 +1022,6 @@ impl Parser {
             );
         self.tok_pos(if named { at - 1 } else { self.pos })
     }
-    /// The source map for a template substitution's own parser: the enclosing file's (so
-    /// positions, function text and lazy bodies inside it are in file coordinates) when the
-    /// substitution text is found verbatim at or after `cursor` inside the template token
-    /// `tpl`, else a standalone map of the text. Advances `cursor` past a match.
-    fn template_sub_map(&self, tpl: usize, cursor: &mut u32, sub: &str) -> SrcMap {
-        if let Some(t) = self.toks.get(tpl) {
-            if let Some((s, e)) = self.src.byte_range(t.start, t.end) {
-                let from = (*cursor).max(s) as usize;
-                if let Some(hay) = self.src.src.get(from..e as usize) {
-                    if let Some(k) = hay.find(sub) {
-                        let start = (from + k) as u32;
-                        let end = start + sub.len() as u32;
-                        *cursor = end;
-                        return SrcMap::new(self.src.src.clone(), start, end);
-                    }
-                }
-            }
-        }
-        SrcMap::whole(sub)
-    }
-    /// Tokens of a template substitution's text.
-    fn sub_tokens(&mut self, src: &str) -> Result<Vec<Token>, ParseError> {
-        let chars: Vec<char> = src.chars().collect();
-        let opts = LexOpts {
-            ts: self.ts.is_some(),
-            ..LexOpts::default()
-        };
-        let lexed = tokenize_opts(&chars, !self.module, 1, opts).map_err(|e| ParseError {
-            at_eof: false,
-            message: e.message,
-            line: e.line,
-        })?;
-        if let (Some(e), Some(t)) = (lexed.soft_err, self.ts.as_mut()) {
-            t.soft_err.get_or_insert(e);
-        }
-        Ok(lexed.tokens)
-    }
     fn prev_end(&self) -> u32 {
         if self.pos == 0 {
             0
@@ -1102,6 +1053,10 @@ impl Parser {
 
     fn cur(&self) -> &Tok {
         &self.toks[self.pos].kind
+    }
+    fn toks_mut(&mut self) -> &mut TokVec {
+        self.bracket_tables = Default::default();
+        Rc::make_mut(&mut self.toks)
     }
     fn line(&self) -> u32 {
         self.toks[self.pos].line
@@ -1338,7 +1293,7 @@ impl Parser {
             }
             // The directive must be the exact code units `use strict` — a string that used
             // escapes or line continuations does not count.
-            if str_val == "use strict" && !tok.escaped {
+            if &**str_val == "use strict" && !tok.escaped {
                 return true;
             }
             i += if semi { 2 } else { 1 };
@@ -1362,6 +1317,9 @@ impl Parser {
     // ----- statements -------------------------------------------------------------------------
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        if crate::stack::exhausted() {
+            return self.err("statement nesting too deep");
+        }
         if self.ts.is_some() {
             return self.ts_parse_stmt();
         }
@@ -1422,7 +1380,7 @@ impl Parser {
                         self.declare_fn_decl(n, f.is_async, f.is_generator)?;
                     }
                 }
-                Ok(Stmt::FuncDecl(rc_fn(f)))
+                Ok(Stmt::FuncDecl(self.rc_fn(f)))
             }
             // `async function f(){}` declaration (async is a contextual keyword).
             Tok::Ident(w)
@@ -1443,7 +1401,7 @@ impl Parser {
                         self.declare_fn_decl(n, f.is_async, f.is_generator)?;
                     }
                 }
-                Ok(Stmt::FuncDecl(rc_fn(f)))
+                Ok(Stmt::FuncDecl(self.rc_fn(f)))
             }
             Tok::Keyword("class") | Tok::Punct("@") => {
                 let c = self.parse_class()?;
@@ -1559,7 +1517,7 @@ impl Parser {
                         }
                         return Err(e);
                     }
-                    if self.labels.contains(&n) {
+                    if self.labels.iter().any(|l| n == *l) {
                         for _ in 0..chain.len() {
                             self.labels.pop();
                         }
@@ -1567,8 +1525,8 @@ impl Parser {
                     }
                     self.advance();
                     self.advance();
-                    self.labels.push(n.clone());
-                    chain.push(n);
+                    self.labels.push(n.to_string());
+                    chain.push(n.to_string());
                 }
                 // `continue label` may only target a label whose statement is (a label chain
                 // over) an iteration statement.
@@ -1592,7 +1550,7 @@ impl Parser {
                                 Some(n) => self.declare_fn_decl(n, false, false),
                                 None => Ok(()),
                             };
-                            declared.map(|_| Stmt::FuncDecl(rc_fn(f)))
+                            declared.map(|_| Stmt::FuncDecl(self.rc_fn(f)))
                         }
                         Err(e) => Err(e),
                     }
@@ -1768,7 +1726,7 @@ impl Parser {
                     return self.err(format!("'{name}' cannot be used as a binding here"));
                 }
                 self.advance();
-                Ok(name)
+                Ok(name.to_string())
             }
             _ => self.err("expected binding identifier"),
         }
@@ -1777,8 +1735,8 @@ impl Parser {
     /// A binding target: a plain identifier, or an array/object destructuring pattern.
     fn parse_binding_pattern(&mut self) -> Result<Pattern, ParseError> {
         match self.cur() {
-            Tok::Punct("[") => self.parse_array_pattern(),
-            Tok::Punct("{") => self.parse_object_pattern(),
+            Tok::Punct("[") => self.nested(Self::parse_array_pattern),
+            Tok::Punct("{") => self.nested(Self::parse_object_pattern),
             _ => self.parse_binding_ident(),
         }
     }
@@ -2051,7 +2009,7 @@ impl Parser {
                 return Ok(Stmt::ForInOf {
                     decl: Some(kind),
                     left: first,
-                    right,
+                    right: Box::new(right),
                     of,
                     is_await,
                     body,
@@ -2090,7 +2048,7 @@ impl Parser {
                     Stmt::ForInOf {
                         decl: Some(DeclKind::Var),
                         left: pat,
-                        right,
+                        right: Box::new(right),
                         of: false,
                         is_await,
                         body,
@@ -2216,7 +2174,7 @@ impl Parser {
             return Ok(Stmt::ForInOf {
                 decl: None,
                 left,
-                right,
+                right: Box::new(right),
                 of,
                 is_await,
                 body,
@@ -2242,8 +2200,8 @@ impl Parser {
         let body = Box::new(self.parse_loop_body()?);
         Ok(Stmt::For {
             init,
-            test,
-            update,
+            test: test.map(Box::new),
+            update: update.map(Box::new),
             body,
         })
     }
@@ -2257,7 +2215,7 @@ impl Parser {
                     return self.err("module export name must be well-formed Unicode");
                 }
                 self.advance();
-                Ok(s)
+                Ok(s.to_string())
             }
             _ => self.parse_property_name_ident(),
         }
@@ -2278,7 +2236,7 @@ impl Parser {
         let spec = match self.cur().clone() {
             Tok::Str(s) => {
                 self.advance();
-                Rc::from(s.as_str())
+                s
             }
             _ => return self.err("expected a module specifier string"),
         };
@@ -2307,7 +2265,7 @@ impl Parser {
             let key = match self.cur().clone() {
                 Tok::Str(s) => {
                     self.advance();
-                    s
+                    s.to_string()
                 }
                 _ => self.parse_property_name_ident()?,
             };
@@ -2319,7 +2277,7 @@ impl Parser {
             match self.cur().clone() {
                 Tok::Str(v) => {
                     if key == "type" {
-                        attr_type = Some(v.clone());
+                        attr_type = Some(v.to_string());
                     }
                     self.advance();
                 }
@@ -2352,7 +2310,7 @@ impl Parser {
                         // Bare import: `import "spec";`
         if let Tok::Str(s) = self.cur().clone() {
             self.advance();
-            let source = Rc::from(s.as_str());
+            let source = s;
             let attr_type = self.parse_import_attributes()?;
             self.consume_semicolon()?;
             return Ok(Stmt::Import(ImportDecl {
@@ -2466,7 +2424,8 @@ impl Parser {
             {
                 let start = self.cur_start();
                 let is_async = self.eat_ident_word("async");
-                Stmt::FuncDecl(rc_fn(self.parse_function(is_async, false, start)?))
+                let f = self.parse_function(is_async, false, start)?;
+                Stmt::FuncDecl(self.rc_fn(f))
             } else if self.is_kw("class") {
                 Stmt::ClassDecl(Rc::new(self.parse_class()?))
             } else {
@@ -2598,7 +2557,7 @@ impl Parser {
         }
         Ok(Stmt::Try {
             block,
-            handler,
+            handler: handler.map(Box::new),
             finalizer,
         })
     }
@@ -2649,7 +2608,10 @@ impl Parser {
         }
         self.switch_depth -= 1;
         self.expect_punct("}")?;
-        Ok(Stmt::Switch { disc, cases })
+        Ok(Stmt::Switch {
+            disc: Box::new(disc),
+            cases,
+        })
     }
 
     /// A label identifier is subject to the identifier-reference rules: `yield` is reserved in
@@ -2715,7 +2677,8 @@ impl Parser {
             lone_surrogate: false,
         }];
         spliced.extend(relexed);
-        self.toks.splice(self.pos..self.pos + 1, spliced);
+        let pos = self.pos;
+        self.toks_mut().splice(pos..pos + 1, spliced);
     }
 
     fn parse_opt_label(&mut self) -> Option<String> {
@@ -2724,7 +2687,7 @@ impl Parser {
         }
         if let Tok::Ident(name) = self.cur().clone() {
             self.advance();
-            Some(name)
+            Some(name.to_string())
         } else {
             None
         }
@@ -2886,7 +2849,7 @@ impl Parser {
         let arg = if no_arg {
             None
         } else {
-            Some(Box::new(self.parse_assign()?))
+            Some(Box::new(self.nested(Self::parse_assign)?))
         };
         Ok(Expr::Yield { delegate, arg })
     }
@@ -2918,6 +2881,10 @@ impl Parser {
     }
 
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        self.chained(|p| p.parse_binary_chain(min_prec))
+    }
+
+    fn parse_binary_chain(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary()?;
         let mut left_paren = self.last_paren;
         loop {
@@ -2951,6 +2918,7 @@ impl Parser {
                 return self.err("cannot mix '??' with '&&' or '||' without parentheses");
             }
             self.advance();
+            self.chain_link()?;
             let next_min = if right_assoc { prec } else { prec + 1 };
             let right = self.parse_binary(next_min)?;
             if op == "??"
@@ -3036,14 +3004,51 @@ impl Parser {
     /// binary op, each parenthesised/array/object nesting level), so bracketing it here bounds all
     /// expression recursion with a single choke point.
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        self.nested(Self::parse_unary_inner)
+    }
+
+    /// Run `f` one nesting level deeper: the guard for every recursion that can bypass
+    /// [`parse_unary`](Parser::parse_unary) (arrow and `yield` operands, `new` callees, binding
+    /// patterns, class heritage).
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
         self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
+        if self.depth > MAX_PARSE_DEPTH || crate::stack::exhausted() {
             self.depth -= 1;
             return self.err("expression nesting too deep");
         }
-        let r = self.parse_unary_inner();
+        let r = f(self);
         self.depth -= 1;
         r
+    }
+
+    /// Run `f`, which builds a left-nested chain in a loop (operators, calls, member accesses,
+    /// template parts) with [`chain_link`](Parser::chain_link) per link.
+    fn chained<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        let saved = self.chain;
+        let r = f(self);
+        self.chain = saved;
+        r
+    }
+
+    /// Count one more link of AST nesting that the parser builds without recursing. Every later
+    /// pass (early errors, compilation, evaluation, drop) recurses once per link, so the open
+    /// links on the current path must fit in the native stack left here (the parser's own
+    /// recursion already paid for the rest of the path).
+    fn chain_link(&mut self) -> Result<(), ParseError> {
+        self.chain += 1;
+        let fits = crate::stack::headroom()
+            .is_some_and(|room| room / CHAIN_LINK_BYTES > self.chain as usize);
+        if fits {
+            Ok(())
+        } else {
+            self.err("expression nesting too deep")
+        }
     }
 
     fn parse_unary_inner(&mut self) -> Result<Expr, ParseError> {
@@ -3149,9 +3154,14 @@ impl Parser {
     }
 
     fn parse_lhs(&mut self) -> Result<Expr, ParseError> {
+        self.chained(Self::parse_lhs_chain)
+    }
+
+    fn parse_lhs_chain(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_member_expr()?;
         let mut had_optional = false;
         loop {
+            self.chain_link()?;
             if self.ts.is_some() && self.ts_lhs_suffix()? {
                 continue;
             }
@@ -3189,7 +3199,7 @@ impl Parser {
                 }
                 // A template immediately after an expression is a tagged template.
                 self.advance();
-                expr = self.build_tagged_template(expr, parts)?;
+                expr = self.build_tagged_template(expr, *parts)?;
             } else if self.eat_punct("?.") {
                 had_optional = true;
                 if self.is_punct("(") {
@@ -3230,6 +3240,10 @@ impl Parser {
 
     /// MemberExpression without trailing calls — handles `new` and `.`/`[]` member tails.
     fn parse_member_expr(&mut self) -> Result<Expr, ParseError> {
+        self.chained(Self::parse_member_expr_chain)
+    }
+
+    fn parse_member_expr_chain(&mut self) -> Result<Expr, ParseError> {
         let mut base = if self.is_kw("new") {
             let new_pos = self.tok_pos(self.pos);
             let new_escaped = self.cur_escaped();
@@ -3256,7 +3270,7 @@ impl Parser {
                 if self.in_async && self.is_ident_word("await") && !self.cur_escaped() {
                     return self.err("'await' expression cannot be the operand of 'new'");
                 }
-                let callee = self.parse_member_expr()?;
+                let callee = self.nested(Self::parse_member_expr)?;
                 if self.ts.is_some() {
                     self.ts_new_type_args();
                 }
@@ -3291,6 +3305,7 @@ impl Parser {
             self.parse_primary()?
         };
         loop {
+            self.chain_link()?;
             if self.eat_punct(".") {
                 let name = self.parse_property_name_ident()?;
                 // `super.#x` is an early SyntaxError.
@@ -3306,7 +3321,7 @@ impl Parser {
                 // A tagged template is itself a MemberExpression: `new tag\`t\`` invokes the
                 // tag and constructs its result.
                 self.advance();
-                base = self.build_tagged_template(base, parts)?;
+                base = self.build_tagged_template(base, *parts)?;
             } else if self.eat_punct("[") {
                 let index = self.parse_expr_allow_in()?;
                 self.expect_punct("]")?;
@@ -3347,7 +3362,7 @@ impl Parser {
         match self.cur().clone() {
             Tok::Ident(name) => {
                 self.advance();
-                Ok(name)
+                Ok(name.to_string())
             }
             Tok::Keyword(k) => {
                 self.advance();
@@ -3388,11 +3403,11 @@ impl Parser {
             }
             Tok::Str(s) => {
                 self.advance();
-                Ok(Expr::Str(Rc::from(s.as_str())))
+                Ok(Expr::Str(s))
             }
             Tok::Template(parts) => {
                 self.advance();
-                self.build_template(parts)
+                self.build_template(*parts)
             }
             Tok::Regex(re) => {
                 self.advance();
@@ -3426,7 +3441,7 @@ impl Parser {
             }
             Tok::Keyword("function") => {
                 let f = self.parse_function(false, true, self.cur_start())?;
-                Ok(Expr::Func(rc_fn(f)))
+                Ok(Expr::Func(self.rc_fn(f)))
             }
             Tok::Keyword("class") | Tok::Punct("@") => {
                 let c = self.parse_class()?;
@@ -3510,7 +3525,7 @@ impl Parser {
                 let start = self.cur_start();
                 self.advance();
                 let f = self.parse_function(true, true, start)?;
-                Ok(Expr::Func(rc_fn(f)))
+                Ok(Expr::Func(self.rc_fn(f)))
             }
             Tok::Ident(name) => {
                 self.advance();
@@ -3536,7 +3551,7 @@ impl Parser {
                 }
                 match name.as_str() {
                     "undefined" => Ok(Expr::Undefined),
-                    _ => Ok(Expr::Ident(name)),
+                    _ => Ok(Expr::Ident(name.to_string())),
                 }
             }
             Tok::Punct("(") => {
@@ -3568,14 +3583,76 @@ impl Parser {
         }
     }
 
+    /// Parse a template substitution from its tokens (see [`TplPart::Sub`]).
+    fn parse_template_sub(&mut self, toks: &SubToks) -> Result<Expr, ParseError> {
+        let end = toks.0.get(toks.0.len().wrapping_sub(1)).map_or(0, |t| t.start);
+        let mut sub = Parser {
+            toks: toks.0.clone(),
+            bracket_tables: Default::default(),
+            pos: 0,
+            src: SrcMap::new(self.src.src.clone(), self.src.base, self.src.base + end),
+            lazy: self.lazy,
+            eager_outermost: false,
+            private_scope: self.private_scope.clone(),
+            in_field_init: self.in_field_init,
+            strict: self.strict,
+            depth: self.depth,
+            chain: self.chain,
+            in_generator: self.in_generator,
+            in_async: self.in_async,
+            in_params: self.in_params,
+            no_in: false,
+            last_for_await: false,
+            module: self.module,
+            fn_depth: self.fn_depth,
+            nonarrow_fn_depth: self.nonarrow_fn_depth,
+            iter_depth: self.iter_depth,
+            switch_depth: self.switch_depth,
+            labels: Vec::new(),
+            iter_labels: Vec::new(),
+            decl_scopes: vec![DeclScope {
+                fn_boundary: true,
+                ..Default::default()
+            }],
+            next_scope_is_fn_boundary: false,
+            allow_new_target: self.allow_new_target,
+            top_level: false,
+            super_prop_ok: self.super_prop_ok,
+            super_call_ok: self.super_call_ok,
+            in_derived_class: false,
+            in_case_clause: false,
+            no_arguments_refs: false,
+            proto_dups: Vec::new(),
+            last_paren: false,
+            single_stmt: false,
+            in_static_block: false,
+            check_skipped: self.check_skipped,
+            checking: self.checking,
+            pending_private: Vec::new(),
+            ts: self.ts.take(),
+        };
+        let e = sub.parse_expr();
+        self.ts = sub.ts.take();
+        let e = e?;
+        if !matches!(sub.cur(), Tok::Eof) {
+            return sub.err(format!("unexpected token {:?}", sub.cur()));
+        }
+        self.proto_dups.append(&mut sub.proto_dups);
+        self.pending_private.append(&mut sub.pending_private);
+        Ok(e)
+    }
+
     /// Desugar a template literal into a string concatenation: cooked chunks become string
     /// literals, `${...}` holes are sub-parsed as expressions. Starting from a string literal makes
     /// every `+` a string concatenation (which ToString-coerces each substitution).
     fn build_template(&mut self, parts: Vec<TplPart>) -> Result<Expr, ParseError> {
+        self.chained(|p| p.build_template_chain(parts))
+    }
+
+    fn build_template_chain(&mut self, parts: Vec<TplPart>) -> Result<Expr, ParseError> {
         let mut expr: Option<Expr> = None;
-        let tpl = self.pos.saturating_sub(1);
-        let mut cursor = 0u32;
         for part in parts {
+            self.chain_link()?;
             let piece = match part {
                 TplPart::Str { cooked, .. } => match cooked {
                     Some(c) => Expr::Str(Rc::from(c.as_str())),
@@ -3584,56 +3661,9 @@ impl Parser {
                         return self.err("invalid escape sequence in template literal");
                     }
                 },
-                TplPart::Sub(src) => {
-                    let tokens = self.sub_tokens(&src)?;
-                    let mut sub = Parser {
-                        toks: tokens,
-                        pos: 0,
-                        src: self.template_sub_map(tpl, &mut cursor, &src),
-                        lazy: self.lazy,
-                        eager_outermost: false,
-                        private_scope: self.private_scope.clone(),
-                        in_field_init: self.in_field_init,
-                        strict: self.strict,
-                        depth: self.depth,
-                        in_generator: self.in_generator,
-                        in_async: self.in_async,
-                        in_params: self.in_params,
-                        no_in: false,
-                        last_for_await: false,
-                        module: self.module,
-                        fn_depth: self.fn_depth,
-                        nonarrow_fn_depth: self.nonarrow_fn_depth,
-                        iter_depth: self.iter_depth,
-                        switch_depth: self.switch_depth,
-                        labels: Vec::new(),
-                        iter_labels: Vec::new(),
-                        decl_scopes: vec![DeclScope {
-                            fn_boundary: true,
-                            ..Default::default()
-                        }],
-                        next_scope_is_fn_boundary: false,
-                        allow_new_target: self.allow_new_target,
-                        top_level: false,
-                        super_prop_ok: self.super_prop_ok,
-                        super_call_ok: self.super_call_ok,
-                        in_derived_class: false,
-                        in_case_clause: false,
-                        no_arguments_refs: false,
-                        proto_dups: Vec::new(),
-                        last_paren: false,
-                        single_stmt: false,
-                        in_static_block: false,
-                        check_skipped: self.check_skipped,
-                        pending_private: Vec::new(),
-                        ts: self.ts.take(),
-                    };
+                TplPart::Sub(toks) => {
+                    let e = self.parse_template_sub(&toks)?;
                     // A substitution is ToString'd (string hint), not concatenated raw.
-                    let e = sub.parse_expr();
-                    self.ts = sub.ts.take();
-                    let e = e?;
-                    self.proto_dups.append(&mut sub.proto_dups);
-                    self.pending_private.append(&mut sub.pending_private);
                     Expr::ToStr(Box::new(e))
                 }
             };
@@ -3656,60 +3686,11 @@ impl Parser {
     ) -> Result<Expr, ParseError> {
         let mut quasis = Vec::new();
         let mut subs = Vec::new();
-        let tpl = self.pos.saturating_sub(1);
-        let mut cursor = 0u32;
         for part in parts {
             match part {
                 TplPart::Str { cooked, raw } => quasis.push((cooked, raw)),
-                TplPart::Sub(src) => {
-                    let tokens = self.sub_tokens(&src)?;
-                    let mut sub = Parser {
-                        toks: tokens,
-                        pos: 0,
-                        src: self.template_sub_map(tpl, &mut cursor, &src),
-                        lazy: self.lazy,
-                        eager_outermost: false,
-                        private_scope: self.private_scope.clone(),
-                        in_field_init: self.in_field_init,
-                        strict: self.strict,
-                        depth: self.depth,
-                        in_generator: self.in_generator,
-                        in_async: self.in_async,
-                        in_params: self.in_params,
-                        no_in: false,
-                        last_for_await: false,
-                        module: self.module,
-                        fn_depth: self.fn_depth,
-                        nonarrow_fn_depth: self.nonarrow_fn_depth,
-                        iter_depth: self.iter_depth,
-                        switch_depth: self.switch_depth,
-                        labels: Vec::new(),
-                        iter_labels: Vec::new(),
-                        decl_scopes: vec![DeclScope {
-                            fn_boundary: true,
-                            ..Default::default()
-                        }],
-                        next_scope_is_fn_boundary: false,
-                        allow_new_target: self.allow_new_target,
-                        top_level: false,
-                        super_prop_ok: self.super_prop_ok,
-                        super_call_ok: self.super_call_ok,
-                        in_derived_class: false,
-                        in_case_clause: false,
-                        no_arguments_refs: false,
-                        proto_dups: Vec::new(),
-                        last_paren: false,
-                        single_stmt: false,
-                        in_static_block: false,
-                        check_skipped: self.check_skipped,
-                        pending_private: Vec::new(),
-                        ts: self.ts.take(),
-                    };
-                    let e = sub.parse_expr();
-                    self.ts = sub.ts.take();
-                    let e = e?;
-                    self.proto_dups.append(&mut sub.proto_dups);
-                    self.pending_private.append(&mut sub.pending_private);
+                TplPart::Sub(toks) => {
+                    let e = self.parse_template_sub(&toks)?;
                     subs.push(e);
                 }
             }
@@ -3808,12 +3789,12 @@ impl Parser {
                 props.push(if is_get {
                     PropDef::Getter {
                         key,
-                        func: rc_fn(func),
+                        func: self.rc_fn(func),
                     }
                 } else {
                     PropDef::Setter {
                         key,
-                        func: rc_fn(func),
+                        func: self.rc_fn(func),
                     }
                 });
                 if !self.eat_punct(",") {
@@ -3858,7 +3839,7 @@ impl Parser {
                 }
                 props.push(PropDef::Method {
                     key,
-                    func: rc_fn(func),
+                    func: self.rc_fn(func),
                 });
             } else if self.eat_punct(":") {
                 // Two `__proto__: value` data properties in one literal are a SyntaxError — but
@@ -3932,7 +3913,7 @@ impl Parser {
         match self.cur().clone() {
             Tok::Ident(name) => {
                 self.advance();
-                Ok(PropKey::Ident(name))
+                Ok(PropKey::Ident(name.to_string()))
             }
             Tok::Keyword(k) => {
                 self.advance();
@@ -3940,7 +3921,7 @@ impl Parser {
             }
             Tok::Str(s) => {
                 self.advance();
-                Ok(PropKey::Str(Rc::from(s.as_str())))
+                Ok(PropKey::Str(s))
             }
             Tok::Num(n) => {
                 self.advance();
@@ -3949,7 +3930,10 @@ impl Parser {
             // A BigInt literal property key (`{1n: x}`) uses its integer string as the key.
             Tok::BigInt(n) => {
                 self.advance();
-                Ok(PropKey::Str(Rc::from(n.to_string().as_str())))
+                match n.to_string_radix_checked(10, crate::interpreter::MAX_STR_LEN) {
+                    Some(s) => Ok(PropKey::Str(Rc::from(s.as_str()))),
+                    None => self.err("Invalid string length"),
+                }
             }
             Tok::Punct("[") => {
                 self.advance();
@@ -3989,7 +3973,7 @@ impl Parser {
                 return self.err(format!("'{n}' cannot be used as a function name here"));
             }
             self.advance();
-            Some(n)
+            Some(n.to_string())
         } else {
             None
         };
@@ -4105,7 +4089,7 @@ impl Parser {
         let name = match self.cur().clone() {
             Tok::Ident(n) => {
                 self.advance();
-                n
+                n.to_string()
             }
             Tok::Keyword(k) => {
                 self.advance();
@@ -4171,7 +4155,7 @@ impl Parser {
             if n == "await" && (self.module || self.in_async || self.in_static_block) {
                 return self.err("'await' cannot be used as a class name here");
             }
-            Some(n)
+            Some(n.to_string())
         } else {
             None
         };
@@ -4186,7 +4170,7 @@ impl Parser {
             r?;
         }
         let superclass = if self.eat_kw("extends") {
-            let mut sc = self.parse_lhs();
+            let mut sc = self.nested(Self::parse_lhs);
             if sc.is_ok() && self.ts.is_some() {
                 if let Err(e) = self.ts_class_heritage(true) {
                     sc = Err(e);
@@ -4354,7 +4338,7 @@ impl Parser {
                 key: PropKey::Ident(String::new()),
                 kind: MemberKind::StaticBlock,
                 is_static: true,
-                func: Some(rc_fn(func)),
+                func: Some(self.rc_fn(func)),
                 value: None,
                 decorators,
             }]);
@@ -4439,7 +4423,7 @@ impl Parser {
                 key,
                 kind,
                 is_static,
-                func: Some(rc_fn(func)),
+                func: Some(self.rc_fn(func)),
                 value: None,
                 decorators,
             }])
@@ -4612,7 +4596,7 @@ impl Parser {
             };
             params.push(Param {
                 pattern,
-                default,
+                default: default.map(Box::new),
                 rest,
             });
             if rest || !self.eat_punct(",") {
@@ -4674,7 +4658,8 @@ impl Parser {
                     || (call_prefix
                         && matches!(next(close + 1), Some(Tok::Punct(")")))
                         && matches!(next(close + 2), Some(Tok::Punct("(" | "."))));
-                if !called_after {
+                // A body checked only for its early errors keeps no AST, even an IIFE's.
+                if !called_after || self.checking {
                     let (start, end) = self
                         .src
                         .byte_range(self.toks[open].start, self.toks[close].end)
@@ -4698,12 +4683,14 @@ impl Parser {
                 }
             }
         }
-        // A body about to be skipped is still parsed once, in full (its nested functions too), so
-        // its early errors are reported at load as the spec requires; that parse is then dropped
-        // and the body re-parsed from its range on first call.
+        // A body about to be skipped is still parsed once so its early errors are reported at
+        // load as the spec requires; each statement's AST is dropped as soon as it is checked
+        // (nested functions are checked and dropped the same way), and the body is re-parsed
+        // from its range on first call.
         let saved_lazy = self.lazy;
+        let saved_checking = self.checking;
         if skipped.is_some() {
-            self.lazy = false;
+            self.checking = true;
         }
         // A function body is a fresh context for return/break/continue and labels.
         let (siter, sswitch) = (self.iter_depth, self.switch_depth);
@@ -4717,8 +4704,11 @@ impl Parser {
         self.iter_depth = 0;
         self.switch_depth = 0;
         self.next_scope_is_fn_boundary = true;
-        let body = self.parse_block_body();
-        self.lazy = saved_lazy;
+        let body = match &skipped {
+            Some(lazy) => self.check_block_body(lazy.line).map(Err),
+            None => self.parse_block_body().map(Ok),
+        };
+        self.checking = saved_checking;
         self.fn_depth -= 1;
         if !is_arrow {
             self.nonarrow_fn_depth -= 1;
@@ -4730,10 +4720,13 @@ impl Parser {
         let body = body?;
         let result_strict = self.strict;
         self.strict = saved_strict;
-        if let Some(lazy) = skipped {
-            self.defer_private_names(&body, lazy.line)?;
-            return Ok((Body::Lazy(lazy, Some(body)), result_strict));
-        }
+        let body = match body {
+            Ok(body) => body,
+            Err(lexical) => {
+                let lazy = skipped.expect("checked bodies are skipped");
+                return Ok((Body::Lazy(lazy, Some(lexical)), result_strict));
+            }
+        };
         if saved_lazy {
             let close = self.pos - 1;
             let (start, end) = self
@@ -4755,18 +4748,40 @@ impl Parser {
         Ok((Body::Eager(body), result_strict))
     }
 
-    /// The private-name check [`parse_lazy_body`] runs, for a body checked at skip time: names a
-    /// class inside the body declares resolve now; the rest wait in `pending_private` until the
-    /// enclosing classes are complete.
-    fn defer_private_names(&mut self, body: &[Stmt], line: u32) -> Result<(), ParseError> {
-        let outer = PN_UNRESOLVED.with(|u| u.replace(Some(Vec::new())));
-        let r = pn_stmts(body, &mut Vec::new());
-        let unresolved = PN_UNRESOLVED.with(|u| u.replace(outer)).unwrap_or_default();
-        r.map_err(|message| ParseError {
-            at_eof: false,
-            message,
-            line,
-        })?;
+    /// Parse a function body only for its early errors, dropping each statement once checked.
+    /// Returns the body's top-level lexical names (bar function declarations, which a parameter
+    /// may share) for the parameter clash check.
+    fn check_block_body(&mut self, line: u32) -> Result<Vec<String>, ParseError> {
+        self.push_decl_scope();
+        let mut lexical = Vec::new();
+        let mut vars = Vec::new();
+        let mut fn_names = Vec::new();
+        let mut unresolved = Vec::new();
+        let r = (|| {
+            while !self.is_punct("}") && !self.at_eof() {
+                let stmt = self.parse_stmt()?;
+                collect_top_decl(&stmt, &mut lexical, &mut vars);
+                if let Stmt::FuncDecl(f) = &stmt {
+                    fn_names.extend(f.name.clone());
+                }
+                vars.clear();
+                // The private-name check [`parse_lazy_body`] runs: names a class inside the body
+                // declares resolve now; the rest wait in `pending_private` until the enclosing
+                // classes are complete.
+                let outer = PN_UNRESOLVED.with(|u| u.replace(Some(std::mem::take(&mut unresolved))));
+                let r = pn_stmt(&stmt, &mut Vec::new());
+                unresolved = PN_UNRESOLVED.with(|u| u.replace(outer)).unwrap_or_default();
+                r.map_err(|message| ParseError {
+                    at_eof: false,
+                    message,
+                    line,
+                })?;
+            }
+            self.expect_punct("}")
+        })();
+        self.pop_decl_scope();
+        r?;
+        lexical.retain(|l| !fn_names.contains(l));
         if !unresolved.is_empty() {
             self.pending_private.push(PendingPrivate {
                 scope: self.private_scope.clone(),
@@ -4774,7 +4789,7 @@ impl Parser {
                 line,
             });
         }
-        Ok(())
+        Ok(lexical)
     }
 
     fn resolve_pending_private(&mut self) -> Result<(), ParseError> {
@@ -4839,7 +4854,7 @@ impl Parser {
                     return self.err(format!("'{name}' cannot be used as a binding here"));
                 }
                 let params = vec![Param {
-                    pattern: Pattern::Ident(name),
+                    pattern: Pattern::Ident(name.to_string()),
                     default: None,
                     rest: false,
                 }];
@@ -4942,7 +4957,7 @@ impl Parser {
             let expression_line = self.toks[self.pos].line;
             let ctx = self.lazy_context(true);
             let private_scope = self.private_scope.clone();
-            let expr = self.parse_assign()?;
+            let expr = self.nested(Self::parse_assign)?;
             let lazy = if self.lazy {
                 let (start, end) = self.src
                     .byte_range(expression_start, self.prev_end())
@@ -4984,45 +4999,88 @@ impl Parser {
         };
         self.in_async = sa;
         self.in_static_block = ssb;
-        Ok(Expr::Func(rc_fn(result)))
+        Ok(Expr::Func(self.rc_fn(result)))
     }
 
     /// Index of the `}` matching the `{` at `open`.
     fn matching_brace(&self, open: usize) -> Option<usize> {
-        let mut depth = 0i32;
-        for (i, t) in self.toks.iter().enumerate().skip(open) {
-            match &t.kind {
-                Tok::Punct("{") => depth += 1,
-                Tok::Punct("}") => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
+        if !matches!(self.toks.get(open).map(|t| &t.kind), Some(Tok::Punct("{"))) {
+            let mut depth = 0i32;
+            for (i, t) in self.toks.iter_from(open).enumerate() {
+                match &t.kind {
+                    Tok::Punct("{") => depth += 1,
+                    Tok::Punct("}") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(open + i);
+                        }
                     }
+                    Tok::Eof => return None,
+                    _ => {}
                 }
-                Tok::Eof => return None,
-                _ => {}
             }
+            return None;
         }
-        None
+        self.bracket_match(open, true)
     }
 
     /// Index of the `)` matching the `(` at `open`, scanning balanced brackets.
     fn matching_paren(&self, open: usize) -> Option<usize> {
+        if !matches!(
+            self.toks.get(open).map(|t| &t.kind),
+            Some(Tok::Punct("(" | "[" | "{"))
+        ) {
+            return self.matching_paren_scan(open);
+        }
+        self.bracket_match(open, false)
+    }
+
+    /// Bracket matches come from tables built once per token list, so nested lookaheads (arrow
+    /// heads, skipped bodies) stay linear overall.
+    fn bracket_match(&self, open: usize, braces_only: bool) -> Option<usize> {
+        let table = self.bracket_tables[usize::from(braces_only)].get_or_init(|| {
+            let mut m = vec![u32::MAX; self.toks.len()];
+            let mut stack = Vec::new();
+            for (i, t) in self.toks.iter_from(0).enumerate() {
+                match &t.kind {
+                    Tok::Punct("{") => stack.push(i),
+                    Tok::Punct("(" | "[") if !braces_only => stack.push(i),
+                    Tok::Punct("}") => {
+                        if let Some(o) = stack.pop() {
+                            m[o] = i as u32;
+                        }
+                    }
+                    Tok::Punct(")" | "]") if !braces_only => {
+                        if let Some(o) = stack.pop() {
+                            m[o] = i as u32;
+                        }
+                    }
+                    Tok::Eof => break,
+                    _ => {}
+                }
+            }
+            m
+        });
+        table
+            .get(open)
+            .filter(|&&c| c != u32::MAX)
+            .map(|&c| c as usize)
+    }
+
+    fn matching_paren_scan(&self, open: usize) -> Option<usize> {
         let mut depth = 0i32;
-        let mut i = open;
-        while i < self.toks.len() {
-            match &self.toks[i].kind {
+        for (i, t) in self.toks.iter_from(open).enumerate() {
+            match &t.kind {
                 Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
                 Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(i);
+                        return Some(open + i);
                     }
                 }
                 Tok::Eof => return None,
                 _ => {}
             }
-            i += 1;
         }
         None
     }
@@ -5536,7 +5594,7 @@ fn pn_stmt(stmt: &Stmt, st: &mut Vec<Vec<String>>) -> Result<(), String> {
             finalizer,
         } => {
             pn_stmts(block, st)?;
-            if let Some((param, body)) = handler {
+            if let Some((param, body)) = handler.as_deref() {
                 if let Some(p) = param {
                     pn_pattern(p, st)?;
                 }
@@ -5883,27 +5941,34 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
 
 #[cfg(test)]
 mod src_map_tests {
-    use super::SrcMap;
+    use super::*;
 
+    /// Token offsets are bytes: function text and lazily re-parsed bodies line up with the
+    /// source around multi-byte characters.
     #[test]
-    fn checkpoints_map_every_char_offset() {
-        for n in [0, 1, 63, 64, 65, 127, 128, 129, 300] {
-            let text: String = (0..n).map(|k| if k % 3 == 0 { 'é' } else { 'a' }).collect();
-            let src = format!("ab{text}cd");
-            let (base, end) = (2u32, (src.len() - 2) as u32);
-            let map = SrcMap::new(std::rc::Rc::from(src.as_str()), base, end);
-            let slice = &src[base as usize..end as usize];
-            let mut want: Vec<u32> = slice.char_indices().map(|(i, _)| i as u32).collect();
-            want.push(slice.len() as u32);
-            for (ch, &b) in want.iter().enumerate() {
-                let (s, e) = map.byte_range(ch as u32, ch as u32).unwrap();
-                assert_eq!((s, e), (base + b, base + b), "n={n} ch={ch}");
-            }
-            if n > 0 {
-                // Past the end of a non-ASCII slice.
-                assert!(map.byte_range(0, want.len() as u32).is_none(), "n={n}");
-            }
-        }
+    fn function_text_spans_non_ascii_source() {
+        let src = "var s = 'h\u{e9}llo \u{1F600}';\nfunction f(\u{e9}) { return `\u{fc}${\u{e9}}` + function g() { return '\u{2603}'; }; }\nfunction h() {}";
+        let body = parse_script_lazy(src).unwrap();
+        let funcs: Vec<&Rc<Function>> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::FuncDecl(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        let text = |f: &Function| f.source.text().unwrap().to_string();
+        assert!(text(funcs[0]).starts_with("function f(\u{e9}) {"));
+        assert!(text(funcs[0]).ends_with("'\u{2603}'; }; }"));
+        assert_eq!(text(funcs[1]), "function h() {}");
+        let lazy = funcs[0].lazy.borrow().clone().expect("lazy body");
+        let inner = parse_lazy_body(&lazy, funcs[0]).unwrap();
+        let Stmt::Return(Some(Expr::Binary { right, .. })) = &inner[0] else {
+            panic!("{inner:?}");
+        };
+        let Expr::Func(g) = &**right else {
+            panic!("{right:?}");
+        };
+        assert_eq!(text(g), "function g() { return '\u{2603}'; }");
     }
 }
 

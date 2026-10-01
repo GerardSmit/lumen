@@ -557,7 +557,7 @@ impl Interp {
                         mutable: false,
                         strict_immutable: true,
                         initialized: false,
-                        import_ref: None,
+                        import: false,
                         deletable: false,
                     },
                 );
@@ -609,17 +609,7 @@ impl Interp {
     fn link_named(&mut self, env: &Env, local: &str, dep: &str, name: &str) -> Result<(), Abrupt> {
         match self.resolve_export(dep, name, &mut Vec::new()) {
             Resolution::Local(src_env, src_local) => {
-                env.borrow_mut().vars.insert(
-                    local.to_string(),
-                    Binding {
-                        value: Value::Undefined,
-                        mutable: false,
-                        strict_immutable: true,
-                        initialized: true,
-                        import_ref: Some(Box::new((src_env, src_local))),
-                        deletable: false,
-                    },
-                );
+                env.borrow_mut().link_import(local, src_env, src_local);
                 Ok(())
             }
             Resolution::Ns(ns) => {
@@ -1827,8 +1817,8 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
                         crate::ast::ForInit::Expr(e) => expr(e),
                     })
                     .unwrap_or(false)
-                    || test.as_ref().map(expr).unwrap_or(false)
-                    || update.as_ref().map(expr).unwrap_or(false)
+                    || test.as_deref().map(expr).unwrap_or(false)
+                    || update.as_deref().map(expr).unwrap_or(false)
                     || stmt(body)
             }
             Stmt::ForInOf {
@@ -1846,7 +1836,7 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
                 block.iter().any(stmt)
                     || handler
                         .as_ref()
-                        .map(|(_, h)| h.iter().any(stmt))
+                        .map(|h| &h.1).map(|h| h.iter().any(stmt))
                         .unwrap_or(false)
                     || finalizer
                         .as_ref()

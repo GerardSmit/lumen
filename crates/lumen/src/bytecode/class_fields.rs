@@ -80,11 +80,11 @@ fn class_ctor(i: &Interp, callee: &Value, allow_derived: bool) -> Option<(super:
         || f.is_method
         || f.is_generator
         || f.is_async
-        || i.depth >= crate::interpreter::MAX_EVAL_DEPTH
+        || i.depth >= i.depth_limit
         || matches!(i.tier, super::Tier::Interp)
         || i.multi_realm()
         || (!i.proxies.is_empty() && i.proxies.contains_key(&key))
-        || u.env.borrow().under_with
+        || u.env.borrow().under_with()
     {
         return None;
     }

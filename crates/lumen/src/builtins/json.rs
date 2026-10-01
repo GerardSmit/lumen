@@ -82,7 +82,7 @@ pub(super) fn install_json(it: &mut Interp) {
             opts: &opts,
             gap: &gap,
             indent: String::new(),
-            stack: Vec::new(),
+            stack: Default::default(),
             out: String::new(),
         };
         if ser.property(i, &holder, JsonKey::Str(""), value)? {
@@ -249,7 +249,7 @@ struct JsonSer<'a> {
     opts: &'a JsonOpts,
     gap: &'a str,
     indent: String,
-    stack: Vec<usize>,
+    stack: crate::fasthash::FastSet<usize>,
     out: String,
 }
 
@@ -397,10 +397,10 @@ impl JsonSer<'_> {
                     return Ok(false); // functions are omitted
                 }
                 let ptr = Gc::as_ptr(o) as usize;
-                if self.stack.contains(&ptr) {
+                if !self.stack.insert(ptr) {
                     return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
                 }
-                self.stack.push(ptr);
+                ab(i.check_native_stack())?;
                 let outer_len = self.indent.len();
                 self.indent.push_str(self.gap);
                 // IsArray sees through proxies; key enumeration / length use proxy-aware
@@ -450,7 +450,7 @@ impl JsonSer<'_> {
                             &owned
                         }
                         None => {
-                            crate::split_view::unview(o);
+                            i.materialize(o);
                             owned = match ta_info(i, o) {
                                 // A TypedArray's enumerable own keys: its indices, then string
                                 // expandos.
@@ -495,7 +495,7 @@ impl JsonSer<'_> {
                     }
                     self.out.push('}');
                 }
-                self.stack.pop();
+                self.stack.remove(&ptr);
                 Ok(true)
             }
         }
@@ -509,7 +509,7 @@ fn json_delete_prop(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Val
         return Ok(());
     }
     if let Value::Obj(o) = holder {
-        crate::split_view::unview(o);
+        i.materialize(o);
         let configurable = o
             .borrow()
             .props
@@ -560,6 +560,7 @@ fn internalize_json_property(
 ) -> Result<Value, Value> {
     let val = ab(i.get_member(holder, name))?;
     if matches!(val, Value::Obj(_)) {
+        ab(i.check_native_stack())?;
         if json_is_array(i, &val)? {
             let len = match val.as_obj() {
                 Some(o) => ab(i.to_length(o))?,
@@ -595,7 +596,7 @@ fn internalize_json_property(
             } else {
                 val.as_obj()
                     .map(|o| {
-                        crate::split_view::unview(o);
+                        i.materialize(o);
                         ordered_enum_keys(o).iter().map(|k| k.to_string()).collect()
                     })
                     .unwrap_or_default()
@@ -688,6 +689,7 @@ impl<'a> JsonBytes<'a> {
         match c {
             b'{' => {
                 self.pos += 1;
+                ab(i.check_native_stack())?;
                 let obj = i.new_object();
                 self.ws();
                 if self.peek() == Some(b'}') {
@@ -725,6 +727,7 @@ impl<'a> JsonBytes<'a> {
             }
             b'[' => {
                 self.pos += 1;
+                ab(i.check_native_stack())?;
                 let mut items = Vec::new();
                 self.ws();
                 if self.peek() == Some(b']') {
@@ -965,6 +968,7 @@ fn json_parse_value(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<V
     match c {
         '{' => {
             *pos += 1;
+            ab(i.check_native_stack())?;
             let obj = i.new_object();
             json_skip_ws(chars, pos);
             if chars.get(*pos) == Some(&'}') {
@@ -1004,6 +1008,7 @@ fn json_parse_value(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<V
         }
         '[' => {
             *pos += 1;
+            ab(i.check_native_stack())?;
             let mut items = Vec::new();
             json_skip_ws(chars, pos);
             if chars.get(*pos) == Some(&']') {
@@ -1102,6 +1107,7 @@ fn json_parse_recorded(
     match c {
         '{' => {
             *pos += 1;
+            ab(i.check_native_stack())?;
             let obj = i.new_object();
             let mut rec: Vec<(String, JsonRecord)> = Vec::new();
             json_skip_ws(chars, pos);
@@ -1142,6 +1148,7 @@ fn json_parse_recorded(
         }
         '[' => {
             *pos += 1;
+            ab(i.check_native_stack())?;
             let mut items = Vec::new();
             let mut rec = Vec::new();
             json_skip_ws(chars, pos);

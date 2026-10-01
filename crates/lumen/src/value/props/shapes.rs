@@ -53,7 +53,8 @@ pub(super) const NO_SLOT: u32 = u32::MAX;
 ///
 /// Two kinds share this type (see [`Keys`]):
 /// - **Shared** shapes live in the [`ShapeTable`] transition tree, are immutable, and are held
-///   by the table forever; their `id` is their index in [`ShapeTable::by_id`]. Each stores only
+///   by the table until nothing else references them (see [`ShapeTable::sweep`]); `id` keys
+///   [`ShapeTable::by_id`] and is never reused. Each stores only
 ///   its own last key and a pointer to its parent: a chain of `n` keys costs `n` keys, not
 ///   `n(n+1)/2`. The full ordered list is materialised once, on demand, for the shapes that
 ///   are iterated — most shapes in a chain are intermediates an object passes through during
@@ -73,7 +74,78 @@ pub(crate) struct Shape {
     keys: Keys,
     /// Built lazily on first lookup once `len > INDEX_THRESHOLD` (shared shapes), or
     /// maintained eagerly on mutation (owned shapes).
-    index: OnceCell<Box<crate::fasthash::FastMap<Rc<str>, u32>>>,
+    index: OnceCell<Box<SlotIndex>>,
+}
+
+/// A shape's key → slot hash index: open addressing with linear probing over `u64` buckets, each
+/// holding a 32-bit hash tag (high half) and the slot (low half). Keys are not duplicated — a
+/// tag match is confirmed against the shape's key list — so a dictionary-sized object pays 8
+/// bytes per bucket instead of a `(Rc<str>, u32)` entry.
+pub(super) struct SlotIndex {
+    buckets: Box<[u64]>,
+    len: u32,
+}
+
+const EMPTY_BUCKET: u64 = u64::MAX;
+
+#[inline]
+fn key_tag(key: &str) -> u32 {
+    (crate::fasthash::hash_bytes(key.as_bytes()) >> 32) as u32
+}
+
+impl SlotIndex {
+    fn new(keys: &[Rc<str>]) -> SlotIndex {
+        let cap = (keys.len() * 4 / 3 + 1).next_power_of_two().max(16);
+        let mut index = SlotIndex {
+            buckets: vec![EMPTY_BUCKET; cap].into_boxed_slice(),
+            len: 0,
+        };
+        for (slot, k) in keys.iter().enumerate() {
+            index.push(k, slot as u32);
+        }
+        index
+    }
+
+    #[inline]
+    fn place(buckets: &mut [u64], bucket: u64) {
+        let mask = buckets.len() - 1;
+        let mut i = (bucket >> 32) as usize & mask;
+        while buckets[i] != EMPTY_BUCKET {
+            i = (i + 1) & mask;
+        }
+        buckets[i] = bucket;
+    }
+
+    /// Add `key` (absent) at `slot`.
+    fn push(&mut self, key: &str, slot: u32) {
+        if (self.len as usize + 1) * 4 > self.buckets.len() * 3 {
+            let mut grown = vec![EMPTY_BUCKET; self.buckets.len() * 2].into_boxed_slice();
+            for &b in self.buckets.iter().filter(|&&b| b != EMPTY_BUCKET) {
+                Self::place(&mut grown, b);
+            }
+            self.buckets = grown;
+        }
+        let bucket = ((key_tag(key) as u64) << 32) | slot as u64;
+        Self::place(&mut self.buckets, bucket);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn get(&self, keys: &[Rc<str>], key: &str) -> Option<u32> {
+        let tag = key_tag(key);
+        let mask = self.buckets.len() - 1;
+        let mut i = tag as usize & mask;
+        loop {
+            let b = self.buckets[i];
+            if b == EMPTY_BUCKET {
+                return None;
+            }
+            if (b >> 32) as u32 == tag && key_eq(&keys[b as u32 as usize], key) {
+                return Some(b as u32);
+            }
+            i = (i + 1) & mask;
+        }
+    }
 }
 
 /// Where a shape's keys live.
@@ -190,8 +262,8 @@ impl Shape {
         })
     }
 
-    /// The ordered key list. Materialised on first use for a shared shape (and kept: the shape
-    /// is immortal, and a shape that is iterated once tends to be iterated again).
+    /// The ordered key list. Materialised on first use for a shared shape (and kept: a shape
+    /// that is iterated once tends to be iterated again).
     pub(super) fn keys(&self) -> &[Rc<str>] {
         match &self.keys {
             Keys::Owned(keys) => keys,
@@ -223,21 +295,10 @@ impl Shape {
         matches!(&self.keys, Keys::Chain { flat, .. } if flat.get().is_some())
     }
 
-    fn make_index(&self) -> Box<crate::fasthash::FastMap<Rc<str>, u32>> {
-        let mut index = Box::<crate::fasthash::FastMap<Rc<str>, u32>>::default();
-        match &self.keys {
-            Keys::Owned(keys) => {
-                for (slot, k) in keys.iter().enumerate() {
-                    index.insert(k.clone(), slot as u32);
-                }
-            }
-            Keys::Chain { .. } => {
-                for (s, k) in self.chain() {
-                    index.insert(k.clone(), s.len - 1);
-                }
-            }
-        }
-        index
+    /// A shared shape's index confirms hits against its materialised key list, so indexing one
+    /// builds that list too.
+    fn make_index(&self) -> Box<SlotIndex> {
+        Box::new(SlotIndex::new(self.keys()))
     }
 
     fn build_index(&mut self) {
@@ -255,14 +316,13 @@ impl Shape {
             return (self.proto_slot != NO_SLOT).then_some(self.proto_slot);
         }
         if let Some(index) = self.index.get() {
-            return index.get(key).copied();
+            return index.get(self.keys(), key);
         }
         if self.len as usize > INDEX_THRESHOLD {
             return self
                 .index
                 .get_or_init(|| self.make_index())
-                .get(key)
-                .copied();
+                .get(self.keys(), key);
         }
         let flat: &[Rc<str>] = match &self.keys {
             Keys::Owned(keys) => keys,
@@ -294,11 +354,16 @@ impl Shape {
         } else if &*key == "prototype" {
             self.proto_slot = slot;
         }
-        self.owned_keys_mut().push(key.clone());
+        let indexed = match self.index.get_mut() {
+            Some(index) => {
+                index.push(&key, slot);
+                true
+            }
+            None => false,
+        };
+        self.owned_keys_mut().push(key);
         self.len += 1;
-        if let Some(index) = self.index.get_mut() {
-            index.insert(key, slot);
-        } else if self.len as usize > INDEX_THRESHOLD {
+        if !indexed && self.len as usize > INDEX_THRESHOLD {
             self.build_index();
         }
     }
@@ -308,13 +373,10 @@ impl Shape {
         let Keys::Owned(keys) = &mut self.keys else {
             unreachable!("shared shapes are immutable")
         };
-        let key = keys.remove(slot);
+        keys.remove(slot);
         self.len -= 1;
-        if let Some(index) = self.index.get_mut() {
-            index.remove(&key);
-            for (j, k) in keys.iter().enumerate().skip(slot) {
-                index.insert(k.clone(), j as u32);
-            }
+        if self.index.get().is_some() {
+            self.build_index();
         }
         self.remember_special_slots();
     }
@@ -357,14 +419,27 @@ impl Shape {
 /// transition (it doesn't extend the key sequence), so it detaches the object to an owned shape
 /// whose id no cache holds.
 ///
+/// Shapes no object, child shape or compiled code references are reclaimed by an amortized
+/// [`ShapeTable::sweep`]. Ids are never reused, so an inline cache still holding a reclaimed
+/// shape's id can never match a live object again; a creation IC resolving its recorded child
+/// by id sees `None` and takes the ordinary transition.
+///
 /// Lives in the [`crate::value::GcState`] shared by a driver thread and the coroutine workers that
 /// run its generator bodies: objects flow between those threads, and a worker looking up a key on
 /// an object the driver built must find its shape here.
 pub(crate) struct ShapeTable {
     transitions: crate::fasthash::FastMap<(u32, Rc<str>), Rc<Shape>>,
-    /// Shared shapes by id (`by_id[0]` is the empty shape). Never shrinks: a shape id recorded
-    /// in an inline cache must stay resolvable for as long as the heap lives.
-    by_id: Vec<Rc<Shape>>,
+    /// Shared shapes by id (`0` is the empty shape). Each holds one strong count here and one in
+    /// `transitions` (the root: only here).
+    by_id: crate::fasthash::FastMap<u32, Rc<Shape>>,
+    /// The id the next shared shape gets: monotonic, so a reclaimed id is never handed out again.
+    next_id: u32,
+    /// Live transitions out of each shape that has any (see [`MAX_TRANSITIONS`]).
+    children: crate::fasthash::FastMap<u32, u32>,
+    /// Shapes whose `Rc` handle compiled code embeds (see [`jit_shared_shape`]): never swept.
+    pinned: crate::fasthash::FastSet<u32>,
+    /// `by_id` size past which the next new shape triggers a sweep.
+    sweep_at: usize,
     /// Owned-shape ids count down from here so they never collide with a tree id.
     next_owned: u32,
     /// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals
@@ -374,15 +449,36 @@ pub(crate) struct ShapeTable {
     exec_result: Option<Rc<Shape>>,
 }
 
+/// Transitions one shape may have before further new keys detach objects to owned shapes
+/// (V8's `kMaxNumberOfTransitions`): objects keyed by unbounded data (`{[id]: v}`) would
+/// otherwise mint a shared shape per distinct key.
+const MAX_TRANSITIONS: u32 = 1536;
+
+/// Floor for [`ShapeTable::sweep_at`].
+const SWEEP_MIN: usize = 4096;
+
+/// The last shared id: owned ids count down from `u32::MAX`.
+const MAX_SHARED_ID: u32 = 0x7fff_ffff;
+
 impl ShapeTable {
     pub(crate) fn new() -> ShapeTable {
+        let mut by_id = crate::fasthash::FastMap::default();
+        by_id.insert(SHAPE_EMPTY, Rc::new(Shape::root()));
         ShapeTable {
             transitions: Default::default(),
-            by_id: vec![Rc::new(Shape::root())],
+            by_id,
+            next_id: SHAPE_EMPTY + 1,
+            children: Default::default(),
+            pinned: Default::default(),
+            sweep_at: SWEEP_MIN,
             next_owned: u32::MAX - 1,
             array_length: None,
             exec_result: None,
         }
+    }
+
+    fn root(&self) -> Rc<Shape> {
+        self.by_id[&SHAPE_EMPTY].clone()
     }
 
     fn fresh_owned_id(&mut self) -> u32 {
@@ -393,17 +489,61 @@ impl ShapeTable {
         id
     }
 
-    fn transition(&mut self, parent: &Rc<Shape>, key: &Rc<str>) -> Rc<Shape> {
+    /// The memoized child of `parent` by `key`, created if absent. `None` when `capped` and
+    /// `parent` already has [`MAX_TRANSITIONS`] children, or the id space is spent: the caller
+    /// detaches to an owned shape.
+    fn transition(&mut self, parent: &Rc<Shape>, key: &Rc<str>, capped: bool) -> Option<Rc<Shape>> {
         if let Some(c) = self.transitions.get(&(parent.id, key.clone())) {
-            return c.clone();
+            return Some(c.clone());
         }
-        let id = self.by_id.len() as u32;
-        assert!(id < 0x8000_0000, "shape table exhausted");
+        if self.by_id.len() > self.sweep_at {
+            self.sweep();
+        }
+        let n = self.children.get(&parent.id).copied().unwrap_or(0);
+        if capped && (n >= MAX_TRANSITIONS || self.next_id > MAX_SHARED_ID) {
+            return None;
+        }
+        let id = self.next_id;
+        assert!(id <= MAX_SHARED_ID, "shape table exhausted");
+        self.next_id += 1;
         let child = Rc::new(Shape::child(parent, id, key.clone()));
-        self.by_id.push(child.clone());
+        self.by_id.insert(id, child.clone());
         self.transitions
             .insert((parent.id, key.clone()), child.clone());
-        child
+        self.children.insert(parent.id, n + 1);
+        Some(child)
+    }
+
+    /// Drop every shared shape referenced only by this table (no object, child shape, cached
+    /// handle or compiled code holds it), with its transition entry. Children always have larger
+    /// ids than their parent, so one pass in descending id order also reclaims a parent whose
+    /// last child goes earlier in the same pass. Re-arms at twice the surviving size, which
+    /// keeps the cost amortized O(log n) per shape created.
+    fn sweep(&mut self) {
+        let mut ids: Vec<u32> = self.by_id.keys().copied().collect();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        for id in ids {
+            if id == SHAPE_EMPTY || self.pinned.contains(&id) {
+                continue;
+            }
+            if self.by_id.get(&id).is_none_or(|s| Rc::strong_count(s) != 2) {
+                continue;
+            }
+            let shape = self.by_id.remove(&id).expect("present");
+            self.children.remove(&id);
+            if let Keys::Chain { parent: Some(p), key, .. } = &shape.keys {
+                self.transitions.remove(&(p.id, key.clone()));
+                if let std::collections::hash_map::Entry::Occupied(mut e) =
+                    self.children.entry(p.id)
+                {
+                    *e.get_mut() -= 1;
+                    if *e.get() == 0 {
+                        e.remove();
+                    }
+                }
+            }
+        }
+        self.sweep_at = (self.by_id.len() * 2).max(SWEEP_MIN);
     }
 }
 
@@ -412,23 +552,27 @@ fn with_shapes<R>(f: impl FnOnce(&mut ShapeTable) -> R) -> R {
 }
 
 /// The child shape reached by adding `key` to shared shape `parent` (memoized so it is shared).
-/// `None` parent = the empty shape.
-pub(super) fn shape_transition(parent: Option<&Rc<Shape>>, key: &Rc<str>) -> Rc<Shape> {
+/// `None` parent = the empty shape. `None` result: `parent` has too many transitions (see
+/// [`MAX_TRANSITIONS`]) and the object should detach to an owned shape.
+pub(super) fn shape_transition(parent: Option<&Rc<Shape>>, key: &Rc<str>) -> Option<Rc<Shape>> {
     with_shapes(|t| match parent {
-        Some(p) => t.transition(p, key),
+        Some(p) => t.transition(p, key, true),
         None => {
-            let empty = t.by_id[0].clone();
-            t.transition(&empty, key)
+            let empty = t.root();
+            t.transition(&empty, key, true)
         }
     })
 }
 
 /// The shared shape with id `id` as its `Rc` handle word and key count, for compiled code that
-/// switches an object to it (the table holds shared shapes forever). `None` for an owned id.
+/// switches an object to it. The shape is pinned: the code embeds the handle, so the table must
+/// keep it for the heap's lifetime. `None` for an owned or reclaimed id.
 pub(crate) fn jit_shared_shape(id: u32) -> Option<(usize, u32)> {
     with_shapes(|t| {
-        let s = t.by_id.get(id as usize)?;
-        Some((unsafe { *(s as *const Rc<Shape> as *const usize) }, s.len))
+        let s = t.by_id.get(&id)?;
+        let r = (unsafe { *(s as *const Rc<Shape> as *const usize) }, s.len);
+        t.pinned.insert(id);
+        Some(r)
     })
 }
 
@@ -437,10 +581,10 @@ pub(crate) fn proto_epoch_addr() -> usize {
     PROTO_EPOCH.as_ptr() as usize
 }
 
-/// The shared shape with id `id` (a creation IC's recorded child). Panics on an owned id — the
-/// fills that record ids only ever record shared ones.
-pub(super) fn shape_by_id(id: u32) -> Rc<Shape> {
-    with_shapes(|t| t.by_id[id as usize].clone())
+/// The shared shape with id `id` (a creation IC's recorded child), or `None` once it has been
+/// reclaimed. The fills that record ids only ever record shared ones.
+pub(super) fn shape_by_id(id: u32) -> Option<Rc<Shape>> {
+    with_shapes(|t| t.by_id.get(&id).cloned())
 }
 
 /// A fresh owned shape holding `keys` (the object detaches from the tree).
@@ -465,8 +609,8 @@ pub(in crate::value) fn array_length_shape() -> Rc<Shape> {
         if let Some(s) = &t.array_length {
             return s.clone();
         }
-        let empty = t.by_id[0].clone();
-        let s = t.transition(&empty, &fn_key(0));
+        let empty = t.root();
+        let s = t.transition(&empty, &fn_key(0), false).expect("uncapped");
         t.array_length = Some(s.clone());
         s
     })
@@ -475,15 +619,18 @@ pub(in crate::value) fn array_length_shape() -> Rc<Shape> {
 /// The `{length, index, input, groups}` shape of a `RegExp.prototype.exec` match array (the
 /// array's own `length`, then the three data properties RegExpBuiltinExec creates in order).
 pub(super) fn exec_result_shape() -> Rc<Shape> {
-    if let Some(s) = with_shapes(|t| t.exec_result.clone()) {
-        return s;
-    }
-    let mut s = array_length_shape();
-    for key in ["index", "input", "groups"] {
-        s = shape_transition(Some(&s), &Rc::from(key));
-    }
-    with_shapes(|t| t.exec_result = Some(s.clone()));
-    s
+    let s = array_length_shape();
+    with_shapes(|t| {
+        if let Some(s) = &t.exec_result {
+            return s.clone();
+        }
+        let mut s = s;
+        for key in ["index", "input", "groups"] {
+            s = t.transition(&s, &Rc::from(key), false).expect("uncapped");
+        }
+        t.exec_result = Some(s.clone());
+        s
+    })
 }
 
 /// Shared-shape table sizes for the heap census (`LUMEN_HEAP_CENSUS`).
@@ -513,7 +660,7 @@ pub(crate) fn shape_table_census() -> ShapeTableCensus {
             indexes: 0,
             bytes: 0,
         };
-        for s in &t.by_id {
+        for s in t.by_id.values() {
             c.keys += s.len();
             if s.flat_built() {
                 c.flat_lists += 1;
@@ -558,4 +705,61 @@ pub(crate) fn index_key(n: usize) -> Rc<str> {
 /// Interned `"length"` / `"name"` / `"prototype"` / `"constructor"` keys (see `FN_KEYS`).
 pub(crate) fn fn_key(i: usize) -> Rc<str> {
     FN_KEYS.with(|k| k[i].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sweep() {
+        with_shapes(|t| t.sweep());
+    }
+
+    #[test]
+    fn unreferenced_shapes_are_reclaimed_and_their_ids_never_reused() {
+        std::thread::spawn(|| {
+            let key: Rc<str> = Rc::from("reclaim_probe");
+            let parent = shape_transition(None, &key).unwrap();
+            let child = shape_transition(Some(&parent), &Rc::from("second")).unwrap();
+            let (pid, cid) = (parent.id, child.id);
+            drop(parent);
+            sweep();
+            assert!(shape_by_id(pid).is_some(), "a live child keeps its parent");
+            drop(child);
+            sweep();
+            assert!(shape_by_id(cid).is_none() && shape_by_id(pid).is_none());
+            let again = shape_transition(None, &key).unwrap();
+            assert!(again.id > cid, "a reclaimed id is not handed out again");
+            // Compiled code embeds a pinned shape's handle: it outlives every other reference.
+            let id = again.id;
+            assert!(jit_shared_shape(id).is_some());
+            drop(again);
+            sweep();
+            assert!(shape_by_id(id).is_some());
+            assert!(array_length_shape().id == exec_result_shape().chain().last().unwrap().0.id);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_shape_mints_at_most_max_transitions_children() {
+        std::thread::spawn(|| {
+            let parent = shape_transition(None, &Rc::from("cap_probe")).unwrap();
+            let held: Vec<_> = (0..MAX_TRANSITIONS)
+                .map(|i| shape_transition(Some(&parent), &Rc::from(format!("c{i}"))).unwrap())
+                .collect();
+            assert!(shape_transition(Some(&parent), &Rc::from("one_more")).is_none());
+            // Existing transitions still resolve.
+            assert!(Rc::ptr_eq(
+                &shape_transition(Some(&parent), &Rc::from("c0")).unwrap(),
+                &held[0]
+            ));
+            drop(held);
+            sweep();
+            assert!(shape_transition(Some(&parent), &Rc::from("one_more")).is_some());
+        })
+        .join()
+        .unwrap();
+    }
 }

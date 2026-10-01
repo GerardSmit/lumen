@@ -57,7 +57,11 @@ fn view(ctx: &mut Ctx, m: &MemEntity) -> Value {
 
 /// Replace the buffers of memories whose length changed (after wasm ran or grew them).
 fn refresh(ctx: &mut Ctx, mems: &[MemEntity]) {
-    let bufs = ctx.host_mut::<WasmStore>().expect("wasm store").bufs.clone();
+    let bufs = ctx
+        .host_mut::<WasmStore>()
+        .expect("wasm store")
+        .bufs
+        .clone();
     for (i, b) in bufs.into_iter().enumerate() {
         let Some(m) = mems.get(b.addr) else { continue };
         if m.bytes.len() != b.len {
@@ -141,13 +145,21 @@ impl Host for CtxHost<'_> {
         let ws = self.ctx.host_mut::<WasmStore>().expect("wasm store");
         let prev = std::mem::replace(&mut ws.active_mems, mems);
         let r = self.call_js(id, args, results);
-        self.ctx.host_mut::<WasmStore>().expect("wasm store").active_mems = prev;
+        self.ctx
+            .host_mut::<WasmStore>()
+            .expect("wasm store")
+            .active_mems = prev;
         r
     }
 }
 
 impl CtxHost<'_> {
-    fn call_js(&mut self, id: usize, args: &[Val], results: &[ValType]) -> Result<Vec<Val>, String> {
+    fn call_js(
+        &mut self,
+        id: usize,
+        args: &[Val],
+        results: &[ValType],
+    ) -> Result<Vec<Val>, String> {
         let callback = self
             .host_funcs
             .get(id)
@@ -261,17 +273,36 @@ pub(crate) fn op_module_imports(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result
 }
 
 // Standalone entity allocation (for `new WebAssembly.Memory/Table/Global`).
+/// A `{initial, maximum}` descriptor's limits: whole numbers in `0..=limit` with `maximum` (when
+/// given) at least `initial`, else a `RangeError`.
+fn alloc_limits(ctx: &mut Ctx, a: &[Value], limit: u32) -> Result<(usize, Option<u32>), Value> {
+    let ok = |n: f64| n >= 0.0 && n <= limit as f64;
+    let min = num(a, 0).trunc();
+    let max = a.get(1).and_then(Value::as_num_opt).map(f64::trunc);
+    if !ok(min) || max.is_some_and(|m| !ok(m) || m < min) {
+        return Err(ctx.make_error("RangeError", "WebAssembly: invalid initial or maximum size"));
+    }
+    Ok((min as usize, max.map(|m| m as u32)))
+}
+
 pub(crate) fn op_alloc_memory(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let min = num(a, 0) as usize;
-    let max = a.get(1).and_then(Value::as_num_opt).map(|n| n as u32);
+    let (min, max) = alloc_limits(ctx, a, wasm::parse::MAX_MEMORY_PAGES)?;
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    Ok(Value::Num(ws.store.alloc_memory(min, max) as f64))
+    match ws.store.alloc_memory(min, max) {
+        Ok(addr) => Ok(Value::Num(addr as f64)),
+        Err(e) => Err(ctx.make_error("RangeError", e)),
+    }
 }
 pub(crate) fn op_alloc_table(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let min = num(a, 0) as usize;
-    let max = a.get(1).and_then(Value::as_num_opt).map(|n| n as u32);
+    let (min, max) = alloc_limits(ctx, a, u32::MAX)?;
+    if min > wasm::parse::MAX_TABLE_SIZE as usize {
+        return Err(ctx.make_error("RangeError", "WebAssembly.Table: initial size too large"));
+    }
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    Ok(Value::Num(ws.store.alloc_table(min, max) as f64))
+    match ws.store.alloc_table(min, max) {
+        Ok(addr) => Ok(Value::Num(addr as f64)),
+        Err(e) => Err(ctx.make_error("RangeError", e)),
+    }
 }
 pub(crate) fn op_alloc_global(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let ty = valtype_of(&ctx.coerce_string(a.get(2).unwrap_or(&Value::Undefined))?);
@@ -359,7 +390,9 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
         imports
     };
     // Data segments may write into an imported memory, which lives in its JS buffer.
-    let inst_result = with_store(ctx, |_, store| store.instantiate(Rc::clone(&module), imports));
+    let inst_result = with_store(ctx, |_, store| {
+        store.instantiate(Rc::clone(&module), imports)
+    });
     let inst_idx = inst_result.map_err(|e| ctx.make_error("Error", format!("LinkError: {e}")))?;
 
     // Run the start function, if any.
@@ -436,7 +469,9 @@ pub(crate) fn op_call(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
 /// `(RuntimeError)`: register the constructor wasm traps are thrown as.
 pub(crate) fn op_set_errors(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let ctor = a.first().cloned().unwrap_or(Value::Undefined);
-    ctx.host_mut::<WasmStore>().expect("wasm store").runtime_error = ctor;
+    ctx.host_mut::<WasmStore>()
+        .expect("wasm store")
+        .runtime_error = ctor;
     Ok(Value::Undefined)
 }
 
@@ -475,7 +510,8 @@ pub(crate) fn op_func(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
 
 /// [`run_func`], with a trap thrown as a `WebAssembly.RuntimeError`.
 fn run_func_js(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Val>, Value> {
-    let host_funcs = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").host_funcs);
+    let host_funcs =
+        std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").host_funcs);
     let (result, host_err) = with_store(ctx, |ctx, store| {
         let mut host = CtxHost {
             ctx,
@@ -488,7 +524,11 @@ fn run_func_js(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Va
     ctx.host_mut::<WasmStore>().expect("wasm store").host_funcs = host_funcs;
     result.map_err(|msg| {
         host_err.unwrap_or_else(|| {
-            let ctor = ctx.host_mut::<WasmStore>().expect("wasm store").runtime_error.clone();
+            let ctor = ctx
+                .host_mut::<WasmStore>()
+                .expect("wasm store")
+                .runtime_error
+                .clone();
             ctx.construct_value(ctor, &[Value::from_string(msg.clone())])
                 .unwrap_or_else(|_| ctx.make_error("Error", format!("RuntimeError: {msg}")))
         })
@@ -528,7 +568,11 @@ pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
 pub(crate) fn op_mem_grow(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let addr = num(a, 0) as usize;
     let delta = num(a, 1);
-    let delta = if (0.0..=65536.0).contains(&delta) { delta as i32 } else { -1 };
+    let delta = if (0.0..=65536.0).contains(&delta) {
+        delta as i32
+    } else {
+        -1
+    };
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
     let active = ws.active_mems;
     // SAFETY: `active_mems` is set only while an import runs, and points at the running store's
@@ -542,9 +586,20 @@ pub(crate) fn op_mem_grow(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value
         return Err(ctx.make_error("Error", "wasm: bad memory address"));
     };
     let r = m.grow(delta);
-    let mems: &[MemEntity] = if active.is_null() { &[] } else { unsafe { &*active } };
+    let mems: &[MemEntity] = if active.is_null() {
+        &[]
+    } else {
+        unsafe { &*active }
+    };
     let store = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").store);
-    refresh(ctx, if mems.is_empty() { &store.memories } else { mems });
+    refresh(
+        ctx,
+        if mems.is_empty() {
+            &store.memories
+        } else {
+            mems
+        },
+    );
     ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
     Ok(Value::Num(r as f64))
 }

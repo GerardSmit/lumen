@@ -4,7 +4,7 @@ pub(in crate::value) use entries::EntryVec;
 use shapes::SHAPE_EMPTY;
 use std::rc::Rc;
 pub(in crate::value) use packed_vec::PackedVec;
-pub(in crate::value) use storage::{DenseBuffers, DenseStorage, INLINE_PACKED_CAPACITY};
+pub(in crate::value) use storage::{DenseBuffers, DenseStorage};
 mod access;
 mod array_builder;
 mod elements;
@@ -35,10 +35,15 @@ pub struct PropsCensus {
 /// The per-function closure templates (see `ast::Function::fn_maps`).
 #[derive(Clone)]
 pub struct FnMaps {
-    /// The function object's map: `length`, `name` and, for prototype-bearing kinds, a
-    /// `prototype` placeholder patched per closure. Without the placeholder its entries are a
-    /// shared block every closure of the function references (see [`EntryVec`]).
+    /// The function object's map: `length`, `name` and, for generators, a `prototype`
+    /// placeholder patched per closure. Without the placeholder its entries are a shared block
+    /// every closure of the function references (see [`EntryVec`]). For an ordinary function
+    /// this is the map of a closure whose `.prototype` is still lazy (see
+    /// `Interp::materialize`).
     pub(crate) fn_map: Props,
+    /// An ordinary function's map with the `prototype` placeholder: what a lazy closure's map
+    /// becomes once its `.prototype` exists.
+    pub(crate) eager_map: Option<Props>,
     /// The fresh `.prototype` object's map (`constructor` placeholder), for prototype-bearing
     /// kinds.
     pub(crate) proto_map: Option<Props>,
@@ -126,8 +131,8 @@ pub(super) const NO_SLOT: u32 = u32::MAX;
 
 /// Byte offsets the optimizing tier's inline element / `length` reads rely on
 /// (`bytecode::jit::layout`): `offset_of!` facts plus one measured `Rc<Shape>` distance (std's
-/// `Rc` layout is not public). `props_*` are relative to the `Props`, `dense_*` to the
-/// `DenseBuffers` the sidecar word points at.
+/// `Rc` layout is not public). `props_*` are relative to the `Props`, `dense_*` / `packed_*` to
+/// the `DenseBuffers` the sidecar word points at, `classic_*` to its boxed classic storage.
 pub(crate) struct PropsLayout {
     /// `EntryVec` pointer / `u32` length / `u32` capacity (capacity 0 with a length = shared,
     /// read-only block).
@@ -146,28 +151,27 @@ pub(crate) struct PropsLayout {
     pub shape_strong: usize,
     /// The `bool` byte `proto_flag`.
     pub proto_flag: usize,
-    /// The sidecar: one word, null = no `DenseBuffers`.
+    /// The sidecar: one word, null = no `DenseBuffers`; [`elems_tag`](Self::elems_tag) bits
+    /// must be masked off.
     pub elems: usize,
-    /// `Option<Box<PackedVec>>`: one word, null = not boxed-packed.
-    pub dense_packed: usize,
-    /// `InlinePacked`'s `u8` length and its slot array.
-    pub dense_inline_len: usize,
-    pub dense_inline_slots: usize,
-    /// `Vec<u32>` slot map and `Vec<f64>` mirror (their inner layout is probed by the caller).
-    pub dense_elems: usize,
-    pub dense_mirror: usize,
-    /// `u8` mirror flags.
-    pub dense_mirror_flags: usize,
-    /// `PackedVec`'s first-element pointer and length words, relative to the boxed buffer.
+    pub elems_tag: usize,
+    /// The packed elements' first-element pointer (null = not packed) and `u32` length.
     pub packed_ptr: usize,
     pub packed_len: usize,
+    /// `Option<Box<Classic>>`: one word, null = no classic storage.
+    pub dense_classic: usize,
+    /// `Vec<u32>` slot map and `Vec<f64>` mirror (their inner layout is probed by the caller).
+    pub classic_elems: usize,
+    pub classic_mirror: usize,
+    /// `u8` mirror flags.
+    pub classic_mirror_flags: usize,
 }
 
 const _: () = {
     // Each is one nullable pointer word.
     assert!(std::mem::size_of::<Option<Rc<Shape>>>() == std::mem::size_of::<usize>());
     assert!(std::mem::size_of::<DenseStorage>() == std::mem::size_of::<usize>());
-    assert!(std::mem::size_of::<Option<Box<PackedVec>>>() == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<Option<Box<storage::Classic>>>() == std::mem::size_of::<usize>());
 };
 
 /// See [`PropsLayout`]. `None` when the `Rc<Shape>` probe is inconclusive.
@@ -212,16 +216,13 @@ pub(crate) fn jit_props_layout() -> Option<PropsLayout> {
         shape_strong,
         proto_flag: offset_of!(Props, proto_flag),
         elems: offset_of!(Props, elems),
-        dense_packed: offset_of!(storage::DenseBuffers, packed),
-        dense_inline_len: offset_of!(storage::DenseBuffers, inline_packed)
-            + offset_of!(storage::InlinePacked, len),
-        dense_inline_slots: offset_of!(storage::DenseBuffers, inline_packed)
-            + offset_of!(storage::InlinePacked, slots),
-        dense_elems: offset_of!(storage::DenseBuffers, elems),
-        dense_mirror: offset_of!(storage::DenseBuffers, mirror),
-        dense_mirror_flags: offset_of!(storage::DenseBuffers, mirror_flags),
-        packed_ptr: packed_vec::PACKED_PTR,
-        packed_len: packed_vec::PACKED_LEN,
+        elems_tag: storage::DENSE_BOXED,
+        packed_ptr: offset_of!(storage::DenseBuffers, packed) + packed_vec::PACKED_PTR,
+        packed_len: offset_of!(storage::DenseBuffers, packed) + packed_vec::PACKED_LEN,
+        dense_classic: offset_of!(storage::DenseBuffers, classic),
+        classic_elems: offset_of!(storage::Classic, elems),
+        classic_mirror: offset_of!(storage::Classic, mirror),
+        classic_mirror_flags: offset_of!(storage::Classic, mirror_flags),
     })
 }
 
@@ -229,6 +230,7 @@ impl std::fmt::Debug for FnMaps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FnMaps")
             .field("fn_map", &self.fn_map)
+            .field("eager_map", &self.eager_map)
             .field("proto_map", &self.proto_map)
             .finish()
     }
@@ -432,12 +434,14 @@ impl Props {
     /// it and copy on their first write through this type. Only for templates whose entries
     /// are non-writable data — inline-cached stores write a writable slot in place after the
     /// shape check alone — and hold no object references, since the cycle collector counts
-    /// each map's values as that object's own edges.
+    /// each map's values as that object's own edges. Accessors are allowed: their getter and
+    /// setter already live in a box every copy of the property shares, so the collector sees
+    /// the same edges whether the entries are copied or shared.
     pub(crate) fn share_entries(&mut self) {
         debug_assert!(self
             .entries
             .iter()
-            .all(|p| !p.writable() && !p.accessor() && !matches!(p.value(), Value::Obj(_))));
+            .all(|p| !p.writable() && !matches!(p.value(), Value::Obj(_))));
         self.entries.make_shared();
     }
 

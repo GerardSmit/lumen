@@ -371,7 +371,7 @@ pub(crate) fn open_coll_iter(i: &Interp, v: &Value) -> Option<(f64, Value)> {
         return None;
     }
     let key = iter_key(i)?;
-    let native_is = |p: Option<&crate::value::Property>, f: crate::value::NativeFn| -> bool {
+    let native_is = |p: Option<crate::value::PropRef<'_>>, f: crate::value::NativeFn| -> bool {
         let Some(p) = p else { return false };
         if p.accessor() {
             return false;
@@ -510,9 +510,9 @@ fn step_encoded(i: &Interp, target: &Gc, idx: f64, kind: u8) -> Option<Option<(V
     match data.next(&mut cur) {
         Some((k, v)) => {
             let v = match kind {
-                VALUES => v.clone(),
-                1 => k.clone(),
-                _ => i.make_array(vec![k.clone(), v.clone()]),
+                VALUES => v.unpack(),
+                1 => k.unpack(),
+                _ => i.make_array(vec![k.unpack(), v.unpack()]),
             };
             Some(Some((v, cur as f64)))
         }
@@ -726,9 +726,9 @@ pub(crate) fn array_packed(i: &Interp, v: &Value, max: usize, mut push: impl FnM
         return false;
     };
     match b.props.packed_elements().and_then(|e| e.get(..len as usize)) {
-        Some(run) if run.iter().all(|p| p.is_plain_element()) => {
+        Some(run) if !run.iter().any(|p| p.is_hole()) => {
             for p in run {
-                push(p.value());
+                push(p.unpack());
             }
             true
         }
@@ -784,8 +784,8 @@ pub(crate) fn coll_values(i: &Interp, v: &Value) -> Option<Vec<Value>> {
     let mut out = Vec::with_capacity(data.len());
     for (k, v) in data.iter() {
         out.push(match kind {
-            CollectionKind::Map => i.make_array(vec![k.clone(), v.clone()]),
-            _ => v.clone(),
+            CollectionKind::Map => i.make_array(vec![k.unpack(), v.unpack()]),
+            _ => v.unpack(),
         });
     }
     Some(out)

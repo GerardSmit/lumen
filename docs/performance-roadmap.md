@@ -296,8 +296,8 @@ Effort: **S** means a day or less, **M** a few days, **L** a week or more.
       | block_const (`{ const k = i; … () => k }`) | ~225 ns | 192 ns | – |
 
     - Left:
-      - function_expr (258 ns vs arrow 90 ns, node 17 ns) is the `.prototype` object, the fn↔prototype pair marking and release, and the legacy `arguments`/`caller` accessors on sloppy functions. A lazy `.prototype` needs every own-property path to materialize it first, and there are over 1,000 direct `props` accesses across 81 files. It needs a props-level design, not a patch.
-      - A closure's `UserCallable` is a separate `Rc` allocation. Storing it inline would add 8 bytes to every object.
+      - A closure's `UserCallable` is a separate `Rc` allocation. Storing it inline would add 8 bytes to every object. Sharing one per (function, env) would need the cycle collector to dedup env edges.
+    - Later: ordinary functions defer `.prototype` until first observed (single-realm only). A deferred function clears `ic_plain`, so every IC and fast path misses, and `Interp::materialize` / `materialize_fn` build the prototype at V8's key position. Until then the closure shares its template's entry block, so `name`, `length` and the legacy `arguments`/`caller` cost nothing per closure. A sloppy `function(){}` went from about 350 to 150 B RSS per closure, and from 323 to 91 ms in the function_expr loop. A closure whose properties are read right after creation pays about 15–20% more than eager creation.
       - Per-iteration envs still allocate a `Scope` plus a binding vector, and register a weak entry for the cycle collector.
 11. ✅ **localeCompare fast path for ASCII and root collation (S).**
     - Finding: every call constructed an `Intl.Collator`, read its options back as strings, then decomposed both strings into per-character vectors.

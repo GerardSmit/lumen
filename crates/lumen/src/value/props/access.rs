@@ -1,7 +1,7 @@
 //! Named lookup, slot access, and ordered reflection.
 use super::shapes::index_key;
 use super::{Props, NO_SLOT};
-use crate::value::{canonical_index, Property, Value};
+use crate::value::{canonical_index, PackedValue, PropRef, Property};
 use std::rc::Rc;
 
 impl Props {
@@ -24,7 +24,7 @@ impl Props {
         (slot != NO_SLOT).then_some(slot as usize)
     }
 
-    pub(crate) fn get(&self, key: &str) -> Option<&Property> {
+    pub(crate) fn get(&self, key: &str) -> Option<PropRef<'_>> {
         if let Some(n) = canonical_index(key) {
             if let Some(p) = self.get_index(n) {
                 return Some(p);
@@ -37,7 +37,7 @@ impl Props {
                 return None;
             }
         }
-        self.find(key).map(|i| &self.entries[i])
+        self.find(key).map(|i| PropRef::of(&self.entries[i]))
     }
 
     /// The memoized own `prototype` slot, for guarded constructor fast paths.
@@ -52,9 +52,9 @@ impl Props {
                 .elems
                 .packed_ref()
                 .and_then(|p| p.get(n as usize))
-                .is_some_and(|p| !matches!(p.value(), Value::Empty))
+                .is_some_and(|p| !p.is_hole())
             {
-                return self.elems.packed_mut().and_then(|p| p.get_mut(n as usize));
+                self.unpack_elements();
             }
         }
         if key.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
@@ -63,6 +63,27 @@ impl Props {
         match self.slot_of(key) {
             Some(i) => Some(&mut self.entries[i]),
             None => None,
+        }
+    }
+
+    /// Overwrite the value of own data property `key`, keeping its attributes (a packed
+    /// element stays packed, where [`get_mut`](Props::get_mut) would unpack). `false` when
+    /// there is no such property.
+    pub(crate) fn set_existing_value(&mut self, key: &str, v: crate::value::Value) -> bool {
+        if let Some(n) = canonical_index(key) {
+            if let Some(w) = self.elems.packed_mut().and_then(|p| p.get_value_mut(n as usize)) {
+                if !w.is_hole() {
+                    *w = PackedValue::pack(v);
+                    return true;
+                }
+            }
+        }
+        match self.get_mut(key) {
+            Some(p) => {
+                p.set_value(v);
+                true
+            }
+            None => false,
         }
     }
 
@@ -131,7 +152,7 @@ impl Props {
             .packed_ref()
             .into_iter()
             .flat_map(|p| p.iter().enumerate())
-            .filter(|(_, p)| !matches!(p.value(), Value::Empty))
+            .filter(|(_, p)| !p.is_hole())
             .map(|(n, _)| index_key(n))
             .chain(self.element_region().map(|(n, _)| index_key(n)))
             .chain(self.shape_keys().iter().cloned())
@@ -150,7 +171,7 @@ impl Props {
                 packed
                     .iter()
                     .enumerate()
-                    .filter(|(_, p)| !matches!(p.value(), Value::Empty))
+                    .filter(|(_, p)| !p.is_hole())
                     .map(|(n, _)| (n as u32, index_key(n))),
             );
         }
@@ -198,24 +219,18 @@ impl Props {
     }
 
     /// Every live property value, including keyless packed elements (for GC tracing).
-    pub(crate) fn values(&self) -> impl Iterator<Item = &Property> {
+    pub(crate) fn values(&self) -> impl Iterator<Item = PropRef<'_>> {
         self.elems
             .packed_ref()
             .into_iter()
             .flat_map(|p| p.iter())
-            .filter(|p| !p.is_empty())
-            .chain(self.entries.iter())
+            .filter(|p| !p.is_hole())
+            .map(PropRef::elem)
+            .chain(self.entries.iter().map(PropRef::of))
     }
 
     pub(crate) fn highest_nonconfig_index_from(&self, from: usize) -> Option<usize> {
-        let packed = self
-            .elems
-            .packed_ref()
-            .into_iter()
-            .flat_map(|p| p.iter().enumerate())
-            .filter_map(|(n, p)| {
-                (!matches!(p.value(), Value::Empty) && !p.configurable() && n >= from).then_some(n)
-            });
+        // Packed elements are all configurable.
         let region = self
             .element_region()
             .filter(|&(n, slot)| n >= from && !self.entries[slot].configurable())
@@ -226,18 +241,16 @@ impl Props {
                 .flatten()
                 .filter(|&n| n >= from)
         });
-        packed.chain(region).chain(named).max()
+        region.chain(named).max()
     }
 
     pub(crate) fn integrity_ok(&self, frozen: bool) -> bool {
         let valid = |p: &Property| !p.configurable() && (!frozen || p.accessor() || !p.writable());
         let named = self.named_len();
+        // A packed element is configurable: only holes pass.
         self.elems
             .packed_ref()
-            .into_iter()
-            .flat_map(|p| p.iter())
-            .filter(|p| !matches!(p.value(), Value::Empty))
-            .all(valid)
+            .is_none_or(|p| p.iter().all(PackedValue::is_hole))
             && self.entries[named..].iter().all(valid)
             && self
                 .iter_named()

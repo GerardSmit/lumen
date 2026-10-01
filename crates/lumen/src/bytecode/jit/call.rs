@@ -147,6 +147,8 @@ fn bound_parts(f: &Value) -> Option<(Value, Value)> {
 /// Byte offsets of the engine state a direct call site touches.
 struct Offs {
     depth: i32,
+    /// `Interp::depth_limit` (the native-stack-derived recursion ceiling).
+    depth_limit: i32,
     strict: i32,
     tco: i32,
     ctor: i32,
@@ -173,6 +175,7 @@ fn offs() -> Option<&'static Offs> {
         let i = |x: usize| i32::try_from(x).ok();
         Some(Offs {
             depth: i(offset_of!(I, depth))?,
+            depth_limit: i(offset_of!(I, depth_limit))?,
             strict: i(offset_of!(I, strict))?,
             tco: i(offset_of!(I, tco_ok))?,
             ctor: i(offset_of!(I, constructing))?,
@@ -1722,11 +1725,11 @@ impl Tr<'_, '_> {
             Some(e)
         };
         let depth = self.fb.load(MemKind::I32, interp, o.depth);
-        let lim = self.i32c(if site.tail {
-            crate::bytecode::TAIL_NEST
+        let lim = if site.tail {
+            self.i32c(crate::bytecode::TAIL_NEST as i64)
         } else {
-            crate::interpreter::MAX_EVAL_DEPTH
-        } as i64);
+            self.fb.load(MemKind::I32, interp, o.depth_limit)
+        };
         let ok = self.fb.icmp(IntCC::Ult, depth, lim);
         self.guard_to(ok, slow);
         // The engine flags are switched to the callee's for the call and back after it: `strict`

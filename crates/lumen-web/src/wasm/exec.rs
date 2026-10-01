@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::parse::{FuncType, Module, ValType};
+use super::parse::{FuncType, Module, ValType, MAX_MEMORY_PAGES, MAX_TABLE_SIZE};
 
 pub const PAGE_SIZE: usize = 65536;
 
@@ -62,9 +62,7 @@ impl Val {
             ValType::I64 => Val::I64(b as i64),
             ValType::F32 => Val::F32(f32::from_bits(b as u32)),
             ValType::F64 => Val::F64(f64::from_bits(b)),
-            ValType::FuncRef | ValType::ExternRef => {
-                Val::Ref((b != u64::MAX).then_some(b as u32))
-            }
+            ValType::FuncRef | ValType::ExternRef => Val::Ref((b != u64::MAX).then_some(b as u32)),
         }
     }
     pub fn ty(self) -> ValType {
@@ -142,7 +140,7 @@ impl MemEntity {
         }
         let old_pages = (self.bytes.len() / PAGE_SIZE) as u32;
         let new_pages = old_pages.saturating_add(delta as u32);
-        if self.max.is_some_and(|max| new_pages > max) || new_pages > 65536 {
+        if self.max.is_some_and(|max| new_pages > max) || new_pages > MAX_MEMORY_PAGES {
             return -1;
         }
         if !self.bytes.resize(new_pages as usize * PAGE_SIZE, 0) {
@@ -171,7 +169,9 @@ impl LinearMem {
             .flatten()
             .map(|r| (r, true))
             .or_else(|| {
-                let max = max_pages.map_or(1 << 32, |m| m as usize * PAGE_SIZE).max(len);
+                let max = max_pages
+                    .map_or(1 << 32, |m| m as usize * PAGE_SIZE)
+                    .max(len);
                 Region::reserve(max.max(PAGE_SIZE)).map(|r| (r, false))
             });
         let (region, guarded) = region.ok_or("wasm: cannot reserve linear memory")?;
@@ -332,24 +332,33 @@ pub fn scan_labels(code: &[u8]) -> Result<HashMap<usize, Label>, String> {
             }
             0x05 => {
                 // else — belongs to the innermost open `if`
-                if let Some(&pos) = open.last() {
-                    if let Some(l) = labels.get_mut(&pos) {
-                        l.else_ip = Some(ip);
-                    }
+                let pos = open.last().ok_or("wasm: else without if")?;
+                if let Some(l) = labels.get_mut(pos) {
+                    l.else_ip = Some(ip);
                 }
             }
             0x0b => {
                 // end
-                if let Some(pos) = open.pop() {
-                    if let Some(l) = labels.get_mut(&pos) {
-                        l.end_ip = ip;
-                    }
+                let pos = open.pop().ok_or("wasm: unbalanced end")?;
+                if let Some(l) = labels.get_mut(&pos) {
+                    l.end_ip = ip;
                 }
             }
             _ => skip_immediates(code, op, &mut ip)?,
         }
     }
+    if !open.is_empty() {
+        return Err("wasm: unterminated block".into());
+    }
     Ok(labels)
+}
+
+/// A fixed-size immediate (a float constant's bytes).
+fn imm<const N: usize>(code: &[u8], ip: &mut usize) -> Result<[u8; N], String> {
+    let end = ip.checked_add(N).ok_or("wasm: truncated immediate")?;
+    let b = code.get(*ip..end).ok_or("wasm: truncated immediate")?;
+    *ip = end;
+    Ok(b.try_into().unwrap_or([0; N]))
 }
 
 fn skip_blocktype(code: &[u8], ip: &mut usize) -> Result<(), String> {
@@ -374,6 +383,9 @@ fn read_uleb(code: &[u8], ip: &mut usize) -> Result<u64, String> {
             return Ok(result);
         }
         shift += 7;
+        if shift >= 64 {
+            return Err("wasm: LEB128 overflow".into());
+        }
     }
 }
 
@@ -391,6 +403,9 @@ fn read_sleb(code: &[u8], ip: &mut usize) -> Result<i64, String> {
             }
             return Ok(result);
         }
+        if shift >= 64 {
+            return Err("wasm: LEB128 overflow".into());
+        }
     }
 }
 
@@ -400,7 +415,7 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
         // no immediates
         0x00 | 0x01 | 0x0f | 0x1a | 0x1b => Ok(()),
         // single LEB immediate (branch depth, call, local/global idx, ref.func)
-        0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0xd2 => {
+        0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 | 0xd2 => {
             read_uleb(code, ip)?;
             Ok(())
         }
@@ -416,6 +431,12 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
             // call_indirect: type idx + table idx
             read_uleb(code, ip)?;
             read_uleb(code, ip)?;
+            Ok(())
+        }
+        0x1c => {
+            // typed select: vec of value types
+            let n = read_uleb(code, ip)? as usize;
+            *ip = ip.checked_add(n).ok_or("wasm: truncated select")?;
             Ok(())
         }
         0xd0 => {
@@ -464,6 +485,13 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
                 11 => {
                     *ip += 1;
                 } // memory.fill: mem
+                12 | 14 => {
+                    read_uleb(code, ip)?;
+                    read_uleb(code, ip)?;
+                } // table.init: elemidx, table; table.copy: two tables
+                13 | 15..=17 => {
+                    read_uleb(code, ip)?;
+                } // elem.drop, table.grow/size/fill
                 _ => {} // trunc_sat variants: no immediate
             }
             Ok(())
@@ -477,15 +505,15 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
 
 macro_rules! binop {
     ($stack:expr, $t:ident, $variant:ident, $f:expr) => {{
-        let b = $stack.pop().unwrap().$t();
-        let a = $stack.pop().unwrap().$t();
+        let b = pop($stack)?.$t();
+        let a = pop($stack)?.$t();
         $stack.push(Val::$variant($f(a, b)));
     }};
 }
 macro_rules! cmpop {
     ($stack:expr, $t:ident, $f:expr) => {{
-        let b = $stack.pop().unwrap().$t();
-        let a = $stack.pop().unwrap().$t();
+        let b = pop($stack)?.$t();
+        let a = pop($stack)?.$t();
         $stack.push(Val::I32(if $f(a, b) { 1 } else { 0 }));
     }};
 }
@@ -512,7 +540,7 @@ impl Store {
         }
         if let Some(FuncEntity::Wasm { instance, .. }) = self.funcs.get(func_addr) {
             let instance = *instance;
-            if let Some(r) = super::native::invoke(self, instance, func_addr, &args, host) {
+            if let Some(r) = super::native::invoke(self, instance, func_addr, &args, host, depth) {
                 return r;
             }
         }
@@ -533,9 +561,13 @@ impl Store {
                 }
                 return Ok(r);
             }
-            FuncEntity::Wasm { compiled, instance } => {
-                (compiled.clone(), self.instances[*instance].clone())
-            }
+            FuncEntity::Wasm { compiled, instance } => (
+                compiled.clone(),
+                self.instances
+                    .get(*instance)
+                    .ok_or("wasm: function of an uninstantiated module")?
+                    .clone(),
+            ),
         };
         let mem_addr = inst.mem_addrs.first().copied();
 
@@ -549,8 +581,11 @@ impl Store {
         let code = &compiled.code;
         // The function body has its own implicit return label.
         let mut ctrl = vec![Ctrl {
-            is_loop: false, end_ip: code.len(), start_ip: 0,
-            stack_height: 0, arity: compiled.ty.results.len(),
+            is_loop: false,
+            end_ip: code.len(),
+            start_ip: 0,
+            stack_height: 0,
+            arity: compiled.ty.results.len(),
         }];
         let labels = &compiled.labels;
         let mut ip = 0;
@@ -568,9 +603,9 @@ impl Store {
                 0x02 | 0x03 | 0x04 => {
                     // block / loop / if
                     let (params, results) = block_arity(&inst.module, code, &mut ip)?;
-                    let label = labels[&op_start];
+                    let label = *labels.get(&op_start).ok_or("wasm: unscanned block")?;
                     if op == 0x04 {
-                        let cond = stack.pop().unwrap().i32();
+                        let cond = pop(&mut stack)?.i32();
                         if cond == 0 {
                             // jump to else (if any) or past end
                             match label.else_ip {
@@ -608,19 +643,20 @@ impl Store {
                 }
                 0x0d => {
                     let l = read_uleb(code, &mut ip)? as usize;
-                    let cond = stack.pop().unwrap().i32();
+                    let cond = pop(&mut stack)?.i32();
                     if cond != 0 {
                         do_branch(&mut ctrl, &mut stack, &mut ip, l)?;
                     }
                 }
                 0x0e => {
                     let n = read_uleb(code, &mut ip)?;
-                    let mut targets = Vec::with_capacity(n as usize);
+                    let mut targets =
+                        Vec::with_capacity((n as usize).min(code.len().saturating_sub(ip)));
                     for _ in 0..n {
                         targets.push(read_uleb(code, &mut ip)? as usize);
                     }
                     let default = read_uleb(code, &mut ip)? as usize;
-                    let idx = stack.pop().unwrap().i32();
+                    let idx = pop(&mut stack)?.i32();
                     let l = if (idx as usize) < targets.len() {
                         targets[idx as usize]
                     } else {
@@ -635,7 +671,7 @@ impl Store {
                 0x10 => {
                     let f = read_uleb(code, &mut ip)? as usize;
                     let addr = *inst.func_addrs.get(f).ok_or("wasm: bad function index")?;
-                    let ty = self.funcs[addr].ty();
+                    let ty = self.funcs.get(addr).ok_or("wasm: bad function index")?.ty();
                     let mut args = Vec::with_capacity(ty.params.len());
                     for _ in 0..ty.params.len() {
                         args.push(stack.pop().ok_or("wasm: stack underflow on call")?);
@@ -647,7 +683,7 @@ impl Store {
                 0x11 => {
                     let type_idx = read_uleb(code, &mut ip)? as usize;
                     let table_idx = read_uleb(code, &mut ip)? as usize;
-                    let elem = stack.pop().unwrap().i32();
+                    let elem = pop(&mut stack)?.i32();
                     let table_addr = *inst
                         .table_addrs
                         .get(table_idx)
@@ -665,7 +701,11 @@ impl Store {
                         .types
                         .get(type_idx)
                         .ok_or("wasm: bad type index")?;
-                    let actual = self.funcs[addr].ty();
+                    let actual = self
+                        .funcs
+                        .get(addr)
+                        .ok_or("wasm: undefined element (indirect call)")?
+                        .ty();
                     if !same_type(expected, &actual) {
                         return Err("wasm: indirect call type mismatch".into());
                     }
@@ -680,11 +720,14 @@ impl Store {
                 0x1a => {
                     stack.pop();
                 } // drop
-                0x1b => {
-                    // select
-                    let c = stack.pop().unwrap().i32();
-                    let b = stack.pop().unwrap();
-                    let a = stack.pop().unwrap();
+                0x1b | 0x1c => {
+                    // select / typed select
+                    if op == 0x1c {
+                        skip_immediates(code, op, &mut ip)?;
+                    }
+                    let c = pop(&mut stack)?.i32();
+                    let b = pop(&mut stack)?;
+                    let a = pop(&mut stack)?;
                     stack.push(if c != 0 { a } else { b });
                 }
                 0x20 => {
@@ -725,20 +768,16 @@ impl Store {
                 0x40 => {
                     ip += 1;
                     let ma = mem_addr.ok_or("wasm: no memory")?;
-                    let delta = stack.pop().unwrap().i32();
+                    let delta = pop(&mut stack)?.i32();
                     stack.push(Val::I32(self.mem_grow(ma, delta)));
                 }
                 0x41 => stack.push(Val::I32(read_sleb(code, &mut ip)? as i32)),
                 0x42 => stack.push(Val::I64(read_sleb(code, &mut ip)?)),
                 0x43 => {
-                    let bytes: [u8; 4] = code[ip..ip + 4].try_into().unwrap();
-                    ip += 4;
-                    stack.push(Val::F32(f32::from_le_bytes(bytes)));
+                    stack.push(Val::F32(f32::from_le_bytes(imm(code, &mut ip)?)));
                 }
                 0x44 => {
-                    let bytes: [u8; 8] = code[ip..ip + 8].try_into().unwrap();
-                    ip += 8;
-                    stack.push(Val::F64(f64::from_le_bytes(bytes)));
+                    stack.push(Val::F64(f64::from_le_bytes(imm(code, &mut ip)?)));
                 }
                 0xfc => {
                     self.op_fc(mem_addr, code, &mut ip, &mut stack)?;
@@ -749,28 +788,45 @@ impl Store {
 
         // Return the top `results` values.
         let nres = compiled.ty.results.len();
-        let start = stack.len().checked_sub(nres).ok_or("wasm: stack underflow on return")?;
+        let start = stack
+            .len()
+            .checked_sub(nres)
+            .ok_or("wasm: stack underflow on return")?;
         Ok(stack.split_off(start))
     }
 
     /// Grow the memory at store address `mem_addr` by `delta` pages; returns the previous page
     /// count, or -1 on failure.
     pub fn mem_grow(&mut self, mem_addr: usize, delta: i32) -> i32 {
-        self.memories[mem_addr].grow(delta)
+        self.memories
+            .get_mut(mem_addr)
+            .map_or(-1, |m| m.grow(delta))
     }
 
-    pub fn alloc_memory(&mut self, min_pages: usize, max: Option<u32>) -> usize {
-        let bytes = LinearMem::new(min_pages * PAGE_SIZE, max)
-            .unwrap_or_else(|e| panic!("{e}"));
+    /// Allocate a memory of `min_pages` pages; `Err` when the limits are invalid or the memory
+    /// cannot be reserved (a JS `RangeError`).
+    pub fn alloc_memory(&mut self, min_pages: usize, max: Option<u32>) -> Result<usize, String> {
+        let limit = MAX_MEMORY_PAGES as usize;
+        if min_pages > limit || max.is_some_and(|m| m as usize > limit || (m as usize) < min_pages)
+        {
+            return Err("wasm: invalid memory size".into());
+        }
+        let bytes = LinearMem::new(min_pages * PAGE_SIZE, max)?;
         self.memories.push(MemEntity { bytes, max });
-        self.memories.len() - 1
+        Ok(self.memories.len() - 1)
     }
-    pub fn alloc_table(&mut self, min: usize, max: Option<u32>) -> usize {
-        self.tables.push(TableEntity {
-            elems: vec![None; min],
-            max,
-        });
-        self.tables.len() - 1
+    /// Allocate a table of `min` null elements; `Err` when the limits are invalid or too large.
+    pub fn alloc_table(&mut self, min: usize, max: Option<u32>) -> Result<usize, String> {
+        if min > MAX_TABLE_SIZE as usize || max.is_some_and(|m| (m as usize) < min) {
+            return Err("wasm: invalid table size".into());
+        }
+        let mut elems = Vec::new();
+        elems
+            .try_reserve_exact(min)
+            .map_err(|_| "wasm: cannot allocate table")?;
+        elems.resize(min, None);
+        self.tables.push(TableEntity { elems, max });
+        Ok(self.tables.len() - 1)
     }
     pub fn alloc_global(&mut self, val: Val, mutable: bool) -> usize {
         self.globals.push(GlobalEntity::new(val, mutable));
@@ -798,21 +854,37 @@ impl Store {
                     func_addrs.push(self.funcs.len() - 1);
                 }
                 crate::wasm::ImportKind::Table(_) => {
-                    table_addrs.push(imports.table_addr.ok_or("wasm: missing table import")?);
+                    let a = imports.table_addr.ok_or("wasm: missing table import")?;
+                    if a >= self.tables.len() {
+                        return Err("wasm: bad table import".into());
+                    }
+                    table_addrs.push(a);
                 }
                 crate::wasm::ImportKind::Memory(_) => {
-                    mem_addrs.push(imports.mem_addr.ok_or("wasm: missing memory import")?);
+                    let a = imports.mem_addr.ok_or("wasm: missing memory import")?;
+                    if a >= self.memories.len() {
+                        return Err("wasm: bad memory import".into());
+                    }
+                    mem_addrs.push(a);
                 }
                 crate::wasm::ImportKind::Global(_) => {
-                    global_addrs.push(imp_globals.next().ok_or("wasm: missing global import")?);
+                    let a = imp_globals.next().ok_or("wasm: missing global import")?;
+                    if a >= self.globals.len() {
+                        return Err("wasm: bad global import".into());
+                    }
+                    global_addrs.push(a);
                 }
             }
         }
 
         // Defined functions.
         for (i, &type_idx) in module.func_types.iter().enumerate() {
-            let ty = module.types[type_idx as usize].clone();
-            let body = &module.code[i];
+            let ty = module
+                .types
+                .get(type_idx as usize)
+                .ok_or("wasm: bad type index")?
+                .clone();
+            let body = module.code.get(i).ok_or("wasm: missing function body")?;
             let labels = scan_labels(&body.code)?;
             self.funcs.push(FuncEntity::Wasm {
                 compiled: Rc::new(Compiled {
@@ -827,16 +899,19 @@ impl Store {
         }
         // Defined memory (single, MVP) and tables.
         if let Some(l) = module.memories.first() {
-            let a = self.alloc_memory(l.min as usize, l.max);
+            let a = self.alloc_memory(l.min as usize, l.max)?;
             mem_addrs.push(a);
         }
         for t in &module.tables {
-            let a = self.alloc_table(t.limits.min as usize, t.limits.max);
+            let a = self.alloc_table(t.limits.min as usize, t.limits.max)?;
             table_addrs.push(a);
         }
         // Defined globals: each init expr sees the globals resolved so far (by value).
         for g in &module.globals {
-            let seen: Vec<Val> = global_addrs.iter().map(|&a| self.globals[a].get()).collect();
+            let seen: Vec<Val> = global_addrs
+                .iter()
+                .map(|&a| self.globals[a].get())
+                .collect();
             let v = eval_const_expr(&g.init, &seen)?;
             let a = self.alloc_global(v, g.ty.mutable);
             global_addrs.push(a);
@@ -858,13 +933,15 @@ impl Store {
 
         // Active element segments: local function indices → store func addresses.
         for seg in &module.elems {
-            let offset = eval_const_expr(&seg.offset, &seen_globals)?.i32() as usize;
+            let offset = eval_const_expr(&seg.offset, &seen_globals)?.i32() as u32 as usize;
             let table_addr = *inst
                 .table_addrs
                 .get(seg.table as usize)
                 .ok_or("wasm: element segment references missing table")?;
             for (k, &f) in seg.func_indices.iter().enumerate() {
-                let slot = offset + k;
+                let slot = offset
+                    .checked_add(k)
+                    .ok_or("wasm: element segment out of table bounds")?;
                 let faddr = *inst
                     .func_addrs
                     .get(f as usize)
@@ -929,7 +1006,7 @@ impl Store {
         let addr = base
             .checked_add(offset)
             .ok_or("wasm: memory address overflow")?;
-        if addr + size > mem_len {
+        if addr.checked_add(size).is_none_or(|end| end > mem_len) {
             return Err("wasm: out of bounds memory access".into());
         }
         Ok(addr)
@@ -1019,45 +1096,46 @@ impl Store {
         match sub {
             // saturating truncation
             0 => {
-                let v = stack.pop().unwrap().f32();
+                let v = pop(stack)?.f32();
                 stack.push(Val::I32(sat_i32(v as f64)));
             }
             1 => {
-                let v = stack.pop().unwrap().f32();
+                let v = pop(stack)?.f32();
                 stack.push(Val::I32(sat_u32(v as f64) as i32));
             }
             2 => {
-                let v = stack.pop().unwrap().f64();
+                let v = pop(stack)?.f64();
                 stack.push(Val::I32(sat_i32(v)));
             }
             3 => {
-                let v = stack.pop().unwrap().f64();
+                let v = pop(stack)?.f64();
                 stack.push(Val::I32(sat_u32(v) as i32));
             }
             4 => {
-                let v = stack.pop().unwrap().f32();
+                let v = pop(stack)?.f32();
                 stack.push(Val::I64(sat_i64(v as f64)));
             }
             5 => {
-                let v = stack.pop().unwrap().f32();
+                let v = pop(stack)?.f32();
                 stack.push(Val::I64(sat_u64(v as f64) as i64));
             }
             6 => {
-                let v = stack.pop().unwrap().f64();
+                let v = pop(stack)?.f64();
                 stack.push(Val::I64(sat_i64(v)));
             }
             7 => {
-                let v = stack.pop().unwrap().f64();
+                let v = pop(stack)?.f64();
                 stack.push(Val::I64(sat_u64(v) as i64));
             }
             10 => {
                 // memory.copy
                 *ip += 2;
                 let mem = &mut self.memories[mem_addr.ok_or("wasm: no memory")?].bytes;
-                let n = stack.pop().unwrap().i32() as usize;
-                let src = stack.pop().unwrap().i32() as u32 as usize;
-                let dst = stack.pop().unwrap().i32() as u32 as usize;
-                if src + n > mem.len() || dst + n > mem.len() {
+                let n = pop(stack)?.i32() as u32 as usize;
+                let src = pop(stack)?.i32() as u32 as usize;
+                let dst = pop(stack)?.i32() as u32 as usize;
+                let in_bounds = |a: usize| a.checked_add(n).is_some_and(|end| end <= mem.len());
+                if !in_bounds(src) || !in_bounds(dst) {
                     return Err("wasm: out of bounds memory.copy".into());
                 }
                 mem.copy_within(src..src + n, dst);
@@ -1066,10 +1144,10 @@ impl Store {
                 // memory.fill
                 *ip += 1;
                 let mem = &mut self.memories[mem_addr.ok_or("wasm: no memory")?].bytes;
-                let n = stack.pop().unwrap().i32() as usize;
-                let val = stack.pop().unwrap().i32() as u8;
-                let dst = stack.pop().unwrap().i32() as u32 as usize;
-                if dst + n > mem.len() {
+                let n = pop(stack)?.i32() as u32 as usize;
+                let val = pop(stack)?.i32() as u8;
+                let dst = pop(stack)?.i32() as u32 as usize;
+                if dst.checked_add(n).is_none_or(|end| end > mem.len()) {
                     return Err("wasm: out of bounds memory.fill".into());
                 }
                 for b in &mut mem[dst..dst + n] {
@@ -1101,7 +1179,10 @@ fn do_branch(
         ctrl[target_idx].end_ip
     };
     // Keep the top `arity` values, drop the rest down to the label's base height.
-    let start = stack.len().checked_sub(arity).ok_or("wasm: stack underflow on branch")?;
+    let start = stack
+        .len()
+        .checked_sub(arity)
+        .ok_or("wasm: stack underflow on branch")?;
     if start < height {
         return Err("wasm: stack underflow on branch".into());
     }
@@ -1116,7 +1197,7 @@ fn do_branch(
 
 /// Parse a block's type immediate and return (param_count, result_count).
 fn block_arity(module: &Module, code: &[u8], ip: &mut usize) -> Result<(usize, usize), String> {
-    let b = code[*ip];
+    let b = *code.get(*ip).ok_or("wasm: truncated blocktype")?;
     if b == 0x40 {
         *ip += 1;
         Ok((0, 0))
@@ -1180,7 +1261,7 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
     match op {
         // i32 comparisons
         0x45 => {
-            let a = stack.pop().unwrap().i32();
+            let a = pop(stack)?.i32();
             stack.push(Val::I32((a == 0) as i32));
         }
         0x46 => cmpop!(stack, i32, |a, b| a == b),
@@ -1195,7 +1276,7 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0x4f => cmpop!(stack, i32, |a: i32, b: i32| (a as u32) >= (b as u32)),
         // i64 comparisons
         0x50 => {
-            let a = stack.pop().unwrap().i64();
+            let a = pop(stack)?.i64();
             stack.push(Val::I32((a == 0) as i32));
         }
         0x51 => cmpop!(stack, i64, |a, b| a == b),
@@ -1223,9 +1304,9 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0x65 => cmpop!(stack, f64, |a, b| a <= b),
         0x66 => cmpop!(stack, f64, |a, b| a >= b),
         // i32 arithmetic
-        0x67 => un(stack, |a: i32| a.leading_zeros() as i32),
-        0x68 => un(stack, |a: i32| a.trailing_zeros() as i32),
-        0x69 => un(stack, |a: i32| a.count_ones() as i32),
+        0x67 => un(stack, |a: i32| a.leading_zeros() as i32)?,
+        0x68 => un(stack, |a: i32| a.trailing_zeros() as i32)?,
+        0x69 => un(stack, |a: i32| a.count_ones() as i32)?,
         0x6a => binop!(stack, i32, I32, |a: i32, b: i32| a.wrapping_add(b)),
         0x6b => binop!(stack, i32, I32, |a: i32, b: i32| a.wrapping_sub(b)),
         0x6c => binop!(stack, i32, I32, |a: i32, b: i32| a.wrapping_mul(b)),
@@ -1247,9 +1328,9 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0x77 => binop!(stack, i32, I32, |a: i32, b: i32| a.rotate_left(b as u32)),
         0x78 => binop!(stack, i32, I32, |a: i32, b: i32| a.rotate_right(b as u32)),
         // i64 arithmetic
-        0x79 => un64(stack, |a: i64| a.leading_zeros() as i64),
-        0x7a => un64(stack, |a: i64| a.trailing_zeros() as i64),
-        0x7b => un64(stack, |a: i64| a.count_ones() as i64),
+        0x79 => un64(stack, |a: i64| a.leading_zeros() as i64)?,
+        0x7a => un64(stack, |a: i64| a.trailing_zeros() as i64)?,
+        0x7b => un64(stack, |a: i64| a.count_ones() as i64)?,
         0x7c => binop!(stack, i64, I64, |a: i64, b: i64| a.wrapping_add(b)),
         0x7d => binop!(stack, i64, I64, |a: i64, b: i64| a.wrapping_sub(b)),
         0x7e => binop!(stack, i64, I64, |a: i64, b: i64| a.wrapping_mul(b)),
@@ -1271,13 +1352,13 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0x89 => binop!(stack, i64, I64, |a: i64, b: i64| a.rotate_left(b as u32)),
         0x8a => binop!(stack, i64, I64, |a: i64, b: i64| a.rotate_right(b as u32)),
         // f32 arithmetic
-        0x8b => unf32(stack, |a: f32| a.abs()),
-        0x8c => unf32(stack, |a: f32| -a),
-        0x8d => unf32(stack, |a: f32| a.ceil()),
-        0x8e => unf32(stack, |a: f32| a.floor()),
-        0x8f => unf32(stack, |a: f32| a.trunc()),
-        0x90 => unf32(stack, round_ties_even_f32),
-        0x91 => unf32(stack, |a: f32| a.sqrt()),
+        0x8b => unf32(stack, |a: f32| a.abs())?,
+        0x8c => unf32(stack, |a: f32| -a)?,
+        0x8d => unf32(stack, |a: f32| a.ceil())?,
+        0x8e => unf32(stack, |a: f32| a.floor())?,
+        0x8f => unf32(stack, |a: f32| a.trunc())?,
+        0x90 => unf32(stack, round_ties_even_f32)?,
+        0x91 => unf32(stack, |a: f32| a.sqrt())?,
         0x92 => binop!(stack, f32, F32, |a: f32, b: f32| a + b),
         0x93 => binop!(stack, f32, F32, |a: f32, b: f32| a - b),
         0x94 => binop!(stack, f32, F32, |a: f32, b: f32| a * b),
@@ -1286,13 +1367,13 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0x97 => binop!(stack, f32, F32, wasm_max_f32),
         0x98 => binop!(stack, f32, F32, |a: f32, b: f32| a.copysign(b)),
         // f64 arithmetic
-        0x99 => unf64(stack, |a: f64| a.abs()),
-        0x9a => unf64(stack, |a: f64| -a),
-        0x9b => unf64(stack, |a: f64| a.ceil()),
-        0x9c => unf64(stack, |a: f64| a.floor()),
-        0x9d => unf64(stack, |a: f64| a.trunc()),
-        0x9e => unf64(stack, round_ties_even_f64),
-        0x9f => unf64(stack, |a: f64| a.sqrt()),
+        0x99 => unf64(stack, |a: f64| a.abs())?,
+        0x9a => unf64(stack, |a: f64| -a)?,
+        0x9b => unf64(stack, |a: f64| a.ceil())?,
+        0x9c => unf64(stack, |a: f64| a.floor())?,
+        0x9d => unf64(stack, |a: f64| a.trunc())?,
+        0x9e => unf64(stack, round_ties_even_f64)?,
+        0x9f => unf64(stack, |a: f64| a.sqrt())?,
         0xa0 => binop!(stack, f64, F64, |a: f64, b: f64| a + b),
         0xa1 => binop!(stack, f64, F64, |a: f64, b: f64| a - b),
         0xa2 => binop!(stack, f64, F64, |a: f64, b: f64| a * b),
@@ -1301,57 +1382,71 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0xa5 => binop!(stack, f64, F64, wasm_max_f64),
         0xa6 => binop!(stack, f64, F64, |a: f64, b: f64| a.copysign(b)),
         // conversions
-        0xa7 => conv(stack, |v: Val| Val::I32(v.i64() as i32)), // i32.wrap_i64
+        0xa7 => conv(stack, |v: Val| Val::I32(v.i64() as i32))?, // i32.wrap_i64
         0xa8 => trunc(stack, |v| v.f32() as f64, I32S, |x| Val::I32(x as i32))?, // i32.trunc_f32_s
-        0xa9 => trunc(stack, |v| v.f32() as f64, I32U, |x| Val::I32(x as u32 as i32))?,
+        0xa9 => trunc(
+            stack,
+            |v| v.f32() as f64,
+            I32U,
+            |x| Val::I32(x as u32 as i32),
+        )?,
         0xaa => trunc(stack, |v| v.f64(), I32S, |x| Val::I32(x as i32))?,
         0xab => trunc(stack, |v| v.f64(), I32U, |x| Val::I32(x as u32 as i32))?,
-        0xac => conv(stack, |v: Val| Val::I64(v.i32() as i64)), // i64.extend_i32_s
-        0xad => conv(stack, |v: Val| Val::I64(v.i32() as u32 as i64)), // i64.extend_i32_u
+        0xac => conv(stack, |v: Val| Val::I64(v.i32() as i64))?, // i64.extend_i32_s
+        0xad => conv(stack, |v: Val| Val::I64(v.i32() as u32 as i64))?, // i64.extend_i32_u
         0xae => trunc(stack, |v| v.f32() as f64, I64S, |x| Val::I64(x as i64))?,
-        0xaf => trunc(stack, |v| v.f32() as f64, I64U, |x| Val::I64(x as u64 as i64))?,
+        0xaf => trunc(
+            stack,
+            |v| v.f32() as f64,
+            I64U,
+            |x| Val::I64(x as u64 as i64),
+        )?,
         0xb0 => trunc(stack, |v| v.f64(), I64S, |x| Val::I64(x as i64))?,
         0xb1 => trunc(stack, |v| v.f64(), I64U, |x| Val::I64(x as u64 as i64))?,
-        0xb2 => conv(stack, |v: Val| Val::F32(v.i32() as f32)),
-        0xb3 => conv(stack, |v: Val| Val::F32(v.i32() as u32 as f32)),
-        0xb4 => conv(stack, |v: Val| Val::F32(v.i64() as f32)),
-        0xb5 => conv(stack, |v: Val| Val::F32(v.i64() as u64 as f32)),
-        0xb6 => conv(stack, |v: Val| Val::F32(v.f64() as f32)),
-        0xb7 => conv(stack, |v: Val| Val::F64(v.i32() as f64)),
-        0xb8 => conv(stack, |v: Val| Val::F64(v.i32() as u32 as f64)),
-        0xb9 => conv(stack, |v: Val| Val::F64(v.i64() as f64)),
-        0xba => conv(stack, |v: Val| Val::F64(v.i64() as u64 as f64)),
-        0xbb => conv(stack, |v: Val| Val::F64(v.f32() as f64)),
-        0xbc => conv(stack, |v: Val| Val::I32(v.f32().to_bits() as i32)),
-        0xbd => conv(stack, |v: Val| Val::I64(v.f64().to_bits() as i64)),
-        0xbe => conv(stack, |v: Val| Val::F32(f32::from_bits(v.i32() as u32))),
-        0xbf => conv(stack, |v: Val| Val::F64(f64::from_bits(v.i64() as u64))),
+        0xb2 => conv(stack, |v: Val| Val::F32(v.i32() as f32))?,
+        0xb3 => conv(stack, |v: Val| Val::F32(v.i32() as u32 as f32))?,
+        0xb4 => conv(stack, |v: Val| Val::F32(v.i64() as f32))?,
+        0xb5 => conv(stack, |v: Val| Val::F32(v.i64() as u64 as f32))?,
+        0xb6 => conv(stack, |v: Val| Val::F32(v.f64() as f32))?,
+        0xb7 => conv(stack, |v: Val| Val::F64(v.i32() as f64))?,
+        0xb8 => conv(stack, |v: Val| Val::F64(v.i32() as u32 as f64))?,
+        0xb9 => conv(stack, |v: Val| Val::F64(v.i64() as f64))?,
+        0xba => conv(stack, |v: Val| Val::F64(v.i64() as u64 as f64))?,
+        0xbb => conv(stack, |v: Val| Val::F64(v.f32() as f64))?,
+        0xbc => conv(stack, |v: Val| Val::I32(v.f32().to_bits() as i32))?,
+        0xbd => conv(stack, |v: Val| Val::I64(v.f64().to_bits() as i64))?,
+        0xbe => conv(stack, |v: Val| Val::F32(f32::from_bits(v.i32() as u32)))?,
+        0xbf => conv(stack, |v: Val| Val::F64(f64::from_bits(v.i64() as u64)))?,
         // sign extension
-        0xc0 => conv(stack, |v: Val| Val::I32(v.i32() as i8 as i32)),
-        0xc1 => conv(stack, |v: Val| Val::I32(v.i32() as i16 as i32)),
-        0xc2 => conv(stack, |v: Val| Val::I64(v.i64() as i8 as i64)),
-        0xc3 => conv(stack, |v: Val| Val::I64(v.i64() as i16 as i64)),
-        0xc4 => conv(stack, |v: Val| Val::I64(v.i64() as i32 as i64)),
+        0xc0 => conv(stack, |v: Val| Val::I32(v.i32() as i8 as i32))?,
+        0xc1 => conv(stack, |v: Val| Val::I32(v.i32() as i16 as i32))?,
+        0xc2 => conv(stack, |v: Val| Val::I64(v.i64() as i8 as i64))?,
+        0xc3 => conv(stack, |v: Val| Val::I64(v.i64() as i16 as i64))?,
+        0xc4 => conv(stack, |v: Val| Val::I64(v.i64() as i32 as i64))?,
         other => return Err(format!("wasm: unsupported opcode 0x{other:x}")),
     }
     Ok(())
 }
 
-fn un(stack: &mut Vec<Val>, f: impl Fn(i32) -> i32) {
-    let a = stack.pop().unwrap().i32();
+fn un(stack: &mut Vec<Val>, f: impl Fn(i32) -> i32) -> Result<(), String> {
+    let a = pop(stack)?.i32();
     stack.push(Val::I32(f(a)));
+    Ok(())
 }
-fn un64(stack: &mut Vec<Val>, f: impl Fn(i64) -> i64) {
-    let a = stack.pop().unwrap().i64();
+fn un64(stack: &mut Vec<Val>, f: impl Fn(i64) -> i64) -> Result<(), String> {
+    let a = pop(stack)?.i64();
     stack.push(Val::I64(f(a)));
+    Ok(())
 }
-fn unf32(stack: &mut Vec<Val>, f: impl Fn(f32) -> f32) {
-    let a = stack.pop().unwrap().f32();
+fn unf32(stack: &mut Vec<Val>, f: impl Fn(f32) -> f32) -> Result<(), String> {
+    let a = pop(stack)?.f32();
     stack.push(Val::F32(f(a)));
+    Ok(())
 }
-fn unf64(stack: &mut Vec<Val>, f: impl Fn(f64) -> f64) {
-    let a = stack.pop().unwrap().f64();
+fn unf64(stack: &mut Vec<Val>, f: impl Fn(f64) -> f64) -> Result<(), String> {
+    let a = pop(stack)?.f64();
     stack.push(Val::F64(f(a)));
+    Ok(())
 }
 // Exclusive bounds for trapping float -> int truncation: valid iff lo < x < hi. f32 inputs are
 // promoted to f64 first, which is exact, so one table serves both widths.
@@ -1366,7 +1461,7 @@ fn trunc(
     (lo, hi): (f64, f64),
     make: impl Fn(f64) -> Val,
 ) -> Result<(), String> {
-    let x = get(stack.pop().unwrap());
+    let x = get(pop(stack)?);
     if x.is_nan() {
         return Err("wasm: invalid conversion to integer".into());
     }
@@ -1377,9 +1472,16 @@ fn trunc(
     Ok(())
 }
 
-fn conv(stack: &mut Vec<Val>, f: impl Fn(Val) -> Val) {
-    let a = stack.pop().unwrap();
+fn conv(stack: &mut Vec<Val>, f: impl Fn(Val) -> Val) -> Result<(), String> {
+    let a = pop(stack)?;
     stack.push(f(a));
+    Ok(())
+}
+
+fn pop(stack: &mut Vec<Val>) -> Result<Val, String> {
+    stack
+        .pop()
+        .ok_or_else(|| "wasm: operand stack underflow".into())
 }
 
 // WebAssembly min/max: NaN propagates and -0 orders below +0 (Rust's `min`/`max` ignore NaN
@@ -1390,7 +1492,11 @@ macro_rules! wasm_minmax {
             if a.is_nan() || b.is_nan() {
                 <$t>::NAN
             } else if a == b {
-                if $min == a.is_sign_negative() { a } else { b }
+                if $min == a.is_sign_negative() {
+                    a
+                } else {
+                    b
+                }
             } else if (a < b) == $min {
                 a
             } else {
@@ -1413,8 +1519,8 @@ fn round_ties_even_f64(a: f64) -> f64 {
 }
 
 fn idiv_i32(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {
-    let b = stack.pop().unwrap().i32();
-    let a = stack.pop().unwrap().i32();
+    let b = pop(stack)?.i32();
+    let a = pop(stack)?.i32();
     if b == 0 {
         return Err("wasm: integer divide by zero".into());
     }
@@ -1430,8 +1536,8 @@ fn idiv_i32(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {
     Ok(())
 }
 fn irem_i32(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {
-    let b = stack.pop().unwrap().i32();
-    let a = stack.pop().unwrap().i32();
+    let b = pop(stack)?.i32();
+    let a = pop(stack)?.i32();
     if b == 0 {
         return Err("wasm: integer divide by zero".into());
     }
@@ -1444,8 +1550,8 @@ fn irem_i32(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {
     Ok(())
 }
 fn idiv_i64(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {
-    let b = stack.pop().unwrap().i64();
-    let a = stack.pop().unwrap().i64();
+    let b = pop(stack)?.i64();
+    let a = pop(stack)?.i64();
     if b == 0 {
         return Err("wasm: integer divide by zero".into());
     }
@@ -1461,8 +1567,8 @@ fn idiv_i64(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {
     Ok(())
 }
 fn irem_i64(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {
-    let b = stack.pop().unwrap().i64();
-    let a = stack.pop().unwrap().i64();
+    let b = pop(stack)?.i64();
+    let a = pop(stack)?.i64();
     if b == 0 {
         return Err("wasm: integer divide by zero".into());
     }
@@ -1487,12 +1593,10 @@ pub fn eval_const_expr(code: &[u8], globals: &[Val]) -> Result<Val, String> {
             0x41 => result = Val::I32(read_sleb(code, &mut ip)? as i32),
             0x42 => result = Val::I64(read_sleb(code, &mut ip)?),
             0x43 => {
-                result = Val::F32(f32::from_le_bytes(code[ip..ip + 4].try_into().unwrap()));
-                ip += 4;
+                result = Val::F32(f32::from_le_bytes(imm(code, &mut ip)?));
             }
             0x44 => {
-                result = Val::F64(f64::from_le_bytes(code[ip..ip + 8].try_into().unwrap()));
-                ip += 8;
+                result = Val::F64(f64::from_le_bytes(imm(code, &mut ip)?));
             }
             0x23 => {
                 let g = read_uleb(code, &mut ip)? as usize;
@@ -1514,15 +1618,30 @@ pub fn eval_const_expr(code: &[u8], globals: &[Val]) -> Result<Val, String> {
     Ok(result)
 }
 
+#[cfg(test)]
+#[path = "exec_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 mod branch_stack_tests {
     use super::*;
     #[test]
     fn malformed_branch_stack_returns_a_trap_without_a_split_index_panic() {
-        let mut control = vec![Ctrl {is_loop:false,end_ip:9,start_ip:0,stack_height:0,arity:1}];
+        let mut control = vec![Ctrl {
+            is_loop: false,
+            end_ip: 9,
+            start_ip: 0,
+            stack_height: 0,
+            arity: 1,
+        }];
         assert!(do_branch(&mut control, &mut vec![], &mut 0, 0).is_err());
-        let mut control = vec![Ctrl {is_loop:false,end_ip:9,start_ip:0,stack_height:2,arity:1}];
+        let mut control = vec![Ctrl {
+            is_loop: false,
+            end_ip: 9,
+            start_ip: 0,
+            stack_height: 2,
+            arity: 1,
+        }];
         assert!(do_branch(&mut control, &mut vec![Val::I32(1)], &mut 0, 0).is_err());
     }
 }

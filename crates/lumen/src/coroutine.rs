@@ -218,6 +218,7 @@ impl ThreadCoro {
         let s = loop {
             match self.suspend_rx.recv() {
                 Ok(WorkerMessage::DriverCall(call)) => {
+                    i.depth_limit = 0;
                     // A nested coroutine may have another coroutine as its driver. Forward
                     // until the realm's owning native thread executes the call.
                     let reply = match driver_call(i, call) {
@@ -235,6 +236,8 @@ impl ThreadCoro {
         i.cur_coro = saved_coro;
         i.strict = saved_strict;
         i.depth = saved_depth;
+        // Back on this thread's stack: re-derive the JIT's recursion ceiling from it.
+        i.depth_limit = 0;
         i.tco_ok = saved_tco;
         i.native_top = saved_natives;
         match s {
@@ -285,6 +288,7 @@ fn park_message(i: &mut Interp, msg: WorkerMessage) -> Resume {
         Ok(r) => {
             i.strict = gen_strict;
             i.depth = gen_depth;
+            i.depth_limit = 0;
             i.tco_ok = gen_tco;
             i.in_async_gen_body = gen_agb;
             r
@@ -297,6 +301,7 @@ fn park_message(i: &mut Interp, msg: WorkerMessage) -> Resume {
         // park forever, holding only the captured `Rc`s. The detached thread is reaped at process
         // exit (the generator never outlives its `Engine`).
         Err(_) => {
+            #[cfg(not(target_arch = "wasm32"))]
             crate::fastalloc::trim();
             loop {
                 std::thread::park();
@@ -411,8 +416,11 @@ fn get_worker() -> std::io::Result<Sender<Job>> {
     let self_tx = job_tx.clone();
     std::thread::Builder::new()
         // Generous stack: execution recurses up to MAX_EVAL_DEPTH units (see its sizing).
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || worker_loop(job_rx, self_tx))?;
+        .stack_size(crate::THREAD_STACK_SIZE)
+        .spawn(move || {
+            crate::set_thread_stack_size(crate::THREAD_STACK_SIZE);
+            worker_loop(job_rx, self_tx)
+        })?;
     Ok(job_tx)
 }
 
@@ -444,6 +452,7 @@ fn receive_after_quiet_trim<T>(
         Ok(job) => Ok(job),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::sync::mpsc::RecvError),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            #[cfg(not(target_arch = "wasm32"))]
             crate::fastalloc::trim();
             if retire() {
                 Err(std::sync::mpsc::RecvError)

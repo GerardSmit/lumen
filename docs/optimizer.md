@@ -1971,11 +1971,10 @@ start/end coercion, and clamping, truncation and bound swapping remain unchanged
 string is retained through callbacks and GC. Long inputs could already reuse a cached unit
 buffer; avoiding a fresh input conversion is not a universal per-call saving.
 
-The A/B switch `LUMEN_NO_ASCII_SUBSTRING=1` is sampled at realm installation and selects a
-plain function pointer to a const-generic implementation. There is no getenv or captured
-closure dispatch on each call. The prepared candidate's capturing closure was corrected
-because the builtin API accepts NativeFn pointers. Output still allocates/copies an LStr;
-this is not a substring-view representation.
+Since then every UTF-16 position (substring, slice, substr, indexOf, startsWith, charCodeAt,
+`.length`, ...) of a non-ASCII string goes through `str_index::UnitIndex`, a checkpoint every
+64 code units plus the last position looked up, instead of a cached full UTF-16 copy; the
+`LUMEN_NO_ASCII_SUBSTRING` switch is gone.
 
 Validation passes 717 unit/34 integration tests, all 46 targeted substring conformance tests,
 and 1,996 differential-fuzz agreements with four budget skips. Tests require actual ASCII

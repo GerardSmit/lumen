@@ -11,7 +11,7 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
     }
     // The proxy internal methods read a target's property map directly: a split view target
     // becomes an ordinary Array first.
-    crate::split_view::unview_val(&target);
+    i.materialize_val(&target);
     let proto = match &target {
         Value::Obj(o) => o.borrow().proto.clone(),
         _ => None,

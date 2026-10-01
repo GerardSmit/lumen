@@ -232,6 +232,18 @@ pub struct ThreadPool {
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// Spawn a host thread with the engine's thread stack size: work run here may call back into an
+/// engine (or run one), whose recursion is sized for it.
+fn spawn_thread<F: FnOnce() + Send + 'static>(f: F) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(move || {
+            lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
+            f()
+        })
+        .expect("spawn host thread")
+}
+
 impl ThreadPool {
     /// `size` worker threads sending [`TaskCompletion`]s to `completions` (the loop thread
     /// holds the receiving end).
@@ -243,7 +255,7 @@ impl ThreadPool {
             .map(|_| {
                 let work_rx = std::sync::Arc::clone(&work_rx);
                 let completions = completions.clone();
-                std::thread::spawn(move || loop {
+                spawn_thread(move || loop {
                     let task = match work_rx.lock().expect("worker queue poisoned").recv() {
                         Ok(t) => t,
                         Err(_) => return, // pool dropped: no more work
@@ -344,7 +356,7 @@ impl CompletionSender {
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        spawn_thread(move || {
             let result = work();
             let _ = tx.send(TaskCompletion { task: id, result });
         });
@@ -375,7 +387,7 @@ impl lumen::embed::AsyncHost for LoopAsyncHost {
 
     fn spawn(&self, job: Box<dyn FnOnce() + Send>, dedicated: bool) {
         if dedicated {
-            std::thread::spawn(job);
+            spawn_thread(job);
         } else {
             self.spawn.spawn_detached(job);
         }

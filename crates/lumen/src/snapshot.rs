@@ -244,7 +244,7 @@ impl Reader<'_> {
         }
     }
     fn f64(&mut self) -> R<f64> {
-        let end = self.pos + 8;
+        let end = self.pos.checked_add(8).ok_or("snapshot: truncated f64")?;
         let bytes = self
             .buf
             .get(self.pos..end)
@@ -257,7 +257,7 @@ impl Reader<'_> {
     }
     fn str(&mut self) -> R<String> {
         let len = self.uv()? as usize;
-        let end = self.pos + len;
+        let end = self.pos.checked_add(len).ok_or("snapshot: truncated str")?;
         let bytes = self
             .buf
             .get(self.pos..end)
@@ -269,13 +269,25 @@ impl Reader<'_> {
         Ok(Rc::from(self.str()?.as_str()))
     }
     fn u64(&mut self) -> R<u64> {
-        let end = self.pos + 8;
+        let end = self.pos.checked_add(8).ok_or("snapshot: truncated u64")?;
         let bytes = self
             .buf
             .get(self.pos..end)
             .ok_or("snapshot: truncated u64")?;
         self.pos = end;
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+    /// A capacity for `n` decoded elements: each takes at least one byte, so a corrupt count
+    /// cannot reserve more than the rest of the blob.
+    fn cap(&self, n: usize) -> usize {
+        n.min(self.buf.len().saturating_sub(self.pos))
+    }
+    /// Guard for the recursive decoders: a corrupt or hostile blob may nest without bound.
+    fn deeper(&self) -> R<()> {
+        if crate::stack::exhausted() {
+            return Err("snapshot: nesting too deep".into());
+        }
+        Ok(())
     }
     /// A byte range into `src`, checked to lie on char boundaries so a slice can never panic.
     fn range(&mut self) -> R<(u32, u32)> {
@@ -729,11 +741,11 @@ impl SplitUnit {
         let mut r = self.reader(&self.ast[start..stop], params_of);
         let name = dec_opt_str(&mut r)?;
         let np = r.uv()? as usize;
-        let mut params = Vec::with_capacity(np.min(1 << 16));
+        let mut params = Vec::with_capacity(r.cap(np));
         for _ in 0..np {
             params.push(Param {
                 pattern: dec_pattern(&mut r)?,
-                default: dec_opt_expr(&mut r)?,
+                default: dec_opt_expr(&mut r)?.map(Box::new),
                 rest: r.bool()?,
             });
         }
@@ -838,7 +850,7 @@ fn enc_stmts(w: &mut Writer, v: &[Stmt]) {
 }
 fn dec_stmts(r: &mut Reader) -> R<Vec<Stmt>> {
     let n = r.uv()? as usize;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(dec_stmt(r)?);
     }
@@ -853,7 +865,7 @@ fn enc_exprs(w: &mut Writer, v: &[Expr]) {
 }
 fn dec_exprs(r: &mut Reader) -> R<Vec<Expr>> {
     let n = r.uv()? as usize;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(dec_expr(r)?);
     }
@@ -861,6 +873,16 @@ fn dec_exprs(r: &mut Reader) -> R<Vec<Expr>> {
 }
 
 fn enc_opt_expr(w: &mut Writer, o: &Option<Expr>) {
+    match o {
+        Some(e) => {
+            w.u8(1);
+            enc_expr(w, e);
+        }
+        None => w.u8(0),
+    }
+}
+
+fn enc_opt_box(w: &mut Writer, o: &Option<Box<Expr>>) {
     match o {
         Some(e) => {
             w.u8(1);
@@ -968,8 +990,8 @@ fn enc_stmt(w: &mut Writer, s: &Stmt) {
                 }
                 None => w.u8(0),
             }
-            enc_opt_expr(w, test);
-            enc_opt_expr(w, update);
+            enc_opt_box(w, test);
+            enc_opt_box(w, update);
             enc_stmt(w, body);
         }
         Stmt::ForInOf {
@@ -1014,7 +1036,8 @@ fn enc_stmt(w: &mut Writer, s: &Stmt) {
             w.u8(13);
             enc_stmts(w, block);
             match handler {
-                Some((param, hbody)) => {
+                Some(h) => {
+                    let (param, hbody) = &**h;
                     w.u8(1);
                     match param {
                         Some(p) => {
@@ -1095,12 +1118,13 @@ fn enc_stmt(w: &mut Writer, s: &Stmt) {
 }
 
 fn dec_stmt(r: &mut Reader) -> R<Stmt> {
+    r.deeper()?;
     Ok(match r.u8()? {
         0 => Stmt::Expr(dec_expr(r)?),
         1 => {
             let kind = dec_declkind(r)?;
             let n = r.uv()? as usize;
-            let mut decls = Vec::with_capacity(n);
+            let mut decls = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));
             }
@@ -1135,8 +1159,8 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             };
             Stmt::For {
                 init,
-                test: dec_opt_expr(r)?,
-                update: dec_opt_expr(r)?,
+                test: dec_opt_expr(r)?.map(Box::new),
+                update: dec_opt_expr(r)?.map(Box::new),
                 body: Box::new(dec_stmt(r)?),
             }
         }
@@ -1149,7 +1173,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             Stmt::ForInOf {
                 decl,
                 left: dec_pattern(r)?,
-                right: dec_expr(r)?,
+                right: Box::new(dec_expr(r)?),
                 of: r.bool()?,
                 is_await: r.bool()?,
                 body: Box::new(dec_stmt(r)?),
@@ -1177,21 +1201,24 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             };
             Stmt::Try {
                 block,
-                handler,
+                handler: handler.map(Box::new),
                 finalizer,
             }
         }
         14 => {
             let disc = dec_expr(r)?;
             let n = r.uv()? as usize;
-            let mut cases = Vec::with_capacity(n);
+            let mut cases = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 cases.push(SwitchCase {
                     test: dec_opt_expr(r)?,
                     body: dec_stmts(r)?,
                 });
             }
-            Stmt::Switch { disc, cases }
+            Stmt::Switch {
+                disc: Box::new(disc),
+                cases,
+            }
         }
         15 => Stmt::Labeled {
             label: r.str()?,
@@ -1207,7 +1234,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         20 => {
             let source = r.rcstr()?;
             let n = r.uv()? as usize;
-            let mut specs = Vec::with_capacity(n);
+            let mut specs = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 specs.push(dec_importspec(r)?);
             }
@@ -1219,7 +1246,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         }
         21 => {
             let n = r.uv()? as usize;
-            let mut specs = Vec::with_capacity(n);
+            let mut specs = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 specs.push(ExportSpec {
                     local: r.str()?,
@@ -1454,6 +1481,7 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
 }
 
 fn dec_expr(r: &mut Reader) -> R<Expr> {
+    r.deeper()?;
     Ok(match r.u8()? {
         0 => Expr::Paren(Box::new(dec_expr(r)?)),
         1 => Expr::Num(r.f64()?),
@@ -1472,7 +1500,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         11 => Expr::Array(dec_array_elems(r)?),
         12 => {
             let n = r.uv()? as usize;
-            let mut props = Vec::with_capacity(n);
+            let mut props = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 props.push(dec_propdef(r)?);
             }
@@ -1545,7 +1573,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         29 => {
             let tag = Box::new(dec_expr(r)?);
             let n = r.uv()? as usize;
-            let mut quasis = Vec::with_capacity(n);
+            let mut quasis = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 quasis.push((dec_opt_str(r)?, r.str()?));
             }
@@ -1601,7 +1629,7 @@ fn enc_array_elems(w: &mut Writer, elems: &[ArrayElem]) {
 }
 fn dec_array_elems(r: &mut Reader) -> R<Vec<ArrayElem>> {
     let n = r.uv()? as usize;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(match r.u8()? {
             0 => ArrayElem::Item(dec_expr(r)?),
@@ -1749,11 +1777,12 @@ fn enc_pattern(w: &mut Writer, p: &Pattern) {
     }
 }
 fn dec_pattern(r: &mut Reader) -> R<Pattern> {
+    r.deeper()?;
     Ok(match r.u8()? {
         0 => Pattern::Ident(r.str()?),
         1 => {
             let n = r.uv()? as usize;
-            let mut elems = Vec::with_capacity(n);
+            let mut elems = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 elems.push(match r.u8()? {
                     0 => ArrayPatElem::Hole,
@@ -1769,7 +1798,7 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
         }
         2 => {
             let n = r.uv()? as usize;
-            let mut props = Vec::with_capacity(n);
+            let mut props = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 props.push(ObjPatProp {
                     key: dec_propkey(r)?,
@@ -1889,6 +1918,7 @@ fn enc_scope(w: &mut Writer, s: &Option<Rc<PrivateScope>>) {
     w.scopes.insert(key, id);
 }
 fn dec_scope(r: &mut Reader) -> R<Option<Rc<PrivateScope>>> {
+    r.deeper()?;
     Ok(match r.u8()? {
         0 => None,
         1 => {
@@ -1903,7 +1933,7 @@ fn dec_scope(r: &mut Reader) -> R<Option<Rc<PrivateScope>>> {
         2 => {
             let parent = dec_scope(r)?;
             let n = r.uv()? as usize;
-            let mut names = Vec::with_capacity(n);
+            let mut names = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 names.push(r.str()?);
             }
@@ -1980,7 +2010,7 @@ fn enc_function(w: &mut Writer, f: &Rc<Function>) {
     w.uv(f.params.len() as u64);
     for p in &f.params {
         enc_pattern(w, &p.pattern);
-        enc_opt_expr(w, &p.default);
+        enc_opt_box(w, &p.default);
         w.bool(p.rest);
     }
     // Flags packed into one byte.
@@ -2028,7 +2058,7 @@ fn enc_function_split(w: &mut Writer, f: &Rc<Function>) {
     w.uv(f.params.len() as u64);
     for p in &f.params {
         enc_pattern(w, &p.pattern);
-        enc_opt_expr(w, &p.default);
+        enc_opt_box(w, &p.default);
         w.bool(p.rest);
     }
     w.u8(fn_flags(f));
@@ -2084,11 +2114,11 @@ fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
     });
     let name = dec_opt_str(r)?;
     let n = r.uv()? as usize;
-    let mut params = Vec::with_capacity(n);
+    let mut params = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         params.push(Param {
             pattern: dec_pattern(r)?,
-            default: dec_opt_expr(r)?,
+            default: dec_opt_expr(r)?.map(Box::new),
             rest: r.bool()?,
         });
     }
@@ -2175,7 +2205,7 @@ fn dec_class(r: &mut Reader) -> R<Class> {
         None
     };
     let n = r.uv()? as usize;
-    let mut members = Vec::with_capacity(n);
+    let mut members = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         let key = dec_propkey(r)?;
         let kind = match r.u8()? {
@@ -2234,7 +2264,7 @@ fn dec_forinit(r: &mut Reader) -> R<ForInit> {
         0 => {
             let kind = dec_declkind(r)?;
             let n = r.uv()? as usize;
-            let mut decls = Vec::with_capacity(n);
+            let mut decls = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));
             }
@@ -2583,5 +2613,70 @@ function fine() { return 'ok'; }";
     #[test]
     fn a_body_that_does_not_parse_is_a_compile_error() {
         assert!(crate::compile_snapshot("function f() { return 1 + ; }").is_err());
+    }
+
+    /// A hand-built blob for source `""`: the header, then `body`.
+    fn blob(body: &[u8]) -> Vec<u8> {
+        fn uv(out: &mut Vec<u8>, mut v: u64) {
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    return;
+                }
+                out.push(b | 0x80);
+            }
+        }
+        let mut out = Vec::new();
+        uv(&mut out, super::MAGIC as u64);
+        uv(&mut out, super::VERSION as u64);
+        uv(&mut out, 0);
+        out.extend_from_slice(&super::source_hash("").to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    const HUGE: [u8; 10] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+
+    #[test]
+    fn corrupt_counts_and_lengths_are_decode_errors() {
+        // A statement count near u64::MAX.
+        assert!(decode(&blob(&HUGE), "").is_err());
+        // One import statement whose source string length is near u64::MAX.
+        let mut b = vec![1, 20];
+        b.extend_from_slice(&HUGE);
+        assert!(decode(&blob(&b), "").is_err());
+        // An import with a valid source but a huge specifier count.
+        let mut b = vec![1, 20, 1, b'x'];
+        b.extend_from_slice(&HUGE);
+        assert!(decode(&blob(&b), "").is_err());
+        // Truncated after the header.
+        assert!(decode(&blob(&[1]), "").is_err());
+        assert!(decode(&blob(&[0]), "").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deep_nesting_is_a_decode_error_on_a_small_stack() {
+        let shallow = {
+            let mut b = vec![1];
+            b.extend(std::iter::repeat_n(23u8, 10));
+            b.push(18);
+            blob(&b)
+        };
+        assert!(decode(&shallow, "").is_ok());
+        let deep = {
+            let mut b = vec![1];
+            b.extend(std::iter::repeat_n(23u8, 1_000_000));
+            b.push(18);
+            blob(&b)
+        };
+        let r = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || decode(&deep, "").map(|_| ()))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(r, Err("snapshot: nesting too deep".to_string()));
     }
 }

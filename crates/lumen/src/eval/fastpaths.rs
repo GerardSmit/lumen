@@ -458,7 +458,13 @@ impl Interp {
             return None;
         }
         let len = len as u32;
-        let mut out = Vec::with_capacity(len as usize);
+        // A sparse `new Array(2**32 - 1)` must not reserve 64 GiB just to find its holes.
+        let cap = match b.props.packed_elements() {
+            Some(p) if p.len() < len as usize => return None,
+            Some(_) => len as usize,
+            None => (len as usize).min(1 << 16),
+        };
+        let mut out = Vec::with_capacity(cap);
         if b.props.copy_dense_run(0, len, &mut out) != len {
             return None;
         }

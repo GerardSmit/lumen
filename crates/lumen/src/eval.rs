@@ -450,7 +450,7 @@ impl Interp {
                         for name in names {
                             let name: Rc<str> = name.into();
                             let mut b = scope.borrow_mut();
-                            b.lexical_names.push(name.clone());
+                            b.push_lexical_name(name.clone());
                             b.vars.insert(
                                 name,
                                 Binding {
@@ -458,7 +458,7 @@ impl Interp {
                                     mutable: true,
                                     strict_immutable: false,
                                     initialized: false,
-                                    import_ref: None,
+                                    import: false,
                                     deletable: false,
                                 },
                             );
@@ -475,7 +475,7 @@ impl Interp {
                                 mutable: true,
                                 strict_immutable: false,
                                 initialized: true,
-                                import_ref: None,
+                                import: false,
                                 deletable: false,
                             },
                         );
@@ -485,7 +485,7 @@ impl Interp {
                     if let Some(name) = &class.name {
                         // Classes are lexically scoped with a TDZ until the declaration executes.
                         let name: Rc<str> = name.as_str().into();
-                        scope.borrow_mut().lexical_names.push(name.clone());
+                        scope.borrow_mut().push_lexical_name(name.clone());
                         scope.borrow_mut().vars.insert(
                             name,
                             Binding {
@@ -493,7 +493,7 @@ impl Interp {
                                 mutable: true,
                                 strict_immutable: false,
                                 initialized: false,
-                                import_ref: None,
+                                import: false,
                                 deletable: false,
                             },
                         );
@@ -855,8 +855,8 @@ impl Interp {
     fn exec_for(
         &mut self,
         init: &Option<Box<ForInit>>,
-        test: &Option<Expr>,
-        update: &Option<Expr>,
+        test: &Option<Box<Expr>>,
+        update: &Option<Box<Expr>>,
         body: &Stmt,
         env: &Env,
         labels: &[&str],
@@ -890,8 +890,8 @@ impl Interp {
     fn exec_c_for_body(
         &mut self,
         init: &Option<Box<ForInit>>,
-        test: &Option<Expr>,
-        update: &Option<Expr>,
+        test: &Option<Box<Expr>>,
+        update: &Option<Box<Expr>>,
         body: &Stmt,
         loop_env: &Env,
         labels: &[&str],
@@ -914,7 +914,7 @@ impl Interp {
                                         mutable: true,
                                         strict_immutable: false,
                                         initialized: false,
-                                        import_ref: None,
+                                        import: false,
                                         deletable: false,
                                     },
                                 );
@@ -1026,7 +1026,7 @@ impl Interp {
                         mutable: true,
                         strict_immutable: false,
                         initialized: false,
-                        import_ref: None,
+                        import: false,
                         deletable: false,
                     },
                 );
@@ -1563,6 +1563,7 @@ impl Interp {
     pub(crate) fn iterate(&mut self, v: &Value) -> Result<Vec<Value>, Abrupt> {
         match v {
             Value::Str(s) => {
+                self.check_heap(s.len() * std::mem::size_of::<Value>())?;
                 return Ok(s
                     .chars()
                     .map(|c| Value::from_string(c.to_string()))
@@ -1585,6 +1586,8 @@ impl Interp {
                 // The Array Iterator re-reads `length` each step: a getter may grow or shrink it.
                 let mut i = 0;
                 while i < self.array_length(o) {
+                    self.poll_native(i)?;
+                    self.check_grow(&out)?;
                     out.push(self.get_member(v, &i.to_string())?);
                     i += 1;
                 }
@@ -1613,6 +1616,7 @@ impl Interp {
         let len = self.checked_array_len(o)?;
         let mut out = Vec::with_capacity(len.min(1024));
         for i in 0..len {
+            self.poll_native(i)?;
             out.push(self.get_member(v, &i.to_string())?);
         }
         Ok(out)
@@ -1649,6 +1653,8 @@ impl Interp {
             if self.to_boolean(&done) {
                 break;
             }
+            self.poll_native(out.len())?;
+            self.check_grow(&out)?;
             out.push(self.get_member(&res, "value")?);
             if out.len() > crate::interpreter::MAX_ARRAY_OP_LEN {
                 return Err(self.throw("RangeError", "iterator produced too many values"));
@@ -1661,7 +1667,7 @@ impl Interp {
     fn exec_try(
         &mut self,
         block: &[Stmt],
-        handler: &Option<(Option<Pattern>, Vec<Stmt>)>,
+        handler: &Option<Box<(Option<Pattern>, Vec<Stmt>)>>,
         finalizer: &Option<Vec<Stmt>>,
         env: &Env,
     ) -> Completion {
@@ -1674,7 +1680,7 @@ impl Interp {
         self.tco_ok = saved_tco;
         let after_catch = match result {
             Err(Abrupt::Throw(ex)) => {
-                if let Some((param, body)) = handler {
+                if let Some((param, body)) = handler.as_deref() {
                     // The catch parameter lives in its own environment (flagged so a sloppy `eval`'s
                     // var-hoisting walk skips it); the body's lexicals + statements run in a child
                     // block environment.
@@ -1798,7 +1804,7 @@ impl Interp {
                 mutable: !is_const,
                 strict_immutable: is_const,
                 initialized: true,
-                import_ref: None,
+                import: false,
                 deletable: false,
             },
         );
@@ -1814,7 +1820,7 @@ impl Interp {
                 let b = s.borrow();
                 match b.vars.get(name) {
                     Some(binding) => (
-                        binding.import_ref.as_deref().cloned(),
+                        binding.import.then(|| b.import_of(name).cloned()).flatten(),
                         !binding.initialized,
                         true,
                     ),
@@ -1888,7 +1894,8 @@ impl Interp {
                     ));
                 }
                 // A live module import reads through to the exporter's binding.
-                if let Some((src_env, local)) = binding.import_ref.as_deref() {
+                if let Some((src_env, local)) = binding.import.then(|| b.import_of(name)).flatten()
+                {
                     let (src_env, local) = (src_env.clone(), local.clone());
                     drop(b);
                     return Ok((self.get_var(&local, &src_env)?, None));
@@ -1897,7 +1904,7 @@ impl Interp {
             }
             // `with (obj)`: resolve against the object's properties if it has the name (the proxy
             // `has` trap and @@unscopables participate here). Rare — fall to the owned path.
-            if let Some(obj @ Value::Obj(_)) = &b.with_obj {
+            if let Some(obj @ Value::Obj(_)) = b.with_obj() {
                 let obj = obj.clone();
                 drop(b);
                 if self.with_has_binding(&obj, name)? {
@@ -2094,7 +2101,7 @@ impl Interp {
         // binding (a catch parameter, an outer var) is not the block binding.
         let own = {
             let b = env.borrow();
-            if b.var_boundary {
+            if b.var_boundary() {
                 None
             } else {
                 b.vars.get(name).map(|x| x.value.clone())
@@ -2111,7 +2118,7 @@ impl Interp {
         });
         let mut cur = Some(env.clone());
         while let Some(s) = cur {
-            if s.borrow().var_boundary {
+            if s.borrow().var_boundary() {
                 if let Some(b) = s.borrow_mut().vars.get_mut(name) {
                     b.value = val;
                     return;
@@ -2145,7 +2152,7 @@ impl Interp {
     /// constructed with this private name in scope (`#x` absent) is a TypeError, not `undefined`.
     pub(crate) fn get_private_member(&mut self, base: &Value, name: &str) -> Completion {
         let prop = match base {
-            Value::Obj(o) => o.borrow().props.get(name).cloned(),
+            Value::Obj(o) => o.borrow().props.get(name).map(|p| p.clone()),
             _ => None,
         };
         match prop {
@@ -2176,7 +2183,7 @@ impl Interp {
     pub(crate) fn set_private_member(&mut self, base: &Value, name: &str, value: Value) -> Result<(), Abrupt> {
         let shown = private_display(name).to_string();
         let (o, prop) = match base {
-            Value::Obj(o) => (o.clone(), o.borrow().props.get(name).cloned()),
+            Value::Obj(o) => (o.clone(), o.borrow().props.get(name).map(|p| p.clone())),
             _ => {
                 return Err(self.throw(
                     "TypeError",
@@ -2252,7 +2259,7 @@ impl Interp {
                     binding.initialized = true;
                     return Ok(());
                 }
-                (b.with_obj.clone(), b.parent.clone())
+                (b.with_obj().cloned(), b.parent.clone())
             };
             if let Some(obj @ Value::Obj(_)) = &with_obj {
                 if self.with_has_binding(obj, name)? {
@@ -2291,6 +2298,8 @@ impl Interp {
         };
         let mut out = Vec::with_capacity(len.min(1024));
         for k in 0..len {
+            self.poll_native(k)?;
+            self.check_grow(&out)?;
             out.push(self.get_member(obj, &k.to_string())?);
         }
         Ok(out)
@@ -2308,7 +2317,7 @@ impl Interp {
         // those clear `ic_plain` or are exotic): [[HasProperty]] is the entries walk alone.
         // Walked by raw pointer: every level is kept alive by `o` for the duration.
         {
-            let mut cur: *const std::cell::RefCell<crate::value::Object> = Gc::as_ptr(o);
+            let mut cur: *const crate::value::ObjCell = Gc::as_ptr(o);
             loop {
                 let Ok(b) = (unsafe { (*cur).try_borrow() }) else { break };
                 if !(matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array) && b.ic_plain.get()) {
@@ -2326,12 +2335,13 @@ impl Interp {
         let o = o.clone();
         // A deferred namespace evaluates on [[HasProperty]] with a string key.
         self.defer_trigger(&o, Some(key))?;
+        self.materialize_fn(&o);
         let ptr = Gc::as_ptr(&o) as usize;
         if let Some((target, handler)) = self.proxy_at(ptr) {
             if matches!(handler, Value::Null) {
                 return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
             }
-            let trap = self.get_member(&handler, "has")?;
+            let trap = self.proxy_trap(&handler, "has")?;
             if matches!(trap, Value::Undefined | Value::Null) {
                 return self.js_has_property(&target, key);
             }
@@ -2346,7 +2356,7 @@ impl Interp {
             let present = self.to_boolean(&res);
             if !present {
                 if let Value::Obj(t) = &target {
-                    let p = t.borrow().props.get(key).cloned();
+                    let p = t.borrow().props.get(key).map(|p| p.clone());
                     if let Some(p) = p {
                         if !p.configurable() || !t.borrow().extensible {
                             return Err(self.throw(
@@ -2372,7 +2382,7 @@ impl Interp {
                 return Ok(true);
             }
             if let Ok(idx) = key.parse::<usize>() {
-                if idx < crate::jstr::unit_len(&s) {
+                if idx < self.str_len(&s) {
                     return Ok(true);
                 }
             }
@@ -2401,7 +2411,7 @@ impl Interp {
                     NameRes::Binding(_, bd) => {
                         // SAFETY: the epoch was current at the lookup and nothing ran since.
                         let bd = unsafe { &*bd };
-                        if bd.initialized && bd.import_ref.is_none() {
+                        if bd.initialized && !bd.import {
                             return Ok(bd.value.clone());
                         }
                     }
@@ -2443,7 +2453,7 @@ impl Interp {
         if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, "this", env) {
             // SAFETY: the epoch was current at the lookup and nothing ran since.
             let bd = unsafe { &*bd };
-            if bd.initialized && bd.import_ref.is_none() {
+            if bd.initialized && !bd.import {
                 return Ok(bd.value.clone());
             }
         }
@@ -2517,6 +2527,7 @@ impl Interp {
 
     #[inline(never)]
     fn eval_node(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        self.check_native_stack()?;
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
             Expr::BigInt(n) => Ok(Value::BigInt(n.clone())),
@@ -2532,7 +2543,7 @@ impl Interp {
                 if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, name, env) {
                     // SAFETY: the epoch was current at the lookup and nothing ran since.
                     let bd = unsafe { &*bd };
-                    if bd.initialized && bd.import_ref.is_none() {
+                    if bd.initialized && !bd.import {
                         return Ok(bd.value.clone());
                     }
                 }
@@ -3358,6 +3369,7 @@ impl Interp {
         pos: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
+        self.check_native_stack()?;
         // Direct eval: `eval(src)` called by that exact name runs the code in the *caller's* scope
         // (so it can see/define local bindings). Any other way of reaching eval is indirect and runs
         // in the global scope (handled by the global `eval` native).
@@ -3584,7 +3596,7 @@ impl Interp {
                     fulfilled: true,
                     kind: crate::eval::promise_fast::JOB_THENABLE,
                     idx: 0,
-                    context: self.async_context.clone(),
+                    context: crate::value::PackedValue::pack(self.async_context.clone()),
                 });
             }
             Ok(_) => self.settle(&target, value, true),
@@ -3618,18 +3630,17 @@ impl Interp {
             if !fulfilled && first.is_none() {
                 s.tracked = true;
             }
-            let rest = if s.rest.is_empty() {
-                Vec::new()
-            } else {
-                std::mem::take(&mut s.rest)
-            };
+            let rest = s.rest.take().map_or_else(Vec::new, |v| *v);
             (first, rest)
         };
         let Some(first) = first else {
             if !fulfilled {
+                // Reported in rejection order, not the map's (seeded) hash order.
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.unhandled_rejections.insert(
                     Gc::as_ptr(promise) as usize,
-                    (Value::Obj(promise.clone()), value),
+                    (Value::Obj(promise.clone()), value, seq),
                 );
             }
             return;
@@ -3730,6 +3741,7 @@ impl Interp {
                 break;
             }
         }
+        crate::value::gc_trim_emptied();
     }
 
     /// Run one promise-reaction job (settle `job.result` from the handler, or pass the
@@ -3746,12 +3758,11 @@ impl Interp {
             return self.run_await_job(job, from_drain);
         }
         if job.handler.is_callable() {
-            let outer = std::mem::replace(&mut self.async_context, job.context.clone());
-            let outcome =
-                match crate::bytecode::call_once_direct(self, &job.handler, job.value) {
-                    Ok(r) => r,
-                    Err(v) => self.call(job.handler.clone(), Value::Undefined, &[v]),
-                };
+            let outer = std::mem::replace(&mut self.async_context, job.context.get().clone());
+            let outcome = match crate::bytecode::call_once_direct(self, &job.handler, job.value) {
+                Ok(r) => r,
+                Err(v) => self.call(job.handler.clone(), Value::Undefined, &[v]),
+            };
             self.async_context = outer;
             match outcome {
                 Ok(r) => self.resolve_promise(&job.result, r),
@@ -3774,12 +3785,12 @@ impl Interp {
             fulfilled: true,
             kind: crate::eval::promise_fast::JOB_TASK,
             idx: 0,
-            context: self.async_context.clone(),
+            context: crate::value::PackedValue::pack(self.async_context.clone()),
         });
     }
 
     fn run_task_job(&mut self, job: crate::interpreter::Job) {
-        let outer = std::mem::replace(&mut self.async_context, job.context);
+        let outer = std::mem::replace(&mut self.async_context, job.context.into_value());
         let outcome = self.call(job.handler, Value::Undefined, &[]);
         self.async_context = outer;
         if let Err(Abrupt::Throw(e)) = outcome {
@@ -4051,9 +4062,11 @@ impl Interp {
         let probe = new_scope(Some(lex_env.clone()));
         let saved_strict = self.strict;
         self.strict = strict;
-        self.hoist(body, &probe, &[]);
+        let hoist_ops = crate::interpreter::collect_hoist_ops(body, strict, &[]);
+        self.apply_hoist_ops(&hoist_ops, &probe);
         self.strict = saved_strict;
-        let var_names: Vec<String> = probe.borrow().vars.keys().map(|k| k.to_string()).collect();
+        // In hoisting order: the probe's map iterates in (seeded) hash order.
+        let var_names = crate::interpreter::hoisted_names(&hoist_ops);
         // A callable hoisted value is a function declaration (which becomes a global *function*
         // binding); everything else is a plain `var`.
         let is_func = |name: &str| {
@@ -4089,7 +4102,7 @@ impl Interp {
                     let b = s.borrow();
                     // A `with` object environment holds no lexical declarations, and a `catch`
                     // parameter environment is exempt from the var/lexical conflict check.
-                    (b.with_obj.is_some() || b.catch_param, b.parent.clone())
+                    (b.with_obj().is_some() || b.catch_param(), b.parent.clone())
                 };
                 if !skip {
                     for name in &var_names {
@@ -4106,7 +4119,7 @@ impl Interp {
             // The variable environment itself may hold body-level lexicals (our function body
             // scope carries both); a var may not hoist over one of those either.
             for name in &var_names {
-                if var_env.borrow().lexical_names.iter().any(|n| &**n == name) {
+                if var_env.borrow().lexical_names().any(|n| &**n == name) {
                     return Err(self.throw(
                         "SyntaxError",
                         format!("Identifier '{name}' has already been declared"),
@@ -4285,7 +4298,7 @@ impl Interp {
                     mutable: false,
                     strict_immutable: true,
                     initialized: false,
-                    import_ref: None,
+                    import: false,
                     deletable: false,
                 },
             );
@@ -4394,10 +4407,13 @@ impl Interp {
         bind(&static_env, "%homeobject%", ctor_val.clone());
         {
             let mut b = ctor_obj.borrow_mut();
+            // The closure's own `.prototype` is still deferred (see `Interp::materialize`): the
+            // class's takes its place.
             b.props.insert(
                 "prototype",
                 Property::data(Value::Obj(proto.clone()), false, false, false),
             );
+            b.ic_plain.set(true);
             b.proto = match &ctor_parent {
                 Some(Value::Obj(p)) => Some(p.clone()),
                 _ => Some(self.function_proto.clone()),
@@ -5014,6 +5030,9 @@ impl Interp {
         this: &Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
+        // `super(...)` chains (and bound-parent chains) recurse here without passing `call`'s
+        // depth guard.
+        self.check_native_stack()?;
         let obj = match ctor {
             Value::Obj(o) => o.clone(),
             _ => return Err(self.throw("TypeError", "super target is not a constructor")),
@@ -5080,8 +5099,9 @@ impl Interp {
                 let made = made?;
                 if let (Value::Obj(src), Value::Obj(dst)) = (&made, this) {
                     if !Gc::ptr_eq(src, dst) {
+                        self.materialize_fn(src);
                         for k in src.borrow().props.keys() {
-                            let p = src.borrow().props.get(&k).cloned().unwrap();
+                            let p = src.borrow().props.get(&k).map(|p| p.clone()).unwrap();
                             dst.borrow_mut().props.insert(k, p);
                         }
                         // A Function (or GeneratorFunction/AsyncFunction) subclass instance is
@@ -5198,7 +5218,7 @@ impl Interp {
             return Ok(());
         }
         // The key walk below reads the source's property map: a split view becomes an Array.
-        crate::split_view::unview_val(value);
+        self.materialize_val(value);
         match value {
             Value::Obj(src) if excluded.is_empty() && self.copy_data_props_fast(rest, src) => {}
             Value::Obj(src) => {
@@ -5617,7 +5637,7 @@ impl Interp {
             {
                 if let Value::Obj(o) = &base {
                     self.defer_trigger(o, Some(prop))?;
-                    crate::split_view::unview(o);
+                    self.materialize(o);
                     let ptr = Gc::as_ptr(o) as usize;
                     if let Some((target, handler)) = self.proxy_at(ptr) {
                         let ok = self.proxy_delete(target, handler, prop)?;
@@ -5696,7 +5716,7 @@ impl Interp {
                         (
                             binding.is_some(),
                             binding.map(|x| x.deletable).unwrap_or(false),
-                            b.with_obj.clone(),
+                            b.with_obj().cloned(),
                             b.parent.clone(),
                         )
                     };
@@ -5713,7 +5733,7 @@ impl Interp {
                         // an inherited one is untouched and reports true per OrdinaryDelete).
                         let (wobj, o) = (wobj.clone(), o.clone());
                         if self.with_has_binding(&wobj, name)? {
-                            crate::split_view::unview(&o);
+                            self.materialize(&o);
                             let configurable = o
                                 .borrow()
                                 .props
@@ -5754,7 +5774,7 @@ impl Interp {
         if matches!(handler, Value::Null) {
             return Err(self.throw("TypeError", "cannot delete on a revoked proxy"));
         }
-        let trap = self.get_member(&handler, "deleteProperty")?;
+        let trap = self.proxy_trap(&handler, "deleteProperty")?;
         if matches!(trap, Value::Undefined | Value::Null) {
             // Forward to the target's [[Delete]] (recursing if the target is itself a proxy).
             if let Value::Obj(t) = &target {
@@ -5762,7 +5782,7 @@ impl Interp {
                 if let Some((t2, h2)) = self.proxies.get(&tptr).cloned() {
                     return self.proxy_delete(t2, h2, key);
                 }
-                crate::split_view::unview(t);
+                self.materialize(t);
                 let configurable = t
                     .borrow()
                     .props
@@ -5790,7 +5810,7 @@ impl Interp {
         // Invariant: a non-configurable property, or any property of a non-extensible target,
         // can't be reported as deleted.
         if let Value::Obj(t) = &target {
-            let p = t.borrow().props.get(key).cloned();
+            let p = t.borrow().props.get(key).map(|p| p.clone());
             if let Some(p) = p {
                 if !p.configurable() {
                     return Err(self.throw(
@@ -5817,12 +5837,12 @@ impl Interp {
         while let Some(s) = cur {
             let (found, parent) = {
                 let b = s.borrow();
-                if b.with_obj.is_some() {
+                if b.with_obj().is_some() {
                     return None;
                 }
                 match b.vars.get(name) {
                     Some(bd) => {
-                        if !bd.initialized || bd.import_ref.is_some() || !bd.mutable {
+                        if !bd.initialized || bd.import || !bd.mutable {
                             return None;
                         }
                         (true, None)
@@ -5852,7 +5872,7 @@ impl Interp {
             if let Some((_, bd)) = self.cached_binding(arg as *const Expr as usize, name, env) {
                 // SAFETY: nothing ran since the lookup; the binding is updated in place.
                 let bd = unsafe { &mut *bd };
-                if bd.initialized && bd.mutable && bd.import_ref.is_none() {
+                if bd.initialized && bd.mutable && !bd.import {
                     if let Value::Num(n) = bd.value {
                         let new = if op == "++" { n + 1.0 } else { n - 1.0 };
                         bd.value = Value::Num(new);
@@ -5881,8 +5901,10 @@ impl Interp {
         let mut lref = self.resolve_reference(arg, env)?;
         let old = self.get_reference(&mut lref)?;
         if let Value::BigInt(n) = old {
-            let one = crate::bigint::JsBigInt::from_u64(1);
-            let new = if op == "++" { n.add(&one) } else { n.sub(&one) };
+            let new = match n.checked_step(op == "++") {
+                Ok(v) => v,
+                Err(e) => return Err(self.throw("RangeError", e.message())),
+            };
             self.put_reference(&mut lref, Value::BigInt(new.clone()))?;
             return Ok(Value::BigInt(if prefix { new } else { n }));
         }
@@ -5909,7 +5931,7 @@ impl Interp {
                     self.cached_binding(target as *const Expr as usize, name, env)
                 {
                     let b = unsafe { &*bd };
-                    if b.initialized && b.mutable && b.import_ref.is_none() {
+                    if b.initialized && b.mutable && !b.import {
                         let old = b.value.clone();
                         let epoch = crate::value::scope_epoch();
                         let rhs = self.eval(value, env)?;
@@ -5918,7 +5940,7 @@ impl Interp {
                         // are re-checked).
                         if crate::value::scope_epoch() == epoch {
                             let b = unsafe { &mut *bd };
-                            if b.mutable && b.initialized && b.import_ref.is_none() {
+                            if b.mutable && b.initialized && !b.import {
                                 b.value = result.clone();
                                 return Ok(result);
                             }
@@ -6041,7 +6063,7 @@ impl Interp {
         if crate::value::scope_epoch() == epoch {
             // SAFETY: an unchanged epoch keeps the binding at this address.
             let b = unsafe { &mut *bd };
-            if b.mutable && b.initialized && b.import_ref.is_none() {
+            if b.mutable && b.initialized && !b.import {
                 b.value = v.clone();
                 return Ok(v);
             }
@@ -6522,55 +6544,55 @@ impl Interp {
     }
 
     fn bigint_binop(
-        &self,
+        &mut self,
         op: &str,
         x: &crate::bigint::JsBigInt,
         y: &crate::bigint::JsBigInt,
     ) -> Result<Value, Abrupt> {
-        use crate::bigint::JsBigInt;
-        let v = match op {
-            "+" => x.add(y),
-            "-" => x.sub(y),
-            "*" => x.mul(y),
-            "/" => x
-                .div(y)
-                .ok_or_else(|| self.throw("RangeError", "Division by zero"))?,
-            "%" => x
-                .rem(y)
-                .ok_or_else(|| self.throw("RangeError", "Division by zero"))?,
-            "**" => x
-                .pow(y)
-                .ok_or_else(|| self.throw("RangeError", "Exponent must be non-negative"))?,
-            "&" => x.bitand(y),
-            "|" => x.bitor(y),
-            "^" => x.bitxor(y),
-            // A negative shift count shifts the other way; the rightward shift is arithmetic
-            // (flooring toward negative infinity).
-            "<<" | ">>" => {
-                let leftward = (op == "<<") != y.is_negative();
-                let count = y.to_i128().map(|v| v.unsigned_abs()).unwrap_or(u128::MAX);
-                if leftward {
-                    if x.is_zero() {
-                        JsBigInt::zero()
-                    } else if count > (1 << 30) {
-                        return Err(self.throw("RangeError", "BigInt is too large to allocate"));
-                    } else {
-                        x.shl(count as u64)
-                    }
-                } else if count >= (1 << 30) {
-                    // Every bit shifted out: floor(x / 2^count) is 0 or -1 by sign.
-                    if x.is_negative() {
-                        JsBigInt::from_i128(-1)
-                    } else {
-                        JsBigInt::zero()
-                    }
-                } else {
-                    x.shr(count as u64)
-                }
-            }
-            _ => return Err(self.throw("TypeError", "unsupported BigInt operator")),
+        let heavy = match op {
+            "*" | "/" | "%" => x.limbs().max(y.limbs()) >= HEAVY_LIMBS,
+            "**" => x.limbs() >= HEAVY_LIMBS || y.to_i128().is_none_or(|e| e >= 64),
+            _ => false,
         };
-        Ok(Value::BigInt(v))
+        let v = if heavy {
+            self.big_guard(|| bigint_arith(op, x, y))?
+        } else {
+            bigint_arith(op, x, y)
+        };
+        match v {
+            Some(v) => v.map(Value::BigInt).map_err(|e| self.throw("RangeError", e.message())),
+            None => Err(self.throw("TypeError", "unsupported BigInt operator")),
+        }
+    }
+
+    /// `n.toString(radix)`, `None` past the string length cap.
+    pub(crate) fn bigint_to_string(
+        &mut self,
+        n: &crate::bigint::JsBigInt,
+        radix: u32,
+    ) -> Result<Option<String>, Abrupt> {
+        if n.limbs() >= HEAVY_LIMBS {
+            self.big_guard(|| n.to_string_radix_checked(radix, MAX_STR_LEN))
+        } else {
+            Ok(n.to_string_radix_checked(radix, MAX_STR_LEN))
+        }
+    }
+
+    /// StringToBigInt, `Ok(None)` for unparsable text.
+    pub(crate) fn parse_bigint_str(
+        &mut self,
+        s: &str,
+    ) -> Result<Result<Option<crate::bigint::JsBigInt>, crate::bigint::BigIntError>, Abrupt> {
+        if s.len() >= HEAVY_LIMBS * 16 {
+            self.big_guard(|| string_to_bigint_checked(s))
+        } else {
+            Ok(string_to_bigint_checked(s))
+        }
+    }
+
+    /// StringToBigInt for comparisons: `None` when unparsable or past the size cap.
+    fn string_to_bigint_g(&mut self, s: &str) -> Result<Option<crate::bigint::JsBigInt>, Abrupt> {
+        Ok(self.parse_bigint_str(s)?.ok().flatten())
     }
 
     /// ToBigInt: BigInt stays; Boolean → 0n/1n; String parses (SyntaxError if malformed); Number /
@@ -6580,8 +6602,11 @@ impl Interp {
         match p {
             Value::BigInt(n) => Ok(n),
             Value::Bool(b) => Ok(crate::bigint::JsBigInt::from_u64(b as u64)),
-            Value::Str(s) => string_to_bigint(&s)
-                .ok_or_else(|| self.throw("SyntaxError", "Cannot convert string to a BigInt")),
+            Value::Str(s) => match self.parse_bigint_str(&s)? {
+                Ok(Some(n)) => Ok(n),
+                Ok(None) => Err(self.throw("SyntaxError", "Cannot convert string to a BigInt")),
+                Err(e) => Err(self.throw("RangeError", e.message())),
+            },
             Value::Num(_) => Err(self.throw("TypeError", "Cannot convert a Number to a BigInt")),
             _ => Err(self.throw("TypeError", "Cannot convert value to a BigInt")),
         }
@@ -6612,9 +6637,9 @@ impl Interp {
             (Value::BigInt(a), Value::BigInt(b)) => Some(a.cmp(b)),
             (Value::BigInt(a), Value::Str(t)) => {
                 // StringToBigInt: an unparsable string makes the comparison undefined (false).
-                string_to_bigint(t).map(|b| a.cmp(&b))
+                self.string_to_bigint_g(t)?.map(|b| a.cmp(&b))
             }
-            (Value::Str(t), Value::BigInt(b)) => string_to_bigint(t).map(|a| a.cmp(b)),
+            (Value::Str(t), Value::BigInt(b)) => self.string_to_bigint_g(t)?.map(|a| a.cmp(b)),
             (Value::BigInt(a), _) => {
                 let n = self.to_number(&rp)?;
                 a.cmp_f64(n)
@@ -6725,7 +6750,7 @@ impl Interp {
                     .props
                     .get(key)
                     .filter(|property| !property.accessor())
-                    .map(Property::value)
+                    .map(|p| p.value())
                     .is_some_and(|value| {
                         matches!(
                             value,
@@ -6925,7 +6950,10 @@ impl Interp {
                 }
                 None => crate::lstr::LStr::from(self.num_to_str(*n).as_str()),
             },
-            Value::BigInt(n) => crate::lstr::LStr::from(n.to_string().as_str()),
+            Value::BigInt(n) => match self.bigint_to_string(n, 10)? {
+                Some(s) => crate::lstr::LStr::from(s.as_str()),
+                None => return Err(self.throw("RangeError", "Invalid string length")),
+            },
             Value::Str(s) => s.clone(),
             Value::Sym(_) => {
                 return Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"));
@@ -7094,11 +7122,12 @@ impl Interp {
     /// IsConstructor: whether `v` has a [[Construct]] internal method.
     pub(crate) fn value_is_constructor(&self, v: &Value) -> bool {
         let Value::Obj(o) = v else { return false };
-        if let Some((target, _)) = self.proxies.get(&(Gc::as_ptr(o) as usize)) {
-            // A proxy is a constructor exactly when its target is.
-            return self.value_is_constructor(&target.clone());
-        }
         let b = o.borrow();
+        // A proxy or bound function is a constructor exactly when its target is; both record
+        // that in `is_constructor` when created, so a long chain is not walked.
+        if !self.proxies.is_empty() && self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
+            return b.is_constructor;
+        }
         match &b.call {
             Callable::User(user) => {
                 !(user.func.is_arrow
@@ -7114,7 +7143,7 @@ impl Interp {
                         .unwrap_or(false)
             }
             // A bound function constructs exactly when its target does.
-            Callable::Bound(bound) => self.value_is_constructor(&Value::Obj(bound.target.clone())),
+            Callable::Bound(_) => b.is_constructor,
             _ => false,
         }
     }
@@ -7132,7 +7161,7 @@ impl Interp {
             (Value::BigInt(x), Value::Num(y)) | (Value::Num(y), Value::BigInt(x)) => x.eq_f64(*y),
             (Value::BigInt(x), Value::Str(s)) | (Value::Str(s), Value::BigInt(x)) => {
                 // StringToBigInt: an unparsable string compares unequal.
-                string_to_bigint(s).map(|n| n == *x).unwrap_or(false)
+                self.string_to_bigint_g(s)?.map(|n| n == *x).unwrap_or(false)
             }
             (Value::BigInt(_), Value::Obj(_)) => {
                 let bp = self.to_primitive(b, Hint::Default)?;
@@ -7200,7 +7229,7 @@ pub(crate) fn bind(env: &Env, name: &str, value: Value) {
             mutable: true,
             strict_immutable: false,
             initialized: true,
-            import_ref: None,
+            import: false,
             deletable: false,
         },
     );
@@ -7310,8 +7339,8 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
                 ForInit::VarDecl { decls, .. } => {
                     decls.iter().any(|(_, x)| x.as_ref().is_some_and(&e))
                 }
-            }) || test.as_ref().is_some_and(&e)
-                || update.as_ref().is_some_and(&e)
+            }) || test.as_deref().is_some_and(&e)
+                || update.as_deref().is_some_and(&e)
                 || stmt_contains(body, pred)
         }
         Stmt::ForInOf { right, body, .. } => e(right) || stmt_contains(body, pred),
@@ -7322,7 +7351,7 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
         } => {
             stmts_contain(block, pred)
                 || handler
-                    .as_ref()
+                    .as_deref()
                     .is_some_and(|(_, b)| stmts_contain(b, pred))
                 || finalizer.as_ref().is_some_and(|b| stmts_contain(b, pred))
         }
@@ -7369,7 +7398,7 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
         }),
         // `Contains` descends into arrow functions; an ordinary function/class does not.
         Expr::Func(f) if f.is_arrow => {
-            f.params.iter().any(|p| p.default.as_ref().is_some_and(&e))
+            f.params.iter().any(|p| p.default.as_deref().is_some_and(&e))
                 || f.parsed_body().is_some_and(|b| stmts_contain(&b, pred))
         }
         _ => false,
@@ -7554,7 +7583,7 @@ fn fi_stmt(s: &Stmt, args: bool) -> Option<&'static str> {
             handler,
             finalizer,
         } => fi_stmts(block, args)
-            .or_else(|| handler.as_ref().and_then(|(_, b)| fi_stmts(b, args)))
+            .or_else(|| handler.as_deref().and_then(|(_, b)| fi_stmts(b, args)))
             .or_else(|| finalizer.as_ref().and_then(|b| fi_stmts(b, args))),
         Stmt::Switch { disc, cases } => fi_expr(disc, args).or_else(|| {
             cases.iter().find_map(|c| {
@@ -7869,7 +7898,7 @@ impl Interp {
                         let b = s.borrow();
                         (
                             b.vars.contains_key(name.as_str()),
-                            b.with_obj.clone(),
+                            b.with_obj().cloned(),
                             b.parent.clone(),
                         )
                     };
@@ -7971,7 +8000,7 @@ impl Interp {
                             Some(bd) => (
                                 bd.initialized,
                                 bd.value.clone(),
-                                bd.import_ref.as_deref().cloned(),
+                                bd.import.then(|| b.import_of(name).cloned()).flatten(),
                             ),
                             None => return self.get_var(name, s),
                         }
@@ -8045,7 +8074,7 @@ impl Interp {
                         let mut b = s.borrow_mut();
                         match b.vars.get_mut(name) {
                             Some(bd) => {
-                                if bd.import_ref.is_some() {
+                                if bd.import {
                                     // An import binding is immutable: reads are live through the
                                     // exporting module, but assignment is always a TypeError.
                                     return Err(self.throw(
@@ -8153,28 +8182,80 @@ pub(crate) fn private_display(key: &str) -> &str {
     key.split('\u{1}').next().unwrap_or(key)
 }
 
-/// StringToBigInt: trimmed decimal / 0x / 0o / 0b text (empty is 0); None when unparsable.
+const HEAVY_LIMBS: usize = 64;
+
+/// A BigInt binary operator; `None` for an operator that is not one.
+fn bigint_arith(
+    op: &str,
+    x: &crate::bigint::JsBigInt,
+    y: &crate::bigint::JsBigInt,
+) -> Option<Result<crate::bigint::JsBigInt, crate::bigint::BigIntError>> {
+    use crate::bigint::JsBigInt;
+    let v = match op {
+        "+" => x.checked_add(y),
+        "-" => x.checked_sub(y),
+        "*" => x.checked_mul(y),
+        "/" => x.checked_div(y),
+        "%" => x.checked_rem(y),
+        "**" => x.pow(y),
+        "&" => Ok(x.bitand(y)),
+        "|" => Ok(x.bitor(y)),
+        "^" => Ok(x.bitxor(y)),
+        // A negative shift count shifts the other way; the rightward shift is arithmetic
+        // (flooring toward negative infinity).
+        "<<" | ">>" => {
+            let leftward = (op == "<<") != y.is_negative();
+            let count = y.to_i128().map(|v| v.unsigned_abs()).unwrap_or(u128::MAX);
+            if leftward {
+                x.checked_shl(count)
+            } else if count >= crate::bigint::MAX_BITS as u128 {
+                // Every bit shifted out: floor(x / 2^count) is 0 or -1 by sign.
+                Ok(if x.is_negative() {
+                    JsBigInt::from_i128(-1)
+                } else {
+                    JsBigInt::zero()
+                })
+            } else {
+                Ok(x.shr(count as u64))
+            }
+        }
+        _ => return None,
+    };
+    Some(v)
+}
+
+/// StringToBigInt: trimmed decimal / 0x / 0o / 0b text (empty is 0); None when unparsable (or
+/// too large).
 fn string_to_bigint(s: &str) -> Option<crate::bigint::JsBigInt> {
+    string_to_bigint_checked(s).ok().flatten()
+}
+
+/// StringToBigInt, distinguishing unparsable text (`Ok(None)`) from a value past the size cap.
+fn string_to_bigint_checked(
+    s: &str,
+) -> Result<Option<crate::bigint::JsBigInt>, crate::bigint::BigIntError> {
     use crate::bigint::JsBigInt;
     let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
     if t.is_empty() {
-        return Some(JsBigInt::zero());
+        return Ok(Some(JsBigInt::zero()));
     }
     if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return JsBigInt::parse_radix(h, 16);
+        return JsBigInt::parse_radix_checked(h, 16);
     }
     if let Some(o) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return JsBigInt::parse_radix(o, 8);
+        return JsBigInt::parse_radix_checked(o, 8);
     }
     if let Some(b) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return JsBigInt::parse_radix(b, 2);
+        return JsBigInt::parse_radix_checked(b, 2);
     }
     let (neg, digits) = match t.strip_prefix('-') {
         Some(d) => (true, d),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let v = JsBigInt::parse_dec(digits)?;
-    Some(if neg { v.neg() } else { v })
+    if !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return Ok(None);
+    }
+    Ok(JsBigInt::parse_radix_checked(digits, 10)?.map(|v| if neg { v.neg() } else { v }))
 }
 
 /// The outcome of evaluating a `return` operand: a pending proper tail call, or a plain value.

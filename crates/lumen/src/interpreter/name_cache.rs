@@ -144,7 +144,7 @@ impl Interp {
             let Ok(mut b) = (unsafe { (*cur).try_borrow_mut() }) else {
                 return NameRes::Unknown;
             };
-            if b.with_obj.is_some() {
+            if b.with_obj().is_some() {
                 return NameRes::Unknown;
             }
             // From now on a structural change to this map bumps the epoch, which is what keeps

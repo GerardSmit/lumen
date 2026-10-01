@@ -85,7 +85,7 @@ fn set_env(slot: &mut Value, env: Env) {
         let mut ob = o.borrow_mut();
         if let Callable::User(u) = &mut ob.call {
             let is_carrier = CARRIER_FN.with(|f| Rc::ptr_eq(f, &u.func));
-            if let Some(u) = Rc::get_mut(u).filter(|_| is_carrier) {
+            if is_carrier {
                 let old = std::mem::replace(&mut u.env, env);
                 drop(ob);
                 drop(old);
@@ -115,7 +115,7 @@ pub(super) fn copy(slots: &mut [Value], slot: u16) {
     let fresh = with_env(&slots[slot as usize], |old| {
         let b = old.borrow();
         let e = new_scope(b.parent.clone());
-        e.borrow_mut().vars = b.vars.copy_all();
+        e.borrow_mut().set_vars(b.vars.copy_all());
         e
     });
     set_env(&mut slots[slot as usize], fresh);

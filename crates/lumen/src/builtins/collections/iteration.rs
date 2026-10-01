@@ -35,7 +35,7 @@ pub(super) fn collection_for_each(
     let mut idx = 0usize;
     let mut f = crate::bytecode::PreparedCall::new(i, cb, cb_this);
     loop {
-        let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).cloned());
+        let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
         let (k, v) = match entry {
             Some(kv) => kv,
             None => break,
@@ -142,9 +142,9 @@ pub(crate) fn map_set_iter_drain(i: &mut Interp, obj: &Gc) -> Vec<Value> {
     if let Some(data) = coll.as_ref().and_then(map_ptr).and_then(|p| i.map_data.get(&p)) {
         while let Some((k, v)) = data.next(&mut idx) {
             match kind {
-                1 => out.push(k.clone()),
-                2 => pairs.push((k.clone(), v.clone())),
-                _ => out.push(v.clone()),
+                1 => out.push(k.unpack()),
+                2 => pairs.push((k.unpack(), v.unpack())),
+                _ => out.push(v.unpack()),
             }
         }
     }
@@ -216,9 +216,9 @@ fn step_at(i: &mut Interp, obj: &Gc, coll: Gc, mut idx: usize, kind: u8, is: usi
         .get(&(Gc::as_ptr(&coll) as usize))
         .and_then(|e| e.next(&mut idx))
         .map(|(k, v)| match kind {
-            1 => (k.clone(), None),
-            2 => (k.clone(), Some(v.clone())),
-            _ => (v.clone(), None),
+            1 => (k.unpack(), None),
+            2 => (k.unpack(), Some(v.unpack())),
+            _ => (v.unpack(), None),
         });
     let set_idx = |idx: usize| {
         if let Some(p) = obj.borrow_mut().props.entry_at_mut(is) {
@@ -289,7 +289,7 @@ fn map_set_iter_step_slow(i: &mut Interp, obj: &Gc) -> Option<Value> {
     // Skip tombstoned (deleted) slots so the iterator observes a live view.
     let entry = coll_ptr
         .and_then(|p| i.map_data.get(&p))
-        .and_then(|e| e.next(&mut idx).cloned());
+        .and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
     match entry {
         Some((k, v)) => {
             set_internal(obj, "__ci_index", Value::Num(idx as f64));

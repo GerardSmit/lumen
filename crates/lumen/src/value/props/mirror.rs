@@ -2,18 +2,13 @@
 use super::{
     f64_exact_i32, Props, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT,
 };
-use crate::value::{canonical_index, Value};
+use crate::value::{canonical_index, PackedValue, Value};
 
 impl Props {
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).
     #[inline]
     pub(crate) fn mirror_invalidate(&mut self) {
-        if let Some(d) = self.elems.as_deref_mut() {
-            if d.mirror_flags & MIRROR_OK != 0 {
-                d.mirror_flags = 0;
-                d.mirror.clear();
-            }
-        }
+        self.elems.mirror_off();
     }
 
     /// Re-mirror element `n` from `entries[slot]` (both already linked via `elems`).
@@ -31,7 +26,7 @@ impl Props {
         let p = &self.entries[slot];
         match p.value() {
             Value::Num(f) if !p.accessor() && p.writable() && f.to_bits() != MIRROR_HOLE => {
-                let d = self.elems.buffers_mut();
+                let d = self.elems.classic_mut();
                 if !f64_exact_i32(f) {
                     d.mirror_flags &= !MIRROR_ALL_I32;
                 }
@@ -65,7 +60,7 @@ impl Props {
             }
         }
         if pads > 0 {
-            let d = self.elems.buffers_mut();
+            let d = self.elems.classic_mut();
             d.mirror_flags &= !MIRROR_NO_HOLES;
             d.mirror_holes += pads as u32;
             d.mirror
@@ -100,10 +95,10 @@ impl Props {
             let Some(p) = packed.get_value_mut(n as usize) else {
                 return Err(v);
             };
-            if matches!(p.value(), Value::Empty) || p.accessor() || !p.writable() {
+            if p.is_hole() {
                 return Err(v);
             }
-            p.set_value(v);
+            *p = PackedValue::pack(v);
             return Ok(());
         }
         let Some(&slot) = self.elems.get(n as usize) else {

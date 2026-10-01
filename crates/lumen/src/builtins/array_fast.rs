@@ -58,13 +58,10 @@ fn dense_find(o: &Gc, from: usize, len: usize, mut hit: impl FnMut(&Value) -> bo
         return None;
     }
     for (k, p) in packed.get(from..len)?.iter().enumerate() {
-        if p.accessor() {
+        if p.is_hole() {
             return None;
         }
-        let v = p.value();
-        if matches!(v, Value::Empty) {
-            return None;
-        }
+        let v = p.unpack();
         if hit(&v) {
             return Some(Some(from + k));
         }
@@ -83,6 +80,7 @@ pub(super) fn has_get(
     if let Some(v) = own_elem(o, k) {
         return Ok(Some(v));
     }
+    ab(i.poll_native(k))?;
     let key = k.to_string();
     if !ab(i.js_has_property(ov, &key))? {
         return Ok(None);
@@ -96,6 +94,7 @@ pub(super) fn get_elem(i: &mut Interp, o: &Gc, ov: &Value, k: usize) -> Result<V
     if let Some(v) = own_elem(o, k) {
         return Ok(v);
     }
+    ab(i.poll_native(k))?;
     ab(i.get_member(ov, &k.to_string()))
 }
 
@@ -123,6 +122,7 @@ pub(super) fn set_elem(
         }
         Err(_) => v,
     };
+    ab(i.poll_native(k))?;
     set_throw(i, ov, &k.to_string(), v)
 }
 
@@ -143,6 +143,7 @@ pub(super) fn delete_elem(i: &mut Interp, o: &Gc, ov: &Value, k: usize) -> Resul
             return Ok(());
         }
     }
+    ab(i.poll_native(k))?;
     delete_or_throw(i, ov, &k.to_string())
 }
 
@@ -302,6 +303,7 @@ impl Out {
     #[inline]
     pub(super) fn put(&mut self, i: &mut Interp, k: usize, v: Value) -> Result<(), Value> {
         if self.slow.is_none() && k == self.fast.len() {
+            ab(i.check_grow(&self.fast))?;
             crate::value::push_value(&mut self.fast, v);
             return Ok(());
         }
@@ -883,7 +885,7 @@ pub(super) fn array_splice_impl(
     let o = arr_to_object(i, &this)?;
     // A mutator: a split view receiver becomes an ordinary Array first (unobservable), so
     // the dense paths below apply.
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     let ov = Value::Obj(o.clone());
     let len = len_of(i, &o)? as i64;
     let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
@@ -978,7 +980,7 @@ fn store_len(o: &mut crate::value::Object, n: u32) {
 
 pub(super) fn array_shift(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     // Dense fast path: a packed array of plain elements drops its first slot in O(1).
     if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize) {
         let mut b = o.borrow_mut();
@@ -1009,7 +1011,7 @@ pub(super) fn array_shift(i: &mut Interp, this: Value, _args: &[Value]) -> Resul
 
 pub(super) fn array_unshift(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     // Dense fast path: the new indices can't reach a setter (no elements on the array
     // prototypes), so prepending into front slack is the whole effect.
     if !args.is_empty()
@@ -1051,7 +1053,7 @@ pub(super) fn array_unshift(i: &mut Interp, this: Value, args: &[Value]) -> Resu
 
 pub(super) fn array_reverse(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     let ov = Value::Obj(o.clone());
     let len = len_of(i, &o)?;
     for lower in 0..len / 2 {
@@ -1081,7 +1083,7 @@ pub(super) fn array_reverse(i: &mut Interp, this: Value, _args: &[Value]) -> Res
 
 pub(super) fn array_fill(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     let len = len_of(i, &o)? as i64;
     let v = arg(args, 0);
     let start = norm_index(ab(i.to_number(&arg(args, 1)))?, len);
@@ -1122,7 +1124,7 @@ pub(super) fn array_sort(i: &mut Interp, this: Value, args: &[Value]) -> Result<
         return Err(i.make_error("TypeError", "the comparator must be a function or undefined"));
     }
     let o = arr_to_object(i, &this)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     let ov = Value::Obj(o.clone());
     let len = checked_len_of(i, &o)?;
     // SortIndexedProperties: read only the present indices (holes are skipped, not read).
@@ -1290,6 +1292,7 @@ pub(super) fn flatten_into_out(
     depth: i64,
     mut mapper: Option<&mut PreparedCall>,
 ) -> Result<usize, Value> {
+    ab(i.check_native_stack())?;
     let mut target_index = start;
     let so = match source {
         Value::Obj(o) => o.clone(),

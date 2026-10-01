@@ -3,27 +3,30 @@
 //! enumerates objects by walking chunks, allocation bumps or pops a chunk-local free list, and
 //! freeing a box needs no thread-local lookup because the chunk is found by masking the pointer.
 //!
-//! Three slot classes share the design ([`SlotClass`]): plain boxes, boxes followed by
-//! [`INLINE_PROPS`] property slots that a small ordinary object uses as its entry storage (see
+//! Several slot classes share the design ([`SlotClass`]): plain boxes, boxes followed by two,
+//! four or eight property slots that a small ordinary object uses as its entry storage (see
 //! `EntryVec`'s inline mode), so `new C()` / `{x, y}` / `{}` allocate one block, not two, and
-//! those plus an array element sidecar (see `DenseStorage`), so `[a, b]` is one block too. Each
-//! chunk holds one class; its header records the slot size.
+//! array boxes: one property slot (`length`), the element sidecar (see `DenseStorage`) and up
+//! to four element slots, so `[a, b]` is one block too. Each chunk holds one class; its header
+//! records the slot size.
 //!
 //! A free slot is marked by a zero weak count (a live box always holds at least the implicit
 //! weak reference of its strong owners). The free slots of one class form ONE list across all
-//! its chunks, threaded through their strong words and headed in the heap itself, so the
+//! its chunks, threaded through their second words and headed in the heap itself, so the
 //! allocation fast path is a single pop (no chunk lookup, no `RefCell` flag) and the slot just
 //! freed — still in cache — is the next one handed out; a chunk bump-allocates only slots it
 //! never handed out. A free pushes onto that list through its chunk header's pointer to it.
 //! Chunks that become empty are returned to the system by [`ObjHeap::trim`], which the
 //! collector calls after a sweep and which rebuilds the lists fullest-chunk-first, so sparse
-//! chunks drain.
+//! chunks drain. Objects that die by reference count never reach a sweep, so a free that empties
+//! a chunk bumps a per-heap counter, and [`ObjHeap::trim_if_emptied`] (polled at the
+//! interpreter's safe points) trims once enough chunks have emptied and stayed so.
 //!
 //! Exclusivity follows `GcState`: a heap is touched by one thread at a time (the driver, or a
 //! coroutine worker during the strict ping-pong handoff), so chunk headers are plain fields.
 
 use super::props::DenseBuffers;
-use super::{GcBox, Property};
+use super::{GcBox, PackedValue, Property};
 use std::alloc::Layout;
 use std::cell::{Cell, UnsafeCell};
 use std::ptr::NonNull;
@@ -32,12 +35,23 @@ use std::ptr::NonNull;
 const CHUNK_BYTES: usize = 256 << 10;
 /// Slots start at a cache-line boundary after the header.
 const SLOTS_OFF: usize = 64;
+/// Property slots trailing a [`SlotClass::Inline2`] box.
+pub(crate) const INLINE_PROPS_NARROW: usize = 2;
 /// Property slots trailing a [`SlotClass::Inline`] box.
 pub(crate) const INLINE_PROPS: usize = 4;
 /// Property slots trailing a [`SlotClass::Inline8`] box.
 pub(crate) const INLINE_PROPS_WIDE: usize = 8;
+/// Named-property slots of an array box: its `length` (more named keys spill to the heap).
+pub(crate) const ARRAY_NAMED: usize = 1;
+/// The most element slots an array box carries ([`SlotClass::Array4`]).
+pub(crate) const ARRAY_SLOTS_MAX: usize = 4;
 /// Number of slot classes.
-const CLASSES: usize = 4;
+pub(crate) const CLASSES: usize = 7;
+/// Slot class names, by index (the `LUMEN_MEM_STATS` report).
+pub(crate) const CLASS_NAMES: [&str; CLASSES] =
+    ["plain", "inline2", "inline4", "inline8", "array0", "array2", "array4"];
+/// How long empty chunks must stay unused before [`ObjHeap::trim_if_emptied`] returns them.
+const PURGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 const fn round_up(n: usize, align: usize) -> usize {
     n.div_ceil(align) * align
@@ -62,45 +76,58 @@ const SLOT_ALIGN: usize = max(
     std::mem::align_of::<Property>(),
 );
 
-/// Offset of an [`SlotClass::Array`] box's element sidecar: after its inline property slots.
+/// Offset of an array box's element sidecar: after its named property slot.
 const DENSE_OFF: usize = round_up(
-    INLINE_OFF + INLINE_PROPS * std::mem::size_of::<Property>(),
+    INLINE_OFF + ARRAY_NAMED * std::mem::size_of::<Property>(),
     std::mem::align_of::<DenseBuffers>(),
 );
 /// Alignment every slot start must satisfy.
 const SLOT_ALIGN_ALL: usize = max(SLOT_ALIGN, std::mem::align_of::<DenseBuffers>());
+
+const fn inline_size(n: usize) -> usize {
+    round_up(INLINE_OFF + n * std::mem::size_of::<Property>(), SLOT_ALIGN)
+}
+/// An array box: the sidecar, then `k` element slots (see `DenseStorage::write_in_box`).
+const fn array_size(k: usize) -> usize {
+    round_up(
+        DENSE_OFF + std::mem::size_of::<DenseBuffers>() + k * std::mem::size_of::<PackedValue>(),
+        SLOT_ALIGN_ALL,
+    )
+}
 
 /// The box sizes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum SlotClass {
     /// A bare [`GcBox`]: functions and every object built around an existing map.
     Plain = 0,
+    /// A [`GcBox`] followed by [`INLINE_PROPS_NARROW`] property slots: objects known to get
+    /// one or two properties (a literal or constructor template that size).
+    Inline2 = 1,
     /// A [`GcBox`] followed by [`INLINE_PROPS`] uninitialized [`Property`] slots.
-    Inline = 1,
-    /// An [`Inline`](SlotClass::Inline) box followed by room for the array element sidecar
-    /// ([`DenseBuffers`]): a small array literal is one block.
-    Array = 2,
+    Inline = 2,
     /// A [`GcBox`] followed by [`INLINE_PROPS_WIDE`] property slots: objects of five to
     /// eight properties (a literal or constructor template that size) in one block.
     Inline8 = 3,
+    /// An array: a [`GcBox`], [`ARRAY_NAMED`] property slot and the element sidecar
+    /// ([`DenseBuffers`]), whose packed elements live in a heap buffer.
+    Array0 = 4,
+    /// An [`Array0`](SlotClass::Array0) box followed by two element slots its packed elements
+    /// start out in: a small array is one block.
+    Array2 = 5,
+    /// As [`Array2`](SlotClass::Array2) with [`ARRAY_SLOTS_MAX`] element slots.
+    Array4 = 6,
 }
 
 impl SlotClass {
     pub(super) const fn size(self) -> usize {
         match self {
             SlotClass::Plain => std::mem::size_of::<GcBox>(),
-            SlotClass::Inline => round_up(
-                INLINE_OFF + INLINE_PROPS * std::mem::size_of::<Property>(),
-                SLOT_ALIGN,
-            ),
-            SlotClass::Array => round_up(
-                DENSE_OFF + std::mem::size_of::<DenseBuffers>(),
-                SLOT_ALIGN_ALL,
-            ),
-            SlotClass::Inline8 => round_up(
-                INLINE_OFF + INLINE_PROPS_WIDE * std::mem::size_of::<Property>(),
-                SLOT_ALIGN,
-            ),
+            SlotClass::Inline2 => inline_size(INLINE_PROPS_NARROW),
+            SlotClass::Inline => inline_size(INLINE_PROPS),
+            SlotClass::Inline8 => inline_size(INLINE_PROPS_WIDE),
+            SlotClass::Array0 | SlotClass::Array2 | SlotClass::Array4 => {
+                array_size(self.array_slots())
+            }
         }
     }
     const fn slots(self) -> usize {
@@ -111,28 +138,58 @@ impl SlotClass {
     pub(super) const fn inline_cap(self) -> usize {
         match self {
             SlotClass::Plain => 0,
-            SlotClass::Inline | SlotClass::Array => INLINE_PROPS,
+            SlotClass::Inline2 => INLINE_PROPS_NARROW,
+            SlotClass::Inline => INLINE_PROPS,
             SlotClass::Inline8 => INLINE_PROPS_WIDE,
+            SlotClass::Array0 | SlotClass::Array2 | SlotClass::Array4 => ARRAY_NAMED,
         }
     }
-    /// The inline class for an object of `n` named properties (at most [`INLINE_PROPS_WIDE`]).
+    /// Element slots following an array box's sidecar.
+    #[inline(always)]
+    pub(super) const fn array_slots(self) -> usize {
+        match self {
+            SlotClass::Array2 => 2,
+            SlotClass::Array4 => ARRAY_SLOTS_MAX,
+            _ => 0,
+        }
+    }
+    /// The inline class for an object expected to get `n` named properties (at most
+    /// [`INLINE_PROPS_WIDE`]). Zero means unknown: room for a few properties added one by one.
     #[inline(always)]
     pub(super) const fn inline_for(n: usize) -> SlotClass {
-        if n <= INLINE_PROPS {
+        if n == 0 {
+            SlotClass::Inline
+        } else if n <= INLINE_PROPS_NARROW {
+            SlotClass::Inline2
+        } else if n <= INLINE_PROPS {
             SlotClass::Inline
         } else {
             SlotClass::Inline8
         }
     }
+    /// The array class for `n` initial elements: the smallest whose slots hold them, and room
+    /// for a few pushes for an empty array. Longer arrays keep their elements on the heap.
+    #[inline(always)]
+    pub(super) const fn array_for(n: usize) -> SlotClass {
+        if n == 0 {
+            SlotClass::Array4
+        } else if n <= 2 {
+            SlotClass::Array2
+        } else if n <= ARRAY_SLOTS_MAX {
+            SlotClass::Array4
+        } else {
+            SlotClass::Array0
+        }
+    }
 }
 
-/// The inline property area of a [`SlotClass::Inline`] / [`SlotClass::Inline8`] box.
+/// The inline property area of a box of any class but [`SlotClass::Plain`].
 #[inline(always)]
 pub(super) fn inline_props(b: *mut GcBox) -> *mut Property {
     unsafe { b.cast::<u8>().add(INLINE_OFF).cast::<Property>() }
 }
 
-/// The element sidecar area of a [`SlotClass::Array`] box.
+/// The element sidecar area of an array class box.
 #[inline(always)]
 pub(super) fn inline_dense(b: *mut GcBox) -> *mut DenseBuffers {
     unsafe { b.cast::<u8>().add(DENSE_OFF).cast::<DenseBuffers>() }
@@ -147,6 +204,8 @@ struct ChunkHdr {
     /// The owning state's live-object count (`GcState::live`): a dying object decrements it
     /// through its chunk, with no thread-local lookup. Repointed like `free_head`.
     live: *const Cell<i64>,
+    /// The owning heap's [`ObjHeap::emptied`] counter. Repointed like `free_head`.
+    emptied: *const Cell<u32>,
     /// Slots `[0, bump)` have been handed out at least once (the rest were never touched).
     bump: u32,
     /// Slots currently holding a box (live or weak-only).
@@ -160,10 +219,13 @@ struct ChunkHdr {
 
 const _: () = assert!(std::mem::size_of::<ChunkHdr>() <= SLOTS_OFF);
 const _: () = assert!(SLOTS_OFF % SLOT_ALIGN == 0);
+const _: () = assert!(SlotClass::Inline2.size() % SLOT_ALIGN == 0);
 const _: () = assert!(SlotClass::Inline.size() % SLOT_ALIGN == 0);
 const _: () = assert!(SlotClass::Inline8.size().is_multiple_of(SLOT_ALIGN));
-const _: () = assert!(SlotClass::Array.size().is_multiple_of(SLOT_ALIGN_ALL));
+const _: () = assert!(SlotClass::Array0.size().is_multiple_of(SLOT_ALIGN_ALL));
+const _: () = assert!(SlotClass::Array4.size().is_multiple_of(SLOT_ALIGN_ALL));
 const _: () = assert!(SLOTS_OFF.is_multiple_of(SLOT_ALIGN_ALL));
+const _: () = assert!(SlotClass::Array4 as usize + 1 == CLASSES);
 // Inline storage must stay within `EntryVec`'s reach check (see `props::entries`).
 const _: () = assert!(INLINE_OFF <= 224);
 
@@ -231,6 +293,7 @@ fn chunk_alloc() -> (*mut u8, usize) {
             }
             #[cfg(feature = "mem-stats")]
             crate::fastalloc::note_slab(CHUNK_BYTES as isize);
+            crate::fastalloc::note_external(CHUNK_BYTES as isize);
             return (p.cast(), COMMIT_STEP);
         }
         std::alloc::handle_alloc_error(chunk_layout());
@@ -274,6 +337,7 @@ unsafe fn chunk_free(c: *mut ChunkHdr) {
         os::VirtualFree(c.cast(), 0, os::MEM_RELEASE);
         #[cfg(feature = "mem-stats")]
         crate::fastalloc::note_slab(-(CHUNK_BYTES as isize));
+        crate::fastalloc::note_external(-(CHUNK_BYTES as isize));
     }
     #[cfg(not(windows))]
     std::alloc::dealloc(c.cast(), chunk_layout());
@@ -296,6 +360,18 @@ fn slot(chunk: NonNull<ChunkHdr>, i: usize) -> *mut GcBox {
     }
 }
 
+/// The free list's link lives in the dead box's second word, after the header word that holds
+/// the zero weak count marking the slot free.
+#[inline(always)]
+unsafe fn free_next(p: *mut GcBox) -> *mut GcBox {
+    p.cast::<*mut GcBox>().add(1).read()
+}
+
+#[inline(always)]
+unsafe fn set_free_next(p: *mut GcBox, next: *mut GcBox) {
+    p.cast::<*mut GcBox>().add(1).write(next)
+}
+
 #[inline]
 fn is_free(b: *const GcBox) -> bool {
     unsafe { (*b).weak.get() == 0 }
@@ -303,7 +379,7 @@ fn is_free(b: *const GcBox) -> bool {
 
 /// One slot class: its free list and chunks.
 struct ClassHeap {
-    /// Head of the class-wide free list (threaded through each free box's strong word).
+    /// Head of the class-wide free list (threaded through each free box's second word).
     free: Cell<*mut GcBox>,
     /// The chunk bump allocation draws from once the free list is empty, or null.
     cur: Cell<*mut ChunkHdr>,
@@ -333,17 +409,18 @@ impl ClassHeap {
 /// exists (chunks point at its free-list heads) — it lives inside its `Arc`ed `GcState`.
 pub(super) struct ObjHeap {
     classes: [ClassHeap; CLASSES],
+    /// Frees that left a chunk empty since the last trim (see [`ObjHeap::trim_if_emptied`]).
+    emptied: Cell<u32>,
+    /// When a pending purge of empty chunks is due.
+    purge_at: Cell<Option<std::time::Instant>>,
 }
 
 impl ObjHeap {
     pub(super) const fn new() -> ObjHeap {
         ObjHeap {
-            classes: [
-                ClassHeap::new(),
-                ClassHeap::new(),
-                ClassHeap::new(),
-                ClassHeap::new(),
-            ],
+            classes: [const { ClassHeap::new() }; CLASSES],
+            emptied: Cell::new(0),
+            purge_at: Cell::new(None),
         }
     }
 
@@ -360,7 +437,7 @@ impl ObjHeap {
         let p = h.free.get();
         if !p.is_null() {
             unsafe {
-                h.free.set((*p).strong.get() as *mut GcBox);
+                h.free.set(free_next(p));
                 (*chunk_of(p)).used += 1;
             }
             return p;
@@ -373,6 +450,7 @@ impl ObjHeap {
     #[cold]
     #[inline(never)]
     fn alloc_slow(&self, live: &Cell<i64>, class: SlotClass) -> *mut GcBox {
+        let emptied = &self.emptied;
         let h = &self.classes[class as usize];
         let mut c = h.cur.get();
         if c.is_null() || unsafe { (*c).bump == (*c).slots } {
@@ -391,6 +469,7 @@ impl ObjHeap {
                         c.as_ptr().write(ChunkHdr {
                             free_head: &h.free,
                             live,
+                            emptied,
                             bump: 0,
                             used: 0,
                             slot_size: class.size() as u32,
@@ -446,6 +525,8 @@ impl ObjHeap {
     /// dense chunks and sparse ones get a chance to drain and be returned.
     pub(super) fn trim(&self, keep: usize) {
         let keep = keep.max(1);
+        self.emptied.set(0);
+        self.purge_at.set(None);
         for h in &self.classes {
             let chunks = h.chunks();
             let mut spare = 0;
@@ -474,7 +555,7 @@ impl ObjHeap {
                 for i in (0..hdr.bump as usize).rev() {
                     let b = slot(c, i);
                     if is_free(b) {
-                        unsafe { (*b).strong.set(head as usize) };
+                        unsafe { set_free_next(b, head) };
                         head = b;
                     }
                 }
@@ -487,6 +568,57 @@ impl ObjHeap {
                     .map_or(std::ptr::null_mut(), |c| c.as_ptr()),
             );
         }
+    }
+
+    /// Return empty chunks beyond `spare` once frees have emptied more than `spare` and they are
+    /// still empty [`PURGE_DELAY`] later, keeping a quarter of `spare` per class. The delay is
+    /// the hysteresis: a program that drops a big structure and immediately builds another
+    /// refills the same chunks instead of unmapping and faulting them back in. Returns whether
+    /// chunks were freed.
+    ///
+    /// A counter compare while nothing is pending; while a purge is pending (only after a
+    /// burst of frees), a clock read. Scans read one header per chunk.
+    #[inline]
+    pub(super) fn trim_if_emptied(&self, spare: usize) -> bool {
+        if (self.emptied.get() as usize) < spare && self.purge_at.get().is_none() {
+            return false;
+        }
+        self.trim_if_emptied_slow(spare)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trim_if_emptied_slow(&self, spare: usize) -> bool {
+        let now = std::time::Instant::now();
+        match self.purge_at.get() {
+            Some(at) if now < at => return false,
+            Some(_) => {
+                self.purge_at.set(None);
+                if self.empty_chunks() > spare {
+                    self.trim(spare / 4);
+                    return true;
+                }
+            }
+            None => {
+                self.emptied.set(0);
+                if self.empty_chunks() > spare {
+                    self.purge_at.set(Some(now + PURGE_DELAY));
+                }
+            }
+        }
+        false
+    }
+
+    fn empty_chunks(&self) -> usize {
+        self.classes
+            .iter()
+            .map(|h| {
+                h.chunks()
+                    .iter()
+                    .filter(|c| unsafe { c.as_ref().used == 0 })
+                    .count()
+            })
+            .sum()
     }
 
     /// Per slot class: `(chunks, slots in use, slots ever handed out, slot size)` — for the
@@ -506,6 +638,13 @@ impl ObjHeap {
     }
 
     #[cfg(test)]
+    pub(super) fn expire_purge_delay(&self) {
+        if self.purge_at.get().is_some() {
+            self.purge_at.set(Some(std::time::Instant::now()));
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn chunk_count(&self) -> usize {
         self.classes.iter().map(|h| h.chunks().len()).sum()
     }
@@ -520,6 +659,7 @@ impl Drop for ObjHeap {
         // leaked sinks (slots freed into the sink list are simply never reused).
         let mut sink: Option<&'static Cell<i64>> = None;
         let mut free_sink: Option<&'static Cell<*mut GcBox>> = None;
+        let mut emptied_sink: Option<&'static Cell<u32>> = None;
         for h in &self.classes {
             for &c in h.chunks().iter() {
                 let hdr = unsafe { &mut *c.as_ptr() };
@@ -530,6 +670,8 @@ impl Drop for ObjHeap {
                     hdr.free_head = *free_sink.get_or_insert_with(|| {
                         Box::leak(Box::new(Cell::new(std::ptr::null_mut())))
                     });
+                    hdr.emptied =
+                        *emptied_sink.get_or_insert_with(|| Box::leak(Box::new(Cell::new(0))));
                 }
             }
         }
@@ -556,7 +698,11 @@ pub(super) unsafe fn free(p: *mut GcBox) {
     let c = &mut *chunk_of(p);
     let head = &*c.free_head;
     (*p).weak.set(0);
-    (*p).strong.set(head.get() as usize);
+    set_free_next(p, head.get());
     head.set(p);
     c.used -= 1;
+    if c.used == 0 {
+        let e = &*c.emptied;
+        e.set(e.get().saturating_add(1));
+    }
 }

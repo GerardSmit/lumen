@@ -349,7 +349,7 @@ function compileCommonJS(module, filename, source, detectEsm = false, ts = false
   const dirname = path.dirname(filename);
   // A leading #! shebang line is neutralized, as Node does, before wrapping: `#!` becomes `//`
   // so every offset in the file (and in its type table) stays put.
-  source = String(source).replace(/^#!/, "//");
+  source = __node.stripShebang(String(source));
   const require = makeRequire(dirname, module);
   let compiled;
   try {
@@ -361,7 +361,8 @@ function compileCommonJS(module, filename, source, detectEsm = false, ts = false
       __node.nameSource(compiled, filename);
     }
   } catch (e) {
-    if (detectEsm && e instanceof SyntaxError) return false;
+    // The textual ESM probe only runs once the CommonJS parse has already failed.
+    if (detectEsm && e instanceof SyntaxError && ESM_SYNTAX.test(source)) return false;
     throw e;
   }
   compiled.call(module.exports, module.exports, require, module, filename, dirname);
@@ -416,7 +417,7 @@ function loadViaHooks(module, filename) {
     if (ext === ".mjs" || ext === ".mts" || (scoped && type === "module")) {
       loadHookESM(module, filename, source);
     } else {
-      const detect = scoped && type === undefined && ESM_SYNTAX.test(source);
+      const detect = scoped && type === undefined;
       const ts = ext === ".ts" || ext === ".cts";
       if (!compileCommonJS(module, filename, source, detect, ts)) loadHookESM(module, filename, source);
     }
@@ -712,7 +713,7 @@ const _extensions = {
     const type = packageScopeType(filename);
     if (type === "module") return loadESM(module, filename);
     const source = __node.readText(filename);
-    const detect = type === undefined && ESM_SYNTAX.test(source);
+    const detect = type === undefined;
     if (!compileCommonJS(module, filename, source, detect)) loadESM(module, filename);
   },
   ".mjs": function (module, filename) {
@@ -725,7 +726,7 @@ const _extensions = {
     const type = packageScopeType(filename);
     if (type === "module") return loadESM(module, filename);
     const source = __node.readText(filename);
-    const detect = type === undefined && ESM_SYNTAX.test(source);
+    const detect = type === undefined;
     if (!compileCommonJS(module, filename, source, detect, true)) loadESM(module, filename);
   },
   ".mts": function (module, filename) {

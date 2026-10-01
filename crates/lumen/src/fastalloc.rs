@@ -1,7 +1,7 @@
 //! A thread-local size-class caching allocator (std-only).
 //!
 //! The engine's workloads are allocation-bound in exactly the way general-purpose system
-//! allocators are slowest: millions of short-lived, same-sized blocks (an `RcBox<RefCell<Object>>`
+//! allocators are slowest: millions of short-lived, same-sized blocks (an `ObjCell`
 //! per JS object, an `RcBox<RefCell<Scope>>` per activation, `Props` entry vectors, `LStr`
 //! buffers). On macOS in particular, `malloc`/`free` pairs dominate parser-shaped profiles.
 //!
@@ -21,6 +21,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
 
 /// Largest cached block size, in bytes.
 const MAX_CLASS: usize = 1024;
@@ -29,16 +30,17 @@ const STEP: usize = 16;
 const NUM_CLASSES: usize = MAX_CLASS / STEP;
 /// Maximum cached storage for one size class. Keeping the bound in bytes rather than items is
 /// important: a 65,536-item limit allowed the 64 classes to retain just over 2 GiB per thread.
-/// This bounds the complete thread-local cache to 16 MiB while preserving a deeper free list for
-/// the small, hot allocation classes.
-const BYTES_PER_CLASS: usize = 256 * 1024;
+const BYTES_PER_CLASS: usize = 128 * 1024;
 /// The classes up to [`SMALL_CLASS_BYTES`] (property-entry blocks of one to eight properties,
 /// small strings, scope maps) get a deeper list: a cycle collection frees one block per garbage
 /// object in a burst of 100k+, and a shallow cap sent all but the first few thousand back to the
-/// system heap only for the next interval to allocate them from it again. Adds at most 8 x 4 MiB
-/// per thread; `trim` still drains everything after a large collection (rate-limited).
+/// system heap only for the next interval to allocate them from it again. `trim` still drains
+/// everything after a large collection (rate-limited).
 const SMALL_CLASS_BYTES: usize = 128;
 const BYTES_PER_SMALL_CLASS: usize = 4 * 1024 * 1024;
+/// Bound on the whole thread-local cache. The per-class caps sum to more: a burst concentrates
+/// in a few classes, which may each fill to their cap, but not all of them at once.
+const TOTAL_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 const fn class_caps() -> [usize; NUM_CLASSES] {
     let mut caps = [0; NUM_CLASSES];
@@ -175,10 +177,14 @@ macro_rules! stat {
 struct Cache {
     heads: [Cell<*mut u8>; NUM_CLASSES],
     counts: [Cell<usize>; NUM_CLASSES],
+    /// Bytes on all the lists (see [`TOTAL_CACHE_BYTES`]).
+    bytes: Cell<usize>,
     /// [`GUARD_NONE`] until the first cached free registers the teardown guard, then
     /// [`GUARD_LIVE`]; [`GUARD_DEAD`] once the guard drained the lists at thread exit (later
     /// frees go straight to the system).
     guard: Cell<u8>,
+    /// Bytes allocated (+) or freed (-) on this thread not yet folded into [`HEAP_BYTES`].
+    pending: Cell<isize>,
 }
 
 const GUARD_NONE: u8 = 0;
@@ -194,6 +200,7 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let _ = CACHE.try_with(|c| {
             c.guard.set(GUARD_DEAD);
+            flush_pending(c);
             drain(c);
         });
     }
@@ -204,10 +211,73 @@ thread_local! {
         Cache {
             heads: [const { Cell::new(std::ptr::null_mut()) }; NUM_CLASSES],
             counts: [const { Cell::new(0) }; NUM_CLASSES],
+            bytes: Cell::new(0),
             guard: Cell::new(GUARD_NONE),
+            pending: Cell::new(0),
         }
     };
     static GUARD: Guard = const { Guard };
+}
+
+/// Process-wide bytes [`ClassAlloc`] holds from the system: live blocks (rounded to their size
+/// class) plus the blocks cached on the per-thread free lists. Counting at the system boundary
+/// keeps the cache-hit fast path free of accounting. Threads batch their deltas in `Cache::pending` and
+/// fold them in here once they pass [`FLUSH_BYTES`], so the total lags by at most that much per
+/// thread. Coroutine threads allocate and free each other's blocks, so only the sum is meaningful.
+static HEAP_BYTES: AtomicIsize = AtomicIsize::new(0);
+const FLUSH_BYTES: isize = 256 * 1024;
+/// Set by the first allocation through [`ClassAlloc`]: without it [`heap_bytes`] means nothing.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
+fn note(c: &Cache, delta: isize) {
+    let p = c.pending.get() + delta;
+    c.pending.set(p);
+    if (p + FLUSH_BYTES) as usize > 2 * FLUSH_BYTES as usize {
+        flush_pending(c);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn flush_pending(c: &Cache) {
+    let p = c.pending.replace(0);
+    HEAP_BYTES.fetch_add(p, Relaxed);
+    if !ACTIVE.load(Relaxed) {
+        ACTIVE.store(true, Relaxed);
+    }
+}
+
+/// A thread whose cache is gone (teardown) counts straight into the shared total.
+#[cold]
+#[inline(never)]
+fn note_dead(delta: isize) {
+    HEAP_BYTES.fetch_add(delta, Relaxed);
+}
+
+/// This thread's cache. `CACHE` is const-initialized and has no destructor, so it stays valid
+/// for the whole life of the thread (teardown included); reading it through a plain reference
+/// keeps the allocation paths free of `LocalKey::with` closures, whose inlining is fragile.
+#[inline(always)]
+fn cache() -> &'static Cache {
+    CACHE.with(|c| unsafe { &*(c as *const Cache) })
+}
+
+/// Bytes currently allocated through [`ClassAlloc`] by the whole process (this thread's pending
+/// delta included), or `None` when `ClassAlloc` is not the global allocator.
+pub fn heap_bytes() -> Option<usize> {
+    if !ACTIVE.load(Relaxed) {
+        return None;
+    }
+    let local = CACHE.try_with(|c| c.pending.get()).unwrap_or(0);
+    Some((HEAP_BYTES.load(Relaxed) + local).max(0) as usize)
+}
+
+/// Memory mapped outside the allocator (the object slab's chunks on Windows) that should still
+/// count toward [`heap_bytes`].
+#[allow(dead_code)]
+pub(crate) fn note_external(delta: isize) {
+    HEAP_BYTES.fetch_add(delta, Relaxed);
 }
 
 #[cfg(test)]
@@ -257,6 +327,8 @@ fn drain(cache: &Cache) {
             p = next;
         }
     }
+    HEAP_BYTES.fetch_sub(cache.bytes.get() as isize, Relaxed);
+    cache.bytes.set(0);
 }
 
 /// Return cached small blocks to the system and ask the platform allocator to release unused
@@ -264,6 +336,11 @@ fn drain(cache: &Cache) {
 /// allocation cache and turn steady-state churn back into malloc/free traffic.
 pub(crate) fn trim() {
     let _ = CACHE.try_with(drain);
+    release_free_pages();
+}
+
+/// Ask the platform allocator to return its free pages to the OS, keeping this thread's cache.
+pub(crate) fn release_free_pages() {
     #[cfg(target_os = "macos")]
     unsafe {
         unsafe extern "C" {
@@ -292,47 +369,49 @@ impl ClassAlloc {
     #[inline(always)]
     unsafe fn raw_alloc(&self, layout: Layout) -> *mut u8 {
         if let Some(class) = class_of(layout.size(), layout.align()) {
-            let cached = CACHE.with(|c| {
-                let p = c.heads[class].get();
-                if !p.is_null() {
-                    c.heads[class].set(unsafe { *(p as *mut *mut u8) });
-                    c.counts[class].set(c.counts[class].get() - 1);
-                }
-                p
-            });
-            if !cached.is_null() {
+            let c = cache();
+            let p = c.heads[class].get();
+            if !p.is_null() {
+                c.heads[class].set(unsafe { *(p as *mut *mut u8) });
+                c.counts[class].set(c.counts[class].get() - 1);
+                c.bytes.set(c.bytes.get() - (class + 1) * STEP);
                 stat!(cached(-(class_layout(class).size() as isize)));
-                return cached;
+                return p;
             }
+            note(c, ((class + 1) * STEP) as isize);
             return System.alloc(class_layout(class));
         }
+        note(cache(), layout.size() as isize);
         System.alloc(layout)
     }
 
     #[inline(always)]
     unsafe fn raw_dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let c = cache();
         if let Some(class) = class_of(layout.size(), layout.align()) {
-            let cached = CACHE.with(|c| {
-                if c.guard.get() != GUARD_LIVE {
-                    if c.guard.get() == GUARD_DEAD {
-                        return false;
-                    }
-                    register_guard(c);
+            if c.guard.get() != GUARD_LIVE {
+                if c.guard.get() == GUARD_DEAD {
+                    note_dead(-(((class + 1) * STEP) as isize));
+                    return System.dealloc(ptr, class_layout(class));
                 }
-                if c.counts[class].get() < CLASS_CAPS[class] {
-                    unsafe { *(ptr as *mut *mut u8) = c.heads[class].get() };
-                    c.heads[class].set(ptr);
-                    c.counts[class].set(c.counts[class].get() + 1);
-                    stat!(cached(class_layout(class).size() as isize));
-                    true
-                } else {
-                    false
-                }
-            });
-            if !cached {
-                System.dealloc(ptr, class_layout(class));
+                register_guard(c);
             }
-            return;
+            let bytes = c.bytes.get() + (class + 1) * STEP;
+            if c.counts[class].get() < CLASS_CAPS[class] && bytes <= TOTAL_CACHE_BYTES {
+                unsafe { *(ptr as *mut *mut u8) = c.heads[class].get() };
+                c.heads[class].set(ptr);
+                c.counts[class].set(c.counts[class].get() + 1);
+                c.bytes.set(bytes);
+                stat!(cached(class_layout(class).size() as isize));
+                return;
+            }
+            note(c, -(((class + 1) * STEP) as isize));
+            return System.dealloc(ptr, class_layout(class));
+        }
+        if c.guard.get() == GUARD_DEAD {
+            note_dead(-(layout.size() as isize));
+        } else {
+            note(c, -(layout.size() as isize));
         }
         System.dealloc(ptr, layout)
     }
@@ -444,5 +523,32 @@ unsafe impl GlobalAlloc for ClassAlloc {
             stats::trace(new_size, cat);
         }
         n.add(STEP)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_whole_cache_stays_within_its_budget() {
+        std::thread::spawn(|| {
+            let allocator = ClassAlloc;
+            for class in 0..8 {
+                let layout = class_layout(class);
+                let n = BYTES_PER_SMALL_CLASS / layout.size();
+                let blocks: Vec<_> = (0..n).map(|_| unsafe { allocator.raw_alloc(layout) }).collect();
+                for b in blocks {
+                    unsafe { allocator.raw_dealloc(b, layout) };
+                }
+            }
+            let cached = cached_bytes_for_test();
+            assert!(cached <= TOTAL_CACHE_BYTES, "{cached} bytes cached");
+            assert!(cached >= TOTAL_CACHE_BYTES - MAX_CLASS, "{cached} bytes cached");
+            trim();
+            assert_eq!(cached_bytes_for_test(), 0);
+        })
+        .join()
+        .unwrap();
     }
 }

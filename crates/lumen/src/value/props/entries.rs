@@ -8,7 +8,7 @@
 //! mode is a plain vector.
 //!
 //! Inline mode (`cap & INLINE_FLAG`): `ptr` points at the property slots trailing the object's
-//! own heap box (`heap::SlotClass::Inline`), so a small object's entries need no allocation.
+//! own heap box (an inline `heap::SlotClass`), so a small object's entries need no allocation.
 //! The storage belongs to the box, not to this vector: an inline `EntryVec` (and the `Props`
 //! holding it) must stay inside that object. It is only ever installed by `Object`
 //! construction, and nothing moves a map out of a live object (maps are replaced by

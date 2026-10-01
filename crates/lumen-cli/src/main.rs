@@ -9,8 +9,12 @@
 //!   lumen-cli -v | --version           print the version
 //!   lumen-cli typed [--report|--json|--facts|--strip] FILE...   typed-tier analysis (see typed.rs)
 //!   --tier=interp|bytecode, --tier-threshold=N   select the engine execution tier
+//!   --max-old-space-size=MB            heap limit: past it scripts get a RangeError
+//!   --timeout=MS (or LUMEN_TIMEOUT_MS)  stop the script after MS milliseconds (exit 124)
 
 use std::io::{IsTerminal, Read};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use lumen_host::Completion;
 use lumen_repl::Repl;
@@ -49,6 +53,10 @@ fn real_main() {
     let mut file = None;
     let mut force_repl = false;
     let mut expose_gc = false;
+    let mut heap_mb = None;
+    let mut timeout_ms = std::env::var("LUMEN_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
     // Runtime flags seen before the script, reported as `process.execArgv` (Node's split).
     let mut exec_argv = Vec::new();
 
@@ -97,6 +105,19 @@ fn real_main() {
             return;
         } else if a == "--expose-gc" || a == "--expose_gc" {
             expose_gc = true;
+        } else if let Some(n) = a
+            .strip_prefix("--max-old-space-size=")
+            .or_else(|| a.strip_prefix("--max_old_space_size="))
+        {
+            match n.parse::<f64>() {
+                Ok(mb) if mb > 0.0 => heap_mb = Some(mb),
+                _ => die(2, &format!("{argv0}: invalid value for {a}")),
+            }
+        } else if let Some(n) = a.strip_prefix("--timeout=") {
+            match n.parse::<u64>() {
+                Ok(ms) => timeout_ms = Some(ms),
+                Err(_) => die(2, &format!("{argv0}: invalid value for {a}")),
+            }
         } else if is_ignored_node_flag(&a) {
             // Accepted for Node command-line compatibility; lumen has no equivalent knob.
         } else if a.starts_with("--") {
@@ -129,6 +150,14 @@ fn real_main() {
     }
     if let Some(n) = threshold {
         runtime.engine().set_tier_threshold(n);
+    }
+    if let Some(mb) = heap_mb {
+        runtime
+            .engine()
+            .set_heap_limit((mb * 1024.0 * 1024.0) as usize);
+    }
+    if let Some(ms) = timeout_ms.filter(|&ms| ms > 0) {
+        start_watchdog(&mut runtime, ms);
     }
 
     if let Some(code) = eval_source {
@@ -175,6 +204,7 @@ fn real_main() {
             die(1, &format!("Uncaught {e}"));
         }
         let code = runtime.finish_process();
+        exit_if_timed_out();
         mem_report(&mut runtime);
         if code != 0 {
             std::process::exit(code);
@@ -228,6 +258,7 @@ fn run_source(runtime: &mut Runtime, src: &str) {
     match runtime.eval(src) {
         Ok(Completion::Value(_)) => {
             let code = runtime.finish_process();
+            exit_if_timed_out();
             mem_report(runtime);
             if code != 0 {
                 std::process::exit(code);
@@ -308,7 +339,38 @@ fn is_ignored_node_flag(a: &str) -> bool {
         || a.starts_with("--max-http-header-size=")
 }
 
+/// The `--timeout` budget in ms once it ran out (0 while it has not).
+static TIMED_OUT_AFTER: AtomicU64 = AtomicU64::new(0);
+
+/// `--timeout`: a watchdog thread raises the engine interrupt when the budget runs out, so the
+/// script stops at its next safe point and the CLI exits 124 (`timeout(1)`'s code). A realm
+/// blocked in the event loop (a pending timer) never reaches one: the watchdog exits itself
+/// after a short grace.
+fn start_watchdog(runtime: &mut Runtime, ms: u64) {
+    let flag = Arc::new(AtomicBool::new(false));
+    runtime.engine().set_interrupt(Arc::clone(&flag));
+    std::thread::Builder::new()
+        .name("lumen-timeout".to_string())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            exit_if_timed_out();
+        })
+        .expect("spawn timeout watchdog");
+}
+
+fn exit_if_timed_out() {
+    let ms = TIMED_OUT_AFTER.load(Ordering::SeqCst);
+    if ms != 0 {
+        eprintln!("lumen: script timed out after {ms} ms");
+        std::process::exit(124);
+    }
+}
+
 fn die(code: i32, message: &str) -> ! {
+    exit_if_timed_out();
     eprintln!("{message}");
     std::process::exit(code);
 }

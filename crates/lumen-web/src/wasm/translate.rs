@@ -86,7 +86,10 @@ pub fn bridge_stub(ty: &FuncType, callee: Option<u64>) -> Result<Function, Strin
     }
     let sig = native_signature(ty)?;
     let mut f = Function::new("bridge", sig);
-    let helper = f.import_function(Signature::new(vec![Type::I64], vec![Type::I32]), HELPER_CALL_SLOW);
+    let helper = f.import_function(
+        Signature::new(vec![Type::I64], vec![Type::I32]),
+        HELPER_CALL_SLOW,
+    );
     let mut b = FunctionBuilder::new(&mut f);
     let entry = b.create_entry_block();
     let params = b.block_params(entry).to_vec();
@@ -144,7 +147,9 @@ pub fn func_type(m: &Module, f: u32) -> Result<&FuncType, String> {
             })
             .nth(f as usize)
     } else {
-        m.func_types.get((f - m.imported_func_count) as usize).copied()
+        m.func_types
+            .get((f - m.imported_func_count) as usize)
+            .copied()
     };
     ti.and_then(|t| m.types.get(t as usize))
         .ok_or_else(|| format!("wasm jit: bad function index {f}"))
@@ -207,7 +212,10 @@ impl Cursor<'_> {
         Ok(s.try_into().unwrap())
     }
     fn block_type(&mut self, m: &Module) -> Result<(Vec<Type>, Vec<Type>), String> {
-        let b = *self.code.get(self.pos).ok_or("wasm jit: truncated blocktype")?;
+        let b = *self
+            .code
+            .get(self.pos)
+            .ok_or("wasm jit: truncated blocktype")?;
         if b == 0x40 {
             self.pos += 1;
             return Ok((vec![], vec![]));
@@ -396,7 +404,9 @@ fn zero(b: &mut FunctionBuilder, t: Type) -> Value {
 
 impl Translator<'_, '_> {
     fn pop(&mut self) -> Result<Value, String> {
-        self.stack.pop().ok_or_else(|| "wasm jit: operand stack underflow".into())
+        self.stack
+            .pop()
+            .ok_or_else(|| "wasm jit: operand stack underflow".into())
     }
     fn popn(&mut self, n: usize) -> Result<Vec<Value>, String> {
         if self.stack.len() < n {
@@ -530,7 +540,13 @@ impl Translator<'_, '_> {
 
     // ----- calls -----------------------------------------------------------------------------
 
-    fn helper(&mut self, id: u32, params: Vec<Type>, results: Vec<Type>, args: &[Value]) -> Vec<Value> {
+    fn helper(
+        &mut self,
+        id: u32,
+        params: Vec<Type>,
+        results: Vec<Type>,
+        args: &[Value],
+    ) -> Vec<Value> {
         let mut p = vec![Type::I64];
         p.extend(params);
         let fr = self.b.func.import_function(Signature::new(p, results), id);
@@ -572,7 +588,12 @@ impl Translator<'_, '_> {
             vec![Type::I64],
             &[ti, tb, elem],
         )[0];
-        for code in [trap::TABLE_OOB, trap::NULL_ELEMENT, trap::SIGNATURE_MISMATCH, trap::HELPER] {
+        for code in [
+            trap::TABLE_OOB,
+            trap::NULL_ELEMENT,
+            trap::SIGNATURE_MISMATCH,
+            trap::HELPER,
+        ] {
             let c = self.b.iconst(Type::I64, code as i64);
             let is = self.b.icmp(IntCC::Eq, slot, c);
             self.b.trap_if(is, code);
@@ -590,7 +611,13 @@ impl Translator<'_, '_> {
 
     // ----- control ---------------------------------------------------------------------------
 
-    fn push_frame(&mut self, kind: FrameKind, params: Vec<Type>, results: Vec<Type>, header: Option<Block>) -> Result<(), String> {
+    fn push_frame(
+        &mut self,
+        kind: FrameKind,
+        params: Vec<Type>,
+        results: Vec<Type>,
+        header: Option<Block>,
+    ) -> Result<(), String> {
         let end = self.b.create_block();
         for &t in &results {
             self.b.append_block_param(end, t);
@@ -727,7 +754,7 @@ impl Translator<'_, '_> {
             }
             0x0e => {
                 let n = cur.u32()?;
-                let mut depths = Vec::with_capacity(n as usize);
+                let mut depths = Vec::with_capacity((n as usize).min(cur.code.len() - cur.pos));
                 for _ in 0..n {
                     depths.push(cur.u32()?);
                 }
@@ -789,7 +816,11 @@ impl Translator<'_, '_> {
             0x21 | 0x22 => {
                 let i = cur.u32()? as usize;
                 let var = *self.locals.get(i).ok_or("wasm jit: bad local")?;
-                let v = if op == 0x21 { self.pop()? } else { *self.stack.last().ok_or("wasm jit: underflow")? };
+                let v = if op == 0x21 {
+                    self.pop()?
+                } else {
+                    *self.stack.last().ok_or("wasm jit: underflow")?
+                };
                 self.b.def_var(var, v);
             }
             0x23 => {
@@ -841,7 +872,12 @@ impl Translator<'_, '_> {
             0x40 => {
                 cur.byte()?;
                 let delta = self.pop()?;
-                let r = self.helper(HELPER_MEMORY_GROW, vec![Type::I32], vec![Type::I32], &[delta]);
+                let r = self.helper(
+                    HELPER_MEMORY_GROW,
+                    vec![Type::I32],
+                    vec![Type::I32],
+                    &[delta],
+                );
                 self.push(r[0]);
             }
             0x41 => {
@@ -904,7 +940,12 @@ impl Translator<'_, '_> {
             return Ok(());
         }
         let reachable = self.reachable;
-        let results = self.ctrl.last().ok_or("wasm jit: else without if")?.results.len();
+        let results = self
+            .ctrl
+            .last()
+            .ok_or("wasm jit: else without if")?
+            .results
+            .len();
         if reachable {
             let args = self.popn(results)?;
             let end = self.ctrl.last().unwrap().end;
@@ -1051,7 +1092,14 @@ impl Translator<'_, '_> {
             let z = self.b.icmp(IntCC::Eq, b, zero);
             self.b.trap_if(z, trap::DIV_BY_ZERO);
             if op == Sdiv {
-                let min = self.b.iconst(ty, if ty == Type::I32 { i32::MIN as i64 } else { i64::MIN });
+                let min = self.b.iconst(
+                    ty,
+                    if ty == Type::I32 {
+                        i32::MIN as i64
+                    } else {
+                        i64::MIN
+                    },
+                );
                 let neg1 = self.b.iconst(ty, -1);
                 let a_min = self.b.icmp(IntCC::Eq, a, min);
                 let b_neg1 = self.b.icmp(IntCC::Eq, b, neg1);
@@ -1118,7 +1166,11 @@ impl Translator<'_, '_> {
         let above = self.b.fcmp(FloatCC::Ge, x, hi);
         let out = self.b.binary(BinaryOp::Bor, below, above);
         self.b.trap_if(out, trap::INT_OVERFLOW);
-        let op = if signed { ConvOp::ToSint } else { ConvOp::ToUint };
+        let op = if signed {
+            ConvOp::ToSint
+        } else {
+            ConvOp::ToUint
+        };
         let v = self.b.convert(op, to, x);
         self.push(v);
         Ok(())
@@ -1129,7 +1181,11 @@ impl Translator<'_, '_> {
         match sub {
             0..=7 => {
                 let to = if sub < 4 { Type::I32 } else { Type::I64 };
-                let op = if sub % 2 == 0 { ConvOp::ToSintSat } else { ConvOp::ToUintSat };
+                let op = if sub % 2 == 0 {
+                    ConvOp::ToSintSat
+                } else {
+                    ConvOp::ToUintSat
+                };
                 self.conv(op, to)
             }
             10 | 11 => {
@@ -1140,7 +1196,11 @@ impl Translator<'_, '_> {
                     cur.byte()?;
                 }
                 let args = self.popn(3)?;
-                let id = if sub == 10 { HELPER_MEMORY_COPY } else { HELPER_MEMORY_FILL };
+                let id = if sub == 10 {
+                    HELPER_MEMORY_COPY
+                } else {
+                    HELPER_MEMORY_FILL
+                };
                 let r = self.helper(id, vec![Type::I32; 3], vec![Type::I32], &args)[0];
                 self.b.trap_if(r, trap::MEMORY_OOB);
                 Ok(())

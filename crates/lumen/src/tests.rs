@@ -851,6 +851,50 @@ fn gc_heap_reuses_dead_object_slots() {
 }
 
 #[test]
+fn gc_heap_returns_chunks_emptied_by_refcount() {
+    let base = crate::value::gc_heap_chunks();
+    let burst = || -> Vec<_> { (0..400_000).map(|_| crate::value::Object::new(None)).collect() };
+    let objects = burst();
+    let grown = crate::value::gc_heap_chunks();
+    assert!(grown > base + 100, "{base} -> {grown} chunks");
+
+    // Dropped without a collection: the first poll only schedules the purge, so a burst that
+    // immediately refills the chunks keeps them.
+    drop(objects);
+    crate::value::gc_trim_emptied();
+    assert_eq!(crate::value::gc_heap_chunks(), grown);
+    let objects = burst();
+    crate::value::gc_expire_purge_delay();
+    crate::value::gc_trim_emptied();
+    assert_eq!(crate::value::gc_heap_chunks(), grown);
+
+    // Still empty once the delay has passed: returned, all but a small reserve.
+    drop(objects);
+    crate::value::gc_trim_emptied();
+    crate::value::gc_expire_purge_delay();
+    crate::value::gc_trim_emptied();
+    let after = crate::value::gc_heap_chunks();
+    assert!(after <= base + 4 * 16 + 1, "{base} -> {grown} -> {after} chunks");
+
+    // Objects that die when a script's function returns are reclaimed through the engine's
+    // safe points (the interpreter's GC poll and the microtask checkpoint).
+    let mut e = Engine::new();
+    let before = crate::value::gc_heap_chunks();
+    e.eval(
+        "(function(){ var a=[]; for (var i=0;i<400000;i++) a.push({x:i,y:i}); return a.length })()",
+        false,
+    )
+    .expect("parse");
+    let peak = crate::value::gc_heap_chunks();
+    assert!(peak > before + 100, "{before} -> {peak} chunks");
+    e.interp.drain_microtasks();
+    crate::value::gc_expire_purge_delay();
+    e.interp.drain_microtasks();
+    let after = crate::value::gc_heap_chunks();
+    assert!(after <= before + 4 * 16 + 1, "{before} -> {peak} -> {after} chunks");
+}
+
+#[test]
 fn unicode_ident_escapes() {
     assert_eq!(run("var \\u0061 = 5; a"), "5");
     assert_eq!(run("var a\\u0062c = 7; abc"), "7");
@@ -11457,10 +11501,12 @@ fn an_eager_body_is_never_released() {
         },
         other => panic!("unexpected statement {other:?}"),
     };
-    assert!(f.lazy.borrow().is_none(), "an IIFE is parsed at load");
-    let _ = f.body();
+    assert!(f.parsed_body().is_some(), "an IIFE is parsed at load");
+    let first = f.body();
     crate::value::flush_cold_lazy_bodies();
     crate::value::flush_cold_lazy_bodies();
+    let again = f.body();
+    assert_eq!(first.len(), again.len());
     assert!(f.parsed_body().is_some());
 }
 
@@ -11508,4 +11554,95 @@ fn live_object_ceiling_is_catchable() {
         Completion::Value(v) => assert_eq!(v, "RangeError:true:1000:1000"),
         Completion::Throw { name, message } => panic!("threw {name}: {message}"),
     }
+}
+
+#[test]
+fn regexp_backtrack_limit_throws_range_error() {
+    let evil = "var re = /(a+)+b/g; var s = 'a'.repeat(40);";
+    for call in [
+        "re.exec(s)",
+        "re.test(s)",
+        "s.match(re)",
+        "[...s.matchAll(re)]",
+        "s.replace(re, 'x')",
+        "s.replace(re, () => 'x')",
+        "s.replaceAll(re, 'x')",
+        "s.search(re)",
+        "s.split(re)",
+        "RegExp.prototype[Symbol.replace].call(re, s, 'x')",
+        "/(a+)+b/y.test(s)",
+    ] {
+        assert_eq!(throws(&format!("{evil} {call}")), "RangeError", "{call}");
+    }
+    assert_eq!(run("/(a|b)*c/.test('ab'.repeat(5e5) + 'c')"), "true");
+    assert_eq!(run("'ab ab '.repeat(2e5).replace(/\\w+/g, 'x').length"), "800000");
+}
+
+#[test]
+fn hash_flooding_keys_stay_fast_and_js_order_stays_insertion_order() {
+    use crate::fasthash::tests::{old_colliding_keys, OldFx};
+    use std::time::{Duration, Instant};
+    let escaped = |k: &str| k.bytes().map(|b| format!("\\x{b:02x}")).collect::<String>();
+    let script = |keys: &[String]| {
+        let list = keys
+            .iter()
+            .map(|k| format!("\"{}\"", escaped(k)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "var ks = [{list}]; var o = {{}}, m = new Map(), s = new Set();
+             for (var i = 0; i < ks.length; i++) {{ o[ks[i]] = i; m.set(ks[i], i); s.add(ks[i]); }}
+             var j = JSON.parse(JSON.stringify(o));
+             var ok = Object.keys(o).every((k, i) => k === ks[i] && o[k] === i)
+               && Object.keys(j).every((k, i) => k === ks[i])
+               && [...m.keys()].every((k, i) => k === ks[i] && m.get(k) === i)
+               && [...s].every((k, i) => k === ks[i]);
+             String(ok)"
+        )
+    };
+    let hostile = old_colliding_keys(&OldFx::default(), 5_000);
+    let benign: Vec<String> = (0..hostile.len()).map(|i| format!("benign-{i:05}")).collect();
+    let time = |keys: &[String]| {
+        let src = script(keys);
+        let start = Instant::now();
+        assert_eq!(run(&src), "true");
+        start.elapsed()
+    };
+    let (hostile, benign) = (time(&hostile), time(&benign));
+    assert!(
+        hostile < benign * 10 + Duration::from_millis(200),
+        "hostile {hostile:?} vs benign {benign:?}"
+    );
+}
+
+#[test]
+fn global_declarations_define_properties_in_hoisting_order() {
+    // More than a small scope's worth of names, so the probe scope is hash-backed.
+    let names = |p: &str| -> Vec<String> {
+        (0..40)
+            .map(|i| format!("{p}{}x{i}", (i * 7919) % 97))
+            .collect()
+    };
+    let decls = |ns: &[String]| ns.iter().map(|n| format!("var {n};")).collect::<String>();
+    let listed = |p: &str| {
+        format!("Object.getOwnPropertyNames(globalThis).filter(k => /^{p}\\d+x\\d+$|^{p}f/.test(k)).join()")
+    };
+    let (script, evald) = (names("g"), names("e"));
+    let src = format!(
+        "{} function gfz() {{}} function gfa() {{}}
+         (0, eval)('{} function efz() {{}} function efa() {{}}');
+         [{}, {}].join(';')",
+        decls(&script),
+        decls(&evald),
+        listed("g"),
+        listed("e"),
+    );
+    let expect = |mut ns: Vec<String>, p: &str| {
+        ns.extend([format!("{p}fz"), format!("{p}fa")]);
+        ns.join(",")
+    };
+    assert_eq!(
+        run(&src),
+        format!("{};{}", expect(script, "g"), expect(evald, "e"))
+    );
 }

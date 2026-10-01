@@ -15,7 +15,7 @@
 //! recursion limit, a second realm appearing, `f.arguments` reflection being switched on) is
 //! re-checked per call, and anything unusual takes [`Interp::call`] with identical semantics.
 use super::*;
-use crate::interpreter::{FnFrame, MAX_EVAL_DEPTH};
+use crate::interpreter::FnFrame;
 use crate::value::{Callable, NativeFn};
 
 /// A callee resolved for repeated calls with a fixed `this` (see the module docs).
@@ -67,7 +67,7 @@ impl PreparedCall {
                     s.push(std::mem::take(v));
                 }
             }),
-            Kind::Native(f) if i.depth < MAX_EVAL_DEPTH && !i.multi_realm() => {
+            Kind::Native(f) if i.depth < i.depth_limit && !i.multi_realm() => {
                 let f = *f;
                 call_native_prepared(i, f, &self.this, args)
             }
@@ -138,7 +138,7 @@ pub(crate) fn call_once_direct(
     arg: Value,
 ) -> Result<Result<Value, Abrupt>, Value> {
     let Value::Obj(o) = callee else { return Err(arg) };
-    if matches!(i.tier, Tier::Interp) || i.depth >= MAX_EVAL_DEPTH || i.multi_realm() {
+    if matches!(i.tier, Tier::Interp) || i.depth >= i.depth_limit || i.multi_realm() {
         return Err(arg);
     }
     let key = Gc::as_ptr(o) as usize;
@@ -153,7 +153,7 @@ pub(crate) fn call_once_direct(
         if f.is_generator
             || f.is_async
             || (!i.class_info.is_empty() && i.class_info.contains_key(&key))
-            || u.env.borrow().under_with
+            || u.env.borrow().under_with()
             || chunk.activation_layout.is_some()
             || chunk.arguments_slot.is_some()
             || chunk.rest_slot.is_some()
@@ -208,7 +208,7 @@ fn resolve(i: &mut Interp, callee: &Value) -> Kind {
             if f.is_generator
                 || f.is_async
                 || (!i.class_info.is_empty() && i.class_info.contains_key(&key))
-                || u.env.borrow().under_with
+                || u.env.borrow().under_with()
                 || chunk.activation_layout.is_some()
                 || chunk.arguments_slot.is_some()
                 || chunk.rest_slot.is_some()
@@ -347,7 +347,7 @@ fn call_compiled_prepared(
 /// ordinary path records the arguments for it).
 #[inline(always)]
 fn compiled_ok(i: &Interp, c: &Compiled) -> bool {
-    i.depth < MAX_EVAL_DEPTH && !i.multi_realm() && !(c.chunk.reflect_args && reflect::enabled())
+    i.depth < i.depth_limit && !i.multi_realm() && !(c.chunk.reflect_args && reflect::enabled())
 }
 
 /// `Interp::call` → `call_dispatch` → `dispatch_native` for a [`Kind::Native`] callee.

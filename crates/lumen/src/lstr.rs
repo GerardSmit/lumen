@@ -33,10 +33,13 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
 use std::ptr::NonNull;
 
+#[repr(C, align(8))]
 struct Header {
-    strong: Cell<usize>,
+    /// Saturates at `u32::MAX` (then the string is immortal); see [`STRONG_STICKY`].
+    strong: Cell<u32>,
     len: Cell<u32>,
     cap: Cell<u32>,
+    _spare: u32,
     // `cap` bytes of UTF-8 follow.
 }
 
@@ -53,6 +56,9 @@ pub(crate) const LSTR_CAP_OFFSET: usize = std::mem::offset_of!(Header, cap);
 /// Offset of the header's strong count (the JIT's inline retain / release of a string that
 /// stays alive).
 pub(crate) const LSTR_STRONG_OFFSET: usize = std::mem::offset_of!(Header, strong);
+/// A strong count at this value never changes again: a string with 2^32 references leaks
+/// rather than wrapping into a premature free.
+pub(crate) const STRONG_STICKY: u32 = u32::MAX;
 /// Offset of the content bytes from the header (the JIT's inline `charCodeAt`).
 pub(crate) const LSTR_DATA_OFFSET: usize = HDR;
 
@@ -175,6 +181,7 @@ impl LStr {
                 strong: Cell::new(1),
                 len: Cell::new(content.len() as u32),
                 cap: Cell::new(cap | hint),
+                _spare: 0,
             });
             let data = (p.as_ptr() as *mut u8).add(HDR);
             std::ptr::copy_nonoverlapping(content.as_ptr(), data, content.len());
@@ -186,6 +193,12 @@ impl LStr {
     #[inline]
     pub(crate) fn ascii_hint(&self) -> bool {
         self.hdr().cap.get() & ASCII_HINT != 0
+    }
+
+    /// Record content found to be all-ASCII (mutators clear the hint again as needed).
+    pub(crate) fn mark_ascii(&self) {
+        let h = self.hdr();
+        h.cap.set(h.cap.get() | ASCII_HINT);
     }
 
     #[inline]
@@ -269,7 +282,7 @@ impl LStr {
             return LStr::from(piece);
         }
         let ascii = self.ascii_hint() || piece.is_ascii();
-        rh.strong.set(rh.strong.get() + 1);
+        bump(&rh.strong);
         rh.cap.set(rh.cap.get() | ROOT);
         unsafe {
             let v = alloc(Layout::new::<ViewHdr>()) as *mut ViewHdr;
@@ -289,6 +302,7 @@ impl LStr {
                     strong: Cell::new(1),
                     len: Cell::new(piece.len() as u32),
                     cap: Cell::new(VIEW | if ascii { ASCII_HINT } else { 0 }),
+                    _spare: 0,
                 },
                 root,
                 off: (piece.as_ptr() as usize - (root.as_ptr() as usize + HDR)) as u32,
@@ -302,6 +316,26 @@ impl LStr {
     #[inline]
     pub fn is_view(&self) -> bool {
         self.hdr().cap.get() & VIEW != 0
+    }
+
+    /// `prefix + self` as a view of `self`'s root, when `self` is a view whose root holds
+    /// exactly `prefix` right before it. Lets a chain of prefixed strings ("bound bound … f")
+    /// share one buffer instead of copying the whole string per link.
+    pub fn view_extend_front(&self, prefix: &str) -> Option<LStr> {
+        if !self.is_view() {
+            return None;
+        }
+        let (root, off) = unsafe {
+            let v = &*(self.p.as_ptr() as *const ViewHdr);
+            (std::mem::ManuallyDrop::new(LStr { p: v.root }), v.off as usize)
+        };
+        let start = off.checked_sub(prefix.len())?;
+        let whole = root.as_str();
+        if whole.as_bytes().get(start..off)? != prefix.as_bytes() {
+            return None;
+        }
+        let piece = whole.get(start..off + self.len())?;
+        Some(root.sub(piece))
     }
 
     /// Free a view whose last reference is going: unregister it and release its root.
@@ -351,7 +385,7 @@ impl LStr {
 
     #[inline]
     pub fn strong_count(&self) -> usize {
-        self.hdr().strong.get()
+        self.hdr().strong.get() as usize
     }
 
     /// Append in place when this is the ONLY reference and capacity suffices. Returns false
@@ -397,8 +431,7 @@ impl LStr {
 impl Clone for LStr {
     #[inline]
     fn clone(&self) -> LStr {
-        let h = self.hdr();
-        h.strong.set(h.strong.get() + 1);
+        bump(&self.hdr().strong);
         LStr { p: self.p }
     }
 }
@@ -415,10 +448,16 @@ impl Drop for LStr {
                 return;
             }
             unsafe { dealloc(self.p.as_ptr() as *mut u8, layout(cap & CAP_MASK)) };
-        } else {
+        } else if s != STRONG_STICKY {
             h.strong.set(s - 1);
         }
     }
+}
+
+#[inline(always)]
+fn bump(c: &Cell<u32>) {
+    let s = c.get();
+    c.set(s + (s != STRONG_STICKY) as u32);
 }
 
 impl std::ops::Deref for LStr {
@@ -524,7 +563,7 @@ pub fn compact_views() -> usize {
             .iter()
             .filter(|(&k, e)| unsafe {
                 let h = &*(k as *const Header);
-                h.strong.get() == e.views.len() && e.bytes < h.len.get() as usize / 2
+                h.strong.get() as usize == e.views.len() && e.bytes < h.len.get() as usize / 2
             })
             .map(|(&k, _)| k)
             .collect()
@@ -571,7 +610,7 @@ pub fn compact_views() -> usize {
             nh.len.set(total as u32);
             nh.cap
                 .set(total as u32 | ((*old).cap.get() & ASCII_HINT) | ROOT);
-            nh.strong.set(e.views.len());
+            nh.strong.set(e.views.len() as u32);
             for v in &e.views {
                 let at = off(v);
                 let m = merged[merged.partition_point(|m| m.0 <= at) - 1];

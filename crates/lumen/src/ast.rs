@@ -29,18 +29,19 @@ pub enum Stmt {
         body: P<Stmt>,
         test: Expr,
     },
-    /// C-style `for (init; test; update) body`.
+    /// C-style `for (init; test; update) body`. The rarer statements box their large parts so
+    /// `Stmt` stays at the size of `If`.
     For {
         init: Option<P<ForInit>>,
-        test: Option<Expr>,
-        update: Option<Expr>,
+        test: Option<P<Expr>>,
+        update: Option<P<Expr>>,
         body: P<Stmt>,
     },
     /// `for (left in right) body` / `for (left of right) body` (`is_await` for `for await … of`).
     ForInOf {
         decl: Option<DeclKind>,
         left: Pattern,
-        right: Expr,
+        right: P<Expr>,
         of: bool,
         is_await: bool,
         body: P<Stmt>,
@@ -50,11 +51,11 @@ pub enum Stmt {
     Throw(Expr),
     Try {
         block: Vec<Stmt>,
-        handler: Option<(Option<Pattern>, Vec<Stmt>)>,
+        handler: Option<P<(Option<Pattern>, Vec<Stmt>)>>,
         finalizer: Option<Vec<Stmt>>,
     },
     Switch {
-        disc: Expr,
+        disc: P<Expr>,
         cases: Vec<SwitchCase>,
     },
     Labeled {
@@ -842,7 +843,7 @@ fn scan_stmt(s: &Stmt, flags: &mut u8) {
             finalizer,
         } => {
             scan_stmts(block, flags);
-            if let Some((param, hbody)) = handler {
+            if let Some((param, hbody)) = handler.as_deref() {
                 if let Some(p) = param {
                     scan_pattern(p, flags);
                 }
@@ -1088,6 +1089,14 @@ fn scan_pattern(p: &Pattern, flags: &mut u8) {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub pattern: Pattern,
-    pub default: Option<Expr>,
+    pub default: Option<P<Expr>>,
     pub rest: bool,
 }
+
+// Node sizes multiply across a large program's AST: keep rare, large statement parts boxed.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<Stmt>() <= 80);
+    assert!(std::mem::size_of::<Expr>() <= 56);
+    assert!(std::mem::size_of::<Param>() <= 64);
+};

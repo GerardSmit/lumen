@@ -1139,7 +1139,7 @@ fn hoisted_vars_stmt(
             hoisted_vars(block, false, strict, out)
                 && handler
                     .as_ref()
-                    .map(|(_, b)| hoisted_vars(b, false, strict, out))
+                    .map(|h| &h.1).map(|b| hoisted_vars(b, false, strict, out))
                     .unwrap_or(true)
                 && finalizer
                     .as_ref()
@@ -1471,6 +1471,9 @@ impl CaptureScan {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Option<()> {
+        if crate::stack::exhausted() {
+            return None;
+        }
         match s {
             Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
             Stmt::VarDecl { decls, .. } => {
@@ -1596,7 +1599,7 @@ impl CaptureScan {
                 finalizer,
             } => {
                 self.block(block)?;
-                if let Some((param, body)) = handler {
+                if let Some((param, body)) = handler.as_deref() {
                     let mut names = std::collections::HashSet::new();
                     if let Some(p) = param {
                         pat_idents(p, &mut names);
@@ -1729,6 +1732,9 @@ impl CaptureScan {
     }
 
     fn expr(&mut self, e: &Expr) -> Option<()> {
+        if crate::stack::exhausted() {
+            return None;
+        }
         match e {
             Expr::Num(_)
             | Expr::BigInt(_)
@@ -2122,7 +2128,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
                 return None;
             }
             pattern_params.push((slot, &p.pattern));
-            inits.push(ParamInit::Pattern(slot, &p.pattern, p.default.as_ref()));
+            inits.push(ParamInit::Pattern(slot, &p.pattern, p.default.as_deref()));
             continue;
         };
         if let Some(d) = &p.default {
@@ -3497,6 +3503,9 @@ impl Compiler {
     }
 
     fn stmt(&mut self, s: &Stmt) -> CResult {
+        if crate::stack::exhausted() {
+            return Err(Bail);
+        }
         let r = self.stmt_inner(s);
         if r.is_err() {
             note_bail_reason(|| format!("stmt {}", node_kind(s)));
@@ -3686,7 +3695,7 @@ impl Compiler {
             } => {
                 self.scopes.push(Vec::new());
                 let depth = self.blk_envs.len();
-                let r = self.for_loop(init.as_deref(), test.as_ref(), update.as_ref(), body);
+                let r = self.for_loop(init.as_deref(), test.as_deref(), update.as_deref(), body);
                 self.blk_envs.truncate(depth);
                 self.scopes.pop();
                 r
@@ -3771,8 +3780,8 @@ impl Compiler {
                 block,
                 handler,
                 finalizer: Some(fin),
-            } => self.try_finally(block, handler.as_ref(), fin),
-            Stmt::Try { block, handler, .. } => self.try_catch(block, handler.as_ref()),
+            } => self.try_finally(block, handler.as_deref(), fin),
+            Stmt::Try { block, handler, .. } => self.try_catch(block, handler.as_deref()),
             Stmt::ForInOf {
                 decl: Some(kind @ (DeclKind::Let | DeclKind::Const)),
                 left: Pattern::Ident(name),
@@ -4476,6 +4485,10 @@ impl Compiler {
     }
 
     fn expr(&mut self, e: &Expr) -> CResult {
+        // Out of native stack: bail to the tree-walker, which throws a RangeError.
+        if crate::stack::exhausted() {
+            return Err(Bail);
+        }
         let saved_site = match e {
             Expr::Call { pos, .. } | Expr::New { pos, .. } => {
                 Some(std::mem::replace(&mut self.site, pos.wrapping_add(1)))
@@ -5560,7 +5573,7 @@ pub(crate) fn inline_callee(i: &Interp, callee: &Value) -> Option<InlineCallee> 
     };
     if f.is_generator
         || f.is_async
-        || i.depth >= crate::interpreter::MAX_EVAL_DEPTH
+        || i.depth >= i.depth_limit
         || matches!(i.tier, Tier::Interp)
         || i.multi_realm()
     {
@@ -5571,7 +5584,7 @@ pub(crate) fn inline_callee(i: &Interp, callee: &Value) -> Option<InlineCallee> 
     let key = Gc::as_ptr(o) as usize;
     if (f.is_strict && !f.is_arrow && !i.class_info.is_empty() && i.class_info.contains_key(&key))
         || (!i.proxies.is_empty() && i.proxies.contains_key(&key))
-        || u.env.borrow().under_with
+        || u.env.borrow().under_with()
     {
         return None;
     }
@@ -5603,7 +5616,7 @@ pub(crate) fn inline_ctor(i: &Interp, callee: &Value) -> Option<InlineCallee> {
         || f.is_method
         || f.is_generator
         || f.is_async
-        || i.depth >= crate::interpreter::MAX_EVAL_DEPTH
+        || i.depth >= i.depth_limit
         || matches!(i.tier, Tier::Interp)
         || i.multi_realm()
     {
@@ -5612,7 +5625,7 @@ pub(crate) fn inline_ctor(i: &Interp, callee: &Value) -> Option<InlineCallee> {
     let key = Gc::as_ptr(o) as usize;
     if (!i.class_info.is_empty() && i.class_info.contains_key(&key))
         || (!i.proxies.is_empty() && i.proxies.contains_key(&key))
-        || u.env.borrow().under_with
+        || u.env.borrow().under_with()
     {
         return None;
     }
@@ -5671,7 +5684,10 @@ unsafe fn enter_inline(
     // with new.target = the callee itself.
     let instance = if construct {
         let own = match &stack[at - 1] {
-            Value::Obj(o) => class_fields::own_prototype(o),
+            Value::Obj(o) => {
+                i.materialize_fn(o);
+                class_fields::own_prototype(o)
+            }
             _ => None,
         };
         let proto = match own.map_or_else(|| i.get_member(&stack[at - 1], "prototype"), Ok) {
@@ -5854,6 +5870,16 @@ unsafe fn enter_frame(
 /// than a share of `MAX_EVAL_DEPTH`: tail recursion must fit any thread's stack (a 2 MB test
 /// thread included), whatever the ceiling for ordinary recursion.
 pub(crate) const TAIL_NEST: u32 = 96;
+
+/// Native stack a tail call made as an ordinary call must leave free: past it the call takes the
+/// trampoline even within `TAIL_NEST` (unoptimized builds spend ~100 KiB per nested call).
+const TAIL_ROOM: usize = 512 * 1024;
+
+/// Whether a tail call that cannot release its frame in place goes through the trampoline.
+#[inline]
+pub(crate) fn tail_nest_exceeded(i: &Interp) -> bool {
+    i.depth > TAIL_NEST || crate::stack::headroom().is_none_or(|r| r < TAIL_ROOM)
+}
 
 /// PrepareForTailCall in the innermost [`InlineFrame`]: move its top `n` operand-stack entries
 /// (the call window) onto its caller's operand stack (the root's `root_stack` when it is the
@@ -6269,7 +6295,7 @@ fn run_vm_frames<const ONE: bool>(
                 // The root frame: an inline callee runs as the first inline frame (its own tail
                 // calls then replace it) while this frame waits in its `Return`.
                 try_inline_call!(at, has_this);
-                if i.depth > TAIL_NEST && i.leaf_native(&stack[at - 1]).is_none() {
+                if tail_nest_exceeded(i) && i.leaf_native(&stack[at - 1]).is_none() {
                     // Past `TAIL_NEST`, anything else but a plain native (which cannot come back
                     // through this frame): the `Interp::call` trampoline (or the compiled-call
                     // paths that mirror it) makes the call once this body has returned, so tail
@@ -6279,7 +6305,7 @@ fn run_vm_frames<const ONE: bool>(
                     unsafe { stack.reload() };
                     return Ok(VmStep::Done(Value::Undefined));
                 }
-            } else if ONE && i.tco_ok && i.depth > TAIL_NEST && stack[at - 1].is_callable() {
+            } else if ONE && i.tco_ok && tail_nest_exceeded(i) && stack[at - 1].is_callable() {
                 // Native code's generic call-out (no frame to release here): an ordinary call
                 // while shallow; past `TAIL_NEST` the call is handed to the caller's trampoline
                 // (the pushed `undefined` is what the following `Return` returns), so unbounded
@@ -6371,14 +6397,13 @@ fn run_vm_frames<const ONE: bool>(
                     // Number and never thrown on like unary `+` would.
                     Value::BigInt(n) => {
                         let old = n.clone();
-                        let one = crate::bigint::JsBigInt::from_u64(1);
-                        let new = match kind {
-                            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => {
-                                old.add(&one)
-                            }
-                            UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => {
-                                old.sub(&one)
-                            }
+                        let inc = matches!(
+                            kind,
+                            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
+                        );
+                        let new = match old.checked_step(inc) {
+                            Ok(v) => v,
+                            Err(e) => return Err(i.throw("RangeError", e.message())),
                         };
                         slots[idx] = Value::BigInt(new.clone());
                         match kind {
@@ -6663,7 +6688,9 @@ fn run_vm_frames<const ONE: bool>(
                         }
                     }
                     (Value::Str(s), Value::Num(n)) => {
-                        if let Some(v) = str_index_fast(s, *n) {
+                        if let Some(v) =
+                            str_index_fast(s, *n).or_else(|| str_index_units(i, s, *n))
+                        {
                             stack.push(v);
                             continue;
                         }
@@ -6750,7 +6777,9 @@ fn run_vm_frames<const ONE: bool>(
                         }
                     }
                     (Value::Str(st), Value::Num(n)) => {
-                        if let Some(v) = str_index_fast(st, *n) {
+                        if let Some(v) =
+                            str_index_fast(st, *n).or_else(|| str_index_units(i, st, *n))
+                        {
                             stack.push(v);
                             continue;
                         }
@@ -7690,10 +7719,10 @@ pub struct VmCoro {
     this_val: Value,
     slots: Vec<Value>,
     stack: Vec<Value>,
-    pc: usize,
+    pc: u32,
     /// The `try` handler stack, saved across suspensions so a rejected `await` inside a `try` still
-    /// lands in its `catch`.
-    handlers: Vec<Handler>,
+    /// lands in its `catch`. Boxed: most suspensions sit outside any `try`.
+    handlers: Option<Box<Vec<Handler>>>,
     pub done: bool,
     pub started: bool,
     /// A generator body's strictness, installed on the interpreter for each resume (a resume
@@ -7729,6 +7758,11 @@ impl VmCoro {
         let env = chunk.make_run_env(i, &env, &this_val, args);
         // Buffers come from the VM pool (see [`run`]) and go back when the body finishes.
         let (mut slots, stack) = i.vm_pool.pop().unwrap_or_default();
+        // A suspended body keeps its slots: size them exactly rather than to a pooled frame's.
+        if slots.capacity() > chunk.n_slots + 4 {
+            slots = Vec::new();
+        }
+        slots.reserve_exact(chunk.n_slots);
         let seed = chunk.n_params.min(args.len());
         slots.extend_from_slice(&args[..seed]);
         slots.resize(chunk.n_slots, Value::Undefined);
@@ -7743,7 +7777,7 @@ impl VmCoro {
             slots,
             stack,
             pc: 0,
-            handlers: Vec::new(),
+            handlers: None,
             done: false,
             started: false,
             strict: None,
@@ -7771,17 +7805,21 @@ impl VmCoro {
         let saved = (i.strict, i.tco_ok);
         i.strict = strict;
         i.tco_ok = false;
+        let mut pc = coro.pc as usize;
+        let mut handlers = Vec::new();
         let r = drive_vm(
             i,
             &coro.chunk,
             &coro.env,
             &mut coro.slots,
             &mut coro.stack,
-            &mut coro.pc,
+            &mut pc,
             &coro.this_val,
-            &mut coro.handlers,
+            &mut handlers,
             None,
         );
+        coro.pc = pc as u32;
+        coro.save_handlers(handlers);
         (i.strict, i.tco_ok) = saved;
         match r? {
             VmStep::Await(_) => {
@@ -7792,12 +7830,29 @@ impl VmCoro {
         }
     }
 
+    /// [`VmCoro::parked`] at a suspension, first giving back an empty operand stack's buffer:
+    /// a suspended body rarely holds operands, and thousands of pending ones would otherwise
+    /// each keep a grown buffer.
+    fn save_handlers(&mut self, handlers: Vec<Handler>) {
+        if !handlers.is_empty() {
+            self.handlers = Some(Box::new(handlers));
+        }
+    }
+
+    fn parked_shrunk(&mut self) -> Parked {
+        if self.stack.is_empty() && self.stack.capacity() != 0 {
+            self.stack = Vec::new();
+        }
+        self.parked()
+    }
+
     fn parked(&self) -> Parked {
         let ops = &self.chunk.ops;
-        if matches!(ops.get(self.pc), Some(Op::YieldDelegate(_))) {
+        let pc = self.pc as usize;
+        if matches!(ops.get(pc), Some(Op::YieldDelegate(_))) {
             return Parked::Delegate;
         }
-        match self.pc.checked_sub(1).map(|k| &ops[k]) {
+        match pc.checked_sub(1).map(|k| &ops[k]) {
             Some(Op::Yield) => Parked::Yield,
             Some(Op::InitialYield) | None => Parked::Start,
             _ => Parked::Await,
@@ -7819,6 +7874,9 @@ impl VmCoro {
             return Suspend::Done(Value::Undefined);
         }
         let parked = self.parked();
+        if self.stack.capacity() == 0 {
+            self.stack.reserve_exact(16);
+        }
         let pending_throw = match signal {
             Resume::Next(v) => {
                 match parked {
@@ -7870,22 +7928,26 @@ impl VmCoro {
             i.strict = strict;
             i.tco_ok = false;
         }
+        let mut pc = self.pc as usize;
+        let mut handlers = self.handlers.take().map_or_else(Vec::new, |h| *h);
         let r = drive_vm(
             i,
             &self.chunk,
             &self.env,
             &mut self.slots,
             &mut self.stack,
-            &mut self.pc,
+            &mut pc,
             &self.this_val,
-            &mut self.handlers,
+            &mut handlers,
             pending_throw,
         );
+        self.pc = pc as u32;
+        self.save_handlers(handlers);
         if self.strict.is_some() {
             (i.strict, i.tco_ok) = saved;
         }
         match r {
-            Ok(VmStep::Await(a)) => match self.parked() {
+            Ok(VmStep::Await(a)) => match self.parked_shrunk() {
                 Parked::Yield | Parked::Delegate => Suspend::Yield(a),
                 _ => Suspend::Await(a),
             },
@@ -7918,7 +7980,7 @@ impl VmCoro {
         if slots.capacity() != 0 && i.vm_pool.len() < 64 {
             i.vm_pool.push((slots, stack));
         }
-        self.handlers = Vec::new();
+        self.handlers = None;
         self.this_val = Value::Undefined;
     }
 }
@@ -7939,8 +8001,10 @@ fn step_value(
     );
     Ok(match old {
         Value::BigInt(n) => {
-            let one = crate::bigint::JsBigInt::from_u64(1);
-            let new = if inc { n.add(&one) } else { n.sub(&one) };
+            let new = match n.checked_step(inc) {
+                Ok(v) => v,
+                Err(e) => return Err(i.throw("RangeError", e.message())),
+            };
             set(i, Value::BigInt(new.clone()))?;
             match kind {
                 UpdKind::PreInc | UpdKind::PreDec => Some(Value::BigInt(new)),
@@ -8144,7 +8208,7 @@ impl Chunk {
         i: &Interp,
         env: &Env,
         c: u32,
-    ) -> Option<*const std::cell::RefCell<crate::value::Object>> {
+    ) -> Option<*const crate::value::ObjCell> {
         if c as usize >= self.name_caches.len() {
             return None;
         }
@@ -8204,11 +8268,11 @@ impl Chunk {
     fn name_ic_fill(&self, i: &Interp, env: &Env, n: u32, c: u32) -> Option<Value> {
         {
             let b = env.borrow();
-            if b.with_obj.is_some() {
+            if b.with_obj().is_some() {
                 return None;
             }
             if let Some(bd) = b.vars.get(&*self.names[n as usize]) {
-                if !bd.initialized || bd.import_ref.is_some() {
+                if !bd.initialized || bd.import {
                     return None;
                 }
                 let v = bd.value.clone();
@@ -8232,9 +8296,9 @@ impl Chunk {
             if self.makes_env() {
                 if let Some(p) = &b.parent {
                     let pb = p.borrow();
-                    if pb.with_obj.is_none() {
+                    if pb.with_obj().is_none() {
                         if let Some(bd) = pb.vars.get(&*self.names[n as usize]) {
-                            if bd.initialized && bd.import_ref.is_none() {
+                            if bd.initialized && !bd.import {
                                 let v = bd.value.clone();
                                 self.name_caches[c as usize].set(NameIc {
                                     env: Rc::as_ptr(p) as usize | 2,
@@ -8394,7 +8458,7 @@ impl Chunk {
             let b = env.borrow_mut();
             if b.vars.generation() == ic.gen {
                 let bd = unsafe { &mut *(ic.binding as usize as *mut crate::interpreter::Binding) };
-                if bd.initialized && bd.mutable && bd.import_ref.is_none() {
+                if bd.initialized && bd.mutable && !bd.import {
                     bd.value = value;
                     return Ok(());
                 }
@@ -8429,7 +8493,7 @@ impl Chunk {
                         let bd = unsafe {
                             &mut *(ic.binding as usize as *mut crate::interpreter::Binding)
                         };
-                        if bd.initialized && bd.mutable && bd.import_ref.is_none() {
+                        if bd.initialized && bd.mutable && !bd.import {
                             bd.value = value;
                             return Ok(());
                         }
@@ -8697,6 +8761,21 @@ pub(crate) fn str_index_fast(s: &crate::lstr::LStr, n: f64) -> Option<Value> {
         return None;
     }
     Some(Value::Str(crate::jstr::unit_lstr(u16::from(s.as_bytes()[n as usize]))))
+}
+
+/// `s[n]` for an in-range integer index of a string that may be non-ASCII (through the
+/// UTF-16 position index). `None` = generic path.
+#[inline(never)]
+pub(crate) fn str_index_units(
+    i: &mut crate::interpreter::Interp,
+    s: &crate::lstr::LStr,
+    n: f64,
+) -> Option<Value> {
+    if !(0.0..u32::MAX as f64).contains(&n) || n.fract() != 0.0 {
+        return None;
+    }
+    i.unit_at(s, n as usize)
+        .map(|u| Value::Str(crate::jstr::unit_lstr(u)))
 }
 
 /// `slots[d] += y` for a string accumulator (`s += x` / `s = s + x` fused into

@@ -1,5 +1,5 @@
 //! Heap edges for cycle collection, without materializing non-object property values.
-use super::{Callable, Gc, Property, Value, PACK_EMPTY, PACK_OBJ};
+use super::{Callable, Gc, Property, Value, PACK_OBJ};
 
 /// Release the source borrow before the collector follows edges, including self references.
 pub(crate) fn object_refs_into(object: &Gc, refs: &mut Vec<Gc>) {
@@ -39,21 +39,9 @@ pub(crate) fn object_refs_into(object: &Gc, refs: &mut Vec<Gc>) {
 }
 
 impl Property {
-    pub(super) fn is_empty(&self) -> bool {
-        self.packed.tag() == PACK_EMPTY
-    }
-
-    /// [`Clone::clone`] for a data property (no accessor box).
-    #[inline(always)]
-    pub(super) fn clone_plain(&self) -> Property {
-        debug_assert!(!self.accessor());
-        Property { packed: self.packed.clone(), meta: self.meta }
-    }
-
-    /// A present, writable, enumerable, configurable data property.
-    pub(crate) fn is_plain_element(&self) -> bool {
-        self.meta == super::PROP_WRITABLE | super::PROP_ENUMERABLE | super::PROP_CONFIGURABLE
-            && !self.is_empty()
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.packed.tag() == super::PACK_EMPTY
     }
 
     fn append_object_refs(&self, refs: &mut Vec<Gc>) {

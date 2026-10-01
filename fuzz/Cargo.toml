@@ -1,0 +1,56 @@
+[package]
+name = "lumen-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lumen = { path = "../crates/lumen", features = ["bench"] }
+lumen-runtime = { path = "../crates/lumen-runtime" }
+
+# Not part of the main workspace: needs nightly + libfuzzer and has its own lockfile.
+[workspace]
+members = []
+
+[profile.release]
+debug = 1
+panic = "abort"
+
+[[bin]]
+name = "wasm_decode"
+path = "fuzz_targets/wasm_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_parse"
+path = "fuzz_targets/json_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "regexp_compile"
+path = "fuzz_targets/regexp_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "js_parse"
+path = "fuzz_targets/js_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false

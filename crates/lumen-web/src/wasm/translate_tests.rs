@@ -248,14 +248,20 @@ impl TestEnv {
 impl Env for TestEnv {
     fn load(&mut self, addr: u64, bytes: u32) -> u64 {
         let a = addr as usize;
-        assert!(a + bytes as usize <= self.buf.len(), "load outside the test buffer: {a:#x}");
+        assert!(
+            a + bytes as usize <= self.buf.len(),
+            "load outside the test buffer: {a:#x}"
+        );
         let mut b = [0u8; 8];
         b[..bytes as usize].copy_from_slice(&self.buf[a..a + bytes as usize]);
         u64::from_le_bytes(b)
     }
     fn store(&mut self, addr: u64, bytes: u32, value: u64) {
         let a = addr as usize;
-        assert!(a + bytes as usize <= self.buf.len(), "store outside the test buffer: {a:#x}");
+        assert!(
+            a + bytes as usize <= self.buf.len(),
+            "store outside the test buffer: {a:#x}"
+        );
         self.buf[a..a + bytes as usize].copy_from_slice(&value.to_le_bytes()[..bytes as usize]);
     }
     fn call(&mut self, func: &ExtFunc, _: &Signature, args: &[u64]) -> Result<Vec<u64>, u32> {
@@ -272,7 +278,11 @@ impl Env for TestEnv {
                 Ok(vec![old])
             }
             HELPER_MEMORY_COPY | HELPER_MEMORY_FILL => {
-                let (d, s, n) = (args[1] as u32 as u64, args[2] as u32 as u64, args[3] as u32 as u64);
+                let (d, s, n) = (
+                    args[1] as u32 as u64,
+                    args[2] as u32 as u64,
+                    args[3] as u32 as u64,
+                );
                 let len = self.mem_len();
                 let fill = func.id == HELPER_MEMORY_FILL;
                 if d + n > len || (!fill && s + n > len) {
@@ -414,7 +424,9 @@ mod native {
         let mut mem = Box::new(mem);
         mem.reserve_exact(4 * PAGE_SIZE);
         let mut cells = cells;
-        let table: Vec<*mut u64> = (0..cells.len()).map(|i| &mut cells[i] as *mut u64).collect();
+        let table: Vec<*mut u64> = (0..cells.len())
+            .map(|i| &mut cells[i] as *mut u64)
+            .collect();
         let here = 0u8;
         let mut vm = VmCtx {
             mem_base: std::ptr::null_mut(),
@@ -449,7 +461,8 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
         let module = parse::decode(bytes).expect("decode");
         let funcs: Vec<Function> = (0..module.code.len() as u32)
             .map(|f| {
-                let mut func = translate::translate(&module, f).unwrap_or_else(|e| panic!("f{f}: {e}"));
+                let mut func =
+                    translate::translate(&module, f).unwrap_or_else(|e| panic!("f{f}: {e}"));
                 if optimize {
                     opt::optimize(&mut func);
                 }
@@ -461,7 +474,9 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
         for (f, args) in cases {
             // Fresh instances per case so memory and globals start equal.
             let mut store = Store::default();
-            let inst = store.instantiate(Rc::clone(&module), Imports::default()).unwrap();
+            let inst = store
+                .instantiate(Rc::clone(&module), Imports::default())
+                .unwrap();
             // The wasm interpreter is the reference here.
             store.native[inst] = None;
             let (_, addr) = store.export_addr(inst, &format!("f{f}")).unwrap();
@@ -492,9 +507,13 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
             #[cfg(target_arch = "x86_64")]
             if let Some(l) = &loaded {
                 let sig = &funcs[*f as usize].sig;
-                let (got, nmem, ncells) = native::run(l, sig, *f, &ir_args[1..], init_mem, init_cells);
-                let ctx = format!("f{f}{args:?} natively (optimize={optimize})
-{}", funcs[*f as usize]);
+                let (got, nmem, ncells) =
+                    native::run(l, sig, *f, &ir_args[1..], init_mem, init_cells);
+                let ctx = format!(
+                    "f{f}{args:?} natively (optimize={optimize})
+{}",
+                    funcs[*f as usize]
+                );
                 match (&want, &got) {
                     (Ok(w), Ok(g)) => {
                         let same = w.len() == g.len()
@@ -502,7 +521,10 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                                 let (a, b) = (val_bits(a), b);
                                 a == b || (is_nan_bits(a) && is_nan_bits(b))
                             });
-                        assert!(same, "results differ: interpreter {w:?}, native {g:x?} for {ctx}");
+                        assert!(
+                            same,
+                            "results differ: interpreter {w:?}, native {g:x?} for {ctx}"
+                        );
                         let imem = &store.memories[instance.mem_addrs[0]].bytes;
                         assert!(imem[..] == nmem[..], "memory differs after {ctx}");
                         for (i, &ga) in instance.global_addrs.iter().enumerate() {
@@ -510,10 +532,16 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                                 Val::I32(_) | Val::F32(_) => ncells[i] & 0xffff_ffff,
                                 _ => ncells[i],
                             };
-                            assert_eq!(val_bits(store.globals[ga].get()), t, "global {i} differs after {ctx}");
+                            assert_eq!(
+                                val_bits(store.globals[ga].get()),
+                                t,
+                                "global {i} differs after {ctx}"
+                            );
                         }
                     }
-                    (Err(w), Err(code)) => assert_eq!(w, trap::message(*code), "trap kinds differ for {ctx}"),
+                    (Err(w), Err(code)) => {
+                        assert_eq!(w, trap::message(*code), "trap kinds differ for {ctx}")
+                    }
                     (w, g) => panic!("outcomes differ: interpreter {w:?}, native {g:?} for {ctx}"),
                 }
             }
@@ -522,13 +550,20 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
             let ctx = format!("f{f}{args:?} (optimize={optimize})\n{}", funcs[*f as usize]);
             match (want, got) {
                 (Ok(w), Ok(g)) => {
-                    let g: Vec<Val> = g.iter().zip(&ty.results).map(|(&b, &t)| bits_val(t, b)).collect();
+                    let g: Vec<Val> = g
+                        .iter()
+                        .zip(&ty.results)
+                        .map(|(&b, &t)| bits_val(t, b))
+                        .collect();
                     let same = w.len() == g.len()
                         && w.iter().zip(&g).all(|(&a, &b)| {
                             let (a, b) = (val_bits(a), val_bits(b));
                             a == b || (is_nan_bits(a) && is_nan_bits(b))
                         });
-                    assert!(same, "results differ: interpreter {w:?}, IR {g:?} for {ctx}");
+                    assert!(
+                        same,
+                        "results differ: interpreter {w:?}, IR {g:?} for {ctx}"
+                    );
                 }
                 (Err(w), Err(code)) => {
                     assert_eq!(w, trap::message(code), "trap kinds differ for {ctx}");
@@ -544,7 +579,11 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                     Val::I32(_) | Val::F32(_) => cell & 0xffff_ffff,
                     _ => cell,
                 };
-                assert_eq!(val_bits(store.globals[ga].get()), t, "global {i} differs after {ctx}");
+                assert_eq!(
+                    val_bits(store.globals[ga].get()),
+                    t,
+                    "global {i} differs after {ctx}"
+                );
             }
         }
     }
@@ -604,12 +643,21 @@ fn loops_blocks_and_branches() {
         body: cat(&[
             vec![0x02, 0x40], // block
             vec![0x03, 0x40], //   loop
-            get(1), get(0), vec![0x4e], vec![0x0d, 1], // if i >= n br 1
-            get(2), get(1), vec![0x6a], set(2),
-            get(1), i32c(1), vec![0x6a], set(1),
-            vec![0x0c, 0],    //   br 0
-            vec![0x0b],       //   end loop
-            vec![0x0b],       // end block
+            get(1),
+            get(0),
+            vec![0x4e],
+            vec![0x0d, 1], // if i >= n br 1
+            get(2),
+            get(1),
+            vec![0x6a],
+            set(2),
+            get(1),
+            i32c(1),
+            vec![0x6a],
+            set(1),
+            vec![0x0c, 0], //   br 0
+            vec![0x0b],    //   end loop
+            vec![0x0b],    // end block
             get(2),
         ]),
     };
@@ -626,11 +674,13 @@ fn loops_blocks_and_branches() {
             get(0),
             vec![0x0e, 2, 0, 1, 2], // br_table $b0 $b1 default $d
             vec![0x0b],
-            i32c(100), vec![0x0c, 2], // case 0 → 100
+            i32c(100),
+            vec![0x0c, 2], // case 0 → 100
             vec![0x0b],
-            i32c(200), vec![0x0c, 1], // case 1 → 200
+            i32c(200),
+            vec![0x0c, 1], // case 1 → 200
             vec![0x0b],
-            i32c(-1),                 // default
+            i32c(-1), // default
             vec![0x0b],
         ]),
     };
@@ -640,14 +690,29 @@ fn loops_blocks_and_branches() {
         results: vec![I32],
         locals: vec![],
         body: cat(&[
-            get(0), vec![0x45], vec![0x04, 0x40], i32c(-5), vec![0x0f], vec![0x0b], // if !a return -5
-            get(0), get(1), vec![0x48], // a < b
+            get(0),
+            vec![0x45],
+            vec![0x04, 0x40],
+            i32c(-5),
+            vec![0x0f],
+            vec![0x0b], // if !a return -5
+            get(0),
+            get(1),
+            vec![0x48], // a < b
             vec![0x04, 0x7f],
-            get(0), get(1), get(0), get(1), vec![0x4a], vec![0x1b], // select(max)
+            get(0),
+            get(1),
+            get(0),
+            get(1),
+            vec![0x4a],
+            vec![0x1b], // select(max)
             vec![0x05],
-            get(1), i32c(3), vec![0x6c],
+            get(1),
+            i32c(3),
+            vec![0x6c],
             vec![0x0b],
-            i32c(1), vec![0x6a],
+            i32c(1),
+            vec![0x6a],
         ]),
     };
     // f3: unreachable code after br, including nested blocks.
@@ -659,10 +724,16 @@ fn loops_blocks_and_branches() {
             vec![0x02, 0x7f],
             get(0),
             vec![0x0c, 0],
-            vec![0x02, 0x40], i32c(9), vec![0x1a], vec![0x0b], // dead nested block
-            i32c(1), i32c(2), vec![0x6a],
+            vec![0x02, 0x40],
+            i32c(9),
+            vec![0x1a],
+            vec![0x0b], // dead nested block
+            i32c(1),
+            i32c(2),
+            vec![0x6a],
             vec![0x0b],
-            i32c(10), vec![0x6a],
+            i32c(10),
+            vec![0x6a],
         ]),
     };
     // f4: loop carrying a value via block params is multi-value; use locals + tee instead.
@@ -671,14 +742,26 @@ fn loops_blocks_and_branches() {
         results: vec![I64],
         locals: vec![I64, I64, I64],
         body: cat(&[
-            i64c(1), set(2),
+            i64c(1),
+            set(2),
             vec![0x02, 0x40],
             vec![0x03, 0x40],
-            get(0), vec![0x45], vec![0x0d, 1],
-            get(1), get(2), vec![0x7c], set(3),
-            get(2), set(1),
-            get(3), set(2),
-            get(0), i32c(1), vec![0x6b], tee(0), vec![0x1a],
+            get(0),
+            vec![0x45],
+            vec![0x0d, 1],
+            get(1),
+            get(2),
+            vec![0x7c],
+            set(3),
+            get(2),
+            set(1),
+            get(3),
+            set(2),
+            get(0),
+            i32c(1),
+            vec![0x6b],
+            tee(0),
+            vec![0x1a],
             vec![0x0c, 0],
             vec![0x0b],
             vec![0x0b],
@@ -709,12 +792,22 @@ fn memory_globals_and_calls() {
         results: vec![I64],
         locals: vec![],
         body: cat(&[
-            get(0), get(1), mem(0x36, 4),               // i32.store offset=4
-            get(0), mem(0x2c, 4),                       // i32.load8_s offset=4
-            get(0), mem(0x2f, 4), vec![0x6a],           // + i32.load16_u
-            vec![0xac],                                 // i64.extend_i32_s
-            get(0), mem(0x35, 4), vec![0x7c],           // + i64.load32_u
-            vec![0x23, 0], i32c(1), vec![0x6a], vec![0x24, 0], // g0 += 1
+            get(0),
+            get(1),
+            mem(0x36, 4), // i32.store offset=4
+            get(0),
+            mem(0x2c, 4), // i32.load8_s offset=4
+            get(0),
+            mem(0x2f, 4),
+            vec![0x6a], // + i32.load16_u
+            vec![0xac], // i64.extend_i32_s
+            get(0),
+            mem(0x35, 4),
+            vec![0x7c], // + i64.load32_u
+            vec![0x23, 0],
+            i32c(1),
+            vec![0x6a],
+            vec![0x24, 0], // g0 += 1
         ]),
     };
     // f1: calls f2 in a loop, accumulating into memory at 0 (i64) and returning it.
@@ -725,16 +818,26 @@ fn memory_globals_and_calls() {
         body: cat(&[
             vec![0x02, 0x40],
             vec![0x03, 0x40],
-            get(0), vec![0x45], vec![0x0d, 1],
+            get(0),
+            vec![0x45],
+            vec![0x0d, 1],
             i32c(0),
-            i32c(0), mem(0x29, 0),
-            get(0), vec![0x10, 2], vec![0xad], vec![0x7c],
+            i32c(0),
+            mem(0x29, 0),
+            get(0),
+            vec![0x10, 2],
+            vec![0xad],
+            vec![0x7c],
             mem(0x37, 0),
-            get(0), i32c(1), vec![0x6b], set(0),
+            get(0),
+            i32c(1),
+            vec![0x6b],
+            set(0),
             vec![0x0c, 0],
             vec![0x0b],
             vec![0x0b],
-            i32c(0), mem(0x29, 0),
+            i32c(0),
+            mem(0x29, 0),
         ]),
     };
     // f2: x*x + global g1 (i64 global read, wrapped).
@@ -742,7 +845,14 @@ fn memory_globals_and_calls() {
         params: vec![I32],
         results: vec![I32],
         locals: vec![],
-        body: cat(&[get(0), get(0), vec![0x6c], vec![0x23, 1], vec![0xa7], vec![0x6a]]),
+        body: cat(&[
+            get(0),
+            get(0),
+            vec![0x6c],
+            vec![0x23, 1],
+            vec![0xa7],
+            vec![0x6a],
+        ]),
     };
     // f3: memory.size, memory.grow, fill, copy, and an out-of-bounds load at the end.
     let bulk = Func {
@@ -750,15 +860,29 @@ fn memory_globals_and_calls() {
         results: vec![I32],
         locals: vec![],
         body: cat(&[
-            i32c(16), i32c(0xab), i32c(8), vec![0xfc, 11, 0],    // fill [16..24) = 0xab
-            i32c(32), i32c(12), i32c(16), vec![0xfc, 10, 0, 0],  // copy [12..28) → [32..48)
-            i32c(1), vec![0x40, 0], vec![0x1a],                  // grow 1
-            vec![0x3f, 0],                                       // size
-            get(0), mem(0x28, 0), vec![0x6a],                    // + load [a]
+            i32c(16),
+            i32c(0xab),
+            i32c(8),
+            vec![0xfc, 11, 0], // fill [16..24) = 0xab
+            i32c(32),
+            i32c(12),
+            i32c(16),
+            vec![0xfc, 10, 0, 0], // copy [12..28) → [32..48)
+            i32c(1),
+            vec![0x40, 0],
+            vec![0x1a],    // grow 1
+            vec![0x3f, 0], // size
+            get(0),
+            mem(0x28, 0),
+            vec![0x6a], // + load [a]
         ]),
     };
     let data: Vec<u8> = (0..64u8).collect();
-    let m = module(&[mem_ops, caller, sq, bulk], &[(I32, 5), (I64, 1 << 33 | 7)], &data);
+    let m = module(
+        &[mem_ops, caller, sq, bulk],
+        &[(I32, 5), (I64, 1 << 33 | 7)],
+        &data,
+    );
     let mut cases = vec![
         (0, vec![Val::I32(0), Val::I32(-2)]),
         (0, vec![Val::I32(100), Val::I32(0x12345678)]),
@@ -796,16 +920,34 @@ fn float_ops_and_conversions() {
             params: vec![F64, F64],
             results: vec![F64],
             locals: vec![],
-            body: cat(&[get(0), get(1), vec![0xa4], get(0), get(1), vec![0xa5], vec![0xa0]]), // min+max
+            body: cat(&[
+                get(0),
+                get(1),
+                vec![0xa4],
+                get(0),
+                get(1),
+                vec![0xa5],
+                vec![0xa0],
+            ]), // min+max
         },
         Func {
             params: vec![F64, F64],
             results: vec![I32],
             locals: vec![],
-            body: cat(&[get(0), get(1), vec![0x63], get(0), get(1), vec![0x62], i32c(2), vec![0x6c], vec![0x6a]]), // lt + 2*ne
+            body: cat(&[
+                get(0),
+                get(1),
+                vec![0x63],
+                get(0),
+                get(1),
+                vec![0x62],
+                i32c(2),
+                vec![0x6c],
+                vec![0x6a],
+            ]), // lt + 2*ne
         },
-        un(vec![0xb9], I64, F64),       // 11: f64.convert_i64_s — note param is i64
-        un(vec![0xba], I64, F64),       // 12: f64.convert_i64_u
+        un(vec![0xb9], I64, F64), // 11: f64.convert_i64_s — note param is i64
+        un(vec![0xba], I64, F64), // 12: f64.convert_i64_u
         Func {
             params: vec![F64],
             results: vec![F64],
@@ -815,9 +957,27 @@ fn float_ops_and_conversions() {
     ];
     let m = module(&funcs, &[], &[]);
     let fs = [
-        0.0, -0.0, 0.5, -0.5, 1.5, 2.5, -2.5, 1e10, -1e10, 2147483647.9, 2147483648.0,
-        -2147483648.9, -2147483649.0, 4294967295.5, 4294967296.0, 9.3e18, -9.3e18, 1.8e19,
-        f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+        0.0,
+        -0.0,
+        0.5,
+        -0.5,
+        1.5,
+        2.5,
+        -2.5,
+        1e10,
+        -1e10,
+        2147483647.9,
+        2147483648.0,
+        -2147483648.9,
+        -2147483649.0,
+        4294967295.5,
+        4294967296.0,
+        9.3e18,
+        -9.3e18,
+        1.8e19,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
     ];
     let mut cases = Vec::new();
     for &x in &fs {
@@ -836,22 +996,34 @@ fn float_ops_and_conversions() {
     differential(&m, &cases);
 }
 
-
 #[test]
 fn completed_then_arm_does_not_leave_a_stale_branch_label() {
     let nested = Func {
-        params: vec![I32], results: vec![I32], locals: vec![],
+        params: vec![I32],
+        results: vec![I32],
+        locals: vec![],
         body: cat(&[
-            vec![0x02,0x40], get(0), vec![0x04,0x7f], i32c(7),
-            vec![0x05], i32c(8), vec![0x0b], vec![0x1a],
-            vec![0x0c,0], vec![0x0b], i32c(42),
+            vec![0x02, 0x40],
+            get(0),
+            vec![0x04, 0x7f],
+            i32c(7),
+            vec![0x05],
+            i32c(8),
+            vec![0x0b],
+            vec![0x1a],
+            vec![0x0c, 0],
+            vec![0x0b],
+            i32c(42),
         ]),
     };
     let return_label = Func {
-        params: vec![], results: vec![I32], locals: vec![],
-        body: cat(&[i32c(77), vec![0x0c,0], vec![0x00]]),
+        params: vec![],
+        results: vec![I32],
+        locals: vec![],
+        body: cat(&[i32c(77), vec![0x0c, 0], vec![0x00]]),
     };
-    differential(&module(&[nested,return_label], &[], &[]), &[
-        (0,vec![Val::I32(1)]),(0,vec![Val::I32(0)]),(1,vec![]),
-    ]);
+    differential(
+        &module(&[nested, return_label], &[], &[]),
+        &[(0, vec![Val::I32(1)]), (0, vec![Val::I32(0)]), (1, vec![])],
+    );
 }

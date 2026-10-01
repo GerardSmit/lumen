@@ -76,6 +76,7 @@ pub fn extension() -> Extension {
                     "isDir" (1) => op_is_dir,
                     "readText" (1) => op_read_text,
                     "readBytes" (1) => op_read_bytes,
+                    "stripShebang" (1) => op_strip_shebang,
                     "realpath" (1) => op_realpath,
                     "loadNativeAddon" (1) => napi::op_load_addon,
                     "isProxy" (1) => op_is_proxy,
@@ -124,15 +125,15 @@ pub fn extension() -> Extension {
                 "__zlib",
                 ops![
                     "deflate" (1) => op_zlib_deflate,
-                    "inflate" (1) => op_zlib_inflate,
+                    "inflate" (2) => op_zlib_inflate,
                     "deflateRaw" (1) => op_zlib_deflate_raw,
-                    "inflateRaw" (1) => op_zlib_inflate_raw,
+                    "inflateRaw" (2) => op_zlib_inflate_raw,
                     "gzip" (1) => op_zlib_gzip,
-                    "gunzip" (1) => op_zlib_gunzip,
+                    "gunzip" (2) => op_zlib_gunzip,
                     "brotliCompress" (1) => op_zlib_brotli_compress,
-                    "brotliDecompress" (1) => op_zlib_brotli_decompress,
+                    "brotliDecompress" (2) => op_zlib_brotli_decompress,
                     "zstdCompress" (1) => op_zlib_zstd_compress,
-                    "zstdDecompress" (1) => op_zlib_zstd_decompress,
+                    "zstdDecompress" (2) => op_zlib_zstd_decompress,
                     "crc32" (2) => op_zlib_crc32,
                     "streamOpen" (1) => op_zlib_stream_open,
                     "streamWrite" (2) => op_zlib_stream_write,
@@ -345,6 +346,18 @@ fn op_read_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
         Ok(s) => Ok(Value::from_string(crate::codec::canonical(s))),
         Err(e) => Err(ctx.make_error("Error", format!("cannot read '{p}': {e}"))),
     }
+}
+
+/// `(source)` — the source with a leading `#!` line marker turned into `//`, keeping every
+/// offset. Done natively: any JS string method on a large source materializes a UTF-16 copy.
+fn op_strip_shebang(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Value::Str(s) = &source {
+        if let Some(rest) = s.as_str().strip_prefix("#!") {
+            return Ok(Value::from_string(format!("//{rest}")));
+        }
+    }
+    Ok(source)
 }
 
 /// Read a file as raw bytes (a Uint8Array), for `fs.readFileSync` without an encoding — the text
@@ -1218,17 +1231,32 @@ fn zlib_compress_op(
     ctx.make_uint8array(&codec(&bytes))
 }
 
+/// `(input, maxOutputLength)`: a result past `maxOutputLength` bytes (default: unbounded, as
+/// Node's `buffer.kMaxLength`) is Node's `RangeError [ERR_BUFFER_TOO_LARGE]`, raised while
+/// decoding — a decompression bomb stops at the cap instead of inflating in full first.
 fn zlib_decompress_op(
     ctx: &mut Ctx,
     args: &[Value],
-    codec: fn(&[u8]) -> Result<Vec<u8>, String>,
+    codec: fn(&[u8], usize) -> Result<Vec<u8>, String>,
 ) -> Result<Value, Value> {
     let v = args.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
     };
-    match codec(&bytes) {
+    let limit = match args.get(1) {
+        Some(Value::Num(n)) if *n >= 0.0 && *n < usize::MAX as f64 => *n as usize,
+        _ => usize::MAX,
+    };
+    match codec(&bytes, limit) {
         Ok(out) => ctx.make_uint8array(&out),
+        Err(e) if e == lumen_host::deflate::OUTPUT_LIMIT => {
+            let err = ctx.make_error(
+                "RangeError",
+                format!("Cannot create a Buffer larger than {limit} bytes"),
+            );
+            let _ = ctx.set_member(&err, "code", Value::str("ERR_BUFFER_TOO_LARGE"));
+            Err(err)
+        }
         Err(e) => Err(ctx.make_error("Error", e)),
     }
 }
@@ -1237,31 +1265,31 @@ fn op_zlib_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value
     zlib_compress_op(ctx, a, lumen_host::deflate::zlib_compress)
 }
 fn op_zlib_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::deflate::zlib_decompress)
+    zlib_decompress_op(ctx, a, lumen_host::deflate::zlib_decompress_limited)
 }
 fn op_zlib_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     zlib_compress_op(ctx, a, lumen_host::deflate::deflate)
 }
 fn op_zlib_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::deflate::inflate)
+    zlib_decompress_op(ctx, a, lumen_host::deflate::inflate_limited)
 }
 fn op_zlib_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     zlib_compress_op(ctx, a, lumen_host::deflate::gzip_compress)
 }
 fn op_zlib_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::deflate::gzip_decompress)
+    zlib_decompress_op(ctx, a, lumen_host::deflate::gzip_decompress_limited)
 }
 fn op_zlib_brotli_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     zlib_compress_op(ctx, a, lumen_host::brotli::brotli_compress)
 }
 fn op_zlib_brotli_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::brotli::brotli_decompress)
+    zlib_decompress_op(ctx, a, lumen_host::brotli::brotli_decompress_limited)
 }
 fn op_zlib_zstd_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     zlib_compress_op(ctx, a, lumen_host::zstd::zstd_compress)
 }
 fn op_zlib_zstd_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::zstd::zstd_decompress)
+    zlib_decompress_op(ctx, a, lumen_host::zstd::zstd_decompress_limited)
 }
 // ---- streaming deflate/inflate (`zlib.createGzip`, `createDeflate`, `createDeflateRaw`, …) ----
 

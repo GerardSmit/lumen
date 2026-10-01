@@ -213,11 +213,11 @@ fn ffi_fixture_abi_shapes_and_callback() {
     assert!(lines.contains(&"mix_ffii 11"), "got: {out}");
     assert!(lines.contains(&"mix_difd 11.5"), "got: {out}");
     assert!(lines.contains(&"ret_f32 10"), "got: {out}");
-    assert!(lines.contains(&"sum8i 36 bigint"), "got: {out}");
+    assert!(lines.contains(&"sum8i 36n bigint"), "got: {out}");
     assert!(lines.contains(&"sum8mix 36"), "got: {out}");
     assert!(lines.contains(&"add_via_ptr 123"), "got: {out}");
     assert!(
-        lines.contains(&"ret_u8 250 ret_i8 -7 ret_u64 18446744073709551615"),
+        lines.contains(&"ret_u8 250 ret_i8 -7 ret_u64 18446744073709551615n"),
         "got: {out}"
     );
     assert!(lines.contains(&"apply_sum 30"), "got: {out}");

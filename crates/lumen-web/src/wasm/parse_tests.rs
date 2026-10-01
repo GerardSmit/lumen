@@ -50,3 +50,107 @@ fn section_decoders_cannot_borrow_next_section_bytes() {
     // Custom name itself must use a well-formed UTF-8 encoding.
     assert!(decode(&module(&[(0, &[1, 0xff])])).is_err());
 }
+
+mod hardening {
+    use super::*;
+    use crate::wasm::test_util::{self as t, I32};
+
+    fn with_code(code_section: Vec<u8>) -> Vec<u8> {
+        t::module(&[
+            (1, t::vec(&[t::func_type(&[], &[])])),
+            (3, vec![1, 0]),
+            (10, code_section),
+        ])
+    }
+
+    #[test]
+    fn locals_cannot_run_past_a_short_code_body() {
+        // Body size 0, then bytes that would parse as a locals declaration.
+        assert!(decode(&with_code(vec![1, 0, 1, 5, I32, 0x0b])).is_err());
+        // Body size 2 holds only the locals declaration: no room for `end`.
+        assert!(decode(&with_code(vec![1, 2, 0, 0x0b, 0x0b])).is_err());
+        // The locals declaration itself is cut off by the body size.
+        assert!(decode(&with_code(vec![1, 2, 1, 5, I32, 0x0b])).is_err());
+        assert!(decode(&with_code(vec![1, 2, 0, 0x0b])).is_ok());
+    }
+
+    #[test]
+    fn local_counts_are_capped_before_expansion() {
+        let locals = |groups: &[u32]| {
+            let mut b = Vec::new();
+            t::uleb(groups.len() as u64, &mut b);
+            for &n in groups {
+                t::uleb(n as u64, &mut b);
+                b.push(I32);
+            }
+            b.push(0x0b);
+            let mut code = vec![1];
+            t::uleb(b.len() as u64, &mut code);
+            code.extend(b);
+            with_code(code)
+        };
+        assert!(decode(&locals(&[u32::MAX])).is_err());
+        assert!(decode(&locals(&[u32::MAX, u32::MAX])).is_err());
+        assert!(decode(&locals(&[30_000, 20_001])).is_err());
+        let ok = decode(&locals(&[30_000, 20_000])).unwrap();
+        assert_eq!(ok.code[0].locals.len(), 50_000);
+    }
+
+    #[test]
+    fn leb128_must_be_minimal_width() {
+        let types = |count: &[u8]| {
+            let mut p = count.to_vec();
+            p.extend(t::func_type(&[], &[]));
+            t::module(&[(1, p)])
+        };
+        assert!(decode(&types(&[0x81, 0x80, 0x80, 0x80, 0x00])).is_ok());
+        // Six bytes for a u32.
+        assert!(decode(&types(&[0x81, 0x80, 0x80, 0x80, 0x80, 0x00])).is_err());
+        // Five bytes whose unused high bits are set.
+        assert!(decode(&types(&[0x81, 0x80, 0x80, 0x80, 0x10])).is_err());
+
+        let global = |init: &[u8]| {
+            let mut g = vec![1, I32, 0];
+            g.extend_from_slice(init);
+            g.push(0x0b);
+            t::module(&[(6, g)])
+        };
+        assert!(decode(&global(&[0x41, 0xff, 0xff, 0xff, 0xff, 0x7f])).is_ok()); // -1
+        assert!(decode(&global(&[0x41, 0x80, 0x80, 0x80, 0x80, 0x70])).is_err());
+        assert!(decode(&global(&[0x41, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00])).is_err());
+    }
+
+    #[test]
+    fn imported_function_type_index_is_checked() {
+        let import = |ty: u8| {
+            let i = vec![1, 1, b'm', 1, b'f', 0x00, ty];
+            t::module(&[(1, t::vec(&[t::func_type(&[], &[])])), (2, i)])
+        };
+        assert!(decode(&import(0)).is_ok());
+        assert!(decode(&import(1)).is_err());
+    }
+
+    #[test]
+    fn limits_are_bounded() {
+        let mem = |l: &[u8]| t::module(&[(5, [&[1u8][..], l].concat())]);
+        assert!(decode(&mem(&[1, 0, 0x80, 0x80, 0x04])).is_ok()); // max 65536 pages
+        assert!(decode(&mem(&[0, 0x81, 0x80, 0x04])).is_err()); // min 65537 pages
+        assert!(decode(&mem(&[1, 0, 0x81, 0x80, 0x04])).is_err()); // max 65537 pages
+        assert!(decode(&mem(&[1, 2, 1])).is_err()); // max below min
+        assert!(decode(&mem(&[3, 1, 1])).is_err()); // shared memory
+        let table = |l: &[u8]| t::module(&[(4, [&[1u8, 0x70][..], l].concat())]);
+        let mut big = vec![0];
+        t::uleb(10_000_001, &mut big);
+        assert!(decode(&table(&big)).is_err());
+        let mut max = vec![0];
+        t::uleb(10_000_000, &mut max);
+        assert!(decode(&table(&max)).is_ok());
+        assert!(decode(&table(&[1, 5, 4])).is_err());
+    }
+
+    #[test]
+    fn declared_functions_need_bodies() {
+        let m = t::module(&[(1, t::vec(&[t::func_type(&[], &[])])), (3, vec![1, 0])]);
+        assert!(decode(&m).is_err());
+    }
+}

@@ -1,17 +1,14 @@
-//! Insertion-ordered collection storage. The index owns only slot numbers, never JS values.
-//! Deleted slots remain in place so live iterators and forEach can observe later appends.
+//! Insertion-ordered collection storage for Map, Set, WeakMap and WeakSet (see `table`).
 
 mod dense;
-use crate::value::Gc;
-use dense::DenseIndex;
+mod index;
+mod table;
 
-use super::same_value_zero;
-use crate::fasthash::{FastMap, FxHasher};
-use crate::value::Value;
+use crate::fasthash::FxHasher;
+use crate::value::{Gc, PackedValue, Value};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-
-const NO_SLOT: usize = usize::MAX;
+use table::{KeyEntry, PairEntry, Table};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CollectionKind {
@@ -33,196 +30,122 @@ impl CollectionKind {
     }
 }
 
-struct Entry {
-    pair: Option<(Value, Value)>,
-    // Intrusive collision chain avoids allocating a Vec for every distinct key hash.
-    next: usize,
+// A Set entry's key doubles as its value, so Sets store keys only.
+enum Store {
+    Pairs(Table<PairEntry>),
+    Keys(Table<KeyEntry>),
 }
 
-#[derive(Default)]
+macro_rules! table {
+    ($store:expr, $table:ident => $body:expr) => {
+        match $store {
+            Store::Pairs($table) => $body,
+            Store::Keys($table) => $body,
+        }
+    };
+}
+
 pub(crate) struct CollectionData {
     kind: CollectionKind,
-    entries: Vec<Entry>,
-    // Logical position of entries[0], retained when clear releases the backing list.
-    base: usize,
-    // Hash collisions are resolved with SameValueZero, not hash equality alone.
-    index: FastMap<u64, usize>,
-    dense: DenseIndex,
-    live_len: usize,
+    store: Store,
+}
+
+impl Default for CollectionData {
+    fn default() -> Self {
+        Self::new(CollectionKind::Map)
+    }
+}
+
+enum Iter<'a> {
+    Pairs(table::Iter<'a, PairEntry>),
+    Keys(table::Iter<'a, KeyEntry>),
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a PackedValue, &'a PackedValue);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Pairs(it) => it.next(),
+            Self::Keys(it) => it.next(),
+        }
+    }
 }
 
 impl CollectionData {
     pub(crate) fn new(kind: CollectionKind) -> Self {
-        Self {
-            kind,
-            ..Self::default()
-        }
+        let store = match kind {
+            CollectionKind::Set | CollectionKind::WeakSet => Store::Keys(Table::default()),
+            CollectionKind::Map | CollectionKind::WeakMap => Store::Pairs(Table::default()),
+        };
+        Self { kind, store }
     }
 
     pub(crate) fn kind(&self) -> CollectionKind {
         self.kind
     }
 
+    /// Whether entries hold a value apart from the key (false for Sets).
+    pub(crate) fn has_values(&self) -> bool {
+        matches!(self.store, Store::Pairs(_))
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.live_len
+        table!(&self.store, t => t.len())
     }
 
-    pub(crate) fn next(&self, cursor: &mut usize) -> Option<&(Value, Value)> {
-        *cursor = (*cursor).max(self.base);
-        while let Some(entry) = self.entries.get(*cursor - self.base) {
-            *cursor += 1;
-            if let Some(pair) = &entry.pair {
-                return Some(pair);
-            }
+    /// The next live entry at or after `cursor`, advancing it. Cursors are opaque positions
+    /// that stay valid across every mutation of the collection; an iteration starts at 0.
+    #[inline]
+    pub(crate) fn next(&self, cursor: &mut usize) -> Option<(&PackedValue, &PackedValue)> {
+        table!(&self.store, t => t.next(cursor))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&PackedValue, &PackedValue)> {
+        match &self.store {
+            Store::Pairs(t) => Iter::Pairs(t.iter()),
+            Store::Keys(t) => Iter::Keys(t.iter()),
         }
-        None
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &(Value, Value)> {
-        self.entries.iter().filter_map(|entry| entry.pair.as_ref())
-    }
-
-    fn find(&self, key: &Value, hash: u64) -> Option<usize> {
-        let mut slot = *self.index.get(&hash)?;
-        while slot != NO_SLOT {
-            let entry = &self.entries[slot];
-            if same_value_zero(&entry.pair.as_ref().unwrap().0, key) {
-                return Some(slot);
-            }
-            slot = entry.next;
-        }
-        None
-    }
-
-    pub(crate) fn lookup(&self, key: &Value) -> Option<&Value> {
-        if matches!(key, Value::Num(_)) {
-            if let Some(slot) = self.dense.lookup(key) {
-                return Some(&self.entries[slot].pair.as_ref().unwrap().1);
-            }
-            if self.index.is_empty() {
-                return None;
-            }
-        }
-        self.find(key, key_hash(key))
-            .map(|slot| &self.entries[slot].pair.as_ref().unwrap().1)
+    pub(crate) fn lookup(&self, key: &Value) -> Option<Value> {
+        table!(&self.store, t => t.lookup(key).map(PackedValue::unpack))
     }
 
     pub(crate) fn contains(&self, key: &Value) -> bool {
-        self.lookup(key).is_some()
+        table!(&self.store, t => t.contains(key))
     }
 
     pub(crate) fn insert(&mut self, key: Value, value: Value) {
         let key = match key {
-            Value::Num(n) if n == 0.0 && n.is_sign_negative() => Value::Num(0.0),
+            Value::Num(n) if n == 0.0 => Value::Num(0.0),
+            // An empty key would pack to the tombstone marker.
+            Value::Empty => Value::Undefined,
             other => other,
         };
-        if let Some(index) = self.dense.candidate(&key, self.entries.len()) {
-            // A formerly sparse integer can still live in the hash index after the direct
-            // frontier grows past it. A direct miss never proves that such a key is absent.
-            let found = self.dense.get(index).or_else(|| {
-                (!self.index.is_empty())
-                    .then(|| self.find(&key, key_hash(&key)))
-                    .flatten()
-            });
-            if let Some(slot) = found {
-                self.entries[slot].pair.as_mut().unwrap().1 = value;
-            } else {
-                self.dense.insert(index, self.entries.len());
-                self.entries.push(Entry {
-                    pair: Some((key, value)),
-                    next: NO_SLOT,
-                });
-                self.live_len += 1;
-            }
-            return;
-        }
-        let hash = key_hash(&key);
-        let next = match self.index.entry(hash) {
-            std::collections::hash_map::Entry::Occupied(mut head) => {
-                let mut slot = *head.get();
-                while slot != NO_SLOT {
-                    let entry = &mut self.entries[slot];
-                    let pair = entry.pair.as_mut().unwrap();
-                    if same_value_zero(&pair.0, &key) {
-                        pair.1 = value;
-                        return;
-                    }
-                    slot = entry.next;
-                }
-                head.insert(self.entries.len())
-            }
-            std::collections::hash_map::Entry::Vacant(head) => {
-                head.insert(self.entries.len());
-                NO_SLOT
-            }
-        };
-        self.entries.push(Entry {
-            pair: Some((key, value)),
-            next,
-        });
-        self.live_len += 1;
+        table!(&mut self.store, t => t.insert(key, value))
     }
 
     pub(crate) fn remove(&mut self, key: &Value) -> bool {
-        if let Some(slot) = self.dense.remove(key) {
-            self.entries[slot].pair = None;
-            self.live_len -= 1;
-            return true;
-        }
-        let hash = key_hash(key);
-        let Some(&head) = self.index.get(&hash) else {
-            return false;
-        };
-        let mut slot = head;
-        let mut previous = NO_SLOT;
-        while slot != NO_SLOT {
-            let entry = &self.entries[slot];
-            let next = entry.next;
-            if same_value_zero(&entry.pair.as_ref().unwrap().0, key) {
-                if previous != NO_SLOT {
-                    self.entries[previous].next = next;
-                } else if next == NO_SLOT {
-                    self.index.remove(&hash);
-                } else {
-                    self.index.insert(hash, next);
-                }
-                self.entries[slot].pair = None;
-                self.live_len -= 1;
-                return true;
-            }
-            previous = slot;
-            slot = next;
-        }
-        false
-    }
-
-    /// Weak collections have no live iterators, so periodically discard their vacant slots.
-    pub(crate) fn remove_weak(&mut self, key: &Value) -> bool {
-        let removed = self.remove(key);
-        if removed && self.entries.len() > self.live_len.saturating_mul(2) {
-            self.entries.retain(|entry| entry.pair.is_some());
-            self.index.clear();
-            self.dense.clear();
-            for (slot, entry) in self.entries.iter_mut().enumerate() {
-                let key = &entry.pair.as_ref().unwrap().0;
-                if let Some(index) = self.dense.candidate(key, slot) {
-                    self.dense.insert(index, slot);
-                    entry.next = NO_SLOT;
-                } else {
-                    entry.next = self.index.insert(key_hash(key), slot).unwrap_or(NO_SLOT);
-                }
-            }
-        }
-        removed
+        table!(&mut self.store, t => t.remove(key))
     }
 
     pub(crate) fn clear(&mut self) {
-        // Older cursors jump to this base, so clear can release every key/value and slot.
-        self.base += self.entries.len();
-        self.entries.clear();
-        self.index.clear();
-        self.dense.clear();
-        self.live_len = 0;
+        table!(&mut self.store, t => t.clear())
+    }
+
+    #[cfg(test)]
+    fn slots(&self) -> usize {
+        table!(&self.store, t => t.slots())
+    }
+
+    #[cfg(test)]
+    fn next_owned(&self, cursor: &mut usize) -> Option<(Value, Value)> {
+        self.next(cursor).map(|(k, v)| (k.unpack(), v.unpack()))
+    }
+
+    #[cfg(test)]
+    fn owned(&self) -> Vec<(Value, Value)> {
+        self.iter().map(|(k, v)| (k.unpack(), v.unpack())).collect()
     }
 }
 
@@ -237,9 +160,11 @@ impl FromIterator<(Value, Value)> for CollectionData {
 }
 
 fn key_hash(key: &Value) -> u64 {
+    // Seeded (see `fasthash`), so scripts cannot precompute colliding keys. Keys of different
+    // types may share a hash input; `same_key` tells them apart.
     let mut hash = FxHasher::default();
-    std::mem::discriminant(key).hash(&mut hash);
     match key {
+        Value::Str(v) => hash.write(v.as_str().as_bytes()),
         Value::Num(n) => {
             let bits = if n.is_nan() {
                 f64::NAN.to_bits()
@@ -248,42 +173,72 @@ fn key_hash(key: &Value) -> u64 {
             } else {
                 n.to_bits()
             };
-            bits.hash(&mut hash);
+            hash.write_u64(bits);
         }
-        Value::Bool(v) => v.hash(&mut hash),
+        Value::Obj(v) => hash.write_usize(Gc::as_ptr(v) as usize),
+        Value::Sym(v) => hash.write_usize(Rc::as_ptr(v) as usize),
+        Value::Bool(v) => hash.write_u64(*v as u64),
         Value::BigInt(v) => v.hash(&mut hash),
-        Value::Str(v) => (**v).hash(&mut hash),
-        Value::Sym(v) => Rc::as_ptr(v).hash(&mut hash),
-        Value::Obj(v) => Gc::as_ptr(v).hash(&mut hash),
         Value::Undefined | Value::Empty | Value::Null => {}
     }
-    // FxHash preserves common low bits in integer-valued doubles. Avalanche before using
-    // this fingerprint as a FastMap key, otherwise even distinct hashes cluster quadratically.
-    let mut bits = hash.finish();
-    bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    bits ^ (bits >> 31)
+    hash.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{key_hash, CollectionData};
-    use crate::fasthash::FxHasher;
+    use crate::fasthash::tests::{old_colliding_keys, OldFx};
     use crate::value::{Object, Value};
     use std::hash::{Hash, Hasher};
+    use std::time::{Duration, Instant};
+
+    fn time_inserts(keys: &[Value]) -> Duration {
+        let start = Instant::now();
+        let mut data = CollectionData::default();
+        for k in keys {
+            data.insert(k.clone(), Value::Undefined);
+        }
+        for k in keys {
+            assert!(data.contains(k));
+        }
+        assert_eq!(data.len(), keys.len());
+        start.elapsed()
+    }
+
+    #[test]
+    fn string_keys_colliding_under_the_old_hash_insert_in_linear_time() {
+        // The old key hash began with the discriminant, then `Hash for str`.
+        let mut prefix = OldFx::default();
+        std::mem::discriminant(&Value::str("")).hash(&mut prefix);
+        let hostile: Vec<Value> = old_colliding_keys(&prefix, 20_000)
+            .iter()
+            .map(|k| Value::str(k.as_str()))
+            .collect();
+        let old_digest = |k: &Value| {
+            let mut h = OldFx::default();
+            std::mem::discriminant(k).hash(&mut h);
+            let Value::Str(s) = k else { unreachable!() };
+            s.as_str().hash(&mut h);
+            h.finish()
+        };
+        assert!(hostile
+            .iter()
+            .all(|k| old_digest(k) == old_digest(&hostile[0])));
+        let benign: Vec<Value> = (0..hostile.len())
+            .map(|i| Value::str(format!("benign-key-{i:05}").as_str()))
+            .collect();
+        let (hostile, benign) = (time_inserts(&hostile), time_inserts(&benign));
+        assert!(
+            hostile < benign * 20 + Duration::from_millis(50),
+            "hostile {hostile:?} vs benign {benign:?}"
+        );
+    }
 
     #[test]
     fn colliding_keys_remain_distinct_through_updates_and_deletes() {
-        let text = Value::str("collision");
-        // Invert FxHasher's final multiply/xor step to create a real Number/String collision.
-        let mut prefix = FxHasher::default();
-        std::mem::discriminant(&Value::Num(1.0)).hash(&mut prefix);
-        let mut text_hash = FxHasher::default();
-        std::mem::discriminant(&text).hash(&mut text_hash);
-        "collision".hash(&mut text_hash);
-        let bits =
-            text_hash.finish().wrapping_mul(0x2040_003d_7809_70bd) ^ prefix.finish().rotate_left(5);
-        let number = Value::Num(f64::from_bits(bits));
+        // `true` and the smallest denormal both hash the word 1.
+        let text = Value::Bool(true);
+        let number = Value::Num(f64::from_bits(1));
         assert_eq!(key_hash(&number), key_hash(&text));
         let mut data = CollectionData::default();
         data.insert(text.clone(), Value::Num(1.0));
@@ -309,7 +264,9 @@ mod tests {
         let other_nan = Value::Num(f64::from_bits(0xfff8_0000_0000_0042));
         data.insert(other_nan.clone(), Value::Num(4.0));
         assert_eq!(data.len(), 2);
-        assert!(matches!(data.iter().next(), Some((Value::Num(n), _)) if n.to_bits() == 0));
+        assert!(
+            matches!(data.owned().into_iter().next(), Some((Value::Num(n), _)) if n.to_bits() == 0)
+        );
         assert!(matches!(
             data.lookup(&Value::Num(f64::NAN)),
             Some(Value::Num(4.0))
@@ -326,18 +283,21 @@ mod tests {
         let value = Object::new(None);
         data.insert(Value::Obj(key.clone()), Value::Obj(value.clone()));
         let mut cursor = 0;
-        assert!(data.next(&mut cursor).is_some());
+        assert!(data.next_owned(&mut cursor).is_some());
         data.clear();
         assert_eq!(crate::value::Gc::strong_count(&key), 1);
         assert_eq!(crate::value::Gc::strong_count(&value), 1);
-        assert!(data.entries.is_empty());
+        assert!(data.slots() == 0);
         data.insert(Value::Num(42.0), Value::Undefined);
         assert!(matches!(
-            data.next(&mut cursor),
+            data.next_owned(&mut cursor),
             Some((Value::Num(42.0), _))
         ));
         // An iterator created before clear but never started sees the new entry too.
-        assert!(matches!(data.next(&mut 0), Some((Value::Num(42.0), _))));
+        assert!(matches!(
+            data.next_owned(&mut 0),
+            Some((Value::Num(42.0), _))
+        ));
     }
 
     #[test]
@@ -352,11 +312,14 @@ mod tests {
         assert_eq!(crate::value::Gc::strong_count(&value), 1);
         data.insert(Value::Obj(key.clone()), Value::Undefined);
         let mut cursor = 0;
-        assert!(matches!(data.next(&mut cursor), Some((Value::Num(1.0), _))));
+        assert!(matches!(
+            data.next_owned(&mut cursor),
+            Some((Value::Num(1.0), _))
+        ));
         assert!(
-            matches!(data.next(&mut cursor), Some((Value::Obj(o), _)) if crate::value::Gc::ptr_eq(o, &key))
+            matches!(data.next_owned(&mut cursor), Some((Value::Obj(o), _)) if crate::value::Gc::ptr_eq(&o, &key))
         );
-        assert!(data.next(&mut cursor).is_none());
+        assert!(data.next_owned(&mut cursor).is_none());
     }
     #[test]
     fn weak_deletion_churn_does_not_accumulate_vacant_slots() {
@@ -366,10 +329,10 @@ mod tests {
         for _ in 0..1000 {
             let temporary = Value::Obj(Object::new(None));
             data.insert(temporary.clone(), Value::Undefined);
-            assert!(data.remove_weak(&temporary));
+            assert!(data.remove(&temporary));
             assert!(!data.contains(&temporary));
         }
-        assert!(data.entries.len() <= 2);
+        assert!(data.slots() <= 7);
         assert!(matches!(
             data.lookup(&Value::Obj(stable)),
             Some(Value::Num(42.0))

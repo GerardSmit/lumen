@@ -268,9 +268,9 @@ fn materialize(o: &Gc) {
         }
     };
     let n = view.len();
-    let mut elems: Vec<Property> = Vec::with_capacity(n);
+    let mut elems: Vec<crate::value::PackedValue> = Vec::with_capacity(n);
     for k in 0..n {
-        elems.push(Property::plain(Value::Str(view.piece_kept(k))));
+        elems.push(crate::value::PackedValue::pack(Value::Str(view.piece_kept(k))));
     }
     drop(view);
     let mut b = o.borrow_mut();

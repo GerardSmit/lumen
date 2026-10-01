@@ -599,7 +599,7 @@ impl crate::interpreter::Interp {
         }
         let w = crate::value::memwalk::walk();
         eprintln!("[mem] ---- engine structures (estimated) ----");
-        let names = ["plain", "inline4", "array", "inline8"];
+        let names = crate::value::SLOT_CLASS_NAMES;
         let mut slab_total = 0;
         for (k, &(chunks, used, bumped, size)) in w.slab.iter().enumerate() {
             slab_total += chunks * 256 * 1024;

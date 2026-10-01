@@ -256,7 +256,7 @@ fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
         .collect();
     for (i, k) in names.iter().enumerate() {
         p.insert(k.clone(), num(i as f64));
-        // Lookups (hits and misses) never build the ordered list.
+        // Lookups (hits and misses) build no list for a shape still answered by a chain scan.
         assert_eq!(p.slot_of(k), Some(i));
         assert_eq!(p.slot_of(&names[0]), Some(0));
         assert_eq!(p.slot_of("absent"), None);
@@ -272,9 +272,18 @@ fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
             assert_eq!(&***key, names[OWNED_THRESHOLD - 1 - depth].as_str());
         }
     }
-    assert_eq!(flat_lists(&p), Vec::<usize>::new(), "no iteration yet");
+    let indexed: Vec<usize> = (INDEX_THRESHOLD + 1..=OWNED_THRESHOLD).rev().collect();
+    assert_eq!(
+        flat_lists(&p),
+        indexed,
+        "only shapes past the scan threshold, for their index"
+    );
     assert_eq!(keys(&p), names);
-    assert_eq!(flat_lists(&p), vec![OWNED_THRESHOLD], "only the iterated leaf");
+    assert_eq!(
+        flat_lists(&p),
+        indexed,
+        "iterating reuses the indexed leaf's list"
+    );
     // The materialised list answers the same lookups.
     for (i, k) in names.iter().enumerate() {
         assert_eq!(p.slot_of(k), Some(i));
@@ -313,4 +322,58 @@ fn chain_shapes_answer_key_at_and_special_slots_without_a_list() {
     assert_eq!(keys(&r), ["a", "length"]);
     assert_eq!(r.slot_of("length"), Some(1));
     assert_eq!(r.slot_of("a"), Some(0));
+}
+
+#[test]
+fn dictionary_sized_objects_index_every_key_through_growth_and_deletes() {
+    let n = 5000;
+    let mut p = Props::new();
+    for i in 0..n {
+        p.insert(format!("k{i}").as_str(), num(i as f64));
+    }
+    for i in 0..n {
+        assert_eq!(p.slot_of(&format!("k{i}")), Some(i));
+    }
+    assert_eq!(p.slot_of("k5000"), None);
+    for i in (0..n).step_by(3) {
+        assert!(p.remove(&format!("k{i}")));
+    }
+    for i in 0..n {
+        let key = format!("k{i}");
+        if i % 3 == 0 {
+            assert!(p.get(&key).is_none());
+        } else {
+            assert_eq!(value_of(&p, &key), i as f64);
+        }
+    }
+    p.insert("k0", num(-1.0));
+    assert_eq!(value_of(&p, "k0"), -1.0);
+    assert_eq!(keys(&p).last().map(String::as_str), Some("k0"));
+}
+
+#[test]
+fn keys_colliding_under_the_old_hash_keep_order_and_insert_in_linear_time() {
+    use crate::fasthash::tests::{old_colliding_keys, OldFx};
+    use std::time::{Duration, Instant};
+    let hostile = old_colliding_keys(&OldFx::default(), 20_000);
+    let benign: Vec<String> = (0..hostile.len())
+        .map(|i| format!("benign-{i:05}"))
+        .collect();
+    let time = |ks: &[String]| {
+        let start = Instant::now();
+        let mut props = Props::default();
+        for (i, k) in ks.iter().enumerate() {
+            props.insert(k.as_str(), num(i as f64));
+        }
+        for (i, k) in ks.iter().enumerate() {
+            assert_eq!(value_of(&props, k), i as f64);
+        }
+        assert_eq!(keys(&props), ks);
+        start.elapsed()
+    };
+    let (hostile, benign) = (time(&hostile), time(&benign));
+    assert!(
+        hostile < benign * 20 + Duration::from_millis(50),
+        "hostile {hostile:?} vs benign {benign:?}"
+    );
 }

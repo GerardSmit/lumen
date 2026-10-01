@@ -78,6 +78,7 @@ pub(crate) fn nf_function_apply(
         Value::Undefined | Value::Null => Vec::new(),
         Value::Obj(o) => {
             let len = ab(i.checked_array_len(&o))?;
+            ab(i.check_heap(len * std::mem::size_of::<Value>()))?;
             let mut v = Vec::with_capacity(len);
             let direct_dense = i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
                 && !i.mapped_arguments.contains_key(&(Gc::as_ptr(&o) as usize));
@@ -95,7 +96,10 @@ pub(crate) fn nf_function_apply(
                 });
                 match own.flatten() {
                     Some(value) => v.push(value),
-                    None => v.push(ab(i.get_member(&Value::Obj(o.clone()), &k.to_string()))?),
+                    None => {
+                        ab(i.poll_native(k))?;
+                        v.push(ab(i.get_member(&Value::Obj(o.clone()), &k.to_string()))?)
+                    }
                 }
             }
             v
@@ -332,7 +336,7 @@ pub(crate) fn proxy_own_keys(
     target: &Value,
     handler: &Value,
 ) -> Result<Vec<Value>, Value> {
-    let trap = ab(i.get_member(handler, "ownKeys"))?;
+    let trap = ab(i.proxy_trap(handler, "ownKeys"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
         // Forward to the target's [[OwnPropertyKeys]] (recursing for a proxy target).
         if let Some((t2, h2)) = proxy_pair(i, target) {
@@ -438,7 +442,7 @@ fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member(&handler, "isExtensible"))?;
+        let trap = ab(i.proxy_trap(&handler, "isExtensible"))?;
         if matches!(trap, Value::Undefined | Value::Null) {
             return js_is_extensible(i, &target);
         }
@@ -465,7 +469,7 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member(&handler, "setPrototypeOf"))?;
+        let trap = ab(i.proxy_trap(&handler, "setPrototypeOf"))?;
         if matches!(trap, Value::Undefined | Value::Null) {
             return js_set_prototype_of(i, &target, proto);
         }
@@ -489,8 +493,8 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         return Ok(true);
     }
     // Ordinary [[SetPrototypeOf]]. A split view (either side) becomes an ordinary Array first.
-    crate::split_view::unview(&o);
-    crate::split_view::unview_val(proto);
+    i.materialize(&o);
+    i.materialize_val(proto);
     let cur = o
         .borrow()
         .proto
@@ -564,7 +568,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member(&handler, "preventExtensions"))?;
+        let trap = ab(i.proxy_trap(&handler, "preventExtensions"))?;
         if matches!(trap, Value::Undefined | Value::Null) {
             return js_prevent_extensions(i, &target);
         }
@@ -605,14 +609,14 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
                 return Ok(false);
             }
         }
-        crate::split_view::unview(o);
+        i.materialize(o);
         o.borrow_mut().extensible = false;
     }
     Ok(true)
 }
 
 fn proxy_get_prototype(i: &mut Interp, target: &Value, handler: &Value) -> Result<Value, Value> {
-    let trap = ab(i.get_member(handler, "getPrototypeOf"))?;
+    let trap = ab(i.proxy_trap(handler, "getPrototypeOf"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
         // Forward to the target's [[GetPrototypeOf]] (recursing for a proxy target).
         return js_get_prototype_of(i, target);
@@ -722,6 +726,7 @@ pub(crate) fn has_own_property_trapped(
             Value::Undefined
         ));
     }
+    i.materialize_fn_val(v);
     Ok(matches!(v, Value::Obj(o) if {
         let b = o.borrow();
         crate::split_view::has_own_elem_obj(&b, key) || b.props.contains(key)
@@ -737,13 +742,13 @@ pub(crate) fn proxy_gopd_value(
     if matches!(handler, Value::Null) {
         return Err(i.make_error("TypeError", "proxy is revoked"));
     }
-    let trap = ab(i.get_member(handler, "getOwnPropertyDescriptor"))?;
+    let trap = ab(i.proxy_trap(handler, "getOwnPropertyDescriptor"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
         if let Some((t2, h2)) = proxy_pair(i, target) {
             return proxy_gopd_value(i, &t2, &h2, key);
         }
         if let Value::Obj(t) = target {
-            let prop = t.borrow().props.get(key).cloned();
+            let prop = t.borrow().props.get(key).map(|p| p.clone());
             return Ok(prop
                 .map(|p| descriptor_from_prop(i, p))
                 .unwrap_or(Value::Undefined));
@@ -763,7 +768,7 @@ pub(crate) fn proxy_gopd_value(
     if matches!(res, Value::Undefined) {
         // The trap may report a property absent only if the target permits it.
         if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).cloned();
+            let tprop = t.borrow().props.get(key).map(|p| p.clone());
             if let Some(p) = tprop {
                 if !p.configurable() {
                     return Err(i.make_error(
@@ -865,7 +870,7 @@ pub(crate) fn proxy_gopd_value(
     // A reported non-configurable descriptor must be backed by the target.
     if matches!(pd.configurable, Some(false)) {
         if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).cloned();
+            let tprop = t.borrow().props.get(key).map(|p| p.clone());
             match tprop {
                 None => {
                     return Err(i.make_error(
@@ -899,7 +904,7 @@ fn proxy_key_enumerable(
     handler: &Value,
     key: &str,
 ) -> Result<bool, Value> {
-    let trap = ab(i.get_member(handler, "getOwnPropertyDescriptor"))?;
+    let trap = ab(i.proxy_trap(handler, "getOwnPropertyDescriptor"))?;
     if trap.is_callable() {
         let kv = i
             .sym_from_key(key)
@@ -931,7 +936,7 @@ fn proxy_define_property(
     key: &str,
     desc: &Value,
 ) -> Result<bool, Abrupt> {
-    let trap = i.get_member(handler, "defineProperty")?;
+    let trap = i.proxy_trap(handler, "defineProperty")?;
     if matches!(trap, Value::Undefined | Value::Null) {
         if let Some((t2, h2)) = proxy_pair(i, target) {
             return proxy_define_property(i, &t2, &h2, key, desc);
@@ -981,7 +986,7 @@ fn proxy_define_property(
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
     if let Value::Obj(t) = target {
-        let tprop = t.borrow().props.get(key).cloned();
+        let tprop = t.borrow().props.get(key).map(|p| p.clone());
         let extensible = t.borrow().extensible;
         match tprop {
             None => {
@@ -1120,7 +1125,7 @@ fn ta_info(i: &Interp, o: &Gc) -> Option<crate::value::TaInfo> {
 /// (these callers read or write the property map directly — see `crate::split_view`).
 fn to_object_arg(i: &mut Interp, v: Value, method: &str) -> Result<Gc, Value> {
     let o = to_object_arg_lazy(i, v, method)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     Ok(o)
 }
 
@@ -1156,13 +1161,14 @@ fn assign_set(i: &mut Interp, to: &Value, key: &str, value: Value) -> Result<(),
 
 /// IsArray, seeing through proxies (a Proxy whose target is an Array is itself an Array).
 pub(crate) fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
-    if let Some((target, handler)) = proxy_pair(i, v) {
+    let mut cur = v.clone();
+    while let Some((target, handler)) = proxy_pair(i, &cur) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "Cannot perform IsArray on a revoked Proxy"));
         }
-        return json_is_array(i, &target);
+        cur = target;
     }
-    Ok(matches!(v, Value::Obj(o) if o.borrow().exotic.is_array()))
+    Ok(matches!(&cur, Value::Obj(o) if o.borrow().exotic.is_array()))
 }
 
 /// EnumerableOwnProperties for Object.values/entries: for each own string key (in order), do
@@ -1284,7 +1290,7 @@ fn reflect_ordinary_set(
     }
     let mut current = target.clone();
     loop {
-        crate::split_view::unview_val(&current);
+        i.materialize_val(&current);
         if proxy_pair(i, &current).is_some() {
             // A proxy's [[Set]] returns its own success boolean (via the trap or a forwarded [[Set]]).
             return ab(i.set_member_recv(&current, key, value, receiver.clone()));
@@ -1324,7 +1330,7 @@ fn reflect_ordinary_set(
             Value::Obj(o) => o.clone(),
             _ => return Ok(false),
         };
-        let own = obj.borrow().props.get(key).cloned();
+        let own = obj.borrow().props.get(key).map(|p| p.clone());
         match own {
             Some(p) if p.accessor() => {
                 return match p.setter().cloned() {
@@ -1400,7 +1406,7 @@ pub(crate) fn reflect_define_on_receiver(
         Value::Obj(o) => o.clone(),
         _ => return Ok(false),
     };
-    crate::split_view::unview(&ro);
+    i.materialize(&ro);
     // A TypedArray receiver's integer index is written through its exotic [[DefineOwnProperty]]
     // (CreateDataProperty semantics), not stored as an ordinary property.
     if let Some(info) = ta_info(i, &ro) {
@@ -1423,11 +1429,11 @@ pub(crate) fn reflect_define_on_receiver(
         i.strict = saved;
         return ab(r);
     }
-    let existing = ro.borrow().props.get(key).cloned();
+    let existing = ro.borrow().props.get(key).map(|p| p.clone());
     match existing {
         Some(ep) if ep.accessor() || !ep.writable() => Ok(false),
         Some(_) => {
-            ro.borrow_mut().props.get_mut(key).unwrap().set_value(value);
+            ro.borrow_mut().props.set_existing_value(key, value);
             Ok(true)
         }
         None => {
@@ -1482,7 +1488,8 @@ pub(crate) fn reflect_ordinary_get(
         if let Some(v) = crate::split_view::own_elem(&obj, key) {
             return Ok(v);
         }
-        let own = obj.borrow().props.get(key).cloned();
+        i.materialize_fn(&obj);
+        let own = obj.borrow().props.get(key).map(|p| p.clone());
         match own {
             Some(p) if p.accessor() => {
                 return match p.getter().cloned() {
@@ -1513,7 +1520,7 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
         return Ok(());
     }
     if let Value::Obj(o) = holder {
-        crate::split_view::unview(o);
+        i.materialize(o);
         let present = o.borrow().props.contains(key);
         if !present {
             return Ok(());
@@ -1848,6 +1855,8 @@ fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, 
     let len = ab(i.to_length(&o))?;
     let mut out = Vec::with_capacity(len.min(1024));
     for k in 0..len {
+        ab(i.poll_native(k))?;
+        ab(i.check_grow(&out))?;
         out.push(ab(i.get_member(v, &k.to_string()))?);
     }
     Ok(out)
@@ -1914,14 +1923,18 @@ fn advance_string_index(index: usize, s: &str, unicode: bool) -> usize {
     if !unicode {
         return index + 1;
     }
-    let units = crate::jstr::units(s);
-    if index + 1 < units.len()
-        && (0xD800..0xDC00).contains(&(units[index] as u32))
-        && (0xDC00..0xE000).contains(&(units[index + 1] as u32))
-    {
-        index + 2
-    } else {
-        index + 1
+    let (b, mid) = crate::str_index::locate_scan(s, index);
+    if mid || b >= s.len() {
+        return index + 1;
+    }
+    let mut it = crate::jstr::UnitIter::new(&s[b..]);
+    match (it.next(), it.next()) {
+        (Some(hi), Some(lo))
+            if (0xD800..0xDC00).contains(&(hi as u32)) && (0xDC00..0xE000).contains(&(lo as u32)) =>
+        {
+            index + 2
+        }
+        _ => index + 1,
     }
 }
 
@@ -1950,11 +1963,11 @@ fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Resu
 fn regex_find_all(
     re: &crate::regex::Regex,
     text: &crate::regex::ReText,
-) -> Vec<Vec<Option<(usize, usize)>>> {
+) -> Result<Vec<Vec<Option<(usize, usize)>>>, crate::regex::BacktrackLimit> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos <= text.len() {
-        match re.exec_text_shared(text, pos) {
+        match re.exec_text_shared(text, pos)? {
             None => break,
             Some(caps) => {
                 let (a, b) = caps[0].unwrap();
@@ -1966,7 +1979,7 @@ fn regex_find_all(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// ToLength of a value (clamped to a non-negative integer).
@@ -2024,7 +2037,10 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
         return Ok(Value::Null);
     }
     let last = text.elem_at_unit(last_units);
-    match re.exec_text_discard_shared(&text, last) {
+    let found = re
+        .exec_text_discard_shared(&text, last)
+        .map_err(|e| regexp::backtrack_error(i, e))?;
+    match found {
         None => {
             if use_last {
                 set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
@@ -2195,7 +2211,10 @@ pub(crate) fn regexp_exec_discard_direct(
         return Ok(false);
     }
     let last = text.elem_at_unit(last_units);
-    match re.find_text_shared(&text, last) {
+    let found = re
+        .find_text_shared(&text, last)
+        .map_err(|e| regexp::backtrack_error(i, e))?;
+    match found {
         None => {
             if use_last {
                 set_last(0);
@@ -2303,7 +2322,8 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
         return;
     };
     if let Some((re, start)) = m.lazy_captures.take() {
-        if let Some(captures) = re.exec_text_shared(&m.text, start) {
+        // Same program and subject as the successful search, so it cannot exceed the budget.
+        if let Ok(Some(captures)) = re.exec_text_shared(&m.text, start) {
             m.caps.clear();
             m.caps.extend_from_slice(&captures);
         }
@@ -3089,6 +3109,7 @@ fn install_object(it: &mut Interp) {
             return Ok(Value::Bool(false));
         }
         let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
+        i.materialize_fn(&o);
         if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
             return Ok(Value::Bool(true));
         }
@@ -3178,7 +3199,7 @@ fn install_object(it: &mut Interp) {
                     return ab(i.get_member(&desc, if is_get { "get" } else { "set" }));
                 }
             } else if let Value::Obj(co) = &cur {
-                crate::split_view::unview(co);
+                i.materialize(co);
                 if let Some(p) = co.borrow().props.get(&key) {
                     if p.accessor() {
                         let f = if is_get {
@@ -3531,7 +3552,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "create", 2, |i, _this, args| {
         let proto = match arg(args, 0) {
             Value::Obj(o) => {
-                crate::split_view::unview(&o);
+                i.materialize(&o);
                 Some(o)
             }
             Value::Null => None,
@@ -3587,7 +3608,7 @@ fn install_object(it: &mut Interp) {
                 return Ok(descriptor_from_prop(i, ab(res)?));
             }
         }
-        let prop = o.borrow().props.get(&key).cloned();
+        let prop = o.borrow().props.get(&key).map(|p| p.clone());
         match prop {
             None => Ok(Value::Undefined),
             Some(p) => Ok(descriptor_from_prop(i, p)),
@@ -3616,7 +3637,7 @@ fn install_object(it: &mut Interp) {
             if Interp::is_private_key(&key) {
                 continue;
             }
-            let prop = o.borrow().props.get(&key).cloned();
+            let prop = o.borrow().props.get(&key).map(|p| p.clone());
             if let Some(p) = prop {
                 let d = descriptor_from_prop(i, p);
                 result
@@ -3781,6 +3802,7 @@ pub(crate) fn nf_object_has_own(
         _ => return Err(i.make_error("TypeError", "Object.hasOwn called on non-object")),
     };
     let key = ab(i.to_property_key(&arg(args, 1)))?;
+    i.materialize_fn(&o);
     let has = {
         let b = o.borrow();
         crate::split_view::has_own_elem_obj(&b, &key) || b.props.contains(&key)
@@ -4077,7 +4099,7 @@ fn define_own_property_ordinary(
     // fill-time chain walks assumed no such shadow could appear (the op is rare).
     crate::value::bump_proto_epoch();
     // A split view becomes an ordinary Array before any define.
-    crate::split_view::unview(o);
+    i.materialize(o);
     let d = d.clone();
     // Module namespace [[DefineOwnProperty]]: a String key is only redefinable to a descriptor that
     // matches the export's fixed shape (writable, enumerable, non-configurable, same value); adding
@@ -4146,7 +4168,7 @@ fn define_own_property_ordinary(
             return Ok(false);
         }
     }
-    let existing = o.borrow().props.get(key).cloned();
+    let existing = o.borrow().props.get(key).map(|p| p.clone());
 
     let mut cur = match existing {
         None => {
@@ -4464,7 +4486,7 @@ pub(crate) fn array_push_one(i: &Interp, o: &Gc, v: Value) -> Result<f64, Value>
 
 pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     // Dense fast path: a plain array whose `length` is a writable own data property and
     // whose tail is exactly the dense frontier appends in place — no key strings, no
     // existence scans, no observable coercions (a whole-number own `length` needs none).
@@ -4529,7 +4551,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
 
 pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let o = arr_to_object(i, &this)?;
-    crate::split_view::unview(&o);
+    i.materialize(&o);
     // Dense fast path (mirror of push's): take the last element straight off the entries
     // tail — no key strings, no hash lookups, and crucially NO shape reset, so the array's
     // inline caches survive a pop (stack-discipline arrays live on push/pop).
@@ -4747,7 +4769,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
     });
     it.def_method(&ap, "copyWithin", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        crate::split_view::unview(&o);
+        i.materialize(&o);
         let ov = Value::Obj(o.clone());
         let len = ab(i.to_length(&o))? as i64;
         let target = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
@@ -4765,6 +4787,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
             (start, target, 1i64)
         };
         while count > 0 {
+            ab(i.poll_native(count as usize))?;
             let fk = from.to_string();
             let tk = to.to_string();
             if ab(i.js_has_property(&ov, &fk))? {
@@ -5003,6 +5026,8 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
                         ab(i.get_member(&res, "value"))?
                     }
                 };
+                ab(i.poll_native(k as usize))?;
+                ab(i.check_grow(&out))?;
                 let step = (|i: &mut Interp| -> Result<(), Value> {
                     let v = if mapfn.is_callable() {
                         ab(mapper.call(i, &mut [raw, Value::Num(k as f64)]))?
@@ -5048,6 +5073,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
             let mut mapper = crate::bytecode::PreparedCall::new(i, mapfn.clone(), this_arg.clone());
             for k in 0..len {
                 let raw = array_fast::get_elem(i, &o, &ov, k)?;
+                ab(i.check_grow(&out))?;
                 out.push(if mapfn.is_callable() {
                     ab(mapper.call(i, &mut [raw, Value::Num(k as f64)]))?
                 } else {
@@ -5065,6 +5091,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
             i.make_array(Vec::new())
         };
         for k in 0..len {
+            ab(i.poll_native(k))?;
             let raw = ab(i.get_member(&ov, &k.to_string()))?;
             let v = if mapfn.is_callable() {
                 ab(i.call(
@@ -7604,20 +7631,53 @@ pub(crate) fn nf_str_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     let s = this_string(i, &this)?;
     let needle = ab(i.to_string(&arg(args, 0)))?;
-    if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
+    if s.ascii_hint() {
         // Byte index == unit index; a non-ASCII needle simply can't occur.
         let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?.min(s.len());
         let r = s[pos..].find(&*needle).map(|k| (pos + k) as f64);
         return Ok(Value::Num(r.unwrap_or(-1.0)));
     }
-    let chars = i.units_full(&s);
-    let nchars = i.units_full(&needle);
-    let len = chars.len() as i64;
+    let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
-    let nlen = nchars.len();
-    let result = (pos..=chars.len())
-        .find(|&start| start + nlen <= chars.len() && chars[start..start + nlen] == nchars[..]);
-    Ok(Value::Num(result.map(|r| r as f64).unwrap_or(-1.0)))
+    Ok(Value::Num(str_find(i, &s, &needle, pos).map_or(-1.0, |k| k as f64)))
+}
+
+/// Whether byte matches of `needle` are exactly its UTF-16 matches: it doesn't begin with a
+/// low surrogate or end with a high one, either of which could match half of a pair.
+fn needle_bytewise(needle: &str) -> bool {
+    let unit = |c: Option<char>| c.and_then(crate::jstr::smuggled).map_or(0, u32::from);
+    !(0xDC00..0xE000).contains(&unit(needle.chars().next()))
+        && !(0xD800..0xDC00).contains(&unit(needle.chars().next_back()))
+}
+
+/// First UTF-16 index `>= pos` (`pos <= length`) where `needle` occurs in `s`.
+fn str_find(i: &mut Interp, s: &crate::lstr::LStr, needle: &str, pos: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(pos);
+    }
+    if !needle_bytewise(needle) {
+        let (h, n) = (crate::jstr::units(s), crate::jstr::units(needle));
+        return (pos..=h.len()).find(|&k| k + n.len() <= h.len() && h[k..k + n.len()] == n[..]);
+    }
+    let (mut b, mid) = i.unit_pos(s, pos);
+    if mid {
+        b += 4;
+    }
+    let k = s[b..].find(needle)?;
+    Some(i.unit_of_byte(s, b + k))
+}
+
+/// Whether `needle` occurs in `s` at UTF-16 index `pos` (`pos <= length`).
+fn str_match_at(i: &mut Interp, s: &crate::lstr::LStr, pos: usize, needle: &str) -> bool {
+    let (b, mid) = i.unit_pos(s, pos);
+    if !mid && needle_bytewise(needle) {
+        return s.as_bytes()[b..].starts_with(needle.as_bytes());
+    }
+    let mut it = crate::jstr::UnitIter::new(&s[b..]);
+    if mid {
+        it.next();
+    }
+    crate::jstr::UnitIter::new(needle).all(|u| it.next() == Some(u))
 }
 
 /// `String.prototype.includes`.
@@ -7634,13 +7694,9 @@ pub(crate) fn nf_str_includes(i: &mut Interp, this: Value, args: &[Value]) -> Re
         let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
         return Ok(Value::Bool(needle.is_ascii() && s[pos..].contains(&*needle)));
     }
-    let chars = i.units_full(&s);
-    let len = chars.len() as i64;
+    let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
-    let nchars = i.units_full(&needle);
-    let found = (pos..=chars.len())
-        .any(|k| k + nchars.len() <= chars.len() && chars[k..k + nchars.len()] == nchars[..]);
-    Ok(Value::Bool(found))
+    Ok(Value::Bool(str_find(i, &s, &needle, pos).is_some()))
 }
 
 /// `String.prototype.startsWith`.
@@ -7660,13 +7716,9 @@ pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) ->
         };
         return Ok(Value::Bool(s.as_bytes()[pos..].starts_with(needle.as_bytes())));
     }
-    let chars = i.units_full(&s);
-    let len = chars.len() as i64;
+    let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
-    let nchars = i.units_full(&needle);
-    Ok(Value::Bool(
-        pos + nchars.len() <= chars.len() && chars[pos..pos + nchars.len()] == nchars[..],
-    ))
+    Ok(Value::Bool(str_match_at(i, &s, pos, &needle)))
 }
 
 /// `String.prototype.endsWith`.
@@ -7688,17 +7740,14 @@ pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> R
         };
         return Ok(Value::Bool(s.as_bytes()[..end].ends_with(needle.as_bytes())));
     }
-    let chars = i.units_full(&s);
-    let len = chars.len() as i64;
+    let len = i.str_len(&s) as i64;
     // endsWith's optional argument is the END position (default = length).
     let end = match args.get(1) {
         Some(v) if !matches!(v, Value::Undefined) => str_clamp_pos(i, Some(v), len)?,
         _ => len as usize,
     };
-    let nchars = i.units_full(&needle);
-    Ok(Value::Bool(
-        end >= nchars.len() && chars[end - nchars.len()..end] == nchars[..],
-    ))
+    let n = crate::str_index::unit_len(&needle);
+    Ok(Value::Bool(end >= n && str_match_at(i, &s, end - n, &needle)))
 }
 
 /// `String.prototype.toUpperCase`.
@@ -7955,10 +8004,13 @@ pub(crate) fn str_fast(k: StrFast, s: &crate::lstr::LStr, args: &[Value]) -> Opt
 fn this_string(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value> {
     match this {
         Value::Str(s) => Ok(s.clone()),
-        Value::Obj(o) => match o.borrow().str_wrap() {
-            Some(s) => Ok(s),
-            None => ab(i.to_string(this)),
-        },
+        Value::Obj(o) => {
+            let wrapped = o.borrow().str_wrap();
+            match wrapped {
+                Some(s) => Ok(s),
+                None => ab(i.to_string(this)),
+            }
+        }
         // String.prototype methods RequireObjectCoercible(this): null/undefined → TypeError.
         Value::Undefined | Value::Null => Err(i.make_error(
             "TypeError",
@@ -8159,7 +8211,8 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
             let text = i.re_text(re.unicode, &s);
             let mut parts = Vec::new();
             let mut last = 0;
-            'outer: for caps in regex_find_all(&re, &text) {
+            let found = regex_find_all(&re, &text).map_err(|e| regexp::backtrack_error(i, e))?;
+            'outer: for caps in found {
                 let (a, b) = caps[0].unwrap();
                 // Skip a zero-width match at the very start or end of the string.
                 if a == b && (b == 0 || a >= text.len()) {
@@ -8262,28 +8315,40 @@ fn install_string(it: &mut Interp) {
             ));
         }
         // Optional `position`: search for the last occurrence starting at or before it.
-        let chars = i.units_full(&s);
-        let nchars = i.units_full(&needle);
+        let len = i.str_len(&s);
         let limit = match arg(args, 1) {
-            Value::Undefined => chars.len(),
+            Value::Undefined => len,
             v => {
                 let p = ab(i.to_number(&v))?;
                 if p.is_nan() {
-                    chars.len()
+                    len
                 } else {
-                    (p.max(0.0) as usize).min(chars.len())
+                    (p.max(0.0) as usize).min(len)
                 }
             }
         };
-        let mut found = -1.0;
-        let mut start = 0;
-        while start + nchars.len() <= chars.len() && start <= limit {
-            if chars[start..start + nchars.len()] == nchars[..] {
-                found = start as f64;
-            }
-            start += 1;
+        if needle.is_empty() {
+            return Ok(Value::Num(limit as f64));
         }
-        Ok(Value::Num(found))
+        if !needle_bytewise(&needle) {
+            let (chars, nchars) = (crate::jstr::units(&s), crate::jstr::units(&needle));
+            let mut found = -1.0;
+            let mut start = 0;
+            while start + nchars.len() <= chars.len() && start <= limit {
+                if chars[start..start + nchars.len()] == nchars[..] {
+                    found = start as f64;
+                }
+                start += 1;
+            }
+            return Ok(Value::Num(found));
+        }
+        // A match ends by unit `limit + n`; one cannot end inside a surrogate pair.
+        let n = crate::str_index::unit_len(&needle);
+        let (end, _) = i.unit_pos(&s, (limit + n).min(len));
+        Ok(Value::Num(match s[..end].rfind(&*needle) {
+            Some(k) => i.unit_of_byte(&s, k) as f64,
+            None => -1.0,
+        }))
     });
     it.def_method(&sp, "toLocaleLowerCase", 0, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -8319,8 +8384,7 @@ fn install_string(it: &mut Interp) {
     // Annex B B.2.3.1 String.prototype.substr(start, length).
     it.def_method(&sp, "substr", 2, |i, this, args| {
         let s = this_string(i, &this)?;
-        let chars = i.units_full(&s);
-        let size = chars.len() as i64;
+        let size = i.str_len(&s) as i64;
         let n = ab(i.to_number(&arg(args, 0)))?;
         // ToIntegerOrInfinity truncates first, so -0.5 is +0, not a from-the-end index.
         let n = n.trunc();
@@ -8349,9 +8413,7 @@ fn install_string(it: &mut Interp) {
         if start < 0 {
             start = 0;
         }
-        Ok(Value::from_string(crate::jstr::from_units(
-            &chars[start as usize..(start + count) as usize],
-        )))
+        Ok(i.unit_slice(&s, start as usize, (start + count) as usize))
     });
     // Annex B B.2.3 HTML-wrapper methods (CreateHTML): each wraps the string in a tag.
     it.def_method(&sp, "anchor", 1, |i, t, a| {
@@ -8477,7 +8539,7 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "trimEnd", 0, nf_str_trim_end);
     // Annex B aliases: trimLeft/trimRight ARE trimStart/trimEnd (same function objects).
     for (alias, target) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
-        let p = sp.borrow().props.get(target).cloned();
+        let p = sp.borrow().props.get(target).map(|p| p.clone());
         if let Some(p) = p {
             sp.borrow_mut().props.insert(alias, p);
         }
@@ -8618,10 +8680,14 @@ fn install_string(it: &mut Interp) {
             // An empty search matches at every position: insert the replacement between each char.
             let mut out = String::new();
             let mut byte = 0usize;
-            for ch in s.chars() {
+            for (n, ch) in s.chars().enumerate() {
                 out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
                 out.push(ch);
                 byte += ch.len_utf8();
+                if out.len() > MAX_STR_LEN {
+                    return Err(i.make_error("RangeError", "Invalid string length"));
+                }
+                ab(i.poll_native(n))?;
             }
             out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
             return Ok(Value::from_string(out));
@@ -8629,10 +8695,16 @@ fn install_string(it: &mut Interp) {
         let mut out = String::new();
         let mut rest = s.as_str();
         let mut base = 0usize;
+        let mut n = 0usize;
         while let Some(pos) = rest.find(pat.as_ref()) {
             out.push_str(&rest[..pos]);
             let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;
             out.push_str(&rep);
+            if out.len() > MAX_STR_LEN {
+                return Err(i.make_error("RangeError", "Invalid string length"));
+            }
+            n += 1;
+            ab(i.poll_native(n))?;
             rest = &rest[pos + pat.len()..];
             base += pos + pat.len();
         }
@@ -8694,6 +8766,7 @@ fn install_string(it: &mut Interp) {
         let len = ab(i.to_length(&raw_obj))?;
         let mut out = String::new();
         for k in 0..len {
+            ab(i.poll_native(k))?;
             let seg = ab(i.get_member(&raw, &k.to_string()))?;
             out.push_str(&ab(i.to_string(&seg))?);
             if k + 1 < len {
@@ -8737,32 +8810,13 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
         return Ok(v);
     }
     let s = this_string(i, &this)?;
-    if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
-        let len = s.len() as i64;
-        let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
-        let end = match arg(args, 1) {
-            Value::Undefined => len,
-            v => norm_index(ab(i.to_number(&v))?, len),
-        };
-        return Ok(if start < end {
-            Value::Str(s.sub(&s[start as usize..end as usize]))
-        } else {
-            Value::str("")
-        });
-    }
-    let chars = i.units_full(&s);
-    let len = chars.len() as i64;
+    let len = i.str_len(&s) as i64;
     let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
     let end = match arg(args, 1) {
         Value::Undefined => len,
         v => norm_index(ab(i.to_number(&v))?, len),
     };
-    let out = if start < end {
-        crate::jstr::from_units(&chars[start as usize..end as usize])
-    } else {
-        String::new()
-    };
-    Ok(Value::from_string(out))
+    Ok(i.unit_slice(&s, start as usize, end as usize))
 }
 
 /// Box a Number/String/Boolean primitive into a wrapper object (right prototype + exotic). Other

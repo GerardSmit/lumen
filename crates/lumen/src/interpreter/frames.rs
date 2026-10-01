@@ -1,7 +1,6 @@
 //! The call-frame stack behind error stacks and legacy `fn.caller`/`fn.arguments` reflection.
 use super::Env;
 use crate::value::{Gc, Value};
-use std::cell::RefCell;
 use std::rc::Rc;
 
 /// One entry of the call stack behind error stacks and the legacy `fn.caller`/`fn.arguments`
@@ -164,7 +163,7 @@ pub struct ReflectStash {
 impl FnFrame {
     /// A strong handle to the callee, reconstructed from `fn_ptr` (see its aliveness invariant).
     pub fn callee(&self) -> Gc {
-        let p = self.fn_ptr as *const RefCell<crate::value::Object>;
+        let p = self.fn_ptr as *const crate::value::ObjCell;
         unsafe {
             Gc::increment_strong_count(p);
             Gc::from_raw(p)

@@ -191,8 +191,12 @@ fn inflate_block(
     out: &mut Vec<u8>,
     lit: &Huffman,
     dist: &Huffman,
+    limit: usize,
 ) -> Result<(), String> {
     loop {
+        if out.len() > limit {
+            return Err(OUTPUT_LIMIT.into());
+        }
         let sym = lit.decode(reader)?;
         match sym {
             0..=255 => out.push(sym as u8),
@@ -220,11 +224,22 @@ fn inflate_block(
     }
 }
 
+/// The error every `*_limited` decoder returns once its output would pass the limit.
+pub const OUTPUT_LIMIT: &str = "output exceeds the length limit";
+
 /// Decode raw DEFLATE (no zlib/gzip wrapper).
 pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
+    inflate_limited(data, usize::MAX)
+}
+
+/// [`inflate`], failing with [`OUTPUT_LIMIT`] as soon as the output passes `limit` bytes.
+pub fn inflate_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut reader = BitReader::new(data);
     let mut out = Vec::new();
-    while !inflate_one_block(&mut reader, &mut out)? {}
+    while !inflate_one_block(&mut reader, &mut out, limit)? {}
+    if out.len() > limit {
+        return Err(OUTPUT_LIMIT.into());
+    }
     Ok(out)
 }
 
@@ -886,7 +901,7 @@ impl Inflater {
         reader.bit_cnt = self.bit_cnt;
         loop {
             let checkpoint = (reader.pos, reader.bit_buf, reader.bit_cnt, out.len());
-            match inflate_one_block(&mut reader, &mut out) {
+            match inflate_one_block(&mut reader, &mut out, usize::MAX) {
                 Ok(final_block) => {
                     if final_block {
                         self.finished = true;
@@ -936,7 +951,11 @@ impl Inflater {
 }
 
 /// Decode one block from `reader` into `out`; returns whether it was the final block.
-fn inflate_one_block(reader: &mut BitReader, out: &mut Vec<u8>) -> Result<bool, String> {
+fn inflate_one_block(
+    reader: &mut BitReader,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<bool, String> {
     let final_block = reader.bit()?;
     let btype = reader.bits(2)?;
     let data = reader.data;
@@ -951,16 +970,19 @@ fn inflate_one_block(reader: &mut BitReader, out: &mut Vec<u8>) -> Result<bool, 
             if reader.pos + len > data.len() {
                 return Err("inflate: stored block overruns input".into());
             }
+            if out.len() + len > limit {
+                return Err(OUTPUT_LIMIT.into());
+            }
             out.extend_from_slice(&data[reader.pos..reader.pos + len]);
             reader.pos += len;
         }
         1 => {
             let (lit, dist) = fixed_huffman();
-            inflate_block(reader, out, &lit, &dist)?;
+            inflate_block(reader, out, &lit, &dist, limit)?;
         }
         2 => {
             let (lit, dist) = read_dynamic_tables(reader)?;
-            inflate_block(reader, out, &lit, &dist)?;
+            inflate_block(reader, out, &lit, &dist, limit)?;
         }
         _ => return Err("inflate: reserved block type".into()),
     }
@@ -977,14 +999,17 @@ pub fn zlib_compress(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    zlib_decompress_limited(data, usize::MAX)
+}
+
+pub fn zlib_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     if data.len() < 6 {
         return Err("zlib: input too short".into());
     }
     if data[0] & 0x0f != 8 {
         return Err("zlib: unsupported compression method".into());
     }
-    let out = inflate(&data[2..])?;
-    Ok(out)
+    inflate_limited(&data[2..], limit)
 }
 
 pub fn gzip_compress(data: &[u8]) -> Vec<u8> {
@@ -996,6 +1021,10 @@ pub fn gzip_compress(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    gzip_decompress_limited(data, usize::MAX)
+}
+
+pub fn gzip_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
         return Err("gzip: bad magic".into());
     }
@@ -1032,7 +1061,7 @@ pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     if pos + 8 > data.len() {
         return Err("gzip: truncated".into());
     }
-    inflate(&data[pos..data.len() - 8])
+    inflate_limited(&data[pos..data.len() - 8], limit)
 }
 
 #[cfg(test)]

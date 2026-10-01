@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// "bound " + `s`. Rebinding a bound function prefixes its name again, so a long chain shares
+/// one root buffer of repeated prefixes (each name a view of it) instead of copying the
+/// whole name per link, which would be quadratic in the chain length.
+fn bound_name(s: &crate::lstr::LStr) -> Value {
+    const P: &str = "bound ";
+    if let Some(v) = s.view_extend_front(P) {
+        return Value::Str(v);
+    }
+    if s.len() >= 2 * crate::lstr::VIEW_MIN && s.starts_with(P) {
+        let reps = (s.len() / P.len()).max(64);
+        let mut buf = String::with_capacity(reps * P.len() + s.len());
+        for _ in 0..reps {
+            buf.push_str(P);
+        }
+        buf.push_str(s);
+        let root = crate::lstr::LStr::from(buf);
+        return Value::Str(root.sub(&root[root.len() - s.len() - P.len()..]));
+    }
+    Value::from_string(format!("{P}{s}"))
+}
+
 pub(super) fn install_function_proto(it: &mut Interp) {
     let fp = it.function_proto.clone();
     // %Function.prototype% is itself a callable function object that accepts any arguments and
@@ -45,8 +66,8 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         };
         let target_name = ab(i.get_member(&this, "name"))?;
         let name = match &target_name {
-            Value::Str(s) => format!("bound {s}"),
-            _ => "bound ".to_string(),
+            Value::Str(s) => bound_name(s),
+            _ => Value::str("bound "),
         };
         // BoundFunctionCreate: the bound function's [[Prototype]] is the target's (via
         // [[GetPrototypeOf]], so a proxy trap participates) — possibly null.
@@ -64,7 +85,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
             .insert("length", Property::data(Value::Num(l), false, false, true));
         obj.borrow_mut().props.insert(
             "name",
-            Property::data(Value::from_string(name), false, false, true),
+            Property::data(name, false, false, true),
         );
         Ok(Value::Obj(obj))
     });

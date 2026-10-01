@@ -1,7 +1,7 @@
 //! Dense element storage and array length access.
 
 use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
-use crate::value::{Property, Value};
+use crate::value::{PackedValue, PropRef, Property, Value};
 
 impl Props {
     /// Reserve the exact backing storage for a dense array whose initial length is known.
@@ -12,9 +12,7 @@ impl Props {
     pub(crate) fn reserve_dense_exact(&mut self, len: usize, numeric: bool) {
         if (1..=32).contains(&len) {
             self.entries.reserve_exact(1); // own `length`
-            self.elems
-                .set_packed(Some(Box::new(super::PackedVec::with_capacity(len))));
-            *self.elems.mirror_flags_mut() = 0;
+            self.elems.install_packed(super::PackedVec::with_capacity(len));
         } else {
             self.entries.reserve_exact(len.saturating_add(1));
             self.elems.reserve_exact(len);
@@ -27,14 +25,12 @@ impl Props {
     /// Install `elems` as the packed dense elements `0..elems.len()` of an array map that has
     /// its own `length` and no elements yet (a split view materializing in place: see
     /// `crate::split_view`). The same storage a compact builtin array of that length gets.
-    pub(crate) fn adopt_packed_elements(&mut self, elems: Vec<Property>) {
+    pub(crate) fn adopt_packed_elements(&mut self, elems: Vec<PackedValue>) {
         debug_assert!(self.elem_mode.get() && self.elems.packed_ref().is_none_or(|p| p.is_empty()) && self.elems.len() == 0);
         if elems.is_empty() {
             return;
         }
-        self.elems
-            .set_packed(Some(Box::new(super::PackedVec::from(elems))));
-        *self.elems.mirror_flags_mut() = 0;
+        self.elems.install_packed(super::PackedVec::from(elems));
     }
 
     /// Mark this map as an array's (see `elem_mode`). One-way, set when the owning object
@@ -65,7 +61,7 @@ impl Props {
             Some(n) if lp.writable() && (n as u32) as f64 == n && n < u32::MAX as f64 => n as u32,
             _ => return Err(v),
         };
-        let packed = match self.elems.as_deref_mut().and_then(|d| d.packed.as_deref_mut()) {
+        let packed = match self.elems.packed_mut() {
             Some(p) if p.len() == len as usize && !self.has_far.get() && self.elem_mode.get() => p,
             _ => {
                 if let Err(p) = self.try_append_element(len, Property::plain(v)) {
@@ -76,7 +72,7 @@ impl Props {
                 return Ok(n);
             }
         };
-        packed.push(Property::plain(v));
+        packed.push(PackedValue::pack(v));
         self.note_structural();
         let n = len as f64 + 1.0;
         self.entries[slot].set_num_over_num(n);
@@ -86,17 +82,46 @@ impl Props {
     /// The own property for canonical index `n`, without hashing. `None` only means "not in the
     /// dense map" — the caller must fall back to the string-keyed path, not conclude absence.
     #[inline]
-    pub(crate) fn get_index(&self, n: u32) -> Option<&Property> {
+    pub(crate) fn get_index(&self, n: u32) -> Option<PropRef<'_>> {
         if let Some(packed) = self.elems.packed_ref() {
-            return packed
-                .get(n as usize)
-                .filter(|p| !matches!(p.value(), Value::Empty));
+            return packed.get(n as usize).filter(|p| !p.is_hole()).map(PropRef::elem);
         }
         let slot = *self.elems.get(n as usize)?;
         if slot == NO_SLOT {
             return None;
         }
-        Some(&self.entries[slot as usize])
+        Some(PropRef::of(&self.entries[slot as usize]))
+    }
+
+    /// Move packed elements to classic storage: an element is about to need descriptor bits
+    /// (or a `&mut Property`) that a packed word cannot hold.
+    pub(super) fn unpack_elements(&mut self) {
+        let Some(packed) = self.elems.packed_mut() else { return };
+        let words = std::mem::take(packed).into_vec(0);
+        self.note_structural();
+        self.elems.drop_packed();
+        if !self.elem_mode.get() {
+            for (n, w) in words.into_iter().enumerate() {
+                if !w.is_hole() {
+                    self.insert(super::shapes::index_key(n), Property::from_elem(w));
+                }
+            }
+            return;
+        }
+        debug_assert_eq!(self.elems.len(), 0);
+        self.elems.classic_mut();
+        self.elems.mirror_off();
+        self.elems.reserve_exact(words.len());
+        self.entries.reserve_exact(words.iter().filter(|w| !w.is_hole()).count());
+        for w in words {
+            if w.is_hole() {
+                self.elems.push(NO_SLOT);
+                continue;
+            }
+            let slot = self.entries.len();
+            self.entries.push(Property::from_elem(w));
+            self.elems.push(slot as u32);
+        }
     }
 
     /// Dense tail append: insert element `n` when `n` is exactly the dense frontier and no
@@ -110,9 +135,14 @@ impl Props {
             if self.has_far.get() || !self.elem_mode.get() || n as usize != packed.len() {
                 return Err(prop);
             }
-            self.note_structural();
-            self.elems.packed_mut().unwrap().push(prop);
-            return Ok(());
+            return match prop.into_elem() {
+                Ok(w) => {
+                    self.note_structural();
+                    self.elems.packed_mut().unwrap().push(w);
+                    Ok(())
+                }
+                Err(prop) => Err(prop),
+            };
         }
         if self.has_far.get() || !self.elem_mode.get() || n as usize != self.elems.len() {
             return Err(prop);
@@ -120,11 +150,20 @@ impl Props {
         if n == 0 && self.elementless() {
             // The first element of an elementless array: start packed storage (one growable
             // buffer; no per-index slot map or mirror bookkeeping on every later append).
-            self.note_structural();
-            self.install_empty_packed();
-            self.elems.packed_mut().unwrap().push(prop);
-            return Ok(());
+            match prop.into_elem() {
+                Ok(w) => {
+                    self.note_structural();
+                    self.install_empty_packed();
+                    self.elems.packed_mut().unwrap().push(w);
+                    return Ok(());
+                }
+                Err(p) => return self.append_classic(p),
+            }
         }
+        self.append_classic(prop)
+    }
+
+    fn append_classic(&mut self, prop: Property) -> Result<(), Property> {
         self.note_structural();
         let slot = self.entries.len();
         self.reserve_entry();
@@ -143,7 +182,10 @@ impl Props {
         n: u32,
         prop: Property,
     ) -> Result<(), Property> {
-        if self.elems.packed_is_some() || self.has_far.get() || !self.elem_mode.get() {
+        if self.has_far.get() || !self.elem_mode.get() {
+            return Err(prop);
+        }
+        if self.elems.packed_is_some() && !self.unpack_for_sparse_fill(n) {
             return Err(prop);
         }
         let n = n as usize;
@@ -186,13 +228,10 @@ impl Props {
             let Some(run) = packed.get(start as usize..hi) else {
                 return 0;
             };
-            // The run ends at the first accessor or hole; one exact-size extend copies it
-            // (each value one full-width store, see `push_value`).
-            let n = run
-                .iter()
-                .position(|p| p.accessor() || p.is_empty())
-                .unwrap_or(run.len());
-            out.extend(run[..n].iter().map(Property::value));
+            // The run ends at the first hole; one exact-size extend copies it (each value one
+            // full-width store, see `push_value`).
+            let n = run.iter().position(PackedValue::is_hole).unwrap_or(run.len());
+            out.extend(run[..n].iter().map(PackedValue::unpack));
             return n as u32;
         }
         let mut k = start;
@@ -209,23 +248,22 @@ impl Props {
     /// A copy of packed elements `start..end` when every one of them is a plain data element
     /// (no holes or accessors): each property is cloned as it stands (a refcount bump at most).
     pub(in crate::value) fn clone_packed_run(&self, start: usize, end: usize) -> Option<super::PackedVec> {
-        if let Some(pv) = self.elems.packed_boxed() {
+        if let Some(pv) = self.elems.packed_vec() {
             if start <= end && end <= pv.len() && pv.all_flat() {
                 return Some(pv.copy_flat(start, end));
             }
         }
         let run = self.elems.packed_ref()?.get(start..end)?;
-        if !self.elems.packed_known_plain() && !run.iter().all(Property::is_plain_element) {
+        if !self.elems.packed_known_plain() && run.iter().any(PackedValue::is_hole) {
             return None;
         }
-        // Plain data properties: the clone is the value's (no accessor box to share).
-        let copy: Vec<Property> = run.iter().map(Property::clone_plain).collect();
+        let copy: Vec<PackedValue> = run.to_vec();
         Some(super::PackedVec::from_plain(copy))
     }
 
     /// The packed element slice, when this map uses packed storage.
     #[inline]
-    pub(crate) fn packed_elements(&self) -> Option<&[Property]> {
+    pub(crate) fn packed_elements(&self) -> Option<&[PackedValue]> {
         self.elems.packed_ref()
     }
 
@@ -246,8 +284,7 @@ impl Props {
             if n as usize + 1 != packed.len() {
                 return None;
             }
-            let p = packed.last()?;
-            if matches!(p.value(), Value::Empty) || p.accessor() || !p.configurable() {
+            if packed.last()?.is_hole() {
                 return None;
             }
             self.note_structural();
@@ -256,7 +293,7 @@ impl Props {
                 .packed_mut()
                 .unwrap()
                 .pop()
-                .map(Property::into_value);
+                .map(PackedValue::into_value);
         }
         if n as usize + 1 != self.elems.len() {
             return None;
@@ -309,7 +346,7 @@ impl Props {
             return None;
         }
         self.note_structural();
-        self.elems.packed_mut()?.pop_front().map(Property::into_value)
+        self.elems.packed_mut()?.pop_front().map(PackedValue::into_value)
     }
 
     /// `unshift(...items)` on a packed array of `len` plain elements with no far keys. The
@@ -335,7 +372,7 @@ impl Props {
         self.elems
             .packed_mut()
             .unwrap()
-            .prepend(items.iter().cloned().map(Property::plain));
+            .prepend(items.iter().cloned().map(PackedValue::pack));
         true
     }
 
@@ -359,9 +396,9 @@ impl Props {
         let removed = self.elems.packed_mut()?.splice(
             start,
             del,
-            items.iter().cloned().map(Property::plain),
+            items.iter().cloned().map(PackedValue::pack),
         );
-        Some(removed.into_iter().map(Property::into_value).collect())
+        Some(removed.into_iter().map(PackedValue::into_value).collect())
     }
 
     /// Append the next dense element while *building a fresh array in order*: element index ==
@@ -370,8 +407,13 @@ impl Props {
     /// 0..len.
     pub(crate) fn push_dense(&mut self, prop: Property) {
         if let Some(packed) = self.elems.packed_mut() {
-            packed.push(prop);
-            return;
+            match prop.into_elem() {
+                Ok(w) => return packed.push(w),
+                Err(p) => {
+                    self.unpack_elements();
+                    return self.push_dense(p);
+                }
+            }
         }
         let slot = self.entries.len();
         self.reserve_entry();

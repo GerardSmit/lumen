@@ -1,6 +1,7 @@
 //! Binding maps with generation-checked entry addresses.
 use super::Binding;
 use crate::value::Value;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 mod layout;
@@ -21,23 +22,99 @@ pub struct VarMap {
     /// Set once a per-site name resolution walked through this map (see
     /// `interpreter::name_cache`): from then on its structural mutations bump the scope epoch.
     observed: std::cell::Cell<bool>,
+    /// The owning scope's flags (`interpreter::SCOPE_*`), here to share this struct's padding.
+    scope_flags: u8,
 }
 
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
 
+/// A template map's values: `layout.names.len()` bindings behind a thin pointer (the length
+/// is the layout's), so the template variant fits the same 24 bytes as the others.
+struct Slots(NonNull<Binding>);
+
+impl Slots {
+    fn new(values: Vec<Binding>) -> Slots {
+        let b: Box<[Binding]> = values.into_boxed_slice();
+        Slots(NonNull::new(Box::into_raw(b) as *mut Binding).expect("box pointer"))
+    }
+    #[inline]
+    fn get<'a>(&'a self, layout: &BindingLayout) -> &'a [Binding] {
+        // SAFETY: a `Slots` is only ever paired with the layout it was built for.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr(), layout.names.len()) }
+    }
+    #[inline]
+    fn get_mut<'a>(&'a mut self, layout: &BindingLayout) -> &'a mut [Binding] {
+        // SAFETY: as in `get`; `&mut self` makes the access unique.
+        unsafe { std::slice::from_raw_parts_mut(self.0.as_ptr(), layout.names.len()) }
+    }
+    fn into_vec(self, layout: &BindingLayout) -> Vec<Binding> {
+        let p = std::ptr::slice_from_raw_parts_mut(self.0.as_ptr(), layout.names.len());
+        // SAFETY: built by `Slots::new` from a boxed slice of exactly this length.
+        unsafe { Box::from_raw(p) }.into_vec()
+    }
+}
+
 enum VarStorage {
-    Template(Rc<BindingLayout>, Vec<Binding>),
+    Template(Rc<BindingLayout>, Slots),
     Small(Vec<(std::rc::Rc<str>, Binding)>),
-    Large(crate::fasthash::FastMap<std::rc::Rc<str>, Binding>),
+    Large(Box<crate::fasthash::FastMap<std::rc::Rc<str>, Binding>>),
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<VarStorage>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<VarMap>() == 32);
+
+thread_local! {
+    /// Layouts recently given to per-iteration copies, keyed by their names' identities.
+    static COPY_LAYOUTS: std::cell::RefCell<Vec<Rc<BindingLayout>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A layout for exactly `entries`' names, in order — reused while the same names (the same
+/// interned `Rc`s: a loop's declarations) come back, so a loop's per-iteration copies share
+/// one.
+fn shared_layout(entries: &[(Rc<str>, Binding)]) -> Option<Rc<BindingLayout>> {
+    const KEEP: usize = 8;
+    if entries.is_empty() {
+        return None;
+    }
+    COPY_LAYOUTS.with(|c| {
+        let mut c = c.borrow_mut();
+        let same = |l: &BindingLayout| {
+            l.names.len() == entries.len()
+                && l.names
+                    .iter()
+                    .zip(entries)
+                    .all(|(a, (b, _))| Rc::ptr_eq(a, b))
+        };
+        if let Some(i) = c.iter().position(|l| same(l)) {
+            let l = c.remove(i);
+            c.push(l.clone());
+            return Some(l);
+        }
+        let l = BindingLayout::new(entries.iter().map(|(n, _)| n.clone()));
+        if l.names.len() != entries.len() {
+            return None;
+        }
+        if c.len() == KEEP {
+            c.remove(0);
+        }
+        c.push(l.clone());
+        Some(l)
+    })
+}
+
+impl Drop for VarMap {
+    fn drop(&mut self) {
+        if let VarStorage::Template(..) = self.map {
+            self.take_template();
+        }
+    }
 }
 
 impl Default for VarMap {
     fn default() -> Self {
-        Self {
-            map: VarStorage::Small(Vec::new()),
-            generation: std::cell::Cell::new(0),
-            observed: std::cell::Cell::new(false),
-        }
+        Self::from_storage(VarStorage::Small(Vec::new()), 0)
     }
 }
 
@@ -93,10 +170,42 @@ impl<'a> Iterator for VarValues<'a> {
 }
 
 impl VarMap {
+    fn from_storage(map: VarStorage, generation: u32) -> Self {
+        Self {
+            map,
+            generation: std::cell::Cell::new(generation),
+            observed: std::cell::Cell::new(false),
+            scope_flags: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn scope_flags(&self) -> u8 {
+        self.scope_flags
+    }
+
+    pub(crate) fn set_scope_flags(&mut self, flags: u8) {
+        self.scope_flags = flags;
+    }
+
+    /// Swap a template representation for an empty small one, handing back its parts.
+    fn take_template(&mut self) -> Option<(Rc<BindingLayout>, Vec<Binding>)> {
+        match std::mem::replace(&mut self.map, VarStorage::Small(Vec::new())) {
+            VarStorage::Template(layout, slots) => {
+                let values = slots.into_vec(&layout);
+                Some((layout, values))
+            }
+            other => {
+                self.map = other;
+                None
+            }
+        }
+    }
+
     /// (bindings, reserved slots, mode) for a heap census.
     pub(crate) fn census(&self) -> (usize, usize, &'static str) {
         match &self.map {
-            VarStorage::Template(_, v) => (v.len(), v.capacity(), "template"),
+            VarStorage::Template(l, _) => (l.names.len(), l.names.len(), "template"),
             VarStorage::Small(v) => (v.len(), v.capacity(), "small"),
             VarStorage::Large(m) => (m.len(), m.capacity(), "large"),
         }
@@ -110,7 +219,9 @@ impl VarMap {
 
     pub(crate) fn template_binding(&self, slot: usize) -> Option<&Binding> {
         match &self.map {
-            VarStorage::Template(_, values) if self.generation() == 0 => values.get(slot),
+            VarStorage::Template(layout, values) if self.generation() == 0 => {
+                values.get(layout).get(slot)
+            }
             _ => None,
         }
     }
@@ -121,11 +232,7 @@ impl VarMap {
             .iter()
             .map(|_| Binding::data(Value::Undefined, true, true))
             .collect();
-        Self {
-            map: VarStorage::Template(layout, values),
-            generation: std::cell::Cell::new(0),
-            observed: std::cell::Cell::new(false),
-        }
+        Self::from_storage(VarStorage::Template(layout, Slots::new(values)), 0)
     }
 
     /// The layout identity proves the slot's name without a string/hash lookup. In-place
@@ -137,37 +244,33 @@ impl VarMap {
     ) -> Option<&mut Binding> {
         match &mut self.map {
             VarStorage::Template(layout, values) if Rc::ptr_eq(layout, expected) => {
-                values.get_mut(slot)
+                values.get_mut(layout).get_mut(slot)
             }
             _ => None,
         }
     }
 
     fn make_dynamic(&mut self) {
-        if !matches!(self.map, VarStorage::Template(..)) {
-            return;
+        if let Some((layout, values)) = self.take_template() {
+            self.map =
+                VarStorage::Large(Box::new(layout.names.iter().cloned().zip(values).collect()));
         }
-        let VarStorage::Template(layout, values) =
-            std::mem::replace(&mut self.map, VarStorage::Small(Vec::new()))
-        else {
-            unreachable!()
-        };
-        self.map = VarStorage::Large(layout.names.iter().cloned().zip(values).collect());
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> VarMap {
-        VarMap {
-            map: if capacity <= SMALL_VAR_MAP_CAPACITY {
+        Self::from_storage(
+            if capacity <= SMALL_VAR_MAP_CAPACITY {
                 VarStorage::Small(Vec::with_capacity(capacity))
             } else {
-                VarStorage::Large(crate::fasthash::FastMap::with_capacity_and_hasher(
-                    capacity,
-                    Default::default(),
+                VarStorage::Large(Box::new(
+                    crate::fasthash::FastMap::with_capacity_and_hasher(
+                        capacity,
+                        Default::default(),
+                    ),
                 ))
             },
-            generation: std::cell::Cell::new(0),
-            observed: std::cell::Cell::new(false),
-        }
+            0,
+        )
     }
 
     /// The structural generation (name-cache validation token).
@@ -194,7 +297,7 @@ impl VarMap {
         match &mut self.map {
             VarStorage::Template(layout, values) => {
                 let slot = layout.slot(&k).expect("existing layout binding");
-                Some(std::mem::replace(&mut values[slot], v))
+                Some(std::mem::replace(&mut values.get_mut(layout)[slot], v))
             }
             VarStorage::Small(entries) => {
                 if let Some((_, old)) = entries.iter_mut().find(|(name, _)| **name == *k) {
@@ -218,7 +321,7 @@ impl VarMap {
                     large.insert(name, binding);
                 }
                 let old = large.insert(k, v);
-                self.map = VarStorage::Large(large);
+                self.map = VarStorage::Large(Box::new(large));
                 old
             }
             VarStorage::Large(entries) => entries.insert(k, v),
@@ -238,10 +341,11 @@ impl VarMap {
     }
     pub fn clear(&mut self) {
         self.bump();
+        self.take_template();
         match &mut self.map {
             VarStorage::Small(entries) => entries.clear(),
             VarStorage::Large(entries) => entries.clear(),
-            VarStorage::Template(..) => self.map = VarStorage::Small(Vec::new()),
+            VarStorage::Template(..) => unreachable!("taken above"),
         }
     }
     /// In-place binding write: entries don't move, so the generation stays (see the type docs).
@@ -252,7 +356,10 @@ impl VarMap {
                 .find(|(name, _)| &**name == k)
                 .map(|(_, binding)| binding),
             VarStorage::Large(entries) => entries.get_mut(k),
-            VarStorage::Template(layout, values) => layout.slot(k).map(|slot| &mut values[slot]),
+            VarStorage::Template(layout, values) => {
+                let slot = layout.slot(k)?;
+                Some(&mut values.get_mut(layout)[slot])
+            }
         }
     }
     pub fn get(&self, k: &str) -> Option<&Binding> {
@@ -262,18 +369,32 @@ impl VarMap {
                 .find(|(name, _)| &**name == k)
                 .map(|(_, binding)| binding),
             VarStorage::Large(entries) => entries.get(k),
-            VarStorage::Template(layout, values) => layout.slot(k).map(|slot| &values[slot]),
+            VarStorage::Template(layout, values) => {
+                layout.slot(k).map(|slot| &values.get(layout)[slot])
+            }
         }
     }
-    /// A copy of every binding (CreatePerIterationEnvironment): the small representation clones
-    /// its entry vector wholesale.
+    /// A copy of every binding (CreatePerIterationEnvironment). A small map's copy takes a
+    /// shared layout for its names (see [`shared_layout`]), so every later iteration's copy
+    /// carries just its values; a template's copy shares its layout. The copy's generation is
+    /// non-zero: it is never a pristine compiled activation.
     pub(crate) fn copy_all(&self) -> VarMap {
-        if let VarStorage::Small(entries) = &self.map {
-            return VarMap {
-                map: VarStorage::Small(entries.clone()),
-                generation: std::cell::Cell::new(1),
-                observed: std::cell::Cell::new(false),
-            };
+        match &self.map {
+            VarStorage::Small(entries) => {
+                if let Some(layout) = shared_layout(entries) {
+                    let values = entries.iter().map(|(_, b)| b.clone()).collect();
+                    return Self::from_storage(VarStorage::Template(layout, Slots::new(values)), 1);
+                }
+                return Self::from_storage(VarStorage::Small(entries.clone()), 1);
+            }
+            VarStorage::Template(layout, values) => {
+                let values = values.get(layout).to_vec();
+                return Self::from_storage(
+                    VarStorage::Template(layout.clone(), Slots::new(values)),
+                    1,
+                );
+            }
+            VarStorage::Large(_) => {}
         }
         let mut m = VarMap::with_capacity(0);
         for (k, v) in self.iter() {
@@ -285,10 +406,18 @@ impl VarMap {
     /// comparison per entry first, the string comparison only on a miss.
     #[inline]
     pub fn get_rc(&self, k: &Rc<str>) -> Option<&Binding> {
-        if let VarStorage::Small(entries) = &self.map {
-            if let Some((_, b)) = entries.iter().find(|(name, _)| Rc::ptr_eq(name, k)) {
-                return Some(b);
+        match &self.map {
+            VarStorage::Small(entries) => {
+                if let Some((_, b)) = entries.iter().find(|(name, _)| Rc::ptr_eq(name, k)) {
+                    return Some(b);
+                }
             }
+            VarStorage::Template(layout, values) => {
+                if let Some(i) = layout.names.iter().position(|n| Rc::ptr_eq(n, k)) {
+                    return Some(&values.get(layout)[i]);
+                }
+            }
+            VarStorage::Large(_) => {}
         }
         self.get(k)
     }
@@ -304,7 +433,13 @@ impl VarMap {
                 Some(&mut entries[i].1)
             }
             VarStorage::Large(entries) => entries.get_mut(&**k),
-            VarStorage::Template(layout, values) => layout.slot(k).map(|slot| &mut values[slot]),
+            VarStorage::Template(layout, values) => {
+                let slot = match layout.names.iter().position(|n| Rc::ptr_eq(n, k)) {
+                    Some(i) => i,
+                    None => layout.slot(k)?,
+                };
+                Some(&mut values.get_mut(layout)[slot])
+            }
         }
     }
     /// Mark this map as walked by a cached name resolution (see the `observed` field).
@@ -329,7 +464,10 @@ impl VarMap {
                 Some((name, entries.get_mut(k)? as *mut Binding))
             }
             VarStorage::Template(layout, values) => layout.slot(k).map(|slot| {
-                (&layout.names[slot] as *const Rc<str>, &mut values[slot] as *mut Binding)
+                (
+                    &layout.names[slot] as *const Rc<str>,
+                    &mut values.get_mut(layout)[slot] as *mut Binding,
+                )
             }),
         }
     }
@@ -341,7 +479,7 @@ impl VarMap {
             VarStorage::Small(entries) => VarIter::Small(entries.iter()),
             VarStorage::Large(entries) => VarIter::Large(entries.iter()),
             VarStorage::Template(layout, values) => {
-                VarIter::Template(layout.names.iter().zip(values.iter()))
+                VarIter::Template(layout.names.iter().zip(values.get(layout).iter()))
             }
         }
     }
@@ -356,7 +494,7 @@ impl VarMap {
         match &self.map {
             VarStorage::Small(entries) => VarValues::Small(entries.iter()),
             VarStorage::Large(entries) => VarValues::Large(entries.values()),
-            VarStorage::Template(_, values) => VarValues::Template(values.iter()),
+            VarStorage::Template(layout, values) => VarValues::Template(values.get(layout).iter()),
         }
     }
 }

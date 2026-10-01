@@ -1,4 +1,4 @@
-//! String.prototype.substring with direct byte slicing for known ASCII inputs.
+//! String.prototype.substring: byte slicing through the UTF-16 position index.
 use super::{ab, arg, this_string};
 use crate::{
     interpreter::Interp,
@@ -6,30 +6,13 @@ use crate::{
 };
 
 pub(super) fn install(i: &mut Interp, prototype: &Gc) {
-    // Select once per realm: no getenv or cache lookup in the substring hot path.
-    let function: crate::value::NativeFn = if std::env::var_os("LUMEN_NO_ASCII_SUBSTRING").is_none()
-    {
-        substring::<true>
-    } else {
-        substring::<false>
-    };
-    i.def_method(prototype, "substring", 2, function);
+    i.def_method(prototype, "substring", 2, substring);
 }
 
-fn substring<const ASCII: bool>(
-    i: &mut Interp,
-    this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn substring(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_string(i, &this)?;
-    // A clear hint is inconclusive, so use the existing complete UTF-16 path then.
-    // Determine length before argument coercion, retaining the original receiver string.
-    let chars = if ASCII && s.ascii_hint() {
-        None
-    } else {
-        Some(i.units_full(&s))
-    };
-    let len = chars.as_ref().map_or(s.len(), |chars| chars.len()) as i64;
+    // Length before argument coercion, retaining the original receiver string.
+    let len = i.str_len(&s) as i64;
     let mut a = (ab(i.to_number(&arg(args, 0)))? as i64).clamp(0, len);
     let mut b = match arg(args, 1) {
         Value::Undefined => len,
@@ -38,20 +21,13 @@ fn substring<const ASCII: bool>(
     if a > b {
         std::mem::swap(&mut a, &mut b);
     }
-    match chars {
-        None => {
-            #[cfg(test)]
-            ASCII_CALLS.with(|calls| calls.set(calls.get() + 1));
-            Ok(Value::Str(s.sub(&s[a as usize..b as usize])))
-        }
-        Some(chars) => {
-            #[cfg(test)]
-            UTF16_CALLS.with(|calls| calls.set(calls.get() + 1));
-            Ok(Value::from_string(crate::jstr::from_units(
-                &chars[a as usize..b as usize],
-            )))
-        }
+    #[cfg(test)]
+    if s.ascii_hint() {
+        ASCII_CALLS.with(|calls| calls.set(calls.get() + 1));
+    } else {
+        UTF16_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
+    Ok(i.unit_slice(&s, a as usize, b as usize))
 }
 
 #[cfg(test)]

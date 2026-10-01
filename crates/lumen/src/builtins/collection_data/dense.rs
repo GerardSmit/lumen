@@ -74,7 +74,7 @@ mod tests {
 
     fn number(data: &CollectionData, key: f64) -> Option<f64> {
         match data.lookup(&Value::Num(key)) {
-            Some(Value::Num(n)) => Some(*n),
+            Some(Value::Num(n)) => Some(n),
             _ => None,
         }
     }
@@ -97,7 +97,7 @@ mod tests {
         data.insert(Value::Num(1000.0), Value::Num(29.0));
         assert_eq!(number(&data, 1000.0), Some(29.0));
         assert!(matches!(
-            data.iter().last(),
+            data.owned().into_iter().last(),
             Some((Value::Num(1000.0), Value::Num(29.0)))
         ));
     }
@@ -121,14 +121,16 @@ mod tests {
         assert_eq!(number(&data, f64::NAN), Some(5.0));
         assert_eq!(number(&data, 0.5), Some(3.0));
         let mut cursor = 0;
-        assert!(matches!(data.next(&mut cursor), Some((Value::Num(n), _)) if n.to_bits()==0));
+        assert!(matches!(data.next_owned(&mut cursor), Some((Value::Num(n), _)) if n.to_bits()==0));
         assert!(data.remove(&Value::Num(-0.0)));
         data.insert(Value::Num(0.0), Value::Num(11.0));
         assert!(matches!(
-            data.iter().last(),
+            data.owned().into_iter().last(),
             Some((Value::Num(0.0), Value::Num(11.0)))
         ));
-        assert!(matches!(data.next(&mut cursor), Some((Value::Str(text), _)) if &**text == "0"));
+        assert!(
+            matches!(data.next_owned(&mut cursor), Some((Value::Str(text), _)) if &*text == "0")
+        );
     }
 
     #[test]
@@ -140,7 +142,7 @@ mod tests {
         data.insert(Value::str("stable"), Value::Num(77.0));
         // The shared storage helper remains correct even when compaction sees numeric keys.
         for n in 0..15 {
-            assert!(data.remove_weak(&Value::Num(n as f64)));
+            assert!(data.remove(&Value::Num(n as f64)));
         }
         for n in 15..20 {
             assert_eq!(number(&data, n as f64), Some(n as f64));
@@ -150,11 +152,11 @@ mod tests {
             Some(Value::Num(77.0))
         ));
         let mut cursor = 0;
-        assert!(data.next(&mut cursor).is_some());
+        assert!(data.next_owned(&mut cursor).is_some());
         data.clear();
         data.insert(Value::Num(0.0), Value::Num(99.0));
         assert!(matches!(
-            data.next(&mut cursor),
+            data.next_owned(&mut cursor),
             Some((Value::Num(0.0), Value::Num(99.0)))
         ));
         assert_eq!(number(&data, 19.0), None);

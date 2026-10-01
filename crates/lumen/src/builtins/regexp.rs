@@ -2,6 +2,14 @@
 
 use super::*;
 
+pub(super) fn backtrack_error(i: &mut Interp, _: crate::regex::BacktrackLimit) -> Value {
+    let abort = crate::regex::take_abort();
+    if abort != crate::regex::Abort::None {
+        return i.regex_abort_error(abort);
+    }
+    i.make_error("RangeError", crate::regex::BACKTRACK_LIMIT_MSG)
+}
+
 /// A RegExp prototype getter: a flag boolean (`Some(char)`), or the special source/flags string.
 fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Value> {
     if let Some(ptr) = map_ptr(this) {
@@ -667,7 +675,7 @@ fn re_sym_match_with(
     let unicode = flags.contains('u') || flags.contains('v');
     set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
     if let Some(direct) = direct_regexp(i, &this, &flags) {
-        let (_re, text, all) = direct_collect(i, direct, &s, true);
+        let (_re, text, all) = direct_collect(i, direct, &s, true)?;
         if all.is_empty() {
             return Ok(Value::Null);
         }
@@ -775,7 +783,7 @@ fn re_sym_replace_impl(
                         p.props
                             .get("exec")
                             .filter(|prop| !prop.accessor())
-                            .map(Property::value)
+                            .map(|p| p.value())
                     })
                     .is_some_and(|value| {
                         let Value::Obj(exec) = value else {
@@ -803,7 +811,7 @@ fn re_sym_replace_impl(
                         .and_then(|last| last.caps.first().copied().flatten())
                         .is_some_and(|(start, end)| start == end);
                     if empty {
-                        let li = match obj.borrow().props.get("lastIndex").map(Property::value) {
+                        let li = match obj.borrow().props.get("lastIndex").map(|p| p.value()) {
                             Some(Value::Num(n)) => n as usize,
                             _ => unreachable!("discard matcher guarded lastIndex"),
                         };
@@ -1109,11 +1117,14 @@ fn direct_collect(
     d: DirectRegExp,
     s: &crate::lstr::LStr,
     global: bool,
-) -> (
-    Rc<crate::regex::Regex>,
-    Rc<crate::regex::ReText>,
-    Vec<crate::regex::Captures>,
-) {
+) -> Result<
+    (
+        Rc<crate::regex::Regex>,
+        Rc<crate::regex::ReText>,
+        Vec<crate::regex::Captures>,
+    ),
+    Value,
+> {
     let DirectRegExp {
         obj,
         re,
@@ -1130,7 +1141,10 @@ fn direct_collect(
             li = 0;
             break;
         }
-        let Some(caps) = re.exec_text_shared(&text, text.elem_at_unit(from)) else {
+        let found = re
+            .exec_text_shared(&text, text.elem_at_unit(from))
+            .map_err(|e| backtrack_error(i, e))?;
+        let Some(caps) = found else {
             li = 0;
             break;
         };
@@ -1159,7 +1173,7 @@ fn direct_collect(
     if let Some(caps) = all.last() {
         update_regexp_legacy_statics(i, &re, caps, &text, s);
     }
-    (re, text, all)
+    Ok((re, text, all))
 }
 
 /// Append subject elements `a..b` to `out`.
@@ -1192,7 +1206,7 @@ fn re_replace_direct(
     repl: &Value,
     repl_str: &crate::lstr::LStr,
 ) -> Result<Value, Value> {
-    let (re, text, all) = direct_collect(i, d, s, global);
+    let (re, text, all) = direct_collect(i, d, s, global)?;
     if all.is_empty() {
         return Ok(Value::Str(s.clone()));
     }
@@ -1396,7 +1410,10 @@ fn re_split_run(
     let result = 'run: {
         if size_e == 0 {
             // A sticky attempt at 0 on the empty subject.
-            if let Some(caps) = re.exec_text_shared(&text, 0) {
+            if let Some(caps) = re
+                .exec_text_shared(&text, 0)
+                .map_err(|e| backtrack_error(i, e))?
+            {
                 if caps[0].is_some_and(|(a, _)| a == 0) {
                     last = Some(caps);
                     break 'run out;
@@ -1409,7 +1426,10 @@ fn re_split_run(
         let mut p = 0usize;
         let mut q = 0usize;
         while q < size_e {
-            let Some(caps) = re.exec_text_shared(&text, q) else {
+            let found = re
+                .exec_text_shared(&text, q)
+                .map_err(|e| backtrack_error(i, e))?;
+            let Some(caps) = found else {
                 if re.sticky {
                     q += 1;
                     continue;

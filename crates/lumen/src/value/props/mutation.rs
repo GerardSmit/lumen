@@ -4,7 +4,7 @@ use super::shapes::{
     SHAPE_EMPTY,
 };
 use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
-use crate::value::{canonical_index, Property, Value};
+use crate::value::{canonical_index, PackedValue, Property, Value};
 use std::rc::Rc;
 
 impl Props {
@@ -45,13 +45,14 @@ impl Props {
 
     /// Add `key` to the shape: a tree transition while the shape is shared and small, else an
     /// in-place append on an owned shape (detaching first when the shared chain would grow past
-    /// [`OWNED_THRESHOLD`]).
+    /// [`OWNED_THRESHOLD`] or the parent has too many transitions).
     fn transition_key(&mut self, key: Rc<str>) {
         let shared = self.shape_rc.as_ref().is_none_or(|s| !s.owned());
         if shared && self.named_len() < OWNED_THRESHOLD {
-            let child = shape_transition(self.shape_rc.as_ref(), &key);
-            self.set_shape(child);
-            return;
+            if let Some(child) = shape_transition(self.shape_rc.as_ref(), &key) {
+                self.set_shape(child);
+                return;
+            }
         }
         self.detach_shape().push_key(key);
         self.reid_owned_shape();
@@ -84,35 +85,60 @@ impl Props {
     /// *known* child shape: skips both the existence scan and the transition-table lookup that
     /// [`Props::insert`] pays. `new_shape` must be the memoized `shape_transition(shape, key)`
     /// result recorded when this (shape, key) pair was first inserted the slow way — a shared
-    /// shape id (see [`Props::shape_is_shared`]).
-    pub(crate) fn append_new(&mut self, key: Rc<str>, prop: Property, new_shape: u32) {
+    /// shape id (see [`Props::shape_is_shared`]). Returns `false` when that shape had been
+    /// reclaimed and the insert took the ordinary transition instead (the caller's recorded id is
+    /// stale; see [`Props::shape`] for the one the map landed on).
+    pub(crate) fn append_new(&mut self, key: Rc<str>, prop: Property, new_shape: u32) -> bool {
         self.note_structural();
-        let child = shape_by_id(new_shape);
+        let Some(child) = shape_by_id(new_shape) else {
+            let slot = self.open_named_slot(prop);
+            self.transition_key(key.clone());
+            self.note_inserted(slot, &key);
+            return false;
+        };
         debug_assert_eq!(child.last_key().map(|k| &**k), Some(&*key));
         debug_assert_eq!(child.len(), self.named_len() + 1);
         let slot = self.open_named_slot(prop);
         self.set_shape(child);
         self.note_inserted(slot, &key);
+        true
     }
 
     pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
         let key = key.into();
         let index = canonical_index(&key);
+        if let Some(n) = index.filter(|_| self.elem_mode.get() && !self.has_far.get()) {
+            self.unpack_for_sparse_fill(n);
+        }
+        let mut prop = prop;
         if let (Some(n), Some(packed)) = (index, self.elems.packed_ref()) {
             let n = n as usize;
-            if n < packed.len() {
-                self.note_structural();
-                self.elems.packed_mut().unwrap()[n] = prop;
-                return;
+            let near = n < packed.len() || (!self.has_far.get() && n <= packed.len() + 256);
+            match prop.into_elem() {
+                Ok(w) if near => {
+                    self.note_structural();
+                    let packed = self.elems.packed_mut().unwrap();
+                    if n < packed.len() {
+                        packed[n] = w;
+                    } else {
+                        packed.resize_with(n, || PackedValue::pack(Value::Empty));
+                        packed.push(w);
+                    }
+                    return;
+                }
+                Ok(w) => {
+                    prop = Property::from_elem(w);
+                    self.has_far.set(true);
+                }
+                Err(p) => {
+                    prop = p;
+                    if near {
+                        self.unpack_elements();
+                    } else {
+                        self.has_far.set(true);
+                    }
+                }
             }
-            if !self.has_far.get() && n <= packed.len() + 256 {
-                self.note_structural();
-                let packed = self.elems.packed_mut().unwrap();
-                packed.resize_with(n, || Property::plain(Value::Empty));
-                packed.push(prop);
-                return;
-            }
-            self.has_far.set(true);
         }
         if let Some(i) = self.slot_of(&key) {
             self.entries[i] = prop;
@@ -173,9 +199,10 @@ impl Props {
     /// (`arr.length = n`). Entries compact and the dense map rebuilds once: O(n) total, where
     /// the per-key [`Props::remove`] loop it replaces was O(n) *per key*.
     pub(crate) fn remove_indices_from(&mut self, from: usize) {
-        let packed_remove = self.elems.packed_ref().is_some_and(|p| {
-            p.len() > from && p[from..].iter().any(|p| !matches!(p.value(), Value::Empty))
-        });
+        let packed_remove = self
+            .elems
+            .packed_ref()
+            .is_some_and(|p| p.len() > from && p[from..].iter().any(|p| !p.is_hole()));
         let named = self.named_len();
         // Slot → canonical index for every dense-mapped entry (element region and named index
         // keys alike).
@@ -251,12 +278,9 @@ impl Props {
     pub(crate) fn remove(&mut self, key: &str) -> bool {
         let index = canonical_index(key);
         if let (Some(n), Some(packed)) = (index, self.elems.packed_ref()) {
-            if packed
-                .get(n as usize)
-                .is_some_and(|p| !matches!(p.value(), Value::Empty))
-            {
+            if packed.get(n as usize).is_some_and(|p| !p.is_hole()) {
                 self.note_structural();
-                self.elems.packed_mut().unwrap()[n as usize] = Property::plain(Value::Empty);
+                self.elems.packed_mut().unwrap()[n as usize] = PackedValue::pack(Value::Empty);
                 return true;
             }
         }
