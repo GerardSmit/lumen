@@ -7069,15 +7069,10 @@ impl Interp {
             };
         }
         let neg = n < 0.0;
-        // Rust's `{:e}` yields the shortest round-tripping mantissa + exponent (`d[.ddd]e±E`).
-        let sci = format!("{:e}", n.abs());
-        let (mantissa, exp_str) = sci.split_once('e').unwrap();
-        let exp: i32 = exp_str.parse().unwrap();
-        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-        let digits = digits.trim_end_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
+        let d = lumen_common::float::shortest(n);
+        let digits = d.as_str();
         let k = digits.len() as i32;
-        let np = exp + 1; // the spec's `n`: value = digits × 10^(n-k)
+        let np = d.decpt; // the spec's `n`: value = digits × 10^(n-k)
         let body = if k <= np && np <= 21 {
             format!("{}{}", digits, "0".repeat((np - k) as usize))
         } else if 0 < np && np <= 21 {

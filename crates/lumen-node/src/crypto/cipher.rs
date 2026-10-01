@@ -17,9 +17,14 @@ use cipher::{
 };
 use ghash::universal_hash::UniversalHash;
 use ghash::GHash;
-use lumen::embed::{OpDesc, OpError};
+use lumen::embed::OpError;
 use md5::{Digest, Md5};
 use poly1305::Poly1305;
+
+
+#[lumen_bind::module(name = "crypto")]
+pub(crate) mod bindings {
+use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Alg {
@@ -159,7 +164,7 @@ fn lookup(name: &str) -> Option<&'static Spec> {
         .or_else(|| HIDDEN.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).and_then(|&(_, nid)| by_nid(nid)))
 }
 
-#[lumen::op(name = "getCiphers")]
+#[op(name = "getCiphers")]
 fn get_ciphers() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = SPECS.iter().flat_map(|s| s.names.iter().copied()).collect();
     v.sort_unstable();
@@ -168,7 +173,7 @@ fn get_ciphers() -> Vec<&'static str> {
 
 /// `[name, mode]` and `[nid, blockSize, ivLength, keyLength]` (0 = not reported) of a cipher, or
 /// `null` when it is unknown or the requested key/IV length does not fit it.
-#[lumen::op(name = "cipherInfo")]
+#[op(name = "cipherInfo")]
 fn cipher_info(name: Option<String>, nid: i32, key_len: Option<f64>, iv_len: Option<f64>) -> Option<(String, &'static str, Vec<i32>)> {
     let spec = match name {
         Some(n) => lookup(&n)?,
@@ -775,7 +780,7 @@ enum TagState {
 }
 
 /// The state of one `CipherBase`: `engine` is `None` once `final()` ran (OpenSSL's freed ctx).
-#[lumen::class(name = "CryptoCipher")]
+#[class(name = "CryptoCipher")]
 pub struct CryptoCipher {
     engine: Option<Engine>,
     spec: &'static Spec,
@@ -787,7 +792,7 @@ pub struct CryptoCipher {
     pending_auth_failed: bool,
 }
 
-#[lumen::methods]
+#[methods]
 impl CryptoCipher {
     fn update(&mut self, data: &[u8]) -> Result<Vec<u8>, OpError> {
         let enc = self.enc;
@@ -1148,7 +1153,7 @@ fn unknown_cipher() -> OpError {
 }
 
 /// `CipherBase#initiv`: key, IV (`null` for none) and `authTagLength` (-1 for none).
-#[lumen::op(name = "cipherNew")]
+#[op(name = "cipherNew")]
 fn cipher_new(name: &str, enc: bool, key: &[u8], iv: Option<&[u8]>, tag_len: f64) -> Result<CryptoCipher, OpError> {
     let spec = lookup(name).ok_or_else(unknown_cipher)?;
     let iv = iv.unwrap_or(&[]);
@@ -1166,7 +1171,7 @@ fn cipher_new(name: &str, enc: bool, key: &[u8], iv: Option<&[u8]>, tag_len: f64
 
 /// `CipherBase#init`: the key and IV come from `EVP_BytesToKey(md5, no salt, 1 round)` over the
 /// password.
-#[lumen::op(name = "cipherInit")]
+#[op(name = "cipherInit")]
 fn cipher_init(name: &str, enc: bool, password: &[u8], tag_len: f64) -> Result<CryptoCipher, OpError> {
     let spec = lookup(name).ok_or_else(unknown_cipher)?;
     let need = spec.key + spec.iv;
@@ -1183,14 +1188,14 @@ fn cipher_init(name: &str, enc: bool, password: &[u8], tag_len: f64) -> Result<C
 }
 
 /// The mode label of a known cipher name (`null` when unknown).
-#[lumen::op(name = "cipherMode")]
+#[op(name = "cipherMode")]
 fn cipher_mode(name: &str) -> Option<&'static str> {
     lookup(name).map(|s| s.mode.label())
 }
 
 /// WebCrypto AES-CTR: the low `length` bits of `counter` count blocks and wrap to zero without
 /// carrying into the nonce bits.
-#[lumen::op(name = "aesCtr")]
+#[op(name = "aesCtr")]
 fn aes_ctr(key: &[u8], counter: &[u8], length: u32, data: &[u8]) -> Result<Vec<u8>, OpError> {
     fn run<C>(key: &[u8], iv: &[u8], buf: &mut [u8]) -> Result<(), OpError>
     where
@@ -1228,5 +1233,4 @@ fn aes_ctr(key: &[u8], counter: &[u8], length: u32, data: &[u8]) -> Result<Vec<u
     f(key, &(ctr & !mask).to_be_bytes(), b)?;
     Ok(out)
 }
-
-pub const OPS: &[&OpDesc] = lumen::ops![get_ciphers, cipher_info, cipher_new, cipher_init, cipher_mode, aes_ctr];
+}

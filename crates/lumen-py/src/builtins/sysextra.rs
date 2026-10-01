@@ -9,14 +9,25 @@ use std::rc::Rc;
 
 // ---- struct sequences ---------------------------------------------------------------------------
 
+const HIDDEN: &str = "_structseq_hidden";
+
 fn field<const N: usize>(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    match a.first().and_then(|v| v.tuple_items()) {
-        Some(items) => Ok(items.get(N).cloned().unwrap_or(Value::None)),
+    let Some(v) = a.first() else { return Err(it.type_error("descriptor requires a struct sequence")) };
+    match v.tuple_items() {
+        Some(items) if N < items.len() => Ok(items[N].clone()),
+        Some(items) => Ok(structseq_hidden(v).get(N - items.len()).cloned().unwrap_or(Value::None)),
         None => Err(it.type_error("descriptor requires a struct sequence")),
     }
 }
 
-const GETTERS: [NativeFn; 20] = [
+/// The fields of a struct sequence past `n_sequence_fields` (reachable by name only).
+pub fn structseq_hidden(v: &Value) -> Vec<Value> {
+    let Value::Obj(o) = v else { return Vec::new() };
+    let d = o.dict.borrow().clone();
+    d.and_then(|d| dict_get_str(&d, HIDDEN)).and_then(|t| t.tuple_items().map(|t| t.to_vec())).unwrap_or_default()
+}
+
+const GETTERS: [NativeFn; 24] = [
     field::<0>,
     field::<1>,
     field::<2>,
@@ -37,6 +48,10 @@ const GETTERS: [NativeFn; 20] = [
     field::<17>,
     field::<18>,
     field::<19>,
+    field::<20>,
+    field::<21>,
+    field::<22>,
+    field::<23>,
 ];
 
 fn structseq_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -72,6 +87,112 @@ pub fn new_structseq_type(it: &mut Interp, module: &str, name: &str, fields: &[&
 
 pub fn structseq(ty: &Obj, vals: Vec<Value>) -> Value {
     Value::Obj(Object::with_cls(ty.clone(), Kind::Tuple(vals)))
+}
+
+fn type_int(ty: &Obj, name: &str) -> usize {
+    ty.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name)).and_then(|v| v.as_i64()).unwrap_or(0) as usize
+}
+
+fn hidden_names(ty: &Obj) -> Vec<Value> {
+    let all = ty.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "_structseq_fields"));
+    let all = all.and_then(|t| t.tuple_items().map(|t| t.to_vec())).unwrap_or_default();
+    all.get(type_int(ty, "n_sequence_fields")..).map(|t| t.to_vec()).unwrap_or_default()
+}
+
+/// A struct sequence type like CPython's `os.stat_result`: `fields` lists all `n_fields` names in
+/// order (`""` for an unnamed field); the first `n_seq` are the tuple items, the rest are reachable
+/// by name only. Instances can be built from Python as `T(sequence, dict=None)` and pickle.
+pub fn new_structseq_type_ext(it: &mut Interp, module: &str, name: &str, fields: &[&'static str], n_seq: usize) -> Obj {
+    let tuple = it.types.tuple.clone();
+    let ty = new_type(it, module, name, Some(&tuple), Layout::Tuple);
+    for (i, f) in fields.iter().enumerate() {
+        if !f.is_empty() {
+            it.reg_prop(&ty, f, GETTERS[i]);
+        }
+    }
+    it.reg(&ty, "__repr__", structseq_repr);
+    it.reg_new(&ty, structseq_new);
+    it.reg(&ty, "__reduce__", structseq_reduce);
+    let named: Vec<Value> = fields.iter().filter(|f| !f.is_empty()).map(|f| Value::str(f)).collect();
+    let match_args: Vec<Value> = fields[..n_seq].iter().filter(|f| !f.is_empty()).map(|f| Value::str(f)).collect();
+    if let Some(d) = ty.dict.borrow().as_ref() {
+        dict_set_str(d, "_fields", Value::tuple(named));
+        dict_set_str(d, "__match_args__", Value::tuple(match_args));
+        dict_set_str(d, "_structseq_fields", Value::tuple(fields.iter().map(|f| Value::str(f)).collect()));
+        dict_set_str(d, "n_fields", Value::Int(fields.len() as i64));
+        dict_set_str(d, "n_sequence_fields", Value::Int(n_seq as i64));
+        dict_set_str(d, "n_unnamed_fields", Value::Int(fields.iter().filter(|f| f.is_empty()).count() as i64));
+    }
+    ty
+}
+
+/// An instance of a [`new_structseq_type_ext`] type from all of its field values.
+pub fn structseq_full(ty: &Obj, mut vals: Vec<Value>) -> Value {
+    let n_seq = type_int(ty, "n_sequence_fields").min(vals.len());
+    let hidden = vals.split_off(n_seq);
+    let v = structseq(ty, vals);
+    if !hidden.is_empty() {
+        set_structseq_hidden(&v, hidden);
+    }
+    v
+}
+
+pub fn set_structseq_hidden(v: &Value, hidden: Vec<Value>) {
+    if let Value::Obj(o) = v {
+        let mut slot = o.dict.borrow_mut();
+        let d = slot.get_or_insert_with(|| Object::new(Kind::Dict(std::cell::RefCell::new(crate::dict::PyDict::new())))).clone();
+        drop(slot);
+        dict_set_str(&d, HIDDEN, Value::tuple(hidden));
+    }
+}
+
+/// `T(sequence, dict=None)` for a struct sequence type.
+pub fn structseq_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
+    let b = it.bind_args("structseq", a, kw, &["cls", "sequence", "dict"], 2)?;
+    let Some(Value::Obj(ty)) = b[0].clone() else { return Err(it.type_error("structseq.__new__(X): X is not a type object")) };
+    let seq = it.iterate_to_vec(b[1].as_ref().unwrap_or(&Value::None))?;
+    let (min, max) = (type_int(&ty, "n_sequence_fields"), type_int(&ty, "n_fields"));
+    let tname = it.type_display(&ty);
+    if seq.len() < min || seq.len() > max {
+        let msg = if min == max {
+            format!("{}() takes a {}-sequence ({}-sequence given)", tname, min, seq.len())
+        } else if seq.len() < min {
+            format!("{}() takes an at least {}-sequence ({}-sequence given)", tname, min, seq.len())
+        } else {
+            format!("{}() takes an at most {}-sequence ({}-sequence given)", tname, max, seq.len())
+        };
+        return Err(it.type_error(&msg));
+    }
+    let dict = match &b[2] {
+        None | Some(Value::None) => None,
+        Some(d) if dict_of(d).is_some() => Some(d.clone()),
+        Some(_) => return Err(it.type_error(&format!("{}() takes a dict as second arg, if any", tname))),
+    };
+    let mut vals = seq[..min].to_vec();
+    for (i, name) in hidden_names(&ty).iter().enumerate() {
+        let v = match seq.get(min + i) {
+            Some(v) => v.clone(),
+            None => match &dict {
+                Some(Value::Obj(d)) => it.dict_get(d, name)?.unwrap_or(Value::None),
+                _ => Value::None,
+            },
+        };
+        vals.push(v);
+    }
+    Ok(structseq_full(&ty, vals))
+}
+
+fn structseq_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__reduce__", a, 1, 1)?;
+    let ty = it.type_of(&a[0]);
+    let visible = a[0].tuple_items().map(|t| t.to_vec()).unwrap_or_default();
+    let d = it.new_dict();
+    for (name, v) in hidden_names(&ty).into_iter().zip(structseq_hidden(&a[0])) {
+        if name.as_str().is_some_and(|n| !n.is_empty()) {
+            it.dict_set(&d, name, v)?;
+        }
+    }
+    Ok(Value::tuple(vec![Value::Obj(ty), Value::tuple(vec![Value::tuple(visible), Value::Obj(d)])]))
 }
 
 // ---- SimpleNamespace ----------------------------------------------------------------------------
@@ -328,7 +449,7 @@ fn size_of_value(v: &Value) -> usize {
             Kind::List(l) => 56 + 8 * l.borrow().capacity(),
             Kind::Dict(d) | Kind::Set(d) | Kind::FrozenSet(d) => 64 + 24 * d.borrow().slots(),
             Kind::Bytes(b) => 33 + b.len(),
-            Kind::ByteArray(b) => 56 + b.borrow().capacity(),
+            Kind::ByteArray(b) => 56 + b.len(),
             Kind::Instance => 48,
             _ => 64,
         },

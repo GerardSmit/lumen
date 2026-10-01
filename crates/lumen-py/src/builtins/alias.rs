@@ -196,6 +196,7 @@ impl Interp {
                     matches!(o.kind, Kind::Type(_))
                         || with_opaque::<AliasData, _>(v, |_| ()).is_some()
                         || with_opaque::<UnionData, _>(v, |_| ()).is_some()
+                        || super::typingm::is_type_alias(v)
                         || {
                             let _ = it;
                             false

@@ -1,7 +1,7 @@
 //! The backtracking matcher: runs a compiled program over a [`ReInput`].
 
 use super::captures::Captures;
-use super::charclass::Flavor;
+use super::charclass::{Flavor, PreMap};
 use super::fold::{fold_eq, is_line_terminator_u32, is_word_ic, py_is_word, CaseFold};
 use super::limits::{self, BacktrackLimit};
 use crate::limits::Abort;
@@ -153,6 +153,7 @@ struct Matcher<I: ReInput> {
     /// Element count the match may see: the input is treated as ending here.
     n: usize,
     caps: Vec<Option<usize>>,
+    nslots: usize,
     marks: Vec<Option<usize>>,
     /// Steps spent by this `exec` across all start positions (see [`STEP_BASE`]).
     steps: u64,
@@ -229,6 +230,16 @@ impl<I: ReInput> Matcher<I> {
                 self.input.at(pos) == 0x0A && (self.multiline() || pos + 1 == self.n)
             }
         }
+    }
+
+    #[inline(always)]
+    fn at_start_line(&self, pos: usize) -> bool {
+        pos == 0 || self.is_line_term(self.input.at(pos - 1))
+    }
+
+    #[inline(always)]
+    fn at_end_line(&self, pos: usize) -> bool {
+        pos == self.n || self.is_line_term(self.input.at(pos))
     }
 
     fn is_word_char(&self, c: u32, flavor: Flavor) -> bool {
@@ -374,6 +385,19 @@ impl<I: ReInput> Matcher<I> {
                     }
                     pc += 1;
                 }
+                Inst::AssertStartLine => {
+                    if !self.at_start_line(pos) {
+                        return Some(false);
+                    }
+                    pc += 1;
+                }
+                Inst::AssertEndLine => {
+                    if !self.at_end_line(pos) {
+                        return Some(false);
+                    }
+                    pc += 1;
+                }
+                Inst::SetLast(_) => pc += 1,
                 Inst::AssertStartText => {
                     if pos != 0 {
                         return Some(false);
@@ -428,6 +452,8 @@ impl<I: ReInput> Matcher<I> {
                 // These affect the next predicate or can branch on mutable state.
                 Inst::Look { .. }
                 | Inst::LookBehind { .. }
+                | Inst::LookBack { .. }
+                | Inst::BackrefMapped(..)
                 | Inst::Atomic(_)
                 | Inst::CondGroup(..)
                 | Inst::PushFlags(..)
@@ -696,6 +722,31 @@ impl<I: ReInput> Matcher<I> {
                         }
                         pc += 1;
                     }
+                    Inst::AssertStartLine => {
+                        if !self.at_start_line(pos) {
+                            break;
+                        }
+                        pc += 1;
+                    }
+                    Inst::AssertEndLine => {
+                        if !self.at_end_line(pos) {
+                            break;
+                        }
+                        pc += 1;
+                    }
+                    Inst::SetLast(group) => {
+                        let slot = self.nslots - 2;
+                        let old = pack(self.caps[slot]);
+                        self.push_undo(
+                            floor,
+                            Bt::Cap {
+                                slot: slot as u32,
+                                old,
+                            },
+                        );
+                        self.caps[slot] = Some(*group);
+                        pc += 1;
+                    }
                     Inst::AssertStartText => {
                         if pos != 0 {
                             break;
@@ -736,6 +787,25 @@ impl<I: ReInput> Matcher<I> {
                             },
                             _ if self.dialect == Dialect::Python => break,
                             _ => pc += 1, // unset group matches empty
+                        }
+                    }
+                    Inst::BackrefMapped(g, pre) => {
+                        let g = *g;
+                        if g == 0 || 2 * g + 1 >= self.caps.len() {
+                            pc += 1;
+                            continue;
+                        }
+                        match (self.caps[2 * g], self.caps[2 * g + 1]) {
+                            (Some(a), Some(b)) => {
+                                match self.backref_end_mapped(pos, a.min(b), a.max(b), *pre) {
+                                    Some(next) => {
+                                        pos = next;
+                                        pc += 1;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ => break,
                         }
                     }
                     Inst::BackrefAlt(idxs) => {
@@ -780,6 +850,35 @@ impl<I: ReInput> Matcher<I> {
                         // right-to-left from `pos`; a nested lookahead always matches forward.
                         let dir = matches!(prog[pc], Inst::LookBehind { .. });
                         let Some(r) = self.sub_match(sub, pos, dir) else {
+                            self.bt.truncate(base);
+                            self.choices = floor;
+                            return false;
+                        };
+                        if r.matched && !negate {
+                            self.keep_caps(&r, floor);
+                            pc += 1;
+                        } else {
+                            self.restore_caps(0, r.hi, r.at);
+                            if r.matched || !negate {
+                                break;
+                            }
+                            pc += 1;
+                        }
+                    }
+                    Inst::LookBack {
+                        negate,
+                        width,
+                        prog: sub,
+                    } => {
+                        let negate = *negate;
+                        if pos < *width {
+                            if negate {
+                                pc += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        let Some(r) = self.sub_match(sub, pos - *width, false) else {
                             self.bt.truncate(base);
                             self.choices = floor;
                             return false;
@@ -925,6 +1024,23 @@ impl<I: ReInput> Matcher<I> {
                 return Some(n);
             }
         }
+    }
+
+    /// A back reference comparing characters after the transformation `pre`.
+    fn backref_end_mapped(&mut self, pos: usize, a: usize, b: usize, pre: PreMap) -> Option<usize> {
+        let n = b - a;
+        self.steps += n as u64;
+        let start = if self.back {
+            pos.checked_sub(n)?
+        } else {
+            if pos + n > self.n {
+                return None;
+            }
+            pos
+        };
+        (0..n)
+            .all(|i| pre.apply(self.input.at(start + i)) == pre.apply(self.input.at(a + i)))
+            .then(|| self.many_end(pos, n))
     }
 
     /// Match a backreference to `input[a..b]` at `pos`, returning the position after it.
@@ -1094,7 +1210,7 @@ impl Regex {
             .with(|s| s.borrow_mut().take())
             .unwrap_or_default();
         scratch.caps.clear();
-        scratch.caps.resize(2 * (self.ngroups + 1), None);
+        scratch.caps.resize(self.nslots, None);
         scratch.marks.clear();
         scratch.marks.resize(self.nmarks, None);
         scratch.flags.clear();
@@ -1107,6 +1223,7 @@ impl Regex {
             input,
             n,
             caps: scratch.caps,
+            nslots: self.nslots,
             marks: scratch.marks,
             steps: 0,
             step_limit: STEP_BASE.saturating_add(STEP_PER_ELEM.saturating_mul(elems)),

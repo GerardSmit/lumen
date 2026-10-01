@@ -20,6 +20,7 @@ use std::sync::mpsc;
 
 pub use lumen::bytecode::Tier;
 pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
+use lumen::embed::JsHost;
 pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 
 /// Compression codecs (zlib, Brotli, Zstandard), shared by web CompressionStream, node:zlib and
@@ -56,10 +57,28 @@ macro_rules! ops {
     };
 }
 
+/// Installs a `lumen_bind` module into a realm (see [`Extension::modules`]).
+pub type ModuleInit = fn(&mut Ctx) -> Result<(), Value>;
+
+/// [`ModuleInit`]: everything `#[lumen_bind::module]` `M` declares, as globals.
+pub fn globals<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    let g = ctx.global_object();
+    ctx.install_module::<M>(&g)
+}
+
+/// [`ModuleInit`]: `globalThis.<module name>` holding everything `M` declares.
+pub fn namespace<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    let ns = ctx.namespace_object(M::DESC.name_for("js"));
+    ctx.install_module::<M>(&ns)
+}
+
 /// A bundle of native ops + host-state init, exported one per op crate. Composing a runtime
 /// is `install(&mut engine, &[timers::extension(), fs::extension(), ...])`.
 pub struct Extension {
     pub name: &'static str,
+    /// `lumen_bind` modules to install ([`globals`] / [`namespace`]), before `globals` and
+    /// `namespaces`.
+    pub modules: &'static [ModuleInit],
     /// Installed as `globalThis.<name>` functions (e.g. `setTimeout`).
     pub globals: &'static [OpDecl],
     /// Installed as `globalThis.<ns>.<name>` namespace methods (e.g. a `__lumen_fs` ops
@@ -88,6 +107,7 @@ impl Extension {
     pub const fn new(name: &'static str) -> Extension {
         Extension {
             name,
+            modules: &[],
             globals: &[],
             namespaces: &[],
             state_init: None,
@@ -119,6 +139,11 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
         let t0 = timing.then(crate::time::Instant::now);
         if let Some(init) = ext.state_init {
             init(engine.ctx().op_state());
+        }
+        for m in ext.modules {
+            if m(engine.ctx()).is_err() {
+                panic!("extension {}: installing a module threw", ext.name);
+            }
         }
         for op in ext.globals {
             engine.define_global(op.name, op.len, op.f);

@@ -125,6 +125,17 @@ pub enum Op {
     LoadAssertionError,
     SetupAnnotations,
 
+    /// Pushes the frame's local namespace (a class body's namespace).
+    LoadLocals,
+    /// Pops a mapping and pushes the value of cell `i`'s name in it, else the cell's value.
+    LoadFromDictOrDeref(u32),
+    /// Pops a mapping and pushes the value of `names[i]` in it, else the global or builtin.
+    LoadFromDictOrGlobals(u32),
+    /// `TOS = intrinsic(TOS)`, one of the `INTRINSIC1_*` functions.
+    CallIntrinsic1(u32),
+    /// `TOS = intrinsic(TOS1, TOS)`, one of the `INTRINSIC2_*` functions.
+    CallIntrinsic2(u32),
+
     /// Pattern matching helpers.
     MatchClass(u32, u32),
     MatchMapping,
@@ -142,6 +153,16 @@ pub const CO_GENERATOR: u32 = 4;
 pub const CO_COROUTINE: u32 = 8;
 pub const CO_ASYNC_GENERATOR: u32 = 16;
 pub const CO_CLASS_BODY: u32 = 32;
+
+pub const INTRINSIC1_TYPEVAR: u32 = 0;
+pub const INTRINSIC1_PARAMSPEC: u32 = 1;
+pub const INTRINSIC1_TYPEVARTUPLE: u32 = 2;
+pub const INTRINSIC1_SUBSCRIPT_GENERIC: u32 = 3;
+pub const INTRINSIC1_TYPEALIAS: u32 = 4;
+
+pub const INTRINSIC2_TYPEVAR_WITH_BOUND: u32 = 0;
+pub const INTRINSIC2_TYPEVAR_WITH_CONSTRAINTS: u32 = 1;
+pub const INTRINSIC2_SET_FUNCTION_TYPE_PARAMS: u32 = 2;
 
 pub const MF_DEFAULTS: u32 = 1;
 pub const MF_KWDEFAULTS: u32 = 2;

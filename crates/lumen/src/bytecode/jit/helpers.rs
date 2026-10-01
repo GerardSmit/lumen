@@ -2470,7 +2470,7 @@ pub(crate) unsafe extern "C" fn coll_method(
 
 // ---- fast native ops, handlers and iteration ------------------------------------------------
 
-/// An unboxed argument / result kind of a `#[op(fast)]` entry (`embed::FastKind`, which only
+/// An unboxed argument / result kind of a scalar op entry (`lumen_bind::Scalar`, which only
 /// exists with the `embed` feature).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(feature = "embed"), allow(dead_code))]
@@ -2482,23 +2482,19 @@ pub(crate) enum FastArg {
     Void,
 }
 
-/// The unboxed signature and entry address of `callee` when it is a `#[op(fast)]` op.
+/// The unboxed signature and entry address of `callee` when it is a scalar op.
 #[cfg(feature = "embed")]
 pub(crate) fn fast_sig(i: &Interp, callee: &Value) -> Option<(Vec<FastArg>, FastArg, u64)> {
-    use crate::embed_convert::FastKind;
+    use lumen_bind::Scalar;
     let sig = i.fast_op_of(callee)?;
-    let k = |k: &FastKind| match k {
-        FastKind::F64 => FastArg::F64,
-        FastKind::I32 => FastArg::I32,
-        FastKind::U32 => FastArg::U32,
-        FastKind::Bool => FastArg::Bool,
-        FastKind::Void => FastArg::Void,
+    let k = |k: &Scalar| match k {
+        Scalar::F64 => FastArg::F64,
+        Scalar::I32 => FastArg::I32,
+        Scalar::U32 => FastArg::U32,
+        Scalar::Bool => FastArg::Bool,
+        Scalar::Void => FastArg::Void,
     };
-    Some((
-        sig.args.iter().map(k).collect(),
-        k(&sig.ret),
-        sig.entry.0 as usize as u64,
-    ))
+    Some((sig.args.iter().map(k).collect(), k(&sig.ret), sig.ptr.0 as usize as u64))
 }
 
 #[cfg(not(feature = "embed"))]
@@ -2819,20 +2815,19 @@ unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
     if !i.shared_buffers.is_empty() && i.shared_buffers.contains_key(&info.buffer) {
         return 0;
     }
-    if write != 0 && !i.immutable_buffers.is_empty() && i.immutable_buffers.contains(&info.buffer) {
-        return 0;
-    }
     let Some(len) = i.ta_len(&info) else { return 0 };
-    let Some(buf) = i.array_buffers.get_mut(&info.buffer) else {
+    let Some(buf) = i.array_buffers.get(&info.buffer) else {
         return 0;
     };
-    let bytes: &mut [u8] = buf;
+    if write != 0 && buf.is_readonly() {
+        return 0;
+    }
     let es = info.kind.elsize();
     match len.checked_mul(es).and_then(|n| n.checked_add(info.offset)) {
-        Some(end) if end <= bytes.len() => {}
+        Some(end) if end <= buf.len() => {}
         _ => return 0,
     }
-    (*f).ta_data = bytes.as_mut_ptr().add(info.offset);
+    (*f).ta_data = buf.as_ptr().add(info.offset);
     (*f).ta_len = len;
     code
 }

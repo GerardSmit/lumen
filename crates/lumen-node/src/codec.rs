@@ -19,24 +19,7 @@ pub const BASE64: u32 = 4;
 pub const BASE64URL: u32 = 5;
 pub const UTF16LE: u32 = 6;
 
-const SMUGGLE_BASE: u32 = 0x10F800;
-
-/// The UTF-16 unit a smuggled scalar stands for.
-#[inline]
-fn smuggled(c: char) -> Option<u16> {
-    let v = c as u32;
-    if (SMUGGLE_BASE..SMUGGLE_BASE + 0x800).contains(&v) {
-        Some((v - SMUGGLE_BASE + 0xD800) as u16)
-    } else {
-        None
-    }
-}
-
-/// Every smuggled scalar starts `F4 8F`; a string without an `F4` byte has none.
-#[inline]
-fn may_smuggle(s: &str) -> bool {
-    s.as_bytes().contains(&0xF4)
-}
+use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, SMUGGLE_BASE};
 
 /// Call `f` with each UTF-16 code unit of `s` (smuggled scalars decode to their surrogates).
 #[inline]
@@ -138,23 +121,7 @@ pub fn utf8_len(s: &str) -> usize {
 /// Rewrite characters >= U+10F800 (which a decoder may produce from valid input) as their
 /// smuggled surrogate pairs, the only form lumen strings hold them in.
 pub(crate) fn canonical(s: String) -> String {
-    if !may_smuggle(&s) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        let v = c as u32;
-        if v >= SMUGGLE_BASE {
-            let w = v - 0x10000;
-            let hi = 0xD800 + (w >> 10);
-            let lo = 0xDC00 + (w & 0x3FF);
-            out.push(char::from_u32(SMUGGLE_BASE + hi - 0xD800).unwrap());
-            out.push(char::from_u32(SMUGGLE_BASE + lo - 0xD800).unwrap());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    lumen_common::smuggle::utf16_text_owned(s)
 }
 
 pub fn utf8_decode(bytes: &[u8]) -> String {
@@ -209,7 +176,7 @@ pub fn from_units(units: impl Iterator<Item = u16>) -> String {
     let mut out = String::new();
     let mut pending: Option<u16> = None;
     let push_lone = |out: &mut String, u: u16| {
-        out.push(char::from_u32(SMUGGLE_BASE + (u as u32 - 0xD800)).unwrap());
+        out.push(smuggle(u));
     };
     for u in units {
         if let Some(hi) = pending.take() {

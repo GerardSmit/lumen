@@ -3,8 +3,51 @@
 
 use super::fold::{
     canonicalize_legacy, fold_orbit, is_word_ic, js_whitespace, py_any_variant, py_is_ascii_space,
-    py_is_decimal, py_is_space, py_is_word, CaseFold,
+    py_is_decimal, py_is_space, py_is_word, py_lower, py_upper, CaseFold,
 };
+
+/// A transformation applied to the subject character before it is tested against a class (or
+/// compared with a captured character by a back reference). Python's `IGNORECASE` ops test the
+/// lowercased character against a set that was itself lowercased at compile time, which is
+/// not the same as testing every case variant of the character.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreMap {
+    /// Python's simple Unicode lowercase mapping.
+    PyLower,
+    /// `A-Z` onto `a-z`; everything else unchanged.
+    AsciiLower,
+    /// The character matches when its ASCII lowercase or its ASCII uppercase is a member
+    /// (C-locale `IGNORECASE`).
+    AsciiEither,
+}
+
+impl PreMap {
+    #[inline]
+    pub fn apply(self, u: u32) -> u32 {
+        match self {
+            PreMap::PyLower => py_lower(u),
+            PreMap::AsciiLower | PreMap::AsciiEither => ascii_lower(u),
+        }
+    }
+}
+
+#[inline]
+fn ascii_lower(u: u32) -> u32 {
+    if (0x41..=0x5A).contains(&u) {
+        u + 32
+    } else {
+        u
+    }
+}
+
+#[inline]
+fn ascii_upper(u: u32) -> u32 {
+    if (0x61..=0x7A).contains(&u) {
+        u - 32
+    } else {
+        u
+    }
+}
 
 /// Which language's definition of `\d`, `\w`, `\s` and `\b` applies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,6 +118,12 @@ pub struct CharClass {
     pub builtins: Vec<Builtin>,
     /// Unicode property escapes `\p{…}` / `\P{…}`: `(negated, sorted codepoint ranges)`.
     pub props: Vec<(bool, &'static [(u32, u32)])>,
+    /// Ranges a character belongs to when it, or its Python simple uppercase, lies inside
+    /// (Python's `RANGE_UNI_IGNORE`).
+    pub upper_ranges: Vec<(u32, u32)>,
+    /// When set, the subject character is transformed before membership is decided and the
+    /// class's case-insensitive matching is not used.
+    pub pre: Option<PreMap>,
     /// Memoized ASCII membership bitmaps per `(icase, fold)` mode, filled on first match
     /// (a compiled class never changes).
     ascii: [std::cell::Cell<Option<u128>>; 8],
@@ -104,6 +153,16 @@ impl CharClass {
         self
     }
 
+    pub fn with_upper_range(mut self, lo: u32, hi: u32) -> CharClass {
+        self.upper_ranges.push((lo, hi));
+        self
+    }
+
+    pub fn with_pre(mut self, pre: PreMap) -> CharClass {
+        self.pre = Some(pre);
+        self
+    }
+
     /// Add a sorted, disjoint range table, optionally negated (`\P{…}`).
     pub fn with_prop(mut self, negated: bool, ranges: &'static [(u32, u32)]) -> CharClass {
         self.props.push((negated, ranges));
@@ -117,6 +176,8 @@ impl CharClass {
             ranges: self.ranges.clone(),
             builtins: self.builtins.clone(),
             props: self.props.clone(),
+            upper_ranges: self.upper_ranges.clone(),
+            pre: self.pre,
             ascii: Default::default(),
         }
     }
@@ -144,6 +205,16 @@ impl CharClass {
     }
 
     fn matches_slow(&self, u: u32, icase: bool, fold: CaseFold) -> bool {
+        if let Some(pre) = self.pre {
+            let hit = match pre {
+                PreMap::AsciiEither => {
+                    let (lo, up) = (ascii_lower(u), ascii_upper(u));
+                    self.matches_raw(lo, false, fold) || (up != lo && self.matches_raw(up, false, fold))
+                }
+                _ => self.matches_raw(pre.apply(u), false, fold),
+            };
+            return hit ^ self.negate;
+        }
         let mut hit = self.matches_raw(u, icase, fold);
         if !hit && icase {
             hit = match fold {
@@ -186,6 +257,11 @@ impl CharClass {
         }
         for &b in &self.builtins {
             if b.matches(u, icase, fold) {
+                return true;
+            }
+        }
+        for &(lo, hi) in &self.upper_ranges {
+            if (lo..=hi).contains(&u) || (lo..=hi).contains(&py_upper(u)) {
                 return true;
             }
         }

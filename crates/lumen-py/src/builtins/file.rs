@@ -3,7 +3,7 @@
 use crate::object::*;
 use crate::vm::*;
 use std::cell::RefCell;
-use crate::platform::{IoError, OpenMode};
+use crate::platform::OpenMode;
 
 type Kw<'a> = &'a [(Obj, Value)];
 
@@ -50,29 +50,6 @@ fn closed_err(it: &mut Interp) -> Obj {
 }
 
 impl Interp {
-    pub fn os_error(&mut self, e: &IoError, filename: &str) -> Obj {
-        use crate::platform::IoErrorKind::*;
-        let name = match e.kind {
-            NotFound => "FileNotFoundError",
-            PermissionDenied => "PermissionError",
-            AlreadyExists => "FileExistsError",
-            IsADirectory => "IsADirectoryError",
-            NotADirectory => "NotADirectoryError",
-            Other => "OSError",
-        };
-        let msg = e.message();
-        let cls = Value::Obj(self.exc_type(name));
-        let mut args = vec![Value::Int(e.errno as i64), Value::str(msg)];
-        if !filename.is_empty() {
-            args.push(Value::str(filename));
-        }
-        match self.call(&cls, args, Vec::new()) {
-            Ok(Value::Obj(o)) => o,
-            Ok(_) => self.new_exc_str("OSError", msg),
-            Err(e) => e,
-        }
-    }
-
     pub fn file_write(&mut self, o: &Obj, s: &str) -> R<()> {
         let Kind::File(f) = &o.kind else { return Ok(()) };
         let mut fd = f.borrow_mut();
@@ -86,7 +63,7 @@ impl Interp {
                 self.write_stderr(s);
             }
             FileMode::Write { buf, .. } => {
-                buf.extend_from_slice(s.as_bytes());
+                buf.extend_from_slice(lumen_common::smuggle::unescape_text(s).as_bytes());
                 if buf.len() > 1 << 16 {
                     flush_data(&mut fd);
                 }
@@ -122,7 +99,7 @@ impl Interp {
 
     fn file_out(&self, text: bool, data: Vec<u8>) -> Value {
         if text {
-            Value::string(String::from_utf8_lossy(&data).into_owned())
+            Value::string(lumen_common::smuggle::escape_text_owned(String::from_utf8_lossy(&data).into_owned()))
         } else {
             Value::bytes(data)
         }
@@ -302,7 +279,7 @@ fn f_write(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         match a[1].as_str() {
             Some(s) => {
                 it.file_write(&o, s)?;
-                Ok(Value::Int(s.chars().count() as i64))
+                Ok(Value::Int(lumen_common::smuggle::count_code_points(s) as i64))
             }
             None => {
                 let t = it.type_name_of(&a[1]);

@@ -1,0 +1,17 @@
+# Lumen's language-neutral native-binding framework: `#[op]`, `#[class]` + `#[methods]` and
+# `#[module]` describe a Rust fn / struct / module once; every engine (JS in `lumen`, Python in
+# `lumen-py`) implements the `Host` trait once and exposes every declaration. See the crate docs
+# for the syntax and the porting guide.
+[package]
+name = "lumen-bind"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-common = { path = "../lumen-common" }
+lumen-bind-macros = { path = "macros" }
+
+[lints]
+workspace = true

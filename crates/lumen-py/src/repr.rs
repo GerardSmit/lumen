@@ -34,26 +34,26 @@ pub fn str_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::with_capacity(s.len() + 2);
     out.push(quote);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
+    for cp in lumen_common::smuggle::code_points(s) {
+        // `from_u32` is `None` exactly for the lone surrogates.
+        match char::from_u32(cp) {
+            Some('\\') => out.push_str("\\\\"),
+            Some('\n') => out.push_str("\\n"),
+            Some('\r') => out.push_str("\\r"),
+            Some('\t') => out.push_str("\\t"),
+            Some(c) if c == quote => {
                 out.push('\\');
                 out.push(c);
             }
-            c if is_printable(c) => out.push(c),
-            c => push_escape(&mut out, c),
+            Some(c) if is_printable(c) => out.push(c),
+            _ => push_escape(&mut out, cp),
         }
     }
     out.push(quote);
     out
 }
 
-fn push_escape(out: &mut String, c: char) {
-    let u = c as u32;
+fn push_escape(out: &mut String, u: u32) {
     if u < 0x100 {
         out.push_str(&format!("\\x{:02x}", u));
     } else if u < 0x10000 {
@@ -65,11 +65,11 @@ fn push_escape(out: &mut String, c: char) {
 
 pub fn ascii_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_ascii() {
-            out.push(c);
+    for cp in lumen_common::smuggle::code_points(s) {
+        if cp < 0x80 {
+            out.push(cp as u8 as char);
         } else {
-            push_escape(&mut out, c);
+            push_escape(&mut out, cp);
         }
     }
     out
@@ -186,7 +186,7 @@ impl Interp {
             Kind::Complex(r, i) => Ok(complex_repr(*r, *i)),
             Kind::Bytes(b) => Ok(bytes_repr(b)),
             Kind::ByteArray(b) => {
-                let r = bytes_repr(&b.borrow());
+                let r = bytes_repr(&b.bytes());
                 Ok(self.wrap_cls_repr(o, "bytearray", &r))
             }
             Kind::Tuple(items) => {
@@ -257,6 +257,12 @@ impl Interp {
             Kind::Type(_) => Ok(format!("<class '{}'>", self.type_display(o))),
             Kind::Function(f) => Ok(format!("<function {} at {:#x}>", f.qualname.borrow(), self.id_of(v))),
             Kind::Method(f, this) => {
+                if let Value::Obj(fo) = f {
+                    if let Kind::Native(n) = &fo.kind {
+                        let t = self.type_of(this);
+                        return Ok(format!("<built-in method {} of {} object at {:#x}>", n.name, self.type_display(&t), self.id_of(this)));
+                    }
+                }
                 let name = match self.get_attr_str(f, "__qualname__") {
                     Ok(q) => q.as_str().unwrap_or("?").to_string(),
                     Err(_) => "?".into(),
@@ -265,7 +271,9 @@ impl Interp {
                 Ok(format!("<bound method {} of {}>", name, r))
             }
             Kind::Native(n) => {
-                if n.method {
+                if let Some(d) = n.desc.filter(|d| n.method && d.class().is_some()) {
+                    Ok(format!("<method '{}' of '{}' objects>", n.name, crate::bind::owner_of(d)))
+                } else if n.method {
                     Ok(format!("<method '{}' of object>", n.name))
                 } else {
                     Ok(format!("<built-in function {}>", n.name))
@@ -418,17 +426,12 @@ impl Interp {
                     }
                     let args = d.borrow().args.clone();
                     if self.exc_is(o, "OSError") {
-                        let dict = o.dict.borrow().clone();
-                        let get = |n: &str| dict.as_ref().and_then(|d| dict_get_str(d, n)).filter(|v| !v.is_none());
-                        if let (Some(errno), Some(msg)) = (get("errno"), get("strerror")) {
-                            let (errno, msg) = (self.str_of(&errno)?, self.str_of(&msg)?);
-                            let mut s = format!("[Errno {}] {}", errno, msg);
-                            if let Some(f) = get("filename") {
-                                s.push_str(&format!(": {}", self.repr_of(&f)?));
-                                if let Some(f2) = get("filename2") {
-                                    s.push_str(&format!(" -> {}", self.repr_of(&f2)?));
-                                }
-                            }
+                        if let Some(s) = self.oserror_str(o)? {
+                            return Ok(s);
+                        }
+                    }
+                    if self.exc_is(o, "UnicodeError") {
+                        if let Some(s) = self.unicode_exc_str(o)? {
                             return Ok(s);
                         }
                     }

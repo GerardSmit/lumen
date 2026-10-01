@@ -25,7 +25,7 @@
 mod ast;
 use lumen_common::bigint;
 mod builtins;
-pub mod bytebuf;
+pub use lumen_common::buffer;
 pub mod bytecode;
 mod console_fmt;
 mod coroutine;
@@ -627,34 +627,17 @@ pub mod embed {
     /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
     pub use crate::value::{NativeClosure, NativeFn, Value};
 
-    // Typed bindings: conversion traits, op/class descriptors, promises (see `embed_convert`).
+    // The JS host of `lumen-bind`, errors, promises and async work (see `embed_convert`).
     pub use crate::embed_convert::{
-        ArgCx, ArrayElem, AsyncHost, BigI64, BigU64, Class, ClassDesc, Completer, CtorReturn,
-        Deferred, FastKind, FastPtr, FastSig, FromJs, IntoJs, JsArrayBuffer, JsFunction, JsObject,
-        MemberDesc, MemberKind, OpDesc, OpError, OpResult, Promise, SendError, Settle, Slot, State,
-        This,
+        class_name, js_name, ArgCx, AsyncHost, BigI64, BigU64, Completer, Deferred, JsArrayBuffer,
+        JsFunction, JsHost, JsObject, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).
     pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};
-    #[doc(hidden)]
-    pub use crate::embed_convert::private as __private;
-    /// The binding macros (feature `macros`), also at the crate root.
-    #[cfg(feature = "macros")]
-    pub use lumen_macros::{class, methods, op};
-}
-
-/// `#[op]` / `#[class]` / `#[methods]` (feature `macros`): see `lumen_macros`.
-#[cfg(feature = "macros")]
-pub use lumen_macros::{class, methods, op};
-
-/// `lumen::ops![a, b, path::c]` — the `&'static OpDesc` list of `#[op]` fns, for
-/// [`Engine::define_ops`].
-#[cfg(feature = "embed")]
-#[macro_export]
-macro_rules! ops {
-    ($($($p:ident)::+),* $(,)?) => {
-        &[$(&$($p)::+::DESC),*]
-    };
+    /// The language-neutral op error (maps to `TypeError` / `RangeError` / `Error`).
+    pub use lumen_common::native::{ErrorKind as NativeErrorKind, NativeError, NativeResult};
+    /// The binding framework (declare natives with `lumen_bind::{op, class, methods, module}`).
+    pub use lumen_bind::{self as bind, State, This};
 }
 
 /// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`

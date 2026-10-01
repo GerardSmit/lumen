@@ -1,11 +1,16 @@
 //! Prime generation and testing (`generatePrime`, `checkPrime`).
 
-use lumen::embed::{OpDesc, OpError, SendError};
+use lumen::embed::{OpError, SendError};
 use num_bigint_dig::prime::probably_prime;
 use num_bigint_dig::{BigUint, RandBigInt, RandPrime};
 use rand_core::OsRng;
 
 use super::keys::safe_prime;
+
+
+#[lumen_bind::module(name = "crypto")]
+pub(crate) mod bindings {
+use super::*;
 
 const MAX_ATTEMPTS: usize = 1 << 22;
 
@@ -62,12 +67,12 @@ fn generate(bits: u32, safe: bool, add: Option<&[u8]>, rem: Option<&[u8]>) -> Re
 }
 
 /// A prime of exactly `bits` bits, optionally `safe` and congruent to `rem` modulo `add`.
-#[lumen::op(name = "primeGenerate")]
+#[op(name = "primeGenerate")]
 fn prime_generate(bits: u32, safe: bool, add: Option<Vec<u8>>, rem: Option<Vec<u8>>) -> Result<Vec<u8>, OpError> {
     Ok(generate(bits, safe, add.as_deref(), rem.as_deref())?)
 }
 
-#[lumen::op(async, name = "primeGenerateAsync")]
+#[op(async, name = "primeGenerateAsync")]
 fn prime_generate_async(bits: u32, safe: bool, add: Option<Vec<u8>>, rem: Option<Vec<u8>>) -> Result<Vec<u8>, SendError> {
     generate(bits, safe, add.as_deref(), rem.as_deref())
 }
@@ -77,14 +82,13 @@ fn check(candidate: &[u8], checks: u32) -> bool {
     probably_prime(&BigUint::from_bytes_be(candidate), rounds)
 }
 
-#[lumen::op(name = "primeCheck")]
+#[op(name = "primeCheck")]
 fn prime_check(candidate: &[u8], checks: u32) -> bool {
     check(candidate, checks)
 }
 
-#[lumen::op(async, name = "primeCheckAsync")]
+#[op(async, name = "primeCheckAsync")]
 fn prime_check_async(candidate: Vec<u8>, checks: u32) -> Result<bool, SendError> {
     Ok(check(&candidate, checks))
 }
-
-pub const OPS: &[&OpDesc] = lumen::ops![prime_generate, prime_generate_async, prime_check, prime_check_async];
+}

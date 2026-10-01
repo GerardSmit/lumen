@@ -1,0 +1,101 @@
+TypeError: math.floor() takes exactly one argument (0 given)
+TypeError: math.floor() takes exactly one argument (2 given)
+TypeError: math.floor() takes no keyword arguments
+TypeError: must be real number, not str
+TypeError: must be real number, not str
+TypeError: pow expected 2 arguments, got 1
+TypeError: pow expected 2 arguments, got 3
+TypeError: math.pow() takes no keyword arguments
+TypeError: log expected at least 1 argument, got 0
+TypeError: log expected at most 2 arguments, got 3
+TypeError: isclose() missing required argument 'b' (pos 2)
+TypeError: isclose() takes exactly 2 positional arguments (3 given)
+TypeError: 'foo' is an invalid keyword argument for isclose()
+TypeError: must be real number, not str
+TypeError: argument for isclose() given by name ('a') and position (1)
+TypeError: isclose() missing required argument 'b' (pos 2)
+TypeError: prod() takes exactly 1 positional argument (0 given)
+TypeError: prod() takes exactly 1 positional argument (2 given)
+TypeError: prod() takes at most 2 arguments (3 given)
+TypeError: 'float' object cannot be interpreted as an integer
+TypeError: 'str' object cannot be interpreted as an integer
+OverflowError: factorial() argument should not exceed 9223372036854775807
+TypeError: comb expected 2 arguments, got 1
+TypeError: comb expected 2 arguments, got 3
+TypeError: perm expected at least 1 argument, got 0
+TypeError: 'float' object cannot be interpreted as an integer
+TypeError: Expected an int as second argument to ldexp.
+OverflowError: math range error
+TypeError: must be real number, not str
+TypeError: 'int' object is not iterable
+TypeError: 'int' object is not iterable
+TypeError: type str doesn't define __trunc__ method
+TypeError: must be real number, not NoneType
+ValueError: isqrt() argument must be nonnegative
+TypeError: 'float' object cannot be interpreted as an integer
+ValueError: math domain error
+ValueError: math domain error
+OverflowError: math range error
+TypeError: deque.append() takes exactly one argument (0 given)
+TypeError: deque.append() takes exactly one argument (2 given)
+TypeError: deque.append() takes no keyword arguments
+TypeError: deque.pop() takes no arguments (1 given)
+IndexError: pop from an empty deque
+TypeError: 'str' object cannot be interpreted as an integer
+TypeError: deque.rotate expected at most 1 argument, got 2
+TypeError: index() takes at least 1 argument (0 given)
+TypeError: insert() takes exactly 2 arguments (1 given)
+TypeError: deque() takes at most 2 arguments (3 given)
+TypeError: an integer is required
+ValueError: maxlen must be non-negative
+TypeError: 'foo' is an invalid keyword argument for deque()
+TypeError: descriptor 'append' for 'collections.deque' objects doesn't apply to a 'int' object
+IndexError: deque index out of range
+TypeError: sequence index must be integer, not 'str'
+TypeError: expected 0 arguments, got 1
+AttributeError: attribute 'maxlen' of 'collections.deque' objects is not writable
+TypeError: a number is required
+TypeError: count() takes at most 2 arguments (3 given)
+TypeError: 'foo' is an invalid keyword argument for count()
+TypeError: repeat() missing required argument 'object' (pos 1)
+TypeError: 'str' object cannot be interpreted as an integer
+TypeError: cycle expected 1 argument, got 0
+TypeError: 'int' object is not iterable
+TypeError: cycle() takes no keyword arguments
+TypeError: chain() takes no keyword arguments
+TypeError: islice expected at least 2 arguments, got 1
+TypeError: islice expected at most 4 arguments, got 5
+ValueError: Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.
+TypeError: accumulate() missing required argument 'iterable' (pos 1)
+TypeError: 'foo' is an invalid keyword argument for accumulate()
+TypeError: compress() missing required argument 'selectors' (pos 2)
+TypeError: dropwhile expected 2 arguments, got 1
+TypeError: starmap expected 2 arguments, got 1
+TypeError: pairwise expected 1 argument, got 0
+ValueError: n must be at least one
+TypeError: batched() missing required argument 'n' (pos 2)
+ValueError: n must be >= 0
+TypeError: tee expected at least 1 argument, got 0
+TypeError: 'foo' is an invalid keyword argument for product()
+TypeError: permutations() missing required argument 'iterable' (pos 1)
+TypeError: combinations() missing required argument 'r' (pos 2)
+ValueError: r must be non-negative
+TypeError: 'str' object cannot be interpreted as an integer
+TypeError: groupby() missing required argument 'iterable' (pos 1)
+TypeError: zip_longest() got an unexpected keyword argument
+TypeError: chain.from_iterable() takes exactly one argument (0 given)
+TypeError: 'int' object is not iterable
+TypeError: isclose() missing required argument 'b' (pos 2)
+TypeError: isclose() takes at most 4 arguments (5 given)
+ValueError: steps must be a non-negative integer
+ValueError: Inputs are not the same length
+TypeError: expected 1 argument, got 0
+TypeError: wrapper __setitem__() takes no keyword arguments
+TypeError: index() takes at most 3 arguments (4 given)
+RuntimeError: deque mutated during iteration
+6.661338147750939e-16 2.220446049250313e-16 11
+($module, x, /) ($module, /, a, b, *, rel_tol=1e-09, abs_tol=0.0) None
+None (start=0, step=1)
+($module, *integers) ($self, value, /) ($self, key, value, /)
+<built-in function floor> <method 'append' of 'collections.deque' objects> <built-in method append of collections.d
+floor floor math deque.append

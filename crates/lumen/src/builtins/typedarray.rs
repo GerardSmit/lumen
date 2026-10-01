@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use lumen_common::buffer::{BufferError, ByteStore, StoreSlot};
 
 pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     // Modeled as a plain ArrayBuffer (no real sharing) — enough for tests that just need the type.
@@ -64,8 +65,8 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         if !new_len.is_finite() || new_len < cur as f64 || new_len as usize > max {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
-        if let Some(buf) = i.array_buffers.get_mut(&ptr) {
-            buf.resize(new_len as usize, 0);
+        if let Some(buf) = i.array_buffers.get(&ptr) {
+            buf.resize(new_len as usize).map_err(|e| buffer_error(i, e))?;
         }
         Ok(Value::Undefined)
     });
@@ -181,7 +182,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(bp, vec![0u8; len].into());
+        i.array_buffers.insert(bp, new_store(len, max.map(|m| m as usize)).into());
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "__abResizable", Value::Bool(max.is_some()));
         let id = crate::interpreter::alloc_shared_mem(len);
@@ -209,9 +210,9 @@ fn ab_transfer(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value>
 fn ab_transfer_fixed(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     ab_transfer_impl(i, this, a, true)
 }
-/// ArrayBuffer.prototype.transfer / transferToFixedLength: copy into a new buffer of `newLength` and
-/// detach the source. `transfer` preserves the source's resizability (its maxByteLength);
-/// `transferToFixedLength` always produces a fixed-length buffer.
+/// ArrayBuffer.prototype.transfer / transferToFixedLength: move the source's bytes into a new
+/// buffer of `newLength` and detach the source. `transfer` preserves the source's resizability
+/// (its maxByteLength); `transferToFixedLength` always produces a fixed-length buffer.
 fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Result<Value, Value> {
     let o = this
         .as_obj()
@@ -234,60 +235,86 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
             Some(n as usize)
         }
     };
-    if i.immutable_buffers.contains(&ptr) {
+    if i.buffer_immutable(ptr) {
         return Err(i.make_error("TypeError", "an immutable ArrayBuffer is not detachable"));
     }
-    if !i.array_buffers.contains_key(&ptr) {
+    let Some(src_len) = i.array_buffers.get(&ptr).map(|s| s.len()) else {
         return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-    }
-    let new_len = new_len.unwrap_or_else(|| i.array_buffers[&ptr].len());
+    };
+    let new_len = new_len.unwrap_or(src_len);
     // transfer() preserves the source's resizability; transferToFixedLength() is always fixed.
     let src_resizable = matches!(i.get_member(&this, "resizable"), Ok(Value::Bool(true)));
     let src_max = match i.get_member(&this, "maxByteLength") {
         Ok(Value::Num(n)) => n as usize,
         _ => new_len,
     };
-    let bytes = i.array_buffers[&ptr].clone();
-    let (bv, bp) = make_array_buffer(i, new_len);
-    if let Some(buf) = i.array_buffers.get_mut(&bp) {
-        let n = bytes.len().min(new_len);
-        buf[..n].copy_from_slice(&bytes[..n]);
-    }
-    if !fixed && src_resizable {
-        if let Value::Obj(nb) = &bv {
-            set_internal(nb, "__abMaxByteLength", Value::Num(src_max as f64));
-            set_internal(nb, "__abResizable", Value::Bool(true));
-        }
-    }
-    // Detach the source (drop its backing store; detached/byteLength derive from the side table).
+    // Detach the source, taking its bytes (no copy for an owned store).
+    let detached = match i.array_buffers.get(&ptr) {
+        Some(src) => src.detach(),
+        None => Err(BufferError::Detached),
+    };
+    let mut bytes = detached.map_err(|e| buffer_error(i, e))?;
     i.array_buffers.remove(&ptr);
+    bytes.resize(new_len, 0);
+    let max = (!fixed && src_resizable).then_some(src_max);
+    let (bv, _) = array_buffer_from_store(i, store_with_max(ByteStore::new(bytes), max).into());
+    if let (Some(m), Value::Obj(nb)) = (max, &bv) {
+        set_internal(nb, "__abMaxByteLength", Value::Num(m as f64));
+    }
     Ok(bv)
+}
+
+/// `store` made resizable up to `max` when given.
+fn store_with_max(store: ByteStore, max: Option<usize>) -> ByteStore {
+    match max {
+        Some(m) => store.with_max_len(m),
+        None => store,
+    }
+}
+
+/// `len` zero bytes, resizable up to `max` when given.
+fn new_store(len: usize, max: Option<usize>) -> ByteStore {
+    store_with_max(ByteStore::zeroed(len), max)
+}
+
+/// The JS error for a store operation the shared buffer refused.
+pub(crate) fn buffer_error(i: &Interp, e: BufferError) -> Value {
+    let msg = match e {
+        BufferError::Pinned => {
+            "ArrayBuffer has live exports and cannot be resized, transferred or detached"
+        }
+        BufferError::Detached => "ArrayBuffer is detached",
+        BufferError::ReadOnly => "ArrayBuffer is immutable",
+        e => e.message(),
+    };
+    let kind = match e {
+        BufferError::TooLarge | BufferError::OutOfBounds => "RangeError",
+        _ => "TypeError",
+    };
+    i.make_error(kind, msg)
 }
 
 /// A fixed-length ArrayBuffer owning `bytes` (no copy).
 pub(crate) fn array_buffer_from_vec(i: &mut Interp, bytes: Vec<u8>) -> Value {
-    let (v, p) = make_array_buffer(i, 0);
-    if let Value::Obj(o) = &v {
-        set_max_byte_length(o, bytes.len());
-    }
-    i.array_buffers.insert(p, bytes.into());
-    v
+    array_buffer_from_store(i, ByteStore::new(bytes).into()).0
 }
 
-pub(crate) fn set_max_byte_length(o: &Gc, len: usize) {
-    set_internal(o, "__abMaxByteLength", Value::Num(len as f64));
-}
-
-fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
+/// A new ArrayBuffer object over `store`; its maxByteLength / resizable slots mirror the store.
+pub(crate) fn array_buffer_from_store(i: &mut Interp, store: StoreSlot) -> (Value, usize) {
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, vec![0u8; byte_len].into());
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
     // behind the `__ab*` prefix and surfaced through prototype accessor getters.
-    set_internal(&obj, "__abMaxByteLength", Value::Num(byte_len as f64));
-    set_internal(&obj, "__abResizable", Value::Bool(false));
+    let max = store.max_len().min(9007199254740991);
+    set_internal(&obj, "__abMaxByteLength", Value::Num(max as f64));
+    set_internal(&obj, "__abResizable", Value::Bool(store.is_resizable()));
+    i.array_buffers.insert(p, store);
     (Value::Obj(obj), p)
+}
+
+fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
+    array_buffer_from_store(i, ByteStore::zeroed(byte_len).into())
 }
 
 /// `get ArrayBuffer.prototype.byteLength`.
@@ -376,9 +403,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .as_obj()
             .filter(|o| o.borrow().props.contains("__abMaxByteLength"))
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
-        Ok(Value::Bool(
-            i.immutable_buffers.contains(&(Gc::as_ptr(o) as usize)),
-        ))
+        Ok(Value::Bool(i.buffer_immutable(Gc::as_ptr(o) as usize)))
     });
     it.def_method(&proto, "slice", 2, |i, this, a| {
         // RequireInternalSlot([[ArrayBufferData]]), reject a shared buffer, then a detached one.
@@ -430,23 +455,21 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if nptr == ptr {
             return Err(i.make_error("TypeError", "slice species returned the same ArrayBuffer"));
         }
-        if i.immutable_buffers.contains(&nptr) {
+        if i.buffer_immutable(nptr) {
             return Err(i.make_error("TypeError", "slice species returned an immutable buffer"));
         }
         if i.array_buffers[&nptr].len() < new_len {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
         // The species constructor may have detached or shrunk the source.
-        if !i.array_buffers.contains_key(&ptr) {
+        let Some(src) = i.array_buffers.get(&ptr) else {
             return Err(i.make_error("TypeError", "source ArrayBuffer was detached during slice"));
-        }
-        let src = i.array_buffers[&ptr].clone();
+        };
         let (begin, end) = (begin.min(src.len() as i64), end.min(src.len() as i64));
         if begin < end {
-            let slice = src[begin as usize..end as usize].to_vec();
-            if let Some(buf) = i.array_buffers.get_mut(&nptr) {
-                buf[..slice.len()].copy_from_slice(&slice);
-            }
+            // Copied out first: two buffer objects may share one store.
+            let slice = src.bytes()[begin as usize..end as usize].to_vec();
+            i.array_buffers[&nptr].write_at(0, &slice);
         }
         Ok(new_buf)
     });
@@ -479,11 +502,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             return Err(i.make_error("RangeError", "ArrayBuffer resize out of range"));
         }
         let n = new_len as usize;
-        if i.immutable_buffers.contains(&(Gc::as_ptr(&o) as usize)) {
+        if i.buffer_immutable(Gc::as_ptr(&o) as usize) {
             return Err(i.make_error("TypeError", "ArrayBuffer is immutable"));
         }
-        if let Some(buf) = i.array_buffers.get_mut(&(Gc::as_ptr(&o) as usize)) {
-            buf.resize(n, 0);
+        if let Some(buf) = i.array_buffers.get(&(Gc::as_ptr(&o) as usize)) {
+            buf.resize(n).map_err(|e| buffer_error(i, e))?;
         }
         // byteLength derives from the backing store length, which the resize above updated.
         Ok(Value::Undefined)
@@ -495,7 +518,9 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     it.def_method(&proto, "transferToImmutable", 0, |i, this, a| {
         let bv = ab_transfer_fixed(i, this, a)?;
         if let Value::Obj(o) = &bv {
-            i.immutable_buffers.insert(Gc::as_ptr(o) as usize);
+            if let Some(store) = i.array_buffers.get(&(Gc::as_ptr(o) as usize)) {
+                store.set_readonly();
+            }
         }
         Ok(bv)
     });
@@ -529,16 +554,12 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             ));
         }
         let slice = if begin < end {
-            bytes[begin as usize..end as usize].to_vec()
+            bytes.bytes()[begin as usize..end as usize].to_vec()
         } else {
             Vec::new()
         };
-        let (bv, bp) = make_array_buffer(i, slice.len());
-        if let Some(buf) = i.array_buffers.get_mut(&bp) {
-            buf.copy_from_slice(&slice);
-        }
-        i.immutable_buffers.insert(bp);
-        Ok(bv)
+        let store = ByteStore::new(slice).readonly();
+        Ok(array_buffer_from_store(i, store.into()).0)
     });
     let ctor = it.make_native("ArrayBuffer", 1, |i, _t, a| {
         if !i.constructing {
@@ -580,7 +601,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let len = n as usize;
         let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(p, vec![0u8; len].into());
+        i.array_buffers.insert(p, new_store(len, max.map(|m| m as usize)).into());
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "__abResizable", Value::Bool(max.is_some()));
         Ok(Value::Obj(obj))
@@ -1064,7 +1085,7 @@ fn ta_native(
             Ok(Value::Bool(false))
         })()),
         "fill" => Some((|| {
-            if i.immutable_buffers.contains(&info.buffer) {
+            if i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             // The fill value is coerced to the element type exactly once.
@@ -1090,7 +1111,7 @@ fn ta_native(
             Ok(this.clone())
         })()),
         "copyWithin" => Some((|| {
-            if i.immutable_buffers.contains(&info.buffer) {
+            if i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             let to = rel_index(ab(i.to_number(&arg(args, 0)))?, len);
@@ -1125,7 +1146,7 @@ fn ta_native(
                 return Err(i.make_error("TypeError", "comparefn must be a function"));
             }
             let in_place = method == "sort";
-            if in_place && i.immutable_buffers.contains(&info.buffer) {
+            if in_place && i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             // Default (no comparator) numeric sort runs natively — the Value-boxed merge sort
@@ -1191,7 +1212,7 @@ fn ta_native(
             Ok(new_ta)
         })()),
         "reverse" => Some((|| {
-            if i.immutable_buffers.contains(&info.buffer) {
+            if i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             for k in 0..len / 2 {
@@ -1326,7 +1347,7 @@ fn ta_validate_created(
             ));
         }
     };
-    if write && i.immutable_buffers.contains(&new_info.buffer) {
+    if write && i.buffer_immutable(new_info.buffer) {
         return Err(i.make_error(
             "TypeError",
             "TypedArray destination is backed by an immutable buffer",
@@ -1580,7 +1601,7 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
         .get(&ptr)
         .ok_or_else(|| i.make_error("TypeError", "set on non-TypedArray"))?;
     // An immutable target buffer can't be written — verified before any argument is coerced.
-    if i.immutable_buffers.contains(&info.buffer) {
+    if i.buffer_immutable(info.buffer) {
         return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
     }
     // targetOffset = ToIntegerOrInfinity(offset); a negative offset is a RangeError.
@@ -2036,15 +2057,15 @@ fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
         .array_buffers
         .get(&info.buffer)
         .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
-    Ok(buf[info.offset..info.offset + info.len].to_vec())
+    Ok(buf.bytes()[info.offset..info.offset + info.len].to_vec())
 }
 fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
     let ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "Uint8Array"))?;
     let ta = ab(i.construct(ctor, &[Value::Num(bytes.len() as f64)]))?;
     if let Some(ptr) = map_ptr(&ta) {
         if let Some(info) = i.typed_arrays.get(&ptr).copied() {
-            if let Some(buf) = i.array_buffers.get_mut(&info.buffer) {
-                buf[info.offset..info.offset + bytes.len()].copy_from_slice(&bytes);
+            if let Some(buf) = i.array_buffers.get(&info.buffer) {
+                buf.bytes_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(&bytes);
             }
         }
     }
@@ -2183,7 +2204,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
 /// (before any argument is read).
 fn u8_validate_writable(i: &mut Interp, this: &Value) -> Result<TaInfo, Value> {
     let info = u8_validate(i, this)?;
-    if i.immutable_buffers.contains(&info.buffer) {
+    if i.buffer_immutable(info.buffer) {
         return Err(i.make_error(
             "TypeError",
             "cannot write into a view over an immutable ArrayBuffer",
@@ -2207,14 +2228,14 @@ fn u8_validate(i: &mut Interp, this: &Value) -> Result<TaInfo, Value> {
 
 /// SetUint8ArrayBytes + result object: write decoded `bytes` into the view, report `{read, written}`.
 fn u8_set_bytes(i: &mut Interp, info: &TaInfo, read: usize, bytes: &[u8]) -> Result<Value, Value> {
-    if !bytes.is_empty() && i.immutable_buffers.contains(&info.buffer) {
+    if !bytes.is_empty() && i.buffer_immutable(info.buffer) {
         return Err(i.make_error(
             "TypeError",
             "cannot write into a view over an immutable ArrayBuffer",
         ));
     }
-    if let Some(buf) = i.array_buffers.get_mut(&info.buffer) {
-        buf[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
+    if let Some(buf) = i.array_buffers.get(&info.buffer) {
+        buf.bytes_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
     }
     let result = i.new_object();
     set_data(&result, "read", Value::Num(read as f64));

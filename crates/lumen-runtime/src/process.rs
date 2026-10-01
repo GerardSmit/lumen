@@ -19,6 +19,7 @@ struct ProcStart(Instant);
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "process",
+        modules: &[],
         globals: &[],
         namespaces: &[
             (

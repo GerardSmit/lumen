@@ -1,0 +1,25 @@
+(T,) (<class 'typing.Generic'>,) (typing.Generic[T],) (T,)
+(<class '__main__.Box'>, <class 'typing.Generic'>, <class 'object'>)
+__main__.Box[int] 3
+True Box.get
+True True
+(T, Ts, P) (<class '__main__.Base'>, <class 'typing.Generic'>) (<class '__main__.Base'>, typing.Generic[T, typing.Unpack[Ts], P]) (T, Ts, P)
+() (__main__.Box[int],) ()
+(__main__.Box[U], typing.Generic[U]) (U,) __main__.Sub2[str]
+TypeError Cannot inherit from Generic[...] multiple times.
+<class 'int'> <class 'int'>
+<class 'int'> dict[W, int]
+<class 'int'> None
+<class 'str'>
+global
+<class 'bytes'> <class 'bytes'>
+(__T,)
+(__U,) {'x': __U}
+kid+parent
+() ()
+(T,)
+(T,)
+(<class '__main__.Base'>, <class 'typing.Generic'>)
+(<class '__main__.Base'>,)
+(T, <class 'int'>) (<class 'int'>, T) (T, <class 'NoneType'>)
+{'item': T}

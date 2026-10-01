@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Fetch the latest CPython 3.12.x release into ./cpython (gitignored) as a shallow, blobless,
-# sparse clone containing only Lib/ (standard library and its test suite) and LICENSE.
+# sparse clone containing only Lib/ (standard library and its test suite), Modules/_sre/ (the C sources of `_sre`,
+# the spec for lumen-py's native `_sre`) and LICENSE.
 # Idempotent: an existing checkout is fetched and moved to the newest tag in place.
 # Set CPYTHON_TAG to pin a tag instead of the newest v3.12.*.
 set -euo pipefail
@@ -29,7 +30,7 @@ if [ ! -d "$DEST/.git" ]; then
   $GIT -C "$DEST" config extensions.partialClone origin
 fi
 $GIT -C "$DEST" sparse-checkout init --no-cone
-$GIT -C "$DEST" sparse-checkout set '/Lib/' '/LICENSE'
+$GIT -C "$DEST" sparse-checkout set '/Lib/' '/LICENSE' '/Modules/_sre/'
 $GIT -C "$DEST" fetch -q --depth 1 --filter=blob:none origin "refs/tags/$TAG:refs/tags/$TAG"
 $GIT -C "$DEST" checkout -q "$TAG"
 

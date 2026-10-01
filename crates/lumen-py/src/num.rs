@@ -146,12 +146,11 @@ pub fn float_repr(f: f64) -> String {
         return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
     let sign = if f < 0.0 { "-" } else { "" };
-    let s = format!("{:e}", f.abs());
-    let (mant, exp) = s.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let d = lumen_common::float::shortest(f);
+    let digits = d.as_str();
+    let decpt = d.decpt;
+    let exp = decpt - 1;
     let n = digits.len() as i32;
-    let decpt = exp + 1;
     let body = if (-4..16).contains(&exp) {
         if decpt <= 0 {
             format!("0.{}{}", "0".repeat((-decpt) as usize), digits)
@@ -161,24 +160,10 @@ pub fn float_repr(f: f64) -> String {
             format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
         }
     } else {
-        let m = if n > 1 { format!("{}.{}", &digits[..1], &digits[1..]) } else { digits.clone() };
+        let m = if n > 1 { format!("{}.{}", &digits[..1], &digits[1..]) } else { digits.to_string() };
         format!("{}e{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
     };
     format!("{}{}", sign, body)
-}
-
-fn frexp(x: f64) -> (f64, i32) {
-    if x == 0.0 || x.is_nan() || x.is_infinite() {
-        return (x, 0);
-    }
-    let bits = x.to_bits();
-    let exp = ((bits >> 52) & 0x7ff) as i32;
-    if exp == 0 {
-        let (m, e) = frexp(x * fmath::powi(2.0, 64));
-        return (m, e - 64);
-    }
-    let m = f64::from_bits((bits & !(0x7ffu64 << 52)) | (1022u64 << 52));
-    (m, exp - 1022)
 }
 
 pub fn hash_float(v: f64) -> i64 {
@@ -189,7 +174,7 @@ pub fn hash_float(v: f64) -> i64 {
     if v.is_infinite() {
         return if v > 0.0 { 314159 } else { -314159 };
     }
-    let (mut m, mut e) = frexp(v);
+    let (mut m, mut e) = lumen_common::float::frexp(v);
     let sign: i64 = if m < 0.0 {
         m = -m;
         -1

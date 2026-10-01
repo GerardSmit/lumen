@@ -19,6 +19,7 @@ pub use bindings::VarMap;
 
 use crate::ast::*;
 use crate::value::*;
+use lumen_common::buffer::{span_len, ByteStore, StoreSlot};
 use lumen_common::limits::size;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -922,14 +923,13 @@ pub struct Interp {
     pub(crate) lang: crate::eval::fastpaths::LangCaches,
     /// The TypedArray `length`/`byteLength`/`byteOffset`/`buffer` read guard (`ta_meta`).
     pub(crate) ta_meta: ta_meta::TaMetaCaches,
-    /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer.
-    pub(crate) array_buffers: crate::fasthash::FastMap<usize, crate::bytebuf::ByteBuf>,
+    /// ArrayBuffer byte storage (the shared `lumen_common::buffer::ByteStore`), keyed by the
+    /// ArrayBuffer object's pointer; a detached buffer has no entry. Immutable buffers (from
+    /// `transferToImmutable`/`sliceToImmutable`) are readonly stores, resizable ones have a max.
+    pub(crate) array_buffers: crate::fasthash::FastMap<usize, StoreSlot>,
     /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
     /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
     pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
-    /// Immutable ArrayBuffer pointers (created via `transferToImmutable`/`sliceToImmutable`): their
-    /// bytes can be read but never written, resized, detached, or transferred.
-    pub(crate) immutable_buffers: std::collections::HashSet<usize>,
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
@@ -1536,7 +1536,6 @@ impl Interp {
             ta_meta: Default::default(),
             array_buffers: Default::default(),
             shared_buffers: Default::default(),
-            immutable_buffers: std::collections::HashSet::new(),
             can_block: true,
             pending_async_waits: Vec::new(),
             pending_timers: Vec::new(),
@@ -1700,6 +1699,39 @@ impl Interp {
 
     // ----- typed arrays -----------------------------------------------------------------------
 
+    /// Run `f` on the bytes of ArrayBuffer `buffer` (a SharedArrayBuffer's under its lock), or
+    /// `None` when it is detached.
+    #[inline]
+    pub(crate) fn with_buffer_bytes<R>(&self, buffer: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if !self.shared_buffers.is_empty() {
+            if let Some(&id) = self.shared_buffers.get(&buffer) {
+                return shared_mem_get(id).map(|mem| f(&mem.lock().unwrap()));
+            }
+        }
+        self.array_buffers.get(&buffer).map(|b| f(&b.bytes()))
+    }
+
+    /// [`with_buffer_bytes`](Self::with_buffer_bytes) with write access.
+    #[inline]
+    pub(crate) fn with_buffer_bytes_mut<R>(
+        &self,
+        buffer: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Option<R> {
+        if !self.shared_buffers.is_empty() {
+            if let Some(&id) = self.shared_buffers.get(&buffer) {
+                return shared_mem_get(id).map(|mem| f(&mut mem.lock().unwrap()));
+            }
+        }
+        self.array_buffers.get(&buffer).map(|b| f(&mut b.bytes_mut()))
+    }
+
+    /// Whether ArrayBuffer `buffer` is immutable (a readonly store).
+    #[inline]
+    pub(crate) fn buffer_immutable(&self, buffer: usize) -> bool {
+        self.array_buffers.get(&buffer).is_some_and(|b| b.is_readonly())
+    }
+
     /// Read element `idx` of a TypedArray as a Number (or undefined if out of range / detached).
     pub(crate) fn ta_read(&self, info: &TaInfo, idx: usize) -> Value {
         if idx >= self.ta_len(info).unwrap_or(0) {
@@ -1707,28 +1739,17 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let decode = |buf: &[u8]| -> Value {
-            if start + es <= buf.len() {
-                let bytes = &buf[start..start + es];
+        self.with_buffer_bytes(info.buffer, |buf| {
+            buf.get(start..start + es).map(|bytes| {
                 if info.kind.is_bigint() {
-                    Value::BigInt(info.kind.read_bigint(bytes).into())
+                    Value::BigInt(info.kind.read_int(bytes).into())
                 } else {
                     Value::Num(info.kind.read(bytes))
                 }
-            } else {
-                Value::Undefined
-            }
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                return decode(&mem.lock().unwrap());
-            }
-            return Value::Undefined;
-        }
-        match self.array_buffers.get(&info.buffer) {
-            Some(buf) => decode(buf),
-            _ => Value::Undefined,
-        }
+            })
+        })
+        .flatten()
+        .unwrap_or(Value::Undefined)
     }
 
     /// The raw bytes of `nelems` elements starting at element `elem_start` (None when the view
@@ -1742,36 +1763,18 @@ impl Interp {
         let es = info.kind.elsize();
         let start = info.offset + elem_start * es;
         let end = start + nelems * es;
-        let take = |buf: &[u8]| {
-            if end <= buf.len() {
-                Some(buf[start..end].to_vec())
-            } else {
-                None
-            }
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            return shared_mem_get(id).and_then(|mem| take(&mem.lock().unwrap()));
-        }
-        self.array_buffers.get(&info.buffer).and_then(|b| take(b))
+        self.with_buffer_bytes(info.buffer, |buf| buf.get(start..end).map(<[u8]>::to_vec))
+            .flatten()
     }
 
     /// Write raw bytes at element `elem_start` (bounds-checked; silently drops what doesn't fit).
     pub(crate) fn ta_write_bytes(&mut self, info: &TaInfo, elem_start: usize, bytes: &[u8]) {
         let start = info.offset + elem_start * info.kind.elsize();
-        let put = |buf: &mut [u8]| {
-            if start + bytes.len() <= buf.len() {
-                buf[start..start + bytes.len()].copy_from_slice(bytes);
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            if let Some(dst) = buf.get_mut(start..start + bytes.len()) {
+                dst.copy_from_slice(bytes);
             }
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                put(&mut mem.lock().unwrap());
-            }
-            return;
-        }
-        if let Some(b) = self.array_buffers.get_mut(&info.buffer) {
-            put(b);
-        }
+        });
     }
 
     /// Atomically read-modify-write an integer TypedArray element: `f` maps the old raw value to
@@ -1790,37 +1793,15 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let apply = |buf: &mut [u8]| -> Option<i128> {
-            if start + es > buf.len() {
-                return None;
-            }
-            let bytes = &buf[start..start + es];
-            let old = if info.kind.is_bigint() {
-                info.kind.read_bigint(bytes)
-            } else {
-                info.kind.read(bytes) as i128
-            };
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            let bytes = buf.get_mut(start..start + es)?;
+            let old = info.kind.read_int(bytes);
             if let Some(new) = f(old) {
-                let nb = if info.kind.is_bigint() {
-                    info.kind.write_bigint(new)
-                } else {
-                    info.kind.write(new as f64)
-                };
-                buf[start..start + es].copy_from_slice(&nb);
+                info.kind.write_int(new, bytes);
             }
             Some(old)
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                return apply(&mut buf);
-            }
-            return None;
-        }
-        match self.array_buffers.get_mut(&info.buffer) {
-            Some(buf) => apply(buf),
-            None => None,
-        }
+        })
+        .flatten()
     }
 
     /// Store a JS value into a TypedArray element, coercing per the element type. BigInt arrays
@@ -1829,8 +1810,7 @@ impl Interp {
         // IntegerIndexedElementSet: the value coerces FIRST (observable, spec order); a write
         // into an immutable buffer then fails like a non-writable data property — a TypeError in
         // strict mode, a silent no-op in sloppy.
-        let immutable =
-            !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&info.buffer);
+        let immutable = self.buffer_immutable(info.buffer);
         if info.kind.is_bigint() {
             let n = self.to_bigint(v)?;
             if !immutable {
@@ -1858,21 +1838,11 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let bytes = info.kind.write_bigint(n);
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                if start + es <= buf.len() {
-                    buf[start..start + es].copy_from_slice(&bytes);
-                }
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            if let Some(dst) = buf.get_mut(start..start + es) {
+                info.kind.write_int(n, dst);
             }
-            return;
-        }
-        if let Some(buf) = self.array_buffers.get_mut(&info.buffer) {
-            if start + es <= buf.len() {
-                buf[start..start + es].copy_from_slice(&bytes);
-            }
-        }
+        });
     }
 
     /// Write Number `n` into element `idx` of a TypedArray (out-of-range writes are ignored).
@@ -1882,21 +1852,11 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let bytes = info.kind.write(n);
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                if start + es <= buf.len() {
-                    buf[start..start + es].copy_from_slice(&bytes);
-                }
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            if let Some(dst) = buf.get_mut(start..start + es) {
+                info.kind.write(n, dst);
             }
-            return;
-        }
-        if let Some(buf) = self.array_buffers.get_mut(&info.buffer) {
-            if start + es <= buf.len() {
-                buf[start..start + es].copy_from_slice(&bytes);
-            }
-        }
+        });
     }
 
     // ----- symbols ----------------------------------------------------------------------------
@@ -2307,23 +2267,24 @@ impl Interp {
             .get(&(Gc::as_ptr(obj) as usize))
             .copied()?;
         let len = self.ta_len(&info)?;
-        let (code, elem) = match info.kind {
-            crate::value::TaKind::I8 => (0u8, 1usize),
-            crate::value::TaKind::U8 => (1, 1),
-            crate::value::TaKind::U8Clamped => (2, 1),
-            crate::value::TaKind::I16 => (3, 2),
-            crate::value::TaKind::U16 => (4, 2),
-            crate::value::TaKind::I32 => (5, 4),
-            crate::value::TaKind::U32 => (6, 4),
-            crate::value::TaKind::F32 => (7, 4),
-            crate::value::TaKind::F64 => (8, 8),
-            crate::value::TaKind::I64 => (9, 8),
-            crate::value::TaKind::U64 => (10, 8),
-            crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
+        let code = match info.kind {
+            crate::value::TaKind::I8 => 0u8,
+            crate::value::TaKind::U8 => 1,
+            crate::value::TaKind::U8Clamped => 2,
+            crate::value::TaKind::I16 => 3,
+            crate::value::TaKind::U16 => 4,
+            crate::value::TaKind::I32 => 5,
+            crate::value::TaKind::U32 => 6,
+            crate::value::TaKind::F32 => 7,
+            crate::value::TaKind::F64 => 8,
+            crate::value::TaKind::I64 => 9,
+            crate::value::TaKind::U64 => 10,
+            crate::value::TaKind::F16 => 1, // no N-API code for float16; report bytes
         };
-        let byte_len = len * elem;
-        let buf = self.array_buffers.get_mut(&info.buffer)?;
-        let ptr = unsafe { buf.as_mut_ptr().add(info.offset) };
+        let byte_len = len * info.kind.elsize();
+        let buf = self.array_buffers.get(&info.buffer)?;
+        // SAFETY: `ta_len` succeeded, so `offset` is within the store.
+        let ptr = unsafe { buf.as_ptr().add(info.offset) };
         Some((code, byte_len, ptr))
     }
 
@@ -2573,7 +2534,7 @@ impl Interp {
         let object = Object::new(self.extra_protos.get("SharedArrayBuffer").cloned());
         let pointer = Gc::as_ptr(&object) as usize;
         self.gc_pin(&object);
-        self.array_buffers.insert(pointer, vec![0u8; length].into());
+        self.array_buffers.insert(pointer, ByteStore::zeroed(length).into());
         for (name, value) in [
             ("__abMaxByteLength", Value::Num(length as f64)),
             ("__abResizable", Value::Bool(false)),
@@ -2592,27 +2553,43 @@ impl Interp {
     /// (no copy: JS and the embedder share the bytes).
     ///
     /// # Safety
-    /// See [`crate::bytebuf::ByteBuf::external`].
+    /// See [`ByteStore::external`].
     pub unsafe fn make_array_buffer_external(
         &mut self,
         ptr: *mut u8,
         len: usize,
         owner: Rc<dyn std::any::Any>,
     ) -> Value {
-        let v = self.make_array_buffer_from(Vec::new());
-        if let Value::Obj(o) = &v {
-            let p = Gc::as_ptr(o) as usize;
-            self.array_buffers
-                .insert(p, crate::bytebuf::ByteBuf::external(ptr, len, owner));
-            crate::builtins::typedarray::set_max_byte_length(o, len);
-        }
-        v
+        let store = ByteStore::external(ptr, len, owner);
+        crate::builtins::typedarray::array_buffer_from_store(self, store.into()).0
     }
 
-    /// Detach an `ArrayBuffer`, dropping its backing store.
+    /// A fresh `ArrayBuffer` over an existing store, sharing its bytes without copying (the
+    /// cross-language bridge: a store another facade created, or one taken from
+    /// [`array_buffer_store`](Self::array_buffer_store)). Resizability, maximum length and
+    /// immutability come from the store.
+    pub fn make_array_buffer_from_store(&mut self, store: Rc<ByteStore>) -> Value {
+        crate::builtins::typedarray::array_buffer_from_store(self, store.into()).0
+    }
+
+    /// The store behind an attached, non-shared `ArrayBuffer` (`None` for anything else). Pin it
+    /// ([`ByteStore::pin`]) while holding a view into it: JS then cannot resize, transfer or
+    /// detach the buffer (it throws a TypeError instead).
+    pub fn array_buffer_store(&mut self, v: &Value) -> Option<Rc<ByteStore>> {
+        let p = Gc::as_ptr(v.as_obj()?) as usize;
+        if self.shared_buffers.contains_key(&p) {
+            return None;
+        }
+        self.array_buffers.get_mut(&p).map(StoreSlot::share)
+    }
+
+    /// Detach an `ArrayBuffer`, dropping its backing store. A store still pinned by another
+    /// holder keeps its bytes for that holder; JS sees the buffer detached either way.
     pub fn array_buffer_detach(&mut self, v: &Value) {
         if let Some(o) = v.as_obj() {
-            self.array_buffers.remove(&(Gc::as_ptr(o) as usize));
+            if let Some(store) = self.array_buffers.remove(&(Gc::as_ptr(o) as usize)) {
+                let _ = store.detach();
+            }
         }
     }
 
@@ -2624,9 +2601,10 @@ impl Interp {
             return false;
         };
         let pointer = Gc::as_ptr(object) as usize;
-        self.array_buffers.contains_key(&pointer)
+        self.array_buffers
+            .get(&pointer)
+            .is_some_and(|b| !b.is_readonly() && !b.is_pinned())
             && !self.shared_buffers.contains_key(&pointer)
-            && !self.immutable_buffers.contains(&pointer)
             && !matches!(
                 object.borrow().props.get("__abResizable").map(|p| p.value()),
                 Some(Value::Bool(true))
@@ -3107,53 +3085,34 @@ impl Interp {
         Some(p.value())
     }
 
-    /// The byte range and element count behind a non-BigInt TypedArray over an ordinary
-    /// (non-shared) ArrayBuffer: `Some((info, len))`, `len == 0` when the view is detached or out
-    /// of bounds (every index invalid). `None` = not such a TypedArray (take the generic path).
-    #[inline]
-    fn ta_fast_view(&self, o: &Gc) -> Option<(TaInfo, usize)> {
+    /// The store and element count behind a non-BigInt TypedArray over an ordinary (non-shared)
+    /// ArrayBuffer: `Some((info, len, store))`, `len == 0` when the view is out of bounds (every
+    /// index invalid). `None` = not such a TypedArray, or detached (take the generic path).
+    #[inline(always)]
+    fn ta_fast_view(&self, o: &Gc) -> Option<(TaInfo, usize, &ByteStore)> {
         let info = *self.typed_arrays.get(&(Gc::as_ptr(o) as usize))?;
         if info.kind.is_bigint()
             || (!self.shared_buffers.is_empty() && self.shared_buffers.contains_key(&info.buffer))
         {
             return None;
         }
-        let buflen = self.array_buffers.get(&info.buffer)?.len();
-        let es = info.kind.elsize();
-        let len = if info.track {
-            buflen.saturating_sub(info.offset) / es
-        } else if info.offset + info.len * es > buflen {
-            0
-        } else {
-            info.len
-        };
-        Some((info, len))
+        let store = self.array_buffers.get(&info.buffer)?;
+        let len = span_len(store.len(), info.offset, info.kind.elsize(), info.len, info.track)
+            .unwrap_or(0);
+        Some((info, len, store))
     }
 
     /// `ta[idx]` for an integer index on a Number-kind TypedArray (IntegerIndexedElementGet:
     /// an invalid index reads `undefined` — never the prototype chain).
     #[inline(never)]
     pub(crate) fn fast_ta_get(&self, o: &Gc, idx: usize) -> Option<Value> {
-        let info = self.typed_arrays.get(&(Gc::as_ptr(o) as usize))?;
-        if info.kind.is_bigint()
-            || (!self.shared_buffers.is_empty() && self.shared_buffers.contains_key(&info.buffer))
-        {
-            return None;
-        }
-        let buf: &[u8] = self.array_buffers.get(&info.buffer)?;
-        let es = info.kind.elsize();
-        let len = if info.track {
-            buf.len().saturating_sub(info.offset) / es
-        } else if info.offset + info.len * es > buf.len() {
-            0
-        } else {
-            info.len
-        };
+        let (info, len, store) = self.ta_fast_view(o)?;
         if idx >= len {
             return Some(Value::Undefined);
         }
+        let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        Some(Value::Num(info.kind.read(&buf[start..start + es])))
+        Some(Value::Num(info.kind.read(&store.bytes()[start..start + es])))
     }
 
     /// `ta[idx] = v` for an integer index on a Number-kind TypedArray when `v` is already a
@@ -3164,10 +3123,10 @@ impl Interp {
         let Value::Num(n) = v else {
             return Err(v);
         };
-        let Some((info, len)) = self.ta_fast_view(o) else {
+        let Some((info, len, store)) = self.ta_fast_view(o) else {
             return Err(v);
         };
-        if !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&info.buffer) {
+        if store.is_readonly() {
             return Err(v);
         }
         if idx >= len {
@@ -3175,29 +3134,7 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let Some(buf) = self.array_buffers.get_mut(&info.buffer) else {
-            return Err(v);
-        };
-        let dst = &mut buf[start..start + es];
-        // The integer conversions of `TaKind::write`, without its `Vec`: modulo 2^32 (a plain
-        // `as i64` saturates at |n| >= 2^63, so 1e20 would store -1 instead of 0).
-        let int = |n: f64| {
-            if !n.is_finite() {
-                0
-            } else if n.abs() < 9223372036854775808.0 {
-                n.trunc() as i64
-            } else {
-                n.trunc().rem_euclid(4294967296.0) as i64
-            }
-        };
-        match info.kind {
-            TaKind::I8 | TaKind::U8 => dst[0] = int(n) as u8,
-            TaKind::I16 | TaKind::U16 => dst.copy_from_slice(&(int(n) as u16).to_le_bytes()),
-            TaKind::I32 | TaKind::U32 => dst.copy_from_slice(&(int(n) as u32).to_le_bytes()),
-            TaKind::F32 => dst.copy_from_slice(&(n as f32).to_le_bytes()),
-            TaKind::F64 => dst.copy_from_slice(&n.to_le_bytes()),
-            k => dst.copy_from_slice(&k.write(n)),
-        }
+        info.kind.write(n, &mut store.bytes_mut()[start..start + es]);
         Ok(())
     }
 
@@ -4866,18 +4803,7 @@ impl Interp {
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
         let buflen = self.array_buffers.get(&info.buffer)?.len();
-        let es = info.kind.elsize();
-        if info.track {
-            if info.offset > buflen {
-                None
-            } else {
-                Some((buflen - info.offset) / es)
-            }
-        } else if info.offset + info.len * es > buflen {
-            None
-        } else {
-            Some(info.len)
-        }
+        span_len(buflen, info.offset, info.kind.elsize(), info.len, info.track)
     }
 
     /// Classify a property key against a TypedArray's integer-index exotic behavior: a valid
@@ -5068,7 +4994,7 @@ impl Interp {
         self.gc_tick = self.gc_tick.wrapping_add(1);
         if self.gc_tick & GC_CALL_POLL_MASK == 0
             || self.terminating
-            || crate::bytebuf::gc_pressure()
+            || lumen_common::buffer::gc_pressure()
         {
             self.gc_check()
         } else {
@@ -5089,11 +5015,11 @@ impl Interp {
         }
         crate::value::gc_trim_emptied();
         let before = crate::value::live_objects();
-        if before <= self.gc_next && !crate::bytebuf::gc_pressure() {
+        if before <= self.gc_next && !lumen_common::buffer::gc_pressure() {
             return Ok(());
         }
         self.gc_collect();
-        crate::bytebuf::after_gc();
+        lumen_common::buffer::after_gc();
         let live = crate::value::live_objects();
 
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
@@ -5182,7 +5108,7 @@ impl Interp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.gc_collect();
-            crate::bytebuf::after_gc();
+            lumen_common::buffer::after_gc();
             let used = crate::fastalloc::heap_bytes().unwrap_or(0);
             if used.saturating_add(extra) <= self.heap_ceiling {
                 return Ok(());

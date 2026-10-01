@@ -340,7 +340,7 @@ impl Interp {
                 IterState::Zip { .. } => t.zip.clone(),
                 IterState::Map { .. } => t.map.clone(),
                 IterState::Filter { .. } => t.filter.clone(),
-                IterState::Native(_) | IterState::Empty => t.iterator.clone(),
+                IterState::Native(_) | IterState::Running | IterState::Empty => t.iterator.clone(),
             },
             Kind::Property(_) => t.property.clone(),
             Kind::StaticMethod(_) => t.staticmethod.clone(),
@@ -712,6 +712,10 @@ impl Interp {
                 Value::None
             }
             "__subclasses__" => return None,
+            "__type_params__" => match cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__type_params__")) {
+                Some(v) => v,
+                None => Value::tuple(Vec::new()),
+            },
             _ => return None,
         })
     }
@@ -833,6 +837,9 @@ impl Interp {
                         }
                     }));
                 }
+                "__type_params__" => {
+                    return Ok(Some(f.type_params.borrow().clone().unwrap_or_else(|| Value::tuple(Vec::new()))));
+                }
                 "__dict__" => {
                     let d = self.instance_dict(o);
                     return Ok(Some(Value::Obj(d)));
@@ -848,10 +855,21 @@ impl Interp {
                 }
                 _ => {}
             },
-            Kind::Native(n) => match nm {
-                "__name__" | "__qualname__" => return Ok(Some(Value::str(n.name))),
-                "__doc__" => return Ok(Some(Value::None)),
-                "__module__" => return Ok(Some(Value::str("builtins"))),
+            Kind::Native(n) => match (nm, n.desc) {
+                ("__name__", _) => return Ok(Some(Value::str(n.name))),
+                ("__qualname__", Some(d)) if d.class().is_some() => {
+                    return Ok(Some(Value::string(format!("{}.{}", crate::bind::args::class_name(d), n.name))));
+                }
+                ("__qualname__", _) => return Ok(Some(Value::str(n.name))),
+                ("__doc__", Some(d)) => return Ok(Some(d.doc.map(Value::str).unwrap_or(Value::None))),
+                ("__doc__", None) => return Ok(Some(Value::None)),
+                ("__text_signature__", d) => {
+                    return Ok(Some(d.and_then(crate::bind::args::text_signature).map(Value::string).unwrap_or(Value::None)))
+                }
+                ("__module__", Some(d)) if d.class().is_none() && d.module().is_some() => {
+                    return Ok(Some(Value::str(d.module().unwrap_or("builtins"))))
+                }
+                ("__module__", _) => return Ok(Some(Value::str("builtins"))),
                 _ => {}
             },
             Kind::Generator(g) => match nm {
@@ -1020,6 +1038,10 @@ impl Interp {
                 match &dobj.kind {
                     Kind::Property(p) => {
                         if p.fset.is_none() {
+                            if let Some(owner) = native_getter_owner(&p.fget) {
+                                let msg = format!("attribute '{}' of '{}' objects is not writable", nm, owner);
+                                return Err(self.new_exc_str("AttributeError", &msg));
+                            }
                             let msg = format!("property '{}' of '{}' object has no setter", nm, self.type_name(cls));
                             return Err(self.new_exc_str("AttributeError", &msg));
                         }
@@ -1102,6 +1124,12 @@ impl Interp {
                         *f.defaults.borrow_mut() = v.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
                     }
                     "__annotations__" => *f.annotations.borrow_mut() = v.as_obj().cloned(),
+                    "__type_params__" => {
+                        if v.tuple_items().is_none() {
+                            return Err(self.type_error("__type_params__ must be set to a tuple"));
+                        }
+                        *f.type_params.borrow_mut() = Some(v);
+                    }
                     _ => {
                         let dd = self.instance_dict(o);
                         dict_set_name(&dd, name, v);
@@ -1228,6 +1256,10 @@ impl Interp {
                 match &dobj.kind {
                     Kind::Property(p) => {
                         if p.fdel.is_none() {
+                            if let Some(owner) = native_getter_owner(&p.fget) {
+                                let msg = format!("attribute '{}' of '{}' objects is not writable", nm, owner);
+                                return Err(self.new_exc_str("AttributeError", &msg));
+                            }
                             let msg = format!("property '{}' of '{}' object has no deleter", nm, self.type_name(cls));
                             return Err(self.new_exc_str("AttributeError", &msg));
                         }
@@ -1353,7 +1385,7 @@ impl Interp {
             Layout::Dict => Kind::Dict(RefCell::new(PyDict::new())),
             Layout::Set => Kind::Set(RefCell::new(PyDict::new_set())),
             Layout::FrozenSet => Kind::FrozenSet(RefCell::new(PyDict::new_set())),
-            Layout::ByteArray => Kind::ByteArray(RefCell::new(Vec::new())),
+            Layout::ByteArray => Kind::ByteArray(ba_store(Vec::new())),
             Layout::Exception => Kind::Exception(RefCell::new(ExcData {
                 args: Value::tuple(Vec::new()),
                 cause: None,
@@ -1623,11 +1655,17 @@ impl Interp {
         }
         self.call_body(&func, &ns)?;
         let cell = dict_del_str(&ns, "__classcell__");
+        let dict_cell = dict_del_str(&ns, "__classdictcell__");
         let mut cargs = vec![Value::str(&name), Value::tuple(base_vals), Value::Obj(ns)];
         let cls = self.call(&meta_val, std::mem::take(&mut cargs), kw)?;
         if let Some(Value::Obj(c)) = cell {
             if let Kind::Cell(cc) = &c.kind {
                 *cc.borrow_mut() = Some(cls.clone());
+            }
+        }
+        if let (Some(Value::Obj(c)), Value::Obj(co)) = (dict_cell, &cls) {
+            if let (Kind::Cell(cc), Some(d)) = (&c.kind, co.dict.borrow().clone()) {
+                *cc.borrow_mut() = Some(Value::Obj(d));
             }
         }
         Ok(cls)
@@ -1721,7 +1759,7 @@ impl Interp {
     }
 
     pub fn new_native(&self, name: &'static str, f: NativeFn, method: bool) -> Value {
-        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method })))
+        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method, desc: None })))
     }
 
     pub fn reg(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
@@ -1764,5 +1802,17 @@ impl Interp {
 
     pub fn module_globals(&self) -> Obj {
         self.frames.last().map(|f| f.globals.clone()).unwrap_or_else(|| self.builtins.clone())
+    }
+}
+
+/// The class of a native `#[getter]` property (CPython's `getset_descriptor`, whose write
+/// errors read `attribute 'x' of 'mod.Cls' objects is not writable`).
+fn native_getter_owner(fget: &Value) -> Option<String> {
+    match fget {
+        Value::Obj(o) => match &o.kind {
+            Kind::Native(n) => n.desc.filter(|d| d.role == lumen_bind::Role::Getter).map(crate::bind::owner_of),
+            _ => None,
+        },
+        _ => None,
     }
 }

@@ -4,6 +4,7 @@ use super::numeric::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
 use crate::vm::*;
+use lumen_common::smuggle::{code_points, may_contain};
 use std::rc::Rc;
 
 type Kw<'a> = &'a [(Obj, Value)];
@@ -72,92 +73,11 @@ fn str_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 
 impl Interp {
     pub fn decode_bytes(&mut self, data: &[u8], enc: &str, errors: &str) -> R<String> {
-        let e = enc.to_ascii_lowercase().replace('_', "-");
-        match e.as_str() {
-            "utf-8" | "utf8" => match std::str::from_utf8(data) {
-                Ok(s) => Ok(s.to_string()),
-                Err(err) => match errors {
-                    "ignore" => Ok(String::from_utf8_lossy(data).replace('\u{FFFD}', "")),
-                    "replace" => Ok(String::from_utf8_lossy(data).into_owned()),
-                    _ => {
-                        let pos = err.valid_up_to();
-                        let byte = data[pos];
-                        let exc = self.new_exc_str(
-                            "UnicodeDecodeError",
-                            &format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: invalid start byte", byte, pos),
-                        );
-                        Err(exc)
-                    }
-                },
-            },
-            "ascii" | "us-ascii" => {
-                let mut out = String::new();
-                for (i, &b) in data.iter().enumerate() {
-                    if b < 128 {
-                        out.push(b as char);
-                    } else {
-                        match errors {
-                            "ignore" => {}
-                            "replace" => out.push('\u{FFFD}'),
-                            _ => {
-                                return Err(self.new_exc_str(
-                                    "UnicodeDecodeError",
-                                    &format!("'ascii' codec can't decode byte 0x{:02x} in position {}: ordinal not in range(128)", b, i),
-                                ))
-                            }
-                        }
-                    }
-                }
-                Ok(out)
-            }
-            "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" => Ok(data.iter().map(|&b| b as char).collect()),
-            _ => Err(self.new_exc_str("LookupError", &format!("unknown encoding: {}", enc))),
-        }
+        crate::codecs::decode(self, data, enc, errors)
     }
 
     pub fn encode_str(&mut self, s: &str, enc: &str, errors: &str) -> R<Vec<u8>> {
-        let e = enc.to_ascii_lowercase().replace('_', "-");
-        match e.as_str() {
-            "utf-8" | "utf8" => Ok(s.as_bytes().to_vec()),
-            "ascii" | "us-ascii" | "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" => {
-                let limit = if e.contains("ascii") { 128 } else { 256 };
-                let name = if e.contains("ascii") { "ascii" } else { "latin-1" };
-                let mut out = Vec::new();
-                for (i, c) in s.chars().enumerate() {
-                    if (c as u32) < limit {
-                        out.push(c as u32 as u8);
-                    } else {
-                        match errors {
-                            "ignore" => {}
-                            "replace" => out.push(b'?'),
-                            "backslashreplace" => out.extend(crate::repr::ascii_escape(&c.to_string()).bytes()),
-                            "xmlcharrefreplace" => out.extend(format!("&#{};", c as u32).bytes()),
-                            _ => {
-                                let r = crate::repr::ascii_escape(&c.to_string());
-                                return Err(self.new_exc_str(
-                                    "UnicodeEncodeError",
-                                    &format!("'{}' codec can't encode character '{}' in position {}: ordinal not in range({})", name, r, i, limit),
-                                ));
-                            }
-                        }
-                    }
-                }
-                Ok(out)
-            }
-            "utf-16" | "utf16" | "utf-16-le" => {
-                let mut out = Vec::new();
-                if e == "utf-16" || e == "utf16" {
-                    out.extend([0xff, 0xfe]);
-                }
-                for u in s.encode_utf16() {
-                    out.extend(u.to_le_bytes());
-                }
-                Ok(out)
-            }
-            "utf-16-be" => Ok(s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()),
-            "utf-32" | "utf-32-le" => Ok(s.chars().flat_map(|c| (c as u32).to_le_bytes()).collect()),
-            _ => Err(self.new_exc_str("LookupError", &format!("unknown encoding: {}", enc))),
-        }
+        crate::codecs::encode(self, s, enc, errors)
     }
 }
 
@@ -241,20 +161,44 @@ fn swapcase(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn strip_impl(it: &mut Interp, a: &[Value], name: &str, left: bool, right: bool) -> R<Value> {
     it.check_args(&format!("str.{}", name), a, 1, 2)?;
     let s = this(it, a, name)?;
-    let chars: Option<Vec<char>> = match a.get(1) {
+    let chars: Option<Vec<u32>> = match a.get(1) {
         Some(Value::None) | None => None,
-        Some(v) => Some(str_arg(it, v, name).map(|x| x.chars().collect())?),
+        Some(v) => Some(str_arg(it, v, name).map(|x| code_points(x).collect())?),
     };
-    let pred = |c: char| match &chars {
-        None => is_py_space(c),
+    let pred = |c: u32| match &chars {
+        None => char::from_u32(c).is_some_and(is_py_space),
         Some(set) => set.contains(&c),
     };
     let mut t: &str = &s.s;
-    if left {
-        t = t.trim_start_matches(pred);
-    }
-    if right {
-        t = t.trim_end_matches(pred);
+    if may_contain(t) {
+        let (mut a, mut b) = (0, t.len());
+        let mut cps = code_points(t);
+        let mut first = true;
+        while let Some(c) = cps.next() {
+            if pred(c) {
+                if first && left {
+                    a = cps.offset();
+                }
+            } else {
+                first = false;
+                b = cps.offset();
+            }
+        }
+        if first {
+            b = a;
+        }
+        if !right {
+            b = t.len();
+        }
+        t = &t[a..b];
+    } else {
+        let pred = |c: char| pred(c as u32);
+        if left {
+            t = t.trim_start_matches(pred);
+        }
+        if right {
+            t = t.trim_end_matches(pred);
+        }
     }
     if t.len() == s.s.len() && a[0].as_str().is_some() && matches!(&a[0], Value::Obj(o) if o.cls.is_none()) {
         return Ok(a[0].clone());
@@ -519,17 +463,17 @@ fn opt_range(it: &mut Interp, a: &[Value], from: usize, nchars: usize) -> R<(usi
     let get = |it: &mut Interp, v: Option<&Value>, dflt: i64| -> R<i64> {
         match v {
             None | Some(Value::None) => Ok(dflt),
-            Some(v) => it.index_of(v),
+            Some(v) => it.slice_index(v),
         }
     };
     let n = nchars as i64;
     let mut s = get(it, a.get(from), 0)?;
     let mut e = get(it, a.get(from + 1), n)?;
     if s < 0 {
-        s = (s + n).max(0);
+        s = s.saturating_add(n).max(0);
     }
     if e < 0 {
-        e = (e + n).max(0);
+        e = e.saturating_add(n).max(0);
     }
     Ok((s.min(n + 1) as usize, e.min(n) as usize))
 }
@@ -552,7 +496,7 @@ fn find_impl(it: &mut Interp, a: &[Value], name: &str, right: bool, raise: bool)
         let be = s.byte_offset(en);
         let hay = &s.s[bs..be];
         let pos = if right { hay.rfind(sub) } else { hay.find(sub) };
-        pos.map(|p| if s.ascii { bs + p } else { s.s[..bs + p].chars().count() })
+        pos.map(|p| if s.ascii { bs + p } else { lumen_common::smuggle::count_code_points(&s.s[..bs + p]) })
     };
     match found {
         Some(i) => Ok(Value::Int(i as i64)),
@@ -595,7 +539,7 @@ fn count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     }
     let hay = s.slice(st, en);
     if sub.is_empty() {
-        return Ok(Value::Int(hay.chars().count() as i64 + 1));
+        return Ok(Value::Int(lumen_common::smuggle::count_code_points(hay) as i64 + 1));
     }
     Ok(Value::Int(hay.matches(sub).count() as i64))
 }
@@ -746,11 +690,11 @@ fn isidentifier(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::Bool(ok))
 }
 
-fn fill_arg(it: &mut Interp, a: &[Value], idx: usize) -> R<char> {
+fn fill_arg(it: &mut Interp, a: &[Value], idx: usize) -> R<String> {
     match a.get(idx) {
-        None => Ok(' '),
+        None => Ok(" ".into()),
         Some(v) => match v.as_str() {
-            Some(s) if s.chars().count() == 1 => Ok(s.chars().next().unwrap_or(' ')),
+            Some(s) if lumen_common::smuggle::count_code_points(s) == 1 => Ok(s.to_string()),
             _ => Err(it.type_error("The fill character must be exactly one character long")),
         },
     }
@@ -766,7 +710,7 @@ fn justify(it: &mut Interp, a: &[Value], name: &str, mode: u8) -> R<Value> {
         return Ok(Value::str(&s.s));
     }
     let total = (width - n) as usize;
-    it.check_str_len(total.saturating_mul(fill.len_utf8()).saturating_add(s.s.len()))?;
+    it.check_str_len(total.saturating_mul(fill.len()).saturating_add(s.s.len()))?;
     let (l, r) = match mode {
         0 => (0, total),
         1 => (total, 0),
@@ -775,10 +719,9 @@ fn justify(it: &mut Interp, a: &[Value], name: &str, mode: u8) -> R<Value> {
             (left, total - left)
         }
     };
-    let mut out = String::new();
-    out.extend(std::iter::repeat_n(fill, l));
+    let mut out = fill.repeat(l);
     out.push_str(&s.s);
-    out.extend(std::iter::repeat_n(fill, r));
+    out.push_str(&fill.repeat(r));
     Ok(Value::string(out))
 }
 
@@ -896,7 +839,7 @@ fn maketrans(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         };
         for (k, v) in items {
             let key = match k.as_str() {
-                Some(s) if s.chars().count() == 1 => Value::Int(s.chars().next().map(|c| c as i64).unwrap_or(0)),
+                Some(s) if lumen_common::smuggle::count_code_points(s) == 1 => Value::Int(lumen_common::smuggle::code_points(s).next().unwrap_or(0) as i64),
                 Some(_) => return Err(it.value_error("string keys in translate table must be of length 1")),
                 None => k,
             };
@@ -904,8 +847,8 @@ fn maketrans(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         }
         return Ok(Value::Obj(d));
     }
-    let x: Vec<char> = a[0].as_str().unwrap_or("").chars().collect();
-    let y: Vec<char> = a[1].as_str().unwrap_or("").chars().collect();
+    let x: Vec<u32> = lumen_common::smuggle::code_points(a[0].as_str().unwrap_or("")).collect();
+    let y: Vec<u32> = lumen_common::smuggle::code_points(a[1].as_str().unwrap_or("")).collect();
     if x.len() != y.len() {
         return Err(it.value_error("the first two maketrans arguments must have equal length"));
     }
@@ -913,7 +856,7 @@ fn maketrans(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         it.dict_set(&d, Value::Int(*p as i64), Value::Int(*q as i64))?;
     }
     if let Some(z) = a.get(2) {
-        for c in z.as_str().unwrap_or("").chars() {
+        for c in lumen_common::smuggle::code_points(z.as_str().unwrap_or("")) {
             it.dict_set(&d, Value::Int(c as i64), Value::None)?;
         }
     }
@@ -924,20 +867,21 @@ fn translate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("translate", a, 2, 2)?;
     let s = this(it, a, "translate")?.s.clone();
     let mut out = String::new();
-    for c in s.chars() {
+    for c in lumen_common::smuggle::code_points(&s) {
         match it.getitem(&a[1], &Value::Int(c as i64)) {
             Ok(Value::None) => {}
-            Ok(Value::Int(i)) => match char::from_u32(i as u32) {
-                Some(ch) => out.push(ch),
-                None => return Err(it.value_error("character mapping must be in range(0x110000)")),
-            },
+            Ok(Value::Int(i)) => {
+                if !u32::try_from(i).is_ok_and(|i| lumen_common::smuggle::push_code_point(&mut out, i)) {
+                    return Err(it.value_error("character mapping must be in range(0x110000)"));
+                }
+            }
             Ok(v) => match v.as_str() {
                 Some(r) => out.push_str(r),
                 None => return Err(it.type_error("character mapping must return integer, None or str")),
             },
             Err(e) => {
                 if it.exc_is(&e, "LookupError") {
-                    out.push(c);
+                    lumen_common::smuggle::push_code_point(&mut out, c);
                 } else {
                     return Err(e);
                 }

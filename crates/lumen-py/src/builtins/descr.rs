@@ -193,10 +193,6 @@ fn function_closure(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(it.special_attr(&a[0], "__closure__")?.unwrap_or(Value::None))
 }
 
-fn memoryview_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    super::bytesm::memoryview_fn()(it, &a[1.min(a.len())..], kw)
-}
-
 fn call_forward(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     if a.is_empty() {
         return Err(it.type_error("descriptor '__call__' needs an argument"));
@@ -246,10 +242,7 @@ pub fn init(it: &mut Interp) {
     for ty in [it.types.function.clone(), it.types.method.clone(), it.types.builtin_function.clone()] {
         it.reg(&ty, "__call__", call_forward);
     }
-    let mv = new_type(it, "builtins", "memoryview", None, Layout::Other);
-    it.reg_new(&mv, memoryview_new);
-    let b = it.builtins.clone();
-    set_type(&b, "memoryview", &mv);
+    super::memview::init(it);
     let getset = new_type(it, "builtins", "getset_descriptor", None, Layout::Other);
     let member = new_type(it, "builtins", "member_descriptor", None, Layout::Other);
     let func = it.types.function.clone();

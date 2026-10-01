@@ -12,12 +12,13 @@ license.workspace = true
 [dependencies]
 lumen-codegen = { path = "../lumen-codegen" }
 lumen-common = { path = "../lumen-common" }
-# The binding macros (`#[lumen::op]`, `#[lumen::class]`, `#[lumen::methods]`); a no-deps
-# proc-macro crate, only pulled in by the `macros` feature.
-lumen-macros = { path = "../lumen-macros", optional = true }
+# The language-neutral binding framework (`#[lumen_bind::op]`, `#[class]`, `#[module]`); the
+# JS host lives in `embed_convert`. Only pulled in by the `embed` feature.
+lumen-bind = { path = "../lumen-bind", optional = true }
 
 [dev-dependencies]
 lumen-common = { path = "../lumen-common", features = ["test-support"] }
+lumen-bind = { path = "../lumen-bind" }
 
 [features]
 default = ["intl", "typed"]
@@ -33,10 +34,8 @@ intl = []
 # The curated embedder surface (`lumen::embed`: Ctx, host state, define_global, event-loop
 # hooks) used by the lumen-host/lumen-runtime crates. Off by default: everything under it is a
 # public-API commitment on a published crate, gated until it stabilizes with those crates.
-embed = []
-# `#[lumen::op]`, `#[lumen::class]`, `#[lumen::methods]` over the `embed` surface (see
-# `lumen::embed::FromJs` / `IntoJs`). Implies `embed`.
-macros = ["embed", "dep:lumen-macros"]
+# Includes the JS host of `lumen-bind` (`lumen::embed::JsHost`).
+embed = ["dep:lumen-bind"]
 # Exposes internal compilation stages (`lumen::bench_api`) for the `internals` benchmark. Not a
 # stability commitment — for measurement only.
 bench = []

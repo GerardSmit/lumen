@@ -1641,14 +1641,7 @@ fn uri_decode(s: &str, preserve: &str) -> Option<String> {
         }
         let decoded = std::str::from_utf8(&buf[..cont + 1]).ok()?;
         for c in decoded.chars() {
-            let cp = c as u32;
-            if cp >= crate::jstr::SMUGGLE_BASE {
-                // A real code point in the lone-surrogate smuggle range must take the
-                // engine's smuggled-pair representation (see jstr).
-                out.push_str(&crate::jstr::from_code_points(&[cp]));
-            } else {
-                out.push(c);
-            }
+            crate::jstr::push_char_utf16(&mut out, c);
         }
     }
     Some(out)
@@ -8794,11 +8787,7 @@ fn install_string(it: &mut Interp) {
                 // A lone surrogate is a valid argument: smuggle it (see `jstr`).
                 s.push(crate::jstr::smuggle(cp as u16));
             } else if cp >= crate::jstr::SMUGGLE_BASE {
-                // A smuggle-range character is canonically its smuggled pair.
-                let hi = 0xD800 + ((cp - 0x10000) >> 10);
-                let lo = 0xDC00 + ((cp - 0x10000) & 0x3FF);
-                s.push(crate::jstr::smuggle(hi as u16));
-                s.push(crate::jstr::smuggle(lo as u16));
+                crate::jstr::push_char_utf16(&mut s, char::from_u32(cp).unwrap_or('\u{FFFD}'));
             } else {
                 s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
             }

@@ -349,7 +349,37 @@ const ASCII_PUNCT: [(&str, char); 31] = [
     ("LATIN CAPITAL LETTER A WITH DIAERESIS", '\u{c4}'),
 ];
 
-fn lookup_name(name: &str) -> Option<char> {
+/// The Unicode name of `c`, from the same partial table `\N{...}` uses (no full names database
+/// yet); `None` for characters it does not cover and for control characters, which have none.
+pub(crate) fn char_name(c: char) -> Option<String> {
+    let u = c as u32;
+    if u < 0x20 || (0x7f..0xa0).contains(&u) {
+        return None;
+    }
+    if c == '\u{feff}' {
+        return Some("ZERO WIDTH NO-BREAK SPACE".into());
+    }
+    if let Some((n, _)) = NAMES.iter().chain(ASCII_PUNCT.iter()).find(|(_, ch)| *ch == c) {
+        return Some(n.to_string());
+    }
+    match c {
+        'a'..='z' => Some(format!("LATIN SMALL LETTER {}", c.to_ascii_uppercase())),
+        'A'..='Z' => Some(format!("LATIN CAPITAL LETTER {c}")),
+        '0'..='9' => Some(format!("DIGIT {}", DIGITS[(u - 0x30) as usize])),
+        '\u{391}'..='\u{3a9}' | '\u{3b1}'..='\u{3c9}' if u != 0x3a2 && u != 0x3c2 => {
+            let (case, base) = if u >= 0x3b1 { ("SMALL", 0x3b1) } else { ("CAPITAL", 0x391) };
+            let idx = u - base;
+            let idx = if idx > 17 { idx - 1 } else { idx };
+            Some(format!("GREEK {case} LETTER {}", GREEK[idx as usize]))
+        }
+        '\u{4e00}'..='\u{9fff}' | '\u{3400}'..='\u{4dbf}' | '\u{20000}'..='\u{2a6df}' => {
+            Some(format!("CJK UNIFIED IDEOGRAPH-{u:04X}"))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn lookup_name(name: &str) -> Option<char> {
     let up = name.to_ascii_uppercase();
     if let Some((_, c)) = NAMES
         .iter()
@@ -460,7 +490,7 @@ pub(crate) fn decode_str(s: &[char], raw: bool) -> Result<String, String> {
                             .into(),
                     );
                 }
-                out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                lumen_common::smuggle::push_code_point(&mut out, v);
             }
             'N' => {
                 let close = (s.get(i) == Some(&'{'))

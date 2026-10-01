@@ -1,0 +1,40 @@
+3 ident ident
+TypeVar T T None ()
+False False True typing
+True True
+True
+()
+['TypeVar', 'TypeVar', 'TypeVar', 'TypeVarTuple', 'ParamSpec']
+A B C Ts P
+<class 'int'> (<class 'str'>, <class 'bytes'>) None ()
+P.args P.kwargs True True False
+P.kwargs
+(1, 2) (5, 6) (1,) {'b': 2}
+NameError name 'Undefined' is not defined
+<class 'int'>
+Outer.method 7 Outer.amethod
+nested.<locals>.inner T
+('outer', 'T')
+decorating decorated (X, Y)
+TypeAliasType Alias Alias Alias __main__
+list[int] () ()
+<class 'dict'>
+(K, V) (K, V) tuple[K, V]
+Pair[int, str] GenericAlias
+TypeError Only generic type aliases are subscriptable
+list[Rec[T]]
+Alias | int int | Alias (Alias, <class 'NoneType'>)
+Alias
+5
+<class 'int'>
+True
+1
+T
+SyntaxError: duplicate type parameter 'T'
+SyntaxError: duplicate type parameter 'T'
+SyntaxError: duplicate type parameter 'T'
+SyntaxError: named expression cannot be used within a TypeVar bound
+SyntaxError: yield expression cannot be used within a type alias
+SyntaxError: named expression cannot be used within the definition of a generic
+SyntaxError: yield expression cannot be used within a TypeVar bound
+SyntaxError: cannot use bound with TypeVarTuple

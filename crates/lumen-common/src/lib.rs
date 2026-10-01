@@ -4,6 +4,7 @@
 //! are off by default so the engine itself carries no dependencies.
 
 pub mod bigint;
+pub mod buffer;
 pub mod civil;
 pub mod codec;
 #[cfg(feature = "compress")]
@@ -11,10 +12,14 @@ pub mod compress;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;
 pub mod fasthash;
+pub mod float;
+pub mod float16;
 #[cfg(feature = "hash")]
 pub mod hash;
 pub mod limits;
 pub mod memcat;
+pub mod mt19937;
+pub mod native;
 pub mod stack;
 pub mod regex;
 pub mod smuggle;

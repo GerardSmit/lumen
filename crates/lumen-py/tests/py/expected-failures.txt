@@ -1,10 +1,15 @@
-stdlib/asyncio_basic.py
-stdlib/asyncio_mod.py
+# Blocked on the missing os/posix module.
+# typing -> contextlib -> `import os`
+classes/pep695_classes.py
+stdlib/enum_typing.py
+stdlib/typing_enum.py
+stdlib/typing_features.py
+# random -> `from os import urandom`
+stdlib/random_basic.py
+stdlib/random_mod.py
+# dataclasses -> inspect -> ast (needs _ast), dis, os
 stdlib/dataclasses_basic.py
 stdlib/dataclasses_mod.py
-stdlib/enum_typing.py
-stdlib/json_basic.py
-stdlib/json_mod.py
-stdlib/re_basic.py
-stdlib/re_mod.py
-stdlib/typing_enum.py
+# asyncio is not vendored; it needs os, socket, select and selectors
+stdlib/asyncio_basic.py
+stdlib/asyncio_mod.py

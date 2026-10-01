@@ -40,3 +40,25 @@ Report the findings and resolve them (or schedule a pass to resolve them) as par
 - Correctness is checked against CPython: the corpus (`cargo test -p lumen-py --test corpus`),
   CPython's own test suite (`crates/cpython-test-runner`, checkout via `scripts/cpython-fetch.sh`),
   and differential runs against a local `python3`.
+
+## Native bindings (`crates/lumen-bind`)
+
+- Every native, in every language, is a typed Rust fn/struct declared once with `lumen_bind`
+  attributes; each host (JS, Python) exposes every declaration and derives its own names, arity,
+  `__text_signature__` / `length` and argument errors. Never hand-write argument parsing or
+  per-language registration tables for new natives. Porting guide: `crates/lumen-bind/src/lib.rs`.
+- `only(..)` / `skip(..)` / `rename(..)` are rare opt-outs; per-host extras go in `hint(py(..))`.
+
+```rust
+#[lumen_bind::module(name = "geometry")]
+pub mod geometry {
+    use super::*;
+
+    /// `clamp(x, /, lo=0.0, *, hi)` in Python, `geometry.clamp(x, lo, hi)` in JS.
+    #[op]
+    pub fn clamp(x: f64, #[kw] #[default(0.0)] lo: f64, #[kwonly] hi: f64) -> NativeResult<f64> {
+        if lo > hi { return Err(NativeError::value_error("lo > hi")); }
+        Ok(x.max(lo).min(hi))
+    }
+}
+```

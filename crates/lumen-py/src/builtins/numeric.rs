@@ -110,7 +110,7 @@ pub fn parse_float_str(s: &str) -> Option<f64> {
                 c.set(v + 1);
                 v
             });
-            return Some(f64::from_bits(0x7ff8_0000_0000_0000 | (n << 3)));
+            return Some(sgn(f64::from_bits(0x7ff8_0000_0000_0000 | (n << 3))));
         }
         _ => {}
     }
@@ -153,7 +153,7 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
             Value::Obj(o) => match &o.kind {
                 Kind::Str(s) => s.s.to_string(),
                 Kind::Bytes(bs) => String::from_utf8_lossy(bs).into_owned(),
-                Kind::ByteArray(bs) => String::from_utf8_lossy(&bs.borrow()).into_owned(),
+                Kind::ByteArray(bs) => String::from_utf8_lossy(&bs.bytes()).into_owned(),
                 _ => return Err(it.type_error("int() can't convert non-string with explicit base")),
             },
             _ => return Err(it.type_error("int() can't convert non-string with explicit base")),
@@ -188,7 +188,7 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
             Kind::Bytes(_) | Kind::ByteArray(_) => {
                 let raw = match &o.kind {
                     Kind::Bytes(bs) => bs.clone(),
-                    Kind::ByteArray(bs) => bs.borrow().clone(),
+                    Kind::ByteArray(bs) => bs.to_vec(),
                     _ => Vec::new(),
                 };
                 let text = String::from_utf8_lossy(&raw).into_owned();

@@ -13,22 +13,15 @@ use std::time::Duration;
 
 use lumen_host::time::Instant;
 
-use lumen_host::{ops, CallbackQueue, Ctx, Extension, Value};
+use lumen::embed::{NativeError, OpError};
+use lumen_host::{CallbackQueue, Ctx, Extension, Value};
 
 /// The extension a runtime installs: the five timer globals plus the [`Timers`] state.
 pub fn extension() -> Extension {
     Extension {
         name: "timers",
-        globals: ops![
-            "setTimeout" (2) => op_set_timeout,
-            "setInterval" (2) => op_set_interval,
-            "clearTimeout" (1) => op_clear_timer,
-            "clearInterval" (1) => op_clear_timer,
-            "setImmediate" (1) => op_set_immediate,
-            // Node's Timeout handle methods, wrapped by the node:timers glue.
-            "__timerSetRef" (2) => op_timer_set_ref,
-            "__timerRefresh" (1) => op_timer_refresh,
-        ],
+        modules: &[lumen_host::globals::<globals::Module>],
+        globals: &[],
         namespaces: &[],
         state_init: Some(|state| state.put(Timers::default())),
         js_init: None,
@@ -189,86 +182,83 @@ impl Timers {
 
 /// WHATWG timer-initialization steps, abridged: coerce the delay (NaN/negative -> 0), stash
 /// callback + extra args, return the id as a Number.
-fn schedule_op(ctx: &mut Ctx, args: &[Value], repeat: bool) -> Result<Value, Value> {
-    let callback = match args.first() {
-        Some(cb) if cb.is_callable() => cb.clone(),
-        _ => {
-            let kind = if repeat { "setInterval" } else { "setTimeout" };
-            return Err(ctx.make_error("TypeError", format!("{kind} expects a function")));
-        }
-    };
-    let ms = match args.get(1) {
-        Some(v) => ctx.coerce_number(v)?,
-        None => 0.0,
-    };
-    let delay = Duration::from_millis(if ms.is_finite() && ms > 0.0 {
-        ms as u64
-    } else {
-        0
-    });
-    let extra: Vec<Value> = args.iter().skip(2).cloned().collect();
+fn schedule(ctx: &mut Ctx, callback: Value, delay: Value, args: &[Value], repeat: bool) -> Result<f64, OpError> {
+    if !callback.is_callable() {
+        let kind = if repeat { "setInterval" } else { "setTimeout" };
+        return Err(NativeError::type_error(format!("{kind} expects a function")).into());
+    }
+    let ms = ctx.coerce_number(&delay)?;
+    let delay = Duration::from_millis(if ms.is_finite() && ms > 0.0 { ms as u64 } else { 0 });
     let timers = ctx.host_mut::<Timers>().expect("timers state installed");
-    let id = timers.schedule(callback, extra, delay, repeat);
-    Ok(Value::Num(id as f64))
+    Ok(timers.schedule(callback, args.to_vec(), delay, repeat) as f64)
 }
 
-fn op_set_timeout(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    schedule_op(ctx, args, false)
-}
-
-fn op_set_interval(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    schedule_op(ctx, args, true)
+/// A timer id argument; `None` for ids that name no timer (non-numeric, negative, NaN).
+fn timer_id(ctx: &mut Ctx, id: &Value) -> Result<Option<u64>, Value> {
+    if matches!(id, Value::Undefined) {
+        return Ok(None);
+    }
+    let id = ctx.coerce_number(id)?;
+    Ok((id.is_finite() && id >= 0.0).then_some(id as u64))
 }
 
 /// Shared by `clearTimeout`/`clearInterval` (per spec either clears either kind). Unknown or
 /// non-numeric ids are ignored.
-fn op_clear_timer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    if let Some(v) = args.first() {
-        let id = ctx.coerce_number(v)?;
-        if id.is_finite() && id >= 0.0 {
-            let timers = ctx.host_mut::<Timers>().expect("timers state installed");
-            timers.clear(id as u64);
-        }
+fn clear_timer(ctx: &mut Ctx, id: &Value) -> Result<(), Value> {
+    if let Some(id) = timer_id(ctx, id)? {
+        ctx.host_mut::<Timers>().expect("timers state installed").clear(id);
     }
-    Ok(Value::Undefined)
+    Ok(())
 }
 
-fn timer_id_arg(ctx: &mut Ctx, args: &[Value]) -> Result<Option<u64>, Value> {
-    match args.first() {
-        Some(v) => {
-            let id = ctx.coerce_number(v)?;
-            Ok((id.is_finite() && id >= 0.0).then_some(id as u64))
-        }
-        None => Ok(None),
+/// The timer globals; `__timerSetRef` / `__timerRefresh` are Node's Timeout handle methods,
+/// wrapped by the node:timers glue.
+#[lumen_bind::module(name = "timers")]
+mod globals {
+    use super::*;
+
+    #[op(name = "setTimeout")]
+    fn set_timeout(ctx: &mut Ctx, callback: Value, delay: Value, #[varargs] args: &[Value]) -> Result<f64, OpError> {
+        schedule(ctx, callback, delay, args, false)
     }
-}
 
-/// `(id, refed)` — Node's `timer.ref()`/`unref()`; returns whether the timer is still live.
-fn op_timer_set_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let Some(id) = timer_id_arg(ctx, args)? else {
-        return Ok(Value::Bool(false));
-    };
-    let refed = !matches!(args.get(1), Some(Value::Bool(false)));
-    let timers = ctx.host_mut::<Timers>().expect("timers state installed");
-    Ok(Value::Bool(timers.set_ref(id, refed)))
-}
+    #[op(name = "setInterval")]
+    fn set_interval(ctx: &mut Ctx, callback: Value, delay: Value, #[varargs] args: &[Value]) -> Result<f64, OpError> {
+        schedule(ctx, callback, delay, args, true)
+    }
 
-/// `(id)` — Node's `timer.refresh()`; false when the timer must be re-scheduled from scratch.
-fn op_timer_refresh(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let Some(id) = timer_id_arg(ctx, args)? else {
-        return Ok(Value::Bool(false));
-    };
-    let timers = ctx.host_mut::<Timers>().expect("timers state installed");
-    Ok(Value::Bool(timers.refresh(id)))
-}
+    #[op(name = "clearTimeout")]
+    fn clear_timeout(ctx: &mut Ctx, id: Value) -> Result<(), Value> {
+        clear_timer(ctx, &id)
+    }
 
-/// Queue for the next loop turn (after microtasks, before timers get another look).
-fn op_set_immediate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let callback = match args.first() {
-        Some(cb) if cb.is_callable() => cb.clone(),
-        _ => return Err(ctx.make_error("TypeError", "setImmediate expects a function")),
-    };
-    let extra: Vec<Value> = args.iter().skip(1).cloned().collect();
-    CallbackQueue::enqueue(ctx.op_state(), callback, extra);
-    Ok(Value::Undefined)
+    #[op(name = "clearInterval")]
+    fn clear_interval(ctx: &mut Ctx, id: Value) -> Result<(), Value> {
+        clear_timer(ctx, &id)
+    }
+
+    /// `(id, refed)` — Node's `timer.ref()`/`unref()`; returns whether the timer is still live.
+    #[op(name = "__timerSetRef")]
+    fn timer_set_ref(ctx: &mut Ctx, id: Value, refed: Value) -> Result<bool, Value> {
+        let Some(id) = timer_id(ctx, &id)? else { return Ok(false) };
+        let refed = !matches!(refed, Value::Bool(false));
+        Ok(ctx.host_mut::<Timers>().expect("timers state installed").set_ref(id, refed))
+    }
+
+    /// `(id)` — Node's `timer.refresh()`; false when the timer must be re-scheduled from scratch.
+    #[op(name = "__timerRefresh")]
+    fn timer_refresh(ctx: &mut Ctx, id: Value) -> Result<bool, Value> {
+        let Some(id) = timer_id(ctx, &id)? else { return Ok(false) };
+        Ok(ctx.host_mut::<Timers>().expect("timers state installed").refresh(id))
+    }
+
+    /// Queue for the next loop turn (after microtasks, before timers get another look).
+    #[op(name = "setImmediate")]
+    fn set_immediate(ctx: &mut Ctx, callback: Value, #[varargs] args: &[Value]) -> Result<(), NativeError> {
+        if !callback.is_callable() {
+            return Err(NativeError::type_error("setImmediate expects a function"));
+        }
+        CallbackQueue::enqueue(ctx.op_state(), callback, args.to_vec());
+        Ok(())
+    }
 }

@@ -5,11 +5,15 @@
 //! coroutines suspend by keeping their frame. Objects are reference counted (`Rc`), which gives
 //! CPython-like deterministic finalization.
 
+extern crate self as lumen_py;
+
 pub mod ast;
+pub mod bind;
 pub mod builtins;
 pub mod bytecode;
 pub mod call;
 pub mod cli;
+pub mod codecs;
 pub mod compile;
 pub mod containers;
 pub mod dict;
@@ -38,3 +42,5 @@ pub use cli::run_main;
 pub use lumen_common::limits::InterruptHandle;
 pub use platform::{MemFs, MemPlatform, Platform, StdPlatform};
 pub use vm::{Interp, Output, ProcessOutput};
+/// The binding macros (see `lumen_bind`; the Python host is [`bind`]).
+pub use lumen_bind::{class, methods, module, op};

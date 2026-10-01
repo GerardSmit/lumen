@@ -10,7 +10,9 @@
 //! total: adjacent smuggled high+low is the canonical form of those two code points' character,
 //! and a solitary smuggled scalar is always a lone surrogate.
 
-pub use lumen_common::smuggle::{paired_char, smuggle, smuggled, smuggled_high, smuggled_low, SMUGGLE_BASE};
+pub use lumen_common::smuggle::{
+    paired_char, push_char_utf16, smuggle, smuggled, smuggled_high, smuggled_low, SMUGGLE_BASE,
+};
 
 /// The UTF-16 code units of `s` (smuggled scalars decode to their lone surrogates).
 pub fn units(s: &str) -> Vec<u16> {

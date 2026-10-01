@@ -78,7 +78,7 @@ impl Interp {
     pub fn run_file(&mut self, path: &str) -> i32 {
         let read = self.platform.borrow_mut().read_file(path);
         let src = match read {
-            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Ok(b) => lumen_common::smuggle::escape_text_owned(String::from_utf8_lossy(&b).into_owned()),
             Err(e) => {
                 self.write_stderr(&format!("lumen-py: can't open file '{}': {}\n", path, e));
                 return 2;
@@ -187,7 +187,7 @@ impl Interp {
         let Some(FoundModule { filename: file_s, source, is_package: is_pkg }) = found else {
             return Err(self.module_not_found(full, format!("No module named '{}'", full)));
         };
-        let src = String::from_utf8_lossy(&source).into_owned();
+        let src = lumen_common::smuggle::escape_text_owned(String::from_utf8_lossy(&source).into_owned());
         let m = self.new_module(full);
         let g = self.module_dict(&m);
         dict_set_str(&g, "__file__", Value::str(&file_s));

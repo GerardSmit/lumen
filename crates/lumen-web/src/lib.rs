@@ -77,6 +77,7 @@ mod wasm_ops;
 pub fn extension() -> Extension {
     Extension {
         name: "web",
+        modules: &[],
         globals: &[],
         namespaces: &[
             (
@@ -247,28 +248,7 @@ fn op_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    Ok(Value::from_string(smuggle_high_scalars(text)))
-}
-
-/// Characters at or above U+10F800 collide with the lone-surrogate encoding, so lumen strings hold
-/// them as their smuggled surrogate pairs.
-fn smuggle_high_scalars(s: String) -> String {
-    const BASE: u32 = 0x10F800;
-    if !s.chars().any(|c| c as u32 >= BASE) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        let v = c as u32;
-        if v >= BASE {
-            let w = v - 0x10000;
-            out.extend(char::from_u32(BASE + (w >> 10)));
-            out.extend(char::from_u32(BASE + 0x400 + (w & 0x3FF)));
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(text)))
 }
 
 /// Base64 of a Latin-1 string, or `null` when a char is past U+00FF.

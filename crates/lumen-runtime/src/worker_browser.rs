@@ -21,6 +21,7 @@ pub(crate) fn terminate_all(_ctx: &mut Ctx) {}
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "worker",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__worker",

@@ -85,6 +85,7 @@ pub fn extension() -> Extension {
     let dev_glue = glue_dev::source();
     Extension {
         name: "node",
+        modules: &[],
         globals: &[],
         namespaces: &[
             (

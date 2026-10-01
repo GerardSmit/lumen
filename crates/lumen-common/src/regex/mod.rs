@@ -23,13 +23,14 @@ pub mod js;
 pub mod limits;
 mod matcher;
 mod program;
+pub mod sre;
 
 pub use captures::Captures;
-pub use charclass::{Builtin, BuiltinSet, CharClass, Flavor};
+pub use charclass::{Builtin, BuiltinSet, CharClass, Flavor, PreMap};
 pub(crate) use compile::NEST_ERROR;
 pub use fold::{
     canonicalize_legacy, fold_canon, fold_eq, fold_orbit, js_whitespace, py_fold, py_is_decimal,
-    py_is_space, py_is_word, py_lower, CaseFold,
+    py_is_space, py_is_word, py_lower, py_upper, CaseFold,
 };
 pub use ir::Node;
 pub use crate::limits::Abort;

@@ -1,39 +1,45 @@
 //! Native ops behind `node:crypto`'s digests/KDFs, `Buffer`'s codecs and search, the built-in
 //! `bufferutil` / `utf-8-validate` fallbacks, and the truly asynchronous `fs` read/write — bound
-//! with the `#[lumen::op]` / `#[lumen::class]` macros. The JS glue reaches them as `__native`
+//! with the `#[op]` / `#[class]` macros. The JS glue reaches them as `__native`
 //! (`__node.native()` builds the namespace once, in preamble.js).
 //!
 //! `#[op(async)]` ops run their body on the runtime's worker pool and settle the returned promise
 //! on the JS thread when it finishes (see `lumen::embed::AsyncHost`), so a 100k-iteration PBKDF2
 //! or an 8 MB file read no longer blocks timers and I/O.
 
-use lumen::embed::{Ctx, OpDesc, SendError, Value};
+use lumen::embed::{Ctx, SendError, Value};
 
 use crate::codec;
+
+pub(crate) use bindings::*;
+
+#[lumen_bind::module(name = "native")]
+pub(crate) mod bindings {
+use super::*;
 
 // ---- Buffer -------------------------------------------------------------------------------------
 
 /// `Buffer.from(string, encoding)`.
-#[lumen::op]
+#[op]
 fn encode(s: &str, enc: u32) -> Vec<u8> {
     codec::encode(s, enc)
 }
 
 /// `buf.toString(encoding, start, end)` over `bytes[start..end]` (clamped).
-#[lumen::op]
+#[op]
 fn decode(bytes: &[u8], enc: u32, start: u32, end: u32) -> String {
     let end = (end as usize).min(bytes.len());
     let start = (start as usize).min(end);
     codec::decode(&bytes[start..end], enc)
 }
 
-#[lumen::op(name = "byteLength")]
+#[op(name = "byteLength")]
 fn byte_length(s: &str, enc: u32) -> u32 {
     codec::byte_length(s, enc) as u32
 }
 
 /// `buf.write(string, offset, length, encoding)`: bytes written (never a partial character).
-#[lumen::op]
+#[op]
 fn write(buf: &mut [u8], s: &str, enc: u32, offset: u32, length: u32) -> u32 {
     let start = (offset as usize).min(buf.len());
     let end = start.saturating_add(length as usize).min(buf.len());
@@ -111,24 +117,24 @@ fn search_ucs2(hay: &[u8], needle: &[u8], start: usize, forward: bool) -> f64 {
 const ENC_UCS2: u32 = 6;
 
 /// `buf.indexOf(bytes, byteOffset, encoding)` / `lastIndexOf` (`forward = false`).
-#[lumen::op(name = "indexOf")]
+#[op(name = "indexOf")]
 fn index_of(hay: &[u8], needle: &[u8], offset: f64, forward: bool, enc: u32) -> f64 {
     search(hay, needle, offset, forward, enc == ENC_UCS2)
 }
 
-#[lumen::op(name = "indexOfStr")]
+#[op(name = "indexOfStr")]
 fn index_of_str(hay: &[u8], needle: &str, enc: u32, offset: f64, forward: bool) -> f64 {
     let bytes = codec::encode(needle, enc);
     search(hay, &bytes, offset, forward, enc == ENC_UCS2)
 }
 
-#[lumen::op(name = "indexOfByte")]
+#[op(name = "indexOfByte")]
 fn index_of_byte(hay: &[u8], byte: u32, offset: f64, forward: bool) -> f64 {
     search(hay, &[byte as u8], offset, forward, false)
 }
 
 /// Lexicographic comparison: -1, 0 or 1.
-#[lumen::op]
+#[op]
 fn compare(a: &[u8], b: &[u8]) -> i32 {
     match a.cmp(b) {
         std::cmp::Ordering::Less => -1,
@@ -137,7 +143,7 @@ fn compare(a: &[u8], b: &[u8]) -> i32 {
     }
 }
 
-#[lumen::op]
+#[op]
 fn equals(a: &[u8], b: &[u8]) -> bool {
     a == b
 }
@@ -160,7 +166,7 @@ fn fill_pattern(dst: &mut [u8], pat: &[u8]) {
 
 /// `buf.fill(bytes, start, end)`; the pattern must not alias `buf` (JS copies it first).
 /// Returns -1 for an empty pattern (Node's ERR_INVALID_ARG_VALUE).
-#[lumen::op]
+#[op]
 fn fill(buf: &mut [u8], pat: &[u8], start: u32, end: u32) -> i32 {
     if pat.is_empty() {
         return -1;
@@ -171,7 +177,7 @@ fn fill(buf: &mut [u8], pat: &[u8], start: u32, end: u32) -> i32 {
     0
 }
 
-#[lumen::op(name = "fillStr")]
+#[op(name = "fillStr")]
 fn fill_str(buf: &mut [u8], s: &str, enc: u32, start: u32, end: u32) -> i32 {
     let pat = codec::encode(s, enc);
     if pat.is_empty() {
@@ -184,7 +190,7 @@ fn fill_str(buf: &mut [u8], s: &str, enc: u32, start: u32, end: u32) -> i32 {
 }
 
 /// `swap16/32/64` in place (JS checked the length is a multiple of `width`).
-#[lumen::op]
+#[op]
 fn swap(buf: &mut [u8], width: u32) {
     match width {
         2 => buf.chunks_exact_mut(2).for_each(|c| c.swap(0, 1)),
@@ -214,7 +220,7 @@ fn num_at(len: usize, offset: f64, width: usize) -> Option<usize> {
 
 /// The fixed-width `buf.read*` accessors: NaN for an invalid offset (JS then builds Node's
 /// error; a float that really is NaN is told apart there).
-#[lumen::op(name = "readNum")]
+#[op(name = "readNum")]
 fn read_num(buf: &[u8], offset: f64, kind: u32) -> f64 {
     let w = num_width(kind);
     let Some(o) = num_at(buf.len(), offset, w) else {
@@ -244,7 +250,7 @@ fn read_num(buf: &[u8], offset: f64, kind: u32) -> f64 {
 
 /// The fixed-width `buf.write*` accessors (JS has range-checked integer values): the offset
 /// after the write, or -1 for an invalid offset.
-#[lumen::op(name = "writeNum")]
+#[op(name = "writeNum")]
 fn write_num(buf: &mut [u8], value: f64, offset: f64, kind: u32) -> f64 {
     let w = num_width(kind);
     let Some(o) = num_at(buf.len(), offset, w) else {
@@ -267,12 +273,12 @@ fn write_num(buf: &mut [u8], value: f64, offset: f64, kind: u32) -> f64 {
     (o + w) as f64
 }
 
-#[lumen::op(name = "isUtf8")]
+#[op(name = "isUtf8")]
 fn is_utf8(bytes: &[u8]) -> bool {
     codec::is_utf8(bytes)
 }
 
-#[lumen::op(name = "isAscii")]
+#[op(name = "isAscii")]
 fn is_ascii(bytes: &[u8]) -> bool {
     bytes.is_ascii()
 }
@@ -298,7 +304,7 @@ fn xor_mask(src: &[u8], out: &mut [u8], key: u32) {
 }
 
 /// bufferutil's `mask(source, mask, output, offset, length)` (distinct buffers).
-#[lumen::op]
+#[op]
 fn mask(src: &[u8], key: u32, out: &mut [u8], offset: u32, length: u32) {
     let start = (offset as usize).min(out.len());
     let end = start.saturating_add(length as usize).min(out.len());
@@ -307,7 +313,7 @@ fn mask(src: &[u8], key: u32, out: &mut [u8], offset: u32, length: u32) {
 }
 
 /// bufferutil's `unmask(buffer, mask)`, in place.
-#[lumen::op]
+#[op]
 fn unmask(buf: &mut [u8], key: u32) {
     let k8 = u64::from(key) | u64::from(key) << 32;
     let mut c = buf.chunks_exact_mut(8);
@@ -326,7 +332,7 @@ fn unmask(buf: &mut [u8], key: u32) {
 /// and this built-in otherwise. The exports are registered in addons.js.
 const FALLBACK_MODULES: &[&str] = &["bufferutil", "utf-8-validate"];
 
-#[lumen::op(name = "isFallbackModule")]
+#[op(name = "isFallbackModule")]
 fn is_fallback_module(name: &str) -> bool {
     FALLBACK_MODULES.contains(&name)
 }
@@ -361,7 +367,7 @@ fn io_err(e: std::io::Error) -> SendError {
 }
 
 /// `fs.readFile(path)` / `fsPromises.readFile(path)`: read on a worker thread.
-#[lumen::op(async, name = "readFile")]
+#[op(async, name = "readFile")]
 fn read_file(path: String) -> Result<Vec<u8>, SendError> {
     use std::io::Read;
     let mut f = std::fs::File::open(&path).map_err(io_err)?;
@@ -375,7 +381,7 @@ fn read_file(path: String) -> Result<Vec<u8>, SendError> {
 
 /// `fs.writeFile` / `fs.appendFile` and their promise forms: `mode` is flagToMode's
 /// `r+`/`w`/`w+`/`a`/`a+` with an optional trailing `x` (exclusive create).
-#[lumen::op(async, name = "writeFile")]
+#[op(async, name = "writeFile")]
 fn write_file(path: String, data: Vec<u8>, mode: String, perm: Option<u32>) -> Result<(), SendError> {
     use std::io::Write;
     let (base, exclusive) = match mode.strip_suffix('x') {
@@ -417,36 +423,9 @@ fn write_file(path: String, data: Vec<u8>, mode: String, perm: Option<u32>) -> R
 
 // ---- registration -------------------------------------------------------------------------------
 
-const OPS: &[&OpDesc] = lumen::ops![
-    encode,
-    decode,
-    byte_length,
-    write,
-    index_of,
-    index_of_str,
-    index_of_byte,
-    compare,
-    equals,
-    fill,
-    fill_str,
-    swap,
-    read_num,
-    write_num,
-    is_utf8,
-    is_ascii,
-    mask,
-    unmask,
-    is_fallback_module,
-    read_file,
-    write_file,
-];
 
 /// `__node.native()`: a fresh object holding every op above (called once by preamble.js).
 pub fn op_native(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let ns = Value::Obj(ctx.new_object());
-    for op in OPS {
-        let f = ctx.op_function(op);
-        let _ = ctx.set_member(&ns, op.name, f);
-    }
-    Ok(ns)
+    ctx.module_object::<Module>()
+}
 }

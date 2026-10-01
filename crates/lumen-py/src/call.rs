@@ -41,18 +41,19 @@ impl Interp {
             }
             Kind::Native(nd) => (nd.f)(self, &args, &kw),
             Kind::Method(func, this) => {
-                if let Value::Obj(fo) = func {
-                    if matches!(fo.kind, Kind::Function(_)) {
-                        let mut a = Vec::with_capacity(args.len() + 1);
-                        a.push(this.clone());
-                        a.extend(args);
-                        let frame = self.bind_frame(fo, a, kw)?;
-                        return self.run_frame(frame);
-                    }
-                }
                 let mut a = Vec::with_capacity(args.len() + 1);
                 a.push(this.clone());
                 a.extend(args);
+                if let Value::Obj(fo) = func {
+                    match &fo.kind {
+                        Kind::Function(_) => {
+                            let frame = self.bind_frame(fo, a, kw)?;
+                            return self.run_frame(frame);
+                        }
+                        Kind::Native(nd) => return (nd.f)(self, &a, &kw),
+                        _ => {}
+                    }
+                }
                 self.call(&func.clone(), a, kw)
             }
             Kind::Type(_) => self.call_type(o, args, kw),
@@ -310,6 +311,7 @@ impl Interp {
             kwdefaults: RefCell::new(kwdefaults),
             closure,
             annotations: RefCell::new(annotations),
+            type_params: RefCell::new(None),
         };
         Ok(Value::Obj(Object::new(Kind::Function(Box::new(f)))))
     }

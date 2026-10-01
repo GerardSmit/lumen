@@ -207,11 +207,8 @@ fn callable(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn chr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("chr", a, 1, 1)?;
     let n = it.index_of(&a[0])?;
-    match u32::try_from(n).ok().and_then(char::from_u32) {
-        Some(c) => {
-            let mut b = [0u8; 4];
-            Ok(Value::str(c.encode_utf8(&mut b)))
-        }
+    match u32::try_from(n).ok().and_then(lumen_common::smuggle::code_point_str) {
+        Some(c) => Ok(Value::str(&c)),
         None => Err(it.value_error("chr() arg not in range(0x110000)")),
     }
 }
@@ -222,13 +219,13 @@ fn ord(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         Value::Obj(o) => match &o.kind {
             Kind::Str(s) => {
                 if s.nchars == 1 {
-                    Ok(Value::Int(s.s.chars().next().map(|c| c as i64).unwrap_or(0)))
+                    Ok(Value::Int(lumen_common::smuggle::code_points(&s.s).next().unwrap_or(0) as i64))
                 } else {
                     Err(it.type_error(&format!("ord() expected a character, but string of length {} found", s.nchars)))
                 }
             }
             Kind::Bytes(b) if b.len() == 1 => Ok(Value::Int(b[0] as i64)),
-            Kind::ByteArray(b) if b.borrow().len() == 1 => Ok(Value::Int(b.borrow()[0] as i64)),
+            Kind::ByteArray(b) if b.len() == 1 => Ok(Value::Int(b.bytes()[0] as i64)),
             _ => {
                 let t = it.type_name_of(&a[0]);
                 Err(it.type_error(&format!("ord() expected string of length 1, but {} found", t)))
@@ -430,7 +427,7 @@ fn input(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if raw.is_empty() {
         return Err(it.new_exc_str("EOFError", "EOF when reading a line"));
     }
-    let mut line = String::from_utf8_lossy(&raw).into_owned();
+    let mut line = lumen_common::smuggle::escape_text_owned(String::from_utf8_lossy(&raw).into_owned());
     if line.ends_with('\n') {
         line.pop();
         if line.ends_with('\r') {

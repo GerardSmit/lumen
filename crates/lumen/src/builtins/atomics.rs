@@ -23,7 +23,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         ) {
             return Err(i.make_error("TypeError", "Atomics requires an integer TypedArray"));
         }
-        if write && i.immutable_buffers.contains(&info.buffer) {
+        if write && i.buffer_immutable(info.buffer) {
             return Err(i.make_error(
                 "TypeError",
                 "Atomics: cannot write into a view over an immutable ArrayBuffer",

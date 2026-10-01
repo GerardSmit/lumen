@@ -405,7 +405,6 @@ impl Interp {
                 array_buffers,
                 ta_buffer,
                 shared_buffers,
-                immutable_buffers,
                 generators,
                 async_gens,
                 async_gen_busy,

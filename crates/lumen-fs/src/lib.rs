@@ -26,6 +26,7 @@ use lumen_host::{ops, Ctx, Extension, SpawnHandle, Value};
 pub fn extension() -> Extension {
     Extension {
         name: "fs",
+        modules: &[],
         globals: &[],
         namespaces: &[
             (

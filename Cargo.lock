@@ -776,9 +776,9 @@ dependencies = [
 name = "lumen"
 version = "0.1.3"
 dependencies = [
+ "lumen-bind",
  "lumen-codegen",
  "lumen-common",
- "lumen-macros",
 ]
 
 [[package]]
@@ -796,6 +796,18 @@ version = "0.1.3"
 dependencies = [
  "lumen",
 ]
+
+[[package]]
+name = "lumen-bind"
+version = "0.1.3"
+dependencies = [
+ "lumen-bind-macros",
+ "lumen-common",
+]
+
+[[package]]
+name = "lumen-bind-macros"
+version = "0.1.3"
 
 [[package]]
 name = "lumen-cli"
@@ -854,14 +866,11 @@ dependencies = [
  "getrandom 0.2.17",
  "js-sys",
  "lumen",
+ "lumen-bind",
  "lumen-common",
  "wasm-bindgen",
  "web-time",
 ]
-
-[[package]]
-name = "lumen-macros"
-version = "0.1.3"
 
 [[package]]
 name = "lumen-node"
@@ -896,6 +905,7 @@ dependencies = [
  "libc",
  "libsqlite3-sys",
  "lumen",
+ "lumen-bind",
  "lumen-common",
  "lumen-host",
  "lumen-os",
@@ -935,7 +945,10 @@ dependencies = [
 name = "lumen-py"
 version = "0.1.3"
 dependencies = [
+ "lumen",
+ "lumen-bind",
  "lumen-common",
+ "lumen-os",
 ]
 
 [[package]]
@@ -951,6 +964,8 @@ name = "lumen-runtime"
 version = "0.1.3"
 dependencies = [
  "lumen",
+ "lumen-bind",
+ "lumen-common",
  "lumen-fs",
  "lumen-host",
  "lumen-node",
@@ -962,6 +977,8 @@ dependencies = [
 name = "lumen-timers"
 version = "0.1.3"
 dependencies = [
+ "lumen",
+ "lumen-bind",
  "lumen-host",
 ]
 

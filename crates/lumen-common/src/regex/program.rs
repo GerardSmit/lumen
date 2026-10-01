@@ -1,6 +1,6 @@
 //! The compiled program and the [`Regex`] that owns it.
 
-use super::charclass::{CharClass, Flavor};
+use super::charclass::{CharClass, Flavor, PreMap};
 use super::compile::compile_program;
 use super::fold::{fold_eq, CaseFold};
 use super::ir::Node;
@@ -51,8 +51,14 @@ pub(super) enum Inst {
     AssertEnd,
     AssertStartText,
     AssertEndText,
+    AssertStartLine,
+    AssertEndLine,
     WordBoundary(bool, Flavor),
     Backref(usize),
+    BackrefMapped(usize, PreMap),
+    /// Record `group` as the last one closed (Python dialect; stored in the slot after the
+    /// last real group so backtracking undoes it like a capture).
+    SetLast(usize),
     /// Matches via whichever of the groups captured (duplicate named groups).
     BackrefAlt(Rc<Vec<usize>>),
     /// Reset capture slots for groups `lo..=hi` at the start of a quantifier iteration.
@@ -64,6 +70,12 @@ pub(super) enum Inst {
     /// The body must match text ending at the current position.
     LookBehind {
         negate: bool,
+        prog: Rc<Vec<Inst>>,
+    },
+    /// A fixed-width lookbehind: the body runs forward from `width` elements back.
+    LookBack {
+        negate: bool,
+        width: usize,
         prog: Rc<Vec<Inst>>,
     },
     /// Runs the body once and continues from where it ended, discarding its alternatives.
@@ -190,6 +202,9 @@ pub struct Regex {
     pub(super) lead_run: Option<Rep>,
     pub(super) options: Options,
     pub ngroups: usize,
+    /// Capture slots the matcher allocates: two per group (group 0 included), plus two more in
+    /// the Python dialect for the last-closed-group record.
+    pub(super) nslots: usize,
     /// Named groups paired with their capture index.
     pub names: Vec<(String, usize)>,
 }
@@ -237,6 +252,7 @@ impl Regex {
             prog,
             options,
             ngroups,
+            nslots: 2 * (ngroups + 1) + if options.dialect == Dialect::Python { 2 } else { 0 },
             names,
         };
         if let FirstFilter::Atoms(atoms) = &re.first {

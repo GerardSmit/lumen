@@ -14,9 +14,9 @@ publish = false
 lumen-host = { path = "../lumen-host" }
 lumen-common = { path = "../lumen-common", features = ["hash"] }
 lumen-os = { path = "../lumen-os" }
-# The binding macros (#[lumen::op] / #[class]) name `::lumen::embed` paths, so the crate is a
-# direct dependency (lumen-host already links it).
-lumen = { path = "../lumen", features = ["macros"] }
+# Natives are declared with lumen-bind and exposed through lumen's JS host (`embed`).
+lumen = { path = "../lumen", features = ["embed"] }
+lumen-bind = { path = "../lumen-bind" }
 
 # node:crypto and crypto.subtle: RustCrypto on every platform (native and wasm32). lumen carries
 # no cryptography of its own.

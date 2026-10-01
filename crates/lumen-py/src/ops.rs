@@ -114,7 +114,7 @@ impl Interp {
                     Kind::List(l) => !l.borrow().is_empty(),
                     Kind::Dict(d) | Kind::Set(d) | Kind::FrozenSet(d) => !d.borrow().is_empty(),
                     Kind::Bytes(b) => !b.is_empty(),
-                    Kind::ByteArray(b) => !b.borrow().is_empty(),
+                    Kind::ByteArray(b) => !b.is_empty(),
                     Kind::Range(r) => slice_len(r.start, r.stop, r.step) > 0,
                     Kind::BigRange(r) => !big_range_len(r).is_zero(),
                     Kind::Complex(a, b) => *a != 0.0 || *b != 0.0,
@@ -149,7 +149,7 @@ impl Interp {
                 Kind::List(l) => return Ok(l.borrow().len()),
                 Kind::Dict(d) | Kind::Set(d) | Kind::FrozenSet(d) => return Ok(d.borrow().len()),
                 Kind::Bytes(b) => return Ok(b.len()),
-                Kind::ByteArray(b) => return Ok(b.borrow().len()),
+                Kind::ByteArray(b) => return Ok(b.len()),
                 Kind::Range(r) => return Ok(slice_len(r.start, r.stop, r.step)),
                 Kind::BigRange(r) => {
                     return match big_range_len(r).to_i64() {
@@ -202,6 +202,51 @@ impl Interp {
                 Err(self.type_error(&format!("'{}' object cannot be interpreted as an integer", t)))
             }
         }
+    }
+
+    /// A sequence subscript (`PyNumber_AsSsize_t(key, PyExc_IndexError)`): an int past
+    /// `Py_ssize_t` is `IndexError: cannot fit 'int' into an index-sized integer`.
+    #[inline]
+    pub fn seq_index(&mut self, v: &Value) -> R<i64> {
+        if let Value::Int(i) = v {
+            return Ok(*i);
+        }
+        self.index_or(v, "IndexError")
+    }
+
+    /// `PyNumber_AsSsize_t(v, exc)`: `__index__`, then `exc` ("cannot fit '<type>' into an
+    /// index-sized integer") when the int does not fit.
+    #[cold]
+    pub fn index_or(&mut self, v: &Value, exc: &str) -> R<i64> {
+        match v.as_bigint() {
+            Some(b) => match b.to_i64() {
+                Some(i) => Ok(i),
+                None => {
+                    let t = self.type_name_of(v);
+                    Err(self.new_exc_str(exc, &format!("cannot fit '{}' into an index-sized integer", t)))
+                }
+            },
+            None => match self.index_of(v) {
+                Err(e) if self.exc_is(&e, "OverflowError") => {
+                    let t = self.type_name_of(v);
+                    Err(self.new_exc_str(exc, &format!("cannot fit '{}' into an index-sized integer", t)))
+                }
+                r => r,
+            },
+        }
+    }
+
+    /// An optional `start`/`stop` argument (`_PyEval_SliceIndexNotNone`): ints out of range clamp.
+    pub fn slice_index(&mut self, v: &Value) -> R<i64> {
+        if !self.has_index(v) {
+            return Err(self.type_error("slice indices must be integers or have an __index__ method"));
+        }
+        if let Some(b) = v.as_bigint() {
+            if b.to_i64().is_none() {
+                return Ok(if b.is_negative() { i64::MIN } else { i64::MAX });
+            }
+        }
+        self.index_of(v)
     }
 
     pub fn has_index(&self, v: &Value) -> bool {
@@ -335,11 +380,11 @@ impl Interp {
             _ => return Ok(None),
         };
         match (&oa.kind, &ob.kind) {
-            (Kind::Str(x), Kind::Str(y)) => Ok(Some(ord_matches(op, x.s.as_bytes().cmp(y.s.as_bytes())))),
+            (Kind::Str(x), Kind::Str(y)) => Ok(Some(ord_matches(op, lumen_common::smuggle::cmp_code_points(&x.s, &y.s)))),
             (Kind::Bytes(x), Kind::Bytes(y)) => Ok(Some(ord_matches(op, x.cmp(y)))),
-            (Kind::ByteArray(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.borrow().cmp(&y.borrow())))),
-            (Kind::Bytes(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.as_slice().cmp(y.borrow().as_slice())))),
-            (Kind::ByteArray(x), Kind::Bytes(y)) => Ok(Some(ord_matches(op, x.borrow().as_slice().cmp(y.as_slice())))),
+            (Kind::ByteArray(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.bytes().cmp(&y.bytes())))),
+            (Kind::Bytes(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.as_slice().cmp(&*y.bytes())))),
+            (Kind::ByteArray(x), Kind::Bytes(y)) => Ok(Some(ord_matches(op, (*x.bytes()).cmp(y.as_slice())))),
             (Kind::Tuple(x), Kind::Tuple(y)) => {
                 let (x, y) = (x.clone(), y.clone());
                 self.seq_compare(op, &x, &y)
@@ -602,14 +647,14 @@ impl Interp {
                     return Ok(None);
                 }
                 let n = self.repeat_count(b)?;
-                let cur = l.borrow().clone();
+                let cur = l.to_vec();
                 let out = self.repeat_bytes(&cur, n, crate::limits::MAX_BYTES_LEN)?;
-                *l.borrow_mut() = out;
+                self.ba_edit(l, |v| *v = out)?;
                 Ok(Some(a.clone()))
             }
             (Kind::ByteArray(l), BinOp::Add) => {
                 let items = self.bytes_of(b)?;
-                l.borrow_mut().extend(items);
+                self.ba_edit(l, |v| v.extend(items))?;
                 Ok(Some(a.clone()))
             }
             (Kind::Set(_), BinOp::BitOr | BinOp::BitAnd | BinOp::Sub | BinOp::BitXor) => {
@@ -683,14 +728,14 @@ impl Interp {
             (Kind::Bytes(_) | Kind::ByteArray(_), BinOp::Mod) => {
                 let raw = match &oa.kind {
                     Kind::Bytes(d) => d.clone(),
-                    Kind::ByteArray(d) => d.borrow().clone(),
+                    Kind::ByteArray(d) => d.to_vec(),
                     _ => Vec::new(),
                 };
                 let latin = |v: &Value| -> Value {
                     match v {
                         Value::Obj(o) => match &o.kind {
                             Kind::Bytes(d) => Value::string(d.iter().map(|&c| c as char).collect()),
-                            Kind::ByteArray(d) => Value::string(d.borrow().iter().map(|&c| c as char).collect()),
+                            Kind::ByteArray(d) => Value::string(d.bytes().iter().map(|&c| c as char).collect()),
                             _ => v.clone(),
                         },
                         _ => v.clone(),
@@ -713,7 +758,7 @@ impl Interp {
                     }
                 }
                 if matches!(oa.kind, Kind::ByteArray(_)) {
-                    return Ok(Some(Value::Obj(Object::new(Kind::ByteArray(std::cell::RefCell::new(out))))));
+                    return Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(out))))));
                 }
                 Ok(Some(Value::bytes(out)))
             }
@@ -756,7 +801,7 @@ impl Interp {
                     }
                     Kind::ByteArray(y) => {
                         let mut v = x.clone();
-                        v.extend_from_slice(&y.borrow());
+                        v.extend_from_slice(&y.bytes());
                         Ok(Some(Value::bytes(v)))
                     }
                     _ => Ok(None),
@@ -765,13 +810,13 @@ impl Interp {
             },
             (Kind::ByteArray(x), BinOp::Add) => match b {
                 Value::Obj(ob) => {
-                    let mut v = x.borrow().clone();
+                    let mut v = x.to_vec();
                     match &ob.kind {
                         Kind::Bytes(y) => v.extend_from_slice(y),
-                        Kind::ByteArray(y) => v.extend_from_slice(&y.borrow()),
+                        Kind::ByteArray(y) => v.extend_from_slice(&y.bytes()),
                         _ => return Ok(None),
                     }
-                    Ok(Some(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(v))))))
+                    Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(v))))))
                 }
                 _ => Ok(None),
             },
@@ -882,9 +927,9 @@ impl Interp {
             Kind::Tuple(t) => Ok(Some(Value::tuple(self.repeat_values(t, n)?))),
             Kind::Bytes(b) => Ok(Some(Value::bytes(self.repeat_bytes(b, n, crate::limits::MAX_BYTES_LEN)?))),
             Kind::ByteArray(b) => {
-                let src = b.borrow().clone();
+                let src = b.to_vec();
                 let out = self.repeat_bytes(&src, n, crate::limits::MAX_BYTES_LEN)?;
-                Ok(Some(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(out))))))
+                Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(out))))))
             }
             _ => Ok(None),
         }
@@ -1167,7 +1212,7 @@ impl Interp {
                     return Ok(Value::list(idx.into_iter().filter_map(|i| l.get(i).cloned()).collect()));
                 }
                 if self.has_index(key) {
-                    let i = self.index_of(key)?;
+                    let i = self.seq_index(key)?;
                     let l = l.borrow();
                     return match norm_index(i, l.len()) {
                         Some(j) => Ok(l[j].clone()),
@@ -1182,7 +1227,7 @@ impl Interp {
                     return Ok(Value::tuple(idx.into_iter().map(|i| t[i].clone()).collect()));
                 }
                 if self.has_index(key) {
-                    let i = self.index_of(key)?;
+                    let i = self.seq_index(key)?;
                     return match norm_index(i, t.len()) {
                         Some(j) => Ok(t[j].clone()),
                         None => Err(self.seq_index_error("tuple")),
@@ -1207,22 +1252,19 @@ impl Interp {
                             i += step;
                         }
                     } else {
-                        let chars: Vec<char> = s.s.chars().collect();
+                        let chars: Vec<u32> = lumen_common::smuggle::code_points(&s.s).collect();
                         let mut i = start;
                         for _ in 0..n {
-                            out.push(chars[i as usize]);
+                            lumen_common::smuggle::push_code_point(&mut out, chars[i as usize]);
                             i += step;
                         }
                     }
                     return Ok(Value::string(out));
                 }
                 if self.has_index(key) {
-                    let i = self.index_of(key)?;
-                    return match norm_index(i, s.nchars).and_then(|j| s.char_at(j)) {
-                        Some(c) => {
-                            let mut buf = [0u8; 4];
-                            Ok(Value::str(c.encode_utf8(&mut buf)))
-                        }
+                    let i = self.seq_index(key)?;
+                    return match norm_index(i, s.nchars) {
+                        Some(j) => Ok(Value::str(s.slice(j, j + 1))),
                         None => Err(self.seq_index_error("string")),
                     };
                 }
@@ -1247,7 +1289,7 @@ impl Interp {
                     let idx = self.slice_indices(key, b.len())?;
                     return Ok(Value::bytes(idx.into_iter().map(|i| b[i]).collect()));
                 }
-                let i = self.index_of(key)?;
+                let i = self.seq_index(key)?;
                 match norm_index(i, b.len()) {
                     Some(j) => Ok(Value::Int(b[j] as i64)),
                     None => Err(self.new_exc_str("IndexError", "index out of range")),
@@ -1255,13 +1297,13 @@ impl Interp {
             }
             Kind::ByteArray(b) => {
                 if self.is_slice(key) {
-                    let len = b.borrow().len();
+                    let len = b.len();
                     let idx = self.slice_indices(key, len)?;
-                    let b = b.borrow();
-                    return Ok(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(idx.into_iter().map(|i| b[i]).collect())))));
+                    let b = b.bytes();
+                    return Ok(Value::Obj(Object::new(Kind::ByteArray(ba_store(idx.into_iter().map(|i| b[i]).collect())))));
                 }
-                let i = self.index_of(key)?;
-                let b = b.borrow();
+                let i = self.seq_index(key)?;
+                let b = b.bytes();
                 match norm_index(i, b.len()) {
                     Some(j) => Ok(Value::Int(b[j] as i64)),
                     None => Err(self.new_exc_str("IndexError", "bytearray index out of range")),
@@ -1292,7 +1334,10 @@ impl Interp {
                         step: r.step * step,
                     }))));
                 }
-                let i = self.index_of(key)?;
+                let i = match self.index_of(key) {
+                    Err(e) if self.exc_is(&e, "OverflowError") => return Err(self.seq_index_error("range object")),
+                    r => r?,
+                };
                 match norm_index(i, len) {
                     Some(j) => Ok(Value::Int(r.start + j as i64 * r.step)),
                     None => Err(self.seq_index_error("range object")),
@@ -1387,7 +1432,7 @@ impl Interp {
                 let i = if let Value::Int(i) = &key {
                     *i
                 } else if self.has_index(&key) {
-                    self.index_of(&key)?
+                    self.seq_index(&key)?
                 } else {
                     return Err(self.bad_index_type("list", &key));
                 };
@@ -1406,12 +1451,16 @@ impl Interp {
             Kind::Dict(_) => self.dict_set(o, key, val),
             Kind::ByteArray(b) => {
                 if self.is_slice(&key) {
-                    let len = b.borrow().len();
+                    let len = b.len();
                     let (start, stop, step) = self.slice_bounds(&key, len)?;
                     let items: Vec<u8> = self.bytes_of(&val)?;
                     if step == 1 {
-                        let stop = stop.max(start) as usize;
-                        b.borrow_mut().splice(start as usize..stop, items);
+                        let (start, stop) = (start as usize, stop.max(start) as usize);
+                        if items.len() == stop - start {
+                            self.ba_write(b)?[start..stop].copy_from_slice(&items);
+                        } else {
+                            self.ba_edit(b, |v| drop(v.splice(start..stop, items)))?;
+                        }
                         return Ok(());
                     }
                     let n = slice_len(start, stop, step);
@@ -1419,7 +1468,7 @@ impl Interp {
                         let msg = format!("attempt to assign bytes of size {} to extended slice of size {}", items.len(), n);
                         return Err(self.value_error(&msg));
                     }
-                    let mut b = b.borrow_mut();
+                    let mut b = self.ba_write(b)?;
                     let mut idx = start;
                     for v in items {
                         b[idx as usize] = v;
@@ -1427,12 +1476,12 @@ impl Interp {
                     }
                     return Ok(());
                 }
-                let i = self.index_of(&key)?;
+                let i = self.seq_index(&key)?;
                 let v = self.index_of(&val)?;
                 if !(0..256).contains(&v) {
                     return Err(self.value_error("byte must be in range(0, 256)"));
                 }
-                let mut b = b.borrow_mut();
+                let mut b = self.ba_write(b)?;
                 match norm_index(i, b.len()) {
                     Some(j) => {
                         b[j] = v as u8;
@@ -1527,7 +1576,7 @@ impl Interp {
                     }
                     return Ok(());
                 }
-                let i = self.index_of(key)?;
+                let i = self.seq_index(key)?;
                 let mut lm = l.borrow_mut();
                 match norm_index(i, lm.len()) {
                     Some(j) => {
@@ -1546,24 +1595,26 @@ impl Interp {
             },
             Kind::ByteArray(b) => {
                 if self.is_slice(key) {
-                    let len = b.borrow().len();
+                    let len = b.len();
                     let mut idx = self.slice_indices(key, len)?;
-                    idx.sort_unstable();
-                    let mut bm = b.borrow_mut();
-                    for i in idx.into_iter().rev() {
-                        bm.remove(i);
+                    if idx.is_empty() {
+                        return Ok(());
                     }
+                    idx.sort_unstable();
+                    self.ba_edit(b, |bm| {
+                        for i in idx.into_iter().rev() {
+                            bm.remove(i);
+                        }
+                    })?;
                     return Ok(());
                 }
-                let i = self.index_of(key)?;
-                let mut bm = b.borrow_mut();
-                match norm_index(i, bm.len()) {
+                let i = self.seq_index(key)?;
+                match norm_index(i, b.len()) {
                     Some(j) => {
-                        bm.remove(j);
+                        self.ba_edit(b, |bm| bm.remove(j))?;
                         Ok(())
                     }
                     None => {
-                        drop(bm);
                         Err(self.new_exc_str("IndexError", "bytearray index out of range"))
                     }
                 }
@@ -1664,7 +1715,7 @@ impl Interp {
             }
             Kind::Bytes(b) => self.bytes_contains(b, item),
             Kind::ByteArray(b) => {
-                let b = b.borrow().clone();
+                let b = b.to_vec();
                 self.bytes_contains(&b, item)
             }
             Kind::DictView(d, vk) => match vk {
@@ -1722,8 +1773,8 @@ impl Interp {
             Value::Obj(o) => match &o.kind {
                 Kind::Bytes(s) => Ok(s.is_empty() || b.windows(s.len()).any(|w| w == s.as_slice())),
                 Kind::ByteArray(s) => {
-                    let s = s.borrow();
-                    Ok(s.is_empty() || b.windows(s.len()).any(|w| w == s.as_slice()))
+                    let s = s.bytes();
+                    Ok(s.is_empty() || b.windows(s.len()).any(|w| w == &s[..]))
                 }
                 _ => Err(self.type_error("a bytes-like object is required, not 'str'")),
             },
@@ -1735,7 +1786,10 @@ impl Interp {
         match v {
             Value::Obj(o) => match &o.kind {
                 Kind::Bytes(b) => Ok(b.clone()),
-                Kind::ByteArray(b) => Ok(b.borrow().clone()),
+                Kind::ByteArray(b) => Ok(b.to_vec()),
+                Kind::Opaque(_) if crate::builtins::memview::is_memoryview(self, v) => {
+                    Ok(crate::builtins::memview::contiguous_bytes(self, v)?.unwrap_or_default())
+                }
                 Kind::List(_) | Kind::Tuple(_) | Kind::Range(_) => {
                     let items = self.iterate_to_vec(v)?;
                     let mut out = Vec::new();

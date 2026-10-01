@@ -1,6 +1,6 @@
 //! The regular-expression tree a front end builds and [`super::Regex::build`] compiles.
 
-use super::charclass::{CharClass, Flavor};
+use super::charclass::{CharClass, Flavor, PreMap};
 
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -25,9 +25,17 @@ pub enum Node {
     StartText,
     /// `\Z`: the end of the input regardless of `multiline`.
     EndText,
+    /// `^` that always matches at the start of input or after a line terminator, whatever the
+    /// `multiline` option is (a scoped `(?m:^)`).
+    StartLine,
+    /// `$` that always matches at the end of input or before a line terminator, whatever the
+    /// `multiline` option is.
+    EndLine,
     /// `\b` (`true`) or `\B` (`false`).
     WordB(bool, Flavor),
     Backref(usize),
+    /// A back reference comparing the transformed characters of the capture and of the subject.
+    BackrefMapped(usize, PreMap),
     /// A placeholder a front end resolves to a group index before compiling.
     NamedBackref(String),
     /// Matches through whichever of the listed groups captured (duplicate named groups).
@@ -36,6 +44,15 @@ pub enum Node {
     Look(bool, Box<Node>),
     /// `(?<=…)` / `(?<!…)`: the body must match text *ending* at the current position.
     LookBehind(bool, Box<Node>),
+    /// A lookbehind whose body has a fixed width: it matches *forward* from `width` elements
+    /// before the current position (so captures and back references inside it behave as in a
+    /// lookahead), and fails — or, when negated, succeeds — when fewer than `width` elements
+    /// precede the position.
+    LookBehindFixed {
+        negate: bool,
+        width: usize,
+        body: Box<Node>,
+    },
     /// `(?>…)`: the body matches once, committing to its first successful path.
     Atomic(Box<Node>),
     /// `(?(n)yes|no)`: `yes` when group `n` has captured, else `no`.

@@ -5,6 +5,10 @@ use super::program::{Dialect, Inst, Rep};
 use std::rc::Rc;
 
 const MAX_REPEAT: usize = 1000;
+/// Python permits counted repeats of any body up to 2^32-2; the body is unrolled, so cap the
+/// count and the whole program instead.
+const MAX_REPEAT_PY: usize = 20_000;
+const MAX_PROGRAM: usize = 4_000_000;
 pub(crate) const NEST_ERROR: &str = "regular expression too deeply nested";
 
 pub(super) fn compile_program(
@@ -46,6 +50,9 @@ impl Compiler {
             Node::End => prog.push(Inst::AssertEnd),
             Node::StartText => prog.push(Inst::AssertStartText),
             Node::EndText => prog.push(Inst::AssertEndText),
+            Node::StartLine => prog.push(Inst::AssertStartLine),
+            Node::EndLine => prog.push(Inst::AssertEndLine),
+            Node::BackrefMapped(n, pre) => prog.push(Inst::BackrefMapped(*n, *pre)),
             Node::WordB(b, flavor) => prog.push(Inst::WordBoundary(*b, *flavor)),
             Node::Backref(n) => prog.push(Inst::Backref(*n)),
             Node::BackrefAlt(v) => prog.push(Inst::BackrefAlt(Rc::new(v.clone()))),
@@ -102,6 +109,9 @@ impl Compiler {
                 self.compile(inner, prog)?;
                 if let Some(i) = idx {
                     prog.push(Inst::Save(2 * i + 1));
+                    if self.dialect == Dialect::Python {
+                        prog.push(Inst::SetLast(*i));
+                    }
                 }
             }
             Node::Look(negate, inner) => {
@@ -116,6 +126,18 @@ impl Compiler {
                 let sub = self.sub_program(&reverse_node(inner))?;
                 prog.push(Inst::LookBehind {
                     negate: *negate,
+                    prog: sub,
+                });
+            }
+            Node::LookBehindFixed {
+                negate,
+                width,
+                body,
+            } => {
+                let sub = self.sub_program(body)?;
+                prog.push(Inst::LookBack {
+                    negate: *negate,
+                    width: *width,
                     prog: sub,
                 });
             }
@@ -178,7 +200,11 @@ impl Compiler {
             return Ok(());
         }
         // The general path unrolls `min` copies, so bound it to keep compiled programs small.
-        if min > MAX_REPEAT || max.map(|m| m > MAX_REPEAT).unwrap_or(false) {
+        let limit = match self.dialect {
+            Dialect::Js => MAX_REPEAT,
+            Dialect::Python => MAX_REPEAT_PY,
+        };
+        if min > limit || max.map(|m| m > limit).unwrap_or(false) {
             return Err("repetition count too large".into());
         }
         // ECMAScript's RepeatMatcher clears the captures inside the atom at the start of every
@@ -247,6 +273,9 @@ impl Compiler {
         span: Option<(usize, usize)>,
         prog: &mut Vec<Inst>,
     ) -> Result<(), String> {
+        if prog.len() > MAX_PROGRAM {
+            return Err("regular expression too large".into());
+        }
         if let Some((lo, hi)) = span {
             prog.push(Inst::ClearCaps(lo, hi));
         }
@@ -293,6 +322,7 @@ fn cap_span(node: &Node) -> Option<(usize, usize)> {
         Node::Repeat(inner, ..)
         | Node::Look(_, inner)
         | Node::LookBehind(_, inner)
+        | Node::LookBehindFixed { body: inner, .. }
         | Node::Atomic(inner)
         | Node::Modifier { inner, .. } => cap_span(inner),
         _ => None,

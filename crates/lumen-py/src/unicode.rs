@@ -51,8 +51,12 @@ pub fn nfkc(s: &str) -> String {
     if s.is_ascii() {
         return s.to_string();
     }
-    let cps: Vec<u32> = s.chars().map(|c| c as u32).collect();
-    unicode_norm_impl::normalize(&cps, "NFKC").into_iter().filter_map(char::from_u32).collect()
+    let cps: Vec<u32> = lumen_common::smuggle::code_points(s).collect();
+    let mut out = String::with_capacity(s.len());
+    for c in unicode_norm_impl::normalize(&cps, "NFKC") {
+        lumen_common::smuggle::push_code_point(&mut out, c);
+    }
+    out
 }
 
 #[cfg(test)]

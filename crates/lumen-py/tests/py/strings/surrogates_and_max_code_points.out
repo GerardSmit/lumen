@@ -1,0 +1,41 @@
+0xd800 1 True '\ud800' '\ud800' UnicodeEncodeError:'utf-8' codec can't encode character '\ud800' in position 0: surrogates not allowed eda080 00d8 0000d800 UnicodeEncodeError:'utf-8' codec can't encode character '\ud800' in position 0: surrogates not allowed True True UnicodeEncodeError:'utf-8' codec can't encode character '\ud800' in position 0: surrogates not allowed
+0xd801 1 True '\ud801' '\ud801' UnicodeEncodeError:'utf-8' codec can't encode character '\ud801' in position 0: surrogates not allowed eda081 01d8 0000d801 UnicodeEncodeError:'utf-8' codec can't encode character '\ud801' in position 0: surrogates not allowed True True UnicodeEncodeError:'utf-8' codec can't encode character '\ud801' in position 0: surrogates not allowed
+0xdb7f 1 True '\udb7f' '\udb7f' UnicodeEncodeError:'utf-8' codec can't encode character '\udb7f' in position 0: surrogates not allowed edadbf 7fdb 0000db7f UnicodeEncodeError:'utf-8' codec can't encode character '\udb7f' in position 0: surrogates not allowed True True UnicodeEncodeError:'utf-8' codec can't encode character '\udb7f' in position 0: surrogates not allowed
+0xdbff 1 True '\udbff' '\udbff' UnicodeEncodeError:'utf-8' codec can't encode character '\udbff' in position 0: surrogates not allowed edafbf ffdb 0000dbff UnicodeEncodeError:'utf-8' codec can't encode character '\udbff' in position 0: surrogates not allowed True True UnicodeEncodeError:'utf-8' codec can't encode character '\udbff' in position 0: surrogates not allowed
+0xdc00 1 True '\udc00' '\udc00' UnicodeEncodeError:'utf-8' codec can't encode character '\udc00' in position 0: surrogates not allowed edb080 00dc 0000dc00 UnicodeEncodeError:'utf-8' codec can't encode character '\udc00' in position 0: surrogates not allowed True True UnicodeEncodeError:'utf-8' codec can't encode character '\udc00' in position 0: surrogates not allowed
+0xdc80 1 True '\udc80' '\udc80' UnicodeEncodeError:'utf-8' codec can't encode character '\udc80' in position 0: surrogates not allowed edb280 80dc 0000dc80 80 True True True
+0xdcff 1 True '\udcff' '\udcff' UnicodeEncodeError:'utf-8' codec can't encode character '\udcff' in position 0: surrogates not allowed edb3bf ffdc 0000dcff ff True True True
+0xdfff 1 True '\udfff' '\udfff' UnicodeEncodeError:'utf-8' codec can't encode character '\udfff' in position 0: surrogates not allowed edbfbf ffdf 0000dfff UnicodeEncodeError:'utf-8' codec can't encode character '\udfff' in position 0: surrogates not allowed True True UnicodeEncodeError:'utf-8' codec can't encode character '\udfff' in position 0: surrogates not allowed
+0x10f000 1 True '\U0010f000' '\U0010f000' f48f8080 f48f8080 fcdb00dc 0010f000 f48f8080 True True True
+0x10f7ff 1 True '\U0010f7ff' '\U0010f7ff' f48f9fbf f48f9fbf fddbffdf 0010f7ff f48f9fbf True True True
+0x10f800 1 True '\U0010f800' '\U0010f800' f48fa080 f48fa080 fedb00dc 0010f800 f48fa080 True True True
+0x10f801 1 True '\U0010f801' '\U0010f801' f48fa081 f48fa081 fedb01dc 0010f801 f48fa081 True True True
+0x10fbff 1 True '\U0010fbff' '\U0010fbff' f48fafbf f48fafbf fedbffdf 0010fbff f48fafbf True True True
+0x10fc00 1 True '\U0010fc00' '\U0010fc00' f48fb080 f48fb080 ffdb00dc 0010fc00 f48fb080 True True True
+0x10fffe 1 True '\U0010fffe' '\U0010fffe' f48fbfbe f48fbfbe ffdbfedf 0010fffe f48fbfbe True True True
+0x10ffff 1 True '\U0010ffff' '\U0010ffff' f48fbfbf f48fbfbf ffdbffdf 0010ffff f48fbfbf True True True
+6144 6144 True
+True True
+True
+'\ud7ff' [True, True, True, True]
+'\ue000' [False, False, True, True]
+'\uffff' [False, False, True, True]
+'𐀀' [False, False, True, True]
+'\U0010efff' [False, False, True, True]
+2 False '\udbff\udfff' True False
+UnicodeEncodeError:'utf-8' codec can't encode characters in position 0-1: surrogates not allowed ffdbffdf
+'\udbff\udfff'
+'\U0010ffff'
+'\U0010ffff' '\U0010f7ff\udc80'
+6 ['0x61', '0x10ffff', '0xd800', '0x10f800', '0xdfff', '0x7a'] '\U0010ffff' '\U0010ffff\ud800\U0010f800' 'z\udfff\U0010f800\ud800\U0010ffffa' 'a\ud800\udfff'
+2 3 4 1 5
+['a\U0010ffff', '\U0010f800\udfffz'] 'a\U0010ffff\ud800-\udfffz' False True
+'A\U0010ffff\ud800\U0010f800\udfffZ' False ['a', '\U0010ffff', '\ud800', '\U0010f800', '\udfff', 'z'] ('a', '\U0010ffff', '\ud800', '\U0010f800', '\udfff', 'z')
+'\U0010ffff\ud800' '\U0010f7ff' 'a\udbff\U0010f800\udfffz'
+'**a\U0010ffff\ud800\U0010f800\udfffz**' '\ud800\U0010f800\udfffz' ('a\U0010ffff\ud800', '\U0010f800', '\udfffz')
+'\U0010ffffx\U0010fffe' 'x\U0010fffe\U0010f801' '\U0010f800\U0010ffffx\U0010fffe' ''
+'\U0010ffff\U0010ffffab\U0010ffff\U0010ffff' 'ab\ud800\ud800' '\U0010ffff\U0010ffffab\U0010ffff\U0010ffff' '\U0010ffff\U0010ffff\U0010ffff5'
+'\U0010ffff  |' '  \U0010ffff' '\U0010ffffa'
+True (2, 3) (3, 4)
+(4, 5) 'a#\ud800#\udfffz' ['a\U0010ffff', '\U0010f800\udfffz']
+True 'aa\U0010ffff\U0010ffff\ud800\ud800\U0010f800\U0010f800\udfff\udfffzz'

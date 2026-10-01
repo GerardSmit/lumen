@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 lumen = { path = "../lumen", features = ["embed"] }
+lumen-bind = { path = "../lumen-bind" }
 lumen-common = { path = "../lumen-common", features = ["compress"] }
 
 web-time = "1"

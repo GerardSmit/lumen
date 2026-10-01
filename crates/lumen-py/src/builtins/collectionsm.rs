@@ -2,23 +2,10 @@
 
 use super::native::*;
 use crate::ast::{BinOp, CmpOp};
+use crate::bind::{opaque_instance, type_object, KwArgs, NativeError, NativeResult, Py, This};
 use crate::object::*;
 use crate::vm::*;
 use std::collections::VecDeque;
-
-pub struct Deque {
-    items: VecDeque<Value>,
-    maxlen: Option<usize>,
-    state: u64,
-}
-
-struct DequeIter {
-    deque: Value,
-    idx: usize,
-    state: u64,
-    remaining: usize,
-    reverse: bool,
-}
 
 pub struct TupleGetter {
     pub index: usize,
@@ -27,557 +14,593 @@ pub struct TupleGetter {
 
 const MUTATED: &str = "deque mutated during iteration";
 
-fn dq<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&mut Deque) -> X) -> R<X> {
-    match with_opaque::<Deque, _>(v, f) {
-        Some(x) => Ok(x),
-        None => Err(it.self_state_err("collections.deque")),
-    }
+#[lumen_bind::class(name = "deque", module = "collections", generic, hint(py(unhashable)))]
+pub struct Deque {
+    items: VecDeque<Value>,
+    maxlen: Option<usize>,
+    state: u64,
 }
 
-fn is_deque(v: &Value) -> bool {
-    with_opaque::<Deque, _>(v, |_| ()).is_some()
-}
-
-fn push_back(d: &mut Deque, v: Value) {
-    d.items.push_back(v);
-    if let Some(m) = d.maxlen {
-        if d.items.len() > m {
-            d.items.pop_front();
+impl Deque {
+    fn push_back(&mut self, v: Value) {
+        self.items.push_back(v);
+        if self.maxlen.is_some_and(|m| self.items.len() > m) {
+            self.items.pop_front();
         }
+        self.state += 1;
     }
-    d.state += 1;
-}
 
-fn push_front(d: &mut Deque, v: Value) {
-    d.items.push_front(v);
-    if let Some(m) = d.maxlen {
-        if d.items.len() > m {
-            d.items.pop_back();
+    fn push_front(&mut self, v: Value) {
+        self.items.push_front(v);
+        if self.maxlen.is_some_and(|m| self.items.len() > m) {
+            self.items.pop_back();
         }
+        self.state += 1;
     }
-    d.state += 1;
-}
 
-fn deque_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    match a.first() {
-        Some(Value::Obj(c)) => Ok(new_opaque(c, Deque { items: VecDeque::new(), maxlen: None, state: 0 })),
-        _ => Err(it.type_error("deque.__new__(X): X is not a type object")),
+    fn snapshot(slf: &Py<Self>, it: &mut Interp) -> R<Vec<Value>> {
+        Ok(slf.borrow(it)?.items.iter().cloned().collect())
     }
-}
 
-fn deque_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("deque", &a[1.min(a.len())..], kw, &["iterable", "maxlen"], 0)?;
-    let maxlen = match &b[1] {
-        Some(v) if !v.is_none() => {
-            if !it.has_index(v) {
-                return Err(it.type_error("an integer is required"));
-            }
-            let n = it.index_of(v)?;
-            if n < 0 {
-                return Err(it.value_error("maxlen must be non-negative"));
-            }
-            Some(n as usize)
-        }
-        _ => None,
-    };
-    dq(it, &a[0], |d| {
-        d.maxlen = maxlen;
-        d.items.clear();
-        d.state += 1;
-    })?;
-    if let Some(src) = &b[0] {
-        extend_with(it, &a[0], src, false)?;
-    }
-    Ok(Value::None)
-}
-
-fn extend_with(it: &mut Interp, target: &Value, src: &Value, left: bool) -> R<()> {
-    let items = if src.is(target) { dq(it, target, |d| d.items.iter().cloned().collect::<Vec<_>>())? } else { it.iterate_to_vec(src)? };
-    dq(it, target, |d| {
+    fn extend_with(slf: &Py<Self>, it: &mut Interp, src: &Value, left: bool) -> R<()> {
+        let items = if src.is(slf.value()) { Self::snapshot(slf, it)? } else { it.iterate_to_vec(src)? };
+        let mut d = slf.borrow_mut(it)?;
         for v in items {
             if left {
-                push_front(d, v);
+                d.push_front(v);
             } else {
-                push_back(d, v);
+                d.push_back(v);
             }
         }
-    })
-}
-
-fn deque_append(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("append", a, 2, 2)?;
-    dq(it, &a[0], |d| push_back(d, a[1].clone()))?;
-    Ok(Value::None)
-}
-
-fn deque_appendleft(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("appendleft", a, 2, 2)?;
-    dq(it, &a[0], |d| push_front(d, a[1].clone()))?;
-    Ok(Value::None)
-}
-
-fn deque_pop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("pop", a, 1, 1)?;
-    match dq(it, &a[0], |d| {
-        d.state += 1;
-        d.items.pop_back()
-    })? {
-        Some(v) => Ok(v),
-        None => Err(it.new_exc_str("IndexError", "pop from an empty deque")),
+        Ok(())
     }
-}
 
-fn deque_popleft(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("popleft", a, 1, 1)?;
-    match dq(it, &a[0], |d| {
-        d.state += 1;
-        d.items.pop_front()
-    })? {
-        Some(v) => Ok(v),
-        None => Err(it.new_exc_str("IndexError", "pop from an empty deque")),
-    }
-}
-
-fn deque_extend(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("extend", a, 2, 2)?;
-    extend_with(it, &a[0], &a[1], false)?;
-    Ok(Value::None)
-}
-
-fn deque_extendleft(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("extendleft", a, 2, 2)?;
-    extend_with(it, &a[0], &a[1], true)?;
-    Ok(Value::None)
-}
-
-fn deque_clear(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("clear", a, 1, 1)?;
-    let old = dq(it, &a[0], |d| {
-        d.state += 1;
-        std::mem::take(&mut d.items)
-    })?;
-    drop(old);
-    Ok(Value::None)
-}
-
-fn deque_copy(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("copy", a, 1, 1)?;
-    let (items, maxlen) = dq(it, &a[0], |d| (d.items.iter().cloned().collect::<Vec<_>>(), d.maxlen))?;
-    let ty = it.type_of(&a[0]);
-    let dt = deque_type(it);
-    let exact = it.is_exact(&a[0], &dt);
-    if exact {
-        return Ok(new_opaque(&ty, Deque { items: items.into_iter().collect(), maxlen, state: 0 }));
-    }
-    let args = vec![Value::list(items), maxlen.map(|m| Value::Int(m as i64)).unwrap_or(Value::None)];
-    it.call(&Value::Obj(ty), args, Vec::new())
-}
-
-fn deque_type(it: &mut Interp) -> Obj {
-    let m = match dict_get_str(&it.modules, "_collections") {
-        Some(Value::Obj(m)) => m,
-        _ => unreachable!("_collections is loaded"),
-    };
-    let d = it.module_dict(&m);
-    match dict_get_str(&d, "deque") {
-        Some(Value::Obj(t)) => t,
-        _ => unreachable!(),
-    }
-}
-
-fn item_at(it: &mut Interp, v: &Value, i: usize) -> R<Option<Value>> {
-    dq(it, v, |d| d.items.get(i).cloned())
-}
-
-fn state_of(it: &mut Interp, v: &Value) -> R<u64> {
-    dq(it, v, |d| d.state)
-}
-
-fn len_of(it: &mut Interp, v: &Value) -> R<usize> {
-    dq(it, v, |d| d.items.len())
-}
-
-fn deque_count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("count", a, 2, 2)?;
-    let st = state_of(it, &a[0])?;
-    let n = len_of(it, &a[0])?;
-    let mut count = 0;
-    for i in 0..n {
-        let Some(x) = item_at(it, &a[0], i)? else { break };
-        if it.values_eq(&x, &a[1])? {
-            count += 1;
+    /// The item at `i` unless the deque changed since `state` (Python code run by a comparison
+    /// may mutate it).
+    fn item_checked(slf: &Py<Self>, it: &mut Interp, i: usize, state: u64, exc: &str) -> R<Option<Value>> {
+        let d = slf.borrow(it)?;
+        if d.state != state {
+            drop(d);
+            return Err(it.new_exc_str(exc, MUTATED));
         }
-        if state_of(it, &a[0])? != st {
-            return Err(it.new_exc_str("RuntimeError", MUTATED));
-        }
+        Ok(d.items.get(i).cloned())
     }
-    Ok(Value::Int(count))
-}
 
-fn clamp_index(it: &mut Interp, v: &Value, len: usize) -> R<usize> {
-    let i = it.index_of(v)?;
-    Ok(if i < 0 { (i + len as i64).max(0) as usize } else { (i as usize).min(len) })
-}
-
-fn deque_index(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("index", a, 2, 4)?;
-    let n = len_of(it, &a[0])?;
-    let start = match a.get(2) {
-        Some(v) => clamp_index(it, v, n)?,
-        None => 0,
-    };
-    let stop = match a.get(3) {
-        Some(v) => clamp_index(it, v, n)?,
-        None => n,
-    };
-    let st = state_of(it, &a[0])?;
-    for i in start..stop.min(n) {
-        let Some(x) = item_at(it, &a[0], i)? else { break };
-        if it.values_eq(&x, &a[1])? {
-            return Ok(Value::Int(i as i64));
+    /// The position of the first item equal to `value` in `start..stop`.
+    fn find(slf: &Py<Self>, it: &mut Interp, value: &Value, start: usize, stop: usize, exc: &str) -> R<Option<usize>> {
+        let state = slf.borrow(it)?.state;
+        for i in start..stop {
+            let Some(x) = Self::item_checked(slf, it, i, state, exc)? else { break };
+            let eq = it.values_eq(&x, value)?;
+            if slf.borrow(it)?.state != state {
+                return Err(it.new_exc_str(exc, MUTATED));
+            }
+            if eq {
+                return Ok(Some(i));
+            }
         }
-        if state_of(it, &a[0])? != st {
-            return Err(it.new_exc_str("RuntimeError", MUTATED));
-        }
+        Ok(None)
     }
-    let r = it.repr_of(&a[1])?;
-    Err(it.value_error(&format!("{} is not in deque", r)))
-}
 
-fn deque_insert(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("insert", a, 3, 3)?;
-    let i = it.index_of(&a[1])?;
-    let full = dq(it, &a[0], |d| d.maxlen.is_some_and(|m| d.items.len() >= m))?;
-    if full {
-        return Err(it.new_exc_str("IndexError", "deque already at its maximum size"));
-    }
-    dq(it, &a[0], |d| {
-        let n = d.items.len() as i64;
-        let pos = if i < 0 { (i + n).max(0) } else { i.min(n) } as usize;
-        d.items.insert(pos, a[2].clone());
-        d.state += 1;
-    })?;
-    Ok(Value::None)
-}
-
-fn deque_remove(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("remove", a, 2, 2)?;
-    let st = state_of(it, &a[0])?;
-    let n = len_of(it, &a[0])?;
-    for i in 0..n {
-        let Some(x) = item_at(it, &a[0], i)? else { break };
-        let eq = it.values_eq(&x, &a[1])?;
-        if state_of(it, &a[0])? != st {
-            return Err(it.new_exc_str("IndexError", MUTATED));
+    fn index_arg(it: &mut Interp, key: &Value, len: usize) -> R<usize> {
+        if it.is_slice(key) || !it.has_index(key) {
+            let t = it.type_name_of(key);
+            return Err(it.type_error(&format!("sequence index must be integer, not '{}'", t)));
         }
-        if eq {
-            dq(it, &a[0], |d| {
-                d.items.remove(i);
+        let i = it.seq_index(key)?;
+        let j = if i < 0 { i + len as i64 } else { i };
+        if j < 0 || j >= len as i64 {
+            return Err(it.new_exc_str("IndexError", "deque index out of range"));
+        }
+        Ok(j as usize)
+    }
+
+    fn clamp_index(it: &mut Interp, v: &Value, len: usize) -> R<usize> {
+        let i = it.slice_index(v)?;
+        Ok(if i < 0 { i.saturating_add(len as i64).max(0) as usize } else { (i as usize).min(len) })
+    }
+
+    fn compare(slf: Py<Self>, it: &mut Interp, other: &Value, op: CmpOp) -> R<Value> {
+        let Some(other) = Py::<Deque>::from_value(it, other) else { return Ok(Value::NotImplemented) };
+        let x = Value::list(Self::snapshot(&slf, it)?);
+        let y = Value::list(Self::snapshot(&other, it)?);
+        it.compare_op(op, &x, &y)
+    }
+
+    fn repeat(slf: &Py<Self>, it: &mut Interp, n: i64) -> R<()> {
+        let items = Self::snapshot(slf, it)?;
+        let mut out = Vec::new();
+        if n > 0 && !items.is_empty() {
+            if (items.len() as i128) * (n as i128) > (isize::MAX as i128) / 16 {
+                return Err(it.new_exc_str("MemoryError", ""));
+            }
+            out.reserve(items.len() * n as usize);
+            for _ in 0..n {
+                out.extend(items.iter().cloned());
+            }
+        }
+        let old = {
+            let mut d = slf.borrow_mut(it)?;
+            let old = std::mem::take(&mut d.items);
+            for v in out {
+                d.push_back(v);
+            }
+            d.state += 1;
+            old
+        };
+        drop(old);
+        Ok(())
+    }
+}
+
+#[lumen_bind::methods]
+impl Deque {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> Deque {
+        let _ = (args, kwargs);
+        Deque { items: VecDeque::new(), maxlen: None, state: 0 }
+    }
+
+    #[proto(init)]
+    #[method(hint(py(text_signature = "($self, /, *args, **kwargs)")))]
+    fn __init__(slf: This<Py<Self>>, it: &mut Interp, #[kw] iterable: Option<&Value>, #[kw] maxlen: Option<&Value>) -> R<()> {
+        let slf = slf.0;
+        let maxlen = match maxlen {
+            Some(v) => {
+                if !it.has_index(v) {
+                    return Err(it.type_error("an integer is required"));
+                }
+                let n = it.index_of(v)?;
+                if n < 0 {
+                    return Err(it.value_error("maxlen must be non-negative"));
+                }
+                Some(n as usize)
+            }
+            None => None,
+        };
+        let old = {
+            let mut d = slf.borrow_mut(it)?;
+            d.maxlen = maxlen;
+            d.state += 1;
+            std::mem::take(&mut d.items)
+        };
+        drop(old);
+        if let Some(src) = iterable {
+            Self::extend_with(&slf, it, src, false)?;
+        }
+        Ok(())
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn append(&mut self, item: Value) {
+        self.push_back(item);
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn appendleft(&mut self, item: Value) {
+        self.push_front(item);
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn pop(&mut self) -> NativeResult<Value> {
+        self.state += 1;
+        self.items.pop_back().ok_or_else(|| NativeError::index_error("pop from an empty deque"))
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn popleft(&mut self) -> NativeResult<Value> {
+        self.state += 1;
+        self.items.pop_front().ok_or_else(|| NativeError::index_error("pop from an empty deque"))
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn extend(slf: This<Py<Self>>, it: &mut Interp, iterable: &Value) -> R<()> {
+        let slf = slf.0;
+        Self::extend_with(&slf, it, iterable, false)
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn extendleft(slf: This<Py<Self>>, it: &mut Interp, iterable: &Value) -> R<()> {
+        let slf = slf.0;
+        Self::extend_with(&slf, it, iterable, true)
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn clear(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
+        let slf = slf.0;
+        let old = {
+            let mut d = slf.borrow_mut(it)?;
+            d.state += 1;
+            std::mem::take(&mut d.items)
+        };
+        drop(old);
+        Ok(())
+    }
+
+    #[method(hint(py(aliases = "__copy__", text_signature = "")))]
+    fn copy(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let slf = slf.0;
+        let items = Self::snapshot(&slf, it)?;
+        let maxlen = slf.borrow(it)?.maxlen;
+        let ty = it.type_of(slf.value());
+        let exact = type_object::<Deque>(it);
+        if it.is_exact(slf.value(), &exact) {
+            return Ok(opaque_instance(&ty, Deque { items: items.into(), maxlen, state: 0 }));
+        }
+        let args = vec![Value::list(items), maxlen.map(|m| Value::Int(m as i64)).unwrap_or(Value::None)];
+        it.call(&Value::Obj(ty), args, Vec::new())
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn count(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<i64> {
+        let slf = slf.0;
+        let (state, n) = {
+            let d = slf.borrow(it)?;
+            (d.state, d.items.len())
+        };
+        let mut count = 0;
+        for i in 0..n {
+            let Some(x) = Self::item_checked(&slf, it, i, state, "RuntimeError")? else { break };
+            if it.values_eq(&x, value)? {
+                count += 1;
+            }
+            if slf.borrow(it)?.state != state {
+                return Err(it.new_exc_str("RuntimeError", MUTATED));
+            }
+        }
+        Ok(count)
+    }
+
+    #[method(hint(py(text_signature = "", arg_style = "parse")))]
+    fn index(slf: This<Py<Self>>, it: &mut Interp, value: &Value, start: Option<&Value>, stop: Option<&Value>) -> R<usize> {
+        let slf = slf.0;
+        let n = slf.borrow(it)?.items.len();
+        let start = match start {
+            Some(v) => Self::clamp_index(it, v, n)?,
+            None => 0,
+        };
+        let stop = match stop {
+            Some(v) => Self::clamp_index(it, v, n)?,
+            None => n,
+        };
+        if let Some(i) = Self::find(&slf, it, value, start, stop.min(n), "RuntimeError")? {
+            return Ok(i);
+        }
+        let r = it.repr_of(value)?;
+        Err(it.value_error(&format!("{} is not in deque", r)))
+    }
+
+    #[method(hint(py(text_signature = "", arg_style = "parse")))]
+    fn insert(&mut self, index: isize, value: Value) -> NativeResult<()> {
+        if self.maxlen.is_some_and(|m| self.items.len() >= m) {
+            return Err(NativeError::index_error("deque already at its maximum size"));
+        }
+        let n = self.items.len() as isize;
+        let pos = if index < 0 { (index + n).max(0) } else { index.min(n) } as usize;
+        self.items.insert(pos, value);
+        self.state += 1;
+        Ok(())
+    }
+
+    #[method(hint(py(text_signature = "")))]
+    fn remove(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<()> {
+        let slf = slf.0;
+        let n = slf.borrow(it)?.items.len();
+        if let Some(i) = Self::find(&slf, it, value, 0, n, "IndexError")? {
+            let old = {
+                let mut d = slf.borrow_mut(it)?;
                 d.state += 1;
-            })?;
-            return Ok(Value::None);
+                d.items.remove(i)
+            };
+            drop(old);
+            return Ok(());
         }
+        let r = it.repr_of(value)?;
+        Err(it.value_error(&format!("{} is not in deque", r)))
     }
-    let r = it.repr_of(&a[1])?;
-    Err(it.value_error(&format!("{} is not in deque", r)))
-}
 
-fn deque_reverse(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("reverse", a, 1, 1)?;
-    dq(it, &a[0], |d| {
-        d.items.make_contiguous().reverse();
-        d.state += 1;
-    })?;
-    Ok(Value::None)
-}
+    #[method(hint(py(text_signature = "")))]
+    fn reverse(&mut self) {
+        self.items.make_contiguous().reverse();
+        self.state += 1;
+    }
 
-fn deque_rotate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("rotate", a, 1, 2)?;
-    let n = match a.get(1) {
-        Some(v) => it.index_of(v)?,
-        None => 1,
-    };
-    dq(it, &a[0], |d| {
-        let len = d.items.len() as i64;
+    #[method(hint(py(text_signature = "", arg_name = "deque.rotate")))]
+    fn rotate(&mut self, #[default(1)] n: isize) {
+        let len = self.items.len() as isize;
         if len > 1 {
-            let k = n.rem_euclid(len) as usize;
-            d.items.rotate_right(k);
+            self.items.rotate_right(n.rem_euclid(len) as usize);
         }
-        d.state += 1;
-    })?;
-    Ok(Value::None)
-}
-
-fn deque_maxlen(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(dq(it, &a[0], |d| d.maxlen)?.map(|m| Value::Int(m as i64)).unwrap_or(Value::None))
-}
-
-fn deque_len(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(len_of(it, &a[0])? as i64))
-}
-
-fn deque_index_arg(it: &mut Interp, key: &Value, len: usize) -> R<usize> {
-    if it.is_slice(key) {
-        return Err(it.type_error("sequence index must be integer, not 'slice'"));
+        self.state += 1;
     }
-    if !it.has_index(key) {
-        let t = it.type_name_of(key);
-        return Err(it.type_error(&format!("sequence index must be integer, not '{}'", t)));
-    }
-    let i = it.index_of(key)?;
-    let j = if i < 0 { i + len as i64 } else { i };
-    if j < 0 || j >= len as i64 {
-        return Err(it.new_exc_str("IndexError", "deque index out of range"));
-    }
-    Ok(j as usize)
-}
 
-fn deque_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__getitem__", a, 2, 2)?;
-    let n = len_of(it, &a[0])?;
-    let i = deque_index_arg(it, &a[1], n)?;
-    Ok(item_at(it, &a[0], i)?.unwrap_or(Value::None))
-}
+    #[getter]
+    fn maxlen(&self) -> Option<usize> {
+        self.maxlen
+    }
 
-fn deque_setitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__setitem__", a, 3, 3)?;
-    let n = len_of(it, &a[0])?;
-    let i = deque_index_arg(it, &a[1], n)?;
-    dq(it, &a[0], |d| {
-        if let Some(slot) = d.items.get_mut(i) {
-            *slot = a[2].clone();
+    #[proto(len)]
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+
+    #[proto(getitem)]
+    fn __getitem__(slf: This<Py<Self>>, it: &mut Interp, key: &Value) -> R<Value> {
+        let slf = slf.0;
+        let n = slf.borrow(it)?.items.len();
+        let i = Self::index_arg(it, key, n)?;
+        let v = slf.borrow(it)?.items.get(i).cloned().unwrap_or(Value::None);
+        Ok(v)
+    }
+
+    #[proto(setitem)]
+    fn __setitem__(slf: This<Py<Self>>, it: &mut Interp, key: &Value, value: Value) -> R<()> {
+        let slf = slf.0;
+        let n = slf.borrow(it)?.items.len();
+        let i = Self::index_arg(it, key, n)?;
+        let old = slf.borrow_mut(it)?.items.get_mut(i).map(|slot| std::mem::replace(slot, value));
+        drop(old);
+        Ok(())
+    }
+
+    #[proto(delitem)]
+    fn __delitem__(slf: This<Py<Self>>, it: &mut Interp, key: &Value) -> R<()> {
+        let slf = slf.0;
+        let n = slf.borrow(it)?.items.len();
+        let i = Self::index_arg(it, key, n)?;
+        let old = {
+            let mut d = slf.borrow_mut(it)?;
+            d.state += 1;
+            d.items.remove(i)
+        };
+        drop(old);
+        Ok(())
+    }
+
+    #[proto(contains)]
+    fn __contains__(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<bool> {
+        let slf = slf.0;
+        let n = slf.borrow(it)?.items.len();
+        Ok(Self::find(&slf, it, value, 0, n, "RuntimeError")?.is_some())
+    }
+
+    #[proto(iter)]
+    fn __iter__(slf: This<Py<Self>>, it: &mut Interp) -> R<DequeIter> {
+        let slf = slf.0;
+        DequeIter::over(slf, it)
+    }
+
+    #[proto(reversed)]
+    #[method(hint(py(text_signature = "")))]
+    fn __reversed__(slf: This<Py<Self>>, it: &mut Interp) -> R<DequeRevIter> {
+        let slf = slf.0;
+        Ok(DequeRevIter(DequeIter::over(slf, it)?))
+    }
+
+    #[proto(repr)]
+    fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let slf = slf.0;
+        let Value::Obj(o) = slf.value() else { return Ok(Value::str("deque([])")) };
+        let ty = it.type_of(slf.value());
+        let name = it.type_name(&ty);
+        if it.repr_enter(o) {
+            return Ok(Value::string(format!("{}(...)", name)));
         }
-    })?;
-    Ok(Value::None)
-}
-
-fn deque_delitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__delitem__", a, 2, 2)?;
-    let n = len_of(it, &a[0])?;
-    let i = deque_index_arg(it, &a[1], n)?;
-    let old = dq(it, &a[0], |d| {
-        d.state += 1;
-        d.items.remove(i)
-    })?;
-    drop(old);
-    Ok(Value::None)
-}
-
-fn deque_contains(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__contains__", a, 2, 2)?;
-    let st = state_of(it, &a[0])?;
-    let n = len_of(it, &a[0])?;
-    for i in 0..n {
-        let Some(x) = item_at(it, &a[0], i)? else { break };
-        if it.values_eq(&x, &a[1])? {
-            return Ok(Value::Bool(true));
-        }
-        if state_of(it, &a[0])? != st {
-            return Err(it.new_exc_str("RuntimeError", MUTATED));
-        }
-    }
-    Ok(Value::Bool(false))
-}
-
-fn deque_iter_obj(it: &mut Interp, deque: &Value, reverse: bool) -> R<Value> {
-    let (st, n) = dq(it, deque, |d| (d.state, d.items.len()))?;
-    let ty = iter_type(it, reverse);
-    Ok(new_opaque(&ty, DequeIter { deque: deque.clone(), idx: 0, state: st, remaining: n, reverse }))
-}
-
-fn iter_type(it: &mut Interp, reverse: bool) -> Obj {
-    let m = match dict_get_str(&it.modules, "_collections") {
-        Some(Value::Obj(m)) => m,
-        _ => unreachable!("_collections is loaded"),
-    };
-    let d = it.module_dict(&m);
-    match dict_get_str(&d, if reverse { "_deque_reverse_iterator" } else { "_deque_iterator" }) {
-        Some(Value::Obj(t)) => t,
-        _ => unreachable!(),
-    }
-}
-
-fn deque_iter(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    deque_iter_obj(it, &a[0], false)
-}
-
-fn deque_reversed(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    deque_iter_obj(it, &a[0], true)
-}
-
-fn dit_next(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Some((deque, idx, st, remaining, reverse)) = with_opaque::<DequeIter, _>(&a[0], |d| (d.deque.clone(), d.idx, d.state, d.remaining, d.reverse)) else {
-        return Err(it.self_state_err("_deque_iterator"));
-    };
-    if state_of(it, &deque)? != st {
-        with_opaque::<DequeIter, _>(&a[0], |d| d.remaining = 0);
-        return Err(it.new_exc_str("RuntimeError", MUTATED));
-    }
-    if remaining == 0 {
-        return Err(it.new_exc_str("StopIteration", ""));
-    }
-    let n = len_of(it, &deque)?;
-    let pos = if reverse { n.checked_sub(1 + idx) } else { Some(idx) };
-    let v = pos.and_then(|p| dq(it, &deque, |d| d.items.get(p).cloned()).ok().flatten());
-    with_opaque::<DequeIter, _>(&a[0], |d| {
-        d.idx += 1;
-        d.remaining -= 1;
-    });
-    match v {
-        Some(v) => Ok(v),
-        None => Err(it.new_exc_str("StopIteration", "")),
-    }
-}
-
-fn dit_iter(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(a[0].clone())
-}
-
-fn dit_len(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    match with_opaque::<DequeIter, _>(&a[0], |d| d.remaining) {
-        Some(n) => Ok(Value::Int(n as i64)),
-        None => Err(it.self_state_err("_deque_iterator")),
-    }
-}
-
-fn dit_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("_deque_iterator", &a[1.min(a.len())..], 1, 2)?;
-    if !is_deque(&a[1]) {
-        return Err(it.type_error("_deque_iterator() argument 1 must be collections.deque"));
-    }
-    deque_iter_obj(it, &a[1], false)
-}
-
-fn deque_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Value::Obj(o) = &a[0] else { return Ok(Value::str("deque([])")) };
-    let ty = it.type_of(&a[0]);
-    let name = it.type_name(&ty);
-    if it.repr_enter(o) {
-        return Ok(Value::string(format!("{}(...)", name)));
-    }
-    let (items, maxlen) = dq(it, &a[0], |d| (d.items.iter().cloned().collect::<Vec<_>>(), d.maxlen))?;
-    let mut parts = Vec::new();
-    let mut err = None;
-    for v in &items {
-        match it.repr_of(v) {
-            Ok(s) => parts.push(s),
-            Err(e) => {
-                err = Some(e);
-                break;
+        let items = Self::snapshot(&slf, it);
+        let maxlen = slf.borrow(it).map(|d| d.maxlen);
+        let (items, maxlen) = match (items, maxlen) {
+            (Ok(i), Ok(m)) => (i, m),
+            (Err(e), _) | (_, Err(e)) => {
+                it.repr_leave();
+                return Err(e);
+            }
+        };
+        let mut parts = Vec::new();
+        let mut err = None;
+        for v in &items {
+            match it.repr_of(v) {
+                Ok(s) => parts.push(s),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             }
         }
-    }
-    it.repr_leave();
-    if let Some(e) = err {
-        return Err(e);
-    }
-    Ok(Value::string(match maxlen {
-        Some(m) => format!("{}([{}], maxlen={})", name, parts.join(", "), m),
-        None => format!("{}([{}])", name, parts.join(", ")),
-    }))
-}
-
-fn deque_cmp(it: &mut Interp, a: &[Value], op: CmpOp) -> R<Value> {
-    it.check_args("comparison", a, 2, 2)?;
-    if !is_deque(&a[1]) {
-        return Ok(Value::NotImplemented);
-    }
-    let x = Value::list(dq(it, &a[0], |d| d.items.iter().cloned().collect())?);
-    let y = Value::list(dq(it, &a[1], |d| d.items.iter().cloned().collect())?);
-    it.compare_op(op, &x, &y)
-}
-
-macro_rules! deque_cmp_fn {
-    ($name:ident, $op:expr) => {
-        fn $name(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-            deque_cmp(it, a, $op)
+        it.repr_leave();
+        if let Some(e) = err {
+            return Err(e);
         }
-    };
-}
-deque_cmp_fn!(deque_eq, CmpOp::Eq);
-deque_cmp_fn!(deque_ne, CmpOp::NotEq);
-deque_cmp_fn!(deque_lt, CmpOp::Lt);
-deque_cmp_fn!(deque_le, CmpOp::LtE);
-deque_cmp_fn!(deque_gt, CmpOp::Gt);
-deque_cmp_fn!(deque_ge, CmpOp::GtE);
-
-fn deque_add(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__add__", a, 2, 2)?;
-    if !is_deque(&a[1]) {
-        let t = it.type_name_of(&a[1]);
-        return Err(it.type_error(&format!("can only concatenate deque (not \"{}\") to deque", t)));
+        Ok(Value::string(match maxlen {
+            Some(m) => format!("{}([{}], maxlen={})", name, parts.join(", "), m),
+            None => format!("{}([{}])", name, parts.join(", ")),
+        }))
     }
-    let copy = deque_copy(it, &a[..1], &[])?;
-    extend_with(it, &copy, &a[1], false)?;
-    Ok(copy)
-}
 
-fn deque_iadd(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__iadd__", a, 2, 2)?;
-    extend_with(it, &a[0], &a[1], false)?;
-    Ok(a[0].clone())
-}
+    #[proto(eq)]
+    fn __eq__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Value> {
+        let slf = slf.0;
+        Self::compare(slf, it, other, CmpOp::Eq)
+    }
 
-fn repeat_items(it: &mut Interp, items: Vec<Value>, n: i64) -> R<Vec<Value>> {
-    if n <= 0 || items.is_empty() {
-        return Ok(Vec::new());
+    #[proto(ne)]
+    fn __ne__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Value> {
+        let slf = slf.0;
+        Self::compare(slf, it, other, CmpOp::NotEq)
     }
-    if (items.len() as i128) * (n as i128) > (isize::MAX as i128) / 16 {
-        return Err(it.new_exc_str("MemoryError", ""));
-    }
-    let mut out = Vec::with_capacity(items.len() * n as usize);
-    for _ in 0..n {
-        out.extend(items.iter().cloned());
-    }
-    Ok(out)
-}
 
-fn deque_mul(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__mul__", a, 2, 2)?;
-    if !it.has_index(&a[1]) {
-        return Ok(Value::NotImplemented);
+    #[proto(lt)]
+    fn __lt__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Value> {
+        let slf = slf.0;
+        Self::compare(slf, it, other, CmpOp::Lt)
     }
-    let n = it.index_of(&a[1])?;
-    let copy = deque_copy(it, &a[..1], &[])?;
-    deque_imul_n(it, &copy, n)?;
-    Ok(copy)
-}
 
-fn deque_imul_n(it: &mut Interp, target: &Value, n: i64) -> R<()> {
-    let items: Vec<Value> = dq(it, target, |d| d.items.iter().cloned().collect())?;
-    let out = repeat_items(it, items, n)?;
-    dq(it, target, |d| {
-        d.items.clear();
-        for v in out {
-            push_back(d, v);
+    #[proto(le)]
+    fn __le__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Value> {
+        let slf = slf.0;
+        Self::compare(slf, it, other, CmpOp::LtE)
+    }
+
+    #[proto(gt)]
+    fn __gt__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Value> {
+        let slf = slf.0;
+        Self::compare(slf, it, other, CmpOp::Gt)
+    }
+
+    #[proto(ge)]
+    fn __ge__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Value> {
+        let slf = slf.0;
+        Self::compare(slf, it, other, CmpOp::GtE)
+    }
+
+    #[proto(add)]
+    fn __add__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Value> {
+        let slf = slf.0;
+        if Py::<Deque>::from_value(it, other).is_none() {
+            let t = it.type_name_of(other);
+            return Err(it.type_error(&format!("can only concatenate deque (not \"{}\") to deque", t)));
         }
-        d.state += 1;
-    })
-}
-
-fn deque_imul(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__imul__", a, 2, 2)?;
-    if !it.has_index(&a[1]) {
-        return Ok(Value::NotImplemented);
+        let copy = Self::copy(This(slf), it)?;
+        if let Some(copy_d) = Py::<Deque>::from_value(it, &copy) {
+            Self::extend_with(&copy_d, it, other, false)?;
+        }
+        Ok(copy)
     }
-    let n = it.index_of(&a[1])?;
-    deque_imul_n(it, &a[0], n)?;
-    Ok(a[0].clone())
+
+    #[proto(iadd)]
+    fn __iadd__(slf: This<Py<Self>>, it: &mut Interp, other: &Value) -> R<Py<Self>> {
+        let slf = slf.0;
+        Self::extend_with(&slf, it, other, false)?;
+        Ok(slf)
+    }
+
+    #[proto(mul)]
+    #[method(hint(py(aliases = "__rmul__")))]
+    fn __mul__(slf: This<Py<Self>>, it: &mut Interp, n: &Value) -> R<Value> {
+        let slf = slf.0;
+        if !it.has_index(n) {
+            return Ok(Value::NotImplemented);
+        }
+        let n = it.index_of(n)?;
+        let copy = Self::copy(This(slf), it)?;
+        if let Some(copy_d) = Py::<Deque>::from_value(it, &copy) {
+            Self::repeat(&copy_d, it, n)?;
+        }
+        Ok(copy)
+    }
+
+    #[proto(imul)]
+    fn __imul__(slf: This<Py<Self>>, it: &mut Interp, n: &Value) -> R<Value> {
+        let slf = slf.0;
+        if !it.has_index(n) {
+            return Ok(Value::NotImplemented);
+        }
+        let n = it.index_of(n)?;
+        Self::repeat(&slf, it, n)?;
+        Ok(slf.into_value())
+    }
+
+    #[proto(reduce)]
+    #[method(hint(py(text_signature = "")))]
+    fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let slf = slf.0;
+        let maxlen = slf.borrow(it)?.maxlen;
+        let ty = Value::Obj(it.type_of(slf.value()));
+        let args = match maxlen {
+            Some(m) => Value::tuple(vec![Value::list(Vec::new()), Value::Int(m as i64)]),
+            None => Value::tuple(Vec::new()),
+        };
+        let items = it.get_iter(slf.value())?;
+        Ok(Value::tuple(vec![ty, args, Value::None, items]))
+    }
+
+    #[proto(sizeof)]
+    #[method(hint(py(text_signature = "")))]
+    fn __sizeof__(&self) -> usize {
+        64 + 8 * self.items.len()
+    }
 }
 
-fn deque_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let maxlen = dq(it, &a[0], |d| d.maxlen)?;
-    let ty = Value::Obj(it.type_of(&a[0]));
-    let args = match maxlen {
-        Some(m) => Value::tuple(vec![Value::list(Vec::new()), Value::Int(m as i64)]),
-        None => Value::tuple(Vec::new()),
-    };
-    let items = it.get_iter(&a[0])?;
-    Ok(Value::tuple(vec![ty, args, Value::None, items]))
+/// A forward iterator over a deque (the reverse one wraps the same state).
+#[lumen_bind::class(name = "_deque_iterator", module = "_collections")]
+pub struct DequeIter {
+    deque: Py<Deque>,
+    idx: usize,
+    state: u64,
+    remaining: usize,
 }
 
-fn deque_sizeof(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(64 + 8 * len_of(it, &a[0])? as i64))
+impl DequeIter {
+    fn over(deque: Py<Deque>, it: &mut Interp) -> R<DequeIter> {
+        let (state, remaining) = {
+            let d = deque.borrow(it)?;
+            (d.state, d.items.len())
+        };
+        Ok(DequeIter { deque, idx: 0, state, remaining })
+    }
+
+    fn step(&mut self, it: &mut Interp, reverse: bool) -> R<Option<Value>> {
+        let d = self.deque.borrow(it)?;
+        if d.state != self.state {
+            drop(d);
+            self.remaining = 0;
+            return Err(it.new_exc_str("RuntimeError", MUTATED));
+        }
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let n = d.items.len();
+        let pos = if reverse { n.checked_sub(1 + self.idx) } else { Some(self.idx) };
+        let v = pos.and_then(|p| d.items.get(p).cloned());
+        self.idx += 1;
+        self.remaining -= 1;
+        Ok(v)
+    }
+}
+
+#[lumen_bind::methods]
+impl DequeIter {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(it: &mut Interp, deque: Py<Deque>, #[default(0)] index: usize) -> R<DequeIter> {
+        let mut d = DequeIter::over(deque, it)?;
+        for _ in 0..index.min(d.remaining) {
+            d.step(it, false)?;
+        }
+        Ok(d)
+    }
+
+    #[proto(iter)]
+    fn __iter__(slf: This<Py<Self>>) -> Py<Self> {
+        slf.0
+    }
+
+    #[proto(next)]
+    fn __next__(&mut self, it: &mut Interp) -> R<Option<Value>> {
+        self.step(it, false)
+    }
+
+    fn __length_hint__(&self) -> usize {
+        self.remaining
+    }
+}
+
+#[lumen_bind::class(name = "_deque_reverse_iterator", module = "_collections")]
+pub struct DequeRevIter(DequeIter);
+
+#[lumen_bind::methods]
+impl DequeRevIter {
+    #[proto(iter)]
+    fn __iter__(slf: This<Py<Self>>) -> Py<Self> {
+        slf.0
+    }
+
+    #[proto(next)]
+    fn __next__(&mut self, it: &mut Interp) -> R<Option<Value>> {
+        self.0.step(it, true)
+    }
+
+    fn __length_hint__(&self) -> usize {
+        self.0.remaining
+    }
 }
 
 fn class_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -747,67 +770,12 @@ pub fn make(it: &mut Interp) -> Obj {
     let d = it.module_dict(&m);
     it.register_module("_collections", &m);
 
-    let deque = new_type(it, "collections", "deque", None, Layout::Other);
-    it.reg_new(&deque, deque_new);
-    let methods: &[(&'static str, NativeFn)] = &[
-        ("__init__", deque_init),
-        ("append", deque_append),
-        ("appendleft", deque_appendleft),
-        ("pop", deque_pop),
-        ("popleft", deque_popleft),
-        ("extend", deque_extend),
-        ("extendleft", deque_extendleft),
-        ("clear", deque_clear),
-        ("copy", deque_copy),
-        ("__copy__", deque_copy),
-        ("count", deque_count),
-        ("index", deque_index),
-        ("insert", deque_insert),
-        ("remove", deque_remove),
-        ("reverse", deque_reverse),
-        ("rotate", deque_rotate),
-        ("__len__", deque_len),
-        ("__getitem__", deque_getitem),
-        ("__setitem__", deque_setitem),
-        ("__delitem__", deque_delitem),
-        ("__contains__", deque_contains),
-        ("__iter__", deque_iter),
-        ("__reversed__", deque_reversed),
-        ("__repr__", deque_repr),
-        ("__eq__", deque_eq),
-        ("__ne__", deque_ne),
-        ("__lt__", deque_lt),
-        ("__le__", deque_le),
-        ("__gt__", deque_gt),
-        ("__ge__", deque_ge),
-        ("__add__", deque_add),
-        ("__iadd__", deque_iadd),
-        ("__mul__", deque_mul),
-        ("__rmul__", deque_mul),
-        ("__imul__", deque_imul),
-        ("__reduce__", deque_reduce),
-        ("__sizeof__", deque_sizeof),
-    ];
-    for (n, f) in methods {
-        it.reg(&deque, n, *f);
-    }
-    it.reg_prop(&deque, "maxlen", deque_maxlen);
-    it.reg_class(&deque, "__class_getitem__", class_getitem);
-    if let Some(dd) = deque.dict.borrow().as_ref() {
-        dict_set_str(dd, "__hash__", Value::None);
-    }
+    let deque = type_object::<Deque>(it);
     set_type(&d, "deque", &deque);
-
-    for (name, reverse) in [("_deque_iterator", false), ("_deque_reverse_iterator", true)] {
-        let ty = new_type(it, "_collections", name, None, Layout::Other);
-        it.reg(&ty, "__iter__", dit_iter);
-        it.reg(&ty, "__next__", dit_next);
-        it.reg(&ty, "__length_hint__", dit_len);
-        if !reverse {
-            it.reg_new(&ty, dit_new);
-        }
-        set_type(&d, name, &ty);
-    }
+    let ty = type_object::<DequeIter>(it);
+    set_type(&d, "_deque_iterator", &ty);
+    let ty = type_object::<DequeRevIter>(it);
+    set_type(&d, "_deque_reverse_iterator", &ty);
 
     let dict_ty = it.types.dict.clone();
     let dd = new_type(it, "collections", "defaultdict", Some(&dict_ty), Layout::Dict);

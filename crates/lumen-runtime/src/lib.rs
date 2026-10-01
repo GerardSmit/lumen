@@ -154,32 +154,13 @@ pub(crate) struct WorkerEmbedding {
 /// Workers for blocking work. libuv's default; revisit when async fs lands and has numbers.
 const POOL_SIZE: usize = 4;
 
-/// First scalar of the engine's lone-surrogate smuggle range (see `lumen::jstr`).
-const SMUGGLE_BASE: u32 = 0x10F800;
-
 /// Bring source text read from disk into the engine's string encoding. The engine stores a lone
 /// surrogate as a plane-16 private-use scalar (U+10F800..=U+10FFFF) and a *real* character in that
 /// range as the corresponding smuggled surrogate pair; text decoded from UTF-8 can hold such a real
 /// character (e.g. a literal U+10FFFF in a string), which the parser would otherwise read as a
 /// lone surrogate. Everything else passes through untouched.
 pub fn import_source_text(s: String) -> String {
-    // Every scalar >= U+10F800 encodes with a leading F4 8F byte pair; most text has none.
-    if !s.as_bytes().contains(&0xF4) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        let v = c as u32;
-        if v >= SMUGGLE_BASE {
-            let w = v - 0x10000;
-            let (hi, lo) = (0xD800 + (w >> 10), 0xDC00 + (w & 0x3FF));
-            out.push(char::from_u32(SMUGGLE_BASE + hi - 0xD800).expect("smuggle scalar"));
-            out.push(char::from_u32(SMUGGLE_BASE + lo - 0xD800).expect("smuggle scalar"));
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    lumen_common::smuggle::utf16_text_owned(s)
 }
 
 pub struct Runtime {

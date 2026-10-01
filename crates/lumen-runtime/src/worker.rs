@@ -642,6 +642,7 @@ fn op_wself_report(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 fn worker_scope_extension() -> Extension {
     Extension {
         name: "worker-scope",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__wself",
@@ -663,6 +664,7 @@ fn worker_scope_extension() -> Extension {
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "worker",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__worker",

@@ -156,6 +156,7 @@ fn reset(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "realm-environment",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__env",

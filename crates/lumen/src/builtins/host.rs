@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use lumen_common::buffer::{BufferError, ByteStore};
 
 /// The test262 `$262` host object. Only the portions lumen can support are provided (`global`,
 /// `gc`, `evalScript`, best-effort `detachArrayBuffer`); `agent`/`createRealm` are omitted.
@@ -64,6 +65,12 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         if let Value::Obj(o) = arg(args, 0) {
             let p = Gc::as_ptr(&o) as usize;
             // Truly detach: drop the backing store (so views see it as detached) and zero the views.
+            if let Some(store) = i.array_buffers.get(&p) {
+                if store.is_pinned() {
+                    return Err(super::typedarray::buffer_error(i, BufferError::Pinned));
+                }
+                let _ = store.detach();
+            }
             i.array_buffers.remove(&p);
             let views: Vec<usize> = i
                 .typed_arrays
@@ -133,7 +140,7 @@ fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, vec![0u8; len].into()); // length placeholder; bytes live in the registry
+    i.array_buffers.insert(p, ByteStore::zeroed(len).into()); // length placeholder; bytes live in the registry
     set_internal(&obj, "__abMaxByteLength", Value::Num(len as f64));
     set_internal(&obj, "__abResizable", Value::Bool(false));
     set_internal(&obj, "__sab_id", Value::Num(id as f64));

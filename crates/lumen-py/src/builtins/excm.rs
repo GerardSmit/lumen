@@ -43,6 +43,89 @@ fn exc_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::string(it.native_str(&a[0])?))
 }
 
+fn unicode_field(e: &Obj, name: &str) -> Option<Value> {
+    e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name))
+}
+
+/// `UnicodeEncodeError.__init__` and friends: `(encoding, object, start, end, reason)`, without
+/// `encoding` for `UnicodeTranslateError`.
+fn unicode_exc_init(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let e = exc_args_cell(it, a)?.clone();
+    let args = &a[1..];
+    if let Kind::Exception(d) = &e.kind {
+        d.borrow_mut().args = Value::tuple(args.to_vec());
+    }
+    let translate = it.exc_is(&e, "UnicodeTranslateError");
+    let decode = it.exc_is(&e, "UnicodeDecodeError");
+    let want = if translate { 4 } else { 5 };
+    if args.len() != want {
+        return Err(it.type_error(&format!("function takes exactly {} arguments ({} given)", want, args.len())));
+    }
+    let (encoding, rest) = if translate { (Value::None, args) } else { (args[0].clone(), &args[1..]) };
+    let check_str = |it: &mut Interp, v: &Value, n: usize| -> R<()> {
+        if v.as_str().is_some() {
+            return Ok(());
+        }
+        let t = it.type_name_of(v);
+        Err(it.type_error(&format!("argument {} must be str, not {}", n, t)))
+    };
+    let off = if translate { 0 } else { 1 };
+    if !translate {
+        check_str(it, &encoding, 1)?;
+    }
+    let object = if decode {
+        Value::bytes(it.bytes_of(&rest[0])?)
+    } else {
+        check_str(it, &rest[0], off + 1)?;
+        rest[0].clone()
+    };
+    let start = it.index_of(&rest[1])?;
+    let end = it.index_of(&rest[2])?;
+    check_str(it, &rest[3], off + 4)?;
+    let d = it.instance_dict(&e);
+    dict_set_str(&d, "encoding", encoding);
+    dict_set_str(&d, "object", object);
+    dict_set_str(&d, "start", Value::Int(start));
+    dict_set_str(&d, "end", Value::Int(end));
+    dict_set_str(&d, "reason", rest[3].clone());
+    Ok(Value::None)
+}
+
+impl Interp {
+    /// `str()` of a `UnicodeEncodeError` / `UnicodeDecodeError` / `UnicodeTranslateError`, from its
+    /// `encoding`, `object`, `start`, `end` and `reason` attributes.
+    pub fn unicode_exc_str(&mut self, e: &Obj) -> R<Option<String>> {
+        let (Some(obj), Some(Value::Int(start)), Some(Value::Int(end)), Some(reason)) =
+            (unicode_field(e, "object"), unicode_field(e, "start"), unicode_field(e, "end"), unicode_field(e, "reason"))
+        else {
+            return Ok(None);
+        };
+        let reason = self.str_of(&reason)?;
+        let encoding = match unicode_field(e, "encoding") {
+            Some(v) if !v.is_none() => self.str_of(&v)?,
+            _ => String::new(),
+        };
+        let (start, end) = (start.max(0) as usize, end.max(0) as usize);
+        let single = end == start + 1;
+        if let Value::Obj(o) = &obj {
+            if let Kind::Bytes(b) = &o.kind {
+                return Ok(Some(match b.get(start) {
+                    Some(byte) if single => format!("'{}' codec can't decode byte 0x{:02x} in position {}: {}", encoding, byte, start, reason),
+                    _ => format!("'{}' codec can't decode bytes in position {}-{}: {}", encoding, start, end.saturating_sub(1), reason),
+                }));
+            }
+        }
+        let what = if encoding.is_empty() { "can't translate".to_string() } else { format!("'{}' codec can't encode", encoding) };
+        Ok(Some(match obj.as_str().and_then(|s| lumen_common::smuggle::code_points(s).nth(start)) {
+            Some(c) if single => {
+                let shown = crate::builtins::codecsm::char_escape(c);
+                format!("{} character '{}' in position {}: {}", what, shown, start, reason)
+            }
+            _ => format!("{} characters in position {}-{}: {}", what, start, end.saturating_sub(1), reason),
+        }))
+    }
+}
+
 fn exc_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__repr__", a, 1, 1)?;
     Ok(Value::string(it.native_repr(&a[0])?))
@@ -67,6 +150,38 @@ fn add_note(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             }
         }
         _ => dict_set_str(&d, "__notes__", Value::list(vec![a[1].clone()])),
+    }
+    Ok(Value::None)
+}
+
+fn exc_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__reduce__", a, 1, 1)?;
+    let e = exc_args_cell(it, a)?.clone();
+    let args = match &e.kind {
+        Kind::Exception(d) => d.borrow().args.clone(),
+        _ => Value::tuple(Vec::new()),
+    };
+    let mut out = vec![Value::Obj(it.type_of_obj(&e)), args];
+    if let Some(d) = e.dict.borrow().as_ref() {
+        if matches!(&d.kind, Kind::Dict(m) if !m.borrow().is_empty()) {
+            out.push(Value::Obj(d.clone()));
+        }
+    }
+    Ok(Value::tuple(out))
+}
+
+fn exc_setstate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__setstate__", a, 2, 2)?;
+    if a[1].is_none() {
+        return Ok(Value::None);
+    }
+    let Some(state) = dict_of(&a[1]) else {
+        return Err(it.type_error("state is not a dictionary"));
+    };
+    let entries: Vec<(Value, Value)> = state.borrow().iter().map(|en| (en.key.clone(), en.val.clone())).collect();
+    for (k, v) in entries {
+        let Value::Obj(name) = &k else { return Err(it.type_error("attribute name must be string")) };
+        it.set_attr(&a[0], name, v)?;
     }
     Ok(Value::None)
 }
@@ -96,30 +211,6 @@ fn exit_code_prop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         },
         _ => Value::None,
     })
-}
-
-fn oserror_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    let _ = kw;
-    let args = a[1..].to_vec();
-    if let Kind::Exception(d) = &e.kind {
-        let shown = if args.len() > 2 { args[..2].to_vec() } else { args.clone() };
-        d.borrow_mut().args = Value::tuple(shown);
-    }
-    let d = it.instance_dict(&e);
-    if args.len() >= 2 {
-        dict_set_str(&d, "errno", args[0].clone());
-        dict_set_str(&d, "strerror", args[1].clone());
-        if let Some(f) = args.get(2) {
-            dict_set_str(&d, "filename", f.clone());
-        }
-    }
-    for n in ["errno", "strerror", "filename"] {
-        if dict_get_str(&d, n).is_none() {
-            dict_set_str(&d, n, Value::None);
-        }
-    }
-    Ok(Value::None)
 }
 
 fn import_error_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -209,18 +300,23 @@ pub fn init(it: &mut Interp) {
     it.reg(&base, "__repr__", exc_repr);
     it.reg(&base, "with_traceback", with_traceback);
     it.reg(&base, "add_note", add_note);
+    it.reg(&base, "__reduce__", exc_reduce);
+    it.reg(&base, "__setstate__", exc_setstate);
     let si = it.exc_type("StopIteration");
     it.reg_prop(&si, "value", stop_value_prop);
     let se = it.exc_type("SystemExit");
     it.reg_prop(&se, "code", exit_code_prop);
-    let oe = it.exc_type("OSError");
-    it.reg(&oe, "__init__", oserror_init);
+    crate::builtins::oserror::init(it);
     let ie = it.exc_type("ImportError");
     it.reg(&ie, "__init__", import_error_init);
     let ae = it.exc_type("AttributeError");
     it.reg(&ae, "__init__", attr_error_init);
     let ne = it.exc_type("NameError");
     it.reg(&ne, "__init__", name_error_init);
+    for name in ["UnicodeEncodeError", "UnicodeDecodeError", "UnicodeTranslateError"] {
+        let t = it.exc_type(name);
+        it.reg(&t, "__init__", unicode_exc_init);
+    }
     let sy = it.exc_type("SyntaxError");
     it.reg(&sy, "__init__", syntax_error_init);
 }

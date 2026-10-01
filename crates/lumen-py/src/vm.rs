@@ -166,7 +166,6 @@ pub struct Interp {
     pub next_id: usize,
     pub obj_new: Option<Obj>,
     pub obj_init: Option<Obj>,
-    pub native_depth: usize,
     pub subclass_registry: Vec<std::rc::Weak<Object>>,
     pub ret_val: Value,
     pub atexit: Vec<(Value, Vec<Value>, Vec<(Obj, Value)>)>,
@@ -178,6 +177,9 @@ pub struct Interp {
     pub interrupted: bool,
     pub heap: HeapBudget,
     pub int_max_str_digits: usize,
+    pub codecs: crate::codecs::CodecState,
+    /// Type objects of the native classes bound with `#[class]` (see `bind::type_object`).
+    pub native_types: std::collections::HashMap<std::any::TypeId, Obj>,
 }
 
 pub enum GenResult {
@@ -223,7 +225,6 @@ impl Interp {
             next_id: 1,
             obj_new: None,
             obj_init: None,
-            native_depth: 0,
             subclass_registry: Vec::new(),
             ret_val: Value::None,
             atexit: Vec::new(),
@@ -235,6 +236,8 @@ impl Interp {
             interrupted: false,
             heap: HeapBudget::NONE,
             int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
+            codecs: Default::default(),
+            native_types: std::collections::HashMap::new(),
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);
@@ -264,7 +267,7 @@ impl Interp {
     }
 
     pub fn write_stdout(&mut self, s: &str) {
-        self.out.extend_from_slice(s.as_bytes());
+        self.out.extend_from_slice(lumen_common::smuggle::unescape_text(s).as_bytes());
         if self.out.len() > 1 << 16 {
             self.flush_out();
         }
@@ -272,6 +275,7 @@ impl Interp {
 
     pub fn write_stderr(&mut self, s: &str) {
         self.flush_out();
+        let s = lumen_common::smuggle::unescape_text(s);
         match &mut self.sink {
             Some(k) => k.write_stderr(s.as_bytes()),
             None => self.platform.borrow_mut().write_stderr(s.as_bytes()),
@@ -1225,6 +1229,58 @@ impl Interp {
                 Op::LoadAssertionError => {
                     let c = self.exc_type("AssertionError");
                     push!(Value::Obj(c));
+                }
+                Op::LoadLocals => {
+                    let fr = fr!();
+                    let ns = fr.names.clone().unwrap_or_else(|| fr.globals.clone());
+                    push!(Value::Obj(ns));
+                }
+                Op::LoadFromDictOrDeref(i) => {
+                    let mapping = pop!();
+                    let n = cell_name(&fr!().code, i as usize);
+                    let key = self.str_obj(&n);
+                    let found = match self.mapping_lookup(&mapping, &key)? {
+                        Some(v) => Some(v),
+                        None => match &fr!().cells[i as usize].kind {
+                            Kind::Cell(c) => c.borrow().clone(),
+                            _ => None,
+                        },
+                    };
+                    match found {
+                        Some(v) => push!(v),
+                        None => {
+                            return Err(self.new_exc_str(
+                                "NameError",
+                                &format!("cannot access free variable '{}' where it is not associated with a value in enclosing scope", n),
+                            ))
+                        }
+                    }
+                }
+                Op::LoadFromDictOrGlobals(i) => {
+                    let mapping = pop!();
+                    let name = fr!().code.names[i as usize].clone();
+                    let mut found = self.mapping_lookup(&mapping, &name)?;
+                    if found.is_none() {
+                        found = dict_get_name(&fr!().globals, &name);
+                    }
+                    if found.is_none() {
+                        found = dict_get_name(&self.builtins, &name);
+                    }
+                    match found {
+                        Some(v) => push!(v),
+                        None => return Err(self.name_err(&name)),
+                    }
+                }
+                Op::CallIntrinsic1(k) => {
+                    let v = pop!();
+                    let r = crate::builtins::typingm::intrinsic1(self, k, v)?;
+                    push!(r);
+                }
+                Op::CallIntrinsic2(k) => {
+                    let b = pop!();
+                    let a = pop!();
+                    let r = crate::builtins::typingm::intrinsic2(self, k, a, b)?;
+                    push!(r);
                 }
                 Op::SetupAnnotations => {
                     let fr = fr!();

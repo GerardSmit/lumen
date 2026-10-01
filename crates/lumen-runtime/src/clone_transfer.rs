@@ -158,6 +158,7 @@ fn import_shared(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "clone-transfer",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__cloneTransfer",

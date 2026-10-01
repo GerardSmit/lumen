@@ -1877,6 +1877,32 @@ impl BigInt {
         m as f64 * 2f64.powi(shift as i32 + 1) * sign
     }
 
+    /// `(x, e)` with `0.5 <= |x| < 1` and `self ≈ x · 2^e`, `x` correctly rounded (ties to even);
+    /// finite for any size, unlike `to_f64`. `(0.0, 0)` for zero.
+    pub fn frexp(&self) -> (f64, u64) {
+        let bl = self.bit_len();
+        if bl == 0 {
+            return (0.0, 0);
+        }
+        let (m, mut e) = if bl <= 53 {
+            (self.0.mag[0], 0u64)
+        } else {
+            let mag = Self::make(false, self.0.mag.clone());
+            let shift = (bl - 54) as u64;
+            let head_big = mag.shr(shift);
+            let head = *head_big.0.mag.first().unwrap_or(&0);
+            let sticky = head_big.shl(shift).cmp(&mag) != std::cmp::Ordering::Equal;
+            let q = head >> 1;
+            let up = head & 1 == 1 && (sticky || q & 1 == 1);
+            (q + up as u64, shift + 1)
+        };
+        // m <= 2^53, so both the conversion and the scaling are exact.
+        let mbits = 64 - m.leading_zeros();
+        e += mbits as u64;
+        let x = m as f64 / 2f64.powi(mbits as i32);
+        (if self.0.neg { -x } else { x }, e)
+    }
+
     /// Parse from digits (no sign) in the given radix; `None` when malformed or too large.
     pub fn parse_radix(text: &str, radix: u32) -> Option<Self> {
         Self::parse_radix_checked(text, radix).ok().flatten()

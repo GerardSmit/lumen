@@ -1199,6 +1199,65 @@ pub fn mkdtemp(prefix: &str) -> R<String> {
     Err(FsError("EEXIST"))
 }
 
+// ---- descriptor operations ----------------------------------------------------------------------
+
+/// `lseek(2)` (`whence`: 0 set, 1 current, 2 end): the new offset.
+pub fn lseek(fd: i32, offset: i64, whence: i32) -> R<u64> {
+    use std::io::{Seek, SeekFrom};
+    let pos = match whence {
+        0 => SeekFrom::Start(u64::try_from(offset).map_err(|_| FsError("EINVAL"))?),
+        1 => SeekFrom::Current(offset),
+        2 => SeekFrom::End(offset),
+        _ => return Err(FsError("EINVAL")),
+    };
+    let seek = |f: &File| -> R<u64> { Ok((&*f).seek(pos)?) };
+    if is_std(fd) && !is_open(fd) {
+        return with_std_file(fd, seek);
+    }
+    seek(&get(fd)?.file)
+}
+
+/// Whether `fd` refers to a terminal.
+pub fn isatty(fd: i32) -> bool {
+    use std::io::IsTerminal;
+    if is_std(fd) && !is_open(fd) {
+        return with_std_file(fd, |f| Ok(f.is_terminal())).unwrap_or(false);
+    }
+    get(fd).map(|e| e.file.is_terminal()).unwrap_or(false)
+}
+
+/// `dup(2)`: a new descriptor for the same open file.
+pub fn dup(fd: i32) -> R<i32> {
+    let file = if is_std(fd) && !is_open(fd) {
+        with_std_file(fd, |f| Ok(f.try_clone()?))?
+    } else {
+        get(fd)?.file.try_clone()?
+    };
+    Ok(insert(file))
+}
+
+/// `pipe(2)`: the read and the write end.
+pub fn pipe() -> R<(i32, i32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe writes.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        for fd in fds {
+            // SAFETY: fcntl on descriptors just created above.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        // SAFETY: both descriptors are fresh and owned by the new `File`s only.
+        let (r, w) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        Ok((insert(r), insert(w)))
+    }
+    #[cfg(not(unix))]
+    Err(FsError("ENOSYS"))
+}
+
 // ---- whole files --------------------------------------------------------------------------------
 
 /// A whole file by path; `fl` are `O_*` open flags (`O_RDONLY` for a plain read).

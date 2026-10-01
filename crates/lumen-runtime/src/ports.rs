@@ -143,6 +143,7 @@ fn close(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "message-ports",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__lumenPorts",

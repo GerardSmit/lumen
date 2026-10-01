@@ -4,7 +4,7 @@ use super::numeric::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
 use crate::vm::*;
-use std::cell::RefCell;
+
 
 type Kw<'a> = &'a [(Obj, Value)];
 
@@ -12,7 +12,7 @@ fn data(it: &mut Interp, v: &Value) -> R<Vec<u8>> {
     match v {
         Value::Obj(o) => match &o.kind {
             Kind::Bytes(b) => Ok(b.clone()),
-            Kind::ByteArray(b) => Ok(b.borrow().clone()),
+            Kind::ByteArray(b) => Ok(b.to_vec()),
             _ => Err(it.type_error("descriptor requires a 'bytes' object")),
         },
         _ => Err(it.type_error("descriptor requires a 'bytes' object")),
@@ -25,7 +25,7 @@ fn is_array(v: &Value) -> bool {
 
 fn wrap(like: &Value, b: Vec<u8>) -> Value {
     if is_array(like) {
-        Value::Obj(Object::new(Kind::ByteArray(RefCell::new(b))))
+        Value::Obj(Object::new(Kind::ByteArray(ba_store(b))))
     } else {
         Value::bytes(b)
     }
@@ -77,8 +77,8 @@ fn bytes_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 fn bytearray_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let v = build(it, a, kw, true)?;
     match a.first() {
-        Some(Value::Obj(c)) if !std::rc::Rc::ptr_eq(c, &it.types.bytearray) => Ok(Value::Obj(Object::with_cls(c.clone(), Kind::ByteArray(RefCell::new(v))))),
-        _ => Ok(wrap(&Value::Obj(Object::new(Kind::ByteArray(RefCell::new(Vec::new())))), v)),
+        Some(Value::Obj(c)) if !std::rc::Rc::ptr_eq(c, &it.types.bytearray) => Ok(Value::Obj(Object::with_cls(c.clone(), Kind::ByteArray(ba_store(v))))),
+        _ => Ok(wrap(&Value::Obj(Object::new(Kind::ByteArray(ba_store(Vec::new())))), v)),
     }
 }
 
@@ -126,7 +126,7 @@ fn fromhex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         }
     }
     Ok(match &a[0] {
-        Value::Obj(c) if std::rc::Rc::ptr_eq(c, &it.types.bytearray) => wrap(&Value::Obj(Object::new(Kind::ByteArray(RefCell::new(Vec::new())))), out),
+        Value::Obj(c) if std::rc::Rc::ptr_eq(c, &it.types.bytearray) => wrap(&Value::Obj(Object::new(Kind::ByteArray(ba_store(Vec::new())))), out),
         _ => Value::bytes(out),
     })
 }
@@ -140,7 +140,7 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         if let Value::Obj(o) = v {
             total = total.saturating_add(match &o.kind {
                 Kind::Bytes(b) => b.len(),
-                Kind::ByteArray(b) => b.borrow().len(),
+                Kind::ByteArray(b) => b.len(),
                 _ => 0,
             });
         }
@@ -192,8 +192,8 @@ fn find_impl(it: &mut Interp, a: &[Value], rev: bool, name: &str) -> R<Option<us
         match v {
             None | Some(Value::None) => Ok(d),
             Some(v) => {
-                let i = it.index_of(v)?;
-                Ok(if i < 0 { (i + len).max(0) } else { i.min(len) })
+                let i = it.slice_index(v)?;
+                Ok(if i < 0 { i.saturating_add(len).max(0) } else { i.min(len) })
             }
         }
     };
@@ -767,25 +767,7 @@ fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     Ok(wrap(&a[0], out))
 }
 
-fn memoryview(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("memoryview", a, 1, 1)?;
-    match &a[0] {
-        Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
-            let d = data(it, &a[0])?;
-            Ok(wrap(&a[0], d))
-        }
-        v => {
-            let t = it.type_name_of(v);
-            Err(it.type_error(&format!("memoryview: a bytes-like object is required, not '{}'", t)))
-        }
-    }
-}
-
-pub fn memoryview_fn() -> NativeFn {
-    memoryview
-}
-
-fn ba_of<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a RefCell<Vec<u8>>> {
+fn ba_of<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a ByteStore> {
     match a.first() {
         Some(Value::Obj(o)) => match &o.kind {
             Kind::ByteArray(b) => Ok(b),
@@ -806,14 +788,16 @@ fn byte_val(it: &mut Interp, v: &Value) -> R<u8> {
 fn ba_append(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("append", a, 2, 2)?;
     let b = byte_val(it, &a[1])?;
-    ba_of(it, a)?.borrow_mut().push(b);
+    let cell = ba_of(it, a)?;
+    it.ba_edit(cell, |v| v.push(b))?;
     Ok(Value::None)
 }
 
 fn ba_extend(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("extend", a, 2, 2)?;
     let items = it.bytes_of(&a[1])?;
-    ba_of(it, a)?.borrow_mut().extend(items);
+    let cell = ba_of(it, a)?;
+    it.ba_edit(cell, |v| v.extend(items))?;
     Ok(Value::None)
 }
 
@@ -824,7 +808,7 @@ fn ba_pop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         None => -1,
     };
     let cell = ba_of(it, a)?;
-    let len = cell.borrow().len() as i64;
+    let len = cell.len() as i64;
     if len == 0 {
         return Err(it.new_exc_str("IndexError", "pop from empty bytearray"));
     }
@@ -832,11 +816,12 @@ fn ba_pop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if k < 0 || k >= len {
         return Err(it.new_exc_str("IndexError", "pop index out of range"));
     }
-    Ok(Value::Int(cell.borrow_mut().remove(k as usize) as i64))
+    Ok(Value::Int(it.ba_edit(cell, |v| v.remove(k as usize))? as i64))
 }
 
 fn ba_clear(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ba_of(it, a)?.borrow_mut().clear();
+    let cell = ba_of(it, a)?;
+    it.ba_edit(cell, |v| v.clear())?;
     Ok(Value::None)
 }
 
@@ -845,9 +830,9 @@ fn ba_insert(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let i = it.index_of(&a[1])?;
     let b = byte_val(it, &a[2])?;
     let cell = ba_of(it, a)?;
-    let len = cell.borrow().len() as i64;
+    let len = cell.len() as i64;
     let k = if i < 0 { (i + len).max(0) } else { i.min(len) };
-    cell.borrow_mut().insert(k as usize, b);
+    it.ba_edit(cell, |v| v.insert(k as usize, b))?;
     Ok(Value::None)
 }
 
@@ -855,10 +840,10 @@ fn ba_remove(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("remove", a, 2, 2)?;
     let b = byte_val(it, &a[1])?;
     let cell = ba_of(it, a)?;
-    let pos = cell.borrow().iter().position(|&x| x == b);
+    let pos = cell.bytes().iter().position(|&x| x == b);
     match pos {
         Some(p) => {
-            cell.borrow_mut().remove(p);
+            it.ba_edit(cell, |v| v.remove(p))?;
             Ok(Value::None)
         }
         None => Err(it.value_error("value not found in bytearray")),
@@ -866,7 +851,8 @@ fn ba_remove(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn ba_reverse(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ba_of(it, a)?.borrow_mut().reverse();
+    let cell = ba_of(it, a)?;
+    it.ba_write(cell)?.reverse();
     Ok(Value::None)
 }
 
@@ -942,5 +928,17 @@ pub fn init(it: &mut Interp) {
     let d = ba.dict.borrow().clone();
     if let Some(d) = d {
         dict_set_str(&d, "__hash__", Value::None);
+    }
+}
+
+impl Interp {
+    /// A length-changing edit of a `bytearray`; refused while a memoryview exports it.
+    pub fn ba_edit<T>(&mut self, b: &ByteStore, f: impl FnOnce(&mut Vec<u8>) -> T) -> R<T> {
+        b.edit(f).map_err(|e| crate::bind::buffer_error(self, e))
+    }
+
+    /// In-place (same-length) writes to a `bytearray`; allowed while exported.
+    pub fn ba_write<'a>(&mut self, b: &'a ByteStore) -> R<lumen_common::buffer::BytesMut<'a>> {
+        b.try_bytes_mut().map_err(|e| crate::bind::buffer_error(self, e))
     }
 }
