@@ -20,6 +20,8 @@ use lumen_host::Completion;
 use lumen_repl::Repl;
 use lumen_runtime::Runtime;
 
+mod dotenv;
+mod options;
 mod typed;
 
 /// The engine's size-class allocator: JS workloads are dominated by millions of short-lived
@@ -46,20 +48,6 @@ fn main() {
 }
 
 fn real_main() {
-    let mut tier = None;
-    let mut threshold = None;
-    let mut eval_source = None;
-    let mut print_result = false;
-    let mut file = None;
-    let mut force_repl = false;
-    let mut expose_gc = false;
-    let mut heap_mb = None;
-    let mut timeout_ms = std::env::var("LUMEN_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    // Runtime flags seen before the script, reported as `process.execArgv` (Node's split).
-    let mut exec_argv = Vec::new();
-
     let all_args: Vec<String> = std::env::args().collect();
     // `lumen typed ...`: the typed tier's analyzer / Node-compatible type stripper.
     if all_args.get(1).map(String::as_str) == Some("typed") {
@@ -69,79 +57,95 @@ fn real_main() {
         .first()
         .cloned()
         .unwrap_or_else(|| "lumen".to_string());
-    let mut args = all_args.iter().skip(1).cloned();
-    while let Some(a) = args.next() {
-        if a.starts_with('-') && a != "-" {
-            exec_argv.push(a.clone());
-        }
-        if let Some(t) = a.strip_prefix("--tier=") {
-            tier = Some(match t {
-                "bytecode" => lumen_host::Tier::Bytecode,
-                "interp" => lumen_host::Tier::Interp,
-                other => die(2, &format!("unknown tier '{other}' (interp|bytecode)")),
-            });
-        } else if let Some(n) = a.strip_prefix("--tier-threshold=") {
-            threshold = n.parse::<u32>().ok();
-        } else if a == "-e" || a == "--eval" {
-            match args.next() {
-                Some(code) => eval_source = Some(code),
-                None => die(2, "-e expects code"),
-            }
-        } else if a == "-p" || a == "--print" || a == "-pe" || a == "-ep" {
-            match args.next() {
-                Some(code) => eval_source = Some(code),
-                None => die(2, &format!("{a} expects code")),
-            }
-            print_result = true;
-        } else if a == "repl" && file.is_none() {
-            force_repl = true;
-        } else if a == "-h" || a == "--help" {
-            println!(
-                "usage: lumen-cli [repl | file.js [args...] | -e code] [--tier=interp|bytecode]"
-            );
-            return;
-        } else if a == "-v" || a == "--version" {
-            println!("lumen {}", full_version());
-            return;
-        } else if a == "--expose-gc" || a == "--expose_gc" {
-            expose_gc = true;
-        } else if let Some(n) = a
-            .strip_prefix("--max-old-space-size=")
-            .or_else(|| a.strip_prefix("--max_old_space_size="))
-        {
-            match n.parse::<f64>() {
-                Ok(mb) if mb > 0.0 => heap_mb = Some(mb),
-                _ => die(2, &format!("{argv0}: invalid value for {a}")),
-            }
-        } else if let Some(n) = a.strip_prefix("--timeout=") {
-            match n.parse::<u64>() {
-                Ok(ms) => timeout_ms = Some(ms),
-                Err(_) => die(2, &format!("{argv0}: invalid value for {a}")),
-            }
-        } else if is_ignored_node_flag(&a) {
-            // Accepted for Node command-line compatibility; lumen has no equivalent knob.
-        } else if a.starts_with("--") {
-            die(2, &format!("{argv0}: bad option: {a}"));
-        } else {
-            // First free arg is the script; the rest belong to it (visible via process.argv).
-            file = Some(a);
-            break;
-        }
+    let mut args: Vec<String> = all_args.iter().skip(1).cloned().collect();
+    let force_repl = args.first().map(String::as_str) == Some("repl");
+    if force_repl {
+        args.remove(0);
     }
 
+    let mut cli = options::Parsed::default();
+    if let Err(e) = options::parse(&argv0, &args, false, &mut cli) {
+        die(e.status, &e.message);
+    }
+    if cli.help {
+        println!(
+            "usage: lumen-cli [repl | file.js [args...] | -e code] [--tier=interp|bytecode]"
+        );
+        return;
+    }
+    if cli.version {
+        println!("lumen {}", full_version());
+        return;
+    }
+
+    load_env_files(&argv0, &cli);
+    let mut opts = cli;
+    if let Ok(env) = std::env::var("NODE_OPTIONS") {
+        let mut from_env = options::Parsed::default();
+        let parsed = options::split_node_options(&env)
+            .and_then(|tokens| options::parse(&argv0, &tokens, true, &mut from_env));
+        if let Err(e) = parsed {
+            die(e.status, &e.message);
+        }
+        opts.merge_env(from_env);
+    }
+
+    let permission = opts.flag("--experimental-permission") || opts.flag("--permission");
+    if !permission && (!opts.list("--allow-fs-read").is_empty() || !opts.list("--allow-fs-write").is_empty()) {
+        let flag = if opts.list("--allow-fs-read").is_empty() {
+            "--allow-fs-write"
+        } else {
+            "--allow-fs-read"
+        };
+        die(1, &format!("{argv0}: --experimental-permission is required for {flag}"));
+    }
+    if opts.check && opts.eval.is_some() {
+        die(9, &format!("{argv0}: either --check or --eval can be used, not both"));
+    }
+    let module_input = match opts.string("--input-type") {
+        None => false,
+        Some("module") => true,
+        Some("commonjs") => false,
+        Some(other) => die(
+            9,
+            &format!("{argv0}: --input-type must be \"module\" or \"commonjs\", got \"{other}\""),
+        ),
+    };
+    if module_input && opts.print {
+        die(1, &format!("{argv0}: --print cannot be used with ESM input"));
+    }
+
+    let tier = match opts.string("--tier") {
+        None => None,
+        Some("bytecode") => Some(lumen_host::Tier::Bytecode),
+        Some("interp") => Some(lumen_host::Tier::Interp),
+        Some(other) => die(2, &format!("unknown tier '{other}' (interp|bytecode)")),
+    };
+    let threshold = opts.string("--tier-threshold").and_then(|n| n.parse::<u32>().ok());
+    let expose_gc = opts.flag("--expose-gc");
+
+    let file = if opts.eval.is_none() && !opts.stdin_dash {
+        opts.rest.first().cloned()
+    } else {
+        None
+    };
+    let script_args: Vec<String> = match &file {
+        Some(_) => opts.rest[1..].to_vec(),
+        None => opts.rest.clone(),
+    };
+
     let mut runtime = Runtime::new();
-    // process.argv is [binary, script, ...its args]: the runtime flags live in execArgv. Like
-    // Node, the script is reported as an absolute path (`path.resolve`, symlinks kept).
     let script_argv: Vec<String> = match &file {
         Some(f) => {
             let script = std::path::absolute(f)
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| f.clone());
-            std::iter::once(script).chain(args).collect()
+            std::iter::once(script).chain(script_args).collect()
         }
-        None => Vec::new(),
+        None => script_args,
     };
-    runtime.set_process_args(&argv0, &exec_argv, &script_argv);
+    runtime.set_process_args(&argv0, &opts.exec_argv, &script_argv);
+    runtime.set_cli_options(&opts.options_json());
     if expose_gc {
         runtime.expose_gc();
     }
@@ -151,6 +155,22 @@ fn real_main() {
     if let Some(n) = threshold {
         runtime.engine().set_tier_threshold(n);
     }
+    let heap_mb = match opts.string("--max-old-space-size") {
+        None => None,
+        Some(n) => match n.parse::<f64>() {
+            Ok(mb) if mb > 0.0 => Some(mb),
+            _ => die(2, &format!("{argv0}: invalid value for --max-old-space-size={n}")),
+        },
+    };
+    let timeout_ms = match opts.string("--timeout") {
+        Some(n) => match n.parse::<u64>() {
+            Ok(ms) => Some(ms),
+            Err(_) => die(2, &format!("{argv0}: invalid value for --timeout={n}")),
+        },
+        None => std::env::var("LUMEN_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()),
+    };
     if let Some(mb) = heap_mb {
         runtime
             .engine()
@@ -160,38 +180,39 @@ fn real_main() {
         start_watchdog(&mut runtime, ms);
     }
 
-    if let Some(code) = eval_source {
-        // Node's [eval] context: module/exports/__filename/__dirname are globals.
-        let _ = runtime.eval(
-            "(function () { try { const M = require('module'); const m = new M('[eval]'); \
-             m.filename = require('path').join(process.cwd(), '[eval]'); \
-             if (typeof M._nodeModulePaths === 'function') m.paths = M._nodeModulePaths(process.cwd()); \
-             globalThis.module = m; globalThis.exports = m.exports; } catch {} \
-             globalThis.__filename = '[eval]'; globalThis.__dirname = '.'; \
-             try { for (const name of require('module').builtinModules) { \
-               if (name.startsWith('_') || name.includes('/') || name in globalThis) continue; \
-               const setReal = (v) => Object.defineProperty(globalThis, name, { value: v, writable: true, enumerable: true, configurable: true }); \
-               Object.defineProperty(globalThis, name, { get() { const v = require(name); \
-                 Object.defineProperty(globalThis, name, { get: () => v, set: setReal, enumerable: false, configurable: true }); return v; }, \
-                 set: setReal, enumerable: false, configurable: true }); } } catch {} })();",
-        );
-        if print_result {
-            // Node's -p: the script's completion value is console.log'd at process exit.
-            let wrapped = format!(
-                "(function (r) {{ process.on(\"exit\", function () {{ console.log(r); }}); }})((0, eval)({}));",
-                js_string_literal(&code)
-            );
-            run_source(&mut runtime, &wrapped);
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".to_string());
+    run_preloads(&mut runtime, &opts, &cwd);
+
+    if opts.check {
+        check_only(&mut runtime, file.as_deref(), module_input);
+        return;
+    }
+
+    if opts.flag("--build-snapshot") {
+        build_snapshot(&mut runtime, &opts, &argv0, file.as_deref());
+        return;
+    }
+    if let Some(blob) = opts.string("--snapshot-blob") {
+        if replay_snapshot(&mut runtime, &opts, &argv0, blob) {
+            let args = js_string_array(&opts.rest);
+            eval_checked(&mut runtime, &format!("{SNAPSHOT_CONTROL}.runMain({args})"));
+            finish(&mut runtime);
+            return;
+        }
+    }
+
+    if let Some(code) = opts.eval.clone() {
+        if module_input {
+            run_module_text(&mut runtime, &code, &cwd, "[eval1]");
         } else {
-            run_source(&mut runtime, &code);
+            eval_global(&mut runtime, &code, "[eval]", opts.print);
         }
     } else if let Some(path) = file {
-        if !std::path::Path::new(&path).is_file() {
-            die(2, &format!("cannot read {path}: not a file"));
-        }
         // ESM vs CommonJS like Node: .mjs -> module, .cjs -> commonjs, .js -> the nearest
         // package.json "type". A module runs through the import graph; CJS as `require.main`.
-        let result = if is_esm_entry(&path) {
+        let result = if std::path::Path::new(&path).is_file() && is_esm_entry(&path) {
             runtime.run_module(&path)
         } else {
             runtime.run_main(&path)
@@ -203,13 +224,9 @@ fn real_main() {
             }
             die(1, &format!("Uncaught {e}"));
         }
-        let code = runtime.finish_process();
-        exit_if_timed_out();
-        mem_report(&mut runtime);
-        if code != 0 {
-            std::process::exit(code);
-        }
-    } else if force_repl || std::io::stdin().is_terminal() {
+        finish(&mut runtime);
+    } else if opts.interactive || force_repl || (std::io::stdin().is_terminal() && !opts.stdin_dash)
+    {
         println!(
             "lumen {} (.help for help, .exit or Ctrl-D to quit)",
             full_version()
@@ -221,7 +238,287 @@ fn real_main() {
         if std::io::stdin().read_to_string(&mut src).is_err() {
             die(2, "cannot read stdin");
         }
-        run_source(&mut runtime, &src);
+        if module_input {
+            run_module_text(&mut runtime, &src, &cwd, "[stdin]");
+        } else {
+            eval_global(&mut runtime, &src, "[stdin]", false);
+        }
+    }
+}
+
+const SNAPSHOT_MAGIC: &str = "LUMEN-SNAPSHOT 1";
+const SNAPSHOT_CONTROL: &str = "require('v8').startupSnapshot[Symbol.for('lumen.snapshotControl')]";
+
+/// The startup-snapshot emulation: a blob records the entry script and the V8 flags it was built
+/// with; loading it replays that script (see `startupSnapshot` in stdlib_extras.js).
+fn v8_flag_signature(opts: &options::Parsed) -> String {
+    opts.exec_argv
+        .iter()
+        .filter(|a| a.starts_with("--harmony") || a.starts_with("--js-flags"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn js_string_array(items: &[String]) -> String {
+    let parts: Vec<String> = items.iter().map(|s| js_string_literal(s)).collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn eval_checked(runtime: &mut Runtime, code: &str) -> String {
+    match runtime.eval(code) {
+        Ok(Completion::Value(v)) => v,
+        Ok(Completion::Throw { name, message }) if name.is_empty() => die(1, &format!("Uncaught {message}")),
+        Ok(Completion::Throw { name, message }) => die(1, &format!("Uncaught {name}: {message}")),
+        Err(e) => die(1, &format!("SyntaxError: {} (line {})", e.message, e.line)),
+    }
+}
+
+fn run_entry(runtime: &mut Runtime, path: &str) {
+    let result = if is_esm_entry(path) {
+        runtime.run_module(path)
+    } else {
+        runtime.run_main(path)
+    };
+    if let Err(e) = result {
+        if lumen::typescript::is_node_uncaught_text(&e) {
+            die(1, &e);
+        }
+        die(1, &format!("Uncaught {e}"));
+    }
+}
+
+fn build_snapshot(runtime: &mut Runtime, opts: &options::Parsed, argv0: &str, file: Option<&str>) {
+    let Some(entry) = file else {
+        die(9, &format!("{argv0}: --build-snapshot must be used with an entry point script."));
+    };
+    if entry == "node:embedded_snapshot_main" {
+        die(9, &format!("{argv0}: Node.js was built without embedded snapshot"));
+    }
+    let entry = absolute(entry);
+    run_entry(runtime, &entry);
+    eval_checked(runtime, &format!("{SNAPSHOT_CONTROL}.endBuild()"));
+    let blob = opts
+        .string("--snapshot-blob")
+        .map(str::to_string)
+        .unwrap_or_else(|| absolute("snapshot.blob"));
+    let text = format!("{SNAPSHOT_MAGIC}\n{entry}\n{}\n", v8_flag_signature(opts));
+    if let Err(e) = std::fs::write(&blob, text) {
+        die(1, &format!("{argv0}: Cannot write {blob}: {e}"));
+    }
+    finish(runtime);
+}
+
+/// Replay a snapshot blob's entry script; true when it registered a deserialize main function.
+fn replay_snapshot(runtime: &mut Runtime, opts: &options::Parsed, argv0: &str, blob: &str) -> bool {
+    let text = std::fs::read_to_string(blob)
+        .unwrap_or_else(|_| die(14, &format!("{argv0}: Cannot open {blob}")));
+    let mut lines = text.lines();
+    let (magic, entry, flags) = (lines.next(), lines.next(), lines.next().unwrap_or(""));
+    let Some(entry) = entry.filter(|_| magic == Some(SNAPSHOT_MAGIC)) else {
+        die(14, &format!("{argv0}: Failed to load the startup snapshot {blob}"));
+    };
+    if flags != v8_flag_signature(opts) {
+        die(14, &format!("{argv0}: Failed to load the startup snapshot {blob}: V8 flags differ from those it was built with"));
+    }
+    eval_checked(runtime, &format!("{SNAPSHOT_CONTROL}.beginReplay()"));
+    run_entry(runtime, entry);
+    eval_checked(runtime, &format!("String({SNAPSHOT_CONTROL}.endReplay())")) == "true"
+}
+
+/// Load each `--env-file` into the process environment. Variables already set in the real
+/// environment win; a later file overrides an earlier one.
+fn load_env_files(argv0: &str, cli: &options::Parsed) {
+    let original: std::collections::HashSet<String> =
+        std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+    let optional: std::collections::HashSet<&String> = cli.list("--env-file-if-exists").iter().collect();
+    let files = cli
+        .list("--env-file")
+        .iter()
+        .chain(cli.list("--env-file-if-exists"));
+    for path in files {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) if optional.contains(path) => continue,
+            Err(_) => die(9, &format!("{argv0}: {path}: not found")),
+        };
+        for (key, value) in dotenv::parse(&text) {
+            if !original.contains(&key) {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+}
+
+/// `-r` modules through the CommonJS loader, then `--import` modules through the ESM one.
+fn run_preloads(runtime: &mut Runtime, opts: &options::Parsed, cwd: &str) {
+    let required = opts.list("--require");
+    if !required.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<String> = required
+            .iter()
+            .filter(|r| seen.insert(r.as_str()))
+            .map(|r| js_string_literal(r))
+            .collect();
+        let src = format!(
+            "require('module')._preloadModules([{}]);",
+            unique.join(",")
+        );
+        run_prelude(runtime, &src);
+    }
+    let imports = opts.list("--import");
+    if !imports.is_empty() {
+        let src: String = imports
+            .iter()
+            .map(|i| format!("import {};\n", js_string_literal(i)))
+            .collect();
+        run_module_text(runtime, &src, cwd, "[preload]");
+    }
+}
+
+fn run_prelude(runtime: &mut Runtime, src: &str) {
+    match runtime.eval(src) {
+        Ok(Completion::Value(_)) => {}
+        Ok(Completion::Throw { name, message }) => {
+            if name.is_empty() {
+                die(1, &format!("Uncaught {message}"));
+            }
+            die(1, &format!("Uncaught {name}: {message}"));
+        }
+        Err(e) => die(1, &format!("SyntaxError: {} (line {})", e.message, e.line)),
+    }
+}
+
+fn run_module_text(runtime: &mut Runtime, src: &str, cwd: &str, name: &str) {
+    let key = std::path::Path::new(cwd).join(name).to_string_lossy().into_owned();
+    if let Err(e) = runtime.run_module_source(src, &key) {
+        die(1, &format!("Uncaught {e}"));
+    }
+    finish(runtime);
+}
+
+fn finish(runtime: &mut Runtime) {
+    let code = runtime.finish_process();
+    exit_if_timed_out();
+    mem_report(runtime);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+/// `--check`: parse the script (a file, or stdin) without running it.
+fn check_only(runtime: &mut Runtime, file: Option<&str>, module_input: bool) {
+    let (name, source, module) = match file {
+        Some(path) => {
+            let resolved = resolve_script(path)
+                .unwrap_or_else(|| die(1, &format!("Error: Cannot find module '{}'", absolute(path))));
+            match std::fs::read_to_string(&resolved) {
+                Ok(s) => (resolved.clone(), s, is_esm_entry(&resolved)),
+                Err(_) => die(1, &format!("Error: Cannot find module '{}'", absolute(path))),
+            }
+        }
+        None => {
+            let mut src = String::new();
+            if std::io::stdin().read_to_string(&mut src).is_err() {
+                die(2, "cannot read stdin");
+            }
+            ("[stdin]".to_string(), src, module_input)
+        }
+    };
+    let source = match source.strip_prefix("#!") {
+        Some(rest) => format!("//{rest}"),
+        None => source,
+    };
+    let wrapper = patched_wrapper(runtime);
+    let result = match (&wrapper, module) {
+        (Some((open, close)), false) => lumen::check_script_syntax(&format!("{open}{source}{close}")),
+        _ => lumen::check_syntax(&source, module),
+    };
+    if let Err(e) = result {
+        let text = source.lines().nth((e.line as usize).saturating_sub(1)).unwrap_or("");
+        die(
+            1,
+            &format!(
+                "{name}:{}\n{text}\n\nSyntaxError: {}\n\nNode.js {}",
+                e.line,
+                e.message,
+                full_version()
+            ),
+        );
+    }
+}
+
+/// The file a script argument names: as given, with a registered extension appended, or a
+/// directory's index file.
+fn resolve_script(path: &str) -> Option<String> {
+    const EXTENSIONS: [&str; 6] = [".js", ".json", ".node", ".cjs", ".mjs", ".ts"];
+    let base = absolute(path);
+    let file = std::path::Path::new(&base);
+    if file.is_file() {
+        return Some(base);
+    }
+    for ext in EXTENSIONS {
+        let candidate = format!("{base}{ext}");
+        if std::path::Path::new(&candidate).is_file() {
+            return Some(candidate);
+        }
+    }
+    if file.is_dir() {
+        for ext in EXTENSIONS {
+            let candidate = format!("{base}/index{ext}");
+            if std::path::Path::new(&candidate).is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The `Module.wrapper` pair when a preload replaced it, else `None`.
+fn patched_wrapper(runtime: &mut Runtime) -> Option<(String, String)> {
+    let probe = "(function () { const w = require('module').wrapper; \
+        if (w[0] === '(function (exports, require, module, __filename, __dirname) { ' && w[1] === '\\n});') return ''; \
+        return String(w[0]) + '\\u0001' + String(w[1]); })()";
+    let Ok(lumen::Completion::Value(pair)) = runtime.eval(probe) else {
+        return None;
+    };
+    let (open, close) = pair.split_once('\u{1}')?;
+    Some((open.to_string(), close.to_string()))
+}
+
+fn absolute(path: &str) -> String {
+    std::path::absolute(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Run `code` as the global script Node's `-e`/`-p`/stdin evaluation is: `module`, `exports` and
+/// `__filename` are globals, and every builtin module is a lazily loaded global.
+fn eval_global(runtime: &mut Runtime, code: &str, name: &str, print: bool) {
+    let setup = format!(
+        "(function () {{ try {{ const M = require('module'); const m = new M({name}); \
+         m.filename = require('path').join(process.cwd(), {name}); \
+         if (typeof M._nodeModulePaths === 'function') m.paths = M._nodeModulePaths(process.cwd()); \
+         globalThis.module = m; globalThis.exports = m.exports; }} catch {{}} \
+         globalThis.__filename = {name}; globalThis.__dirname = '.'; \
+         try {{ for (const name of require('module').builtinModules) {{ \
+           if (name.startsWith('_') || name.includes('/') || name in globalThis) continue; \
+           const setReal = (v) => Object.defineProperty(globalThis, name, {{ value: v, writable: true, enumerable: true, configurable: true }}); \
+           Object.defineProperty(globalThis, name, {{ get() {{ const v = require(name); \
+             Object.defineProperty(globalThis, name, {{ get: () => v, set: setReal, enumerable: false, configurable: true }}); return v; }}, \
+             set: setReal, enumerable: false, configurable: true }}); }} }} catch {{}} }})();",
+        name = js_string_literal(name)
+    );
+    let _ = runtime.eval(&setup);
+    if print {
+        // Node's -p: the script's completion value is console.log'd at process exit.
+        let wrapped = format!(
+            "(function (r) {{ process.on(\"exit\", function () {{ console.log(r); }}); }})((0, eval)({}));",
+            js_string_literal(code)
+        );
+        run_source(runtime, &wrapped);
+    } else {
+        run_source(runtime, code);
     }
 }
 
@@ -308,35 +605,6 @@ fn nearest_package_type_is_module(file: &std::path::Path) -> bool {
 /// Share the runtime's root-field lookup; repository metadata can also contain `type`.
 fn json_type_field(json: &str) -> Option<String> {
     lumen_runtime::package_type_from_json(json)
-}
-
-/// Node flags that tune V8 or Node internals lumen does not have: accepted and ignored so a
-/// `package.json` script or a spawned `process.execPath` invocation written for Node still runs.
-fn is_ignored_node_flag(a: &str) -> bool {
-    const EXACT: &[&str] = &[
-        "--no-warnings",
-        "--no-deprecation",
-        "--enable-source-maps",
-        "--preserve-symlinks",
-        "--trace-warnings",
-        "--trace-uncaught",
-        "--pending-deprecation",
-        "--throw-deprecation",
-        "--unhandled-rejections=strict",
-        "--unhandled-rejections=throw",
-        "--jitless",
-        // Read back from process.execArgv by node:http (getOptionValue).
-        "--insecure-http-parser",
-    ];
-    EXACT.contains(&a)
-        || a.starts_with("--max-old-space-size")
-        || a.starts_with("--max-semi-space-size")
-        || a.starts_with("--stack-size")
-        || a.starts_with("--experimental-")
-        || a.starts_with("--no-experimental-")
-        || a.starts_with("--disable-warning")
-        || a.starts_with("--title=")
-        || a.starts_with("--max-http-header-size=")
 }
 
 /// The `--timeout` budget in ms once it ran out (0 while it has not).

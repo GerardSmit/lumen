@@ -556,7 +556,7 @@ impl Drop for TlsStream {
     }
 }
 
-fn ssl_candidates() -> &'static [&'static str] {
+pub(crate) fn ssl_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
         &[
@@ -574,7 +574,7 @@ fn ssl_candidates() -> &'static [&'static str] {
         &[]
     }
 }
-fn crypto_candidates() -> &'static [&'static str] {
+pub(crate) fn crypto_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
         &[
@@ -593,11 +593,11 @@ fn crypto_candidates() -> &'static [&'static str] {
     }
 }
 
-struct Library {
+pub(crate) struct Library {
     handle: *mut c_void,
 }
 impl Library {
-    fn open_candidates(paths: &[&str]) -> Result<Self, String> {
+    pub(crate) fn open_candidates(paths: &[&str]) -> Result<Self, String> {
         let mut errors = Vec::new();
         for path in paths {
             match Self::open(path) {
@@ -619,7 +619,7 @@ impl Library {
             Ok(Self { handle })
         }
     }
-    unsafe fn function<T: Copy>(&self, name: &str) -> Result<T, String> {
+    pub(crate) unsafe fn function<T: Copy>(&self, name: &str) -> Result<T, String> {
         let name = CString::new(name).map_err(|_| "symbol contains NUL".to_string())?;
         let symbol = dlsym(self.handle, name.as_ptr());
         if symbol.is_null() {

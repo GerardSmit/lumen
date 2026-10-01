@@ -207,6 +207,14 @@ On top of that:
   editing is line-buffered (raw-mode/history would need `termios`); use `rlwrap` for arrows
   and history.
 
+- **Browser** (`lumen-wasm`, feature `runtime`) — `lumen-runtime` builds for
+  `wasm32-unknown-unknown` and runs in a Worker: the same Buffer, crypto, zlib, timers, streams
+  and `node:fs` (over an in-memory file system), with `fetch` and `WebSocket` bridged to the
+  page's own. The event loop is single-threaded and driven by the page (`Runtime::run_until_idle`);
+  a synchronous host call (`fs.readFileSync` of a remote or OPFS path) suspends the guest through
+  a helper Worker and `Atomics.wait`. Sockets, subprocesses, native addons and sqlite throw
+  `ERR_NOT_SUPPORTED_IN_BROWSER`. See `docs/browser-runtime.md` and `crates/lumen-wasm/example`.
+
 ### Workspace crates
 
 ```
@@ -222,7 +230,7 @@ lumen-cli      node/deno-style entrypoint
 
 test262-runner   conformance harness (parallel workers over ./test262)
 lumen-difftest   differential fuzzer across the two execution tiers
-lumen-wasm       wasm build of the engine
+lumen-wasm       wasm build of the engine; with `--features runtime`, `RuntimeSession`: the runtime in a browser
 ```
 
 The dependency graph is a strict DAG — `lumen ← lumen-host ← {op crates} ← lumen-runtime ←

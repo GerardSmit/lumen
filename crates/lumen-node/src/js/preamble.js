@@ -6,7 +6,7 @@ const __zlib = globalThis.__zlib;
 const __bunhash = globalThis.__bunhash;
 const __child = globalThis.__child;
 const __ffi = globalThis.__ffi;
-const __crypto = globalThis.__crypto;
+const __cryptoBinding = __node.cryptoBinding;
 const __password = globalThis.__password;
 // Macro-bound native ops (src/native.rs): digests, Buffer codecs, bufferutil, async fs.
 const __native = __node.native();
@@ -16,7 +16,6 @@ delete globalThis.__zlib;
 delete globalThis.__bunhash;
 delete globalThis.__child;
 delete globalThis.__ffi;
-delete globalThis.__crypto;
 delete globalThis.__password;
 // The runtime installs process.platform/arch after the glue runs, but the glue ported from Node
 // reads them while loading (`const isWindows = process.platform === 'win32'`).
@@ -34,13 +33,45 @@ if (typeof process === "object" && process !== null && process.platform === unde
 // turn (an I/O completion) runs in.
 const __asyncContextGet = __node.asyncContextGet;
 const __asyncContextSet = __node.asyncContextSet;
-function __bindAsyncContext(fn) {
+// The async context a callback was running in when it threw: node:domain routes an uncaught
+// error to the domains that were active at the throw, which the unwound wrapper no longer sees.
+let __thrownContext;
+function __noteThrown(error) {
+  if (__thrownContext === undefined || __thrownContext.error !== error) {
+    __thrownContext = { error, context: __asyncContextGet() };
+  }
+}
+function __takeThrownContext(error) {
+  const held = __thrownContext;
+  if (held === undefined || held.error !== error) return undefined;
+  __thrownContext = undefined;
+  return held;
+}
+// node:trace_events routes trace points (console timers, user timing, ...) through this function
+// once loaded; until then the points cost one null check.
+let __traceEvent = null;
+function __setTraceEvent(fn) {
+  __traceEvent = fn;
+}
+// Set by node:async_hooks while any hook is enabled; `type` names the resource being scheduled.
+let __asyncHooks = null;
+function __setAsyncHooks(runtime) {
+  __asyncHooks = runtime;
+}
+function __destroyAsyncResource(resource) {
+  if (__asyncHooks !== null) __asyncHooks.destroyOf(resource);
+}
+function __bindAsyncContext(fn, type, resource, repeat) {
+  if (__asyncHooks !== null && type !== undefined) return __asyncHooks.wrap(fn, type, resource, repeat);
   const context = __asyncContextGet();
   if (context === undefined) return fn;
   return function boundWithAsyncContext(...args) {
     const previous = __asyncContextSet(context);
     try {
       return fn.apply(this, args);
+    } catch (error) {
+      __noteThrown(error);
+      throw error;
     } finally {
       __asyncContextSet(previous);
     }
@@ -50,6 +81,9 @@ function __runInAsyncContext(context, fn, thisArg, args) {
   const previous = __asyncContextSet(context);
   try {
     return Reflect.apply(fn, thisArg, args);
+  } catch (error) {
+    __noteThrown(error);
+    throw error;
   } finally {
     __asyncContextSet(previous);
   }
@@ -356,6 +390,7 @@ const __errors = (() => {
     return "Attempt to access memory outside buffer bounds";
   }, RangeError);
   E("ERR_INVALID_BUFFER_SIZE", "Buffer size must be a multiple of %s", RangeError);
+  E("ERR_UNKNOWN_CREDENTIAL", "%s identifier does not exist: %s", Error);
   E("ERR_UNKNOWN_BUILTIN_MODULE", "No such built-in module: %s", Error);
   E("ERR_UNHANDLED_ERROR", (err = undefined) => {
     const msg = "Unhandled error.";
@@ -363,6 +398,18 @@ const __errors = (() => {
     return `${msg} (${err})`;
   }, Error);
   E("ERR_MULTIPLE_CALLBACK", "Callback called multiple times", Error);
+  E("ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET", "`process.setupUncaughtExceptionCapture()` was " +
+    "called while a capture callback was already active", Error);
+  E("ERR_INVALID_ASYNC_ID", "Invalid %s value: %s", RangeError);
+  E("ERR_TRACE_EVENTS_CATEGORY_REQUIRED", "At least one category is required", TypeError);
+  E("ERR_TRACE_EVENTS_UNAVAILABLE", "Trace events are unavailable", Error);
+  E("ERR_DOMAIN_CALLBACK_NOT_AVAILABLE", "A callback was registered through " +
+    "process.setUncaughtExceptionCaptureCallback(), which is mutually exclusive " +
+    "with using the `domain` module", Error);
+  E("ERR_DOMAIN_CANNOT_SET_UNCAUGHT_EXCEPTION_CAPTURE", "The `domain` module is in use, which is " +
+    "mutually exclusive with calling process.setUncaughtExceptionCaptureCallback()", Error);
+  E("ERR_NOT_BUILDING_SNAPSHOT", "Operation cannot be invoked when not building startup snapshot", Error);
+  E("ERR_DUPLICATE_STARTUP_SNAPSHOT_MAIN_FUNCTION", "Deserialize main function is already configured.", Error);
   E("ERR_STREAM_WRITE_AFTER_END", "write after end", Error);
   E("ERR_STREAM_PREMATURE_CLOSE", "Premature close", Error);
   E("ERR_STREAM_DESTROYED", "Cannot call %s after a stream was destroyed", Error);
@@ -444,6 +491,11 @@ const __errors = (() => {
     return `Invalid address family: ${addressType} ${host}:${port}`;
   }, RangeError);
   E("ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "%s maxBuffer length exceeded", RangeError);
+  E("ERR_CHILD_PROCESS_IPC_REQUIRED", "Forked processes must have an IPC channel, missing value 'ipc' in %s", Error);
+  E("ERR_IPC_DISCONNECTED", "IPC channel is already disconnected", Error);
+  E("ERR_IPC_ONE_PIPE", "Child process can have only one IPC pipe", Error);
+  E("ERR_IPC_SYNC_FORK", "IPC cannot be used with synchronous forks", Error);
+  E("ERR_INVALID_SYNC_FORK_INPUT", "Asynchronous forks do not support Buffer, TypedArray, DataView or string input: %s", TypeError);
   E("ERR_ASYNC_CALLBACK", "%s must be a function", TypeError);
   E("ERR_ASYNC_TYPE", 'Invalid name for async "type": %s', TypeError);
   E("ERR_OPERATION_FAILED", "Operation failed: %s", Error, TypeError);

@@ -1,4 +1,4 @@
-// node:repl over the stream-based readline implementation. Terminal editing remains readline's
+// node:repl over node:readline's Interface. Terminal editing remains readline's
 // concern; this module owns evaluation, multiline buffering, commands, prompts, and result output.
 {
   const util = __builtins.get("util");
@@ -34,7 +34,7 @@
       this.writer = options.writer || writer;
       this.commands = Object.create(null);
       this._defineDefaults();
-      this.on("line", line => this._onLine(line));
+      this.on("line", line => this._evalLine(line));
       // Node's REPL reports its end (`.exit`, or the input ending) as 'exit'.
       this.once("close", () => this.emit("exit"));
       if (options.breakEvalOnSigint) this.breakEvalOnSigint = true;
@@ -51,7 +51,7 @@
       }
     }
 
-    _onLine(line) {
+    _evalLine(line) {
       if (!this._bufferedCommand && line[0] === ".") { this._command(line); return; }
       const command = this._bufferedCommand + line + "\n";
       // Like Node's REPL context console, output written via console during evaluation goes to
@@ -63,6 +63,15 @@
         if (error && error.domainThrown && error.domain && typeof error.domain.listenerCount === "function"
             && error.domain.listenerCount("error") > 0) {
           error.domain.emit("error", error);
+          this.displayPrompt();
+          return;
+        }
+        // A synchronous throw out of `domain.run()` leaves that domain entered; like Node's REPL,
+        // hand the error to it.
+        const active = process.domain;
+        if (error && active && typeof active.listenerCount === "function" && active.listenerCount("error") > 0) {
+          active.emit("error", error);
+          active.exit();
           this.displayPrompt();
           return;
         }
@@ -110,7 +119,7 @@
       if (!command || typeof command.action !== "function") throw new TypeError("REPL command requires an action function");
       this.commands[String(keyword).replace(/^\./, "")] = { help: command.help || "", action: command.action };
     }
-    displayPrompt(preserveCursor) { const p = this._bufferedCommand ? "... " : this._prompt; if (!this._closed && p) this._write(p); return this; }
+    displayPrompt(preserveCursor) { const p = this._bufferedCommand ? "... " : this._prompt; if (!this.closed && p) this._write(p); return this; }
     setPrompt(prompt) { this._prompt = String(prompt); }
     getPrompt() { return this._prompt; }
     clearBufferedCommand() { this._bufferedCommand = ""; }

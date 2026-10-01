@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use lumen_host::sysfs::PathExt as _;
+
 pub use lumen::typescript::CompilerOptions;
 
 /// The raw option values of one config file chain (later files override earlier ones).
@@ -271,17 +273,17 @@ fn raw_from(json: &Json) -> RawOptions {
 
 fn resolve_extends(base_dir: &Path, spec: &str) -> Option<PathBuf> {
     let with_json = |p: PathBuf| -> Option<PathBuf> {
-        if p.is_file() {
+        if p.fs_is_file() {
             return Some(p);
         }
         let mut s = p.clone().into_os_string();
         s.push(".json");
         let j = PathBuf::from(s);
-        if j.is_file() {
+        if j.fs_is_file() {
             return Some(j);
         }
         let t = p.join("tsconfig.json");
-        t.is_file().then_some(t)
+        t.fs_is_file().then_some(t)
     };
     let path = Path::new(spec);
     if spec.starts_with('.') || path.is_absolute() {
@@ -302,7 +304,7 @@ fn load_raw(path: &Path, depth: usize) -> Result<RawOptions, String> {
     if depth > 32 {
         return Err("tsconfig `extends` chain too deep".into());
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = lumen_host::sysfs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let json = parse_jsonc(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut raw = RawOptions::default();
@@ -342,14 +344,14 @@ pub fn load_for(file: &Path) -> Result<CompilerOptions, String> {
     let abs = if file.is_absolute() {
         file.to_path_buf()
     } else {
-        std::env::current_dir()
+        lumen_host::sysfs::current_dir()
             .map_err(|e| e.to_string())?
             .join(file)
     };
     let mut dir = abs.parent();
     while let Some(d) = dir {
         let candidate = d.join("tsconfig.json");
-        if candidate.is_file() {
+        if candidate.fs_is_file() {
             return load(&candidate);
         }
         dir = d.parent();

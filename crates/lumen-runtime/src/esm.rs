@@ -25,6 +25,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use lumen_host::sysfs::PathExt as _;
+
 /// The named exports of each builtin (`"node:fs"` -> `"appendFile appendFileSync …"`, from the
 /// node glue's `esm_exports.js`). A builtin's synthetic ESM source is built from its list when it
 /// is first imported ([`builtin_source`]), not for every builtin at startup.
@@ -176,11 +178,11 @@ thread_local! {
 fn dir_package_type(dir: &Path) -> Option<Option<String>> {
     let lookup = || {
         let pkg = dir.join("package.json");
-        if !pkg.is_file() {
+        if !pkg.fs_is_file() {
             return None;
         }
         Some(
-            std::fs::read_to_string(pkg)
+            lumen_host::sysfs::read_to_string(pkg)
                 .ok()
                 .and_then(|t| crate::package_type_from_json(&t)),
         )
@@ -203,7 +205,7 @@ fn canonical_key(file: &Path) -> String {
     let via_dir = || -> Option<PathBuf> {
         let (dir, name) = (file.parent()?, file.file_name()?);
         if dir.as_os_str().is_empty()
-            || !std::fs::symlink_metadata(file).is_ok_and(|m| !m.file_type().is_symlink())
+            || !lumen_host::sysfs::exists_not_symlink(file)
         {
             return None;
         }
@@ -356,7 +358,7 @@ fn resolve(
         if Path::new(specifier).is_absolute() || specifier.starts_with("file://") {
             return resolve(specifier, "", builtins, attr_type);
         }
-        let cwd = std::env::current_dir().ok()?;
+        let cwd = lumen_host::sysfs::current_dir().ok()?;
         let (file, is_esm_pkg) = resolve_node_modules(specifier, &cwd)?;
         return load_as_module(&file, !is_esm_pkg);
     }
@@ -484,7 +486,7 @@ fn js_string_literal(text: &str) -> String {
 /// must round-trip exactly, so non-UTF-8 content is latin-1-decoded (one char per byte; the
 /// engine re-extracts the original bytes when it builds the `Uint8Array`).
 fn read_raw(file: &Path, attr_type: Option<&str>) -> Option<String> {
-    let bytes = std::fs::read(file).ok()?;
+    let bytes = lumen_host::sysfs::read(file).ok()?;
     Some(match attr_type {
         Some("bytes") => match String::from_utf8(bytes) {
             Ok(t) => t,
@@ -505,21 +507,21 @@ fn resolve_file_or_dir(base: &Path) -> Option<PathBuf> {
     if let Some(f) = resolve_file(base) {
         return Some(f);
     }
-    if base.is_dir() {
+    if base.fs_is_dir() {
         return resolve_directory(base);
     }
     None
 }
 
 fn resolve_file(base: &Path) -> Option<PathBuf> {
-    if base.is_file() {
+    if base.fs_is_file() {
         return Some(base.to_path_buf());
     }
     for ext in EXTENSIONS {
         let mut s = base.as_os_str().to_os_string();
         s.push(ext);
         let candidate = PathBuf::from(s);
-        if candidate.is_file() {
+        if candidate.fs_is_file() {
             return Some(candidate);
         }
     }
@@ -528,8 +530,8 @@ fn resolve_file(base: &Path) -> Option<PathBuf> {
 
 fn resolve_directory(dir: &Path) -> Option<PathBuf> {
     let pkg = dir.join("package.json");
-    if pkg.is_file() {
-        if let Ok(text) = std::fs::read_to_string(&pkg) {
+    if pkg.fs_is_file() {
+        if let Ok(text) = lumen_host::sysfs::read_to_string(&pkg) {
             if let Some(entry) = pkg_entry(&text) {
                 let target = normalize(&dir.join(entry));
                 if let Some(f) =
@@ -564,25 +566,25 @@ fn resolve_node_modules(name: &str, start: &Path) -> Option<(PathBuf, bool)> {
         // of the same name. Check it before probing physical files/directories.
         if let Some(subpath) = package_subpath(name) {
             let pkg_dir = package_dir(d, name);
-            if let Ok(text) = std::fs::read_to_string(pkg_dir.join("package.json")) {
+            if let Ok(text) = lumen_host::sysfs::read_to_string(pkg_dir.join("package.json")) {
                 if crate::tsconfig::parse_jsonc(&text).ok().is_some_and(|json| json.get("exports").is_some()) {
                     let entry = exports_subpath(&text, &subpath)?;
                     let mapped = normalize(&pkg_dir.join(entry));
-                    if !mapped.is_file() { return None; }
+                    if !mapped.fs_is_file() { return None; }
                     let esm = file_is_esm(&mapped);
                     return Some((mapped, esm));
                 }
             }
         }
         let target = d.join("node_modules").join(name);
-        if target.is_dir() {
+        if target.fs_is_dir() {
             if let Some(f) = resolve_directory(&target) {
                 // The resolved file's own nearest package.json decides ESM-ness — a package can
                 // ship an ESM build under `dist/es/` with its own `{"type":"module"}`.
                 let esm = file_is_esm(&f);
                 return Some((f, esm));
             }
-            if package_subpath(name).is_none() && target.join("package.json").is_file() {
+            if package_subpath(name).is_none() && target.join("package.json").fs_is_file() {
                 return None;
             }
         }
@@ -604,8 +606,8 @@ fn resolve_package_import(name: &str, start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(scope) = dir {
         let manifest = scope.join("package.json");
-        if manifest.is_file() {
-            let json = parse_jsonc(&std::fs::read_to_string(manifest).ok()?).ok()?;
+        if manifest.fs_is_file() {
+            let json = parse_jsonc(&lumen_host::sysfs::read_to_string(manifest).ok()?).ok()?;
             let entry = json.get("imports")?.get(name)?;
             let entry = package_esm_target(entry).target()?;
             // Relative exact targets cover package-private ESM dependencies such as Chalk.
@@ -655,17 +657,17 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
             // object literal would give `"__proto__"` keys prototype-SETTING semantics (a
             // pollution vector), where JSON.parse creates a plain own data property — the same
             // semantics as a `with { type: "json" }` import.
-            let text = std::fs::read_to_string(file).ok()?;
+            let text = lumen_host::sysfs::read_to_string(file).ok()?;
             Some((
                 key,
                 format!("export default JSON.parse({});", js_string_literal(&text)),
             ))
         }
         // `.mjs` is always ESM regardless of package type; `.cjs` is always CommonJS.
-        "mjs" => Some((key.clone(), std::fs::read_to_string(file).ok()?)),
+        "mjs" => Some((key.clone(), lumen_host::sysfs::read_to_string(file).ok()?)),
         // `.jsx` is JSX-over-ESM: transpile to plain JS, then load as a module.
         "jsx" => {
-            let text = std::fs::read_to_string(file).ok()?;
+            let text = lumen_host::sysfs::read_to_string(file).ok()?;
             let js = crate::jsx::transform(&text).unwrap_or(text);
             Some((key, js))
         }
@@ -674,7 +676,7 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
         // semantics, every offset kept; `require` of a `.cts`/CJS `.ts` goes through
         // node:module, which compiles it the same way). Syntax it cannot run throws Node's
         // SyntaxError when the module is parsed.
-        "mts" => Some((key, std::fs::read_to_string(file).ok()?)),
+        "mts" => Some((key, lumen_host::sysfs::read_to_string(file).ok()?)),
         "cts" => Some((key.clone(), cjs_wrapper(&key, source_of(file)))),
         _ if cjs_default => {
             let text = source_of(file);
@@ -689,7 +691,7 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
             Some((key.clone(), cjs_wrapper(&key, text)))
         }
         _ => {
-            let text = std::fs::read_to_string(file).ok()?;
+            let text = lumen_host::sysfs::read_to_string(file).ok()?;
             Some((key, text))
         }
     }
@@ -751,7 +753,7 @@ fn detect_module_syntax(src: &str, ts: bool) -> bool {
 
 /// Read a file's source (empty on failure — the wrapper still yields a working default export).
 fn source_of(file: &Path) -> String {
-    std::fs::read_to_string(file).unwrap_or_default()
+    lumen_host::sysfs::read_to_string(file).unwrap_or_default()
 }
 
 /// A synthetic ESM module bridging a CommonJS file: `require(path)`'s result is the default
@@ -801,7 +803,7 @@ fn collect_cjs_exports(
             .parent()
             .and_then(|d| resolve_relative_cjs(&d.join(&spec)))
         {
-            if let Ok(sub) = std::fs::read_to_string(&target) {
+            if let Ok(sub) = lumen_host::sysfs::read_to_string(&target) {
                 collect_cjs_exports(&sub, &target, depth + 1, names, seen);
             }
         }
@@ -813,19 +815,19 @@ fn collect_cjs_exports(
 /// `require('./server.node')` resolves to `server.node.js` rather than `server.js`.
 fn resolve_relative_cjs(base: &Path) -> Option<PathBuf> {
     let base = normalize(base);
-    if base.is_file() {
+    if base.fs_is_file() {
         return Some(base);
     }
     for ext in [".js", ".cjs", ".json"] {
         let mut s = base.as_os_str().to_os_string();
         s.push(ext);
         let cand = PathBuf::from(s);
-        if cand.is_file() {
+        if cand.fs_is_file() {
             return Some(cand);
         }
     }
     let index = base.join("index.js");
-    index.is_file().then_some(index)
+    index.fs_is_file().then_some(index)
 }
 
 /// The relative specifiers a module re-exports wholesale: `module.exports = require('X')` and

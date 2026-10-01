@@ -41,6 +41,9 @@ const TA_KINDS = [
   "BigInt64Array", "BigUint64Array",
 ];
 const TA_BRAND = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
+const MapForEach = Map.prototype.forEach;
+const SetForEach = Set.prototype.forEach;
+const ObjectKeys = Object.keys;
 const ERROR_NAMES = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "EvalError", "URIError"];
 
 function serializeForClone(value, transfer = [], transport = false) {
@@ -48,7 +51,8 @@ function serializeForClone(value, transfer = [], transport = false) {
   if (!Array.isArray(list)) throw new TypeError("transferList must be an array");
   const ports = globalThis.__lumenPortClone;
   const listed = new Set();
-  for (const port of list) {
+  for (let i = 0; i < list.length; i++) {
+    const port = list[i];
     if (ports?.isUntransferable(port) || listed.has(port)) throw new DOMException("Unsupported or duplicate transferable", "DataCloneError");
     if (ports?.isPort(port)) ports.validate(port);
     else if (!transport || !globalThis.__cloneTransfer?.isTransferableBuffer(port)) throw new DOMException("Unsupported or detached transferable", "DataCloneError");
@@ -57,7 +61,8 @@ function serializeForClone(value, transfer = [], transport = false) {
   if (transport) globalThis.__cloneTransfer?.begin();
   try {
   const portIndices = new Map();
-  for (const port of list) {
+  for (let i = 0; i < list.length; i++) {
+    const port = list[i];
     if(!transport) throw new DOMException("MessagePort requires native message transport", "DataCloneError");
     if(ports?.isPort(port))portIndices.set(port, ports.export(port));
   }
@@ -144,14 +149,14 @@ function serializeForClone(value, transfer = [], transport = false) {
       memory.set(v, ref);
       u8(T_MAP);
       u32(v.size);
-      for (const [k, val] of v) { write(k); write(val); }
+      MapForEach.call(v, (val, k) => { write(k); write(val); });
       return;
     }
     if (v instanceof Set) {
       memory.set(v, ref);
       u8(T_SET);
       u32(v.size);
-      for (const item of v) write(item);
+      SetForEach.call(v, (item) => write(item));
       return;
     }
     if (v instanceof Error) {
@@ -179,19 +184,21 @@ function serializeForClone(value, transfer = [], transport = false) {
     // Plain object (its own enumerable string-keyed properties).
     memory.set(v, ref);
     u8(T_OBJECT);
-    const keys = Object.keys(v);
+    const keys = ObjectKeys(v);
     u32(keys.length);
-    for (const k of keys) { str(k); write(v[k]); }
+    for (let i = 0; i < keys.length; i++) { const k = keys[i]; str(k); write(v[k]); }
   };
 
   write(value);
   // Getters may have transferred an outer buffer/port in a nested message. Revalidate
   // the complete list before detaching any sender-owned resources.
-  for (const item of list) {
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
     if(ports?.isPort(item))ports.validate(item);
     else if(!globalThis.__cloneTransfer.isTransferableBuffer(item))throw new DOMException("Transferable was detached during serialization", "DataCloneError");
   }
-  for (const item of list) {
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
     if(ports?.isPort(item))ports.detach(item);
     else globalThis.__cloneTransfer.detachBuffer(item);
   }

@@ -20,6 +20,11 @@ const kEmptyObject = Object.freeze({ __proto__: null });
 
 let defaultMaxListeners = 10;
 
+function validateMaxListeners(n, name) {
+  if (typeof n !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", n);
+  if (n < 0 || Number.isNaN(n)) throw new ERR_OUT_OF_RANGE(name, "a non-negative number", n);
+}
+
 const inspect = (v, o) => __builtins.get("util").inspect(v, o);
 
 function EventEmitter(opts) {
@@ -56,9 +61,7 @@ Object.defineProperty(EventEmitter, "defaultMaxListeners", {
   enumerable: true,
   get() { return defaultMaxListeners; },
   set(arg) {
-    if (typeof arg !== "number" || arg < 0 || Number.isNaN(arg)) {
-      throw new ERR_OUT_OF_RANGE("defaultMaxListeners", "a non-negative number", arg);
-    }
+    validateMaxListeners(arg, "defaultMaxListeners");
     defaultMaxListeners = arg;
   },
 });
@@ -75,9 +78,7 @@ function isEventTarget(obj) {
 
 // setMaxListeners(n, ...eventTargets): the process default with no targets, else each target's.
 EventEmitter.setMaxListeners = function setMaxListeners(n = defaultMaxListeners, ...eventTargets) {
-  if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-    throw new ERR_OUT_OF_RANGE("n", "a non-negative number", n);
-  }
+  validateMaxListeners(n, "setMaxListeners");
   if (eventTargets.length === 0) {
     defaultMaxListeners = n;
   } else {
@@ -148,9 +149,7 @@ function emitUnhandledRejectionOrErr(ee, err, type, args) {
 }
 
 EventEmitter.prototype.setMaxListeners = function setMaxListeners(n) {
-  if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-    throw new ERR_OUT_OF_RANGE("n", "a non-negative number", n);
-  }
+  validateMaxListeners(n, "setMaxListeners");
   this._maxListeners = n;
   return this;
 };
@@ -177,6 +176,18 @@ EventEmitter.prototype.emit = function emit(type, ...args) {
 
   // If there is no 'error' event listener then throw.
   if (doError) {
+    const domain = this.domain;
+    if (domain != null && this !== process && typeof domain.listenerCount === "function"
+        && domain.listenerCount("error") > 0) {
+      const er = args.length > 0 && args[0] ? args[0] : new ERR_UNHANDLED_ERROR();
+      if (typeof er === "object") {
+        er.domainEmitter = this;
+        er.domain = domain;
+        er.domainThrown = false;
+      }
+      domain.emit("error", er);
+      return false;
+    }
     let er;
     if (args.length > 0) er = args[0];
     if (er instanceof Error) {
@@ -442,15 +453,25 @@ EventEmitter.listenerCount = function (emitter, type) {
 };
 
 EventEmitter.prototype.listenerCount = listenerCount;
-function listenerCount(type) {
+function listenerCount(type, listener) {
   const events = this._events;
 
   if (events !== undefined) {
     const evlistener = events[type];
 
     if (typeof evlistener === "function") {
+      if (listener != null) {
+        return listener === evlistener || listener === evlistener.listener ? 1 : 0;
+      }
       return 1;
     } else if (evlistener !== undefined) {
+      if (listener != null) {
+        let matching = 0;
+        for (let i = 0, l = evlistener.length; i < l; i++) {
+          if (evlistener[i] === listener || evlistener[i].listener === listener) matching++;
+        }
+        return matching;
+      }
       return evlistener.length;
     }
   }
@@ -744,7 +765,9 @@ function addAbortListener(signal, listener) {
   if (signal.aborted) {
     queueMicrotask(() => listener());
   } else {
-    signal.addEventListener("abort", listener, { __proto__: null, once: true });
+    signal.addEventListener("abort", listener, {
+      __proto__: null, once: true, [Symbol.for("nodejs.internal.kResistStopPropagation")]: true,
+    });
     removeEventListener = () => {
       signal.removeEventListener("abort", listener);
     };
@@ -803,8 +826,14 @@ class EventEmitterAsyncResource extends EventEmitter {
   emitDestroy() {
     this.asyncResource.emitDestroy();
   }
-  get asyncId() { return this.asyncResource.asyncId(); }
-  get triggerAsyncId() { return this.asyncResource.triggerAsyncId(); }
+  get asyncId() {
+    if (this[kAsyncResource] === undefined) throw new __errors.ERR_INVALID_THIS("EventEmitterAsyncResource");
+    return this[kAsyncResource].asyncId();
+  }
+  get triggerAsyncId() {
+    if (this[kAsyncResource] === undefined) throw new __errors.ERR_INVALID_THIS("EventEmitterAsyncResource");
+    return this[kAsyncResource].triggerAsyncId();
+  }
   get asyncResource() {
     if (this[kAsyncResource] === undefined) {
       throw new __errors.ERR_INVALID_THIS("EventEmitterAsyncResource");
@@ -820,3 +849,4 @@ Object.defineProperty(EventEmitter, "EventEmitterAsyncResource", {
 });
 
 __builtins.set("events", EventEmitter);
+__internals.set("events_symbols", { kFirstEventParam });

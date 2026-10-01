@@ -1,7 +1,7 @@
 // A minimal but functional `ReadableStream` — default readers only (no BYOB/byte streams, no
 // `tee()`, no piping, no `WritableStream`/`TransformStream`). Chunks are queued and served from the
 // queue, pulling from the underlying source on demand. lumen buffers request/response bodies, so a
-// stream backed by a *synchronous* source can also be drained synchronously (see `_readSync`, used
+// stream backed by a *synchronous* source can also be drained synchronously (see `lumen.readSync`, used
 // by the Request/Response body interop in fetch.js).
 
 const kStream = Symbol("stream");
@@ -207,7 +207,7 @@ class ReadableStreamDefaultReader {
   }
   // Non-standard internal: get one chunk without awaiting, for synchronous body draining. Returns
   // `{ pending: true }` when the source can't produce synchronously.
-  _readSync() {
+  [Symbol.for("lumen.readSync")]() {
     const s = this[kStream];
     if (!s) throw new TypeError("reader has been released");
     if (s._chunks.length) return { value: s._chunks.shift(), done: false };

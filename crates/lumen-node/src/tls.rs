@@ -1,462 +1,501 @@
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+//! Native half of `node:tls`: secure contexts and TLS sessions over `lumen_tls::engine`. A session
+//! owns no socket; `tls.js` moves encrypted bytes between it and the underlying stream.
 
-use lumen_host::{ops, CallbackQueue, CompletionSender, Ctx, OpDecl, Value};
+use lumen_host::{ops, OpDecl};
 
 pub const TLS_OPS: &[OpDecl] = ops![
-    "connect" (7) => op_connect,
-    "upgrade" (6) => op_upgrade,
-    "read" (3) => op_read,
-    "write" (4) => op_write,
-    "close" (1) => op_close,
-    "listen" (5) => op_listen,
-    "accept" (3) => op_accept,
-    "closeServer" (1) => op_close_server,
+    "available" (0) => op_available,
+    "rootCertificates" (0) => op_root_certificates,
+    "ciphers" (0) => op_ciphers,
+    "ctxNew" (3) => op_ctx_new,
+    "ctxOp" (4) => op_ctx_op,
+    "sessNew" (2) => op_sess_new,
+    "sessFree" (1) => op_sess_free,
+    "sessOp" (4) => op_sess_op,
+    "feed" (2) => op_feed,
+    "output" (1) => op_output,
+    "read" (2) => op_read,
+    "write" (2) => op_write,
+    "events" (1) => op_events,
+    "lastError" (1) => op_last_error,
 ];
 
-fn op_upgrade(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let socket_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
-    let servername = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let alpn: Vec<String> = ctx
-        .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
-        .to_string()
-        .split(',')
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect();
-    let verify_peer = !matches!(args.get(3), Some(Value::Bool(false)));
-    let (resolve, reject) = callbacks(ctx, args.get(4), args.get(5))?;
-    let tcp = crate::net::take_stream(ctx, socket_id)?;
-    let local = tcp
-        .local_addr()
-        .map_err(|error| ctx.make_error("Error", error.to_string()))?;
-    let peer = tcp
-        .peer_addr()
-        .map_err(|error| ctx.make_error("Error", error.to_string()))?;
-    tcp.set_read_timeout(Some(Duration::from_millis(100))).ok();
-    tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
-    let task = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
-    completions(ctx).run_blocking(task, move || {
-        let result =
-            lumen_tls::TlsStream::connect_with_options(tcp, &servername, &alpn, verify_peer).map(
-                |stream| {
-                    let protocol = stream.protocol();
-                    let cipher = stream.cipher();
-                    let negotiated_alpn = stream.alpn_protocol();
-                    Connected {
-                        stream,
-                        local,
-                        peer,
-                        protocol,
-                        cipher,
-                        alpn: negotiated_alpn,
-                    }
-                },
-            );
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
-}
+#[cfg(all(unix, not(target_os = "android")))]
+pub use imp::TlsRegistry;
 
-struct Entry {
-    stream: Arc<Mutex<lumen_tls::TlsStream>>,
-    closed: Arc<AtomicBool>,
-}
-
+#[cfg(not(all(unix, not(target_os = "android"))))]
 #[derive(Default)]
-pub struct TlsRegistry {
-    next: u64,
-    sockets: std::collections::HashMap<u64, Entry>,
-    next_listener: u64,
-    listeners: std::collections::HashMap<u64, ListenerEntry>,
+pub struct TlsRegistry;
+
+#[cfg(not(all(unix, not(target_os = "android"))))]
+mod unsupported {
+    use lumen_host::{Ctx, Value};
+
+    fn unavailable(ctx: &mut Ctx) -> Result<Value, Value> {
+        Err(ctx.make_error("Error", "node:tls is not available on this platform"))
+    }
+
+    pub fn available(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Bool(false))
+    }
+
+    pub fn any(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        unavailable(ctx)
+    }
 }
 
-struct ListenerEntry {
-    listener: Arc<TcpListener>,
-    closed: Arc<AtomicBool>,
-    local: SocketAddr,
-    certificate: Arc<Vec<u8>>,
-    private_key: Arc<Vec<u8>>,
-    alpn: Arc<Vec<String>>,
-}
+#[cfg(not(all(unix, not(target_os = "android"))))]
+use unsupported::{any as op_ciphers, any as op_ctx_new, any as op_ctx_op, any as op_events, any as op_feed, any as op_last_error, any as op_output, any as op_read, any as op_root_certificates, any as op_sess_free, any as op_sess_new, any as op_sess_op, any as op_write, available as op_available};
 
-struct Connected {
-    stream: lumen_tls::TlsStream,
-    local: SocketAddr,
-    peer: SocketAddr,
-    protocol: String,
-    cipher: String,
-    alpn: String,
-}
+#[cfg(all(unix, not(target_os = "android")))]
+use imp::{
+    op_available, op_ciphers, op_ctx_new, op_ctx_op, op_events, op_feed, op_last_error, op_output,
+    op_read, op_root_certificates, op_sess_free, op_sess_new, op_sess_op, op_write,
+};
 
-fn callbacks(
-    ctx: &mut Ctx,
-    resolve: Option<&Value>,
-    reject: Option<&Value>,
-) -> Result<(Value, Value), Value> {
-    match (resolve, reject) {
-        (Some(resolve), Some(reject)) if resolve.is_callable() && reject.is_callable() => {
-            Ok((resolve.clone(), reject.clone()))
+#[cfg(all(unix, not(target_os = "android")))]
+mod imp {
+    use std::collections::HashMap;
+
+    use lumen_host::{Ctx, Value};
+    use lumen_tls::engine::{ClientHello, Context, EngineError, Event, Io, Session};
+
+    #[derive(Default)]
+    pub struct TlsRegistry {
+        next: u64,
+        contexts: HashMap<u64, Context>,
+        sessions: HashMap<u64, Session>,
+    }
+
+    enum Out {
+        Undefined,
+        Null,
+        Bool(bool),
+        Num(f64),
+        Str(String),
+        Bytes(Vec<u8>),
+        Array(Vec<Out>),
+        Error(EngineError),
+    }
+
+    impl From<Result<(), EngineError>> for Out {
+        fn from(result: Result<(), EngineError>) -> Out {
+            match result {
+                Ok(()) => Out::Undefined,
+                Err(error) => Out::Error(error),
+            }
         }
-        _ => Err(ctx.make_error("TypeError", "TLS op expects resolve and reject callbacks")),
     }
-}
 
-fn completions(ctx: &mut Ctx) -> CompletionSender {
-    ctx.op_state()
-        .get::<CompletionSender>()
-        .expect("runtime installs completion sender")
-        .clone()
-}
-
-fn op_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let host = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let port = args.get(1).and_then(Value::as_num_opt).unwrap_or(443.0) as u16;
-    let servername = ctx
-        .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let alpn: Vec<String> = ctx
-        .coerce_string(args.get(3).unwrap_or(&Value::Undefined))?
-        .to_string()
-        .split(',')
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect();
-    let verify_peer = !matches!(args.get(4), Some(Value::Bool(false)));
-    let (resolve, reject) = callbacks(ctx, args.get(5), args.get(6))?;
-    let task = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
-    completions(ctx).run_blocking(task, move || {
-        let result = (|| -> Result<Connected, String> {
-            let addresses: Vec<_> = (host.as_str(), port)
-                .to_socket_addrs()
-                .map_err(|error| format!("getaddrinfo {host}: {error}"))?
-                .collect();
-            let mut last_error = None;
-            for address in addresses {
-                match TcpStream::connect_timeout(&address, Duration::from_secs(30)) {
-                    Ok(tcp) => {
-                        tcp.set_read_timeout(Some(Duration::from_millis(100))).ok();
-                        tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
-                        let local = tcp.local_addr().map_err(|error| error.to_string())?;
-                        let peer = tcp.peer_addr().map_err(|error| error.to_string())?;
-                        let stream = lumen_tls::TlsStream::connect_with_options(
-                            tcp,
-                            &servername,
-                            &alpn,
-                            verify_peer,
-                        )?;
-                        let protocol = stream.protocol();
-                        let cipher = stream.cipher();
-                        let alpn = stream.alpn_protocol();
-                        return Ok(Connected {
-                            stream,
-                            local,
-                            peer,
-                            protocol,
-                            cipher,
-                            alpn,
-                        });
-                    }
-                    Err(error) => last_error = Some(error),
-                }
+    fn error_value(ctx: &mut Ctx, error: &EngineError) -> Value {
+        let value = ctx.make_error(error.kind.unwrap_or("Error"), error.message.clone());
+        let mut set = |key: &str, text: &Option<String>| {
+            if let Some(text) = text {
+                let _ = ctx.set_member(&value, key, Value::from_string(text.clone()));
             }
-            Err(format!(
-                "connect {host}:{port}: {}",
-                last_error.map_or_else(|| "no address".into(), |error| error.to_string())
-            ))
-        })();
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
-}
-
-fn decode_connect(
-    ctx: &mut Ctx,
-    payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
-    let connected = *payload
-        .downcast::<Result<Connected, String>>()
-        .expect("TLS connect payload");
-    register_connected(
-        ctx,
-        connected.map_err(|message| ctx.make_error("Error", message))?,
-    )
-}
-
-fn register_connected(ctx: &mut Ctx, connected: Connected) -> Result<Vec<Value>, Value> {
-    let Connected {
-        stream,
-        local,
-        peer,
-        protocol,
-        cipher,
-        alpn,
-    } = connected;
-    let registry = ctx.host_mut::<TlsRegistry>().expect("TLS registry");
-    let id = registry.next;
-    registry.next += 1;
-    registry.sockets.insert(
-        id,
-        Entry {
-            stream: Arc::new(Mutex::new(stream)),
-            closed: Arc::new(AtomicBool::new(false)),
-        },
-    );
-    Ok(vec![
-        Value::Num(id as f64),
-        Value::from_string(local.ip().to_string()),
-        Value::Num(local.port() as f64),
-        Value::from_string(peer.ip().to_string()),
-        Value::Num(peer.port() as f64),
-        Value::from_string(protocol),
-        Value::from_string(cipher),
-        Value::from_string(alpn),
-    ])
-}
-
-fn op_listen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let host = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let port = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u16;
-    let certificate = ctx
-        .typed_array_bytes(args.get(2).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "TLS server certificate must be bytes"))?;
-    let private_key = ctx
-        .typed_array_bytes(args.get(3).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "TLS server private key must be bytes"))?;
-    let alpn: Vec<String> = ctx
-        .coerce_string(args.get(4).unwrap_or(&Value::Undefined))?
-        .to_string()
-        .split(',')
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect();
-    let listener = TcpListener::bind((if host.is_empty() { "0.0.0.0" } else { &host }, port))
-        .map_err(|error| ctx.make_error("Error", format!("TLS listen: {error}")))?;
-    let local = listener
-        .local_addr()
-        .map_err(|error| ctx.make_error("Error", error.to_string()))?;
-    let registry = ctx.host_mut::<TlsRegistry>().expect("TLS registry");
-    let id = registry.next_listener;
-    registry.next_listener += 1;
-    registry.listeners.insert(
-        id,
-        ListenerEntry {
-            listener: Arc::new(listener),
-            closed: Arc::new(AtomicBool::new(false)),
-            local,
-            certificate: Arc::new(certificate),
-            private_key: Arc::new(private_key),
-            alpn: Arc::new(alpn),
-        },
-    );
-    let result = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&result, "serverId", Value::Num(id as f64));
-    let _ = ctx.set_member(
-        &result,
-        "address",
-        Value::from_string(local.ip().to_string()),
-    );
-    let _ = ctx.set_member(&result, "port", Value::Num(local.port() as f64));
-    Ok(result)
-}
-
-enum AcceptResult {
-    Connected(Connected),
-    Closed,
-    Error(String),
-}
-
-fn op_accept(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
-    let (resolve, reject) = callbacks(ctx, args.get(1), args.get(2))?;
-    let found = ctx
-        .host_mut::<TlsRegistry>()
-        .and_then(|registry| registry.listeners.get(&id))
-        .map(|entry| {
-            (
-                entry.listener.clone(),
-                entry.closed.clone(),
-                entry.certificate.clone(),
-                entry.private_key.clone(),
-                entry.alpn.clone(),
-            )
-        });
-    let Some((listener, closed, certificate, private_key, alpn)) = found else {
-        CallbackQueue::enqueue(ctx.op_state(), resolve, vec![Value::Null]);
-        return Ok(Value::Undefined);
-    };
-    let task = lumen_host::register_task(ctx, resolve, Some(reject), decode_accept);
-    completions(ctx).run_blocking(task, move || {
-        let result = match listener.accept() {
-            Ok((tcp, peer)) if !closed.load(Ordering::SeqCst) => {
-                let local = tcp
-                    .local_addr()
-                    .unwrap_or_else(|_| listener.local_addr().unwrap());
-                tcp.set_read_timeout(Some(Duration::from_millis(100))).ok();
-                match lumen_tls::TlsStream::accept_with_alpn(tcp, &certificate, &private_key, &alpn)
-                {
-                    Ok(stream) => {
-                        let protocol = stream.protocol();
-                        let cipher = stream.cipher();
-                        let alpn = stream.alpn_protocol();
-                        AcceptResult::Connected(Connected {
-                            stream,
-                            local,
-                            peer,
-                            protocol,
-                            cipher,
-                            alpn,
-                        })
-                    }
-                    Err(error) => AcceptResult::Error(error),
-                }
-            }
-            _ => AcceptResult::Closed,
         };
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
-}
-
-fn decode_accept(
-    ctx: &mut Ctx,
-    payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
-    match *payload
-        .downcast::<AcceptResult>()
-        .expect("TLS accept payload")
-    {
-        AcceptResult::Connected(connected) => register_connected(ctx, connected),
-        AcceptResult::Closed => Ok(vec![Value::Null]),
-        AcceptResult::Error(message) => Err(ctx.make_error("Error", message)),
+        set("library", &error.library);
+        set("function", &error.function);
+        set("reason", &error.reason);
+        set("code", &error.code);
+        value
     }
-}
 
-fn op_close_server(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
-    let entry = ctx
-        .host_mut::<TlsRegistry>()
-        .and_then(|registry| registry.listeners.remove(&id));
-    if let Some(entry) = entry {
-        entry.closed.store(true, Ordering::SeqCst);
-        let address = if entry.local.ip().is_unspecified() {
-            SocketAddr::new(
-                if entry.local.is_ipv6() {
-                    IpAddr::V6(Ipv6Addr::LOCALHOST)
-                } else {
-                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+    fn to_value(ctx: &mut Ctx, out: Out) -> Result<Value, Value> {
+        Ok(match out {
+            Out::Undefined => Value::Undefined,
+            Out::Null => Value::Null,
+            Out::Bool(flag) => Value::Bool(flag),
+            Out::Num(number) => Value::Num(number),
+            Out::Str(text) => Value::from_string(text),
+            Out::Bytes(bytes) => ctx.make_uint8array(&bytes)?,
+            Out::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(to_value(ctx, item)?);
+                }
+                ctx.make_array(values)
+            }
+            Out::Error(error) => return Err(error_value(ctx, &error)),
+        })
+    }
+
+    fn registry(ctx: &mut Ctx) -> &mut TlsRegistry {
+        ctx.host_mut::<TlsRegistry>().expect("runtime installs the TLS registry")
+    }
+
+    fn id_arg(args: &[Value]) -> u64 {
+        args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64
+    }
+
+    fn num_arg(args: &[Value], index: usize) -> f64 {
+        args.get(index).and_then(Value::as_num_opt).unwrap_or(0.0)
+    }
+
+    fn bytes_arg(ctx: &mut Ctx, args: &[Value], index: usize) -> Option<Vec<u8>> {
+        args.get(index).and_then(|value| ctx.typed_array_bytes(value))
+    }
+
+    fn string_arg(ctx: &mut Ctx, args: &[Value], index: usize) -> Result<Option<String>, Value> {
+        match args.get(index) {
+            None | Some(Value::Undefined) | Some(Value::Null) => Ok(None),
+            Some(value) => Ok(Some(ctx.coerce_string(value)?.to_string())),
+        }
+    }
+
+    pub fn op_available(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Bool(lumen_tls::engine::openssl_available()))
+    }
+
+    pub fn op_root_certificates(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        let out = Out::Array(
+            lumen_tls::engine::root_certificate_pems()
+                .into_iter()
+                .map(Out::Str)
+                .collect(),
+        );
+        to_value(ctx, out)
+    }
+
+    pub fn op_ciphers(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        let out = match lumen_tls::engine::cipher_names() {
+            Ok(names) => Out::Array(names.into_iter().map(Out::Str).collect()),
+            Err(error) => Out::Error(error),
+        };
+        to_value(ctx, out)
+    }
+
+    pub fn op_ctx_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let method = string_arg(ctx, args, 0)?;
+        let min = num_arg(args, 1) as i32;
+        let max = num_arg(args, 2) as i32;
+        let out = match Context::new(method.as_deref(), min, max) {
+            Ok(context) => {
+                let registry = registry(ctx);
+                registry.next += 1;
+                let id = registry.next;
+                registry.contexts.insert(id, context);
+                Out::Num(id as f64)
+            }
+            Err(error) => Out::Error(error),
+        };
+        to_value(ctx, out)
+    }
+
+    pub fn op_ctx_op(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let name = string_arg(ctx, args, 1)?.unwrap_or_default();
+        let bytes = bytes_arg(ctx, args, 2);
+        let text = match name.as_str() {
+            "setCiphers" | "setCipherSuites" | "setSigalgs" | "setECDHCurve" => string_arg(ctx, args, 2)?,
+            _ => None,
+        };
+        let number = num_arg(args, 2);
+        let passphrase = bytes_arg(ctx, args, 3);
+        let out = match registry(ctx).contexts.get_mut(&id) {
+            None => Out::Error(EngineError::plain("SecureContext is closed")),
+            Some(context) => match name.as_str() {
+                "setKey" => bytes
+                    .map_or(Out::Undefined, |pem| context.set_key(&pem, passphrase.as_deref()).into()),
+                "setCert" => bytes.map_or(Out::Undefined, |pem| context.set_cert(&pem).into()),
+                "addCACert" => bytes.map_or(Out::Undefined, |pem| context.add_ca_cert(&pem).into()),
+                "addCRL" => bytes.map_or(Out::Undefined, |pem| context.add_crl(&pem).into()),
+                "addRootCerts" => context.add_root_certs().into(),
+                "setCiphers" => context.set_ciphers(&text.unwrap_or_default()).into(),
+                "setCipherSuites" => context.set_cipher_suites(&text.unwrap_or_default()).into(),
+                "setSigalgs" => context.set_sigalgs(&text.unwrap_or_default()).into(),
+                "setECDHCurve" => context.set_ecdh_curve(&text.unwrap_or_default()).into(),
+                "setDHParam" => match context.set_dh_param(bytes.as_deref()) {
+                    Ok(Some(warning)) => Out::Str(warning.to_string()),
+                    Ok(None) => Out::Undefined,
+                    Err(error) => Out::Error(error),
                 },
-                entry.local.port(),
-            )
+                "setMinProto" => context.set_min_proto(number as i32).into(),
+                "setMaxProto" => context.set_max_proto(number as i32).into(),
+                "getMinProto" => Out::Num(context.min_proto() as f64),
+                "getMaxProto" => Out::Num(context.max_proto() as f64),
+                "setOptions" => context.set_options(number as u64).into(),
+                "setSessionIdContext" => bytes
+                    .map_or(Out::Undefined, |context_id| context.set_session_id_context(&context_id).into()),
+                "setSessionTimeout" => context.set_session_timeout(number as i32).into(),
+                "setTicketKeys" => bytes.map_or(Out::Undefined, |keys| context.set_ticket_keys(&keys).into()),
+                "getTicketKeys" => Out::Bytes(context.ticket_keys()),
+                "loadPKCS12" => bytes
+                    .map_or(Out::Undefined, |data| context.load_pkcs12(&data, passphrase.as_deref()).into()),
+                "getCertificate" => Out::Bytes(context.certificate().to_vec()),
+                "getIssuer" => Out::Bytes(context.issuer().to_vec()),
+                "close" => {
+                    context.close();
+                    Out::Undefined
+                }
+                other => Out::Error(EngineError::plain(format!("unknown context operation {other}"))),
+            },
+        };
+        if name == "close" {
+            registry(ctx).contexts.remove(&id);
+        }
+        to_value(ctx, out)
+    }
+
+    pub fn op_sess_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let context_id = id_arg(args);
+        let is_server = matches!(args.get(1), Some(Value::Bool(true)));
+        let registry = registry(ctx);
+        let out = match registry.contexts.get(&context_id) {
+            None => Out::Error(EngineError::plain("SecureContext is closed")),
+            Some(context) => match Session::new(context, is_server) {
+                Ok(session) => {
+                    registry.next += 1;
+                    let id = registry.next;
+                    registry.sessions.insert(id, session);
+                    Out::Num(id as f64)
+                }
+                Err(error) => Out::Error(error),
+            },
+        };
+        to_value(ctx, out)
+    }
+
+    pub fn op_sess_free(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        registry(ctx).sessions.remove(&id);
+        Ok(Value::Undefined)
+    }
+
+    fn hello_out(hello: ClientHello) -> Out {
+        Out::Array(vec![
+            Out::Bytes(hello.session_id),
+            Out::Str(hello.servername),
+            Out::Bool(hello.has_ticket),
+            Out::Bool(hello.ocsp_request),
+            Out::Bytes(hello.alpn),
+        ])
+    }
+
+    fn certificates_out(chain: Vec<Vec<u8>>) -> Out {
+        Out::Array(chain.into_iter().map(Out::Bytes).collect())
+    }
+
+    pub fn op_sess_op(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let name = string_arg(ctx, args, 1)?.unwrap_or_default();
+        let bytes = bytes_arg(ctx, args, 2);
+        let text = match name.as_str() {
+            "setServername" => string_arg(ctx, args, 2)?,
+            _ => None,
+        };
+        let label = if name == "exportKeyingMaterial" {
+            string_arg(ctx, args, 3)?
         } else {
-            entry.local
+            None
         };
-        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(100));
-    }
-    Ok(Value::Undefined)
-}
-
-fn op_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
-    let (resolve, reject) = callbacks(ctx, args.get(1), args.get(2))?;
-    let found = ctx
-        .host_mut::<TlsRegistry>()
-        .and_then(|registry| registry.sockets.get(&id))
-        .map(|entry| (entry.stream.clone(), entry.closed.clone()));
-    let Some((stream, closed)) = found else {
-        CallbackQueue::enqueue(ctx.op_state(), resolve, vec![Value::Null]);
-        return Ok(Value::Undefined);
-    };
-    let task = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
-    completions(ctx).run_blocking(task, move || {
-        let result = loop {
-            if closed.load(Ordering::SeqCst) {
-                break Ok(Vec::new());
-            }
-            let mut bytes = vec![0u8; 65536];
-            match stream.lock().unwrap().read(&mut bytes) {
-                Ok(0) => break Ok(Vec::new()),
-                Ok(length) => {
-                    bytes.truncate(length);
-                    break Ok(bytes);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    std::thread::yield_now()
-                }
-                Err(error) => break Err(error.to_string()),
-            }
+        let context_bytes = if name == "exportKeyingMaterial" {
+            bytes_arg(ctx, args, 4)
+        } else {
+            None
         };
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
-}
-
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
-    match *payload
-        .downcast::<Result<Vec<u8>, String>>()
-        .expect("TLS read payload")
-    {
-        Ok(bytes) if bytes.is_empty() => Ok(vec![Value::Null]),
-        Ok(bytes) => Ok(vec![ctx.make_uint8array(&bytes)?]),
-        Err(message) => Err(ctx.make_error("Error", message)),
+        let flag_a = matches!(args.get(2), Some(Value::Bool(true)));
+        let flag_b = matches!(args.get(3), Some(Value::Bool(true)));
+        let number = num_arg(args, 2);
+        let sni_context = if name == "setSniContext" {
+            Some(num_arg(args, 2) as u64)
+        } else {
+            None
+        };
+        let registry = registry(ctx);
+        let sni = sni_context.and_then(|id| registry.contexts.get(&id).map(|context| context as *const Context));
+        let Some(session) = registry.sessions.get_mut(&id) else {
+            return to_value(ctx, Out::Error(EngineError::plain("TLS session is closed")));
+        };
+        let out = match name.as_str() {
+            "setVerifyMode" => {
+                session.set_verify_mode(flag_a, flag_b);
+                Out::Undefined
+            }
+            "verifyError" => match session.verify_error() {
+                Some((code, reason)) => Out::Array(vec![Out::Num(code as f64), Out::Str(reason)]),
+                None => Out::Undefined,
+            },
+            "protocol" => session.protocol().map_or(Out::Null, Out::Str),
+            "cipher" => match session.cipher() {
+                Some((name, standard, version)) => {
+                    Out::Array(vec![Out::Str(name), Out::Str(standard), Out::Str(version)])
+                }
+                None => Out::Null,
+            },
+            "alpnSelected" => session.alpn_selected().map_or(Out::Bool(false), Out::Bytes),
+            "setAlpn" => Out::Bool(bytes.is_some_and(|protocols| session.set_alpn_protocols(&protocols))),
+            "servername" => session.servername().map_or(Out::Bool(false), Out::Str),
+            "setServername" => Out::Bool(text.is_some_and(|name| session.set_servername(&name))),
+            "getSession" => session.session_bytes().map_or(Out::Undefined, Out::Bytes),
+            "setSession" => Out::Bool(bytes.is_some_and(|data| session.set_session(&data))),
+            "loadSession" => {
+                session.load_session(bytes.as_deref());
+                Out::Undefined
+            }
+            "isSessionReused" => Out::Bool(session.session_reused()),
+            "finished" => session.finished(flag_a).map_or(Out::Undefined, Out::Bytes),
+            "exportKeyingMaterial" => match session.export_keying_material(
+                number as usize,
+                &label.unwrap_or_default(),
+                context_bytes.as_deref(),
+            ) {
+                Ok(out) => Out::Bytes(out),
+                Err(error) => Out::Error(error),
+            },
+            "peerCertificates" => certificates_out(session.peer_certificates()),
+            "ownCertificate" => session.own_certificate().map_or(Out::Undefined, Out::Bytes),
+            "setSniContext" => match sni {
+                // SAFETY: contexts are only removed by `ctxOp close`, which cannot run during this call.
+                Some(context) => session.set_sni_context(unsafe { &*context }).into(),
+                None => Out::Undefined,
+            },
+            "setMaxSendFragment" => Out::Bool(session.set_max_send_fragment(number as i64)),
+            "requestOCSP" => {
+                session.request_ocsp();
+                Out::Undefined
+            }
+            "setOCSPResponse" => {
+                if let Some(response) = bytes {
+                    session.set_ocsp_response(response);
+                }
+                Out::Undefined
+            }
+            "renegotiate" => session.renegotiate().into(),
+            "enableSessionCallbacks" => {
+                session.enable_session_callbacks();
+                Out::Undefined
+            }
+            "enableKeylog" => {
+                session.enable_keylog();
+                Out::Undefined
+            }
+            "enableCertCb" => {
+                session.enable_cert_cb();
+                Out::Undefined
+            }
+            "enableAlpnCb" => {
+                session.enable_alpn_callback();
+                Out::Undefined
+            }
+            "enableHelloCb" => {
+                session.enable_hello_callback();
+                Out::Undefined
+            }
+            "helloRequest" => session.take_hello().map_or(Out::Undefined, hello_out),
+            "helloDone" => {
+                session.hello_done();
+                Out::Undefined
+            }
+            "setAlpnChoice" => {
+                session.set_alpn_choice(if number < 0.0 { None } else { Some(number as usize) });
+                Out::Undefined
+            }
+            "certRequest" => match session.take_cert_request() {
+                Some((servername, ocsp)) => Out::Array(vec![Out::Str(servername), Out::Bool(ocsp)]),
+                None => Out::Undefined,
+            },
+            "certDone" => {
+                session.cert_done();
+                Out::Undefined
+            }
+            "ephemeralKey" => match session.ephemeral_key() {
+                Some((kind, bits)) => Out::Array(vec![Out::Num(kind as f64), Out::Num(bits as f64)]),
+                None => Out::Undefined,
+            },
+            "sharedSigalgs" => Out::Array(session.shared_sigalgs().into_iter().map(Out::Str).collect()),
+            "shutdown" => {
+                session.shutdown();
+                Out::Undefined
+            }
+            "shutdownReceived" => Out::Bool(session.handshake_pending_close()),
+            "clearErrors" => {
+                session.clear_errors();
+                Out::Undefined
+            }
+            "handshakeFinished" => Out::Bool(session.handshake_finished()),
+            other => Out::Error(EngineError::plain(format!("unknown session operation {other}"))),
+        };
+        to_value(ctx, out)
     }
-}
 
-fn op_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
-    let bytes = ctx
-        .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "TLS write expects bytes"))?;
-    let (resolve, reject) = callbacks(ctx, args.get(2), args.get(3))?;
-    let stream = ctx
-        .host_mut::<TlsRegistry>()
-        .and_then(|registry| registry.sockets.get(&id))
-        .map(|entry| entry.stream.clone());
-    let Some(stream) = stream else {
-        return Err(ctx.make_error("Error", "TLS socket is closed"));
-    };
-    let task = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
-    completions(ctx).run_blocking(task, move || {
-        let result = stream
-            .lock()
-            .unwrap()
-            .write_all(&bytes)
-            .map(|()| bytes.len())
-            .map_err(|error| error.to_string());
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
-}
-
-fn decode_write(
-    ctx: &mut Ctx,
-    payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
-    match *payload
-        .downcast::<Result<usize, String>>()
-        .expect("TLS write payload")
-    {
-        Ok(length) => Ok(vec![Value::Num(length as f64)]),
-        Err(message) => Err(ctx.make_error("Error", message)),
+    pub fn op_feed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let bytes = bytes_arg(ctx, args, 1).unwrap_or_default();
+        let accepted = registry(ctx)
+            .sessions
+            .get_mut(&id)
+            .is_some_and(|session| session.feed(&bytes));
+        Ok(Value::Bool(accepted))
     }
-}
 
-fn op_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
-    if let Some(entry) = ctx
-        .host_mut::<TlsRegistry>()
-        .and_then(|registry| registry.sockets.remove(&id))
-    {
-        entry.closed.store(true, Ordering::SeqCst);
+    pub fn op_output(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let out = match registry(ctx).sessions.get_mut(&id) {
+            Some(session) if session.pending_output() > 0 => Out::Bytes(session.take_output()),
+            _ => Out::Undefined,
+        };
+        to_value(ctx, out)
     }
-    Ok(Value::Undefined)
+
+    pub fn op_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let max = args.get(1).and_then(Value::as_num_opt).unwrap_or(65536.0) as usize;
+        let out = match registry(ctx).sessions.get_mut(&id) {
+            None => Out::Num(-1.0),
+            Some(session) => match session.read(max) {
+                Io::Data(data) => Out::Bytes(data),
+                Io::Code(code) => Out::Num(code as f64),
+            },
+        };
+        to_value(ctx, out)
+    }
+
+    pub fn op_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let bytes = bytes_arg(ctx, args, 1).unwrap_or_default();
+        let result = registry(ctx)
+            .sessions
+            .get_mut(&id)
+            .map_or(-1, |session| session.write(&bytes));
+        Ok(Value::Num(result as f64))
+    }
+
+    pub fn op_events(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let events = match registry(ctx).sessions.get_mut(&id) {
+            Some(session) => session.take_events(),
+            None => Vec::new(),
+        };
+        if events.is_empty() {
+            return Ok(Value::Undefined);
+        }
+        let out = Out::Array(
+            events
+                .into_iter()
+                .map(|event| match event {
+                    Event::HandshakeStart => Out::Array(vec![Out::Str("hs-start".into())]),
+                    Event::HandshakeDone => Out::Array(vec![Out::Str("hs-done".into())]),
+                    Event::NewSession { id, session } => {
+                        Out::Array(vec![Out::Str("session".into()), Out::Bytes(id), Out::Bytes(session)])
+                    }
+                    Event::Keylog(line) => Out::Array(vec![Out::Str("keylog".into()), Out::Bytes(line)]),
+                    Event::OcspResponse(response) => Out::Array(vec![
+                        Out::Str("ocsp".into()),
+                        response.map_or(Out::Undefined, Out::Bytes),
+                    ]),
+                })
+                .collect(),
+        );
+        to_value(ctx, out)
+    }
+
+    pub fn op_last_error(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let id = id_arg(args);
+        let error = match registry(ctx).sessions.get(&id) {
+            Some(session) => session.last_error(),
+            None => EngineError::plain("TLS session is closed"),
+        };
+        Ok(error_value(ctx, &error))
+    }
 }

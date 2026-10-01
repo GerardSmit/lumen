@@ -97,7 +97,7 @@ pub fn build(store: &mut Store, inst_idx: usize) -> Option<Box<NativeInstance>> 
     if !enabled() {
         return None;
     }
-    let start = std::time::Instant::now();
+    let start = lumen_host::time::Instant::now();
     let inst = store.instances[inst_idx].clone();
     let m = &inst.module;
     let cfg = config();

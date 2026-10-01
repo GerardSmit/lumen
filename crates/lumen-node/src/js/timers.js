@@ -29,7 +29,7 @@
   };
   class Timeout {
     constructor(callback, delay, args, repeat) {
-      callback = __bindAsyncContext(callback);
+      callback = __bindAsyncContext(callback, "Timeout", this, repeat);
       this._onTimeout = callback;
       this._idleTimeout = delay;
       this._timerArgs = args;
@@ -55,7 +55,7 @@
       }
       return this;
     }
-    close() { this._destroyed = true; rawClearTimeout(this._id); return this; }
+    close() { this._destroyed = true; rawClearTimeout(this._id); __destroyAsyncResource(this); return this; }
     [Symbol.toPrimitive]() { return this._id; }
     [Symbol.dispose]() { this.close(); }
   }
@@ -73,7 +73,7 @@
   }
   function clearTimeout(timer) {
     if (timer == null) return;
-    if (timer instanceof Timeout) { timer._destroyed = true; rawClearTimeout(timer._id); return; }
+    if (timer instanceof Timeout) { timer._destroyed = true; rawClearTimeout(timer._id); __destroyAsyncResource(timer); return; }
     const id = typeof timer === "object" ? timer._id : timer;
     if (typeof id === "number" || typeof id === "string") rawClearTimeout(id);
   }
@@ -97,11 +97,15 @@
   function setImmediate(callback, ...args) {
     if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
     const handle = new Immediate();
-    gSetImmediate(__bindAsyncContext(() => { if (!handle._cleared) callback(...args); }));
+    const run = __bindAsyncContext(() => callback(...args), "Immediate", handle);
+    gSetImmediate(() => { if (!handle._cleared) run(); });
     return handle;
   }
   function clearImmediate(handle) {
-    if (handle && typeof handle === "object") handle._cleared = true;
+    if (handle && typeof handle === "object") {
+      handle._cleared = true;
+      __destroyAsyncResource(handle);
+    }
   }
   globalThis.setImmediate = setImmediate;
   globalThis.clearImmediate = clearImmediate;

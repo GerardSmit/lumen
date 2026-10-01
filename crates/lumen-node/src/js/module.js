@@ -12,11 +12,13 @@ const CORE = new Set([...__builtins.keys()]);
 // and `Module._cache`, so `delete require.cache[file]` forces the next require to re-run it.
 const cache = Object.create(null);
 
-const EXTENSIONS = [".js", ".json", ".cjs", ".ts", ".cts", ".node"];
-
 function isCoreSpecifier(spec) {
   if (spec === "bun" || spec.startsWith("bun:")) return CORE.has(spec) ? spec : null;
   const bare = spec.startsWith("node:") ? spec.slice(5) : spec;
+  if (bare === "internal/test/binding" && process[Symbol.for("lumen.options")]?.["--expose-internals"]) {
+    return bare;
+  }
+  if (!spec.startsWith("node:") && SCHEME_ONLY.has(bare)) return null;
   return CORE.has(bare) ? bare : null;
 }
 
@@ -24,15 +26,77 @@ function isRelativeSpecifier(specifier) {
   return specifier === "." || specifier === ".." || specifier.startsWith("./") || specifier.startsWith("../");
 }
 
-function readIfFile(p) {
-  return __node.isFile(p) ? p : null;
+const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+
+// stat() answers 0 for a file, 1 for a directory and a negative number for anything else, the
+// way Node's internalModuleStat does. Results are memoised while one top-level require runs.
+let statCache = null;
+function stat(filename) {
+  filename = path.toNamespacedPath(filename);
+  if (statCache !== null) {
+    const result = statCache.get(filename);
+    if (result !== undefined) return result;
+  }
+  const result = __node.isDir(filename) ? 1 : __node.isFile(filename) ? 0 : -2;
+  if (statCache !== null && result >= 0) statCache.set(filename, result);
+  return result;
 }
 
-// LOAD_AS_FILE: exact, then with each known extension.
-function loadAsFile(p) {
-  if (readIfFile(p)) return p;
-  for (const ext of EXTENSIONS) if (readIfFile(p + ext)) return p + ext;
-  return null;
+const preserveSymlinks = () => {
+  const options = process[Symbol.for("lumen.options")];
+  return !!(options && options["--preserve-symlinks"]);
+};
+const preserveSymlinksMain = () => {
+  const options = process[Symbol.for("lumen.options")];
+  return !!(options && options["--preserve-symlinks-main"]);
+};
+function toRealPath(requestPath) {
+  return __node.realpath(requestPath);
+}
+
+// tryFile(path): `path` when it is a file (symlinks resolved unless preserved), else undefined.
+function tryFile(requestPath, isMain) {
+  if (stat(requestPath) !== 0) return undefined;
+  if (isMain ? preserveSymlinksMain() : preserveSymlinks()) return path.resolve(requestPath);
+  return toRealPath(requestPath);
+}
+
+function tryExtensions(basePath, exts, isMain) {
+  for (let i = 0; i < exts.length; i++) {
+    const filename = tryFile(basePath + exts[i], isMain);
+    if (filename) return filename;
+  }
+  return undefined;
+}
+
+// package.json of a directory, with the fields the resolver reads checked as own properties
+// (a polluted Object.prototype must not leak a `main`/`exports`/`type` into a package).
+const packageJsonCache = new Map();
+function readPackage(requestPath) {
+  const jsonPath = path.resolve(requestPath, "package.json");
+  if (packageJsonCache.has(jsonPath)) return packageJsonCache.get(jsonPath);
+  let result = false;
+  if (__node.isFile(jsonPath)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(__node.readText(jsonPath).replace(/^\uFEFF/, ""));
+    } catch (error) {
+      error.path = jsonPath;
+      error.message = "Error parsing " + jsonPath + ": " + error.message;
+      throw error;
+    }
+    const field = (name) => (parsed !== null && typeof parsed === "object" && hasOwn(parsed, name) ? parsed[name] : undefined);
+    const main = field("main");
+    result = {
+      jsonPath,
+      main: typeof main === "string" ? main : undefined,
+      exports: field("exports"),
+      name: typeof field("name") === "string" ? field("name") : undefined,
+      type: typeof field("type") === "string" ? field("type") : undefined,
+    };
+  }
+  packageJsonCache.set(jsonPath, result);
+  return result;
 }
 
 // Exact package exports, with declaration-ordered node/require/default conditions.
@@ -104,51 +168,151 @@ function resolveExports(exports, key = ".") {
   return relativePackageTarget(mapped) ? mapped : null;
 }
 
-function readPackage(dir) {
-  const pkgPath = path.join(dir, "package.json");
-  if (!__node.isFile(pkgPath)) return null;
-  try { return JSON.parse(__node.readText(pkgPath)); }
-  catch (e) { throw new Error(`invalid package.json in ${dir}: ${e.message}`); }
-}
-
-function loadAsDirectory(dir) {
-  const pkg = readPackage(dir);
-  if (pkg) {
-    const hasExports = Object.prototype.hasOwnProperty.call(pkg, "exports");
-    const entry = hasExports ? resolveExports(pkg.exports) : pkg.main;
-    if (entry) {
-      const target = path.resolve(dir, entry);
-      const found = loadAsFile(target) || loadAsFile(path.join(target, "index"));
-      if (found) return found;
-    }
-    if (hasExports) return null;
+function tryPackage(requestPath, exts, isMain, originalPath) {
+  const pkg = readPackage(requestPath);
+  if (!pkg || pkg.main === undefined || pkg.main === "") {
+    return tryExtensions(path.resolve(requestPath, "index"), exts, isMain);
   }
-  return loadAsFile(path.join(dir, "index"));
+  const filename = path.resolve(requestPath, pkg.main);
+  let actual = tryFile(filename, isMain)
+    || tryExtensions(filename, exts, isMain)
+    || tryExtensions(path.resolve(filename, "index"), exts, isMain);
+  if (actual === undefined) {
+    actual = tryExtensions(path.resolve(requestPath, "index"), exts, isMain);
+    if (!actual) {
+      const err = new Error(
+        `Cannot find module '${filename}'. Please verify that the package.json has a valid "main" entry`,
+      );
+      err.code = "MODULE_NOT_FOUND";
+      err.path = path.resolve(requestPath, "package.json");
+      err.requestPath = originalPath;
+      throw err;
+    }
+    process.emitWarning(
+      `Invalid 'main' field in '${pkg.jsonPath}' of '${pkg.main}'. Please either fix that or report it to the module author`,
+      "DeprecationWarning",
+      "DEP0128",
+    );
+  }
+  return actual;
 }
 
-// LOAD_NODE_MODULES: walk node_modules from `start` up to the filesystem root.
-function loadNodeModules(name, start) {
-  let dir = start;
-  while (true) {
-    if (path.basename(dir) !== "node_modules") {
-      const parts = name.split("/");
-      const packageParts = name.startsWith("@") ? 2 : 1;
-      const packageName = parts.slice(0, packageParts).join("/");
-      const packageDir = path.join(dir, "node_modules", packageName);
-      const pkg = readPackage(packageDir);
-      if (pkg && Object.prototype.hasOwnProperty.call(pkg, "exports")) {
-        const subpath = parts.slice(packageParts).join("/");
-        const target = resolveExports(pkg.exports, subpath ? "./" + subpath : ".");
-        return target ? loadAsFile(path.resolve(packageDir, target)) : null;
+// A package naming itself in its own "exports" (`require("pkg/sub")` from inside `pkg`).
+function trySelf(parentFilename, request) {
+  if (!parentFilename) return false;
+  let dir = path.dirname(parentFilename);
+  let scope = false;
+  for (;;) {
+    if (dir.endsWith(path.sep + "node_modules")) return false;
+    scope = readPackage(dir);
+    if (scope) break;
+    const up = path.dirname(dir);
+    if (up === dir) return false;
+    dir = up;
+  }
+  if (scope.exports === undefined || scope.exports === null || typeof scope.name !== "string") return false;
+  let expansion;
+  if (request === scope.name) expansion = ".";
+  else if (request.startsWith(scope.name + "/")) expansion = "." + request.slice(scope.name.length);
+  else return false;
+  const pkgDir = path.dirname(scope.jsonPath);
+  const target = resolveExports(scope.exports, expansion);
+  const file = target ? tryFile(path.resolve(pkgDir, target), false) : undefined;
+  if (file) return file;
+  const err = new Error(
+    target
+      ? `Cannot find module '${path.resolve(pkgDir, target)}'`
+      : expansion === "."
+        ? `No "exports" main defined in ${scope.jsonPath}`
+        : `Package subpath '${expansion}' is not defined by "exports" in ${scope.jsonPath}`,
+  );
+  err.code = target ? "MODULE_NOT_FOUND" : "ERR_PACKAGE_PATH_NOT_EXPORTED";
+  throw err;
+}
+
+const EXPORTS_PATTERN = /^((?:@[^/\\%]+\/)?[^./\\%][^/\\%]*)(\/.*)?$/;
+
+// A package's "exports" map as the CommonJS loader applies it to `request` found under the
+// node_modules directory `nmPath`; undefined when the package has none.
+function resolveExportsFrom(nmPath, request) {
+  const match = EXPORTS_PATTERN.exec(request);
+  if (!match) return undefined;
+  const name = match[1];
+  const expansion = match[2] || "";
+  const pkgPath = path.resolve(nmPath, name);
+  const pkg = readPackage(pkgPath);
+  if (!pkg || pkg.exports === undefined || pkg.exports === null) return undefined;
+  const target = resolveExports(pkg.exports, "." + expansion);
+  const file = target ? tryFile(path.resolve(pkgPath, target), false) : undefined;
+  if (file) return file;
+  const err = new Error(
+    target
+      ? `Cannot find module '${path.resolve(pkgPath, target)}'`
+      : expansion === ""
+        ? `No "exports" main defined in ${pkg.jsonPath}`
+        : `Package subpath '.${expansion}' is not defined by "exports" in ${pkg.jsonPath}`,
+  );
+  err.code = target ? "MODULE_NOT_FOUND" : "ERR_PACKAGE_PATH_NOT_EXPORTED";
+  throw err;
+}
+
+const pathCacheHit = (key) => Module._pathCache[key];
+
+// Module._findPath(request, paths, isMain): the file `request` names under the first of `paths`
+// that has it — exact file, then each registered extension, then a directory's package.json
+// "main" or index — or false.
+function findPath(request, paths, isMain) {
+  const absoluteRequest = path.isAbsolute(request);
+  if (absoluteRequest) {
+    paths = [""];
+  } else if (!paths || paths.length === 0) {
+    return false;
+  }
+  const cacheKey = request + "\x00" + (paths.length === 1 ? paths[0] : paths.join("\x00"));
+  const entry = pathCacheHit(cacheKey);
+  if (entry) return entry;
+
+  let exts;
+  const last = request.charCodeAt(request.length - 1);
+  const trailingSlash = request.length > 0 && (last === 47 || (last === 46 && (
+    request.length === 1 || request.endsWith("/.") || request.endsWith("/..") || request === ".."
+  )));
+
+  for (let i = 0; i < paths.length; i++) {
+    const curPath = paths[i];
+    if (curPath && !isRelativeSpecifier(request) && stat(curPath) < 1) continue;
+    if (!absoluteRequest) {
+      const exportsResolved = resolveExportsFrom(curPath, request);
+      if (exportsResolved) return exportsResolved;
+    }
+    const basePath = path.resolve(curPath, request);
+    let filename;
+    const rc = stat(basePath);
+    if (!trailingSlash) {
+      if (rc === 0) {
+        filename = (isMain ? preserveSymlinksMain() : preserveSymlinks()) ? path.resolve(basePath) : toRealPath(basePath);
       }
-      const candidate = path.join(dir, "node_modules", name);
-      const found = loadAsFile(candidate) || loadAsDirectory(candidate);
-      if (found) return found;
+      if (!filename) {
+        if (exts === undefined) exts = resolutionExtensions();
+        filename = tryExtensions(basePath, exts, isMain);
+      }
     }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
+    if (!filename && rc === 1) {
+      if (exts === undefined) exts = resolutionExtensions();
+      filename = tryPackage(basePath, exts, isMain, request);
+    }
+    if (filename) {
+      Module._pathCache[cacheKey] = filename;
+      return filename;
+    }
   }
+  return false;
+}
+
+// The extensions a bare `require("./x")` tries, in the order the loaders were registered. ESM-only
+// extensions load when named but are not guessed.
+function resolutionExtensions() {
+  return Object.keys(Module._extensions).filter((ext) => ext !== ".mjs" && ext !== ".mts");
 }
 
 // --- ahead-of-time blobs ------------------------------------------------------------------------
@@ -170,37 +334,79 @@ function aotDirname(key) {
   return i >= "aot:/".length ? key.slice(0, i) : "aot:/";
 }
 
-function defaultResolveFilename(specifier, fromDir, parentFilename) {
-  const core = isCoreSpecifier(specifier);
-  if (core) return "node:" + core;
-  // A `node:` specifier never falls back to disk (Node: ERR_UNKNOWN_BUILTIN_MODULE).
-  if (specifier.startsWith("node:")) throw new __errors.ERR_UNKNOWN_BUILTIN_MODULE(specifier);
-  const aotKey = aotResolve(specifier, parentFilename);
+const SCHEME_ONLY = new Set(["test", "test/reporters", "sea", "sqlite"]);
+
+function pseudoParent(fromDir, parentFilename) {
+  const filename = parentFilename || path.join(fromDir, "[internal]");
+  return { id: filename, filename, path: fromDir, paths: nodeModulePaths(fromDir) };
+}
+
+// Node's Module._resolveFilename. Builtins come back exactly as requested.
+function resolveRequest(request, parent, isMain, options) {
+  if (isCoreSpecifier(request)) return request;
+  if (request.startsWith("node:")) throw new __errors.ERR_UNKNOWN_BUILTIN_MODULE(request);
+  const parentFilename = parent && typeof parent.filename === "string" ? parent.filename : undefined;
+  const aotKey = aotResolve(request, parentFilename);
   if (aotKey !== undefined) return aotKey;
-  if (isAotKey(fromDir) || isAotKey(specifier)) {
-    // Not in the blob: nothing on disk is relative to an `aot:/` module.
-    if (isAotKey(specifier) || isRelativeSpecifier(specifier)) {
-      const e = new Error(`Cannot find module '${specifier}' from '${parentFilename || fromDir}'`);
+  if (isAotKey(parentFilename) || isAotKey(request)) {
+    if (isAotKey(request) || isRelativeSpecifier(request)) {
+      const e = new Error(`Cannot find module '${request}' from '${parentFilename || request}'`);
       e.code = "MODULE_NOT_FOUND";
       throw e;
     }
-    fromDir = process.cwd();
+    parent = pseudoParent(process.cwd());
   }
-  if (isRelativeSpecifier(specifier) || path.isAbsolute(specifier)) {
-    const base = path.resolve(fromDir, specifier);
-    const found = loadAsFile(base) || loadAsDirectory(base);
-    if (found) return __node.realpath(found);
-    const e = new Error(`Cannot find module '${specifier}' from '${fromDir}'`);
-    e.code = "MODULE_NOT_FOUND";
-    throw e;
+
+  let paths;
+  if (typeof options === "object" && options !== null) {
+    if (Array.isArray(options.paths)) {
+      if (isRelativeSpecifier(request)) {
+        paths = options.paths;
+      } else {
+        const fakeParent = new Module("", null);
+        paths = [];
+        for (const dir of options.paths) {
+          fakeParent.paths = Module._nodeModulePaths(dir);
+          const lookupPaths = Module._resolveLookupPaths(request, fakeParent);
+          for (const candidate of lookupPaths) {
+            if (!paths.includes(candidate)) paths.push(candidate);
+          }
+        }
+      }
+    } else if (options.paths === undefined) {
+      paths = Module._resolveLookupPaths(request, parent);
+    } else {
+      throw new __errors.ERR_INVALID_ARG_VALUE("options.paths", options.paths);
+    }
+  } else {
+    paths = Module._resolveLookupPaths(request, parent);
   }
-  const found = loadNodeModules(specifier, fromDir);
-  if (found) return __node.realpath(found);
+
+  const selfResolved = trySelf(parentFilename, request);
+  if (selfResolved) return selfResolved;
+
+  const filename = Module._findPath(request, paths, isMain);
+  if (filename) return filename;
   // Optional native addons lumen implements itself (bufferutil, ...): used only when not installed.
-  if (__native.isFallbackModule(specifier)) return "node:" + specifier;
-  const e = new Error(`Cannot find module '${specifier}'`);
-  e.code = "MODULE_NOT_FOUND";
-  throw e;
+  if (__native.isFallbackModule(request)) return "node:" + request;
+  const requireStack = [];
+  for (let cursor = parent; cursor; cursor = moduleParentCache.get(cursor)) {
+    requireStack.push(cursor.filename || cursor.id);
+  }
+  let message = `Cannot find module '${request}'`;
+  if (requireStack.length > 0) message += "\nRequire stack:\n- " + requireStack.join("\n- ");
+  const err = new Error(message);
+  err.code = "MODULE_NOT_FOUND";
+  err.requireStack = requireStack;
+  throw err;
+}
+
+// The internal resolve step: builtins come back as "node:<name>".
+function defaultResolveFilename(specifier, fromDir, parentFilename) {
+  const parent = pseudoParent(fromDir, parentFilename);
+  const resolved = resolveRequest(specifier, parent, false, undefined);
+  const core = isCoreSpecifier(resolved);
+  return core ? "node:" + core : resolved;
 }
 
 // --- registerHooks (Node's sync module customization hooks) -------------------------------------
@@ -350,11 +556,14 @@ function compileCommonJS(module, filename, source, detectEsm = false, ts = false
   // A leading #! shebang line is neutralized, as Node does, before wrapping: `#!` becomes `//`
   // so every offset in the file (and in its type table) stays put.
   source = __node.stripShebang(String(source));
-  const require = makeRequire(dirname, module);
+  const require = makeRequireFunction(module);
   let compiled;
   try {
     if (ts) {
       compiled = __node.compileCommonJS(source, filename, true);
+    } else if (wrapperPatched) {
+      compiled = (0, eval)(Module.wrap(source));
+      __node.nameSource(compiled, filename);
     } else {
       compiled = new Function("exports", "require", "module", "__filename", "__dirname", source);
       // Stack traces name the module's frames after its file, positions relative to `source`.
@@ -365,7 +574,7 @@ function compileCommonJS(module, filename, source, detectEsm = false, ts = false
     if (detectEsm && e instanceof SyntaxError && ESM_SYNTAX.test(source)) return false;
     throw e;
   }
-  compiled.call(module.exports, module.exports, require, module, filename, dirname);
+  Reflect.apply(compiled, module.exports, [module.exports, require, module, filename, dirname]);
   return true;
 }
 
@@ -419,12 +628,12 @@ function loadViaHooks(module, filename) {
     } else {
       const detect = scoped && type === undefined;
       const ts = ext === ".ts" || ext === ".cts";
-      if (!compileCommonJS(module, filename, source, detect, ts)) loadHookESM(module, filename, source);
+      if (module._compile(source, filename, detect, ts) === false) loadHookESM(module, filename, source);
     }
     return true;
   }
   if (result.format === "commonjs") {
-    compileCommonJS(module, filename, source);
+    module._compile(source, filename);
     return true;
   }
   throw new Error(
@@ -432,25 +641,15 @@ function loadViaHooks(module, filename) {
   );
 }
 
-function loadModule(filename, parent) {
-  if (filename.startsWith("node:")) {
-    return { exports: __builtins.get(filename.slice(5)), filename, loaded: true };
-  }
-  const cached = cache[filename];
-  if (cached) return cached;
+const moduleParentCache = new WeakMap();
 
-  const module = {
-    id: filename,
-    filename,
-    loaded: false,
-    exports: {},
-    parent,
-    children: [],
-    paths: [],
-  };
-  cache[filename] = module;
-  if (parent) parent.children.push(module);
+function updateChildren(parent, child, scan) {
+  const children = parent && parent.children;
+  if (children && !(scan && children.includes(child))) children.push(child);
+}
 
+// Loads a module whose resolved `filename` is not a builtin into `module` (see Module.prototype.load).
+function loadFile(module, filename) {
   // A unit of a precompiled blob: CommonJS runs its precompiled module wrapper; an ES module
   // unit loads through import() (require(esm)).
   if (isAotKey(filename)) {
@@ -460,113 +659,116 @@ function loadModule(filename, parent) {
     module.path = dirname;
     if (kind === "commonjs") {
       const wrapper = aot.load(filename);
-      wrapper.call(module.exports, module.exports, makeRequire(dirname, module), module, filename, dirname);
+      wrapper.call(module.exports, module.exports, makeRequireFunction(module), module, filename, dirname);
     } else if (kind === "module") {
       loadESM(module, filename);
     } else {
-      delete cache[filename];
       const e = new Error(`Cannot find module '${filename}'`);
       e.code = "MODULE_NOT_FOUND";
       throw e;
     }
-    module.loaded = true;
-    return module;
+    return;
   }
-
   // registerHooks load chain first (it can rewrite the source); otherwise — and for results the
   // hooks leave alone (addons) — dispatch on file extension through Module._extensions, exactly
   // as Node does: `.js`/`.cjs` run the module wrapper, `.json` is parsed, `.node` is dlopen'd for
   // its N-API registration. An unknown extension falls back to the `.js` loader, like Node.
   if (!(hasHook("load") && loadViaHooks(module, filename))) {
-    const ext = path.extname(filename);
-    const handler = Module._extensions[ext] || Module._extensions[".js"];
-    handler(module, filename);
+    Module._extensions[findLongestRegisteredExtension(filename)](module, filename);
   }
-  module.loaded = true;
-  return module;
 }
 
-function makeRequire(fromDir, parentModule) {
-  const parentFilename = parentModule && typeof parentModule.filename === "string" ? parentModule.filename : undefined;
-  const require = function (specifier) {
-    // Like Node, every require() goes through the *current* `Module._load`, so a host that
-    // replaces it (the VS Code extension host does, to serve `require("vscode")`) intercepts
-    // loads from modules it did not create. The default `_load` resolves against the parent's
-    // directory; a parentless require (createRequire, the REPL) carries its own base directory.
-    return Module._load(String(specifier), parentModule ?? { path: fromDir }, false);
+function findLongestRegisteredExtension(filename) {
+  const name = path.basename(filename);
+  let startIndex = 0;
+  let index;
+  while ((index = name.indexOf(".", startIndex)) !== -1) {
+    startIndex = index + 1;
+    if (index === 0) continue;
+    const currentExtension = name.slice(index);
+    if (Module._extensions[currentExtension]) return currentExtension;
+  }
+  return ".js";
+}
+
+// Node's makeRequireFunction: a `require` bound to `mod`, always going through the current
+// `mod.require` so a host that replaces `Module.prototype.require` / `Module._load` (the VS Code
+// extension host does, to serve `require("vscode")`) intercepts loads from modules it did not create.
+function makeRequireFunction(mod) {
+  const require = function require(path) {
+    return mod.require(path);
   };
-  // Node v22.16 quirk, mirrored deliberately: require.resolve() does NOT consult registerHooks
-  // (only actual loads do) — verified against `node -e`.
-  require.resolve = (specifier) => defaultResolveFilename(String(specifier), fromDir, parentFilename);
-  require.resolve.paths = (specifier) => {
-    if (typeof specifier !== "string") throw new TypeError("specifier must be a string");
-    if (isCoreSpecifier(specifier) || specifier.startsWith("node:")) return null;
-    if (isRelativeSpecifier(specifier)) return [fromDir];
-    // This resolver currently searches local ancestor node_modules only. Report those
-    // actual lookup directories rather than advertising unimplemented global searches.
-    return nodeModulePaths(fromDir);
-  };
-  require.cache = cache;
-  require.main = mainModule;
+  function resolve(request, options) {
+    if (typeof request !== "string") throw new __errors.ERR_INVALID_ARG_TYPE("request", "string", request);
+    return Module._resolveFilename(request, mod, false, options);
+  }
+  require.resolve = resolve;
+  function paths(request) {
+    if (typeof request !== "string") throw new __errors.ERR_INVALID_ARG_TYPE("request", "string", request);
+    return Module._resolveLookupPaths(request, mod);
+  }
+  resolve.paths = paths;
+  Object.defineProperty(require, "main", { value: process.mainModule, writable: true, enumerable: true, configurable: true });
+  require.extensions = Module._extensions;
+  require.cache = Module._cache;
   return require;
 }
 
-let mainModule = null;
-
 // Run `filename` as the program entry (require.main === module), returning its exports.
 function runMain(filename) {
-  const resolved = __node.realpath(filename);
-  const module = {
-    id: ".",
-    filename: resolved,
-    loaded: false,
-    exports: {},
-    parent: null,
-    children: [],
-    paths: [],
-  };
-  mainModule = module;
-  cache[resolved] = module;
-  const ext = path.extname(resolved);
-  const handler = Module._extensions[ext] || Module._extensions[".js"];
-  handler(module, resolved);
-  module.loaded = true;
-  return module.exports;
+  return Module._load(path.resolve(String(filename)), null, true);
 }
 
 // The main module from source the embedder holds, under a `filename` that need not exist.
 function runMainSource(filename, source) {
-  const module = {
-    id: ".",
-    filename,
-    loaded: false,
-    exports: {},
-    parent: null,
-    children: [],
-    paths: [],
-  };
-  mainModule = module;
-  cache[filename] = module;
+  const module = new Module(filename, null);
+  module.id = ".";
+  module.filename = filename;
+  module.paths = nodeModulePaths(path.dirname(filename));
+  process.mainModule = module;
+  Module._cache[filename] = module;
   compileCommonJS(module, filename, source);
   module.loaded = true;
   return module.exports;
 }
 
 // A cwd-bound require for -e / the REPL, plus createRequire(fromPath) like node:module's.
-const cwdRequire = makeRequire(process.cwd(), null);
+const cwdRequire = makeRequireFunction(Object.assign(new Module(path.join(process.cwd(), "[cwd-require]")), {
+  filename: path.join(process.cwd(), "[cwd-require]"),
+  paths: nodeModulePaths(process.cwd()),
+}));
 globalThis.require = cwdRequire;
 
-function createRequire(fromPath) {
-  // Node accepts a path or a file: URL (string or URL object), e.g. createRequire(import.meta.url).
-  let p = typeof fromPath === "object" && fromPath ? fromPath.href || String(fromPath) : String(fromPath);
-  if (p.startsWith("file://")) p = p.slice(7).replace(/^\/([A-Za-z]:)/, "$1");
-  if (isAotKey(p)) {
-    // createRequire(import.meta.url) in a module of a precompiled blob: resolve like a unit there.
-    const dir = aotDirname(p);
-    return makeRequire(dir, { id: p, filename: p, path: dir, exports: {}, loaded: true, children: [], paths: [] });
+const createRequireError = "must be a file URL object, file URL string, or absolute path string";
+function createRequire(filename) {
+  let filepath;
+  const isURL = filename !== null && typeof filename === "object" && typeof filename.href === "string" && typeof filename.protocol === "string";
+  if (isURL || (typeof filename === "string" && !path.isAbsolute(filename))) {
+    try {
+      filepath = __builtins.get("url").fileURLToPath(filename);
+    } catch {
+      throw new __errors.ERR_INVALID_ARG_VALUE("filename", filename, createRequireError);
+    }
+  } else if (typeof filename !== "string") {
+    throw new __errors.ERR_INVALID_ARG_VALUE("filename", filename, createRequireError);
+  } else {
+    filepath = filename;
   }
-  const dir = __node.isDir(p) ? p : path.dirname(p);
-  return makeRequire(dir, null);
+  if (isAotKey(filepath)) {
+    // createRequire(import.meta.url) in a module of a precompiled blob: resolve like a unit there.
+    const dir = aotDirname(filepath);
+    const m = new Module(filepath);
+    m.filename = filepath;
+    m.path = dir;
+    m.paths = [];
+    return makeRequireFunction(m);
+  }
+  const trailingSlash = filepath.endsWith("/");
+  const proxyPath = trailingSlash ? path.join(filepath, "noop.js") : filepath;
+  const m = new Module(proxyPath);
+  m.filename = proxyPath;
+  m.paths = nodeModulePaths(m.path);
+  return makeRequireFunction(m);
 }
 
 // --- node:module surface -----------------------------------------------------------------
@@ -579,12 +781,12 @@ CORE.add("module");
 
 // The frozen list of core module names, mirroring node:module's `builtinModules` (bare names,
 // no "node:" prefix), which now includes "module" itself.
-const builtinModules = Object.freeze([...CORE]);
+const builtinModules = Object.freeze([...CORE].filter((name) => !name.startsWith("internal/")));
 
 // isBuiltin(spec): true when `spec` — with an optional "node:" prefix — names a core module.
 function isBuiltin(spec) {
   if (typeof spec !== "string") return false;
-  return CORE.has(spec.startsWith("node:") ? spec.slice(5) : spec);
+  return isCoreSpecifier(spec) !== null;
 }
 
 // Normalize a path or a file: URL (string or URL object) to a filesystem path — the same shape
@@ -603,10 +805,20 @@ const constants = {
 
 // The module wrapper strings Node exposes so tools can reconstruct the `(function (exports, ...))`
 // preamble; kept identical to Node's so byte-offset math in coverage/source tooling lines up.
-const wrapper = ["(function (exports, require, module, __filename, __dirname) { ", "\n});"];
-function wrap(source) {
-  return wrapper[0] + source + wrapper[1];
-}
+let wrapperPatched = false;
+let wrapper = new Proxy(["(function (exports, require, module, __filename, __dirname) { ", "\n});"], {
+  set(target, property, value, receiver) {
+    wrapperPatched = true;
+    return Reflect.set(target, property, value, receiver);
+  },
+  defineProperty(target, property, descriptor) {
+    wrapperPatched = true;
+    return Reflect.defineProperty(target, property, descriptor);
+  },
+});
+let wrap = function (script) {
+  return wrapper[0] + script + wrapper[1];
+};
 
 // The nearest enclosing package.json's "type" for `filename` ("module" | "commonjs" | undefined),
 // Node's package scope lookup. Cached per directory: a package tree asks once per folder.
@@ -707,14 +919,14 @@ const ESM_SYNTAX = /(^|[\s;})])(import\s*[{*\w"']|export\s*[{*\w]|import\.meta\b
 const _extensions = {
   // An explicit .cjs file stays CommonJS even inside a type:module package.
   ".cjs": function (module, filename) {
-    compileCommonJS(module, filename, __node.readText(filename), false);
+    module._compile(__node.readText(filename), filename, false);
   },
   ".js": function (module, filename) {
     const type = packageScopeType(filename);
     if (type === "module") return loadESM(module, filename);
     const source = __node.readText(filename);
     const detect = type === undefined;
-    if (!compileCommonJS(module, filename, source, detect)) loadESM(module, filename);
+    if (module._compile(source, filename, detect) === false) loadESM(module, filename);
   },
   ".mjs": function (module, filename) {
     loadESM(module, filename);
@@ -727,37 +939,108 @@ const _extensions = {
     if (type === "module") return loadESM(module, filename);
     const source = __node.readText(filename);
     const detect = type === undefined;
-    if (!compileCommonJS(module, filename, source, detect, true)) loadESM(module, filename);
+    if (module._compile(source, filename, detect, true) === false) loadESM(module, filename);
   },
   ".mts": function (module, filename) {
     loadESM(module, filename);
   },
   ".cts": function (module, filename) {
-    compileCommonJS(module, filename, __node.readText(filename), false, true);
+    module._compile(__node.readText(filename), filename, false, true);
   },
   ".json": function (module, filename) {
-    module.exports = JSON.parse(__node.readText(filename));
+    try {
+      module.exports = JSON.parse(__node.readText(filename).replace(/^\uFEFF/, ""));
+    } catch (err) {
+      err.message = filename + ": " + err.message;
+      throw err;
+    }
   },
   ".node": function (module, filename) {
     module.exports = __node.loadNativeAddon(filename);
   },
 };
 
-// Module.prototype instances, shaped like Node's. The internal require() machinery above uses
-// plain objects, but the class is here for code that constructs modules or subclasses Module.
+const pendingDeprecation = () =>
+  !!process[Symbol.for("lumen.options")]?.["--pending-deprecation"] || process.env.NODE_PENDING_DEPRECATION === "1";
+
 function Module(id = "", parent) {
   this.id = id;
-  this.path = id ? path.dirname(id) : ".";
-  this.exports = {};
+  this.path = path.dirname(id);
+  Object.defineProperty(this, "exports", { value: {}, writable: true, enumerable: true, configurable: true });
+  moduleParentCache.set(this, parent);
+  updateChildren(parent, this, false);
   this.filename = null;
   this.loaded = false;
   this.children = [];
-  this.parent = parent;
-  this.paths = [];
 }
-// A require() bound to this module instance's directory, like Node's Module.prototype.require.
+
+const parentDeprecation = () => {
+  if (pendingDeprecation()) {
+    process.emitWarning(
+      "module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.",
+      "DeprecationWarning",
+      "DEP0144",
+    );
+  }
+};
+Object.defineProperty(Module.prototype, "parent", {
+  get() {
+    parentDeprecation();
+    return moduleParentCache.get(this);
+  },
+  set(value) {
+    parentDeprecation();
+    moduleParentCache.set(this, value);
+  },
+  configurable: true,
+});
+
+let isPreloading = false;
+Object.defineProperty(Module.prototype, "isPreloading", { get: () => isPreloading, configurable: true });
+
+let requireDepth = 0;
+let modulePaths = null;
+let globalPathsValue = [];
+
+function initPaths() {
+  const home = process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME;
+  const nodePath = process.env.NODE_PATH;
+  let paths = [path.resolve(process.execPath, "..", "..", "lib", "node")];
+  if (home) {
+    paths.unshift(path.resolve(home, ".node_libraries"));
+    paths.unshift(path.resolve(home, ".node_modules"));
+  }
+  if (nodePath) paths = nodePath.split(path.delimiter).filter(Boolean).concat(paths);
+  modulePaths = paths;
+  globalPathsValue = paths.slice();
+}
+
 Module.prototype.require = function (id) {
-  return makeRequire(this.path || process.cwd(), this)(String(id));
+  if (typeof id !== "string") throw new __errors.ERR_INVALID_ARG_TYPE("id", "string", id);
+  if (id === "") throw new __errors.ERR_INVALID_ARG_VALUE("id", id, "must be a non-empty string");
+  requireDepth++;
+  try {
+    return Module._load(id, this, false);
+  } finally {
+    requireDepth--;
+  }
+};
+
+Module.prototype.load = function (filename) {
+  this.filename = filename;
+  if (!isAotKey(filename)) this.paths = Module._nodeModulePaths(path.dirname(filename));
+  loadFile(this, filename);
+  this.loaded = true;
+};
+
+Module.prototype._compile = function (content, filename, detectEsm, ts) {
+  const initial = requireDepth === 0;
+  if (initial) statCache = new Map();
+  try {
+    return compileCommonJS(this, filename, content, detectEsm === true, ts === true);
+  } finally {
+    if (initial) statCache = null;
+  }
 };
 
 // node_modules lookup paths for `from`, walking to the filesystem root (Node's _nodeModulePaths).
@@ -780,42 +1063,134 @@ function parentDir(parent) {
   return process.cwd();
 }
 
-// Module._resolveFilename(request, parent): like require.resolve, but core modules come back in
-// the specifier's own form ("fs" / "node:fs"), matching Node rather than our internal "node:" tag.
-function _resolveFilename(request, parent) {
-  const spec = String(request);
-  if (isBuiltin(spec)) return spec;
-  // Like require.resolve, Node v22.16's _resolveFilename does not consult registerHooks.
-  return defaultResolveFilename(spec, parentDir(parent), parent && parent.filename);
+function _resolveFilename(request, parent, isMain, options) {
+  return resolveRequest(request, parent, isMain, options);
+}
+
+const relativeResolveCache = Object.create(null);
+
+const CircularRequirePrototypeWarningProxy = new Proxy(
+  {},
+  {
+    get(target, prop) {
+      if (prop in target || prop === "__esModule") return target[prop];
+      emitCircularRequireWarning(prop);
+      return undefined;
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      if (hasOwn(target, prop) || prop === "__esModule") return Object.getOwnPropertyDescriptor(target, prop);
+      emitCircularRequireWarning(prop);
+      return undefined;
+    },
+  },
+);
+
+function emitCircularRequireWarning(prop) {
+  process.emitWarning(`Accessing non-existent property '${String(prop)}' of module exports inside circular dependency`);
+}
+
+const isProxy = (value) => __builtins.get("util").types.isProxy(value);
+
+function getExportsForCircularRequire(module) {
+  if (
+    module.exports &&
+    !isProxy(module.exports) &&
+    Object.getPrototypeOf(module.exports) === Object.prototype &&
+    !module.exports.__esModule
+  ) {
+    Object.setPrototypeOf(module.exports, CircularRequirePrototypeWarningProxy);
+  }
+  return module.exports;
+}
+
+function builtinFor(filename) {
+  const core = filename.startsWith("node:") ? filename.slice(5) : filename;
+  return CORE.has(core) && (filename.startsWith("node:") || isCoreSpecifier(filename) !== null) ? core : null;
 }
 
 // Module._load(request, parent, isMain): resolve then load, returning the module's exports.
 function _load(request, parent, isMain) {
-  const parentFilename = parent && typeof parent.filename === "string" ? parent.filename : undefined;
-  const filename = resolveFilename(String(request), parentDir(parent), parentFilename);
-  const mod = loadModule(filename, parent && typeof parent.filename === "string" ? parent : null);
-  if (isMain) mainModule = mod;
-  return mod.exports;
-}
-
-// Module._findPath(request, paths): first existing file/dir for `request` under any of `paths`,
-// else false — the primitive resolveFilename builds on, exposed for parity.
-function _findPath(request, paths) {
-  for (const p of paths || []) {
-    const base = path.resolve(String(p), String(request));
-    const found = loadAsFile(base) || loadAsDirectory(base);
-    if (found) return __node.realpath(found);
+  let relResolveCacheIdentifier;
+  if (parent) {
+    if (!request.startsWith("node:")) {
+      relResolveCacheIdentifier = `${parent.path}\x00${request}`;
+      const cachedFilename = relativeResolveCache[relResolveCacheIdentifier];
+      if (cachedFilename !== undefined) {
+        const cachedModule = Module._cache[cachedFilename];
+        if (cachedModule !== undefined) {
+          updateChildren(parent, cachedModule, true);
+          if (!cachedModule.loaded) return getExportsForCircularRequire(cachedModule);
+          return cachedModule.exports;
+        }
+        delete relativeResolveCache[relResolveCacheIdentifier];
+      }
+    }
   }
-  return false;
+  if (request.startsWith("node:")) {
+    if (!isCoreSpecifier(request)) throw new __errors.ERR_UNKNOWN_BUILTIN_MODULE(request);
+    return __builtins.get(request.slice(5));
+  }
+  let filename;
+  if (hasHook("resolve")) {
+    filename = resolveFilename(request, parentDir(parent), parent && typeof parent.filename === "string" ? parent.filename : undefined);
+  } else {
+    filename = Module._resolveFilename(request, parent, isMain);
+  }
+  const builtin = builtinFor(filename);
+  if (builtin !== null) return __builtins.get(builtin);
+  const cachedModule = Module._cache[filename];
+  if (cachedModule !== undefined) {
+    updateChildren(parent, cachedModule, true);
+    if (!cachedModule.loaded) return getExportsForCircularRequire(cachedModule);
+    return cachedModule.exports;
+  }
+  const module = new Module(filename, parent);
+  if (isMain) {
+    process.mainModule = module;
+    module.id = ".";
+  }
+  Module._cache[filename] = module;
+  if (parent !== undefined && relResolveCacheIdentifier !== undefined) relativeResolveCache[relResolveCacheIdentifier] = filename;
+  let threw = true;
+  try {
+    module.load(filename);
+    threw = false;
+  } finally {
+    if (threw) {
+      delete Module._cache[filename];
+      if (relResolveCacheIdentifier !== undefined) delete relativeResolveCache[relResolveCacheIdentifier];
+      const children = parent && parent.children;
+      if (Array.isArray(children)) {
+        const index = children.indexOf(module);
+        if (index !== -1) children.splice(index, 1);
+      }
+    } else if (
+      module.exports &&
+      !isProxy(module.exports) &&
+      Object.getPrototypeOf(module.exports) === CircularRequirePrototypeWarningProxy
+    ) {
+      Object.setPrototypeOf(module.exports, Object.prototype);
+    }
+  }
+  return module.exports;
 }
 
-// Module._resolveLookupPaths(request, parent): the search paths for a bare specifier (null for
-// relative/absolute/core requests, as Node returns).
+function _findPath(request, paths, isMain) {
+  return findPath(request, paths, isMain);
+}
+
+// Module._resolveLookupPaths(request, parent): the search paths for `request` (null for core
+// modules); a relative request resolves against its parent's directory.
 function _resolveLookupPaths(request, parent) {
-  const spec = String(request);
-  if (isBuiltin(spec)) return null;
-  if (spec.startsWith("./") || spec.startsWith("../") || spec.startsWith("/")) return null;
-  return nodeModulePaths(parentDir(parent));
+  if (isCoreSpecifier(request)) return null;
+  const second = request.charAt(1);
+  if (request.charAt(0) !== "." || (request.length > 1 && second !== "." && second !== "/")) {
+    if (modulePaths === null) initPaths();
+    const paths = parent && parent.paths && parent.paths.length ? parent.paths.concat(modulePaths) : modulePaths;
+    return paths.length > 0 ? paths : null;
+  }
+  if (!parent || !parent.id || !parent.filename) return ["."];
+  return [path.dirname(parent.filename)];
 }
 
 // Module.runMain(): run the process entry point (process.argv[1]) as the main module.
@@ -946,8 +1321,22 @@ Module.getCompileCacheDir = getCompileCacheDir;
 Module.flushCompileCache = flushCompileCache;
 Module.runMain = moduleRunMain;
 // wrap/wrapper are non-enumerable in Node (they stay off Object.keys(module)), so define them so.
-Object.defineProperty(Module, "wrap", { value: wrap, writable: true, configurable: true });
-Object.defineProperty(Module, "wrapper", { value: wrapper, writable: true, configurable: true });
+Object.defineProperty(Module, "wrap", {
+  get: () => wrap,
+  set(value) {
+    wrapperPatched = true;
+    wrap = value;
+  },
+  configurable: true,
+});
+Object.defineProperty(Module, "wrapper", {
+  get: () => wrapper,
+  set(value) {
+    wrapperPatched = true;
+    wrapper = value;
+  },
+  configurable: true,
+});
 Module._extensions = _extensions;
 Module._pathCache = Object.create(null);
 Module._debug = function () {};
@@ -956,27 +1345,63 @@ Module._nodeModulePaths = nodeModulePaths;
 Module._resolveFilename = _resolveFilename;
 Module._resolveLookupPaths = _resolveLookupPaths;
 Module._load = _load;
-Module._initPaths = function () {};
-Module._preloadModules = function () {};
+Module._initPaths = initPaths;
+Module._stat = stat;
+Module._preloadModules = function (requests) {
+  if (!Array.isArray(requests)) return;
+  isPreloading = true;
+  const parent = new Module("internal/preload", null);
+  try {
+    parent.paths = Module._nodeModulePaths(process.cwd());
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+  try {
+    for (const request of requests) parent.require(request);
+  } finally {
+    isPreloading = false;
+  }
+};
 // _cache is the live require cache; globalPaths is computed on access because process.env is
 // populated by the runtime *after* this glue runs (so reading HOME eagerly here would miss it).
 Module._cache = cache;
 Object.defineProperty(Module, "globalPaths", {
   enumerable: true,
+  configurable: true,
   get() {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const list = [];
-    if (process.env.NODE_PATH) list.push(...process.env.NODE_PATH.split(path.delimiter).filter(Boolean));
-    if (home) list.push(path.join(home, ".node_modules"), path.join(home, ".node_libraries"));
-    return list;
+    if (modulePaths === null) initPaths();
+    return globalPathsValue;
+  },
+  set(value) {
+    globalPathsValue = value;
   },
 });
 
 __builtins.set("module", Module);
 __builtins.set("node:module", Module);
 
+// The CLI calls this once the parsed command-line options are in place (see Runtime::set_cli_options).
+globalThis.__lumenApplyOptions = function () {
+  const options = process[Symbol.for("lumen.options")];
+  if (options && (options["--experimental-permission"] || options["--permission"])) {
+    __internals.get("permission").init();
+  }
+  if (options && (options["--trace-events-enabled"] || options["--trace-event-categories"] !== undefined)) {
+    __internals.get("trace_events").startFromOptions(options);
+  }
+};
+
 // Exposed to the CLI (via a tiny bootstrap) to run a file as the main module.
-globalThis.__runMain = runMain;
+// The text an uncaught Error prints as: its inspection, which carries the own properties
+// (`code`, `requireStack`, ...) after the stack. Plain errors keep the short report.
+globalThis.__lumenDescribeError = (error) => {
+  try {
+    if (error instanceof Error && Object.keys(error).length > 0) return __builtins.get("util").inspect(error);
+  } catch {}
+  return undefined;
+};
+
+globalThis.__runMain = (filename) => Module.runMain(filename);
 globalThis.__runMainSource = runMainSource;
 
 // --- ESM interop: synthetic re-export modules for the builtins ---

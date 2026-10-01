@@ -3514,7 +3514,7 @@ fn install_object(it: &mut Interp) {
             }
             // ToObject coerces a primitive (Object.getPrototypeOf('') → String.prototype).
             Value::Undefined | Value::Empty | Value::Null => {
-                Err(i.make_error("TypeError", "called on null or undefined"))
+                Err(i.make_error("TypeError", "Cannot convert undefined or null to object"))
             }
             Value::Str(_) => Ok(Value::Obj(i.string_proto.clone())),
             Value::Num(_) => Ok(Value::Obj(i.number_proto.clone())),

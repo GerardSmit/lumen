@@ -11,6 +11,9 @@
 
 use std::path::PathBuf;
 
+#[path = "src/glue.rs"]
+mod glue;
+
 /// Order matters: preamble first; each builtin registers itself into `__builtins` as it loads, so
 /// dependencies must come first (events ← stream ← http; util/crypto/shims before their users);
 /// module.js is LAST because it snapshots `__builtins.keys()` as the core-module set.
@@ -81,6 +84,10 @@ const JS_FILES: &[GlueFile] = &[
         wrap: true,
     },
     GlueFile {
+        name: "async_hooks.js",
+        wrap: true,
+    },
+    GlueFile {
         name: "url.js",
         wrap: true,
     },
@@ -90,6 +97,15 @@ const JS_FILES: &[GlueFile] = &[
     },
     GlueFile {
         name: "stream.js",
+        wrap: true,
+    },
+    GlueFile {
+        name: "zlib.js",
+        wrap: true,
+    },
+    // webstreams.js is Node's WHATWG streams (generated; see its header).
+    GlueFile {
+        name: "webstreams.js",
         wrap: true,
     },
     // net.js is Node's net/http/https stack (generated; see its header).
@@ -128,6 +144,10 @@ const JS_FILES: &[GlueFile] = &[
     },
     GlueFile {
         name: "tty.js",
+        wrap: true,
+    },
+    GlueFile {
+        name: "readline.js",
         wrap: true,
     },
     GlueFile {
@@ -221,6 +241,10 @@ const JS_FILES: &[GlueFile] = &[
         wrap: false,
     },
     GlueFile {
+        name: "permission.js",
+        wrap: true,
+    },
+    GlueFile {
         name: "module.js",
         wrap: false,
     },
@@ -239,6 +263,9 @@ const JS_FILES: &[GlueFile] = &[
 /// globals other than the ones it defines. Each lazy file costs nothing (not even its decoded
 /// AST) until a program touches it, which is most of the node glue for most programs.
 const LAZY: &[&str] = &[
+    "async_hooks.js",
+    "domain.js",
+    "diagnostics_channel.js",
     "trace_events.js",
     "util.js",
     "crypto.js",
@@ -247,6 +274,8 @@ const LAZY: &[&str] = &[
     "url.js",
     "assert.js",
     "stream.js",
+    "zlib.js",
+    "webstreams.js",
     "net.js",
     "fs.js",
     "http2_huffman.js",
@@ -255,10 +284,12 @@ const LAZY: &[&str] = &[
     "child_process.js",
     "dns.js",
     "tty.js",
+    "readline.js",
     "tls.js",
     "worker_threads.js",
     "vm.js",
     "repl.js",
+    "permission.js",
     "cluster.js",
     "dgram.js",
     "wasi.js",
@@ -276,57 +307,6 @@ const LAZY: &[&str] = &[
     "bun_s3.js",
     "bun.js",
 ];
-
-/// The names a lazy glue file registers, as `__lazyGlue` takes them: the `__builtins` names, the
-/// `__internals` names, and the globals it defines at (near) top level — space-separated.
-fn lazy_names(file: &str, body: &str) -> [String; 3] {
-    let literal_args = |call: &str| -> Vec<String> {
-        let mut names = Vec::new();
-        let mut rest = body;
-        while let Some(at) = rest.find(call) {
-            rest = &rest[at + call.len()..];
-            let arg = rest.trim_start();
-            let Some(arg) = arg.strip_prefix('"') else {
-                panic!("{file}: {call}…) needs a string-literal name to load lazily (see LAZY)");
-            };
-            let name = &arg[..arg.find('"').expect("unterminated name")];
-            if !names.iter().any(|n| n == name) {
-                names.push(name.to_string());
-            }
-        }
-        names
-    };
-    let builtins = literal_args("__builtins.set(");
-    let internals = literal_args("__internals.set(");
-    let mut globals: Vec<String> = Vec::new();
-    for line in body.lines() {
-        let indent = line.len() - line.trim_start().len();
-        let line = line.trim_start();
-        if indent > 2 {
-            continue;
-        }
-        let name = if let Some(rest) = line.strip_prefix("Object.defineProperty(globalThis, \"") {
-            rest.split('"').next()
-        } else if let Some(rest) = line.strip_prefix("globalThis.") {
-            let end = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-                .unwrap_or(rest.len());
-            rest[end..].trim_start().strip_prefix('=').filter(|r| !r.starts_with('=')).map(|_| &rest[..end])
-        } else {
-            None
-        };
-        if let Some(name) = name {
-            if !globals.iter().any(|g| g == name) {
-                globals.push(name.to_string());
-            }
-        }
-    }
-    assert!(
-        !builtins.is_empty() || !internals.is_empty() || !globals.is_empty(),
-        "{file}: a lazy glue file must register something (see LAZY)"
-    );
-    [builtins.join(" "), internals.join(" "), globals.join(" ")]
-}
 
 /// Glue files that belong to an optional cargo feature (`CARGO_FEATURE_<NAME>`), left out of
 /// the glue when it is off.
@@ -354,59 +334,23 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let src_dir = manifest.join("src/js");
 
-    let mut glue = String::from("(() => {\n");
-    for (index, file) in JS_FILES.iter().enumerate() {
-        let gate = GATED.iter().find(|(name, _)| *name == file.name);
-        if gate.is_some_and(|(_, f)| std::env::var_os(format!("CARGO_FEATURE_{f}")).is_none()) {
-            continue;
-        }
-        let path = src_dir.join(file.name);
+    let entries: Vec<glue::Entry> = JS_FILES
+        .iter()
+        .map(|file| glue::Entry {
+            name: file.name,
+            wrap: file.wrap,
+            lazy: LAZY.contains(&file.name),
+            feature: GATED.iter().find(|(name, _)| *name == file.name).map(|(_, f)| *f),
+        })
+        .collect();
+    let feature_on = |f: &str| std::env::var_os(format!("CARGO_FEATURE_{f}")).is_some();
+    let read = |name: &str| {
+        let path = src_dir.join(name);
         println!("cargo:rerun-if-changed={}", path.display());
-        let body = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        // Node's lib modules (`defineModule(name, function (module, exports, …) {…})`) each run
-        // once too: mark them like the lazy files' bodies.
-        let body = body.replace(
-            "function (module, exports, require, internalBinding, primordials) {",
-            "function (module, exports, require, internalBinding, primordials) {\"lumen:run-once\";",
-        );
-        // A memory checkpoint after each file, for LUMEN_MEM_STATS (see lumen-host).
-        let mark = if std::env::var_os("LUMEN_GLUE_MEM_MARKS").is_some() {
-            format!(
-                "\nif (typeof __lumenMemMark === \"function\") __lumenMemMark({:?});\n",
-                file.name
-            )
-        } else {
-            String::new()
-        };
-        if LAZY.contains(&file.name) {
-            assert!(file.wrap, "{}: a lazy glue file must be wrapped", file.name);
-            let [builtins, internals, globals] = lazy_names(file.name, &body);
-            // The `"lumen:run-once"` directive (lumen's `serialize::RUN_ONCE`): the body runs
-            // once, on the tree-walker, and the collector can release it afterwards.
-            glue.push_str(&format!(
-                "__lazyGlue({index}, {builtins:?}, {internals:?}, {globals:?}, () => {{\n\"lumen:run-once\";\n"
-            ));
-            glue.push_str(&body);
-            glue.push_str(&mark);
-            glue.push_str("\n});\n");
-            continue;
-        }
-        if index > 0 {
-            // preamble.js (index 0) declares it.
-            glue.push_str(&format!("__glueIndex = {index};\n"));
-        }
-        if file.wrap {
-            glue.push_str("{\n");
-            glue.push_str(&body);
-            glue.push_str("\n}\n");
-        } else {
-            glue.push_str(&body);
-        }
-        glue.push_str(&mark);
-    }
-    // Registrations made after startup (by code the glue runs later) win over any lazy file's.
-    glue.push_str("\n__glueIndex = 1e9;\n})();");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+    let mem_marks = std::env::var_os("LUMEN_GLUE_MEM_MARKS").is_some();
+    let glue = glue::assemble(&entries, read, feature_on, mem_marks);
 
     let blob = lumen::precompiled::precompile_glue(&glue, "node-glue")
         .unwrap_or_else(|e| panic!("node glue failed to precompile: {e}"));
@@ -415,6 +359,17 @@ fn main() {
     // node_glue.js is for reference only (not linked).
     std::fs::write(out.join("node_glue.js"), &glue).unwrap();
     std::fs::write(out.join("node_glue.aot"), &blob).unwrap();
+    // The same file list for `LUMEN_NODE_GLUE_DIR` (src/glue_dev.rs), which assembles the glue
+    // from disk at startup so a JS-only change needs no rebuild.
+    let mut list = String::from("pub const MANIFEST: &[glue::Entry] = &[\n");
+    for e in &entries {
+        list.push_str(&format!(
+            "    glue::Entry {{ name: {:?}, wrap: {}, lazy: {}, feature: {:?} }},\n",
+            e.name, e.wrap, e.lazy, e.feature
+        ));
+    }
+    list.push_str("];\n");
+    std::fs::write(out.join("glue_manifest.rs"), list).unwrap();
 
     std::fs::write(out.join("ffi_trampolines.rs"), generate_ffi_trampolines()).unwrap();
     println!("cargo:rerun-if-changed=build.rs");

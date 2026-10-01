@@ -70,6 +70,7 @@ if (!/\bObjectDefineProperty,/.test(net.slice(0, 2000))) throw new Error('net.js
 net = patch(net, `} = primordials;\n`, `  PromiseReject,\n} = primordials;\n`, 'net.js');
 
 let out = read(path.join(here, 'head.js'));
+out += read(path.join(here, 'cares.js'));
 out += mod('internal/validators', src('internal_validators.js'));
 out += mod('internal/net', src('internal_net.js'));
 out += mod('internal/stream_base_commons', src('internal_stream_base_commons.js'));
@@ -114,15 +115,19 @@ out += mod('_http_client', stripLicense(src('_http_client.js')));
 out += mod('_http_server', stripLicense(src('_http_server.js')));
 out += mod('http', stripLicense(src('http.js')));
 
-// https: lumen's tls.Server is a class (tls.js), so https.Server initializes itself through
-// its `_init` rather than calling the constructor on `this`.
-let https = stripLicense(src('https.js'));
-https = patch(https,
-  `  FunctionPrototypeCall(tls.Server, this,`,
-  `  // lumen: tls.Server is a class; run its initializer on this object.
-` +
-  `  FunctionPrototypeCall(tls.Server.prototype._init, this,`, 'https.js');
-out += mod('https', https);
+out += mod('https', stripLicense(src('https.js')));
+out += mod('internal/dgram', stripLicense(src('internal_dgram.js')));
+out += mod('dgram', stripLicense(src('dgram.js')));
+
+// ---- dns ----
+// lumen: the default result order is read where Node's pre-execution would call initializeDns().
+out += mod('internal/dns/utils', patch(stripLicense(src('internal_dns_utils.js')),
+  `let dnsOrder;\n`, `let dnsOrder = getOptionValue('--dns-result-order') || 'verbatim'; // lumen\n`,
+  'internal_dns_utils.js'));
+out += mod('internal/dns/promises', stripLicense(src('internal_dns_promises.js')));
+out += mod('internal/dns/callback_resolver', stripLicense(src('internal_dns_callback_resolver.js')));
+out += mod('dns', stripLicense(src('dns.js')));
+out += mod('dns/promises', "'use strict';\n\nmodule.exports = require('internal/dns/promises');\n");
 out += read(path.join(here, 'tail.js'));
 fs.writeFileSync(process.argv[2], out);
 console.log('wrote', out.length);

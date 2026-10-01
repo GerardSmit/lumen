@@ -1464,7 +1464,7 @@ impl Interp {
             tier_threshold: std::env::var("LUMEN_TIER_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+                .unwrap_or(if cfg!(target_arch = "wasm32") { 0 } else { 8 }),
             vm_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
             vm_frame_one: Vec::new(),
