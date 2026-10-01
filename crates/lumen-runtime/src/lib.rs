@@ -678,6 +678,7 @@ impl Runtime {
             if self.ticks_pending() {
                 continue;
             }
+            let _ = self.idle_collect(); // The 50-ms stop poll also services maintenance.
             let wait = match self.next_timer_deadline() {
                 Some(deadline) => {
                     let now = Instant::now();
@@ -790,9 +791,13 @@ impl Runtime {
                 continue;
             }
 
-            self.idle_collect();
-            // Blocked: only a timer deadline or a task completion can make progress now.
-            match self.next_timer_deadline() {
+            let maintenance = self.idle_collect();
+            // A pending idle pass must not wait forever behind an otherwise silent task.
+            let deadline = match (self.next_timer_deadline(), maintenance) {
+                (Some(timer), Some(gc)) => Some(timer.min(gc)),
+                (timer, gc) => timer.or(gc),
+            };
+            match deadline {
                 Some(deadline) => {
                     let now = Instant::now();
                     if deadline > now {
@@ -816,13 +821,11 @@ impl Runtime {
     /// collects again and keeps every function body it ran once; the collector releases those
     /// bodies only across two collections it actually runs. Throttled so a loop that blocks
     /// between every request does not collect on every request.
-    fn idle_collect(&mut self) {
+    /// Returns the next maintenance deadline, if an initial or follow-up pass is pending.
+    fn idle_collect(&mut self) -> Option<Instant> {
         const MIN_INTERVAL: Duration = Duration::from_secs(1);
         const MIN_NEW_OBJECTS: i64 = 10_000;
         let (last, live_then) = self.idle_gc;
-        if last.elapsed() < MIN_INTERVAL {
-            return;
-        }
         let ctx = self.engine.ctx();
         let live = ctx.live_object_count();
         // A collection releases the bodies that were cold across the *previous* one, so the
@@ -830,12 +833,16 @@ impl Runtime {
         let busy = (live - live_then).abs() >= MIN_NEW_OBJECTS;
         if !busy && !self.idle_gc_followup {
             self.idle_gc.0 = Instant::now();
-            return;
+            return None;
+        }
+        if last.elapsed() < MIN_INTERVAL {
+            return Some(last + MIN_INTERVAL);
         }
         ctx.collect_garbage_for_host();
         ctx.release_unused_memory_for_host();
         self.idle_gc_followup = busy;
         self.idle_gc = (Instant::now(), ctx.live_object_count());
+        self.idle_gc_followup.then_some(self.idle_gc.0 + MIN_INTERVAL)
     }
 
     /// Set `process.argv` to `[argv0, ...script_argv]` and `process.execArgv` to the runtime

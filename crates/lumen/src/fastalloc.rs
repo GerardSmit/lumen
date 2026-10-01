@@ -210,6 +210,18 @@ thread_local! {
     static GUARD: Guard = const { Guard };
 }
 
+#[cfg(test)]
+pub(crate) fn cached_bytes_for_test() -> usize {
+    CACHE.with(|cache| {
+        cache
+            .counts
+            .iter()
+            .enumerate()
+            .map(|(class, count)| count.get() * (class + 1) * STEP)
+            .sum()
+    })
+}
+
 #[cold]
 #[inline(never)]
 fn register_guard(c: &Cache) {
@@ -260,6 +272,16 @@ pub(crate) fn trim() {
         // A null zone requests pressure relief from every registered malloc zone (including the
         // nano/tiny zones that may own allocations returned by `System`).
         let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // glibc keeps freed arena pages resident after parse/compile bursts.
+        // This only releases unused pages; it cannot move live Rust/JS objects.
+        // No equivalent symbol is assumed on musl or Android's bionic.
+        let _ = malloc_trim(0);
     }
 }
 

@@ -109,6 +109,10 @@ pub(crate) struct JitFrame {
     pub ta_data: *mut u8,
     pub pad5: u64,
     pub ta_len: usize,
+    /// Keep the shadow pointer in the payload half of a trivially droppable word.
+    pub pad6: u64,
+    /// This interpreter's shadow stack, never a compilation thread's TLS address.
+    pub shadow: *mut Shadow,
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -121,7 +125,8 @@ const _: () = {
     assert!(o!(JitFrame, canon) % 16 == 0 && o!(JitFrame, resume) % 16 == 0);
     assert!(o!(JitFrame, pad2) % 16 == 0 && o!(JitFrame, pad3) % 16 == 0);
     assert!(o!(JitFrame, pad4) % 16 == 0 && o!(JitFrame, pad5) % 16 == 0);
-    assert!(std::mem::size_of::<JitFrame>() == 160);
+    assert!(o!(JitFrame, pad6) % 16 == 0 && o!(JitFrame, shadow) % 16 == 8);
+    assert!(std::mem::size_of::<JitFrame>() == 176);
 };
 
 /// The lazy call record of a directly called frame (see `build::call` and [`sync_frames`]),
@@ -180,6 +185,7 @@ pub(crate) const FRAME_SLOTS: i32 = std::mem::offset_of!(JitFrame, slots) as i32
 pub(crate) const FRAME_CONSTS: i32 = std::mem::offset_of!(JitFrame, consts) as i32;
 pub(crate) const FRAME_STACK: i32 = std::mem::offset_of!(JitFrame, stack) as i32;
 pub(crate) const FRAME_INTERP: i32 = std::mem::offset_of!(JitFrame, interp) as i32;
+pub(crate) const FRAME_SHADOW: i32 = std::mem::offset_of!(JitFrame, shadow) as i32;
 pub(crate) const FRAME_CHUNK: i32 = std::mem::offset_of!(JitFrame, chunk) as i32;
 pub(crate) const FRAME_ENV: i32 = std::mem::offset_of!(JitFrame, env) as i32;
 pub(crate) const FRAME_THIS: i32 = std::mem::offset_of!(JitFrame, this_val) as i32;
@@ -384,7 +390,7 @@ pub(crate) fn frame_bytes(n_slots: usize, max_stack: usize) -> usize {
     REC_BYTES + FRAME_HDR + (n_slots + max_stack.max(1)) * VALUE_SIZE as usize
 }
 
-/// The per-thread shadow stack directly called function code runs its frames on (see
+/// The per-interpreter shadow stack directly called function code runs its frames on (see
 /// `build::call`). `top` / `end` are read and bumped by native code; a caller restores `top`
 /// when its callee returns, so the stack is always exactly the live direct frames.
 ///
@@ -396,12 +402,18 @@ pub(crate) fn frame_bytes(n_slots: usize, max_stack: usize) -> usize {
 pub(crate) struct Shadow {
     pub top: usize,
     pub end: usize,
+    _storage: ShadowStorage,
+}
+
+enum ShadowStorage {
+    Pages(lumen_codegen::jitmem::DataMemory),
+    Heap(Box<[u128]>),
 }
 
 pub(crate) const SHADOW_TOP: i32 = std::mem::offset_of!(Shadow, top) as i32;
 pub(crate) const SHADOW_END: i32 = std::mem::offset_of!(Shadow, end) as i32;
 
-/// Shadow-stack bytes per thread. A call that would pass the end takes the generic (slow) call
+/// Shadow-stack bytes per interpreter. A call that would pass the end takes the generic (slow) call
 /// path, so this bounds only how deep JIT-to-JIT calls stay direct. On Windows the buffer is
 /// committed from the start (private bytes, though not working set), so it is kept smaller
 /// there; elsewhere untouched pages cost nothing.
@@ -412,33 +424,31 @@ const SHADOW_BYTES: usize = 1 << 20;
 #[cfg(target_pointer_width = "32")]
 const SHADOW_BYTES: usize = 1 << 20;
 
-thread_local! {
-    static SHADOW: Cell<*mut Shadow> = const { Cell::new(std::ptr::null_mut()) };
-}
-
-/// This thread's shadow stack (allocated on first use and never freed: code compiled on a
-/// thread bakes the address in, and may outlive the thread — a parked coroutine worker's code
-/// runs on its resumer). Only one thread runs JS of an engine at a time, and every use of a
-/// shadow stack is strictly nested, so frames of code from different threads never interleave
-/// out of order.
-pub(crate) fn shadow() -> *mut Shadow {
-    SHADOW.with(|s| {
-        if s.get().is_null() {
-            // OS pages: untouched ones (a shallow call depth) cost no memory.
-            let mut base = lumen_codegen::jitmem::alloc_pages(SHADOW_BYTES) as usize;
-            if base == 0 {
-                let buf: &'static mut [u128] =
-                    Box::leak(vec![0u128; SHADOW_BYTES / 16].into_boxed_slice());
-                base = buf.as_mut_ptr() as usize;
-            }
-            s.set(Box::into_raw(Box::new(Shadow {
+/// Engine-owned storage follows its active frame across exclusive coroutine handoffs.
+/// Code must not embed a TLS address: that thread can serve another engine concurrently
+/// while a previously compiled chunk executes elsewhere.
+pub(crate) fn shadow(i: &mut Interp) -> *mut Shadow {
+    i.jit_shadow
+        .get_or_insert_with(|| {
+            let storage = match lumen_codegen::jitmem::DataMemory::new(SHADOW_BYTES) {
+                Some(memory) => ShadowStorage::Pages(memory),
+                None => ShadowStorage::Heap(vec![0u128; SHADOW_BYTES / 16].into_boxed_slice()),
+            };
+            let base = match &storage {
+                ShadowStorage::Pages(memory) => memory.as_ptr() as usize,
+                ShadowStorage::Heap(memory) => memory.as_ptr() as usize,
+            };
+            Box::new(Shadow {
                 top: base,
                 end: base + SHADOW_BYTES,
-            })));
-        }
-        s.get()
-    })
+                _storage: storage,
+            })
+        })
+        .as_mut() as *mut Shadow
 }
+
+#[cfg(test)]
+mod shadow_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
 /// payload word, `fn_frames` identity and the address of the environment it closes over (inside
@@ -1175,6 +1185,8 @@ fn enter(
         area[k] = v;
     }
     let mut frame = JitFrame {
+        shadow: shadow(i),
+        pad6: 0,
         slots: slots.as_mut_ptr(),
         consts: chunk.consts.as_ptr(),
         stack: area.as_mut_ptr(),
@@ -1537,11 +1549,11 @@ pub(crate) unsafe fn seed_raw(p: *mut Value, chunk: &Chunk, seed: impl FnOnce(&m
 /// Whether [`call_direct`] can run `chunk` now: it has function code and the shadow stack has
 /// room for its frame.
 #[inline(always)]
-pub(crate) fn direct_ready(chunk: &Chunk) -> bool {
+pub(crate) fn direct_ready(i: &mut Interp, chunk: &Chunk) -> bool {
     let entry = chunk.jit.dentry.get();
-    // SAFETY: the shadow stack is this thread's and outlives it.
+    // SAFETY: the shadow stack belongs to the exclusively running interpreter.
     entry != 0 && unsafe {
-        let sh = shadow();
+        let sh = shadow(i);
         (*sh).top + chunk.jit.dsize.get() <= (*sh).end
     }
 }
@@ -1569,7 +1581,7 @@ pub(crate) unsafe fn call_direct(
     seed: impl FnOnce(&mut Seed),
 ) -> Result<Value, Abrupt> {
     let entry = chunk.jit.dentry.get();
-    let sh = shadow();
+    let sh = shadow(i);
     let top0 = (*sh).top;
     (*sh).top = top0 + chunk.jit.dsize.get();
     // --- enter_frame (an ordinary call) ---
@@ -1610,6 +1622,8 @@ pub(crate) unsafe fn call_direct(
         super::drop_value_fast(std::ptr::replace(slots.add(k as usize), Value::Undefined));
     }
     nf.write(JitFrame {
+        shadow: sh,
+        pad6: 0,
         exception: Value::Undefined,
         budget: SAFEPOINT_BUDGET,
         slots,

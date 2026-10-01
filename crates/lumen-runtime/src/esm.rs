@@ -82,17 +82,77 @@ pub fn make_cached_loader(
 /// every module it parses — also for dependencies it has already loaded, whose source it then
 /// ignores — so a module graph repeats the same resolutions many times (Puppeteer: ~630 loads for
 /// ~170 modules), each one filesystem probes, `package.json` reads and a file read. Resolutions
-/// are cached by (specifier, referrer directory, attribute) and sources by resolved key, for the
-/// loader's lifetime; the file system is assumed not to change under a loading module graph
+/// are cached by (specifier, referrer directory, attribute). Redundant source copies are bounded
+/// by bytes/entries; evaluated modules and their exports remain cached by the engine. The file
+/// system is assumed not to change under a loading module graph
 /// (Node's resolver caches the same way). A failed resolution is not cached.
 #[derive(Default)]
 pub struct LoaderCache {
     /// (specifier, referrer directory, attribute type) -> resolved key.
     keys: std::cell::RefCell<HashMap<(String, String, Option<String>), String>>,
     /// (resolved key, attribute type) -> source.
-    sources: std::cell::RefCell<HashMap<(String, Option<String>), String>>,
+    sources: std::cell::RefCell<SourceCache>,
     /// Package types and canonical directories, for the resolver's helpers.
     memo: std::cell::RefCell<FsMemo>,
+    /// Numeric-only opt-in memory checkpoints while a graph is still loading.
+    diagnostic_lookups: std::cell::Cell<usize>,
+}
+
+const SOURCE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const SOURCE_CACHE_ENTRIES: usize = 512;
+type SourceKey = (String, Option<String>);
+
+/// Dynamic imports can keep a loader alive for an entire account lifetime. Cache only
+/// 8 MiB of redundant source/key bytes plus at most 512 small map records, not the graph.
+#[derive(Default)]
+struct SourceCache {
+    entries: HashMap<SourceKey, (String, u64)>,
+    bytes: usize,
+    clock: u64,
+}
+impl SourceCache {
+    fn weight(key: &SourceKey, source: &str) -> usize {
+        key.0
+            .len()
+            .saturating_add(key.1.as_ref().map_or(0, String::len))
+            .saturating_add(source.len())
+    }
+    fn get(&mut self, key: &SourceKey) -> Option<String> {
+        let entry = self.entries.get_mut(key)?;
+        self.clock = self.clock.saturating_add(1);
+        entry.1 = self.clock;
+        Some(entry.0.clone())
+    }
+    fn insert(&mut self, key: SourceKey, source: &str) {
+        if let Some((old, _)) = self.entries.remove(&key) {
+            self.bytes -= Self::weight(&key, &old);
+        }
+        let weight = Self::weight(&key, source);
+        if weight > SOURCE_CACHE_BYTES {
+            return;
+        }
+        while self.entries.len() >= SOURCE_CACHE_ENTRIES
+            || self.bytes.saturating_add(weight) > SOURCE_CACHE_BYTES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, time))| *time)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            let (old, _) = self.entries.remove(&oldest).expect("cached source");
+            self.bytes -= Self::weight(&oldest, &old);
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.bytes += weight;
+        self.entries.insert(key, (source.to_owned(), self.clock));
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
 }
 
 /// Filesystem facts the resolver re-derives for nearly every module: the `"type"` of each
@@ -175,6 +235,51 @@ impl LoaderCache {
         attr_type: Option<&str>,
         uncached: impl FnOnce(&str, &str, Option<&str>) -> Option<(String, String)>,
     ) -> Option<(String, String)> {
+        if lumen::memstats::enabled() {
+            let lookups = self.diagnostic_lookups.get().wrapping_add(1);
+            self.diagnostic_lookups.set(lookups);
+            if lookups % 4096 == 0 {
+                let keys = self.keys.borrow();
+                let sources = self.sources.borrow();
+                let memo = self.memo.borrow();
+                let key_bytes: usize = keys
+                    .iter()
+                    .map(|((specifier, base, attr), resolved)| {
+                        specifier.len()
+                            + base.len()
+                            + attr.as_ref().map_or(0, String::len)
+                            + resolved.len()
+                    })
+                    .sum();
+                let package_bytes: usize = memo
+                    .pkg_type
+                    .iter()
+                    .map(|(path, kind)| {
+                        path.as_os_str().as_encoded_bytes().len()
+                            + kind
+                                .as_ref()
+                                .and_then(Option::as_ref)
+                                .map_or(0, String::len)
+                    })
+                    .sum();
+                let canonical_bytes: usize = memo
+                    .canon_dirs
+                    .iter()
+                    .map(|(path, canonical)| {
+                        path.as_os_str().as_encoded_bytes().len()
+                            + canonical.as_os_str().as_encoded_bytes().len()
+                    })
+                    .sum();
+                eprintln!(
+                    "[loader-memory] lookups={lookups} resolutions={} key_payload={key_bytes} sources={} source_payload={} packages={} package_payload={package_bytes} canonical_dirs={} canonical_payload={canonical_bytes}",
+                    keys.len(),
+                    sources.entries.len(),
+                    sources.bytes,
+                    memo.pkg_type.len(),
+                    memo.canon_dirs.len()
+                );
+            }
+        }
         // An `aot:` referrer resolves against the current directory, not its own location.
         let base = if referrer.starts_with("aot:") {
             None
@@ -192,8 +297,8 @@ impl LoaderCache {
             let key = (specifier.to_owned(), base.clone(), attr.clone());
             if let Some(resolved) = self.keys.borrow().get(&key) {
                 let sk = (resolved.clone(), attr.clone());
-                if let Some(src) = self.sources.borrow().get(&sk) {
-                    return Some((resolved.clone(), src.clone()));
+                if let Some(src) = self.sources.borrow_mut().get(&sk) {
+                    return Some((resolved.clone(), src));
                 }
             }
         }
@@ -209,7 +314,7 @@ impl LoaderCache {
                 .insert((specifier.to_owned(), base, attr.clone()), resolved.clone());
             self.sources
                 .borrow_mut()
-                .insert((resolved.clone(), attr), src.clone());
+                .insert((resolved.clone(), attr), &src);
         }
         Some((resolved, src))
     }
@@ -1190,6 +1295,83 @@ fn js_string(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_cache_bounds_bytes_and_keeps_recent_sources() {
+        use super::*;
+        let mut cache = SourceCache::default();
+        let a = ("a".to_owned(), None);
+        let b = ("b".to_owned(), None);
+        let c = ("c".to_owned(), None);
+        let source = "x".repeat(SOURCE_CACHE_BYTES / 2 - 16);
+        cache.insert(a.clone(), &source);
+        cache.insert(b.clone(), &source);
+        assert!(cache.get(&a).is_some());
+        cache.insert(c.clone(), &"y".repeat(64));
+        assert!(cache.get(&a).is_some());
+        assert!(cache.get(&b).is_none());
+        assert_eq!(cache.get(&c).as_deref(), Some("y".repeat(64).as_str()));
+        assert!(cache.bytes <= SOURCE_CACHE_BYTES);
+        cache.insert(a.clone(), &"z".repeat(SOURCE_CACHE_BYTES + 1));
+        assert!(
+            cache.get(&a).is_none(),
+            "oversized replacement must not leave stale source"
+        );
+        cache.clear();
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn source_cache_bounds_empty_records_and_separates_attributes() {
+        use super::*;
+        let mut cache = SourceCache::default();
+        for index in 0..SOURCE_CACHE_ENTRIES + 1 {
+            cache.insert((index.to_string(), None), "");
+        }
+        assert_eq!(cache.entries.len(), SOURCE_CACHE_ENTRIES);
+        assert!(cache.get(&("0".into(), None)).is_none());
+        cache.insert(("file".into(), None), "plain");
+        cache.insert(("file".into(), Some("json".into())), "json");
+        assert_eq!(cache.get(&("file".into(), None)).as_deref(), Some("plain"));
+        assert_eq!(
+            cache.get(&("file".into(), Some("json".into()))).as_deref(),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn source_cache_misses_reread_while_hits_preserve_resolution() {
+        use super::*;
+        let cache = LoaderCache::default();
+        let calls = std::cell::Cell::new(0);
+        let read = |_: &str, _: &str, _: Option<&str>| {
+            calls.set(calls.get() + 1);
+            Some(("canonical".to_owned(), calls.get().to_string()))
+        };
+        assert_eq!(
+            cache
+                .resolve("./a.mjs", "/root/main.mjs", None, read)
+                .unwrap()
+                .1,
+            "1"
+        );
+        assert_eq!(
+            cache
+                .resolve("./a.mjs", "/root/main.mjs", None, read)
+                .unwrap()
+                .1,
+            "1"
+        );
+        cache.forget_sources();
+        assert_eq!(
+            cache
+                .resolve("./a.mjs", "/root/main.mjs", None, read)
+                .unwrap()
+                .1,
+            "2"
+        );
+        assert_eq!(calls.get(), 2);
+    }
     #[test]
     fn export_patterns_preserve_exact_blocks_specificity_and_boundaries() {
         let manifest = r#"{"exports":{"./*":{"import":"./dist/esm/*","require":"./dist/cjs/*"},"./feature/*":"./feature/*","./feature/*.js":"./specific/*.mjs","./blocked.js":null,"./internal/*":null}}"#;

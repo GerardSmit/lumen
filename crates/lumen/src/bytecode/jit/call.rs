@@ -1753,7 +1753,7 @@ impl Tr<'_, '_> {
         let t_ok = self.fb.icmp(IntCC::Eq, term, z);
         let ok = self.fb.binary(BinaryOp::Band, m_ok, t_ok);
         self.guard_to(ok, slow);
-        let sh = self.ptrc(super::shadow() as usize as i64);
+        let sh = self.fb.load(PTR_MEM, self.frame, FRAME_SHADOW);
         // A `new` keeps its instance in the 16 bytes below the callee frame.
         let top0 = self.fb.load(PTR_MEM, sh, SHADOW_TOP);
         let top = if construct {
@@ -1851,6 +1851,7 @@ impl Tr<'_, '_> {
         self.fb.store(PTR_MEM, nf, consts, FRAME_CONSTS);
         self.fb.store(PTR_MEM, nf, stack_p, FRAME_STACK);
         self.fb.store(PTR_MEM, nf, interp, FRAME_INTERP);
+        self.fb.store(PTR_MEM, nf, sh, FRAME_SHADOW);
         self.fb.store(PTR_MEM, nf, cp, FRAME_CHUNK);
         let envp = self.fb.load(PTR_MEM, cellp, CELL_ENV);
         self.fb.store(PTR_MEM, nf, envp, FRAME_ENV);

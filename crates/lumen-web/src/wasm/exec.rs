@@ -546,8 +546,12 @@ impl Store {
         }
 
         let mut stack: Vec<Val> = Vec::new();
-        let mut ctrl: Vec<Ctrl> = Vec::new();
         let code = &compiled.code;
+        // The function body has its own implicit return label.
+        let mut ctrl = vec![Ctrl {
+            is_loop: false, end_ip: code.len(), start_ip: 0,
+            stack_height: 0, arity: compiled.ty.results.len(),
+        }];
         let labels = &compiled.labels;
         let mut ip = 0;
 
@@ -588,7 +592,7 @@ impl Store {
                 }
                 0x05 => {
                     // else: reached only by falling out of the `then` arm → jump to end
-                    if let Some(c) = ctrl.last() {
+                    if let Some(c) = ctrl.pop() {
                         ip = c.end_ip;
                     }
                 }
@@ -745,7 +749,7 @@ impl Store {
 
         // Return the top `results` values.
         let nres = compiled.ty.results.len();
-        let start = stack.len().saturating_sub(nres);
+        let start = stack.len().checked_sub(nres).ok_or("wasm: stack underflow on return")?;
         Ok(stack.split_off(start))
     }
 
@@ -1097,7 +1101,11 @@ fn do_branch(
         ctrl[target_idx].end_ip
     };
     // Keep the top `arity` values, drop the rest down to the label's base height.
-    let kept: Vec<Val> = stack.split_off(stack.len() - arity);
+    let start = stack.len().checked_sub(arity).ok_or("wasm: stack underflow on branch")?;
+    if start < height {
+        return Err("wasm: stack underflow on branch".into());
+    }
+    let kept: Vec<Val> = stack.split_off(start);
     stack.truncate(height);
     stack.extend(kept);
     // Popping to (and including) the target frame; a loop keeps its own frame.
@@ -1504,4 +1512,17 @@ pub fn eval_const_expr(code: &[u8], globals: &[Val]) -> Result<Val, String> {
         }
     }
     Ok(result)
+}
+
+
+#[cfg(test)]
+mod branch_stack_tests {
+    use super::*;
+    #[test]
+    fn malformed_branch_stack_returns_a_trap_without_a_split_index_panic() {
+        let mut control = vec![Ctrl {is_loop:false,end_ip:9,start_ip:0,stack_height:0,arity:1}];
+        assert!(do_branch(&mut control, &mut vec![], &mut 0, 0).is_err());
+        let mut control = vec![Ctrl {is_loop:false,end_ip:9,start_ip:0,stack_height:2,arity:1}];
+        assert!(do_branch(&mut control, &mut vec![Val::I32(1)], &mut 0, 0).is_err());
+    }
 }

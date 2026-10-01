@@ -33,7 +33,7 @@ pub(super) struct Api {
     result_error: unsafe extern "C" fn(*mut c_void, *const c_char, c_int),
 }
 impl Api {
-    pub(super) fn load(lib: &DynLib) -> Result<Self, String> {
+    pub(super) fn load(lib: &Library) -> Result<Self, String> {
         macro_rules! symbol {
             ($name:literal) => {{
                 let pointer = lib

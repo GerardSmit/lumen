@@ -1,8 +1,6 @@
-//! `bun:sqlite` backend — the real SQLite engine, reached through the *system* libsqlite3 at
-//! runtime via the dependency-free dynamic linker ([`crate::dylib`]). No third-party crate and no
-//! build-time dependency: we `dlopen` the shared library the OS already ships
-//! (`/usr/lib/libsqlite3.dylib` on macOS, `libsqlite3.so.0` on Linux) and `dlsym` the handful of
-//! C entry points we need, exactly as the N-API loader does for `.node` addons.
+//! `bun:sqlite` / `node:sqlite` backend. With `bundled-sqlite`, use the statically linked
+//! portable SQLite implementation. Otherwise resolve the OS library through [`crate::dylib`].
+//! An explicit custom library selects that implementation for the complete API table.
 //!
 //! The JS surface (Bun's `Database`/`Statement` API) lives in `js/bun_sqlite.js`; this module is
 //! the thin native op layer it drives: open/close, prepare/finalize, bind, step, and column
@@ -22,6 +20,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::{Cell as ActiveCell, RefCell};
 mod functions;
+mod library;
+use library::Library;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -114,11 +114,11 @@ type FileControl = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut 
 type DbConfig = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
 type DbFilename = unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_char;
 
-/// Every libsqlite3 entry point we resolve, kept alongside the [`DynLib`] that owns them (dropping
-/// the lib would dangle every pointer, so it lives as long as the API).
+/// Every SQLite entry point, kept alongside its selected library. A dynamic library must
+/// live as long as the API to keep its function pointers valid.
 struct Api {
     functions: functions::Api,
-    _lib: DynLib,
+    _lib: Library,
     open_v2: OpenV2,
     close_v2: CloseV2,
     prepare_v2: PrepareV2,
@@ -180,33 +180,9 @@ macro_rules! sym {
 }
 
 impl Api {
-    /// `dlopen` the system libsqlite3 and resolve every entry point. The candidate list is the
-    /// platform's canonical install location(s); a miss (no SQLite on the box, or too old) is an
-    /// honest error the constructor surfaces.
+    /// Select the bundled/system/custom implementation and resolve one complete API table.
     fn load(custom_path: Option<&str>) -> Result<Api, String> {
-        #[cfg(target_os = "macos")]
-        let candidates: &[&str] = &["/usr/lib/libsqlite3.dylib", "libsqlite3.dylib"];
-        #[cfg(target_os = "linux")]
-        let candidates: &[&str] = &["libsqlite3.so.0", "libsqlite3.so"];
-        #[cfg(target_os = "windows")]
-        let candidates: &[&str] = &["winsqlite3.dll", "sqlite3.dll"];
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        let candidates: &[&str] = &["libsqlite3.so.0", "libsqlite3.so", "libsqlite3.dylib"];
-
-        let lib = if let Some(path) = custom_path {
-            DynLib::open(path)
-                .map_err(|error| format!("could not load custom libsqlite3 '{path}' ({error})"))?
-        } else {
-            let mut last_err = String::from("no candidate paths");
-            let found = candidates.iter().find_map(|path| match DynLib::open(path) {
-                Ok(lib) => Some(lib),
-                Err(error) => {
-                    last_err = error;
-                    None
-                }
-            });
-            found.ok_or_else(|| format!("could not load the system libsqlite3 ({last_err})"))?
-        };
+        let lib = Library::load(custom_path)?;
 
         Ok(Api {
             functions: functions::Api::load(&lib)?,

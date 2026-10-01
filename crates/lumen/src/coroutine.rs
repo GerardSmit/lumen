@@ -9,8 +9,9 @@
 //!
 //! Worker threads are **pooled**: spawning a fresh thread per async call / generator was ~30µs
 //! (measured), dominating async cost, so finished workers return to an idle pool and are handed the
-//! next coroutine instead. The pool grows to the high-water mark of concurrently *live* coroutines
-//! and is reused across calls; only the ~6µs per-suspend channel handoff remains.
+//! next coroutine instead. At most eight idle helpers stay warm, and an offered helper retires
+//! after one second of silence. A helper checked out for a new job is fenced against retirement;
+//! active coroutines retain the same ~6µs per-suspend channel handoff.
 //!
 //! The running coroutine's channels live in a thread-local [`YIELDER`], so a `yield` buried deep in
 //! eval finds the right channel and nested coroutines (each on their own worker) need no extra
@@ -276,7 +277,9 @@ fn park_message(i: &mut Interp, msg: WorkerMessage) -> Resume {
         let b = y.borrow();
         let yl = b.as_ref().expect("suspend outside a coroutine");
         let _ = yl.suspend_tx.send(msg);
-        yl.resume_rx.recv()
+        // A suspended activation must stay intact, but its unused allocation cache
+        // need not stay resident during a long yield/await/driver-call handoff.
+        receive_after_quiet_trim(&yl.resume_rx, || false)
     });
     match resumed {
         Ok(r) => {
@@ -293,8 +296,11 @@ fn park_message(i: &mut Interp, msg: WorkerMessage) -> Resume {
         // `RefCell already borrowed` panics / SIGSEGV. Instead, never touch the interpreter again:
         // park forever, holding only the captured `Rc`s. The detached thread is reaped at process
         // exit (the generator never outlives its `Engine`).
-        Err(_) => loop {
-            std::thread::park();
+        Err(_) => {
+            crate::fastalloc::trim();
+            loop {
+                std::thread::park();
+            }
         },
     }
 }
@@ -352,11 +358,53 @@ unsafe impl Send for DriverTable {}
 /// Idle worker threads waiting for their next coroutine. Guarded by a plain `Mutex`: under the
 /// strict ping-pong exactly one thread touches the interpreter at a time, so contention is
 /// near-zero (a worker only pushes itself back *after* handing its final value to the driver).
-static IDLE: Mutex<Vec<Sender<Job>>> = Mutex::new(Vec::new());
+const MAX_IDLE_WORKERS: usize = 8;
+
+struct IdlePool<T> {
+    entries: Vec<(std::sync::Arc<()>, Sender<T>)>,
+}
+
+impl<T> IdlePool<T> {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn take(&mut self) -> Option<Sender<T>> {
+        self.entries.pop().map(|(_, sender)| sender)
+    }
+
+    fn offer(&mut self, identity: std::sync::Arc<()>, sender: Sender<T>) -> bool {
+        if self.entries.len() >= MAX_IDLE_WORKERS {
+            return false;
+        }
+        self.entries.push((identity, sender));
+        true
+    }
+
+    // Removing under the same lock as take fences retirement against checkout. Absence
+    // means the driver already reserved this worker and may still be constructing its job.
+    fn retire(&mut self, identity: &std::sync::Arc<()>) -> bool {
+        match self
+            .entries
+            .iter()
+            .position(|(entry, _)| std::sync::Arc::ptr_eq(entry, identity))
+        {
+            Some(index) => {
+                self.entries.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+static IDLE: Mutex<IdlePool<Job>> = Mutex::new(IdlePool::new());
 
 /// Grab an idle worker, or start a new one. `Err` when the platform cannot spawn threads (wasm32).
 fn get_worker() -> std::io::Result<Sender<Job>> {
-    if let Some(tx) = IDLE.lock().unwrap().pop() {
+    if let Some(tx) = IDLE.lock().unwrap().take() {
         return Ok(tx);
     }
     let (job_tx, job_rx) = channel::<Job>();
@@ -372,9 +420,147 @@ fn get_worker() -> std::io::Result<Sender<Job>> {
 /// parks forever (its `Engine` was torn down while it was suspended; see `park`) simply never comes
 /// back — the same leak-at-teardown as the pre-pool one-thread-per-coroutine design.
 fn worker_loop(job_rx: Receiver<Job>, self_tx: Sender<Job>) {
-    while let Ok(job) = job_rx.recv() {
+    let identity = std::sync::Arc::new(());
+    while let Ok(job) = receive_after_quiet_trim(&job_rx, || IDLE.lock().unwrap().retire(&identity)) {
         run_job(job);
-        IDLE.lock().unwrap().push(self_tx.clone());
+        if !IDLE
+            .lock()
+            .unwrap()
+            .offer(identity.clone(), self_tx.clone())
+        {
+            return;
+        }
+    }
+}
+
+// Release unused thread-local allocation blocks after one quiet second. A suspended
+// activation always uses retire=false and stays intact. Completed helpers may retire
+// only an unreserved pool offer after restoring the driver's TLS.
+fn receive_after_quiet_trim<T>(
+    rx: &Receiver<T>,
+    retire: impl FnOnce() -> bool,
+) -> Result<T, std::sync::mpsc::RecvError> {
+    match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        Ok(job) => Ok(job),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::sync::mpsc::RecvError),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crate::fastalloc::trim();
+            if retire() {
+                Err(std::sync::mpsc::RecvError)
+            } else {
+                rx.recv()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    #[test]
+    fn idle_pool_never_offers_more_than_its_warm_limit() {
+        let mut pool = IdlePool::new();
+        for _ in 0..MAX_IDLE_WORKERS {
+            let (tx, _) = channel::<()>();
+            assert!(pool.offer(std::sync::Arc::new(()), tx));
+        }
+        let (tx, _) = channel::<()>();
+        assert!(!pool.offer(std::sync::Arc::new(()), tx));
+        assert_eq!(pool.entries.len(), MAX_IDLE_WORKERS);
+    }
+
+    #[test]
+    fn quiet_pool_worker_exits_and_removes_its_exact_offer() {
+        let pool = std::sync::Arc::new(Mutex::new(IdlePool::new()));
+        let identity = std::sync::Arc::new(());
+        let (tx, rx) = channel::<()>();
+        assert!(pool.lock().unwrap().offer(identity.clone(), tx.clone()));
+        let other = std::sync::Arc::new(());
+        assert!(!pool.lock().unwrap().retire(&other));
+        let owner = pool.clone();
+        let worker = std::thread::spawn(move || {
+            receive_after_quiet_trim(&rx, || owner.lock().unwrap().retire(&identity)).is_err()
+        });
+        assert!(worker.join().unwrap());
+        assert!(pool.lock().unwrap().take().is_none());
+        assert!(tx.send(()).is_err());
+    }
+
+    #[test]
+    fn checked_out_worker_survives_timeout_before_job_dispatch() {
+        let pool = std::sync::Arc::new(Mutex::new(IdlePool::new()));
+        let identity = std::sync::Arc::new(());
+        let (tx, rx) = channel::<u8>();
+        assert!(pool.lock().unwrap().offer(identity.clone(), tx));
+        let reservation = pool.lock().unwrap().take().unwrap();
+        let (timeout_tx, timeout_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            receive_after_quiet_trim(&rx, || {
+                let retired = pool.lock().unwrap().retire(&identity);
+                timeout_tx.send(retired).unwrap();
+                retired
+            })
+            .unwrap()
+        });
+        // Dispatch deliberately follows the worker's timeout; an absent offer is reserved,
+        // not eligible for exit. No speculative resend or second worker is needed.
+        assert!(!timeout_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap());
+        reservation.send(42).unwrap();
+        assert_eq!(worker.join().unwrap(), 42);
+    }
+
+    #[test]
+    fn suspended_activation_resumes_after_the_quiet_trim_deadline() {
+        let mut engine = crate::Engine::new();
+        let first = engine.eval(r#"
+            let suspended = (function* (value) {
+                "use strict";
+                const text = "a captured string";
+                const next = yield value + arguments.length;
+                return value + next + (text === "a captured string" ? 1 : 0);
+            })(40);
+            suspended.next().value;
+        "#, false).unwrap();
+        assert!(matches!(first, crate::Completion::Value(value) if value == "41"));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let resumed = engine.eval("$262.gc(); suspended.next(8).value;", false).unwrap();
+        assert!(matches!(resumed, crate::Completion::Value(value) if value == "49"));
+    }
+
+    #[test]
+    fn silent_coroutine_pool_wait_releases_native_cache_before_reuse() {
+        let (job_tx, job_rx) = channel::<()>();
+        let (ready_tx, ready_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            use std::alloc::{GlobalAlloc, Layout};
+            let allocator = crate::fastalloc::ClassAlloc;
+            let layout = Layout::from_size_align(112, 16).unwrap();
+            let blocks: Vec<_> = (0..20_000)
+                .map(|_| {
+                    // The library leaves global allocator selection to its embedder. Exercise
+                    // its cache explicitly with matching allocation/deallocation layouts.
+                    let block = unsafe { allocator.alloc(layout) };
+                    assert!(!block.is_null());
+                    block
+                })
+                .collect();
+            for block in blocks {
+                unsafe {
+                    allocator.dealloc(block, layout);
+                }
+            }
+            let cached = crate::fastalloc::cached_bytes_for_test();
+            ready_tx.send(cached).unwrap();
+            receive_after_quiet_trim(&job_rx, || false).unwrap();
+            crate::fastalloc::cached_bytes_for_test()
+        });
+        assert!(ready_rx.recv().unwrap() >= 2_000_000);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        job_tx.send(()).unwrap();
+        assert!(worker.join().unwrap() < 64 * 1024);
     }
 }
 

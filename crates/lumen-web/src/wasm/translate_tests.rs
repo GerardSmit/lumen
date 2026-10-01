@@ -835,3 +835,23 @@ fn float_ops_and_conversions() {
     }
     differential(&m, &cases);
 }
+
+
+#[test]
+fn completed_then_arm_does_not_leave_a_stale_branch_label() {
+    let nested = Func {
+        params: vec![I32], results: vec![I32], locals: vec![],
+        body: cat(&[
+            vec![0x02,0x40], get(0), vec![0x04,0x7f], i32c(7),
+            vec![0x05], i32c(8), vec![0x0b], vec![0x1a],
+            vec![0x0c,0], vec![0x0b], i32c(42),
+        ]),
+    };
+    let return_label = Func {
+        params: vec![], results: vec![I32], locals: vec![],
+        body: cat(&[i32c(77), vec![0x0c,0], vec![0x00]]),
+    };
+    differential(&module(&[nested,return_label], &[], &[]), &[
+        (0,vec![Val::I32(1)]),(0,vec![Val::I32(0)]),(1,vec![]),
+    ]);
+}

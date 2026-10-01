@@ -210,6 +210,78 @@ fn spawn_blocking_completion_settles_on_the_loop() {
     assert_eq!(out.lines(), ["got 42"]);
 }
 
+// An inbox/task may be silent for arbitrarily long after loading. Collection must happen
+// before its completion, rather than only when the next JS callback allocates objects.
+struct IdleCollectionProbe {
+    before: i64,
+    reclaimed: Rc<RefCell<i64>>,
+}
+
+fn idle_loop_reclaims_setup_cycles(worker_loop: bool) {
+    let (mut rt, out, _) = test_runtime();
+    let source = r#"
+        const retained = { offset: 2 };
+        globalThis.onDone = n => console.log('retained', n + retained.offset);
+        for (let n = 0; n < 12000; n++) {
+            const garbage = {};
+            garbage.self = garbage;
+        }
+        0;
+    "#;
+    match rt.engine().eval(source, false).expect("setup parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+    let before = rt.engine().ctx().live_object_count();
+    let global = rt.engine().global_this();
+    let callback = rt
+        .engine()
+        .ctx()
+        .get_member(&global, "onDone")
+        .unwrap_or_else(|_| panic!("callback exists"));
+    let reclaimed = Rc::new(RefCell::new(0));
+    rt.engine().ctx().op_state().put(IdleCollectionProbe {
+        before,
+        reclaimed: reclaimed.clone(),
+    });
+    rt.spawn_blocking(
+        || {
+            std::thread::sleep(Duration::from_millis(2500));
+            Box::new(())
+        },
+        callback,
+        |ctx, _| {
+            let live = ctx.live_object_count();
+            let probe = ctx
+                .op_state()
+                .get::<IdleCollectionProbe>()
+                .expect("probe installed");
+            *probe.reclaimed.borrow_mut() = probe.before - live;
+            Ok(vec![Value::Num(40.)])
+        },
+    );
+    if worker_loop {
+        rt.run_worker_loop(&std::sync::atomic::AtomicBool::new(false));
+    } else {
+        rt.run_to_completion();
+    }
+    assert!(
+        *reclaimed.borrow() >= 12000,
+        "setup cycles remained rooted until completion"
+    );
+    assert_eq!(out.lines(), ["retained 42"]);
+}
+
+#[test]
+fn idle_main_loop_reclaims_before_silent_task_completion() {
+    idle_loop_reclaims_setup_cycles(false);
+}
+
+#[test]
+fn idle_worker_loop_reclaims_before_silent_task_completion() {
+    idle_loop_reclaims_setup_cycles(true);
+}
+
 #[test]
 fn console_streams_and_renders_common_values() {
     let (mut rt, out, err) = test_runtime();

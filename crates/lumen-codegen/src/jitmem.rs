@@ -49,6 +49,36 @@ pub fn alloc_pages(len: usize) -> *mut u8 {
     unsafe { sys::alloc_data(len) }
 }
 
+/// An owned zeroed read-write OS mapping, released on drop. Unlike executable code,
+/// it never changes permissions and can hold an engine's bounded scratch storage.
+pub struct DataMemory {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl DataMemory {
+    pub fn new(len: usize) -> Option<Self> {
+        let len = len.max(1);
+        let ptr = alloc_pages(len);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr, len })
+        }
+    }
+
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for DataMemory {
+    fn drop(&mut self) {
+        // Both OS mapping families release data/code with the same unmap operation.
+        unsafe { sys::free_exec(self.ptr, self.len) }
+    }
+}
+
 impl Drop for ExecMemory {
     fn drop(&mut self) {
         unsafe { sys::free_exec(self.ptr, self.len) }

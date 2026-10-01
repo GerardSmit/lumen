@@ -181,8 +181,9 @@ impl FnSource {
     }
 }
 
-/// A function body the parser skipped: the byte range of `{ ... }` in the shared file source,
-/// the line the `{` is on, and the parser context the body inherits. Parsed on first call (see
+/// A reloadable function body: a block or concise arrow expression range in the shared source,
+/// its starting line and inherited parser context. Function.expr_body selects the grammar.
+/// Parsed on first call when initially skipped (see
 /// [`Function::ensure_body`]) and kept afterwards, so a body the collector released can be
 /// parsed again (see [`Function::release_cold_body`]).
 #[derive(Clone)]

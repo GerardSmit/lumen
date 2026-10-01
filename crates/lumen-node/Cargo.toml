@@ -17,6 +17,8 @@ lumen-tls = { path = "../lumen-tls" }
 # direct dependency (lumen-host already links it).
 lumen = { path = "../lumen", features = ["macros"] }
 
+libsqlite3-sys = { version = "0.37", optional = true, features = ["bundled", "column_metadata"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -30,6 +32,8 @@ lumen = { path = "../lumen" }
 default = ["bun", "http2", "cluster", "dgram", "wasi"]
 # Bun APIs: `bun`, `bun:ffi` (the native-call trampolines), `bun:sqlite`, `bun:jsc`, Bun.hash, …
 bun = []
+# Pin a portable SQLite implementation rather than the device OS library.
+bundled-sqlite = ["dep:libsqlite3-sys"]
 http2 = []
 cluster = []
 dgram = []

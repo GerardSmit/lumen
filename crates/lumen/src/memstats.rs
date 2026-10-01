@@ -7,7 +7,8 @@
 //! - **address space**: a walk of the process's committed regions (Windows), split into
 //!   private heap/other, image (copy-on-write data), mapped, and the calling thread's stack
 //!   (reserved vs committed);
-//! - **allocator**: bytes the system heap holds (`HeapSummary` on Windows), and with the
+//! - **allocator**: system heap ownership (`HeapSummary` on Windows, optional `mallinfo2`
+//!   on GNU/Linux), and with the
 //!   `mem-stats` cargo feature exact live/peak counters kept by [`crate::fastalloc`] (the only
 //!   counters on a hot path, hence the feature);
 //! - **engine**: a walk of the realm by category (see `Engine::mem_report`).
@@ -277,6 +278,67 @@ pub fn process_memory() -> Option<ProcessMemory> {
     }
 }
 
+/// GNU allocator ownership counters. Arena totals include free blocks; mapped
+/// totals cover malloc's separate mappings. Neither is a resident-memory count.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod gnu_heap {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    // glibc's public mallinfo2 ABI: ten size_t fields, in this order.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct Info {
+        pub arena: usize,
+        ordblks: usize,
+        smblks: usize,
+        hblks: usize,
+        pub mapped: usize,
+        usmblks: usize,
+        fsmblks: usize,
+        pub allocated: usize,
+        pub free: usize,
+        keepcost: usize,
+    }
+
+    type Query = unsafe extern "C" fn() -> Info;
+
+    #[link(name = "dl")]
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    pub(super) fn query() -> Option<Info> {
+        static QUERY: OnceLock<Option<Query>> = OnceLock::new();
+        let query = QUERY.get_or_init(|| {
+            // RTLD_DEFAULT is null on GNU/Linux. mallinfo2 arrived in glibc 2.33;
+            // optional lookup keeps older glibc builds runnable without counters.
+            let address = unsafe { dlsym(std::ptr::null_mut(), c"mallinfo2".as_ptr()) };
+            if address.is_null() {
+                None
+            } else {
+                // POSIX dlsym permits conversion to the symbol's function type.
+                // Info mirrors the public ABI and the symbol takes no arguments.
+                Some(unsafe { std::mem::transmute::<*mut c_void, Query>(address) })
+            }
+        });
+        query.map(|query| unsafe { query() })
+    }
+}
+
+fn gnu_heap_report() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Some(info) = gnu_heap::query() {
+        eprintln!(
+            "[mem] GNU heap: arena {} allocated {} free {} mapped {}",
+            fmt_bytes(info.arena),
+            fmt_bytes(info.allocated),
+            fmt_bytes(info.free),
+            fmt_bytes(info.mapped),
+        );
+    }
+}
+
 /// `(allocated, committed)` bytes of every heap in the process (Windows `HeapSummary`): what the
 /// system allocator hands out to Rust, and what it keeps committed to do so.
 pub fn system_heap() -> Option<(usize, usize)> {
@@ -445,6 +507,7 @@ pub fn phase(label: &str) {
         ));
     }
     eprintln!("{line}");
+    gnu_heap_report();
 }
 
 /// The process-level part of the final report.
@@ -484,6 +547,7 @@ pub fn report_process() {
             .collect();
         eprintln!("[mem] largest private regions: {}", big.join(", "));
     }
+    gnu_heap_report();
     if let Some((alloc, commit)) = system_heap() {
         eprintln!(
             "[mem] system heaps: allocated {}, committed {} (overhead/fragmentation {})",
@@ -625,6 +689,13 @@ impl crate::interpreter::Interp {
             "[mem]   module records {}; stub cache {}",
             self.module_recs.len(),
             fmt_bytes(self.stub_cache.len() * std::mem::size_of_val(&self.stub_cache[0]))
+        );
+        let [retained, unevaluated, evaluating, completed, len, cap, source] =
+            self.module_program_memory();
+        eprintln!(
+            "[mem]   module programs retained={retained} unevaluated={unevaluated} evaluating={evaluating} completed_retained={completed}; stmts={len}/{cap} (slots {}); distinct captured source {}",
+            fmt_bytes(cap * std::mem::size_of::<crate::ast::Stmt>()),
+            fmt_bytes(source)
         );
     }
 }

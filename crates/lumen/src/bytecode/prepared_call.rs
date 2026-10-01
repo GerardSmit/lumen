@@ -158,7 +158,7 @@ pub(crate) fn call_once_direct(
             || chunk.arguments_slot.is_some()
             || chunk.rest_slot.is_some()
             || (chunk.reflect_args && reflect::enabled())
-            || !crate::bytecode::jit::direct_ready(chunk)
+            || !crate::bytecode::jit::direct_ready(i, chunk)
         {
             return Err(arg);
         }
@@ -248,7 +248,7 @@ fn call_compiled_prepared(
         return Err(e);
     }
     let chunk: &Chunk = &c.chunk;
-    if crate::bytecode::jit::direct_ready(chunk) {
+    if crate::bytecode::jit::direct_ready(i, chunk) {
         // SAFETY: `c` is a live compiled function (see `resolve`).
         let r = unsafe {
             crate::bytecode::jit::call_direct(i, chunk, &c.env, c.fn_ptr, c.strict, c.arrow, this, seed)

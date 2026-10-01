@@ -252,6 +252,39 @@ cargo build --release -p lumen-cli
 ./target/release/lumen-cli -e 'code'       # evaluate a string
 ```
 
+For memory-sanitizer diagnostics, building `lumen-cli` with `--features system-allocator`
+uses Rust's system allocator instead of the size-class cache. This lets AddressSanitizer
+observe individual frees and detect use-after-free inside Rust/host code; generated JIT
+instructions are not sanitizer-instrumented. The feature is off by default and does not
+change the normal runtime's allocator. With a nightly toolchain, an example build is:
+
+```sh
+RUSTFLAGS='-Zsanitizer=address -Cforce-frame-pointers=yes -Cdebuginfo=1' cargo +nightly build --profile fast --target aarch64-apple-darwin -p lumen-cli --features system-allocator
+```
+
+When building from Hashset, run this through its bounded Cargo wrapper and the shared target.
+The size-class allocator's `mem-stats` allocation counters are unavailable in this mode.
+
+With the normal allocator, `--features mem-stats` plus `LUMEN_MEM_STATS=1` prints a
+memory breakdown at normal exit. Add `LUMEN_MEM_GC=1` to report at GC checkpoints
+as well, useful when a constrained VM kills the process before exit. This diagnostic
+walks the realm and is off by default. Major object sweeps or substantial cold-function
+body retirement drain the allocator cache at most once per second per thread; macOS pressure relief
+and glibc `malloc_trim` return unused pages where available. Musl and Android do not link
+the glibc-only symbol.
+
+Completed module initialization ASTs are released after success or terminal failure.
+Live exports, their closures and environments, source positions, dependency ordering,
+top-level-await metadata and cached errors survive. A module parked at an await keeps
+its initialization body until settlement; imports never rerun a completed body.
+
+Direct JIT calls use an interpreter-owned shadow stack. Every active frame carries its
+owner's stack pointer; compiled code never embeds a coroutine pool thread's TLS address.
+This prevents independent worker engines from sharing call records when cached code runs
+on another thread. Storage is allocated lazily, bounded to 4 MiB per interpreter on 64-bit
+Unix and 1 MiB on Windows/32-bit targets, and released with its interpreter. Untouched OS
+pages consume no physical memory; a heap fallback keeps the same byte bound.
+
 The engine also ships a minimal standalone shell (the test262 host, no runtime/host APIs):
 
 ```sh
@@ -321,3 +354,79 @@ ARES-6 sources are not vendored here. The runner expects a checkout at `../ARES-
 The reported `summary:` is the ARES-6 geomean in milliseconds, so lower is better. A selected run reports a partial geomean over only the selected workloads, which is useful for local iteration but is not the official full-suite ARES-6 score. If a workload fails, or if the expected metric and completion lines are missing, `scripts/run-ares6.sh` exits nonzero instead of hiding the failure.
 
 Expect the full suite to take a long time on the current tree-walking engine; use selected workloads for quicker local checks.
+
+### Portable SQLite embedding
+
+`lumen-node`, `lumen-runtime` and `lumen-cli` expose the opt-in `bundled-sqlite` feature.
+It links libsqlite3-sys 0.37's SQLite 3.51.3 and resolves the existing opaque-handle API
+against static C entry points, including scalar callbacks, serialization and metadata.
+Explicit custom-library selection still selects the whole dynamic API table; without the
+feature the dependency-free system SQLite behavior is unchanged. Hashset enables the feature
+for its embedded runtime. Original OpenClaw WAL-reset version checks are preserved.
+
+The original Discord libopus-wasm codec now passes encode/decode in both main and real worker
+realms. Its binary exposed incorrect numeric section ordering and stale completed-if labels;
+WASM decoding now bounds section readers and checks DataCount, while branch/result stack
+underflow traps rather than panicking. This verifies the codec, not a live voice gateway.
+
+
+Disposed worker realms run an explicit cycle collection after their Runtime roots
+are dropped, before publishing the exit event. The collector uses an uninitialized
+interpreter without creating fresh builtin cycles and preserves external value
+handles. Completed-worker allocator caches are released too. A panic skips this
+collection. `collect_disposed_realms` is for a quiescent driver after realm disposal;
+do not call it during active JS evaluation or while borrowing heap objects.
+Focused core tests cover repeated closure/scope/prototype reclamation and external
+handles; Web, Node and embedded-worker lifecycle checks cover normal/failed exits,
+messaging, termination, top-level await and nested environment sharing.
+
+Parsed functions compact their immutable parameter vectors before sharing,
+releasing parser growth capacity without changing defaults, patterns, rest
+arguments or reflection. `LUMEN_MEM_STATS=1` also enables numeric ESM-loader
+retention checkpoints every 4,096 lookups, exposing counts/payload bytes rather
+than paths or source. These payload counts exclude allocator overhead.
+
+Main and worker event loops also collect on quiescent waits after substantial
+setup allocation. The worker loop retains its cooperative 50-ms stop poll, and
+the main loop includes the pending one-second collection deadline alongside
+ordinary timers. This lets the follow-up pass release cold function bodies even
+when no further message arrives; live closures and callbacks remain rooted.
+
+The coroutine pool keeps at most eight completed helpers warm for immediate
+reuse. After one second without a job, an unreserved offer is atomically removed
+and its helper exits, dropping native cache, TLS and stack ownership. Checkout
+and retirement share a mutex and exact allocation identity: a reserved helper
+keeps waiting even when dispatch follows its timeout. Driver TLS is restored
+before offering a helper. Active/suspended coroutines are not idle offers and
+remain unaffected; this bounds idle retention rather than live concurrency.
+
+Opt-in GC memory reports now include numeric module program state, retained
+top-level statement slots and distinct captured source bytes. These describe
+ModuleRec ownership, exclude nested AST allocations and never print module
+paths or source. Existing completed/deferred/TLA/error and namespace checks
+validate that adding the census leaves initialization and live bindings intact.
+
+Immediately called block functions and dynamic/CommonJS wrappers parsed in lazy
+mode retain their first validated body plus its original reload context. Cold
+collection can release that AST and rebuild it on demand, just like skipped
+bodies; explicit eager parsing remains eager. Captured scopes and source text
+stay live, so this bounds cold AST retention rather than total source storage.
+
+GNU/Linux opt-in memory checkpoints also report glibc arena allocation/free
+bytes and directly mapped allocation bytes through optional `mallinfo2` lookup.
+These measure allocator ownership, not RSS or source/AST totals. Older glibc
+without that symbol simply omits this report; ordinary builds gain no allocation
+headers or hot-path counters.
+
+Suspended coroutine handoffs also drain unused native allocation caches after a
+quiet second. They remain suspended with their activation and captured values
+intact; cache trimming does not retire an active coroutine or run JavaScript.
+Disconnected coroutines retain the existing permanent-park semantics but release
+their unused allocation cache first.
+
+Concise arrow expressions now retain reload metadata too. They keep their
+validated first AST and original expression range, then reparse with lexical
+context after cold collection. Their `expr_body` flag selects the expression
+grammar; no synthetic source is allocated. Snapshot version 6 rejects older
+format versions cleanly so callers can rebuild/reparse rather than interpret
+new expression ranges as blocks.

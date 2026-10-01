@@ -288,22 +288,33 @@ pub fn decode(data: &[u8]) -> Result<Rc<Module>, String> {
 
     let mut m = Module::default();
     let mut last_section = 0u8;
+    let mut data_count = None;
     while !r.eof() {
         let id = r.byte()?;
         let size = r.u32()? as usize;
-        let end = r.pos + size;
-        if end > r.data.len() {
-            return Err("wasm: section overruns input".into());
-        }
-        // Section ordering (custom sections, id 0, may appear anywhere and are ignored).
+        // A section decoder cannot consume bytes belonging to the next section.
+        let payload = r.bytes(size).map_err(|_| "wasm: section overruns input")?;
+        let mut r = Reader::new(payload);
+        // IDs are not ranks: bulk-memory DataCount precedes Code and Data.
+        // Custom sections can repeat anywhere; unsupported section kinds still fail.
         if id != 0 {
-            if id <= last_section {
+            let rank = match id {
+                1..=9 => id,
+                12 => 10,
+                10 => 11,
+                11 => 12,
+                other => return Err(format!("wasm: unknown section id {other}")),
+            };
+            if rank <= last_section {
                 return Err("wasm: sections out of order".into());
             }
-            last_section = id;
+            last_section = rank;
         }
         match id {
-            0 => {} // custom section — skip
+            0 => {
+                r.name()?;
+                r.pos = payload.len(); // named opaque custom payload
+            }
             1 => decode_types(&mut r, &mut m)?,
             2 => decode_imports(&mut r, &mut m)?,
             3 => decode_functions(&mut r, &mut m)?,
@@ -323,17 +334,22 @@ pub fn decode(data: &[u8]) -> Result<Rc<Module>, String> {
             9 => decode_elems(&mut r, &mut m)?,
             10 => decode_code(&mut r, &mut m)?,
             11 => decode_data(&mut r, &mut m)?,
-            12 => {
-                r.u32()?;
-            } // DataCount section — advisory, skip
+            12 => data_count = Some(r.u32()?),
             other => return Err(format!("wasm: unknown section id {other}")),
         }
-        if r.pos != end {
+        if r.pos != payload.len() {
             return Err(format!("wasm: section {id} size mismatch"));
         }
     }
+    if data_count.is_some_and(|count| count as usize != m.data.len()) {
+        return Err("wasm: data count does not match data segments".into());
+    }
     Ok(Rc::new(m))
 }
+
+#[cfg(test)]
+#[path = "parse_tests.rs"]
+mod tests;
 
 fn decode_types(r: &mut Reader, m: &mut Module) -> Result<(), String> {
     for _ in 0..r.u32()? {

@@ -184,6 +184,30 @@ pub struct Engine {
     interp: Interp,
 }
 
+/// Collect unreachable object/scope cycles after all realms on this driver have been
+/// disposed. Call only at a quiescent point, never during an active JS evaluation or
+/// while borrowing its objects. External value handles stay roots. This lets a worker
+/// reclaim dead cycles before its thread-local heap teardown would leak live chunks.
+pub fn collect_disposed_realms() {
+    let before = memstats::enabled().then(crate::value::live_objects);
+    let mut collector = Interp::uninitialized();
+    collector.gc_collect();
+    drop(collector);
+    if let Some(before) = before {
+        eprintln!(
+            "[disposed-realm] before={before} after={}",
+            crate::value::live_objects()
+        );
+    }
+    // A completed worker will not reuse these allocator caches. Release them now,
+    // including free glibc pages on GNU Linux, rather than retaining startup RSS.
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::fastalloc::trim();
+}
+
+#[cfg(test)]
+mod realm_cleanup_tests;
+
 impl Default for Engine {
     fn default() -> Self {
         Self::new()

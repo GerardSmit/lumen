@@ -940,6 +940,9 @@ pub struct Interp {
     /// `bytecode::jit::sync_frames`; read the whole stack through `jit::pending_frames` (or sync
     /// first). See `bytecode/jit/call.rs`.
     pub(crate) jit_frames: usize,
+    /// Lazy bounded shadow stack owned by this engine, shared only by its exclusive
+    /// coroutine handoffs. Compiled code loads it from its current frame.
+    pub(crate) jit_shadow: Option<Box<crate::bytecode::jit::Shadow>>,
     /// The innermost running native function's [`frames::NativeCtx`] (its address on the
     /// dispatcher's Rust stack; 0 = none), for the builtin frames of a stack trace.
     pub(crate) native_top: usize,
@@ -1329,7 +1332,9 @@ const WELL_KNOWN_SYMBOLS: &[&str] = &[
 ];
 
 impl Interp {
-    pub(crate) fn new() -> Interp {
+    // A collector for disposed realms must not create new builtin/prototype cycles.
+    // Keep the ordinary constructor on this shared field initialization path.
+    pub(crate) fn uninitialized() -> Interp {
         let object_proto = Object::new(None);
         let function_proto = Object::new(Some(object_proto.clone()));
         let array_proto = Object::new(Some(object_proto.clone()));
@@ -1350,7 +1355,7 @@ impl Interp {
         let symbol_proto = Object::new(Some(object_proto.clone()));
         let global = Object::new(Some(object_proto.clone()));
         let global_env = new_var_scope(None);
-        let mut interp = Interp {
+        Interp {
             global,
             global_env,
             object_proto,
@@ -1448,6 +1453,7 @@ impl Interp {
             super_call_ok: false,
             fn_frames: Vec::new(),
             jit_frames: 0,
+            jit_shadow: None,
             native_top: 0,
             cur_site: frames::NO_SITE,
             sources: Default::default(),
@@ -1471,7 +1477,11 @@ impl Interp {
             weak: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
-        };
+        }
+    }
+
+    pub(crate) fn new() -> Interp {
+        let mut interp = Self::uninitialized();
         crate::builtins::install(&mut interp);
         // `this` at the top level is the global object (sloppy mode).
         let g = Value::Obj(interp.global.clone());
@@ -5203,8 +5213,13 @@ impl Interp {
         // draining the allocator cache each time turned every later allocation into a system
         // heap call until the cache refilled.
         #[cfg(not(target_arch = "wasm32"))]
-        if garbage >= 50_000 && crate::value::gc_allocator_trim_due() {
+        if (garbage >= 50_000 || flushed >= 512) && crate::value::gc_allocator_trim_due() {
             crate::fastalloc::trim();
+        }
+        // An OOM-killed guest cannot print the normal-exit memory report. Opt-in
+        // checkpoints expose retained structures while the process is still alive.
+        if crate::memstats::enabled() && std::env::var_os("LUMEN_MEM_GC").is_some() {
+            self.mem_report();
         }
     }
 

@@ -26,6 +26,7 @@ lumen = { path = "../lumen", features = ["macros"] }
 [features]
 default = ["bun", "http2", "cluster", "dgram", "wasi"]
 bun = ["lumen-node/bun"]
+bundled-sqlite = ["lumen-node/bundled-sqlite"]
 http2 = ["lumen-node/http2"]
 cluster = ["lumen-node/cluster"]
 dgram = ["lumen-node/dgram"]

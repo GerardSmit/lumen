@@ -19,8 +19,11 @@ lumen-runtime = { path = "../lumen-runtime" }
 default = ["typed"]
 # `lumen typed` analysis modes (the engine's typed-tier checker); `--strip` works without it.
 typed = ["lumen/typed"]
+bundled-sqlite = ["lumen-runtime/bundled-sqlite"]
 # Exact allocator counters in the `LUMEN_MEM_STATS=1` report (costs a few atomics per allocation).
 mem-stats = ["lumen/mem-stats"]
+# Diagnostic builds: expose individual allocations/frees to memory sanitizers.
+system-allocator = []
 
 [lints]
 workspace = true

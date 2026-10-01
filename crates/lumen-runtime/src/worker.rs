@@ -337,6 +337,21 @@ struct WorkerSelf {
     inbox_task: Option<TaskId>,
 }
 
+// Declared before Runtime so every normal return drops the runtime and its host
+// roots before collecting. Publish exit only after its realm has been reclaimed.
+struct WorkerExit {
+    parent: Sender<ToMain>,
+    code: i32,
+}
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            lumen::collect_disposed_realms();
+        }
+        let _ = self.parent.send(ToMain::Exited(self.code));
+    }
+}
+
 /// The worker thread's whole lifecycle: build a realm, run the entry, then pump the loop until
 /// stopped (or, node mode, idle), bridging messages both ways.
 fn run_worker(
@@ -348,6 +363,10 @@ fn run_worker(
 ) {
     // An embedded parent's workers share its interrupt (the embedder ends them together);
     // otherwise `terminate()` interrupts this realm's JS directly.
+    let mut exit = WorkerExit {
+        parent: to_main_tx.clone(),
+        code: 1,
+    };
     let embedded = spec.embedding.is_some();
     let mut rt = Runtime::new_worker(spec.embedding.clone());
     if let Some(environment) = spec.shared_env.take() {
@@ -384,7 +403,6 @@ fn run_worker(
                 }
                 Err(_) => {
                     let _ = to_main_tx.send(ToMain::Error("worker init payload failed".into()));
-                    let _ = to_main_tx.send(ToMain::Exited(1));
                     return;
                 }
             }
@@ -395,7 +413,6 @@ fn run_worker(
     };
     if rt.engine().eval(boot, false).is_err() {
         let _ = to_main_tx.send(ToMain::Error("worker scope bootstrap failed".into()));
-        let _ = to_main_tx.send(ToMain::Exited(1));
         return;
     }
 
@@ -404,7 +421,9 @@ fn run_worker(
     // Node worker entries follow the same extension/package scope policy as imports.
     // Requiring a type:module .js entry would reject a legitimately suspended TLA graph.
     let is_module = spec.is_module
-        || (spec.is_node && !spec.is_eval && crate::esm::file_is_esm(std::path::Path::new(&spec.entry)));
+        || (spec.is_node
+            && !spec.is_eval
+            && crate::esm::file_is_esm(std::path::Path::new(&spec.entry)));
     let entry_result = if spec.is_eval {
         // `eval: true` — the entry IS the source, run as a classic script (global `require` in
         // scope, like Node's eval workers). Imports resolve against the cwd.
@@ -421,24 +440,20 @@ fn run_worker(
         rt.start_main(&spec.entry)
     } else {
         match std::fs::read_to_string(&spec.entry) {
-            Ok(source) => rt.eval_worker_entry(
-                &crate::import_source_text(source),
-                &spec.entry,
-                is_module,
-            ),
+            Ok(source) => {
+                rt.eval_worker_entry(&crate::import_source_text(source), &spec.entry, is_module)
+            }
             Err(e) => Err(format!("cannot load worker script {}: {e}", spec.entry)),
         }
     };
     if let Err(e) = entry_result {
         if kill.load(Ordering::SeqCst) {
             // Terminated while the entry ran: its unwinding error is the termination.
-            let _ = to_main_tx.send(ToMain::Exited(1));
             return;
         }
         let _ = to_main_tx.send(ToMain::Error(e));
         if spec.is_node {
             // Node: an entry that throws kills the worker ('error', then 'exit' with code 1).
-            let _ = to_main_tx.send(ToMain::Exited(1));
             return;
         }
     }
@@ -455,7 +470,7 @@ fn run_worker(
         .get::<WorkerSelf>()
         .and_then(|w| w.exit_code)
         .unwrap_or(if stop.load(Ordering::SeqCst) { 1 } else { 0 });
-    let _ = to_main_tx.send(ToMain::Exited(code));
+    exit.code = code;
 }
 
 struct WorkerInbox {

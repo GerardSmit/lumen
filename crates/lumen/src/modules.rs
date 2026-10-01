@@ -33,6 +33,10 @@ pub enum NsBinding {
 /// evaluation status. Keyed by canonical specifier in `Interp::module_recs`.
 pub(crate) struct ModuleRec {
     body: Rc<Vec<Stmt>>,
+    /// Evaluation metadata survives retirement of the one-shot initialization AST.
+    has_tla: bool,
+    retired_eager_named: Option<Vec<String>>,
+    retired_eager_order: Option<Vec<String>>,
     /// The source the body was parsed from, for its stack-trace frame (see `stack_trace`).
     src: Option<Rc<str>>,
     env: Env,
@@ -185,6 +189,9 @@ impl Interp {
             Some(r) => r,
             None => return Vec::new(),
         };
+        if let Some(eager) = &rec.retired_eager_named {
+            return eager.clone();
+        }
         let mut eager: Vec<String> = Vec::new();
         for stmt in rec.body.iter() {
             let (spec, defers) = match stmt {
@@ -326,6 +333,9 @@ impl Interp {
             key.to_string(),
             ModuleRec {
                 body: body.clone(),
+                has_tla: body_has_tla(&body),
+                retired_eager_named: None,
+                retired_eager_order: None,
                 src: module_src,
                 env: env.clone(),
                 ns,
@@ -949,7 +959,7 @@ impl Interp {
         if rec.evaluating || (rec.started && !rec.evaluated) {
             return false;
         }
-        if !rec.evaluated && body_has_tla(&rec.body) {
+        if !rec.evaluated && rec.has_tla {
             return false;
         }
         // Every requested module counts — deferred requests included (a deferred dep that is
@@ -1017,7 +1027,7 @@ impl Interp {
 
         let rec = self.module_recs.get_mut(key).unwrap();
         rec.evaluating = false;
-        match result {
+        let result = match result {
             Ok(_) => {
                 rec.evaluated = true;
                 Ok(())
@@ -1028,7 +1038,47 @@ impl Interp {
                 rec.evaluated = true;
                 Err(Abrupt::Throw(v))
             }
+        };
+        self.retire_module_body(key);
+        result
+    }
+
+    /// Exports retain their own function/class nodes and environment. Completed module
+    /// initialization statements cannot execute again, but graph metadata is still needed
+    /// by subsequent imports, including deferred imports through an evaluated module.
+    fn retire_module_body(&mut self, key: &str) {
+        let Some(rec) = self.module_recs.get(key) else { return };
+        if !rec.evaluated || rec.retired_eager_order.is_some() {
+            return;
         }
+        let named = self.eager_named_deps(key);
+        let order = self.eager_dep_order(key);
+        let rec = self.module_recs.get_mut(key).unwrap();
+        rec.retired_eager_named = Some(named);
+        rec.retired_eager_order = Some(order);
+        rec.body = Rc::new(Vec::new());
+    }
+
+    /// Numeric-only diagnostic descriptors; statement slots exclude nested AST storage.
+    pub(crate) fn module_program_memory(&self) -> [usize; 7] {
+        let mut result = [0; 7];
+        let mut sources = std::collections::HashSet::new();
+        for rec in self.module_recs.values() {
+            if !rec.body.is_empty() {
+                result[0] += 1;
+                result[1] += usize::from(!rec.evaluated);
+                result[2] += usize::from(rec.evaluating);
+                result[3] += usize::from(rec.evaluated);
+                result[4] += rec.body.len();
+                result[5] += rec.body.capacity();
+            }
+            if let Some(source) = &rec.src {
+                if sources.insert(Rc::as_ptr(source) as *const u8 as usize) {
+                    result[6] += source.len();
+                }
+            }
+        }
+        result
     }
 
     /// This module's dependencies in evaluation order: each dep at the position of its first
@@ -1038,6 +1088,9 @@ impl Interp {
             Some(r) => r,
             None => return Vec::new(),
         };
+        if let Some(order) = &rec.retired_eager_order {
+            return order.clone();
+        }
         let body = rec.body.clone();
         let resolved = rec.resolved.clone();
         let mut eager: Vec<String> = Vec::new();
@@ -1197,7 +1250,7 @@ impl Interp {
                 self.defer_async_deps(key, dep, stack, index);
             }
         }
-        let has_tla = body_has_tla(&self.module_recs[key].body);
+        let has_tla = self.module_recs[key].has_tla;
         if self.module_recs[key].pending_async > 0 || has_tla {
             self.module_async_seq += 1;
             self.module_recs.get_mut(key).unwrap().async_order = Some(self.module_async_seq);
@@ -1221,7 +1274,7 @@ impl Interp {
         let mut graph = Vec::new();
         self.collect_graph(dep, &mut graph);
         for m in graph {
-            if !body_has_tla(&self.module_recs[&m].body) {
+            if !self.module_recs[&m].has_tla {
                 continue;
             }
             if !self.module_recs[&m].evaluated && self.module_recs[&m].top_promise.is_none() {
@@ -1350,6 +1403,7 @@ impl Interp {
         match result {
             Ok(_) => {
                 self.module_recs.get_mut(key).unwrap().evaluated = true;
+                self.retire_module_body(key);
                 if let Some(t) = self.module_recs[key].top_promise.clone() {
                     self.resolve_promise(&t, Value::Undefined);
                 }
@@ -1397,7 +1451,7 @@ impl Interp {
                 out.push((order, parent.clone()));
                 // A synchronous ancestor completes as part of this cascade, so its own parents
                 // become available too (GatherAvailableAncestors' recursion).
-                if !body_has_tla(&self.module_recs[&parent].body) {
+                if !self.module_recs[&parent].has_tla {
                     self.gather_available_ancestors(&parent, out);
                 }
             }
@@ -1415,6 +1469,7 @@ impl Interp {
             rec.evaluated = true;
             rec.evaluating = false;
         }
+        self.retire_module_body(key);
         if let Some(t) = self.module_recs[key].top_promise.clone() {
             self.reject_promise(&t, err.clone());
         }
@@ -1437,7 +1492,7 @@ impl Interp {
         if rec.evaluated || rec.evaluating {
             return Ok(());
         }
-        if body_has_tla(&rec.body) {
+        if rec.has_tla {
             // The async module (and its own graph) evaluates through the batch machinery — the
             // deferring parent does NOT wait on it.
             let mut graph = Vec::new();
@@ -1624,6 +1679,7 @@ impl Interp {
                     rec.evaluated = true;
                     rec.evaluating = false;
                 }
+                self.retire_module_body(key);
                 // The module's own promise settles first (the coroutine driver resolves it when
                 // this returns), then ancestors execute in [[AsyncEvaluationOrder]].
                 self.async_module_fulfilled(key);
@@ -2015,6 +2071,149 @@ fn file_url(key: &str) -> String {
         format!("file://{path}")
     } else {
         format!("file:///{path}")
+    }
+}
+
+#[cfg(test)]
+mod body_retirement_tests {
+    use super::*;
+
+    fn number(interp: &mut Interp, namespace: &Value, name: &str) -> f64 {
+        match interp.get_member(namespace, name).ok().expect("export") {
+            Value::Num(value) => value,
+            _ => panic!("numeric export required"),
+        }
+    }
+
+    #[test]
+    fn completed_body_is_released_but_exports_and_closures_remain_live() {
+        let mut interp = Interp::new();
+        interp
+            .parse_and_register(
+                "counter",
+                Some("export let value = 3; export function inc() { return ++value; }".into()),
+            )
+            .ok()
+            .unwrap();
+        let body = Rc::downgrade(&interp.module_recs["counter"].body);
+        interp.link_module("counter").ok().unwrap();
+        interp.evaluate_module("counter").ok().unwrap();
+        assert!(
+            body.upgrade().is_none(),
+            "initialization AST is no longer needed"
+        );
+        let namespace = interp.module_recs["counter"].ns.clone();
+        let inc = interp.get_member(&namespace, "inc").ok().unwrap();
+        assert!(matches!(
+            interp.invoke(inc, Value::Undefined, &[]).ok(),
+            Some(Value::Num(4.0))
+        ));
+        assert_eq!(number(&mut interp, &namespace, "value"), 4.0);
+        interp.evaluate_module("counter").ok().unwrap();
+        assert_eq!(
+            number(&mut interp, &namespace, "value"),
+            4.0,
+            "imports do not repeat initialization"
+        );
+    }
+
+    #[test]
+    fn top_level_await_retires_only_after_settlement_and_keeps_tla_metadata() {
+        let mut interp = Interp::new();
+        let source = "export const value = await Promise.resolve(7); export function read() { return value; }";
+        interp
+            .parse_and_register("awaited", Some(source.into()))
+            .ok()
+            .unwrap();
+        let body = Rc::downgrade(&interp.module_recs["awaited"].body);
+        assert!(body.upgrade().is_some());
+        let namespace = interp.load_module("awaited", source).ok().unwrap();
+        assert!(interp.module_recs["awaited"].evaluated);
+        assert!(interp.module_recs["awaited"].has_tla);
+        assert!(body.upgrade().is_none());
+        assert_eq!(number(&mut interp, &namespace, "value"), 7.0);
+        let read = interp.get_member(&namespace, "read").ok().unwrap();
+        assert!(matches!(
+            interp.invoke(read, Value::Undefined, &[]).ok(),
+            Some(Value::Num(7.0))
+        ));
+        assert!(interp
+            .load_module("awaited", "throw new Error('must not run')")
+            .is_ok());
+    }
+
+    #[test]
+    fn terminal_error_is_cached_after_body_retirement() {
+        let mut interp = Interp::new();
+        interp
+            .parse_and_register(
+                "failed",
+                Some("throw new Error('original failure');".into()),
+            )
+            .ok()
+            .unwrap();
+        let body = Rc::downgrade(&interp.module_recs["failed"].body);
+        interp.link_module("failed").ok().unwrap();
+        assert!(interp.evaluate_module("failed").is_err());
+        assert!(body.upgrade().is_none());
+        let error = interp.module_recs["failed"].eval_error.clone().unwrap();
+        match interp.evaluate_module("failed") {
+            Err(Abrupt::Throw(second)) => assert!(interp.values_strict_equal(&error, &second)),
+            _ => panic!("must return the same cached error"),
+        }
+    }
+
+    #[test]
+    fn pending_await_keeps_its_body_until_the_exported_resolver_settles_it() {
+        let mut interp = Interp::new();
+        let source = "export let release; export const value = await new Promise(resolve => { release = resolve; });";
+        interp
+            .parse_and_register("pending", Some(source.into()))
+            .ok()
+            .unwrap();
+        let body = Rc::downgrade(&interp.module_recs["pending"].body);
+        let namespace = interp.load_module("pending", source).ok().unwrap();
+        assert!(!interp.module_recs["pending"].evaluated);
+        assert!(
+            body.upgrade().is_some(),
+            "a parked module still needs its statements"
+        );
+        let release = interp.get_member(&namespace, "release").ok().unwrap();
+        interp
+            .invoke(release, Value::Undefined, &[Value::Num(9.0)])
+            .ok()
+            .unwrap();
+        interp.run_agent_event_loop();
+        assert!(interp.module_recs["pending"].evaluated);
+        assert!(body.upgrade().is_none());
+        assert_eq!(number(&mut interp, &namespace, "value"), 9.0);
+    }
+
+    #[test]
+    fn mixed_eager_and_deferred_imports_keep_graph_and_live_reexports() {
+        let mut interp = Interp::new();
+        interp.module_loader = Some(Rc::new(|specifier, _, _| match specifier {
+            "dep" => Some((
+                "dep".into(),
+                "export let value = 3; export function inc() { return ++value; }".into(),
+            )),
+            _ => None,
+        }));
+        let namespace = interp.load_module("mixed", "import defer * as lazy from 'dep'; import { value, inc } from 'dep'; export { value, inc }; export function read() { return lazy.value; }").ok().unwrap();
+        assert!(interp.module_recs["mixed"].body.is_empty());
+        assert_eq!(interp.eager_named_deps("mixed"), vec!["dep"]);
+        assert_eq!(interp.eager_dep_order("mixed"), vec!["dep"]);
+        let mut graph = Vec::new();
+        interp.collect_eager_graph("mixed", &mut graph);
+        assert_eq!(graph, vec!["mixed", "dep"]);
+        let inc = interp.get_member(&namespace, "inc").ok().unwrap();
+        interp.invoke(inc, Value::Undefined, &[]).ok().unwrap();
+        assert_eq!(number(&mut interp, &namespace, "value"), 4.0);
+        let read = interp.get_member(&namespace, "read").ok().unwrap();
+        assert!(matches!(
+            interp.invoke(read, Value::Undefined, &[]).ok(),
+            Some(Value::Num(4.0))
+        ));
     }
 }
 

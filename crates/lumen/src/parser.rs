@@ -675,8 +675,12 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         pending_private: Vec::new(),
         ts: None,
     };
-    p.expect_punct("{")?;
-    let body = p.parse_block_body()?;
+    let body = if func.expr_body {
+        vec![Stmt::Return(Some(p.parse_assign()?))]
+    } else {
+        p.expect_punct("{")?;
+        p.parse_block_body()?
+    };
     if !p.at_eof() {
         return p.err("unexpected token after function body");
     }
@@ -933,10 +937,14 @@ pub(crate) fn fresh_template_site() -> u32 {
     })
 }
 
-/// Wrap a parsed function node. One whose body was skipped is registered with the collector,
-/// which releases the body again once it goes cold (see `Function::release_cold_body`); a
-/// function parsed eagerly has no source range to re-parse from and is never released.
-fn rc_fn(f: Function) -> Rc<Function> {
+/// Wrap a parsed function node. Bodies with reload metadata register with the collector,
+/// which releases their AST once cold (see `Function::release_cold_body`). Explicit eager
+/// mode provides no reload metadata and keeps its parsed bodies.
+fn rc_fn(mut f: Function) -> Rc<Function> {
+    // Parsing grows this vector geometrically. Once shared, its parameter list is
+    // immutable: avoid retaining four 112-byte slots for every one-parameter export
+    // in a large module graph.
+    f.params.shrink_to_fit();
     let f = Rc::new(f);
     if f.lazy.borrow().is_some() {
         crate::value::register_lazy_function(&f);
@@ -946,8 +954,10 @@ fn rc_fn(f: Function) -> Rc<Function> {
 
 /// A parsed function body, or one skipped for [`parse_lazy_body`]. A skipped body may carry the
 /// throwaway parse it was checked with, kept only until the function node is built.
+/// Immediately called and dynamic functions keep their first parse, but can reload it after GC.
 enum Body {
     Eager(Vec<Stmt>),
+    Reloadable(LazyBody, Vec<Stmt>),
     Lazy(LazyBody, Option<Vec<Stmt>>),
 }
 
@@ -956,7 +966,9 @@ impl Body {
     /// it when parsed.
     fn params_lexical_clash(&self, params: &[Param]) -> Option<String> {
         match self {
-            Body::Eager(b) | Body::Lazy(_, Some(b)) => params_body_lexical_clash(params, b),
+            Body::Eager(b) | Body::Reloadable(_, b) | Body::Lazy(_, Some(b)) => {
+                params_body_lexical_clash(params, b)
+            }
             Body::Lazy(_, None) => None,
         }
     }
@@ -970,6 +982,10 @@ impl Body {
             Body::Eager(b) => (
                 std::cell::RefCell::new(Some(Rc::new(b))),
                 std::cell::RefCell::new(None),
+            ),
+            Body::Reloadable(l, b) => (
+                std::cell::RefCell::new(Some(Rc::new(b))),
+                std::cell::RefCell::new(Some(Box::new(l))),
             ),
             Body::Lazy(l, _) => (
                 std::cell::RefCell::new(None),
@@ -4607,6 +4623,21 @@ impl Parser {
         Ok(params)
     }
 
+    fn lazy_context(&self, is_arrow: bool) -> LazyCtx {
+        LazyCtx {
+            strict: self.strict,
+            in_generator: self.in_generator,
+            in_async: self.in_async,
+            module: self.module,
+            allow_new_target: !is_arrow || self.nonarrow_fn_depth > 0 || self.allow_new_target,
+            super_prop_ok: self.super_prop_ok,
+            super_call_ok: self.super_call_ok,
+            in_derived_class: self.in_derived_class,
+            no_arguments_refs: self.no_arguments_refs,
+            in_field_init: self.in_field_init,
+        }
+    }
+
     /// Parse a `{ ... }` function body, or — when bodies are lazy — skip it: walk the tokens to
     /// the matching `}` (the lexer has already resolved strings, templates, regexes and comments,
     /// so a brace count is exact) and record the range with the context the body inherits, for
@@ -4633,6 +4664,8 @@ impl Parser {
         if inner_strict {
             self.strict = true;
         }
+        let ctx = self.lazy_context(is_arrow);
+        let private_scope = self.private_scope.clone();
         let mut skipped = None;
         if self.lazy && !(self.eager_outermost && self.fn_depth == 0) {
             if let Some(close) = self.matching_brace(open) {
@@ -4642,20 +4675,6 @@ impl Parser {
                         && matches!(next(close + 1), Some(Tok::Punct(")")))
                         && matches!(next(close + 2), Some(Tok::Punct("(" | "."))));
                 if !called_after {
-                    let ctx = LazyCtx {
-                        strict: self.strict,
-                        in_generator: self.in_generator,
-                        in_async: self.in_async,
-                        module: self.module,
-                        allow_new_target: !is_arrow
-                            || self.nonarrow_fn_depth > 0
-                            || self.allow_new_target,
-                        super_prop_ok: self.super_prop_ok,
-                        super_call_ok: self.super_call_ok,
-                        in_derived_class: self.in_derived_class,
-                        no_arguments_refs: self.no_arguments_refs,
-                        in_field_init: self.in_field_init,
-                    };
                     let (start, end) = self
                         .src
                         .byte_range(self.toks[open].start, self.toks[close].end)
@@ -4714,6 +4733,24 @@ impl Parser {
         if let Some(lazy) = skipped {
             self.defer_private_names(&body, lazy.line)?;
             return Ok((Body::Lazy(lazy, Some(body)), result_strict));
+        }
+        if saved_lazy {
+            let close = self.pos - 1;
+            let (start, end) = self
+                .src
+                .byte_range(self.toks[open].start, self.toks[close].end)
+                .expect("brace tokens lie inside the lexed source");
+            let lazy = LazyBody {
+                src: self.src.src.clone(),
+                start,
+                end,
+                line: self.toks[open].line,
+                html_comments: !self.module,
+                ctx,
+                private_scope,
+                aot: None,
+            };
+            return Ok((Body::Reloadable(lazy, body), result_strict));
         }
         Ok((Body::Eager(body), result_strict))
     }
@@ -4901,7 +4938,28 @@ impl Parser {
                 source: self.src_slice(start, self.prev_end()),
             }
         } else {
+            let expression_start = self.cur_start();
+            let expression_line = self.toks[self.pos].line;
+            let ctx = self.lazy_context(true);
+            let private_scope = self.private_scope.clone();
             let expr = self.parse_assign()?;
+            let lazy = if self.lazy {
+                let (start, end) = self.src
+                    .byte_range(expression_start, self.prev_end())
+                    .expect("expression tokens lie inside the lexed source");
+                Some(Box::new(LazyBody {
+                    src: self.src.src.clone(),
+                    start,
+                    end,
+                    line: expression_line,
+                    html_comments: !self.module,
+                    ctx,
+                    private_scope,
+                    aot: None,
+                }))
+            } else {
+                None
+            };
             Function {
                 scan: std::cell::Cell::new(0),
                 hoist: std::cell::RefCell::new(None),
@@ -4913,7 +4971,7 @@ impl Parser {
                 name: None,
                 params,
                 body: std::cell::RefCell::new(Some(Rc::new(vec![Stmt::Return(Some(expr))]))),
-                lazy: std::cell::RefCell::new(None),
+                lazy: std::cell::RefCell::new(lazy),
                 is_arrow: true,
                 is_strict: self.strict,
                 expr_body: true,
@@ -5846,5 +5904,199 @@ mod src_map_tests {
                 assert!(map.byte_range(0, want.len() as u32).is_none(), "n={n}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod parameter_storage_tests {
+    use super::*;
+
+    #[test]
+    fn loaded_function_graph_has_no_spare_parameter_slots() {
+        let source: String = (0..1024)
+            .map(|index| format!("function f{index}(value) {{ return value; }}\n"))
+            .collect();
+        for body in [
+            parse_script(&source, false).unwrap(),
+            parse_script_lazy(&source).unwrap(),
+        ] {
+            let (mut used, mut capacity) = (0, 0);
+            for statement in body {
+                let Stmt::FuncDecl(function) = statement else {
+                    panic!("expected function");
+                };
+                used += function.params.len();
+                capacity += function.params.capacity();
+            }
+            assert_eq!(used, 1024);
+            assert_eq!(
+                capacity, used,
+                "loaded functions must not retain parser growth capacity"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_parameters_keep_defaults_patterns_rest_and_reflection() {
+        let mut engine = crate::Engine::new();
+        let value = engine
+            .eval(
+                r#"
+            function ordinary({value}, multiplier = 3, ...rest) {
+                return value * multiplier + rest.length;
+            }
+            const arrow = ([value], ...rest) => value + rest.length;
+            const object = { method(value, increment = 1) { return value + increment; } };
+            ordinary({value: 7}, undefined, 1, 2) + arrow([4], 9) + object.method(2)
+                + ordinary.length + arrow.length + object.method.length;
+        "#,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(value, crate::Completion::Value(number) if number == "34"));
+    }
+}
+
+#[cfg(test)]
+mod reloadable_eager_body_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_wrapper_releases_and_reparses_its_initial_body() {
+        let source = "function anonymous({value}, multiplier = 3, ...rest) { return value * multiplier + rest.length; }";
+        let mut program = parse_script_inner(source, false, false, false, &[], true, true).unwrap();
+        let Stmt::FuncDecl(function) = program.remove(0) else {
+            panic!("function required")
+        };
+        let original = Rc::downgrade(function.body.borrow().as_ref().unwrap());
+        assert!(function.lazy.borrow().is_some());
+        assert!(function.release_body());
+        assert!(
+            original.upgrade().is_none(),
+            "cold AST must actually be freed"
+        );
+        function.ensure_body().unwrap();
+        assert!(!function.body.borrow().as_ref().unwrap().is_empty());
+        assert!(function.source().unwrap().contains("multiplier = 3"));
+        assert!(function.release_body());
+        function.ensure_body().unwrap();
+    }
+
+    #[test]
+    fn eager_mode_and_dynamic_creation_errors_are_preserved() {
+        let source = "function anonymous() { return 7; }";
+        let program = parse_script_inner(source, false, false, false, &[], false, true).unwrap();
+        let Stmt::FuncDecl(function) = &program[0] else {
+            panic!("function required")
+        };
+        assert!(function.lazy.borrow().is_none());
+        assert!(!function.release_body());
+        for source in [
+            "function anonymous() { const x; }",
+            "function anonymous(value = 1) { 'use strict'; return value; }",
+            "function anonymous(value) { let value; }",
+        ] {
+            assert!(parse_script_inner(source, false, false, false, &[], true, true).is_err());
+        }
+    }
+
+    #[test]
+    fn repeated_collection_keeps_dynamic_semantics_and_iife_captures() {
+        let mut engine = crate::Engine::new();
+        let value = engine
+            .eval(
+                r#"
+            const dynamic = new Function('{value}', 'multiplier = 3', '...rest',
+                'return value * multiplier + rest.length + arguments.length;');
+            const strict = new Function('"use strict"; return this === undefined;');
+            const capture = (function () { let value = 40; return () => ++value; })();
+            const gen = new (Object.getPrototypeOf(function*(){}).constructor)('yield 8;');
+            const template = new Function('tag', 'return tag`hello`;');
+            const tag = strings => strings;
+            const first = template(tag);
+            let total = 0;
+            for (let i = 0; i < 3; ++i) {
+                $262.gc(); $262.gc();
+                if (!strict() || template(tag) !== first || gen().next().value !== 8)
+                    throw new Error('reload changed execution context or template identity');
+                total += dynamic({value: 7}, undefined, 1, 2) + capture();
+            }
+            total + dynamic.length;
+        "#,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(value, crate::Completion::Value(number) if number == "208"));
+    }
+}
+
+#[cfg(test)]
+mod reloadable_expression_body_tests {
+    use super::*;
+
+    #[test]
+    fn concise_arrow_ast_is_released_and_reloaded_from_original_source() {
+        let source = "const arrow = value => ({text: 'é', value: value + 3});";
+        let program = parse_script_lazy(source).unwrap();
+        let Stmt::VarDecl { decls, .. } = &program[0] else {
+            panic!("declaration")
+        };
+        let Some(Expr::Func(function)) = &decls[0].1 else {
+            panic!("arrow")
+        };
+        let body = Rc::downgrade(function.body.borrow().as_ref().unwrap());
+        assert!(function.expr_body);
+        {
+            let guard = function.lazy.borrow();
+            let lazy = guard.as_ref().unwrap();
+            assert_eq!(
+                &lazy.src[lazy.start as usize..lazy.end as usize],
+                "({text: 'é', value: value + 3})"
+            );
+        }
+        assert!(function.release_body());
+        assert!(body.upgrade().is_none());
+        function.ensure_body().unwrap();
+        assert!(matches!(
+            &function.body.borrow().as_ref().unwrap()[0],
+            Stmt::Return(Some(_))
+        ));
+        assert_eq!(
+            function.source().unwrap().as_ref(),
+            "value => ({text: 'é', value: value + 3})"
+        );
+    }
+
+    #[test]
+    fn reloaded_arrows_keep_lexical_context_and_template_identity() {
+        let mut engine = crate::Engine::new();
+        let value = engine
+            .eval(
+                r#"
+            class Base { value() { return 4; } }
+            class Derived extends Base {
+                #value = 7;
+                reader = (increment = 2) => this.#value + super.value() + increment;
+            }
+            function Capture() { this.reader = () => new.target === Capture; }
+            function scope(value) { return increment => eval('value + increment + arguments[0]'); }
+            const object = new Derived();
+            const capture = new Capture();
+            const scoped = scope(4);
+            const tag = strings => strings;
+            const template = () => tag`é`;
+            const first = template();
+            let total = 0;
+            for (let index = 0; index < 3; ++index) {
+                $262.gc(); $262.gc();
+                if (!capture.reader() || template() !== first) throw new Error('lexical identity');
+                total += object.reader() + scoped(1);
+            }
+            total;
+        "#,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(value, crate::Completion::Value(value) if value == "66"));
     }
 }

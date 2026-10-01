@@ -35,7 +35,7 @@ const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// The split ahead-of-time form (see [`encode_split`]).
 const MAGIC_SPLIT: u32 = 0x4c53_4e32; // "LSN2"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-pub(crate) const VERSION: u32 = 5;
+pub(crate) const VERSION: u32 = 6;
 
 /// A call/`new` source position (stack traces): LEB128 of `pos + 1`, 0 = none (`NO_POS`).
 fn enc_pos(w: &mut Writer, pos: u32) {
@@ -2340,6 +2340,30 @@ mod tests {
     }
 
     #[test]
+    fn expression_arrow_reload_metadata_roundtrips_and_executes() {
+        assert_roundtrips("const arrow = value => ({text: 'é', value: value + 3});");
+        check_snapshot(r#"
+            const tag = strings => strings;
+            const template = () => tag`é`;
+            const first = template();
+            const read = (() => { let value = 40; return () => ++value; })();
+            assert(read() === 41);
+            $262.gc(); $262.gc();
+            assert(read() === 42 && template() === first);
+        "#);
+    }
+
+    #[test]
+    fn previous_snapshot_version_is_a_clean_decode_error() {
+        let source = "const arrow = value => value + 1;";
+        let mut blob = crate::compile_snapshot(source).unwrap();
+        // MAGIC is a five-byte unsigned LEB128 followed by the one-byte VERSION.
+        assert_eq!(blob[5], super::VERSION as u8);
+        blob[5] = (super::VERSION - 1) as u8;
+        assert!(decode(&blob, source).unwrap_err().contains("version"));
+    }
+
+    #[test]
     fn roundtrip_diverse_constructs() {
         for src in [
             "1; 'two'; true; null; undefined; 0xffn; 1.5e10;",
@@ -2400,8 +2424,8 @@ mod tests {
                         },
                         e => panic!("unexpected callee {e:?}"),
                     };
-                    assert!(f.parsed_body().is_some(), "an IIFE is encoded eagerly");
-                    assert!(f.lazy.borrow().is_none());
+                    assert!(f.parsed_body().is_none(), "an IIFE decodes with reload metadata");
+                    assert!(f.lazy.borrow().is_some());
                     assert_eq!(f.source.as_str(), Some("function iife() { return 3; }"));
                 }
                 _ => panic!("unexpected {s:?}"),

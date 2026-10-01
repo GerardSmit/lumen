@@ -20,7 +20,7 @@ mod typed;
 
 /// The engine's size-class allocator: JS workloads are dominated by millions of short-lived
 /// same-sized blocks (objects, scopes, strings), where the system allocator is slowest.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "system-allocator")))]
 #[global_allocator]
 static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;
 
