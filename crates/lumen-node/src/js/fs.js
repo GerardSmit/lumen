@@ -409,7 +409,26 @@ const shims = {
   "internal/readline/interface": { get Interface() { return __builtins.get("readline").Interface; } },
   "internal/blob": {
     createBlobFromFilePath(path, options) {
-      return new Blob([Buffer.from(bindingCall("open", () => fsb.readFile(P(path), 0), path))], options);
+      const p = P(path);
+      const signature = () => {
+        const st = bindingCall("stat", () => fsb.stat(p), path);
+        return { size: st[8], mtime: `${st[12]}.${st[13]}` };
+      };
+      const opened = signature();
+      const read = (from, to) => {
+        let now;
+        try {
+          now = signature();
+        } catch {
+          throw new DOMException("The blob could not be read", "NotReadableError");
+        }
+        if (now.size !== opened.size || now.mtime !== opened.mtime) {
+          throw new DOMException("The blob could not be read", "NotReadableError");
+        }
+        const bytes = new Uint8Array(fsb.readFile(p, 0));
+        return bytes.slice(from, to);
+      };
+      return Blob[Symbol.for("lumen.fileBlob")](opened.size, options?.type, read);
     },
   },
 };

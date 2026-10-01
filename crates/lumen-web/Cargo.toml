@@ -13,8 +13,16 @@ publish = false
 
 [dependencies]
 lumen-host = { path = "../lumen-host" }
-lumen-tls = { path = "../lumen-tls" }
 lumen-codegen = { path = "../lumen-codegen" }
+sha1 = "0.10"
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lumen-tls = { path = "../lumen-tls" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.127"
+js-sys = "0.3"
 
 # Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
 [build-dependencies]

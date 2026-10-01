@@ -22,14 +22,22 @@ pub use lumen::bytecode::Tier;
 pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
 pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 
-/// DEFLATE/zlib/gzip codec (std-only), shared by web CompressionStream and node:zlib.
-pub mod deflate;
+/// Compression codecs (zlib, Brotli, Zstandard) over maintained crates, shared by web
+/// CompressionStream, node:zlib and the Bun APIs.
+pub mod codec;
 
-/// Brotli (RFC 7932) codec (std-only), for node:zlib brotli* APIs.
-pub mod brotli;
+/// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
+/// `Date.now()`), where `std::time::Instant::now()` panics.
+pub mod sysfs;
+pub mod time;
 
-/// Zstandard (RFC 8878) codec (std-only), for node:zlib zstd* and Bun.zstd* APIs.
-pub mod zstd;
+/// The in-memory virtual file system behind `node:fs` on targets without an OS file system, and
+/// the mount table that lets a path be served by the embedder (OPFS, a remote origin).
+pub mod vfs;
+
+/// Browser-embedding hooks: the suspending synchronous host call (Worker + `Atomics.wait`, or
+/// JSPI) and the completion queue the embedder pushes settled Promises into.
+pub mod browser;
 
 /// One native op: a named native function with its JS arity.
 #[derive(Clone, Copy)]
@@ -108,7 +116,7 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
     }
     for ext in extensions {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Glue);
-        let t0 = timing.then(std::time::Instant::now);
+        let t0 = timing.then(crate::time::Instant::now);
         if let Some(init) = ext.state_init {
             init(engine.ctx().op_state());
         }
@@ -230,10 +238,12 @@ enum Task {
 pub struct ThreadPool {
     work_tx: Option<mpsc::Sender<Task>>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    completions: mpsc::Sender<TaskCompletion>,
 }
 
 /// Spawn a host thread with the engine's thread stack size: work run here may call back into an
 /// engine (or run one), whose recursion is sized for it.
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_thread<F: FnOnce() + Send + 'static>(f: F) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .stack_size(lumen::THREAD_STACK_SIZE)
@@ -247,8 +257,27 @@ fn spawn_thread<F: FnOnce() + Send + 'static>(f: F) -> std::thread::JoinHandle<(
 impl ThreadPool {
     /// `size` worker threads sending [`TaskCompletion`]s to `completions` (the loop thread
     /// holds the receiving end).
+    ///
+    /// On `wasm32` there are no threads: the pool has no workers and runs each job inline on the
+    /// calling (loop) thread, delivering its completion on the same channel.
     pub fn new(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = size;
+            return ThreadPool {
+                work_tx: None,
+                workers: Vec::new(),
+                completions,
+            };
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::with_workers(size, completions)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_workers(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
         let (work_tx, work_rx) = mpsc::channel::<Task>();
+        let pool_completions = completions.clone();
         // std's mpsc receiver is single-consumer: share it across workers behind a mutex.
         let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
         let workers = (0..size.max(1))
@@ -275,6 +304,7 @@ impl ThreadPool {
         ThreadPool {
             work_tx: Some(work_tx),
             workers,
+            completions: pool_completions,
         }
     }
 
@@ -285,21 +315,15 @@ impl ThreadPool {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        self.work_tx
-            .as_ref()
-            .expect("pool shut down")
-            .send(Task::Tracked {
-                id,
-                work: Box::new(work),
-            })
-            .expect("worker threads gone");
+        self.handle().spawn_blocking(id, work);
     }
 
     /// A cloneable spawn handle. The runtime puts one in [`OpState`], which is how a native fn
     /// (holding only `&mut Ctx`) reaches the pool.
     pub fn handle(&self) -> SpawnHandle {
         SpawnHandle {
-            work_tx: self.work_tx.clone().expect("pool shut down"),
+            work_tx: self.work_tx.clone(),
+            completions: self.completions.clone(),
         }
     }
 }
@@ -308,7 +332,9 @@ impl ThreadPool {
 /// blocking work from inside a native fn.
 #[derive(Clone)]
 pub struct SpawnHandle {
-    work_tx: mpsc::Sender<Task>,
+    /// `None` on a pool without workers (`wasm32`): jobs run inline.
+    work_tx: Option<mpsc::Sender<Task>>,
+    completions: mpsc::Sender<TaskCompletion>,
 }
 
 impl SpawnHandle {
@@ -317,20 +343,27 @@ impl SpawnHandle {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        self.work_tx
-            .send(Task::Tracked {
-                id,
-                work: Box::new(work),
-            })
-            .expect("worker threads gone");
+        match &self.work_tx {
+            Some(tx) => tx
+                .send(Task::Tracked {
+                    id,
+                    work: Box::new(work),
+                })
+                .expect("worker threads gone"),
+            None => {
+                let result = work();
+                let _ = self.completions.send(TaskCompletion { task: id, result });
+            }
+        }
     }
 
     /// Run `job` on a pool thread; it reports back by itself (e.g. through a
     /// [`lumen::embed::Completer`]), so no completion is sent for it.
     pub fn spawn_detached(&self, job: Box<dyn FnOnce() + Send>) {
-        self.work_tx
-            .send(Task::Detached(job))
-            .expect("worker threads gone");
+        match &self.work_tx {
+            Some(tx) => tx.send(Task::Detached(job)).expect("worker threads gone"),
+            None => job(),
+        }
     }
 }
 
@@ -356,10 +389,14 @@ impl CompletionSender {
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
         let tx = self.tx.clone();
-        spawn_thread(move || {
+        let run = move || {
             let result = work();
             let _ = tx.send(TaskCompletion { task: id, result });
-        });
+        };
+        #[cfg(target_arch = "wasm32")]
+        run();
+        #[cfg(not(target_arch = "wasm32"))]
+        spawn_thread(run);
     }
     /// Deliver a completion from any thread (an I/O callback, a readiness thread).
     pub fn send(&self, id: TaskId, result: Box<dyn Any + Send>) {
@@ -386,11 +423,14 @@ impl lumen::embed::AsyncHost for LoopAsyncHost {
     }
 
     fn spawn(&self, job: Box<dyn FnOnce() + Send>, dedicated: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
         if dedicated {
             spawn_thread(job);
-        } else {
-            self.spawn.spawn_detached(job);
+            return;
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = dedicated;
+        self.spawn.spawn_detached(job);
     }
 }
 
@@ -427,6 +467,9 @@ pub struct TaskEntry {
     /// An `unref`'d task still settles when it completes, but does not by itself keep the event
     /// loop alive (Node's `child.unref()` — e.g. esbuild's persistent service child).
     pub unref: bool,
+    /// A stream entry survives its completions (a WebSocket's events); it is removed with
+    /// [`TaskRegistry::cancel`].
+    pub persistent: bool,
 }
 
 impl TaskRegistry {
@@ -442,13 +485,39 @@ impl TaskRegistry {
                 decode,
                 context: Value::Undefined,
                 unref: false,
+                persistent: false,
             },
         );
         id
     }
-    /// Claim a completed task's settlement entry (a missing id means it was cancelled).
+    /// Reserve an id whose callback fires for every completion until [`cancel`](Self::cancel)led.
+    pub fn register_stream(&mut self, on_event: Value, decode: TaskDecoder) -> TaskId {
+        let id = self.register(on_event, None, decode);
+        if let Some(e) = self.map.get_mut(&id) {
+            e.persistent = true;
+        }
+        id
+    }
+    /// Claim a completed task's settlement entry (a missing id means it was cancelled). A
+    /// stream entry is copied, not removed.
     pub fn take(&mut self, id: TaskId) -> Option<TaskEntry> {
+        if let Some(e) = self.map.get(&id) {
+            if e.persistent {
+                return Some(TaskEntry {
+                    on_ok: e.on_ok.clone(),
+                    on_err: e.on_err.clone(),
+                    decode: e.decode,
+                    context: e.context.clone(),
+                    unref: e.unref,
+                    persistent: true,
+                });
+            }
+        }
         self.map.remove(&id)
+    }
+    /// Drop a pending task or stream; late completions for it are ignored.
+    pub fn cancel(&mut self, id: TaskId) {
+        self.map.remove(&id);
     }
     /// Mark a pending task as `unref`'d (see [`TaskEntry::unref`]).
     pub fn set_unref(&mut self, id: TaskId) {
@@ -588,8 +657,16 @@ pub fn write_std_fd(ctx: &mut Ctx, fd: u32, bytes: &[u8]) -> std::io::Result<()>
 /// `std::fs::canonicalize` as Node's `realpath` reports it. On Windows std returns verbatim paths
 /// (`\\?\C:\dir`, `\\?\UNC\server\share`), which Node never shows a program: they leak into
 /// `__filename`, `require.cache` keys and paths handed to Node APIs that reject them.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
     std::fs::canonicalize(path).map(strip_verbatim)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    vfs::realpath(&path.as_ref().to_string_lossy())
+        .map(std::path::PathBuf::from)
+        .map_err(std::io::Error::from)
 }
 
 /// Drop Windows' verbatim prefix: `\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`.
@@ -653,7 +730,11 @@ fn std_handles_not_inheritable() {
 /// Fill `buf` from the operating system's CSPRNG: `ProcessPrng` on Windows (what std itself
 /// uses), `/dev/urandom` elsewhere.
 pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
-    #[cfg(windows)]
+    #[cfg(target_arch = "wasm32")]
+    {
+        getrandom::getrandom(buf).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+    #[cfg(all(windows, not(target_arch = "wasm32")))]
     {
         #[link(name = "bcryptprimitives", kind = "raw-dylib")]
         extern "system" {
@@ -665,7 +746,7 @@ pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
     {
         use std::io::Read;
         static URANDOM: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();

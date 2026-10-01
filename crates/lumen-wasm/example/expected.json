@@ -1,0 +1,20 @@
+{
+  "buffer": "68c3a96c6c6f hi",
+  "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  "hmac": "104152c5bfdca07bc633eebd46199f0255c9f49d",
+  "random": 16,
+  "zlib": true,
+  "gzip": 3000,
+  "brotli": 3000,
+  "syncRead": "hello from the remote file tree",
+  "readdir": "hello.txt,sub",
+  "nested": "note",
+  "memfs": "in memory",
+  "async": "in memory",
+  "missing": "ENOENT",
+  "timer": true,
+  "generator": "123",
+  "asyncGenerator": "ab",
+  "fetch": "hello fetch",
+  "platform": "linux/wasm32"
+}

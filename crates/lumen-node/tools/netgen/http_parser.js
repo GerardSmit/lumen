@@ -469,7 +469,10 @@ class HTTPParser {
     const keepAlive = this._shouldKeepAlive();
     this._finish = FINISH_SAFE;
     const cb = this[kOnMessageComplete];
-    if (typeof cb === "function") cb.call(this);
+    if (typeof cb === "function") {
+      cb.call(this);
+      this._drainTicks();
+    }
     this._flags = 0;
     if (this._upgrade) return S_START;
     return keepAlive || (this._lenient & kLenientKeepAlive) !== 0 ? S_START : S_CLOSED;
@@ -478,7 +481,17 @@ class HTTPParser {
   _body(bytes, start, end) {
     if (end <= start) return;
     const cb = this[kOnBody];
-    if (typeof cb === "function") cb.call(this, Buffer.from(bytes.subarray(start, end)));
+    if (typeof cb === "function") {
+      cb.call(this, Buffer.from(bytes.subarray(start, end)));
+      this._drainTicks();
+    }
+  }
+
+  // Node's server parser consumes the socket handle and is driven from native code, so llhttp's
+  // body and message-complete callbacks are outermost callbacks that run the nextTick queue when
+  // they return. The client parser runs inside a JS data callback, which is not outermost.
+  _drainTicks() {
+    if (this._type === HTTP_REQUEST) process._tickCallback();
   }
 
   _run(bytes) {

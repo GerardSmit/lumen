@@ -1,15 +1,123 @@
-// node:domain — the legacy error-routing shim. Domains are deprecated in Node but the module still
-// ships; this is a minimal real implementation: run/bind/intercept execute callbacks with the
-// domain active and funnel synchronous throws to the domain's 'error' handler. lumen has no
-// async-context propagation, so a domain only spans the synchronous extent of run()/bind() calls.
+// node:domain — Node's legacy error-routing module over lumen's async context. Node tracks the
+// active domain with async_hooks; here the stack of entered domains lives in the engine's async
+// context frame itself, so every callback deferred from inside a domain (timers, nextTick,
+// immediates, promise reactions, emitters bound by `domain`) runs with that stack restored.
 
 const EventEmitter = __builtins.get("events");
+const { ERR_DOMAIN_CALLBACK_NOT_AVAILABLE, ERR_UNHANDLED_ERROR } = __errors;
 
-// The domain stack: the top of stack is the currently-active domain.
-const stack = [];
-// error -> the domain stack when it was thrown (see `_mark`).
-const thrownIn = new WeakMap();
-const domainModule = {};
+if (process.hasUncaughtExceptionCaptureCallback()) {
+  throw new ERR_DOMAIN_CALLBACK_NOT_AVAILABLE();
+}
+
+EventEmitter.usingDomains = true;
+EventEmitter[Symbol.for("lumen.domainRequireStack")] = new Error("require(`domain`) at this point").stack;
+
+const kStack = Symbol("domainStack");
+const kNoDomains = Object.freeze([]);
+const exports_ = {};
+// `process.domain` is null until a domain has been exited, then undefined (as Node leaves it).
+let emptyValue = null;
+
+function currentStack() {
+  const context = __asyncContextGet();
+  return (context !== undefined && context.get(kStack)) || kNoDomains;
+}
+function setStack(stack) {
+  const next = new Map(__asyncContextGet());
+  if (stack.length === 0) next.delete(kStack);
+  else next.set(kStack, Object.freeze(stack));
+  __asyncContextSet(next.size === 0 ? undefined : next);
+}
+function activeDomain() {
+  const stack = currentStack();
+  return stack.length === 0 ? emptyValue : stack[stack.length - 1];
+}
+
+Object.defineProperty(exports_, "_stack", {
+  get() { return [...currentStack()]; },
+  set(value) { setStack([...value]); },
+  enumerable: true, configurable: true,
+});
+Object.defineProperty(exports_, "active", {
+  get: activeDomain,
+  set(value) { emptyValue = value; },
+  enumerable: true, configurable: true,
+});
+Object.defineProperty(process, "domain", {
+  get: activeDomain,
+  set(value) { emptyValue = value; },
+  enumerable: true, configurable: true,
+});
+
+const eventInit = EventEmitter.init;
+EventEmitter.init = function init(opts) {
+  Object.defineProperty(this, "domain", {
+    __proto__: null, configurable: true, enumerable: false, value: null, writable: true,
+  });
+  const active = activeDomain();
+  if (active && !(this instanceof Domain)) {
+    this.domain = active;
+  }
+  return Reflect.apply(eventInit, this, [opts]);
+};
+
+const eventEmit = EventEmitter.prototype.emit;
+EventEmitter.prototype.emit = function emit(...args) {
+  const domain = this.domain;
+  const type = args[0];
+  const shouldEmitError = type === "error" && this.listenerCount(type) > 0;
+  if (shouldEmitError || domain === null || domain === undefined || this === process) {
+    return Reflect.apply(eventEmit, this, args);
+  }
+  if (type === "error") {
+    const er = args.length > 1 && args[1] ? args[1] : new ERR_UNHANDLED_ERROR();
+    if (typeof er === "object") {
+      er.domainEmitter = this;
+      Object.defineProperty(er, "domain", {
+        __proto__: null, configurable: true, enumerable: false, value: domain, writable: true,
+      });
+      er.domainThrown = false;
+    }
+    domain.emit("error", er);
+    return false;
+  }
+  domain.enter();
+  const ret = Reflect.apply(eventEmit, this, args);
+  domain.exit();
+  return ret;
+};
+
+function updateExceptionCapture() {}
+
+function domainUncaught(err) {
+  const thrown = __takeThrownContext(err);
+  if (thrown !== undefined) __asyncContextSet(thrown.context);
+  const stack = currentStack();
+  if (stack.length === 0) return false;
+  const domain = stack[stack.length - 1];
+  try {
+    return Boolean(domain._errorHandler(err));
+  } catch (thrown) {
+    process.stderr.write(`Uncaught ${thrown?.stack ?? String(thrown)}\n`);
+    process.exitCode = 7;
+    process.reallyExit(7);
+  }
+}
+
+const previousUncaught = globalThis.__lumen_domain_uncaught;
+Reflect.defineProperty(globalThis, "__lumen_domain_uncaught", {
+  value: (err) => {
+    if (domainUncaught(err)) return true;
+    return previousUncaught(err);
+  },
+  configurable: true, writable: true, enumerable: false,
+});
+
+function domainUncaughtExceptionClear() {
+  setStack([]);
+  emptyValue = null;
+}
 
 class Domain extends EventEmitter {
   constructor() {
@@ -18,152 +126,119 @@ class Domain extends EventEmitter {
   }
 
   enter() {
-    stack.push(this);
-    domainModule.active = this;
-    process.domain = this;
+    setStack([...currentStack(), this]);
   }
 
   exit() {
-    const idx = stack.lastIndexOf(this);
-    if (idx !== -1) stack.splice(idx, 1);
-    const top = stack[stack.length - 1];
-    domainModule.active = top;
-    process.domain = top ?? null;
+    const stack = currentStack();
+    const index = stack.lastIndexOf(this);
+    if (index === -1) return;
+    setStack(stack.slice(0, index));
+    emptyValue = undefined;
   }
 
-  // As in Node, a throw inside run()/bind() is not caught here: it unwinds like any exception
-  // (a surrounding try/catch sees it), and once it reaches the top as uncaught, the domain it
-  // was thrown in gets it as 'error' (`__lumen_fire_error` → `domainModule._handleUncaught`).
+  add(ee) {
+    if (ee.domain === this) return;
+    if (ee.domain) ee.domain.remove(ee);
+    if (this.domain && ee instanceof Domain) {
+      for (let d = this.domain; d; d = d.domain) {
+        if (ee === d) return;
+      }
+    }
+    Object.defineProperty(ee, "domain", {
+      __proto__: null, configurable: true, enumerable: false, value: this, writable: true,
+    });
+    this.members.push(ee);
+  }
+
+  remove(ee) {
+    ee.domain = null;
+    const index = this.members.indexOf(ee);
+    if (index !== -1) this.members.splice(index, 1);
+  }
+
   run(fn, ...args) {
     this.enter();
-    try {
-      return Reflect.apply(fn, this, args);
-    } catch (err) {
-      this._mark(err);
-      throw err;
-    } finally {
-      this.exit();
-    }
+    const ret = Reflect.apply(fn, this, args);
+    this.exit();
+    return ret;
   }
 
-  bind(fn) {
+  bind(cb) {
     const self = this;
-    return function bound(...args) {
+    function runBound(...args) {
       self.enter();
-      try {
-        return Reflect.apply(fn, this, args);
-      } catch (err) {
-        self._mark(err);
-        throw err;
-      } finally {
-        self.exit();
-      }
-    };
+      const ret = Reflect.apply(cb, this, args);
+      self.exit();
+      return ret;
+    }
+    Object.defineProperty(runBound, "domain", {
+      __proto__: null, configurable: true, enumerable: false, value: this, writable: true,
+    });
+    return runBound;
   }
 
-  // Wrap a Node-style callback: an error first-arg is routed to the domain, otherwise the callback
-  // runs bound to the domain.
-  intercept(fn) {
+  intercept(cb) {
     const self = this;
-    return function intercepted(err, ...args) {
-      if (err) return self._handle(err);
+    function runIntercepted(...fnargs) {
+      if (fnargs[0] && fnargs[0] instanceof Error) {
+        const er = fnargs[0];
+        er.domainBound = cb;
+        er.domainThrown = false;
+        Object.defineProperty(er, "domain", {
+          __proto__: null, configurable: true, enumerable: false, value: self, writable: true,
+        });
+        self.emit("error", er);
+        return undefined;
+      }
       self.enter();
-      try {
-        return Reflect.apply(fn, this, args);
-      } catch (e) {
-        self._handle(e);
-      } finally {
-        self.exit();
-      }
-    };
-  }
-
-  add(emitter) {
-    if (emitter.domain === this) return;
-    if (emitter.domain) emitter.domain.remove(emitter);
-    emitter.domain = this;
-    this.members.push(emitter);
-  }
-
-  remove(emitter) {
-    emitter.domain = null;
-    const idx = this.members.indexOf(emitter);
-    if (idx !== -1) this.members.splice(idx, 1);
-  }
-
-  // Tag an error with the innermost domain it was thrown in, and remember the domains that were
-  // active then (outermost first): a throw from that domain's 'error' handler goes to the next
-  // one out, as Node's domain stack does.
-  _mark(err) {
-    try {
-      if (err !== null && typeof err === "object" && !err.domainThrown) {
-        err.domain = this;
-        err.domainThrown = true;
-        thrownIn.set(err, stack.slice());
-      }
-    } catch {
-      /* frozen or exotic error: leave it */
+      const ret = Reflect.apply(cb, this, fnargs.slice(1));
+      self.exit();
+      return ret;
     }
+    return runIntercepted;
   }
 
-  _handle(err) {
-    try {
-      err.domain = this;
-      err.domainThrown = true;
-    } catch {
-      /* err may be a primitive; ignore */
+  _errorHandler(er) {
+    let caught = false;
+    if ((typeof er === "object" && er !== null) || typeof er === "function") {
+      Object.defineProperty(er, "domain", {
+        __proto__: null, configurable: true, enumerable: false, value: this, writable: true,
+      });
+      er.domainThrown = true;
     }
-    if (this.listenerCount("error") === 0) {
-      // No handler: re-throw so the error is not silently swallowed.
-      throw err;
-    }
-    this.emit("error", err);
-  }
-}
-
-function create() {
-  return new Domain();
-}
-
-domainModule.Domain = Domain;
-domainModule.create = create;
-domainModule.createDomain = create;
-domainModule.active = null;
-domainModule._stack = stack;
-// An uncaught error thrown inside a domain goes to that domain's 'error' listeners; true when
-// one took it.
-domainModule._handleUncaught = (err) => {
-  const domain = err !== null && typeof err === "object" && err.domainThrown ? err.domain : null;
-  if (!(domain instanceof Domain)) return false;
-  const chain = thrownIn.get(err) ?? [domain];
-  thrownIn.delete(err);
-  while (chain.length !== 0) {
-    const current = chain.pop();
-    if (current.listenerCount("error") === 0) return false;
-    try {
-      current.emit("error", err);
-      return true;
-    } catch (thrown) {
-      // The handler threw: the next domain out gets that error.
-      err = thrown;
-      try {
-        if (err !== null && typeof err === "object") {
-          err.domain = chain[chain.length - 1];
-          err.domainThrown = true;
+    // The handler must not run inside the domain it handles, nor re-enter itself.
+    while (activeDomain() === this) this.exit();
+    if (currentStack().length === 0) {
+      if (this.listenerCount("error") > 0) {
+        try {
+          caught = this.emit("error", er);
+        } finally {
+          updateExceptionCapture();
         }
-      } catch {
-        /* leave it */
+      }
+    } else {
+      try {
+        caught = this.emit("error", er);
+      } catch (er2) {
+        if (this === activeDomain()) this.exit();
+        if (currentStack().length) {
+          caught = process._fatalException(er2);
+        } else {
+          caught = false;
+        }
+        return caught;
       }
     }
+    domainUncaughtExceptionClear();
+    return caught;
   }
-  throw err;
-};
-// The runtime's uncaught-error path (lumen-runtime `__lumen_fire_error`) asks this first.
-Object.defineProperty(globalThis, "__lumen_domain_uncaught", {
-  value: domainModule._handleUncaught,
-  configurable: true,
-  writable: true,
-  enumerable: false,
-});
 
-__builtins.set("domain", domainModule);
+}
+
+exports_.Domain = Domain;
+exports_.create = exports_.createDomain = function create() {
+  return new Domain();
+};
+
+__builtins.set("domain", exports_);

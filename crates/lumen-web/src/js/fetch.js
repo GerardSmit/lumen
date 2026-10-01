@@ -77,7 +77,7 @@ const kSourceStream = Symbol("bodySourceStream");
 // one and none is already set. A ReadableStream is stored, not drained (see kSourceStream).
 function initBody(owner, body) {
   let contentType;
-  if (body instanceof ReadableStream) {
+  if (body instanceof globalThis.ReadableStream) {
     owner[kSourceStream] = body;
     owner._bodyBytes = undefined;
   } else if (body instanceof Blob) {
@@ -171,7 +171,7 @@ function toBodyBytes(body) {
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-  if (body instanceof ReadableStream) return drainStreamSync(body);
+  if (body instanceof globalThis.ReadableStream) return drainStreamSync(body);
   if (body instanceof URLSearchParams) return new TextEncoder().encode(body.toString());
   return new TextEncoder().encode(String(body));
 }
@@ -185,7 +185,7 @@ function drainStreamSync(stream) {
   const parts = [];
   let total = 0;
   for (;;) {
-    const r = reader._readSync();
+    const r = reader[Symbol.for("lumen.readSync")]();
     if (r.pending) {
       throw new TypeError("a body ReadableStream must produce its data synchronously in this runtime");
     }
@@ -213,7 +213,7 @@ function drainStreamSync(stream) {
 // single chunk (marking the body consumed, shared with `text()`/`json()`), or is empty when there
 // is no body.
 function makeBodyStream(owner) {
-  return new ReadableStream({
+  return new globalThis.ReadableStream({
     pull(controller) {
       if (owner[kConsumed]) {
         controller.error(new TypeError("body already consumed"));

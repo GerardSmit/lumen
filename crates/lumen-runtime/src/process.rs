@@ -4,7 +4,7 @@
 //! on in lumen-node.
 
 use std::io::{Read, Write};
-use std::time::Instant;
+use lumen_host::time::Instant;
 
 use lumen_host::{
     ops, CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId,
@@ -34,6 +34,7 @@ pub(crate) fn extension() -> Extension {
             (
                 "__proc",
                 ops![
+                    "tickCallback" (0) => op_tick_callback,
                     "writeStdout" (1) => op_write_stdout,
                     "writeStderr" (1) => op_write_stderr,
                     "readStdin" (2) => op_read_stdin,
@@ -56,6 +57,9 @@ pub(crate) fn extension() -> Extension {
                     "getgroups" (0) => op_getgroups,
                     "setgroups" (1) => op_setgroups,
                     "initgroups" (2) => op_initgroups,
+                    "uidOf" (1) => op_uid_of,
+                    "gidOf" (1) => op_gid_of,
+                    "userNameOf" (1) => op_user_name_of,
                     "metrics" (0) => op_metrics,
                     "isatty" (1) => op_isatty,
                     "ttySize" (1) => op_tty_size,
@@ -119,7 +123,11 @@ pub(crate) fn install_data_props(
 
     crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("startup environment exceeds realm limits"));
 
-    let platform = match std::env::consts::OS {
+    #[cfg(target_arch = "wasm32")]
+    let (os_name, arch_name) = ("linux", "wasm32");
+    #[cfg(not(target_arch = "wasm32"))]
+    let (os_name, arch_name) = (std::env::consts::OS, std::env::consts::ARCH);
+    let platform = match os_name {
         // Node's names for them; programs branch on `process.platform === "win32"`.
         "macos" => "darwin",
         "windows" => "win32",
@@ -127,9 +135,9 @@ pub(crate) fn install_data_props(
     };
     let _ = ctx.set_member(&process, "platform", Value::str(platform));
 
-    let _ = ctx.set_member(&process, "pid", Value::Num(std::process::id() as f64));
+    let _ = ctx.set_member(&process, "pid", Value::Num(lumen_host::sysfs::process_id() as f64));
     // Node's architecture names, not Rust's (native addons resolve their platform binary by these).
-    let arch = match std::env::consts::ARCH {
+    let arch = match arch_name {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         "x86" => "ia32",
@@ -434,7 +442,7 @@ fn current_rss_bytes() -> Option<u64> {
     let mut info = ffi::RUsageInfoV2::default();
     let result = unsafe {
         ffi::proc_pid_rusage(
-            std::process::id() as i32,
+            lumen_host::sysfs::process_id() as i32,
             2,
             (&mut info as *mut ffi::RUsageInfoV2).cast(),
         )
@@ -684,6 +692,32 @@ fn op_next_tick(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     Ok(Value::Undefined)
 }
 
+/// `process._tickCallback()` — run the nextTick queue and the promise microtasks to quiescence
+/// now, as Node does when a native-to-JS callback returns. A throwing tick unwinds to the
+/// caller; the rest of the queue waits for the next checkpoint.
+fn op_tick_callback(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    loop {
+        loop {
+            let next = ctx
+                .op_state()
+                .get_mut::<TickQueue>()
+                .and_then(|q| q.queue.pop_front());
+            let Some((callback, args)) = next else {
+                break;
+            };
+            ctx.invoke(callback, Value::Undefined, &args)?;
+        }
+        ctx.drain_microtasks_for_host();
+        let more = ctx
+            .op_state()
+            .get::<TickQueue>()
+            .is_some_and(|q| !q.queue.is_empty());
+        if !more {
+            return Ok(Value::Undefined);
+        }
+    }
+}
+
 /// `(dir)` — change the process working directory (`std::env::set_current_dir`). Cross-platform,
 /// no FFI. Throws with the OS error on failure (matching `process.chdir`).
 fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -693,7 +727,7 @@ fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     if let Some(realm) = ctx.host_mut::<RealmProcess>() {
         let target = realm.resolve(&dir);
         return match lumen_host::canonicalize(&target) {
-            Ok(path) if path.is_dir() => {
+            Ok(path) if lumen_host::sysfs::is_dir(&path) => {
                 realm.cwd = path;
                 Ok(Value::Undefined)
             }
@@ -733,7 +767,7 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
     // The realm's own pid is the host's, and 0 / negative pids reach the host's process group.
-    if pid <= 0 || pid as u32 == std::process::id() {
+    if pid <= 0 || pid as u32 == lumen_host::sysfs::process_id() {
         refuse_in_realm(ctx, "process.kill of the host process")?;
     }
     // SAFETY: kill(2) takes no pointers.
@@ -776,7 +810,7 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
 
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
-    if pid <= 0 || pid as u32 == std::process::id() {
+    if pid <= 0 || pid as u32 == lumen_host::sysfs::process_id() {
         refuse_in_realm(ctx, "process.kill of the host process")?;
     }
     if !matches!(sig, 0 | 2 | 3 | 9 | 15) {
@@ -791,7 +825,7 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
         _ => kill_error(ctx, "UNKNOWN", -4094),
     };
     // pid 0 means this process, as in libuv.
-    let pid = if pid == 0 { std::process::id() } else { pid as u32 };
+    let pid = if pid == 0 { lumen_host::sysfs::process_id() } else { pid as u32 };
     let access = PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE;
     // SAFETY: plain Win32 calls; the handle is closed on every path below.
     let handle = unsafe { OpenProcess(access, 0, pid) };
@@ -918,15 +952,67 @@ fn op_execve(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 #[cfg(unix)]
-fn identity_result(ctx: &mut Ctx, rc: i32, name: &str) -> Result<Value, Value> {
+fn identity_result(ctx: &mut Ctx, rc: i32, _name: &str) -> Result<Value, Value> {
     if rc == 0 {
-        Ok(Value::Undefined)
-    } else {
-        Err(ctx.make_error(
-            "Error",
-            format!("{name} failed: {}", std::io::Error::last_os_error()),
-        ))
+        return Ok(Value::Undefined);
     }
+    let os_err = std::io::Error::last_os_error();
+    let errno = os_err.raw_os_error().unwrap_or(0);
+    let code = match errno {
+        1 => "EPERM",
+        12 => "ENOMEM",
+        22 => "EINVAL",
+        _ => "EPERM",
+    };
+    let detail = os_err.to_string();
+    let detail = detail.split(" (os error").next().unwrap_or(&detail).to_string();
+    let err = ctx.make_error("Error", format!("{code}, {detail}"));
+    let _ = ctx.set_member(&err, "code", Value::str(code));
+    let _ = ctx.set_member(&err, "errno", Value::Num(-(errno as f64)));
+    let _ = ctx.set_member(&err, "syscall", Value::from_string(_name.to_string()));
+    Err(err)
+}
+#[cfg(unix)]
+fn op_uid_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?.to_string();
+    let Ok(name) = std::ffi::CString::new(name) else { return Ok(Value::Undefined) };
+    let entry = unsafe { ffi::getpwnam(name.as_ptr()) };
+    if entry.is_null() {
+        return Ok(Value::Undefined);
+    }
+    Ok(Value::Num(unsafe { (*entry).uid } as f64))
+}
+#[cfg(unix)]
+fn op_gid_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?.to_string();
+    let Ok(name) = std::ffi::CString::new(name) else { return Ok(Value::Undefined) };
+    let entry = unsafe { ffi::getgrnam(name.as_ptr()) };
+    if entry.is_null() {
+        return Ok(Value::Undefined);
+    }
+    Ok(Value::Num(unsafe { (*entry).gid } as f64))
+}
+#[cfg(unix)]
+fn op_user_name_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+    let uid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
+    let entry = unsafe { ffi::getpwuid(uid) };
+    if entry.is_null() {
+        return Ok(Value::Undefined);
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr((*entry).name) };
+    Ok(Value::from_string(name.to_string_lossy().into_owned()))
+}
+#[cfg(not(unix))]
+fn op_uid_of(_ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Undefined)
+}
+#[cfg(not(unix))]
+fn op_gid_of(_ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Undefined)
+}
+#[cfg(not(unix))]
+fn op_user_name_of(_ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Undefined)
 }
 #[cfg(unix)]
 fn op_setuid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
@@ -1139,7 +1225,25 @@ mod ffi {
         (result == 0).then_some(value)
     }
 
+    #[repr(C)]
+    pub struct Passwd {
+        pub name: *const c_char,
+        pub passwd: *const c_char,
+        pub uid: c_uint,
+        pub gid: c_uint,
+    }
+
+    #[repr(C)]
+    pub struct Group {
+        pub name: *const c_char,
+        pub passwd: *const c_char,
+        pub gid: c_uint,
+    }
+
     extern "C" {
+        pub fn getpwnam(name: *const c_char) -> *const Passwd;
+        pub fn getpwuid(uid: c_uint) -> *const Passwd;
+        pub fn getgrnam(name: *const c_char) -> *const Group;
         pub fn getrusage(who: c_int, usage: *mut RUsage) -> c_int;
         #[cfg(target_os = "macos")]
         pub fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut std::ffi::c_void) -> c_int;

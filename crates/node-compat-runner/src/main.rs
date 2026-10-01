@@ -462,9 +462,30 @@ fn parse_flags(source: &str) -> Vec<String> {
 fn forwarded_flag(flag: &str) -> bool {
     matches!(
         flag,
-        "--expose-gc" | "--expose_gc" | "--no-warnings" | "--pending-deprecation"
+        "--expose-gc"
+            | "--expose_gc"
+            | "--no-warnings"
+            | "--pending-deprecation"
+            | "--no-deprecation"
+            | "--preserve-symlinks"
+            | "--preserve-symlinks-main"
+            | "--permission"
+            | "--allow-child-process"
+            | "--allow-worker"
+            | "--allow-addons"
+            | "--allow-wasi"
+            | "--insecure-http-parser"
+            | "--test-udp-no-try-send"
+            | "--network-family-autoselection"
+            | "--no-network-family-autoselection"
+            | "--enable-network-family-autoselection"
     ) || flag.starts_with("--experimental-")
+        || flag.starts_with("--dns-result-order")
+        || flag.starts_with("--max-http-header-size")
+        || flag.starts_with("--network-family-autoselection-attempt-timeout")
         || flag.starts_with("--no-experimental-")
+        || flag.starts_with("--allow-fs-")
+        || flag.starts_with("--env-file")
 }
 
 /// The module a test belongs to, for the per-module score: `test-buffer-alloc.js` -> `buffer`.

@@ -1461,7 +1461,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             // not the element cap that guards Value-per-element arrays. `Buffer.alloc(2 MiB)`
             // is ordinary Node.
             if len.saturating_mul(es) > MAX_BUFFER_BYTES {
-                return Err(i.make_error("RangeError", "Invalid typed array length"));
+                return Err(i.make_error("RangeError", format!("Invalid typed array length: {len}")));
             }
             let (bv, bp) = make_array_buffer(i, len * es);
             (bv, bp, 0, len, false)

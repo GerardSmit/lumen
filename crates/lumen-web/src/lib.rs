@@ -26,23 +26,38 @@
 //! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
 //!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
 
-use std::time::Instant;
+use lumen_host::time::Instant;
 
-use lumen_host::{ops, Ctx, Extension, OpState, SpawnHandle, Value};
+#[cfg(not(target_arch = "wasm32"))]
+use lumen_host::SpawnHandle;
+use lumen_host::{ops, Ctx, Extension, OpState, Value};
 
+#[cfg(not(target_arch = "wasm32"))]
 mod http;
+#[cfg(not(target_arch = "wasm32"))]
 mod server;
-mod sha1;
-mod sha256;
+#[cfg(not(target_arch = "wasm32"))]
 mod sse;
 mod url;
+#[cfg(not(target_arch = "wasm32"))]
 mod websocket;
+
+#[cfg(target_arch = "wasm32")]
+mod browser;
+#[cfg(target_arch = "wasm32")]
+use browser as server;
+#[cfg(target_arch = "wasm32")]
+use browser as sse;
+#[cfg(target_arch = "wasm32")]
+use browser as websocket;
 
 /// WebSocket protocol internals — a from-scratch RFC 6455 codec. `websocket::testing` exposes a
 /// minimal echo server other crates' tests and benchmarks drive the client against.
+#[cfg(not(target_arch = "wasm32"))]
 pub use websocket::testing as ws_testing;
 
 /// SSE transport internals — `sse::testing` exposes a canned event-stream server for tests.
+#[cfg(not(target_arch = "wasm32"))]
 pub use sse::testing as sse_testing;
 // The decoder parses the whole binary format; the MVP interpreter doesn't consume every field yet
 // (reserved value-type data, mutability flags, etc.), and a few opcode matches read cleaner as
@@ -77,7 +92,7 @@ pub fn extension() -> Extension {
                     "format" (5) => op_url_format,
                 ],
             ),
-            ("__http", ops!["request" (6) => op_http_request]),
+            ("__http", ops!["request" (6) => http_request]),
             (
                 "__http_server",
                 ops![
@@ -92,7 +107,7 @@ pub fn extension() -> Extension {
                 ops![
                     "fill" (1) => op_random_fill,
                     "uuid" (0) => op_uuid,
-                    "sha256" (1) => op_sha256,
+                    "digest" (2) => op_digest,
                 ],
             ),
             (
@@ -177,10 +192,7 @@ impl WebState {
     fn clock_start(&mut self) -> Instant {
         if self.start.is_none() {
             self.start = Some(Instant::now());
-            self.time_origin_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64() * 1000.0)
-                .unwrap_or(0.0);
+            self.time_origin_ms = lumen_host::time::unix_ms();
         }
         self.start.unwrap()
     }
@@ -214,16 +226,36 @@ fn op_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         return Err(ctx.make_error("TypeError", "TextDecoder.decode expects a BufferSource"));
     };
     let fatal = matches!(args.get(1), Some(Value::Bool(true)));
-    if fatal {
+    let text = if fatal {
         match String::from_utf8(bytes) {
-            Ok(s) => Ok(Value::from_string(s)),
-            Err(_) => Err(ctx.make_error("TypeError", "TextDecoder: invalid utf-8 (fatal)")),
+            Ok(s) => s,
+            Err(_) => return Err(ctx.make_error("TypeError", "TextDecoder: invalid utf-8 (fatal)")),
         }
     } else {
-        Ok(Value::from_string(
-            String::from_utf8_lossy(&bytes).into_owned(),
-        ))
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(Value::from_string(smuggle_high_scalars(text)))
+}
+
+/// Characters at or above U+10F800 collide with the lone-surrogate encoding, so lumen strings hold
+/// them as their smuggled surrogate pairs.
+fn smuggle_high_scalars(s: String) -> String {
+    const BASE: u32 = 0x10F800;
+    if !s.chars().any(|c| c as u32 >= BASE) {
+        return s;
     }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        let v = c as u32;
+        if v >= BASE {
+            let w = v - 0x10000;
+            out.extend(char::from_u32(BASE + (w >> 10)));
+            out.extend(char::from_u32(BASE + 0x400 + (w & 0x3FF)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ---- url ----
@@ -337,6 +369,7 @@ fn op_url_format(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 
 /// `n` cryptographically-random bytes (the WebSocket handshake key needs these, same source as
 /// `crypto.getRandomValues`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn web_random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
     random_bytes(ctx, n)
 }
@@ -375,12 +408,20 @@ fn op_uuid(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value>
     )))
 }
 
-fn op_sha256(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
+fn op_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use sha2::Digest;
+    let name = str_arg(ctx, args, 0)?.unwrap_or_default();
+    let v = args.get(1).unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "digest expects a BufferSource"));
     };
-    let digest = sha256::sha256(&bytes);
+    let digest = match name.as_str() {
+        "SHA-1" => sha1::Sha1::digest(&bytes).to_vec(),
+        "SHA-256" => sha2::Sha256::digest(&bytes).to_vec(),
+        "SHA-384" => sha2::Sha384::digest(&bytes).to_vec(),
+        "SHA-512" => sha2::Sha512::digest(&bytes).to_vec(),
+        _ => return Err(ctx.make_error("TypeError", format!("unsupported digest {name}"))),
+    };
     ctx.make_uint8array(&digest)
 }
 
@@ -410,28 +451,34 @@ fn decompress_op(
 }
 
 fn op_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::deflate::zlib_compress)
+    compress_op(ctx, a, lumen_host::codec::zlib_compress)
 }
 fn op_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::deflate::zlib_decompress)
+    decompress_op(ctx, a, lumen_host::codec::zlib_decompress)
 }
 fn op_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::deflate::deflate)
+    compress_op(ctx, a, lumen_host::codec::deflate)
 }
 fn op_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::deflate::inflate)
+    decompress_op(ctx, a, lumen_host::codec::inflate)
 }
 fn op_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::deflate::gzip_compress)
+    compress_op(ctx, a, lumen_host::codec::gzip_compress)
 }
 fn op_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::deflate::gzip_decompress)
+    decompress_op(ctx, a, lumen_host::codec::gzip_decompress)
 }
 
 // ---- fetch ----
 
+#[cfg(target_arch = "wasm32")]
+use browser::op_http_request as http_request;
+#[cfg(not(target_arch = "wasm32"))]
+use op_http_request as http_request;
+
 /// `(method, url, headerPairs, bodyOrUndefined, resolve, reject)`: one HTTP request on the
 /// threadpool, settled through the TaskRegistry like every async op.
+#[cfg(not(target_arch = "wasm32"))]
 fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let method = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
@@ -492,6 +539,7 @@ pub(crate) fn read_header_pairs(ctx: &mut Ctx, v: &Value) -> Result<Vec<(String,
 }
 
 /// Build the raw-response object the JS glue wraps into a `Response`.
+#[cfg(not(target_arch = "wasm32"))]
 fn decode_http(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
     let result = *payload
         .downcast::<Result<http::HttpResponse, String>>()

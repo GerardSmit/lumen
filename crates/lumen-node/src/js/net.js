@@ -61,6 +61,31 @@ function builtinModule(id) {
 const { Buffer } = __builtins.get("buffer");
 const { codes } = { codes: __errors };
 
+// The dgram error codes lib/dgram.js raises that the shared error table does not carry.
+if (!codes.ERR_SOCKET_BAD_TYPE) {
+  const plain = (key, message, Base) => {
+    codes[key] = { [key]: function () { return __nodeError(Base, key, message); } }[key];
+  };
+  plain("ERR_SOCKET_BAD_TYPE", "Bad socket type specified. Valid types are: udp4, udp6", TypeError);
+  plain("ERR_SOCKET_ALREADY_BOUND", "Socket is already bound", Error);
+  plain("ERR_SOCKET_BAD_BUFFER_SIZE", "Buffer size must be a positive integer", TypeError);
+  // A SystemError: the libuv failure it wraps rides along as `info`, with `errno` and `syscall`
+  // mirroring it.
+  codes.ERR_SOCKET_BUFFER_SIZE = function ERR_SOCKET_BUFFER_SIZE(context) {
+    const key = "ERR_SOCKET_BUFFER_SIZE";
+    const message = `Could not get or set buffer size: ${context.syscall} returned ${context.code} (${context.message})`;
+    const err = __nodeError(Error, key, message);
+    Object.defineProperties(err, {
+      name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
+      info: { value: context, enumerable: true, configurable: true, writable: false },
+      errno: { get() { return context.errno; }, set(value) { context.errno = value; }, enumerable: true, configurable: true },
+      syscall: { get() { return context.syscall; }, set(value) { context.syscall = value; }, enumerable: true, configurable: true },
+    });
+    if (typeof err.stack === "string") err.stack = err.stack.replace(/^Error \[/, "SystemError [");
+    return err;
+  };
+}
+
 // ---- internal/errors --------------------------------------------------------------------------
 
 const uvUnmappedError = ["UNKNOWN", "unknown error"];
@@ -186,6 +211,7 @@ const internalUtil = {
   assertCrypto() {},
   deprecate: (fn, msg, code) => __builtins.get("util").deprecate(fn, msg, code),
   get promisify() { return __builtins.get("util").promisify; },
+  get customPromisifyArgs() { return __internals.get("customPromisifyArgs"); },
   spliceOne(list, index) {
     for (; index + 1 < list.length; index++) list[index] = list[index + 1];
     list.pop();
@@ -262,6 +288,11 @@ const optionDefaults = {
   "--pending-deprecation": false,
 };
 function getOptionValue(name) {
+  const parsed = process[Symbol.for("lumen.options")];
+  if (parsed !== undefined && Object.hasOwn(parsed, name)) {
+    const value = parsed[name];
+    return name === "--max-http-header-size" ? Number(value) : value;
+  }
   if (name === "--insecure-http-parser" || name === "--pending-deprecation") {
     const argv = process.execArgv || [];
     const env = process.env?.NODE_OPTIONS || "";
@@ -300,6 +331,9 @@ const shims = {
     return Buffer.from(arrayBuffer, byteOffset, length);
   } },
   "internal/worker/js_transferable": { JSTransferable, kClone, kDeserialize },
+  "internal/v8/startup_snapshot": {
+    namespace: { addSerializeCallback() {}, addDeserializeCallback() {}, isBuildingSnapshot: () => false },
+  },
 };
 for (const id of Object.keys(shims)) moduleCache.set(id, { exports: shims[id] });
 
@@ -315,6 +349,7 @@ const UV_ENOTSUP = uvBinding.UV_ENOTSUP;
 
 // A native op error (`{ code: 'ECONNREFUSED', ... }`) as the libuv errno the handles report.
 function errnoOf(error) {
+  if (error && typeof error.errno === "number" && error.errno < 0 && __uvErrmap().has(error.errno)) return error.errno;
   const code = error && error.code;
   if (typeof code === "string") {
     const errno = __uvCodes().get(code);
@@ -466,15 +501,18 @@ class StreamHandle {
 
   // Writes go out one at a time, in order (the native write runs on a worker thread).
   writeBuffer(req, data) {
+    if (!ArrayBuffer.isView(data)) {
+      const err = new TypeError("Second argument must be a buffer");
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
     if (this._closed || this._id === null) return UV_EBADF;
     let bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     streamBaseState[kBytesWritten] = bytes.length;
     // LibuvStreamWrap::DoTryWrite: with nothing queued, whatever the kernel takes right now is
     // written synchronously (the write then completes without a callback, req.async false).
-    if (!this._writing && this._writeQueue.length === 0) {
-      // An empty write is complete at once, as in libuv; queueing it made every later write
-      // wait behind a thread-pool round trip.
-      const n = bytes.length === 0 ? 0 : __net.tryWrite(this._id, bytes);
+    if (!this._writing && this._writeQueue.length === 0 && bytes.length !== 0) {
+      const n = __net.tryWrite(this._id, bytes);
       if (n === bytes.length) {
         this.bytesWritten += n;
         streamBaseState[kLastWriteWasAsync] = 0;
@@ -679,12 +717,16 @@ class TCP extends StreamHandle {
     this._bindAddress = address;
     this._bindPort = port | 0;
     this._bindFlags = 0;
+    this._connectBindAddress = address;
+    this._connectBindPort = port | 0;
     return 0;
   }
   bind6(address, port, flags) {
     this._bindAddress = address;
     this._bindPort = port | 0;
     this._bindFlags = flags | 0;
+    this._connectBindAddress = address;
+    this._connectBindPort = port | 0;
     return 0;
   }
   // The listener binds here (std binds and listens in one step, so EADDRINUSE surfaces from
@@ -696,7 +738,7 @@ class TCP extends StreamHandle {
     const address = this._bindAddress ?? "0.0.0.0";
     let info;
     try {
-      info = __net.listen(address, this._bindPort, backlog | 0);
+      info = __net.listen(address, this._bindPort, backlog | 0, this._bindFlags | 0);
     } catch (error) {
       return errnoOf(error);
     }
@@ -715,7 +757,7 @@ class TCP extends StreamHandle {
     return 0;
   }
   connect(req, address, port) {
-    return this._connectWith(req, (ok, fail) => __net.connect(address, port, ok, fail));
+    return this._connectWith(req, (ok, fail) => __net.connect(address, port, this._connectBindAddress ?? "", this._connectBindPort | 0, ok, fail));
   }
   connect6(req, address, port) {
     return this.connect(req, address, port);
@@ -755,6 +797,11 @@ class Pipe extends StreamHandle {
     });
   }
   setPendingInstances() {}
+  getsockname(out) {
+    if (this._path === null) return UV_EINVAL;
+    out.address = this._path;
+    return 0;
+  }
 }
 
 class TCPConnectWrap {}
@@ -887,6 +934,214 @@ class BlockListHandle {
 
 const blockListBinding = { SocketAddress: SocketAddressHandle, BlockList: BlockListHandle, AF_INET, AF_INET6 };
 
+// ---- internalBinding('udp_wrap') ---------------------------------------------------------------
+
+// libuv's uv_udp_t over the `__udp` ops (net.rs). The native ops throw errno-tagged errors; the
+// handle reports them the way libuv does, as negative return codes.
+const UDPConstants = { UV_UDP_IPV6ONLY: 1, UV_UDP_REUSEADDR: 4 };
+class SendWrap {}
+class UDP {
+  constructor() {
+    this._id = null;
+    this._kind6 = false;
+    this._closed = false;
+    this._reading = false;
+    this._readInFlight = false;
+    this._held = [];
+    this._refed = true;
+    this._asyncId = newAsyncId();
+    this._queuedBytes = 0;
+    this._queuedCount = 0;
+    this.onmessage = null;
+    this.lookup = null;
+  }
+  getAsyncId() { return this._asyncId; }
+  getProviderType() { return 0; }
+  get fd() { return this._id === null ? -1 : 1000 + this._id; }
+
+  _guard(op) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    try {
+      op();
+      return 0;
+    } catch (error) {
+      return errnoOf(error);
+    }
+  }
+
+  _bind(kind6, address, port, flags) {
+    if (this._closed) return UV_EBADF;
+    if (this._id !== null) return UV_EINVAL;
+    try {
+      const info = __udp.bind(kind6 ? "udp6" : "udp4", address, port, flags | 0);
+      this._id = info.socketId;
+      this._kind6 = kind6;
+      if (!this._refed) __udp.udpRef(this._id, true);
+      return 0;
+    } catch (error) {
+      return errnoOf(error);
+    }
+  }
+  bind(address, port, flags) { return this._bind(false, address, port, flags); }
+  bind6(address, port, flags) { return this._bind(true, address, port, flags); }
+  open(_fd) { return UV_ENOTSUP; }
+
+  connect(address, port) { return this._guard(() => __udp.connect(this._id, address, port)); }
+  connect6(address, port) { return this.connect(address, port); }
+  disconnect() { return this._guard(() => __udp.disconnect(this._id)); }
+
+  // send(req, list, count, port, address, hasCallback) — or, on a connected socket,
+  // send(req, list, count, hasCallback). The datagram goes out synchronously; the result is
+  // size + 1 (the "finished synchronously" convention of lib/dgram.js) or a negative errno.
+  send(req, list, count, port, address) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    const connected = typeof port === "boolean" || port === undefined;
+    const parts = [];
+    for (let i = 0; i < count; i++) parts.push(list[i]);
+    const bytes = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+    if (getOptionValue("--test-udp-no-try-send")) {
+      this._queuedBytes += bytes.length;
+      this._queuedCount++;
+      setImmediate(() => {
+        let sent = 0;
+        const status = this._guard(() => {
+          sent = __udp.send(this._id, bytes, connected ? 0 : port, connected ? "" : address);
+        });
+        this._queuedBytes -= bytes.length;
+        this._queuedCount--;
+        if (typeof req.oncomplete === "function") req.oncomplete(status, sent);
+      });
+      return 0;
+    }
+    let sent;
+    const err = this._guard(() => {
+      sent = __udp.send(this._id, bytes, connected ? 0 : port, connected ? "" : address);
+    });
+    return err === 0 ? sent + 1 : err;
+  }
+  send6(req, list, count, port, address, hasCallback) { return this.send(req, list, count, port, address, hasCallback); }
+
+  recvStart() {
+    if (this._closed) return UV_EBADF;
+    if (this._id === null) return UV_EINVAL;
+    this._reading = true;
+    if (this._held.length !== 0) process.nextTick(() => this._drainHeld());
+    else this._armRecv();
+    return 0;
+  }
+  recvStop() {
+    this._reading = false;
+    return 0;
+  }
+  _drainHeld() {
+    try {
+      while (this._reading && !this._closed && this._held.length !== 0) this._deliver(this._held.shift());
+    } finally {
+      this._armRecv();
+    }
+  }
+  _armRecv() {
+    if (!this._reading || this._readInFlight || this._closed || this._id === null || this._held.length !== 0) return;
+    this._readInFlight = true;
+    __udp.recv(
+      this._id,
+      (msg) => this._onRecv(msg),
+      (error) => this._onRecv(errnoOf(error)),
+    );
+  }
+  _onRecv(result) {
+    this._readInFlight = false;
+    if (this._closed || result === null) return;
+    this._held.push(result);
+    if (this._reading) this._drainHeld();
+  }
+  _deliver(result) {
+    if (typeof this.onmessage !== "function") return;
+    if (typeof result === "number") {
+      this.onmessage(result, this, undefined, undefined);
+      return;
+    }
+    const { data, address, port, family } = result;
+    this.onmessage(data.length, this, Buffer.from(data.buffer, data.byteOffset, data.byteLength), { address, family, port });
+  }
+
+  getsockname(out) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    const name = __udp.address(this._id);
+    if (name === null) return UV_EBADF;
+    out.address = name.address;
+    out.family = name.family;
+    out.port = name.port;
+    return 0;
+  }
+  getpeername(out) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    const name = __udp.peer(this._id);
+    if (name === null) return UV_ENOTCONN;
+    out.address = name.address;
+    out.family = name.family;
+    out.port = name.port;
+    return 0;
+  }
+
+  setBroadcast(on) { return this._guard(() => __udp.setBroadcast(this._id, !!on)); }
+  setTTL(ttl) { return this._guard(() => __udp.setTTL(this._id, ttl)); }
+  setMulticastTTL(ttl) { return this._guard(() => __udp.setMulticastTTL(this._id, ttl)); }
+  setMulticastLoopback(on) { return this._guard(() => __udp.setMulticastLoopback(this._id, !!on)); }
+  setMulticastInterface(address) { return this._guard(() => __udp.setMulticastInterface(this._id, address)); }
+  addMembership(group, iface) { return this._guard(() => __udp.addMembership(this._id, group, iface)); }
+  dropMembership(group, iface) { return this._guard(() => __udp.dropMembership(this._id, group, iface)); }
+  addSourceSpecificMembership(source, group, iface) {
+    return this._guard(() => __udp.addSourceMembership(this._id, source, group, iface));
+  }
+  dropSourceSpecificMembership(source, group, iface) {
+    return this._guard(() => __udp.dropSourceMembership(this._id, source, group, iface));
+  }
+
+  // bufferSize(size, isRecv, ctx): `size` 0 reads the current size. A failure fills `ctx` and
+  // returns undefined, as UDPWrap::BufferSize does.
+  bufferSize(size, isRecv, ctx) {
+    const syscall = isRecv ? "uv_recv_buffer_size" : "uv_send_buffer_size";
+    let result;
+    const err = this._guard(() => {
+      if (size === 0) result = __udp.getBufferSize(this._id, !!isRecv);
+      else {
+        __udp.setBufferSize(this._id, !!isRecv, size);
+        result = __udp.getBufferSize(this._id, !!isRecv);
+      }
+    });
+    if (err !== 0) {
+      const [code, message] = __uvErrmap().get(err) || uvUnmappedError;
+      ctx.errno = err;
+      ctx.code = code;
+      ctx.message = message;
+      ctx.syscall = syscall;
+      return undefined;
+    }
+    return result;
+  }
+  getSendQueueSize() { return this._queuedBytes; }
+  getSendQueueCount() { return this._queuedCount; }
+
+  close(callback) {
+    if (this._closed) return;
+    this._closed = true;
+    this._reading = false;
+    if (this._id !== null) __udp.close(this._id);
+    this._id = null;
+    if (typeof callback === "function") setImmediate(() => callback.call(this));
+  }
+  ref() {
+    this._refed = true;
+    if (this._id !== null) __udp.udpRef(this._id, false);
+  }
+  unref() {
+    this._refed = false;
+    if (this._id !== null) __udp.udpRef(this._id, true);
+  }
+  hasRef() { return this._refed && !this._closed; }
+}
+
 // ---- internalBinding() --------------------------------------------------------------------------
 
 const bindings = {
@@ -895,11 +1150,12 @@ const bindings = {
   stream_wrap: streamWrapBinding,
   tcp_wrap: { TCP, TCPConnectWrap, constants: TCPConstants },
   pipe_wrap: { Pipe, PipeConnectWrap, constants: PipeConstants },
+  udp_wrap: { UDP, SendWrap, constants: UDPConstants },
   block_list: blockListBinding,
   symbols: { owner_symbol: asyncHookSymbols.owner_symbol, async_id_symbol: asyncHookSymbols.async_id_symbol },
   // Only the fd-socket sync write path (makeSyncWrite) reaches this; lumen wraps no raw fds.
   fs: { writeBuffer() { throw new Error("lumen net: synchronous fd writes are not supported"); } },
-  constants: { get os() { return __builtins.get("os").constants; } },
+  constants: { get os() { return { __proto__: __builtins.get("os").constants, UV_UDP_REUSEADDR: UDPConstants.UV_UDP_REUSEADDR }; } },
   trace_events: { trace() {}, isTraceCategoryEnabled: () => false, getCategoryEnabledBuffer: () => new Uint8Array(1) },
   // http_parser is defined further down (after the llhttp port).
 };
@@ -908,6 +1164,657 @@ function internalBinding(name) {
   if (binding === undefined) throw new Error(`lumen net: internalBinding('${name}') is not available`);
   return binding;
 }
+
+// ---- internalBinding('cares_wrap') --------------------------------------------------------------
+
+// What c-ares gives Node: a resolver channel that speaks DNS (RFC 1035) to its servers over UDP,
+// falling back to TCP for truncated answers, plus getaddrinfo/getnameinfo over the system
+// resolver (`__dns`, dns.rs).
+
+const aiFlags = (() => {
+  const platform = __os.info().platform;
+  if (platform === "linux" || platform === "android") return { ADDRCONFIG: 0x20, ALL: 0x10, V4MAPPED: 0x8 };
+  return { ADDRCONFIG: 0x400, ALL: 0x100, V4MAPPED: 0x800 };
+})();
+
+class GetAddrInfoReqWrap {}
+class GetNameInfoReqWrap {}
+class QueryReqWrap {}
+
+// libuv's EAI_* code (a native op's `code`) as the negative number `dnsException` expects.
+function gaiErrno(error) {
+  const code = error && error.code;
+  const errno = typeof code === "string" ? __uvCodes().get(code) : undefined;
+  return errno === undefined ? __uvCodes().get("EAI_FAIL") : errno;
+}
+
+function caresGetaddrinfo(req, hostname, family, hints, verbatim) {
+  __dns.getaddrinfo(
+    hostname,
+    family,
+    hints | 0,
+    (list) => {
+      if (verbatim === false) {
+        list = [...list.filter((a) => a.family === 4), ...list.filter((a) => a.family !== 4)];
+      }
+      req.oncomplete(0, list.map((a) => a.address));
+    },
+    (error) => req.oncomplete(gaiErrno(error)),
+  );
+  return 0;
+}
+
+function caresGetnameinfo(req, address, port) {
+  __dns.getnameinfo(
+    address,
+    port,
+    ([hostname, service]) => req.oncomplete(0, hostname, service),
+    (error) => req.oncomplete(gaiErrno(error)),
+  );
+  return 0;
+}
+
+// ---- wire format ---------------------------------------------------------------------------
+
+const T = { A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15, TXT: 16, AAAA: 28, SRV: 33, NAPTR: 35, CAA: 257, ANY: 255 };
+
+class WireError extends Error {
+  constructor(code) {
+    super(code);
+    this.aresCode = code;
+  }
+}
+
+function encodeName(name) {
+  if (name.endsWith(".")) name = name.slice(0, -1);
+  const parts = [];
+  if (name !== "") {
+    for (const label of name.split(".")) {
+      const bytes = Buffer.from(label, "utf8");
+      if (bytes.length === 0 || bytes.length > 63) throw new WireError("EBADNAME");
+      parts.push(Buffer.from([bytes.length]), bytes);
+    }
+  }
+  parts.push(Buffer.from([0]));
+  const out = Buffer.concat(parts);
+  if (out.length > 255) throw new WireError("EBADNAME");
+  return out;
+}
+
+function buildQuery(id, name, type) {
+  const header = Buffer.alloc(12);
+  header.writeUInt16BE(id, 0);
+  header.writeUInt16BE(0x0100, 2);
+  header.writeUInt16BE(1, 4);
+  const tail = Buffer.alloc(4);
+  tail.writeUInt16BE(type, 0);
+  tail.writeUInt16BE(1, 2);
+  return Buffer.concat([header, encodeName(name), tail]);
+}
+
+function readName(buf, offset) {
+  const labels = [];
+  let pos = offset;
+  let next = -1;
+  for (let hops = 0; ; hops++) {
+    if (pos >= buf.length || hops > 128) throw new WireError("EBADRESP");
+    const len = buf[pos];
+    if (len === 0) {
+      pos += 1;
+      break;
+    }
+    if ((len & 0xc0) === 0xc0) {
+      if (pos + 1 >= buf.length) throw new WireError("EBADRESP");
+      if (next < 0) next = pos + 2;
+      pos = ((len & 0x3f) << 8) | buf[pos + 1];
+      continue;
+    }
+    if ((len & 0xc0) !== 0 || pos + 1 + len > buf.length) throw new WireError("EBADRESP");
+    labels.push(buf.toString("latin1", pos + 1, pos + 1 + len));
+    pos += 1 + len;
+  }
+  return { name: labels.join("."), next: next >= 0 ? next : pos };
+}
+
+function formatIPv6(bytes) {
+  const groups = [];
+  for (let i = 0; i < 16; i += 2) groups.push((bytes[i] << 8) | bytes[i + 1]);
+  let bestStart = -1;
+  let bestLen = 0;
+  for (let i = 0; i < 8;) {
+    if (groups[i] !== 0) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < 8 && groups[j] === 0) j++;
+    if (j - i > bestLen) {
+      bestStart = i;
+      bestLen = j - i;
+    }
+    i = j;
+  }
+  if (bestLen < 2) return groups.map((g) => g.toString(16)).join(":");
+  const head = groups.slice(0, bestStart).map((g) => g.toString(16)).join(":");
+  const tail = groups.slice(bestStart + bestLen).map((g) => g.toString(16)).join(":");
+  return `${head}::${tail}`;
+}
+
+function parseRecord(buf, type, start, length) {
+  const end = start + length;
+  if (end > buf.length) throw new WireError("EBADRESP");
+  switch (type) {
+    case T.A:
+      if (length !== 4) throw new WireError("EBADRESP");
+      return { type: "A", address: `${buf[start]}.${buf[start + 1]}.${buf[start + 2]}.${buf[start + 3]}` };
+    case T.AAAA:
+      if (length !== 16) throw new WireError("EBADRESP");
+      return { type: "AAAA", address: formatIPv6(buf.subarray(start, end)) };
+    case T.NS:
+    case T.CNAME:
+    case T.PTR:
+      return { type: type === T.NS ? "NS" : type === T.CNAME ? "CNAME" : "PTR", value: readName(buf, start).name };
+    case T.MX: {
+      if (length < 3) throw new WireError("EBADRESP");
+      return { type: "MX", priority: buf.readUInt16BE(start), exchange: readName(buf, start + 2).name };
+    }
+    case T.TXT: {
+      const entries = [];
+      let pos = start;
+      while (pos < end) {
+        const len = buf[pos];
+        if (pos + 1 + len > end) throw new WireError("EBADRESP");
+        entries.push(buf.toString("utf8", pos + 1, pos + 1 + len));
+        pos += 1 + len;
+      }
+      return { type: "TXT", entries };
+    }
+    case T.SOA: {
+      const ns = readName(buf, start);
+      const mail = readName(buf, ns.next);
+      if (mail.next + 20 > end) throw new WireError("EBADRESP");
+      const p = mail.next;
+      return {
+        type: "SOA",
+        nsname: ns.name,
+        hostmaster: mail.name,
+        serial: buf.readUInt32BE(p),
+        refresh: buf.readUInt32BE(p + 4),
+        retry: buf.readUInt32BE(p + 8),
+        expire: buf.readUInt32BE(p + 12),
+        minttl: buf.readUInt32BE(p + 16),
+      };
+    }
+    case T.SRV: {
+      if (length < 7) throw new WireError("EBADRESP");
+      return {
+        type: "SRV",
+        priority: buf.readUInt16BE(start),
+        weight: buf.readUInt16BE(start + 2),
+        port: buf.readUInt16BE(start + 4),
+        name: readName(buf, start + 6).name,
+      };
+    }
+    case T.NAPTR: {
+      if (length < 4) throw new WireError("EBADRESP");
+      const order = buf.readUInt16BE(start);
+      const preference = buf.readUInt16BE(start + 2);
+      let pos = start + 4;
+      const strings = [];
+      for (let i = 0; i < 3; i++) {
+        const len = buf[pos];
+        if (pos + 1 + len > end) throw new WireError("EBADRESP");
+        strings.push(buf.toString("latin1", pos + 1, pos + 1 + len));
+        pos += 1 + len;
+      }
+      return {
+        type: "NAPTR",
+        flags: strings[0],
+        service: strings[1],
+        regexp: strings[2],
+        replacement: readName(buf, pos).name,
+        order,
+        preference,
+      };
+    }
+    case T.CAA: {
+      if (length < 2) throw new WireError("EBADRESP");
+      const critical = buf[start];
+      const tagLength = buf[start + 1];
+      if (start + 2 + tagLength > end) throw new WireError("EBADRESP");
+      const tag = buf.toString("latin1", start + 2, start + 2 + tagLength);
+      return { type: "CAA", critical, tag, value: buf.toString("latin1", start + 2 + tagLength, end) };
+    }
+    default:
+      return null;
+  }
+}
+
+function parseResponse(buf) {
+  if (buf.length < 12) throw new WireError("EBADRESP");
+  const flags = buf.readUInt16BE(2);
+  const counts = [buf.readUInt16BE(4), buf.readUInt16BE(6)];
+  let pos = 12;
+  for (let i = 0; i < counts[0]; i++) {
+    pos = readName(buf, pos).next + 4;
+    if (pos > buf.length) throw new WireError("EBADRESP");
+  }
+  const answers = [];
+  for (let i = 0; i < counts[1]; i++) {
+    const owner = readName(buf, pos);
+    pos = owner.next;
+    if (pos + 10 > buf.length) throw new WireError("EBADRESP");
+    const type = buf.readUInt16BE(pos);
+    const ttl = buf.readUInt32BE(pos + 4);
+    const length = buf.readUInt16BE(pos + 8);
+    pos += 10;
+    const record = parseRecord(buf, type, pos, length);
+    if (record !== null) {
+      record.ttl = ttl;
+      answers.push(record);
+    }
+    pos += length;
+  }
+  return { id: buf.readUInt16BE(0), truncated: (flags & 0x0200) !== 0, rcode: flags & 0xf, response: (flags & 0x8000) !== 0, answers };
+}
+
+const RCODE_ERRORS = { 1: "EFORMERR", 2: "ESERVFAIL", 3: "ENOTFOUND", 4: "ENOTIMP", 5: "EREFUSED" };
+
+// ---- the channel ---------------------------------------------------------------------------
+
+const DNS_ESETSRVPENDING = -1000;
+const ARES_MESSAGES = {
+  ENODATA: "DNS server returned answer with no data",
+  EFORMERR: "DNS server claims query was misformatted",
+  ESERVFAIL: "DNS server returned general failure",
+  ENOTFOUND: "Domain name not found",
+  ENOTIMP: "DNS server does not implement requested operation",
+  EREFUSED: "DNS server refused query",
+  EBADQUERY: "Misformatted DNS query",
+  EBADNAME: "Misformatted domain name",
+  EBADFAMILY: "Unsupported address family",
+  EBADRESP: "Misformatted DNS reply",
+  ECONNREFUSED: "Could not contact DNS servers",
+  ETIMEOUT: "Timeout while contacting DNS servers",
+  EOF: "End of file",
+  EFILE: "Error reading file",
+  ENOMEM: "Out of memory",
+  EDESTRUCTION: "Channel is being destroyed",
+  EBADSTR: "Misformatted string",
+  EBADFLAGS: "Illegal flags specified",
+  ENONAME: "Given hostname is not numeric",
+  EBADHINTS: "Illegal hints flags specified",
+  ENOTINITIALIZED: "c-ares library initialization not yet performed",
+  ECANCELLED: "DNS query cancelled",
+};
+function strerror(code) {
+  if (code === DNS_ESETSRVPENDING) return "There are pending queries.";
+  return ARES_MESSAGES[code] || "unknown";
+}
+
+function systemServers() {
+  const servers = __dns.getServers().map((ip) => ({ ip, port: 53, family: ip.includes(":") ? 6 : 4 }));
+  return servers.length === 0 ? [{ ip: "127.0.0.1", port: 53, family: 4 }] : servers;
+}
+
+class Query {
+  constructor(channel, name, type, finish) {
+    this.channel = channel;
+    this.name = name;
+    this.type = type;
+    this.finish = finish;
+    this.id = Math.floor(Math.random() * 0x10000);
+    this.attempt = 0;
+    this.error = "ETIMEOUT";
+    this.timer = null;
+    this.sockets = new Map();
+    this.done = false;
+    this.packet = null;
+  }
+}
+
+class ChannelWrap {
+  constructor(timeout, tries) {
+    this._timeout = timeout < 0 ? 2000 : timeout;
+    this._tries = tries > 0 ? tries : 4;
+    this._servers = null;
+    this._active = new Set();
+    this._local4 = "";
+    this._local6 = "";
+  }
+
+  getServers() {
+    const servers = this._servers || systemServers();
+    return servers.map((s) => [s.ip, s.port]);
+  }
+
+  setServers(list) {
+    if (this._active.size !== 0) return DNS_ESETSRVPENDING;
+    this._servers = list.map(([family, ip, port]) => ({ ip, port, family }));
+    return 0;
+  }
+
+  setLocalAddress(ipv4, ipv6) {
+    const v4 = net_isIPv4(ipv4);
+    if (!v4) throw new codes.ERR_INVALID_IP_ADDRESS(ipv4);
+    this._local4 = ipv4;
+    if (ipv6 !== undefined) {
+      if (!isIPv6(ipv6)) throw new codes.ERR_INVALID_IP_ADDRESS(ipv6);
+      this._local6 = ipv6;
+    }
+  }
+
+  cancel() {
+    for (const query of [...this._active]) this._end(query, "ECANCELLED");
+  }
+
+  _serverList() {
+    return this._servers || systemServers();
+  }
+
+  _start(req, name, type, parse) {
+    const query = new Query(this, name, type, (code, answers) => {
+      let result;
+      let ttls;
+      if (code === 0) {
+        try {
+          [result, ttls] = parse(answers);
+        } catch {
+          code = "EBADRESP";
+        }
+        if (code === 0 && result === null) code = "ENODATA";
+      }
+      if (code !== 0) req.oncomplete(code);
+      else req.oncomplete(0, result, ttls);
+    });
+    try {
+      query.packet = buildQuery(query.id, name, type);
+    } catch (error) {
+      this._active.add(query);
+      process.nextTick(() => this._end(query, error.aresCode || "EBADNAME"));
+      return 0;
+    }
+    this._active.add(query);
+    process.nextTick(() => this._send(query));
+    return 0;
+  }
+
+  _end(query, code, answers) {
+    if (query.done) return;
+    query.done = true;
+    this._active.delete(query);
+    if (query.timer !== null) clearTimeout(query.timer);
+    for (const handle of query.sockets.values()) handle.close();
+    query.sockets.clear();
+    query.finish(code, answers);
+  }
+
+  _send(query) {
+    if (query.done) return;
+    const servers = this._serverList();
+    const limit = this._tries * servers.length;
+    if (query.attempt >= limit) {
+      this._end(query, query.error);
+      return;
+    }
+    const k = query.attempt++;
+    const server = servers[k % servers.length];
+    const wait = this._timeout * 2 ** Math.floor(k / servers.length);
+    const handle = this._socketFor(query, server);
+    if (handle === null) {
+      query.error = "ECONNREFUSED";
+      process.nextTick(() => this._send(query));
+      return;
+    }
+    const err = handle.send({}, [query.packet], 1, server.port, server.ip);
+    if (err < 0) {
+      query.error = "ECONNREFUSED";
+      process.nextTick(() => this._send(query));
+      return;
+    }
+    query.timer = setTimeout(() => {
+      query.timer = null;
+      query.error = "ETIMEOUT";
+      this._send(query);
+    }, wait);
+  }
+
+  _socketFor(query, server) {
+    let handle = query.sockets.get(server.family);
+    if (handle !== undefined) return handle;
+    handle = new UDP();
+    const local = server.family === 6 ? this._local6 : this._local4;
+    const err = server.family === 6
+      ? handle.bind6(local || "::", 0, 0)
+      : handle.bind(local || "0.0.0.0", 0, 0);
+    if (err !== 0) {
+      handle.close();
+      return null;
+    }
+    handle.onmessage = (nread, _h, buf) => this._onPacket(query, server, nread, buf);
+    handle.recvStart();
+    query.sockets.set(server.family, handle);
+    return handle;
+  }
+
+  _onPacket(query, server, nread, buf) {
+    if (query.done) return;
+    if (nread < 0) {
+      query.error = "ECONNREFUSED";
+      this._retryNow(query);
+      return;
+    }
+    let parsed;
+    try {
+      parsed = parseResponse(buf);
+    } catch {
+      return;
+    }
+    if (!parsed.response || parsed.id !== query.id) return;
+    if (parsed.truncated) {
+      this._viaTcp(query, server);
+      return;
+    }
+    this._complete(query, parsed);
+  }
+
+  _retryNow(query) {
+    if (query.timer !== null) clearTimeout(query.timer);
+    query.timer = null;
+    process.nextTick(() => this._send(query));
+  }
+
+  _complete(query, parsed) {
+    if (parsed.rcode === 0) {
+      this._end(query, 0, parsed.answers);
+    } else if (parsed.rcode === 1 || parsed.rcode === 3) {
+      this._end(query, RCODE_ERRORS[parsed.rcode]);
+    } else {
+      query.error = RCODE_ERRORS[parsed.rcode] || "ESERVFAIL";
+      this._retryNow(query);
+    }
+  }
+
+  _viaTcp(query, server) {
+    if (query.timer !== null) clearTimeout(query.timer);
+    query.timer = null;
+    const socket = require("net").connect({ host: server.ip, port: server.port });
+    const chunks = [];
+    let settled = false;
+    const fail = (code) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      query.error = code;
+      if (!query.done) this._send(query);
+    };
+    query.timer = setTimeout(() => fail("ETIMEOUT"), Math.max(this._timeout, 1) * 2);
+    socket.on("connect", () => {
+      const frame = Buffer.alloc(2 + query.packet.length);
+      frame.writeUInt16BE(query.packet.length, 0);
+      query.packet.copy(frame, 2);
+      socket.write(frame);
+    });
+    socket.on("data", (chunk) => {
+      chunks.push(chunk);
+      const all = Buffer.concat(chunks);
+      if (all.length < 2 || all.length < 2 + all.readUInt16BE(0) || settled) return;
+      settled = true;
+      socket.destroy();
+      if (query.timer !== null) clearTimeout(query.timer);
+      query.timer = null;
+      let parsed;
+      try {
+        parsed = parseResponse(all.subarray(2, 2 + all.readUInt16BE(0)));
+      } catch {
+        this._end(query, "EBADRESP");
+        return;
+      }
+      if (parsed.id !== query.id) this._end(query, "EBADRESP");
+      else this._complete(query, parsed);
+    });
+    socket.on("error", () => fail("ECONNREFUSED"));
+    socket.on("close", () => fail("ECONNREFUSED"));
+  }
+}
+
+function net_isIPv4(text) {
+  return /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(text);
+}
+function isIPv6(text) {
+  return require("net").isIPv6(text);
+}
+
+// The records of `type` among the answers (CNAME chains leave A/AAAA answers under other names).
+const ofType = (answers, type) => answers.filter((a) => a.type === type);
+
+const PARSERS = {
+  queryA: [T.A, (answers) => {
+    const found = ofType(answers, "A");
+    return found.length === 0 ? [null] : [found.map((a) => a.address), found.map((a) => a.ttl)];
+  }],
+  queryAaaa: [T.AAAA, (answers) => {
+    const found = ofType(answers, "AAAA");
+    return found.length === 0 ? [null] : [found.map((a) => a.address), found.map((a) => a.ttl)];
+  }],
+  queryCname: [T.CNAME, (answers) => {
+    const found = ofType(answers, "CNAME");
+    return found.length === 0 ? [null] : [found.map((a) => a.value)];
+  }],
+  queryNs: [T.NS, (answers) => {
+    const found = ofType(answers, "NS");
+    return found.length === 0 ? [null] : [found.map((a) => a.value)];
+  }],
+  queryPtr: [T.PTR, (answers) => {
+    const found = ofType(answers, "PTR");
+    return found.length === 0 ? [null] : [found.map((a) => a.value)];
+  }],
+  queryMx: [T.MX, (answers) => {
+    const found = ofType(answers, "MX");
+    return found.length === 0 ? [null] : [found.map((a) => ({ exchange: a.exchange, priority: a.priority }))];
+  }],
+  queryTxt: [T.TXT, (answers) => {
+    const found = ofType(answers, "TXT");
+    return found.length === 0 ? [null] : [found.map((a) => a.entries)];
+  }],
+  querySrv: [T.SRV, (answers) => {
+    const found = ofType(answers, "SRV");
+    return found.length === 0 ? [null] : [found.map((a) => ({ name: a.name, port: a.port, priority: a.priority, weight: a.weight }))];
+  }],
+  queryNaptr: [T.NAPTR, (answers) => {
+    const found = ofType(answers, "NAPTR");
+    return found.length === 0 ? [null] : [found.map((a) => ({
+      flags: a.flags, service: a.service, regexp: a.regexp, replacement: a.replacement,
+      order: a.order, preference: a.preference,
+    }))];
+  }],
+  querySoa: [T.SOA, (answers) => {
+    const found = ofType(answers, "SOA");
+    if (found.length === 0) return [null];
+    const a = found[0];
+    return [{
+      nsname: a.nsname, hostmaster: a.hostmaster, serial: a.serial, refresh: a.refresh,
+      retry: a.retry, expire: a.expire, minttl: a.minttl,
+    }];
+  }],
+  queryCaa: [T.CAA, (answers) => {
+    const found = ofType(answers, "CAA");
+    return found.length === 0 ? [null] : [found.map((a) => ({ critical: a.critical, [a.tag]: a.value }))];
+  }],
+  queryAny: [T.ANY, (answers) => {
+    const out = [];
+    for (const type of ["A", "AAAA", "CNAME", "MX", "NS", "TXT", "SRV", "PTR", "NAPTR", "SOA", "CAA"]) {
+      for (const a of ofType(answers, type)) {
+        switch (type) {
+          case "A":
+          case "AAAA": out.push({ type, address: a.address, ttl: a.ttl }); break;
+          case "CNAME":
+          case "NS":
+          case "PTR": out.push({ type, value: a.value }); break;
+          case "MX": out.push({ type, priority: a.priority, exchange: a.exchange }); break;
+          case "TXT": out.push({ type, entries: a.entries }); break;
+          case "SRV": out.push({ type, name: a.name, port: a.port, priority: a.priority, weight: a.weight }); break;
+          case "NAPTR":
+            out.push({ type, flags: a.flags, service: a.service, regexp: a.regexp, replacement: a.replacement, order: a.order, preference: a.preference });
+            break;
+          case "SOA":
+            out.push({ type, nsname: a.nsname, hostmaster: a.hostmaster, serial: a.serial, refresh: a.refresh, retry: a.retry, expire: a.expire, minttl: a.minttl });
+            break;
+          case "CAA": out.push({ type, critical: a.critical, [a.tag]: a.value }); break;
+        }
+      }
+    }
+    return out.length === 0 ? [null] : [out];
+  }],
+};
+for (const [method, [type, parse]] of Object.entries(PARSERS)) {
+  ChannelWrap.prototype[method] = function (req, name) {
+    return this._start(req, String(name), type, parse);
+  };
+}
+
+function reverseName(ip) {
+  if (ip.includes(":")) {
+    const [head, tail = ""] = ip.split("::");
+    const h = head ? head.split(":") : [];
+    const t = tail ? tail.split(":") : [];
+    const groups = [...h, ...Array(8 - h.length - t.length).fill("0"), ...t];
+    const nibbles = groups.map((g) => g.padStart(4, "0")).join("");
+    return `${nibbles.split("").reverse().join(".")}.ip6.arpa`;
+  }
+  return `${ip.split(".").reverse().join(".")}.in-addr.arpa`;
+}
+
+ChannelWrap.prototype.getHostByAddr = function (req, ip) {
+  const family = require("net").isIP(ip);
+  if (family === 0) return UV_EINVAL;
+  return this._start(req, reverseName(ip), T.PTR, (answers) => {
+    const found = ofType(answers, "PTR");
+    return found.length === 0 ? [null] : [found.map((a) => a.value)];
+  });
+};
+
+bindings.cares_wrap = {
+  GetAddrInfoReqWrap,
+  GetNameInfoReqWrap,
+  QueryReqWrap,
+  ChannelWrap,
+  getaddrinfo: caresGetaddrinfo,
+  getnameinfo: caresGetnameinfo,
+  canonicalizeIP(ip) {
+    const family = require("net").isIP(ip);
+    if (family === 0) return undefined;
+    if (family === 4) return ip.split(".").map(Number).join(".");
+    return new (require("net").SocketAddress)({ address: ip, family: "ipv6" }).address;
+  },
+  strerror,
+  AI_ADDRCONFIG: aiFlags.ADDRCONFIG,
+  AI_ALL: aiFlags.ALL,
+  AI_V4MAPPED: aiFlags.V4MAPPED,
+  DNS_ORDER_VERBATIM: 0,
+  DNS_ORDER_IPV4_FIRST: 1,
+  DNS_ORDER_IPV6_FIRST: 2,
+};
 
 defineModule("internal/validators", function (module, exports, require, internalBinding, primordials) {
   /* eslint jsdoc/require-jsdoc: "error" */
@@ -5100,7 +6007,10 @@ class HTTPParser {
     const keepAlive = this._shouldKeepAlive();
     this._finish = FINISH_SAFE;
     const cb = this[kOnMessageComplete];
-    if (typeof cb === "function") cb.call(this);
+    if (typeof cb === "function") {
+      cb.call(this);
+      this._drainTicks();
+    }
     this._flags = 0;
     if (this._upgrade) return S_START;
     return keepAlive || (this._lenient & kLenientKeepAlive) !== 0 ? S_START : S_CLOSED;
@@ -5109,7 +6019,17 @@ class HTTPParser {
   _body(bytes, start, end) {
     if (end <= start) return;
     const cb = this[kOnBody];
-    if (typeof cb === "function") cb.call(this, Buffer.from(bytes.subarray(start, end)));
+    if (typeof cb === "function") {
+      cb.call(this, Buffer.from(bytes.subarray(start, end)));
+      this._drainTicks();
+    }
+  }
+
+  // Node's server parser consumes the socket handle and is driven from native code, so llhttp's
+  // body and message-complete callbacks are outermost callbacks that run the nextTick queue when
+  // they return. The client parser runs inside a JS data callback, which is not outermost.
+  _drainTicks() {
+    if (this._type === HTTP_REQUEST) process._tickCallback();
   }
 
   _run(bytes) {
@@ -10511,8 +11431,7 @@ defineModule("https", function (module, exports, require, internalBinding, primo
     }
 
     FunctionPrototypeCall(storeHTTPOptions, this, opts);
-    // lumen: tls.Server is a class; run its initializer on this object.
-    FunctionPrototypeCall(tls.Server.prototype._init, this,
+    FunctionPrototypeCall(tls.Server, this,
                           {
                             noDelay: true,
                             // http/1.0 is not defined as Protocol IDs in IANA
@@ -10866,8 +11785,2391 @@ defineModule("https", function (module, exports, require, internalBinding, primo
   };
 });
 
+defineModule("internal/dgram", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+
+  const {
+    FunctionPrototypeBind,
+    Symbol,
+  } = primordials;
+
+  const { codes } = require('internal/errors');
+  const { UDP } = internalBinding('udp_wrap');
+  const { guessHandleType } = require('internal/util');
+  const {
+    isInt32,
+    validateFunction,
+  } = require('internal/validators');
+  const { UV_EINVAL } = internalBinding('uv');
+  const {
+    ERR_SOCKET_BAD_TYPE,
+  } = codes;
+  const kStateSymbol = Symbol('state symbol');
+  let dns;  // Lazy load for startup performance.
+
+
+  function lookup4(lookup, address, callback) {
+    return lookup(address || '127.0.0.1', 4, callback);
+  }
+
+
+  function lookup6(lookup, address, callback) {
+    return lookup(address || '::1', 6, callback);
+  }
+
+  function newHandle(type, lookup) {
+    if (lookup === undefined) {
+      if (dns === undefined) {
+        dns = require('dns');
+      }
+
+      lookup = dns.lookup;
+    } else {
+      validateFunction(lookup, 'lookup');
+    }
+
+    if (type === 'udp4') {
+      const handle = new UDP();
+
+      handle.lookup = FunctionPrototypeBind(lookup4, handle, lookup);
+      return handle;
+    }
+
+    if (type === 'udp6') {
+      const handle = new UDP();
+
+      handle.lookup = FunctionPrototypeBind(lookup6, handle, lookup);
+      handle.bind = handle.bind6;
+      handle.connect = handle.connect6;
+      handle.send = handle.send6;
+      return handle;
+    }
+
+    throw new ERR_SOCKET_BAD_TYPE();
+  }
+
+
+  function _createSocketHandle(address, port, addressType, fd, flags) {
+    const handle = newHandle(addressType);
+    let err;
+
+    if (isInt32(fd) && fd > 0) {
+      const type = guessHandleType(fd);
+      if (type !== 'UDP') {
+        err = UV_EINVAL;
+      } else {
+        err = handle.open(fd);
+      }
+    } else if (port || address) {
+      err = handle.bind(address, port || 0, flags);
+    }
+
+    if (err) {
+      handle.close();
+      return err;
+    }
+
+    return handle;
+  }
+
+
+  module.exports = {
+    kStateSymbol,
+    _createSocketHandle,
+    newHandle,
+  };
+});
+
+defineModule("dgram", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+
+  const {
+    Array,
+    ArrayIsArray,
+    ArrayPrototypePush,
+    FunctionPrototypeBind,
+    FunctionPrototypeCall,
+    ObjectDefineProperty,
+    ObjectSetPrototypeOf,
+    ReflectApply,
+    SymbolAsyncDispose,
+    SymbolDispose,
+  } = primordials;
+
+  const errors = require('internal/errors');
+  const {
+    kStateSymbol,
+    _createSocketHandle,
+    newHandle,
+  } = require('internal/dgram');
+  const {
+    ERR_BUFFER_OUT_OF_BOUNDS,
+    ERR_INVALID_ARG_TYPE,
+    ERR_MISSING_ARGS,
+    ERR_SOCKET_ALREADY_BOUND,
+    ERR_SOCKET_BAD_BUFFER_SIZE,
+    ERR_SOCKET_BUFFER_SIZE,
+    ERR_SOCKET_DGRAM_IS_CONNECTED,
+    ERR_SOCKET_DGRAM_NOT_CONNECTED,
+    ERR_SOCKET_DGRAM_NOT_RUNNING,
+    ERR_INVALID_FD_TYPE,
+  } = errors.codes;
+  const {
+    isInt32,
+    validateAbortSignal,
+    validateString,
+    validateNumber,
+    validatePort,
+  } = require('internal/validators');
+  const { Buffer } = require('buffer');
+  const { deprecate, guessHandleType, promisify } = require('internal/util');
+  const { isArrayBufferView } = require('internal/util/types');
+  const EventEmitter = require('events');
+  const {
+    defaultTriggerAsyncIdScope,
+    symbols: { async_id_symbol, owner_symbol },
+  } = require('internal/async_hooks');
+  const { UV_UDP_REUSEADDR } = internalBinding('constants').os;
+
+  const {
+    constants: { UV_UDP_IPV6ONLY },
+    UDP,
+    SendWrap,
+  } = internalBinding('udp_wrap');
+
+  const dc = require('diagnostics_channel');
+  const udpSocketChannel = dc.channel('udp.socket');
+
+  const BIND_STATE_UNBOUND = 0;
+  const BIND_STATE_BINDING = 1;
+  const BIND_STATE_BOUND = 2;
+
+  const CONNECT_STATE_DISCONNECTED = 0;
+  const CONNECT_STATE_CONNECTING = 1;
+  const CONNECT_STATE_CONNECTED = 2;
+
+  const RECV_BUFFER = true;
+  const SEND_BUFFER = false;
+
+  // Lazily loaded
+  let _cluster = null;
+  function lazyLoadCluster() {
+    if (!_cluster) _cluster = require('cluster');
+    return _cluster;
+  }
+
+  const errnoException = errors.errnoException;
+  const exceptionWithHostPort = errors.exceptionWithHostPort;
+
+
+  function Socket(type, listener) {
+    FunctionPrototypeCall(EventEmitter, this);
+    let lookup;
+    let recvBufferSize;
+    let sendBufferSize;
+
+    let options;
+    if (type !== null && typeof type === 'object') {
+      options = type;
+      type = options.type;
+      lookup = options.lookup;
+      recvBufferSize = options.recvBufferSize;
+      sendBufferSize = options.sendBufferSize;
+    }
+
+    const handle = newHandle(type, lookup);
+    handle[owner_symbol] = this;
+
+    this[async_id_symbol] = handle.getAsyncId();
+    this.type = type;
+
+    if (typeof listener === 'function')
+      this.on('message', listener);
+
+    this[kStateSymbol] = {
+      handle,
+      receiving: false,
+      bindState: BIND_STATE_UNBOUND,
+      connectState: CONNECT_STATE_DISCONNECTED,
+      queue: undefined,
+      reuseAddr: options && options.reuseAddr, // Use UV_UDP_REUSEADDR if true.
+      ipv6Only: options && options.ipv6Only,
+      recvBufferSize,
+      sendBufferSize,
+    };
+
+    if (options?.signal !== undefined) {
+      const { signal } = options;
+      validateAbortSignal(signal, 'options.signal');
+      const onAborted = () => {
+        if (this[kStateSymbol].handle) this.close();
+      };
+      if (signal.aborted) {
+        onAborted();
+      } else {
+        const disposable = EventEmitter.addAbortListener(signal, onAborted);
+        this.once('close', disposable[SymbolDispose]);
+      }
+    }
+    if (udpSocketChannel.hasSubscribers) {
+      udpSocketChannel.publish({
+        socket: this,
+      });
+    }
+  }
+  ObjectSetPrototypeOf(Socket.prototype, EventEmitter.prototype);
+  ObjectSetPrototypeOf(Socket, EventEmitter);
+
+
+  function createSocket(type, listener) {
+    return new Socket(type, listener);
+  }
+
+
+  function startListening(socket) {
+    const state = socket[kStateSymbol];
+
+    state.handle.onmessage = onMessage;
+    state.handle.onerror = onError;
+    state.handle.recvStart();
+    state.receiving = true;
+    state.bindState = BIND_STATE_BOUND;
+
+    if (state.recvBufferSize)
+      bufferSize(socket, state.recvBufferSize, RECV_BUFFER);
+
+    if (state.sendBufferSize)
+      bufferSize(socket, state.sendBufferSize, SEND_BUFFER);
+
+    socket.emit('listening');
+  }
+
+  function replaceHandle(self, newHandle) {
+    const state = self[kStateSymbol];
+    const oldHandle = state.handle;
+    // Sync the old handle state to new handle
+    if (!oldHandle.hasRef() && typeof newHandle.unref === 'function') {
+      newHandle.unref();
+    }
+    // Set up the handle that we got from primary.
+    newHandle.lookup = oldHandle.lookup;
+    newHandle.bind = oldHandle.bind;
+    newHandle.send = oldHandle.send;
+    newHandle[owner_symbol] = self;
+
+    // Replace the existing handle by the handle we got from primary.
+    oldHandle.close();
+    state.handle = newHandle;
+  }
+
+  function bufferSize(self, size, buffer) {
+    if (size >>> 0 !== size)
+      throw new ERR_SOCKET_BAD_BUFFER_SIZE();
+
+    const ctx = {};
+    const ret = self[kStateSymbol].handle.bufferSize(size, buffer, ctx);
+    if (ret === undefined) {
+      throw new ERR_SOCKET_BUFFER_SIZE(ctx);
+    }
+    return ret;
+  }
+
+  // Query primary process to get the server handle and utilize it.
+  function bindServerHandle(self, options, errCb) {
+    const cluster = lazyLoadCluster();
+
+    const state = self[kStateSymbol];
+    cluster._getServer(self, options, (err, handle) => {
+      if (err) {
+        errCb(err);
+        return;
+      }
+
+      if (!state.handle) {
+        // Handle has been closed in the mean time.
+        return handle.close();
+      }
+
+      replaceHandle(self, handle);
+      startListening(self);
+    });
+  }
+
+  Socket.prototype.bind = function(port_, address_ /* , callback */) {
+    let port = port_;
+
+    healthCheck(this);
+    const state = this[kStateSymbol];
+
+    if (state.bindState !== BIND_STATE_UNBOUND)
+      throw new ERR_SOCKET_ALREADY_BOUND();
+
+    state.bindState = BIND_STATE_BINDING;
+
+    const cb = arguments.length && arguments[arguments.length - 1];
+    if (typeof cb === 'function') {
+      function removeListeners() {
+        this.removeListener('error', removeListeners);
+        this.removeListener('listening', onListening);
+      }
+
+      function onListening() {
+        FunctionPrototypeCall(removeListeners, this);
+        FunctionPrototypeCall(cb, this);
+      }
+
+      this.on('error', removeListeners);
+      this.on('listening', onListening);
+    }
+
+    if (port !== null &&
+        typeof port === 'object' &&
+        typeof port.recvStart === 'function') {
+      replaceHandle(this, port);
+      startListening(this);
+      return this;
+    }
+
+    // Open an existing fd instead of creating a new one.
+    if (port !== null && typeof port === 'object' &&
+        isInt32(port.fd) && port.fd > 0) {
+      const fd = port.fd;
+      const exclusive = !!port.exclusive;
+      const state = this[kStateSymbol];
+
+      const cluster = lazyLoadCluster();
+
+      if (cluster.isWorker && !exclusive) {
+        bindServerHandle(this, {
+          address: null,
+          port: null,
+          addressType: this.type,
+          fd,
+          flags: null,
+        }, (err) => {
+          // Callback to handle error.
+          const ex = errnoException(err, 'open');
+          state.bindState = BIND_STATE_UNBOUND;
+          this.emit('error', ex);
+        });
+        return this;
+      }
+
+      const type = guessHandleType(fd);
+      if (type !== 'UDP')
+        throw new ERR_INVALID_FD_TYPE(type);
+      const err = state.handle.open(fd);
+
+      if (err)
+        throw errnoException(err, 'open');
+
+      startListening(this);
+      return this;
+    }
+
+    let address;
+    let exclusive;
+
+    if (port !== null && typeof port === 'object') {
+      address = port.address || '';
+      exclusive = !!port.exclusive;
+      port = port.port;
+    } else {
+      address = typeof address_ === 'function' ? '' : address_;
+      exclusive = false;
+    }
+
+    // Defaulting address for bind to all interfaces
+    if (!address) {
+      if (this.type === 'udp4')
+        address = '0.0.0.0';
+      else
+        address = '::';
+    }
+
+    // Resolve address first
+    state.handle.lookup(address, (err, ip) => {
+      if (err) {
+        state.bindState = BIND_STATE_UNBOUND;
+        this.emit('error', err);
+        return;
+      }
+
+      const cluster = lazyLoadCluster();
+
+      let flags = 0;
+      if (state.reuseAddr)
+        flags |= UV_UDP_REUSEADDR;
+      if (state.ipv6Only)
+        flags |= UV_UDP_IPV6ONLY;
+
+      if (cluster.isWorker && !exclusive) {
+        bindServerHandle(this, {
+          address: ip,
+          port: port,
+          addressType: this.type,
+          fd: -1,
+          flags: flags,
+        }, (err) => {
+          // Callback to handle error.
+          const ex = exceptionWithHostPort(err, 'bind', ip, port);
+          state.bindState = BIND_STATE_UNBOUND;
+          this.emit('error', ex);
+        });
+      } else {
+        if (!state.handle)
+          return; // Handle has been closed in the mean time
+
+        const err = state.handle.bind(ip, port || 0, flags);
+        if (err) {
+          const ex = exceptionWithHostPort(err, 'bind', ip, port);
+          state.bindState = BIND_STATE_UNBOUND;
+          this.emit('error', ex);
+          // Todo: close?
+          return;
+        }
+
+        startListening(this);
+      }
+    });
+
+    return this;
+  };
+
+  Socket.prototype.connect = function(port, address, callback) {
+    port = validatePort(port, 'Port', false);
+    if (typeof address === 'function') {
+      callback = address;
+      address = '';
+    } else if (address === undefined) {
+      address = '';
+    }
+
+    validateString(address, 'address');
+
+    const state = this[kStateSymbol];
+
+    if (state.connectState !== CONNECT_STATE_DISCONNECTED)
+      throw new ERR_SOCKET_DGRAM_IS_CONNECTED();
+
+    state.connectState = CONNECT_STATE_CONNECTING;
+    if (state.bindState === BIND_STATE_UNBOUND)
+      this.bind({ port: 0, exclusive: true }, null);
+
+    if (state.bindState !== BIND_STATE_BOUND) {
+      enqueue(this, FunctionPrototypeBind(_connect, this,
+                                          port, address, callback));
+      return;
+    }
+
+    ReflectApply(_connect, this, [port, address, callback]);
+  };
+
+
+  function _connect(port, address, callback) {
+    const state = this[kStateSymbol];
+    if (callback)
+      this.once('connect', callback);
+
+    const afterDns = (ex, ip) => {
+      defaultTriggerAsyncIdScope(
+        this[async_id_symbol],
+        doConnect,
+        ex, this, ip, address, port, callback,
+      );
+    };
+
+    state.handle.lookup(address, afterDns);
+  }
+
+
+  function doConnect(ex, self, ip, address, port, callback) {
+    const state = self[kStateSymbol];
+    if (!state.handle)
+      return;
+
+    if (!ex) {
+      const err = state.handle.connect(ip, port);
+      if (err) {
+        ex = exceptionWithHostPort(err, 'connect', address, port);
+      }
+    }
+
+    if (ex) {
+      state.connectState = CONNECT_STATE_DISCONNECTED;
+      return process.nextTick(() => {
+        if (callback) {
+          self.removeListener('connect', callback);
+          callback(ex);
+        } else {
+          self.emit('error', ex);
+        }
+      });
+    }
+
+    state.connectState = CONNECT_STATE_CONNECTED;
+    process.nextTick(() => self.emit('connect'));
+  }
+
+
+  Socket.prototype.disconnect = function() {
+    const state = this[kStateSymbol];
+    if (state.connectState !== CONNECT_STATE_CONNECTED)
+      throw new ERR_SOCKET_DGRAM_NOT_CONNECTED();
+
+    const err = state.handle.disconnect();
+    if (err)
+      throw errnoException(err, 'connect');
+    else
+      state.connectState = CONNECT_STATE_DISCONNECTED;
+  };
+
+
+  // Thin wrapper around `send`, here for compatibility with dgram_legacy.js
+  Socket.prototype.sendto = function(buffer,
+                                     offset,
+                                     length,
+                                     port,
+                                     address,
+                                     callback) {
+    validateNumber(offset, 'offset');
+    validateNumber(length, 'length');
+    validateNumber(port, 'port');
+    validateString(address, 'address');
+
+    this.send(buffer, offset, length, port, address, callback);
+  };
+
+
+  function sliceBuffer(buffer, offset, length) {
+    if (typeof buffer === 'string') {
+      buffer = Buffer.from(buffer);
+    } else if (!isArrayBufferView(buffer)) {
+      throw new ERR_INVALID_ARG_TYPE('buffer',
+                                     ['Buffer',
+                                      'TypedArray',
+                                      'DataView',
+                                      'string'],
+                                     buffer);
+    }
+
+    offset = offset >>> 0;
+    length = length >>> 0;
+    if (offset > buffer.byteLength) {
+      throw new ERR_BUFFER_OUT_OF_BOUNDS('offset');
+    }
+
+    if (offset + length > buffer.byteLength) {
+      throw new ERR_BUFFER_OUT_OF_BOUNDS('length');
+    }
+
+    return Buffer.from(buffer.buffer, buffer.byteOffset + offset, length);
+  }
+
+
+  function fixBufferList(list) {
+    const newlist = new Array(list.length);
+
+    for (let i = 0, l = list.length; i < l; i++) {
+      const buf = list[i];
+      if (typeof buf === 'string')
+        newlist[i] = Buffer.from(buf);
+      else if (!isArrayBufferView(buf))
+        return null;
+      else
+        newlist[i] = Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+    }
+
+    return newlist;
+  }
+
+
+  function enqueue(self, toEnqueue) {
+    const state = self[kStateSymbol];
+
+    // If the send queue hasn't been initialized yet, do it, and install an
+    // event handler that flushes the send queue after binding is done.
+    if (state.queue === undefined) {
+      state.queue = [];
+      self.once(EventEmitter.errorMonitor, onListenError);
+      self.once('listening', onListenSuccess);
+    }
+    ArrayPrototypePush(state.queue, toEnqueue);
+  }
+
+
+  function onListenSuccess() {
+    this.removeListener(EventEmitter.errorMonitor, onListenError);
+    FunctionPrototypeCall(clearQueue, this);
+  }
+
+
+  function onListenError(err) {
+    this.removeListener('listening', onListenSuccess);
+    this[kStateSymbol].queue = undefined;
+  }
+
+
+  function clearQueue() {
+    const state = this[kStateSymbol];
+    const queue = state.queue;
+    state.queue = undefined;
+
+    // Flush the send queue.
+    for (const queueEntry of queue)
+      queueEntry();
+  }
+
+  // valid combinations
+  // For connectionless sockets
+  // send(buffer, offset, length, port, address, callback)
+  // send(buffer, offset, length, port, address)
+  // send(buffer, offset, length, port, callback)
+  // send(buffer, offset, length, port)
+  // send(bufferOrList, port, address, callback)
+  // send(bufferOrList, port, address)
+  // send(bufferOrList, port, callback)
+  // send(bufferOrList, port)
+  // For connected sockets
+  // send(buffer, offset, length, callback)
+  // send(buffer, offset, length)
+  // send(bufferOrList, callback)
+  // send(bufferOrList)
+  Socket.prototype.send = function(buffer,
+                                   offset,
+                                   length,
+                                   port,
+                                   address,
+                                   callback) {
+
+    let list;
+    const state = this[kStateSymbol];
+    const connected = state.connectState === CONNECT_STATE_CONNECTED;
+    if (!connected) {
+      if (address || (port && typeof port !== 'function')) {
+        buffer = sliceBuffer(buffer, offset, length);
+      } else {
+        callback = port;
+        port = offset;
+        address = length;
+      }
+    } else {
+      if (typeof length === 'number') {
+        buffer = sliceBuffer(buffer, offset, length);
+        if (typeof port === 'function') {
+          callback = port;
+          port = null;
+        }
+      } else {
+        callback = offset;
+      }
+
+      if (port || address)
+        throw new ERR_SOCKET_DGRAM_IS_CONNECTED();
+    }
+
+    if (!ArrayIsArray(buffer)) {
+      if (typeof buffer === 'string') {
+        list = [ Buffer.from(buffer) ];
+      } else if (!isArrayBufferView(buffer)) {
+        throw new ERR_INVALID_ARG_TYPE('buffer',
+                                       ['Buffer',
+                                        'TypedArray',
+                                        'DataView',
+                                        'string'],
+                                       buffer);
+      } else {
+        list = [ buffer ];
+      }
+    } else if (!(list = fixBufferList(buffer))) {
+      throw new ERR_INVALID_ARG_TYPE('buffer list arguments',
+                                     ['Buffer',
+                                      'TypedArray',
+                                      'DataView',
+                                      'string'],
+                                     buffer);
+    }
+
+    if (!connected)
+      port = validatePort(port, 'Port', false);
+
+    // Normalize callback so it's either a function or undefined but not anything
+    // else.
+    if (typeof callback !== 'function')
+      callback = undefined;
+
+    if (typeof address === 'function') {
+      callback = address;
+      address = undefined;
+    } else if (address != null) {
+      validateString(address, 'address');
+    }
+
+    healthCheck(this);
+
+    if (state.bindState === BIND_STATE_UNBOUND)
+      this.bind({ port: 0, exclusive: true }, null);
+
+    if (list.length === 0)
+      ArrayPrototypePush(list, Buffer.alloc(0));
+
+    // If the socket hasn't been bound yet, push the outbound packet onto the
+    // send queue and send after binding is complete.
+    if (state.bindState !== BIND_STATE_BOUND) {
+      enqueue(this, FunctionPrototypeBind(this.send, this,
+                                          list, port, address, callback));
+      return;
+    }
+
+    const afterDns = (ex, ip) => {
+      defaultTriggerAsyncIdScope(
+        this[async_id_symbol],
+        doSend,
+        ex, this, ip, list, address, port, callback,
+      );
+    };
+
+    if (!connected) {
+      state.handle.lookup(address, afterDns);
+    } else {
+      afterDns(null, null);
+    }
+  };
+
+  function doSend(ex, self, ip, list, address, port, callback) {
+    const state = self[kStateSymbol];
+
+    if (ex) {
+      if (typeof callback === 'function') {
+        process.nextTick(callback, ex);
+        return;
+      }
+
+      process.nextTick(() => self.emit('error', ex));
+      return;
+    } else if (!state.handle) {
+      return;
+    }
+
+    const req = new SendWrap();
+    req.list = list;  // Keep reference alive.
+    req.address = address;
+    req.port = port;
+    if (callback) {
+      req.callback = callback;
+      req.oncomplete = afterSend;
+    }
+
+    let err;
+    if (port)
+      err = state.handle.send(req, list, list.length, port, ip, !!callback);
+    else
+      err = state.handle.send(req, list, list.length, !!callback);
+
+    if (err >= 1) {
+      // Synchronous finish. The return code is msg_length + 1 so that we can
+      // distinguish between synchronous success and asynchronous success.
+      if (callback)
+        process.nextTick(callback, null, err - 1);
+      return;
+    }
+
+    if (err && callback) {
+      // Don't emit as error, dgram_legacy.js compatibility
+      const ex = exceptionWithHostPort(err, 'send', address, port);
+      process.nextTick(callback, ex);
+    }
+  }
+
+  function afterSend(err, sent) {
+    if (err) {
+      err = exceptionWithHostPort(err, 'send', this.address, this.port);
+    } else {
+      err = null;
+    }
+
+    this.callback(err, sent);
+  }
+
+  Socket.prototype.close = function(callback) {
+    const state = this[kStateSymbol];
+    const queue = state.queue;
+
+    if (typeof callback === 'function')
+      this.on('close', callback);
+
+    if (queue !== undefined) {
+      ArrayPrototypePush(queue, FunctionPrototypeBind(this.close, this));
+      return this;
+    }
+
+    healthCheck(this);
+    stopReceiving(this);
+    state.handle.close();
+    state.handle = null;
+    defaultTriggerAsyncIdScope(this[async_id_symbol],
+                               process.nextTick,
+                               socketCloseNT,
+                               this);
+
+    return this;
+  };
+
+  Socket.prototype[SymbolAsyncDispose] = async function() {
+    if (!this[kStateSymbol].handle) {
+      return;
+    }
+    return FunctionPrototypeCall(promisify(this.close), this);
+  };
+
+
+  function socketCloseNT(self) {
+    self.emit('close');
+  }
+
+
+  Socket.prototype.address = function() {
+    healthCheck(this);
+
+    const out = {};
+    const err = this[kStateSymbol].handle.getsockname(out);
+    if (err) {
+      throw errnoException(err, 'getsockname');
+    }
+
+    return out;
+  };
+
+  Socket.prototype.remoteAddress = function() {
+    healthCheck(this);
+
+    const state = this[kStateSymbol];
+    if (state.connectState !== CONNECT_STATE_CONNECTED)
+      throw new ERR_SOCKET_DGRAM_NOT_CONNECTED();
+
+    const out = {};
+    const err = state.handle.getpeername(out);
+    if (err)
+      throw errnoException(err, 'getpeername');
+
+    return out;
+  };
+
+
+  Socket.prototype.setBroadcast = function(arg) {
+    const err = this[kStateSymbol].handle.setBroadcast(arg ? 1 : 0);
+    if (err) {
+      throw errnoException(err, 'setBroadcast');
+    }
+  };
+
+
+  Socket.prototype.setTTL = function(ttl) {
+    validateNumber(ttl, 'ttl');
+
+    const err = this[kStateSymbol].handle.setTTL(ttl);
+    if (err) {
+      throw errnoException(err, 'setTTL');
+    }
+
+    return ttl;
+  };
+
+
+  Socket.prototype.setMulticastTTL = function(ttl) {
+    validateNumber(ttl, 'ttl');
+
+    const err = this[kStateSymbol].handle.setMulticastTTL(ttl);
+    if (err) {
+      throw errnoException(err, 'setMulticastTTL');
+    }
+
+    return ttl;
+  };
+
+
+  Socket.prototype.setMulticastLoopback = function(arg) {
+    const err = this[kStateSymbol].handle.setMulticastLoopback(arg ? 1 : 0);
+    if (err) {
+      throw errnoException(err, 'setMulticastLoopback');
+    }
+
+    return arg; // 0.4 compatibility
+  };
+
+
+  Socket.prototype.setMulticastInterface = function(interfaceAddress) {
+    healthCheck(this);
+    validateString(interfaceAddress, 'interfaceAddress');
+
+    const err = this[kStateSymbol].handle.setMulticastInterface(interfaceAddress);
+    if (err) {
+      throw errnoException(err, 'setMulticastInterface');
+    }
+  };
+
+  Socket.prototype.addMembership = function(multicastAddress,
+                                            interfaceAddress) {
+    healthCheck(this);
+
+    if (!multicastAddress) {
+      throw new ERR_MISSING_ARGS('multicastAddress');
+    }
+
+    const { handle } = this[kStateSymbol];
+    const err = handle.addMembership(multicastAddress, interfaceAddress);
+    if (err) {
+      throw errnoException(err, 'addMembership');
+    }
+  };
+
+
+  Socket.prototype.dropMembership = function(multicastAddress,
+                                             interfaceAddress) {
+    healthCheck(this);
+
+    if (!multicastAddress) {
+      throw new ERR_MISSING_ARGS('multicastAddress');
+    }
+
+    const { handle } = this[kStateSymbol];
+    const err = handle.dropMembership(multicastAddress, interfaceAddress);
+    if (err) {
+      throw errnoException(err, 'dropMembership');
+    }
+  };
+
+  Socket.prototype.addSourceSpecificMembership = function(sourceAddress,
+                                                          groupAddress,
+                                                          interfaceAddress) {
+    healthCheck(this);
+
+    validateString(sourceAddress, 'sourceAddress');
+    validateString(groupAddress, 'groupAddress');
+
+    const err =
+      this[kStateSymbol].handle.addSourceSpecificMembership(sourceAddress,
+                                                            groupAddress,
+                                                            interfaceAddress);
+    if (err) {
+      throw errnoException(err, 'addSourceSpecificMembership');
+    }
+  };
+
+
+  Socket.prototype.dropSourceSpecificMembership = function(sourceAddress,
+                                                           groupAddress,
+                                                           interfaceAddress) {
+    healthCheck(this);
+
+    validateString(sourceAddress, 'sourceAddress');
+    validateString(groupAddress, 'groupAddress');
+
+    const err =
+      this[kStateSymbol].handle.dropSourceSpecificMembership(sourceAddress,
+                                                             groupAddress,
+                                                             interfaceAddress);
+    if (err) {
+      throw errnoException(err, 'dropSourceSpecificMembership');
+    }
+  };
+
+
+  function healthCheck(socket) {
+    if (!socket[kStateSymbol].handle) {
+      // Error message from dgram_legacy.js.
+      throw new ERR_SOCKET_DGRAM_NOT_RUNNING();
+    }
+  }
+
+
+  function stopReceiving(socket) {
+    const state = socket[kStateSymbol];
+
+    if (!state.receiving)
+      return;
+
+    state.handle.recvStop();
+    state.receiving = false;
+  }
+
+
+  function onMessage(nread, handle, buf, rinfo) {
+    const self = handle[owner_symbol];
+    if (nread < 0) {
+      return self.emit('error', errnoException(nread, 'recvmsg'));
+    }
+    rinfo.size = buf.length; // compatibility
+    self.emit('message', buf, rinfo);
+  }
+
+
+  function onError(nread, handle, error) {
+    const self = handle[owner_symbol];
+    return self.emit('error', error);
+  }
+
+
+  Socket.prototype.ref = function() {
+    const handle = this[kStateSymbol].handle;
+
+    if (handle)
+      handle.ref();
+
+    return this;
+  };
+
+
+  Socket.prototype.unref = function() {
+    const handle = this[kStateSymbol].handle;
+
+    if (handle)
+      handle.unref();
+
+    return this;
+  };
+
+
+  Socket.prototype.setRecvBufferSize = function(size) {
+    bufferSize(this, size, RECV_BUFFER);
+  };
+
+
+  Socket.prototype.setSendBufferSize = function(size) {
+    bufferSize(this, size, SEND_BUFFER);
+  };
+
+
+  Socket.prototype.getRecvBufferSize = function() {
+    return bufferSize(this, 0, RECV_BUFFER);
+  };
+
+
+  Socket.prototype.getSendBufferSize = function() {
+    return bufferSize(this, 0, SEND_BUFFER);
+  };
+
+  Socket.prototype.getSendQueueSize = function() {
+    return this[kStateSymbol].handle.getSendQueueSize();
+  };
+
+  Socket.prototype.getSendQueueCount = function() {
+    return this[kStateSymbol].handle.getSendQueueCount();
+  };
+
+  // Deprecated private APIs.
+  ObjectDefineProperty(Socket.prototype, '_handle', {
+    __proto__: null,
+    get: deprecate(function() {
+      return this[kStateSymbol].handle;
+    }, 'Socket.prototype._handle is deprecated', 'DEP0112'),
+    set: deprecate(function(val) {
+      this[kStateSymbol].handle = val;
+    }, 'Socket.prototype._handle is deprecated', 'DEP0112'),
+  });
+
+
+  ObjectDefineProperty(Socket.prototype, '_receiving', {
+    __proto__: null,
+    get: deprecate(function() {
+      return this[kStateSymbol].receiving;
+    }, 'Socket.prototype._receiving is deprecated', 'DEP0112'),
+    set: deprecate(function(val) {
+      this[kStateSymbol].receiving = val;
+    }, 'Socket.prototype._receiving is deprecated', 'DEP0112'),
+  });
+
+
+  ObjectDefineProperty(Socket.prototype, '_bindState', {
+    __proto__: null,
+    get: deprecate(function() {
+      return this[kStateSymbol].bindState;
+    }, 'Socket.prototype._bindState is deprecated', 'DEP0112'),
+    set: deprecate(function(val) {
+      this[kStateSymbol].bindState = val;
+    }, 'Socket.prototype._bindState is deprecated', 'DEP0112'),
+  });
+
+
+  ObjectDefineProperty(Socket.prototype, '_queue', {
+    __proto__: null,
+    get: deprecate(function() {
+      return this[kStateSymbol].queue;
+    }, 'Socket.prototype._queue is deprecated', 'DEP0112'),
+    set: deprecate(function(val) {
+      this[kStateSymbol].queue = val;
+    }, 'Socket.prototype._queue is deprecated', 'DEP0112'),
+  });
+
+
+  ObjectDefineProperty(Socket.prototype, '_reuseAddr', {
+    __proto__: null,
+    get: deprecate(function() {
+      return this[kStateSymbol].reuseAddr;
+    }, 'Socket.prototype._reuseAddr is deprecated', 'DEP0112'),
+    set: deprecate(function(val) {
+      this[kStateSymbol].reuseAddr = val;
+    }, 'Socket.prototype._reuseAddr is deprecated', 'DEP0112'),
+  });
+
+
+  Socket.prototype._healthCheck = deprecate(function() {
+    healthCheck(this);
+  }, 'Socket.prototype._healthCheck() is deprecated', 'DEP0112');
+
+
+  Socket.prototype._stopReceiving = deprecate(function() {
+    stopReceiving(this);
+  }, 'Socket.prototype._stopReceiving() is deprecated', 'DEP0112');
+
+
+  // Legacy alias on the C++ wrapper object. This is not public API, so we may
+  // want to runtime-deprecate it at some point. There's no hurry, though.
+  ObjectDefineProperty(UDP.prototype, 'owner', {
+    __proto__: null,
+    get() { return this[owner_symbol]; },
+    set(v) { return this[owner_symbol] = v; },
+  });
+
+
+  module.exports = {
+    _createSocketHandle: deprecate(
+      _createSocketHandle,
+      'dgram._createSocketHandle() is deprecated',
+      'DEP0112',
+    ),
+    createSocket,
+    Socket,
+  };
+});
+
+defineModule("internal/dns/utils", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+
+  const {
+    ArrayPrototypeForEach,
+    ArrayPrototypeMap,
+    ArrayPrototypePush,
+    FunctionPrototypeBind,
+    NumberParseInt,
+    RegExpPrototypeExec,
+    RegExpPrototypeSymbolReplace,
+    Symbol,
+  } = primordials;
+
+  const errors = require('internal/errors');
+  const { isIP } = require('internal/net');
+  const { getOptionValue } = require('internal/options');
+  const {
+    validateArray,
+    validateInt32,
+    validateOneOf,
+    validateString,
+  } = require('internal/validators');
+  let binding;
+  function lazyBinding() {
+    binding ??= internalBinding('cares_wrap');
+    return binding;
+  }
+  const IANA_DNS_PORT = 53;
+  const IPv6RE = /^\[([^[\]]*)\]/;
+  const addrSplitRE = /(^.+?)(?::(\d+))?$/;
+  const {
+    ERR_DNS_SET_SERVERS_FAILED,
+    ERR_INVALID_ARG_VALUE,
+    ERR_INVALID_IP_ADDRESS,
+  } = errors.codes;
+
+  const {
+    namespace: {
+      addSerializeCallback,
+      addDeserializeCallback,
+      isBuildingSnapshot,
+    },
+  } = require('internal/v8/startup_snapshot');
+
+  function validateTimeout(options) {
+    const { timeout = -1 } = { ...options };
+    validateInt32(timeout, 'options.timeout', -1);
+    return timeout;
+  }
+
+  function validateTries(options) {
+    const { tries = 4 } = { ...options };
+    validateInt32(tries, 'options.tries', 1);
+    return tries;
+  }
+
+  const kSerializeResolver = Symbol('dns:resolver:serialize');
+  const kDeserializeResolver = Symbol('dns:resolver:deserialize');
+  const kSnapshotStates = Symbol('dns:resolver:config');
+  const kInitializeHandle = Symbol('dns:resolver:initializeHandle');
+  const kSetServersInteral = Symbol('dns:resolver:setServers');
+
+  // Resolver instances correspond 1:1 to c-ares channels.
+
+  class ResolverBase {
+    constructor(options = undefined) {
+      const timeout = validateTimeout(options);
+      const tries = validateTries(options);
+      // If we are building snapshot, save the states of the resolver along
+      // the way.
+      if (isBuildingSnapshot()) {
+        this[kSnapshotStates] = { timeout, tries };
+      }
+      this[kInitializeHandle](timeout, tries);
+    }
+
+    [kInitializeHandle](timeout, tries) {
+      const { ChannelWrap } = lazyBinding();
+      this._handle = new ChannelWrap(timeout, tries);
+    }
+
+    cancel() {
+      this._handle.cancel();
+    }
+
+    getServers() {
+      return ArrayPrototypeMap(this._handle.getServers() || [], (val) => {
+        if (!val[1] || val[1] === IANA_DNS_PORT)
+          return val[0];
+
+        const host = isIP(val[0]) === 6 ? `[${val[0]}]` : val[0];
+        return `${host}:${val[1]}`;
+      });
+    }
+
+    setServers(servers) {
+      validateArray(servers, 'servers');
+
+      // Cache the original servers because in the event of an error while
+      // setting the servers, c-ares won't have any servers available for
+      // resolution.
+      const newSet = [];
+      ArrayPrototypeForEach(servers, (serv, index) => {
+        validateString(serv, `servers[${index}]`);
+        let ipVersion = isIP(serv);
+
+        if (ipVersion !== 0)
+          return ArrayPrototypePush(newSet, [ipVersion, serv, IANA_DNS_PORT]);
+
+        const match = RegExpPrototypeExec(IPv6RE, serv);
+
+        // Check for an IPv6 in brackets.
+        if (match) {
+          ipVersion = isIP(match[1]);
+
+          if (ipVersion !== 0) {
+            const port = NumberParseInt(
+              RegExpPrototypeSymbolReplace(addrSplitRE, serv, '$2')) || IANA_DNS_PORT;
+            return ArrayPrototypePush(newSet, [ipVersion, match[1], port]);
+          }
+        }
+
+        // addr::port
+        const addrSplitMatch = RegExpPrototypeExec(addrSplitRE, serv);
+
+        if (addrSplitMatch) {
+          const hostIP = addrSplitMatch[1];
+          const port = addrSplitMatch[2] || IANA_DNS_PORT;
+
+          ipVersion = isIP(hostIP);
+
+          if (ipVersion !== 0) {
+            return ArrayPrototypePush(
+              newSet, [ipVersion, hostIP, NumberParseInt(port)]);
+          }
+        }
+
+        throw new ERR_INVALID_IP_ADDRESS(serv);
+      });
+
+      this[kSetServersInteral](newSet, servers);
+    }
+
+    [kSetServersInteral](newSet, servers) {
+      const orig = ArrayPrototypeMap(this._handle.getServers() || [], (val) => {
+        val.unshift(isIP(val[0]));
+        return val;
+      });
+      const errorNumber = this._handle.setServers(newSet);
+
+      if (errorNumber !== 0) {
+        // Reset the servers to the old servers, because ares probably unset them.
+        this._handle.setServers(orig);
+        const { strerror } = lazyBinding();
+        const err = strerror(errorNumber);
+        throw new ERR_DNS_SET_SERVERS_FAILED(err, servers);
+      }
+
+      if (isBuildingSnapshot()) {
+        this[kSnapshotStates].servers = newSet;
+      }
+    }
+
+
+    setLocalAddress(ipv4, ipv6) {
+      validateString(ipv4, 'ipv4');
+
+      if (ipv6 !== undefined) {
+        validateString(ipv6, 'ipv6');
+      }
+
+      this._handle.setLocalAddress(ipv4, ipv6);
+
+      if (isBuildingSnapshot()) {
+        this[kSnapshotStates].localAddress = { ipv4, ipv6 };
+      }
+    }
+
+    // TODO(joyeecheung): consider exposing this if custom DNS resolvers
+    // end up being useful for snapshot users.
+    [kSerializeResolver]() {
+      this._handle = null;  // We'll restore it during deserialization.
+      addDeserializeCallback(function deserializeResolver(resolver) {
+        resolver[kDeserializeResolver]();
+      }, this);
+    }
+
+    [kDeserializeResolver]() {
+      const { timeout, tries, localAddress, servers } = this[kSnapshotStates];
+      this[kInitializeHandle](timeout, tries);
+      if (localAddress) {
+        const { ipv4, ipv6 } = localAddress;
+        this._handle.setLocalAddress(ipv4, ipv6);
+      }
+      if (servers) {
+        this[kSetServersInteral](servers, servers);
+      }
+    }
+  }
+
+  let defaultResolver;
+  let dnsOrder = getOptionValue('--dns-result-order') || 'verbatim'; // lumen
+
+  function initializeDns() {
+    const orderFromCLI = getOptionValue('--dns-result-order');
+    if (!orderFromCLI) {
+      dnsOrder ??= 'verbatim';
+    } else {
+      // Allow the deserialized application to override order from CLI.
+      dnsOrder = orderFromCLI;
+    }
+
+    if (!isBuildingSnapshot()) {
+      return;
+    }
+
+    addSerializeCallback(() => {
+      defaultResolver?.[kSerializeResolver]();
+    });
+  }
+
+  const resolverKeys = [
+    'getServers',
+    'resolve',
+    'resolve4',
+    'resolve6',
+    'resolveAny',
+    'resolveCaa',
+    'resolveCname',
+    'resolveMx',
+    'resolveNaptr',
+    'resolveNs',
+    'resolvePtr',
+    'resolveSoa',
+    'resolveSrv',
+    'resolveTxt',
+    'reverse',
+  ];
+
+  function getDefaultResolver() {
+    // We do this here instead of pre-execution so that the default resolver is
+    // only ever created when the user loads any dns module.
+    if (defaultResolver === undefined) {
+      defaultResolver = new ResolverBase();
+    }
+    return defaultResolver;
+  }
+
+  function setDefaultResolver(resolver) {
+    defaultResolver = resolver;
+  }
+
+  function bindDefaultResolver(target, source) {
+    const defaultResolver = getDefaultResolver();
+    ArrayPrototypeForEach(resolverKeys, (key) => {
+      target[key] = FunctionPrototypeBind(source[key], defaultResolver);
+    });
+  }
+
+  function validateHints(hints) {
+    const { AI_ADDRCONFIG, AI_ALL, AI_V4MAPPED } = lazyBinding();
+    if ((hints & ~(AI_ADDRCONFIG | AI_ALL | AI_V4MAPPED)) !== 0) {
+      throw new ERR_INVALID_ARG_VALUE('hints', hints);
+    }
+  }
+
+  let invalidHostnameWarningEmitted = false;
+  function emitInvalidHostnameWarning(hostname) {
+    if (!invalidHostnameWarningEmitted) {
+      process.emitWarning(
+        `The provided hostname "${hostname}" is not a valid ` +
+        'hostname, and is supported in the dns module solely for compatibility.',
+        'DeprecationWarning',
+        'DEP0118',
+      );
+      invalidHostnameWarningEmitted = true;
+    }
+  }
+
+  function getDefaultVerbatim() {
+    return dnsOrder !== 'ipv4first';
+  }
+
+  function setDefaultResultOrder(value) {
+    validateOneOf(value, 'dnsOrder', ['verbatim', 'ipv4first']);
+    dnsOrder = value;
+  }
+
+  function getDefaultResultOrder() {
+    return dnsOrder;
+  }
+
+  function createResolverClass(resolver) {
+    const resolveMap = { __proto__: null };
+
+    class Resolver extends ResolverBase {}
+
+    Resolver.prototype.resolveAny = resolveMap.ANY = resolver('queryAny');
+    Resolver.prototype.resolve4 = resolveMap.A = resolver('queryA');
+    Resolver.prototype.resolve6 = resolveMap.AAAA = resolver('queryAaaa');
+    Resolver.prototype.resolveCaa = resolveMap.CAA = resolver('queryCaa');
+    Resolver.prototype.resolveCname = resolveMap.CNAME = resolver('queryCname');
+    Resolver.prototype.resolveMx = resolveMap.MX = resolver('queryMx');
+    Resolver.prototype.resolveNs = resolveMap.NS = resolver('queryNs');
+    Resolver.prototype.resolveTxt = resolveMap.TXT = resolver('queryTxt');
+    Resolver.prototype.resolveSrv = resolveMap.SRV = resolver('querySrv');
+    Resolver.prototype.resolvePtr = resolveMap.PTR = resolver('queryPtr');
+    Resolver.prototype.resolveNaptr = resolveMap.NAPTR = resolver('queryNaptr');
+    Resolver.prototype.resolveSoa = resolveMap.SOA = resolver('querySoa');
+    Resolver.prototype.reverse = resolver('getHostByAddr');
+
+    return {
+      resolveMap,
+      Resolver,
+    };
+  }
+
+  // ERROR CODES
+  const errorCodes = {
+    NODATA: 'ENODATA',
+    FORMERR: 'EFORMERR',
+    SERVFAIL: 'ESERVFAIL',
+    NOTFOUND: 'ENOTFOUND',
+    NOTIMP: 'ENOTIMP',
+    REFUSED: 'EREFUSED',
+    BADQUERY: 'EBADQUERY',
+    BADNAME: 'EBADNAME',
+    BADFAMILY: 'EBADFAMILY',
+    BADRESP: 'EBADRESP',
+    CONNREFUSED: 'ECONNREFUSED',
+    TIMEOUT: 'ETIMEOUT',
+    EOF: 'EOF',
+    FILE: 'EFILE',
+    NOMEM: 'ENOMEM',
+    DESTRUCTION: 'EDESTRUCTION',
+    BADSTR: 'EBADSTR',
+    BADFLAGS: 'EBADFLAGS',
+    NONAME: 'ENONAME',
+    BADHINTS: 'EBADHINTS',
+    NOTINITIALIZED: 'ENOTINITIALIZED',
+    LOADIPHLPAPI: 'ELOADIPHLPAPI',
+    ADDRGETNETWORKPARAMS: 'EADDRGETNETWORKPARAMS',
+    CANCELLED: 'ECANCELLED',
+  };
+
+  module.exports = {
+    bindDefaultResolver,
+    getDefaultResolver,
+    setDefaultResolver,
+    validateHints,
+    validateTimeout,
+    validateTries,
+    emitInvalidHostnameWarning,
+    getDefaultVerbatim,
+    getDefaultResultOrder,
+    setDefaultResultOrder,
+    errorCodes,
+    createResolverClass,
+    initializeDns,
+  };
+});
+
+defineModule("internal/dns/promises", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+  const {
+    ArrayPrototypeMap,
+    ObjectDefineProperty,
+    Promise,
+    ReflectApply,
+    Symbol,
+  } = primordials;
+
+  const {
+    bindDefaultResolver,
+    createResolverClass,
+    validateHints,
+    emitInvalidHostnameWarning,
+    getDefaultVerbatim,
+    errorCodes: dnsErrorCodes,
+    getDefaultResultOrder,
+    setDefaultResultOrder,
+    setDefaultResolver,
+  } = require('internal/dns/utils');
+
+  const {
+    NODATA,
+    FORMERR,
+    SERVFAIL,
+    NOTFOUND,
+    NOTIMP,
+    REFUSED,
+    BADQUERY,
+    BADNAME,
+    BADFAMILY,
+    BADRESP,
+    CONNREFUSED,
+    TIMEOUT,
+    EOF,
+    FILE,
+    NOMEM,
+    DESTRUCTION,
+    BADSTR,
+    BADFLAGS,
+    NONAME,
+    BADHINTS,
+    NOTINITIALIZED,
+    LOADIPHLPAPI,
+    ADDRGETNETWORKPARAMS,
+    CANCELLED,
+  } = dnsErrorCodes;
+  const { codes, dnsException } = require('internal/errors');
+  const { isIP } = require('internal/net');
+  const {
+    getaddrinfo,
+    getnameinfo,
+    GetAddrInfoReqWrap,
+    GetNameInfoReqWrap,
+    QueryReqWrap,
+  } = internalBinding('cares_wrap');
+  const {
+    ERR_INVALID_ARG_TYPE,
+    ERR_INVALID_ARG_VALUE,
+    ERR_MISSING_ARGS,
+  } = codes;
+  const {
+    validateBoolean,
+    validateNumber,
+    validateOneOf,
+    validatePort,
+    validateString,
+  } = require('internal/validators');
+
+  const kPerfHooksDnsLookupContext = Symbol('kPerfHooksDnsLookupContext');
+  const kPerfHooksDnsLookupServiceContext = Symbol('kPerfHooksDnsLookupServiceContext');
+  const kPerfHooksDnsLookupResolveContext = Symbol('kPerfHooksDnsLookupResolveContext');
+
+  const {
+    hasObserver,
+    startPerf,
+    stopPerf,
+  } = require('internal/perf/observe');
+
+  function onlookup(err, addresses) {
+    if (err) {
+      this.reject(dnsException(err, 'getaddrinfo', this.hostname));
+      return;
+    }
+
+    const family = this.family || isIP(addresses[0]);
+    this.resolve({ address: addresses[0], family });
+    if (this[kPerfHooksDnsLookupContext] && hasObserver('dns')) {
+      stopPerf(this, kPerfHooksDnsLookupContext, { detail: { addresses } });
+    }
+  }
+
+  function onlookupall(err, addresses) {
+    if (err) {
+      this.reject(dnsException(err, 'getaddrinfo', this.hostname));
+      return;
+    }
+
+    const family = this.family;
+
+    for (let i = 0; i < addresses.length; i++) {
+      const address = addresses[i];
+
+      addresses[i] = {
+        address,
+        family: family || isIP(addresses[i]),
+      };
+    }
+
+    this.resolve(addresses);
+    if (this[kPerfHooksDnsLookupContext] && hasObserver('dns')) {
+      stopPerf(this, kPerfHooksDnsLookupContext, { detail: { addresses } });
+    }
+  }
+
+  /**
+   * Creates a promise that resolves with the IP address of the given hostname.
+   * @param {0 | 4 | 6} family - The IP address family (4 or 6, or 0 for both).
+   * @param {string} hostname - The hostname to resolve.
+   * @param {boolean} all - Whether to resolve with all IP addresses for the hostname.
+   * @param {number} hints - One or more supported getaddrinfo flags (supply multiple via
+   * bitwise OR).
+   * @param {boolean} verbatim - Whether to use the hostname verbatim.
+   * @returns {Promise<DNSLookupResult | DNSLookupResult[]>} The IP address(es) of the hostname.
+   * @typedef {object} DNSLookupResult
+   * @property {string} address - The IP address.
+   * @property {0 | 4 | 6} family - The IP address type. 4 for IPv4 or 6 for IPv6, or 0 (for both).
+   */
+  function createLookupPromise(family, hostname, all, hints, verbatim) {
+    return new Promise((resolve, reject) => {
+      if (!hostname) {
+        emitInvalidHostnameWarning(hostname);
+        resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
+        return;
+      }
+
+      const matchedFamily = isIP(hostname);
+
+      if (matchedFamily !== 0) {
+        const result = { address: hostname, family: matchedFamily };
+        resolve(all ? [result] : result);
+        return;
+      }
+
+      const req = new GetAddrInfoReqWrap();
+
+      req.family = family;
+      req.hostname = hostname;
+      req.oncomplete = all ? onlookupall : onlookup;
+      req.resolve = resolve;
+      req.reject = reject;
+
+      const err = getaddrinfo(req, hostname, family, hints, verbatim);
+
+      if (err) {
+        reject(dnsException(err, 'getaddrinfo', hostname));
+      } else if (hasObserver('dns')) {
+        const detail = {
+          hostname,
+          family,
+          hints,
+          verbatim,
+        };
+        startPerf(req, kPerfHooksDnsLookupContext, { type: 'dns', name: 'lookup', detail });
+      }
+    });
+  }
+
+  const validFamilies = [0, 4, 6];
+  /**
+   * Get the IP address for a given hostname.
+   * @param {string} hostname - The hostname to resolve (ex. 'nodejs.org').
+   * @param {object} [options] - Optional settings.
+   * @param {boolean} [options.all=false] - Whether to return all or just the first resolved address.
+   * @param {0 | 4 | 6} [options.family=0] - The record family. Must be 4, 6, or 0 (for both).
+   * @param {number} [options.hints] - One or more supported getaddrinfo flags (supply multiple via
+   * bitwise OR).
+   * @param {boolean} [options.verbatim=false] - Return results in same order DNS resolved them;
+   * otherwise IPv4 then IPv6. New code should supply `true`.
+   */
+  function lookup(hostname, options) {
+    let hints = 0;
+    let family = 0;
+    let all = false;
+    let verbatim = getDefaultVerbatim();
+
+    // Parse arguments
+    if (hostname) {
+      validateString(hostname, 'hostname');
+    }
+
+    if (typeof options === 'number') {
+      validateOneOf(options, 'family', validFamilies);
+      family = options;
+    } else if (options !== undefined && typeof options !== 'object') {
+      throw new ERR_INVALID_ARG_TYPE('options', ['integer', 'object'], options);
+    } else {
+      if (options?.hints != null) {
+        validateNumber(options.hints, 'options.hints');
+        hints = options.hints >>> 0;
+        validateHints(hints);
+      }
+      if (options?.family != null) {
+        validateOneOf(options.family, 'options.family', validFamilies);
+        family = options.family;
+      }
+      if (options?.all != null) {
+        validateBoolean(options.all, 'options.all');
+        all = options.all;
+      }
+      if (options?.verbatim != null) {
+        validateBoolean(options.verbatim, 'options.verbatim');
+        verbatim = options.verbatim;
+      }
+    }
+
+    return createLookupPromise(family, hostname, all, hints, verbatim);
+  }
+
+
+  function onlookupservice(err, hostname, service) {
+    if (err) {
+      this.reject(dnsException(err, 'getnameinfo', this.host));
+      return;
+    }
+
+    this.resolve({ hostname, service });
+    if (this[kPerfHooksDnsLookupServiceContext] && hasObserver('dns')) {
+      stopPerf(this, kPerfHooksDnsLookupServiceContext, { detail: { hostname, service } });
+    }
+  }
+
+  function createLookupServicePromise(hostname, port) {
+    return new Promise((resolve, reject) => {
+      const req = new GetNameInfoReqWrap();
+
+      req.hostname = hostname;
+      req.port = port;
+      req.oncomplete = onlookupservice;
+      req.resolve = resolve;
+      req.reject = reject;
+
+      const err = getnameinfo(req, hostname, port);
+
+      if (err)
+        reject(dnsException(err, 'getnameinfo', hostname));
+      else if (hasObserver('dns')) {
+        startPerf(req, kPerfHooksDnsLookupServiceContext, {
+          type: 'dns',
+          name: 'lookupService',
+          detail: {
+            host: hostname,
+            port,
+          },
+        });
+      }
+    });
+  }
+
+  function lookupService(address, port) {
+    if (arguments.length !== 2)
+      throw new ERR_MISSING_ARGS('address', 'port');
+
+    if (isIP(address) === 0)
+      throw new ERR_INVALID_ARG_VALUE('address', address);
+
+    validatePort(port);
+
+    return createLookupServicePromise(address, +port);
+  }
+
+
+  function onresolve(err, result, ttls) {
+    if (err) {
+      this.reject(dnsException(err, this.bindingName, this.hostname));
+      return;
+    }
+
+    if (ttls && this.ttl)
+      result = ArrayPrototypeMap(
+        result, (address, index) => ({ address, ttl: ttls[index] }));
+
+    this.resolve(result);
+    if (this[kPerfHooksDnsLookupResolveContext] && hasObserver('dns')) {
+      stopPerf(this, kPerfHooksDnsLookupResolveContext, { detail: { result } });
+    }
+  }
+
+  function createResolverPromise(resolver, bindingName, hostname, ttl) {
+    return new Promise((resolve, reject) => {
+      const req = new QueryReqWrap();
+
+      req.bindingName = bindingName;
+      req.hostname = hostname;
+      req.oncomplete = onresolve;
+      req.resolve = resolve;
+      req.reject = reject;
+      req.ttl = ttl;
+
+      const err = resolver._handle[bindingName](req, hostname);
+
+      if (err)
+        reject(dnsException(err, bindingName, hostname));
+      else if (hasObserver('dns')) {
+        startPerf(req, kPerfHooksDnsLookupResolveContext, {
+          type: 'dns',
+          name: bindingName,
+          detail: {
+            host: hostname,
+            ttl,
+          },
+        });
+      }
+    });
+  }
+
+  function resolver(bindingName) {
+    function query(name, options) {
+      validateString(name, 'name');
+
+      const ttl = !!(options && options.ttl);
+      return createResolverPromise(this, bindingName, name, ttl);
+    }
+
+    ObjectDefineProperty(query, 'name', { __proto__: null, value: bindingName });
+    return query;
+  }
+
+  function resolve(hostname, rrtype) {
+    let resolver;
+
+    if (rrtype !== undefined) {
+      validateString(rrtype, 'rrtype');
+
+      resolver = resolveMap[rrtype];
+
+      if (typeof resolver !== 'function')
+        throw new ERR_INVALID_ARG_VALUE('rrtype', rrtype);
+    } else {
+      resolver = resolveMap.A;
+    }
+
+    return ReflectApply(resolver, this, [hostname]);
+  }
+
+  // Promise-based resolver.
+  const { Resolver, resolveMap } = createResolverClass(resolver);
+  Resolver.prototype.resolve = resolve;
+
+  function defaultResolverSetServers(servers) {
+    const resolver = new Resolver();
+
+    resolver.setServers(servers);
+    setDefaultResolver(resolver);
+    bindDefaultResolver(module.exports, Resolver.prototype);
+  }
+
+  module.exports = {
+    lookup,
+    lookupService,
+    Resolver,
+    getDefaultResultOrder,
+    setDefaultResultOrder,
+    setServers: defaultResolverSetServers,
+
+    // ERROR CODES
+    NODATA,
+    FORMERR,
+    SERVFAIL,
+    NOTFOUND,
+    NOTIMP,
+    REFUSED,
+    BADQUERY,
+    BADNAME,
+    BADFAMILY,
+    BADRESP,
+    CONNREFUSED,
+    TIMEOUT,
+    EOF,
+    FILE,
+    NOMEM,
+    DESTRUCTION,
+    BADSTR,
+    BADFLAGS,
+    NONAME,
+    BADHINTS,
+    NOTINITIALIZED,
+    LOADIPHLPAPI,
+    ADDRGETNETWORKPARAMS,
+    CANCELLED,
+  };
+  bindDefaultResolver(module.exports, Resolver.prototype);
+});
+
+defineModule("internal/dns/callback_resolver", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+
+  const {
+    ObjectDefineProperty,
+    ReflectApply,
+    ArrayPrototypeMap,
+    Symbol,
+  } = primordials;
+
+  const {
+    codes: {
+      ERR_INVALID_ARG_TYPE,
+      ERR_INVALID_ARG_VALUE,
+    },
+    dnsException,
+  } = require('internal/errors');
+
+  const {
+    createResolverClass,
+  } = require('internal/dns/utils');
+
+  const {
+    validateFunction,
+    validateString,
+  } = require('internal/validators');
+
+  const {
+    QueryReqWrap,
+  } = internalBinding('cares_wrap');
+
+  const {
+    hasObserver,
+    startPerf,
+    stopPerf,
+  } = require('internal/perf/observe');
+
+  const kPerfHooksDnsLookupResolveContext = Symbol('kPerfHooksDnsLookupResolveContext');
+
+  function onresolve(err, result, ttls) {
+    if (ttls && this.ttl)
+      result = ArrayPrototypeMap(
+        result, (address, index) => ({ address, ttl: ttls[index] }));
+
+    if (err)
+      this.callback(dnsException(err, this.bindingName, this.hostname));
+    else {
+      this.callback(null, result);
+      if (this[kPerfHooksDnsLookupResolveContext] && hasObserver('dns')) {
+        stopPerf(this, kPerfHooksDnsLookupResolveContext, { detail: { result } });
+      }
+    }
+  }
+
+  function resolver(bindingName) {
+    function query(name, /* options, */ callback) {
+      let options;
+      if (arguments.length > 2) {
+        options = callback;
+        callback = arguments[2];
+      }
+
+      validateString(name, 'name');
+      validateFunction(callback, 'callback');
+
+      const req = new QueryReqWrap();
+      req.bindingName = bindingName;
+      req.callback = callback;
+      req.hostname = name;
+      req.oncomplete = onresolve;
+      req.ttl = !!(options && options.ttl);
+      const err = this._handle[bindingName](req, name);
+      if (err) throw dnsException(err, bindingName, name);
+      if (hasObserver('dns')) {
+        startPerf(req, kPerfHooksDnsLookupResolveContext, {
+          type: 'dns',
+          name: bindingName,
+          detail: {
+            host: name,
+            ttl: req.ttl,
+          },
+        });
+      }
+      return req;
+    }
+    ObjectDefineProperty(query, 'name', { __proto__: null, value: bindingName });
+    return query;
+  }
+
+  // This is the callback-based resolver. There is another similar
+  // resolver in dns/promises.js with resolve methods that are based
+  // on promises instead.
+  const { Resolver, resolveMap } = createResolverClass(resolver);
+  Resolver.prototype.resolve = resolve;
+
+  function resolve(hostname, rrtype, callback) {
+    let resolver;
+    if (typeof rrtype === 'string') {
+      resolver = resolveMap[rrtype];
+    } else if (typeof rrtype === 'function') {
+      resolver = resolveMap.A;
+      callback = rrtype;
+    } else {
+      throw new ERR_INVALID_ARG_TYPE('rrtype', 'string', rrtype);
+    }
+
+    if (typeof resolver === 'function') {
+      return ReflectApply(resolver, this, [hostname, callback]);
+    }
+    throw new ERR_INVALID_ARG_VALUE('rrtype', rrtype);
+  }
+
+  module.exports = {
+    Resolver,
+  };
+});
+
+defineModule("dns", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+
+  const {
+    ObjectDefineProperties,
+    ObjectDefineProperty,
+    Symbol,
+  } = primordials;
+
+  const cares = internalBinding('cares_wrap');
+  const { isIP } = require('internal/net');
+  const { customPromisifyArgs } = require('internal/util');
+  const errors = require('internal/errors');
+  const {
+    bindDefaultResolver,
+    setDefaultResolver,
+    validateHints,
+    emitInvalidHostnameWarning,
+    getDefaultVerbatim,
+    getDefaultResultOrder,
+    setDefaultResultOrder,
+    errorCodes: dnsErrorCodes,
+  } = require('internal/dns/utils');
+  const {
+    Resolver,
+  } = require('internal/dns/callback_resolver');
+  const {
+    NODATA,
+    FORMERR,
+    SERVFAIL,
+    NOTFOUND,
+    NOTIMP,
+    REFUSED,
+    BADQUERY,
+    BADNAME,
+    BADFAMILY,
+    BADRESP,
+    CONNREFUSED,
+    TIMEOUT,
+    EOF,
+    FILE,
+    NOMEM,
+    DESTRUCTION,
+    BADSTR,
+    BADFLAGS,
+    NONAME,
+    BADHINTS,
+    NOTINITIALIZED,
+    LOADIPHLPAPI,
+    ADDRGETNETWORKPARAMS,
+    CANCELLED,
+  } = dnsErrorCodes;
+  const {
+    ERR_INVALID_ARG_TYPE,
+    ERR_INVALID_ARG_VALUE,
+    ERR_MISSING_ARGS,
+  } = errors.codes;
+  const {
+    validateBoolean,
+    validateFunction,
+    validateNumber,
+    validateOneOf,
+    validatePort,
+    validateString,
+  } = require('internal/validators');
+
+  const {
+    GetAddrInfoReqWrap,
+    GetNameInfoReqWrap,
+  } = cares;
+
+  const kPerfHooksDnsLookupContext = Symbol('kPerfHooksDnsLookupContext');
+  const kPerfHooksDnsLookupServiceContext = Symbol('kPerfHooksDnsLookupServiceContext');
+
+  const {
+    hasObserver,
+    startPerf,
+    stopPerf,
+  } = require('internal/perf/observe');
+
+  const dnsException = errors.dnsException;
+
+  let promises = null; // Lazy loaded
+
+  function onlookup(err, addresses) {
+    if (err) {
+      return this.callback(dnsException(err, 'getaddrinfo', this.hostname));
+    }
+    this.callback(null, addresses[0], this.family || isIP(addresses[0]));
+    if (this[kPerfHooksDnsLookupContext] && hasObserver('dns')) {
+      stopPerf(this, kPerfHooksDnsLookupContext, { detail: { addresses } });
+    }
+  }
+
+
+  function onlookupall(err, addresses) {
+    if (err) {
+      return this.callback(dnsException(err, 'getaddrinfo', this.hostname));
+    }
+
+    const family = this.family;
+    for (let i = 0; i < addresses.length; i++) {
+      const addr = addresses[i];
+      addresses[i] = {
+        address: addr,
+        family: family || isIP(addr),
+      };
+    }
+
+    this.callback(null, addresses);
+    if (this[kPerfHooksDnsLookupContext] && hasObserver('dns')) {
+      stopPerf(this, kPerfHooksDnsLookupContext, { detail: { addresses } });
+    }
+  }
+
+
+  // Easy DNS A/AAAA look up
+  // lookup(hostname, [options,] callback)
+  const validFamilies = [0, 4, 6];
+  function lookup(hostname, options, callback) {
+    let hints = 0;
+    let family = 0;
+    let all = false;
+    let verbatim = getDefaultVerbatim();
+
+    // Parse arguments
+    if (hostname) {
+      validateString(hostname, 'hostname');
+    }
+
+    if (typeof options === 'function') {
+      callback = options;
+      family = 0;
+    } else if (typeof options === 'number') {
+      validateFunction(callback, 'callback');
+
+      validateOneOf(options, 'family', validFamilies);
+      family = options;
+    } else if (options !== undefined && typeof options !== 'object') {
+      validateFunction(arguments.length === 2 ? options : callback, 'callback');
+      throw new ERR_INVALID_ARG_TYPE('options', ['integer', 'object'], options);
+    } else {
+      validateFunction(callback, 'callback');
+
+      if (options?.hints != null) {
+        validateNumber(options.hints, 'options.hints');
+        hints = options.hints >>> 0;
+        validateHints(hints);
+      }
+      if (options?.family != null) {
+        switch (options.family) {
+          case 'IPv4':
+            family = 4;
+            break;
+          case 'IPv6':
+            family = 6;
+            break;
+          default:
+            validateOneOf(options.family, 'options.family', validFamilies);
+            family = options.family;
+            break;
+        }
+      }
+      if (options?.all != null) {
+        validateBoolean(options.all, 'options.all');
+        all = options.all;
+      }
+      if (options?.verbatim != null) {
+        validateBoolean(options.verbatim, 'options.verbatim');
+        verbatim = options.verbatim;
+      }
+    }
+
+    if (!hostname) {
+      emitInvalidHostnameWarning(hostname);
+      if (all) {
+        process.nextTick(callback, null, []);
+      } else {
+        process.nextTick(callback, null, null, family === 6 ? 6 : 4);
+      }
+      return {};
+    }
+
+    const matchedFamily = isIP(hostname);
+    if (matchedFamily) {
+      if (all) {
+        process.nextTick(
+          callback, null, [{ address: hostname, family: matchedFamily }]);
+      } else {
+        process.nextTick(callback, null, hostname, matchedFamily);
+      }
+      return {};
+    }
+
+    const req = new GetAddrInfoReqWrap();
+    req.callback = callback;
+    req.family = family;
+    req.hostname = hostname;
+    req.oncomplete = all ? onlookupall : onlookup;
+
+    const err = cares.getaddrinfo(
+      req, hostname, family, hints, verbatim,
+    );
+    if (err) {
+      process.nextTick(callback, dnsException(err, 'getaddrinfo', hostname));
+      return {};
+    }
+    if (hasObserver('dns')) {
+      const detail = {
+        hostname,
+        family,
+        hints,
+        verbatim,
+      };
+      startPerf(req, kPerfHooksDnsLookupContext, { type: 'dns', name: 'lookup', detail });
+    }
+    return req;
+  }
+
+  ObjectDefineProperty(lookup, customPromisifyArgs,
+                       { __proto__: null, value: ['address', 'family'], enumerable: false });
+
+
+  function onlookupservice(err, hostname, service) {
+    if (err)
+      return this.callback(dnsException(err, 'getnameinfo', this.hostname));
+
+    this.callback(null, hostname, service);
+    if (this[kPerfHooksDnsLookupServiceContext] && hasObserver('dns')) {
+      stopPerf(this, kPerfHooksDnsLookupServiceContext, { detail: { hostname, service } });
+    }
+  }
+
+
+  function lookupService(address, port, callback) {
+    if (arguments.length !== 3)
+      throw new ERR_MISSING_ARGS('address', 'port', 'callback');
+
+    if (isIP(address) === 0)
+      throw new ERR_INVALID_ARG_VALUE('address', address);
+
+    validatePort(port);
+
+    validateFunction(callback, 'callback');
+
+    port = +port;
+
+    const req = new GetNameInfoReqWrap();
+    req.callback = callback;
+    req.hostname = address;
+    req.port = port;
+    req.oncomplete = onlookupservice;
+
+    const err = cares.getnameinfo(req, address, port);
+    if (err) throw dnsException(err, 'getnameinfo', address);
+    if (hasObserver('dns')) {
+      startPerf(req, kPerfHooksDnsLookupServiceContext, {
+        type: 'dns',
+        name: 'lookupService',
+        detail: {
+          host: address,
+          port,
+        },
+      });
+    }
+    return req;
+  }
+
+  ObjectDefineProperty(lookupService, customPromisifyArgs,
+                       { __proto__: null, value: ['hostname', 'service'], enumerable: false });
+
+  function defaultResolverSetServers(servers) {
+    const resolver = new Resolver();
+
+    resolver.setServers(servers);
+    setDefaultResolver(resolver);
+    bindDefaultResolver(module.exports, Resolver.prototype);
+
+    if (promises !== null)
+      bindDefaultResolver(promises, promises.Resolver.prototype);
+  }
+
+  module.exports = {
+    lookup,
+    lookupService,
+
+    Resolver,
+    getDefaultResultOrder,
+    setDefaultResultOrder,
+    setServers: defaultResolverSetServers,
+
+    // uv_getaddrinfo flags
+    ADDRCONFIG: cares.AI_ADDRCONFIG,
+    ALL: cares.AI_ALL,
+    V4MAPPED: cares.AI_V4MAPPED,
+
+    // ERROR CODES
+    NODATA,
+    FORMERR,
+    SERVFAIL,
+    NOTFOUND,
+    NOTIMP,
+    REFUSED,
+    BADQUERY,
+    BADNAME,
+    BADFAMILY,
+    BADRESP,
+    CONNREFUSED,
+    TIMEOUT,
+    EOF,
+    FILE,
+    NOMEM,
+    DESTRUCTION,
+    BADSTR,
+    BADFLAGS,
+    NONAME,
+    BADHINTS,
+    NOTINITIALIZED,
+    LOADIPHLPAPI,
+    ADDRGETNETWORKPARAMS,
+    CANCELLED,
+  };
+
+  bindDefaultResolver(module.exports, Resolver.prototype);
+
+  ObjectDefineProperties(module.exports, {
+    promises: {
+      __proto__: null,
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (promises === null) {
+          promises = require('internal/dns/promises');
+        }
+        return promises;
+      },
+    },
+  });
+});
+
+defineModule("dns/promises", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+
+  module.exports = require('internal/dns/promises');
+});
+
 // ---- registration ------------------------------------------------------------------------------
 
+// node:dgram and node:dns are defined in this module table; their glue files pick them up here.
+__internals.set("netRequire", require);
+// node:tls (tls.js) runs over the same module table and handle bindings.
+__internals.set("netBinding", internalBinding);
 __builtins.set("net", require("net"));
 {
   const http = require("http");
@@ -10883,8 +14185,15 @@ __builtins.set("net", require("net"));
   __builtins.set("_http_outgoing", require("_http_outgoing"));
   __builtins.set("_http_server", require("_http_server"));
 }
-// node:https needs node:tls, which loads later: tls.js registers it through this hook.
-__internals.set("loadHttps", () => require("https"));
 
-// process.binding() (stdlib_extras.js) serves the internal bindings this glue implements.
-__internals.set("internalBinding", internalBinding);
+// process.binding(): Node 20 still serves an allowlist of internal bindings (DEP0111, a warning
+// only under --pending-deprecation). The ones this glue implements are served from here.
+{
+  const served = ["http_parser", "tcp_wrap", "pipe_wrap", "stream_wrap", "uv"];
+  const previous = process.binding;
+  process.binding = function binding(name) {
+    name = `${name}`;
+    if (served.includes(name)) return internalBinding(name);
+    return previous.call(this, name);
+  };
+}

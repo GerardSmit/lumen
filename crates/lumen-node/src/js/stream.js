@@ -65,10 +65,11 @@ function aggregateTwoErrors(innerError, outerError) {
 // ---- utils (lib/internal/streams/utils.js) ----------------------------------------------------
 
 const kDestroyed = Symbol("kDestroyed");
-const kIsErrored = Symbol("kIsErrored");
-const kIsReadable = Symbol("kIsReadable");
-const kIsWritable = Symbol("kIsWritable");
-const kIsDisturbed = Symbol("kIsDisturbed");
+// Shared with the web streams (webstreams.js), which carry them.
+const kIsErrored = Symbol.for("nodejs.stream.kIsErrored");
+const kIsReadable = Symbol.for("nodejs.stream.kIsReadable");
+const kIsWritable = Symbol.for("nodejs.stream.kIsWritable");
+const kIsDisturbed = Symbol.for("nodejs.stream.kIsDisturbed");
 const kIsClosedPromise = Symbol.for("nodejs.webstream.isClosedPromise");
 const kControllerErrorFunction = Symbol.for("nodejs.webstream.controllerErrorFunction");
 
@@ -1256,7 +1257,14 @@ function ReadableState(options, stream, isDuplex) {
 
   // Crypto is kind of old and crusty. Historically, its default string encoding is 'binary' so we
   // have to make this configurable. Everything else in the universe uses 'utf8', though.
-  this.defaultEncoding = (options && options.defaultEncoding) || "utf8";
+  const defaultEncoding = options ? options.defaultEncoding : null;
+  if (defaultEncoding == null || defaultEncoding === "utf8" || defaultEncoding === "utf-8") {
+    this.defaultEncoding = "utf8";
+  } else if (Buffer.isEncoding(defaultEncoding)) {
+    this.defaultEncoding = defaultEncoding;
+  } else {
+    throw new ERR_UNKNOWN_ENCODING(defaultEncoding);
+  }
 
   // Ref the piped dest which we need a drain event on it type: null | Writable | Set<Writable>.
   this.awaitDrainWriters = null;
@@ -2433,7 +2441,14 @@ function WritableState(options, stream, isDuplex) {
 
   // Crypto is kind of old and crusty. Historically, its default string encoding is 'binary' so we
   // have to make this configurable. Everything else in the universe uses 'utf8', though.
-  this.defaultEncoding = (options && options.defaultEncoding) || "utf8";
+  const defaultEncoding = options ? options.defaultEncoding : null;
+  if (defaultEncoding == null || defaultEncoding === "utf8" || defaultEncoding === "utf-8") {
+    this.defaultEncoding = "utf8";
+  } else if (Buffer.isEncoding(defaultEncoding)) {
+    this.defaultEncoding = defaultEncoding;
+  } else {
+    throw new ERR_UNKNOWN_ENCODING(defaultEncoding);
+  }
 
   // Not an actual buffer we keep track of, but a measurement of how much we're waiting to get
   // pushed to some underlying socket or file.
@@ -2589,18 +2604,21 @@ Writable.prototype.pipe = function () {
 function _write(stream, chunk, encoding, cb) {
   const state = stream._writableState;
 
-  if (typeof encoding === "function") {
-    cb = encoding;
-    encoding = state.defaultEncoding;
-  } else {
-    if (!encoding) encoding = state.defaultEncoding;
-    else if (encoding !== "buffer" && !Buffer.isEncoding(encoding)) throw new ERR_UNKNOWN_ENCODING(encoding);
-    if (typeof cb !== "function") cb = nop;
+  if (cb == null || typeof cb !== "function") {
+    cb = nop;
   }
 
   if (chunk === null) {
     throw new ERR_STREAM_NULL_VALUES();
-  } else if (!state.objectMode) {
+  }
+
+  if (!state.objectMode) {
+    if (!encoding) {
+      encoding = state.defaultEncoding;
+    } else if (encoding !== "buffer" && !Buffer.isEncoding(encoding)) {
+      throw new ERR_UNKNOWN_ENCODING(encoding);
+    }
+
     if (typeof chunk === "string") {
       if (state.decodeStrings !== false) {
         chunk = Buffer.from(chunk, encoding);
@@ -2633,6 +2651,11 @@ function _write(stream, chunk, encoding, cb) {
 }
 
 Writable.prototype.write = function (chunk, encoding, cb) {
+  if (encoding != null && typeof encoding === "function") {
+    cb = encoding;
+    encoding = null;
+  }
+
   return _write(this, chunk, encoding, cb) === true;
 };
 
@@ -4230,8 +4253,7 @@ function pipe(src, dst, finish, { end }) {
 
   if (end) {
     // Compat. Before node v10.12.0 stdio used to throw an error so pipe() did/does not end()
-    // stdio. Now they allow it but "secretly" don't close the underlying fd.
-
+    // stdio destinations. Now they allow it but "secretly" don't close the underlying fd.
     function endFn() {
       ended = true;
       dst.end();
@@ -4242,30 +4264,30 @@ function pipe(src, dst, finish, { end }) {
     } else {
       src.once("end", endFn);
     }
-
-    eos(src, { readable: true, writable: false }, (err) => {
-      const rState = src._readableState;
-      if (
-        err &&
-        err.code === "ERR_STREAM_PREMATURE_CLOSE" &&
-        (rState && rState.ended && !rState.errored && !rState.errorEmitted)
-      ) {
-        // Some readable streams will emit 'close' before 'end'. However, since this is on the
-        // readable side 'end' should still be emitted if the stream has been ended and no error
-        // emitted. This should be allowed in favor of backwards compatibility. Since the stream is
-        // piped to a destination this should not result in any observable difference. We don't
-        // need to check if this is a writable premature close since eos will only fail with
-        // premature close on the reading side for duplex streams.
-        src
-          .once("end", finish)
-          .once("error", finish);
-      } else {
-        finish(err);
-      }
-    });
   } else {
     finish();
   }
+
+  eos(src, { readable: true, writable: false }, (err) => {
+    const rState = src._readableState;
+    if (
+      err &&
+      err.code === "ERR_STREAM_PREMATURE_CLOSE" &&
+      (rState && rState.ended && !rState.errored && !rState.errorEmitted)
+    ) {
+      // Some readable streams will emit 'close' before 'end'. However, since this is on the
+      // readable side 'end' should still be emitted if the stream has been ended and no error
+      // emitted. This should be allowed in favor of backwards compatibility. Since the stream is
+      // piped to a destination this should not result in any observable difference. We don't
+      // need to check if this is a writable premature close since eos will only fail with
+      // premature close on the reading side for duplex streams.
+      src
+        .once("end", finish)
+        .once("error", finish);
+    } else {
+      finish(err);
+    }
+  });
   return eos(dst, { readable: false, writable: true }, finish);
 }
 
@@ -5624,21 +5646,10 @@ Object.defineProperty(Stream, "_afterWrites", {
 
 __builtins.set("stream", Stream);
 __builtins.set("stream/promises", promises);
+__builtins.set("_stream_readable", Readable);
+__builtins.set("_stream_writable", Writable);
+__builtins.set("_stream_duplex", Duplex);
+__builtins.set("_stream_transform", Transform);
+__builtins.set("_stream_passthrough", PassThrough);
 // Node's internal/streams/{destroy,utils} helpers, for the fs port (see fs.js).
 __internals.set("streams", { errorOrDestroy, isIterable, kResistStopPropagation });
-
-// node:stream/web — the WHATWG streams. lumen-web already ships these as globals (spec-correct
-// pull/backpressure, BYOB, and CompressionStream/DecompressionStream over the shared DEFLATE
-// codec), so re-export the exact same constructors by identity.
-const webStreams = {};
-for (const name of [
-  "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamBYOBReader",
-  "ReadableStreamDefaultController", "ReadableByteStreamController", "ReadableStreamBYOBRequest",
-  "WritableStream", "WritableStreamDefaultWriter", "WritableStreamDefaultController",
-  "TransformStream", "TransformStreamDefaultController",
-  "ByteLengthQueuingStrategy", "CountQueuingStrategy",
-  "TextEncoderStream", "TextDecoderStream", "CompressionStream", "DecompressionStream",
-]) {
-  if (typeof globalThis[name] !== "undefined") webStreams[name] = globalThis[name];
-}
-__builtins.set("stream/web", webStreams);

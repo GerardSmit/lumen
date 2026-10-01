@@ -1337,6 +1337,7 @@ const kCustomPromisify = Symbol.for("nodejs.util.promisify.custom");
 // fs.read/fs.write/dns.lookup resolve several callback values as a named object.
 const kCustomPromisifyArgs = Symbol("customPromisifyArgs");
 __internals.set("customPromisifyArgs", kCustomPromisifyArgs);
+__internals.set("util_inspect", { getStringWidth });
 
 function promisify(original) {
   __validators.validateFunction(original, "original");
@@ -1739,22 +1740,33 @@ function isDeepStrictEqual(a, b) {
 
 // ---- AbortSignal helpers ----------------------------------------------------------------------
 
-function aborted(signal, resource) {
-  if (signal == null || typeof signal.addEventListener !== "function") {
-    throw new TypeError('The "signal" argument must be an instance of AbortSignal.');
-  }
-  if (signal.aborted) return Promise.resolve();
+async function aborted(signal, resource) {
+  if (signal === undefined) throw new __errors.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+  __validators.validateAbortSignal(signal, "signal");
+  __validators.validateObject(resource, "resource");
+  if (signal.aborted) return;
+  // The wait lives only as long as `resource`: once it is collected the promise stays pending.
+  const resourceRef = new WeakRef(resource);
   return new Promise((resolve) => {
-    signal.addEventListener("abort", () => resolve(), { once: true });
+    signal.addEventListener("abort", () => {
+      if (resourceRef.deref() !== undefined) resolve();
+    }, { once: true });
   });
 }
 
-// lumen has no MessagePort transfer, so the "transferable" marker is a no-op; these return real,
-// fully-functional controllers/signals so the common non-transfer usage works.
+const kTransferableSignal = Symbol.for("nodejs.abortsignal.transferable");
 function transferableAbortController() {
-  return new AbortController();
+  return transferableController(new AbortController());
+}
+function transferableController(controller) {
+  Object.defineProperty(controller.signal, kTransferableSignal, { value: true });
+  return controller;
 }
 function transferableAbortSignal(signal) {
+  if (!(signal instanceof AbortSignal)) {
+    throw new __errors.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+  }
+  Object.defineProperty(signal, kTransferableSignal, { value: true, configurable: true });
   return signal;
 }
 

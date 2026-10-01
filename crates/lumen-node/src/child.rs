@@ -77,7 +77,7 @@ pub struct ChildRegistry {
 }
 
 pub const CHILD_OPS: &[OpDecl] = ops![
-    "spawn" (5) => op_spawn,
+    "spawn" (7) => op_spawn,
     "read" (4) => op_read,
     "write" (4) => op_write,
     "wait" (3) => op_wait,
@@ -87,7 +87,7 @@ pub const CHILD_OPS: &[OpDecl] = ops![
     "closeStdin" (1) => op_close_stdin,
     "writeFd" (5) => op_write_fd,
     "closeFd" (2) => op_close_fd,
-    "execSync" (5) => op_exec_sync,
+    "execSync" (8) => op_exec_sync,
     "ipcOpen" (1) => op_ipc_open,
     "ipcRead" (1) => op_ipc_read,
     "ipcWrite" (2) => op_ipc_write,
@@ -341,18 +341,60 @@ fn add_args(command: &mut Command, arg_list: &[String], verbatim: bool) {
 /// A failed spawn as an error carrying the errno `code` (`ENOENT` for a missing program); the JS
 /// glue turns it into Node's `spawn <file> ENOENT` error with `syscall`, `path` and `spawnargs`.
 fn spawn_failure(ctx: &mut Ctx, cmd: &str, e: &std::io::Error) -> Value {
-    let code = match e.kind() {
-        std::io::ErrorKind::NotFound => "ENOENT",
-        std::io::ErrorKind::PermissionDenied => "EACCES",
-        _ => match e.raw_os_error() {
-            Some(20) => "ENOTDIR",
-            _ => "EINVAL",
-        },
-    };
+    let code = crate::fsb::uv_code(e);
     let err = ctx.make_error("Error", format!("spawn {cmd} {code}"));
     let _ = ctx.set_member(&err, "code", Value::str(code));
     err
 }
+
+struct SpawnOpts {
+    argv0: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    detached: bool,
+}
+
+fn read_spawn_opts(ctx: &mut Ctx, v: Option<&Value>) -> SpawnOpts {
+    let mut o = SpawnOpts { argv0: None, uid: None, gid: None, detached: false };
+    let Some(v) = v.filter(|v| v.as_obj().is_some()) else { return o };
+    let get = |ctx: &mut Ctx, k: &str| ctx.get_member(v, k).unwrap_or(Value::Undefined);
+    let argv0 = get(ctx, "argv0");
+    o.argv0 = opt_string(ctx, Some(&argv0));
+    if let Value::Num(n) = get(ctx, "uid") {
+        o.uid = Some(n as u32);
+    }
+    if let Value::Num(n) = get(ctx, "gid") {
+        o.gid = Some(n as u32);
+    }
+    o.detached = matches!(get(ctx, "detached"), Value::Bool(true));
+    o
+}
+
+#[cfg(unix)]
+fn apply_spawn_opts(command: &mut Command, o: &SpawnOpts) {
+    use std::os::unix::process::CommandExt;
+    if let Some(a) = &o.argv0 {
+        command.arg0(a);
+    }
+    if let Some(uid) = o.uid {
+        command.uid(uid);
+    }
+    if let Some(gid) = o.gid {
+        command.gid(gid);
+    }
+    if o.detached {
+        // SAFETY: setsid is async-signal-safe and runs in the forked child before exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_spawn_opts(_command: &mut Command, _o: &SpawnOpts) {}
 
 fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let cmd = ctx
@@ -366,6 +408,8 @@ fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         return spawn_windows_extra(ctx, &cmd, args);
     }
     let (mut command, stdio) = build_command(ctx, &cmd, args)?;
+    let spawn_opts = read_spawn_opts(ctx, args.get(6));
+    apply_spawn_opts(&mut command, &spawn_opts);
     command
         .stdin(stdio_for(&stdio[0]))
         .stdout(stdio_for(&stdio[1]))
@@ -761,7 +805,7 @@ fn op_close_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
     Ok(Value::Undefined)
 }
 
-/// `(childId, signal)` — `signal` is the numeric signal (0 means the default, SIGTERM). On unix
+/// `(childId, signal)` — `signal` is the numeric signal (0 only probes that the child exists). On unix
 /// any signal is delivered with kill(2); elsewhere every signal is a hard kill.
 fn op_kill(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
@@ -784,7 +828,7 @@ fn send_signal(child: &Arc<Mutex<ProcHandle>>, signal: i32) -> bool {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return false;
     }
-    let sig = if signal == 0 { 15 } else { signal };
+    let sig = signal;
     // SAFETY: plain syscall on a pid this process spawned and has not reaped.
     unsafe { kill(child.id() as std::os::raw::c_int, sig) == 0 }
 }
@@ -805,8 +849,18 @@ fn op_close_stdin(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
     Ok(Value::Undefined)
 }
 
-/// `(cmd, argsArray, inputBytesOrNull, cwd, envPairsOrNull) -> { stdout, stderr, status }`. Synchronous: spawns,
-/// writes optional stdin, waits, and captures output — for `execFileSync`/`spawnSync`/`execSync`.
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: i32) {
+    // SAFETY: plain syscall on a child this call spawned and has not yet reaped.
+    unsafe {
+        kill(pid as std::os::raw::c_int, signal);
+    }
+}
+
+/// `(cmd, argsArray, inputBytesOrNull, cwd, envPairsOrNull, verbatim, timeoutMs, opts)` with
+/// `opts = { stdio: [in, out, err], argv0, uid, gid, killSignal, maxBuffer }`. Synchronous: spawns,
+/// writes optional stdin, waits, and captures piped output — for the `*Sync` APIs. A child whose
+/// output passes `maxBuffer` or that outlives `timeout` is killed with `killSignal`.
 fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let cmd = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
@@ -816,20 +870,38 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     let cwd = opt_string(ctx, args.get(3));
     let env_pairs = args.get(4).cloned().unwrap_or(Value::Undefined);
     let verbatim = matches!(args.get(5), Some(Value::Bool(true)));
+    let opts = args.get(7).cloned().unwrap_or(Value::Undefined);
+    let (stdio, max_buffer, kill_signal) = if opts.as_obj().is_some() {
+        let stdio_v = ctx.get_member(&opts, "stdio").unwrap_or(Value::Undefined);
+        let stdio = read_string_array(ctx, &stdio_v)?;
+        let max = match ctx.get_member(&opts, "maxBuffer") {
+            Ok(Value::Num(n)) if n.is_finite() && n >= 0.0 => Some(n as usize),
+            _ => None,
+        };
+        let sig = match ctx.get_member(&opts, "killSignal") {
+            Ok(Value::Num(n)) if n > 0.0 => n as i32,
+            _ => 15,
+        };
+        (stdio, max, sig)
+    } else {
+        (Vec::new(), None, 15)
+    };
+    let mode = |i: usize| stdio.get(i).map(String::as_str).unwrap_or("pipe");
+    let spawn_opts = read_spawn_opts(ctx, Some(&opts));
 
     let mut command = Command::new(&cmd);
     add_args(&mut command, &arg_list, verbatim);
+    apply_spawn_opts(&mut command, &spawn_opts);
     command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command.stdin(if input.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
+        .stdout(stdio_for(mode(1)))
+        .stderr(stdio_for(mode(2)));
+    command.stdin(match mode(0) {
+        "inherit" => Stdio::inherit(),
+        "pipe" if input.is_some() => Stdio::piped(),
+        _ => Stdio::null(),
     });
     apply_cwd(ctx, &mut command, cwd);
     apply_env(ctx, &mut command, &env_pairs)?;
-    // `timeout` (ms): past it the child is killed and the result says so (Node's ETIMEDOUT).
     let timeout = args
         .get(6)
         .and_then(Value::as_num_opt)
@@ -837,6 +909,7 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
         .map(|t| std::time::Duration::from_secs_f64(t / 1000.0));
     let mut child =
         lumen_host::spawn_command(ctx, &mut command).map_err(|e| spawn_failure(ctx, &cmd, &e))?;
+    let pid = child.id();
     // Feed stdin from its own thread (dropping it signals EOF): a child that fills its stdout
     // pipe before draining stdin would otherwise deadlock against this write.
     if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
@@ -844,17 +917,35 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
             let _ = stdin.write_all(&input);
         });
     }
+    let exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
     let pipes: [(u8, Option<Box<dyn Read + Send>>); 2] = [
         (1, child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
         (2, child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
     ];
+    let mut piped = [false; 3];
     for (which, pipe) in pipes {
         if let Some(mut pipe) = pipe {
+            piped[which as usize] = true;
             let tx = tx.clone();
+            let exceeded = Arc::clone(&exceeded);
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                let _ = pipe.read_to_end(&mut buf);
+                let mut chunk = vec![0u8; 65536];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if max_buffer.is_some_and(|max| buf.len() > max) {
+                                exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
+                                #[cfg(unix)]
+                                signal_pid(pid, kill_signal);
+                                break;
+                            }
+                        }
+                    }
+                }
                 let _ = tx.send((which, buf));
             });
         }
@@ -862,28 +953,36 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     drop(tx);
     let wait_error = |ctx: &mut Ctx, e: std::io::Error| ctx.make_error("Error", format!("exec {cmd}: {e}"));
     let mut timed_out = false;
-    let status = match timeout {
-        None => child.wait().map_err(|e| wait_error(ctx, e))?,
-        Some(limit) => {
-            let started = std::time::Instant::now();
-            loop {
-                if let Some(status) = child.try_wait().map_err(|e| wait_error(ctx, e))? {
-                    break status;
-                }
-                let elapsed = started.elapsed();
-                if elapsed >= limit {
-                    timed_out = true;
-                    let _ = child.kill();
-                    break child.wait().map_err(|e| wait_error(ctx, e))?;
-                }
-                std::thread::sleep((limit - elapsed).min(std::time::Duration::from_millis(5)));
+    let stop = |child: &mut Child| {
+        #[cfg(unix)]
+        signal_pid(child.id(), kill_signal);
+        #[cfg(not(unix))]
+        let _ = child.kill();
+    };
+    let status = if timeout.is_none() && !cfg!(unix) && max_buffer.is_some() || timeout.is_some() {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| wait_error(ctx, e))? {
+                break status;
             }
+            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                timed_out = true;
+                stop(&mut child);
+                break child.wait().map_err(|e| wait_error(ctx, e))?;
+            }
+            if !cfg!(unix) && exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+                stop(&mut child);
+                break child.wait().map_err(|e| wait_error(ctx, e))?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    } else {
+        child.wait().map_err(|e| wait_error(ctx, e))?
     };
     // After a timeout, a grandchild may still hold the pipes: take what arrived, don't wait.
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     loop {
-        let got = if timed_out {
+        let got = if timed_out || exceeded.load(std::sync::atomic::Ordering::SeqCst) {
             rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
         } else {
             rx.recv().ok()
@@ -896,18 +995,26 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     }
 
     let o = Value::Obj(ctx.new_object());
-    let stdout = ctx.make_uint8array(&stdout)?;
-    let stderr = ctx.make_uint8array(&stderr)?;
+    let stdout = if piped[1] { ctx.make_uint8array(&stdout)? } else { Value::Null };
+    let stderr = if piped[2] { ctx.make_uint8array(&stderr)? } else { Value::Null };
     let _ = ctx.set_member(&o, "stdout", stdout);
     let _ = ctx.set_member(&o, "stderr", stderr);
     let _ = ctx.set_member(
         &o,
         "status",
-        match status.code() {
-            Some(c) if !timed_out => Value::Num(c as f64),
-            _ => Value::Null,
-        },
+        status.code().map_or(Value::Null, |c| Value::Num(c as f64)),
     );
+    let _ = ctx.set_member(
+        &o,
+        "signal",
+        exit_signal(&status).map_or(Value::Null, |s| Value::Num(s as f64)),
+    );
+    let _ = ctx.set_member(&o, "pid", Value::Num(pid as f64));
     let _ = ctx.set_member(&o, "timedOut", Value::Bool(timed_out));
+    let _ = ctx.set_member(
+        &o,
+        "maxBufferExceeded",
+        Value::Bool(exceeded.load(std::sync::atomic::Ordering::SeqCst)),
+    );
     Ok(o)
 }

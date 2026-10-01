@@ -124,9 +124,11 @@
       const c = this[kCounts] || (this[kCounts] = new Map());
       const n = (c.get(label) || 0) + 1;
       c.set(label, n);
+      if (__traceEvent !== null) __traceEvent("node,node.console", "C", `count::${label}`, 0, n);
       this[kOut](withIndent(this, `${label}: ${n}`));
     },
     countReset(label = "default") {
+      if (__traceEvent !== null) __traceEvent("node,node.console", "C", `count::${String(label)}`, 0, 0);
       if (this[kCounts]) this[kCounts].delete(String(label));
     },
     group(...args) {
@@ -143,6 +145,7 @@
       const t = this[kTimes] || (this[kTimes] = new Map());
       if (t.has(label)) { this[kErr](withIndent(this, `Warning: Label '${label}' already exists for console.time()`)); return; }
       t.set(label, nowMs());
+      if (__traceEvent !== null) __traceEvent("node,node.console", "b", `time::${label}`, 0);
     },
     timeEnd(label = "default") {
       label = String(label);
@@ -150,6 +153,7 @@
       if (!t || !t.has(label)) { this[kErr](withIndent(this, `Warning: No such label '${label}' for console.timeEnd()`)); return; }
       const dur = nowMs() - t.get(label);
       t.delete(label);
+      if (__traceEvent !== null) __traceEvent("node,node.console", "e", `time::${label}`, 0);
       this[kOut](withIndent(this, `${label}: ${formatTime(dur)}`));
     },
     timeLog(label = "default", ...args) {
@@ -157,6 +161,7 @@
       const t = this[kTimes];
       if (!t || !t.has(label)) { this[kErr](withIndent(this, `Warning: No such label '${label}' for console.timeLog()`)); return; }
       const dur = nowMs() - t.get(label);
+      if (__traceEvent !== null) __traceEvent("node,node.console", "n", `time::${label}`, 0, { duration: dur });
       this[kOut](withIndent(this, `${label}: ${formatTime(dur)}` + (args.length ? " " + fmt(args) : "")));
     },
     // Inspector-timeline hooks: inert without an attached inspector (as in a non-inspected Node).

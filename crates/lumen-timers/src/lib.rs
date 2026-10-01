@@ -9,7 +9,9 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use lumen_host::time::Instant;
 
 use lumen_host::{ops, CallbackQueue, Ctx, Extension, Value};
 

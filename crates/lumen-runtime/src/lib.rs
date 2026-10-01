@@ -19,7 +19,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use lumen_host::time::Instant;
 
 use lumen_host::{
     install, CallbackQueue, CompletionSender, Engine, TaskCompletion, TaskDecoder, TaskId,
@@ -32,6 +34,10 @@ mod jsx;
 mod process;
 mod process_env;
 pub mod tsconfig;
+#[cfg(not(target_arch = "wasm32"))]
+mod worker;
+#[cfg(target_arch = "wasm32")]
+#[path = "worker_browser.rs"]
 mod worker;
 mod ports;
 mod clone_transfer;
@@ -206,6 +212,19 @@ pub struct Runtime {
     wake: mpsc::Sender<TaskCompletion>,
 }
 
+/// Where the loop stands after [`Runtime::run_until_idle`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoopStatus {
+    /// Milliseconds until the earliest pending timer is due (0 when already due).
+    pub next_timer_ms: Option<f64>,
+    /// A registered task is still waiting for its completion.
+    pub pending_tasks: bool,
+    /// Nothing is pending anywhere: the program has finished.
+    pub idle: bool,
+    /// `process.exit` or a termination request ended the realm.
+    pub halted: bool,
+}
+
 /// Why the entry script did not start cleanly.
 enum StartError {
     /// The node glue is missing from this engine.
@@ -225,7 +244,7 @@ impl Runtime {
     /// collecting its cycles is wasted work when the OS reclaims the address space). A clean
     /// exit still runs what the drop would: addon cleanup hooks and closing SQLite databases.
     /// Standard output and error are flushed by `process::exit`.
-    pub fn exit(mut self, code: i32) -> ! {
+    pub fn exit(&mut self, code: i32) -> ! {
         if code == 0 {
             lumen_node::shutdown_native_resources(self.engine.ctx());
         }
@@ -476,7 +495,7 @@ impl Runtime {
     pub fn run_module(&mut self, path: &str) -> Result<(), String> {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         let source =
-            std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+            lumen_host::sysfs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let source = import_source_text(source);
         // A `.jsx` entry is lowered to plain JS before the engine parses it.
         let source = if path.ends_with(".jsx") {
@@ -490,9 +509,20 @@ impl Runtime {
             .unwrap_or_else(|_| std::path::PathBuf::from(path))
             .to_string_lossy()
             .into_owned();
+        self.run_module_text(&source, &key)
+    }
+
+    /// Run `source` as an ES module identified by `key` (relative imports resolve against it),
+    /// then the loop to quiescence. `--input-type=module` eval and piped stdin use this.
+    pub fn run_module_source(&mut self, source: &str, key: &str) -> Result<(), String> {
+        let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
+        self.run_module_text(&import_source_text(source.to_string()), key)
+    }
+
+    fn run_module_text(&mut self, source: &str, key: &str) -> Result<(), String> {
         let (loader, cache) = esm::make_cached_loader(self.builtin_modules());
         let t_eval = lumen_host::startup_timing().then(Instant::now);
-        let result = self.engine.eval_module_attrs(&source, &key, loader);
+        let result = self.engine.eval_module_attrs(source, key, loader);
         // The static graph has loaded: its sources live in the engine now.
         cache.forget_sources();
         if let Some(t0) = t_eval {
@@ -688,6 +718,66 @@ impl Runtime {
         self.pool.spawn_blocking(id, work);
     }
 
+    /// A sender that pushes a completion into this runtime's loop from outside it. An embedder
+    /// with no threads (the browser) settles tasks it registered with
+    /// [`lumen_host::register_task`] this way, then calls [`Self::run_until_idle`].
+    pub fn completion_sender(&self) -> CompletionSender {
+        CompletionSender::new(self.wake.clone())
+    }
+
+    /// Run every turn that is ready now (microtasks, queued callbacks, due timers, delivered
+    /// completions) and return without blocking, so a host that owns the thread (a browser tab)
+    /// can hand control back and resume when [`LoopStatus::next_timer_ms`] elapses or a
+    /// completion is pushed.
+    pub fn run_until_idle(&mut self) -> LoopStatus {
+        loop {
+            self.checkpoint();
+            self.report_unhandled_rejections();
+            let mut progressed = false;
+            for (cb, args) in self.take_queued_callbacks() {
+                if self.halted() {
+                    break;
+                }
+                progressed = true;
+                self.fire(&cb, &args);
+            }
+            let now = Instant::now();
+            while let Some((cb, args)) = self.take_next_due_timer(now) {
+                if self.halted() {
+                    break;
+                }
+                progressed = true;
+                self.fire(&cb, &args);
+            }
+            while !self.halted() {
+                let Ok(done) = self.completions.try_recv() else {
+                    break;
+                };
+                progressed = true;
+                self.dispatch(done);
+            }
+            if self.halted() || !(progressed || self.ticks_pending()) {
+                break;
+            }
+        }
+        let now = Instant::now();
+        let next_timer_ms = self
+            .next_timer_deadline()
+            .map(|d| d.saturating_duration_since(now).as_secs_f64() * 1000.0);
+        let pending_tasks = self
+            .engine
+            .ctx()
+            .op_state()
+            .get::<TaskRegistry>()
+            .is_some_and(|r| r.has_ref_pending());
+        LoopStatus {
+            next_timer_ms,
+            pending_tasks,
+            idle: self.idle(),
+            halted: self.halted(),
+        }
+    }
+
     /// Run the loop until nothing is pending: no microtasks, no queued callbacks, no live
     /// timers, no in-flight tasks.
     pub fn run_to_completion(&mut self) {
@@ -733,27 +823,35 @@ impl Runtime {
                 continue;
             }
 
+            // With no thread to block, the embedder resumes the loop when a completion arrives
+            // or the next timer is due (see `run_until_idle`).
+            #[cfg(target_arch = "wasm32")]
+            return;
+            #[cfg(not(target_arch = "wasm32"))]
             let maintenance = self.idle_collect();
             // A pending idle pass must not wait forever behind an otherwise silent task.
-            let deadline = match (self.next_timer_deadline(), maintenance) {
-                (Some(timer), Some(gc)) => Some(timer.min(gc)),
-                (timer, gc) => timer.or(gc),
-            };
-            match deadline {
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if deadline > now {
-                        if let Ok(done) = self.completions.recv_timeout(deadline - now) {
-                            self.dispatch(done);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let deadline = match (self.next_timer_deadline(), maintenance) {
+                    (Some(timer), Some(gc)) => Some(timer.min(gc)),
+                    (timer, gc) => timer.or(gc),
+                };
+                match deadline {
+                    Some(deadline) => {
+                        let now = Instant::now();
+                        if deadline > now {
+                            if let Ok(done) = self.completions.recv_timeout(deadline - now) {
+                                self.dispatch(done);
+                            }
                         }
                     }
+                    None => match self.completions.recv() {
+                        Ok(done) => self.dispatch(done),
+                        // The pool is gone (unreachable while `self.pool` lives); nothing can
+                        // ever complete, so pending tasks are abandoned rather than spun on.
+                        Err(_) => return,
+                    },
                 }
-                None => match self.completions.recv() {
-                    Ok(done) => self.dispatch(done),
-                    // The pool is gone (unreachable while `self.pool` lives); nothing can
-                    // ever complete, so pending tasks are abandoned rather than spun on.
-                    Err(_) => return,
-                },
             }
         }
     }
@@ -764,6 +862,7 @@ impl Runtime {
     /// bodies only across two collections it actually runs. Throttled so a loop that blocks
     /// between every request does not collect on every request.
     /// Returns the next maintenance deadline, if an initial or follow-up pass is pending.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn idle_collect(&mut self) -> Option<Instant> {
         const MIN_INTERVAL: Duration = Duration::from_secs(1);
         const MIN_NEW_OBJECTS: i64 = 10_000;
@@ -810,6 +909,21 @@ impl Runtime {
         let exec: Vec<Value> = exec_argv.iter().cloned().map(Value::from_string).collect();
         let exec = ctx.make_array(exec);
         let _ = ctx.set_member(&process, "execArgv", exec);
+    }
+
+    /// Hand the parsed command-line options (a JSON object keyed by canonical option name) to the
+    /// JS side, which answers `getOptionValue` from them.
+    pub fn set_cli_options(&mut self, json: &str) {
+        let src = format!(
+            "Object.defineProperty(process, Symbol.for('lumen.options'), {{ value: JSON.parse({}), configurable: true }});\
+             if (process[Symbol.for('lumen.options')]['--experimental-fetch'] === false) {{\
+               for (const k of ['fetch', 'FormData', 'Headers', 'Request', 'Response']) delete globalThis[k];\
+               if (globalThis.WebAssembly) {{ delete WebAssembly.compileStreaming; delete WebAssembly.instantiateStreaming; }}\
+             }} \
+             const apply = globalThis.__lumenApplyOptions; delete globalThis.__lumenApplyOptions; if (apply) apply();",
+            js_quote(json)
+        );
+        let _ = self.engine.eval(&src, false);
     }
 
     /// Node's `--expose-gc`: define `globalThis.gc`, which runs lumen's cycle collector.
@@ -1043,7 +1157,23 @@ impl Runtime {
             });
         let line = match ts_text {
             Some(t) => t,
-            None => format!("{prefix} {}", console::describe_error(ctx, error)),
+            None => {
+                let global = self.engine.global_this();
+                let describe = self.engine.ctx().get_member(&global, "__lumenDescribeError");
+                let detailed = match describe {
+                    Ok(f) if f.as_obj().is_some() => {
+                        match self.engine.call_function(&f, Value::Undefined, &[error.clone()]) {
+                            Ok(Value::Str(s)) => Some(s.to_string()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match detailed {
+                    Some(text) => format!("{prefix} {text}"),
+                    None => format!("{prefix} {}", console::describe_error(self.engine.ctx(), error)),
+                }
+            }
         };
         console::write_err_line(self.engine.ctx(), line);
         self.fatal_exit.get_or_insert(1);
@@ -1160,4 +1290,23 @@ fn report_load_stats(what: &str, t0: Instant) {
         "[startup] {what} {:?} (parse/decode {pms:.1} ms, {pn} modules, {pb} bytes; fetch {fms:.1} ms, {fn_} loads)",
         t0.elapsed()
     );
+}
+
+fn js_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

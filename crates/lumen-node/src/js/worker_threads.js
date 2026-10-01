@@ -320,8 +320,14 @@
       // process.exit in a worker stops this thread's loop, never the whole process. Cooperative:
       // the current synchronous JS runs to its end first (documented in worker.rs).
       const exitWorker = (code) => {
-        const n = code == null ? (process.exitCode ?? 0) : Number(code);
-        wself.exit(Number.isFinite(n) ? Math.trunc(n) : 0);
+        if (code != null) process.exitCode = code;
+        const n = Number(process.exitCode ?? 0);
+        const exitCode = Number.isFinite(n) ? Math.trunc(n) : 0;
+        if (!process._exiting) {
+          process._exiting = true;
+          try { process.emit("exit", exitCode); } catch {}
+        }
+        wself.exit(Number(process.exitCode ?? exitCode) | 0);
       };
       Object.defineProperty(process, "exit", {
         value: exitWorker, enumerable: true, configurable: true, writable: true,

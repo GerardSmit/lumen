@@ -185,7 +185,7 @@ function aggregateTwoErrors(innerError, outerError) {
 }
 
 function uvErrmapGet(errno) {
-  return __uvErrmap.get(errno);
+  return __uvErrmap().get(errno);
 }
 
 // Node's uvException: `${code}: ${desc}, ${syscall} '${path}' -> '${dest}'`, with every other
@@ -409,7 +409,26 @@ const shims = {
   "internal/readline/interface": { get Interface() { return __builtins.get("readline").Interface; } },
   "internal/blob": {
     createBlobFromFilePath(path, options) {
-      return new Blob([Buffer.from(bindingCall("open", () => fsb.readFile(P(path), 0), path))], options);
+      const p = P(path);
+      const signature = () => {
+        const st = bindingCall("stat", () => fsb.stat(p), path);
+        return { size: st[8], mtime: `${st[12]}.${st[13]}` };
+      };
+      const opened = signature();
+      const read = (from, to) => {
+        let now;
+        try {
+          now = signature();
+        } catch {
+          throw new DOMException("The blob could not be read", "NotReadableError");
+        }
+        if (now.size !== opened.size || now.mtime !== opened.mtime) {
+          throw new DOMException("The blob could not be read", "NotReadableError");
+        }
+        const bytes = new Uint8Array(fsb.readFile(p, 0));
+        return bytes.slice(from, to);
+      };
+      return Blob[Symbol.for("lumen.fileBlob")](opened.size, options?.type, read);
     },
   },
 };
@@ -491,8 +510,8 @@ function displayPath(path) {
 // A binding failure (OpError with a libuv code) as Node's uvException.
 function bindingError(e, syscall, path, dest) {
   const code = e?.code;
-  if (typeof code !== "string" || !__uvCodes.has(code)) return e;
-  const ctx = { errno: __uvCodes.get(code), code, syscall };
+  if (typeof code !== "string" || !__uvCodes().has(code)) return e;
+  const ctx = { errno: __uvCodes().get(code), code, syscall };
   if (path !== undefined) ctx.path = displayPath(path);
   if (dest !== undefined) ctx.dest = displayPath(dest);
   return uvException(ctx);
@@ -524,8 +543,8 @@ function dispatch(req, ctx, syscall, path, dest, sync, async, post) {
     } catch (e) {
       if (ctx !== null && typeof ctx === "object") {
         const code = e?.code;
-        if (typeof code === "string" && __uvCodes.has(code)) {
-          ctx.errno = __uvCodes.get(code);
+        if (typeof code === "string" && __uvCodes().has(code)) {
+          ctx.errno = __uvCodes().get(code);
           ctx.code = code;
           ctx.syscall = syscall;
           return undefined;
@@ -642,7 +661,7 @@ StatWatcherHandle.prototype.start = function (path, interval) {
     try {
       cur = fsb.stat(p);
     } catch (e) {
-      status = __uvCodes.get(e?.code) ?? __uvCodes.get("UNKNOWN");
+      status = __uvCodes().get(e?.code) ?? __uvCodes().get("UNKNOWN");
     }
     const zero = new Array(kFsStatsFieldsNumber).fill(0);
     if (status !== 0) {
@@ -1009,7 +1028,7 @@ FSEvent.prototype.start = function (path, persistent, recursive, encoding) {
   try {
     st = fsb.stat(p);
   } catch (e) {
-    return __uvCodes.get(e?.code) ?? __uvCodes.get("UNKNOWN");
+    return __uvCodes().get(e?.code) ?? __uvCodes().get("UNKNOWN");
   }
   const pathMod = __builtins.get("path");
   const sep = pathMod.sep;
@@ -1068,9 +1087,9 @@ function internalBinding(name) {
       return { fs: fsConstants, os: __builtins.get("os").constants };
     case "uv":
       return {
-        UV_ENOSPC: __uvCodes.get("ENOSPC"),
-        errname: (errno) => __uvErrmap.get(errno)?.[0],
-        getErrorMap: () => __uvErrmap,
+        UV_ENOSPC: __uvCodes().get("ENOSPC"),
+        errname: (errno) => __uvErrmap().get(errno)?.[0],
+        getErrorMap: () => __uvErrmap(),
       };
   }
   throw new Error(`lumen fs: internalBinding('${name}') is not available`);

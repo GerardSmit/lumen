@@ -122,8 +122,8 @@
       this.exitedAfterDisconnect = true;
       if (this.process.connected) {
         try { this.process.send({ [INTERNAL]: "disconnect" }); } catch {}
+        this.process.disconnect();
       }
-      this.process.disconnect();
       return this;
     }
     isConnected() { return !!this.process.connected; }
