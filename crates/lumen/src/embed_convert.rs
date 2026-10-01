@@ -741,7 +741,7 @@ fn resolve_view(i: &Interp, v: &Value) -> Result<(usize, usize, usize), ViewErr>
     if let Some(b) = i.array_buffers.get(&p) {
         return Ok((p, 0, b.len()));
     }
-    if o.borrow().props.contains("__abMaxByteLength") {
+    if o.borrow().props.contains("\u{0}ab_max_byte_length") {
         return Err(ViewErr::Detached);
     }
     Err(ViewErr::NotView)

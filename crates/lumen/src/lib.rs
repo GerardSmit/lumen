@@ -117,6 +117,18 @@ pub fn set_host_clock(f: fn() -> f64) {
     let _ = HOST_CLOCK.set(f);
 }
 
+pub(crate) static TAIL_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn proper tail calls (ES2015 PrepareForTailCall) off for this process. V8 has none, and
+/// hosts that mirror its stack traces need every caller's frame to stay visible.
+pub fn set_tail_calls(on: bool) {
+    TAIL_CALLS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn tail_calls_enabled() -> bool {
+    TAIL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Install the WebAssembly JIT host (first call wins; meaningful on wasm32 only). On wasm32 the
 /// optimizing tier compiles hot loops to small WebAssembly modules that import the engine's own
 /// `env.memory` and `env.table` (the indirect-function table, which must be growable — link with

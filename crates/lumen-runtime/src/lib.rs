@@ -356,6 +356,7 @@ impl Runtime {
         let boot = lumen_host::startup_timing().then(Instant::now);
         let (tx, rx) = mpsc::channel();
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
+        lumen::set_tail_calls(false);
         let mut engine = Engine::new();
         // Substrate first: fs's js_init runs during install and its ops need these.
         engine.ctx().op_state().put(pool.handle());

@@ -2554,7 +2554,7 @@ impl Interp {
             return Ok(None);
         };
         if matches!(
-            object.borrow().props.get("__abResizable").map(|p| p.value()),
+            object.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
             Some(Value::Bool(true))
         ) {
             return Err(self.make_error(
@@ -2576,9 +2576,9 @@ impl Interp {
         self.gc_pin(&object);
         self.array_buffers.insert(pointer, vec![0u8; length].into());
         for (name, value) in [
-            ("__abMaxByteLength", Value::Num(length as f64)),
-            ("__abResizable", Value::Bool(false)),
-            ("__sab_id", Value::Num(handle.id as f64)),
+            ("\u{0}ab_max_byte_length", Value::Num(length as f64)),
+            ("\u{0}ab_resizable", Value::Bool(false)),
+            ("\u{0}sab_id", Value::Num(handle.id as f64)),
         ] {
             object
                 .borrow_mut()
@@ -2629,7 +2629,7 @@ impl Interp {
             && !self.shared_buffers.contains_key(&pointer)
             && !self.immutable_buffers.contains(&pointer)
             && !matches!(
-                object.borrow().props.get("__abResizable").map(|p| p.value()),
+                object.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
                 Some(Value::Bool(true))
             )
     }
@@ -6230,7 +6230,10 @@ impl Interp {
         is_construct: bool,
     ) -> Result<Value, Abrupt> {
         let saved_strict = std::mem::replace(&mut self.strict, func.is_strict);
-        let saved_tco = std::mem::replace(&mut self.tco_ok, func.is_strict && !is_construct);
+        let saved_tco = std::mem::replace(
+            &mut self.tco_ok,
+            func.is_strict && !is_construct && crate::tail_calls_enabled(),
+        );
         let saved_field_init = self.in_field_init_code;
         let saved_agb = self.in_async_gen_body;
         if !func.is_arrow {
@@ -6632,7 +6635,11 @@ impl Interp {
         // `return f(...)` is a proper tail call only in a strict, ordinary, non-constructor body.
         let saved_tco = std::mem::replace(
             &mut self.tco_ok,
-            func.is_strict && !func.is_generator && !func.is_async && !is_construct,
+            func.is_strict
+                && !func.is_generator
+                && !func.is_async
+                && !is_construct
+                && crate::tail_calls_enabled(),
         );
         // (The bytecode tier intercepted eligible calls at the top of this function; anything
         // reaching here — construct calls, uncompilable bodies — runs on the tree-walker.)

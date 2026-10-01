@@ -2020,7 +2020,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
         blk_names,
         // Strict code's calls in tail position are proper tail calls (see [`self_tail`]); an
         // async or generator body completes through its coroutine after the call.
-        tail_calls: func.is_strict && !func.is_async && !func.is_generator,
+        tail_calls: func.is_strict && !func.is_async && !func.is_generator && crate::tail_calls_enabled(),
         ..Compiler::default()
     };
     // Captured once-per-call block `let`s home in the activation (TDZ from entry, initialized

@@ -687,12 +687,12 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
     } else if (typeof value === "function") {
       base = getFunctionBase(value, constructor, tag);
       if (keys.length === 0 && protoProps === undefined) return ctx.stylize(base, "special");
-    } else if (valueTag === "RegExp") {
+    } else if (types.isRegExp(value)) {
       base = RegExp.prototype.toString.call(constructor !== null ? value : new RegExp(value));
       const prefix = getPrefix(constructor, tag, "RegExp");
       if (prefix !== "RegExp ") base = `${prefix}${base}`;
       if (keys.length === 0 && protoProps === undefined || (recurseTimes > ctx.depth && ctx.depth !== null)) return ctx.stylize(base, "regexp");
-    } else if (valueTag === "Date") {
+    } else if (types.isDate(value)) {
       const time = Date.prototype.getTime.call(value);
       base = Number.isNaN(time) ? Date.prototype.toString.call(value) : Date.prototype.toISOString.call(value);
       const prefix = getPrefix(constructor, tag, "Date");
@@ -701,8 +701,8 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
     } else if (isErrorValue(value)) {
       base = formatError(value, constructor, tag, ctx, keys);
       if (keys.length === 0 && protoProps === undefined) return base;
-    } else if (valueTag === "ArrayBuffer" || valueTag === "SharedArrayBuffer") {
-      const prefix = getPrefix(constructor, tag, valueTag);
+    } else if (types.isAnyArrayBuffer(value)) {
+      const prefix = getPrefix(constructor, tag, types.isSharedArrayBuffer(value) ? "SharedArrayBuffer" : "ArrayBuffer");
       if (typedArray === undefined) {
         formatter = formatArrayBuffer;
       } else if (keys.length === 0 && protoProps === undefined) {
@@ -710,16 +710,16 @@ function formatRaw(ctx, value, recurseTimes, typedArray) {
       }
       braces[0] = `${prefix}{`;
       keys.unshift("byteLength");
-    } else if (valueTag === "DataView") {
+    } else if (types.isDataView(value)) {
       braces[0] = `${getPrefix(constructor, tag, "DataView")}{`;
       keys.unshift("byteLength", "byteOffset", "buffer");
     } else if (valueTag === "Promise" && __node.promiseState(value) !== undefined) {
       braces[0] = `${getPrefix(constructor, tag, "Promise")}{`;
       formatter = formatPromise;
-    } else if (valueTag === "WeakSet") {
+    } else if (types.isWeakSet(value)) {
       braces[0] = `${getPrefix(constructor, tag, "WeakSet")}{`;
       formatter = formatWeakCollection;
-    } else if (valueTag === "WeakMap") {
+    } else if (types.isWeakMap(value)) {
       braces[0] = `${getPrefix(constructor, tag, "WeakMap")}{`;
       formatter = formatWeakCollection;
     } else if (valueTag === "Module") {
