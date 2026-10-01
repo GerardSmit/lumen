@@ -1120,7 +1120,7 @@ class UDP {
     });
     return err === 0 ? sent + 1 : err;
   }
-  send6(req, list, count, port, address, hasCallback) { return this.send(req, list, count, port, address, hasCallback); }
+  send6(req, list, count, port, address, hasCallback) { return UDP.prototype.send.call(this, req, list, count, port, address, hasCallback); }
 
   recvStart() {
     if (this._closed) return UV_EBADF;

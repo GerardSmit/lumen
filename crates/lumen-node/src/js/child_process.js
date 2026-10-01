@@ -1621,11 +1621,24 @@ function execFile(file, args, options, callback) {
 
 // ---- synchronous variants ---------------------------------------------------------------------
 
+const internalChildProcess = {
+  ChildProcess,
+  kChannelHandle,
+  setupChannel,
+  getValidStdio,
+  stdioStringToArray,
+  spawnSync: spawnSyncImpl,
+};
+
 function spawnSync(file, args, options) {
   options = { maxBuffer: MAX_BUFFER, ...normalizeSpawnArguments(file, args, options) };
   validateTimeout(options.timeout);
   validateMaxBuffer(options.maxBuffer);
   options.killSignal = sanitizeKillSignal(options.killSignal);
+  return internalChildProcess.spawnSync(options);
+}
+
+function spawnSyncImpl(options) {
   const { stdio } = getValidStdio(options.stdio || "pipe", true);
   let input = options.input;
   if (input) {
@@ -1786,11 +1799,4 @@ const __childProcessExports = {
 Object.defineProperty(__childProcessExports, "_ipcWire", { value: __ipcWire, configurable: true });
 __builtins.set("child_process", __childProcessExports);
 // require('internal/child_process') under --expose-internals.
-__builtins.set("internal/child_process", {
-  ChildProcess,
-  kChannelHandle,
-  setupChannel,
-  getValidStdio,
-  stdioStringToArray,
-  spawnSync,
-});
+__builtins.set("internal/child_process", internalChildProcess);

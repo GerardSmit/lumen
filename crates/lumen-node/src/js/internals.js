@@ -41,9 +41,13 @@ for (const [table, ids] of [
     "internal/fs/recursive_watch"],
   ["http2Require", "internal/http2/util internal/http2/compat internal/http2/core"],
   ["tlsRequire", "internal/js_stream_socket internal/tls/secure-context internal/tls/secure-pair"],
+  ["builtinInternals", "internal/child_process internal/cluster/round_robin_handle " +
+    "internal/cluster/shared_handle internal/cluster/worker internal/cluster/utils"],
 ]) {
   for (const id of ids.split(" ")) foreignModules.set(id, table);
 }
+
+__internals.set("builtinInternals", (id) => __builtins.get(id));
 
 function require(id) {
   const cached = moduleCache.get(id);
