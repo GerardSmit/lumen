@@ -409,6 +409,22 @@ impl Runtime {
             interrupt = Some(e.interrupt);
             embedded_io = Some((e.argv, e.env, e.stdout, e.stderr));
         }
+        // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
+        // unhandled rejection, not a reported exception.
+        {
+            let ctx = engine.ctx();
+            let f = ctx.make_native("queueMicrotask", 1, |i, _this, args| {
+                match args.first() {
+                    Some(cb) if cb.is_callable() => {
+                        i.queue_microtask(cb.clone());
+                        Ok(Value::Undefined)
+                    }
+                    _ => Err(i.make_error("TypeError", "queueMicrotask expects a function")),
+                }
+            });
+            let global = engine.global_this();
+            let _ = engine.ctx().set_member(&global, "queueMicrotask", Value::Obj(f));
+        }
         install(
             &mut engine,
             &[
@@ -436,22 +452,6 @@ impl Runtime {
                 out: Box::new(stdout),
                 err: Box::new(stderr),
             });
-        }
-        // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
-        // unhandled rejection, not a reported exception.
-        {
-            let ctx = engine.ctx();
-            let f = ctx.make_native("queueMicrotask", 1, |i, _this, args| {
-                match args.first() {
-                    Some(cb) if cb.is_callable() => {
-                        i.queue_microtask(cb.clone());
-                        Ok(Value::Undefined)
-                    }
-                    _ => Err(i.make_error("TypeError", "queueMicrotask expects a function")),
-                }
-            });
-            let global = engine.global_this();
-            let _ = engine.ctx().set_member(&global, "queueMicrotask", Value::Obj(f));
         }
         // The HTML error-reporting globals (WinterTC Minimum Common API §5.2): `onerror` /
         // `onunhandledrejection` global event-handler properties and `reportError`. The fire
@@ -541,7 +541,7 @@ impl Runtime {
 
     /// Give the engine the ESM loader (so dynamic `import()` works) and resolve bare relative
     /// specifiers against `path`.
-    pub(crate) fn install_module_loader(&mut self, path: &str, has_source: bool) {
+    pub fn install_module_loader(&mut self, path: &str, has_source: bool) {
         let loader = esm::make_loader(self.builtin_modules());
         self.engine.set_module_loader_attrs(loader);
         match lumen_host::canonicalize(path) {

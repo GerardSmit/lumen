@@ -747,6 +747,7 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
   // 'Microtask' async resource. A throwing callback is an uncaught exception.
   {
     const rawQueueMicrotask = globalThis.queueMicrotask;
+    __internals.set("rawQueueMicrotask", rawQueueMicrotask);
     globalThis.queueMicrotask = function queueMicrotask(callback) {
       __validators.validateFunction(callback, "callback");
       rawQueueMicrotask(__asyncTracking ? __bindAsyncContext(callback, "Microtask", { callback }) : callback);

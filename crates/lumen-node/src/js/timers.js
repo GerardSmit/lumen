@@ -18,15 +18,31 @@
   delete globalThis.__timerSetRef;
   delete globalThis.__timerRefresh;
 
+  // Unref'd immediates only run while something else keeps the loop alive: they wait here until a
+  // ref'd immediate or a timer fires.
+  const unrefPending = [];
+  const flushUnref = () => {
+    for (const [handle, run] of unrefPending.splice(0)) if (!handle._cleared) run();
+  };
+  const scheduleUnrefFlush = () => { if (unrefPending.length) gSetImmediate(flushUnref); };
+
   // --- Timeout handles ----------------------------------------------------------------------
   // Node's setTimeout/setInterval return a Timeout object, not an id: `ref()`/`unref()` decide
   // whether the timer keeps the process alive, `refresh()` restarts it, and the object coerces
   // to its numeric id so `clearTimeout(+timer)` and the raw ops still agree.
-  const invalidCallback = () => {
-    const err = new TypeError('The "callback" argument must be of type function. Received undefined');
+  const describeReceived = (v) => {
+    if (v == null) return " Received " + v;
+    if (typeof v === "function") return ` Received function ${v.name}`;
+    if (typeof v === "object") return v.constructor && v.constructor.name ? ` Received an instance of ${v.constructor.name}` : " Received [Object: null prototype] {}";
+    let shown = typeof v === "string" ? `'${v.length > 28 ? v.slice(0, 25) + "..." : v}'` : typeof v === "symbol" ? v.toString() : String(v);
+    return ` Received type ${typeof v} (${shown})`;
+  };
+  const invalidArg = (name, value) => {
+    const err = new TypeError(`The "${name}" argument must be of type function.${describeReceived(value)}`);
     err.code = "ERR_INVALID_ARG_TYPE";
     return err;
   };
+  const invalidCallback = (value) => invalidArg("callback", value);
   class Timeout {
     constructor(callback, delay, args, repeat) {
       callback = __bindAsyncContext(callback, "Timeout", this, repeat);
@@ -40,12 +56,29 @@
       // Node calls `timer._onTimeout()`: the callback's `this` is the Timeout (an interval
       // callback commonly stops itself with `clearInterval(this)`). A one-shot timer stays
       // active until its callback returns.
-      this._fire = repeat ? (...a) => this._onTimeout(...a) : (...a) => {
+      this._converted = false;
+      this._fire = repeat ? (...a) => {
+        try {
+          return typeof this._onTimeout === "function" ? this._onTimeout(...a) : undefined;
+        } finally {
+          if (!this._destroyed && this._idleTimeout < 0) this.close();
+          scheduleUnrefFlush();
+        }
+      } : (...a) => {
         const id = this._id;
         try {
-          return this._onTimeout(...a);
+          return typeof this._onTimeout === "function" ? this._onTimeout(...a) : undefined;
         } finally {
-          if (this._id === id) this._setArmed(false);
+          scheduleUnrefFlush();
+          if (this._id === id && !this._destroyed) {
+            if (this._repeat && !this._converted) {
+              this._converted = true;
+              this._id = rawSetInterval(this._fire, this._repeat, ...this._timerArgs);
+              if (!this._refed) timerSetRef(this._id, false);
+            } else if (!this._converted) {
+              this._setArmed(false);
+            }
+          }
         }
       };
       this._id = repeat ? rawSetInterval(this._fire, delay, ...args) : rawSetTimeout(this._fire, delay, ...args);
@@ -94,11 +127,11 @@
     return Number.isFinite(n) && n >= 1 ? n : 1;
   };
   function setTimeout(callback, ms, ...args) {
-    if (typeof callback !== "function") throw invalidCallback();
+    if (typeof callback !== "function") throw invalidCallback(callback);
     return new Timeout(callback, coerceDelay(ms), args, false);
   }
   function setInterval(callback, ms, ...args) {
-    if (typeof callback !== "function") throw invalidCallback();
+    if (typeof callback !== "function") throw invalidCallback(callback);
     return new Timeout(callback, coerceDelay(ms), args, true);
   }
   function clearTimeout(timer) {
@@ -119,22 +152,30 @@
 
   // --- setImmediate / clearImmediate as cancellable handles ------------------------------------
   class Immediate {
-    constructor() { this._cleared = false; this._pending = true; __activeResources.immediates++; }
+    constructor() { this._cleared = false; this._pending = true; this._destroyed = false; this._refed = true; __activeResources.immediates++; }
     _settle() { if (this._pending) { this._pending = false; __activeResources.immediates--; } }
-    ref() { return this; }
-    unref() { return this; }
-    hasRef() { return true; }
+    ref() { this._refed = true; return this; }
+    unref() { this._refed = false; return this; }
+    hasRef() { return this._refed; }
+    [Symbol.dispose]() { clearImmediate(this); }
   }
   function setImmediate(callback, ...args) {
-    if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
+    if (typeof callback !== "function") throw invalidCallback(callback);
     const handle = new Immediate();
-    const run = __bindAsyncContext(() => callback(...args), "Immediate", handle);
-    gSetImmediate(() => { handle._settle(); if (!handle._cleared) run(); });
+    const run = __bindAsyncContext(() => Reflect.apply(callback, handle, args), "Immediate", handle);
+    gSetImmediate(() => {
+      handle._settle();
+      if (handle._cleared) return;
+      if (!handle._refed) { unrefPending.push([handle, run]); return; }
+      flushUnref();
+      run();
+    });
     return handle;
   }
   function clearImmediate(handle) {
     if (handle && typeof handle === "object") {
       handle._cleared = true;
+      handle._destroyed = true;
       if (handle instanceof Immediate) handle._settle();
       __destroyAsyncResource(handle);
     }
@@ -146,18 +187,32 @@
   // Operates on an object carrying `_onTimeout` and `_idleTimeout` (ms). `active`/`_unrefActive`
   // (re)arm the timer; `enroll`/`unenroll` set/clear its duration.
   function enroll(item, msecs) {
+    if (typeof msecs !== "number") {
+      const err = new TypeError(`The "msecs" argument must be of type number.${describeReceived(msecs)}`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    if (msecs < 0 || !Number.isFinite(msecs)) {
+      const err = new RangeError(`The value of "msecs" is out of range. It must be a non-negative finite number. Received ${msecs}`);
+      err.code = "ERR_OUT_OF_RANGE";
+      throw err;
+    }
     item._idleTimeout = msecs;
     if (item._idleTimeoutId != null) { gClearTimeout(item._idleTimeoutId); item._idleTimeoutId = null; }
     return item;
   }
   function unenroll(item) {
+    if (item instanceof Timeout) { clearTimeout(item); item._idleTimeout = -1; return item; }
     if (item && item._idleTimeoutId != null) { gClearTimeout(item._idleTimeoutId); item._idleTimeoutId = null; }
     if (item) item._idleTimeout = -1;
     return item;
   }
+  const idleList = {};
   function active(item) {
     if (!item || typeof item._idleTimeout !== "number" || item._idleTimeout < 0) return;
     if (item._idleTimeoutId != null) gClearTimeout(item._idleTimeoutId);
+    item._idleStart = Date.now();
+    item._idleNext = item._idlePrev = idleList;
     item._idleTimeoutId = gSetTimeout(() => {
       if (typeof item._onTimeout === "function") item._onTimeout();
     }, item._idleTimeout);

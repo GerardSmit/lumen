@@ -39,7 +39,7 @@ const callOnunhandledrejection = (promise, reason) => {
     } catch {}
     return prevented;
 };
-globalThis.__lumen_fire_error = function (error, origin = 'uncaughtException') {
+const fireError = globalThis.__lumen_fire_error = function (error, origin = 'uncaughtException') {
     // Node's process owns fatal errors through `process._fatalException` (exit code 6 when a
     // program replaced it with a non-function; a throw out of it propagates, which is fatal).
     const p = globalThis.process;
@@ -166,7 +166,7 @@ const nodeUnhandledRejection = (promise, reason) => {
     switch (rejectionMode()) {
         case 'strict': {
             const err = unhandledRejectionError(reason);
-            if (!globalThis.__lumen_fire_error(err, 'unhandledRejection')) return [err];
+            if (!fireError(err, 'unhandledRejection')) return [err];
             if (!emit()) warnUnhandledRejection(uid, reason);
             return true;
         }

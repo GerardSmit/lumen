@@ -142,7 +142,7 @@ const emitBefore = (id) => emit("before", id);
 const emitAfter = (id) => emit("after", id);
 function emitDestroy(id) {
   if (!has("destroy")) return;
-  queueMicrotask(() => emit("destroy", id));
+  __internals.get("rawQueueMicrotask")(() => emit("destroy", id));
 }
 
 // What preamble.js calls while any hook is enabled (`__asyncHooks`).
@@ -204,7 +204,7 @@ function syncHooks() {
   __setAsyncHooks(active.length === 0 ? null : hookRuntime);
   if (active.length === 0) {
     // Later: a promise reaction running now still gets its `after`, which pops its frame.
-    queueMicrotask(stopPromiseHooksIfUnused);
+    __internals.get("rawQueueMicrotask")(stopPromiseHooksIfUnused);
     return;
   }
   if (stopAsyncPromiseHooks !== null) stopAsyncPromiseHooks();
