@@ -39,216 +39,624 @@ for (let i = 0; i < domExceptionConstants.length; i++) {
 }
 
 const kResistStopPropagation = Symbol.for("nodejs.internal.kResistStopPropagation");
+const kWeakHandler = Symbol.for("nodejs.internal.kWeakHandler");
+const kEmptyObject = Object.freeze({ __proto__: null });
+const kTrustEvent = Symbol("kTrustEvent");
+const kEvents = Symbol.for("lumen.kEvents");
+const kMaxEventTargetListeners = Symbol.for("events.maxEventTargetListeners");
+const kMaxEventTargetListenersWarned = Symbol.for("events.maxEventTargetListenersWarned");
+const kIsNodeStyleListener = Symbol("kIsNodeStyleListener");
+const kHybridDispatch = Symbol("kHybridDispatch");
+const kCreateEvent = Symbol("kCreateEvent");
+const kNewListener = Symbol("kNewListener");
+const kRemoveListener = Symbol("kRemoveListener");
+const kType = Symbol("kType");
+const kTarget = Symbol("kTarget");
+const kDispatching = Symbol("kIsBeingDispatched");
+const kStop = Symbol("kStop");
+const kTrusted = Symbol("kTrusted");
+const kHandlers = Symbol("kHandlers");
+const inspectCustom = Symbol.for("nodejs.util.inspect.custom");
+
+function receivedText(value) {
+  if (value == null) return ` Received ${value}`;
+  if (typeof value === "function") return ` Received function ${value.name}`;
+  if (typeof value === "object") {
+    const name = value.constructor?.name;
+    return name ? ` Received an instance of ${name}` : " Received [Object: null prototype] {}";
+  }
+  let shown;
+  if (typeof value === "string") {
+    shown = value.length > 25 ? `${value.slice(0, 25)}...` : value;
+    shown = `'${shown}'`;
+  } else if (typeof value === "bigint") {
+    shown = `${value}n`;
+  } else if (Object.is(value, -0)) {
+    shown = "-0";
+  } else {
+    shown = String(value);
+  }
+  return ` Received type ${typeof value} (${shown})`;
+}
+
+function codedError(Base, code, message) {
+  const err = new Base(message);
+  Object.defineProperty(err, "toString", {
+    value() { return `${this.name} [${code}]: ${this.message}`; },
+    enumerable: false, writable: true, configurable: true,
+  });
+  err.code = code;
+  if (typeof err.stack === "string" && err.stack.startsWith(`${err.name}: `)) {
+    err.stack = `${err.name} [${code}]${err.stack.slice(err.name.length)}`;
+  }
+  return err;
+}
+function invalidArgType(name, expected, value) {
+  const kind = name.includes(".") ? "property" : "argument";
+  return codedError(TypeError, "ERR_INVALID_ARG_TYPE", `The "${name}" ${kind} must be ${expected}.${receivedText(value)}`);
+}
+const invalidThis = (name) => codedError(TypeError, "ERR_INVALID_THIS", `Value of "this" must be of type ${name}`);
+
+function validateEventObject(options) {
+  if (options === null || options === undefined) return;
+  if (typeof options !== "object" && typeof options !== "function") {
+    throw invalidArgType("options", "of type object", options);
+  }
+}
+
+function inspectObject(self, fields, depth, options, inspect, named = false) {
+  const name = self.constructor?.name ?? "Object";
+  if (depth < 0) return named ? name : self;
+  const opts = { ...options, depth: Number.isInteger(options.depth) ? options.depth - 1 : options.depth };
+  return `${name} ${inspect(fields, opts)}`;
+}
 
 class Event {
-  constructor(type, init = {}) {
+  constructor(type, options = kEmptyObject) {
     if (arguments.length === 0) {
-      throw new TypeError("Event constructor requires a type");
+      throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "type" argument must be specified');
     }
-    init = init && typeof init === "object" ? init : {};
-    this.type = String(type);
-    this.bubbles = !!init.bubbles;
-    this.cancelable = !!init.cancelable;
-    this.composed = !!init.composed;
-    this.defaultPrevented = false;
-    this.target = null;
-    this.currentTarget = null;
-    this.eventPhase = Event.AT_TARGET;
-    this.isTrusted = false;
-    this.timeStamp = performance.now();
-    this._propagationStopped = false;
-    this._immediateStopped = false;
+    validateEventObject(options);
+    this[kType] = `${type}`;
+    this[kStop] = false;
+    this[kTrusted] = options?.[kTrustEvent] === true;
+    this[kTarget] = null;
+    this[kDispatching] = false;
+    const bubbles = !!options?.bubbles;
+    const cancelable = !!options?.cancelable;
+    const composed = !!options?.composed;
+    const state = { cancelable, bubbles, composed, defaultPrevented: false, propagationStopped: false, timeStamp: performance.now() };
+    Object.defineProperty(this, kEventState, { value: state, enumerable: false });
   }
-  preventDefault() {
-    if (this.cancelable) this.defaultPrevented = true;
-  }
-  stopPropagation() {
-    this._propagationStopped = true;
+  [inspectCustom](depth, options, inspect) {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return inspectObject(this, { type: this[kType], defaultPrevented: this.defaultPrevented, cancelable: this.cancelable, timeStamp: this.timeStamp }, depth, options, inspect, true);
   }
   stopImmediatePropagation() {
-    this._propagationStopped = true;
-    this._immediateStopped = true;
+    if (!isEvent(this)) throw invalidThis("Event");
+    this[kStop] = true;
+  }
+  preventDefault() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    this[kEventState].defaultPrevented = true;
+  }
+  get target() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kTarget];
+  }
+  get currentTarget() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kDispatching] ? this[kTarget] : null;
+  }
+  get srcElement() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kTarget];
+  }
+  get type() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kType];
+  }
+  get cancelable() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kEventState].cancelable;
+  }
+  get defaultPrevented() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kEventState].cancelable && this[kEventState].defaultPrevented;
+  }
+  get timeStamp() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kEventState].timeStamp;
+  }
+  composedPath() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kDispatching] ? [this[kTarget]] : [];
+  }
+  get returnValue() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return !this.defaultPrevented;
+  }
+  get bubbles() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kEventState].bubbles;
+  }
+  get composed() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kEventState].composed;
+  }
+  get eventPhase() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kDispatching] ? Event.AT_TARGET : Event.NONE;
+  }
+  get cancelBubble() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kEventState].propagationStopped;
+  }
+  set cancelBubble(value) {
+    if (!isEvent(this)) throw invalidThis("Event");
+    if (value) this.stopPropagation();
+  }
+  stopPropagation() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    this[kEventState].propagationStopped = true;
+  }
+  get isTrusted() {
+    if (!isEvent(this)) throw invalidThis("Event");
+    return this[kTrusted];
   }
 }
+const kEventState = Symbol("kEventState");
+function isEvent(value) {
+  return typeof value?.[kType] === "string" && value[kEventState] !== undefined;
+}
+Object.defineProperty(Event.prototype, Symbol.toStringTag, { value: "Event", configurable: true });
 for (const [i, name] of ["NONE", "CAPTURING_PHASE", "AT_TARGET", "BUBBLING_PHASE"].entries()) {
-  Object.defineProperty(Event, name, { value: i, writable: false, configurable: false, enumerable: true });
+  const desc = { value: i, writable: false, configurable: false, enumerable: true };
+  Object.defineProperty(Event, name, desc);
+  Object.defineProperty(Event.prototype, name, desc);
+}
+for (const name of ["target", "currentTarget", "srcElement", "type", "cancelable", "defaultPrevented", "timeStamp",
+  "returnValue", "bubbles", "composed", "eventPhase", "isTrusted", "cancelBubble", "stopPropagation",
+  "stopImmediatePropagation", "preventDefault", "composedPath"]) {
+  Object.defineProperty(Event.prototype, name, { enumerable: true });
 }
 
+const kDetail = Symbol("kDetail");
 class CustomEvent extends Event {
-  constructor(type, init = {}) {
-    super(type, init);
-    this.detail = init && "detail" in init ? init.detail : null;
+  constructor(type, options = kEmptyObject) {
+    if (arguments.length === 0) {
+      throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "type" argument must be specified');
+    }
+    super(type, options);
+    this[kDetail] = options?.detail ?? null;
   }
+  get detail() {
+    if (!(kDetail in Object(this))) throw invalidThis("CustomEvent");
+    return this[kDetail];
+  }
+}
+Object.defineProperty(CustomEvent.prototype, Symbol.toStringTag, { value: "CustomEvent", configurable: true });
+Object.defineProperty(CustomEvent.prototype, "detail", { enumerable: true });
+
+class NodeCustomEvent extends Event {
+  constructor(type, options) {
+    super(type, options);
+    if (options?.detail) this.detail = options.detail;
+  }
+}
+
+function defaultMaxListeners() {
+  return globalThis[Symbol.for("lumen.EventEmitter")]?.defaultMaxListeners ?? 10;
+}
+
+function initEventTarget(self) {
+  self[kEvents] = new Map();
+  self[kMaxEventTargetListeners] = defaultMaxListeners();
+  self[kMaxEventTargetListenersWarned] = false;
+}
+
+function isEventTarget(value) {
+  return value !== null && typeof value === "object" && value[kEvents] instanceof Map;
+}
+
+const keepAlive = new WeakMap();
+
+function entryCallback(entry) {
+  return entry.weak ? entry.callback.deref() : entry.callback;
+}
+
+function reportUncaught(error) {
+  const rethrow = () => {
+    throw error;
+  };
+  if (typeof process === "object" && typeof process?.nextTick === "function") process.nextTick(rethrow);
+  else setTimeout(rethrow, 0);
+}
+
+function validateEventListener(listener, name) {
+  if (typeof listener === "function" || typeof listener?.handleEvent === "function") return true;
+  if (listener === null || listener === undefined) return false;
+  if (typeof listener === "object") return true;
+  throw invalidArgType(name, "an instance of EventListener", listener);
+}
+
+function eventListenerOptions(options) {
+  if (typeof options === "boolean") return { capture: options };
+  if (options === null || options === undefined) return {};
+  if (typeof options !== "object" && typeof options !== "function") {
+    throw invalidArgType("options", "of type object", options);
+  }
+  return {
+    once: !!options.once,
+    capture: !!options.capture,
+    passive: !!options.passive,
+    signal: options.signal,
+    weak: options[kWeakHandler],
+    nodeStyle: !!options[kIsNodeStyleListener],
+    resist: options[kResistStopPropagation] === true,
+  };
+}
+
+function missingArgs(names) {
+  const list = names.map((n) => `"${n}"`);
+  const text = list.length === 1 ? `The ${list[0]} argument` : `The ${list.join(" and ")} arguments`;
+  return codedError(TypeError, "ERR_MISSING_ARGS", `${text} must be specified`);
 }
 
 class EventTarget {
   constructor() {
-    this._listeners = new Map();
+    initEventTarget(this);
   }
-  addEventListener(type, callback, options = {}) {
-    if (arguments.length < 2) {
-      const err = new TypeError('The "type" and "listener" arguments must be specified');
-      err.code = "ERR_MISSING_ARGS";
-      throw err;
+  [kNewListener](size, type) {
+    const max = this[kMaxEventTargetListeners];
+    if (max > 0 && size > max && !this[kMaxEventTargetListenersWarned]) {
+      this[kMaxEventTargetListenersWarned] = true;
+      const inspect = globalThis[Symbol.for("lumen.inspect")];
+      const shown = inspect ? inspect(this, { depth: -1 }) : (this.constructor?.name ?? "EventTarget");
+      const w = new Error(`Possible EventTarget memory leak detected. ${size} ${type} listeners added to ${shown}. Use events.setMaxListeners() to increase limit`);
+      w.name = "MaxListenersExceededWarning";
+      w.target = this;
+      w.type = type;
+      w.count = size;
+      process.emitWarning(w);
     }
-    let once = false, capture = false, signal, resist = false;
-    if (typeof options === "boolean") {
-      capture = options;
-    } else if (options !== null && (typeof options === "object" || typeof options === "function")) {
-      // Option getters run in this order, even for a null listener.
-      once = !!options.once;
-      capture = !!options.capture;
-      void options.passive;
-      signal = options.signal;
-      resist = options[kResistStopPropagation] === true;
-      if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
-        const err = new TypeError(`The "options.signal" property must be an instance of AbortSignal.`);
-        err.code = "ERR_INVALID_ARG_TYPE";
-        throw err;
-      }
-    } else if (options !== undefined) {
-      const err = new TypeError('The "options" argument must be of type object.');
-      err.code = "ERR_INVALID_ARG_TYPE";
-      throw err;
+  }
+  [kRemoveListener]() {}
+  addEventListener(type, listener, options = {}) {
+    if (!isEventTarget(this)) throw invalidThis("EventTarget");
+    if (arguments.length < 2) throw missingArgs(["type", "listener"]);
+    const { once, capture, passive, signal, weak, nodeStyle, resist } = eventListenerOptions(options);
+    if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+      throw invalidArgType("options.signal", "an instance of AbortSignal", signal);
     }
-    if (callback === null || callback === undefined) return;
-    if (typeof callback !== "function" && (callback === null || typeof callback !== "object")) {
-      const err = new TypeError('The "listener" argument must be an instance of EventListener.');
-      err.code = "ERR_INVALID_ARG_TYPE";
-      throw err;
+    if (!validateEventListener(listener, "listener")) {
+      const w = new Error(`addEventListener called with ${listener} which has no effect.`);
+      w.name = "AddEventListenerArgumentTypeWarning";
+      w.target = this;
+      w.type = type;
+      process.emitWarning(w);
+      return;
     }
-    const key = String(type);
-    let list = this._listeners.get(key);
-    if (!list) {
-      list = [];
-      this._listeners.set(key, list);
-    }
-    if (list.some((l) => l.callback === callback && l.capture === capture)) return;
+    const key = `${type}`;
     if (signal) {
       if (signal.aborted) return;
       signal.addEventListener("abort", () => {
-        this.removeEventListener(key, callback, { capture });
-      }, { once: true, [kResistStopPropagation]: true });
+        this.removeEventListener(key, listener, { capture });
+      }, { once: true, [kWeakHandler]: this, [kResistStopPropagation]: true });
     }
-    list.push({ callback, capture, once, resist, removed: false });
-  }
-  removeEventListener(type, callback, options = {}) {
-    if (arguments.length < 2) {
-      const err = new TypeError('The "type" and "listener" arguments must be specified');
-      err.code = "ERR_MISSING_ARGS";
-      throw err;
-    }
-    const capture = typeof options === "boolean" ? options
-      : options !== null && typeof options === "object" ? !!options.capture : false;
-    const list = this._listeners.get(String(type));
-    if (!list) return;
-    const i = list.findIndex((l) => l.callback === callback && l.capture === capture);
-    if (i >= 0) {
-      list[i].removed = true;
-      list.splice(i, 1);
-    }
-  }
-  dispatchEvent(event) {
-    if (!(event instanceof Event)) {
-      throw new TypeError("dispatchEvent expects an Event");
-    }
-    event.target = this;
-    event.currentTarget = this;
-    const list = this._listeners.get(event.type);
-    if (list) {
-      for (const entry of [...list]) {
-        if (event._immediateStopped && !list.some((l) => l.resist)) break;
-        if (entry.removed) continue;
-        if (entry.once) {
-          this.removeEventListener(event.type, entry.callback, { capture: entry.capture });
-        }
-        try {
-          if (typeof entry.callback === "function") {
-            entry.callback.call(this, event);
-          } else if (entry.callback && typeof entry.callback.handleEvent === "function") {
-            entry.callback.handleEvent(event);
-          }
-        } catch (e) {
-          // A listener throwing must not break dispatch (the spec "reports" the exception).
-          console.error("Uncaught (in event listener)", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+    let list = this[kEvents].get(key);
+    if (list !== undefined) {
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i].weak && list[i].callback.deref() === undefined) {
+          list[i].removed = true;
+          list.splice(i, 1);
         }
       }
     }
-    event.currentTarget = null;
-    return !event.defaultPrevented;
+    if (list === undefined || list.length === 0) {
+      list = [];
+      this[kEvents].set(key, list);
+    } else if (list.some((l) => entryCallback(l) === listener && l.capture === capture)) {
+      return;
+    }
+    const entry = {
+      callback: weak ? new WeakRef(listener) : listener,
+      weak: weak !== undefined && weak !== null,
+      capture, once, passive, nodeStyle, resist, removed: false,
+    };
+    if (entry.weak) {
+      const owner = Object(weak);
+      let held = keepAlive.get(owner);
+      if (held === undefined) keepAlive.set(owner, (held = new Set()));
+      held.add(listener);
+    }
+    list.push(entry);
+    this[kNewListener](list.length, key, listener, once, capture, passive, entry.weak);
   }
+  removeEventListener(type, listener, options = {}) {
+    if (!isEventTarget(this)) throw invalidThis("EventTarget");
+    if (arguments.length < 2) throw missingArgs(["type", "listener"]);
+    const key = `${type}`;
+    const capture = typeof options === "boolean" ? options : !!options?.capture;
+    const list = this[kEvents].get(key);
+    if (list === undefined) return;
+    const i = list.findIndex((l) => entryCallback(l) === listener && l.capture === capture);
+    if (i < 0) return;
+    list[i].removed = true;
+    list.splice(i, 1);
+    if (list.length === 0) this[kEvents].delete(key);
+    this[kRemoveListener](list.length, key, listener, capture);
+  }
+  dispatchEvent(event) {
+    if (!isEventTarget(this)) throw invalidThis("EventTarget");
+    if (arguments.length < 1) throw missingArgs(["event"]);
+    if (!(event instanceof Event)) throw invalidArgType("event", "an instance of Event", event);
+    if (event[kDispatching]) {
+      throw codedError(Error, "ERR_EVENT_RECURSION", `The event "${event.type}" is already being dispatched`);
+    }
+    this[kHybridDispatch](event, event.type, event);
+    return event.defaultPrevented !== true;
+  }
+  [kCreateEvent](nodeValue, type) {
+    return new NodeCustomEvent(type, { detail: nodeValue });
+  }
+  [kHybridDispatch](nodeValue, type, event) {
+    const createEvent = () => {
+      if (event === undefined) {
+        event = this[kCreateEvent](nodeValue, type);
+        event[kTarget] = this;
+        event[kDispatching] = true;
+      }
+      return event;
+    };
+    if (event !== undefined) {
+      event[kTarget] = this;
+      event[kDispatching] = true;
+    }
+    const list = this[kEvents].get(type);
+    if (list === undefined || list.length === 0) {
+      if (event !== undefined) event[kDispatching] = false;
+      return true;
+    }
+    for (const entry of [...list]) {
+      if (event?.[kStop] === true && !entry.resist) break;
+      if (entry.removed) continue;
+      const callback = entryCallback(entry);
+      if (callback === undefined) {
+        this.removeEventListener(type, undefined, { capture: entry.capture });
+        continue;
+      }
+      if (entry.once) {
+        entry.removed = true;
+        const live = this[kEvents].get(type);
+        const at = live?.indexOf(entry) ?? -1;
+        if (at >= 0) {
+          live.splice(at, 1);
+          if (live.length === 0) this[kEvents].delete(type);
+          this[kRemoveListener](live.length, type, callback, entry.capture);
+        }
+      }
+      try {
+        const arg = entry.nodeStyle ? nodeValue : createEvent();
+        let result;
+        if (typeof callback === "function") result = Reflect.apply(callback, this, [arg]);
+        else result = callback.handleEvent(arg);
+        if (!entry.nodeStyle) arg[kDispatching] = false;
+        if (result !== undefined && result !== null && typeof result.then === "function") {
+          result.then(undefined, reportUncaught);
+        }
+      } catch (error) {
+        reportUncaught(error);
+      }
+    }
+    if (event !== undefined) event[kDispatching] = false;
+    return true;
+  }
+  [inspectCustom](depth, options, inspect) {
+    if (!isEventTarget(this)) throw invalidThis("EventTarget");
+    return inspectObject(this, {}, depth, options, inspect, true);
+  }
+}
+Object.defineProperty(EventTarget.prototype, Symbol.toStringTag, { value: "EventTarget", configurable: true });
+for (const name of ["addEventListener", "removeEventListener", "dispatchEvent"]) {
+  Object.defineProperty(EventTarget.prototype, name, { enumerable: true });
+}
+
+function makeEventHandler(handler) {
+  function eventHandler(...args) {
+    if (typeof eventHandler.handler !== "function") return undefined;
+    return Reflect.apply(eventHandler.handler, this, args);
+  }
+  eventHandler.handler = handler;
+  return eventHandler;
+}
+
+function defineNodeEventHandler(emitter, name, event = name) {
+  Object.defineProperty(emitter, `on${name}`, {
+    __proto__: null,
+    get() {
+      return this[kHandlers]?.get(event)?.handler ?? null;
+    },
+    set(value) {
+      if (!this[kHandlers]) {
+        Object.defineProperty(this, kHandlers, { value: new Map(), writable: true, configurable: true });
+      }
+      const handler = typeof value === "function" ? value : null;
+      let wrapped = this[kHandlers].get(event);
+      if (wrapped) {
+        wrapped.handler = handler;
+      } else {
+        wrapped = makeEventHandler(handler);
+        this[kHandlers].set(event, wrapped);
+        this.addEventListener(event, wrapped);
+      }
+    },
+    configurable: true,
+    enumerable: true,
+  });
+}
+
+const isNodeEventTarget = (value) => isEventTarget(value) && typeof value.emit === "function" && typeof value.on === "function";
+
+class NodeEventTarget extends EventTarget {
+  static get defaultMaxListeners() {
+    return defaultMaxListeners();
+  }
+  setMaxListeners(n) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    const emitter = globalThis[Symbol.for("lumen.EventEmitter")];
+    if (emitter) emitter.setMaxListeners(n, this);
+    else this[kMaxEventTargetListeners] = n;
+    return this;
+  }
+  getMaxListeners() {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    return this[kMaxEventTargetListeners];
+  }
+  eventNames() {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    return [...this[kEvents].keys()];
+  }
+  listenerCount(type) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    return this[kEvents].get(String(type))?.length ?? 0;
+  }
+  off(type, listener, options) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    this.removeEventListener(type, listener, options);
+    return this;
+  }
+  removeListener(type, listener, options) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    this.removeEventListener(type, listener, options);
+    return this;
+  }
+  on(type, listener) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    this.addEventListener(type, listener, { [kIsNodeStyleListener]: true });
+    return this;
+  }
+  addListener(type, listener) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    this.addEventListener(type, listener, { [kIsNodeStyleListener]: true });
+    return this;
+  }
+  emit(type, arg) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    if (typeof type !== "string") throw invalidArgType("type", "of type string", type);
+    const hadListeners = this.listenerCount(type) > 0;
+    this[kHybridDispatch](arg, type);
+    return hadListeners;
+  }
+  once(type, listener) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    this.addEventListener(type, listener, { once: true, [kIsNodeStyleListener]: true });
+    return this;
+  }
+  removeAllListeners(type) {
+    if (!isNodeEventTarget(this)) throw invalidThis("NodeEventTarget");
+    const keys = type !== undefined ? [String(type)] : [...this[kEvents].keys()];
+    for (const key of keys) {
+      for (const entry of this[kEvents].get(key) ?? []) entry.removed = true;
+      this[kEvents].delete(key);
+    }
+    return this;
+  }
+}
+for (const name of ["setMaxListeners", "getMaxListeners", "eventNames", "listenerCount", "off", "removeListener",
+  "on", "addListener", "emit", "once", "removeAllListeners"]) {
+  Object.defineProperty(NodeEventTarget.prototype, name, { enumerable: true });
 }
 
 const kSignalCreate = Symbol("AbortSignal-internal-create");
 const kSourceSignals = Symbol("kSourceSignals");
 const kDependantSignals = Symbol("kDependantSignals");
 const kComposite = Symbol("kComposite");
+const kAborted = Symbol("kAborted");
+const kReason = Symbol("kReason");
+
+const kTimeout = Symbol("kTimeout");
+const gcPersistentSignals = new Set();
+
+const isAbortSignal = (value) => typeof value === "object" && value !== null && kAborted in value;
+
+function abortSignal(signal, reason) {
+  if (signal[kAborted]) return;
+  signal[kAborted] = true;
+  signal[kReason] = reason;
+  gcPersistentSignals.delete(signal);
+  const event = new Event("abort", { [kTrustEvent]: true });
+  signal.dispatchEvent(event);
+  const dependants = signal[kDependantSignals];
+  if (dependants) for (const dependant of [...dependants]) abortSignal(dependant, reason);
+}
+
+function defaultAbortReason() {
+  return new DOMException("This operation was aborted", "AbortError");
+}
 
 class AbortSignal extends EventTarget {
   constructor(token) {
-    if (token !== kSignalCreate) throw new TypeError("Illegal constructor");
+    if (token !== kSignalCreate) throw codedError(TypeError, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
     super();
-    this.aborted = false;
-    this.reason = undefined;
-    this.onabort = null;
-    this[kComposite] = false;
+    Object.defineProperty(this, kAborted, { value: false, writable: true, configurable: true });
+    Object.defineProperty(this, kReason, { value: undefined, writable: true, configurable: true });
+    Object.defineProperty(this, kComposite, { value: false, writable: true, configurable: true });
+  }
+  get aborted() {
+    if (!isAbortSignal(this)) throw invalidThis("AbortSignal");
+    return !!this[kAborted];
+  }
+  get reason() {
+    if (!isAbortSignal(this)) throw invalidThis("AbortSignal");
+    return this[kReason];
   }
   throwIfAborted() {
-    if (this.aborted) throw this.reason;
+    if (!isAbortSignal(this)) throw invalidThis("AbortSignal");
+    if (this[kAborted]) throw this[kReason];
   }
-  _doAbort(reason) {
-    if (this.aborted) return;
-    this.aborted = true;
-    this.reason =
-      reason !== undefined
-        ? reason
-        : new DOMException("This operation was aborted", "AbortError");
-    const event = new Event("abort");
-    if (typeof this.onabort === "function") {
-      try {
-        this.onabort.call(this, event);
-      } catch (e) {
-        console.error("Uncaught (in onabort)", e instanceof Error ? `${e.name}: ${e.message}` : String(e));
-      }
+  [kNewListener](size, type, listener, once, capture, passive, weak) {
+    super[kNewListener](size, type, listener, once, capture, passive, weak);
+    if (this[kTimeout] === true && type === "abort" && !this[kAborted] && !weak && size === 1) {
+      gcPersistentSignals.add(this);
     }
-    this.dispatchEvent(event);
-    const dependants = this[kDependantSignals];
-    if (dependants) for (const dependant of [...dependants]) dependant._doAbort(this.reason);
   }
-  static abort(reason) {
+  [kRemoveListener](size, type, listener, capture) {
+    super[kRemoveListener](size, type, listener, capture);
+    if (this[kTimeout] === true && type === "abort" && size === 0) gcPersistentSignals.delete(this);
+  }
+  [inspectCustom](depth, options, inspect) {
+    return inspectObject(this, { aborted: this.aborted }, depth, options, inspect);
+  }
+  static abort(reason = defaultAbortReason()) {
     const signal = new AbortSignal(kSignalCreate);
-    signal._doAbort(reason);
+    abortSignal(signal, reason);
     return signal;
   }
-  static timeout(ms) {
-    if (typeof ms !== "number") {
-      const err = new TypeError('The "delay" argument must be of type number.');
-      err.code = "ERR_INVALID_ARG_TYPE";
-      throw err;
+  static timeout(delay) {
+    if (typeof delay !== "number") throw invalidArgType("delay", "of type number", delay);
+    if (!Number.isInteger(delay) || delay < 0 || delay > 4294967295) {
+      throw codedError(RangeError, "ERR_OUT_OF_RANGE",
+        `The value of "delay" is out of range. It must be >= 0 && <= 4294967295. Received ${String(delay)}`);
     }
-    const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")),
-      ms,
-    );
+    const signal = new AbortSignal(kSignalCreate);
+    signal[kTimeout] = true;
+    const ref = new WeakRef(signal);
+    const timer = setTimeout(() => {
+      const target = ref.deref();
+      if (target !== undefined) {
+        abortSignal(target, new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+      }
+    }, delay);
     if (typeof timer?.unref === "function") timer.unref();
-    return controller.signal;
+    return signal;
   }
   static any(signals) {
     if (!Array.isArray(signals)) {
-      const err = new TypeError('The "signals" argument must be an instance of Array.');
-      err.code = "ERR_INVALID_ARG_TYPE";
-      throw err;
+      throw invalidArgType("signals", "an instance of Array", signals);
     }
     signals.forEach((s, i) => {
-      if (!(s instanceof AbortSignal)) {
-        const shown = s === undefined ? "undefined" : s === null ? "null"
-          : typeof s === "object" ? `an instance of ${s.constructor?.name ?? "Object"}`
-          : typeof s === "function" ? `function ${s.name}` : `type ${typeof s} (${String(s)})`;
-        const err = new TypeError(`The "signals[${i}]" argument must be an instance of AbortSignal. Received ${shown}`);
-        err.code = "ERR_INVALID_ARG_TYPE";
-        throw err;
-      }
+      if (!(s instanceof AbortSignal)) throw invalidArgType(`signals[${i}]`, "an instance of AbortSignal", s);
     });
     const result = new AbortSignal(kSignalCreate);
     result[kComposite] = true;
@@ -256,7 +664,7 @@ class AbortSignal extends EventTarget {
     result[kSourceSignals] = new Set();
     for (const signal of signals) {
       if (signal.aborted) {
-        result._doAbort(signal.reason);
+        abortSignal(result, signal.reason);
         return result;
       }
       signal[kDependantSignals] ??= new Set();
@@ -274,14 +682,37 @@ class AbortSignal extends EventTarget {
     return result;
   }
 }
+Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, { value: "AbortSignal", configurable: true });
+defineNodeEventHandler(AbortSignal.prototype, "abort");
+for (const name of ["aborted", "reason", "throwIfAborted"]) {
+  Object.defineProperty(AbortSignal.prototype, name, { enumerable: true });
+}
+for (const name of ["abort", "timeout", "any"]) {
+  Object.defineProperty(AbortSignal, name, { enumerable: true });
+}
+
+const kControllerSignal = Symbol("kControllerSignal");
+const isAbortController = (value) => typeof value === "object" && value !== null && kControllerSignal in value;
 
 class AbortController {
   constructor() {
-    this.signal = new AbortSignal(kSignalCreate);
+    Object.defineProperty(this, kControllerSignal, { value: new AbortSignal(kSignalCreate) });
   }
-  abort(reason) {
-    this.signal._doAbort(reason);
+  get signal() {
+    if (!isAbortController(this)) throw invalidThis("AbortController");
+    return this[kControllerSignal];
   }
+  abort(reason = defaultAbortReason()) {
+    if (!isAbortController(this)) throw invalidThis("AbortController");
+    abortSignal(this[kControllerSignal], reason);
+  }
+  [inspectCustom](depth, options, inspect) {
+    return inspectObject(this, { signal: this.signal }, depth, options, inspect);
+  }
+}
+Object.defineProperty(AbortController.prototype, Symbol.toStringTag, { value: "AbortController", configurable: true });
+for (const name of ["signal", "abort"]) {
+  Object.defineProperty(AbortController.prototype, name, { enumerable: true });
 }
 
 const kTransferableSignal = Symbol.for("nodejs.abortsignal.transferable");
@@ -292,12 +723,12 @@ function cloneTransferableSignal(signal) {
   const clone = new AbortSignal(kSignalCreate);
   Object.defineProperty(clone, kTransferableSignal, { value: true });
   if (signal.aborted) {
-    clone._doAbort(signal.reason);
+    abortSignal(clone, signal.reason);
   } else {
     signal.addEventListener("abort", () => {
       const timer = typeof setImmediate === "function"
-        ? setImmediate(() => clone._doAbort(signal.reason))
-        : setTimeout(() => clone._doAbort(signal.reason), 0);
+        ? setImmediate(() => abortSignal(clone, signal.reason))
+        : setTimeout(() => abortSignal(clone, signal.reason), 0);
       if (typeof timer?.unref === "function") timer.unref();
     }, { once: true });
   }
@@ -305,6 +736,16 @@ function cloneTransferableSignal(signal) {
 }
 
 Object.defineProperty(globalThis, "__cloneTransferableSignal", { value: cloneTransferableSignal, configurable: true });
+Object.defineProperty(globalThis, "__eventTargetInternals", {
+  value: {
+    Event, CustomEvent, EventTarget, NodeEventTarget, kEvents, kWeakHandler, kResistStopPropagation, kTrustEvent,
+    kNewListener, kRemoveListener, kCreateEvent, kHybridDispatch, kIsNodeStyleListener, kMaxEventTargetListeners,
+    kMaxEventTargetListenersWarned, defineEventHandler: defineNodeEventHandler, initEventTarget, isEventTarget, isNodeEventTarget,
+    isAbortSignal, isEvent, kTarget, kDispatching, kStop, createAbortSignal: () => new AbortSignal(kSignalCreate),
+    abortSignal,
+  },
+  configurable: true,
+});
 globalThis.DOMException = DOMException;
 globalThis.Event = Event;
 globalThis.CustomEvent = CustomEvent;

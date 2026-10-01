@@ -27,7 +27,7 @@ struct Unit {
 
 const UNITS: &[Unit] = &[
     Unit { files: &["preamble.js"], lazy: false, defined: &[] },
-    Unit { files: &["events.js", "messaging.js"], lazy: true, defined: &[("__cloneTransferableSignal", false)] },
+    Unit { files: &["events.js", "messaging.js"], lazy: true, defined: &[("__cloneTransferableSignal", false), ("__eventTargetInternals", false)] },
     Unit { files: &["encoding.js", "serialize.js"], lazy: true, defined: &[] },
     Unit { files: &["url.js"], lazy: true, defined: &[("URL", false), ("URLSearchParams", false)] },
     Unit { files: &["urlpattern.js"], lazy: true, defined: &[] },

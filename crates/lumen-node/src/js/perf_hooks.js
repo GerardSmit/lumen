@@ -864,7 +864,7 @@ __builtins.set("perf_hooks", __lazyValue(() => {
   }
   if (!(Performance.prototype instanceof EventTarget)) {
     Object.setPrototypeOf(Performance.prototype, EventTarget.prototype);
-    Object.defineProperty(perf, "_listeners", { value: new Map(), writable: true, configurable: true });
+    __eventTargetInternals.initEventTarget(perf);
   }
 
   const method = (fn, name = fn.name) => Object.defineProperty(fn, "name", { value: name, configurable: true });
