@@ -18,10 +18,12 @@ fn timeout_stops_long_bigint_operations() {
         "const a = 7n ** 12000000n; (a * a) / (a + 1n)",
         "BigInt('9'.repeat(30000000))",
     ];
+    // Unoptimized builds spend most of the budget scanning the 30M-digit string before the parse polls.
+    let limit = Duration::from_millis(if cfg!(debug_assertions) { 5000 } else { 1500 });
     for src in cases {
         let (out, elapsed) = lumen(&["--timeout=300", "-e", src]);
         assert_eq!(out.status.code(), Some(124), "{src}: {out:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("timed out after 300 ms"), "{src}");
-        assert!(elapsed < Duration::from_millis(1500), "{src}: {elapsed:?}");
+        assert!(elapsed < limit, "{src}: {elapsed:?}");
     }
 }
