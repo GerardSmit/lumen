@@ -450,6 +450,11 @@ impl Props {
         self.entries.shares_with(&template.entries)
     }
 
+    #[inline]
+    pub(crate) fn is_marked_proto(&self) -> bool {
+        self.proto_flag.get()
+    }
+
     /// Mark this object as a live prototype (see `proto_flag`).
     #[inline]
     pub(crate) fn mark_proto(&self) {

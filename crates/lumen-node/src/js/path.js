@@ -176,6 +176,14 @@ function makePath(sep, isWin) {
       return p;
     },
   };
+  if (!isWin) {
+    const { pathResolve, pathJoin, pathDirname, pathBasename, pathExtname } = __node;
+    path.join = function join(...args) { return pathJoin(...args); };
+    path.resolve = function resolve(...args) { return pathResolve(...args); };
+    path.dirname = function dirname(p) { return pathDirname(p); };
+    path.basename = function basename(p, ext) { return pathBasename(p, ext); };
+    path.extname = function extname(p) { return pathExtname(p); };
+  }
   path._makeLong = path.toNamespacedPath; // legacy alias Node still exports
   return path;
 }

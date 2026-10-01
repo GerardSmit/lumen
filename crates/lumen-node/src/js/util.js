@@ -236,12 +236,19 @@ function inspect(value, opts) {
   return formatValue(ctx, value, 0);
 }
 inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+// Console's native formatter assumes the default options: any change to them switches it off.
+const nativeFormatOff = () => __internals.get("console_native").disableNative();
+const inspectDefaultOptionsView = new Proxy(inspectDefaultOptions, {
+  set(target, key, value) { nativeFormatOff(); return Reflect.set(target, key, value); },
+  defineProperty(target, key, descriptor) { nativeFormatOff(); return Reflect.defineProperty(target, key, descriptor); },
+});
 Object.defineProperty(inspect, "defaultOptions", {
-  get() { return inspectDefaultOptions; },
+  get() { return inspectDefaultOptionsView; },
   set(options) {
     if (options === null || typeof options !== "object") {
       throw new __errors.ERR_INVALID_ARG_TYPE("options", "Object", options);
     }
+    nativeFormatOff();
     return Object.assign(inspectDefaultOptions, options);
   },
   enumerable: true,

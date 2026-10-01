@@ -527,9 +527,12 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
             None => break,
         };
     }
-    // Any successful prototype swap invalidates every property-creation inline cache: a chain
-    // that was proven clean at fill time may now route through different objects.
-    crate::value::bump_proto_epoch();
+    // A swap on an object no creation-IC fill ever walked through changes no proven chain (the
+    // receiver's own proto identity is re-checked by the cache), so only a marked prototype
+    // invalidates the caches.
+    if o.borrow().props.is_marked_proto() {
+        crate::value::bump_proto_epoch();
+    }
     o.borrow_mut().proto = match proto {
         Value::Obj(p) => Some(p.clone()),
         _ => None,

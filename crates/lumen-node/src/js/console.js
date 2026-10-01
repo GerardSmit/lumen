@@ -7,17 +7,27 @@
 // the global get the full API too) and register it as the module, exactly as Node's identity holds
 // (`require('console') === globalThis.console`).
 //
-// The `log` family is reimplemented in JS (over `util.formatWithOptions`, so objects render like
-// `{ a: 1 }` rather than `[object Object]`) but still emits through the captured native sink, so
-// output routing (and any embedder redirection) is preserved. Group indentation, counters, and
-// timers are real; `profile`/`profileEnd`/`timeStamp` are inspector-timeline hooks that are inert
+// The global `log`/`info`/`debug`/`warn`/`error` stay native: they format (util.format-compatible
+// for primitives, plain objects and arrays) and write by themselves while `process.stdout` /
+// `process.stderr` have not been materialised and no group is open, so a program that only logs
+// never loads util, stream or tty. Anything else (a patched or materialised stream, an open
+// group, values the native formatter declines) goes to the function registered with `cops.slow`
+// below, which formats through `util` and writes through the stream. Group indentation, counters, and timers are real; `profile`/`profileEnd`/`timeStamp` are inspector-timeline hooks that are inert
 // without an attached inspector — the honest behavior for a non-inspected process, matching Node.
 
 {
   // node:util loads on first use (see build.rs `LAZY`): plain-string logging never needs it.
   let utilMod;
   const util = () => (utilMod ??= __builtins.get("util"));
-  const fmt = (args, opts) => util().formatWithOptions(opts || {}, ...args);
+  const cops = process._console;
+  __internals.set("console_native", cops);
+  const fmt = (args, opts) => {
+    if (!opts) {
+      const text = cops.format(...args);
+      if (text !== undefined) return text;
+    }
+    return util().formatWithOptions(opts || {}, ...args);
+  };
   const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
 
   // Internal state lives under symbols so it never shows up in `Object.keys` (Node's console
@@ -206,17 +216,14 @@
 
   // --- augment the global console into the module object ---------------------------------------
   // Node's `console` module *is* the global console (`require('console') === globalThis.console`).
-  // The global's log family (`log`/`info`/`debug`/`warn`/`error`) is native and its rendering is
-  // relied on elsewhere, so those are kept as-is (only made enumerable so they show up as module
-  // keys); `this[kOut]`/`this[kErr]` therefore delegate to the native sinks. The remaining surface
+  // The global's log family (`log`/`info`/`debug`/`warn`/`error`) is native and kept as-is (only
+  // made enumerable so they show up as module keys). The remaining surface
   // (dir/table/group/count/time/trace/assert/…) is added in JS on top.
   const NATIVE_KEEP = new Set(["log", "info", "debug", "warn", "error"]);
   const g = globalThis.console;
-  const nativeOut = typeof g.log === "function" ? g.log.bind(g) : () => {};
-  const nativeErr = typeof g.error === "function" ? g.error.bind(g) : () => {};
   // Node's global console writes through `process.stdout.write` / `process.stderr.write`, so a
-  // program (or test) that replaces those methods captures console output. Keep the native sinks
-  // (they honour embedder redirection) unless the stream's write was swapped out.
+  // program (or test) that replaces those methods captures console output. Until a stream is
+  // materialised there is nothing to have replaced and the native sink is written directly.
   const stdoutWrite = process.stdout && process.stdout.write;
   const stderrWrite = process.stderr && process.stderr.write;
   // The native sink may stand in for the stream while the stream is the standard one (its write
@@ -228,45 +235,39 @@
     return !!S && w === S.Writable.prototype.write && stream._isStdio === true &&
       !stream.writableCorked && !stream.writableLength;
   };
-  const emitOut = (s) => {
-    const out = process.stdout;
-    if (!isNativeSink(out, stdoutWrite) && out && typeof out.write === "function") out.write(s + "\n");
-    else nativeOut(s);
+  const emit = (fd, s) => {
+    if (cops.live(fd)) {
+      const stream = fd === 1 ? process.stdout : process.stderr;
+      if (!isNativeSink(stream, fd === 1 ? stdoutWrite : stderrWrite) && stream && typeof stream.write === "function") {
+        stream.write(s + "\n");
+        return;
+      }
+    }
+    cops.write(fd, s);
   };
-  const emitErr = (s) => {
-    const err = process.stderr;
-    if (!isNativeSink(err, stderrWrite) && err && typeof err.write === "function") err.write(s + "\n");
-    else nativeErr(s);
-  };
+  const emitOut = (s) => emit(1, s);
+  const emitErr = (s) => emit(2, s);
   Object.defineProperty(g, kOut, { value: emitOut, configurable: true });
   Object.defineProperty(g, kErr, { value: emitErr, configurable: true });
   Object.defineProperty(g, kIndent, { value: "", writable: true, configurable: true });
   const define = (name, value) =>
     Object.defineProperty(g, name, { value, writable: true, enumerable: true, configurable: true });
-  // The native log family renders each argument itself but knows nothing of printf-style
-  // format strings (`console.log('%s: %d', a, b)`) or group indentation. Keep the native path
-  // for the common case and route through `util.format` when either applies, as Node does.
-  for (const name of NATIVE_KEEP) {
-    const native = g[name];
-    if (typeof native !== "function") continue;
-    const sink = name === "warn" || name === "error" ? kErr : kOut;
-    const wrapped = {
+  for (const name of NATIVE_KEEP) if (typeof g[name] === "function") define(name, g[name]);
+  // The native fast path does not indent: it only needs to know a group is open.
+  for (const name of ["group", "groupCollapsed", "groupEnd"]) {
+    const method = methods[name];
+    define(name, {
       [name](...args) {
-        // Plain strings (no format directives) take the native path unchanged; everything else
-        // renders through util.format like Node's console.
-        let plain = !g[kIndent];
-        for (let i = 0; plain && i < args.length; i++) {
-          if (typeof args[i] !== "string" || (i === 0 && args.length > 1 && args[0].includes("%"))) plain = false;
-        }
-        if (plain && (sink === kOut ? isNativeSink(process.stdout, stdoutWrite) : isNativeSink(process.stderr, stderrWrite))) {
-          return native.apply(g, args);
-        }
-        g[sink](withIndent(g, fmt(args)));
+        const result = method.apply(g, args);
+        cops.indent(g[kIndent] !== "");
+        return result;
       },
-    }[name];
-    define(name, wrapped);
+    }[name]);
   }
-  for (const name of Object.keys(methods)) if (!NATIVE_KEEP.has(name)) define(name, methods[name]);
+  cops.slow((fd, args) => (fd === 2 ? g[kErr] : g[kOut])(withIndent(g, fmt(args))));
+  for (const name of Object.keys(methods)) {
+    if (!NATIVE_KEEP.has(name) && name !== "group" && name !== "groupCollapsed" && name !== "groupEnd") define(name, methods[name]);
+  }
   define("Console", Console);
   // `console.context([label])` returns a fresh Console over this process's stdout/stderr.
   define("context", (_label) => new Console(process.stdout, process.stderr));

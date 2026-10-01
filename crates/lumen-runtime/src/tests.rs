@@ -795,6 +795,26 @@ fn fs_sync_error_throws_catchable_error() {
 // ---- lumen-web (WinterTC minimum common API; the runtime assembles it) ----
 
 #[test]
+fn web_base64_edge_cases() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const t = (f) => { try { return JSON.stringify(f()); } catch (e) { return e.name; } };
+        const r = [];
+        for (const s of ["", "a", "ab", "abc", "h\xe9llo\xff\0", "\u0100", "\ud800", undefined, 12]) r.push(t(() => btoa(s)));
+        for (const s of ["", "YQ==", "YQ", "YWI=", " Y W J j ", "YQ=", "YQ===", "Y", "=", "\u00e9", "Y-_=", "\u00ff"]) r.push(t(() => atob(s)));
+        r.push(atob(btoa("x".repeat(100000))).length);
+        console.log(r.join("|"));
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [r#"""|"YQ=="|"YWI="|"YWJj"|"aOlsbG//AA=="|InvalidCharacterError|InvalidCharacterError|"dW5kZWZpbmVk"|"MTI="|""|"a"|"a"|"ab"|"abc"|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|100000"#]
+    );
+}
+
+#[test]
 fn web_encoding_and_base64() {
     let (mut rt, out, _err) = test_runtime();
     eval_ok(
