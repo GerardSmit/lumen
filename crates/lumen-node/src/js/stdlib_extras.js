@@ -1004,7 +1004,7 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     };
   }
   proc.availableMemory = () => metrics()[14];
-  proc.constrainedMemory = () => metrics()[15] || undefined;
+  proc.constrainedMemory = () => metrics()[15] || 0;
   proc.cpuUsage = (previous) => {
     const m = metrics();
     const current = { user: m[2], system: m[3] };

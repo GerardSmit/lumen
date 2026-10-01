@@ -513,6 +513,8 @@ class ChildProcess extends EventEmitter {
     this._ipcPipe = pipe;
     this._ipcAdvanced = serialization === "advanced";
     this.connected = true;
+    this._closesNeeded++;
+    this._ipcCounted = true;
     this.channel = { ref() {}, unref() {} };
     let pending = "";
     const decoder = new (__builtins.get("string_decoder").StringDecoder)("utf8");
@@ -672,7 +674,10 @@ class ChildProcess extends EventEmitter {
     this.connected = false;
     this.channel = null;
     if (!this._ipcPipe && this.stdin && !this.stdin.writableEnded) this.stdin.end();
-    process.nextTick(() => this.emit("disconnect"));
+    process.nextTick(() => {
+      this.emit("disconnect");
+      if (this._ipcCounted) maybeClose(this);
+    });
   }
 }
 
@@ -783,7 +788,7 @@ function normalizeExecFileArgs(file, args, options, callback) {
 
 function exec(command, options, callback) {
   const opts = normalizeExecArgs(command, options, callback);
-  return module_exports.execFile(opts.file, opts.options, opts.callback);
+  return __childProcessExports.execFile(opts.file, opts.options, opts.callback);
 }
 
 function execFile(file, args, options, callback) {

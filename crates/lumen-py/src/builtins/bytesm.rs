@@ -31,6 +31,12 @@ fn wrap(like: &Value, b: Vec<u8>) -> Value {
     }
 }
 
+fn zeroed(it: &mut Interp, n: usize) -> R<Vec<u8>> {
+    let mut v = it.vec_with_capacity(n, crate::limits::MAX_BYTES_LEN)?;
+    v.resize(n, 0);
+    Ok(v)
+}
+
 fn build(it: &mut Interp, a: &[Value], kw: Kw, array: bool) -> R<Vec<u8>> {
     let name = if array { "bytearray" } else { "bytes" };
     let b = it.bind_args(name, &a[1.min(a.len())..], kw, &["source", "encoding", "errors"], 0)?;
@@ -52,9 +58,10 @@ fn build(it: &mut Interp, a: &[Value], kw: Kw, array: bool) -> R<Vec<u8>> {
             if *n < 0 {
                 return Err(it.value_error("negative count"));
             }
-            Ok(vec![0; *n as usize])
+            zeroed(it, *n as usize)
         }
-        Value::Bool(n) => Ok(vec![0; *n as usize]),
+        Value::Bool(n) => zeroed(it, *n as usize),
+        Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => Err(it.overflow_err("cannot fit 'int' into an index-sized integer")),
         _ => it.bytes_of(src),
     }
 }
@@ -128,8 +135,21 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("join", a, 2, 2)?;
     let sep = data(it, &a[0])?;
     let items = it.iterate_to_vec(&a[1])?;
-    let mut out = Vec::new();
+    let mut total = sep.len().saturating_mul(items.len().saturating_sub(1));
+    for v in &items {
+        if let Value::Obj(o) = v {
+            total = total.saturating_add(match &o.kind {
+                Kind::Bytes(b) => b.len(),
+                Kind::ByteArray(b) => b.borrow().len(),
+                _ => 0,
+            });
+        }
+    }
+    let mut out = it.vec_with_capacity(total, crate::limits::MAX_BYTES_LEN)?;
     for (i, v) in items.iter().enumerate() {
+        if i & 0x3ff == 0 {
+            it.poll()?;
+        }
         if i > 0 {
             out.extend_from_slice(&sep);
         }
@@ -255,6 +275,22 @@ fn replace(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         Some(v) => it.index_of(v)?,
         None => -1,
     };
+    let growth = new.len().saturating_sub(old.len());
+    if growth > 0 {
+        let cap = if max < 0 { usize::MAX } else { max as usize };
+        let mut hits = 0;
+        if old.is_empty() {
+            hits = (h.len() + 1).min(cap);
+        } else {
+            let mut from = 0;
+            while hits < cap {
+                let Some(p) = find_sub(&h, &old, from, false) else { break };
+                hits += 1;
+                from = p + old.len();
+            }
+        }
+        it.check_bytes_len(h.len().saturating_add(growth.saturating_mul(hits)))?;
+    }
     let mut out = Vec::new();
     let mut i = 0;
     if old.is_empty() {
@@ -565,6 +601,7 @@ fn zfill(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if d.len() >= w {
         return Ok(wrap(&a[0], d));
     }
+    it.check_bytes_len(w)?;
     let (sign, rest) = match d.first() {
         Some(b'+') | Some(b'-') => (d[..1].to_vec(), d[1..].to_vec()),
         _ => (Vec::new(), d),
@@ -592,6 +629,7 @@ fn justify(it: &mut Interp, a: &[Value], mode: u8) -> R<Value> {
     if d.len() >= w {
         return Ok(wrap(&a[0], d));
     }
+    it.check_bytes_len(w)?;
     let pad = w - d.len();
     let (l, r) = match mode {
         0 => (0, pad),
@@ -700,6 +738,9 @@ fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         Some(v) => it.index_of(v)?,
         None => 8,
     };
+    if i32::try_from(ts).is_err() {
+        return Err(it.overflow_err("Python int too large to convert to C int"));
+    }
     let d = data(it, &a[0])?;
     let mut out = Vec::new();
     let mut col = 0i64;
@@ -708,6 +749,7 @@ fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             b'\t' => {
                 if ts > 0 {
                     let n = ts - (col % ts);
+                    it.check_bytes_len(out.len() + n as usize)?;
                     out.extend(std::iter::repeat_n(b' ', n as usize));
                     col += n;
                 }

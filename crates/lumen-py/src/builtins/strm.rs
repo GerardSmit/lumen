@@ -439,8 +439,15 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("str.join", a, 2, 2)?;
     let sep = this(it, a, "join")?.s.clone();
     let items = it.iterate_to_vec(&a[1])?;
-    let mut out = String::new();
+    let mut total = sep.len().saturating_mul(items.len().saturating_sub(1));
+    for v in &items {
+        total = total.saturating_add(v.as_str().map_or(0, str::len));
+    }
+    let mut out = it.string_with_capacity(total)?;
     for (i, v) in items.iter().enumerate() {
+        if i & 0x3ff == 0 {
+            it.poll()?;
+        }
         match v.as_str() {
             Some(s) => {
                 if i > 0 {
@@ -466,6 +473,18 @@ fn replace(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         Some(v) => it.index_of(v)?,
         None => -1,
     };
+    let growth = new.len().saturating_sub(old.len());
+    if growth > 0 {
+        let hits = if old.is_empty() {
+            let n = s.nchars + 1;
+            if count < 0 { n } else { n.min(count as usize) }
+        } else {
+            let n = s.s.matches(old.as_str()).count();
+            if count < 0 { n } else { n.min(count as usize) }
+        };
+        let extra = if old.is_empty() { new.len().saturating_mul(hits) } else { growth.saturating_mul(hits) };
+        it.check_str_len(s.s.len().saturating_add(extra))?;
+    }
     if count < 0 {
         if old.is_empty() {
             let mut out = String::new();
@@ -747,6 +766,7 @@ fn justify(it: &mut Interp, a: &[Value], name: &str, mode: u8) -> R<Value> {
         return Ok(Value::str(&s.s));
     }
     let total = (width - n) as usize;
+    it.check_str_len(total.saturating_mul(fill.len_utf8()).saturating_add(s.s.len()))?;
     let (l, r) = match mode {
         0 => (0, total),
         1 => (total, 0),
@@ -780,6 +800,7 @@ fn zfill(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if width <= n {
         return Ok(Value::str(&s.s));
     }
+    it.check_str_len((width - n) as usize + s.s.len())?;
     let pad = "0".repeat((width - n) as usize);
     let (sign, rest) = match s.s.chars().next() {
         Some(c @ ('+' | '-')) => (c.to_string(), &s.s[1..]),
@@ -794,6 +815,9 @@ fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         Some(v) => it.index_of(v)?,
         None => 8,
     };
+    if i32::try_from(ts).is_err() {
+        return Err(it.overflow_err("Python int too large to convert to C int"));
+    }
     let s = this(it, a, "expandtabs")?;
     let mut out = String::new();
     let mut col = 0i64;
@@ -802,6 +826,7 @@ fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             '\t' => {
                 if ts > 0 {
                     let n = ts - (col % ts);
+                    it.check_str_len(out.len() + n as usize)?;
                     out.extend(std::iter::repeat_n(' ', n as usize));
                     col += n;
                 }

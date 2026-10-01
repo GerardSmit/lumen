@@ -725,6 +725,14 @@ fn op_realm_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, V
 /// Finalize native addon producers while the owning realm remains alive.
 pub fn shutdown_native_addons(ctx: &mut Ctx) { napi::shutdown(ctx); }
 
+/// Close every socket and listener the realm still holds, ending the threads blocked on them.
+pub fn close_native_io(ctx: &mut Ctx) {
+    #[cfg(not(target_arch = "wasm32"))]
+    net::close_all(ctx);
+    #[cfg(target_arch = "wasm32")]
+    let _ = ctx;
+}
+
 /// What dropping the realm does besides freeing memory — addon cleanup hooks, then closing open
 /// SQLite databases (which checkpoints their write-ahead logs) — for an exit that skips the drop.
 pub fn shutdown_native_resources(ctx: &mut Ctx) {

@@ -19,7 +19,18 @@ fn cls_of(it: &mut Interp, a: &[Value], what: &str) -> R<Obj> {
     }
 }
 
-pub fn parse_int_str(s: &str, base: u32) -> Option<BigInt> {
+pub enum IntParseError {
+    Invalid,
+    /// More digits than `sys.get_int_max_str_digits()` allows; carries the digit count.
+    TooManyDigits(usize),
+}
+
+/// Parses `s` as `int(s, base)` would; `max_digits` of 0 means no limit.
+pub fn parse_int_str(s: &str, base: u32, max_digits: usize) -> Result<BigInt, IntParseError> {
+    parse_int_inner(s, base, max_digits).ok_or(IntParseError::Invalid).and_then(|r| r)
+}
+
+fn parse_int_inner(s: &str, base: u32, max_digits: usize) -> Option<Result<BigInt, IntParseError>> {
     let t = s.trim();
     let (neg, rest) = match t.strip_prefix('-') {
         Some(r) => (true, r),
@@ -61,8 +72,22 @@ pub fn parse_int_str(s: &str, base: u32) -> Option<BigInt> {
     if !clean.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
+    if max_digits != 0 && !base.is_power_of_two() && clean.len() > max_digits {
+        return Some(Err(IntParseError::TooManyDigits(clean.len())));
+    }
     let v = BigInt::parse_signed(&clean, base)?;
-    Some(if neg { v.neg() } else { v })
+    Some(Ok(if neg { v.neg() } else { v }))
+}
+
+fn parse_int_checked(it: &mut Interp, text: &str, base: u32) -> R<Option<BigInt>> {
+    match parse_int_str(text, base, it.int_max_str_digits()) {
+        Ok(v) => Ok(Some(v)),
+        Err(IntParseError::Invalid) => Ok(None),
+        Err(IntParseError::TooManyDigits(n)) => {
+            it.check_parse_digits(n)?;
+            Ok(None)
+        }
+    }
 }
 
 pub fn parse_float_str(s: &str) -> Option<f64> {
@@ -133,7 +158,7 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
             },
             _ => return Err(it.type_error("int() can't convert non-string with explicit base")),
         };
-        return match parse_int_str(&text, b as u32) {
+        return match parse_int_checked(it, &text, b as u32)? {
             Some(v) => Ok(Value::big(v)),
             None => {
                 let r = it.repr_of(x)?;
@@ -152,7 +177,7 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
             Kind::Int(b) => return Ok(Value::big(b.clone())),
             Kind::Float(f) => return float_to_int_checked(it, *f),
             Kind::Str(s) => {
-                return match parse_int_str(&s.s, 10) {
+                return match parse_int_checked(it, &s.s, 10)? {
                     Some(v) => Ok(Value::big(v)),
                     None => {
                         let r = it.repr_of(x)?;
@@ -167,7 +192,7 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
                     _ => Vec::new(),
                 };
                 let text = String::from_utf8_lossy(&raw).into_owned();
-                return match parse_int_str(&text, 10) {
+                return match parse_int_checked(it, &text, 10)? {
                     Some(v) => Ok(Value::big(v)),
                     None => {
                         let r = it.repr_of(x)?;
@@ -399,6 +424,7 @@ fn int_to_bytes(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         Some(l) => it.index_of(l)?.max(0) as usize,
         None => 1,
     };
+    it.check_bytes_len(len)?;
     let big_endian = match &b[1] {
         Some(o) => match o.as_str() {
             Some("big") => true,

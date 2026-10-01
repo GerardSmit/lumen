@@ -797,11 +797,6 @@ class Pipe extends StreamHandle {
     });
   }
   setPendingInstances() {}
-  getsockname(out) {
-    if (this._path === null) return UV_EINVAL;
-    out.address = this._path;
-    return 0;
-  }
 }
 
 class TCPConnectWrap {}
@@ -1216,7 +1211,7 @@ function caresGetnameinfo(req, address, port) {
 
 // ---- wire format ---------------------------------------------------------------------------
 
-const T = { A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15, TXT: 16, AAAA: 28, SRV: 33, NAPTR: 35, CAA: 257, ANY: 255 };
+const T = { A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15, TXT: 16, AAAA: 28, SRV: 33, NAPTR: 35, TLSA: 52, CAA: 257, ANY: 255 };
 
 class WireError extends Error {
   constructor(code) {
@@ -1384,6 +1379,16 @@ function parseRecord(buf, type, start, length) {
       if (start + 2 + tagLength > end) throw new WireError("EBADRESP");
       const tag = buf.toString("latin1", start + 2, start + 2 + tagLength);
       return { type: "CAA", critical, tag, value: buf.toString("latin1", start + 2 + tagLength, end) };
+    }
+    case T.TLSA: {
+      if (length < 3) throw new WireError("EBADRESP");
+      return {
+        type: "TLSA",
+        certUsage: buf[start],
+        selector: buf[start + 1],
+        match: buf[start + 2],
+        data: buf.subarray(start + 3, end),
+      };
     }
     default:
       return null;
@@ -1740,6 +1745,13 @@ const PARSERS = {
   queryCaa: [T.CAA, (answers) => {
     const found = ofType(answers, "CAA");
     return found.length === 0 ? [null] : [found.map((a) => ({ critical: a.critical, [a.tag]: a.value }))];
+  }],
+  queryTlsa: [T.TLSA, (answers) => {
+    const found = ofType(answers, "TLSA");
+    return found.length === 0 ? [null] : [found.map((a) => ({
+      certUsage: a.certUsage, selector: a.selector, match: a.match,
+      data: a.data.buffer.slice(a.data.byteOffset, a.data.byteOffset + a.data.byteLength),
+    }))];
   }],
   queryAny: [T.ANY, (answers) => {
     const out = [];
@@ -13179,6 +13191,7 @@ defineModule("internal/dns/utils", function (module, exports, require, internalB
     'resolvePtr',
     'resolveSoa',
     'resolveSrv',
+    'resolveTlsa',
     'resolveTxt',
     'reverse',
   ];
@@ -13253,6 +13266,7 @@ defineModule("internal/dns/utils", function (module, exports, require, internalB
     Resolver.prototype.resolvePtr = resolveMap.PTR = resolver('queryPtr');
     Resolver.prototype.resolveNaptr = resolveMap.NAPTR = resolver('queryNaptr');
     Resolver.prototype.resolveSoa = resolveMap.SOA = resolver('querySoa');
+    Resolver.prototype.resolveTlsa = resolveMap.TLSA = resolver('queryTlsa');
     Resolver.prototype.reverse = resolver('getHostByAddr');
 
     return {

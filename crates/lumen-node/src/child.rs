@@ -959,11 +959,23 @@ fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
         #[cfg(not(unix))]
         let _ = child.kill();
     };
-    let status = if timeout.is_none() && !cfg!(unix) && max_buffer.is_some() || timeout.is_some() {
+    let interrupt = ctx.interrupt_for_host();
+    let status = if timeout.is_none() && !cfg!(unix) && max_buffer.is_some()
+        || timeout.is_some()
+        || interrupt.is_some()
+    {
         let started = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().map_err(|e| wait_error(ctx, e))? {
                 break status;
+            }
+            if interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                stop(&mut child);
+                let _ = child.wait();
+                ctx.poll_interrupt_for_host()?;
             }
             if timeout.is_some_and(|limit| started.elapsed() >= limit) {
                 timed_out = true;

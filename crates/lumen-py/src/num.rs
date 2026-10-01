@@ -421,7 +421,10 @@ impl Interp {
         Ok(match op {
             BinOp::Add => Value::big(a.add(&b)),
             BinOp::Sub => Value::big(a.sub(&b)),
-            BinOp::Mult => Value::big(a.mul(&b)),
+            BinOp::Mult => {
+                self.check_int_bits((a.bit_len() + b.bit_len()) as u128)?;
+                Value::big(a.mul(&b))
+            }
             BinOp::FloorDiv => {
                 if b.is_zero() {
                     return Err(self.zero_div("division by zero"));
@@ -454,7 +457,10 @@ impl Interp {
                     return Ok(Value::Int(0));
                 }
                 match b.to_u64() {
-                    Some(n) if n < (1 << 32) => Value::big(a.shl(n)),
+                    Some(n) if n < (1 << 63) => {
+                        self.check_int_bits(a.bit_len() as u128 + n as u128)?;
+                        Value::big(a.shl(n))
+                    }
                     _ => return Err(self.new_exc_str("OverflowError", "too many digits in integer")),
                 }
             }
@@ -477,17 +483,17 @@ impl Interp {
                     };
                 }
                 match b.to_u64() {
-                    Some(n) => match a.pow(&BigInt::from_u64(n)) {
-                        Ok(v) => Value::big(v),
-                        Err(_) => return Err(self.new_exc_str("MemoryError", "")),
-                    },
-                    None => {
-                        if a.is_zero() || a == BigInt::from_i64(1) {
-                            Value::big(a)
-                        } else {
-                            return Err(self.new_exc_str("MemoryError", ""));
+                    Some(n) => {
+                        self.check_int_bits((a.bit_len() as u128).saturating_sub(1) * n as u128)?;
+                        match a.pow(&BigInt::from_u64(n)) {
+                            Ok(v) => Value::big(v),
+                            Err(_) => return Err(self.memory_error()),
                         }
                     }
+                    None => match a.abs() == BigInt::from_i64(1) || a.is_zero() {
+                        true => Value::big(a.pow(&b).map_err(|_| self.memory_error())?),
+                        false => return Err(self.memory_error()),
+                    },
                 }
             }
             _ => Value::NotImplemented,

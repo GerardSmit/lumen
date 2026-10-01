@@ -121,9 +121,16 @@ out += mod('dgram', stripLicense(src('dgram.js')));
 
 // ---- dns ----
 // lumen: the default result order is read where Node's pre-execution would call initializeDns().
-out += mod('internal/dns/utils', patch(stripLicense(src('internal_dns_utils.js')),
+let dnsUtils = patch(stripLicense(src('internal_dns_utils.js')),
   `let dnsOrder;\n`, `let dnsOrder = getOptionValue('--dns-result-order') || 'verbatim'; // lumen\n`,
-  'internal_dns_utils.js'));
+  'internal_dns_utils.js');
+// lumen: resolveTlsa (Node 22.15), which the vendored 20.11 sources predate.
+dnsUtils = patch(dnsUtils, `  'resolveSrv',\n  'resolveTxt',\n`, `  'resolveSrv',\n  'resolveTlsa',\n  'resolveTxt',\n`,
+  'internal_dns_utils.js');
+dnsUtils = patch(dnsUtils, `  Resolver.prototype.resolveSoa = resolveMap.SOA = resolver('querySoa');\n`,
+  `  Resolver.prototype.resolveSoa = resolveMap.SOA = resolver('querySoa');\n` +
+  `  Resolver.prototype.resolveTlsa = resolveMap.TLSA = resolver('queryTlsa');\n`, 'internal_dns_utils.js');
+out += mod('internal/dns/utils', dnsUtils);
 out += mod('internal/dns/promises', stripLicense(src('internal_dns_promises.js')));
 out += mod('internal/dns/callback_resolver', stripLicense(src('internal_dns_callback_resolver.js')));
 out += mod('dns', stripLicense(src('dns.js')));

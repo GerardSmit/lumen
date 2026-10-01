@@ -45,7 +45,7 @@ fn rsa_no_padding_supports_public_and_private_transforms() {
       console.log("roundtrip", c.privateDecrypt(options(privateKey), encrypted).equals(message),
                   c.publicDecrypt(options(publicKey), signed).equals(message));
       try { c.publicEncrypt(options(publicKey), Buffer.from([42])); }
-      catch (error) { console.log("size", error.message.includes("same size")); }
+      catch (error) { console.log("size", error.code === "ERR_OSSL_RSA_DATA_TOO_SMALL_FOR_KEY_SIZE"); }
     "#;
 
     match rt.eval(source).expect("raw RSA script parses") {

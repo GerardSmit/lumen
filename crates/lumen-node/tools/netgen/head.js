@@ -797,11 +797,6 @@ class Pipe extends StreamHandle {
     });
   }
   setPendingInstances() {}
-  getsockname(out) {
-    if (this._path === null) return UV_EINVAL;
-    out.address = this._path;
-    return 0;
-  }
 }
 
 class TCPConnectWrap {}

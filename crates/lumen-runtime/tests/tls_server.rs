@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use lumen_runtime::{Completion, ConsoleOut, Runtime};
 
+mod support;
+
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Default)]
@@ -75,10 +77,11 @@ fn tls_server_accepts_verified_client_and_exchanges_data() {
             .spawn()
             .unwrap();
         child.stdin.as_mut().unwrap().write_all(b"ping").unwrap();
-        child.wait_with_output().unwrap()
+        support::output_within(child, support::CHILD_DEADLINE)
     });
 
     let mut runtime = Runtime::new();
+    support::arm(&mut runtime);
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
@@ -97,6 +100,8 @@ fn tls_server_accepts_verified_client_and_exchanges_data() {
         Completion::Value(_) => {}
         Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
     }
+    support::assert_in_time(&runtime);
+    drop(runtime);
     let client = client.join().unwrap();
     let _ = std::fs::remove_dir_all(directory);
     assert!(client.status.success());
@@ -136,6 +141,7 @@ fn tls_client_upgrades_a_paused_tcp_socket() {
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
     let mut runtime = Runtime::new();
+    support::arm(&mut runtime);
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
@@ -162,6 +168,7 @@ fn tls_client_upgrades_a_paused_tcp_socket() {
         Completion::Value(_) => {}
         Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
     }
+    support::assert_in_time(&runtime);
     let _ = std::fs::remove_dir_all(directory);
     assert_eq!(
         String::from_utf8(out.0.borrow().clone()).unwrap().trim(),

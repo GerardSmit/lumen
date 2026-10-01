@@ -1433,42 +1433,73 @@ fn decode_accept(
 /// blocked `accept()` wakes and reports closed.
 fn op_close_server(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u64(args, 0);
-    let target = ctx
+    let entry = ctx
         .host_mut::<NetRegistry>()
-        .and_then(|r| r.servers.remove(&sid))
-        .map(|e| (e.closed, e.local_addr, e.listener));
-    if let Some((closed, local_addr, listener)) = target {
-        closed.store(true, Ordering::SeqCst);
-        match local_addr {
-            ServerAddress::Tcp(local_addr) => {
-                let wake = if local_addr.ip().is_unspecified() {
-                    let ip = if local_addr.is_ipv6() {
-                        IpAddr::V6(Ipv6Addr::LOCALHOST)
-                    } else {
-                        IpAddr::V4(Ipv4Addr::LOCALHOST)
-                    };
-                    SocketAddr::new(ip, local_addr.port())
-                } else {
-                    local_addr
-                };
-                let _ = connect_tcp(wake, None);
-            }
-            #[cfg(unix)]
-            ServerAddress::Unix(path) => {
-                let _ = UnixStream::connect(&path);
-                let _ = std::fs::remove_file(path);
-            }
-            // A pipe listener cancels its own blocked accept.
-            #[cfg(windows)]
-            ServerAddress::Pipe(_) => {
-                if let NetListener::Pipe(pipe) = &*listener {
-                    pipe.close();
-                }
-            }
-        }
-        drop(listener);
+        .and_then(|r| r.servers.remove(&sid));
+    if let Some(entry) = entry {
+        close_server_entry(entry);
     }
     Ok(Value::Undefined)
+}
+
+/// Flag a listener closed and wake its blocked `accept` (a throwaway connection, or the pipe's
+/// own cancel) so the accept thread sees the flag and ends.
+fn close_server_entry(entry: ServerEntry) {
+    let ServerEntry {
+        closed,
+        local_addr,
+        listener,
+        ..
+    } = entry;
+    closed.store(true, Ordering::SeqCst);
+    match local_addr {
+        ServerAddress::Tcp(local_addr) => {
+            let wake = if local_addr.ip().is_unspecified() {
+                let ip = if local_addr.is_ipv6() {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                } else {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                };
+                SocketAddr::new(ip, local_addr.port())
+            } else {
+                local_addr
+            };
+            let _ = TcpStream::connect_timeout(&wake, Duration::from_millis(250));
+        }
+        #[cfg(unix)]
+        ServerAddress::Unix(path) => {
+            let _ = UnixStream::connect(&path);
+            let _ = std::fs::remove_file(path);
+        }
+        // A pipe listener cancels its own blocked accept.
+        #[cfg(windows)]
+        ServerAddress::Pipe(_) => {
+            if let NetListener::Pipe(pipe) = &*listener {
+                pipe.close();
+            }
+        }
+    }
+    drop(listener);
+}
+
+/// Shut every socket and listener down and release every blocked reader, accept and receive
+/// thread: a terminated or dropped realm has nobody left to settle them, and their threads would
+/// otherwise sit in the kernel until the peer acts.
+pub(crate) fn close_all(ctx: &mut Ctx) {
+    if let Some(reg) = ctx.host_mut::<NetRegistry>() {
+        for (_, entry) in reg.sockets.drain() {
+            let _ = entry.stream.shutdown(Shutdown::Both);
+        }
+        let servers: Vec<ServerEntry> = reg.servers.drain().map(|(_, e)| e).collect();
+        for entry in servers {
+            close_server_entry(entry);
+        }
+    }
+    if let Some(reg) = ctx.host_mut::<DgramRegistry>() {
+        for (_, entry) in reg.sockets.drain() {
+            entry.closed.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// `(serverId)` — `server.address()`; `null` if the server is gone.
@@ -1940,10 +1971,18 @@ fn op_udp_set_broadcast(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Valu
 
 fn op_udp_set_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u64(args, 0);
-    let ttl = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0) as u32;
+    let ttl = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0);
     // std's set_ttl sets IP_TTL, which is invalid on an IPv6 socket; Node sets
     // IPV6_UNICAST_HOPS there, so do the same via setsockopt.
     with_udp(ctx, sid, "setTTL", |s, kind6| {
+        // libuv rejects anything outside 1..=255 before reaching the socket.
+        if !(1.0..=255.0).contains(&ttl) {
+            #[cfg(unix)]
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            #[cfg(not(unix))]
+            return Err(std::io::Error::from_raw_os_error(10022));
+        }
+        let ttl = ttl as u32;
         if kind6 {
             set_ipv6_unicast_hops(s, ttl as i32)
         } else {

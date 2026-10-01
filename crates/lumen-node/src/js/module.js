@@ -1359,7 +1359,6 @@ Module._resolveFilename = _resolveFilename;
 Module._resolveLookupPaths = _resolveLookupPaths;
 Module._load = _load;
 Module._initPaths = initPaths;
-Module._stat = stat;
 Module._preloadModules = function (requests) {
   if (!Array.isArray(requests)) return;
   isPreloading = true;

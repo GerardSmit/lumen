@@ -534,7 +534,7 @@ fn dgram_errors_and_option_paths() {
             u.addSourceSpecificMembership("127.0.0.1", "232.0.0.114", "127.0.0.1");
             u.dropSourceSpecificMembership("127.0.0.1", "232.0.0.114", "127.0.0.1");
             console.log("source membership: true");
-            console.log("mcast iface:", u.setMulticastInterface("0.0.0.0") === u);
+            console.log("mcast iface:", u.setMulticastInterface("0.0.0.0") === undefined);
             try { u.setTTL(0); } catch (e) { console.log("ttl range:", e.code); }
             u.close(() => {
                 try { u.send("x", 9, "127.0.0.1"); }
@@ -551,7 +551,7 @@ fn dgram_errors_and_option_paths() {
             "mttl: 2",
             "source membership: true",
             "mcast iface: true",
-            "ttl range: ERR_OUT_OF_RANGE",
+            "ttl range: EINVAL",
             "send after close: ERR_SOCKET_DGRAM_NOT_RUNNING",
         ]
     );

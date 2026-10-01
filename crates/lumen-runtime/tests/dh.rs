@@ -31,15 +31,17 @@ fn finite_field_dh_matches_node_vector_and_modp14() {
       const a = c.createDiffieHellman(Buffer.from([23]), 5);
       const b = c.createDiffieHellman(Buffer.from([23]), 5);
       a.setPrivateKey(Buffer.from([6]));
+      a.setPublicKey(Buffer.from([8]));
       b.setPrivateKey(Buffer.from([15]));
+      b.setPublicKey(Buffer.from([19]));
       console.log("small", a.getPublicKey("hex"), b.getPublicKey("hex"),
                   a.computeSecret(b.getPublicKey()).toString("hex"),
                   b.computeSecret(a.getPublicKey()).toString("hex"));
 
       const x = c.getDiffieHellman("modp14");
       const y = c.createDiffieHellmanGroup("modp14");
-      x.setPrivateKey(Buffer.from([6]));
-      y.setPrivateKey(Buffer.from([15]));
+      x.generateKeys();
+      y.generateKeys();
       console.log("modp14", x.getPrime("hex").length, x.getGenerator("hex"),
                   x.computeSecret(y.getPublicKey()).equals(y.computeSecret(x.getPublicKey())));
     "#;

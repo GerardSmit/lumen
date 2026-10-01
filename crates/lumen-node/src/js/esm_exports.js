@@ -50,7 +50,7 @@ const __ESM_EXPORTS = {
   "test": "skip todo only test it describe suite before after beforeEach afterEach mock run snapshot assert",
   "tls": "connect createServer TLSSocket Server createSecurePair createSecureContext SecureContext checkServerIdentity convertALPNProtocols getCiphers getCACertificates rootCertificates CLIENT_RENEG_LIMIT CLIENT_RENEG_WINDOW DEFAULT_CIPHERS DEFAULT_ECDH_CURVE DEFAULT_MIN_VERSION DEFAULT_MAX_VERSION",
   "diagnostics_channel": "channel hasSubscribers subscribe unsubscribe tracingChannel Channel",
-  "domain": "Domain create createDomain active _stack _handleUncaught",
+  "domain": "Domain create createDomain active _stack",
   "trace_events": "createTracing getEnabledCategories",
   "vm": "Script compileFunction constants createContext createScript isContext measureMemory runInContext runInNewContext runInThisContext",
   "repl": "REPLServer start writer Recoverable REPL_MODE_SLOPPY REPL_MODE_STRICT",

@@ -72,8 +72,29 @@ fn make_sys(it: &mut Interp) -> Obj {
     set_fn(it, &d, "setrecursionlimit", sys_setrecursionlimit);
     set_fn(it, &d, "exc_info", sys_exc_info);
     set_fn(it, &d, "intern", sys_intern);
+    set_fn(it, &d, "get_int_max_str_digits", sys_get_int_max_str_digits);
+    set_fn(it, &d, "set_int_max_str_digits", sys_set_int_max_str_digits);
     super::sysextra::init_sys(it, &d);
     m
+}
+
+fn sys_get_int_max_str_digits(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("get_int_max_str_digits", a, 0, 0)?;
+    Ok(Value::Int(it.int_max_str_digits() as i64))
+}
+
+fn sys_set_int_max_str_digits(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
+    let b = it.bind_args("set_int_max_str_digits", a, kw, &["maxdigits"], 1)?;
+    let n = it.index_of(b[0].as_ref().unwrap_or(&Value::None))?;
+    if n < 0 || !it.set_int_max_str_digits(n as usize) {
+        return Err(it.value_error(&format!("maxdigits must be >= {} or 0 for unlimited", crate::limits::INT_MAX_STR_DIGITS_THRESHOLD)));
+    }
+    // sys.flags is built lazily and cached; drop it so it reflects the new limit, as CPython does.
+    if let Some(m) = it.sys_module.clone() {
+        let d = it.module_dict(&m);
+        dict_del_str(&d, "flags");
+    }
+    Ok(Value::None)
 }
 
 fn sys_exit(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -513,9 +534,14 @@ fn m_factorial(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if n < 0 {
         return Err(it.value_error("factorial() not defined for negative values"));
     }
+    let nf = n as f64;
+    it.check_int_bits((nf * (nf / std::f64::consts::E).log2().max(0.0)) as u128)?;
     let mut acc = BigInt::from_i64(1);
     let mut small: i64 = 1;
     for i in 2..=n {
+        if i & 0xfff == 0 {
+            it.poll()?;
+        }
         match small.checked_mul(i) {
             Some(v) => small = v,
             None => {
@@ -563,8 +589,14 @@ fn comb_perm(it: &mut Interp, a: &[Value], perm: bool) -> R<Value> {
         return Ok(Value::Int(0));
     }
     let k = if perm { k } else { k.min(n - k) };
+    let (nf, kf) = (n as f64, k as f64);
+    let bits = if perm { kf * nf.log2() } else { kf * ((nf / kf.max(1.0)).log2() + std::f64::consts::LOG2_E) };
+    it.check_int_bits(bits as u128)?;
     let mut acc = BigInt::from_i64(1);
     for i in 0..k {
+        if i & 0xff == 0 {
+            it.poll()?;
+        }
         acc = acc.mul(&BigInt::from_i64(n - i));
         if !perm {
             acc = acc.floor_div(&BigInt::from_i64(i + 1));
@@ -791,8 +823,16 @@ fn t_sleep(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         return Err(it.value_error("sleep length must be non-negative"));
     }
     it.flush_out();
-    it.platform.borrow_mut().sleep(s);
-    Ok(Value::None)
+    let deadline = it.platform.borrow().monotonic_ns().saturating_add((s.min(1e9) * 1e9) as u64);
+    loop {
+        it.poll()?;
+        let left = deadline.saturating_sub(it.platform.borrow().monotonic_ns());
+        if left == 0 {
+            return Ok(Value::None);
+        }
+        // Sleep in slices so an interrupt is noticed promptly.
+        it.platform.borrow_mut().sleep(left.min(20_000_000) as f64 / 1e9);
+    }
 }
 
 fn make_time(it: &mut Interp) -> Obj {

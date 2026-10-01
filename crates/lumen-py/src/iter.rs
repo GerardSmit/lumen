@@ -100,6 +100,13 @@ impl Interp {
 
     /// Next item, or `None` when exhausted (StopIteration is swallowed).
     pub fn iter_next(&mut self, it: &Value) -> R<Option<Value>> {
+        self.poll()?;
+        self.iter_step(it)
+    }
+
+    /// [`Interp::iter_next`] without the interrupt poll, for the `for` loop whose back-edge polls.
+    #[inline]
+    pub(crate) fn iter_step(&mut self, it: &Value) -> R<Option<Value>> {
         let o = match it {
             Value::Obj(o) => o,
             _ => return Err(self.not_iterator(it)),
@@ -498,9 +505,23 @@ impl Interp {
                 }
             }
         }
+        let hint = match v {
+            Value::Obj(o) => match &o.kind {
+                Kind::Range(r) => crate::ops::slice_len(r.start, r.stop, r.step),
+                Kind::BigRange(r) => match crate::ops::big_range_len(r).to_i64() {
+                    Some(n) => n as usize,
+                    None => return Err(self.overflow_err("Python int too large to convert to C ssize_t")),
+                },
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let mut out = self.vec_with_capacity(hint, crate::limits::MAX_SEQ_LEN)?;
         let it = self.get_iter(v)?;
-        let mut out = Vec::new();
         while let Some(x) = self.iter_next(&it)? {
+            if out.len() >= crate::limits::MAX_SEQ_LEN {
+                return Err(self.memory_error());
+            }
             out.push(x);
         }
         Ok(out)

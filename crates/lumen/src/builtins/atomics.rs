@@ -202,7 +202,12 @@ pub(super) fn install_atomics(it: &mut Interp) {
         let Some(waiter) = waiter else {
             return Ok(Value::str("not-equal"));
         };
-        let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
+        let interrupt = i.interrupt.clone();
+        let woken =
+            crate::interpreter::futex_block(&waiter, id, byte_index, timeout, interrupt.as_deref());
+        if !woken {
+            ab(i.poll_interrupt())?;
+        }
         Ok(Value::str(if woken { "ok" } else { "timed-out" }))
     });
     it.def_method(&atomics, "notify", 3, |i, _t, a| {
@@ -282,7 +287,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         };
         let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
         std::thread::spawn(move || {
-            let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
+            let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout, None);
             let _ = tx.send(if woken { "ok" } else { "timed-out" });
         });
         let promise = i.new_promise();

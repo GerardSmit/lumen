@@ -28,7 +28,7 @@ fn p256_ecdh_matches_node_vector() {
 
     let source = r#"
       const c = require("node:crypto");
-      console.log("curves", JSON.stringify(c.getCurves()));
+      console.log("curves", ["prime256v1", "secp384r1", "secp521r1", "secp256k1"].every((name) => c.getCurves().includes(name)));
       const scalar = n => Buffer.from(n.toString(16).padStart(64, "0"), "hex");
       const b64u = bytes => Buffer.from(bytes).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
       const jwk = (ecdh, d) => {
@@ -62,7 +62,7 @@ fn p256_ecdh_matches_node_vector() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "curves [\"P-256\",\"prime256v1\",\"secp256r1\"]",
+            "curves true",
             "secret true true",
             "convert true true",
             "keyobjects true"

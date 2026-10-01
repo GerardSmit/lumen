@@ -399,11 +399,12 @@ fn sys_getattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
                 "int_max_str_digits",
             ];
             let ty = new_structseq_type(it, "sys", "flags", &names);
+            let digits = it.int_max_str_digits() as i64;
             let vals = names
                 .iter()
                 .map(|n| match *n {
-                    "hash_randomization" => Value::Int(1),
-                    "int_max_str_digits" => Value::Int(4300),
+                    "hash_randomization" | "dont_write_bytecode" | "utf8_mode" => Value::Int(1),
+                    "int_max_str_digits" => Value::Int(digits),
                     "dev_mode" => Value::Bool(false),
                     "safe_path" => Value::Bool(false),
                     _ => Value::Int(0),
@@ -433,7 +434,15 @@ fn sys_getattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         }
         "int_info" => {
             let ty = new_structseq_type(it, "sys", "int_info", &["bits_per_digit", "sizeof_digit", "default_max_str_digits", "str_digits_check_threshold"]);
-            structseq(&ty, vec![Value::Int(30), Value::Int(4), Value::Int(4300), Value::Int(640)])
+            structseq(
+                &ty,
+                vec![
+                    Value::Int(30),
+                    Value::Int(4),
+                    Value::Int(crate::limits::DEFAULT_INT_MAX_STR_DIGITS as i64),
+                    Value::Int(crate::limits::INT_MAX_STR_DIGITS_THRESHOLD as i64),
+                ],
+            )
         }
         "hash_info" => {
             let names = ["width", "modulus", "inf", "nan", "imag", "algorithm", "hash_bits", "seed_bits", "cutoff"];

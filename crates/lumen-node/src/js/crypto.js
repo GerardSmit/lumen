@@ -208,6 +208,9 @@ Object.assign(cryptoBinding, {
   kKeyEncodingPKCS8: 1,
   kKeyEncodingSPKI: 2,
   kKeyEncodingSEC1: 3,
+  kTypeArgon2d: 0,
+  kTypeArgon2i: 1,
+  kTypeArgon2id: 2,
   kSigEncDER: 0,
   kSigEncP1363: 1,
   kSignJobModeSign: 0,
@@ -494,6 +497,24 @@ class HKDFJob extends CryptoJob {
   }
 }
 
+class Argon2Job extends CryptoJob {
+  constructor(mode, message, nonce, parallelism, tagLength, memory, passes, secret, associatedData, type) {
+    super(mode);
+    const empty = new Uint8Array(0);
+    this.args = [type, new Uint8Array(bytesOf(message)), new Uint8Array(bytesOf(nonce)), parallelism, tagLength,
+                 memory, passes, secret === undefined ? empty : new Uint8Array(bytesOf(secret)),
+                 associatedData === undefined ? empty : new Uint8Array(bytesOf(associatedData))];
+  }
+
+  _run() {
+    return toArrayBuffer(__rc.argon2(...this.args));
+  }
+
+  _runAsync() {
+    return __rc.argon2Async(...this.args).then(toArrayBuffer);
+  }
+}
+
 class RandomBytesJob extends CryptoJob {
   constructor(mode, buffer, offset, size) {
     super(mode);
@@ -526,6 +547,7 @@ Object.assign(cryptoBinding, {
   PBKDF2Job,
   ScryptJob,
   HKDFJob,
+  Argon2Job,
   RandomBytesJob,
   timingSafeEqual,
   getHashes: () => hashNames.slice(),
@@ -541,9 +563,25 @@ Object.assign(cryptoBinding, {
   testFipsCrypto: () => false,
 });
 
-// ---- KeyObjectHandle and key generation -----------------------------------------------------------
+// ---- KeyObjectHandle, key generation and WebCrypto key export --------------------------------------
 // A handle holds the key as `_type` (kKeyType*) and `_data`: the raw bytes of a secret key, an SPKI
-// DER for a public key or a PKCS#8 DER for a private key. Everything else derives from those.
+// DER for a public key or a PKCS#8 DER for a private key. Everything else derives from those through
+// the native key model (src/crypto/keys).
+
+const kKeyFormatPEMValue = 1;
+
+function hexToArrayBuffer(hex) {
+  const bytes = Buffer.from(hex.length % 2 ? "0" + hex : hex, "hex");
+  return toArrayBuffer(new Uint8Array(bytes));
+}
+
+function asBytes(u8) {
+  return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
+}
+
+function base64url(bytes) {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64url");
+}
 
 class KeyObjectHandle {
   constructor() {
@@ -551,22 +589,247 @@ class KeyObjectHandle {
     this._data = undefined;
   }
 
-  init(type, data) {
+  init(type, data, format, encoding, passphrase) {
+    if (type === cryptoBinding.kKeyTypeSecret) {
+      this._type = type;
+      this._data = new Uint8Array(bytesOf(data));
+      return;
+    }
+    if (data instanceof KeyObjectHandle) {
+      if (data._type === cryptoBinding.kKeyTypeSecret) {
+        throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key object type secret, expected private or public.");
+      }
+      if (type === cryptoBinding.kKeyTypePrivate) {
+        this._data = data._data;
+        this._type = data._type;
+      } else {
+        this._data = data._type === cryptoBinding.kKeyTypePrivate ? __rc.keyToPublic(data._data) : data._data;
+        this._type = cryptoBinding.kKeyTypePublic;
+      }
+      return;
+    }
+    try {
+      this._data = __rc.keyImport(type, bytesOf(data), format, encoding,
+                                  passphrase === undefined ? undefined : bytesOf(passphrase));
+    } catch (err) {
+      throw cipherError(err);
+    }
     this._type = type;
-    this._data = new Uint8Array(bytesOf(data));
+  }
+
+  initJwk(jwk, namedCurve) {
+    const fields = [];
+    for (const key of Object.keys(jwk)) {
+      if (typeof jwk[key] === "string") fields.push(key, jwk[key]);
+    }
+    let result;
+    try {
+      result = __rc.keyImportJwk(fields, namedCurve);
+    } catch (err) {
+      throw cipherError(err);
+    }
+    this._type = result[0];
+    this._data = new Uint8Array(result[1]);
+    return this._type;
+  }
+
+  initEDRaw(name, data, type) {
+    const der = __rc.keyImportOkpRaw(name, bytesOf(data), type === cryptoBinding.kKeyTypePrivate);
+    if (der === null) return false;
+    this._type = type;
+    this._data = new Uint8Array(der);
+    return true;
+  }
+
+  initECRaw(curve, data) {
+    const der = __rc.keyImportEcRaw(curve, bytesOf(data));
+    if (der === null) return false;
+    this._type = cryptoBinding.kKeyTypePublic;
+    this._data = new Uint8Array(der);
+    return true;
   }
 
   getSymmetricKeySize() {
     return this._data.byteLength;
   }
 
-  export() {
-    return Buffer.from(this._data);
+  getAsymmetricKeyType() {
+    return __rc.keyType(this._type, this._data);
+  }
+
+  keyDetail(target) {
+    const flat = __rc.keyDetail(this._type, this._data);
+    for (let i = 0; i < flat.length; i += 2) {
+      const name = flat[i];
+      const value = flat[i + 1];
+      if (name === "publicExponent") target[name] = hexToArrayBuffer(value);
+      else if (name === "modulusLength" || name === "divisorLength" || name === "saltLength") target[name] = Number(value);
+      else target[name] = value;
+    }
+    return target;
+  }
+
+  export(format, type, cipher, passphrase) {
+    if (this._type === cryptoBinding.kKeyTypeSecret) return Buffer.from(this._data);
+    const encoding = type === undefined ? (this._type === cryptoBinding.kKeyTypePrivate ? 1 : 2) : type;
+    let out;
+    try {
+      out = __rc.keyExport(this._type, this._data, format, encoding, cipher,
+                           passphrase === undefined ? undefined : bytesOf(passphrase));
+    } catch (err) {
+      throw cipherError(err);
+    }
+    const buf = asBytes(out);
+    return format === kKeyFormatPEMValue ? buf.toString("latin1") : buf;
+  }
+
+  exportJwk(target, handleRsaPss) {
+    if (this._type === cryptoBinding.kKeyTypeSecret) {
+      target.kty = "oct";
+      target.k = base64url(this._data);
+      return target;
+    }
+    const flat = __rc.keyExportJwk(this._type, this._data, handleRsaPss === true);
+    for (let i = 0; i < flat.length; i += 2) target[flat[i]] = flat[i + 1];
+    return target;
+  }
+
+  checkEcKeyData() {
+    return __rc.keyCheckEc(this._type, this._data);
   }
 
   equals(other) {
-    return this._type === other._type && this._data.byteLength === other._data.byteLength &&
-      __rc.timingSafeEqual(this._data, other._data);
+    if (this._type !== other._type) return false;
+    if (this._type === cryptoBinding.kKeyTypeSecret) {
+      return this._data.byteLength === other._data.byteLength && __rc.timingSafeEqual(this._data, other._data);
+    }
+    return __rc.keyEquals(this._type, this._data, other._data);
+  }
+}
+
+function handleOf(type, data) {
+  const handle = new KeyObjectHandle();
+  handle._type = type;
+  handle._data = new Uint8Array(data);
+  return handle;
+}
+
+// Key pair results: a handle per key when no encoding was requested, else the exported key.
+function exportPairKey(handle, format, type, cipher, passphrase) {
+  if (format === undefined) return handle;
+  if (format === cryptoBinding.kKeyFormatJWK) return handle.exportJwk({}, false);
+  return handle.export(format, type, cipher, passphrase);
+}
+
+class KeyPairGenJob extends CryptoJob {
+  constructor(mode, encoding) {
+    super(mode);
+    this.encoding = encoding;
+    if (typeof this._generateAsync === "function") {
+      this._runAsync = () => this._generateAsync().then((pair) => this._finish(pair), (err) => {
+        throw cipherError(err);
+      });
+    }
+  }
+
+  _finish(pair) {
+    const { 0: publicFormat, 1: publicType, 2: privateFormat, 3: privateType, 4: cipher, 5: passphrase } = this.encoding;
+    return [
+      exportPairKey(handleOf(cryptoBinding.kKeyTypePublic, pair[0]), publicFormat, publicType),
+      exportPairKey(handleOf(cryptoBinding.kKeyTypePrivate, pair[1]), privateFormat, privateType, cipher, passphrase),
+    ];
+  }
+
+  _run() {
+    try {
+      return this._finish(this._generate());
+    } catch (err) {
+      throw cipherError(err);
+    }
+  }
+}
+
+class RsaKeyPairGenJob extends KeyPairGenJob {
+  constructor(mode, variant, modulusLength, publicExponent, ...rest) {
+    const pss = variant === cryptoBinding.kKeyVariantRSA_PSS;
+    const options = pss ? rest.slice(0, 3) : [];
+    super(mode, pss ? rest.slice(3) : rest);
+    this.args = [modulusLength, publicExponent, pss, ...(pss ? options : [undefined, undefined, undefined])];
+  }
+
+  _generate() {
+    return __rc.keygenRsa(...this.args);
+  }
+
+  _generateAsync() {
+    return __rc.keygenRsaAsync(...this.args);
+  }
+}
+
+class DsaKeyPairGenJob extends KeyPairGenJob {
+  constructor(mode, modulusLength, divisorLength, ...encoding) {
+    super(mode, encoding);
+    this.args = [modulusLength, divisorLength];
+  }
+
+  _generate() {
+    return __rc.keygenDsa(...this.args);
+  }
+
+  _generateAsync() {
+    return __rc.keygenDsaAsync(...this.args);
+  }
+}
+
+class EcKeyPairGenJob extends KeyPairGenJob {
+  constructor(mode, namedCurve, paramEncoding, ...encoding) {
+    super(mode, encoding);
+    this.args = [namedCurve, paramEncoding === cryptoBinding.OPENSSL_EC_EXPLICIT_CURVE];
+  }
+
+  _generate() {
+    return __rc.keygenEc(...this.args);
+  }
+}
+
+const nidTypes = {
+  [cryptoBinding.EVP_PKEY_ED25519]: "ed25519",
+  [cryptoBinding.EVP_PKEY_ED448]: "ed448",
+  [cryptoBinding.EVP_PKEY_X25519]: "x25519",
+  [cryptoBinding.EVP_PKEY_X448]: "x448",
+};
+
+class NidKeyPairGenJob extends KeyPairGenJob {
+  constructor(mode, id, ...encoding) {
+    super(mode, encoding);
+    this.kind = nidTypes[id];
+  }
+
+  _generate() {
+    return __rc.keygenOkp(this.kind);
+  }
+}
+
+class DhKeyPairGenJob extends KeyPairGenJob {
+  constructor(mode, first, ...rest) {
+    if (typeof first === "string") {
+      super(mode, rest);
+      this.args = [first, undefined, undefined, 2];
+      return;
+    }
+    const generator = rest[0];
+    super(mode, rest.slice(1));
+    this.args = typeof first === "number" ?
+      [undefined, undefined, first, generator] :
+      [undefined, bytesOf(first), undefined, generator];
+  }
+
+  _generate() {
+    return __rc.keygenDh(...this.args);
+  }
+
+  _generateAsync() {
+    return __rc.keygenDhAsync(...this.args);
   }
 }
 
@@ -579,9 +842,57 @@ class SecretKeyGenJob extends CryptoJob {
   _run() {
     const bytes = new Uint8Array(this.bits >> 3);
     __rc.randomFill(bytes);
-    const handle = new KeyObjectHandle();
-    handle.init(cryptoBinding.kKeyTypeSecret, bytes);
-    return handle;
+    return handleOf(cryptoBinding.kKeyTypeSecret, bytes);
+  }
+}
+
+function keyDer(handle, wantPublic) {
+  if (wantPublic && handle._type === cryptoBinding.kKeyTypePrivate) return __rc.keyToPublic(handle._data);
+  return handle._data;
+}
+
+// WebCrypto `exportKey` for EC / CFRG keys (crypto_ec.cc): raw point, PKCS#8 or SPKI.
+class ECKeyExportJob extends CryptoJob {
+  constructor(mode, format, handle) {
+    super(mode);
+    this.format = format;
+    this.handle = handle;
+  }
+
+  _run() {
+    const { format, handle } = this;
+    switch (format) {
+      case cryptoBinding.kWebCryptoKeyFormatRaw:
+        return toArrayBuffer(__rc.keyRawPublic(keyDer(handle, true)));
+      case cryptoBinding.kWebCryptoKeyFormatPKCS8:
+        if (handle._type !== cryptoBinding.kKeyTypePrivate) throw cryptoError(Error, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+        return toArrayBuffer(handle._data);
+      case cryptoBinding.kWebCryptoKeyFormatSPKI:
+        return toArrayBuffer(keyDer(handle, true));
+    }
+    throw cryptoError(Error, "ERR_CRYPTO_INVALID_KEYTYPE", "Unsupported key export format");
+  }
+}
+
+// WebCrypto `exportKey` for RSA keys (crypto_rsa.cc): PKCS#8 or SPKI.
+class RSAKeyExportJob extends CryptoJob {
+  constructor(mode, format, handle, variant) {
+    super(mode);
+    this.format = format;
+    this.handle = handle;
+    this.variant = variant;
+  }
+
+  _run() {
+    const { format, handle } = this;
+    switch (format) {
+      case cryptoBinding.kWebCryptoKeyFormatPKCS8:
+        if (handle._type !== cryptoBinding.kKeyTypePrivate) throw cryptoError(Error, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+        return toArrayBuffer(handle._data);
+      case cryptoBinding.kWebCryptoKeyFormatSPKI:
+        return toArrayBuffer(keyDer(handle, true));
+    }
+    throw cryptoError(Error, "ERR_CRYPTO_INVALID_KEYTYPE", "Unsupported key export format");
   }
 }
 
@@ -594,7 +905,766 @@ function createNativeKeyObjectClass(callback) {
   return callback(NativeKeyObject);
 }
 
-Object.assign(cryptoBinding, { KeyObjectHandle, SecretKeyGenJob, createNativeKeyObjectClass });
+Object.assign(cryptoBinding, {
+  KeyObjectHandle,
+  SecretKeyGenJob,
+  RsaKeyPairGenJob,
+  DsaKeyPairGenJob,
+  EcKeyPairGenJob,
+  NidKeyPairGenJob,
+  DhKeyPairGenJob,
+  ECKeyExportJob,
+  RSAKeyExportJob,
+  createNativeKeyObjectClass,
+});
+
+// ---- symmetric ciphers ---------------------------------------------------------------------------
+// CipherBase over the native CryptoCipher engine (src/crypto/cipher.rs), getCiphers/getCipherInfo
+// and WebCrypto's AESCipherJob.
+
+// Native errors carry OpenSSL's `error:<hex>:<library>::<reason>` message; Node also exposes
+// `library` and `reason` on them.
+function cipherError(err) {
+  const m = err && typeof err.message === "string" && /^error:[0-9A-F]{8}:([^:]*)::(.*)$/.exec(err.message);
+  if (m) {
+    err.library = m[1];
+    err.reason = m[2];
+  }
+  return err;
+}
+
+function cipherInput(data, encoding) {
+  if (typeof data === "string") return Buffer.from(data, Buffer.isEncoding(encoding) ? encoding : "utf8");
+  return bytesOf(data);
+}
+
+function asBuffer(u8) {
+  return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
+}
+
+function concatBytes(parts) {
+  let n = 0;
+  for (const p of parts) n += p.byteLength;
+  const out = new Uint8Array(n);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.byteLength;
+  }
+  return out;
+}
+
+class CipherBase {
+  constructor(isEncrypt) {
+    this._enc = isEncrypt === true;
+    this._c = undefined;
+  }
+
+  init(cipher, password, authTagLength) {
+    const mode = __rc.cipherMode(cipher);
+    if (mode === null) throw cryptoError(Error, "ERR_CRYPTO_UNKNOWN_CIPHER", "Unknown cipher");
+    if (this._enc && (mode === "ctr" || mode === "gcm" || mode === "ccm")) {
+      process.emitWarning(`Use Cipheriv for counter mode of ${cipher}`);
+    }
+    this._c = __rc.cipherInit(cipher, this._enc, bytesOf(password), authTagLength);
+  }
+
+  initiv(cipher, key, iv, authTagLength) {
+    this._c = __rc.cipherNew(cipher, this._enc, secretBytes(key), iv == null ? null : bytesOf(iv), authTagLength);
+  }
+
+  update(data, encoding) {
+    try {
+      return asBuffer(this._c.update(cipherInput(data, encoding)));
+    } catch (err) {
+      throw cipherError(err);
+    }
+  }
+
+  final() {
+    try {
+      return asBuffer(this._c.final());
+    } catch (err) {
+      throw cipherError(err);
+    }
+  }
+
+  setAutoPadding(autoPadding) {
+    return this._c.setPadding(autoPadding === undefined || autoPadding === true);
+  }
+
+  getAuthTag() {
+    const tag = this._c.authTag();
+    return tag === null ? undefined : asBuffer(tag);
+  }
+
+  setAuthTag(tag) {
+    return this._c.setAuthTag(bytesOf(tag));
+  }
+
+  setAAD(aad, plaintextLength) {
+    return this._c.setAad(bytesOf(aad), plaintextLength);
+  }
+}
+
+function getCipherInfo(info, nameOrNid, keyLength, ivLength) {
+  const r = typeof nameOrNid === "string" ?
+    __rc.cipherInfo(nameOrNid, 0, keyLength, ivLength) :
+    __rc.cipherInfo(undefined, nameOrNid, keyLength, ivLength);
+  if (r === null) return undefined;
+  const [name, mode, [nid, blockSize, ivLen, keyLen]] = r;
+  info.mode = mode;
+  info.name = name;
+  info.nid = nid;
+  if (blockSize) info.blockSize = blockSize;
+  if (ivLen) info.ivLength = ivLen;
+  info.keyLength = keyLen;
+  return info;
+}
+
+const kAesKwDefaultIv = new Uint8Array(8).fill(0xa6);
+
+// WebCrypto AES-CTR/CBC/GCM/KW (crypto_aes.cc): `variant` is one of kKeyVariantAES_*.
+class AESCipherJob extends CryptoJob {
+  constructor(mode, cipherMode, key, data, variant, iv, extra, additionalData) {
+    super(mode);
+    this.encrypt = cipherMode === cryptoBinding.kWebCryptoCipherEncrypt;
+    this.key = key._data;
+    this.data = new Uint8Array(bytesOf(data));
+    this.bits = [128, 192, 256][variant % 3];
+    this.kind = ["ctr", "cbc", "gcm", "kw"][Math.floor(variant / 3)];
+    if (this.kind === "kw") return;
+    this.iv = new Uint8Array(bytesOf(iv));
+    if (this.kind === "ctr") {
+      if (this.iv.byteLength !== 16 || extra === 0 || extra > 128) {
+        throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_COUNTER", "Invalid counter");
+      }
+      this.length = extra;
+    } else if (this.kind === "gcm") {
+      if (this.encrypt) {
+        if (typeof extra !== "number" || extra >>> 0 !== extra || extra > 128) {
+          throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_TAG_LENGTH", "Invalid tag length");
+        }
+        this.tagLength = extra;
+      } else {
+        if (!(extra instanceof ArrayBuffer || ArrayBuffer.isView(extra))) {
+          throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_TAG_LENGTH", "Invalid tag length");
+        }
+        this.tag = new Uint8Array(bytesOf(extra));
+      }
+      if (additionalData instanceof ArrayBuffer || ArrayBuffer.isView(additionalData)) {
+        this.aad = new Uint8Array(bytesOf(additionalData));
+      }
+    }
+  }
+
+  _run() {
+    const { encrypt, key, data, bits } = this;
+    switch (this.kind) {
+      case "ctr":
+        return toArrayBuffer(__rc.aesCtr(key, this.iv, this.length, data));
+      case "cbc": {
+        const c = __rc.cipherNew(`aes-${bits}-cbc`, encrypt, key, this.iv, -1);
+        return toArrayBuffer(concatBytes([c.update(data), c.final()]));
+      }
+      case "kw": {
+        const c = __rc.cipherNew(`id-aes${bits}-wrap`, encrypt, key, kAesKwDefaultIv, -1);
+        return toArrayBuffer(concatBytes([c.update(data), c.final()]));
+      }
+      case "gcm": {
+        const c = __rc.cipherNew(`aes-${bits}-gcm`, encrypt, key, this.iv,
+                                 encrypt ? this.tagLength : this.tag.byteLength);
+        if (!encrypt) c.setAuthTag(this.tag);
+        if (this.aad !== undefined && this.aad.byteLength > 0) c.setAad(this.aad, -1);
+        const parts = [c.update(data), c.final()];
+        if (encrypt) parts.push(c.authTag());
+        return toArrayBuffer(concatBytes(parts));
+      }
+    }
+    throw new Error("Cipher job failed");
+  }
+}
+
+Object.assign(cryptoBinding, {
+  CipherBase,
+  AESCipherJob,
+  getCipherInfo,
+  getCiphers: () => __rc.getCiphers(),
+});
+
+// ---- signatures and RSA encryption ---------------------------------------------------------------
+// Sign / Verify / SignJob over `sigSign` / `sigVerify`, and the RSA cipher functions over
+// `rsaCipher` (src/crypto/sign.rs).
+
+// `[kind, der]` of a key argument: a KeyObjectHandle, or key material in `format` / `type`.
+function resolveKey(kind, data, format, type, passphrase) {
+  if (data instanceof KeyObjectHandle) {
+    if (data._type === cryptoBinding.kKeyTypeSecret) {
+      throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key object type secret, expected private or public.");
+    }
+    return [data._type, data._data];
+  }
+  const handle = new KeyObjectHandle();
+  handle.init(kind, data, format, type, passphrase);
+  return [handle._type, handle._data];
+}
+
+function digestOrUndefined(algorithm) {
+  if (algorithm === undefined || algorithm === null) return undefined;
+  if (__rc.hashInfo(algorithm) === null) throw invalidDigest(algorithm);
+  return algorithm;
+}
+
+function signBytes(chunks) {
+  if (chunks.length === 1) return chunks[0];
+  return concatBytes(chunks);
+}
+
+function sigSign(key, algorithm, data, padding, salt, dsaEncoding) {
+  try {
+    return __rc.sigSign(key[0], key[1], algorithm, padding, salt, dsaEncoding === cryptoBinding.kSigEncP1363, data);
+  } catch (err) {
+    throw cipherError(err);
+  }
+}
+
+function sigVerify(key, algorithm, data, signature, padding, salt, dsaEncoding) {
+  try {
+    return __rc.sigVerify(key[0], key[1], algorithm, padding, salt, dsaEncoding === cryptoBinding.kSigEncP1363, data, signature);
+  } catch (err) {
+    throw cipherError(err);
+  }
+}
+
+class Sign {
+  init(algorithm) {
+    if (__rc.hashInfo(algorithm) === null) {
+      throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest");
+    }
+    this._algorithm = algorithm;
+    this._chunks = [];
+  }
+
+  update(data, encoding) {
+    this._chunks.push(new Uint8Array(dataBytes(data, encoding)));
+  }
+
+  sign(data, format, type, passphrase, padding, salt, dsaEncoding) {
+    const key = resolveKey(cryptoBinding.kKeyTypePrivate, data, format, type, passphrase);
+    const out = sigSign(key, this._algorithm, signBytes(this._chunks.length ? this._chunks : [new Uint8Array(0)]),
+                        padding, salt, dsaEncoding);
+    return asBuffer(out);
+  }
+}
+
+class Verify {
+  init(algorithm) {
+    Sign.prototype.init.call(this, algorithm);
+  }
+
+  update(data, encoding) {
+    Sign.prototype.update.call(this, data, encoding);
+  }
+
+  verify(data, format, type, passphrase, signature, padding, salt, dsaEncoding) {
+    const key = resolveKey(cryptoBinding.kKeyTypePublic, data, format, type, passphrase);
+    return sigVerify(key, this._algorithm, signBytes(this._chunks.length ? this._chunks : [new Uint8Array(0)]),
+                     bytesOf(signature), padding, salt, dsaEncoding);
+  }
+}
+
+class SignJob extends CryptoJob {
+  constructor(mode, signMode, keyData, keyFormat, keyType, keyPassphrase, data, algorithm, saltLength, padding, dsaEncoding, signature) {
+    super(mode);
+    this.signMode = signMode;
+    const sign = signMode === cryptoBinding.kSignJobModeSign;
+    this.key = resolveKey(sign ? cryptoBinding.kKeyTypePrivate : cryptoBinding.kKeyTypePublic,
+                          keyData, keyFormat, keyType, keyPassphrase);
+    this.data = new Uint8Array(bytesOf(data));
+    this.algorithm = digestOrUndefined(algorithm);
+    this.saltLength = saltLength;
+    this.padding = padding;
+    this.dsaEncoding = dsaEncoding;
+    this.signature = signature === undefined ? undefined : new Uint8Array(bytesOf(signature));
+  }
+
+  _run() {
+    if (this.signMode === cryptoBinding.kSignJobModeSign) {
+      const out = sigSign(this.key, this.algorithm, this.data, this.padding, this.saltLength, this.dsaEncoding);
+      return toArrayBuffer(out);
+    }
+    return sigVerify(this.key, this.algorithm, this.data, this.signature, this.padding, this.saltLength, this.dsaEncoding);
+  }
+}
+
+function rsaFunction(operation, kind) {
+  return (data, format, type, passphrase, buffer, padding, oaepHash, oaepLabel) => {
+    const key = resolveKey(kind, data, format, type, passphrase);
+    try {
+      return asBuffer(__rc.rsaCipher(operation, key[0], key[1], bytesOf(buffer), padding, oaepHash,
+                                     oaepLabel === undefined ? undefined : bytesOf(oaepLabel)));
+    } catch (err) {
+      throw cipherError(err);
+    }
+  };
+}
+
+// WebCrypto RSA-OAEP (crypto_rsa.cc).
+class RSACipherJob extends CryptoJob {
+  constructor(mode, cipherMode, key, data, variant, hash, label) {
+    super(mode);
+    this.encrypt = cipherMode === cryptoBinding.kWebCryptoCipherEncrypt;
+    this.key = key;
+    this.data = new Uint8Array(bytesOf(data));
+    this.hash = hash;
+    this.label = label === undefined ? undefined : new Uint8Array(bytesOf(label));
+  }
+
+  _run() {
+    try {
+      return toArrayBuffer(__rc.rsaCipher(this.encrypt ? 0 : 1, this.key._type, this.key._data, this.data, 4,
+                                          this.hash, this.label));
+    } catch (err) {
+      throw cipherError(err);
+    }
+  }
+}
+
+Object.assign(cryptoBinding, {
+  Sign,
+  Verify,
+  SignJob,
+  RSACipherJob,
+  publicEncrypt: rsaFunction(0, cryptoBinding.kKeyTypePublic),
+  privateDecrypt: rsaFunction(1, cryptoBinding.kKeyTypePrivate),
+  privateEncrypt: rsaFunction(2, cryptoBinding.kKeyTypePrivate),
+  publicDecrypt: rsaFunction(3, cryptoBinding.kKeyTypePublic),
+});
+
+// ---- Diffie-Hellman, ECDH and stateless key agreement ----------------------------------------------
+// The classes keep their key material as bytes; the arithmetic is `dh*` / `ecdh*` / `statelessDh`
+// (src/crypto/dh.rs).
+
+function invalidState(message) {
+  return cryptoError(Error, "ERR_CRYPTO_INVALID_STATE", message);
+}
+
+function badGenerator() {
+  return opensslError("02800080", "Diffie-Hellman routines", "bad generator", "ERR_OSSL_DH_BAD_GENERATOR");
+}
+
+function numberBytes(n) {
+  const hex = n.toString(16);
+  return new Uint8Array(Buffer.from(hex.length % 2 ? "0" + hex : hex, "hex"));
+}
+
+class DiffieHellmanBase {
+  _init(prime, generator) {
+    this._p = prime;
+    this._g = generator;
+    this._priv = undefined;
+    this._pub = undefined;
+  }
+
+  get verifyError() {
+    return __rc.dhVerify(this._p, this._g);
+  }
+
+  generateKeys() {
+    try {
+      const [x, y] = __rc.dhGenKey(this._p, this._g, this._priv);
+      this._priv = new Uint8Array(x);
+      this._pub = new Uint8Array(y);
+    } catch (err) {
+      throw cipherError(err);
+    }
+    return asBuffer(this._pub);
+  }
+
+  computeSecret(key) {
+    if (this._priv === undefined) throw cryptoError(Error, "ERR_CRYPTO_OPERATION_FAILED", "Failed to compute DH key");
+    return asBuffer(__rc.dhCompute(this._p, this._priv, bytesOf(key)));
+  }
+
+  getPrime() {
+    return asBuffer(this._p);
+  }
+
+  getGenerator() {
+    return asBuffer(this._g);
+  }
+
+  getPublicKey() {
+    if (this._pub === undefined) throw invalidState("No public key - did you forget to generate one?");
+    return asBuffer(this._pub);
+  }
+
+  getPrivateKey() {
+    if (this._priv === undefined) throw invalidState("No private key - did you forget to generate one?");
+    return asBuffer(this._priv);
+  }
+}
+
+class DiffieHellman extends DiffieHellmanBase {
+  constructor(sizeOrKey, generator) {
+    super();
+    let g;
+    if (typeof generator === "number") {
+      if (generator < 2) throw badGenerator();
+      g = numberBytes(generator);
+    } else {
+      g = new Uint8Array(bytesOf(generator));
+      if (g.every((b) => b === 0) || (g.length > 0 && g.every((b, i) => (i === g.length - 1 ? b <= 1 : b === 0)))) {
+        throw badGenerator();
+      }
+    }
+    let p;
+    if (typeof sizeOrKey === "number") {
+      if (sizeOrKey < 2) {
+        throw opensslError("01800076", "bignum routines", "bits too small", "ERR_OSSL_BN_BITS_TOO_SMALL");
+      }
+      const small = g.length === 1 ? g[0] : 0;
+      p = new Uint8Array(__rc.dhGenPrime(sizeOrKey, small));
+    } else {
+      p = new Uint8Array(bytesOf(sizeOrKey));
+    }
+    this._init(p, g);
+  }
+
+  setPublicKey(key) {
+    this._pub = new Uint8Array(bytesOf(key));
+  }
+
+  setPrivateKey(key) {
+    this._priv = new Uint8Array(bytesOf(key));
+  }
+}
+
+class DiffieHellmanGroup extends DiffieHellmanBase {
+  constructor(name) {
+    super();
+    const params = __rc.dhGroupParams(name);
+    if (params === null) throw cryptoError(Error, "ERR_CRYPTO_UNKNOWN_DH_GROUP", "Unknown DH group");
+    this._init(new Uint8Array(params[0]), new Uint8Array(params[1]));
+  }
+}
+
+function trimLeadingZeros(bytes) {
+  let i = 0;
+  while (i < bytes.byteLength - 1 && bytes[i] === 0) i++;
+  return bytes.subarray(i);
+}
+
+class ECDH {
+  constructor(curve) {
+    if (!__rc.ecdhCurveKnown(curve)) {
+      throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_CURVE", "Invalid EC curve name");
+    }
+    this._curve = curve;
+    this._priv = undefined;
+    this._pub = undefined;
+  }
+
+  generateKeys() {
+    const [priv, pub] = __rc.ecdhGenerate(this._curve);
+    this._priv = trimLeadingZeros(new Uint8Array(priv));
+    this._pub = new Uint8Array(pub);
+  }
+
+  computeSecret(key) {
+    if (this._priv === undefined) throw cryptoError(Error, "ERR_CRYPTO_OPERATION_FAILED", "Failed to compute ECDH key");
+    return asBuffer(__rc.ecdhCompute(this._curve, this._priv, bytesOf(key)));
+  }
+
+  getPublicKey(format) {
+    if (this._pub === undefined) throw cryptoError(Error, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get ECDH public key");
+    return asBuffer(__rc.ecdhConvert(this._curve, this._pub, format));
+  }
+
+  getPrivateKey() {
+    if (this._priv === undefined) throw cryptoError(Error, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get ECDH private key");
+    return asBuffer(this._priv);
+  }
+
+  setPrivateKey(key) {
+    const priv = trimLeadingZeros(new Uint8Array(bytesOf(key)));
+    this._pub = new Uint8Array(__rc.ecdhPublic(this._curve, priv));
+    this._priv = priv;
+  }
+
+  setPublicKey(key) {
+    this._pub = new Uint8Array(__rc.ecdhConvert(this._curve, bytesOf(key), 4));
+  }
+}
+
+function ecdhConvertKey(key, curve, format) {
+  return asBuffer(__rc.ecdhConvert(curve, bytesOf(key), format));
+}
+
+function statelessSecret(privateHandle, publicHandle) {
+  try {
+    return __rc.statelessDh(privateHandle._type, privateHandle._data, publicHandle._type, publicHandle._data);
+  } catch (err) {
+    throw cipherError(err);
+  }
+}
+
+class ECDHBitsJob extends CryptoJob {
+  constructor(mode, name, publicHandle, privateHandle) {
+    super(mode);
+    this.publicHandle = publicHandle;
+    this.privateHandle = privateHandle;
+  }
+
+  _run() {
+    return toArrayBuffer(statelessSecret(this.privateHandle, this.publicHandle));
+  }
+}
+
+Object.assign(cryptoBinding, {
+  DiffieHellman,
+  DiffieHellmanGroup,
+  ECDH,
+  ECDHBitsJob,
+  ECDHConvertKey: ecdhConvertKey,
+  statelessDH: (privateHandle, publicHandle) => asBuffer(statelessSecret(privateHandle, publicHandle)),
+});
+
+// ---- prime generation and testing --------------------------------------------------------------------
+
+function outOfRange(message) {
+  return cryptoError(RangeError, "ERR_OUT_OF_RANGE", message);
+}
+
+function bitLength(bytes) {
+  const t = trimLeadingZeros(bytes);
+  return t.byteLength === 1 && t[0] === 0 ? 0 : (t.byteLength - 1) * 8 + (32 - Math.clz32(t[0]));
+}
+
+function compareUnsigned(a, b) {
+  const x = trimLeadingZeros(a);
+  const y = trimLeadingZeros(b);
+  if (x.byteLength !== y.byteLength) return x.byteLength - y.byteLength;
+  for (let i = 0; i < x.byteLength; i++) {
+    if (x[i] !== y[i]) return x[i] - y[i];
+  }
+  return 0;
+}
+
+class RandomPrimeJob extends CryptoJob {
+  constructor(mode, size, safe, add, rem) {
+    super(mode);
+    const addBytes = add === undefined ? undefined : new Uint8Array(bytesOf(add));
+    const remBytes = rem === undefined || addBytes === undefined ? undefined : new Uint8Array(bytesOf(rem));
+    if (addBytes !== undefined) {
+      if (bitLength(addBytes) > size) throw outOfRange("invalid options.add");
+      if (remBytes !== undefined && compareUnsigned(addBytes, remBytes) <= 0) throw outOfRange("invalid options.rem");
+    }
+    this.args = [size, safe, addBytes, remBytes];
+  }
+
+  _run() {
+    try {
+      return toArrayBuffer(__rc.primeGenerate(...this.args));
+    } catch (err) {
+      throw cipherError(err);
+    }
+  }
+
+  _runAsync() {
+    return __rc.primeGenerateAsync(...this.args).then(toArrayBuffer, (err) => {
+      throw cipherError(err);
+    });
+  }
+}
+
+class CheckPrimeJob extends CryptoJob {
+  constructor(mode, candidate, checks) {
+    super(mode);
+    this.args = [new Uint8Array(bytesOf(candidate)), checks];
+  }
+
+  _run() {
+    return __rc.primeCheck(...this.args);
+  }
+
+  _runAsync() {
+    return __rc.primeCheckAsync(...this.args);
+  }
+}
+
+Object.assign(cryptoBinding, { RandomPrimeJob, CheckPrimeJob });
+
+// ---- X.509 certificates, SPKAC and curve lists -------------------------------------------------------
+// `parseX509` returns a handle over the certificate DER and the `x509*` ops (src/crypto/x509.rs).
+
+function orUndefined(value) {
+  return value === null ? undefined : value;
+}
+
+function nameObject(entries) {
+  if (entries === null) return undefined;
+  const out = { __proto__: null };
+  for (let i = 0; i < entries.length; i += 2) {
+    const key = entries[i];
+    const value = entries[i + 1];
+    if (key in out) out[key] = [].concat(out[key], value);
+    else out[key] = value;
+  }
+  return out;
+}
+
+class X509Handle {
+  constructor(der) {
+    this._der = der;
+  }
+
+  subject() {
+    return orUndefined(__rc.x509Subject(this._der));
+  }
+
+  issuer() {
+    return orUndefined(__rc.x509Issuer(this._der));
+  }
+
+  subjectAltName() {
+    const [present, text] = __rc.x509SubjectAltName(this._der);
+    return present ? orUndefined(text) : undefined;
+  }
+
+  infoAccess() {
+    const [present, text] = __rc.x509InfoAccess(this._der);
+    return present ? orUndefined(text) : undefined;
+  }
+
+  getIssuerCert() {
+    return undefined;
+  }
+
+  validFrom() {
+    return __rc.x509Validity(this._der)[0];
+  }
+
+  validTo() {
+    return __rc.x509Validity(this._der)[1];
+  }
+
+  fingerprint() {
+    return __rc.x509Fingerprint(this._der, "sha1");
+  }
+
+  fingerprint256() {
+    return __rc.x509Fingerprint(this._der, "sha256");
+  }
+
+  fingerprint512() {
+    return __rc.x509Fingerprint(this._der, "sha512");
+  }
+
+  keyUsage() {
+    return orUndefined(__rc.x509KeyUsage(this._der));
+  }
+
+  serialNumber() {
+    return __rc.x509SerialNumber(this._der);
+  }
+
+  raw() {
+    return Buffer.from(this._der);
+  }
+
+  publicKey() {
+    return handleOf(cryptoBinding.kKeyTypePublic, __rc.x509PublicKey(this._der));
+  }
+
+  pem() {
+    return __rc.x509Pem(this._der);
+  }
+
+  checkCA() {
+    return __rc.x509CheckCA(this._der);
+  }
+
+  checkHost(name, flags) {
+    return orUndefined(__rc.x509CheckHost(this._der, name, flags));
+  }
+
+  checkEmail(email, flags) {
+    return __rc.x509CheckEmail(this._der, email, flags) ? email : undefined;
+  }
+
+  checkIP(ip, flags) {
+    return __rc.x509CheckIP(this._der, ip, flags) ? ip : undefined;
+  }
+
+  checkIssued(other) {
+    return __rc.x509CheckIssued(this._der, other._der);
+  }
+
+  checkPrivateKey(handle) {
+    return __rc.x509CheckPrivateKey(this._der, handle._data);
+  }
+
+  verify(handle) {
+    return __rc.x509Verify(this._der, keyDer(handle, true));
+  }
+
+  toLegacy() {
+    const der = this._der;
+    const out = {
+      subject: nameObject(__rc.x509NameEntries(der, false)),
+      issuer: nameObject(__rc.x509NameEntries(der, true)),
+    };
+    const san = this.subjectAltName();
+    if (san !== undefined) out.subjectaltname = san;
+    const access = this.infoAccess();
+    if (access !== undefined) out.infoAccess = access;
+    out.ca = this.checkCA();
+    const [type, names, bits, pubkey] = __rc.x509KeyDetails(der);
+    if (type === "rsa") {
+      out.modulus = names[0];
+      out.bits = bits;
+      out.exponent = names[1];
+      out.pubkey = Buffer.from(pubkey);
+    } else if (type === "ec") {
+      out.bits = bits;
+      out.pubkey = Buffer.from(pubkey);
+      out.asn1Curve = names[0];
+      if (names[1] !== "") out.nistCurve = names[1];
+    }
+    out.valid_from = this.validFrom();
+    out.valid_to = this.validTo();
+    out.fingerprint = this.fingerprint();
+    out.fingerprint256 = this.fingerprint256();
+    out.fingerprint512 = this.fingerprint512();
+    const usage = this.keyUsage();
+    if (usage !== undefined) out.ext_key_usage = usage;
+    out.serialNumber = this.serialNumber();
+    out.raw = this.raw();
+    return out;
+  }
+}
+
+function parseX509(buffer) {
+  try {
+    return new X509Handle(new Uint8Array(__rc.x509Parse(bytesOf(buffer))));
+  } catch (err) {
+    throw cipherError(err);
+  }
+}
+
+function spkacResult(fn, buffer) {
+  const out = fn(bytesOf(buffer));
+  return out === null ? Buffer.alloc(0) : asBuffer(out);
+}
+
+Object.assign(cryptoBinding, {
+  parseX509,
+  certVerifySpkac: (buffer) => __rc.certVerifySpkac(bytesOf(buffer)),
+  certExportPublicKey: (buffer) => spkacResult(__rc.certExportPublicKey, buffer),
+  certExportChallenge: (buffer) => spkacResult(__rc.certExportChallenge, buffer),
+  getCurves: () => __rc.keyCurves(),
+});
 
 defineModule("internal/validators", function (module, exports, require, internalBinding, primordials) {
   'use strict';
@@ -1593,6 +2663,128 @@ defineModule("internal/crypto/aes", function (module, exports, require, internal
     aesGenerateKey,
     aesImportKey,
     getAlgorithmName,
+  };
+});
+
+defineModule("internal/crypto/argon2", function (module, exports, require, internalBinding, primordials) {
+  'use strict';
+
+  // lumen: argon2() and argon2Sync() (the Argon2 KDF of RFC 9106), written to match Node 26's
+  // lib/internal/crypto/argon2.js without its WebCrypto deriveBits entry point.
+
+  const {
+    FunctionPrototypeCall,
+  } = primordials;
+
+  const {
+    Argon2Job,
+    kCryptoJobAsync,
+    kCryptoJobSync,
+    kTypeArgon2d,
+    kTypeArgon2i,
+    kTypeArgon2id,
+  } = internalBinding('crypto');
+
+  const {
+    validateFunction,
+    validateInteger,
+    validateObject,
+    validateOneOf,
+    validateString,
+  } = require('internal/validators');
+
+  const {
+    getArrayBufferOrView,
+  } = require('internal/crypto/util');
+
+  const { Buffer } = require('buffer');
+
+  const types = {
+    __proto__: null,
+    argon2d: kTypeArgon2d,
+    argon2i: kTypeArgon2i,
+    argon2id: kTypeArgon2id,
+  };
+
+  function check(algorithm, parameters) {
+    validateString(algorithm, 'algorithm');
+    validateOneOf(algorithm, 'algorithm', ['argon2d', 'argon2i', 'argon2id']);
+    validateObject(parameters, 'parameters');
+
+    const message = getArrayBufferOrView(parameters.message, 'parameters.message');
+    const nonce = getArrayBufferOrView(parameters.nonce, 'parameters.nonce');
+    validateInteger(nonce.byteLength, 'parameters.nonce.byteLength', 8, 2 ** 32 - 1);
+    const { parallelism, tagLength, memory, passes } = parameters;
+    validateInteger(parallelism, 'parameters.parallelism', 1, 2 ** 24 - 1);
+    validateInteger(tagLength, 'parameters.tagLength', 4, 2 ** 32 - 1);
+    validateInteger(memory, 'parameters.memory', 8 * parallelism, 2 ** 32 - 1);
+    validateInteger(passes, 'parameters.passes', 1, 2 ** 32 - 1);
+
+    let { secret, associatedData } = parameters;
+    if (secret !== undefined) secret = getArrayBufferOrView(secret, 'parameters.secret');
+    if (associatedData !== undefined) {
+      associatedData = getArrayBufferOrView(associatedData, 'parameters.associatedData');
+    }
+
+    return {
+      message, nonce, parallelism, tagLength, memory, passes, secret, associatedData,
+      type: types[algorithm],
+    };
+  }
+
+  function argon2(algorithm, parameters, callback) {
+    parameters = check(algorithm, parameters);
+
+    validateFunction(callback, 'callback');
+
+    const job = new Argon2Job(
+      kCryptoJobAsync,
+      parameters.message,
+      parameters.nonce,
+      parameters.parallelism,
+      parameters.tagLength,
+      parameters.memory,
+      parameters.passes,
+      parameters.secret,
+      parameters.associatedData,
+      parameters.type);
+
+    job.ondone = (error, result) => {
+      if (error !== undefined)
+        return FunctionPrototypeCall(callback, job, error);
+      const buf = Buffer.from(result);
+      return FunctionPrototypeCall(callback, job, null, buf);
+    };
+
+    job.run();
+  }
+
+  function argon2Sync(algorithm, parameters) {
+    parameters = check(algorithm, parameters);
+
+    const job = new Argon2Job(
+      kCryptoJobSync,
+      parameters.message,
+      parameters.nonce,
+      parameters.parallelism,
+      parameters.tagLength,
+      parameters.memory,
+      parameters.passes,
+      parameters.secret,
+      parameters.associatedData,
+      parameters.type);
+
+    const { 0: err, 1: result } = job.run();
+
+    if (err !== undefined)
+      throw err;
+
+    return Buffer.from(result);
+  }
+
+  module.exports = {
+    argon2,
+    argon2Sync,
   };
 });
 
@@ -9277,9 +10469,7 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
     diffieHellman,
   } = require('internal/crypto/diffiehellman');
   const {
-    Cipher,
     Cipheriv,
-    Decipher,
     Decipheriv,
     privateDecrypt,
     privateEncrypt,
@@ -9297,6 +10487,15 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
     Hash,
     Hmac,
   } = require('internal/crypto/hash');
+  const { argon2, argon2Sync } = require('internal/crypto/argon2');
+  const {
+    validateObject,
+    validateString,
+    validateUint32,
+  } = require('internal/validators');
+  const { isArrayBufferView } = require('internal/util/types');
+  const { normalizeEncoding } = require('internal/util');
+  const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE } = require('internal/errors').codes;
   const {
     X509Certificate,
   } = require('internal/crypto/x509');
@@ -9327,16 +10526,8 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
     return new Hash(algorithm, options);
   }
 
-  function createCipher(cipher, password, options) {
-    return new Cipher(cipher, password, options);
-  }
-
   function createCipheriv(cipher, key, iv, options) {
     return new Cipheriv(cipher, key, iv, options);
-  }
-
-  function createDecipher(cipher, password, options) {
-    return new Decipher(cipher, password, options);
   }
 
   function createDecipheriv(cipher, key, iv, options) {
@@ -9369,6 +10560,9 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
 
   module.exports = {
     // Methods
+    argon2,
+    argon2Sync,
+    hash,
     checkPrime,
     checkPrimeSync,
     createCipheriv,
@@ -9419,9 +10613,7 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
 
     // Classes
     Certificate,
-    Cipher,
     Cipheriv,
-    Decipher,
     Decipheriv,
     DiffieHellman,
     DiffieHellmanGroup,
@@ -9434,6 +10626,43 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
     X509Certificate,
     secureHeapUsed,
   };
+
+  // lumen: crypto.hash(), the one-shot digest of Node 26's lib/crypto.js.
+  function hash(algorithm, input, options) {
+    validateString(algorithm, 'algorithm');
+    if (typeof input !== 'string' && !isArrayBufferView(input)) {
+      throw new ERR_INVALID_ARG_TYPE('input', ['Buffer', 'TypedArray', 'DataView', 'string'], input);
+    }
+    let outputEncoding;
+    let outputLength;
+    if (typeof options === 'string') {
+      outputEncoding = options;
+    } else if (options !== undefined) {
+      validateObject(options, 'options');
+      outputLength = options.outputLength;
+      outputEncoding = options.outputEncoding;
+    }
+    outputEncoding ??= 'hex';
+    let normalized = outputEncoding;
+    if (normalized !== 'hex') {
+      validateString(outputEncoding, 'outputEncoding');
+      normalized = normalizeEncoding(outputEncoding);
+      if (normalized === undefined) {
+        if (outputEncoding.toLowerCase() === 'buffer') {
+          normalized = 'buffer';
+        } else {
+          throw new ERR_INVALID_ARG_VALUE('outputEncoding', outputEncoding);
+        }
+      }
+    }
+    if (outputLength !== undefined) {
+      validateUint32(outputLength, 'outputLength');
+      outputLength += 0;
+    }
+    const hasher = new Hash(algorithm, outputLength === undefined ? undefined : { outputLength });
+    hasher.update(input);
+    return normalized === 'buffer' ? hasher.digest() : hasher.digest(normalized);
+  }
 
   function getFips() {
     return getOptionValue('--force-fips') ? 1 : getFipsCrypto();
@@ -9525,18 +10754,6 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
   }
 
   ObjectDefineProperties(module.exports, {
-    createCipher: {
-      __proto__: null,
-      enumerable: false,
-      value: deprecate(createCipher,
-                       'crypto.createCipher is deprecated.', 'DEP0106'),
-    },
-    createDecipher: {
-      __proto__: null,
-      enumerable: false,
-      value: deprecate(createDecipher,
-                       'crypto.createDecipher is deprecated.', 'DEP0106'),
-    },
     // crypto.fips is deprecated. DEP0093. Use crypto.getFips()/crypto.setFips()
     fips: {
       __proto__: null,

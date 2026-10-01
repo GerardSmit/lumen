@@ -193,7 +193,7 @@ fn require_resolves_exact_scoped_exports_before_literal_subpaths() {
     );
     let ran = Realm::default().run(&scratch, "console.log(require('@scope/safe/temp').value, require('@scope/safe/ordered').value); try { require('@scope/safe/blocked'); } catch (error) { console.log(error.code); }");
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert_eq!(ran.stdout, "actual actual\nMODULE_NOT_FOUND\n");
+    assert_eq!(ran.stdout, "actual actual\nERR_PACKAGE_PATH_NOT_EXPORTED\n");
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
@@ -216,7 +216,7 @@ fn esm_and_require_map_scoped_export_patterns_to_their_own_conditions() {
     );
     let ran = Realm::default().run(&scratch, "console.log(require('@scope/sdk/types').value); try { require('@scope/sdk/blocked'); } catch (error) { console.log(error.code); } import('./entry.mjs');");
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert_eq!(ran.stdout, "cjs\nMODULE_NOT_FOUND\nesm\n");
+    assert_eq!(ran.stdout, "cjs\nERR_PACKAGE_PATH_NOT_EXPORTED\nesm\n");
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
@@ -396,7 +396,8 @@ fn require_resolve_paths_reports_real_local_lookup_directories() {
         console.log(scoped.resolve.paths('node:fs'), scoped.resolve.paths('fs'));
         console.log(scoped.resolve.paths('./relative')[0] === base);
         const lookup = scoped.resolve.paths('pkg');
-        console.log(JSON.stringify(lookup) === JSON.stringify(Module._nodeModulePaths(base)));
+        const local = Module._nodeModulePaths(base);
+        console.log(JSON.stringify(lookup.slice(0, local.length)) === JSON.stringify(local));
         console.log(scoped.resolve('pkg') === path.join(lookup[0], 'pkg/index.js'), scoped('pkg'));
         console.log(scoped.resolve.paths('/absolute')[0] === lookup[0]);
         try { scoped.resolve.paths(42); } catch(error) { console.log(error.name); }

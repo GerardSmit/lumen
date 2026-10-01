@@ -13,8 +13,7 @@
 //!   --timeout=MS (or LUMEN_TIMEOUT_MS)  stop the script after MS milliseconds (exit 124)
 
 use std::io::{IsTerminal, Read};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lumen_host::Completion;
 use lumen_repl::Repl;
@@ -606,20 +605,23 @@ fn json_type_field(json: &str) -> Option<String> {
 /// The `--timeout` budget in ms once it ran out (0 while it has not).
 static TIMED_OUT_AFTER: AtomicU64 = AtomicU64::new(0);
 
-/// `--timeout`: a watchdog thread raises the engine interrupt when the budget runs out, so the
-/// script stops at its next safe point and the CLI exits 124 (`timeout(1)`'s code). A realm
-/// blocked in the event loop (a pending timer) never reaches one: the watchdog exits itself
-/// after a short grace.
+/// How long after the interrupt the watchdog waits for the normal exit path before it exits the
+/// process itself (a native call that cannot be interrupted would otherwise hang it).
+const TIMEOUT_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `--timeout`: a watchdog thread interrupts the runtime when the budget runs out. The script
+/// stops at its next safe point, or the event loop wakes if it was blocked, and the CLI exits 124
+/// (`timeout(1)`'s code) through its normal path with output flushed. Only if that path does not
+/// finish within a few seconds does the watchdog exit the process itself.
 fn start_watchdog(runtime: &mut Runtime, ms: u64) {
-    let flag = Arc::new(AtomicBool::new(false));
-    runtime.engine().set_interrupt(Arc::clone(&flag));
+    let handle = runtime.interrupt_handle();
     std::thread::Builder::new()
         .name("lumen-timeout".to_string())
         .spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
-            flag.store(true, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            handle.interrupt();
+            std::thread::sleep(TIMEOUT_EXIT_GRACE);
             exit_if_timed_out();
         })
         .expect("spawn timeout watchdog");

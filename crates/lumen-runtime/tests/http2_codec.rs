@@ -28,24 +28,15 @@ fn frames_and_hpack_round_trip_and_reject_invalid_input() {
     });
     let source = r#"
         const codec = globalThis.__lumenHttp2Codec;
-        const frame = codec.encodeFrame(1, 5, 0x1020304, Buffer.from("hello"));
-        const decoder = new codec.FrameDecoder();
-        console.log("partial", decoder.push(frame.subarray(0, 7)).length);
-        const decoded = decoder.push(frame.subarray(7))[0];
-        console.log("frame", decoded.type, decoded.flags, decoded.streamId,
-                    decoded.payload.toString());
-
-        const integer = codec.encodeInteger(1337, 5);
-        console.log("integer", integer.toString("hex"),
-                    codec.decodeInteger(integer, 0, 5).join(","));
-
-        const encoder = new codec.Hpack();
-        const headers = encoder.encode({
-          ":method": "GET", ":path": "/", "content-type": "text/plain", "x-test": "yes"
-        });
-        const values = new codec.Hpack().decode(headers);
-        console.log("headers", values[":method"], values[":path"],
-                    values["content-type"], values["x-test"]);
+        const encoder = new codec.Encoder(4096), decoder = new codec.Decoder(4096);
+        const list = [[":method", "GET", false], [":path", "/", false],
+                      ["content-type", "text/plain", false], ["x-test", "yes", false],
+                      ["authorization", "secret", false]];
+        const first = encoder.encode(list);
+        const again = encoder.encode(list);
+        const show = (headers) => headers.map(([n, v, never]) => `${n}=${v}${never ? "!" : ""}`).join(";");
+        console.log("headers", show(decoder.decode(first)));
+        console.log("indexed", again.length < first.length, show(decoder.decode(again)) === show(list.map(([n, v]) => [n, v, n === "authorization"])));
 
         const huffman = globalThis.__lumenHpackHuffman;
         const encodedText = huffman.encode(Buffer.from("www.example.com"));
@@ -54,8 +45,10 @@ fn frames_and_hpack_round_trip_and_reject_invalid_input() {
         for (let i = 0; i < everyByte.length; i++) everyByte[i] = i;
         console.log("huffman-bytes", huffman.decode(huffman.encode(everyByte)).equals(everyByte));
 
-        try { new codec.FrameDecoder(4).push(frame); }
-        catch (error) { console.log("frame-error", error.code); }
+        try { new codec.Decoder().decode(Buffer.from([0x80])); }
+        catch (error) { console.log("index-error", error.code); }
+        try { new codec.Decoder().decode(Buffer.from([0x40, 0x7f])); }
+        catch (error) { console.log("truncated-error", error.code); }
         try { huffman.decode(Buffer.from([0xff])); }
         catch (error) { console.log("hpack-error", error.code); }
     "#;
@@ -71,13 +64,12 @@ fn frames_and_hpack_round_trip_and_reject_invalid_input() {
     assert_eq!(
         lines,
         [
-            "partial 0",
-            "frame 1 5 16909060 hello",
-            "integer 1f9a0a 1337,3",
-            "headers GET / text/plain yes",
+            "headers :method=GET;:path=/;content-type=text/plain;x-test=yes;authorization=secret!",
+            "indexed true true",
             "huffman f1e3c2e5f23a6ba0ab90f4ff www.example.com",
             "huffman-bytes true",
-            "frame-error ERR_HTTP2_FRAME_SIZE_ERROR",
+            "index-error ERR_HTTP2_COMPRESSION_ERROR",
+            "truncated-error ERR_HTTP2_COMPRESSION_ERROR",
             "hpack-error ERR_HTTP2_COMPRESSION_ERROR",
         ]
     );

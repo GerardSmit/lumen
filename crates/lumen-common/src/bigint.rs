@@ -1390,6 +1390,9 @@ impl BigInt {
         let mut base = reduce(self)?;
         let bits = e.bit_len();
         for i in 0..bits {
+            if i & 0x3ff == 0 && poll() {
+                return Some(result);
+            }
             if e.0.mag[i / 64] >> (i % 64) & 1 == 1 {
                 result = reduce(&result.mul(&base))?;
             }

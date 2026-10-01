@@ -487,26 +487,26 @@ fn minmax(it: &mut Interp, a: &[Value], kw: Kw, name: &str, want_max: bool) -> R
             other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for {}()", other, name))),
         }
     }
-    let items: Vec<Value> = if a.len() == 1 {
-        it.iterate_to_vec(&a[0])?
+    let source = if a.len() == 1 {
+        it.get_iter(&a[0])?
     } else if a.is_empty() {
         return Err(it.type_error(&format!("{} expected at least 1 argument, got 0", name)));
     } else {
         if default.is_some() {
             return Err(it.type_error(&format!("Cannot specify a default for {}() with multiple positional arguments", name)));
         }
-        a.to_vec()
+        it.get_iter(&Value::tuple(a.to_vec()))?
     };
-    if items.is_empty() {
+    let Some(first) = it.iter_next(&source)? else {
         return match default {
             Some(d) => Ok(d),
             None => Err(it.value_error(&format!("{}() iterable argument is empty", name))),
         };
-    }
+    };
     let op = if want_max { crate::ast::CmpOp::Gt } else { crate::ast::CmpOp::Lt };
-    let mut best = items[0].clone();
+    let mut best = first;
     let mut best_key = if key.is_none() { best.clone() } else { it.call(&key, vec![best.clone()], Vec::new())? };
-    for x in items.into_iter().skip(1) {
+    while let Some(x) = it.iter_next(&source)? {
         let k = if key.is_none() { x.clone() } else { it.call(&key, vec![x.clone()], Vec::new())? };
         let r = it.compare_op(op, &k, &best_key)?;
         if it.truthy(&r)? {
@@ -756,7 +756,8 @@ fn anext(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 impl Interp {
     pub fn compile_eval_str(&mut self, src: &str, filename: &str) -> R<Rc<crate::bytecode::Code>> {
         let text = src.trim();
-        let module = match crate::parser::parse(text, filename) {
+        let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(text, filename));
+        let module = match parsed {
             Ok(m) => m,
             Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, e.col)),
         };

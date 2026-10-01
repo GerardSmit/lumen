@@ -53,6 +53,21 @@ fn interrupt_stops_native_array_like_loops() {
 }
 
 #[test]
+fn interrupt_stops_a_blocked_atomics_wait() {
+    let cases = [
+        "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0)",
+        "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1e9)",
+    ];
+    for src in cases {
+        let (after, completion) = run_interrupted(src, Duration::from_millis(100));
+        if let Completion::Value(v) = &completion {
+            panic!("{src}: expected the termination, got {v}");
+        }
+        assert!(after < Duration::from_millis(500), "{src}: ran {after:?} past the interrupt");
+    }
+}
+
+#[test]
 fn heap_limit_is_inert_without_the_class_allocator() {
     // The test binary does not install `ClassAlloc`: no byte count, so no false positives.
     let mut engine = Engine::new();
