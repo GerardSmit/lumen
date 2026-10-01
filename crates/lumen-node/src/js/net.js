@@ -864,8 +864,12 @@ const v4MappedPrefix = 0xffffn << 32n;
 class SocketAddressHandle {
   constructor(address, port, type, flowlabel) {
     const value = type === AF_INET ? parseIPv4(address) : parseIPv6(address);
-    // An unparsable address yields a handle whose detail() is undefined (SocketAddress throws).
-    this._valid = value !== null;
+    if (value === null) {
+      const err = new Error("Invalid socket address");
+      err.code = "ERR_INVALID_ADDRESS";
+      throw err;
+    }
+    this._valid = true;
     this._family = type;
     this._value = value;
     this._address = value === null ? "" : type === AF_INET ? address : formatIPv6Value(value);
@@ -2886,11 +2890,6 @@ defineModule("internal/socketaddress", function (module, exports, require, inter
         family: undefined,
         flowlabel: undefined,
       });
-      if (this[kDetail] === undefined) {
-        const err = new Error('Invalid socket address');
-        err.code = 'ERR_INVALID_ADDRESS';
-        throw err;
-      }
     }
 
     get address() {

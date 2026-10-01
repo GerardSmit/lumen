@@ -844,7 +844,7 @@ function parseIPv6(s) {
   if (tail4 !== null) n = (n & ~0xffffffffn) | tail4;
   return n;
 }
-function formatIPv6(n) {
+function formatIPv6Value(n) {
   const groups = [];
   for (let i = 7; i >= 0; i--) groups.push(Number((n >> BigInt(i * 16)) & 0xffffn));
   let bestStart = -1, bestLen = 0;
@@ -864,11 +864,15 @@ const v4MappedPrefix = 0xffffn << 32n;
 class SocketAddressHandle {
   constructor(address, port, type, flowlabel) {
     const value = type === AF_INET ? parseIPv4(address) : parseIPv6(address);
-    // An unparsable address yields a handle whose detail() is undefined (SocketAddress throws).
-    this._valid = value !== null;
+    if (value === null) {
+      const err = new Error("Invalid socket address");
+      err.code = "ERR_INVALID_ADDRESS";
+      throw err;
+    }
+    this._valid = true;
     this._family = type;
     this._value = value;
-    this._address = value === null ? "" : type === AF_INET ? address : formatIPv6(value);
+    this._address = value === null ? "" : type === AF_INET ? address : formatIPv6Value(value);
     this._port = port | 0;
     this._flowlabel = flowlabel >>> 0;
   }

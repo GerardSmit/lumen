@@ -165,8 +165,8 @@ internalAssert.fail = (message) => {
 };
 
 // Objects that structuredClone / MessagePort transfer rebuild from their `kClone` data.
-const kClone = Symbol("kClone");
-const kDeserialize = Symbol("kDeserialize");
+const kClone = Symbol.for("lumen.transferable.clone");
+const kDeserialize = Symbol.for("lumen.transferable.deserialize");
 class JSTransferable {}
 function makeTransferable(obj) {
   return obj;
@@ -313,6 +313,7 @@ function opensslError(hex, library, reason, code, Base = Error) {
 // Base of every CryptoJob: `run()` is synchronous (returns [err, result]) or schedules `ondone`.
 // Subclasses implement `_run()` (a result or a throw) and may implement `_runAsync()` returning a
 // Promise when the work belongs on the native worker pool.
+let threadpoolTraceId = 0;
 class CryptoJob {
   constructor(mode) {
     this.mode = mode;
@@ -327,20 +328,31 @@ class CryptoJob {
         return [err, undefined];
       }
     }
-    const pending = typeof this._runAsync === "function" ?
+    const traceId = __traceEvent === null ? 0 : ++threadpoolTraceId;
+    if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "b", "crypto", traceId);
+    const native = typeof this._runAsync === "function";
+    if (traceId !== 0 && native) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "B", "crypto");
+    const pending = native ?
       this._runAsync() :
       new Promise((resolve, reject) => {
         setImmediate(() => {
           try {
+            if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "B", "crypto");
             resolve(this._run());
           } catch (err) {
             reject(err);
+          } finally {
+            if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "E", "crypto");
           }
         });
       });
+    const finish = () => {
+      if (traceId !== 0 && native) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "E", "crypto");
+      if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "e", "crypto", traceId);
+    };
     pending.then(
-      (result) => process.nextTick(() => this.ondone(undefined, result)),
-      (err) => process.nextTick(() => this.ondone(err, undefined)),
+      (result) => { finish(); process.nextTick(() => this.ondone(undefined, result)); },
+      (err) => { finish(); process.nextTick(() => this.ondone(err, undefined)); },
     );
   }
 }
@@ -358,6 +370,7 @@ function cryptoError(Base, code, message) {
 // Bytes of a secret key argument: a secret KeyObjectHandle or a BufferSource.
 function secretBytes(key) {
   if (key instanceof KeyObjectHandle) return key._data;
+  if (key instanceof NativeKeyObject) return key[kNativeKeyHandle]._data;
   return bytesOf(key);
 }
 
@@ -908,13 +921,34 @@ class RSAKeyExportJob extends CryptoJob {
   }
 }
 
-function createNativeKeyObjectClass(callback) {
-  class NativeKeyObject {
-    constructor(handle) {
-      this.handle = handle;
-    }
+// The base of KeyObject. Like Node's C++ NativeKeyObject it holds the handle out of sight and
+// clones across threads (structured clone rebuilds it with `keyObjectFromClone`).
+const kNativeKeyHandle = Symbol("kNativeKeyHandle");
+let keyObjectClasses;
+class NativeKeyObject {
+  constructor(handle) {
+    Object.defineProperty(this, kNativeKeyHandle, { value: handle });
   }
-  return callback(NativeKeyObject);
+
+  [kClone]() {
+    const handle = this[kNativeKeyHandle];
+    return {
+      data: { kind: handle._type, bytes: handle._data },
+      deserializeInfo: "internal/crypto/keys:keyObjectFromClone",
+    };
+  }
+}
+
+function createNativeKeyObjectClass(callback) {
+  keyObjectClasses = callback(NativeKeyObject);
+  return keyObjectClasses;
+}
+
+function keyObjectFromClone({ kind, bytes }) {
+  const handle = handleOf(kind, bytes);
+  if (kind === cryptoBinding.kKeyTypeSecret) return new keyObjectClasses[1](handle);
+  if (kind === cryptoBinding.kKeyTypePublic) return new keyObjectClasses[2](handle);
+  return new keyObjectClasses[3](handle);
 }
 
 Object.assign(cryptoBinding, {
@@ -4537,7 +4571,6 @@ defineModule("internal/crypto/hkdf", function (module, exports, require, interna
     normalizeHashName,
     toBuf,
     validateByteSource,
-    kHandle,
     kKeyObject,
   } = require('internal/crypto/util');
 
@@ -4625,7 +4658,7 @@ defineModule("internal/crypto/hkdf", function (module, exports, require, interna
 
     validateFunction(callback, 'callback');
 
-    const job = new HKDFJob(kCryptoJobAsync, hash, key[kHandle], salt, info, length);
+    const job = new HKDFJob(kCryptoJobAsync, hash, key, salt, info, length);
 
     job.ondone = (error, bits) => {
       if (error) return FunctionPrototypeCall(callback, job, error);
@@ -4644,7 +4677,7 @@ defineModule("internal/crypto/hkdf", function (module, exports, require, interna
       length,
     } = validateParameters(hash, key, salt, info, length));
 
-    const job = new HKDFJob(kCryptoJobSync, hash, key[kHandle], salt, info, length);
+    const job = new HKDFJob(kCryptoJobSync, hash, key, salt, info, length);
     const { 0: err, 1: bits } = job.run();
     if (err !== undefined)
       throw err;
@@ -10815,6 +10848,8 @@ defineModule("crypto", function (module, exports, require, internalBinding, prim
 // ---- registration ------------------------------------------------------------------------------
 
 __builtins.set("crypto", require("crypto"));
+__internals.set("cloneModule:internal/crypto",
+                (id, name) => (name === "keyObjectFromClone" ? keyObjectFromClone : require(id)[name]));
 
 // The WebCrypto globals, as accessors like Node's own that an assignment replaces.
 function lazyGlobal(name, get) {
