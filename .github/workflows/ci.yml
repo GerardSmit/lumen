@@ -38,7 +38,9 @@ jobs:
           done
       # test262-runner and node-compat-runner drive the external test262 / node test suites, which
       # are cloned on demand by scripts/ and are not available in CI.
-      - run: cargo test --workspace --exclude test262-runner --exclude node-compat-runner
+      # `ci` profile: optimized so deep-recursion tests fit the stack, with debug assertions and
+      # overflow checks kept.
+      - run: cargo test --profile ci --workspace --exclude test262-runner --exclude node-compat-runner
 
   clippy:
     runs-on: ubuntu-latest

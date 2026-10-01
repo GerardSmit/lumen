@@ -42,8 +42,7 @@ fn normalize_string(path: &str, allow_above_root: bool) -> String {
                             }
                             Some(at) => {
                                 res.truncate(at);
-                                last_segment_length =
-                                    res.len() - 1 - res.rfind('/').map_or(-1, |x| x as isize) as usize;
+                                last_segment_length = (res.len() as isize - 1 - res.rfind('/').map_or(-1, |x| x as isize)) as usize;
                             }
                         }
                         last_slash = i as isize;
