@@ -1,9 +1,12 @@
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use lumen_runtime::{Completion, ConsoleOut, Runtime};
+
+mod support;
+use support::ChildGuard;
 
 #[derive(Clone, Default)]
 struct Captured(Rc<RefCell<Vec<u8>>>);
@@ -30,6 +33,7 @@ impl Captured {
 
 fn run(source: &str) -> Vec<String> {
     let mut runtime = Runtime::new();
+    support::arm(&mut runtime);
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
@@ -39,6 +43,7 @@ fn run(source: &str) -> Vec<String> {
         Completion::Value(_) => {}
         Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
     }
+    support::assert_in_time(&runtime);
     out.lines()
 }
 
@@ -180,16 +185,15 @@ fn redis_client_connects_over_tls() {
       server.on("secureConnection", socket => socket.on("close", () => server.close()));
     "#
     );
-    let mut server = Command::new("node")
-        .args(["-e", &server_source])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut ready = String::new();
-    BufReader::new(server.stdout.take().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
+    let mut server = ChildGuard::new(
+        Command::new("node")
+            .args(["-e", &server_source])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let ready = support::read_line(server.take_stdout(), support::CHILD_DEADLINE);
     assert_eq!(ready.trim(), "ready");
     let lines = run(&format!(
         r#"
@@ -200,7 +204,7 @@ fn redis_client_connects_over_tls() {
         }})();
     "#
     ));
-    let status = server.wait().unwrap();
+    let status = server.wait(support::CHILD_DEADLINE);
     let _ = std::fs::remove_dir_all(directory);
     assert!(status.success());
     assert_eq!(lines, ["secure PONG"]);

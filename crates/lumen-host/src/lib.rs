@@ -239,6 +239,8 @@ pub struct ThreadPool {
     work_tx: Option<mpsc::Sender<Task>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     completions: mpsc::Sender<TaskCompletion>,
+    /// Tasks submitted and not yet finished (queued or running).
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Spawn a host thread with the engine's thread stack size: work run here may call back into an
@@ -268,6 +270,7 @@ impl ThreadPool {
                 work_tx: None,
                 workers: Vec::new(),
                 completions,
+                pending: Default::default(),
             };
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -278,12 +281,14 @@ impl ThreadPool {
     fn with_workers(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
         let (work_tx, work_rx) = mpsc::channel::<Task>();
         let pool_completions = completions.clone();
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // std's mpsc receiver is single-consumer: share it across workers behind a mutex.
         let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
         let workers = (0..size.max(1))
             .map(|_| {
                 let work_rx = std::sync::Arc::clone(&work_rx);
                 let completions = completions.clone();
+                let pending = std::sync::Arc::clone(&pending);
                 spawn_thread(move || loop {
                     let task = match work_rx.lock().expect("worker queue poisoned").recv() {
                         Ok(t) => t,
@@ -298,6 +303,7 @@ impl ThreadPool {
                         }
                         Task::Detached(job) => job(),
                     }
+                    pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 })
             })
             .collect();
@@ -305,6 +311,7 @@ impl ThreadPool {
             work_tx: Some(work_tx),
             workers,
             completions: pool_completions,
+            pending,
         }
     }
 
@@ -324,6 +331,7 @@ impl ThreadPool {
         SpawnHandle {
             work_tx: self.work_tx.clone(),
             completions: self.completions.clone(),
+            pending: std::sync::Arc::clone(&self.pending),
         }
     }
 }
@@ -335,6 +343,7 @@ pub struct SpawnHandle {
     /// `None` on a pool without workers (`wasm32`): jobs run inline.
     work_tx: Option<mpsc::Sender<Task>>,
     completions: mpsc::Sender<TaskCompletion>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SpawnHandle {
@@ -344,12 +353,15 @@ impl SpawnHandle {
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
         match &self.work_tx {
-            Some(tx) => tx
-                .send(Task::Tracked {
+            Some(tx) => {
+                self.pending
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tx.send(Task::Tracked {
                     id,
                     work: Box::new(work),
                 })
-                .expect("worker threads gone"),
+                .expect("worker threads gone")
+            }
             None => {
                 let result = work();
                 let _ = self.completions.send(TaskCompletion { task: id, result });
@@ -361,7 +373,11 @@ impl SpawnHandle {
     /// [`lumen::embed::Completer`]), so no completion is sent for it.
     pub fn spawn_detached(&self, job: Box<dyn FnOnce() + Send>) {
         match &self.work_tx {
-            Some(tx) => tx.send(Task::Detached(job)).expect("worker threads gone"),
+            Some(tx) => {
+                self.pending
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tx.send(Task::Detached(job)).expect("worker threads gone")
+            }
             None => job(),
         }
     }
@@ -558,13 +574,27 @@ pub fn register_task(
     id
 }
 
+/// How long dropping a pool waits for tasks already running before it stops waiting.
+const POOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Closing the work channel ends each worker's recv loop; join so no worker outlives
-        // the runtime that owns the completion receiver.
+        // Closing the work channel ends each worker's recv loop. Normally the workers are joined
+        // so none outlives the runtime that owns the completion receiver; a task stuck in a
+        // blocking call (a read that never returns) must not hold the drop hostage, so after a
+        // grace period the workers are detached and exit when that call does.
         self.work_tx.take();
+        let give_up = std::time::Instant::now() + POOL_DRAIN_GRACE;
+        while self.pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && std::time::Instant::now() < give_up
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let stuck = self.pending.load(std::sync::atomic::Ordering::SeqCst) > 0;
         for w in self.workers.drain(..) {
-            let _ = w.join();
+            if !stuck || w.is_finished() {
+                let _ = w.join();
+            }
         }
     }
 }
@@ -623,7 +653,53 @@ pub fn read_stdin_fd(ctx: &mut Ctx, buf: &mut [u8]) -> std::io::Result<usize> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .read(buf),
-        None => std::io::stdin().read(buf),
+        None => {
+            #[cfg(unix)]
+            wait_stdin_readable(ctx)?;
+            std::io::stdin().read(buf)
+        }
+    }
+}
+
+/// Block until fd 0 has data (or hangs up), watching the realm's interrupt: a `read` on a pipe
+/// nobody writes to cannot be cancelled, so it is only entered once it will not block.
+#[cfg(unix)]
+fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    #[cfg(target_vendor = "apple")]
+    type NFds = std::ffi::c_uint;
+    #[cfg(not(target_vendor = "apple"))]
+    type NFds = std::ffi::c_ulong;
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: NFds, timeout: i32) -> i32;
+    }
+    const POLLIN: i16 = 1;
+    if ctx.interrupt_for_host().is_none() {
+        return Ok(());
+    }
+    loop {
+        if ctx.poll_interrupt_for_host().is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "realm terminated",
+            ));
+        }
+        let mut fd = PollFd {
+            fd: 0,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd; a negative result (EINTR, EBADF) falls through to the read,
+        // which reports it.
+        let ready = unsafe { poll(&mut fd, 1, 20) };
+        if ready != 0 {
+            return Ok(());
+        }
     }
 }
 

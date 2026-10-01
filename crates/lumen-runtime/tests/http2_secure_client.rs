@@ -1,9 +1,12 @@
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use lumen_runtime::{Completion, ConsoleOut, Runtime};
+
+mod support;
+use support::ChildGuard;
 
 #[derive(Clone, Default)]
 struct Captured(Rc<RefCell<Vec<u8>>>);
@@ -62,19 +65,19 @@ fn secure_client_negotiates_h2_with_node_server() {
         server.on("session", session => session.on("close", () => server.close()));
     "#
     );
-    let mut child = Command::new("node")
-        .args(["-e", &server_source])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut ready = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
+    let mut child = ChildGuard::new(
+        Command::new("node")
+            .args(["-e", &server_source])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let ready = support::read_line(child.take_stdout(), support::CHILD_DEADLINE);
     assert_eq!(ready.trim(), "ready");
 
     let mut runtime = Runtime::new();
+    support::arm(&mut runtime);
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
@@ -96,7 +99,8 @@ fn secure_client_negotiates_h2_with_node_server() {
         Completion::Value(_) => {}
         Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
     }
-    let status = child.wait().unwrap();
+    support::assert_in_time(&runtime);
+    let status = child.wait(support::CHILD_DEADLINE);
     let _ = std::fs::remove_dir_all(directory);
     assert!(status.success());
     assert_eq!(

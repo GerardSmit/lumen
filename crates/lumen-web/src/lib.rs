@@ -51,6 +51,14 @@ use browser as sse;
 #[cfg(target_arch = "wasm32")]
 use browser as websocket;
 
+/// Close every HTTP listener the realm still holds, waking the accepts blocked on them.
+pub fn close_servers(ctx: &mut Ctx) {
+    #[cfg(not(target_arch = "wasm32"))]
+    server::close_all(ctx);
+    #[cfg(target_arch = "wasm32")]
+    let _ = ctx;
+}
+
 /// WebSocket protocol internals — a from-scratch RFC 6455 codec. `websocket::testing` exposes a
 /// minimal echo server other crates' tests and benchmarks drive the client against.
 #[cfg(not(target_arch = "wasm32"))]

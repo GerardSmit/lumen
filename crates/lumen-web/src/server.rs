@@ -213,16 +213,34 @@ pub(crate) fn op_server_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
         .map(|e| (Arc::clone(&e.closed), e.local_addr));
     if let Some((closed, local_addr)) = target {
         closed.store(true, Ordering::SeqCst);
-        // Connect to a concrete loopback address when bound to the wildcard, so the wake
-        // actually reaches our listener.
-        let wake_addr = if local_addr.ip().is_unspecified() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_addr.port())
-        } else {
-            local_addr
-        };
-        let _ = TcpStream::connect(wake_addr);
+        wake_accept(local_addr);
     }
     Ok(Value::Undefined)
+}
+
+/// Close every listener the realm still holds, waking their blocked `accept`s.
+pub(crate) fn close_all(ctx: &mut Ctx) {
+    let servers: Vec<ServerEntry> = ctx
+        .host_mut::<ServerRegistry>()
+        .map(|reg| reg.servers.drain().map(|(_, e)| e).collect())
+        .unwrap_or_default();
+    for entry in servers {
+        entry.closed.store(true, Ordering::SeqCst);
+        wake_accept(entry.local_addr);
+    }
+}
+
+/// Poke a listener with a throwaway connection so its blocked `accept()` returns. Bounded: a
+/// listener that has stopped accepting must not stall the caller.
+fn wake_accept(local_addr: SocketAddr) {
+    // Connect to a concrete loopback address when bound to the wildcard, so the wake actually
+    // reaches our listener.
+    let wake_addr = if local_addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_addr.port())
+    } else {
+        local_addr
+    };
+    let _ = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(250));
 }
 
 /// `__http_server.version()` -> the runtime version string (backs `Lumen.version`).

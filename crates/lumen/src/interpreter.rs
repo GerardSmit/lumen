@@ -89,38 +89,50 @@ pub fn futex_register_if(id: u64, index: usize, matches: impl FnOnce() -> bool) 
     table.entry((id, index)).or_default().push(waiter.clone());
     Some(waiter)
 }
-/// Block on an already-registered waiter.
+/// How often a blocked `Atomics.wait` looks at the embedder's interrupt.
+const FUTEX_INTERRUPT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Block on an already-registered waiter. With `interrupt` the wait gives up (returning `false`)
+/// once the flag is set, so the caller can unwind with the termination.
 pub fn futex_block(
     waiter: &Waiter,
     id: u64,
     index: usize,
     timeout: Option<std::time::Duration>,
+    interrupt: Option<&std::sync::atomic::AtomicBool>,
 ) -> bool {
     let (lock, cvar) = &**waiter;
     let mut woken = lock.lock().unwrap();
-    let result = match timeout {
-        Some(dur) => {
-            let deadline = std::time::Instant::now() + dur;
-            loop {
-                if *woken {
-                    break true;
-                }
+    let deadline = timeout.map(|dur| std::time::Instant::now() + dur);
+    let result = loop {
+        if *woken {
+            break true;
+        }
+        if interrupt.is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)) {
+            break false;
+        }
+        let left = match deadline {
+            Some(deadline) => {
                 let now = std::time::Instant::now();
+                // The loop head decides the timeout, not `timed_out()`: a platform wait can end
+                // a little before the deadline (Windows condition variables count whole
+                // milliseconds), and a wait must never report "timed-out" before its time.
                 if now >= deadline {
                     break false;
                 }
-                // The loop head decides the timeout, not `timed_out()`: a platform wait can end a
-                // little before the deadline (Windows condition variables count whole
-                // milliseconds), and a wait must never report "timed-out" before its time.
-                woken = cvar.wait_timeout(woken, deadline - now).unwrap().0;
+                Some(deadline - now)
             }
-        }
-        None => loop {
-            if *woken {
-                break true;
-            }
-            woken = cvar.wait(woken).unwrap();
-        },
+            None => None,
+        };
+        woken = match (left, interrupt) {
+            (Some(left), Some(_)) => cvar
+                .wait_timeout(woken, left.min(FUTEX_INTERRUPT_POLL))
+                .unwrap()
+                .0,
+            (Some(left), None) => cvar.wait_timeout(woken, left).unwrap().0,
+            (None, Some(_)) => cvar.wait_timeout(woken, FUTEX_INTERRUPT_POLL).unwrap().0,
+            (None, None) => cvar.wait(woken).unwrap(),
+        };
     };
     // On timeout, remove ourselves from the table (a notify may have already pulled us out).
     if !result {
@@ -1997,6 +2009,21 @@ impl Interp {
         if self.interrupt.is_some() {
             self.terminating = true;
         }
+    }
+
+    /// The embedder's interrupt flag, for a native call that has to wait on something the engine
+    /// cannot see (a child process, a read): poll it, then unwind with
+    /// [`Interp::poll_interrupt_for_host`].
+    pub fn interrupt_for_host(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.interrupt.clone()
+    }
+
+    /// Throw the realm's termination if the embedder asked it to stop.
+    pub fn poll_interrupt_for_host(&mut self) -> Result<(), Value> {
+        self.poll_interrupt().map_err(|a| match a {
+            Abrupt::Throw(v) => v,
+            _ => Value::Undefined,
+        })
     }
 
     /// Run lumen's cycle collector and return the number of reclaimed heap objects.

@@ -237,6 +237,18 @@ pub(crate) fn op_worker_terminate(
     Ok(Value::Undefined)
 }
 
+/// Stop every worker this realm started: its loop, any JS it is running, and its inbox thread.
+/// Used when the realm itself is being interrupted or dropped, so no worker outlives it.
+pub(crate) fn terminate_all(ctx: &mut Ctx) {
+    if let Some(reg) = ctx.host_mut::<WorkerRegistry>() {
+        for w in reg.workers.values_mut() {
+            w.stop.store(true, Ordering::SeqCst);
+            w.kill.store(true, Ordering::SeqCst);
+            w.to_worker = None;
+        }
+    }
+}
+
 /// `__worker.setRef(id, keep)` — `worker.ref()/unref()`: whether this worker's inbox keeps the
 /// main loop alive. Applies to the in-flight inbox task and every re-arm after it.
 pub(crate) fn op_worker_set_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {

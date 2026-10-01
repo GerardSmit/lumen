@@ -130,22 +130,83 @@ pub enum RealmExit {
     HeapLimit,
 }
 
-/// Stops an embedded realm from any thread: sets its interrupt and wakes its loop if it is
-/// blocked waiting for I/O or a timer.
+/// Stops a realm from any thread: sets its interrupt, which running JS and the native waits
+/// that poll it (`Atomics.wait`, `spawnSync`, a synchronous stdin read) notice, and wakes the
+/// event loop if it is blocked waiting for I/O, a timer or a worker. The loop then unwinds with
+/// the same termination an interrupt raised inside JS gives, stops the realm's workers and
+/// closes its sockets and listeners. Interrupting is permanent for the realm.
 #[derive(Clone)]
-pub struct Terminator {
+pub struct InterruptHandle {
     interrupt: Arc<AtomicBool>,
     wake: mpsc::Sender<TaskCompletion>,
 }
 
-impl Terminator {
-    pub fn terminate(&self) {
+impl InterruptHandle {
+    pub fn interrupt(&self) {
         self.interrupt.store(true, Ordering::SeqCst);
         // No task has this id, so the loop wakes, finds nothing to settle, and sees the flag.
         let _ = self.wake.send(TaskCompletion {
             task: TaskId::MAX,
             result: Box::new(()),
         });
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupt.load(Ordering::SeqCst)
+    }
+}
+
+/// The embedder-facing name of [`InterruptHandle`] for realms inside a host process.
+pub type Terminator = InterruptHandle;
+
+impl InterruptHandle {
+    pub fn terminate(&self) {
+        self.interrupt();
+    }
+}
+
+/// Raises a runtime's interrupt after a time limit. Dropping it (the runtime's drop, or a newer
+/// deadline) cancels the timer thread.
+#[cfg(not(target_arch = "wasm32"))]
+struct Deadline {
+    cancel: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Deadline {
+    fn start(limit: Duration, handle: InterruptHandle) -> Deadline {
+        let cancel = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let watcher = Arc::clone(&cancel);
+        let thread = std::thread::Builder::new()
+            .name("lumen-deadline".to_string())
+            .spawn(move || {
+                let (lock, cvar) = &*watcher;
+                let cancelled = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (cancelled, _) = cvar
+                    .wait_timeout_while(cancelled, limit, |c| !*c)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !*cancelled {
+                    handle.interrupt();
+                }
+            })
+            .expect("spawn deadline thread");
+        Deadline {
+            cancel,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.cancel;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -210,6 +271,8 @@ pub struct Runtime {
     interrupt: Option<Arc<AtomicBool>>,
     /// Wakes the loop when it is blocked on completions.
     wake: mpsc::Sender<TaskCompletion>,
+    #[cfg(not(target_arch = "wasm32"))]
+    deadline: Option<Deadline>,
 }
 
 /// Where the loop stands after [`Runtime::run_until_idle`].
@@ -235,7 +298,10 @@ enum StartError {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.deadline.take();
         lumen_node::shutdown_native_addons(self.engine.ctx());
+        self.release_blocked_io();
     }
 }
 
@@ -416,6 +482,8 @@ impl Runtime {
             fatal_exit: None,
             idle_gc: (Instant::now(), 0),
             idle_gc_followup: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            deadline: None,
         }
     }
 
@@ -620,6 +688,13 @@ impl Runtime {
     /// polls `stop` on a short interval so a `terminate()` from another thread is noticed even
     /// with no message or timer due.
     pub fn run_worker_loop(&mut self, stop: &std::sync::atomic::AtomicBool) {
+        self.worker_loop(stop);
+        if self.interrupted() {
+            self.release_blocked_io();
+        }
+    }
+
+    fn worker_loop(&mut self, stop: &std::sync::atomic::AtomicBool) {
         let poll = Duration::from_millis(50);
         loop {
             if stop.load(Ordering::SeqCst) || self.interrupted() {
@@ -781,6 +856,22 @@ impl Runtime {
     /// Run the loop until nothing is pending: no microtasks, no queued callbacks, no live
     /// timers, no in-flight tasks.
     pub fn run_to_completion(&mut self) {
+        self.run_loop();
+        if self.interrupted() {
+            self.release_blocked_io();
+        }
+    }
+
+    /// Stop the realm's workers and close its sockets and listeners, so the threads blocked on
+    /// them end instead of waiting for a peer that may never act.
+    fn release_blocked_io(&mut self) {
+        let ctx = self.engine.ctx();
+        worker::terminate_all(ctx);
+        lumen_node::close_native_io(ctx);
+        lumen_web::close_servers(ctx);
+    }
+
+    fn run_loop(&mut self) {
         loop {
             // Run everything already runnable. Each JS entry is followed by a microtask
             // checkpoint, matching the "after every macrotask" model.
@@ -1218,6 +1309,39 @@ impl Runtime {
     pub(crate) fn set_worker_interrupt(&mut self, flag: Arc<AtomicBool>) {
         self.engine.set_interrupt(Arc::clone(&flag));
         self.interrupt = Some(flag);
+    }
+
+    /// A handle that stops this runtime from any thread, however it is blocked (see
+    /// [`InterruptHandle`]). The first call installs the engine interrupt, after which crossing
+    /// the live-object ceiling or the heap limit also terminates the realm instead of throwing a
+    /// catchable `RangeError`.
+    pub fn interrupt_handle(&mut self) -> InterruptHandle {
+        let flag = match &self.interrupt {
+            Some(flag) => Arc::clone(flag),
+            None => {
+                let flag = Arc::new(AtomicBool::new(false));
+                self.engine.set_interrupt(Arc::clone(&flag));
+                self.interrupt = Some(Arc::clone(&flag));
+                flag
+            }
+        };
+        InterruptHandle {
+            interrupt: flag,
+            wake: self.wake.clone(),
+        }
+    }
+
+    /// Interrupt this runtime once `limit` has passed, as [`InterruptHandle::interrupt`] would.
+    /// A later call replaces the earlier deadline; dropping the runtime cancels it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_deadline(&mut self, limit: Duration) {
+        let handle = self.interrupt_handle();
+        self.deadline = Some(Deadline::start(limit, handle));
+    }
+
+    /// Whether the realm has been interrupted.
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted()
     }
 
     /// A handle that stops this realm from another thread. `None` unless embedded.

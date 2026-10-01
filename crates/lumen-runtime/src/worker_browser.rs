@@ -16,6 +16,8 @@ fn noop(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
+pub(crate) fn terminate_all(_ctx: &mut Ctx) {}
+
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "worker",
