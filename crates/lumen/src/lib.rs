@@ -40,6 +40,7 @@ mod eval;
 /// `#[global_allocator] static A: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;`
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumen_common::fastalloc;
+pub use lumen_common::limits;
 use lumen_common::fasthash;
 mod host;
 mod interpreter;
@@ -488,7 +489,7 @@ impl Engine {
     /// safe point (a call, a loop turn) throws, every later one throws again, and no further
     /// promise reactions run.
     pub fn set_interrupt(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        self.interp.interrupt = Some(flag);
+        self.interp.stop.set_interrupt(flag);
         self.interp.sync_regex_poll();
     }
 

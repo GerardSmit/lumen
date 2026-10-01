@@ -13,6 +13,7 @@ pub mod fastalloc;
 pub mod fasthash;
 #[cfg(feature = "hash")]
 pub mod hash;
+pub mod limits;
 pub mod memcat;
 pub mod stack;
 pub mod regex;

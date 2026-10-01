@@ -9,6 +9,7 @@ use crate::ast::*;
 use crate::interpreter::name_cache::NameRes;
 use crate::interpreter::*;
 use crate::value::*;
+use lumen_common::limits::size;
 use std::rc::Rc;
 
 impl Interp {
@@ -6455,7 +6456,7 @@ impl Interp {
             if op == "+" && (matches!(lp, Value::Str(_)) || matches!(rp, Value::Str(_))) {
                 let ls = self.to_string(&lp)?;
                 let rs = self.to_string(&rp)?;
-                if ls.len() + rs.len() > MAX_STR_LEN {
+                if size::sum(ls.len(), rs.len(), MAX_STR_LEN).is_err() {
                     return Err(self.throw("RangeError", "Invalid string length"));
                 }
                 return Ok(Value::Str(if crate::jstr::needs_join_fixup(&ls, &rs) {

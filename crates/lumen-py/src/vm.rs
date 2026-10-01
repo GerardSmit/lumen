@@ -7,9 +7,8 @@ use crate::object::*;
 use std::cell::RefCell;
 use crate::platform::{Platform, PlatformRef, StdPlatform};
 use std::collections::BTreeMap;
+use lumen_common::limits::{HeapBudget, InterruptHandle};
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 pub struct Block {
     pub handler: u32,
@@ -175,10 +174,9 @@ pub struct Interp {
     pub simple_namespace: Option<Obj>,
     pub alias_types: Option<Rc<crate::builtins::alias::AliasTypes>>,
     pub mappingproxy_type: Option<Obj>,
-    pub interrupt: Arc<AtomicBool>,
+    pub interrupt: InterruptHandle,
     pub interrupted: bool,
-    pub heap_limit: usize,
-    pub heap_base: isize,
+    pub heap: HeapBudget,
     pub int_max_str_digits: usize,
 }
 
@@ -233,10 +231,9 @@ impl Interp {
             simple_namespace: None,
             alias_types: None,
             mappingproxy_type: None,
-            interrupt: Arc::new(AtomicBool::new(false)),
+            interrupt: InterruptHandle::new(),
             interrupted: false,
-            heap_limit: usize::MAX,
-            heap_base: 0,
+            heap: HeapBudget::NONE,
             int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
         };
         it.bootstrap_types();
@@ -338,7 +335,7 @@ impl Interp {
     /// consequence of an aborted big-integer operation) is replaced by `KeyboardInterrupt`, so
     /// handlers for ordinary exceptions never see it.
     pub(crate) fn supersede_by_interrupt(&mut self, e: Obj) -> Obj {
-        if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) && !self.exc_is(&e, "KeyboardInterrupt") {
+        if self.interrupt.is_interrupted() && !self.exc_is(&e, "KeyboardInterrupt") {
             return self.interrupt_exc();
         }
         e

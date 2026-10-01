@@ -3,7 +3,8 @@
 use super::captures::Captures;
 use super::charclass::Flavor;
 use super::fold::{fold_eq, is_line_terminator_u32, is_word_ic, py_is_word, CaseFold};
-use super::limits::{self, Abort, BacktrackLimit};
+use super::limits::{self, BacktrackLimit};
+use crate::limits::Abort;
 use super::program::{Dialect, FirstFilter, Inst, Regex, Rep};
 
 /// Backtracking budget of one `exec` (all start positions together): `STEP_BASE` plus

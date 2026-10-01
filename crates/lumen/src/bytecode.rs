@@ -58,6 +58,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
+use lumen_common::limits::size;
 use vm_regs::{PcReg, VmStack};
 
 /// Execution tier. `Interp` must not touch any codegen path at all; `Bytecode` (the default)
@@ -8819,7 +8820,7 @@ pub(crate) fn append_to_slot(slots: &mut [Value], d: usize, y: &Value) -> bool {
     let Value::Str(cur) = &slots[d] else {
         return false;
     };
-    if cur.len() + rhs.len() > crate::interpreter::MAX_STR_LEN
+    if size::sum(cur.len(), rhs.len(), crate::interpreter::MAX_STR_LEN).is_err()
         || crate::jstr::needs_join_fixup(cur, rhs)
     {
         return false;

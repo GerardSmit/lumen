@@ -19,6 +19,7 @@ pub use bindings::VarMap;
 
 use crate::ast::*;
 use crate::value::*;
+use lumen_common::limits::size;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1017,12 +1018,11 @@ pub struct Interp {
     pub(crate) gc_tick: u32,
     /// Per-site identifier resolutions (see [`name_cache`]).
     pub(crate) name_sites: name_cache::NameSites,
-    /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point.
-    pub(crate) interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Host deadline for a bounded run (`vm` `timeout`): while set, every polled safe point
-    /// throws a catchable error, until the host clears it. Unlike `interrupt` it never latches
-    /// `terminating`, so the realm lives on after the host converts the error.
-    pub(crate) script_timeout: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point, and
+    /// the host deadline for a bounded run (`vm` `timeout`): while raised, every polled safe
+    /// point throws a catchable error, until the host clears it. Unlike the interrupt it never
+    /// latches `terminating`, so the realm lives on after the host converts the error.
+    pub(crate) stop: lumen_common::limits::StopFlags,
     /// Latched once `interrupt` was seen set: from then on every safe point (not one in 256)
     /// throws, so a `catch` that swallows the termination reaches the next call or loop turn
     /// and is terminated again.
@@ -1566,8 +1566,7 @@ impl Interp {
             gc_next: GC_TRIGGER,
             gc_tick: 0,
             name_sites: Default::default(),
-            interrupt: None,
-            script_timeout: None,
+            stop: lumen_common::limits::StopFlags::new(),
             terminating: false,
             heap_limit_hit: false,
             live_limit: MAX_LIVE,
@@ -2006,7 +2005,7 @@ impl Interp {
     /// Only meaningful with an interrupt installed — `process.exit` in an embedded realm uses it
     /// so a `catch` around the exit cannot keep the program running for another 255 calls.
     pub fn terminate_for_host(&mut self) {
-        if self.interrupt.is_some() {
+        if self.stop.has_interrupt() {
             self.terminating = true;
         }
     }
@@ -2015,7 +2014,7 @@ impl Interp {
     /// cannot see (a child process, a read): poll it, then unwind with
     /// [`Interp::poll_interrupt_for_host`].
     pub fn interrupt_for_host(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        self.interrupt.clone()
+        self.stop.interrupt_flag().cloned()
     }
 
     /// Throw the realm's termination if the embedder asked it to stop.
@@ -3742,7 +3741,7 @@ impl Interp {
         };
         // Too long: the generic path raises the RangeError. A smuggled high surrogate meeting a
         // smuggled low must join canonically (`jstr::concat`), which a byte append would skip.
-        if lv.len() + x.len() > MAX_STR_LEN || crate::jstr::needs_join_fixup(lv, x) {
+        if size::sum(lv.len(), x.len(), MAX_STR_LEN).is_err() || crate::jstr::needs_join_fixup(lv, x) {
             return Err(lval);
         }
         let mut b = o.borrow_mut();
@@ -5101,7 +5100,7 @@ impl Interp {
             eprintln!("[gc] live={live}");
         }
         if live > self.live_limit {
-            if self.interrupt.is_some() {
+            if self.stop.has_interrupt() {
                 // An embedded realm is terminated, not handed a catchable RangeError: past its
                 // ceiling it must not keep running (the embedder reports why).
                 self.heap_limit_hit = true;
@@ -5195,7 +5194,7 @@ impl Interp {
                     self.heap_ceiling = self
                         .heap_limit
                         .saturating_add((self.heap_limit / 8).max(HEAP_HEADROOM_MIN));
-                } else if self.interrupt.is_some() {
+                } else if self.stop.has_interrupt() {
                     self.heap_limit_hit = true;
                     self.terminating = true;
                     return Err(self.termination());
@@ -5210,19 +5209,12 @@ impl Interp {
     /// one branch on `terminating`, one relaxed load.
     #[inline]
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Abrupt> {
+        use lumen_common::limits::Abort;
         if !self.terminating {
-            match &self.interrupt {
-                Some(flag) if flag.load(std::sync::atomic::Ordering::Relaxed) => {
-                    self.terminating = true;
-                }
-                _ => {
-                    if let Some(deadline) = &self.script_timeout {
-                        if deadline.load(std::sync::atomic::Ordering::Relaxed) {
-                            return Err(self.throw("Error", "Script execution timed out"));
-                        }
-                    }
-                    return Ok(());
-                }
+            match self.stop.poll() {
+                Abort::Interrupt => self.terminating = true,
+                Abort::Deadline => return Err(self.throw("Error", "Script execution timed out")),
+                _ => return Ok(()),
             }
         }
         Err(self.termination())
@@ -5230,7 +5222,7 @@ impl Interp {
 
     /// Run a long native BigInt computation so the interrupt and script deadline can stop it.
     pub(crate) fn big_guard<T>(&mut self, f: impl FnOnce() -> T) -> Result<T, Abrupt> {
-        match crate::bigint::interruptible(&self.interrupt, &self.script_timeout, f) {
+        match crate::bigint::interruptible(&self.stop, f) {
             Some(v) => Ok(v),
             None => {
                 self.poll_interrupt()?;
@@ -5241,9 +5233,8 @@ impl Interp {
 
     pub(crate) fn sync_regex_poll(&self) {
         crate::regex::set_host_poll(
-            self.interrupt.clone(),
-            self.script_timeout.clone(),
-            self.heap_limit,
+            self.stop.clone(),
+            lumen_common::limits::HeapBudget::process(self.heap_limit),
         );
     }
 
@@ -5258,7 +5249,7 @@ impl Interp {
             }
             Abort::Deadline => self.make_error("Error", "Script execution timed out"),
             _ => {
-                if self.interrupt.is_some() {
+                if self.stop.has_interrupt() {
                     self.heap_limit_hit = true;
                     self.terminating = true;
                     return self.make_error("Error", "realm terminated");
@@ -5271,10 +5262,7 @@ impl Interp {
     /// The flag behind `script_timeout`, created on first use. A host thread sets it when a
     /// deadline passes; the host clears it once the bounded run has unwound.
     pub fn script_timeout_flag(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        let flag = self
-            .script_timeout
-            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-            .clone();
+        let flag = self.stop.deadline_flag();
         self.sync_regex_poll();
         flag
     }

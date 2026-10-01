@@ -1,6 +1,5 @@
 use super::*;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use crate::limits::{HeapBudget, InterruptHandle, StopFlags};
 
 fn ch(c: char) -> Node {
     Node::Char(c as u32)
@@ -433,8 +432,9 @@ fn exec_str_indexes_by_code_point() {
 
 #[test]
 fn interrupt_flag_aborts_a_match() {
-    let flag = Arc::new(AtomicBool::new(true));
-    set_host_poll(Some(flag.clone()), None, 0);
+    let handle = InterruptHandle::new();
+    handle.interrupt();
+    set_host_poll(StopFlags::from_handle(&handle), HeapBudget::NONE);
     let re = py(
         Node::concat(vec![
             plus(Node::capture(1, plus(ch('a')))),
@@ -444,7 +444,7 @@ fn interrupt_flag_aborts_a_match() {
     );
     let subject = "a".repeat(40);
     let result = re.exec_str(&subject, ExecOptions::search(0));
-    set_host_poll(None, None, 0);
+    set_host_poll(StopFlags::new(), HeapBudget::NONE);
     assert!(result.is_err());
     assert_eq!(take_abort(), Abort::Interrupt);
     assert_eq!(take_abort(), Abort::None);
@@ -452,21 +452,22 @@ fn interrupt_flag_aborts_a_match() {
 
 #[test]
 fn deadline_flag_aborts_a_match() {
-    let flag = Arc::new(AtomicBool::new(true));
-    set_host_poll(None, Some(flag), 0);
+    let mut stop = StopFlags::new();
+    stop.deadline_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+    set_host_poll(stop, HeapBudget::NONE);
     let re = py(
         Node::concat(vec![plus(Node::capture(1, plus(ch('a')))), ch('b')]),
         1,
     );
     let result = re.exec_str(&"a".repeat(40), ExecOptions::search(0));
-    set_host_poll(None, None, 0);
+    set_host_poll(StopFlags::new(), HeapBudget::NONE);
     assert!(result.is_err());
     assert_eq!(take_abort(), Abort::Deadline);
 }
 
 #[test]
 fn backtracking_budget_stops_catastrophic_patterns() {
-    set_host_poll(None, None, 0);
+    set_host_poll(StopFlags::new(), HeapBudget::NONE);
     let re = py(
         Node::concat(vec![plus(Node::capture(1, plus(ch('a')))), ch('b')]),
         1,

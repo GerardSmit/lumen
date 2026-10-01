@@ -35,6 +35,6 @@ pub mod weak;
 
 pub use parser::{parse, SyntaxError};
 pub use cli::run_main;
-pub use limits::InterruptHandle;
+pub use lumen_common::limits::InterruptHandle;
 pub use platform::{MemFs, MemPlatform, Platform, StdPlatform};
 pub use vm::{Interp, Output, ProcessOutput};

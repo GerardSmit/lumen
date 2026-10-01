@@ -4,6 +4,7 @@
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
 use crate::value::*;
+use lumen_common::limits::size;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
@@ -8527,7 +8528,7 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("RangeError", "invalid count value"));
         }
         let count = n as usize;
-        if s.len().saturating_mul(count) > MAX_STR_LEN {
+        if size::repeat(s.len(), count, MAX_STR_LEN).is_err() {
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
         let out = s.repeat(count);

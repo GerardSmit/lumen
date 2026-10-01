@@ -2,6 +2,7 @@
 
 use crate::limits::DEFAULT_INT_MAX_STR_DIGITS;
 use crate::vm::Interp;
+use lumen_common::limits::Deadline;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const USAGE: &str = "usage: lumen-py [--timeout=MS] [--max-memory=MB] [-X int_max_str_digits=N] <script.py> [args]\n";
@@ -118,14 +119,11 @@ pub fn run_main(args: &[String]) -> i32 {
 /// A watchdog thread raises the interpreter's interrupt when the budget runs out.
 fn start_watchdog(it: &Interp, ms: u64) {
     let handle = it.interrupt_handle();
-    std::thread::Builder::new()
-        .name("lumen-py-timeout".to_string())
-        .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-            TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
-            handle.interrupt();
-        })
-        .expect("spawn timeout watchdog");
+    Deadline::start("lumen-py-timeout", std::time::Duration::from_millis(ms), move || {
+        TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
+        handle.interrupt();
+    })
+    .detach();
 }
 
 #[cfg(unix)]
@@ -151,7 +149,7 @@ mod sigint {
 
     /// Maps Ctrl-C to the interpreter's interrupt, so it surfaces as `KeyboardInterrupt`.
     pub fn install(it: &Interp) {
-        let flag: Arc<AtomicBool> = it.interrupt.clone();
+        let flag: Arc<AtomicBool> = it.interrupt.flag().clone();
         TARGET.store(Arc::into_raw(flag) as *mut AtomicBool, Ordering::SeqCst);
         unsafe { signal(SIGINT, on_sigint as *const () as usize) };
     }

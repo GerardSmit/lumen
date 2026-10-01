@@ -1,5 +1,5 @@
 #[global_allocator]
-static ALLOC: lumen_py::limits::CountingAlloc = lumen_py::limits::CountingAlloc;
+static ALLOC: lumen_common::fastalloc::ClassAlloc = lumen_common::fastalloc::ClassAlloc;
 
 const STACK_SIZE: usize = 1 << 28;
 

@@ -615,16 +615,13 @@ const TIMEOUT_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5
 /// finish within a few seconds does the watchdog exit the process itself.
 fn start_watchdog(runtime: &mut Runtime, ms: u64) {
     let handle = runtime.interrupt_handle();
-    std::thread::Builder::new()
-        .name("lumen-timeout".to_string())
-        .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-            TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
-            handle.interrupt();
-            std::thread::sleep(TIMEOUT_EXIT_GRACE);
-            exit_if_timed_out();
-        })
-        .expect("spawn timeout watchdog");
+    lumen::limits::Deadline::start("lumen-timeout", std::time::Duration::from_millis(ms), move || {
+        TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
+        handle.interrupt();
+        std::thread::sleep(TIMEOUT_EXIT_GRACE);
+        exit_if_timed_out();
+    })
+    .detach();
 }
 
 fn exit_if_timed_out() {

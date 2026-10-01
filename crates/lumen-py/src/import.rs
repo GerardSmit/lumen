@@ -3,6 +3,7 @@
 use crate::dict::PyDict;
 use crate::object::*;
 use crate::vm::*;
+use lumen_common::limits::StopFlags;
 use std::cell::RefCell;
 use crate::platform::{parent_dir, FoundModule};
 use std::rc::Rc;
@@ -103,8 +104,8 @@ impl Interp {
         self.register_module("__main__", &main);
         self.main_globals = Some(globals.clone());
         self.interrupted = false;
-        let flag = Some(self.interrupt.clone());
-        let outcome = lumen_common::bigint::interruptible(&flag, &None, || match self.compile_source(src, filename) {
+        let stop = StopFlags::from_handle(&self.interrupt);
+        let outcome = lumen_common::bigint::interruptible(&stop, || match self.compile_source(src, filename) {
             Ok(code) => self.run_code(code, globals.clone(), globals),
             Err(e) => Err(e),
         });
@@ -113,7 +114,7 @@ impl Interp {
             None => Err(self.interrupt_exc()),
         };
         let result = match result {
-            Ok(_) if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) => Err(self.interrupt_exc()),
+            Ok(_) if self.interrupt.is_interrupted() => Err(self.interrupt_exc()),
             r => r.map_err(|e| self.supersede_by_interrupt(e)),
         };
         let code = match result {
@@ -121,7 +122,7 @@ impl Interp {
             Err(e) => {
                 if self.is_exc_instance(&e, "KeyboardInterrupt") {
                     self.interrupted = true;
-                    self.interrupt.store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.interrupt.clear();
                 }
                 self.flush_out();
                 self.report_uncaught(&e)

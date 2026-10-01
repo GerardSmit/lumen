@@ -622,7 +622,7 @@ impl<'a> Lexer<'a> {
                     );
                 } else {
                     let limit = crate::limits::literal_digit_limit();
-                    if limit != 0 && int_end > limit {
+                    if lumen_common::bigint::digits_exceed(limit, int_end) {
                         let msg = crate::limits::digit_limit_message(limit, Some(int_end));
                         return self.err(
                             format!("{msg} - Consider hexadecimal for huge integer literals to avoid decimal conversion limits."),

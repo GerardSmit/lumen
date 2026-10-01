@@ -9,6 +9,7 @@ use crate::dict::PyDict;
 use crate::num::*;
 use crate::object::*;
 use crate::vm::*;
+use lumen_common::limits::size;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -835,7 +836,7 @@ impl Interp {
 
     /// `src` repeated `n` times, refusing results past the sequence cap before allocating.
     pub fn repeat_values(&mut self, src: &[Value], n: usize) -> R<Vec<Value>> {
-        let Some(total) = src.len().checked_mul(n) else { return Err(self.memory_error()) };
+        let total = size::repeat(src.len(), n, crate::limits::MAX_SEQ_LEN).map_err(|_| self.memory_error())?;
         if total == 0 {
             return Ok(Vec::new());
         }
@@ -853,7 +854,7 @@ impl Interp {
 
     /// `src` repeated `n` times as bytes, built by doubling.
     pub fn repeat_bytes(&mut self, src: &[u8], n: usize, max: usize) -> R<Vec<u8>> {
-        let Some(total) = src.len().checked_mul(n) else { return Err(self.memory_error()) };
+        let total = size::repeat(src.len(), n, max).map_err(|_| self.memory_error())?;
         if total == 0 {
             return Ok(Vec::new());
         }

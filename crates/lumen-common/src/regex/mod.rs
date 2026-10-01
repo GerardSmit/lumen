@@ -32,7 +32,8 @@ pub use fold::{
     py_is_space, py_is_word, py_lower, CaseFold,
 };
 pub use ir::Node;
-pub use limits::{set_host_poll, take_abort, Abort, BacktrackLimit, BACKTRACK_LIMIT_MSG};
+pub use crate::limits::Abort;
+pub use limits::{set_host_poll, take_abort, BacktrackLimit, BACKTRACK_LIMIT_MSG};
 pub use matcher::{ExecOptions, Mode, ReInput};
 pub use program::{Dialect, Options, Regex};
 

@@ -202,7 +202,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         let Some(waiter) = waiter else {
             return Ok(Value::str("not-equal"));
         };
-        let interrupt = i.interrupt.clone();
+        let interrupt = i.stop.interrupt_flag().cloned();
         let woken =
             crate::interpreter::futex_block(&waiter, id, byte_index, timeout, interrupt.as_deref());
         if !woken {

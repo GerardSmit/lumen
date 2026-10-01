@@ -72,7 +72,7 @@ fn parse_int_inner(s: &str, base: u32, max_digits: usize) -> Option<Result<BigIn
     if !clean.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
-    if max_digits != 0 && !base.is_power_of_two() && clean.len() > max_digits {
+    if !base.is_power_of_two() && lumen_common::bigint::digits_exceed(max_digits, clean.len()) {
         return Some(Err(IntParseError::TooManyDigits(clean.len())));
     }
     let v = BigInt::parse_signed(&clean, base)?;

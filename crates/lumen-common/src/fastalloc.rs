@@ -189,6 +189,8 @@ struct Cache {
     guard: Cell<u8>,
     /// Bytes allocated (+) or freed (-) on this thread not yet folded into [`HEAP_BYTES`].
     pending: Cell<isize>,
+    /// Requested bytes this thread allocated minus the ones it freed (see [`thread_live_bytes`]).
+    live: Cell<isize>,
 }
 
 const GUARD_NONE: u8 = 0;
@@ -218,6 +220,7 @@ thread_local! {
             bytes: Cell::new(0),
             guard: Cell::new(GUARD_NONE),
             pending: Cell::new(0),
+            live: Cell::new(0),
         }
     };
     static GUARD: Guard = const { Guard };
@@ -275,6 +278,15 @@ pub fn heap_bytes() -> Option<usize> {
     }
     let local = CACHE.try_with(|c| c.pending.get()).unwrap_or(0);
     Some((HEAP_BYTES.load(Relaxed) + local).max(0) as usize)
+}
+
+/// Bytes the calling thread has allocated through [`ClassAlloc`] and not freed, counted at the
+/// requested sizes, so a per-thread budget (one interpreter per thread) is exact. A block freed
+/// on another thread counts against that thread, so only a thread that owns what it allocates
+/// reads a meaningful value; zero when `ClassAlloc` is not the global allocator.
+#[inline]
+pub fn thread_live_bytes() -> isize {
+    cache().live.get()
 }
 
 /// Memory mapped outside the allocator (the object slab's chunks on Windows) that should still
@@ -372,8 +384,9 @@ pub struct ClassAlloc;
 impl ClassAlloc {
     #[inline(always)]
     unsafe fn raw_alloc(&self, layout: Layout) -> *mut u8 {
+        let c = cache();
+        c.live.set(c.live.get() + layout.size() as isize);
         if let Some(class) = class_of(layout.size(), layout.align()) {
-            let c = cache();
             let p = c.heads[class].get();
             if !p.is_null() {
                 c.heads[class].set(unsafe { *(p as *mut *mut u8) });
@@ -383,15 +396,24 @@ impl ClassAlloc {
                 return p;
             }
             note(c, ((class + 1) * STEP) as isize);
-            return System.alloc(class_layout(class));
+            let p = System.alloc(class_layout(class));
+            if p.is_null() {
+                c.live.set(c.live.get() - layout.size() as isize);
+            }
+            return p;
         }
-        note(cache(), layout.size() as isize);
-        System.alloc(layout)
+        note(c, layout.size() as isize);
+        let p = System.alloc(layout);
+        if p.is_null() {
+            c.live.set(c.live.get() - layout.size() as isize);
+        }
+        p
     }
 
     #[inline(always)]
     unsafe fn raw_dealloc(&self, ptr: *mut u8, layout: Layout) {
         let c = cache();
+        c.live.set(c.live.get() - layout.size() as isize);
         if let Some(class) = class_of(layout.size(), layout.align()) {
             if c.guard.get() != GUARD_LIVE {
                 if c.guard.get() == GUARD_DEAD {
@@ -429,6 +451,8 @@ impl ClassAlloc {
             class_of(new_size, layout.align()),
         ) {
             if a == b {
+                let c = cache();
+                c.live.set(c.live.get() + new_size as isize - layout.size() as isize);
                 return ptr;
             }
         }
@@ -533,6 +557,27 @@ unsafe impl GlobalAlloc for ClassAlloc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_live_bytes_follows_requested_sizes() {
+        std::thread::spawn(|| {
+            let allocator = ClassAlloc;
+            let small = Layout::from_size_align(40, 8).unwrap();
+            let large = Layout::from_size_align(5000, 8).unwrap();
+            unsafe {
+                let a = allocator.raw_alloc(small);
+                let b = allocator.raw_alloc(large);
+                assert_eq!(thread_live_bytes(), 5040);
+                let a = allocator.raw_realloc(a, small, 100);
+                assert_eq!(thread_live_bytes(), 5100);
+                allocator.raw_dealloc(a, Layout::from_size_align(100, 8).unwrap());
+                allocator.raw_dealloc(b, large);
+            }
+            assert_eq!(thread_live_bytes(), 0);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn the_whole_cache_stays_within_its_budget() {

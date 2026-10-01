@@ -12,10 +12,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::Arc;
-
-type Flag = Option<Arc<AtomicBool>>;
+use crate::limits::{Abort, StopFlags};
 
 const IDLE: u8 = 0;
 const ARMED: u8 = 1;
@@ -23,21 +20,21 @@ const ABORTED: u8 = 2;
 
 thread_local! {
     static STATE: Cell<u8> = const { Cell::new(IDLE) };
-    static FLAGS: RefCell<(Flag, Flag)> = const { RefCell::new((None, None)) };
+    static FLAGS: RefCell<StopFlags> = const { RefCell::new(StopFlags::new()) };
 }
 
-/// Runs `f` with the long-running operations below polling `interrupt` and `deadline`. When
-/// either is raised the operations stop early with meaningless results and this returns `None`
-/// (the caller discards everything `f` produced). Outside this wrapper the polls are inert.
-pub fn interruptible<T>(interrupt: &Flag, deadline: &Flag, f: impl FnOnce() -> T) -> Option<T> {
+/// Runs `f` with the long-running operations below polling `stop`. When either flag is raised the
+/// operations stop early with meaningless results and this returns `None` (the caller discards
+/// everything `f` produced). Outside this wrapper the polls are inert.
+pub fn interruptible<T>(stop: &StopFlags, f: impl FnOnce() -> T) -> Option<T> {
     if STATE.get() != IDLE {
         return Some(f());
     }
-    FLAGS.with(|c| *c.borrow_mut() = (interrupt.clone(), deadline.clone()));
+    FLAGS.with(|c| *c.borrow_mut() = stop.clone());
     STATE.set(ARMED);
     let out = f();
     let aborted = STATE.replace(IDLE) == ABORTED;
-    FLAGS.with(|c| *c.borrow_mut() = (None, None));
+    FLAGS.with(|c| *c.borrow_mut() = StopFlags::new());
     (!aborted).then_some(out)
 }
 
@@ -59,14 +56,17 @@ fn poll() -> bool {
 #[cold]
 #[inline(never)]
 fn poll_flags() -> bool {
-    let hit = FLAGS.with(|c| {
-        let (i, d) = &*c.borrow();
-        i.as_ref().is_some_and(|f| f.load(Relaxed)) || d.as_ref().is_some_and(|f| f.load(Relaxed))
-    });
+    let hit = FLAGS.with(|c| c.borrow().poll() != Abort::None);
     if hit {
         STATE.set(ABORTED);
     }
     hit
+}
+
+/// Whether a decimal string of `digits` digits is past a conversion limit of `max_digits`
+/// (0 means no limit).
+pub fn digits_exceed(max_digits: usize, digits: usize) -> bool {
+    max_digits != 0 && digits > max_digits
 }
 
 #[derive(Clone, Debug)]
@@ -1914,6 +1914,14 @@ impl BigInt {
         }
         let s = self.to_string_radix(radix);
         (s.len() <= max_len).then_some(s)
+    }
+    /// Decimal text, or `None` when it has more than `max_digits` digits (the sign is not
+    /// counted; 0 means no limit). Decided before converting.
+    pub fn to_decimal_limited(&self, max_digits: usize) -> Option<String> {
+        if max_digits == 0 {
+            return Some(self.to_string_radix(10));
+        }
+        self.to_string_radix_checked(10, max_digits + self.is_negative() as usize)
     }
     /// An upper bound on the digit count in `radix`.
     fn max_digits(&self, radix: u32) -> usize {
