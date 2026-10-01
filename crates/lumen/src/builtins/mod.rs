@@ -26,6 +26,7 @@ mod globals;
 mod host;
 mod json;
 mod math;
+pub(crate) mod natives;
 pub(crate) use math::jit_math_fns;
 mod primitives;
 mod promise;
@@ -4052,7 +4053,8 @@ pub(crate) fn object_define_property(
         return Ok(Value::Obj(o));
     }
     if !ab(define_own_property(i, &o, &key, &descriptor))? {
-        return Err(i.make_error("TypeError", "Cannot redefine property"));
+        let shown = vm_context::key_display(i, &key);
+        return Err(i.make_error("TypeError", format!("Cannot redefine property: {shown}")));
     }
     Ok(Value::Obj(o))
 }

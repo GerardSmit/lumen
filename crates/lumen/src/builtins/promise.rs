@@ -21,7 +21,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         // SpeciesConstructor(this, %Promise%) on an unmodified promise is %Promise% with no
         // observable step: the result is just a fresh promise.
         if promise_then_is_silent(i, &this) {
-            let result = i.new_promise();
+            let result = i.new_promise_with_parent(&this);
             i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
             return Ok(result);
         }
@@ -32,7 +32,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         // never escape, and %Promise%.prototype is a non-writable, non-configurable data
         // property): the result is just a fresh promise.
         if is_intrinsic_promise_ctor(i, &c) {
-            let result = i.new_promise();
+            let result = i.new_promise_with_parent(&this);
             i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
             return Ok(result);
         }

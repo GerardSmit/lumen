@@ -10627,14 +10627,16 @@ fn install_now(it: &mut Interp, ns: &Gc) {
     }
     fn now_zone(i: &mut Interp, v: &Value) -> Result<Rc<str>, Value> {
         match v {
-            Value::Undefined => Ok(Rc::from("UTC")),
+            Value::Undefined => Ok(Rc::from(crate::local_tz::id())),
             _ => tz_from_field(i, v),
         }
     }
     it.def_method(&now, "instant", 0, |i, _t, _| {
         Ok(make(i, "Temporal.Instant", Temporal::Instant(now_ns())))
     });
-    it.def_method(&now, "timeZoneId", 0, |_i, _t, _| Ok(Value::str("UTC")));
+    it.def_method(&now, "timeZoneId", 0, |_i, _t, _| {
+        Ok(Value::str(crate::local_tz::id()))
+    });
     it.def_method(&now, "zonedDateTimeISO", 0, |i, _t, a| {
         let tz = now_zone(i, &arg(a, 0))?;
         let e = now_ns();

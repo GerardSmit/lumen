@@ -8323,7 +8323,7 @@ impl Chunk {
         if !Rc::ptr_eq(env, &i.global_env) {
             return self.name_path_fill(i, env, n, c);
         }
-        if !i.ordinary_get_ptr(Gc::as_ptr(&i.global) as usize) {
+        if i.global_proxy.is_some() || !i.ordinary_get_ptr(Gc::as_ptr(&i.global) as usize) {
             return None;
         }
         let g = i.global.borrow();

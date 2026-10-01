@@ -11,6 +11,7 @@ mod collect;
 pub(crate) mod class_fields;
 mod constructor_body;
 mod generator_body;
+mod heap_snapshot;
 pub(crate) mod name_cache;
 mod this_binding;
 pub(crate) mod ta_meta;
@@ -205,6 +206,24 @@ impl Interp {
     /// Replace the current async context, returning the previous one.
     pub fn set_async_context(&mut self, context: Value) -> Value {
         std::mem::replace(&mut self.async_context, context)
+    }
+
+    /// Install (a callable) or remove the multiple-resolves hook (see the field).
+    pub fn set_multiple_resolves_hook(&mut self, hook: Value) {
+        self.multiple_resolves_hook = hook.is_callable().then_some(hook);
+    }
+
+    /// Queue `error` to be reported as an uncaught exception once the running microtask
+    /// checkpoint ends, as a throwing `queueMicrotask` callback is; `false` when the embedder
+    /// does not collect such errors.
+    pub fn report_task_error(&mut self, error: Value) -> bool {
+        match self.task_errors.as_mut() {
+            Some(errors) => {
+                errors.push(error);
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn null_read_message(&self, base: &Value, key: Option<&Value>) -> String {
@@ -1027,6 +1046,19 @@ pub struct Interp {
     /// around the handler — so a runtime can build `AsyncLocalStorage` on it. Timers and other
     /// host continuations capture and restore it themselves through the host API.
     pub(crate) async_context: Value,
+    /// The host's promise lifecycle hooks (V8's context promise hooks), when installed. Every
+    /// hook site is behind this one `is_some` check.
+    pub(crate) promise_hooks: Option<Box<crate::eval::promise_fast::PromiseHooks>>,
+    /// Rejected promises reported unhandled that later got a handler (V8's
+    /// kPromiseHandlerAddedAfterReject), for the embedder's `rejectionHandled`; `None` until
+    /// the embedder asks for them.
+    pub(crate) late_handled_rejections: Option<Vec<Value>>,
+    /// Errors thrown by `queueMicrotask` callbacks, when the embedder reports them as uncaught
+    /// exceptions (see [`Interp::set_report_task_errors`]).
+    pub(crate) task_errors: Option<Vec<Value>>,
+    /// Called as `(type, promise, value)` when a promise's resolving function runs after it was
+    /// already resolved (V8's kPromiseResolveAfterResolved / kPromiseRejectAfterResolved).
+    pub(crate) multiple_resolves_hook: Option<Value>,
     /// Embedder host state (typed slots + resource table); see [`crate::host`]. Reached from
     /// native fns via [`Interp::op_state`] — the only way, since `NativeFn` cannot capture.
     pub(crate) host_state: crate::host::OpState,
@@ -1045,6 +1077,10 @@ pub struct Interp {
     /// throws a catchable error, until the host clears it. Unlike `interrupt` it never latches
     /// `terminating`, so the realm lives on after the host converts the error.
     pub(crate) script_timeout: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The active realm's global *proxy* when it is a `vm` context: the object free names,
+    /// global declarations and the global `this` resolve against (it intercepts onto the
+    /// context's sandbox). `global` keeps holding the realm's intrinsics.
+    pub(crate) global_proxy: Option<Gc>,
     /// Latched once `interrupt` was seen set: from then on every safe point (not one in 256)
     /// throws, so a `catch` that swallows the termination reaches the next call or loop turn
     /// and is terminated again.
@@ -1273,11 +1309,15 @@ pub struct RealmState {
     pub error_protos: crate::fasthash::FastMap<&'static str, Gc>,
     pub eval_fn: Option<Gc>,
     pub extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
+    /// A `vm` context's global proxy (see [`Interp::global_proxy`]).
+    pub global_proxy: Option<Gc>,
+    /// A `vm` context realm: dropped by the collector once nothing reaches its global.
+    pub collectable: bool,
 }
 
 impl Interp {
     /// Snapshot the current realm's intrinsics so they can be swapped out and back.
-    fn snapshot_realm(&self) -> RealmState {
+    pub(crate) fn snapshot_realm(&self) -> RealmState {
         RealmState {
             global: self.global.clone(),
             global_env: self.global_env.clone(),
@@ -1291,11 +1331,13 @@ impl Interp {
             error_protos: self.error_protos.clone(),
             eval_fn: self.eval_fn.clone(),
             extra_protos: self.extra_protos.clone(),
+            global_proxy: self.global_proxy.clone(),
+            collectable: false,
         }
     }
 
     /// Install a realm's intrinsics as the active ones.
-    fn restore_realm(&mut self, r: &RealmState) {
+    pub(crate) fn restore_realm(&mut self, r: &RealmState) {
         self.global = r.global.clone();
         self.global_env = r.global_env.clone();
         self.object_proto = r.object_proto.clone();
@@ -1308,6 +1350,7 @@ impl Interp {
         self.error_protos = r.error_protos.clone();
         self.eval_fn = r.eval_fn.clone();
         self.extra_protos = r.extra_protos.clone();
+        self.global_proxy = r.global_proxy.clone();
     }
 
     /// `$262.createRealm()`: build a fresh realm (its own global + intrinsics) and register it. The
@@ -1316,6 +1359,11 @@ impl Interp {
     /// main realm, so `realms.is_empty()` never distinguishes anything — cross-realm dispatch
     /// only becomes possible once another realm joins, and realms are never removed. Every
     /// single-realm fast-path gate keys on this.
+    #[inline]
+    pub(crate) fn name_global(&self) -> &Gc {
+        self.global_proxy.as_ref().unwrap_or(&self.global)
+    }
+
     #[inline]
     pub(crate) fn multi_realm(&self) -> bool {
         self.realms.len() > 1
@@ -1372,6 +1420,7 @@ impl Interp {
         self.error_protos = Default::default();
         self.extra_protos = Default::default();
         self.eval_fn = None;
+        self.global_proxy = None;
         crate::builtins::install(self);
         // Top-level `this` is the new global.
         let g = Value::Obj(self.global.clone());
@@ -1434,7 +1483,27 @@ impl Interp {
 }
 
 impl RealmState {
-    fn snapshot_clone(&self) -> RealmState {
+    /// Every object handle the realm record holds.
+    pub(crate) fn for_each_object(&self, mut f: impl FnMut(&Gc)) {
+        for o in [
+            &self.global,
+            &self.object_proto,
+            &self.function_proto,
+            &self.array_proto,
+            &self.string_proto,
+            &self.number_proto,
+            &self.boolean_proto,
+            &self.symbol_proto,
+        ] {
+            f(o);
+        }
+        self.error_protos.values().for_each(&mut f);
+        self.extra_protos.values().for_each(&mut f);
+        self.eval_fn.iter().for_each(&mut f);
+        self.global_proxy.iter().for_each(&mut f);
+    }
+
+    pub(crate) fn snapshot_clone(&self) -> RealmState {
         RealmState {
             global: self.global.clone(),
             global_env: self.global_env.clone(),
@@ -1448,6 +1517,8 @@ impl RealmState {
             error_protos: self.error_protos.clone(),
             eval_fn: self.eval_fn.clone(),
             extra_protos: self.extra_protos.clone(),
+            global_proxy: self.global_proxy.clone(),
+            collectable: false,
         }
     }
 }
@@ -1580,6 +1651,10 @@ impl Interp {
             ctor_caller_realm: None,
             realms: Default::default(),
             unhandled_rejections: Default::default(),
+            promise_hooks: None,
+            late_handled_rejections: None,
+            task_errors: None,
+            multiple_resolves_hook: None,
             temporal: Default::default(),
             temporal_cal: Default::default(),
             microtasks: std::collections::VecDeque::new(),
@@ -1591,6 +1666,7 @@ impl Interp {
             name_sites: Default::default(),
             interrupt: None,
             script_timeout: None,
+            global_proxy: None,
             terminating: false,
             heap_limit_hit: false,
             live_limit: MAX_LIVE,
@@ -2058,6 +2134,9 @@ impl Interp {
     /// Run lumen's cycle collector and return the number of reclaimed heap objects.
     pub fn collect_garbage_for_host(&mut self) -> i64 {
         let before = crate::value::live_objects();
+        if let Some(observer) = self.host_state.get_mut::<crate::gc_log::GcObserver>() {
+            observer.forced_next = true;
+        }
         self.gc_collect();
         before.saturating_sub(crate::value::live_objects())
     }
@@ -4411,6 +4490,9 @@ impl Interp {
         let strict = self.strict;
         let success = self.set_member_recv(base, key, value, base.clone())?;
         if !success && strict {
+            if let Some(m) = self.vm_store_error(base, key) {
+                return Err(self.throw("TypeError", m));
+            }
             return Err(self.throw("TypeError", format!("cannot assign to property '{key}'")));
         }
         Ok(())
@@ -5696,10 +5778,11 @@ impl Interp {
                 if !self.class_info.is_empty()
                     && self.class_info.contains_key(&(Gc::as_ptr(&obj) as usize))
                 {
-                    Err(self.throw(
-                        "TypeError",
-                        "Class constructor cannot be invoked without 'new'",
-                    ))
+                    let msg = format!(
+                        "Class constructor {} cannot be invoked without 'new'",
+                        user.func.name.as_deref().unwrap_or("")
+                    );
+                    Err(self.throw("TypeError", &msg))
                 } else {
                     self.call_user(&user.func, user.env.clone(), this, args, false, &obj)
                 }
@@ -6238,7 +6321,7 @@ impl Interp {
             return this;
         }
         match this {
-            Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
+            Value::Undefined | Value::Null => Value::Obj(self.name_global().clone()),
             other @ Value::Obj(_) => other,
             prim => crate::builtins::box_primitive_pub(self, prim),
         }
@@ -6532,7 +6615,7 @@ impl Interp {
                     this
                 } else {
                     match this {
-                        Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
+                        Value::Undefined | Value::Null => Value::Obj(self.name_global().clone()),
                         other @ Value::Obj(_) => other,
                         // Sloppy mode: a primitive `this` is boxed to its wrapper (ToObject).
                         prim => crate::builtins::box_primitive_pub(self, prim),
@@ -7577,12 +7660,7 @@ impl Interp {
         }
         for n in &lex_names {
             // HasVarDeclaration / HasLexicalDeclaration / HasRestrictedGlobalProperty.
-            let restricted = self
-                .global
-                .borrow()
-                .props
-                .get(n.as_str())
-                .is_some_and(|p| !p.configurable());
+            let restricted = self.global_own_attrs(n)?.is_some_and(|a| !a.0);
             if self.global_env.borrow().vars.contains_key(n.as_str())
                 || self.global_var_names.contains(n)
                 || restricted
@@ -7593,7 +7671,11 @@ impl Interp {
                 ));
             }
         }
-        let extensible = self.global.borrow().extensible;
+        let extensible = if self.global_proxy.is_some() {
+            self.vm_global_extensible().map_err(abrupt_value)?
+        } else {
+            self.global.borrow().extensible
+        };
         for name in &var_names {
             let is_func = probe
                 .borrow()
@@ -7606,12 +7688,7 @@ impl Interp {
                     format!("Identifier '{name}' has already been declared"),
                 ));
             }
-            let existing = self
-                .global
-                .borrow()
-                .props
-                .get(name.as_str())
-                .map(|p| (p.configurable(), p.accessor(), p.writable(), p.enumerable()));
+            let existing = self.global_own_attrs(name)?;
             if is_func {
                 // CanDeclareGlobalFunction.
                 let ok = match existing {
@@ -7638,6 +7715,10 @@ impl Interp {
         let new_vars = var_names;
         self.global_var_names.extend(new_vars.iter().cloned());
         self.hoist(body, &self.global_env.clone(), &[]);
+        if self.global_proxy.is_some() {
+            self.vm_bind_global_vars(new_vars)?;
+            return self.run_program_body(body);
+        }
         // The global Environment Record is object-backed: this script's `var`/`function` bindings
         // (which `hoist` just placed in `global_env`) become properties of the global object, so
         // they are visible as `globalThis.<name>` and writes stay in sync. Only the probe-computed
@@ -7676,6 +7757,48 @@ impl Interp {
                 _ => {}
             }
         }
+        self.run_program_body(body)
+    }
+
+    /// The `(configurable, accessor, writable, enumerable)` attributes of the global object's
+    /// own property `name` (through a `vm` context's global proxy when one is active).
+    fn global_own_attrs(&mut self, name: &str) -> Result<Option<(bool, bool, bool, bool)>, Value> {
+        let attrs = |p: &Property| (p.configurable(), p.accessor(), p.writable(), p.enumerable());
+        if self.global_proxy.is_some() {
+            return Ok(self.vm_global_own(name).map_err(abrupt_value)?.as_ref().map(attrs));
+        }
+        Ok(self.global.borrow().props.get(name).map(|p| attrs(&p)))
+    }
+
+    /// CreateGlobalFunctionBinding / CreateGlobalVarBinding for a script run in a `vm`
+    /// context: the hoisted bindings move to the global proxy (and so to the sandbox).
+    fn vm_bind_global_vars(&mut self, names: Vec<String>) -> Result<(), Value> {
+        for name in names {
+            let Some(binding) = self.global_env.borrow_mut().vars.remove(&name) else {
+                continue;
+            };
+            let existing = self.global_own_attrs(&name)?;
+            if matches!(binding.value, Value::Undefined) {
+                if existing.is_none() {
+                    self.vm_global_define(&name, Some(Value::Undefined), Some((true, true, false)))
+                        .map_err(abrupt_value)?;
+                }
+                continue;
+            }
+            let attrs = match existing {
+                None | Some((true, ..)) => Some((true, true, false)),
+                Some(_) => None,
+            };
+            self.vm_global_define(&name, Some(binding.value.clone()), attrs)
+                .map_err(abrupt_value)?;
+            let g = Value::Obj(self.name_global().clone());
+            self.set_member_recv(&g, &name, binding.value, g.clone())
+                .map_err(abrupt_value)?;
+        }
+        Ok(())
+    }
+
+    fn run_program_body(&mut self, body: &[Stmt]) -> Result<Value, Value> {
         // Top-level `let`/`const` are pre-declared in their temporal dead zone.
         self.declare_block_lexicals(body, &self.global_env.clone(), false);
         let env = self.global_env.clone();
