@@ -107,8 +107,25 @@ fn main() {
     );
 
     let started = Instant::now();
+    let sweeping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sweeper = {
+        let sweeping = Arc::clone(&sweeping);
+        std::thread::spawn(move || {
+            let mut idle = 0;
+            while sweeping.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                idle += 1;
+                if idle % 25 == 0 {
+                    leaks::sweep(None, false);
+                }
+            }
+        })
+    };
     let mut results = run_all(&options, &test_dir, &tests, &skips);
     retry_expected_failures(&options, &test_dir, &tests, &expected, &mut results);
+    sweeping.store(false, Ordering::Relaxed);
+    let _ = sweeper.join();
+    leaks::sweep(None, true);
     let elapsed = started.elapsed();
 
     report(&options, &workspace, &tests, &results, &expected, elapsed);
@@ -328,11 +345,13 @@ fn run_test(options: &Options, test_dir: &Path, test: &TestCase, serial_id: usiz
         .env("NODE_TEST_KNOWN_GLOBALS", "0")
         .env("NO_COLOR", "1")
         .env("TEST_SERIAL_ID", serial_id.to_string())
+        .env(leaks::VAR, leaks::tag(serial_id))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     tree::isolate(&mut command);
 
+    leaks::begin(serial_id);
     let outcome = match command.spawn() {
         Ok(child) => {
             let tree = tree::ProcessTree::new(&child);
@@ -343,6 +362,10 @@ fn run_test(options: &Options, test_dir: &Path, test: &TestCase, serial_id: usiz
             output: format!("failed to spawn runtime: {e}"),
         },
     };
+    leaks::end(serial_id);
+    if matches!(outcome, Outcome::Timeout) {
+        leaks::sweep(Some(serial_id), false);
+    }
     let _ = std::fs::remove_dir_all(test_dir.join(format!(".tmp.{serial_id}")));
     outcome
 }
@@ -730,6 +753,75 @@ fn write_list(path: &Path, tests: &BTreeSet<String>) {
 fn die(message: &str) -> ! {
     eprintln!("node-compat-runner: {message}");
     std::process::exit(2);
+}
+
+/// Finds processes a test left behind after they left its process group (`detached` children,
+/// `setsid`): every test's environment carries `NODE_COMPAT_TAG=<runner pid>.<serial>`, which
+/// descendants inherit, so a process listing with environments identifies them.
+mod leaks {
+    use std::collections::HashSet;
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    pub const VAR: &str = "NODE_COMPAT_TAG";
+    static ACTIVE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+    pub fn tag(serial: usize) -> String {
+        format!("{}.{serial}", std::process::id())
+    }
+
+    pub fn begin(serial: usize) {
+        ACTIVE.lock().unwrap().get_or_insert_with(HashSet::new).insert(serial);
+    }
+
+    pub fn end(serial: usize) {
+        if let Some(set) = ACTIVE.lock().unwrap().as_mut() {
+            set.remove(&serial);
+        }
+    }
+
+    #[cfg(unix)]
+    fn listing() -> String {
+        #[cfg(target_os = "macos")]
+        let args = ["-axwwE", "-o", "pid=,command="];
+        #[cfg(not(target_os = "macos"))]
+        let args = ["axeww", "-o", "pid=,command="];
+        Command::new("ps")
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Kills every tagged process of this run whose test is no longer active (or, with `all`,
+    /// every tagged process, or with `only`, just that test's).
+    #[cfg(unix)]
+    pub fn sweep(only: Option<usize>, all: bool) {
+        extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        let needle = format!("{VAR}={}.", std::process::id());
+        let me = std::process::id() as i32;
+        let active = ACTIVE.lock().unwrap().clone().unwrap_or_default();
+        for line in listing().lines() {
+            let line = line.trim_start();
+            let Some((pid, rest)) = line.split_once(' ') else { continue };
+            let Ok(pid) = pid.parse::<i32>() else { continue };
+            let Some(at) = rest.find(&needle) else { continue };
+            let digits: String = rest[at + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let Ok(serial) = digits.parse::<usize>() else { continue };
+            let doomed = match only {
+                Some(only) => serial == only,
+                None => all || !active.contains(&serial),
+            };
+            if doomed && pid != me && pid > 1 {
+                unsafe { kill(pid, 9) };
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn sweep(_only: Option<usize>, _all: bool) {}
 }
 
 /// Kills a test's whole process tree, not just the direct child: a Job Object on Windows (closing
