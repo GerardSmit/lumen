@@ -1374,8 +1374,9 @@ class DiffieHellman extends DiffieHellmanBase {
     }
     let p;
     if (typeof sizeOrKey === "number") {
-      if (sizeOrKey < 2) {
-        throw opensslError("01800076", "bignum routines", "bits too small", "ERR_OSSL_BN_BITS_TOO_SMALL");
+      // OpenSSL 3 refuses to generate a prime below DH_MIN_MODULUS_BITS.
+      if (sizeOrKey < 512) {
+        throw opensslError("0280007E", "Diffie-Hellman routines", "modulus too small", "ERR_OSSL_DH_MODULUS_TOO_SMALL");
       }
       const small = g.length === 1 ? g[0] : 0;
       p = new Uint8Array(__rc.dhGenPrime(sizeOrKey, small));
@@ -10860,18 +10861,18 @@ __internals.set("cloneModule:internal/crypto",
                 (id, name) => (name === "keyObjectFromClone" ? keyObjectFromClone : require(id)[name]));
 
 // The WebCrypto globals, as accessors like Node's own that an assignment replaces.
-function lazyGlobal(name, get, enumerable = false) {
+function lazyGlobal(name, get) {
   return {
     __proto__: null,
     get,
     set(value) {
-      Object.defineProperty(globalThis, name, { __proto__: null, value, writable: true, enumerable, configurable: true });
+      Object.defineProperty(globalThis, name, { __proto__: null, value, writable: true, enumerable: false, configurable: true });
     },
-    enumerable,
+    enumerable: false,
     configurable: true,
   };
 }
-Object.defineProperty(globalThis, "crypto", lazyGlobal("crypto", () => require("internal/crypto/webcrypto").crypto, true));
+Object.defineProperty(globalThis, "crypto", lazyGlobal("crypto", () => require("internal/crypto/webcrypto").crypto));
 Object.defineProperty(globalThis, "Crypto", lazyGlobal("Crypto", () => require("internal/crypto/webcrypto").Crypto));
 Object.defineProperty(globalThis, "CryptoKey", lazyGlobal("CryptoKey", () => require("internal/crypto/webcrypto").CryptoKey));
 Object.defineProperty(globalThis, "SubtleCrypto", lazyGlobal("SubtleCrypto", () => require("internal/crypto/webcrypto").SubtleCrypto));

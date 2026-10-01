@@ -77,8 +77,9 @@ class DiffieHellman extends DiffieHellmanBase {
     }
     let p;
     if (typeof sizeOrKey === "number") {
-      if (sizeOrKey < 2) {
-        throw opensslError("01800076", "bignum routines", "bits too small", "ERR_OSSL_BN_BITS_TOO_SMALL");
+      // OpenSSL 3 refuses to generate a prime below DH_MIN_MODULUS_BITS.
+      if (sizeOrKey < 512) {
+        throw opensslError("0280007E", "Diffie-Hellman routines", "modulus too small", "ERR_OSSL_DH_MODULUS_TOO_SMALL");
       }
       const small = g.length === 1 ? g[0] : 0;
       p = new Uint8Array(__rc.dhGenPrime(sizeOrKey, small));
