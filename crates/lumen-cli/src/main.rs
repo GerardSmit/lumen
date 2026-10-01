@@ -170,6 +170,7 @@ fn real_main() {
     };
     let script_args: Vec<String> = match &file {
         Some(_) => opts.rest[1..].to_vec(),
+        None if opts.stdin_dash => std::iter::once("-".to_string()).chain(opts.rest.iter().cloned()).collect(),
         None => opts.rest.clone(),
     };
 
@@ -562,6 +563,10 @@ fn eval_global(runtime: &mut Runtime, code: &str, name: &str, print: bool) {
         name = js_string_literal(name)
     );
     let _ = runtime.eval(&setup);
+    let base = std::env::current_dir()
+        .map(|dir| dir.join(name).to_string_lossy().into_owned())
+        .unwrap_or_else(|_| name.to_string());
+    runtime.install_module_loader(&base, true);
     if print {
         // Node's -p: the script's completion value is console.log'd at process exit.
         let wrapped = format!(

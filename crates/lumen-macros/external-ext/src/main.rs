@@ -91,8 +91,8 @@ fn main() {
     check(&mut e, "const q = new Uint8Array(8); return ext.copy_into(q.subarray(0, 4), q.subarray(3))",
         "THROW TypeError: copy_into: argument 2 (src) overlaps argument 1 (dst) in the same buffer; a mutable byte slice cannot alias");
     check(&mut e, "const s = new SharedArrayBuffer(4); new Uint8Array(s).fill(2); return ext.sum(new Uint8Array(s))", "8");
-    check(&mut e, "return ext.copy_into(new Uint8Array(new SharedArrayBuffer(4)), new Uint8Array(1))",
-        "THROW TypeError: copy_into: argument 1 (dst) must not be a SharedArrayBuffer view (&mut [u8])");
+    check(&mut e, "const d = new Uint8Array(new SharedArrayBuffer(4)); return ext.copy_into(d, new Uint8Array([5])) + ':' + d.join()",
+        "1:5,0,0,0");
     check(&mut e,
         "const d = new Uint8Array(4); const seen = ext.fill_with_callback(d, () => d.length); return seen + ':' + d.length + ':' + d.join()",
         "0:4:7,7,7,7");

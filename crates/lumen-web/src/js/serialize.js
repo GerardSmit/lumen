@@ -117,7 +117,8 @@ function serializeForClone(value, transfer = [], transport = false) {
     if (t === "string") { u8(T_STRING); return str(v); }
     if (t === "bigint") { u8(T_BIGINT); return str(v.toString()); }
     if (t === "function" || t === "symbol") {
-      throw new DOMException("value could not be cloned", "DataCloneError");
+      const shown = t === "function" ? Function.prototype.toString.call(v) : String(v);
+      throw new DOMException(`${shown} could not be cloned.`, "DataCloneError");
     }
     if (ports?.isUncloneable(v)) throw new DOMException("Object marked uncloneable", "DataCloneError");
     // Objects: a repeat emits a back-ref.
