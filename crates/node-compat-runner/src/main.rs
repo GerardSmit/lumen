@@ -337,7 +337,7 @@ fn run_test(options: &Options, test_dir: &Path, test: &TestCase, serial_id: usiz
     let flags = parse_flags(&source);
 
     let mut command = Command::new(&options.lumen);
-    command.args(flags.iter().filter(|f| forwarded_flag(f)));
+    command.args(forwarded_flags(&flags));
     command
         .arg(&path)
         .current_dir(test_dir.parent().unwrap_or(test_dir))
@@ -489,6 +489,58 @@ fn parse_flags(source: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+const NODE_OPTIONS_TABLE: &str = include_str!("../../lumen-cli/src/node_options.txt");
+
+/// The flags (with a separate value operand where the option takes one) lumen-cli will honor.
+fn forwarded_flags(flags: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = flags.iter().peekable();
+    while let Some(flag) = iter.next() {
+        if !forwarded_flag(flag) {
+            continue;
+        }
+        out.push(flag.clone());
+        if !flag.contains('=') && option_takes_value(flag) {
+            if let Some(value) = iter.next() {
+                out.push(value.clone());
+            }
+        }
+    }
+    out
+}
+
+fn option_entry(flag: &str) -> Option<(&'static str, bool)> {
+    let name = flag.split('=').next().unwrap_or(flag);
+    let bare = name.strip_prefix("--no-").map(|n| format!("--{n}"));
+    NODE_OPTIONS_TABLE.lines().find_map(|line| {
+        let mut fields = line.split(' ');
+        let entry = fields.next()?;
+        if entry != name && bare.as_deref() != Some(entry) {
+            return None;
+        }
+        let takes_value = fields.next()? == "v";
+        fields.next()?;
+        let source = if fields.next() == Some("v8") { "v8" } else { "node" };
+        Some((source, takes_value))
+    })
+}
+
+fn option_takes_value(flag: &str) -> bool {
+    option_entry(flag).is_some_and(|(_, value)| value)
+}
+
+fn node_table_flag(flag: &str) -> bool {
+    const SKIPPED: &[&str] = &[
+        "--check", "--eval", "--print", "--interactive", "--help", "--version", "--test", "--watch",
+        "--watch-path", "--build-snapshot", "--prof", "--prof-process", "--cpu-prof", "--heap-prof",
+    ];
+    let name = flag.split('=').next().unwrap_or(flag);
+    if name.starts_with("--inspect") || SKIPPED.contains(&name) {
+        return false;
+    }
+    option_entry(flag).is_some_and(|(source, _)| source == "node")
+}
+
 /// Flags lumen-cli accepts. Anything else is dropped, like Deno's runner does, rather than
 /// failing the run on a V8 or Node knob lumen has no equivalent for.
 fn forwarded_flag(flag: &str) -> bool {
@@ -517,7 +569,9 @@ fn forwarded_flag(flag: &str) -> bool {
             | "--enable-network-family-autoselection"
             | "--allow-natives-syntax"
             | "--allow_natives_syntax"
-    ) || flag.starts_with("--experimental-")
+    ) || node_table_flag(flag)
+        || flag.starts_with("--max-old-space-size")
+        || flag.starts_with("--experimental-")
         || flag.starts_with("--dns-result-order")
         || flag.starts_with("--max-http-header-size")
         || flag.starts_with("--network-family-autoselection-attempt-timeout")
