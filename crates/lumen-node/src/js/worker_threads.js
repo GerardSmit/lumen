@@ -1,29 +1,32 @@
 // node:worker_threads — REAL workers: one OS thread + one fresh engine realm per Worker, over the
-// runtime's __worker/__wself ops (lumen-runtime/src/worker.rs). Messages cross the thread boundary
-// as structured-clone wire bytes (__serializeForClone, lumen-web/src/js/serialize.js).
+// runtime's __worker/__wself ops (lumen-runtime/src/worker.rs). Messages cross thread boundaries
+// as structured-clone wire bytes (__serializeForClone, lumen-web/src/js/serialize.js) through the
+// native MessagePort endpoints (lumen-runtime/src/ports.rs), which also carry transferred ports.
 //
-// Real: new Worker(filename | URL | source-with-{eval:true}) with workerData/argv/env options,
-// postMessage both ways, 'online'/'message'/'messageerror'/'error'/'exit', terminate() (resolves
-// with the exit code), worker.ref()/unref(), threadId, parentPort (postMessage/'message'/ref/
-// unref/close with Node's keep-alive-while-listening semantics), isMainThread, workerData,
-// get/setEnvironmentData (snapshot inherited by new workers), receiveMessageOnPort, and the
-// native transferable MessageChannel/MessagePort pair and shared ArrayBuffer backing. process.exit(code) in a worker stops only that
-// worker; an uncaught exception emits 'error' on the parent and exits the worker with code 1.
+// Each Worker is wired like Node's: a public channel (worker 'message' <-> parentPort) and an
+// internal one carrying the worker's stdio, its uncaught errors and its stdin. The worker's
+// process.stdout/stderr are streams over that channel, piped to the parent's process streams
+// unless the stdout/stderr options ask for them as worker.stdout/stderr.
 //
 // Honest throws (semantics lumen cannot honor): SHARE_ENV (realms snapshot the env; there is no
-// shared store), unsupported transfer types/resizable buffers, stdin/stdout/stderr capture options (workers share the process stdio),
-// moveMessagePortToContext, postMessageToThread. BroadcastChannel is the same-realm web one.
+// shared store), unsupported transfer types/resizable buffers, moving a port into another vm
+// context, postMessageToThread.
 {
   const EventEmitter = __builtins.get("events");
   const pathMod = __builtins.get("path");
+  const inspectCustom = Symbol.for("nodejs.util.inspect.custom");
+  const kUntransferable = Symbol.for("nodejs.untransferable");
+  const lazyUtil = () => __builtins.get("util");
+  const lazyStream = () => __builtins.get("stream");
 
   const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
   const environmentData = new Map();
-  const untransferable = new WeakSet();
   const uncloneable = new WeakSet();
 
+  const nodeError = (Base, code, message) => __nodeError(Base, code, message);
   const ser = (v, transfer) => globalThis.__serializeForClone(v, transfer, true);
   const deser = (b) => globalThis.__deserializeClone(b);
+  const ops = () => globalThis.__lumenPorts;
 
   // The runtime's worker extension installs after this glue and stashes its ops in a hidden
   // global (see WORKER_JS in lumen-runtime/src/worker.rs); grab them lazily on first use.
@@ -36,384 +39,1399 @@
     return workerOps;
   }
 
-  // Worker-side uncaught errors travel as "Name: message" text; rebuild a matching Error here.
-  function reviveError(text) {
-    const m = /^([A-Za-z][A-Za-z0-9_$]*(?:Error|Exception)): ([\s\S]*)$/.exec(String(text));
-    const Ctor = m && typeof globalThis[m[1]] === "function" ? globalThis[m[1]] : Error;
-    return m ? new Ctor(m[2]) : new Error(String(text));
+  // ---- MessagePort ------------------------------------------------------------------------------
+  // A NodeEventTarget: one listener list per type holds both DOM listeners (called with the
+  // event) and Node-style ones (called with the event's value: a message's data, an emit's
+  // argument). A listener that throws is an uncaught exception, as in Node.
+
+  const ET = EventTarget.prototype;
+  const nodeStyle = new WeakMap(); // registered wrapper -> the user's listener
+  const onceRemoved = new WeakMap(); // `once` listener -> the target's listener-removed hook
+  const portState = new WeakMap();
+  let receivedPorts = null; // ports created by the deserialization running now
+
+  function listenerList(target, type) {
+    return target._listeners.get(String(type));
+  }
+  function rethrowAsync(error) {
+    process.nextTick(() => {
+      throw error;
+    });
+  }
+  function hybridDispatch(target, type, nodeValue, makeEvent) {
+    const list = listenerList(target, type);
+    if (!list || list.length === 0) return false;
+    let event;
+    for (const entry of [...list]) {
+      if (entry.removed) continue;
+      if (entry.once) {
+        ET.removeEventListener.call(target, type, entry.callback, { capture: entry.capture });
+        onceRemoved.get(entry.callback)?.(target, String(type));
+      }
+      const original = nodeStyle.get(entry.callback);
+      try {
+        if (original !== undefined) {
+          Reflect.apply(original, target, [nodeValue]);
+        } else {
+          if (event === undefined) {
+            event = makeEvent();
+            try {
+              event.target = target;
+              event.currentTarget = target;
+            } catch {}
+          }
+          if (typeof entry.callback === "function") Reflect.apply(entry.callback, target, [event]);
+          else entry.callback.handleEvent(event);
+        }
+      } catch (error) {
+        rethrowAsync(error);
+      }
+      if (event !== undefined && event._immediateStopped) break;
+    }
+    if (event !== undefined) {
+      try {
+        event.currentTarget = null;
+      } catch {}
+    }
+    return true;
+  }
+  function validateListener(fn) {
+    if (typeof fn !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("listener", "Function", fn);
+  }
+  function makeNodeTargetMethods(proto, onAdd, onRemove) {
+    const addNode = function (type, listener, once) {
+      validateListener(listener);
+      const wrapper = function () {};
+      nodeStyle.set(wrapper, listener);
+      ET.addEventListener.call(this, type, wrapper, { once });
+      if (once) onceRemoved.set(wrapper, onRemove);
+      onAdd(this, String(type));
+      return this;
+    };
+    const removeNode = function (type, listener) {
+      const list = listenerList(this, type);
+      if (!list) return this;
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (nodeStyle.get(list[i].callback) === listener) {
+          ET.removeEventListener.call(this, type, list[i].callback, { capture: list[i].capture });
+          onRemove(this, String(type));
+          break;
+        }
+      }
+      return this;
+    };
+    const methods = {
+      addEventListener(type, callback, options) {
+        Reflect.apply(ET.addEventListener, this, arguments);
+        if (callback != null) onAdd(this, String(type));
+      },
+      removeEventListener(type, callback, options) {
+        Reflect.apply(ET.removeEventListener, this, arguments);
+        onRemove(this, String(type));
+      },
+      dispatchEvent(event) {
+        if (!(event instanceof Event)) throw new __errors.ERR_INVALID_ARG_TYPE("event", "Event", event);
+        hybridDispatch(this, event.type, event, () => event);
+        return !event.defaultPrevented;
+      },
+      on(type, listener) { return addNode.call(this, type, listener, false); },
+      addListener(type, listener) { return addNode.call(this, type, listener, false); },
+      once(type, listener) { return addNode.call(this, type, listener, true); },
+      off(type, listener) { return removeNode.call(this, type, listener); },
+      removeListener(type, listener) { return removeNode.call(this, type, listener); },
+      emit(type, arg) {
+        return hybridDispatch(this, type, arg, () => {
+          const event = new Event(type);
+          event.detail = arg;
+          return event;
+        });
+      },
+      removeAllListeners(type) {
+        const types = type === undefined ? [...this._listeners.keys()] : [String(type)];
+        for (const t of types) {
+          const list = this._listeners.get(t);
+          if (!list) continue;
+          for (const entry of [...list]) ET.removeEventListener.call(this, t, entry.callback, { capture: entry.capture });
+          onRemove(this, t);
+        }
+        return this;
+      },
+      listenerCount(type) {
+        return listenerList(this, type)?.length ?? 0;
+      },
+      listeners(type) {
+        return (listenerList(this, type) ?? []).map((e) => nodeStyle.get(e.callback) ?? e.callback);
+      },
+      eventNames() {
+        return [...this._listeners].filter(([, list]) => list.length > 0).map(([t]) => t);
+      },
+      setMaxListeners(n) {
+        portStateOf(this).maxListeners = n;
+        return this;
+      },
+      getMaxListeners() {
+        return portStateOf(this).maxListeners ?? EventEmitter.defaultMaxListeners;
+      },
+    };
+    for (const name of Object.keys(methods)) {
+      Object.defineProperty(proto, name, { value: methods[name], writable: true, configurable: true, enumerable: false });
+    }
+  }
+  // `onmessage`-style attributes: a real listener, so it orders with addEventListener ones.
+  function defineEventHandler(proto, name) {
+    const handlers = new WeakMap();
+    Object.defineProperty(proto, `on${name}`, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return handlers.get(this)?.fn ?? null;
+      },
+      set(fn) {
+        const old = handlers.get(this);
+        if (old) {
+          handlers.delete(this);
+          this.removeEventListener(name, old.wrapped);
+        }
+        if (typeof fn === "function" || (fn !== null && typeof fn === "object")) {
+          const self = this;
+          const wrapped = function (event) {
+            return typeof fn === "function" ? Reflect.apply(fn, self, [event]) : undefined;
+          };
+          handlers.set(this, { fn, wrapped });
+          this.addEventListener(name, wrapped);
+        }
+      },
+    });
   }
 
+  function portStateOf(port) {
+    const state = portState.get(port);
+    if (state === undefined) throw new __errors.ERR_INVALID_THIS("MessagePort");
+    return state;
+  }
+
+  const MessagePortMethods = class MessagePort extends EventTarget {
+    postMessage(message, transfer) {
+      const state = portStateOf(this);
+      if (arguments.length === 0) {
+        throw nodeError(TypeError, "ERR_MISSING_ARGS", "Not enough arguments to MessagePort.postMessage");
+      }
+      const list = readTransferList(transfer);
+      if (list.includes(this)) throw new DOMException("Transfer list contains source port", "DataCloneError");
+      if (state.destroyed || state.detached) {
+        // Nothing reaches a closed port, but the message is still serialized (and its transfer
+        // list detached), like Node.
+        ser(message, list);
+        return;
+      }
+      const result = ops().post(state.id, ser(message, list));
+      if (result === "lost") {
+        process.emitWarning("The target port was posted to itself, and the communication channel was lost");
+      }
+    }
+    start() {
+      const state = portStateOf(this);
+      if (state.destroyed || state.started) return;
+      state.started = true;
+      ops().wake(state.id);
+    }
+    close(callback) {
+      const state = portStateOf(this);
+      if (typeof callback === "function") this.once("close", callback);
+      if (state.destroyed || state.closing || state.detached) return;
+      state.closingLocal = true;
+      ops().close(state.id);
+    }
+    ref() {
+      const state = portStateOf(this);
+      if (state.destroyed || state.closing) return this;
+      state.refed = true;
+      ops().setRef(state.id, true);
+      return this;
+    }
+    unref() {
+      const state = portStateOf(this);
+      if (state.destroyed) return this;
+      state.refed = false;
+      ops().setRef(state.id, false);
+      return this;
+    }
+    hasRef() {
+      const state = portStateOf(this);
+      return !state.destroyed && !state.closing && !state.closingLocal && state.refed;
+    }
+    [inspectCustom](depth, options) {
+      const state = portState.get(this);
+      if (state === undefined) return this;
+      const shown = state.destroyed ? { active: false } : { active: true, refed: this.hasRef() };
+      for (const key of Object.keys(this)) shown[key] = this[key];
+      if (depth < 0) return this.constructor.name;
+      const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+      return `${this.constructor.name} [EventTarget] ${lazyUtil().inspect(shown, opts)}`;
+    }
+  }
+  function messagePortListenerAdded(port, type) {
+    if (type !== "message") return;
+    const state = portState.get(port);
+    if (state === undefined || state.destroyed) return;
+    if (port.listenerCount("message") === 1) {
+      port.ref();
+      port.start();
+    }
+  }
+  function messagePortListenerRemoved(port, type) {
+    if (type !== "message") return;
+    const state = portState.get(port);
+    if (state === undefined || state.destroyed) return;
+    if (port.listenerCount("message") === 0) port.unref();
+  }
+  // Node: MessagePort.prototype -> NodeEventTarget.prototype -> EventTarget.prototype, and the
+  // constructor is not callable at all (instances come from MessageChannel or a transfer).
+  const nodeEventTargetProto = Object.create(EventTarget.prototype);
+  makeNodeTargetMethods(nodeEventTargetProto, messagePortListenerAdded, messagePortListenerRemoved);
+  function MessagePort() {
+    throw nodeError(TypeError, "ERR_CONSTRUCT_CALL_INVALID", "Constructor cannot be called");
+  }
+  Object.setPrototypeOf(MessagePort, EventTarget);
+  Object.setPrototypeOf(MessagePortMethods.prototype, nodeEventTargetProto);
+  Object.defineProperty(MessagePortMethods.prototype, "constructor", { value: MessagePort, writable: true, configurable: true });
+  MessagePort.prototype = MessagePortMethods.prototype;
+  defineEventHandler(MessagePort.prototype, "message");
+  defineEventHandler(MessagePort.prototype, "messageerror");
+
+  function readIterable(value) {
+    if (Array.isArray(value)) return [...value];
+    const method = value[Symbol.iterator];
+    if (typeof method !== "function") return null;
+    const iterator = Reflect.apply(method, value, []);
+    if (iterator === null || (typeof iterator !== "object" && typeof iterator !== "function")) return null;
+    const next = iterator.next;
+    if (typeof next !== "function") return null;
+    const out = [];
+    for (;;) {
+      const result = Reflect.apply(next, iterator, []);
+      if (result === null || (typeof result !== "object" && typeof result !== "function")) return null;
+      if (result.done) break;
+      out.push(result.value);
+    }
+    return out;
+  }
+  // postMessage's second argument: a transfer list (any iterable) or `{ transfer }`.
+  function readTransferList(arg) {
+    if (arg === undefined || arg === null) return [];
+    if (typeof arg !== "object" && typeof arg !== "function") {
+      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", "Optional transferList argument must be an iterable");
+    }
+    const list = readIterable(arg);
+    if (list !== null) return list;
+    const transfer = arg.transfer;
+    if (transfer === undefined) return [];
+    const fromOption = transfer !== null && (typeof transfer === "object" || typeof transfer === "function")
+      ? readIterable(transfer) : null;
+    if (fromOption === null) {
+      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", "Optional options.transfer argument must be an iterable");
+    }
+    return fromOption;
+  }
+
+  // One wake per message: each delivery is its own macrotask, so microtasks queued by a
+  // listener run before the next message is dispatched.
+  function onPortWake(port) {
+    const state = portState.get(port);
+    if (state === undefined || state.destroyed) return;
+    if (state.broadcast) {
+      drainBroadcastPorts();
+      return;
+    }
+    if (!state.started) {
+      if (state.closingLocal || ops().peek(state.id) < 0) closeFromWake(port, state);
+      return;
+    }
+    const bytes = ops().poll(state.id);
+    if (bytes === false) {
+      closeFromWake(port, state);
+      return;
+    }
+    if (bytes === undefined) return;
+    ops().wake(state.id);
+    deliver(port, bytes);
+  }
+  // The side that called close() sees its 'close' first; the peer's follows a turn later.
+  function closeFromWake(port, state) {
+    if (!state.closingLocal && !state.closeDeferred) {
+      state.closeDeferred = true;
+      ops().wake(state.id);
+      return;
+    }
+    finishClose(port);
+  }
+  // Like Node's (libuv async handles), every BroadcastChannel with mail is drained in turn, in
+  // creation order.
+  const broadcastPorts = new Set();
+  function drainBroadcastPorts() {
+    for (const port of [...broadcastPorts]) {
+      const state = portState.get(port);
+      while (!state.destroyed) {
+        const bytes = ops().poll(state.id);
+        if (bytes === undefined) break;
+        if (bytes === false) {
+          broadcastPorts.delete(port);
+          finishClose(port);
+          break;
+        }
+        deliver(port, bytes);
+      }
+    }
+  }
+  function decodeMessage(bytes) {
+    const outer = receivedPorts;
+    receivedPorts = [];
+    try {
+      return { data: deser(bytes), ports: receivedPorts };
+    } finally {
+      receivedPorts = outer;
+    }
+  }
+  function deliver(port, bytes) {
+    let decoded;
+    try {
+      decoded = decodeMessage(bytes);
+    } catch (error) {
+      hybridDispatch(port, "messageerror", error, () => new MessageEvent("messageerror", { data: error }));
+      return;
+    }
+    const { data, ports } = decoded;
+    hybridDispatch(port, "message", data, () => new MessageEvent("message", { data, ports }));
+  }
+  function finishClose(port) {
+    const state = portState.get(port);
+    if (state === undefined || state.destroyed || state.closing) return;
+    state.closing = true;
+    try {
+      port.emit("close");
+    } finally {
+      state.destroyed = true;
+      ops().detach(state.id);
+      __destroyAsyncResource(port);
+    }
+  }
+  // Drain whatever is queued right now, synchronously (a Worker's exit, receiveMessageOnPort).
+  function drainPort(port) {
+    const state = portState.get(port);
+    if (state === undefined || state.destroyed) return;
+    for (;;) {
+      const bytes = ops().poll(state.id);
+      if (bytes === undefined || bytes === false) return;
+      deliver(port, bytes);
+    }
+  }
+
+  function createPort(id, hooks = true) {
+    const port = Reflect.construct(EventTarget, [], MessagePort);
+    Object.defineProperty(port, "_listeners", { value: port._listeners, writable: true, configurable: true, enumerable: false });
+    portState.set(port, {
+      id, refed: false, started: false, closing: false, closingLocal: false, destroyed: false, detached: false,
+    });
+    ops().listen(id, () => onPortWake(port));
+    if (hooks && __asyncTracking) __initAsyncResource(port, "MESSAGEPORT");
+    return port;
+  }
+
+  function MessageChannel() {
+    if (!new.target) {
+      throw nodeError(TypeError, "ERR_CONSTRUCT_CALL_REQUIRED", "Class constructor MessageChannel cannot be invoked without 'new'");
+    }
+    const pair = ops().pair();
+    this.port1 = createPort(pair.a);
+    this.port2 = createPort(pair.b);
+  }
+  Object.defineProperty(MessageChannel, "name", { value: "MessageChannel" });
+
+  function isMessagePort(value) {
+    return value !== null && typeof value === "object" && portState.has(value);
+  }
+
+  function receiveMessageOnPort(port) {
+    const target = port?.[kBroadcastPort] ?? port;
+    if (!isMessagePort(target)) {
+      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "port" argument must be a MessagePort instance');
+    }
+    const state = portState.get(target);
+    if (state.destroyed || state.detached) return undefined;
+    const bytes = ops().poll(state.id);
+    if (bytes === false) {
+      finishClose(target);
+      return undefined;
+    }
+    if (bytes === undefined) return undefined;
+    return { message: decodeMessage(bytes).data };
+  }
+
+  function moveMessagePortToContext(port, contextifiedSandbox) {
+    if (!isMessagePort(port)) {
+      throw new __errors.ERR_INVALID_ARG_TYPE("port", "MessagePort", port);
+    }
+    const state = portState.get(port);
+    if (state.destroyed || state.closing || state.closingLocal || state.detached) {
+      throw nodeError(Error, "ERR_CLOSED_MESSAGE_PORT", "Cannot send data on closed MessagePort");
+    }
+    throw new Error("worker_threads moveMessagePortToContext is not supported in lumen");
+  }
+
+  // The serializer's view of ports (lumen-web serialize.js).
+  Object.defineProperty(globalThis, "__lumenPortClone", {
+    value: {
+      isPort: isMessagePort,
+      isUntransferable: (value) => value !== null && typeof value === "object" && value[kUntransferable] === true,
+      isUncloneable: (value) => uncloneable.has(value),
+      validate(port) {
+        const state = portState.get(port);
+        if (state.destroyed || state.closing || state.closingLocal || state.detached || ops().isClosed(state.id)) {
+          throw new DOMException("MessagePort in transfer list is already detached", "DataCloneError");
+        }
+      },
+      export(port) {
+        return ops().export(portState.get(port).id);
+      },
+      detach(port) {
+        const state = portState.get(port);
+        state.detached = true;
+        state.closing = true;
+        ops().detach(state.id);
+        process.nextTick(() => {
+          try {
+            port.emit("close");
+          } finally {
+            state.destroyed = true;
+            __destroyAsyncResource(port);
+          }
+        });
+      },
+      import(index) {
+        const port = createPort(ops().import(index));
+        if (receivedPorts !== null) receivedPorts.push(port);
+        return port;
+      },
+    },
+    configurable: true,
+  });
+
+  // ---- BroadcastChannel ---------------------------------------------------------------------------
+  // Every same-name channel in the process (any thread) receives a copy, except the sender.
+
+  const kBroadcastPort = Symbol("kHandle");
+  const broadcastState = new WeakMap();
+  function broadcastStateOf(bc) {
+    const state = broadcastState.get(bc);
+    if (state === undefined) throw new __errors.ERR_INVALID_THIS("BroadcastChannel");
+    return state;
+  }
+  class BroadcastChannel extends EventTarget {
+    constructor(name) {
+      if (arguments.length === 0) throw new __errors.ERR_MISSING_ARGS("name");
+      super();
+      Object.defineProperty(this, "_listeners", { value: this._listeners, writable: true, configurable: true, enumerable: false });
+      const state = { name: `${name}`, port: null, refed: true };
+      broadcastState.set(this, state);
+      const port = createPort(ops().broadcast(state.name), false);
+      portState.get(port).broadcast = true;
+      broadcastPorts.add(port);
+      state.port = port;
+      Object.defineProperty(this, kBroadcastPort, { value: port, configurable: true });
+      const self = this;
+      port.on("message", (data) => {
+        if (state.port === null) return;
+        hybridDispatch(self, "message", data, () => new MessageEvent("message", { data }));
+      });
+      port.on("messageerror", (error) => {
+        if (state.port === null) return;
+        hybridDispatch(self, "messageerror", error, () => new MessageEvent("messageerror", { data: error }));
+      });
+      port.ref();
+    }
+    get name() {
+      return broadcastStateOf(this).name;
+    }
+    close() {
+      const state = broadcastStateOf(this);
+      if (state.port === null) return;
+      const port = state.port;
+      state.port = null;
+      port.close();
+    }
+    postMessage(message) {
+      const state = broadcastStateOf(this);
+      if (arguments.length === 0) throw new __errors.ERR_MISSING_ARGS("message");
+      if (state.port === null) throw new DOMException("BroadcastChannel is closed.", "InvalidStateError");
+      ops().post(portState.get(state.port).id, ser(message, []));
+    }
+    ref() {
+      const state = broadcastStateOf(this);
+      state.port?.ref();
+      return this;
+    }
+    unref() {
+      const state = broadcastStateOf(this);
+      state.port?.unref();
+      return this;
+    }
+    [inspectCustom](depth, options) {
+      const state = broadcastStateOf(this);
+      if (depth < 0) return "BroadcastChannel";
+      const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+      return `BroadcastChannel ${lazyUtil().inspect({ name: state.name, active: state.port !== null }, opts)}`;
+    }
+  }
+  makeNodeTargetMethods(BroadcastChannel.prototype, () => {}, () => {});
+  for (const name of ["on", "addListener", "once", "off", "removeListener", "emit", "removeAllListeners",
+    "listenerCount", "listeners", "eventNames", "setMaxListeners", "getMaxListeners"]) {
+    delete BroadcastChannel.prototype[name];
+  }
+  defineEventHandler(BroadcastChannel.prototype, "message");
+  defineEventHandler(BroadcastChannel.prototype, "messageerror");
+
+  // ---- errors across threads ----------------------------------------------------------------------
+  // Node's internal/error_serdes: an Error travels as its constructor name plus every property
+  // (own and inherited, getters resolved, functions skipped), so the parent rebuilds an Error
+  // of the same class with the same name/message/stack/code/...; anything else as its clone.
+
+  const ERROR_CTORS = ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError"];
+  function errorProperties(object, target, depth = 0) {
+    const all = {};
+    if (object === null || object === Object.prototype || depth > 32) return all;
+    Object.assign(all, errorProperties(Object.getPrototypeOf(object), target, depth + 1));
+    for (const key of Object.getOwnPropertyNames(object)) {
+      if (key === "constructor" || key === "__proto__") continue;
+      let desc;
+      try {
+        desc = Object.getOwnPropertyDescriptor(object, key);
+      } catch {
+        continue;
+      }
+      let value = desc.value;
+      if (desc.get) {
+        try {
+          value = Reflect.apply(desc.get, target, []);
+        } catch {
+          continue;
+        }
+      } else if (!("value" in desc)) {
+        continue;
+      }
+      if (typeof value === "function" || typeof value === "symbol") continue;
+      if (key === "cause") value = { [kSerializedCause]: serializeError(value) };
+      all[key] = { value, enumerable: !!desc.enumerable };
+    }
+    return all;
+  }
+  const kSerializedCause = "\u0000lumen.cause";
+  function serializeError(error) {
+    try {
+      if (error !== null && typeof error === "object" && Object.prototype.toString.call(error) === "[object Error]") {
+        for (let proto = Object.getPrototypeOf(error); proto !== null; proto = Object.getPrototypeOf(proto)) {
+          const ctor = Object.prototype.hasOwnProperty.call(proto, "constructor") ? proto.constructor : undefined;
+          const name = typeof ctor === "function" ? ctor.name : undefined;
+          if (ERROR_CTORS.includes(name)) {
+            return { kind: "error", bytes: ser({ constructor: name, properties: errorProperties(error, error) }) };
+          }
+        }
+      }
+    } catch {}
+    try {
+      return { kind: "value", bytes: ser(error) };
+    } catch {}
+    let text;
+    try {
+      text = lazyUtil().inspect(error);
+    } catch {
+      text = "[unserializable error]";
+    }
+    return { kind: "inspected", text };
+  }
+  function deserializeError(serialized) {
+    if (serialized.kind === "inspected") return serialized.text;
+    const value = deser(serialized.bytes);
+    if (serialized.kind !== "error") return value;
+    const Ctor = globalThis[value.constructor] ?? Error;
+    const error = Object.create(Ctor.prototype);
+    for (const key of Object.keys(value.properties)) {
+      const { value: v, enumerable } = value.properties[key];
+      const restored = v !== null && typeof v === "object" && kSerializedCause in v ? deserializeError(v[kSerializedCause]) : v;
+      Object.defineProperty(error, key, { value: restored, enumerable, writable: true, configurable: true });
+    }
+    return error;
+  }
+
+  // ---- Worker (parent side) -----------------------------------------------------------------------
+
+  const kResourceLimitKeys = ["maxYoungGenerationSizeMb", "maxOldGenerationSizeMb", "codeRangeSizeMb", "stackSizeMb"];
+  function parseResourceLimits(limits) {
+    const out = {};
+    if (limits === undefined || limits === null || typeof limits !== "object") return out;
+    for (const key of kResourceLimitKeys) {
+      const v = limits[key];
+      if (typeof v === "number" && v > 0) out[key] = v;
+    }
+    return out;
+  }
+
+  // Node's worker execArgv/NODE_OPTIONS check: per-process options are not allowed in a worker.
+  const kPerProcessOptions = new Set([
+    "--title", "--v8-options", "--version", "-v", "--help", "-h", "--icu-data-dir", "--openssl-config",
+    "--tls-cipher-list", "--use-openssl-ca", "--use-bundled-ca", "--enable-fips", "--force-fips",
+    "--secure-heap", "--secure-heap-min", "--disable-proto", "--build-snapshot", "--snapshot-blob",
+    "--abort-on-uncaught-exception", "--max-old-space-size", "--max-semi-space-size", "--stack-size",
+    "--perf-basic-prof", "--perf-prof", "--interpreted-frames-native-stack", "--prof",
+    "--report-on-signal", "--report-signal", "--v8-pool-size", "--zero-fill-buffers", "--debug-arraybuffer-allocations",
+  ]);
+  const kOptionsWithValue = new Set([
+    "--require", "-r", "--import", "--loader", "--experimental-loader", "--input-type", "--conditions", "-C",
+    "--redirect-warnings", "--unhandled-rejections", "--trace-event-categories", "--trace-event-file-pattern",
+    "--diagnostic-dir", "--heapsnapshot-signal", "--dns-result-order", "--es-module-specifier-resolution",
+    "--experimental-specifier-resolution", "--inspect-publish-uid", "--max-http-header-size", "--stack-trace-limit",
+    "--secure-heap", "--title", "--report-dir", "--report-directory", "--report-filename", "--env-file",
+    "--disable-warning", "--watch-path", "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
+    "--experimental-policy", "--policy-integrity", "--heap-prof-dir", "--heap-prof-name", "--cpu-prof-dir",
+    "--cpu-prof-name", "--icu-data-dir", "--openssl-config", "--tls-cipher-list",
+  ]);
+  const kKnownFlag = /^--(?:no-)?(?:experimental-[a-z0-9-]+|trace-[a-z0-9-]+|expose[-_][a-z0-9_-]+|harmony[a-z0-9_-]*|allow-[a-z0-9-]+|frozen-intrinsics|pending-deprecation|no-deprecation|throw-deprecation|trace-deprecation|no-warnings|warnings|preserve-symlinks(?:-main)?|insecure-http-parser|enable-source-maps|abort-on-uncaught-exception|addons|global-search-paths|force-context-aware|deprecation|verify-base-objects|report-[a-z-]+|inspect(?:-brk)?(?:=.*)?|debug-port|max-http-header-size|use-largepages|node-memory-debug|heapsnapshot-near-heap-limit|force-async-hooks-checks|async-context-frame|extra-info-on-fatal-exception|network-family-autoselection|test|test-only|watch|permission|stack-trace-limit|zero-fill-buffers|jitless|expose-internals|gc-interval|max-lazy|lazy|opt|no-opt|sparkplug|always-sparkplug|predictable|random-seed|single-threaded|allow-natives-syntax|interrupt-budget|cpu-prof|heap-prof)(?:=.*)?$/;
+  function invalidExecArgv(argv) {
+    const bad = [];
+    for (let i = 0; i < argv.length; i++) {
+      const arg = String(argv[i]);
+      if (!arg.startsWith("-") || arg === "-" || arg === "--") continue;
+      const eq = arg.indexOf("=");
+      const name = (eq === -1 ? arg : arg.slice(0, eq)).replace(/_/g, "-");
+      if (kPerProcessOptions.has(name)) {
+        bad.push(arg);
+      } else if (kOptionsWithValue.has(name)) {
+        if (eq === -1) {
+          if (i + 1 >= argv.length) bad.push(arg);
+          else i++;
+        }
+      } else if (!kKnownFlag.test(arg.replace(/_/g, "-"))) {
+        bad.push(arg);
+      }
+    }
+    return bad;
+  }
+  function splitNodeOptions(text) {
+    const out = [];
+    const re = /"((?:\\.|[^"\\])*)"|(\S+)/g;
+    let m;
+    while ((m = re.exec(text)) !== null) out.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, "$1") : m[2]);
+    return out;
+  }
+
+  // Node caches a worker's cwd and re-reads it when the main thread's chdir() bumps this
+  // counter (shared with every worker).
+  let cwdCounter = null;
+  function sharedCwdCounter() {
+    if (cwdCounter !== null) return cwdCounter;
+    cwdCounter = new Int32Array(new SharedArrayBuffer(4));
+    if (wt.isMainThread) {
+      const chdir = process.chdir;
+      process.chdir = function chdir_(directory) {
+        const result = Reflect.apply(chdir, this, arguments);
+        Atomics.add(cwdCounter, 0, 1);
+        return result;
+      };
+    }
+    return cwdCounter;
+  }
+
+  const workerState = new WeakMap();
   let terminateCallbackWarned = false;
   class Worker extends EventEmitter {
-    #id;
-    #exited = false;
-    #exitCode = null;
-    #exitResolvers = [];
     constructor(filename, options = {}) {
       super();
-      options = options && typeof options === "object" ? options : {};
-      const ops = getWorkerOps();
-      for (const opt of ["stdin", "stdout", "stderr"]) {
-        if (options[opt]) {
-          throw new Error(`worker_threads option '${opt}' is not supported in lumen (workers share the process stdio)`);
-        }
+      if (options === null || options === undefined) options = {};
+      if (options.execArgv !== undefined && !Array.isArray(options.execArgv)) {
+        throw new __errors.ERR_INVALID_ARG_TYPE("options.execArgv", "Array", options.execArgv);
       }
-      const shareEnv = options.env === SHARE_ENV;
+      let argv = [];
+      if (options.argv !== undefined) {
+        if (!Array.isArray(options.argv)) throw new __errors.ERR_INVALID_ARG_TYPE("options.argv", "Array", options.argv);
+        argv = options.argv.map(String);
+      }
+      const isURL = filename !== null && typeof filename === "object" && typeof URL === "function" && filename instanceof URL;
       let entry;
-      let isModule = false;
+      let mode; // "file" | "eval" | "module-eval"
       if (options.eval) {
-        entry = String(filename);
-      } else {
-        let p = filename;
-        if (typeof URL === "function" && p instanceof URL) p = p.href;
-        p = String(p);
-        if (p.startsWith("file:")) p = __builtins.get("url").fileURLToPath(p);
-        // Node's check: absolute for this platform, or explicitly relative (`./x`, `..\x`).
-        if (!pathMod.isAbsolute(p) && !/^\.\.?[\\/]/.test(p)) {
-          const error = new TypeError(
-            "The worker script or module filename must be an absolute path or a relative path " +
-              `starting with './' or '../'. Received ${JSON.stringify(p)}`,
-          );
-          error.code = "ERR_WORKER_PATH";
-          throw error;
+        if (typeof filename !== "string") {
+          throw new __errors.ERR_INVALID_ARG_VALUE("options.eval", options.eval, "must be false when 'filename' is not a string");
         }
-        p = pathMod.resolve(p);
-        isModule = p.endsWith(".mjs");
-        entry = p;
+        entry = filename;
+        mode = "eval";
+      } else if (isURL && filename.protocol === "data:") {
+        entry = filename.href;
+        mode = "module-eval";
+      } else {
+        let p;
+        if (isURL) {
+          if (filename.protocol !== "file:") throw new __errors.ERR_INVALID_URL_SCHEME(["file:", "data:"]);
+          p = __builtins.get("url").fileURLToPath(filename);
+        } else if (typeof filename !== "string") {
+          throw new __errors.ERR_INVALID_ARG_TYPE("filename", ["string", "URL"], filename);
+        } else if (pathMod.isAbsolute(filename) || /^\.\.?[\\/]/.test(filename)) {
+          p = filename;
+        } else {
+          throw nodeError(TypeError, "ERR_WORKER_PATH",
+            "The worker script or module filename must be an absolute path or a relative path starting with './' or '../'." +
+            (filename.startsWith("file://") ? " Wrap file:// URLs with `new URL`." : "") +
+            (filename.startsWith("data:text/javascript") ? " Wrap data: URLs with `new URL`." : "") +
+            ` Received "${filename}"`);
+        }
+        entry = pathMod.resolve(p);
+        mode = "file";
       }
-      // Snapshot the environment (Node copies the parent's process.env unless overridden).
-      const envSrc = options.env == null || shareEnv ? process.env : options.env;
-      if (typeof envSrc !== "object") throw new TypeError("options.env must be an object");
-      const env = shareEnv ? null : {};
-      if (!shareEnv) for (const k of Object.keys(envSrc)) {
-        const v = envSrc[k];
-        if (v !== undefined) env[k] = String(v);
+
+      const shareEnv = options.env === SHARE_ENV;
+      let env = null;
+      if (options.env !== null && typeof options.env === "object") {
+        env = {};
+        for (const [k, v] of Object.entries(options.env)) env[k] = `${v}`;
+      } else if (options.env === undefined || options.env === null) {
+        env = {};
+        for (const k of Object.keys(process.env)) {
+          const v = process.env[k];
+          if (v !== undefined) env[k] = String(v);
+        }
+      } else if (!shareEnv) {
+        throw new __errors.ERR_INVALID_ARG_TYPE("options.env", ["object", "undefined", "null", "worker_threads.SHARE_ENV"], options.env);
       }
-      const argv = Array.isArray(options.argv) ? options.argv.map(String) : [];
-      // One structured-clone payload carries everything the worker realm needs at boot; a
-      // DataCloneError from workerData surfaces to the caller, like Node.
+      if (options.name !== undefined && options.name !== "" && typeof options.name !== "string") {
+        throw new __errors.ERR_INVALID_ARG_TYPE("options.name", "string", options.name);
+      }
+      const execArgv = options.execArgv !== undefined ? options.execArgv.map(String) : [...process.execArgv];
+      if (options.execArgv !== undefined) {
+        const bad = invalidExecArgv(execArgv);
+        if (bad.length) {
+          throw nodeError(Error, "ERR_WORKER_INVALID_EXEC_ARGV", `Initiated Worker with invalid execArgv flags: ${bad.join(", ")}`);
+        }
+      }
+      const nodeOptions = env !== null ? env.NODE_OPTIONS : process.env.NODE_OPTIONS;
+      if (typeof nodeOptions === "string" && nodeOptions.trim() !== "") {
+        const bad = invalidExecArgv(splitNodeOptions(nodeOptions));
+        if (bad.length) {
+          throw nodeError(Error, "ERR_WORKER_INVALID_EXEC_ARGV", `Initiated Worker with invalid NODE_OPTIONS env variable: ${bad.join(", ")}`);
+        }
+      }
+      const resourceLimits = parseResourceLimits(options.resourceLimits);
+      const preload = [];
+      for (let i = 0; i < execArgv.length; i++) {
+        const arg = execArgv[i];
+        if ((arg === "--require" || arg === "-r") && i + 1 < execArgv.length) preload.push(execArgv[++i]);
+        else if (arg.startsWith("--require=")) preload.push(arg.slice(10));
+      }
+
+      // Everything the worker realm needs at boot travels as one structured clone; a
+      // DataCloneError from workerData (or its transferList) surfaces here, like Node.
+      const transferList = options.transferList === undefined ? [] : readTransferList(options.transferList);
       const init = ser({
         workerData: options.workerData,
         argv,
         env,
         envData: environmentData,
-        entry: options.eval ? "[worker eval]" : entry,
-      }, options.transferList);
-      const res = ops.spawn(entry, isModule, (kind, a) => this.#onEvent(kind, a), {
-        node: true,
-        eval: !!options.eval,
-        shareEnv,
-        init,
+        entry: mode === "file" ? entry : "[worker eval]",
+        mode,
+        execArgv,
+        resourceLimits,
+        hasStdin: !!options.stdin,
+        trace: __traceEvent === null ? undefined : __internals.get("trace_events").groups(),
+        cwdCounter: sharedCwdCounter(),
+        preload,
+        trackUnmanagedFds: options.trackUnmanagedFds ?? true,
+      }, transferList);
+      const res = getWorkerOps().spawn(
+        entry,
+        mode === "module-eval" || (mode === "file" && entry.endsWith(".mjs")),
+        (kind, a) => this.#onEvent(kind, a),
+        { node: true, eval: mode === "eval", moduleEval: mode === "module-eval", shareEnv, init },
+      );
+
+      const handle = {
+        hasRef: () => (state.handleDestroyed ? undefined : state.refed),
+      };
+      const state = {
+        id: res.id,
+        threadId: res.threadId,
+        exited: false,
+        exitCode: null,
+        refed: true,
+        handle,
+        handleDestroyed: false,
+        resourceLimits,
+        stdin: null,
+        stdout: null,
+        stderr: null,
+        stdoutOption: !!options.stdout,
+        stderrOption: !!options.stderr,
+        internal: createPort(res.internal, false),
+        publicPort: null,
+      };
+      workerState.set(this, state);
+      if (__traceEvent !== null) {
+        const name = options.name === undefined ? "" : ` ${options.name}`;
+        __internals.get("trace_events").threadName(res.threadId, `[worker ${res.threadId}]${name}`);
+      }
+      const channel = __builtins.get("diagnostics_channel").channel("worker_threads");
+      if (channel.hasSubscribers) channel.publish({ worker: this });
+      if (__asyncTracking) __initAsyncResource(handle, "WORKER");
+
+      state.internal.on("message", (message) => this.#onInternalMessage(message));
+      state.internal.unref();
+      if (options.stdin) state.stdin = createParentStdin(state.internal);
+      if (state.stdoutOption) state.stdout = createParentStdio();
+      if (state.stderrOption) state.stderr = createParentStdio();
+
+      const publicPort = createPort(res.port);
+      state.publicPort = publicPort;
+      publicPort.on("message", (message) => this.emit("message", message));
+      publicPort.on("messageerror", (error) => this.emit("messageerror", error));
+      publicPort.unref();
+      this.on("newListener", (name) => {
+        if (name === "message" && this.listenerCount("message") === 0 && !state.exited) {
+          publicPort.ref();
+        }
       });
-      this.#id = res.id;
-      this.threadId = res.threadId;
-      this.resourceLimits = {};
-      this.performance = { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) };
-      // stdio capture is unsupported (the options throw above); worker console output goes
-      // straight to the shared process streams.
-      this.stdin = null;
-      this.stdout = null;
-      this.stderr = null;
+      this.on("removeListener", (name) => {
+        if (name === "message" && this.listenerCount("message") === 0 && !state.exited) publicPort.unref();
+      });
+
+      this.performance = {
+        eventLoopUtilization: (util1, util2) => workerEventLoopUtilization(this, util1, util2),
+      };
+      process.nextTick(() => process.emit("worker", this));
     }
-    #onEvent(kind, a) {
-      if (kind === "online") {
-        this.emit("online");
-      } else if (kind === "message") {
-        let data;
-        try {
-          data = deser(a);
-        } catch (e) {
-          this.emit("messageerror", e);
+    get threadId() {
+      const state = workerState.get(this);
+      return state === undefined || state.exited ? -1 : state.threadId;
+    }
+    get resourceLimits() {
+      const state = workerState.get(this);
+      return state === undefined || state.exited ? {} : { ...state.resourceLimits };
+    }
+    get stdin() {
+      return workerState.get(this)?.stdin ?? null;
+    }
+    get stdout() {
+      const state = workerState.get(this);
+      if (state === undefined) return null;
+      if (state.stdout === null) {
+        state.stdout = createParentStdio();
+        pipeToProcess(state.stdout, "stdout");
+        if (state.exited) state.stdout.push(null);
+      }
+      return state.stdout;
+    }
+    get stderr() {
+      const state = workerState.get(this);
+      if (state === undefined) return null;
+      if (state.stderr === null) {
+        state.stderr = createParentStdio();
+        pipeToProcess(state.stderr, "stderr");
+        if (state.exited) state.stderr.push(null);
+      }
+      return state.stderr;
+    }
+    #stdioReadable(stream) {
+      const state = workerState.get(this);
+      if (stream === "stdout") return state.stdout ?? (state.stdoutOption ? null : this.stdout);
+      return state.stderr ?? (state.stderrOption ? null : this.stderr);
+    }
+    #onInternalMessage(message) {
+      if (message === null || typeof message !== "object") return;
+      const state = workerState.get(this);
+      switch (message.type) {
+        case "stdio": {
+          const readable = state[message.stream];
+          if (readable !== null) readable.push(message.chunk);
+          else (message.stream === "stderr" ? process.stderr : process.stdout).write(message.chunk);
           return;
         }
-        this.emit("message", data);
-      } else if (kind === "error") {
-        this.emit("error", reviveError(a));
-      } else if (kind === "exit") {
-        this.#exited = true;
-        this.#exitCode = a;
-        for (const resolve of this.#exitResolvers.splice(0)) resolve(a);
-        this.emit("exit", a);
+        case "error":
+          this.emit("error", deserializeError(message.error));
+          return;
+        case "heapSnapshot": {
+          const pending = state.heapSnapshots?.get(message.id);
+          if (pending === undefined) return;
+          state.heapSnapshots.delete(message.id);
+          if (message.error !== undefined) pending.reject(deserializeError(message.error));
+          else {
+            const { Readable } = lazyStream();
+            const stream = new Readable({ read() {} });
+            stream.push(message.data);
+            stream.push(null);
+            pending.resolve(stream);
+          }
+          return;
+        }
+        case "elu":
+          state.elu = message.elu;
+          return;
+        case "trace":
+          __internals.get("trace_events").addWorkerEvents(message.events);
+          return;
       }
     }
-    postMessage(value, transferList) {
-      if (this.#exited) return;
-      getWorkerOps().post(this.#id, ser(value, transferList));
+    #onEvent(kind, a) {
+      const state = workerState.get(this);
+      if (kind === "online") {
+        state.online = true;
+        this.emit("online");
+      } else if (kind === "error") {
+        // A failure before the worker's own error reporting was in place (its bootstrap).
+        this.emit("error", reviveError(a));
+      } else if (kind === "exit") {
+        this.#onExit(a);
+      }
+    }
+    #onExit(code) {
+      const state = workerState.get(this);
+      drainPort(state.internal);
+      drainPort(state.publicPort);
+      this.removeAllListeners("message");
+      this.removeAllListeners("messageerrors");
+      state.exited = true;
+      state.exitCode = code;
+      state.publicPort.unref();
+      if (!portState.get(state.publicPort).destroyed) finishClose(state.publicPort);
+      if (!portState.get(state.internal).destroyed) finishClose(state.internal);
+      for (const name of ["stdout", "stderr"]) {
+        const readable = state[name];
+        if (readable !== null && !readable.readableEnded) readable.push(null);
+      }
+      for (const { reject } of state.heapSnapshots?.values() ?? []) {
+        reject(nodeError(Error, "ERR_WORKER_NOT_RUNNING", "Worker instance not running"));
+      }
+      state.heapSnapshots = undefined;
+      if (state.oom) {
+        this.emit("error", nodeError(Error, "ERR_WORKER_OUT_OF_MEMORY",
+          "Worker terminated due to reaching memory limit: JS heap out of memory"));
+      }
+      this.emit("exit", code);
+      this.removeAllListeners();
+      process.nextTick(() => {
+        state.handleDestroyed = true;
+        __destroyAsyncResource(state.handle);
+      });
+    }
+    postMessage(...args) {
+      const state = workerState.get(this);
+      if (state === undefined || state.exited) return;
+      Reflect.apply(MessagePort.prototype.postMessage, state.publicPort, args);
     }
     terminate(callback) {
-      // Legacy callback form, still honored by Node alongside the promise.
+      const state = workerState.get(this);
+      this.ref();
       if (typeof callback === "function") {
         if (!terminateCallbackWarned) {
           terminateCallbackWarned = true;
           process.emitWarning("Passing a callback to worker.terminate() is deprecated. It returns a Promise instead.",
             "DeprecationWarning", "DEP0132");
         }
+        if (state.exited) return Promise.resolve();
         this.once("exit", (code) => callback(null, code));
       }
-      if (this.#exited) return Promise.resolve(this.#exitCode);
-      // The returned promise keeps the loop alive until the exit, even for an unref()'d worker.
-      getWorkerOps().setRef(this.#id, true);
-      getWorkerOps().terminate(this.#id);
-      return new Promise((resolve) => this.#exitResolvers.push(resolve));
+      if (state.exited) return Promise.resolve();
+      getWorkerOps().terminate(state.id);
+      return new Promise((resolve) => this.once("exit", resolve));
     }
     ref() {
-      getWorkerOps().setRef(this.#id, true);
-      return this;
+      const state = workerState.get(this);
+      if (state === undefined || state.exited) return;
+      state.refed = true;
+      getWorkerOps().setRef(state.id, true);
+      state.publicPort.ref();
     }
     unref() {
-      getWorkerOps().setRef(this.#id, false);
-      return this;
+      const state = workerState.get(this);
+      if (state === undefined || state.exited) return;
+      state.refed = false;
+      getWorkerOps().setRef(state.id, false);
+      state.publicPort.unref();
     }
-    getHeapSnapshot() {
-      return Promise.reject(new Error("worker.getHeapSnapshot is not supported in lumen"));
+    getHeapSnapshot(options) {
+      if (options !== undefined && (options === null || typeof options !== "object")) {
+        throw new __errors.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const state = workerState.get(this);
+      if (state.exited) {
+        return Promise.reject(nodeError(Error, "ERR_WORKER_NOT_RUNNING", "Worker instance not running"));
+      }
+      state.heapSnapshots ??= new Map();
+      const id = (state.nextSnapshot = (state.nextSnapshot ?? 0) + 1);
+      return new Promise((resolve, reject) => {
+        state.heapSnapshots.set(id, { resolve, reject });
+        state.internal.postMessage({ type: "heapSnapshot", id, options: options ?? {} });
+        state.internal.ref();
+      }).finally(() => {
+        if (state.heapSnapshots?.size === 0 && !state.exited) state.internal.unref();
+      });
     }
     getHeapStatistics() {
       return Promise.reject(new Error("worker.getHeapStatistics is not supported in lumen"));
     }
   }
 
-  const WebPort = globalThis.MessagePort;
-  const portState = new WeakMap();
-  const localPorts = new Map();
-  function portOps() { return globalThis.__lumenPorts; }
-  class NodeMessagePort extends WebPort {
-    constructor() { throw new TypeError("Illegal constructor"); }
-    postMessage(value, transferList) {
-      const state = portState.get(this);
-      if (!state || state.closed || state.detached) return;
-      if (transferList?.includes(this)) throw new DOMException("Cannot transfer the source port", "DataCloneError");
-      const bytes = ser(value, transferList);
-      portOps().post(state.id, bytes);
-    }
-    addEventListener(type, callback, options) {
-      EventTarget.prototype.addEventListener.call(this,type,callback,options);
-      if (type === "message" && callback != null) { this.start(); this.ref(); }
-    }
-    removeEventListener(type, callback, options) {
-      EventTarget.prototype.removeEventListener.call(this,type,callback,options);
-      if(type === "message" && this.listenerCount("message")===0 && !(this._listeners.get("message")?.length)) this.unref();
-    }
-    start() { const state=portState.get(this);if(state)state.started=true;this._arm(); }
-    _arm() {
-      const state = portState.get(this);
-      if (!state || state.closed || state.detached || state.timer !== null) return;
-      state.timer = setInterval(() => {
-        // A peer close follows its already-queued messages. Poll drains the queue before
-        // returning the close sentinel; observing the closed flag first would lose receipts.
-        if(!state.started){if(portOps().isClosed(state.id))this._finishClose();return;}
-        const bytes = portOps().poll(state.id);
-        if (bytes === false) { this._finishClose(); return; }
-        if (bytes === undefined) return;
-        let data;
-        try { data = deser(bytes); } catch(error) { this.emit("messageerror", error); return; }
-        this.dispatchEvent(new MessageEvent("message", {data}));
-        this.emit("message", data);
-      }, 1);
-      if (!state.ref) state.timer.unref();
-    }
-    ref() { const state=portState.get(this); if (state && !state.closed && !state.detached) {state.ref=true;this._arm();state.timer?.ref();} return this; }
-    unref() { const state=portState.get(this); if (state) {state.ref=false;state.timer?.unref();} return this; }
-    hasRef() { const state=portState.get(this); return !!state && !state.closed && !state.detached && state.ref; }
-    _finishClose() { const state=portState.get(this); if(!state || state.closed)return;state.closed=true;portOps().detach(state.id);localPorts.delete(state.id);if(state.timer!==null)clearInterval(state.timer);state.timer=null;queueMicrotask(()=>this.emit("close")); }
-    close() { const state=portState.get(this); if(!state||state.closed||state.detached)return;const peer=portOps().close(state.id);this._finishClose();localPorts.get(peer)?._arm(); }
+  function workerEventLoopUtilization(worker, util1, util2) {
+    const state = workerState.get(worker);
+    if (state === undefined || state.exited || !state.online) return { idle: 0, active: 0, utilization: 0 };
+    const now = getWorkerOps().elu?.(state.id);
+    if (now == null) return { idle: 0, active: 0, utilization: 0 };
+    return __builtins.get("perf_hooks").__computeELU?.(now, util1, util2) ?? { idle: 0, active: 0, utilization: 0 };
   }
-  for (const name of ["on", "addListener", "once", "off", "removeListener", "removeAllListeners", "prependListener", "prependOnceListener", "emit", "listeners", "rawListeners", "listenerCount", "eventNames", "setMaxListeners", "getMaxListeners"]) {
-    Object.defineProperty(NodeMessagePort.prototype,name,{configurable:true,writable:true,value:function(...args){
-      const result=EventEmitter.prototype[name].apply(this,args);
-      if (["on","addListener","once","prependListener","prependOnceListener"].includes(name)) {if(args[0]==="message"){this.start();this.ref();}else if(args[0]==="close")this._arm();}
-      else if (["off","removeListener","removeAllListeners"].includes(name)&&this.listenerCount("message")===0)this.unref();
-      return result;
-    }});
-  }
-  function nodePort(id) {
-    const port=new EventTarget();
-    Object.setPrototypeOf(port,NodeMessagePort.prototype);
-    EventEmitter.call(port);
-    portState.set(port,{id,timer:null,closed:false,detached:false,ref:false,started:false});
-    localPorts.set(id,port);
-    return port;
-  }
-  class NodeMessageChannel {constructor(){const pair=portOps().pair();this.port1=nodePort(pair.a);this.port2=nodePort(pair.b);}}
-  function receiveMessageOnPort(port) {
-    const state=portState.get(port);
-    if(!state)throw new TypeError("receiveMessageOnPort expects a MessagePort");
-    if(state.closed||state.detached)return undefined;
-    const bytes=portOps().poll(state.id);
-    if(bytes===false){port._finishClose();return undefined;}
-    return bytes===undefined?undefined:{message:deser(bytes)};
-  }
-  Object.defineProperty(globalThis,"__lumenPortClone",{value:{
-    isPort:value=>portState.has(value),
-    isUntransferable:value=>untransferable.has(value),
-    isUncloneable:value=>uncloneable.has(value),
-    validate:port=>{const state=portState.get(port);if(!state || state.closed || state.detached || portOps().isClosed(state.id))throw new DOMException("MessagePort is detached or closed", "DataCloneError");},
-    export:port=>{const state=portState.get(port);if(state.closed||state.detached)throw new DOMException("MessagePort is detached", "DataCloneError");return portOps().export(state.id);},
-    detach:port=>{const state=portState.get(port);portOps().detach(state.id);state.detached=true;localPorts.delete(state.id);if(state.timer!==null)clearInterval(state.timer);state.timer=null;queueMicrotask(()=>port.emit("close"));},
-    import:index=>nodePort(portOps().import(index)),
-  },configurable:true});
 
-  const notSupported = (name) =>
-    function () {
-      throw new Error(`worker_threads ${name} is not supported in lumen`);
-    };
+  // Worker-side uncaught errors that predate the worker's own reporting travel as text.
+  function reviveError(text) {
+    const m = /^([A-Za-z][A-Za-z0-9_$]*(?:Error|Exception)): ([\s\S]*)$/.exec(String(text));
+    const Ctor = m && typeof globalThis[m[1]] === "function" ? globalThis[m[1]] : Error;
+    return m ? new Ctor(m[2]) : new Error(String(text));
+  }
+
+  function createParentStdio() {
+    const { Readable } = lazyStream();
+    return new Readable({ read() {} });
+  }
+  function pipeToProcess(readable, name) {
+    readable.on("data", (chunk) => process[name].write(chunk));
+  }
+  function createParentStdin(internal) {
+    const { Writable } = lazyStream();
+    return new Writable({
+      write(chunk, encoding, cb) {
+        const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
+        internal.postMessage({ type: "stdin", chunk: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength).slice() });
+        cb();
+      },
+      final(cb) {
+        internal.postMessage({ type: "stdin", chunk: null });
+        cb();
+      },
+    });
+  }
 
   const wt = {
     isMainThread: true,
     isInternalThread: false,
     threadId: 0,
     parentPort: null,
-    workerData: undefined,
+    workerData: null,
     SHARE_ENV,
     resourceLimits: {},
     Worker,
-    // Native queues and exclusive transferred endpoint ownership across real worker realms.
-    MessageChannel: NodeMessageChannel,
-    MessagePort: NodeMessagePort,
-    BroadcastChannel: globalThis.BroadcastChannel,
-    markAsUntransferable: value => { if(value !== null && (typeof value === "object" || typeof value === "function")) untransferable.add(value); },
-    isMarkedAsUntransferable: value => untransferable.has(value),
-    markAsUncloneable: value => { if(value !== null && (typeof value === "object" || typeof value === "function")) uncloneable.add(value); },
-    moveMessagePortToContext: notSupported("moveMessagePortToContext"),
-    postMessageToThread: notSupported("postMessageToThread"),
+    MessageChannel,
+    MessagePort,
+    BroadcastChannel,
+    markAsUntransferable(value) {
+      if (value === null || (typeof value !== "object" && typeof value !== "function")) return;
+      Object.defineProperty(value, kUntransferable, { value: true, configurable: true, enumerable: false, writable: false });
+    },
+    isMarkedAsUntransferable(value) {
+      return value !== null && (typeof value === "object" || typeof value === "function") && value[kUntransferable] === true;
+    },
+    markAsUncloneable(value) {
+      if (value !== null && (typeof value === "object" || typeof value === "function")) uncloneable.add(value);
+    },
+    moveMessagePortToContext,
+    postMessageToThread() {
+      throw new Error("worker_threads postMessageToThread is not supported in lumen");
+    },
     receiveMessageOnPort,
-    setEnvironmentData: (key, value) => {
+    setEnvironmentData(key, value) {
       if (value === undefined) environmentData.delete(key);
       else environmentData.set(key, value);
     },
-    getEnvironmentData: (key) => environmentData.get(key),
+    getEnvironmentData(key) {
+      return environmentData.get(key);
+    },
   };
 
-  // The worker-realm bootstrap. NODE_WORKER_SCOPE_JS (lumen-runtime/src/worker.rs) calls this in
-  // each node worker realm BEFORE the worker entry runs: it flips this module to worker-side
-  // state (parentPort/workerData/threadId), patches process (argv/env/exit), wires uncaught-error
-  // fatality, and returns the message-inbox dispatcher.
+  globalThis.MessagePort = MessagePort;
+  globalThis.MessageChannel = MessageChannel;
+  globalThis.BroadcastChannel = BroadcastChannel;
+
+  // ---- the worker realm's bootstrap ---------------------------------------------------------------
+  // NODE_WORKER_SCOPE_JS (lumen-runtime/src/js/node_worker_scope.js) calls this in each node worker
+  // realm BEFORE the entry runs: it flips this module to worker-side state, patches process, and
+  // returns the hooks the runtime drives the entry and the end of the thread with.
   Object.defineProperty(globalThis, "__lumenInitWorkerThread", {
     configurable: true,
     enumerable: false,
     writable: false,
-    value: function __lumenInitWorkerThread(wself, threadId, initBytes) {
+    value: function __lumenInitWorkerThread(wself, threadId, initBytes, portIds) {
+      const internal = createPort(portIds[1], false);
       let init = {};
-      try {
-        if (initBytes) init = deser(initBytes) || {};
-      } catch {
-        init = {};
-      }
+      if (initBytes) init = deser(initBytes) || {};
 
       wt.isMainThread = false;
       wt.threadId = typeof threadId === "number" ? threadId : -1;
       wt.workerData = init.workerData;
+      wt.resourceLimits = { ...(init.resourceLimits ?? {}) };
       if (init.envData instanceof Map) {
         for (const [k, v] of init.envData) environmentData.set(k, v);
       }
-      if (init.env && typeof init.env === "object") globalThis.__lumenResetWorkerEnvironment(init.env);
+      if (init.env && typeof init.env === "object") globalThis.__lumenResetWorkerEnvironment?.(init.env);
       delete globalThis.__lumenResetWorkerEnvironment;
-      process.argv = [
-        process.execPath,
-        init.entry ?? "[worker]",
-        ...(Array.isArray(init.argv) ? init.argv : []),
-      ];
-      // Tell the cluster glue this realm is a worker *thread*, never a cluster worker's main
-      // realm — it must not adopt the process's cluster IPC channel (see cluster.js).
+      process.argv = [process.execPath, init.entry ?? "[worker eval]", ...(Array.isArray(init.argv) ? init.argv : [])];
+      process.execArgv = Array.isArray(init.execArgv) ? init.execArgv : [];
+      if (process.execArgv.includes("--trace-warnings")) process.traceProcessWarnings = true;
+      if (Array.isArray(init.trace)) {
+        __internals.get("trace_events").startInWorker(init.trace, wt.threadId, (events) => {
+          internal.postMessage({ type: "trace", events });
+        });
+      }
+      if (process.execArgv.some((a) => a === "--expose-gc" || a === "--expose_gc") && typeof globalThis.gc !== "function") {
+        globalThis.gc = function gc() { __node.collectGarbage(); };
+      }
+      // The cluster glue must not adopt the process's cluster IPC channel in a worker thread.
       Object.defineProperty(globalThis, "__lumenWorkerThreadRealm", {
         configurable: true, enumerable: false, writable: false, value: true,
       });
-      // process.exit in a worker stops this thread's loop, never the whole process. Cooperative:
-      // the current synchronous JS runs to its end first (documented in worker.rs).
-      const exitWorker = (code) => {
-        if (code != null) process.exitCode = code;
-        const n = Number(process.exitCode ?? 0);
-        const exitCode = Number.isFinite(n) ? Math.trunc(n) : 0;
+
+      // process.exit() ends this thread only; the code is process.exitCode's.
+      const endThread = (code) => {
+        if (code !== undefined) process.exitCode = code;
+        const exitCode = () => {
+          const n = Number(process.exitCode ?? 0);
+          return Number.isFinite(n) ? Math.trunc(n) | 0 : 0;
+        };
         if (!process._exiting) {
           process._exiting = true;
-          try { process.emit("exit", exitCode); } catch {}
+          try {
+            process.emit("exit", exitCode());
+          } catch {}
         }
-        wself.exit(Number(process.exitCode ?? exitCode) | 0);
+        wself.exit(exitCode());
       };
-      Object.defineProperty(process, "exit", {
-        value: exitWorker, enumerable: true, configurable: true, writable: true,
-      });
-      process.reallyExit = exitWorker;
+      const exitWorker = function exit(code) {
+        if (process.execArgv.includes("--trace-exit")) {
+          __internals.get("traceExit")(code === undefined ? Number(process.exitCode ?? 0) | 0 : code, threadId);
+        }
+        endThread(code);
+      };
+      Object.defineProperty(process, "exit", { value: exitWorker, enumerable: true, configurable: true, writable: true });
+      process.reallyExit = (code) => wself.exit(Number(code) | 0);
 
-      class ParentPort extends EventEmitter {
-        #closed = false;
-        constructor() {
-          super();
-          // Node's port-ref semantics: the port keeps the worker alive only while a 'message'
-          // listener is attached.
-          this.on("newListener", (ev) => {
-            if (ev === "message" && !this.#closed) wself.setRef(true);
-          });
-          this.on("removeListener", (ev) => {
-            if (ev === "message" && this.listenerCount("message") === 0) wself.setRef(false);
-          });
-        }
-        postMessage(value, transferList) {
-          if (this.#closed) return;
-          wself.post(ser(value, transferList));
-        }
-        // Node's MessagePort is also an EventTarget; alias the listener API.
-        addEventListener(type, fn) {
-          this.on(type, fn);
-        }
-        removeEventListener(type, fn) {
-          this.off(type, fn);
-        }
-        start() {}
-        ref() {
-          wself.setRef(true);
-          return this;
-        }
-        unref() {
-          wself.setRef(false);
-          return this;
-        }
-        close() {
-          this.#closed = true;
-          wself.setRef(false);
-        }
-      }
-      const parentPort = new ParentPort();
-      wt.parentPort = parentPort;
-
-      // Node kills a worker on an uncaught exception or unhandled rejection: the parent Worker
-      // gets 'error', then 'exit' with code 1.
-      const reportFatal = (err) => {
-        let text;
+      // Uncaught errors: the worker's own handlers first (Node's onGlobalUncaughtException),
+      // then the error goes to the parent's 'error' event and the thread exits.
+      const onGlobalUncaughtException = process._fatalException;
+      process._fatalException = function workerOnGlobalUncaughtException(error, fromPromise) {
+        let handled = false;
+        let handlerThrew = false;
         try {
-          text =
-            err instanceof Error
-              ? `${err.name}: ${err.message}`
-              : String(err).replace(/^Uncaught /, "");
-        } catch {
-          text = "Error: uncaught";
+          handled = Reflect.apply(onGlobalUncaughtException, process, [error, fromPromise]);
+        } catch (e) {
+          error = e;
+          handlerThrew = true;
+        }
+        if (handled) return true;
+        if (!process._exiting) {
+          try {
+            process._exiting = true;
+            process.exitCode = 1;
+            if (!handlerThrew) process.emit("exit", process.exitCode);
+          } catch {}
         }
         try {
-          wself.report(text);
+          internal.postMessage({ type: "error", error: serializeError(error) });
         } catch {}
-        wself.exit(1);
-      };
-      globalThis.onerror = (message, _file, _line, _col, error) => {
-        reportFatal(error !== undefined ? error : message);
+        endThread();
         return true;
       };
-      globalThis.onunhandledrejection = (event) => {
-        event.preventDefault();
-        reportFatal(event.reason);
-      };
 
-      return (bytes) => {
-        if (bytes === false) return; // channel-closed sentinel (terminate)
-        let data;
-        try {
-          data = deser(bytes);
-        } catch (e) {
-          parentPort.emit("messageerror", e);
-          return;
-        }
-        parentPort.emit("message", data);
+      patchWorkerProcess(init);
+      setupWorkerStdio(internal, !!init.hasStdin);
+
+      // The internal channel: stdin data and heap snapshot requests from the parent.
+      internal.on("message", (message) => {
+        if (message === null || typeof message !== "object") return;
+        if (message.type === "stdin") workerStdinPush(message.chunk);
+        else if (message.type === "heapSnapshot") sendHeapSnapshot(internal, message);
+      });
+      internal.unref();
+
+      const parentPort = createPort(portIds[0]);
+      wt.parentPort = parentPort;
+
+      for (const file of Array.isArray(init.preload) ? init.preload : []) {
+        __builtins.get("module").createRequire(pathMod.join(process.cwd(), "[worker preload]"))(file);
+      }
+
+      let entryPending = false;
+      return {
+        dispatch() {},
+        // `eval: true`: a classic script with CommonJS-like globals, as Node's worker eval.
+        runEval(source) {
+          const cwd = process.cwd();
+          const Module = __builtins.get("module");
+          const mod = new Module("[worker eval]", null);
+          mod.filename = pathMod.join(cwd, "[worker eval]");
+          mod.paths = Module._nodeModulePaths(cwd);
+          globalThis.module = mod;
+          globalThis.exports = mod.exports;
+          globalThis.__dirname = ".";
+          globalThis.__filename = "[worker eval]";
+          globalThis.require = Module.createRequire(mod.filename);
+          return (0, eval)(source);
+        },
+        runModule(specifier) {
+          const url = specifier.startsWith("data:") ? specifier : __builtins.get("url").pathToFileURL(specifier).href;
+          entryPending = true;
+          import(url).then(
+            () => {
+              entryPending = false;
+            },
+            (error) => {
+              entryPending = false;
+              process.nextTick(() => {
+                throw error;
+              });
+            },
+          );
+        },
+        beforeExit() {
+          if (entryPending) {
+            // Node: a module entry whose top-level await never settles ends with code 13.
+            process.exitCode = 13;
+            endThread();
+            return;
+          }
+          process.emit("beforeExit", Number(process.exitCode ?? 0) | 0);
+        },
+        exit() {
+          endThread();
+        },
       };
     },
   });
+
+  function patchWorkerProcess(init) {
+    const unsupported = (name) => {
+      const fn = function () {
+        throw new __errors.ERR_WORKER_UNSUPPORTED_OPERATION(`process.${name}()`);
+      };
+      fn.disabled = true;
+      return fn;
+    };
+    const stubs = ["abort", "chdir", "send", "disconnect"];
+    if (process.platform !== "win32") stubs.push("setuid", "seteuid", "setgid", "setegid", "setgroups", "initgroups");
+    for (const name of stubs) {
+      Object.defineProperty(process, name, { value: unsupported(name), writable: true, configurable: true, enumerable: true });
+    }
+    for (const name of ["channel", "connected"]) {
+      Object.defineProperty(process, name, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          throw new __errors.ERR_WORKER_UNSUPPORTED_OPERATION(`process.${name}`);
+        },
+      });
+    }
+    const umask = process.umask;
+    process.umask = function umask_(mask) {
+      if (mask !== undefined) throw new __errors.ERR_WORKER_UNSUPPORTED_OPERATION("Setting process.umask()");
+      return Reflect.apply(umask, this, []);
+    };
+    const title = process.title;
+    Object.defineProperty(process, "title", { configurable: true, enumerable: true, get: () => title, set() {} });
+    const debugPort = process.debugPort;
+    Object.defineProperty(process, "debugPort", { configurable: true, enumerable: true, get: () => debugPort, set() {} });
+    for (const name of ["_startProfilerIdleNotifier", "_stopProfilerIdleNotifier", "_debugProcess", "_debugPause", "_debugEnd"]) {
+      delete process[name];
+    }
+    if (init.cwdCounter instanceof Int32Array) {
+      cwdCounter = init.cwdCounter;
+      const rawCwd = process.cwd;
+      let cachedCwd = "";
+      let lastCounter = -1;
+      process.cwd = function cwd() {
+        const current = Atomics.load(cwdCounter, 0);
+        if (current === lastCounter && cachedCwd !== "") return cachedCwd;
+        lastCounter = current;
+        cachedCwd = Reflect.apply(rawCwd, process, []);
+        return cachedCwd;
+      };
+    }
+  }
+
+  // The worker's stdio: process.stdout/stderr write to the parent over the internal channel;
+  // process.stdin reads what the parent writes to worker.stdin (empty without `stdin: true`).
+  let workerStdin = null;
+  let workerStdinPending = [];
+  function workerStdinPush(chunk) {
+    if (workerStdin === null) {
+      workerStdinPending.push(chunk);
+      return;
+    }
+    workerStdin.push(chunk === null ? null : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+  }
+  function setupWorkerStdio(internal, hasStdin) {
+    const makeWritable = (stream) => {
+      const { Writable } = lazyStream();
+      const writable = new Writable({
+        write(chunk, encoding, cb) {
+          const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
+          internal.postMessage({
+            type: "stdio",
+            stream,
+            chunk: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength).slice(),
+          });
+          cb();
+        },
+      });
+      writable.fd = stream === "stdout" ? 1 : 2;
+      return writable;
+    };
+    let stdout = null;
+    let stderr = null;
+    Object.defineProperty(process, "stdout", {
+      configurable: true, enumerable: true,
+      get: () => (stdout ??= makeWritable("stdout")),
+    });
+    Object.defineProperty(process, "stderr", {
+      configurable: true, enumerable: true,
+      get: () => (stderr ??= makeWritable("stderr")),
+    });
+    Object.defineProperty(process, "stdin", {
+      configurable: true, enumerable: true,
+      get() {
+        if (workerStdin !== null) return workerStdin;
+        const { Readable } = lazyStream();
+        workerStdin = new Readable({
+          read() {
+            if (hasStdin && !this.readableEnded) internal.ref();
+          },
+        });
+        workerStdin.fd = 0;
+        workerStdin.on("end", () => internal.unref());
+        workerStdin.on("pause", () => internal.unref());
+        workerStdin.on("resume", () => {
+          if (hasStdin && !workerStdin.readableEnded) internal.ref();
+        });
+        if (!hasStdin) workerStdin.push(null);
+        const pending = workerStdinPending;
+        workerStdinPending = [];
+        for (const chunk of pending) workerStdinPush(chunk);
+        return workerStdin;
+      },
+    });
+  }
+
+  function sendHeapSnapshot(internal, message) {
+    let reply;
+    try {
+      const stream = __builtins.get("v8").getHeapSnapshot(message.options);
+      const chunks = [];
+      let chunk;
+      while ((chunk = stream.read()) !== null) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      reply = { type: "heapSnapshot", id: message.id, data: Buffer.concat(chunks).toString() };
+    } catch (error) {
+      reply = { type: "heapSnapshot", id: message.id, error: serializeError(error) };
+    }
+    internal.postMessage(reply);
+  }
 
   __builtins.set("worker_threads", wt);
 }

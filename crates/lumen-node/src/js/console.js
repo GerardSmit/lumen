@@ -178,7 +178,7 @@
 
         // Errors may come synchronously (files, TTYs) or asynchronously (pipes): handle both.
         try {
-          if (stream.listenerCount("error") === 0) stream.once("error", noop);
+          if (typeof stream.listenerCount === "function" && stream.listenerCount("error") === 0) stream.once("error", noop);
           stream.write(string, errorHandler);
         } catch (e) {
           // Swallowing is wrong for a stack overflow: the caller must see it.

@@ -36,16 +36,46 @@
       this._repeat = repeat ? delay : null;
       this._destroyed = false;
       this._refed = true;
+      this._armed = false;
       // Node calls `timer._onTimeout()`: the callback's `this` is the Timeout (an interval
-      // callback commonly stops itself with `clearInterval(this)`).
-      this._fire = (...a) => this._onTimeout(...a);
+      // callback commonly stops itself with `clearInterval(this)`). A one-shot timer stays
+      // active until its callback returns.
+      this._fire = repeat ? (...a) => this._onTimeout(...a) : (...a) => {
+        const id = this._id;
+        try {
+          return this._onTimeout(...a);
+        } finally {
+          if (this._id === id) this._setArmed(false);
+        }
+      };
       this._id = repeat ? rawSetInterval(this._fire, delay, ...args) : rawSetTimeout(this._fire, delay, ...args);
+      this._setArmed(true);
     }
-    ref() { if (!this._refed) { this._refed = true; timerSetRef(this._id, true); } return this; }
-    unref() { if (this._refed) { this._refed = false; timerSetRef(this._id, false); } return this; }
+    _setArmed(armed) {
+      if (this._armed === armed) return;
+      this._armed = armed;
+      if (this._refed) __activeResources.timeouts += armed ? 1 : -1;
+    }
+    ref() {
+      if (!this._refed) {
+        this._refed = true;
+        if (this._armed) __activeResources.timeouts++;
+        timerSetRef(this._id, true);
+      }
+      return this;
+    }
+    unref() {
+      if (this._refed) {
+        this._refed = false;
+        if (this._armed) __activeResources.timeouts--;
+        timerSetRef(this._id, false);
+      }
+      return this;
+    }
     hasRef() { return this._refed; }
     refresh() {
       if (this._destroyed) return this;
+      this._setArmed(true);
       if (!timerRefresh(this._id)) {
         // Already fired: start it over with the same callback, delay and ref state.
         this._id = this._repeat !== null
@@ -55,7 +85,7 @@
       }
       return this;
     }
-    close() { this._destroyed = true; rawClearTimeout(this._id); __destroyAsyncResource(this); return this; }
+    close() { this._destroyed = true; this._setArmed(false); rawClearTimeout(this._id); __destroyAsyncResource(this); return this; }
     [Symbol.toPrimitive]() { return this._id; }
     [Symbol.dispose]() { this.close(); }
   }
@@ -73,7 +103,7 @@
   }
   function clearTimeout(timer) {
     if (timer == null) return;
-    if (timer instanceof Timeout) { timer._destroyed = true; rawClearTimeout(timer._id); __destroyAsyncResource(timer); return; }
+    if (timer instanceof Timeout) { timer._destroyed = true; timer._setArmed(false); rawClearTimeout(timer._id); __destroyAsyncResource(timer); return; }
     const id = typeof timer === "object" ? timer._id : timer;
     if (typeof id === "number" || typeof id === "string") rawClearTimeout(id);
   }
@@ -89,7 +119,8 @@
 
   // --- setImmediate / clearImmediate as cancellable handles ------------------------------------
   class Immediate {
-    constructor() { this._cleared = false; }
+    constructor() { this._cleared = false; this._pending = true; __activeResources.immediates++; }
+    _settle() { if (this._pending) { this._pending = false; __activeResources.immediates--; } }
     ref() { return this; }
     unref() { return this; }
     hasRef() { return true; }
@@ -98,12 +129,13 @@
     if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
     const handle = new Immediate();
     const run = __bindAsyncContext(() => callback(...args), "Immediate", handle);
-    gSetImmediate(() => { if (!handle._cleared) run(); });
+    gSetImmediate(() => { handle._settle(); if (!handle._cleared) run(); });
     return handle;
   }
   function clearImmediate(handle) {
     if (handle && typeof handle === "object") {
       handle._cleared = true;
+      if (handle instanceof Immediate) handle._settle();
       __destroyAsyncResource(handle);
     }
   }

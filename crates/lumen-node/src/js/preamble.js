@@ -772,7 +772,7 @@ function __primordialsResolver() {
     "Function", "Int16Array", "Int32Array", "Int8Array", "Map", "Number", "Object", "RangeError",
     "ReferenceError", "RegExp", "Set", "String", "Symbol", "SyntaxError", "TypeError", "URIError",
     "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet",
-    "Promise", "Reflect", "Math", "JSON", "Atomics", "SharedArrayBuffer",
+    "Promise", "Proxy", "Reflect", "Math", "JSON", "Atomics", "SharedArrayBuffer",
     "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "unescape",
     "eval", "isFinite", "isNaN", "parseFloat", "parseInt",
   ];

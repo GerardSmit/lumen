@@ -1471,6 +1471,7 @@ globalThis.__lumenApplyOptions = function () {
   if (options && (options["--trace-events-enabled"] || options["--trace-event-categories"] !== undefined)) {
     __internals.get("trace_events").startFromOptions(options);
   }
+  if (options && options["--allow-natives-syntax"]) __node.v8SetFlags("--allow-natives-syntax");
   if (options && options["--heapsnapshot-signal"]) {
     const signal = options["--heapsnapshot-signal"];
     process.on(signal, function doWriteHeapSnapshot() {
@@ -1511,6 +1512,9 @@ globalThis.__lumenApplyOptions = function () {
   }
 };
 
+// `lumen-cli --test`: Node's test runner main (test_runner.js).
+globalThis.__lumenRunTestMain = () => __internals.get("testRunnerMain")();
+
 // Exposed to the CLI (via a tiny bootstrap) to run a file as the main module.
 // The text an uncaught Error prints as: its inspection, which carries the own properties
 // (`code`, `requireStack`, ...) after the stack. Plain errors keep the short report.
@@ -1519,6 +1523,30 @@ globalThis.__lumenDescribeError = (error) => {
     if (error instanceof Error && Object.keys(error).length > 0) return __builtins.get("util").inspect(error);
   } catch {}
   return undefined;
+};
+
+// Node's ReportFatalException: an object prints as its inspection (customInspect off), anything
+// else as its string with the --trace-uncaught hint; then the Node.js version line.
+globalThis.__lumenFatalReport = (error) => {
+  let text;
+  if ((typeof error === "object" && error !== null) || typeof error === "function") {
+    try {
+      const { inspect } = __builtins.get("util");
+      text = inspect(error, { colors: false, customInspect: false, depth: Math.max(inspect.defaultOptions.depth, 5) });
+    } catch {
+      try { text = error.stack; } catch {}
+    }
+  }
+  if (typeof text !== "string" || text === "") {
+    try {
+      text = typeof error === "symbol" ? error.toString() : String(error);
+    } catch {
+      text = "<toString() threw exception>";
+    }
+    const argv0 = String(process.argv0 || "node").replace(/^.*[\\/]/, "").replace(/\.exe$/, "");
+    text += `\n(Use \`${argv0} --trace-uncaught ...\` to show where the exception was thrown)`;
+  }
+  return `${text}\n\nNode.js ${process.version}`;
 };
 
 globalThis.__runMain = (filename) => Module.runMain(filename);

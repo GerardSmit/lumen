@@ -1,142 +1,288 @@
 // ---- node:vm ----------------------------------------------------------------------------------
-// The engine can eval (globalThis.eval and `new Function` both work), so the pieces of `vm` that
-// only need "run this string" are real: `runInThisContext`, `Script`, `compileFunction`.
-//
-// Contexts are best-effort. Node's `createContext` builds a brand-new global object with fresh
-// copies of every intrinsic (Object, Array, ...) that the sandboxed code sees instead of the
-// host's. lumen cannot mint a second set of intrinsics from JS, so `runInContext` isolates the
-// *variable environment* only: a `with`-over-Proxy whose `has` trap claims every name, so free
-// identifiers in the code resolve against the sandbox object rather than escaping to the caller's
-// scope. Names the sandbox does not define fall through to the host's globals (same Object/Array
-// identity). This matches Node's loose contract for the common "eval a config/expression against a
-// supplied object" case, but it is NOT a security boundary and shares host intrinsics — do not use
-// it to run untrusted code.
+// Contexts are real: `createContext` makes a realm of its own (fresh intrinsics) whose global
+// object is fronted by a global proxy intercepting onto the sandbox, like Node's contextify
+// (see lumen's `builtins/vm_context.rs`). This file validates arguments the way Node's lib/vm.js
+// does and keeps the sandbox -> global proxy map.
 {
-  // Indirect eval always evaluates in the global lexical scope, which is exactly the semantics of
-  // `runInThisContext`. Capturing it via a comma-expression call keeps it indirect.
-  const indirectEval = eval;
-  const runInGlobal = (code) => (0, indirectEval)(code);
+  const {
+    validateString, validateInt32, validateUint32, validateBoolean, validateObject, validateArray,
+    validateOneOf, kValidateObjectAllowArray,
+  } = __validators;
 
-  const contexts = new WeakSet();
+  // sandbox -> its context's global proxy (an ephemeron: the proxy references the sandbox).
+  const contexts = new WeakMap();
+  let contextCounter = 0;
 
-  // Build the `with`-scope proxy over a contextified sandbox (see file header).
-  const proxyFor = (sandbox) =>
-    new Proxy(sandbox, {
-      has() {
-        // Claim every name so all free identifiers resolve through this proxy.
-        return true;
-      },
-      get(target, key) {
-        if (key === Symbol.unscopables) return undefined;
-        if (key in target) return target[key];
-        return globalThis[key];
-      },
-      set(target, key, value) {
-        target[key] = value;
-        return true;
-      },
-      deleteProperty(target, key) {
-        delete target[key];
-        return true;
-      },
-    });
+  const isArrayBufferView = (v) => ArrayBuffer.isView(v);
 
-  // `with (proxy) { return eval("<code>") }` — a *direct* eval whose argument is a baked-in string
-  // literal (the proxy's `has` claims every name, so a `code` *parameter* would itself be shadowed
-  // to undefined; a literal sidesteps that). The direct eval runs in the with-scope, so `code`'s
-  // free identifiers bind through the proxy. JSON.stringify escapes the source so it cannot break
-  // out of the literal.
-  const runWithSandbox = (code, sandbox) => {
-    const runner = new Function("_", "with (_) { return eval(" + JSON.stringify(code) + "); }");
-    return runner(proxyFor(sandbox));
+  const isContext = (object) => {
+    validateObject(object, "object", kValidateObjectAllowArray);
+    return contexts.has(object);
   };
 
-  // `options.timeout`: run under a deadline (see vm_timeout.rs); past it the run throws
-  // ERR_SCRIPT_EXECUTION_TIMEOUT instead of spinning forever.
-  const bounded = (options, run) => {
-    const timeout = options !== null && typeof options === "object" ? options.timeout : undefined;
-    if (timeout === undefined) return run();
-    if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout <= 0 || timeout > 4294967295) {
-      const error = new RangeError(`The value of "options.timeout" is out of range. It must be >= 1 && <= 4294967295. Received ${String(timeout)}`);
-      error.code = "ERR_OUT_OF_RANGE";
-      throw error;
+  const globalProxyOf = (contextifiedObject) => {
+    validateObject(contextifiedObject, "contextifiedObject", kValidateObjectAllowArray);
+    const proxy = contexts.get(contextifiedObject);
+    if (proxy === undefined) {
+      throw new __errors.ERR_INVALID_ARG_TYPE("contextifiedObject", "vm.Context", contextifiedObject);
     }
-    return __vm.runWithTimeout(timeout, run);
+    return proxy;
   };
 
-  const contextify = (sandbox) => {
-    if (sandbox === undefined) sandbox = {};
-    if (typeof sandbox !== "object" || sandbox === null) {
-      throw new TypeError("The \"contextObject\" argument must be an object.");
-    }
-    contexts.add(sandbox);
-    return sandbox;
+  const validateCodeGeneration = (codeGeneration, name) => {
+    if (codeGeneration === undefined) return;
+    validateObject(codeGeneration, name);
+    const { strings, wasm } = codeGeneration;
+    if (strings !== undefined) validateBoolean(strings, `${name}.strings`);
+    if (wasm !== undefined) validateBoolean(wasm, `${name}.wasm`);
   };
+
+  const createContext = (contextObject = {}, options = {}) => {
+    if (isContext(contextObject)) return contextObject;
+    validateObject(options, "options");
+    const {
+      name = `VM Context ${++contextCounter}`,
+      origin,
+      codeGeneration,
+      microtaskMode,
+      importModuleDynamically,
+    } = options;
+    validateString(name, "options.name");
+    if (origin !== undefined) validateString(origin, "options.origin");
+    validateCodeGeneration(codeGeneration, "options.codeGeneration");
+    validateOneOf(microtaskMode, "options.microtaskMode", ["afterEvaluate", undefined]);
+    if (importModuleDynamically !== undefined && typeof importModuleDynamically !== "function") {
+      throw new __errors.ERR_INVALID_ARG_TYPE("options.importModuleDynamically", "function", importModuleDynamically);
+    }
+    const proxy = __vmc.createContext(contextObject);
+    contexts.set(contextObject, proxy);
+    return contextObject;
+  };
+
+  // `{ timeout, displayErrors, breakOnSigint }` of the run* methods (Node's getRunInContextArgs).
+  const runArgs = (options = {}) => {
+    validateObject(options, "options");
+    let timeout = options.timeout;
+    if (timeout === undefined) {
+      timeout = -1;
+    } else {
+      validateUint32(timeout, "options.timeout", true);
+    }
+    const { displayErrors = true, breakOnSigint = false } = options;
+    validateBoolean(displayErrors, "options.displayErrors");
+    validateBoolean(breakOnSigint, "options.breakOnSigint");
+    return { timeout, displayErrors, breakOnSigint };
+  };
+
+  // `runInNewContext`'s context options (Node's getContextOptions).
+  const contextOptions = (options) => {
+    if (!options) return {};
+    const contextOptions = {
+      name: options.contextName,
+      origin: options.contextOrigin,
+      codeGeneration: undefined,
+      microtaskMode: options.microtaskMode,
+    };
+    if (contextOptions.name !== undefined) validateString(contextOptions.name, "options.contextName");
+    if (contextOptions.origin !== undefined) validateString(contextOptions.origin, "options.contextOrigin");
+    if (options.contextCodeGeneration !== undefined) {
+      validateCodeGeneration(options.contextCodeGeneration, "options.contextCodeGeneration");
+      contextOptions.codeGeneration = options.contextCodeGeneration;
+    }
+    return contextOptions;
+  };
+
+  const runBounded = (args, run) =>
+    args.timeout === -1 ? run() : __vm.runWithTimeout(args.timeout, run);
+
+  // A code cache stand-in: lumen compiles from source, so the "cache" records only what V8's
+  // sanity check does (a magic, the source length and hash) and is accepted iff it matches.
+  const cacheMagic = 0x6c6d6331;
+  const sourceHash = (source) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < source.length; i++) {
+      h ^= source.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h;
+  };
+  const makeCache = (source) => {
+    const buf = Buffer.alloc(12);
+    buf.writeUInt32LE(cacheMagic, 0);
+    buf.writeUInt32LE(source.length >>> 0, 4);
+    buf.writeUInt32LE(sourceHash(source), 8);
+    return buf;
+  };
+  const cacheMatches = (view, source) => {
+    if (view.byteLength !== 12) return false;
+    const dv = new DataView(view.buffer, view.byteOffset, view.byteLength);
+    return dv.getUint32(0, true) === cacheMagic &&
+      dv.getUint32(4, true) === (source.length >>> 0) &&
+      dv.getUint32(8, true) === sourceHash(source);
+  };
+
+  // The last `//# sourceMappingURL=` magic comment, as V8 reports it.
+  const sourceMapURLOf = (source) => {
+    const re = /\/\/[#@][ \t]+sourceMappingURL=[ \t]*([^\s'"]*)[ \t]*$/gm;
+    let url;
+    for (let m = re.exec(source); m !== null; m = re.exec(source)) url = m[1];
+    return url;
+  };
+
+  const kSource = Symbol("kSource");
+  const kFilename = Symbol("kFilename");
+  const kLineOffset = Symbol("kLineOffset");
+  const kColumnOffset = Symbol("kColumnOffset");
 
   class Script {
     constructor(code, options = {}) {
-      this.code = code === undefined ? "undefined" : String(code);
-      this.filename = (options && options.filename) || "evalmachine.<anonymous>";
-      // Compile eagerly so a SyntaxError surfaces at construction, like Node. `new Function`
-      // parses the body without running it.
-      try {
-        new Function(this.code);
-      } catch (e) {
-        if (e instanceof SyntaxError) throw e;
+      code = `${code}`;
+      if (typeof options === "string") {
+        options = { filename: options };
+      } else {
+        validateObject(options, "options");
       }
-    }
-    runInThisContext(options) {
-      return bounded(options, () => runInGlobal(this.code));
-    }
-    runInContext(contextifiedObject, options) {
-      if (!contexts.has(contextifiedObject)) {
-        throw new TypeError("The \"contextifiedObject\" argument must be a vm.Context.");
+      const {
+        filename = "evalmachine.<anonymous>",
+        lineOffset = 0,
+        columnOffset = 0,
+        cachedData,
+        produceCachedData = false,
+        importModuleDynamically,
+      } = options;
+      validateString(filename, "options.filename");
+      validateInt32(lineOffset, "options.lineOffset");
+      validateInt32(columnOffset, "options.columnOffset");
+      if (cachedData !== undefined && !isArrayBufferView(cachedData)) {
+        throw new __errors.ERR_INVALID_ARG_TYPE("options.cachedData", ["Buffer", "TypedArray", "DataView"], cachedData);
       }
-      return bounded(options, () => runWithSandbox(this.code, contextifiedObject));
+      validateBoolean(produceCachedData, "options.produceCachedData");
+      if (importModuleDynamically !== undefined && typeof importModuleDynamically !== "function") {
+        throw new __errors.ERR_INVALID_ARG_TYPE("options.importModuleDynamically", "function", importModuleDynamically);
+      }
+      __vmc.compileScript(code, filename, lineOffset, columnOffset);
+      this[kSource] = code;
+      this[kFilename] = filename;
+      this[kLineOffset] = lineOffset;
+      this[kColumnOffset] = columnOffset;
+      if (cachedData !== undefined) this.cachedDataRejected = !cacheMatches(cachedData, code);
+      if (produceCachedData) {
+        this.cachedDataProduced = true;
+        this.cachedData = makeCache(code);
+      }
+      this.sourceMapURL = sourceMapURLOf(code);
     }
-    runInNewContext(sandbox, options) {
-      const context = contextify(sandbox);
-      return bounded(options, () => runWithSandbox(this.code, context));
-    }
+
     createCachedData() {
-      throw new Error("vm.Script.createCachedData is not supported in lumen");
+      return makeCache(this[kSource]);
+    }
+
+    runInThisContext(options) {
+      const args = runArgs(options);
+      return runScript(this, null, args);
+    }
+
+    runInContext(contextifiedObject, options) {
+      const proxy = globalProxyOf(contextifiedObject);
+      const args = runArgs(options);
+      return runScript(this, proxy, args);
+    }
+
+    runInNewContext(contextObject, options) {
+      const context = createContext(contextObject, contextOptions(options));
+      return this.runInContext(context, options);
     }
   }
 
-  const runInThisContext = (code, options) => {
-    code = String(code);
-    return bounded(options, () => runInGlobal(code));
-  };
-  const createContext = (sandbox) => contextify(sandbox);
-  const isContext = (sandbox) => contexts.has(sandbox);
-  const runInContext = (code, contextifiedObject, options) => {
-    if (!contexts.has(contextifiedObject)) {
-      throw new TypeError("The \"contextifiedObject\" argument must be a vm.Context.");
-    }
-    code = String(code);
-    return bounded(options, () => runWithSandbox(code, contextifiedObject));
-  };
-  const runInNewContext = (code, sandbox, options) => {
-    code = String(code);
-    const context = contextify(sandbox);
-    return bounded(options, () => runWithSandbox(code, context));
-  };
+  const runScript = (script, proxy, args) =>
+    runBounded(args, () =>
+      __vmc.runScript(proxy, script[kSource], script[kFilename], script[kLineOffset], script[kColumnOffset],
+        args.displayErrors));
+
   const createScript = (code, options) => new Script(code, options);
 
-  // `compileFunction(code, params, options)` — a real function compiled from the body + named
-  // params via `new Function`. The `parsingContext`/`contextExtensions` options are not honored.
-  const compileFunction = (code, params = [], options = {}) => {
-    const args = Array.isArray(params) ? params.slice() : [];
-    args.push(code === undefined ? "" : String(code));
-    return new Function(...args);
+  const runInContext = (code, contextifiedObject, options) => {
+    globalProxyOf(contextifiedObject);
+    if (typeof options === "string") options = { filename: options };
+    return createScript(code, options).runInContext(contextifiedObject, options);
   };
 
-  // Node returns a Promise of a memory estimate; lumen has no per-context measurement, so hand back
-  // a correctly shaped resolved estimate of zero.
-  const measureMemory = () =>
-    Promise.resolve({ total: { jsMemoryEstimate: 0, jsMemoryRange: [0, 0] } });
+  const runInNewContext = (code, contextObject, options) => {
+    if (typeof options === "string") options = { filename: options };
+    contextObject = createContext(contextObject, contextOptions(options));
+    return createScript(code, options).runInContext(contextObject, options);
+  };
+
+  const runInThisContext = (code, options) => {
+    if (typeof options === "string") options = { filename: options };
+    return createScript(code, options).runInThisContext(options);
+  };
+
+  const compileFunction = (code, params, options = {}) => {
+    validateString(code, "code");
+    if (params !== undefined) validateArray(params, "params");
+    validateObject(options, "options");
+    const {
+      filename = "",
+      columnOffset = 0,
+      lineOffset = 0,
+      cachedData = undefined,
+      produceCachedData = false,
+      parsingContext = undefined,
+      contextExtensions = [],
+      importModuleDynamically,
+    } = options;
+    validateString(filename, "options.filename");
+    validateInt32(columnOffset, "options.columnOffset");
+    validateInt32(lineOffset, "options.lineOffset");
+    if (cachedData !== undefined && !isArrayBufferView(cachedData)) {
+      throw new __errors.ERR_INVALID_ARG_TYPE("options.cachedData", ["Buffer", "TypedArray", "DataView"], cachedData);
+    }
+    validateBoolean(produceCachedData, "options.produceCachedData");
+    let proxy = null;
+    if (parsingContext !== undefined) {
+      if (typeof parsingContext !== "object" || parsingContext === null || !isContext(parsingContext)) {
+        throw new __errors.ERR_INVALID_ARG_TYPE("options.parsingContext", "Context", parsingContext);
+      }
+      proxy = contexts.get(parsingContext);
+    }
+    validateArray(contextExtensions, "options.contextExtensions");
+    contextExtensions.forEach((extension, i) => {
+      const name = `options.contextExtensions[${i}]`;
+      validateObject(extension, name, __validators.kValidateObjectAllowNullable);
+    });
+    if (importModuleDynamically !== undefined && typeof importModuleDynamically !== "function") {
+      throw new __errors.ERR_INVALID_ARG_TYPE("options.importModuleDynamically", "function", importModuleDynamically);
+    }
+    const paramList = params === undefined ? [] : params;
+    paramList.forEach((p, i) => validateString(p, `params[${i}]`));
+    const fn = __vmc.compileFunction(proxy, code, paramList, contextExtensions, filename, lineOffset, columnOffset);
+    const source = `function (${paramList.join(", ")}) {\n${code}\n}`;
+    if (produceCachedData) {
+      fn.cachedDataProduced = true;
+      fn.cachedData = makeCache(source);
+    }
+    if (cachedData !== undefined) fn.cachedDataRejected = !cacheMatches(cachedData, source);
+    return fn;
+  };
+
+  const measureMemory = (options = {}) => {
+    validateObject(options, "options");
+    const { mode = "summary", execution = "default" } = options;
+    validateOneOf(mode, "options.mode", ["summary", "detailed"]);
+    validateOneOf(execution, "options.execution", ["default", "eager"]);
+    const used = process.memoryUsage().heapUsed;
+    const estimate = { jsMemoryEstimate: used, jsMemoryRange: [used, used] };
+    const result = { total: estimate };
+    if (mode === "detailed") {
+      result.current = estimate;
+      result.other = [];
+    }
+    return Promise.resolve(result);
+  };
 
   const constants = {
+    __proto__: null,
     USE_MAIN_CONTEXT_DEFAULT_LOADER: Symbol("vm_dynamic_import_main_context_default"),
     DONT_CONTEXTIFY: Symbol("vm_context_no_contextify"),
   };
