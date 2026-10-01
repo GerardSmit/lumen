@@ -15,14 +15,15 @@ const INTEGER_VIEWS = [
 class SubtleCrypto {
   async digest(algorithm, data) {
     const name = (typeof algorithm === "string" ? algorithm : algorithm && algorithm.name) || "";
-    if (String(name).toUpperCase() !== "SHA-256") {
-      throw new DOMException(`unsupported digest algorithm '${name}' (SHA-256 only for now)`, "NotSupportedError");
+    const canonical = { "SHA-1": "SHA-1", "SHA-256": "SHA-256", "SHA-384": "SHA-384", "SHA-512": "SHA-512" }[String(name).toUpperCase()];
+    if (canonical === undefined) {
+      throw new DOMException(`unsupported digest algorithm '${name}'`, "NotSupportedError");
     }
     let view;
     if (data instanceof ArrayBuffer) view = new Uint8Array(data);
     else if (ArrayBuffer.isView(data)) view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     else throw new TypeError("digest expects a BufferSource");
-    return __crypto.sha256(view).buffer;
+    return __crypto.digest(canonical, view).buffer;
   }
 }
 

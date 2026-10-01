@@ -338,6 +338,9 @@ struct WorkerSelf {
     /// for messages until closed). Node workers: only while parentPort has a 'message' listener.
     keep_alive: bool,
     inbox_task: Option<TaskId>,
+    /// The realm's engine interrupt (absent for an embedded parent's workers, which share the
+    /// embedder's): `process.exit()` raises it so the calling JS stops at once, as in Node.
+    kill: Option<Arc<AtomicBool>>,
 }
 
 // Declared before Runtime so every normal return drops the runtime and its host
@@ -385,6 +388,7 @@ fn run_worker(
         exit_code: None,
         keep_alive: !spec.is_node,
         inbox_task: None,
+        kill: (!embedded).then(|| Arc::clone(&kill)),
     });
 
     // The per-realm bootstrap: DedicatedWorkerGlobalScope for web workers, the worker_threads
@@ -451,7 +455,9 @@ fn run_worker(
     };
     if let Err(e) = entry_result {
         if kill.load(Ordering::SeqCst) {
-            // Terminated while the entry ran: its unwinding error is the termination.
+            // Terminated (or `process.exit()`ed) while the entry ran: its unwinding error is the
+            // termination.
+            exit.code = worker_exit_code(&mut rt).unwrap_or(1);
             return;
         }
         let _ = to_main_tx.send(ToMain::Error(e));
@@ -466,14 +472,16 @@ fn run_worker(
     arm_worker_inbox(rt.engine().ctx(), WorkerInbox { rx: to_worker_rx });
     rt.run_worker_loop(&stop);
 
-    let code = rt
-        .engine()
+    exit.code =
+        worker_exit_code(&mut rt).unwrap_or(if stop.load(Ordering::SeqCst) { 1 } else { 0 });
+}
+
+fn worker_exit_code(rt: &mut Runtime) -> Option<i32> {
+    rt.engine()
         .ctx()
         .op_state()
         .get::<WorkerSelf>()
         .and_then(|w| w.exit_code)
-        .unwrap_or(if stop.load(Ordering::SeqCst) { 1 } else { 0 });
-    exit.code = code;
 }
 
 struct WorkerInbox {
@@ -566,14 +574,24 @@ fn op_wself_close(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Va
 }
 
 /// `__wself.exit(code)` — node `process.exit(code)` inside a worker: record the code and stop the
-/// loop (cooperatively — the current synchronous JS runs to its end first; see the module docs).
+/// loop. With the realm's own interrupt available the calling JS unwinds now (every later safe
+/// point throws again); an embedded parent's worker stops cooperatively at the next loop poll.
 fn op_wself_exit(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let code = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as i32;
+    let mut kill = None;
     if let Some(w) = ctx.host_mut::<WorkerSelf>() {
-        w.exit_code = Some(code);
+        w.exit_code.get_or_insert(code);
         w.stop.store(true, Ordering::SeqCst);
+        kill = w.kill.clone();
     }
-    Ok(Value::Undefined)
+    match kill {
+        Some(kill) => {
+            kill.store(true, Ordering::SeqCst);
+            ctx.terminate_for_host();
+            Err(ctx.make_error("Error", format!("process.exit({code})")))
+        }
+        None => Ok(Value::Undefined),
+    }
 }
 
 /// `__wself.setRef(keep)` — whether the armed inbox keeps this worker alive (parentPort ref

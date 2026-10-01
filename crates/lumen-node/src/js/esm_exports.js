@@ -33,7 +33,7 @@ const __ESM_EXPORTS = {
   "stream/consumers": "arrayBuffer blob buffer json text",
   "http": "_connectionListener METHODS STATUS_CODES Agent ClientRequest IncomingMessage OutgoingMessage Server ServerResponse createServer validateHeaderName validateHeaderValue get request setMaxIdleHTTPParsers maxHeaderSize globalAgent WebSocket MessageEvent CloseEvent",
   "https": "Agent globalAgent Server createServer get request",
-  "http2": "constants sensitiveHeaders getDefaultSettings getPackedSettings getUnpackedSettings createServer createSecureServer connect performServerHandshake Http2ServerRequest Http2ServerResponse ClientHttp2Session ClientHttp2Stream ServerHttp2Session ServerHttp2Stream Http2Server",
+  "http2": "constants sensitiveHeaders getDefaultSettings getPackedSettings getUnpackedSettings createServer createSecureServer connect Http2ServerRequest Http2ServerResponse",
   "perf_hooks": "performance Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceResourceTiming PerformanceObserver PerformanceObserverEntryList constants createHistogram monitorEventLoopDelay",
   "fs/promises": "access copyFile cp open opendir rename truncate rm rmdir mkdir readdir readlink symlink lstat stat statfs link unlink chmod lchmod lchown chown utimes lutimes realpath mkdtemp writeFile appendFile readFile watch constants",
   "path/posix": "sep delimiter isAbsolute normalize join resolve dirname basename extname parse format relative matchesGlob toNamespacedPath _makeLong posix win32",

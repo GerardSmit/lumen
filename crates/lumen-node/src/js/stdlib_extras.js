@@ -277,8 +277,8 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
   });
   const HEAP_SPACES = [
     "read_only_space", "new_space", "old_space", "code_space", "shared_space",
-    "trusted_space", "new_large_object_space", "large_object_space",
-    "code_large_object_space", "shared_large_object_space", "trusted_large_object_space",
+    "new_large_object_space", "large_object_space",
+    "code_large_object_space", "shared_large_object_space",
   ];
   const getHeapSpaceStatistics = () =>
     HEAP_SPACES.map((space_name) => ({
@@ -316,7 +316,12 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
 
   // Not backed by V8's build hash; a stable tag so callers that only compare it for equality across
   // a single process (compile-cache guards) behave consistently.
-  const cachedDataVersionTag = () => 0x6c756d65;
+  let flagSalt = 0;
+  const cachedDataVersionTag = () => (0x6c756d65 ^ flagSalt) >>> 0;
+  const setFlagsFromString = (flags) => {
+    if (typeof flags !== "string") throw new __errors.ERR_INVALID_ARG_TYPE("flags", "string", flags);
+    for (let i = 0; i < flags.length; i++) flagSalt = (Math.imul(flagSalt, 31) + flags.charCodeAt(i) + 1) | 0;
+  };
 
   // Inert GC profiler: lumen surfaces no GC event stream, so a session records nothing.
   class GCProfiler {
@@ -324,6 +329,200 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     stop() {
       return { version: 1, startTime: this._start || Date.now(), statistics: [], endTime: Date.now() };
     }
+  }
+
+  // ---- heap snapshots ------------------------------------------------------------------------
+  // A V8-format `.heapsnapshot` of the object graph reachable from the global object (own data
+  // properties and prototypes, walked breadth-first). lumen has no heap profiler, so the graph is
+  // what JS reflection can see, bounded to `kMaxSnapshotNodes` objects and `kMaxEdgesPerNode`
+  // edges per object; engine-internal structures are absent.
+  const kMaxSnapshotNodes = 50000;
+  const kMaxEdgesPerNode = 64;
+  const NODE_TYPES = ["hidden", "array", "string", "object", "code", "closure", "regexp", "number",
+    "native", "synthetic", "concatenated string", "sliced string", "symbol", "bigint", "object shape"];
+  const EDGE_TYPES = ["context", "element", "property", "internal", "hidden", "shortcut", "weak"];
+  const T_ARRAY = 1, T_OBJECT = 3, T_CLOSURE = 5, T_SYNTHETIC = 9;
+  const E_ELEMENT = 1, E_PROPERTY = 2, E_INTERNAL = 3, E_SHORTCUT = 5;
+
+  function buildHeapSnapshot() {
+    const strings = [];
+    const stringIds = new Map();
+    const intern = (s) => {
+      let id = stringIds.get(s);
+      if (id === undefined) {
+        id = strings.length;
+        strings.push(s);
+        stringIds.set(s, id);
+      }
+      return id;
+    };
+    const nodes = [];
+    const edges = [];
+    const indexOf = new Map();
+    const queue = [];
+    const classNameOf = (obj) => {
+      try {
+        let proto = Object.getPrototypeOf(obj);
+        for (let depth = 0; proto !== null && depth < 8; depth++, proto = Object.getPrototypeOf(proto)) {
+          const d = Object.getOwnPropertyDescriptor(proto, "constructor");
+          if (d !== undefined && typeof d.value === "function" && typeof d.value.name === "string" && d.value.name) {
+            return d.value.name;
+          }
+        }
+      } catch {
+        /* exotic object: fall through */
+      }
+      return "Object";
+    };
+    const visit = (obj) => {
+      let idx = indexOf.get(obj);
+      if (idx === undefined && queue.length < kMaxSnapshotNodes) {
+        idx = queue.length + 1;
+        indexOf.set(obj, idx);
+        queue.push(obj);
+      }
+      return idx;
+    };
+    const rootEdges = [];
+    const g = visit(globalThis);
+    if (g !== undefined) rootEdges.push([E_SHORTCUT, intern("global"), g]);
+
+    // node 0 is the synthetic root, then the queue in discovery order.
+    const nodeFields = 7;
+    let nextId = 1;
+    const emitNode = (type, name, selfSize, edgeCount) => {
+      nodes.push(type, intern(name), nextId, selfSize, edgeCount, 0, 0);
+      nextId += 2;
+    };
+    emitNode(T_SYNTHETIC, "", 0, rootEdges.length);
+    for (const [type, name, to] of rootEdges) edges.push(type, name, to * nodeFields);
+    for (let i = 0; i < queue.length; i++) {
+      const obj = queue[i];
+      const isFunction = typeof obj === "function";
+      const isArray = Array.isArray(obj);
+      let keys;
+      try {
+        keys = Reflect.ownKeys(obj);
+      } catch {
+        keys = [];
+      }
+      const mine = [];
+      for (const key of keys) {
+        if (mine.length >= kMaxEdgesPerNode) break;
+        let d;
+        try {
+          d = Object.getOwnPropertyDescriptor(obj, key);
+        } catch {
+          continue;
+        }
+        const value = d && "value" in d ? d.value : undefined;
+        if (value === null || (typeof value !== "object" && typeof value !== "function")) continue;
+        const to = visit(value);
+        if (to === undefined) continue;
+        const element = isArray && typeof key === "string" && /^\d+$/.test(key);
+        mine.push([element ? E_ELEMENT : E_PROPERTY, element ? Number(key) : intern(typeof key === "symbol" ? key.toString() : key), to]);
+      }
+      let proto = null;
+      try {
+        proto = Object.getPrototypeOf(obj);
+      } catch {
+        /* proxy without a prototype trap */
+      }
+      if (proto !== null) {
+        const to = visit(proto);
+        if (to !== undefined) mine.push([E_INTERNAL, intern("__proto__"), to]);
+      }
+      const name = isFunction ? (typeof obj.name === "string" ? obj.name : "") : classNameOf(obj);
+      emitNode(isFunction ? T_CLOSURE : isArray ? T_ARRAY : T_OBJECT, name, 16 + 8 * mine.length, mine.length);
+      for (const [type, nameOrIndex, to] of mine) edges.push(type, nameOrIndex, to * nodeFields);
+    }
+    const nodeCount = nodes.length / nodeFields;
+    return {
+      snapshot: {
+        meta: {
+          node_fields: ["type", "name", "id", "self_size", "edge_count", "trace_node_id", "detachedness"],
+          node_types: [NODE_TYPES, "string", "number", "number", "number", "number", "number"],
+          edge_fields: ["type", "name_or_index", "to_node"],
+          edge_types: [EDGE_TYPES, "string_or_number", "node"],
+          trace_function_info_fields: ["function_id", "name", "script_name", "script_id", "line", "column"],
+          trace_node_fields: ["id", "function_info_index", "count", "size", "children"],
+          sample_fields: ["timestamp_us", "last_assigned_id"],
+          location_fields: ["object_index", "script_id", "line", "column"],
+        },
+        node_count: nodeCount,
+        edge_count: edges.length / 3,
+        trace_function_count: 0,
+      },
+      nodes,
+      edges,
+      trace_function_infos: [],
+      trace_tree: [],
+      samples: [],
+      locations: [],
+      strings,
+    };
+  }
+
+  // The snapshot as JSON text pieces, so a stream can hand them out without one giant string.
+  function* heapSnapshotChunks() {
+    const snap = buildHeapSnapshot();
+    yield `{"snapshot":${JSON.stringify(snap.snapshot)},\n"nodes":[`;
+    const rows = (array, width) => {
+      const out = [];
+      for (let i = 0; i < array.length; i += width * 1024) out.push(array.slice(i, i + width * 1024).join(","));
+      return out;
+    };
+    const emitList = function* (array, width) {
+      const pieces = rows(array, width);
+      for (let i = 0; i < pieces.length; i++) yield (i === 0 ? "" : ",") + pieces[i];
+    };
+    yield* emitList(snap.nodes, 7);
+    yield `],\n"edges":[`;
+    yield* emitList(snap.edges, 3);
+    yield `],\n"trace_function_infos":[],\n"trace_tree":[],\n"samples":[],\n"locations":[],\n"strings":[`;
+    for (let i = 0; i < snap.strings.length; i += 1024) {
+      const part = snap.strings.slice(i, i + 1024).map((s) => JSON.stringify(s)).join(",");
+      yield (i === 0 ? "" : ",") + part;
+    }
+    yield "]}\n";
+  }
+
+  function getHeapSnapshot(options) {
+    if (options !== undefined && (typeof options !== "object" || options === null)) {
+      throw new __errors.ERR_INVALID_ARG_TYPE("options", "Object", options);
+    }
+    const { Readable } = __builtins.get("stream");
+    const chunks = heapSnapshotChunks();
+    return new Readable({
+      read() {
+        const next = chunks.next();
+        this.push(next.done ? null : next.value);
+      },
+    });
+  }
+
+  let snapshotCounter = 0;
+  function writeHeapSnapshot(filename, options) {
+    if (filename !== undefined) {
+      if (typeof filename !== "string" && !(filename instanceof Uint8Array)) {
+        throw new __errors.ERR_INVALID_ARG_TYPE("path", ["string", "Buffer", "URL"], filename);
+      }
+    } else {
+      const d = new Date();
+      const pad = (n, w = 2) => String(n).padStart(w, "0");
+      filename = `Heap.${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${process.pid}.0.${pad(++snapshotCounter, 3)}.heapsnapshot`;
+    }
+    if (options !== undefined && (typeof options !== "object" || options === null)) {
+      throw new __errors.ERR_INVALID_ARG_TYPE("options", "Object", options);
+    }
+    const fs = __builtins.get("fs");
+    const fd = fs.openSync(filename, "w");
+    try {
+      for (const chunk of heapSnapshotChunks()) fs.writeSync(fd, chunk);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return filename;
   }
 
   const notSupported = (what) => () => {
@@ -341,14 +540,69 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     onSettled: () => noopStop,
   };
 
-  // startupSnapshot: we never build a V8 startup snapshot, so callbacks are inert and
-  // isBuildingSnapshot is always false — the honest state for a non-snapshotting process.
-  const startupSnapshot = {
-    addDeserializeCallback: () => {},
-    addSerializeCallback: () => {},
-    setDeserializeMainFunction: () => {},
-    isBuildingSnapshot: () => false,
+  // startupSnapshot: lumen has no heap serializer. A snapshot blob names the entry script; running
+  // from a blob replays that script (stdout/stderr muted) through the serialize and deserialize
+  // callbacks, then hands over to the deserialize main function or the requested script. The CLI
+  // drives this through the `lumen.snapshotControl` hooks.
+  const snapshotState = {
+    building: !!process[Symbol.for("lumen.options")]?.["--build-snapshot"],
+    serialize: [],
+    deserialize: [],
+    main: undefined,
+    mainData: undefined,
+    muted: null,
   };
+  const requireBuilding = () => {
+    if (!snapshotState.building) throw new __errors.ERR_NOT_BUILDING_SNAPSHOT();
+  };
+  const addCallback = (list, callback, data) => {
+    requireBuilding();
+    if (typeof callback !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+    list.push([callback, data]);
+  };
+  const runCallbacks = (list) => {
+    for (const [callback, data] of list.splice(0)) callback(data);
+  };
+  const startupSnapshot = {
+    addDeserializeCallback: (callback, data) => addCallback(snapshotState.deserialize, callback, data),
+    addSerializeCallback: (callback, data) => addCallback(snapshotState.serialize, callback, data),
+    setDeserializeMainFunction(callback, data) {
+      requireBuilding();
+      if (typeof callback !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+      if (snapshotState.main !== undefined) throw new __errors.ERR_DUPLICATE_STARTUP_SNAPSHOT_MAIN_FUNCTION();
+      snapshotState.main = callback;
+      snapshotState.mainData = data;
+    },
+    isBuildingSnapshot: () => snapshotState.building,
+  };
+  Object.defineProperty(startupSnapshot, Symbol.for("lumen.snapshotControl"), {
+    __proto__: null,
+    value: {
+      beginReplay() {
+        snapshotState.building = true;
+        const mute = () => true;
+        snapshotState.muted = [process.stdout.write, process.stderr.write];
+        process.stdout.write = mute;
+        process.stderr.write = mute;
+      },
+      endBuild() {
+        runCallbacks(snapshotState.serialize);
+        snapshotState.building = false;
+      },
+      endReplay() {
+        runCallbacks(snapshotState.serialize);
+        snapshotState.building = false;
+        [process.stdout.write, process.stderr.write] = snapshotState.muted;
+        runCallbacks(snapshotState.deserialize);
+        return snapshotState.main !== undefined;
+      },
+      runMain(args) {
+        process.argv = [process.execPath, ...args];
+        const { main, mainData } = snapshotState;
+        return main(mainData);
+      },
+    },
+  });
 
   __builtins.set("v8", {
     serialize,
@@ -366,8 +620,7 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     GCProfiler,
     promiseHooks,
     startupSnapshot,
-    // A non-V8 engine has no V8 flags to set — the honest result is a no-op.
-    setFlagsFromString: () => {},
+    setFlagsFromString,
     // No snapshot-on-near-heap-limit mechanism exists here; registering a limit is a no-op.
     setHeapSnapshotNearHeapLimit: () => {},
     // Coverage collection is not wired up (no NODE_V8_COVERAGE sink); these are the inert no-ops
@@ -376,8 +629,8 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     stopCoverage: () => {},
     // Heap introspection (walking live objects / writing .heapsnapshot) is unbackable without V8.
     queryObjects: notSupported("queryObjects"),
-    getHeapSnapshot: notSupported("heap snapshots"),
-    writeHeapSnapshot: notSupported("heap snapshots"),
+    getHeapSnapshot,
+    writeHeapSnapshot,
   });
 });
 
@@ -464,154 +717,6 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     return JSON.parse(str);
   }
   __builtins.set("stream/consumers", { arrayBuffer, blob, buffer, json, text });
-});
-
-// ---- node:readline ----------------------------------------------------------------------------
-// A real line reader over an input stream (the interactive cursor/history features a TTY would
-// provide are absent — lumen runs behind pipes — but line events, question(), and async iteration
-// all work).
-__lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
-  const { EventEmitter } = __builtins.get("events");
-  const kKeypressWired = Symbol("readline.keypressWired");
-
-  class Interface extends EventEmitter {
-    constructor(options) {
-      super();
-      const opts = options && options.input ? options : { input: options };
-      this.input = opts.input;
-      this.output = opts.output;
-      this._buf = "";
-      this._closed = false;
-      if (this.input && typeof this.input.on === "function") {
-        this.input.on("data", (chunk) => this._onData(chunk));
-        this.input.on("end", () => this.close());
-      }
-    }
-
-    _onData(chunk) {
-      this._buf += chunk.toString();
-      let idx;
-      while ((idx = this._buf.indexOf("\n")) >= 0) {
-        const line = this._buf.slice(0, idx).replace(/\r$/, "");
-        this._buf = this._buf.slice(idx + 1);
-        this.emit("line", line);
-      }
-    }
-
-    question(query, callback) {
-      if (this.output && typeof this.output.write === "function") this.output.write(query);
-      this.once("line", callback);
-    }
-
-    close() {
-      if (!this._closed) {
-        this._closed = true;
-        this.emit("close");
-      }
-    }
-
-    pause() { return this; }
-    resume() { return this; }
-    write() {}
-
-    [Symbol.asyncIterator]() {
-      const pending = [];
-      let done = false;
-      let waiting = null;
-      this.on("line", (line) => {
-        if (waiting) { waiting({ value: line, done: false }); waiting = null; }
-        else pending.push(line);
-      });
-      this.on("close", () => {
-        done = true;
-        if (waiting) { waiting({ value: undefined, done: true }); waiting = null; }
-      });
-      return {
-        next() {
-          return new Promise((resolve) => {
-            if (pending.length) resolve({ value: pending.shift(), done: false });
-            else if (done) resolve({ value: undefined, done: true });
-            else waiting = resolve;
-          });
-        },
-        [Symbol.asyncIterator]() { return this; },
-      };
-    }
-  }
-
-  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
-  Interface = __legacyConstructor(Interface);
-  const createInterface = (options) => new Interface(options);
-  const questionPromise = (rl) => (query) => new Promise((resolve) => rl.question(query, resolve));
-
-  // emitKeypressEvents(stream) — turn a stream's incoming data into 'keypress' events. lumen has no
-  // TTY key decoding, so this emits one keypress per character with a best-effort key descriptor,
-  // which is what non-TTY consumers of the API can observe.
-  const emitKeypressEvents = (stream, iface) => {
-    if (!stream || stream[kKeypressWired]) return;
-    stream[kKeypressWired] = true;
-    stream.on("data", (chunk) => {
-      const str = chunk.toString();
-      for (const ch of str) {
-        const key = { sequence: ch, name: undefined, ctrl: false, meta: false, shift: false };
-        if (ch === "\r" || ch === "\n") key.name = "return";
-        else if (ch === "\t") key.name = "tab";
-        else if (ch === "\x7f") key.name = "backspace";
-        else if (ch >= " ") key.name = ch.toLowerCase();
-        stream.emit("keypress", ch, key);
-      }
-    });
-  };
-
-  // node:readline/promises — same Interface with a promise-returning question(), plus the Readline
-  // class that batches cursor/screen operations and applies them on commit().
-  class Readline {
-    constructor(stream, options = {}) {
-      this._stream = stream;
-      this._autoCommit = Boolean(options.autoCommit);
-      this._ops = [];
-    }
-    _push(op) {
-      if (this._autoCommit) return this.commit();
-      this._ops.push(op);
-      return this;
-    }
-    clearLine(dir) { return this._push(() => {}); }
-    clearScreenDown() { return this._push(() => {}); }
-    cursorTo(x, y) { return this._push(() => {}); }
-    moveCursor(dx, dy) { return this._push(() => {}); }
-    commit() {
-      for (const op of this._ops) op();
-      this._ops = [];
-      return Promise.resolve();
-    }
-    rollback() {
-      this._ops = [];
-      return Promise.resolve();
-    }
-  }
-
-  const promisesModule = {
-    createInterface: (options) => {
-      const rl = new Interface(options);
-      rl.question = questionPromise(rl);
-      return rl;
-    },
-    Interface,
-    Readline,
-  };
-
-  __builtins.set("readline", {
-    createInterface,
-    Interface,
-    clearLine: () => true,
-    clearScreenDown: () => true,
-    cursorTo: () => true,
-    moveCursor: () => true,
-    emitKeypressEvents,
-    promises: promisesModule,
-  });
-  __builtins.set("readline/promises", promisesModule);
 });
 
 // ---- node:process ----------------------------------------------------------------------------
@@ -713,7 +818,7 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
       err.code = "ERR_INVALID_ARG_TYPE";
       throw err;
     }
-    return rawNextTick(__bindAsyncContext(callback), ...args);
+    return rawNextTick(__bindAsyncContext(callback, "TickObject", { callback, args }), ...args);
   };
 
   // exit() honors process.exitCode when called without an explicit code; reallyExit is the raw op.
@@ -734,7 +839,13 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   // are honored from execArgv.
   {
     // execArgv is stamped after the glue runs, so the flag-backed properties resolve on first read.
-    const hasFlag = (f) => Array.isArray(proc.execArgv) && proc.execArgv.includes(f);
+    const hasFlag = (f) => {
+      const options = proc[Symbol.for("lumen.options")];
+      if (options !== undefined) {
+        return f.startsWith("--no-") ? options["--" + f.slice(5)] === false : options[f] === true;
+      }
+      return Array.isArray(proc.execArgv) && proc.execArgv.includes(f);
+    };
     for (const [prop, flag] of [["noDeprecation", "--no-deprecation"], ["throwDeprecation", "--throw-deprecation"],
       ["traceDeprecation", "--trace-deprecation"], ["traceProcessWarnings", "--trace-warnings"]]) {
       Object.defineProperty(proc, prop, {
@@ -850,8 +961,50 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   const memoryUsage = () => ({ rss: metrics()[0], heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 });
   memoryUsage.rss = () => metrics()[0];
   proc.memoryUsage = memoryUsage;
+  const identity = proc[Symbol.for("lumen.identity")];
+  if (identity !== undefined) {
+    const credential = (kind, name, value) => {
+      if (typeof value === "number") {
+        __validators.validateUint32(value, name);
+        return value;
+      }
+      if (typeof value !== "string") throw new __errors.ERR_INVALID_ARG_TYPE(name, ["number", "string"], value);
+      const id = kind === "User" ? identity.uidOf(value) : identity.gidOf(value);
+      if (id === undefined) throw new __errors.ERR_UNKNOWN_CREDENTIAL(kind, value);
+      return id;
+    };
+    const defineSetter = (name, kind) => {
+      proc[name] = { [name](id) { return identity[name](credential(kind, "id", id)); } }[name];
+    };
+    defineSetter("setuid", "User");
+    defineSetter("seteuid", "User");
+    defineSetter("setgid", "Group");
+    defineSetter("setegid", "Group");
+    proc.setgroups = function setgroups(groups) {
+      __validators.validateArray(groups, "groups");
+      const ids = groups.map((group, i) => credential("Group", `groups[${i}]`, group));
+      return identity.setgroups(ids.join(","));
+    };
+    proc.initgroups = function initgroups(user, extraGroup) {
+      if (typeof user !== "number" && typeof user !== "string") {
+        throw new __errors.ERR_INVALID_ARG_TYPE("user", ["number", "string"], user);
+      }
+      if (typeof extraGroup !== "number" && typeof extraGroup !== "string") {
+        throw new __errors.ERR_INVALID_ARG_TYPE("extraGroup", ["number", "string"], extraGroup);
+      }
+      const gid = credential("Group", "extraGroup", extraGroup);
+      let userName = user;
+      if (typeof user === "number") {
+        userName = identity.userNameOf(user);
+        if (userName === undefined) throw new __errors.ERR_UNKNOWN_CREDENTIAL("User", String(user));
+      } else if (identity.uidOf(user) === undefined) {
+        throw new __errors.ERR_UNKNOWN_CREDENTIAL("User", user);
+      }
+      return identity.initgroups(userName, gid);
+    };
+  }
   proc.availableMemory = () => metrics()[14];
-  proc.constrainedMemory = () => metrics()[15];
+  proc.constrainedMemory = () => metrics()[15] || undefined;
   proc.cpuUsage = (previous) => {
     const m = metrics();
     const current = { user: m[2], system: m[3] };
@@ -896,7 +1049,7 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
         javascriptStack: { message: error ? String(error) : "No stack.", stack, errorProperties: {} },
         javascriptHeap: proc.memoryUsage(), resourceUsage: proc.resourceUsage(),
         environmentVariables: report.excludeEnv ? {} : { ...proc.env },
-        userLimits: {}, sharedObjects: [], workers: [],
+        libuv: [], userLimits: {}, sharedObjects: [], workers: [],
       };
     },
     writeReport(filename, error) {
@@ -917,9 +1070,6 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
     },
   };
   proc.report = report;
-
-  // lumen imposes no permission model, so every capability is genuinely permitted.
-  proc.permission = { has: () => true };
 
   const finalizationRecords = new WeakMap();
   const finalizer = new FinalizationRegistry((record) => {
@@ -969,16 +1119,43 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   // Not supported: replacing the process image / changing OS identity can't be done honestly
   // without the underlying syscall, and silently "succeeding" would misrepresent the result.
 
-  // Real state tracking (the callback isn't routed anywhere yet, but registration is honest).
   let uncaughtCb = null;
   proc.setUncaughtExceptionCaptureCallback = function (cb) {
-    if (cb !== null && typeof cb !== "function") {
-      throw new TypeError('The "fn" argument must be of type function or null');
+    if (cb === null) {
+      uncaughtCb = null;
+      return;
     }
-    if (cb !== null && uncaughtCb !== null) {
-      throw new Error("`process.setUncaughtExceptionCaptureCallback()` was called while a capture callback was already active");
+    if (typeof cb !== "function") {
+      throw new __errors.ERR_INVALID_ARG_TYPE("fn", ["Function", "null"], cb);
+    }
+    const Events = __builtins.get("events");
+    if (Events.usingDomains) {
+      const err = new __errors.ERR_DOMAIN_CANNOT_SET_UNCAUGHT_EXCEPTION_CAPTURE();
+      const loadedAt = Events[Symbol.for("lumen.domainRequireStack")];
+      if (typeof loadedAt === "string") err.stack = `${err.stack}\n${"-".repeat(40)}\n${loadedAt}`;
+      throw err;
+    }
+    if (uncaughtCb !== null) {
+      throw new __errors.ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET();
     }
     uncaughtCb = cb;
+  };
+  // The runtime's uncaught-error path asks this first (node:domain replaces it, chaining here).
+  Object.defineProperty(globalThis, "__lumen_domain_uncaught", {
+    value: (err) => {
+      if (uncaughtCb === null) return false;
+      uncaughtCb(err);
+      return true;
+    },
+    configurable: true, writable: true, enumerable: false,
+  });
+  proc._fatalException = function _fatalException(err) {
+    if (globalThis.__lumen_domain_uncaught(err)) return true;
+    if (proc.listenerCount("uncaughtException") > 0) {
+      proc.emit("uncaughtException", err, "uncaughtException");
+      return true;
+    }
+    return false;
   };
   proc.hasUncaughtExceptionCaptureCallback = () => uncaughtCb !== null;
 
@@ -1094,8 +1271,10 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
     if (!this._writableState.emitClose) process.nextTick(() => this.emit("close"));
   }
   function createWritableStdioStream(fd) {
-    const tty = __builtins.get("tty");
-    const stream = tty && proc._isatty && proc._isatty(fd)
+    __internals.get("console_native").setLive(fd);
+    const isTTY = proc._isatty && proc._isatty(fd);
+    const tty = isTTY ? __builtins.get("tty") : undefined;
+    const stream = tty
       ? new tty.WriteStream(fd)
       : new (syncWriteStream())(fd, rawStdio[fd]);
     stream.fd = fd;
@@ -1114,6 +1293,8 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
     configurable: true, enumerable: true,
     get() { return stderrStream ??= createWritableStdioStream(2); },
   });
+  __internals.get("console_native").watch(proc,
+    Object.getOwnPropertyDescriptor(proc, "stdout").get, Object.getOwnPropertyDescriptor(proc, "stderr").get);
 
   // child_process.fork IPC. Lumen has no extra inherited fd, so fork reserves stdin and frames
   // messages with a control-prefixed JSON line; ordinary stdout lines remain ordinary stdout.
@@ -1139,8 +1320,12 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
       closed = true; clearInterval(timer); forkConnected = false; forkDisconnected = true;
       try { __child.ipcClose(fd); } catch {}
       for (const item of queue.splice(0)) if (item.callback) item.callback(error || new Error("IPC channel closed"));
-      queuedBytes = 0; proc.emit("disconnect");
-      if (error) proc.emit("error", error);
+      queuedBytes = 0;
+      process.nextTick(() => {
+        proc.emit("disconnect");
+        // A cluster worker whose primary went away exits, as in the stdin-backed channel below.
+        if ((proc._lumenClusterWorker || (proc.env && proc.env.LUMEN_CLUSTER_WORKER === "1")) && !proc._clusterExitedAfterDisconnect) proc.exit(0);
+      });
     }
     function flush() {
       let writes=0;
@@ -1171,7 +1356,9 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
             const end=pending.indexOf("\n");if(end<0) break;
             const line=pending.slice(0,end);pending=pending.slice(end+1);
             if(line==="\x1eLUMEN_IPC_DISCONNECT") {close();return;}
-            proc.emit("message",__ipcWire.decode(line),null);
+            const message = __ipcWire.decode(line);
+            if (message !== null && typeof message === "object" && message.__lumenCluster !== undefined) proc.emit("internalMessage", message);
+            else proc.emit("message", message, null);
           }
         }
       } catch(error) {close(error);}
@@ -1224,15 +1411,23 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
     updateForkRef();
   };
   const forkSend = (message, sendHandle, options, callback) => {
-    if (typeof sendHandle === "function") callback = sendHandle;
-    else if (typeof options === "function") callback = options;
-    if (sendHandle != null && typeof sendHandle !== "function") {
-      const error = new Error("child_process.fork handle transfer is not supported in lumen");
-      if (callback) queueMicrotask(() => callback(error)); else throw error;
+    if (typeof sendHandle === "function") { callback = sendHandle; sendHandle = undefined; options = undefined; }
+    else if (typeof options === "function") { callback = options; options = undefined; }
+    else if (options !== undefined) __validators.validateObject(options, "options");
+    startForkIpc();
+    if (!forkConnected) {
+      const ex = new __errors.ERR_IPC_CHANNEL_CLOSED();
+      if (typeof callback === "function") process.nextTick(callback, ex);
+      else process.nextTick(() => proc.emit("error", ex));
       return false;
     }
-    startForkIpc();
-    if (!forkConnected) return false;
+    __builtins.get("child_process")._ipcWire.validate(message);
+    if (sendHandle != null) {
+      const error = new Error("child_process.fork handle transfer is not supported in lumen");
+      if (typeof callback === "function") process.nextTick(callback, error);
+      else process.nextTick(() => proc.emit("error", error));
+      return false;
+    }
     try {
       if (dedicatedIpc) return dedicatedIpc.send(__builtins.get("child_process")._ipcWire.encode(message,proc.env.LUMEN_FORK_IPC_MODE === "advanced"),callback);
       proc.stdout.write(IPC_PREFIX + JSON.stringify(message === undefined ? null : message) + "\n");
@@ -1258,7 +1453,11 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
     get() { return isForkChild() ? forkConnected : undefined; },
   });
   proc.disconnect = function () {
-    if (!isForkChild() || forkDisconnected) return;
+    if (!isForkChild()) return;
+    if (forkDisconnected || !forkConnected) {
+      proc.emit("error", new __errors.ERR_IPC_DISCONNECTED());
+      return;
+    }
     if (dedicatedIpc) {dedicatedIpc.disconnect();return;}
     forkDisconnected = true;
     forkConnected = false;
@@ -1292,8 +1491,6 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   proc._getActiveHandles = () => [];
   proc._getActiveRequests = () => [];
   proc._rawDebug = (...a) => { proc.stderr.write(a.join(" ") + "\n"); };
-  proc._tickCallback = () => {};
-  proc._fatalException = () => false;
   proc._exiting = false;
   proc._kill = (pid, sig) => proc.kill(pid, sig);
   proc._eval = undefined;

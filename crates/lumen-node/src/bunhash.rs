@@ -1273,7 +1273,7 @@ mod tests {
                 "murmur32v2" => murmur32v2(seed as u32, &input) as u64,
                 "murmur64v2" => murmur64v2(seed, &input),
                 "rapidhash" => rapidhash(seed, &input),
-                "crc32" => lumen_host::deflate::crc32_from(0, &input) as u64,
+                "crc32" => lumen_host::codec::crc32_from(0, &input) as u64,
                 "adler32" => adler32(&input) as u64,
                 other => panic!("unknown oracle family {other}"),
             };

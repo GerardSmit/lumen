@@ -78,7 +78,7 @@ fn client_multiplexes_requests_against_node_server() {
               client.close();
             }});
           }});
-          req.end(body);
+          if (body) req.end(body);
         }}
         request({{ ":method": "GET", ":path": "/first" }}, "");
         request({{ ":method": "POST", ":path": "/second" }}, "hello");

@@ -65,7 +65,7 @@
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use super::{
@@ -872,11 +872,13 @@ pub struct SectionStats {
 /// The directive that marks a function as run-once (see [`encode_unit`]).
 pub const RUN_ONCE: &str = "lumen:run-once";
 
-/// Whether `f`'s body opens with the [`RUN_ONCE`] directive.
+/// Whether `body` opens with the [`RUN_ONCE`] directive.
+pub(crate) fn opens_run_once(body: &[crate::ast::Stmt]) -> bool {
+    matches!(body.first(), Some(crate::ast::Stmt::Expr(crate::ast::Expr::Str(s))) if &**s == RUN_ONCE)
+}
+
 fn is_run_once(f: &Function) -> bool {
-    f.parsed_body().is_some_and(|body| {
-        matches!(body.first(), Some(crate::ast::Stmt::Expr(crate::ast::Expr::Str(s))) if &**s == RUN_ONCE)
-    })
+    f.parsed_body().is_some_and(|body| opens_run_once(&body))
 }
 
 pub(crate) fn encode_unit(funcs: &[Rc<Function>]) -> (Vec<u8>, SectionStats) {
@@ -1021,14 +1023,11 @@ fn dec_chunk_at(
     Ok(chunk)
 }
 
-/// A unit whose chunks decode on demand (see [`attach_unit`]).
-struct LazyUnit {
+/// A unit whose chunks decode on demand (see [`attach_unit`]): the unit's AST holds it, and a
+/// function finds its chunk by its own index.
+pub(crate) struct LazyUnit {
     section: &'static [u8],
     strings: RefCell<StrTable<'static>>,
-    /// The unit's AST, which resolves a chunk's inner functions by index (decoding their
-    /// headers if need be). Weak: the unit lives as long as any of its functions does, and a
-    /// chunk is only decoded for a live function.
-    ast: Weak<crate::snapshot::SplitUnit>,
     /// Where each function's entry begins within `section`, by function index: 8 bytes of
     /// `(start, len)` u32 LE, [`NO_ENTRY`], [`REFUSED`], or the chunk's range within `section`.
     entries_at: usize,
@@ -1049,75 +1048,6 @@ impl LazyUnit {
 
 const NO_ENTRY: (u32, u32) = (0, 0);
 const REFUSED: (u32, u32) = (u32::MAX, 0);
-
-struct LazyEntry {
-    unit: Rc<LazyUnit>,
-    idx: usize,
-    bytes: std::ops::Range<usize>,
-}
-
-thread_local! {
-    /// Precompiled chunks not yet decoded, by function identity. Keys are only compared with a
-    /// live function's address: the unit's `Weak` keeps each registered allocation from being
-    /// reused, so an address match is that very function.
-    static LAZY: RefCell<LazyMap> = RefCell::new(LazyMap::default());
-    /// On a coroutine worker thread, the table of the thread driving it (see [`lazy_enter`]);
-    /// null elsewhere.
-    static LAZY_DRIVER: std::cell::Cell<*const RefCell<LazyMap>> =
-        const { std::cell::Cell::new(std::ptr::null()) };
-}
-
-/// Run `f` on this thread's table of registered chunks: its own, or on a coroutine worker the
-/// driver's (a body running there decodes function headers, which register their chunks).
-fn with_lazy<T>(f: impl FnOnce(&RefCell<LazyMap>) -> T) -> T {
-    let driver = LAZY_DRIVER.with(|d| d.get());
-    if driver.is_null() {
-        LAZY.with(f)
-    } else {
-        // SAFETY: set by `lazy_enter` to the driving thread's table, which outlives the
-        // coroutine, and only this thread runs while the driver is parked (the coroutine
-        // handoff is strict ping-pong).
-        f(unsafe { &*driver })
-    }
-}
-
-/// The table this thread's code uses, for a coroutine body it hands to a worker thread
-/// (opaque; see [`lazy_enter`]).
-pub(crate) fn lazy_handle() -> *const () {
-    let driver = LAZY_DRIVER.with(|d| d.get());
-    if driver.is_null() {
-        with_lazy(|l| l as *const RefCell<LazyMap> as *const ())
-    } else {
-        driver as *const ()
-    }
-}
-
-/// Make this (coroutine worker) thread use `table` ([`lazy_handle`] of its driver), or its own
-/// again for null; returns the previous setting.
-pub(crate) fn lazy_enter(table: *const ()) -> *const () {
-    LAZY_DRIVER.with(|d| d.replace(table as *const RefCell<LazyMap>)) as *const ()
-}
-
-type LazyMap = HashMap<*const Function, LazyEntry, std::hash::BuildHasherDefault<PtrHasher>>;
-
-/// Hashes a pointer key with one multiply (registration inserts one key per function of a
-/// bundle; SipHash would be most of the load-time cost of the table).
-#[derive(Default)]
-struct PtrHasher(u64);
-
-impl std::hash::Hasher for PtrHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        }
-    }
-    fn write_usize(&mut self, v: usize) {
-        self.0 = ((v as u64) >> 3).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-}
 
 /// Attach a unit's bytecode section to its AST: every function the unit decodes (now or
 /// later — function headers decode on demand, see [`crate::snapshot::SplitUnit`]) is passed
@@ -1143,17 +1073,9 @@ pub(crate) fn attach_unit(
             data,
             interned: Default::default(),
         }),
-        ast: Rc::downgrade(ast),
         entries_at,
     });
-    with_lazy(|lazy| {
-        // Drop registrations whose function died (their allocations are only pinned by the
-        // unit's table), so reloading a program does not grow the table forever.
-        let mut lazy = lazy.borrow_mut();
-        if lazy.len() > 4096 {
-            lazy.retain(|&f, e| e.unit.ast.upgrade().is_some_and(|u| u.is(e.idx, f)));
-        }
-    });
+    ast.set_chunks(unit.clone());
     ast.set_hook(Box::new(move |idx, f| register(&unit, idx, f)));
     Ok(())
 }
@@ -1167,19 +1089,13 @@ fn register(unit: &Rc<LazyUnit>, idx: usize, f: &Rc<Function>) {
                 REFUSALS.fetch_add(1, Relaxed);
             }
         }
-        (start, len) => {
+        _ => {
             if f.code.get().is_some() {
                 return;
             }
             // Tier up on the first call: the chunk is ready, and running the function on the
             // tree-walker first would decode its (deferred) body.
             f.calls.set(f.calls.get().max(u32::MAX - 1));
-            let entry = LazyEntry {
-                unit: unit.clone(),
-                idx,
-                bytes: start as usize..(start + len) as usize,
-            };
-            with_lazy(|lazy| lazy.borrow_mut().insert(Rc::as_ptr(f), entry));
             REGISTERED.fetch_add(1, Relaxed);
         }
     }
@@ -1196,29 +1112,29 @@ pub(crate) fn attach_now(f: &Rc<Function>) {
 
 /// Precompiled chunks registered and not yet decoded (for the `LUMEN_MEM_STATS` report).
 pub(crate) fn lazy_registered() -> usize {
-    with_lazy(|l| l.borrow().len())
+    REGISTERED
+        .load(Relaxed)
+        .saturating_sub(ATTACHED.load(Relaxed)) as usize
 }
 
-/// The precompiled chunk registered for `func`, decoded (consumed: the caller caches it in
-/// `func.code`). `None` = nothing registered, or its bytes failed to decode — the caller
-/// compiles as usual.
+/// The precompiled chunk registered for `func`, decoded (the caller caches it in `func.code`).
+/// `None` = nothing registered, or its bytes failed to decode — the caller compiles as usual.
 pub(crate) fn take_precompiled(func: &Function) -> Option<Rc<Chunk>> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::ChunkDecode);
-    let entry = with_lazy(|lazy| {
-        let mut lazy = lazy.borrow_mut();
-        if lazy.is_empty() {
-            return None;
-        }
-        lazy.remove(&(func as *const Function))
-    })?;
-    let unit = &entry.unit;
-    let ast = unit.ast.upgrade()?;
-    if !ast.is(entry.idx, func as *const Function) {
+    let (ast, idx) = {
+        let lazy = func.lazy.borrow();
+        let aot = lazy.as_ref()?.aot.as_ref()?;
+        (aot.unit.clone(), aot.idx)
+    };
+    let unit = ast.chunks()?;
+    let (start, len) = unit.entry(idx);
+    if (start, len) == NO_ENTRY || (start, len) == REFUSED {
         return None;
     }
     let lookup = |i: usize| ast.function(i).ok();
     let mut strings = unit.strings.borrow_mut();
-    let chunk = dec_chunk_at(unit.section.get(entry.bytes)?, &mut strings, &lookup).ok()?;
+    let bytes = unit.section.get(start as usize..(start + len) as usize)?;
+    let chunk = dec_chunk_at(bytes, &mut strings, &lookup).ok()?;
     ATTACHED.fetch_add(1, Relaxed);
     Some(Rc::new(chunk))
 }
@@ -1312,7 +1228,11 @@ mod tests {
         let funcs = unit.all_functions().unwrap();
         let chunks = funcs
             .iter()
-            .filter(|f| with_lazy(|l| l.borrow().contains_key(&Rc::as_ptr(f))))
+            .enumerate()
+            .filter(|(i, f)| {
+                f.code.get().is_none()
+                    && unit.chunks().is_some_and(|u| !matches!(u.entry(*i), NO_ENTRY | REFUSED))
+            })
             .count();
         let refusals = funcs.iter().filter(|f| matches!(f.code.get(), Some(None))).count();
         (funcs, chunks, refusals)

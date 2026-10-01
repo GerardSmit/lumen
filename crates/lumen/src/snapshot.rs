@@ -590,6 +590,8 @@ pub(crate) struct SplitUnit {
     /// hold it; one that died is decoded again if referred to again.
     funcs: RefCell<Vec<std::rc::Weak<Function>>>,
     hook: RefCell<Option<Rc<dyn Fn(usize, &Rc<Function>)>>>,
+    /// The unit's undecoded bytecode chunks (see `bytecode::serialize::attach_unit`).
+    chunks: RefCell<Option<Rc<crate::bytecode::serialize::LazyUnit>>>,
 }
 
 impl SplitUnit {
@@ -638,6 +640,7 @@ impl SplitUnit {
             kept,
             funcs: RefCell::new((0..n).map(|_| std::rc::Weak::new()).collect()),
             hook: RefCell::new(None),
+            chunks: RefCell::new(None),
         }))
     }
 
@@ -667,6 +670,14 @@ impl SplitUnit {
         Ok((from..to).filter(|&j| self.row(j).0 == code).collect())
     }
 
+    pub(crate) fn set_chunks(&self, chunks: Rc<crate::bytecode::serialize::LazyUnit>) {
+        *self.chunks.borrow_mut() = Some(chunks);
+    }
+
+    pub(crate) fn chunks(&self) -> Option<Rc<crate::bytecode::serialize::LazyUnit>> {
+        self.chunks.borrow().clone()
+    }
+
     /// Install the hook every later-decoded function is passed to (the bytecode attach: see
     /// `bytecode::serialize::attach_unit`), and pass it the functions decoded so far.
     pub(crate) fn set_hook(&self, hook: FunctionHook) {
@@ -682,14 +693,6 @@ impl SplitUnit {
         for (i, f) in live {
             hook(i, &f);
         }
-    }
-
-    /// Whether function `i` is `f` (decoded and still alive as that node).
-    pub(crate) fn is(&self, i: usize, f: *const Function) -> bool {
-        self.funcs
-            .borrow()
-            .get(i)
-            .is_some_and(|w| w.strong_count() > 0 && w.as_ptr() == f)
     }
 
     /// Function `i`, decoding its header if it is not alive.

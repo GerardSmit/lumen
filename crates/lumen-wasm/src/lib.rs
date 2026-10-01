@@ -4,6 +4,9 @@
 
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "runtime")]
+mod runtime;
+
 /// Bridge the engine's wall clock to the embedding page.
 fn js_clock_ms() -> f64 {
     js_sys::Date::now()

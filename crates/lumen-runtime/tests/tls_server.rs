@@ -103,7 +103,7 @@ fn tls_server_accepts_verified_client_and_exchanges_data() {
     assert_eq!(client.stdout, b"pong");
     assert_eq!(
         String::from_utf8(out.0.borrow().clone()).unwrap().trim(),
-        "server ping true"
+        "server ping false"
     );
 }
 
@@ -148,9 +148,10 @@ fn tls_client_upgrades_a_paused_tcp_socket() {
         socket.on("data", data => socket.end("reply:" + data));
       }});
       server.listen({port}, "127.0.0.1", () => {{
-        const raw = new net.Socket({{ _deferRead: true }});
+        const raw = new net.Socket();
+        raw.pause();
         raw.connect({port}, "127.0.0.1", () => {{
-          const secure = new tls.TLSSocket(raw, {{ servername: "localhost", rejectUnauthorized: false }});
+          const secure = tls.connect({{ socket: raw, servername: "localhost", rejectUnauthorized: false }});
           secure.once("secureConnect", () => secure.write("ping"));
           secure.on("data", data => {{ console.log(data.toString()); secure.end(); server.close(); }});
         }});

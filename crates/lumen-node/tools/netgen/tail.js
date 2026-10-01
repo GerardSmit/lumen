@@ -1,5 +1,9 @@
 // ---- registration ------------------------------------------------------------------------------
 
+// node:dgram and node:dns are defined in this module table; their glue files pick them up here.
+__internals.set("netRequire", require);
+// node:tls (tls.js) runs over the same module table and handle bindings.
+__internals.set("netBinding", internalBinding);
 __builtins.set("net", require("net"));
 {
   const http = require("http");
@@ -15,8 +19,6 @@ __builtins.set("net", require("net"));
   __builtins.set("_http_outgoing", require("_http_outgoing"));
   __builtins.set("_http_server", require("_http_server"));
 }
-// node:https needs node:tls, which loads later: tls.js registers it through this hook.
-__internals.set("loadHttps", () => require("https"));
 
 // process.binding(): Node 20 still serves an allowlist of internal bindings (DEP0111, a warning
 // only under --pending-deprecation). The ones this glue implements are served from here.

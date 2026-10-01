@@ -27,6 +27,7 @@ use lumen_common::bigint;
 mod builtins;
 pub mod bytebuf;
 pub mod bytecode;
+mod console_fmt;
 mod coroutine;
 /// Typed Rust <-> JS conversions and the runtime of the binding macros (see [`embed`]).
 #[cfg(feature = "embed")]
@@ -150,6 +151,23 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 pub use parser::with_eager_bodies;
 pub use stack::{set_thread_stack_size, THREAD_STACK_SIZE};
 
+/// Parse `src` without running it: as an ES module when `module`, otherwise as a CommonJS
+/// module body (where a top-level `return` is legal). Node's `--check`.
+pub fn check_syntax(src: &str, module: bool) -> Result<(), ParseError> {
+    let fmt = |e: parser::ParseError| ParseError {
+        message: e.message,
+        line: e.line,
+        at_eof: e.at_eof,
+    };
+    if module {
+        parser::parse_module(src).map(|_| ()).map_err(fmt)
+    } else {
+        parser::parse_cjs_function(src, &[], false)
+            .map(|_| ())
+            .map_err(fmt)
+    }
+}
+
 /// A JS string's text as well-formed UTF-8 (lone surrogates become U+FFFD): what encoders
 /// such as `TextEncoder` write, as opposed to the engine's internal form.
 pub fn well_formed_utf8(s: &str) -> std::borrow::Cow<'_, str> {
@@ -178,6 +196,17 @@ pub enum Completion {
     /// A value was thrown. `name` is the error's constructor name (`"TypeError"`, …) when the
     /// thrown value is an Error object, else `""`.
     Throw { name: String, message: String },
+}
+
+/// Parse `src` as a plain script without running it.
+pub fn check_script_syntax(src: &str) -> Result<(), ParseError> {
+    parser::parse_script(src, false)
+        .map(|_| ())
+        .map_err(|e| ParseError {
+            message: e.message,
+            line: e.line,
+            at_eof: e.at_eof,
+        })
 }
 
 /// A JavaScript engine instance: one realm (global object + intrinsics) that persists across

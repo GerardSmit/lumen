@@ -5,6 +5,8 @@
 
 const kBlobBytes = Symbol("blobBytes");
 const kBlobType = Symbol("blobType");
+const kBlobFile = Symbol("blobFile");
+const kFileChunk = 65536;
 
 // Clamp a Blob.slice() index (negative = from the end), per spec.
 function clampSlice(value, size) {
@@ -45,17 +47,22 @@ class Blob {
     this[kBlobType] = /[^ -~]/.test(type) ? "" : type.toLowerCase();
   }
   get size() {
-    return this[kBlobBytes].length;
+    return this[kBlobFile] ? this[kBlobFile].size : this[kBlobBytes].length;
   }
   get type() {
     return this[kBlobType];
   }
   slice(start, end, contentType) {
-    const bytes = this[kBlobBytes];
-    const s = clampSlice(start, bytes.length) ?? 0;
-    const e = clampSlice(end, bytes.length) ?? bytes.length;
+    const file = this[kBlobFile];
+    const size = this.size;
+    const s = clampSlice(start, size) ?? 0;
+    const e = Math.max(s, clampSlice(end, size) ?? size);
     const b = new Blob([], { type: contentType });
-    b[kBlobBytes] = bytes.slice(s, Math.max(s, e));
+    if (file) {
+      makeFileBacked(b, { size: e - s, read: (from, to) => file.read(s + from, s + to) });
+    } else {
+      b[kBlobBytes] = this[kBlobBytes].slice(s, e);
+    }
     return b;
   }
   async text() {
@@ -69,8 +76,28 @@ class Blob {
     return this[kBlobBytes].slice();
   }
   stream() {
+    const file = this[kBlobFile];
+    if (file) {
+      let offset = 0;
+      return new globalThis.ReadableStream({
+        pull(controller) {
+          try {
+            if (offset >= file.size) {
+              controller.close();
+              return;
+            }
+            const end = Math.min(offset + kFileChunk, file.size);
+            const chunk = file.read(offset, end);
+            offset = end;
+            controller.enqueue(chunk);
+          } catch (e) {
+            controller.error(e);
+          }
+        },
+      });
+    }
     const bytes = this[kBlobBytes];
-    return new ReadableStream({
+    return new globalThis.ReadableStream({
       start(controller) {
         if (bytes.length) controller.enqueue(bytes.slice());
         controller.close();
@@ -81,6 +108,20 @@ class Blob {
     return "Blob";
   }
 }
+
+// A Blob whose bytes stay on disk: `read(from, to)` fetches a range and throws
+// NotReadableError once the file no longer matches what was opened.
+function makeFileBacked(blob, source) {
+  blob[kBlobFile] = source;
+  Object.defineProperty(blob, kBlobBytes, { get: () => source.read(0, source.size), configurable: true });
+  return blob;
+}
+
+Object.defineProperty(Blob, Symbol.for("lumen.fileBlob"), {
+  value(size, type, read) {
+    return makeFileBacked(new Blob([], { type }), { size, read });
+  },
+});
 
 const kFileName = Symbol("fileName");
 const kFileLastMod = Symbol("fileLastModified");

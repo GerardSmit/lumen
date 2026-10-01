@@ -74,30 +74,106 @@ const WINDOWS_1252_C1 = [
   0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
   0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178,
 ];
+const UTF8_LABELS = new Set([
+  "utf-8", "utf8", "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "x-unicode20utf8",
+]);
+const UTF16LE_LABELS = new Set(["csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le"]);
+const UTF16BE_LABELS = new Set(["unicodefffe", "utf-16be"]);
+
+function codedError(Ctor, code, message) {
+  const err = new Ctor(message);
+  err.code = code;
+  if (typeof err.stack === "string") {
+    err.stack = `${err.name} [${code}]${err.stack.slice(err.name.length)}`;
+  }
+  return err;
+}
+
+function receivedSuffix(value) {
+  if (value === null || value === undefined) return ` Received ${value}`;
+  if (typeof value === "function") return ` Received function ${value.name}`;
+  if (typeof value === "object") {
+    const name = value.constructor?.name;
+    return name ? ` Received an instance of ${name}` : " Received [Object: null prototype] {}";
+  }
+  let shown = typeof value === "string" ? `'${value.length > 28 ? value.slice(0, 25) + "..." : value}'` : String(value);
+  if (typeof value === "bigint") shown += "n";
+  return ` Received type ${typeof value} (${shown})`;
+}
+
+const decoderState = new WeakMap();
+
+function decoderOf(self) {
+  const state = decoderState.get(self);
+  if (state === undefined) throw codedError(TypeError, "ERR_INVALID_THIS", 'Value of "this" must be of type TextDecoder');
+  return state;
+}
+
+function fatalDecodeError(encoding) {
+  return codedError(TypeError, "ERR_ENCODING_INVALID_ENCODED_DATA", `The encoded data was not valid for encoding ${encoding}`);
+}
+
+function unitsToString(units) {
+  let out = "";
+  for (let i = 0; i < units.length; i += 4096) {
+    out += String.fromCharCode.apply(null, units.slice(i, i + 4096));
+  }
+  return out;
+}
+
 class TextDecoder {
   constructor(label = "utf-8", options = {}) {
     const l = String(label).replace(/^[\x09\x0a\x0c\x0d\x20]+|[\x09\x0a\x0c\x0d\x20]+$/g, "").toLowerCase();
-    if (["utf-8", "utf8", "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "x-unicode20utf8"].includes(l)) {
-      this.encoding = "utf-8";
-    } else if (WINDOWS_1252_LABELS.has(l)) {
-      this.encoding = "windows-1252";
-    } else {
-      throw new RangeError(`TextDecoder: unsupported encoding '${label}' (UTF-8 and Windows-1252 are supported)`);
+    let encoding;
+    if (UTF8_LABELS.has(l)) encoding = "utf-8";
+    else if (UTF16LE_LABELS.has(l)) encoding = "utf-16le";
+    else if (UTF16BE_LABELS.has(l)) encoding = "utf-16be";
+    else if (WINDOWS_1252_LABELS.has(l)) encoding = "windows-1252";
+    else throw codedError(RangeError, "ERR_ENCODING_NOT_SUPPORTED", `The "${label}" encoding is not supported`);
+    if (options !== null && typeof options !== "object" && typeof options !== "function") {
+      throw codedError(TypeError, "ERR_INVALID_ARG_TYPE", `The "options" argument must be of type object.${receivedSuffix(options)}`);
     }
-    options = options && typeof options === "object" ? options : {};
-    this.fatal = !!options.fatal;
-    this.ignoreBOM = !!options.ignoreBOM;
-    this._pending = null; // an incomplete trailing sequence held back by a streaming decode
-    this._bomSeen = false; // the stream's first bytes have been decoded (BOM handled)
+    options = options ?? {};
+    decoderState.set(this, {
+      encoding,
+      fatal: !!options.fatal,
+      ignoreBOM: !!options.ignoreBOM,
+      pending: null, // an incomplete trailing sequence held back by a streaming decode
+      lead: -1, // a UTF-16 high surrogate awaiting its pair
+      bomSeen: false, // the stream's first bytes have been decoded (BOM handled)
+    });
+  }
+  get encoding() {
+    return decoderOf(this).encoding;
+  }
+  get fatal() {
+    return decoderOf(this).fatal;
+  }
+  get ignoreBOM() {
+    return decoderOf(this).ignoreBOM;
+  }
+  [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+    const state = decoderOf(this);
+    if (typeof depth === "number" && depth < 0) return this;
+    const shown = { encoding: state.encoding, fatal: state.fatal, ignoreBOM: state.ignoreBOM };
+    return `${this.constructor.name} ${inspect ? inspect(shown, options) : JSON.stringify(shown)}`;
   }
   decode(input, options) {
-    const stream = !!(options && typeof options === "object" && options.stream);
+    const state = decoderOf(this);
+    if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function") {
+      throw codedError(TypeError, "ERR_INVALID_ARG_TYPE", `The "options" argument must be of type object.${receivedSuffix(options)}`);
+    }
+    const stream = !!(options && options.stream);
     let bytes;
     if (input === undefined) bytes = new Uint8Array(0);
     else if (input instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && input instanceof SharedArrayBuffer)) bytes = new Uint8Array(input);
     else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-    else throw new TypeError("TextDecoder.decode expects a BufferSource");
-    if (this.encoding === "windows-1252") {
+    else {
+      throw codedError(TypeError, "ERR_INVALID_ARG_TYPE",
+        `The "input" argument must be an instance of ArrayBuffer or ArrayBufferView.${receivedSuffix(input)}`);
+    }
+    const { encoding } = state;
+    if (encoding === "windows-1252") {
       let result = "";
       for (let j = 0; j < bytes.length; j++) {
         const byte = bytes[j];
@@ -106,30 +182,87 @@ class TextDecoder {
       // A single-byte encoding has no pending multibyte tail or BOM to remove.
       return result;
     }
-    if (this._pending !== null) {
-      const joined = new Uint8Array(this._pending.length + bytes.length);
-      joined.set(this._pending);
-      joined.set(bytes, this._pending.length);
+    if (state.pending !== null) {
+      const joined = new Uint8Array(state.pending.length + bytes.length);
+      joined.set(state.pending);
+      joined.set(bytes, state.pending.length);
       bytes = joined;
-      this._pending = null;
+      state.pending = null;
     }
-    if (stream) {
-      const keep = incompleteUtf8Tail(bytes);
-      if (keep > 0) {
-        this._pending = bytes.slice(bytes.length - keep);
-        bytes = bytes.subarray(0, bytes.length - keep);
+    let s;
+    if (encoding === "utf-8") {
+      if (stream) {
+        const keep = incompleteUtf8Tail(bytes);
+        if (keep > 0) {
+          state.pending = bytes.slice(bytes.length - keep);
+          bytes = bytes.subarray(0, bytes.length - keep);
+        }
       }
+      try {
+        s = bytes.length === 0 ? "" : __encoding.decode(bytes, state.fatal);
+      } catch (e) {
+        state.pending = null;
+        state.bomSeen = false;
+        throw state.fatal ? fatalDecodeError(encoding) : e;
+      }
+    } else {
+      s = this._decodeUtf16(state, bytes, stream);
     }
-    let s = bytes.length === 0 ? "" : __encoding.decode(bytes, this.fatal);
-    if (!this._bomSeen && s.length !== 0) {
-      if (!this.ignoreBOM && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
-      this._bomSeen = true;
+    if (!state.bomSeen && s.length !== 0) {
+      if (!state.ignoreBOM && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
+      state.bomSeen = true;
     }
     // A non-streaming call ends the stream: the next decode starts a new one.
-    if (!stream) this._bomSeen = false;
+    if (!stream) state.bomSeen = false;
     return s;
   }
+  _decodeUtf16(state, bytes, stream) {
+    const be = state.encoding === "utf-16be";
+    const units = [];
+    const bad = () => {
+      if (state.fatal) {
+        state.pending = null;
+        state.lead = -1;
+        state.bomSeen = false;
+        throw fatalDecodeError(state.encoding);
+      }
+      units.push(0xfffd);
+    };
+    const even = bytes.length & ~1;
+    for (let k = 0; k < even; k += 2) {
+      const u = be ? (bytes[k] << 8) | bytes[k + 1] : (bytes[k + 1] << 8) | bytes[k];
+      if (state.lead !== -1) {
+        if (u >= 0xdc00 && u <= 0xdfff) {
+          units.push(state.lead, u);
+          state.lead = -1;
+          continue;
+        }
+        state.lead = -1;
+        bad();
+      }
+      if (u >= 0xd800 && u <= 0xdbff) state.lead = u;
+      else if (u >= 0xdc00 && u <= 0xdfff) bad();
+      else units.push(u);
+    }
+    if (stream) {
+      if (even !== bytes.length) state.pending = bytes.slice(even);
+    } else {
+      if (state.lead !== -1) {
+        state.lead = -1;
+        bad();
+      }
+      if (even !== bytes.length) bad();
+    }
+    return unitsToString(units);
+  }
 }
+Object.defineProperties(TextDecoder.prototype, {
+  encoding: { enumerable: true },
+  fatal: { enumerable: true },
+  ignoreBOM: { enumerable: true },
+  decode: { enumerable: true },
+  [Symbol.toStringTag]: { value: "TextDecoder", configurable: true },
+});
 
 // The length of a trailing UTF-8 sequence that is a valid but incomplete prefix (0 if none).
 function incompleteUtf8Tail(bytes) {
@@ -154,41 +287,15 @@ function incompleteUtf8Tail(bytes) {
   return 0;
 }
 
-const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 function btoa(data) {
-  const s = String(data);
-  let out = "";
-  for (let i = 0; i < s.length; i += 3) {
-    const cs = [s.charCodeAt(i), s.charCodeAt(i + 1), s.charCodeAt(i + 2)];
-    if (cs[0] > 255 || cs[1] > 255 || cs[2] > 255) {
-      throw new DOMException("btoa: character beyond latin1 range", "InvalidCharacterError");
-    }
-    const n = (cs[0] << 16) | ((cs[1] || 0) << 8) | (cs[2] || 0);
-    out += B64_ALPHABET[(n >> 18) & 63];
-    out += B64_ALPHABET[(n >> 12) & 63];
-    out += i + 1 < s.length ? B64_ALPHABET[(n >> 6) & 63] : "=";
-    out += i + 2 < s.length ? B64_ALPHABET[n & 63] : "=";
-  }
+  const out = __encoding.btoa(data);
+  if (out === null) throw new DOMException("btoa: character beyond latin1 range", "InvalidCharacterError");
   return out;
 }
 
 function atob(data) {
-  let s = String(data).replace(/[\t\n\f\r ]/g, "");
-  if (s.length % 4 === 0) s = s.replace(/==?$/, "");
-  if (s.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(s)) {
-    throw new DOMException("atob: invalid base64", "InvalidCharacterError");
-  }
-  let out = "";
-  for (let i = 0; i < s.length; i += 4) {
-    const bits = [0, 1, 2, 3].map((j) =>
-      j + i < s.length ? B64_ALPHABET.indexOf(s[i + j]) : 0
-    );
-    const n = (bits[0] << 18) | (bits[1] << 12) | (bits[2] << 6) | bits[3];
-    out += String.fromCharCode((n >> 16) & 255);
-    if (i + 2 < s.length) out += String.fromCharCode((n >> 8) & 255);
-    if (i + 3 < s.length) out += String.fromCharCode(n & 255);
-  }
+  const out = __encoding.atob(data);
+  if (out === null) throw new DOMException("atob: invalid base64", "InvalidCharacterError");
   return out;
 }
 
@@ -225,6 +332,10 @@ function structuredClone(value, options) {
   }
   const seen = new Map();
   for (const t of transfer) {
+    if (t instanceof AbortSignal && t[kTransferableSignal] === true) {
+      seen.set(t, cloneTransferableSignal(t));
+      continue;
+    }
     if (!cloneIsArrayBuffer(t)) throw cloneDataCloneError("Found invalid value in transferList.");
     if (seen.has(t)) throw cloneDataCloneError("ArrayBuffer at index 1 is a duplicate of an earlier ArrayBuffer. Duplicate array buffers are not allowed.");
     if (t.detached) throw cloneDataCloneError("An ArrayBuffer is detached and could not be cloned.");
@@ -236,6 +347,9 @@ function structuredClone(value, options) {
     if (v === null || typeof v !== "object") return v;
     if (seen.has(v)) return seen.get(v);
     if (globalThis.__lumenPortClone?.isPort(v)) throw cloneDataCloneError("MessagePort must be listed in transferList.");
+    if (v instanceof Blob && v[kBlobFile]) {
+      throw codedError(Error, "ERR_INVALID_STATE", "Invalid state: File-backed Blobs are not cloneable");
+    }
     let out;
     if (globalThis.__cloneTransfer && (out=globalThis.__cloneTransfer.cloneShared(v)) !== undefined) {
       seen.set(v,out);
@@ -307,7 +421,7 @@ function structuredClone(value, options) {
     return out;
   };
   const result = clone(value);
-  for (const t of transfer) t.transfer(); // detach the originals
+  for (const t of transfer) if (!(t instanceof AbortSignal)) t.transfer(); // detach the originals
   return result;
 }
 

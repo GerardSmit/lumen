@@ -264,9 +264,16 @@ impl Scope {
         self.rare.as_ref()?.with_obj.as_ref()
     }
 
-    pub(crate) fn clear_with_obj(&mut self) {
-        if let Some(r) = &mut self.rare {
-            r.with_obj = None;
+    /// Drop the references to other heap nodes held outside the binding map and parent link (a
+    /// `with` object, module import targets), returning the import targets so the caller can
+    /// release them once this scope is no longer borrowed.
+    pub(crate) fn clear_rare_edges(&mut self) -> Vec<(Rc<str>, (Env, String))> {
+        match &mut self.rare {
+            Some(r) => {
+                r.with_obj = None;
+                std::mem::take(&mut r.imports)
+            }
+            None => Vec::new(),
         }
     }
 
@@ -1496,7 +1503,7 @@ impl Interp {
             tier_threshold: std::env::var("LUMEN_TIER_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+                .unwrap_or(if cfg!(target_arch = "wasm32") { 0 } else { 8 }),
             vm_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
             vm_frame_one: Vec::new(),
@@ -6620,6 +6627,11 @@ impl Interp {
         if has_using {
             let frame = self.using_stack.pop().unwrap_or_default();
             result = self.dispose_frame(frame, result);
+        }
+        // A run-once body (a lazily loaded glue file's) is not needed again: release it now
+        // rather than at a collection.
+        if crate::bytecode::serialize::opens_run_once(&stmts) {
+            func.release_body();
         }
         // [[Construct]]: a non-object return yields the *current* `this` binding — which a
         // derived constructor's super() may have rebound to a base constructor's returned object.

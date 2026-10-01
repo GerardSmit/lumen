@@ -274,6 +274,11 @@ function isAnyArrayBuffer(v) {
 }
 
 class Buffer extends Uint8Array {
+  static of(...items) {
+    const b = new BufferClass(items.length);
+    for (let i = 0; i < items.length; i++) b[i] = items[i];
+    return b;
+  }
   static from(value, encodingOrOffset, length) {
     if (typeof value === "string") return adopt(bytesFromString(value, encodingOrOffset));
     if (typeof value === "object" && value !== null) {
@@ -834,15 +839,24 @@ const kStringMaxLength = 1 << 26;
 // allocates (zero-filled), anything else goes through Buffer.from. Subclasses still get the
 // Uint8Array constructor, and so do TypedArray methods that build a Buffer through the species
 // constructor (`subarray` passes an ArrayBuffer, which Buffer.from turns into a view).
-// DEP0005. Node warns for calls outside node_modules, which it tells from the caller's file in the
-// stack; lumen's frames carry no file names, so it warns only under --pending-deprecation (where
-// Node warns unconditionally) rather than risk flagging every dependency.
+// DEP0005: warned once, for calls whose first non-internal stack frame is outside node_modules
+// (or unconditionally under --pending-deprecation).
 let bufferWarned = false;
+function insideNodeModules() {
+  const frames = String(new Error().stack).split("\n").slice(1);
+  for (const frame of frames) {
+    if (frame.includes("node-glue:") || frame.includes("node:internal") || !frame.includes("(") && !frame.includes("/")) continue;
+    return /[\\/]node_modules[\\/]/.test(frame);
+  }
+  return false;
+}
 function showFlaggedDeprecation() {
   if (bufferWarned) return;
+  const options = process[Symbol.for("lumen.options")];
   const pending = process.execArgv.includes("--pending-deprecation")
+    || (options && options["--pending-deprecation"])
     || (process.env && process.env.NODE_PENDING_DEPRECATION === "1");
-  if (!pending) return;
+  if (!pending && insideNodeModules()) return;
   bufferWarned = true;
   process.emitWarning("Buffer() is deprecated due to security and usability issues. Please use the " +
     "Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.", "DeprecationWarning", "DEP0005");

@@ -1,0 +1,1171 @@
+--abort-on-bad-builtin-profile-data b 1 v8
+--abort-on-contradictory-flags b 1 v8
+--abort-on-far-code-range b 1 v8
+--abort-on-uncaught-exception b 1
+--additive-safe-int-feedback b 1 v8
+--addons b 1
+--adjust-os-scheduling-parameters b 1 v8
+--allocation-buffer-parking b 1 v8
+--allocation-site-pretenuring b 1 v8
+--allocation-site-tracking b 1 v8
+--allow-addons b 1
+--allow-child-process b 1
+--allow-ffi b 1
+--allow-fs-read v 1
+--allow-fs-write v 1
+--allow-inspector b 1
+--allow-natives-for-differential-fuzzing b 1 v8
+--allow-natives-syntax b 1 v8
+--allow-net b 1
+--allow-openssl-store b 1
+--allow-overwriting-for-next-flag b 1 v8
+--allow-unsafe-function-constructor b 1 v8
+--allow-wasi b 1
+--allow-worker b 1
+--always-osr b 1 v8
+--always-osr-from-maglev b 1 v8
+--always-sparkplug b 1 v8
+--always-use-string-forwarding-table b 1 v8
+--analyze-environment-liveness b 1 v8
+--arm-arch v 1 v8
+--asm-wasm-lazy-compilation b 1 v8
+--assert-types b 1 v8
+--async-stack-traces b 1 v8
+--baseline-batch-compilation b 1 v8
+--baseline-batch-compilation-threshold v 1 v8
+--battery-saver-mode v 1 v8
+--better-code-range-allocation b 1 v8
+--black-allocated-pages b 1 v8
+--build-sea v 0
+--build-snapshot b 0
+--build-snapshot-config v 0
+--builtin-subclassing b 1 v8
+--builtins-effects-src v 1 v8
+--builtins-in-stack-traces b 1 v8
+--bytecode-compiler-ablation-amount v 1 v8
+--bytecode-old-age v 1 v8
+--bytecode-old-time v 1 v8
+--cache-property-key-string-adds b 1 v8
+--cache-prototype-transitions b 1 v8
+--cet-compatible b 1 v8
+--check b 0
+--check-handle-count b 1 v8
+--clear-exceptions-on-js-entry b 1 v8
+--clear-free-memory b 1 v8
+--clone-object-sidestep-transitions b 1 v8
+--code-comments b 1 v8
+--code-stats b 1 v8
+--compact b 1 v8
+--compact-code-space b 1 v8
+--compact-on-every-full-gc b 1 v8
+--compact-with-stack b 1 v8
+--compaction-max-evacuated-bytes-mb v 1 v8
+--compaction-max-evacuated-bytes-mb-for-optimize-memory v 1 v8
+--compaction-max-evacuated-bytes-mb-for-reduce-memory v 1 v8
+--compaction-target-fragmentation-percent-for-optimize-memory v 1 v8
+--compaction-target-fragmentation-percent-for-reduce-memory v 1 v8
+--compilation-cache b 1 v8
+--completion-bash b 0
+--concurrent-array-buffer-sweeping b 1 v8
+--concurrent-builtin-generation b 1 v8
+--concurrent-cache-deserialization b 1 v8
+--concurrent-maglev-high-priority-threads b 1 v8
+--concurrent-maglev-max-threads v 1 v8
+--concurrent-marking b 1 v8
+--concurrent-marking-high-priority-threads b 1 v8
+--concurrent-marking-max-worker-num v 1 v8
+--concurrent-minor-ms-marking b 1 v8
+--concurrent-osr b 1 v8
+--concurrent-recompilation b 1 v8
+--concurrent-recompilation-delay v 1 v8
+--concurrent-recompilation-front-running b 1 v8
+--concurrent-recompilation-queue-length v 1 v8
+--concurrent-sparkplug b 1 v8
+--concurrent-sparkplug-high-priority-threads b 1 v8
+--concurrent-sparkplug-max-threads v 1 v8
+--concurrent-sweeping b 1 v8
+--concurrent-turbo-tracing b 1 v8
+--concurrent-turbofan-max-threads v 1 v8
+--conditions v 1
+--conservative-stack-scanning b 1 v8
+--correctness-fuzzer-suppressions b 1 v8
+--cppgc-random-gc-interval v 1 v8
+--cppgc-young-generation b 1 v8
+--cppheap-concurrent-marking b 1 v8
+--cppheap-incremental-marking b 1 v8
+--cpu-prof b 1
+--cpu-prof-dir v 1
+--cpu-prof-interval v 1
+--cpu-prof-name v 1
+--cpu-profiler-sampling-interval v 1 v8
+--csa-trap-on-node v 1 v8
+--debug-arraybuffer-allocations b 1
+--debug-code b 1 v8
+--debug-port b 1
+--deduplicate-heap-number-requests b 1 v8
+--default-to-experimental-regexp-engine b 1 v8
+--deopt-every-n-times v 1 v8
+--deprecation b 1
+--detailed-error-stack-trace b 1 v8
+--detailed-line-info b 1 v8
+--detect-ineffective-gcs-near-heap-limit b 1 v8
+--diagnostic-dir v 1
+--dict-property-const-tracking b 1 v8
+--direct-handle b 1 v8
+--disable-abortjs b 1 v8
+--disable-optimizing-compilers b 1 v8
+--disable-proto v 1
+--disable-sigusr1 b 1
+--disable-warning v 1
+--disable-wasm-trap-handler b 1
+--disable-write-barriers b 1 v8
+--disallow-code-generation-from-strings b 1
+--disallow-unsafe-flags b 1 v8
+--dns-result-order v 1
+--double-string-cache-size v 1 v8
+--dump-allocations-digest-at-alloc v 1 v8
+--dump-builtins-hashes-to-file v 1 v8
+--dump-wasm-module b 1 v8
+--dump-wasm-module-path v 1 v8
+--efficiency-mode v 1 v8
+--efficiency-mode-delay-turbofan-multiply v 1 v8
+--efficiency-mode-disable-turbofan b 1 v8
+--embedded-src v 1 v8
+--embedded-variant v 1 v8
+--empty-context-extension-dep b 1 v8
+--enable-32dregs v 1 v8
+--enable-allocation-failures-optimize-memory b 1 v8
+--enable-allocation-failures-optimize-memory-ignoring-priority b 1 v8
+--enable-allocation-folding b 1 v8
+--enable-armv7 v 1 v8
+--enable-armv8 v 1 v8
+--enable-avx b 1 v8
+--enable-avx-vnni b 1 v8
+--enable-avx-vnni-int8 b 1 v8
+--enable-avx2 b 1 v8
+--enable-bmi1 b 1 v8
+--enable-bmi2 b 1 v8
+--enable-bytecode-compiler-ablation b 1 v8
+--enable-enumerated-keyed-access-bytecode b 1 v8
+--enable-etw-by-custom-filter-only b 1 v8
+--enable-etw-stack-walking b 1
+--enable-experimental-regexp-engine b 1 v8
+--enable-experimental-regexp-engine-on-excessive-backtracks b 1 v8
+--enable-f16c b 1 v8
+--enable-fips b 1
+--enable-fma3 b 1 v8
+--enable-lazy-source-positions b 1 v8
+--enable-lzcnt b 1 v8
+--enable-neon v 1 v8
+--enable-network-family-autoselection b 1
+--enable-parser-ablation b 1 v8
+--enable-popcnt b 1 v8
+--enable-preparser-ablation b 1 v8
+--enable-regexp-unaligned-accesses b 1 v8
+--enable-sahf b 1 v8
+--enable-sharedarraybuffer-per-context b 1 v8
+--enable-slow-asserts b 1 v8
+--enable-source-at-csa-bind b 1 v8
+--enable-source-maps b 1
+--enable-sse3 b 1 v8
+--enable-sse4-1 b 1 v8
+--enable-sse4-2 b 1 v8
+--enable-ssse3 b 1 v8
+--enable-sudiv v 1 v8
+--enable-testing-opcode-in-wasm b 1 v8
+--enable-unconditional-write-barriers b 1 v8
+--enable-vfp3 v 1 v8
+--entry-url b 1
+--env-file v 0
+--env-file-if-exists v 0
+--ephemeron-fixpoint-iterations v 1 v8
+--etw-trace-debug b 1 v8
+--eval v 0
+--exit-on-contradictory-flags b 1 v8
+--experimental b 1 v8
+--experimental-abortcontroller b 1
+--experimental-addon-modules b 1
+--experimental-config-file b 0
+--experimental-default-config-file b 0
+--experimental-default-type v 1
+--experimental-embedder-instance-types b 1 v8
+--experimental-eventsource b 1
+--experimental-fetch b 1
+--experimental-ffi b 1
+--experimental-flush-embedded-blob-icache b 1 v8
+--experimental-fuzzing b 1 v8
+--experimental-global-customevent b 1
+--experimental-global-navigator b 1
+--experimental-global-webcrypto b 1
+--experimental-import-meta-resolve b 1
+--experimental-import-text b 1
+--experimental-inspector-network-resource b 0
+--experimental-json-modules b 1
+--experimental-loader v 1
+--experimental-network-inspection b 0
+--experimental-package-map v 1
+--experimental-permission b 1
+--experimental-policy v 1
+--experimental-print-required-tla b 1
+--experimental-regexp-engine-capture-group-opt b 1 v8
+--experimental-regexp-engine-capture-group-opt-max-memory-usage v 1 v8
+--experimental-repl-await b 1
+--experimental-report b 1
+--experimental-report-exceptions-from-callbacks b 1 v8
+--experimental-sea-config v 0
+--experimental-specifier-resolution v 1
+--experimental-stack-trace-frames b 1 v8
+--experimental-storage-inspection b 0
+--experimental-stream-iter b 1
+--experimental-strip-types b 1
+--experimental-test-coverage b 1
+--experimental-test-isolation b 1
+--experimental-test-module-mocks b 0
+--experimental-test-tag-filter v 0
+--experimental-top-level-await b 1
+--experimental-vfs b 1
+--experimental-vm-modules b 1
+--experimental-wasm-acquire-release b 1 v8
+--experimental-wasm-assume-ref-cast-succeeds b 1 v8
+--experimental-wasm-branch-hinting b 1 v8
+--experimental-wasm-compilation-hints b 1 v8
+--experimental-wasm-custom-descriptors b 1 v8
+--experimental-wasm-exnref b 1 v8
+--experimental-wasm-fp16 b 1 v8
+--experimental-wasm-growable-stacks b 1 v8
+--experimental-wasm-imported-strings-utf8 b 1 v8
+--experimental-wasm-instruction-tracing b 1 v8
+--experimental-wasm-js-interop b 1 v8
+--experimental-wasm-legacy-eh b 1 v8
+--experimental-wasm-memory-control b 1 v8
+--experimental-wasm-modules b 1
+--experimental-wasm-pgo-from-file b 1 v8
+--experimental-wasm-pgo-to-file b 1 v8
+--experimental-wasm-rab-integration b 1 v8
+--experimental-wasm-ref-cast-nop b 1 v8
+--experimental-wasm-shared b 1 v8
+--experimental-wasm-simd-opt b 1 v8
+--experimental-wasm-skip-bounds-checks b 1 v8
+--experimental-wasm-skip-null-checks b 1 v8
+--experimental-wasm-stringref b 1 v8
+--experimental-wasm-type-reflection b 1 v8
+--experimental-wasm-wasmfx b 1 v8
+--experimental-websocket b 1
+--experimental-worker-inspection b 0
+--expose-async-hooks b 1 v8
+--expose-cputracemark-as v 1 v8
+--expose-externalize-string b 1 v8
+--expose-gc b 1
+--expose-gc-as v 1 v8
+--expose-ignition-statistics b 1 v8
+--expose-inspector-scripts b 1 v8
+--expose-internals b 0
+--expose-memory-corruption-api b 1 v8
+--expose-statistics b 1 v8
+--expose-trigger-failure b 1 v8
+--extensible-ro-snapshot b 1 v8
+--external-memory-accounted-in-global-limit b 1 v8
+--external-memory-max-growing-factor v 1 v8
+--external-memory-max-reasonable-size v 1 v8
+--extra-info-on-fatal-exception b 1
+--fast-api-allow-float-in-sim b 1 v8
+--fast-map-update b 1 v8
+--fast-properties-soft-limit v 1 v8
+--feedback-normalization b 1 v8
+--fixed-array-bounds-checks b 1 v8
+--fixed-margin-for-input-handling v 1 v8
+--flush-baseline-code b 1 v8
+--flush-bytecode b 1 v8
+--flush-code-based-on-tab-visibility b 1 v8
+--flush-code-based-on-time b 1 v8
+--flush-liftoff-code b 1 v8
+--for-of-optimization b 1 v8
+--force-async-hooks-checks b 1
+--force-context-aware b 1
+--force-emit-interrupt-budget-checks b 1 v8
+--force-fips b 1
+--force-long-branches b 1 v8
+--force-memory-protection-keys b 1 v8
+--force-node-api-uncaught-exceptions-policy b 1
+--force-slow-path b 1 v8
+--freeze-flags-after-init b 1 v8
+--frozen-intrinsics b 1
+--function-context-cells b 1 v8
+--function-context-cells-max-size v 1 v8
+--future b 1 v8
+--fuzzer-gc-analysis b 1 v8
+--fuzzer-random-seed v 1 v8
+--fuzzing b 1 v8
+--fuzzing-and-concurrent-recompilation b 1 v8
+--gc-fake-mmap v 1 v8
+--gc-global b 1 v8
+--gc-interval v 1 v8
+--gc-memory-reducer-start-delay-ms v 1 v8
+--gc-speed-uses-counters b 1 v8
+--gc-stats v 1 v8
+--gc-verbose b 1 v8
+--gdbjit b 1 v8
+--gdbjit-dump b 1 v8
+--gdbjit-dump-filter v 1 v8
+--gdbjit-full b 1 v8
+--global-search-paths b 1
+--handle-weak-ref-weakly-in-minor-gc b 1 v8
+--hard-abort b 1 v8
+--harmony b 1 v8
+--harmony-import-attributes b 1 v8
+--harmony-intl-best-fit-matcher b 1 v8
+--harmony-shadow-realm b 1 v8
+--harmony-shipping b 1 v8
+--harmony-struct b 1 v8
+--harmony-temporal b 1 v8
+--hash-seed v 1 v8
+--heap-growing-percent v 1 v8
+--heap-prof b 1
+--heap-prof-dir v 1
+--heap-prof-interval v 1
+--heap-prof-name v 1
+--heap-profiler-show-hidden-objects b 1 v8
+--heap-profiler-trace-objects b 1 v8
+--heap-profiler-use-embedder-graph b 1 v8
+--heap-snapshot-on-gc v 1 v8
+--heap-snapshot-on-oom b 1 v8
+--heap-snapshot-path v 1 v8
+--heap-snapshot-string-limit v 1 v8
+--heapsnapshot-near-heap-limit v 1
+--heapsnapshot-signal v 1
+--help b 0
+--high-end-android b 1 v8
+--high-end-android-physical-memory-threshold v 1 v8
+--histogram-interval v 1 v8
+--hole-fuzzing b 1 v8
+--icu-british-remove-full-weekday-comma b 1 v8
+--icu-data-dir v 1
+--icu-datetime-compat-lang v 1 v8
+--icu-default-italian-number-grouping-always b 1 v8
+--icu-timezone-data b 1 v8
+--idle-gc-on-context-disposal b 1 v8
+--ignition-elide-noneffectful-bytecodes b 1 v8
+--ignition-elide-redundant-tdz-checks b 1 v8
+--ignition-filter-expression-positions b 1 v8
+--ignition-reo b 1 v8
+--ignition-share-named-property-feedback b 1 v8
+--import v 1
+--incremental-marking b 1 v8
+--incremental-marking-for-gc-in-background b 1 v8
+--incremental-marking-hard-trigger v 1 v8
+--incremental-marking-soft-trigger v 1 v8
+--incremental-marking-task b 1 v8
+--incremental-marking-unified-schedule b 1 v8
+--ineffective-gc-includes-global b 1 v8
+--ineffective-gc-mutator-utilization-threshold v 1 v8
+--ineffective-gc-size-threshold v 1 v8
+--ineffective-gcs-forces-last-resort b 1 v8
+--initial-heap-size v 1 v8
+--initial-old-space-size v 1 v8
+--initial-shared-heap-size v 1 v8
+--inline-date-accessors b 1 v8
+--inline-new b 1 v8
+--input-type v 1
+--insecure-http-parser b 1
+--inspect b 1
+--inspect-brk b 1
+--inspect-port b 1
+--inspect-publish-uid v 1
+--inspect-wait b 1
+--inspector-live-edit b 1 v8
+--intel-jcc-erratum-mitigation b 1 v8
+--interactive b 0
+--internalize-on-the-fly b 1 v8
+--interpreted-frames-native-stack b 1
+--invocation-count-for-early-optimization v 1 v8
+--invocation-count-for-feedback-allocation v 1 v8
+--invocation-count-for-maglev v 1 v8
+--invocation-count-for-maglev-osr v 1 v8
+--invocation-count-for-maglev-with-delay v 1 v8
+--invocation-count-for-osr v 1 v8
+--invocation-count-for-turbofan v 1 v8
+--is-standalone-d8-shell b 1 v8
+--jit-fuzzing b 1 v8
+--jitless b 1
+--js-atomics-pause b 1 v8
+--js-base-64 b 1 v8
+--js-decorators b 1 v8
+--js-defer-import-eval b 1 v8
+--js-error-iserror b 1 v8
+--js-esm-ns-reexport b 1 v8
+--js-explicit-resource-management b 1 v8
+--js-float16array b 1 v8
+--js-immutable-arraybuffer b 1 v8
+--js-intl-locale-variants b 1 v8
+--js-iterator-sequencing b 1 v8
+--js-nonextensible-applies-to-private b 1 v8
+--js-promise-try b 1 v8
+--js-regexp-duplicate-named-groups b 1 v8
+--js-regexp-escape b 1 v8
+--js-regexp-modifiers b 1 v8
+--js-shipping b 1 v8
+--js-source-phase-imports b 1 v8
+--js-staging b 1 v8
+--js-sum-precise b 1 v8
+--js-upsert b 1 v8
+--json-stringify-fast-path b 1 v8
+--large-page-pool b 1 v8
+--late-heap-limit-check b 1 v8
+--lazy b 1 v8
+--lazy-compile-dispatcher b 1 v8
+--lazy-compile-dispatcher-max-threads v 1 v8
+--lazy-eval b 1 v8
+--lazy-feedback-allocation b 1 v8
+--lazy-new-space-shrinking b 1 v8
+--lazy-streaming b 1 v8
+--liftoff b 1 v8
+--liftoff-only b 1 v8
+--lite-mode b 1 v8
+--ll-prof b 1 v8
+--loader v 1
+--local-off-stack-check b 1 v8
+--localstorage-file v 1
+--log b 1 v8
+--log-all b 1 v8
+--log-code b 1 v8
+--log-code-disassemble b 1 v8
+--log-colour b 1 v8
+--log-deopt b 1 v8
+--log-feedback-vector b 1 v8
+--log-function-events b 1 v8
+--log-ic b 1 v8
+--log-internal-timer-events b 1 v8
+--log-maps b 1 v8
+--log-maps-details b 1 v8
+--log-or-trace-osr b 1 v8
+--log-source-code b 1 v8
+--log-source-position b 1 v8
+--log-timer-events b 1 v8
+--logfile v 1 v8
+--logfile-per-isolate b 1 v8
+--maglev b 1 v8
+--maglev-allocation-folding v 1 v8
+--maglev-as-top-tier b 1 v8
+--maglev-assert b 1 v8
+--maglev-assert-stack-size b 1 v8
+--maglev-assert-types b 1 v8
+--maglev-break-on-entry b 1 v8
+--maglev-build-code-on-background b 1 v8
+--maglev-cons-string-elision b 1 v8
+--maglev-cse b 1 v8
+--maglev-deopt-data-on-background b 1 v8
+--maglev-destroy-on-background b 1 v8
+--maglev-escape-analysis b 1 v8
+--maglev-filter v 1 v8
+--maglev-function-context-specialization b 1 v8
+--maglev-future b 1 v8
+--maglev-hoist-osr-value-phi-untagging b 1 v8
+--maglev-inline-api-calls b 1 v8
+--maglev-inline-date-accessors b 1 v8
+--maglev-inlining b 1 v8
+--maglev-licm b 1 v8
+--maglev-loop-peeling b 1 v8
+--maglev-loop-peeling-max-size v 1 v8
+--maglev-loop-peeling-max-size-cumulative v 1 v8
+--maglev-max-small-graph-size v 1 v8
+--maglev-non-eager-inlining b 1 v8
+--maglev-object-tracking b 1 v8
+--maglev-optimistic-peeled-loops b 1 v8
+--maglev-osr b 1 v8
+--maglev-overwrite-budget b 1 v8
+--maglev-overwrite-osr-budget b 1 v8
+--maglev-poly-calls b 1 v8
+--maglev-pretenure-store-values b 1 v8
+--maglev-print-bytecode b 1 v8
+--maglev-print-feedback b 1 v8
+--maglev-print-filter v 1 v8
+--maglev-print-inlined b 1 v8
+--maglev-print-provenance b 1 v8
+--maglev-range-analysis b 1 v8
+--maglev-range-verification b 1 v8
+--maglev-reuse-stack-slots b 1 v8
+--maglev-speculative-hoist-phi-untagging b 1 v8
+--maglev-stats b 1 v8
+--maglev-stats-nvp b 1 v8
+--maglev-truncated-int32-phis b 1 v8
+--maglev-truncation b 1 v8
+--maglev-untagged-phis b 1 v8
+--managed-zone-memory b 1 v8
+--managed-zone-memory-for-isolate-independent-memory b 1 v8
+--manual-evacuation-candidates-selection b 1 v8
+--map-counters v 1 v8
+--max-fast-properties v 1 v8
+--max-heap-size v 1 v8
+--max-http-header-size v 1
+--max-inlined-bytecode-size v 1 v8
+--max-inlined-bytecode-size-absolute v 1 v8
+--max-inlined-bytecode-size-cumulative v 1 v8
+--max-inlined-bytecode-size-small v 1 v8
+--max-inlined-bytecode-size-small-total v 1 v8
+--max-inlined-bytecode-size-small-with-heapnum-in-out v 1 v8
+--max-large-page-pool-size v 1 v8
+--max-lazy b 1 v8
+--max-maglev-eager-inlined-bytecode-size v 1 v8
+--max-maglev-hard-inline-depth v 1 v8
+--max-maglev-inline-depth v 1 v8
+--max-maglev-inlined-bytecode-size v 1 v8
+--max-maglev-inlined-bytecode-size-cumulative v 1 v8
+--max-maglev-inlined-bytecode-size-small v 1 v8
+--max-maglev-inlined-bytecode-size-small-total v 1 v8
+--max-maglev-inlined-bytecode-size-small-with-heapnum-in-out v 1 v8
+--max-old-space-size v 1 v8
+--max-old-space-size-percentage v 1
+--max-opt v 1 v8
+--max-optimized-bytecode-size v 1 v8
+--max-old-space-size v 1 v8
+--max-semi-space-size v 1 v8
+--max-serializer-nesting v 1 v8
+--max-shared-heap-size v 1 v8
+--max-stack-trace-source-length v 1 v8
+--max-turbolev-eager-inlined-bytecode-size v 1 v8
+--max-turbolev-inline-depth v 1 v8
+--max-valid-polymorphic-map-count v 1 v8
+--max-wasm-functions v 1 v8
+--mcpu v 1 v8
+--mega-dom-ic b 1 v8
+--memory-balancer b 1 v8
+--memory-balancer-c-value v 1 v8
+--memory-pool b 1 v8
+--memory-pool-release-before-memory-pressure-gcs b 1 v8
+--memory-pool-release-on-malloc-failures b 1 v8
+--memory-pool-share-memory-on-teardown b 1 v8
+--memory-pool-timeout v 1 v8
+--memory-protection-keys b 1 v8
+--memory-reducer b 1 v8
+--memory-reducer-delay-ms v 1 v8
+--memory-reducer-for-small-heaps b 1 v8
+--memory-reducer-gc-count v 1 v8
+--memory-saver-mode v 1 v8
+--merge-background-deserialized-script-with-compilation-cache b 1 v8
+--min-inlining-frequency v 1 v8
+--min-maglev-inlining-frequency v 1 v8
+--min-semi-space-size v 1 v8
+--minimum-invocations-after-ic-update v 1 v8
+--minimum-invocations-before-optimization v 1 v8
+--minor-gc-task b 1 v8
+--minor-gc-task-trigger v 1 v8
+--minor-gc-task-with-lower-priority b 1 v8
+--minor-ms b 1 v8
+--minor-ms-concurrent-marking-trigger v 1 v8
+--minor-ms-max-page-age v 1 v8
+--minor-ms-min-lab-size-kb v 1 v8
+--minor-ms-min-new-space-capacity-for-concurrent-marking-mb v 1 v8
+--minor-ms-page-promotion-max-lab-threshold v 1 v8
+--minor-ms-page-promotion-threshold v 1 v8
+--minor-ms-shortcut-strings b 1 v8
+--minor-ms-trace-fragmentation b 1 v8
+--mock-arraybuffer-allocator b 1 v8
+--mock-arraybuffer-allocator-limit v 1 v8
+--move-object-start b 1 v8
+--native-code-counters b 1 v8
+--network-family-autoselection b 1
+--network-family-autoselection-attempt-timeout b 1
+--new-old-generation-heap-size b 1 v8
+--node-memory-debug b 1
+--node-snapshot b 1
+--omit-default-ctors b 1 v8
+--openssl-config v 1
+--openssl-legacy-provider b 1
+--openssl-shared-config b 1
+--opt b 1 v8
+--optimize-for-input-handling b 1 v8
+--optimize-for-size b 1 v8
+--optimize-gc-for-battery b 1 v8
+--optimize-maglev-optimizes-to-turbofan b 1 v8
+--optimize-on-next-call-optimizes-to-maglev b 1 v8
+--osr-from-maglev b 1 v8
+--osr-from-maglev-interrupt-scale-factor v 1 v8
+--osr-to-tierup v 1 v8
+--page-promotion b 1 v8
+--page-promotion-threshold v 1 v8
+--parallel-compaction b 1 v8
+--parallel-compile-tasks-for-eager-toplevel b 1 v8
+--parallel-compile-tasks-for-lazy b 1 v8
+--parallel-gc-clearing b 1 v8
+--parallel-marking b 1 v8
+--parallel-pause-for-gc-in-background b 1 v8
+--parallel-pointer-update b 1 v8
+--parallel-reclaim-unmodified-wrappers b 1 v8
+--parallel-scavenge b 1 v8
+--parse-only b 1 v8
+--parser-ablation-amount v 1 v8
+--partial-constant-pool b 1 v8
+--pending-deprecation b 1
+--perf-basic-prof b 1 v8
+--perf-basic-prof-only-functions b 1 v8
+--perf-basic-prof-path v 1 v8
+--perf-prof b 1 v8
+--perf-prof-annotate-wasm b 1 v8
+--perf-prof-delete-file b 1 v8
+--perf-prof-path v 1 v8
+--perf-prof-unwinding-info b 1 v8
+--perfetto-code-logger b 1 v8
+--permission b 1
+--permission-audit b 1
+--policy-integrity v 1
+--precise-object-pinning b 1 v8
+--preconfigured-old-space-size v 1 v8
+--predictable b 1 v8
+--predictable-gc-schedule b 1 v8
+--preparser-ablation-amount v 1 v8
+--preserve-symlinks b 1
+--preserve-symlinks-main b 1
+--print b 0
+--print-all-code b 1 v8
+--print-all-exceptions b 1 v8
+--print-ast b 1 v8
+--print-break-location b 1 v8
+--print-builtin-code b 1 v8
+--print-builtin-code-filter v 1 v8
+--print-builtin-size b 1 v8
+--print-bytecode b 1 v8
+--print-bytecode-filter v 1 v8
+--print-code b 1 v8
+--print-code-verbose b 1 v8
+--print-deopt-stress b 1 v8
+--print-feature-flags-json b 1 v8
+--print-flag-values b 1 v8
+--print-gc-clearing-dependency-graph b 1 v8
+--print-global-handles b 1 v8
+--print-handles b 1 v8
+--print-maglev-code b 1 v8
+--print-maglev-deopt-verbose b 1 v8
+--print-maglev-graph b 1 v8
+--print-maglev-graphs b 1 v8
+--print-opt-code b 1 v8
+--print-opt-code-filter v 1 v8
+--print-opt-source b 1 v8
+--print-regexp-bytecode b 1 v8
+--print-regexp-code b 1 v8
+--print-regexp-graph b 1 v8
+--print-scopes b 1 v8
+--print-turbolev-frontend b 1 v8
+--print-turbolev-inline-functions b 1 v8
+--print-wasm-code b 1 v8
+--print-wasm-code-function-index v 1 v8
+--print-wasm-offheap-memory-size b 1 v8
+--print-wasm-stub-code b 1 v8
+--prof b 0
+--prof-browser-mode b 1 v8
+--prof-cpp b 1 v8
+--prof-include-idle b 1 v8
+--prof-process b 0
+--prof-sampling-interval v 1 v8
+--profile-deserialization b 1 v8
+--profile-guided-optimization b 1 v8
+--profile-guided-optimization-for-empty-feedback-vector b 1 v8
+--profile-heap-snapshot b 1 v8
+--proto-assign-seq-lazy-func-opt b 1 v8
+--proto-assign-seq-opt b 1 v8
+--proto-assign-seq-opt-count v 1 v8
+--random-gc-interval v 1 v8
+--random-seed v 1 v8
+--randomize-all-allocations b 1 v8
+--rcs b 1 v8
+--rcs-cpu-time b 1 v8
+--reclaim-unmodified-wrappers b 1 v8
+--redirect-code-traces b 1 v8
+--redirect-code-traces-to v 1 v8
+--redirect-warnings v 1
+--regexp-assemble-from-bytecode b 1 v8
+--regexp-backtracks-before-fallback v 1 v8
+--regexp-bytecode-analysis b 1 v8
+--regexp-interpret-all b 1 v8
+--regexp-optimization b 1 v8
+--regexp-peephole-optimization b 1 v8
+--regexp-possessive-quantifier b 1 v8
+--regexp-quick-check b 1 v8
+--regexp-results-cache b 1 v8
+--regexp-simd b 1 v8
+--regexp-tier-up b 1 v8
+--regexp-tier-up-ticks v 1 v8
+--regexp-unroll b 1 v8
+--rehash-snapshot b 1 v8
+--reopt-after-lazy-deopts b 1 v8
+--reorder-builtins b 1 v8
+--report-compact b 1
+--report-dir v 1
+--report-directory v 1
+--report-exclude-env b 1
+--report-exclude-network b 1
+--report-filename v 1
+--report-on-fatalerror b 1
+--report-on-signal b 1
+--report-signal v 1
+--report-uncaught-exception b 1
+--require v 1
+--reserve-inline-budget-scale-factor v 1 v8
+--resize-large-object b 1 v8
+--retain-maps-for-n-gc v 1 v8
+--reuse-scope-infos b 1 v8
+--run v 0
+--runtime-call-stats b 1 v8
+--safepoint-bump-qos-class b 1 v8
+--sampling-heap-profiler-suppress-randomness b 1 v8
+--sandbox-fuzzing b 1 v8
+--sandbox-testing b 1 v8
+--scavenger-chaos-mode b 1 v8
+--scavenger-chaos-mode-threshold v 1 v8
+--scavenger-conservative-object-pinning b 1 v8
+--scavenger-precise-object-pinning b 1 v8
+--scavenger-promote-quarantined-pages b 1 v8
+--scavenger-updates-allocation-limit b 1 v8
+--script-context-cells b 1 v8
+--script-streaming b 1 v8
+--secure-heap v 1
+--secure-heap-min v 1
+--semi-space-growth-factor v 1 v8
+--serialization-statistics b 1 v8
+--shared-heap b 1 v8
+--shared-string-table b 1 v8
+--shared-strings b 1 v8
+--short-builtin-calls b 1 v8
+--shortcut-strings-with-stack b 1 v8
+--sim-abort-on-bad-auth b 1 v8
+--sim-arm64-optional-features v 1 v8
+--simulator-debugger b 1 v8
+--single-generation b 1 v8
+--single-threaded b 1 v8
+--single-threaded-gc b 1 v8
+--single-threaded-gc-in-background b 1 v8
+--slow-debug-code b 1 v8
+--slow-histograms b 1 v8
+--smi-string-cache-size v 1 v8
+--snapshot-blob v 1
+--sparkplug b 1 v8
+--sparkplug-filter v 1 v8
+--sparkplug-needs-short-builtins b 1 v8
+--sparkplug-plus b 1 v8
+--specialize-code-for-one-byte-seq-strings b 1 v8
+--stack-size v 1 v8
+--stack-trace-limit v 1 v8
+--stack-trace-on-illegal b 1 v8
+--startup-blob v 1 v8
+--startup-src v 1 v8
+--sticky-mark-bits b 1 v8
+--stress-background-compile b 1 v8
+--stress-branch-hinting b 1 v8
+--stress-compaction b 1 v8
+--stress-compaction-random b 1 v8
+--stress-concurrent-allocation b 1 v8
+--stress-concurrent-inlining b 1 v8
+--stress-concurrent-inlining-attach-code b 1 v8
+--stress-flush-code b 1 v8
+--stress-gc-during-compilation b 1 v8
+--stress-ic b 1 v8
+--stress-incremental-marking b 1 v8
+--stress-inline b 1 v8
+--stress-lazy b 1 v8
+--stress-lazy-compilation v 1 v8
+--stress-lazy-source-positions b 1 v8
+--stress-maglev b 1 v8
+--stress-marking v 1 v8
+--stress-per-context-marking-worklist b 1 v8
+--stress-runs v 1 v8
+--stress-sampling-allocation-profiler v 1 v8
+--stress-scavenge v 1 v8
+--stress-scavenger-conservative-object-pinning b 1 v8
+--stress-scavenger-conservative-object-pinning-random b 1 v8
+--stress-snapshot b 1 v8
+--stress-validate-asm b 1 v8
+--stress-wasm-code-gc b 1 v8
+--stress-wasm-memory-moving b 1 v8
+--stress-wasm-stack-switching b 1 v8
+--strict-termination-checks b 1 v8
+--string-slices b 1 v8
+--super-ic b 1 v8
+--suppress-asm-messages b 1 v8
+--switch-table-min-cases v 1 v8
+--switch-table-spread-threshold v 1 v8
+--target-arch v 1 v8
+--target-is-simulator b 1 v8
+--target-os v 1 v8
+--test b 0
+--test-concurrency v 0
+--test-coverage-branches v 1
+--test-coverage-exclude v 1
+--test-coverage-functions v 1
+--test-coverage-include v 1
+--test-coverage-include-all b 1
+--test-coverage-lines v 1
+--test-force-exit b 0
+--test-global-setup v 1
+--test-isolation b 1
+--test-name-pattern v 1
+--test-only b 1
+--test-only-unsafe b 1 v8
+--test-random-seed v 1
+--test-randomize b 1
+--test-reporter v 1
+--test-reporter-destination v 1
+--test-rerun-failures v 1
+--test-shard v 1
+--test-skip-pattern v 1
+--test-small-max-function-context-stub-size b 1 v8
+--test-timeout v 0
+--test-udp-no-try-send b 1
+--test-update-snapshots b 0
+--testing-bool-flag b 1 v8
+--testing-bool-flag-A b 1 v8
+--testing-bool-flag-B b 1 v8
+--testing-bool-flag-C b 1 v8
+--testing-float-flag v 1 v8
+--testing-int-flag v 1 v8
+--testing-maybe-bool-flag v 1 v8
+--testing-prng-seed v 1 v8
+--testing-string-flag v 1 v8
+--text-is-readable b 1 v8
+--throw-deprecation b 1
+--title v 1
+--timeout v 0
+--tls-cipher-list v 1
+--tls-keylog v 1
+--tls-max-v1.2 b 1
+--tls-max-v1.3 b 1
+--tls-min-v1.0 b 1
+--tls-min-v1.1 b 1
+--tls-min-v1.2 b 1
+--tls-min-v1.3 b 1
+--trace b 1 v8
+--trace-all-uses b 1 v8
+--trace-allocation-stack-interval v 1 v8
+--trace-asm-parser b 1 v8
+--trace-asm-scanner b 1 v8
+--trace-asm-time b 1 v8
+--trace-backing-store b 1 v8
+--trace-baseline b 1 v8
+--trace-baseline-batch-compilation b 1 v8
+--trace-block-coverage b 1 v8
+--trace-code-range-allocation b 1 v8
+--trace-compilation-dependencies b 1 v8
+--trace-compiler-dispatcher b 1 v8
+--trace-concurrent-marking b 1 v8
+--trace-concurrent-recompilation b 1 v8
+--trace-context-disposal b 1 v8
+--trace-contexts b 1 v8
+--trace-creation-allocation-sites b 1 v8
+--trace-deopt b 1 v8
+--trace-deopt-verbose b 1 v8
+--trace-deprecation b 1
+--trace-deserialization b 1 v8
+--trace-detached-contexts b 1 v8
+--trace-duplicate-threshold-kb v 1 v8
+--trace-elements-transitions b 1 v8
+--trace-env b 1
+--trace-env-js-stack b 1
+--trace-env-native-stack b 1
+--trace-environment-liveness b 1 v8
+--trace-evacuation b 1 v8
+--trace-evacuation-candidates b 1 v8
+--trace-event-categories v 1
+--trace-event-file-pattern v 1
+--trace-events-enabled b 1
+--trace-exit b 1
+--trace-experimental-regexp-engine b 1 v8
+--trace-file-names b 1 v8
+--trace-flush-code b 1 v8
+--trace-for-in-enumerate b 1 v8
+--trace-fragmentation b 1 v8
+--trace-fragmentation-verbose b 1 v8
+--trace-gc b 1 v8
+--trace-gc-freelists b 1 v8
+--trace-gc-freelists-verbose b 1 v8
+--trace-gc-heap-layout b 1 v8
+--trace-gc-heap-layout-ignore-minor-gc b 1 v8
+--trace-gc-ignore-scavenger b 1 v8
+--trace-gc-nvp b 1 v8
+--trace-gc-object-stats b 1 v8
+--trace-gc-verbose b 1 v8
+--trace-generalization b 1 v8
+--trace-heap-broker b 1 v8
+--trace-heap-broker-verbose b 1 v8
+--trace-ignition-codegen b 1 v8
+--trace-ignition-dispatches-output-file v 1 v8
+--trace-incremental-marking b 1 v8
+--trace-isolates b 1 v8
+--trace-lazy b 1 v8
+--trace-liftoff b 1 v8
+--trace-maglev-escape-analysis b 1 v8
+--trace-maglev-graph-building b 1 v8
+--trace-maglev-inlining b 1 v8
+--trace-maglev-kna-processor b 1 v8
+--trace-maglev-loop-speeling b 1 v8
+--trace-maglev-object-tracking b 1 v8
+--trace-maglev-phi-untagging b 1 v8
+--trace-maglev-range-analysis b 1 v8
+--trace-maglev-regalloc b 1 v8
+--trace-maglev-truncation b 1 v8
+--trace-memory-balancer b 1 v8
+--trace-memory-reducer b 1 v8
+--trace-migration b 1 v8
+--trace-minor-ms-parallel-marking b 1 v8
+--trace-module-status b 1 v8
+--trace-mutator-utilization b 1 v8
+--trace-normalization b 1 v8
+--trace-number-string-cache b 1 v8
+--trace-opt b 1 v8
+--trace-opt-stats b 1 v8
+--trace-opt-status b 1 v8
+--trace-opt-verbose b 1 v8
+--trace-osr b 1 v8
+--trace-page-promotions b 1 v8
+--trace-parallel-scavenge b 1 v8
+--trace-pending-allocations b 1 v8
+--trace-pretenuring b 1 v8
+--trace-pretenuring-statistics b 1 v8
+--trace-promises b 1
+--trace-protector-invalidation b 1 v8
+--trace-prototype-users b 1 v8
+--trace-rail b 1 v8
+--trace-read-only-promotion b 1 v8
+--trace-read-only-promotion-verbose b 1 v8
+--trace-regexp-assembler b 1 v8
+--trace-regexp-bytecode-analysis b 1 v8
+--trace-regexp-bytecodes b 1 v8
+--trace-regexp-compiler b 1 v8
+--trace-regexp-graph b 1 v8
+--trace-regexp-graph-building b 1 v8
+--trace-regexp-parser b 1 v8
+--trace-regexp-peephole-optimization b 1 v8
+--trace-regexp-tier-up b 1 v8
+--trace-representation b 1 v8
+--trace-require-module v 1
+--trace-resize-large-object b 1 v8
+--trace-serializer b 1 v8
+--trace-side-effect-free-debug-evaluate b 1 v8
+--trace-sigint b 1
+--trace-store-elimination b 1 v8
+--trace-stress-marking b 1 v8
+--trace-stress-scavenge b 1 v8
+--trace-sync-io b 1
+--trace-temporal b 1 v8
+--trace-tls b 1
+--trace-track-allocation-sites b 1 v8
+--trace-turbo b 1 v8
+--trace-turbo-alloc b 1 v8
+--trace-turbo-bailouts b 1 v8
+--trace-turbo-ceq b 1 v8
+--trace-turbo-cfg-file v 1 v8
+--trace-turbo-escape b 1 v8
+--trace-turbo-file-prefix v 1 v8
+--trace-turbo-filter v 1 v8
+--trace-turbo-graph b 1 v8
+--trace-turbo-inlining b 1 v8
+--trace-turbo-jt b 1 v8
+--trace-turbo-load-elimination b 1 v8
+--trace-turbo-loop b 1 v8
+--trace-turbo-path v 1 v8
+--trace-turbo-reduction b 1 v8
+--trace-turbo-scheduled b 1 v8
+--trace-turbo-scheduler b 1 v8
+--trace-turbo-stack-accesses b 1 v8
+--trace-turbo-trimming b 1 v8
+--trace-turbo-types b 1 v8
+--trace-uncaught b 1
+--trace-unmapper b 1 v8
+--trace-verify-csa b 1 v8
+--trace-warnings b 1
+--trace-wasm b 1 v8
+--trace-wasm-code-gc b 1 v8
+--trace-wasm-compilation-hints b 1 v8
+--trace-wasm-compilation-times b 1 v8
+--trace-wasm-compiler b 1 v8
+--trace-wasm-decoder b 1 v8
+--trace-wasm-generate-compilation-hints b 1 v8
+--trace-wasm-globals b 1 v8
+--trace-wasm-inlining b 1 v8
+--trace-wasm-instances b 1 v8
+--trace-wasm-lazy-compilation b 1 v8
+--trace-wasm-loop-peeling b 1 v8
+--trace-wasm-memory b 1 v8
+--trace-wasm-native-heap b 1 v8
+--trace-wasm-offheap-memory b 1 v8
+--trace-wasm-serialization b 1 v8
+--trace-wasm-simd-shuffle b 1 v8
+--trace-wasm-stack-switching b 1 v8
+--trace-wasm-streaming b 1 v8
+--trace-wasm-typer b 1 v8
+--trace-zone-stats b 1 v8
+--trace-zone-type-stats b 1 v8
+--track-array-buffer-views b 1 v8
+--track-detached-contexts b 1 v8
+--track-field-types b 1 v8
+--track-gc-object-stats b 1 v8
+--track-heap-objects b 1
+--transition-strings-during-gc-with-stack b 1 v8
+--trap-on-abort b 1 v8
+--trim-descriptor-arrays-in-gc b 1 v8
+--trim-descriptor-arrays-in-gc-with-stack b 1 v8
+--turbo-allocation-folding b 1 v8
+--turbo-always-optimize-spills b 1 v8
+--turbo-cf-optimization b 1 v8
+--turbo-compress-frame-translations b 1 v8
+--turbo-elide-frames b 1 v8
+--turbo-escape b 1 v8
+--turbo-fast-api-calls b 1 v8
+--turbo-filter v 1 v8
+--turbo-inline-array-builtins b 1 v8
+--turbo-inline-js-wasm-calls b 1 v8
+--turbo-inlining b 1 v8
+--turbo-instruction-scheduling b 1 v8
+--turbo-jt b 1 v8
+--turbo-load-elimination b 1 v8
+--turbo-log-builtins-count-input v 1 v8
+--turbo-loop-peeling b 1 v8
+--turbo-loop-rotation b 1 v8
+--turbo-loop-variable b 1 v8
+--turbo-move-optimization b 1 v8
+--turbo-optimize-apply b 1 v8
+--turbo-optimize-inlined-js-wasm-wrappers b 1 v8
+--turbo-optimize-math-minmax b 1 v8
+--turbo-profiling b 1 v8
+--turbo-profiling-input v 1 v8
+--turbo-profiling-output v 1 v8
+--turbo-profiling-verbose b 1 v8
+--turbo-rewrite-far-jumps b 1 v8
+--turbo-splitting b 1 v8
+--turbo-stats b 1 v8
+--turbo-stats-nvp b 1 v8
+--turbo-stats-wasm b 1 v8
+--turbo-store-elimination b 1 v8
+--turbo-stress-instruction-scheduling b 1 v8
+--turbo-string-builder b 1 v8
+--turbo-typer-hardening b 1 v8
+--turbo-verify b 1 v8
+--turbo-verify-allocation b 1 v8
+--turbo-verify-machine-graph v 1 v8
+--turbo-wasm-address-reassociation b 1 v8
+--turbofan b 1 v8
+--turbofan-inline-date-accessors b 1 v8
+--turbolev b 1 v8
+--turbolev-additive-safe-int-feedback b 1 v8
+--turbolev-future b 1 v8
+--turbolev-inline-js-wasm-wrappers b 1 v8
+--turbolev-non-eager-inlining b 1 v8
+--turboshaft b 1 v8
+--turboshaft-assert-types b 1 v8
+--turboshaft-enable-debug-features b 1 v8
+--turboshaft-load-elimination b 1 v8
+--turboshaft-loop-unrolling b 1 v8
+--turboshaft-string-concat-escape-analysis b 1 v8
+--turboshaft-trace-emitted b 1 v8
+--turboshaft-trace-if-else-to-switch b 1 v8
+--turboshaft-trace-intermediate-reductions b 1 v8
+--turboshaft-trace-load-elimination b 1 v8
+--turboshaft-trace-reduction b 1 v8
+--turboshaft-trusted-load-elimination b 1 v8
+--turboshaft-typed-optimizations b 1 v8
+--turboshaft-verify-load-store-taggedness b 1 v8
+--turboshaft-wasm-in-js-inlining b 1 v8
+--turboshaft-wasm-load-elimination b 1 v8
+--typed-array-length-loading b 1 v8
+--unbox-double-arrays b 1 v8
+--unhandled-rejections v 1
+--unmap-holes b 1 v8
+--use-bundled-ca b 1
+--use-env-proxy b 1
+--use-external-strings b 1 v8
+--use-ic b 1 v8
+--use-largepages v 1
+--use-marking-progress-bar b 1 v8
+--use-openssl-ca b 1
+--use-original-message-for-stack-trace b 1 v8
+--use-osr b 1 v8
+--use-std-math-pow b 1 v8
+--use-strict b 1 v8
+--use-system-ca b 1
+--v8-options b 0
+--v8-os-page-size v 1 v8
+--v8-pool-size v 1
+--validate-asm b 1 v8
+--verify-base-objects b 1
+--verify-bytecode-full b 1 v8
+--verify-bytecode-light b 1 v8
+--verify-code-merge b 1 v8
+--verify-csa b 1 v8
+--verify-get-js-builtin-state b 1 v8
+--verify-heap b 1 v8
+--verify-predictable b 1 v8
+--verify-simplified-lowering b 1 v8
+--verify-snapshot-checksum b 1 v8
+--verify-turboshaft b 1 v8
+--verify-write-barriers b 1 v8
+--version b 0
+--vtune-prof-annotate-wasm b 1 v8
+--warn-about-builtin-profile-data b 1 v8
+--warnings b 1
+--wasm-allow-mixed-eh-for-testing b 1 v8
+--wasm-assert-types b 1 v8
+--wasm-async-compilation b 1 v8
+--wasm-bounds-checks b 1 v8
+--wasm-bulkmem-inlining b 1 v8
+--wasm-caching-hard-threshold v 1 v8
+--wasm-caching-threshold v 1 v8
+--wasm-caching-timeout-ms v 1 v8
+--wasm-capi-thread-pool-size v 1 v8
+--wasm-code-coverage b 1 v8
+--wasm-code-gc b 1 v8
+--wasm-debug-mask-for-testing v 1 v8
+--wasm-deopt b 1 v8
+--wasm-deopts-per-function-limit v 1 v8
+--wasm-disassembly-max-mb v 1 v8
+--wasm-dynamic-tiering b 1 v8
+--wasm-eager-tier-up-function v 1 v8
+--wasm-enforce-bounds-checks b 1 v8
+--wasm-fast-api b 1 v8
+--wasm-fuzzer-gen-test b 1 v8
+--wasm-generate-compilation-hints b 1 v8
+--wasm-generic-wrapper b 1 v8
+--wasm-inlining b 1 v8
+--wasm-inlining-budget v 1 v8
+--wasm-inlining-call-indirect b 1 v8
+--wasm-inlining-factor v 1 v8
+--wasm-inlining-ignore-call-counts b 1 v8
+--wasm-inlining-max-size v 1 v8
+--wasm-inlining-min-budget v 1 v8
+--wasm-jitless b 1 v8
+--wasm-jitless-if-available-for-testing b 1 v8
+--wasm-lazy-compilation b 1 v8
+--wasm-lazy-validation b 1 v8
+--wasm-loop-peeling b 1 v8
+--wasm-loop-peeling-max-size v 1 v8
+--wasm-loop-unrolling b 1 v8
+--wasm-math-intrinsics b 1 v8
+--wasm-max-code-space-size-mb v 1 v8
+--wasm-max-committed-code-mb v 1 v8
+--wasm-max-initial-code-space-reservation v 1 v8
+--wasm-max-mem-pages v 1 v8
+--wasm-max-module-size v 1 v8
+--wasm-max-table-size v 1 v8
+--wasm-memory64-trap-handling b 1 v8
+--wasm-native-module-cache b 1 v8
+--wasm-num-compilation-tasks v 1 v8
+--wasm-opt b 1 v8
+--wasm-simd-opt b 1 v8
+--wasm-stack-checks b 1 v8
+--wasm-stack-switching-stack-size v 1 v8
+--wasm-staging b 1 v8
+--wasm-sync-tier-up b 1 v8
+--wasm-test-streaming b 1 v8
+--wasm-tier-mask-for-testing v 1 v8
+--wasm-tier-up b 1 v8
+--wasm-tier-up-filter v 1 v8
+--wasm-tiering-budget v 1 v8
+--wasm-trace-native v 1 v8
+--wasm-wrapper-tiering-budget v 1 v8
+--watch b 0
+--watch-kill-signal v 1
+--watch-path v 0
+--watch-preserve-output b 0
+--webstorage b 1
+--win64-unwinding-info b 1 v8
+--zero-fill-buffers b 1
+--zero-unused-memory b 1 v8
+--zone-stats-tolerance v 1 v8
+--tier v 0
+--tier-threshold v 0

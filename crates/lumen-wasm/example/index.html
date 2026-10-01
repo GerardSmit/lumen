@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lumen runtime in the browser</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; }
+  pre { background: #f4f4f4; padding: 1rem; overflow: auto; }
+  #verdict { font-weight: 600; }
+  .pass { color: #0a7d2c; } .fail { color: #b3261e; }
+</style>
+<h1>lumen runtime in the browser</h1>
+<p>Runs <code>smoke-script.js</code> (Buffer, crypto, zlib, fs, timers, generators, fetch) in a
+Worker through <code>RuntimeSession</code>. <code>/remote</code> is served by synchronous host
+calls over a <code>SharedArrayBuffer</code>; this needs a cross-origin isolated page
+(<code>node serve.mjs</code>).</p>
+<p id="verdict">running...</p>
+<pre id="log"></pre>
+<script type="module">
+  const verdict = document.getElementById('verdict');
+  const log = document.getElementById('log');
+  const worker = new Worker('./runtime-worker.js', { type: 'module' });
+  worker.onerror = (e) => {
+    verdict.textContent = 'FAIL: worker error: ' + e.message;
+    verdict.className = 'fail';
+    document.title = 'FAIL';
+  };
+  worker.onmessage = (e) => {
+    const r = e.data;
+    verdict.textContent = (r.pass ? 'PASS' : 'FAIL') + (r.isolated ? ' (cross-origin isolated)' : ' (not isolated)');
+    verdict.className = r.pass ? 'pass' : 'fail';
+    document.title = r.pass ? 'PASS' : 'FAIL';
+    log.textContent = [...(r.output || []), ...(r.mismatches || []).map((m) => 'MISMATCH ' + m)].join('\n');
+    window.smokeResult = r;
+  };
+  worker.postMessage('run');
+</script>

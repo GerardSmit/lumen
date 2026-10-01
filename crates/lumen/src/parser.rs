@@ -1085,11 +1085,31 @@ impl Parser {
         if self.ts.is_some() {
             self.ts_note_error();
         }
+        let message = msg.into();
+        let message = if message.starts_with("expected ") || message.starts_with("unexpected token") {
+            self.unexpected_message()
+        } else {
+            message
+        };
         Err(ParseError {
-            message: msg.into(),
+            message,
             line: self.line(),
             at_eof: self.at_eof(),
         })
+    }
+
+    /// V8's wording for a token the grammar did not allow here.
+    fn unexpected_message(&self) -> String {
+        match self.cur() {
+            Tok::Eof => "Unexpected end of input".to_string(),
+            Tok::Num(_) | Tok::BigInt(_) => "Unexpected number".to_string(),
+            Tok::Str(_) => "Unexpected string".to_string(),
+            Tok::Template(_) => "Unexpected template string".to_string(),
+            Tok::Ident(name) => format!("Unexpected identifier '{name}'"),
+            Tok::Keyword(word) => format!("Unexpected token '{word}'"),
+            Tok::Punct(p) => format!("Unexpected token '{p}'"),
+            Tok::Regex(_) => "Unexpected regular expression".to_string(),
+        }
     }
 
     /// [`err`](Parser::err) for post-consumption semantic checks (duplicate bindings, `let` as

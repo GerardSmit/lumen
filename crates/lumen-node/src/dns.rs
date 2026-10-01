@@ -86,6 +86,184 @@ fn decode_addr_list(
     }
 }
 
+/// `__dns.getaddrinfo(hostname, family, flags, resolve, reject)` — `getaddrinfo(3)` with the
+/// caller's family and `AI_*` hints; resolves with `[{ address, family }, …]` in the resolver's
+/// order, or rejects with `{ code: "EAI_…" }`.
+pub fn op_getaddrinfo(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let hostname = arg_str(ctx, args, 0)?;
+    let family = arg_num(args, 1) as u8;
+    let flags = arg_num(args, 2) as i32;
+    let (resolve, reject) = settle_pair(ctx, args, 3, "__dns.getaddrinfo")?;
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_gai_list);
+    spawn_handle(ctx).spawn_blocking(id, move || Box::new(gai_lookup(&hostname, family, flags)));
+    Ok(Value::Undefined)
+}
+
+#[cfg(unix)]
+fn gai_lookup(hostname: &str, family: u8, flags: i32) -> Result<Vec<(String, u8)>, &'static str> {
+    use std::ffi::{CStr, CString};
+    let host = CString::new(hostname).map_err(|_| "EAI_NONAME")?;
+    // SAFETY: an all-zero addrinfo is the documented "no hints" starting point.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_flags = flags;
+    hints.ai_family = match family {
+        4 => libc::AF_INET,
+        6 => libc::AF_INET6,
+        _ => libc::AF_UNSPEC,
+    };
+    hints.ai_socktype = libc::SOCK_STREAM;
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    // SAFETY: `host` is NUL-terminated, `hints` is initialised and `res` receives the list.
+    let rc = unsafe { libc::getaddrinfo(host.as_ptr(), std::ptr::null(), &hints, &mut res) };
+    if rc != 0 {
+        return Err(match rc {
+            libc::EAI_AGAIN => "EAI_AGAIN",
+            libc::EAI_BADFLAGS => "EAI_BADFLAGS",
+            libc::EAI_FAMILY => "EAI_FAMILY",
+            libc::EAI_MEMORY => "EAI_MEMORY",
+            libc::EAI_NONAME => "EAI_NONAME",
+            libc::EAI_SERVICE => "EAI_SERVICE",
+            libc::EAI_SOCKTYPE => "EAI_SOCKTYPE",
+            _ => "EAI_FAIL",
+        });
+    }
+    let mut out = Vec::new();
+    let mut cur = res;
+    while !cur.is_null() {
+        // SAFETY: `cur` walks the list getaddrinfo returned, which stays alive until freeaddrinfo.
+        let info = unsafe { &*cur };
+        if !info.ai_addr.is_null() {
+            // SAFETY: the family says which sockaddr layout `ai_addr` points to.
+            match info.ai_family {
+                libc::AF_INET => {
+                    let sa = unsafe { &*(info.ai_addr as *const libc::sockaddr_in) };
+                    let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+                    out.push((ip.to_string(), 4));
+                }
+                libc::AF_INET6 => {
+                    let sa = unsafe { &*(info.ai_addr as *const libc::sockaddr_in6) };
+                    let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+                    out.push((ip.to_string(), 6));
+                }
+                _ => {}
+            }
+        }
+        cur = info.ai_next;
+    }
+    // SAFETY: `res` came from a successful getaddrinfo.
+    unsafe { libc::freeaddrinfo(res) };
+    if out.is_empty() {
+        return Err("EAI_NONAME");
+    }
+    Ok(out)
+}
+
+#[cfg(not(unix))]
+fn gai_lookup(hostname: &str, family: u8, _flags: i32) -> Result<Vec<(String, u8)>, &'static str> {
+    system_lookup(hostname, family).map_err(|_| "EAI_NONAME")
+}
+
+fn decode_gai_list(
+    ctx: &mut Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
+    match *payload
+        .downcast::<Result<Vec<(String, u8)>, &'static str>>()
+        .expect("getaddrinfo payload")
+    {
+        Ok(list) => {
+            let items = list
+                .into_iter()
+                .map(|(address, family)| {
+                    let o = Value::Obj(ctx.new_object());
+                    let _ = ctx.member_set(&o, "address", Value::from_string(address));
+                    let _ = ctx.member_set(&o, "family", Value::Num(family as f64));
+                    o
+                })
+                .collect();
+            Ok(vec![ctx.make_array(items)])
+        }
+        Err(code) => {
+            let err = ctx.make_error("Error", format!("getaddrinfo {code}"));
+            let _ = ctx.set_member(&err, "code", Value::str(code));
+            Err(err)
+        }
+    }
+}
+
+/// `__dns.getnameinfo(address, port, resolve, reject)` — `getnameinfo(3)`; resolves with
+/// `[hostname, service]` or rejects with `{ code: "EAI_…" }`.
+pub fn op_getnameinfo(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let address = arg_str(ctx, args, 0)?;
+    let port = arg_num(args, 1) as u16;
+    let (resolve, reject) = settle_pair(ctx, args, 2, "__dns.getnameinfo")?;
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_name_info);
+    spawn_handle(ctx).spawn_blocking(id, move || Box::new(name_info(&address, port)));
+    Ok(Value::Undefined)
+}
+
+#[cfg(unix)]
+fn name_info(address: &str, port: u16) -> Result<(String, String), &'static str> {
+    use std::ffi::CStr;
+    let ip: IpAddr = address.parse().map_err(|_| "EAI_NONAME")?;
+    let addr = SocketAddr::new(ip, port);
+    let (storage, len) = crate::net::sockaddr_of(&addr);
+    let mut host = [0 as libc::c_char; 1025];
+    let mut serv = [0 as libc::c_char; 64];
+    // SAFETY: `storage` holds a valid sockaddr of `len` bytes; the output buffers are sized as
+    // declared.
+    let rc = unsafe {
+        libc::getnameinfo(
+            (&storage as *const libc::sockaddr_storage).cast(),
+            len,
+            host.as_mut_ptr(),
+            host.len() as _,
+            serv.as_mut_ptr(),
+            serv.len() as _,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(match rc {
+            libc::EAI_AGAIN => "EAI_AGAIN",
+            libc::EAI_BADFLAGS => "EAI_BADFLAGS",
+            libc::EAI_FAMILY => "EAI_FAMILY",
+            libc::EAI_MEMORY => "EAI_MEMORY",
+            libc::EAI_NONAME => "EAI_NONAME",
+            _ => "EAI_FAIL",
+        });
+    }
+    // SAFETY: getnameinfo wrote NUL-terminated strings.
+    let text = |buf: &[libc::c_char]| unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+    Ok((text(&host), text(&serv)))
+}
+
+#[cfg(not(unix))]
+fn name_info(address: &str, port: u16) -> Result<(String, String), &'static str> {
+    let ip: IpAddr = address.parse().map_err(|_| "EAI_NONAME")?;
+    Ok((ip.to_string(), port.to_string()))
+}
+
+fn decode_name_info(
+    ctx: &mut Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
+    match *payload
+        .downcast::<Result<(String, String), &'static str>>()
+        .expect("getnameinfo payload")
+    {
+        Ok((host, service)) => Ok(vec![ctx.make_array(vec![
+            Value::from_string(host),
+            Value::from_string(service),
+        ])]),
+        Err(code) => {
+            let err = ctx.make_error("Error", format!("getnameinfo {code}"));
+            let _ = ctx.set_member(&err, "code", Value::str(code));
+            Err(err)
+        }
+    }
+}
+
 // ---- record-type queries via DNS-over-UDP ----------------------------------------------------
 
 /// `__dns.resolve(hostname, rrtype, resolve, reject)` — a record-type query (A/AAAA/CNAME/NS/MX/

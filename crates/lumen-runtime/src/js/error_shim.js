@@ -24,6 +24,13 @@ globalThis.__lumen_fire_error = function (error, origin = 'uncaughtException') {
             return false;
         }
     }
+    const execArgv = globalThis.process && globalThis.process.execArgv;
+    if (Array.isArray(execArgv) && execArgv.includes('--abort-on-uncaught-exception')) {
+        try {
+            console.error(error instanceof Error ? error.stack : error);
+        } catch {}
+        globalThis.process.abort();
+    }
     const h = globalThis.onerror;
     if (typeof h !== 'function') return false;
     let message = '';

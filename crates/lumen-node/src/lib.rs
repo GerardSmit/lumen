@@ -29,30 +29,49 @@ use lumen_host::{ops, Ctx, Extension, SpawnHandle, Value};
 
 #[cfg(feature = "bun")]
 mod bunhash;
+#[cfg(not(target_arch = "wasm32"))]
 mod child;
 mod codec;
+mod glue_dev;
 #[cfg(windows)]
 mod win_spawn;
 #[cfg(windows)]
 mod win_pipe;
 mod crypto;
+#[cfg(not(target_arch = "wasm32"))]
 mod dns;
+#[cfg(not(target_arch = "wasm32"))]
 mod dylib;
-#[cfg(feature = "bun")]
+#[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod ffi;
 mod hash;
 #[path = "../../lumen-runtime/src/jsx.rs"]
 mod jsx;
+#[cfg(not(target_arch = "wasm32"))]
 mod napi;
+#[cfg(not(target_arch = "wasm32"))]
+mod fsb;
+#[cfg(target_arch = "wasm32")]
+#[path = "fsb_vfs.rs"]
 mod fsb;
 mod native;
+#[cfg(not(target_arch = "wasm32"))]
 mod net;
 mod password;
 mod pathops;
-#[cfg(feature = "bun")]
+#[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod sqlite;
+#[cfg(not(target_arch = "wasm32"))]
 mod tls;
+#[cfg(not(target_arch = "wasm32"))]
 mod vm_timeout;
+mod zlib;
+#[cfg(target_arch = "wasm32")]
+mod browser;
+#[cfg(target_arch = "wasm32")]
+use browser::{child, dns, napi, net, tls, vm_timeout};
+#[cfg(all(feature = "bun", target_arch = "wasm32"))]
+use browser::{ffi, sqlite};
 
 /// The runtime's blocking-work spawner (threadpool), for async ops.
 fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
@@ -63,6 +82,7 @@ fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
 }
 
 pub fn extension() -> Extension {
+    let dev_glue = glue_dev::source();
     Extension {
         name: "node",
         globals: &[],
@@ -72,6 +92,7 @@ pub fn extension() -> Extension {
                 ops![
                     "realmCwd" (0) => op_realm_cwd,
                     "native" (0) => native::op_native,
+                    "cryptoBinding" (0) => crypto::op_crypto_binding,
                     "fsBinding" (0) => fsb::op_fs_binding,
                     "isFile" (1) => op_is_file,
                     "isDir" (1) => op_is_dir,
@@ -130,22 +151,14 @@ pub fn extension() -> Extension {
             (
                 "__zlib",
                 ops![
-                    "deflate" (1) => op_zlib_deflate,
-                    "inflate" (2) => op_zlib_inflate,
-                    "deflateRaw" (1) => op_zlib_deflate_raw,
-                    "inflateRaw" (2) => op_zlib_inflate_raw,
-                    "gzip" (1) => op_zlib_gzip,
-                    "gunzip" (2) => op_zlib_gunzip,
-                    "brotliCompress" (1) => op_zlib_brotli_compress,
-                    "brotliDecompress" (2) => op_zlib_brotli_decompress,
-                    "zstdCompress" (1) => op_zlib_zstd_compress,
-                    "zstdDecompress" (2) => op_zlib_zstd_decompress,
-                    "crc32" (2) => op_zlib_crc32,
-                    "streamOpen" (1) => op_zlib_stream_open,
-                    "streamWrite" (2) => op_zlib_stream_write,
-                    "streamFlush" (2) => op_zlib_stream_flush,
-                    "streamReset" (1) => op_zlib_stream_reset,
-                    "streamClose" (1) => op_zlib_stream_close,
+                    "zstdCompress" (1) => zlib::op_zstd_compress,
+                    "zstdDecompress" (1) => zlib::op_zstd_decompress,
+                    "crc32" (2) => zlib::op_crc32,
+                    "handleOpen" (6) => zlib::op_handle_open,
+                    "handleWrite" (8) => zlib::op_handle_write,
+                    "handleParams" (3) => zlib::op_handle_params,
+                    "handleReset" (1) => zlib::op_handle_reset,
+                    "handleClose" (1) => zlib::op_handle_close,
                 ],
             ),
             #[cfg(feature = "bun")]
@@ -187,7 +200,6 @@ pub fn extension() -> Extension {
             ("__net", net::NET_OPS),
             ("__udp", net::UDP_OPS),
             ("__tls", tls::TLS_OPS),
-            ("__crypto", crypto::CRYPTO_OPS),
             ("__password", password::PASSWORD_OPS),
             #[cfg(feature = "bun")]
             ("__sqlite", sqlite::SQLITE_OPS),
@@ -197,6 +209,8 @@ pub fn extension() -> Extension {
                     "lookup" (4) => dns::op_lookup,
                     "resolve" (4) => dns::op_resolve,
                     "getServers" (0) => dns::op_get_servers,
+                    "getaddrinfo" (5) => dns::op_getaddrinfo,
+                    "getnameinfo" (4) => dns::op_getnameinfo,
                 ],
             ),
         ],
@@ -205,10 +219,10 @@ pub fn extension() -> Extension {
             state.put(net::NetRegistry::default());
             state.put(net::DgramRegistry::default());
             state.put(tls::TlsRegistry::default());
-            state.put(ZlibStreams::default());
+            state.put(zlib::ZlibHandles::default());
         }),
-        js_init: None,
-        js_init_snapshot: Some(JS_GLUE_AOT),
+        js_init: dev_glue,
+        js_init_snapshot: if dev_glue.is_some() { None } else { Some(JS_GLUE_AOT) },
     }
 }
 
@@ -226,6 +240,9 @@ fn arg_path(ctx: &mut Ctx, args: &[Value]) -> Result<String, Value> {
 
 fn op_is_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
+    #[cfg(target_arch = "wasm32")]
+    return Ok(Value::Bool(lumen_host::vfs::is_file(&p)));
+    #[cfg(not(target_arch = "wasm32"))]
     Ok(Value::Bool(Path::new(&p).is_file()))
 }
 
@@ -343,6 +360,9 @@ fn op_compile_commonjs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 fn op_is_dir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
+    #[cfg(target_arch = "wasm32")]
+    return Ok(Value::Bool(lumen_host::vfs::is_dir(&p)));
+    #[cfg(not(target_arch = "wasm32"))]
     Ok(Value::Bool(Path::new(&p).is_dir()))
 }
 
@@ -350,7 +370,13 @@ fn op_is_dir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 /// MODULE_NOT_FOUND context.
 fn op_read_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    match std::fs::read_to_string(&p) {
+    #[cfg(target_arch = "wasm32")]
+    let read = lumen_host::vfs::read_file(&p)
+        .map_err(|e| e.to_io())
+        .and_then(|b| String::from_utf8(b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)));
+    #[cfg(not(target_arch = "wasm32"))]
+    let read = std::fs::read_to_string(&p);
+    match read {
         Ok(s) => Ok(Value::from_string(crate::codec::canonical(s))),
         Err(e) => Err(ctx.make_error("Error", format!("cannot read '{p}': {e}"))),
     }
@@ -361,8 +387,13 @@ fn op_read_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
 fn op_strip_shebang(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let source = args.first().cloned().unwrap_or(Value::Undefined);
     if let Value::Str(s) = &source {
-        if let Some(rest) = s.as_str().strip_prefix("#!") {
+        let text = s.as_str();
+        let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+        if let Some(rest) = body.strip_prefix("#!") {
             return Ok(Value::from_string(format!("//{rest}")));
+        }
+        if body.len() != text.len() {
+            return Ok(Value::from_string(body.to_string()));
         }
     }
     Ok(source)
@@ -372,7 +403,11 @@ fn op_strip_shebang(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 /// path corrupts binary. Errors carry the errno `code` Node users switch on.
 fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    match std::fs::read(&p) {
+    #[cfg(target_arch = "wasm32")]
+    let read = lumen_host::vfs::read_file(&p).map_err(|e| e.to_io());
+    #[cfg(not(target_arch = "wasm32"))]
+    let read = std::fs::read(&p);
+    match read {
         Ok(bytes) => ctx.make_uint8array(&bytes),
         Err(e) => {
             let err = ctx.make_error("Error", format!("cannot read '{p}': {e}"));
@@ -391,7 +426,11 @@ fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 /// path doesn't exist yet (matching how the JS resolver probes candidates).
 fn op_realpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    match lumen_host::canonicalize(&p) {
+    #[cfg(target_arch = "wasm32")]
+    let canon = lumen_host::vfs::realpath(&p).map(std::path::PathBuf::from).map_err(|e| e.to_io());
+    #[cfg(not(target_arch = "wasm32"))]
+    let canon = lumen_host::canonicalize(&p);
+    match canon {
         Ok(c) => Ok(Value::from_string(c.to_string_lossy().into_owned())),
         Err(_) => Ok(Value::from_string(p)),
     }
@@ -945,18 +984,22 @@ fn op_statfs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 /// One object of OS facts the JS `os` shim reads (snapshotted like Node's are). `hostname`
 /// is separate because it can do I/O.
 fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let platform = match std::env::consts::OS {
+    #[cfg(target_arch = "wasm32")]
+    let (os_name, arch_name) = ("linux", "wasm32");
+    #[cfg(not(target_arch = "wasm32"))]
+    let (os_name, arch_name) = (std::env::consts::OS, std::env::consts::ARCH);
+    let platform = match os_name {
         "macos" => "darwin",
         "windows" => "win32",
         other => other,
     };
-    let arch = match std::env::consts::ARCH {
+    let arch = match arch_name {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         "x86" => "ia32",
         other => other,
     };
-    let os_type = match std::env::consts::OS {
+    let os_type = match os_name {
         "macos" => "Darwin",
         "linux" => "Linux",
         "windows" => "Windows_NT",
@@ -964,11 +1007,19 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
     };
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .filter(|home| !home.is_empty())
+        .or_else(passwd_home_dir)
         .unwrap_or_default();
-    let tmpdir = std::env::temp_dir().to_string_lossy().into_owned();
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    #[cfg(target_arch = "wasm32")]
+    let (tmpdir, cpus) = ("/tmp".to_string(), 1usize);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (tmpdir, cpus) = (
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    );
     let (release, version) = os_release_version();
 
     let obj = Value::Obj(ctx.new_object());
@@ -1225,200 +1276,6 @@ fn op_os_setpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     }
 }
 
-// ---- node:zlib, over the shared DEFLATE codec ----
-
-fn zlib_compress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
-    codec: fn(&[u8]) -> Vec<u8>,
-) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
-    };
-    ctx.make_uint8array(&codec(&bytes))
-}
-
-/// `(input, maxOutputLength)`: a result past `maxOutputLength` bytes (default: unbounded, as
-/// Node's `buffer.kMaxLength`) is Node's `RangeError [ERR_BUFFER_TOO_LARGE]`, raised while
-/// decoding — a decompression bomb stops at the cap instead of inflating in full first.
-fn zlib_decompress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
-    codec: fn(&[u8], usize) -> Result<Vec<u8>, String>,
-) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
-    };
-    let limit = match args.get(1) {
-        Some(Value::Num(n)) if *n >= 0.0 && *n < usize::MAX as f64 => *n as usize,
-        _ => usize::MAX,
-    };
-    match codec(&bytes, limit) {
-        Ok(out) => ctx.make_uint8array(&out),
-        Err(e) if e == lumen_host::deflate::OUTPUT_LIMIT => {
-            let err = ctx.make_error(
-                "RangeError",
-                format!("Cannot create a Buffer larger than {limit} bytes"),
-            );
-            let _ = ctx.set_member(&err, "code", Value::str("ERR_BUFFER_TOO_LARGE"));
-            Err(err)
-        }
-        Err(e) => Err(ctx.make_error("Error", e)),
-    }
-}
-
-fn op_zlib_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_compress_op(ctx, a, lumen_host::deflate::zlib_compress)
-}
-fn op_zlib_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::deflate::zlib_decompress_limited)
-}
-fn op_zlib_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_compress_op(ctx, a, lumen_host::deflate::deflate)
-}
-fn op_zlib_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::deflate::inflate_limited)
-}
-fn op_zlib_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_compress_op(ctx, a, lumen_host::deflate::gzip_compress)
-}
-fn op_zlib_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::deflate::gzip_decompress_limited)
-}
-fn op_zlib_brotli_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_compress_op(ctx, a, lumen_host::brotli::brotli_compress)
-}
-fn op_zlib_brotli_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::brotli::brotli_decompress_limited)
-}
-fn op_zlib_zstd_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_compress_op(ctx, a, lumen_host::zstd::zstd_compress)
-}
-fn op_zlib_zstd_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    zlib_decompress_op(ctx, a, lumen_host::zstd::zstd_decompress_limited)
-}
-// ---- streaming deflate/inflate (`zlib.createGzip`, `createDeflate`, `createDeflateRaw`, …) ----
-
-enum ZlibStream {
-    Deflate(lumen_host::deflate::FramedDeflater),
-    Inflate(lumen_host::deflate::FramedInflater),
-}
-
-/// Live streaming codecs, keyed by the id JS holds. A stream is released by `streamClose`
-/// (the JS object's `close()`/`destroy()`), or leaks with the object — Node's does the same.
-#[derive(Default)]
-struct ZlibStreams {
-    next: u64,
-    streams: std::collections::HashMap<u64, ZlibStream>,
-}
-
-/// `(kind)` — `"deflate"`/`"inflate"` (raw), `"zlib"`/`"unzlib"` (zlib framing),
-/// `"gzip"`/`"gunzip"`, or `"unzip"` (gzip or zlib by header); returns the stream id.
-fn op_zlib_stream_open(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    use lumen_host::deflate::{FramedDeflater as D, FramedInflater as I, Framing};
-    let kind = ctx
-        .coerce_string(a.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let stream = match kind.as_str() {
-        "deflate" => ZlibStream::Deflate(D::new(Framing::Raw)),
-        "zlib" => ZlibStream::Deflate(D::new(Framing::Zlib)),
-        "gzip" => ZlibStream::Deflate(D::new(Framing::Gzip)),
-        "inflate" => ZlibStream::Inflate(I::new(Framing::Raw)),
-        "unzlib" => ZlibStream::Inflate(I::new(Framing::Zlib)),
-        "gunzip" => ZlibStream::Inflate(I::new(Framing::Gzip)),
-        "unzip" => ZlibStream::Inflate(I::new(Framing::Auto)),
-        other => {
-            return Err(ctx.make_error("TypeError", format!("unknown zlib stream kind {other:?}")))
-        }
-    };
-    let reg = ctx.host_mut::<ZlibStreams>().expect("registry");
-    reg.next += 1;
-    let id = reg.next;
-    reg.streams.insert(id, stream);
-    Ok(Value::Num(id as f64))
-}
-
-fn zlib_stream_id(a: &[Value]) -> u64 {
-    a.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64
-}
-
-fn zlib_stream_missing(ctx: &Ctx) -> Value {
-    ctx.make_error("Error", "zlib stream is closed")
-}
-
-/// `(id, chunk)` — feed bytes; returns the bytes produced so far (a compressor emits a block
-/// whenever enough input is buffered, otherwise only on flush).
-fn op_zlib_stream_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let id = zlib_stream_id(a);
-    let Some(bytes) = ctx.typed_array_bytes(a.get(1).unwrap_or(&Value::Undefined)) else {
-        return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
-    };
-    let result = match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
-        Some(ZlibStream::Deflate(d)) => Ok(d.write(&bytes)),
-        Some(ZlibStream::Inflate(i)) => i.write(&bytes),
-        None => return Err(zlib_stream_missing(ctx)),
-    };
-    match result {
-        Ok(out) => ctx.make_uint8array(&out),
-        Err(e) => Err(ctx.make_error("Error", e)),
-    }
-}
-
-/// `(id, mode)` — a compressor flushes with zlib flush constant `mode` (`true` = `Z_FINISH`,
-/// `false`/absent = `Z_SYNC_FLUSH`) and returns the bytes; a decompressor returns whether its
-/// stream has ended (as a boolean).
-fn op_zlib_stream_flush(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    use lumen_host::deflate::Flush;
-    let id = zlib_stream_id(a);
-    let mode = match a.get(1) {
-        Some(Value::Bool(true)) => Flush::Finish,
-        Some(Value::Num(n)) => Flush::from_zlib(*n as u32).unwrap_or(Flush::Sync),
-        _ => Flush::Sync,
-    };
-    let result = match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
-        Some(ZlibStream::Deflate(d)) => d.flush(mode),
-        Some(ZlibStream::Inflate(i)) => return Ok(Value::Bool(i.finished())),
-        None => return Err(zlib_stream_missing(ctx)),
-    };
-    match result {
-        Ok(out) => ctx.make_uint8array(&out),
-        Err(e) => Err(ctx.make_error("Error", e)),
-    }
-}
-
-/// `(id)` — `zlib.reset()`: drop the window so the next message stands alone.
-fn op_zlib_stream_reset(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let id = zlib_stream_id(a);
-    match ctx.host_mut::<ZlibStreams>().and_then(|r| r.streams.get_mut(&id)) {
-        Some(ZlibStream::Deflate(d)) => d.reset(),
-        Some(ZlibStream::Inflate(i)) => i.reset(),
-        None => return Err(zlib_stream_missing(ctx)),
-    }
-    Ok(Value::Undefined)
-}
-
-fn op_zlib_stream_close(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let id = zlib_stream_id(a);
-    if let Some(reg) = ctx.host_mut::<ZlibStreams>() {
-        reg.streams.remove(&id);
-    }
-    Ok(Value::Undefined)
-}
-
-/// `__zlib.crc32(bytes, seed)` — CRC-32 of `bytes`, optionally continued from `seed`.
-fn op_zlib_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let v = a.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "zlib.crc32 expects a Buffer/TypedArray"));
-    };
-    let seed = a.get(1).and_then(|v| v.as_num_opt()).unwrap_or(0.0) as u32;
-    Ok(Value::Num(
-        lumen_host::deflate::crc32_from(seed, &bytes) as f64
-    ))
-}
-
 /// `() -> string | undefined` — the embedded realm's working directory, or `undefined` when the
 /// runtime owns its process (the OS cwd is then the right base and paths stay as written).
 fn op_realm_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -1436,6 +1293,45 @@ pub fn shutdown_native_addons(ctx: &mut Ctx) { napi::shutdown(ctx); }
 /// SQLite databases (which checkpoints their write-ahead logs) — for an exit that skips the drop.
 pub fn shutdown_native_resources(ctx: &mut Ctx) {
     napi::shutdown(ctx);
-    #[cfg(feature = "bun")]
+    #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
     sqlite::close_all(ctx);
+}
+
+#[cfg(unix)]
+fn passwd_home_dir() -> Option<String> {
+    use std::ffi::{c_char, c_uint, CStr};
+    #[repr(C)]
+    struct Passwd {
+        name: *const c_char,
+        passwd: *const c_char,
+        uid: c_uint,
+        gid: c_uint,
+        #[cfg(target_os = "macos")]
+        change: i64,
+        #[cfg(target_os = "macos")]
+        class: *const c_char,
+        #[cfg(target_os = "macos")]
+        gecos: *const c_char,
+        #[cfg(not(target_os = "macos"))]
+        gecos: *const c_char,
+        dir: *const c_char,
+    }
+    extern "C" {
+        fn getuid() -> c_uint;
+        fn getpwuid(uid: c_uint) -> *const Passwd;
+    }
+    let entry = unsafe { getpwuid(getuid()) };
+    if entry.is_null() {
+        return None;
+    }
+    let dir = unsafe { (*entry).dir };
+    if dir.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(dir) }.to_string_lossy().into_owned())
+}
+
+#[cfg(not(unix))]
+fn passwd_home_dir() -> Option<String> {
+    None
 }

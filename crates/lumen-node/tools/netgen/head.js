@@ -46,7 +46,7 @@ function builtinModule(id) {
     case "async_hooks": case "diagnostics_channel": case "path": case "cluster":
       return __builtins.get(id);
     case "internal/util/types":
-      return __builtins.get("util").types;
+      return __builtins.get("util/types");
     case "internal/util/inspect":
       return { inspect: __builtins.get("util").inspect };
     case "internal/url": {
@@ -61,14 +61,39 @@ function builtinModule(id) {
 const { Buffer } = __builtins.get("buffer");
 const { codes } = { codes: __errors };
 
+// The dgram error codes lib/dgram.js raises that the shared error table does not carry.
+if (!codes.ERR_SOCKET_BAD_TYPE) {
+  const plain = (key, message, Base) => {
+    codes[key] = { [key]: function () { return __nodeError(Base, key, message); } }[key];
+  };
+  plain("ERR_SOCKET_BAD_TYPE", "Bad socket type specified. Valid types are: udp4, udp6", TypeError);
+  plain("ERR_SOCKET_ALREADY_BOUND", "Socket is already bound", Error);
+  plain("ERR_SOCKET_BAD_BUFFER_SIZE", "Buffer size must be a positive integer", TypeError);
+  // A SystemError: the libuv failure it wraps rides along as `info`, with `errno` and `syscall`
+  // mirroring it.
+  codes.ERR_SOCKET_BUFFER_SIZE = function ERR_SOCKET_BUFFER_SIZE(context) {
+    const key = "ERR_SOCKET_BUFFER_SIZE";
+    const message = `Could not get or set buffer size: ${context.syscall} returned ${context.code} (${context.message})`;
+    const err = __nodeError(Error, key, message);
+    Object.defineProperties(err, {
+      name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
+      info: { value: context, enumerable: true, configurable: true, writable: false },
+      errno: { get() { return context.errno; }, set(value) { context.errno = value; }, enumerable: true, configurable: true },
+      syscall: { get() { return context.syscall; }, set(value) { context.syscall = value; }, enumerable: true, configurable: true },
+    });
+    if (typeof err.stack === "string") err.stack = err.stack.replace(/^Error \[/, "SystemError [");
+    return err;
+  };
+}
+
 // ---- internal/errors --------------------------------------------------------------------------
 
 const uvUnmappedError = ["UNKNOWN", "unknown error"];
 function uvErrmapGet(errno) {
-  return __uvErrmap.get(errno);
+  return __uvErrmap().get(errno);
 }
 function getSystemErrorName(errno) {
-  const entry = __uvErrmap.get(errno);
+  const entry = __uvErrmap().get(errno);
   return entry ? entry[0] : `Unknown system error ${errno}`;
 }
 function uvException(ctx) {
@@ -134,7 +159,7 @@ function dnsException(code, syscall, hostname) {
   let errno;
   if (typeof code === "number") {
     errno = code;
-    if (code === __uvCodes.get("EAI_NODATA") || code === __uvCodes.get("EAI_NONAME")) code = "ENOTFOUND";
+    if (code === __uvCodes().get("EAI_NODATA") || code === __uvCodes().get("EAI_NONAME")) code = "ENOTFOUND";
     else code = getSystemErrorName(code);
   }
   const ex = new Error(`${syscall} ${code}${hostname ? ` ${hostname}` : ""}`);
@@ -186,6 +211,7 @@ const internalUtil = {
   assertCrypto() {},
   deprecate: (fn, msg, code) => __builtins.get("util").deprecate(fn, msg, code),
   get promisify() { return __builtins.get("util").promisify; },
+  get customPromisifyArgs() { return __internals.get("customPromisifyArgs"); },
   spliceOne(list, index) {
     for (; index + 1 < list.length; index++) list[index] = list[index + 1];
     list.pop();
@@ -262,6 +288,11 @@ const optionDefaults = {
   "--pending-deprecation": false,
 };
 function getOptionValue(name) {
+  const parsed = process[Symbol.for("lumen.options")];
+  if (parsed !== undefined && Object.hasOwn(parsed, name)) {
+    const value = parsed[name];
+    return name === "--max-http-header-size" ? Number(value) : value;
+  }
   if (name === "--insecure-http-parser" || name === "--pending-deprecation") {
     const argv = process.execArgv || [];
     const env = process.env?.NODE_OPTIONS || "";
@@ -300,13 +331,16 @@ const shims = {
     return Buffer.from(arrayBuffer, byteOffset, length);
   } },
   "internal/worker/js_transferable": { JSTransferable, kClone, kDeserialize },
+  "internal/v8/startup_snapshot": {
+    namespace: { addSerializeCallback() {}, addDeserializeCallback() {}, isBuildingSnapshot: () => false },
+  },
 };
 for (const id of Object.keys(shims)) moduleCache.set(id, { exports: shims[id] });
 
 // ---- internalBinding('uv') --------------------------------------------------------------------
 
-const uvBinding = { errname: getSystemErrorName, getErrorMap: () => __uvErrmap };
-for (const [errno, [name]] of __uvErrmap) uvBinding[`UV_${name}`] = errno;
+const uvBinding = { errname: getSystemErrorName, getErrorMap: () => __uvErrmap() };
+for (const [errno, [name]] of __uvErrmap()) uvBinding[`UV_${name}`] = errno;
 const UV_EOF = uvBinding.UV_EOF;
 const UV_EBADF = uvBinding.UV_EBADF;
 const UV_ENOTCONN = uvBinding.UV_ENOTCONN;
@@ -315,11 +349,12 @@ const UV_ENOTSUP = uvBinding.UV_ENOTSUP;
 
 // A native op error (`{ code: 'ECONNREFUSED', ... }`) as the libuv errno the handles report.
 function errnoOf(error) {
+  if (error && typeof error.errno === "number" && error.errno < 0 && __uvErrmap().has(error.errno)) return error.errno;
   const code = error && error.code;
   if (typeof code === "string") {
-    const errno = __uvCodes.get(code);
+    const errno = __uvCodes().get(code);
     if (errno !== undefined) return errno;
-    if (code === "ENOTFOUND") return __uvCodes.get("EAI_NONAME");
+    if (code === "ENOTFOUND") return __uvCodes().get("EAI_NONAME");
   }
   return uvBinding.UV_UNKNOWN;
 }
@@ -466,6 +501,11 @@ class StreamHandle {
 
   // Writes go out one at a time, in order (the native write runs on a worker thread).
   writeBuffer(req, data) {
+    if (!ArrayBuffer.isView(data)) {
+      const err = new TypeError("Second argument must be a buffer");
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
     if (this._closed || this._id === null) return UV_EBADF;
     let bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     streamBaseState[kBytesWritten] = bytes.length;
@@ -677,12 +717,16 @@ class TCP extends StreamHandle {
     this._bindAddress = address;
     this._bindPort = port | 0;
     this._bindFlags = 0;
+    this._connectBindAddress = address;
+    this._connectBindPort = port | 0;
     return 0;
   }
   bind6(address, port, flags) {
     this._bindAddress = address;
     this._bindPort = port | 0;
     this._bindFlags = flags | 0;
+    this._connectBindAddress = address;
+    this._connectBindPort = port | 0;
     return 0;
   }
   // The listener binds here (std binds and listens in one step, so EADDRINUSE surfaces from
@@ -694,7 +738,7 @@ class TCP extends StreamHandle {
     const address = this._bindAddress ?? "0.0.0.0";
     let info;
     try {
-      info = __net.listen(address, this._bindPort, backlog | 0);
+      info = __net.listen(address, this._bindPort, backlog | 0, this._bindFlags | 0);
     } catch (error) {
       return errnoOf(error);
     }
@@ -713,7 +757,7 @@ class TCP extends StreamHandle {
     return 0;
   }
   connect(req, address, port) {
-    return this._connectWith(req, (ok, fail) => __net.connect(address, port, ok, fail));
+    return this._connectWith(req, (ok, fail) => __net.connect(address, port, this._connectBindAddress ?? "", this._connectBindPort | 0, ok, fail));
   }
   connect6(req, address, port) {
     return this.connect(req, address, port);
@@ -890,6 +934,214 @@ class BlockListHandle {
 
 const blockListBinding = { SocketAddress: SocketAddressHandle, BlockList: BlockListHandle, AF_INET, AF_INET6 };
 
+// ---- internalBinding('udp_wrap') ---------------------------------------------------------------
+
+// libuv's uv_udp_t over the `__udp` ops (net.rs). The native ops throw errno-tagged errors; the
+// handle reports them the way libuv does, as negative return codes.
+const UDPConstants = { UV_UDP_IPV6ONLY: 1, UV_UDP_REUSEADDR: 4 };
+class SendWrap {}
+class UDP {
+  constructor() {
+    this._id = null;
+    this._kind6 = false;
+    this._closed = false;
+    this._reading = false;
+    this._readInFlight = false;
+    this._held = [];
+    this._refed = true;
+    this._asyncId = newAsyncId();
+    this._queuedBytes = 0;
+    this._queuedCount = 0;
+    this.onmessage = null;
+    this.lookup = null;
+  }
+  getAsyncId() { return this._asyncId; }
+  getProviderType() { return 0; }
+  get fd() { return this._id === null ? -1 : 1000 + this._id; }
+
+  _guard(op) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    try {
+      op();
+      return 0;
+    } catch (error) {
+      return errnoOf(error);
+    }
+  }
+
+  _bind(kind6, address, port, flags) {
+    if (this._closed) return UV_EBADF;
+    if (this._id !== null) return UV_EINVAL;
+    try {
+      const info = __udp.bind(kind6 ? "udp6" : "udp4", address, port, flags | 0);
+      this._id = info.socketId;
+      this._kind6 = kind6;
+      if (!this._refed) __udp.udpRef(this._id, true);
+      return 0;
+    } catch (error) {
+      return errnoOf(error);
+    }
+  }
+  bind(address, port, flags) { return this._bind(false, address, port, flags); }
+  bind6(address, port, flags) { return this._bind(true, address, port, flags); }
+  open(_fd) { return UV_ENOTSUP; }
+
+  connect(address, port) { return this._guard(() => __udp.connect(this._id, address, port)); }
+  connect6(address, port) { return this.connect(address, port); }
+  disconnect() { return this._guard(() => __udp.disconnect(this._id)); }
+
+  // send(req, list, count, port, address, hasCallback) — or, on a connected socket,
+  // send(req, list, count, hasCallback). The datagram goes out synchronously; the result is
+  // size + 1 (the "finished synchronously" convention of lib/dgram.js) or a negative errno.
+  send(req, list, count, port, address) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    const connected = typeof port === "boolean" || port === undefined;
+    const parts = [];
+    for (let i = 0; i < count; i++) parts.push(list[i]);
+    const bytes = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+    if (getOptionValue("--test-udp-no-try-send")) {
+      this._queuedBytes += bytes.length;
+      this._queuedCount++;
+      setImmediate(() => {
+        let sent = 0;
+        const status = this._guard(() => {
+          sent = __udp.send(this._id, bytes, connected ? 0 : port, connected ? "" : address);
+        });
+        this._queuedBytes -= bytes.length;
+        this._queuedCount--;
+        if (typeof req.oncomplete === "function") req.oncomplete(status, sent);
+      });
+      return 0;
+    }
+    let sent;
+    const err = this._guard(() => {
+      sent = __udp.send(this._id, bytes, connected ? 0 : port, connected ? "" : address);
+    });
+    return err === 0 ? sent + 1 : err;
+  }
+  send6(req, list, count, port, address, hasCallback) { return this.send(req, list, count, port, address, hasCallback); }
+
+  recvStart() {
+    if (this._closed) return UV_EBADF;
+    if (this._id === null) return UV_EINVAL;
+    this._reading = true;
+    if (this._held.length !== 0) process.nextTick(() => this._drainHeld());
+    else this._armRecv();
+    return 0;
+  }
+  recvStop() {
+    this._reading = false;
+    return 0;
+  }
+  _drainHeld() {
+    try {
+      while (this._reading && !this._closed && this._held.length !== 0) this._deliver(this._held.shift());
+    } finally {
+      this._armRecv();
+    }
+  }
+  _armRecv() {
+    if (!this._reading || this._readInFlight || this._closed || this._id === null || this._held.length !== 0) return;
+    this._readInFlight = true;
+    __udp.recv(
+      this._id,
+      (msg) => this._onRecv(msg),
+      (error) => this._onRecv(errnoOf(error)),
+    );
+  }
+  _onRecv(result) {
+    this._readInFlight = false;
+    if (this._closed || result === null) return;
+    this._held.push(result);
+    if (this._reading) this._drainHeld();
+  }
+  _deliver(result) {
+    if (typeof this.onmessage !== "function") return;
+    if (typeof result === "number") {
+      this.onmessage(result, this, undefined, undefined);
+      return;
+    }
+    const { data, address, port, family } = result;
+    this.onmessage(data.length, this, Buffer.from(data.buffer, data.byteOffset, data.byteLength), { address, family, port });
+  }
+
+  getsockname(out) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    const name = __udp.address(this._id);
+    if (name === null) return UV_EBADF;
+    out.address = name.address;
+    out.family = name.family;
+    out.port = name.port;
+    return 0;
+  }
+  getpeername(out) {
+    if (this._closed || this._id === null) return UV_EBADF;
+    const name = __udp.peer(this._id);
+    if (name === null) return UV_ENOTCONN;
+    out.address = name.address;
+    out.family = name.family;
+    out.port = name.port;
+    return 0;
+  }
+
+  setBroadcast(on) { return this._guard(() => __udp.setBroadcast(this._id, !!on)); }
+  setTTL(ttl) { return this._guard(() => __udp.setTTL(this._id, ttl)); }
+  setMulticastTTL(ttl) { return this._guard(() => __udp.setMulticastTTL(this._id, ttl)); }
+  setMulticastLoopback(on) { return this._guard(() => __udp.setMulticastLoopback(this._id, !!on)); }
+  setMulticastInterface(address) { return this._guard(() => __udp.setMulticastInterface(this._id, address)); }
+  addMembership(group, iface) { return this._guard(() => __udp.addMembership(this._id, group, iface)); }
+  dropMembership(group, iface) { return this._guard(() => __udp.dropMembership(this._id, group, iface)); }
+  addSourceSpecificMembership(source, group, iface) {
+    return this._guard(() => __udp.addSourceMembership(this._id, source, group, iface));
+  }
+  dropSourceSpecificMembership(source, group, iface) {
+    return this._guard(() => __udp.dropSourceMembership(this._id, source, group, iface));
+  }
+
+  // bufferSize(size, isRecv, ctx): `size` 0 reads the current size. A failure fills `ctx` and
+  // returns undefined, as UDPWrap::BufferSize does.
+  bufferSize(size, isRecv, ctx) {
+    const syscall = isRecv ? "uv_recv_buffer_size" : "uv_send_buffer_size";
+    let result;
+    const err = this._guard(() => {
+      if (size === 0) result = __udp.getBufferSize(this._id, !!isRecv);
+      else {
+        __udp.setBufferSize(this._id, !!isRecv, size);
+        result = __udp.getBufferSize(this._id, !!isRecv);
+      }
+    });
+    if (err !== 0) {
+      const [code, message] = __uvErrmap().get(err) || uvUnmappedError;
+      ctx.errno = err;
+      ctx.code = code;
+      ctx.message = message;
+      ctx.syscall = syscall;
+      return undefined;
+    }
+    return result;
+  }
+  getSendQueueSize() { return this._queuedBytes; }
+  getSendQueueCount() { return this._queuedCount; }
+
+  close(callback) {
+    if (this._closed) return;
+    this._closed = true;
+    this._reading = false;
+    if (this._id !== null) __udp.close(this._id);
+    this._id = null;
+    if (typeof callback === "function") setImmediate(() => callback.call(this));
+  }
+  ref() {
+    this._refed = true;
+    if (this._id !== null) __udp.udpRef(this._id, false);
+  }
+  unref() {
+    this._refed = false;
+    if (this._id !== null) __udp.udpRef(this._id, true);
+  }
+  hasRef() { return this._refed && !this._closed; }
+}
+
 // ---- internalBinding() --------------------------------------------------------------------------
 
 const bindings = {
@@ -898,11 +1150,12 @@ const bindings = {
   stream_wrap: streamWrapBinding,
   tcp_wrap: { TCP, TCPConnectWrap, constants: TCPConstants },
   pipe_wrap: { Pipe, PipeConnectWrap, constants: PipeConstants },
+  udp_wrap: { UDP, SendWrap, constants: UDPConstants },
   block_list: blockListBinding,
   symbols: { owner_symbol: asyncHookSymbols.owner_symbol, async_id_symbol: asyncHookSymbols.async_id_symbol },
   // Only the fd-socket sync write path (makeSyncWrite) reaches this; lumen wraps no raw fds.
   fs: { writeBuffer() { throw new Error("lumen net: synchronous fd writes are not supported"); } },
-  constants: { get os() { return __builtins.get("os").constants; } },
+  constants: { get os() { return { __proto__: __builtins.get("os").constants, UV_UDP_REUSEADDR: UDPConstants.UV_UDP_REUSEADDR }; } },
   trace_events: { trace() {}, isTraceCategoryEnabled: () => false, getCategoryEnabledBuffer: () => new Uint8Array(1) },
   // http_parser is defined further down (after the llhttp port).
 };

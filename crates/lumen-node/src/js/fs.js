@@ -51,7 +51,7 @@ function builtinModule(id) {
     case "events":
       return __builtins.get("events");
     case "internal/util/types":
-      return __builtins.get("util").types;
+      return __builtins.get("util/types");
     case "fs/promises":
       return require("fs").promises;
   }
@@ -299,13 +299,18 @@ function sleep(msec) {
     while (Date.now() < end);
   }
 }
+// `promisify.custom` is all fs reads of it while loading; util loads when something promisifies.
+function promisify(original) {
+  return __builtins.get("util").promisify(original);
+}
+promisify.custom = Symbol.for("nodejs.util.promisify.custom");
 const internalUtil = {
+  promisify,
   kEmptyObject,
   once,
   defineLazyProperties,
   createDeferredPromise,
   sleep,
-  get promisify() { return __builtins.get("util").promisify; },
   get deprecate() { return __builtins.get("util").deprecate; },
   get customPromisifyArgs() { return __internals.get("customPromisifyArgs"); },
   SideEffectFreeRegExpPrototypeExec: (re, string) => RegExp.prototype.exec.call(re, string),
@@ -409,7 +414,26 @@ const shims = {
   "internal/readline/interface": { get Interface() { return __builtins.get("readline").Interface; } },
   "internal/blob": {
     createBlobFromFilePath(path, options) {
-      return new Blob([Buffer.from(bindingCall("open", () => fsb.readFile(P(path), 0), path))], options);
+      const p = P(path);
+      const signature = () => {
+        const st = bindingCall("stat", () => fsb.stat(p), path);
+        return { size: st[8], mtime: `${st[12]}.${st[13]}` };
+      };
+      const opened = signature();
+      const read = (from, to) => {
+        let now;
+        try {
+          now = signature();
+        } catch {
+          throw new DOMException("The blob could not be read", "NotReadableError");
+        }
+        if (now.size !== opened.size || now.mtime !== opened.mtime) {
+          throw new DOMException("The blob could not be read", "NotReadableError");
+        }
+        const bytes = new Uint8Array(fsb.readFile(p, 0));
+        return bytes.slice(from, to);
+      };
+      return Blob[Symbol.for("lumen.fileBlob")](opened.size, options?.type, read);
     },
   },
 };
@@ -9328,4 +9352,4 @@ fs.globSync = function globSync(pattern, options = {}) {
 };
 
 __builtins.set("fs", fs);
-__builtins.set("fs/promises", fs.promises);
+__builtins.set("fs/promises", __lazyValue(() => fs.promises));

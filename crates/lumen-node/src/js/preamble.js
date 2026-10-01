@@ -6,7 +6,7 @@ const __zlib = globalThis.__zlib;
 const __bunhash = globalThis.__bunhash;
 const __child = globalThis.__child;
 const __ffi = globalThis.__ffi;
-const __crypto = globalThis.__crypto;
+const __cryptoBinding = __node.cryptoBinding;
 const __password = globalThis.__password;
 // Macro-bound native ops (src/native.rs): digests, Buffer codecs, bufferutil, async fs.
 const __native = __node.native();
@@ -16,7 +16,6 @@ delete globalThis.__zlib;
 delete globalThis.__bunhash;
 delete globalThis.__child;
 delete globalThis.__ffi;
-delete globalThis.__crypto;
 delete globalThis.__password;
 // The runtime installs process.platform/arch after the glue runs, but the glue ported from Node
 // reads them while loading (`const isWindows = process.platform === 'win32'`).
@@ -34,13 +33,45 @@ if (typeof process === "object" && process !== null && process.platform === unde
 // turn (an I/O completion) runs in.
 const __asyncContextGet = __node.asyncContextGet;
 const __asyncContextSet = __node.asyncContextSet;
-function __bindAsyncContext(fn) {
+// The async context a callback was running in when it threw: node:domain routes an uncaught
+// error to the domains that were active at the throw, which the unwound wrapper no longer sees.
+let __thrownContext;
+function __noteThrown(error) {
+  if (__thrownContext === undefined || __thrownContext.error !== error) {
+    __thrownContext = { error, context: __asyncContextGet() };
+  }
+}
+function __takeThrownContext(error) {
+  const held = __thrownContext;
+  if (held === undefined || held.error !== error) return undefined;
+  __thrownContext = undefined;
+  return held;
+}
+// node:trace_events routes trace points (console timers, user timing, ...) through this function
+// once loaded; until then the points cost one null check.
+let __traceEvent = null;
+function __setTraceEvent(fn) {
+  __traceEvent = fn;
+}
+// Set by node:async_hooks while any hook is enabled; `type` names the resource being scheduled.
+let __asyncHooks = null;
+function __setAsyncHooks(runtime) {
+  __asyncHooks = runtime;
+}
+function __destroyAsyncResource(resource) {
+  if (__asyncHooks !== null) __asyncHooks.destroyOf(resource);
+}
+function __bindAsyncContext(fn, type, resource, repeat) {
+  if (__asyncHooks !== null && type !== undefined) return __asyncHooks.wrap(fn, type, resource, repeat);
   const context = __asyncContextGet();
   if (context === undefined) return fn;
   return function boundWithAsyncContext(...args) {
     const previous = __asyncContextSet(context);
     try {
       return fn.apply(this, args);
+    } catch (error) {
+      __noteThrown(error);
+      throw error;
     } finally {
       __asyncContextSet(previous);
     }
@@ -50,6 +81,9 @@ function __runInAsyncContext(context, fn, thisArg, args) {
   const previous = __asyncContextSet(context);
   try {
     return Reflect.apply(fn, thisArg, args);
+  } catch (error) {
+    __noteThrown(error);
+    throw error;
   } finally {
     __asyncContextSet(previous);
   }
@@ -67,6 +101,15 @@ if (typeof globalThis.global === "undefined") {
 // when several files set one name, the value of the file that comes last in glue order wins,
 // whichever order they run in — the result every file running eagerly, in order, gave.
 let __glueIndex = 0;
+// A registry value computed on its first `get`, for a name whose value is costly to build.
+class __LazyValue {
+  constructor(make) {
+    this.make = make;
+  }
+}
+function __lazyValue(make) {
+  return new __LazyValue(make);
+}
 class __GlueRegistry extends Map {
   constructor() {
     super();
@@ -77,7 +120,13 @@ class __GlueRegistry extends Map {
   get(key) {
     const pending = this.pending.get(key);
     if (pending !== undefined) for (const rec of [...pending]) __glueRun(rec);
-    return super.get(key);
+    const value = super.get(key);
+    if (value instanceof __LazyValue) {
+      const made = value.make();
+      super.set(key, made);
+      return made;
+    }
+    return value;
   }
   has(key) {
     return super.has(key) || this.pending.has(key);
@@ -156,6 +205,9 @@ function __lazyGlue(index, builtins, internals, globals, init) {
 const __builtins = new __GlueRegistry();
 // Glue-internal values shared between the wrapped builtin files (never user-requirable).
 const __internals = new __GlueRegistry();
+// Shared by util.promisify and the builtins that annotate callback signatures (fs), which must not
+// load util to name it.
+__internals.set("customPromisifyArgs", Symbol("customPromisifyArgs"));
 
 // libuv's error table (uv_err_name / uv_strerror): name -> description, and the negative errno
 // each platform's libuv reports (Windows uses libuv's own -40xx range; Unix negates errno). Names
@@ -375,6 +427,7 @@ const __errors = __lazyObject(() => {
     return "Attempt to access memory outside buffer bounds";
   }, RangeError);
   E("ERR_INVALID_BUFFER_SIZE", "Buffer size must be a multiple of %s", RangeError);
+  E("ERR_UNKNOWN_CREDENTIAL", "%s identifier does not exist: %s", Error);
   E("ERR_UNKNOWN_BUILTIN_MODULE", "No such built-in module: %s", Error);
   E("ERR_UNHANDLED_ERROR", (err = undefined) => {
     const msg = "Unhandled error.";
@@ -382,6 +435,18 @@ const __errors = __lazyObject(() => {
     return `${msg} (${err})`;
   }, Error);
   E("ERR_MULTIPLE_CALLBACK", "Callback called multiple times", Error);
+  E("ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET", "`process.setupUncaughtExceptionCapture()` was " +
+    "called while a capture callback was already active", Error);
+  E("ERR_INVALID_ASYNC_ID", "Invalid %s value: %s", RangeError);
+  E("ERR_TRACE_EVENTS_CATEGORY_REQUIRED", "At least one category is required", TypeError);
+  E("ERR_TRACE_EVENTS_UNAVAILABLE", "Trace events are unavailable", Error);
+  E("ERR_DOMAIN_CALLBACK_NOT_AVAILABLE", "A callback was registered through " +
+    "process.setUncaughtExceptionCaptureCallback(), which is mutually exclusive " +
+    "with using the `domain` module", Error);
+  E("ERR_DOMAIN_CANNOT_SET_UNCAUGHT_EXCEPTION_CAPTURE", "The `domain` module is in use, which is " +
+    "mutually exclusive with calling process.setUncaughtExceptionCaptureCallback()", Error);
+  E("ERR_NOT_BUILDING_SNAPSHOT", "Operation cannot be invoked when not building startup snapshot", Error);
+  E("ERR_DUPLICATE_STARTUP_SNAPSHOT_MAIN_FUNCTION", "Deserialize main function is already configured.", Error);
   E("ERR_STREAM_WRITE_AFTER_END", "write after end", Error);
   E("ERR_STREAM_PREMATURE_CLOSE", "Premature close", Error);
   E("ERR_STREAM_DESTROYED", "Cannot call %s after a stream was destroyed", Error);
@@ -463,6 +528,11 @@ const __errors = __lazyObject(() => {
     return `Invalid address family: ${addressType} ${host}:${port}`;
   }, RangeError);
   E("ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "%s maxBuffer length exceeded", RangeError);
+  E("ERR_CHILD_PROCESS_IPC_REQUIRED", "Forked processes must have an IPC channel, missing value 'ipc' in %s", Error);
+  E("ERR_IPC_DISCONNECTED", "IPC channel is already disconnected", Error);
+  E("ERR_IPC_ONE_PIPE", "Child process can have only one IPC pipe", Error);
+  E("ERR_IPC_SYNC_FORK", "IPC cannot be used with synchronous forks", Error);
+  E("ERR_INVALID_SYNC_FORK_INPUT", "Asynchronous forks do not support Buffer, TypedArray, DataView or string input: %s", TypeError);
   E("ERR_ASYNC_CALLBACK", "%s must be a function", TypeError);
   E("ERR_ASYNC_TYPE", 'Invalid name for async "type": %s', TypeError);
   E("ERR_OPERATION_FAILED", "Operation failed: %s", Error, TypeError);
@@ -573,10 +643,14 @@ const __validators = (() => {
 // accessor. `Symbol<Name>` keys name well-known symbols. The `Safe*` classes are the plain ones:
 // the guarantee they add (immunity to user monkey-patching of the prototypes) is not observable
 // to the tests that exercise this glue.
+// Bound `call`/`apply`, as Node's: a primordial is one bound-function object instead of a closure
+// and its scope, and calls run natively. Captured now, before a program can patch `Function`.
+const __uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
+const __applyBind = Function.prototype.bind.bind(Function.prototype.apply);
 function __primordialsResolver() {
 "lumen:run-once";
-  const uncurryThis = (fn) => function (thisArg, ...args) { return Reflect.apply(fn, thisArg, args); };
-  const applyBind = (fn) => function (thisArg, args) { return Reflect.apply(fn, thisArg, args); };
+  const uncurryThis = __uncurryThis;
+  const applyBind = __applyBind;
   const TypedArray = Object.getPrototypeOf(Uint8Array);
   const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
   const IteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
@@ -766,4 +840,26 @@ function __initByCopy(Class) {
     Twin.prototype = Object.getPrototypeOf(self);
     Object.defineProperties(self, Object.getOwnPropertyDescriptors(Reflect.construct(Class, args, Twin)));
   };
+}
+
+// The user-timing methods perf_hooks adds to the global `performance` exist before anything
+// requires it: touching one builds perf_hooks, which installs the real methods in their place.
+{
+  const perf = globalThis.performance;
+  const names = ["mark", "measure", "clearMarks", "clearMeasures", "getEntries", "getEntriesByName",
+    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming"];
+  const materialize = () => {
+    for (const n of names) delete perf[n];
+    __builtins.get("perf_hooks");
+  };
+  if (perf && typeof perf.mark !== "function") {
+    for (const name of names) {
+      Object.defineProperty(perf, name, {
+        get() { materialize(); return perf[name]; },
+        set(value) { materialize(); perf[name] = value; },
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
 }

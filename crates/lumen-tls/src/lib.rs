@@ -8,6 +8,8 @@
 mod openssl;
 #[cfg(all(unix, not(target_os = "android")))]
 pub use openssl::TlsStream;
+#[cfg(all(unix, not(target_os = "android")))]
+pub mod engine;
 
 #[cfg(any(not(unix), target_os = "android"))]
 mod rustls;

@@ -5,6 +5,8 @@
   const rawExecve = proc.execve;
   const metrics = proc.metrics;
   delete globalThis.__proc;
+  const consoleOps = globalThis.__console;
+  delete globalThis.__console;
   const process = globalThis.process;
 
   // Node's `write(chunk[, encoding][, callback])` / `end([chunk][, encoding][, callback])`: the
@@ -40,6 +42,8 @@
   });
   Object.defineProperty(process, "stdout", { value: makeStream(proc.writeStdout, 1), enumerable: true, configurable: true });
   Object.defineProperty(process, "stderr", { value: makeStream(proc.writeStderr, 2), enumerable: true, configurable: true });
+  Object.defineProperty(process, "_tickCallback", { value: proc.tickCallback, writable: true, configurable: true });
+  Object.defineProperty(process, "_console", { value: consoleOps, configurable: true });
   Object.defineProperty(process, "_readStdin", { value: readStdin, configurable: true });
   Object.defineProperty(process, "_stdinRef", { value: stdinRef, configurable: true });
   Object.defineProperty(process, "_nativeMetrics", { value: metrics, configurable: true });
@@ -98,16 +102,8 @@
     process.geteuid = proc.geteuid;
     process.getgid = proc.getgid;
     process.getegid = proc.getegid;
-    process.setuid = proc.setuid;
-    process.seteuid = proc.seteuid;
-    process.setgid = proc.setgid;
-    process.setegid = proc.setegid;
     process.getgroups = proc.getgroups;
-    process.setgroups = groups => {
-      if (!Array.isArray(groups)) throw new TypeError('The "groups" argument must be an Array');
-      return proc.setgroups(groups.map(group => Number(group)).join(","));
-    };
-    process.initgroups = (user, extraGroup) => proc.initgroups(String(user), Number(extraGroup));
+    Object.defineProperty(process, Symbol.for("lumen.identity"), { value: proc, configurable: true });
   }
   // Portable signal numbers (identical on Linux/macOS); named signals outside this set fall back
   // to SIGTERM's number so `process.kill(pid)` still delivers a terminating signal.

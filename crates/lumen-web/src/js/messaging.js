@@ -186,21 +186,6 @@ class BroadcastChannel extends EventTarget {
 defineEventHandler(BroadcastChannel.prototype, "message");
 defineEventHandler(BroadcastChannel.prototype, "messageerror");
 
-AbortSignal.any = function any(signals) {
-  const list = [...signals];
-  const controller = new AbortController();
-  for (const s of list) {
-    if (s.aborted) {
-      controller.abort(s.reason);
-      return controller.signal;
-    }
-  }
-  for (const s of list) {
-    s.addEventListener("abort", () => controller.abort(s.reason), { once: true });
-  }
-  return controller.signal;
-};
-
 globalThis.MessageEvent = MessageEvent;
 globalThis.CloseEvent = CloseEvent;
 globalThis.ErrorEvent = ErrorEvent;

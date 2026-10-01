@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use lumen_host::{Ctx, SpawnHandle, Value};
 
-use crate::sha1::sha1;
+use sha1::{Digest, Sha1};
 use crate::url;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -70,7 +70,7 @@ pub(crate) fn base64(data: &[u8]) -> String {
 pub fn websocket_accept(key: &str) -> String {
     let mut input = key.trim().to_string();
     input.push_str(GUID);
-    base64(&sha1(input.as_bytes()))
+    base64(&Sha1::digest(input.as_bytes()))
 }
 
 // ---- frame codec -------------------------------------------------------------------------------
