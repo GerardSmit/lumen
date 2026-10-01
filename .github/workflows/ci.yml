@@ -24,6 +24,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - name: Install OpenSSL headers (lumen-tls links the system OpenSSL on Unix)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Download V8 benchmark test fixtures
@@ -40,7 +43,7 @@ jobs:
       # are cloned on demand by scripts/ and are not available in CI.
       # `ci` profile: optimized so deep-recursion tests fit the stack, with debug assertions and
       # overflow checks kept.
-      - run: cargo test --profile ci --workspace --exclude test262-runner --exclude node-compat-runner
+      - run: cargo test --profile ci --no-fail-fast --workspace --exclude test262-runner --exclude node-compat-runner
 
   clippy:
     runs-on: ubuntu-latest

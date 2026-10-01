@@ -882,11 +882,12 @@ for s in srcs:
 sys.stdout.write(sep.join(out))
 "#;
 
+/// The corpus targets Python 3.14 grammar and `ast.dump` output, so older interpreters are skipped.
 fn python_available() -> bool {
     Command::new("python3")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
+        .args(["-c", "import sys; sys.exit(sys.version_info < (3, 14))"])
+        .status()
+        .map(|s| s.success())
         .unwrap_or(false)
 }
 
