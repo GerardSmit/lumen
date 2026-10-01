@@ -1,0 +1,17 @@
+empty-or-any-dict empty-or-any-dict x
+circle 2
+rect 3x4
+unknown tri {'a': 1, 'b': 2}
+first item 7
+bad
+bad
+origin
+on x-axis at 3
+on y-axis at 4
+diagonal 2
+point 1,2
+circle at 1,1 r=5
+unknown
+kw match
+TypeError positional
+['number', 'number', 'string', 'seq', 'seq', 'dict', 'other', 'number']

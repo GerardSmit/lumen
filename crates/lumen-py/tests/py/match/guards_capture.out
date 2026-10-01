@@ -1,0 +1,18 @@
+['negative', 'zero', 'even 4', 'odd 7']
+'go north' heading north
+'go west' cannot go west
+'take a b' taking a,b
+'take' unknown verb take
+'quit' bye
+'' nothing
+'dance now' unknown verb dance
+K.A K.B none
+('many', [3, 4, 5]) ('pair', 1) wild
+1
+second guard 3
+[3, 13]
+sub-dict ['a', 'b']
+fallthrough
+bound 5 5
+or-seq 1 2
+done

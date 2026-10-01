@@ -1,0 +1,7 @@
+Point(x=1, y=2) 1 True False Point(x=5, y=0)
+{'x': 1, 'y': 2} (1, 2) Point(x=1, y=9) ['x', 'y']
+True [Version(major=1, minor=0), Version(major=1, minor=5), Version(major=2, minor=0)]
+FrozenInstanceError
+Bag(name='a', items=[1], count=0) Bag(name='b', items=[], count=0) True
+Post(a=1, b=2, total=3) 3
+True Point(x=-1, y=0)

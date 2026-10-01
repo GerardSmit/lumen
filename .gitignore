@@ -11,3 +11,4 @@
 /site/pkg/
 /site/version.json
 examples/ejs/code.js
+__pycache__/

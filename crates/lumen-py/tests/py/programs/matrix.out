@@ -1,0 +1,53 @@
+Matrix([[1, 2], [3, 4]])
+[1 3]
+[4 4]
+[1 1]
+[2 4]
+[0 2]
+[3 0]
+[2 1]
+[4 3]
+[2 4]
+[6 8]
+[ 3  6]
+[ 9 12]
+[-1 -2]
+[-3 -4]
+True False False True
+2 3 [3, 4]
+[10  2]
+[ 3  4] (2, 2)
+[1 3]
+[2 4]
+[1 0 0]
+[0 1 0]
+[0 0 1]
+(3, 2)
+True
+[89 55]
+[55 34]
+2880067194370816120
+True
+49 49
+30 30
+0
+-6 -6
+7 -2 5
+[ 7  3  4  5  6]
+[ 4 11  1  3  5]
+[ 6  2 10  1  4]
+[ 1  5  2 11  3]
+[ 3  1  6  4  7]
+21640 21640
+True
+MatrixError: shape mismatch (2, 2) vs (1, 3)
+MatrixError: ragged rows
+MatrixError: cannot multiply (1, 3) by (1, 3)
+MatrixError: not square
+MatrixError: exponent must be a non-negative int
+TypeError
+TypeError
+[(1, 2), (3, 4)] 2
+x
+[1.5   2]
+[ -3   4]

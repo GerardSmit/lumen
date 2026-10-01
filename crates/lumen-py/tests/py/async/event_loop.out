@@ -1,0 +1,7 @@
+[('a', 0), ('b', 0), ('c', 0), ('c', 1), ('c', 2), ('a', 1), ('b', 1), ('a', 2)]
+a-done b-done 3
+['a-done', 'b-done', 3]
+ValueError task failed
+8
+[True, True, True, True, True]
+[0, 1, 1, 2, 3, 5, 8, 13]

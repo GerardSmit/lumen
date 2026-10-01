@@ -1,0 +1,20 @@
+(3+4j) (1-2j) (4+2j) (2+6j) (11-2j) (-1+2j)
+3.0 4.0 5.0 (3-4j) (-3-4j) (3+4j)
+(-1+0j) (-1+0j) 2j True
+(1+2j) (1+2j) (3+0j) 0j (1.5-0.5j)
+1j 0j (-0-1j) (1+0j) (1.5+2.5j) -0j
+True True True True
+complex complex float float
+3.0 (1+2j) (1.5+2j) 6.0 6j 2.0 8 8.0 8.0
+TypeError
+TypeError floor
+TypeError mod
+ZeroDivisionError
+(3.5+3j) 3j 0.0 True
+(3.0, 1.0) (-4.0, 1.0) 3.0 2.0
+False True False False True
+(3+0j) (-3-3j) (1e+20+1e-05j) (1+1j)
+11 3.0 1.5
+5 -5 512 64 -9 24.0
+5 5 0.5 2.0 11 8 False
+False True True True True

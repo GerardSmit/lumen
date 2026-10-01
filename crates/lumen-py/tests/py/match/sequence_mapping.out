@@ -1,0 +1,27 @@
+[] empty
+[1] one:1
+[1, 2] two:1,2
+[1, 2, 3] many:1|[2]|3
+[1, 2, 3, 4, 5, 6] long:1+5
+(7, 8) two:7,8
+() empty
+'ab' None
+'a' None
+('ends0', [1, 2]) ends9 ('tail', [3, 4]) none
+('point', 1, 2)
+('circle', [('c', (0, 0)), ('r', 5)])
+('k', None)
+any-mapping
+any-mapping
+not-mapping
+not-mapping
+('ann', 't1')
+nope
+('items', 3, 2)
+('pairs', 10)
+('mixed', 1, 2, 9)
+nope
+1 2 3
+{'b': 2}
+{} {'a': 1}
+1 [2, 3]

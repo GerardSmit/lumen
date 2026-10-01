@@ -1,0 +1,26 @@
+i 0
+i 2
+i 3
+for else 1
+while else 3
+6
+finally runs
+try
+body 0
+fin 0
+fin 1
+body 2
+fin 2
+always
+except x
+else clause
+finally clause
+KeyError ('inner',) True
+ZeroDivisionError division by zero
+('a', 1) ('a', 1) Exception('a', 1)
+code 7 7 True Exception
+pos 2 t
+enter
+exit ValueError
+CM
+True True

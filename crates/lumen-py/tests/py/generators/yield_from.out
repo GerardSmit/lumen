@@ -1,0 +1,14 @@
+1
+inner got a
+2
+inner got b
+outer r = inner-result
+10
+20
+z = None
+outer-result
+[1, 2, 3, 4, 5, 6, 7, 8]
+[0, 1, 2, 0, 1] 50
+a
+outer caught x
+after

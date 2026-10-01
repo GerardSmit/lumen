@@ -1,0 +1,17 @@
+hello Base
+hello Child
+hello Child
+True
+['Grand', 'Child', 'Base', 'object']
+True False True
+True True
+['D', 'B', 'C', 'A']
+['D', 'B', 'C', 'A', 'object']
+1 2 ['x', 'y']
+Dog says woof Cat says meow Animal says ...
+Z ['W', 'Y', 'Z', 'X', 'object']
+X Z
+MRO conflict
+True type Base Base
+True True
+Exception object

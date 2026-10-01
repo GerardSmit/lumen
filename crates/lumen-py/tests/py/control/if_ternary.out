@@ -1,0 +1,27 @@
+-5 neg
+0 zero
+3 small
+10 big
+99 big
+0 F no
+1 T yes
+'' F no
+'a' T yes
+[] F no
+[0] T yes
+None F no
+0.0 F no
+0.1 T yes
+() F no
+{} F no
+a
+b
+c
+5
+[0, 1, -2, 3, -4, 5]
+none
+falsy
+combo
+walrus 10
+True False True False
+2

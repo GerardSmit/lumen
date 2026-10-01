@@ -1,0 +1,33 @@
+'Hello, World' 'Hello, World  ' '  Hello, World'
+hi hixx xxhi
+['a', 'b', 'c'] ['a', 'b', 'c'] ['a', 'b,c']
+a,b,c xy 
+heLLo heLlo -a-b-c-
+2 -1 3 3
+1 3
+3 2 7 2
+True True True
+True True
+('a', '=', 'b=c') ('a=b', '=', 'c') ('abc', '', '') ('', '', 'abc')
+'   ab  ' '***ab**' 'ab...' '...ab'
+00042 -0042 +007 abc
+Hello World hello HELLO HellO
+Hello world Hello
+They'Re Bill'S
+True True True True False
+True True True False
+aaa  
+b c bcd ace fedcba
+5 0
+['a', 'b', 'c']
+['The', 'Quick', 'Brown', 'Fox'] fox brown quick the
+['e', 'h', 'l', 'l', 'o'] ehllo
+True True True
+x and y
+axbxc bc ab abc
+['a', 'b'] ['a', '', 'b']
+ValueError substring not found
+ValueError substring not found
+TypeError sequence item 0: expected str instance, int found
+IndexError string index out of range
+ValueError empty separator

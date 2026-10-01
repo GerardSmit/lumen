@@ -1,0 +1,40 @@
+[('alice', 30), ('bob', 25), ('carol', 25), ('dave', 30), ('eve', 25), ('frank', 20)]
+[('frank', 20), ('bob', 25), ('carol', 25), ('eve', 25), ('alice', 30), ('dave', 30)]
+[('alice', 30), ('dave', 30), ('bob', 25), ('carol', 25), ('eve', 25), ('frank', 20)]
+[('frank', 20), ('bob', 25), ('carol', 25), ('eve', 25), ('alice', 30), ('dave', 30)]
+[('alice', 30), ('dave', 30), ('bob', 25), ('carol', 25), ('eve', 25), ('frank', 20)]
+[('bob', 25), ('eve', 25), ('dave', 30), ('alice', 30), ('carol', 25), ('frank', 20)]
+[('bob', 25), ('alice', 30), ('dave', 30), ('eve', 25), ('frank', 20), ('carol', 25)]
+['Apple', 'Banana', 'apple', 'banana', 'cherry', 'cherry']
+['Apple', 'apple', 'banana', 'Banana', 'cherry', 'cherry']
+['cherry', 'cherry', 'banana', 'Banana', 'Apple', 'apple']
+['Apple', 'apple', 'banana', 'cherry', 'Banana', 'cherry']
+['Apple', 'apple', 'Banana', 'banana', 'cherry', 'cherry']
+True
+[1, 2, 5, 5, 6, 9]
+[9, 6, 5, 5, 2, 1]
+[9, 6, 1, 5, 5, 2]
+[5, 5, 2, 1, 9, 6]
+['b', 'd', 'a', 'c']
+['a', 'c', 'b', 'd']
+[(0, 'z'), (1, 'a'), (1, 'a'), (1, 'b')]
+[(), (1,), (1, 2), (1, 2, 3)]
+[[], [1, 2], [1, 5], [2, 1]]
+['1', '10', '2', '9'] ['1', '2', '9', '10']
+[-1, 1.5, 2, 2.0, 3] [False, 0, True, 2]
+['e', 'h', 'l', 'l', 'o'] [1, 3] [1, 2, 3] [1, 3, 5]
+[-1.5, -0.0, 0.0, 0.5]
+[4, 2, 3, 1] [4, 3, 2, 1]
+[1, 2, 3] [] [1]
+[(1, 'x'), (1, 'y'), (1, 'z')]
+[(1, 'z'), (1, 'y'), (1, 'x')]
+[('a', 2), ('c', 2), ('b', 1), ('d', 1)]
+('b', 1) ('a', 2) ('a', 2) ('d', 1)
+[3, 1, 2, 0]
+{'b': 0, 'd': 1, 'a': 2, 'c': 3}
+[3, 1, 2] [1, 2, 3] False
+[(0, 0), (0, 5), (0, 10), (0, 15), (1, 1), (1, 6), (1, 11), (1, 16)]
+True
+TypeError '<' not supported between instances of 'str' and 'int'
+TypeError '<' not supported between instances of 'int' and 'NoneType'
+TypeError 'int' object is not callable

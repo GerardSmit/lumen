@@ -1,0 +1,32 @@
+s = "Hello, World"
+print(s.lower(), s.upper(), s.swapcase(), s.title(), s.capitalize(), s.casefold())
+print(s.split(", "), s.split("o", 1), s.rsplit("o", 1), "a  b".split(), " a b ".split(" "), "a,b,,c".split(","))
+print(s.find("o"), s.rfind("o"), s.index("W"), s.find("zz"), s.count("l"), s.count(""))
+print(s.startswith("Hell"), s.endswith(("d", "x")), s.replace("l", "L", 2), s.strip("Hd"), "  x ".lstrip(), " x  ".rstrip() + "|")
+print("abc".center(9, "*"), "abc".ljust(5) + "|", "abc".rjust(5, "0"), "42".zfill(5), "-42".zfill(5))
+print("a-b-c".partition("-"), "a-b-c".rpartition("-"), "abc".partition("x"), "x".join("abc"), ",".join(["1", "2"]))
+print("abc".isalpha(), "ab1".isalnum(), "12".isdigit(), " ".isspace(), "Ab".istitle(), "ab".islower(), "AB".isupper(), "".isalpha())
+print("a\tb".expandtabs(4), "l1\nl2\r\nl3".splitlines(), "l1\nl2\n".splitlines(True), "abc"[::-1], "abc" * 2, "abc" * 0 == "")
+print("abc" < "abd", "a" < "B", "abc" == "abc", "é" > "z", max("abc", "abd"), "abc".encode())
+print("%s-%d-%.1f" % ("a", 1, 2.55), "{:>5}|{:<5}|{:^5}".format("a", "b", "c"), f"{3.14159:.2f}", f"{'a'*2}")
+print("abc"[1], "abc"[-1], "abcdef"[1:4], "abcdef"[::2], "abcdef"[-3:], "abcdef"[10:], "abc"[:-1])
+print("a b".removeprefix("a "), "abc".removesuffix("bc"), "ß".upper(), "İ".lower() == "i̇", "ǆ".title())
+print(str.maketrans("ab", "xy"), "aabb".translate(str.maketrans("ab", "xy")), "a-b".translate({45: None}))
+l = [5, 3, 8, 1]
+l.append(9); l.extend([7, 7]); l.insert(0, 0)
+print(l, l.index(8), l.count(7), l.pop(), l.pop(0), l)
+l.remove(7); l.reverse()
+print(l, l[::-1], l[1:3], l[-2:], l * 2, l + [1], [0] * 3, len(l), 8 in l)
+l[1:3] = [100, 200, 300]
+print(l, l.copy() == l, l.copy() is l)
+l.clear()
+print(l, bool(l))
+t = (1, 2, 3)
+print(t + (4,), t * 2, t[1:], t.index(2), t.count(1), (1,), (), tuple([1]), tuple("ab"), (1, 2) < (1, 3), (1, 2) == (1, 2))
+d = {"a": 1, "b": 2}
+d.update(c=3)
+d.update({"a": 10})
+print(d, d.get("z"), d.get("z", 0), d.pop("a"), d.pop("zz", None), d.setdefault("q", 5), d, list(d.items()), d.popitem(), len(d))
+print(dict.fromkeys("ab", 0), {**d, "x": 1}, {"a": 1} | {"b": 2}, "b" in d, d.copy() == d)
+sset = {1, 2, 3}
+print(sorted(sset | {5}), sorted(sset & {2, 9}), sorted(sset - {1}), sorted(sset ^ {3, 4}), {1} <= sset, sset >= {1, 2}, sset.isdisjoint({7}))

@@ -1,0 +1,23 @@
+True True False True True
+True False True True True
+True True True True
+1 dflt 1 m
+True False True True
+99 True
+False
+{'x': 1, 'y': 2} [('x', 1), ('y', 2)] {'x': 1, 'y': 2}
+['cls_attr', 'method']
+AttributeError 'A' object has no attribute 'missing'
+<class 'int'> <class 'str'> <class 'NoneType'> <class 'list'> <class '__main__.A'> <class 'type'> <class 'type'>
+True True False B True
+float function builtin_function_or_method builtin_function_or_method function
+D 5 hi 1 True True
+True True False False True True
+True True A True
+True A True
+type int object
+True True True True
+True True True
+<class 'int'> <class 'str'> <class 'int'>
+True True
+3 2 0 5 2 1

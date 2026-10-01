@@ -1,0 +1,26 @@
+tuple KeyError ('x',)
+tuple IndexError
+ZeroDivisionError True
+LookupError base
+ArithmeticError LookupError OSError
+NameError RuntimeError RuntimeError
+Exception BaseException BaseException
+outer v
+inner 'inner'
+e still v
+e deleted
+1 dflt
+StopIteration () None
+[1, 2, 3] [1, 2, 3]
+AssertionError math broke
+AssertionError ()
+exit 3
+KeyboardInterrupt
+passed through e
+5
+[1, 'ValueError', 3, 'TypeError']
+('a', 'b', 3) ('a', 'b', 3) 3
+(1, 2) None True
+True () ('a',)
+x NotImplementedError()
+TypeError raise NotImplemented

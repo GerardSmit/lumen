@@ -1,0 +1,28 @@
+0 zero
+1 small
+3 small
+-1 neg one
+3.5 float
+'hi' greeting
+'b' letter
+None none
+True small
+False zero
+b'x' bytes
+99 other
+'zz' other
+1.0 small
+[] empty
+[5] one 5
+(1, 2) two 1 2
+[1, 2, 3] starts 1, rest [2, 3]
+[9, 8, 7, 6] first 9 last 6 mid [8, 7]
+(4, 5, 6) first 4 last 6 mid [5]
+'ab' no
+5 no
+{1: 2} no
+1 2 3
+whole [1, 2, 3]
+str abc
+big int 5
+6

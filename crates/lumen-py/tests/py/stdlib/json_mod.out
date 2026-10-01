@@ -1,0 +1,37 @@
+{"name": "x", "n": [1, 2.5, null, true], "nested": {"b": 1, "a": [], "c": {}}, "s": "\u00e9\n\"q\""}
+{"n": [1, 2.5, null, true], "name": "x", "nested": {"a": [], "b": 1, "c": {}}, "s": "\u00e9\n\"q\""}
+{
+  "n": [
+    1,
+    2.5,
+    null,
+    true
+  ],
+  "name": "x",
+  "nested": {
+    "a": [],
+    "b": 1,
+    "c": {}
+  },
+  "s": "\u00e9\n\"q\""
+}
+[1,"a"] "é" "\u00e9"
+null true 1.0 100000000000000000000 {"1": "a", "2": "b"}
+{'a': [1, 2, {'b': None}], 'c': 'dé', 'e': 150.0, 'f': False, 'g': 0} True float int
+[] 123 s True {}
+True
+JSONDecodeError '{'
+JSONDecodeError '[1,]'
+JSONDecodeError 'nope'
+JSONDecodeError ''
+TypeError
+{"b": 1, "a": 2} [] {}
+Infinity [
+ 1,
+ [
+  2,
+  [
+   3
+  ]
+ ]
+]

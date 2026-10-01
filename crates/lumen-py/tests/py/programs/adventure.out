@@ -1,0 +1,58 @@
+[Hall] A dusty entrance hall. You see: lamp. Exits: east, north, west.
+ 1> look
+    [Hall] A dusty entrance hall. You see: lamp. Exits: east, north, west.
+ 2> go north
+    [Library] Shelves of old books. You see: book. Exits: south, up.
+ 3> take book
+    Taken: book.
+ 4> take sword
+    No sword here.
+ 5> go up
+    [Tower] Wind howls through the windows. You see: gem. Exits: down.
+ 6> take gem
+    Taken: gem.
+ 7> go down
+    [Library] Shelves of old books. Exits: south, up.
+ 8> go south
+    [Hall] A dusty entrance hall. You see: lamp. Exits: east, north, west.
+ 9> go west
+    The way west is locked.
+10> go east
+    [Kitchen] Pots hang from the ceiling. You see: bread, knife. Exits: down, west.
+11> take all
+    Taken: bread, knife
+12> eat bread
+    Yum.
+13> dance
+    I don't know how to 'dance'.
+14> go down
+    It is pitch black.
+15> look
+    It is pitch black.
+16> take key
+    You fumble in the dark.
+17> go up
+    [Kitchen] Pots hang from the ceiling. Exits: down, west.
+18> go up
+    You can't go that way.
+19> go west
+    [Hall] A dusty entrance hall. You see: lamp. Exits: east, north, west.
+20> look
+    [Hall] A dusty entrance hall. You see: lamp. Exits: east, north, west.
+21> drop gem
+    Dropped: gem.
+22> inventory
+    Carrying: book, knife
+23> go west
+    The way west is locked.
+24> take crown
+    No crown here.
+25> look
+    [Hall] A dusty entrance hall. You see: gem, lamp. Exits: east, north, west.
+state: playing
+score: 62 moves: 24
+inventory: ['book', 'knife']
+visited: ['cellar', 'hall', 'kitchen', 'library', 'tower']
+{'cellar': ['key'], 'hall': ['gem', 'lamp'], 'kitchen': [], 'library': [], 'tower': [], 'vault': ['crown']}
+Say something.
+Bye. quit

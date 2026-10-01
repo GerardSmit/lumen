@@ -1,0 +1,20 @@
+Bag(1, 2, 3) <bag of 3> <bag of 3> [Bag(1, 2, 3)]
+3 1 3 [1, 2] True False True
+<bag of 3> [1, 20, 3] 24 20
+<bag of 2> 2
+True False F
+23 26
+<bag of 2>|Bag(20, 3)|<bag of 2>
+Bag(20, 3) <bag of 2>
+20 3
+[3, 2, 1]
+[0, 1, 4, 9] True (0, 1, 4, 9)
+[0, 1, 4, 9]
+1 slice(1, 2, None) slice(None, None, 2) (1, 2) True
+1 2 None
+False 0
+ValueError neg len
+TypeError len
+TypeError getitem
+TypeError call
+TypeError iter

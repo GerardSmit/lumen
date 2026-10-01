@@ -1,0 +1,16 @@
+TypeError ValueError('a') ValueError('a') True
+True
+TypeError None ValueError('a') True
+TypeError None ValueError('a') False
+RuntimeError OSError('os') KeyError('k') True
+ValueError None None False
+TypeError('two')
+ValueError('one')
+None
+True KeyError('c')
+False
+KeyError('y') None
+ZeroDivisionError ('division by zero',)
+TypeError
+OSError('io') None
+ValueError('v')

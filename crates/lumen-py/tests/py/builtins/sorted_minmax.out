@@ -1,0 +1,46 @@
+[1, 2, 3] [3, 2, 1] [] ['e', 'h', 'l', 'l', 'o']
+[3, 2, 1]
+['a', 'e', 'bb', 'dd', 'ccc', 'fff']
+['ccc', 'fff', 'bb', 'dd', 'a', 'e']
+['a', 'bb', 'ccc', 'dd', 'e', 'fff']
+[(0, 'z'), (0, 'y'), (1, 'b'), (1, 'a')]
+[(1, 'b'), (1, 'a'), (0, 'z'), (0, 'y')]
+[(0, 'y'), (0, 'z'), (1, 'a'), (1, 'b')]
+[0, 1, True, 2.5]
+[1, 3]
+[0, 2, 4, 1, 3]
+[[1], [1, 5], [2, 1]]
+[-1, 2, -3]
+['a', 'B', 'C']
+['B', 'C', 'a']
+[5, 3, 5, 1] [1, 3, 5, 5] False
+[5, 5, 3, 1]
+None [1, 3, 5, 5]
+TypeError
+TypeError
+TypeError
+TypeError
+1 3 2 c
+none 0 1
+a bb
+bb x
+(1, 'b') (1, 9)
+2.0 2 2.0 1 1.0
+0 3
+b
+4 3
+None
+ValueError min() iterable argument is empty
+ValueError max() iterable argument is empty
+TypeError
+TypeError
+TypeError
+6 0 13 0.75 45
+[1, 2] (1, 2) 3.5 2
+14 6 3
+True 1.0
+8
+TypeError
+TypeError
+b [1, 1.0, True]
+[3, 2, 1]

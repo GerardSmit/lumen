@@ -1,0 +1,15 @@
+True True False False False True
+True True
+[Card(2), Card(9), Card(T), Card(K), Card(A)] Card(A) Card(2)
+[Card(A), Card(K), Card(T), Card(9), Card(2)]
+Card(A)
+False True
+TypeError
+3 False True True 1
+True True
+sorted
+['A', 'B', 'a', 'b'] [1.5, 2, 3] ['e', 'h', 'l', 'l', 'o']
+[(1, 'z'), (2, 'a'), (2, 'b')]
+[3, 2, 1] [[1], [1, 5], [2]]
+1 a (1, 3)
+e 3 a

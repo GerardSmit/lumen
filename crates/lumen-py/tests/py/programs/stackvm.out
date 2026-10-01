@@ -1,0 +1,27 @@
+factorial: len=32 steps=119 out=[3628800]
+fib: len=39 steps=234 out=[0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
+call: len=14 steps=13 out=[25, 144]
+primes: len=54 steps=1459 out=[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+000 PUSH 5
+002 CALL 11
+004 PRINT
+005 PUSH 12
+007 CALL 11
+009 PRINT
+010 HALT
+011 DUP
+012 MUL
+013 RET
+underflow VMError: stack underflow at pc=1
+divzero VMError: division by zero at pc=4
+undefined VMError: undefined variable x
+offend VMError: ran off end of program
+overflow StackOverflow: stack overflow at pc=2
+recurse StackOverflow: call depth exceeded
+badret VMError: return with empty call stack
+badop VMError: bad opcode 99 at 0
+badmnemonic VMError: unknown mnemonic FROBNICATE
+noarg VMError: PUSH needs an argument
+inf VMError: step limit exceeded
+[7, -7, 3] []
+0 22

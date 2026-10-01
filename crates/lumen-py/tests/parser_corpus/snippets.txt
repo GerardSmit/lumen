@@ -1,0 +1,2746 @@
+x = 1
+#---
+x = y = z = 1, 2
+#---
+a, b = b, a
+#---
+a, *b, c = d
+#---
+*a, = b
+#---
+[a, b] = c
+#---
+(a, b), c = d
+#---
+x: int
+#---
+x: int = 5
+#---
+(x): int = 5
+#---
+a.b: int = 5
+#---
+a[1]: int
+#---
+x += 1
+x -= 1
+x *= 2
+x /= 2
+x //= 2
+x %= 2
+x **= 2
+x >>= 1
+x <<= 1
+x &= 1
+x |= 1
+x ^= 1
+x @= m
+#---
+x = 1,
+#---
+x = *a, *b
+#---
+return 1, 2
+#---
+def f(): return a, b
+#---
+-2**2
+#---
+2**-1
+#---
+2**3**4
+#---
+(-2)**2
+#---
+not a == b
+#---
+a < b < c
+#---
+a is not b
+#---
+a not in b
+#---
+a if b else c if d else e
+#---
+a or b and c or d
+#---
+not not a
+#---
+~a + -b - +c
+#---
+a | b ^ c & d << e >> f + g - h * i / j // k % l @ m
+#---
+lambda: 0
+#---
+lambda x, y=1, *a, z, w=2, **k: x
+#---
+lambda x, /, y: x
+#---
+lambda *, a: a
+#---
+lambda: (yield)
+#---
+(x := 5)
+#---
+if (n := len(a)) > 10: pass
+#---
+while chunk := f.read(): pass
+#---
+f(a := 1)
+#---
+[y := 1, y**2]
+#---
+x = [a for a in b]
+#---
+x = [a for a in b if c if d]
+#---
+x = [a for a in b for c in d if e]
+#---
+x = {a: b for a, b in c}
+#---
+x = {a for a in b}
+#---
+x = (a for a in b)
+#---
+x = [a async for a in b]
+#---
+x = [await a async for a in b if await c]
+#---
+f(a for a in b)
+#---
+f(a, b=1, *c, d=2, **e)
+#---
+f(*a, *b, **c, **d)
+#---
+f(x for x in y if z)
+#---
+f(a)(b)(c)
+#---
+f(a, b,)
+#---
+f(**{'a': 1})
+#---
+f(a=1, *b)
+#---
+x.y.z
+#---
+x[1]
+#---
+x[1:2]
+#---
+x[:]
+#---
+x[::]
+#---
+x[1:2:3]
+#---
+x[::3]
+#---
+x[:2]
+#---
+x[1:]
+#---
+x[1:2, 3]
+#---
+x[1, 2]
+#---
+x[1,]
+#---
+x[a:b, ::c, ...]
+#---
+x[*a]
+#---
+x[*a, b]
+#---
+x[a := 1]
+#---
+x[a][b][c]
+#---
+...
+#---
+x = ...
+#---
+[]
+#---
+[1, 2, 3,]
+#---
+[*a, *b]
+#---
+()
+#---
+(1,)
+#---
+(1, 2)
+#---
+(*a, b)
+#---
+(a)
+#---
+((a))
+#---
+{}
+#---
+{1, 2}
+#---
+{*a, 1}
+#---
+{1: 2, 3: 4,}
+#---
+{**a, 'b': 1, **c}
+#---
+{'a': 1, **b}
+#---
+{a: b for a in c}
+#---
+{(a): b}
+#---
+(yield)
+#---
+def f():
+    x = yield
+    y = yield 1
+    z = yield 1, 2
+    yield from a
+    await b
+    return (yield)
+#---
+async def f():
+    await a
+    async for x in y:
+        pass
+    else:
+        pass
+    async with a as b, c as d:
+        pass
+    return [x async for x in y]
+#---
+async def f(): pass
+#---
+@a
+@b.c
+@d(e)
+def f(): pass
+#---
+@a
+class C: pass
+#---
+@a
+async def f(): pass
+#---
+@(yield)
+def f(): pass
+#---
+@x := y
+def f(): pass
+#---
+class A: pass
+#---
+class A(): pass
+#---
+class A(B, C, metaclass=M, x=1): pass
+#---
+class A(*b, **c): pass
+#---
+def f(a, b): pass
+#---
+def f(a, b=1, c=2): pass
+#---
+def f(*, a): pass
+#---
+def f(*, a, b=1, c): pass
+#---
+def f(a, /): pass
+#---
+def f(a, /, b): pass
+#---
+def f(a, b=1, /, c=2, *d, e, f=3, **g): pass
+#---
+def f(*args: int, **kwargs: str) -> None: pass
+#---
+def f(a: int = 1, *, b: str = 'x') -> int: pass
+#---
+def f(*a: *b): pass
+#---
+def f(a,): pass
+#---
+def f(*a,): pass
+#---
+def f(**a,): pass
+#---
+def f(a, *, b,): pass
+#---
+def f(a, b=1, c): pass
+#---
+def f(*): pass
+#---
+def f(*, **k): pass
+#---
+def f(a, a): pass
+#---
+if a:
+    pass
+#---
+if a:
+    pass
+elif b:
+    pass
+elif c:
+    pass
+else:
+    pass
+#---
+if a: pass
+else: pass
+#---
+if a:
+    if b:
+        pass
+    else:
+        pass
+else:
+    pass
+#---
+while a:
+    break
+else:
+    continue
+#---
+while 1: pass
+#---
+for x in y: pass
+#---
+for x, y in z: pass
+#---
+for (x, y) in z: pass
+#---
+for x, in z: pass
+#---
+for *a, b in c: pass
+#---
+for x in a, b: pass
+#---
+for x in *a, b: pass
+#---
+for x.y in z: pass
+#---
+for x[0] in z: pass
+#---
+for x in y:
+    pass
+else:
+    pass
+#---
+for f() in x: pass
+#---
+try:
+    pass
+except:
+    pass
+#---
+try:
+    pass
+except E:
+    pass
+except (A, B) as e:
+    pass
+except E as e:
+    pass
+else:
+    pass
+finally:
+    pass
+#---
+try:
+    pass
+finally:
+    pass
+#---
+try:
+    pass
+except* E:
+    pass
+except* (A, B) as e:
+    pass
+#---
+try:
+    pass
+except A, B:
+    pass
+#---
+try:
+    pass
+except A:
+    pass
+except* B:
+    pass
+#---
+try:
+    pass
+#---
+with a: pass
+#---
+with a as b: pass
+#---
+with a as b, c as d: pass
+#---
+with a, b: pass
+#---
+with (a, b): pass
+#---
+with (a as b, c as d): pass
+#---
+with (a as b, c as d,): pass
+#---
+with (a, b) as c: pass
+#---
+with (a): pass
+#---
+with (a) as b: pass
+#---
+with (yield): pass
+#---
+with a as (b, c): pass
+#---
+with a as b.c: pass
+#---
+with a as b[0]: pass
+#---
+with (open('a')) as f, (open('b')) as g: pass
+#---
+with (a := b): pass
+#---
+with (a,): pass
+#---
+with (
+    a as b,
+    c as d,
+):
+    pass
+#---
+raise
+#---
+raise E
+#---
+raise E from F
+#---
+raise E(1) from None
+#---
+return
+#---
+return 1
+#---
+del a
+#---
+del a, b
+#---
+del a,
+#---
+del (a, b)
+#---
+del [a, b]
+#---
+del a.b, a[0], (c)
+#---
+del (a), (b)
+#---
+del f()
+#---
+del a + b
+#---
+pass; pass
+#---
+pass;
+#---
+x = 1; y = 2;
+#---
+break
+#---
+continue
+#---
+global a
+#---
+global a, b, c
+#---
+nonlocal a, b
+#---
+assert a
+#---
+assert a, b
+#---
+assert (a, b)
+#---
+import a
+#---
+import a.b.c
+#---
+import a as b
+#---
+import a.b as c, d, e.f as g
+#---
+from a import b
+#---
+from a import b as c, d
+#---
+from a.b import c
+#---
+from . import a
+#---
+from .. import a
+#---
+from ... import a
+#---
+from .... import a
+#---
+from .a import b
+#---
+from ..a.b import c
+#---
+from a import *
+#---
+from . import *
+#---
+from a import (b, c)
+#---
+from a import (b, c,)
+#---
+from a import (b as c, d as e)
+#---
+from a import b,
+#---
+from a import
+#---
+from . import (a,
+    b)
+#---
+import
+#---
+match x:
+    case 1:
+        pass
+#---
+match x:
+    case 1 | 2 | 3:
+        pass
+    case "a":
+        pass
+    case b"a":
+        pass
+    case -1:
+        pass
+    case 1.5:
+        pass
+    case -1.5:
+        pass
+    case 1+2j:
+        pass
+    case -1-2j:
+        pass
+    case None:
+        pass
+    case True:
+        pass
+    case False:
+        pass
+    case _:
+        pass
+#---
+match x:
+    case a:
+        pass
+    case a.b:
+        pass
+    case a.b.c:
+        pass
+    case A():
+        pass
+    case A(1, 2):
+        pass
+    case A(x=1, y=2):
+        pass
+    case A(1, x=2):
+        pass
+    case a.A(b, c=d):
+        pass
+#---
+match x:
+    case [a, b]:
+        pass
+    case [a, *b]:
+        pass
+    case [*_]:
+        pass
+    case (a, b):
+        pass
+    case (a,):
+        pass
+    case ():
+        pass
+    case []:
+        pass
+    case a, b:
+        pass
+    case a, *b:
+        pass
+    case *a, b:
+        pass
+    case [a, [b, c]]:
+        pass
+#---
+match x:
+    case {}:
+        pass
+    case {"a": 1}:
+        pass
+    case {"a": 1, "b": c}:
+        pass
+    case {"a": 1, **rest}:
+        pass
+    case {**rest}:
+        pass
+    case {1: a, None: b, True: c}:
+        pass
+    case {a.b: c}:
+        pass
+    case {"a": 1,}:
+        pass
+#---
+match x:
+    case a as b:
+        pass
+    case (a | b) as c:
+        pass
+    case [a, b] as c:
+        pass
+    case A(x) as y:
+        pass
+    case a | b as c:
+        pass
+    case [a as b, c as d]:
+        pass
+#---
+match x:
+    case a if a > 1:
+        pass
+    case b if (c := b):
+        pass
+#---
+match x, y:
+    case 1, 2:
+        pass
+#---
+match (x, y):
+    case _:
+        pass
+#---
+match x,:
+    case _:
+        pass
+#---
+match *a, b:
+    case _:
+        pass
+#---
+match x:
+    case 1:
+        match y:
+            case 2:
+                pass
+#---
+match x:
+    case "a" "b":
+        pass
+#---
+match x:
+    case f"a":
+        pass
+#---
+match x:
+    case a.b():
+        pass
+#---
+match x:
+    case [1, 2] | [3, 4]:
+        pass
+#---
+match x:
+    case _ as a:
+        pass
+#---
+match x:
+    case a, | b:
+        pass
+#---
+match x:
+    case {a: 1}:
+        pass
+#---
+match x:
+    case A(x=1, 2):
+        pass
+#---
+match x:
+    case *a:
+        pass
+#---
+match x:
+    case 1 + 2:
+        pass
+#---
+match x:
+    pass
+#---
+match = 1
+#---
+match(x)
+#---
+match[x]
+#---
+match.x
+#---
+match x
+#---
+match -x:
+    case _:
+        pass
+#---
+print(match, case, _)
+#---
+case = 1
+#---
+type = 1
+#---
+type(x)
+#---
+'a'
+#---
+'a' 'b'
+#---
+'a' "b" '''c'''
+#---
+b'a'
+#---
+b'a' b'b'
+#---
+b'a' 'b'
+#---
+'a' b'b'
+#---
+r'a\nb'
+#---
+'a\nb\tc\\d\'e\"f\a\b\f\v\0\1\12\123\x41\u0041\U00000041'
+#---
+'\N{BULLET}'
+#---
+'\N{NOT A REAL NAME}'
+#---
+'\x4'
+#---
+'\u12'
+#---
+'\U00110000'
+#---
+b'\x41\101\n'
+#---
+b'\u0041'
+#---
+b'é'
+#---
+rb'\n'
+#---
+Rb'\n'
+#---
+bR'\n'
+#---
+BR'\n'
+#---
+R'a\n'
+#---
+'\q'
+#---
+"""a
+b"""
+#---
+'''a
+b'''
+#---
+'a\
+b'
+#---
+"abc
+#---
+'''abc
+#---
+f'a'
+#---
+f''
+#---
+f'{x}'
+#---
+f'{x}{y}'
+#---
+f'a{x}b'
+#---
+f'{x!r}'
+#---
+f'{x!s}'
+#---
+f'{x!a}'
+#---
+f'{x!z}'
+#---
+f'{x:>10}'
+#---
+f'{x:{w}}'
+#---
+f'{x:{w}.{p}}'
+#---
+f'{x!r:>{w}}'
+#---
+f'{x:}'
+#---
+f'{x=}'
+#---
+f'{x = }'
+#---
+f'{x=!r}'
+#---
+f'{x=!s}'
+#---
+f'{x=:>5}'
+#---
+f'{ x = !r:>5}'
+#---
+f'{x==y}'
+#---
+f'{x!=y}'
+#---
+f'{x<=y}'
+#---
+f'{x>=y}'
+#---
+f'{{}}'
+#---
+f'{{x}}'
+#---
+f'{{{x}}}'
+#---
+f'}}'
+#---
+f'{{'
+#---
+f'}'
+#---
+f'{'
+#---
+f'{}'
+#---
+f'{ }'
+#---
+f'{x'
+#---
+f'{x!}'
+#---
+f'{x:'
+#---
+f'{a["b"]}'
+#---
+f"{a['b']}"
+#---
+f"{a["b"]}"
+#---
+f'{a['b']}'
+#---
+f"{'a' if x else 'b'}"
+#---
+f"{f'{x}'}"
+#---
+f"{f"{x}"}"
+#---
+f"{f"{f"{x}"}"}"
+#---
+f"{x:{f'{y}'}}"
+#---
+f'{lambda x: 1}'
+#---
+f'{(lambda x: 1)}'
+#---
+f'{x:=5}'
+#---
+f'{(x:=5)}'
+#---
+f'{a, b}'
+#---
+f'{*a, b}'
+#---
+f'{yield}'
+#---
+f'{x#}'
+#---
+f'''{
+x
+}'''
+#---
+f'''{x
++ y}'''
+#---
+f'''a
+{x}
+b'''
+#---
+f'''{
+    x  # comment
+}'''
+#---
+f'{d[1:2]}'
+#---
+f'{d[::2]}'
+#---
+f'{ {1: 2}[1] }'
+#---
+f'{ {1, 2} }'
+#---
+f'{{1: 2}[1]}'
+#---
+f'{x:%Y-%m-%d}'
+#---
+f'{x:{y}{z}}'
+#---
+f'{x:a{y}b}'
+#---
+f'{x!r:^{w}.{p}f}'
+#---
+f'a' 'b'
+#---
+'a' f'b'
+#---
+f'a' f'{b}' 'c'
+#---
+f'{a}' 'b' f'{c}'
+#---
+f'a' b'b'
+#---
+f'\n{x}\t'
+#---
+f'\{x}'
+#---
+f'\\{x}'
+#---
+f'\N{BULLET}{x}'
+#---
+rf'\n{x}'
+#---
+fr'\n{x}'
+#---
+Rf'\n{x}'
+#---
+F'{x}'
+#---
+fb'a'
+#---
+bf'a'
+#---
+rb'a' b'b'
+#---
+f'{x!r}' f'{y!s}'
+#---
+f'{"a"}'
+#---
+f'{"\n"}'
+#---
+f'{x:\n}'
+#---
+f'{{{{}}}}'
+#---
+f'{1_0}'
+#---
+f'{1.5e3}'
+#---
+f'{x if y else z}'
+#---
+f'{not x}'
+#---
+f'{await x}'
+#---
+f'{x.y.z(1, 2)}'
+#---
+f'{x!r:}'
+#---
+f'{x=:}'
+#---
+f'{ x }'
+#---
+f'{ x !r}'
+#---
+f'{x:{{}}}'
+#---
+f'{x:{y:{z}}}'
+#---
+f'{x:{y!r}}'
+#---
+f"{'''a'''}"
+#---
+f'{"""a"""}'
+#---
+f'''{"""a"""}'''
+#---
+f"{x:{'a'}}"
+#---
+f'{x}{{'
+#---
+f'{{{x}'
+#---
+f'{x}}}'
+#---
+1
+#---
+1_000
+#---
+0
+#---
+00
+#---
+01
+#---
+0_0
+#---
+0x10
+#---
+0X1f
+#---
+0xFF_FF
+#---
+0x_f
+#---
+0o17
+#---
+0O17
+#---
+0o_7
+#---
+0b101
+#---
+0B1_0
+#---
+0xffffffffffffffffffffffffffffffffffffffffffffffffffff
+#---
+0o7777777777777777777777777777777
+#---
+0b11111111111111111111111111111111111111111111111111111111111111111111111
+#---
+123456789012345678901234567890123456789012345678901234567890
+#---
+0x
+#---
+0b2
+#---
+0o8
+#---
+1__0
+#---
+1_
+#---
+1.
+#---
+1.5
+#---
+.5
+#---
+1e10
+#---
+1E10
+#---
+1e+10
+#---
+1e-10
+#---
+1_0.0_1
+#---
+1.5e1_0
+#---
+1e
+#---
+1e+
+#---
+0.0
+#---
+1.7976931348623157e308
+#---
+1e999
+#---
+1e-999
+#---
+4.9e-324
+#---
+123456789.123456789
+#---
+0.1
+#---
+1e16
+#---
+1e15
+#---
+1.5e-5
+#---
+0.0001
+#---
+0.00001
+#---
+3j
+#---
+3J
+#---
+1.5j
+#---
+1e3j
+#---
+1.5e3J
+#---
+.5j
+#---
+0j
+#---
+0xj
+#---
+1_0j
+#---
+1 if x else 2
+#---
+1if x else 2
+#---
+0x1for x in y
+#---
+1or 2
+#---
+1 .real
+#---
+1..real
+#---
+1.real
+#---
+1abc
+#---
+1 2
+#---
+x = 1 + \
+    2
+#---
+x = (1 +
+     2)
+#---
+x = [
+    1,
+    2,
+]
+#---
+x = {
+    'a': 1,
+    'b': 2,
+}
+#---
+if x:
+    # comment
+    pass
+
+    # another
+
+    pass
+#---
+if x:
+    pass
+# trailing comment
+y = 1
+#---
+if x:
+        pass
+        pass
+#---
+if x:
+	pass
+	pass
+#---
+if x:
+    if y:
+	pass
+#---
+if x:
+	if y:
+	    pass
+#---
+if x:
+    pass
+  y = 1
+#---
+if x:
+pass
+#---
+  x = 1
+#---
+x = 1
+  y = 2
+#---
+x = 1  # comment
+#---
+# just a comment
+#---
+
+#---
+
+#---
+x = 1
+
+y = 2
+#---
+class A:
+    def f(self):
+        pass
+
+    def g(self):
+        pass
+#---
+def f():
+    return 1
+def g():
+    return 2
+#---
+if x: pass
+elif y: pass
+else: pass
+#---
+x = 1\
++2
+#---
+x = 1 \
+#---
+x = 1 \
+#---
+\
+x = 1
+#---
+x = $
+#---
+x = ?
+#---
+x = `a`
+#---
+x = a ! b
+#---
+x = a <> b
+#---
+x = é
+#---
+éa = 1
+#---
+a€ = 1
+#---
+x = (
+#---
+x = )
+#---
+x = (]
+#---
+x = [)
+#---
+x = {)
+#---
+x = ((((((((((((((((((((((((((((((1))))))))))))))))))))))))))))))
+#---
+f() = 1
+#---
+1 = 1
+#---
+a + b = 1
+#---
+None = 1
+#---
+True = 1
+#---
+... = 1
+#---
+(a, b()) = c
+#---
+[a, 1] = c
+#---
+*a = b
+#---
+(*a) = b
+#---
+a, *b, *c = d
+#---
+a = *b
+#---
+x = yield = 1
+#---
+x = (yield)
+#---
+f(x) += 1
+#---
+a, b += 1
+#---
+(a) += 1
+#---
+a.b += 1
+#---
+a[0] += 1
+#---
+[a] += 1
+#---
+a: int: str
+#---
+a, b: int
+#---
+[a]: int
+#---
+(a, b): int
+#---
+a = b: int
+#---
+f(a=1, b)
+#---
+f(**a, b)
+#---
+f(**a, *b)
+#---
+f(a for a in b, c)
+#---
+f(c, a for a in b)
+#---
+f(a for a in b,)
+#---
+f(a.b=1)
+#---
+f(1=2)
+#---
+f(a, a=1)
+#---
+f(a=1, a=2)
+#---
+f(*)
+#---
+f(**)
+#---
+f(,)
+#---
+f(a b)
+#---
+[a for a in b for]
+#---
+[*a for a in b]
+#---
+(*a for a in b)
+#---
+{*a for a in b}
+#---
+{**a for a in b}
+#---
+{a: b, c}
+#---
+{a, b: c}
+#---
+{a: b for a in c, d}
+#---
+[a, b for a in c]
+#---
+(*a)
+#---
+*a
+#---
+*a, *b
+#---
+print(*a)
+#---
+x = *a
+#---
+x[a:b:c:d]
+#---
+x[a b]
+#---
+x[]
+#---
+x.
+#---
+x.1
+#---
+x..y
+#---
+a if b
+#---
+a if b else
+#---
+lambda
+#---
+lambda x
+#---
+lambda x:
+#---
+lambda (x): x
+#---
+lambda x=1, y: x
+#---
+lambda *: x
+#---
+def
+#---
+def f
+#---
+def f(
+#---
+def f():
+#---
+def f():
+#---
+def f()
+    pass
+#---
+class
+#---
+class A
+#---
+class A(
+#---
+class A:
+#---
+if
+#---
+if x
+#---
+if x:
+#---
+elif x: pass
+#---
+else: pass
+#---
+if x: pass
+else: pass
+else: pass
+#---
+if x: pass
+else if y: pass
+#---
+while
+#---
+for
+#---
+for x
+#---
+for x in
+#---
+for x in y
+#---
+for in y: pass
+#---
+for x in y: pass
+else
+#---
+try
+#---
+try:
+    pass
+except
+#---
+try:
+    pass
+except:
+    pass
+except E:
+    pass
+#---
+try:
+    pass
+else:
+    pass
+#---
+try:
+    pass
+except* :
+    pass
+#---
+with
+#---
+with a as
+#---
+with a as b c: pass
+#---
+with a as 1: pass
+#---
+with a as f(): pass
+#---
+async
+#---
+async x
+#---
+async def
+#---
+async for x in y: pass
+#---
+async with a: pass
+#---
+async class A: pass
+#---
+await x
+#---
+await
+#---
+await await x
+#---
+await -x
+#---
+-await x
+#---
+await x ** 2
+#---
+await x.y(z)[0]
+#---
+yield
+#---
+yield x
+#---
+yield x, y
+#---
+yield from x
+#---
+yield from
+#---
+x = yield from y
+#---
+x = yield
+#---
+x += yield
+#---
+x = yield y, z
+#---
+x = (yield from y)
+#---
+print((yield))
+#---
+f(yield)
+#---
+[yield]
+#---
+print(a, (yield b))
+#---
+a = b if c else (yield)
+#---
+yield = 1
+#---
+raise E from
+#---
+raise from E
+#---
+global
+#---
+global a,
+#---
+nonlocal
+#---
+assert
+#---
+assert a,
+#---
+del
+#---
+del a b
+#---
+import a.
+#---
+import a b
+#---
+import . a
+#---
+from import a
+#---
+from a
+#---
+from a import
+#---
+from a import b,
+#---
+from a import (b
+#---
+from a import ()
+#---
+from a import *, b
+#---
+from a import (*)
+#---
+import a as
+#---
+import a as 1
+#---
+import *
+#---
+from a.b import *
+#---
+from . a import b
+#---
+from .a. b import c
+#---
+return
+#---
+pass pass
+#---
+pass; ; pass
+#---
+;
+#---
+x = 1;; y = 2
+#---
+@
+def f(): pass
+#---
+@a
+x = 1
+#---
+@a b
+def f(): pass
+#---
+@a
+@b
+class C: pass
+#---
+@a.b.c
+def f(): pass
+#---
+@a[0]
+def f(): pass
+#---
+@a(1)(2)
+def f(): pass
+#---
+@lambda f: f
+def g(): pass
+#---
+@a if b else c
+def f(): pass
+#---
+@a or b
+def f(): pass
+#---
+@a
+@b
+
+def f(): pass
+#---
+@a
+# comment
+def f(): pass
+#---
+x = a if b else c
+#---
+x = (a
+     if b
+     else c)
+#---
+x = not a
+#---
+x = a and b or c and d
+#---
+x = a < b > c == d != e <= f >= g
+#---
+x = a in b not in c is d is not e
+#---
+x = a or not b
+#---
+x = a if not b else c
+#---
+x = (a for a in b if c) if d else e
+#---
+x = lambda: (yield)
+#---
+x = lambda: lambda: 0
+#---
+x = [lambda: i for i in range(3)]
+#---
+x = lambda a=lambda: 0: a
+#---
+x = a[lambda: 0]
+#---
+x = {lambda: 0: 1}
+#---
+x = a, lambda: 0
+#---
+x = a if b else lambda: 0
+#---
+x = (lambda: 0)()
+#---
+x = a(lambda: 0, b)
+#---
+x = ''.join(x for x in y)
+#---
+x = a.b.c.d(1)(2)[3].e
+#---
+x = (a).b
+#---
+x = (a)(b)
+#---
+x = (a)[b]
+#---
+x = 1 .real
+#---
+x = 1.0.real
+#---
+x = 0x1.real
+#---
+x = "a".join
+#---
+x = "a" "b".join
+#---
+x = [1, 2][0]
+#---
+x = {1: 2}[1]
+#---
+x = (1, 2)[0]
+#---
+x = ...[0]
+#---
+x = None.x
+#---
+x = True.x
+#---
+x = f"{a}".x
+#---
+x = -a.b
+#---
+x = -a ** b
+#---
+x = a ** -b
+#---
+x = a ** b ** c
+#---
+x = (a ** b) ** c
+#---
+x = -a ** -b ** -c
+#---
+x = ~a ** b
+#---
+x = await a ** b
+#---
+x = a * b ** c
+#---
+x = a + b * c
+#---
+x = (a + b) * c
+#---
+x = a - b - c
+#---
+x = a / b / c
+#---
+x = a // b % c @ d
+#---
+x = a << b >> c
+#---
+x = a & b | c ^ d
+#---
+x = a | b & c
+#---
+x = a == b | c
+#---
+x = a and b == c
+#---
+x = a, b = c
+#---
+x = a if b else c, d
+#---
+x = (a, b if c else d)
+#---
+x = [a if b else c for d in e]
+#---
+x = [a for b in c if d else e]
+#---
+x = [a for b in c or d]
+#---
+x = [a for b in c if d or e]
+#---
+x = [a for b in (c if d else e)]
+#---
+x = [a for b in lambda: c]
+#---
+x = [a for b in c, d]
+#---
+x = [a for b, c in d]
+#---
+x = [a for (b, c) in d]
+#---
+x = [a for b.c in d]
+#---
+x = [a for b[0] in d]
+#---
+x = [a for *b, c in d]
+#---
+x = [a for b in c for d in e for f in g]
+#---
+x = [(a, b) for a in c for b in d]
+#---
+x = [[a for a in b] for b in c]
+#---
+x = {a: [b for b in c] for a in d}
+#---
+x = {**a for a in b}
+#---
+x = [a := 1 for b in c]
+#---
+x = [(a := 1) for b in c]
+#---
+x = [a for b in c if (d := b)]
+#---
+x = [a for b in c if d := b]
+#---
+x = (a async for a in b)
+#---
+x = {a async for a in b}
+#---
+x = {a: b async for a, b in c}
+#---
+x = [a for a in b async for c in d]
+#---
+x = [async for a in b]
+#---
+x = [a async b]
+#---
+x = f(a)(b)[c].d
+#---
+x = a.b(c).d[e](f)
+#---
+x = "a" % b
+#---
+x = b"a" % b
+#---
+x = a % "b"
+#---
+x = -1
+#---
+x = - 1
+#---
+x = +1
+#---
+x = ~1
+#---
+x = not 1
+#---
+x = -(1)
+#---
+x = --1
+#---
+x = - -1
+#---
+x = -+-1
+#---
+x = 1 - -1
+#---
+x = 1--1
+#---
+x = 1+-1
+#---
+x = a if b else c if d else e if f else g
+#---
+x = a or (b if c else d)
+#---
+x = (a or b) if c else d
+#---
+x = a if b or c else d
+#---
+x = a if (b if c else d) else e
+#---
+x = a if b else (c if d else e)
+#---
+x = ((((a))))
+#---
+x = ((a, b))
+#---
+x = ((a,),)
+#---
+x = ((a, b),)
+#---
+x = [(a)]
+#---
+x = [(a, b)]
+#---
+x = [[a]]
+#---
+x = {(a, b): c}
+#---
+x = {a: (b, c)}
+#---
+x = {a: b, **c, d: e}
+#---
+x = {*a, *b, c}
+#---
+x = {a, *b}
+#---
+x = {*a}
+#---
+x = {**a}
+#---
+x = {a: b,}
+#---
+x = {a,}
+#---
+x = {,}
+#---
+x = {a: }
+#---
+x = {: b}
+#---
+x = [,]
+#---
+x = (,)
+#---
+x = [a,,]
+#---
+x = (a,,)
+#---
+x = a,,
+#---
+x = a,
+#---
+x = a, b,
+#---
+x = *a,
+#---
+x = *a, b
+#---
+x = a, *b
+#---
+x = *a, *b,
+#---
+x = (*a,)
+#---
+x = [*a]
+#---
+x = {*a,}
+#---
+print(*a, sep='')
+#---
+print(a, *b, c, *d, e=1, **f)
+#---
+x = f(a)(b)(c)(d)
+#---
+x[a](b)[c](d)
+#---
+class A(B):
+    x = 1
+    def f(self): pass
+    @property
+    def g(self): return self._g
+    @g.setter
+    def g(self, v): self._g = v
+#---
+class A:
+    """doc"""
+    x: int = 1
+    y: str
+#---
+def f(a, b):
+    """doc"""
+    c = a + b
+    return c
+#---
+def f():
+    global x
+    x = 1
+    def g():
+        nonlocal y
+        y = 2
+#---
+def f(a, b=1, *args, c, d=2, **kwargs):
+    pass
+#---
+def f(a, /, b, *, c):
+    pass
+#---
+def f(a=1, /, b=2, *, c=3):
+    pass
+#---
+def f(a: int, /, b: int = 1, *args: int, c: int, d: int = 2, **kwargs: int) -> int:
+    pass
+#---
+def f(a, b, /, c, d, *, e, f):
+    pass
+#---
+def f(a, /, *, b):
+    pass
+#---
+def f(a, /, *args):
+    pass
+#---
+def f(a, /, **kwargs):
+    pass
+#---
+def f(*args, a):
+    pass
+#---
+def f(*args, a=1):
+    pass
+#---
+def f(*args, a=1, b):
+    pass
+#---
+def f(**kwargs, a):
+    pass
+#---
+def f(**kwargs, *a):
+    pass
+#---
+def f(*a, *b):
+    pass
+#---
+def f(/, a):
+    pass
+#---
+def f(a, /, /):
+    pass
+#---
+def f(*, /, a):
+    pass
+#---
+def f(a, *, /):
+    pass
+#---
+def f(a, *, b, /):
+    pass
+#---
+def f(a=1, b):
+    pass
+#---
+def f(a=1, /, b):
+    pass
+#---
+def f(a, b=1, /, c):
+    pass
+#---
+lambda a=1, b: 0
+#---
+lambda a, /: 0
+#---
+lambda /, a: 0
+#---
+lambda *a, b: 0
+#---
+lambda *, a: 0
+#---
+lambda **a: 0
+#---
+lambda a, *b, c=1, **d: 0
+#---
+lambda a: lambda b: lambda c: 0
+#---
+x = (lambda a, b=1: a + b)(1)
+#---
+def f():
+    return
+#---
+def f():
+    return a
+#---
+def f():
+    return a, b
+#---
+def f():
+    return *a, b
+#---
+def f():
+    return (yield)
+#---
+def f():
+    return await x
+#---
+def f():
+    yield
+    yield 1
+    yield 1, 2
+    yield *a, b
+    x = yield
+    x = yield 1
+    x = yield 1, 2
+    x = yield from y
+    x += yield 1
+    await y
+#---
+x = 1 if True else 2
+#---
+if True: x = 1
+#---
+if True:
+    pass
+else:
+    if True:
+        pass
+#---
+if a:
+    pass
+elif b:
+    if c:
+        pass
+else:
+    pass
+#---
+while True:
+    if a:
+        break
+    elif b:
+        continue
+    else:
+        pass
+#---
+for i in range(10):
+    for j in range(10):
+        if i == j:
+            continue
+        break
+    else:
+        pass
+else:
+    pass
+#---
+try:
+    try:
+        pass
+    except A:
+        pass
+except B:
+    pass
+#---
+try:
+    pass
+except (A, B):
+    pass
+except A.B:
+    pass
+except A.B as c:
+    pass
+except (A.B, C) as d:
+    pass
+#---
+try:
+    pass
+except A or B:
+    pass
+#---
+try:
+    pass
+except A if b else C:
+    pass
+#---
+try:
+    pass
+except A, B as c:
+    pass
+#---
+try:
+    pass
+except A, B, C:
+    pass
+#---
+try:
+    pass
+except (A, B), C:
+    pass
+#---
+try:
+    pass
+except A as c, B:
+    pass
+#---
+try:
+    pass
+except* A, B:
+    pass
+#---
+try:
+    pass
+except*:
+    pass
+#---
+try:
+    pass
+except:
+    pass
+else:
+    pass
+finally:
+    pass
+#---
+try:
+    pass
+except A as a.b:
+    pass
+#---
+try:
+    pass
+except A as (a):
+    pass
+#---
+try:
+    pass
+except A as 1:
+    pass
+#---
+with a, b, c: pass
+#---
+with a as b, c as d, e as f: pass
+#---
+with (a as b): pass
+#---
+with (a as b,): pass
+#---
+with (a, b,): pass
+#---
+with (a, b), c: pass
+#---
+with (a, b) as c, d: pass
+#---
+with (a as b) as c: pass
+#---
+with (a as b, c): pass
+#---
+with (a, b as c): pass
+#---
+with (a) as b, (c) as d: pass
+#---
+with (a)(b): pass
+#---
+with (a).b: pass
+#---
+with (a)[b]: pass
+#---
+with (a) + b: pass
+#---
+with (a, b)[0]: pass
+#---
+with (a for a in b): pass
+#---
+with (a for a in b) as c: pass
+#---
+with ((a, b)) as c: pass
+#---
+with (a as b, (c, d) as e): pass
+#---
+with (a as (b, c)): pass
+#---
+with (a as [b, c]): pass
+#---
+with (a as b.c): pass
+#---
+with (a as b[0]): pass
+#---
+with (a as *b): pass
+#---
+with (*a): pass
+#---
+with (*a, b): pass
+#---
+with ((a as b)): pass
+#---
+with (a as b) , (c as d): pass
+#---
+with (
+    a
+): pass
+#---
+with (
+    a as b
+): pass
+#---
+with (a := b): pass
+#---
+with (a := b) as c: pass
+#---
+with a := b: pass
+#---
+with a: pass
+with b: pass
+#---
+with a as b: x = 1
+#---
+with a as b:
+    with c as d:
+        pass
+#---
+x = [
+    1, # comment
+    2,
+]
+#---
+x = (  # comment
+    1
+)
+#---
+x = [1,
+     2,
+     3,
+    ]
+#---
+x = f(
+    a,
+    b,
+    c=d,
+)
+#---
+x = f(a,
+      b)(c,
+         d)
+#---
+if (a and
+    b):
+    pass
+#---
+if a and \
+   b:
+    pass
+#---
+x = """
+"""
+#---
+x = ('a'
+     'b')
+#---
+x = ('a'
+     'b'
+     f'{c}')
+#---
+x = {'a': 1,
+     'b': 2}
+#---
+def f(a,
+      b):
+    pass
+#---
+def f(
+    a,
+    b,
+):
+    pass
+#---
+class A(
+    B,
+    C,
+):
+    pass
+#---
+from a import (
+    b,
+    c,
+)
+#---
+x = a.b \
+    .c \
+    .d
+#---
+x = (a.b
+     .c
+     .d)
+#---
+x = [a for a in
+     b]
+#---
+x = 1; y = 2
+z = 3
+#---
+if x:
+    y = 1; z = 2
+#---
+if x: y = 1; z = 2
+#---
+if x: pass; pass
+else: pass
+#---
+class A: x = 1; y = 2
+#---
+def f(): x = 1; return x
+#---
+while x: y = 1; break
+#---
+for x in y: pass; continue
+#---
+try: pass
+except: pass
+finally: pass
+#---
+with a: pass; pass
+#---
+if x:
+    pass
+    ;
+#---
+x = 1 if y else 2; z = 3
+#---
+a = b = c
+#---
+a = b = c = d = e
+#---
+a = b, c = d, e
+#---
+a[0] = b[1] = c
+#---
+a.b = c.d = e
+#---
+a, b = c, d = e, f
+#---
+(a, b) = (c, d) = e
+#---
+[a, b] = [c, d] = e
+#---
+a = yield
+#---
+a = b = yield
+#---
+a = b = yield c
+#---
+a = (yield)
+#---
+a += b += c
+#---
+a = b += c
+#---
+a += b = c
+#---
+a : int = b = c
+#---
+a = b : int
+#---
+a: int = b: int
+#---
+a: int, b: int
+#---
+a: int = 1, 2
+#---
+a: int = *b, c
+#---
+a: int = yield
+#---
+a: int = yield b
+#---
+a: (yield)
+#---
+a: yield
+#---
+a: lambda: 0 = 1
+#---
+a: b if c else d = 1
+#---
+a: b, c = 1
+#---
+a: *b
+#---
+a: [int] = []
+#---
+a: dict[str, int] = {}
+#---
+a.b.c: int
+#---
+a[b][c]: int = 1
+#---
+a().b: int
+#---
+a(): int
+#---
+(a): int
+#---
+(a.b): int
+#---
+((a)): int
+#---
+(a, b): int
+#---
+a, : int
+#---
+a: int = 1
+b: str
+#---
+def f():
+    a: int
+    b: int = 1
+#---
+class A:
+    a: int
+    b: int = 1
+#---
+for x in y: z: int
+#---
+x: int = y if z else w
+#---
+if x: y: int = 1
+#---
+print("a" "b" 'c')
+#---
+print(f"{a}" "b" f'{c}')
+#---
+print(*args, **kwargs)
+#---
+print(*args, a, **kwargs)
+#---
+print(a, *args, b, **kwargs, c=1)
+#---
+print(a=1, *args)
+#---
+print(**a, **b)
+#---
+print(*a, *b)
+#---
+print(a, b, c,)
+#---
+print(a for a in b)
+#---
+print((a for a in b), c)
+#---
+print(a, (b for b in c))
+#---
+print(a, b for b in c)
+#---
+print(a for a in b, c)
+#---
+print((a for a in b))
+#---
+print(((a for a in b)))
+#---
+print(a := 1)
+#---
+print(a := 1, b := 2)
+#---
+print(a=(b := 1))
+#---
+print(a=b := 1)
+#---
+print(*a := b)
+#---
+print(**a := b)
+#---
+print(a if b else c)
+#---
+print(a if b else c, d)
+#---
+print(lambda: 0)
+#---
+print(lambda a, b: 0, 1)
+#---
+print(not a)
+#---
+print(-a)
+#---
+print(await a)
+#---
+print(a, await b)
+#---
+x = a[b:c, d:e]
+#---
+x = a[b:c, d]
+#---
+x = a[b, c:d]
+#---
+x = a[b:c][d:e]
+#---
+x = a[:, :]
+#---
+x = a[..., 0]
+#---
+x = a[0, ...]
+#---
+x = a[::]
+#---
+x = a[::, ::]
+#---
+x = a[b if c else d]
+#---
+x = a[b if c else d : e]
+#---
+x = a[b : c if d else e]
+#---
+x = a[lambda: 0]
+#---
+x = a[lambda: 0 : 1]
+#---
+x = a[b := 1, c]
+#---
+x = a[(b := 1) : c]
+#---
+x = a[b := 1 : c]
+#---
+x = a[-1]
+#---
+x = a[-1:]
+#---
+x = a[:-1]
+#---
+x = a[::-1]
+#---
+x = a[b:c:d] = 1
+#---
+x = a[b:c:d] += 1
+#---
+del a[b:c:d]
+#---
+del a[b:c, d]
+#---
+a[b:c] = d
+#---
+a[b, c] = d
+#---
+a[b:c, d] = e
+#---
+a[*b] = c
+#---
+a[*b, c] = d
+#---
+a[b, *c] = d
+#---
+a[b] = c = d
+#---
+a[b][c] = d
+#---
+a.b[c].d = e
+#---
+a().b = c
+#---
+a()[b] = c
+#---
+a[b]() = c
+#---
+(a)[b] = c
+#---
+(a).b = c
+#---
+(a, b)[c] = d
+#---
+[a, b][c] = d
+#---
+{a: b}[c] = d
+#---
+"a"[b] = c
+#---
+"a".b = c
+#---
+1[b] = c
+#---
+1 .b = c
+#---
+None[b] = c
+#---
+x = [a for a in b][0]
+#---
+x = (a for a in b).send
+#---
+x = {a for a in b}.pop()
+#---
+x = {a: b for a in c}.get(d)
+#---
+x = lambda: 0 .real
+#---
+x = (lambda: 0).real
+#---
+x = f"{a}".b
+#---
+x = f"{a}"[0]
+#---
+x = f"{a}"()
+#---
+x = b"a"[0]
+#---
+x = ...
+#---
+x = ... + 1
+#---
+x = a ... b
+#---
+x = [...]
+#---
+x = (...)
+#---
+x = {...}
+#---
+x = {...: ...}
+#---
+x = f(...)
+#---
+x = a[...]
+#---
+def f(a=...): pass
+#---
+def f(a: ... = ...) -> ...: pass
+#---
+x: ... = ...
+#---
+class A: ...
+#---
+def f(): ...
+#---
+if x: ...
+#---
+while x: ...
+#---
+for x in y: ...
+#---
+try: ...
+except: ...
+#---
+with a: ...
+#---
+match x:
+    case _: ...
+#---
+match x:
+    case [] | (): ...
+#---
+class A:
+    def f(self): ...
+    def g(self): ...
+#---
+print("hello", file=sys.stderr)
+#---
+print "hello"
+#---
+exec "code"
+#---
+a <> b
+#---
+a = 0777
+#---
+a = 0xL
+#---
+a = 1L
+#---
+a = ur"x"
+#---
+a = `b`
+#---
+raise E, "msg"
+#---
+except E, e:
+#---
+print >>f, x
+#---
+def f((a, b)): pass
+#---
+lambda (a, b): 0
+#---
+x = {1, 2, 3}
+#---
+x = {1: 2, 3: 4}
+#---
+x = {1, 2: 3}
+#---
+x = {1: 2, 3}
+#---
+x = {**a, 1}
+#---
+x = {*a, 1: 2}
+#---
+x = {1: 2, *a}
+#---
+x = {1: 2, **a}
+#---
+x = {**a, 1: 2}
+#---
+x = {**a, **b}
+#---
+x = {*a, *b}
+#---
+x = {a: b for a, b in c if d}
+#---
+x = {a for a in b if c}
+#---
+x = {a: b for a in c for b in d}
+#---
+x = {a: b for a in c if d for b in e if f}
+#---
+x = [a for a in b if c for d in e if f]
+#---
+x = [a for a in b if c if d for e in f if g if h]

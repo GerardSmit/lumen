@@ -1,0 +1,12 @@
+coroutine
+result 3
+result 39
+first
+a = resumed-with-1
+second
+b = resumed-with-2
+done ('resumed-with-1', 'resumed-with-2')
+ValueError async boom
+caught 'kk'
+closed
+add compute

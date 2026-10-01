@@ -1,0 +1,27 @@
+1
+gen caught thrown
+99
+gen finally
+gen exhausted
+gen finally
+closed
+got 1
+outer saw 'in gen'
+enter
+body
+exit None
+caught from exit None
+enter
+exit ValueError
+caught from exit ValueError('body error')
+comp zero
+dictcomp index
+genexp zero
+['SystemExit', 'KeyboardInterrupt']
+code 5
+code None
+kbd
+False False False True
+GeneratorExit
+thrown through tt
+dead

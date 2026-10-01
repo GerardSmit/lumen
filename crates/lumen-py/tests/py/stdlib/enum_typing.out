@@ -1,0 +1,8 @@
+Color.RED RED 1 Color.GREEN Color.BLUE <Color.GREEN: 2>
+[<Color.RED: 1>, <Color.GREEN: 2>, <Color.BLUE: 3>] 3 True False True
+True 11 1 [<Pri.LOW: 1>, <Pri.HIGH: 10>]
+Perm.R|W True 4 False
+RED 1; GREEN 2; BLUE 3; 
+ValueError
+2 1 None {'r': (1, 1)} int
+5 <class 'int'>

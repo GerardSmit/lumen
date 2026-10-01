@@ -1,0 +1,20 @@
+b'hello' 5 104 111 b'el' b'olleh' int bytes
+b'hello world' b'hellohello' True False True
+[104, 101, 108, 108, 111] b'hi' b'\x00\x00\x00' b'\xc3\xa9' b'\xc3\xa9' b'\xe9'
+hello é b'HELLO' 2 2 b'heLLo'
+True True [b'he', b'', b'o'] b'a,b' b'x'
+68656c6c6f b'hi' True True False
+b'\x00\x01\x02\x03\x04' b'abc' b'\x00\x01' b'a\nb' b'\\'
+True False True [97, 98, 99] 99
+bytearray(b'Abcdef') 6 98 Abcdef b'Abcdef' bytearray
+bytearray(b'Abcdef') 33 bytearray(b'Abcdef') True True
+bytearray(b'AXYZdef')
+bytearray(b'fedZYX') 2 None bytearray(b'fedZYX')
+bytearray(b'fedZYX') bytearray(b'\x00\x00') bytearray(b'hi') bytearray(b'\x01\x02')
+ValueError bytes must be in range(0, 256)
+TypeError immutable
+TypeError concat
+UnicodeDecodeError
+b'h\xc3\xa9llo' 6 b'hllo' b'h?llo'
+16 b'\x02\x01' b'\x01' True
+[b'a', b'b', b'c'] b'abc--' b'5-x' 98 b'bc'

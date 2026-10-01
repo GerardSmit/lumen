@@ -1,0 +1,27 @@
+n = 123456789012345678901234567890
+print(n, str(n), repr(n), -n, str(-n))
+print(int("123456789012345678901234567890") == n, int("-" + str(n)) == -n, int("  +" + str(n) + "\n") == n)
+print(int("1" + "0" * 50), int("9" * 40), int("0" * 30 + "7"))
+print(int("1_000_000_000_000_000_000_000"))
+print(int("ffffffffffffffffffffffff", 16), int("-FFFFFFFFFFFFFFFFFFFF", 16), int("0xffffffffffffffffffff", 16))
+print(int("zzzzzzzzzzzzzzzzzz", 36), int("1" * 70, 2), int("7" * 30, 8), int("0b" + "1" * 70, 0))
+print(hex(n), oct(n), bin(n))
+print(int(hex(n), 16) == n, int(oct(n), 8) == n, int(bin(n), 2) == n, int(hex(-n), 16) == -n)
+print("%d" % n, "%x" % n, "%o" % (n // 10 ** 20), "%s" % n, "%20d|" % (10 ** 18), "%-25d|" % n, "%030d" % n, "%+d" % n)
+print("{}".format(n), "{:x}".format(n), "{:,}".format(n), "{:_}".format(n), "{:>35}".format(n), "{:e}".format(10 ** 25), "{:.3e}".format(n))
+print(f"{n:040d}", f"{-n:,}", f"{n:#x}", f"{n:#b}"[:30], f"{2 ** 64:_x}", f"{10 ** 22:_d}")
+print(str(2 ** 200), len(str(7 ** 500)), str(7 ** 500)[:15])
+digits = "".join(str(i % 10) for i in range(300))
+big = int(digits)
+print(len(str(big)), str(big) == digits.lstrip("0"), big % 10 ** 10, big // 10 ** 280)
+print(float(n), float("1" + "0" * 30), int(float(n)), int(1e22), int(1.5e25), int(-1e25))
+print(int(2.0 ** 100), int(-(2.0 ** 100)), int(1e300) % 1000, int(1e300) > 10 ** 299)
+for s in ("12a", "1 2", "", "-", "0x", "1__0", "_1", "1_"):
+    try:
+        int(s)
+    except ValueError:
+        print("ValueError", repr(s))
+print(repr(n), ascii(n), n.__str__(), n.__repr__() == str(n), n.__hash__() == hash(n))
+print(divmod(n, 10 ** 15), n // 10 ** 29, n % 10 ** 29, round(n, -25), round(n, -29), round(-n, -28))
+print(n.to_bytes(13, "big"), int.from_bytes(n.to_bytes(13, "big"), "big") == n, n.bit_length())
+print(sum(int(c) for c in str(2 ** 1000)), str(2 ** 100).count("0"), str(3 ** 100)[::-1][:10])

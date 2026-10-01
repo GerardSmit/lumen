@@ -1,0 +1,27 @@
+Meta.__new__ Base ['hello']
+Meta.__init__ Base
+Meta.__new__ Child ['extra']
+Meta.__init__ Child
+['Base', 'Child']
+Meta Meta
+Meta Meta
+Meta.__call__ Base (5,)
+5 True
+Meta.__call__ Child ()
+0 True
+class Base class Child
+metaclass methods not on instances
+True False True
+Dyn 1 2 type
+20 Dyn True
+Meta.__new__ Dyn3 ['z']
+Meta.__init__ Dyn3
+3 Meta True
+Meta.__call__ Dyn3 (1,)
+1
+Conf init
+True
+False hi 5
+['P1', 'P2']
+type type type
+int True NoneType

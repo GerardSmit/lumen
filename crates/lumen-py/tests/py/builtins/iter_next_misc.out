@@ -1,0 +1,37 @@
+1 2 done None
+StopIteration
+stop
+TypeError
+TypeError
+['a', 'b'] [1, 2] [1] True
+[1, 2, 3]
+[(0, 'x'), (1, 'y')]
+0 5 1 7 3 2
+TypeError
+3 A True 97 233 10 ab
+ValueError
+TypeError
+0b1010 0o100 0xfff 0b0 0o0 -0x1 -0b101 0b10000000000000000000000000000000000000000000000000000000000000000000000
+(3, 2) (-4, 3)
+"a'b" 'a"b' 'a\'b"c' '\n\t\\' '' 'é' '\x00'
+1 1.0 None True [1, 'a'] ('a',) {'k': (1,)}
+[1, 'a', None] {'a': [1]} 1.5 0 100000000000000000000
+b"a\x00'" bytearray(b'hi') range(0, 3) slice(None, 1, None) Ellipsis NotImplemented
+b'x' <class 'int'> <class 'int'> <built-in function l <built-in function print>
+True True True True True
+True True -5 1000
+True True True True
+True True True True False False
+a b c 1
+True True 2 5 -1 0.5
+True False True True True True
+True False True True True
+True True
+True False True neg
+False [1, 0]
+True True True True
+True True
+[1, 2, 3] ['0', '1', '2'] 6 a 9
+8 8 4 -6 0 -3 40 2 7 5
+True True True
+256 256 0.25 -8 -4 512

@@ -23,7 +23,7 @@
 #![allow(clippy::wrong_self_convention)]
 
 mod ast;
-mod bigint;
+use lumen_common::bigint;
 mod builtins;
 pub mod bytebuf;
 pub mod bytecode;
@@ -39,7 +39,7 @@ mod eval;
 /// `#[global_allocator] static A: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;`
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;
-mod fasthash;
+use lumen_common::fasthash;
 mod host;
 mod interpreter;
 #[cfg(feature = "intl")]
@@ -87,9 +87,8 @@ mod cldr_dates;
 mod cldr_units;
 #[rustfmt::skip]
 mod units;
-mod unicode_norm;
-mod unicode_norm_impl;
-mod unicode_props;
+use lumen_common::unicode_norm_impl;
+use lumen_common::unicode_props;
 mod value;
 
 use interpreter::Interp;

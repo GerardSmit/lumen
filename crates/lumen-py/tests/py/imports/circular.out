@@ -1,0 +1,12 @@
+main: importing _circ_a
+a: start
+b: start
+b: has A_NAME yet? False
+b: end
+a: b.NAME = from-b
+a: end
+main: done importing
+from-a from-b
+a_func sees from-b
+b_func sees from-a
+['_circ_a', '_circ_b']

@@ -1,0 +1,52 @@
+init a
+enter a
+body a
+exit a None None
+after a
+init b
+enter b
+no target
+exit b None None
+init c
+enter c
+True
+exit c None None
+init d
+enter d
+exit d ValueError swallowed
+continued after d
+init e
+enter e
+exit e KeyError 'propagates'
+caught 'propagates'
+1 2
+exit args 3 None None None
+(1, 2)
+exit args 3 None None None
+init ret
+enter ret
+exit ret None None
+returned
+init loop0
+enter loop0
+loop body 0
+exit loop0 None None
+init loop1
+enter loop1
+exit loop1 None None
+init loop2
+enter loop2
+exit loop2 None None
+zero suppressed
+index not suppressed
+1 2
+-18
+init attr
+enter attr
+exit attr None None
+5
+init sub
+enter sub
+exit sub None None
+[9]
+TypeError

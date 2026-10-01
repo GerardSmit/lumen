@@ -1,0 +1,28 @@
+b'hello' 5 104 111 b'el' b'olleh' int bytes
+[104, 101, 108, 108, 111] b'hi' b'\x00\x01\x02' b'\x00\x00\x00' b'\xc3\xa9'
+b'hello world' b'hellohello' True True True False
+b'HELLO' b'Hello' b'heLLo' [b'he', b'', b'o'] b'a b' [b'a', b'b']
+2 2 True True 1
+b'a-b' 68656c6c6f b'Hi' True True
+True True True True False True
+hello hello True (b'he', b'l', b'lo') b'**hello'
+bytearray(b'bcdef') 7 103 bytearray(b'bcdef') 65 bytearray(b'bcdef')
+bytearray(b'bXYZef') b'bXYZef' bXYZef
+bytearray(b'!bYZef') 2 1
+bytearray(b'feZYb!') False bytearray(b'\x00\x00') bytearray(b'\x01\x02')
+bytearray(b'eZYb!') bytearray(b'ZYb!') bytearray
+bytearray(b'') 0 False
+True [b'a', b'ab', b'b'] 99 3
+b'xy' True True
+b'a-5' b'ac'
+b'a' [b'a', b'b', b'c'] [b'line1', b'line2'] b'--x--'
+256 1 b'\x01\x02' b'\xff'
+TypeError
+ValueError
+IndexError
+ValueError
+UnicodeDecodeError
+TypeError
+ff00 ff00 b'\xff\x00'
+97 98 
+b'abc..' b'00abc' b'a   b' b'ab'

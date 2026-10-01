@@ -1,0 +1,26 @@
+1 26 None {'a': 1, 'b': 2, 'c': 3, 'z': 26, 'n': None}
+1 none None {'b': 2, 'c': 3, 'z': 26}
+KeyError 'nope'
+('z', 26) ('c', 3) {'b': 2}
+KeyError popitem
+{'a': 1, 'b': 20, 'c': 30, 'x': 1, 'y': 2, 'p': 1, 'q': 2}
+dict_keys(['a', 'b', 'c', 'x', 'y', 'p', 'q']) dict_values([1, 20, 30, 1, 2, 1, 2]) dict_items([('a', 1), ('b', 20), ('c', 30), ('x', 1), ('y', 2), ('p', 1), ('q', 2)]) 7 7 7
+dict_keys dict_values dict_items
+new N ('new', 'N') True True True
+True {'a'} ['a', 'b', 'c', 'new', 'p', 'q', 'x', 'y', 'zz'] ['b', 'c', 'new', 'p', 'q', 'x', 'y'] ['b', 'c', 'new', 'p', 'q', 'x', 'y', 'zz']
+{('a', 1)} ('y', 2) skip True True True
+['new', 'q'] ['N', 2] [('new', 'N')]
+[('a', 1), ('x', 1), ('p', 1)] ['a', 'x', 'p'] N a
+1 None [] True False
+{} 0
+RuntimeError dictionary changed size during iteration
+RuntimeError dictionary changed size during iteration
+{0: 0, 2: 2, 4: 4}
+{0: 1, 2: 3, 4: 5}
+{'a': 3}
+a b
+StopIteration
+{'m': 1, 'i': 4, 's': 4, 'p': 2} [('i', 4), ('s', 4), ('p', 2), ('m', 1)]
+{'a': ['apple', 'avocado'], 'b': ['banana', 'blueberry'], 'c': ['cherry']}
+{1: ['a', 'b'], 2: ['c']}
+{'a': 2, 'b': 1} {'a': 2} True

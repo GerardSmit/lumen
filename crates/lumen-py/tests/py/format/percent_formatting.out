@@ -1,0 +1,32 @@
+5 -5 5 1 7     1|2    |00003|+4| 5
+str 1 1.5 None [1, 'a'] tuple (1, 2) 'r' [1, 'a']
+       abc|abc       |abc|       abc|abc       |
+1.500000 1.500000 3.14 2      3.142 3.142     | +2.0 -000003.14
+1.234568e+04 1.234568E+04 1.23e+04 12345.7 1E-10 1.23e+04 0.0001 1e+20
+ff FF 10 0xff 0XFF 0o10 000000ff ff      | -ff
+A B ☺ %%  99.5% 100%
+Bob is 30 x x 003.1
+   42|42   |3.14
+a and b single 50% None True False
+100000000000000000000 400000000000000000 1180591620717411303424 1.000000e+20 100000000000000000000.000000 123
+    1|  1.5|True |    ab| x 0 2 2
+b'x' é 'é' '\xe9' ['\xe9'] "it's" 'say "hi"'
+{'a': 1} {1, 2} 1.0 1e+20 1e-05 -0.0 inf 3j
+inf nan  -inf 0 0 0 0.000000e+00
+'%d' TypeError
+'%d %d' TypeError
+'%d' TypeError
+{'a': 1} 1
+'%(a)s' TypeError
+'%z' ValueError
+'%' ValueError
+'%c' TypeError
+'%c' OverflowError
+'%x' TypeError
+'%(a)s' KeyError
+'%s' TypeError
+no args only [] %s
+ab    |    cd|001.50|  +42|bee 1234|1234|1234
+ab ab x-yx-yx-y
+0.2 0.3 0.1 0.1 1.00 2.67 0.1000000000 0.10000000000000000555
+%s %d 3 nested

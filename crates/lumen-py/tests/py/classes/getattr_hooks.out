@@ -1,0 +1,23 @@
+real
+inst
+__getattr__ dyn_thing
+thing
+__getattr__ nothing
+AttributeError nothing
+__getattr__ nothing
+dflt
+__getattr__ dyn_x
+__getattr__ other
+True False
+[('get', 'x'), ('set', 'y', 5), ('get', 'y'), ('del', 'y'), ('get', 'missing')]
+1 gattribute-miss:absent
+getattr saw boom getattr saw other
+1
+frozen: cannot set a
+frozen: cannot delete a
+1
+1 hello from target
+99 99
+1 2 [('a', 1), ('b', 2)]
+False
+2

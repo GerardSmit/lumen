@@ -1,0 +1,2 @@
+1
+TypeError: add() missing 1 required positional argument: 'b'

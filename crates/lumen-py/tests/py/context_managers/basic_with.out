@@ -1,0 +1,54 @@
+enter a
+body A
+exit a None None True
+enter b
+no as
+exit b None None True
+enter c
+enter d
+two C D
+exit d None None True
+exit c None None True
+enter e
+enter f
+enter g
+nested
+exit g None None True
+exit f None None True
+exit e None None True
+enter h
+exit h ValueError boom False
+propagated boom
+enter i
+exit i ValueError hidden False
+after suppressed
+enter j
+enter failed
+enter k
+enter l
+exit k RuntimeError enter failed False
+k exited first? enter failed
+enter ret
+exit ret None None True
+returned
+enter loop0
+exit loop0 None None True
+enter loop1
+exit loop1 None None True
+i 1
+enter m
+exit m None None True
+enter n
+enter o
+N O
+exit o None None True
+exit n None None True
+not a context manager
+enter saved
+exit saved None None True
+enter saved
+True
+exit saved None None True
+enter t
+exit t None None True
+T

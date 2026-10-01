@@ -1,0 +1,52 @@
+6 True False
+SKU     Name              Qty     Price       Value
+---------------------------------------------------
+A100    Hammer             25     12.99      324.75
+A200    Screwdriver        40      7.99      319.60
+B100    Garden Hose         8     24.50      196.00
+B200    Rake                3     18.50       55.50
+C100    Paint (1L)         12     15.75      189.00
+C200    Brush Set           0      9.99        0.00
+---------------------------------------------------
+TOTAL                                       1084.85
+SKU     Name              Qty     Price       Value
+---------------------------------------------------
+A100    Hammer             25     12.99      324.75
+A200    Screwdriver        40      7.99      319.60
+B100    Garden Hose         8     24.50      196.00
+B200    Rake                3     18.50       55.50
+C100    Paint (1L)         12     15.75      189.00
+C200    Brush Set          15      9.99      149.85
+D100    Ladder              2     89.00      178.00
+---------------------------------------------------
+TOTAL                                       1412.70
+sold 5 x A100 = 64.95
+sold 3 x B200 = 55.50
+out of stock: B200: wanted 1, have 0
+sold 1 x D100 = 89.00
+key error: 'unknown sku Z999' | ('unknown sku Z999',)
+sold 12 x C100 = 189.00
+out of stock: A200: wanted 41, have 40
+revenue 39845
+low stock: ['B200', 'C100', 'D100'] ['B200', 'C100']
+garden    ['B100', 'B200']
+hardware  ['A100', 'C100']
+paint     ['C100', 'C200']
+tools     ['A100', 'A200', 'B200', 'D100']
+[('new', 'A100', 25), ('new', 'A200', 40), ('new', 'B100', 8), ('new', 'B200', 3), ('new', 'C100', 12), ('new', 'C200', 0), ('restock', 'C200', 15), ('new', 'D100', 2), ('sold', 'A100', 5), ('sold', 'B200', 3), ('depleted', 'B200', 0), ('sold', 'D100', 1), ('sold', 'C100', 12), ('depleted', 'C100', 0)]
+[('new', 7), ('sold', 4), ('depleted', 2), ('restock', 1)]
+Item('A100', 'Hammer', 1299, 20) True False
+{'A100': 25980, 'A200': 31960, 'B100': 19600, 'C200': 14985}
+Screwdriver Screwdriver
+2
+SKU     Name              Qty     Price       Value
+---------------------------------------------------
+A100    Hammer             20     12.99      259.80
+A200    Screwdriver        40      7.99      319.60
+B100    Garden Hose         8     24.50      196.00
+B200    Rake                0     18.50        0.00
+C100    Paint (1L)          0     15.75        0.00
+C200    Brush Set          15      9.99      149.85
+D100    Ladder              1     89.00       89.00
+---------------------------------------------------
+TOTAL                                       1014.25

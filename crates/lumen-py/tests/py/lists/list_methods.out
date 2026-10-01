@@ -1,0 +1,29 @@
+['z', 3, 1, 2, 5, 7, 8, 'a', 'b', 'pen', 'end'] 11
+end z pen [3, 1, 2, 5, 7, 8, 'a', 'b']
+1 3 4 2 0
+[1, 3, 2, 1]
+[1, 2, 3, 1]
+[1, 1, 2, 3]
+[3, 2, 1, 1]
+['Apple', 'apple', 'banana', 'cherry'] ['Apple', 'apple', 'banana', 'cherry'] ['banana', 'cherry', 'Apple', 'apple'] ['Apple', 'apple', 'banana', 'cherry']
+[3, 2, 1] [1, 2, 3] ['a', 'b', 'c'] [1, 3] [[1, 2], [1, 5], [2, 1]]
+[(1, 'y'), (1, 'z'), (2, 'a'), (2, 'b')] [(1, 'z'), (1, 'y'), (2, 'b'), (2, 'a')] [(2, 'b'), (2, 'a'), (1, 'z'), (1, 'y')]
+[0, 1, True, 2.5] [0, -1, 5, -10] [3, 2, 1]
+[3, 2, 1, 1] [3, 2, 1, 1, 99] False True
+[] 0 False
+IndexError
+IndexError
+ValueError
+ValueError
+TypeError
+TypeError
+TypeError
+None None None None None None []
+[1, 2, 3, 4, 5, 1, 2, 3, 4, 5] [0, 0, 0] [[0, 0], [0, 0]] [] [1, 2, 1, 2, 1, 2] [1, 2, 3] 2
+[[1, 0], [0, 0]] [[1, 0], [1, 0]]
+[0, 1, 2, 3, 4] ['a', 'b', 'c'] [1, 2] [1] [] [10, 7, 4, 1] [3, 2, 1] ['1', '2'] [1, 'a']
+5 2 6 2 True False False True
+True True True True True True False False
+True 1 True 0
+True True True True True 2
+[(5, 'a'), (6, 'b')] [(1, 'a'), (2, 'b')] [] [(1, 2, 3)]

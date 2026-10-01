@@ -1,0 +1,16 @@
+1 missing:foo missing:bar
+5
+missing:zzz True
+[('set', 'a', 1), ('get', 'a'), ('del', 'a')]
+AttributeError
+['NAME', 'OTHER']
+1 2
+no c
+False
+named H d
+('get', False, 'H') ('get', True, 'H')
+set 9
+7 {'r': 7}
+{'x': 1, 'y': 2} dflt True
+['y'] False
+c False

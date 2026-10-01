@@ -1,0 +1,55 @@
+5 255 255 511 1295 1295
+5 15 255 255 3 7
+-16 7 -7 12 12 0 0 7
+1000 100 15 1 1000
+3 7 35 3 36
+3 -3 0 0 1000000000000000 100000000000000000000 1 0
+0 5 1180591620717411303424 123456789012345678901234567890
+42 7
+ValueError invalid literal for int() with base 10: ''
+ValueError invalid literal for int() with base 10: ' '
+ValueError invalid literal for int() with base 10: '1.5'
+ValueError invalid literal for int() with base 10: 'abc'
+ValueError invalid literal for int() with base 10: '1__0'
+ValueError invalid literal for int() with base 10: '_1'
+ValueError invalid literal for int() with base 10: '1_'
+ValueError invalid literal for int() with base 10: '0x10'
+ValueError invalid literal for int() with base 10: '1e3'
+ValueError invalid literal for int() with base 10: '--1'
+ValueError invalid literal for int() with base 10: '0b2'
+ValueError invalid literal for int() with base 10: '٣x'
+ValueError int() base must be >= 2 and <= 36, or 0
+ValueError
+TypeError
+ValueError invalid literal for int() with base 8: '9'
+TypeError
+OverflowError
+ValueError
+1.5 2.5 1000.0 -0.01 0.5 5.0 10.5
+inf -inf inf nan nan inf nan
+3.0 1.0 0.0 0.0 -0.0 1.1805916207174113e+21 inf
+ValueError could not convert string to float: ''
+ValueError could not convert string to float: 'abc'
+ValueError could not convert string to float: '1.2.3'
+ValueError could not convert string to float: '1e'
+ValueError could not convert string to float: '0x10'
+ValueError could not convert string to float: '1__0'
+ValueError could not convert string to float: '--1'
+TypeError
+OverflowError
+1e+16 1000000000000000.0 0.0001 1e-05 123456789.12345679 1.0 100.0 1.5e+300 1e+22 1e+21
+0.30000000000000004 0.30000000000000004 0.3333333333333333 0.6666666666666666 5e-324 1.7976931348623157e+308 2.2250738585072014e-308
+9007199254740992.0 9007199254740992.0 9007199254740992.0 1e+100 1.2345678901234567e+19
+-0.0 True 3.0 3.14 -1e-10 1234567.0 0.000123
+0.1 0.1 1e+16 1e-07 inf -inf
+False True True
+True False True False
+(1, 2) (3, 1) 0x1.999999999999ap-4 3.0
+ff 0XFF 00000101 377
+-0xff 1,234,567 0b11111111 +3
+0xff -0xff 0o10 0b101 -0b101 0x0
+False True True False False True False True
+False True False False False False
+True False False True
+9 2.0 0 0
+1000000 255 3 7 10.01 10000000000.0

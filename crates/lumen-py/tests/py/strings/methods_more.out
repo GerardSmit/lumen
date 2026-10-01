@@ -1,0 +1,33 @@
+['a', 'b', 'c', 'd']
+['a', 'b'] ['a\n', 'b\n'] []
+'a       b       c' 'a   b' 'ab  c'
+120 xxyyzz
+dctn
+AAcd
+True False False True True False
+True False True True True False
+ss ß SS hello
+['a b c', 'd'] ['a b', 'c', 'd'] ['a,b', 'c'] ['a', 'b', 'c']
+['a', 'b', 'c d'] ['a', 'b  ']
+b'h\xc3\xa9llo w\xc3\xb6rld' 13 héllo wörld
+b'h?llo' b'hllo'
+abc b'\xe2\x82\xac' 3
+UnicodeEncodeError
+UnicodeDecodeError
+True
+97 8364 a € True
+[97, 233, 8364] ABCDE
+1 2 False
+é É True
+abc aaaabc
+Hello
+['a', 'b-c'] ['a-b', 'c']
+True False True
+True False True
+True 'x'
+('one', ' ', 'two') ('one', '', '')
+6162 ab
+abc 123 None True [1, 'a']
+Test String X1Y2 O'Neil
+3 items abc
+['A', 'B', 'a', 'b'] ['A', 'a', 'b', 'B']

@@ -1,0 +1,19 @@
+6 30 (14, '7')
+True ['return', 'weights', 'xs']
+Color.RED RED 1 <Color.GREEN: 2> Color.GREEN Color.BLUE
+[<Color.RED: 1>, <Color.GREEN: 2>, <Color.BLUE: 3>] ['RED', 'GREEN', 'BLUE'] 3 True
+True True True False
+green=2 Color True
+3 Color.BLUE
+True ['RED', 'GREEN', 'BLUE']
+ValueError bad value
+KeyError bad name
+AttributeError immutable member
+True True 11 [<Level.LOW: 1>, <Level.MID: 5>, <Level.HIGH: 10>]
+5 10 10 [1, 5, 10] 5 10
+1 2 3 [<Auto.FIRST: 1>, <Auto.SECOND: 2>, <Auto.THIRD: 3>]
+Perm.R|W 6 True False False True Perm.R|W|X
+5 7 3 True 5
+9.8 3.7 5.976e+24 6378140.0
+['circle', 'square', 'other'] Shape.CIRCLE SQUARE
+True [<Alias.ONE: 1>, <Alias.TWO: 2>] ONE Alias.ONE

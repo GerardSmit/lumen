@@ -1,0 +1,11 @@
+init _pkg _pkg
+init _pkg.sub _pkg.sub _pkg
+---
+42 sub-tag pkg-const 6
+False False
+NameError not_exported
+loading _helper_mod as _helper_mod
+42 hello star Box(1) ['a', 'b']
+False True
+['PKG_CONST', 'TAG', 'double', 'sub']
+nope

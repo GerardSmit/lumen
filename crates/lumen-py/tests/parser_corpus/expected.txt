@@ -1,0 +1,2237 @@
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store()), Name(id='y', ctx=Store()), Name(id='z', ctx=Store())], value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store())], value=Tuple(elts=[Name(id='b', ctx=Load()), Name(id='a', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Tuple(elts=[Name(id='a', ctx=Store()), Starred(value=Name(id='b', ctx=Store()), ctx=Store()), Name(id='c', ctx=Store())], ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Tuple(elts=[Starred(value=Name(id='a', ctx=Store()), ctx=Store())], ctx=Store())], value=Name(id='b', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[List(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Tuple(elts=[Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), Name(id='c', ctx=Store())], ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[AnnAssign(target=Name(id='x', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='x', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=5), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='x', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=5), simple=0)])
+#---
+Module(body=[AnnAssign(target=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=5), simple=0)])
+#---
+Module(body=[AnnAssign(target=Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value=1), ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=0)])
+#---
+Module(body=[AugAssign(target=Name(id='x', ctx=Store()), op=Add(), value=Constant(value=1)), AugAssign(target=Name(id='x', ctx=Store()), op=Sub(), value=Constant(value=1)), AugAssign(target=Name(id='x', ctx=Store()), op=Mult(), value=Constant(value=2)), AugAssign(target=Name(id='x', ctx=Store()), op=Div(), value=Constant(value=2)), AugAssign(target=Name(id='x', ctx=Store()), op=FloorDiv(), value=Constant(value=2)), AugAssign(target=Name(id='x', ctx=Store()), op=Mod(), value=Constant(value=2)), AugAssign(target=Name(id='x', ctx=Store()), op=Pow(), value=Constant(value=2)), AugAssign(target=Name(id='x', ctx=Store()), op=RShift(), value=Constant(value=1)), AugAssign(target=Name(id='x', ctx=Store()), op=LShift(), value=Constant(value=1)), AugAssign(target=Name(id='x', ctx=Store()), op=BitAnd(), value=Constant(value=1)), AugAssign(target=Name(id='x', ctx=Store()), op=BitOr(), value=Constant(value=1)), AugAssign(target=Name(id='x', ctx=Store()), op=BitXor(), value=Constant(value=1)), AugAssign(target=Name(id='x', ctx=Store()), op=MatMult(), value=Name(id='m', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Constant(value=1)], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Return(value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return(value=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])])
+#---
+Module(body=[Expr(value=UnaryOp(op=USub(), operand=BinOp(left=Constant(value=2), op=Pow(), right=Constant(value=2))))])
+#---
+Module(body=[Expr(value=BinOp(left=Constant(value=2), op=Pow(), right=UnaryOp(op=USub(), operand=Constant(value=1))))])
+#---
+Module(body=[Expr(value=BinOp(left=Constant(value=2), op=Pow(), right=BinOp(left=Constant(value=3), op=Pow(), right=Constant(value=4))))])
+#---
+Module(body=[Expr(value=BinOp(left=UnaryOp(op=USub(), operand=Constant(value=2)), op=Pow(), right=Constant(value=2)))])
+#---
+Module(body=[Expr(value=UnaryOp(op=Not(), operand=Compare(left=Name(id='a', ctx=Load()), ops=[Eq()], comparators=[Name(id='b', ctx=Load())])))])
+#---
+Module(body=[Expr(value=Compare(left=Name(id='a', ctx=Load()), ops=[Lt(), Lt()], comparators=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Compare(left=Name(id='a', ctx=Load()), ops=[IsNot()], comparators=[Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Compare(left=Name(id='a', ctx=Load()), ops=[NotIn()], comparators=[Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Expr(value=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=IfExp(test=Name(id='d', ctx=Load()), body=Name(id='c', ctx=Load()), orelse=Name(id='e', ctx=Load()))))])
+#---
+Module(body=[Expr(value=BoolOp(op=Or(), values=[Name(id='a', ctx=Load()), BoolOp(op=And(), values=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load())]), Name(id='d', ctx=Load())]))])
+#---
+Module(body=[Expr(value=UnaryOp(op=Not(), operand=UnaryOp(op=Not(), operand=Name(id='a', ctx=Load()))))])
+#---
+Module(body=[Expr(value=BinOp(left=BinOp(left=UnaryOp(op=Invert(), operand=Name(id='a', ctx=Load())), op=Add(), right=UnaryOp(op=USub(), operand=Name(id='b', ctx=Load()))), op=Sub(), right=UnaryOp(op=UAdd(), operand=Name(id='c', ctx=Load()))))])
+#---
+Module(body=[Expr(value=BinOp(left=Name(id='a', ctx=Load()), op=BitOr(), right=BinOp(left=Name(id='b', ctx=Load()), op=BitXor(), right=BinOp(left=Name(id='c', ctx=Load()), op=BitAnd(), right=BinOp(left=BinOp(left=Name(id='d', ctx=Load()), op=LShift(), right=Name(id='e', ctx=Load())), op=RShift(), right=BinOp(left=BinOp(left=Name(id='f', ctx=Load()), op=Add(), right=Name(id='g', ctx=Load())), op=Sub(), right=BinOp(left=BinOp(left=BinOp(left=BinOp(left=BinOp(left=Name(id='h', ctx=Load()), op=Mult(), right=Name(id='i', ctx=Load())), op=Div(), right=Name(id='j', ctx=Load())), op=FloorDiv(), right=Name(id='k', ctx=Load())), op=Mod(), right=Name(id='l', ctx=Load())), op=MatMult(), right=Name(id='m', ctx=Load()))))))))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(), body=Constant(value=0)))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(args=[arg(arg='x'), arg(arg='y')], vararg=arg(arg='a'), kwonlyargs=[arg(arg='z'), arg(arg='w')], kw_defaults=[None, Constant(value=2)], kwarg=arg(arg='k'), defaults=[Constant(value=1)]), body=Name(id='x', ctx=Load())))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(posonlyargs=[arg(arg='x')], args=[arg(arg='y')]), body=Name(id='x', ctx=Load())))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(kwonlyargs=[arg(arg='a')], kw_defaults=[None]), body=Name(id='a', ctx=Load())))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(), body=Yield()))])
+#---
+Module(body=[Expr(value=NamedExpr(target=Name(id='x', ctx=Store()), value=Constant(value=5)))])
+#---
+Module(body=[If(test=Compare(left=NamedExpr(target=Name(id='n', ctx=Store()), value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='a', ctx=Load())])), ops=[Gt()], comparators=[Constant(value=10)]), body=[Pass()])])
+#---
+Module(body=[While(test=NamedExpr(target=Name(id='chunk', ctx=Store()), value=Call(func=Attribute(value=Name(id='f', ctx=Load()), attr='read', ctx=Load()))), body=[Pass()])])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[NamedExpr(target=Name(id='a', ctx=Store()), value=Constant(value=1))]))])
+#---
+Module(body=[Expr(value=List(elts=[NamedExpr(target=Name(id='y', ctx=Store()), value=Constant(value=1)), BinOp(left=Name(id='y', ctx=Load()), op=Pow(), right=Constant(value=2))], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Name(id='c', ctx=Load()), Name(id='d', ctx=Load())], is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0), comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='d', ctx=Load()), ifs=[Name(id='e', ctx=Load())], is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=DictComp(key=Name(id='a', ctx=Load()), value=Name(id='b', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=SetComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=1)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Await(value=Name(id='a', ctx=Load())), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Await(value=Name(id='c', ctx=Load()))], is_async=1)]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)])]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load()), Starred(value=Name(id='c', ctx=Load()), ctx=Load())], keywords=[keyword(arg='b', value=Constant(value=1)), keyword(arg='d', value=Constant(value=2)), keyword(value=Name(id='e', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())], keywords=[keyword(value=Name(id='c', ctx=Load())), keyword(value=Name(id='d', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[GeneratorExp(elt=Name(id='x', ctx=Load()), generators=[comprehension(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), ifs=[Name(id='z', ctx=Load())], is_async=0)])]))])
+#---
+Module(body=[Expr(value=Call(func=Call(func=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load())]), args=[Name(id='b', ctx=Load())]), args=[Name(id='c', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), keywords=[keyword(value=Dict(keys=[Constant(value='a')], values=[Constant(value=1)]))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[Starred(value=Name(id='b', ctx=Load()), ctx=Load())], keywords=[keyword(arg='a', value=Constant(value=1))]))])
+#---
+Module(body=[Expr(value=Attribute(value=Attribute(value=Name(id='x', ctx=Load()), attr='y', ctx=Load()), attr='z', ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Constant(value=1), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Slice(lower=Constant(value=1), upper=Constant(value=2)), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Slice(), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Slice(), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Slice(lower=Constant(value=1), upper=Constant(value=2), step=Constant(value=3)), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Slice(step=Constant(value=3)), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Slice(upper=Constant(value=2)), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Slice(lower=Constant(value=1)), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Tuple(elts=[Slice(lower=Constant(value=1), upper=Constant(value=2)), Constant(value=3)], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Tuple(elts=[Constant(value=1)], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Tuple(elts=[Slice(lower=Name(id='a', ctx=Load()), upper=Name(id='b', ctx=Load())), Slice(step=Name(id='c', ctx=Load())), Constant(value=Ellipsis)], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='x', ctx=Load()), slice=NamedExpr(target=Name(id='a', ctx=Store()), value=Constant(value=1)), ctx=Load()))])
+#---
+Module(body=[Expr(value=Subscript(value=Subscript(value=Subscript(value=Name(id='x', ctx=Load()), slice=Name(id='a', ctx=Load()), ctx=Load()), slice=Name(id='b', ctx=Load()), ctx=Load()), slice=Name(id='c', ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Constant(value=Ellipsis))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=Ellipsis))])
+#---
+Module(body=[Expr(value=List(ctx=Load()))])
+#---
+Module(body=[Expr(value=List(elts=[Constant(value=1), Constant(value=2), Constant(value=3)], ctx=Load()))])
+#---
+Module(body=[Expr(value=List(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Expr(value=Tuple(ctx=Load()))])
+#---
+Module(body=[Expr(value=Tuple(elts=[Constant(value=1)], ctx=Load()))])
+#---
+Module(body=[Expr(value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))])
+#---
+Module(body=[Expr(value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Expr(value=Name(id='a', ctx=Load()))])
+#---
+Module(body=[Expr(value=Name(id='a', ctx=Load()))])
+#---
+Module(body=[Expr(value=Dict())])
+#---
+Module(body=[Expr(value=Set(elts=[Constant(value=1), Constant(value=2)]))])
+#---
+Module(body=[Expr(value=Set(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Constant(value=1)]))])
+#---
+Module(body=[Expr(value=Dict(keys=[Constant(value=1), Constant(value=3)], values=[Constant(value=2), Constant(value=4)]))])
+#---
+Module(body=[Expr(value=Dict(keys=[None, Constant(value='b'), None], values=[Name(id='a', ctx=Load()), Constant(value=1), Name(id='c', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Dict(keys=[Constant(value='a'), None], values=[Constant(value=1), Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Expr(value=DictComp(key=Name(id='a', ctx=Load()), value=Name(id='b', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Expr(value=Dict(keys=[Name(id='a', ctx=Load())], values=[Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Yield())])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Assign(targets=[Name(id='x', ctx=Store())], value=Yield()), Assign(targets=[Name(id='y', ctx=Store())], value=Yield(value=Constant(value=1))), Assign(targets=[Name(id='z', ctx=Store())], value=Yield(value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))), Expr(value=YieldFrom(value=Name(id='a', ctx=Load()))), Expr(value=Await(value=Name(id='b', ctx=Load()))), Return(value=Yield())])])
+#---
+Module(body=[AsyncFunctionDef(name='f', args=arguments(), body=[Expr(value=Await(value=Name(id='a', ctx=Load()))), AsyncFor(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), body=[Pass()], orelse=[Pass()]), AsyncWith(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store()))], body=[Pass()]), Return(value=ListComp(elt=Name(id='x', ctx=Load()), generators=[comprehension(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), is_async=1)]))])])
+#---
+Module(body=[AsyncFunctionDef(name='f', args=arguments(), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Name(id='a', ctx=Load()), Attribute(value=Name(id='b', ctx=Load()), attr='c', ctx=Load()), Call(func=Name(id='d', ctx=Load()), args=[Name(id='e', ctx=Load())])])])
+#---
+Module(body=[ClassDef(name='C', body=[Pass()], decorator_list=[Name(id='a', ctx=Load())])])
+#---
+Module(body=[AsyncFunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Name(id='a', ctx=Load())])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Yield()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[NamedExpr(target=Name(id='x', ctx=Store()), value=Name(id='y', ctx=Load()))])])
+#---
+Module(body=[ClassDef(name='A', body=[Pass()])])
+#---
+Module(body=[ClassDef(name='A', body=[Pass()])])
+#---
+Module(body=[ClassDef(name='A', bases=[Name(id='B', ctx=Load()), Name(id='C', ctx=Load())], keywords=[keyword(arg='metaclass', value=Name(id='M', ctx=Load())), keyword(arg='x', value=Constant(value=1))], body=[Pass()])])
+#---
+Module(body=[ClassDef(name='A', bases=[Starred(value=Name(id='b', ctx=Load()), ctx=Load())], keywords=[keyword(value=Name(id='c', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a'), arg(arg='b')]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a'), arg(arg='b'), arg(arg='c')], defaults=[Constant(value=1), Constant(value=2)]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(kwonlyargs=[arg(arg='a')], kw_defaults=[None]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(kwonlyargs=[arg(arg='a'), arg(arg='b'), arg(arg='c')], kw_defaults=[None, Constant(value=1), None]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a')]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a')], args=[arg(arg='b')]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a'), arg(arg='b')], args=[arg(arg='c')], vararg=arg(arg='d'), kwonlyargs=[arg(arg='e'), arg(arg='f')], kw_defaults=[None, Constant(value=3)], kwarg=arg(arg='g'), defaults=[Constant(value=1), Constant(value=2)]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(vararg=arg(arg='args', annotation=Name(id='int', ctx=Load())), kwarg=arg(arg='kwargs', annotation=Name(id='str', ctx=Load()))), body=[Pass()], returns=Constant(value=None))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a', annotation=Name(id='int', ctx=Load()))], kwonlyargs=[arg(arg='b', annotation=Name(id='str', ctx=Load()))], kw_defaults=[Constant(value='x')], defaults=[Constant(value=1)]), body=[Pass()], returns=Name(id='int', ctx=Load()))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(vararg=arg(arg='a', annotation=Starred(value=Name(id='b', ctx=Load()), ctx=Load()))), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a')]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(vararg=arg(arg='a')), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(kwarg=arg(arg='a')), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a')], kwonlyargs=[arg(arg='b')], kw_defaults=[None]), body=[Pass()])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a'), arg(arg='a')]), body=[Pass()])])
+#---
+Module(body=[If(test=Name(id='a', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[If(test=Name(id='a', ctx=Load()), body=[Pass()], orelse=[If(test=Name(id='b', ctx=Load()), body=[Pass()], orelse=[If(test=Name(id='c', ctx=Load()), body=[Pass()], orelse=[Pass()])])])])
+#---
+Module(body=[If(test=Name(id='a', ctx=Load()), body=[Pass()], orelse=[Pass()])])
+#---
+Module(body=[If(test=Name(id='a', ctx=Load()), body=[If(test=Name(id='b', ctx=Load()), body=[Pass()], orelse=[Pass()])], orelse=[Pass()])])
+#---
+Module(body=[While(test=Name(id='a', ctx=Load()), body=[Break()], orelse=[Continue()])])
+#---
+Module(body=[While(test=Constant(value=1), body=[Pass()])])
+#---
+Module(body=[For(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Tuple(elts=[Name(id='x', ctx=Store()), Name(id='y', ctx=Store())], ctx=Store()), iter=Name(id='z', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Tuple(elts=[Name(id='x', ctx=Store()), Name(id='y', ctx=Store())], ctx=Store()), iter=Name(id='z', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Tuple(elts=[Name(id='x', ctx=Store())], ctx=Store()), iter=Name(id='z', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Tuple(elts=[Starred(value=Name(id='a', ctx=Store()), ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), iter=Name(id='c', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Name(id='x', ctx=Store()), iter=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Name(id='x', ctx=Store()), iter=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Attribute(value=Name(id='x', ctx=Load()), attr='y', ctx=Store()), iter=Name(id='z', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Subscript(value=Name(id='x', ctx=Load()), slice=Constant(value=0), ctx=Store()), iter=Name(id='z', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[For(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), body=[Pass()], orelse=[Pass()])])
+#---
+SyntaxError
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(body=[Pass()])])])
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=Name(id='E', ctx=Load()), body=[Pass()]), ExceptHandler(type=Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load()), name='e', body=[Pass()]), ExceptHandler(type=Name(id='E', ctx=Load()), name='e', body=[Pass()])], orelse=[Pass()], finalbody=[Pass()])])
+#---
+Module(body=[Try(body=[Pass()], finalbody=[Pass()])])
+#---
+Module(body=[TryStar(body=[Pass()], handlers=[ExceptHandler(type=Name(id='E', ctx=Load()), body=[Pass()]), ExceptHandler(type=Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load()), name='e', body=[Pass()])])])
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load()), body=[Pass()])])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load())), withitem(context_expr=Name(id='b', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load())), withitem(context_expr=Name(id='b', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), optional_vars=Name(id='c', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Yield())], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Tuple(elts=[Name(id='b', ctx=Store()), Name(id='c', ctx=Store())], ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Attribute(value=Name(id='b', ctx=Load()), attr='c', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value=0), ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Call(func=Name(id='open', ctx=Load()), args=[Constant(value='a')]), optional_vars=Name(id='f', ctx=Store())), withitem(context_expr=Call(func=Name(id='open', ctx=Load()), args=[Constant(value='b')]), optional_vars=Name(id='g', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=NamedExpr(target=Name(id='a', ctx=Store()), value=Name(id='b', ctx=Load())))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[Raise()])
+#---
+Module(body=[Raise(exc=Name(id='E', ctx=Load()))])
+#---
+Module(body=[Raise(exc=Name(id='E', ctx=Load()), cause=Name(id='F', ctx=Load()))])
+#---
+Module(body=[Raise(exc=Call(func=Name(id='E', ctx=Load()), args=[Constant(value=1)]), cause=Constant(value=None))])
+#---
+Module(body=[Return()])
+#---
+Module(body=[Return(value=Constant(value=1))])
+#---
+Module(body=[Delete(targets=[Name(id='a', ctx=Del())])])
+#---
+Module(body=[Delete(targets=[Name(id='a', ctx=Del()), Name(id='b', ctx=Del())])])
+#---
+Module(body=[Delete(targets=[Name(id='a', ctx=Del())])])
+#---
+Module(body=[Delete(targets=[Tuple(elts=[Name(id='a', ctx=Del()), Name(id='b', ctx=Del())], ctx=Del())])])
+#---
+Module(body=[Delete(targets=[List(elts=[Name(id='a', ctx=Del()), Name(id='b', ctx=Del())], ctx=Del())])])
+#---
+Module(body=[Delete(targets=[Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Del()), Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value=0), ctx=Del()), Name(id='c', ctx=Del())])])
+#---
+Module(body=[Delete(targets=[Name(id='a', ctx=Del()), Name(id='b', ctx=Del())])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Pass(), Pass()])
+#---
+Module(body=[Pass()])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1)), Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=2))])
+#---
+Module(body=[Break()])
+#---
+Module(body=[Continue()])
+#---
+Module(body=[Global(names=['a'])])
+#---
+Module(body=[Global(names=['a', 'b', 'c'])])
+#---
+Module(body=[Nonlocal(names=['a', 'b'])])
+#---
+Module(body=[Assert(test=Name(id='a', ctx=Load()))])
+#---
+Module(body=[Assert(test=Name(id='a', ctx=Load()), msg=Name(id='b', ctx=Load()))])
+#---
+Module(body=[Assert(test=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Import(names=[alias(name='a')])])
+#---
+Module(body=[Import(names=[alias(name='a.b.c')])])
+#---
+Module(body=[Import(names=[alias(name='a', asname='b')])])
+#---
+Module(body=[Import(names=[alias(name='a.b', asname='c'), alias(name='d'), alias(name='e.f', asname='g')])])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b')], level=0)])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b', asname='c'), alias(name='d')], level=0)])
+#---
+Module(body=[ImportFrom(module='a.b', names=[alias(name='c')], level=0)])
+#---
+Module(body=[ImportFrom(names=[alias(name='a')], level=1)])
+#---
+Module(body=[ImportFrom(names=[alias(name='a')], level=2)])
+#---
+Module(body=[ImportFrom(names=[alias(name='a')], level=3)])
+#---
+Module(body=[ImportFrom(names=[alias(name='a')], level=4)])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b')], level=1)])
+#---
+Module(body=[ImportFrom(module='a.b', names=[alias(name='c')], level=2)])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='*')], level=0)])
+#---
+Module(body=[ImportFrom(names=[alias(name='*')], level=1)])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b'), alias(name='c')], level=0)])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b'), alias(name='c')], level=0)])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b', asname='c'), alias(name='d', asname='e')], level=0)])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[ImportFrom(names=[alias(name='a'), alias(name='b')], level=1)])
+#---
+SyntaxError
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchValue(value=Constant(value=1)), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchOr(patterns=[MatchValue(value=Constant(value=1)), MatchValue(value=Constant(value=2)), MatchValue(value=Constant(value=3))]), body=[Pass()]), match_case(pattern=MatchValue(value=Constant(value='a')), body=[Pass()]), match_case(pattern=MatchValue(value=Constant(value=b'a')), body=[Pass()]), match_case(pattern=MatchValue(value=UnaryOp(op=USub(), operand=Constant(value=1))), body=[Pass()]), match_case(pattern=MatchValue(value=Constant(value=1.5)), body=[Pass()]), match_case(pattern=MatchValue(value=UnaryOp(op=USub(), operand=Constant(value=1.5))), body=[Pass()]), match_case(pattern=MatchValue(value=BinOp(left=Constant(value=1), op=Add(), right=Constant(value=2j))), body=[Pass()]), match_case(pattern=MatchValue(value=BinOp(left=UnaryOp(op=USub(), operand=Constant(value=1)), op=Sub(), right=Constant(value=2j))), body=[Pass()]), match_case(pattern=MatchSingleton(value=None), body=[Pass()]), match_case(pattern=MatchSingleton(value=True), body=[Pass()]), match_case(pattern=MatchSingleton(value=False), body=[Pass()]), match_case(pattern=MatchAs(), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchAs(name='a'), body=[Pass()]), match_case(pattern=MatchValue(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load())), body=[Pass()]), match_case(pattern=MatchValue(value=Attribute(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), attr='c', ctx=Load())), body=[Pass()]), match_case(pattern=MatchClass(cls=Name(id='A', ctx=Load())), body=[Pass()]), match_case(pattern=MatchClass(cls=Name(id='A', ctx=Load()), patterns=[MatchValue(value=Constant(value=1)), MatchValue(value=Constant(value=2))]), body=[Pass()]), match_case(pattern=MatchClass(cls=Name(id='A', ctx=Load()), kwd_attrs=['x', 'y'], kwd_patterns=[MatchValue(value=Constant(value=1)), MatchValue(value=Constant(value=2))]), body=[Pass()]), match_case(pattern=MatchClass(cls=Name(id='A', ctx=Load()), patterns=[MatchValue(value=Constant(value=1))], kwd_attrs=['x'], kwd_patterns=[MatchValue(value=Constant(value=2))]), body=[Pass()]), match_case(pattern=MatchClass(cls=Attribute(value=Name(id='a', ctx=Load()), attr='A', ctx=Load()), patterns=[MatchAs(name='b')], kwd_attrs=['c'], kwd_patterns=[MatchAs(name='d')]), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchSequence(patterns=[MatchAs(name='a'), MatchAs(name='b')]), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchAs(name='a'), MatchStar(name='b')]), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchStar()]), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchAs(name='a'), MatchAs(name='b')]), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchAs(name='a')]), body=[Pass()]), match_case(pattern=MatchSequence(), body=[Pass()]), match_case(pattern=MatchSequence(), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchAs(name='a'), MatchAs(name='b')]), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchAs(name='a'), MatchStar(name='b')]), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchStar(name='a'), MatchAs(name='b')]), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchAs(name='a'), MatchSequence(patterns=[MatchAs(name='b'), MatchAs(name='c')])]), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchMapping(), body=[Pass()]), match_case(pattern=MatchMapping(keys=[Constant(value='a')], patterns=[MatchValue(value=Constant(value=1))]), body=[Pass()]), match_case(pattern=MatchMapping(keys=[Constant(value='a'), Constant(value='b')], patterns=[MatchValue(value=Constant(value=1)), MatchAs(name='c')]), body=[Pass()]), match_case(pattern=MatchMapping(keys=[Constant(value='a')], patterns=[MatchValue(value=Constant(value=1))], rest='rest'), body=[Pass()]), match_case(pattern=MatchMapping(rest='rest'), body=[Pass()]), match_case(pattern=MatchMapping(keys=[Constant(value=1), Constant(value=None), Constant(value=True)], patterns=[MatchAs(name='a'), MatchAs(name='b'), MatchAs(name='c')]), body=[Pass()]), match_case(pattern=MatchMapping(keys=[Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load())], patterns=[MatchAs(name='c')]), body=[Pass()]), match_case(pattern=MatchMapping(keys=[Constant(value='a')], patterns=[MatchValue(value=Constant(value=1))]), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchAs(pattern=MatchAs(name='a'), name='b'), body=[Pass()]), match_case(pattern=MatchAs(pattern=MatchOr(patterns=[MatchAs(name='a'), MatchAs(name='b')]), name='c'), body=[Pass()]), match_case(pattern=MatchAs(pattern=MatchSequence(patterns=[MatchAs(name='a'), MatchAs(name='b')]), name='c'), body=[Pass()]), match_case(pattern=MatchAs(pattern=MatchClass(cls=Name(id='A', ctx=Load()), patterns=[MatchAs(name='x')]), name='y'), body=[Pass()]), match_case(pattern=MatchAs(pattern=MatchOr(patterns=[MatchAs(name='a'), MatchAs(name='b')]), name='c'), body=[Pass()]), match_case(pattern=MatchSequence(patterns=[MatchAs(pattern=MatchAs(name='a'), name='b'), MatchAs(pattern=MatchAs(name='c'), name='d')]), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchAs(name='a'), guard=Compare(left=Name(id='a', ctx=Load()), ops=[Gt()], comparators=[Constant(value=1)]), body=[Pass()]), match_case(pattern=MatchAs(name='b'), guard=NamedExpr(target=Name(id='c', ctx=Store()), value=Name(id='b', ctx=Load())), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Tuple(elts=[Name(id='x', ctx=Load()), Name(id='y', ctx=Load())], ctx=Load()), cases=[match_case(pattern=MatchSequence(patterns=[MatchValue(value=Constant(value=1)), MatchValue(value=Constant(value=2))]), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Tuple(elts=[Name(id='x', ctx=Load()), Name(id='y', ctx=Load())], ctx=Load()), cases=[match_case(pattern=MatchAs(), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Tuple(elts=[Name(id='x', ctx=Load())], ctx=Load()), cases=[match_case(pattern=MatchAs(), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), cases=[match_case(pattern=MatchAs(), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchValue(value=Constant(value=1)), body=[Match(subject=Name(id='y', ctx=Load()), cases=[match_case(pattern=MatchValue(value=Constant(value=2)), body=[Pass()])])])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchValue(value=Constant(value='ab')), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchValue(value=JoinedStr(values=[Constant(value='a')])), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchClass(cls=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load())), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchOr(patterns=[MatchSequence(patterns=[MatchValue(value=Constant(value=1)), MatchValue(value=Constant(value=2))]), MatchSequence(patterns=[MatchValue(value=Constant(value=3)), MatchValue(value=Constant(value=4))])]), body=[Pass()])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchAs(pattern=MatchAs(), name='a'), body=[Pass()])])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='match', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='match', ctx=Load()), args=[Name(id='x', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Subscript(value=Name(id='match', ctx=Load()), slice=Name(id='x', ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Attribute(value=Name(id='match', ctx=Load()), attr='x', ctx=Load()))])
+#---
+SyntaxError
+#---
+Module(body=[Match(subject=UnaryOp(op=USub(), operand=Name(id='x', ctx=Load())), cases=[match_case(pattern=MatchAs(), body=[Pass()])])])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Name(id='match', ctx=Load()), Name(id='case', ctx=Load()), Name(id='_', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='case', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[Assign(targets=[Name(id='type', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='x', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Constant(value='a'))])
+#---
+Module(body=[Expr(value=Constant(value='ab'))])
+#---
+Module(body=[Expr(value=Constant(value='abc'))])
+#---
+Module(body=[Expr(value=Constant(value=b'a'))])
+#---
+Module(body=[Expr(value=Constant(value=b'ab'))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value='a\\nb'))])
+#---
+Module(body=[Expr(value=Constant(value='a\nb\tc\\d\'e"f\x07\x08\x0c\x0b\x00\x01\nSAAA'))])
+#---
+Module(body=[Expr(value=Constant(value='•'))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value=b'AA\n'))])
+#---
+Module(body=[Expr(value=Constant(value=b'\\u0041'))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value=b'\\n'))])
+#---
+Module(body=[Expr(value=Constant(value=b'\\n'))])
+#---
+Module(body=[Expr(value=Constant(value=b'\\n'))])
+#---
+Module(body=[Expr(value=Constant(value=b'\\n'))])
+#---
+Module(body=[Expr(value=Constant(value='a\\n'))])
+#---
+Module(body=[Expr(value=Constant(value='\\q'))])
+#---
+Module(body=[Expr(value=Constant(value='a\nb'))])
+#---
+Module(body=[Expr(value=Constant(value='a\nb'))])
+#---
+Module(body=[Expr(value=Constant(value='ab'))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='a')]))])
+#---
+Module(body=[Expr(value=JoinedStr())])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='y', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='a'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1), Constant(value='b')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=114)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=115)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=97)]))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='>10')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Name(id='w', ctx=Load()), conversion=-1)]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Name(id='w', ctx=Load()), conversion=-1), Constant(value='.'), FormattedValue(value=Name(id='p', ctx=Load()), conversion=-1)]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=114, format_spec=JoinedStr(values=[Constant(value='>'), FormattedValue(value=Name(id='w', ctx=Load()), conversion=-1)]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr())]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='x='), FormattedValue(value=Name(id='x', ctx=Load()), conversion=114)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='x = '), FormattedValue(value=Name(id='x', ctx=Load()), conversion=114)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='x='), FormattedValue(value=Name(id='x', ctx=Load()), conversion=114)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='x='), FormattedValue(value=Name(id='x', ctx=Load()), conversion=115)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='x='), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='>5')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value=' x = '), FormattedValue(value=Name(id='x', ctx=Load()), conversion=114, format_spec=JoinedStr(values=[Constant(value='>5')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Compare(left=Name(id='x', ctx=Load()), ops=[Eq()], comparators=[Name(id='y', ctx=Load())]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Compare(left=Name(id='x', ctx=Load()), ops=[NotEq()], comparators=[Name(id='y', ctx=Load())]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Compare(left=Name(id='x', ctx=Load()), ops=[LtE()], comparators=[Name(id='y', ctx=Load())]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Compare(left=Name(id='x', ctx=Load()), ops=[GtE()], comparators=[Name(id='y', ctx=Load())]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='{}')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='{x}')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='{'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1), Constant(value='}')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='}')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='{')]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value='b'), ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value='b'), ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value='b'), ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value='b'), ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=IfExp(test=Name(id='x', ctx=Load()), body=Constant(value='a'), orelse=Constant(value='b')), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=JoinedStr(values=[FormattedValue(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]), conversion=-1)]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=JoinedStr(values=[FormattedValue(value=Name(id='y', ctx=Load()), conversion=-1)]), conversion=-1)]))]))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Lambda(args=arguments(args=[arg(arg='x')]), body=Constant(value=1)), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='=5')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=NamedExpr(target=Name(id='x', ctx=Store()), value=Constant(value=5)), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Yield(), conversion=-1)]))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=BinOp(left=Name(id='x', ctx=Load()), op=Add(), right=Name(id='y', ctx=Load())), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='a\n'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1), Constant(value='\nb')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Subscript(value=Name(id='d', ctx=Load()), slice=Slice(lower=Constant(value=1), upper=Constant(value=2)), ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Subscript(value=Name(id='d', ctx=Load()), slice=Slice(step=Constant(value=2)), ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Subscript(value=Dict(keys=[Constant(value=1)], values=[Constant(value=2)]), slice=Constant(value=1), ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Set(elts=[Constant(value=1), Constant(value=2)]), conversion=-1)]))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='%Y-%m-%d')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Name(id='y', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='z', ctx=Load()), conversion=-1)]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='a'), FormattedValue(value=Name(id='y', ctx=Load()), conversion=-1), Constant(value='b')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=114, format_spec=JoinedStr(values=[Constant(value='^'), FormattedValue(value=Name(id='w', ctx=Load()), conversion=-1), Constant(value='.'), FormattedValue(value=Name(id='p', ctx=Load()), conversion=-1), Constant(value='f')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='ab')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='ab')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='a'), FormattedValue(value=Name(id='b', ctx=Load()), conversion=-1), Constant(value='c')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='a', ctx=Load()), conversion=-1), Constant(value='b'), FormattedValue(value=Name(id='c', ctx=Load()), conversion=-1)]))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='\n'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1), Constant(value='\t')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='\\'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='\\'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='•'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='\\n'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='\\n'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='\\n'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value=b'ab'))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=114), FormattedValue(value=Name(id='y', ctx=Load()), conversion=115)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Constant(value='a'), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Constant(value='\n'), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='\n')]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='{{}}')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Constant(value=10), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Constant(value=1500.0), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=IfExp(test=Name(id='y', ctx=Load()), body=Name(id='x', ctx=Load()), orelse=Name(id='z', ctx=Load())), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=UnaryOp(op=Not(), operand=Name(id='x', ctx=Load())), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Await(value=Name(id='x', ctx=Load())), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Call(func=Attribute(value=Attribute(value=Name(id='x', ctx=Load()), attr='y', ctx=Load()), attr='z', ctx=Load()), args=[Constant(value=1), Constant(value=2)]), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=114, format_spec=JoinedStr())]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='x='), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr())]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=114)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Dict(), conversion=-1)]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Name(id='y', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Name(id='z', ctx=Load()), conversion=-1)]))]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Name(id='y', ctx=Load()), conversion=114)]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Constant(value='a'), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Constant(value='a'), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Constant(value='a'), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[FormattedValue(value=Constant(value='a'), conversion=-1)]))]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1), Constant(value='{')]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[Constant(value='{'), FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Expr(value=JoinedStr(values=[FormattedValue(value=Name(id='x', ctx=Load()), conversion=-1), Constant(value='}')]))])
+#---
+Module(body=[Expr(value=Constant(value=1))])
+#---
+Module(body=[Expr(value=Constant(value=1000))])
+#---
+Module(body=[Expr(value=Constant(value=0))])
+#---
+Module(body=[Expr(value=Constant(value=0))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value=0))])
+#---
+Module(body=[Expr(value=Constant(value=16))])
+#---
+Module(body=[Expr(value=Constant(value=31))])
+#---
+Module(body=[Expr(value=Constant(value=65535))])
+#---
+Module(body=[Expr(value=Constant(value=15))])
+#---
+Module(body=[Expr(value=Constant(value=15))])
+#---
+Module(body=[Expr(value=Constant(value=15))])
+#---
+Module(body=[Expr(value=Constant(value=7))])
+#---
+Module(body=[Expr(value=Constant(value=5))])
+#---
+Module(body=[Expr(value=Constant(value=2))])
+#---
+Module(body=[Expr(value=Constant(value=411376139330301510538742295639337626245683966408394965837152255))])
+#---
+Module(body=[Expr(value=Constant(value=9903520314283042199192993791))])
+#---
+Module(body=[Expr(value=Constant(value=2361183241434822606847))])
+#---
+Module(body=[Expr(value=Constant(value=123456789012345678901234567890123456789012345678901234567890))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value=1.0))])
+#---
+Module(body=[Expr(value=Constant(value=1.5))])
+#---
+Module(body=[Expr(value=Constant(value=0.5))])
+#---
+Module(body=[Expr(value=Constant(value=10000000000.0))])
+#---
+Module(body=[Expr(value=Constant(value=10000000000.0))])
+#---
+Module(body=[Expr(value=Constant(value=10000000000.0))])
+#---
+Module(body=[Expr(value=Constant(value=1e-10))])
+#---
+Module(body=[Expr(value=Constant(value=10.01))])
+#---
+Module(body=[Expr(value=Constant(value=15000000000.0))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value=0.0))])
+#---
+Module(body=[Expr(value=Constant(value=1.7976931348623157e+308))])
+#---
+Module(body=[Expr(value=Constant(value=inf))])
+#---
+Module(body=[Expr(value=Constant(value=0.0))])
+#---
+Module(body=[Expr(value=Constant(value=5e-324))])
+#---
+Module(body=[Expr(value=Constant(value=123456789.12345679))])
+#---
+Module(body=[Expr(value=Constant(value=0.1))])
+#---
+Module(body=[Expr(value=Constant(value=1e+16))])
+#---
+Module(body=[Expr(value=Constant(value=1000000000000000.0))])
+#---
+Module(body=[Expr(value=Constant(value=1.5e-05))])
+#---
+Module(body=[Expr(value=Constant(value=0.0001))])
+#---
+Module(body=[Expr(value=Constant(value=1e-05))])
+#---
+Module(body=[Expr(value=Constant(value=3j))])
+#---
+Module(body=[Expr(value=Constant(value=3j))])
+#---
+Module(body=[Expr(value=Constant(value=1.5j))])
+#---
+Module(body=[Expr(value=Constant(value=1000j))])
+#---
+Module(body=[Expr(value=Constant(value=1500j))])
+#---
+Module(body=[Expr(value=Constant(value=0.5j))])
+#---
+Module(body=[Expr(value=Constant(value=0j))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Constant(value=10j))])
+#---
+Module(body=[Expr(value=IfExp(test=Name(id='x', ctx=Load()), body=Constant(value=1), orelse=Constant(value=2)))])
+#---
+Module(body=[Expr(value=IfExp(test=Name(id='x', ctx=Load()), body=Constant(value=1), orelse=Constant(value=2)))])
+#---
+Module(body=[Expr(value=BoolOp(op=Or(), values=[Constant(value=31), Compare(left=Name(id='x', ctx=Load()), ops=[In()], comparators=[Name(id='y', ctx=Load())])]))])
+#---
+Module(body=[Expr(value=BoolOp(op=Or(), values=[Constant(value=1), Constant(value=2)]))])
+#---
+Module(body=[Expr(value=Attribute(value=Constant(value=1), attr='real', ctx=Load()))])
+#---
+Module(body=[Expr(value=Attribute(value=Constant(value=1.0), attr='real', ctx=Load()))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=1), op=Add(), right=Constant(value=2)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=1), op=Add(), right=Constant(value=2)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Constant(value='a'), Constant(value='b')], values=[Constant(value=1), Constant(value=2)]))])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Pass(), Pass()])])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Pass()]), Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Pass(), Pass()])])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Pass(), Pass()])])
+#---
+SyntaxError
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[If(test=Name(id='y', ctx=Load()), body=[Pass()])])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1))])
+#---
+Module()
+#---
+Module()
+#---
+Module()
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1)), Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=2))])
+#---
+Module(body=[ClassDef(name='A', body=[FunctionDef(name='f', args=arguments(args=[arg(arg='self')]), body=[Pass()]), FunctionDef(name='g', args=arguments(args=[arg(arg='self')]), body=[Pass()])])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return(value=Constant(value=1))]), FunctionDef(name='g', args=arguments(), body=[Return(value=Constant(value=2))])])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Pass()], orelse=[If(test=Name(id='y', ctx=Load()), body=[Pass()], orelse=[Pass()])])])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=1), op=Add(), right=Constant(value=2)))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Name(id='é', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='éa', ctx=Store())], value=Constant(value=1))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Starred(value=Name(id='a', ctx=Store()), ctx=Store())], value=Name(id='b', ctx=Load()))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Tuple(elts=[Name(id='a', ctx=Store()), Starred(value=Name(id='b', ctx=Store()), ctx=Store()), Starred(value=Name(id='c', ctx=Store()), ctx=Store())], ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store())], value=Starred(value=Name(id='b', ctx=Load()), ctx=Load()))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Yield())])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[AugAssign(target=Name(id='a', ctx=Store()), op=Add(), value=Constant(value=1))])
+#---
+Module(body=[AugAssign(target=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Store()), op=Add(), value=Constant(value=1))])
+#---
+Module(body=[AugAssign(target=Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value=0), ctx=Store()), op=Add(), value=Constant(value=1))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load())], keywords=[keyword(arg='a', value=Constant(value=1))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='f', ctx=Load()), keywords=[keyword(arg='a', value=Constant(value=1)), keyword(arg='a', value=Constant(value=2))]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Starred(value=Name(id='a', ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Expr(value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Starred(value=Name(id='a', ctx=Load()), ctx=Load()))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(body=[Pass()]), ExceptHandler(type=Name(id='E', ctx=Load()), body=[Pass()])])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[AsyncFor(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), body=[Pass()])])
+#---
+Module(body=[AsyncWith(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Pass()])])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Await(value=Name(id='x', ctx=Load())))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=UnaryOp(op=USub(), operand=Await(value=Name(id='x', ctx=Load()))))])
+#---
+Module(body=[Expr(value=BinOp(left=Await(value=Name(id='x', ctx=Load())), op=Pow(), right=Constant(value=2)))])
+#---
+Module(body=[Expr(value=Await(value=Subscript(value=Call(func=Attribute(value=Name(id='x', ctx=Load()), attr='y', ctx=Load()), args=[Name(id='z', ctx=Load())]), slice=Constant(value=0), ctx=Load())))])
+#---
+Module(body=[Expr(value=Yield())])
+#---
+Module(body=[Expr(value=Yield(value=Name(id='x', ctx=Load())))])
+#---
+Module(body=[Expr(value=Yield(value=Tuple(elts=[Name(id='x', ctx=Load()), Name(id='y', ctx=Load())], ctx=Load())))])
+#---
+Module(body=[Expr(value=YieldFrom(value=Name(id='x', ctx=Load())))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=YieldFrom(value=Name(id='y', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Yield())])
+#---
+Module(body=[AugAssign(target=Name(id='x', ctx=Store()), op=Add(), value=Yield())])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Yield(value=Tuple(elts=[Name(id='y', ctx=Load()), Name(id='z', ctx=Load())], ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=YieldFrom(value=Name(id='y', ctx=Load())))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Yield()]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Name(id='a', ctx=Load()), Yield(value=Name(id='b', ctx=Load()))]))])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store())], value=IfExp(test=Name(id='c', ctx=Load()), body=Name(id='b', ctx=Load()), orelse=Yield()))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[ImportFrom(module='a.b', names=[alias(name='*')], level=0)])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b')], level=1)])
+#---
+Module(body=[ImportFrom(module='a.b', names=[alias(name='c')], level=1)])
+#---
+Module(body=[Return()])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[ClassDef(name='C', body=[Pass()], decorator_list=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Attribute(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), attr='c', ctx=Load())])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value=0), ctx=Load())])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Call(func=Call(func=Name(id='a', ctx=Load()), args=[Constant(value=1)]), args=[Constant(value=2)])])])
+#---
+Module(body=[FunctionDef(name='g', args=arguments(), body=[Pass()], decorator_list=[Lambda(args=arguments(args=[arg(arg='f')]), body=Name(id='f', ctx=Load()))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load()))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[BoolOp(op=Or(), values=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())])])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], decorator_list=[Name(id='a', ctx=Load())])])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=Not(), operand=Name(id='a', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BoolOp(op=Or(), values=[BoolOp(op=And(), values=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())]), BoolOp(op=And(), values=[Name(id='c', ctx=Load()), Name(id='d', ctx=Load())])]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Compare(left=Name(id='a', ctx=Load()), ops=[Lt(), Gt(), Eq(), NotEq(), LtE(), GtE()], comparators=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load()), Name(id='d', ctx=Load()), Name(id='e', ctx=Load()), Name(id='f', ctx=Load()), Name(id='g', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Compare(left=Name(id='a', ctx=Load()), ops=[In(), NotIn(), Is(), IsNot()], comparators=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load()), Name(id='d', ctx=Load()), Name(id='e', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BoolOp(op=Or(), values=[Name(id='a', ctx=Load()), UnaryOp(op=Not(), operand=Name(id='b', ctx=Load()))]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=UnaryOp(op=Not(), operand=Name(id='b', ctx=Load())), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='d', ctx=Load()), body=GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Name(id='c', ctx=Load())], is_async=0)]), orelse=Name(id='e', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Lambda(args=arguments(), body=Yield()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Lambda(args=arguments(), body=Lambda(args=arguments(), body=Constant(value=0))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Lambda(args=arguments(), body=Name(id='i', ctx=Load())), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Call(func=Name(id='range', ctx=Load()), args=[Constant(value=3)]), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Lambda(args=arguments(args=[arg(arg='a')], defaults=[Lambda(args=arguments(), body=Constant(value=0))]), body=Name(id='a', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Lambda(args=arguments(), body=Constant(value=0)), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Lambda(args=arguments(), body=Constant(value=0))], values=[Constant(value=1)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Name(id='a', ctx=Load()), Lambda(args=arguments(), body=Constant(value=0))], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Lambda(args=arguments(), body=Constant(value=0))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Lambda(args=arguments(), body=Constant(value=0))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Name(id='a', ctx=Load()), args=[Lambda(args=arguments(), body=Constant(value=0)), Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[GeneratorExp(elt=Name(id='x', ctx=Load()), generators=[comprehension(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), is_async=0)])]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Subscript(value=Call(func=Call(func=Attribute(value=Attribute(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), attr='c', ctx=Load()), attr='d', ctx=Load()), args=[Constant(value=1)]), args=[Constant(value=2)]), slice=Constant(value=3), ctx=Load()), attr='e', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Name(id='a', ctx=Load()), args=[Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Name(id='b', ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Constant(value=1), attr='real', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Constant(value=1.0), attr='real', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Constant(value=1), attr='real', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Constant(value='a'), attr='join', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Constant(value='ab'), attr='join', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=List(elts=[Constant(value=1), Constant(value=2)], ctx=Load()), slice=Constant(value=0), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Dict(keys=[Constant(value=1)], values=[Constant(value=2)]), slice=Constant(value=1), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()), slice=Constant(value=0), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Constant(value=Ellipsis), slice=Constant(value=0), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Constant(value=None), attr='x', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Constant(value=True), attr='x', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=JoinedStr(values=[FormattedValue(value=Name(id='a', ctx=Load()), conversion=-1)]), attr='x', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=BinOp(left=Name(id='a', ctx=Load()), op=Pow(), right=Name(id='b', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Name(id='a', ctx=Load()), op=Pow(), right=UnaryOp(op=USub(), operand=Name(id='b', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Name(id='a', ctx=Load()), op=Pow(), right=BinOp(left=Name(id='b', ctx=Load()), op=Pow(), right=Name(id='c', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=BinOp(left=Name(id='a', ctx=Load()), op=Pow(), right=Name(id='b', ctx=Load())), op=Pow(), right=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=BinOp(left=Name(id='a', ctx=Load()), op=Pow(), right=UnaryOp(op=USub(), operand=BinOp(left=Name(id='b', ctx=Load()), op=Pow(), right=UnaryOp(op=USub(), operand=Name(id='c', ctx=Load())))))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=Invert(), operand=BinOp(left=Name(id='a', ctx=Load()), op=Pow(), right=Name(id='b', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Await(value=Name(id='a', ctx=Load())), op=Pow(), right=Name(id='b', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Name(id='a', ctx=Load()), op=Mult(), right=BinOp(left=Name(id='b', ctx=Load()), op=Pow(), right=Name(id='c', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Name(id='a', ctx=Load()), op=Add(), right=BinOp(left=Name(id='b', ctx=Load()), op=Mult(), right=Name(id='c', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=BinOp(left=Name(id='a', ctx=Load()), op=Add(), right=Name(id='b', ctx=Load())), op=Mult(), right=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=BinOp(left=Name(id='a', ctx=Load()), op=Sub(), right=Name(id='b', ctx=Load())), op=Sub(), right=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=BinOp(left=Name(id='a', ctx=Load()), op=Div(), right=Name(id='b', ctx=Load())), op=Div(), right=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=BinOp(left=BinOp(left=Name(id='a', ctx=Load()), op=FloorDiv(), right=Name(id='b', ctx=Load())), op=Mod(), right=Name(id='c', ctx=Load())), op=MatMult(), right=Name(id='d', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=BinOp(left=Name(id='a', ctx=Load()), op=LShift(), right=Name(id='b', ctx=Load())), op=RShift(), right=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=BinOp(left=Name(id='a', ctx=Load()), op=BitAnd(), right=Name(id='b', ctx=Load())), op=BitOr(), right=BinOp(left=Name(id='c', ctx=Load()), op=BitXor(), right=Name(id='d', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Name(id='a', ctx=Load()), op=BitOr(), right=BinOp(left=Name(id='b', ctx=Load()), op=BitAnd(), right=Name(id='c', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Compare(left=Name(id='a', ctx=Load()), ops=[Eq()], comparators=[BinOp(left=Name(id='b', ctx=Load()), op=BitOr(), right=Name(id='c', ctx=Load()))]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BoolOp(op=And(), values=[Name(id='a', ctx=Load()), Compare(left=Name(id='b', ctx=Load()), ops=[Eq()], comparators=[Name(id='c', ctx=Load())])]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store()), Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load())), Name(id='d', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Name(id='a', ctx=Load()), IfExp(test=Name(id='c', ctx=Load()), body=Name(id='b', ctx=Load()), orelse=Name(id='d', ctx=Load()))], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load())), generators=[comprehension(target=Name(id='d', ctx=Store()), iter=Name(id='e', ctx=Load()), is_async=0)]))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=BoolOp(op=Or(), values=[Name(id='c', ctx=Load()), Name(id='d', ctx=Load())]), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), ifs=[BoolOp(op=Or(), values=[Name(id='d', ctx=Load()), Name(id='e', ctx=Load())])], is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=IfExp(test=Name(id='d', ctx=Load()), body=Name(id='c', ctx=Load()), orelse=Name(id='e', ctx=Load())), is_async=0)]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='b', ctx=Store()), Name(id='c', ctx=Store())], ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='b', ctx=Store()), Name(id='c', ctx=Store())], ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Attribute(value=Name(id='b', ctx=Load()), attr='c', ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value=0), ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Starred(value=Name(id='b', ctx=Store()), ctx=Store()), Name(id='c', ctx=Store())], ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0), comprehension(target=Name(id='d', ctx=Store()), iter=Name(id='e', ctx=Load()), is_async=0), comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='g', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0), comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=DictComp(key=Name(id='a', ctx=Load()), value=ListComp(elt=Name(id='b', ctx=Load()), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)]), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=NamedExpr(target=Name(id='a', ctx=Store()), value=Constant(value=1)), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=NamedExpr(target=Name(id='a', ctx=Store()), value=Constant(value=1)), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), ifs=[NamedExpr(target=Name(id='d', ctx=Store()), value=Name(id='b', ctx=Load()))], is_async=0)]))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=1)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=SetComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=1)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=DictComp(key=Name(id='a', ctx=Load()), value=Name(id='b', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=1)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0), comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=1)]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Subscript(value=Call(func=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load())]), args=[Name(id='b', ctx=Load())]), slice=Name(id='c', ctx=Load()), ctx=Load()), attr='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Subscript(value=Attribute(value=Call(func=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), args=[Name(id='c', ctx=Load())]), attr='d', ctx=Load()), slice=Name(id='e', ctx=Load()), ctx=Load()), args=[Name(id='f', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value='a'), op=Mod(), right=Name(id='b', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=b'a'), op=Mod(), right=Name(id='b', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Name(id='a', ctx=Load()), op=Mod(), right=Constant(value='b')))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=Constant(value=1)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=Constant(value=1)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=UAdd(), operand=Constant(value=1)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=Invert(), operand=Constant(value=1)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=Not(), operand=Constant(value=1)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=Constant(value=1)))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=UnaryOp(op=USub(), operand=Constant(value=1))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=UnaryOp(op=USub(), operand=Constant(value=1))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=UnaryOp(op=USub(), operand=UnaryOp(op=UAdd(), operand=UnaryOp(op=USub(), operand=Constant(value=1)))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=1), op=Sub(), right=UnaryOp(op=USub(), operand=Constant(value=1))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=1), op=Sub(), right=UnaryOp(op=USub(), operand=Constant(value=1))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=1), op=Add(), right=UnaryOp(op=USub(), operand=Constant(value=1))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=IfExp(test=Name(id='d', ctx=Load()), body=Name(id='c', ctx=Load()), orelse=IfExp(test=Name(id='f', ctx=Load()), body=Name(id='e', ctx=Load()), orelse=Name(id='g', ctx=Load())))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BoolOp(op=Or(), values=[Name(id='a', ctx=Load()), IfExp(test=Name(id='c', ctx=Load()), body=Name(id='b', ctx=Load()), orelse=Name(id='d', ctx=Load()))]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='c', ctx=Load()), body=BoolOp(op=Or(), values=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())]), orelse=Name(id='d', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=BoolOp(op=Or(), values=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load())]), body=Name(id='a', ctx=Load()), orelse=Name(id='d', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=IfExp(test=Name(id='c', ctx=Load()), body=Name(id='b', ctx=Load()), orelse=Name(id='d', ctx=Load())), body=Name(id='a', ctx=Load()), orelse=Name(id='e', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=IfExp(test=Name(id='d', ctx=Load()), body=Name(id='c', ctx=Load()), orelse=Name(id='e', ctx=Load()))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Name(id='a', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Tuple(elts=[Name(id='a', ctx=Load())], ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Name(id='a', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[List(elts=[Name(id='a', ctx=Load())], ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load())], values=[Name(id='c', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Name(id='a', ctx=Load())], values=[Tuple(elts=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load())], ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Name(id='a', ctx=Load()), None, Name(id='d', ctx=Load())], values=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load()), Name(id='e', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load()), Name(id='c', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Name(id='a', ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[None], values=[Name(id='a', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Name(id='a', ctx=Load())], values=[Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Name(id='a', ctx=Load())]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Name(id='a', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Name(id='a', ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Starred(value=Name(id='a', ctx=Load()), ctx=Load())], keywords=[keyword(arg='sep', value=Constant(value=''))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Name(id='a', ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load()), Name(id='c', ctx=Load()), Starred(value=Name(id='d', ctx=Load()), ctx=Load())], keywords=[keyword(arg='e', value=Constant(value=1)), keyword(value=Name(id='f', ctx=Load()))]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Call(func=Call(func=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load())]), args=[Name(id='b', ctx=Load())]), args=[Name(id='c', ctx=Load())]), args=[Name(id='d', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Subscript(value=Call(func=Subscript(value=Name(id='x', ctx=Load()), slice=Name(id='a', ctx=Load()), ctx=Load()), args=[Name(id='b', ctx=Load())]), slice=Name(id='c', ctx=Load()), ctx=Load()), args=[Name(id='d', ctx=Load())]))])
+#---
+Module(body=[ClassDef(name='A', bases=[Name(id='B', ctx=Load())], body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1)), FunctionDef(name='f', args=arguments(args=[arg(arg='self')]), body=[Pass()]), FunctionDef(name='g', args=arguments(args=[arg(arg='self')]), body=[Return(value=Attribute(value=Name(id='self', ctx=Load()), attr='_g', ctx=Load()))], decorator_list=[Name(id='property', ctx=Load())]), FunctionDef(name='g', args=arguments(args=[arg(arg='self'), arg(arg='v')]), body=[Assign(targets=[Attribute(value=Name(id='self', ctx=Load()), attr='_g', ctx=Store())], value=Name(id='v', ctx=Load()))], decorator_list=[Attribute(value=Name(id='g', ctx=Load()), attr='setter', ctx=Load())])])])
+#---
+Module(body=[ClassDef(name='A', body=[Expr(value=Constant(value='doc')), AnnAssign(target=Name(id='x', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=1), simple=1), AnnAssign(target=Name(id='y', ctx=Store()), annotation=Name(id='str', ctx=Load()), simple=1)])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a'), arg(arg='b')]), body=[Expr(value=Constant(value='doc')), Assign(targets=[Name(id='c', ctx=Store())], value=BinOp(left=Name(id='a', ctx=Load()), op=Add(), right=Name(id='b', ctx=Load()))), Return(value=Name(id='c', ctx=Load()))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Global(names=['x']), Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1)), FunctionDef(name='g', args=arguments(), body=[Nonlocal(names=['y']), Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=2))])])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a'), arg(arg='b')], vararg=arg(arg='args'), kwonlyargs=[arg(arg='c'), arg(arg='d')], kw_defaults=[None, Constant(value=2)], kwarg=arg(arg='kwargs'), defaults=[Constant(value=1)]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a')], args=[arg(arg='b')], kwonlyargs=[arg(arg='c')], kw_defaults=[None]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a')], args=[arg(arg='b')], kwonlyargs=[arg(arg='c')], kw_defaults=[Constant(value=3)], defaults=[Constant(value=1), Constant(value=2)]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a', annotation=Name(id='int', ctx=Load()))], args=[arg(arg='b', annotation=Name(id='int', ctx=Load()))], vararg=arg(arg='args', annotation=Name(id='int', ctx=Load())), kwonlyargs=[arg(arg='c', annotation=Name(id='int', ctx=Load())), arg(arg='d', annotation=Name(id='int', ctx=Load()))], kw_defaults=[None, Constant(value=2)], kwarg=arg(arg='kwargs', annotation=Name(id='int', ctx=Load())), defaults=[Constant(value=1)]), body=[Pass()], returns=Name(id='int', ctx=Load()))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a'), arg(arg='b')], args=[arg(arg='c'), arg(arg='d')], kwonlyargs=[arg(arg='e'), arg(arg='f')], kw_defaults=[None, None]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a')], kwonlyargs=[arg(arg='b')], kw_defaults=[None]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a')], vararg=arg(arg='args')), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(posonlyargs=[arg(arg='a')], kwarg=arg(arg='kwargs')), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(vararg=arg(arg='args'), kwonlyargs=[arg(arg='a')], kw_defaults=[None]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(vararg=arg(arg='args'), kwonlyargs=[arg(arg='a')], kw_defaults=[Constant(value=1)]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(vararg=arg(arg='args'), kwonlyargs=[arg(arg='a'), arg(arg='b')], kw_defaults=[Constant(value=1), None]), body=[Pass()])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Lambda(args=arguments(posonlyargs=[arg(arg='a')]), body=Constant(value=0)))])
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Lambda(args=arguments(vararg=arg(arg='a'), kwonlyargs=[arg(arg='b')], kw_defaults=[None]), body=Constant(value=0)))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(kwonlyargs=[arg(arg='a')], kw_defaults=[None]), body=Constant(value=0)))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(kwarg=arg(arg='a')), body=Constant(value=0)))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(args=[arg(arg='a')], vararg=arg(arg='b'), kwonlyargs=[arg(arg='c')], kw_defaults=[Constant(value=1)], kwarg=arg(arg='d')), body=Constant(value=0)))])
+#---
+Module(body=[Expr(value=Lambda(args=arguments(args=[arg(arg='a')]), body=Lambda(args=arguments(args=[arg(arg='b')]), body=Lambda(args=arguments(args=[arg(arg='c')]), body=Constant(value=0)))))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Lambda(args=arguments(args=[arg(arg='a'), arg(arg='b')], defaults=[Constant(value=1)]), body=BinOp(left=Name(id='a', ctx=Load()), op=Add(), right=Name(id='b', ctx=Load()))), args=[Constant(value=1)]))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return(value=Name(id='a', ctx=Load()))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return(value=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return(value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return(value=Yield())])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Return(value=Await(value=Name(id='x', ctx=Load())))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Expr(value=Yield()), Expr(value=Yield(value=Constant(value=1))), Expr(value=Yield(value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))), Expr(value=Yield(value=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))), Assign(targets=[Name(id='x', ctx=Store())], value=Yield()), Assign(targets=[Name(id='x', ctx=Store())], value=Yield(value=Constant(value=1))), Assign(targets=[Name(id='x', ctx=Store())], value=Yield(value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))), Assign(targets=[Name(id='x', ctx=Store())], value=YieldFrom(value=Name(id='y', ctx=Load()))), AugAssign(target=Name(id='x', ctx=Store()), op=Add(), value=Yield(value=Constant(value=1))), Expr(value=Await(value=Name(id='y', ctx=Load())))])])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Constant(value=True), body=Constant(value=1), orelse=Constant(value=2)))])
+#---
+Module(body=[If(test=Constant(value=True), body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1))])])
+#---
+Module(body=[If(test=Constant(value=True), body=[Pass()], orelse=[If(test=Constant(value=True), body=[Pass()])])])
+#---
+Module(body=[If(test=Name(id='a', ctx=Load()), body=[Pass()], orelse=[If(test=Name(id='b', ctx=Load()), body=[If(test=Name(id='c', ctx=Load()), body=[Pass()])], orelse=[Pass()])])])
+#---
+Module(body=[While(test=Constant(value=True), body=[If(test=Name(id='a', ctx=Load()), body=[Break()], orelse=[If(test=Name(id='b', ctx=Load()), body=[Continue()], orelse=[Pass()])])])])
+#---
+Module(body=[For(target=Name(id='i', ctx=Store()), iter=Call(func=Name(id='range', ctx=Load()), args=[Constant(value=10)]), body=[For(target=Name(id='j', ctx=Store()), iter=Call(func=Name(id='range', ctx=Load()), args=[Constant(value=10)]), body=[If(test=Compare(left=Name(id='i', ctx=Load()), ops=[Eq()], comparators=[Name(id='j', ctx=Load())]), body=[Continue()]), Break()], orelse=[Pass()])], orelse=[Pass()])])
+#---
+Module(body=[Try(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=Name(id='A', ctx=Load()), body=[Pass()])])], handlers=[ExceptHandler(type=Name(id='B', ctx=Load()), body=[Pass()])])])
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load()), body=[Pass()]), ExceptHandler(type=Attribute(value=Name(id='A', ctx=Load()), attr='B', ctx=Load()), body=[Pass()]), ExceptHandler(type=Attribute(value=Name(id='A', ctx=Load()), attr='B', ctx=Load()), name='c', body=[Pass()]), ExceptHandler(type=Tuple(elts=[Attribute(value=Name(id='A', ctx=Load()), attr='B', ctx=Load()), Name(id='C', ctx=Load())], ctx=Load()), name='d', body=[Pass()])])])
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=BoolOp(op=Or(), values=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())]), body=[Pass()])])])
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=IfExp(test=Name(id='b', ctx=Load()), body=Name(id='A', ctx=Load()), orelse=Name(id='C', ctx=Load())), body=[Pass()])])])
+#---
+SyntaxError
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load()), Name(id='C', ctx=Load())], ctx=Load()), body=[Pass()])])])
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(type=Tuple(elts=[Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load()), Name(id='C', ctx=Load())], ctx=Load()), body=[Pass()])])])
+#---
+SyntaxError
+#---
+Module(body=[TryStar(body=[Pass()], handlers=[ExceptHandler(type=Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load()), body=[Pass()])])])
+#---
+SyntaxError
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(body=[Pass()])], orelse=[Pass()], finalbody=[Pass()])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load())), withitem(context_expr=Name(id='b', ctx=Load())), withitem(context_expr=Name(id='c', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store())), withitem(context_expr=Name(id='e', ctx=Load()), optional_vars=Name(id='f', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load())), withitem(context_expr=Name(id='b', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load())), withitem(context_expr=Name(id='c', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), optional_vars=Name(id='c', ctx=Store())), withitem(context_expr=Name(id='d', ctx=Load()))], body=[Pass()])])
+#---
+SyntaxError
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load())), withitem(context_expr=Name(id='b', ctx=Load()), optional_vars=Name(id='c', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Call(func=Name(id='a', ctx=Load()), args=[Name(id='b', ctx=Load())]))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Subscript(value=Name(id='a', ctx=Load()), slice=Name(id='b', ctx=Load()), ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=BinOp(left=Name(id='a', ctx=Load()), op=Add(), right=Name(id='b', ctx=Load())))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Subscript(value=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), slice=Constant(value=0), ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]), optional_vars=Name(id='c', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), optional_vars=Name(id='c', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store())), withitem(context_expr=Tuple(elts=[Name(id='c', ctx=Load()), Name(id='d', ctx=Load())], ctx=Load()), optional_vars=Name(id='e', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Tuple(elts=[Name(id='b', ctx=Store()), Name(id='c', ctx=Store())], ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=List(elts=[Name(id='b', ctx=Store()), Name(id='c', ctx=Store())], ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Attribute(value=Name(id='b', ctx=Load()), attr='c', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value=0), ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Starred(value=Name(id='b', ctx=Store()), ctx=Store()))], body=[Pass()])])
+#---
+SyntaxError
+#---
+Module(body=[With(items=[withitem(context_expr=Tuple(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()))], body=[Pass()])])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=NamedExpr(target=Name(id='a', ctx=Store()), value=Name(id='b', ctx=Load())))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=NamedExpr(target=Name(id='a', ctx=Store()), value=Name(id='b', ctx=Load())), optional_vars=Name(id='c', ctx=Store()))], body=[Pass()])])
+#---
+SyntaxError
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Pass()]), With(items=[withitem(context_expr=Name(id='b', ctx=Load()))], body=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store()))], body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1))])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()), optional_vars=Name(id='b', ctx=Store()))], body=[With(items=[withitem(context_expr=Name(id='c', ctx=Load()), optional_vars=Name(id='d', ctx=Store()))], body=[Pass()])])])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Constant(value=1), Constant(value=2)], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Constant(value=1), Constant(value=2), Constant(value=3)], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], keywords=[keyword(arg='c', value=Name(id='d', ctx=Load()))]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Call(func=Name(id='f', ctx=Load()), args=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())]), args=[Name(id='c', ctx=Load()), Name(id='d', ctx=Load())]))])
+#---
+Module(body=[If(test=BoolOp(op=And(), values=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())]), body=[Pass()])])
+#---
+Module(body=[If(test=BoolOp(op=And(), values=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())]), body=[Pass()])])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value='\n'))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value='ab'))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=JoinedStr(values=[Constant(value='ab'), FormattedValue(value=Name(id='c', ctx=Load()), conversion=-1)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Constant(value='a'), Constant(value='b')], values=[Constant(value=1), Constant(value=2)]))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a'), arg(arg='b')]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a'), arg(arg='b')]), body=[Pass()])])
+#---
+Module(body=[ClassDef(name='A', bases=[Name(id='B', ctx=Load()), Name(id='C', ctx=Load())], body=[Pass()])])
+#---
+Module(body=[ImportFrom(module='a', names=[alias(name='b'), alias(name='c')], level=0)])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Attribute(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), attr='c', ctx=Load()), attr='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Attribute(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), attr='c', ctx=Load()), attr='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1)), Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=2)), Assign(targets=[Name(id='z', ctx=Store())], value=Constant(value=3))])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=1)), Assign(targets=[Name(id='z', ctx=Store())], value=Constant(value=2))])])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=1)), Assign(targets=[Name(id='z', ctx=Store())], value=Constant(value=2))])])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Pass(), Pass()], orelse=[Pass()])])
+#---
+Module(body=[ClassDef(name='A', body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1)), Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=2))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1)), Return(value=Name(id='x', ctx=Load()))])])
+#---
+Module(body=[While(test=Name(id='x', ctx=Load()), body=[Assign(targets=[Name(id='y', ctx=Store())], value=Constant(value=1)), Break()])])
+#---
+Module(body=[For(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), body=[Pass(), Continue()])])
+#---
+Module(body=[Try(body=[Pass()], handlers=[ExceptHandler(body=[Pass()])], finalbody=[Pass()])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Pass(), Pass()])])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=IfExp(test=Name(id='y', ctx=Load()), body=Constant(value=1), orelse=Constant(value=2))), Assign(targets=[Name(id='z', ctx=Store())], value=Constant(value=3))])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store()), Name(id='c', ctx=Store()), Name(id='d', ctx=Store())], value=Name(id='e', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store()), Tuple(elts=[Name(id='b', ctx=Store()), Name(id='c', ctx=Store())], ctx=Store())], value=Tuple(elts=[Name(id='d', ctx=Load()), Name(id='e', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value=0), ctx=Store()), Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value=1), ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Store()), Attribute(value=Name(id='c', ctx=Load()), attr='d', ctx=Store())], value=Name(id='e', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), Tuple(elts=[Name(id='c', ctx=Store()), Name(id='d', ctx=Store())], ctx=Store())], value=Tuple(elts=[Name(id='e', ctx=Load()), Name(id='f', ctx=Load())], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), Tuple(elts=[Name(id='c', ctx=Store()), Name(id='d', ctx=Store())], ctx=Store())], value=Name(id='e', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[List(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), List(elts=[Name(id='c', ctx=Store()), Name(id='d', ctx=Store())], ctx=Store())], value=Name(id='e', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store())], value=Yield())])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], value=Yield())])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], value=Yield(value=Name(id='c', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='a', ctx=Store())], value=Yield())])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Tuple(elts=[Constant(value=1), Constant(value=2)], ctx=Load()), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Tuple(elts=[Starred(value=Name(id='b', ctx=Load()), ctx=Load()), Name(id='c', ctx=Load())], ctx=Load()), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Yield(), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Yield(value=Name(id='b', ctx=Load())), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Yield(), simple=1)])
+#---
+SyntaxError
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Lambda(args=arguments(), body=Constant(value=0)), value=Constant(value=1), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=IfExp(test=Name(id='c', ctx=Load()), body=Name(id='b', ctx=Load()), orelse=Name(id='d', ctx=Load())), value=Constant(value=1), simple=1)])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=List(elts=[Name(id='int', ctx=Load())], ctx=Load()), value=List(ctx=Load()), simple=1)])
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Subscript(value=Name(id='dict', ctx=Load()), slice=Tuple(elts=[Name(id='str', ctx=Load()), Name(id='int', ctx=Load())], ctx=Load()), ctx=Load()), value=Dict(), simple=1)])
+#---
+Module(body=[AnnAssign(target=Attribute(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), attr='c', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=0)])
+#---
+Module(body=[AnnAssign(target=Subscript(value=Subscript(value=Name(id='a', ctx=Load()), slice=Name(id='b', ctx=Load()), ctx=Load()), slice=Name(id='c', ctx=Load()), ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=1), simple=0)])
+#---
+Module(body=[AnnAssign(target=Attribute(value=Call(func=Name(id='a', ctx=Load())), attr='b', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=0)])
+#---
+SyntaxError
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=0)])
+#---
+Module(body=[AnnAssign(target=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=0)])
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=0)])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=1), simple=1), AnnAssign(target=Name(id='b', ctx=Store()), annotation=Name(id='str', ctx=Load()), simple=1)])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=1), AnnAssign(target=Name(id='b', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=1), simple=1)])])
+#---
+Module(body=[ClassDef(name='A', body=[AnnAssign(target=Name(id='a', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=1), AnnAssign(target=Name(id='b', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=1), simple=1)])])
+#---
+Module(body=[For(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), body=[AnnAssign(target=Name(id='z', ctx=Store()), annotation=Name(id='int', ctx=Load()), simple=1)])])
+#---
+Module(body=[AnnAssign(target=Name(id='x', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=IfExp(test=Name(id='z', ctx=Load()), body=Name(id='y', ctx=Load()), orelse=Name(id='w', ctx=Load())), simple=1)])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[AnnAssign(target=Name(id='y', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=1), simple=1)])])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Constant(value='abc')]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='a', ctx=Load()), conversion=-1), Constant(value='b'), FormattedValue(value=Name(id='c', ctx=Load()), conversion=-1)])]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Starred(value=Name(id='args', ctx=Load()), ctx=Load())], keywords=[keyword(value=Name(id='kwargs', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Starred(value=Name(id='args', ctx=Load()), ctx=Load()), Name(id='a', ctx=Load())], keywords=[keyword(value=Name(id='kwargs', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Name(id='a', ctx=Load()), Starred(value=Name(id='args', ctx=Load()), ctx=Load()), Name(id='b', ctx=Load())], keywords=[keyword(value=Name(id='kwargs', ctx=Load())), keyword(arg='c', value=Constant(value=1))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Starred(value=Name(id='args', ctx=Load()), ctx=Load())], keywords=[keyword(arg='a', value=Constant(value=1))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), keywords=[keyword(value=Name(id='a', ctx=Load())), keyword(value=Name(id='b', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load()), Name(id='c', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)])]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]), Name(id='c', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Name(id='a', ctx=Load()), GeneratorExp(elt=Name(id='b', ctx=Load()), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)])]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)])]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)])]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[NamedExpr(target=Name(id='a', ctx=Store()), value=Constant(value=1))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[NamedExpr(target=Name(id='a', ctx=Store()), value=Constant(value=1)), NamedExpr(target=Name(id='b', ctx=Store()), value=Constant(value=2))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), keywords=[keyword(arg='a', value=NamedExpr(target=Name(id='b', ctx=Store()), value=Constant(value=1)))]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[IfExp(test=Name(id='b', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='c', ctx=Load())), Name(id='d', ctx=Load())]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Lambda(args=arguments(), body=Constant(value=0))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Lambda(args=arguments(args=[arg(arg='a'), arg(arg='b')]), body=Constant(value=0)), Constant(value=1)]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[UnaryOp(op=Not(), operand=Name(id='a', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[UnaryOp(op=USub(), operand=Name(id='a', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Await(value=Name(id='a', ctx=Load()))]))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Name(id='a', ctx=Load()), Await(value=Name(id='b', ctx=Load()))]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load())), Slice(lower=Name(id='d', ctx=Load()), upper=Name(id='e', ctx=Load()))], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load())), Name(id='d', ctx=Load())], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Name(id='b', ctx=Load()), Slice(lower=Name(id='c', ctx=Load()), upper=Name(id='d', ctx=Load()))], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load())), ctx=Load()), slice=Slice(lower=Name(id='d', ctx=Load()), upper=Name(id='e', ctx=Load())), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Slice(), Slice()], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Constant(value=Ellipsis), Constant(value=0)], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Constant(value=0), Constant(value=Ellipsis)], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Slice(), Slice()], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=IfExp(test=Name(id='c', ctx=Load()), body=Name(id='b', ctx=Load()), orelse=Name(id='d', ctx=Load())), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=IfExp(test=Name(id='c', ctx=Load()), body=Name(id='b', ctx=Load()), orelse=Name(id='d', ctx=Load())), upper=Name(id='e', ctx=Load())), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=Name(id='b', ctx=Load()), upper=IfExp(test=Name(id='d', ctx=Load()), body=Name(id='c', ctx=Load()), orelse=Name(id='e', ctx=Load()))), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Lambda(args=arguments(), body=Constant(value=0)), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=Lambda(args=arguments(), body=Constant(value=0)), upper=Constant(value=1)), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[NamedExpr(target=Name(id='b', ctx=Store()), value=Constant(value=1)), Name(id='c', ctx=Load())], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=NamedExpr(target=Name(id='b', ctx=Store()), value=Constant(value=1)), upper=Name(id='c', ctx=Load())), ctx=Load()))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=UnaryOp(op=USub(), operand=Constant(value=1))), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(upper=UnaryOp(op=USub(), operand=Constant(value=1))), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Slice(step=UnaryOp(op=USub(), operand=Constant(value=1))), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store()), Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load()), step=Name(id='d', ctx=Load())), ctx=Store())], value=Constant(value=1))])
+#---
+SyntaxError
+#---
+Module(body=[Delete(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load()), step=Name(id='d', ctx=Load())), ctx=Del())])])
+#---
+Module(body=[Delete(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load())), Name(id='d', ctx=Load())], ctx=Load()), ctx=Del())])])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load())), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Name(id='b', ctx=Load()), Name(id='c', ctx=Load())], ctx=Load()), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Slice(lower=Name(id='b', ctx=Load()), upper=Name(id='c', ctx=Load())), Name(id='d', ctx=Load())], ctx=Load()), ctx=Store())], value=Name(id='e', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Starred(value=Name(id='b', ctx=Load()), ctx=Load())], ctx=Load()), ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Starred(value=Name(id='b', ctx=Load()), ctx=Load()), Name(id='c', ctx=Load())], ctx=Load()), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Tuple(elts=[Name(id='b', ctx=Load()), Starred(value=Name(id='c', ctx=Load()), ctx=Load())], ctx=Load()), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Name(id='b', ctx=Load()), ctx=Store()), Name(id='c', ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Subscript(value=Name(id='a', ctx=Load()), slice=Name(id='b', ctx=Load()), ctx=Load()), slice=Name(id='c', ctx=Load()), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Attribute(value=Subscript(value=Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Load()), slice=Name(id='c', ctx=Load()), ctx=Load()), attr='d', ctx=Store())], value=Name(id='e', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Attribute(value=Call(func=Name(id='a', ctx=Load())), attr='b', ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Call(func=Name(id='a', ctx=Load())), slice=Name(id='b', ctx=Load()), ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='a', ctx=Load()), slice=Name(id='b', ctx=Load()), ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Attribute(value=Name(id='a', ctx=Load()), attr='b', ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Tuple(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), slice=Name(id='c', ctx=Load()), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=List(elts=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())], ctx=Load()), slice=Name(id='c', ctx=Load()), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Dict(keys=[Name(id='a', ctx=Load())], values=[Name(id='b', ctx=Load())]), slice=Name(id='c', ctx=Load()), ctx=Store())], value=Name(id='d', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Constant(value='a'), slice=Name(id='b', ctx=Load()), ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Attribute(value=Constant(value='a'), attr='b', ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Constant(value=1), slice=Name(id='b', ctx=Load()), ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Attribute(value=Constant(value=1), attr='b', ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Constant(value=None), slice=Name(id='b', ctx=Load()), ctx=Store())], value=Name(id='c', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]), slice=Constant(value=0), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=GeneratorExp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]), attr='send', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Attribute(value=SetComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), is_async=0)]), attr='pop', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Attribute(value=DictComp(key=Name(id='a', ctx=Load()), value=Name(id='b', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0)]), attr='get', ctx=Load()), args=[Name(id='d', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Lambda(args=arguments(), body=Attribute(value=Constant(value=0), attr='real', ctx=Load())))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=Lambda(args=arguments(), body=Constant(value=0)), attr='real', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Attribute(value=JoinedStr(values=[FormattedValue(value=Name(id='a', ctx=Load()), conversion=-1)]), attr='b', ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=JoinedStr(values=[FormattedValue(value=Name(id='a', ctx=Load()), conversion=-1)]), slice=Constant(value=0), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=JoinedStr(values=[FormattedValue(value=Name(id='a', ctx=Load()), conversion=-1)])))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Constant(value=b'a'), slice=Constant(value=0), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=Ellipsis))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=BinOp(left=Constant(value=Ellipsis), op=Add(), right=Constant(value=1)))])
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Constant(value=Ellipsis)], ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=Ellipsis))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Constant(value=Ellipsis)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Constant(value=Ellipsis)], values=[Constant(value=Ellipsis)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Call(func=Name(id='f', ctx=Load()), args=[Constant(value=Ellipsis)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Subscript(value=Name(id='a', ctx=Load()), slice=Constant(value=Ellipsis), ctx=Load()))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a')], defaults=[Constant(value=Ellipsis)]), body=[Pass()])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='a', annotation=Constant(value=Ellipsis))], defaults=[Constant(value=Ellipsis)]), body=[Pass()], returns=Constant(value=Ellipsis))])
+#---
+Module(body=[AnnAssign(target=Name(id='x', ctx=Store()), annotation=Constant(value=Ellipsis), value=Constant(value=Ellipsis), simple=1)])
+#---
+Module(body=[ClassDef(name='A', body=[Expr(value=Constant(value=Ellipsis))])])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Expr(value=Constant(value=Ellipsis))])])
+#---
+Module(body=[If(test=Name(id='x', ctx=Load()), body=[Expr(value=Constant(value=Ellipsis))])])
+#---
+Module(body=[While(test=Name(id='x', ctx=Load()), body=[Expr(value=Constant(value=Ellipsis))])])
+#---
+Module(body=[For(target=Name(id='x', ctx=Store()), iter=Name(id='y', ctx=Load()), body=[Expr(value=Constant(value=Ellipsis))])])
+#---
+Module(body=[Try(body=[Expr(value=Constant(value=Ellipsis))], handlers=[ExceptHandler(body=[Expr(value=Constant(value=Ellipsis))])])])
+#---
+Module(body=[With(items=[withitem(context_expr=Name(id='a', ctx=Load()))], body=[Expr(value=Constant(value=Ellipsis))])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchAs(), body=[Expr(value=Constant(value=Ellipsis))])])])
+#---
+Module(body=[Match(subject=Name(id='x', ctx=Load()), cases=[match_case(pattern=MatchOr(patterns=[MatchSequence(), MatchSequence()]), body=[Expr(value=Constant(value=Ellipsis))])])])
+#---
+Module(body=[ClassDef(name='A', body=[FunctionDef(name='f', args=arguments(args=[arg(arg='self')]), body=[Expr(value=Constant(value=Ellipsis))]), FunctionDef(name='g', args=arguments(args=[arg(arg='self')]), body=[Expr(value=Constant(value=Ellipsis))])])])
+#---
+Module(body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Constant(value='hello')], keywords=[keyword(arg='file', value=Attribute(value=Name(id='sys', ctx=Load()), attr='stderr', ctx=Load()))]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Expr(value=Tuple(elts=[BinOp(left=Name(id='print', ctx=Load()), op=RShift(), right=Name(id='f', ctx=Load())), Name(id='x', ctx=Load())], ctx=Load()))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Constant(value=1), Constant(value=2), Constant(value=3)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Constant(value=1), Constant(value=3)], values=[Constant(value=2), Constant(value=4)]))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[Constant(value=1), None], values=[Constant(value=2), Name(id='a', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[None, Constant(value=1)], values=[Name(id='a', ctx=Load()), Constant(value=2)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Dict(keys=[None, None], values=[Name(id='a', ctx=Load()), Name(id='b', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Set(elts=[Starred(value=Name(id='a', ctx=Load()), ctx=Load()), Starred(value=Name(id='b', ctx=Load()), ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=DictComp(key=Name(id='a', ctx=Load()), value=Name(id='b', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='a', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), iter=Name(id='c', ctx=Load()), ifs=[Name(id='d', ctx=Load())], is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=SetComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Name(id='c', ctx=Load())], is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=DictComp(key=Name(id='a', ctx=Load()), value=Name(id='b', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='c', ctx=Load()), is_async=0), comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='d', ctx=Load()), is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=DictComp(key=Name(id='a', ctx=Load()), value=Name(id='b', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='c', ctx=Load()), ifs=[Name(id='d', ctx=Load())], is_async=0), comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='e', ctx=Load()), ifs=[Name(id='f', ctx=Load())], is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Name(id='c', ctx=Load())], is_async=0), comprehension(target=Name(id='d', ctx=Store()), iter=Name(id='e', ctx=Load()), ifs=[Name(id='f', ctx=Load())], is_async=0)]))])
+#---
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Name(id='c', ctx=Load()), Name(id='d', ctx=Load())], is_async=0), comprehension(target=Name(id='e', ctx=Store()), iter=Name(id='f', ctx=Load()), ifs=[Name(id='g', ctx=Load()), Name(id='h', ctx=Load())], is_async=0)]))])

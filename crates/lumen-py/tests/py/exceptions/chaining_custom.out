@@ -1,0 +1,19 @@
+NotFound row 404 ('row',) True
+DbError True True
+high ValueError('low') ValueError('low') True
+None ValueError('low') False
+None ValueError('low') True
+KeyError('b')
+handling
+outer got orig
+AppError() () True
+AppError('m') AppError('m', 1) ('m', 1)
+ValueError() KeyError('k') 'k' OSError('x')
+None None None
+1 ('v',)
+(5, 6) (5, 6)
+custom! Custom('r')
+custom!
+ValueError
+cannot raise int
+bad cause

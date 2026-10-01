@@ -1,0 +1,23 @@
+3 55
+['A', 'B', 'C'] ['a:0', 'b:0', 'c:0', 'a:1', 'b:1', 'a:2']
+[3, 7, 11] 21
+[]
+2 ValueError ('boom',)
+gather raised first
+False []
+True True ['t1:0', 't2:0', 't1:1', 't2:1']
+T1 T2 T1 True
+task raised task failure True ValueError
+t4 cancelled True ['cancelled']
+inside 1
+after 11
+[0, 1, 4, 9, 16]
+4
+[0, 10, 20, 30]
+['in1', 'out1', 'in2', 'out2', 'in3', 'out3']
+False False
+released
+timeout
+5
+main done
+42

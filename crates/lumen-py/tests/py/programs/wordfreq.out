@@ -1,0 +1,48 @@
+total words: 186 unique: 86
+longest: superlative
+top 10 overall:
+  the          18 ##################
+  of           16 ################
+  was          12 ############
+  it           11 ###########
+  a             8 ########
+  were          5 #####
+  in            4 ####
+  we            4 ####
+  with          4 ####
+  and           3 ###
+top 10 content: [('were', 5), ('age', 2), ('all', 2), ('before', 2), ('direct', 2), ('epoch', 2), ('face', 2), ('going', 2), ('had', 2), ('jaw', 2)]
+len  1:   1 words: a
+len  2:   9 words: in, it, of, on, or, ... (+4)
+len  3:  11 words: age, all, and, far, for, ... (+6)
+len  4:  16 words: best, both, ever, evil, face, ... (+11)
+len  5:  14 words: being, epoch, going, large, light, ... (+9)
+len  6:  15 words: before, belief, degree, direct, fishes, ... (+10)
+len  7:   8 words: clearer, crystal, despair, england, general, ... (+3)
+len  8:   4 words: darkness, insisted, noisiest, received
+len  9:   2 words: countries, preserves
+len 10:   2 words: comparison, everything
+len 11:   4 words: authorities, foolishness, incredulity, superlative
+top bigrams: [('it was', 11), ('was the', 10), ('with a', 4), ('a king', 2), ('a large', 2), ('a queen', 2)]
+top trigram: [('it was the', 10), ('a king with', 2), ('a large jaw', 2)]
+letters: e110 t73 i59 o58 a57 s54 r48 h45 
+vowel ratio: 0.398
+first seen order: ['it', 'was', 'the', 'best', 'of', 'times', 'worst', 'age', 'wisdom', 'foolishness', 'epoch', 'belief']
+longest span: of
+4 [119, 20, 20, 27]
+avg word length 3.946
+14 81 'that some of its noisiest auth'
+caps: ['Darkness', 'England;', 'France.', 'Heaven', 'In', 'It', 'Light', 'State', 'There']
+[]
+  1 ->  53 words
+  2 ->  21 words
+  3 ->   3 words
+  4 ->   3 words
+  5 ->   1 words
+  8 ->   1 words
+ 11 ->   1 words
+ 12 ->   1 words
+ 16 ->   1 words
+ 18 ->   1 words
+[('the', 1), ('was', 3), ('king', 23), ('queen', 26), ('fishes', 52)]
+Lord Of The Rings ***title*** axb

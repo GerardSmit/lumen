@@ -1,0 +1,30 @@
+'hello' "it's" 'say "hi"' 'both \' and "'
+'a\'b"c' '\\' 'a\nb' 'tab\there'
+'\r\x00\x01\x7f' '\x1b[0m' '\x07\x08\x0c\x0b'
+'é' '€' '\u200b' '😀' '\xa0'
+'\xe9' '\u20ac' '\U0001f600' 'abc' "it's"
+['\xe9', 'a'] {'k': '\xfc'}
+b'abc' b"a'b" b'a"b' b'\x00\xff\n' b'a\'b"c'
+bytearray(b'hi') b'\x00\x00\x00' b''
+\n 2 C:\path\to a\"b 4
+b'\\x00' 4
+'line1\nline2 "quoted" \'single\'\nline3' 2
+'ab'
+abc xy
+ABCCa
+'€' True
+2 1 1 1
+'1.5' 'None' x "'x'"
+'\'"a\\\'b"\''
+'a' 1 '\xe9'
+['a', "b'c"] ('x',) {'k': 'v"w'}
+'\x80' '\x9f' '\xad'
+'aaa' ''
+A0 True
+['tab', 'sep'] ['nl', 'sep']
+'\ud7ff' True
+f48fbfbf
+b'\\' b'\t\r' b'~\x7f'
+2 b'A' True
+ab
+'\'"' "'" '"'

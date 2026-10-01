@@ -1,0 +1,24 @@
+origin
+on y axis at 5
+on x axis at 3
+diagonal 2
+point 1,2
+origin3
+point 1,2
+not a point
+('bool', True)
+('int', 1)
+('float', 2.5)
+('str', 's')
+('list', 9)
+other
+tuple
+dict
+none
+other
+v is one v pair 1 2 v other 'z'
+TypeError positional without __match_args__
+no attr
+12 10 unknown shape
+1 4
+1 2 3

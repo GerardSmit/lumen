@@ -1,0 +1,18 @@
+NameError name 'a' is not defined
+False True
+[0, 2, 3, 4, 5]
+[0, 4, 5]
+[4]
+{'x': 1, 'z': 3}
+KeyError 'nope'
+False
+AttributeError
+unbound
+[2, 2, 2]
+[0, 1, 2]
+[10, 11, 12]
+2
+(2, 1)
+[1] [1] True
+1 2 3 [4, 5]
+2

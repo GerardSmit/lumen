@@ -1,0 +1,52 @@
+85 words, 34 unique
+the           11 ###########
+it            10 ##########
+of            10 ##########
+was           10 ##########
+we             4 ####
+age            2 ##
+all            2 ##
+before         2 ##
+without stop words:
+  age=2
+  before=2
+  direct=2
+  epoch=2
+  going=2
+  season=2
+2 ['it', 'of', 'to', 'us', 'we']
+3 ['age', 'all', 'had', 'the', 'was', 'way']
+4 ['best', 'hope', 'were']
+5 ['epoch', 'going', 'light', 'other', 'times', 'worst']
+6 ['before', 'belief', 'direct', 'heaven', 'season', 'spring', 'winter', 'wisdom']
+7 ['despair', 'nothing']
+8 ['darkness']
+10 ['everything']
+11 ['foolishness', 'incredulity']
+longest: incredulity avg len: 3.753
+etsioahwfrngdlcpbmuyvk
+--- wrap 30
+|It was the best of times, it  |
+|was the worst of times, it was|
+|the age of wisdom, it was the |
+|age of foolishness, it was the|
+|epoch of belief, it was the   |
+--- justify 38
+|It  was  the best of times, it was the|
+|worst  of  times,  it  was  the age of|
+|wisdom, it was the age of foolishness,|
+|it was the epoch of belief,           |
+Khoor, Zruog! Wkh txlfn eurzq ira. True True bcd BCD
+Round Trip
+'A man, a plan, a canal: Panama' True
+'No lemon, no melon' True
+'Hello' False
+'' True
+'Was it a car or a cat I saw?' True
+['enlist', 'inlets', 'listen', 'silent']
+['act', 'cat', 'tac']
+['dog', 'god', 'odg']
+['gogole', 'google']
+[]
+[]
+['Was', 'Way', 'We', 'Were', 'Winter', 'Wisdom', 'Worst']

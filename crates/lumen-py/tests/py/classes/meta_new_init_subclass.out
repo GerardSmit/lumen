@@ -1,0 +1,12 @@
+<Meta K> 3 True k ['K'] Meta
+['K', 'K2'] True k2
+['P1', 'P2'] one none
+True 2
+5 4 Pos
+5
+('Generic', <class 'int'>) ('Generic', 'a')
+('Generic', (1, 2))
+2 C type
+11 C
+1
+True False
