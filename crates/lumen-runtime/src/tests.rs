@@ -434,7 +434,7 @@ fn process_reports_native_cpu_and_memory_metrics() {
         console.log(memory.rss > 0, process.memoryUsage.rss() > 0);
         console.log(cpu.user >= 0, cpu.system >= 0, cpu.user + cpu.system > 0);
         console.log(resources.maxRSS > 0, resources.userCPUTime >= 0, resources.minorPageFault >= 0);
-        console.log(process.availableMemory() > 0, process.constrainedMemory() >= 0);
+        console.log(process.availableMemory() > 0, process.constrainedMemory() === undefined || process.constrainedMemory() > 0);
         "#,
     );
     assert_eq!(

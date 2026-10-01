@@ -889,6 +889,8 @@ pub struct Interp {
     /// check) defer to [`Interp::call`]; refreshed there from the native stack headroom (see
     /// [`Interp::stack_guard`]). 0 forces the next call through the checked path.
     pub(crate) depth_limit: u32,
+    /// Recursion ceiling for this realm; [`MAX_EVAL_DEPTH`] unless the embedder lowered it.
+    pub(crate) max_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
@@ -1091,6 +1093,11 @@ pub struct Interp {
     pub(crate) live_limit: i64,
     /// Allocated-bytes ceiling (see `Engine::set_heap_limit`); 0 = none.
     pub(crate) heap_limit: usize,
+    /// Terminate the realm at the first crossing of `heap_limit` instead of throwing first.
+    pub(crate) heap_fatal: bool,
+    /// Runs when the realm first crosses its ceiling, `remaining` times, each time raising the
+    /// ceiling by a twentieth so the realm can go on (see `Engine::set_near_limit_hook`).
+    pub(crate) near_limit: Option<NearLimit>,
     /// The ceiling checks compare against: `heap_limit`, raised by a headroom once an
     /// out-of-memory error was thrown so its handler can run (see [`Interp::heap_over`]).
     pub(crate) heap_ceiling: usize,
@@ -1267,6 +1274,15 @@ pub const MAX_LIVE: i64 = 3_000_000;
 
 /// Live-object count at which the collector first runs; the threshold then floats (see `gc_check`).
 pub const GC_TRIGGER: i64 = 100_000;
+
+/// A callback for a realm that reached its memory ceiling, with the number of times it may run.
+pub struct NearLimit {
+    pub remaining: u32,
+    pub hook: Box<dyn FnMut(&mut Interp)>,
+}
+
+/// The lowest live-object ceiling an embedder can set.
+pub const MIN_LIVE_LIMIT: i64 = 4_096;
 /// Layered calls check allocation counters once per 256 calls.
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
 /// Native long loops poll the interrupt and heap limit every this many iterations (a power of 2).
@@ -1584,6 +1600,7 @@ impl Interp {
             strict: false,
             depth: 0,
             depth_limit: 0,
+            max_depth: MAX_EVAL_DEPTH,
             class_info: Default::default(),
             ctor_plans: Default::default(),
             plan_cache: None,
@@ -1671,6 +1688,8 @@ impl Interp {
             heap_limit_hit: false,
             live_limit: MAX_LIVE,
             heap_limit: 0,
+            heap_fatal: false,
+            near_limit: None,
             heap_ceiling: 0,
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
@@ -5211,6 +5230,9 @@ impl Interp {
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!("[gc] live={live}");
         }
+        if live > self.live_limit && self.near_limit_event() {
+            self.live_limit = live + live / 20;
+        }
         if live > self.live_limit {
             if self.interrupt.is_some() {
                 // An embedded realm is terminated, not handed a catchable RangeError: past its
@@ -5233,9 +5255,34 @@ impl Interp {
         // data (a long promise chain, a big build-up): collecting again at +25% would rescan the
         // same survivors every few allocations, so wait until live doubles instead.
         let growth = if before - live < before / 8 { live } else { live / 4 };
-        self.gc_next = (live + growth.max(GC_TRIGGER)).clamp(GC_TRIGGER, self.live_limit);
+        self.gc_next = (live + growth.max(GC_TRIGGER)).min(self.live_limit);
         Ok(())
 
+    }
+
+    /// Call `hook` the first `times` times this realm crosses its live-object or heap ceiling,
+    /// raising the ceiling by a twentieth after each so the realm can go on; once the runs are
+    /// used up the ceiling applies as usual. `times == 0` removes the hook.
+    pub fn set_near_limit_hook(&mut self, times: u32, hook: Box<dyn FnMut(&mut Interp)>) {
+        self.near_limit = (times > 0).then_some(NearLimit { remaining: times, hook });
+    }
+
+    /// Run the near-limit hook if one has runs left; whether it ran. A hook out of runs is
+    /// dropped, after which the next crossing is the limit for good.
+    #[cold]
+    fn near_limit_event(&mut self) -> bool {
+        let Some(mut near) = self.near_limit.take() else {
+            return false;
+        };
+        if near.remaining == 0 {
+            return false;
+        }
+        near.remaining -= 1;
+        (near.hook)(self);
+        if near.remaining > 0 {
+            self.near_limit = Some(near);
+        }
+        true
     }
 
     /// Poll for every `STRIDE`th `k` of a native loop that may run for a very long time (an
@@ -5300,6 +5347,16 @@ impl Interp {
                 return Ok(());
             }
             if used > self.heap_limit {
+                if self.heap_ceiling == self.heap_limit && self.near_limit_event() {
+                    self.heap_limit = used.saturating_add(used / 20);
+                    self.heap_ceiling = self.heap_limit;
+                    return Ok(());
+                }
+                if self.heap_fatal && self.interrupt.is_some() {
+                    self.heap_limit_hit = true;
+                    self.terminating = true;
+                    return Err(self.termination());
+                }
                 if self.heap_ceiling == self.heap_limit {
                     // Headroom for the handler, as with `live_limit`: the `catch` block's own
                     // allocations must not throw again before it can drop what it retains.
@@ -5444,7 +5501,7 @@ impl Interp {
             return self.call_native_fast(f, this, args);
         }
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
+        if self.depth > self.max_depth || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -5487,7 +5544,7 @@ impl Interp {
     pub(crate) fn stack_guard(&mut self) -> bool {
         match crate::stack::headroom() {
             Some(room) => {
-                self.depth_limit = crate::stack::depth_cap(self.depth, room, MAX_EVAL_DEPTH);
+                self.depth_limit = crate::stack::depth_cap(self.depth, room, self.max_depth);
                 false
             }
             None => true,
@@ -5542,7 +5599,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
+        if self.depth > self.max_depth || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -7368,7 +7425,7 @@ impl Interp {
         new_target: Value,
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
+        if self.depth > self.max_depth || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }

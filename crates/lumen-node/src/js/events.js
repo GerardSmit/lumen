@@ -7,10 +7,11 @@
 const { validateAbortSignal, validateBoolean, validateFunction, validateInteger, validateObject } = __validators;
 
 const kCapture = Symbol("kCapture");
+const kResistStopPropagation = Symbol.for("nodejs.internal.kResistStopPropagation");
 const kErrorMonitor = Symbol("events.errorMonitor");
 const kShapeMode = Symbol("shapeMode");
-const kMaxEventTargetListeners = Symbol("events.maxEventTargetListeners");
-const kMaxEventTargetListenersWarned = Symbol("events.maxEventTargetListenersWarned");
+const kMaxEventTargetListeners = Symbol.for("events.maxEventTargetListeners");
+const kMaxEventTargetListenersWarned = Symbol.for("events.maxEventTargetListenersWarned");
 const kWatermarkData = Symbol.for("nodejs.watermarkData");
 const kRejection = Symbol.for("nodejs.rejection");
 const kFirstEventParam = Symbol("nodejs.kFirstEventParam");
@@ -42,6 +43,11 @@ Object.defineProperty(EventEmitter.prototype, kShapeMode, {
 });
 
 EventEmitter.EventEmitter = EventEmitter;
+Object.defineProperty(globalThis, Symbol.for("lumen.EventEmitter"), { value: EventEmitter, configurable: true });
+Object.defineProperty(globalThis, Symbol.for("lumen.inspect"), {
+  get: () => __builtins.get("util").inspect,
+  configurable: true,
+});
 EventEmitter.usingDomains = false;
 EventEmitter.captureRejectionSymbol = kRejection;
 EventEmitter.errorMonitor = kErrorMonitor;
@@ -72,7 +78,7 @@ Object.defineProperties(EventEmitter, {
 });
 
 function isEventTarget(obj) {
-  return obj != null && typeof obj.addEventListener === "function" && typeof obj.dispatchEvent === "function"
+  return obj != null && obj[Symbol.for("lumen.kEvents")] instanceof Map || obj != null && typeof obj.addEventListener === "function" && typeof obj.dispatchEvent === "function"
     && typeof obj.on !== "function";
 }
 
@@ -505,12 +511,12 @@ function unwrapListeners(arr) {
   return ret;
 }
 
-// lumen-web's EventTarget keeps `_listeners`: a Map of type -> [{ callback, ... }].
+// lumen-web's EventTarget keeps its listeners in a Map of type -> [{ callback, ... }].
 function eventTargetListeners(target, type) {
-  const map = target._listeners;
+  const map = target[Symbol.for("lumen.kEvents")];
   if (!(map instanceof Map)) return [];
   const list = map.get(String(type));
-  return list ? list.filter((l) => !l.removed).map((l) => l.callback) : [];
+  return list ? list.filter((l) => !l.removed).map((l) => (l.weak ? l.callback.deref() : l.callback)).filter((c) => c !== undefined) : [];
 }
 
 function getEventListeners(emitterOrTarget, type) {
@@ -540,7 +546,7 @@ class AbortError extends Error {
 }
 
 async function once(emitter, name, options = kEmptyObject) {
-  validateObject(options, "options");
+  if (options !== null) validateObject(options, "options");
   const signal = options?.signal;
   validateAbortSignal(signal, "options.signal");
   if (signal?.aborted) throw new AbortError(undefined, { cause: signal?.reason });
@@ -574,7 +580,7 @@ async function once(emitter, name, options = kEmptyObject) {
       reject(new AbortError(undefined, { cause: signal?.reason }));
     }
     if (signal != null) {
-      eventTargetAgnosticAddListener(signal, "abort", abortListener, { __proto__: null, once: true });
+      eventTargetAgnosticAddListener(signal, "abort", abortListener, { __proto__: null, once: true, [kResistStopPropagation]: true });
     }
   });
 }

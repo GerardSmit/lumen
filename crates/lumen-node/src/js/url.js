@@ -2076,3 +2076,4 @@ defineModule("url", function (module, exports, require, internalBinding, primord
 
 __builtins.set("querystring", require("querystring"));
 __builtins.set("url", require("url"));
+__internals.set("urlRequire", (id) => require(id));

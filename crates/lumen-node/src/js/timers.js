@@ -220,46 +220,107 @@
   const _unrefActive = active;
 
   // --- timers/promises -------------------------------------------------------------------------
-  const abortReason = (signal) => {
-    if (signal && signal.reason !== undefined) return signal.reason;
-    const e = new Error("The operation was aborted");
-    e.name = "AbortError";
-    e.code = "ABORT_ERR";
-    return e;
-  };
+  class AbortError extends Error {
+    constructor(message = "The operation was aborted", options = undefined) {
+      super(message, options);
+      this.code = "ABORT_ERR";
+      this.name = "AbortError";
+    }
+  }
+  const abortError = (signal) => new AbortError(undefined, { cause: signal?.reason });
+  const kResist = Symbol.for("nodejs.internal.kResistStopPropagation");
 
-  function setTimeoutP(delay = 1, value, options = {}) {
-    const signal = options.signal;
-    return new Promise((resolve, reject) => {
-      if (signal && signal.aborted) { reject(abortReason(signal)); return; }
-      const onAbort = () => { gClearTimeout(id); reject(abortReason(signal)); };
-      const id = gSetTimeout(() => {
-        if (signal) signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      }, delay);
-      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  function validateTimerOptions(options) {
+    __validators.validateObject(options, "options");
+    if (options.signal !== undefined) __validators.validateAbortSignal(options.signal, "options.signal");
+    if (options.ref !== undefined) __validators.validateBoolean(options.ref, "options.ref");
+  }
+
+  function setTimeoutP(after, value, options = {}) {
+    try {
+      if (after !== undefined) __validators.validateNumber(after, "delay");
+      validateTimerOptions(options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const { signal, ref = true } = options;
+    if (signal?.aborted) return Promise.reject(abortError(signal));
+    let onAbort;
+    let timeout;
+    const promise = new Promise((resolve, reject) => {
+      timeout = gSetTimeout(() => resolve(value), after);
+      if (!ref) timeout.unref();
+      if (signal) {
+        onAbort = () => {
+          gClearTimeout(timeout);
+          reject(abortError(signal));
+        };
+        signal.addEventListener("abort", onAbort, { __proto__: null, once: true, [kResist]: true });
+      }
     });
+    return signal ? promise.finally(() => signal.removeEventListener("abort", onAbort)) : promise;
   }
 
   function setImmediateP(value, options = {}) {
-    const signal = options.signal;
-    return new Promise((resolve, reject) => {
-      if (signal && signal.aborted) { reject(abortReason(signal)); return; }
-      const handle = setImmediate(() => {
-        if (signal) signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      });
-      const onAbort = () => { clearImmediate(handle); reject(abortReason(signal)); };
-      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      validateTimerOptions(options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const { signal, ref = true } = options;
+    if (signal?.aborted) return Promise.reject(abortError(signal));
+    let onAbort;
+    let immediate;
+    const promise = new Promise((resolve, reject) => {
+      immediate = setImmediate(() => resolve(value));
+      if (!ref) immediate.unref();
+      if (signal) {
+        onAbort = () => {
+          clearImmediate(immediate);
+          reject(abortError(signal));
+        };
+        signal.addEventListener("abort", onAbort, { __proto__: null, once: true, [kResist]: true });
+      }
     });
+    return signal ? promise.finally(() => signal.removeEventListener("abort", onAbort)) : promise;
   }
 
-  async function* setIntervalP(delay = 1, value, options = {}) {
-    const signal = options.signal;
-    if (signal && signal.aborted) throw abortReason(signal);
-    while (true) {
-      await setTimeoutP(delay, undefined, { signal });
-      yield value;
+  async function* setIntervalP(after, value, options = {}) {
+    if (after !== undefined) __validators.validateNumber(after, "delay");
+    validateTimerOptions(options);
+    const { signal, ref = true } = options;
+    if (signal?.aborted) throw abortError(signal);
+    let onAbort;
+    let interval;
+    let notYielded = 0;
+    let callback;
+    try {
+      interval = gSetInterval(() => {
+        notYielded++;
+        if (callback) {
+          callback();
+          callback = undefined;
+        }
+      }, after);
+      if (!ref) interval.unref();
+      if (signal) {
+        onAbort = () => {
+          gClearInterval(interval);
+          if (callback) {
+            callback(Promise.reject(abortError(signal)));
+            callback = undefined;
+          }
+        };
+        signal.addEventListener("abort", onAbort, { __proto__: null, once: true, [kResist]: true });
+      }
+      while (!signal?.aborted) {
+        if (notYielded === 0) await new Promise((resolve) => (callback = resolve));
+        for (; notYielded > 0; notYielded--) yield value;
+      }
+      throw abortError(signal);
+    } finally {
+      gClearInterval(interval);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 
@@ -268,6 +329,7 @@
     yield: () => setImmediateP(),
   };
 
+  Object.defineProperty(setIntervalP, "name", { value: "setInterval", configurable: true });
   const timersPromises = {
     setTimeout: setTimeoutP,
     setImmediate: setImmediateP,
@@ -275,6 +337,17 @@
     scheduler,
   };
   __builtins.set("timers/promises", timersPromises);
+  const kCustomPromisified = Symbol.for("nodejs.util.promisify.custom");
+  for (const [fn, promisified, name] of [
+    [gSetTimeout, setTimeoutP, "setTimeout"],
+    [setImmediate, setImmediateP, "setImmediate"],
+    [globalThis.setTimeout, setTimeoutP, "setTimeout"],
+  ]) {
+    Object.defineProperty(promisified, "name", { value: name, configurable: true });
+    if (typeof fn === "function") {
+      Object.defineProperty(fn, kCustomPromisified, { enumerable: true, get: () => promisified, configurable: true });
+    }
+  }
 
   __builtins.set("timers", {
     Timeout,

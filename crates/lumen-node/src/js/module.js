@@ -1478,6 +1478,9 @@ globalThis.__lumenApplyOptions = function () {
       __builtins.get("v8").writeHeapSnapshot();
     });
   }
+  if (options && Number(options["--heapsnapshot-near-heap-limit"]) > 0) {
+    __builtins.get("v8").setHeapSnapshotNearHeapLimit(Number(options["--heapsnapshot-near-heap-limit"]));
+  }
   if (process.env.NODE_V8_COVERAGE && !process.features.inspector) {
     process.emitWarning("The inspector is disabled, coverage could not be collected", "Warning");
   }

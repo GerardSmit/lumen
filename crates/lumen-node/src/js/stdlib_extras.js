@@ -262,38 +262,62 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     return d.readValue();
   };
 
-  // lumen exposes no V8 heap accounting, so the numeric fields are honest zeros in Node's shape
-  // (rather than invented figures). Field names and count match Node v22 exactly.
-  const HEAP_LIMIT = 2 * 1024 * 1024 * 1024;
-  const getHeapStatistics = () => ({
-    total_heap_size: 0,
-    total_heap_size_executable: 0,
-    total_physical_size: 0,
-    total_available_size: HEAP_LIMIT,
-    used_heap_size: 0,
-    heap_size_limit: HEAP_LIMIT,
-    malloced_memory: 0,
-    peak_malloced_memory: 0,
-    does_zap_garbage: 0,
-    number_of_native_contexts: 1,
-    number_of_detached_contexts: 0,
-    total_global_handles_size: 0,
-    used_global_handles_size: 0,
-    external_memory: 0,
-  });
-  const HEAP_SPACES = [
-    "read_only_space", "new_space", "old_space", "code_space", "shared_space",
-    "new_large_object_space", "large_object_space",
-    "code_large_object_space", "shared_large_object_space",
-  ];
-  const getHeapSpaceStatistics = () =>
-    HEAP_SPACES.map((space_name) => ({
-      space_name,
-      space_size: 0,
-      space_used_size: 0,
-      space_available_size: 0,
-      physical_space_size: 0,
-    }));
+  // The engine counts live objects, not bytes: the heap figures are the same shallow estimate
+  // `process.memoryUsage()` reports (128 bytes per object plus the live ArrayBuffer bytes). The
+  // limit is the worker's `resourceLimits` or, on the main thread, `--max-old-space-size`.
+  const MIB = 1024 * 1024;
+  const heapLimits = () => {
+    const limits = __builtins.get("worker_threads").resourceLimits;
+    if (limits.maxOldGenerationSizeMb !== undefined) {
+      return { old: limits.maxOldGenerationSizeMb * MIB, young: limits.maxYoungGenerationSizeMb * MIB };
+    }
+    const flag = Number(process[Symbol.for("lumen.options")]?.["--max-old-space-size"]);
+    return { old: (flag > 0 ? flag : 2048) * MIB, young: 16 * MIB };
+  };
+  const heapUsage = () => {
+    const [objects, buffers] = __node.memoryStats();
+    return { used: objects * 128 + buffers, external: buffers, ...heapLimits() };
+  };
+  const getHeapStatistics = () => {
+    const { used, external, old, young } = heapUsage();
+    const limit = old + young;
+    return {
+      total_heap_size: used,
+      total_heap_size_executable: 0,
+      total_physical_size: used,
+      total_available_size: Math.max(limit - used, 0),
+      used_heap_size: used,
+      heap_size_limit: limit,
+      malloced_memory: 0,
+      peak_malloced_memory: 0,
+      does_zap_garbage: 0,
+      number_of_native_contexts: 1,
+      number_of_detached_contexts: 0,
+      total_global_handles_size: 0,
+      used_global_handles_size: 0,
+      external_memory: external,
+    };
+  };
+  const getHeapSpaceStatistics = () => {
+    const { used, old, young } = heapUsage();
+    const newUsed = Math.min(used >> 3, young >> 2);
+    const oldUsed = used - newUsed;
+    const space = (space_name, size, available) => ({
+      space_name, space_size: size, space_used_size: size, space_available_size: available,
+      physical_space_size: size,
+    });
+    return [
+      space("read_only_space", 0, 0),
+      space("new_space", newUsed, Math.max((young >> 1) - newUsed, 0)),
+      space("old_space", oldUsed, Math.max(old - oldUsed, 0)),
+      space("code_space", 0, 0),
+      space("shared_space", 0, 0),
+      space("new_large_object_space", 0, 0),
+      space("large_object_space", 0, 0),
+      space("code_large_object_space", 0, 0),
+      space("shared_large_object_space", 0, 0),
+    ];
+  };
   const getHeapCodeStatistics = () => ({
     code_and_metadata_size: 0,
     bytecode_and_metadata_size: 0,
@@ -479,7 +503,11 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     startupSnapshot,
     setFlagsFromString,
     // No snapshot-on-near-heap-limit mechanism exists here; registering a limit is a no-op.
-    setHeapSnapshotNearHeapLimit: () => {},
+    setHeapSnapshotNearHeapLimit(limit) {
+      __validators.validateUint32(limit, "limit");
+      __node.setNearHeapLimit(limit, __builtins.get("worker_threads").threadId,
+        process[Symbol.for("lumen.options")]?.["--diagnostic-dir"] ?? "");
+    },
     // Coverage collection is not wired up (no NODE_V8_COVERAGE sink); these are the inert no-ops
     // Node itself uses when coverage is disabled.
     takeCoverage: () => {},
@@ -1012,7 +1040,7 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     };
   }
   proc.availableMemory = () => metrics()[14];
-  proc.constrainedMemory = () => metrics()[15] || 0;
+  proc.constrainedMemory = () => metrics()[15] || undefined;
   const previousValueIsValid = (num) => typeof num === "number" && num <= Number.MAX_SAFE_INTEGER && num >= 0;
   proc.cpuUsage = function cpuUsage(prevValue) {
     const m = metrics();

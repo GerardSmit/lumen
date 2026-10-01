@@ -537,7 +537,7 @@ impl Engine {
     /// interrupt set, crossing it terminates the realm (see [`Engine::heap_limit_hit`]); without
     /// one it is the usual catchable `RangeError`.
     pub fn set_live_object_limit(&mut self, limit: i64) {
-        self.interp.live_limit = limit.clamp(interpreter::GC_TRIGGER, interpreter::MAX_LIVE);
+        self.interp.live_limit = limit.clamp(interpreter::MIN_LIVE_LIMIT, interpreter::MAX_LIVE);
         self.interp.gc_next = self.interp.gc_next.min(self.interp.live_limit);
     }
 
@@ -556,6 +556,12 @@ impl Engine {
         self.interp.sync_regex_poll();
     }
 
+    /// Make crossing the heap limit terminate the realm outright (see [`Engine::heap_limit_hit`])
+    /// instead of throwing a catchable error first. Needs an interrupt flag on the realm.
+    pub fn set_heap_limit_fatal(&mut self, fatal: bool) {
+        self.interp.heap_fatal = fatal;
+    }
+
     /// Bytes currently allocated through [`fastalloc::ClassAlloc`] by the whole process, or
     /// `None` when it is not the global allocator (a heap limit then has no effect).
     pub fn heap_bytes() -> Option<usize> {
@@ -563,6 +569,14 @@ impl Engine {
         return fastalloc::heap_bytes();
         #[cfg(target_arch = "wasm32")]
         None
+    }
+
+    /// Lower this realm's call-depth ceiling (default [`interpreter::MAX_EVAL_DEPTH`]); past it a
+    /// call throws `RangeError: Maximum call stack size exceeded`. It cannot be raised above the
+    /// default, which is what the engine's thread stacks are sized for.
+    pub fn set_max_depth(&mut self, depth: u32) {
+        self.interp.max_depth = depth.clamp(16, interpreter::MAX_EVAL_DEPTH);
+        self.interp.depth_limit = 0;
     }
 
     /// Whether this realm has been terminated (interrupt or live-object ceiling).
