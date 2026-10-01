@@ -1709,7 +1709,7 @@ function parseX509(buffer) {
 
 function spkacResult(fn, buffer) {
   const out = fn(bytesOf(buffer));
-  return out === null ? Buffer.alloc(0) : asBuffer(out);
+  return out === null ? "" : asBuffer(out);
 }
 
 Object.assign(cryptoBinding, {
