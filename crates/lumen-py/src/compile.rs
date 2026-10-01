@@ -5,7 +5,7 @@ use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::*;
 use crate::object::*;
 use crate::symtable::{self, mangle, Sc, SymTable};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -16,7 +16,7 @@ pub struct CompileError {
 
 type Label = u32;
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum ConstKey {
     None,
     True,
@@ -53,13 +53,13 @@ struct Unit<'a> {
     lines: Vec<u32>,
     labels: Vec<u32>,
     consts: Vec<Value>,
-    const_keys: HashMap<ConstKey, u32>,
+    const_keys: BTreeMap<ConstKey, u32>,
     names: Vec<Obj>,
-    name_idx: HashMap<Rc<str>, u32>,
+    name_idx: BTreeMap<Rc<str>, u32>,
     varnames: Vec<Rc<str>>,
-    var_idx: HashMap<Rc<str>, u32>,
+    var_idx: BTreeMap<Rc<str>, u32>,
     cells: Vec<Rc<str>>,
-    cell_idx: HashMap<Rc<str>, u32>,
+    cell_idx: BTreeMap<Rc<str>, u32>,
     ncellvars: usize,
     fblocks: Vec<FBlock<'a>>,
     line: u32,
@@ -233,9 +233,9 @@ impl<'a> Compiler<'a> {
             lines: Vec::new(),
             labels: Vec::new(),
             consts: Vec::new(),
-            const_keys: HashMap::new(),
+            const_keys: BTreeMap::new(),
             names: Vec::new(),
-            name_idx: HashMap::new(),
+            name_idx: BTreeMap::new(),
             varnames,
             var_idx,
             cells,

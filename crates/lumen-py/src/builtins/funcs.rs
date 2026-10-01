@@ -1,6 +1,7 @@
 //! Builtin functions.
 
 use crate::ast::{BinOp, StmtKind};
+use crate::fmath;
 use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::UnOp;
 use crate::num::{to_num, Num};
@@ -117,7 +118,7 @@ fn abs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             match &o.kind {
                 Kind::Int(b) => return Ok(Value::big(b.abs())),
                 Kind::Float(f) => return Ok(Value::Float(f.abs())),
-                Kind::Complex(r, i) => return Ok(Value::Float(r.hypot(*i))),
+                Kind::Complex(r, i) => return Ok(Value::Float(fmath::hypot(*r, *i))),
                 _ => {}
             }
         }
@@ -425,19 +426,18 @@ fn input(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         it.write_stdout(&s);
     }
     it.flush_out();
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => Err(it.new_exc_str("EOFError", "EOF when reading a line")),
-        Ok(_) => {
-            if line.ends_with('\n') {
-                line.pop();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-            }
-            Ok(Value::string(line))
+    let raw = it.platform.borrow_mut().read_stdin_line();
+    if raw.is_empty() {
+        return Err(it.new_exc_str("EOFError", "EOF when reading a line"));
+    }
+    let mut line = String::from_utf8_lossy(&raw).into_owned();
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
         }
     }
+    Ok(Value::string(line))
 }
 
 fn isinstance(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -616,7 +616,7 @@ fn round(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
                     let s = format!("{:.*}", n as usize, f);
                     Ok(Value::Float(s.parse().unwrap_or(f)))
                 } else {
-                    let p = 10f64.powi((-n) as i32);
+                    let p = fmath::powi(10.0, (-n) as i32);
                     Ok(Value::Float(round_half_even(f / p) * p))
                 }
             }
@@ -629,9 +629,9 @@ fn round(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 }
 
 pub fn round_half_even(f: f64) -> f64 {
-    let r = f.round();
-    if (f - f.trunc()).abs() == 0.5 {
-        let t = f.trunc();
+    let r = fmath::round(f);
+    if (f - fmath::trunc(f)).abs() == 0.5 {
+        let t = fmath::trunc(f);
         if t % 2.0 == 0.0 {
             t
         } else {
@@ -858,7 +858,6 @@ pub fn init(it: &mut Interp) {
     let defs: &[(&'static str, NativeFn)] = &[
         ("print", print),
         ("len", len),
-        ("memoryview", super::bytesm::memoryview_fn()),
         ("abs", abs),
         ("all", all),
         ("any", any),

@@ -1,4 +1,4 @@
-use lumen_py::{Interp, Output};
+use lumen_py::{Interp, MemPlatform, Output, StdPlatform};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -65,5 +65,51 @@ fn interpreters_do_not_share_state() {
         b.flush_out();
         assert_eq!(String::from_utf8_lossy(&out_a.borrow().out), "[1, 2, 3]\n");
         assert_eq!(String::from_utf8_lossy(&out_b.borrow().out), "False\n");
+    });
+}
+
+const LIB: &[(&str, &str)] = &[
+    ("/lib/shapes/__init__.py", "from .area import square\nNAME = 'shapes'\n"),
+    ("/lib/shapes/area.py", "def square(n):\n    return n * n\n"),
+    ("/lib/helper.py", "VALUE = 41\n"),
+];
+
+fn mem_interp() -> (Interp, Rc<RefCell<Captured>>) {
+    let cap = Rc::new(RefCell::new(Captured::default()));
+    let platform = MemPlatform::with_table(Box::new(StdPlatform::new()), LIB);
+    let mut it = Interp::with_platform(Box::new(platform));
+    it.set_output(Box::new(Capture(cap.clone())));
+    it.set_path(&["/lib".into()]);
+    (it, cap)
+}
+
+#[test]
+fn imports_are_served_from_memory() {
+    on_big_stack(|| {
+        let (mut it, cap) = mem_interp();
+        let src = "import shapes, helper\nfrom shapes.area import square\nprint(shapes.NAME, square(7), helper.VALUE + 1, shapes.__file__)\n";
+        assert_eq!(it.run_source(src, "<mem>"), 0);
+        it.flush_out();
+        assert_eq!(String::from_utf8_lossy(&cap.borrow().out), "shapes 49 42 /lib/shapes/__init__.py\n");
+    });
+}
+
+#[test]
+fn missing_module_is_not_found_in_memory() {
+    on_big_stack(|| {
+        let (mut it, cap) = mem_interp();
+        assert_eq!(it.run_source("import nowhere\n", "<mem>"), 1);
+        assert!(String::from_utf8_lossy(&cap.borrow().err).contains("ModuleNotFoundError: No module named 'nowhere'"));
+    });
+}
+
+#[test]
+fn open_reads_memory_files_and_rejects_writes() {
+    on_big_stack(|| {
+        let (mut it, cap) = mem_interp();
+        let src = "print(open('/lib/helper.py').read().strip())\ntry:\n    open('/lib/helper.py', 'w')\nexcept PermissionError:\n    print('denied')\n";
+        assert_eq!(it.run_source(src, "<mem>"), 0);
+        it.flush_out();
+        assert_eq!(String::from_utf8_lossy(&cap.borrow().out), "VALUE = 41\ndenied\n");
     });
 }

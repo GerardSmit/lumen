@@ -1,6 +1,7 @@
 //! `int`, `bool`, `float`, `complex`: constructors, methods and operator slot wrappers.
 
 use super::funcs::{float_to_int, round_half_even};
+use crate::fmath;
 use crate::ast::{BinOp, CmpOp};
 use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::UnOp;
@@ -207,7 +208,7 @@ fn float_to_int_checked(it: &mut Interp, f: f64) -> R<Value> {
     if f.is_infinite() {
         return Err(it.overflow_err("cannot convert float infinity to integer"));
     }
-    Ok(float_to_int(f.trunc()))
+    Ok(float_to_int(fmath::trunc(f)))
 }
 
 fn int_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -481,7 +482,7 @@ impl Interp {
 
 fn float_is_integer(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let f = it.float_arg(&a[0])?;
-    Ok(Value::Bool(f.is_finite() && f == f.trunc()))
+    Ok(Value::Bool(f.is_finite() && f == fmath::trunc(f)))
 }
 
 fn float_trunc(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -491,12 +492,12 @@ fn float_trunc(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn float_floor(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let f = it.float_arg(&a[0])?;
-    float_to_int_checked(it, f.floor())
+    float_to_int_checked(it, fmath::floor(f))
 }
 
 fn float_ceil(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let f = it.float_arg(&a[0])?;
-    float_to_int_checked(it, f.ceil())
+    float_to_int_checked(it, fmath::ceil(f))
 }
 
 fn float_as_ratio(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -579,7 +580,7 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
         scale /= 16.0;
     }
     let e = exp.clamp(-3000, 3000) as i32;
-    let r = v * 2f64.powi(e.clamp(-1000, 1000)) * 2f64.powi((e - e.clamp(-1000, 1000)).clamp(-1000, 1000));
+    let r = v * fmath::powi(2.0, e.clamp(-1000, 1000)) * fmath::powi(2.0, (e - e.clamp(-1000, 1000)).clamp(-1000, 1000));
     Some(if neg { -r } else { r })
 }
 

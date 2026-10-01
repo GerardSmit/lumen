@@ -59,7 +59,7 @@ const fn class_caps() -> [usize; NUM_CLASSES] {
 
 const CLASS_CAPS: [usize; NUM_CLASSES] = class_caps();
 
-/// Exact allocation counters for `LUMEN_MEM_STATS` (see [`crate::memstats`]). They sit on the
+/// Exact allocation counters for `LUMEN_MEM_STATS` (see the engine's `memstats`). They sit on the
 /// allocation fast path, so they only exist with the `mem-stats` cargo feature.
 #[cfg(feature = "mem-stats")]
 mod stats {
@@ -144,12 +144,12 @@ pub fn trace_allocations_from(bytes: usize) {
 
 /// Slab chunks mapped outside the allocator (see `value::heap::chunk_alloc`).
 #[cfg(feature = "mem-stats")]
-pub(crate) fn note_slab(delta: isize) {
-    stats::cat_add(crate::memstats::Cat::Slab as u8, delta);
+pub fn note_slab(delta: isize) {
+    stats::cat_add(CAT_SLAB, delta);
     let _ = stats::LIVE.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Live bytes per [`crate::memstats::Cat`] (see the `mem-stats` allocator below).
+/// Live bytes per allocation category (see the `mem-stats` allocator below).
 #[cfg(feature = "mem-stats")]
 pub fn category_bytes() -> [isize; 32] {
     std::array::from_fn(|k| stats::CATS[k].load(std::sync::atomic::Ordering::Relaxed))
@@ -166,6 +166,10 @@ pub fn counters() -> (usize, usize, usize, usize) {
         stats::COUNT.load(Relaxed),
     )
 }
+
+/// The category the object slab's chunks are counted under (`memstats::Cat::Slab`).
+#[cfg(feature = "mem-stats")]
+const CAT_SLAB: u8 = 1;
 
 macro_rules! stat {
     ($f:ident($e:expr)) => {
@@ -276,12 +280,12 @@ pub fn heap_bytes() -> Option<usize> {
 /// Memory mapped outside the allocator (the object slab's chunks on Windows) that should still
 /// count toward [`heap_bytes`].
 #[allow(dead_code)]
-pub(crate) fn note_external(delta: isize) {
+pub fn note_external(delta: isize) {
     HEAP_BYTES.fetch_add(delta, Relaxed);
 }
 
-#[cfg(test)]
-pub(crate) fn cached_bytes_for_test() -> usize {
+#[doc(hidden)]
+pub fn cached_bytes_for_test() -> usize {
     CACHE.with(|cache| {
         cache
             .counts
@@ -303,7 +307,7 @@ fn register_guard(c: &Cache) {
 #[inline]
 fn class_of(size: usize, align: usize) -> Option<usize> {
     if align <= STEP && size <= MAX_CLASS && size > 0 {
-        Some((size + STEP - 1) / STEP - 1)
+        Some(size.div_ceil(STEP) - 1)
     } else {
         None
     }
@@ -334,13 +338,13 @@ fn drain(cache: &Cache) {
 /// Return cached small blocks to the system and ask the platform allocator to release unused
 /// pages. Called only after a major GC: doing this on every collection would throw away the hot
 /// allocation cache and turn steady-state churn back into malloc/free traffic.
-pub(crate) fn trim() {
+pub fn trim() {
     let _ = CACHE.try_with(drain);
     release_free_pages();
 }
 
 /// Ask the platform allocator to return its free pages to the OS, keeping this thread's cache.
-pub(crate) fn release_free_pages() {
+pub fn release_free_pages() {
     #[cfg(target_os = "macos")]
     unsafe {
         unsafe extern "C" {
@@ -457,18 +461,18 @@ unsafe impl GlobalAlloc for ClassAlloc {
 }
 
 /// With `mem-stats`, every block of alignment <= 16 carries a 16-byte header recording the
-/// [`crate::memstats::Cat`] that was current when it was allocated, so live bytes can be
+/// allocation category that was current when it was allocated, so live bytes can be
 /// attributed by category (parser, AST decode, bytecode, ...). Over-aligned blocks (the object
-/// slab's chunks) carry none and are counted as [`crate::memstats::Cat::Slab`].
+/// slab's chunks) carry none and are counted as the slab category.
 #[cfg(feature = "mem-stats")]
 unsafe impl GlobalAlloc for ClassAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         stats::alloc(layout.size());
         if layout.align() > STEP {
-            stats::cat_add(crate::memstats::Cat::Slab as u8, layout.size() as isize);
+            stats::cat_add(CAT_SLAB, layout.size() as isize);
             return self.raw_alloc(layout);
         }
-        let cat = crate::memstats::current_cat();
+        let cat = crate::memcat::current();
         let inner = Layout::from_size_align_unchecked(layout.size() + STEP, STEP);
         let p = self.raw_alloc(inner);
         if p.is_null() {
@@ -486,7 +490,7 @@ unsafe impl GlobalAlloc for ClassAlloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         stats::free(layout.size());
         if layout.align() > STEP {
-            stats::cat_add(crate::memstats::Cat::Slab as u8, -(layout.size() as isize));
+            stats::cat_add(CAT_SLAB, -(layout.size() as isize));
             return self.raw_dealloc(ptr, layout);
         }
         let p = ptr.sub(STEP);
@@ -502,7 +506,7 @@ unsafe impl GlobalAlloc for ClassAlloc {
                 stats::free(layout.size());
                 stats::alloc(new_size);
                 let d = new_size as isize - layout.size() as isize;
-                stats::cat_add(crate::memstats::Cat::Slab as u8, d);
+                stats::cat_add(CAT_SLAB, d);
             }
             return n;
         }

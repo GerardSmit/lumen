@@ -1,6 +1,7 @@
 //! Native modules: `sys`, `math` and `time`.
 
 use super::file::new_file;
+use crate::fmath;
 use crate::ast::BinOp;
 use crate::pyint::{BigInt, PyInt};
 use crate::object::*;
@@ -13,6 +14,15 @@ pub fn builtin_module(it: &mut Interp, name: &str) -> Option<Obj> {
         "sys" => Some(make_sys(it)),
         "math" => Some(make_math(it)),
         "time" => Some(make_time(it)),
+        "builtins" => Some(super::sysmods::make_builtins(it)),
+        "_thread" => Some(super::sysmods::make_thread(it)),
+        "gc" => Some(super::sysmods::make_gc(it)),
+        "atexit" => Some(super::sysmods::make_atexit(it)),
+        "itertools" => Some(super::itertools::make_module(it)),
+        "_string" => Some(super::stringm::make(it)),
+        "_warnings" => Some(super::warningsm::make(it)),
+        "_weakref" => Some(super::weakm::make(it)),
+        "_collections" => Some(super::collectionsm::make(it)),
         _ => None,
     }
 }
@@ -36,17 +46,24 @@ fn make_sys(it: &mut Interp) -> Obj {
     it.sys_module = Some(m.clone());
     dict_set_str(&d, "modules", Value::Obj(it.modules.clone()));
     dict_set_str(&d, "argv", Value::list(vec![Value::str("")]));
-    dict_set_str(&d, "path", Value::list(Vec::new()));
+    dict_set_str(&d, "path", Value::list(vec![Value::str(crate::frozen::FROZEN_DIR)]));
     dict_set_str(&d, "maxsize", Value::Int(i64::MAX));
     dict_set_str(&d, "maxunicode", Value::Int(0x10ffff));
     dict_set_str(&d, "byteorder", Value::str("little"));
-    dict_set_str(&d, "version", Value::str("3.14.0 (lumen-py)"));
-    dict_set_str(&d, "version_info", Value::tuple(vec![Value::Int(3), Value::Int(14), Value::Int(0), Value::str("final"), Value::Int(0)]));
-    dict_set_str(&d, "hexversion", Value::Int(0x030e00f0));
-    let platform = if cfg!(target_os = "macos") { "darwin" } else { std::env::consts::OS };
-    dict_set_str(&d, "platform", Value::str(platform));
-    dict_set_str(&d, "executable", Value::str("lumen-py"));
-    dict_set_str(&d, "builtin_module_names", Value::tuple(vec![Value::str("sys"), Value::str("math"), Value::str("time")]));
+    dict_set_str(&d, "version", Value::str("3.12.15 (lumen-py)"));
+    dict_set_str(&d, "hexversion", Value::Int(0x030c0ff0));
+    let (platform, executable, argv) = {
+        let p = it.platform.borrow();
+        (p.platform_name(), p.executable(), p.argv())
+    };
+    dict_set_str(&d, "platform", Value::str(&platform));
+    dict_set_str(&d, "executable", Value::str(&executable));
+    if !argv.is_empty() {
+        dict_set_str(&d, "argv", Value::list(argv.iter().map(|a| Value::str(a)).collect()));
+        it.argv = argv;
+    }
+    let builtin_names = ["_collections", "_string", "_thread", "_warnings", "_weakref", "atexit", "builtins", "gc", "itertools", "math", "sys", "time"];
+    dict_set_str(&d, "builtin_module_names", Value::tuple(builtin_names.iter().map(|n| Value::str(n)).collect()));
     dict_set_str(&d, "stdout", new_file(it, FileMode::Stdout, true, "<stdout>"));
     dict_set_str(&d, "stderr", new_file(it, FileMode::Stderr, true, "<stderr>"));
     dict_set_str(&d, "stdin", new_file(it, FileMode::Stdin, true, "<stdin>"));
@@ -54,8 +71,8 @@ fn make_sys(it: &mut Interp) -> Obj {
     set_fn(it, &d, "getrecursionlimit", sys_getrecursionlimit);
     set_fn(it, &d, "setrecursionlimit", sys_setrecursionlimit);
     set_fn(it, &d, "exc_info", sys_exc_info);
-    set_fn(it, &d, "getsizeof", sys_getsizeof);
     set_fn(it, &d, "intern", sys_intern);
+    super::sysextra::init_sys(it, &d);
     m
 }
 
@@ -91,10 +108,6 @@ fn sys_exc_info(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
         }
         None => Value::tuple(vec![Value::None, Value::None, Value::None]),
     })
-}
-
-fn sys_getsizeof(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(64))
 }
 
 fn sys_intern(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -137,20 +150,20 @@ macro_rules! unary {
     };
 }
 
-unary!(m_sin, "sin", f64::sin);
-unary!(m_cos, "cos", f64::cos);
-unary!(m_tan, "tan", f64::tan);
-unary!(m_asin, "asin", f64::asin);
-unary!(m_acos, "acos", f64::acos);
-unary!(m_atan, "atan", f64::atan);
-unary!(m_sinh, "sinh", f64::sinh);
-unary!(m_cosh, "cosh", f64::cosh);
-unary!(m_tanh, "tanh", f64::tanh);
-unary!(m_asinh, "asinh", f64::asinh);
-unary!(m_acosh, "acosh", f64::acosh);
-unary!(m_atanh, "atanh", f64::atanh);
-unary!(m_exp, "exp", f64::exp);
-unary!(m_expm1, "expm1", f64::exp_m1);
+unary!(m_sin, "sin", fmath::sin);
+unary!(m_cos, "cos", fmath::cos);
+unary!(m_tan, "tan", fmath::tan);
+unary!(m_asin, "asin", fmath::asin);
+unary!(m_acos, "acos", fmath::acos);
+unary!(m_atan, "atan", fmath::atan);
+unary!(m_sinh, "sinh", fmath::sinh);
+unary!(m_cosh, "cosh", fmath::cosh);
+unary!(m_tanh, "tanh", fmath::tanh);
+unary!(m_asinh, "asinh", fmath::asinh);
+unary!(m_acosh, "acosh", fmath::acosh);
+unary!(m_atanh, "atanh", fmath::atanh);
+unary!(m_exp, "exp", fmath::exp);
+unary!(m_expm1, "expm1", fmath::exp_m1);
 unary!(m_fabs, "fabs", f64::abs);
 unary!(m_degrees, "degrees", f64::to_degrees);
 unary!(m_radians, "radians", f64::to_radians);
@@ -159,7 +172,7 @@ unary!(m_erfc, "erfc", |x| 1.0 - erf(x));
 
 fn erf(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.3275911 * x.abs());
-    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-x * x).exp();
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * fmath::exp(-x * x);
     if x >= 0.0 {
         y
     } else {
@@ -173,7 +186,7 @@ fn m_sqrt(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if x < 0.0 {
         return Err(domain(it));
     }
-    Ok(Value::Float(x.sqrt()))
+    Ok(Value::Float(fmath::sqrt(x)))
 }
 
 fn ln_of(it: &mut Interp, v: &Value) -> R<f64> {
@@ -186,7 +199,7 @@ fn ln_of(it: &mut Interp, v: &Value) -> R<f64> {
             if bits > 1000 {
                 let shift = (bits - 1000) as usize;
                 let top = b.shr(shift as u64).to_float().unwrap_or(f64::INFINITY);
-                return Ok(top.ln() + shift as f64 * std::f64::consts::LN_2);
+                return Ok(fmath::ln(top) + shift as f64 * std::f64::consts::LN_2);
             }
         }
     }
@@ -194,7 +207,7 @@ fn ln_of(it: &mut Interp, v: &Value) -> R<f64> {
     if x <= 0.0 {
         return Err(domain(it));
     }
-    Ok(x.ln())
+    Ok(fmath::ln(x))
 }
 
 fn m_log(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -227,7 +240,7 @@ fn m_log10(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("log10", a, 1, 1)?;
     if let Value::Int(i) = &a[0] {
         if *i > 0 {
-            return Ok(Value::Float((*i as f64).log10()));
+            return Ok(Value::Float(fmath::log10(*i as f64)));
         }
     }
     let x = ln_of(it, &a[0])?;
@@ -240,14 +253,14 @@ fn m_log1p(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if x <= -1.0 {
         return Err(domain(it));
     }
-    Ok(Value::Float(x.ln_1p()))
+    Ok(Value::Float(fmath::ln_1p(x)))
 }
 
 fn m_pow(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("pow", a, 2, 2)?;
     let x = num(it, &a[0])?;
     let y = num(it, &a[1])?;
-    let r = x.powf(y);
+    let r = fmath::powf(x, y);
     if r.is_nan() && !x.is_nan() && !y.is_nan() {
         return Err(domain(it));
     }
@@ -264,7 +277,7 @@ fn m_atan2(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("atan2", a, 2, 2)?;
     let y = num(it, &a[0])?;
     let x = num(it, &a[1])?;
-    Ok(Value::Float(y.atan2(x)))
+    Ok(Value::Float(fmath::atan2(y, x)))
 }
 
 fn m_hypot(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -280,7 +293,7 @@ fn m_hypot(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         return Ok(Value::Float(max));
     }
     let sum: f64 = vals.iter().map(|v| (v / max) * (v / max)).sum();
-    Ok(Value::Float(max * sum.sqrt()))
+    Ok(Value::Float(max * fmath::sqrt(sum)))
 }
 
 fn m_copysign(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -336,7 +349,7 @@ fn m_modf(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if x.is_infinite() {
         return Ok(Value::tuple(vec![Value::Float(0.0f64.copysign(x)), Value::Float(x)]));
     }
-    let i = x.trunc();
+    let i = fmath::trunc(x);
     Ok(Value::tuple(vec![Value::Float((x - i).copysign(x)), Value::Float(i)]))
 }
 
@@ -346,8 +359,8 @@ fn m_frexp(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if x == 0.0 || !x.is_finite() {
         return Ok(Value::tuple(vec![Value::Float(x), Value::Int(0)]));
     }
-    let mut e = x.abs().log2().floor() as i32 + 1;
-    let mut m = x / 2f64.powi(e);
+    let mut e = fmath::floor(fmath::log2(x.abs())) as i32 + 1;
+    let mut m = x / fmath::powi(2.0, e);
     if m.abs() >= 1.0 {
         m /= 2.0;
         e += 1;
@@ -362,7 +375,7 @@ fn m_ldexp(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("ldexp", a, 2, 2)?;
     let x = num(it, &a[0])?;
     let e = it.index_of(&a[1])?.clamp(-5000, 5000) as i32;
-    let r = x * 2f64.powi(e.clamp(-1000, 1000)) * 2f64.powi((e - e.clamp(-1000, 1000)).clamp(-1000, 1000));
+    let r = x * fmath::powi(2.0, e.clamp(-1000, 1000)) * fmath::powi(2.0, (e - e.clamp(-1000, 1000)).clamp(-1000, 1000));
     if r.is_infinite() && x.is_finite() {
         return Err(range_err(it));
     }
@@ -403,15 +416,15 @@ fn round_op(it: &mut Interp, a: &[Value], name: &'static str, f: fn(f64) -> f64)
 }
 
 fn m_floor(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    round_op(it, a, "floor", f64::floor)
+    round_op(it, a, "floor", fmath::floor)
 }
 
 fn m_ceil(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    round_op(it, a, "ceil", f64::ceil)
+    round_op(it, a, "ceil", fmath::ceil)
 }
 
 fn m_trunc(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    round_op(it, a, "trunc", f64::trunc)
+    round_op(it, a, "trunc", fmath::trunc)
 }
 
 fn m_isnan(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -616,27 +629,27 @@ fn m_dist(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         let d = num(it, x)? - num(it, y)?;
         s += d * d;
     }
-    Ok(Value::Float(s.sqrt()))
+    Ok(Value::Float(fmath::sqrt(s)))
 }
 
 fn m_cbrt(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("cbrt", a, 1, 1)?;
-    Ok(Value::Float(num(it, &a[0])?.cbrt()))
+    Ok(Value::Float(fmath::cbrt(num(it, &a[0])?)))
 }
 
 fn m_exp2(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("exp2", a, 1, 1)?;
     let x = num(it, &a[0])?;
-    float_checked(it, x.exp2(), x.is_finite())
+    float_checked(it, fmath::exp2(x), x.is_finite())
 }
 
 fn m_gamma(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("gamma", a, 1, 1)?;
     let x = num(it, &a[0])?;
-    if x == x.floor() && x <= 0.0 {
+    if x == fmath::floor(x) && x <= 0.0 {
         return Err(domain(it));
     }
-    if x == x.floor() && x < 171.0 {
+    if x == fmath::floor(x) && x < 171.0 {
         let mut r = 1.0;
         for i in 2..(x as i64) {
             r *= i as f64;
@@ -648,7 +661,7 @@ fn m_gamma(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn gamma(x: f64) -> f64 {
     if x < 0.5 {
-        return std::f64::consts::PI / ((std::f64::consts::PI * x).sin() * gamma(1.0 - x));
+        return std::f64::consts::PI / (fmath::sin(std::f64::consts::PI * x) * gamma(1.0 - x));
     }
     let g = 7.0;
     let c = [
@@ -668,13 +681,13 @@ fn gamma(x: f64) -> f64 {
     for (i, ci) in c.iter().enumerate().skip(1) {
         a += ci / (x + i as f64);
     }
-    (2.0 * std::f64::consts::PI).sqrt() * t.powf(x + 0.5) * (-t).exp() * a
+    fmath::sqrt(2.0 * std::f64::consts::PI) * fmath::powf(t, x + 0.5) * fmath::exp(-t) * a
 }
 
 fn m_lgamma(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("lgamma", a, 1, 1)?;
     let x = num(it, &a[0])?;
-    Ok(Value::Float(gamma(x).abs().ln()))
+    Ok(Value::Float(fmath::ln(gamma(x).abs())))
 }
 
 fn make_math(it: &mut Interp) -> Obj {
@@ -749,22 +762,26 @@ fn make_math(it: &mut Interp) -> Obj {
 
 // ---- time ---------------------------------------------------------------------------------------
 
-fn t_time(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    Ok(Value::Float(d.as_secs_f64()))
+fn t_time(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
+    let ns = it.platform.borrow().wall_time_ns();
+    Ok(Value::Float((ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1e9))
 }
 
-fn t_time_ns(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    Ok(Value::Int(d.as_nanos() as i64))
+fn t_time_ns(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
+    Ok(Value::Int(it.platform.borrow().wall_time_ns() as i64))
+}
+
+fn elapsed_ns(it: &Interp) -> u64 {
+    it.platform.borrow().monotonic_ns().saturating_sub(it.start_ns)
 }
 
 fn t_perf(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Float(it.start.elapsed().as_secs_f64() + 1000.0))
+    let ns = elapsed_ns(it);
+    Ok(Value::Float((ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1e9 + 1000.0))
 }
 
 fn t_perf_ns(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(it.start.elapsed().as_nanos() as i64 + 1_000_000_000_000))
+    Ok(Value::Int(elapsed_ns(it) as i64 + 1_000_000_000_000))
 }
 
 fn t_sleep(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -774,7 +791,7 @@ fn t_sleep(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         return Err(it.value_error("sleep length must be non-negative"));
     }
     it.flush_out();
-    std::thread::sleep(std::time::Duration::from_secs_f64(s));
+    it.platform.borrow_mut().sleep(s);
     Ok(Value::None)
 }
 

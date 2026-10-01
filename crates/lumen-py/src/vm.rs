@@ -5,7 +5,8 @@ use crate::bytecode::*;
 use crate::dict::PyDict;
 use crate::object::*;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::platform::{Platform, PlatformRef, StdPlatform};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub struct Block {
@@ -141,7 +142,7 @@ impl Output for ProcessOutput {
 pub struct Interp {
     pub frames: Vec<Frame>,
     pub types: Types,
-    pub exc_types: HashMap<&'static str, Obj>,
+    pub exc_types: BTreeMap<&'static str, Obj>,
     pub builtins: Obj,
     pub modules: Obj,
     pub sys_module: Option<Obj>,
@@ -151,21 +152,27 @@ pub struct Interp {
     pub no_tb: bool,
     pub repr_stack: Vec<usize>,
     pub out: Vec<u8>,
-    pub sink: Box<dyn Output>,
+    pub sink: Option<Box<dyn Output>>,
+    pub platform: PlatformRef,
     pub path_set: bool,
     pub script_dir: String,
     pub argv: Vec<String>,
-    pub sources: HashMap<String, Vec<String>>,
+    pub sources: BTreeMap<String, Vec<String>>,
     pub type_epoch: u64,
     pub main_globals: Option<Obj>,
     pub exit_code: Option<i32>,
-    pub start: std::time::Instant,
+    pub start_ns: u64,
     pub next_id: usize,
     pub obj_new: Option<Obj>,
     pub obj_init: Option<Obj>,
     pub native_depth: usize,
     pub subclass_registry: Vec<std::rc::Weak<Object>>,
     pub ret_val: Value,
+    pub atexit: Vec<(Value, Vec<Value>, Vec<(Obj, Value)>)>,
+    pub gc_enabled: bool,
+    pub simple_namespace: Option<Obj>,
+    pub alias_types: Option<Rc<crate::builtins::alias::AliasTypes>>,
+    pub mappingproxy_type: Option<Obj>,
 }
 
 pub enum GenResult {
@@ -176,13 +183,19 @@ pub enum GenResult {
 impl Interp {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Interp {
+        Interp::with_platform(Box::new(StdPlatform::new()))
+    }
+
+    pub fn with_platform(platform: Box<dyn Platform>) -> Interp {
+        let platform: Box<dyn Platform> = Box::new(crate::platform::MemPlatform::new(platform, crate::frozen::fs()));
+        let start_ns = platform.monotonic_ns();
         let types = Types::create();
         let builtins = Object::new(Kind::Dict(RefCell::new(PyDict::new())));
         let modules = Object::new(Kind::Dict(RefCell::new(PyDict::new())));
         let mut it = Interp {
             frames: Vec::new(),
             types,
-            exc_types: HashMap::new(),
+            exc_types: BTreeMap::new(),
             builtins,
             modules,
             sys_module: None,
@@ -192,21 +205,27 @@ impl Interp {
             no_tb: false,
             repr_stack: Vec::new(),
             out: Vec::new(),
-            sink: Box::new(ProcessOutput),
+            sink: None,
+            platform: Rc::new(RefCell::new(platform)),
             path_set: false,
             script_dir: ".".into(),
             argv: Vec::new(),
-            sources: HashMap::new(),
+            sources: BTreeMap::new(),
             type_epoch: 0,
             main_globals: None,
             exit_code: None,
-            start: std::time::Instant::now(),
+            start_ns,
             next_id: 1,
             obj_new: None,
             obj_init: None,
             native_depth: 0,
             subclass_registry: Vec::new(),
             ret_val: Value::None,
+            atexit: Vec::new(),
+            gc_enabled: true,
+            simple_namespace: None,
+            alias_types: None,
+            mappingproxy_type: None,
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);
@@ -215,13 +234,22 @@ impl Interp {
 
     pub fn set_output(&mut self, sink: Box<dyn Output>) {
         self.flush_out();
-        self.sink = sink;
+        self.sink = Some(sink);
     }
 
     pub fn flush_out(&mut self) {
         if !self.out.is_empty() {
-            self.sink.write_stdout(&self.out);
-            self.sink.flush();
+            match &mut self.sink {
+                Some(s) => {
+                    s.write_stdout(&self.out);
+                    s.flush();
+                }
+                None => {
+                    let mut p = self.platform.borrow_mut();
+                    p.write_stdout(&self.out);
+                    p.flush_stdout();
+                }
+            }
             self.out.clear();
         }
     }
@@ -235,7 +263,10 @@ impl Interp {
 
     pub fn write_stderr(&mut self, s: &str) {
         self.flush_out();
-        self.sink.write_stderr(s.as_bytes());
+        match &mut self.sink {
+            Some(k) => k.write_stderr(s.as_bytes()),
+            None => self.platform.borrow_mut().write_stderr(s.as_bytes()),
+        }
     }
 
     // ---- frames ----------------------------------------------------------------------------
@@ -296,7 +327,7 @@ impl Interp {
             let fr = self.frames.last_mut().unwrap();
             if add_tb {
                 let line = fr.code.line_at(fr.pc.saturating_sub(1));
-                let entry_tb = TbEntry { file: fr.code.filename.clone(), line, name: fr.code.name.clone() };
+                let entry_tb = TbEntry { file: fr.code.filename.clone(), line, name: fr.code.name.clone(), code: fr.code.clone(), globals: fr.globals.clone() };
                 if let Kind::Exception(d) = &exc.kind {
                     d.borrow_mut().tb.push(entry_tb);
                 }
@@ -444,6 +475,9 @@ impl Interp {
                             &format!("cannot access local variable '{}' where it is not associated with a value", n),
                         ));
                     }
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                 }
                 Op::LoadName(i) => {
                     let fr = fr!();
@@ -468,7 +502,11 @@ impl Interp {
                     let name = fr.code.names[i as usize].clone();
                     let v = fr.stack.pop().unwrap();
                     let ns = fr.names.clone().unwrap_or_else(|| fr.globals.clone());
-                    dict_set_name(&ns, &name, v);
+                    if ns.cls.is_some() {
+                        self.setitem(&Value::Obj(ns), Value::Obj(name), v)?;
+                    } else {
+                        dict_set_name(&ns, &name, v);
+                    }
                 }
                 Op::DelName(i) => {
                     let fr = fr!();
@@ -476,6 +514,9 @@ impl Interp {
                     let ns = fr.names.clone().unwrap_or_else(|| fr.globals.clone());
                     if dict_del_name(&ns, &name).is_none() {
                         return Err(self.name_err(&name));
+                    }
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
                     }
                 }
                 Op::LoadGlobal(i) => {
@@ -503,6 +544,9 @@ impl Interp {
                     let g = fr.globals.clone();
                     if dict_del_name(&g, &name).is_none() {
                         return Err(self.name_err(&name));
+                    }
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
                     }
                 }
                 Op::LoadDeref(i) => {
@@ -855,6 +899,9 @@ impl Interp {
                     push!(f);
                 }
                 Op::Call(argc) => {
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     let fr = fr!();
                     let at = fr.stack.len() - argc as usize;
                     let args: Vec<Value> = fr.stack.drain(at..).collect();
@@ -864,6 +911,9 @@ impl Interp {
                     }
                 }
                 Op::CallKw(argc) => {
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     let names = pop!();
                     let fr = fr!();
                     let at = fr.stack.len() - argc as usize;
@@ -882,6 +932,9 @@ impl Interp {
                     }
                 }
                 Op::CallEx(flags) => {
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     let kwd = if flags & 1 != 0 { Some(pop!()) } else { None };
                     let args = pop!();
                     let f = pop!();
@@ -900,6 +953,9 @@ impl Interp {
                 Op::ReturnValue => {
                     let v = pop!();
                     self.frames.pop();
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     if self.frames.len() == entry {
                         return Ok(v);
                     }

@@ -4,7 +4,7 @@ use crate::dict::PyDict;
 use crate::object::*;
 use crate::vm::*;
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use crate::platform::{parent_dir, FoundModule};
 use std::rc::Rc;
 
 /// Runs `args[0]` as a script with `args` as `sys.argv` on the calling thread and returns the
@@ -16,6 +16,12 @@ pub fn run_main(args: &[String]) -> i32 {
         return 2;
     };
     it.set_argv(args);
+    if let Ok(extra) = std::env::var("PYTHONPATH") {
+        let abs = it.platform.borrow_mut().canonicalize(path);
+        let mut dirs = vec![parent_dir(&abs)];
+        dirs.extend(extra.split(':').filter(|d| !d.is_empty()).map(String::from));
+        it.set_path(&dirs);
+    }
     let code = it.run_file(path);
     it.flush_out();
     code
@@ -79,14 +85,17 @@ impl Interp {
         self.script_dir = dirs.first().cloned().unwrap_or_else(|| ".".into());
         self.path_set = true;
         if let Some(d) = self.sys_dict() {
-            dict_set_str(&d, "path", Value::list(dirs.iter().map(|a| Value::str(a)).collect()));
+            let mut entries: Vec<Value> = dirs.iter().map(|a| Value::str(a)).collect();
+            entries.push(Value::str(crate::frozen::FROZEN_DIR));
+            dict_set_str(&d, "path", Value::list(entries));
         }
     }
 
     /// Runs the file as `__main__`, returning its exit status. `sys.path` defaults to the file's
     /// directory unless [`Interp::set_path`] was called.
     pub fn run_file(&mut self, path: &str) -> i32 {
-        let src = match std::fs::read(path) {
+        let read = self.platform.borrow_mut().read_file(path);
+        let src = match read {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) => {
                 self.write_stderr(&format!("lumen-py: can't open file '{}': {}\n", path, e));
@@ -94,9 +103,8 @@ impl Interp {
             }
         };
         if !self.path_set {
-            let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-            let dir = abs.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".into());
-            self.set_path(&[dir]);
+            let abs = self.platform.borrow_mut().canonicalize(path);
+            self.set_path(&[parent_dir(&abs)]);
         }
         self.run_source(&src, path)
     }
@@ -129,6 +137,7 @@ impl Interp {
     }
 
     fn run_exit_hooks(&mut self) {
+        self.run_atexit();
         self.flush_out();
     }
 
@@ -148,21 +157,6 @@ impl Interp {
         let e = self.new_exc_str("ModuleNotFoundError", &msg);
         self.set_exc_attr(&e, "name", Value::str(name));
         e
-    }
-
-    fn find_on_path(&self, dirs: &[String], leaf: &str) -> Option<(PathBuf, bool)> {
-        for d in dirs {
-            let base = Path::new(d);
-            let pkg = base.join(leaf).join("__init__.py");
-            if pkg.is_file() {
-                return Some((pkg, true));
-            }
-            let file = base.join(format!("{}.py", leaf));
-            if file.is_file() {
-                return Some((file, false));
-            }
-        }
-        None
     }
 
     pub fn import_module(&mut self, full: &str) -> R<Obj> {
@@ -193,23 +187,18 @@ impl Interp {
             }
             None => (self.sys_path(), None),
         };
-        let (file, is_pkg) = match self.find_on_path(&dirs, leaf) {
-            Some(x) => x,
-            None => return Err(self.module_not_found(full, format!("No module named '{}'", full))),
+        let found = self.platform.borrow_mut().find_module(&dirs, leaf);
+        let Some(FoundModule { filename: file_s, source, is_package: is_pkg }) = found else {
+            return Err(self.module_not_found(full, format!("No module named '{}'", full)));
         };
-        let src = match std::fs::read(&file) {
-            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-            Err(e) => return Err(self.new_exc_str("ImportError", &format!("cannot read {}: {}", file.display(), e))),
-        };
-        let file_s = file.to_string_lossy().into_owned();
+        let src = String::from_utf8_lossy(&source).into_owned();
         let m = self.new_module(full);
         let g = self.module_dict(&m);
         dict_set_str(&g, "__file__", Value::str(&file_s));
         dict_set_str(&g, "__builtins__", Value::Obj(self.builtins.clone()));
         if is_pkg {
             dict_set_str(&g, "__package__", Value::str(full));
-            let pdir = file.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-            dict_set_str(&g, "__path__", Value::list(vec![Value::str(&pdir)]));
+            dict_set_str(&g, "__path__", Value::list(vec![Value::str(&parent_dir(&file_s))]));
         } else {
             dict_set_str(&g, "__package__", Value::str(parent_name.unwrap_or("")));
         }

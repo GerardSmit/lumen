@@ -105,7 +105,7 @@ fn ipc_fd(ctx: &mut Ctx, args: &[Value]) -> Result<i32, Value> {
 fn ipc_failure(ctx: &mut Ctx) -> Value {
     let error=std::io::Error::last_os_error();
     let value=ctx.make_error("Error",format!("IPC descriptor: {error}"));
-    let _=ctx.set_member(&value,"code",Value::str(crate::fsb::uv_code(&error)));value
+    let _=ctx.set_member(&value,"code",Value::str(lumen_os::errno::uv_code(&error)));value
 }
 fn op_ipc_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let fd=ipc_fd(ctx,args)?;
@@ -341,7 +341,7 @@ fn add_args(command: &mut Command, arg_list: &[String], verbatim: bool) {
 /// A failed spawn as an error carrying the errno `code` (`ENOENT` for a missing program); the JS
 /// glue turns it into Node's `spawn <file> ENOENT` error with `syscall`, `path` and `spawnargs`.
 fn spawn_failure(ctx: &mut Ctx, cmd: &str, e: &std::io::Error) -> Value {
-    let code = crate::fsb::uv_code(e);
+    let code = lumen_os::errno::uv_code(e);
     let err = ctx.make_error("Error", format!("spawn {cmd} {code}"));
     let _ = ctx.set_member(&err, "code", Value::str(code));
     err

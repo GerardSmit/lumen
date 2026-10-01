@@ -1,0 +1,14 @@
+3 2 12 3.5 3 1
+1024 -3 -3 4 -6
+True True True True True False
+2 7 5 16 4
+True False True True
+[1, 2] True 2 1
+[9, 3] 3
+7 2
+b ('a', 'c') 1
+1 2 1
+8 AB
+[('b', 2), ('a', 3)]
+[1, 2, 1, 2] [1, 2, 1, 2]
+matmul 3

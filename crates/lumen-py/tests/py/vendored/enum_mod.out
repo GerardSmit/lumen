@@ -1,0 +1,13 @@
+Color.RED <Color.GREEN: 2> Color.BLUE Color.RED
+[<Color.RED: 1>, <Color.GREEN: 2>, <Color.BLUE: 3>] 3 True
+RED=1 BLUE 3
+True True True
+ValueError 9 is not a valid Color
+True 3 1 2
+Mode.R|W True False False
+[1, 2]
+x y True
+True [<Alias.A: 1>, <Alias.C: 2>] Alias.A
+2
+ValueError
+AttributeError

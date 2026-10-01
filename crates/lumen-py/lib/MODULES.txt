@@ -1,0 +1,29 @@
+# Files copied unmodified from CPython's Lib/ by scripts/cpython-vendor.sh. One path per line,
+# relative to Lib/; blank lines and '#' comments are ignored.
+__future__.py
+_collections_abc.py
+_py_abc.py
+_weakrefset.py
+abc.py
+bisect.py
+collections/__init__.py
+collections/abc.py
+contextlib.py
+copy.py
+copyreg.py
+dataclasses.py
+enum.py
+functools.py
+graphlib.py
+heapq.py
+inspect.py
+keyword.py
+numbers.py
+operator.py
+reprlib.py
+string.py
+textwrap.py
+types.py
+typing.py
+warnings.py
+weakref.py

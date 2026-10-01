@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cpython-test-runner",
     "crates/lumen",
     "crates/lumen-aot",
     "crates/lumen-cli",
@@ -11,6 +12,7 @@ members = [
     "crates/lumen-host",
     "crates/lumen-macros",
     "crates/lumen-node",
+    "crates/lumen-os",
     "crates/lumen-py",
     "crates/lumen-repl",
     "crates/lumen-runtime",

@@ -1,6 +1,7 @@
 //! The format-spec mini-language, `str.format` and `%` formatting.
 
 use crate::pyint::{BigInt, PyInt};
+use crate::fmath;
 use crate::num::{float_repr, to_num, Num};
 use crate::object::*;
 use crate::vm::*;
@@ -809,7 +810,7 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                         if f.is_nan() || f.is_infinite() {
                             return Err(it.value_error("cannot convert float NaN or infinity to integer"));
                         }
-                        BigInt::from_f64_trunc(f.trunc())
+                        BigInt::from_f64_trunc(fmath::trunc(f))
                     }
                     None => {
                         if it.has_index(&arg) {

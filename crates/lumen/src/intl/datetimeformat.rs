@@ -8,15 +8,7 @@ use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, set_data, Gc, Value};
 
-/// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
+use lumen_common::civil::days_from_civil;
 
 /// The epoch-milliseconds a Temporal value formats at (ISO calendar, UTC).
 fn temporal_to_ms(t: &crate::temporal::Temporal) -> f64 {

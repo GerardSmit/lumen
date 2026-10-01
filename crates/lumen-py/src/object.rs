@@ -60,6 +60,7 @@ impl Drop for Object {
     fn drop(&mut self) {
         let id = self.id.get();
         if id != 0 {
+            crate::weak::on_object_drop(id);
             let _ = FREE_IDS.try_with(|f| f.borrow_mut().push(id));
         }
     }
@@ -153,6 +154,8 @@ pub enum Layout {
 pub const TF_HEAP: u32 = 1;
 pub const TF_NO_INSTANCE_DICT: u32 = 2;
 pub const TF_ABSTRACT: u32 = 4;
+/// Special methods defined in the type's own dict are dispatched like those of a heap class.
+pub const TF_DISPATCH: u32 = 8;
 
 pub struct TypeData {
     pub name: RefCell<Rc<str>>,
@@ -207,6 +210,8 @@ pub struct TbEntry {
     pub file: Rc<str>,
     pub line: u32,
     pub name: Rc<str>,
+    pub code: Rc<Code>,
+    pub globals: Obj,
 }
 
 pub struct ExcData {
@@ -256,7 +261,7 @@ pub enum FileMode {
     Stderr,
     Stdin,
     Read { data: Vec<u8>, pos: usize },
-    Write { path: String, buf: Vec<u8>, append: bool },
+    Write { handle: crate::platform::FileHandle, buf: Vec<u8>, append: bool },
     Closed,
 }
 
@@ -264,6 +269,7 @@ pub struct FileData {
     pub mode: FileMode,
     pub text: bool,
     pub name: String,
+    pub platform: Option<crate::platform::PlatformRef>,
 }
 
 pub struct RangeData {
@@ -306,6 +312,8 @@ pub enum Kind {
     File(RefCell<FileData>),
     Frame,
     AsyncGenValue(Value),
+    /// Native state owned by a builtin extension type (deque, partial, weakref, ...).
+    Opaque(RefCell<Box<dyn std::any::Any>>),
 }
 
 impl Object {

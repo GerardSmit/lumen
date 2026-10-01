@@ -2,7 +2,7 @@
 //! global, free or cell.
 
 use crate::ast::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 pub const DEF_GLOBAL: u32 = 1;
@@ -39,7 +39,7 @@ pub struct Scope {
     pub is_lambda: bool,
     pub name: Rc<str>,
     pub syms: Vec<(Rc<str>, Sym)>,
-    pub index: HashMap<Rc<str>, usize>,
+    pub index: BTreeMap<Rc<str>, usize>,
     pub children: Vec<usize>,
     pub is_gen: bool,
     pub is_async: bool,
@@ -62,7 +62,7 @@ impl Scope {
 
 pub struct SymTable {
     pub scopes: Vec<Scope>,
-    pub ids: HashMap<usize, usize>,
+    pub ids: BTreeMap<usize, usize>,
 }
 
 pub struct SymError {
@@ -84,42 +84,42 @@ pub fn mangle(private: &Option<Rc<str>>, name: &str) -> Rc<str> {
 
 struct Builder {
     scopes: Vec<Scope>,
-    ids: HashMap<usize, usize>,
+    ids: BTreeMap<usize, usize>,
     cur: usize,
     line: u32,
     err: Option<SymError>,
 }
 
 pub fn build(module: &Module) -> Result<SymTable, SymError> {
-    let mut b = Builder { scopes: Vec::new(), ids: HashMap::new(), cur: 0, line: 1, err: None };
+    let mut b = Builder { scopes: Vec::new(), ids: BTreeMap::new(), cur: 0, line: 1, err: None };
     b.new_scope(ScopeKind::Module, "<module>".into(), None, false);
     b.visit_body(&module.body);
     if let Some(e) = b.err.take() {
         return Err(e);
     }
     let mut t = SymTable { scopes: b.scopes, ids: b.ids };
-    let empty = HashSet::new();
+    let empty = BTreeSet::new();
     analyze(&mut t, 0, &empty)?;
     Ok(t)
 }
 
 pub fn build_expr(e: &Expr) -> Result<SymTable, SymError> {
-    let mut b = Builder { scopes: Vec::new(), ids: HashMap::new(), cur: 0, line: 1, err: None };
+    let mut b = Builder { scopes: Vec::new(), ids: BTreeMap::new(), cur: 0, line: 1, err: None };
     b.new_scope(ScopeKind::Module, "<module>".into(), None, false);
     b.visit_expr(e);
     if let Some(e) = b.err.take() {
         return Err(e);
     }
     let mut t = SymTable { scopes: b.scopes, ids: b.ids };
-    let empty = HashSet::new();
+    let empty = BTreeSet::new();
     analyze(&mut t, 0, &empty)?;
     Ok(t)
 }
 
-fn analyze(t: &mut SymTable, id: usize, bound: &HashSet<Rc<str>>) -> Result<HashSet<Rc<str>>, SymError> {
+fn analyze(t: &mut SymTable, id: usize, bound: &BTreeSet<Rc<str>>) -> Result<BTreeSet<Rc<str>>, SymError> {
     let kind = t.scopes[id].kind;
-    let mut local: HashSet<Rc<str>> = HashSet::new();
-    let mut free: HashSet<Rc<str>> = HashSet::new();
+    let mut local: BTreeSet<Rc<str>> = BTreeSet::new();
+    let mut free: BTreeSet<Rc<str>> = BTreeSet::new();
     let line = t.scopes[id].line;
     for (name, sym) in t.scopes[id].syms.iter_mut() {
         let f = sym.flags;
@@ -196,7 +196,7 @@ impl Builder {
             is_lambda: false,
             name,
             syms: Vec::new(),
-            index: HashMap::new(),
+            index: BTreeMap::new(),
             children: Vec::new(),
             is_gen: false,
             is_async: false,

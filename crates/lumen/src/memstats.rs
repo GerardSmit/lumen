@@ -29,7 +29,7 @@ pub fn enabled() -> bool {
             .flatten()
             .and_then(|v| v.parse::<usize>().ok())
         {
-            crate::fastalloc::trace_allocations_from(n);
+            lumen_common::fastalloc::trace_allocations_from(n);
         }
         on
     })
@@ -84,16 +84,11 @@ pub const CAT_NAMES: [&str; 12] = [
     "JIT metadata",
 ];
 
-#[cfg(feature = "mem-stats")]
-thread_local! {
-    static CUR_CAT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
 /// The current thread's allocation category (see [`Cat`]).
 #[cfg(feature = "mem-stats")]
 #[inline(always)]
 pub fn current_cat() -> u8 {
-    CUR_CAT.try_with(|c| c.get()).unwrap_or(0)
+    lumen_common::memcat::current()
 }
 
 /// Restores the previous category on drop (see [`enter`]).
@@ -106,7 +101,7 @@ pub struct CatGuard {
 #[cfg(feature = "mem-stats")]
 impl Drop for CatGuard {
     fn drop(&mut self) {
-        let _ = CUR_CAT.try_with(|c| c.set(self.prev));
+        lumen_common::memcat::replace(self.prev);
     }
 }
 
@@ -117,7 +112,7 @@ pub fn enter(cat: Cat) -> CatGuard {
     #[cfg(feature = "mem-stats")]
     {
         CatGuard {
-            prev: CUR_CAT.try_with(|c| c.replace(cat as u8)).unwrap_or(0),
+            prev: lumen_common::memcat::replace(cat as u8),
         }
     }
     #[cfg(not(feature = "mem-stats"))]
@@ -131,7 +126,7 @@ pub fn enter(cat: Cat) -> CatGuard {
 fn size_buckets() -> [[isize; 8]; 32] {
     #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
     {
-        crate::fastalloc::size_buckets()
+        lumen_common::fastalloc::size_buckets()
     }
     #[cfg(not(all(feature = "mem-stats", not(target_arch = "wasm32"))))]
     {
@@ -142,7 +137,7 @@ fn size_buckets() -> [[isize; 8]; 32] {
 pub fn categories() -> Option<[isize; 32]> {
     #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
     {
-        Some(crate::fastalloc::category_bytes())
+        Some(lumen_common::fastalloc::category_bytes())
     }
     #[cfg(not(all(feature = "mem-stats", not(target_arch = "wasm32"))))]
     {
@@ -478,7 +473,7 @@ pub fn address_space() -> Option<AddressSpace> {
 pub fn allocator() -> Option<(usize, usize, usize, usize)> {
     #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
     {
-        Some(crate::fastalloc::counters())
+        Some(lumen_common::fastalloc::counters())
     }
     #[cfg(not(all(feature = "mem-stats", not(target_arch = "wasm32"))))]
     {

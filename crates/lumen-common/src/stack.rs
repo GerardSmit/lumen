@@ -52,7 +52,7 @@ fn limit() -> usize {
 
 /// Bytes of native stack left above the limit on the current thread; `None` when exhausted.
 #[inline]
-pub(crate) fn headroom() -> Option<usize> {
+pub fn headroom() -> Option<usize> {
     #[cfg(target_arch = "wasm32")]
     {
         Some(usize::MAX)
@@ -65,14 +65,14 @@ pub(crate) fn headroom() -> Option<usize> {
 
 /// Whether the current thread's native stack is within the safety margin of its end.
 #[inline]
-pub(crate) fn exhausted() -> bool {
+pub fn exhausted() -> bool {
     headroom().is_none()
 }
 
 /// A recursion ceiling for code paths without a byte check (JIT direct calls): `depth` plus the
 /// number of [`UNIT_BYTES`] units that fit in `room`, capped at `max`.
 #[inline]
-pub(crate) fn depth_cap(depth: u32, room: usize, max: u32) -> u32 {
+pub fn depth_cap(depth: u32, room: usize, max: u32) -> u32 {
     let units = (room / UNIT_BYTES).min(u32::MAX as usize) as u32;
     depth.saturating_add(units).min(max)
 }

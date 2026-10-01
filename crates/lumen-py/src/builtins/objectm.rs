@@ -145,8 +145,67 @@ fn obj_subclasshook(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<V
     Ok(Value::NotImplemented)
 }
 
-fn obj_reduce_ex(it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    Err(it.type_error("cannot pickle object"))
+fn obj_getstate(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    it.check_args("__getstate__", a, 1, 1)?;
+    let Value::Obj(o) = &a[0] else { return Ok(Value::None) };
+    let d = match o.dict.borrow().as_ref() {
+        Some(d) if matches!(&d.kind, Kind::Dict(p) if !p.borrow().is_empty()) => d.clone(),
+        _ => return Ok(Value::None),
+    };
+    it.call_method(&Value::Obj(d), "copy", Vec::new())
+}
+
+fn obj_reduce_ex(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    it.check_args("__reduce_ex__", a, 1, 2)?;
+    let obj = &a[0];
+    if matches!(obj, Value::Obj(o) if matches!(o.kind, Kind::Type(_) | Kind::Function(_) | Kind::Native(_) | Kind::Module)) || !matches!(obj, Value::Obj(_)) {
+        return Err(it.type_error("cannot pickle object"));
+    }
+    if let Some(m) = it.user_special(obj, "__reduce__") {
+        return it.call_user_special(obj, &m, Vec::new());
+    }
+    let cls = it.type_of(obj);
+    let mut args = vec![Value::Obj(cls.clone())];
+    if let Some(m) = it.lookup_mro(&cls, "__getnewargs__") {
+        let b = it.bind_descr(&m, obj, &cls)?;
+        let extra = it.call(&b, Vec::new(), Vec::new())?;
+        args.extend(it.iterate_to_vec(&extra)?);
+    }
+    let state = it.call_method(obj, "__getstate__", Vec::new())?;
+    let layout = it.type_layout(&cls);
+    if matches!(layout, Layout::Set | Layout::FrozenSet) {
+        let items = it.iterate_to_vec(obj)?;
+        return Ok(Value::tuple(vec![Value::Obj(cls), Value::tuple(vec![Value::list(items)]), state]));
+    }
+    let base = match layout {
+        Layout::Tuple => Some(it.types.tuple.clone()),
+        Layout::Str => Some(it.types.str_.clone()),
+        Layout::Int => Some(it.types.int.clone()),
+        Layout::Float => Some(it.types.float.clone()),
+        Layout::Bytes => Some(it.types.bytes.clone()),
+        _ => None,
+    };
+    if let (Some(base), 1) = (base, args.len()) {
+        args.push(it.call(&Value::Obj(base), vec![obj.clone()], Vec::new())?);
+    }
+    let copyreg = it.import_module("copyreg")?;
+    let newobj = it.get_attr_str(&Value::Obj(copyreg), "__newobj__")?;
+    let is_list = it.isinstance_value(obj, &Value::Obj(it.types.list.clone()))?;
+    let is_dict = it.isinstance_value(obj, &Value::Obj(it.types.dict.clone()))?;
+    let listitems = if is_list { it.get_iter(obj)? } else { Value::None };
+    let dictitems = if is_dict {
+        let items = it.call_method(obj, "items", Vec::new())?;
+        it.get_iter(&items)?
+    } else {
+        Value::None
+    };
+    Ok(Value::tuple(vec![newobj, Value::tuple(args), state, listitems, dictitems]))
+}
+
+fn obj_reduce(it: &mut Interp, a: &[Value], kw: &[(Obj, Value)]) -> R<Value> {
+    it.check_args("__reduce__", a, 1, 1)?;
+    let args = [a[0].clone(), Value::Int(2)];
+    obj_reduce_ex(it, &args, kw)
 }
 
 impl Interp {
@@ -474,6 +533,8 @@ pub fn init(it: &mut Interp) {
     it.reg(&object, "__dir__", obj_dir);
     it.reg(&object, "__sizeof__", obj_sizeof);
     it.reg(&object, "__reduce_ex__", obj_reduce_ex);
+    it.reg(&object, "__reduce__", obj_reduce);
+    it.reg(&object, "__getstate__", obj_getstate);
     it.reg_class(&object, "__init_subclass__", obj_init_subclass);
     it.reg_class(&object, "__subclasshook__", obj_subclasshook);
     if let Some(d) = object.dict.borrow().as_ref() {

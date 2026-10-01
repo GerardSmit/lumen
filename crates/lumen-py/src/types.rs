@@ -304,6 +304,7 @@ impl Interp {
             Kind::ByteArray(_) => t.bytearray.clone(),
             Kind::Type(_) => t.type_.clone(),
             Kind::Function(_) => t.function.clone(),
+            Kind::Method(Value::Obj(f), _) if matches!(f.kind, Kind::Native(_)) => t.builtin_function.clone(),
             Kind::Method(..) => t.method.clone(),
             Kind::Native(_) => t.builtin_function.clone(),
             Kind::Module => t.module.clone(),
@@ -352,7 +353,7 @@ impl Interp {
             },
             Kind::File(_) => t.file.clone(),
             Kind::Frame => t.frame.clone(),
-            Kind::AsyncGenValue(_) => t.object.clone(),
+            Kind::AsyncGenValue(_) | Kind::Opaque(_) => t.object.clone(),
         }
     }
 
@@ -482,7 +483,7 @@ impl Interp {
         match v {
             Value::Obj(o) => match &o.kind {
                 Kind::Property(_) => true,
-                Kind::Instance => {
+                Kind::Instance | Kind::Opaque(_) => {
                     let c = self.type_of_obj(o);
                     self.lookup_mro(&c, "__set__").is_some() || self.lookup_mro(&c, "__delete__").is_some()
                 }
@@ -509,7 +510,7 @@ impl Interp {
             }
             Kind::StaticMethod(f) => Ok(f.clone()),
             Kind::ClassMethod(f) => Ok(Value::Obj(Object::new(Kind::Method(f.clone(), Value::Obj(cls.clone()))))),
-            Kind::Instance | Kind::Exception(_) => {
+            Kind::Instance | Kind::Exception(_) | Kind::Opaque(_) => {
                 let c = self.type_of_obj(o);
                 if let Some(g) = self.lookup_mro(&c, "__get__") {
                     let gb = self.bind_descr(&g, descr, &c)?;
@@ -530,7 +531,7 @@ impl Interp {
         match &o.kind {
             Kind::StaticMethod(f) => Ok(f.clone()),
             Kind::ClassMethod(f) => Ok(Value::Obj(Object::new(Kind::Method(f.clone(), Value::Obj(cls.clone()))))),
-            Kind::Instance => {
+            Kind::Instance | Kind::Opaque(_) => {
                 let c = self.type_of_obj(o);
                 if let Some(g) = self.lookup_mro(&c, "__get__") {
                     let gb = self.bind_descr(&g, descr, &c)?;
@@ -696,10 +697,7 @@ impl Interp {
             "__class__" => Value::Obj(self.type_of_obj(cls)),
             "__dict__" => {
                 let d = cls.dict.borrow().clone().unwrap();
-                match &d.kind {
-                    Kind::Dict(dd) => Value::dict(dd.borrow().clone()),
-                    _ => Value::None,
-                }
+                self.new_mappingproxy(Value::Obj(d))
             }
             "__module__" => {
                 if cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__module__")).is_some() {
@@ -907,11 +905,24 @@ impl Interp {
                 "fset" => return Ok(Some(p.fset.clone())),
                 "fdel" => return Ok(Some(p.fdel.clone())),
                 "__doc__" => return Ok(Some(p.doc.clone())),
+                "__isabstractmethod__" => {
+                    let parts = [p.fget.clone(), p.fset.clone(), p.fdel.clone()];
+                    for f in &parts {
+                        if !f.is_none() && self.is_abstract_value(f)? {
+                            return Ok(Some(Value::Bool(true)));
+                        }
+                    }
+                    return Ok(Some(Value::Bool(false)));
+                }
                 _ => {}
             },
             Kind::StaticMethod(f) | Kind::ClassMethod(f) => {
                 if nm == "__func__" {
                     return Ok(Some(f.clone()));
+                }
+                if nm == "__isabstractmethod__" {
+                    let f = f.clone();
+                    return Ok(Some(Value::Bool(self.is_abstract_value(&f)?)));
                 }
             }
             Kind::Complex(re, im) => match nm {
@@ -1041,6 +1052,14 @@ impl Interp {
                         self.type_epoch += 1;
                         return Ok(());
                     }
+                    "__abstractmethods__" => {
+                        let abstract_ = self.truthy(&v)?;
+                        let d = self.instance_dict(o);
+                        dict_set_name(&d, name, v);
+                        let f = td.flags.get();
+                        td.flags.set(if abstract_ { f | TF_ABSTRACT } else { f & !TF_ABSTRACT });
+                        return Ok(());
+                    }
                     _ => {}
                 }
                 let d = self.instance_dict(o);
@@ -1104,6 +1123,10 @@ impl Interp {
             }
             _ => {
                 if o.cls.is_some() {
+                    if self.lookup_mro(cls, "__slots__").is_some() && self.slots_forbid(cls, &nm) {
+                        let msg = format!("'{}' object has no attribute '{}' and no __dict__ for setting new attributes", self.type_name(cls), nm);
+                        return Err(self.new_exc_str("AttributeError", &msg));
+                    }
                     let dd = self.instance_dict(o);
                     dict_set_name(&dd, name, v);
                     Ok(())
@@ -1127,7 +1150,7 @@ impl Interp {
             let d = self.instance_dict(&o);
             dict_set_str(&d, "tb_lineno", Value::Int(e.line as i64));
             dict_set_str(&d, "tb_next", next);
-            dict_set_str(&d, "tb_frame", Value::None);
+            dict_set_str(&d, "tb_frame", self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line));
             dict_set_str(&d, "tb_lasti", Value::Int(0));
             next = Value::Obj(o);
         }
@@ -1261,6 +1284,20 @@ impl Interp {
             if args.len() != 3 {
                 return Err(self.type_error("type() takes 1 or 3 arguments"));
             }
+            let mut winner = cls.clone();
+            if let Some(bases) = args[1].tuple_items() {
+                for b in bases.iter() {
+                    if let Value::Obj(bo) = b {
+                        let bm = self.type_of_obj(bo);
+                        if self.is_subtype(&bm, &winner) {
+                            winner = bm;
+                        }
+                    }
+                }
+            }
+            if !Rc::ptr_eq(&winner, cls) {
+                return self.type_call_default(&winner, args, kw);
+            }
             return self.type_new_from_args(cls.clone(), &args, kw);
         }
         let new = match self.lookup_mro(cls, "__new__") {
@@ -1305,6 +1342,9 @@ impl Interp {
     }
 
     pub fn alloc_instance(&mut self, cls: &Obj) -> R<Value> {
+        if matches!(&cls.kind, Kind::Type(td) if td.flags.get() & TF_ABSTRACT != 0) {
+            self.check_abstract(cls)?;
+        }
         let layout = self.type_layout(cls);
         let exact = |t: &Obj, s: &Interp, base: &Obj| Rc::ptr_eq(t, base) || !s.is_heap(t);
         let kind = match layout {
@@ -1343,6 +1383,32 @@ impl Interp {
             Object::with_cls(cls.clone(), kind)
         };
         Ok(Value::Obj(o))
+    }
+
+    fn is_abstract_value(&mut self, f: &Value) -> R<bool> {
+        match self.get_attr_str(f, "__isabstractmethod__") {
+            Ok(v) => self.truthy(&v),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn check_abstract(&mut self, cls: &Obj) -> R<()> {
+        let names = match cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__abstractmethods__")) {
+            Some(v) => self.iterate_to_vec(&v)?,
+            None => return Ok(()),
+        };
+        let mut names: Vec<String> = names.iter().filter_map(|n| n.as_str().map(str::to_string)).collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+        names.sort();
+        let msg = format!(
+            "Can't instantiate abstract class {} with abstract method{} {}",
+            self.type_name(cls),
+            if names.len() > 1 { "s" } else { "" },
+            names.join(", ")
+        );
+        Err(self.type_error(&msg))
     }
 
     pub fn is_heap(&self, t: &Obj) -> bool {
@@ -1601,7 +1667,17 @@ impl Interp {
                 }
                 Ok(false)
             }
-            _ => Err(self.type_error("isinstance() arg 2 must be a type, a tuple of types, or a union")),
+            _ => match crate::builtins::alias::union_members(cls) {
+                Some(members) => {
+                    for m in &members {
+                        if self.isinstance_value(v, m)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                None => Err(self.type_error("isinstance() arg 2 must be a type, a tuple of types, or a union")),
+            },
         }
     }
 
@@ -1630,7 +1706,17 @@ impl Interp {
                 }
                 Ok(self.is_subtype(&s, c))
             }
-            _ => Err(self.type_error("issubclass() arg 2 must be a class, a tuple of classes, or a union")),
+            _ => match crate::builtins::alias::union_members(cls) {
+                Some(members) => {
+                    for m in &members {
+                        if self.issubclass_value(sub, m)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                None => Err(self.type_error("issubclass() arg 2 must be a class, a tuple of classes, or a union")),
+            },
         }
     }
 

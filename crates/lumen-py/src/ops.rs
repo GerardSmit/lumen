@@ -1,6 +1,7 @@
 //! Operator protocols: truthiness, comparison, arithmetic, subscripting, containment.
 
 use crate::ast::{BinOp, CmpOp};
+use crate::fmath;
 use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::UnOp;
 use crate::containers::pydict_of;
@@ -628,6 +629,11 @@ impl Interp {
     }
 
     pub fn native_binop(&mut self, op: BinOp, a: &Value, b: &Value) -> R<Option<Value>> {
+        if op == BinOp::BitOr {
+            if let Some(u) = self.union_binop(a, b)? {
+                return Ok(Some(u));
+            }
+        }
         if let Some(v) = self.num_binop(op, a, b)? {
             return Ok(if matches!(v, Value::NotImplemented) { None } else { Some(v) });
         }
@@ -917,7 +923,7 @@ impl Interp {
                 if a2 == 0.0 && b2 == 0.0 {
                     return Ok(mk(1.0, 0.0));
                 }
-                if b2 == 0.0 && a2 == a2.trunc() && a2.abs() <= 100.0 {
+                if b2 == 0.0 && a2 == fmath::trunc(a2) && a2.abs() <= 100.0 {
                     let mul = |x: (f64, f64), y: (f64, f64)| (x.0 * y.0 - x.1 * y.1, x.0 * y.1 + x.1 * y.0);
                     let mut n = a2.abs() as u32;
                     let (mut result, mut base) = ((1.0, 0.0), (a1, b1));
@@ -937,15 +943,15 @@ impl Interp {
                     }
                     return Ok(mk(result.0, result.1));
                 }
-                let r = (a1 * a1 + b1 * b1).sqrt();
-                let theta = b1.atan2(a1);
+                let r = fmath::sqrt(a1 * a1 + b1 * b1);
+                let theta = fmath::atan2(b1, a1);
                 if r == 0.0 {
                     return Ok(mk(0.0, 0.0));
                 }
-                let lnr = r.ln();
-                let nr = (a2 * lnr - b2 * theta).exp();
+                let lnr = fmath::ln(r);
+                let nr = fmath::exp(a2 * lnr - b2 * theta);
                 let nt = b2 * lnr + a2 * theta;
-                mk(nr * nt.cos(), nr * nt.sin())
+                mk(nr * fmath::cos(nt), nr * fmath::sin(nt))
             }
             _ => None,
         })
@@ -1258,7 +1264,7 @@ impl Interp {
                     return self.call(&b, vec![key.clone()], Vec::new());
                 }
                 if self.is_builtin_generic(o) {
-                    return Ok(obj.clone());
+                    return Ok(self.make_alias(obj.clone(), key));
                 }
                 let n = self.type_name(o);
                 Err(self.type_error(&format!("type '{}' is not subscriptable", n)))

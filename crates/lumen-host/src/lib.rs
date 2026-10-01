@@ -22,9 +22,9 @@ pub use lumen::bytecode::Tier;
 pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
 pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 
-/// Compression codecs (zlib, Brotli, Zstandard) over maintained crates, shared by web
-/// CompressionStream, node:zlib and the Bun APIs.
-pub mod codec;
+/// Compression codecs (zlib, Brotli, Zstandard), shared by web CompressionStream, node:zlib and
+/// the Bun APIs.
+pub use lumen_common::compress as codec;
 
 /// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
 /// `Date.now()`), where `std::time::Instant::now()` panics.

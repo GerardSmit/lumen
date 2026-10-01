@@ -1884,38 +1884,9 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
 // --- Uint8Array base64 / hex (the Stage-3 proposal) -------------------------------------------
 
 const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn b64_encode(bytes: &[u8], url: bool, pad: bool) -> String {
-    let alpha = if url { B64_URL } else { B64_STD };
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(alpha[(n >> 18 & 63) as usize] as char);
-        out.push(alpha[(n >> 12 & 63) as usize] as char);
-        match chunk.len() {
-            1 => {
-                if pad {
-                    out.push_str("==");
-                }
-            }
-            2 => {
-                out.push(alpha[(n >> 6 & 63) as usize] as char);
-                if pad {
-                    out.push('=');
-                }
-            }
-            _ => {
-                out.push(alpha[(n >> 6 & 63) as usize] as char);
-                out.push(alpha[(n & 63) as usize] as char);
-            }
-        }
-    }
-    out
-}
+use lumen_common::codec::base64_encode as b64_encode;
+
 /// FromBase64: decode at most `max_len` bytes honoring `handling` (loose / strict /
 /// stop-before-partial). Returns `(read, bytes)` where `read` is the code units consumed through
 /// the last fully decoded chunk; `Err(())` is a syntax error.

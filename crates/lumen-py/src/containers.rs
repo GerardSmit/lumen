@@ -25,13 +25,17 @@ impl Interp {
         if let Value::Obj(o) = v {
             if let Some(cls) = &o.cls {
                 if let Some((owner, m)) = self.lookup_mro_with_owner(cls, name) {
-                    if self.is_heap(&owner) {
+                    if self.is_heap(&owner) || self.dispatches_natively(&owner) {
                         return Some(m);
                     }
                 }
             }
         }
         None
+    }
+
+    fn dispatches_natively(&self, t: &Obj) -> bool {
+        matches!(&t.kind, Kind::Type(td) if td.flags.get() & TF_DISPATCH != 0)
     }
 
     pub fn call_user_special(&mut self, v: &Value, m: &Value, args: Vec<Value>) -> R<Value> {

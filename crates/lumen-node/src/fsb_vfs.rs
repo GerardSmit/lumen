@@ -32,22 +32,7 @@ impl From<std::io::Error> for UvErr {
 
 type R<T> = Result<T, UvErr>;
 
-pub fn uv_code(e: &std::io::Error) -> &'static str {
-    use std::io::ErrorKind as K;
-    match e.kind() {
-        K::NotFound => "ENOENT",
-        K::PermissionDenied => "EACCES",
-        K::AlreadyExists => "EEXIST",
-        K::InvalidInput => "EINVAL",
-        K::IsADirectory => "EISDIR",
-        K::NotADirectory => "ENOTDIR",
-        K::DirectoryNotEmpty => "ENOTEMPTY",
-        K::BrokenPipe => "EPIPE",
-        K::Unsupported => "ENOSYS",
-        K::OutOfMemory => "ENOMEM",
-        _ => "EIO",
-    }
-}
+pub use lumen_os::errno::uv_code;
 
 fn is_std(fd: i32) -> bool {
     (0..=2).contains(&fd) && !vfs::is_open(fd)

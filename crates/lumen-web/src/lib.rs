@@ -263,8 +263,6 @@ fn smuggle_high_scalars(s: String) -> String {
     out
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 /// Base64 of a Latin-1 string, or `null` when a char is past U+00FF.
 fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
@@ -275,17 +273,7 @@ fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
             Err(_) => return Ok(Value::Null),
         }
     }
-    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(B64[(n >> 18) as usize & 63]);
-        out.push(B64[(n >> 12) as usize & 63]);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] } else { b'=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] } else { b'=' });
-    }
-    Ok(Value::from_string(String::from_utf8(out).unwrap_or_default()))
+    Ok(Value::from_string(lumen_common::codec::base64_encode(&bytes, false, true)))
 }
 
 /// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
@@ -484,17 +472,17 @@ fn op_uuid(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value>
 }
 
 fn op_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    use sha2::Digest;
+    use lumen_common::hash::{digest, Algo};
     let name = str_arg(ctx, args, 0)?.unwrap_or_default();
     let v = args.get(1).unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "digest expects a BufferSource"));
     };
     let digest = match name.as_str() {
-        "SHA-1" => sha1::Sha1::digest(&bytes).to_vec(),
-        "SHA-256" => sha2::Sha256::digest(&bytes).to_vec(),
-        "SHA-384" => sha2::Sha384::digest(&bytes).to_vec(),
-        "SHA-512" => sha2::Sha512::digest(&bytes).to_vec(),
+        "SHA-1" => digest(Algo::Sha1, &bytes),
+        "SHA-256" => digest(Algo::Sha256, &bytes),
+        "SHA-384" => digest(Algo::Sha384, &bytes),
+        "SHA-512" => digest(Algo::Sha512, &bytes),
         _ => return Err(ctx.make_error("TypeError", format!("unsupported digest {name}"))),
     };
     ctx.make_uint8array(&digest)

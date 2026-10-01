@@ -39,7 +39,7 @@ mod eval;
 /// worker allocations with its own). Binaries opt in:
 /// `#[global_allocator] static A: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;`
 #[cfg(not(target_arch = "wasm32"))]
-pub mod fastalloc;
+pub use lumen_common::fastalloc;
 use lumen_common::fasthash;
 mod host;
 mod interpreter;
@@ -60,19 +60,15 @@ pub mod memstats;
 mod parser;
 pub mod precompiled;
 mod regex;
-mod regex_emoji;
-mod regex_fold;
 mod snapshot;
 mod split_view;
 mod str_index;
-mod stack;
+use lumen_common::stack;
 mod sync_callbacks;
 mod temporal;
 mod token;
-mod tz;
+use lumen_common::tz;
 pub mod typescript;
-#[rustfmt::skip]
-mod tzdata;
 #[rustfmt::skip]
 mod umalqura;
 #[cfg(feature = "intl")]

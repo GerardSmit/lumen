@@ -127,6 +127,7 @@ impl ZStream {
         Some(text.to_string_lossy().into_owned())
     }
 
+    #[allow(clippy::unnecessary_cast)] // `uLong` is 32-bit on some targets
     pub fn total_in(&self) -> u64 {
         self.strm.total_in as u64
     }
@@ -145,6 +146,7 @@ impl Drop for ZStream {
     }
 }
 
+#[inline]
 pub fn crc32_from(seed: u32, data: &[u8]) -> u32 {
     // SAFETY: the pointer and length describe a live slice.
     unsafe { z::crc32_z(seed as _, data.as_ptr(), data.len()) as u32 }

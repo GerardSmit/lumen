@@ -3,30 +3,39 @@
 use crate::object::*;
 use crate::vm::*;
 use std::cell::RefCell;
-use std::io::{BufRead, Read, Write};
+use crate::platform::{IoError, OpenMode};
 
 type Kw<'a> = &'a [(Obj, Value)];
 
 impl Drop for FileData {
     fn drop(&mut self) {
         flush_data(self);
+        release_handle(self);
     }
 }
 
 fn flush_data(fd: &mut FileData) {
-    if let FileMode::Write { path, buf, .. } = &mut fd.mode {
+    if let (FileMode::Write { handle, buf, .. }, Some(p)) = (&mut fd.mode, &fd.platform) {
         if !buf.is_empty() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path.as_str()) {
-                let _ = f.write_all(buf);
+            if let Ok(mut p) = p.try_borrow_mut() {
+                let _ = p.write_all(*handle, buf);
             }
             buf.clear();
         }
     }
 }
 
+fn release_handle(fd: &mut FileData) {
+    if let (FileMode::Write { handle, .. }, Some(p)) = (&fd.mode, &fd.platform) {
+        if let Ok(mut p) = p.try_borrow_mut() {
+            p.close(*handle);
+        }
+    }
+}
+
 pub fn new_file(it: &Interp, mode: FileMode, text: bool, name: &str) -> Value {
-    let _ = it;
-    Value::Obj(Object::new(Kind::File(RefCell::new(FileData { mode, text, name: name.to_string() }))))
+    let platform = Some(it.platform.clone());
+    Value::Obj(Object::new(Kind::File(RefCell::new(FileData { mode, text, name: name.to_string(), platform }))))
 }
 
 fn file_of<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a Obj> {
@@ -41,24 +50,19 @@ fn closed_err(it: &mut Interp) -> Obj {
 }
 
 impl Interp {
-    pub fn os_error(&mut self, e: &std::io::Error, filename: &str) -> Obj {
-        use std::io::ErrorKind::*;
-        let (name, errno, msg) = match e.kind() {
-            NotFound => ("FileNotFoundError", 2, "No such file or directory"),
-            PermissionDenied => ("PermissionError", 13, "Permission denied"),
-            AlreadyExists => ("FileExistsError", 17, "File exists"),
-            _ => {
-                if e.raw_os_error() == Some(21) {
-                    ("IsADirectoryError", 21, "Is a directory")
-                } else if e.raw_os_error() == Some(20) {
-                    ("NotADirectoryError", 20, "Not a directory")
-                } else {
-                    ("OSError", e.raw_os_error().unwrap_or(5) as i64, "Input/output error")
-                }
-            }
+    pub fn os_error(&mut self, e: &IoError, filename: &str) -> Obj {
+        use crate::platform::IoErrorKind::*;
+        let name = match e.kind {
+            NotFound => "FileNotFoundError",
+            PermissionDenied => "PermissionError",
+            AlreadyExists => "FileExistsError",
+            IsADirectory => "IsADirectoryError",
+            NotADirectory => "NotADirectoryError",
+            Other => "OSError",
         };
+        let msg = e.message();
         let cls = Value::Obj(self.exc_type(name));
-        let mut args = vec![Value::Int(errno), Value::str(msg)];
+        let mut args = vec![Value::Int(e.errno as i64), Value::str(msg)];
         if !filename.is_empty() {
             args.push(Value::str(filename));
         }
@@ -142,8 +146,7 @@ impl Interp {
             FileMode::Stdin => {
                 drop(fd);
                 self.flush_out();
-                let mut line = Vec::new();
-                let _ = std::io::stdin().lock().read_until(b'\n', &mut line);
+                let line = self.platform.borrow_mut().read_stdin_line();
                 return Ok(self.file_out(text, line));
             }
             FileMode::Closed => {
@@ -188,8 +191,7 @@ impl Interp {
             FileMode::Stdin => {
                 drop(fd);
                 self.flush_out();
-                let mut v = Vec::new();
-                let _ = std::io::stdin().lock().read_to_end(&mut v);
+                let v = self.platform.borrow_mut().read_stdin_to_end();
                 return Ok(self.file_out(text, v));
             }
             FileMode::Closed => {
@@ -212,6 +214,7 @@ impl Interp {
                 return;
             }
             flush_data(&mut fd);
+            release_handle(&mut fd);
             fd.mode = FileMode::Closed;
         }
     }
@@ -232,28 +235,26 @@ fn open(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     if mode.contains('+') {
         return Err(it.new_exc_str("NotImplementedError", "read-write file modes are not supported"));
     }
-    let fm = match kind {
-        'r' => match std::fs::read(&path) {
+    let open_mode = match kind {
+        'r' => OpenMode::Read,
+        'a' => OpenMode::Append,
+        'x' => OpenMode::CreateNew,
+        _ => OpenMode::Write,
+    };
+    let opened = it.platform.borrow_mut().open(&path, open_mode);
+    let handle = match opened {
+        Ok(h) => h,
+        Err(e) => return Err(it.os_error(&e, &path)),
+    };
+    let fm = if kind == 'r' {
+        let read = it.platform.borrow_mut().read_to_end(handle);
+        it.platform.borrow_mut().close(handle);
+        match read {
             Ok(data) => FileMode::Read { data, pos: 0 },
             Err(e) => return Err(it.os_error(&e, &path)),
-        },
-        'x' if std::path::Path::new(&path).exists() => {
-            let e = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
-            return Err(it.os_error(&e, &path));
         }
-        k => {
-            let mut oo = std::fs::OpenOptions::new();
-            oo.create(true);
-            if k == 'a' {
-                oo.append(true);
-            } else {
-                oo.write(true).truncate(true);
-            }
-            if let Err(e) = oo.open(&path) {
-                return Err(it.os_error(&e, &path));
-            }
-            FileMode::Write { path: path.clone(), buf: Vec::new(), append: k == 'a' }
-        }
+    } else {
+        FileMode::Write { handle, buf: Vec::new(), append: kind == 'a' }
     };
     Ok(new_file(it, fm, !binary, &path))
 }

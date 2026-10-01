@@ -1,7 +1,9 @@
 //! Builtin functions, types and native modules.
 
+pub mod alias;
 pub mod args;
 pub mod bytesm;
+pub mod descr;
 pub mod dictm;
 pub mod excgroup;
 pub mod excm;
@@ -10,12 +12,20 @@ pub mod format;
 pub mod funcs;
 pub mod genm;
 pub mod iterm;
+pub mod itertools;
 pub mod listm;
 pub mod modules;
+pub mod native;
 pub mod numeric;
 pub mod objectm;
 pub mod slots;
 pub mod strm;
+pub mod sysextra;
+pub mod sysmods;
+pub mod weakm;
+pub mod stringm;
+pub mod warningsm;
+pub mod collectionsm;
 
 use crate::object::*;
 use crate::vm::*;
@@ -33,6 +43,8 @@ pub fn init(it: &mut Interp) {
     excgroup::init(it);
     file::init(it);
     funcs::init(it);
+    sysextra::init_frame_type(it);
+    descr::init(it);
     modules::init(it);
     register_names(it);
 }
@@ -67,6 +79,9 @@ fn register_names(it: &mut Interp) {
         ("filter", t.filter.clone()),
         ("reversed", t.reversed.clone()),
     ];
+    if let Some(d) = it.types.object.dict.borrow().as_ref() {
+        dict_set_str(d, "__doc__", Value::str("The base class of the class hierarchy."));
+    }
     for (n, o) in named {
         dict_set_str(&b, n, Value::Obj(o));
     }

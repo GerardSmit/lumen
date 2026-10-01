@@ -132,6 +132,7 @@ macro_rules! define_hasher {
                 }
             }
 
+            #[inline]
             pub fn update(&mut self, data: &[u8]) {
                 match self {
                     $(Hasher::$variant(h) => Digest::update(h, data),)*
@@ -201,6 +202,7 @@ impl Hasher {
     }
 }
 
+#[inline]
 pub fn digest(algo: Algo, data: &[u8]) -> Vec<u8> {
     let mut h = Hasher::new(algo);
     h.update(data);
@@ -226,6 +228,7 @@ macro_rules! define_hmac {
                 })
             }
 
+            #[inline]
             pub fn update(&mut self, data: &[u8]) {
                 match self {
                     $(Hmac::$variant(m) => Mac::update(m, data),)*
@@ -242,6 +245,7 @@ macro_rules! define_hmac {
 }
 fixed_digests!(define_hmac);
 
+#[inline]
 pub fn hmac(algo: Algo, key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut h = Hmac::new(algo, key).expect("HMAC is defined over this digest");
     h.update(data);

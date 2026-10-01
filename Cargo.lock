@@ -320,6 +320,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpython-test-runner"
+version = "0.1.3"
+
+[[package]]
 name = "crypto-bigint"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -810,6 +814,24 @@ version = "0.1.3"
 [[package]]
 name = "lumen-common"
 version = "0.1.3"
+dependencies = [
+ "blake2",
+ "brotli",
+ "digest",
+ "hkdf",
+ "hmac",
+ "libz-rs-sys",
+ "md-5",
+ "pbkdf2",
+ "ripemd",
+ "ruzstd",
+ "scrypt",
+ "sha1",
+ "sha2",
+ "sha3",
+ "sm3",
+ "zstd",
+]
 
 [[package]]
 name = "lumen-difftest"
@@ -829,15 +851,12 @@ dependencies = [
 name = "lumen-host"
 version = "0.1.3"
 dependencies = [
- "brotli",
  "getrandom 0.2.17",
  "js-sys",
- "libz-rs-sys",
  "lumen",
- "ruzstd",
+ "lumen-common",
  "wasm-bindgen",
  "web-time",
- "zstd",
 ]
 
 [[package]]
@@ -855,7 +874,6 @@ dependencies = [
  "base64",
  "base64ct",
  "bcrypt",
- "blake2",
  "cbc",
  "ccm",
  "cfb-mode",
@@ -866,7 +884,6 @@ dependencies = [
  "ctr",
  "der",
  "des",
- "digest",
  "dsa",
  "ecb",
  "ecdsa",
@@ -875,13 +892,13 @@ dependencies = [
  "elliptic-curve",
  "getrandom 0.2.17",
  "ghash",
- "hkdf",
- "hmac",
  "k256",
  "libc",
  "libsqlite3-sys",
  "lumen",
+ "lumen-common",
  "lumen-host",
+ "lumen-os",
  "lumen-tls",
  "md-5",
  "num-bigint-dig",
@@ -890,25 +907,28 @@ dependencies = [
  "p256",
  "p384",
  "p521",
- "pbkdf2",
  "pkcs1",
  "pkcs5",
  "pkcs8",
  "poly1305",
  "rand_core",
- "ripemd",
  "rsa",
  "scrypt",
  "sec1",
  "sha1",
  "sha2",
- "sha3",
  "signature",
- "sm3",
  "spki",
  "subtle",
  "x25519-dalek",
  "x509-cert",
+]
+
+[[package]]
+name = "lumen-os"
+version = "0.1.3"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -973,10 +993,9 @@ dependencies = [
  "js-sys",
  "lumen",
  "lumen-codegen",
+ "lumen-common",
  "lumen-host",
  "lumen-tls",
- "sha1",
- "sha2",
  "wasm-bindgen",
 ]
 

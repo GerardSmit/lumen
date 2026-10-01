@@ -355,7 +355,7 @@ impl Interp {
         }
     }
 
-    fn repr_enter(&mut self, o: &Obj) -> bool {
+    pub fn repr_enter(&mut self, o: &Obj) -> bool {
         let id = Rc::as_ptr(o) as *const u8 as usize;
         if self.repr_stack.contains(&id) {
             return true;
@@ -364,7 +364,7 @@ impl Interp {
         false
     }
 
-    fn repr_leave(&mut self) {
+    pub fn repr_leave(&mut self) {
         self.repr_stack.pop();
     }
 

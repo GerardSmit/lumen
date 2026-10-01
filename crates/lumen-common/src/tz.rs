@@ -90,3 +90,21 @@ pub fn next_transition(name: &str, epoch_sec: i64, forward: bool) -> Option<i64>
             .map(|&(t, _)| t)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offsets_and_names() {
+        assert_eq!(canonicalize("america/new_york"), Some("America/New_York"));
+        assert_eq!(canonicalize("Etc/UTC"), Some("UTC"));
+        assert_eq!(canonicalize("Asia/Calcutta"), Some("Asia/Kolkata"));
+        assert_eq!(registry_name("asia/calcutta"), Some("Asia/Calcutta"));
+        assert_eq!(canonicalize("Mars/Base"), None);
+        assert_eq!(offset_at("America/New_York", 1_719_792_000), Some(-4 * 3600));
+        assert_eq!(offset_at("America/New_York", 1_704_067_200), Some(-5 * 3600));
+        assert_eq!(next_transition("America/New_York", 1_704_067_200, true), Some(1_710_054_000));
+        assert!(canonical_zone_names().contains(&"America/New_York"));
+    }
+}

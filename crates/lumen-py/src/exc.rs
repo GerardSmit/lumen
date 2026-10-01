@@ -7,7 +7,8 @@ use std::rc::Rc;
 impl Interp {
     pub fn source_line(&mut self, file: &str, line: u32) -> Option<String> {
         if !self.sources.contains_key(file) {
-            let lines = std::fs::read_to_string(file).map(|s| s.lines().map(|l| l.to_string()).collect()).unwrap_or_default();
+            let read = self.platform.borrow_mut().read_file(file);
+            let lines = read.map(|b| String::from_utf8_lossy(&b).lines().map(|l| l.to_string()).collect()).unwrap_or_default();
             self.sources.insert(file.to_string(), lines);
         }
         let l = self.sources.get(file)?.get((line as usize).checked_sub(1)?)?;

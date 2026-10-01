@@ -44,7 +44,7 @@ bench = []
 # free-list-cached bytes). They sit on the allocation fast path, so they are off by default; the
 # rest of the report (OS counters, system-heap summary, the engine's per-category walk) works
 # without this feature.
-mem-stats = []
+mem-stats = ["lumen-common/mem-stats"]
 
 [lints]
 workspace = true
