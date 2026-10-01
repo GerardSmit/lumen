@@ -1456,7 +1456,13 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         // A non-object first argument is a length (ToIndex): NaN→0, negative/too-large→RangeError,
         // a Symbol/BigInt → TypeError via ToNumber.
         Some(v) if !matches!(v, Value::Obj(_)) => {
-            let len = to_index(i, v)?;
+            let n = ab(i.to_number(v))?;
+            let n = if n.is_nan() { 0.0 } else { n.trunc() };
+            if !(0.0..=9007199254740991.0).contains(&n) {
+                let shown = i.num_to_str(n);
+                return Err(i.make_error("RangeError", format!("Invalid typed array length: {shown}")));
+            }
+            let len = n as usize;
             // A fresh typed array is one flat allocation, so the byte ceiling is the bound —
             // not the element cap that guards Value-per-element arrays. `Buffer.alloc(2 MiB)`
             // is ordinary Node.

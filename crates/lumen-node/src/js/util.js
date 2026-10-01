@@ -1973,6 +1973,11 @@ function diff(actual, expected) {
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~A-Za-z0-9]+$/;
 const NEEDS_QUOTE = /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/;
 
+function mimeInvalid(production, str, re) {
+  const m = re.exec(str);
+  return new __errors.ERR_INVALID_MIME_SYNTAX(production, str, m ? m.index : -1);
+}
+
 function serializeParamValue(value) {
   if (value.length === 0 || NEEDS_QUOTE.test(value)) {
     return `"${value.replace(/["\\]/g, "\\$&")}"`;
@@ -1994,8 +1999,9 @@ class MIMEParams {
     name = `${name}`;
     value = `${value}`;
     if (!HTTP_TOKEN.test(name)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME parameter name "${name}" is invalid`);
+      throw mimeInvalid("parameter name", name, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     }
+    if (/[^\t\u0020-\u007e\u0080-\u00ff]/.test(value)) throw mimeInvalid("parameter value", value, /[^\t\u0020-\u007e\u0080-\u00ff]/);
     this.#data.set(name, value);
   }
   delete(name) {
@@ -2022,6 +2028,12 @@ class MIMEParams {
     for (const [name, value] of this.#data) out += `;${name}=${serializeParamValue(value)}`;
     return out;
   }
+  toString() {
+    return this._serialize().slice(1);
+  }
+  toJSON() {
+    return this.toString();
+  }
 }
 
 class MIMEType {
@@ -2030,10 +2042,10 @@ class MIMEType {
   #params = new MIMEParams();
 
   constructor(input) {
-    input = `${input}`.trim();
+    input = `${input}`.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
     const slash = input.indexOf("/");
     if (slash === -1) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME syntax for "${input}" is invalid: missing "/"`);
+      throw new __errors.ERR_INVALID_MIME_SYNTAX("type", input, -1);
     }
     const type = input.slice(0, slash).toLowerCase();
     let rest = input.slice(slash + 1);
@@ -2045,47 +2057,59 @@ class MIMEType {
     } else {
       rest = "";
     }
-    subtype = subtype.trim().toLowerCase();
-    if (!HTTP_TOKEN.test(type) || !HTTP_TOKEN.test(subtype)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME syntax for "${input}" is invalid`);
-    }
+    subtype = subtype.replace(/[ \t\r\n]+$/, "").toLowerCase();
+    if (!HTTP_TOKEN.test(type)) throw mimeInvalid("type", type, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
+    if (!HTTP_TOKEN.test(subtype)) throw mimeInvalid("subtype", subtype, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     this.#type = type;
     this.#subtype = subtype;
     this.#parseParams(rest);
   }
 
   #parseParams(str) {
-    let i = 0;
     const n = str.length;
+    const ws = (c) => c === " " || c === "\t" || c === "\r" || c === "\n";
+    let i = 0;
     while (i < n) {
-      while (i < n && (str[i] === ";" || str[i] === " " || str[i] === "\t")) i++;
-      if (i >= n) break;
+      while (i < n && ws(str[i])) i++;
       let name = "";
       while (i < n && str[i] !== "=" && str[i] !== ";") name += str[i++];
-      name = name.trim().toLowerCase();
-      if (str[i] !== "=") {
-        while (i < n && str[i] !== ";") i++;
+      name = name.toLowerCase();
+      if (i >= n) break;
+      if (str[i] === ";") {
+        i++;
         continue;
       }
-      i++; // skip '='
+      i++;
+      if (i >= n) break;
       let value = "";
+      let quoted = false;
       if (str[i] === '"') {
+        quoted = true;
         i++;
-        while (i < n && str[i] !== '"') {
-          if (str[i] === "\\" && i + 1 < n) {
-            value += str[i + 1];
-            i += 2;
-            continue;
-          }
-          value += str[i++];
+        while (i < n) {
+          const c = str[i++];
+          if (c === '"') break;
+          if (c === "\\") {
+            if (i >= n) {
+              value += c;
+              break;
+            }
+            value += str[i++];
+          } else value += c;
         }
-        i++; // closing quote
         while (i < n && str[i] !== ";") i++;
       } else {
         while (i < n && str[i] !== ";") value += str[i++];
-        value = value.trim();
+        value = value.replace(/[ \t\r\n]+$/, "");
+        if (value === "") {
+          i++;
+          continue;
+        }
       }
-      if (name && HTTP_TOKEN.test(name) && !this.#params.has(name)) this.#params._setRaw(name, value);
+      i++;
+      if (name && HTTP_TOKEN.test(name) && /^[\t\u0020-\u007e\u0080-\u00ff]*$/.test(value) && !this.#params.has(name)) {
+        this.#params._setRaw(name, value);
+      }
     }
   }
 
@@ -2095,7 +2119,7 @@ class MIMEType {
   set type(value) {
     value = `${value}`.toLowerCase();
     if (!HTTP_TOKEN.test(value)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME type "${value}" is invalid`);
+      throw mimeInvalid("type", value, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     }
     this.#type = value;
   }
@@ -2105,7 +2129,7 @@ class MIMEType {
   set subtype(value) {
     value = `${value}`.toLowerCase();
     if (!HTTP_TOKEN.test(value)) {
-      throw codedError(TypeError, "ERR_INVALID_MIME_SYNTAX", `The MIME subtype "${value}" is invalid`);
+      throw mimeInvalid("subtype", value, /[^!#$%&'*+\-.^_`|~A-Za-z0-9]/);
     }
     this.#subtype = value;
   }

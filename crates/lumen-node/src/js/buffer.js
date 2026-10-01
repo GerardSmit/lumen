@@ -257,8 +257,36 @@ function fromArrayBuffer(ab, byteOffset, length) {
 function fromArrayLike(obj) {
   const len = obj.length;
   if (!(len > 0)) return new BufferClass(0);
-  const b = new BufferClass(len);
+  const b = len < (Buffer.poolSize >>> 1) ? pooled(len) : new BufferClass(len);
   b.set(obj);
+  return b;
+}
+
+// Small buffers share one pool ArrayBuffer, as Node's do (`Buffer.poolSize`). The pool is never
+// transferred to another thread: a transfer list entry for it is cloned instead.
+const kUntransferable = Symbol.for("nodejs.untransferable");
+let allocPool;
+let poolOffset = 0;
+let currentPoolSize = 0;
+function createPool() {
+  currentPoolSize = Buffer.poolSize;
+  allocPool = new ArrayBuffer(currentPoolSize);
+  Object.defineProperty(allocPool, kUntransferable, { value: true });
+  poolOffset = 0;
+}
+function pooled(size) {
+  if (allocPool === undefined || size > currentPoolSize - poolOffset) createPool();
+  const b = new BufferClass(allocPool, poolOffset, size);
+  poolOffset += size;
+  if (poolOffset & 7) poolOffset = (poolOffset | 7) + 1;
+  return b;
+}
+function fromString(str, enc) {
+  const bytes = bytesFromString(str, enc);
+  const n = bytes.length;
+  if (n === 0 || n >= (Buffer.poolSize >>> 1)) return adopt(bytes);
+  const b = pooled(n);
+  b.set(bytes);
   return b;
 }
 
@@ -275,12 +303,12 @@ function isAnyArrayBuffer(v) {
 
 class Buffer extends Uint8Array {
   static of(...items) {
-    const b = new BufferClass(items.length);
+    const b = items.length > 0 && items.length < (Buffer.poolSize >>> 1) ? pooled(items.length) : new BufferClass(items.length);
     for (let i = 0; i < items.length; i++) b[i] = items[i];
     return b;
   }
   static from(value, encodingOrOffset, length) {
-    if (typeof value === "string") return adopt(bytesFromString(value, encodingOrOffset));
+    if (typeof value === "string") return fromString(value, encodingOrOffset);
     if (typeof value === "object" && value !== null) {
       if (isAnyArrayBuffer(value)) return fromArrayBuffer(value, encodingOrOffset, length);
       const valueOf = value.valueOf && value.valueOf();
@@ -307,11 +335,9 @@ class Buffer extends Uint8Array {
   }
   static allocUnsafe(size) {
     validateSize(size);
+    if (size > 0 && size < (Buffer.poolSize >>> 1)) return pooled(size);
     return new Buffer(size);
   }
-  // Node distinguishes allocUnsafeSlow (un-pooled) from allocUnsafe; we don't pool, so they are
-  // the same. Its presence also matters for feature-detection: safe-buffer only passes the real
-  // Buffer through when all four of from/alloc/allocUnsafe/allocUnsafeSlow exist.
   static allocUnsafeSlow(size) {
     validateSize(size);
     return new Buffer(size);
@@ -758,8 +784,7 @@ for (const [method, enc] of [["utf8", "utf8"], ["hex", "hex"], ["latin1", "latin
   Buffer.prototype[method + "Write"] = function (string, offset, length) { return this.write(string, offset, length, enc); };
 }
 
-// Node deprecated SlowBuffer (it used to return an un-pooled Buffer); we never pool, so it is just
-// an un-pooled allocation.
+// Node deprecated SlowBuffer: an un-pooled allocation.
 function SlowBuffer(length) {
   return Buffer.allocUnsafeSlow(length);
 }
@@ -788,28 +813,30 @@ function isUtf8(input) {
   return __native.isUtf8(bytesOf(input, "input"));
 }
 
-// Re-encode bytes from one encoding to another by round-tripping through a JS string. Covers every
-// pair the Buffer codec already supports; unknown encodings throw a Node-shaped ERR_UNKNOWN_ENCODING
-// (Node itself surfaces an ICU error here, but an explicit unknown-encoding throw is the honest
-// signal on an engine without ICU's transcoder).
+// Node's ICU-backed transcode between utf8, ucs2/utf16le, latin1 and ascii. Characters the target
+// cannot represent become "?" (one per code point); undecodable source bytes become U+FFFD.
+const TRANSCODE_ENC = { utf8: "utf8", "utf-8": "utf8", ucs2: "ucs2", "ucs-2": "ucs2", utf16le: "ucs2",
+  "utf-16le": "ucs2", latin1: "latin1", binary: "latin1", ascii: "ascii" };
 function transcode(source, fromEnc, toEnc) {
-  if (!ArrayBuffer.isView(source) && !(source instanceof ArrayBuffer)) {
-    const err = new TypeError('The "source" argument must be an instance of Buffer or Uint8Array.');
-    err.code = "ERR_INVALID_ARG_TYPE";
+  if (!(source instanceof Uint8Array)) {
+    throw new __errors.ERR_INVALID_ARG_TYPE("source", ["Buffer", "Uint8Array"], source);
+  }
+  if (source.length === 0) return Buffer.alloc(0);
+  const from = TRANSCODE_ENC[`${fromEnc}`.toLowerCase()];
+  const to = TRANSCODE_ENC[`${toEnc}`.toLowerCase()];
+  if (from === undefined || to === undefined) {
+    const err = new Error("Unable to transcode Buffer [U_ILLEGAL_ARGUMENT_ERROR]");
+    err.code = "U_ILLEGAL_ARGUMENT_ERROR";
+    err.errno = 1;
     throw err;
   }
-  for (const enc of [fromEnc, toEnc]) {
-    if (!Buffer.isEncoding(enc)) {
-      const err = new Error(`Unknown encoding: ${enc}`);
-      err.code = "ERR_UNKNOWN_ENCODING";
-      throw err;
-    }
-  }
-  const bytes =
-    source instanceof ArrayBuffer
-      ? new Uint8Array(source)
-      : new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
-  return adopt(bytesFromString(stringFromBytes(bytes, fromEnc), toEnc));
+  const bytes = new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+  let str;
+  if (from === "ascii") str = __native.decode(bytes, encodingId("latin1"), 0, bytes.length).replace(/[\x80-\xff]/g, "\ufffd");
+  else str = __native.decode(bytes, encodingId(from), 0, from === "ucs2" ? bytes.length & ~1 : bytes.length);
+  if (to === "latin1") str = str.replace(/[^\x00-\xff]/gu, "?");
+  else if (to === "ascii") str = str.replace(/[^\x00-\x7f]/gu, "?");
+  return adopt(__native.encode(str, encodingId(to)));
 }
 
 // Node's resolveObjectURL: "blob:nodedata:<id>" -> a new Blob over the registered one's data, or
@@ -917,6 +944,7 @@ Object.defineProperty(Buffer.prototype, "inspect", {
 Object.defineProperty(Buffer, Symbol.species, { get() { return BufferClass; }, enumerable: false, configurable: true });
 
 // Node's pool granularity; lumen does not pool, but code sizes allocations off this value.
+Buffer.prototype.toLocaleString = Buffer.prototype.toString;
 Buffer.poolSize = 8 * 1024;
 
 // Buffer.copyBytesFrom(view[, offset[, length]]): a copy of a TypedArray's elements' bytes.

@@ -295,13 +295,16 @@ function cloneTransferableSignal(signal) {
     clone._doAbort(signal.reason);
   } else {
     signal.addEventListener("abort", () => {
-      const timer = setTimeout(() => clone._doAbort(signal.reason), 0);
+      const timer = typeof setImmediate === "function"
+        ? setImmediate(() => clone._doAbort(signal.reason))
+        : setTimeout(() => clone._doAbort(signal.reason), 0);
       if (typeof timer?.unref === "function") timer.unref();
     }, { once: true });
   }
   return clone;
 }
 
+Object.defineProperty(globalThis, "__cloneTransferableSignal", { value: cloneTransferableSignal, configurable: true });
 globalThis.DOMException = DOMException;
 globalThis.Event = Event;
 globalThis.CustomEvent = CustomEvent;

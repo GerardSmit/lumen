@@ -34,6 +34,7 @@ mod proxy;
 mod reflect;
 mod regexp;
 mod shadowrealm;
+pub(crate) mod vm_context;
 mod string_code_point;
 mod string_substring;
 pub(crate) use string_code_point::nf_code_point_at;
@@ -796,6 +797,10 @@ pub(crate) fn proxy_gopd_value(
         ));
     }
     let pd = ab(build_partial(i, &res))?;
+    // A `vm` context's interceptor reports the sandbox's descriptors as they are.
+    if vm_context::is_vm_handler(handler) {
+        return Ok(descriptor_from_prop(i, complete_descriptor(pd)));
+    }
     // A descriptor may be reported for a property the target lacks only on an extensible target.
     if let Value::Obj(t) = target {
         if !t.borrow().props.contains(key) && !t.borrow().extensible {
@@ -985,6 +990,9 @@ fn proxy_define_property(
     )?;
     if !i.to_boolean(&res) {
         return Ok(false);
+    }
+    if vm_context::is_vm_handler(handler) {
+        return Ok(true);
     }
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
@@ -4036,6 +4044,9 @@ pub(crate) fn object_define_property(
             &key,
             &descriptor,
         ))? {
+            if vm_context::is_vm_handler(&handler) {
+                return Err(i.make_error("TypeError", format!("Cannot redefine property: {}", vm_context::key_display(i, &key))));
+            }
             return Err(i.make_error("TypeError", "proxy defineProperty returned a falsish value"));
         }
         return Ok(Value::Obj(o));
@@ -9046,17 +9057,32 @@ fn to_uint32(n: f64) -> u32 {
     n.trunc().rem_euclid(4294967296.0) as u32
 }
 
-/// A small deterministic PRNG for `Math.random` (lumen has no entropy source; tests only check the
-/// `[0, 1)` range, not distribution).
+/// `Math.random`: xorshift128+ per thread, seeded from the OS-keyed `RandomState` (std's per-process
+/// random SipHash keys) so every process and thread draws its own sequence.
 fn next_random() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x >> 11) as f64 / (1u64 << 53) as f64
+    use std::cell::Cell;
+    use std::hash::{BuildHasher, Hasher};
+    thread_local! {
+        static STATE: Cell<[u64; 2]> = const { Cell::new([0, 0]) };
+    }
+    STATE.with(|cell| {
+        let mut s = cell.get();
+        if s == [0, 0] {
+            let seed = |salt: u64| {
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u64(salt);
+                h.finish()
+            };
+            s = [seed(0x9E37_79B9_7F4A_7C15) | 1, seed(0xBF58_476D_1CE4_E5B9)];
+        }
+        let mut x = s[0];
+        let y = s[1];
+        s[0] = y;
+        x ^= x << 23;
+        s[1] = x ^ y ^ (x >> 17) ^ (y >> 26);
+        cell.set(s);
+        ((s[1].wrapping_add(y)) >> 11) as f64 / (1u64 << 53) as f64
+    })
 }
 
 fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {

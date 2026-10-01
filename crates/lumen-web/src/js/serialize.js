@@ -33,6 +33,13 @@ const T_NUMOBJ = 19;
 const T_STROBJ = 20;
 const T_SHARED = 21;
 const T_PORT = 22;
+const T_HOST = 23;
+
+// Platform objects (KeyObject, CryptoKey, X509Certificate, ...) clone through `[kTransferClone]()`,
+// which returns `{ data, deserializeInfo: "module:name" }`, and are rebuilt on the receiving side by
+// `globalThis.__lumenCloneResolve(deserializeInfo)` (see `cloneHostObject` / `reviveHostObject`).
+const kTransferClone = Symbol.for("lumen.transferable.clone");
+const kTransferDeserialize = Symbol.for("lumen.transferable.deserialize");
 
 // TypedArray kinds by constructor name — index is the wire byte.
 const TA_KINDS = [
@@ -46,9 +53,14 @@ const SetForEach = Set.prototype.forEach;
 const ObjectKeys = Object.keys;
 const ERROR_NAMES = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "EvalError", "URIError"];
 
+const kUntransferable = Symbol.for("nodejs.untransferable");
+// A pooled buffer's ArrayBuffer (see Buffer's pool) stays with the sender: it is cloned instead.
+const isUntransferableBuffer = (item) => item !== null && typeof item === "object" && item[kUntransferable] === true;
+
 function serializeForClone(value, transfer = [], transport = false) {
-  const list = Array.isArray(transfer) ? transfer : transfer?.transfer ?? [];
+  let list = Array.isArray(transfer) ? transfer : transfer?.transfer ?? [];
   if (!Array.isArray(list)) throw new TypeError("transferList must be an array");
+  if (list.some(isUntransferableBuffer)) list = list.filter((item) => !isUntransferableBuffer(item));
   const ports = globalThis.__lumenPortClone;
   const listed = new Set();
   for (let i = 0; i < list.length; i++) {
@@ -159,6 +171,13 @@ function serializeForClone(value, transfer = [], transport = false) {
       SetForEach.call(v, (item) => write(item));
       return;
     }
+    if (typeof v[kTransferClone] === "function") {
+      memory.set(v, ref);
+      const { data, deserializeInfo } = v[kTransferClone]();
+      u8(T_HOST);
+      str(deserializeInfo);
+      return write(data);
+    }
     if (v instanceof Error) {
       memory.set(v, ref);
       u8(T_ERROR);
@@ -204,6 +223,22 @@ function serializeForClone(value, transfer = [], transport = false) {
   }
   return buf.subarray(0, len);
   } catch(error) { if(transport) globalThis.__cloneTransfer?.abort(); throw error; }
+}
+
+// The reviver for a `deserializeInfo`: a class whose prototype has `[kTransferDeserialize]` is
+// constructed with no arguments and then handed the data; any other function is a factory that
+// builds the object from the data.
+function reviveHostObject(info) {
+  const Ctor = globalThis.__lumenCloneResolve?.(info);
+  if (typeof Ctor !== "function") throw new DOMException(`Cannot deserialize ${info}`, "DataCloneError");
+  if (typeof Ctor.prototype?.[kTransferDeserialize] === "function") {
+    return (data) => {
+      const obj = new Ctor();
+      obj[kTransferDeserialize](data);
+      return obj;
+    };
+  }
+  return Ctor;
 }
 
 function deserializeClone(buf) {
@@ -302,6 +337,15 @@ function deserializeClone(buf) {
         for (let i = 0; i < len; i++) a[i] = read();
         return a;
       }
+      case T_HOST: {
+        const info = str();
+        const at = memory.length;
+        memory.push(undefined);
+        const revive = reviveHostObject(info);
+        const value = revive(read());
+        memory[at] = value;
+        return value;
+      }
       case T_OBJECT: {
         const o = {};
         memory.push(o);
@@ -319,3 +363,4 @@ function deserializeClone(buf) {
 // Exposed for the Worker bridge (worker.js) — not global API.
 globalThis.__serializeForClone = serializeForClone;
 globalThis.__deserializeClone = deserializeClone;
+globalThis.__reviveHostObject = reviveHostObject;
