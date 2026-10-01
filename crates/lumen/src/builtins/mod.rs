@@ -27,6 +27,7 @@ mod globals;
 mod host;
 mod json;
 mod math;
+pub(crate) mod natives;
 pub(crate) use math::jit_math_fns;
 mod primitives;
 mod promise;
@@ -35,6 +36,7 @@ mod proxy;
 mod reflect;
 mod regexp;
 mod shadowrealm;
+pub(crate) mod vm_context;
 mod string_code_point;
 mod string_substring;
 pub(crate) use string_code_point::nf_code_point_at;
@@ -378,7 +380,7 @@ pub(crate) fn proxy_own_keys(
         let result_set: std::collections::HashSet<&str> =
             key_strs.iter().map(|s| s.as_str()).collect();
         if result_set.len() != key_strs.len() {
-            return Err(i.make_error("TypeError", "ownKeys trap result has duplicate keys"));
+            return Err(i.make_error("TypeError", "'ownKeys' on proxy: trap returned duplicate entries"));
         }
         // Invariants relative to the target's own keys / extensibility.
         if let Value::Obj(t) = target {
@@ -402,7 +404,7 @@ pub(crate) fn proxy_own_keys(
                 if !conf && !result_set.contains(tk.as_str()) {
                     return Err(i.make_error(
                         "TypeError",
-                        "ownKeys trap omitted a non-configurable target key",
+                        &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
                     ));
                 }
             }
@@ -411,14 +413,14 @@ pub(crate) fn proxy_own_keys(
                     if !result_set.contains(tk.as_str()) {
                         return Err(i.make_error(
                             "TypeError",
-                            "ownKeys trap omitted a key of a non-extensible target",
+                            &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
                         ));
                     }
                 }
                 if key_strs.len() != target_keys.len() {
                     return Err(i.make_error(
                         "TypeError",
-                        "ownKeys trap added a key to a non-extensible target",
+                        "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
                     ));
                 }
             }
@@ -604,7 +606,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
                 .and_then(|b| b.as_obj())
                 .is_some_and(|b| {
                     matches!(
-                        b.borrow().props.get("__abResizable").map(|p| p.value()),
+                        b.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
                         Some(Value::Bool(true))
                     )
                 });
@@ -797,6 +799,10 @@ pub(crate) fn proxy_gopd_value(
         ));
     }
     let pd = ab(build_partial(i, &res))?;
+    // A `vm` context's interceptor reports the sandbox's descriptors as they are.
+    if vm_context::is_vm_handler(handler) {
+        return Ok(descriptor_from_prop(i, complete_descriptor(pd)));
+    }
     // A descriptor may be reported for a property the target lacks only on an extensible target.
     if let Value::Obj(t) = target {
         if !t.borrow().props.contains(key) && !t.borrow().extensible {
@@ -986,6 +992,9 @@ fn proxy_define_property(
     )?;
     if !i.to_boolean(&res) {
         return Ok(false);
+    }
+    if vm_context::is_vm_handler(handler) {
+        return Ok(true);
     }
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
@@ -2634,7 +2643,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "Number"
             } else if matches!(b.exotic, Exotic::StrWrap) {
                 "String"
-            } else if b.props.contains("__date_ms") {
+            } else if b.props.contains("\u{0}date_ms") {
                 "Date"
             } else if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
                 "RegExp"
@@ -3087,54 +3096,7 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
 }
 fn install_object(it: &mut Interp) {
     let op = it.object_proto.clone();
-    it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
-        // A string key on an ordinary object or array (no proxy, namespace or typed array —
-        // those clear `ic_plain`): the own entries decide, with no key copy.
-        if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
-            if let Ok(b) = o.try_borrow() {
-                if matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array)
-                    && b.ic_plain.get()
-                    && !Interp::is_private_key(k)
-                {
-                    return Ok(Value::Bool(b.props.contains(k)));
-                }
-            }
-        }
-        let key = ab(i.to_property_key(&arg(args, 0)))?;
-        // A private-name slot (`#x`) is never an observable own property.
-        if Interp::is_private_key(&key) {
-            return Ok(Value::Bool(false));
-        }
-        let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
-        i.materialize_fn(&o);
-        if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
-            return Ok(Value::Bool(true));
-        }
-        // A TypedArray index in range is an own property even though it isn't in the property map;
-        // a canonical-numeric non-index is never an own property.
-        if let Some(info) = ta_info(i, &o) {
-            match i.ta_index_kind(&info, &key) {
-                crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
-                crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
-                crate::value::TaIndex::Ordinary => {}
-            }
-        }
-        // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-            return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
-        }
-        // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
-        let ptr = Gc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            if let Some(res) = i.namespace_own_property(ptr, &key) {
-                ab(res)?;
-                return Ok(Value::Bool(true));
-            }
-        }
-        let has = o.borrow().props.contains(&key);
-        Ok(Value::Bool(has))
-    });
+    it.def_method(&op, "hasOwnProperty", 1, nf_has_own_property);
     // Annex B __defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__.
     fn define_accessor(
         i: &mut Interp,
@@ -3631,7 +3593,9 @@ fn install_object(it: &mut Interp) {
             return Ok(Value::Obj(result));
         }
         for key in o.borrow().props.ordered_keys() {
-            if Interp::is_private_key(&key) {
+            if Interp::is_private_key(&key)
+                || (Interp::is_sym_key(&key) && i.sym_from_key(&key).is_none())
+            {
                 continue;
             }
             let prop = o.borrow().props.get(&key).map(|p| p.clone());
@@ -3789,22 +3753,69 @@ fn install_object(it: &mut Interp) {
 }
 
 /// Named entry so the bytecode call cache can recognize and specialize `Object.hasOwn`.
+pub(crate) fn nf_has_own_property(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+        // A string key on an ordinary object or array (no proxy, namespace or typed array —
+        // those clear `ic_plain`): the own entries decide, with no key copy.
+        if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
+            if let Ok(b) = o.try_borrow() {
+                if matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array)
+                    && b.ic_plain.get()
+                    && !Interp::is_private_key(k)
+                {
+                    return Ok(Value::Bool(b.props.contains(k)));
+                }
+            }
+        }
+        let key = ab(i.to_property_key(&arg(args, 0)))?;
+        // A private-name slot (`#x`) is never an observable own property.
+        if Interp::is_private_key(&key) {
+            return Ok(Value::Bool(false));
+        }
+        let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
+        i.materialize_fn(&o);
+        if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
+            return Ok(Value::Bool(true));
+        }
+        // A TypedArray index in range is an own property even though it isn't in the property map;
+        // a canonical-numeric non-index is never an own property.
+        if let Some(info) = ta_info(i, &o) {
+            match i.ta_index_kind(&info, &key) {
+                crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
+                crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
+                crate::value::TaIndex::Ordinary => {}
+            }
+        }
+        // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
+        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
+            return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
+        }
+        // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
+        let ptr = Gc::as_ptr(&o) as usize;
+        if i.is_namespace(ptr) {
+            if let Some(res) = i.namespace_own_property(ptr, &key) {
+                ab(res)?;
+                return Ok(Value::Bool(true));
+            }
+        }
+        let has = o.borrow().props.contains(&key);
+        Ok(Value::Bool(has))
+}
+
 pub(crate) fn nf_object_has_own(
     i: &mut Interp,
     _this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-    let o = match arg(args, 0) {
-        Value::Obj(o) => o,
-        _ => return Err(i.make_error("TypeError", "Object.hasOwn called on non-object")),
-    };
-    let key = ab(i.to_property_key(&arg(args, 1)))?;
-    i.materialize_fn(&o);
-    let has = {
-        let b = o.borrow();
-        crate::split_view::has_own_elem_obj(&b, &key) || b.props.contains(&key)
-    };
-    Ok(Value::Bool(has))
+    let target = arg(args, 0);
+    if matches!(target, Value::Undefined | Value::Null) {
+        return Err(i.make_error("TypeError", "Cannot convert undefined or null to object"));
+    }
+    nf_has_own_property(i, target, args.get(1..).unwrap_or(&[]))
 }
 
 /// TestIntegrityLevel: extensibility plus per-key configurability (and, for frozen, data-property
@@ -4028,12 +4039,16 @@ pub(crate) fn object_define_property(
             &key,
             &descriptor,
         ))? {
+            if vm_context::is_vm_handler(&handler) {
+                return Err(i.make_error("TypeError", format!("Cannot redefine property: {}", vm_context::key_display(i, &key))));
+            }
             return Err(i.make_error("TypeError", "proxy defineProperty returned a falsish value"));
         }
         return Ok(Value::Obj(o));
     }
     if !ab(define_own_property(i, &o, &key, &descriptor))? {
-        return Err(i.make_error("TypeError", "Cannot redefine property"));
+        let shown = vm_context::key_display(i, &key);
+        return Err(i.make_error("TypeError", format!("Cannot redefine property: {shown}")));
     }
     Ok(Value::Obj(o))
 }
@@ -9034,17 +9049,32 @@ fn to_uint32(n: f64) -> u32 {
     n.trunc().rem_euclid(4294967296.0) as u32
 }
 
-/// A small deterministic PRNG for `Math.random` (lumen has no entropy source; tests only check the
-/// `[0, 1)` range, not distribution).
+/// `Math.random`: xorshift128+ per thread, seeded from the OS-keyed `RandomState` (std's per-process
+/// random SipHash keys) so every process and thread draws its own sequence.
 fn next_random() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x >> 11) as f64 / (1u64 << 53) as f64
+    use std::cell::Cell;
+    use std::hash::{BuildHasher, Hasher};
+    thread_local! {
+        static STATE: Cell<[u64; 2]> = const { Cell::new([0, 0]) };
+    }
+    STATE.with(|cell| {
+        let mut s = cell.get();
+        if s == [0, 0] {
+            let seed = |salt: u64| {
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u64(salt);
+                h.finish()
+            };
+            s = [seed(0x9E37_79B9_7F4A_7C15) | 1, seed(0xBF58_476D_1CE4_E5B9)];
+        }
+        let mut x = s[0];
+        let y = s[1];
+        s[0] = y;
+        x ^= x << 23;
+        s[1] = x ^ y ^ (x >> 17) ^ (y >> 26);
+        cell.set(s);
+        ((s[1].wrapping_add(y)) >> 11) as f64 / (1u64 << 53) as f64
+    })
 }
 
 fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {

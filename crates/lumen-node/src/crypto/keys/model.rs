@@ -5,7 +5,7 @@
 use der::asn1::ObjectIdentifier;
 use num_bigint_dig::BigUint;
 
-use super::asn1::{self, Reader, TAG_BIT_STRING, TAG_INTEGER, TAG_NULL, TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE};
+use super::asn1::{self, Reader, TAG_NULL, TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE};
 use super::curves::EcCurve;
 use super::{decoder_unsupported, invalid_private, KResult};
 

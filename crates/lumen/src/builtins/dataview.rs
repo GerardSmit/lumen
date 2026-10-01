@@ -20,7 +20,7 @@ fn dv_view_len(i: &Interp, buf: usize, off: usize, len: usize, track: bool) -> O
 }
 fn dv_buffer_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     dv_info(i, &this)?;
-    ab(i.get_member(&this, "__dv_buffer"))
+    ab(i.get_member(&this, "\u{0}dv_buffer"))
 }
 fn dv_bytelength_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let (buf, off, len, track) = dv_info(i, &this)?;
@@ -268,7 +268,7 @@ pub(crate) fn jit_byte_length(i: &Interp, obj: &Gc) -> Option<usize> {
     };
     let p = Gc::as_ptr(obj) as usize;
     if fp == super::typedarray::ab_bytelength_get as crate::value::NativeFn as usize {
-        if i.shared_buffers.contains_key(&p) || !obj.try_borrow().ok()?.props.contains("__abMaxByteLength") {
+        if i.shared_buffers.contains_key(&p) || !obj.try_borrow().ok()?.props.contains("\u{0}ab_max_byte_length") {
             return None;
         }
         Some(i.array_buffers.get(&p).map_or(0, |b| b.len()))
@@ -316,10 +316,10 @@ pub(super) fn install_dataview(it: &mut Interp) {
             return Err(i.make_error("TypeError", "DataView constructor requires 'new'"));
         }
         // An ArrayBuffer object is identified by its [[ArrayBufferData]] slot (the internal
-        // `__abMaxByteLength` marker), which survives detachment — a detached buffer is still an
+        // max-byte-length marker), which survives detachment — a detached buffer is still an
         // ArrayBuffer, so ToNumber(byteOffset) must run before the detached check throws.
         let (bv, bp) = match arg(a, 0) {
-            Value::Obj(o) if o.borrow().props.contains("__abMaxByteLength") => {
+            Value::Obj(o) if o.borrow().props.contains("\u{0}ab_max_byte_length") => {
                 (Value::Obj(o.clone()), Gc::as_ptr(&o) as usize)
             }
             _ => return Err(i.make_error("TypeError", "DataView requires an ArrayBuffer")),
@@ -377,7 +377,7 @@ pub(super) fn install_dataview(it: &mut Interp) {
         i.data_views.insert(p, (bp, offset, len, track));
         // buffer/byteOffset/byteLength are accessor getters on the prototype, not own properties;
         // only the buffer object itself is kept (hidden) for the `buffer` getter.
-        set_internal(&obj, "__dv_buffer", arg(a, 0));
+        set_internal(&obj, "\u{0}dv_buffer", arg(a, 0));
         Ok(Value::Obj(obj))
     });
     ctor.borrow_mut().props.insert(

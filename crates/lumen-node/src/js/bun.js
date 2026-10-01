@@ -1749,7 +1749,7 @@ function generateHeapSnapshot(format = "jsc", outputFormat) {
     objectCount: data.snapshot.lumen_object_count,
   };
 }
-globalThis.__lumenGenerateHeapSnapshot = generateHeapSnapshot;
+Object.defineProperty(globalThis, "__lumenGenerateHeapSnapshot", { value: generateHeapSnapshot, writable: true, configurable: true });
 
 function mmap(path, options = {}) {
   if (options === null || typeof options !== "object") throw new TypeError("Bun.mmap options must be an object");

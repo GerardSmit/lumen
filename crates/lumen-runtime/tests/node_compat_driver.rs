@@ -422,16 +422,16 @@ fn node_test_runner_runs_sequentially_and_reports() {
     let lines = out.lines();
     let summary = lines.join("\n");
     assert!(
-        lines.contains(&"order before,first,afterEach,second,afterEach,third,afterEach".to_string()),
+        lines.contains(&"order before,first,afterEach,second,afterEach,afterEach,third,afterEach".to_string()),
         "{summary}"
     );
-    assert!(summary.contains("✔ first waits for its promise"), "{summary}");
-    assert!(summary.contains("✖ fails"), "{summary}");
-    assert!(summary.contains("ℹ tests 4"), "{summary}");
-    assert!(summary.contains("ℹ suites 1"), "{summary}");
-    assert!(summary.contains("ℹ pass 2"), "{summary}");
-    assert!(summary.contains("ℹ fail 1"), "{summary}");
-    assert!(summary.contains("ℹ skipped 1"), "{summary}");
+    assert!(summary.contains("ok 1 - first waits for its promise"), "{summary}");
+    assert!(summary.contains("not ok 3 - fails"), "{summary}");
+    assert!(summary.contains("# tests 4"), "{summary}");
+    assert!(summary.contains("# suites 1"), "{summary}");
+    assert!(summary.contains("# pass 2"), "{summary}");
+    assert!(summary.contains("# fail 1"), "{summary}");
+    assert!(summary.contains("# skipped 1"), "{summary}");
     assert!(lines.last().unwrap().ends_with("exitCode 1"), "{summary}");
 }
 

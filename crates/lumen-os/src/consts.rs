@@ -24,6 +24,72 @@ pub fn sysconf_names() -> impl Iterator<Item = (&'static str, i64)> {
     unix::SYSCONF.iter().map(|(n, v)| (&n[1..], *v))
 }
 
+/// The number of signal `name` (`"SIGTERM"`) on this platform (Windows: the C runtime's numbers
+/// libuv emulates).
+pub fn signal_number(name: &str) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        let n = match name {
+            "SIGHUP" => libc::SIGHUP,
+            "SIGINT" => libc::SIGINT,
+            "SIGQUIT" => libc::SIGQUIT,
+            "SIGILL" => libc::SIGILL,
+            "SIGTRAP" => libc::SIGTRAP,
+            "SIGABRT" => libc::SIGABRT,
+            "SIGIOT" => libc::SIGIOT,
+            "SIGBUS" => libc::SIGBUS,
+            "SIGFPE" => libc::SIGFPE,
+            "SIGKILL" => libc::SIGKILL,
+            "SIGUSR1" => libc::SIGUSR1,
+            "SIGSEGV" => libc::SIGSEGV,
+            "SIGUSR2" => libc::SIGUSR2,
+            "SIGPIPE" => libc::SIGPIPE,
+            "SIGALRM" => libc::SIGALRM,
+            "SIGTERM" => libc::SIGTERM,
+            "SIGCHLD" => libc::SIGCHLD,
+            "SIGCONT" => libc::SIGCONT,
+            "SIGSTOP" => libc::SIGSTOP,
+            "SIGTSTP" => libc::SIGTSTP,
+            "SIGTTIN" => libc::SIGTTIN,
+            "SIGTTOU" => libc::SIGTTOU,
+            "SIGURG" => libc::SIGURG,
+            "SIGXCPU" => libc::SIGXCPU,
+            "SIGXFSZ" => libc::SIGXFSZ,
+            "SIGVTALRM" => libc::SIGVTALRM,
+            "SIGPROF" => libc::SIGPROF,
+            "SIGWINCH" => libc::SIGWINCH,
+            "SIGIO" => libc::SIGIO,
+            "SIGSYS" => libc::SIGSYS,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            "SIGSTKFLT" => libc::SIGSTKFLT,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            "SIGPOLL" => libc::SIGPOLL,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            "SIGPWR" => libc::SIGPWR,
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+            "SIGINFO" => libc::SIGINFO,
+            _ => return None,
+        };
+        Some(n)
+    }
+    #[cfg(not(unix))]
+    {
+        Some(match name {
+            "SIGHUP" => 1,
+            "SIGINT" => 2,
+            "SIGILL" => 4,
+            "SIGABRT" => 22,
+            "SIGFPE" => 8,
+            "SIGKILL" => 9,
+            "SIGSEGV" => 11,
+            "SIGTERM" => 15,
+            "SIGBREAK" => 21,
+            "SIGWINCH" => 28,
+            _ => return None,
+        })
+    }
+}
+
 static SYSEXITS: &[(&str, i64)] = &[
     ("EX_OK", 0),
     ("EX_USAGE", 64),

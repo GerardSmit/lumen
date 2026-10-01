@@ -250,6 +250,7 @@ pub fn uv_code(e: &io::Error) -> &'static str {
         K::NotADirectory => "ENOTDIR",
         K::DirectoryNotEmpty => "ENOTEMPTY",
         K::BrokenPipe => "EPIPE",
+        K::WouldBlock => "EAGAIN",
         K::Unsupported => "ENOSYS",
         K::OutOfMemory => "ENOMEM",
         _ => "EIO",

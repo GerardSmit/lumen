@@ -46,7 +46,9 @@ impl Interp {
         self.in_async_gen_body = false;
         // Consume a `Call; Await` fusion request aimed at exactly this call (see
         // `note_await_call`).
-        let fused = self.take_await_call(fn_obj);
+        let fused = self.take_await_call(fn_obj) && self.promise_hooks.is_none();
+        // Promise hooks see the result promise before anything the body creates.
+        let early = self.promise_hooks.is_some().then(|| self.new_promise());
         let mut coro = crate::coroutine::Coroutine::Vm(crate::bytecode::VmCoro::new(
             self,
             chunk,
@@ -71,7 +73,10 @@ impl Interp {
                 }
             }
         }
-        let promise = self.new_promise();
+        let promise = match early {
+            Some(p) => p,
+            None => self.new_promise(),
+        };
         match suspend {
             Suspend::Await(awaited) => {
                 // Its later resumes run outside this call: give them the function's frame.

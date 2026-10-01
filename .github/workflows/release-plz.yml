@@ -6,8 +6,7 @@ name: release-plz
 #   * once that PR is merged, creates the version tag — which triggers .github/workflows/release.yml
 #     to build and publish the per-platform CLI binaries.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write

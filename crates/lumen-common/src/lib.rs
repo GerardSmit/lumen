@@ -17,6 +17,7 @@ pub mod float16;
 #[cfg(feature = "hash")]
 pub mod hash;
 pub mod limits;
+pub mod local_tz;
 pub mod memcat;
 pub mod mt19937;
 pub mod native;

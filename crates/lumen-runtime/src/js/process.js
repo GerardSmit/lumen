@@ -66,6 +66,10 @@
   // Seconds (fractional) since process start, from the same monotonic clock hrtime uses.
   process.uptime = () => { const t = raw(); return t[0] + t[1] / 1e9; };
 
+  const tagDesc = (value) => ({ __proto__: null, value, writable: false, enumerable: false, configurable: true });
+  Object.defineProperty(process, Symbol.toStringTag, tagDesc("process"));
+  Object.defineProperty(globalThis, Symbol.toStringTag, tagDesc("global"));
+
   process.version = "v20.11.0";
   // The component versions Node 20.11.0 reports. Packages and Node's own test/common probe
   // these (`hasCrypto` is `Boolean(process.versions.openssl)`); lumen implements the matching
@@ -81,6 +85,12 @@
 
   // Real OS-identity / control surface over the native ops. These need the (about-to-be-deleted)
   // `__proc` namespace, so they are wired here rather than in the lumen-node JS glue.
+  let title;
+  Object.defineProperty(process, "title", {
+    get() { return title ?? proc.startupTitle() ?? process.argv0; },
+    set(value) { title = `${value}`; proc.setTitle(title); },
+    enumerable: true, configurable: true,
+  });
   process.chdir = proc.chdir;
   process.abort = proc.abort;
   process.umask = proc.umask;
@@ -105,13 +115,21 @@
     process.getgroups = proc.getgroups;
     Object.defineProperty(process, Symbol.for("lumen.identity"), { value: proc, configurable: true });
   }
-  // Portable signal numbers (identical on Linux/macOS); named signals outside this set fall back
-  // to SIGTERM's number so `process.kill(pid)` still delivers a terminating signal.
-  const SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGABRT: 6, SIGFPE: 8,
-    SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15 };
+  // `process.platform` is stamped after this runs, so the table is built on first use.
+  let signals;
+  const signalNumber = (name) => {
+    if (signals === undefined) {
+      const linux = process.platform !== "darwin";
+      signals = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGABRT: 6, SIGFPE: 8,
+        SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGWINCH: 28,
+        SIGUSR1: linux ? 10 : 30, SIGUSR2: linux ? 12 : 31, SIGCONT: linux ? 18 : 19 };
+    }
+    return signals[name] ?? 15;
+  };
+  Object.defineProperty(process, Symbol.for("lumen.signalHandler"), { value: proc.signalHandler, configurable: true });
   const rawKill = proc.kill;
   process.kill = (pid, sig = "SIGTERM") => {
-    const n = typeof sig === "number" ? sig : (SIGNALS[sig] ?? 15);
+    const n = typeof sig === "number" ? sig : signalNumber(sig);
     rawKill(pid | 0, n);
     return true;
   };

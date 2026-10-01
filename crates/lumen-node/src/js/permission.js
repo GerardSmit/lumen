@@ -6,7 +6,16 @@
   const optionsOf = () => (typeof process === "object" && process !== null && process[Symbol.for("lumen.options")]) || {};
   let model;
 
-  const lazyPath = () => __builtins.get("path");
+  // The path functions as they are at startup: a program replacing `path.resolve` must not
+  // change how the model resolves what it is asked to check.
+  let pathFns;
+  const lazyPath = () => {
+    if (pathFns === undefined) {
+      const { resolve, toNamespacedPath, dirname, isAbsolute } = __builtins.get("path");
+      pathFns = { resolve, toNamespacedPath, dirname, isAbsolute };
+    }
+    return pathFns;
+  };
 
   const newPathSet = (flag, options) => {
     const set = { all: false, exact: [], wildcard: [] };
@@ -148,7 +157,7 @@
     createReadStream: "r0", writeFile: "w0", appendFile: "w0", mkdir: "w0", mkdtemp: "w0", rm: "w0",
     rmdir: "w0", unlink: "w0", truncate: "w0", utimes: "w0", lutimes: "w0", chmod: "w0", lchmod: "w0",
     chown: "w0", lchown: "w0", createWriteStream: "w0", copyFile: "r0w1", cp: "d1r0w1", rename: "r0w0w1",
-    link: "r0w1", symlink: "w1",
+    link: "r0w0w1", symlink: "r0w0w1",
   };
 
   const applyRule = (name, args) => {
@@ -160,7 +169,13 @@
         continue;
       }
       const scope = part[0] === "r" ? "FileSystemRead" : "FileSystemWrite";
-      check(scope, args[+part[1]]);
+      let target = args[+part[1]];
+      // mkdtemp is checked on the template it fills in, as Node does.
+      if (name === "mkdtemp") {
+        const text = toPath(target);
+        if (text !== undefined) target = `${text}XXXXXX`;
+      }
+      check(scope, target);
     }
   };
 
@@ -223,14 +238,18 @@
   const guardObject = (target, promises) => {
     for (const key of Object.keys(target)) {
       const descriptor = Object.getOwnPropertyDescriptor(target, key);
-      if (!descriptor || typeof descriptor.value !== "function" || !descriptor.writable) continue;
-      const guarded = guardFsFunction(key, descriptor.value, promises);
-      if (guarded !== descriptor.value) {
-        Object.defineProperty(guarded, "name", { value: descriptor.value.name, configurable: true });
-        if (descriptor.value[__builtins.get("util").promisify.custom]) {
-          guarded[__builtins.get("util").promisify.custom] = descriptor.value[__builtins.get("util").promisify.custom];
+      if (!descriptor) continue;
+      // A lazily materialised member (an accessor) is guarded as the value it yields.
+      const accessor = typeof descriptor.get === "function";
+      const value = accessor ? target[key] : descriptor.value;
+      if (typeof value !== "function" || (!accessor && !descriptor.writable)) continue;
+      const guarded = guardFsFunction(key, value, promises);
+      if (guarded !== value) {
+        Object.defineProperty(guarded, "name", { value: value.name, configurable: true });
+        if (value[__builtins.get("util").promisify.custom]) {
+          guarded[__builtins.get("util").promisify.custom] = value[__builtins.get("util").promisify.custom];
         }
-        target[key] = guarded;
+        Object.defineProperty(target, key, { value: guarded, writable: true, enumerable: descriptor.enumerable, configurable: true });
       }
     }
   };
@@ -263,9 +282,9 @@
       childProcess[name] = guarded;
     }
     const workers = __builtins.get("worker_threads");
-    const Worker = workers.Worker;
-    if (typeof Worker === "function") {
-      workers.Worker = class Worker extends Worker {
+    const BaseWorker = workers.Worker;
+    if (typeof BaseWorker === "function") {
+      workers.Worker = class Worker extends BaseWorker {
         constructor(...args) {
           if (!getModel().worker) throw denied("WorkerThreads");
           super(...args);

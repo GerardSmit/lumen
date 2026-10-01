@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ use lumen_host::{
     TaskRegistry, ThreadPool, Value,
 };
 
+mod child_realm;
 mod console;
 mod esm;
 mod jsx;
@@ -137,18 +138,52 @@ pub enum RealmExit {
 /// closes its sockets and listeners. Interrupting is permanent for the realm.
 pub use lumen::limits::InterruptHandle;
 
-/// The embedder-facing name of [`InterruptHandle`] for realms inside a host process.
-pub type Terminator = InterruptHandle;
+/// The wake-up that carries a signal for the realm's own `process.on` listeners: its payload is
+/// the signal number.
+const SIGNAL_TASK: TaskId = TaskId::MAX - 1;
+
+/// An embedded realm's stop request (its [`InterruptHandle`]), which can also deliver a signal
+/// to the realm's own `process.on` listeners.
+#[derive(Clone)]
+pub struct Terminator {
+    handle: InterruptHandle,
+    wake: mpsc::Sender<TaskCompletion>,
+}
+
+impl Terminator {
+    /// Queue `signal` for the realm's loop, which emits it to the program's listeners.
+    pub(crate) fn deliver(&self, signal: i32) {
+        let _ = self.wake.send(TaskCompletion {
+            task: SIGNAL_TASK,
+            result: Box::new(signal),
+        });
+    }
+
+    pub fn terminate(&self) {
+        self.handle.interrupt();
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        self.handle.is_interrupted()
+    }
+
+    pub fn handle(&self) -> &InterruptHandle {
+        &self.handle
+    }
+}
 
 /// What a worker inherits from an embedded parent realm.
 #[derive(Clone)]
 pub(crate) struct WorkerEmbedding {
+    exec_path: String,
     pub(crate) cwd: PathBuf,
     env: Vec<(String, String)>,
     stdout: SharedWriter,
     stderr: SharedWriter,
     interrupt: Arc<AtomicBool>,
     spawner: Option<Arc<dyn Spawner>>,
+    owned_fds: Vec<i32>,
+    tree: Arc<child_realm::RealmTree>,
 }
 
 /// Workers for blocking work. libuv's default; revisit when async fs lands and has numbers.
@@ -171,6 +206,7 @@ pub struct Runtime {
     /// `onerror` convention and `(promise, reason) -> suppressed` for `onunhandledrejection`.
     fire_error: Value,
     fire_rejection: Value,
+    fire_handled: Value,
     /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
     /// `finish_process` emits `'exit'` with this code (no `'beforeExit'`) and returns it.
     fatal_exit: Option<i32>,
@@ -180,6 +216,12 @@ pub struct Runtime {
     idle_gc_followup: bool,
     /// Embedded realms only: the stop request (see [`Terminator`]).
     interrupt: Option<Arc<AtomicBool>>,
+    /// Embedded realms only: the child realms this one started (see `child_realm`).
+    child_realms: Option<Arc<child_realm::ChildRealms>>,
+    /// A signal's default action stopped the realm (see `deliver_signal`).
+    signal_exit: Option<i32>,
+    /// A tick threw and its error was handled: the queue behind it drains before the next callback.
+    tick_recovery: bool,
     /// Wakes the loop when it is blocked on completions.
     wake: mpsc::Sender<TaskCompletion>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -211,6 +253,12 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         self.deadline.take();
+        // Nothing reads a child's output once its launcher is going away: wake any child blocked
+        // on a full pipe before waiting for it.
+        lumen_node::close_child_pipes(self.engine.ctx());
+        if let Some(children) = &self.child_realms {
+            children.shutdown();
+        }
         lumen_node::shutdown_native_addons(self.engine.ctx());
         self.release_blocked_io();
     }
@@ -239,19 +287,28 @@ impl Runtime {
     /// An engine with the runtime globals installed: timers, streaming `console`, minimal
     /// `process`, `queueMicrotask`.
     pub fn new() -> Runtime {
-        Self::build(None)
+        let mut rt = Self::build(None, None);
+        process_env::own_time_zone(rt.engine().ctx());
+        rt
     }
 
     /// A runtime for a realm inside a host process (see [`Embedding`]). Runs on the calling
     /// thread, which must have a large stack (the CLI uses 256 MiB; the engine recurses natively).
     pub fn new_embedded(embedding: Embedding) -> Runtime {
-        Self::build(Some(embedding))
+        Self::build(Some(embedding), None)
+    }
+
+    /// A child realm's runtime: embedded, and counted in its launcher's realm tree.
+    pub(crate) fn new_child(embedding: Embedding, tree: Arc<child_realm::RealmTree>) -> Runtime {
+        Self::build(Some(embedding), Some(tree))
     }
 
     /// A worker's runtime: embedded like its parent when the parent is, else process-backed.
     pub(crate) fn new_worker(parent: Option<WorkerEmbedding>) -> Runtime {
-        Self::build(parent.map(|p| Embedding {
-            argv: Vec::new(),
+        let owned_fds = parent.as_ref().map(|p| p.owned_fds.clone()).unwrap_or_default();
+        let tree = parent.as_ref().map(|p| Arc::clone(&p.tree));
+        let mut runtime = Self::build(parent.map(|p| Embedding {
+            argv: vec![p.exec_path],
             env: p.env,
             cwd: p.cwd,
             stdin: Box::new(std::io::empty()),
@@ -260,14 +317,23 @@ impl Runtime {
             interrupt: p.interrupt,
             live_object_limit: None,
             spawner: p.spawner,
-        }))
+        }), tree);
+        // A worker shares its realm's descriptors: closing one there must not close the host's.
+        if let Some(realm) = runtime.engine.ctx().host_mut::<RealmProcess>() {
+            realm.owned_fds = owned_fds;
+        }
+        runtime
     }
 
-    fn build(embedding: Option<Embedding>) -> Runtime {
+    fn build(embedding: Option<Embedding>, tree: Option<Arc<child_realm::RealmTree>>) -> Runtime {
         let boot = lumen_host::startup_timing().then(Instant::now);
+        lumen_host::perf::start_clock();
+        lumen_host::perf::mark(lumen_host::perf::Milestone::NodeStart);
         let (tx, rx) = mpsc::channel();
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
+        lumen::set_tail_calls(false);
         let mut engine = Engine::new();
+        lumen_host::perf::mark(lumen_host::perf::Milestone::V8Start);
         // Substrate first: fs's js_init runs during install and its ops need these.
         engine.ctx().op_state().put(pool.handle());
         // Dedicated-thread completions for unbounded-blocking work (child stdio) that must not
@@ -285,6 +351,7 @@ impl Runtime {
         // Before install: the extensions' js_init already asks for the cwd.
         let mut embedded_io = None;
         let mut interrupt = None;
+        let mut child_realms = None;
         if let Some(mut e) = embedding {
             // `process.cwd()` never carries Windows' verbatim `\\?\` prefix; JS path code does
             // not expect it.
@@ -293,7 +360,19 @@ impl Runtime {
             if let Some(limit) = e.live_object_limit {
                 engine.set_live_object_limit(limit);
             }
+            let exec_path = e.argv.first().cloned().unwrap_or_else(|| "lumen".to_string());
+            let tree = tree.unwrap_or_default();
+            let launcher = Arc::new(child_realm::ChildRealms::new(
+                e.spawner.clone(),
+                e.live_object_limit,
+                Arc::clone(&tree),
+            ));
+            child_realms = Some(Arc::clone(&launcher));
             engine.ctx().op_state().put(RealmProcess {
+                exec_path: exec_path.clone(),
+                launcher: Some(launcher),
+                owned_fds: Vec::new(),
+                signal_handlers: Arc::new(AtomicU64::new(0)),
                 cwd: e.cwd.clone(),
                 exit_code: None,
                 interrupt: Arc::clone(&e.interrupt),
@@ -303,15 +382,34 @@ impl Runtime {
                 spawner: e.spawner.clone(),
             });
             engine.ctx().op_state().put(WorkerEmbedding {
+                exec_path,
                 cwd: e.cwd,
                 env: e.env.clone(),
                 stdout: e.stdout.clone(),
                 stderr: e.stderr.clone(),
                 interrupt: Arc::clone(&e.interrupt),
                 spawner: e.spawner,
+                owned_fds: Vec::new(),
+                tree,
             });
             interrupt = Some(e.interrupt);
             embedded_io = Some((e.argv, e.env, e.stdout, e.stderr));
+        }
+        // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
+        // unhandled rejection, not a reported exception.
+        {
+            let ctx = engine.ctx();
+            let f = ctx.make_native("queueMicrotask", 1, |i, _this, args| {
+                match args.first() {
+                    Some(cb) if cb.is_callable() => {
+                        i.queue_microtask(cb.clone());
+                        Ok(Value::Undefined)
+                    }
+                    _ => Err(i.make_error("TypeError", "queueMicrotask expects a function")),
+                }
+            });
+            let global = engine.global_this();
+            let _ = engine.ctx().set_member(&global, "queueMicrotask", Value::Obj(f));
         }
         install(
             &mut engine,
@@ -330,6 +428,7 @@ impl Runtime {
                 worker::extension(),
             ],
         );
+        lumen_host::perf::mark(lumen_host::perf::Milestone::Environment);
         let data = embedded_io
             .as_ref()
             .map(|(argv, env, _, _)| (argv.as_slice(), env.as_slice()));
@@ -339,22 +438,6 @@ impl Runtime {
                 out: Box::new(stdout),
                 err: Box::new(stderr),
             });
-        }
-        // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
-        // unhandled rejection, not a reported exception.
-        {
-            let ctx = engine.ctx();
-            let f = ctx.make_native("queueMicrotask", 1, |i, _this, args| {
-                match args.first() {
-                    Some(cb) if cb.is_callable() => {
-                        i.queue_microtask(cb.clone());
-                        Ok(Value::Undefined)
-                    }
-                    _ => Err(i.make_error("TypeError", "queueMicrotask expects a function")),
-                }
-            });
-            let global = engine.global_this();
-            let _ = engine.ctx().set_member(&global, "queueMicrotask", Value::Obj(f));
         }
         // The HTML error-reporting globals (WinterTC Minimum Common API §5.2): `onerror` /
         // `onunhandledrejection` global event-handler properties and `reportError`. The fire
@@ -368,13 +451,20 @@ impl Runtime {
             .ctx()
             .get_member(&global, "__lumen_fire_error")
             .unwrap_or_else(|_| panic!("error-reporting shim installed"));
+        let fire_handled = engine
+            .ctx()
+            .get_member(&global, "__lumen_fire_handled")
+            .unwrap_or(Value::Undefined);
+        engine.track_late_handled_rejections();
+        engine.report_task_errors();
         let fire_rejection = engine
             .ctx()
             .get_member(&global, "__lumen_fire_rejection")
             .unwrap_or_else(|_| panic!("error-reporting shim installed"));
         engine
             .eval(
-                "delete globalThis.__lumen_fire_error; delete globalThis.__lumen_fire_rejection;",
+                "delete globalThis.__lumen_fire_error; delete globalThis.__lumen_fire_rejection; \
+                 delete globalThis.__lumen_fire_handled;",
                 false,
             )
             .expect("shim cleanup");
@@ -382,14 +472,19 @@ impl Runtime {
             eprintln!("[startup] runtime built    {:?}", t0.elapsed());
         }
         lumen::memstats::phase("runtime built");
+        lumen_host::perf::mark(lumen_host::perf::Milestone::BootstrapComplete);
         Runtime {
             engine,
             pool,
             interrupt,
+            child_realms,
+            signal_exit: None,
+            tick_recovery: false,
             wake: tx,
             completions: rx,
             fire_error,
             fire_rejection,
+            fire_handled,
             fatal_exit: None,
             idle_gc: (Instant::now(), 0),
             idle_gc_followup: false,
@@ -401,6 +496,13 @@ impl Runtime {
     /// The engine, for embedder access beyond script evaluation (defining globals, etc.).
     pub fn engine(&mut self) -> &mut Engine {
         &mut self.engine
+    }
+
+    /// Node's `--trace-atomics-wait`: every `Atomics.wait` of this realm and of the workers it
+    /// spawns reports its progress on stderr.
+    pub fn trace_atomics_wait(&mut self) {
+        TRACE_ATOMICS_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+        install_atomics_wait_trace(&mut self.engine, 0);
     }
 
     /// Run `path` as a CommonJS program entry (`require.main === module`, with `__dirname`/
@@ -422,30 +524,24 @@ impl Runtime {
             // `process.on('uncaughtException')` listener may own it, otherwise it is fatal.
             Err(StartError::Thrown(error)) => self.report_uncaught(&error),
         }
-        self.run_to_completion();
+        self.run_entry_loop();
         Ok(())
     }
 
-    /// Start `path` as the CJS main module WITHOUT pumping the macrotask loop (only the top-level
-    /// microtask checkpoint runs). Worker threads use this: the caller arms its message inbox
-    /// first and then drives the loop itself. `Err` is the rendered uncaught error.
-    pub(crate) fn start_main(&mut self, path: &str) -> Result<(), String> {
-        self.start_main_raw(path, None).map_err(|e| match e {
-            StartError::NotInstalled(message) => message,
-            StartError::Thrown(error) => describe_error(self.engine.ctx(), &error),
-        })
-    }
-
-    fn start_main_raw(&mut self, path: &str, source: Option<&str>) -> Result<(), StartError> {
-        // A CJS script can still dynamic-`import()`: give the engine the ESM loader and resolve
-        // bare relative specifiers against the entry file.
+    /// Give the engine the ESM loader (so dynamic `import()` works) and resolve bare relative
+    /// specifiers against `path`.
+    pub fn install_module_loader(&mut self, path: &str, has_source: bool) {
         let loader = esm::make_loader(self.builtin_modules());
         self.engine.set_module_loader_attrs(loader);
         match lumen_host::canonicalize(path) {
             Ok(abs) => self.engine.set_import_base(&abs.to_string_lossy()),
-            Err(_) if source.is_some() => self.engine.set_import_base(path),
+            Err(_) if has_source => self.engine.set_import_base(path),
             Err(_) => {}
         }
+    }
+
+    fn start_main_raw(&mut self, path: &str, source: Option<&str>) -> Result<(), StartError> {
+        self.install_module_loader(path, source.is_some());
         let global = self.engine.global_this();
         let entry = if source.is_some() {
             "__runMainSource"
@@ -510,7 +606,7 @@ impl Runtime {
         lumen::memstats::phase("entry module evaluated");
         match result {
             Ok(Completion::Value(_)) => {
-                self.run_to_completion();
+                self.run_entry_loop();
                 Ok(())
             }
             // The module evaluation reports a rendered throw, not the value, so process-level
@@ -546,7 +642,7 @@ impl Runtime {
         }
         match loaded {
             Ok(Completion::Value(_)) => {
-                self.run_to_completion();
+                self.run_entry_loop();
                 Ok(())
             }
             Ok(Completion::Throw { name, message }) => {
@@ -600,6 +696,7 @@ impl Runtime {
     /// with no message or timer due.
     pub fn run_worker_loop(&mut self, stop: &std::sync::atomic::AtomicBool) {
         self.worker_loop(stop);
+        lumen_host::perf::mark_loop_exit();
         if self.interrupted() {
             self.release_blocked_io();
         }
@@ -652,7 +749,10 @@ impl Runtime {
                 }
                 None => poll,
             };
-            if let Ok(done) = self.completions.recv_timeout(wait) {
+            let blocked = Instant::now();
+            let received = self.completions.recv_timeout(wait);
+            lumen_host::perf::add_idle(blocked.elapsed());
+            if let Ok(done) = received {
                 self.dispatch(done);
             }
         }
@@ -773,6 +873,14 @@ impl Runtime {
         }
     }
 
+    /// [`Self::run_to_completion`] for the program's own loop: the point `nodeTiming` reports as
+    /// the loop's start and exit.
+    fn run_entry_loop(&mut self) {
+        lumen_host::perf::mark(lumen_host::perf::Milestone::LoopStart);
+        self.run_to_completion();
+        lumen_host::perf::mark_loop_exit();
+    }
+
     /// Stop the realm's workers and close its sockets and listeners, so the threads blocked on
     /// them end instead of waiting for a peer that may never act.
     fn release_blocked_io(&mut self) {
@@ -796,6 +904,12 @@ impl Runtime {
                     }
                     progressed = true;
                     self.fire(&cb, &args);
+                }
+                if self.tick_recovery && !self.halted() {
+                    self.tick_recovery = false;
+                    progressed = true;
+                    self.checkpoint();
+                    self.report_unhandled_rejections();
                 }
                 let now = Instant::now();
                 while let Some((cb, args)) = self.take_next_due_timer(now) {
@@ -842,12 +956,20 @@ impl Runtime {
                     Some(deadline) => {
                         let now = Instant::now();
                         if deadline > now {
-                            if let Ok(done) = self.completions.recv_timeout(deadline - now) {
+                            let blocked = Instant::now();
+                            let received = self.completions.recv_timeout(deadline - now);
+                            lumen_host::perf::add_idle(blocked.elapsed());
+                            if let Ok(done) = received {
                                 self.dispatch(done);
                             }
                         }
                     }
-                    None => match self.completions.recv() {
+                    None => match {
+                        let blocked = Instant::now();
+                        let received = self.completions.recv();
+                        lumen_host::perf::add_idle(blocked.elapsed());
+                        received
+                    } {
                         Ok(done) => self.dispatch(done),
                         // The pool is gone (unreachable while `self.pool` lives); nothing can
                         // ever complete, so pending tasks are abandoned rather than spun on.
@@ -937,6 +1059,19 @@ impl Runtime {
         );
     }
 
+    /// V8's `--expose-externalize-string`: `externalizeString` (a no-op here, as lumen strings
+    /// have no external representation) and `isOneByteString` (every code unit fits Latin-1).
+    pub fn expose_externalize_string(&mut self) {
+        let _ = self.engine.eval(
+            "globalThis.externalizeString = function externalizeString(s) { \
+               if (typeof s !== 'string') throw new TypeError('First parameter is not a string'); }; \
+             globalThis.isOneByteString = function isOneByteString(s) { \
+               if (typeof s !== 'string') throw new TypeError('First parameter is not a string'); \
+               return !/[^\\u0000-\\u00ff]/.test(s); };",
+            false,
+        );
+    }
+
     /// Node's end-of-program protocol, for a CLI that has run the loop to quiescence: emit
     /// `process` `'beforeExit'` (and keep running while a listener schedules more work), then
     /// `'exit'`, and return the code the process should exit with — `process.exitCode`, or 0.
@@ -948,52 +1083,77 @@ impl Runtime {
         let Ok(emit) = self.engine.ctx().get_member(&process, "emit") else {
             return 0;
         };
-        let code = |rt: &mut Runtime| -> i32 {
+        let exit_code = |rt: &mut Runtime| -> Option<i32> {
             match rt.engine.ctx().get_member(&process, "exitCode") {
-                Ok(Value::Num(n)) => n as i32,
-                Ok(Value::Str(s)) => s.to_string().parse().unwrap_or(0),
-                _ => 0,
+                Ok(Value::Num(n)) => Some(n as i32),
+                Ok(Value::Str(s)) => s.to_string().trim().parse().ok(),
+                _ => None,
             }
         };
-        // An uncaught exception ends the process without 'beforeExit': only 'exit' runs, with
-        // the fatal code.
-        if let Some(fatal) = self.fatal_exit {
-            let _ = self.engine.call_function(
+        let code = |rt: &mut Runtime| exit_code(rt).unwrap_or(0);
+        let exiting = |rt: &mut Runtime| {
+            matches!(rt.engine.ctx().get_member(&process, "_exiting"), Ok(Value::Bool(true)))
+        };
+        let emit_exit = |rt: &mut Runtime, c: i32| {
+            let _ = rt.engine.ctx().set_member(&process, "_exiting", Value::Bool(true));
+            if let Err(e) = rt.engine.call_function(
                 &emit,
                 process.clone(),
-                &[
-                    Value::from_string("exit".to_string()),
-                    Value::Num(fatal as f64),
-                ],
-            );
-            self.checkpoint();
-            return fatal;
-        }
+                &[Value::from_string("exit".to_string()), Value::Num(c as f64)],
+            ) {
+                rt.report_uncaught(&e);
+            }
+            rt.checkpoint();
+        };
         // A 'beforeExit' listener may schedule more work; Node re-enters the loop until one
         // round adds nothing.
-        for _ in 0..1000 {
+        let mut rounds = 0;
+        loop {
+            // An uncaught exception ends the process without (further) 'beforeExit'. A generic
+            // one (code 1) runs 'exit' (unless the fatal-exception handler already did) and
+            // exits with `process.exitCode`, which those listeners may change; Node's other
+            // fatal codes exit as they are.
+            if let Some(fatal) = self.fatal_exit {
+                if fatal != 1 {
+                    return fatal;
+                }
+                if !exiting(self) {
+                    let _ = self.engine.ctx().set_member(&process, "exitCode", Value::Num(1.0));
+                    emit_exit(self, 1);
+                }
+                return exit_code(self).unwrap_or(1);
+            }
+            if rounds == 1000 {
+                break;
+            }
+            rounds += 1;
             let c = code(self);
-            let _ = self.engine.call_function(
+            if let Err(e) = self.engine.call_function(
                 &emit,
                 process.clone(),
                 &[
                     Value::from_string("beforeExit".to_string()),
                     Value::Num(c as f64),
                 ],
-            );
+            ) {
+                self.report_uncaught(&e);
+            }
             self.checkpoint();
+            if self.fatal_exit.is_some() {
+                continue;
+            }
             if self.idle() {
                 break;
             }
-            self.run_to_completion();
+            self.run_entry_loop();
         }
-        let c = code(self);
-        let _ = self.engine.call_function(
-            &emit,
-            process.clone(),
-            &[Value::from_string("exit".to_string()), Value::Num(c as f64)],
-        );
-        self.checkpoint();
+        if !exiting(self) {
+            let c = code(self);
+            emit_exit(self, c);
+        }
+        if self.fatal_exit.is_some() {
+            return exit_code(self).unwrap_or(1);
+        }
         code(self)
     }
 
@@ -1052,6 +1212,12 @@ impl Runtime {
     /// Settle one completed task: decode the payload, then run the success callback — or the
     /// failure one (a promise's reject) when the decoder says the work failed.
     fn dispatch(&mut self, done: TaskCompletion) {
+        if done.task == SIGNAL_TASK {
+            if let Ok(signal) = done.result.downcast::<i32>() {
+                self.deliver_signal(*signal);
+            }
+            return;
+        }
         let entry = self
             .engine
             .ctx()
@@ -1075,6 +1241,51 @@ impl Runtime {
         self.report_unhandled_rejections();
     }
 
+    /// Emit `signal` to the program's `process.on` listeners; with none (the program dropped
+    /// them since the sender looked), the signal takes its default action.
+    fn deliver_signal(&mut self, signal: i32) {
+        let global = self.engine.global_this();
+        let deliver = self
+            .engine
+            .ctx()
+            .get_member(&global, "__lumen_deliver_signal")
+            .unwrap_or(Value::Undefined);
+        let handled = match self.engine.call_function(
+            &deliver,
+            Value::Undefined,
+            &[Value::Num(signal as f64)],
+        ) {
+            Ok(Value::Bool(handled)) => handled,
+            Ok(_) => false,
+            Err(error) => {
+                self.report_uncaught(&error);
+                true
+            }
+        };
+        if !handled && child_realm::terminates_by_default(signal) {
+            self.signal_exit.get_or_insert(signal);
+            if let Some(flag) = &self.interrupt {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        self.checkpoint();
+        self.report_unhandled_rejections();
+    }
+
+    /// The signal that stopped this realm by its default action, if one did.
+    pub(crate) fn signal_exit(&self) -> Option<i32> {
+        self.signal_exit
+    }
+
+    /// The live signal-listener mask (see [`RealmProcess::signal_handlers`]).
+    pub(crate) fn signal_handlers(&mut self) -> Option<Arc<AtomicU64>> {
+        self.engine
+            .ctx()
+            .op_state()
+            .get::<RealmProcess>()
+            .map(|realm| Arc::clone(&realm.signal_handlers))
+    }
+
     /// Node's tick checkpoint (`processTicksAndRejections`): run the nextTick queue (including
     /// ticks queued by ticks), then the promise microtasks, and repeat until both are empty.
     fn checkpoint(&mut self) {
@@ -1096,14 +1307,15 @@ impl Runtime {
                     .call_function(&callback, Value::Undefined, &args)
                 {
                     // As in Node, a throwing tick unwinds the drain: once the error is handled,
-                    // the rest of the queue waits for the next checkpoint, so a tick that keeps
-                    // rescheduling a throw cannot starve the loop.
+                    // the rest of the queue and the pending microtasks wait for the next
+                    // checkpoint, so a tick that keeps rescheduling a throw cannot starve the
+                    // loop, and queued ticks still run before the promise jobs.
                     self.report_uncaught(&e);
-                    self.engine.run_microtasks();
+                    self.tick_recovery = true;
                     return;
                 }
             }
-            self.engine.run_microtasks();
+            self.run_microtasks();
             let more = self
                 .engine
                 .ctx()
@@ -1116,8 +1328,29 @@ impl Runtime {
         }
     }
 
+    /// Drain the microtask queue; a throwing `queueMicrotask` callback is an uncaught exception,
+    /// and the queue carries on once a listener handled it.
+    fn run_microtasks(&mut self) {
+        loop {
+            self.engine.run_microtasks();
+            let errors = self.engine.take_task_errors();
+            if errors.is_empty() {
+                return;
+            }
+            for e in errors {
+                if self.halted() {
+                    return;
+                }
+                self.report_uncaught(&e);
+            }
+        }
+    }
+
     /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
     fn fire(&mut self, callback: &Value, args: &[Value]) {
+        if std::mem::take(&mut self.tick_recovery) {
+            self.checkpoint();
+        }
         if let Err(e) = self.engine.call_function(callback, Value::Undefined, args) {
             self.report_uncaught(&e);
         }
@@ -1139,13 +1372,29 @@ impl Runtime {
             return;
         }
         let fire = self.fire_error.clone();
-        if let Ok(Value::Bool(true)) = self.engine.call_function(
+        // The hook answers `true` (handled), `false` (fatal), or the exit code of a fatal error
+        // it could not hand to the process (Node's 6: `process._fatalException` is not a
+        // function). A throw out of the handlers is itself fatal with Node's code 7, and that
+        // error is the one reported.
+        let (code, thrown) = match self.engine.call_function(
             &fire,
             Value::Undefined,
             &[error.clone(), Value::str(origin)],
         ) {
+            Ok(Value::Bool(true)) => return,
+            Ok(Value::Num(n)) => (n as i32, None),
+            Ok(_) => (1, None),
+            Err(e) => (7, Some(e)),
+        };
+        if self.interrupted() {
             return;
         }
+        let error = thrown.as_ref().unwrap_or(error);
+        self.print_fatal(error, prefix);
+        self.fatal_exit.get_or_insert(code);
+    }
+
+    fn print_fatal(&mut self, error: &Value, prefix: &str) {
         // A rejected TypeScript source prints as Node prints it (its `stack` and `code`).
         let ctx = self.engine.ctx();
         let member = |ctx: &mut lumen_host::Ctx, key: &str| match ctx.get_member(error, key) {
@@ -1161,6 +1410,17 @@ impl Runtime {
             Some(t) => t,
             None => {
                 let global = self.engine.global_this();
+                // A Node runtime reports a fatal error as Node does (its own text, no prefix).
+                if let Ok(report) = self.engine.ctx().get_member(&global, "__lumenFatalReport") {
+                    if report.as_obj().is_some() {
+                        if let Ok(Value::Str(s)) =
+                            self.engine.call_function(&report, Value::Undefined, &[error.clone()])
+                        {
+                            console::write_err_line(self.engine.ctx(), s.to_string());
+                            return;
+                        }
+                    }
+                }
                 let describe = self.engine.ctx().get_member(&global, "__lumenDescribeError");
                 let detailed = match describe {
                     Ok(f) if f.as_obj().is_some() => {
@@ -1178,7 +1438,6 @@ impl Runtime {
             }
         };
         console::write_err_line(self.engine.ctx(), line);
-        self.fatal_exit.get_or_insert(1);
     }
 
     /// Report promises rejected without a handler. Called after each microtask checkpoint; a
@@ -1187,15 +1446,42 @@ impl Runtime {
     /// otherwise it is raised as an uncaught exception — which an `'uncaughtException'` listener
     /// may still catch, and which is fatal if nothing does.
     fn report_unhandled_rejections(&mut self) {
-        for (promise, reason) in self.engine.take_unhandled_rejections_full() {
-            let fire = self.fire_rejection.clone();
-            if let Ok(Value::Bool(true)) =
-                self.engine
-                    .call_function(&fire, Value::Undefined, &[promise, reason.clone()])
-            {
-                continue;
+        // Rejections reported earlier that have a handler now (Node's 'rejectionHandled').
+        let handled = self.engine.take_late_handled_rejections();
+        if !handled.is_empty() {
+            let fire = self.fire_handled.clone();
+            for promise in handled {
+                if self.halted() {
+                    return;
+                }
+                if let Err(e) = self.engine.call_function(&fire, Value::Undefined, &[promise]) {
+                    self.report_uncaught(&e);
+                }
             }
-            self.report_fatal(&reason, "Uncaught (in promise)", "unhandledRejection");
+        }
+        for (promise, reason) in self.engine.take_unhandled_rejections_full() {
+            if self.halted() {
+                return;
+            }
+            let fire = self.fire_rejection.clone();
+            // The policy returns true when it dealt with the rejection, or `[error]` to raise
+            // `error` (the reason, or Node's UnhandledPromiseRejection for a non-error).
+            let raised = match self
+                .engine
+                .call_function(&fire, Value::Undefined, &[promise, reason.clone()])
+            {
+                Ok(Value::Bool(true)) => continue,
+                Ok(list @ Value::Obj(_)) => {
+                    self.engine.ctx().get_member(&list, "0").unwrap_or(reason)
+                }
+                // A throwing 'unhandledRejection' listener is an uncaught exception itself.
+                Err(e) => {
+                    self.report_uncaught(&e);
+                    continue;
+                }
+                _ => reason,
+            };
+            self.report_fatal(&raised, "Uncaught (in promise)", "unhandledRejection");
         }
     }
 
@@ -1212,7 +1498,7 @@ impl Runtime {
 
     /// The loop stops: a fatal error, or the embedder / `process.exit` asked the realm to end.
     fn halted(&self) -> bool {
-        self.fatal_exit.is_some() || self.interrupted()
+        self.fatal_exit.is_some() || self.interrupted() || self.engine.is_terminated()
     }
 
     /// A worker realm's `terminate()` flag: the engine polls it at every call and loop turn, and
@@ -1261,6 +1547,21 @@ impl Runtime {
         }));
     }
 
+    /// Run `f` so that SIGINT stops the JS it runs (as `vm`'s `breakOnSigint` does) instead of
+    /// killing the process; the flag says whether it was the signal that stopped it. The realm
+    /// stays usable afterwards.
+    pub fn with_sigint_break<R>(&mut self, f: impl FnOnce(&mut Runtime) -> R) -> (R, bool) {
+        let raised = self.engine.ctx().script_timeout_flag();
+        let guard = lumen_node::SigintBreak::new(Arc::clone(&raised));
+        let result = f(self);
+        let fired = guard.fired();
+        drop(guard);
+        if fired {
+            raised.store(false, Ordering::SeqCst);
+        }
+        (result, fired)
+    }
+
     /// Whether the realm has been interrupted.
     pub fn is_interrupted(&self) -> bool {
         self.interrupted()
@@ -1268,12 +1569,16 @@ impl Runtime {
 
     /// A handle that stops this realm from another thread. `None` unless embedded.
     pub fn terminator(&self) -> Option<Terminator> {
-        Some(self.handle_for(Arc::clone(self.interrupt.as_ref()?)))
+        Some(Terminator {
+            handle: self.handle_for(Arc::clone(self.interrupt.as_ref()?)),
+            wake: self.wake.clone(),
+        })
     }
 
     /// Run an embedded realm's entry script to the end: `.mjs` as an ES module, anything else as
     /// the CommonJS main module (the Node programs this hosts are `.cjs`). Returns how it ended.
     pub fn run_embedded_main(&mut self, path: &str) -> RealmExit {
+        self.prepare_main();
         let result = if path.ends_with(".mjs") {
             self.run_module(path)
         } else {
@@ -1286,8 +1591,15 @@ impl Runtime {
     /// compiled into its binary, say). `path` is the program's `__filename`; nothing is read
     /// from it, and it need not exist.
     pub fn run_embedded_source(&mut self, path: &str, source: &str) -> RealmExit {
+        self.prepare_main();
         let result = self.run_main_from(path, Some(source));
         self.finish_embedded(result)
+    }
+
+    /// Node's prepareMainThreadExecution, as the CLI runs it: opens the IPC channel a parent
+    /// passed in `NODE_CHANNEL_FD` and sets up a cluster worker.
+    fn prepare_main(&mut self) {
+        let _ = self.eval("typeof __lumenPrepareMain === 'function' && __lumenPrepareMain()");
     }
 
     fn finish_embedded(&mut self, result: Result<(), String>) -> RealmExit {
@@ -1352,4 +1664,36 @@ fn js_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+static TRACE_ATOMICS_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print each `Atomics.wait` step of `engine` the way Node's `--trace-atomics-wait` does; the
+/// thread id is Node's (0 for the main thread, a worker's `threadId` otherwise).
+pub(crate) fn install_atomics_wait_trace(engine: &mut Engine, thread_id: u64) {
+    use lumen::AtomicsWaitPhase::*;
+    engine.set_atomics_wait_hook(Some(Box::new(move |event| {
+        let call = format!(
+            "[Thread {thread_id}] Atomics.wait({:#x} + {:x}, {}, {})",
+            event.buffer,
+            event.byte_index,
+            event.value,
+            if event.timeout_ms.is_infinite() {
+                "inf".to_string()
+            } else {
+                format!("{}", event.timeout_ms)
+            }
+        );
+        let outcome = match event.phase {
+            Started => "started",
+            NotEqual => "did not wait because the values mismatched",
+            Woken => "was woken up by another thread",
+            TimedOut => "timed out",
+        };
+        eprintln!("(node:{}) {call} {outcome}", std::process::id());
+    })));
+}
+
+pub(crate) fn atomics_wait_trace_enabled() -> bool {
+    TRACE_ATOMICS_WAIT.load(std::sync::atomic::Ordering::SeqCst)
 }

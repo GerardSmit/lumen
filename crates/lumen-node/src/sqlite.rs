@@ -107,7 +107,6 @@ type SerializeFn = unsafe extern "C" fn(*mut c_void, *const c_char, *mut i64, c_
 type DeserializeFn =
     unsafe extern "C" fn(*mut c_void, *const c_char, *mut u8, i64, i64, c_int) -> c_int;
 type Malloc64 = unsafe extern "C" fn(u64) -> *mut c_void;
-type EnableLoadExtension = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type LoadExtension =
     unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *mut *mut c_char) -> c_int;
 type FileControl = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
@@ -161,7 +160,6 @@ struct Api {
     serialize: Option<SerializeFn>,
     deserialize: Option<DeserializeFn>,
     malloc64: Option<Malloc64>,
-    enable_load_extension: Option<EnableLoadExtension>,
     compileoption_used: Option<unsafe extern "C" fn(*const c_char) -> c_int>,
     load_extension: Option<LoadExtension>,
     file_control: FileControl,
@@ -249,9 +247,6 @@ impl Api {
             compileoption_used: lib.symbol("sqlite3_compileoption_used").map(|p| unsafe {
                 std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_char) -> c_int>(p)
             }),
-            enable_load_extension: lib
-                .symbol("sqlite3_enable_load_extension")
-                .map(|p| unsafe { std::mem::transmute::<*mut c_void, EnableLoadExtension>(p) }),
             load_extension: lib
                 .symbol("sqlite3_load_extension")
                 .map(|p| unsafe { std::mem::transmute::<*mut c_void, LoadExtension>(p) }),
@@ -1079,29 +1074,43 @@ fn op_set_custom_sqlite(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Valu
     Ok(Value::Undefined)
 }
 
+/// `SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION`: allows only the C `sqlite3_load_extension` interface,
+/// as Node does. `sqlite3_enable_load_extension` would also switch on the SQL `load_extension()`
+/// function, which lets any SQL text load native code.
+const SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION: c_int = 1005;
+
 fn op_enable_load_extension(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let db = db_ptr(ctx, arg_u32(args, 0))?;
     let enabled = match args.get(1) {
         Some(Value::Bool(value)) => *value,
         _ => return Err(ctx.make_error("TypeError", "allow must be a boolean")),
     };
-    let Some(enable) = state(ctx).api.as_ref().unwrap().enable_load_extension else {
-        let used = state(ctx).api.as_ref().unwrap().compileoption_used;
-        if !enabled
-            && used.is_some_and(|used| unsafe { used(c"OMIT_LOAD_EXTENSION".as_ptr()) != 0 })
-        {
+    let api = state(ctx).api.as_ref().unwrap().clone();
+    let mut actual: c_int = 0;
+    // SAFETY: the documented (int, int*) shape of the variadic configuration call.
+    let rc = unsafe {
+        (api.db_config)(
+            db,
+            SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION,
+            i32::from(enabled),
+            &mut actual as *mut c_int,
+        )
+    };
+    if rc != SQLITE_OK {
+        // A library built without extension loading has nothing to disable.
+        let omitted = api
+            .compileoption_used
+            .is_some_and(|used| unsafe { used(c"OMIT_LOAD_EXTENSION".as_ptr()) != 0 });
+        if omitted && !enabled {
             return Ok(Value::Undefined);
         }
         return Err(ctx.make_error(
             "Error",
-            "the loaded SQLite library does not support extension configuration",
-        ));
-    };
-    if unsafe { enable(db, i32::from(enabled)) } != SQLITE_OK {
-        return Err(db_error(
-            ctx,
-            db,
-            "unable to configure SQLite extension loading",
+            if omitted {
+                "the loaded SQLite library does not support extensions".to_string()
+            } else {
+                "unable to configure SQLite extension loading".to_string()
+            },
         ));
     }
     Ok(Value::Undefined)
@@ -1115,20 +1124,16 @@ fn op_load_extension(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, 
         .to_string();
     let path = std::ffi::CString::new(path)
         .map_err(|_| ctx.make_error("TypeError", "extension path contains a null byte"))?;
-    let (enable, load, free) = {
+    let (load, free) = {
         let api = state(ctx).api.as_ref().unwrap().clone();
-        (api.enable_load_extension, api.load_extension, api.free)
+        (api.load_extension, api.free)
     };
-    let (Some(enable), Some(load)) = (enable, load) else {
+    let Some(load) = load else {
         return Err(ctx.make_error(
             "Error",
             "the loaded SQLite library does not support extensions",
         ));
     };
-    let enabled = unsafe { enable(db, 1) };
-    if enabled != SQLITE_OK {
-        return Err(db_error(ctx, db, "unable to enable SQLite extensions"));
-    }
     let mut message: *mut c_char = std::ptr::null_mut();
     let rc = unsafe { load(db, path.as_ptr(), std::ptr::null(), &mut message) };
     if rc != SQLITE_OK {

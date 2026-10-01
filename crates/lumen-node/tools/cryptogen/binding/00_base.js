@@ -124,6 +124,7 @@ function opensslError(hex, library, reason, code, Base = Error) {
 // Base of every CryptoJob: `run()` is synchronous (returns [err, result]) or schedules `ondone`.
 // Subclasses implement `_run()` (a result or a throw) and may implement `_runAsync()` returning a
 // Promise when the work belongs on the native worker pool.
+let threadpoolTraceId = 0;
 class CryptoJob {
   constructor(mode) {
     this.mode = mode;
@@ -138,20 +139,31 @@ class CryptoJob {
         return [err, undefined];
       }
     }
-    const pending = typeof this._runAsync === "function" ?
+    const traceId = __traceEvent === null ? 0 : ++threadpoolTraceId;
+    if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "b", "crypto", traceId);
+    const native = typeof this._runAsync === "function";
+    if (traceId !== 0 && native) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "B", "crypto");
+    const pending = native ?
       this._runAsync() :
       new Promise((resolve, reject) => {
         setImmediate(() => {
           try {
+            if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "B", "crypto");
             resolve(this._run());
           } catch (err) {
             reject(err);
+          } finally {
+            if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "E", "crypto");
           }
         });
       });
+    const finish = () => {
+      if (traceId !== 0 && native) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "E", "crypto");
+      if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "e", "crypto", traceId);
+    };
     pending.then(
-      (result) => process.nextTick(() => this.ondone(undefined, result)),
-      (err) => process.nextTick(() => this.ondone(err, undefined)),
+      (result) => { finish(); process.nextTick(() => this.ondone(undefined, result)); },
+      (err) => { finish(); process.nextTick(() => this.ondone(err, undefined)); },
     );
   }
 }

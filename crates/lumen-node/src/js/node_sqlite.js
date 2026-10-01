@@ -113,8 +113,8 @@
       }
       if (options.limits !== undefined) throw new Error("node:sqlite custom limits are not implemented");
       if (options.timeout !== undefined && (!Number.isInteger(options.timeout) || options.timeout < 0)) throw new RangeError("SQLite timeout must be a non-negative integer");
-      if (options.allowExtension) throw new Error("node:sqlite extension loading is not implemented");
-      this._allowExtension = false;
+      this._allowExtension = options.allowExtension === true;
+      this._extensionEnabled = this._allowExtension;
       this._location = location;
       this._options = options;
       this._id = null;
@@ -130,7 +130,7 @@
       }
       this._id = call(S.open, this._location, (this._options.readOnly ? 1 : 6) | 64);
       try {
-        call(S.enableLoadExtension, this._id, false);
+        call(S.enableLoadExtension, this._id, this._allowExtension);
         call(S.doubleQuotedStringLiterals, this._id, this._options.enableDoubleQuotedStringLiterals === true);
         call(S.defensive, this._id, this._options.defensive !== false);
         this.exec(`PRAGMA foreign_keys=${this._options.enableForeignKeyConstraints === false ? 0 : 1}`);
@@ -157,10 +157,13 @@
       if(typeof allow !== "boolean") {const error=new TypeError('The "allow" argument must be a boolean.');error.code="ERR_INVALID_ARG_TYPE";throw error;}
       if(allow && !this._allowExtension) {const error=new Error("Cannot enable extension loading because it was disabled at database creation.");error.code="ERR_INVALID_STATE";throw error;}
       call(S.enableLoadExtension,this._id,allow);
+      this._extensionEnabled = allow;
     }
-    loadExtension() {
+    loadExtension(path) {
       this._assertOpen();
-      const error=new Error("Extension loading is disabled for this database.");error.code="ERR_INVALID_STATE";throw error;
+      if (!this._extensionEnabled) {const error=new Error("Extension loading is disabled for this database.");error.code="ERR_INVALID_STATE";throw error;}
+      if (typeof path !== "string") {const error=new TypeError('The "path" argument must be a string.');error.code="ERR_INVALID_ARG_TYPE";throw error;}
+      call(S.loadExtension,this._id,path);
     }
     enableDefensive(enabled) { this._assertOpen(); if (typeof enabled !== "boolean") throw new TypeError("enabled must be a boolean"); call(S.defensive, this._id, enabled); }
     location(schema = "main") { this._assertOpen(); return call(S.location, this._id, String(schema)); }

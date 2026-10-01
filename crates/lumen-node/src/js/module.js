@@ -26,11 +26,14 @@ const cache = Object.create(null);
 function isCoreSpecifier(spec) {
   if (spec === "bun" || spec.startsWith("bun:")) return CORE.has(spec) ? spec : null;
   const bare = spec.startsWith("node:") ? spec.slice(5) : spec;
-  if (bare === "internal/test/binding" && process[Symbol.for("lumen.options")]?.["--expose-internals"]) {
-    return bare;
-  }
+  // Internal modules are only reachable under --expose-internals (internals.js provides them).
+  if (bare.startsWith("internal/")) return exposedInternal(bare) ? bare : null;
   if (!spec.startsWith("node:") && SCHEME_ONLY.has(bare)) return null;
   return CORE.has(bare) ? bare : null;
+}
+
+function exposedInternal(id) {
+  return !!process[Symbol.for("lumen.options")]?.["--expose-internals"] && __internals.get("exposedInternals").has(id);
 }
 
 function isRelativeSpecifier(specifier) {
@@ -53,21 +56,49 @@ function stat(filename) {
   return result;
 }
 
+// NODE_PRESERVE_SYMLINKS=1 in the starting environment acts as --preserve-symlinks (read once,
+// before any program code runs, as Node reads it at startup).
+let envPreserveSymlinks;
 const preserveSymlinks = () => {
   const options = process[Symbol.for("lumen.options")];
-  return !!(options && options["--preserve-symlinks"]);
+  if (options && options["--preserve-symlinks"]) return true;
+  envPreserveSymlinks ??= process.env.NODE_PRESERVE_SYMLINKS === "1";
+  return envPreserveSymlinks;
 };
 const preserveSymlinksMain = () => {
   const options = process[Symbol.for("lumen.options")];
   return !!(options && options["--preserve-symlinks-main"]);
 };
+// The stat the resolver uses: `Module._stat`, which a program may replace (Node's experimental
+// hook for a virtual file system).
+let _stat = stat;
+const experimentalWarned = new Set();
+function emitExperimentalWarning(feature) {
+  if (experimentalWarned.has(feature)) return;
+  experimentalWarned.add(feature);
+  process.emitWarning(`${feature} is an experimental feature and might change at any time`, "ExperimentalWarning");
+}
+
+// Node's loader reads and realpaths through fs, so a program that patched fs (a virtual file
+// system) is honoured; until fs has loaded nothing can have patched it, and the native calls
+// stand in.
+function patchedFs(method) {
+  if (__builtins.pending.has("fs")) return undefined;
+  const fs = __builtins.get("fs");
+  return fs[method] !== __internals.get(`fs_${method}`) ? fs : undefined;
+}
+function readSource(filename) {
+  const fs = patchedFs("readFileSync");
+  return fs !== undefined ? fs.readFileSync(filename, "utf8") : __node.readText(filename);
+}
 function toRealPath(requestPath) {
-  return __node.realpath(requestPath);
+  const fs = patchedFs("realpathSync");
+  return fs !== undefined ? fs.realpathSync(requestPath) : __node.realpath(requestPath);
 }
 
 // tryFile(path): `path` when it is a file (symlinks resolved unless preserved), else undefined.
 function tryFile(requestPath, isMain) {
-  if (stat(requestPath) !== 0) return undefined;
+  if (_stat(requestPath) !== 0) return undefined;
   if (isMain ? preserveSymlinksMain() : preserveSymlinks()) return path.resolve(requestPath);
   return toRealPath(requestPath);
 }
@@ -121,6 +152,19 @@ function relativePackageTarget(target) {
       || lower.includes("%2f") || lower.includes("%5c") || lower.includes("\\");
   });
 }
+// require()'s conditions: Node's defaults, "node-addons" unless --no-addons, and --conditions.
+let cjsConditions;
+function cjsConditionMatches(condition) {
+  if (cjsConditions === undefined) {
+    const options = process[Symbol.for("lumen.options")] || {};
+    cjsConditions = new Set(["node", "require", "default"]);
+    if (options["--addons"] !== false) cjsConditions.add("node-addons");
+    const user = options["--conditions"];
+    if (Array.isArray(user)) for (let i = 0; i < user.length; i++) cjsConditions.add(user[i]);
+    else if (typeof user === "string") cjsConditions.add(user);
+  }
+  return cjsConditions.has(condition);
+}
 function resolveExportTarget(target) {
   if (typeof target === "string") {
     if (!relativePackageTarget(target)) return INVALID_EXPORT_TARGET;
@@ -140,7 +184,7 @@ function resolveExportTarget(target) {
   }
   if (target && typeof target === "object") {
     for (const condition of Object.keys(target)) {
-      if (condition === "node" || condition === "require" || condition === "default") {
+      if (cjsConditionMatches(condition)) {
         const resolved = resolveExportTarget(target[condition]);
         if (resolved !== undefined) return resolved;
       }
@@ -291,14 +335,14 @@ function findPath(request, paths, isMain) {
 
   for (let i = 0; i < paths.length; i++) {
     const curPath = paths[i];
-    if (curPath && !isRelativeSpecifier(request) && stat(curPath) < 1) continue;
+    if (curPath && !isRelativeSpecifier(request) && _stat(curPath) < 1) continue;
     if (!absoluteRequest) {
       const exportsResolved = resolveExportsFrom(curPath, request);
       if (exportsResolved) return exportsResolved;
     }
     const basePath = path.resolve(curPath, request);
     let filename;
-    const rc = stat(basePath);
+    const rc = _stat(basePath);
     if (!trailingSlash) {
       if (rc === 0) {
         filename = (isMain ? preserveSymlinksMain() : preserveSymlinks()) ? path.resolve(basePath) : toRealPath(basePath);
@@ -355,7 +399,6 @@ function pseudoParent(fromDir, parentFilename) {
 // Node's Module._resolveFilename. Builtins come back exactly as requested.
 function resolveRequest(request, parent, isMain, options) {
   if (isCoreSpecifier(request)) return request;
-  if (request.startsWith("node:")) throw new __errors.ERR_UNKNOWN_BUILTIN_MODULE(request);
   const parentFilename = parent && typeof parent.filename === "string" ? parent.filename : undefined;
   const aotKey = aotResolve(request, parentFilename);
   if (aotKey !== undefined) return aotKey;
@@ -480,7 +523,8 @@ function chainHooks(kind, defaultStep) {
 }
 
 function hasHook(kind) {
-  for (const reg of __registeredHooks) if (reg[kind]) return true;
+  // Indexed, not for-of: module loading must survive a program deleting the array iterator.
+  for (let i = 0; i < __registeredHooks.length; i++) if (__registeredHooks[i][kind]) return true;
   return false;
 }
 
@@ -792,7 +836,7 @@ CORE.add("module");
 
 // The frozen list of core module names, mirroring node:module's `builtinModules` (bare names,
 // no "node:" prefix), which now includes "module" itself.
-const builtinModules = Object.freeze([...CORE].filter((name) => !name.startsWith("internal/")));
+const builtinModules = Object.freeze([...CORE].filter((name) => !name.startsWith("internal/") && !SCHEME_ONLY.has(name)));
 
 // isBuiltin(spec): true when `spec` — with an optional "node:" prefix — names a core module.
 function isBuiltin(spec) {
@@ -860,7 +904,7 @@ function packageScopeType(filename) {
     if (parent === dir) break;
     dir = parent;
   }
-  for (const d of seen) packageTypeCache.set(d, type);
+  for (let i = 0; i < seen.length; i++) packageTypeCache.set(seen[i], type);
   return type;
 }
 
@@ -930,12 +974,12 @@ const ESM_SYNTAX = /(^|[\s;})])(import\s*[{*\w"']|export\s*[{*\w]|import\.meta\b
 const _extensions = {
   // An explicit .cjs file stays CommonJS even inside a type:module package.
   ".cjs": function (module, filename) {
-    module._compile(__node.readText(filename), filename, false);
+    module._compile(readSource(filename), filename, false);
   },
   ".js": function (module, filename) {
     const type = packageScopeType(filename);
     if (type === "module") return loadESM(module, filename);
-    const source = __node.readText(filename);
+    const source = readSource(filename);
     const detect = type === undefined;
     if (module._compile(source, filename, detect) === false) loadESM(module, filename);
   },
@@ -948,7 +992,7 @@ const _extensions = {
   ".ts": function (module, filename) {
     const type = packageScopeType(filename);
     if (type === "module") return loadESM(module, filename);
-    const source = __node.readText(filename);
+    const source = readSource(filename);
     const detect = type === undefined;
     if (module._compile(source, filename, detect, true) === false) loadESM(module, filename);
   },
@@ -956,11 +1000,11 @@ const _extensions = {
     loadESM(module, filename);
   },
   ".cts": function (module, filename) {
-    module._compile(__node.readText(filename), filename, false, true);
+    module._compile(readSource(filename), filename, false, true);
   },
   ".json": function (module, filename) {
     try {
-      module.exports = JSON.parse(__node.readText(filename).replace(/^\uFEFF/, ""));
+      module.exports = JSON.parse(readSource(filename).replace(/^\uFEFF/, ""));
     } catch (err) {
       err.message = filename + ": " + err.message;
       throw err;
@@ -1116,7 +1160,8 @@ function getExportsForCircularRequire(module) {
 
 function builtinFor(filename) {
   const core = filename.startsWith("node:") ? filename.slice(5) : filename;
-  return CORE.has(core) && (filename.startsWith("node:") || isCoreSpecifier(filename) !== null) ? core : null;
+  if (core.startsWith("internal/")) return exposedInternal(core) ? core : null;
+  return CORE.has(core) &&(filename.startsWith("node:") || isCoreSpecifier(filename) !== null) ? core : null;
 }
 
 // Module._load(request, parent, isMain): resolve then load, returning the module's exports.
@@ -1139,7 +1184,7 @@ function _load(request, parent, isMain) {
   }
   if (request.startsWith("node:")) {
     if (!isCoreSpecifier(request)) throw new __errors.ERR_UNKNOWN_BUILTIN_MODULE(request);
-    return __builtins.get(request.slice(5));
+    return loadBuiltin(request.slice(5));
   }
   let filename;
   if (hasHook("resolve")) {
@@ -1147,14 +1192,15 @@ function _load(request, parent, isMain) {
   } else {
     filename = Module._resolveFilename(request, parent, isMain);
   }
-  const builtin = builtinFor(filename);
-  if (builtin !== null) return __builtins.get(builtin);
+  // The cache comes first, so `require.cache.fs = …` stands in for the builtin (`node:fs` does not).
   const cachedModule = Module._cache[filename];
   if (cachedModule !== undefined) {
     updateChildren(parent, cachedModule, true);
     if (!cachedModule.loaded) return getExportsForCircularRequire(cachedModule);
     return cachedModule.exports;
   }
+  const builtin = builtinFor(filename);
+  if (builtin !== null) return loadBuiltin(builtin);
   const module = new Module(filename, parent);
   if (isMain) {
     process.mainModule = module;
@@ -1354,6 +1400,15 @@ Module._extensions = _extensions;
 Module._pathCache = Object.create(null);
 Module._debug = function () {};
 Module._findPath = _findPath;
+Object.defineProperty(Module, "_stat", {
+  get() { return _stat; },
+  set(fn) {
+    emitExperimentalWarning("Module._stat");
+    _stat = fn;
+    return true;
+  },
+  configurable: true,
+});
 Module._nodeModulePaths = nodeModulePaths;
 Module._resolveFilename = _resolveFilename;
 Module._resolveLookupPaths = _resolveLookupPaths;
@@ -1393,15 +1448,75 @@ __builtins.set("module", Module);
 __builtins.set("node:module", Module);
 
 // The CLI calls this once the parsed command-line options are in place (see Runtime::set_cli_options).
+// --trace-exit: process.exit() reports where it was called from, like Node's Environment::Exit.
+__internals.set("traceExit", function traceExit(code, threadId) {
+  const who = threadId === undefined || threadId === 0 ? `node:${process.pid}` : `node:${process.pid}, thread:${threadId}`;
+  const stack = String(new Error().stack).split("\n").slice(1).join("\n");
+  process.stderr.write(`(${who}) WARNING: Exited the environment with code ${code}\n${stack}\n`);
+});
+
 globalThis.__lumenApplyOptions = function () {
   const options = process[Symbol.for("lumen.options")];
+  if (options && options["--trace-exit"]) {
+    const reallyExit = process.reallyExit;
+    process.reallyExit = function reallyExit_(code) {
+      __internals.get("traceExit")(code);
+      return Reflect.apply(reallyExit, process, [code]);
+    };
+  }
+  if (options && typeof options["--title"] === "string") process.title = options["--title"];
   if (options && (options["--experimental-permission"] || options["--permission"])) {
     __internals.get("permission").init();
   }
   if (options && (options["--trace-events-enabled"] || options["--trace-event-categories"] !== undefined)) {
     __internals.get("trace_events").startFromOptions(options);
   }
+  if (options && options["--allow-natives-syntax"]) __node.v8SetFlags("--allow-natives-syntax");
+  if (options && options["--heapsnapshot-signal"]) {
+    const signal = options["--heapsnapshot-signal"];
+    process.on(signal, function doWriteHeapSnapshot() {
+      __builtins.get("v8").writeHeapSnapshot();
+    });
+  }
+  if (options && Number(options["--heapsnapshot-near-heap-limit"]) > 0) {
+    __builtins.get("v8").setHeapSnapshotNearHeapLimit(Number(options["--heapsnapshot-near-heap-limit"]));
+  }
+  if (process.env.NODE_V8_COVERAGE && !process.features.inspector) {
+    process.emitWarning("The inspector is disabled, coverage could not be collected", "Warning");
+  }
+  if (options && options["--experimental-global-customevent"] === false) {
+    // Materialise the lazy events unit first, or its first use would publish the name again.
+    void globalThis.Event;
+    delete globalThis.CustomEvent;
+  }
+  if (options && options["--experimental-global-webcrypto"] === false) {
+    void globalThis.crypto;
+    for (const name of ["crypto", "Crypto", "CryptoKey", "SubtleCrypto"]) delete globalThis[name];
+  }
+  // Node's global object: of its own properties only these are enumerable (V8's builtins and
+  // the web interfaces Node adds are not), and `process`/`Buffer` are replaceable accessors.
+  const enumerable = new Set([
+    "global", "queueMicrotask", "clearImmediate", "clearInterval", "clearTimeout", "atob", "btoa",
+    "performance", "setImmediate", "setInterval", "setTimeout", "structuredClone", "fetch", "crypto",
+  ]);
+  for (const key of Reflect.ownKeys(globalThis)) {
+    const desc = Reflect.getOwnPropertyDescriptor(globalThis, key);
+    const want = enumerable.has(key);
+    if (desc.configurable && desc.enumerable !== want) Object.defineProperty(globalThis, key, { enumerable: want });
+  }
+  for (const name of ["process", "Buffer"]) {
+    let value = globalThis[name];
+    Object.defineProperty(globalThis, name, {
+      get() { return value; },
+      set(v) { value = v; },
+      enumerable: false,
+      configurable: true,
+    });
+  }
 };
+
+// `lumen-cli --test`: Node's test runner main (test_runner.js).
+globalThis.__lumenRunTestMain = () => __internals.get("testRunnerMain")();
 
 // Exposed to the CLI (via a tiny bootstrap) to run a file as the main module.
 // The text an uncaught Error prints as: its inspection, which carries the own properties
@@ -1413,12 +1528,47 @@ globalThis.__lumenDescribeError = (error) => {
   return undefined;
 };
 
+// Node's ReportFatalException: an object prints as its inspection (customInspect off), anything
+// else as its string with the --trace-uncaught hint; then the Node.js version line.
+globalThis.__lumenFatalReport = (error) => {
+  let text;
+  if ((typeof error === "object" && error !== null) || typeof error === "function") {
+    try {
+      const { inspect } = __builtins.get("util");
+      text = inspect(error, { colors: false, customInspect: false, depth: Math.max(inspect.defaultOptions.depth, 5) });
+    } catch {
+      try { text = error.stack; } catch {}
+    }
+  }
+  if (typeof text !== "string" || text === "") {
+    try {
+      text = typeof error === "symbol" ? error.toString() : String(error);
+    } catch {
+      text = "<toString() threw exception>";
+    }
+    const argv0 = String(process.argv0 || "node").replace(/^.*[\\/]/, "").replace(/\.exe$/, "");
+    text += `\n(Use \`${argv0} --trace-uncaught ...\` to show where the exception was thrown)`;
+  }
+  return `${text}\n\nNode.js ${process.version}`;
+};
+
 globalThis.__runMain = (filename) => Module.runMain(filename);
 globalThis.__runMainSource = runMainSource;
 
 // --- ESM interop: synthetic re-export modules for the builtins ---
 // The runtime's module loader (Rust) builds each builtin's ESM source from the export lists
 // below; the source reads the module object through `__esmBuiltin`.
+let punycodeWarned = false;
+function loadBuiltin(name) {
+  if (name === "punycode" && !punycodeWarned) {
+    punycodeWarned = true;
+    if (process.execArgv.includes("--pending-deprecation") || /(^|\s)--pending-deprecation(\s|$)/.test(process.env.NODE_OPTIONS || "")) {
+      process.emitWarning("The `punycode` module is deprecated. Please use a userland alternative instead.", "DeprecationWarning", "DEP0040");
+    }
+  }
+  if (name.startsWith("internal/")) return __internals.get("exposedInternals").require(name);
+  return __builtins.get(name);
+}
 globalThis.__esmBuiltin = (name) => __builtins.get(name);
 
 // The export names of each builtin, for the runtime's module loader: it builds a builtin's
@@ -1452,3 +1602,4 @@ const __BUILTIN_NAMES = [
   "vm", "repl", "cluster", "dgram", "wasi",
 ];
 globalThis.__builtinNames = __BUILTIN_NAMES.join(",");
+

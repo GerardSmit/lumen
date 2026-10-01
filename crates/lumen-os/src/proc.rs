@@ -101,6 +101,114 @@ pub fn times() -> R<[f64; 5]> {
     Err(FsError("ENOSYS"))
 }
 
+/// The password-database entry of the real user id (`getpwuid(getuid())`). Without an entry (or
+/// off Unix) the ids are still set (-1 off Unix) and the strings are absent.
+pub struct PasswdEntry {
+    pub uid: i64,
+    pub gid: i64,
+    pub name: Option<String>,
+    pub dir: Option<String>,
+    pub shell: Option<String>,
+}
+
+pub fn current_user() -> PasswdEntry {
+    #[cfg(unix)]
+    {
+        use std::ffi::CStr;
+        let text = |p: *const libc::c_char| {
+            // SAFETY: a non-null passwd string field is a NUL-terminated C string.
+            (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        };
+        // SAFETY: no arguments, cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        // SAFETY: getpwuid returns null or a pointer to static storage valid until the next call.
+        let entry = unsafe { libc::getpwuid(uid) };
+        let (name, dir, shell) = if entry.is_null() {
+            (None, None, None)
+        } else {
+            unsafe { (text((*entry).pw_name), text((*entry).pw_dir), text((*entry).pw_shell)) }
+        };
+        PasswdEntry { uid: uid as i64, gid: gid as i64, name, dir, shell }
+    }
+    #[cfg(not(unix))]
+    PasswdEntry { uid: -1, gid: -1, name: None, dir: None, shell: None }
+}
+
+/// The 1, 5 and 15 minute load averages (zeros where the OS has none).
+pub fn loadavg() -> [f64; 3] {
+    #[cfg(unix)]
+    {
+        let mut out = [0f64; 3];
+        // SAFETY: `out` has room for the three samples requested.
+        if unsafe { libc::getloadavg(out.as_mut_ptr(), 3) } == 3 {
+            return out;
+        }
+    }
+    [0.0; 3]
+}
+
+/// Seconds since boot (0 where unknown).
+pub fn uptime() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        sysctl::<libc::timeval>("kern.boottime")
+            .map(|boot| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                (now - boot.tv_sec as f64 - boot.tv_usec as f64 / 1e6).max(0.0)
+            })
+            .unwrap_or(0.0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|t| t.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()))
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    0.0
+}
+
+/// Bytes of memory available to new allocations (0 where unknown).
+pub fn free_memory() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        let free_pages = sysctl::<u32>("vm.page_free_count").unwrap_or(0) as f64;
+        // SAFETY: sysconf has no failure mode beyond returning -1.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as f64;
+        free_pages * page
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|t| {
+                t.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| {
+                    l.split_whitespace().nth(1).and_then(|n| n.parse::<f64>().ok())
+                })
+            })
+            .map(|kb| kb * 1024.0)
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    0.0
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl<T: Default>(name: &str) -> Option<T> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut value = T::default();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: `value` is a writable `T` of `len` bytes.
+    let rc = unsafe {
+        libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    (rc == 0).then_some(value)
+}
+
 pub fn cpu_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }

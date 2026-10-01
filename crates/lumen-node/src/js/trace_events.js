@@ -7,9 +7,7 @@
 
 const { ERR_INVALID_ARG_TYPE, ERR_TRACE_EVENTS_CATEGORY_REQUIRED, ERR_TRACE_EVENTS_UNAVAILABLE } = __errors;
 
-if (!__builtins.get("worker_threads").isMainThread) {
-  throw new ERR_TRACE_EVENTS_UNAVAILABLE();
-}
+const isMainThread = __builtins.get("worker_threads").isMainThread;
 
 const kDefaultCategories = ["v8", "node", "node.async_hooks"];
 const kDefaultPattern = "node_trace.${rotation}.log";
@@ -23,6 +21,8 @@ let pattern = kDefaultPattern;
 let asyncHook = null;
 let startupTitle = "node";
 let fromOptions = false;
+let tid = process.pid;
+let postToParent = null;
 
 const timestamp = () => Number(process.hrtime.bigint() / 1000n);
 
@@ -61,15 +61,20 @@ function isTraceCategoryEnabled(category) {
 
 function record(ph, category, name, id, args, extra) {
   if (!started || !isTraceCategoryEnabled(category)) return;
-  const event = { pid: process.pid, tid: process.pid, ts: timestamp(), ph, cat: category, name };
+  const event = { pid: process.pid, tid, ts: timestamp(), ph, cat: category, name };
   if (id !== undefined) event.id = typeof id === "number" ? `0x${id.toString(16)}` : id;
   event.args = args === undefined ? {} : args;
   if (extra !== undefined) Object.assign(event, extra);
   events.push(event);
 }
 
-function metadata(name, args) {
-  return { pid: process.pid, tid: process.pid, ts: startTimestamp, ph: "M", cat: "__metadata", name, args };
+function metadata(name, args, tid = process.pid) {
+  return { pid: process.pid, tid, ts: startTimestamp, ph: "M", cat: "__metadata", name, args };
+}
+
+const workerThreads = [];
+function threadName(threadId, name) {
+  workerThreads.push(metadata("thread_name", { name }, process.pid + threadId));
 }
 
 function start() {
@@ -81,12 +86,17 @@ function start() {
 
 function flush() {
   if (!started) return;
-  started = false;
+  if (postToParent !== null) {
+    started = false;
+    postToParent(events);
+    return;
+  }
   const title = process.title;
   if (fromOptions) {
     record("I", "node,node.bootstrap", "loopExit", undefined, {}, { s: "t" });
     for (const name of ["RunCleanup", "AtExit"]) record("X", "node,node.environment", name, undefined, {}, { dur: 0 });
   }
+  started = false;
   const all = [
     metadata("process_name", { name: startupTitle }),
     metadata("version", { node: process.versions.node }),
@@ -101,6 +111,7 @@ function flush() {
     metadata("thread_name", { name: "JavaScriptMainThread" }),
     metadata("thread_name", { name: "PlatformWorkerThread" }),
   ];
+  all.push(...workerThreads);
   if (typeof title === "string" && title !== startupTitle) all.push(metadata("process_name", { name: title }));
   if (isTraceCategoryEnabled("v8")) {
     all.push({
@@ -224,6 +235,18 @@ function startFromOptions(options) {
   setImmediate(() => boot("loopStart")).unref();
 }
 
+// A worker thread records the categories its parent traces and ships its events to the parent
+// when it ends; the parent's trace file then carries them under the worker's thread id.
+function startInWorker(groups, threadId, post) {
+  tid = process.pid + threadId;
+  postToParent = post;
+  retain(groups);
+}
+
+function addWorkerEvents(list) {
+  for (const event of list) events.push(event);
+}
+
 // The `trace_events` binding that `internal/test/binding` (--expose-internals) hands out.
 const binding = {
   isTraceCategoryEnabled,
@@ -239,11 +262,11 @@ __setTraceEvent((category, phase, name, id, data) => {
   record(phase, category, name, id, data === undefined ? undefined : { data });
 });
 
-__builtins.set("trace_events", { createTracing, getEnabledCategories });
-__builtins.set("internal/test/binding", {
-  internalBinding(name) {
-    if (name === "trace_events") return binding;
-    return __internals.get("internalBinding")(name);
-  },
+__builtins.set("trace_events", __lazyValue(() => {
+  if (!isMainThread) throw new ERR_TRACE_EVENTS_UNAVAILABLE();
+  return { createTracing, getEnabledCategories };
+}));
+__internals.set("trace_events", {
+  startFromOptions, binding, threadName, startInWorker, addWorkerEvents,
+  groups: () => [...enabledGroups.keys()],
 });
-__internals.set("trace_events", { startFromOptions, binding });

@@ -1742,12 +1742,19 @@ const posix = {
 
 if (!isWindows) {
   const { pathResolve, pathJoin, pathDirname, pathBasename, pathExtname } = __node;
+  const jsResolve = posix.resolve;
+  const builtinCwd = process.cwd;
   Object.assign(posix, {
     resolve(...args) {
+      let absolute = false;
       for (let i = args.length - 1; i >= 0; i--) {
         validateString(args[i], `paths[${i}]`);
-        if (StringPrototypeCharCodeAt(args[i], 0) === CHAR_FORWARD_SLASH) break;
+        if (StringPrototypeCharCodeAt(args[i], 0) === CHAR_FORWARD_SLASH) {
+          absolute = true;
+          break;
+        }
       }
+      if (!absolute && process.cwd !== builtinCwd) return Reflect.apply(jsResolve, this, args);
       return pathResolve(...args);
     },
     join(...args) {

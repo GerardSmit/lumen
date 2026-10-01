@@ -279,6 +279,9 @@ pub(crate) struct SourceInfo {
     /// frame `Object.<anonymous>`.
     wrapper: usize,
     table: Option<Rc<LineTable>>,
+    /// Added to every line, and to the columns of the first line (`vm`'s `lineOffset` /
+    /// `columnOffset`).
+    offsets: (i32, i32),
 }
 
 /// The source registry, keyed by the address of a source's `Rc<str>` text (the `src` every
@@ -311,6 +314,7 @@ impl Sources {
                     body_start: 0,
                     wrapper: 0,
                     table: None,
+                    offsets: (0, 0),
                 },
             );
         }
@@ -361,6 +365,13 @@ impl Sources {
                 }),
                 _ => None,
             }
+        };
+        let lc = match (lc, e.offsets) {
+            (Some((l, c)), (lo, co)) if (lo, co) != (0, 0) => {
+                let c = if l == 1 { (c as i64 + co as i64).max(1) } else { c as i64 };
+                Some(((l as i64 + lo as i64).max(1) as u32, c as u32))
+            }
+            (lc, _) => lc,
         };
         (e.name.clone(), lc, e.wrapper)
     }
@@ -681,6 +692,11 @@ impl Interp {
         self.sources
             .borrow_mut()
             .register(src, name, body_start, wrapper, table);
+    }
+
+    /// Shift the reported lines (and first-line columns) of `src` by `vm`'s offsets.
+    pub(crate) fn set_source_offsets(&self, src: &Rc<str>, line: i32, column: i32) {
+        self.sources.borrow_mut().entry(src).offsets = (line, column);
     }
 
     /// Take the source the parse / decode that just ran read from ([`take_parsed_source`]),

@@ -126,7 +126,13 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
       this.writeUint32(keys.length);
       for (const k of keys) { this._writeString(k); this.writeValue(value[k]); }
     }
-    releaseBuffer() { return Buffer.from(this._bytes); }
+    releaseBuffer() {
+      const buffer = Buffer.from(this._bytes);
+      this._bytes = [];
+      this._ids = new Map();
+      this._nextId = 0;
+      return buffer;
+    }
   }
 
   // DefaultSerializer is the class serialize() uses; it differs from Serializer only in how it
@@ -256,38 +262,62 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     return d.readValue();
   };
 
-  // lumen exposes no V8 heap accounting, so the numeric fields are honest zeros in Node's shape
-  // (rather than invented figures). Field names and count match Node v22 exactly.
-  const HEAP_LIMIT = 2 * 1024 * 1024 * 1024;
-  const getHeapStatistics = () => ({
-    total_heap_size: 0,
-    total_heap_size_executable: 0,
-    total_physical_size: 0,
-    total_available_size: HEAP_LIMIT,
-    used_heap_size: 0,
-    heap_size_limit: HEAP_LIMIT,
-    malloced_memory: 0,
-    peak_malloced_memory: 0,
-    does_zap_garbage: 0,
-    number_of_native_contexts: 1,
-    number_of_detached_contexts: 0,
-    total_global_handles_size: 0,
-    used_global_handles_size: 0,
-    external_memory: 0,
-  });
-  const HEAP_SPACES = [
-    "read_only_space", "new_space", "old_space", "code_space", "shared_space",
-    "new_large_object_space", "large_object_space",
-    "code_large_object_space", "shared_large_object_space",
-  ];
-  const getHeapSpaceStatistics = () =>
-    HEAP_SPACES.map((space_name) => ({
-      space_name,
-      space_size: 0,
-      space_used_size: 0,
-      space_available_size: 0,
-      physical_space_size: 0,
-    }));
+  // The engine counts live objects, not bytes: the heap figures are the same shallow estimate
+  // `process.memoryUsage()` reports (128 bytes per object plus the live ArrayBuffer bytes). The
+  // limit is the worker's `resourceLimits` or, on the main thread, `--max-old-space-size`.
+  const MIB = 1024 * 1024;
+  const heapLimits = () => {
+    const limits = __builtins.get("worker_threads").resourceLimits;
+    if (limits.maxOldGenerationSizeMb !== undefined) {
+      return { old: limits.maxOldGenerationSizeMb * MIB, young: limits.maxYoungGenerationSizeMb * MIB };
+    }
+    const flag = Number(process[Symbol.for("lumen.options")]?.["--max-old-space-size"]);
+    return { old: (flag > 0 ? flag : 2048) * MIB, young: 16 * MIB };
+  };
+  const heapUsage = () => {
+    const [objects, buffers] = __node.memoryStats();
+    return { used: objects * 128 + buffers, external: buffers, ...heapLimits() };
+  };
+  const getHeapStatistics = () => {
+    const { used, external, old, young } = heapUsage();
+    const limit = old + young;
+    return {
+      total_heap_size: used,
+      total_heap_size_executable: 0,
+      total_physical_size: used,
+      total_available_size: Math.max(limit - used, 0),
+      used_heap_size: used,
+      heap_size_limit: limit,
+      malloced_memory: 0,
+      peak_malloced_memory: 0,
+      does_zap_garbage: 0,
+      number_of_native_contexts: 1,
+      number_of_detached_contexts: 0,
+      total_global_handles_size: 0,
+      used_global_handles_size: 0,
+      external_memory: external,
+    };
+  };
+  const getHeapSpaceStatistics = () => {
+    const { used, old, young } = heapUsage();
+    const newUsed = Math.min(used >> 3, young >> 2);
+    const oldUsed = used - newUsed;
+    const space = (space_name, size, available) => ({
+      space_name, space_size: size, space_used_size: size, space_available_size: available,
+      physical_space_size: size,
+    });
+    return [
+      space("read_only_space", 0, 0),
+      space("new_space", newUsed, Math.max((young >> 1) - newUsed, 0)),
+      space("old_space", oldUsed, Math.max(old - oldUsed, 0)),
+      space("code_space", 0, 0),
+      space("shared_space", 0, 0),
+      space("new_large_object_space", 0, 0),
+      space("large_object_space", 0, 0),
+      space("code_large_object_space", 0, 0),
+      space("shared_large_object_space", 0, 0),
+    ];
+  };
   const getHeapCodeStatistics = () => ({
     code_and_metadata_size: 0,
     bytecode_and_metadata_size: 0,
@@ -321,6 +351,7 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
   const setFlagsFromString = (flags) => {
     if (typeof flags !== "string") throw new __errors.ERR_INVALID_ARG_TYPE("flags", "string", flags);
     for (let i = 0; i < flags.length; i++) flagSalt = (Math.imul(flagSalt, 31) + flags.charCodeAt(i) + 1) | 0;
+    __node.v8SetFlags(flags);
   };
 
   // Inert GC profiler: lumen surfaces no GC event stream, so a session records nothing.
@@ -332,171 +363,27 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
   }
 
   // ---- heap snapshots ------------------------------------------------------------------------
-  // A V8-format `.heapsnapshot` of the object graph reachable from the global object (own data
-  // properties and prototypes, walked breadth-first). lumen has no heap profiler, so the graph is
-  // what JS reflection can see, bounded to `kMaxSnapshotNodes` objects and `kMaxEdgesPerNode`
-  // edges per object; engine-internal structures are absent.
-  const kMaxSnapshotNodes = 50000;
-  const kMaxEdgesPerNode = 64;
-  const NODE_TYPES = ["hidden", "array", "string", "object", "code", "closure", "regexp", "number",
-    "native", "synthetic", "concatenated string", "sliced string", "symbol", "bigint", "object shape"];
-  const EDGE_TYPES = ["context", "element", "property", "internal", "hidden", "shortcut", "weak"];
-  const T_ARRAY = 1, T_OBJECT = 3, T_CLOSURE = 5, T_SYNTHETIC = 9;
-  const E_ELEMENT = 1, E_PROPERTY = 2, E_INTERNAL = 3, E_SHORTCUT = 5;
-
-  function buildHeapSnapshot() {
-    const strings = [];
-    const stringIds = new Map();
-    const intern = (s) => {
-      let id = stringIds.get(s);
-      if (id === undefined) {
-        id = strings.length;
-        strings.push(s);
-        stringIds.set(s, id);
-      }
-      return id;
-    };
-    const nodes = [];
-    const edges = [];
-    const indexOf = new Map();
-    const queue = [];
-    const classNameOf = (obj) => {
-      try {
-        let proto = Object.getPrototypeOf(obj);
-        for (let depth = 0; proto !== null && depth < 8; depth++, proto = Object.getPrototypeOf(proto)) {
-          const d = Object.getOwnPropertyDescriptor(proto, "constructor");
-          if (d !== undefined && typeof d.value === "function" && typeof d.value.name === "string" && d.value.name) {
-            return d.value.name;
-          }
-        }
-      } catch {
-        /* exotic object: fall through */
-      }
-      return "Object";
-    };
-    const visit = (obj) => {
-      let idx = indexOf.get(obj);
-      if (idx === undefined && queue.length < kMaxSnapshotNodes) {
-        idx = queue.length + 1;
-        indexOf.set(obj, idx);
-        queue.push(obj);
-      }
-      return idx;
-    };
-    const rootEdges = [];
-    const g = visit(globalThis);
-    if (g !== undefined) rootEdges.push([E_SHORTCUT, intern("global"), g]);
-
-    // node 0 is the synthetic root, then the queue in discovery order.
-    const nodeFields = 7;
-    let nextId = 1;
-    const emitNode = (type, name, selfSize, edgeCount) => {
-      nodes.push(type, intern(name), nextId, selfSize, edgeCount, 0, 0);
-      nextId += 2;
-    };
-    emitNode(T_SYNTHETIC, "", 0, rootEdges.length);
-    for (const [type, name, to] of rootEdges) edges.push(type, name, to * nodeFields);
-    for (let i = 0; i < queue.length; i++) {
-      const obj = queue[i];
-      const isFunction = typeof obj === "function";
-      const isArray = Array.isArray(obj);
-      let keys;
-      try {
-        keys = Reflect.ownKeys(obj);
-      } catch {
-        keys = [];
-      }
-      const mine = [];
-      for (const key of keys) {
-        if (mine.length >= kMaxEdgesPerNode) break;
-        let d;
-        try {
-          d = Object.getOwnPropertyDescriptor(obj, key);
-        } catch {
-          continue;
-        }
-        const value = d && "value" in d ? d.value : undefined;
-        if (value === null || (typeof value !== "object" && typeof value !== "function")) continue;
-        const to = visit(value);
-        if (to === undefined) continue;
-        const element = isArray && typeof key === "string" && /^\d+$/.test(key);
-        mine.push([element ? E_ELEMENT : E_PROPERTY, element ? Number(key) : intern(typeof key === "symbol" ? key.toString() : key), to]);
-      }
-      let proto = null;
-      try {
-        proto = Object.getPrototypeOf(obj);
-      } catch {
-        /* proxy without a prototype trap */
-      }
-      if (proto !== null) {
-        const to = visit(proto);
-        if (to !== undefined) mine.push([E_INTERNAL, intern("__proto__"), to]);
-      }
-      const name = isFunction ? (typeof obj.name === "string" ? obj.name : "") : classNameOf(obj);
-      emitNode(isFunction ? T_CLOSURE : isArray ? T_ARRAY : T_OBJECT, name, 16 + 8 * mine.length, mine.length);
-      for (const [type, nameOrIndex, to] of mine) edges.push(type, nameOrIndex, to * nodeFields);
-    }
-    const nodeCount = nodes.length / nodeFields;
-    return {
-      snapshot: {
-        meta: {
-          node_fields: ["type", "name", "id", "self_size", "edge_count", "trace_node_id", "detachedness"],
-          node_types: [NODE_TYPES, "string", "number", "number", "number", "number", "number"],
-          edge_fields: ["type", "name_or_index", "to_node"],
-          edge_types: [EDGE_TYPES, "string_or_number", "node"],
-          trace_function_info_fields: ["function_id", "name", "script_name", "script_id", "line", "column"],
-          trace_node_fields: ["id", "function_info_index", "count", "size", "children"],
-          sample_fields: ["timestamp_us", "last_assigned_id"],
-          location_fields: ["object_index", "script_id", "line", "column"],
-        },
-        node_count: nodeCount,
-        edge_count: edges.length / 3,
-        trace_function_count: 0,
-      },
-      nodes,
-      edges,
-      trace_function_infos: [],
-      trace_tree: [],
-      samples: [],
-      locations: [],
-      strings,
-    };
-  }
-
-  // The snapshot as JSON text pieces, so a stream can hand them out without one giant string.
-  function* heapSnapshotChunks() {
-    const snap = buildHeapSnapshot();
-    yield `{"snapshot":${JSON.stringify(snap.snapshot)},\n"nodes":[`;
-    const rows = (array, width) => {
-      const out = [];
-      for (let i = 0; i < array.length; i += width * 1024) out.push(array.slice(i, i + width * 1024).join(","));
-      return out;
-    };
-    const emitList = function* (array, width) {
-      const pieces = rows(array, width);
-      for (let i = 0; i < pieces.length; i++) yield (i === 0 ? "" : ",") + pieces[i];
-    };
-    yield* emitList(snap.nodes, 7);
-    yield `],\n"edges":[`;
-    yield* emitList(snap.edges, 3);
-    yield `],\n"trace_function_infos":[],\n"trace_tree":[],\n"samples":[],\n"locations":[],\n"strings":[`;
-    for (let i = 0; i < snap.strings.length; i += 1024) {
-      const part = snap.strings.slice(i, i + 1024).map((s) => JSON.stringify(s)).join(",");
-      yield (i === 0 ? "" : ",") + part;
-    }
-    yield "]}\n";
+  // V8-format `.heapsnapshot`s of the engine's object graph, built natively (`__node.heapSnapshot`).
+  function validateHeapSnapshotOptions(options = {}) {
+    __validators.validateObject(options, "options");
+    const { exposeInternals = false, exposeNumericValues = false } = options;
+    __validators.validateBoolean(exposeInternals, "options.exposeInternals");
+    __validators.validateBoolean(exposeNumericValues, "options.exposeNumericValues");
   }
 
   function getHeapSnapshot(options) {
-    if (options !== undefined && (typeof options !== "object" || options === null)) {
-      throw new __errors.ERR_INVALID_ARG_TYPE("options", "Object", options);
-    }
+    validateHeapSnapshotOptions(options);
     const { Readable } = __builtins.get("stream");
-    const chunks = heapSnapshotChunks();
+    const kChunk = 64 * 1024;
+    // Node's HeapSnapshotStream serializes and pushes the whole snapshot on the first read,
+    // synchronously (so a paused stream's read() returns all of it).
     return new Readable({
       read() {
-        const next = chunks.next();
-        this.push(next.done ? null : next.value);
+        const data = __node.heapSnapshot();
+        for (let offset = 0; offset < data.length; offset += kChunk) {
+          this.push(Buffer.from(data.buffer, data.byteOffset + offset, Math.min(kChunk, data.length - offset)));
+        }
+        this.push(null);
       },
     });
   }
@@ -504,41 +391,35 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
   let snapshotCounter = 0;
   function writeHeapSnapshot(filename, options) {
     if (filename !== undefined) {
-      if (typeof filename !== "string" && !(filename instanceof Uint8Array)) {
+      if (filename instanceof URL) filename = __builtins.get("url").fileURLToPath(filename);
+      else if (typeof filename !== "string" && !(filename instanceof Uint8Array)) {
         throw new __errors.ERR_INVALID_ARG_TYPE("path", ["string", "Buffer", "URL"], filename);
       }
-    } else {
+    }
+    validateHeapSnapshotOptions(options);
+    if (filename === undefined) {
+      // Node's DiagnosticFilename: Heap.<date>.<time>.<pid>.<thread id>.<seq>.heapsnapshot,
+      // inside --diagnostic-dir when one is given.
       const d = new Date();
       const pad = (n, w = 2) => String(n).padStart(w, "0");
-      filename = `Heap.${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${process.pid}.0.${pad(++snapshotCounter, 3)}.heapsnapshot`;
-    }
-    if (options !== undefined && (typeof options !== "object" || options === null)) {
-      throw new __errors.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      const threadId = __builtins.get("worker_threads")?.threadId ?? 0;
+      filename = `Heap.${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${process.pid}.${threadId}.${pad(++snapshotCounter, 3)}.heapsnapshot`;
+      const dir = process[Symbol.for("lumen.options")]?.["--diagnostic-dir"];
+      if (dir) filename = __builtins.get("path").join(dir, filename);
     }
     const fs = __builtins.get("fs");
-    const fd = fs.openSync(filename, "w");
-    try {
-      for (const chunk of heapSnapshotChunks()) fs.writeSync(fd, chunk);
-    } finally {
-      fs.closeSync(fd);
-    }
-    return filename;
+    fs.closeSync(fs.openSync(filename, "w"));
+    const path = typeof filename === "string" ? filename : Buffer.from(filename).toString();
+    __node.heapSnapshot(path);
+    return path;
   }
 
   const notSupported = (what) => () => {
     throw new Error(`node:v8 ${what} is not supported in lumen`);
   };
 
-  // promiseHooks: lumen has no promise-lifecycle hook plumbing. Shaped like Node's; each registrar
-  // is a no-op that returns the standard "stop" function.
-  const noopStop = () => {};
-  const promiseHooks = {
-    createHook: () => noopStop,
-    onInit: () => noopStop,
-    onBefore: () => noopStop,
-    onAfter: () => noopStop,
-    onSettled: () => noopStop,
-  };
+  // promiseHooks: the engine's promise lifecycle hooks, multiplexed in async_hooks.js.
+  const promiseHooks = __internals.get("promiseHooks");
 
   // startupSnapshot: lumen has no heap serializer. A snapshot blob names the entry script; running
   // from a blob replays that script (stdout/stderr muted) through the serialize and deserialize
@@ -622,7 +503,11 @@ __lazyGlue(__glueIndex, "v8", "", "", () => {
     startupSnapshot,
     setFlagsFromString,
     // No snapshot-on-near-heap-limit mechanism exists here; registering a limit is a no-op.
-    setHeapSnapshotNearHeapLimit: () => {},
+    setHeapSnapshotNearHeapLimit(limit) {
+      __validators.validateUint32(limit, "limit");
+      __node.setNearHeapLimit(limit, __builtins.get("worker_threads").threadId,
+        process[Symbol.for("lumen.options")]?.["--diagnostic-dir"] ?? "");
+    },
     // Coverage collection is not wired up (no NODE_V8_COVERAGE sink); these are the inert no-ops
     // Node itself uses when coverage is disabled.
     takeCoverage: () => {},
@@ -728,6 +613,20 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
 // so `emit` of anything else is false and `listenerCount` is 0 without loading anything.
 {
   const proc = globalThis.process;
+  {
+    // Node's `process` is an instance of the `process` function, whose prototype inherits from
+    // EventEmitter.prototype (linked when node:events loads).
+    const processPrototype = Object.getPrototypeOf(proc) === Object.prototype ? {} : undefined;
+    if (processPrototype !== undefined) {
+      const ctor = function process() {};
+      ctor.prototype = processPrototype;
+      Object.defineProperty(processPrototype, "constructor", { value: ctor, writable: true, enumerable: false, configurable: true });
+      const events = Map.prototype.get.call(__builtins, "events");
+      if (typeof events === "function") Object.setPrototypeOf(processPrototype, events.prototype);
+      Object.setPrototypeOf(proc, processPrototype);
+      __internals.set("process_prototype", processPrototype);
+    }
+  }
   const EMITTER_METHODS = [
     "on", "off", "once", "emit", "addListener", "removeListener", "removeAllListeners",
     "prependListener", "prependOnceListener", "listeners", "rawListeners", "listenerCount",
@@ -737,6 +636,7 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
   let EventEmitter = null;
   let defaultWarningListener;
   const stubs = new Map();
+  const impl = new Map();
   const materialize = () => {
     if (EventEmitter !== null) return;
     EventEmitter = __builtins.get("events");
@@ -744,8 +644,49 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     Object.defineProperty(proc, "_events", { value: Object.create(null), writable: true, enumerable: true, configurable: true });
     Object.defineProperty(proc, "_eventsCount", { value: 0, writable: true, enumerable: true, configurable: true });
     Object.defineProperty(proc, "_maxListeners", { value: undefined, writable: true, enumerable: true, configurable: true });
-    for (const [m, stub] of stubs) if (proc[m] === stub) proc[m] = EventEmitter.prototype[m];
     EventEmitter.prototype.on.call(proc, "warning", defaultWarningListener);
+    // An OS handler exists while a signal has listeners and its delivery does not keep the loop
+    // alive. Hooked around the emitter methods so no observable newListener/removeListener
+    // listeners are needed.
+    const signalWatches = new Map();
+    const isSignal = (type) => typeof type === "string" && type.startsWith("SIG") && __node.signalNumber(type) !== undefined;
+    const startWatch = (type) => {
+      if (signalWatches.has(type)) return;
+      const key = __node.signalWatch(type, (signum) => proc.emit(type, type, signum));
+      if (key !== undefined) signalWatches.set(type, key);
+    };
+    const stopWatch = (type) => {
+      const key = signalWatches.get(type);
+      if (key !== undefined && EventEmitter.prototype.listenerCount.call(proc, type) === 0) {
+        __node.signalUnwatch(key);
+        signalWatches.delete(type);
+      }
+    };
+    for (const m of ["on", "addListener", "once", "prependListener", "prependOnceListener"]) {
+      const original = EventEmitter.prototype[m];
+      impl.set(m, { [m](type, listener) {
+        const r = Reflect.apply(original, this, arguments);
+        if (this === proc && isSignal(type)) startWatch(type);
+        return r;
+      } }[m]);
+    }
+    for (const m of ["removeListener", "off"]) {
+      const original = EventEmitter.prototype[m];
+      impl.set(m, { [m](type, listener) {
+        const r = Reflect.apply(original, this, arguments);
+        if (this === proc && isSignal(type)) stopWatch(type);
+        return r;
+      } }[m]);
+    }
+    {
+      const original = EventEmitter.prototype.removeAllListeners;
+      impl.set("removeAllListeners", function removeAllListeners(type) {
+        const r = Reflect.apply(original, this, arguments);
+        if (this === proc) for (const t of [...signalWatches.keys()]) if (type === undefined || type === t) stopWatch(t);
+        return r;
+      });
+    }
+    for (const [m, stub] of stubs) if (proc[m] === stub) proc[m] = impl.get(m) ?? EventEmitter.prototype[m];
   };
   const quiet = (self, type) => EventEmitter === null && self === proc && type !== "warning" && type !== "error";
   for (const m of EMITTER_METHODS) {
@@ -755,7 +696,7 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
         if (m === "emit" && quiet(this, args[0])) return false;
         if (m === "listenerCount" && quiet(this, args[0])) return 0;
         materialize();
-        return Reflect.apply(EventEmitter.prototype[m], this, args);
+        return Reflect.apply(impl.get(m) ?? EventEmitter.prototype[m], this, args);
       },
     })[m];
     stubs.set(m, stub);
@@ -784,8 +725,19 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
   // after argv is populated). execArgv — the runtime flags before the script — is empty for lumen.
   proc.execArgv = [];
 
-  // Plain data slots (all settable, matching Node).
-  proc.exitCode = undefined;
+  let exitCode;
+  Object.defineProperty(proc, "exitCode", {
+    get() { return exitCode; },
+    set(code) {
+      if (code !== null && code !== undefined) {
+        if (!(typeof code === "string" && code !== "" && Number.isInteger(+code))) {
+          __validators.validateInteger(code, "code");
+        }
+      }
+      exitCode = code;
+    },
+    enumerable: true, configurable: false,
+  });
   proc.debugPort = 9229;
   proc.domain = null;
   proc.moduleLoadList = [];
@@ -794,10 +746,19 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     target_defaults: { default_configuration: "Release" },
     variables: {
       v8_enable_i18n_support: 1, icu_small: false, node_shared_openssl: false,
+      // Intl data is built in (not a system ICU), at the ICU version process.versions.icu reports.
+      icu_gyp_path: "tools/icu/icu-generic.gyp", icu_ver_major: "74",
       openssl_is_fips: false, openssl_quic: false, node_module_version: 115, napi_build_version: "9",
       node_shared: false, node_use_openssl: true, asan: 0,
     },
   };
+  {
+    const deepFreeze = (o) => {
+      for (const v of Object.values(o)) if (v !== null && typeof v === "object") deepFreeze(v);
+      return Object.freeze(o);
+    };
+    deepFreeze(proc.config);
+  }
   proc.sourceMapsEnabled = false;
   proc.allowedNodeEnvironmentFlags = new Set();
 
@@ -810,6 +771,25 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     }
   }
 
+  // queueMicrotask validates like Node's and, once async_hooks is loaded, runs the callback as a
+  // 'Microtask' async resource. A throwing callback is an uncaught exception.
+  {
+    const rawQueueMicrotask = globalThis.queueMicrotask;
+    __internals.set("rawQueueMicrotask", rawQueueMicrotask);
+    globalThis.queueMicrotask = function queueMicrotask(callback) {
+      __validators.validateFunction(callback, "callback");
+      rawQueueMicrotask(__asyncTracking ? __bindAsyncContext(callback, "Microtask", { callback }) : callback);
+    };
+  }
+
+  // process 'multipleResolves' (deprecated): a promise resolved or rejected again after it was
+  // resolved, reported from a tick so the promise's own handlers cannot catch it.
+  __node.setMultipleResolvesHook((type, promise, reason) => {
+    if (proc.listenerCount("multipleResolves") > 0) {
+      proc.nextTick(() => proc.emit("multipleResolves", type, promise, reason));
+    }
+  });
+
   // nextTick callbacks run in the async context they were queued from (AsyncLocalStorage).
   const rawNextTick = proc.nextTick;
   proc.nextTick = function nextTick(callback, ...args) {
@@ -821,14 +801,17 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     return rawNextTick(__bindAsyncContext(callback, "TickObject", { callback, args }), ...args);
   };
 
-  // exit() honors process.exitCode when called without an explicit code; reallyExit is the raw op.
+  // Node's process.exit: record the code, emit 'exit' once, then process.reallyExit (the raw op).
   const nativeExit = proc.exit;
-  proc.reallyExit = nativeExit;
+  proc.reallyExit = function reallyExit(code) { return nativeExit(code); };
   Object.defineProperty(proc, "exit", {
-    value: function (code) {
-      const c = code !== undefined && code !== null ? code
-        : (proc.exitCode !== undefined && proc.exitCode !== null ? proc.exitCode : 0);
-      return nativeExit(c);
+    value: function exit(code) {
+      if (arguments.length !== 0) proc.exitCode = code;
+      if (!proc._exiting) {
+        proc._exiting = true;
+        proc.emit("exit", proc.exitCode || 0);
+      }
+      proc.reallyExit(proc.exitCode || 0);
     },
     enumerable: true, configurable: true, writable: true,
   });
@@ -953,12 +936,65 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
   };
 
   // Real state, no real source-map support yet: toggle the flag setSourceMapsEnabled reads back.
-  proc.setSourceMapsEnabled = function (val) { proc.sourceMapsEnabled = !!val; };
+  {
+    const rawChdir = proc.chdir;
+    proc.chdir = function chdir(directory) {
+      __validators.validateString(directory, "directory");
+      try {
+        rawChdir(directory);
+      } catch (e) {
+        if (typeof e?.errno !== "number") throw e;
+        const [code, desc] = __uvErrmap().get(e.errno) || ["UNKNOWN", "unknown error"];
+        const err = new Error(`${code}: ${desc}, chdir ${proc.cwd()} -> '${directory}'`);
+        err.errno = e.errno;
+        err.code = code;
+        err.syscall = "chdir";
+        err.path = proc.cwd();
+        err.dest = directory;
+        throw err;
+      }
+    };
+    const rawUmask = proc.umask;
+    proc.umask = function umask(mask) {
+      if (mask === undefined) return rawUmask();
+      if (typeof mask === "string") {
+        if (!/^[0-7]+$/.test(mask)) {
+          throw new __errors.ERR_INVALID_ARG_VALUE("mask", mask, "must be a 32-bit unsigned integer or an octal string");
+        }
+        mask = Number.parseInt(mask, 8);
+      }
+      __validators.validateUint32(mask, "mask");
+      return rawUmask(mask);
+    };
+  }
+  proc.setSourceMapsEnabled = function setSourceMapsEnabled(val) {
+    __validators.validateBoolean(val, "val");
+    proc.sourceMapsEnabled = val;
+  };
+  {
+    const rawHrtime = proc.hrtime;
+    const hrtime = function hrtime(time) {
+      if (time !== undefined) {
+        __validators.validateArray(time, "time");
+        if (time.length !== 2) throw new __errors.ERR_OUT_OF_RANGE("time", 2, time.length);
+      }
+      return rawHrtime(time);
+    };
+    hrtime.bigint = rawHrtime.bigint;
+    proc.hrtime = hrtime;
+  }
 
   // Native OS process counters. Heap-specific fields stay zero until the engine exposes allocator
   // accounting, while RSS/CPU/resource counters are real getrusage(2) measurements.
   const metrics = () => proc._nativeMetrics();
-  const memoryUsage = () => ({ rss: metrics()[0], heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 });
+  // The engine tracks live heap objects, not bytes: the heap figures are a shallow estimate
+  // (128 bytes per object); arrayBuffers is the exact byte count of live ArrayBuffer storage.
+  const memoryUsage = () => {
+    const [objects, buffers] = __node.memoryStats();
+    const heapUsed = objects * 128;
+    return { rss: metrics()[0], heapTotal: Math.ceil(heapUsed / 1048576) * 1048576, heapUsed,
+      external: buffers, arrayBuffers: buffers };
+  };
   memoryUsage.rss = () => metrics()[0];
   proc.memoryUsage = memoryUsage;
   const identity = proc[Symbol.for("lumen.identity")];
@@ -1004,11 +1040,24 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     };
   }
   proc.availableMemory = () => metrics()[14];
-  proc.constrainedMemory = () => metrics()[15] || 0;
-  proc.cpuUsage = (previous) => {
+  proc.constrainedMemory = () => metrics()[15] || undefined;
+  const previousValueIsValid = (num) => typeof num === "number" && num <= Number.MAX_SAFE_INTEGER && num >= 0;
+  proc.cpuUsage = function cpuUsage(prevValue) {
     const m = metrics();
     const current = { user: m[2], system: m[3] };
-    return previous ? { user: current.user - previous.user, system: current.system - previous.system } : current;
+    if (prevValue) {
+      if (!previousValueIsValid(prevValue.user)) {
+        __validators.validateObject(prevValue, "prevValue");
+        __validators.validateNumber(prevValue.user, "prevValue.user");
+        throw new __errors.ERR_INVALID_ARG_VALUE.RangeError("prevValue.user", prevValue.user);
+      }
+      if (!previousValueIsValid(prevValue.system)) {
+        __validators.validateNumber(prevValue.system, "prevValue.system");
+        throw new __errors.ERR_INVALID_ARG_VALUE.RangeError("prevValue.system", prevValue.system);
+      }
+      return { user: current.user - prevValue.user, system: current.system - prevValue.system };
+    }
+    return current;
   };
   proc.resourceUsage = () => {
     const m = metrics();
@@ -1019,7 +1068,14 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
       signalsCount: m[11], voluntaryContextSwitches: m[12], involuntaryContextSwitches: m[13],
     };
   };
-  proc.getActiveResourcesInfo = () => [];
+  proc.getActiveResourcesInfo = function getActiveResourcesInfo() {
+    const info = [];
+    for (const req of __activeResources.requests) info.push(req._resourceType ?? "FSReqCallback");
+    for (const h of __activeResources.handles) if (h.hasRef()) info.push(h._resourceType);
+    for (let i = 0; i < __activeResources.timeouts; i++) info.push("Timeout");
+    for (let i = 0; i < __activeResources.immediates; i++) info.push("Immediate");
+    return info;
+  };
 
   // Honest build-feature booleans (false where lumen genuinely lacks the capability, e.g. tls).
   proc.features = {
@@ -1027,7 +1083,11 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     tls_alpn: false, tls_sni: false, tls_ocsp: false, tls: false, cached_builtins: true,
   };
 
-  proc.release = { name: "node", lts: undefined, sourceUrl: "", headersUrl: "" };
+  proc.release = {
+    name: "node", lts: "Iron",
+    sourceUrl: "https://nodejs.org/download/release/v20.11.0/node-v20.11.0.tar.gz",
+    headersUrl: "https://nodejs.org/download/release/v20.11.0/node-v20.11.0-headers.tar.gz",
+  };
 
   // Diagnostic reports with live process/runtime data. Native stacks and libuv handles are not
   // available, but the report is useful and writable rather than an empty compatibility shell.
@@ -1055,6 +1115,10 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     writeReport(filename, error) {
       if (filename instanceof Error && error === undefined) { error = filename; filename = undefined; }
       let target = filename || report.filename;
+      // Node checks write permission up front: on the named file, else on the working directory.
+      const permission = __internals.get("permission");
+      if (target) permission.check("FileSystemWrite", String(target));
+      else permission.check("FileSystemWrite", proc.cwd());
       if (!target) {
         const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
         target = `report.${stamp}.${proc.pid}.0.001.json`;
@@ -1149,19 +1213,35 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     },
     configurable: true, writable: true, enumerable: false,
   });
-  proc._fatalException = function _fatalException(err) {
+  // Node's onGlobalUncaughtException: the monitor sees every fatal error first; the capture
+  // callback (or a domain) or an 'uncaughtException' listener owns it; otherwise 'exit' runs with
+  // code 1 before the runtime reports the error.
+  proc._fatalException = function _fatalException(err, fromPromise) {
+    const type = fromPromise ? "unhandledRejection" : "uncaughtException";
+    proc.emit("uncaughtExceptionMonitor", err, type);
     if (globalThis.__lumen_domain_uncaught(err)) return true;
-    if (proc.listenerCount("uncaughtException") > 0) {
-      proc.emit("uncaughtException", err, "uncaughtException");
-      return true;
+    if (!proc.emit("uncaughtException", err, type)) {
+      try {
+        if (!proc._exiting) {
+          proc._exiting = true;
+          proc.exitCode = 1;
+          proc.emit("exit", 1);
+        }
+      } catch {}
+      return false;
     }
-    return false;
+    return true;
   };
+  Object.defineProperty(proc, Symbol.for("lumen.nodeFatalException"), { value: true, configurable: true });
   proc.hasUncaughtExceptionCaptureCallback = () => uncaughtCb !== null;
 
-  // Real: the deprecated process.assert.
-  proc.assert = function (value, message) {
-    if (!value) throw new Error("assertion failed" + (message ? ": " + message : ""));
+  let assertWarned = false;
+  proc.assert = function assert(value, message) {
+    if (!assertWarned) {
+      assertWarned = true;
+      proc.emitWarning("process.assert() is deprecated. Please use the `assert` module instead.", "DeprecationWarning", "DEP0100");
+    }
+    if (!value) throw __nodeError(Error, "ERR_ASSERTION", message || "assertion error");
   };
 
   // No-ops: process-level ref/unref have no handle to keep the loop alive here.
@@ -1296,81 +1376,41 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
   __internals.get("console_native").watch(proc,
     Object.getOwnPropertyDescriptor(proc, "stdout").get, Object.getOwnPropertyDescriptor(proc, "stderr").get);
 
-  // child_process.fork IPC. Lumen has no extra inherited fd, so fork reserves stdin and frames
-  // messages with a control-prefixed JSON line; ordinary stdout lines remain ordinary stdout.
+  // Node's prepareMainThreadExecution, run by the CLI before the entry point: the IPC channel a
+  // parent opened (NODE_CHANNEL_FD, removed so grandchildren do not inherit it), then the cluster
+  // worker setup (NODE_UNIQUE_ID).
+  Object.defineProperty(globalThis, "__lumenPrepareMain", {
+    configurable: true,
+    writable: true,
+    enumerable: false,
+    value() {
+      const env = proc.env;
+      if (env.NODE_CHANNEL_FD !== undefined && proc.platform !== "win32") {
+        const fd = Number.parseInt(env.NODE_CHANNEL_FD, 10);
+        delete env.NODE_CHANNEL_FD;
+        const serializationMode = env.NODE_CHANNEL_SERIALIZATION_MODE || "json";
+        delete env.NODE_CHANNEL_SERIALIZATION_MODE;
+        if (fd >= 0) __builtins.get("child_process")._forkChild(fd, serializationMode);
+      }
+      if (env.NODE_UNIQUE_ID !== undefined) {
+        __builtins.get("cluster")._setupWorker();
+        delete env.NODE_UNIQUE_ID;
+      }
+    },
+  });
+
+  // child_process.fork IPC on Windows: the channel rides the child's stdin, with messages framed
+  // as control-prefixed JSON lines; ordinary stdout lines remain ordinary stdout.
   const IPC_PREFIX = "\x1eLUMEN_IPC ";
   let forkIpcStarted = false;
   let forkConnected = false;
   let forkDisconnected = false;
   let forkPending = "";
   const isForkChild = () => proc.env && proc.env.LUMEN_FORK_IPC === "1";
-  let dedicatedIpc;
-  function openDedicatedIpc(fd) {
-    const __ipcWire=__builtins.get("child_process")._ipcWire;
-    __child.ipcOpen(fd);
-    const decoder = new (__builtins.get("string_decoder").StringDecoder)("utf8");
-    let pending = "", queuedBytes = 0, closed = false, ending = false;
-    const queue = [];
-    const updateRef = () => {
-      if (closed) return;
-      if (queue.length || forkConnected && (proc.listenerCount("message") || proc.listenerCount("disconnect"))) timer.ref(); else timer.unref();
-    };
-    function close(error) {
-      if (closed) return;
-      closed = true; clearInterval(timer); forkConnected = false; forkDisconnected = true;
-      try { __child.ipcClose(fd); } catch {}
-      for (const item of queue.splice(0)) if (item.callback) item.callback(error || new Error("IPC channel closed"));
-      queuedBytes = 0;
-      process.nextTick(() => {
-        proc.emit("disconnect");
-        // A cluster worker whose primary went away exits, as in the stdin-backed channel below.
-        if ((proc._lumenClusterWorker || (proc.env && proc.env.LUMEN_CLUSTER_WORKER === "1")) && !proc._clusterExitedAfterDisconnect) proc.exit(0);
-      });
-    }
-    function flush() {
-      let writes=0;
-      while (queue.length && writes++ < 16) {
-        const item=queue[0], count=__child.ipcWrite(fd,item.bytes.subarray(item.offset,item.offset+65536));
-        if (!count) break;
-        item.offset+=count;queuedBytes-=count;
-        if (item.offset===item.bytes.length) {queue.shift();if(item.callback) queueMicrotask(()=>item.callback(null));}
-      }
-      if (ending && queue.length===0) close(); else updateRef();
-    }
-    function send(bytes, callback) {
-      if (closed || ending) { if(callback) queueMicrotask(()=>callback(new Error("IPC channel closed"))); return false; }
-      if (queuedBytes+bytes.length > __ipcWire.limit) throw new RangeError("IPC queued messages exceed 8 MiB");
-      queue.push({bytes,offset:0,callback});queuedBytes+=bytes.length;
-      try { flush(); } catch(error) {close(error);}
-      return queuedBytes < 65536;
-    }
-    const timer=setInterval(()=>{
-      try {
-        flush(); if(closed) return;
-        for(let reads=0;reads<16;reads++) {
-          const chunk=__child.ipcRead(fd);if(chunk===null) break;
-          if(chunk.length===0) {close();break;}
-          pending+=decoder.write(Buffer.from(chunk));
-          if(pending.length > __ipcWire.limit) throw new RangeError("IPC frame exceeds 8 MiB");
-          for(;;) {
-            const end=pending.indexOf("\n");if(end<0) break;
-            const line=pending.slice(0,end);pending=pending.slice(end+1);
-            if(line==="\x1eLUMEN_IPC_DISCONNECT") {close();return;}
-            const message = __ipcWire.decode(line);
-            if (message !== null && typeof message === "object" && message.__lumenCluster !== undefined) proc.emit("internalMessage", message);
-            else proc.emit("message", message, null);
-          }
-        }
-      } catch(error) {close(error);}
-    },1);
-    timer.unref();
-    return {updateRef,send,disconnect(){send(Buffer.from("\x1eLUMEN_IPC_DISCONNECT\n"));ending=true;flush()}};
-  }
   // Node's channel ref counting: the IPC channel keeps the child alive only while it is
   // connected and 'message' / 'disconnect' listeners exist, so a child that only sends exits.
   const updateForkRef = () => {
     if (!forkIpcStarted) return;
-    if (dedicatedIpc) {dedicatedIpc.updateRef();return;}
     const keep = forkConnected && (proc.listenerCount("message") > 0 || proc.listenerCount("disconnect") > 0);
     if (keep) getStdin().ref(); else getStdin().unref();
   };
@@ -1378,8 +1418,6 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     if (forkIpcStarted || forkDisconnected || !isForkChild()) return;
     forkIpcStarted = true;
     forkConnected = true;
-    const ipcFd = Number(proc.env.LUMEN_FORK_IPC_FD);
-    if (Number.isInteger(ipcFd) && ipcFd >= 3) {dedicatedIpc=openDedicatedIpc(ipcFd);return;}
     getStdin().on("data", (chunk) => {
       forkPending += Buffer.from(chunk).toString("utf8");
       for (;;) {
@@ -1429,7 +1467,6 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
       return false;
     }
     try {
-      if (dedicatedIpc) return dedicatedIpc.send(__builtins.get("child_process")._ipcWire.encode(message,proc.env.LUMEN_FORK_IPC_MODE === "advanced"),callback);
       proc.stdout.write(IPC_PREFIX + JSON.stringify(message === undefined ? null : message) + "\n");
       if (callback) queueMicrotask(() => callback(null));
       return true;
@@ -1458,7 +1495,6 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
       proc.emit("error", new __errors.ERR_IPC_DISCONNECTED());
       return;
     }
-    if (dedicatedIpc) {dedicatedIpc.disconnect();return;}
     forkDisconnected = true;
     forkConnected = false;
     updateForkRef();
@@ -1486,13 +1522,78 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     return result;
   };
 
+  // Signals reach an embedded realm only from its launcher (a parent realm's `child.kill()` or
+  // `process.kill(childPid)`): the realm records which signals have listeners, and `deliver`
+  // emits one when the launcher sends it. The listener methods are wrapped rather than observed
+  // through `newListener`, which would load `events` at startup.
+  {
+    const setHandler = proc[Symbol.for("lumen.signalHandler")];
+    if (typeof setHandler === "function" && setHandler(0, false) === true) {
+      // `process.platform` is stamped after this glue runs, so the tables are built on first use.
+      let table;
+      const signals = () => {
+        if (table === undefined) {
+          const linux = process.platform !== "darwin";
+          const numbers = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGALRM: 14, SIGTERM: 15, SIGWINCH: 28,
+            SIGUSR1: linux ? 10 : 30, SIGUSR2: linux ? 12 : 31, SIGCONT: linux ? 18 : 19 };
+          const names = {};
+          for (const [name, number] of Object.entries(numbers)) names[number] = name;
+          table = { numbers, names };
+        }
+        return table;
+      };
+      const sync = (event) => {
+        const number = typeof event === "string" ? signals().numbers[event] : undefined;
+        if (number) setHandler(number, proc.listenerCount(event) > 0);
+      };
+      for (const method of ["on", "addListener", "once", "prependListener", "prependOnceListener",
+        "off", "removeListener", "removeAllListeners"]) {
+        const inner = proc[method];
+        proc[method] = function (...args) {
+          const result = Reflect.apply(inner, this, args);
+          if (this === proc) {
+            if (args.length === 0) for (const name of Object.keys(signals().numbers)) sync(name);
+            else sync(args[0]);
+          }
+          return result;
+        };
+      }
+      Object.defineProperty(globalThis, "__lumen_deliver_signal", {
+        configurable: true,
+        value: (number) => {
+          const name = signals().names[number];
+          if (name === undefined || proc.listenerCount(name) === 0) return false;
+          proc.emit(name, name, number);
+          return true;
+        },
+      });
+    }
+  }
+
   // Semi-internal underscore surface Node exposes as own keys. Honest no-ops / empty collectors;
   // _rawDebug writes straight to stderr (its one real behavior).
-  proc._getActiveHandles = () => [];
-  proc._getActiveRequests = () => [];
+  const refedHandles = () => [...__activeResources.handles].filter((h) => h.hasRef());
+  proc._getActiveHandles = () => refedHandles().map((h) => h._resourceOwner());
+  proc._getActiveRequests = () => [...__activeResources.requests];
   proc._rawDebug = (...a) => { proc.stderr.write(a.join(" ") + "\n"); };
   proc._exiting = false;
-  proc._kill = (pid, sig) => proc.kill(pid, sig);
+  {
+    const rawKill = proc.kill;
+    proc._kill = (pid, sig) => rawKill(pid, sig);
+    proc.kill = function kill(pid, sig) {
+      if (pid != (pid | 0)) throw new __errors.ERR_INVALID_ARG_TYPE("pid", "number", pid);
+      let signum;
+      if (sig === (sig | 0)) {
+        signum = sig;
+      } else {
+        sig = sig || "SIGTERM";
+        signum = typeof sig === "string" ? __node.signalNumber(sig) : undefined;
+        if (signum === undefined) throw new __errors.ERR_UNKNOWN_SIGNAL(sig);
+      }
+      if (pid === proc.pid && __node.signalRaise(signum)) return true;
+      return rawKill(pid, signum);
+    };
+  }
   proc._eval = undefined;
   proc._print_eval = false;
   proc._preload_modules = [];
@@ -1616,330 +1717,3 @@ __lazyGlue(__glueIndex, "tls", "", "", () => {
   });
 });
 
-// ---- node:test --------------------------------------------------------------------------------
-// The runner Node ships: tests and suites run one at a time in declaration order, hooks wrap
-// them, `t.after`/`t.mock` clean up, a spec-style report goes to stdout, and a failure sets the
-// exit code — so a `test/*.test.cjs` file behaves under lumen as it does under `node --test`.
-// Loaded on first use (see preamble.js `__lazyGlue`).
-__lazyGlue(__glueIndex, "test", "", "", () => {
-  const assert = __builtins.get("assert");
-  const now = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
-
-  class MockTracker {
-    constructor() { this._restores = []; }
-    fn(original, implementation, options) {
-      if (typeof original === "object" && original !== null && implementation === undefined) { options = original; original = undefined; }
-      const impl = typeof implementation === "function" ? implementation : original;
-      const times = options && options.times;
-      const state = { calls: [], impl, original, remaining: times === undefined ? Infinity : times };
-      const mock = function (...args) {
-        const call = { arguments: args, this: this, result: undefined, error: undefined, stack: new Error(), target: new.target };
-        const fnToCall = state.remaining > 0 && state.impl ? state.impl : (state.original || (() => undefined));
-        if (state.remaining > 0) state.remaining--;
-        try {
-          call.result = new.target ? Reflect.construct(fnToCall, args, new.target) : fnToCall.apply(this, args);
-        } catch (e) {
-          call.error = e;
-          state.calls.push(call);
-          throw e;
-        }
-        state.calls.push(call);
-        return call.result;
-      };
-      mock.mock = {
-        get calls() { return state.calls.slice(); },
-        callCount() { return state.calls.length; },
-        mockImplementation(fn) { state.impl = fn; state.remaining = Infinity; },
-        mockImplementationOnce(fn, onCall) {
-          const prev = state.impl;
-          const at = onCall === undefined ? state.calls.length : onCall;
-          const once = function (...args) { if (state.calls.length === at) { state.impl = prev; return fn.apply(this, args); } return prev.apply(this, args); };
-          state.impl = once;
-        },
-        resetCalls() { state.calls.length = 0; },
-        restore() { state.impl = state.original; },
-      };
-      return mock;
-    }
-    method(object, methodName, implementation, options) {
-      const original = object[methodName];
-      if (typeof original !== "function") throw new TypeError(`The "methodName" argument must name a function property. Received ${typeof original}`);
-      const mock = this.fn(original, implementation, options);
-      const descriptor = Object.getOwnPropertyDescriptor(object, methodName);
-      object[methodName] = mock;
-      const restore = mock.mock.restore;
-      mock.mock.restore = () => { if (descriptor) Object.defineProperty(object, methodName, descriptor); else delete object[methodName]; restore(); };
-      this._restores.push(mock.mock.restore);
-      return mock;
-    }
-    getter(object, name, implementation, options) { return this.method(object, name, implementation, { ...options, getter: true }); }
-    setter(object, name, implementation, options) { return this.method(object, name, implementation, { ...options, setter: true }); }
-    module() { throw new Error("mock.module is not supported in lumen"); }
-    reset() { this.restoreAll(); }
-    restoreAll() { for (const r of this._restores.splice(0)) r(); }
-  }
-
-  let passed = 0, failed = 0, skipped = 0, todo = 0, total = 0;
-  const out = (s) => { process.stdout.write(s + "\n"); };
-  // Report lines stream out as tests finish, like Node's spec reporter.
-  const lines = { push: out, splice: () => [] };
-
-  function describeError(e) {
-    if (e && typeof e === "object" && "stack" in e && e.stack) return String(e.stack);
-    if (e && typeof e === "object" && "message" in e) return `${e.name || "Error"}: ${e.message}`;
-    return String(e);
-  }
-
-  // A test (or suite) in the tree. Children run after the body has registered them, in order.
-  class TestNode {
-    constructor(parent, name, options, fn, kind) {
-      this.parent = parent;
-      this.name = name;
-      this.options = options || {};
-      this.fn = fn;
-      this.kind = kind; // "test" | "suite"
-      this.children = [];
-      this.hooks = { before: [], after: [], beforeEach: [], afterEach: [] };
-      this.depth = parent ? parent.depth + 1 : 0;
-      this.mock = new MockTracker();
-      this.done = false;
-    }
-    get fullName() { return this.parent && this.parent.parent ? `${this.parent.fullName} > ${this.name}` : this.name; }
-    hasOnly() { return this.children.some((c) => c.options.only || c.hasOnly()); }
-  }
-
-  const root = new TestNode(null, "<root>", {}, null, "suite");
-  let current = root;
-  let running = false;
-
-  async function runHooks(list, ctx) { for (const h of list) await h(ctx); }
-  async function runEachHooks(node, which, ctx) {
-    const chain = [];
-    for (let n = node.parent; n; n = n.parent) chain.push(n);
-    if (which === "beforeEach") chain.reverse();
-    for (const n of chain) await runHooks(n.hooks[which], ctx);
-  }
-
-  function makeContext(node) {
-    const ctx = {
-      name: node.name,
-      fullName: node.fullName,
-      signal: typeof AbortController === "function" ? new AbortController().signal : undefined,
-      mock: node.mock,
-      assert,
-      diagnostic(message) { lines.push(`${"  ".repeat(node.depth)}# ${message}`); },
-      skip(message) { ctx._skipped = message || true; },
-      todo(message) { ctx._todo = message || true; },
-      plan() {},
-      after(fn) { node.hooks.after.push(fn); },
-      before(fn) { node.hooks.before.push(fn); },
-      beforeEach(fn) { node.hooks.beforeEach.push(fn); },
-      afterEach(fn) { node.hooks.afterEach.push(fn); },
-      test(name, options, fn) { return declare(node, name, options, fn, "test"); },
-      waitFor: async (fn, options) => {
-        const timeout = (options && options.timeout) || 1000, interval = (options && options.interval) || 50;
-        const deadline = now() + timeout;
-        for (;;) {
-          try { return await fn(); } catch (e) { if (now() >= deadline) throw e; }
-          await new Promise((r) => setTimeout(r, interval));
-        }
-      },
-    };
-    ctx.runOnly = () => {};
-    return ctx;
-  }
-
-  function withTimeout(promise, ms, name) {
-    if (!(ms > 0) || ms === Infinity) return promise;
-    let timer;
-    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`test timed out after ${ms}ms`)), ms); });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-  }
-
-  async function runNode(node, onlyMode) {
-    const skipReason = node.options.skip;
-    const todoReason = node.options.todo;
-    const indent = "  ".repeat(node.depth - 1);
-    const skipNow = (suffix) => {
-      if (node.kind === "test") { skipped++; total++; }
-      lines.push(`${indent}﹣ ${node.name} # SKIP${suffix}`);
-      node.done = true;
-      if (node.onDone) node.onDone();
-    };
-    if (onlyMode && !node.options.only && !node.hasOnly()) return skipNow("");
-    if (skipReason) return skipNow(typeof skipReason === "string" ? " " + skipReason : "");
-    const start = now();
-    const ctx = makeContext(node);
-    let error = null;
-    const previous = current;
-    current = node;
-    try {
-      if (node.kind === "test") await runEachHooks(node, "beforeEach", ctx);
-      await runHooks(node.hooks.before, ctx);
-      node.running = true;
-      if (typeof node.fn === "function") {
-        const result = node.fn.length >= 2
-          ? new Promise((resolve, reject) => { try { node.fn(ctx, (e) => (e ? reject(e) : resolve())); } catch (e) { reject(e); } })
-          : Promise.resolve().then(() => node.fn(ctx));
-        await withTimeout(result, node.options.timeout, node.name);
-      }
-      const childOnly = node.hasOnly();
-      while (node.children.some((c) => !c.done && !c.running)) {
-        await runNode(node.children.find((c) => !c.done && !c.running), childOnly);
-      }
-    } catch (e) {
-      error = e;
-    } finally {
-      node.running = false;
-      current = previous;
-      try { await runHooks(node.hooks.after, ctx); } catch (e) { error = error || e; }
-      // Each-hooks wrap tests, not suites (a suite's own hooks wrap the tests inside it).
-      if (node.kind === "test") {
-        try { await runEachHooks(node, "afterEach", ctx); } catch (e) { error = error || e; }
-      }
-      node.mock.restoreAll();
-      node.done = true;
-      if (node.onDone) node.onDone();
-    }
-    const ms = (now() - start).toFixed(3);
-    // The summary counts tests; suites are tallied separately and a suite fails only through
-    // its tests (or its own hooks), so it is not one more failure.
-    const isTest = node.kind === "test";
-    if (isTest) total++;
-    const childFailed = node.children.some((c) => c.failed);
-    if (ctx._skipped) { if (isTest) skipped++; lines.push(`${indent}﹣ ${node.name} # SKIP`); return; }
-    if (ctx._todo || todoReason) { if (isTest) todo++; lines.push(`${indent}${error ? "✖" : "✔"} ${node.name} # TODO`); return; }
-    if (error || childFailed) {
-      if (isTest || (error && !childFailed)) failed++;
-      node.failed = true;
-      lines.push(`${indent}✖ ${node.name} (${ms}ms)`);
-      if (error) {
-        for (const l of describeError(error).split("\n")) lines.push(`${indent}  ${l}`);
-        node.error = error;
-      }
-    } else {
-      if (isTest) passed++;
-      lines.push(`${indent}✔ ${node.name} (${ms}ms)`);
-    }
-  }
-
-  let queue = Promise.resolve();
-  let scheduled = false;
-  // A test awaiting something the loop does not otherwise hold open (an unref'd timer, say)
-  // must still get to finish: the harness keeps the loop alive for the whole run, as Node's
-  // does, and the exit hook above only ever sees a genuinely stuck test.
-  let keepAlive = null;
-  function schedule() {
-    if (scheduled) return;
-    scheduled = true;
-    // Let the whole file register its tests before the first one runs (Node does the same).
-    setTimeout(() => {
-      scheduled = false;
-      if (running) return;
-      running = true;
-      keepAlive = setInterval(() => {}, 1 << 30);
-      queue = queue.then(async () => {
-        const onlyMode = root.hasOnly();
-        const rootCtx = makeContext(root);
-        try {
-          await runHooks(root.hooks.before, rootCtx);
-          while (root.children.some((c) => !c.done && !c.running)) {
-            await runNode(root.children.find((c) => !c.done && !c.running), onlyMode);
-          }
-        } catch (e) {
-          failed++;
-          lines.push(`✖ hook failed: ${describeError(e)}`);
-        }
-        try { await runHooks(root.hooks.after, rootCtx); } catch (e) { failed++; lines.push(`✖ after hook failed: ${describeError(e)}`); }
-        root.hooks.before.length = root.hooks.after.length = 0;
-        running = false;
-        clearInterval(keepAlive);
-        report();
-      });
-    }, 0);
-  }
-
-  // A test that is still awaiting something when the loop goes quiet never finishes: Node
-  // reports it as cancelled and fails the run, rather than exiting 0 in silence.
-  process.on("exit", () => {
-    if (!running) return;
-    const unfinished = [];
-    const walk = (n) => { for (const c of n.children) { if (!c.done) unfinished.push(c); walk(c); } };
-    walk(root);
-    for (const c of unfinished) out(`✖ ${c.fullName} (cancelled: the process exited before the test finished)`);
-    if (unfinished.length) { failed += unfinished.length; total += unfinished.length; }
-    running = false;
-    clearInterval(keepAlive);
-    report();
-  });
-
-  function report() {
-    out(`ℹ tests ${total}`);
-    out(`ℹ suites ${root.children.filter((c) => c.kind === "suite").length}`);
-    out(`ℹ pass ${passed}`);
-    out(`ℹ fail ${failed}`);
-    out(`ℹ cancelled 0`);
-    out(`ℹ skipped ${skipped}`);
-    out(`ℹ todo ${todo}`);
-    if (failed > 0) {
-      out("");
-      out("✖ failing tests:");
-      const walk = (n) => { for (const c of n.children) { if ((c.failed && c.error) || !c.done) out(`✖ ${c.fullName}`); walk(c); } };
-      walk(root);
-      process.exitCode = 1;
-    }
-    passed = failed = skipped = todo = total = 0;
-    root.children.length = 0;
-  }
-
-  function normalize(name, options, fn) {
-    if (typeof name === "function") { fn = name; name = fn.name || "<anonymous>"; options = {}; }
-    else if (typeof options === "function") { fn = options; options = {}; }
-    return { name: String(name), options: options || {}, fn };
-  }
-
-  function declare(parent, name, options, fn, kind) {
-    const spec = normalize(name, options, fn);
-    const node = new TestNode(parent, spec.name, spec.options, spec.fn, kind);
-    parent.children.push(node);
-    // A subtest declared from inside its parent's body runs right away, so `await t.test(...)`
-    // sequences like it does in Node; a top-level test waits for the file to finish registering.
-    if (parent.running) return runNode(node, false);
-    if (parent === root) schedule();
-    return new Promise((resolve) => { node.onDone = resolve; });
-  }
-
-  const test = (name, options, fn) => declare(current, name, options, fn, "test");
-  const describe = (name, options, fn) => {
-    const spec = normalize(name, options, fn);
-    const node = new TestNode(current, spec.name, spec.options, null, "suite");
-    current.children.push(node);
-    // A suite's body runs immediately so its tests register in order under it.
-    const previous = current;
-    current = node;
-    try { if (spec.fn) spec.fn(); } finally { current = previous; }
-    if (previous === root) schedule();
-    return Promise.resolve();
-  };
-  const variants = (base) => {
-    base.skip = (name, options, fn) => { const s = normalize(name, options, fn); return base(s.name, { ...s.options, skip: true }, s.fn); };
-    base.todo = (name, options, fn) => { const s = normalize(name, options, fn); return base(s.name, { ...s.options, todo: true }, s.fn); };
-    base.only = (name, options, fn) => { const s = normalize(name, options, fn); return base(s.name, { ...s.options, only: true }, s.fn); };
-    return base;
-  };
-  variants(test);
-  variants(describe);
-  test.test = test;
-  test.it = test;
-  test.describe = describe;
-  test.suite = describe;
-  test.before = (fn) => { current.hooks.before.push(fn); };
-  test.after = (fn) => { current.hooks.after.push(fn); };
-  test.beforeEach = (fn) => { current.hooks.beforeEach.push(fn); };
-  test.afterEach = (fn) => { current.hooks.afterEach.push(fn); };
-  test.mock = new MockTracker();
-  test.run = () => { throw new Error("test.run is not supported in lumen"); };
-  test.snapshot = { setDefaultSnapshotSerializers() {}, setResolveSnapshotPath() {} };
-  test.assert = assert;
-  __builtins.set("test", test);
-});

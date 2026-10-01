@@ -36,6 +36,11 @@ fn track_sub(n: usize) {
     let _ = TRACKED.try_with(|t| t.set(t.get().saturating_sub(n)));
 }
 
+/// Owned buffer bytes alive on this thread.
+pub fn tracked_bytes() -> usize {
+    TRACKED.with(Cell::get)
+}
+
 /// Whether this thread's owned buffer bytes grew past the budget since the last collection.
 #[inline]
 pub fn gc_pressure() -> bool {

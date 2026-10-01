@@ -53,6 +53,14 @@ class KeyObjectHandle {
   }
 
   initJwk(jwk, namedCurve) {
+    if (jwk.kty === "oct") {
+      if (typeof jwk.k !== "string") {
+        throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK secret key format");
+      }
+      this._type = cryptoBinding.kKeyTypeSecret;
+      this._data = new Uint8Array(Buffer.from(jwk.k, "base64"));
+      return this._type;
+    }
     const fields = [];
     for (const key of Object.keys(jwk)) {
       if (typeof jwk[key] === "string") fields.push(key, jwk[key]);
@@ -93,6 +101,10 @@ class KeyObjectHandle {
   }
 
   keyDetail(target) {
+    if (this._type === cryptoBinding.kKeyTypeSecret) {
+      target.length = this._data.byteLength * 8;
+      return target;
+    }
     const flat = __rc.keyDetail(this._type, this._data);
     for (let i = 0; i < flat.length; i += 2) {
       const name = flat[i];
@@ -105,7 +117,7 @@ class KeyObjectHandle {
   }
 
   export(format, type, cipher, passphrase) {
-    if (this._type === cryptoBinding.kKeyTypeSecret) return Buffer.from(this._data);
+    if (this._type === cryptoBinding.kKeyTypeSecret) return Buffer.from(this._data.slice().buffer);
     const encoding = type === undefined ? (this._type === cryptoBinding.kKeyTypePrivate ? 1 : 2) : type;
     let out;
     try {
@@ -331,13 +343,34 @@ class RSAKeyExportJob extends CryptoJob {
   }
 }
 
-function createNativeKeyObjectClass(callback) {
-  class NativeKeyObject {
-    constructor(handle) {
-      this.handle = handle;
-    }
+// The base of KeyObject. Like Node's C++ NativeKeyObject it holds the handle out of sight and
+// clones across threads (structured clone rebuilds it with `keyObjectFromClone`).
+const kNativeKeyHandle = Symbol("kNativeKeyHandle");
+let keyObjectClasses;
+class NativeKeyObject {
+  constructor(handle) {
+    Object.defineProperty(this, kNativeKeyHandle, { value: handle });
   }
-  return callback(NativeKeyObject);
+
+  [kClone]() {
+    const handle = this[kNativeKeyHandle];
+    return {
+      data: { kind: handle._type, bytes: handle._data },
+      deserializeInfo: "internal/crypto/keys:keyObjectFromClone",
+    };
+  }
+}
+
+function createNativeKeyObjectClass(callback) {
+  keyObjectClasses = callback(NativeKeyObject);
+  return keyObjectClasses;
+}
+
+function keyObjectFromClone({ kind, bytes }) {
+  const handle = handleOf(kind, bytes);
+  if (kind === cryptoBinding.kKeyTypeSecret) return new keyObjectClasses[1](handle);
+  if (kind === cryptoBinding.kKeyTypePublic) return new keyObjectClasses[2](handle);
+  return new keyObjectClasses[3](handle);
 }
 
 Object.assign(cryptoBinding, {

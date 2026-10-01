@@ -26,8 +26,6 @@
 //! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
 //!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
 
-use lumen_host::time::Instant;
-
 #[cfg(not(target_arch = "wasm32"))]
 use lumen_host::SpawnHandle;
 use lumen_host::{ops, Ctx, Extension, OpState, Value};
@@ -176,7 +174,6 @@ pub fn extension() -> Extension {
             ),
         ],
         state_init: Some(|state: &mut OpState| {
-            state.put(WebState::default());
             state.put(server::ServerRegistry::default());
             state.put(websocket::WsRegistry::default());
             state.put(sse::SseRegistry::default());
@@ -193,36 +190,13 @@ pub fn extension() -> Extension {
 /// text), loaded at boot (see `lumen_host::install`).
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
 
-#[derive(Default)]
-struct WebState {
-    /// `performance.now()`'s monotonic zero point and the wall-clock time (`timeOrigin`, Unix ms)
-    /// captured at the same instant — set together on first access.
-    start: Option<Instant>,
-    time_origin_ms: f64,
-}
-
-impl WebState {
-    /// The monotonic clock's zero point, initializing it (and the paired `timeOrigin`) on first use.
-    fn clock_start(&mut self) -> Instant {
-        if self.start.is_none() {
-            self.start = Some(Instant::now());
-            self.time_origin_ms = lumen_host::time::unix_ms();
-        }
-        self.start.unwrap()
-    }
-}
-
-fn op_perf_now(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let state = ctx.host_mut::<WebState>().expect("web state installed");
-    let start = state.clock_start();
-    Ok(Value::Num(start.elapsed().as_secs_f64() * 1000.0))
+fn op_perf_now(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(lumen_host::perf::now_ms()))
 }
 
 /// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
-fn op_time_origin(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let state = ctx.host_mut::<WebState>().expect("web state installed");
-    state.clock_start();
-    Ok(Value::Num(state.time_origin_ms))
+fn op_time_origin(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(lumen_host::perf::time_origin_ms()))
 }
 
 // ---- encoding ----

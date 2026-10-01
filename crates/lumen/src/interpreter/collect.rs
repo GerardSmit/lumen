@@ -215,9 +215,47 @@ impl Interp {
             }
         }
         self.visit_object_scopes(&o, &mut |e| tr.mark_scope(Rc::as_ptr(e)));
+        if !self.proxies.is_empty() {
+            if let Some((t, h)) = self.proxies.get(&(p as usize)) {
+                for v in [t, h] {
+                    if let Value::Obj(c) = v {
+                        tr.mark_obj(c);
+                    }
+                }
+            }
+        }
+        if self.multi_realm() {
+            if let Some(r) = self.realms.get(&(p as usize)).filter(|r| r.collectable) {
+                r.for_each_object(|c| tr.mark_obj(c));
+                tr.mark_scope(Rc::as_ptr(&r.global_env));
+            }
+        }
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn gc_collect(&mut self) {
+        self.gc_collect_cycles();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn gc_collect(&mut self) {
+        use crate::gc_log::{GcEvent, GcObserver};
+        let Some(epoch) = self.host_state.get::<GcObserver>().map(|o| o.epoch) else {
+            return self.gc_collect_cycles();
+        };
+        let start = std::time::Instant::now();
+        self.gc_collect_cycles();
+        let duration = start.elapsed();
+        let Some(observer) = self.host_state.get_mut::<GcObserver>() else { return };
+        let forced = std::mem::take(&mut observer.forced_next);
+        observer.events.push(GcEvent { start: start.saturating_duration_since(epoch), duration, forced });
+        if !std::mem::replace(&mut observer.queued, true) {
+            let callback = observer.callback.clone();
+            self.queue_microtask(callback);
+        }
+    }
+
+    fn gc_collect_cycles(&mut self) {
         self.str_units.clear();
         super::GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -248,6 +286,26 @@ impl Interp {
         // pinned-but-unreachable object is still collectable (the sweep evicts its entries).
         for o in self.gc_pins.values() {
             o.gc_add_ref();
+        }
+        // A proxy's target and handler are edges of the proxy object (traced when it is marked),
+        // so a cycle through them (a `vm` context's global proxy) is collectable.
+        for (t, h) in self.proxies.values() {
+            for v in [t, h] {
+                if let Value::Obj(o) = v {
+                    o.gc_add_ref();
+                }
+            }
+        }
+        // A `vm` context realm's registry entry is bookkeeping too: it is traced from the realm's
+        // global and dropped with it.
+        let vm_realms = self.multi_realm() && self.realms.values().any(|r| r.collectable);
+        if vm_realms {
+            // Per-realm `arguments` templates are rebuilt on demand; they must not pin a realm.
+            self.args_tpls.clear();
+            for r in self.realms.values().filter(|r| r.collectable) {
+                r.for_each_object(|o| o.gc_add_ref());
+                counts.add(Rc::as_ptr(&r.global_env));
+            }
         }
         // A Map/Set/WeakMap/WeakSet's entries are edges of the collection object (the table is
         // its [[MapData]] slot), not external holders: a collection in a cycle, and whatever a
@@ -338,6 +396,24 @@ impl Interp {
         drop(tr.wide);
         drop(tr.scopes);
         let marked = tr.marked;
+        // Realms whose global died go with their objects (held until the sweep is over).
+        let mut dead_realms = Vec::new();
+        if vm_realms {
+            let dead: Vec<usize> = self
+                .realms
+                .iter()
+                .filter(|(_, r)| r.collectable && !r.global.gc_marked())
+                .map(|(k, _)| *k)
+                .collect();
+            for k in dead {
+                if let Some(r) = self.realms.remove(&k) {
+                    if let Some(ef) = &r.eval_fn {
+                        self.eval_realm_fns.remove(&(Gc::as_ptr(ef) as usize));
+                    }
+                    dead_realms.push(r);
+                }
+            }
+        }
 
         // Entries of live weak collections whose key died go now: the key (and a value only
         // it kept alive) is swept below, and nothing may observe it through the table. The
@@ -437,6 +513,7 @@ impl Interp {
         drop(garbage);
         drop(dead_scopes);
         drop(removed);
+        drop(dead_realms);
         // FinalizationRegistry targets may have died: the next checkpoint scans for them.
         self.weak_note_collection();
         value::gc_trim_heap();

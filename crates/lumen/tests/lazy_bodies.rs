@@ -60,7 +60,7 @@ fn a_syntax_error_in_an_uncalled_body_is_a_load_error() {
         load_error(source);
     }
     let message = load_error("function bad() { return 1; var 1; }");
-    assert!(message.contains("binding identifier"), "{message}");
+    assert!(message.contains("Unexpected number"), "{message}");
 }
 
 #[test]

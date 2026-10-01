@@ -32,3 +32,4 @@
 
 __builtins.set("querystring", require("querystring"));
 __builtins.set("url", require("url"));
+__internals.set("urlRequire", (id) => require(id));

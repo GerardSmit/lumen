@@ -15,6 +15,23 @@ fn check(rc: libc::c_int) -> R<libc::c_int> {
     }
 }
 
+/// A raw OS `pipe(2)` outside the descriptor table of [`crate::fs`]: `(read, write)`, both
+/// close-on-exec. For a runtime's own wake-up and self-pipes.
+#[cfg(unix)]
+pub fn os_pipe() -> R<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe writes.
+    check(unsafe { libc::pipe(fds.as_mut_ptr()) })?;
+    // SAFETY: both descriptors are fresh and owned by nobody else.
+    let (r, w) = unsafe {
+        (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1]))
+    };
+    set_inheritable(fds[0], false)?;
+    set_inheritable(fds[1], false)?;
+    Ok((r, w))
+}
+
 /// `dup2(fd, fd2)`; the new descriptor is close-on-exec unless `inheritable`.
 pub fn dup2(fd: i32, fd2: i32, inheritable: bool) -> R<i32> {
     #[cfg(unix)]

@@ -6,7 +6,7 @@ use num_bigint_dig::prime::probably_prime;
 use num_bigint_dig::{BigUint, RandBigInt};
 use rand_core::OsRng;
 
-use super::keys::{asn1, dh_group, safe_prime, with_ec_curve, x448_mul, AsymKey, EcCurve};
+use super::keys::{asn1, dh_group, safe_prime, safe_prime_congruent, with_ec_curve, x448_mul, AsymKey, EcCurve};
 
 
 #[lumen_bind::module(name = "crypto")]
@@ -23,6 +23,12 @@ const DH_MAX_MODULUS_BITS: usize = 10000;
 
 fn failed(message: &'static str) -> OpError {
     OpError::error(message).with_code("ERR_CRYPTO_OPERATION_FAILED")
+}
+
+/// OpenSSL 3's provider error for peer keys over different groups / curves.
+fn domain_mismatch() -> OpError {
+    OpError::error("error:1C8000DE:Provider routines::mismatching domain parameters")
+        .with_code("ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS")
 }
 
 fn num(bytes: &[u8]) -> BigUint {
@@ -72,6 +78,12 @@ fn dh_verify(p: &[u8], g: &[u8]) -> u32 {
 /// A safe prime of `bits` bits that `g` (2 or 5) generates a subgroup of.
 #[op(name = "dhGenPrime")]
 fn dh_gen_prime(bits: u32, g: u32) -> Result<Vec<u8>, OpError> {
+    // OpenSSL's congruences for the generator: p ≡ 23 (mod 24) for 2, p ≡ 59 (mod 60) for 5.
+    match g {
+        2 if bits >= 6 => return Ok(minimal(&safe_prime_congruent(bits, 24, 23))),
+        5 if bits >= 6 => return Ok(minimal(&safe_prime_congruent(bits, 60, 59))),
+        _ => {}
+    }
     loop {
         let p = safe_prime(bits)?;
         let suitable = match g {
@@ -215,7 +227,7 @@ fn stateless_dh(private_kind: u32, private_der: &[u8], public_kind: u32, public_
     match (&private, &public) {
         (AsymKey::Ec(a), AsymKey::Ec(b)) => {
             if a.curve != b.curve {
-                return Err(mismatch());
+                return Err(domain_mismatch());
             }
             ec_agree(a.curve, a.d.as_deref().ok_or_else(mismatch)?, &b.point)
         }
@@ -237,7 +249,7 @@ fn stateless_dh(private_kind: u32, private_der: &[u8], public_kind: u32, public_
         }
         (AsymKey::Dh(a), AsymKey::Dh(b)) => {
             if a.p != b.p || a.g != b.g {
-                return Err(mismatch());
+                return Err(domain_mismatch());
             }
             let x = a.x.as_ref().ok_or_else(mismatch)?;
             let secret = b.y.modpow(x, &a.p);

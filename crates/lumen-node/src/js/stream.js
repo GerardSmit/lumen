@@ -5653,3 +5653,16 @@ __builtins.set("_stream_transform", Transform);
 __builtins.set("_stream_passthrough", PassThrough);
 // Node's internal/streams/{destroy,utils} helpers, for the fs port (see fs.js).
 __internals.set("streams", { errorOrDestroy, isIterable, kResistStopPropagation });
+// Node's internal stream modules, for --expose-internals (internals.js).
+__internals.set("streamsInternal", {
+  compose,
+  addAbortSignal: { addAbortSignal, addAbortSignalNoValidate },
+  adapters: {
+    newStreamReadableFromReadableStream,
+    newReadableStreamFromStreamReadable,
+    newStreamWritableFromWritableStream,
+    newWritableStreamFromStreamWritable,
+    newReadableWritablePairFromDuplex,
+    newStreamDuplexFromReadableWritablePair,
+  },
+});

@@ -32,9 +32,9 @@ mod pem;
 
 pub use curves::{with_ec_curve, EcCurve};
 pub use dh_groups::dh_group;
-pub use gen::safe_prime;
-pub use model::{okp_public, pss_hash, x448_mul, AsymKey, DhKey, DsaKey, EcKey, OkpKey, PssParams, RsaKey, RsaPrivateParts};
-pub use pem::{import_private, import_public, KeyCipher};
+pub use gen::{safe_prime, safe_prime_congruent};
+pub use model::{pss_hash, x448_mul, AsymKey, DsaKey, EcKey, PssParams, RsaKey};
+pub use pem::KeyCipher;
 
 pub(crate) use bindings::*;
 

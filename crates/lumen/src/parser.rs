@@ -21,6 +21,20 @@ pub struct ParseError {
     pub at_eof: bool,
 }
 
+thread_local! {
+    static ERROR_SPAN: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Record the source byte range of the syntax error being raised.
+pub(crate) fn set_error_span(start: u32, end: u32) {
+    ERROR_SPAN.with(|s| s.set((start, end)));
+}
+
+/// The byte range of the last syntax error raised (for V8's `^^^` source decoration).
+pub fn last_error_span() -> (u32, u32) {
+    ERROR_SPAN.with(|s| s.get())
+}
+
 /// Parse a complete script. `strict` seeds strict mode (e.g. for the strict test262 variant); a
 /// `"use strict"` directive prologue also turns it on.
 pub fn parse_script(src: &str, strict: bool) -> Result<Vec<Stmt>, ParseError> {
@@ -1091,6 +1105,8 @@ impl Parser {
         } else {
             message
         };
+        let t = &self.toks[self.pos];
+        set_error_span(t.start, t.end);
         Err(ParseError {
             message,
             line: self.line(),
@@ -1118,6 +1134,8 @@ impl Parser {
         if self.ts.is_some() {
             self.ts_note_error();
         }
+        let t = &self.toks[self.pos.saturating_sub(1)];
+        set_error_span(t.start, t.end);
         Err(ParseError {
             message: msg.into(),
             line: self.line(),
@@ -3599,8 +3617,33 @@ impl Parser {
                 self.last_paren = false;
                 e
             }
+            Tok::Punct("%") if crate::builtins::natives::syntax_allowed() => self.parse_native_call(),
             other => self.err(format!("unexpected token {other:?}")),
         }
+    }
+
+    /// `%Name(args)` under `--allow-natives-syntax`: a call of the realm's runtime function
+    /// `%Name` (see `builtins::natives`).
+    fn parse_native_call(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        let Tok::Ident(name) = self.cur().clone() else {
+            return self.err("unexpected token '%'");
+        };
+        if !crate::builtins::natives::NAMES.contains(&name.as_str()) {
+            return self.err(format!("Unknown runtime function: %{}", name.as_str()));
+        }
+        self.advance();
+        if !self.is_punct("(") {
+            return self.err("unexpected token '%'");
+        }
+        let pos = self.call_pos();
+        let args = self.parse_args()?;
+        Ok(Expr::Call {
+            callee: Box::new(Expr::Ident(format!("%{}", name.as_str()))),
+            args,
+            optional: false,
+            pos,
+        })
     }
 
     /// Parse a template substitution from its tokens (see [`TplPart::Sub`]).

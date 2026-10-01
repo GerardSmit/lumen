@@ -53,16 +53,79 @@ let __traceEvent = null;
 function __setTraceEvent(fn) {
   __traceEvent = fn;
 }
-// Set by node:async_hooks while any hook is enabled; `type` names the resource being scheduled.
+// node:async_hooks. Once that module is loaded (`__asyncTracking`), every async resource made
+// from then on gets an id (`__asyncIdSymbol` / `__triggerIdSymbol` on the resource), and its
+// callbacks run on the execution stack (`__asyncIds`/`__asyncTriggers`/`__asyncResources`), which
+// promise reactions also push to through the engine's promise hooks. Until then none of this
+// costs anything. `__asyncHooks` holds the emitters while any hook is enabled.
+let __asyncTracking = false;
 let __asyncHooks = null;
+let __asyncIdCounter = 1;
+const __asyncIds = [];
+const __asyncTriggers = [];
+const __asyncResources = [];
+const __asyncIdSymbol = Symbol("async_id_symbol");
+const __triggerIdSymbol = Symbol("trigger_async_id_symbol");
 function __setAsyncHooks(runtime) {
   __asyncHooks = runtime;
 }
-function __destroyAsyncResource(resource) {
-  if (__asyncHooks !== null) __asyncHooks.destroyOf(resource);
+function __executionAsyncId() {
+  const n = __asyncIds.length;
+  return n === 0 ? 1 : __asyncIds[n - 1];
 }
+// Give `resource` an async id (triggered by the running resource) and emit its init.
+function __initAsyncResource(resource, type) {
+  const id = ++__asyncIdCounter;
+  const trigger = __executionAsyncId();
+  resource[__asyncIdSymbol] = id;
+  resource[__triggerIdSymbol] = trigger;
+  if (__asyncHooks !== null) __asyncHooks.init(id, type, trigger, resource);
+  return id;
+}
+const __asyncDestroyedSymbol = Symbol("asyncDestroyed");
+function __destroyAsyncResource(resource) {
+  if (__asyncHooks !== null && resource[__asyncIdSymbol] !== undefined && !resource[__asyncDestroyedSymbol]) {
+    resource[__asyncDestroyedSymbol] = true;
+    __asyncHooks.destroy(resource[__asyncIdSymbol]);
+  }
+}
+// Run `fn` as a callback of `resource` (which has an id) inside async context `context`.
+function __runAsyncCallback(resource, context, fn, thisArg, args) {
+  const id = resource[__asyncIdSymbol];
+  const previous = __asyncContextSet(context);
+  const depth = __asyncIds.length;
+  __asyncIds.push(id);
+  __asyncTriggers.push(resource[__triggerIdSymbol]);
+  __asyncResources.push(resource);
+  if (__asyncHooks !== null) __asyncHooks.before(id);
+  try {
+    return Reflect.apply(fn, thisArg, args);
+  } catch (error) {
+    __noteThrown(error);
+    throw error;
+  } finally {
+    if (__asyncHooks !== null) __asyncHooks.after(id);
+    __asyncIds.length = depth;
+    __asyncTriggers.length = depth;
+    __asyncResources.length = depth;
+    __asyncContextSet(previous);
+  }
+}
+// Bind `fn` to the current async context; with a `type`, `fn` is the callback of async resource
+// `resource` (destroyed after its one call unless `repeat`).
 function __bindAsyncContext(fn, type, resource, repeat) {
-  if (__asyncHooks !== null && type !== undefined) return __asyncHooks.wrap(fn, type, resource, repeat);
+  if (__asyncTracking && type !== undefined) {
+    if (resource === undefined) resource = {};
+    __initAsyncResource(resource, type);
+    const context = __asyncContextGet();
+    return function boundAsyncResource(...args) {
+      try {
+        return __runAsyncCallback(resource, context, fn, this, args);
+      } finally {
+        if (!repeat) __destroyAsyncResource(resource);
+      }
+    };
+  }
   const context = __asyncContextGet();
   if (context === undefined) return fn;
   return function boundWithAsyncContext(...args) {
@@ -119,7 +182,12 @@ class __GlueRegistry extends Map {
   }
   get(key) {
     const pending = this.pending.get(key);
-    if (pending !== undefined) for (const rec of [...pending]) __glueRun(rec);
+    // Indexed loops here and in __glueRun: loading glue must not depend on the (deletable)
+    // array iterator.
+    if (pending !== undefined) {
+      const recs = pending.slice();
+      for (let i = 0; i < recs.length; i++) __glueRun(recs[i]);
+    }
     const value = super.get(key);
     if (value instanceof __LazyValue) {
       const made = value.make();
@@ -161,7 +229,8 @@ function __glueRun(rec) {
   } finally {
     __glueIndex = saved;
     rec.state = 2;
-    for (const [reg, name] of rec.names) {
+    for (let i = 0; i < rec.names.length; i++) {
+      const reg = rec.names[i][0], name = rec.names[i][1];
       const recs = reg.pending.get(name);
       const at = recs.indexOf(rec);
       if (at >= 0) recs.splice(at, 1);
@@ -194,8 +263,11 @@ function __lazyGlue(index, builtins, internals, globals, init) {
       }
       return globalThis[name];
     };
+    // The slot keeps the enumerability it has when filled (the bootstrap settles it).
     const set = (value) => {
-      Object.defineProperty(globalThis, name, { value, writable: true, enumerable: true, configurable: true });
+      const now = Object.getOwnPropertyDescriptor(globalThis, name);
+      const enumerable = now !== undefined && now.get === get ? now.enumerable : true;
+      Object.defineProperty(globalThis, name, { value, writable: true, enumerable, configurable: true });
     };
     Object.defineProperty(globalThis, name, { get, set, enumerable: false, configurable: true });
   }
@@ -208,6 +280,24 @@ const __internals = new __GlueRegistry();
 // Shared by util.promisify and the builtins that annotate callback signatures (fs), which must not
 // load util to name it.
 __internals.set("customPromisifyArgs", Symbol("customPromisifyArgs"));
+// What process.getActiveResourcesInfo() / _getActiveHandles() / _getActiveRequests() report:
+// open handles (each with `hasRef()`, `_resourceType` and `_resourceOwner()`), in-flight
+// callback requests (each with `_resourceType`), and the counts of ref'd armed Timeouts and of
+// pending Immediates.
+const __activeResources = { handles: new Set(), requests: new Set(), timeouts: 0, immediates: 0 };
+// structured clone's reviver lookup for a `deserializeInfo` ("internal/<area>/...:Name"): the glue
+// file owning <area> registers `cloneModule:internal/<area>` as a `(moduleId, name)` lookup.
+Object.defineProperty(globalThis, "__lumenCloneResolve", {
+  value(info) {
+    const colon = info.indexOf(":");
+    if (colon < 0) return undefined;
+    const id = info.slice(0, colon);
+    const load = __internals.get(`cloneModule:${id.split("/").slice(0, 2).join("/")}`);
+    return typeof load === "function" ? load(id, info.slice(colon + 1)) : undefined;
+  },
+  writable: true,
+  configurable: true,
+});
 
 // libuv's error table (uv_err_name / uv_strerror): name -> description, and the negative errno
 // each platform's libuv reports (Windows uses libuv's own -40xx range; Unix negates errno). Names
@@ -411,14 +501,16 @@ const __errors = __lazyObject(() => {
   }, TypeError);
   E("ERR_INVALID_RETURN_VALUE", (input, name, value) => {
     let type;
-    if (value && value.constructor && value.constructor.name) type = `instance of ${value.constructor.name}`;
-    else type = `type ${typeof value}`;
+    if (value?.constructor?.name) type = `an instance of ${value.constructor.name}`;
+    else type = __builtins.get("util").inspect(value, { colors: false });
     return `Expected ${input} to be returned from the "${name}" function but got ${type}.`;
   }, TypeError, RangeError);
   E("ERR_AMBIGUOUS_ARGUMENT", 'The "%s" argument is ambiguous. %s', TypeError);
   E("ERR_INVALID_THIS", 'Value of "this" must be of type %s', TypeError);
   E("ERR_INVALID_STATE", "Invalid state: %s", Error, TypeError, RangeError);
   E("ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor", TypeError);
+  E("ERR_CONSOLE_WRITABLE_STREAM", "Console expects a writable stream instance for %s", TypeError);
+  E("ERR_INCOMPATIBLE_OPTION_PAIR", 'Option "%s" cannot be used in combination with option "%s"', TypeError);
   E("ERR_METHOD_NOT_IMPLEMENTED", "The %s method is not implemented", Error);
   E("ERR_MISSING_OPTION", "%s is required", TypeError);
   E("ERR_UNKNOWN_ENCODING", "Unknown encoding: %s", TypeError);
@@ -456,6 +548,12 @@ const __errors = __lazyObject(() => {
   E("ERR_STREAM_PUSH_AFTER_EOF", "stream.push() after EOF", Error);
   E("ERR_STREAM_UNSHIFT_AFTER_END_EVENT", "stream.unshift() after end event", Error);
   // Node's ERR_INVALID_URL keeps the message fixed and records the offending input (and base).
+  E(
+    "ERR_INVALID_MIME_SYNTAX",
+    (production, str, invalidIndex) =>
+      `The MIME syntax for a ${production} in "${str}" is invalid${invalidIndex !== -1 ? ` at ${invalidIndex}` : ""}`,
+    TypeError,
+  );
   E("ERR_INVALID_URL", "Invalid URL", TypeError);
   {
     const make = codes.ERR_INVALID_URL;
@@ -497,7 +595,14 @@ const __errors = __lazyObject(() => {
   E("ERR_FS_EISDIR", "Path is a directory", Error);
   E("ERR_DIR_CLOSED", "Directory handle was closed", Error);
   E("ERR_DIR_CONCURRENT_OPERATION", "Cannot do synchronous work on directory handle with concurrent asynchronous operations", Error);
-  E("ERR_FALSY_VALUE_REJECTION", "Promise was rejected with falsy value", Error);
+  E(
+    "ERR_FALSY_VALUE_REJECTION",
+    function (reason) {
+      this.reason = reason;
+      return "Promise was rejected with falsy value";
+    },
+    Error,
+  );
   E("ERR_INVALID_CHAR", (name, field = undefined) => {
     let msg = `Invalid character in ${name}`;
     if (field !== undefined) msg += ` ["${field}"]`;
@@ -522,6 +627,7 @@ const __errors = __lazyObject(() => {
   E("ERR_SERVER_ALREADY_LISTEN", "Listen method has been called more than once without closing.", Error);
   E("ERR_USE_AFTER_CLOSE", "%s was closed", Error);
   E("ERR_IPC_CHANNEL_CLOSED", "Channel closed", Error);
+  E("ERR_CHILD_CLOSED_BEFORE_REPLY", "Child closed before reply received", Error);
   E("ERR_INVALID_ADDRESS_FAMILY", function (addressType, host, port) {
     this.host = host;
     this.port = port;
@@ -666,7 +772,7 @@ function __primordialsResolver() {
     "Function", "Int16Array", "Int32Array", "Int8Array", "Map", "Number", "Object", "RangeError",
     "ReferenceError", "RegExp", "Set", "String", "Symbol", "SyntaxError", "TypeError", "URIError",
     "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet",
-    "Promise", "Reflect", "Math", "JSON", "Atomics", "SharedArrayBuffer",
+    "Promise", "Proxy", "Reflect", "Math", "JSON", "Atomics", "SharedArrayBuffer",
     "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "unescape",
     "eval", "isFinite", "isNaN", "parseFloat", "parseInt",
   ];
@@ -847,7 +953,8 @@ function __initByCopy(Class) {
 {
   const perf = globalThis.performance;
   const names = ["mark", "measure", "clearMarks", "clearMeasures", "getEntries", "getEntriesByName",
-    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming"];
+    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming",
+    "timerify", "eventLoopUtilization", "nodeTiming", "addEventListener", "removeEventListener", "dispatchEvent"];
   const materialize = () => {
     for (const n of names) delete perf[n];
     __builtins.get("perf_hooks");

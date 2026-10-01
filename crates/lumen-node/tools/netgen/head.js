@@ -206,7 +206,7 @@ const internalUtil = {
   once,
   customInspectSymbol: Symbol.for("nodejs.util.inspect.custom"),
   // lumen wraps no raw OS descriptors as sockets, so no fd is a TCP or PIPE handle.
-  guessHandleType: (_fd) => "UNKNOWN",
+  guessHandleType: (fd) => (isWindows ? "UNKNOWN" : __net.guessHandle(fd)),
   normalizeEncoding: (enc) => __builtins.get("util")._normalizeEncoding?.(enc) ?? normalizeEncoding(enc),
   assertCrypto() {},
   deprecate: (fn, msg, code) => __builtins.get("util").deprecate(fn, msg, code),
@@ -340,7 +340,10 @@ for (const id of Object.keys(shims)) moduleCache.set(id, { exports: shims[id] })
 // ---- internalBinding('uv') --------------------------------------------------------------------
 
 const uvBinding = { errname: getSystemErrorName, getErrorMap: () => __uvErrmap() };
-for (const [errno, [name]] of __uvErrmap()) uvBinding[`UV_${name}`] = errno;
+// Read-only, as node_uv.cc defines them.
+for (const [errno, [name]] of __uvErrmap()) {
+  Object.defineProperty(uvBinding, `UV_${name}`, { value: errno, enumerable: true, writable: false, configurable: false });
+}
 const UV_EOF = uvBinding.UV_EOF;
 const UV_EBADF = uvBinding.UV_EBADF;
 const UV_ENOTCONN = uvBinding.UV_ENOTCONN;
@@ -409,6 +412,12 @@ class StreamHandle {
   getProviderType() { return 0; }
   isStreamBase = false;
   get writeQueueSize() { return this._queuedBytes; }
+  get fd() {
+    if (this._closed || isWindows) return -1;
+    if (this._id !== null) return __net.socketFd(this._id);
+    if (this._serverIds !== null) return __net.serverFd(this._serverIds[0]);
+    return -1;
+  }
 
   // Adopt a connected native stream: `[id, localAddress, localPort, remoteAddress, remotePort, family]`.
   _adopt(desc) {
@@ -593,15 +602,18 @@ class StreamHandle {
     this._reading = false;
     this.reading = false;
     if (this._id !== null) {
+      // A socket whose descriptor went to another process (child_process handle passing) lives
+      // on there: closing this copy must not shut the connection down.
+      const closeNative = (id) => (this._sent ? __net.release(id) : __net.close(id));
       if (this._writeQueue.length !== 0 && !this._resetting) {
         // libuv writes what it can synchronously (uv_try_write) before a close, so a response
         // written just before destroy() still reaches the peer: let queued writes finish first.
         this._whenDrained(() => {
-          if (this._id !== null) __net.close(this._id);
+          if (this._id !== null) closeNative(this._id);
           this._id = null;
         });
       } else {
-        __net.close(this._id);
+        closeNative(this._id);
         this._id = null;
       }
     }
@@ -632,7 +644,29 @@ class StreamHandle {
 
   setBlocking() { return 0; }
   fchmod() { return 0; }
-  open(_fd) { return UV_ENOTSUP; }
+  // uv_tcp_open / uv_pipe_open: adopt an existing socket descriptor (a listener or a connection).
+  open(fd) {
+    if (isWindows) return UV_ENOTSUP;
+    const type = __net.guessHandle(fd);
+    if (type !== "TCP" && type !== "PIPE") return type === "UNKNOWN" ? UV_EBADF : UV_EINVAL;
+    let info;
+    try {
+      info = __net.adoptFd(fd);
+    } catch (error) {
+      return errnoOf(error);
+    }
+    this._adoptInfo(info);
+    return 0;
+  }
+  _adoptInfo(info) {
+    if (info.server) {
+      this._serverIds = [info.serverId];
+      if (info.port !== undefined) this._sockname = { address: info.address, family: info.family, port: info.port };
+      if (!this._refed) __net.serverRef(info.serverId, true);
+    } else {
+      this._adopt(info.desc);
+    }
+  }
 
   _connectWith(req, start) {
     start(
@@ -650,6 +684,12 @@ class StreamHandle {
       },
     );
     return 0;
+  }
+
+  _startAccepting() {
+    if (this._accepting || this._serverIds === null) return;
+    this._accepting = true;
+    for (const id of this._serverIds) this._acceptLoop(id);
   }
 
   // The accept loop: one blocking accept per listener, each connection handed to onconnection.
@@ -719,7 +759,7 @@ class TCP extends StreamHandle {
     this._bindFlags = 0;
     this._connectBindAddress = address;
     this._connectBindPort = port | 0;
-    return 0;
+    return this._bindServer();
   }
   bind6(address, port, flags) {
     this._bindAddress = address;
@@ -727,7 +767,19 @@ class TCP extends StreamHandle {
     this._bindFlags = flags | 0;
     this._connectBindAddress = address;
     this._connectBindPort = port | 0;
-    return 0;
+    return this._bindServer();
+  }
+  // A server handle owns its socket from bind() on, as libuv's does, so it can be handed to
+  // another process (cluster's shared handles) before anyone listens on it. libuv reports
+  // EADDRINUSE from listen(), not bind(); so does this.
+  _bindServer() {
+    if (this._type !== TCPConstants.SERVER || this._serverIds !== null) return 0;
+    const err = this._openListener(511);
+    if (err === uvBinding.UV_EADDRINUSE) {
+      this._delayedError = err;
+      return 0;
+    }
+    return err;
   }
   // The listener binds here (std binds and listens in one step, so EADDRINUSE surfaces from
   // listen, as it does for libuv on Linux). An unspecified IPv6 address is dual-stack in Node;
@@ -735,6 +787,14 @@ class TCP extends StreamHandle {
   // IPv4 clients.
   listen(backlog) {
     if (this._closed) return UV_EBADF;
+    if (this._delayedError) return this._delayedError;
+    const err = this._openListener(backlog);
+    if (err !== 0) return err;
+    this._startAccepting();
+    return 0;
+  }
+  _openListener(backlog) {
+    if (this._serverIds !== null) return 0;
     const address = this._bindAddress ?? "0.0.0.0";
     let info;
     try {
@@ -753,7 +813,6 @@ class TCP extends StreamHandle {
       }
     }
     if (!this._refed) for (const id of this._serverIds) __net.serverRef(id, true);
-    for (const id of this._serverIds) this._acceptLoop(id);
     return 0;
   }
   connect(req, address, port) {
@@ -770,12 +829,15 @@ class Pipe extends StreamHandle {
     super(type);
     this._path = null;
   }
+  // uv_pipe_bind creates the socket file at once (errors included), so a server handle can be
+  // shared with another process before it listens.
   bind(path) {
     this._path = path;
-    return 0;
+    if (this._type !== PipeConstants.SERVER || isWindows) return 0;
+    return this._openListener();
   }
-  listen(_backlog) {
-    if (this._closed) return UV_EBADF;
+  _openListener() {
+    if (this._serverIds !== null) return 0;
     let info;
     try {
       info = __net.listenPath(this._path);
@@ -784,7 +846,13 @@ class Pipe extends StreamHandle {
     }
     this._serverIds = [info.serverId];
     if (!this._refed) __net.serverRef(info.serverId, true);
-    this._acceptLoop(info.serverId);
+    return 0;
+  }
+  listen(_backlog) {
+    if (this._closed) return UV_EBADF;
+    const err = this._openListener();
+    if (err !== 0) return err;
+    this._startAccepting();
     return 0;
   }
   connect(req, path) {
@@ -801,6 +869,21 @@ class Pipe extends StreamHandle {
 
 class TCPConnectWrap {}
 class PipeConnectWrap {}
+
+// A descriptor received over a child_process channel, as the handle libuv would hand JS for it.
+function handleFromFd(fd) {
+  const info = __net.adoptFd(fd);
+  if (info.type === "udp") {
+    const handle = new UDP();
+    handle._adoptId(info.socketId);
+    return handle;
+  }
+  const handle = info.type === "tcp"
+    ? new TCP(info.server ? TCPConstants.SERVER : TCPConstants.SOCKET)
+    : new Pipe(info.server ? PipeConstants.SERVER : PipeConstants.SOCKET);
+  handle._adoptInfo(info);
+  return handle;
+}
 
 // ---- internalBinding('block_list') -------------------------------------------------------------
 
@@ -844,7 +927,7 @@ function parseIPv6(s) {
   if (tail4 !== null) n = (n & ~0xffffffffn) | tail4;
   return n;
 }
-function formatIPv6(n) {
+function formatIPv6Value(n) {
   const groups = [];
   for (let i = 7; i >= 0; i--) groups.push(Number((n >> BigInt(i * 16)) & 0xffffn));
   let bestStart = -1, bestLen = 0;
@@ -864,11 +947,15 @@ const v4MappedPrefix = 0xffffn << 32n;
 class SocketAddressHandle {
   constructor(address, port, type, flowlabel) {
     const value = type === AF_INET ? parseIPv4(address) : parseIPv6(address);
-    // An unparsable address yields a handle whose detail() is undefined (SocketAddress throws).
-    this._valid = value !== null;
+    if (value === null) {
+      const err = new Error("Invalid socket address");
+      err.code = "ERR_INVALID_ADDRESS";
+      throw err;
+    }
+    this._valid = true;
     this._family = type;
     this._value = value;
-    this._address = value === null ? "" : type === AF_INET ? address : formatIPv6(value);
+    this._address = value === null ? "" : type === AF_INET ? address : formatIPv6Value(value);
     this._port = port | 0;
     this._flowlabel = flowlabel >>> 0;
   }
@@ -952,7 +1039,7 @@ class UDP {
   }
   getAsyncId() { return this._asyncId; }
   getProviderType() { return 0; }
-  get fd() { return this._id === null ? -1 : 1000 + this._id; }
+  get fd() { return this._id === null || isWindows ? -1 : __udp.fd(this._id); }
 
   _guard(op) {
     if (this._closed || this._id === null) return UV_EBADF;
@@ -979,7 +1066,26 @@ class UDP {
   }
   bind(address, port, flags) { return this._bind(false, address, port, flags); }
   bind6(address, port, flags) { return this._bind(true, address, port, flags); }
-  open(_fd) { return UV_ENOTSUP; }
+  open(fd) {
+    if (this._closed) return UV_EBADF;
+    if (this._id !== null) return UV_EINVAL;
+    if (isWindows) return UV_ENOTSUP;
+    if (__net.guessHandle(fd) !== "UDP") return UV_EINVAL;
+    let info;
+    try {
+      info = __net.adoptFd(fd);
+    } catch (error) {
+      return errnoOf(error);
+    }
+    this._adoptId(info.socketId);
+    return 0;
+  }
+  _adoptId(id) {
+    this._id = id;
+    const name = __udp.address(id);
+    this._kind6 = !!name && name.family === "IPv6";
+    if (!this._refed) __udp.udpRef(id, true);
+  }
 
   connect(address, port) { return this._guard(() => __udp.connect(this._id, address, port)); }
   connect6(address, port) { return this.connect(address, port); }
@@ -1014,7 +1120,7 @@ class UDP {
     });
     return err === 0 ? sent + 1 : err;
   }
-  send6(req, list, count, port, address, hasCallback) { return this.send(req, list, count, port, address, hasCallback); }
+  send6(req, list, count, port, address, hasCallback) { return UDP.prototype.send.call(this, req, list, count, port, address, hasCallback); }
 
   recvStart() {
     if (this._closed) return UV_EBADF;

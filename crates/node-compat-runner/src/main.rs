@@ -13,8 +13,9 @@
 //!   - `sequential/` runs one test at a time (shared ports); `parallel/` runs concurrently.
 //!
 //! A test that calls `common.skip()` (prints `1..0 # Skipped: ...`, exits 0) counts as skipped,
-//! like Node's test.py does. Tests with `--expose-internals` are skipped: they `require('internal/...')` and exercise Node's
-//! private modules, not the public API. `skip.txt` lists further files that cannot be run at all
+//! like Node's test.py does. `--expose-internals` is forwarded: lumen serves the internal modules
+//! and bindings it has an equivalent for (`require('internal/...')`, `internalBinding(...)`), and a
+//! test reaching for one it lacks fails. `skip.txt` lists the files that cannot be run at all
 //! (hang, crash the runner) with a reason.
 //!
 //! `passing.txt` is the checked-in list of tests expected to pass. A listed test that fails is a
@@ -106,8 +107,25 @@ fn main() {
     );
 
     let started = Instant::now();
+    let sweeping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sweeper = {
+        let sweeping = Arc::clone(&sweeping);
+        std::thread::spawn(move || {
+            let mut idle = 0;
+            while sweeping.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                idle += 1;
+                if idle % 25 == 0 {
+                    leaks::sweep(None, false);
+                }
+            }
+        })
+    };
     let mut results = run_all(&options, &test_dir, &tests, &skips);
     retry_expected_failures(&options, &test_dir, &tests, &expected, &mut results);
+    sweeping.store(false, Ordering::Relaxed);
+    let _ = sweeper.join();
+    leaks::sweep(None, true);
     let elapsed = started.elapsed();
 
     report(&options, &workspace, &tests, &results, &expected, elapsed);
@@ -317,15 +335,9 @@ fn run_test(options: &Options, test_dir: &Path, test: &TestCase, serial_id: usiz
         Err(e) => return Outcome::Skip(format!("unreadable: {e}")),
     };
     let flags = parse_flags(&source);
-    if flags
-        .iter()
-        .any(|f| f == "--expose-internals" || f == "--expose_internals")
-    {
-        return Outcome::Skip("--expose-internals".to_string());
-    }
 
     let mut command = Command::new(&options.lumen);
-    command.args(flags.iter().filter(|f| forwarded_flag(f)));
+    command.args(forwarded_flags(&flags));
     command
         .arg(&path)
         .current_dir(test_dir.parent().unwrap_or(test_dir))
@@ -333,21 +345,27 @@ fn run_test(options: &Options, test_dir: &Path, test: &TestCase, serial_id: usiz
         .env("NODE_TEST_KNOWN_GLOBALS", "0")
         .env("NO_COLOR", "1")
         .env("TEST_SERIAL_ID", serial_id.to_string())
+        .env(leaks::VAR, leaks::tag(serial_id))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     tree::isolate(&mut command);
 
+    leaks::begin(serial_id);
     let outcome = match command.spawn() {
         Ok(child) => {
             let tree = tree::ProcessTree::new(&child);
-            wait_with_timeout(child, tree, options.timeout)
+            wait_with_timeout(child, tree, options.timeout, dump_path(&test.name))
         }
         Err(e) => Outcome::Fail {
             code: None,
             output: format!("failed to spawn runtime: {e}"),
         },
     };
+    leaks::end(serial_id);
+    if matches!(outcome, Outcome::Timeout) {
+        leaks::sweep(Some(serial_id), false);
+    }
     let _ = std::fs::remove_dir_all(test_dir.join(format!(".tmp.{serial_id}")));
     outcome
 }
@@ -356,6 +374,7 @@ fn wait_with_timeout(
     mut child: std::process::Child,
     tree: tree::ProcessTree,
     timeout: Duration,
+    dump: Option<PathBuf>,
 ) -> Outcome {
     // Drain both pipes on their own threads so a chatty test cannot block on a full pipe.
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -412,6 +431,12 @@ fn wait_with_timeout(
         }
     }
 
+    if let Some(path) = dump {
+        if !status.is_some_and(|s| s.success()) {
+            let _ = std::fs::write(path, &*output.lock().unwrap());
+        }
+    }
+
     match status {
         None => Outcome::Timeout,
         // `common.skip(reason)` prints `1..0 # Skipped: <reason>` and exits 0 — the test decided
@@ -448,6 +473,13 @@ fn wait_with_timeout(
     }
 }
 
+/// Where `NODE_COMPAT_DUMP=<dir>` keeps a failing test's whole captured output.
+fn dump_path(name: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("NODE_COMPAT_DUMP")?);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{}.txt", name.replace('/', "_"))))
+}
+
 /// The flags on the file's first `// Flags:` line, as Node's test.py reads them.
 fn parse_flags(source: &str) -> Vec<String> {
     source
@@ -457,6 +489,58 @@ fn parse_flags(source: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+const NODE_OPTIONS_TABLE: &str = include_str!("../../lumen-cli/src/node_options.txt");
+
+/// The flags (with a separate value operand where the option takes one) lumen-cli will honor.
+fn forwarded_flags(flags: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = flags.iter().peekable();
+    while let Some(flag) = iter.next() {
+        if !forwarded_flag(flag) {
+            continue;
+        }
+        out.push(flag.clone());
+        if !flag.contains('=') && option_takes_value(flag) {
+            if let Some(value) = iter.next() {
+                out.push(value.clone());
+            }
+        }
+    }
+    out
+}
+
+fn option_entry(flag: &str) -> Option<(&'static str, bool)> {
+    let name = flag.split('=').next().unwrap_or(flag);
+    let bare = name.strip_prefix("--no-").map(|n| format!("--{n}"));
+    NODE_OPTIONS_TABLE.lines().find_map(|line| {
+        let mut fields = line.split(' ');
+        let entry = fields.next()?;
+        if entry != name && bare.as_deref() != Some(entry) {
+            return None;
+        }
+        let takes_value = fields.next()? == "v";
+        fields.next()?;
+        let source = if fields.next() == Some("v8") { "v8" } else { "node" };
+        Some((source, takes_value))
+    })
+}
+
+fn option_takes_value(flag: &str) -> bool {
+    option_entry(flag).is_some_and(|(_, value)| value)
+}
+
+fn node_table_flag(flag: &str) -> bool {
+    const SKIPPED: &[&str] = &[
+        "--check", "--eval", "--print", "--interactive", "--help", "--version", "--test", "--watch",
+        "--watch-path", "--build-snapshot", "--prof", "--prof-process", "--cpu-prof", "--heap-prof",
+    ];
+    let name = flag.split('=').next().unwrap_or(flag);
+    if name.starts_with("--inspect") || SKIPPED.contains(&name) {
+        return false;
+    }
+    option_entry(flag).is_some_and(|(source, _)| source == "node")
+}
+
 /// Flags lumen-cli accepts. Anything else is dropped, like Deno's runner does, rather than
 /// failing the run on a V8 or Node knob lumen has no equivalent for.
 fn forwarded_flag(flag: &str) -> bool {
@@ -464,6 +548,10 @@ fn forwarded_flag(flag: &str) -> bool {
         flag,
         "--expose-gc"
             | "--expose_gc"
+            | "--expose-externalize-string"
+            | "--expose_externalize_string"
+            | "--expose-internals"
+            | "--expose_internals"
             | "--no-warnings"
             | "--pending-deprecation"
             | "--no-deprecation"
@@ -479,13 +567,18 @@ fn forwarded_flag(flag: &str) -> bool {
             | "--network-family-autoselection"
             | "--no-network-family-autoselection"
             | "--enable-network-family-autoselection"
-    ) || flag.starts_with("--experimental-")
+            | "--allow-natives-syntax"
+            | "--allow_natives_syntax"
+    ) || node_table_flag(flag)
+        || flag.starts_with("--max-old-space-size")
+        || flag.starts_with("--experimental-")
         || flag.starts_with("--dns-result-order")
         || flag.starts_with("--max-http-header-size")
         || flag.starts_with("--network-family-autoselection-attempt-timeout")
         || flag.starts_with("--no-experimental-")
         || flag.starts_with("--allow-fs-")
         || flag.starts_with("--env-file")
+        || flag.starts_with("--title")
 }
 
 /// The module a test belongs to, for the per-module score: `test-buffer-alloc.js` -> `buffer`.
@@ -728,6 +821,75 @@ fn write_list(path: &Path, tests: &BTreeSet<String>) {
 fn die(message: &str) -> ! {
     eprintln!("node-compat-runner: {message}");
     std::process::exit(2);
+}
+
+/// Finds processes a test left behind after they left its process group (`detached` children,
+/// `setsid`): every test's environment carries `NODE_COMPAT_TAG=<runner pid>.<serial>`, which
+/// descendants inherit, so a process listing with environments identifies them.
+mod leaks {
+    use std::collections::HashSet;
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    pub const VAR: &str = "NODE_COMPAT_TAG";
+    static ACTIVE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+    pub fn tag(serial: usize) -> String {
+        format!("{}.{serial}", std::process::id())
+    }
+
+    pub fn begin(serial: usize) {
+        ACTIVE.lock().unwrap().get_or_insert_with(HashSet::new).insert(serial);
+    }
+
+    pub fn end(serial: usize) {
+        if let Some(set) = ACTIVE.lock().unwrap().as_mut() {
+            set.remove(&serial);
+        }
+    }
+
+    #[cfg(unix)]
+    fn listing() -> String {
+        #[cfg(target_os = "macos")]
+        let args = ["-axwwE", "-o", "pid=,command="];
+        #[cfg(not(target_os = "macos"))]
+        let args = ["axeww", "-o", "pid=,command="];
+        Command::new("ps")
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Kills every tagged process of this run whose test is no longer active (or, with `all`,
+    /// every tagged process, or with `only`, just that test's).
+    #[cfg(unix)]
+    pub fn sweep(only: Option<usize>, all: bool) {
+        extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        let needle = format!("{VAR}={}.", std::process::id());
+        let me = std::process::id() as i32;
+        let active = ACTIVE.lock().unwrap().clone().unwrap_or_default();
+        for line in listing().lines() {
+            let line = line.trim_start();
+            let Some((pid, rest)) = line.split_once(' ') else { continue };
+            let Ok(pid) = pid.parse::<i32>() else { continue };
+            let Some(at) = rest.find(&needle) else { continue };
+            let digits: String = rest[at + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let Ok(serial) = digits.parse::<usize>() else { continue };
+            let doomed = match only {
+                Some(only) => serial == only,
+                None => all || !active.contains(&serial),
+            };
+            if doomed && pid != me && pid > 1 {
+                unsafe { kill(pid, 9) };
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn sweep(_only: Option<usize>, _all: bool) {}
 }
 
 /// Kills a test's whole process tree, not just the direct child: a Job Object on Windows (closing

@@ -61,6 +61,10 @@ pub fn canonical_zone_names() -> Vec<&'static str> {
 }
 
 fn zone(name: &str) -> Option<&'static Zone> {
+    // Callers mostly pass an already-canonical name: match it without canonicalize's allocation.
+    if let Some(z) = ZONES.iter().find(|z| z.name == name) {
+        return Some(z);
+    }
     let canon = canonicalize(name)?;
     ZONES.iter().find(|z| z.name == canon)
 }

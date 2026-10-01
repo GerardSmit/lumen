@@ -58,6 +58,13 @@ lto = false
 codegen-units = 64
 incremental = true
 
+# CI tests: optimized like `fast` so deep-recursion tests fit the stack, but keep debug assertions
+# and overflow checks.
+[profile.ci]
+inherits = "fast"
+debug-assertions = true
+overflow-checks = true
+
 # Size-focused release build for shipping (mobile, WASM, embedders): `--profile release-small`.
 # Everything is optimized for size except the engine core (`lumen`: interpreter, VM, builtins),
 # which stays at opt-level 3 — the hot paths live there. panic = "abort" is inherited (the

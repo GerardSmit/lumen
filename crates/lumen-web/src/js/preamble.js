@@ -50,8 +50,11 @@ function __lazyWeb(names, init) {
       }
       return globalThis[name];
     };
+    // The slot keeps the enumerability it has when filled (an embedder may have changed it).
     const set = (value) => {
-      Object.defineProperty(globalThis, name, { value, writable: true, enumerable, configurable: true });
+      const now = Object.getOwnPropertyDescriptor(globalThis, name);
+      const e = now !== undefined && now.get === get ? now.enumerable : enumerable;
+      Object.defineProperty(globalThis, name, { value, writable: true, enumerable: e, configurable: true });
     };
     Object.defineProperty(globalThis, name, { get, set, enumerable, configurable: true });
   }

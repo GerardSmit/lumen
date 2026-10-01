@@ -250,10 +250,16 @@ fn node_sqlite_uses_real_storage_binding_and_transaction_state() {
         const quoted = new DatabaseSync(':memory:', {enableDoubleQuotedStringLiterals:true});
         console.log(quoted.prepare('SELECT "enabled string" AS value').get().value);
         quoted.close();
-        try { new DatabaseSync(':memory:', {allowExtension:true}); } catch(error) { console.log(error.message); }
+        let extensible;
+        try { extensible = new DatabaseSync(':memory:', {allowExtension:true}); } catch(error) { if (!/does not support/.test(error.message)) throw error; }
+        if (extensible) {
+          try { extensible.prepare("SELECT load_extension('/does/not/exist')").get(); console.log('sql loaded'); } catch(error) { console.log('sql refused'); }
+          try { extensible.loadExtension('/does/not/exist'); console.log('loaded'); } catch(error) { console.log(error.code !== 'ERR_INVALID_STATE'); }
+          extensible.close();
+        } else { console.log('sql refused'); console.log(true); }
     "#);
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert_eq!(ran.stdout, "true\nnull\ntrue\nERR_SQLITE_ERROR\nlabel,calculated TEXT null\ntrue false\ntrue\n1\nfalse\n9007199254740993\nfalse\nretained\nERR_SQLITE_ERROR\nenabled string\nnode:sqlite extension loading is not implemented\n");
+    assert_eq!(ran.stdout, "true\nnull\ntrue\nERR_SQLITE_ERROR\nlabel,calculated TEXT null\ntrue false\ntrue\n1\nfalse\n9007199254740993\nfalse\nretained\nERR_SQLITE_ERROR\nenabled string\nsql refused\ntrue\n");
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
@@ -709,7 +715,17 @@ fn node_sqlite_disables_native_extension_loading_and_enforces_constructor_policy
  assert.throws(()=>db.loadExtension('/does/not/exist'),{code:'ERR_INVALID_STATE'});
  assert.throws(()=>db.prepare("SELECT load_extension('/does/not/exist')").get(),/not authorized|no such function/);
  db.close();assert.throws(()=>db.enableLoadExtension(false),/not open/);
- assert.throws(()=>new DatabaseSync(':memory:',{allowExtension:true}),/not implemented/);
+ let ext;
+ try { ext=new DatabaseSync(':memory:',{allowExtension:true}); } catch(error) { assert.match(error.message,/does not support/); }
+ if(ext) {
+   assert.throws(()=>ext.prepare("SELECT load_extension('/does/not/exist')").get(),/not authorized|no such function/);
+   assert.throws(()=>ext.loadExtension('/does/not/exist'),(error)=>error.code!=='ERR_INVALID_STATE');
+   ext.enableLoadExtension(false);
+   assert.throws(()=>ext.loadExtension('/does/not/exist'),{code:'ERR_INVALID_STATE'});
+   ext.enableLoadExtension(true);
+   assert.throws(()=>ext.prepare("SELECT load_extension('/does/not/exist')").get(),/not authorized|no such function/);
+   ext.close();
+ }
  "#;
     match runtime.eval(source).expect("source parses") {
         lumen_runtime::Completion::Value(_) => {}
@@ -783,5 +799,406 @@ fn copied_worker_environment_remains_isolated_and_nested_sharing_stays_in_its_gr
     "#);
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
     assert_eq!(ran.stdout, "[[\"nested\",true],\"root\"]\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn fork_of_exec_path_runs_a_child_realm_with_ipc() {
+    let scratch = Scratch::new("fork-ipc");
+    scratch.file(
+        "child.cjs",
+        "process.on('message', (m) => {
+           if (m === 'bye') { process.disconnect(); return; }
+           process.send({ echo: m, argv: process.argv.slice(2), env: process.env.CHILD_MARK, cwd: process.cwd() });
+         });
+         process.send('ready');",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const { fork } = require('child_process');
+         const child = fork(__dirname + '/child.cjs', ['a', 'b'], { env: { ...process.env, CHILD_MARK: 'x' } });
+         const seen = [];
+         child.on('message', (m) => {
+           seen.push(m);
+           if (m === 'ready') child.send({ n: 1, big: 10n === 10n });
+           else child.send('bye');
+         });
+         child.on('exit', (code, signal) => console.log('exit', code, signal));
+         child.on('close', () => console.log(JSON.stringify(seen), child.pid > 0, child.connected));",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    let cwd = scratch.0.to_string_lossy().replace('\\', "\\\\");
+    assert!(ran.stdout.contains("exit 0 null"), "{}", ran.stdout);
+    assert!(
+        ran.stdout.contains(&format!(
+            r#"["ready",{{"echo":{{"n":1,"big":true}},"argv":["a","b"],"env":"x","cwd":"{cwd}"}}]"#
+        )),
+        "{}",
+        ran.stdout
+    );
+    assert!(ran.stdout.contains("false"), "{}", ran.stdout);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn fork_with_advanced_serialization_round_trips_structured_values() {
+    let scratch = Scratch::new("fork-advanced");
+    scratch.file(
+        "child.cjs",
+        "process.on('message', (m) => { process.send({ big: m.big * 2n, map: [...m.map], date: m.date instanceof Date }); process.exit(7); });",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const { fork } = require('child_process');
+         const child = fork(__dirname + '/child.cjs', { serialization: 'advanced' });
+         child.on('message', (m) => console.log(typeof m.big, String(m.big), JSON.stringify(m.map), m.date));
+         child.on('exit', (code) => console.log('exit', code));
+         child.send({ big: 21n, map: new Map([[1, 2]]), date: new Date(0) });",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert!(ran.stdout.contains("bigint 42 [[1,2]] true"), "{}", ran.stdout);
+    assert!(ran.stdout.contains("exit 7"), "{}", ran.stdout);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn killing_a_child_realm_reports_the_signal() {
+    let scratch = Scratch::new("child-kill");
+    scratch.file(
+        "child.cjs",
+        "process.send('up'); setInterval(() => {}, 1000); for (;;) {}",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const { fork } = require('child_process');
+         const child = fork(__dirname + '/child.cjs');
+         child.on('message', () => console.log('killed', child.kill()));
+         child.on('exit', (code, signal) => console.log('exit', code, signal, child.killed));",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert!(ran.stdout.contains("killed true"), "{}", ran.stdout);
+    assert!(ran.stdout.contains("exit null SIGTERM true"), "{}", ran.stdout);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn spawn_of_exec_path_pipes_stdio_to_a_child_realm() {
+    let scratch = Scratch::new("spawn-pipe");
+    scratch.file(
+        "child.cjs",
+        "process.stdin.on('data', (d) => process.stdout.write('got:' + d));
+         process.stdin.on('end', () => { console.error('child-err'); process.exit(3); });",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const { spawn } = require('child_process');
+         const child = spawn(process.execPath, [__dirname + '/child.cjs'], { stdio: ['pipe', 'pipe', 'pipe'] });
+         let out = '', err = '';
+         child.stdout.on('data', (d) => out += d);
+         child.stderr.on('data', (d) => err += d);
+         child.on('close', (code, signal) => console.log(JSON.stringify({ out, err, code, signal })));
+         child.stdin.write('one');
+         setTimeout(() => child.stdin.end(), 50);",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert!(
+        ran.stdout
+            .contains(r#"{"out":"got:one","err":"child-err\n","code":3,"signal":null}"#),
+        "{}",
+        ran.stdout
+    );
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn child_realm_inherits_the_parent_streams() {
+    let scratch = Scratch::new("spawn-inherit");
+    scratch.file("child.cjs", "console.log('from child'); console.error('child err');");
+    let ran = Realm::default().run(
+        &scratch,
+        "require('child_process').spawn(process.execPath, [__dirname + '/child.cjs'], { stdio: 'inherit' });",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "from child\n");
+    assert!(ran.stderr.contains("child err"), "{}", ran.stderr);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn ending_the_parent_realm_stops_its_children() {
+    let scratch = Scratch::new("child-orphan");
+    scratch.file("child.cjs", "setInterval(() => {}, 1000); for (;;) {}");
+    let started = Instant::now();
+    let ran = Realm::default().run(
+        &scratch,
+        "const child = require('child_process').spawn(process.execPath, [__dirname + '/child.cjs']);
+         child.unref();
+         setTimeout(() => process.exit(5), 200);",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(5), "{}", ran.stderr);
+    assert!(started.elapsed() < Duration::from_secs(20));
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn a_nested_child_realm_starts_children_of_its_own() {
+    let scratch = Scratch::new("child-nested");
+    scratch.file("leaf.cjs", "process.send('leaf'); process.exit(0);");
+    scratch.file(
+        "mid.cjs",
+        "const child = require('child_process').fork(__dirname + '/leaf.cjs');
+         child.on('message', (m) => process.send('mid saw ' + m));",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const child = require('child_process').fork(__dirname + '/mid.cjs');
+         child.on('message', (m) => console.log(m));",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "mid saw leaf\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn spawn_of_exec_path_with_ignored_stdin_and_ipc_slot() {
+    let scratch = Scratch::new("spawn-ipc-slot");
+    scratch.file(
+        "child.cjs",
+        "process.on('message', (m) => { process.send({ id: m.id, result: { ok: true } }); });
+         console.error('worker started');",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const { spawn } = require('child_process');
+         const env = { A: '1' };
+         const child = spawn(process.execPath, [__dirname + '/child.cjs'], { env, cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+         let err = '';
+         child.stderr.on('data', (d) => err += d);
+         child.on('error', (e) => console.log('error', e.message));
+         child.once('spawn', () => console.log('spawned'));
+         child.on('message', (m) => { console.log(JSON.stringify(m)); child.kill('SIGKILL'); });
+         child.on('close', (code, signal) => console.log('close', code, signal, JSON.stringify(err)));
+         child.send({ id: 1 });",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(
+        ran.stdout,
+        "spawned\n{\"id\":1,\"result\":{\"ok\":true}}\nclose null SIGKILL \"worker started\\n\"\n"
+    );
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn a_child_blocked_on_an_unread_pipe_does_not_outlive_its_parent() {
+    let scratch = Scratch::new("child-full-pipe");
+    scratch.file(
+        "child.cjs",
+        "const chunk = 'x'.repeat(65536); for (;;) process.stdout.write(chunk);",
+    );
+    let started = Instant::now();
+    let ran = Realm::default().run(
+        &scratch,
+        "const child = require('child_process').spawn(process.execPath, [__dirname + '/child.cjs']);
+         child.unref();
+         setTimeout(() => process.exit(5), 400);",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(5), "{}", ran.stderr);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn killing_a_child_blocked_on_an_unread_pipe_frees_it() {
+    let scratch = Scratch::new("child-full-pipe-kill");
+    scratch.file(
+        "child.cjs",
+        "const chunk = 'x'.repeat(65536); for (;;) process.stdout.write(chunk);",
+    );
+    let started = Instant::now();
+    let ran = Realm::default().run(
+        &scratch,
+        "const child = require('child_process').spawn(process.execPath, [__dirname + '/child.cjs']);
+         child.on('exit', (code, signal) => console.log('exit', code, signal));
+         setTimeout(() => child.kill('SIGKILL'), 400);",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert!(ran.stdout.contains("exit null SIGKILL"), "{}", ran.stdout);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn only_the_ipc_slot_gets_the_channel_descriptor() {
+    let scratch = Scratch::new("child-ipc-slots");
+    scratch.file(
+        "child.cjs",
+        "process.on('message', (m) => { process.send({ echo: m, fd: process.env.NODE_CHANNEL_FD !== undefined }); process.exit(0); });",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const { spawn } = require('child_process');
+         const child = spawn(process.execPath, [__dirname + '/child.cjs'], { stdio: ['pipe', 'pipe', 'pipe', 'ipc', 'pipe'] });
+         child.on('message', (m) => console.log(JSON.stringify(m)));
+         child.on('close', (code) => console.log('close', code));
+         child.send('hi');",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    // Like Node, the child consumes NODE_CHANNEL_FD while opening the channel.
+    assert!(ran.stdout.contains(r#"{"echo":"hi","fd":false}"#), "{}", ran.stdout);
+    assert!(ran.stdout.contains("close 0"), "{}", ran.stdout);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn a_signal_reaches_the_child_realms_listener() {
+    let scratch = Scratch::new("child-signal-handler");
+    scratch.file(
+        "child.cjs",
+        "process.on('SIGTERM', (name) => { process.send('handled ' + name); process.exit(3); });
+         process.on('SIGWINCH', () => process.send('winch'));
+         setInterval(() => {}, 1000); process.send('up');",
+    );
+    let ran = Realm::default().run(
+        &scratch,
+        "const { fork } = require('child_process');
+         const child = fork(__dirname + '/child.cjs');
+         child.on('message', (m) => {
+           console.log(m);
+           if (m === 'up') process.kill(child.pid, 'SIGWINCH');
+           if (m === 'winch') child.kill('SIGTERM');
+         });
+         child.on('exit', (code, signal) => console.log('exit', code, signal));",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "up\nwinch\nhandled SIGTERM\nexit 3 null\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn an_unhandled_catchable_signal_takes_its_default_action() {
+    let scratch = Scratch::new("child-signal-default");
+    scratch.file("child.cjs", "setInterval(() => {}, 1000); process.send('up');");
+    let ran = Realm::default().run(
+        &scratch,
+        "const { fork } = require('child_process');
+         const child = fork(__dirname + '/child.cjs');
+         child.on('message', () => { child.kill('SIGWINCH'); setTimeout(() => { console.log('alive', child.exitCode); child.kill('SIGINT'); }, 100); });
+         child.on('exit', (code, signal) => console.log('exit', code, signal));",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "alive null\nexit null SIGINT\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn a_realm_tree_has_a_limit_on_live_children() {
+    let scratch = Scratch::new("child-limit");
+    scratch.file("child.cjs", "setInterval(() => {}, 1000);");
+    scratch.file("quick.cjs", "process.exit(0);");
+    let ran = Realm::default().run(
+        &scratch,
+        "const { spawn } = require('child_process');
+         const live = [];
+         let refused = null;
+         for (let i = 0; i < 9; i++) {
+           const child = spawn(process.execPath, [__dirname + '/child.cjs']);
+           child.on('error', (e) => { refused = e.code; });
+           live.push(child);
+         }
+         setTimeout(() => {
+           console.log('refused', refused);
+           for (const child of live) child.kill('SIGKILL');
+           setTimeout(() => {
+             const again = spawn(process.execPath, [__dirname + '/quick.cjs']);
+             again.on('error', (e) => console.log('again failed', e.code));
+             again.on('exit', (code) => console.log('again', code));
+           }, 300);
+         }, 300);",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert!(ran.stdout.contains("refused EAGAIN"), "{}", ran.stdout);
+    assert!(ran.stdout.contains("again 0"), "{}", ran.stdout);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn a_child_realm_over_the_heap_ceiling_reports_an_abort() {
+    let scratch = Scratch::new("child-heap");
+    scratch.file("child.cjs", "const keep = []; for (;;) keep.push({});");
+    let ran = Realm {
+        live_object_limit: Some(200_000),
+        ..Realm::default()
+    }
+    .run(
+        &scratch,
+        "const child = require('child_process').spawn(process.execPath, [__dirname + '/child.cjs']);
+         child.on('exit', (code, signal) => console.log('exit', code, signal));",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert!(ran.stdout.contains("exit null SIGABRT"), "{}", ran.stdout);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn spawn_sync_of_exec_path_runs_a_child_realm() {
+    let scratch = Scratch::new("spawn-sync");
+    scratch.file(
+        "child.cjs",
+        "let input = ''; process.stdin.on('data', (d) => input += d);
+         process.stdin.on('end', () => { console.log('out:' + input + ':' + process.argv.slice(2)); console.error('err'); process.exit(4); });",
+    );
+    scratch.file("loud.cjs", "for (;;) process.stdout.write('x'.repeat(4096));");
+    scratch.file("slow.cjs", "setInterval(() => {}, 1000);");
+    let ran = Realm::default().run(
+        &scratch,
+        "const { spawnSync, execFileSync } = require('child_process');
+         const done = spawnSync(process.execPath, [__dirname + '/child.cjs', 'a'], { input: 'in', encoding: 'utf8' });
+         console.log(JSON.stringify([done.status, done.signal, done.stdout, done.stderr, done.error === undefined]));
+         const loud = spawnSync(process.execPath, [__dirname + '/loud.cjs'], { maxBuffer: 10000 });
+         console.log(loud.error && loud.error.code, loud.signal);
+         const slow = spawnSync(process.execPath, [__dirname + '/slow.cjs'], { timeout: 200 });
+         console.log(slow.error && slow.error.code, slow.signal);
+         try { execFileSync(process.execPath, ['-r', 'x', '--', __dirname + '/child.cjs'], { stdio: ['pipe', 'pipe', 'ignore'], input: '' }); } catch (e) { console.log('threw', e.status); }",
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert!(ran.stdout.contains("threw 4"), "{}", ran.stdout);
+    assert!(ran.stdout.contains(r#"[4,null,"out:in:a\n","err\n",true]"#), "{}", ran.stdout);
+    assert!(ran.stdout.contains("ENOBUFS SIGTERM"), "{}", ran.stdout);
+    assert!(ran.stdout.contains("ETIMEDOUT SIGTERM"), "{}", ran.stdout);
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn module_graph_that_fails_to_link_is_rejected_every_time() {
+    let scratch = Scratch::new("esm-failed-link");
+    scratch.file("a.mjs", "import { b } from './b.mjs'; globalThis.ranA = true; export const a = b;");
+    scratch.file("b.mjs", "import { gone } from './c.mjs'; export const b = gone;");
+    scratch.file("c.mjs", "export const present = 1;");
+    let ran = Realm::default().run(
+        &scratch,
+        r#"
+        const attempt = () => import('./a.mjs').then(() => 'loaded', e => e.constructor.name);
+        attempt().then(first => attempt().then(second => console.log(first, second, globalThis.ranA === true)));
+        "#,
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "SyntaxError SyntaxError false\n");
+    std::fs::remove_dir_all(&scratch.0).unwrap();
+}
+
+#[test]
+fn failed_module_graph_can_be_imported_again() {
+    let scratch = Scratch::new("esm-failed-graph");
+    scratch.file("a.mjs", "import { b } from './b.mjs'; export const a = b;");
+    scratch.file("b.mjs", "import { gone } from './missing.mjs'; export const b = gone;");
+    let ran = Realm::default().run(
+        &scratch,
+        r#"
+        const attempt = () => import('./a.mjs').then(() => 'loaded', e => e.constructor.name);
+        attempt().then(first => attempt().then(second => console.log(first, second)));
+        "#,
+    );
+    assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "TypeError TypeError\n");
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
