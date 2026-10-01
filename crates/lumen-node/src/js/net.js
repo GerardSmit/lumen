@@ -340,7 +340,10 @@ for (const id of Object.keys(shims)) moduleCache.set(id, { exports: shims[id] })
 // ---- internalBinding('uv') --------------------------------------------------------------------
 
 const uvBinding = { errname: getSystemErrorName, getErrorMap: () => __uvErrmap() };
-for (const [errno, [name]] of __uvErrmap()) uvBinding[`UV_${name}`] = errno;
+// Read-only, as node_uv.cc defines them.
+for (const [errno, [name]] of __uvErrmap()) {
+  Object.defineProperty(uvBinding, `UV_${name}`, { value: errno, enumerable: true, writable: false, configurable: false });
+}
 const UV_EOF = uvBinding.UV_EOF;
 const UV_EBADF = uvBinding.UV_EBADF;
 const UV_ENOTCONN = uvBinding.UV_ENOTCONN;

@@ -248,6 +248,11 @@ const JS_FILES: &[GlueFile] = &[
         name: "permission.js",
         wrap: true,
     },
+    // Node's internal modules and bindings, for --expose-internals (generated; see its header).
+    GlueFile {
+        name: "internals.js",
+        wrap: true,
+    },
     GlueFile {
         name: "module.js",
         wrap: false,
@@ -300,6 +305,7 @@ const LAZY: &[&str] = &[
     "vm.js",
     "repl.js",
     "permission.js",
+    "internals.js",
     "cluster.js",
     "dgram.js",
     "wasi.js",

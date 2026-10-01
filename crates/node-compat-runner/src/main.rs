@@ -13,8 +13,9 @@
 //!   - `sequential/` runs one test at a time (shared ports); `parallel/` runs concurrently.
 //!
 //! A test that calls `common.skip()` (prints `1..0 # Skipped: ...`, exits 0) counts as skipped,
-//! like Node's test.py does. Tests with `--expose-internals` are skipped: they `require('internal/...')` and exercise Node's
-//! private modules, not the public API. `skip.txt` lists further files that cannot be run at all
+//! like Node's test.py does. `--expose-internals` is forwarded: lumen serves the internal modules
+//! and bindings it has an equivalent for (`require('internal/...')`, `internalBinding(...)`), and a
+//! test reaching for one it lacks fails. `skip.txt` lists the files that cannot be run at all
 //! (hang, crash the runner) with a reason.
 //!
 //! `passing.txt` is the checked-in list of tests expected to pass. A listed test that fails is a
@@ -317,12 +318,6 @@ fn run_test(options: &Options, test_dir: &Path, test: &TestCase, serial_id: usiz
         Err(e) => return Outcome::Skip(format!("unreadable: {e}")),
     };
     let flags = parse_flags(&source);
-    if flags
-        .iter()
-        .any(|f| f == "--expose-internals" || f == "--expose_internals")
-    {
-        return Outcome::Skip("--expose-internals".to_string());
-    }
 
     let mut command = Command::new(&options.lumen);
     command.args(flags.iter().filter(|f| forwarded_flag(f)));
@@ -464,6 +459,10 @@ fn forwarded_flag(flag: &str) -> bool {
         flag,
         "--expose-gc"
             | "--expose_gc"
+            | "--expose-externalize-string"
+            | "--expose_externalize_string"
+            | "--expose-internals"
+            | "--expose_internals"
             | "--no-warnings"
             | "--pending-deprecation"
             | "--no-deprecation"
@@ -479,6 +478,8 @@ fn forwarded_flag(flag: &str) -> bool {
             | "--network-family-autoselection"
             | "--no-network-family-autoselection"
             | "--enable-network-family-autoselection"
+            | "--allow-natives-syntax"
+            | "--allow_natives_syntax"
     ) || flag.starts_with("--experimental-")
         || flag.starts_with("--dns-result-order")
         || flag.starts_with("--max-http-header-size")
@@ -486,6 +487,7 @@ fn forwarded_flag(flag: &str) -> bool {
         || flag.starts_with("--no-experimental-")
         || flag.starts_with("--allow-fs-")
         || flag.starts_with("--env-file")
+        || flag.starts_with("--title")
 }
 
 /// The module a test belongs to, for the per-module score: `test-buffer-alloc.js` -> `buffer`.
