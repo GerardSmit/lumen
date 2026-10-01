@@ -101,6 +101,15 @@ if (typeof globalThis.global === "undefined") {
 // when several files set one name, the value of the file that comes last in glue order wins,
 // whichever order they run in — the result every file running eagerly, in order, gave.
 let __glueIndex = 0;
+// A registry value computed on its first `get`, for a name whose value is costly to build.
+class __LazyValue {
+  constructor(make) {
+    this.make = make;
+  }
+}
+function __lazyValue(make) {
+  return new __LazyValue(make);
+}
 class __GlueRegistry extends Map {
   constructor() {
     super();
@@ -111,7 +120,13 @@ class __GlueRegistry extends Map {
   get(key) {
     const pending = this.pending.get(key);
     if (pending !== undefined) for (const rec of [...pending]) __glueRun(rec);
-    return super.get(key);
+    const value = super.get(key);
+    if (value instanceof __LazyValue) {
+      const made = value.make();
+      super.set(key, made);
+      return made;
+    }
+    return value;
   }
   has(key) {
     return super.has(key) || this.pending.has(key);
@@ -190,6 +205,9 @@ function __lazyGlue(index, builtins, internals, globals, init) {
 const __builtins = new __GlueRegistry();
 // Glue-internal values shared between the wrapped builtin files (never user-requirable).
 const __internals = new __GlueRegistry();
+// Shared by util.promisify and the builtins that annotate callback signatures (fs), which must not
+// load util to name it.
+__internals.set("customPromisifyArgs", Symbol("customPromisifyArgs"));
 
 // libuv's error table (uv_err_name / uv_strerror): name -> description, and the negative errno
 // each platform's libuv reports (Windows uses libuv's own -40xx range; Unix negates errno). Names
@@ -625,10 +643,14 @@ const __validators = (() => {
 // accessor. `Symbol<Name>` keys name well-known symbols. The `Safe*` classes are the plain ones:
 // the guarantee they add (immunity to user monkey-patching of the prototypes) is not observable
 // to the tests that exercise this glue.
+// Bound `call`/`apply`, as Node's: a primordial is one bound-function object instead of a closure
+// and its scope, and calls run natively. Captured now, before a program can patch `Function`.
+const __uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
+const __applyBind = Function.prototype.bind.bind(Function.prototype.apply);
 function __primordialsResolver() {
 "lumen:run-once";
-  const uncurryThis = (fn) => function (thisArg, ...args) { return Reflect.apply(fn, thisArg, args); };
-  const applyBind = (fn) => function (thisArg, args) { return Reflect.apply(fn, thisArg, args); };
+  const uncurryThis = __uncurryThis;
+  const applyBind = __applyBind;
   const TypedArray = Object.getPrototypeOf(Uint8Array);
   const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
   const IteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
@@ -818,4 +840,26 @@ function __initByCopy(Class) {
     Twin.prototype = Object.getPrototypeOf(self);
     Object.defineProperties(self, Object.getOwnPropertyDescriptors(Reflect.construct(Class, args, Twin)));
   };
+}
+
+// The user-timing methods perf_hooks adds to the global `performance` exist before anything
+// requires it: touching one builds perf_hooks, which installs the real methods in their place.
+{
+  const perf = globalThis.performance;
+  const names = ["mark", "measure", "clearMarks", "clearMeasures", "getEntries", "getEntriesByName",
+    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming"];
+  const materialize = () => {
+    for (const n of names) delete perf[n];
+    __builtins.get("perf_hooks");
+  };
+  if (perf && typeof perf.mark !== "function") {
+    for (const name of names) {
+      Object.defineProperty(perf, name, {
+        get() { materialize(); return perf[name]; },
+        set(value) { materialize(); perf[name] = value; },
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
 }

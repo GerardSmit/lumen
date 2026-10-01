@@ -6,7 +6,7 @@
 // the same way.
 
 const EE = __builtins.get("events");
-const { StringDecoder } = __builtins.get("string_decoder");
+const newStringDecoder = (encoding) => new (__builtins.get("string_decoder").StringDecoder)(encoding);
 const {
   ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_RETURN_VALUE, ERR_MISSING_ARGS,
   ERR_METHOD_NOT_IMPLEMENTED, ERR_MULTIPLE_CALLBACK, ERR_OUT_OF_RANGE, ERR_STREAM_ALREADY_FINISHED,
@@ -1278,7 +1278,7 @@ function ReadableState(options, stream, isDuplex) {
   this.decoder = null;
   this.encoding = null;
   if (options && options.encoding) {
-    this.decoder = new StringDecoder(options.encoding);
+    this.decoder = newStringDecoder(options.encoding);
     this.encoding = options.encoding;
   }
 }
@@ -1444,7 +1444,7 @@ Readable.prototype.isPaused = function () {
 
 // Backwards compatibility.
 Readable.prototype.setEncoding = function (enc) {
-  const decoder = new StringDecoder(enc);
+  const decoder = newStringDecoder(enc);
   this._readableState.decoder = decoder;
   // If setEncoding(null), decoder.encoding equals utf8.
   this._readableState.encoding = this._readableState.decoder.encoding;

@@ -346,17 +346,15 @@ struct Job {
     gc: std::sync::Arc<crate::value::GcState>,
     templates: std::sync::Arc<crate::parser::TemplateSites>,
     views: std::sync::Arc<crate::lstr::ViewRegistry>,
-    /// The driver's `Symbol.for` registry and table of registered precompiled chunks (see
-    /// `interpreter::sym_for_enter`, `serialize::lazy_enter`).
+    /// The driver's `Symbol.for` registry (see `interpreter::sym_for_enter`).
     syms: DriverTable,
-    lazy: DriverTable,
     body: SendBody,
     resume_rx: Receiver<Resume>,
     suspend_tx: Sender<WorkerMessage>,
 }
 
-/// A driver's thread-local table (`Symbol.for` registry, registered precompiled chunks), used by
-/// the worker only while the driver is parked.
+/// A driver's thread-local table (the `Symbol.for` registry), used by the worker only while the
+/// driver is parked.
 struct DriverTable(*const ());
 unsafe impl Send for DriverTable {}
 
@@ -573,12 +571,11 @@ mod idle_tests {
     }
 }
 
-struct RestoreDriverTables(*const (), *const ());
+struct RestoreDriverTables(*const ());
 
 impl Drop for RestoreDriverTables {
     fn drop(&mut self) {
         crate::interpreter::sym_for_enter(self.0 as *const _);
-        crate::bytecode::serialize::lazy_enter(self.1);
     }
 }
 
@@ -620,16 +617,13 @@ fn run_job(job: Job) {
         templates,
         views,
         syms,
-        lazy,
         body,
         resume_rx,
         suspend_tx,
     } = job;
-    // The body's `Symbol.for` and precompiled-chunk lookups must see the driver's tables, not
-    // this thread's.
+    // The body's `Symbol.for` lookups must see the driver's table, not this thread's.
     let _restore_syms = RestoreDriverTables(
         crate::interpreter::sym_for_enter(syms.0 as *const _) as *const (),
-        crate::bytecode::serialize::lazy_enter(lazy.0),
     );
     let SendBody(body) = body;
     // Everything this job drops — the captured closure on an undriven job, the values a body
@@ -698,7 +692,6 @@ pub fn spawn_coroutine(interp: *mut Interp, body: SendBody) -> std::io::Result<C
         templates: crate::parser::template_sites_handle(),
         views: crate::lstr::view_registry_handle(),
         syms: DriverTable(crate::interpreter::sym_for_handle() as *const ()),
-        lazy: DriverTable(crate::bytecode::serialize::lazy_handle()),
         body,
         resume_rx,
         suspend_tx,
