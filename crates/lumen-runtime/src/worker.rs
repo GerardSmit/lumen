@@ -644,152 +644,24 @@ pub(crate) fn extension() -> Extension {
             ],
         )],
         state_init: Some(|state| state.put(WorkerRegistry::default())),
-        js_init: Some(WORKER_JS),
-        js_init_snapshot: None,
+        js_init: None,
+        js_init_snapshot: Some(WORKER_AOT),
     }
 }
 
-/// The main-side web `Worker` class. Captures `__worker` (removing it from global scope, but
+/// js/worker.js, precompiled by build.rs: the main-side web `Worker` class. Captures `__worker` (removing it from global scope, but
 /// stashing a hidden handle for the node glue's worker_threads Worker, whose js_init ran earlier
 /// and grabs the ops lazily on first use) and drives the message bridge through the
 /// structured-clone wire format.
-const WORKER_JS: &str = r#"
-(() => {
-  "use strict";
-  const __worker = globalThis.__worker;
-  delete globalThis.__worker;
-  // node:worker_threads (lumen-node glue) drives the same ops; hand them over via a hidden global.
-  Object.defineProperty(globalThis, "__lumenWorkerOps", {
-    value: __worker, configurable: true, enumerable: false, writable: false,
-  });
-  const serialize = (value, transfer) => globalThis.__serializeForClone(value, transfer, true);
-  const deserialize = (bytes) => globalThis.__deserializeClone(bytes);
-
-  const defineWorker = () => {
-  class Worker extends EventTarget {
-    #id;
-    #terminated = false;
-    constructor(scriptURL, options = {}) {
-      super();
-      if (arguments.length === 0) throw new TypeError("Worker requires a scriptURL");
-      options = options && typeof options === "object" ? options : {};
-      const isModule = options.type === "module";
-      let path = String(scriptURL);
-      if (path.startsWith("file://")) path = path.slice(7);
-      this.#id = __worker.spawn(path, isModule, (kind, ...args) => this.#onEvent(kind, args)).id;
-    }
-    postMessage(message, _transfer) {
-      if (this.#terminated) return;
-      let bytes;
-      try { bytes = serialize(message); }
-      catch (e) { throw e; } // DataCloneError surfaces to the caller
-      __worker.post(this.#id, bytes);
-    }
-    terminate() {
-      if (this.#terminated) return;
-      this.#terminated = true;
-      __worker.terminate(this.#id);
-    }
-    #fire(type, event) {
-      const h = this["on" + type];
-      if (typeof h === "function") { try { h.call(this, event); } catch (e) { reportError(e); } }
-      this.dispatchEvent(event);
-    }
-    #onEvent(kind, args) {
-      // A message the worker posted before `terminate()` reached it may still be in flight;
-      // a terminated Worker dispatches nothing but its exit.
-      if (this.#terminated && kind !== "exit") return;
-      if (kind === "message") {
-        let data;
-        try { data = deserialize(args[0]); }
-        catch { this.#fire("messageerror", new MessageEvent("messageerror", {})); return; }
-        this.#fire("message", new MessageEvent("message", { data }));
-      } else if (kind === "error") {
-        this.#fire("error", new ErrorEvent("error", { message: args[0] }));
-      } else if (kind === "exit") {
-        this.#terminated = true;
-      }
-      // "online" is a node-mode event; the web Worker has no counterpart and ignores it.
-    }
-  }
-  for (const name of ["message", "messageerror", "error"]) {
-    Object.defineProperty(Worker.prototype, "on" + name, {
-      configurable: true, enumerable: true, writable: true, value: null,
-    });
-  }
-  Object.defineProperty(globalThis, "Worker", { value: Worker, writable: true, enumerable: true, configurable: true });
-  };
-  // The class extends EventTarget, so it is built when first used (see lumen-web's `__lazyWeb`).
-  Object.defineProperty(globalThis, "Worker", {
-    get() { defineWorker(); return globalThis.Worker; },
-    set(value) { Object.defineProperty(globalThis, "Worker", { value, writable: true, enumerable: true, configurable: true }); },
-    enumerable: true, configurable: true,
-  });
-})();
-"#;
+const WORKER_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/worker.aot"));
 
 /// The DedicatedWorkerGlobalScope surface, evaluated inside each *web* worker realm (see
-/// `run_worker`).
-const WORKER_SCOPE_JS: &str = r#"
-(() => {
-  "use strict";
-  const post = __wself.post;
-  const closeSelf = __wself.close;
-  const report = __wself.report;
-  delete globalThis.__wself;
-  const serialize = (value, transfer) => globalThis.__serializeForClone(value, transfer, true);
-  const deserialize = (bytes) => globalThis.__deserializeClone(bytes);
+/// `run_worker`). Evaluated from source: loading a precompiled blob in every worker costs more
+/// memory per worker than parsing these few lines.
+const WORKER_SCOPE_JS: &str = include_str!("js/worker_scope.js");
 
-  // The global scope acts as an EventTarget for message/messageerror/error.
-  let scopeTarget;
-  const target = {
-    addEventListener: (...args) => (scopeTarget ??= new EventTarget()).addEventListener(...args),
-    removeEventListener: (...args) => (scopeTarget ??= new EventTarget()).removeEventListener(...args),
-    dispatchEvent: (event) => (scopeTarget ??= new EventTarget()).dispatchEvent(event),
-  };
-  globalThis.addEventListener = target.addEventListener;
-  globalThis.removeEventListener = target.removeEventListener;
-  globalThis.dispatchEvent = target.dispatchEvent;
-
-  globalThis.postMessage = (message, _transfer) => { post(serialize(message)); };
-  globalThis.close = () => closeSelf();
-  globalThis.onmessage = null;
-  globalThis.onmessageerror = null;
-
-  const fire = (type, event) => {
-    const h = globalThis["on" + type];
-    if (typeof h === "function") { try { h.call(globalThis, event); } catch (e) { reportError(e); } }
-    target.dispatchEvent(event);
-  };
-
-  globalThis.__workerDispatchMessage = (bytes) => {
-    if (bytes === false) return; // channel-closed sentinel
-    let data;
-    try { data = deserialize(bytes); }
-    catch { fire("messageerror", new MessageEvent("messageerror", {})); return; }
-    fire("message", new MessageEvent("message", { data }));
-  };
-
-  // A worker-side uncaught error propagates to the parent's Worker.onerror.
-  globalThis.onerror = (message) => { report(String(message)); return true; };
-})();
-"#;
-
-/// The node worker bootstrap, evaluated inside each *node* worker realm: hands the `__wself` ops,
-/// the thread id, and the init payload to the hook the node glue installed
+/// The node worker bootstrap, evaluated (from source, like the web scope) inside each *node*
+/// worker realm: hands the `__wself` ops, the thread id, and the init payload to the hook the node glue installed
 /// (`__lumenInitWorkerThread`, see lumen-node/src/js/worker_threads.js), which wires parentPort/
 /// workerData/process and returns the inbox dispatcher.
-const NODE_WORKER_SCOPE_JS: &str = r#"
-(() => {
-  "use strict";
-  const wself = globalThis.__wself;
-  delete globalThis.__wself;
-  const threadId = globalThis.__lumenWorkerThreadId;
-  delete globalThis.__lumenWorkerThreadId;
-  const initBytes = globalThis.__lumenWorkerInit;
-  delete globalThis.__lumenWorkerInit;
-  const hook = globalThis.__lumenInitWorkerThread;
-  if (typeof hook !== "function") throw new Error("node worker glue is not installed");
-  globalThis.__workerDispatchMessage = hook(wself, threadId, initBytes);
-})();
-"#;
+const NODE_WORKER_SCOPE_JS: &str = include_str!("js/node_worker_scope.js");

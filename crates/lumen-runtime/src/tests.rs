@@ -181,6 +181,97 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
 }
 
 #[test]
+fn process_emitter_materializes_on_first_use_with_the_same_observable_state() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        console.log(process.listenerCount("exit"), process.listenerCount("warning"), process.emit("exit"), process.emit("beforeExit"));
+        let thrown = "";
+        try { process.emit("error", new Error("unheard")); } catch (e) { thrown = e.message; }
+        console.log(thrown);
+        console.log(Object.keys(process).filter((k) => k.startsWith("_event") || k === "_maxListeners").join());
+        console.log(process.on("SIGINT", () => {}) === process, process.listenerCount("SIGINT"));
+        console.log(process.eventNames().map(String).join());
+        const EE = require("events");
+        console.log(require("node:events") === EE, process.emit === EE.prototype.emit, process._eventsCount);
+        process.on("warning", (w) => console.log("user", w.message));
+        const listeners = process.listeners("warning");
+        console.log(listeners.length, listeners[0].name === "", listeners[0] !== listeners[1]);
+        process.emitWarning("careful");
+        "#,
+    );
+    rt.run_to_completion();
+    assert_eq!(
+        out.lines(),
+        [
+            "0 1 false false",
+            "unheard",
+            "_events,_eventsCount,_maxListeners",
+            "true 1",
+            "warning,SIGINT",
+            "true true 2",
+            "2 true true",
+            "user careful",
+        ]
+    );
+    assert_eq!(err.lines().len(), 2, "{:?}", err.lines());
+    assert!(err.lines()[0].ends_with("Warning: careful"), "{:?}", err.lines());
+
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        process.emitWarning("alone");
+        process.on("exit", (c) => console.log("exit", c));
+        "#,
+    );
+    rt.run_to_completion();
+    assert_eq!(rt.finish_process(), 0);
+    assert_eq!(out.lines(), ["exit 0"]);
+    assert!(err.lines()[0].ends_with("Warning: alone"), "{:?}", err.lines());
+}
+
+#[test]
+fn module_loader_path_math_matches_node_path() {
+    let dir = TempDir::new("loader-path");
+    std::fs::create_dir_all(std::path::Path::new(&dir.path("a/b"))).unwrap();
+    std::fs::write(dir.path("a/b/c.js"), "module.exports = __filename + '|' + __dirname;").unwrap();
+    std::fs::write(dir.path("a/d.json"), "{}").unwrap();
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        &format!(
+            r#"
+            const path = require("path");
+            const Module = require("module");
+            const root = require("fs").realpathSync({root:?});
+            const from = path.join(root, "a", "x//y", "..", "..");
+            const req = Module.createRequire(path.join(from, "entry.js"));
+            console.log(req.resolve("./b//c.js") === path.join(root, "a", "b", "c.js"));
+            console.log(req.resolve("./b/./../b/c") === path.join(root, "a", "b", "c.js"));
+            console.log(req.resolve("../a/d") === path.join(root, "a", "d.json"));
+            console.log(req(path.join(root, "a/b/c.js")) === [path.join(root, "a/b/c.js"), path.join(root, "a/b")].join("|"));
+            const walk = (start) => {{
+                const expected = [];
+                for (let d = path.resolve(start); ; d = path.dirname(d)) {{
+                    if (path.basename(d) !== "node_modules") expected.push(path.join(d, "node_modules"));
+                    if (path.dirname(d) === d) break;
+                }}
+                return expected;
+            }};
+            for (const start of [from, path.join(root, "a", "node_modules", "p"), "rel//x/../y", "/", "/a/"]) {{
+                console.log(JSON.stringify(Module._nodeModulePaths(start)) === JSON.stringify(walk(start)));
+            }}
+            console.log(Module.globalPaths.every((p) => typeof p === "string"));
+            "#,
+            root = dir.path("")
+        ),
+    );
+    assert_eq!(out.lines(), vec!["true"; 10]);
+}
+
+#[test]
 fn spawn_blocking_completion_settles_on_the_loop() {
     let (mut rt, out, _err) = test_runtime();
     eval_ok(

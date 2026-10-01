@@ -181,9 +181,9 @@ fn real_main() {
                 "(function (r) {{ process.on(\"exit\", function () {{ console.log(r); }}); }})((0, eval)({}));",
                 js_string_literal(&code)
             );
-            run_source(&mut runtime, &wrapped);
+            run_source(runtime, &wrapped);
         } else {
-            run_source(&mut runtime, &code);
+            run_source(runtime, &code);
         }
     } else if let Some(path) = file {
         if !std::path::Path::new(&path).is_file() {
@@ -206,9 +206,7 @@ fn real_main() {
         let code = runtime.finish_process();
         exit_if_timed_out();
         mem_report(&mut runtime);
-        if code != 0 {
-            std::process::exit(code);
-        }
+        runtime.exit(code);
     } else if force_repl || std::io::stdin().is_terminal() {
         println!(
             "lumen {} (.help for help, .exit or Ctrl-D to quit)",
@@ -221,7 +219,7 @@ fn real_main() {
         if std::io::stdin().read_to_string(&mut src).is_err() {
             die(2, "cannot read stdin");
         }
-        run_source(&mut runtime, &src);
+        run_source(runtime, &src);
     }
 }
 
@@ -254,15 +252,13 @@ fn js_string_literal(s: &str) -> String {
 
 /// Evaluate + loop to quiescence; uncaught top-level throws exit 1 (console output already
 /// streamed as the script ran).
-fn run_source(runtime: &mut Runtime, src: &str) {
+fn run_source(mut runtime: Runtime, src: &str) {
     match runtime.eval(src) {
         Ok(Completion::Value(_)) => {
             let code = runtime.finish_process();
             exit_if_timed_out();
-            mem_report(runtime);
-            if code != 0 {
-                std::process::exit(code);
-            }
+            mem_report(&mut runtime);
+            runtime.exit(code);
         }
         Ok(Completion::Throw { name, message }) => {
             if name.is_empty() {

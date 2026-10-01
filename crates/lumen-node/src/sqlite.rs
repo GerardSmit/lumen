@@ -304,6 +304,13 @@ impl SqliteState {
     }
 }
 
+/// Close every open database now, as dropping the state would.
+pub(crate) fn close_all(ctx: &mut Ctx) {
+    if let Some(state) = ctx.host_mut::<SqliteState>() {
+        *state = SqliteState::default();
+    }
+}
+
 /// Fetch (or lazily install) the `SqliteState`.
 fn state(ctx: &mut Ctx) -> &mut SqliteState {
     if ctx.host_mut::<SqliteState>().is_none() {

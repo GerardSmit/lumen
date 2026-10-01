@@ -48,6 +48,7 @@ mod fsb;
 mod native;
 mod net;
 mod password;
+mod pathops;
 #[cfg(feature = "bun")]
 mod sqlite;
 mod tls;
@@ -78,6 +79,11 @@ pub fn extension() -> Extension {
                     "readBytes" (1) => op_read_bytes,
                     "stripShebang" (1) => op_strip_shebang,
                     "realpath" (1) => op_realpath,
+                    "pathResolve" (0) => pathops::op_resolve,
+                    "pathJoin" (0) => pathops::op_join,
+                    "pathDirname" (1) => pathops::op_dirname,
+                    "pathBasename" (2) => pathops::op_basename,
+                    "pathExtname" (1) => pathops::op_extname,
                     "loadNativeAddon" (1) => napi::op_load_addon,
                     "isProxy" (1) => op_is_proxy,
                     "nameSource" (2) => op_name_source,
@@ -1425,3 +1431,11 @@ fn op_realm_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, V
 
 /// Finalize native addon producers while the owning realm remains alive.
 pub fn shutdown_native_addons(ctx: &mut Ctx) { napi::shutdown(ctx); }
+
+/// What dropping the realm does besides freeing memory — addon cleanup hooks, then closing open
+/// SQLite databases (which checkpoints their write-ahead logs) — for an exit that skips the drop.
+pub fn shutdown_native_resources(ctx: &mut Ctx) {
+    napi::shutdown(ctx);
+    #[cfg(feature = "bun")]
+    sqlite::close_all(ctx);
+}

@@ -34,7 +34,7 @@ const JS_FILES: &[GlueFile] = &[
     },
     GlueFile {
         name: "path.js",
-        wrap: false,
+        wrap: true,
     },
     GlueFile {
         name: "os.js",
@@ -239,6 +239,8 @@ const JS_FILES: &[GlueFile] = &[
 /// globals other than the ones it defines. Each lazy file costs nothing (not even its decoded
 /// AST) until a program touches it, which is most of the node glue for most programs.
 const LAZY: &[&str] = &[
+    "path.js",
+    "events.js",
     "os.js",
     "esm_exports.js",
     "diagnostics_channel.js",

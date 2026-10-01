@@ -36,6 +36,22 @@ mod worker;
 mod ports;
 mod clone_transfer;
 
+/// js/error_shim.js, precompiled by build.rs.
+const ERROR_SHIM_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/error_shim.aot"));
+
+/// Run a script precompiled by build.rs, in the tree-walker like extension glue (its setup path
+/// runs once, so compiling it would be wasted).
+pub(crate) fn run_aot(
+    engine: &mut Engine,
+    blob: &'static [u8],
+) -> Result<lumen::Completion, lumen::ParseError> {
+    let tier = engine.tier();
+    engine.set_tier(lumen_host::Tier::Interp);
+    let result = engine.load_precompiled(&lumen::Precompiled::from_static(blob));
+    engine.set_tier(tier);
+    result
+}
+
 pub use console::{describe_error, render_value, ConsoleOut};
 pub use lumen_host::{Completion, Ctx, RealmProcess, Spawner};
 
@@ -204,6 +220,19 @@ impl Drop for Runtime {
     }
 }
 
+impl Runtime {
+    /// End the process with `code` without tearing the realm down (freeing every object and
+    /// collecting its cycles is wasted work when the OS reclaims the address space). A clean
+    /// exit still runs what the drop would: addon cleanup hooks and closing SQLite databases.
+    /// Standard output and error are flushed by `process::exit`.
+    pub fn exit(mut self, code: i32) -> ! {
+        if code == 0 {
+            lumen_node::shutdown_native_resources(self.engine.ctx());
+        }
+        std::process::exit(code)
+    }
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
@@ -337,89 +366,7 @@ impl Runtime {
         // `unhandledrejection`'s `event.preventDefault()`); the loop's uncaught/rejection
         // reporting consults them through handles grabbed (and then unglobaled) below. A throw
         // inside a handler never re-enters it — the original error still default-reports.
-        engine
-            .eval(
-                r#"
-                globalThis.onerror = null;
-                globalThis.onunhandledrejection = null;
-                // Node's process-level hooks come first: a registered 'uncaughtException' /
-                // 'unhandledRejection' listener owns the error, exactly as it does in Node.
-                const processHas = (event) => {
-                    const p = globalThis.process;
-                    return !!(p && typeof p.listenerCount === 'function' && p.listenerCount(event) > 0);
-                };
-                globalThis.__lumen_fire_error = function (error, origin = 'uncaughtException') {
-                    // node:domain: an error thrown inside a domain goes to its 'error' handler.
-                    const toDomain = globalThis.__lumen_domain_uncaught;
-                    if (typeof toDomain === 'function') {
-                        try {
-                            if (toDomain(error)) return true;
-                        } catch {
-                            return false;
-                        }
-                    }
-                    if (processHas('uncaughtException')) {
-                        try {
-                            globalThis.process.emit('uncaughtException', error, origin);
-                            return true;
-                        } catch {
-                            return false;
-                        }
-                    }
-                    const h = globalThis.onerror;
-                    if (typeof h !== 'function') return false;
-                    let message = '';
-                    try {
-                        message =
-                            error instanceof Error
-                                ? `Uncaught ${error.name}: ${error.message}`
-                                : `Uncaught ${String(error)}`;
-                    } catch {}
-                    try {
-                        return h.call(globalThis, message, '', 0, 0, error) === true;
-                    } catch {
-                        return false;
-                    }
-                };
-                globalThis.__lumen_fire_rejection = function (promise, reason) {
-                    if (processHas('unhandledRejection')) {
-                        try {
-                            globalThis.process.emit('unhandledRejection', reason, promise);
-                            return true;
-                        } catch {
-                            return false;
-                        }
-                    }
-                    const h = globalThis.onunhandledrejection;
-                    if (typeof h !== 'function') return false;
-                    let prevented = false;
-                    const event = {
-                        type: 'unhandledrejection',
-                        promise,
-                        reason,
-                        cancelable: true,
-                        preventDefault() { prevented = true; },
-                        get defaultPrevented() { return prevented; },
-                    };
-                    try {
-                        h.call(globalThis, event);
-                    } catch {}
-                    return prevented;
-                };
-                {
-                    const fire = globalThis.__lumen_fire_error;
-                    const report = console.__reportUncaught;
-                    delete console.__reportUncaught;
-                    globalThis.reportError = function reportError(e) {
-                        if (arguments.length === 0)
-                            throw new TypeError('reportError requires at least 1 argument');
-                        if (!fire(e)) report(e);
-                    };
-                }
-                "#,
-                false,
-            )
-            .expect("error-reporting shim parses");
+        run_aot(&mut engine, ERROR_SHIM_AOT).expect("error-reporting shim loads");
         let global = engine.global_this();
         let fire_error = engine
             .ctx()

@@ -616,18 +616,55 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
 
 // ---- node:process ----------------------------------------------------------------------------
 // Node's `process` is an EventEmitter (SIGINT/exit/beforeExit/…). lumen builds `process` in Rust
-// without that surface, so mix the emitter methods in here. Signals never fire (no handler
+// without that surface, so the emitter methods are mixed in here. Signals never fire (no handler
 // plumbing), but registering/removing listeners no longer throws, which is what tools rely on.
+// The methods start as stubs: `events` loads, and the default 'warning' listener registers, the
+// first time a program uses the emitter. Until then the process holds exactly that one listener,
+// so `emit` of anything else is false and `listenerCount` is 0 without loading anything.
 {
-  const EventEmitter = __builtins.get("events");
   const proc = globalThis.process;
   const EMITTER_METHODS = [
     "on", "off", "once", "emit", "addListener", "removeListener", "removeAllListeners",
     "prependListener", "prependOnceListener", "listeners", "rawListeners", "listenerCount",
     "eventNames", "setMaxListeners", "getMaxListeners",
   ];
+  const BOOKKEEPING = ["_events", "_eventsCount", "_maxListeners"];
+  let EventEmitter = null;
+  let defaultWarningListener;
+  const stubs = new Map();
+  const materialize = () => {
+    if (EventEmitter !== null) return;
+    EventEmitter = __builtins.get("events");
+    // EventEmitter bookkeeping fields Node exposes as own keys (methods lazily init these too).
+    Object.defineProperty(proc, "_events", { value: Object.create(null), writable: true, enumerable: true, configurable: true });
+    Object.defineProperty(proc, "_eventsCount", { value: 0, writable: true, enumerable: true, configurable: true });
+    Object.defineProperty(proc, "_maxListeners", { value: undefined, writable: true, enumerable: true, configurable: true });
+    for (const [m, stub] of stubs) if (proc[m] === stub) proc[m] = EventEmitter.prototype[m];
+    EventEmitter.prototype.on.call(proc, "warning", defaultWarningListener);
+  };
+  const quiet = (self, type) => EventEmitter === null && self === proc && type !== "warning" && type !== "error";
   for (const m of EMITTER_METHODS) {
-    if (typeof proc[m] !== "function") proc[m] = EventEmitter.prototype[m];
+    if (typeof proc[m] === "function") continue;
+    const stub = ({
+      [m]: function (...args) {
+        if (m === "emit" && quiet(this, args[0])) return false;
+        if (m === "listenerCount" && quiet(this, args[0])) return 0;
+        materialize();
+        return Reflect.apply(EventEmitter.prototype[m], this, args);
+      },
+    })[m];
+    stubs.set(m, stub);
+    proc[m] = stub;
+  }
+  if (proc._events === undefined) {
+    for (const key of BOOKKEEPING) {
+      Object.defineProperty(proc, key, {
+        get() { materialize(); return proc[key]; },
+        set(value) { materialize(); proc[key] = value; },
+        enumerable: true,
+        configurable: true,
+      });
+    }
   }
 
   // ---- fuller node:process surface ----------------------------------------------------------
@@ -637,13 +674,6 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
   // metrics, and Node-shaped stubs for surfaces lumen can't back with real data. Nothing here
   // fabricates plausible-but-false numbers — unmeasured metrics report 0 / [] and unsupported
   // operations throw.
-
-  // EventEmitter bookkeeping fields Node exposes as own keys (methods above lazily init these too).
-  if (proc._events === undefined) {
-    proc._events = Object.create(null);
-    proc._eventsCount = 0;
-    proc._maxListeners = undefined;
-  }
 
   // argv0/execPath/title are stamped by the Rust data-prop pass (which, unlike this glue, runs
   // after argv is populated). execArgv — the runtime flags before the script — is empty for lumen.
@@ -774,7 +804,8 @@ __lazyGlue(__glueIndex, "readline readline/promises", "", "", () => {
       }
       proc.nextTick(() => proc.emit("warning", warning));
     };
-    proc.on("warning", function (warning) {
+    // Anonymous, like the `proc.on("warning", function (warning) {…})` it stands for.
+    defaultWarningListener = (0, function (warning) {
       if (hasFlag("--no-warnings") || (proc.env && proc.env.NODE_NO_WARNINGS === "1")) return;
       onWarning(warning);
     });

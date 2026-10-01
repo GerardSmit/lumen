@@ -18,6 +18,10 @@ lumen-node = { path = "../lumen-node", default-features = false }
 lumen-timers = { path = "../lumen-timers" }
 lumen-web = { path = "../lumen-web" }
 
+# Build-only: build.rs precompiles the embedded JS (no runtime dep).
+[build-dependencies]
+lumen = { path = "../lumen" }
+
 [dev-dependencies]
 # tests/async_ops.rs binds its ops with #[lumen::op].
 lumen = { path = "../lumen", features = ["macros"] }

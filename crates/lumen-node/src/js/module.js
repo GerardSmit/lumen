@@ -6,7 +6,16 @@
 // `new Function(exports, require, module, __filename, __dirname)` wrapper, exactly as Node's
 // does.
 
-const path = __builtins.get("path");
+// The loader's posix path needs are native, so `node:path` loads only when a program asks for it.
+const path = __os.info().platform === "win32" ? __builtins.get("path") : {
+  delimiter: ":",
+  isAbsolute: (p) => String(p).startsWith("/"),
+  resolve: __node.pathResolve,
+  join: __node.pathJoin,
+  dirname: __node.pathDirname,
+  basename: __node.pathBasename,
+  extname: __node.pathExtname,
+};
 const CORE = new Set([...__builtins.keys()]);
 // resolved filename -> module. A plain null-prototype object, exposed live as `require.cache`
 // and `Module._cache`, so `delete require.cache[file]` forces the next require to re-run it.
