@@ -189,7 +189,7 @@ impl Interp {
         let o = ManuallyDrop::new(unsafe { Gc::from_raw(p) });
         {
             let b = o.borrow();
-            visit_object_head(&b, &mut |c| tr.mark_obj(c));
+            visit_object_head(&b, true, &mut |c| tr.mark_obj(c));
             if let Some(next) = b
                 .props
                 .visit_object_refs(0, MARK_STEP, &mut |c| tr.mark_obj(c))
@@ -423,10 +423,13 @@ impl Interp {
         }
         // Sweep garbage scopes the same way: emptying them breaks env-involving cycles.
         for e in &dead_scopes {
-            let mut b = e.borrow_mut();
-            b.vars.clear();
-            b.parent = None;
-            b.clear_with_obj();
+            let imports = {
+                let mut b = e.borrow_mut();
+                b.vars.clear();
+                b.parent = None;
+                b.clear_rare_edges()
+            };
+            drop(imports);
         }
         // Release the garbage first: only then do swept objects and their property buffers
         // reach the allocator's free lists. A high threshold confines the expensive platform
@@ -496,5 +499,83 @@ impl Interp {
                 shown += 1;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(interp: &mut Interp, src: &str) {
+        let body = crate::parser::parse_script(src, false).expect("parse");
+        assert!(interp.run_program_parsed(&body).is_ok(), "script threw");
+    }
+
+    /// Side-table names with an entry whose key is no live object. `regexps` is exempt: its
+    /// entries are tied to a weak handle and pruned lazily.
+    fn stale_side_tables(interp: &Interp) -> Vec<&'static str> {
+        let mut live = std::collections::HashSet::new();
+        value::gc_for_each_live(|o| {
+            live.insert(Gc::as_ptr(o) as usize);
+        });
+        let mut stale = Vec::new();
+        macro_rules! check {
+            ($($table:ident),*) => {$(
+                if interp.$table.keys().any(|k| !live.contains(k)) {
+                    stale.push(stringify!($table));
+                }
+            )*};
+        }
+        check!(
+            class_info,
+            map_data,
+            typed_arrays,
+            data_views,
+            proxies,
+            temporal,
+            array_buffers,
+            ta_buffer,
+            shared_buffers,
+            generators,
+            mapped_arguments,
+            deferred_ns,
+            module_ns,
+            gc_pins
+        );
+        stale
+    }
+
+    /// A sweep frees a marked object only when a garbage object's own entry or closure was its
+    /// sole holder; such an object has no entries of its own, because anything with a side-table
+    /// entry is pinned (`gc_pin`) and so dies only in a sweep that evicts the entries first.
+    #[test]
+    fn objects_freed_with_their_garbage_holder_leave_no_side_table_entries() {
+        let mut interp = Interp::new();
+        run(
+            &mut interp,
+            "(function () {
+               for (let round = 0; round < 3; round++) {
+                 for (let i = 0; i < 200; i++) {
+                   const m = new Map([[i, i]]), s = new Set([m]), w = new WeakMap([[m, s]]);
+                   const px = new Proxy(m, {});
+                   const ta = new Uint8Array(new ArrayBuffer(8));
+                   const dv = new DataView(ta.buffer);
+                   const arrayBuffer = new ArrayBuffer(4), view = new Int8Array(arrayBuffer);
+                   function* g() { yield px; }
+                   const it = g(); it.next();
+                   class C { static #p = m; x = s; }
+                   const args = (function (a) { return arguments; })(1);
+                   const bound = function () {}.bind(null, m, px, ta, dv);
+                   const hold = { m, s, w, px, ta, dv, it, C, args, bound, view };
+                   hold.self = hold; m.set('hold', hold); px.hold = hold;
+                 }
+                 $262.gc();
+               }
+             })();",
+        );
+        for _ in 0..3 {
+            interp.gc_collect();
+        }
+        assert_eq!(stale_side_tables(&interp), Vec::<&str>::new());
     }
 }
