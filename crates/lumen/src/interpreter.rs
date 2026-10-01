@@ -264,9 +264,16 @@ impl Scope {
         self.rare.as_ref()?.with_obj.as_ref()
     }
 
-    pub(crate) fn clear_with_obj(&mut self) {
-        if let Some(r) = &mut self.rare {
-            r.with_obj = None;
+    /// Drop the references to other heap nodes held outside the binding map and parent link (a
+    /// `with` object, module import targets), returning the import targets so the caller can
+    /// release them once this scope is no longer borrowed.
+    pub(crate) fn clear_rare_edges(&mut self) -> Vec<(Rc<str>, (Env, String))> {
+        match &mut self.rare {
+            Some(r) => {
+                r.with_obj = None;
+                std::mem::take(&mut r.imports)
+            }
+            None => Vec::new(),
         }
     }
 

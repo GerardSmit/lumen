@@ -27,6 +27,7 @@ mod bigint;
 mod builtins;
 pub mod bytebuf;
 pub mod bytecode;
+mod console_fmt;
 mod coroutine;
 /// Typed Rust <-> JS conversions and the runtime of the binding macros (see [`embed`]).
 #[cfg(feature = "embed")]

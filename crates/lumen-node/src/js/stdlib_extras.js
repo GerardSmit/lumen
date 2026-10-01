@@ -1271,8 +1271,10 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     if (!this._writableState.emitClose) process.nextTick(() => this.emit("close"));
   }
   function createWritableStdioStream(fd) {
-    const tty = __builtins.get("tty");
-    const stream = tty && proc._isatty && proc._isatty(fd)
+    __internals.get("console_native").setLive(fd);
+    const isTTY = proc._isatty && proc._isatty(fd);
+    const tty = isTTY ? __builtins.get("tty") : undefined;
+    const stream = tty
       ? new tty.WriteStream(fd)
       : new (syncWriteStream())(fd, rawStdio[fd]);
     stream.fd = fd;
@@ -1291,6 +1293,8 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     configurable: true, enumerable: true,
     get() { return stderrStream ??= createWritableStdioStream(2); },
   });
+  __internals.get("console_native").watch(proc,
+    Object.getOwnPropertyDescriptor(proc, "stdout").get, Object.getOwnPropertyDescriptor(proc, "stderr").get);
 
   // child_process.fork IPC. Lumen has no extra inherited fd, so fork reserves stdin and frames
   // messages with a control-prefixed JSON line; ordinary stdout lines remain ordinary stdout.

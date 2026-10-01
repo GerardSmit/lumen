@@ -77,7 +77,12 @@ pub fn extension() -> Extension {
             ),
             (
                 "__encoding",
-                ops!["encode" (1) => op_encode, "decode" (2) => op_decode],
+                ops![
+                    "encode" (1) => op_encode,
+                    "decode" (2) => op_decode,
+                    "btoa" (1) => op_btoa,
+                    "atob" (1) => op_atob,
+                ],
             ),
             (
                 "__url",
@@ -256,6 +261,76 @@ fn smuggle_high_scalars(s: String) -> String {
         }
     }
     out
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Base64 of a Latin-1 string, or `null` when a char is past U+00FF.
+fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
+    let mut bytes = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        match u8::try_from(u32::from(c)) {
+            Ok(b) => bytes.push(b),
+            Err(_) => return Ok(Value::Null),
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(B64[(n >> 18) as usize & 63]);
+        out.push(B64[(n >> 12) as usize & 63]);
+        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] } else { b'=' });
+        out.push(if chunk.len() > 2 { B64[n as usize & 63] } else { b'=' });
+    }
+    Ok(Value::from_string(String::from_utf8(out).unwrap_or_default()))
+}
+
+/// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
+fn op_atob(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
+    let mut data: Vec<u8> = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ') {
+            continue;
+        }
+        if !c.is_ascii() {
+            return Ok(Value::Null);
+        }
+        data.push(c as u8);
+    }
+    if data.len() % 4 == 0 {
+        for _ in 0..2 {
+            if data.last() == Some(&b'=') {
+                data.pop();
+            }
+        }
+    }
+    if data.len() % 4 == 1 {
+        return Ok(Value::Null);
+    }
+    let mut out = String::with_capacity(data.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in &data {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Ok(Value::Null),
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(char::from((acc >> bits) as u8));
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Ok(Value::from_string(out))
 }
 
 // ---- url ----

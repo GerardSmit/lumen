@@ -4,8 +4,10 @@ use super::{Callable, Gc, Object, Property, Props, Value};
 use std::mem::ManuallyDrop;
 
 /// Visit the edges an object holds outside its property map: its prototype and the objects its
-/// call behavior references.
-pub(crate) fn visit_object_head(object: &Object, f: &mut impl FnMut(&Gc)) {
+/// call behavior references. With `reachable`, also the edges that keep a referent reachable
+/// without being a reference this object owns (see `Callable::Resolver` below): marking asks
+/// for those, reference counting must not.
+pub(crate) fn visit_object_head(object: &Object, reachable: bool, f: &mut impl FnMut(&Gc)) {
     if let Some(proto) = &object.proto {
         f(proto);
     }
@@ -24,10 +26,11 @@ pub(crate) fn visit_object_head(object: &Object, f: &mut impl FnMut(&Gc)) {
         // A promise's result and pending reactions are heap edges (its suspended coroutine, if
         // any, is not traced: what it holds counts as external, i.e. roots).
         Callable::Promise(slot) => slot.visit_object_refs(f),
-        // The pair shares one cell: only the resolve function reports its edge, so the count
-        // never exceeds the promise's real reference count (a lone reject function leaves the
-        // promise looking externally held, which is conservative).
-        Callable::Resolver(cell, true) => {
+        // The pair shares one cell holding a single reference: only the resolve function counts
+        // it, so the count never exceeds the promise's real reference count. Either function
+        // keeps the promise reachable, though: a live reject function must not leave it
+        // unmarked because its resolve function died in a cycle.
+        Callable::Resolver(cell, resolve) if *resolve || reachable => {
             if let Value::Obj(object) = &cell.promise {
                 f(object);
             }
@@ -38,7 +41,7 @@ pub(crate) fn visit_object_head(object: &Object, f: &mut impl FnMut(&Gc)) {
 
 /// Visit every edge of `object`. The caller must not mutate it meanwhile.
 pub(crate) fn visit_object_refs(object: &Object, f: &mut impl FnMut(&Gc)) {
-    visit_object_head(object, f);
+    visit_object_head(object, false, f);
     object.props.visit_object_refs(0, usize::MAX, f);
 }
 

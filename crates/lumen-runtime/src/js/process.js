@@ -5,6 +5,8 @@
   const rawExecve = proc.execve;
   const metrics = proc.metrics;
   delete globalThis.__proc;
+  const consoleOps = globalThis.__console;
+  delete globalThis.__console;
   const process = globalThis.process;
 
   // Node's `write(chunk[, encoding][, callback])` / `end([chunk][, encoding][, callback])`: the
@@ -41,6 +43,7 @@
   Object.defineProperty(process, "stdout", { value: makeStream(proc.writeStdout, 1), enumerable: true, configurable: true });
   Object.defineProperty(process, "stderr", { value: makeStream(proc.writeStderr, 2), enumerable: true, configurable: true });
   Object.defineProperty(process, "_tickCallback", { value: proc.tickCallback, writable: true, configurable: true });
+  Object.defineProperty(process, "_console", { value: consoleOps, configurable: true });
   Object.defineProperty(process, "_readStdin", { value: readStdin, configurable: true });
   Object.defineProperty(process, "_stdinRef", { value: stdinRef, configurable: true });
   Object.defineProperty(process, "_nativeMetrics", { value: metrics, configurable: true });

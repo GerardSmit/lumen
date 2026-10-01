@@ -287,41 +287,15 @@ function incompleteUtf8Tail(bytes) {
   return 0;
 }
 
-const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 function btoa(data) {
-  const s = String(data);
-  let out = "";
-  for (let i = 0; i < s.length; i += 3) {
-    const cs = [s.charCodeAt(i), s.charCodeAt(i + 1), s.charCodeAt(i + 2)];
-    if (cs[0] > 255 || cs[1] > 255 || cs[2] > 255) {
-      throw new DOMException("btoa: character beyond latin1 range", "InvalidCharacterError");
-    }
-    const n = (cs[0] << 16) | ((cs[1] || 0) << 8) | (cs[2] || 0);
-    out += B64_ALPHABET[(n >> 18) & 63];
-    out += B64_ALPHABET[(n >> 12) & 63];
-    out += i + 1 < s.length ? B64_ALPHABET[(n >> 6) & 63] : "=";
-    out += i + 2 < s.length ? B64_ALPHABET[n & 63] : "=";
-  }
+  const out = __encoding.btoa(data);
+  if (out === null) throw new DOMException("btoa: character beyond latin1 range", "InvalidCharacterError");
   return out;
 }
 
 function atob(data) {
-  let s = String(data).replace(/[\t\n\f\r ]/g, "");
-  if (s.length % 4 === 0) s = s.replace(/==?$/, "");
-  if (s.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(s)) {
-    throw new DOMException("atob: invalid base64", "InvalidCharacterError");
-  }
-  let out = "";
-  for (let i = 0; i < s.length; i += 4) {
-    const bits = [0, 1, 2, 3].map((j) =>
-      j + i < s.length ? B64_ALPHABET.indexOf(s[i + j]) : 0
-    );
-    const n = (bits[0] << 18) | (bits[1] << 12) | (bits[2] << 6) | bits[3];
-    out += String.fromCharCode((n >> 16) & 255);
-    if (i + 2 < s.length) out += String.fromCharCode((n >> 8) & 255);
-    if (i + 3 < s.length) out += String.fromCharCode(n & 255);
-  }
+  const out = __encoding.atob(data);
+  if (out === null) throw new DOMException("atob: invalid base64", "InvalidCharacterError");
   return out;
 }
 

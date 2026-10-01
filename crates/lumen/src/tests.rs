@@ -905,6 +905,28 @@ fn gc_collects_promise_cycles_and_keeps_pending_ones() {
 }
 
 #[test]
+fn gc_keeps_promise_reachable_through_a_lone_reject_function() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var rej, out = [];
+             (function () {
+               const holder = {}; holder.self = holder;
+               const p = new Promise((res, rej_) => { holder.res = res; rej = rej_; });
+               p.then(null, e => { out.push('rejected ' + e); });
+             })();
+             $262.gc();
+             rej(1);",
+            false,
+        )
+        .ok();
+    match engine.eval("out.join()", false).expect("parse") {
+        Completion::Value(v) => assert_eq!(v, "rejected 1"),
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}
+
+#[test]
 fn gc_keeps_suspended_generators_intact() {
     assert_eq!(
         run("function* g() { const keep = { v: 1 }; keep.self = keep; yield keep; keep.v += 1; yield keep.v; return keep; }

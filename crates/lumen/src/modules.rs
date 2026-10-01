@@ -2244,6 +2244,53 @@ mod namespace_lifetime_tests {
         );
     }
 
+    fn live_scopes() -> usize {
+        crate::value::scope_registry_with(|registry| registry.len())
+    }
+
+    #[test]
+    fn dead_modules_importing_each_other_are_collected() {
+        let mut interp = Interp::new();
+        interp.module_loader = Some(Rc::new(|specifier, _, _| match specifier {
+            "a" => Some((
+                "a".into(),
+                "import { b } from 'b'; export const a = 1; export const readB = () => b;".into(),
+            )),
+            "b" => Some((
+                "b".into(),
+                "import { a } from 'a'; export const b = 2; export const readA = () => a;".into(),
+            )),
+            _ => None,
+        }));
+        interp.gc_collect();
+        let base = live_scopes();
+        let ns = interp
+            .load_module(
+                "a",
+                "import { b } from 'b'; export const a = 1; export const readB = () => b;",
+            )
+            .ok()
+            .expect("load cyclic graph");
+        let read_b = interp.get_member(&ns, "readB").ok().unwrap();
+        assert!(matches!(
+            interp.invoke(read_b, Value::Undefined, &[]).ok(),
+            Some(Value::Num(2.0))
+        ));
+        drop(ns);
+        interp.gc_collect();
+        assert!(live_scopes() > base, "registered modules stay live");
+        interp.module_recs.clear();
+        interp.modules.clear();
+        for _ in 0..2 {
+            interp.gc_collect();
+        }
+        assert_eq!(
+            live_scopes(),
+            base,
+            "module scopes that import from each other must not outlive their records"
+        );
+    }
+
     #[test]
     fn retained_namespace_survives_collection_and_stays_read_only() {
         let mut interp = Interp::new();

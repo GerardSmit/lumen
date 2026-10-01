@@ -1740,6 +1740,36 @@ const posix = {
   posix: null,
 };
 
+if (!isWindows) {
+  const { pathResolve, pathJoin, pathDirname, pathBasename, pathExtname } = __node;
+  Object.assign(posix, {
+    resolve(...args) {
+      for (let i = args.length - 1; i >= 0; i--) {
+        validateString(args[i], `paths[${i}]`);
+        if (StringPrototypeCharCodeAt(args[i], 0) === CHAR_FORWARD_SLASH) break;
+      }
+      return pathResolve(...args);
+    },
+    join(...args) {
+      for (let i = 0; i < args.length; ++i) validateString(args[i], 'path');
+      return pathJoin(...args);
+    },
+    dirname(path) {
+      validateString(path, 'path');
+      return pathDirname(path);
+    },
+    basename(path, suffix) {
+      if (suffix !== undefined) validateString(suffix, 'suffix');
+      validateString(path, 'path');
+      return pathBasename(path, suffix);
+    },
+    extname(path) {
+      validateString(path, 'path');
+      return pathExtname(path);
+    },
+  });
+}
+
 posix.win32 = win32.win32 = win32;
 posix.posix = win32.posix = posix;
 
