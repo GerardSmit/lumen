@@ -539,26 +539,20 @@ impl Runtime {
         Ok(())
     }
 
-    /// Start `path` as the CJS main module WITHOUT pumping the macrotask loop (only the top-level
-    /// microtask checkpoint runs). Worker threads use this: the caller arms its message inbox
-    /// first and then drives the loop itself. `Err` is the rendered uncaught error.
-    pub(crate) fn start_main(&mut self, path: &str) -> Result<(), String> {
-        self.start_main_raw(path, None).map_err(|e| match e {
-            StartError::NotInstalled(message) => message,
-            StartError::Thrown(error) => describe_error(self.engine.ctx(), &error),
-        })
-    }
-
-    fn start_main_raw(&mut self, path: &str, source: Option<&str>) -> Result<(), StartError> {
-        // A CJS script can still dynamic-`import()`: give the engine the ESM loader and resolve
-        // bare relative specifiers against the entry file.
+    /// Give the engine the ESM loader (so dynamic `import()` works) and resolve bare relative
+    /// specifiers against `path`.
+    pub(crate) fn install_module_loader(&mut self, path: &str, has_source: bool) {
         let loader = esm::make_loader(self.builtin_modules());
         self.engine.set_module_loader_attrs(loader);
         match lumen_host::canonicalize(path) {
             Ok(abs) => self.engine.set_import_base(&abs.to_string_lossy()),
-            Err(_) if source.is_some() => self.engine.set_import_base(path),
+            Err(_) if has_source => self.engine.set_import_base(path),
             Err(_) => {}
         }
+    }
+
+    fn start_main_raw(&mut self, path: &str, source: Option<&str>) -> Result<(), StartError> {
+        self.install_module_loader(path, source.is_some());
         let global = self.engine.global_this();
         let entry = if source.is_some() {
             "__runMainSource"

@@ -17,7 +17,7 @@ fn client_resource_timing_records_real_measurements_and_delivers_observers() {
       globalThis.result=[a instanceof PerformanceResourceTiming,a.duration,a.connectStart,a.nextHopProtocol,
         a.transferSize,b.transferSize,a.responseStatus,a.deliveryType,a.toJSON().encodedBodySize,
         p.getEntriesByType('resource').length];
-      queueMicrotask(()=>{result.push(observed);p.clearResourceTimings();result.push(p.getEntriesByType('resource').length);observer.disconnect()});
+      setImmediate(()=>{result.push(observed);p.clearResourceTimings();result.push(p.getEntriesByType('resource').length);observer.disconnect()});
     "#;
     assert!(matches!(
         runtime.eval(source).expect("parse"),

@@ -109,6 +109,8 @@ struct WorkerSpec {
     /// not fall back to the host's own cwd, stdio and process.
     embedding: Option<crate::WorkerEmbedding>,
     shared_env: Option<crate::process_env::RealmEnvironment>,
+    /// Node mode: the worker's ends of the public (`parentPort`) and internal channels.
+    ports: Option<(crate::ports::PortTransfer, crate::ports::PortTransfer)>,
 }
 
 /// `__worker.spawn(path, isModule, dispatch, opts?)` → `{ id, threadId }`. Spawns the worker
@@ -170,6 +172,16 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
     };
 
     let embedding = ctx.op_state().get::<crate::WorkerEmbedding>().cloned();
+    let mut parent_ports = None;
+    let ports = is_node.then(|| {
+        let (public_main, public_worker) = crate::ports::new_pair();
+        let (internal_main, internal_worker) = crate::ports::new_pair();
+        parent_ports = Some((
+            crate::ports::adopt(ctx, public_main),
+            crate::ports::adopt(ctx, internal_main),
+        ));
+        (public_worker, internal_worker)
+    });
     let spec = WorkerSpec {
         entry,
         is_module,
@@ -179,6 +191,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         thread_id,
         embedding,
         shared_env,
+        ports,
     };
     let worker_stop = Arc::clone(&stop);
     std::thread::Builder::new()
@@ -196,6 +209,10 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
     let o = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&o, "id", Value::Num(id as f64));
     let _ = ctx.set_member(&o, "threadId", Value::Num(thread_id as f64));
+    if let Some((public, internal)) = parent_ports {
+        let _ = ctx.set_member(&o, "port", Value::Num(public as f64));
+        let _ = ctx.set_member(&o, "internal", Value::Num(internal as f64));
+    }
     Ok(o)
 }
 
@@ -417,6 +434,12 @@ fn run_worker(
             "__lumenWorkerThreadId",
             Value::Num(spec.thread_id as f64),
         );
+        if let Some((public, internal)) = spec.ports.take() {
+            let public = crate::ports::adopt(ctx, public);
+            let internal = crate::ports::adopt(ctx, internal);
+            let ids = ctx.make_array(vec![Value::Num(public as f64), Value::Num(internal as f64)]);
+            let _ = ctx.set_member(&global, "__lumenWorkerPorts", ids);
+        }
         if let Some(message) = spec.init.take() {
             let bytes = clone_transfer::install_message(ctx, message);
             match ctx.make_uint8array(&bytes) {
@@ -440,15 +463,16 @@ fn run_worker(
 
     let _ = to_main_tx.send(ToMain::Online);
 
-    // Node worker entries follow the same extension/package scope policy as imports.
-    // Requiring a type:module .js entry would reject a legitimately suspended TLA graph.
-    let is_module = spec.is_module
-        || (spec.is_node
-            && !spec.is_eval
-            && crate::esm::file_is_esm(std::path::Path::new(&spec.entry)));
+    if spec.is_node {
+        run_node_worker(&mut rt, &spec, to_worker_rx, &stop, &kill);
+        exit.code = worker_exit_code(&mut rt)
+            .or(rt.fatal_exit_code())
+            .unwrap_or(if stop.load(Ordering::SeqCst) || kill.load(Ordering::SeqCst) { 1 } else { 0 });
+        return;
+    }
+
+    let is_module = spec.is_module;
     let entry_result = if spec.is_eval {
-        // `eval: true` — the entry IS the source, run as a classic script (global `require` in
-        // scope, like Node's eval workers). Imports resolve against the cwd.
         let cwd = match &spec.embedding {
             Some(embedding) => Ok(embedding.cwd.clone()),
             None => std::env::current_dir(),
@@ -457,9 +481,6 @@ fn run_worker(
             .map(|d| d.join("[worker eval]").to_string_lossy().into_owned())
             .unwrap_or_else(|_| "[worker eval]".to_string());
         rt.eval_worker_entry(&spec.entry, &base, false)
-    } else if spec.is_node && !is_module {
-        // A node CJS worker file is the realm's main module (require.main, __filename, ...).
-        rt.start_main(&spec.entry)
     } else {
         match std::fs::read_to_string(&spec.entry) {
             Ok(source) => {
@@ -470,25 +491,99 @@ fn run_worker(
     };
     if let Err(e) = entry_result {
         if kill.load(Ordering::SeqCst) {
-            // Terminated (or `process.exit()`ed) while the entry ran: its unwinding error is the
-            // termination.
             exit.code = worker_exit_code(&mut rt).unwrap_or(1);
             return;
         }
         let _ = to_main_tx.send(ToMain::Error(e));
-        if spec.is_node {
-            // Node: an entry that throws kills the worker ('error', then 'exit' with code 1).
-            return;
-        }
     }
 
-    // Arm the main→worker inbox, then pump the loop until stopped — or, in node mode with the
-    // inbox unref'd, until nothing else is pending (a natural exit).
     arm_worker_inbox(rt.engine().ctx(), WorkerInbox { rx: to_worker_rx });
     rt.run_worker_loop(&stop);
 
     exit.code =
         worker_exit_code(&mut rt).unwrap_or(if stop.load(Ordering::SeqCst) { 1 } else { 0 });
+}
+
+/// A node worker: the entry runs as the realm's main program (a throw is an uncaught exception
+/// the worker's own `process` handlers see), then the loop, then Node's end-of-thread protocol
+/// (`'beforeExit'` while listeners add work, then `'exit'`) when it ran out of work by itself.
+fn run_node_worker(
+    rt: &mut Runtime,
+    spec: &WorkerSpec,
+    to_worker_rx: Receiver<ToWorker>,
+    stop: &AtomicBool,
+    kill: &AtomicBool,
+) {
+    lumen_host::perf::mark(lumen_host::perf::Milestone::LoopStart);
+    let hooks = {
+        let ctx = rt.engine().ctx();
+        let global = ctx.global_this();
+        ctx.get_member(&global, "__lumenWorkerHooks")
+            .unwrap_or(Value::Undefined)
+    };
+    let hook = |rt: &mut Runtime, name: &str| -> Value {
+        rt.engine()
+            .ctx()
+            .get_member(&hooks, name)
+            .unwrap_or(Value::Undefined)
+    };
+    // Node worker entries follow the same extension/package scope policy as imports.
+    let is_module = spec.is_module
+        || (!spec.is_eval && crate::esm::file_is_esm(std::path::Path::new(&spec.entry)));
+    let thrown = if spec.is_eval {
+        let run = hook(rt, "runEval");
+        let result = rt.engine().call_function(
+            &run,
+            Value::Undefined,
+            &[Value::from_string(spec.entry.clone())],
+        );
+        rt.checkpoint();
+        result.err()
+    } else if is_module {
+        rt.install_module_loader(&spec.entry, false);
+        let run = hook(rt, "runModule");
+        let result = rt.engine().call_function(
+            &run,
+            Value::Undefined,
+            &[Value::from_string(spec.entry.clone())],
+        );
+        rt.checkpoint();
+        result.err()
+    } else {
+        match rt.start_main_raw(&spec.entry, None) {
+            Ok(()) => None,
+            Err(crate::StartError::Thrown(error)) => Some(error),
+            Err(crate::StartError::NotInstalled(message)) => {
+                Some(rt.engine().ctx().make_error("Error", message))
+            }
+        }
+    };
+    if let Some(error) = thrown {
+        if !kill.load(Ordering::SeqCst) {
+            rt.report_uncaught(&error);
+        }
+    }
+    if kill.load(Ordering::SeqCst) || rt.halted() {
+        return;
+    }
+    arm_worker_inbox(rt.engine().ctx(), WorkerInbox { rx: to_worker_rx });
+    rt.run_worker_loop(stop);
+    let before_exit = hook(rt, "beforeExit");
+    for _ in 0..1000 {
+        if stop.load(Ordering::SeqCst) || kill.load(Ordering::SeqCst) || rt.halted() {
+            return;
+        }
+        rt.fire(&before_exit, &[]);
+        if stop.load(Ordering::SeqCst) || kill.load(Ordering::SeqCst) || rt.halted() || rt.idle() {
+            break;
+        }
+        rt.run_worker_loop(stop);
+    }
+    if stop.load(Ordering::SeqCst) || kill.load(Ordering::SeqCst) || rt.halted() {
+        return;
+    }
+    let exit = hook(rt, "exit");
+    rt.fire(&exit, &[]);
 }
 
 fn worker_exit_code(rt: &mut Runtime) -> Option<i32> {

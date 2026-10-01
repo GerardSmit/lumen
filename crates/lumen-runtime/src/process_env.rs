@@ -72,6 +72,51 @@ pub(crate) fn bind(ctx: &mut Ctx, backing: RealmEnvironment) {
     ctx.op_state().put(backing);
 }
 
+/// Marks the realm whose `process.env.TZ` is the process's time zone (Node's main thread; a
+/// worker's or an embedded realm's environment is its own).
+pub(crate) struct OwnsTimeZone;
+
+/// Make `ctx`'s realm own the engine's local time zone and set it from the `TZ` environment
+/// variable, else the system zone.
+pub(crate) fn own_time_zone(ctx: &mut Ctx) {
+    ctx.op_state().put(OwnsTimeZone);
+    apply_time_zone(std::env::var("TZ").ok().as_deref());
+}
+
+/// Like V8 after a `TZ` change: set `TZ`'s zone (an empty or unknown one is UTC), or with `TZ`
+/// unset re-detect the system zone.
+fn apply_time_zone(tz: Option<&str>) {
+    match tz {
+        Some(tz) => lumen::set_local_time_zone(Some(tz)),
+        None => lumen::set_local_time_zone(system_time_zone().as_deref()),
+    };
+}
+
+/// The system's IANA zone: the `/etc/localtime` link's `.../zoneinfo/<name>` target, else
+/// `/etc/timezone` (Debian).
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn system_time_zone() -> Option<String> {
+    if let Ok(target) = std::fs::read_link("/etc/localtime") {
+        let target = target.to_string_lossy();
+        if let Some(pos) = target.rfind("zoneinfo/") {
+            return Some(target[pos + "zoneinfo/".len()..].to_string());
+        }
+    }
+    let name = std::fs::read_to_string("/etc/timezone").ok()?;
+    Some(name.trim().to_string()).filter(|n| !n.is_empty())
+}
+
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+fn system_time_zone() -> Option<String> {
+    None
+}
+
+fn time_zone_changed(ctx: &mut Ctx, key: &str, value: Option<&str>) {
+    if key == "TZ" && ctx.op_state().get::<OwnsTimeZone>().is_some() {
+        apply_time_zone(value);
+    }
+}
+
 fn get(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     let key = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
@@ -91,12 +136,16 @@ fn set(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
         .to_string();
     let backing = backing(ctx);
+    let changed = (key == "TZ").then(|| value.clone());
     backing
         .0
         .lock()
         .unwrap()
         .set(key, value)
         .map_err(|msg| ctx.make_error("RangeError", msg))?;
+    if let Some(value) = changed {
+        time_zone_changed(ctx, "TZ", Some(&value));
+    }
     Ok(Value::Undefined)
 }
 fn delete(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
@@ -104,11 +153,14 @@ fn delete(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
     let backing = backing(ctx);
-    let mut env = backing.0.lock().unwrap();
-    if let Some(i) = env.index(&key) {
-        let (key, value) = env.values.remove(i);
-        env.bytes -= key.len() + value.len();
+    {
+        let mut env = backing.0.lock().unwrap();
+        if let Some(i) = env.index(&key) {
+            let (key, value) = env.values.remove(i);
+            env.bytes -= key.len() + value.len();
+        }
     }
+    time_zone_changed(ctx, &key, None);
     Ok(Value::Undefined)
 }
 fn keys(ctx: &mut Ctx, _: Value, _: &[Value]) -> Result<Value, Value> {

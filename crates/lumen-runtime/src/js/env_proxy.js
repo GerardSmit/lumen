@@ -8,9 +8,14 @@
   };
   process.env = new Proxy(target, {
     get: (t, key) => typeof key === "symbol" ? Reflect.get(t,key) : env.get(key) ?? Reflect.get(t,key),
-    set: (t, key, value) => { env.set(requireKey(key), `${value}`); return true; },
+    set: (t, key, value) => {
+      requireKey(key);
+      value = `${value}`;
+      if (key !== "") env.set(key, value);
+      return true;
+    },
     has: (t, key) => typeof key === "symbol" ? Reflect.has(t,key) : env.get(key) !== undefined || Reflect.has(t,key),
-    deleteProperty: (t, key) => { env.delete(requireKey(key)); return true; },
+    deleteProperty: (t, key) => { if (typeof key !== "symbol") env.delete(key); return true; },
     ownKeys: () => env.keys(),
     getOwnPropertyDescriptor: (t, key) => {
       if (typeof key === "symbol") return Reflect.getOwnPropertyDescriptor(t,key);
@@ -18,11 +23,24 @@
       return value === undefined ? undefined : {value,writable:true,configurable:true,enumerable:true};
     },
     defineProperty: (t, key, desc) => {
-      if (!("value" in desc) || !desc.writable || !desc.configurable || !desc.enumerable) {
-        throw new TypeError("process.env descriptors must contain value, writable, enumerable and configurable");
+      const invalid = (message) => {
+        const err = new TypeError(message);
+        err.code = "ERR_INVALID_OBJECT_DEFINE_PROPERTY";
+        return err;
+      };
+      if ("value" in desc) {
+        if (!desc.writable || !desc.configurable || !desc.enumerable) {
+          throw invalid("'process.env' only accepts a configurable, writable, and enumerable data descriptor");
+        }
+        requireKey(key);
+        const value = `${desc.value}`;
+        if (key !== "") env.set(key, value);
+        return true;
       }
-      env.set(requireKey(key), `${desc.value}`);
-      return true;
+      if ("get" in desc || "set" in desc) {
+        throw invalid("'process.env' does not accept an accessor(getter/setter) descriptor");
+      }
+      throw invalid("'process.env' only accepts a configurable, writable, and enumerable data descriptor");
     },
     preventExtensions: () => false,
   });

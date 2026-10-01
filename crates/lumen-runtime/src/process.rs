@@ -63,6 +63,8 @@ pub(crate) fn extension() -> Extension {
                     "metrics" (0) => op_metrics,
                     "isatty" (1) => op_isatty,
                     "ttySize" (1) => op_tty_size,
+                    "startupTitle" (0) => op_startup_title,
+                    "setTitle" (1) => op_set_title,
                 ],
             ),
         ],
@@ -93,7 +95,7 @@ pub(crate) fn install_data_props(
 
     let (args, vars): (Vec<String>, Vec<(String, String)>) = match embedded {
         Some((argv, env)) => (argv.to_vec(), env.to_vec()),
-        None => (std::env::args().collect(), std::env::vars().collect()),
+        None => (startup_args().to_vec(), std::env::vars().collect()),
     };
     let argv0_str = args.first().cloned().unwrap_or_else(|| "lumen".to_string());
     let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
@@ -109,17 +111,10 @@ pub(crate) fn install_data_props(
     let exec_path = match embedded {
         Some(_) => argv0_str.clone(),
         None => std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.canonicalize().unwrap_or(p).to_string_lossy().into_owned())
             .unwrap_or_else(|_| argv0_str.clone()),
     };
     let _ = ctx.set_member(&process, "execPath", Value::from_string(exec_path));
-    let title = argv0_str
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("lumen")
-        .to_string();
-    let _ = ctx.set_member(&process, "title", Value::from_string(title));
 
     crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("startup environment exceeds realm limits"));
 
@@ -612,6 +607,107 @@ fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
     Ok(ctx.make_array(vec![Value::Num(0.0); 16]))
 }
 
+/// The OS process's argv as it was at startup. Setting `process.title` reuses argv's memory (as
+/// libuv does), after which the live argv no longer reads back the arguments.
+fn startup_args() -> &'static [String] {
+    static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ARGS.get_or_init(|| std::env::args().collect())
+}
+
+/// `process.title` before a program sets it: argv[0] as the process was started (an embedded
+/// realm has no title of its own: `undefined`, and the JS side falls back to its argv0).
+fn op_startup_title(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    if ctx.op_state().get::<RealmProcess>().is_some() {
+        return Ok(Value::Undefined);
+    }
+    Ok(match startup_args().first() {
+        Some(t) => Value::from_string(t.clone()),
+        None => Value::Undefined,
+    })
+}
+
+/// `process.title = t`: what `ps` shows for the process, written over the argv strings (the only
+/// memory the kernel reports a process's command line from), truncated to fit them.
+fn op_set_title(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let title = ctx
+        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
+        .to_string();
+    if ctx.op_state().get::<RealmProcess>().is_some() {
+        return Ok(Value::Undefined);
+    }
+    let _ = startup_args();
+    set_os_title(&title);
+    Ok(Value::Undefined)
+}
+
+#[cfg(target_os = "macos")]
+fn set_os_title(title: &str) {
+    use std::os::raw::{c_char, c_int};
+    extern "C" {
+        fn _NSGetArgv() -> *mut *mut *mut c_char;
+        fn _NSGetArgc() -> *mut c_int;
+    }
+    // SAFETY: the argv strings are the process's own, NUL-terminated, and laid out back to back;
+    // only the contiguous run starting at argv[0] is overwritten, within its original length.
+    unsafe {
+        let argc = *_NSGetArgc();
+        let argv = *_NSGetArgv();
+        if argc <= 0 || argv.is_null() || (*argv).is_null() {
+            return;
+        }
+        let start = *argv;
+        let mut end = start.add(std::ffi::CStr::from_ptr(start).to_bytes().len());
+        for i in 1..argc as usize {
+            let arg = *argv.add(i);
+            if arg != end.add(1) {
+                break;
+            }
+            end = arg.add(std::ffi::CStr::from_ptr(arg).to_bytes().len());
+        }
+        overwrite_args(start as *mut u8, end.offset_from(start) as usize, title);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_os_title(title: &str) {
+    // /proc/self/stat fields 48 and 49 (after the parenthesized comm): the argv area's bounds.
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else { return };
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else { return };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let (Some(start), Some(end)) = (
+        fields.get(45).and_then(|f| f.parse::<usize>().ok()),
+        fields.get(46).and_then(|f| f.parse::<usize>().ok()),
+    ) else {
+        return;
+    };
+    if start == 0 || end <= start {
+        return;
+    }
+    // SAFETY: [arg_start, arg_end) is this process's own argv area, mapped and writable; the
+    // write stays inside it.
+    unsafe { overwrite_args(start as *mut u8, end - start - 1, title) };
+    let mut name = [0u8; 16];
+    let n = title.len().min(15);
+    name[..n].copy_from_slice(&title.as_bytes()[..n]);
+    extern "C" {
+        fn prctl(option: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    }
+    // PR_SET_NAME
+    unsafe { prctl(15, name.as_ptr()) };
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn set_os_title(_title: &str) {}
+
+/// Write `title` over `cap` bytes at `start` (NUL-padded, plus the terminating NUL at
+/// `start + cap`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+unsafe fn overwrite_args(start: *mut u8, cap: usize, title: &str) {
+    let n = title.len().min(cap);
+    std::ptr::copy_nonoverlapping(title.as_ptr(), start, n);
+    std::ptr::write_bytes(start.add(n), 0, cap - n + 1);
+}
+
 fn op_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     if let Some(realm) = ctx.op_state().get::<RealmProcess>() {
         return Ok(Value::from_string(realm.cwd.to_string_lossy().into_owned()));
@@ -737,7 +833,13 @@ fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     }
     match std::env::set_current_dir(&dir) {
         Ok(()) => Ok(Value::Undefined),
-        Err(e) => Err(ctx.make_error("Error", format!("ENOENT: chdir '{dir}': {e}"))),
+        Err(e) => {
+            let err = ctx.make_error("Error", format!("chdir '{dir}': {e}"));
+            if let Some(errno) = e.raw_os_error() {
+                let _ = ctx.set_member(&err, "errno", Value::Num(-(errno as f64)));
+            }
+            Err(err)
+        }
     }
 }
 

@@ -85,6 +85,12 @@
 
   // Real OS-identity / control surface over the native ops. These need the (about-to-be-deleted)
   // `__proc` namespace, so they are wired here rather than in the lumen-node JS glue.
+  let title;
+  Object.defineProperty(process, "title", {
+    get() { return title ?? proc.startupTitle() ?? process.argv0; },
+    set(value) { title = `${value}`; proc.setTitle(title); },
+    enumerable: true, configurable: true,
+  });
   process.chdir = proc.chdir;
   process.abort = proc.abort;
   process.umask = proc.umask;
