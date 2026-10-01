@@ -119,6 +119,23 @@ fn real_main() {
             die(9, &format!("{argv0}: invalid value for --unhandled-rejections"));
         }
     }
+    if opts.flag("--test") {
+        let conflict = if opts.check {
+            Some("--check")
+        } else if opts.eval.is_some() {
+            Some("--eval")
+        } else if opts.interactive || force_repl {
+            Some("--interactive")
+        } else {
+            None
+        };
+        if let Some(other) = conflict {
+            die(9, &format!("{argv0}: either --test or {other} can be used, not both"));
+        }
+        if opts.string("--watch-path").is_some() {
+            die(9, &format!("{argv0}: --watch-path cannot be used in combination with --test"));
+        }
+    }
     if opts.check && opts.eval.is_some() {
         die(9, &format!("{argv0}: either --check or --eval can be used, not both"));
     }
@@ -414,7 +431,7 @@ fn run_preloads(runtime: &mut Runtime, opts: &options::Parsed, cwd: &str) {
 }
 
 fn run_prelude(runtime: &mut Runtime, src: &str) {
-    match runtime.eval(src) {
+    match runtime.engine().eval(src, false) {
         Ok(Completion::Value(_)) => {}
         Ok(Completion::Throw { name, message }) => {
             if name.is_empty() {
