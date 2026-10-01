@@ -1,40 +1,70 @@
-//! Heap edges for cycle collection, without materializing non-object property values.
-use super::{Callable, Gc, Property, Value, PACK_OBJ};
+//! Heap edges for cycle collection, visited in place: no handle is cloned and no property value
+//! is materialized.
+use super::{Callable, Gc, Object, Property, Props, Value};
+use std::mem::ManuallyDrop;
 
-/// Release the source borrow before the collector follows edges, including self references.
-pub(crate) fn object_refs_into(object: &Gc, refs: &mut Vec<Gc>) {
-    refs.clear();
-    let object = object.borrow();
+/// Visit the edges an object holds outside its property map: its prototype and the objects its
+/// call behavior references.
+pub(crate) fn visit_object_head(object: &Object, f: &mut impl FnMut(&Gc)) {
     if let Some(proto) = &object.proto {
-        refs.push(proto.clone());
-    }
-    for property in object.props.values() {
-        property.append_object_refs(refs);
+        f(proto);
     }
     match &object.call {
         Callable::Bound(bound) => {
-            refs.push(bound.target.clone());
+            f(&bound.target);
             if let Value::Obj(object) = &bound.this {
-                refs.push(object.clone());
+                f(object);
             }
             for argument in &bound.args {
                 if let Value::Obj(object) = argument {
-                    refs.push(object.clone());
+                    f(object);
                 }
             }
         }
         // A promise's result and pending reactions are heap edges (its suspended coroutine, if
         // any, is not traced: what it holds counts as external, i.e. roots).
-        Callable::Promise(slot) => slot.object_refs(refs),
+        Callable::Promise(slot) => slot.visit_object_refs(f),
         // The pair shares one cell: only the resolve function reports its edge, so the count
         // never exceeds the promise's real reference count (a lone reject function leaves the
         // promise looking externally held, which is conservative).
         Callable::Resolver(cell, true) => {
             if let Value::Obj(object) = &cell.promise {
-                refs.push(object.clone());
+                f(object);
             }
         }
         _ => {}
+    }
+}
+
+/// Visit every edge of `object`. The caller must not mutate it meanwhile.
+pub(crate) fn visit_object_refs(object: &Object, f: &mut impl FnMut(&Gc)) {
+    visit_object_head(object, f);
+    object.props.visit_object_refs(0, usize::MAX, f);
+}
+
+impl Props {
+    /// Visit the objects held by property slots `from..from + limit`, in the order `values`
+    /// yields them (packed elements, then entries). Returns where to resume, or `None` once
+    /// every slot has been visited, so a huge array is walked in bounded steps.
+    pub(crate) fn visit_object_refs(
+        &self,
+        from: usize,
+        limit: usize,
+        f: &mut impl FnMut(&Gc),
+    ) -> Option<usize> {
+        let packed = self.elems.packed_ref().unwrap_or(&[]);
+        let entries = &self.entries[..];
+        let total = packed.len() + entries.len();
+        let end = total.min(from.saturating_add(limit));
+        for i in from..end {
+            if let Some(i) = i.checked_sub(packed.len()) {
+                entries[i].visit_object_refs(f);
+            } else if let Some(p) = packed[i].obj_ptr() {
+                // SAFETY: a packed object word is a live handle; it is only borrowed.
+                f(&ManuallyDrop::new(unsafe { Gc::from_raw(p) }));
+            }
+        }
+        (end < total).then_some(end)
     }
 }
 
@@ -44,17 +74,16 @@ impl Property {
         self.packed.tag() == super::PACK_EMPTY
     }
 
-    fn append_object_refs(&self, refs: &mut Vec<Gc>) {
-        if self.packed.tag() == PACK_OBJ {
-            // PACK_OBJ is installed only by packing an owned Gc. Clone that owner while
-            // retaining the property's ownership, exactly as PackedValue::unpack does.
-            refs.push(unsafe { self.packed.clone_word::<Gc>() });
+    pub(crate) fn visit_object_refs(&self, f: &mut impl FnMut(&Gc)) {
+        if let Some(p) = self.packed.obj_ptr() {
+            // SAFETY: a packed object word is a live handle; it is only borrowed.
+            f(&ManuallyDrop::new(unsafe { Gc::from_raw(p) }));
         }
         if let Some(Value::Obj(object)) = self.getter() {
-            refs.push(object.clone());
+            f(object);
         }
         if let Some(Value::Obj(object)) = self.setter() {
-            refs.push(object.clone());
+            f(object);
         }
     }
 }
@@ -64,6 +93,18 @@ mod tests {
     use super::*;
     use crate::value::Object;
     use std::rc::Rc;
+
+    fn property_refs(property: &Property) -> Vec<Gc> {
+        let mut refs = Vec::new();
+        property.visit_object_refs(&mut |g| refs.push(g.clone()));
+        refs
+    }
+
+    fn object_refs(object: &Gc) -> Vec<Gc> {
+        let mut refs = Vec::new();
+        visit_object_refs(&object.borrow(), &mut |g| refs.push(g.clone()));
+        refs
+    }
 
     #[test]
     fn scalar_payloads_have_no_edges_and_only_empty_is_a_hole() {
@@ -84,9 +125,7 @@ mod tests {
         for value in values {
             let empty = matches!(value, Value::Empty);
             let property = Property::plain(value);
-            let mut refs = Vec::new();
-            property.append_object_refs(&mut refs);
-            assert!(refs.is_empty());
+            assert!(property_refs(&property).is_empty());
             assert_eq!(property.is_empty(), empty);
         }
     }
@@ -99,8 +138,7 @@ mod tests {
         property.set_setter(Some(Value::Obj(target.clone())));
         assert!(!property.accessor());
         let before = Gc::strong_count(&target);
-        let mut refs = Vec::new();
-        property.append_object_refs(&mut refs);
+        let mut refs = property_refs(&property);
         assert_eq!(refs.len(), 3);
         assert!(refs.iter().all(|edge| Gc::ptr_eq(edge, &target)));
         assert_eq!(Gc::strong_count(&target), before + 3);
@@ -142,8 +180,7 @@ mod tests {
             );
         }
         let before = Gc::strong_count(&target);
-        let mut refs = vec![target.clone()];
-        object_refs_into(&object, &mut refs);
+        let mut refs = object_refs(&object);
         assert_eq!(refs.len(), 5);
         assert_eq!(
             refs.iter()

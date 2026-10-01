@@ -822,6 +822,167 @@ fn gc_keeps_reachable_cycles() {
     );
 }
 
+/// Runs `garbage` (which must leave nothing reachable), collects, and returns the live-object
+/// growth over the baseline taken after a first collection.
+fn gc_growth(garbage: &str) -> i64 {
+    let mut e = Engine::new();
+    let mut eval = |src: &str| match e.eval(src, false).expect("parse") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    };
+    eval("$262.gc()");
+    let base = crate::value::live_objects();
+    eval(garbage);
+    eval("$262.gc()");
+    crate::value::live_objects() - base
+}
+
+#[test]
+fn gc_collects_cycles_through_closures_and_scopes() {
+    assert!(
+        gc_growth(
+            "(function () {
+               for (let i = 0; i < 20000; i++) {
+                 let o = { i };
+                 o.f = function () { return o; };
+                 let g = () => g;
+                 o.g = g;
+               }
+               for (let i = 0; i < 2000; i++) {
+                 const mk = () => { let a = {}; a.f = () => a; return a; };
+                 mk();
+               }
+             })();"
+        ) < 200
+    );
+}
+
+#[test]
+fn gc_collects_collection_cycles() {
+    assert!(
+        gc_growth(
+            "(function () {
+               for (let i = 0; i < 5000; i++) {
+                 const m = new Map(); m.set(m, { m }); m.set(1, m);
+                 const s = new Set(); s.add(s); s.add({ s });
+                 const k = {}; const w = new WeakMap(); w.set(k, { k, w, s });
+                 const ws = new WeakSet(); ws.add(k); k.ws = ws;
+               }
+             })();"
+        ) < 200
+    );
+    assert_eq!(
+        run("const live = {}; const w = new WeakMap(); const dead = {};
+             w.set(live, { back: live, n: 1 }); w.set(dead, { back: dead, n: 2 });
+             const m = new Map([[1, { w }]]); const s = new Set([live]);
+             for (let i = 0; i < 3; i++) $262.gc();
+             [w.get(live).n, w.has(live), m.get(1).w === w, s.has(live)].join()"),
+        "1,true,true,true"
+    );
+}
+
+#[test]
+fn gc_collects_promise_cycles_and_keeps_pending_ones() {
+    assert!(
+        gc_growth(
+            "(function () {
+               for (let i = 0; i < 5000; i++) {
+                 const p = new Promise(() => {});
+                 p.then(() => p).catch(() => p);
+                 const q = Promise.resolve({ i }); q.then(v => { v.q = q; });
+               }
+             })();"
+        ) < 400
+    );
+    assert_eq!(
+        run("var out = []; let resolve;
+             const p = new Promise(r => { resolve = r; });
+             p.then(v => out.push(v));
+             for (let i = 0; i < 3; i++) $262.gc();
+             resolve(7); out.length + ':' + typeof resolve"),
+        "0:function"
+    );
+}
+
+#[test]
+fn gc_keeps_suspended_generators_intact() {
+    assert_eq!(
+        run("function* g() { const keep = { v: 1 }; keep.self = keep; yield keep; keep.v += 1; yield keep.v; return keep; }
+             const it = g(); const first = it.next().value;
+             for (let i = 0; i < 3; i++) { for (let j = 0; j < 20000; j++) { const o = {}; o.o = o; } $262.gc(); }
+             const second = it.next().value; const third = it.next().value;
+             [first.v, first.self === first, second, third === first].join()"),
+        "2,true,2,true"
+    );
+}
+
+#[test]
+fn gc_marks_deep_chains_without_native_recursion() {
+    assert_eq!(
+        run("let head = null;
+             for (let i = 0; i < 1000000; i++) head = { next: head, i };
+             $262.gc();
+             let n = 0; for (let p = head; p; p = p.next) n++;
+             n + ':' + head.i"),
+        "1000000:999999"
+    );
+    assert!(
+        gc_growth(
+            "(function () {
+               let head = null, tail = null;
+               for (let i = 0; i < 1000000; i++) { head = { next: head }; tail ??= head; }
+               tail.next = head;
+             })();"
+        ) < 200
+    );
+}
+
+#[test]
+fn gc_marks_huge_arrays_and_collects_their_cycles() {
+    assert_eq!(
+        run("const a = new Array(1000000);
+             for (let i = 0; i < a.length; i++) a[i] = { i };
+             a.push(a); a.extra = { a };
+             $262.gc();
+             let ok = 0; for (let i = 0; i < 1000000; i++) if (a[i].i === i) ok++;
+             ok + ':' + (a[1000000] === a) + ':' + (a.extra.a === a)"),
+        "1000000:true:true"
+    );
+    assert!(
+        gc_growth(
+            "(function () {
+               const a = []; for (let i = 0; i < 500000; i++) a.push({ a });
+               a.push(a);
+             })();"
+        ) < 200
+    );
+}
+
+#[test]
+fn gc_counts_scopes_shared_by_many_closures() {
+    assert_eq!(
+        run("function make() {
+               const shared = { tag: 'x' }; const fns = [];
+               for (let i = 0; i < 70000; i++) fns.push(() => shared);
+               shared.fns = fns;
+               return fns;
+             }
+             const fns = make();
+             for (let i = 0; i < 3; i++) $262.gc();
+             fns[69999]().tag + fns[0]().fns.length"),
+        "x70000"
+    );
+    assert!(
+        gc_growth(
+            "(function () {
+               const shared = { tag: 'x' }; const fns = [];
+               for (let i = 0; i < 70000; i++) fns.push(() => shared);
+               shared.fns = fns;
+             })();"
+        ) < 200
+    );
+}
+
 #[test]
 fn gc_heap_reuses_dead_object_slots() {
     // Churn reuses freed slab slots instead of mapping new chunks.

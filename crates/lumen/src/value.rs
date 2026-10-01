@@ -124,6 +124,35 @@ impl ObjCell {
     pub fn as_ptr(&self) -> *mut Object {
         self.value.get()
     }
+
+    #[inline]
+    fn gc_scratch(&self) -> &Cell<u32> {
+        // SAFETY: only the scratch cell is referenced, never the rest of the object, so this
+        // is valid whatever borrow state the object is in.
+        unsafe { &*std::ptr::addr_of!((*self.value.get()).gc_internal) }
+    }
+    #[inline]
+    pub(crate) fn gc_marked(&self) -> bool {
+        self.gc_scratch().get() & GC_MARK != 0
+    }
+    #[inline]
+    pub(crate) fn gc_set_mark(&self) {
+        let c = self.gc_scratch();
+        c.set(c.get() | GC_MARK);
+    }
+    #[inline]
+    pub(crate) fn gc_refs(&self) -> u32 {
+        self.gc_scratch().get() & !GC_MARK
+    }
+    #[inline]
+    pub(crate) fn gc_add_ref(&self) {
+        let c = self.gc_scratch();
+        c.set(c.get() + 1);
+    }
+    #[inline]
+    pub(crate) fn gc_reset(&self) {
+        self.gc_scratch().set(0);
+    }
 }
 
 #[cold]
@@ -1212,28 +1241,6 @@ pub struct Object {
 const GC_MARK: u32 = 1 << 31;
 
 impl Object {
-    #[inline]
-    pub(crate) fn gc_marked(&self) -> bool {
-        self.gc_internal.get() & GC_MARK != 0
-    }
-    #[inline]
-    pub(crate) fn gc_set_mark(&self) {
-        self.gc_internal.set(self.gc_internal.get() | GC_MARK);
-    }
-    /// Start a collection: no mark, zero internal references.
-    #[inline]
-    pub(crate) fn gc_reset(&self) {
-        self.gc_internal.set(0);
-    }
-    #[inline]
-    pub(crate) fn gc_refs(&self) -> u32 {
-        self.gc_internal.get() & !GC_MARK
-    }
-    #[inline]
-    pub(crate) fn gc_add_ref(&self) {
-        self.gc_internal.set(self.gc_internal.get() + 1);
-    }
-
     /// Fast teardown of a dying object whose property entries live in its box's inline slots
     /// and that has no call behavior — every literal, `new` instance, iterator result and small
     /// array: drops exactly the fields that own something (entries, element sidecar, shape,
@@ -1756,6 +1763,20 @@ pub fn live_objects() -> i64 {
     with_gc_state(|state| state.live.get())
 }
 
+/// Visit every currently-live heap object in place. `f` must not allocate, free or drop a
+/// handle to heap objects (cloning and dropping a clone it made is fine only while another
+/// owner exists).
+pub(crate) fn gc_for_each_live(mut f: impl FnMut(&Gc)) {
+    with_gc_state(|state| {
+        state.heap.for_each_live(|b| {
+            // SAFETY: a borrowed view of a live box; never dropped.
+            f(&std::mem::ManuallyDrop::new(unsafe {
+                Gc(std::ptr::NonNull::new_unchecked(b))
+            }))
+        });
+    })
+}
+
 /// Strong handles to every currently-live heap object. The slab borrow is held for the walk,
 /// and taking a handle only increments counts, so no object can disappear mid-walk.
 pub fn gc_snapshot() -> Vec<Gc> {
@@ -1868,6 +1889,26 @@ pub(crate) fn scope_registry_prune() -> usize {
         reg.retain(|w| w.strong_count() > 0);
         reg.len()
     })
+}
+
+/// Purge dead entries, then run `f` on the registry (in registration, i.e. serial, order): every
+/// entry's scope is alive for as long as nothing releases a handle.
+pub(crate) fn scope_registry_with<R>(
+    f: impl FnOnce(&[std::rc::Weak<RefCell<crate::interpreter::Scope>>]) -> R,
+) -> R {
+    with_gc_state(|state| {
+        let mut reg = state.scopes.borrow_mut();
+        reg.retain(|w| w.strong_count() > 0);
+        f(&reg)
+    })
+}
+
+/// Run `f` on the registry as left by the last [`scope_registry_with`], with no purge: valid
+/// only while no scope has been released since.
+pub(crate) fn scope_registry_view<R>(
+    f: impl FnOnce(&[std::rc::Weak<RefCell<crate::interpreter::Scope>>]) -> R,
+) -> R {
+    with_gc_state(|state| f(&state.scopes.borrow()))
 }
 
 /// The live scopes (purging dead weak entries as it goes).

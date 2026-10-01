@@ -156,10 +156,10 @@ impl PromiseSlot {
     }
 
     /// Every object edge the slot holds, for the collector.
-    pub(crate) fn object_refs(&self, refs: &mut Vec<Gc>) {
+    pub(crate) fn visit_object_refs(&self, f: &mut impl FnMut(&Gc)) {
         let mut push = |v: &Value| {
             if let Value::Obj(o) = v {
-                refs.push(o.clone());
+                f(o);
             }
         };
         push(&self.value);

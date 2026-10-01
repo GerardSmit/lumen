@@ -24,7 +24,11 @@ pub struct VarMap {
     observed: std::cell::Cell<bool>,
     /// The owning scope's flags (`interpreter::SCOPE_*`), here to share this struct's padding.
     scope_flags: u8,
+    /// The cycle collector's per-scope scratch (see `Interp::gc_collect`), in the padding.
+    gc: std::cell::Cell<u16>,
 }
+
+const _: () = assert!(std::mem::size_of::<VarMap>() <= 32);
 
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
 
@@ -176,7 +180,13 @@ impl VarMap {
             generation: std::cell::Cell::new(generation),
             observed: std::cell::Cell::new(false),
             scope_flags: 0,
+            gc: std::cell::Cell::new(0),
         }
+    }
+
+    #[inline]
+    pub(crate) fn gc_scratch(&self) -> &std::cell::Cell<u16> {
+        &self.gc
     }
 
     #[inline]
