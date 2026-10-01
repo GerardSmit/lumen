@@ -38,7 +38,7 @@ const JS_FILES: &[GlueFile] = &[
     },
     GlueFile {
         name: "os.js",
-        wrap: false,
+        wrap: true,
     },
     GlueFile {
         name: "events.js",
@@ -218,7 +218,7 @@ const JS_FILES: &[GlueFile] = &[
     // The builtins' ESM export names, for module.js.
     GlueFile {
         name: "esm_exports.js",
-        wrap: false,
+        wrap: true,
     },
     GlueFile {
         name: "module.js",
@@ -239,6 +239,11 @@ const JS_FILES: &[GlueFile] = &[
 /// globals other than the ones it defines. Each lazy file costs nothing (not even its decoded
 /// AST) until a program touches it, which is most of the node glue for most programs.
 const LAZY: &[&str] = &[
+    "os.js",
+    "esm_exports.js",
+    "diagnostics_channel.js",
+    "domain.js",
+    "typescript_strip.js",
     "trace_events.js",
     "util.js",
     "crypto.js",
@@ -417,8 +422,59 @@ fn main() {
     std::fs::write(out.join("node_glue.aot"), &blob).unwrap();
 
     std::fs::write(out.join("ffi_trampolines.rs"), generate_ffi_trampolines()).unwrap();
+    std::fs::write(
+        out.join("esm_exports.rs"),
+        generate_esm_exports(&std::fs::read_to_string(src_dir.join("esm_exports.js")).unwrap()),
+    )
+    .unwrap();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LUMEN_GLUE_MEM_MARKS");
+}
+
+/// The builtins' ESM export lists as a Rust table, read from `esm_exports.js` (the single
+/// source): the `"name": "a b c",` entries of `__ESM_EXPORTS` plus `process`, whose names are
+/// the `PROCESS_EXPORTS` array. The module loader reads them without evaluating any glue.
+fn generate_esm_exports(js: &str) -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut process: Vec<String> = Vec::new();
+    let mut in_table = false;
+    let mut in_process = false;
+    for line in js.lines() {
+        if line.starts_with("const __ESM_EXPORTS = {") {
+            in_table = true;
+        } else if in_table && line.starts_with("};") {
+            in_table = false;
+        } else if line.starts_with("const PROCESS_EXPORTS = [") {
+            in_process = true;
+        } else if in_process && line.starts_with("];") {
+            in_process = false;
+        } else if in_table {
+            let line = line.trim();
+            let (key, rest) = line
+                .strip_prefix('"')
+                .and_then(|l| l.split_once("\": \""))
+                .unwrap_or_else(|| panic!("esm_exports.js: unexpected entry {line:?}"));
+            let list = rest
+                .strip_suffix("\",")
+                .unwrap_or_else(|| panic!("esm_exports.js: unexpected entry {line:?}"));
+            entries.push((key.to_string(), list.to_string()));
+        } else if in_process {
+            process.extend(
+                line.split(',')
+                    .map(|n| n.trim().trim_matches('"'))
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    assert!(!entries.is_empty() && !process.is_empty(), "esm_exports.js: nothing parsed");
+    entries.push(("process".to_string(), process.join(" ")));
+    let mut out = String::from("/// Each builtin's ESM named exports, space-separated (generated from esm_exports.js).\npub static ESM_EXPORTS: &[(&str, &str)] = &[\n");
+    for (name, list) in &entries {
+        out.push_str(&format!("    ({name:?}, {list:?}),\n"));
+    }
+    out.push_str("];\n");
+    out
 }
 
 /// Maximum FFI argument count and the JSCallback thunk-pool size per arity. Kept in sync with the

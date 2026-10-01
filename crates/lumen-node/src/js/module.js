@@ -923,7 +923,9 @@ function registerHooks(hooks) {
 function register() {
   throw new Error("node:module register() (async ESM loader hooks) is not supported in lumen; module.registerHooks (the sync API) is");
 }
-const stripTypeScriptTypes = globalThis.__lumenStripTypeScriptTypes;
+function stripTypeScriptTypes(code, options = {}) {
+  return globalThis.__lumenStripTypeScriptTypes(code, options);
+}
 
 // Node's `require('module')` is the Module constructor itself, with every named export hung off it
 // as a static (so require('module') === require('module').Module). Mirror that exactly.
@@ -984,24 +986,21 @@ globalThis.__runMainSource = runMainSource;
 // below; the source reads the module object through `__esmBuiltin`.
 globalThis.__esmBuiltin = (name) => __builtins.get(name);
 
-// `process` is populated (env/argv/…) by the runtime *after* this glue runs, so enumerating its
-// keys here would miss them. Emit a fixed superset of its named exports instead; each reads the
-// live `process` object at import time (missing ones are harmless `undefined`).
-const PROCESS_EXPORTS = [
-  "env", "argv", "argv0", "execArgv", "execPath", "platform", "arch", "pid", "ppid",
-  "version", "versions", "cwd", "chdir", "exit", "exitCode", "nextTick", "hrtime",
-  "stdout", "stderr", "stdin", "title", "on", "once", "off", "emit", "emitWarning",
-  "memoryUsage", "uptime", "features", "release", "config", "kill", "umask",
-  "allowedNodeEnvironmentFlags", "setSourceMapsEnabled",
-];
-
 // The export names of each builtin, for the runtime's module loader: it builds a builtin's
 // synthetic ESM source (`export default …; export const readFile = …`) on first import
 // (lumen-runtime `esm::builtin_source`). The names come from esm_exports.js, not the modules'
 // keys: reading those would load every builtin at startup (they load on first use; see build.rs
-// `LAZY`).
-__ESM_EXPORTS.process = PROCESS_EXPORTS.join(" ");
-globalThis.__esmExportLists = __ESM_EXPORTS;
+// `LAZY`). The table itself loads on first read of the global.
+{
+  const publish = (value) => Object.defineProperty(globalThis, "__esmExportLists", {
+    value, writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(globalThis, "__esmExportLists", {
+    get() { const lists = __internals.get("esmExportLists"); publish(lists); return lists; },
+    set: publish,
+    enumerable: true, configurable: true,
+  });
+}
 
 // The clean builtin base names (skip the "node:module" alias key). Order is cosmetic here.
 const __BUILTIN_NAMES = [

@@ -272,7 +272,25 @@ pub fn process_memory() -> Option<ProcessMemory> {
             peak_working_set: kb("VmHWM:"),
         })
     }
-    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn getpid() -> i32;
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+        }
+        // rusage_info_v0: a 16-byte uuid, then u64 counters; resident size is word 8, physical footprint word 9.
+        let mut buf = [0u64; 32];
+        if unsafe { proc_pid_rusage(getpid(), 0, buf.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        Some(ProcessMemory {
+            private: buf[9] as usize,
+            peak_private: 0,
+            working_set: buf[8] as usize,
+            peak_working_set: 0,
+        })
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         None
     }
@@ -508,6 +526,12 @@ pub fn phase(label: &str) {
         if let Some(cats) = categories() {
             let slab = cats[Cat::Slab as usize].max(0) as usize;
             line.push_str(&format!(" excl. slab chunks {:>9}", fmt_bytes(live.saturating_sub(slab))));
+            if std::env::var_os("LUMEN_MEM_CATS").is_some() {
+                line.push_str(&format!(" [shapes={}]", crate::value::shape_count()));
+                for (k, name) in CAT_NAMES.iter().enumerate().filter(|(k, _)| *k != Cat::Slab as usize) {
+                    line.push_str(&format!(" [{}={}]", name.split(' ').next().unwrap_or(""), cats[k] / 1024));
+                }
+            }
         }
     }
     eprintln!("{line}");

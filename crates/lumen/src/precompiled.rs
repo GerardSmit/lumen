@@ -137,7 +137,7 @@ pub const SEC_STORE: u32 = 6;
 pub const SEC_LINES: u32 = 7;
 
 /// The uncompressed size of a store block: the unit of decompression.
-pub const STORE_BLOCK: usize = 64 * 1024;
+pub const STORE_BLOCK: usize = 16 * 1024;
 
 /// The layout fingerprint a blob with bytecode must carry (see the header's `layout_fp`).
 pub const LAYOUT_FINGERPRINT: u64 = crate::bytecode::serialize::FINGERPRINT;
@@ -811,7 +811,7 @@ pub(crate) mod store {
     }
 
     /// Recently decompressed blocks for [`bytes`], most recent last: `(section, block, data)`.
-    const RECENT: usize = 4;
+    const RECENT: usize = 2;
     static RECENT_BLOCKS: Mutex<Vec<(usize, usize, Box<[u8]>)>> = Mutex::new(Vec::new());
 
     /// `len` bytes at `off` of the store `section`, for a reader that only needs them for a

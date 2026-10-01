@@ -79,7 +79,7 @@ use crate::value::Value;
 type R<T> = Result<T, String>;
 
 /// Bump on any change to the chunk layout that the tables below do not capture.
-const CODEC_VERSION: u32 = 1;
+const CODEC_VERSION: u32 = 2;
 
 // ---- runtime counters (verification / diagnostics) --------------------------------------------
 
@@ -500,31 +500,40 @@ impl Strings {
     }
 }
 
-/// The decoded side: raw strings, interned on first use as a name.
+/// The decoded side: strings read in place from the section, interned on first use as a name.
+/// A unit's table runs to thousands of entries of which a run touches a few hundred, so nothing
+/// is built per string and only the pages of the strings used become resident.
 struct StrTable<'a> {
-    raw: Vec<&'a str>,
-    interned: Vec<Option<Rc<str>>>,
+    /// `u32` LE offset of each string within `data`.
+    offsets: &'a [u8],
+    /// Each string as `uv len` + UTF-8 bytes.
+    data: &'a [u8],
+    interned: crate::fasthash::FastMap<u32, Rc<str>>,
 }
 
 impl StrTable<'_> {
     fn raw(&self, i: u64) -> R<&str> {
-        self.raw
-            .get(i as usize)
-            .copied()
-            .ok_or_else(|| "bytecode: bad string index".into())
+        let at = (i as usize)
+            .checked_mul(4)
+            .and_then(|o| self.offsets.get(o..o + 4))
+            .ok_or("bytecode: bad string index")?;
+        let mut r = Rd {
+            b: self.data,
+            pos: u32::from_le_bytes([at[0], at[1], at[2], at[3]]) as usize,
+        };
+        let len = r.len()?;
+        let bytes = r.bytes(len)?;
+        std::str::from_utf8(bytes).map_err(|_| "bytecode: bad utf8".into())
     }
     /// The shared `Rc<str>` for entry `i`, interned exactly as the compiler interns names (so
     /// pointer-keyed caches see the same allocation a fresh compile would hand them).
     fn name(&mut self, i: u64) -> R<Rc<str>> {
-        let slot = self
-            .interned
-            .get_mut(i as usize)
-            .ok_or("bytecode: bad string index")?;
-        if let Some(s) = slot {
+        let key = u32::try_from(i).map_err(|_| "bytecode: bad string index")?;
+        if let Some(s) = self.interned.get(&key) {
             return Ok(s.clone());
         }
-        let s = intern_name(self.raw[i as usize]);
-        *slot = Some(s.clone());
+        let s = intern_name(self.raw(i)?);
+        self.interned.insert(key, s.clone());
         Ok(s)
     }
 }
@@ -906,95 +915,97 @@ pub(crate) fn encode_unit(funcs: &[Rc<Function>]) -> (Vec<u8>, SectionStats) {
             }
         }
     }
-    let mut out = Vec::new();
-    uv(&mut out, funcs.len() as u64);
-    uv(&mut out, strings.list.len() as u64);
+    // Layout: function count, string count, string data length, the section's total length (a
+    // truncated section is rejected without reading it), the strings' offsets (u32 LE), the
+    // strings, one (start, len) u32 LE pair per function, then the chunks' bytes. The tables
+    // are fixed-width so a loader finds a string or a function's chunk without reading the
+    // rest of the section.
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(strings.list.len() * 4);
     for s in &strings.list {
-        uv(&mut out, s.len() as u64);
-        out.extend_from_slice(s.as_bytes());
+        offsets.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        uv(&mut data, s.len() as u64);
+        data.extend_from_slice(s.as_bytes());
     }
-    uv(&mut out, entries.len() as u64);
-    let mut prev = 0u32;
-    for (i, e) in &entries {
-        uv(&mut out, (*i - prev) as u64);
-        prev = *i;
-        match e {
-            None => out.push(0),
-            Some(bytes) => {
-                out.push(1);
-                uv(&mut out, bytes.len() as u64);
-                out.extend_from_slice(bytes);
-            }
+    let mut counts = Vec::new();
+    uv(&mut counts, funcs.len() as u64);
+    uv(&mut counts, strings.list.len() as u64);
+    uv(&mut counts, data.len() as u64);
+    let tables = offsets.len() + data.len() + funcs.len() * 8;
+    let chunk_bytes: usize = entries
+        .iter()
+        .map(|(_, e)| e.as_ref().map_or(0, Vec::len))
+        .sum();
+    // The total length is itself a varint, so its width is settled by trying widths until it fits.
+    let mut total_len = Vec::new();
+    loop {
+        let mut next = Vec::new();
+        uv(&mut next, (counts.len() + total_len.len() + tables + chunk_bytes) as u64);
+        let settled = next.len() == total_len.len();
+        total_len = next;
+        if settled {
+            break;
         }
     }
-    (out, stats)
-}
-
-/// A parsed bytecode section: its string table, and each entry's function index and kind
-/// (`None` = refusal, `Some(range)` = the chunk's bytes within the section).
-struct Section {
-    /// The string table's bytes (count + strings), parsed by [`parse_strings`] when needed.
-    strings: std::ops::Range<usize>,
-    entries: Vec<(usize, Option<std::ops::Range<usize>>)>,
-}
-
-fn parse_strings(table: &[u8]) -> R<StrTable<'_>> {
-    let mut r = Rd { b: table, pos: 0 };
-    let n = r.len()?;
-    let mut raw = Vec::with_capacity(n);
-    for _ in 0..n {
-        let len = r.len()?;
-        let bytes = r.bytes(len)?;
-        raw.push(std::str::from_utf8(bytes).map_err(|_| "bytecode: bad utf8")?);
+    let mut head = counts;
+    head.extend_from_slice(&total_len);
+    head.extend_from_slice(&offsets);
+    head.extend_from_slice(&data);
+    let chunks_at = head.len() + funcs.len() * 8;
+    let mut table = vec![0u8; funcs.len() * 8];
+    let mut chunks = Vec::new();
+    for (i, e) in &entries {
+        let (start, len) = match e {
+            None => (u32::MAX, 0),
+            Some(bytes) => {
+                let start = (chunks_at + chunks.len()) as u32;
+                chunks.extend_from_slice(bytes);
+                (start, bytes.len() as u32)
+            }
+        };
+        let at = *i as usize * 8;
+        table[at..at + 4].copy_from_slice(&start.to_le_bytes());
+        table[at + 4..at + 8].copy_from_slice(&len.to_le_bytes());
     }
-    Ok(StrTable {
-        interned: vec![None; raw.len()],
-        raw,
-    })
+    head.extend_from_slice(&table);
+    head.extend_from_slice(&chunks);
+    (head, stats)
 }
 
-fn parse_section(section: &[u8], fn_count: usize) -> R<Section> {
+/// A bytecode section's tables, located (not read): the string offsets and data, and the
+/// per-function entries.
+struct Section<'a> {
+    offsets: &'a [u8],
+    data: &'a [u8],
+    /// Where the (start, len) pairs begin within the section.
+    entries_at: usize,
+}
+
+fn parse_section(section: &[u8], fn_count: usize) -> R<Section<'_>> {
     let mut r = Rd { b: section, pos: 0 };
     if r.uv()? as usize != fn_count {
         return Err("bytecode: function count does not match the unit's AST".into());
     }
-    let strings_start = r.pos;
-    let n = r.len()?;
-    for _ in 0..n {
-        let len = r.len()?;
-        r.bytes(len)?;
+    let strings = r.uv()? as usize;
+    let data_len = r.uv()? as usize;
+    if r.uv()? as usize != section.len() {
+        return Err("bytecode: section length does not match".into());
     }
-    let strings = strings_start..r.pos;
-    let n = r.len()?;
-    let mut entries = Vec::with_capacity(n);
-    let mut idx = 0usize;
-    for k in 0..n {
-        let delta = r.uv()? as usize;
-        idx = if k == 0 {
-            delta
-        } else {
-            idx.checked_add(delta)
-                .filter(|_| delta > 0)
-                .ok_or("bytecode: bad entry order")?
-        };
-        if idx >= fn_count {
-            return Err("bytecode: bad function index".into());
-        }
-        match r.u8()? {
-            0 => entries.push((idx, None)),
-            1 => {
-                let len = r.len()?;
-                let start = r.pos;
-                r.bytes(len)?;
-                entries.push((idx, Some(start..start + len)));
-            }
-            t => return Err(format!("bytecode: bad entry kind {t}")),
-        }
+    let bad = || "bytecode: truncated tables".to_string();
+    let offsets_end = r.pos.checked_add(strings.checked_mul(4).ok_or_else(bad)?).ok_or_else(bad)?;
+    let data_end = offsets_end.checked_add(data_len).ok_or_else(bad)?;
+    let entries_at = data_end;
+    let entries_end = entries_at
+        .checked_add(fn_count.checked_mul(8).ok_or_else(bad)?)
+        .ok_or_else(bad)?;
+    if entries_end > section.len() {
+        return Err(bad());
     }
-    if r.pos != section.len() {
-        return Err("bytecode: trailing bytes in section".into());
-    }
-    Ok(Section { strings, entries })
+    Ok(Section {
+        offsets: &section[r.pos..offsets_end],
+        data: &section[offsets_end..data_end],
+        entries_at,
+    })
 }
 
 fn dec_chunk_at(
@@ -1013,16 +1024,27 @@ fn dec_chunk_at(
 /// A unit whose chunks decode on demand (see [`attach_unit`]).
 struct LazyUnit {
     section: &'static [u8],
-    /// The string table: its byte range, parsed on the first decode.
-    strings_at: std::ops::Range<usize>,
-    strings: RefCell<Option<StrTable<'static>>>,
+    strings: RefCell<StrTable<'static>>,
     /// The unit's AST, which resolves a chunk's inner functions by index (decoding their
     /// headers if need be). Weak: the unit lives as long as any of its functions does, and a
     /// chunk is only decoded for a live function.
     ast: Weak<crate::snapshot::SplitUnit>,
-    /// Each function's entry, by function index: [`NO_ENTRY`], [`REFUSED`], or the chunk's
-    /// `(start, len)` within `section`.
-    entries: Box<[(u32, u32)]>,
+    /// Where each function's entry begins within `section`, by function index: 8 bytes of
+    /// `(start, len)` u32 LE, [`NO_ENTRY`], [`REFUSED`], or the chunk's range within `section`.
+    entries_at: usize,
+}
+
+impl LazyUnit {
+    fn entry(&self, idx: usize) -> (u32, u32) {
+        let at = self.entries_at + idx * 8;
+        match self.section.get(at..at + 8) {
+            Some(b) => (
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            ),
+            None => NO_ENTRY,
+        }
+    }
 }
 
 const NO_ENTRY: (u32, u32) = (0, 0);
@@ -1110,22 +1132,19 @@ pub(crate) fn attach_unit(
 ) -> R<()> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::ChunkDecode);
     let Section {
-        strings: strings_at,
-        entries: list,
+        offsets,
+        data,
+        entries_at,
     } = parse_section(section, ast.fn_count())?;
-    let mut entries = vec![NO_ENTRY; ast.fn_count()].into_boxed_slice();
-    for (idx, e) in list {
-        entries[idx] = match e {
-            None => REFUSED,
-            Some(range) => (range.start as u32, range.len() as u32),
-        };
-    }
     let unit = Rc::new(LazyUnit {
         section,
-        strings_at,
-        strings: RefCell::new(None),
+        strings: RefCell::new(StrTable {
+            offsets,
+            data,
+            interned: Default::default(),
+        }),
         ast: Rc::downgrade(ast),
-        entries,
+        entries_at,
     });
     with_lazy(|lazy| {
         // Drop registrations whose function died (their allocations are only pinned by the
@@ -1141,7 +1160,7 @@ pub(crate) fn attach_unit(
 
 /// [`attach_unit`]'s per-function step.
 fn register(unit: &Rc<LazyUnit>, idx: usize, f: &Rc<Function>) {
-    match unit.entries.get(idx).copied().unwrap_or(NO_ENTRY) {
+    match unit.entry(idx) {
         NO_ENTRY => {}
         REFUSED => {
             if f.code.set(None).is_ok() {
@@ -1199,15 +1218,7 @@ pub(crate) fn take_precompiled(func: &Function) -> Option<Rc<Chunk>> {
     }
     let lookup = |i: usize| ast.function(i).ok();
     let mut strings = unit.strings.borrow_mut();
-    if strings.is_none() {
-        *strings = Some(parse_strings(&unit.section[unit.strings_at.clone()]).ok()?);
-    }
-    let chunk = dec_chunk_at(
-        &unit.section[entry.bytes],
-        strings.as_mut().unwrap(),
-        &lookup,
-    )
-    .ok()?;
+    let chunk = dec_chunk_at(unit.section.get(entry.bytes)?, &mut strings, &lookup).ok()?;
     ATTACHED.fetch_add(1, Relaxed);
     Some(Rc::new(chunk))
 }

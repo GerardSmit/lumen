@@ -275,10 +275,27 @@ function __invalidArgTypeMessage(name, expected, actual) {
   return msg;
 }
 
+// An object built on first use: the proxy forwards every operation to what `build()` returns, so
+// tables that most programs never read (the ERR_* codes) cost a proxy until then.
+function __lazyObject(build) {
+  let built;
+  const real = () => (built ??= build());
+  return new Proxy({}, {
+    get: (_, key) => Reflect.get(real(), key),
+    has: (_, key) => Reflect.has(real(), key),
+    ownKeys: () => Reflect.ownKeys(real()),
+    getOwnPropertyDescriptor: (_, key) => Reflect.getOwnPropertyDescriptor(real(), key),
+    set: (_, key, value) => Reflect.set(real(), key, value),
+    defineProperty: (_, key, desc) => Reflect.defineProperty(real(), key, desc),
+    deleteProperty: (_, key) => Reflect.deleteProperty(real(), key),
+  });
+}
+
 // ERR_* codes: `new __errors.ERR_X(...args)` builds the error Node's `internal/errors` would —
 // the right base class, `.code`, the exact message, `toString()` and a `Name [CODE]: message`
 // stack header. Message builders take Node's argument lists.
-const __errors = (() => {
+const __errors = __lazyObject(() => {
+"lumen:run-once";
   const inspect = (value, opts) => __builtins.get("util").inspect(value, opts);
   const format = (...args) => __builtins.get("util").format(...args);
   const addNumericalSeparator = (val) => {
@@ -459,46 +476,45 @@ const __errors = (() => {
   E("ERR_NO_CRYPTO", "Node.js is not compiled with OpenSSL crypto support", Error);
   E("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM", "The feature %s is unavailable on the current platform, which is being used to run Node.js", TypeError);
   return codes;
-})();
+});
 
 // Argument validators with Node's exact error codes and messages (internal/validators).
 const __validators = (() => {
-  const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE } = __errors;
   const validateString = (value, name) => {
-    if (typeof value !== "string") throw new ERR_INVALID_ARG_TYPE(name, "string", value);
+    if (typeof value !== "string") throw new __errors.ERR_INVALID_ARG_TYPE(name, "string", value);
   };
   const validateNumber = (value, name, min = undefined, max) => {
-    if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
+    if (typeof value !== "number") throw new __errors.ERR_INVALID_ARG_TYPE(name, "number", value);
     if ((min != null && value < min) || (max != null && value > max) ||
         ((min != null || max != null) && Number.isNaN(value))) {
-      throw new ERR_OUT_OF_RANGE(
+      throw new __errors.ERR_OUT_OF_RANGE(
         name,
         `${min != null ? `>= ${min}` : ""}${min != null && max != null ? " && " : ""}${max != null ? `<= ${max}` : ""}`,
         value);
     }
   };
   const validateInteger = (value, name, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) => {
-    if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
-    if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, "an integer", value);
-    if (value < min || value > max) throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
+    if (typeof value !== "number") throw new __errors.ERR_INVALID_ARG_TYPE(name, "number", value);
+    if (!Number.isInteger(value)) throw new __errors.ERR_OUT_OF_RANGE(name, "an integer", value);
+    if (value < min || value > max) throw new __errors.ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
   };
   const validateInt32 = (value, name, min = -2147483648, max = 2147483647) => {
-    if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
-    if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, "an integer", value);
-    if (value < min || value > max) throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
+    if (typeof value !== "number") throw new __errors.ERR_INVALID_ARG_TYPE(name, "number", value);
+    if (!Number.isInteger(value)) throw new __errors.ERR_OUT_OF_RANGE(name, "an integer", value);
+    if (value < min || value > max) throw new __errors.ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
   };
   const validateUint32 = (value, name, positive = false) => {
-    if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
-    if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, "an integer", value);
+    if (typeof value !== "number") throw new __errors.ERR_INVALID_ARG_TYPE(name, "number", value);
+    if (!Number.isInteger(value)) throw new __errors.ERR_OUT_OF_RANGE(name, "an integer", value);
     const min = positive ? 1 : 0;
     const max = 4294967295;
-    if (value < min || value > max) throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
+    if (value < min || value > max) throw new __errors.ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
   };
   const validateBoolean = (value, name) => {
-    if (typeof value !== "boolean") throw new ERR_INVALID_ARG_TYPE(name, "boolean", value);
+    if (typeof value !== "boolean") throw new __errors.ERR_INVALID_ARG_TYPE(name, "boolean", value);
   };
   const validateFunction = (value, name) => {
-    if (typeof value !== "function") throw new ERR_INVALID_ARG_TYPE(name, "Function", value);
+    if (typeof value !== "function") throw new __errors.ERR_INVALID_ARG_TYPE(name, "Function", value);
   };
   const kValidateObjectNone = 0;
   const kValidateObjectAllowNullable = 1;
@@ -507,7 +523,7 @@ const __validators = (() => {
   const validateObject = (value, name, options = kValidateObjectNone) => {
     if (options === kValidateObjectNone) {
       if (value === null || Array.isArray(value) || typeof value !== "object") {
-        throw new ERR_INVALID_ARG_TYPE(name, "Object", value);
+        throw new __errors.ERR_INVALID_ARG_TYPE(name, "Object", value);
       }
       return;
     }
@@ -515,32 +531,32 @@ const __validators = (() => {
     const allowArray = (options & kValidateObjectAllowArray) !== 0;
     const allowFunction = (options & kValidateObjectAllowFunction) !== 0;
     if (value === null) {
-      if (!possiblyNull) throw new ERR_INVALID_ARG_TYPE(name, "Object", value);
+      if (!possiblyNull) throw new __errors.ERR_INVALID_ARG_TYPE(name, "Object", value);
       return;
     }
-    if (!allowArray && Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, "Object", value);
+    if (!allowArray && Array.isArray(value)) throw new __errors.ERR_INVALID_ARG_TYPE(name, "Object", value);
     const type = typeof value;
     if (type !== "object" && !(allowFunction && type === "function")) {
-      throw new ERR_INVALID_ARG_TYPE(name, "Object", value);
+      throw new __errors.ERR_INVALID_ARG_TYPE(name, "Object", value);
     }
   };
   const validateArray = (value, name, minLength = 0) => {
-    if (!Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, "Array", value);
-    if (value.length < minLength) throw new ERR_INVALID_ARG_VALUE(name, value, `must be longer than ${minLength}`);
+    if (!Array.isArray(value)) throw new __errors.ERR_INVALID_ARG_TYPE(name, "Array", value);
+    if (value.length < minLength) throw new __errors.ERR_INVALID_ARG_VALUE(name, value, `must be longer than ${minLength}`);
   };
   const validateOneOf = (value, name, oneOf) => {
     if (!oneOf.includes(value)) {
       const allowed = oneOf.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join(", ");
-      throw new ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
+      throw new __errors.ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
     }
   };
   const validateAbortSignal = (signal, name) => {
     if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
-      throw new ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
+      throw new __errors.ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
     }
   };
   const validateBuffer = (buffer, name = "buffer") => {
-    if (!ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE(name, ["Buffer", "TypedArray", "DataView"], buffer);
+    if (!ArrayBuffer.isView(buffer)) throw new __errors.ERR_INVALID_ARG_TYPE(name, ["Buffer", "TypedArray", "DataView"], buffer);
   };
   return {
     validateString, validateNumber, validateInteger, validateInt32, validateUint32, validateBoolean,
@@ -557,8 +573,8 @@ const __validators = (() => {
 // accessor. `Symbol<Name>` keys name well-known symbols. The `Safe*` classes are the plain ones:
 // the guarantee they add (immunity to user monkey-patching of the prototypes) is not observable
 // to the tests that exercise this glue.
-const __primordials = (() => {
-  const cache = { __proto__: null };
+function __primordialsResolver() {
+"lumen:run-once";
   const uncurryThis = (fn) => function (thisArg, ...args) { return Reflect.apply(fn, thisArg, args); };
   const applyBind = (fn) => function (thisArg, args) { return Reflect.apply(fn, thisArg, args); };
   const TypedArray = Object.getPrototypeOf(Uint8Array);
@@ -671,10 +687,15 @@ const __primordials = (() => {
     }
     throw new TypeError(`primordials: unknown intrinsic ${name}`);
   }
+  return resolve;
+}
+const __primordials = (() => {
+  const cache = { __proto__: null };
+  let resolve;
   return new Proxy(cache, {
     get(target, name) {
       if (typeof name !== "string") return undefined;
-      if (!(name in target)) target[name] = resolve(name);
+      if (!(name in target)) target[name] = (resolve ??= __primordialsResolver())(name);
       return target[name];
     },
   });

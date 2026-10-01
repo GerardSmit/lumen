@@ -695,9 +695,10 @@ impl Runtime {
         }
     }
 
-    /// Pull each `node:` builtin's list of named exports out of the engine (the loader can't
-    /// enumerate a builtin's exports from Rust; see the node module glue). The loader builds a
-    /// builtin's ESM source from its list on first import.
+    /// Each `node:` builtin's list of named exports, from the table lumen-node generates out of
+    /// `esm_exports.js` (the loader can't enumerate a builtin's exports from Rust, and reading
+    /// them from the engine would load the builtins). The loader builds a builtin's ESM source
+    /// from its list on first import.
     fn builtin_modules(&mut self) -> esm::BuiltinModules {
         let global = self.engine.global_this();
         let ctx = self.engine.ctx();
@@ -708,18 +709,12 @@ impl Runtime {
             .and_then(|v| ctx.coerce_string(&v).ok())
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let lists = ctx.get_member(&global, "__esmExportLists").ok();
-        if let Some(lists) = lists {
-            for name in names.split(',').filter(|s| !s.is_empty()) {
-                let exports = match ctx.get_member(&lists, name) {
-                    Ok(v) if !matches!(v, Value::Undefined) => ctx
-                        .coerce_string(&v)
-                        .map(|s| s.to_string())
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
-                map.insert(format!("node:{name}"), exports);
-            }
+        for name in names.split(',').filter(|s| !s.is_empty()) {
+            let exports = lumen_node::ESM_EXPORTS
+                .iter()
+                .find_map(|(n, list)| (*n == name).then_some(*list))
+                .unwrap_or("");
+            map.insert(format!("node:{name}"), exports);
         }
         esm::BuiltinModules(map)
     }

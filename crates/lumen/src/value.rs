@@ -2385,6 +2385,11 @@ mod props;
 pub(crate) use props::FnMaps;
 pub use props::Props;
 pub(crate) use props::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
+
+/// Shared shapes alive in the shape table (for the memory report).
+pub(crate) fn shape_count() -> usize {
+    shape_table_census().shapes
+}
 pub(crate) use props::{jit_props_layout, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK};
 pub(crate) use props::{jit_shared_shape, proto_epoch_addr};
 

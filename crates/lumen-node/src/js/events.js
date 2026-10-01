@@ -3,7 +3,7 @@
 // tolerate an uninitialized receiver; the module-level helpers (once/on/getEventListeners/
 // setMaxListeners/addAbortListener/...) follow Node's validation and error codes.
 
-const { ERR_INVALID_ARG_TYPE, ERR_OUT_OF_RANGE, ERR_UNHANDLED_ERROR } = __errors;
+
 const { validateAbortSignal, validateBoolean, validateFunction, validateInteger, validateObject } = __validators;
 
 const kCapture = Symbol("kCapture");
@@ -57,7 +57,7 @@ Object.defineProperty(EventEmitter, "defaultMaxListeners", {
   get() { return defaultMaxListeners; },
   set(arg) {
     if (typeof arg !== "number" || arg < 0 || Number.isNaN(arg)) {
-      throw new ERR_OUT_OF_RANGE("defaultMaxListeners", "a non-negative number", arg);
+      throw new __errors.ERR_OUT_OF_RANGE("defaultMaxListeners", "a non-negative number", arg);
     }
     defaultMaxListeners = arg;
   },
@@ -76,7 +76,7 @@ function isEventTarget(obj) {
 // setMaxListeners(n, ...eventTargets): the process default with no targets, else each target's.
 EventEmitter.setMaxListeners = function setMaxListeners(n = defaultMaxListeners, ...eventTargets) {
   if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-    throw new ERR_OUT_OF_RANGE("n", "a non-negative number", n);
+    throw new __errors.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
   }
   if (eventTargets.length === 0) {
     defaultMaxListeners = n;
@@ -89,7 +89,7 @@ EventEmitter.setMaxListeners = function setMaxListeners(n = defaultMaxListeners,
       } else if (target != null && typeof target.setMaxListeners === "function") {
         target.setMaxListeners(n);
       } else {
-        throw new ERR_INVALID_ARG_TYPE("eventTargets", ["EventEmitter", "EventTarget"], target);
+        throw new __errors.ERR_INVALID_ARG_TYPE("eventTargets", ["EventEmitter", "EventTarget"], target);
       }
     }
   }
@@ -149,7 +149,7 @@ function emitUnhandledRejectionOrErr(ee, err, type, args) {
 
 EventEmitter.prototype.setMaxListeners = function setMaxListeners(n) {
   if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-    throw new ERR_OUT_OF_RANGE("n", "a non-negative number", n);
+    throw new __errors.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
   }
   this._maxListeners = n;
   return this;
@@ -191,7 +191,7 @@ EventEmitter.prototype.emit = function emit(type, ...args) {
     }
 
     // At least give some kind of context to the user
-    const err = new ERR_UNHANDLED_ERROR(stringifiedEr);
+    const err = new __errors.ERR_UNHANDLED_ERROR(stringifiedEr);
     err.context = er;
     throw err; // Unhandled 'error' event
   }
@@ -498,7 +498,7 @@ function getEventListeners(emitterOrTarget, type) {
     return emitterOrTarget.listeners(type);
   }
   if (isEventTarget(emitterOrTarget)) return eventTargetListeners(emitterOrTarget, type);
-  throw new ERR_INVALID_ARG_TYPE("emitter", ["EventEmitter", "EventTarget"], emitterOrTarget);
+  throw new __errors.ERR_INVALID_ARG_TYPE("emitter", ["EventEmitter", "EventTarget"], emitterOrTarget);
 }
 
 function getMaxListeners(emitterOrTarget) {
@@ -507,7 +507,7 @@ function getMaxListeners(emitterOrTarget) {
   } else if (isEventTarget(emitterOrTarget)) {
     return emitterOrTarget[kMaxEventTargetListeners] ?? defaultMaxListeners;
   }
-  throw new ERR_INVALID_ARG_TYPE("emitter", ["EventEmitter", "EventTarget"], emitterOrTarget);
+  throw new __errors.ERR_INVALID_ARG_TYPE("emitter", ["EventEmitter", "EventTarget"], emitterOrTarget);
 }
 
 class AbortError extends Error {
@@ -568,7 +568,7 @@ function eventTargetAgnosticRemoveListener(emitter, name, listener, flags) {
   } else if (typeof emitter.removeEventListener === "function") {
     emitter.removeEventListener(name, listener, flags);
   } else {
-    throw new ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter);
+    throw new __errors.ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter);
   }
 }
 
@@ -582,7 +582,7 @@ function eventTargetAgnosticAddListener(emitter, name, listener, flags) {
   } else if (typeof emitter.addEventListener === "function") {
     emitter.addEventListener(name, listener, flags);
   } else {
-    throw new ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter);
+    throw new __errors.ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter);
   }
 }
 
@@ -645,7 +645,7 @@ function on(emitter, event, options = kEmptyObject) {
 
     throw(err) {
       if (!err || !(err instanceof Error)) {
-        throw new ERR_INVALID_ARG_TYPE("EventEmitter.AsyncIterator", "Error", err);
+        throw new __errors.ERR_INVALID_ARG_TYPE("EventEmitter.AsyncIterator", "Error", err);
       }
       errorHandler(err);
     },
@@ -735,7 +735,7 @@ function listenersController() {
 // addAbortListener(signal, listener): a one-shot 'abort' listener, returned as a Disposable.
 function addAbortListener(signal, listener) {
   if (signal === undefined) {
-    throw new ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+    throw new __errors.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
   }
   validateAbortSignal(signal, "signal");
   validateFunction(listener, "listener");
@@ -813,7 +813,7 @@ class EventEmitterAsyncResource extends EventEmitter {
   }
 }
 function validateString(value, name) {
-  if (typeof value !== "string") throw new ERR_INVALID_ARG_TYPE(name, "string", value);
+  if (typeof value !== "string") throw new __errors.ERR_INVALID_ARG_TYPE(name, "string", value);
 }
 Object.defineProperty(EventEmitter, "EventEmitterAsyncResource", {
   __proto__: null, enumerable: true, value: EventEmitterAsyncResource, writable: true, configurable: true,

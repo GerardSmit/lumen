@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 /// The named exports of each builtin (`"node:fs"` -> `"appendFile appendFileSync …"`, from the
 /// node glue's `esm_exports.js`). A builtin's synthetic ESM source is built from its list when it
 /// is first imported ([`builtin_source`]), not for every builtin at startup.
-pub struct BuiltinModules(pub HashMap<String, String>);
+pub struct BuiltinModules(pub HashMap<String, &'static str>);
 
 /// The synthetic ESM form of a builtin: the module object as the default export, and each listed
 /// name that is a plain identifier as a named export read from it at import time.

@@ -210,6 +210,8 @@ pub fn extension() -> Extension {
 // ahead-of-time blob (AST, bytecode, compressed function text), loaded at boot.
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node_glue.aot"));
 
+include!(concat!(env!("OUT_DIR"), "/esm_exports.rs"));
+
 fn arg_path(ctx: &mut Ctx, args: &[Value]) -> Result<String, Value> {
     Ok(ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?

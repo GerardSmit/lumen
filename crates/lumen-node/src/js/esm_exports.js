@@ -2,7 +2,7 @@
 // builtin. The builtins load on first use (see build.rs `LAZY`), so their keys cannot be read
 // at startup; this table stands in for `Object.keys` of each, and a test
 // (lumen-runtime/tests/esm_builtin_exports.rs) keeps it equal to them. `process` is not here
-// (see PROCESS_EXPORTS in module.js).
+// (see PROCESS_EXPORTS below).
 const __ESM_EXPORTS = {
   "sqlite": "DatabaseSync StatementSync constants",
   "util/types": "isExternal isProxy isKeyObject isDate isRegExp isArgumentsObject isNativeError isMap isSet isMapIterator isSetIterator isWeakMap isWeakSet isPromise isGeneratorFunction isAsyncFunction isGeneratorObject isModuleNamespaceObject isNumberObject isStringObject isBooleanObject isSymbolObject isBigIntObject isBoxedPrimitive isArrayBuffer isSharedArrayBuffer isAnyArrayBuffer isDataView isArrayBufferView isTypedArray isUint8Array isUint8ClampedArray isUint16Array isUint32Array isInt8Array isInt16Array isInt32Array isFloat16Array isFloat32Array isFloat64Array isBigInt64Array isBigUint64Array isCryptoKey",
@@ -58,3 +58,16 @@ const __ESM_EXPORTS = {
   "dgram": "Socket createSocket _createSocketHandle",
   "wasi": "WASI",
 };
+
+// `process` is populated (env/argv/…) by the runtime *after* this glue runs, so enumerating its
+// keys here would miss them. Emit a fixed superset of its named exports instead; each reads the
+// live `process` object at import time (missing ones are harmless `undefined`).
+const PROCESS_EXPORTS = [
+  "env", "argv", "argv0", "execArgv", "execPath", "platform", "arch", "pid", "ppid",
+  "version", "versions", "cwd", "chdir", "exit", "exitCode", "nextTick", "hrtime",
+  "stdout", "stderr", "stdin", "title", "on", "once", "off", "emit", "emitWarning",
+  "memoryUsage", "uptime", "features", "release", "config", "kill", "umask",
+  "allowedNodeEnvironmentFlags", "setSourceMapsEnabled",
+];
+__ESM_EXPORTS.process = PROCESS_EXPORTS.join(" ");
+__internals.set("esmExportLists", __ESM_EXPORTS);
