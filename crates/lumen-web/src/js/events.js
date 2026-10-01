@@ -1,10 +1,41 @@
 // DOMException + the DOM event model, flattened: one target, no tree, no capture phase.
 
+const domExceptionCodes = [
+  "IndexSizeError", "DOMStringSizeError", "HierarchyRequestError", "WrongDocumentError",
+  "InvalidCharacterError", "NoDataAllowedError", "NoModificationAllowedError", "NotFoundError",
+  "NotSupportedError", "InUseAttributeError", "InvalidStateError", "SyntaxError",
+  "InvalidModificationError", "NamespaceError", "InvalidAccessError", "ValidationError",
+  "TypeMismatchError", "SecurityError", "NetworkError", "AbortError", "URLMismatchError",
+  "QuotaExceededError", "TimeoutError", "InvalidNodeTypeError", "DataCloneError",
+];
+const domExceptionConstants = [
+  "INDEX_SIZE_ERR", "DOMSTRING_SIZE_ERR", "HIERARCHY_REQUEST_ERR", "WRONG_DOCUMENT_ERR",
+  "INVALID_CHARACTER_ERR", "NO_DATA_ALLOWED_ERR", "NO_MODIFICATION_ALLOWED_ERR", "NOT_FOUND_ERR",
+  "NOT_SUPPORTED_ERR", "INUSE_ATTRIBUTE_ERR", "INVALID_STATE_ERR", "SYNTAX_ERR",
+  "INVALID_MODIFICATION_ERR", "NAMESPACE_ERR", "INVALID_ACCESS_ERR", "VALIDATION_ERR",
+  "TYPE_MISMATCH_ERR", "SECURITY_ERR", "NETWORK_ERR", "ABORT_ERR", "URL_MISMATCH_ERR",
+  "QUOTA_EXCEEDED_ERR", "TIMEOUT_ERR", "INVALID_NODE_TYPE_ERR", "DATA_CLONE_ERR",
+];
+
 class DOMException extends Error {
-  constructor(message = "", name = "Error") {
-    super(message);
-    this.name = String(name);
+  constructor(message = "", options = "Error") {
+    if (options !== null && typeof options === "object") {
+      super(message, "cause" in options ? { cause: options.cause } : undefined);
+      this.name = "name" in options ? String(options.name) : "Error";
+    } else {
+      super(message);
+      this.name = String(options);
+    }
   }
+  get code() {
+    const i = domExceptionCodes.indexOf(this.name);
+    return i === -1 ? 0 : i + 1;
+  }
+}
+for (let i = 0; i < domExceptionConstants.length; i++) {
+  const desc = { value: i + 1, writable: false, configurable: false, enumerable: true };
+  Object.defineProperty(DOMException, domExceptionConstants[i], desc);
+  Object.defineProperty(DOMException.prototype, domExceptionConstants[i], desc);
 }
 
 const kResistStopPropagation = Symbol.for("nodejs.internal.kResistStopPropagation");

@@ -414,7 +414,7 @@ class HashJob extends CryptoJob {
     super(mode);
     if (__rc.hashInfo(algorithm) === null) throw invalidDigest(algorithm);
     this.algorithm = algorithm;
-    this.data = bytesOf(data);
+    this.data = new Uint8Array(bytesOf(data));
     this.length = length;
   }
 
@@ -431,7 +431,7 @@ class HmacJob extends CryptoJob {
     this.signMode = signMode;
     this.hash = hash;
     this.key = secretBytes(key);
-    this.data = bytesOf(data);
+    this.data = new Uint8Array(bytesOf(data));
     this.signature = signature === undefined ? undefined : bytesOf(signature);
   }
 
@@ -447,7 +447,7 @@ class PBKDF2Job extends CryptoJob {
     super(mode);
     const info = __rc.hashInfo(digest);
     if (info === null || info[2]) throw invalidDigest(digest);
-    this.args = [digest, bytesOf(password), bytesOf(salt), iterations, keylen];
+    this.args = [digest, new Uint8Array(bytesOf(password)), new Uint8Array(bytesOf(salt)), iterations, keylen];
   }
 
   _run() {
@@ -465,7 +465,7 @@ class ScryptJob extends CryptoJob {
     if (!__rc.scryptCheck(N, r, p, maxmem)) {
       throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS", "Invalid scrypt params: memory limit exceeded");
     }
-    this.args = [bytesOf(password), bytesOf(salt), N, r, p, keylen];
+    this.args = [new Uint8Array(bytesOf(password)), new Uint8Array(bytesOf(salt)), N, r, p, keylen];
   }
 
   _run() {
@@ -485,7 +485,7 @@ class HKDFJob extends CryptoJob {
     if (length > 255 * hi[0]) {
       throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length");
     }
-    this.args = [hash, secretBytes(key), bytesOf(salt), bytesOf(info), length];
+    this.args = [hash, new Uint8Array(secretBytes(key)), new Uint8Array(bytesOf(salt)), new Uint8Array(bytesOf(info)), length];
   }
 
   _run() {
@@ -658,6 +658,10 @@ class KeyObjectHandle {
   }
 
   keyDetail(target) {
+    if (this._type === cryptoBinding.kKeyTypeSecret) {
+      target.length = this._data.byteLength * 8;
+      return target;
+    }
     const flat = __rc.keyDetail(this._type, this._data);
     for (let i = 0; i < flat.length; i += 2) {
       const name = flat[i];
