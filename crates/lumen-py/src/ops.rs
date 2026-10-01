@@ -589,12 +589,19 @@ impl Interp {
                 if !self.has_index(b) {
                     return Ok(None);
                 }
-                let n = self.index_of(b)?;
+                let n = self.repeat_count(b)?;
                 let cur = l.borrow().clone();
-                let mut out = Vec::new();
-                for _ in 0..n.max(0) {
-                    out.extend(cur.iter().cloned());
+                let out = self.repeat_values(&cur, n)?;
+                *l.borrow_mut() = out;
+                Ok(Some(a.clone()))
+            }
+            (Kind::ByteArray(l), BinOp::Mult) => {
+                if !self.has_index(b) {
+                    return Ok(None);
                 }
+                let n = self.repeat_count(b)?;
+                let cur = l.borrow().clone();
+                let out = self.repeat_bytes(&cur, n, crate::limits::MAX_BYTES_LEN)?;
                 *l.borrow_mut() = out;
                 Ok(Some(a.clone()))
             }
@@ -654,6 +661,7 @@ impl Interp {
         match (&oa.kind, op) {
             (Kind::Str(x), BinOp::Add) => {
                 if let Some(y) = b.as_str() {
+                    self.check_str_len(x.s.len() + y.len())?;
                     let mut s = String::with_capacity(x.s.len() + y.len());
                     s.push_str(&x.s);
                     s.push_str(y);
@@ -711,6 +719,9 @@ impl Interp {
             }
             (Kind::List(x), BinOp::Add) => match b {
                 Value::Obj(ob) if matches!(ob.kind, Kind::List(_)) => {
+                    if let Kind::List(y) = &ob.kind {
+                        self.check_seq_len(x.borrow().len() + y.borrow().len())?;
+                    }
                     let mut v = x.borrow().clone();
                     if let Kind::List(y) = &ob.kind {
                         v.extend(y.borrow().iter().cloned());
@@ -721,6 +732,7 @@ impl Interp {
             },
             (Kind::Tuple(x), BinOp::Add) => match b.tuple_items() {
                 Some(y) => {
+                    self.check_seq_len(x.len() + y.len())?;
                     let mut v = x.clone();
                     v.extend(y.iter().cloned());
                     Ok(Some(Value::tuple(v)))
@@ -730,6 +742,7 @@ impl Interp {
             (Kind::Bytes(x), BinOp::Add) => match b {
                 Value::Obj(ob) => match &ob.kind {
                     Kind::Bytes(y) => {
+                        self.check_bytes_len(x.len() + y.len())?;
                         let mut v = x.clone();
                         v.extend_from_slice(y);
                         Ok(Some(Value::bytes(v)))
@@ -796,7 +809,7 @@ impl Interp {
             _ => {
                 if op == BinOp::Mult {
                     if let Value::Obj(ob) = b {
-                        if matches!(ob.kind, Kind::Str(_) | Kind::List(_) | Kind::Tuple(_) | Kind::Bytes(_)) && self.has_index(a) {
+                        if matches!(ob.kind, Kind::Str(_) | Kind::List(_) | Kind::Tuple(_) | Kind::Bytes(_) | Kind::ByteArray(_)) && self.has_index(a) {
                             return self.repeat_seq(ob, a);
                         }
                     }
@@ -806,32 +819,66 @@ impl Interp {
         }
     }
 
+    fn repeat_count(&mut self, n: &Value) -> R<usize> {
+        match self.index_of(n) {
+            Ok(n) => Ok(n.max(0) as usize),
+            Err(e) if self.exc_is(&e, "OverflowError") => Err(self.overflow_err("cannot fit 'int' into an index-sized integer")),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `src` repeated `n` times, refusing results past the sequence cap before allocating.
+    pub fn repeat_values(&mut self, src: &[Value], n: usize) -> R<Vec<Value>> {
+        let Some(total) = src.len().checked_mul(n) else { return Err(self.memory_error()) };
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = self.vec_with_capacity(total, crate::limits::MAX_SEQ_LEN)?;
+        let mut next_poll = 0;
+        for _ in 0..n {
+            out.extend_from_slice(src);
+            if out.len() >= next_poll {
+                self.poll()?;
+                next_poll = out.len() + (1 << 16);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `src` repeated `n` times as bytes, built by doubling.
+    pub fn repeat_bytes(&mut self, src: &[u8], n: usize, max: usize) -> R<Vec<u8>> {
+        let Some(total) = src.len().checked_mul(n) else { return Err(self.memory_error()) };
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = self.vec_with_capacity(total, max)?;
+        out.extend_from_slice(src);
+        while out.len() < total {
+            let take = out.len().min(total - out.len());
+            out.extend_from_within(..take);
+            self.poll()?;
+        }
+        Ok(out)
+    }
+
     fn repeat_seq(&mut self, seq: &Obj, n: &Value) -> R<Option<Value>> {
-        let n = self.index_of(n)?.max(0) as usize;
+        let n = self.repeat_count(n)?;
         match &seq.kind {
             Kind::Str(s) => {
-                if s.s.len().saturating_mul(n) > (1 << 32) {
-                    return Err(self.new_exc_str("MemoryError", ""));
-                }
-                Ok(Some(Value::string(s.s.repeat(n))))
+                let bytes = self.repeat_bytes(s.s.as_bytes(), n, crate::limits::MAX_STR_LEN)?;
+                Ok(Some(Value::string(String::from_utf8(bytes).expect("whole copies of valid UTF-8"))))
             }
             Kind::List(l) => {
-                let l = l.borrow();
-                let mut out = Vec::with_capacity(l.len() * n);
-                for _ in 0..n {
-                    out.extend(l.iter().cloned());
-                }
-                Ok(Some(Value::list(out)))
+                let src = l.borrow().clone();
+                Ok(Some(Value::list(self.repeat_values(&src, n)?)))
             }
-            Kind::Tuple(t) => {
-                let mut out = Vec::with_capacity(t.len() * n);
-                for _ in 0..n {
-                    out.extend(t.iter().cloned());
-                }
-                Ok(Some(Value::tuple(out)))
+            Kind::Tuple(t) => Ok(Some(Value::tuple(self.repeat_values(t, n)?))),
+            Kind::Bytes(b) => Ok(Some(Value::bytes(self.repeat_bytes(b, n, crate::limits::MAX_BYTES_LEN)?))),
+            Kind::ByteArray(b) => {
+                let src = b.borrow().clone();
+                let out = self.repeat_bytes(&src, n, crate::limits::MAX_BYTES_LEN)?;
+                Ok(Some(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(out))))))
             }
-            Kind::Bytes(b) => Ok(Some(Value::bytes(b.repeat(n)))),
-            Kind::ByteArray(b) => Ok(Some(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(b.borrow().repeat(n))))))),
             _ => Ok(None),
         }
     }

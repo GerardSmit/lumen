@@ -56,7 +56,74 @@ fn make_sys(it: &mut Interp) -> Obj {
     set_fn(it, &d, "exc_info", sys_exc_info);
     set_fn(it, &d, "getsizeof", sys_getsizeof);
     set_fn(it, &d, "intern", sys_intern);
+    set_fn(it, &d, "get_int_max_str_digits", sys_get_int_max_str_digits);
+    set_fn(it, &d, "set_int_max_str_digits", sys_set_int_max_str_digits);
+    let flags = make_record(
+        it,
+        "flags",
+        &[
+            ("debug", Value::Int(0)),
+            ("inspect", Value::Int(0)),
+            ("interactive", Value::Int(0)),
+            ("optimize", Value::Int(0)),
+            ("dont_write_bytecode", Value::Int(1)),
+            ("no_user_site", Value::Int(0)),
+            ("no_site", Value::Int(0)),
+            ("ignore_environment", Value::Int(0)),
+            ("verbose", Value::Int(0)),
+            ("bytes_warning", Value::Int(0)),
+            ("quiet", Value::Int(0)),
+            ("hash_randomization", Value::Int(1)),
+            ("isolated", Value::Int(0)),
+            ("dev_mode", Value::Bool(false)),
+            ("utf8_mode", Value::Int(1)),
+            ("int_max_str_digits", Value::Int(it.int_max_str_digits() as i64)),
+        ],
+    );
+    let int_info = make_record(
+        it,
+        "int_info",
+        &[
+            ("bits_per_digit", Value::Int(30)),
+            ("sizeof_digit", Value::Int(4)),
+            ("default_max_str_digits", Value::Int(crate::limits::DEFAULT_INT_MAX_STR_DIGITS as i64)),
+            ("str_digits_check_threshold", Value::Int(crate::limits::INT_MAX_STR_DIGITS_THRESHOLD as i64)),
+        ],
+    );
+    dict_set_str(&d, "flags", flags);
+    dict_set_str(&d, "int_info", int_info);
     m
+}
+
+/// An instance of a fresh class `name` in module `sys` carrying `fields` as attributes.
+fn make_record(it: &mut Interp, name: &str, fields: &[(&str, Value)]) -> Value {
+    let ns = Value::dict(crate::dict::PyDict::new());
+    if let Value::Obj(o) = &ns {
+        dict_set_str(o, "__module__", Value::str("sys"));
+    }
+    let ty = Value::Obj(it.types.type_.clone());
+    let Ok(cls) = it.call(&ty, vec![Value::str(name), Value::tuple(Vec::new()), ns], Vec::new()) else { return Value::None };
+    let Ok(obj) = it.call(&cls, Vec::new(), Vec::new()) else { return Value::None };
+    for (k, v) in fields {
+        if let Value::Obj(n) = Value::str(k) {
+            let _ = it.set_attr(&obj, &n, v.clone());
+        }
+    }
+    obj
+}
+
+fn sys_get_int_max_str_digits(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("get_int_max_str_digits", a, 0, 0)?;
+    Ok(Value::Int(it.int_max_str_digits() as i64))
+}
+
+fn sys_set_int_max_str_digits(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
+    let b = it.bind_args("set_int_max_str_digits", a, kw, &["maxdigits"], 1)?;
+    let n = it.index_of(b[0].as_ref().unwrap_or(&Value::None))?;
+    if n < 0 || !it.set_int_max_str_digits(n as usize) {
+        return Err(it.value_error(&format!("maxdigits must be >= {} or 0 for unlimited", crate::limits::INT_MAX_STR_DIGITS_THRESHOLD)));
+    }
+    Ok(Value::None)
 }
 
 fn sys_exit(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -500,9 +567,14 @@ fn m_factorial(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if n < 0 {
         return Err(it.value_error("factorial() not defined for negative values"));
     }
+    let nf = n as f64;
+    it.check_int_bits((nf * (nf / std::f64::consts::E).log2().max(0.0)) as u128)?;
     let mut acc = BigInt::from_i64(1);
     let mut small: i64 = 1;
     for i in 2..=n {
+        if i & 0xfff == 0 {
+            it.poll()?;
+        }
         match small.checked_mul(i) {
             Some(v) => small = v,
             None => {
@@ -550,8 +622,14 @@ fn comb_perm(it: &mut Interp, a: &[Value], perm: bool) -> R<Value> {
         return Ok(Value::Int(0));
     }
     let k = if perm { k } else { k.min(n - k) };
+    let (nf, kf) = (n as f64, k as f64);
+    let bits = if perm { kf * nf.log2() } else { kf * ((nf / kf.max(1.0)).log2() + std::f64::consts::LOG2_E) };
+    it.check_int_bits(bits as u128)?;
     let mut acc = BigInt::from_i64(1);
     for i in 0..k {
+        if i & 0xff == 0 {
+            it.poll()?;
+        }
         acc = acc.mul(&BigInt::from_i64(n - i));
         if !perm {
             acc = acc.floor_div(&BigInt::from_i64(i + 1));
@@ -774,8 +852,15 @@ fn t_sleep(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         return Err(it.value_error("sleep length must be non-negative"));
     }
     it.flush_out();
-    std::thread::sleep(std::time::Duration::from_secs_f64(s));
-    Ok(Value::None)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(s.min(1e9));
+    loop {
+        it.poll()?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(Value::None);
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(20)));
+    }
 }
 
 fn make_time(it: &mut Interp) -> Obj {

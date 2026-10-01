@@ -92,7 +92,9 @@ impl Interp {
         }
         if i > start {
             let w: String = chars[start..i].iter().collect();
-            s.width = Some(w.parse().map_err(|_| self.value_error("Too many decimal digits in format string"))?);
+            let w: usize = w.parse().ok().filter(|&w| w <= i64::MAX as usize).ok_or_else(|| self.value_error("Too many decimal digits in format string"))?;
+            self.check_str_len(w)?;
+            s.width = Some(w);
         }
         if i < chars.len() && (chars[i] == ',' || chars[i] == '_') {
             s.grouping = Some(chars[i]);
@@ -111,7 +113,8 @@ impl Interp {
                 return Err(self.value_error("Format specifier missing precision"));
             }
             let p: String = chars[start..i].iter().collect();
-            s.precision = Some(p.parse().map_err(|_| self.value_error("Too many decimal digits in format string"))?);
+            let p: usize = p.parse().ok().filter(|&p| p <= i64::MAX as usize).ok_or_else(|| self.value_error("Too many decimal digits in format string"))?;
+            s.precision = Some(p);
         }
         if i < chars.len() {
             s.ty = Some(chars[i]);
@@ -288,7 +291,7 @@ impl Interp {
 
     fn format_int(&mut self, n: &BigInt, spec: &str) -> R<String> {
         if spec.is_empty() {
-            return Ok(n.to_string_radix(10));
+            return self.int_to_decimal(n);
         }
         let sp = self.parse_spec(spec, "int")?;
         if sp.z && !matches!(sp.ty, Some('e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%')) {
@@ -328,7 +331,7 @@ impl Interp {
             'x' | 'X' => (16, "0x"),
             _ => (10, ""),
         };
-        let mut digits = mag.to_string_radix(radix);
+        let mut digits = if radix == 10 { self.int_to_decimal(&mag)? } else { mag.to_string_radix(radix) };
         if ty == 'X' {
             digits = digits.to_uppercase();
         }
@@ -369,6 +372,12 @@ impl Interp {
             return Ok(float_repr(f));
         }
         let sp = self.parse_spec(spec, "float")?;
+        if let Some(p) = sp.precision {
+            if p > i32::MAX as usize {
+                return Err(self.value_error("precision too big"));
+            }
+            self.check_str_len(p)?;
+        }
         let ty = sp.ty;
         if let Some(c) = ty {
             if !matches!(c, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
@@ -710,8 +719,12 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                 i += 1;
             }
             if i > st {
-                width = f[st..i].iter().collect::<String>().parse().ok();
+                let w: usize = f[st..i].iter().collect::<String>().parse().ok().filter(|&w| w <= i64::MAX as usize).ok_or_else(|| it.value_error("width too big"))?;
+                width = Some(w);
             }
+        }
+        if let Some(w) = width {
+            it.check_str_len(w)?;
         }
         let mut prec: Option<usize> = None;
         if i < f.len() && f[i] == '.' {
@@ -730,7 +743,14 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                 while i < f.len() && f[i].is_ascii_digit() {
                     i += 1;
                 }
-                prec = Some(f[st..i].iter().collect::<String>().parse().unwrap_or(0));
+                let digits: String = f[st..i].iter().collect();
+                prec = Some(if digits.is_empty() { 0 } else { digits.parse().map_err(|_| it.value_error("precision too big"))? });
+            }
+            if prec.is_some_and(|p| p > i32::MAX as usize) {
+                return Err(it.value_error("precision too big"));
+            }
+            if let Some(p) = prec {
+                it.check_str_len(p)?;
             }
         }
         while i < f.len() && matches!(f[i], 'l' | 'h' | 'L') {
@@ -826,7 +846,7 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                     'x' | 'X' => 16,
                     _ => 10,
                 };
-                let mut d = big.abs().to_string_radix(radix);
+                let mut d = if radix == 10 { it.int_to_decimal(&big.abs())? } else { big.abs().to_string_radix(radix) };
                 if ty == 'X' {
                     d = d.to_uppercase();
                 }

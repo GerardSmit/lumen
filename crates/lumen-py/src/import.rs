@@ -7,20 +7,6 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-/// Runs `args[0]` as a script with `args` as `sys.argv` on the calling thread and returns the
-/// process exit status. The interpreter recurses natively, so the caller needs a large stack.
-pub fn run_main(args: &[String]) -> i32 {
-    let mut it = Interp::new();
-    let Some(path) = args.first() else {
-        it.write_stderr("usage: lumen-py <script.py> [args]\n");
-        return 2;
-    };
-    it.set_argv(args);
-    let code = it.run_file(path);
-    it.flush_out();
-    code
-}
-
 impl Interp {
     pub fn new_module(&mut self, name: &str) -> Obj {
         let d = Object::new(Kind::Dict(RefCell::new(PyDict::new())));
@@ -53,7 +39,8 @@ impl Interp {
     }
 
     pub fn compile_source(&mut self, src: &str, filename: &str) -> R<Rc<crate::bytecode::Code>> {
-        let module = match crate::parser::parse(src, filename) {
+        let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(src, filename));
+        let module = match parsed {
             Ok(m) => m,
             Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, e.col)),
         };
@@ -113,13 +100,27 @@ impl Interp {
         dict_set_str(&globals, "__builtins__", Value::Obj(self.builtins.clone()));
         self.register_module("__main__", &main);
         self.main_globals = Some(globals.clone());
-        let result = match self.compile_source(src, filename) {
+        self.interrupted = false;
+        let flag = Some(self.interrupt.clone());
+        let outcome = lumen_common::bigint::interruptible(&flag, &None, || match self.compile_source(src, filename) {
             Ok(code) => self.run_code(code, globals.clone(), globals),
             Err(e) => Err(e),
+        });
+        let result = match outcome {
+            Some(r) => r,
+            None => Err(self.interrupt_exc()),
+        };
+        let result = match result {
+            Ok(_) if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) => Err(self.interrupt_exc()),
+            r => r.map_err(|e| self.supersede_by_interrupt(e)),
         };
         let code = match result {
             Ok(_) => 0,
             Err(e) => {
+                if self.is_exc_instance(&e, "KeyboardInterrupt") {
+                    self.interrupted = true;
+                    self.interrupt.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.flush_out();
                 self.report_uncaught(&e)
             }

@@ -168,7 +168,7 @@ impl Interp {
         }
     }
 
-    fn is_exc_instance(&self, e: &Obj, name: &str) -> bool {
+    pub(crate) fn is_exc_instance(&self, e: &Obj, name: &str) -> bool {
         let c = self.type_of_obj(e);
         self.is_subtype(&c, &self.exc_type(name))
     }
@@ -211,6 +211,9 @@ impl Interp {
             };
         }
         self.print_exception(exc);
+        if self.is_exc_instance(exc, "KeyboardInterrupt") {
+            return crate::limits::EXIT_INTERRUPTED;
+        }
         1
     }
 }

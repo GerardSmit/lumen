@@ -43,13 +43,13 @@ impl Interp {
         }
         if keys.iter().all(|k| matches!(k, Value::Int(_))) {
             let ik: Vec<i64> = keys.iter().map(|k| if let Value::Int(i) = k { *i } else { 0 }).collect();
-            order.sort_by_key(|&i| ik[i]);
+            self.sort_order(&mut order, |a, b| ik[a].cmp(&ik[b]))?;
         } else if keys.iter().all(|k| matches!(k, Value::Float(f) if !f.is_nan())) {
             let fk: Vec<f64> = keys.iter().map(|k| if let Value::Float(f) = k { *f } else { 0.0 }).collect();
-            order.sort_by(|&a, &b| fk[a].partial_cmp(&fk[b]).unwrap_or(Ordering::Equal));
+            self.sort_order(&mut order, |a, b| fk[a].partial_cmp(&fk[b]).unwrap_or(Ordering::Equal))?;
         } else if keys.iter().all(|k| matches!(k, Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Str(_)))) {
             let sk: Vec<&str> = keys.iter().map(|k| k.as_str().unwrap_or("")).collect();
-            order.sort_by(|&a, &b| sk[a].as_bytes().cmp(sk[b].as_bytes()));
+            self.sort_order(&mut order, |a, b| sk[a].as_bytes().cmp(sk[b].as_bytes()))?;
         } else {
             order = self.merge_sort_indices(order, &keys)?;
         }
@@ -62,7 +62,50 @@ impl Interp {
         Ok(())
     }
 
+    /// A stable sort of `order` that polls for interrupts between runs: sorted runs of
+    /// `SORT_RUN` indices are merged pairwise.
+    fn sort_order(&mut self, order: &mut Vec<usize>, mut cmp: impl FnMut(usize, usize) -> Ordering) -> R<()> {
+        const SORT_RUN: usize = 1 << 15;
+        let n = order.len();
+        if n <= SORT_RUN {
+            order.sort_by(|&a, &b| cmp(a, b));
+            return Ok(());
+        }
+        for run in order.chunks_mut(SORT_RUN) {
+            run.sort_by(|&a, &b| cmp(a, b));
+            self.poll()?;
+        }
+        let mut buf: Vec<usize> = Vec::with_capacity(n);
+        let mut width = SORT_RUN;
+        while width < n {
+            buf.clear();
+            for pair in order.chunks(2 * width) {
+                let (left, right) = pair.split_at(width.min(pair.len()));
+                let (mut i, mut j) = (0, 0);
+                while i < left.len() && j < right.len() {
+                    if cmp(right[j], left[i]) == Ordering::Less {
+                        buf.push(right[j]);
+                        j += 1;
+                    } else {
+                        buf.push(left[i]);
+                        i += 1;
+                    }
+                    if buf.len() & 0xffff == 0 {
+                        self.poll()?;
+                    }
+                }
+                buf.extend_from_slice(&left[i..]);
+                buf.extend_from_slice(&right[j..]);
+            }
+            std::mem::swap(order, &mut buf);
+            self.poll()?;
+            width *= 2;
+        }
+        Ok(())
+    }
+
     fn key_lt(&mut self, a: &Value, b: &Value) -> R<bool> {
+        self.poll()?;
         let r = self.compare_op(CmpOp::Lt, a, b)?;
         self.truthy(&r)
     }

@@ -181,7 +181,7 @@ impl Interp {
         };
         match &o.kind {
             Kind::Str(s) => Ok(str_repr(&s.s)),
-            Kind::Int(b) => Ok(b.to_string_radix(10)),
+            Kind::Int(b) => self.int_to_decimal(b),
             Kind::Float(f) => Ok(float_repr(*f)),
             Kind::Complex(r, i) => Ok(complex_repr(*r, *i)),
             Kind::Bytes(b) => Ok(bytes_repr(b)),
@@ -300,10 +300,11 @@ impl Interp {
                 Ok(format!("slice({}, {}, {})", a, b, c))
             }
             Kind::BigRange(r) => {
+                let (a, b, c) = (self.int_to_decimal(&r[0])?, self.int_to_decimal(&r[1])?, self.int_to_decimal(&r[2])?);
                 if r[2].cmp(&crate::pyint::BigInt::from_i64(1)) == std::cmp::Ordering::Equal {
-                    Ok(format!("range({}, {})", r[0].to_string_radix(10), r[1].to_string_radix(10)))
+                    Ok(format!("range({}, {})", a, b))
                 } else {
-                    Ok(format!("range({}, {}, {})", r[0].to_string_radix(10), r[1].to_string_radix(10), r[2].to_string_radix(10)))
+                    Ok(format!("range({}, {}, {})", a, b, c))
                 }
             }
             Kind::Range(r) => {

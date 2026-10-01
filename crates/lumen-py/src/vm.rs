@@ -7,6 +7,8 @@ use crate::object::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 pub struct Block {
     pub handler: u32,
@@ -166,6 +168,11 @@ pub struct Interp {
     pub native_depth: usize,
     pub subclass_registry: Vec<std::rc::Weak<Object>>,
     pub ret_val: Value,
+    pub interrupt: Arc<AtomicBool>,
+    pub interrupted: bool,
+    pub heap_limit: usize,
+    pub heap_base: isize,
+    pub int_max_str_digits: usize,
 }
 
 pub enum GenResult {
@@ -207,6 +214,11 @@ impl Interp {
             native_depth: 0,
             subclass_registry: Vec::new(),
             ret_val: Value::None,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            interrupted: false,
+            heap_limit: usize::MAX,
+            heap_base: 0,
+            int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);
@@ -263,6 +275,7 @@ impl Interp {
         if self.frames.len() >= self.recursion_limit {
             return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"));
         }
+        self.poll()?;
         self.frames.push(frame);
         Ok(())
     }
@@ -285,9 +298,19 @@ impl Interp {
             }
             match self.exec(entry) {
                 Ok(v) => return Ok(v),
-                Err(e) => pending = Some(e),
+                Err(e) => pending = Some(self.supersede_by_interrupt(e)),
             }
         }
+    }
+
+    /// While an interrupt is pending, whatever a script was in the middle of (possibly a
+    /// consequence of an aborted big-integer operation) is replaced by `KeyboardInterrupt`, so
+    /// handlers for ordinary exceptions never see it.
+    pub(crate) fn supersede_by_interrupt(&mut self, e: Obj) -> Obj {
+        if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) && !self.exc_is(&e, "KeyboardInterrupt") {
+            return self.interrupt_exc();
+        }
+        e
     }
 
     fn unwind(&mut self, exc: Obj, entry: usize, mut add_tb: bool) -> R<()> {
@@ -623,7 +646,14 @@ impl Interp {
                     let v = self.compare_op(op, &a, &b)?;
                     push!(v);
                 }
-                Op::Jump(t) => fr!().pc = t as usize,
+                Op::Jump(t) => {
+                    let fr = fr!();
+                    let back = (t as usize) < fr.pc;
+                    fr.pc = t as usize;
+                    if back {
+                        self.poll()?;
+                    }
+                }
                 Op::JumpIfFalse(t) => {
                     let v = pop!();
                     let b = match v {
@@ -675,7 +705,7 @@ impl Interp {
                 }
                 Op::ForIter(t) => {
                     let it = fr!().stack.last().unwrap().clone();
-                    match self.iter_next(&it)? {
+                    match self.iter_step(&it)? {
                         Some(v) => push!(v),
                         None => {
                             let fr = fr!();

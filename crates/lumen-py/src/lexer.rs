@@ -100,6 +100,12 @@ pub fn keyword(s: &str) -> Option<&'static str> {
 
 /// Converts digits in `radix` (2, 8 or 16; no separators) to a decimal digit string.
 fn radix_to_decimal(digits: &[char], radix: u64) -> String {
+    if digits.len() > 64 {
+        let text: String = digits.iter().collect();
+        if let Some(n) = lumen_common::bigint::BigInt::parse_radix(&text, radix as u32) {
+            return n.to_string_radix(10);
+        }
+    }
     const BASE: u64 = 1_000_000_000;
     let mut limbs: Vec<u64> = vec![0];
     for d in digits {
@@ -615,6 +621,15 @@ impl<'a> Lexer<'a> {
                         col,
                     );
                 } else {
+                    let limit = crate::limits::literal_digit_limit();
+                    if limit != 0 && int_end > limit {
+                        let msg = crate::limits::digit_limit_message(limit, Some(int_end));
+                        return self.err(
+                            format!("{msg} - Consider hexadecimal for huge integer literals to avoid decimal conversion limits."),
+                            line,
+                            col,
+                        );
+                    }
                     tok = Tok::Int(Rc::from(trimmed));
                 }
             }
