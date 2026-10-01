@@ -788,7 +788,7 @@ function normalizeExecFileArgs(file, args, options, callback) {
 
 function exec(command, options, callback) {
   const opts = normalizeExecArgs(command, options, callback);
-  return module_exports.execFile(opts.file, opts.options, opts.callback);
+  return __childProcessExports.execFile(opts.file, opts.options, opts.callback);
 }
 
 function execFile(file, args, options, callback) {
