@@ -60,12 +60,14 @@ const isUntransferableBuffer = (item) => item !== null && typeof item === "objec
 function serializeForClone(value, transfer = [], transport = false) {
   let list = Array.isArray(transfer) ? transfer : transfer?.transfer ?? [];
   if (!Array.isArray(list)) throw new TypeError("transferList must be an array");
-  if (list.some(isUntransferableBuffer)) list = list.filter((item) => !isUntransferableBuffer(item));
   const ports = globalThis.__lumenPortClone;
+  const isPooledBuffer = (item) => isUntransferableBuffer(item) && !ports?.isPort(item);
+  if (list.some(isPooledBuffer)) list = list.filter((item) => !isPooledBuffer(item));
   const listed = new Set();
   for (let i = 0; i < list.length; i++) {
     const port = list[i];
-    if (ports?.isUntransferable(port) || listed.has(port)) throw new DOMException("Unsupported or duplicate transferable", "DataCloneError");
+    if (listed.has(port)) throw new DOMException(`Transfer list contains duplicate ${ports?.isPort(port) ? "MessagePort" : "ArrayBuffer"}`, "DataCloneError");
+    if (ports?.isUntransferable(port)) throw new DOMException("Unsupported or duplicate transferable", "DataCloneError");
     if (ports?.isPort(port)) ports.validate(port);
     else if (!transport || !globalThis.__cloneTransfer?.isTransferableBuffer(port)) throw new DOMException("Unsupported or detached transferable", "DataCloneError");
     listed.add(port);
@@ -128,7 +130,11 @@ function serializeForClone(value, transfer = [], transport = false) {
       throw new DOMException("a Promise cannot be cloned", "DataCloneError");
     }
     if (ports?.isPort(v)) {
-      if (!listed.has(v)) throw new DOMException("MessagePort must be listed in transferList", "DataCloneError");
+      if (!listed.has(v)) {
+        const error = new TypeError("Object that needs transfer was found in message but not listed in transferList");
+        error.code = "ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST";
+        throw error;
+      }
       memory.set(v, ref); u8(T_PORT); return u32(portIndices.get(v));
     }
     if (typeof SharedArrayBuffer === "function" && v instanceof SharedArrayBuffer) {
