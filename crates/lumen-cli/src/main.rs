@@ -148,6 +148,9 @@ fn real_main() {
     if expose_gc {
         runtime.expose_gc();
     }
+    if opts.flag("--trace-atomics-wait") {
+        runtime.trace_atomics_wait();
+    }
     if let Some(t) = tier {
         runtime.engine().set_tier(t);
     }
@@ -499,7 +502,7 @@ fn eval_global(runtime: &mut Runtime, code: &str, name: &str, print: bool) {
          globalThis.module = m; globalThis.exports = m.exports; }} catch {{}} \
          globalThis.__filename = {name}; globalThis.__dirname = '.'; \
          try {{ for (const name of require('module').builtinModules) {{ \
-           if (name.startsWith('_') || name.includes('/') || name in globalThis) continue; \
+           if (name.startsWith('_') || name.includes('/') || (name in globalThis && name !== 'fs')) continue; \
            const setReal = (v) => Object.defineProperty(globalThis, name, {{ value: v, writable: true, enumerable: true, configurable: true }}); \
            Object.defineProperty(globalThis, name, {{ get() {{ const v = require(name); \
              Object.defineProperty(globalThis, name, {{ get: () => v, set: setReal, enumerable: false, configurable: true }}); return v; }}, \

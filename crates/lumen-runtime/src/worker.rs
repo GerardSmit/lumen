@@ -393,6 +393,9 @@ fn run_worker(
     if !embedded {
         rt.set_worker_interrupt(Arc::clone(&kill));
     }
+    if crate::atomics_wait_trace_enabled() {
+        crate::install_atomics_wait_trace(rt.engine(), spec.thread_id);
+    }
     lumen_host::install(rt.engine(), &[worker_scope_extension()]);
     rt.engine().ctx().op_state().put(WorkerSelf {
         to_main: to_main_tx.clone(),

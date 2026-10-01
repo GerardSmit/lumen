@@ -1448,8 +1448,23 @@ __builtins.set("module", Module);
 __builtins.set("node:module", Module);
 
 // The CLI calls this once the parsed command-line options are in place (see Runtime::set_cli_options).
+// --trace-exit: process.exit() reports where it was called from, like Node's Environment::Exit.
+__internals.set("traceExit", function traceExit(code, threadId) {
+  const who = threadId === undefined || threadId === 0 ? `node:${process.pid}` : `node:${process.pid}, thread:${threadId}`;
+  const stack = String(new Error().stack).split("\n").slice(1).join("\n");
+  process.stderr.write(`(${who}) WARNING: Exited the environment with code ${code}\n${stack}\n`);
+});
+
 globalThis.__lumenApplyOptions = function () {
   const options = process[Symbol.for("lumen.options")];
+  if (options && options["--trace-exit"]) {
+    const reallyExit = process.reallyExit;
+    process.reallyExit = function reallyExit_(code) {
+      __internals.get("traceExit")(code);
+      return Reflect.apply(reallyExit, process, [code]);
+    };
+  }
+  if (options && typeof options["--title"] === "string") process.title = options["--title"];
   if (options && (options["--experimental-permission"] || options["--permission"])) {
     __internals.get("permission").init();
   }

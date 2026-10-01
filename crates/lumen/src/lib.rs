@@ -189,6 +189,7 @@ pub fn well_formed_utf8(s: &str) -> std::borrow::Cow<'_, str> {
 /// Ahead-of-time compilation (see [`Engine::load_precompiled`] and the `lumen-aot` crate):
 /// [`precompile`] / [`precompiled::PrecompileBundle`] run at build time and produce a
 /// source-free blob; [`Precompiled`] wraps one linked into the binary.
+pub use interpreter::{AtomicsWaitEvent, AtomicsWaitPhase};
 pub use precompiled::{precompile, Precompiled, SourceKind};
 
 /// A parse-phase failure. test262 reports these as a `SyntaxError` thrown during parsing.
@@ -299,6 +300,11 @@ impl Engine {
     /// Whether this agent may block in `Atomics.wait` (test262's CanBlockIsTrue flag).
     pub fn set_can_block(&mut self, b: bool) {
         self.interp.can_block = b;
+    }
+
+    /// Observe every synchronous `Atomics.wait` of this realm.
+    pub fn set_atomics_wait_hook(&mut self, hook: Option<Box<dyn Fn(&AtomicsWaitEvent)>>) {
+        self.interp.atomics_wait_hook = hook;
     }
 
     pub fn run_as_agent(

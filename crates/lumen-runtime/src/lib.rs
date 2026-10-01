@@ -493,6 +493,13 @@ impl Runtime {
         &mut self.engine
     }
 
+    /// Node's `--trace-atomics-wait`: every `Atomics.wait` of this realm and of the workers it
+    /// spawns reports its progress on stderr.
+    pub fn trace_atomics_wait(&mut self) {
+        TRACE_ATOMICS_WAIT.store(true, std::sync::atomic::Ordering::SeqCst);
+        install_atomics_wait_trace(&mut self.engine, 0);
+    }
+
     /// Run `path` as a CommonJS program entry (`require.main === module`, with `__dirname`/
     /// `__filename`/`require` in scope), then loop to quiescence. `Err` is the rendered
     /// uncaught error. This is what the CLI uses for `lumen-cli file.js`.
@@ -1434,4 +1441,36 @@ fn js_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+static TRACE_ATOMICS_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print each `Atomics.wait` step of `engine` the way Node's `--trace-atomics-wait` does; the
+/// thread id is Node's (0 for the main thread, a worker's `threadId` otherwise).
+pub(crate) fn install_atomics_wait_trace(engine: &mut Engine, thread_id: u64) {
+    use lumen::AtomicsWaitPhase::*;
+    engine.set_atomics_wait_hook(Some(Box::new(move |event| {
+        let call = format!(
+            "[Thread {thread_id}] Atomics.wait({:#x} + {:x}, {}, {})",
+            event.buffer,
+            event.byte_index,
+            event.value,
+            if event.timeout_ms.is_infinite() {
+                "inf".to_string()
+            } else {
+                format!("{}", event.timeout_ms)
+            }
+        );
+        let outcome = match event.phase {
+            Started => "started",
+            NotEqual => "did not wait because the values mismatched",
+            Woken => "was woken up by another thread",
+            TimedOut => "timed out",
+        };
+        eprintln!("(node:{}) {call} {outcome}", std::process::id());
+    })));
+}
+
+pub(crate) fn atomics_wait_trace_enabled() -> bool {
+    TRACE_ATOMICS_WAIT.load(std::sync::atomic::Ordering::SeqCst)
 }

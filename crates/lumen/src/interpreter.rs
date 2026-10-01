@@ -78,6 +78,26 @@ fn wait_table() -> &'static Mutex<HashMap<(u64, usize), Vec<Waiter>>> {
     static T: OnceLock<Mutex<HashMap<(u64, usize), Vec<Waiter>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Default::default()))
 }
+/// One step of a synchronous `Atomics.wait`, reported to the hook installed with
+/// `Engine::set_atomics_wait_hook`.
+pub struct AtomicsWaitEvent {
+    pub phase: AtomicsWaitPhase,
+    /// Identity of the shared buffer (equal across the agents that share it).
+    pub buffer: u64,
+    pub byte_index: usize,
+    pub value: i128,
+    /// The timeout in milliseconds; infinite when the wait has none.
+    pub timeout_ms: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AtomicsWaitPhase {
+    Started,
+    NotEqual,
+    Woken,
+    TimedOut,
+}
+
 /// Check the expected memory value and register while holding the waiter-list lock.
 /// A concurrent notification cannot slip between the check and registration.
 pub fn futex_register_if(id: u64, index: usize, matches: impl FnOnce() -> bool) -> Option<Waiter> {
@@ -932,6 +952,8 @@ pub struct Interp {
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
+    /// Observer of synchronous `Atomics.wait` calls (Node's `--trace-atomics-wait`).
+    pub(crate) atomics_wait_hook: Option<Box<dyn Fn(&AtomicsWaitEvent)>>,
     /// Pending `Atomics.waitAsync` operations: each carries the result promise and a channel that a
     /// waiter thread sends "ok"/"timed-out" on. The event loop resolves them as they complete.
     pub(crate) pending_async_waits: Vec<(Value, std::sync::mpsc::Receiver<&'static str>)>,
@@ -1538,6 +1560,7 @@ impl Interp {
             shared_buffers: Default::default(),
             immutable_buffers: std::collections::HashSet::new(),
             can_block: true,
+            atomics_wait_hook: None,
             pending_async_waits: Vec::new(),
             pending_timers: Vec::new(),
             agent: None,
