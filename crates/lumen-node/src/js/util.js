@@ -1430,10 +1430,8 @@ function codedError(Ctor, code, message) {
 const sysErrorMap = () => __uvErrmap();
 
 function validateErrno(err) {
-  if (typeof err !== "number") throw new TypeError('The "err" argument must be of type number.');
-  if (err >= 0 || !Number.isInteger(err)) {
-    throw new RangeError(`The value of "err" is out of range. It must be a negative integer. Received ${err}`);
-  }
+  if (typeof err !== "number") throw new __errors.ERR_INVALID_ARG_TYPE("err", "number", err);
+  if (err >= 0 || !Number.isSafeInteger(err)) throw new __errors.ERR_OUT_OF_RANGE("err", "a negative integer", err);
 }
 function getSystemErrorName(err) {
   validateErrno(err);

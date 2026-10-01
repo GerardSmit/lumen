@@ -160,6 +160,7 @@ pub fn extension() -> Extension {
                 ops![
                     "info" (0) => op_os_info,
                     "hostname" (0) => op_hostname,
+                    "sysinfo" (0) => op_os_sysinfo,
                     "getPriority" (1) => op_os_getpriority,
                     "setPriority" (2) => op_os_setpriority,
                 ],
@@ -1449,6 +1450,125 @@ pub fn shutdown_native_resources(ctx: &mut Ctx) {
     napi::shutdown(ctx);
     #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
     sqlite::close_all(ctx);
+}
+
+/// Live facts for `os.uptime/loadavg/freemem/userInfo`: `{ uptime, load1/5/15, freemem, uid, gid,
+/// username, shell, homedir }`, read fresh on each call.
+fn op_os_sysinfo(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let obj = Value::Obj(ctx.new_object());
+    let (uptime, freemem) = uptime_and_freemem();
+    let _ = ctx.set_member(&obj, "uptime", Value::Num(uptime));
+    let _ = ctx.set_member(&obj, "freemem", Value::Num(freemem));
+    let load = loadavg();
+    for (key, n) in ["load1", "load5", "load15"].into_iter().zip(load) {
+        let _ = ctx.set_member(&obj, key, Value::Num(n));
+    }
+    let user = passwd_user();
+    let _ = ctx.set_member(&obj, "uid", Value::Num(user.uid as f64));
+    let _ = ctx.set_member(&obj, "gid", Value::Num(user.gid as f64));
+    let _ = ctx.set_member(&obj, "username", Value::from_string(user.name));
+    let _ = ctx.set_member(&obj, "shell", user.shell.map(Value::from_string).unwrap_or(Value::Null));
+    let _ = ctx.set_member(&obj, "homedir", Value::from_string(user.dir));
+    Ok(obj)
+}
+
+struct PasswdUser {
+    uid: i64,
+    gid: i64,
+    name: String,
+    dir: String,
+    shell: Option<String>,
+}
+
+#[cfg(unix)]
+fn passwd_user() -> PasswdUser {
+    use std::ffi::CStr;
+    let text = |p: *const std::os::raw::c_char| {
+        (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    };
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let entry = unsafe { libc::getpwuid(uid) };
+    let (name, dir, shell) = if entry.is_null() {
+        (None, None, None)
+    } else {
+        unsafe { (text((*entry).pw_name), text((*entry).pw_dir), text((*entry).pw_shell)) }
+    };
+    PasswdUser {
+        uid: uid as i64,
+        gid: gid as i64,
+        name: name.unwrap_or_default(),
+        dir: dir.or_else(passwd_home_dir).unwrap_or_default(),
+        shell: shell.filter(|s| !s.is_empty()),
+    }
+}
+
+#[cfg(not(unix))]
+fn passwd_user() -> PasswdUser {
+    PasswdUser { uid: -1, gid: -1, name: String::new(), dir: passwd_home_dir().unwrap_or_default(), shell: None }
+}
+
+#[cfg(unix)]
+fn loadavg() -> [f64; 3] {
+    let mut out = [0f64; 3];
+    let n = unsafe { libc::getloadavg(out.as_mut_ptr(), 3) };
+    if n < 3 {
+        return [0.0; 3];
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn loadavg() -> [f64; 3] {
+    [0.0; 3]
+}
+
+#[cfg(target_os = "macos")]
+fn uptime_and_freemem() -> (f64, f64) {
+    fn sysctl<T: Default>(name: &str) -> Option<T> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let mut value = T::default();
+        let mut len = std::mem::size_of::<T>();
+        let rc = unsafe {
+            libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        (rc == 0).then_some(value)
+    }
+    let uptime = sysctl::<libc::timeval>("kern.boottime")
+        .map(|boot| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            (now - boot.tv_sec as f64 - boot.tv_usec as f64 / 1e6).max(0.0)
+        })
+        .unwrap_or(0.0);
+    let free_pages = sysctl::<u32>("vm.page_free_count").unwrap_or(0) as f64;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as f64;
+    (uptime, free_pages * page)
+}
+
+#[cfg(target_os = "linux")]
+fn uptime_and_freemem() -> (f64, f64) {
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|t| t.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()))
+        .unwrap_or(0.0);
+    let free = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|t| {
+            t.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| {
+                l.split_whitespace().nth(1).and_then(|n| n.parse::<f64>().ok())
+            })
+        })
+        .map(|kb| kb * 1024.0)
+        .unwrap_or(0.0);
+    (uptime, free)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn uptime_and_freemem() -> (f64, f64) {
+    (0.0, 0.0)
 }
 
 #[cfg(unix)]
