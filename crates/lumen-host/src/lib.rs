@@ -627,6 +627,74 @@ pub struct RealmProcess {
     pub stdout: std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
     pub stderr: std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
     pub spawner: Option<std::sync::Arc<dyn Spawner>>,
+    /// `process.execPath`. `child_process` starts a program with exactly this path as a child
+    /// realm (see [`RealmLauncher`]) instead of an OS process: nothing on disk runs a realm.
+    pub exec_path: String,
+    pub launcher: Option<std::sync::Arc<dyn RealmLauncher>>,
+    /// Descriptors the host owns and closes when the realm ends (a child realm's IPC channel):
+    /// the program closing one only shuts the connection down.
+    pub owned_fds: Vec<i32>,
+    /// Bit `n` is set while the program has a `process.on('SIG…')` listener for signal number
+    /// `n`; read by the launching realm's threads to choose between delivering a signal to the
+    /// program and its default action.
+    pub signal_handlers: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Stand-in pids of child realms start here: far above any OS pid, so signalling one by number
+/// never reaches a real process.
+pub const REALM_PID_BASE: u32 = 1 << 30;
+
+/// What a child realm runs with: the same things an OS process gets from `spawn`.
+pub struct ChildRealmRequest {
+    /// `process.argv`: `[execPath, script, ...args]`.
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: std::path::PathBuf,
+    pub stdin: Box<dyn std::io::Read + Send>,
+    pub stdout: Box<dyn std::io::Write + Send>,
+    pub stderr: Box<dyn std::io::Write + Send>,
+    /// The realm's stop request, shared with whoever feeds its stdin so a blocked read can give
+    /// up when the realm is stopped.
+    pub interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Descriptors in `resources` the program may name (see [`RealmProcess::owned_fds`]).
+    pub owned_fds: Vec<i32>,
+    /// Kept alive for as long as the realm runs and dropped after it ends (the realm's end of an
+    /// IPC channel, say).
+    pub resources: Vec<Box<dyn Send>>,
+}
+
+/// How a child realm ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildRealmExit {
+    Exited(i32),
+    /// Stopped by [`ChildRealm::terminate`] with this signal number.
+    Signalled(i32),
+}
+
+/// A running child realm.
+pub trait ChildRealm: Send + Sync {
+    /// The stand-in pid (at least [`REALM_PID_BASE`]).
+    fn pid(&self) -> u32;
+    /// Stop the realm at once; it then ends as [`ChildRealmExit::Signalled`] with `signal`. No
+    /// effect once it has ended.
+    fn terminate(&self, signal: i32);
+    /// Deliver `signal` as an OS would: `SIGKILL` stops the realm at once; any other signal
+    /// reaches the program's `process.on` listeners when it has some, else takes its default
+    /// action (terminate for `SIGHUP`, `SIGINT`, `SIGQUIT` and `SIGTERM`, ignore the rest).
+    fn signal(&self, signal: i32);
+    /// `None` while the realm runs.
+    fn exit(&self) -> Option<ChildRealmExit>;
+}
+
+/// Starts child realms on threads of their own, for `child_process` when the program spawns its
+/// own `process.execPath`. An embedder's realm tree owns what it launches: ending the parent
+/// stops and joins its children.
+pub trait RealmLauncher: Send + Sync {
+    /// Fails with `WouldBlock` when the realm tree already runs as many realms as it may.
+    fn launch(&self, request: ChildRealmRequest) -> std::io::Result<std::sync::Arc<dyn ChildRealm>>;
+    /// Deliver `signal` to the live child realm with stand-in pid `pid`; `false` when there is
+    /// none.
+    fn signal_pid(&self, pid: u32, signal: i32) -> bool;
 }
 
 impl RealmProcess {

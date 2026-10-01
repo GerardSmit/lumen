@@ -43,6 +43,7 @@ pub(crate) fn extension() -> Extension {
                     "chdir" (1) => op_chdir,
                     "abort" (0) => op_abort,
                     "kill" (2) => op_kill,
+                    "signalHandler" (2) => op_signal_handler,
                     "umask" (1) => op_umask,
                     "getuid" (0) => op_getuid,
                     "geteuid" (0) => op_geteuid,
@@ -760,12 +761,52 @@ fn kill_error(ctx: &mut Ctx, code: &str, errno: i32) -> Value {
     err
 }
 
+/// `(signal, listening)` — record whether the program has a `process.on` listener for `signal`,
+/// so the launching realm can deliver it (see `RealmProcess::signal_handlers`). Answers whether
+/// the program is an embedded realm (signal 0 only asks).
+fn op_signal_handler(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let signal = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i64;
+    let listening = matches!(args.get(1), Some(Value::Bool(true)));
+    let Some(realm) = ctx.op_state().get::<RealmProcess>() else {
+        return Ok(Value::Bool(false));
+    };
+    if (1..64).contains(&signal) {
+        let bit = 1u64 << signal;
+        if listening {
+            realm.signal_handlers.fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            realm.signal_handlers.fetch_and(!bit, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// `process.kill` of a child realm's stand-in pid: delivered by the realm that launched it.
+/// `None` for any other pid.
+fn kill_child_realm(ctx: &mut Ctx, pid: i32, signal: i32) -> Option<Result<Value, Value>> {
+    if pid < lumen_host::REALM_PID_BASE as i32 {
+        return None;
+    }
+    let launcher = ctx
+        .op_state()
+        .get::<RealmProcess>()
+        .and_then(|realm| realm.launcher.clone())?;
+    Some(if launcher.signal_pid(pid as u32, signal) {
+        Ok(Value::Undefined)
+    } else {
+        Err(kill_error(ctx, "ESRCH", -3))
+    })
+}
+
 /// `(pid, signal)` — deliver `signal` to `pid` via libc `kill(2)`. The JS wrapper maps signal
 /// names to numbers.
 #[cfg(unix)]
 fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
+    if let Some(result) = kill_child_realm(ctx, pid, sig) {
+        return result;
+    }
     // The realm's own pid is the host's, and 0 / negative pids reach the host's process group.
     if pid <= 0 || pid as u32 == lumen_host::sysfs::process_id() {
         refuse_in_realm(ctx, "process.kill of the host process")?;
@@ -810,6 +851,9 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
 
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
+    if let Some(result) = kill_child_realm(ctx, pid, sig) {
+        return result;
+    }
     if pid <= 0 || pid as u32 == lumen_host::sysfs::process_id() {
         refuse_in_realm(ctx, "process.kill of the host process")?;
     }

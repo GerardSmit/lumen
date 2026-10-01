@@ -1486,6 +1486,54 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
     return result;
   };
 
+  // Signals reach an embedded realm only from its launcher (a parent realm's `child.kill()` or
+  // `process.kill(childPid)`): the realm records which signals have listeners, and `deliver`
+  // emits one when the launcher sends it. The listener methods are wrapped rather than observed
+  // through `newListener`, which would load `events` at startup.
+  {
+    const setHandler = proc[Symbol.for("lumen.signalHandler")];
+    if (typeof setHandler === "function" && setHandler(0, false) === true) {
+      // `process.platform` is stamped after this glue runs, so the tables are built on first use.
+      let table;
+      const signals = () => {
+        if (table === undefined) {
+          const linux = process.platform !== "darwin";
+          const numbers = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGALRM: 14, SIGTERM: 15, SIGWINCH: 28,
+            SIGUSR1: linux ? 10 : 30, SIGUSR2: linux ? 12 : 31, SIGCONT: linux ? 18 : 19 };
+          const names = {};
+          for (const [name, number] of Object.entries(numbers)) names[number] = name;
+          table = { numbers, names };
+        }
+        return table;
+      };
+      const sync = (event) => {
+        const number = typeof event === "string" ? signals().numbers[event] : undefined;
+        if (number) setHandler(number, proc.listenerCount(event) > 0);
+      };
+      for (const method of ["on", "addListener", "once", "prependListener", "prependOnceListener",
+        "off", "removeListener", "removeAllListeners"]) {
+        const inner = proc[method];
+        proc[method] = function (...args) {
+          const result = Reflect.apply(inner, this, args);
+          if (this === proc) {
+            if (args.length === 0) for (const name of Object.keys(signals().numbers)) sync(name);
+            else sync(args[0]);
+          }
+          return result;
+        };
+      }
+      Object.defineProperty(globalThis, "__lumen_deliver_signal", {
+        configurable: true,
+        value: (number) => {
+          const name = signals().names[number];
+          if (name === undefined || proc.listenerCount(name) === 0) return false;
+          proc.emit(name, name, number);
+          return true;
+        },
+      });
+    }
+  }
+
   // Semi-internal underscore surface Node exposes as own keys. Honest no-ops / empty collectors;
   // _rawDebug writes straight to stderr (its one real behavior).
   proc._getActiveHandles = () => [];

@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ use lumen_host::{
     TaskRegistry, ThreadPool, Value,
 };
 
+mod child_realm;
 mod console;
 mod esm;
 mod jsx;
@@ -141,7 +142,19 @@ pub struct InterruptHandle {
     wake: mpsc::Sender<TaskCompletion>,
 }
 
+/// The wake-up that carries a signal for the realm's own `process.on` listeners: its payload is
+/// the signal number.
+const SIGNAL_TASK: TaskId = TaskId::MAX - 1;
+
 impl InterruptHandle {
+    /// Queue `signal` for the realm's loop, which emits it to the program's listeners.
+    pub(crate) fn deliver(&self, signal: i32) {
+        let _ = self.wake.send(TaskCompletion {
+            task: SIGNAL_TASK,
+            result: Box::new(signal),
+        });
+    }
+
     pub fn interrupt(&self) {
         self.interrupt.store(true, Ordering::SeqCst);
         // No task has this id, so the loop wakes, finds nothing to settle, and sees the flag.
@@ -213,12 +226,15 @@ impl Drop for Deadline {
 /// What a worker inherits from an embedded parent realm.
 #[derive(Clone)]
 pub(crate) struct WorkerEmbedding {
+    exec_path: String,
     pub(crate) cwd: PathBuf,
     env: Vec<(String, String)>,
     stdout: SharedWriter,
     stderr: SharedWriter,
     interrupt: Arc<AtomicBool>,
     spawner: Option<Arc<dyn Spawner>>,
+    owned_fds: Vec<i32>,
+    tree: Arc<child_realm::RealmTree>,
 }
 
 /// Workers for blocking work. libuv's default; revisit when async fs lands and has numbers.
@@ -269,6 +285,10 @@ pub struct Runtime {
     idle_gc_followup: bool,
     /// Embedded realms only: the stop request (see [`Terminator`]).
     interrupt: Option<Arc<AtomicBool>>,
+    /// Embedded realms only: the child realms this one started (see `child_realm`).
+    child_realms: Option<Arc<child_realm::ChildRealms>>,
+    /// A signal's default action stopped the realm (see `deliver_signal`).
+    signal_exit: Option<i32>,
     /// Wakes the loop when it is blocked on completions.
     wake: mpsc::Sender<TaskCompletion>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -300,6 +320,12 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         self.deadline.take();
+        // Nothing reads a child's output once its launcher is going away: wake any child blocked
+        // on a full pipe before waiting for it.
+        lumen_node::close_child_pipes(self.engine.ctx());
+        if let Some(children) = &self.child_realms {
+            children.shutdown();
+        }
         lumen_node::shutdown_native_addons(self.engine.ctx());
         self.release_blocked_io();
     }
@@ -328,19 +354,26 @@ impl Runtime {
     /// An engine with the runtime globals installed: timers, streaming `console`, minimal
     /// `process`, `queueMicrotask`.
     pub fn new() -> Runtime {
-        Self::build(None)
+        Self::build(None, None)
     }
 
     /// A runtime for a realm inside a host process (see [`Embedding`]). Runs on the calling
     /// thread, which must have a large stack (the CLI uses 256 MiB; the engine recurses natively).
     pub fn new_embedded(embedding: Embedding) -> Runtime {
-        Self::build(Some(embedding))
+        Self::build(Some(embedding), None)
+    }
+
+    /// A child realm's runtime: embedded, and counted in its launcher's realm tree.
+    pub(crate) fn new_child(embedding: Embedding, tree: Arc<child_realm::RealmTree>) -> Runtime {
+        Self::build(Some(embedding), Some(tree))
     }
 
     /// A worker's runtime: embedded like its parent when the parent is, else process-backed.
     pub(crate) fn new_worker(parent: Option<WorkerEmbedding>) -> Runtime {
-        Self::build(parent.map(|p| Embedding {
-            argv: Vec::new(),
+        let owned_fds = parent.as_ref().map(|p| p.owned_fds.clone()).unwrap_or_default();
+        let tree = parent.as_ref().map(|p| Arc::clone(&p.tree));
+        let mut runtime = Self::build(parent.map(|p| Embedding {
+            argv: vec![p.exec_path],
             env: p.env,
             cwd: p.cwd,
             stdin: Box::new(std::io::empty()),
@@ -349,10 +382,15 @@ impl Runtime {
             interrupt: p.interrupt,
             live_object_limit: None,
             spawner: p.spawner,
-        }))
+        }), tree);
+        // A worker shares its realm's descriptors: closing one there must not close the host's.
+        if let Some(realm) = runtime.engine.ctx().host_mut::<RealmProcess>() {
+            realm.owned_fds = owned_fds;
+        }
+        runtime
     }
 
-    fn build(embedding: Option<Embedding>) -> Runtime {
+    fn build(embedding: Option<Embedding>, tree: Option<Arc<child_realm::RealmTree>>) -> Runtime {
         let boot = lumen_host::startup_timing().then(Instant::now);
         let (tx, rx) = mpsc::channel();
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
@@ -374,6 +412,7 @@ impl Runtime {
         // Before install: the extensions' js_init already asks for the cwd.
         let mut embedded_io = None;
         let mut interrupt = None;
+        let mut child_realms = None;
         if let Some(mut e) = embedding {
             // `process.cwd()` never carries Windows' verbatim `\\?\` prefix; JS path code does
             // not expect it.
@@ -382,7 +421,19 @@ impl Runtime {
             if let Some(limit) = e.live_object_limit {
                 engine.set_live_object_limit(limit);
             }
+            let exec_path = e.argv.first().cloned().unwrap_or_else(|| "lumen".to_string());
+            let tree = tree.unwrap_or_default();
+            let launcher = Arc::new(child_realm::ChildRealms::new(
+                e.spawner.clone(),
+                e.live_object_limit,
+                Arc::clone(&tree),
+            ));
+            child_realms = Some(Arc::clone(&launcher));
             engine.ctx().op_state().put(RealmProcess {
+                exec_path: exec_path.clone(),
+                launcher: Some(launcher),
+                owned_fds: Vec::new(),
+                signal_handlers: Arc::new(AtomicU64::new(0)),
                 cwd: e.cwd.clone(),
                 exit_code: None,
                 interrupt: Arc::clone(&e.interrupt),
@@ -392,12 +443,15 @@ impl Runtime {
                 spawner: e.spawner.clone(),
             });
             engine.ctx().op_state().put(WorkerEmbedding {
+                exec_path,
                 cwd: e.cwd,
                 env: e.env.clone(),
                 stdout: e.stdout.clone(),
                 stderr: e.stderr.clone(),
                 interrupt: Arc::clone(&e.interrupt),
                 spawner: e.spawner,
+                owned_fds: Vec::new(),
+                tree,
             });
             interrupt = Some(e.interrupt);
             embedded_io = Some((e.argv, e.env, e.stdout, e.stderr));
@@ -475,6 +529,8 @@ impl Runtime {
             engine,
             pool,
             interrupt,
+            child_realms,
+            signal_exit: None,
             wake: tx,
             completions: rx,
             fire_error,
@@ -1141,6 +1197,12 @@ impl Runtime {
     /// Settle one completed task: decode the payload, then run the success callback — or the
     /// failure one (a promise's reject) when the decoder says the work failed.
     fn dispatch(&mut self, done: TaskCompletion) {
+        if done.task == SIGNAL_TASK {
+            if let Ok(signal) = done.result.downcast::<i32>() {
+                self.deliver_signal(*signal);
+            }
+            return;
+        }
         let entry = self
             .engine
             .ctx()
@@ -1162,6 +1224,51 @@ impl Runtime {
         self.engine.ctx().set_async_context(outer);
         self.checkpoint();
         self.report_unhandled_rejections();
+    }
+
+    /// Emit `signal` to the program's `process.on` listeners; with none (the program dropped
+    /// them since the sender looked), the signal takes its default action.
+    fn deliver_signal(&mut self, signal: i32) {
+        let global = self.engine.global_this();
+        let deliver = self
+            .engine
+            .ctx()
+            .get_member(&global, "__lumen_deliver_signal")
+            .unwrap_or(Value::Undefined);
+        let handled = match self.engine.call_function(
+            &deliver,
+            Value::Undefined,
+            &[Value::Num(signal as f64)],
+        ) {
+            Ok(Value::Bool(handled)) => handled,
+            Ok(_) => false,
+            Err(error) => {
+                self.report_uncaught(&error);
+                true
+            }
+        };
+        if !handled && child_realm::terminates_by_default(signal) {
+            self.signal_exit.get_or_insert(signal);
+            if let Some(flag) = &self.interrupt {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        self.checkpoint();
+        self.report_unhandled_rejections();
+    }
+
+    /// The signal that stopped this realm by its default action, if one did.
+    pub(crate) fn signal_exit(&self) -> Option<i32> {
+        self.signal_exit
+    }
+
+    /// The live signal-listener mask (see [`RealmProcess::signal_handlers`]).
+    pub(crate) fn signal_handlers(&mut self) -> Option<Arc<AtomicU64>> {
+        self.engine
+            .ctx()
+            .op_state()
+            .get::<RealmProcess>()
+            .map(|realm| Arc::clone(&realm.signal_handlers))
     }
 
     /// Node's tick checkpoint (`processTicksAndRejections`): run the nextTick queue (including

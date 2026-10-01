@@ -1305,6 +1305,9 @@ pub fn shutdown_native_resources(ctx: &mut Ctx) {
     sqlite::close_all(ctx);
 }
 
+/// Wake child realms blocked on their stdio pipes (see `child::close_child_pipes`).
+pub fn close_child_pipes(ctx: &mut Ctx) { child::close_child_pipes(ctx); }
+
 #[cfg(unix)]
 fn passwd_home_dir() -> Option<String> {
     use std::ffi::{c_char, c_uint, CStr};

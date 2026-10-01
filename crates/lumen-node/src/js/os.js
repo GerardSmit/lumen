@@ -24,6 +24,28 @@ function validatePid(pid, name) {
   return pid;
 }
 
+// homedir/tmpdir read the realm's own process.env on every call, as Node does, so an embedded
+// realm sees the environment it was given and not the host process's startup values.
+function __envValue(...names) {
+  for (const name of names) {
+    const value = process.env[name];
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return undefined;
+}
+function __homedir() {
+  const names = __osInfo.platform === "win32" ? ["USERPROFILE", "HOME"] : ["HOME", "USERPROFILE"];
+  return __envValue(...names) || __osInfo.homedir;
+}
+function __tmpdir() {
+  const win = __osInfo.platform === "win32";
+  let path = __envValue(...(win ? ["TEMP", "TMP"] : ["TMPDIR", "TMP", "TEMP"]));
+  if (path === undefined) return __osInfo.tmpdir;
+  const keep = win ? /^[A-Za-z]:\\?$/ : /^\/$/;
+  if (path.length > 1 && /[\\/]$/.test(path) && !keep.test(path)) path = path.slice(0, -1);
+  return path;
+}
+
 const os = {
   EOL,
   platform: () => __osInfo.platform,
@@ -31,8 +53,8 @@ const os = {
   type: () => __osInfo.type,
   release: () => __osInfo.release,
   version: () => __osInfo.version,
-  homedir: () => __osInfo.homedir,
-  tmpdir: () => __osInfo.tmpdir,
+  homedir: () => __homedir(),
+  tmpdir: () => __tmpdir(),
   hostname: () => __os.hostname(),
   endianness: () => __osInfo.endianness,
   // cpus(): count, model and speed are real (one model for every core); per-core times aren't
@@ -90,7 +112,7 @@ const os = {
   loadavg: () => [0, 0, 0],
   userInfo: () => ({
     username: (__osInfo.homedir.split(/[\\/]/).pop()) || "",
-    homedir: __osInfo.homedir,
+    homedir: __homedir(),
     shell: null,
     uid: -1,
     gid: -1,
