@@ -53,16 +53,79 @@ let __traceEvent = null;
 function __setTraceEvent(fn) {
   __traceEvent = fn;
 }
-// Set by node:async_hooks while any hook is enabled; `type` names the resource being scheduled.
+// node:async_hooks. Once that module is loaded (`__asyncTracking`), every async resource made
+// from then on gets an id (`__asyncIdSymbol` / `__triggerIdSymbol` on the resource), and its
+// callbacks run on the execution stack (`__asyncIds`/`__asyncTriggers`/`__asyncResources`), which
+// promise reactions also push to through the engine's promise hooks. Until then none of this
+// costs anything. `__asyncHooks` holds the emitters while any hook is enabled.
+let __asyncTracking = false;
 let __asyncHooks = null;
+let __asyncIdCounter = 1;
+const __asyncIds = [];
+const __asyncTriggers = [];
+const __asyncResources = [];
+const __asyncIdSymbol = Symbol("async_id_symbol");
+const __triggerIdSymbol = Symbol("trigger_async_id_symbol");
 function __setAsyncHooks(runtime) {
   __asyncHooks = runtime;
 }
-function __destroyAsyncResource(resource) {
-  if (__asyncHooks !== null) __asyncHooks.destroyOf(resource);
+function __executionAsyncId() {
+  const n = __asyncIds.length;
+  return n === 0 ? 1 : __asyncIds[n - 1];
 }
+// Give `resource` an async id (triggered by the running resource) and emit its init.
+function __initAsyncResource(resource, type) {
+  const id = ++__asyncIdCounter;
+  const trigger = __executionAsyncId();
+  resource[__asyncIdSymbol] = id;
+  resource[__triggerIdSymbol] = trigger;
+  if (__asyncHooks !== null) __asyncHooks.init(id, type, trigger, resource);
+  return id;
+}
+const __asyncDestroyedSymbol = Symbol("asyncDestroyed");
+function __destroyAsyncResource(resource) {
+  if (__asyncHooks !== null && resource[__asyncIdSymbol] !== undefined && !resource[__asyncDestroyedSymbol]) {
+    resource[__asyncDestroyedSymbol] = true;
+    __asyncHooks.destroy(resource[__asyncIdSymbol]);
+  }
+}
+// Run `fn` as a callback of `resource` (which has an id) inside async context `context`.
+function __runAsyncCallback(resource, context, fn, thisArg, args) {
+  const id = resource[__asyncIdSymbol];
+  const previous = __asyncContextSet(context);
+  const depth = __asyncIds.length;
+  __asyncIds.push(id);
+  __asyncTriggers.push(resource[__triggerIdSymbol]);
+  __asyncResources.push(resource);
+  if (__asyncHooks !== null) __asyncHooks.before(id);
+  try {
+    return Reflect.apply(fn, thisArg, args);
+  } catch (error) {
+    __noteThrown(error);
+    throw error;
+  } finally {
+    if (__asyncHooks !== null) __asyncHooks.after(id);
+    __asyncIds.length = depth;
+    __asyncTriggers.length = depth;
+    __asyncResources.length = depth;
+    __asyncContextSet(previous);
+  }
+}
+// Bind `fn` to the current async context; with a `type`, `fn` is the callback of async resource
+// `resource` (destroyed after its one call unless `repeat`).
 function __bindAsyncContext(fn, type, resource, repeat) {
-  if (__asyncHooks !== null && type !== undefined) return __asyncHooks.wrap(fn, type, resource, repeat);
+  if (__asyncTracking && type !== undefined) {
+    if (resource === undefined) resource = {};
+    __initAsyncResource(resource, type);
+    const context = __asyncContextGet();
+    return function boundAsyncResource(...args) {
+      try {
+        return __runAsyncCallback(resource, context, fn, this, args);
+      } finally {
+        if (!repeat) __destroyAsyncResource(resource);
+      }
+    };
+  }
   const context = __asyncContextGet();
   if (context === undefined) return fn;
   return function boundWithAsyncContext(...args) {
@@ -532,7 +595,14 @@ const __errors = __lazyObject(() => {
   E("ERR_FS_EISDIR", "Path is a directory", Error);
   E("ERR_DIR_CLOSED", "Directory handle was closed", Error);
   E("ERR_DIR_CONCURRENT_OPERATION", "Cannot do synchronous work on directory handle with concurrent asynchronous operations", Error);
-  E("ERR_FALSY_VALUE_REJECTION", "Promise was rejected with falsy value", Error);
+  E(
+    "ERR_FALSY_VALUE_REJECTION",
+    function (reason) {
+      this.reason = reason;
+      return "Promise was rejected with falsy value";
+    },
+    Error,
+  );
   E("ERR_INVALID_CHAR", (name, field = undefined) => {
     let msg = `Invalid character in ${name}`;
     if (field !== undefined) msg += ` ["${field}"]`;
@@ -557,6 +627,7 @@ const __errors = __lazyObject(() => {
   E("ERR_SERVER_ALREADY_LISTEN", "Listen method has been called more than once without closing.", Error);
   E("ERR_USE_AFTER_CLOSE", "%s was closed", Error);
   E("ERR_IPC_CHANNEL_CLOSED", "Channel closed", Error);
+  E("ERR_CHILD_CLOSED_BEFORE_REPLY", "Child closed before reply received", Error);
   E("ERR_INVALID_ADDRESS_FAMILY", function (addressType, host, port) {
     this.host = host;
     this.port = port;
@@ -882,7 +953,8 @@ function __initByCopy(Class) {
 {
   const perf = globalThis.performance;
   const names = ["mark", "measure", "clearMarks", "clearMeasures", "getEntries", "getEntriesByName",
-    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming"];
+    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming",
+    "timerify", "eventLoopUtilization", "nodeTiming", "addEventListener", "removeEventListener", "dispatchEvent"];
   const materialize = () => {
     for (const n of names) delete perf[n];
     __builtins.get("perf_hooks");

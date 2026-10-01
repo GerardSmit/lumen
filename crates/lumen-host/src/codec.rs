@@ -32,6 +32,8 @@ pub struct ZStep {
 pub struct ZStream {
     strm: Box<z::z_stream>,
     deflating: bool,
+    /// Output `deflateParams` flushed while no output window was open; the next `run` emits it.
+    carry: Vec<u8>,
 }
 
 fn stream_size() -> c_int {
@@ -49,7 +51,7 @@ impl ZStream {
         if code != Z_OK {
             return Err(code);
         }
-        Ok(ZStream { strm, deflating: true })
+        Ok(ZStream { strm, deflating: true, carry: Vec::new() })
     }
 
     /// `inflateInit2`; `window_bits` as for [`ZStream::deflate`] (+32: auto-detect zlib or gzip).
@@ -60,10 +62,26 @@ impl ZStream {
         if code != Z_OK {
             return Err(code);
         }
-        Ok(ZStream { strm, deflating: false })
+        Ok(ZStream { strm, deflating: false, carry: Vec::new() })
     }
 
     pub fn run(&mut self, flush: i32, input: &[u8], output: &mut [u8]) -> ZStep {
+        let mut carried = 0;
+        if !self.carry.is_empty() {
+            carried = self.carry.len().min(output.len());
+            output[..carried].copy_from_slice(&self.carry[..carried]);
+            self.carry.drain(..carried);
+            if !self.carry.is_empty() {
+                return ZStep { code: Z_OK, consumed: 0, produced: carried };
+            }
+        }
+        let output = &mut output[carried..];
+        let mut step = self.run_window(flush, input, output);
+        step.produced += carried;
+        step
+    }
+
+    fn run_window(&mut self, flush: i32, input: &[u8], output: &mut [u8]) -> ZStep {
         let s = &mut *self.strm;
         s.next_in = input.as_ptr();
         s.avail_in = input.len().min(u32::MAX as usize) as u32;
@@ -102,11 +120,24 @@ impl ZStream {
     }
 
     pub fn params(&mut self, level: i32, strategy: i32) -> i32 {
-        // SAFETY: the stream is initialised; both windows are empty.
-        unsafe { z::deflateParams(&mut *self.strm, level, strategy) }
+        let mut scratch = [0u8; 4096];
+        let s = &mut *self.strm;
+        s.next_in = std::ptr::null();
+        s.avail_in = 0;
+        s.next_out = scratch.as_mut_ptr();
+        s.avail_out = scratch.len() as u32;
+        // SAFETY: the stream is initialised; the input window is empty and the output window is the
+        // live scratch buffer.
+        let code = unsafe { z::deflateParams(s, level, strategy) };
+        let produced = scratch.len() - s.avail_out as usize;
+        s.next_out = std::ptr::null_mut();
+        s.avail_out = 0;
+        self.carry.extend_from_slice(&scratch[..produced]);
+        code
     }
 
     pub fn reset(&mut self) -> i32 {
+        self.carry.clear();
         // SAFETY: the stream is initialised.
         unsafe {
             if self.deflating {

@@ -4,9 +4,11 @@
 // and error messages need.
 
 function inherits(ctor, superCtor) {
-  if (ctor === undefined || ctor === null) throw new TypeError('The "ctor" argument must be a function');
-  if (superCtor === undefined || superCtor === null) throw new TypeError('The "superCtor" argument must be a function');
-  if (superCtor.prototype === undefined) throw new TypeError('The "superCtor.prototype" property must not be undefined');
+  if (ctor === undefined || ctor === null) throw new __errors.ERR_INVALID_ARG_TYPE("ctor", "Function", ctor);
+  if (superCtor === undefined || superCtor === null) throw new __errors.ERR_INVALID_ARG_TYPE("superCtor", "Function", superCtor);
+  if (superCtor.prototype === undefined) {
+    throw new __errors.ERR_INVALID_ARG_TYPE("superCtor.prototype", "Object", superCtor.prototype);
+  }
   Object.defineProperty(ctor, "super_", { value: superCtor, writable: true, configurable: true });
   Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
 }
@@ -1233,8 +1235,8 @@ function formatWithOptionsInternal(inspectOptions, args) {
           switch (nextChar) {
             case 115: { // 's'
               const tempArg = args[++a];
-              if (typeof tempArg === "number") tempStr = formatNumber(stylizeNoColor, tempArg, false);
-              else if (typeof tempArg === "bigint") tempStr = formatBigInt(stylizeNoColor, tempArg, false);
+              if (typeof tempArg === "number") tempStr = formatNumber(stylizeNoColor, tempArg, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
+              else if (typeof tempArg === "bigint") tempStr = formatBigInt(stylizeNoColor, tempArg, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               else if (typeof tempArg !== "object" || tempArg === null || !hasBuiltInToString(tempArg)) tempStr = String(tempArg);
               else tempStr = inspect(tempArg, { ...inspectOptions, depth: 0, colors: false, compact: 3 });
               break;
@@ -1244,9 +1246,9 @@ function formatWithOptionsInternal(inspectOptions, args) {
               break;
             case 100: { // 'd'
               const tempNum = args[++a];
-              if (typeof tempNum === "bigint") tempStr = formatBigInt(stylizeNoColor, tempNum, false);
+              if (typeof tempNum === "bigint") tempStr = formatBigInt(stylizeNoColor, tempNum, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               else if (typeof tempNum === "symbol") tempStr = "NaN";
-              else tempStr = formatNumber(stylizeNoColor, Number(tempNum), false);
+              else tempStr = formatNumber(stylizeNoColor, Number(tempNum), (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               break;
             }
             case 79: // 'O'
@@ -1257,15 +1259,15 @@ function formatWithOptionsInternal(inspectOptions, args) {
               break;
             case 105: { // 'i'
               const tempInteger = args[++a];
-              if (typeof tempInteger === "bigint") tempStr = formatBigInt(stylizeNoColor, tempInteger, false);
+              if (typeof tempInteger === "bigint") tempStr = formatBigInt(stylizeNoColor, tempInteger, (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               else if (typeof tempInteger === "symbol") tempStr = "NaN";
-              else tempStr = formatNumber(stylizeNoColor, Number.parseInt(tempInteger), false);
+              else tempStr = formatNumber(stylizeNoColor, Number.parseInt(tempInteger), (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               break;
             }
             case 102: { // 'f'
               const tempFloat = args[++a];
               if (typeof tempFloat === "symbol") tempStr = "NaN";
-              else tempStr = formatNumber(stylizeNoColor, Number.parseFloat(tempFloat), false);
+              else tempStr = formatNumber(stylizeNoColor, Number.parseFloat(tempFloat), (inspectOptions && inspectOptions.numericSeparator !== undefined ? inspectOptions.numericSeparator : inspectDefaultOptions.numericSeparator));
               break;
             }
             case 99: // 'c'
@@ -1378,15 +1380,27 @@ function promisify(original) {
 }
 promisify.custom = kCustomPromisify;
 
+function callbackifyOnRejected(reason, cb) {
+  if (!reason) reason = new __errors.ERR_FALSY_VALUE_REJECTION(reason);
+  return cb(reason);
+}
+
 function callbackify(original) {
-  if (typeof original !== "function") throw new TypeError('The "original" argument must be of type function');
-  return function (...args) {
-    const cb = args.pop();
-    original.apply(this, args).then(
-      (value) => queueMicrotask(() => cb(null, value)),
-      (err) => queueMicrotask(() => cb(err || new Error("Promise was rejected with a falsy value"))),
+  if (typeof original !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("original", "Function", original);
+  function callbackified(...args) {
+    const maybeCb = args.pop();
+    if (typeof maybeCb !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("last argument", "Function", maybeCb);
+    const cb = maybeCb.bind(this);
+    Reflect.apply(original, this, args).then(
+      (ret) => process.nextTick(cb, null, ret),
+      (rej) => process.nextTick(callbackifyOnRejected, rej, cb),
     );
-  };
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(original);
+  if (typeof descriptors.length.value === "number") descriptors.length.value++;
+  if (typeof descriptors.name.value === "string") descriptors.name.value += "Callbackified";
+  Object.defineProperties(callbackified, descriptors);
+  return callbackified;
 }
 
 // ---- util/types: see util_types.js ------------------------------------------------------------

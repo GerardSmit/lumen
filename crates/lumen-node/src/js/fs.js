@@ -529,6 +529,7 @@ function bindingCall(syscall, fn, path, dest) {
   }
 }
 function complete(req, err, value) {
+  __activeResources.requests.delete(req);
   try {
     if (err) Reflect.apply(req.oncomplete, req, [err]);
     // Node passes the result only when there is one: a void op completes as oncomplete(null).
@@ -605,6 +606,7 @@ function dispatchRun(req, ctx, syscall, path, dest, sync, async, post) {
       (e) => { throw bindingError(e, syscall, path, dest); },
     );
   }
+  __activeResources.requests.add(req);
   promise.then(
     (result) => {
       let value;
@@ -9384,11 +9386,13 @@ fs.globSync = function globSync(pattern, options = {}) {
   }
   return results;
 };
-
-__builtins.set("fs", fs);
-__builtins.set("fs/promises", __lazyValue(() => fs.promises));
 // A later Node API (22+): available, but not one of the enumerable keys Node 20 exposes.
 Object.defineProperty(fs, "globSync", { enumerable: false });
+
+__builtins.set("fs", fs);
 // The originals, so the module loader can tell when a program patched them (module.js).
 __internals.set("fs_readFileSync", fs.readFileSync);
 __internals.set("fs_realpathSync", fs.realpathSync);
+__builtins.set("fs/promises", __lazyValue(() => fs.promises));
+// The module table, for --expose-internals (internals.js).
+__internals.set("fsRequire", require);

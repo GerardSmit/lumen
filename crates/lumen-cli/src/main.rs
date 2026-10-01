@@ -35,7 +35,23 @@ static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc
 /// stack before the guard fires. The reservation is virtual; pages are committed as touched.
 const MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
 
+/// Writing past RLIMIT_FSIZE must fail with EFBIG, not kill the process with SIGXFSZ.
+#[cfg(unix)]
+fn ignore_sigxfsz() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGXFSZ: i32 = 25;
+    const SIG_IGN: usize = 1;
+    // SAFETY: installing SIG_IGN for a signal has no handler code to run.
+    unsafe {
+        signal(SIGXFSZ, SIG_IGN);
+    }
+}
+
 fn main() {
+    #[cfg(unix)]
+    ignore_sigxfsz();
     let worker = std::thread::Builder::new()
         .name("lumen-main".to_string())
         .stack_size(MAIN_STACK_BYTES)
@@ -98,6 +114,11 @@ fn real_main() {
         };
         die(1, &format!("{argv0}: --experimental-permission is required for {flag}"));
     }
+    if let Some(mode) = opts.string("--unhandled-rejections") {
+        if !matches!(mode, "strict" | "warn" | "none" | "throw" | "warn-with-error-code") {
+            die(9, &format!("{argv0}: invalid value for --unhandled-rejections"));
+        }
+    }
     if opts.check && opts.eval.is_some() {
         die(9, &format!("{argv0}: either --check or --eval can be used, not both"));
     }
@@ -123,7 +144,9 @@ fn real_main() {
     let threshold = opts.string("--tier-threshold").and_then(|n| n.parse::<u32>().ok());
     let expose_gc = opts.flag("--expose-gc");
 
-    let file = if opts.eval.is_none() && !opts.stdin_dash {
+    // `--test`: the operands are test files or directories, not a script.
+    let test_runner = opts.flag("--test") && opts.eval.is_none();
+    let file = if opts.eval.is_none() && !opts.stdin_dash && !test_runner {
         opts.rest.first().cloned()
     } else {
         None
@@ -147,6 +170,9 @@ fn real_main() {
     runtime.set_cli_options(&opts.options_json());
     if expose_gc {
         runtime.expose_gc();
+    }
+    if opts.flag("--expose-externalize-string") {
+        runtime.expose_externalize_string();
     }
     if opts.flag("--trace-atomics-wait") {
         runtime.trace_atomics_wait();
@@ -185,7 +211,16 @@ fn real_main() {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".to_string());
+    run_prelude(
+        &mut runtime,
+        "typeof __lumenPrepareMain === 'function' && __lumenPrepareMain()",
+    );
     run_preloads(&mut runtime, &opts, &cwd);
+
+    if test_runner {
+        run_source(&mut runtime, "__lumenRunTestMain()");
+        return;
+    }
 
     if opts.check {
         check_only(&mut runtime, file.as_deref(), module_input);
