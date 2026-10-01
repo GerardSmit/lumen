@@ -227,6 +227,26 @@ impl Interp {
     /// namespace object, and export tables. No user code runs and no linking happens yet, so a later
     /// ResolveExport can see the whole graph. Idempotent per key.
     fn parse_and_register(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
+        let mut added = Vec::new();
+        let result = self.parse_and_register_graph(key, src, &mut added);
+        if result.is_err() {
+            // A record is registered before its dependencies are parsed (so cycles resolve), so a
+            // failure deeper in the graph would otherwise leave records naming unregistered
+            // dependencies, and a later import of them would link against missing keys.
+            for k in added {
+                self.module_recs.remove(&k);
+                self.modules.remove(&k);
+            }
+        }
+        result
+    }
+
+    fn parse_and_register_graph(
+        &mut self,
+        key: &str,
+        src: Option<String>,
+        added: &mut Vec<String>,
+    ) -> Result<(), Abrupt> {
         if self.module_recs.contains_key(key) {
             return Ok(());
         }
@@ -364,9 +384,11 @@ impl Interp {
             },
         );
 
+        added.push(key.to_string());
+
         // Recurse: parse each dependency (fetched during specifier resolution above).
         for (canon, dsrc) in dep_srcs {
-            self.parse_and_register(&canon, Some(dsrc))?;
+            self.parse_and_register_graph(&canon, Some(dsrc), added)?;
         }
         Ok(())
     }
