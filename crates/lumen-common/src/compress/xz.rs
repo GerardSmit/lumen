@@ -225,22 +225,6 @@ fn validate_chain(chain: &[Filter], xz: bool) -> Result<(), XzError> {
 
 // ---- integrity checks ---------------------------------------------------------------------
 
-const CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 == 1 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
-
 const CRC64_TABLE: [u64; 256] = {
     let mut table = [0u64; 256];
     let mut i = 0;
@@ -258,11 +242,7 @@ const CRC64_TABLE: [u64; 256] = {
 };
 
 fn crc32(data: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in data {
-        c = CRC32_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
-    }
-    !c
+    crate::compress::crc32_from(0, data)
 }
 
 enum Checker {
@@ -276,7 +256,7 @@ impl Checker {
     /// The checker for check id `id`; ids this build cannot compute are not verified.
     fn new(id: u32) -> Checker {
         match id {
-            CHECK_CRC32 => Checker::Crc32(!0),
+            CHECK_CRC32 => Checker::Crc32(0),
             CHECK_CRC64 => Checker::Crc64(!0),
             CHECK_SHA256 => Checker::Sha256(Box::new(Sha256::new())),
             _ => Checker::None,
@@ -286,11 +266,7 @@ impl Checker {
     fn update(&mut self, data: &[u8]) {
         match self {
             Checker::None => {}
-            Checker::Crc32(c) => {
-                for &b in data {
-                    *c = CRC32_TABLE[((*c ^ u32::from(b)) & 0xFF) as usize] ^ (*c >> 8);
-                }
-            }
+            Checker::Crc32(c) => *c = crate::compress::crc32_from(*c, data),
             Checker::Crc64(c) => {
                 for &b in data {
                     *c = CRC64_TABLE[((*c ^ u64::from(b)) & 0xFF) as usize] ^ (*c >> 8);
@@ -303,7 +279,7 @@ impl Checker {
     fn finish(self) -> Vec<u8> {
         match self {
             Checker::None => Vec::new(),
-            Checker::Crc32(c) => (!c).to_le_bytes().to_vec(),
+            Checker::Crc32(c) => c.to_le_bytes().to_vec(),
             Checker::Crc64(c) => (!c).to_le_bytes().to_vec(),
             Checker::Sha256(h) => h.finalize().to_vec(),
         }
