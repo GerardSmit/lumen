@@ -109,7 +109,7 @@ pub(super) fn install_number(it: &mut Interp) {
         }
         let digits = d as usize;
         // The sign is `-` only for a strictly-negative value (not -0), and the magnitude is rounded.
-        let body = to_fixed_magnitude(n.abs(), digits);
+        let body = numfmt::fixed(n, digits, AWAY);
         Ok(Value::from_string(if n < 0.0 {
             format!("-{body}")
         } else {
@@ -171,94 +171,51 @@ pub(super) fn install_number(it: &mut Interp) {
     set_builtin(&it.global, "Number", Value::Obj(ctor));
 }
 
-/// Format the magnitude `x` (assumed ≥ 0, finite, and < 1e21) to exactly `digits` fractional
-/// places for `Number.prototype.toFixed`. The spec rounds to nearest and, on an *exact* tie, picks
-/// the larger n (ties away from zero) — whereas Rust's `{:.*}` rounds ties to even. The tie must be
-/// judged on the true binary64 value: `0.15` is really `0.1499…` and must round down, while `0.5`
-/// is an exact tie and rounds up. We therefore expand `x` to its exact decimal digits and round
-/// half-up ourselves: round up iff the exact digit just past the cut is ≥ 5.
-fn to_fixed_magnitude(x: f64, digits: usize) -> String {
-    // Fast path: when x·10^digits is small enough that the product's rounding error (< 2^-13
-    // below 2^40) cannot move it across a rounding boundary, the nearest integer (ties can't
-    // be this close) is decided from the product directly.
-    if digits <= 22 {
-        let scaled = x * 10f64.powi(digits as i32);
-        if scaled < (1u64 << 40) as f64 {
-            let floor = scaled.floor();
-            let frac = scaled - floor;
-            if (frac - 0.5).abs() > 1e-3 {
-                let n = floor as u64 + u64::from(frac > 0.5);
-                let mut s = n.to_string();
-                if digits > 0 {
-                    while s.len() <= digits {
-                        s.insert(0, '0');
-                    }
-                    s.insert(s.len() - digits, '.');
-                }
-                return s;
-            }
+use lumen_common::float::format::{self as numfmt, Rounding::HalfAwayFromZero as AWAY};
+
+/// `Number.prototype.toPrecision(p)`: `p` significant digits, fixed or exponential per the exponent.
+fn to_precision(n: f64, p: usize) -> String {
+    let (digits, e) = numfmt::significant(n, p, AWAY);
+    let body = if n != 0.0 && (e < -6 || e >= p as i32) {
+        exponential_layout(&digits, e)
+    } else if e >= 0 {
+        let ip = (e + 1) as usize;
+        if ip >= p {
+            digits
+        } else {
+            format!("{}.{}", &digits[..ip], &digits[ip..])
         }
-    }
-    // The exact decimal expansion of a finite f64 terminates. Its number of fractional digits is
-    // `-e2` where `x = significand × 2^e2` with an integer significand — bounded by 1074 (the
-    // smallest subnormal). Formatting to at least that many places incurs no rounding, so the digit
-    // we inspect is the true one. Derive the needed precision from the bit pattern to avoid always
-    // emitting ~1074 digits.
-    let bits = x.to_bits();
-    let biased = ((bits >> 52) & 0x7ff) as i64;
-    let mantissa = bits & 0xf_ffff_ffff_ffff;
-    let significand = if biased == 0 {
-        mantissa // subnormal (or zero)
     } else {
-        (1u64 << 52) | mantissa // normal: implicit leading 1
+        format!("0.{}{}", "0".repeat((-e - 1) as usize), digits)
     };
-    let e2 = if biased == 0 { -1074 } else { biased - 1075 } + significand.trailing_zeros() as i64;
-    let exact_frac = if e2 < 0 && significand != 0 {
-        (-e2) as usize
+    if n < 0.0 {
+        format!("-{body}")
     } else {
-        0
+        body
+    }
+}
+
+/// `Number.prototype.toExponential`: `f` fraction digits, or (fractionDigits undefined,
+/// `shortest`) the fewest digits that round-trip.
+fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
+    let sign = if x < 0.0 { "-" } else { "" };
+    let (digits, e) = if shortest && x != 0.0 {
+        let d = lumen_common::float::shortest(x);
+        (d.as_str().to_string(), d.decpt - 1)
+    } else {
+        numfmt::significant(x, if shortest { 1 } else { f + 1 }, AWAY)
     };
-    // Expand to enough places to (a) reach the digit past the cut and (b) be exact there.
-    let prec = exact_frac.max(digits + 1);
-    let exact = format!("{:.*}", prec, x);
-    let dot = exact.find('.').unwrap();
-    let int_digits = exact[..dot].bytes();
-    let frac = &exact.as_bytes()[dot + 1..];
-    let round_up = frac[digits] >= b'5';
-    // Digits we keep: the whole integer part plus the first `digits` fractional digits.
-    let mut ds: Vec<u8> = int_digits
-        .chain(frac[..digits].iter().copied())
-        .map(|b| b - b'0')
-        .collect();
-    if round_up {
-        // Propagate the carry leftward; a carry out of the most-significant digit prepends a 1.
-        let mut i = ds.len();
-        loop {
-            match i.checked_sub(1) {
-                None => {
-                    ds.insert(0, 1);
-                    break;
-                }
-                Some(j) => {
-                    i = j;
-                    if ds[j] == 9 {
-                        ds[j] = 0;
-                    } else {
-                        ds[j] += 1;
-                        break;
-                    }
-                }
-            }
-        }
+    format!("{sign}{}", exponential_layout(&digits, e))
+}
+
+/// `d.ddde±x`.
+fn exponential_layout(digits: &str, e: i32) -> String {
+    let sign = if e < 0 { '-' } else { '+' };
+    if digits.len() == 1 {
+        format!("{digits}e{sign}{}", e.abs())
+    } else {
+        format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
     }
-    let int_len = ds.len() - digits; // grew by 1 iff the carry rippled out the front
-    let mut out = String::with_capacity(ds.len() + 1);
-    out.extend(ds[..int_len].iter().map(|d| (d + b'0') as char));
-    if digits > 0 {
-        out.push('.');
-        out.extend(ds[int_len..].iter().map(|d| (d + b'0') as char));
-    }
-    out
 }
 
 fn to_radix_string(n: f64, radix: u32) -> String {

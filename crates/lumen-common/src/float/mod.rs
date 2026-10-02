@@ -1,8 +1,9 @@
 //! Floating-point algorithms whose results the languages specify more tightly than the platform
-//! libm does: shortest round-trip formatting, exact summation, Euclidean norms, gamma and the error
+//! libm does: shortest round-trip and correctly rounded fixed-precision formatting, exact summation, Euclidean norms, gamma and the error
 //! functions.
 
 mod erf;
+pub mod format;
 mod fsum;
 mod gamma;
 mod norm;
