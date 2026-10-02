@@ -114,13 +114,13 @@ pub mod gc {
     /// collection.
     ///
     #[op(hint(py(arg_style = "parse", text_signature = "")))]
-    fn set_threshold(it: &mut Interp, threshold0: i32, threshold1: Option<i32>, threshold2: Option<i32>) {
+    fn set_threshold(it: &mut Interp, threshold0: i32, threshold1: lumen_bind::Passed<i32>, threshold2: lumen_bind::Passed<i32>) {
         let st = it.native_state::<GcState>();
         st.threshold.0 = threshold0 as i64;
-        if let Some(t) = threshold1 {
+        if let Some(t) = threshold1.0 {
             st.threshold.1 = t as i64;
         }
-        if let Some(t) = threshold2 {
+        if let Some(t) = threshold2.0 {
             st.threshold.2 = t as i64;
         }
     }
