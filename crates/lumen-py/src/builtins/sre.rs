@@ -147,9 +147,9 @@ impl Input {
                     let copy: Rc<[u8]> = (&*b.bytes()).into();
                     Input { len: copy.len(), subj: Subj::Owned(copy), isbytes: true }
                 }
-                _ => return Err(not_a_string(it, string)),
+                _ => return Input::from_buffer(it, string),
             },
-            _ => return Err(not_a_string(it, string)),
+            _ => return Input::from_buffer(it, string),
         };
         if input.isbytes && pat.isbytes == 0 {
             return Err(it.type_error("cannot use a string pattern on a bytes-like object"));
@@ -158,6 +158,17 @@ impl Input {
             return Err(it.type_error("cannot use a bytes pattern on a string-like object"));
         }
         Ok(input)
+    }
+
+    /// Any other bytes-like object, such as a `memoryview`: its bytes are copied.
+    fn from_buffer(it: &mut Interp, string: &Value) -> R<Input> {
+        match crate::builtins::memview::contiguous_bytes(it, string)? {
+            Some(b) => {
+                let copy: Rc<[u8]> = b.into();
+                Ok(Input { len: copy.len(), subj: Subj::Owned(copy), isbytes: true })
+            }
+            None => Err(not_a_string(it, string)),
+        }
     }
 
     fn exec(&self, re: &Regex, opts: ExecOptions) -> Result<Option<Captures>, BacktrackLimit> {
@@ -408,7 +419,7 @@ fn expand(it: &mut Interp, template: &Template, groups: usize, input: &Input, st
 }
 
 /// A slice of the match's subject by character offsets, clamped to its current length.
-fn subject_slice(string: &Value, a: i64, b: i64) -> Value {
+fn subject_slice(it: &mut Interp, string: &Value, a: i64, b: i64) -> Value {
     let Value::Obj(o) = string else { return Value::None };
     let (a, b) = (a.max(0) as usize, b.max(0) as usize);
     match &o.kind {
@@ -439,7 +450,13 @@ fn subject_slice(string: &Value, a: i64, b: i64) -> Value {
             let (a, b) = (a.min(v.len()), b.min(v.len()));
             Value::bytes(v[a..b.max(a)].to_vec())
         }
-        _ => Value::None,
+        _ => match crate::builtins::memview::contiguous_bytes(it, string) {
+            Ok(Some(v)) => {
+                let (a, b) = (a.min(v.len()), b.min(v.len()));
+                Value::bytes(v[a..b.max(a)].to_vec())
+            }
+            _ => Value::None,
+        },
     }
 }
 
@@ -812,7 +829,11 @@ fn group_index(it: &mut Interp, m: &Py<Match>, index: Option<&Value>) -> R<usize
     let (pattern, groups) = md(it, m, |d| (d.pattern.clone(), d.marks.len()))?;
     let found: Option<i64> = match index {
         None => Some(0),
-        Some(v) if it.has_index(v) => Some(it.index_of(v)?),
+        Some(v) if it.has_index(v) => match it.index_of(v) {
+            Ok(i) => Some(i),
+            Err(e) if it.exc_is(&e, "OverflowError") => None,
+            Err(e) => return Err(e),
+        },
         Some(v) => match &pattern_field(&pattern, |d| d.groupindex.clone()) {
             Value::Obj(d) => match it.dict_get(d, v)? {
                 Some(Value::Int(n)) => Some(n),
@@ -832,7 +853,7 @@ fn group_slice(it: &mut Interp, m: &Py<Match>, index: usize, default: &Value) ->
     if mark.0 < 0 {
         return Ok(default.clone());
     }
-    Ok(subject_slice(&string, mark.0, mark.1))
+    Ok(subject_slice(it, &string, mark.0, mark.1))
 }
 
 fn match_getslice(it: &mut Interp, m: &Py<Match>, index: Option<&Value>, default: &Value) -> R<Value> {
@@ -940,7 +961,7 @@ impl Match {
             }
             let mark = marks[*index];
             if mark.0 >= 0 {
-                let item = subject_slice(&string, mark.0, mark.1);
+                let item = subject_slice(it, &string, mark.0, mark.1);
                 out.push_value(it, &item)?;
             }
             if let Some(l) = literal {
