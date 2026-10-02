@@ -1,6 +1,7 @@
 //! Numeric tower: int (small and big), float, bool arithmetic and comparison.
 
 use crate::ast::BinOp;
+use crate::fmath;
 use crate::pyint::{BigInt, PyInt};
 use crate::object::*;
 use crate::vm::Interp;
@@ -63,7 +64,7 @@ pub fn float_floor_div_mod(x: f64, y: f64) -> (f64, f64) {
         m = 0.0f64.copysign(y);
     }
     let fd = if d != 0.0 {
-        let f = d.floor();
+        let f = fmath::floor(d);
         if d - f > 0.5 {
             f + 1.0
         } else {
@@ -91,7 +92,7 @@ pub fn cmp_int_float(i: &Num, f: f64) -> Option<Ordering> {
     let fi = BigInt::from_f64_trunc(f);
     match ib.cmp(&fi) {
         Ordering::Equal => {
-            let frac = f - f.trunc();
+            let frac = f - fmath::trunc(f);
             if frac > 0.0 {
                 Some(Ordering::Less)
             } else if frac < 0.0 {
@@ -124,10 +125,10 @@ pub fn big_true_div(a: &BigInt, b: &BigInt) -> Option<f64> {
     let q = a.abs().shl(shift as u64).floor_div(&b.abs());
     let qf = q.to_float()?;
     let neg = a.is_negative() != b.is_negative();
-    let r = qf * 2f64.powi(-(shift as i32));
+    let r = qf * fmath::powi(2.0, -(shift as i32));
     let r = if r == 0.0 && shift > 1000 {
         let s2 = shift as i32 - 1000;
-        qf * 2f64.powi(-1000) * 2f64.powi(-s2)
+        qf * fmath::powi(2.0, -1000) * fmath::powi(2.0, -s2)
     } else {
         r
     };
@@ -145,12 +146,11 @@ pub fn float_repr(f: f64) -> String {
         return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
     let sign = if f < 0.0 { "-" } else { "" };
-    let s = format!("{:e}", f.abs());
-    let (mant, exp) = s.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let d = lumen_common::float::shortest(f);
+    let digits = d.as_str();
+    let decpt = d.decpt;
+    let exp = decpt - 1;
     let n = digits.len() as i32;
-    let decpt = exp + 1;
     let body = if (-4..16).contains(&exp) {
         if decpt <= 0 {
             format!("0.{}{}", "0".repeat((-decpt) as usize), digits)
@@ -160,24 +160,10 @@ pub fn float_repr(f: f64) -> String {
             format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
         }
     } else {
-        let m = if n > 1 { format!("{}.{}", &digits[..1], &digits[1..]) } else { digits.clone() };
+        let m = if n > 1 { format!("{}.{}", &digits[..1], &digits[1..]) } else { digits.to_string() };
         format!("{}e{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
     };
     format!("{}{}", sign, body)
-}
-
-fn frexp(x: f64) -> (f64, i32) {
-    if x == 0.0 || x.is_nan() || x.is_infinite() {
-        return (x, 0);
-    }
-    let bits = x.to_bits();
-    let exp = ((bits >> 52) & 0x7ff) as i32;
-    if exp == 0 {
-        let (m, e) = frexp(x * 2f64.powi(64));
-        return (m, e - 64);
-    }
-    let m = f64::from_bits((bits & !(0x7ffu64 << 52)) | (1022u64 << 52));
-    (m, exp - 1022)
 }
 
 pub fn hash_float(v: f64) -> i64 {
@@ -188,7 +174,7 @@ pub fn hash_float(v: f64) -> i64 {
     if v.is_infinite() {
         return if v > 0.0 { 314159 } else { -314159 };
     }
-    let (mut m, mut e) = frexp(v);
+    let (mut m, mut e) = lumen_common::float::frexp(v);
     let sign: i64 = if m < 0.0 {
         m = -m;
         -1
@@ -217,8 +203,10 @@ pub fn hash_float(v: f64) -> i64 {
     }
 }
 
+/// The inverse of `a` modulo |m|, in [0, |m|).
 fn mod_inverse(a: &BigInt, m: &BigInt) -> Option<BigInt> {
     let one = BigInt::from_i64(1);
+    let m = &m.abs();
     let (mut old_r, mut r) = (a.floor_mod(m), m.clone());
     let (mut old_s, mut s) = (one.clone(), BigInt::zero());
     while !r.is_zero() {
@@ -312,12 +300,14 @@ impl Interp {
         if x == 0.0 && y < 0.0 {
             return Err(self.zero_div("zero to a negative power"));
         }
-        if x < 0.0 && y.is_finite() && y != y.floor() {
-            let r = (-x).powf(y);
-            let ang = std::f64::consts::PI * y;
-            return Ok(Value::Obj(Object::new(Kind::Complex(r * ang.cos(), r * ang.sin()))));
+        if x < 0.0 && y.is_finite() && y != fmath::floor(y) {
+            use lumen_common::float::complex::{pow, Complex};
+            return match pow(Complex::new(x, 0.0), Complex::new(y, 0.0)) {
+                Ok(z) => Ok(Value::Obj(Object::new(Kind::Complex(z.re, z.im)))),
+                Err(_) => Err(self.overflow_err("complex exponentiation")),
+            };
         }
-        let r = x.powf(y);
+        let r = fmath::powf(x, y);
         if r.is_infinite() && x.is_finite() && y.is_finite() {
             return Err(self.overflow_err("(34, 'Numerical result out of range')"));
         }

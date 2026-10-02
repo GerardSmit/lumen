@@ -49,7 +49,7 @@ impl Interp {
             self.sort_order(&mut order, |a, b| fk[a].partial_cmp(&fk[b]).unwrap_or(Ordering::Equal))?;
         } else if keys.iter().all(|k| matches!(k, Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Str(_)))) {
             let sk: Vec<&str> = keys.iter().map(|k| k.as_str().unwrap_or("")).collect();
-            self.sort_order(&mut order, |a, b| sk[a].as_bytes().cmp(sk[b].as_bytes()))?;
+            self.sort_order(&mut order, |a, b| lumen_common::smuggle::cmp_code_points(sk[a], sk[b]))?;
         } else {
             order = self.merge_sort_indices(order, &keys)?;
         }
@@ -236,18 +236,18 @@ fn remove(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn seq_index(it: &mut Interp, items: Vec<Value>, a: &[Value], kind: &str) -> R<Value> {
     let n = items.len() as i64;
     let mut start = match a.get(2) {
-        Some(v) => it.index_of(v)?,
+        Some(v) => it.slice_index(v)?,
         None => 0,
     };
     let mut stop = match a.get(3) {
-        Some(v) => it.index_of(v)?,
+        Some(v) => it.slice_index(v)?,
         None => n,
     };
     if start < 0 {
-        start = (start + n).max(0);
+        start = start.saturating_add(n).max(0);
     }
     if stop < 0 {
-        stop = (stop + n).max(0);
+        stop = stop.saturating_add(n).max(0);
     }
     let stop = stop.min(n);
     let mut i = start;

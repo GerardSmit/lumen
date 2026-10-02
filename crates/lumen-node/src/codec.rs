@@ -19,24 +19,7 @@ pub const BASE64: u32 = 4;
 pub const BASE64URL: u32 = 5;
 pub const UTF16LE: u32 = 6;
 
-const SMUGGLE_BASE: u32 = 0x10F800;
-
-/// The UTF-16 unit a smuggled scalar stands for.
-#[inline]
-fn smuggled(c: char) -> Option<u16> {
-    let v = c as u32;
-    if (SMUGGLE_BASE..SMUGGLE_BASE + 0x800).contains(&v) {
-        Some((v - SMUGGLE_BASE + 0xD800) as u16)
-    } else {
-        None
-    }
-}
-
-/// Every smuggled scalar starts `F4 8F`; a string without an `F4` byte has none.
-#[inline]
-fn may_smuggle(s: &str) -> bool {
-    s.as_bytes().contains(&0xF4)
-}
+use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, SMUGGLE_BASE};
 
 /// Call `f` with each UTF-16 code unit of `s` (smuggled scalars decode to their surrogates).
 #[inline]
@@ -138,23 +121,7 @@ pub fn utf8_len(s: &str) -> usize {
 /// Rewrite characters >= U+10F800 (which a decoder may produce from valid input) as their
 /// smuggled surrogate pairs, the only form lumen strings hold them in.
 pub(crate) fn canonical(s: String) -> String {
-    if !may_smuggle(&s) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        let v = c as u32;
-        if v >= SMUGGLE_BASE {
-            let w = v - 0x10000;
-            let hi = 0xD800 + (w >> 10);
-            let lo = 0xDC00 + (w & 0x3FF);
-            out.push(char::from_u32(SMUGGLE_BASE + hi - 0xD800).unwrap());
-            out.push(char::from_u32(SMUGGLE_BASE + lo - 0xD800).unwrap());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    lumen_common::smuggle::utf16_text_owned(s)
 }
 
 pub fn utf8_decode(bytes: &[u8]) -> String {
@@ -209,7 +176,7 @@ pub fn from_units(units: impl Iterator<Item = u16>) -> String {
     let mut out = String::new();
     let mut pending: Option<u16> = None;
     let push_lone = |out: &mut String, u: u16| {
-        out.push(char::from_u32(SMUGGLE_BASE + (u as u32 - 0xD800)).unwrap());
+        out.push(smuggle(u));
     };
     for u in units {
         if let Some(hi) = pending.take() {
@@ -245,182 +212,23 @@ pub fn utf16le_decode(bytes: &[u8]) -> String {
     )
 }
 
-// ---- hex ----------------------------------------------------------------------------------------
+// ---- hex / base64 (shared byte codecs; Node's lenient decoders) --------------------------------
 
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+pub use lumen_common::codec::hex_encode;
 
-pub fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = vec![0u8; bytes.len() * 2];
-    for (o, &b) in out.chunks_exact_mut(2).zip(bytes) {
-        o[0] = HEX_DIGITS[(b >> 4) as usize];
-        o[1] = HEX_DIGITS[(b & 15) as usize];
-    }
-    // SAFETY: hex digits are ASCII.
-    unsafe { String::from_utf8_unchecked(out) }
+#[inline]
+pub fn hex_decode(s: &str) -> Vec<u8> {
+    lumen_common::codec::hex_decode_lenient(s.as_bytes())
 }
 
 #[inline]
-fn unhex(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => 0xff,
-    }
-}
-
-/// Node's hex decode: pairs until the first invalid one (an odd trailing digit is dropped).
-pub fn hex_decode(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len() / 2);
-    for pair in b.chunks_exact(2) {
-        let (hi, lo) = (unhex(pair[0]), unhex(pair[1]));
-        if hi == 0xff || lo == 0xff {
-            break;
-        }
-        out.push(hi << 4 | lo);
-    }
-    out
-}
-
-// ---- base64 -------------------------------------------------------------------------------------
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
 pub fn base64_encode(bytes: &[u8], url: bool) -> String {
-    let alpha = if url { B64URL } else { B64 };
-    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for c in &mut chunks {
-        let n = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
-        out.extend_from_slice(&[
-            alpha[(n >> 18) as usize & 63],
-            alpha[(n >> 12) as usize & 63],
-            alpha[(n >> 6) as usize & 63],
-            alpha[n as usize & 63],
-        ]);
-    }
-    let rest = chunks.remainder();
-    match rest.len() {
-        1 => {
-            let n = (rest[0] as u32) << 16;
-            out.push(alpha[(n >> 18) as usize & 63]);
-            out.push(alpha[(n >> 12) as usize & 63]);
-            if !url {
-                out.extend_from_slice(b"==");
-            }
-        }
-        2 => {
-            let n = (rest[0] as u32) << 16 | (rest[1] as u32) << 8;
-            out.push(alpha[(n >> 18) as usize & 63]);
-            out.push(alpha[(n >> 12) as usize & 63]);
-            out.push(alpha[(n >> 6) as usize & 63]);
-            if !url {
-                out.push(b'=');
-            }
-        }
-        _ => {}
-    }
-    // SAFETY: the alphabet is ASCII.
-    unsafe { String::from_utf8_unchecked(out) }
+    lumen_common::codec::base64_encode(bytes, url, !url)
 }
 
-/// Both alphabets decode in both encodings, as in Node. 0xff = not in the alphabet.
-const UNB64: [u8; 256] = {
-    let mut t = [0xffu8; 256];
-    let mut i = 0;
-    while i < 64 {
-        t[B64[i] as usize] = i as u8;
-        t[B64URL[i] as usize] = i as u8;
-        i += 1;
-    }
-    t
-};
-
-/// Node's `base64_decoded_size`: the buffer it allocates (decoding never writes past it).
-fn base64_decoded_size(src: &[u8]) -> usize {
-    let mut size = src.len();
-    if size < 2 {
-        return 0;
-    }
-    if src[size - 1] == b'=' {
-        size -= 1;
-        if src[size - 1] == b'=' {
-            size -= 1;
-        }
-    }
-    let rem = size % 4;
-    let mut n = size / 4 * 3;
-    if rem != 0 {
-        if n == 0 && rem == 1 {
-            n = 0;
-        } else {
-            n += 1 + (rem == 3) as usize;
-        }
-    }
-    n
-}
-
-/// Node's lenient base64 decode (either alphabet): characters outside the alphabet are skipped,
-/// `=` ends the input, and a trailing partial group yields the bytes it completes.
+#[inline]
 pub fn base64_decode(s: &str) -> Vec<u8> {
-    let src = s.as_bytes();
-    let cap = base64_decoded_size(src);
-    let mut out = Vec::with_capacity(cap);
-    // Fast path: whole groups of clean alphabet characters.
-    let mut i = 0;
-    while i + 4 <= src.len() && out.len() + 3 <= cap {
-        let a = UNB64[src[i] as usize];
-        let b = UNB64[src[i + 1] as usize];
-        let c = UNB64[src[i + 2] as usize];
-        let d = UNB64[src[i + 3] as usize];
-        if (a | b | c | d) & 0x80 != 0 {
-            break;
-        }
-        let n = (a as u32) << 18 | (b as u32) << 12 | (c as u32) << 6 | d as u32;
-        out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
-        i += 4;
-    }
-    // Slow path (Node's base64_decode_group_slow), from wherever the fast path stopped.
-    let mut quad = [0u8; 4];
-    let mut q = 0;
-    while i < src.len() {
-        let c = src[i];
-        i += 1;
-        let v = UNB64[c as usize];
-        if v == 0xff {
-            if c == b'=' {
-                break;
-            }
-            continue;
-        }
-        quad[q] = v;
-        q += 1;
-        if q == 4 {
-            if out.len() >= cap {
-                break;
-            }
-            out.push(quad[0] << 2 | quad[1] >> 4);
-            if out.len() >= cap {
-                break;
-            }
-            out.push(quad[1] << 4 | quad[2] >> 2);
-            if out.len() >= cap {
-                break;
-            }
-            out.push(quad[2] << 6 | quad[3]);
-            q = 0;
-        }
-    }
-    // A partial final group: 2 characters make 1 byte, 3 make 2.
-    if q >= 2 && out.len() < cap {
-        out.push(quad[0] << 2 | quad[1] >> 4);
-        if q == 3 && out.len() < cap {
-            out.push(quad[1] << 4 | quad[2] >> 2);
-        }
-    }
-    out
+    lumen_common::codec::base64_decode_lenient(s.as_bytes())
 }
 
 /// `Buffer.byteLength(s, 'base64')`, Node's formula (no decoding).

@@ -30,47 +30,16 @@
 //! isolation + budget is what keeps the parent flat and turns pathological programs into skipped
 //! "inconclusive" results rather than false divergences or an OOM.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lumen::bytecode::Tier;
 use lumen::{Completion, Engine};
 
-/// A counting allocator with a hard live-bytes cap. When a `--check` child engages the cap, any
-/// allocation that would exceed it fails (returns null → `handle_alloc_error` aborts the child)
-/// *before* the memory is committed — so a runaway program can never spike RSS between RSS polls;
-/// it dies the instant it asks for too much. Uncapped (`usize::MAX`) in the parent.
-struct CappedAlloc {
-    live: AtomicUsize,
-    cap: AtomicUsize,
-}
-
-unsafe impl GlobalAlloc for CappedAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let prev = self.live.fetch_add(layout.size(), Ordering::Relaxed);
-        if prev + layout.size() > self.cap.load(Ordering::Relaxed) {
-            self.live.fetch_sub(layout.size(), Ordering::Relaxed);
-            return std::ptr::null_mut();
-        }
-        let p = System.alloc(layout);
-        if p.is_null() {
-            self.live.fetch_sub(layout.size(), Ordering::Relaxed);
-        }
-        p
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        self.live.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
-
+/// Uncapped in the parent; a `--check` child engages the cap, so a runaway program dies the
+/// instant it asks for too much instead of spiking RSS between polls.
 #[global_allocator]
-static ALLOC: CappedAlloc = CappedAlloc {
-    live: AtomicUsize::new(0),
-    cap: AtomicUsize::new(usize::MAX),
-};
+static ALLOC: lumen_common::limits::CappedAlloc = lumen_common::limits::CappedAlloc::new(usize::MAX);
 
 /// xorshift64*: deterministic, dependency-free.
 struct Rng(u64);
@@ -405,9 +374,7 @@ fn dispatch() {
         Some("--check") => {
             // Hard allocation ceiling for this child: an over-budget program's allocation fails
             // and aborts the child (exit != 3 → parent reads Inconclusive) with no RSS spike.
-            ALLOC
-                .cap
-                .store(CAP_MB as usize * 1024 * 1024, Ordering::Relaxed);
+            ALLOC.set_cap(CAP_MB as usize * 1024 * 1024);
             let src = std::fs::read_to_string(&args[1]).unwrap();
             std::process::exit(if diverges(&src) { 3 } else { 0 });
         }
@@ -440,35 +407,19 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
         .unwrap();
     let pid = child.id();
     let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return match status.code() {
+    let over_budget = || {
+        lumen_os::sysinfo::resident_set_bytes_of(pid).is_some_and(|b| b > CAP_MB * 1024 * 1024)
+            || start.elapsed().as_millis() as u64 > TIMEOUT_MS
+    };
+    match lumen_os::child::wait_or_kill(&mut child, std::time::Duration::from_millis(4), over_budget).unwrap() {
+        Some(status) => match status.code() {
                 Some(3) => Verdict::Diverge,
                 Some(0) => Verdict::Agree,
                 // Nonzero-but-not-3 (a crash/abort in BOTH tiers, e.g. a stack overflow on a
                 // deeply-recursive program) is inconclusive, not a divergence.
                 _ => Verdict::Inconclusive,
-            };
-        }
-        // Poll RSS via `ps` (dependency-free); kill if over budget or past the deadline.
-        if let Ok(out) = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid.to_string()])
-            .output()
-        {
-            if let Ok(kb) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
-                if kb > CAP_MB * 1024 {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Verdict::Inconclusive;
-                }
-            }
-        }
-        if start.elapsed().as_millis() as u64 > TIMEOUT_MS {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Verdict::Inconclusive;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(4));
+        },
+        None => Verdict::Inconclusive,
     }
 }
 

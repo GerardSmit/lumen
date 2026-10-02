@@ -79,7 +79,7 @@ If any check fails, the one generic call runs, so behaviour is unchanged.
 
 Query: `Ctx::sync_callback_params(&callee) -> u32`. Bit `i` set means JS argument `i` is a sync non-escaping callback. For a bare fn pointer, use `sync_callbacks::sync_callback_params_of(NativeFn)`. The query is keyed by native-fn identity, and the mask comes from one of two sources.
 
-**`#[lumen::op]` functions.** A parameter typed `SyncFn<'call>` sets bit `8 + i` of `OpDesc::flags`. The shift is the constant `OP_SYNC_CB_SHIFT`. `SyncFn` has these properties:
+**`lumen_bind` ops.** A parameter typed `SyncFn<'call>` sets bit `i` of the op's callback mask (`Native::CALLBACKS`); `Interp::op_info_of` finds it from the fn pointer. `SyncFn` has these properties:
 
 - It borrows the argument for the op call's lifetime.
 - It is `!Send`, `!Clone`, and not convertible to `Value`.

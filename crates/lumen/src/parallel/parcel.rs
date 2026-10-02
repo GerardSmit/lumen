@@ -25,7 +25,7 @@ impl Drop for HeapGuard {
 }
 
 pub(crate) enum Intrinsic {
-    Object, Array, String, Number, Boolean, Error(&'static str), Extra(&'static str),
+    Object, Array, String, Number, Boolean, Function, Error(&'static str), Extra(&'static str),
 }
 
 #[derive(Default)]
@@ -46,6 +46,7 @@ pub struct Parcel {
     pub(crate) root: Value,
     pub(crate) protos: Vec<(Gc, Intrinsic)>,
     pub(crate) side: SideTables,
+    pub(crate) functions: Vec<(Gc, std::rc::Rc<crate::ast::Function>)>,
     pub(crate) bytes: usize,
     pub(crate) objects: usize,
     pub(crate) adopted: bool,
@@ -56,7 +57,7 @@ unsafe impl Send for Parcel {}
 
 impl Parcel {
     pub(crate) fn empty() -> Self {
-        Self { heap: GcState::new(), root: Value::Undefined, protos: Vec::new(), side: SideTables::default(), bytes: 0, objects: 0, adopted: false }
+        Self { heap: GcState::new(), root: Value::Undefined, protos: Vec::new(), side: SideTables::default(), functions: Vec::new(), bytes: 0, objects: 0, adopted: false }
     }
     pub fn bytes(&self) -> usize { self.bytes }
     pub fn objects(&self) -> usize { self.objects }
@@ -76,6 +77,7 @@ impl Drop for Parcel {
         self.root = Value::Undefined;
         self.protos.clear();
         self.side = SideTables::default();
+        self.functions.clear();
         drop(objects);
     }
 }

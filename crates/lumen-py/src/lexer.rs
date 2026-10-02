@@ -4,6 +4,9 @@
 //! tokens: names, keywords, operators, numbers, strings, and `INDENT`/`DEDENT`/`NEWLINE`
 //! bookkeeping. Integer literals are converted to decimal digit strings, string literals are
 //! decoded; f-strings are delimited here (PEP 701) and kept raw for the parser to split.
+//!
+//! [`tokenize_extra`] is the `tokenize` module's view of the same scan: every token with its
+//! source text and end position, plus comments, `NL` and the PEP 701 f-string tokens.
 
 pub(crate) mod string;
 
@@ -42,6 +45,31 @@ pub enum Tok {
     Indent,
     Dedent,
     EndMarker,
+    /// The tokens below come from [`tokenize_extra`] only.
+    Comment,
+    Nl,
+    FStart,
+    FMiddle,
+    FEnd,
+    /// A character that starts no token.
+    Error,
+}
+
+/// A token of [`tokenize_extra`]: its source text and end position (`col` in characters).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawToken {
+    pub tok: Tok,
+    pub text: String,
+    pub start: (u32, u32),
+    pub end: (u32, u32),
+}
+
+#[derive(Clone, Copy)]
+struct Span {
+    start: usize,
+    end: usize,
+    end_line: u32,
+    end_col: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +160,42 @@ fn radix_to_decimal(digits: &[char], radix: u64) -> String {
 }
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
+    let chars = source_chars(src)?;
+    Lexer::new(&chars, 1, 0, false).run()
+}
+
+/// The `tokenize` module's tokens of `src` (CPython's tokenizer with `extra_tokens`), and the
+/// error that stopped the scan, if any.
+pub fn tokenize_extra(src: &str) -> (Vec<RawToken>, Option<SyntaxError>) {
+    let chars = match source_chars(src) {
+        Ok(c) => c,
+        Err(e) => return (Vec::new(), Some(e)),
+    };
+    let mut lx = Lexer::new(&chars, 1, 0, false);
+    lx.extra = true;
+    lx.line_starts.push(0);
+    for (k, &c) in chars.iter().enumerate() {
+        if c == '\n' {
+            lx.line_starts.push(k + 1);
+        }
+    }
+    let r = lx.lex_until(chars.len(), true).and_then(|()| lx.finish_extra());
+    let toks = lx
+        .toks
+        .iter()
+        .zip(&lx.spans)
+        .map(|(t, sp)| RawToken {
+            tok: t.tok.clone(),
+            text: chars[sp.start..sp.end].iter().collect(),
+            start: (t.line, if t.tok == Tok::Indent { 0 } else { t.col }),
+            end: (sp.end_line, sp.end_col),
+        })
+        .collect();
+    (toks, r.err())
+}
+
+/// `src` as characters: without a byte order mark, with `\r\n` / `\r` as `\n`.
+fn source_chars(src: &str) -> Result<Vec<char>, SyntaxError> {
     let mut chars: Vec<char> = Vec::with_capacity(src.len());
     let mut it = src.chars().peekable();
     if it.peek() == Some(&'\u{feff}') {
@@ -155,7 +219,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
             _ => chars.push(c),
         }
     }
-    Lexer::new(&chars, 1, 0, false).run()
+    Ok(chars)
 }
 
 /// Tokenizes an expression embedded in an f-string: newlines are insignificant and there is
@@ -177,6 +241,12 @@ struct Lexer<'a> {
     indents: Vec<(u32, u32)>,
     brackets: Vec<(char, u32, u32)>,
     fragment: bool,
+    /// [`tokenize_extra`]: keep comments, `NL` and f-string pieces, record spans, and leave
+    /// literal validation to the parser.
+    extra: bool,
+    spans: Vec<Span>,
+    line_starts: Vec<usize>,
+    fdepth: u32,
 }
 
 impl<'a> Lexer<'a> {
@@ -190,6 +260,18 @@ impl<'a> Lexer<'a> {
             indents: vec![(0, 0)],
             brackets: Vec::new(),
             fragment,
+            extra: false,
+            spans: Vec::new(),
+            line_starts: Vec::new(),
+            fdepth: 0,
+        }
+    }
+
+    /// The index of `(line, col)`; past the end for positions after the last line.
+    fn index_at(&self, line: u32, col: u32) -> usize {
+        match self.line_starts.get(line as usize - 1) {
+            Some(&s) => (s + col as usize).min(self.src.len()),
+            None => self.src.len(),
         }
     }
 
@@ -222,12 +304,31 @@ impl<'a> Lexer<'a> {
     }
 
     fn push(&mut self, tok: Tok, line: u32, col: u32) {
+        if self.extra {
+            let span = match tok {
+                Tok::Dedent | Tok::EndMarker => {
+                    let at = self.index_at(line, col);
+                    Span { start: at, end: at, end_line: line, end_col: col }
+                }
+                Tok::Indent => Span { start: self.index_at(line, 0), end: self.i, end_line: self.line, end_col: self.col },
+                // CPython ends a newline token one column after its start, also at the end of
+                // the input, where its text is empty.
+                Tok::Newline | Tok::Nl => Span { start: self.index_at(line, col), end: self.i, end_line: line, end_col: col + 1 },
+                _ => Span { start: self.index_at(line, col), end: self.i, end_line: self.line, end_col: self.col },
+            };
+            self.spans.push(span);
+        }
         self.toks.push(Token { tok, line, col });
     }
 
     fn run(mut self) -> Result<Vec<Token>, SyntaxError> {
-        let mut at_line_start = !self.fragment;
-        while self.i < self.src.len() {
+        let start = !self.fragment;
+        self.lex_until(self.src.len(), start)?;
+        self.finish()
+    }
+
+    fn lex_until(&mut self, limit: usize, mut at_line_start: bool) -> Result<(), SyntaxError> {
+        while self.i < limit {
             if at_line_start && self.brackets.is_empty() {
                 if self.line_start()? {
                     continue;
@@ -237,17 +338,15 @@ impl<'a> Lexer<'a> {
             let c = self.src[self.i];
             match c {
                 ' ' | '\t' | '\x0c' => self.bump(),
-                '#' => {
-                    while self.i < self.src.len() && self.src[self.i] != '\n' {
-                        self.bump();
-                    }
-                }
+                '#' => self.comment(),
                 '\n' => {
                     let (line, col) = (self.line, self.col);
                     self.bump();
                     if self.brackets.is_empty() && !self.fragment {
                         self.push(Tok::Newline, line, col);
                         at_line_start = true;
+                    } else if self.extra {
+                        self.push(Tok::Nl, line, col);
                     }
                 }
                 '\\' => self.continuation()?,
@@ -258,7 +357,39 @@ impl<'a> Lexer<'a> {
                 _ => self.operator()?,
             }
         }
-        self.finish()
+        Ok(())
+    }
+
+    fn comment(&mut self) {
+        let (line, col, start) = (self.line, self.col, self.i);
+        while self.i < self.src.len() && self.src[self.i] != '\n' {
+            self.bump();
+        }
+        if self.extra && self.i > start {
+            self.push(Tok::Comment, line, col);
+        }
+    }
+
+    /// The end of a [`tokenize_extra`] scan: CPython puts a missing `NEWLINE` on the last
+    /// line and the closing `DEDENT`s and `ENDMARKER` at the start of the line after it.
+    fn finish_extra(&mut self) -> Result<(), SyntaxError> {
+        if !self.brackets.is_empty() {
+            let line = if self.col == 0 { self.line.saturating_sub(1).max(1) } else { self.line };
+            return self.err("unexpected EOF in multi-line statement", line, 0);
+        }
+        let (mut line, col) = (self.line, self.col);
+        if !matches!(self.toks.last(), None | Some(Token { tok: Tok::Newline | Tok::Nl, .. })) {
+            self.push(Tok::Newline, line, col);
+        }
+        if col != 0 {
+            line += 1;
+        }
+        while self.indents.len() > 1 {
+            self.indents.pop();
+            self.push(Tok::Dedent, line, 0);
+        }
+        self.push(Tok::EndMarker, line, 0);
+        Ok(())
     }
 
     fn finish(mut self) -> Result<Vec<Token>, SyntaxError> {
@@ -331,11 +462,13 @@ impl<'a> Lexer<'a> {
         match self.src.get(j) {
             None | Some('\n') | Some('#') => {
                 self.advance_to(j);
-                while self.i < self.src.len() && self.src[self.i] != '\n' {
-                    self.bump();
-                }
+                self.comment();
+                let (line, col) = (self.line, self.col);
                 if self.i < self.src.len() {
                     self.bump();
+                }
+                if self.extra {
+                    self.push(Tok::Nl, line, col);
                 }
                 return Ok(true);
             }
@@ -434,6 +567,11 @@ impl<'a> Lexer<'a> {
                 .all(|(k, ch)| self.peek(k) == Some(ch))
         });
         let Some(&op) = op else {
+            if self.extra {
+                self.bump();
+                self.push(Tok::Error, line, col);
+                return Ok(());
+            }
             let msg = if c.is_control() || !c.is_ascii() {
                 format!("invalid character '{c}' (U+{:04X})", c as u32)
             } else {
@@ -483,6 +621,9 @@ impl<'a> Lexer<'a> {
         raw: bool,
         fmt: bool,
     ) -> Result<(), SyntaxError> {
+        if fmt && self.extra {
+            return self.fstring_extra(prefix, raw);
+        }
         let (line, col) = (self.line, self.col);
         self.advance_to(self.i + prefix);
         let q = self.src[self.i];
@@ -511,7 +652,9 @@ impl<'a> Lexer<'a> {
             }
         };
         let body = &self.src[start..end];
-        let tok = if fmt {
+        let tok = if self.extra {
+            Tok::Str(Rc::from(""))
+        } else if fmt {
             Tok::FStr {
                 body: Rc::from(body),
                 raw,
@@ -534,6 +677,143 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
+    fn unterminated<T>(&self, q: Quote, line: u32, col: u32) -> Result<T, SyntaxError> {
+        let msg = if q.triple {
+            "unterminated triple-quoted f-string literal"
+        } else {
+            "unterminated f-string literal"
+        };
+        self.err(format!("{msg} (detected at line {})", self.line), line, col)
+    }
+
+    /// An f-string as CPython's tokenizer splits it: `FSTRING_START`, literal text as
+    /// `FSTRING_MIDDLE`, the replacement fields' tokens, `FSTRING_END`.
+    fn fstring_extra(&mut self, prefix: usize, raw: bool) -> Result<(), SyntaxError> {
+        let (line, col) = (self.line, self.col);
+        self.advance_to(self.i + prefix);
+        let ch = self.src[self.i];
+        let triple = self.peek(1) == Some(ch) && self.peek(2) == Some(ch);
+        let q = Quote { ch, triple };
+        let qlen = if triple { 3 } else { 1 };
+        self.advance_to(self.i + qlen);
+        self.push(Tok::FStart, line, col);
+        if self.fdepth >= string::MAX_FSTRING_DEPTH {
+            return self.err("too many nested f-strings", line, col);
+        }
+        self.fdepth += 1;
+        self.fstring_text(q, raw, false, (line, col))?;
+        self.fdepth -= 1;
+        let (l, c) = (self.line, self.col);
+        self.advance_to(self.i + qlen);
+        self.push(Tok::FEnd, l, c);
+        Ok(())
+    }
+
+    /// Literal text up to the closing quote (or, in a format spec, up to its `}`), with the
+    /// replacement fields in it. A doubled brace ends a `FSTRING_MIDDLE` after its first brace.
+    fn fstring_text(&mut self, q: Quote, raw: bool, spec: bool, open: (u32, u32)) -> Result<(), SyntaxError> {
+        let mut chunk = (self.line, self.col, self.i);
+        let mut after_field = false;
+        loop {
+            let Some(c) = self.peek(0) else {
+                return self.unterminated(q, open.0, open.1);
+            };
+            match c {
+                '\\' => match self.peek(1) {
+                    None => return self.unterminated(q, open.0, open.1),
+                    Some('{' | '}') => self.bump(),
+                    Some('N') if !raw && self.peek(2) == Some('{') => {
+                        while self.i < self.src.len() && self.src[self.i] != '}' && self.src[self.i] != '\n' {
+                            self.bump();
+                        }
+                        if self.i < self.src.len() {
+                            self.bump();
+                        }
+                    }
+                    Some(_) => {
+                        self.bump();
+                        self.bump();
+                    }
+                },
+                '\n' if !q.triple => return self.unterminated(q, open.0, open.1),
+                _ if c == q.ch && (!q.triple || (self.peek(1) == Some(c) && self.peek(2) == Some(c))) => {
+                    if spec {
+                        return self.err("f-string: expecting '}'", self.line, self.col);
+                    }
+                    self.fstring_middle(chunk, false);
+                    return Ok(());
+                }
+                '{' | '}' if !spec && self.peek(1) == Some(c) => {
+                    self.bump();
+                    self.fstring_middle(chunk, false);
+                    self.bump();
+                    chunk = (self.line, self.col, self.i);
+                }
+                '{' => {
+                    self.fstring_middle(chunk, spec && after_field);
+                    self.fstring_field(q, raw)?;
+                    after_field = true;
+                    chunk = (self.line, self.col, self.i);
+                }
+                '}' if spec => {
+                    self.fstring_middle(chunk, after_field);
+                    return Ok(());
+                }
+                '}' => return self.err("f-string: single '}' is not allowed", self.line, self.col),
+                _ => self.bump(),
+            }
+        }
+    }
+
+    fn fstring_middle(&mut self, (line, col, start): (u32, u32, usize), keep_empty: bool) {
+        if self.i > start || keep_empty {
+            self.push(Tok::FMiddle, line, col);
+        }
+    }
+
+    /// A replacement field, from its `{` to its `}`.
+    fn fstring_field(&mut self, q: Quote, raw: bool) -> Result<(), SyntaxError> {
+        let (line, col) = (self.line, self.col);
+        self.bump();
+        self.push(Tok::Op("{"), line, col);
+        let (end, kind) = match string::scan_field_expr(self.src, self.i, self.fdepth) {
+            Ok(r) => r,
+            Err(ScanErr::Msg(m)) => return self.err(m, line, col),
+            Err(ScanErr::Unterminated) => return self.unterminated(q, line, col),
+        };
+        self.brackets.push(('{', line, col));
+        self.lex_until(end, false)?;
+        self.brackets.pop();
+        if kind == string::FieldEnd::Debug {
+            let (l, c) = (self.line, self.col);
+            self.bump();
+            self.push(Tok::Op("="), l, c);
+            let next = string::skip_debug_ws(self.src, end);
+            self.advance_to(next);
+        }
+        if self.peek(0) == Some('!') {
+            let (l, c) = (self.line, self.col);
+            self.bump();
+            self.push(Tok::Op("!"), l, c);
+            if self.peek(0).is_some_and(is_xid_start) {
+                self.name()?;
+            }
+        }
+        if self.peek(0) == Some(':') {
+            let (l, c) = (self.line, self.col);
+            self.bump();
+            self.push(Tok::Op(":"), l, c);
+            self.fstring_text(q, raw, true, (line, col))?;
+        }
+        if self.peek(0) != Some('}') {
+            return self.err("f-string: expecting '}'", self.line, self.col);
+        }
+        let (l, c) = (self.line, self.col);
+        self.bump();
+        self.push(Tok::Op("}"), l, c);
+        Ok(())
+    }
+
     /// Reads digits (with single `_` separators) valid in `radix` starting at `j`.
     fn digits(&self, mut j: usize, radix: u32, out: &mut Vec<char>) -> Result<usize, SyntaxError> {
         let is_digit = |c: Option<&char>| c.is_some_and(|c| c.is_digit(radix));
@@ -542,7 +822,7 @@ impl<'a> Lexer<'a> {
             j += 1;
             if self.src.get(j) == Some(&'_') {
                 if !is_digit(self.src.get(j + 1)) {
-                    return self.err("invalid decimal literal", self.line, self.col);
+                    return self.err("invalid decimal literal", self.line, self.col + (j - self.i) as u32);
                 }
                 j += 1;
             }
@@ -614,6 +894,8 @@ impl<'a> Lexer<'a> {
                 let trimmed = trimmed.trim_start_matches('0');
                 if trimmed.is_empty() {
                     tok = Tok::Int(Rc::from("0"));
+                } else if self.extra {
+                    tok = Tok::Int(Rc::from(""));
                 } else if digits[0] == '0' {
                     return self.err(
                         "leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers",
@@ -622,7 +904,7 @@ impl<'a> Lexer<'a> {
                     );
                 } else {
                     let limit = crate::limits::literal_digit_limit();
-                    if limit != 0 && int_end > limit {
+                    if lumen_common::bigint::digits_exceed(limit, int_end) {
                         let msg = crate::limits::digit_limit_message(limit, Some(int_end));
                         return self.err(
                             format!("{msg} - Consider hexadecimal for huge integer literals to avoid decimal conversion limits."),

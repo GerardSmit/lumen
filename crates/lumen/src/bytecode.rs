@@ -58,6 +58,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
+use lumen_common::limits::size;
 use vm_regs::{PcReg, VmStack};
 
 /// Execution tier. `Interp` must not touch any codegen path at all; `Bytecode` (the default)
@@ -1154,6 +1155,20 @@ fn hoisted_vars_stmt(
 }
 
 impl CaptureScan {
+    #[cfg(feature = "parallel")]
+    fn free_identifiers(func: &Function) -> Option<std::collections::HashSet<String>> {
+        let mut scan = Self {
+            scopes: Vec::new(), fn_depth: 0, captured: Default::default(),
+            depth0_inner_decls: Default::default(), candidates: Default::default(),
+            ever_candidates: Default::default(), captured_serials: Default::default(),
+            const_candidates: Default::default(), free_refs: Default::default(),
+            self_name: func.name.clone().filter(|_| func.is_fn_expr), self_named: false,
+            loop_depth: 0, next_serial: 0, env_this: false, arrow_path: vec![func.is_arrow],
+        };
+        scan.fn_body(func)?;
+        Some(scan.free_refs)
+    }
+
     /// Analyze `func`, returning (captured names, inner-arrow-reads-this, activation-homed block
     /// lets, self-named, captured block-scoped names needing per-entry block envs) or `None` to
     /// bail.
@@ -1885,6 +1900,13 @@ impl CaptureScan {
     }
 }
 
+/// Reuse the compiler's scope-aware AST walk rather than treating property keys
+/// or shadowed lexical bindings as free variables.
+#[cfg(feature = "parallel")]
+pub(crate) fn function_free_identifiers(func: &Function) -> Option<std::collections::HashSet<String>> {
+    CaptureScan::free_identifiers(func)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Compiler
 // ---------------------------------------------------------------------------------------------
@@ -2020,7 +2042,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
         blk_names,
         // Strict code's calls in tail position are proper tail calls (see [`self_tail`]); an
         // async or generator body completes through its coroutine after the call.
-        tail_calls: func.is_strict && !func.is_async && !func.is_generator,
+        tail_calls: func.is_strict && !func.is_async && !func.is_generator && crate::tail_calls_enabled(),
         ..Compiler::default()
     };
     // Captured once-per-call block `let`s home in the activation (TDZ from entry, initialized
@@ -8323,7 +8345,7 @@ impl Chunk {
         if !Rc::ptr_eq(env, &i.global_env) {
             return self.name_path_fill(i, env, n, c);
         }
-        if !i.ordinary_get_ptr(Gc::as_ptr(&i.global) as usize) {
+        if i.global_proxy.is_some() || !i.ordinary_get_ptr(Gc::as_ptr(&i.global) as usize) {
             return None;
         }
         let g = i.global.borrow();
@@ -8819,7 +8841,7 @@ pub(crate) fn append_to_slot(slots: &mut [Value], d: usize, y: &Value) -> bool {
     let Value::Str(cur) = &slots[d] else {
         return false;
     };
-    if cur.len() + rhs.len() > crate::interpreter::MAX_STR_LEN
+    if size::sum(cur.len(), rhs.len(), crate::interpreter::MAX_STR_LEN).is_err()
         || crate::jstr::needs_join_fixup(cur, rhs)
     {
         return false;

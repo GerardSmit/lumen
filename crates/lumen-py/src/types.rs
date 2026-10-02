@@ -139,7 +139,6 @@ impl Interp {
             (t.zip.clone(), obj.clone()),
             (t.map.clone(), obj.clone()),
             (t.filter.clone(), obj.clone()),
-            (t.file.clone(), obj.clone()),
             (t.frame.clone(), obj.clone()),
         ];
         self.set_bases(&obj, vec![]);
@@ -241,6 +240,10 @@ impl Interp {
         self.new_exc(&cls, vec![v])
     }
 
+    pub fn runtime_error(&mut self, msg: &str) -> Obj {
+        self.new_exc_str("RuntimeError", msg)
+    }
+
     pub fn type_error(&mut self, msg: &str) -> Obj {
         self.new_exc_str("TypeError", msg)
     }
@@ -304,6 +307,7 @@ impl Interp {
             Kind::ByteArray(_) => t.bytearray.clone(),
             Kind::Type(_) => t.type_.clone(),
             Kind::Function(_) => t.function.clone(),
+            Kind::Method(Value::Obj(f), _) if matches!(f.kind, Kind::Native(_)) => t.builtin_function.clone(),
             Kind::Method(..) => t.method.clone(),
             Kind::Native(_) => t.builtin_function.clone(),
             Kind::Module => t.module.clone(),
@@ -339,7 +343,7 @@ impl Interp {
                 IterState::Zip { .. } => t.zip.clone(),
                 IterState::Map { .. } => t.map.clone(),
                 IterState::Filter { .. } => t.filter.clone(),
-                IterState::Native(_) | IterState::Empty => t.iterator.clone(),
+                IterState::Native(_) | IterState::Running | IterState::Empty => t.iterator.clone(),
             },
             Kind::Property(_) => t.property.clone(),
             Kind::StaticMethod(_) => t.staticmethod.clone(),
@@ -350,10 +354,27 @@ impl Interp {
                 ViewKind::Values => t.dict_values.clone(),
                 ViewKind::Items => t.dict_items.clone(),
             },
-            Kind::File(_) => t.file.clone(),
             Kind::Frame => t.frame.clone(),
-            Kind::AsyncGenValue(_) => t.object.clone(),
+            Kind::AsyncGenValue(_) | Kind::Opaque(_) => t.object.clone(),
         }
+    }
+
+    /// CPython's `tp_name`: the bare name of a class made by a `class` statement, `module.name`
+    /// for a native type outside `builtins`.
+    pub fn tp_name(&self, t: &Obj) -> String {
+        let name = self.type_name(t);
+        if self.is_heap(t) {
+            return name;
+        }
+        match self.type_module(t) {
+            Some(m) if m != "builtins" => format!("{m}.{name}"),
+            _ => name,
+        }
+    }
+
+    pub fn tp_name_of(&self, v: &Value) -> String {
+        let t = self.type_of(v);
+        self.tp_name(&t)
     }
 
     pub fn type_name_of(&self, v: &Value) -> String {
@@ -482,7 +503,7 @@ impl Interp {
         match v {
             Value::Obj(o) => match &o.kind {
                 Kind::Property(_) => true,
-                Kind::Instance => {
+                Kind::Instance | Kind::Opaque(_) => {
                     let c = self.type_of_obj(o);
                     self.lookup_mro(&c, "__set__").is_some() || self.lookup_mro(&c, "__delete__").is_some()
                 }
@@ -509,7 +530,7 @@ impl Interp {
             }
             Kind::StaticMethod(f) => Ok(f.clone()),
             Kind::ClassMethod(f) => Ok(Value::Obj(Object::new(Kind::Method(f.clone(), Value::Obj(cls.clone()))))),
-            Kind::Instance | Kind::Exception(_) => {
+            Kind::Instance | Kind::Exception(_) | Kind::Opaque(_) => {
                 let c = self.type_of_obj(o);
                 if let Some(g) = self.lookup_mro(&c, "__get__") {
                     let gb = self.bind_descr(&g, descr, &c)?;
@@ -530,7 +551,7 @@ impl Interp {
         match &o.kind {
             Kind::StaticMethod(f) => Ok(f.clone()),
             Kind::ClassMethod(f) => Ok(Value::Obj(Object::new(Kind::Method(f.clone(), Value::Obj(cls.clone()))))),
-            Kind::Instance => {
+            Kind::Instance | Kind::Opaque(_) => {
                 let c = self.type_of_obj(o);
                 if let Some(g) = self.lookup_mro(&c, "__get__") {
                     let gb = self.bind_descr(&g, descr, &c)?;
@@ -560,9 +581,9 @@ impl Interp {
                     let mn = o.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__name__")).and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
                     format!("module '{}' has no attribute '{}'", mn, name)
                 }
-                _ => format!("'{}' object has no attribute '{}'", self.type_name_of(obj), name),
+                _ => format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), name),
             },
-            _ => format!("'{}' object has no attribute '{}'", self.type_name_of(obj), name),
+            _ => format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), name),
         };
         let e = self.new_exc_str("AttributeError", &msg);
         self.set_exc_attr(&e, "name", Value::str(name));
@@ -613,16 +634,18 @@ impl Interp {
             match &o.kind {
                 Kind::Type(_) => return self.type_getattr(obj, o, name),
                 Kind::Module => {
-                    if let Some(d) = o.dict.borrow().as_ref() {
-                        if let Some(v) = dict_get_name(d, name) {
-                            return Ok(v);
-                        }
-                        if let Some(ga) = dict_get_str(d, "__getattr__") {
-                            return self.call(&ga, vec![Value::Obj(name.clone())], Vec::new());
-                        }
+                    let d = o.dict.borrow().clone();
+                    if let Some(v) = d.as_ref().and_then(|d| dict_get_name(d, name)) {
+                        return Ok(v);
                     }
                     if let Some(v) = self.special_attr(obj, nm)? {
                         return Ok(v);
+                    }
+                    if let Some(descr) = self.lookup_mro_name(cls, name) {
+                        return self.bind_descr(&descr, obj, cls);
+                    }
+                    if let Some(ga) = d.as_ref().and_then(|d| dict_get_str(d, "__getattr__")) {
+                        return self.call(&ga, vec![Value::Obj(name.clone())], Vec::new());
                     }
                     return Err(self.attr_error(obj, nm));
                 }
@@ -673,7 +696,7 @@ impl Interp {
         Err(self.attr_error(obj, &nm))
     }
 
-    fn type_special_attr(&mut self, cls: &Obj, nm: &str) -> Option<Value> {
+    pub fn type_special_attr(&mut self, cls: &Obj, nm: &str) -> Option<Value> {
         let td = match &cls.kind {
             Kind::Type(td) => td,
             _ => return None,
@@ -683,8 +706,8 @@ impl Interp {
         }
         Some(match nm {
             "__name__" => Value::str(&td.name.borrow()),
-            "__qualname__" => match cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__qualname__")) {
-                Some(v) => v,
+            "__qualname__" => match &*td.qualname.borrow() {
+                Some(q) => Value::str(q),
                 None => Value::str(&td.name.borrow()),
             },
             "__bases__" => Value::tuple(td.bases.borrow().iter().map(|b| Value::Obj(b.clone())).collect()),
@@ -696,10 +719,7 @@ impl Interp {
             "__class__" => Value::Obj(self.type_of_obj(cls)),
             "__dict__" => {
                 let d = cls.dict.borrow().clone().unwrap();
-                match &d.kind {
-                    Kind::Dict(dd) => Value::dict(dd.borrow().clone()),
-                    _ => Value::None,
-                }
+                self.new_mappingproxy(Value::Obj(d))
             }
             "__module__" => {
                 if cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__module__")).is_some() {
@@ -714,6 +734,10 @@ impl Interp {
                 Value::None
             }
             "__subclasses__" => return None,
+            "__type_params__" => match cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__type_params__")) {
+                Some(v) => v,
+                None => Value::tuple(Vec::new()),
+            },
             _ => return None,
         })
     }
@@ -835,6 +859,9 @@ impl Interp {
                         }
                     }));
                 }
+                "__type_params__" => {
+                    return Ok(Some(f.type_params.borrow().clone().unwrap_or_else(|| Value::tuple(Vec::new()))));
+                }
                 "__dict__" => {
                     let d = self.instance_dict(o);
                     return Ok(Some(Value::Obj(d)));
@@ -845,15 +872,50 @@ impl Interp {
             Kind::Method(f, this) => match nm {
                 "__self__" => return Ok(Some(this.clone())),
                 "__func__" => return Ok(Some(f.clone())),
-                "__name__" | "__qualname__" | "__doc__" | "__module__" | "__wrapped__" => {
+                "__name__" | "__qualname__" | "__doc__" | "__module__" | "__wrapped__" | "__text_signature__" => {
                     return self.get_attr_str(f, nm).map(Some).or_else(|e| if nm == "__doc__" { Ok(Some(Value::None)) } else { Err(e) })
                 }
                 _ => {}
             },
-            Kind::Native(n) => match nm {
-                "__name__" | "__qualname__" => return Ok(Some(Value::str(n.name))),
-                "__doc__" => return Ok(Some(Value::None)),
-                "__module__" => return Ok(Some(Value::str("builtins"))),
+            Kind::Native(n) => match (nm, n.desc) {
+                ("__name__", _) => return Ok(Some(Value::str(n.name))),
+                ("__qualname__", Some(d)) if d.class().is_some() => {
+                    return Ok(Some(Value::string(format!("{}.{}", crate::bind::args::class_name(d), n.name))));
+                }
+                ("__qualname__", None) if n.method => {
+                    if let Some(NativeOwner::Class(c)) = &n.owner {
+                        return Ok(Some(Value::string(format!("{}.{}", self.type_name(c), n.name))));
+                    }
+                    return Ok(Some(Value::str(n.name)));
+                }
+                ("__objclass__", None) if n.method => {
+                    if let Some(NativeOwner::Class(c)) = &n.owner {
+                        return Ok(Some(Value::Obj(c.clone())));
+                    }
+                }
+                ("__qualname__", _) => return Ok(Some(Value::str(n.name))),
+                ("__doc__", Some(d)) => return Ok(Some(d.doc.map(Value::str).unwrap_or(Value::None))),
+                ("__doc__", None) => return Ok(Some(Value::None)),
+                ("__text_signature__", d) => {
+                    return Ok(Some(d.and_then(crate::bind::args::text_signature).map(Value::string).unwrap_or(Value::None)))
+                }
+                ("__module__", Some(d)) if d.class().is_none() && d.module().is_some() => {
+                    return Ok(Some(Value::str(d.module().unwrap_or("builtins"))))
+                }
+                ("__module__", None) if matches!(n.owner, Some(NativeOwner::Module(_))) => {
+                    if let Some(NativeOwner::Module(m)) = &n.owner {
+                        return Ok(Some(Value::str(m)));
+                    }
+                }
+                ("__module__", _) => return Ok(Some(Value::str("builtins"))),
+                ("__self__", d) if d.is_none_or(|d| d.class().is_none()) => {
+                    let own = match &n.owner {
+                        Some(NativeOwner::Module(m)) => Some(&**m),
+                        _ => None,
+                    };
+                    let m = d.and_then(|d| d.module()).or(own).unwrap_or("builtins").to_string();
+                    return self.import_module(&m).map(|m| Some(Value::Obj(m)));
+                }
                 _ => {}
             },
             Kind::Generator(g) => match nm {
@@ -880,6 +942,13 @@ impl Interp {
                 "co_filename" => return Ok(Some(Value::str(&c.filename))),
                 "co_firstlineno" => return Ok(Some(Value::Int(c.first_line as i64))),
                 "co_argcount" => return Ok(Some(Value::Int(c.argcount as i64))),
+                "co_posonlyargcount" => return Ok(Some(Value::Int(c.posonly as i64))),
+                "co_kwonlyargcount" => return Ok(Some(Value::Int(c.kwonly as i64))),
+                "co_qualname" => return Ok(Some(Value::str(&c.qualname))),
+                "co_nlocals" => return Ok(Some(Value::Int(c.varnames.len() as i64))),
+                "co_cellvars" => return Ok(Some(Value::tuple(c.cellvars.iter().map(|n| Value::str(n)).collect()))),
+                "co_freevars" => return Ok(Some(Value::tuple(c.freevars.iter().map(|n| Value::str(n)).collect()))),
+                "co_names" => return Ok(Some(Value::tuple(c.names.iter().map(|n| Value::Obj(n.clone())).collect()))),
                 "co_varnames" => return Ok(Some(Value::tuple(c.varnames.iter().map(|n| Value::str(n)).collect()))),
                 "co_flags" => return Ok(Some(Value::Int(c.flags as i64))),
                 _ => {}
@@ -907,11 +976,24 @@ impl Interp {
                 "fset" => return Ok(Some(p.fset.clone())),
                 "fdel" => return Ok(Some(p.fdel.clone())),
                 "__doc__" => return Ok(Some(p.doc.clone())),
+                "__isabstractmethod__" => {
+                    let parts = [p.fget.clone(), p.fset.clone(), p.fdel.clone()];
+                    for f in &parts {
+                        if !f.is_none() && self.is_abstract_value(f)? {
+                            return Ok(Some(Value::Bool(true)));
+                        }
+                    }
+                    return Ok(Some(Value::Bool(false)));
+                }
                 _ => {}
             },
             Kind::StaticMethod(f) | Kind::ClassMethod(f) => {
                 if nm == "__func__" {
                     return Ok(Some(f.clone()));
+                }
+                if nm == "__isabstractmethod__" {
+                    let f = f.clone();
+                    return Ok(Some(Value::Bool(self.is_abstract_value(&f)?)));
                 }
             }
             Kind::Complex(re, im) => match nm {
@@ -928,11 +1010,6 @@ impl Interp {
             Kind::Super(t, _, ot) => match nm {
                 "__thisclass__" => return Ok(Some(t.clone())),
                 "__self_class__" => return Ok(Some(ot.clone())),
-                _ => {}
-            },
-            Kind::File(f) => match nm {
-                "name" => return Ok(Some(Value::str(&f.borrow().name))),
-                "closed" => return Ok(Some(Value::Bool(matches!(f.borrow().mode, FileMode::Closed)))),
                 _ => {}
             },
             Kind::Cell(c) if nm == "cell_contents" => {
@@ -998,17 +1075,70 @@ impl Interp {
         self.set_attr(obj, &n, v)
     }
 
+    /// Stores a class attribute past any descriptor: the slots `type`'s own getsets write.
+    pub fn type_store_attr(&mut self, o: &Obj, name: &Obj, v: Value) -> R<()> {
+        let Kind::Type(td) = &o.kind else { unreachable!() };
+        let nm = name.as_str_kind().unwrap_or("").to_string();
+        match nm.as_str() {
+            "__name__" => {
+                *td.name.borrow_mut() = v.as_str().unwrap_or("").into();
+                return Ok(());
+            }
+            "__qualname__" => {
+                let Some(q) = v.as_str() else {
+                    let msg = format!("can only assign string to {}.__qualname__, not '{}'", td.name.borrow(), self.type_name_of(&v));
+                    return Err(self.type_error(&msg));
+                };
+                *td.qualname.borrow_mut() = Some(q.into());
+                return Ok(());
+            }
+            "__bases__" => {
+                let items: Vec<Obj> = v.tuple_items().unwrap_or(&[]).iter().filter_map(|b| b.as_obj().cloned()).collect();
+                self.set_bases(o, items);
+                self.type_epoch += 1;
+                return Ok(());
+            }
+            "__abstractmethods__" => {
+                let abstract_ = self.truthy(&v)?;
+                let d = self.instance_dict(o);
+                dict_set_name(&d, name, v);
+                let f = td.flags.get();
+                td.flags.set(if abstract_ { f | TF_ABSTRACT } else { f & !TF_ABSTRACT });
+                return Ok(());
+            }
+            _ => {}
+        }
+        let d = self.instance_dict(o);
+        dict_set_name(&d, name, v);
+        if nm.starts_with("__") {
+            self.type_epoch += 1;
+        }
+        Ok(())
+    }
+
     pub fn generic_setattr(&mut self, obj: &Value, cls: &Obj, name: &Obj, v: Value) -> R<()> {
         let nm = name.as_str_kind().unwrap_or("").to_string();
+        if let Value::Obj(o) = obj {
+            if let Kind::Type(td) = &o.kind {
+                if td.flags.get() & TF_IMMUTABLE != 0 {
+                    let tn = td.name.borrow().clone();
+                    return Err(self.type_error(&format!("cannot set '{nm}' attribute of immutable type '{tn}'")));
+                }
+            }
+        }
         let o = match obj {
             Value::Obj(o) => o,
-            _ => return Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.type_name_of(obj), nm))),
+            _ => return Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), nm))),
         };
         if let Some(d) = self.lookup_mro_name(cls, name) {
             if let Value::Obj(dobj) = &d {
                 match &dobj.kind {
                     Kind::Property(p) => {
                         if p.fset.is_none() {
+                            if let Some(owner) = native_getter_owner(dobj, &p.fget) {
+                                let msg = format!("attribute '{}' of '{}' objects is not writable", nm, owner);
+                                return Err(self.new_exc_str("AttributeError", &msg));
+                            }
                             let msg = format!("property '{}' of '{}' object has no setter", nm, self.type_name(cls));
                             return Err(self.new_exc_str("AttributeError", &msg));
                         }
@@ -1016,7 +1146,7 @@ impl Interp {
                         self.call(&f, vec![obj.clone(), v], Vec::new())?;
                         return Ok(());
                     }
-                    Kind::Instance => {
+                    Kind::Instance | Kind::Opaque(_) => {
                         let dc = self.type_of_obj(dobj);
                         if let Some(s) = self.lookup_mro(&dc, "__set__") {
                             let b = self.bind_descr(&s, &d, &dc)?;
@@ -1029,27 +1159,7 @@ impl Interp {
             }
         }
         match &o.kind {
-            Kind::Type(td) => {
-                match nm.as_str() {
-                    "__name__" => {
-                        *td.name.borrow_mut() = v.as_str().unwrap_or("").into();
-                        return Ok(());
-                    }
-                    "__bases__" => {
-                        let items: Vec<Obj> = v.tuple_items().unwrap_or(&[]).iter().filter_map(|b| b.as_obj().cloned()).collect();
-                        self.set_bases(o, items);
-                        self.type_epoch += 1;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-                let d = self.instance_dict(o);
-                dict_set_name(&d, name, v);
-                if nm.starts_with("__") {
-                    self.type_epoch += 1;
-                }
-                Ok(())
-            }
+            Kind::Type(_) => self.type_store_attr(o, name, v),
             Kind::Exception(d) => {
                 match nm.as_str() {
                     "args" => {
@@ -1083,6 +1193,12 @@ impl Interp {
                         *f.defaults.borrow_mut() = v.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
                     }
                     "__annotations__" => *f.annotations.borrow_mut() = v.as_obj().cloned(),
+                    "__type_params__" => {
+                        if v.tuple_items().is_none() {
+                            return Err(self.type_error("__type_params__ must be set to a tuple"));
+                        }
+                        *f.type_params.borrow_mut() = Some(v);
+                    }
                     _ => {
                         let dd = self.instance_dict(o);
                         dict_set_name(&dd, name, v);
@@ -1095,7 +1211,7 @@ impl Interp {
                     return Err(self.new_exc_str("TypeError", "__class__ assignment not supported"));
                 }
                 if matches!(o.kind, Kind::Instance) && self.lookup_mro(cls, "__slots__").is_some() && self.slots_forbid(cls, &nm) {
-                    let msg = format!("'{}' object has no attribute '{}' and no __dict__ for setting new attributes", self.type_name(cls), nm);
+                    let msg = format!("'{}' object has no attribute '{}'", self.tp_name(cls), nm);
                     return Err(self.new_exc_str("AttributeError", &msg));
                 }
                 let dd = self.instance_dict(o);
@@ -1104,6 +1220,10 @@ impl Interp {
             }
             _ => {
                 if o.cls.is_some() {
+                    if self.lookup_mro(cls, "__slots__").is_some() && self.slots_forbid(cls, &nm) {
+                        let msg = format!("'{}' object has no attribute '{}'", self.tp_name(cls), nm);
+                        return Err(self.new_exc_str("AttributeError", &msg));
+                    }
                     let dd = self.instance_dict(o);
                     dict_set_name(&dd, name, v);
                     Ok(())
@@ -1113,7 +1233,7 @@ impl Interp {
                     }
                     Ok(())
                 } else {
-                    Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.type_name_of(obj), nm)))
+                    Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), nm)))
                 }
             }
         }
@@ -1127,8 +1247,8 @@ impl Interp {
             let d = self.instance_dict(&o);
             dict_set_str(&d, "tb_lineno", Value::Int(e.line as i64));
             dict_set_str(&d, "tb_next", next);
-            dict_set_str(&d, "tb_frame", Value::None);
-            dict_set_str(&d, "tb_lasti", Value::Int(0));
+            dict_set_str(&d, "tb_frame", self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line, e.lasti));
+            dict_set_str(&d, "tb_lasti", Value::Int(2 * e.lasti as i64));
             next = Value::Obj(o);
         }
         next
@@ -1139,15 +1259,9 @@ impl Interp {
         let mro = td.mro.borrow().clone();
         let mut out = Vec::new();
         for c in &mro {
-            let slots = c.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__slots__"));
-            let Some(Value::Obj(so)) = slots else { continue };
-            let items: Vec<Value> = match &so.kind {
-                Kind::Tuple(t) => t.clone(),
-                Kind::List(l) => l.borrow().clone(),
-                Kind::Str(_) => vec![Value::Obj(so.clone())],
-                _ => Vec::new(),
-            };
-            out.extend(items.iter().filter_map(|v| v.as_str().map(str::to_string)));
+            if let Some(names) = class_slots(c) {
+                out.extend(names.iter().map(|n| n.to_string()));
+            }
         }
         out
     }
@@ -1160,25 +1274,16 @@ impl Interp {
             if Rc::ptr_eq(c, &self.types.object) {
                 continue;
             }
-            let slots = c.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__slots__"));
-            let Some(slots) = slots else {
+            let Some(names) = class_slots(c) else {
                 if self.is_heap(c) {
                     return false;
                 }
                 continue;
             };
-            let names: Vec<Value> = match &slots {
-                Value::Obj(o) => match &o.kind {
-                    Kind::Tuple(t) => t.clone(),
-                    Kind::List(l) => l.borrow().clone(),
-                    _ => vec![slots.clone()],
-                },
-                _ => Vec::new(),
-            };
-            for n in names {
-                match n.as_str() {
-                    Some("__dict__") => return false,
-                    Some(s) if s == name => allowed = true,
+            for n in names.iter() {
+                match &**n {
+                    "__dict__" => return false,
+                    s if s == name => allowed = true,
                     _ => {}
                 }
             }
@@ -1205,6 +1310,10 @@ impl Interp {
                 match &dobj.kind {
                     Kind::Property(p) => {
                         if p.fdel.is_none() {
+                            if let Some(owner) = native_getter_owner(dobj, &p.fget) {
+                                let msg = format!("attribute '{}' of '{}' objects is not writable", nm, owner);
+                                return Err(self.new_exc_str("AttributeError", &msg));
+                            }
                             let msg = format!("property '{}' of '{}' object has no deleter", nm, self.type_name(cls));
                             return Err(self.new_exc_str("AttributeError", &msg));
                         }
@@ -1212,7 +1321,7 @@ impl Interp {
                         self.call(&f, vec![obj.clone()], Vec::new())?;
                         return Ok(());
                     }
-                    Kind::Instance => {
+                    Kind::Instance | Kind::Opaque(_) => {
                         let dc = self.type_of_obj(dobj);
                         if let Some(s) = self.lookup_mro(&dc, "__delete__") {
                             let b = self.bind_descr(&s, &d, &dc)?;
@@ -1261,6 +1370,20 @@ impl Interp {
             if args.len() != 3 {
                 return Err(self.type_error("type() takes 1 or 3 arguments"));
             }
+            let mut winner = cls.clone();
+            if let Some(bases) = args[1].tuple_items() {
+                for b in bases.iter() {
+                    if let Value::Obj(bo) = b {
+                        let bm = self.type_of_obj(bo);
+                        if self.is_subtype(&bm, &winner) {
+                            winner = bm;
+                        }
+                    }
+                }
+            }
+            if !Rc::ptr_eq(&winner, cls) {
+                return self.type_call_default(&winner, args, kw);
+            }
             return self.type_new_from_args(cls.clone(), &args, kw);
         }
         let new = match self.lookup_mro(cls, "__new__") {
@@ -1305,6 +1428,9 @@ impl Interp {
     }
 
     pub fn alloc_instance(&mut self, cls: &Obj) -> R<Value> {
+        if matches!(&cls.kind, Kind::Type(td) if td.flags.get() & TF_ABSTRACT != 0) {
+            self.check_abstract(cls)?;
+        }
         let layout = self.type_layout(cls);
         let exact = |t: &Obj, s: &Interp, base: &Obj| Rc::ptr_eq(t, base) || !s.is_heap(t);
         let kind = match layout {
@@ -1313,7 +1439,7 @@ impl Interp {
             Layout::Dict => Kind::Dict(RefCell::new(PyDict::new())),
             Layout::Set => Kind::Set(RefCell::new(PyDict::new_set())),
             Layout::FrozenSet => Kind::FrozenSet(RefCell::new(PyDict::new_set())),
-            Layout::ByteArray => Kind::ByteArray(RefCell::new(Vec::new())),
+            Layout::ByteArray => Kind::ByteArray(ba_store(Vec::new())),
             Layout::Exception => Kind::Exception(RefCell::new(ExcData {
                 args: Value::tuple(Vec::new()),
                 cause: None,
@@ -1343,6 +1469,32 @@ impl Interp {
             Object::with_cls(cls.clone(), kind)
         };
         Ok(Value::Obj(o))
+    }
+
+    fn is_abstract_value(&mut self, f: &Value) -> R<bool> {
+        match self.get_attr_str(f, "__isabstractmethod__") {
+            Ok(v) => self.truthy(&v),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn check_abstract(&mut self, cls: &Obj) -> R<()> {
+        let names = match cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__abstractmethods__")) {
+            Some(v) => self.iterate_to_vec(&v)?,
+            None => return Ok(()),
+        };
+        let mut names: Vec<String> = names.iter().filter_map(|n| n.as_str().map(str::to_string)).collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+        names.sort();
+        let msg = format!(
+            "Can't instantiate abstract class {} with abstract method{} {}",
+            self.type_name(cls),
+            if names.len() > 1 { "s" } else { "" },
+            names.join(", ")
+        );
+        Err(self.type_error(&msg))
     }
 
     pub fn is_heap(&self, t: &Obj) -> bool {
@@ -1383,6 +1535,12 @@ impl Interp {
         }
         let mut layout = Layout::Object;
         for b in &bases {
+            if let Kind::Type(td) = &b.kind {
+                if td.flags.get() & TF_FINAL != 0 {
+                    let n = self.type_display(b);
+                    return Err(self.type_error(&format!("type '{n}' is not an acceptable base type")));
+                }
+            }
             let bl = self.type_layout(b);
             if bl != Layout::Object {
                 if layout == Layout::Object {
@@ -1396,6 +1554,20 @@ impl Interp {
             Kind::Dict(d) => d.borrow().clone(),
             _ => PyDict::new(),
         })));
+        let qualname: Option<Rc<str>> = match dict_get_str(&dict, "__qualname__") {
+            Some(v) => match v.as_str() {
+                Some(q) => {
+                    let q = q.into();
+                    dict_del_str(&dict, "__qualname__");
+                    Some(q)
+                }
+                None => {
+                    let msg = format!("type __qualname__ must be a str, not {}", self.type_name_of(&v));
+                    return Err(self.type_error(&msg));
+                }
+            },
+            None => None,
+        };
         if dict_get_str(&dict, "__module__").is_none() {
             let m = self.frames.last().and_then(|f| dict_get_str(&f.globals, "__name__")).unwrap_or_else(|| Value::str("__main__"));
             dict_set_str(&dict, "__module__", m);
@@ -1406,6 +1578,34 @@ impl Interp {
         if dict_get_str(&dict, "__eq__").is_some() && dict_get_str(&dict, "__hash__").is_none() {
             dict_set_str(&dict, "__hash__", Value::None);
         }
+        for name in ["__init_subclass__", "__class_getitem__"] {
+            if let Some(Value::Obj(f)) = dict_get_str(&dict, name) {
+                if matches!(f.kind, Kind::Function(_)) {
+                    dict_set_str(&dict, name, Value::Obj(Object::new(Kind::ClassMethod(Value::Obj(f)))));
+                }
+            }
+        }
+        if let Some(Value::Obj(f)) = dict_get_str(&dict, "__new__") {
+            if matches!(f.kind, Kind::Function(_)) {
+                dict_set_str(&dict, "__new__", Value::Obj(Object::new(Kind::StaticMethod(Value::Obj(f)))));
+            }
+        }
+        let slots = match dict_get_str(&dict, "__slots__") {
+            None => None,
+            Some(v) => {
+                let items = if v.as_str().is_some() { vec![v] } else { self.iterate_to_vec(&v)? };
+                let private: Option<Rc<str>> = Some(name.into());
+                let mut names: Vec<Rc<str>> = Vec::with_capacity(items.len());
+                for item in &items {
+                    let Some(s) = item.as_str() else {
+                        let t = self.type_name_of(item);
+                        return Err(self.type_error(&format!("__slots__ items must be strings, not '{t}'")));
+                    };
+                    names.push(crate::symtable::mangle(&private, s));
+                }
+                Some(Rc::from(names))
+            }
+        };
         let cls_field = if Rc::ptr_eq(meta, &self.types.type_) { None } else { Some(meta.clone()) };
         let ty = Rc::new(Object {
             cls: cls_field,
@@ -1413,11 +1613,13 @@ impl Interp {
             id: std::cell::Cell::new(0),
             kind: Kind::Type(TypeData {
                 name: RefCell::new(name.into()),
+                qualname: RefCell::new(qualname),
                 bases: RefCell::new(Vec::new()),
                 mro: RefCell::new(Vec::new()),
                 layout: Cell::new(layout),
                 flags: Cell::new(TF_HEAP),
                 hooks: Cell::new((u64::MAX, 0)),
+                slots: RefCell::new(slots),
             }),
         });
         match self.compute_mro(&ty, &bases) {
@@ -1498,9 +1700,12 @@ impl Interp {
         for b in &base_vals {
             let is_type = matches!(b, Value::Obj(o) if matches!(o.kind, Kind::Type(_)));
             if !is_type {
-                let bc = self.type_of(b);
-                if let Some(m) = self.lookup_mro(&bc, "__mro_entries__") {
-                    let bound = self.bind_descr(&m, b, &bc)?;
+                let entries = match self.get_attr_str(b, "__mro_entries__") {
+                    Ok(m) => Some(m),
+                    Err(e) if self.exc_is(&e, "AttributeError") => None,
+                    Err(e) => return Err(e),
+                };
+                if let Some(bound) = entries {
                     let r = self.call(&bound, vec![Value::tuple(args[2..].to_vec())], Vec::new())?;
                     if let Some(t) = r.tuple_items() {
                         resolved.extend(t.iter().cloned());
@@ -1557,11 +1762,17 @@ impl Interp {
         }
         self.call_body(&func, &ns)?;
         let cell = dict_del_str(&ns, "__classcell__");
+        let dict_cell = dict_del_str(&ns, "__classdictcell__");
         let mut cargs = vec![Value::str(&name), Value::tuple(base_vals), Value::Obj(ns)];
         let cls = self.call(&meta_val, std::mem::take(&mut cargs), kw)?;
         if let Some(Value::Obj(c)) = cell {
             if let Kind::Cell(cc) = &c.kind {
                 *cc.borrow_mut() = Some(cls.clone());
+            }
+        }
+        if let (Some(Value::Obj(c)), Value::Obj(co)) = (dict_cell, &cls) {
+            if let (Kind::Cell(cc), Some(d)) = (&c.kind, co.dict.borrow().clone()) {
+                *cc.borrow_mut() = Some(Value::Obj(d));
             }
         }
         Ok(cls)
@@ -1601,7 +1812,21 @@ impl Interp {
                 }
                 Ok(false)
             }
-            _ => Err(self.type_error("isinstance() arg 2 must be a type, a tuple of types, or a union")),
+            _ if crate::builtins::alias::union_members(cls).is_none() && self.user_special(cls, "__instancecheck__").is_some() => {
+                let r = self.call_special(cls, "__instancecheck__", vec![v.clone()])?;
+                self.truthy(&r)
+            }
+            _ => match crate::builtins::alias::union_members(cls) {
+                Some(members) => {
+                    for m in &members {
+                        if self.isinstance_value(v, m)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                None => Err(self.type_error("isinstance() arg 2 must be a type, a tuple of types, or a union")),
+            },
         }
     }
 
@@ -1613,6 +1838,11 @@ impl Interp {
                 }
             }
             return Ok(false);
+        }
+        let cls_is_type = matches!(cls, Value::Obj(c) if matches!(c.kind, Kind::Type(_)));
+        if !cls_is_type && crate::builtins::alias::union_members(cls).is_none() && self.user_special(cls, "__subclasscheck__").is_some() {
+            let r = self.call_special(cls, "__subclasscheck__", vec![sub.clone()])?;
+            return self.truthy(&r);
         }
         let s = match sub {
             Value::Obj(o) if matches!(o.kind, Kind::Type(_)) => o.clone(),
@@ -1630,16 +1860,33 @@ impl Interp {
                 }
                 Ok(self.is_subtype(&s, c))
             }
-            _ => Err(self.type_error("issubclass() arg 2 must be a class, a tuple of classes, or a union")),
+            _ => match crate::builtins::alias::union_members(cls) {
+                Some(members) => {
+                    for m in &members {
+                        if self.issubclass_value(sub, m)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                None => Err(self.type_error("issubclass() arg 2 must be a class, a tuple of classes, or a union")),
+            },
         }
     }
 
     pub fn new_native(&self, name: &'static str, f: NativeFn, method: bool) -> Value {
-        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method })))
+        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method, desc: None, owner: None })))
+    }
+
+    /// A module-level function of module `module`.
+    pub fn new_module_native(&self, module: &str, name: &'static str, f: NativeFn) -> Value {
+        let owner = Some(NativeOwner::Module(module.into()));
+        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method: false, desc: None, owner })))
     }
 
     pub fn reg(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let v = self.new_native(name, f, true);
+        let owner = Some(NativeOwner::Class(ty.clone()));
+        let v = Value::Obj(Object::new(Kind::Native(NativeData { name, f, method: true, desc: None, owner })));
         if let Some(d) = ty.dict.borrow().as_ref() {
             dict_set_str(d, name, v);
         }
@@ -1678,5 +1925,29 @@ impl Interp {
 
     pub fn module_globals(&self) -> Obj {
         self.frames.last().map(|f| f.globals.clone()).unwrap_or_else(|| self.builtins.clone())
+    }
+}
+
+/// The class of a native `#[getter]` property (CPython's `getset_descriptor`, whose write
+/// errors read `attribute 'x' of 'mod.Cls' objects is not writable`).
+fn native_getter_owner(descr: &Obj, fget: &Value) -> Option<String> {
+    if let Some(Value::Obj(owner)) = descr.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__objclass__")) {
+        if let Kind::Type(td) = &owner.kind {
+            return Some(td.name.borrow().to_string());
+        }
+    }
+    match fget {
+        Value::Obj(o) => match &o.kind {
+            Kind::Native(n) => n.desc.filter(|d| d.role == lumen_bind::Role::Getter).map(crate::bind::owner_of),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn class_slots(c: &Obj) -> Option<Rc<[Rc<str>]>> {
+    match &c.kind {
+        Kind::Type(td) => td.slots.borrow().clone(),
+        _ => None,
     }
 }

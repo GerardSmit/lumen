@@ -6,7 +6,6 @@ const __url = globalThis.__url;
 const __http = globalThis.__http;
 const __crypto = globalThis.__crypto;
 const __perf = globalThis.__perf;
-const __compress = globalThis.__compress;
 const __wasm = globalThis.__wasm;
 const __ws = globalThis.__ws;
 const __sse = globalThis.__sse;
@@ -15,7 +14,6 @@ delete globalThis.__url;
 delete globalThis.__http;
 delete globalThis.__crypto;
 delete globalThis.__perf;
-delete globalThis.__compress;
 delete globalThis.__wasm;
 delete globalThis.__ws;
 delete globalThis.__sse;
@@ -50,8 +48,11 @@ function __lazyWeb(names, init) {
       }
       return globalThis[name];
     };
+    // The slot keeps the enumerability it has when filled (an embedder may have changed it).
     const set = (value) => {
-      Object.defineProperty(globalThis, name, { value, writable: true, enumerable, configurable: true });
+      const now = Object.getOwnPropertyDescriptor(globalThis, name);
+      const e = now !== undefined && now.get === get ? now.enumerable : enumerable;
+      Object.defineProperty(globalThis, name, { value, writable: true, enumerable: e, configurable: true });
     };
     Object.defineProperty(globalThis, name, { get, set, enumerable, configurable: true });
   }

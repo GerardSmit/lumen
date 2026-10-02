@@ -2235,3 +2235,47 @@ Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=DictComp(key=Name
 Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Name(id='c', ctx=Load())], is_async=0), comprehension(target=Name(id='d', ctx=Store()), iter=Name(id='e', ctx=Load()), ifs=[Name(id='f', ctx=Load())], is_async=0)]))])
 #---
 Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=ListComp(elt=Name(id='a', ctx=Load()), generators=[comprehension(target=Name(id='a', ctx=Store()), iter=Name(id='b', ctx=Load()), ifs=[Name(id='c', ctx=Load()), Name(id='d', ctx=Load())], is_async=0), comprehension(target=Name(id='e', ctx=Store()), iter=Name(id='f', ctx=Load()), ifs=[Name(id='g', ctx=Load()), Name(id='h', ctx=Load())], is_async=0)]))])
+#---
+Module(body=[FunctionDef(name='f', args=arguments(args=[arg(arg='x', annotation=Name(id='T', ctx=Load()))]), body=[Return(value=Name(id='x', ctx=Load()))], returns=Name(id='T', ctx=Load()), type_params=[TypeVar(name='T')])])
+#---
+Module(body=[AsyncFunctionDef(name='g', args=arguments(args=[arg(arg='a', annotation=Name(id='T', ctx=Load()))], vararg=arg(arg='b', annotation=Starred(value=Name(id='Ts', ctx=Load()), ctx=Load()))), body=[Pass()], returns=Constant(value=None), type_params=[TypeVar(name='T', bound=Name(id='int', ctx=Load())), TypeVarTuple(name='Ts'), ParamSpec(name='P')])])
+#---
+Module(body=[ClassDef(name='C', bases=[Subscript(value=Name(id='Base', ctx=Load()), slice=Name(id='T', ctx=Load()), ctx=Load())], keywords=[keyword(arg='metaclass', value=Name(id='M', ctx=Load()))], body=[FunctionDef(name='m', args=arguments(args=[arg(arg='self'), arg(arg='v', annotation=Name(id='V', ctx=Load()))]), body=[Expr(value=Constant(value=Ellipsis))], returns=Name(id='V', ctx=Load()), type_params=[TypeVar(name='V')])], decorator_list=[Name(id='dec', ctx=Load())], type_params=[TypeVar(name='T'), TypeVar(name='U', bound=Tuple(elts=[Name(id='int', ctx=Load()), Name(id='str', ctx=Load())], ctx=Load())), ParamSpec(name='P')])])
+#---
+Module(body=[TypeAlias(name=Name(id='X', ctx=Store()), value=Name(id='int', ctx=Load()))])
+#---
+Module(body=[TypeAlias(name=Name(id='Pair', ctx=Store()), type_params=[TypeVar(name='A'), TypeVar(name='B')], value=Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[TypeAlias(name=Name(id='Alias', ctx=Store()), type_params=[TypeVar(name='T', bound=Tuple(elts=[Name(id='int', ctx=Load()), Name(id='str', ctx=Load())], ctx=Load())), TypeVarTuple(name='Ts'), ParamSpec(name='P')], value=Subscript(value=Name(id='Callable', ctx=Load()), slice=Tuple(elts=[Name(id='P', ctx=Load()), Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Name(id='T', ctx=Load()), Starred(value=Name(id='Ts', ctx=Load()), ctx=Load())], ctx=Load()), ctx=Load())], ctx=Load()), ctx=Load()))])
+#---
+Module(body=[TypeAlias(name=Name(id='X', ctx=Store()), type_params=[TypeVar(name='T')], value=Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='T', ctx=Load()), ctx=Load()))])
+#---
+Module(body=[Assign(targets=[Name(id='type', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[Expr(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='x', ctx=Load())]))])
+#---
+Module(body=[Assign(targets=[Attribute(value=Name(id='type', ctx=Load()), attr='x', ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[Assign(targets=[Subscript(value=Name(id='type', ctx=Load()), slice=Name(id='x', ctx=Load()), ctx=Store())], value=Constant(value=1))])
+#---
+Module(body=[AnnAssign(target=Name(id='type', ctx=Store()), annotation=Name(id='int', ctx=Load()), value=Constant(value=1), simple=1)])
+#---
+SyntaxError
+#---
+Module(body=[TypeAlias(name=Name(id='match', ctx=Store()), value=Name(id='case', ctx=Load()))])
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+SyntaxError
+#---
+Module(body=[TypeAlias(name=Name(id='X', ctx=Store()), type_params=[TypeVar(name='T')], value=Yield())])
+#---
+SyntaxError
+#---
+Module(body=[FunctionDef(name='f', args=arguments(), body=[Pass()], type_params=[TypeVar(name='T')])])
+#---
+SyntaxError

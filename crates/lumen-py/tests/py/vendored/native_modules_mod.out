@@ -1,0 +1,20 @@
+[('a', '0', '>5', 'r'), ('b{', None, None, None), ('c}', None, None, None), ('', 'name.x[1]', '', None)]
+a [(True, 'b'), (False, 0), (True, 'c')]
+True True False
+False
+True
+reentrant
+True
+5
+True True
+True 3 True
+True 9223372036854775807 little
+<module> True True
+deque([2], maxlen=3) 3 3 0 1
+['b', 2, 'a'] b a
+True True deque([1, 1, 1])
+defaultdict(<class 'list'>, {'a': [1], 'b': []}) [] ['a', 'b']
+[('a', 5), ('b', 2)]
+OrderedDict({'a': 1, 'b': 2}) [('b', 2), ('a', 1)]
+P(x=1, y=2) P(x=5, y=2) ('x', 'y')
+bye 2

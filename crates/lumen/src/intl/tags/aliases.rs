@@ -117,8 +117,43 @@ pub fn language_alias(key: &str) -> Option<&'static str> {
         "sgn-se" => "swl",
         "sgn-us" => "ase",
         "sgn-za" => "sfs",
-        _ => return None,
+        _ => return alpha3_alias(key),
     })
+}
+
+/// CLDR's alpha-3 language aliases with an alpha-2 replacement (ISO 639-2/T and /B codes such as
+/// "deu"/"ger" → "de", and encompassed languages such as "ayr" → "ay"), as 5-byte records sorted
+/// by key.
+const ALPHA3_TO_ALPHA2: &str = concat!(
+    "abkabafrafakaakalbsqalssqamhamaraararganarmhyasmasavaavaveaeaymayayrayazeazazjazbakbabambmbaqeubelbe",
+    "benbnbisbibodbobosbsbrebrbulbgburmycatcachachchecechizhchucuchvcvclssacorkwcoscocrecrcwdcrcymcyczecs",
+    "dandadeudedivdvdrhmndutnldzodzekketellelengenepoeoeskikesteteuseueweeefaofofasfafatakfijfjfinfifrafr",
+    "frefrfryfyfucfffulffgazomgeokagerdeglagdglegaglgglglvgvgreelgrngnguggngujguhaththauhaherhzhinhihmoho",
+    "hrvhrhunhuhyehyiboigiceisidoioiiiiiikeiuikuiuileieinaiaindidipkikislisitaitjavjvjawjvjpnjakalklkankn",
+    "kaskskatkakaukrkazkkkhkmnkhmkmkikkikinrwkirkykmrkuknckrkngkgkomkvkonkgkorkokpvkvkuakjkurkulaololatla",
+    "lavlvlimlilinlnlitltltzlblubluluglglvslvmacmkmahmhmalmlmaomimarmrmaymsmkdmkmlgmgmltmtmolromonmnmrimi",
+    "msamsmyamynaunanavnvnblnrndendndongnepnenldnlnnonnnobnbnornonpinenyanyociocojgojojiojoriorormomoryor",
+    "ossospanpapbupsperfapesfaplipipltmgpolplporptprpgupuspsqueququzqurohrmronrorumrorunrnrusrusagsgsansa",
+    "sccsrscrhrsinsislksksloskslvslsmesesmosmsnasnsndsdsomsosotstspaessqisqsrcscsrdscsrpsrsswsssunsuswasw",
+    "swesvswhswtahtytamtatatttteltetgktgthathtibbotirtitontotsntntsotstuktkturtrtwiakuigugukrukurduruzbuz",
+    "uznuzvenvevievivolvowelcywlnwawolwoxhoxhyddyiyidyiyoryozhazazhozhzulzuzybza",
+);
+
+fn alpha3_alias(key: &str) -> Option<&'static str> {
+    if key.len() != 3 {
+        return None;
+    }
+    let (mut lo, mut hi) = (0, ALPHA3_TO_ALPHA2.len() / 5);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let rec = &ALPHA3_TO_ALPHA2[mid * 5..mid * 5 + 5];
+        match rec[..3].cmp(key) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Some(&rec[3..]),
+        }
+    }
+    None
 }
 
 /// territoryAlias: deprecated region → preferred (single-target aliases only; multi-target

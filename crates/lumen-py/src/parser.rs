@@ -8,7 +8,6 @@ mod fstring;
 mod pattern;
 mod stmt;
 
-use std::cell::Cell;
 use std::fmt;
 
 use crate::ast::{self, Expr, Ident, Pos};
@@ -38,23 +37,11 @@ impl std::error::Error for SyntaxError {}
 type PResult<T> = Result<T, SyntaxError>;
 
 const MAX_DEPTH: u32 = 250;
-/// Bytes of native stack the parser may use before refusing deeper nesting.
-const STACK_BUDGET: usize = 1 << 20;
 /// Longest left-nested chain (`a + b + ...`, `a.b.c...`, `elif` ladders) the parser accepts, so
 /// later passes over the tree stay within stack limits.
 const MAX_CHAIN: u32 = 1000;
 
-thread_local! {
-    static STACK_BASE: Cell<usize> = const { Cell::new(0) };
-}
-
-fn stack_addr() -> usize {
-    let marker = 0u8;
-    std::hint::black_box(&marker) as *const u8 as usize
-}
-
 pub fn parse(src: &str, _filename: &str) -> Result<ast::Module, SyntaxError> {
-    STACK_BASE.with(|b| b.set(stack_addr()));
     let toks = lexer::tokenize(src)?;
     Parser::new(toks, 0).module()
 }
@@ -180,8 +167,7 @@ impl Parser {
     }
 
     fn enter(&mut self) -> PResult<()> {
-        let used = STACK_BASE.with(Cell::get).saturating_sub(stack_addr());
-        if self.depth >= MAX_DEPTH || used > STACK_BUDGET {
+        if self.depth >= MAX_DEPTH || lumen_common::stack::exhausted() {
             return self.error("too many nested parentheses");
         }
         self.depth += 1;

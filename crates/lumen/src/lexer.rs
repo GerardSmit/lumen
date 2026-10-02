@@ -199,6 +199,7 @@ impl Lexer<'_> {
         c
     }
     fn err(&self, message: impl Into<String>) -> LexError {
+        crate::parser::set_error_span(self.pos as u32, self.pos as u32 + 1);
         LexError {
             message: message.into(),
             line: self.line,
@@ -916,10 +917,7 @@ impl Lexer<'_> {
             return Err(self.err("undefined Unicode code-point"));
         }
         if n >= crate::jstr::SMUGGLE_BASE {
-            // A smuggle-range character is canonically its smuggled surrogate pair.
-            let v = n - 0x10000;
-            out.push(crate::jstr::smuggle(0xD800 + (v >> 10) as u16));
-            out.push(crate::jstr::smuggle(0xDC00 + (v & 0x3FF) as u16));
+            crate::jstr::push_char_utf16(out, char::from_u32(n).unwrap_or('\u{FFFD}'));
             return Ok(());
         }
         if let Some(c) = char::from_u32(n) {

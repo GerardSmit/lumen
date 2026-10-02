@@ -2815,6 +2815,7 @@
     };
   };
 
+  __internals.set("readlineRequire", require);
   __builtins.set("readline", require("readline"));
   __builtins.set("readline/promises", require("readline/promises"));
 }

@@ -44,7 +44,7 @@ mod dns;
 mod dylib;
 #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod ffi;
-mod hash;
+use lumen_common::hash;
 #[path = "../../lumen-runtime/src/jsx.rs"]
 mod jsx;
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,14 +55,17 @@ mod fsb;
 #[path = "fsb_vfs.rs"]
 mod fsb;
 mod native;
+mod oscon;
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
 mod password;
 mod pathops;
+mod signals;
 #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod sqlite;
 #[cfg(not(target_arch = "wasm32"))]
 mod tls;
+mod vm_context;
 #[cfg(not(target_arch = "wasm32"))]
 mod vm_timeout;
 mod zlib;
@@ -81,10 +84,13 @@ fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
         .clone()
 }
 
+pub use signals::SigintBreak;
+
 pub fn extension() -> Extension {
     let dev_glue = glue_dev::source();
     Extension {
         name: "node",
+        modules: &[lumen_host::namespace::<oscon::Module>],
         globals: &[],
         namespaces: &[
             (
@@ -110,33 +116,32 @@ pub fn extension() -> Extension {
                     "nameSource" (2) => op_name_source,
                     "promiseState" (1) => op_promise_state,
                     "proxyParts" (1) => op_proxy_parts,
+                    "previewEntries" (2) => op_preview_entries,
                     "collectGarbage" (0) => op_collect_garbage,
+                    "signalNumber" (1) => signals::op_signal_number,
+                    "signalWatch" (2) => signals::op_signal_watch,
+                    "signalUnwatch" (1) => signals::op_signal_unwatch,
+                    "signalRaise" (1) => signals::op_signal_raise,
+                    "sigintWatchdogStart" (0) => signals::op_sigint_watchdog_start,
+                    "sigintWatchdogStop" (0) => signals::op_sigint_watchdog_stop,
+                    "sigintWatchdogPending" (0) => signals::op_sigint_watchdog_pending,
+                    "v8SetFlags" (1) => op_v8_set_flags,
+                    "heapSnapshot" (1) => op_heap_snapshot,
+                    "setNearHeapLimit" (3) => op_set_near_heap_limit,
+                    "perfTiming" (0) => op_perf_timing,
+                    "memoryStats" (0) => op_memory_stats,
+                    "gcObserve" (1) => op_gc_observe,
+                    "gcTake" (0) => op_gc_take,
                     "asyncContextGet" (0) => op_async_context_get,
                     "asyncContextSet" (1) => op_async_context_set,
+                    "setPromiseHooks" (4) => op_set_promise_hooks,
+                    "reportTaskError" (1) => op_report_task_error,
+                    "setMultipleResolvesHook" (1) => op_set_multiple_resolves_hook,
                     "heapObjectCount" (0) => op_heap_object_count,
                     "drainMicrotasks" (0) => op_drain_microtasks,
                     "transformJsx" (1) => op_transform_jsx,
                     "stripTypes" (1) => op_strip_types,
                     "compileCommonJS" (3) => op_compile_commonjs,
-                    "stat" (1) => op_stat,
-                    "lstat" (1) => op_lstat,
-                    "rm" (3) => op_rm,
-                    "mkdir" (2) => op_mkdir,
-                    "rename" (2) => op_rename,
-                    "copyFile" (2) => op_copy_file,
-                    "readdirTypes" (1) => op_readdir_types,
-                    "readlink" (1) => op_readlink,
-                    "symlink" (2) => op_symlink,
-                    "access" (1) => op_access,
-                    "chmod" (2) => op_chmod,
-                    "chown" (3) => op_chown,
-                    "lchown" (3) => op_lchown,
-                    "lchmod" (2) => op_lchmod,
-                    "mkdtemp" (1) => op_mkdtemp,
-                    "link" (2) => op_link,
-                    "utimes" (3) => op_utimes,
-                    "lutimes" (3) => op_lutimes,
-                    "statfs" (1) => op_statfs,
                 ],
             ),
             (
@@ -144,6 +149,7 @@ pub fn extension() -> Extension {
                 ops![
                     "info" (0) => op_os_info,
                     "hostname" (0) => op_hostname,
+                    "sysinfo" (0) => op_os_sysinfo,
                     "getPriority" (1) => op_os_getpriority,
                     "setPriority" (2) => op_os_setpriority,
                 ],
@@ -193,10 +199,13 @@ pub fn extension() -> Extension {
                     "murmur32v2" (2) => bunhash::op_murmur32v2,
                     "murmur64v2" (2) => bunhash::op_murmur64v2,
                     "rapidhash" (2) => bunhash::op_rapidhash,
+                    "crc32" (1) => bunhash::op_crc32,
+                    "adler32" (1) => bunhash::op_adler32,
                 ],
             ),
             ("__child", child::CHILD_OPS),
             ("__vm", vm_timeout::VM_OPS),
+            ("__vmc", vm_context::VM_CONTEXT_OPS),
             ("__net", net::NET_OPS),
             ("__udp", net::UDP_OPS),
             ("__tls", tls::TLS_OPS),
@@ -282,7 +291,142 @@ fn op_proxy_parts(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     })
 }
 
+/// `(iterator, isKeyValue)` — V8's `previewEntries`: a Map/Set iterator's remaining entries
+/// without advancing it; `[entries, isKeyValue]` when `isKeyValue` is true, else `entries`.
+fn op_preview_entries(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let Some((entries, key_value)) = ctx.preview_entries_for_host(&v) else {
+        return Ok(Value::Undefined);
+    };
+    let list = ctx.make_array(entries);
+    Ok(if matches!(args.get(1), Some(Value::Bool(true))) {
+        ctx.make_array(vec![list, Value::Bool(key_value)])
+    } else {
+        list
+    })
+}
+
+/// `(path?)` — a V8 heap snapshot of this realm's heap: written to `path`, or returned as a
+/// `Uint8Array` of its JSON.
+fn op_heap_snapshot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    match args.first() {
+        Some(Value::Str(path)) => {
+            let path = path.to_string();
+            let written = std::fs::File::create(&path).and_then(|f| {
+                let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
+                ctx.write_heap_snapshot(&mut out)
+            });
+            match written {
+                Ok(()) => Ok(Value::Undefined),
+                Err(e) => Err(ctx.make_error("Error", format!("cannot write heap snapshot '{path}': {e}"))),
+            }
+        }
+        _ => {
+            let mut out = Vec::new();
+            ctx.write_heap_snapshot(&mut out)
+                .map_err(|e| ctx.make_error("Error", format!("heap snapshot: {e}")))?;
+            ctx.make_uint8array(&out)
+        }
+    }
+}
+
+/// `(times, threadId, dir?)` — write a heap snapshot the first `times` times the realm reaches its
+/// memory ceiling (Node's `v8.setHeapSnapshotNearHeapLimit`); `0` stops. The realm then runs on
+/// with a slightly higher ceiling, and the last crossing is the limit for good.
+fn op_set_near_heap_limit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let times = args.first().and_then(Value::as_num_opt).unwrap_or(0.0).max(0.0) as u32;
+    let thread_id = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
+    let dir = match args.get(2) {
+        Some(Value::Str(d)) if !d.to_string().is_empty() => Some(std::path::PathBuf::from(d.to_string())),
+        _ => None,
+    };
+    ctx.set_near_limit_hook(
+        times,
+        Box::new(move |interp| {
+            static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let name = format!(
+                "Heap.{}.{}.{thread_id}.{seq:03}.heapsnapshot",
+                local_stamp(),
+                std::process::id()
+            );
+            let path = dir.as_ref().map_or_else(|| std::path::PathBuf::from(&name), |d| d.join(&name));
+            let _ = std::fs::File::create(&path).and_then(|f| {
+                let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
+                interp.write_heap_snapshot(&mut out)
+            });
+        }),
+    );
+    Ok(Value::Undefined)
+}
+
+/// `YYYYMMDD.HHMMSS` in local time, as Node's diagnostic file names carry it.
+fn local_stamp() -> String {
+    #[cfg(unix)]
+    // SAFETY: localtime_r fills the zeroed `tm` it is given from a valid `time_t`.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&now, &mut tm).is_null() {
+            return format!(
+                "{:04}{:02}{:02}.{:02}{:02}{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            );
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    format!("{}.{:06}", secs / 86_400, secs % 86_400)
+}
+
+/// `(flags)` — apply the V8 flags lumen implements from a `v8.setFlagsFromString` string
+/// (`--allow-natives-syntax` and its `--no` form); the rest have no lumen counterpart.
+fn op_v8_set_flags(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(Value::Str(flags)) = args.first() else {
+        return Ok(Value::Undefined);
+    };
+    for flag in flags.to_string().split_whitespace() {
+        let flag = flag.trim_start_matches('-').replace('_', "-");
+        let (on, name) = match flag.strip_prefix("no-").or_else(|| flag.strip_prefix("no")) {
+            Some(rest) if rest == "allow-natives-syntax" => (false, rest),
+            _ => (true, flag.as_str()),
+        };
+        if name == "allow-natives-syntax" {
+            ctx.set_natives_syntax(on);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
 /// `()` — the current async context value (see `Interp::async_context`).
+/// `(init, before, after, settled)` — install V8-style promise hooks (`v8.promiseHooks`,
+/// async_hooks); all four non-callable removes them.
+fn op_set_promise_hooks(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Undefined);
+    ctx.set_promise_hooks(Some([arg(0), arg(1), arg(2), arg(3)]));
+    Ok(Value::Undefined)
+}
+
+/// `(error)` — report `error` as an uncaught exception after the current microtask checkpoint
+/// (Node's triggerUncaughtException from a hook or microtask); `false` when unsupported.
+fn op_report_task_error(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let error = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(Value::Bool(ctx.report_task_error(error)))
+}
+
+/// `(hook)` — call `hook(type, promise, value)` when a settled promise is resolved again
+/// (process 'multipleResolves'); a non-function removes it.
+fn op_set_multiple_resolves_hook(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    ctx.set_multiple_resolves_hook(args.first().cloned().unwrap_or(Value::Undefined));
+    Ok(Value::Undefined)
+}
+
 fn op_async_context_get(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(ctx.async_context())
 }
@@ -294,6 +438,55 @@ fn op_async_context_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 
 fn op_collect_garbage(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Num(ctx.collect_garbage_for_host() as f64))
+}
+
+/// `[nodeStart, v8Start, environment, bootstrapComplete, loopStart, loopExit, idleTime]` in
+/// milliseconds on the `performance.now()` clock (-1: not reached yet).
+fn op_perf_timing(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let values = lumen_host::perf::snapshot().into_iter().map(Value::Num).collect();
+    Ok(ctx.make_array(values))
+}
+
+/// `[liveHeapObjects, arrayBufferBytes]` for `process.memoryUsage()`.
+fn op_memory_stats(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let objects = Value::Num(ctx.live_object_count() as f64);
+    let buffers = Value::Num(lumen_common::buffer::tracked_bytes() as f64);
+    Ok(ctx.make_array(vec![objects, buffers]))
+}
+
+/// `(callback | null)` — log every collection and queue `callback` as a microtask after it;
+/// `null` stops.
+fn op_gc_observe(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    match args.first() {
+        Some(callback) if callback.is_callable() => {
+            let mut observer = lumen::gc_log::GcObserver::new(callback.clone());
+            observer.epoch_ms = lumen_host::perf::now_ms();
+            ctx.op_state().put(observer);
+        }
+        _ => {
+            ctx.op_state().take::<lumen::gc_log::GcObserver>();
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+/// `()` — the logged collections as a flat `[startTime, duration, forced, ...]` array (ms, on
+/// the `performance.now()` clock), clearing the log.
+fn op_gc_take(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let (events, base_ms) = match ctx.op_state().get_mut::<lumen::gc_log::GcObserver>() {
+        Some(observer) => {
+            observer.queued = false;
+            (std::mem::take(&mut observer.events), observer.epoch_ms)
+        }
+        None => (Vec::new(), 0.0),
+    };
+    let mut flat = Vec::with_capacity(events.len() * 3);
+    for event in events {
+        flat.push(Value::Num(base_ms + event.start.as_secs_f64() * 1000.0));
+        flat.push(Value::Num(event.duration.as_secs_f64() * 1000.0));
+        flat.push(Value::Bool(event.forced));
+    }
+    Ok(ctx.make_array(flat))
 }
 
 fn op_heap_object_count(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -436,551 +629,6 @@ fn op_realpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
     }
 }
 
-/// Build a Stats-shaped object from real filesystem metadata (the JS glue wraps it with the
-/// `isFile()`/`isDirectory()`/… methods). `kind` lets the glue answer those without re-probing.
-fn stat_object(ctx: &mut Ctx, meta: &std::fs::Metadata) -> Value {
-    let ms = |t: std::io::Result<std::time::SystemTime>| -> f64 {
-        t.ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .unwrap_or(0.0)
-    };
-    let ft = meta.file_type();
-    let kind = if ft.is_file() {
-        "file"
-    } else if ft.is_dir() {
-        "dir"
-    } else if ft.is_symlink() {
-        "symlink"
-    } else {
-        "other"
-    };
-    let o = Value::Obj(ctx.new_object());
-    let set = |o: &Value, k: &str, v: f64, ctx: &mut Ctx| {
-        let _ = ctx.set_member(o, k, Value::Num(v));
-    };
-    set(&o, "size", meta.len() as f64, ctx);
-    set(&o, "mtimeMs", ms(meta.modified()), ctx);
-    set(&o, "atimeMs", ms(meta.accessed()), ctx);
-    set(&o, "birthtimeMs", ms(meta.created()), ctx);
-    // The rest of the Node `Stats` fields are OS-specific. Unix reads them straight from the inode;
-    // Windows has no inode/uid/gid/mode, so — as Node does — we emulate: `mode` from the read-only
-    // attribute + file type, `ino`/`dev` from the file index + volume serial, and 0/defaults for
-    // the POSIX-only fields.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        set(&o, "mode", meta.mode() as f64, ctx);
-        // Unix has no true creation time everywhere; `ctime` is the inode change time.
-        set(
-            &o,
-            "ctimeMs",
-            meta.ctime() as f64 * 1000.0 + meta.ctime_nsec() as f64 / 1e6,
-            ctx,
-        );
-        set(&o, "ino", meta.ino() as f64, ctx);
-        set(&o, "dev", meta.dev() as f64, ctx);
-        set(&o, "nlink", meta.nlink() as f64, ctx);
-        set(&o, "uid", meta.uid() as f64, ctx);
-        set(&o, "gid", meta.gid() as f64, ctx);
-        set(&o, "rdev", meta.rdev() as f64, ctx);
-        set(&o, "blksize", meta.blksize() as f64, ctx);
-        set(&o, "blocks", meta.blocks() as f64, ctx);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-        let readonly = meta.file_attributes() & FILE_ATTRIBUTE_READONLY != 0;
-        // POSIX-style mode, matching Node's Windows emulation: type bits | rwx (0o666/0o444 for
-        // files, 0o777/0o555 for directories) with the write bits cleared when read-only.
-        let type_bits = if ft.is_dir() {
-            0o040000
-        } else if ft.is_symlink() {
-            0o120000
-        } else {
-            0o100000
-        };
-        let perm = match (ft.is_dir(), readonly) {
-            (true, false) => 0o777,
-            (true, true) => 0o555,
-            (false, false) => 0o666,
-            (false, true) => 0o444,
-        };
-        set(&o, "mode", (type_bits | perm) as f64, ctx);
-        // Windows has no change time; Node reports the last-write time here.
-        set(&o, "ctimeMs", ms(meta.modified()), ctx);
-        // `ino`/`dev`/`nlink` come from the by-handle info that stable std doesn't expose (the
-        // `windows_by_handle` feature is nightly-only), and lumen takes no `winapi`-style
-        // dependency, so report the neutral defaults rather than call into the Win32 API.
-        set(&o, "ino", 0.0, ctx);
-        set(&o, "dev", 0.0, ctx);
-        set(&o, "nlink", 1.0, ctx);
-        set(&o, "uid", 0.0, ctx);
-        set(&o, "gid", 0.0, ctx);
-        set(&o, "rdev", 0.0, ctx);
-        set(&o, "blksize", 4096.0, ctx);
-        set(&o, "blocks", ((meta.len() + 511) / 512) as f64, ctx);
-    }
-    let _ = ctx.set_member(&o, "kind", Value::str(kind));
-    o
-}
-
-/// An errno-tagged filesystem error (the `code` Node users switch on), from a `std::io::Error`.
-fn fs_error(ctx: &mut Ctx, op: &str, path: &str, e: &std::io::Error) -> Value {
-    let code = match e.kind() {
-        std::io::ErrorKind::NotFound => "ENOENT",
-        std::io::ErrorKind::PermissionDenied => "EACCES",
-        std::io::ErrorKind::AlreadyExists => "EEXIST",
-        _ => match e.raw_os_error() {
-            Some(20) => "ENOTDIR",
-            Some(21) => "EISDIR",
-            Some(39) | Some(66) => "ENOTEMPTY",
-            _ => "EIO",
-        },
-    };
-    let err = ctx.make_error("Error", format!("{code}: {e}, {op} '{path}'"));
-    let _ = ctx.set_member(&err, "code", Value::str(code));
-    let _ = ctx.set_member(&err, "path", Value::str(path));
-    let _ = ctx.set_member(&err, "syscall", Value::str(op));
-    err
-}
-
-/// `stat(path)` — follow symlinks.
-fn op_stat(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    match std::fs::metadata(&p) {
-        Ok(m) => Ok(stat_object(ctx, &m)),
-        Err(e) => Err(fs_error(ctx, "stat", &p, &e)),
-    }
-}
-
-/// `lstat(path)` — do not follow symlinks.
-fn op_lstat(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    match std::fs::symlink_metadata(&p) {
-        Ok(m) => Ok(stat_object(ctx, &m)),
-        Err(e) => Err(fs_error(ctx, "lstat", &p, &e)),
-    }
-}
-
-/// `rm(path, recursive, force)` — remove a file or directory tree.
-fn op_rm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    let recursive = matches!(args.get(1), Some(Value::Bool(true)));
-    let force = matches!(args.get(2), Some(Value::Bool(true)));
-    let path = std::path::Path::new(&p);
-    let result = if path.is_dir() {
-        if recursive {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_dir(path)
-        }
-    } else {
-        std::fs::remove_file(path)
-    };
-    match result {
-        Ok(()) => Ok(Value::Undefined),
-        // `force` swallows a missing path, as Node's rmSync does.
-        Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Undefined),
-        Err(e) => Err(fs_error(ctx, "rm", &p, &e)),
-    }
-}
-
-/// `mkdir(path, recursive)` — returns the first created directory (Node's recursive contract).
-fn op_mkdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    let recursive = matches!(args.get(1), Some(Value::Bool(true)));
-    let result = if recursive {
-        std::fs::create_dir_all(&p)
-    } else {
-        std::fs::create_dir(&p)
-    };
-    match result {
-        Ok(()) => Ok(Value::from_string(p)),
-        Err(e) if recursive && e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(Value::Undefined)
-        }
-        Err(e) => Err(fs_error(ctx, "mkdir", &p, &e)),
-    }
-}
-
-/// `rename(from, to)`.
-fn op_rename(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let from = arg_path(ctx, args)?;
-    let to = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    match std::fs::rename(&from, &to) {
-        Ok(()) => Ok(Value::Undefined),
-        Err(e) => Err(fs_error(ctx, "rename", &from, &e)),
-    }
-}
-
-/// `copyFile(from, to)`.
-fn op_copy_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let from = arg_path(ctx, args)?;
-    let to = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    match std::fs::copy(&from, &to) {
-        Ok(_) => Ok(Value::Undefined),
-        Err(e) => Err(fs_error(ctx, "copyfile", &from, &e)),
-    }
-}
-
-/// `readdirTypes(path)` — directory entries as `[name, kind]` pairs for `withFileTypes`.
-fn op_readdir_types(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    let entries = std::fs::read_dir(&p).map_err(|e| fs_error(ctx, "scandir", &p, &e))?;
-    let mut items = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let kind = match entry.file_type() {
-            Ok(ft) if ft.is_dir() => "dir",
-            Ok(ft) if ft.is_symlink() => "symlink",
-            Ok(ft) if ft.is_file() => "file",
-            _ => "other",
-        };
-        let pair = ctx.make_array(vec![Value::from_string(name), Value::str(kind)]);
-        items.push(pair);
-    }
-    Ok(ctx.make_array(items))
-}
-
-/// `readlink(path)`.
-fn op_readlink(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    match std::fs::read_link(&p) {
-        Ok(target) => Ok(Value::from_string(target.to_string_lossy().into_owned())),
-        Err(e) => Err(fs_error(ctx, "readlink", &p, &e)),
-    }
-}
-
-/// `symlink(target, path)`.
-fn op_symlink(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let target = arg_path(ctx, args)?;
-    let link = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    // Unix has one symlink call; Windows distinguishes file vs directory links (and needs the
-    // privilege / developer mode to create them), so pick by what the target currently is — the
-    // same heuristic Node uses when its `type` argument is omitted.
-    #[cfg(unix)]
-    let r = std::os::unix::fs::symlink(&target, &link);
-    #[cfg(windows)]
-    let r = if std::fs::metadata(&target)
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
-        std::os::windows::fs::symlink_dir(&target, &link)
-    } else {
-        std::os::windows::fs::symlink_file(&target, &link)
-    };
-    match r {
-        Ok(()) => Ok(Value::Undefined),
-        Err(e) => Err(fs_error(ctx, "symlink", &link, &e)),
-    }
-}
-
-/// `access(path)` — existence/readability check; rejects with ENOENT if absent.
-fn op_access(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    match std::fs::metadata(&p) {
-        Ok(_) => Ok(Value::Undefined),
-        Err(e) => Err(fs_error(ctx, "access", &p, &e)),
-    }
-}
-
-/// `chmod(path, mode)`.
-fn op_chmod(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    let mode = args.get(1).and_then(|v| v.as_num_opt()).unwrap_or(0.0) as u32;
-    // Unix applies the full POSIX mode. Windows has no POSIX permissions — the only bit it can
-    // honour (as Node does) is read-only: clear it when the owner-write bit is set, set it
-    // otherwise.
-    #[cfg(unix)]
-    let perms = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::Permissions::from_mode(mode)
-    };
-    #[cfg(windows)]
-    let perms = match std::fs::metadata(&p) {
-        Ok(m) => {
-            let mut perms = m.permissions();
-            perms.set_readonly(mode & 0o200 == 0);
-            perms
-        }
-        Err(e) => return Err(fs_error(ctx, "chmod", &p, &e)),
-    };
-    match std::fs::set_permissions(&p, perms) {
-        Ok(()) => Ok(Value::Undefined),
-        Err(e) => Err(fs_error(ctx, "chmod", &p, &e)),
-    }
-}
-
-#[cfg(unix)]
-fn ownership_path(ctx: &mut Ctx, args: &[Value], op: &str, follow: bool) -> Result<Value, Value> {
-    let path = arg_path(ctx, args)?;
-    let uid = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let gid = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let result = if follow {
-        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
-    } else {
-        std::os::unix::fs::lchown(&path, Some(uid), Some(gid))
-    };
-    result
-        .map(|()| Value::Undefined)
-        .map_err(|error| fs_error(ctx, op, &path, &error))
-}
-
-fn op_chown(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    #[cfg(unix)]
-    {
-        ownership_path(ctx, args, "chown", true)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = args;
-        Err(ctx.make_error("Error", "ENOSYS: chown is not supported on this platform"))
-    }
-}
-
-fn op_lchown(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    #[cfg(unix)]
-    {
-        ownership_path(ctx, args, "lchown", false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = args;
-        Err(ctx.make_error("Error", "ENOSYS: lchown is not supported on this platform"))
-    }
-}
-
-fn op_lchmod(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let path = arg_path(ctx, args)?;
-    let mode = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = std::ffi::CString::new(std::ffi::OsStr::new(&path).as_bytes())
-            .map_err(|_| ctx.make_error("TypeError", "path must not contain NUL bytes"))?;
-        if unsafe { lchmod(c_path.as_ptr(), mode) } == 0 {
-            Ok(Value::Undefined)
-        } else {
-            Err(fs_error(
-                ctx,
-                "lchmod",
-                &path,
-                &std::io::Error::last_os_error(),
-            ))
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = mode;
-        Err(ctx.make_error(
-            "Error",
-            format!("ENOSYS: lchmod is not supported on this platform, lchmod '{path}'"),
-        ))
-    }
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn lchmod(path: *const std::os::raw::c_char, mode: u32) -> i32;
-}
-
-/// `mkdtemp(prefix)` — create a uniquely-named temp directory and return its path. Uniqueness
-/// comes from the OS-assigned pid plus a monotonically bumped counter (no RNG dependency).
-fn op_mkdtemp(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let prefix = arg_path(ctx, args)?;
-    let pid = std::process::id();
-    for _ in 0..1000 {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = format!("{prefix}{:06x}{:04x}", pid, n & 0xffff);
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(Value::from_string(candidate)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(fs_error(ctx, "mkdtemp", &candidate, &e)),
-        }
-    }
-    Err(ctx.make_error("Error", format!("mkdtemp '{prefix}': exhausted candidates")))
-}
-
-/// `link(existingPath, newPath)` — create a hard link.
-fn op_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let existing = arg_path(ctx, args)?;
-    let new = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    match std::fs::hard_link(&existing, &new) {
-        Ok(()) => Ok(Value::Undefined),
-        Err(e) => Err(fs_error(ctx, "link", &existing, &e)),
-    }
-}
-
-/// `utimes(path, atimeSec, mtimeSec)` / `lutimes(...)` — set access/modification times.
-/// Backed by the BSD `utimes(2)`/`lutimes(2)` (present on macOS and glibc Linux); a clean
-/// ENOSYS error elsewhere. `lutimes` acts on the link itself rather than its target.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[repr(C)]
-struct Timeval {
-    tv_sec: i64,
-    #[cfg(target_os = "macos")]
-    tv_usec: i32,
-    #[cfg(target_os = "linux")]
-    tv_usec: i64,
-}
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn timeval_from_secs(secs: f64) -> Timeval {
-    let s = secs.floor();
-    let usec = ((secs - s) * 1_000_000.0).round();
-    Timeval {
-        tv_sec: s as i64,
-        tv_usec: usec as _,
-    }
-}
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-extern "C" {
-    fn utimes(path: *const std::os::raw::c_char, times: *const Timeval) -> i32;
-    fn lutimes(path: *const std::os::raw::c_char, times: *const Timeval) -> i32;
-}
-
-fn set_times(ctx: &mut Ctx, args: &[Value], follow: bool, op: &str) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    let atime = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))?;
-    let mtime = ctx.coerce_number(args.get(2).unwrap_or(&Value::Undefined))?;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let c_path = match std::ffi::CString::new(p.clone()) {
-            Ok(c) => c,
-            Err(_) => return Err(ctx.make_error("Error", "path contains a NUL byte")),
-        };
-        let times = [timeval_from_secs(atime), timeval_from_secs(mtime)];
-        // SAFETY: `c_path` is a valid NUL-terminated string; `times` is a 2-element array.
-        let rc = unsafe {
-            if follow {
-                utimes(c_path.as_ptr(), times.as_ptr())
-            } else {
-                lutimes(c_path.as_ptr(), times.as_ptr())
-            }
-        };
-        if rc != 0 {
-            return Err(fs_error(ctx, op, &p, &std::io::Error::last_os_error()));
-        }
-        Ok(Value::Undefined)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (atime, mtime, follow, op);
-        let err = ctx.make_error(
-            "Error",
-            format!("ENOSYS: {op} is not supported on this platform, {op} '{p}'"),
-        );
-        let _ = ctx.set_member(&err, "code", Value::str("ENOSYS"));
-        Err(err)
-    }
-}
-
-fn op_utimes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    set_times(ctx, args, true, "utime")
-}
-
-fn op_lutimes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    set_times(ctx, args, false, "lutime")
-}
-
-/// `statfs(path)` — filesystem statistics via `statvfs(3)`. Returns the fields Node's
-/// `fs.statfs` reports (`type`, `bsize`, `blocks`, `bfree`, `bavail`, `files`, `ffree`);
-/// `type` is 0 because `statvfs` carries no filesystem-type magic. Backed on macOS and Linux;
-/// a clean ENOSYS error elsewhere. The trailing padding keeps our buffer at least as large as
-/// the platform's `struct statvfs`, so the call can never write out of bounds.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-pub(crate) struct Statvfs {
-    f_bsize: u64,
-    f_frsize: u64,
-    f_blocks: u32,
-    f_bfree: u32,
-    f_bavail: u32,
-    f_files: u32,
-    f_ffree: u32,
-    f_favail: u32,
-    f_fsid: u64,
-    f_flag: u64,
-    f_namemax: u64,
-    _pad: [u64; 8],
-}
-#[cfg(target_os = "linux")]
-#[repr(C)]
-pub(crate) struct Statvfs {
-    f_bsize: u64,
-    f_frsize: u64,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_favail: u64,
-    f_fsid: u64,
-    f_flag: u64,
-    f_namemax: u64,
-    _pad: [u64; 8],
-}
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-extern "C" {
-    pub(crate) fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> i32;
-}
-
-fn op_statfs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg_path(ctx, args)?;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let c_path = match std::ffi::CString::new(p.clone()) {
-            Ok(c) => c,
-            Err(_) => return Err(ctx.make_error("Error", "path contains a NUL byte")),
-        };
-        let mut buf: std::mem::MaybeUninit<Statvfs> = std::mem::MaybeUninit::zeroed();
-        // SAFETY: `c_path` is NUL-terminated; `buf` is a zeroed struct at least as large as the
-        // platform's `struct statvfs` (extra trailing padding), so the write stays in bounds.
-        let rc = unsafe { statvfs(c_path.as_ptr(), buf.as_mut_ptr()) };
-        if rc != 0 {
-            return Err(fs_error(
-                ctx,
-                "statfs",
-                &p,
-                &std::io::Error::last_os_error(),
-            ));
-        }
-        let s = unsafe { buf.assume_init() };
-        let o = Value::Obj(ctx.new_object());
-        let set = |k: &str, v: f64, ctx: &mut Ctx| {
-            let _ = ctx.set_member(&o, k, Value::Num(v));
-        };
-        set("type", 0.0, ctx);
-        set("bsize", s.f_bsize as f64, ctx);
-        set("blocks", s.f_blocks as f64, ctx);
-        set("bfree", s.f_bfree as f64, ctx);
-        set("bavail", s.f_bavail as f64, ctx);
-        set("files", s.f_files as f64, ctx);
-        set("ffree", s.f_ffree as f64, ctx);
-        Ok(o)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let err = ctx.make_error(
-            "Error",
-            format!("ENOSYS: statfs is not supported on this platform, statfs '{p}'"),
-        );
-        let _ = ctx.set_member(&err, "code", Value::str("ENOSYS"));
-        Err(err)
-    }
-}
-
 /// One object of OS facts the JS `os` shim reads (snapshotted like Node's are). `hostname`
 /// is separate because it can do I/O.
 fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -1009,18 +657,11 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .filter(|home| !home.is_empty())
-        .or_else(passwd_home_dir)
+        .or_else(|| lumen_os::proc::current_user().dir)
         .unwrap_or_default();
-    #[cfg(target_arch = "wasm32")]
-    let (tmpdir, cpus) = ("/tmp".to_string(), 1usize);
-    #[cfg(not(target_arch = "wasm32"))]
-    let (tmpdir, cpus) = (
-        std::env::temp_dir().to_string_lossy().into_owned(),
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    );
-    let (release, version) = os_release_version();
+    let tmpdir = lumen_os::sysinfo::tmpdir();
+    let cpus = lumen_os::proc::cpu_count();
+    let [_, _, release, version, _] = lumen_os::proc::uname().unwrap_or_default();
 
     let obj = Value::Obj(ctx.new_object());
     for (k, v) in [
@@ -1044,129 +685,11 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         let _ = ctx.set_member(&obj, k, Value::from_string(v));
     }
     let _ = ctx.set_member(&obj, "cpus", Value::Num(cpus as f64));
-    let (cpu_model, cpu_speed_mhz, total_mem) = cpu_and_memory_facts();
+    let (cpu_model, cpu_speed_mhz, total_mem) = lumen_os::sysinfo::cpu_and_memory();
     let _ = ctx.set_member(&obj, "cpuModel", Value::from_string(cpu_model));
     let _ = ctx.set_member(&obj, "cpuSpeed", Value::Num(cpu_speed_mhz as f64));
     let _ = ctx.set_member(&obj, "totalmem", Value::Num(total_mem as f64));
     Ok(obj)
-}
-
-/// `(cpu model, cpu speed in MHz, total memory in bytes)` for `os.cpus()` / `os.totalmem()`.
-/// Playwright reads the model to tell Apple silicon from Intel when it picks a browser build.
-#[cfg(target_os = "macos")]
-fn cpu_and_memory_facts() -> (String, u64, u64) {
-    extern "C" {
-        fn sysctlbyname(
-            name: *const std::os::raw::c_char,
-            oldp: *mut std::os::raw::c_void,
-            oldlenp: *mut usize,
-            newp: *mut std::os::raw::c_void,
-            newlen: usize,
-        ) -> std::os::raw::c_int;
-    }
-    fn read(name: &str, buf: &mut [u8]) -> Option<usize> {
-        let cname = std::ffi::CString::new(name).ok()?;
-        let mut len = buf.len();
-        // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
-        let rc = unsafe {
-            sysctlbyname(
-                cname.as_ptr(),
-                buf.as_mut_ptr().cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (rc == 0).then_some(len)
-    }
-    let mut model = [0u8; 256];
-    let model = read("machdep.cpu.brand_string", &mut model)
-        .map(|n| String::from_utf8_lossy(&model[..n]).trim_end_matches('\0').to_string())
-        .unwrap_or_default();
-    let mut u64_buf = [0u8; 8];
-    let hz = read("hw.cpufrequency", &mut u64_buf)
-        .filter(|&n| n == 8)
-        .map(|_| u64::from_ne_bytes(u64_buf))
-        .unwrap_or(0);
-    let memsize = read("hw.memsize", &mut u64_buf)
-        .filter(|&n| n == 8)
-        .map(|_| u64::from_ne_bytes(u64_buf))
-        .unwrap_or(0);
-    (model, hz / 1_000_000, memsize)
-}
-
-#[cfg(target_os = "linux")]
-fn cpu_and_memory_facts() -> (String, u64, u64) {
-    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let field = |key: &str| {
-        cpuinfo
-            .lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_once(':'))
-            .map(|(_, v)| v.trim().to_string())
-    };
-    let model = field("model name").unwrap_or_default();
-    let mhz = field("cpu MHz")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0) as u64;
-    let total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            m.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-        })
-        .map(|kb| kb * 1024)
-        .unwrap_or(0);
-    (model, mhz, total)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn cpu_and_memory_facts() -> (String, u64, u64) {
-    (String::new(), 0, 0)
-}
-
-/// `(os.release(), os.version())` — utsname's `release` and `version` fields. std exposes no
-/// uname(), so on macOS and Linux this calls it directly; Playwright reads the release to pick a
-/// browser build for the running macOS, and an empty string sends it to the wrong one.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn os_release_version() -> (String, String) {
-    // struct utsname is N fixed-size char arrays: 256 each on macOS, 65 each on Linux (glibc
-    // adds a sixth, `domainname`). Only sysname/nodename/release/version/machine are read.
-    #[cfg(target_os = "macos")]
-    const FIELD: usize = 256;
-    #[cfg(target_os = "linux")]
-    const FIELD: usize = 65;
-    #[repr(C)]
-    struct Utsname([[std::os::raw::c_char; FIELD]; 6]);
-    extern "C" {
-        fn uname(buf: *mut Utsname) -> std::os::raw::c_int;
-    }
-    let mut buf = Utsname([[0; FIELD]; 6]);
-    // SAFETY: `buf` is a writable utsname at least as large as the platform's struct.
-    if unsafe { uname(&mut buf) } != 0 {
-        return (String::new(), String::new());
-    }
-    let field = |i: usize| {
-        let bytes: Vec<u8> = buf.0[i]
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    (field(2), field(3))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn os_release_version() -> (String, String) {
-    // No uname; Linux-style fallback for other unixes, blank elsewhere rather than an invented
-    // version.
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    (release, String::new())
 }
 
 /// Best-effort hostname without a syscall or crate: env, then the file Linux writes it to,
@@ -1186,94 +709,32 @@ fn op_hostname(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, V
 }
 
 // ---- os.getPriority / os.setPriority, over getpriority(2)/setpriority(2) ----
-// std exposes no nice-value API, so reach libc directly (same category as the utimes/statvfs FFI
-// above). `PRIO_PROCESS` is 0 on macOS and Linux. Each op returns either the numeric priority /
-// undefined on success, or `{ errno, code }` on failure so os.js can build Node's ERR_SYSTEM_ERROR.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-extern "C" {
-    fn getpriority(which: std::os::raw::c_int, who: std::os::raw::c_uint) -> std::os::raw::c_int;
-    fn setpriority(
-        which: std::os::raw::c_int,
-        who: std::os::raw::c_uint,
-        prio: std::os::raw::c_int,
-    ) -> std::os::raw::c_int;
-}
+// Each op returns the numeric priority / undefined on success, or `{ errno, code }` on failure so
+// os.js can build Node's ERR_SYSTEM_ERROR.
 
-// The thread-local errno cell, so getpriority's -1 return can be disambiguated from a real error
-// (a nice value of -1 is legal). macOS spells the accessor `__error`, Linux `__errno_location`.
-#[cfg(target_os = "macos")]
-extern "C" {
-    #[link_name = "__error"]
-    fn errno_location() -> *mut std::os::raw::c_int;
-}
-#[cfg(target_os = "linux")]
-extern "C" {
-    #[link_name = "__errno_location"]
-    fn errno_location() -> *mut std::os::raw::c_int;
-}
-
-/// Map a raw errno to the code string Node reports (the subset getpriority/setpriority raise).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn priority_errno_code(errno: i32) -> &'static str {
-    match errno {
-        1 => "EPERM",
-        3 => "ESRCH",
-        13 => "EACCES",
-        22 => "EINVAL",
-        _ => "UNKNOWN",
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn priority_error(ctx: &mut Ctx, errno: i32) -> Value {
+fn priority_error(ctx: &mut Ctx, e: lumen_os::FsError) -> Value {
     let obj = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&obj, "errno", Value::Num(-(errno as f64)));
-    let _ = ctx.set_member(&obj, "code", Value::str(priority_errno_code(errno)));
+    let errno = lumen_os::uv::errno(e.code()).unwrap_or(-e.errno());
+    let _ = ctx.set_member(&obj, "errno", Value::Num(errno as f64));
+    let _ = ctx.set_member(&obj, "code", Value::str(e.code()));
     obj
 }
 
 fn op_os_getpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i64;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        // getpriority can legitimately return -1..-20, so zero errno first and consult it after.
-        // SAFETY: errno_location returns a valid pointer to the thread's errno cell; PRIO_PROCESS(0)
-        // with a pid touches no memory.
-        let rc = unsafe {
-            *errno_location() = 0;
-            getpriority(0, pid as std::os::raw::c_uint)
-        };
-        let errno = unsafe { *errno_location() };
-        if rc == -1 && errno != 0 {
-            return Ok(priority_error(ctx, errno));
-        }
-        Ok(Value::Num(rc as f64))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        Ok(Value::Num(0.0))
-    }
+    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
+    Ok(match lumen_os::sysinfo::get_priority(pid) {
+        Ok(p) => Value::Num(p as f64),
+        Err(e) => priority_error(ctx, e),
+    })
 }
 
 fn op_os_setpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i64;
+    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let prio = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        // SAFETY: PRIO_PROCESS(0) with a pid and an integer priority; no memory is touched.
-        let rc = unsafe { setpriority(0, pid as std::os::raw::c_uint, prio) };
-        if rc != 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Ok(priority_error(ctx, errno));
-        }
-        Ok(Value::Undefined)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (pid, prio);
-        Ok(Value::Undefined)
-    }
+    Ok(match lumen_os::sysinfo::set_priority(pid, prio) {
+        Ok(()) => Value::Undefined,
+        Err(e) => priority_error(ctx, e),
+    })
 }
 
 /// `() -> string | undefined` — the embedded realm's working directory, or `undefined` when the
@@ -1308,41 +769,23 @@ pub fn shutdown_native_resources(ctx: &mut Ctx) {
 /// Wake child realms blocked on their stdio pipes (see `child::close_child_pipes`).
 pub fn close_child_pipes(ctx: &mut Ctx) { child::close_child_pipes(ctx); }
 
-#[cfg(unix)]
-fn passwd_home_dir() -> Option<String> {
-    use std::ffi::{c_char, c_uint, CStr};
-    #[repr(C)]
-    struct Passwd {
-        name: *const c_char,
-        passwd: *const c_char,
-        uid: c_uint,
-        gid: c_uint,
-        #[cfg(target_os = "macos")]
-        change: i64,
-        #[cfg(target_os = "macos")]
-        class: *const c_char,
-        #[cfg(target_os = "macos")]
-        gecos: *const c_char,
-        #[cfg(not(target_os = "macos"))]
-        gecos: *const c_char,
-        dir: *const c_char,
+/// Live facts for `os.uptime/loadavg/freemem/userInfo`: `{ uptime, load1/5/15, freemem, uid, gid,
+/// username, shell, homedir }`, read fresh on each call.
+fn op_os_sysinfo(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let obj = Value::Obj(ctx.new_object());
+    let _ = ctx.set_member(&obj, "uptime", Value::Num(lumen_os::proc::uptime()));
+    let _ = ctx.set_member(&obj, "freemem", Value::Num(lumen_os::proc::free_memory()));
+    let load = lumen_os::proc::loadavg();
+    for (key, n) in ["load1", "load5", "load15"].into_iter().zip(load) {
+        let _ = ctx.set_member(&obj, key, Value::Num(n));
     }
-    extern "C" {
-        fn getuid() -> c_uint;
-        fn getpwuid(uid: c_uint) -> *const Passwd;
-    }
-    let entry = unsafe { getpwuid(getuid()) };
-    if entry.is_null() {
-        return None;
-    }
-    let dir = unsafe { (*entry).dir };
-    if dir.is_null() {
-        return None;
-    }
-    Some(unsafe { CStr::from_ptr(dir) }.to_string_lossy().into_owned())
+    let user = lumen_os::proc::current_user();
+    let _ = ctx.set_member(&obj, "uid", Value::Num(user.uid as f64));
+    let _ = ctx.set_member(&obj, "gid", Value::Num(user.gid as f64));
+    let _ = ctx.set_member(&obj, "username", Value::from_string(user.name.unwrap_or_default()));
+    let shell = user.shell.filter(|s| !s.is_empty());
+    let _ = ctx.set_member(&obj, "shell", shell.map(Value::from_string).unwrap_or(Value::Null));
+    let _ = ctx.set_member(&obj, "homedir", Value::from_string(user.dir.unwrap_or_default()));
+    Ok(obj)
 }
 
-#[cfg(not(unix))]
-fn passwd_home_dir() -> Option<String> {
-    None
-}

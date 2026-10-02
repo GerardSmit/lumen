@@ -4,10 +4,15 @@
 //! OpenSSL's `X509_NAME_print_ex`, `ASN1_TIME_print` and Node's `PrintGeneralName`. Signatures and
 //! key checks use the RustCrypto crates.
 
-use base64::Engine;
-use lumen::embed::{OpDesc, OpError};
+use lumen_common::codec::{self, Padding};
+use lumen::embed::OpError;
 
 use crate::hash::{self, Algo};
+
+
+#[lumen_bind::module(name = "crypto")]
+pub(crate) mod bindings {
+use super::*;
 
 #[derive(Clone, Copy)]
 struct Tlv<'a> {
@@ -354,9 +359,7 @@ fn escape_chars(chars: &[Vec<u8>], ctrl: bool, out: &mut Vec<u8>) {
     }
 }
 
-fn hex_upper(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect()
-}
+use codec::hex_encode_upper as hex_upper;
 
 // ---- names --------------------------------------------------------------------------------------
 
@@ -909,25 +912,14 @@ fn verify_signature(alg: &Tlv, spki_raw: &[u8], data: &[u8], signature: &[u8]) -
                 return false;
             }
             let Some((n, e)) = rsa_public(spki.key) else { return false };
-            let key = rsa::RsaPublicKey::new_unchecked(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e));
-            let hashed = hash::digest(h, data);
             match scheme {
                 SigScheme::Pkcs1(_) => {
+                    let key = rsa::RsaPublicKey::new_unchecked(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e));
                     let Some(prefix) = digest_info_prefix(h) else { return false };
                     let padding = rsa::Pkcs1v15Sign { hash_len: Some(h.out_len()), prefix: prefix.into() };
-                    key.verify(padding, &hashed, signature).is_ok()
+                    key.verify(padding, &hash::digest(h, data), signature).is_ok()
                 }
-                SigScheme::Pss(_, salt) => {
-                    let padding = match h {
-                        Algo::Sha1 => rsa::Pss::new_with_salt::<sha1::Sha1>(salt),
-                        Algo::Sha224 => rsa::Pss::new_with_salt::<sha2::Sha224>(salt),
-                        Algo::Sha256 => rsa::Pss::new_with_salt::<sha2::Sha256>(salt),
-                        Algo::Sha384 => rsa::Pss::new_with_salt::<sha2::Sha384>(salt),
-                        Algo::Sha512 => rsa::Pss::new_with_salt::<sha2::Sha512>(salt),
-                        _ => return false,
-                    };
-                    key.verify(padding, &hashed, signature).is_ok()
-                }
+                SigScheme::Pss(_, salt) => crate::crypto::sign::bindings::rsa_pss_verify(&n, &e, h, salt, data, signature),
                 _ => false,
             }
         }
@@ -1241,7 +1233,7 @@ fn check_name(name: &str) -> Result<&[u8], OpError> {
 // ---- PEM ----------------------------------------------------------------------------------------
 
 fn pem_encode(label: &str, der: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let b64 = codec::base64_encode(der, false, true);
     let mut out = format!("-----BEGIN {label}-----\n");
     for chunk in b64.as_bytes().chunks(64) {
         out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
@@ -1277,7 +1269,7 @@ fn pem_find(input: &[u8], labels: &[&str]) -> Result<Vec<u8>, PemError> {
             .filter(|l| !l.contains(':'))
             .flat_map(|l| l.chars().filter(|c| !c.is_whitespace()))
             .collect();
-        return base64::engine::general_purpose::STANDARD.decode(lines).map_err(|_| PemError::BadBase64);
+        return codec::base64_decode_strict(lines.as_bytes(), false, Padding::Required).map_err(|_| PemError::BadBase64);
     }
     Err(PemError::NoStartLine)
 }
@@ -1294,7 +1286,7 @@ fn cert_of(der: &[u8]) -> Result<Cert<'_>, OpError> {
 
 /// `parseX509`: the DER of a PEM (`CERTIFICATE`, `X509 CERTIFICATE`, `TRUSTED CERTIFICATE`) or DER
 /// certificate.
-#[lumen::op(name = "x509Parse")]
+#[op(name = "x509Parse")]
 fn x509_parse(input: &[u8]) -> Result<Vec<u8>, OpError> {
     match pem_find(input, &["CERTIFICATE", "X509 CERTIFICATE", "TRUSTED CERTIFICATE"]) {
         Ok(der) => parse_cert(&der).map(|c| c.raw.to_vec()).ok_or_else(asn1_error),
@@ -1306,20 +1298,20 @@ fn x509_parse(input: &[u8]) -> Result<Vec<u8>, OpError> {
     }
 }
 
-#[lumen::op(name = "x509Subject")]
+#[op(name = "x509Subject")]
 fn x509_subject(der: &[u8]) -> Result<Option<String>, OpError> {
     let c = cert_of(der)?;
     Ok(print_name(c.subject.value, false).map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
-#[lumen::op(name = "x509Issuer")]
+#[op(name = "x509Issuer")]
 fn x509_issuer(der: &[u8]) -> Result<Option<String>, OpError> {
     let c = cert_of(der)?;
     Ok(print_name(c.issuer.value, false).map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
 /// `[present, text]`: text is `null` when the extension cannot be decoded.
-#[lumen::op(name = "x509SubjectAltName")]
+#[op(name = "x509SubjectAltName")]
 fn x509_subject_alt_name(der: &[u8]) -> Result<(bool, Option<String>), OpError> {
     let c = cert_of(der)?;
     Ok(match c.ext(OID_SAN) {
@@ -1328,7 +1320,7 @@ fn x509_subject_alt_name(der: &[u8]) -> Result<(bool, Option<String>), OpError> 
     })
 }
 
-#[lumen::op(name = "x509InfoAccess")]
+#[op(name = "x509InfoAccess")]
 fn x509_info_access(der: &[u8]) -> Result<(bool, Option<String>), OpError> {
     let c = cert_of(der)?;
     Ok(match c.ext(OID_AIA) {
@@ -1338,13 +1330,13 @@ fn x509_info_access(der: &[u8]) -> Result<(bool, Option<String>), OpError> {
 }
 
 /// `[validFrom, validTo]`.
-#[lumen::op(name = "x509Validity")]
+#[op(name = "x509Validity")]
 fn x509_validity(der: &[u8]) -> Result<(String, String), OpError> {
     let c = cert_of(der)?;
     Ok((print_time(&c.not_before).unwrap_or_default(), print_time(&c.not_after).unwrap_or_default()))
 }
 
-#[lumen::op(name = "x509Fingerprint")]
+#[op(name = "x509Fingerprint")]
 fn x509_fingerprint(der: &[u8], algorithm: &str) -> Result<String, OpError> {
     let c = cert_of(der)?;
     let algo = Algo::from_name(algorithm).ok_or_else(|| OpError::error("Digest method not supported"))?;
@@ -1353,7 +1345,7 @@ fn x509_fingerprint(der: &[u8], algorithm: &str) -> Result<String, OpError> {
 }
 
 /// The extended key usage OIDs, `null` without the extension.
-#[lumen::op(name = "x509KeyUsage")]
+#[op(name = "x509KeyUsage")]
 fn x509_key_usage(der: &[u8]) -> Result<Option<Vec<String>>, OpError> {
     let c = cert_of(der)?;
     let Some(ext) = c.ext(OID_EKU) else { return Ok(None) };
@@ -1363,7 +1355,7 @@ fn x509_key_usage(der: &[u8]) -> Result<Option<Vec<String>>, OpError> {
 }
 
 /// `BN_bn2hex` of the serial number.
-#[lumen::op(name = "x509SerialNumber")]
+#[op(name = "x509SerialNumber")]
 fn x509_serial_number(der: &[u8]) -> Result<String, OpError> {
     let c = cert_of(der)?;
     let negative = c.serial.first().is_some_and(|&b| b & 0x80 != 0);
@@ -1390,14 +1382,14 @@ fn x509_serial_number(der: &[u8]) -> Result<String, OpError> {
     })
 }
 
-#[lumen::op(name = "x509Pem")]
+#[op(name = "x509Pem")]
 fn x509_pem(der: &[u8]) -> Result<String, OpError> {
     let c = cert_of(der)?;
     Ok(pem_encode("CERTIFICATE", c.raw))
 }
 
 /// The SubjectPublicKeyInfo DER; throws like `X509_get_pubkey` when the key cannot be decoded.
-#[lumen::op(name = "x509PublicKey")]
+#[op(name = "x509PublicKey")]
 fn x509_public_key(der: &[u8]) -> Result<Vec<u8>, OpError> {
     let c = cert_of(der)?;
     match parse_spki(c.spki.raw) {
@@ -1407,12 +1399,12 @@ fn x509_public_key(der: &[u8]) -> Result<Vec<u8>, OpError> {
     }
 }
 
-#[lumen::op(name = "x509CheckCA")]
+#[op(name = "x509CheckCA")]
 fn x509_check_ca(der: &[u8]) -> Result<bool, OpError> {
     Ok(is_ca(&cert_of(der)?))
 }
 
-#[lumen::op(name = "x509CheckHost")]
+#[op(name = "x509CheckHost")]
 fn x509_check_host(der: &[u8], name: &str, flags: u32) -> Result<Option<String>, OpError> {
     let c = cert_of(der)?;
     let chk = check_name(name)?;
@@ -1422,7 +1414,7 @@ fn x509_check_host(der: &[u8], name: &str, flags: u32) -> Result<Option<String>,
     }
 }
 
-#[lumen::op(name = "x509CheckEmail")]
+#[op(name = "x509CheckEmail")]
 fn x509_check_email(der: &[u8], email: &str, flags: u32) -> Result<bool, OpError> {
     let c = cert_of(der)?;
     let chk = check_name(email)?;
@@ -1433,7 +1425,7 @@ fn x509_check_email(der: &[u8], email: &str, flags: u32) -> Result<bool, OpError
 }
 
 /// `X509_check_ip_asc`.
-#[lumen::op(name = "x509CheckIP")]
+#[op(name = "x509CheckIP")]
 fn x509_check_ip(der: &[u8], ip: &str, flags: u32) -> Result<bool, OpError> {
     let c = cert_of(der)?;
     let addr: Vec<u8> = match ip.parse::<std::net::IpAddr>() {
@@ -1448,13 +1440,13 @@ fn x509_check_ip(der: &[u8], ip: &str, flags: u32) -> Result<bool, OpError> {
 }
 
 /// Whether `issuer` issued `der` (`X509_check_issued`).
-#[lumen::op(name = "x509CheckIssued")]
+#[op(name = "x509CheckIssued")]
 fn x509_check_issued(der: &[u8], issuer: &[u8]) -> Result<bool, OpError> {
     Ok(check_issued(&cert_of(issuer)?, &cert_of(der)?))
 }
 
 /// Whether the PKCS#8 private key matches the certificate's public key.
-#[lumen::op(name = "x509CheckPrivateKey")]
+#[op(name = "x509CheckPrivateKey")]
 fn x509_check_private_key(der: &[u8], pkcs8: &[u8]) -> Result<bool, OpError> {
     let c = cert_of(der)?;
     let Some(spki) = parse_spki(c.spki.raw) else { return Ok(false) };
@@ -1463,7 +1455,7 @@ fn x509_check_private_key(der: &[u8], pkcs8: &[u8]) -> Result<bool, OpError> {
 }
 
 /// Whether the certificate's signature verifies under the SPKI public key.
-#[lumen::op(name = "x509Verify")]
+#[op(name = "x509Verify")]
 fn x509_verify(der: &[u8], spki: &[u8]) -> Result<bool, OpError> {
     let c = cert_of(der)?;
     Ok(verify_signature(&c.sig_alg, spki, c.tbs, c.signature))
@@ -1471,7 +1463,7 @@ fn x509_verify(der: &[u8], spki: &[u8]) -> Result<bool, OpError> {
 
 /// The entries of the subject (`issuer` false) or issuer name as `[type, value, ...]` for the
 /// legacy object; `null` when a value is not a string.
-#[lumen::op(name = "x509NameEntries")]
+#[op(name = "x509NameEntries")]
 fn x509_name_entries(der: &[u8], issuer: bool) -> Result<Option<Vec<String>>, OpError> {
     let c = cert_of(der)?;
     let name = if issuer { c.issuer } else { c.subject };
@@ -1487,7 +1479,7 @@ fn x509_name_entries(der: &[u8], issuer: bool) -> Result<Option<Vec<String>>, Op
 
 /// Key details of the legacy object: `["rsa", [modulus, exponent], bits, pubkey]`,
 /// `["ec", [asn1Curve, nistCurve], bits, point]` or `["", [], 0, []]`.
-#[lumen::op(name = "x509KeyDetails")]
+#[op(name = "x509KeyDetails")]
 fn x509_key_details(der: &[u8]) -> Result<(String, Vec<String>, u32, Vec<u8>), OpError> {
     let c = cert_of(der)?;
     let none = || (String::new(), Vec::new(), 0, Vec::new());
@@ -1529,10 +1521,7 @@ fn spkac_decode(input: &[u8]) -> Option<Vec<u8>> {
         end -= 1;
     }
     let text = &input[start..end];
-    base64::engine::general_purpose::STANDARD
-        .decode(text)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text))
-        .ok()
+    codec::base64_decode_strict(text, false, Padding::Optional).ok()
 }
 
 struct Spkac<'a> {
@@ -1563,7 +1552,7 @@ fn spkac_too_large(input: &[u8]) -> Result<(), OpError> {
     Ok(())
 }
 
-#[lumen::op(name = "certVerifySpkac")]
+#[op(name = "certVerifySpkac")]
 fn cert_verify_spkac(input: &[u8]) -> Result<bool, OpError> {
     spkac_too_large(input)?;
     let Some(der) = spkac_decode(input) else { return Ok(false) };
@@ -1575,7 +1564,7 @@ fn cert_verify_spkac(input: &[u8]) -> Result<bool, OpError> {
 }
 
 /// The SPKAC's public key as PEM, `null` when it cannot be decoded.
-#[lumen::op(name = "certExportPublicKey")]
+#[op(name = "certExportPublicKey")]
 fn cert_export_public_key(input: &[u8]) -> Result<Option<Vec<u8>>, OpError> {
     spkac_too_large(input)?;
     let Some(der) = spkac_decode(input) else { return Ok(None) };
@@ -1586,36 +1575,11 @@ fn cert_export_public_key(input: &[u8]) -> Result<Option<Vec<u8>>, OpError> {
     }
 }
 
-#[lumen::op(name = "certExportChallenge")]
+#[op(name = "certExportChallenge")]
 fn cert_export_challenge(input: &[u8]) -> Result<Option<Vec<u8>>, OpError> {
     spkac_too_large(input)?;
     let Some(der) = spkac_decode(input) else { return Ok(None) };
     let Some(s) = spkac_parse(&der) else { return Ok(None) };
     Ok(string_to_utf8(s.challenge.tag, s.challenge.value).map(String::into_bytes))
 }
-
-pub const OPS: &[&OpDesc] = lumen::ops![
-    x509_parse,
-    x509_subject,
-    x509_issuer,
-    x509_subject_alt_name,
-    x509_info_access,
-    x509_validity,
-    x509_fingerprint,
-    x509_key_usage,
-    x509_serial_number,
-    x509_pem,
-    x509_public_key,
-    x509_check_ca,
-    x509_check_host,
-    x509_check_email,
-    x509_check_ip,
-    x509_check_issued,
-    x509_check_private_key,
-    x509_verify,
-    x509_name_entries,
-    x509_key_details,
-    cert_verify_spkac,
-    cert_export_public_key,
-    cert_export_challenge,
-];
+}

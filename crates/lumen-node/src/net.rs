@@ -46,6 +46,30 @@ use lumen_host::{ops, CallbackQueue, CompletionSender, Ctx, OpDecl, TaskId, Task
 /// gives no other way to interrupt a blocked `recv_from`).
 const UDP_POLL: Duration = Duration::from_millis(200);
 
+#[cfg(unix)]
+mod wake;
+#[cfg(unix)]
+mod fdpass;
+/// Descriptor passing is unix-only (Windows IPC rides the child's stdio instead).
+#[cfg(not(unix))]
+mod fdpass {
+    use lumen_host::{Ctx, Value};
+    fn unsupported(ctx: &mut Ctx) -> Result<Value, Value> {
+        Err(ctx.make_error("Error", "socket descriptor passing is not supported on this platform"))
+    }
+    pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
+    pub(super) fn op_socket_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
+    pub(super) fn op_server_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
+    pub(super) fn op_udp_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
+    pub(super) fn op_release(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
+    pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
+    pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
+    pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
+    pub(super) fn op_guess_handle(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::str("UNKNOWN")) }
+    pub(super) fn op_dup_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
+    pub(super) fn op_close_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Undefined) }
+}
+
 // ---- op tables --------------------------------------------------------------------------------
 
 pub const NET_OPS: &[OpDecl] = ops![
@@ -66,6 +90,16 @@ pub const NET_OPS: &[OpDecl] = ops![
     "closeServer" (1) => op_close_server,
     "serverAddress" (1) => op_server_address,
     "serverRef" (2) => op_server_ref,
+    "adoptFd" (1) => fdpass::op_adopt_fd,
+    "socketFd" (1) => fdpass::op_socket_fd,
+    "serverFd" (1) => fdpass::op_server_fd,
+    "release" (1) => fdpass::op_release,
+    "readMsg" (3) => fdpass::op_read_msg,
+    "trySendMsg" (3) => fdpass::op_try_send_msg,
+    "writeMsg" (5) => fdpass::op_write_msg,
+    "guessHandle" (1) => fdpass::op_guess_handle,
+    "dupFd" (1) => fdpass::op_dup_fd,
+    "closeFd" (1) => fdpass::op_close_fd,
 ];
 
 pub const UDP_OPS: &[OpDecl] = ops![
@@ -89,6 +123,7 @@ pub const UDP_OPS: &[OpDecl] = ops![
     "getBufferSize" (2) => op_udp_get_buffer_size,
     "setBufferSize" (3) => op_udp_set_buffer_size,
     "udpRef" (2) => op_udp_ref,
+    "fd" (1) => fdpass::op_udp_fd,
 ];
 
 // ---- registries ---------------------------------------------------------------------------------
@@ -99,6 +134,8 @@ struct SockEntry {
     unref: bool,
     /// The in-flight read task, so `ref`/`unref` can retroactively toggle it.
     pending: Option<TaskId>,
+    /// Set to stop a parked reader without shutting the connection down (see `wake`).
+    cancel: Arc<AtomicBool>,
 }
 
 struct ServerEntry {
@@ -107,6 +144,8 @@ struct ServerEntry {
     local_addr: ServerAddress,
     unref: bool,
     pending: Option<TaskId>,
+    /// This process bound the socket path, so closing the listener unlinks it (as libuv does).
+    owns_path: bool,
 }
 
 enum NetStream {
@@ -174,6 +213,15 @@ impl NetStream {
         }
     }
 
+    #[cfg(unix)]
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::Tcp(stream) => stream.as_raw_fd(),
+            Self::Unix(stream) => stream.as_raw_fd(),
+        }
+    }
+
     fn tcp(&self) -> Option<&TcpStream> {
         match self {
             Self::Tcp(stream) => Some(stream),
@@ -228,6 +276,25 @@ enum NetListener {
 }
 
 impl NetListener {
+    #[cfg(unix)]
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::Tcp(listener) => listener.as_raw_fd(),
+            Self::Unix(listener) => listener.as_raw_fd(),
+        }
+    }
+
+    /// Unix listeners are non-blocking: the accept thread parks in `wake::wait` instead, so a
+    /// close (or another process sharing the socket winning the race) never strands it.
+    #[cfg(unix)]
+    fn set_nonblocking(&self) {
+        let _ = match self {
+            Self::Tcp(listener) => listener.set_nonblocking(true),
+            Self::Unix(listener) => listener.set_nonblocking(true),
+        };
+    }
+
     fn accept(&self) -> std::io::Result<NetStream> {
         match self {
             Self::Tcp(listener) => listener.accept().map(|(stream, _)| NetStream::Tcp(stream)),
@@ -283,67 +350,11 @@ struct NetErr {
     errno: Option<i32>,
 }
 
+/// libuv's name for a socket error; `UNKNOWN` for one that carries no OS error of its own.
 fn io_code(e: &std::io::Error) -> &'static str {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        ConnectionRefused => "ECONNREFUSED",
-        ConnectionReset => "ECONNRESET",
-        ConnectionAborted => "ECONNABORTED",
-        NotConnected => "ENOTCONN",
-        AddrInUse => "EADDRINUSE",
-        AddrNotAvailable => "EADDRNOTAVAIL",
-        BrokenPipe => "EPIPE",
-        TimedOut => "ETIMEDOUT",
-        PermissionDenied => "EACCES",
-        NotFound => "ENOENT",
-        _ => errno_name(e.raw_os_error()).unwrap_or("UNKNOWN"),
-    }
-}
-
-#[cfg(unix)]
-fn errno_name(raw: Option<i32>) -> Option<&'static str> {
-    use libc::*;
-    let raw = raw?;
-    Some(match raw {
-        EPIPE => "EPIPE",
-        ECONNRESET => "ECONNRESET",
-        EINVAL => "EINVAL",
-        EAFNOSUPPORT => "EAFNOSUPPORT",
-        EMSGSIZE => "EMSGSIZE",
-        ENOBUFS => "ENOBUFS",
-        ENOTSOCK => "ENOTSOCK",
-        ENETUNREACH => "ENETUNREACH",
-        EHOSTUNREACH => "EHOSTUNREACH",
-        EISCONN => "EISCONN",
-        EDESTADDRREQ => "EDESTADDRREQ",
-        EBADF => "EBADF",
-        ENOPROTOOPT => "ENOPROTOOPT",
-        EPROTONOSUPPORT => "EPROTONOSUPPORT",
-        ENODEV => "ENODEV",
-        ENOMEM => "ENOMEM",
-        EMFILE => "EMFILE",
-        EPERM => "EPERM",
-        EAGAIN => "EAGAIN",
-        EADDRINUSE => "EADDRINUSE",
-        EADDRNOTAVAIL => "EADDRNOTAVAIL",
-        ENOTCONN => "ENOTCONN",
-        ECONNREFUSED => "ECONNREFUSED",
-        ENOENT => "ENOENT",
-        EACCES => "EACCES",
-        ENOTDIR => "ENOTDIR",
-        ENAMETOOLONG => "ENAMETOOLONG",
-        _ => return None,
-    })
-}
-
-#[cfg(not(unix))]
-fn errno_name(raw: Option<i32>) -> Option<&'static str> {
-    match raw? {
-        10040 => Some("EMSGSIZE"),
-        10022 => Some("EINVAL"),
-        10047 => Some("EAFNOSUPPORT"),
-        10038 => Some("ENOTSOCK"),
-        _ => None,
+    match lumen_os::errno::uv_code(e) {
+        "EIO" if e.raw_os_error().is_none() => "UNKNOWN",
+        code => code,
     }
 }
 
@@ -456,6 +467,7 @@ fn register_stream(ctx: &mut Ctx, stream: NetStream) -> Result<Vec<Value>, Value
             stream: Arc::new(stream),
             unref: false,
             pending: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         },
     );
     match (local, peer) {
@@ -614,8 +626,7 @@ fn connect_tcp_from(
     }
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = lumen_os::fdctl::set_inheritable(fd, false);
     let ip = local_ip.unwrap_or(if addr.is_ipv6() {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     } else {
@@ -859,14 +870,16 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let found = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
-        .map(|e| (e.stream.clone(), e.unref));
-    let (stream, unref) = match found {
+        .map(|e| (e.stream.clone(), e.unref, e.cancel.clone()));
+    let (stream, unref, cancel) = match found {
         Some(v) => v,
         None => {
             enqueue(ctx, resolve, vec![Value::Null]); // gone → treat as EOF
             return Ok(Value::Undefined);
         }
     };
+    #[cfg(not(unix))]
+    let _ = &cancel;
 
     let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
     let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
@@ -882,7 +895,27 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     completions(ctx).run_blocking(id, move || {
         let mut buf = vec![0u8; 65536];
         let mut s: &NetStream = &stream;
-        let result: Result<Vec<u8>, NetErr> = match s.read(&mut buf) {
+        #[cfg(unix)]
+        let read = loop {
+            match wake::wait(stream.raw_fd(), libc::POLLIN, &cancel) {
+                Ok(true) => {}
+                Ok(false) => break Ok(0),
+                Err(e) => break Err(e),
+            }
+            // SAFETY: the descriptor is kept open by `stream`; `buf` is a live buffer.
+            let n = unsafe { libc::recv(stream.raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+            if n >= 0 {
+                break Ok(n as usize);
+            }
+            let e = std::io::Error::last_os_error();
+            if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
+                break Err(e);
+            }
+        };
+        #[cfg(not(unix))]
+        let read = s.read(&mut buf);
+        let _ = &mut s;
+        let result: Result<Vec<u8>, NetErr> = match read {
             Ok(0) => Ok(Vec::new()),
             Ok(n) => {
                 buf.truncate(n);
@@ -1214,8 +1247,7 @@ fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Resul
     }
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = lumen_os::fdctl::set_inheritable(fd, false);
     let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
         // SAFETY: `on` is a live c_int of the size passed.
         let rc = unsafe {
@@ -1287,11 +1319,17 @@ fn op_listen(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     reg.servers.insert(
         id,
         ServerEntry {
-            listener: Arc::new(NetListener::Tcp(listener)),
+            listener: Arc::new({
+                let listener = NetListener::Tcp(listener);
+                #[cfg(unix)]
+                listener.set_nonblocking();
+                listener
+            }),
             closed: Arc::new(AtomicBool::new(false)),
             local_addr: ServerAddress::Tcp(local_addr),
             unref: false,
             pending: None,
+            owns_path: false,
         },
     );
 
@@ -1323,11 +1361,16 @@ fn op_listen_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
         reg.servers.insert(
             id,
             ServerEntry {
-                listener: Arc::new(NetListener::Unix(listener)),
+                listener: Arc::new({
+                    let listener = NetListener::Unix(listener);
+                    listener.set_nonblocking();
+                    listener
+                }),
                 closed: Arc::new(AtomicBool::new(false)),
                 local_addr: ServerAddress::Unix(path.clone()),
                 unref: false,
                 pending: None,
+                owns_path: true,
             },
         );
         let object = Value::Obj(ctx.new_object());
@@ -1352,6 +1395,7 @@ fn op_listen_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
                 local_addr: ServerAddress::Pipe(path.clone()),
                 unref: false,
                 pending: None,
+                owns_path: true,
             },
         );
         let object = Value::Obj(ctx.new_object());
@@ -1399,7 +1443,29 @@ fn op_accept(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         e.pending = Some(id);
     }
     completions(ctx).run_blocking(id, move || {
-        let result: AcceptResult = match listener.accept() {
+        #[cfg(unix)]
+        let accepted = loop {
+            match wake::wait(listener.raw_fd(), libc::POLLIN, &closed) {
+                Ok(true) => {}
+                Ok(false) => break Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                Err(e) => break Err(e),
+            }
+            match listener.accept() {
+                // BSD sockets inherit the listener's O_NONBLOCK; the stream threads block.
+                Ok(stream) => {
+                    let _ = match &stream {
+                        NetStream::Tcp(s) => s.set_nonblocking(false),
+                        NetStream::Unix(s) => s.set_nonblocking(false),
+                    };
+                    break Ok(stream);
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        #[cfg(not(unix))]
+        let accepted = listener.accept();
+        let result: AcceptResult = match accepted {
             Ok(stream) => {
                 if closed.load(Ordering::SeqCst) {
                     AcceptResult::Closed // woken by closeServer()'s throwaway connect
@@ -1449,9 +1515,22 @@ fn close_server_entry(entry: ServerEntry) {
         closed,
         local_addr,
         listener,
+        owns_path,
         ..
     } = entry;
     closed.store(true, Ordering::SeqCst);
+    #[cfg(unix)]
+    {
+        wake::wake_all();
+        if let (true, ServerAddress::Unix(path)) = (owns_path, &local_addr) {
+            let _ = std::fs::remove_file(path);
+        }
+        drop(listener);
+        return;
+    }
+    #[cfg(not(unix))]
+    let _ = owns_path;
+    #[allow(unreachable_code)]
     match local_addr {
         ServerAddress::Tcp(local_addr) => {
             let wake = if local_addr.ip().is_unspecified() {
@@ -1633,43 +1712,11 @@ fn invalid_argument_errno() -> i32 {
 
 #[cfg(unix)]
 pub(crate) fn sockaddr_of(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    // SAFETY: an all-zero sockaddr_storage is a valid value; the family-specific struct written
-    // into it below is no larger than the storage.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = match addr {
-        SocketAddr::V4(a) => {
-            let sin = libc::sockaddr_in {
-                #[cfg(target_vendor = "apple")]
-                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: a.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(a.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            // SAFETY: see above.
-            unsafe { std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sin) };
-            std::mem::size_of::<libc::sockaddr_in>()
-        }
-        SocketAddr::V6(a) => {
-            let sin6 = libc::sockaddr_in6 {
-                #[cfg(target_vendor = "apple")]
-                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: a.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: a.ip().octets(),
-                },
-                sin6_scope_id: a.scope_id(),
-            };
-            // SAFETY: see above.
-            unsafe { std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sin6) };
-            std::mem::size_of::<libc::sockaddr_in6>()
-        }
+    let addr = match *addr {
+        SocketAddr::V4(a) => lumen_os::net::SockAddr::V4(a),
+        SocketAddr::V6(a) => lumen_os::net::SockAddr::V6(a),
     };
-    (storage, len as libc::socklen_t)
+    addr.to_raw().expect("an IP socket address always converts")
 }
 
 /// Bind a UDP socket with the libuv bind flags std cannot express (`UV_UDP_IPV6ONLY` = 1,
@@ -1687,8 +1734,7 @@ fn bind_udp(addr: SocketAddr, flags: u32) -> std::io::Result<UdpSocket> {
     }
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = lumen_os::fdctl::set_inheritable(fd, false);
     let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
         // SAFETY: `on` is a live c_int of the size passed.
         let rc = unsafe {

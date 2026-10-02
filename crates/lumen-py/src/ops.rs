@@ -8,6 +8,9 @@ use crate::dict::PyDict;
 use crate::num::*;
 use crate::object::*;
 use crate::vm::*;
+use lumen_common::float::complex::{self, Complex};
+use lumen_common::float::MathError;
+use lumen_common::limits::size;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -67,12 +70,12 @@ pub fn norm_index(i: i64, len: usize) -> Option<usize> {
 pub fn slice_len(start: i64, stop: i64, step: i64) -> usize {
     if step > 0 {
         if stop > start {
-            ((stop - start + step - 1) / step) as usize
+            ((stop - start - 1) / step + 1) as usize
         } else {
             0
         }
     } else if start > stop {
-        ((start - stop - step - 1) / (-step)) as usize
+        ((start - stop - 1) / step.saturating_neg() + 1) as usize
     } else {
         0
     }
@@ -112,7 +115,7 @@ impl Interp {
                     Kind::List(l) => !l.borrow().is_empty(),
                     Kind::Dict(d) | Kind::Set(d) | Kind::FrozenSet(d) => !d.borrow().is_empty(),
                     Kind::Bytes(b) => !b.is_empty(),
-                    Kind::ByteArray(b) => !b.borrow().is_empty(),
+                    Kind::ByteArray(b) => !b.is_empty(),
                     Kind::Range(r) => slice_len(r.start, r.stop, r.step) > 0,
                     Kind::BigRange(r) => !big_range_len(r).is_zero(),
                     Kind::Complex(a, b) => *a != 0.0 || *b != 0.0,
@@ -147,7 +150,7 @@ impl Interp {
                 Kind::List(l) => return Ok(l.borrow().len()),
                 Kind::Dict(d) | Kind::Set(d) | Kind::FrozenSet(d) => return Ok(d.borrow().len()),
                 Kind::Bytes(b) => return Ok(b.len()),
-                Kind::ByteArray(b) => return Ok(b.borrow().len()),
+                Kind::ByteArray(b) => return Ok(b.len()),
                 Kind::Range(r) => return Ok(slice_len(r.start, r.stop, r.step)),
                 Kind::BigRange(r) => {
                     return match big_range_len(r).to_i64() {
@@ -199,6 +202,66 @@ impl Interp {
                 let t = self.type_name_of(v);
                 Err(self.type_error(&format!("'{}' object cannot be interpreted as an integer", t)))
             }
+        }
+    }
+
+    /// A sequence subscript (`PyNumber_AsSsize_t(key, PyExc_IndexError)`): an int past
+    /// `Py_ssize_t` is `IndexError: cannot fit 'int' into an index-sized integer`.
+    #[inline]
+    pub fn seq_index(&mut self, v: &Value) -> R<i64> {
+        if let Value::Int(i) = v {
+            return Ok(*i);
+        }
+        self.index_or(v, "IndexError")
+    }
+
+    /// `PyNumber_AsSsize_t(v, exc)`: `__index__`, then `exc` ("cannot fit '<type>' into an
+    /// index-sized integer") when the int does not fit.
+    #[cold]
+    pub fn index_or(&mut self, v: &Value, exc: &str) -> R<i64> {
+        match v.as_bigint() {
+            Some(b) => match b.to_i64() {
+                Some(i) => Ok(i),
+                None => {
+                    let t = self.type_name_of(v);
+                    Err(self.new_exc_str(exc, &format!("cannot fit '{}' into an index-sized integer", t)))
+                }
+            },
+            None => match self.index_of(v) {
+                Err(e) if self.exc_is(&e, "OverflowError") => {
+                    let t = self.type_name_of(v);
+                    Err(self.new_exc_str(exc, &format!("cannot fit '{}' into an index-sized integer", t)))
+                }
+                r => r,
+            },
+        }
+    }
+
+    /// An optional `start`/`stop` argument (`_PyEval_SliceIndexNotNone`): ints out of range clamp.
+    pub fn slice_index(&mut self, v: &Value) -> R<i64> {
+        if !self.has_index(v) {
+            return Err(self.type_error("slice indices must be integers or have an __index__ method"));
+        }
+        if let Some(b) = v.as_bigint() {
+            if b.to_i64().is_none() {
+                return Ok(if b.is_negative() { i64::MIN } else { i64::MAX });
+            }
+        }
+        self.index_of(v)
+    }
+
+    /// `PyNumber_Check`: an `int`/`float`/`complex`, or an object with `__index__`, `__int__` or
+    /// `__float__`.
+    pub fn number_check(&self, v: &Value) -> bool {
+        match v {
+            Value::Int(_) | Value::Bool(_) | Value::Float(_) => true,
+            Value::Obj(o) => {
+                matches!(o.kind, Kind::Int(_) | Kind::Float(_) | Kind::Complex(..)) || {
+                    let cls = self.type_of_obj(o);
+                    ["__index__", "__int__", "__float__"].iter().any(|m| self.lookup_mro(&cls, m).is_some())
+                }
+            }
+            _ => false,
         }
     }
 
@@ -306,20 +369,18 @@ impl Interp {
                 },
                 _ => None,
             };
-            let real = |s: &mut Self, v: &Value| -> Option<f64> {
-                if cx(v).is_some() {
-                    return None;
-                }
-                to_num(v)?;
-                s.float_arg(v).ok()
-            };
             let pair = match (cx(a), cx(b)) {
-                (Some(p), None) => real(self, b).map(|f| (p, (f, 0.0))),
-                (None, Some(q)) => real(self, a).map(|f| ((f, 0.0), q)),
+                (Some(p), None) => Some((p, b)),
+                (None, Some(q)) => Some((q, a)),
                 _ => None,
             };
-            if let Some((p, q)) = pair {
-                return Ok(Some((p == q) == (op == CmpOp::Eq)));
+            // A complex equals a real number only when its imaginary part is zero and its real part
+            // equals the number exactly.
+            if let Some(((re, im), other)) = pair {
+                if let Some(n) = to_num(other) {
+                    let eq = im == 0.0 && to_num(&Value::Float(re)).and_then(|x| num_cmp(&x, &n)) == Some(Ordering::Equal);
+                    return Ok(Some(eq == (op == CmpOp::Eq)));
+                }
             }
         }
         if let (Some(x), Some(y)) = (to_num(a), to_num(b)) {
@@ -333,11 +394,11 @@ impl Interp {
             _ => return Ok(None),
         };
         match (&oa.kind, &ob.kind) {
-            (Kind::Str(x), Kind::Str(y)) => Ok(Some(ord_matches(op, x.s.as_bytes().cmp(y.s.as_bytes())))),
+            (Kind::Str(x), Kind::Str(y)) => Ok(Some(ord_matches(op, lumen_common::smuggle::cmp_code_points(&x.s, &y.s)))),
             (Kind::Bytes(x), Kind::Bytes(y)) => Ok(Some(ord_matches(op, x.cmp(y)))),
-            (Kind::ByteArray(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.borrow().cmp(&y.borrow())))),
-            (Kind::Bytes(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.as_slice().cmp(y.borrow().as_slice())))),
-            (Kind::ByteArray(x), Kind::Bytes(y)) => Ok(Some(ord_matches(op, x.borrow().as_slice().cmp(y.as_slice())))),
+            (Kind::ByteArray(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.bytes().cmp(&y.bytes())))),
+            (Kind::Bytes(x), Kind::ByteArray(y)) => Ok(Some(ord_matches(op, x.as_slice().cmp(&*y.bytes())))),
+            (Kind::ByteArray(x), Kind::Bytes(y)) => Ok(Some(ord_matches(op, (*x.bytes()).cmp(y.as_slice())))),
             (Kind::Tuple(x), Kind::Tuple(y)) => {
                 let (x, y) = (x.clone(), y.clone());
                 self.seq_compare(op, &x, &y)
@@ -516,10 +577,18 @@ impl Interp {
                 return Ok(r);
             }
         }
+        // Mixed int/float/complex arithmetic is the wider type's slot: when that is `b`'s, its
+        // reflected method runs before the native fallback.
+        let b_wider = !b_first && differ && b_user && numeric_rank(a) > 0 && numeric_rank(b) > numeric_rank(a);
+        if b_wider {
+            if let Some(r) = self.call_cmp_user(b, a, rev)? {
+                return Ok(r);
+            }
+        }
         if let Some(v) = self.native_binop(op, a, b)? {
             return Ok(v);
         }
-        if !b_first && differ && b_user {
+        if !b_first && !b_wider && differ && b_user {
             if let Some(r) = self.call_cmp_user(b, a, rev)? {
                 return Ok(r);
             }
@@ -600,14 +669,14 @@ impl Interp {
                     return Ok(None);
                 }
                 let n = self.repeat_count(b)?;
-                let cur = l.borrow().clone();
+                let cur = l.to_vec();
                 let out = self.repeat_bytes(&cur, n, crate::limits::MAX_BYTES_LEN)?;
-                *l.borrow_mut() = out;
+                self.ba_edit(l, |v| *v = out)?;
                 Ok(Some(a.clone()))
             }
             (Kind::ByteArray(l), BinOp::Add) => {
                 let items = self.bytes_of(b)?;
-                l.borrow_mut().extend(items);
+                self.ba_edit(l, |v| v.extend(items))?;
                 Ok(Some(a.clone()))
             }
             (Kind::Set(_), BinOp::BitOr | BinOp::BitAnd | BinOp::Sub | BinOp::BitXor) => {
@@ -635,6 +704,11 @@ impl Interp {
     }
 
     pub fn native_binop(&mut self, op: BinOp, a: &Value, b: &Value) -> R<Option<Value>> {
+        if op == BinOp::BitOr {
+            if let Some(u) = self.union_binop(a, b)? {
+                return Ok(Some(u));
+            }
+        }
         if let Some(v) = self.num_binop(op, a, b)? {
             return Ok(if matches!(v, Value::NotImplemented) { None } else { Some(v) });
         }
@@ -676,14 +750,14 @@ impl Interp {
             (Kind::Bytes(_) | Kind::ByteArray(_), BinOp::Mod) => {
                 let raw = match &oa.kind {
                     Kind::Bytes(d) => d.clone(),
-                    Kind::ByteArray(d) => d.borrow().clone(),
+                    Kind::ByteArray(d) => d.to_vec(),
                     _ => Vec::new(),
                 };
                 let latin = |v: &Value| -> Value {
                     match v {
                         Value::Obj(o) => match &o.kind {
                             Kind::Bytes(d) => Value::string(d.iter().map(|&c| c as char).collect()),
-                            Kind::ByteArray(d) => Value::string(d.borrow().iter().map(|&c| c as char).collect()),
+                            Kind::ByteArray(d) => Value::string(d.bytes().iter().map(|&c| c as char).collect()),
                             _ => v.clone(),
                         },
                         _ => v.clone(),
@@ -706,7 +780,7 @@ impl Interp {
                     }
                 }
                 if matches!(oa.kind, Kind::ByteArray(_)) {
-                    return Ok(Some(Value::Obj(Object::new(Kind::ByteArray(std::cell::RefCell::new(out))))));
+                    return Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(out))))));
                 }
                 Ok(Some(Value::bytes(out)))
             }
@@ -749,7 +823,7 @@ impl Interp {
                     }
                     Kind::ByteArray(y) => {
                         let mut v = x.clone();
-                        v.extend_from_slice(&y.borrow());
+                        v.extend_from_slice(&y.bytes());
                         Ok(Some(Value::bytes(v)))
                     }
                     _ => Ok(None),
@@ -758,13 +832,13 @@ impl Interp {
             },
             (Kind::ByteArray(x), BinOp::Add) => match b {
                 Value::Obj(ob) => {
-                    let mut v = x.borrow().clone();
+                    let mut v = x.to_vec();
                     match &ob.kind {
                         Kind::Bytes(y) => v.extend_from_slice(y),
-                        Kind::ByteArray(y) => v.extend_from_slice(&y.borrow()),
+                        Kind::ByteArray(y) => v.extend_from_slice(&y.bytes()),
                         _ => return Ok(None),
                     }
-                    Ok(Some(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(v))))))
+                    Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(v))))))
                 }
                 _ => Ok(None),
             },
@@ -829,7 +903,7 @@ impl Interp {
 
     /// `src` repeated `n` times, refusing results past the sequence cap before allocating.
     pub fn repeat_values(&mut self, src: &[Value], n: usize) -> R<Vec<Value>> {
-        let Some(total) = src.len().checked_mul(n) else { return Err(self.memory_error()) };
+        let total = size::repeat(src.len(), n, crate::limits::MAX_SEQ_LEN).map_err(|_| self.memory_error())?;
         if total == 0 {
             return Ok(Vec::new());
         }
@@ -847,7 +921,7 @@ impl Interp {
 
     /// `src` repeated `n` times as bytes, built by doubling.
     pub fn repeat_bytes(&mut self, src: &[u8], n: usize, max: usize) -> R<Vec<u8>> {
-        let Some(total) = src.len().checked_mul(n) else { return Err(self.memory_error()) };
+        let total = size::repeat(src.len(), n, max).map_err(|_| self.memory_error())?;
         if total == 0 {
             return Ok(Vec::new());
         }
@@ -875,9 +949,9 @@ impl Interp {
             Kind::Tuple(t) => Ok(Some(Value::tuple(self.repeat_values(t, n)?))),
             Kind::Bytes(b) => Ok(Some(Value::bytes(self.repeat_bytes(b, n, crate::limits::MAX_BYTES_LEN)?))),
             Kind::ByteArray(b) => {
-                let src = b.borrow().clone();
+                let src = b.to_vec();
                 let out = self.repeat_bytes(&src, n, crate::limits::MAX_BYTES_LEN)?;
-                Ok(Some(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(out))))))
+                Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(out))))))
             }
             _ => Ok(None),
         }
@@ -930,22 +1004,23 @@ impl Interp {
     }
 
     fn complex_binop(&mut self, op: BinOp, a: &Value, b: &Value) -> R<Option<Value>> {
-        let get = |v: &Value| -> Option<(f64, f64)> {
-            match v {
+        let get = |v: &Value| -> Option<Result<(f64, f64), ()>> {
+            Some(Ok(match v {
                 Value::Obj(o) => match &o.kind {
-                    Kind::Complex(r, i) => Some((*r, *i)),
-                    Kind::Int(b) => b.to_float().map(|f| (f, 0.0)),
-                    Kind::Float(f) => Some((*f, 0.0)),
-                    _ => None,
+                    Kind::Complex(r, i) => (*r, *i),
+                    Kind::Int(b) => return Some(b.to_float().map(|f| (f, 0.0)).ok_or(())),
+                    Kind::Float(f) => (*f, 0.0),
+                    _ => return None,
                 },
-                Value::Int(i) => Some((*i as f64, 0.0)),
-                Value::Bool(b) => Some((*b as i64 as f64, 0.0)),
-                Value::Float(f) => Some((*f, 0.0)),
-                _ => None,
-            }
+                Value::Int(i) => (*i as f64, 0.0),
+                Value::Bool(b) => (*b as i64 as f64, 0.0),
+                Value::Float(f) => (*f, 0.0),
+                _ => return None,
+            }))
         };
         let ((a1, b1), (a2, b2)) = match (get(a), get(b)) {
-            (Some(x), Some(y)) => (x, y),
+            (Some(Ok(x)), Some(Ok(y))) => (x, y),
+            (Some(_), Some(_)) => return Err(self.overflow_err("int too large to convert to float")),
             _ => return Ok(None),
         };
         let mk = |r: f64, i: f64| Some(Value::Obj(Object::new(Kind::Complex(r, i))));
@@ -953,47 +1028,15 @@ impl Interp {
             BinOp::Add => mk(a1 + a2, b1 + b2),
             BinOp::Sub => mk(a1 - a2, b1 - b2),
             BinOp::Mult => mk(a1 * a2 - b1 * b2, a1 * b2 + b1 * a2),
-            BinOp::Div => {
-                let d = a2 * a2 + b2 * b2;
-                if d == 0.0 {
-                    return Err(self.zero_div("division by zero"));
-                }
-                mk((a1 * a2 + b1 * b2) / d, (b1 * a2 - a1 * b2) / d)
-            }
-            BinOp::Pow => {
-                if a2 == 0.0 && b2 == 0.0 {
-                    return Ok(mk(1.0, 0.0));
-                }
-                if b2 == 0.0 && a2 == a2.trunc() && a2.abs() <= 100.0 {
-                    let mul = |x: (f64, f64), y: (f64, f64)| (x.0 * y.0 - x.1 * y.1, x.0 * y.1 + x.1 * y.0);
-                    let mut n = a2.abs() as u32;
-                    let (mut result, mut base) = ((1.0, 0.0), (a1, b1));
-                    while n > 0 {
-                        if n & 1 == 1 {
-                            result = mul(result, base);
-                        }
-                        base = mul(base, base);
-                        n >>= 1;
-                    }
-                    if a2 < 0.0 {
-                        let d = result.0 * result.0 + result.1 * result.1;
-                        if d == 0.0 {
-                            return Err(self.zero_div("zero to a negative power"));
-                        }
-                        result = (result.0 / d, -result.1 / d);
-                    }
-                    return Ok(mk(result.0, result.1));
-                }
-                let r = (a1 * a1 + b1 * b1).sqrt();
-                let theta = b1.atan2(a1);
-                if r == 0.0 {
-                    return Ok(mk(0.0, 0.0));
-                }
-                let lnr = r.ln();
-                let nr = (a2 * lnr - b2 * theta).exp();
-                let nt = b2 * lnr + a2 * theta;
-                mk(nr * nt.cos(), nr * nt.sin())
-            }
+            BinOp::Div => match complex::quot(Complex::new(a1, b1), Complex::new(a2, b2)) {
+                Some(z) => mk(z.re, z.im),
+                None => return Err(self.zero_div("complex division by zero")),
+            },
+            BinOp::Pow => match complex::pow(Complex::new(a1, b1), Complex::new(a2, b2)) {
+                Ok(z) => mk(z.re, z.im),
+                Err(MathError::Domain) => return Err(self.zero_div("0.0 to a negative or complex power")),
+                Err(MathError::Range) => return Err(self.overflow_err("complex exponentiation")),
+            },
             _ => None,
         })
     }
@@ -1061,7 +1104,7 @@ impl Interp {
             _ => return Err(self.type_error("slice expected")),
         };
         let len = len as i64;
-        let step = if step.is_none() { 1 } else { self.index_of(&step)? };
+        let step = if step.is_none() { 1 } else { self.slice_index(&step)?.max(-i64::MAX) };
         if step == 0 {
             return Err(self.value_error("slice step cannot be zero"));
         }
@@ -1160,7 +1203,7 @@ impl Interp {
                     return Ok(Value::list(idx.into_iter().filter_map(|i| l.get(i).cloned()).collect()));
                 }
                 if self.has_index(key) {
-                    let i = self.index_of(key)?;
+                    let i = self.seq_index(key)?;
                     let l = l.borrow();
                     return match norm_index(i, l.len()) {
                         Some(j) => Ok(l[j].clone()),
@@ -1175,7 +1218,7 @@ impl Interp {
                     return Ok(Value::tuple(idx.into_iter().map(|i| t[i].clone()).collect()));
                 }
                 if self.has_index(key) {
-                    let i = self.index_of(key)?;
+                    let i = self.seq_index(key)?;
                     return match norm_index(i, t.len()) {
                         Some(j) => Ok(t[j].clone()),
                         None => Err(self.seq_index_error("tuple")),
@@ -1200,22 +1243,19 @@ impl Interp {
                             i += step;
                         }
                     } else {
-                        let chars: Vec<char> = s.s.chars().collect();
+                        let chars: Vec<u32> = lumen_common::smuggle::code_points(&s.s).collect();
                         let mut i = start;
                         for _ in 0..n {
-                            out.push(chars[i as usize]);
+                            lumen_common::smuggle::push_code_point(&mut out, chars[i as usize]);
                             i += step;
                         }
                     }
                     return Ok(Value::string(out));
                 }
                 if self.has_index(key) {
-                    let i = self.index_of(key)?;
-                    return match norm_index(i, s.nchars).and_then(|j| s.char_at(j)) {
-                        Some(c) => {
-                            let mut buf = [0u8; 4];
-                            Ok(Value::str(c.encode_utf8(&mut buf)))
-                        }
+                    let i = self.seq_index(key)?;
+                    return match norm_index(i, s.nchars) {
+                        Some(j) => Ok(Value::str(s.slice(j, j + 1))),
                         None => Err(self.seq_index_error("string")),
                     };
                 }
@@ -1240,7 +1280,7 @@ impl Interp {
                     let idx = self.slice_indices(key, b.len())?;
                     return Ok(Value::bytes(idx.into_iter().map(|i| b[i]).collect()));
                 }
-                let i = self.index_of(key)?;
+                let i = self.seq_index(key)?;
                 match norm_index(i, b.len()) {
                     Some(j) => Ok(Value::Int(b[j] as i64)),
                     None => Err(self.new_exc_str("IndexError", "index out of range")),
@@ -1248,13 +1288,13 @@ impl Interp {
             }
             Kind::ByteArray(b) => {
                 if self.is_slice(key) {
-                    let len = b.borrow().len();
+                    let len = b.len();
                     let idx = self.slice_indices(key, len)?;
-                    let b = b.borrow();
-                    return Ok(Value::Obj(Object::new(Kind::ByteArray(RefCell::new(idx.into_iter().map(|i| b[i]).collect())))));
+                    let b = b.bytes();
+                    return Ok(Value::Obj(Object::new(Kind::ByteArray(ba_store(idx.into_iter().map(|i| b[i]).collect())))));
                 }
-                let i = self.index_of(key)?;
-                let b = b.borrow();
+                let i = self.seq_index(key)?;
+                let b = b.bytes();
                 match norm_index(i, b.len()) {
                     Some(j) => Ok(Value::Int(b[j] as i64)),
                     None => Err(self.new_exc_str("IndexError", "bytearray index out of range")),
@@ -1285,7 +1325,10 @@ impl Interp {
                         step: r.step * step,
                     }))));
                 }
-                let i = self.index_of(key)?;
+                let i = match self.index_of(key) {
+                    Err(e) if self.exc_is(&e, "OverflowError") => return Err(self.seq_index_error("range object")),
+                    r => r?,
+                };
                 match norm_index(i, len) {
                     Some(j) => Ok(Value::Int(r.start + j as i64 * r.step)),
                     None => Err(self.seq_index_error("range object")),
@@ -1305,7 +1348,7 @@ impl Interp {
                     return self.call(&b, vec![key.clone()], Vec::new());
                 }
                 if self.is_builtin_generic(o) {
-                    return Ok(obj.clone());
+                    return Ok(self.make_alias(obj.clone(), key));
                 }
                 let n = self.type_name(o);
                 Err(self.type_error(&format!("type '{}' is not subscriptable", n)))
@@ -1380,7 +1423,7 @@ impl Interp {
                 let i = if let Value::Int(i) = &key {
                     *i
                 } else if self.has_index(&key) {
-                    self.index_of(&key)?
+                    self.seq_index(&key)?
                 } else {
                     return Err(self.bad_index_type("list", &key));
                 };
@@ -1399,12 +1442,16 @@ impl Interp {
             Kind::Dict(_) => self.dict_set(o, key, val),
             Kind::ByteArray(b) => {
                 if self.is_slice(&key) {
-                    let len = b.borrow().len();
+                    let len = b.len();
                     let (start, stop, step) = self.slice_bounds(&key, len)?;
                     let items: Vec<u8> = self.bytes_of(&val)?;
                     if step == 1 {
-                        let stop = stop.max(start) as usize;
-                        b.borrow_mut().splice(start as usize..stop, items);
+                        let (start, stop) = (start as usize, stop.max(start) as usize);
+                        if items.len() == stop - start {
+                            self.ba_write(b)?[start..stop].copy_from_slice(&items);
+                        } else {
+                            self.ba_edit(b, |v| drop(v.splice(start..stop, items)))?;
+                        }
                         return Ok(());
                     }
                     let n = slice_len(start, stop, step);
@@ -1412,7 +1459,7 @@ impl Interp {
                         let msg = format!("attempt to assign bytes of size {} to extended slice of size {}", items.len(), n);
                         return Err(self.value_error(&msg));
                     }
-                    let mut b = b.borrow_mut();
+                    let mut b = self.ba_write(b)?;
                     let mut idx = start;
                     for v in items {
                         b[idx as usize] = v;
@@ -1420,12 +1467,12 @@ impl Interp {
                     }
                     return Ok(());
                 }
-                let i = self.index_of(&key)?;
+                let i = self.seq_index(&key)?;
                 let v = self.index_of(&val)?;
                 if !(0..256).contains(&v) {
                     return Err(self.value_error("byte must be in range(0, 256)"));
                 }
-                let mut b = b.borrow_mut();
+                let mut b = self.ba_write(b)?;
                 match norm_index(i, b.len()) {
                     Some(j) => {
                         b[j] = v as u8;
@@ -1520,7 +1567,7 @@ impl Interp {
                     }
                     return Ok(());
                 }
-                let i = self.index_of(key)?;
+                let i = self.seq_index(key)?;
                 let mut lm = l.borrow_mut();
                 match norm_index(i, lm.len()) {
                     Some(j) => {
@@ -1539,24 +1586,26 @@ impl Interp {
             },
             Kind::ByteArray(b) => {
                 if self.is_slice(key) {
-                    let len = b.borrow().len();
+                    let len = b.len();
                     let mut idx = self.slice_indices(key, len)?;
-                    idx.sort_unstable();
-                    let mut bm = b.borrow_mut();
-                    for i in idx.into_iter().rev() {
-                        bm.remove(i);
+                    if idx.is_empty() {
+                        return Ok(());
                     }
+                    idx.sort_unstable();
+                    self.ba_edit(b, |bm| {
+                        for i in idx.into_iter().rev() {
+                            bm.remove(i);
+                        }
+                    })?;
                     return Ok(());
                 }
-                let i = self.index_of(key)?;
-                let mut bm = b.borrow_mut();
-                match norm_index(i, bm.len()) {
+                let i = self.seq_index(key)?;
+                match norm_index(i, b.len()) {
                     Some(j) => {
-                        bm.remove(j);
+                        self.ba_edit(b, |bm| bm.remove(j))?;
                         Ok(())
                     }
                     None => {
-                        drop(bm);
                         Err(self.new_exc_str("IndexError", "bytearray index out of range"))
                     }
                 }
@@ -1657,7 +1706,7 @@ impl Interp {
             }
             Kind::Bytes(b) => self.bytes_contains(b, item),
             Kind::ByteArray(b) => {
-                let b = b.borrow().clone();
+                let b = b.to_vec();
                 self.bytes_contains(&b, item)
             }
             Kind::DictView(d, vk) => match vk {
@@ -1715,8 +1764,8 @@ impl Interp {
             Value::Obj(o) => match &o.kind {
                 Kind::Bytes(s) => Ok(s.is_empty() || b.windows(s.len()).any(|w| w == s.as_slice())),
                 Kind::ByteArray(s) => {
-                    let s = s.borrow();
-                    Ok(s.is_empty() || b.windows(s.len()).any(|w| w == s.as_slice()))
+                    let s = s.bytes();
+                    Ok(s.is_empty() || b.windows(s.len()).any(|w| w == &s[..]))
                 }
                 _ => Err(self.type_error("a bytes-like object is required, not 'str'")),
             },
@@ -1724,11 +1773,70 @@ impl Interp {
         }
     }
 
+    /// `PyObject_Bytes`: `__bytes__`, a buffer, or an iterable of ints (never a str).
+    pub fn bytes_from_object(&mut self, v: &Value) -> R<Vec<u8>> {
+        if self.user_special(v, "__bytes__").is_some() {
+            let r = self.call_special(v, "__bytes__", Vec::new())?;
+            return match &r {
+                Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => self.bytes_of(&r),
+                _ => {
+                    let t = self.type_name_of(&r);
+                    Err(self.type_error(&format!("__bytes__ returned non-bytes (type {t})")))
+                }
+            };
+        }
+        if matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_) | Kind::List(_) | Kind::Tuple(_) | Kind::Range(_))) {
+            return self.bytes_of(v);
+        }
+        if let Some(b) = crate::builtins::memview::contiguous_bytes(self, v)? {
+            return Ok(b);
+        }
+        let iterable = match v {
+            Value::Obj(o) => !matches!(o.kind, Kind::Str(_)) && {
+                let c = self.type_of(v);
+                self.lookup_mro(&c, "__iter__").is_some()
+            },
+            _ => false,
+        };
+        if !iterable {
+            let t = self.type_name_of(v);
+            return Err(self.type_error(&format!("cannot convert '{t}' object to bytes")));
+        }
+        let iter = self.get_iter(v)?;
+        let mut out = Vec::new();
+        while let Some(i) = self.iter_next(&iter)? {
+            let n = self.index_of(&i)?;
+            if !(0..256).contains(&n) {
+                return Err(self.value_error("bytes must be in range(0, 256)"));
+            }
+            out.push(n as u8);
+        }
+        Ok(out)
+    }
+
+    /// Whether `v` exports a contiguous buffer (`bytes`, `bytearray`, `memoryview`, `array`).
+    pub fn is_buffer(&mut self, v: &Value) -> bool {
+        matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_))) || crate::builtins::memview::is_buffer_object(self, v)
+    }
+
+    /// The bytes of a buffer argument (`Py_buffer` in CPython's argument clinic); anything else
+    /// is "a bytes-like object is required".
+    pub fn buffer_bytes(&mut self, v: &Value) -> R<Vec<u8>> {
+        if !self.is_buffer(v) {
+            let t = self.type_name_of(v);
+            return Err(self.type_error(&format!("a bytes-like object is required, not '{t}'")));
+        }
+        self.bytes_of(v)
+    }
+
     pub fn bytes_of(&mut self, v: &Value) -> R<Vec<u8>> {
         match v {
             Value::Obj(o) => match &o.kind {
                 Kind::Bytes(b) => Ok(b.clone()),
-                Kind::ByteArray(b) => Ok(b.borrow().clone()),
+                Kind::ByteArray(b) => Ok(b.to_vec()),
+                Kind::Opaque(_) if crate::builtins::memview::is_buffer_object(self, v) => {
+                    Ok(crate::builtins::memview::contiguous_bytes(self, v)?.unwrap_or_default())
+                }
                 Kind::List(_) | Kind::Tuple(_) | Kind::Range(_) => {
                     let items = self.iterate_to_vec(v)?;
                     let mut out = Vec::new();
@@ -1996,5 +2104,20 @@ mod tests {
         assert_eq!(n(r(0, 10, -1)), "0");
         assert_eq!(n(r(5, 5, 1)), "0");
         assert_eq!(n(r(-(1 << 70), 1 << 70, 1 << 69)), "4");
+    }
+}
+
+/// The position of a builtin number in the int < float < complex tower; 0 for anything else.
+fn numeric_rank(v: &Value) -> u8 {
+    match v {
+        Value::Int(_) | Value::Bool(_) => 1,
+        Value::Float(_) => 2,
+        Value::Obj(o) => match o.kind {
+            Kind::Int(_) => 1,
+            Kind::Float(_) => 2,
+            Kind::Complex(..) => 3,
+            _ => 0,
+        },
+        _ => 0,
     }
 }

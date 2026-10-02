@@ -71,6 +71,23 @@ impl Props {
     }
 }
 
+impl Props {
+    /// Every own property slot, for a heap snapshot: packed elements by index, then the keyed
+    /// entries (named keys in slot order, then the element region, keyed by index strings).
+    pub(crate) fn visit_snapshot_slots(&self, f: &mut impl FnMut(Result<u32, std::rc::Rc<str>>, &Property)) {
+        if let Some(packed) = self.elems.packed_ref() {
+            for (i, w) in packed.iter().enumerate() {
+                if !w.is_hole() {
+                    f(Ok(i as u32), &super::PropRef::elem(w));
+                }
+            }
+        }
+        for (k, p) in self.iter() {
+            f(Err(k), p);
+        }
+    }
+}
+
 impl Property {
     #[cfg(test)]
     fn is_empty(&self) -> bool {

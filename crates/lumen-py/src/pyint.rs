@@ -1,6 +1,7 @@
 //! Python `int` semantics on top of the shared arbitrary-precision integer.
 
 pub use lumen_common::bigint::BigInt;
+use crate::fmath;
 
 const HASH_MODULUS: u64 = (1 << 61) - 1;
 
@@ -51,7 +52,7 @@ impl PyInt for BigInt {
     }
 
     fn from_f64_trunc(f: f64) -> Self {
-        BigInt::from_f64(f.trunc()).unwrap_or_else(BigInt::zero)
+        BigInt::from_f64(fmath::trunc(f)).unwrap_or_else(BigInt::zero)
     }
 
     fn parse_signed(s: &str, radix: u32) -> Option<Self> {

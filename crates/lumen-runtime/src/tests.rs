@@ -153,7 +153,10 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
     assert_eq!(rt.fatal_exit_code(), Some(1));
     assert_eq!(rt.finish_process(), 1);
     assert_eq!(out.lines(), ["exit 1"]);
-    assert_eq!(err.lines(), ["Uncaught TypeError: boom"]);
+    // Reported as Node reports it: the inspected error, then the version line.
+    let err = err.lines();
+    assert_eq!(err.first().map(String::as_str), Some("TypeError: boom"), "{err:?}");
+    assert_eq!(err.last().map(String::as_str), Some("Node.js v20.11.0"), "{err:?}");
 
     // A 'uncaughtException' listener owns the error and the loop carries on; an unhandled
     // rejection with no 'unhandledRejection' listener is raised through the same hook.
@@ -431,7 +434,7 @@ fn process_reports_native_cpu_and_memory_metrics() {
         console.log(memory.rss > 0, process.memoryUsage.rss() > 0);
         console.log(cpu.user >= 0, cpu.system >= 0, cpu.user + cpu.system > 0);
         console.log(resources.maxRSS > 0, resources.userCPUTime >= 0, resources.minorPageFault >= 0);
-        console.log(process.availableMemory() > 0, process.constrainedMemory() >= 0);
+        console.log(process.availableMemory() > 0, process.constrainedMemory() === undefined || process.constrainedMemory() > 0);
         "#,
     );
     assert_eq!(
@@ -1281,7 +1284,11 @@ fn error_reporting_globals() {
         err.lines(),
         [
             "Uncaught TypeError: boom-default",
-            "Uncaught (in promise) loud"
+            "[UnhandledPromiseRejection: This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason \"loud\".] {",
+            "  code: 'ERR_UNHANDLED_REJECTION'",
+            "}",
+            "",
+            "Node.js v20.11.0",
         ]
     );
 }
@@ -1300,6 +1307,7 @@ fn message_channel_semantics() {
         msg.n = 999;                  // must not be observable (sync serialize)
         port1.onmessage = (e) => {
             console.log(e.data.n, e.data !== msg, e instanceof MessageEvent, e.type);
+            port1.close();
         };
         "#,
     )
@@ -1343,6 +1351,7 @@ fn broadcast_channel_fanout() {
         setTimeout(() => {
             c.close();
             try { c.postMessage(1); } catch (e) { console.log("closed:", e.name); }
+            a.close(); b.close(); other.close();
         }, 5);
         "#,
     )

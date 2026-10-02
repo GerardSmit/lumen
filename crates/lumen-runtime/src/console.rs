@@ -9,6 +9,7 @@ use lumen_host::{ops, Ctx, Extension, OpState, Value};
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "console",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "console",

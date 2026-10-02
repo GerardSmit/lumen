@@ -1,12 +1,17 @@
 //! Diffie-Hellman: finite-field DH over `num-bigint-dig`, ECDH and the stateless key agreement of
 //! `crypto.diffieHellman` (EC, X25519, X448, DH).
 
-use lumen::embed::{OpDesc, OpError};
+use lumen::embed::OpError;
 use num_bigint_dig::prime::probably_prime;
 use num_bigint_dig::{BigUint, RandBigInt};
 use rand_core::OsRng;
 
-use super::keys::{asn1, dh_group, safe_prime, with_ec_curve, x448_mul, AsymKey, EcCurve};
+use super::keys::{asn1, dh_group, safe_prime, safe_prime_congruent, with_ec_curve, x448_mul, AsymKey, EcCurve};
+
+
+#[lumen_bind::module(name = "crypto")]
+pub(crate) mod bindings {
+use super::*;
 
 const DH_CHECK_P_NOT_PRIME: u32 = 1;
 const DH_CHECK_P_NOT_SAFE_PRIME: u32 = 2;
@@ -18,6 +23,12 @@ const DH_MAX_MODULUS_BITS: usize = 10000;
 
 fn failed(message: &'static str) -> OpError {
     OpError::error(message).with_code("ERR_CRYPTO_OPERATION_FAILED")
+}
+
+/// OpenSSL 3's provider error for peer keys over different groups / curves.
+fn domain_mismatch() -> OpError {
+    OpError::error("error:1C8000DE:Provider routines::mismatching domain parameters")
+        .with_code("ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS")
 }
 
 fn num(bytes: &[u8]) -> BigUint {
@@ -36,7 +47,7 @@ fn small_mod(n: &BigUint, m: u32) -> u32 {
 }
 
 /// `DH_check`: the `verifyError` flags of the parameters.
-#[lumen::op(name = "dhVerify")]
+#[op(name = "dhVerify")]
 fn dh_verify(p: &[u8], g: &[u8]) -> u32 {
     let (p, g) = (num(p), num(g));
     let one = BigUint::from(1u8);
@@ -65,8 +76,14 @@ fn dh_verify(p: &[u8], g: &[u8]) -> u32 {
 }
 
 /// A safe prime of `bits` bits that `g` (2 or 5) generates a subgroup of.
-#[lumen::op(name = "dhGenPrime")]
+#[op(name = "dhGenPrime")]
 fn dh_gen_prime(bits: u32, g: u32) -> Result<Vec<u8>, OpError> {
+    // OpenSSL's congruences for the generator: p ≡ 23 (mod 24) for 2, p ≡ 59 (mod 60) for 5.
+    match g {
+        2 if bits >= 6 => return Ok(minimal(&safe_prime_congruent(bits, 24, 23))),
+        5 if bits >= 6 => return Ok(minimal(&safe_prime_congruent(bits, 60, 59))),
+        _ => {}
+    }
     loop {
         let p = safe_prime(bits)?;
         let suitable = match g {
@@ -81,7 +98,7 @@ fn dh_gen_prime(bits: u32, g: u32) -> Result<Vec<u8>, OpError> {
 }
 
 /// A key pair `[private, public]` for the parameters.
-#[lumen::op(name = "dhGenKey")]
+#[op(name = "dhGenKey")]
 fn dh_gen_key(p: &[u8], g: &[u8], private: Option<Vec<u8>>) -> Result<(Vec<u8>, Vec<u8>), OpError> {
     let (p, g) = (num(p), num(g));
     if p.bits() < DH_MIN_MODULUS_BITS || p.bits() > DH_MAX_MODULUS_BITS {
@@ -95,13 +112,13 @@ fn dh_gen_key(p: &[u8], g: &[u8], private: Option<Vec<u8>>) -> Result<(Vec<u8>, 
     Ok((minimal(&x), minimal(&y)))
 }
 
-#[lumen::op(name = "dhPublic")]
+#[op(name = "dhPublic")]
 fn dh_public(p: &[u8], g: &[u8], x: &[u8]) -> Vec<u8> {
     let p = num(p);
     minimal(&num(g).modpow(&num(x), &p))
 }
 
-#[lumen::op(name = "dhCompute")]
+#[op(name = "dhCompute")]
 fn dh_compute(p: &[u8], x: &[u8], peer: &[u8]) -> Result<Vec<u8>, OpError> {
     let (p, peer) = (num(p), num(peer));
     let one = BigUint::from(1u8);
@@ -116,7 +133,7 @@ fn dh_compute(p: &[u8], x: &[u8], peer: &[u8]) -> Result<Vec<u8>, OpError> {
 }
 
 /// `[p, g]` of a MODP group.
-#[lumen::op(name = "dhGroupParams")]
+#[op(name = "dhGroupParams")]
 fn dh_group_params(name: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     dh_group(name).map(|(p, g)| (minimal(&p), minimal(&g)))
 }
@@ -130,13 +147,13 @@ fn ecdh_curve(name: &str) -> Result<EcCurve, OpError> {
     .ok_or_else(|| OpError::type_error("Invalid EC curve name").with_code("ERR_CRYPTO_INVALID_CURVE"))
 }
 
-#[lumen::op(name = "ecdhCurveKnown")]
+#[op(name = "ecdhCurveKnown")]
 fn ecdh_curve_known(name: &str) -> bool {
     ecdh_curve(name).is_ok()
 }
 
 /// `[private, public]` with the private scalar of the curve's field length.
-#[lumen::op(name = "ecdhGenerate")]
+#[op(name = "ecdhGenerate")]
 fn ecdh_generate(curve: &str) -> Result<(Vec<u8>, Vec<u8>), OpError> {
     Ok(ecdh_curve(curve)?.generate())
 }
@@ -146,7 +163,7 @@ fn invalid_private() -> OpError {
 }
 
 /// The uncompressed public point of a private scalar; throws when the scalar is out of range.
-#[lumen::op(name = "ecdhPublic")]
+#[op(name = "ecdhPublic")]
 fn ecdh_public(curve: &str, private: &[u8]) -> Result<Vec<u8>, OpError> {
     let curve = ecdh_curve(curve)?;
     if private.len() > curve.field_len() && private[..private.len() - curve.field_len()].iter().any(|&b| b != 0) {
@@ -166,7 +183,7 @@ fn ec_agree(curve: EcCurve, private: &[u8], peer: &[u8]) -> Result<Vec<u8>, OpEr
     })
 }
 
-#[lumen::op(name = "ecdhCompute")]
+#[op(name = "ecdhCompute")]
 fn ecdh_compute(curve: &str, private: &[u8], peer: &[u8]) -> Result<Vec<u8>, OpError> {
     ec_agree(ecdh_curve(curve)?, private, peer)
 }
@@ -196,13 +213,13 @@ fn convert_point(curve: EcCurve, key: &[u8], format: u32) -> Result<Vec<u8>, OpE
 }
 
 /// A public point in `format` (`POINT_CONVERSION_*`), validating it on the curve.
-#[lumen::op(name = "ecdhConvert")]
+#[op(name = "ecdhConvert")]
 fn ecdh_convert(curve: &str, key: &[u8], format: u32) -> Result<Vec<u8>, OpError> {
     convert_point(ecdh_curve(curve)?, key, format)
 }
 
 /// `crypto.diffieHellman`: the shared secret of a private and a public (or private) handle.
-#[lumen::op(name = "statelessDh")]
+#[op(name = "statelessDh")]
 fn stateless_dh(private_kind: u32, private_der: &[u8], public_kind: u32, public_der: &[u8]) -> Result<Vec<u8>, OpError> {
     let private = AsymKey::from_handle(private_kind, private_der)?;
     let public = AsymKey::from_handle(public_kind, public_der)?;
@@ -210,7 +227,7 @@ fn stateless_dh(private_kind: u32, private_der: &[u8], public_kind: u32, public_
     match (&private, &public) {
         (AsymKey::Ec(a), AsymKey::Ec(b)) => {
             if a.curve != b.curve {
-                return Err(mismatch());
+                return Err(domain_mismatch());
             }
             ec_agree(a.curve, a.d.as_deref().ok_or_else(mismatch)?, &b.point)
         }
@@ -232,7 +249,7 @@ fn stateless_dh(private_kind: u32, private_der: &[u8], public_kind: u32, public_
         }
         (AsymKey::Dh(a), AsymKey::Dh(b)) => {
             if a.p != b.p || a.g != b.g {
-                return Err(mismatch());
+                return Err(domain_mismatch());
             }
             let x = a.x.as_ref().ok_or_else(mismatch)?;
             let secret = b.y.modpow(x, &a.p);
@@ -241,18 +258,4 @@ fn stateless_dh(private_kind: u32, private_der: &[u8], public_kind: u32, public_
         _ => Err(mismatch()),
     }
 }
-
-pub const OPS: &[&OpDesc] = lumen::ops![
-    dh_verify,
-    dh_gen_prime,
-    dh_gen_key,
-    dh_public,
-    dh_compute,
-    dh_group_params,
-    ecdh_curve_known,
-    ecdh_generate,
-    ecdh_public,
-    ecdh_compute,
-    ecdh_convert,
-    stateless_dh,
-];
+}

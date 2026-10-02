@@ -1,6 +1,10 @@
 // ---- registration ------------------------------------------------------------------------------
 
 __builtins.set("crypto", require("crypto"));
+__internals.set("cryptoRequire", (id) => require(id));
+__internals.set("cryptoBinding", cryptoBinding);
+__internals.set("cloneModule:internal/crypto",
+                (id, name) => (name === "keyObjectFromClone" ? keyObjectFromClone : require(id)[name]));
 
 // The WebCrypto globals, as accessors like Node's own that an assignment replaces.
 function lazyGlobal(name, get) {

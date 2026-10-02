@@ -11,6 +11,7 @@ mod collect;
 pub(crate) mod class_fields;
 mod constructor_body;
 mod generator_body;
+mod heap_snapshot;
 pub(crate) mod name_cache;
 mod this_binding;
 pub(crate) mod ta_meta;
@@ -19,6 +20,8 @@ pub use bindings::VarMap;
 
 use crate::ast::*;
 use crate::value::*;
+use lumen_common::buffer::{span_len, ByteStore, StoreSlot};
+use lumen_common::limits::size;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -85,6 +88,26 @@ fn wait_table() -> &'static Mutex<HashMap<(u64, usize), Vec<Waiter>>> {
     static T: OnceLock<Mutex<HashMap<(u64, usize), Vec<Waiter>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Default::default()))
 }
+/// One step of a synchronous `Atomics.wait`, reported to the hook installed with
+/// `Engine::set_atomics_wait_hook`.
+pub struct AtomicsWaitEvent {
+    pub phase: AtomicsWaitPhase,
+    /// Identity of the shared buffer (equal across the agents that share it).
+    pub buffer: u64,
+    pub byte_index: usize,
+    pub value: i128,
+    /// The timeout in milliseconds; infinite when the wait has none.
+    pub timeout_ms: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AtomicsWaitPhase {
+    Started,
+    NotEqual,
+    Woken,
+    TimedOut,
+}
+
 /// Check the expected memory value and register while holding the waiter-list lock.
 /// A concurrent notification cannot slip between the check and registration.
 pub fn futex_register_if(id: u64, index: usize, matches: impl FnOnce() -> bool) -> Option<Waiter> {
@@ -192,6 +215,24 @@ impl Interp {
     /// Replace the current async context, returning the previous one.
     pub fn set_async_context(&mut self, context: Value) -> Value {
         std::mem::replace(&mut self.async_context, context)
+    }
+
+    /// Install (a callable) or remove the multiple-resolves hook (see the field).
+    pub fn set_multiple_resolves_hook(&mut self, hook: Value) {
+        self.multiple_resolves_hook = hook.is_callable().then_some(hook);
+    }
+
+    /// Queue `error` to be reported as an uncaught exception once the running microtask
+    /// checkpoint ends, as a throwing `queueMicrotask` callback is; `false` when the embedder
+    /// does not collect such errors.
+    pub fn report_task_error(&mut self, error: Value) -> bool {
+        match self.task_errors.as_mut() {
+            Some(errors) => {
+                errors.push(error);
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn null_read_message(&self, base: &Value, key: Option<&Value>) -> String {
@@ -857,6 +898,8 @@ pub struct Interp {
     /// check) defer to [`Interp::call`]; refreshed there from the native stack headroom (see
     /// [`Interp::stack_guard`]). 0 forces the next call through the checked path.
     pub(crate) depth_limit: u32,
+    /// Recursion ceiling for this realm; [`MAX_EVAL_DEPTH`] unless the embedder lowered it.
+    pub(crate) max_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
@@ -928,17 +971,18 @@ pub struct Interp {
     pub(crate) lang: crate::eval::fastpaths::LangCaches,
     /// The TypedArray `length`/`byteLength`/`byteOffset`/`buffer` read guard (`ta_meta`).
     pub(crate) ta_meta: ta_meta::TaMetaCaches,
-    /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer.
-    pub(crate) array_buffers: crate::fasthash::FastMap<usize, crate::bytebuf::ByteBuf>,
+    /// ArrayBuffer byte storage (the shared `lumen_common::buffer::ByteStore`), keyed by the
+    /// ArrayBuffer object's pointer; a detached buffer has no entry. Immutable buffers (from
+    /// `transferToImmutable`/`sliceToImmutable`) are readonly stores, resizable ones have a max.
+    pub(crate) array_buffers: crate::fasthash::FastMap<usize, StoreSlot>,
     /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
     /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
     pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
-    /// Immutable ArrayBuffer pointers (created via `transferToImmutable`/`sliceToImmutable`): their
-    /// bytes can be read but never written, resized, detached, or transferred.
-    pub(crate) immutable_buffers: std::collections::HashSet<usize>,
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
+    /// Observer of synchronous `Atomics.wait` calls (Node's `--trace-atomics-wait`).
+    pub(crate) atomics_wait_hook: Option<Box<dyn Fn(&AtomicsWaitEvent)>>,
     /// Pending `Atomics.waitAsync` operations: each carries the result promise and a channel that a
     /// waiter thread sends "ok"/"timed-out" on. The event loop resolves them as they complete.
     pub(crate) pending_async_waits: Vec<(Value, std::sync::mpsc::Receiver<&'static str>)>,
@@ -1012,6 +1056,19 @@ pub struct Interp {
     /// around the handler — so a runtime can build `AsyncLocalStorage` on it. Timers and other
     /// host continuations capture and restore it themselves through the host API.
     pub(crate) async_context: Value,
+    /// The host's promise lifecycle hooks (V8's context promise hooks), when installed. Every
+    /// hook site is behind this one `is_some` check.
+    pub(crate) promise_hooks: Option<Box<crate::eval::promise_fast::PromiseHooks>>,
+    /// Rejected promises reported unhandled that later got a handler (V8's
+    /// kPromiseHandlerAddedAfterReject), for the embedder's `rejectionHandled`; `None` until
+    /// the embedder asks for them.
+    pub(crate) late_handled_rejections: Option<Vec<Value>>,
+    /// Errors thrown by `queueMicrotask` callbacks, when the embedder reports them as uncaught
+    /// exceptions (see [`Interp::set_report_task_errors`]).
+    pub(crate) task_errors: Option<Vec<Value>>,
+    /// Called as `(type, promise, value)` when a promise's resolving function runs after it was
+    /// already resolved (V8's kPromiseResolveAfterResolved / kPromiseRejectAfterResolved).
+    pub(crate) multiple_resolves_hook: Option<Value>,
     /// Embedder host state (typed slots + resource table); see [`crate::host`]. Reached from
     /// native fns via [`Interp::op_state`] — the only way, since `NativeFn` cannot capture.
     pub(crate) host_state: crate::host::OpState,
@@ -1024,12 +1081,15 @@ pub struct Interp {
     pub(crate) gc_tick: u32,
     /// Per-site identifier resolutions (see [`name_cache`]).
     pub(crate) name_sites: name_cache::NameSites,
-    /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point.
-    pub(crate) interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Host deadline for a bounded run (`vm` `timeout`): while set, every polled safe point
-    /// throws a catchable error, until the host clears it. Unlike `interrupt` it never latches
-    /// `terminating`, so the realm lives on after the host converts the error.
-    pub(crate) script_timeout: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Embedder stop request (see `Engine::set_interrupt`), polled at every GC safe point, and
+    /// the host deadline for a bounded run (`vm` `timeout`): while raised, every polled safe
+    /// point throws a catchable error, until the host clears it. Unlike the interrupt it never
+    /// latches `terminating`, so the realm lives on after the host converts the error.
+    pub(crate) stop: lumen_common::limits::StopFlags,
+    /// The active realm's global *proxy* when it is a `vm` context: the object free names,
+    /// global declarations and the global `this` resolve against (it intercepts onto the
+    /// context's sandbox). `global` keeps holding the realm's intrinsics.
+    pub(crate) global_proxy: Option<Gc>,
     /// Latched once `interrupt` was seen set: from then on every safe point (not one in 256)
     /// throws, so a `catch` that swallows the termination reaches the next call or loop turn
     /// and is terminated again.
@@ -1040,6 +1100,11 @@ pub struct Interp {
     pub(crate) live_limit: i64,
     /// Allocated-bytes ceiling (see `Engine::set_heap_limit`); 0 = none.
     pub(crate) heap_limit: usize,
+    /// Terminate the realm at the first crossing of `heap_limit` instead of throwing first.
+    pub(crate) heap_fatal: bool,
+    /// Runs when the realm first crosses its ceiling, `remaining` times, each time raising the
+    /// ceiling by a twentieth so the realm can go on (see `Engine::set_near_limit_hook`).
+    pub(crate) near_limit: Option<NearLimit>,
     /// The ceiling checks compare against: `heap_limit`, raised by a headroom once an
     /// out-of-memory error was thrown so its handler can run (see [`Interp::heap_over`]).
     pub(crate) heap_ceiling: usize,
@@ -1217,6 +1282,15 @@ pub const MAX_LIVE: i64 = 3_000_000;
 
 /// Live-object count at which the collector first runs; the threshold then floats (see `gc_check`).
 pub const GC_TRIGGER: i64 = 100_000;
+
+/// A callback for a realm that reached its memory ceiling, with the number of times it may run.
+pub struct NearLimit {
+    pub remaining: u32,
+    pub hook: Box<dyn FnMut(&mut Interp)>,
+}
+
+/// The lowest live-object ceiling an embedder can set.
+pub const MIN_LIVE_LIMIT: i64 = 4_096;
 /// Layered calls check allocation counters once per 256 calls.
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
 /// Native long loops poll the interrupt and heap limit every this many iterations (a power of 2).
@@ -1259,11 +1333,15 @@ pub struct RealmState {
     pub error_protos: crate::fasthash::FastMap<&'static str, Gc>,
     pub eval_fn: Option<Gc>,
     pub extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
+    /// A `vm` context's global proxy (see [`Interp::global_proxy`]).
+    pub global_proxy: Option<Gc>,
+    /// A `vm` context realm: dropped by the collector once nothing reaches its global.
+    pub collectable: bool,
 }
 
 impl Interp {
     /// Snapshot the current realm's intrinsics so they can be swapped out and back.
-    fn snapshot_realm(&self) -> RealmState {
+    pub(crate) fn snapshot_realm(&self) -> RealmState {
         RealmState {
             global: self.global.clone(),
             global_env: self.global_env.clone(),
@@ -1277,11 +1355,13 @@ impl Interp {
             error_protos: self.error_protos.clone(),
             eval_fn: self.eval_fn.clone(),
             extra_protos: self.extra_protos.clone(),
+            global_proxy: self.global_proxy.clone(),
+            collectable: false,
         }
     }
 
     /// Install a realm's intrinsics as the active ones.
-    fn restore_realm(&mut self, r: &RealmState) {
+    pub(crate) fn restore_realm(&mut self, r: &RealmState) {
         self.global = r.global.clone();
         self.global_env = r.global_env.clone();
         self.object_proto = r.object_proto.clone();
@@ -1294,6 +1374,7 @@ impl Interp {
         self.error_protos = r.error_protos.clone();
         self.eval_fn = r.eval_fn.clone();
         self.extra_protos = r.extra_protos.clone();
+        self.global_proxy = r.global_proxy.clone();
     }
 
     /// `$262.createRealm()`: build a fresh realm (its own global + intrinsics) and register it. The
@@ -1302,6 +1383,11 @@ impl Interp {
     /// main realm, so `realms.is_empty()` never distinguishes anything — cross-realm dispatch
     /// only becomes possible once another realm joins, and realms are never removed. Every
     /// single-realm fast-path gate keys on this.
+    #[inline]
+    pub(crate) fn name_global(&self) -> &Gc {
+        self.global_proxy.as_ref().unwrap_or(&self.global)
+    }
+
     #[inline]
     pub(crate) fn multi_realm(&self) -> bool {
         self.realms.len() > 1
@@ -1358,6 +1444,7 @@ impl Interp {
         self.error_protos = Default::default();
         self.extra_protos = Default::default();
         self.eval_fn = None;
+        self.global_proxy = None;
         crate::builtins::install(self);
         // Top-level `this` is the new global.
         let g = Value::Obj(self.global.clone());
@@ -1420,7 +1507,27 @@ impl Interp {
 }
 
 impl RealmState {
-    fn snapshot_clone(&self) -> RealmState {
+    /// Every object handle the realm record holds.
+    pub(crate) fn for_each_object(&self, mut f: impl FnMut(&Gc)) {
+        for o in [
+            &self.global,
+            &self.object_proto,
+            &self.function_proto,
+            &self.array_proto,
+            &self.string_proto,
+            &self.number_proto,
+            &self.boolean_proto,
+            &self.symbol_proto,
+        ] {
+            f(o);
+        }
+        self.error_protos.values().for_each(&mut f);
+        self.extra_protos.values().for_each(&mut f);
+        self.eval_fn.iter().for_each(&mut f);
+        self.global_proxy.iter().for_each(&mut f);
+    }
+
+    pub(crate) fn snapshot_clone(&self) -> RealmState {
         RealmState {
             global: self.global.clone(),
             global_env: self.global_env.clone(),
@@ -1434,6 +1541,8 @@ impl RealmState {
             error_protos: self.error_protos.clone(),
             eval_fn: self.eval_fn.clone(),
             extra_protos: self.extra_protos.clone(),
+            global_proxy: self.global_proxy.clone(),
+            collectable: false,
         }
     }
 }
@@ -1499,6 +1608,7 @@ impl Interp {
             strict: false,
             depth: 0,
             depth_limit: 0,
+            max_depth: MAX_EVAL_DEPTH,
             class_info: Default::default(),
             ctor_plans: Default::default(),
             plan_cache: None,
@@ -1544,8 +1654,8 @@ impl Interp {
             ta_meta: Default::default(),
             array_buffers: Default::default(),
             shared_buffers: Default::default(),
-            immutable_buffers: std::collections::HashSet::new(),
             can_block: true,
+            atomics_wait_hook: None,
             pending_async_waits: Vec::new(),
             pending_timers: Vec::new(),
             agent: None,
@@ -1565,6 +1675,10 @@ impl Interp {
             ctor_caller_realm: None,
             realms: Default::default(),
             unhandled_rejections: Default::default(),
+            promise_hooks: None,
+            late_handled_rejections: None,
+            task_errors: None,
+            multiple_resolves_hook: None,
             temporal: Default::default(),
             temporal_cal: Default::default(),
             microtasks: std::collections::VecDeque::new(),
@@ -1574,12 +1688,14 @@ impl Interp {
             gc_next: GC_TRIGGER,
             gc_tick: 0,
             name_sites: Default::default(),
-            interrupt: None,
-            script_timeout: None,
+            stop: lumen_common::limits::StopFlags::new(),
+            global_proxy: None,
             terminating: false,
             heap_limit_hit: false,
             live_limit: MAX_LIVE,
             heap_limit: 0,
+            heap_fatal: false,
+            near_limit: None,
             heap_ceiling: 0,
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
@@ -1710,6 +1826,39 @@ impl Interp {
 
     // ----- typed arrays -----------------------------------------------------------------------
 
+    /// Run `f` on the bytes of ArrayBuffer `buffer` (a SharedArrayBuffer's under its lock), or
+    /// `None` when it is detached.
+    #[inline]
+    pub(crate) fn with_buffer_bytes<R>(&self, buffer: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if !self.shared_buffers.is_empty() {
+            if let Some(&id) = self.shared_buffers.get(&buffer) {
+                return shared_mem_get(id).map(|mem| f(&mem.lock().unwrap()));
+            }
+        }
+        self.array_buffers.get(&buffer).map(|b| f(&b.bytes()))
+    }
+
+    /// [`with_buffer_bytes`](Self::with_buffer_bytes) with write access.
+    #[inline]
+    pub(crate) fn with_buffer_bytes_mut<R>(
+        &self,
+        buffer: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Option<R> {
+        if !self.shared_buffers.is_empty() {
+            if let Some(&id) = self.shared_buffers.get(&buffer) {
+                return shared_mem_get(id).map(|mem| f(&mut mem.lock().unwrap()));
+            }
+        }
+        self.array_buffers.get(&buffer).map(|b| f(&mut b.bytes_mut()))
+    }
+
+    /// Whether ArrayBuffer `buffer` is immutable (a readonly store).
+    #[inline]
+    pub(crate) fn buffer_immutable(&self, buffer: usize) -> bool {
+        self.array_buffers.get(&buffer).is_some_and(|b| b.is_readonly())
+    }
+
     /// Read element `idx` of a TypedArray as a Number (or undefined if out of range / detached).
     pub(crate) fn ta_read(&self, info: &TaInfo, idx: usize) -> Value {
         if idx >= self.ta_len(info).unwrap_or(0) {
@@ -1717,28 +1866,17 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let decode = |buf: &[u8]| -> Value {
-            if start + es <= buf.len() {
-                let bytes = &buf[start..start + es];
+        self.with_buffer_bytes(info.buffer, |buf| {
+            buf.get(start..start + es).map(|bytes| {
                 if info.kind.is_bigint() {
-                    Value::BigInt(info.kind.read_bigint(bytes).into())
+                    Value::BigInt(info.kind.read_int(bytes).into())
                 } else {
                     Value::Num(info.kind.read(bytes))
                 }
-            } else {
-                Value::Undefined
-            }
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                return decode(&mem.lock().unwrap());
-            }
-            return Value::Undefined;
-        }
-        match self.array_buffers.get(&info.buffer) {
-            Some(buf) => decode(buf),
-            _ => Value::Undefined,
-        }
+            })
+        })
+        .flatten()
+        .unwrap_or(Value::Undefined)
     }
 
     /// The raw bytes of `nelems` elements starting at element `elem_start` (None when the view
@@ -1752,36 +1890,18 @@ impl Interp {
         let es = info.kind.elsize();
         let start = info.offset + elem_start * es;
         let end = start + nelems * es;
-        let take = |buf: &[u8]| {
-            if end <= buf.len() {
-                Some(buf[start..end].to_vec())
-            } else {
-                None
-            }
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            return shared_mem_get(id).and_then(|mem| take(&mem.lock().unwrap()));
-        }
-        self.array_buffers.get(&info.buffer).and_then(|b| take(b))
+        self.with_buffer_bytes(info.buffer, |buf| buf.get(start..end).map(<[u8]>::to_vec))
+            .flatten()
     }
 
     /// Write raw bytes at element `elem_start` (bounds-checked; silently drops what doesn't fit).
     pub(crate) fn ta_write_bytes(&mut self, info: &TaInfo, elem_start: usize, bytes: &[u8]) {
         let start = info.offset + elem_start * info.kind.elsize();
-        let put = |buf: &mut [u8]| {
-            if start + bytes.len() <= buf.len() {
-                buf[start..start + bytes.len()].copy_from_slice(bytes);
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            if let Some(dst) = buf.get_mut(start..start + bytes.len()) {
+                dst.copy_from_slice(bytes);
             }
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                put(&mut mem.lock().unwrap());
-            }
-            return;
-        }
-        if let Some(b) = self.array_buffers.get_mut(&info.buffer) {
-            put(b);
-        }
+        });
     }
 
     /// Atomically read-modify-write an integer TypedArray element: `f` maps the old raw value to
@@ -1800,37 +1920,15 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let apply = |buf: &mut [u8]| -> Option<i128> {
-            if start + es > buf.len() {
-                return None;
-            }
-            let bytes = &buf[start..start + es];
-            let old = if info.kind.is_bigint() {
-                info.kind.read_bigint(bytes)
-            } else {
-                info.kind.read(bytes) as i128
-            };
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            let bytes = buf.get_mut(start..start + es)?;
+            let old = info.kind.read_int(bytes);
             if let Some(new) = f(old) {
-                let nb = if info.kind.is_bigint() {
-                    info.kind.write_bigint(new)
-                } else {
-                    info.kind.write(new as f64)
-                };
-                buf[start..start + es].copy_from_slice(&nb);
+                info.kind.write_int(new, bytes);
             }
             Some(old)
-        };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                return apply(&mut buf);
-            }
-            return None;
-        }
-        match self.array_buffers.get_mut(&info.buffer) {
-            Some(buf) => apply(buf),
-            None => None,
-        }
+        })
+        .flatten()
     }
 
     /// Store a JS value into a TypedArray element, coercing per the element type. BigInt arrays
@@ -1839,8 +1937,7 @@ impl Interp {
         // IntegerIndexedElementSet: the value coerces FIRST (observable, spec order); a write
         // into an immutable buffer then fails like a non-writable data property — a TypeError in
         // strict mode, a silent no-op in sloppy.
-        let immutable =
-            !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&info.buffer);
+        let immutable = self.buffer_immutable(info.buffer);
         if info.kind.is_bigint() {
             let n = self.to_bigint(v)?;
             if !immutable {
@@ -1868,21 +1965,11 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let bytes = info.kind.write_bigint(n);
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                if start + es <= buf.len() {
-                    buf[start..start + es].copy_from_slice(&bytes);
-                }
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            if let Some(dst) = buf.get_mut(start..start + es) {
+                info.kind.write_int(n, dst);
             }
-            return;
-        }
-        if let Some(buf) = self.array_buffers.get_mut(&info.buffer) {
-            if start + es <= buf.len() {
-                buf[start..start + es].copy_from_slice(&bytes);
-            }
-        }
+        });
     }
 
     /// Write Number `n` into element `idx` of a TypedArray (out-of-range writes are ignored).
@@ -1892,21 +1979,11 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let bytes = info.kind.write(n);
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                if start + es <= buf.len() {
-                    buf[start..start + es].copy_from_slice(&bytes);
-                }
+        self.with_buffer_bytes_mut(info.buffer, |buf| {
+            if let Some(dst) = buf.get_mut(start..start + es) {
+                info.kind.write(n, dst);
             }
-            return;
-        }
-        if let Some(buf) = self.array_buffers.get_mut(&info.buffer) {
-            if start + es <= buf.len() {
-                buf[start..start + es].copy_from_slice(&bytes);
-            }
-        }
+        });
     }
 
     // ----- symbols ----------------------------------------------------------------------------
@@ -2006,6 +2083,12 @@ impl Interp {
     }
 
     /// `(target, handler)` of a proxy, for `util.inspect(proxy, { showProxy: true })`.
+    /// The remaining entries of a Map/Set iterator without advancing it, see
+    /// [`crate::builtins::collections::map_set_iter_preview`].
+    pub fn preview_entries_for_host(&self, v: &Value) -> Option<(Vec<Value>, bool)> {
+        crate::builtins::collections::map_set_iter_preview(self, v.as_obj()?)
+    }
+
     pub fn proxy_parts_for_host(&self, v: &Value) -> Option<(Value, Value)> {
         let ptr = self.object_addr(v)?;
         self.proxies.get(&ptr).cloned()
@@ -2015,7 +2098,7 @@ impl Interp {
     /// Only meaningful with an interrupt installed — `process.exit` in an embedded realm uses it
     /// so a `catch` around the exit cannot keep the program running for another 255 calls.
     pub fn terminate_for_host(&mut self) {
-        if self.interrupt.is_some() {
+        if self.stop.has_interrupt() {
             self.terminating = true;
         }
     }
@@ -2024,7 +2107,7 @@ impl Interp {
     /// cannot see (a child process, a read): poll it, then unwind with
     /// [`Interp::poll_interrupt_for_host`].
     pub fn interrupt_for_host(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        self.interrupt.clone()
+        self.stop.interrupt_flag().cloned()
     }
 
     /// Throw the realm's termination if the embedder asked it to stop.
@@ -2038,6 +2121,9 @@ impl Interp {
     /// Run lumen's cycle collector and return the number of reclaimed heap objects.
     pub fn collect_garbage_for_host(&mut self) -> i64 {
         let before = crate::value::live_objects();
+        if let Some(observer) = self.host_state.get_mut::<crate::gc_log::GcObserver>() {
+            observer.forced_next = true;
+        }
         self.gc_collect();
         before.saturating_sub(crate::value::live_objects())
     }
@@ -2317,23 +2403,24 @@ impl Interp {
             .get(&(Gc::as_ptr(obj) as usize))
             .copied()?;
         let len = self.ta_len(&info)?;
-        let (code, elem) = match info.kind {
-            crate::value::TaKind::I8 => (0u8, 1usize),
-            crate::value::TaKind::U8 => (1, 1),
-            crate::value::TaKind::U8Clamped => (2, 1),
-            crate::value::TaKind::I16 => (3, 2),
-            crate::value::TaKind::U16 => (4, 2),
-            crate::value::TaKind::I32 => (5, 4),
-            crate::value::TaKind::U32 => (6, 4),
-            crate::value::TaKind::F32 => (7, 4),
-            crate::value::TaKind::F64 => (8, 8),
-            crate::value::TaKind::I64 => (9, 8),
-            crate::value::TaKind::U64 => (10, 8),
-            crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
+        let code = match info.kind {
+            crate::value::TaKind::I8 => 0u8,
+            crate::value::TaKind::U8 => 1,
+            crate::value::TaKind::U8Clamped => 2,
+            crate::value::TaKind::I16 => 3,
+            crate::value::TaKind::U16 => 4,
+            crate::value::TaKind::I32 => 5,
+            crate::value::TaKind::U32 => 6,
+            crate::value::TaKind::F32 => 7,
+            crate::value::TaKind::F64 => 8,
+            crate::value::TaKind::I64 => 9,
+            crate::value::TaKind::U64 => 10,
+            crate::value::TaKind::F16 => 1, // no N-API code for float16; report bytes
         };
-        let byte_len = len * elem;
-        let buf = self.array_buffers.get_mut(&info.buffer)?;
-        let ptr = unsafe { buf.as_mut_ptr().add(info.offset) };
+        let byte_len = len * info.kind.elsize();
+        let buf = self.array_buffers.get(&info.buffer)?;
+        // SAFETY: `ta_len` succeeded, so `offset` is within the store.
+        let ptr = unsafe { buf.as_ptr().add(info.offset) };
         Some((code, byte_len, ptr))
     }
 
@@ -2563,7 +2650,7 @@ impl Interp {
             return Ok(None);
         };
         if matches!(
-            object.borrow().props.get("__abResizable").map(|p| p.value()),
+            object.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
             Some(Value::Bool(true))
         ) {
             return Err(self.make_error(
@@ -2583,11 +2670,11 @@ impl Interp {
         let object = Object::new(self.extra_protos.get("SharedArrayBuffer").cloned());
         let pointer = Gc::as_ptr(&object) as usize;
         self.gc_pin(&object);
-        self.array_buffers.insert(pointer, vec![0u8; length].into());
+        self.array_buffers.insert(pointer, ByteStore::zeroed(length).into());
         for (name, value) in [
-            ("__abMaxByteLength", Value::Num(length as f64)),
-            ("__abResizable", Value::Bool(false)),
-            ("__sab_id", Value::Num(handle.id as f64)),
+            ("\u{0}ab_max_byte_length", Value::Num(length as f64)),
+            ("\u{0}ab_resizable", Value::Bool(false)),
+            ("\u{0}sab_id", Value::Num(handle.id as f64)),
         ] {
             object
                 .borrow_mut()
@@ -2602,27 +2689,43 @@ impl Interp {
     /// (no copy: JS and the embedder share the bytes).
     ///
     /// # Safety
-    /// See [`crate::bytebuf::ByteBuf::external`].
+    /// See [`ByteStore::external`].
     pub unsafe fn make_array_buffer_external(
         &mut self,
         ptr: *mut u8,
         len: usize,
         owner: Rc<dyn std::any::Any>,
     ) -> Value {
-        let v = self.make_array_buffer_from(Vec::new());
-        if let Value::Obj(o) = &v {
-            let p = Gc::as_ptr(o) as usize;
-            self.array_buffers
-                .insert(p, crate::bytebuf::ByteBuf::external(ptr, len, owner));
-            crate::builtins::typedarray::set_max_byte_length(o, len);
-        }
-        v
+        let store = ByteStore::external(ptr, len, owner);
+        crate::builtins::typedarray::array_buffer_from_store(self, store.into()).0
     }
 
-    /// Detach an `ArrayBuffer`, dropping its backing store.
+    /// A fresh `ArrayBuffer` over an existing store, sharing its bytes without copying (the
+    /// cross-language bridge: a store another facade created, or one taken from
+    /// [`array_buffer_store`](Self::array_buffer_store)). Resizability, maximum length and
+    /// immutability come from the store.
+    pub fn make_array_buffer_from_store(&mut self, store: Rc<ByteStore>) -> Value {
+        crate::builtins::typedarray::array_buffer_from_store(self, store.into()).0
+    }
+
+    /// The store behind an attached, non-shared `ArrayBuffer` (`None` for anything else). Pin it
+    /// ([`ByteStore::pin`]) while holding a view into it: JS then cannot resize, transfer or
+    /// detach the buffer (it throws a TypeError instead).
+    pub fn array_buffer_store(&mut self, v: &Value) -> Option<Rc<ByteStore>> {
+        let p = Gc::as_ptr(v.as_obj()?) as usize;
+        if self.shared_buffers.contains_key(&p) {
+            return None;
+        }
+        self.array_buffers.get_mut(&p).map(StoreSlot::share)
+    }
+
+    /// Detach an `ArrayBuffer`, dropping its backing store. A store still pinned by another
+    /// holder keeps its bytes for that holder; JS sees the buffer detached either way.
     pub fn array_buffer_detach(&mut self, v: &Value) {
         if let Some(o) = v.as_obj() {
-            self.array_buffers.remove(&(Gc::as_ptr(o) as usize));
+            if let Some(store) = self.array_buffers.remove(&(Gc::as_ptr(o) as usize)) {
+                let _ = store.detach();
+            }
         }
     }
 
@@ -2634,11 +2737,12 @@ impl Interp {
             return false;
         };
         let pointer = Gc::as_ptr(object) as usize;
-        self.array_buffers.contains_key(&pointer)
+        self.array_buffers
+            .get(&pointer)
+            .is_some_and(|b| !b.is_readonly() && !b.is_pinned())
             && !self.shared_buffers.contains_key(&pointer)
-            && !self.immutable_buffers.contains(&pointer)
             && !matches!(
-                object.borrow().props.get("__abResizable").map(|p| p.value()),
+                object.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
                 Some(Value::Bool(true))
             )
     }
@@ -3117,53 +3221,34 @@ impl Interp {
         Some(p.value())
     }
 
-    /// The byte range and element count behind a non-BigInt TypedArray over an ordinary
-    /// (non-shared) ArrayBuffer: `Some((info, len))`, `len == 0` when the view is detached or out
-    /// of bounds (every index invalid). `None` = not such a TypedArray (take the generic path).
-    #[inline]
-    fn ta_fast_view(&self, o: &Gc) -> Option<(TaInfo, usize)> {
+    /// The store and element count behind a non-BigInt TypedArray over an ordinary (non-shared)
+    /// ArrayBuffer: `Some((info, len, store))`, `len == 0` when the view is out of bounds (every
+    /// index invalid). `None` = not such a TypedArray, or detached (take the generic path).
+    #[inline(always)]
+    fn ta_fast_view(&self, o: &Gc) -> Option<(TaInfo, usize, &ByteStore)> {
         let info = *self.typed_arrays.get(&(Gc::as_ptr(o) as usize))?;
         if info.kind.is_bigint()
             || (!self.shared_buffers.is_empty() && self.shared_buffers.contains_key(&info.buffer))
         {
             return None;
         }
-        let buflen = self.array_buffers.get(&info.buffer)?.len();
-        let es = info.kind.elsize();
-        let len = if info.track {
-            buflen.saturating_sub(info.offset) / es
-        } else if info.offset + info.len * es > buflen {
-            0
-        } else {
-            info.len
-        };
-        Some((info, len))
+        let store = self.array_buffers.get(&info.buffer)?;
+        let len = span_len(store.len(), info.offset, info.kind.elsize(), info.len, info.track)
+            .unwrap_or(0);
+        Some((info, len, store))
     }
 
     /// `ta[idx]` for an integer index on a Number-kind TypedArray (IntegerIndexedElementGet:
     /// an invalid index reads `undefined` — never the prototype chain).
     #[inline(never)]
     pub(crate) fn fast_ta_get(&self, o: &Gc, idx: usize) -> Option<Value> {
-        let info = self.typed_arrays.get(&(Gc::as_ptr(o) as usize))?;
-        if info.kind.is_bigint()
-            || (!self.shared_buffers.is_empty() && self.shared_buffers.contains_key(&info.buffer))
-        {
-            return None;
-        }
-        let buf: &[u8] = self.array_buffers.get(&info.buffer)?;
-        let es = info.kind.elsize();
-        let len = if info.track {
-            buf.len().saturating_sub(info.offset) / es
-        } else if info.offset + info.len * es > buf.len() {
-            0
-        } else {
-            info.len
-        };
+        let (info, len, store) = self.ta_fast_view(o)?;
         if idx >= len {
             return Some(Value::Undefined);
         }
+        let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        Some(Value::Num(info.kind.read(&buf[start..start + es])))
+        Some(Value::Num(info.kind.read(&store.bytes()[start..start + es])))
     }
 
     /// `ta[idx] = v` for an integer index on a Number-kind TypedArray when `v` is already a
@@ -3174,10 +3259,10 @@ impl Interp {
         let Value::Num(n) = v else {
             return Err(v);
         };
-        let Some((info, len)) = self.ta_fast_view(o) else {
+        let Some((info, len, store)) = self.ta_fast_view(o) else {
             return Err(v);
         };
-        if !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&info.buffer) {
+        if store.is_readonly() {
             return Err(v);
         }
         if idx >= len {
@@ -3185,29 +3270,7 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let Some(buf) = self.array_buffers.get_mut(&info.buffer) else {
-            return Err(v);
-        };
-        let dst = &mut buf[start..start + es];
-        // The integer conversions of `TaKind::write`, without its `Vec`: modulo 2^32 (a plain
-        // `as i64` saturates at |n| >= 2^63, so 1e20 would store -1 instead of 0).
-        let int = |n: f64| {
-            if !n.is_finite() {
-                0
-            } else if n.abs() < 9223372036854775808.0 {
-                n.trunc() as i64
-            } else {
-                n.trunc().rem_euclid(4294967296.0) as i64
-            }
-        };
-        match info.kind {
-            TaKind::I8 | TaKind::U8 => dst[0] = int(n) as u8,
-            TaKind::I16 | TaKind::U16 => dst.copy_from_slice(&(int(n) as u16).to_le_bytes()),
-            TaKind::I32 | TaKind::U32 => dst.copy_from_slice(&(int(n) as u32).to_le_bytes()),
-            TaKind::F32 => dst.copy_from_slice(&(n as f32).to_le_bytes()),
-            TaKind::F64 => dst.copy_from_slice(&n.to_le_bytes()),
-            k => dst.copy_from_slice(&k.write(n)),
-        }
+        info.kind.write(n, &mut store.bytes_mut()[start..start + es]);
         Ok(())
     }
 
@@ -3751,7 +3814,7 @@ impl Interp {
         };
         // Too long: the generic path raises the RangeError. A smuggled high surrogate meeting a
         // smuggled low must join canonically (`jstr::concat`), which a byte append would skip.
-        if lv.len() + x.len() > MAX_STR_LEN || crate::jstr::needs_join_fixup(lv, x) {
+        if size::sum(lv.len(), x.len(), MAX_STR_LEN).is_err() || crate::jstr::needs_join_fixup(lv, x) {
             return Err(lval);
         }
         let mut b = o.borrow_mut();
@@ -4391,6 +4454,9 @@ impl Interp {
         let strict = self.strict;
         let success = self.set_member_recv(base, key, value, base.clone())?;
         if !success && strict {
+            if let Some(m) = self.vm_store_error(base, key) {
+                return Err(self.throw("TypeError", m));
+            }
             return Err(self.throw("TypeError", format!("cannot assign to property '{key}'")));
         }
         Ok(())
@@ -4876,18 +4942,7 @@ impl Interp {
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
         let buflen = self.array_buffers.get(&info.buffer)?.len();
-        let es = info.kind.elsize();
-        if info.track {
-            if info.offset > buflen {
-                None
-            } else {
-                Some((buflen - info.offset) / es)
-            }
-        } else if info.offset + info.len * es > buflen {
-            None
-        } else {
-            Some(info.len)
-        }
+        span_len(buflen, info.offset, info.kind.elsize(), info.len, info.track)
     }
 
     /// Classify a property key against a TypedArray's integer-index exotic behavior: a valid
@@ -5078,7 +5133,7 @@ impl Interp {
         self.gc_tick = self.gc_tick.wrapping_add(1);
         if self.gc_tick & GC_CALL_POLL_MASK == 0
             || self.terminating
-            || crate::bytebuf::gc_pressure()
+            || lumen_common::buffer::gc_pressure()
         {
             self.gc_check()
         } else {
@@ -5099,18 +5154,21 @@ impl Interp {
         }
         crate::value::gc_trim_emptied();
         let before = crate::value::live_objects();
-        if before <= self.gc_next && !crate::bytebuf::gc_pressure() {
+        if before <= self.gc_next && !lumen_common::buffer::gc_pressure() {
             return Ok(());
         }
         self.gc_collect();
-        crate::bytebuf::after_gc();
+        lumen_common::buffer::after_gc();
         let live = crate::value::live_objects();
 
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!("[gc] live={live}");
         }
+        if live > self.live_limit && self.near_limit_event() {
+            self.live_limit = live + live / 20;
+        }
         if live > self.live_limit {
-            if self.interrupt.is_some() {
+            if self.stop.has_interrupt() {
                 // An embedded realm is terminated, not handed a catchable RangeError: past its
                 // ceiling it must not keep running (the embedder reports why).
                 self.heap_limit_hit = true;
@@ -5131,9 +5189,34 @@ impl Interp {
         // data (a long promise chain, a big build-up): collecting again at +25% would rescan the
         // same survivors every few allocations, so wait until live doubles instead.
         let growth = if before - live < before / 8 { live } else { live / 4 };
-        self.gc_next = (live + growth.max(GC_TRIGGER)).clamp(GC_TRIGGER, self.live_limit);
+        self.gc_next = (live + growth.max(GC_TRIGGER)).min(self.live_limit);
         Ok(())
 
+    }
+
+    /// Call `hook` the first `times` times this realm crosses its live-object or heap ceiling,
+    /// raising the ceiling by a twentieth after each so the realm can go on; once the runs are
+    /// used up the ceiling applies as usual. `times == 0` removes the hook.
+    pub fn set_near_limit_hook(&mut self, times: u32, hook: Box<dyn FnMut(&mut Interp)>) {
+        self.near_limit = (times > 0).then_some(NearLimit { remaining: times, hook });
+    }
+
+    /// Run the near-limit hook if one has runs left; whether it ran. A hook out of runs is
+    /// dropped, after which the next crossing is the limit for good.
+    #[cold]
+    fn near_limit_event(&mut self) -> bool {
+        let Some(mut near) = self.near_limit.take() else {
+            return false;
+        };
+        if near.remaining == 0 {
+            return false;
+        }
+        near.remaining -= 1;
+        (near.hook)(self);
+        if near.remaining > 0 {
+            self.near_limit = Some(near);
+        }
+        true
     }
 
     /// Poll for every `STRIDE`th `k` of a native loop that may run for a very long time (an
@@ -5192,19 +5275,30 @@ impl Interp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.gc_collect();
-            crate::bytebuf::after_gc();
+            lumen_common::buffer::after_gc();
             let used = crate::fastalloc::heap_bytes().unwrap_or(0);
             if used.saturating_add(extra) <= self.heap_ceiling {
                 return Ok(());
             }
             if used > self.heap_limit {
+                if self.heap_ceiling == self.heap_limit && self.near_limit_event() {
+                    self.heap_limit = used.saturating_add(used / 20);
+                    self.heap_ceiling = self.heap_limit;
+                    self.sync_regex_poll();
+                    return Ok(());
+                }
+                if self.heap_fatal && self.stop.has_interrupt() {
+                    self.heap_limit_hit = true;
+                    self.terminating = true;
+                    return Err(self.termination());
+                }
                 if self.heap_ceiling == self.heap_limit {
                     // Headroom for the handler, as with `live_limit`: the `catch` block's own
                     // allocations must not throw again before it can drop what it retains.
                     self.heap_ceiling = self
                         .heap_limit
                         .saturating_add((self.heap_limit / 8).max(HEAP_HEADROOM_MIN));
-                } else if self.interrupt.is_some() {
+                } else if self.stop.has_interrupt() {
                     self.heap_limit_hit = true;
                     self.terminating = true;
                     return Err(self.termination());
@@ -5219,19 +5313,12 @@ impl Interp {
     /// one branch on `terminating`, one relaxed load.
     #[inline]
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Abrupt> {
+        use lumen_common::limits::Abort;
         if !self.terminating {
-            match &self.interrupt {
-                Some(flag) if flag.load(std::sync::atomic::Ordering::Relaxed) => {
-                    self.terminating = true;
-                }
-                _ => {
-                    if let Some(deadline) = &self.script_timeout {
-                        if deadline.load(std::sync::atomic::Ordering::Relaxed) {
-                            return Err(self.throw("Error", "Script execution timed out"));
-                        }
-                    }
-                    return Ok(());
-                }
+            match self.stop.poll() {
+                Abort::Interrupt => self.terminating = true,
+                Abort::Deadline => return Err(self.throw("Error", "Script execution timed out")),
+                _ => return Ok(()),
             }
         }
         Err(self.termination())
@@ -5239,7 +5326,7 @@ impl Interp {
 
     /// Run a long native BigInt computation so the interrupt and script deadline can stop it.
     pub(crate) fn big_guard<T>(&mut self, f: impl FnOnce() -> T) -> Result<T, Abrupt> {
-        match crate::bigint::interruptible(&self.interrupt, &self.script_timeout, f) {
+        match crate::bigint::interruptible(&self.stop, f) {
             Some(v) => Ok(v),
             None => {
                 self.poll_interrupt()?;
@@ -5250,9 +5337,8 @@ impl Interp {
 
     pub(crate) fn sync_regex_poll(&self) {
         crate::regex::set_host_poll(
-            self.interrupt.clone(),
-            self.script_timeout.clone(),
-            self.heap_limit,
+            self.stop.clone(),
+            lumen_common::limits::HeapBudget::process(self.heap_limit),
         );
     }
 
@@ -5267,7 +5353,7 @@ impl Interp {
             }
             Abort::Deadline => self.make_error("Error", "Script execution timed out"),
             _ => {
-                if self.interrupt.is_some() {
+                if self.stop.has_interrupt() {
                     self.heap_limit_hit = true;
                     self.terminating = true;
                     return self.make_error("Error", "realm terminated");
@@ -5280,10 +5366,7 @@ impl Interp {
     /// The flag behind `script_timeout`, created on first use. A host thread sets it when a
     /// deadline passes; the host clears it once the bounded run has unwound.
     pub fn script_timeout_flag(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        let flag = self
-            .script_timeout
-            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-            .clone();
+        let flag = self.stop.deadline_flag();
         self.sync_regex_poll();
         flag
     }
@@ -5342,7 +5425,7 @@ impl Interp {
             return self.call_native_fast(f, this, args);
         }
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
+        if self.depth > self.max_depth || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -5385,7 +5468,7 @@ impl Interp {
     pub(crate) fn stack_guard(&mut self) -> bool {
         match crate::stack::headroom() {
             Some(room) => {
-                self.depth_limit = crate::stack::depth_cap(self.depth, room, MAX_EVAL_DEPTH);
+                self.depth_limit = crate::stack::depth_cap(self.depth, room, self.max_depth);
                 false
             }
             None => true,
@@ -5440,7 +5523,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
+        if self.depth > self.max_depth || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -5676,10 +5759,11 @@ impl Interp {
                 if !self.class_info.is_empty()
                     && self.class_info.contains_key(&(Gc::as_ptr(&obj) as usize))
                 {
-                    Err(self.throw(
-                        "TypeError",
-                        "Class constructor cannot be invoked without 'new'",
-                    ))
+                    let msg = format!(
+                        "Class constructor {} cannot be invoked without 'new'",
+                        user.func.name.as_deref().unwrap_or("")
+                    );
+                    Err(self.throw("TypeError", &msg))
                 } else {
                     self.call_user(&user.func, user.env.clone(), this, args, false, &obj)
                 }
@@ -6218,7 +6302,7 @@ impl Interp {
             return this;
         }
         match this {
-            Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
+            Value::Undefined | Value::Null => Value::Obj(self.name_global().clone()),
             other @ Value::Obj(_) => other,
             prim => crate::builtins::box_primitive_pub(self, prim),
         }
@@ -6239,7 +6323,10 @@ impl Interp {
         is_construct: bool,
     ) -> Result<Value, Abrupt> {
         let saved_strict = std::mem::replace(&mut self.strict, func.is_strict);
-        let saved_tco = std::mem::replace(&mut self.tco_ok, func.is_strict && !is_construct);
+        let saved_tco = std::mem::replace(
+            &mut self.tco_ok,
+            func.is_strict && !is_construct && crate::tail_calls_enabled(),
+        );
         let saved_field_init = self.in_field_init_code;
         let saved_agb = self.in_async_gen_body;
         if !func.is_arrow {
@@ -6509,7 +6596,7 @@ impl Interp {
                     this
                 } else {
                     match this {
-                        Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
+                        Value::Undefined | Value::Null => Value::Obj(self.name_global().clone()),
                         other @ Value::Obj(_) => other,
                         // Sloppy mode: a primitive `this` is boxed to its wrapper (ToObject).
                         prim => crate::builtins::box_primitive_pub(self, prim),
@@ -6641,7 +6728,11 @@ impl Interp {
         // `return f(...)` is a proper tail call only in a strict, ordinary, non-constructor body.
         let saved_tco = std::mem::replace(
             &mut self.tco_ok,
-            func.is_strict && !func.is_generator && !func.is_async && !is_construct,
+            func.is_strict
+                && !func.is_generator
+                && !func.is_async
+                && !is_construct
+                && crate::tail_calls_enabled(),
         );
         // (The bytecode tier intercepted eligible calls at the top of this function; anything
         // reaching here — construct calls, uncompilable bodies — runs on the tree-walker.)
@@ -7258,7 +7349,7 @@ impl Interp {
         new_target: Value,
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH || self.stack_guard() {
+        if self.depth > self.max_depth || self.stack_guard() {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -7550,12 +7641,7 @@ impl Interp {
         }
         for n in &lex_names {
             // HasVarDeclaration / HasLexicalDeclaration / HasRestrictedGlobalProperty.
-            let restricted = self
-                .global
-                .borrow()
-                .props
-                .get(n.as_str())
-                .is_some_and(|p| !p.configurable());
+            let restricted = self.global_own_attrs(n)?.is_some_and(|a| !a.0);
             if self.global_env.borrow().vars.contains_key(n.as_str())
                 || self.global_var_names.contains(n)
                 || restricted
@@ -7566,7 +7652,11 @@ impl Interp {
                 ));
             }
         }
-        let extensible = self.global.borrow().extensible;
+        let extensible = if self.global_proxy.is_some() {
+            self.vm_global_extensible().map_err(abrupt_value)?
+        } else {
+            self.global.borrow().extensible
+        };
         for name in &var_names {
             let is_func = probe
                 .borrow()
@@ -7579,12 +7669,7 @@ impl Interp {
                     format!("Identifier '{name}' has already been declared"),
                 ));
             }
-            let existing = self
-                .global
-                .borrow()
-                .props
-                .get(name.as_str())
-                .map(|p| (p.configurable(), p.accessor(), p.writable(), p.enumerable()));
+            let existing = self.global_own_attrs(name)?;
             if is_func {
                 // CanDeclareGlobalFunction.
                 let ok = match existing {
@@ -7611,6 +7696,10 @@ impl Interp {
         let new_vars = var_names;
         self.global_var_names.extend(new_vars.iter().cloned());
         self.hoist(body, &self.global_env.clone(), &[]);
+        if self.global_proxy.is_some() {
+            self.vm_bind_global_vars(new_vars)?;
+            return self.run_program_body(body);
+        }
         // The global Environment Record is object-backed: this script's `var`/`function` bindings
         // (which `hoist` just placed in `global_env`) become properties of the global object, so
         // they are visible as `globalThis.<name>` and writes stay in sync. Only the probe-computed
@@ -7649,6 +7738,48 @@ impl Interp {
                 _ => {}
             }
         }
+        self.run_program_body(body)
+    }
+
+    /// The `(configurable, accessor, writable, enumerable)` attributes of the global object's
+    /// own property `name` (through a `vm` context's global proxy when one is active).
+    fn global_own_attrs(&mut self, name: &str) -> Result<Option<(bool, bool, bool, bool)>, Value> {
+        let attrs = |p: &Property| (p.configurable(), p.accessor(), p.writable(), p.enumerable());
+        if self.global_proxy.is_some() {
+            return Ok(self.vm_global_own(name).map_err(abrupt_value)?.as_ref().map(attrs));
+        }
+        Ok(self.global.borrow().props.get(name).map(|p| attrs(&p)))
+    }
+
+    /// CreateGlobalFunctionBinding / CreateGlobalVarBinding for a script run in a `vm`
+    /// context: the hoisted bindings move to the global proxy (and so to the sandbox).
+    fn vm_bind_global_vars(&mut self, names: Vec<String>) -> Result<(), Value> {
+        for name in names {
+            let Some(binding) = self.global_env.borrow_mut().vars.remove(&name) else {
+                continue;
+            };
+            let existing = self.global_own_attrs(&name)?;
+            if matches!(binding.value, Value::Undefined) {
+                if existing.is_none() {
+                    self.vm_global_define(&name, Some(Value::Undefined), Some((true, true, false)))
+                        .map_err(abrupt_value)?;
+                }
+                continue;
+            }
+            let attrs = match existing {
+                None | Some((true, ..)) => Some((true, true, false)),
+                Some(_) => None,
+            };
+            self.vm_global_define(&name, Some(binding.value.clone()), attrs)
+                .map_err(abrupt_value)?;
+            let g = Value::Obj(self.name_global().clone());
+            self.set_member_recv(&g, &name, binding.value, g.clone())
+                .map_err(abrupt_value)?;
+        }
+        Ok(())
+    }
+
+    fn run_program_body(&mut self, body: &[Stmt]) -> Result<Value, Value> {
         // Top-level `let`/`const` are pre-declared in their temporal dead zone.
         self.declare_block_lexicals(body, &self.global_env.clone(), false);
         let env = self.global_env.clone();

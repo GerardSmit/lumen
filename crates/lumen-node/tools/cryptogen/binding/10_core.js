@@ -11,6 +11,7 @@ function cryptoError(Base, code, message) {
 // Bytes of a secret key argument: a secret KeyObjectHandle or a BufferSource.
 function secretBytes(key) {
   if (key instanceof KeyObjectHandle) return key._data;
+  if (key instanceof NativeKeyObject) return key[kNativeKeyHandle]._data;
   return bytesOf(key);
 }
 
@@ -67,7 +68,7 @@ class HashJob extends CryptoJob {
     super(mode);
     if (__rc.hashInfo(algorithm) === null) throw invalidDigest(algorithm);
     this.algorithm = algorithm;
-    this.data = bytesOf(data);
+    this.data = new Uint8Array(bytesOf(data));
     this.length = length;
   }
 
@@ -84,8 +85,8 @@ class HmacJob extends CryptoJob {
     this.signMode = signMode;
     this.hash = hash;
     this.key = secretBytes(key);
-    this.data = bytesOf(data);
-    this.signature = signature === undefined ? undefined : bytesOf(signature);
+    this.data = new Uint8Array(bytesOf(data));
+    this.signature = signature === undefined ? undefined : new Uint8Array(bytesOf(signature));
   }
 
   _run() {
@@ -100,7 +101,7 @@ class PBKDF2Job extends CryptoJob {
     super(mode);
     const info = __rc.hashInfo(digest);
     if (info === null || info[2]) throw invalidDigest(digest);
-    this.args = [digest, bytesOf(password), bytesOf(salt), iterations, keylen];
+    this.args = [digest, new Uint8Array(bytesOf(password)), new Uint8Array(bytesOf(salt)), iterations, keylen];
   }
 
   _run() {
@@ -118,7 +119,7 @@ class ScryptJob extends CryptoJob {
     if (!__rc.scryptCheck(N, r, p, maxmem)) {
       throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS", "Invalid scrypt params: memory limit exceeded");
     }
-    this.args = [bytesOf(password), bytesOf(salt), N, r, p, keylen];
+    this.args = [new Uint8Array(bytesOf(password)), new Uint8Array(bytesOf(salt)), N, r, p, keylen];
   }
 
   _run() {
@@ -138,7 +139,7 @@ class HKDFJob extends CryptoJob {
     if (length > 255 * hi[0]) {
       throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length");
     }
-    this.args = [hash, secretBytes(key), bytesOf(salt), bytesOf(info), length];
+    this.args = [hash, new Uint8Array(secretBytes(key)), new Uint8Array(bytesOf(salt)), new Uint8Array(bytesOf(info)), length];
   }
 
   _run() {
@@ -175,7 +176,15 @@ class RandomBytesJob extends CryptoJob {
   }
 
   _run() {
-    __rc.randomFill(this.target);
+    const target = this.target;
+    if (typeof SharedArrayBuffer === "function" && target.buffer instanceof SharedArrayBuffer) {
+      // The native op takes exclusive (non-shared) memory: fill a private copy, then store it.
+      const bytes = new Uint8Array(target.byteLength);
+      __rc.randomFill(bytes);
+      target.set(bytes);
+    } else {
+      __rc.randomFill(target);
+    }
     return undefined;
   }
 }

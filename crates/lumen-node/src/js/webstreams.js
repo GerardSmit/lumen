@@ -6562,3 +6562,5 @@ Object.defineProperty(globalThis, "TextEncoderStream", exposed("TextEncoderStrea
 Object.defineProperty(globalThis, "TextDecoderStream", exposed("TextDecoderStream"));
 Object.defineProperty(globalThis, "CompressionStream", exposed("CompressionStream"));
 Object.defineProperty(globalThis, "DecompressionStream", exposed("DecompressionStream"));
+// The module table, for --expose-internals (internals.js).
+__internals.set("webstreamsRequire", require);

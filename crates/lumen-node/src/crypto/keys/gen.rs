@@ -102,7 +102,7 @@ pub fn okp(kind: &str) -> KResult<AsymKey> {
         _ => return Err(SendError::new("Error", "Unsupported key type")),
     };
     let mut private = vec![0u8; len];
-    getrandom::getrandom(&mut private).map_err(|e| SendError::new("Error", e.to_string()))?;
+    lumen_os::proc::entropy(&mut private).map_err(|e| SendError::new("Error", e.to_string()))?;
     let public = okp_public(kind, &private)?;
     Ok(ctor(OkpKey { public, private: Some(private) }))
 }
@@ -116,12 +116,84 @@ pub fn safe_prime(bits: u32) -> KResult<BigUint> {
     if bits < 3 {
         return Ok(BigUint::from(3u8));
     }
+    if bits < 6 {
+        let one = BigUint::from(1u8);
+        loop {
+            let q = OsRng.gen_prime(bits as usize - 1);
+            let p = (&q << 1usize) + &one;
+            if p.bits() == bits as usize && probably_prime(&p, 20) {
+                return Ok(p);
+            }
+        }
+    }
+    // Every safe prime above 7 is 11 mod 12.
+    Ok(safe_prime_congruent(bits, 12, 11))
+}
+
+/// Odd primes below 2^15, for sieving safe-prime candidates.
+fn sieve_primes() -> Vec<u32> {
+    const LIMIT: usize = 1 << 15;
+    let mut composite = vec![false; LIMIT];
+    let mut out = Vec::new();
+    for i in 3..LIMIT {
+        if composite[i] || i % 2 == 0 {
+            continue;
+        }
+        out.push(i as u32);
+        let mut j = i * i;
+        while j < LIMIT {
+            composite[j] = true;
+            j += i;
+        }
+    }
+    out
+}
+
+/// A safe prime `p` (with `(p - 1) / 2` prime) of exactly `bits` bits (`bits >= 6`) and
+/// `p ≡ rem (mod add)`, where `add` is a multiple of 12 or 12 itself and `rem ≡ 11 (mod 12)`.
+/// Like OpenSSL's search: walk `p0, p0 + add, ...` from a random start, sieving out candidates
+/// where `p` or `(p - 1) / 2` has a small factor, then a base-2 Fermat test on `q` and `p`, and
+/// Miller-Rabin on `q`. Once `q` is prime, `2^(p-1) ≡ 1 (mod p)` proves `p` prime (Pocklington,
+/// as `gcd(2^2 - 1, p) = 1` for `p ≡ 2 (mod 3)`).
+pub fn safe_prime_congruent(bits: u32, add: u32, rem: u32) -> BigUint {
+    let primes = sieve_primes();
     let one = BigUint::from(1u8);
+    let two = BigUint::from(2u8);
+    let add_big = BigUint::from(add);
+    let bits = bits as usize;
     loop {
-        let q = OsRng.gen_prime(bits as usize - 1);
-        let p = (&q << 1usize) + &one;
-        if p.bits() == bits as usize && probably_prime(&p, 20) {
-            return Ok(p);
+        let r = OsRng.gen_biguint(bits) | (&one << (bits - 1)) | (&one << (bits - 2));
+        let p0 = &r - (&r % &add_big) + BigUint::from(rem);
+        if p0.bits() != bits {
+            continue;
+        }
+        let residues: Vec<u32> = primes
+            .iter()
+            .map(|&q| (&p0 % BigUint::from(q)).to_bytes_be().iter().fold(0u32, |acc, &b| (acc << 8) | b as u32))
+            .collect();
+        let steps: Vec<u32> = primes.iter().map(|&q| add % q).collect();
+        let mut k: u64 = 0;
+        while k < (1 << 20) {
+            let sieved = primes.iter().enumerate().any(|(i, &q)| {
+                let m = ((residues[i] as u64 + k * steps[i] as u64) % q as u64) as u32;
+                // p ≡ 0 divides p; p ≡ 1 means q | (p - 1) / 2. A prime p equal to the small prime itself
+                // cannot occur at these sizes.
+                m == 0 || m == 1
+            });
+            if !sieved {
+                let p = &p0 + BigUint::from(k) * &add_big;
+                if p.bits() != bits {
+                    break;
+                }
+                let q = &p >> 1usize;
+                if two.modpow(&(&q - &one), &q) == one
+                    && two.modpow(&(&p - &one), &p) == one
+                    && probably_prime(&q, 20)
+                {
+                    return p;
+                }
+            }
+            k += 1;
         }
     }
 }

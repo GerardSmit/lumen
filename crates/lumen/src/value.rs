@@ -7,6 +7,7 @@ use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use lumen_common::buffer::{self, ByteOrder, ElemKind};
 
 /// A handle to a heap object. Opaque on purpose: every engine site goes through this API rather
 /// than `Rc`/`RefCell` directly, so the storage underneath can move to a traced heap without
@@ -2011,17 +2012,32 @@ pub enum TaKind {
 }
 
 impl TaKind {
-    pub(crate) fn elsize(self) -> usize {
+    /// The shared element format (`lumen_common::buffer`) this array kind stores.
+    #[inline(always)]
+    pub(crate) fn elem(self) -> ElemKind {
         match self {
-            TaKind::I8 | TaKind::U8 | TaKind::U8Clamped => 1,
-            TaKind::I16 | TaKind::U16 | TaKind::F16 => 2,
-            TaKind::I32 | TaKind::U32 | TaKind::F32 => 4,
-            TaKind::F64 | TaKind::I64 | TaKind::U64 => 8,
+            TaKind::I8 => ElemKind::I8,
+            TaKind::U8 => ElemKind::U8,
+            TaKind::U8Clamped => ElemKind::U8Clamped,
+            TaKind::I16 => ElemKind::I16,
+            TaKind::U16 => ElemKind::U16,
+            TaKind::I32 => ElemKind::I32,
+            TaKind::U32 => ElemKind::U32,
+            TaKind::F16 => ElemKind::F16,
+            TaKind::F32 => ElemKind::F32,
+            TaKind::F64 => ElemKind::F64,
+            TaKind::I64 => ElemKind::I64,
+            TaKind::U64 => ElemKind::U64,
         }
     }
+    #[inline(always)]
+    pub(crate) fn elsize(self) -> usize {
+        self.elem().size()
+    }
     /// Whether elements are BigInt (BigInt64Array / BigUint64Array) rather than Number.
+    #[inline(always)]
     pub(crate) fn is_bigint(self) -> bool {
-        matches!(self, TaKind::I64 | TaKind::U64)
+        self.elem().is_64bit_int()
     }
     /// Constructor / prototype name, e.g. "Int8Array".
     pub(crate) fn name(self) -> &'static str {
@@ -2040,77 +2056,25 @@ impl TaKind {
             TaKind::U64 => "BigUint64Array",
         }
     }
-    /// Read a BigInt element (little-endian) from `b` (8 bytes) as an i128.
-    pub(crate) fn read_bigint(self, b: &[u8]) -> i128 {
-        let arr = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-        match self {
-            TaKind::U64 => u64::from_le_bytes(arr) as i128,
-            _ => i64::from_le_bytes(arr) as i128,
-        }
-    }
-    /// Convert a BigInt (i128) to this element's 8 little-endian bytes, wrapping mod 2^64.
-    pub(crate) fn write_bigint(self, n: i128) -> Vec<u8> {
-        (n as u64).to_le_bytes().to_vec()
-    }
-    /// Read one element (little-endian) from `b` (which must be `elsize()` bytes) as a Number.
+    /// Read one little-endian element from `b` as a Number.
+    #[inline(always)]
     pub(crate) fn read(self, b: &[u8]) -> f64 {
-        match self {
-            TaKind::I8 => b[0] as i8 as f64,
-            TaKind::U8 | TaKind::U8Clamped => b[0] as f64,
-            TaKind::I16 => i16::from_le_bytes([b[0], b[1]]) as f64,
-            TaKind::U16 => u16::from_le_bytes([b[0], b[1]]) as f64,
-            TaKind::I32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-            TaKind::U32 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-            TaKind::F16 => f16_to_f32(u16::from_le_bytes([b[0], b[1]])) as f64,
-            TaKind::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-            TaKind::F64 => f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
-            TaKind::I64 | TaKind::U64 => self.read_bigint(b) as f64,
-        }
+        buffer::load_f64(self.elem(), b, ByteOrder::Little)
     }
-    /// Convert a Number to this element type's little-endian bytes (JS integer-conversion rules).
-    pub(crate) fn write(self, n: f64) -> Vec<u8> {
-        let int = |n: f64| if n.is_finite() { n.trunc() as i64 } else { 0 };
-        // ToInt8..ToUint32 reduce modulo 2^bits; reducing modulo 2^32 first keeps the right low
-        // bits for every width (a plain `as i64` saturates at |n| >= 2^63: 1e20 must store 0 in
-        // an Int8Array, not -1).
-        let bits32 = |n: f64| {
-            if n.is_finite() {
-                n.trunc().rem_euclid(4294967296.0) as u32
-            } else {
-                0
-            }
-        };
-        match self {
-            TaKind::I8 | TaKind::U8 => vec![bits32(n) as u8],
-            TaKind::U8Clamped => {
-                // ToUint8Clamp: round-half-to-even (0.5 → 0, 1.5 → 2, 2.5 → 2), clamped to [0,255].
-                let c = if n.is_nan() || n <= 0.0 {
-                    0.0
-                } else if n >= 255.0 {
-                    255.0
-                } else {
-                    let f = n.floor();
-                    if f + 0.5 < n {
-                        f + 1.0
-                    } else if n < f + 0.5 {
-                        f
-                    } else if (f as i64) % 2 == 1 {
-                        f + 1.0
-                    } else {
-                        f
-                    }
-                };
-                vec![c as u8]
-            }
-            TaKind::I16 => (bits32(n) as i16).to_le_bytes().to_vec(),
-            TaKind::U16 => (bits32(n) as u16).to_le_bytes().to_vec(),
-            TaKind::I32 => (bits32(n) as i32).to_le_bytes().to_vec(),
-            TaKind::U32 => (bits32(n) as u32).to_le_bytes().to_vec(),
-            TaKind::F16 => f64_to_f16(n).to_le_bytes().to_vec(),
-            TaKind::F32 => (n as f32).to_le_bytes().to_vec(),
-            TaKind::F64 => n.to_le_bytes().to_vec(),
-            TaKind::I64 | TaKind::U64 => self.write_bigint(int(n) as i128),
-        }
+    /// Read one little-endian element from `b` as an exact integer.
+    #[inline]
+    pub(crate) fn read_int(self, b: &[u8]) -> i128 {
+        buffer::load_int(self.elem(), b, ByteOrder::Little)
+    }
+    /// Store a Number into `out` (JS integer-conversion rules), little-endian.
+    #[inline(always)]
+    pub(crate) fn write(self, n: f64, out: &mut [u8]) {
+        buffer::store_f64(self.elem(), n, out, ByteOrder::Little)
+    }
+    /// Store an integer (wrapping modulo 2^bits) into `out`, little-endian.
+    #[inline]
+    pub(crate) fn write_int(self, n: i128, out: &mut [u8]) {
+        buffer::store_int_wrapping(self.elem(), n, out, ByteOrder::Little)
     }
 }
 
@@ -2479,83 +2443,6 @@ pub fn set_data(obj: &Gc, key: &str, value: Value) {
 /// Convenience: define a non-enumerable builtin property by key/value.
 pub fn set_builtin(obj: &Gc, key: &str, value: Value) {
     obj.borrow_mut().props.insert(key, Property::builtin(value));
-}
-
-/// IEEE-754 half-precision (binary16) to single-precision conversion.
-pub fn f16_to_f32(h: u16) -> f32 {
-    let sign = (h as u32 & 0x8000) << 16;
-    let exp = (h >> 10) & 0x1f;
-    let mant = (h & 0x3ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign
-        } else {
-            // Subnormal: normalize into a single-precision normal number.
-            let mut e: i32 = -1;
-            let mut m = mant;
-            loop {
-                e += 1;
-                m <<= 1;
-                if m & 0x400 != 0 {
-                    break;
-                }
-            }
-            let m = m & 0x3ff;
-            sign | (((127 - 15 - e) as u32) << 23) | (m << 13)
-        }
-    } else if exp == 0x1f {
-        sign | 0x7f80_0000 | (mant << 13)
-    } else {
-        sign | (((exp as u32) + 127 - 15) << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
-}
-
-/// IEEE-754 double-precision to half-precision (binary16), round-to-nearest-even, rounding **once**.
-/// Going through `f32` first would double-round — e.g. `2^-25 + ε` collapses to an exact tie at
-/// `f32` and then rounds to zero instead of up to the smallest subnormal.
-pub fn f64_to_f16(value: f64) -> u16 {
-    let x = value.to_bits();
-    let sign = ((x >> 48) & 0x8000) as u16;
-    let exp = ((x >> 52) & 0x7ff) as i32;
-    let mant = x & 0x000f_ffff_ffff_ffff; // 52-bit fraction
-    if exp == 0x7ff {
-        return if mant != 0 {
-            sign | 0x7e00 // NaN
-        } else {
-            sign | 0x7c00 // infinity
-        };
-    }
-    if exp == 0 && mant == 0 {
-        return sign; // signed zero
-    }
-    let half_exp = exp - 1023 + 15;
-    if half_exp >= 0x1f {
-        return sign | 0x7c00; // overflow → infinity
-    }
-    if half_exp <= 0 {
-        // Subnormal half (or underflow to zero). Drop the low bits of the full significand,
-        // rounding to nearest even. `exp == 0` doubles are far below f16 range → they fall out as 0.
-        let m = if exp == 0 { mant } else { mant | (1u64 << 52) };
-        let shift = 43 - half_exp; // 52-bit fraction → 10-bit fraction, minus the exponent deficit
-        if shift >= 64 {
-            return sign;
-        }
-        let mut h = (m >> shift) as u16;
-        let round_bit = (m >> (shift - 1)) & 1;
-        let sticky = (m & ((1u64 << (shift - 1)) - 1)) != 0;
-        if round_bit != 0 && (sticky || (h & 1) != 0) {
-            h += 1;
-        }
-        return sign | h;
-    }
-    let mut h = (((half_exp as u32) << 10) | ((mant >> 42) as u32)) as u16;
-    let round_bit = (mant >> 41) & 1;
-    let sticky = (mant & ((1u64 << 41) - 1)) != 0;
-    if round_bit != 0 && (sticky || (h & 1) != 0) {
-        h = h.wrapping_add(1); // carry into exponent is intentional
-    }
-    sign | h
 }
 
 // ----- layout facts for the optimizing tier's inline reads (`bytecode::jit::layout`) ---------

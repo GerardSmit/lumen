@@ -224,6 +224,8 @@ On top of that:
 
 ```
 lumen          engine (std-only, zero-dep; `embed` feature gates the runtime API)
+lumen-common   engine-neutral code shared with lumen-py: bigint, Unicode, byte codecs, civil dates, tz tables; optional `hash` / `compress` features
+lumen-os       engine-neutral OS services: file-system primitives and the errno mapping
 lumen-host     substrate: OpState, ResourceTable, Extension, the thread-pool/callback primitives
 lumen-timers   setTimeout/setInterval/queueMicrotask/setImmediate
 lumen-fs       filesystem (sync + async)

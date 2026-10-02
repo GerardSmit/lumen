@@ -10,26 +10,9 @@
 //! total: adjacent smuggled high+low is the canonical form of those two code points' character,
 //! and a solitary smuggled scalar is always a lone surrogate.
 
-/// First smuggled scalar: encodes the lone surrogate U+D800.
-pub const SMUGGLE_BASE: u32 = 0x10F800;
-
-/// If `c` is a smuggled lone surrogate, the surrogate code unit it encodes.
-#[inline]
-pub fn smuggled(c: char) -> Option<u16> {
-    let v = c as u32;
-    if (SMUGGLE_BASE..SMUGGLE_BASE + 0x800).contains(&v) {
-        Some((v - SMUGGLE_BASE + 0xD800) as u16)
-    } else {
-        None
-    }
-}
-
-/// Smuggle a surrogate code unit (0xD800..=0xDFFF) into its private-use scalar.
-#[inline]
-pub fn smuggle(unit: u16) -> char {
-    debug_assert!((0xD800..0xE000).contains(&(unit as u32)));
-    char::from_u32(SMUGGLE_BASE + (unit as u32 - 0xD800)).unwrap()
-}
+pub use lumen_common::smuggle::{
+    paired_char, push_char_utf16, smuggle, smuggled, smuggled_high, smuggled_low, SMUGGLE_BASE,
+};
 
 /// The UTF-16 code units of `s` (smuggled scalars decode to their lone surrogates).
 pub fn units(s: &str) -> Vec<u16> {
@@ -226,25 +209,6 @@ pub fn well_formed(s: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
-}
-
-/// If `a` and `b` are a smuggled high+low pair, the real character they encode.
-pub fn paired_char(a: char, b: char) -> Option<char> {
-    let hi = smuggled_high(a)?;
-    let lo = smuggled_low(b)?;
-    char::from_u32(0x10000 + ((hi as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00))
-}
-
-/// Whether `c` is a smuggled HIGH surrogate (U+D800..U+DBFF).
-#[inline]
-fn smuggled_high(c: char) -> Option<u16> {
-    smuggled(c).filter(|u| (0xD800..0xDC00).contains(&(*u as u32)))
-}
-
-/// Whether `c` is a smuggled LOW surrogate (U+DC00..U+DFFF).
-#[inline]
-fn smuggled_low(c: char) -> Option<u16> {
-    smuggled(c).filter(|u| (0xDC00..0xE000).contains(&(*u as u32)))
 }
 
 /// String concatenation with the canonical-form fix-up: a smuggled high surrogate at the end of

@@ -19,7 +19,7 @@
 //! Errors are [`SendError`]s carrying Node's codes; OpenSSL-style messages
 //! (`error:<hex>:<library>::<reason>`) get their `library`/`reason` fields in the JS binding.
 
-use lumen::embed::{OpDesc, OpError};
+use lumen::embed::OpError;
 pub use lumen::embed::SendError;
 
 pub(crate) mod asn1;
@@ -32,9 +32,15 @@ mod pem;
 
 pub use curves::{with_ec_curve, EcCurve};
 pub use dh_groups::dh_group;
-pub use gen::safe_prime;
-pub use model::{okp_public, pss_hash, x448_mul, AsymKey, DhKey, DsaKey, EcKey, OkpKey, PssParams, RsaKey, RsaPrivateParts};
-pub use pem::{import_private, import_public, KeyCipher};
+pub use gen::{safe_prime, safe_prime_congruent};
+pub use model::{pss_hash, x448_mul, AsymKey, DsaKey, EcKey, PssParams, RsaKey};
+pub use pem::KeyCipher;
+
+pub(crate) use bindings::*;
+
+#[lumen_bind::module(name = "crypto")]
+pub(crate) mod bindings {
+use super::*;
 
 /// Result of key operations.
 pub type KResult<T> = Result<T, SendError>;
@@ -48,11 +54,11 @@ pub fn decoder_unsupported() -> SendError {
     ossl("1E08010C", "DECODER routines", "unsupported", "ERR_OSSL_UNSUPPORTED")
 }
 
-fn invalid_private() -> SendError {
+pub(crate) fn invalid_private() -> SendError {
     decoder_unsupported()
 }
 
-fn invalid_point() -> SendError {
+pub(crate) fn invalid_point() -> SendError {
     decoder_unsupported()
 }
 
@@ -70,7 +76,7 @@ pub fn bad_decrypt() -> SendError {
     ossl("1C800064", "Provider routines", "bad decrypt", "ERR_OSSL_BAD_DECRYPT")
 }
 
-fn unknown_cipher() -> SendError {
+pub(crate) fn unknown_cipher() -> SendError {
     SendError::new("Error", "Unknown cipher").with_code("ERR_CRYPTO_UNKNOWN_CIPHER")
 }
 
@@ -82,7 +88,7 @@ fn op_err(e: SendError) -> OpError {
 
 /// `KeyObjectHandle.init` for asymmetric input: `kind` 1 parses a public key (from public or
 /// private input), 2 a private key. Returns the SPKI / PKCS#8 DER the handle stores.
-#[lumen::op(name = "keyImport")]
+#[op(name = "keyImport")]
 fn key_import(kind: u32, data: &[u8], format: u32, enc: Option<u32>, passphrase: Option<&[u8]>) -> Result<Vec<u8>, OpError> {
     if kind == 2 {
         let k = pem::import_private(data, format, enc, passphrase).map_err(op_err)?;
@@ -93,19 +99,19 @@ fn key_import(kind: u32, data: &[u8], format: u32, enc: Option<u32>, passphrase:
 }
 
 /// The SPKI of the public half of a PKCS#8 private key.
-#[lumen::op(name = "keyToPublic")]
+#[op(name = "keyToPublic")]
 fn key_to_public(pkcs8: &[u8]) -> Result<Vec<u8>, OpError> {
     Ok(AsymKey::from_pkcs8_der(pkcs8).map_err(op_err)?.to_spki_der())
 }
 
 /// `asymmetricKeyType` of a handle's key.
-#[lumen::op(name = "keyType")]
+#[op(name = "keyType")]
 fn key_type(kind: u32, der: &[u8]) -> Result<&'static str, OpError> {
     Ok(AsymKey::from_handle(kind, der).map_err(op_err)?.type_name())
 }
 
 /// `keyDetail()` as `[name, value, ...]`: numbers in decimal, `publicExponent` in hex.
-#[lumen::op(name = "keyDetail")]
+#[op(name = "keyDetail")]
 fn key_detail(kind: u32, der: &[u8]) -> Result<Vec<String>, OpError> {
     let key = AsymKey::from_handle(kind, der).map_err(op_err)?;
     let mut out = Vec::new();
@@ -135,7 +141,7 @@ fn key_detail(kind: u32, der: &[u8]) -> Result<Vec<String>, OpError> {
 
 /// `KeyObjectHandle.export(format, type, cipher, passphrase)` for asymmetric keys: PEM text (as
 /// bytes) or DER.
-#[lumen::op(name = "keyExport")]
+#[op(name = "keyExport")]
 fn key_export(kind: u32, der: &[u8], format: u32, enc: u32, cipher: Option<String>, passphrase: Option<&[u8]>) -> Result<Vec<u8>, OpError> {
     let key = AsymKey::from_handle(kind, der).map_err(op_err)?;
     let out = if kind == 2 {
@@ -147,27 +153,27 @@ fn key_export(kind: u32, der: &[u8], format: u32, enc: u32, cipher: Option<Strin
 }
 
 /// `exportJwk` for asymmetric keys: the members as `[name, value, ...]`.
-#[lumen::op(name = "keyExportJwk")]
+#[op(name = "keyExportJwk")]
 fn key_export_jwk(kind: u32, der: &[u8], handle_rsa_pss: bool) -> Result<Vec<String>, OpError> {
     let key = AsymKey::from_handle(kind, der).map_err(op_err)?;
     jwk::export(&key, handle_rsa_pss).map_err(op_err)
 }
 
 /// `initJwk` for RSA / EC JWKs given as `[name, value, ...]`: `[kind, der]`.
-#[lumen::op(name = "keyImportJwk")]
+#[op(name = "keyImportJwk")]
 fn key_import_jwk(fields: Vec<String>, curve: Option<String>) -> Result<(u32, Vec<u8>), OpError> {
     let key = jwk::import(&fields, curve.as_deref()).map_err(op_err)?;
     Ok(if key.is_private() { (2, key.to_handle_der()) } else { (1, key.to_spki_der()) })
 }
 
 /// `initEDRaw`: the handle DER of a raw OKP key, or `null` when the bytes are not a valid key.
-#[lumen::op(name = "keyImportOkpRaw")]
+#[op(name = "keyImportOkpRaw")]
 fn key_import_okp_raw(name: &str, data: &[u8], private: bool) -> Option<Vec<u8>> {
     jwk::import_okp_raw(name, data, private).map(|k| k.to_handle_der())
 }
 
 /// `initECRaw`: the SPKI of a raw (SEC1) EC public point, or `null` when it is not on the curve.
-#[lumen::op(name = "keyImportEcRaw")]
+#[op(name = "keyImportEcRaw")]
 fn key_import_ec_raw(curve: &str, data: &[u8]) -> Option<Vec<u8>> {
     let curve = EcCurve::from_name(curve)?;
     let point = curve.normalize_point(data).ok()?;
@@ -175,7 +181,7 @@ fn key_import_ec_raw(curve: &str, data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// `equals` for two asymmetric handles of the same kind.
-#[lumen::op(name = "keyEquals")]
+#[op(name = "keyEquals")]
 fn key_equals(kind: u32, a: &[u8], b: &[u8]) -> bool {
     match (AsymKey::from_handle(kind, a), AsymKey::from_handle(kind, b)) {
         (Ok(a), Ok(b)) => a.public_eq(&b),
@@ -184,7 +190,7 @@ fn key_equals(kind: u32, a: &[u8], b: &[u8]) -> bool {
 }
 
 /// `checkEcKeyData`: whether an EC key's point (and scalar) are valid.
-#[lumen::op(name = "keyCheckEc")]
+#[op(name = "keyCheckEc")]
 fn key_check_ec(kind: u32, der: &[u8]) -> bool {
     match AsymKey::from_handle(kind, der) {
         Ok(AsymKey::Ec(k)) => match &k.d {
@@ -196,7 +202,7 @@ fn key_check_ec(kind: u32, der: &[u8]) -> bool {
 }
 
 /// WebCrypto raw export of a public key: the uncompressed EC point or the raw OKP key.
-#[lumen::op(name = "keyRawPublic")]
+#[op(name = "keyRawPublic")]
 fn key_raw_public(spki: &[u8]) -> Result<Vec<u8>, OpError> {
     match AsymKey::from_spki_der(spki).map_err(op_err)? {
         AsymKey::Ec(k) => Ok(k.point),
@@ -206,13 +212,13 @@ fn key_raw_public(spki: &[u8]) -> Result<Vec<u8>, OpError> {
 }
 
 /// Whether `name` is a cipher usable for private key encryption.
-#[lumen::op(name = "keyCipherKnown")]
+#[op(name = "keyCipherKnown")]
 fn key_cipher_known(name: &str) -> bool {
     KeyCipher::from_name(name).is_some()
 }
 
 /// `getCurves()`: the supported curves, sorted.
-#[lumen::op(name = "keyCurves")]
+#[op(name = "keyCurves")]
 fn key_curves() -> Vec<String> {
     let mut v: Vec<String> = curves::ALL.iter().map(|c| c.name().to_string()).collect();
     v.sort();
@@ -220,13 +226,13 @@ fn key_curves() -> Vec<String> {
 }
 
 /// Whether `name` names a supported EC curve.
-#[lumen::op(name = "keyCurveKnown")]
+#[op(name = "keyCurveKnown")]
 fn key_curve_known(name: &str) -> bool {
     EcCurve::from_name(name).is_some()
 }
 
 /// Whether `name` is a known MODP group.
-#[lumen::op(name = "keyDhGroupKnown")]
+#[op(name = "keyDhGroupKnown")]
 fn key_dh_group_known(name: &str) -> bool {
     dh_group(name).is_some()
 }
@@ -258,38 +264,38 @@ fn pss_config(pss: bool, hash: Option<&str>, mgf1: Option<&str>, salt: Option<i3
 }
 
 /// RSA / RSA-PSS key generation: `[spki, pkcs8]`.
-#[lumen::op(name = "keygenRsa")]
+#[op(name = "keygenRsa")]
 fn keygen_rsa(bits: u32, e: u32, pss: bool, hash: Option<String>, mgf1: Option<String>, salt: Option<i32>) -> Result<KeyPair, OpError> {
     let cfg = pss_config(pss, hash.as_deref(), mgf1.as_deref(), salt);
     gen::rsa(bits, e, cfg).map(pair).map_err(op_err)
 }
 
-#[lumen::op(async, name = "keygenRsaAsync")]
+#[op(async, name = "keygenRsaAsync")]
 fn keygen_rsa_async(bits: u32, e: u32, pss: bool, hash: Option<String>, mgf1: Option<String>, salt: Option<i32>) -> Result<KeyPair, SendError> {
     let cfg = pss_config(pss, hash.as_deref(), mgf1.as_deref(), salt);
     gen::rsa(bits, e, cfg).map(pair)
 }
 
 /// DSA key generation (`divisor` < 0 picks OpenSSL's default): `[spki, pkcs8]`.
-#[lumen::op(name = "keygenDsa")]
+#[op(name = "keygenDsa")]
 fn keygen_dsa(bits: u32, divisor: i32) -> Result<KeyPair, OpError> {
     gen::dsa(bits, u32::try_from(divisor).ok()).map(pair).map_err(op_err)
 }
 
-#[lumen::op(async, name = "keygenDsaAsync")]
+#[op(async, name = "keygenDsaAsync")]
 fn keygen_dsa_async(bits: u32, divisor: i32) -> Result<KeyPair, SendError> {
     gen::dsa(bits, u32::try_from(divisor).ok()).map(pair)
 }
 
 /// EC key generation on a named curve (`explicit` writes explicit parameters): `[spki, pkcs8]`.
-#[lumen::op(name = "keygenEc")]
+#[op(name = "keygenEc")]
 fn keygen_ec(curve: &str, explicit: bool) -> Result<KeyPair, OpError> {
     let c = EcCurve::from_name(curve).ok_or_else(|| OpError::type_error("Invalid EC curve name").with_code("ERR_CRYPTO_INVALID_CURVE"))?;
     Ok(pair(gen::ec(c, explicit)))
 }
 
 /// Ed25519 / Ed448 / X25519 / X448 key generation (`kind` as `asymmetricKeyType`).
-#[lumen::op(name = "keygenOkp")]
+#[op(name = "keygenOkp")]
 fn keygen_okp(kind: &str) -> Result<KeyPair, OpError> {
     gen::okp(kind).map(pair).map_err(op_err)
 }
@@ -305,39 +311,13 @@ fn dh_keygen(group: Option<String>, prime: Option<Vec<u8>>, prime_len: Option<u3
 }
 
 /// DH key generation from a MODP group name, a prime, or a prime length: `[spki, pkcs8]`.
-#[lumen::op(name = "keygenDh")]
+#[op(name = "keygenDh")]
 fn keygen_dh(group: Option<String>, prime: Option<Vec<u8>>, prime_len: Option<u32>, g: u32) -> Result<KeyPair, OpError> {
     dh_keygen(group, prime, prime_len, g).map_err(op_err)
 }
 
-#[lumen::op(async, name = "keygenDhAsync")]
+#[op(async, name = "keygenDhAsync")]
 fn keygen_dh_async(group: Option<String>, prime: Option<Vec<u8>>, prime_len: Option<u32>, g: u32) -> Result<KeyPair, SendError> {
     dh_keygen(group, prime, prime_len, g)
 }
-
-pub const OPS: &[&OpDesc] = lumen::ops![
-    key_import,
-    key_to_public,
-    key_type,
-    key_detail,
-    key_export,
-    key_export_jwk,
-    key_import_jwk,
-    key_import_okp_raw,
-    key_import_ec_raw,
-    key_equals,
-    key_check_ec,
-    key_raw_public,
-    key_cipher_known,
-    key_curves,
-    key_curve_known,
-    key_dh_group_known,
-    keygen_rsa,
-    keygen_rsa_async,
-    keygen_dsa,
-    keygen_dsa_async,
-    keygen_ec,
-    keygen_okp,
-    keygen_dh,
-    keygen_dh_async,
-];
+}

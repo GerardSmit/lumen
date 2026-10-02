@@ -25,7 +25,7 @@ impl Interp {
         if let Value::Obj(o) = v {
             if let Some(cls) = &o.cls {
                 if let Some((owner, m)) = self.lookup_mro_with_owner(cls, name) {
-                    if self.is_heap(&owner) {
+                    if self.is_heap(&owner) || self.dispatches_natively(&owner) {
                         return Some(m);
                     }
                 }
@@ -34,7 +34,20 @@ impl Interp {
         None
     }
 
+    fn dispatches_natively(&self, t: &Obj) -> bool {
+        matches!(&t.kind, Kind::Type(td) if td.flags.get() & TF_DISPATCH != 0)
+    }
+
     pub fn call_user_special(&mut self, v: &Value, m: &Value, args: Vec<Value>) -> R<Value> {
+        // A plain method binds to `v`: call it with `v` prepended, without a bound-method object.
+        if let Value::Obj(f) = m {
+            if matches!(&f.kind, Kind::Function(_)) || matches!(&f.kind, Kind::Native(nd) if nd.method) {
+                let mut a = Vec::with_capacity(args.len() + 1);
+                a.push(v.clone());
+                a.extend(args);
+                return self.call(m, a, Vec::new());
+            }
+        }
         let cls = self.type_of(v);
         let b = self.bind_descr(m, v, &cls)?;
         self.call(&b, args, Vec::new())
@@ -44,11 +57,14 @@ impl Interp {
         if let Value::Obj(_) = v {
             if let Some(m) = self.user_special(v, "__hash__") {
                 if m.is_none() {
-                    let t = self.type_name_of(v);
+                    let t = self.tp_name_of(v);
                     return Err(self.type_error(&format!("unhashable type: '{}'", t)));
                 }
+                // A native `tp_hash` slot returns the hash itself, not an int to hash again.
+                let slot = matches!(&m, Value::Obj(f) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some_and(|d| d.role == lumen_bind::Role::Proto("hash"))));
                 let r = self.call_user_special(v, &m, Vec::new())?;
                 return match r {
+                    Value::Int(i) if slot => Ok(if i == -1 { -2 } else { i }),
                     Value::Int(i) => Ok(hash_int(i)),
                     Value::Bool(b) => Ok(b as i64),
                     Value::Obj(ro) if matches!(ro.kind, Kind::Int(_)) => self.native_hash(&Value::Obj(ro)),
@@ -109,7 +125,10 @@ impl Interp {
                         let t = self.type_name_of(v);
                         return Err(self.type_error(&format!("unhashable type: '{}'", t)));
                     }
-                    Kind::Complex(re, im) => hash_float(*re).wrapping_add(hash_float(*im).wrapping_mul(1000003)),
+                    Kind::Complex(re, im) => match hash_float(*re).wrapping_add(hash_float(*im).wrapping_mul(1000003)) {
+                        -1 => -2,
+                        h => h,
+                    },
                     Kind::Slice(..) => {
                         let t = self.type_name_of(v);
                         return Err(self.type_error(&format!("unhashable type: '{}'", t)));

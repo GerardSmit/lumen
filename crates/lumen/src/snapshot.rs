@@ -2424,7 +2424,6 @@ mod tests {
             "events.js",
             "encoding.js",
             "url.js",
-            "streams.js",
             "fetch.js",
             "server.js",
             "crypto.js",

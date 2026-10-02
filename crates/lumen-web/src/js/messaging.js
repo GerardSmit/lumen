@@ -5,15 +5,37 @@
 // each BroadcastChannel receiver gets its own clone (mutation isolation, like the spec's
 // per-destination deserialize).
 
+function isMessagePortLike(value) {
+  if (value === null || typeof value !== "object") return false;
+  if (globalThis.__lumenPortClone?.isPort(value)) return true;
+  return value instanceof MessagePort || (typeof globalThis.MessagePort === "function" && value instanceof globalThis.MessagePort);
+}
+function invalidPortArg(name, value) {
+  const shown = value === null ? "null" : typeof value === "object" ? "an instance of Object" : `type ${typeof value} (${String(value)})`;
+  const err = new TypeError(`The "${name}" property must be an instance of MessagePort. Received ${shown}`);
+  err.code = "ERR_INVALID_ARG_TYPE";
+  return err;
+}
+
 class MessageEvent extends Event {
   constructor(type, init = {}) {
     super(type, init);
     init = init && typeof init === "object" ? init : {};
-    this.data = "data" in init ? init.data : null;
-    this.origin = "origin" in init ? String(init.origin) : "";
-    this.lastEventId = "lastEventId" in init ? String(init.lastEventId) : "";
-    this.source = "source" in init ? init.source : null;
-    this.ports = Object.freeze("ports" in init && init.ports ? [...init.ports] : []);
+    this.data = init.data === undefined ? null : init.data;
+    this.origin = init.origin === undefined ? "" : `${init.origin}`;
+    this.lastEventId = init.lastEventId === undefined ? "" : `${init.lastEventId}`;
+    const source = init.source === undefined ? null : init.source;
+    if (source !== null && !isMessagePortLike(source)) throw invalidPortArg("init.source", source);
+    this.source = source;
+    const portsInit = init.ports;
+    if (portsInit !== undefined && (portsInit === null || typeof portsInit[Symbol.iterator] !== "function")) {
+      throw new TypeError("ports is not iterable");
+    }
+    const ports = portsInit === undefined ? [] : [...portsInit];
+    for (let i = 0; i < ports.length; i++) {
+      if (!isMessagePortLike(ports[i])) throw invalidPortArg(`init.ports[${i}]`, ports[i]);
+    }
+    this.ports = Object.freeze(ports);
   }
 }
 

@@ -2,9 +2,18 @@
 
 use crate::limits::DEFAULT_INT_MAX_STR_DIGITS;
 use crate::vm::Interp;
+use lumen_common::limits::Deadline;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const USAGE: &str = "usage: lumen-py [--timeout=MS] [--max-memory=MB] [-X int_max_str_digits=N] <script.py> [args]\n";
+const USAGE: &str =
+    "usage: lumen-py [--timeout=MS] [--max-memory=MB] [-X int_max_str_digits=N] (<script.py> | -m module | -c command) [args]\n";
+
+/// What runs as `__main__`.
+enum Target<'a> {
+    Script(&'a str),
+    Module(&'a str),
+    Command(&'a str),
+}
 
 /// The `--timeout` budget in ms once it ran out (0 while it has not).
 static TIMED_OUT_AFTER: AtomicU64 = AtomicU64::new(0);
@@ -86,9 +95,20 @@ pub fn run_main(args: &[String]) -> i32 {
             return if msg.starts_with("Fatal") { 1 } else { 2 };
         }
     };
-    let Some(path) = opts.script_args.first() else {
-        it.write_stderr(USAGE);
-        return 2;
+    let target = match opts.script_args.first().map(String::as_str) {
+        Some(flag @ ("-m" | "-c")) => match opts.script_args.get(1) {
+            Some(arg) if flag == "-m" => Target::Module(arg),
+            Some(arg) => Target::Command(arg),
+            None => {
+                it.write_stderr(&format!("Argument expected for the {flag} option\n{USAGE}"));
+                return 2;
+            }
+        },
+        Some(path) => Target::Script(path),
+        None => {
+            it.write_stderr(USAGE);
+            return 2;
+        }
     };
     it.set_int_max_str_digits(opts.int_max_str_digits);
     if let Some(mb) = opts.max_memory_mb.filter(|&mb| mb > 0) {
@@ -97,9 +117,40 @@ pub fn run_main(args: &[String]) -> i32 {
     if let Some(ms) = opts.timeout_ms.filter(|&ms| ms > 0) {
         start_watchdog(&it, ms);
     }
-    sigint::install(&it);
-    it.set_argv(&opts.script_args);
-    let code = it.run_file(path);
+    crate::builtins::signalm::install_default_handlers(&mut it);
+    // `sys.path[0]` is the script's directory, or the working directory for -m and -c.
+    let first_dir = match target {
+        Target::Script(path) => {
+            let abs = it.platform.borrow_mut().canonicalize(path);
+            crate::platform::parent_dir(&abs)
+        }
+        _ => it.platform.borrow_mut().getcwd().unwrap_or_else(|_| ".".into()),
+    };
+    let mut dirs = vec![first_dir];
+    if let Ok(extra) = std::env::var("PYTHONPATH") {
+        dirs.extend(extra.split(':').filter(|d| !d.is_empty()).map(String::from));
+    }
+    it.set_path(&dirs);
+    let code = match target {
+        Target::Script(path) => {
+            it.set_argv(&opts.script_args);
+            it.run_file(path)
+        }
+        Target::Module(name) => {
+            // runpy replaces argv[0] with the module's path once it finds it.
+            let mut argv = vec!["-m".to_string()];
+            argv.extend(opts.script_args[2..].iter().cloned());
+            it.set_argv(&argv);
+            let name = name.replace('\\', "\\\\").replace('\'', "\\'");
+            it.run_source(&format!("import runpy\nrunpy._run_module_as_main('{name}')\n"), "<string>")
+        }
+        Target::Command(src) => {
+            let mut argv = vec!["-c".to_string()];
+            argv.extend(opts.script_args[2..].iter().cloned());
+            it.set_argv(&argv);
+            it.run_source(src, "<string>")
+        }
+    };
     it.flush_out();
     let ms = TIMED_OUT_AFTER.load(Ordering::SeqCst);
     if ms != 0 && it.was_interrupted() {
@@ -112,48 +163,10 @@ pub fn run_main(args: &[String]) -> i32 {
 /// A watchdog thread raises the interpreter's interrupt when the budget runs out.
 fn start_watchdog(it: &Interp, ms: u64) {
     let handle = it.interrupt_handle();
-    std::thread::Builder::new()
-        .name("lumen-py-timeout".to_string())
-        .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-            TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
-            handle.interrupt();
-        })
-        .expect("spawn timeout watchdog");
+    Deadline::start("lumen-py-timeout", std::time::Duration::from_millis(ms), move || {
+        TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
+        handle.interrupt();
+    })
+    .detach();
 }
 
-#[cfg(unix)]
-mod sigint {
-    use crate::vm::Interp;
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-    use std::sync::Arc;
-
-    static TARGET: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
-    const SIGINT: i32 = 2;
-
-    extern "C" {
-        fn signal(signum: i32, handler: usize) -> usize;
-    }
-
-    extern "C" fn on_sigint(_: i32) {
-        let p = TARGET.load(Ordering::Relaxed);
-        if !p.is_null() {
-            // The flag lives for the rest of the process (see `install`), so the pointer stays valid.
-            unsafe { (*p).store(true, Ordering::Relaxed) };
-        }
-    }
-
-    /// Maps Ctrl-C to the interpreter's interrupt, so it surfaces as `KeyboardInterrupt`.
-    pub fn install(it: &Interp) {
-        let flag: Arc<AtomicBool> = it.interrupt.clone();
-        TARGET.store(Arc::into_raw(flag) as *mut AtomicBool, Ordering::SeqCst);
-        unsafe { signal(SIGINT, on_sigint as *const () as usize) };
-    }
-}
-
-#[cfg(not(unix))]
-mod sigint {
-    use crate::vm::Interp;
-
-    pub fn install(_it: &Interp) {}
-}

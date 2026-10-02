@@ -20,15 +20,18 @@ use std::sync::mpsc;
 
 pub use lumen::bytecode::Tier;
 pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
+use lumen::embed::JsHost;
 pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 
-/// Compression codecs (zlib, Brotli, Zstandard) over maintained crates, shared by web
-/// CompressionStream, node:zlib and the Bun APIs.
-pub mod codec;
+/// Compression codecs (zlib, Brotli, Zstandard), shared by web CompressionStream, node:zlib and
+/// the Bun APIs.
+pub use lumen_common::compress as codec;
 
+/// The process clock behind `performance` and the event loop's milestone and idle counters.
+pub mod perf;
+pub mod sysfs;
 /// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
 /// `Date.now()`), where `std::time::Instant::now()` panics.
-pub mod sysfs;
 pub mod time;
 
 /// The in-memory virtual file system behind `node:fs` on targets without an OS file system, and
@@ -56,10 +59,28 @@ macro_rules! ops {
     };
 }
 
+/// Installs a `lumen_bind` module into a realm (see [`Extension::modules`]).
+pub type ModuleInit = fn(&mut Ctx) -> Result<(), Value>;
+
+/// [`ModuleInit`]: everything `#[lumen_bind::module]` `M` declares, as globals.
+pub fn globals<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    let g = ctx.global_object();
+    ctx.install_module::<M>(&g)
+}
+
+/// [`ModuleInit`]: `globalThis.<module name>` holding everything `M` declares.
+pub fn namespace<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    let ns = ctx.namespace_object(M::DESC.name_for("js"));
+    ctx.install_module::<M>(&ns)
+}
+
 /// A bundle of native ops + host-state init, exported one per op crate. Composing a runtime
 /// is `install(&mut engine, &[timers::extension(), fs::extension(), ...])`.
 pub struct Extension {
     pub name: &'static str,
+    /// `lumen_bind` modules to install ([`globals`] / [`namespace`]), before `globals` and
+    /// `namespaces`.
+    pub modules: &'static [ModuleInit],
     /// Installed as `globalThis.<name>` functions (e.g. `setTimeout`).
     pub globals: &'static [OpDecl],
     /// Installed as `globalThis.<ns>.<name>` namespace methods (e.g. a `__lumen_fs` ops
@@ -88,6 +109,7 @@ impl Extension {
     pub const fn new(name: &'static str) -> Extension {
         Extension {
             name,
+            modules: &[],
             globals: &[],
             namespaces: &[],
             state_init: None,
@@ -119,6 +141,11 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
         let t0 = timing.then(crate::time::Instant::now);
         if let Some(init) = ext.state_init {
             init(engine.ctx().op_state());
+        }
+        for m in ext.modules {
+            if m(engine.ctx()).is_err() {
+                panic!("extension {}: installing a module threw", ext.name);
+            }
         }
         for op in ext.globals {
             engine.define_global(op.name, op.len, op.f);
@@ -733,20 +760,7 @@ pub fn read_stdin_fd(ctx: &mut Ctx, buf: &mut [u8]) -> std::io::Result<usize> {
 /// nobody writes to cannot be cancelled, so it is only entered once it will not block.
 #[cfg(unix)]
 fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-    #[cfg(target_vendor = "apple")]
-    type NFds = std::ffi::c_uint;
-    #[cfg(not(target_vendor = "apple"))]
-    type NFds = std::ffi::c_ulong;
-    extern "C" {
-        fn poll(fds: *mut PollFd, nfds: NFds, timeout: i32) -> i32;
-    }
-    const POLLIN: i16 = 1;
+    use lumen_os::poll::{poll, PollFd, POLLIN};
     if ctx.interrupt_for_host().is_none() {
         return Ok(());
     }
@@ -757,15 +771,8 @@ fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
                 "realm terminated",
             ));
         }
-        let mut fd = PollFd {
-            fd: 0,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd; a negative result (EINTR, EBADF) falls through to the read,
-        // which reports it.
-        let ready = unsafe { poll(&mut fd, 1, 20) };
-        if ready != 0 {
+        // An error (EINTR, EBADF) falls through to the read, which reports it.
+        if poll(&mut [PollFd::new(0, POLLIN)], 20) != Ok(0) {
             return Ok(());
         }
     }
@@ -871,36 +878,3 @@ fn std_handles_not_inheritable() {
     });
 }
 
-/// Fill `buf` from the operating system's CSPRNG: `ProcessPrng` on Windows (what std itself
-/// uses), `/dev/urandom` elsewhere.
-pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        getrandom::getrandom(buf).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-    #[cfg(all(windows, not(target_arch = "wasm32")))]
-    {
-        #[link(name = "bcryptprimitives", kind = "raw-dylib")]
-        extern "system" {
-            fn ProcessPrng(data: *mut u8, len: usize) -> i32;
-        }
-        // Documented to always succeed (it returns TRUE); checked anyway.
-        if unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) } == 0 {
-            return Err(std::io::Error::other("ProcessPrng failed"));
-        }
-        Ok(())
-    }
-    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
-    {
-        use std::io::Read;
-        static URANDOM: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
-        let file = match URANDOM.get() {
-            Some(file) => file,
-            None => {
-                let opened = std::fs::File::open("/dev/urandom")?;
-                URANDOM.get_or_init(|| opened)
-            }
-        };
-        (&*file).read_exact(buf)
-    }
-}

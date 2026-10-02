@@ -1,6 +1,7 @@
 //! Builtin functions.
 
 use crate::ast::{BinOp, StmtKind};
+use crate::fmath;
 use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::UnOp;
 use crate::num::{to_num, Num};
@@ -44,30 +45,43 @@ fn print(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for print()", other))),
         }
     }
-    let mut out = String::new();
-    for (i, v) in a.iter().enumerate() {
-        if i > 0 {
-            out.push_str(&sep);
-        }
-        match v.as_str() {
-            Some(s) => out.push_str(s),
-            None => out.push_str(&it.str_of(v)?),
+    if file.is_none() {
+        match it.sys_attr("stdout") {
+            Some(f) if !f.is_none() => file = f,
+            _ => return Ok(Value::None),
         }
     }
-    out.push_str(&end);
-    if file.is_none() {
-        let sys_out = it.sys_attr("stdout");
-        match sys_out {
-            Some(f) if !matches!(&f, Value::Obj(o) if matches!(&o.kind, Kind::File(fd) if matches!(fd.borrow().mode, FileMode::Stdout))) => {
-                it.write_to(&f, &out)?;
+    let native = super::iom::textio::is_native_textio(it, &file);
+    if native {
+        let mut out = String::new();
+        for (i, v) in a.iter().enumerate() {
+            if i > 0 {
+                out.push_str(&sep);
             }
-            _ => it.write_stdout(&out),
+            match v.as_exact_str() {
+                Some(s) => out.push_str(s),
+                None => out.push_str(&it.str_of(v)?),
+            }
         }
-    } else {
+        out.push_str(&end);
         it.write_to(&file, &out)?;
+    } else {
+        for (i, v) in a.iter().enumerate() {
+            if i > 0 {
+                it.write_to(&file, &sep)?;
+            }
+            match v.as_exact_str() {
+                Some(s) => it.write_to(&file, s)?,
+                None => {
+                    let s = it.str_of(v)?;
+                    it.write_to(&file, &s)?;
+                }
+            }
+        }
+        it.write_to(&file, &end)?;
     }
     if flush {
-        it.flush_out();
+        it.call_method(&file, "flush", Vec::new())?;
     }
     Ok(Value::None)
 }
@@ -79,13 +93,10 @@ impl Interp {
         dict_get_str(&d, name)
     }
 
+    /// `f.write(s)`, directly for a native `TextIOWrapper`.
     pub fn write_to(&mut self, f: &Value, s: &str) -> R<()> {
-        if let Value::Obj(o) = f {
-            if let Kind::File(_) = &o.kind {
-                if o.cls.is_none() {
-                    return self.file_write(o, s);
-                }
-            }
+        if let Some(r) = super::iom::textio::write_native(self, f, s) {
+            return r.map(|_| ());
         }
         self.call_method(f, "write", vec![Value::str(s)])?;
         Ok(())
@@ -117,7 +128,12 @@ fn abs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             match &o.kind {
                 Kind::Int(b) => return Ok(Value::big(b.abs())),
                 Kind::Float(f) => return Ok(Value::Float(f.abs())),
-                Kind::Complex(r, i) => return Ok(Value::Float(r.hypot(*i))),
+                Kind::Complex(r, i) => {
+                    return match lumen_common::float::complex::abs(lumen_common::float::complex::Complex::new(*r, *i)) {
+                        Ok(f) => Ok(Value::Float(f)),
+                        Err(_) => Err(it.overflow_err("absolute value too large")),
+                    }
+                }
                 _ => {}
             }
         }
@@ -206,11 +222,8 @@ fn callable(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn chr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("chr", a, 1, 1)?;
     let n = it.index_of(&a[0])?;
-    match u32::try_from(n).ok().and_then(char::from_u32) {
-        Some(c) => {
-            let mut b = [0u8; 4];
-            Ok(Value::str(c.encode_utf8(&mut b)))
-        }
+    match u32::try_from(n).ok().and_then(lumen_common::smuggle::code_point_str) {
+        Some(c) => Ok(Value::str(&c)),
         None => Err(it.value_error("chr() arg not in range(0x110000)")),
     }
 }
@@ -221,13 +234,13 @@ fn ord(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         Value::Obj(o) => match &o.kind {
             Kind::Str(s) => {
                 if s.nchars == 1 {
-                    Ok(Value::Int(s.s.chars().next().map(|c| c as i64).unwrap_or(0)))
+                    Ok(Value::Int(lumen_common::smuggle::code_points(&s.s).next().unwrap_or(0) as i64))
                 } else {
                     Err(it.type_error(&format!("ord() expected a character, but string of length {} found", s.nchars)))
                 }
             }
             Kind::Bytes(b) if b.len() == 1 => Ok(Value::Int(b[0] as i64)),
-            Kind::ByteArray(b) if b.borrow().len() == 1 => Ok(Value::Int(b.borrow()[0] as i64)),
+            Kind::ByteArray(b) if b.len() == 1 => Ok(Value::Int(b.bytes()[0] as i64)),
             _ => {
                 let t = it.type_name_of(&a[0]);
                 Err(it.type_error(&format!("ord() expected string of length 1, but {} found", t)))
@@ -420,24 +433,28 @@ fn id(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn input(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("input", a, 0, 1)?;
-    if let Some(p) = a.first() {
-        let s = it.str_of(p)?;
-        it.write_stdout(&s);
-    }
-    it.flush_out();
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => Err(it.new_exc_str("EOFError", "EOF when reading a line")),
-        Ok(_) => {
-            if line.ends_with('\n') {
-                line.pop();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-            }
-            Ok(Value::string(line))
+    let mut streams = Vec::new();
+    for name in ["stdin", "stdout", "stderr"] {
+        match it.sys_attr(name) {
+            Some(f) if !f.is_none() => streams.push(f),
+            _ => return Err(it.new_exc_str("RuntimeError", &format!("input(): lost sys.{}", name))),
         }
     }
+    let (fin, fout, ferr) = (&streams[0], &streams[1], &streams[2]);
+    let _ = it.call_method(ferr, "flush", Vec::new());
+    if let Some(p) = a.first() {
+        let s = it.str_of(p)?;
+        it.write_to(fout, &s)?;
+    }
+    it.call_method(fout, "flush", Vec::new())?;
+    let line = it.call_method(fin, "readline", Vec::new())?;
+    let Some(s) = line.as_str() else {
+        return Err(it.type_error("object.readline() returned non-string"));
+    };
+    if s.is_empty() {
+        return Err(it.new_exc_str("EOFError", "EOF when reading a line"));
+    }
+    Ok(Value::str(s.strip_suffix('\n').unwrap_or(s)))
 }
 
 fn isinstance(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -536,6 +553,10 @@ fn pow(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             if it.user_special(&base, "__pow__").is_some() {
                 return it.call_method(&base, "__pow__", vec![exp, m]);
             }
+            let is_complex = |v: &Value| matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Complex(..)));
+            if is_complex(&base) || is_complex(&exp) {
+                return Err(it.value_error("complex modulo"));
+            }
             Err(it.type_error("pow() 3rd argument not allowed unless all arguments are integers"))
         }
     }
@@ -616,7 +637,7 @@ fn round(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
                     let s = format!("{:.*}", n as usize, f);
                     Ok(Value::Float(s.parse().unwrap_or(f)))
                 } else {
-                    let p = 10f64.powi((-n) as i32);
+                    let p = fmath::powi(10.0, (-n) as i32);
                     Ok(Value::Float(round_half_even(f / p) * p))
                 }
             }
@@ -629,9 +650,9 @@ fn round(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 }
 
 pub fn round_half_even(f: f64) -> f64 {
-    let r = f.round();
-    if (f - f.trunc()).abs() == 0.5 {
-        let t = f.trunc();
+    let r = fmath::round(f);
+    if (f - fmath::trunc(f)).abs() == 0.5 {
+        let t = fmath::trunc(f);
         if t % 2.0 == 0.0 {
             t
         } else {
@@ -759,17 +780,17 @@ impl Interp {
         let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(text, filename));
         let module = match parsed {
             Ok(m) => m,
-            Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, e.col)),
+            Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), text)),
         };
         if module.body.len() == 1 {
             if let StmtKind::Expr(e) = &module.body[0].kind {
                 return match crate::compile::compile_eval(e, filename) {
                     Ok(c) => Ok(c),
-                    Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, 0)),
+                    Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, None, text)),
                 };
             }
         }
-        Err(self.syntax_error("invalid syntax", filename, 1, 0))
+        Err(self.syntax_error("invalid syntax", filename, 1, None, text))
     }
 }
 
@@ -808,7 +829,7 @@ fn eval_exec(it: &mut Interp, a: &[Value], name: &str, is_eval: bool) -> R<Value
                 }
             }
             Kind::Bytes(b) => {
-                let s = String::from_utf8_lossy(b).into_owned();
+                let s = it.decode_source(b, "<string>")?;
                 if is_eval {
                     it.compile_eval_str(&s, "<string>")?
                 } else {
@@ -833,14 +854,78 @@ fn exec(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     eval_exec(it, a, "exec", false)
 }
 
+/// `PyUnicode_FSDecoder`: a `str`, `bytes` or path-like filename as text.
+fn fs_filename(it: &mut Interp, v: &Value) -> R<String> {
+    let p = crate::bind::path::fspath(it, v)?;
+    match &p {
+        Value::Obj(o) => match &o.kind {
+            Kind::Bytes(b) => Ok(crate::bind::path::bytes_path(b)),
+            _ => Ok(p.as_str().unwrap_or("").to_string()),
+        },
+        _ => Ok(String::new()),
+    }
+}
+
+const PY_CF_ONLY_AST: i64 = 0x400;
+
 fn compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("compile", a, kw, &["source", "filename", "mode", "flags", "dont_inherit", "optimize"], 3)?;
-    let src = it.str_arg(&b[0].clone().unwrap_or(Value::None), "compile() arg 1")?;
-    let filename = it.str_arg(&b[1].clone().unwrap_or(Value::None), "compile() arg 2")?;
+    let b = it.bind_args("compile", a, kw, &["source", "filename", "mode", "flags", "dont_inherit", "optimize", "_feature_version"], 3)?;
+    let mut source = b[0].clone().unwrap_or(Value::None);
+    let filename = fs_filename(it, &b[1].clone().unwrap_or(Value::None))?;
     let mode = it.str_arg(&b[2].clone().unwrap_or(Value::None), "compile() arg 3")?;
+    let flags = match &b[3] {
+        Some(v) => it.index_of(v)?,
+        None => 0,
+    };
+    let ast_mode = match mode.as_str() {
+        "exec" => super::astconv::Mode::Exec,
+        "eval" => super::astconv::Mode::Eval,
+        "single" => super::astconv::Mode::Single,
+        "func_type" if flags & PY_CF_ONLY_AST != 0 => {
+            return Err(it.value_error("compile() mode 'func_type' is not supported"));
+        }
+        "func_type" => return Err(it.value_error("compile() mode 'func_type' requires flag PyCF_ONLY_AST")),
+        _ => return Err(it.value_error("compile() mode must be 'exec', 'eval' or 'single'")),
+    };
+    if crate::bind::is_instance::<super::astm::_ast::AST>(it, &source) {
+        if flags & PY_CF_ONLY_AST != 0 {
+            return Ok(source);
+        }
+        // Compiling a tree goes through its source text: positions follow the unparsed text.
+        let ast = Value::Obj(it.import_module("ast")?);
+        let unparse = it.get_attr_str(&ast, "unparse")?;
+        source = it.call(&unparse, vec![source], Vec::new())?;
+    }
+    let src = match &source {
+        Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => o.as_str_kind().unwrap_or("").to_string(),
+        _ => match crate::builtins::memview::contiguous_bytes(it, &source)? {
+            Some(bytes) => it.decode_source(&bytes, &filename)?,
+            None => return Err(it.type_error("compile() arg 1 must be a string, bytes or AST object")),
+        },
+    };
+    if src.contains('\0') {
+        let e = it.syntax_error("source code string cannot contain null bytes", &filename, 0, None, "");
+        if let Some(d) = e.dict.borrow().as_ref() {
+            crate::vm::dict_set_str(d, "lineno", Value::None);
+        }
+        return Err(e);
+    }
+    if flags & PY_CF_ONLY_AST != 0 {
+        let text = if ast_mode == super::astconv::Mode::Eval { src.trim_start_matches([' ', '\t']) } else { &src };
+        let parsed = crate::limits::with_literal_digit_limit(it.int_max_str_digits, || crate::parser::parse(text, &filename));
+        let module = match parsed {
+            Ok(m) => m,
+            Err(e) => return Err(it.syntax_error(&e.msg, &filename, e.line, Some(e.col), text)),
+        };
+        if ast_mode == super::astconv::Mode::Eval && !matches!(module.body.as_slice(), [s] if matches!(s.kind, StmtKind::Expr(_))) {
+            return Err(it.syntax_error("invalid syntax", &filename, 1, None, text));
+        }
+        return super::astconv::module_to_py(it, &module, ast_mode);
+    }
     let code = match mode.as_str() {
         "eval" => it.compile_eval_str(&src, &filename)?,
-        "exec" | "single" => it.compile_source(&src, &filename)?,
+        "exec" => it.compile_source(&src, &filename)?,
+        "single" => it.compile_source_mode(&src, &filename, true)?,
         _ => return Err(it.value_error("compile() mode must be 'exec', 'eval' or 'single'")),
     };
     Ok(Value::Obj(Object::new(Kind::Code(code))))
@@ -859,7 +944,6 @@ pub fn init(it: &mut Interp) {
     let defs: &[(&'static str, NativeFn)] = &[
         ("print", print),
         ("len", len),
-        ("memoryview", super::bytesm::memoryview_fn()),
         ("abs", abs),
         ("all", all),
         ("any", any),

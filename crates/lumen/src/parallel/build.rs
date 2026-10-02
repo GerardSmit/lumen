@@ -32,7 +32,8 @@ impl Parcel {
             }
         }
         for pointer in &builder.transfer {
-            let bytes = interp.array_buffers.remove(pointer).expect("validated buffer").into_vec();
+            let bytes = interp.array_buffers.remove(pointer).expect("validated buffer")
+                .detach().expect("validated buffer is attached and unpinned");
             if let Some(object) = builder.memo.get(pointer) {
                 builder.parcel.side.buffers.insert(Gc::as_ptr(object) as usize, bytes);
             }
@@ -69,7 +70,7 @@ impl Builder {
             Value::Obj(object) => {
                 let pointer = Gc::as_ptr(object) as usize;
                 if let Some(copied) = self.memo.get(&pointer) { return Ok(Value::Obj(copied.clone())); }
-                if interp.proxies.contains_key(&pointer) || !matches!(object.borrow().call, crate::value::Callable::None) {
+                if interp.proxies.contains_key(&pointer) || !matches!(object.borrow().call, crate::value::Callable::None | crate::value::Callable::User(_)) {
                     return Err(interp.make_error("DataCloneError", "unsupported object"));
                 }
                 interp.materialize(object);
@@ -87,6 +88,13 @@ impl Builder {
                 };
                 self.memo.insert(pointer, copied.clone());
                 self.parcel.protos.push((copied.clone(), intrinsic));
+                let function = match &object.borrow().call {
+                    crate::value::Callable::User(user) => Some((user.func.clone(), user.env.clone())),
+                    _ => None,
+                };
+                if let Some((function, environment)) = function {
+                    self.copy_function(interp, object, &copied, function, environment, depth)?;
+                }
                 self.copy_slots(interp, object, &copied, pointer, depth)?;
                 let keys = object.borrow().props.ordered_keys();
                 for key in keys {
@@ -113,6 +121,14 @@ impl Builder {
     }
 
     fn intrinsic(&self, interp: &Interp, object: &Gc, pointer: usize) -> Result<Intrinsic, Value> {
+        if let crate::value::Callable::User(user) = &object.borrow().call {
+            return Ok(match (user.func.is_async, user.func.is_generator) {
+                (true, true) => Intrinsic::Extra("%AsyncGeneratorFunction.prototype%"),
+                (true, false) => Intrinsic::Extra("%AsyncFunction.prototype%"),
+                (false, true) => Intrinsic::Extra("%GeneratorFunction.prototype%"),
+                _ => Intrinsic::Function,
+            });
+        }
         if interp.generators.contains_key(&pointer) || interp.module_ns.contains_key(&pointer)
             || object.borrow().props.iter().any(|(key, _)| Interp::is_private_key(&key) && &*key != crate::value::EXOTIC_SLOT) {
             return Err(interp.make_error("DataCloneError", "object has unsupported internal slots"));
@@ -142,13 +158,68 @@ impl Builder {
                         "ArrayBuffer" | "SharedArrayBuffer" | "DataView" | "RegExp" | "Date" |
                         "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array" |
                         "Int32Array" | "Uint32Array" | "Float16Array" | "Float32Array" | "Float64Array" |
-                        "BigInt64Array" | "BigUint64Array" => Intrinsic::Extra(name),
+                        "BigInt64Array" | "BigUint64Array" | "%GeneratorPrototype%" | "%AsyncGeneratorPrototype%" => Intrinsic::Extra(name),
                         _ => return Err(interp.make_error("DataCloneError", "unsupported builtin object")),
                     }
                 } else { Intrinsic::Object }
             }
         };
         Ok(kind)
+    }
+
+    fn copy_function(&mut self, interp: &mut Interp, source: &Gc, target: &Gc, function: std::rc::Rc<crate::ast::Function>, environment: crate::interpreter::Env, depth: usize) -> Result<(), Value> {
+        if function.is_method {
+            return Err(interp.make_error("DataCloneError", "methods and accessors cannot be cloned"));
+        }
+        let capture = |name: &str| interp.make_error("TypeError", format!("parallel function captures '{name}' from the outer scope; pass it in args"));
+        if environment.borrow().under_with() { return Err(capture("with")); }
+        if function.is_arrow {
+            let flags = function.scan_flags();
+            for (flag, name) in [(crate::ast::SCAN_THIS, "this"), (crate::ast::SCAN_ARGUMENTS, "arguments"), (crate::ast::SCAN_NEW_TARGET, "new.target")] {
+                if flags & flag != 0 { return Err(capture(name)); }
+            }
+        }
+        let names = crate::bytecode::function_free_identifiers(&function)
+            .ok_or_else(|| interp.make_error("TypeError", "parallel function contains dynamic scope; pass helpers in args"))?;
+        for name in names {
+            let mut scope = Some(environment.clone());
+            while let Some(current) = scope {
+                if current.borrow().vars.contains_key(&name) { return Err(capture(&name)); }
+                scope = current.borrow().parent.clone();
+            }
+            if interp.global.borrow().props.get(&name).is_some_and(|property| property.enumerable()) {
+                return Err(capture(&name));
+            }
+        }
+        let text = match &function.source {
+            crate::ast::FnSource::Range { src, .. } => &**src,
+            _ => function.source.as_str().unwrap_or(""),
+        };
+        let snapshot = crate::snapshot::encode(&[crate::ast::Stmt::FuncDecl(function.clone())], text);
+        self.charge(interp, snapshot.len().saturating_add(text.len()))?;
+        let decoded = {
+            let _entered = HeapGuard::enter(&self.parcel.heap);
+            crate::snapshot::decode(&snapshot, text)
+        }.map_err(|message| interp.make_error("DataCloneError", message))?;
+        let crate::ast::Stmt::FuncDecl(decoded) = decoded.into_iter().next().expect("function snapshot") else { unreachable!() };
+        self.parcel.functions.push((target.clone(), decoded));
+        target.borrow_mut().is_constructor = source.borrow().is_constructor;
+        for key in ["name", "length", "prototype"] {
+            if !source.borrow().props.contains(key) { continue; }
+            let value = interp.get_member(&Value::Obj(source.clone()), key).map_err(|abrupt| match abrupt {
+                crate::interpreter::Abrupt::Throw(value) => value,
+                _ => interp.make_error("DataCloneError", "function property read failed"),
+            })?;
+            let value = self.copy(interp, &value, depth + 1)?;
+            let _entered = HeapGuard::enter(&self.parcel.heap);
+            if key == "prototype" {
+                if let Value::Obj(prototype) = &value {
+                    prototype.borrow_mut().props.insert("constructor", crate::value::Property::builtin(Value::Obj(target.clone())));
+                }
+            }
+            target.borrow_mut().props.insert(key, crate::value::Property::builtin(value));
+        }
+        Ok(())
     }
 
     fn copy_slots(&mut self, interp: &mut Interp, source: &Gc, target: &Gc, pointer: usize, depth: usize) -> Result<(), Value> {
@@ -193,7 +264,7 @@ impl Builder {
             let buffer = self.copy(interp, &buffer, depth + 1)?;
             self.parcel.side.views.insert(target_pointer, (Gc::as_ptr(buffer.as_obj().unwrap()) as usize, offset, length, track));
             let _entered = HeapGuard::enter(&self.parcel.heap);
-            target.borrow_mut().props.insert("__dv_buffer", crate::value::Property::builtin(buffer));
+            target.borrow_mut().props.insert("\u{0}dv_buffer", crate::value::Property::builtin(buffer));
         }
         if let Some(regex) = interp.regexps.get(&pointer) {
             let regex = crate::regex::Regex::new(&regex.source, &regex.flags).map_err(|message| interp.make_error("DataCloneError", message))?;
@@ -205,9 +276,9 @@ impl Builder {
             Exotic::Error => vec!["name", "message", "stack", "cause", "code"],
             _ => {
                 let mut keys = Vec::new();
-                if interp.array_buffers.contains_key(&pointer) { keys.extend(["__abMaxByteLength", "__abResizable", "__sab_id"]); }
+                if interp.array_buffers.contains_key(&pointer) { keys.extend(["\u{0}ab_max_byte_length", "\u{0}ab_resizable", "\u{0}sab_id"]); }
                 if interp.regexps.contains_key(&pointer) { keys.push("lastIndex"); }
-                if source.borrow().proto.as_ref().is_some_and(|proto| interp.extra_protos.get("Date").is_some_and(|date| Gc::as_ptr(date) == Gc::as_ptr(proto))) { keys.push("__date_ms"); }
+                if source.borrow().proto.as_ref().is_some_and(|proto| interp.extra_protos.get("Date").is_some_and(|date| Gc::as_ptr(date) == Gc::as_ptr(proto))) { keys.push("\u{0}date_ms"); }
                 keys
             },
         };

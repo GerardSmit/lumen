@@ -8,15 +8,7 @@ use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, set_data, Gc, Value};
 
-/// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
+use lumen_common::civil::days_from_civil;
 
 /// The epoch-milliseconds a Temporal value formats at (ISO calendar, UTC).
 fn temporal_to_ms(t: &crate::temporal::Temporal) -> f64 {
@@ -340,7 +332,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     let time_zone = {
         let v = ab(i.get_member(&options, "timeZone"))?;
         if matches!(v, Value::Undefined) {
-            "UTC".to_string()
+            crate::local_tz::id().to_string()
         } else {
             let raw = ab(i.to_string(&v))?.to_string();
             match canonicalize_time_zone(&raw) {
@@ -852,6 +844,7 @@ fn range_split(
 fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
     // An absolute instant (number/Date kind 0, Temporal.Instant kind 6) is shifted into the
     // formatter's time zone; Temporal wall-clock values (kinds 1-5) already carry their local time.
+    let instant_ms = ms;
     let ms = if kind == 0 || kind == 6 {
         match o.borrow().props.get("__dtf_tz").map(|p| p.value()) {
             Some(Value::Str(tz)) => {
@@ -1053,7 +1046,8 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
             parts.push(("day", dd.clone()));
         }
         if let Some(yy) = &year_str {
-            lit(&mut parts, ", ");
+            // CLDR en: "MMM d, y" but "MMM y".
+            lit(&mut parts, if day_str.is_some() { ", " } else { " " });
             match &year_cluster {
                 Some(c) => parts.extend(c.iter().cloned()),
                 None => parts.push(("year", yy.clone())),
@@ -1297,13 +1291,13 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
         }
     }
 
-    // Time-zone name (UTC only; the display form depends on the requested style).
+    // Time-zone name (the display form depends on the requested style).
     if let Some(style) = get("__dtf_tzname") {
         let tz = match o.borrow().props.get("__dtf_tz").map(|p| p.value()) {
             Some(Value::Str(s)) => s.to_string(),
             _ => "UTC".to_string(),
         };
-        let name = tz_display_name(&tz, &style);
+        let name = tz_display_name(&tz, &style, instant_ms);
         if !parts.is_empty() {
             lit(&mut parts, " ");
         }
@@ -1401,8 +1395,8 @@ fn day_period_word(h: u32, width: &str) -> &'static str {
     }
 }
 
-/// The time-zone display name for the (UTC) zone under a `timeZoneName` style.
-fn tz_display_name(tz: &str, style: &str) -> String {
+/// The time-zone display name of `tz` at instant `ms` under a `timeZoneName` style.
+fn tz_display_name(tz: &str, style: &str, ms: f64) -> String {
     if tz == "UTC" {
         return match style {
             "long" | "longGeneric" => "Coordinated Universal Time",
@@ -1426,36 +1420,11 @@ fn tz_display_name(tz: &str, style: &str) -> String {
             format!("GMT{sign}{h}:{m:02}")
         };
     }
-    // Named zones: the short styles render a generic GMT offset; the long styles use the CLDR
-    // standard-time metazone name where known, else the canonical identifier.
-    let canon = crate::tz::canonicalize(tz).unwrap_or(tz).to_string();
-    match style {
-        "short" | "shortOffset" | "shortGeneric" => {
-            let off = crate::tz::offset_at(&canon, 0).unwrap_or(0) as i64;
-            let sign = if off < 0 { "-" } else { "+" };
-            let a = off.abs();
-            let (h, m) = (a / 3600, (a % 3600) / 60);
-            if m == 0 {
-                format!("GMT{sign}{h}")
-            } else {
-                format!("GMT{sign}{h}:{m:02}")
-            }
-        }
-        _ => match canon.as_str() {
-            "Europe/Vienna" | "Europe/Berlin" | "Europe/Paris" | "Europe/Rome"
-            | "Europe/Madrid" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Prague"
-            | "Europe/Warsaw" | "Europe/Budapest" | "Europe/Stockholm" | "Europe/Oslo"
-            | "Europe/Copenhagen" | "Europe/Zurich" => "Central European Standard Time".to_string(),
-            "Europe/London" => "Greenwich Mean Time".to_string(),
-            "America/New_York" => "Eastern Standard Time".to_string(),
-            "America/Chicago" => "Central Standard Time".to_string(),
-            "America/Denver" => "Mountain Standard Time".to_string(),
-            "America/Los_Angeles" => "Pacific Standard Time".to_string(),
-            "Asia/Tokyo" => "Japan Standard Time".to_string(),
-            "Asia/Shanghai" => "China Standard Time".to_string(),
-            "Asia/Kolkata" => "India Standard Time".to_string(),
-            _ => canon,
-        },
+    // Named zones: the CLDR (en) metazone names, else a GMT offset, as at the formatted instant.
+    let canon = crate::tz::canonicalize(tz).unwrap_or(tz);
+    match crate::local_tz::zone_index(canon) {
+        Some(idx) => crate::local_tz::zone_display_name(idx, (ms / 1000.0).floor() as i64, style),
+        None => canon.to_string(),
     }
 }
 

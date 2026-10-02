@@ -3,22 +3,26 @@
 const __osInfo = __os.info();
 const EOL = __osInfo.platform === "win32" ? "\r\n" : "\n";
 
-// libuv errno descriptions for the codes getpriority/setpriority can raise.
-const __ERRNO_DESC = { EPERM: "operation not permitted", ESRCH: "no such process", EACCES: "permission denied", EINVAL: "invalid argument", UNKNOWN: "unknown error" };
 function systemError(syscall, info) {
   const code = info.code || "UNKNOWN";
-  const desc = __ERRNO_DESC[code] || "unknown error";
+  const desc = __uvErrmap().get(info.errno)?.[1] || "unknown error";
   const err = new Error(`A system error occurred: ${syscall} returned ${code} (${desc})`);
   err.code = "ERR_SYSTEM_ERROR";
   err.errno = info.errno;
+  Object.defineProperty(err, "name", { value: "SystemError", writable: true, configurable: true, enumerable: false });
   err.syscall = syscall;
   err.info = { errno: info.errno, code, message: desc, syscall };
   return err;
 }
 function validatePid(pid, name) {
-  if (typeof pid !== "number" || !Number.isInteger(pid)) {
-    const e = new TypeError(`The "${name}" argument must be of type number. Received ${typeof pid}`);
+  if (typeof pid !== "number") {
+    const e = new TypeError(`The "${name}" argument must be of type number. Received ${pid === null ? "null" : typeof pid === "object" ? "an instance of " + (pid.constructor?.name ?? "Object") : `type ${typeof pid} (${String(pid)})`}`);
     e.code = "ERR_INVALID_ARG_TYPE";
+    throw e;
+  }
+  if (!Number.isInteger(pid) || pid < -2147483648 || pid > 2147483647) {
+    const e = new RangeError(`The value of "${name}" is out of range. It must be an integer >= -2147483648 && <= 2147483647. Received ${pid}`);
+    e.code = "ERR_OUT_OF_RANGE";
     throw e;
   }
   return pid;
@@ -38,16 +42,11 @@ function __homedir() {
   return __envValue(...names) || __osInfo.homedir;
 }
 function __tmpdir() {
-  const win = __osInfo.platform === "win32";
-  let path = __envValue(...(win ? ["TEMP", "TMP"] : ["TMPDIR", "TMP", "TEMP"]));
-  if (path === undefined) return __osInfo.tmpdir;
-  const keep = win ? /^[A-Za-z]:\\?$/ : /^\/$/;
-  if (path.length > 1 && /[\\/]$/.test(path) && !keep.test(path)) path = path.slice(0, -1);
-  return path;
+  return __oscon.tmpdir(__envValue("TMPDIR"), __envValue("TMP"), __envValue("TEMP"),
+    __envValue("SystemRoot", "windir"));
 }
 
 const os = {
-  EOL,
   platform: () => __osInfo.platform,
   arch: () => __osInfo.arch,
   type: () => __osInfo.type,
@@ -93,12 +92,12 @@ const os = {
     let pid = 0, priority;
     if (args.length >= 2) { pid = validatePid(args[0], "pid"); priority = args[1]; }
     else priority = args[0];
-    if (typeof priority !== "number" || !Number.isInteger(priority)) {
-      const e = new TypeError(`The "priority" argument must be of type number. Received ${typeof priority}`);
+    if (typeof priority !== "number") {
+      const e = new TypeError(`The "priority" argument must be of type number. Received ${priority === null ? "null" : typeof priority === "object" ? "an instance of " + (priority.constructor?.name ?? "Object") : `type ${typeof priority} (${String(priority)})`}`);
       e.code = "ERR_INVALID_ARG_TYPE";
       throw e;
     }
-    if (priority < -20 || priority > 19) {
+    if (!Number.isInteger(priority) || priority < -20 || priority > 19) {
       const e = new RangeError(`The value of "priority" is out of range. It must be >= -20 && <= 19. Received ${priority}`);
       e.code = "ERR_OUT_OF_RANGE";
       throw e;
@@ -107,18 +106,37 @@ const os = {
     if (r && typeof r === "object") throw systemError("uv_os_setpriority", r);
   },
   totalmem: () => __osInfo.totalmem,
-  freemem: () => 0,
-  uptime: () => 0,
-  loadavg: () => [0, 0, 0],
-  userInfo: () => ({
-    username: (__osInfo.homedir.split(/[\\/]/).pop()) || "",
-    homedir: __homedir(),
-    shell: null,
-    uid: -1,
-    gid: -1,
-  }),
-  constants: { signals: {}, errno: {} },
+  freemem: () => __os.sysinfo().freemem,
+  uptime: () => __os.sysinfo().uptime,
+  loadavg: () => { const i = __os.sysinfo(); return [i.load1, i.load5, i.load15]; },
+  userInfo: (options) => {
+    const encoding = options == null ? undefined : options.encoding;
+    const { uid, gid, username, shell, homedir } = __os.sysinfo();
+    if (encoding === "buffer") {
+      return { uid, gid, username: Buffer.from(username), homedir: Buffer.from(homedir), shell: shell === null ? null : Buffer.from(shell) };
+    }
+    return { uid, gid, username, homedir, shell };
+  },
   devNull: __osInfo.platform === "win32" ? "\\\\.\\nul" : "/dev/null",
 };
+
+Object.defineProperty(os, "EOL", { get: () => EOL, enumerable: true, configurable: true });
+
+for (const name of ["arch", "availableParallelism", "endianness", "freemem", "homedir", "hostname", "platform", "release", "tmpdir", "totalmem", "type", "version", "machine", "uptime"]) {
+  const fn = os[name];
+  fn[Symbol.toPrimitive] = () => fn();
+}
+
+const part = (data) => Object.freeze(Object.assign({ __proto__: null }, data));
+const osConstants = Object.freeze({
+  __proto__: null,
+  UV_UDP_REUSEADDR: 4,
+  dlopen: part({ RTLD_LAZY: 1, RTLD_NOW: 2, RTLD_GLOBAL: 8, RTLD_LOCAL: 4 }),
+  errno: part(Object.fromEntries(__oscon.errno())),
+  signals: part(Object.fromEntries(__oscon.signals())),
+  priority: part({ PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
+  PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 }),
+});
+Object.defineProperty(os, "constants", { value: osConstants, enumerable: true, configurable: true, writable: true });
 
 __builtins.set("os", os);

@@ -13,20 +13,17 @@
 //! - [x] `URL` / `URLSearchParams` (see url.rs for the parser's declared subset — no IDNA)
 //! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
-//!   `lumen_host::fill_random`, no crates), `crypto.subtle.digest` (SHA-256 only)
+//!   `lumen_os::proc::entropy`, no crates), `crypto.subtle.digest` (SHA-256 only)
 //! - [x] `fetch` / `Headers` / `Request` / `Response` — HTTP and certificate-verified HTTPS
 //!   through lumen-tls (system OpenSSL on Unix, rustls on Windows)
 //! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
 //!   `serve((request) => Response)` convention of Deno/Bun/Workers). v1 is single-accept,
 //!   `Connection: close`, buffered bodies, http only — see `server.rs` for what's deferred.
-//! - [~] Streams: `ReadableStream` (default reader, async iteration, `getReader`/`cancel`/
-//!   `values`) backing Request/Response `.body` over the buffered bytes; no BYOB/byte streams,
-//!   `tee()`, piping, `WritableStream`, or `TransformStream` yet. Bodies remain buffered, so a
-//!   stream used as a body must produce its data synchronously.
-//! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
-//!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
-
-use lumen_host::time::Instant;
+//! - [x] Streams (`ReadableStream`, `WritableStream`, `TransformStream`, the text and compression
+//!   streams, queuing strategies) come from lumen-node's `webstreams.js` (Node's own WHATWG
+//!   streams), which the runtime installs alongside this crate; the glue here only consumes them.
+//!   Bodies remain buffered, so a stream used as a body must produce its data synchronously.
+//! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `crypto.subtle` beyond digest, `WebSocket`
 
 #[cfg(not(target_arch = "wasm32"))]
 use lumen_host::SpawnHandle;
@@ -77,6 +74,7 @@ mod wasm_ops;
 pub fn extension() -> Extension {
     Extension {
         name: "web",
+        modules: &[],
         globals: &[],
         namespaces: &[
             (
@@ -140,17 +138,6 @@ pub fn extension() -> Extension {
                 ],
             ),
             (
-                "__compress",
-                ops![
-                    "deflate" (1) => op_deflate,
-                    "inflate" (1) => op_inflate,
-                    "deflateRaw" (1) => op_deflate_raw,
-                    "inflateRaw" (1) => op_inflate_raw,
-                    "gzip" (1) => op_gzip,
-                    "gunzip" (1) => op_gunzip,
-                ],
-            ),
-            (
                 "__wasm",
                 ops![
                     "validate" (1) => wasm_ops::op_validate,
@@ -175,7 +162,6 @@ pub fn extension() -> Extension {
             ),
         ],
         state_init: Some(|state: &mut OpState| {
-            state.put(WebState::default());
             state.put(server::ServerRegistry::default());
             state.put(websocket::WsRegistry::default());
             state.put(sse::SseRegistry::default());
@@ -192,36 +178,13 @@ pub fn extension() -> Extension {
 /// text), loaded at boot (see `lumen_host::install`).
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
 
-#[derive(Default)]
-struct WebState {
-    /// `performance.now()`'s monotonic zero point and the wall-clock time (`timeOrigin`, Unix ms)
-    /// captured at the same instant — set together on first access.
-    start: Option<Instant>,
-    time_origin_ms: f64,
-}
-
-impl WebState {
-    /// The monotonic clock's zero point, initializing it (and the paired `timeOrigin`) on first use.
-    fn clock_start(&mut self) -> Instant {
-        if self.start.is_none() {
-            self.start = Some(Instant::now());
-            self.time_origin_ms = lumen_host::time::unix_ms();
-        }
-        self.start.unwrap()
-    }
-}
-
-fn op_perf_now(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let state = ctx.host_mut::<WebState>().expect("web state installed");
-    let start = state.clock_start();
-    Ok(Value::Num(start.elapsed().as_secs_f64() * 1000.0))
+fn op_perf_now(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(lumen_host::perf::now_ms()))
 }
 
 /// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
-fn op_time_origin(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let state = ctx.host_mut::<WebState>().expect("web state installed");
-    state.clock_start();
-    Ok(Value::Num(state.time_origin_ms))
+fn op_time_origin(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(lumen_host::perf::time_origin_ms()))
 }
 
 // ---- encoding ----
@@ -247,31 +210,8 @@ fn op_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    Ok(Value::from_string(smuggle_high_scalars(text)))
+    Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(text)))
 }
-
-/// Characters at or above U+10F800 collide with the lone-surrogate encoding, so lumen strings hold
-/// them as their smuggled surrogate pairs.
-fn smuggle_high_scalars(s: String) -> String {
-    const BASE: u32 = 0x10F800;
-    if !s.chars().any(|c| c as u32 >= BASE) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        let v = c as u32;
-        if v >= BASE {
-            let w = v - 0x10000;
-            out.extend(char::from_u32(BASE + (w >> 10)));
-            out.extend(char::from_u32(BASE + 0x400 + (w & 0x3FF)));
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Base64 of a Latin-1 string, or `null` when a char is past U+00FF.
 fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -283,62 +223,16 @@ fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
             Err(_) => return Ok(Value::Null),
         }
     }
-    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(B64[(n >> 18) as usize & 63]);
-        out.push(B64[(n >> 12) as usize & 63]);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] } else { b'=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] } else { b'=' });
-    }
-    Ok(Value::from_string(String::from_utf8(out).unwrap_or_default()))
+    Ok(Value::from_string(lumen_common::codec::base64_encode(&bytes, false, true)))
 }
 
 /// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
 fn op_atob(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
-    let mut data: Vec<u8> = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ') {
-            continue;
-        }
-        if !c.is_ascii() {
-            return Ok(Value::Null);
-        }
-        data.push(c as u8);
-    }
-    if data.len() % 4 == 0 {
-        for _ in 0..2 {
-            if data.last() == Some(&b'=') {
-                data.pop();
-            }
-        }
-    }
-    if data.len() % 4 == 1 {
-        return Ok(Value::Null);
-    }
-    let mut out = String::with_capacity(data.len() * 3 / 4);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &b in &data {
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return Ok(Value::Null),
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(char::from((acc >> bits) as u8));
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Ok(Value::from_string(out))
+    Ok(match lumen_common::codec::base64_decode_forgiving(s.as_bytes()) {
+        Some(bytes) => Value::from_string(bytes.into_iter().map(char::from).collect::<String>()),
+        None => Value::Null,
+    })
 }
 
 // ---- url ----
@@ -459,7 +353,7 @@ pub(crate) fn web_random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value
 
 fn random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
     let mut buf = vec![0u8; n];
-    lumen_host::fill_random(&mut buf)
+    lumen_os::proc::entropy(&mut buf)
         .map_err(|e| ctx.make_error("Error", format!("no randomness source: {e}")))?;
     Ok(buf)
 }
@@ -492,64 +386,20 @@ fn op_uuid(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value>
 }
 
 fn op_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    use sha2::Digest;
+    use lumen_common::hash::{digest, Algo};
     let name = str_arg(ctx, args, 0)?.unwrap_or_default();
     let v = args.get(1).unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "digest expects a BufferSource"));
     };
     let digest = match name.as_str() {
-        "SHA-1" => sha1::Sha1::digest(&bytes).to_vec(),
-        "SHA-256" => sha2::Sha256::digest(&bytes).to_vec(),
-        "SHA-384" => sha2::Sha384::digest(&bytes).to_vec(),
-        "SHA-512" => sha2::Sha512::digest(&bytes).to_vec(),
+        "SHA-1" => digest(Algo::Sha1, &bytes),
+        "SHA-256" => digest(Algo::Sha256, &bytes),
+        "SHA-384" => digest(Algo::Sha384, &bytes),
+        "SHA-512" => digest(Algo::Sha512, &bytes),
         _ => return Err(ctx.make_error("TypeError", format!("unsupported digest {name}"))),
     };
     ctx.make_uint8array(&digest)
-}
-
-// ---- compression (DEFLATE/zlib/gzip, backing CompressionStream/DecompressionStream) ----
-
-fn compress_op(ctx: &mut Ctx, args: &[Value], codec: fn(&[u8]) -> Vec<u8>) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "compression expects a BufferSource"));
-    };
-    ctx.make_uint8array(&codec(&bytes))
-}
-
-fn decompress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
-    codec: fn(&[u8]) -> Result<Vec<u8>, String>,
-) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "decompression expects a BufferSource"));
-    };
-    match codec(&bytes) {
-        Ok(out) => ctx.make_uint8array(&out),
-        Err(e) => Err(ctx.make_error("TypeError", e)),
-    }
-}
-
-fn op_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::zlib_compress)
-}
-fn op_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::zlib_decompress)
-}
-fn op_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::deflate)
-}
-fn op_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::inflate)
-}
-fn op_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::gzip_compress)
-}
-fn op_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::gzip_decompress)
 }
 
 // ---- fetch ----

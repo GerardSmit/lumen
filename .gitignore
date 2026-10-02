@@ -12,3 +12,6 @@
 /site/version.json
 examples/ejs/code.js
 __pycache__/
+# CPython 3.12 checkout (scripts/cpython-fetch.sh) and the test-suite report.
+/cpython/
+/cpython-test-report/

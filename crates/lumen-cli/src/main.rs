@@ -35,7 +35,23 @@ static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc
 /// stack before the guard fires. The reservation is virtual; pages are committed as touched.
 const MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
 
+/// Writing past RLIMIT_FSIZE must fail with EFBIG, not kill the process with SIGXFSZ.
+#[cfg(unix)]
+fn ignore_sigxfsz() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGXFSZ: i32 = 25;
+    const SIG_IGN: usize = 1;
+    // SAFETY: installing SIG_IGN for a signal has no handler code to run.
+    unsafe {
+        signal(SIGXFSZ, SIG_IGN);
+    }
+}
+
 fn main() {
+    #[cfg(unix)]
+    ignore_sigxfsz();
     let worker = std::thread::Builder::new()
         .name("lumen-main".to_string())
         .stack_size(MAIN_STACK_BYTES)
@@ -98,6 +114,28 @@ fn real_main() {
         };
         die(1, &format!("{argv0}: --experimental-permission is required for {flag}"));
     }
+    if let Some(mode) = opts.string("--unhandled-rejections") {
+        if !matches!(mode, "strict" | "warn" | "none" | "throw" | "warn-with-error-code") {
+            die(9, &format!("{argv0}: invalid value for --unhandled-rejections"));
+        }
+    }
+    if opts.flag("--test") {
+        let conflict = if opts.check {
+            Some("--check")
+        } else if opts.eval.is_some() {
+            Some("--eval")
+        } else if opts.interactive || force_repl {
+            Some("--interactive")
+        } else {
+            None
+        };
+        if let Some(other) = conflict {
+            die(9, &format!("{argv0}: either --test or {other} can be used, not both"));
+        }
+        if opts.string("--watch-path").is_some() {
+            die(9, &format!("{argv0}: --watch-path cannot be used in combination with --test"));
+        }
+    }
     if opts.check && opts.eval.is_some() {
         die(9, &format!("{argv0}: either --check or --eval can be used, not both"));
     }
@@ -123,13 +161,16 @@ fn real_main() {
     let threshold = opts.string("--tier-threshold").and_then(|n| n.parse::<u32>().ok());
     let expose_gc = opts.flag("--expose-gc");
 
-    let file = if opts.eval.is_none() && !opts.stdin_dash {
+    // `--test`: the operands are test files or directories, not a script.
+    let test_runner = opts.flag("--test") && opts.eval.is_none();
+    let file = if opts.eval.is_none() && !opts.stdin_dash && !test_runner {
         opts.rest.first().cloned()
     } else {
         None
     };
     let script_args: Vec<String> = match &file {
         Some(_) => opts.rest[1..].to_vec(),
+        None if opts.stdin_dash => std::iter::once("-".to_string()).chain(opts.rest.iter().cloned()).collect(),
         None => opts.rest.clone(),
     };
 
@@ -147,6 +188,12 @@ fn real_main() {
     runtime.set_cli_options(&opts.options_json());
     if expose_gc {
         runtime.expose_gc();
+    }
+    if opts.flag("--expose-externalize-string") {
+        runtime.expose_externalize_string();
+    }
+    if opts.flag("--trace-atomics-wait") {
+        runtime.trace_atomics_wait();
     }
     if let Some(t) = tier {
         runtime.engine().set_tier(t);
@@ -182,7 +229,16 @@ fn real_main() {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".to_string());
+    run_prelude(
+        &mut runtime,
+        "typeof __lumenPrepareMain === 'function' && __lumenPrepareMain()",
+    );
     run_preloads(&mut runtime, &opts, &cwd);
+
+    if test_runner {
+        run_source(&mut runtime, "__lumenRunTestMain()");
+        return;
+    }
 
     if opts.check {
         check_only(&mut runtime, file.as_deref(), module_input);
@@ -376,7 +432,7 @@ fn run_preloads(runtime: &mut Runtime, opts: &options::Parsed, cwd: &str) {
 }
 
 fn run_prelude(runtime: &mut Runtime, src: &str) {
-    match runtime.eval(src) {
+    match runtime.engine().eval(src, false) {
         Ok(Completion::Value(_)) => {}
         Ok(Completion::Throw { name, message }) => {
             if name.is_empty() {
@@ -499,7 +555,7 @@ fn eval_global(runtime: &mut Runtime, code: &str, name: &str, print: bool) {
          globalThis.module = m; globalThis.exports = m.exports; }} catch {{}} \
          globalThis.__filename = {name}; globalThis.__dirname = '.'; \
          try {{ for (const name of require('module').builtinModules) {{ \
-           if (name.startsWith('_') || name.includes('/') || name in globalThis) continue; \
+           if (name.startsWith('_') || name.includes('/') || (name in globalThis && name !== 'fs')) continue; \
            const setReal = (v) => Object.defineProperty(globalThis, name, {{ value: v, writable: true, enumerable: true, configurable: true }}); \
            Object.defineProperty(globalThis, name, {{ get() {{ const v = require(name); \
              Object.defineProperty(globalThis, name, {{ get: () => v, set: setReal, enumerable: false, configurable: true }}); return v; }}, \
@@ -507,6 +563,10 @@ fn eval_global(runtime: &mut Runtime, code: &str, name: &str, print: bool) {
         name = js_string_literal(name)
     );
     let _ = runtime.eval(&setup);
+    let base = std::env::current_dir()
+        .map(|dir| dir.join(name).to_string_lossy().into_owned())
+        .unwrap_or_else(|_| name.to_string());
+    runtime.install_module_loader(&base, true);
     if print {
         // Node's -p: the script's completion value is console.log'd at process exit.
         let wrapped = format!(
@@ -615,16 +675,13 @@ const TIMEOUT_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5
 /// finish within a few seconds does the watchdog exit the process itself.
 fn start_watchdog(runtime: &mut Runtime, ms: u64) {
     let handle = runtime.interrupt_handle();
-    std::thread::Builder::new()
-        .name("lumen-timeout".to_string())
-        .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-            TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
-            handle.interrupt();
-            std::thread::sleep(TIMEOUT_EXIT_GRACE);
-            exit_if_timed_out();
-        })
-        .expect("spawn timeout watchdog");
+    lumen::limits::Deadline::start("lumen-timeout", std::time::Duration::from_millis(ms), move || {
+        TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
+        handle.interrupt();
+        std::thread::sleep(TIMEOUT_EXIT_GRACE);
+        exit_if_timed_out();
+    })
+    .detach();
 }
 
 fn exit_if_timed_out() {

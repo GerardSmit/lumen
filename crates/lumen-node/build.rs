@@ -60,6 +60,10 @@ const JS_FILES: &[GlueFile] = &[
         wrap: true,
     },
     GlueFile {
+        name: "perf_hooks.js",
+        wrap: true,
+    },
+    GlueFile {
         name: "util.js",
         wrap: true,
     },
@@ -248,6 +252,16 @@ const JS_FILES: &[GlueFile] = &[
         name: "permission.js",
         wrap: true,
     },
+    // Node's internal modules and bindings, for --expose-internals (generated; see its header).
+    GlueFile {
+        name: "internals.js",
+        wrap: true,
+    },
+    // Node's test runner (node:test, node:test/reporters, --test; generated, see its header).
+    GlueFile {
+        name: "test_runner.js",
+        wrap: true,
+    },
     GlueFile {
         name: "module.js",
         wrap: false,
@@ -276,6 +290,7 @@ const LAZY: &[&str] = &[
     "typescript_strip.js",
     "async_hooks.js",
     "trace_events.js",
+    "perf_hooks.js",
     "util.js",
     "util_types.js",
     "crypto.js",
@@ -300,6 +315,8 @@ const LAZY: &[&str] = &[
     "vm.js",
     "repl.js",
     "permission.js",
+    "internals.js",
+    "test_runner.js",
     "cluster.js",
     "dgram.js",
     "wasi.js",

@@ -119,6 +119,7 @@
   // The handle is a thin shell over a native codec (`__zlib.handle*`). Like Node's, write() runs
   // the codec over one window pair and reports [availOut, availIn] in the write state; the async
   // form completes on a later turn.
+  let threadpoolTraceId = 0;
   class CompressionHandle {
     constructor(mode) {
       this._mode = mode;
@@ -154,8 +155,19 @@
 
     write(flush, input, inOff, inLen, out, outOff, outLen) {
       this.writeInProgress = true;
-      const error = this._write(flush, input, inOff, inLen, out, outOff, outLen);
+      let error;
+      let traceId = 0;
+      if (__traceEvent === null) {
+        error = this._write(flush, input, inOff, inLen, out, outOff, outLen);
+      } else {
+        traceId = ++threadpoolTraceId;
+        __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "b", "zlib", traceId);
+        __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "B", "zlib");
+        error = this._write(flush, input, inOff, inLen, out, outOff, outLen);
+        __traceEvent("node,node.threadpoolwork,node.threadpoolwork.sync", "E", "zlib");
+      }
       setImmediate(() => {
+        if (traceId !== 0) __traceEvent("node,node.threadpoolwork,node.threadpoolwork.async", "e", "zlib", traceId);
         this.writeInProgress = false;
         if (this._pendingClose) {
           this.close();

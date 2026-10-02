@@ -1,19 +1,14 @@
-// node:console — the Console class and the module object Node exposes.
+// node:console — the Console class and the module object Node exposes, after Node's
+// lib/internal/console/constructor.js.
 //
-// The global `console` (native `log`/`info`/`debug` → stdout sink, `warn`/`error` → stderr sink)
-// is built in Rust with just those five methods. Node's `console` module is the *same object* as
-// the global, carrying the full surface (assert/dir/group/count/time/table/trace/…) plus the
-// `Console` constructor. We reproduce that: augment the global console in place (so scripts using
-// the global get the full API too) and register it as the module, exactly as Node's identity holds
-// (`require('console') === globalThis.console`).
-//
-// The global `log`/`info`/`debug`/`warn`/`error` stay native: they format (util.format-compatible
-// for primitives, plain objects and arrays) and write by themselves while `process.stdout` /
-// `process.stderr` have not been materialised and no group is open, so a program that only logs
-// never loads util, stream or tty. Anything else (a patched or materialised stream, an open
-// group, values the native formatter declines) goes to the function registered with `cops.slow`
-// below, which formats through `util` and writes through the stream. Group indentation, counters, and timers are real; `profile`/`profileEnd`/`timeStamp` are inspector-timeline hooks that are inert
-// without an attached inspector — the honest behavior for a non-inspected process, matching Node.
+// The global `console` is built in Rust with native `log`/`info`/`debug` (stdout) and
+// `warn`/`error` (stderr). They format (util.format-compatible for the common cases) and write by
+// themselves while nothing JS-visible stands between them and the sinks: `process.stdout` /
+// `process.stderr` unmaterialised (or still the standard stream with nothing queued), no group
+// open and `console._stdout`/`_stderr` untouched. Otherwise the call goes to the function
+// registered with `cops.slow`, which runs Node's write path. Node's `console` module *is* the
+// global console, so the rest of the surface is added to that object in place, bound to it the
+// way Node binds its global console's methods.
 
 {
   // node:util loads on first use (see build.rs `LAZY`): plain-string logging never needs it.
@@ -21,218 +16,523 @@
   const util = () => (utilMod ??= __builtins.get("util"));
   const cops = process._console;
   __internals.set("console_native", cops);
-  const fmt = (args, opts) => {
-    if (!opts) {
-      const text = cops.format(...args);
-      if (text !== undefined) return text;
+
+  const kCounts = Symbol("counts");
+  const kGroupIndent = Symbol("kGroupIndent");
+  const kGroupIndentationWidth = Symbol("kGroupIndentWidth");
+  const kFormatForStderr = Symbol("kFormatForStderr");
+  const kFormatForStdout = Symbol("kFormatForStdout");
+  const kGetInspectOptions = Symbol("kGetInspectOptions");
+  const kColorMode = Symbol("kColorMode");
+  const kIsConsole = Symbol("kIsConsole");
+  const kWriteToConsole = Symbol("kWriteToConsole");
+  const kBindProperties = Symbol("kBindProperties");
+  const kBindStreamsEager = Symbol("kBindStreamsEager");
+  const kBindStreamsLazy = Symbol("kBindStreamsLazy");
+  const kUseStdout = Symbol("kUseStdout");
+  const kUseStderr = Symbol("kUseStderr");
+  const kMaxGroupIndentation = 1000;
+  const kSecond = 1000;
+  const kMinute = 60 * kSecond;
+  const kHour = 60 * kMinute;
+
+  const optionsMap = new WeakMap();
+  const noop = () => {};
+
+  function shouldColorize(stream) {
+    if (process.env.FORCE_COLOR !== undefined) {
+      return __builtins.get("tty").WriteStream.prototype.getColorDepth.call(stream, process.env) > 2;
     }
-    return util().formatWithOptions(opts || {}, ...args);
-  };
-  const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+    return !!(stream?.isTTY && (typeof stream.getColorDepth === "function" ? stream.getColorDepth() > 2 : true));
+  }
 
-  // Internal state lives under symbols so it never shows up in `Object.keys` (Node's console
-  // module and Console instances expose only their public method surface).
-  const kOut = Symbol("kWriteToStdout");
-  const kErr = Symbol("kWriteToStderr");
-  const kIndent = Symbol("kGroupIndent");
-  const kCounts = Symbol("kCounts");
-  const kTimes = Symbol("kTimes");
-  const kStdout = Symbol("kStdout");
-  const kStderr = Symbol("kStderr");
+  function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
+    // Called without `new`: construct (a custom instanceof covers the global console too).
+    if (new.target === undefined) return Reflect.construct(Console, arguments);
 
-  function withIndent(self, str) {
-    const gi = self[kIndent] || "";
-    return gi ? gi + String(str).replace(/\n/g, "\n" + gi) : String(str);
+    if (!options || typeof options.write === "function") {
+      options = { stdout: options, stderr: arguments[1], ignoreErrors: arguments[2] };
+    }
+    const {
+      stdout,
+      stderr = stdout,
+      ignoreErrors = true,
+      colorMode = "auto",
+      inspectOptions,
+      groupIndentation,
+    } = options;
+
+    if (!stdout || typeof stdout.write !== "function") throw new __errors.ERR_CONSOLE_WRITABLE_STREAM("stdout");
+    if (!stderr || typeof stderr.write !== "function") throw new __errors.ERR_CONSOLE_WRITABLE_STREAM("stderr");
+    if (typeof colorMode !== "boolean" && colorMode !== "auto") {
+      throw new __errors.ERR_INVALID_ARG_VALUE("colorMode", colorMode);
+    }
+    if (groupIndentation !== undefined) {
+      __validators.validateInteger(groupIndentation, "groupIndentation", 0, kMaxGroupIndentation);
+    }
+    if (inspectOptions !== undefined) {
+      __validators.validateObject(inspectOptions, "options.inspectOptions");
+      if (inspectOptions.colors !== undefined && options.colorMode !== undefined) {
+        throw new __errors.ERR_INCOMPATIBLE_OPTION_PAIR("options.inspectOptions.color", "colorMode");
+      }
+      optionsMap.set(this, inspectOptions);
+    }
+
+    // Bind the methods found through the instance (so a subclass's overrides win).
+    for (const key of Object.keys(Console.prototype)) {
+      this[key] = this[key].bind(this);
+      Object.defineProperty(this[key], "name", { value: key });
+    }
+    this[kBindStreamsEager](stdout, stderr);
+    this[kBindProperties](ignoreErrors, colorMode, groupIndentation);
+  }
+
+  const consolePropAttributes = { writable: true, enumerable: false, configurable: true };
+
+  // `globalThis.console instanceof Console` holds although the global was not constructed.
+  Object.defineProperty(Console, Symbol.hasInstance, {
+    value(instance) { return instance != null && instance[kIsConsole] === true; },
+  });
+
+  const kColorInspectOptions = { colors: true };
+  const kNoColorInspectOptions = {};
+
+  function createWriteErrorHandler(instance, streamSymbol) {
+    return (err) => {
+      // An error not yet emitted (the write callback ran first) would be emitted on the stream
+      // as an 'error' event: a one-off noop listener keeps it from becoming uncaught.
+      const stream = streamSymbol === kUseStdout ? instance._stdout : instance._stderr;
+      if (err != null && !stream?._writableState?.errorEmitted) {
+        if (typeof stream.listenerCount === "function" && stream.listenerCount("error") === 0) {
+          stream.once("error", noop);
+        }
+      }
+    };
+  }
+
+  Object.defineProperties(Console.prototype, {
+    [kBindStreamsEager]: {
+      ...consolePropAttributes,
+      value: function (stdout, stderr) {
+        Object.defineProperties(this, {
+          _stdout: { ...consolePropAttributes, value: stdout },
+          _stderr: { ...consolePropAttributes, value: stderr },
+        });
+      },
+    },
+    [kBindStreamsLazy]: {
+      ...consolePropAttributes,
+      // Read the streams from `object` only when used, so they are not created needlessly.
+      value: function (object) {
+        let stdout;
+        let stderr;
+        Object.defineProperties(this, {
+          _stdout: {
+            enumerable: false,
+            configurable: true,
+            get() { return stdout ||= object.stdout; },
+            set(value) { stdout = value; cops.setLive(1); },
+          },
+          _stderr: {
+            enumerable: false,
+            configurable: true,
+            get() { return stderr ||= object.stderr; },
+            set(value) { stderr = value; cops.setLive(2); },
+          },
+        });
+      },
+    },
+    [kBindProperties]: {
+      ...consolePropAttributes,
+      value: function (ignoreErrors, colorMode, groupIndentation = 2) {
+        Object.defineProperties(this, {
+          _stdoutErrorHandler: { ...consolePropAttributes, value: createWriteErrorHandler(this, kUseStdout) },
+          _stderrErrorHandler: { ...consolePropAttributes, value: createWriteErrorHandler(this, kUseStderr) },
+          _ignoreErrors: { ...consolePropAttributes, value: Boolean(ignoreErrors) },
+          _times: { ...consolePropAttributes, value: new Map() },
+          [kCounts]: { ...consolePropAttributes, value: new Map() },
+          [kColorMode]: { ...consolePropAttributes, value: colorMode },
+          [kIsConsole]: { ...consolePropAttributes, value: true },
+          [kGroupIndent]: { ...consolePropAttributes, value: "" },
+          [kGroupIndentationWidth]: { ...consolePropAttributes, value: groupIndentation },
+          [Symbol.toStringTag]: { writable: false, enumerable: false, configurable: true, value: "console" },
+        });
+      },
+    },
+    [kWriteToConsole]: {
+      ...consolePropAttributes,
+      value: function (streamSymbol, string) {
+        const ignoreErrors = this._ignoreErrors;
+        const groupIndent = this[kGroupIndent];
+        const useStdout = streamSymbol === kUseStdout;
+        const stream = useStdout ? this._stdout : this._stderr;
+        const errorHandler = useStdout ? this._stdoutErrorHandler : this._stderrErrorHandler;
+
+        if (groupIndent.length !== 0) {
+          if (string.includes("\n")) string = string.replace(/\n/g, `\n${groupIndent}`);
+          string = groupIndent + string;
+        }
+        string += "\n";
+
+        if (ignoreErrors === false) return stream.write(string);
+
+        // Errors may come synchronously (files, TTYs) or asynchronously (pipes): handle both.
+        try {
+          if (typeof stream.listenerCount === "function" && stream.listenerCount("error") === 0) stream.once("error", noop);
+          stream.write(string, errorHandler);
+        } catch (e) {
+          // Swallowing is wrong for a stack overflow: the caller must see it.
+          if (e instanceof RangeError && e.message === "Maximum call stack size exceeded") throw e;
+        } finally {
+          try { stream.removeListener("error", noop); } catch {}
+        }
+      },
+    },
+    [kGetInspectOptions]: {
+      ...consolePropAttributes,
+      value: function (stream) {
+        let color = this[kColorMode];
+        if (color === "auto") color = shouldColorize(stream);
+        const options = optionsMap.get(this);
+        if (options) {
+          if (options.colors === undefined) options.colors = color;
+          return options;
+        }
+        return color ? kColorInspectOptions : kNoColorInspectOptions;
+      },
+    },
+    [kFormatForStdout]: {
+      ...consolePropAttributes,
+      value: function (args) {
+        return util().formatWithOptions(this[kGetInspectOptions](this._stdout), ...args);
+      },
+    },
+    [kFormatForStderr]: {
+      ...consolePropAttributes,
+      value: function (args) {
+        return util().formatWithOptions(this[kGetInspectOptions](this._stderr), ...args);
+      },
+    },
+  });
+
+  function pad(value) {
+    return `${value}`.padStart(2, "0");
   }
 
   function formatTime(ms) {
-    if (ms >= 60000) {
-      const m = Math.floor(ms / 60000);
-      return `${m}m${((ms % 60000) / 1000).toFixed(3)}s`;
-    }
-    if (ms >= 1000) return `${(ms / 1000).toFixed(3)}s`;
-    return `${ms.toFixed(3)}ms`;
-  }
-
-  // --- console.table ---------------------------------------------------------------------------
-  function cellText(v) {
-    return util().inspect(v, { depth: 0, colors: false });
-  }
-  function renderTable(data, properties) {
-    if (data === null || typeof data !== "object") return fmt([data]);
-    const indexKey = "(index)";
-    const valuesKey = "Values";
-    const entries = Array.isArray(data)
-      ? data.map((v, i) => [String(i), v])
-      : data instanceof Map
-        ? [...data.entries()].map(([k, v]) => [typeof k === "object" ? cellText(k) : String(k), v])
-        : Object.entries(data);
-    const colSet = new Map();
-    let hasValues = false;
-    const rows = [];
-    for (const [idx, value] of entries) {
-      const cells = {};
-      if (value !== null && typeof value === "object") {
-        const keys = Array.isArray(value) ? value.map((_, i) => String(i)) : Object.keys(value);
-        for (const k of keys) {
-          if (properties && !properties.includes(k)) continue;
-          colSet.set(k, true);
-          cells[k] = cellText(value[k]);
+    let hours = 0;
+    let minutes = 0;
+    let seconds = 0;
+    if (ms >= kSecond) {
+      if (ms >= kMinute) {
+        if (ms >= kHour) {
+          hours = Math.floor(ms / kHour);
+          ms = ms % kHour;
         }
-      } else {
-        hasValues = true;
-        cells[valuesKey] = cellText(value);
+        minutes = Math.floor(ms / kMinute);
+        ms = ms % kMinute;
       }
-      rows.push({ idx, cells });
+      seconds = ms / kSecond;
     }
-    const cols = [...colSet.keys()];
-    if (hasValues) cols.push(valuesKey);
-    const header = [indexKey, ...cols];
-    const matrix = rows.map((r) => [r.idx, ...cols.map((c) => (c in r.cells ? r.cells[c] : ""))]);
-    const widths = header.map((h, i) => Math.max(h.length, ...matrix.map((row) => String(row[i] ?? "").length), 0));
-    const pad = (s, w) => {
-      s = String(s);
-      const total = w - s.length;
-      const left = Math.floor(total / 2);
-      return " ".repeat(left + 1) + s + " ".repeat(total - left + 1);
-    };
-    const rule = (l, m, r) => l + widths.map((w) => "─".repeat(w + 2)).join(m) + r;
-    const rowStr = (cells) => "│" + cells.map((c, i) => pad(c, widths[i])).join("│") + "│";
-    const out = [rule("┌", "┬", "┐"), rowStr(header), rule("├", "┼", "┤")];
-    for (const row of matrix) out.push(rowStr(row));
-    out.push(rule("└", "┴", "┘"));
-    return out.join("\n");
+    if (hours !== 0 || minutes !== 0) {
+      ({ 0: seconds, 1: ms } = seconds.toFixed(3).split("."));
+      const res = hours !== 0 ? `${hours}:${pad(minutes)}` : minutes;
+      return `${res}:${pad(seconds)}.${ms} (${hours !== 0 ? "h:m" : ""}m:ss.mmm)`;
+    }
+    if (seconds !== 0) return `${seconds.toFixed(3)}s`;
+    return `${Number(ms.toFixed(3))}ms`;
   }
 
-  // The method surface shared by the global console and every `Console` instance. `this[kOut]` /
-  // `this[kErr]` emit one already-formatted line (they own the trailing newline).
-  const methods = {
-    log(...args) { this[kOut](withIndent(this, fmt(args))); },
-    info(...args) { this[kOut](withIndent(this, fmt(args))); },
-    debug(...args) { this[kOut](withIndent(this, fmt(args))); },
-    dirxml(...args) { this[kOut](withIndent(this, fmt(args))); },
-    error(...args) { this[kErr](withIndent(this, fmt(args))); },
-    warn(...args) { this[kErr](withIndent(this, fmt(args))); },
-    dir(obj, options) { this[kOut](withIndent(this, util().inspect(obj, { colors: false, ...options }))); },
-    trace(...args) {
-      const label = args.length ? ": " + fmt(args) : "";
-      let frames = "";
-      try { throw new Error(); } catch (e) {
-        if (e.stack) frames = "\n" + e.stack.split("\n").slice(1).join("\n");
+  function timeLogImpl(self, name, label, data) {
+    const time = self._times.get(label);
+    if (time === undefined) {
+      process.emitWarning(`No such label '${label}' for console.${name}()`);
+      return false;
+    }
+    const duration = process.hrtime(time);
+    const ms = duration[0] * 1000 + duration[1] / 1e6;
+    const formatted = formatTime(ms);
+    if (data === undefined) self.log("%s: %s", label, formatted);
+    else self.log("%s: %s", label, formatted, ...data);
+    return true;
+  }
+
+  const traceConsole = (phase, name, ...rest) => {
+    if (__traceEvent !== null) __traceEvent("node,node.console", phase, name, 0, ...rest);
+  };
+
+  const keyKey = "Key";
+  const valuesKey = "Values";
+  const indexKey = "(index)";
+  const iterKey = "(iteration index)";
+
+  // lib/internal/cli_table.js
+  function cliTable(head, columns) {
+    const { getStringWidth } = __internals.get("util_inspect");
+    const renderRow = (row, columnWidths) => {
+      let out = "│ ";
+      for (let i = 0; i < row.length; i++) {
+        const cell = row[i];
+        const len = getStringWidth(cell);
+        const needed = columnWidths[i] - len;
+        out += cell + " ".repeat(needed);
+        if (i !== row.length - 1) out += " │ ";
       }
-      this[kErr](withIndent(this, "Trace" + label + frames));
+      return out + " │";
+    };
+    const rows = [];
+    const columnWidths = head.map((h) => getStringWidth(h));
+    const longestColumn = Math.max(...columns.map((a) => a.length));
+    for (let i = 0; i < head.length; i++) {
+      const column = columns[i];
+      for (let j = 0; j < longestColumn; j++) {
+        if (rows[j] === undefined) rows[j] = [];
+        const value = rows[j][i] = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "";
+        const width = columnWidths[i] || 0;
+        const counted = getStringWidth(value);
+        columnWidths[i] = Math.max(width, counted);
+      }
+    }
+    const divider = columnWidths.map((i) => "─".repeat(i + 2));
+    let result = `┌${divider.join("┬")}┐\n${renderRow(head, columnWidths)}\n├${divider.join("┼")}┤\n`;
+    for (const row of rows) result += `${renderRow(row, columnWidths)}\n`;
+    result += `└${divider.join("┴")}┘`;
+    return result;
+  }
+
+  const consoleMethods = {
+    log(...args) {
+      this[kWriteToConsole](kUseStdout, this[kFormatForStdout](args));
     },
-    assert(value, ...args) {
-      if (value) return;
-      const msg = args.length ? fmt(args) : "";
-      this[kErr](withIndent(this, "Assertion failed" + (msg ? ": " + msg : "")));
+
+    warn(...args) {
+      this[kWriteToConsole](kUseStderr, this[kFormatForStderr](args));
     },
-    // Behind a pipe (never a TTY) there is nothing to clear — a no-op, as in Node.
-    clear() {},
-    count(label = "default") {
-      label = String(label);
-      const c = this[kCounts] || (this[kCounts] = new Map());
-      const n = (c.get(label) || 0) + 1;
-      c.set(label, n);
-      if (__traceEvent !== null) __traceEvent("node,node.console", "C", `count::${label}`, 0, n);
-      this[kOut](withIndent(this, `${label}: ${n}`));
+
+    dir(object, options) {
+      this[kWriteToConsole](kUseStdout, util().inspect(object, {
+        customInspect: false,
+        ...this[kGetInspectOptions](this._stdout),
+        ...options,
+      }));
     },
-    countReset(label = "default") {
-      if (__traceEvent !== null) __traceEvent("node,node.console", "C", `count::${String(label)}`, 0, 0);
-      if (this[kCounts]) this[kCounts].delete(String(label));
-    },
-    group(...args) {
-      if (args.length) this.log(...args);
-      this[kIndent] = (this[kIndent] || "") + "  ";
-    },
-    groupCollapsed(...args) { this.group(...args); },
-    groupEnd() {
-      const gi = this[kIndent] || "";
-      this[kIndent] = gi.slice(0, Math.max(0, gi.length - 2));
-    },
+
     time(label = "default") {
-      label = String(label);
-      const t = this[kTimes] || (this[kTimes] = new Map());
-      if (t.has(label)) { this[kErr](withIndent(this, `Warning: Label '${label}' already exists for console.time()`)); return; }
-      t.set(label, nowMs());
-      if (__traceEvent !== null) __traceEvent("node,node.console", "b", `time::${label}`, 0);
+      label = `${label}`;
+      if (this._times.has(label)) {
+        process.emitWarning(`Label '${label}' already exists for console.time()`);
+        return;
+      }
+      traceConsole("b", `time::${label}`);
+      this._times.set(label, process.hrtime());
     },
+
     timeEnd(label = "default") {
-      label = String(label);
-      const t = this[kTimes];
-      if (!t || !t.has(label)) { this[kErr](withIndent(this, `Warning: No such label '${label}' for console.timeEnd()`)); return; }
-      const dur = nowMs() - t.get(label);
-      t.delete(label);
-      if (__traceEvent !== null) __traceEvent("node,node.console", "e", `time::${label}`, 0);
-      this[kOut](withIndent(this, `${label}: ${formatTime(dur)}`));
+      label = `${label}`;
+      const found = timeLogImpl(this, "timeEnd", label);
+      traceConsole("e", `time::${label}`);
+      if (found) this._times.delete(label);
     },
-    timeLog(label = "default", ...args) {
-      label = String(label);
-      const t = this[kTimes];
-      if (!t || !t.has(label)) { this[kErr](withIndent(this, `Warning: No such label '${label}' for console.timeLog()`)); return; }
-      const dur = nowMs() - t.get(label);
-      if (__traceEvent !== null) __traceEvent("node,node.console", "n", `time::${label}`, 0, { duration: dur });
-      this[kOut](withIndent(this, `${label}: ${formatTime(dur)}` + (args.length ? " " + fmt(args) : "")));
+
+    timeLog(label = "default", ...data) {
+      label = `${label}`;
+      timeLogImpl(this, "timeLog", label, data);
+      traceConsole("n", `time::${label}`);
     },
-    // Inspector-timeline hooks: inert without an attached inspector (as in a non-inspected Node).
-    timeStamp() {},
-    profile() {},
-    profileEnd() {},
-    table(tabularData, properties) { this[kOut](withIndent(this, renderTable(tabularData, properties))); },
-    // V8's async-stack Task. lumen tracks no async stacks, so run() simply invokes the callback.
-    createTask(name) {
-      return { name: String(name), run(fn, ...args) { return fn(...args); } };
+
+    trace(...args) {
+      const err = { name: "Trace", message: this[kFormatForStderr](args) };
+      Error.captureStackTrace(err, consoleMethods.trace);
+      this.error(err.stack);
+    },
+
+    assert(expression, ...args) {
+      if (!expression) {
+        args[0] = `Assertion failed${args.length === 0 ? "" : `: ${args[0]}`}`;
+        // The arguments are formatted again by warn().
+        Reflect.apply(this.warn, this, args);
+      }
+    },
+
+    // Clearing only makes sense when _stdout is a TTY.
+    clear() {
+      if (this._stdout.isTTY && process.env.TERM !== "dumb") {
+        const { cursorTo, clearScreenDown } = __builtins.get("readline");
+        cursorTo(this._stdout, 0, 0);
+        clearScreenDown(this._stdout);
+      }
+    },
+
+    count(label = "default") {
+      // Anything coercible to a string; a Symbol throws.
+      label = `${label}`;
+      const counts = this[kCounts];
+      let count = counts.get(label);
+      if (count === undefined) count = 1;
+      else count++;
+      counts.set(label, count);
+      traceConsole("C", `count::${label}`, count);
+      this.log(`${label}: ${count}`);
+    },
+
+    countReset(label = "default") {
+      const counts = this[kCounts];
+      if (!counts.has(label)) {
+        process.emitWarning(`Count for '${label}' does not exist`);
+        return;
+      }
+      traceConsole("C", `count::${label}`, 0);
+      counts.delete(`${label}`);
+    },
+
+    group(...data) {
+      if (data.length > 0) Reflect.apply(this.log, this, data);
+      this[kGroupIndent] += " ".repeat(this[kGroupIndentationWidth]);
+    },
+
+    groupEnd() {
+      this[kGroupIndent] = this[kGroupIndent].slice(0, this[kGroupIndent].length - this[kGroupIndentationWidth]);
+    },
+
+    table(tabularData, properties) {
+      if (properties !== undefined) __validators.validateArray(properties, "properties");
+      if (tabularData === null || typeof tabularData !== "object") return this.log(tabularData);
+
+      const types = __builtins.get("util/types");
+      const final = (k, v) => this.log(cliTable(k, v));
+      const isArray = (v) => Array.isArray(v) || types.isTypedArray(v) || __builtins.get("buffer").Buffer.isBuffer(v);
+      const _inspect = (v) => {
+        const depth = v !== null && typeof v === "object" && !isArray(v) && Object.keys(v).length > 2 ? -1 : 0;
+        const opt = {
+          depth,
+          maxArrayLength: 3,
+          breakLength: Infinity,
+          ...this[kGetInspectOptions](this._stdout),
+        };
+        return util().inspect(v, opt);
+      };
+      const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
+
+      const mapIter = types.isMapIterator(tabularData);
+      let isKeyValue = false;
+      let i = 0;
+      if (mapIter) {
+        const res = __node.previewEntries(tabularData, true);
+        tabularData = res[0];
+        isKeyValue = res[1];
+      }
+
+      if (isKeyValue || types.isMap(tabularData)) {
+        const keys = [];
+        const values = [];
+        let length = 0;
+        if (mapIter) {
+          for (; i < tabularData.length / 2; ++i) {
+            keys.push(_inspect(tabularData[i * 2]));
+            values.push(_inspect(tabularData[i * 2 + 1]));
+            length++;
+          }
+        } else {
+          for (const { 0: k, 1: v } of tabularData) {
+            keys.push(_inspect(k));
+            values.push(_inspect(v));
+            length++;
+          }
+        }
+        return final([iterKey, keyKey, valuesKey], [getIndexArray(length), keys, values]);
+      }
+
+      const setIter = types.isSetIterator(tabularData);
+      if (setIter) tabularData = __node.previewEntries(tabularData);
+
+      const setlike = setIter || mapIter || types.isSet(tabularData);
+      if (setlike) {
+        const values = [];
+        let length = 0;
+        for (const v of tabularData) {
+          values.push(_inspect(v));
+          length++;
+        }
+        return final([iterKey, valuesKey], [getIndexArray(length), values]);
+      }
+
+      const map = { __proto__: null };
+      let hasPrimitives = false;
+      const valuesKeyArray = [];
+      const indexKeyArray = Object.keys(tabularData);
+      for (; i < indexKeyArray.length; i++) {
+        const item = tabularData[indexKeyArray[i]];
+        const primitive = item === null || (typeof item !== "function" && typeof item !== "object");
+        if (properties === undefined && primitive) {
+          hasPrimitives = true;
+          valuesKeyArray[i] = _inspect(item);
+        } else {
+          const keys = properties || Object.keys(item);
+          for (const key of keys) {
+            map[key] ??= [];
+            if ((primitive && properties) || !Object.prototype.hasOwnProperty.call(item, key)) map[key][i] = "";
+            else map[key][i] = _inspect(item[key]);
+          }
+        }
+      }
+      const keys = Object.keys(map);
+      const values = Object.values(map);
+      if (hasPrimitives) {
+        keys.push(valuesKey);
+        values.push(valuesKeyArray);
+      }
+      keys.unshift(indexKey);
+      values.unshift(indexKeyArray);
+      return final(keys, values);
     },
   };
 
-  // `new Console(stdout[, stderr][, ignoreErrors])` or `new Console({ stdout, stderr, ... })`.
-  class Console {
-    constructor(options, stderrArg) {
-      let stdout, stderr;
-      if (options && typeof options === "object" && typeof options.write !== "function") {
-        stdout = options.stdout;
-        stderr = options.stderr || options.stdout;
-      } else {
-        stdout = options;
-        stderr = stderrArg || options;
-      }
-      if (!stdout || typeof stdout.write !== "function") {
-        throw new TypeError('The "stdout" argument must be an instance of a writable stream');
-      }
-      if (stderr && typeof stderr.write !== "function") {
-        throw new TypeError('The "stderr" argument must be an instance of a writable stream');
-      }
-      this[kStdout] = stdout;
-      this[kStderr] = stderr;
-      this[kIndent] = "";
-      const self = this;
-      Object.defineProperty(this, kOut, { value: (s) => self[kStdout].write(s + "\n") });
-      Object.defineProperty(this, kErr, { value: (s) => self[kStderr].write(s + "\n") });
-      // Node binds the methods as own properties on each instance.
-      for (const name of Object.keys(methods)) {
-        Object.defineProperty(this, name, { value: methods[name].bind(this), writable: true, enumerable: true, configurable: true });
-      }
+  for (const method of Reflect.ownKeys(consoleMethods)) Console.prototype[method] = consoleMethods[method];
+  Console.prototype.debug = Console.prototype.log;
+  Console.prototype.info = Console.prototype.log;
+  Console.prototype.dirxml = Console.prototype.log;
+  Console.prototype.error = Console.prototype.warn;
+  Console.prototype.groupCollapsed = Console.prototype.group;
+
+  // --- the global console ----------------------------------------------------------------------
+  const g = globalThis.console;
+  const NATIVE_KEEP = new Set(["log", "info", "debug", "warn", "error"]);
+  for (const prop of Reflect.ownKeys(Console.prototype)) {
+    if (prop === "constructor" || NATIVE_KEEP.has(prop)) continue;
+    const desc = Reflect.getOwnPropertyDescriptor(Console.prototype, prop);
+    if (typeof desc.value === "function") {
+      const name = desc.value.name;
+      desc.value = desc.value.bind(g);
+      Reflect.defineProperty(desc.value, "name", { value: name });
+    }
+    Reflect.defineProperty(g, prop, desc);
+  }
+  for (const name of NATIVE_KEEP) {
+    if (typeof g[name] === "function") {
+      Object.defineProperty(g, name, { value: g[name], writable: true, enumerable: true, configurable: true });
     }
   }
-  Object.assign(Console.prototype, methods);
-  // Callable without `new`, as Node's constructors are (see __legacyConstructor).
-  Console = __legacyConstructor(Console);
-  Console.prototype.Console = Console;
+  g[kBindStreamsLazy](process);
+  g[kBindProperties](true, "auto");
 
-  // --- augment the global console into the module object ---------------------------------------
-  // Node's `console` module *is* the global console (`require('console') === globalThis.console`).
-  // The global's log family (`log`/`info`/`debug`/`warn`/`error`) is native and kept as-is (only
-  // made enumerable so they show up as module keys). The remaining surface
-  // (dir/table/group/count/time/trace/assert/…) is added in JS on top.
-  const NATIVE_KEEP = new Set(["log", "info", "debug", "warn", "error"]);
-  const g = globalThis.console;
-  // Node's global console writes through `process.stdout.write` / `process.stderr.write`, so a
-  // program (or test) that replaces those methods captures console output. Until a stream is
-  // materialised there is nothing to have replaced and the native sink is written directly.
+  // The native fast path does not indent: it only needs to know a group is open.
+  for (const name of ["group", "groupEnd"]) {
+    const method = g[name];
+    const wrapped = {
+      [name](...args) {
+        const result = Reflect.apply(method, g, args);
+        cops.indent(g[kGroupIndent] !== "");
+        return result;
+      },
+    }[name].bind(g);
+    Object.defineProperty(wrapped, "name", { value: name });
+    Object.defineProperty(g, name, { value: wrapped, writable: true, enumerable: true, configurable: true });
+  }
+  Object.defineProperty(g, "groupCollapsed", { value: g.group, writable: true, enumerable: true, configurable: true });
+
+  // While a stream is the standard one with nothing queued, the native sink may stand in for it.
   const stdoutWrite = process.stdout && process.stdout.write;
   const stderrWrite = process.stderr && process.stderr.write;
-  // The native sink may stand in for the stream while the stream is the standard one (its write
-  // is the shared Writable write, or the runtime's raw one) and has nothing queued ahead.
   const isNativeSink = (stream, rawWrite) => {
     const w = stream && stream.write;
     if (w === rawWrite) return true;
@@ -240,42 +540,43 @@
     return !!S && w === S.Writable.prototype.write && stream._isStdio === true &&
       !stream.writableCorked && !stream.writableLength;
   };
-  const emit = (fd, s) => {
+  const slowWrite = (fd, args) => {
+    const useStdout = fd !== 2;
+    const kind = useStdout ? kUseStdout : kUseStderr;
     if (cops.live(fd)) {
-      const stream = fd === 1 ? process.stdout : process.stderr;
-      if (!isNativeSink(stream, fd === 1 ? stdoutWrite : stderrWrite) && stream && typeof stream.write === "function") {
-        stream.write(s + "\n");
+      const stream = useStdout ? g._stdout : g._stderr;
+      if (!isNativeSink(stream, useStdout ? stdoutWrite : stderrWrite)) {
+        g[kWriteToConsole](kind, useStdout ? g[kFormatForStdout](args) : g[kFormatForStderr](args));
         return;
       }
     }
-    cops.write(fd, s);
+    let string = useStdout ? g[kFormatForStdout](args) : g[kFormatForStderr](args);
+    const groupIndent = g[kGroupIndent];
+    if (groupIndent.length !== 0) {
+      if (string.includes("\n")) string = string.replace(/\n/g, `\n${groupIndent}`);
+      string = groupIndent + string;
+    }
+    cops.write(fd, string);
   };
-  const emitOut = (s) => emit(1, s);
-  const emitErr = (s) => emit(2, s);
-  Object.defineProperty(g, kOut, { value: emitOut, configurable: true });
-  Object.defineProperty(g, kErr, { value: emitErr, configurable: true });
-  Object.defineProperty(g, kIndent, { value: "", writable: true, configurable: true });
-  const define = (name, value) =>
-    Object.defineProperty(g, name, { value, writable: true, enumerable: true, configurable: true });
-  for (const name of NATIVE_KEEP) if (typeof g[name] === "function") define(name, g[name]);
-  // The native fast path does not indent: it only needs to know a group is open.
-  for (const name of ["group", "groupCollapsed", "groupEnd"]) {
-    const method = methods[name];
-    define(name, {
-      [name](...args) {
-        const result = method.apply(g, args);
-        cops.indent(g[kIndent] !== "");
-        return result;
-      },
-    }[name]);
-  }
-  cops.slow((fd, args) => (fd === 2 ? g[kErr] : g[kOut])(withIndent(g, fmt(args))));
-  for (const name of Object.keys(methods)) {
-    if (!NATIVE_KEEP.has(name) && name !== "group" && name !== "groupCollapsed" && name !== "groupEnd") define(name, methods[name]);
-  }
-  define("Console", Console);
-  // `console.context([label])` returns a fresh Console over this process's stdout/stderr.
-  define("context", (_label) => new Console(process.stdout, process.stderr));
+  cops.slow(slowWrite);
+
+  Object.defineProperty(g, "Console", { value: Console, writable: true, enumerable: true, configurable: true });
+  // Inspector-timeline hooks: inert without an attached inspector, as in a non-inspected Node.
+  const inert = (name) => Object.defineProperty(g, name, {
+    value: { [name]() {} }[name], writable: true, enumerable: true, configurable: true,
+  });
+  inert("timeStamp");
+  inert("profile");
+  inert("profileEnd");
+  Object.defineProperty(g, "context", {
+    value: function context(_label) { return new Console(process.stdout, process.stderr); },
+    writable: true, enumerable: true, configurable: true,
+  });
+  // V8's async-stack Task. lumen tracks no async stacks, so run() simply invokes the callback.
+  Object.defineProperty(g, "createTask", {
+    value: function createTask(name) { return { name: String(name), run(fn, ...args) { return fn(...args); } }; },
+    writable: true, enumerable: true, configurable: true,
+  });
 
   __builtins.set("console", g);
 }

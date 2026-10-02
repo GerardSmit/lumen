@@ -9,6 +9,7 @@ use crate::ast::*;
 use crate::interpreter::name_cache::NameRes;
 use crate::interpreter::*;
 use crate::value::*;
+use lumen_common::limits::size;
 use std::rc::Rc;
 
 impl Interp {
@@ -1941,7 +1942,7 @@ impl Interp {
     pub(crate) fn get_unscoped(&mut self, name: &str) -> Result<Value, Abrupt> {
         // Fast path: an own data property of an ordinary global (the overwhelmingly common
         // resolution for builtins and script-level bindings) — one hash lookup, no trap walk.
-        if self.ordinary_get_ptr(Gc::as_ptr(&self.global) as usize) {
+        if self.ordinary_get_ptr(Gc::as_ptr(self.name_global()) as usize) {
             let b = self.global.borrow();
             if matches!(b.exotic, crate::value::Exotic::None) {
                 if let Some(p) = b.props.get(name) {
@@ -1955,7 +1956,7 @@ impl Interp {
         }
         // Fall back to a property of the global object (where builtins live). The lookup is the
         // full trap-aware [[HasProperty]]: the global's prototype may be (or contain) a proxy.
-        let g = Value::Obj(self.global.clone());
+        let g = Value::Obj(self.name_global().clone());
         if self.js_has_property(&g, name)? {
             return self.get_member(&g, name);
         }
@@ -2138,6 +2139,11 @@ impl Interp {
         }
         // Global code: the var binding lives as a global-object property (re-created when a
         // deletable eval-made one was deleted).
+        if self.global_proxy.is_some() {
+            let g = Value::Obj(self.name_global().clone());
+            let _ = self.set_member_recv(&g, name, val.clone(), g.clone());
+            return;
+        }
         let mut g = self.global.borrow_mut();
         if let Some(p) = g.props.get_mut(name) {
             if p.writable() && !p.accessor() {
@@ -2275,14 +2281,14 @@ impl Interp {
         }
         // A declared global `var`/`function` lives as a property of the global object (the check
         // is the trap-aware [[HasProperty]] — the global's proto chain may contain a proxy).
-        if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
-            return self.set_member(&Value::Obj(self.global.clone()), name, value);
+        let g = Value::Obj(self.name_global().clone());
+        if self.js_has_property(&g, name)? {
+            return self.set_member(&g, name, value);
         }
         // Truly undeclared: strict → ReferenceError; sloppy → create a global property.
         if self.strict {
             return Err(self.throw("ReferenceError", format!("{name} is not defined")));
         }
-        let g = Value::Obj(self.global.clone());
         self.set_member(&g, name, value)
     }
 
@@ -3546,7 +3552,11 @@ impl Interp {
     pub(crate) fn new_promise(&mut self) -> Value {
         let obj = Object::new_bare(self.promise_proto());
         obj.borrow_mut().call = Callable::Promise(crate::eval::promise_fast::PromiseSlot::boxed());
-        Value::Obj(obj)
+        let p = Value::Obj(obj);
+        if self.promise_hooks.is_some() {
+            self.run_promise_hook(crate::eval::promise_fast::HOOK_INIT, &p, &Value::Undefined);
+        }
+        p
     }
 
     /// The promise whose state `promise` holds: itself, or the subclass instance a native
@@ -3570,6 +3580,13 @@ impl Interp {
     pub(crate) fn resolve_promise(&mut self, promise: &Value, value: Value) {
         // Only a pending promise is affected (a subclass graft forwards to its target).
         let Some(target) = Self::pending_promise_target(promise) else { return };
+        if self.promise_hooks.is_some() {
+            self.run_promise_hook(
+                crate::eval::promise_fast::HOOK_RESOLVE,
+                &Value::Obj(target.clone()),
+                &Value::Undefined,
+            );
+        }
         let Value::Obj(v) = &value else {
             // A non-object settles at once.
             self.settle(&target, value, true);
@@ -3607,6 +3624,13 @@ impl Interp {
 
     pub(crate) fn reject_promise(&mut self, promise: &Value, reason: Value) {
         if let Some(target) = Self::pending_promise_target(promise) {
+            if self.promise_hooks.is_some() {
+                self.run_promise_hook(
+                    crate::eval::promise_fast::HOOK_RESOLVE,
+                    &Value::Obj(target.clone()),
+                    &Value::Undefined,
+                );
+            }
             self.settle(&target, reason, false);
         }
     }
@@ -3653,7 +3677,7 @@ impl Interp {
 
     /// The `then` operation: register reactions, returning a new dependent promise.
     pub(crate) fn promise_then(&mut self, promise: &Value, on_f: Value, on_r: Value) -> Value {
-        let result = self.new_promise();
+        let result = self.new_promise_with_parent(promise);
         self.promise_then_into(promise, on_f, on_r, result.clone());
         result
     }
@@ -3747,9 +3771,21 @@ impl Interp {
     /// Run one promise-reaction job (settle `job.result` from the handler, or pass the
     /// settlement through when there is no handler).
     pub(crate) fn run_job(&mut self, job: crate::interpreter::Job) {
+        if self.promise_hooks.is_some() {
+            return self.run_job_hooked(job);
+        }
+        self.run_job_unhooked(job)
+    }
+
+    pub(crate) fn run_job_unhooked(&mut self, mut job: crate::interpreter::Job) {
         let from_drain = self.lang.promise.drain_job.replace(false);
         match job.kind {
             crate::eval::promise_fast::JOB_REACTION => {}
+            // Subscribed while hooks were installed; they are gone now.
+            crate::eval::promise_fast::JOB_AWAIT_HOOKED => {
+                job.kind = crate::eval::promise_fast::JOB_REACTION;
+                job.result = Value::Empty;
+            }
             crate::eval::promise_fast::JOB_THENABLE => return self.run_thenable_job(job),
             crate::eval::promise_fast::JOB_TASK => return self.run_task_job(job),
             _ => return self.run_combinator_job(job),
@@ -3794,8 +3830,12 @@ impl Interp {
         let outcome = self.call(job.handler, Value::Undefined, &[]);
         self.async_context = outer;
         if let Err(Abrupt::Throw(e)) = outcome {
-            let p = self.new_promise();
-            self.reject_promise(&p, e);
+            if let Some(errors) = self.task_errors.as_mut() {
+                errors.push(e);
+            } else {
+                let p = self.new_promise();
+                self.reject_promise(&p, e);
+            }
         }
     }
 
@@ -4132,7 +4172,17 @@ impl Interp {
         // non-configurable same-named property) with a TypeError.
         if is_global {
             for name in &var_names {
-                let ok = if is_func(name) {
+                let ok = if self.global_proxy.is_some() {
+                    let own = self.vm_global_own(name)?;
+                    match own {
+                        None => self.vm_global_extensible()?,
+                        Some(p) => {
+                            !is_func(name)
+                                || p.configurable()
+                                || (!p.accessor() && p.writable() && p.enumerable())
+                        }
+                    }
+                } else if is_func(name) {
                     self.can_declare_global_function(name)
                 } else {
                     self.can_declare_global_var(name)
@@ -4156,7 +4206,20 @@ impl Interp {
                 .get(name.as_str())
                 .map(|b| b.value.clone())
                 .unwrap_or(Value::Undefined);
-            if is_global {
+            if is_global && self.global_proxy.is_some() {
+                let own = self.vm_global_own(name)?;
+                if is_func(name) {
+                    let attrs = match &own {
+                        Some(p) if !p.configurable() => None,
+                        _ => Some((true, true, true)),
+                    };
+                    self.vm_global_define(name, Some(value.clone()), attrs)?;
+                    let g = Value::Obj(self.name_global().clone());
+                    self.set_member_recv(&g, name, value, g.clone())?;
+                } else if own.is_none() && self.vm_global_extensible()? {
+                    self.vm_global_define(name, Some(Value::Undefined), Some((true, true, true)))?;
+                }
+            } else if is_global {
                 if is_func(name) {
                     self.create_global_function_binding(name, value);
                 } else {
@@ -5619,6 +5682,35 @@ impl Interp {
         }
     }
 
+    /// V8's rendering of an object in property-error messages: `[object Array]` for arrays,
+    /// else `#<Name>` with the name of the nearest `constructor` data property's function.
+    /// Reads data properties only, so it never runs user code.
+    pub(crate) fn v8_object_label(&self, o: &Gc) -> String {
+        if o.borrow().exotic.is_array() {
+            return "[object Array]".to_string();
+        }
+        let mut cur = Some(o.clone());
+        for _ in 0..64 {
+            let Some(obj) = cur else { break };
+            let (ctor, proto) = {
+                let b = obj.borrow();
+                let ctor = b.props.get("constructor").filter(|p| !p.accessor()).map(|p| p.value());
+                (ctor, b.proto.clone())
+            };
+            if let Some(Value::Obj(f)) = ctor {
+                let name = f.borrow().props.get("name").filter(|p| !p.accessor()).map(|p| p.value());
+                if let Some(Value::Str(name)) = name {
+                    let name = name.to_string();
+                    if !name.is_empty() {
+                        return format!("#<{name}>");
+                    }
+                }
+            }
+            cur = proto;
+        }
+        "#<Object>".to_string()
+    }
+
     /// [[Delete]] on an evaluated base (shared by the plain and optional `delete` paths).
     fn delete_prop_on(&mut self, base: Value, prop: &str) -> Result<Value, Abrupt> {
         let strict = self.strict;
@@ -5677,9 +5769,10 @@ impl Interp {
                     }
                     // [[Delete]] returned false: strict-mode `delete` throws.
                     if strict {
+                        let label = self.v8_object_label(o);
                         return Err(self.throw(
                             "TypeError",
-                            format!("cannot delete non-configurable property '{prop}'"),
+                            format!("Cannot delete property '{prop}' of {label}"),
                         ));
                     }
                     return Ok(Value::Bool(false));
@@ -5691,7 +5784,7 @@ impl Interp {
                         if strict {
                             return Err(self.throw(
                                 "TypeError",
-                                format!("cannot delete non-configurable property '{prop}'"),
+                                format!("Cannot delete property '{prop}' of [object String]"),
                             ));
                         }
                         return Ok(Value::Bool(false));
@@ -5750,6 +5843,9 @@ impl Interp {
                     cur = parent;
                 }
                 // Fall back to a global-object property.
+                if self.global_proxy.is_some() {
+                    return Ok(Value::Bool(self.vm_global_delete(name)?));
+                }
                 let g = self.global.clone();
                 let existing = g.borrow().props.get(name).map(|p| p.configurable());
                 match existing {
@@ -6455,7 +6551,7 @@ impl Interp {
             if op == "+" && (matches!(lp, Value::Str(_)) || matches!(rp, Value::Str(_))) {
                 let ls = self.to_string(&lp)?;
                 let rs = self.to_string(&rp)?;
-                if ls.len() + rs.len() > MAX_STR_LEN {
+                if size::sum(ls.len(), rs.len(), MAX_STR_LEN).is_err() {
                     return Err(self.throw("RangeError", "Invalid string length"));
                 }
                 return Ok(Value::Str(if crate::jstr::needs_join_fixup(&ls, &rs) {
@@ -7068,15 +7164,10 @@ impl Interp {
             };
         }
         let neg = n < 0.0;
-        // Rust's `{:e}` yields the shortest round-tripping mantissa + exponent (`d[.ddd]e±E`).
-        let sci = format!("{:e}", n.abs());
-        let (mantissa, exp_str) = sci.split_once('e').unwrap();
-        let exp: i32 = exp_str.parse().unwrap();
-        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-        let digits = digits.trim_end_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
+        let d = lumen_common::float::shortest(n);
+        let digits = d.as_str();
         let k = digits.len() as i32;
-        let np = exp + 1; // the spec's `n`: value = digits × 10^(n-k)
+        let np = d.decpt; // the spec's `n`: value = digits × 10^(n-k)
         let body = if k <= np && np <= 21 {
             format!("{}{}", digits, "0".repeat((np - k) as usize))
         } else if 0 < np && np <= 21 {
@@ -7961,7 +8052,7 @@ impl Interp {
 
     /// The Reference for a name no scope declares: a global object property, or unresolvable.
     fn unscoped_reference(&mut self, name: &str) -> Result<Reference, Abrupt> {
-        if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
+        if self.js_has_property(&Value::Obj(self.name_global().clone()), name)? {
             return Ok(Reference::Var(RefBase::Global, name.to_string()));
         }
         Ok(Reference::Var(RefBase::Unresolvable, name.to_string()))
@@ -8029,7 +8120,7 @@ impl Interp {
                     }
                     self.get_member(&obj, name)
                 }
-                RefBase::Global => self.get_member(&Value::Obj(self.global.clone()), name),
+                RefBase::Global => self.get_member(&Value::Obj(self.name_global().clone()), name),
                 RefBase::Unresolvable => {
                     Err(self.throw("ReferenceError", format!("{name} is not defined")))
                 }
@@ -8126,7 +8217,7 @@ impl Interp {
                     self.set_member(&obj, name, value)
                 }
                 RefBase::Global => {
-                    let g = Value::Obj(self.global.clone());
+                    let g = Value::Obj(self.name_global().clone());
                     // SetMutableBinding re-checks HasProperty — trap-aware, the global's proto
                     // chain may contain a proxy.
                     if self.strict && !self.js_has_property(&g, name)? {
@@ -8138,7 +8229,7 @@ impl Interp {
                     if self.strict {
                         return Err(self.throw("ReferenceError", format!("{name} is not defined")));
                     }
-                    self.set_member(&Value::Obj(self.global.clone()), name, value)
+                    self.set_member(&Value::Obj(self.name_global().clone()), name, value)
                 }
             },
             Reference::Prop(base, key) => {

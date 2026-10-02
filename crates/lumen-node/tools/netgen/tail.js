@@ -4,6 +4,8 @@
 __internals.set("netRequire", require);
 // node:tls (tls.js) runs over the same module table and handle bindings.
 __internals.set("netBinding", internalBinding);
+// child_process: descriptors received over an IPC channel become these handles.
+__internals.set("netHandleFromFd", handleFromFd);
 __builtins.set("net", require("net"));
 {
   const http = require("http");

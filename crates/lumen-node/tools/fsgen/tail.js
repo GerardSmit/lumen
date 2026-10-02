@@ -89,3 +89,5 @@ fs.globSync = function globSync(pattern, options = {}) {
 
 __builtins.set("fs", fs);
 __builtins.set("fs/promises", __lazyValue(() => fs.promises));
+// The module table, for --expose-internals (internals.js).
+__internals.set("fsRequire", require);

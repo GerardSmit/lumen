@@ -145,8 +145,86 @@ fn obj_subclasshook(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<V
     Ok(Value::NotImplemented)
 }
 
-fn obj_reduce_ex(it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    Err(it.type_error("cannot pickle object"))
+fn obj_getstate(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    it.check_args("__getstate__", a, 1, 1)?;
+    let Value::Obj(o) = &a[0] else { return Ok(Value::None) };
+    let d = match o.dict.borrow().as_ref() {
+        Some(d) if matches!(&d.kind, Kind::Dict(p) if !p.borrow().is_empty()) => d.clone(),
+        _ => return Ok(Value::None),
+    };
+    it.call_method(&Value::Obj(d), "copy", Vec::new())
+}
+
+fn obj_reduce_ex(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    it.check_args("__reduce_ex__", a, 1, 2)?;
+    let obj = &a[0];
+    let cls = it.type_of(obj);
+    if let Some((owner, m)) = it.lookup_mro_with_owner(&cls, "__reduce__") {
+        if !Rc::ptr_eq(&owner, &it.types.object) {
+            let b = it.bind_descr(&m, obj, &cls)?;
+            return it.call(&b, Vec::new(), Vec::new());
+        }
+    }
+    let proto = match a.get(1) {
+        Some(p) => it.index_of(p)?,
+        None => 0,
+    };
+    common_reduce(it, obj, &cls, proto)
+}
+
+/// `_common_reduce`: `copyreg._reduce_ex` below protocol 2, `reduce_newobj` from it on.
+fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value> {
+    if matches!(obj, Value::Obj(o) if matches!(o.kind, Kind::Type(_) | Kind::Function(_) | Kind::Native(_) | Kind::Method(..) | Kind::Module)) || !matches!(obj, Value::Obj(_)) {
+        let t = it.tp_name(cls);
+        return Err(it.type_error(&format!("cannot pickle '{t}' object")));
+    }
+    if proto < 2 {
+        let copyreg = it.import_module("copyreg")?;
+        let f = it.get_attr_str(&Value::Obj(copyreg), "_reduce_ex")?;
+        return it.call(&f, vec![obj.clone(), Value::Int(proto)], Vec::new());
+    }
+    let cls = cls.clone();
+    let mut args = vec![Value::Obj(cls.clone())];
+    if let Some(m) = it.lookup_mro(&cls, "__getnewargs__") {
+        let b = it.bind_descr(&m, obj, &cls)?;
+        let extra = it.call(&b, Vec::new(), Vec::new())?;
+        args.extend(it.iterate_to_vec(&extra)?);
+    }
+    let state = it.call_method(obj, "__getstate__", Vec::new())?;
+    let layout = it.type_layout(&cls);
+    if matches!(layout, Layout::Set | Layout::FrozenSet) {
+        let items = it.iterate_to_vec(obj)?;
+        return Ok(Value::tuple(vec![Value::Obj(cls), Value::tuple(vec![Value::list(items)]), state]));
+    }
+    let base = match layout {
+        Layout::Tuple => Some(it.types.tuple.clone()),
+        Layout::Str => Some(it.types.str_.clone()),
+        Layout::Int => Some(it.types.int.clone()),
+        Layout::Float => Some(it.types.float.clone()),
+        Layout::Bytes => Some(it.types.bytes.clone()),
+        _ => None,
+    };
+    if let (Some(base), 1) = (base, args.len()) {
+        args.push(it.call(&Value::Obj(base), vec![obj.clone()], Vec::new())?);
+    }
+    let copyreg = it.import_module("copyreg")?;
+    let newobj = it.get_attr_str(&Value::Obj(copyreg), "__newobj__")?;
+    let is_list = it.isinstance_value(obj, &Value::Obj(it.types.list.clone()))?;
+    let is_dict = it.isinstance_value(obj, &Value::Obj(it.types.dict.clone()))?;
+    let listitems = if is_list { it.get_iter(obj)? } else { Value::None };
+    let dictitems = if is_dict {
+        let items = it.call_method(obj, "items", Vec::new())?;
+        it.get_iter(&items)?
+    } else {
+        Value::None
+    };
+    Ok(Value::tuple(vec![newobj, Value::tuple(args), state, listitems, dictitems]))
+}
+
+fn obj_reduce(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    it.check_args("__reduce__", a, 1, 1)?;
+    let cls = it.type_of(&a[0]);
+    common_reduce(it, &a[0], &cls, 0)
 }
 
 impl Interp {
@@ -339,7 +417,7 @@ fn none_bool(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     Ok(Value::Bool(false))
 }
 
-fn prop_get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+pub(crate) fn prop_get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.check_args("__get__", a, 2, 3)?;
     if a[1].is_none() {
         return Ok(a[0].clone());
@@ -348,7 +426,7 @@ fn prop_get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.bind_descr(&a[0], &a[1], &cls)
 }
 
-fn prop_set(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+pub(crate) fn prop_set(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.check_args("__set__", a, 3, 3)?;
     if let Value::Obj(o) = &a[0] {
         if let Kind::Property(p) = &o.kind {
@@ -452,6 +530,71 @@ fn super_init(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> 
     Ok(Value::None)
 }
 
+/// A getter of `type`'s own getset descriptors: the class's slot, else its own dict entry.
+fn type_getset(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
+    let cls = match a.first() {
+        Some(Value::Obj(o)) if matches!(o.kind, Kind::Type(_)) => o.clone(),
+        _ => {
+            let t = a.first().map(|v| it.tp_name_of(v)).unwrap_or_default();
+            return Err(it.type_error(&format!("descriptor '{name}' for 'type' objects doesn't apply to a '{t}' object")));
+        }
+    };
+    let is_type = Rc::ptr_eq(&cls, &it.types.type_);
+    let own = match is_type {
+        true => None,
+        false => cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name)),
+    };
+    match (name, own) {
+        ("__module__", Some(v)) => Ok(v),
+        ("__doc__", Some(v)) => it.bind_descr_cls(&v, &cls),
+        ("__module__", None) => Ok(Value::str("builtins")),
+        ("__doc__", None) => Ok(Value::None),
+        _ => match it.type_special_attr(&cls, name) {
+            Some(v) => Ok(v),
+            None => Err(it.new_exc_str("AttributeError", &format!("type object '{}' has no attribute '{name}'", it.type_name(&cls)))),
+        },
+    }
+}
+
+fn type_getset_store(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
+    let (Some(Value::Obj(o)), Some(v)) = (a.first(), a.get(1)) else { return Ok(Value::None) };
+    if !matches!(o.kind, Kind::Type(_)) {
+        return Ok(Value::None);
+    }
+    let n = match Value::str(name) {
+        Value::Obj(n) => n,
+        _ => unreachable!(),
+    };
+    it.type_store_attr(o, &n, v.clone())?;
+    Ok(Value::None)
+}
+
+macro_rules! type_getsets {
+    ($($name:literal => $get:ident $(, $set:ident)?;)*) => {
+        $(fn $get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+            type_getset(it, a, $name)
+        })*
+        $($(fn $set(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+            type_getset_store(it, a, $name)
+        })?)*
+        type GetSet = (&'static str, NativeFn, Option<NativeFn>);
+        pub(crate) const TYPE_GETSETS: &[GetSet] = &[$(($name, $get, type_getsets!(@set $($set)?))),*];
+    };
+    (@set) => { None };
+    (@set $set:ident) => { Some($set) };
+}
+
+type_getsets! {
+    "__name__" => type_get_name, type_set_name;
+    "__qualname__" => type_get_qualname, type_set_qualname;
+    "__bases__" => type_get_bases, type_set_bases;
+    "__base__" => type_get_base;
+    "__mro__" => type_get_mro;
+    "__module__" => type_get_module, type_set_module;
+    "__doc__" => type_get_doc, type_set_doc;
+    "__dict__" => type_get_dict;
+}
+
 pub fn init(it: &mut Interp) {
     let t = &it.types;
     let (object, type_, property, staticmethod, classmethod, super_) =
@@ -474,6 +617,8 @@ pub fn init(it: &mut Interp) {
     it.reg(&object, "__dir__", obj_dir);
     it.reg(&object, "__sizeof__", obj_sizeof);
     it.reg(&object, "__reduce_ex__", obj_reduce_ex);
+    it.reg(&object, "__reduce__", obj_reduce);
+    it.reg(&object, "__getstate__", obj_getstate);
     it.reg_class(&object, "__init_subclass__", obj_init_subclass);
     it.reg_class(&object, "__subclasshook__", obj_subclasshook);
     if let Some(d) = object.dict.borrow().as_ref() {

@@ -2,7 +2,7 @@
 //! global, free or cell.
 
 use crate::ast::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 pub const DEF_GLOBAL: u32 = 1;
@@ -10,6 +10,26 @@ pub const DEF_NONLOCAL: u32 = 2;
 pub const DEF_LOCAL: u32 = 4;
 pub const DEF_PARAM: u32 = 8;
 pub const DEF_USE: u32 = 16;
+pub const DEF_TYPE_PARAM: u32 = 32;
+
+/// The PEP 695 annotation scopes. They are function scopes for name resolution; inside a class
+/// they can also see the class namespace (through the `__classdict__` cell).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnnKind {
+    /// `<generic parameters of X>`: evaluates the type parameters (and, for a function, its
+    /// annotations; for a class, its bases).
+    TypeParams,
+    /// The lazily evaluated bound or constraints of one `TypeVar`.
+    TypeVarBound,
+    /// The lazily evaluated value of a `type` statement.
+    TypeAlias,
+}
+
+/// Symbol-table key of the `<generic parameters of X>` scope for `params` (kept apart from the
+/// key of the first parameter's bound scope, which is the parameter's own address).
+pub fn type_params_key(params: &[TypeParam]) -> usize {
+    params.as_ptr() as usize + 1
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScopeKind {
@@ -39,7 +59,7 @@ pub struct Scope {
     pub is_lambda: bool,
     pub name: Rc<str>,
     pub syms: Vec<(Rc<str>, Sym)>,
-    pub index: HashMap<Rc<str>, usize>,
+    pub index: BTreeMap<Rc<str>, usize>,
     pub children: Vec<usize>,
     pub is_gen: bool,
     pub is_async: bool,
@@ -49,6 +69,9 @@ pub struct Scope {
     pub params: Vec<Rc<str>>,
     pub extra_free: Vec<Rc<str>>,
     pub line: u32,
+    pub ann: Option<AnnKind>,
+    pub can_see_class_scope: bool,
+    pub needs_classdict: bool,
 }
 
 impl Scope {
@@ -62,7 +85,7 @@ impl Scope {
 
 pub struct SymTable {
     pub scopes: Vec<Scope>,
-    pub ids: HashMap<usize, usize>,
+    pub ids: BTreeMap<usize, usize>,
 }
 
 pub struct SymError {
@@ -84,43 +107,55 @@ pub fn mangle(private: &Option<Rc<str>>, name: &str) -> Rc<str> {
 
 struct Builder {
     scopes: Vec<Scope>,
-    ids: HashMap<usize, usize>,
+    ids: BTreeMap<usize, usize>,
     cur: usize,
     line: u32,
     err: Option<SymError>,
 }
 
 pub fn build(module: &Module) -> Result<SymTable, SymError> {
-    let mut b = Builder { scopes: Vec::new(), ids: HashMap::new(), cur: 0, line: 1, err: None };
+    let mut b = Builder { scopes: Vec::new(), ids: BTreeMap::new(), cur: 0, line: 1, err: None };
     b.new_scope(ScopeKind::Module, "<module>".into(), None, false);
     b.visit_body(&module.body);
     if let Some(e) = b.err.take() {
         return Err(e);
     }
     let mut t = SymTable { scopes: b.scopes, ids: b.ids };
-    let empty = HashSet::new();
-    analyze(&mut t, 0, &empty)?;
+    let empty = BTreeSet::new();
+    analyze(&mut t, 0, &empty, None)?;
     Ok(t)
 }
 
 pub fn build_expr(e: &Expr) -> Result<SymTable, SymError> {
-    let mut b = Builder { scopes: Vec::new(), ids: HashMap::new(), cur: 0, line: 1, err: None };
+    let mut b = Builder { scopes: Vec::new(), ids: BTreeMap::new(), cur: 0, line: 1, err: None };
     b.new_scope(ScopeKind::Module, "<module>".into(), None, false);
     b.visit_expr(e);
     if let Some(e) = b.err.take() {
         return Err(e);
     }
     let mut t = SymTable { scopes: b.scopes, ids: b.ids };
-    let empty = HashSet::new();
-    analyze(&mut t, 0, &empty)?;
+    let empty = BTreeSet::new();
+    analyze(&mut t, 0, &empty, None)?;
     Ok(t)
 }
 
-fn analyze(t: &mut SymTable, id: usize, bound: &HashSet<Rc<str>>) -> Result<HashSet<Rc<str>>, SymError> {
+/// `class_entry` is the class whose namespace an annotation scope can see.
+fn analyze(
+    t: &mut SymTable,
+    id: usize,
+    bound: &BTreeSet<Rc<str>>,
+    class_entry: Option<usize>,
+) -> Result<BTreeSet<Rc<str>>, SymError> {
     let kind = t.scopes[id].kind;
-    let mut local: HashSet<Rc<str>> = HashSet::new();
-    let mut free: HashSet<Rc<str>> = HashSet::new();
+    let mut local: BTreeSet<Rc<str>> = BTreeSet::new();
+    let mut free: BTreeSet<Rc<str>> = BTreeSet::new();
     let line = t.scopes[id].line;
+    let class_flags: BTreeMap<Rc<str>, u32> = match class_entry {
+        Some(c) if t.scopes[id].can_see_class_scope => {
+            t.scopes[c].syms.iter().map(|(n, s)| (n.clone(), s.flags)).collect()
+        }
+        _ => BTreeMap::new(),
+    };
     for (name, sym) in t.scopes[id].syms.iter_mut() {
         let f = sym.flags;
         if f & DEF_GLOBAL != 0 {
@@ -134,6 +169,13 @@ fn analyze(t: &mut SymTable, id: usize, bound: &HashSet<Rc<str>>) -> Result<Hash
         } else if f & (DEF_LOCAL | DEF_PARAM) != 0 {
             sym.scope = Sc::Local;
             local.insert(name.clone());
+        } else if class_flags.get(name).is_some_and(|cf| cf & DEF_GLOBAL != 0) {
+            sym.scope = Sc::GlobalExplicit;
+        } else if class_flags
+            .get(name)
+            .is_some_and(|cf| cf & (DEF_LOCAL | DEF_PARAM) != 0 && cf & DEF_NONLOCAL == 0)
+        {
+            sym.scope = Sc::GlobalImplicit;
         } else if bound.contains(name) {
             sym.scope = Sc::Free;
             free.insert(name.clone());
@@ -148,12 +190,20 @@ fn analyze(t: &mut SymTable, id: usize, bound: &HashSet<Rc<str>>) -> Result<Hash
         }
         ScopeKind::Class => {
             newbound.insert("__class__".into());
+            newbound.insert("__classdict__".into());
         }
         ScopeKind::Module => {}
     }
     let children = t.scopes[id].children.clone();
     for c in children {
-        let cf = analyze(t, c, &newbound)?;
+        let child_class = if !t.scopes[c].can_see_class_scope {
+            None
+        } else if kind == ScopeKind::Class {
+            Some(id)
+        } else {
+            class_entry
+        };
+        let cf = analyze(t, c, &newbound, child_class)?;
         for name in cf {
             let s = &mut t.scopes[id];
             if kind == ScopeKind::Function && local.contains(&name) {
@@ -162,6 +212,8 @@ fn analyze(t: &mut SymTable, id: usize, bound: &HashSet<Rc<str>>) -> Result<Hash
                 }
             } else if kind == ScopeKind::Class && &*name == "__class__" {
                 s.has_class_cell = true;
+            } else if kind == ScopeKind::Class && &*name == "__classdict__" {
+                s.needs_classdict = true;
             } else if let Some(&i) = s.index.get(&name) {
                 match s.syms[i].1.scope {
                     Sc::GlobalImplicit => s.syms[i].1.scope = Sc::Free,
@@ -179,6 +231,7 @@ fn analyze(t: &mut SymTable, id: usize, bound: &HashSet<Rc<str>>) -> Result<Hash
     }
     if kind == ScopeKind::Class {
         free.remove("__class__");
+        free.remove("__classdict__");
     }
     Ok(free)
 }
@@ -196,7 +249,7 @@ impl Builder {
             is_lambda: false,
             name,
             syms: Vec::new(),
-            index: HashMap::new(),
+            index: BTreeMap::new(),
             children: Vec::new(),
             is_gen: false,
             is_async: false,
@@ -206,6 +259,9 @@ impl Builder {
             params: Vec::new(),
             extra_free: Vec::new(),
             line: self.line,
+            ann: None,
+            can_see_class_scope: false,
+            needs_classdict: false,
         });
         if id > 0 {
             self.scopes[self.cur].children.push(id);
@@ -226,6 +282,10 @@ impl Builder {
         let name = mangle(&self.scopes[scope].private, name);
         let s = &mut self.scopes[scope];
         match s.index.get(&name) {
+            Some(&i) if flags & DEF_TYPE_PARAM != 0 && s.syms[i].1.flags & DEF_TYPE_PARAM != 0 => {
+                let msg = format!("duplicate type parameter '{}'", name);
+                self.error(msg);
+            }
             Some(&i) => s.syms[i].1.flags |= flags,
             None => {
                 let n = s.syms.len();
@@ -275,12 +335,20 @@ impl Builder {
     }
 
     fn visit_arg_exprs(&mut self, args: &Arguments) {
+        self.visit_defaults(args);
+        self.visit_annotations(args);
+    }
+
+    fn visit_defaults(&mut self, args: &Arguments) {
         for d in &args.defaults {
             self.visit_expr(d);
         }
         for d in args.kw_defaults.iter().flatten() {
             self.visit_expr(d);
         }
+    }
+
+    fn visit_annotations(&mut self, args: &Arguments) {
         for a in args.posonlyargs.iter().chain(args.args.iter()).chain(args.kwonlyargs.iter()) {
             if let Some(an) = &a.annotation {
                 self.visit_expr(an);
@@ -293,15 +361,79 @@ impl Builder {
         }
     }
 
+    /// Enters the `<generic parameters of X>` scope and declares the type parameters in it.
+    /// Returns the scope to go back to.
+    fn enter_type_params(&mut self, name: &Ident, params: &[TypeParam], args: Option<&Arguments>, is_class: bool) -> usize {
+        let saved = self.cur;
+        let in_class = self.scopes[saved].kind == ScopeKind::Class;
+        let id = self.new_scope(ScopeKind::Function, name.clone(), Some(type_params_key(params)), false);
+        self.scopes[id].ann = Some(AnnKind::TypeParams);
+        self.cur = id;
+        if in_class {
+            self.scopes[id].can_see_class_scope = true;
+            self.add(id, "__classdict__", DEF_USE);
+        }
+        if is_class {
+            self.scopes[id].private = Some(name.clone());
+            self.add(id, ".type_params", DEF_LOCAL | DEF_USE);
+            self.add(id, ".generic_base", DEF_LOCAL | DEF_USE);
+        }
+        if let Some(args) = args {
+            let has_kwdefaults = args.kw_defaults.iter().any(|d| d.is_some());
+            for (present, n) in [(!args.defaults.is_empty(), ".defaults"), (has_kwdefaults, ".kwdefaults")] {
+                if present {
+                    self.add(id, n, DEF_PARAM);
+                    self.scopes[id].params.push(n.into());
+                }
+            }
+        }
+        for tp in params {
+            self.line = tp.pos.line;
+            self.add(id, tp.name(), DEF_TYPE_PARAM | DEF_LOCAL);
+            if let TypeParamKind::TypeVar { name, bound: Some(b) } = &tp.kind {
+                let key = tp as *const TypeParam as usize;
+                self.enter_annotation_scope(name.clone(), key, AnnKind::TypeVarBound, in_class);
+                self.visit_expr(b);
+                self.cur = id;
+            }
+        }
+        saved
+    }
+
+    fn enter_annotation_scope(&mut self, name: Ident, key: usize, ann: AnnKind, see_class: bool) {
+        let id = self.new_scope(ScopeKind::Function, name, Some(key), false);
+        self.scopes[id].ann = Some(ann);
+        self.scopes[id].can_see_class_scope = see_class;
+        if see_class {
+            self.add(id, "__classdict__", DEF_USE);
+        }
+        self.cur = id;
+    }
+
+    /// Rejects `what` (walrus, yield, await) inside an annotation scope.
+    fn check_annotation_scope(&mut self, what: &str) {
+        let msg = match self.scopes[self.cur].ann {
+            Some(AnnKind::TypeVarBound) => format!("{what} cannot be used within a TypeVar bound"),
+            Some(AnnKind::TypeAlias) => format!("{what} cannot be used within a type alias"),
+            Some(AnnKind::TypeParams) => format!("{what} cannot be used within the definition of a generic"),
+            None => return,
+        };
+        self.error(msg);
+    }
+
     fn visit_stmt(&mut self, s: &Stmt) {
         self.line = s.pos.line;
         match &s.kind {
             StmtKind::FunctionDef(f) => {
                 self.def(&f.name);
+                self.visit_defaults(&f.args);
                 for d in &f.decorators {
                     self.visit_expr(d);
                 }
-                self.visit_arg_exprs(&f.args);
+                let outer = (!f.type_params.is_empty())
+                    .then(|| self.enter_type_params(&f.name, &f.type_params, Some(&f.args), false));
+                self.line = s.pos.line;
+                self.visit_annotations(&f.args);
                 if let Some(r) = &f.returns {
                     self.visit_expr(r);
                 }
@@ -312,13 +444,16 @@ impl Builder {
                 self.cur = id;
                 self.visit_params(&f.args);
                 self.visit_body(&f.body);
-                self.cur = saved;
+                self.cur = outer.unwrap_or(saved);
             }
             StmtKind::ClassDef(c) => {
                 self.def(&c.name);
                 for d in &c.decorators {
                     self.visit_expr(d);
                 }
+                let generic = !c.type_params.is_empty();
+                let outer = generic.then(|| self.enter_type_params(&c.name, &c.type_params, None, true));
+                self.line = s.pos.line;
                 for b in &c.bases {
                     self.visit_expr(b);
                 }
@@ -329,7 +464,24 @@ impl Builder {
                 let id = self.new_scope(ScopeKind::Class, c.name.clone(), Some(key), false);
                 let saved = self.cur;
                 self.cur = id;
+                if generic {
+                    self.add(id, "__type_params__", DEF_LOCAL);
+                    self.add(id, ".type_params", DEF_USE);
+                }
                 self.visit_body(&c.body);
+                self.cur = outer.unwrap_or(saved);
+            }
+            StmtKind::TypeAlias { name, type_params, value } => {
+                self.visit_expr(name);
+                let ExprKind::Name { id: alias, .. } = &name.kind else { return };
+                let in_class = self.scopes[self.cur].kind == ScopeKind::Class;
+                let saved = self.cur;
+                if !type_params.is_empty() {
+                    self.enter_type_params(alias, type_params, None, false);
+                }
+                let key = s as *const Stmt as usize;
+                self.enter_annotation_scope(alias.clone(), key, AnnKind::TypeAlias, in_class);
+                self.visit_expr(value);
                 self.cur = saved;
             }
             StmtKind::Return(v) => {
@@ -555,6 +707,7 @@ impl Builder {
                 }
             }
             ExprKind::NamedExpr { target, value } => {
+                self.check_annotation_scope("named expression");
                 self.visit_expr(value);
                 if let ExprKind::Name { id, .. } = &target.kind {
                     let mut c = self.cur;
@@ -624,15 +777,18 @@ impl Builder {
             }
             ExprKind::GeneratorExp { elt, generators } => self.visit_comp(e, generators, &[elt], "<genexpr>", true),
             ExprKind::Await(v) => {
+                self.check_annotation_scope("await expression");
                 self.visit_expr(v);
             }
             ExprKind::Yield(v) => {
+                self.check_annotation_scope("yield expression");
                 if let Some(v) = v {
                     self.visit_expr(v);
                 }
                 self.mark_gen();
             }
             ExprKind::YieldFrom(v) => {
+                self.check_annotation_scope("yield expression");
                 self.visit_expr(v);
                 self.mark_gen();
             }

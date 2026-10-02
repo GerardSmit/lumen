@@ -94,28 +94,49 @@ fn new_asend(it: &mut Interp, g: &Value, mode: &str, arg: Value) -> Value {
     Value::Obj(o)
 }
 
+/// The hooks set by `sys.set_asyncgen_hooks`.
+#[derive(Default)]
+pub struct AsyncGenHooks {
+    pub firstiter: Option<Value>,
+    pub finalizer: Option<Value>,
+}
+
+/// `async_gen_init_hooks`: on the first `__anext__`/`asend`/`athrow`/`aclose` of `g`, calls
+/// the `firstiter` hook with it.
+fn agen_init_hooks(it: &mut Interp, a: &[Value]) -> R<()> {
+    let g = gen_of(it, a)?;
+    let Kind::Generator(gd) = &g.kind else { return Ok(()) };
+    if gd.hooks_inited.replace(true) {
+        return Ok(());
+    }
+    if let Some(f) = it.native_state::<AsyncGenHooks>().firstiter.clone() {
+        it.call(&f, vec![a[0].clone()], Vec::new())?;
+    }
+    Ok(())
+}
+
 fn agen_anext(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__anext__", a, 1, 1)?;
-    gen_of(it, a)?;
+    agen_init_hooks(it, a)?;
     Ok(new_asend(it, &a[0], "anext", Value::None))
 }
 
 fn agen_asend(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("asend", a, 2, 2)?;
-    gen_of(it, a)?;
+    agen_init_hooks(it, a)?;
     Ok(new_asend(it, &a[0], "asend", a[1].clone()))
 }
 
 fn agen_athrow(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("athrow", a, 2, 4)?;
-    gen_of(it, a)?;
+    agen_init_hooks(it, a)?;
     let exc = it.throw_exc(&a[1..])?;
     Ok(new_asend(it, &a[0], "athrow", Value::Obj(exc)))
 }
 
 fn agen_aclose(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("aclose", a, 1, 1)?;
-    gen_of(it, a)?;
+    agen_init_hooks(it, a)?;
     Ok(new_asend(it, &a[0], "aclose", Value::None))
 }
 

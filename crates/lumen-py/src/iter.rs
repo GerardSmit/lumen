@@ -64,7 +64,6 @@ impl Interp {
                     let t = self.type_name_of(v);
                     return Err(self.type_error(&format!("'{}' object is not iterable", t)));
                 }
-                Kind::File(_) => return Ok(v.clone()),
                 _ => {}
             }
         }
@@ -130,14 +129,6 @@ impl Interp {
                         self.ret_val = v;
                         Ok(None)
                     }
-                }
-            }
-            Kind::File(_) => {
-                let line = self.file_readline(o, -1)?;
-                if line.as_str().map(|s| s.is_empty()).unwrap_or(line.as_bytes_empty()) {
-                    Ok(None)
-                } else {
-                    Ok(Some(line))
                 }
             }
             _ => {
@@ -223,11 +214,11 @@ impl Interp {
             }
             IterState::Str { s: so, pos } => {
                 if let Kind::Str(ps) = &so.kind {
-                    let rest = &ps.s[*pos..];
-                    if let Some(c) = rest.chars().next() {
-                        *pos += c.len_utf8();
-                        let mut buf = [0u8; 4];
-                        return Ok(Some(Value::str(c.encode_utf8(&mut buf))));
+                    if *pos < ps.s.len() {
+                        let (_, n) = lumen_common::smuggle::decode_at(&ps.s, *pos);
+                        let c = &ps.s[*pos..*pos + n];
+                        *pos += n;
+                        return Ok(Some(Value::str(c)));
                     }
                 }
                 *s = IterState::Empty;
@@ -236,7 +227,7 @@ impl Interp {
             IterState::Bytes { b, idx } => {
                 let v = match &b.kind {
                     Kind::Bytes(x) => x.get(*idx).copied(),
-                    Kind::ByteArray(x) => x.borrow().get(*idx).copied(),
+                    Kind::ByteArray(x) => x.bytes().get(*idx).copied(),
                     _ => None,
                 };
                 match v {
@@ -461,17 +452,21 @@ impl Interp {
                 }
             }
             IterState::Native(_) => {
-                let mut taken = std::mem::replace(&mut *s, IterState::Empty);
+                let mut taken = std::mem::replace(&mut *s, IterState::Running);
                 drop(s);
                 let r = match &mut taken {
                     IterState::Native(f) => f(self),
                     _ => Ok(None),
                 };
                 let exhausted = matches!(r, Ok(None) | Err(_));
-                if !exhausted {
-                    *st.borrow_mut() = taken;
-                }
+                *st.borrow_mut() = if exhausted { IterState::Empty } else { taken };
                 r
+            }
+            // Re-entered from code its own step runs: CPython's itertools would step the same
+            // source again, which is the generator already running.
+            IterState::Running => {
+                drop(s);
+                Err(self.value_error("generator already executing"))
             }
             IterState::Empty => Ok(None),
         }
@@ -492,14 +487,14 @@ impl Interp {
                     Kind::Dict(d) => return Ok(d.borrow().keys()),
                     Kind::Set(d) | Kind::FrozenSet(d) => return Ok(d.borrow().keys()),
                     Kind::Str(s) => {
-                        return Ok(s
-                            .s
-                            .chars()
-                            .map(|c| {
-                                let mut b = [0u8; 4];
-                                Value::str(c.encode_utf8(&mut b))
-                            })
-                            .collect())
+                        let mut out = Vec::with_capacity(s.nchars);
+                        let mut i = 0;
+                        while i < s.s.len() {
+                            let (_, n) = lumen_common::smuggle::decode_at(&s.s, i);
+                            out.push(Value::str(&s.s[i..i + n]));
+                            i += n;
+                        }
+                        return Ok(out);
                     }
                     _ => {}
                 }

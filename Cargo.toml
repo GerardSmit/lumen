@@ -1,16 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cpython-test-runner",
     "crates/lumen",
     "crates/lumen-aot",
     "crates/lumen-cli",
     "crates/lumen-codegen",
+    "crates/lumen-bind",
+    "crates/lumen-bind/macros",
     "crates/lumen-common",
     "crates/lumen-difftest",
     "crates/lumen-fs",
     "crates/lumen-host",
-    "crates/lumen-macros",
     "crates/lumen-node",
+    "crates/lumen-os",
     "crates/lumen-py",
     "crates/lumen-repl",
     "crates/lumen-runtime",
@@ -54,6 +57,13 @@ inherits = "release"
 lto = false
 codegen-units = 64
 incremental = true
+
+# CI tests: optimized like `fast` so deep-recursion tests fit the stack, but keep debug assertions
+# and overflow checks.
+[profile.ci]
+inherits = "fast"
+debug-assertions = true
+overflow-checks = true
 
 # Size-focused release build for shipping (mobile, WASM, embedders): `--profile release-small`.
 # Everything is optimized for size except the engine core (`lumen`: interpreter, VM, builtins),

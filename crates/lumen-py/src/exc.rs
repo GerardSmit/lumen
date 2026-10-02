@@ -7,7 +7,8 @@ use std::rc::Rc;
 impl Interp {
     pub fn source_line(&mut self, file: &str, line: u32) -> Option<String> {
         if !self.sources.contains_key(file) {
-            let lines = std::fs::read_to_string(file).map(|s| s.lines().map(|l| l.to_string()).collect()).unwrap_or_default();
+            let read = self.platform.borrow_mut().read_file(file);
+            let lines = read.map(|b| String::from_utf8_lossy(&b).lines().map(|l| l.to_string()).collect()).unwrap_or_default();
             self.sources.insert(file.to_string(), lines);
         }
         let l = self.sources.get(file)?.get((line as usize).checked_sub(1)?)?;
@@ -26,7 +27,13 @@ impl Interp {
             Some(m) if m != "builtins" && m != "__main__" => format!("{}.{}", m, name),
             _ => name,
         };
-        let msg = match self.str_of(&Value::Obj(exc.clone())) {
+        // A syntax error shows its location on the lines above, so only its `msg` here.
+        let msg_attr = match self.is_exc_instance(exc, "SyntaxError") {
+            true => exc.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "msg")).filter(|m| !m.is_none()),
+            false => None,
+        };
+        let shown = msg_attr.unwrap_or_else(|| Value::Obj(exc.clone()));
+        let msg = match self.str_of(&shown) {
             Ok(m) => m,
             Err(_) => "<exception str() failed>".to_string(),
         };
@@ -191,6 +198,28 @@ impl Interp {
         self.write_stderr(&s);
     }
 
+    /// Reports an uncaught exception through `sys.excepthook` when a script replaced it.
+    fn call_excepthook(&mut self, exc: &Obj) {
+        let d = self.sys_module.clone().map(|m| self.module_dict(&m));
+        let hook = d.as_ref().and_then(|d| dict_get_str(d, "excepthook"));
+        let original = d.as_ref().and_then(|d| dict_get_str(d, "__excepthook__"));
+        let hook = match (hook, original) {
+            (Some(Value::Obj(h)), Some(Value::Obj(o))) if !Rc::ptr_eq(&h, &o) => Value::Obj(h),
+            _ => return self.print_exception(exc),
+        };
+        let t = Value::Obj(self.type_of_obj(exc));
+        let tb = match &exc.kind {
+            Kind::Exception(d) => self.make_tb(&d.borrow().tb),
+            _ => Value::None,
+        };
+        if let Err(e) = self.call(&hook, vec![t, Value::Obj(exc.clone()), tb], Vec::new()) {
+            self.write_stderr("Error in sys.excepthook:\n");
+            self.print_exception(&e);
+            self.write_stderr("\nOriginal exception was:\n");
+            self.print_exception(exc);
+        }
+    }
+
     /// Exit status for an exception that reached the top level (printing it unless `SystemExit`).
     pub fn report_uncaught(&mut self, exc: &Obj) -> i32 {
         if self.is_exc_instance(exc, "SystemExit") {
@@ -210,7 +239,7 @@ impl Interp {
                 }
             };
         }
-        self.print_exception(exc);
+        self.call_excepthook(exc);
         if self.is_exc_instance(exc, "KeyboardInterrupt") {
             return crate::limits::EXIT_INTERRUPTED;
         }

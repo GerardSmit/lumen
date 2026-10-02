@@ -342,6 +342,10 @@ fn resolve(
         return Some((key, src));
     }
 
+    if let Some(source) = data_url_module(specifier) {
+        return Some((specifier.to_string(), source));
+    }
+
     // A module of an ahead-of-time blob (`aot:/…`, see `Runtime::run_precompiled`). The engine
     // already resolved everything the blob holds (its own units, the packages it bundled)
     // before asking here, so what is left is not in the blob: a relative path has nothing on
@@ -418,6 +422,25 @@ fn resolve(
     load_as_module(&file, !is_esm_pkg)
 }
 
+/// The source of a `data:text/javascript,...` (or `application/javascript`) module URL, whose
+/// body is percent-encoded or, with `;base64`, base64.
+fn data_url_module(specifier: &str) -> Option<String> {
+    let rest = specifier.strip_prefix("data:")?;
+    let (meta, body) = rest.split_once(',')?;
+    let mut parts = meta.split(';');
+    let mime = parts.next()?.trim().to_ascii_lowercase();
+    if mime != "text/javascript" && mime != "application/javascript" {
+        return None;
+    }
+    let base64 = parts.any(|p| p.trim().eq_ignore_ascii_case("base64"));
+    let bytes = if base64 {
+        lumen_common::codec::base64_decode_forgiving(body.as_bytes())?
+    } else {
+        lumen_common::codec::percent_decode(body.as_bytes())
+    };
+    String::from_utf8(bytes).ok()
+}
+
 /// Reduce a `file://` URL to a filesystem path: `file:///C:/x` -> `C:/x` on Windows (the drive
 /// letter follows the URL path's leading slash), `file:///x` -> `/x` elsewhere. `%XX` escapes are
 /// decoded (a path with a space arrives as `%20`). Anything else is returned unchanged.
@@ -441,21 +464,7 @@ fn strip_file_scheme(s: &str) -> std::borrow::Cow<'_, str> {
     if !rest.contains('%') {
         return std::borrow::Cow::Owned(rest.to_string());
     }
-    let mut out = Vec::with_capacity(rest.len());
-    let b = rest.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = |c: u8| (c as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
+    let out = lumen_common::codec::percent_decode(rest.as_bytes());
     std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 

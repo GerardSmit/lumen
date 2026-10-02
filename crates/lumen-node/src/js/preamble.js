@@ -53,16 +53,79 @@ let __traceEvent = null;
 function __setTraceEvent(fn) {
   __traceEvent = fn;
 }
-// Set by node:async_hooks while any hook is enabled; `type` names the resource being scheduled.
+// node:async_hooks. Once that module is loaded (`__asyncTracking`), every async resource made
+// from then on gets an id (`__asyncIdSymbol` / `__triggerIdSymbol` on the resource), and its
+// callbacks run on the execution stack (`__asyncIds`/`__asyncTriggers`/`__asyncResources`), which
+// promise reactions also push to through the engine's promise hooks. Until then none of this
+// costs anything. `__asyncHooks` holds the emitters while any hook is enabled.
+let __asyncTracking = false;
 let __asyncHooks = null;
+let __asyncIdCounter = 1;
+const __asyncIds = [];
+const __asyncTriggers = [];
+const __asyncResources = [];
+const __asyncIdSymbol = Symbol("async_id_symbol");
+const __triggerIdSymbol = Symbol("trigger_async_id_symbol");
 function __setAsyncHooks(runtime) {
   __asyncHooks = runtime;
 }
-function __destroyAsyncResource(resource) {
-  if (__asyncHooks !== null) __asyncHooks.destroyOf(resource);
+function __executionAsyncId() {
+  const n = __asyncIds.length;
+  return n === 0 ? 1 : __asyncIds[n - 1];
 }
+// Give `resource` an async id (triggered by the running resource) and emit its init.
+function __initAsyncResource(resource, type) {
+  const id = ++__asyncIdCounter;
+  const trigger = __executionAsyncId();
+  resource[__asyncIdSymbol] = id;
+  resource[__triggerIdSymbol] = trigger;
+  if (__asyncHooks !== null) __asyncHooks.init(id, type, trigger, resource);
+  return id;
+}
+const __asyncDestroyedSymbol = Symbol("asyncDestroyed");
+function __destroyAsyncResource(resource) {
+  if (__asyncHooks !== null && resource[__asyncIdSymbol] !== undefined && !resource[__asyncDestroyedSymbol]) {
+    resource[__asyncDestroyedSymbol] = true;
+    __asyncHooks.destroy(resource[__asyncIdSymbol]);
+  }
+}
+// Run `fn` as a callback of `resource` (which has an id) inside async context `context`.
+function __runAsyncCallback(resource, context, fn, thisArg, args) {
+  const id = resource[__asyncIdSymbol];
+  const previous = __asyncContextSet(context);
+  const depth = __asyncIds.length;
+  __asyncIds.push(id);
+  __asyncTriggers.push(resource[__triggerIdSymbol]);
+  __asyncResources.push(resource);
+  if (__asyncHooks !== null) __asyncHooks.before(id);
+  try {
+    return Reflect.apply(fn, thisArg, args);
+  } catch (error) {
+    __noteThrown(error);
+    throw error;
+  } finally {
+    if (__asyncHooks !== null) __asyncHooks.after(id);
+    __asyncIds.length = depth;
+    __asyncTriggers.length = depth;
+    __asyncResources.length = depth;
+    __asyncContextSet(previous);
+  }
+}
+// Bind `fn` to the current async context; with a `type`, `fn` is the callback of async resource
+// `resource` (destroyed after its one call unless `repeat`).
 function __bindAsyncContext(fn, type, resource, repeat) {
-  if (__asyncHooks !== null && type !== undefined) return __asyncHooks.wrap(fn, type, resource, repeat);
+  if (__asyncTracking && type !== undefined) {
+    if (resource === undefined) resource = {};
+    __initAsyncResource(resource, type);
+    const context = __asyncContextGet();
+    return function boundAsyncResource(...args) {
+      try {
+        return __runAsyncCallback(resource, context, fn, this, args);
+      } finally {
+        if (!repeat) __destroyAsyncResource(resource);
+      }
+    };
+  }
   const context = __asyncContextGet();
   if (context === undefined) return fn;
   return function boundWithAsyncContext(...args) {
@@ -119,7 +182,12 @@ class __GlueRegistry extends Map {
   }
   get(key) {
     const pending = this.pending.get(key);
-    if (pending !== undefined) for (const rec of [...pending]) __glueRun(rec);
+    // Indexed loops here and in __glueRun: loading glue must not depend on the (deletable)
+    // array iterator.
+    if (pending !== undefined) {
+      const recs = pending.slice();
+      for (let i = 0; i < recs.length; i++) __glueRun(recs[i]);
+    }
     const value = super.get(key);
     if (value instanceof __LazyValue) {
       const made = value.make();
@@ -161,7 +229,8 @@ function __glueRun(rec) {
   } finally {
     __glueIndex = saved;
     rec.state = 2;
-    for (const [reg, name] of rec.names) {
+    for (let i = 0; i < rec.names.length; i++) {
+      const reg = rec.names[i][0], name = rec.names[i][1];
       const recs = reg.pending.get(name);
       const at = recs.indexOf(rec);
       if (at >= 0) recs.splice(at, 1);
@@ -194,8 +263,11 @@ function __lazyGlue(index, builtins, internals, globals, init) {
       }
       return globalThis[name];
     };
+    // The slot keeps the enumerability it has when filled (the bootstrap settles it).
     const set = (value) => {
-      Object.defineProperty(globalThis, name, { value, writable: true, enumerable: true, configurable: true });
+      const now = Object.getOwnPropertyDescriptor(globalThis, name);
+      const enumerable = now !== undefined && now.get === get ? now.enumerable : true;
+      Object.defineProperty(globalThis, name, { value, writable: true, enumerable, configurable: true });
     };
     Object.defineProperty(globalThis, name, { get, set, enumerable: false, configurable: true });
   }
@@ -208,22 +280,30 @@ const __internals = new __GlueRegistry();
 // Shared by util.promisify and the builtins that annotate callback signatures (fs), which must not
 // load util to name it.
 __internals.set("customPromisifyArgs", Symbol("customPromisifyArgs"));
+// What process.getActiveResourcesInfo() / _getActiveHandles() / _getActiveRequests() report:
+// open handles (each with `hasRef()`, `_resourceType` and `_resourceOwner()`), in-flight
+// callback requests (each with `_resourceType`), and the counts of ref'd armed Timeouts and of
+// pending Immediates.
+const __activeResources = { handles: new Set(), requests: new Set(), timeouts: 0, immediates: 0 };
+// structured clone's reviver lookup for a `deserializeInfo` ("internal/<area>/...:Name"): the glue
+// file owning <area> registers `cloneModule:internal/<area>` as a `(moduleId, name)` lookup.
+Object.defineProperty(globalThis, "__lumenCloneResolve", {
+  value(info) {
+    const colon = info.indexOf(":");
+    if (colon < 0) return undefined;
+    const id = info.slice(0, colon);
+    const load = __internals.get(`cloneModule:${id.split("/").slice(0, 2).join("/")}`);
+    return typeof load === "function" ? load(id, info.slice(colon + 1)) : undefined;
+  },
+  writable: true,
+  configurable: true,
+});
 
-// libuv's error table (uv_err_name / uv_strerror): name -> description, and the negative errno
-// each platform's libuv reports (Windows uses libuv's own -40xx range; Unix negates errno). Names
-// missing from a platform's override list use libuv's portable value (the Windows column).
+// libuv's error table (uv_err_name / uv_strerror): errno -> [name, description], with the negative
+// errno this platform's libuv reports (from lumen_os::uv).
 let __uvErrmapCache;
 function __uvErrmap() {
-  if (__uvErrmapCache !== undefined) return __uvErrmapCache;
-  const desc = {E2BIG:"argument list too long",EACCES:"permission denied",EADDRINUSE:"address already in use",EADDRNOTAVAIL:"address not available",EAFNOSUPPORT:"address family not supported",EAGAIN:"resource temporarily unavailable",EAI_ADDRFAMILY:"address family not supported",EAI_AGAIN:"temporary failure",EAI_BADFLAGS:"bad ai_flags value",EAI_BADHINTS:"invalid value for hints",EAI_CANCELED:"request canceled",EAI_FAIL:"permanent failure",EAI_FAMILY:"ai_family not supported",EAI_MEMORY:"out of memory",EAI_NODATA:"no address",EAI_NONAME:"unknown node or service",EAI_OVERFLOW:"argument buffer overflow",EAI_PROTOCOL:"resolved protocol is unknown",EAI_SERVICE:"service not available for socket type",EAI_SOCKTYPE:"socket type not supported",EALREADY:"connection already in progress",EBADF:"bad file descriptor",EBUSY:"resource busy or locked",ECANCELED:"operation canceled",ECHARSET:"invalid Unicode character",ECONNABORTED:"software caused connection abort",ECONNREFUSED:"connection refused",ECONNRESET:"connection reset by peer",EDESTADDRREQ:"destination address required",EEXIST:"file already exists",EFAULT:"bad address in system call argument",EFBIG:"file too large",EHOSTUNREACH:"host is unreachable",EINTR:"interrupted system call",EINVAL:"invalid argument",EIO:"i/o error",EISCONN:"socket is already connected",EISDIR:"illegal operation on a directory",ELOOP:"too many symbolic links encountered",EMFILE:"too many open files",EMSGSIZE:"message too long",ENAMETOOLONG:"name too long",ENETDOWN:"network is down",ENETUNREACH:"network is unreachable",ENFILE:"file table overflow",ENOBUFS:"no buffer space available",ENODEV:"no such device",ENOENT:"no such file or directory",ENOMEM:"not enough memory",ENONET:"machine is not on the network",ENOPROTOOPT:"protocol not available",ENOSPC:"no space left on device",ENOSYS:"function not implemented",ENOTCONN:"socket is not connected",ENOTDIR:"not a directory",ENOTEMPTY:"directory not empty",ENOTSOCK:"socket operation on non-socket",ENOTSUP:"operation not supported on socket",EOVERFLOW:"value too large for defined data type",EPERM:"operation not permitted",EPIPE:"broken pipe",EPROTO:"protocol error",EPROTONOSUPPORT:"protocol not supported",EPROTOTYPE:"protocol wrong type for socket",ERANGE:"result too large",EROFS:"read-only file system",ESHUTDOWN:"cannot send after transport endpoint shutdown",ESPIPE:"invalid seek",ESRCH:"no such process",ETIMEDOUT:"connection timed out",ETXTBSY:"text file is busy",EXDEV:"cross-device link not permitted",UNKNOWN:"unknown error",EOF:"end of file",ENXIO:"no such device or address",EMLINK:"too many links",EHOSTDOWN:"host is down",EREMOTEIO:"remote I/O error",ENOTTY:"inappropriate ioctl for device",EFTYPE:"inappropriate file type or format",EILSEQ:"illegal byte sequence",ESOCKTNOSUPPORT:"socket type not supported",ENODATA:"no data available",EUNATCH:"protocol driver not attached"};
-  const base = {E2BIG:-4093,EACCES:-4092,EADDRINUSE:-4091,EADDRNOTAVAIL:-4090,EAFNOSUPPORT:-4089,EAGAIN:-4088,EAI_ADDRFAMILY:-3000,EAI_AGAIN:-3001,EAI_BADFLAGS:-3002,EAI_BADHINTS:-3013,EAI_CANCELED:-3003,EAI_FAIL:-3004,EAI_FAMILY:-3005,EAI_MEMORY:-3006,EAI_NODATA:-3007,EAI_NONAME:-3008,EAI_OVERFLOW:-3009,EAI_PROTOCOL:-3014,EAI_SERVICE:-3010,EAI_SOCKTYPE:-3011,EALREADY:-4084,EBADF:-4083,EBUSY:-4082,ECANCELED:-4081,ECHARSET:-4080,ECONNABORTED:-4079,ECONNREFUSED:-4078,ECONNRESET:-4077,EDESTADDRREQ:-4076,EEXIST:-4075,EFAULT:-4074,EFBIG:-4036,EHOSTUNREACH:-4073,EINTR:-4072,EINVAL:-4071,EIO:-4070,EISCONN:-4069,EISDIR:-4068,ELOOP:-4067,EMFILE:-4066,EMSGSIZE:-4065,ENAMETOOLONG:-4064,ENETDOWN:-4063,ENETUNREACH:-4062,ENFILE:-4061,ENOBUFS:-4060,ENODEV:-4059,ENOENT:-4058,ENOMEM:-4057,ENONET:-4056,ENOPROTOOPT:-4035,ENOSPC:-4055,ENOSYS:-4054,ENOTCONN:-4053,ENOTDIR:-4052,ENOTEMPTY:-4051,ENOTSOCK:-4050,ENOTSUP:-4049,EOVERFLOW:-4026,EPERM:-4048,EPIPE:-4047,EPROTO:-4046,EPROTONOSUPPORT:-4045,EPROTOTYPE:-4044,ERANGE:-4034,EROFS:-4043,ESHUTDOWN:-4042,ESPIPE:-4041,ESRCH:-4040,ETIMEDOUT:-4039,ETXTBSY:-4038,EXDEV:-4037,UNKNOWN:-4094,EOF:-4095,ENXIO:-4033,EMLINK:-4032,EHOSTDOWN:-4031,EREMOTEIO:-4030,ENOTTY:-4029,EFTYPE:-4028,EILSEQ:-4027,ESOCKTNOSUPPORT:-4025,ENODATA:-4024,EUNATCH:-4023};
-  const darwin = {E2BIG:-7,EACCES:-13,EADDRINUSE:-48,EADDRNOTAVAIL:-49,EAFNOSUPPORT:-47,EAGAIN:-35,EALREADY:-37,EBADF:-9,EBUSY:-16,ECANCELED:-89,ECONNABORTED:-53,ECONNREFUSED:-61,ECONNRESET:-54,EDESTADDRREQ:-39,EEXIST:-17,EFAULT:-14,EFBIG:-27,EHOSTUNREACH:-65,EINTR:-4,EINVAL:-22,EIO:-5,EISCONN:-56,EISDIR:-21,ELOOP:-62,EMFILE:-24,EMSGSIZE:-40,ENAMETOOLONG:-63,ENETDOWN:-50,ENETUNREACH:-51,ENFILE:-23,ENOBUFS:-55,ENODEV:-19,ENOENT:-2,ENOMEM:-12,ENOPROTOOPT:-42,ENOSPC:-28,ENOSYS:-78,ENOTCONN:-57,ENOTDIR:-20,ENOTEMPTY:-66,ENOTSOCK:-38,ENOTSUP:-45,EOVERFLOW:-84,EPERM:-1,EPIPE:-32,EPROTO:-100,EPROTONOSUPPORT:-43,EPROTOTYPE:-41,ERANGE:-34,EROFS:-30,ESHUTDOWN:-58,ESPIPE:-29,ESRCH:-3,ETIMEDOUT:-60,ETXTBSY:-26,EXDEV:-18,ENXIO:-6,EMLINK:-31,EHOSTDOWN:-64,ENOTTY:-25,EFTYPE:-79,EILSEQ:-92,ESOCKTNOSUPPORT:-44,ENODATA:-96};
-  const linux = {E2BIG:-7,EACCES:-13,EADDRINUSE:-98,EADDRNOTAVAIL:-99,EAFNOSUPPORT:-97,EAGAIN:-11,EALREADY:-114,EBADF:-9,EBUSY:-16,ECANCELED:-125,ECONNABORTED:-103,ECONNREFUSED:-111,ECONNRESET:-104,EDESTADDRREQ:-89,EEXIST:-17,EFAULT:-14,EFBIG:-27,EHOSTUNREACH:-113,EINTR:-4,EINVAL:-22,EIO:-5,EISCONN:-106,EISDIR:-21,ELOOP:-40,EMFILE:-24,EMSGSIZE:-90,ENAMETOOLONG:-36,ENETDOWN:-100,ENETUNREACH:-101,ENFILE:-23,ENOBUFS:-105,ENODEV:-19,ENOENT:-2,ENOMEM:-12,ENONET:-64,ENOPROTOOPT:-92,ENOSPC:-28,ENOSYS:-38,ENOTCONN:-107,ENOTDIR:-20,ENOTEMPTY:-39,ENOTSOCK:-88,ENOTSUP:-95,EOVERFLOW:-75,EPERM:-1,EPIPE:-32,EPROTO:-71,EPROTONOSUPPORT:-93,EPROTOTYPE:-91,ERANGE:-34,EROFS:-30,ESHUTDOWN:-108,ESPIPE:-29,ESRCH:-3,ETIMEDOUT:-110,ETXTBSY:-26,EXDEV:-18,ENXIO:-6,EMLINK:-31,EHOSTDOWN:-112,EREMOTEIO:-121,ENOTTY:-25,EILSEQ:-84,ESOCKTNOSUPPORT:-94,ENODATA:-61,EUNATCH:-49};
-  const platform = __os.info().platform;
-  const over = platform === "win32" ? {} : platform === "linux" || platform === "android" ? linux : darwin;
-  const map = new Map();
-  for (const name of Object.keys(base)) map.set(over[name] ?? base[name], [name, desc[name]]);
-  return (__uvErrmapCache = map);
+  return (__uvErrmapCache ??= new Map(__oscon.uvErrors().map(([name, errno, desc]) => [errno, [name, desc]])));
 }
 let __uvCodesCache;
 function __uvCodes() {
@@ -411,14 +491,16 @@ const __errors = __lazyObject(() => {
   }, TypeError);
   E("ERR_INVALID_RETURN_VALUE", (input, name, value) => {
     let type;
-    if (value && value.constructor && value.constructor.name) type = `instance of ${value.constructor.name}`;
-    else type = `type ${typeof value}`;
+    if (value?.constructor?.name) type = `an instance of ${value.constructor.name}`;
+    else type = __builtins.get("util").inspect(value, { colors: false });
     return `Expected ${input} to be returned from the "${name}" function but got ${type}.`;
   }, TypeError, RangeError);
   E("ERR_AMBIGUOUS_ARGUMENT", 'The "%s" argument is ambiguous. %s', TypeError);
   E("ERR_INVALID_THIS", 'Value of "this" must be of type %s', TypeError);
   E("ERR_INVALID_STATE", "Invalid state: %s", Error, TypeError, RangeError);
   E("ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor", TypeError);
+  E("ERR_CONSOLE_WRITABLE_STREAM", "Console expects a writable stream instance for %s", TypeError);
+  E("ERR_INCOMPATIBLE_OPTION_PAIR", 'Option "%s" cannot be used in combination with option "%s"', TypeError);
   E("ERR_METHOD_NOT_IMPLEMENTED", "The %s method is not implemented", Error);
   E("ERR_MISSING_OPTION", "%s is required", TypeError);
   E("ERR_UNKNOWN_ENCODING", "Unknown encoding: %s", TypeError);
@@ -456,6 +538,12 @@ const __errors = __lazyObject(() => {
   E("ERR_STREAM_PUSH_AFTER_EOF", "stream.push() after EOF", Error);
   E("ERR_STREAM_UNSHIFT_AFTER_END_EVENT", "stream.unshift() after end event", Error);
   // Node's ERR_INVALID_URL keeps the message fixed and records the offending input (and base).
+  E(
+    "ERR_INVALID_MIME_SYNTAX",
+    (production, str, invalidIndex) =>
+      `The MIME syntax for a ${production} in "${str}" is invalid${invalidIndex !== -1 ? ` at ${invalidIndex}` : ""}`,
+    TypeError,
+  );
   E("ERR_INVALID_URL", "Invalid URL", TypeError);
   {
     const make = codes.ERR_INVALID_URL;
@@ -497,7 +585,14 @@ const __errors = __lazyObject(() => {
   E("ERR_FS_EISDIR", "Path is a directory", Error);
   E("ERR_DIR_CLOSED", "Directory handle was closed", Error);
   E("ERR_DIR_CONCURRENT_OPERATION", "Cannot do synchronous work on directory handle with concurrent asynchronous operations", Error);
-  E("ERR_FALSY_VALUE_REJECTION", "Promise was rejected with falsy value", Error);
+  E(
+    "ERR_FALSY_VALUE_REJECTION",
+    function (reason) {
+      this.reason = reason;
+      return "Promise was rejected with falsy value";
+    },
+    Error,
+  );
   E("ERR_INVALID_CHAR", (name, field = undefined) => {
     let msg = `Invalid character in ${name}`;
     if (field !== undefined) msg += ` ["${field}"]`;
@@ -522,6 +617,7 @@ const __errors = __lazyObject(() => {
   E("ERR_SERVER_ALREADY_LISTEN", "Listen method has been called more than once without closing.", Error);
   E("ERR_USE_AFTER_CLOSE", "%s was closed", Error);
   E("ERR_IPC_CHANNEL_CLOSED", "Channel closed", Error);
+  E("ERR_CHILD_CLOSED_BEFORE_REPLY", "Child closed before reply received", Error);
   E("ERR_INVALID_ADDRESS_FAMILY", function (addressType, host, port) {
     this.host = host;
     this.port = port;
@@ -666,7 +762,7 @@ function __primordialsResolver() {
     "Function", "Int16Array", "Int32Array", "Int8Array", "Map", "Number", "Object", "RangeError",
     "ReferenceError", "RegExp", "Set", "String", "Symbol", "SyntaxError", "TypeError", "URIError",
     "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet",
-    "Promise", "Reflect", "Math", "JSON", "Atomics", "SharedArrayBuffer",
+    "Promise", "Proxy", "Reflect", "Math", "JSON", "Atomics", "SharedArrayBuffer",
     "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "unescape",
     "eval", "isFinite", "isNaN", "parseFloat", "parseInt",
   ];
@@ -847,7 +943,8 @@ function __initByCopy(Class) {
 {
   const perf = globalThis.performance;
   const names = ["mark", "measure", "clearMarks", "clearMeasures", "getEntries", "getEntriesByName",
-    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming"];
+    "getEntriesByType", "clearResourceTimings", "setResourceTimingBufferSize", "markResourceTiming",
+    "timerify", "eventLoopUtilization", "nodeTiming", "addEventListener", "removeEventListener", "dispatchEvent"];
   const materialize = () => {
     for (const n of names) delete perf[n];
     __builtins.get("perf_hooks");

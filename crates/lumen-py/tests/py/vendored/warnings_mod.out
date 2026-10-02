@@ -1,0 +1,8 @@
+[('UserWarning', 'one'), ('DeprecationWarning', 'two'), ('UserWarning', 'three')]
+1
+0
+raised boom
+file.py 10
+DeprecationWarning True
+f.py:3: UserWarning: m
+True

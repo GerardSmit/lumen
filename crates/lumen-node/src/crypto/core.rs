@@ -1,8 +1,13 @@
 //! Digests, HMAC, KDFs and randomness.
 
-use lumen::embed::{JsArrayBuffer, OpDesc, OpError, SendError};
+use lumen::embed::{JsArrayBuffer, OpError, SendError};
 
 use crate::hash::{self, Algo, Hasher, Hmac};
+
+
+#[lumen_bind::module(name = "crypto")]
+pub(crate) mod bindings {
+use super::*;
 
 fn algo(name: &str) -> Result<Algo, OpError> {
     Algo::from_name(name).ok_or_else(|| OpError::error("Digest method not supported"))
@@ -13,29 +18,31 @@ fn send_algo(name: &str) -> Result<Algo, SendError> {
 }
 
 /// `[outputLength, blockSize, isXof]` of a digest name, or `null` when unknown.
-#[lumen::op(name = "hashInfo")]
+#[op(name = "hashInfo")]
 fn hash_info(name: &str) -> Option<(u32, u32, bool)> {
     Algo::from_name(name).map(|a| (a.out_len() as u32, a.block_len() as u32, a.is_xof()))
 }
 
-#[lumen::op]
+#[op]
 fn digest(name: &str, data: &[u8]) -> Result<Vec<u8>, OpError> {
     Ok(hash::digest(algo(name)?, data))
 }
 
-#[lumen::op(async, name = "digestAsync")]
+#[op(async, name = "digestAsync")]
 fn digest_async(name: String, data: Vec<u8>) -> Result<JsArrayBuffer, SendError> {
     Ok(JsArrayBuffer(hash::digest(send_algo(&name)?, &data)))
 }
 
 /// A streaming digest.
-#[lumen::class(name = "CryptoHash")]
+#[class(name = "CryptoHash")]
 pub struct CryptoHash {
     h: Option<Hasher>,
     xof_len: usize,
+    // Node's handle keeps its digest: a second `digest()` returns it again.
+    done: Option<Vec<u8>>,
 }
 
-#[lumen::methods]
+#[methods]
 impl CryptoHash {
     fn update(&mut self, data: &[u8]) -> Result<(), OpError> {
         self.h.as_mut().ok_or_else(finalized)?.update(data);
@@ -43,13 +50,19 @@ impl CryptoHash {
     }
 
     fn digest(&mut self) -> Result<Vec<u8>, OpError> {
+        if let Some(done) = &self.done {
+            return Ok(done.clone());
+        }
         let len = self.xof_len;
-        Ok(self.h.take().ok_or_else(finalized)?.finish_len(len))
+        let out = self.h.take().ok_or_else(finalized)?.finish_len(len);
+        self.done = Some(out.clone());
+        Ok(out)
     }
 
     fn copy(&self, xof_len: Option<u32>) -> Result<CryptoHash, OpError> {
         let h = self.h.clone().ok_or_else(finalized)?;
-        Ok(CryptoHash { xof_len: xof_len.map_or(self.xof_len, |l| l as usize), h: Some(h) })
+        let xof_len = xof_len.map_or(h.algo().out_len(), |l| l as usize);
+        Ok(CryptoHash { xof_len, h: Some(h), done: None })
     }
 }
 
@@ -58,7 +71,7 @@ fn finalized() -> OpError {
 }
 
 /// `new Hash(name, xofLen)`; throws `Digest method not supported` for an unknown name.
-#[lumen::op(name = "hashNew")]
+#[op(name = "hashNew")]
 fn hash_new(name: &str, xof_len: Option<u32>) -> Result<CryptoHash, OpError> {
     let a = algo(name)?;
     let len = match xof_len {
@@ -69,15 +82,15 @@ fn hash_new(name: &str, xof_len: Option<u32>) -> Result<CryptoHash, OpError> {
         Some(l) => l as usize,
         None => a.out_len(),
     };
-    Ok(CryptoHash { h: Some(Hasher::new(a)), xof_len: len })
+    Ok(CryptoHash { h: Some(Hasher::new(a)), xof_len: len, done: None })
 }
 
-#[lumen::class(name = "CryptoHmac")]
+#[class(name = "CryptoHmac")]
 pub struct CryptoHmac {
     h: Option<Hmac>,
 }
 
-#[lumen::methods]
+#[methods]
 impl CryptoHmac {
     fn update(&mut self, data: &[u8]) -> Result<(), OpError> {
         if let Some(h) = self.h.as_mut() {
@@ -92,7 +105,7 @@ impl CryptoHmac {
     }
 }
 
-#[lumen::op(name = "hmacNew")]
+#[op(name = "hmacNew")]
 fn hmac_new(name: &str, key: &[u8]) -> Result<CryptoHmac, OpError> {
     let a = Algo::from_name(name)
         .filter(|a| hash::supports_mac(*a))
@@ -100,7 +113,7 @@ fn hmac_new(name: &str, key: &[u8]) -> Result<CryptoHmac, OpError> {
     Ok(CryptoHmac { h: Hmac::new(a, key) })
 }
 
-#[lumen::op]
+#[op]
 fn hmac(name: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>, OpError> {
     let a = Algo::from_name(name)
         .filter(|a| hash::supports_mac(*a))
@@ -112,19 +125,19 @@ fn mac_algo(name: &str) -> Option<Algo> {
     Algo::from_name(name).filter(|a| hash::supports_mac(*a))
 }
 
-#[lumen::op]
+#[op]
 fn pbkdf2(name: &str, password: &[u8], salt: &[u8], iterations: u32, keylen: u32) -> Result<Vec<u8>, OpError> {
     let a = mac_algo(name).ok_or_else(|| OpError::type_error(format!("Invalid digest: {name}")).with_code("ERR_CRYPTO_INVALID_DIGEST"))?;
     Ok(hash::pbkdf2(a, password, salt, iterations, keylen as usize))
 }
 
-#[lumen::op(async, name = "pbkdf2Async")]
+#[op(async, name = "pbkdf2Async")]
 fn pbkdf2_async(name: String, password: Vec<u8>, salt: Vec<u8>, iterations: u32, keylen: u32) -> Result<Vec<u8>, SendError> {
     let a = mac_algo(&name).ok_or_else(|| SendError::new("TypeError", format!("Invalid digest: {name}")).with_code("ERR_CRYPTO_INVALID_DIGEST"))?;
     Ok(hash::pbkdf2(a, &password, &salt, iterations, keylen as usize))
 }
 
-#[lumen::op]
+#[op]
 fn hkdf(name: &str, ikm: &[u8], salt: &[u8], info: &[u8], keylen: u32) -> Result<Vec<u8>, OpError> {
     let a = mac_algo(name).ok_or_else(|| OpError::type_error(format!("Invalid digest: {name}")).with_code("ERR_CRYPTO_INVALID_DIGEST"))?;
     if keylen as usize > 255 * a.out_len() {
@@ -133,7 +146,7 @@ fn hkdf(name: &str, ikm: &[u8], salt: &[u8], info: &[u8], keylen: u32) -> Result
     Ok(hash::hkdf(a, ikm, salt, info, keylen as usize))
 }
 
-#[lumen::op(async, name = "hkdfAsync")]
+#[op(async, name = "hkdfAsync")]
 fn hkdf_async(name: String, ikm: Vec<u8>, salt: Vec<u8>, info: Vec<u8>, keylen: u32) -> Result<Vec<u8>, SendError> {
     let a = mac_algo(&name).ok_or_else(|| SendError::new("TypeError", format!("Invalid digest: {name}")).with_code("ERR_CRYPTO_INVALID_DIGEST"))?;
     if keylen as usize > 255 * a.out_len() {
@@ -142,18 +155,18 @@ fn hkdf_async(name: String, ikm: Vec<u8>, salt: Vec<u8>, info: Vec<u8>, keylen: 
     Ok(hash::hkdf(a, &ikm, &salt, &info, keylen as usize))
 }
 
-#[lumen::op]
+#[op]
 fn scrypt(password: &[u8], salt: &[u8], n: f64, r: u32, p: u32, keylen: u32) -> Result<Vec<u8>, OpError> {
     hash::scrypt(password, salt, n as u64, r, p, keylen as usize).map_err(OpError::error)
 }
 
-#[lumen::op(async, name = "scryptAsync")]
+#[op(async, name = "scryptAsync")]
 fn scrypt_async(password: Vec<u8>, salt: Vec<u8>, n: f64, r: u32, p: u32, keylen: u32) -> Result<Vec<u8>, SendError> {
     hash::scrypt(&password, &salt, n as u64, r, p, keylen as usize).map_err(|e| SendError::new("Error", e))
 }
 
 /// Whether scrypt accepts these parameters (N a power of two above one, memory under `maxmem`).
-#[lumen::op(name = "scryptCheck")]
+#[op(name = "scryptCheck")]
 fn scrypt_check(n: f64, r: u32, p: u32, maxmem: f64) -> bool {
     let n = n as u64;
     if n < 2 || !n.is_power_of_two() || r == 0 || p == 0 {
@@ -192,7 +205,7 @@ fn argon2_derive(
     Ok(out)
 }
 
-#[lumen::op(name = "argon2")]
+#[op(name = "argon2")]
 fn argon2_sync(
     kind: u32,
     message: &[u8],
@@ -208,7 +221,7 @@ fn argon2_sync(
         .map_err(OpError::error)
 }
 
-#[lumen::op(async, name = "argon2Async")]
+#[op(async, name = "argon2Async")]
 fn argon2_async(
     kind: u32,
     message: Vec<u8>,
@@ -225,39 +238,13 @@ fn argon2_async(
 }
 
 /// Fill a view with CSPRNG bytes.
-#[lumen::op(name = "randomFill")]
+#[op(name = "randomFill")]
 fn random_fill(buf: &mut [u8]) -> Result<(), OpError> {
-    getrandom::getrandom(buf).map_err(|e| OpError::error(format!("random source failed: {e}")))
+    lumen_os::proc::entropy(buf).map_err(|e| OpError::error(format!("random source failed: {e}")))
 }
 
-#[lumen::op(name = "timingSafeEqual")]
+#[op(name = "timingSafeEqual")]
 fn timing_safe_equal(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    std::hint::black_box(diff) == 0
+    a.len() == b.len() && lumen_common::hash::constant_time_eq(a, b)
 }
-
-pub const OPS: &[&OpDesc] = lumen::ops![
-    hash_info,
-    digest,
-    digest_async,
-    hash_new,
-    hmac_new,
-    hmac,
-    pbkdf2,
-    pbkdf2_async,
-    hkdf,
-    hkdf_async,
-    scrypt,
-    scrypt_async,
-    scrypt_check,
-    argon2_sync,
-    argon2_async,
-    random_fill,
-    timing_safe_equal,
-];
+}

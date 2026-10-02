@@ -9,24 +9,19 @@
 //!
 //! Two sources feed one query, [`Interp::sync_callback_params`], which is keyed by native-fn
 //! identity (the `fn` pointer behind `Callable::Native`):
-//! - `#[lumen::op]` functions: a parameter typed [`SyncFn<'call>`] sets bit
-//!   `OP_SYNC_CB_SHIFT + i` (JS argument `i`) in [`OpDesc::flags`](crate::embed::OpDesc);
-//!   [`Interp::op_desc_of`] finds the descriptor from the fn pointer.
+//! - `lumen_bind` ops: a parameter typed [`SyncFn<'call>`] sets bit `i` (JS argument `i`) of
+//!   the op's callback mask (`Native::CALLBACKS`); [`Interp::op_info_of`] finds it from the fn
+//!   pointer.
 //! - builtins: [`BUILTINS`], resolved once to fn pointers by [`record_builtins`] at realm setup.
 
 #[cfg(feature = "embed")]
-use crate::embed_convert::{ArgCx, FromJs, OpError, Slot};
+use crate::embed_convert::{ArgCx, JsHost, OpError, Slot};
 use crate::interpreter::Interp;
 use crate::value::{Callable, Value};
 use std::collections::HashMap;
 #[cfg(feature = "embed")]
 use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};
-
-/// `OpDesc::flags` bit of JS argument 0 being a [`SyncFn`]; argument `i` is this `<< i`
-/// (`i < 24`).
-#[allow(dead_code)]
-pub const OP_SYNC_CB_SHIFT: u32 = 8;
 
 #[cfg(feature = "embed")]
 /// A callable argument the op may call only while it runs: bound to the op invocation
@@ -49,8 +44,10 @@ impl<'call> SyncFn<'call> {
 }
 
 #[cfg(feature = "embed")]
-impl<'a> FromJs<'a> for SyncFn<'a> {
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
+impl<'a> lumen_bind::FromArg<'a, JsHost> for SyncFn<'a> {
+    const CALLBACK: bool = true;
+
+    fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
         if v.is_callable() {
             Ok(SyncFn { f: v, _not_send: PhantomData })
         } else {
@@ -145,7 +142,7 @@ pub(crate) fn record_builtins(i: &mut Interp) {
 impl Interp {
     /// Bitmask of `callee`'s arguments that are sync non-escaping callbacks (bit `i` = JS
     /// argument `i`), by native-fn identity: a marked builtin ([`BUILTINS`]) or a
-    /// `#[lumen::op]` with [`SyncFn`] parameters. `0` for anything else (including every
+    /// bound op with [`SyncFn`] parameters. `0` for anything else (including every
     /// user function).
     pub fn sync_callback_params(&self, callee: &Value) -> u32 {
         let Some(o) = callee.as_obj() else { return 0 };
@@ -154,8 +151,8 @@ impl Interp {
             _ => return 0,
         };
         #[cfg(feature = "embed")]
-        if let Some(d) = self.op_desc_of(callee) {
-            return d.flags >> OP_SYNC_CB_SHIFT;
+        if let Some(d) = self.op_info_of(callee) {
+            return d.callbacks;
         }
         sync_callback_params_of(f)
     }

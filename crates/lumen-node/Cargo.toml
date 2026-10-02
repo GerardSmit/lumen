@@ -12,24 +12,14 @@ publish = false
 
 [dependencies]
 lumen-host = { path = "../lumen-host" }
-# The binding macros (#[lumen::op] / #[class]) name `::lumen::embed` paths, so the crate is a
-# direct dependency (lumen-host already links it).
-lumen = { path = "../lumen", features = ["macros"] }
+lumen-common = { path = "../lumen-common", features = ["hash"] }
+lumen-os = { path = "../lumen-os" }
+# Natives are declared with lumen-bind and exposed through lumen's JS host (`embed`).
+lumen = { path = "../lumen", features = ["embed"] }
+lumen-bind = { path = "../lumen-bind" }
 
 # node:crypto and crypto.subtle: RustCrypto on every platform (native and wasm32). lumen carries
 # no cryptography of its own.
-getrandom = "0.2"
-digest = "0.10"
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
-sha3 = "0.10"
-ripemd = "0.1"
-blake2 = "0.10"
-sm3 = "0.4"
-hmac = "0.12"
-hkdf = "0.12"
-pbkdf2 = { version = "0.12", default-features = false }
 scrypt = { version = "0.11", default-features = false }
 argon2 = "0.5"
 bcrypt = { version = "0.17", default-features = false }
@@ -59,7 +49,6 @@ p521 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 k256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 ed448-goldilocks-plus = { version = "0.16", default-features = false, features = ["signing", "pkcs8", "zeroize"] }
 pkcs5 = { version = "0.7", features = ["pbes2", "3des", "des-insecure", "sha1-insecure", "alloc"] }
-base64ct = { version = "1", features = ["alloc"] }
 ecdsa = { version = "0.16", features = ["der", "signing", "verifying", "pkcs8", "pem", "digest"] }
 elliptic-curve = { version = "0.13", features = ["sec1", "pkcs8", "pem", "jwk", "ecdh"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }

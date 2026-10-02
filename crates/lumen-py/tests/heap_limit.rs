@@ -1,15 +1,15 @@
 //! `Interp::set_heap_limit`: exceeding the budget raises `MemoryError`. This binary installs the
-//! counting allocator, which makes the accounting exact; without it only single requests larger
+//! size-class allocator, which makes the accounting exact; without it only single requests larger
 //! than the budget are refused (see `heap_limit_without_the_counting_allocator` in limits.rs).
 
-use lumen_py::limits::CountingAlloc;
+use lumen_common::fastalloc::{thread_live_bytes, ClassAlloc};
 use lumen_py::{Interp, Output};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 #[global_allocator]
-static ALLOC: CountingAlloc = CountingAlloc;
+static ALLOC: ClassAlloc = ClassAlloc;
 
 const MB: usize = 1 << 20;
 
@@ -145,9 +145,9 @@ fn limit_can_be_removed() {
 
 #[test]
 fn counting_allocator_tracks_live_bytes() {
-    let before = lumen_py::limits::live_bytes();
+    let before = thread_live_bytes();
     let v = vec![0u8; 5 * MB];
-    assert!(lumen_py::limits::live_bytes() - before >= (5 * MB) as isize);
+    assert!(thread_live_bytes() - before >= (5 * MB) as isize);
     drop(v);
-    assert!(lumen_py::limits::live_bytes() - before < MB as isize);
+    assert!(thread_live_bytes() - before < MB as isize);
 }

@@ -1,14 +1,14 @@
-//! Typed Rust <-> JS conversions and the runtime behind the binding macros (`#[lumen::op]`,
-//! `#[lumen::class]`, `#[lumen::methods]`; feature `macros`). Everything here is reachable
-//! through [`crate::embed`] and usable without the macros: [`FromJs`] / [`IntoJs`] are ordinary
-//! public traits an embedder implements for its own types.
+//! The JS host of `lumen-bind` ([`JsHost`]): every `#[lumen_bind::op]`, `#[class]` and
+//! `#[module]` becomes a JS function, class or namespace object through it. Also the embedder
+//! runtime around it: errors ([`OpError`]), promises ([`Deferred`], [`Promise`]), async work
+//! ([`Completer`], [`AsyncHost`]) and class instances.
 //!
-//! # How a generated wrapper works
-//! A wrapper is a plain [`NativeFn`]. It builds an [`ArgCx`] over `(ctx, this, args)`, converts
-//! each JS argument with `FromJs` (borrowing where the JS storage allows), calls the Rust fn,
-//! and converts the result with `IntoJs`. The `ArgCx` owns everything a borrow needs to stay
-//! valid (coerced strings, snapshot copies, `RefCell` guards of class instances, lent buffers)
-//! and releases it when the wrapper returns.
+//! # How a call works
+//! [`JsHost::entry`] is a plain [`NativeFn`]. It builds an [`ArgCx`] over `(ctx, this, args)`,
+//! the generated thunk converts each argument (borrowing where the JS storage allows), calls the
+//! Rust fn and converts the result. The `ArgCx` owns everything a borrow needs to stay valid
+//! (coerced strings, snapshot copies, `RefCell` guards of class instances, lent buffers) and
+//! releases it when the call returns.
 //!
 //! # Byte-slice borrows (`&[u8]`, `&mut [u8]`)
 //! A slice points straight into the `ArrayBuffer` backing store — no copy. The store lives in the
@@ -23,13 +23,27 @@
 //!
 //! Aliasing is checked per call: a `&mut [u8]` overlapping any other slice argument of the same
 //! buffer is a `TypeError`. SharedArrayBuffer views are copied for `&[u8]` (racy memory cannot
-//! back a Rust reference) and rejected for `&mut [u8]`; immutable buffers reject `&mut [u8]`.
+//! back a shared Rust reference) and borrowed in place for `&mut [u8]`, which writes straight to
+//! the shared memory; immutable buffers reject `&mut [u8]`.
+//!
+//! # Names
+//! Free functions keep their Rust name; class members are camelCased (`set_x` sets `x`);
+//! `name = ".."` / `rename(js = "..")` override both. A function's `length` is its number of
+//! required parameters. Protocols: `iter` is `[Symbol.iterator]`, `next` returns
+//! `{ value, done }`, `str` is `toString`, `len` is a `length` getter; the others are not
+//! installed in JS.
 
-use crate::bytebuf::ByteBuf;
 use crate::fasthash::FastMap;
 use crate::interpreter::{abrupt_value, Interp};
 use crate::lstr::LStr;
 use crate::value::{Callable, Gc, NativeFn, Object, Property, TaInfo, TaKind, Value, WeakGc};
+use lumen_bind::{
+    flags, BigInt, Class, Elem, FnDesc, FnItem, FromArg, Host, IntKind, IntoError, IntoRet,
+    Methods, Module, ModuleItems, Native, NextRet, Owner, Role, ScalarEntry, SpawnHost, State, StateHost,
+};
+pub use lumen_bind::Slot;
+use lumen_common::buffer::StoreSlot;
+use lumen_common::native::NativeError;
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -37,86 +51,26 @@ use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
 
-// =============================================================================================
-// Descriptors
-// =============================================================================================
+/// The JS engine as a `lumen-bind` host.
+pub struct JsHost;
 
-/// An unboxed argument / return kind of a fast op entry (see [`FastSig`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum FastKind {
-    /// `f64` — a JS Number, passed as a double.
-    F64,
-    /// `i32` — ToInt32 of a JS Number, passed as a 32-bit integer.
-    I32,
-    /// `u32` — ToUint32 of a JS Number, passed as a 32-bit integer.
-    U32,
-    /// `bool` — passed and returned as an `i32` that is exactly 0 or 1 (never a C `_Bool`).
-    Bool,
-    /// Return only: no value (`undefined`).
-    Void,
-}
-
-/// An untyped code pointer. The real type is `extern "C" fn(<args per FastSig::args>) -> <ret>`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FastPtr(pub *const ());
-// SAFETY: a code address; carries no data.
-unsafe impl Send for FastPtr {}
-unsafe impl Sync for FastPtr {}
-
-/// The unboxed entry of a `#[op(fast)]` op: an `extern "C"` function taking the arguments
-/// directly (no `Ctx`, no `Value`s, cannot throw). A compiler that has proven the argument
-/// kinds calls `entry` instead of the generic [`OpDesc::native`] wrapper.
-#[derive(Clone, Copy, Debug)]
-pub struct FastSig {
-    pub args: &'static [FastKind],
-    pub ret: FastKind,
-    pub entry: FastPtr,
-}
-
-/// A native op: what `#[lumen::op]` generates (as `<fn name>::DESC`) and what
-/// [`Engine::define_op`](crate::Engine::define_op) registers. Class members use the same shape.
-pub struct OpDesc {
-    /// The JS property / function name.
-    pub name: &'static str,
-    /// The owning class name for class members (`""` for free ops); used in error messages.
-    pub owner: &'static str,
-    /// The function's `length`: JS parameters before the first optional one.
-    pub arity: u32,
-    /// JS parameter names (error messages), indexed by JS argument position.
-    pub params: &'static [&'static str],
-    /// The generic entry: converts, calls, converts back.
-    pub native: NativeFn,
-    /// The unboxed entry of a `#[op(fast)]` op.
-    pub fast: Option<FastSig>,
-    /// `OP_*` flags (see [`private`]).
-    pub flags: u32,
-}
-
-/// Where a value being converted came from — only used to word error messages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Slot {
-    arg: u32,
-    elem: u32,
-}
-
-impl Slot {
-    /// The receiver (`this`).
-    pub const THIS: Slot = Slot {
-        arg: u32::MAX,
-        elem: u32::MAX,
-    };
-    /// JS argument `i` (0-based).
-    pub const fn arg(i: u32) -> Slot {
-        Slot { arg: i, elem: u32::MAX }
+/// The JS name of a bound fn (see the module docs).
+pub fn js_name(d: &FnDesc) -> Cow<'static, str> {
+    if let Some(n) = d.fixed_name("js") {
+        return Cow::Borrowed(n);
     }
-    /// Element `i` of the array at this slot.
-    pub const fn elem(self, i: u32) -> Slot {
-        Slot {
-            arg: self.arg,
-            elem: i,
-        }
+    match d.role {
+        Role::Function => Cow::Borrowed(d.name),
+        Role::Setter => Cow::Owned(lumen_bind::camel_case(lumen_bind::setter_property(d.name))),
+        Role::Proto("str") => Cow::Borrowed("toString"),
+        Role::Proto("len") => Cow::Borrowed("length"),
+        _ => Cow::Owned(lumen_bind::camel_case(d.name)),
     }
+}
+
+/// The JS class name of `T`.
+pub fn class_name<T: Class>() -> &'static str {
+    T::DESC.name_for("js")
 }
 
 // =============================================================================================
@@ -136,25 +90,25 @@ struct ByteBorrow {
 const INLINE_BORROWS: usize = 4;
 
 #[derive(Default)]
-struct Scratch {
+pub(crate) struct Scratch {
     more_borrows: Vec<ByteBorrow>,
-    lent: Vec<(usize, ByteBuf)>,
+    lent: Vec<(usize, StoreSlot)>,
     strs: Vec<LStr>,
     vals: Vec<Box<[Value]>>,
     copies: Vec<Box<[u8]>>,
     guards: Vec<Box<dyn Any>>,
+    new_target: Option<Value>,
 }
 
 const UNDEF: &Value = &Value::Undefined;
 
-/// The per-call conversion context handed to [`FromJs::from_js`]. It owns whatever a borrowed
+/// The per-call context of a bound fn ([`JsHost`]'s `Cx`). It owns whatever a borrowed
 /// argument needs to stay valid until the op returns.
 pub struct ArgCx<'s> {
     interp: *mut Interp,
     this: &'s Value,
     args: &'s [Value],
-    desc: &'static OpDesc,
-    flags: u32,
+    desc: &'static FnDesc,
     /// Set while a `&mut Interp` derived from this context is live (see [`ArgCx::with_ctx`]).
     in_ctx: Cell<bool>,
     nborrow: Cell<usize>,
@@ -170,15 +124,13 @@ impl<'s> ArgCx<'s> {
         ctx: &'s mut Interp,
         this: &'s Value,
         args: &'s [Value],
-        desc: &'static OpDesc,
-        flags: u32,
+        desc: &'static FnDesc,
     ) -> ArgCx<'s> {
         ArgCx {
             interp: ctx,
             this,
             args,
             desc,
-            flags,
             in_ctx: Cell::new(false),
             nborrow: Cell::new(0),
             borrows: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_BORROWS]),
@@ -190,11 +142,11 @@ impl<'s> ArgCx<'s> {
     /// instead of strict type checks).
     #[inline]
     pub fn coerce(&self) -> bool {
-        self.flags & private::OP_COERCE != 0
+        self.desc.flags & flags::COERCE != 0
     }
 
     /// The op's descriptor.
-    pub fn desc(&self) -> &'static OpDesc {
+    pub fn desc(&self) -> &'static FnDesc {
         self.desc
     }
 
@@ -208,21 +160,8 @@ impl<'s> ArgCx<'s> {
         self.this
     }
 
-    /// Convert JS argument `i` (missing arguments convert from `undefined`).
     #[inline]
-    pub fn arg<'a, T: FromJs<'a>>(&'a self, i: u32) -> Result<T, Value> {
-        let v = self.args.get(i as usize).unwrap_or(UNDEF);
-        T::from_js(self, v, Slot::arg(i))
-    }
-
-    /// Convert the receiver.
-    #[inline]
-    pub fn this_arg<'a, T: FromJs<'a>>(&'a self) -> Result<T, Value> {
-        T::from_js(self, self.this, Slot::THIS)
-    }
-
-    #[inline]
-    fn interp(&self) -> &Interp {
+    pub(crate) fn interp(&self) -> &Interp {
         assert!(!self.in_ctx.get(), "ArgCx used while its Ctx is lent out");
         // SAFETY: `interp` came from a `&mut Interp` that outlives `self`; no `&mut` derived
         // from it is live (checked above).
@@ -233,7 +172,7 @@ impl<'s> ArgCx<'s> {
     /// The returned reference must be dead before any other use of `self`'s interpreter.
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    unsafe fn interp_mut(&self) -> &mut Interp {
+    pub(crate) unsafe fn interp_mut(&self) -> &mut Interp {
         assert!(!self.in_ctx.get(), "ArgCx used while its Ctx is lent out");
         &mut *self.interp
     }
@@ -244,7 +183,7 @@ impl<'s> ArgCx<'s> {
     }
 
     #[allow(clippy::mut_from_ref)]
-    fn scratch(&self) -> &mut Scratch {
+    pub(crate) fn scratch(&self) -> &mut Scratch {
         // SAFETY: single-threaded; every caller finishes with the `&mut Scratch` before calling
         // back into another method that takes it. Borrows handed out point into heap data owned
         // by scratch elements, never into the `Scratch` struct or its vectors' buffers.
@@ -284,8 +223,7 @@ impl<'s> ArgCx<'s> {
         };
         let reset = ResetOnDrop(&self.in_ctx);
         self.in_ctx.set(true);
-        // SAFETY: `State<T>` is `repr(transparent)` over `T`.
-        let st = unsafe { &mut *(slot as *mut T as *mut State<T>) };
+        let st = State::from_mut(slot);
         let r = f(st);
         drop(reset);
         Ok(r)
@@ -311,12 +249,12 @@ impl<'s> ArgCx<'s> {
     /// Move buffer `key` out of the interpreter's table (once); returns its base pointer.
     fn lend(&self, key: usize) -> Option<*mut u8> {
         let s = self.scratch();
-        if let Some((_, b)) = s.lent.iter_mut().find(|(k, _)| *k == key) {
-            return Some(b.as_mut_ptr());
+        if let Some((_, b)) = s.lent.iter().find(|(k, _)| *k == key) {
+            return Some(b.as_ptr());
         }
         let ctx = unsafe { self.interp_mut() };
-        let mut buf = ctx.array_buffers.remove(&key)?;
-        let p = buf.as_mut_ptr();
+        let buf = ctx.array_buffers.remove(&key)?;
+        let p = buf.as_ptr();
         self.scratch().lent.push((key, buf));
         Some(p)
     }
@@ -341,7 +279,7 @@ impl<'s> ArgCx<'s> {
     }
 
     /// `resolve_view` with this call's lent buffers put back for the lookup. No JS runs while
-    /// they are back; moving a `ByteBuf` never moves its heap data, so earlier borrows stay valid.
+    /// they are back; moving a store handle never moves its bytes, so earlier borrows stay valid.
     #[cold]
     fn resolve_with_lent(&self, v: &Value) -> Result<(usize, usize, usize), ViewErr> {
         let s = self.scratch();
@@ -374,7 +312,13 @@ impl<'s> ArgCx<'s> {
         let i = self.interp();
         if let Some(&id) = i.shared_buffers.get(&key) {
             if mutable {
-                return Err(self.type_error(at, "must not be a SharedArrayBuffer view (&mut [u8])"));
+                let mem = crate::interpreter::shared_mem_get(id)
+                    .ok_or_else(|| self.type_error(at, "SharedArrayBuffer memory is gone"))?;
+                let mut m = mem.lock().unwrap();
+                let Some(window) = m.get_mut(off..off + len) else {
+                    return Err(self.type_error(at, "view is out of range of its SharedArrayBuffer"));
+                };
+                return Ok((window.as_mut_ptr(), window.len()));
             }
             let copy: Box<[u8]> = crate::interpreter::shared_mem_get(id)
                 .map(|m| {
@@ -387,7 +331,13 @@ impl<'s> ArgCx<'s> {
             let c = s.copies.last_mut().unwrap();
             return Ok((c.as_mut_ptr(), c.len()));
         }
-        if mutable && i.immutable_buffers.contains(&key) {
+        // A buffer this call already lent out is absent from the table; ask its store directly.
+        let lent_readonly = || {
+            self.scratch_ref()
+                .and_then(|s| s.lent.iter().find(|(k, _)| *k == key).map(|(_, b)| b.is_readonly()))
+                .unwrap_or(false)
+        };
+        if mutable && (i.buffer_immutable(key) || lent_readonly()) {
             return Err(self.type_error(at, "is backed by an immutable ArrayBuffer"));
         }
         // Alias check + base-pointer reuse against earlier borrows of the same buffer.
@@ -410,7 +360,7 @@ impl<'s> ArgCx<'s> {
         let base = match base {
             Some(b) => b,
             None => {
-                let lend_now = self.flags & private::OP_CTX != 0
+                let lend_now = self.desc.flags & flags::CTX != 0
                     || self.scratch_ref().is_some_and(|s| !s.lent.is_empty());
                 if lend_now {
                     match self.lend(key) {
@@ -419,8 +369,8 @@ impl<'s> ArgCx<'s> {
                     }
                 } else {
                     let ctx = unsafe { self.interp_mut() };
-                    match ctx.array_buffers.get_mut(&key) {
-                        Some(b) => b.as_mut_ptr(),
+                    match ctx.array_buffers.get(&key) {
+                        Some(b) => b.as_ptr(),
                         None => return Err(self.view_error(ViewErr::Detached, at)),
                     }
                 }
@@ -455,12 +405,12 @@ impl<'s> ArgCx<'s> {
                 .unwrap_or_default());
         }
         if let Some(b) = i.array_buffers.get(&key) {
-            return Ok(b[off..off + len].to_vec());
+            return Ok(b.bytes()[off..off + len].to_vec());
         }
         // Lent by this very call: read the lent copy.
         if let Some(s) = self.scratch_ref() {
             if let Some((_, b)) = s.lent.iter().find(|(k, _)| *k == key) {
-                return Ok(b[off..off + len].to_vec());
+                return Ok(b.bytes()[off..off + len].to_vec());
             }
         }
         Err(self.view_error(ViewErr::Detached, at))
@@ -487,24 +437,23 @@ impl<'s> ArgCx<'s> {
 
     /// `"Class.op"` / `"op"`.
     pub fn label(&self) -> String {
-        if self.desc.owner.is_empty() {
-            self.desc.name.to_string()
-        } else {
-            format!("{}.{}", self.desc.owner, self.desc.name)
+        let name = js_name(self.desc);
+        match self.desc.owner {
+            Owner::Class(c) => format!("{}.{}", c.name_for("js"), name),
+            _ => name.into_owned(),
         }
     }
 
     fn slot_label(&self, s: Slot) -> String {
-        let mut out = if s.arg == u32::MAX {
-            "receiver (this)".to_string()
-        } else {
-            match self.desc.params.get(s.arg as usize) {
-                Some(n) => format!("argument {} ({})", s.arg + 1, n),
-                None => format!("argument {}", s.arg + 1),
-            }
+        let mut out = match s.index() {
+            None => "receiver (this)".to_string(),
+            Some(i) => match self.desc.named().nth(i as usize) {
+                Some(p) => format!("argument {} ({})", i + 1, p.name),
+                None => format!("argument {}", i + 1),
+            },
         };
-        if s.elem != u32::MAX {
-            out.push_str(&format!(" element {}", s.elem));
+        if let Some(e) = s.element() {
+            out.push_str(&format!(" element {e}"));
         }
         out
     }
@@ -537,7 +486,7 @@ impl<'s> ArgCx<'s> {
 
     /// `#[op(async)]`: run `work` (the op body over its already-converted, owned arguments) on
     /// the host's worker pool; returns the promise (see [`Interp::spawn_blocking`]).
-    pub fn spawn_blocking<R: IntoJs + Send + 'static>(
+    pub fn spawn_blocking<R: IntoRet<JsHost> + Send + 'static>(
         &self,
         work: impl FnOnce() -> R + Send + 'static,
     ) -> Result<Value, Value> {
@@ -545,39 +494,26 @@ impl<'s> ArgCx<'s> {
         // SAFETY: no borrow derived from the context is live past this call.
         let ctx = unsafe { self.interp_mut() };
         let p = ctx.spawn_blocking(work);
-        p.into_js(ctx)
+        p.into_ret(ctx)
     }
 
     /// Convert the op's result (the tail of every wrapper).
-    #[inline]
-    pub fn ret<R: IntoJs>(&self, r: R) -> Result<Value, Value> {
-        if R::MAY_RUN_JS {
+    #[inline(always)]
+    pub fn ret<R: IntoRet<JsHost>>(&self, r: R) -> Result<Value, Value> {
+        if R::MAY_RUN {
             self.before_js();
         }
-        r.into_js(unsafe { self.interp_mut() })
+        r.into_ret(unsafe { self.interp_mut() })
     }
 
     // ---- classes ----
 
-    /// The `new.target` of a class-constructor call; throws when called without `new`.
-    pub fn new_target(&self) -> Result<Value, Value> {
-        let i = self.interp();
-        if !i.constructing {
-            let msg = format!(
-                "Class constructor {} cannot be invoked without 'new'",
-                self.desc.owner
-            );
-            return Err(i.make_error("TypeError", msg));
-        }
-        Ok(i.new_target.clone())
-    }
-
     /// Finish a class constructor: wrap the Rust value in an instance whose prototype comes
-    /// from `new_target` (so JS subclasses get their own prototype and still pass brand checks).
-    pub fn construct_ret<T: Class, R: CtorReturn<T>>(&self, nt: Value, r: R) -> Result<Value, Value> {
+    /// from `new.target` (so JS subclasses get their own prototype and still pass brand checks).
+    fn construct<T: Class>(&self, value: T) -> Result<Value, Value> {
         self.before_js();
+        let nt = self.scratch_ref().and_then(|s| s.new_target.clone()).unwrap_or(Value::Undefined);
         let ctx = unsafe { self.interp_mut() };
-        let value = r.into_ctor_result().map_err(|e| e.to_value(ctx))?;
         // `super(...)` from a JS subclass runs a native parent constructor with the derived
         // instance already allocated as `this`: attach the Rust value to it directly (returning
         // it unchanged, so the engine's native-parent graft has nothing to move).
@@ -585,7 +521,9 @@ impl<'s> ArgCx<'s> {
             attach_instance(ctx, o, value);
             return Ok(self.this.clone());
         }
-        let (_, class_proto) = class_entry::<T>(ctx);
+        let Some((_, class_proto)) = registered_class::<T>(ctx) else {
+            return Err(unregistered::<T>(ctx));
+        };
         let proto = match &nt {
             Value::Obj(_) => match ctx.get_member(&nt, "prototype").map_err(abrupt_value)? {
                 Value::Obj(p) => p,
@@ -596,18 +534,18 @@ impl<'s> ArgCx<'s> {
         Ok(new_instance(ctx, value, proto))
     }
 
-    fn class_rc<T: Class>(&self, v: &Value, at: Slot) -> Result<Rc<RefCell<T>>, Value> {
+    pub(crate) fn class_rc<T: Class>(&self, v: &Value, at: Slot) -> Result<Rc<RefCell<T>>, Value> {
         match host_data(self.interp(), v).and_then(|d| d.downcast::<RefCell<T>>().ok()) {
             Some(rc) => Ok(rc),
             None if at == Slot::THIS => {
                 let msg = format!(
                     "{}: illegal invocation (receiver is not a {})",
                     self.label(),
-                    T::NAME
+                    class_name::<T>()
                 );
                 Err(self.interp().make_error("TypeError", msg))
             }
-            None => Err(self.type_error(at, &format!("must be a {}", T::NAME))),
+            None => Err(self.type_error(at, &format!("must be a {}", class_name::<T>()))),
         }
     }
 
@@ -645,7 +583,7 @@ impl<'s> ArgCx<'s> {
     fn borrow_conflict<T: Class>(&self, at: Slot) -> Value {
         self.type_error(
             at,
-            &format!("is a {} already in use by an enclosing call (re-entrant borrow)", T::NAME),
+            &format!("is a {} already in use by an enclosing call (re-entrant borrow)", class_name::<T>()),
         )
     }
 }
@@ -741,74 +679,40 @@ fn resolve_view(i: &Interp, v: &Value) -> Result<(usize, usize, usize), ViewErr>
     if let Some(b) = i.array_buffers.get(&p) {
         return Ok((p, 0, b.len()));
     }
-    if o.borrow().props.contains("__abMaxByteLength") {
+    if o.borrow().props.contains("\u{0}ab_max_byte_length") {
         return Err(ViewErr::Detached);
     }
     Err(ViewErr::NotView)
 }
 
 // =============================================================================================
-// FromJs
+// The host
 // =============================================================================================
 
-/// Convert a JS value into a Rust argument. `'a` is the lifetime of the call's [`ArgCx`]:
-/// implementations may borrow from the argument value or from storage the context holds.
-///
-/// Implement it for your own types by delegating to the provided impls (`f64::from_js`, ...)
-/// or to `ArgCx` helpers ([`ArgCx::type_error`], [`ArgCx::with_ctx`] for anything that
-/// needs the interpreter).
-pub trait FromJs<'a>: Sized {
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value>;
-}
-
-/// Types that may appear as elements of a `Vec<T>` argument or result (a JS Array). Everything
-/// except `u8` (a `Vec<u8>` is a byte buffer). Implement it for your own element types.
-pub trait ArrayElem {}
-
-impl<'a> FromJs<'a> for Value {
-    #[inline]
-    fn from_js(_: &'a ArgCx<'_>, v: &'a Value, _: Slot) -> Result<Self, Value> {
-        Ok(v.clone())
+#[inline(always)]
+fn js_entry<N: Native<JsHost>>(ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if matches!(N::DESC.role, Role::Constructor) {
+        return js_construct::<N>(ctx, this, args);
     }
+    let cx = ArgCx::new(ctx, &this, args, N::DESC);
+    N::call(&cx)
 }
 
-impl<'a> FromJs<'a> for &'a Value {
-    #[inline]
-    fn from_js(_: &'a ArgCx<'_>, v: &'a Value, _: Slot) -> Result<Self, Value> {
-        Ok(v)
+#[inline(never)]
+fn js_construct<N: Native<JsHost>>(ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if !ctx.constructing {
+        let name = match N::DESC.owner {
+            Owner::Class(c) => c.name_for("js"),
+            _ => N::DESC.name,
+        };
+        let msg = format!("Class constructor {name} cannot be invoked without 'new'");
+        return Err(ctx.make_error("TypeError", msg));
     }
+    let nt = ctx.new_target.clone();
+    let cx = ArgCx::new(ctx, &this, args, N::DESC);
+    cx.scratch().new_target = Some(nt);
+    N::call(&cx)
 }
-
-impl<'a> FromJs<'a> for f64 {
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        match v {
-            Value::Num(n) => Ok(*n),
-            _ => cx.number_slow(v, at),
-        }
-    }
-}
-
-impl<'a> FromJs<'a> for f32 {
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        f64::from_js(cx, v, at).map(|n| n as f32)
-    }
-}
-
-macro_rules! int32_from_js {
-    ($($t:ty),*) => {$(
-        /// JS ToInt32/ToUint32 wrapping (modulo 2^N) of a Number, like WebIDL integer types.
-        impl<'a> FromJs<'a> for $t {
-            #[inline]
-            fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-                let n = f64::from_js(cx, v, at)?;
-                Ok(crate::eval::to_int32(n) as $t)
-            }
-        }
-    )*};
-}
-int32_from_js!(i8, u8, i16, u16, i32, u32);
 
 impl ArgCx<'_> {
     /// A 64-bit integer argument: a Number that is a safe integer (|n| <= 2^53-1), or a BigInt.
@@ -835,131 +739,17 @@ impl ArgCx<'_> {
             Err(self.range_error(at, "must be a safe integer"))
         }
     }
-}
 
-macro_rules! int64_from_js {
-    ($($t:ty),*) => {$(
-        /// A safe-integer Number or a BigInt in range; otherwise RangeError/TypeError.
-        impl<'a> FromJs<'a> for $t {
-            fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-                cx.int64(v, at, <$t>::MIN as i128, <$t>::MAX as i128).map(|n| n as $t)
-            }
-        }
-    )*};
-}
-int64_from_js!(i64, u64, isize, usize);
-
-/// A BigInt-typed 64-bit integer: accepts a BigInt (or an integral Number) and always returns
-/// a BigInt. Plain `i64`/`u64` return Numbers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct BigI64(pub i64);
-/// The unsigned counterpart of [`BigI64`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct BigU64(pub u64);
-
-impl<'a> FromJs<'a> for BigI64 {
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        cx.int64(v, at, i64::MIN as i128, i64::MAX as i128).map(|n| BigI64(n as i64))
-    }
-}
-impl<'a> FromJs<'a> for BigU64 {
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        cx.int64(v, at, 0, u64::MAX as i128).map(|n| BigU64(n as u64))
-    }
-}
-
-impl<'a> FromJs<'a> for bool {
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        match v {
-            Value::Bool(b) => Ok(*b),
-            _ if cx.coerce() => Ok(cx.interp().to_boolean(v)),
-            _ => Err(cx.type_error(at, "must be a boolean")),
-        }
-    }
-}
-
-impl<'a> FromJs<'a> for &'a str {
-    /// Borrows the JS string's UTF-8 storage. Lone surrogates appear as the private-use
-    /// scalars U+10F800.. (lumen's internal smuggling scheme), so the `str` is always valid.
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        match v {
-            Value::Str(s) => Ok(s.as_str()),
-            _ if cx.coerce() => {
-                cx.before_js();
-                let s = unsafe { cx.interp_mut() }
-                    .to_string(v)
-                    .map_err(abrupt_value)?;
-                Ok(cx.hold_str(s))
-            }
-            _ => Err(cx.type_error(at, "must be a string")),
-        }
-    }
-}
-
-impl<'a> FromJs<'a> for String {
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        <&str>::from_js(cx, v, at).map(str::to_owned)
-    }
-}
-
-impl<'a> FromJs<'a> for Cow<'a, str> {
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        <&str>::from_js(cx, v, at).map(Cow::Borrowed)
-    }
-}
-
-impl<'a> FromJs<'a> for &'a [u8] {
-    /// Zero-copy view of an ArrayBuffer / TypedArray (any element type) / DataView.
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        let (p, n) = cx.view_bytes(v, at, false)?;
-        // SAFETY: see the module docs (pointer borrow / lending).
-        Ok(unsafe { std::slice::from_raw_parts(p, n) })
-    }
-}
-
-impl<'a> FromJs<'a> for &'a mut [u8] {
-    /// Zero-copy mutable view; writes are visible to JS after the call.
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        let (p, n) = cx.view_bytes(v, at, true)?;
-        // SAFETY: as above, plus the per-call alias check.
-        Ok(unsafe { std::slice::from_raw_parts_mut(p, n) })
-    }
-}
-
-impl<'a> FromJs<'a> for Vec<u8> {
-    /// A copy of a view's bytes.
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        cx.view_copy(v, at)
-    }
-}
-
-impl<'a, T: FromJs<'a>> FromJs<'a> for Option<T> {
-    /// `undefined` (or a missing argument) and `null` are `None`.
-    #[inline]
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        match v {
-            Value::Undefined | Value::Null => Ok(None),
-            _ => T::from_js(cx, v, at).map(Some),
-        }
-    }
-}
-
-impl<'a, T: FromJs<'a> + ArrayElem> FromJs<'a> for Vec<T> {
-    /// A JS Array, element by element (reads go through `[[Get]]`, so getters run).
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
+    /// The elements of a JS Array (reads go through `[[Get]]`, so getters run), held until the
+    /// call returns.
+    fn array_items(&self, v: &Value, at: Slot) -> Result<&[Value], Value> {
         let is_array = matches!(v, Value::Obj(o) if o.borrow().exotic.is_array());
         if !is_array {
-            return Err(cx.type_error(at, "must be an array"));
+            return Err(self.type_error(at, "must be an array"));
         }
-        cx.before_js();
+        self.before_js();
         let items: Box<[Value]> = {
-            let ctx = unsafe { cx.interp_mut() };
+            let ctx = unsafe { self.interp_mut() };
             let len = ctx.get_member(v, "length").map_err(abrupt_value)?;
             let len = match len {
                 Value::Num(n) if n >= 0.0 => n as usize,
@@ -971,16 +761,344 @@ impl<'a, T: FromJs<'a> + ArrayElem> FromJs<'a> for Vec<T> {
             }
             items.into_boxed_slice()
         };
-        let s = cx.scratch();
+        let s = self.scratch();
         s.vals.push(items);
         let p: *const [Value] = &**s.vals.last().unwrap();
         // SAFETY: the boxed slice is owned by scratch until the context drops.
-        let items: &'a [Value] = unsafe { &*p };
-        items
-            .iter()
-            .enumerate()
-            .map(|(k, e)| T::from_js(cx, e, at.elem(k as u32)))
-            .collect()
+        Ok(unsafe { &*p })
+    }
+}
+
+impl Host for JsHost {
+    const NAME: &'static str = "js";
+    type Value = Value;
+    type Error = Value;
+    type Ctx = Interp;
+    type Cx<'s> = ArgCx<'s>;
+    type Entry = NativeFn;
+
+    fn entry<N: Native<Self>>() -> NativeFn {
+        js_entry::<N>
+    }
+
+    /// JS has no keywords: named parameters are the arguments in declaration order, and
+    /// `undefined` is a missing argument (so it takes the default).
+    #[inline(always)]
+    fn bind<'c, const N: usize>(cx: &'c ArgCx<'_>) -> Result<[Option<&'c Value>; N], Value> {
+        let args: &'c [Value] = cx.args;
+        let max = cx.desc.max_pos as usize;
+        // Keyword-only parameters after `*args` cannot be passed positionally.
+        let positional = if N > max && cx.desc.has_varargs() { max } else { N };
+        Ok(std::array::from_fn(|i| match args.get(i) {
+            Some(Value::Undefined) | None => None,
+            Some(v) if i < positional => Some(v),
+            Some(_) => None,
+        }))
+    }
+
+    fn rest<'c>(cx: &'c ArgCx<'_>) -> &'c [Value] {
+        let args: &'c [Value] = cx.args;
+        args.get(cx.desc.max_pos as usize..).unwrap_or(&[])
+    }
+
+    fn varkw<'c>(_: &'c ArgCx<'_>) -> Vec<(&'c str, &'c Value)> {
+        Vec::new()
+    }
+
+    #[inline(always)]
+    fn this<'c>(cx: &'c ArgCx<'_>) -> &'c Value {
+        cx.this
+    }
+
+    #[inline(always)]
+    fn absent() -> &'static Value {
+        UNDEF
+    }
+
+    #[inline(always)]
+    fn with_ctx<R>(cx: &ArgCx<'_>, f: impl FnOnce(&mut Interp) -> R) -> R {
+        cx.with_ctx(f)
+    }
+
+    #[inline(always)]
+    fn ret<R: IntoRet<Self>>(cx: &ArgCx<'_>, r: R) -> Result<Value, Value> {
+        cx.ret(r)
+    }
+
+    fn ret_next<R: NextRet<Self>>(cx: &ArgCx<'_>, r: R) -> Result<Value, Value> {
+        cx.before_js();
+        r.into_next(unsafe { cx.interp_mut() })
+    }
+
+    fn construct<T: Class>(cx: &ArgCx<'_>, value: T) -> Result<Value, Value> {
+        cx.construct(value)
+    }
+
+    #[inline(always)]
+    fn is_none(v: &Value) -> bool {
+        matches!(v, Value::Undefined | Value::Null)
+    }
+
+    #[inline(always)]
+    fn to_f64(cx: &ArgCx<'_>, v: &Value, at: Slot) -> Result<f64, Value> {
+        match v {
+            Value::Num(n) => Ok(*n),
+            _ => cx.number_slow(v, at),
+        }
+    }
+
+    /// Up to 32 bits: ToInt32 / ToUint32 wrapping (modulo 2^N) of a Number, like WebIDL integer
+    /// types. 64 bits: a safe-integer Number or a BigInt in range.
+    #[inline(always)]
+    fn to_int(cx: &ArgCx<'_>, v: &Value, at: Slot, kind: IntKind) -> Result<i128, Value> {
+        if kind.bits <= 32 {
+            let n = Self::to_f64(cx, v, at)?;
+            Ok(crate::eval::to_int32(n) as i128)
+        } else {
+            cx.int64(v, at, kind.min(), kind.max())
+        }
+    }
+
+    fn to_bigint(cx: &ArgCx<'_>, v: &Value, at: Slot) -> Result<BigInt, Value> {
+        match v {
+            Value::BigInt(b) => Ok(b.clone()),
+            Value::Num(n) => cx.safe_int(*n, at).map(BigInt::from_i128),
+            _ => Err(cx.type_error(at, "must be a bigint")),
+        }
+    }
+
+    #[inline]
+    fn to_bool(cx: &ArgCx<'_>, v: &Value, at: Slot) -> Result<bool, Value> {
+        match v {
+            Value::Bool(b) => Ok(*b),
+            _ if cx.coerce() => Ok(cx.interp().to_boolean(v)),
+            _ => Err(cx.type_error(at, "must be a boolean")),
+        }
+    }
+
+    /// Borrows the JS string's UTF-8 storage. Lone surrogates appear as the private-use
+    /// scalars U+10F800.. (lumen's internal smuggling scheme), so the `str` is always valid.
+    #[inline]
+    fn to_str<'c>(cx: &'c ArgCx<'_>, v: &'c Value, at: Slot) -> Result<&'c str, Value> {
+        match v {
+            Value::Str(s) => Ok(s.as_str()),
+            _ if cx.coerce() => {
+                cx.before_js();
+                let s = unsafe { cx.interp_mut() }.to_string(v).map_err(abrupt_value)?;
+                Ok(cx.hold_str(s))
+            }
+            _ => Err(cx.type_error(at, "must be a string")),
+        }
+    }
+
+    /// Zero-copy view of an ArrayBuffer / TypedArray (any element type) / DataView.
+    #[inline]
+    fn to_bytes<'c>(cx: &'c ArgCx<'_>, v: &'c Value, at: Slot) -> Result<&'c [u8], Value> {
+        let (p, n) = cx.view_bytes(v, at, false)?;
+        // SAFETY: see the module docs (pointer borrow / lending).
+        Ok(unsafe { std::slice::from_raw_parts(p, n) })
+    }
+
+    /// Zero-copy mutable view; writes are visible to JS after the call.
+    #[inline]
+    fn to_bytes_mut<'c>(cx: &'c ArgCx<'_>, v: &'c Value, at: Slot) -> Result<&'c mut [u8], Value> {
+        let (p, n) = cx.view_bytes(v, at, true)?;
+        // SAFETY: as above, plus the per-call alias check.
+        Ok(unsafe { std::slice::from_raw_parts_mut(p, n) })
+    }
+
+    fn to_byte_vec(cx: &ArgCx<'_>, v: &Value, at: Slot) -> Result<Vec<u8>, Value> {
+        cx.view_copy(v, at)
+    }
+
+    fn to_seq<'c>(cx: &'c ArgCx<'_>, v: &'c Value, at: Slot) -> Result<&'c [Value], Value> {
+        cx.array_items(v, at)
+    }
+
+    fn class_ref<'c, T: Class>(cx: &'c ArgCx<'_>, v: &'c Value, at: Slot) -> Result<&'c T, Value> {
+        cx.class_ref(v, at)
+    }
+
+    fn class_mut<'c, T: Class>(cx: &'c ArgCx<'_>, v: &'c Value, at: Slot) -> Result<&'c mut T, Value> {
+        cx.class_mut(v, at)
+    }
+
+    #[inline(always)]
+    fn unit(_: &mut Interp) -> Value {
+        Value::Undefined
+    }
+
+    #[inline(always)]
+    fn none(_: &mut Interp) -> Value {
+        Value::Null
+    }
+
+    #[inline(always)]
+    fn from_bool(_: &mut Interp, b: bool) -> Value {
+        Value::Bool(b)
+    }
+
+    #[inline(always)]
+    fn from_f64(_: &mut Interp, x: f64) -> Value {
+        Value::Num(x)
+    }
+
+    /// A Number; beyond ±(2^53-1) a RangeError (return `BigInt` / `BigI64` for a BigInt).
+    #[inline(always)]
+    fn from_int(ctx: &mut Interp, n: i128) -> Result<Value, Value> {
+        if n.abs() <= 9007199254740991 {
+            Ok(Value::Num(n as f64))
+        } else {
+            Err(ctx.make_error(
+                "RangeError",
+                format!("result {n} exceeds Number.MAX_SAFE_INTEGER (return a BigInt)"),
+            ))
+        }
+    }
+
+    fn from_bigint(_: &mut Interp, n: BigInt) -> Value {
+        Value::BigInt(n)
+    }
+
+    #[inline]
+    fn from_str(_: &mut Interp, s: &str) -> Value {
+        Value::str(s)
+    }
+
+    #[inline]
+    fn from_string(_: &mut Interp, s: String) -> Value {
+        Value::from_string(s)
+    }
+
+    /// A `Uint8Array` that adopts the vector as its backing store (no copy).
+    fn from_bytes(ctx: &mut Interp, b: Vec<u8>) -> Value {
+        uint8array_from_vec(ctx, b)
+    }
+
+    fn from_list(ctx: &mut Interp, items: Vec<Value>) -> Value {
+        ctx.make_array(items)
+    }
+
+    fn from_tuple(ctx: &mut Interp, items: Vec<Value>) -> Value {
+        ctx.make_array(items)
+    }
+
+    fn new_instance<T: Class>(ctx: &mut Interp, value: T) -> Result<Value, Value> {
+        match registered_class::<T>(ctx) {
+            Some((_, proto)) => Ok(new_instance(ctx, value, proto)),
+            None => Err(unregistered::<T>(ctx)),
+        }
+    }
+
+    /// `{ value, done }`.
+    fn iter_step(ctx: &mut Interp, item: Option<Value>) -> Result<Value, Value> {
+        let o = ctx.new_object();
+        {
+            let mut b = o.borrow_mut();
+            let done = item.is_none();
+            b.props.insert("value", Property::plain(item.unwrap_or(Value::Undefined)));
+            b.props.insert("done", Property::plain(Value::Bool(done)));
+        }
+        Ok(Value::Obj(o))
+    }
+
+    fn error(ctx: &mut Interp, e: NativeError) -> Value {
+        OpError::from(e).to_value(ctx)
+    }
+
+    fn class_object<T: Methods<Self>>(ctx: &mut Interp) -> Result<Value, Value> {
+        Ok(class_entry::<T>(ctx).0)
+    }
+
+    fn module_object<M: Module<Self>>(ctx: &mut Interp) -> Result<Value, Value> {
+        let ns = ctx.new_object();
+        install_items(ctx, &ns, ModuleItems::of::<M>())?;
+        Ok(Value::Obj(ns))
+    }
+}
+
+impl StateHost for JsHost {
+    fn with_state<T: 'static, R>(cx: &ArgCx<'_>, f: impl FnOnce(&mut State<T>) -> R) -> Result<R, Value> {
+        cx.with_state(f)
+    }
+}
+
+impl SpawnHost for JsHost {
+    fn spawn_blocking<R: IntoRet<Self> + Send + 'static>(
+        cx: &ArgCx<'_>,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<Value, Value> {
+        cx.spawn_blocking(work)
+    }
+
+    /// The promise from `spawn_blocking` passes through; an argument conversion error (thrown
+    /// before any work was spawned) becomes a rejected promise.
+    fn async_ret(cx: &ArgCx<'_>, r: Result<Value, Value>) -> Result<Value, Value> {
+        let e = match r {
+            Ok(p) => return Ok(p),
+            Err(e) => e,
+        };
+        cx.with_ctx(|ctx| {
+            let d = Deferred::new(ctx);
+            let p = d.promise();
+            ctx.reject_promise(&p, e);
+            Ok(p)
+        })
+    }
+}
+
+/// Install a module's items on `target`.
+fn install_items(ctx: &mut Interp, target: &Gc, items: ModuleItems<JsHost>) -> Result<(), Value> {
+    for f in items.functions.iter().filter(|f| f.desc.exposed_to("js")) {
+        let v = ctx.bound_function(f);
+        target.borrow_mut().props.insert(&*js_name(f.desc), Property::builtin(v));
+    }
+    for c in items.classes.iter().filter(|c| c.desc.exposed_to("js")) {
+        let v = (c.object)(ctx)?;
+        target.borrow_mut().props.insert(c.desc.name_for("js"), Property::builtin(v));
+    }
+    for k in &items.constants {
+        let v = (k.value)(ctx)?;
+        target.borrow_mut().props.insert(k.name, Property::builtin(v));
+    }
+    if let Some(init) = items.init {
+        init(ctx, &Value::Obj(target.clone()))?;
+    }
+    Ok(())
+}
+
+// ---- JS-only parameter and result types ------------------------------------------------------
+
+impl<'a> FromArg<'a, JsHost> for Value {
+    #[inline(always)]
+    fn from_arg(_: &'a ArgCx<'_>, v: &'a Value, _: Slot) -> Result<Self, Value> {
+        Ok(v.clone())
+    }
+}
+
+impl<'a> FromArg<'a, JsHost> for &'a Value {
+    #[inline(always)]
+    fn from_arg(_: &'a ArgCx<'_>, v: &'a Value, _: Slot) -> Result<Self, Value> {
+        Ok(v)
+    }
+}
+
+/// A BigInt-typed 64-bit integer: accepts a BigInt (or an integral Number) and always returns
+/// a BigInt. Plain `i64`/`u64` return Numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BigI64(pub i64);
+/// The unsigned counterpart of [`BigI64`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BigU64(pub u64);
+
+impl<'a> FromArg<'a, JsHost> for BigI64 {
+    fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
+        cx.int64(v, at, i64::MIN as i128, i64::MAX as i128).map(|n| BigI64(n as i64))
+    }
+}
+impl<'a> FromArg<'a, JsHost> for BigU64 {
+    fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
+        cx.int64(v, at, 0, u64::MAX as i128).map(|n| BigU64(n as u64))
     }
 }
 
@@ -1000,8 +1118,7 @@ impl JsObject {
     }
     /// `obj[key]` (runs getters).
     pub fn get(&self, ctx: &mut Interp, key: &str) -> Result<Value, OpError> {
-        ctx.get_member(&self.0, key)
-            .map_err(|a| OpError::thrown(abrupt_value(a)))
+        ctx.get_member(&self.0, key).map_err(|a| OpError::thrown(abrupt_value(a)))
     }
     pub fn from_value(v: Value) -> Option<JsObject> {
         matches!(v, Value::Obj(_)).then_some(JsObject(v))
@@ -1024,8 +1141,8 @@ impl JsFunction {
     }
 }
 
-impl<'a> FromJs<'a> for JsObject {
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
+impl<'a> FromArg<'a, JsHost> for JsObject {
+    fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
         match v {
             Value::Obj(_) => Ok(JsObject(v.clone())),
             _ => Err(cx.type_error(at, "must be an object")),
@@ -1033,8 +1150,8 @@ impl<'a> FromJs<'a> for JsObject {
     }
 }
 
-impl<'a> FromJs<'a> for JsFunction {
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
+impl<'a> FromArg<'a, JsHost> for JsFunction {
+    fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
         if v.is_callable() {
             Ok(JsFunction(v.clone()))
         } else {
@@ -1043,273 +1160,52 @@ impl<'a> FromJs<'a> for JsFunction {
     }
 }
 
-/// The receiver as an op parameter: `fn f(this: This<Value>, ...)`. Not a JS argument.
-pub struct This<T>(pub T);
-impl<T> std::ops::Deref for This<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
+impl<'a, T: Class> FromArg<'a, JsHost> for Rc<RefCell<T>> {
+    /// A shared handle to a class instance's Rust value (no borrow held during the call).
+    fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
+        cx.class_rc::<T>(v, at)
     }
 }
 
-/// Typed host state as an op parameter: `fn f(st: &mut State<Counter>)` reads the `Counter`
-/// the embedder installed with `ctx.op_state().put(Counter { .. })`. Not a JS argument.
-#[repr(transparent)]
-pub struct State<T>(T);
-impl<T> std::ops::Deref for State<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-impl<T> std::ops::DerefMut for State<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
+macro_rules! plain_ret {
+    ($($t:ty => |$s:ident, $c:ident| $e:expr;)*) => {$(
+        impl IntoRet<JsHost> for $t {
+            const MAY_RUN: bool = false;
+            #[inline(always)]
+            fn into_ret(self, $c: &mut Interp) -> Result<Value, Value> {
+                let $s = self;
+                let _ = &$c;
+                Ok($e)
+            }
+        }
+    )*};
 }
 
-// =============================================================================================
-// IntoJs
-// =============================================================================================
-
-/// Convert a Rust result into a JS value. `Err` is a thrown value.
-pub trait IntoJs {
-    /// Whether `into_js` may run JS (getters, thenables, user code). When it may, byte buffers
-    /// the op borrowed are lent first (see the module docs). Keep the default `true` unless the
-    /// conversion only allocates.
-    const MAY_RUN_JS: bool = true;
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value>;
+plain_ret! {
+    Value => |s, _c| s;
+    JsObject => |s, _c| s.0;
+    JsFunction => |s, _c| s.0;
+    BigI64 => |s, _c| Value::bigint_from_i64(s.0);
+    BigU64 => |s, _c| Value::bigint_from_u64(s.0);
+    JsArrayBuffer => |s, c| c.make_array_buffer_from(s.0);
 }
 
-impl IntoJs for () {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::Undefined)
-    }
-}
-impl IntoJs for Value {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(self)
-    }
-}
-impl IntoJs for &Value {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
+impl IntoRet<JsHost> for &Value {
+    const MAY_RUN: bool = false;
+    #[inline(always)]
+    fn into_ret(self, _: &mut Interp) -> Result<Value, Value> {
         Ok(self.clone())
-    }
-}
-impl IntoJs for bool {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::Bool(self))
-    }
-}
-macro_rules! num_into_js {
-    ($($t:ty),*) => {$(
-        impl IntoJs for $t {
-            const MAY_RUN_JS: bool = false;
-            #[inline]
-            fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-                Ok(Value::Num(self as f64))
-            }
-        }
-    )*};
-}
-num_into_js!(f64, f32, i8, u8, i16, u16, i32, u32);
-
-macro_rules! int64_into_js {
-    ($($t:ty),*) => {$(
-        /// A Number; a value beyond ±(2^53-1) throws a RangeError (return `BigI64`/`BigU64`
-        /// for a BigInt instead).
-        impl IntoJs for $t {
-            const MAY_RUN_JS: bool = false;
-            #[inline]
-            fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-                let n = self as i128;
-                if n.abs() <= 9007199254740991 {
-                    Ok(Value::Num(n as f64))
-                } else {
-                    Err(ctx.make_error(
-                        "RangeError",
-                        format!("result {self} exceeds Number.MAX_SAFE_INTEGER (return BigI64/BigU64)"),
-                    ))
-                }
-            }
-        }
-    )*};
-}
-int64_into_js!(i64, u64, isize, usize);
-
-impl IntoJs for BigI64 {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::bigint_from_i64(self.0))
-    }
-}
-impl IntoJs for BigU64 {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::bigint_from_u64(self.0))
-    }
-}
-impl IntoJs for String {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::from_string(self))
-    }
-}
-impl IntoJs for &str {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::str(self))
-    }
-}
-impl IntoJs for &String {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::str(self.as_str()))
-    }
-}
-impl IntoJs for Cow<'_, str> {
-    const MAY_RUN_JS: bool = false;
-    #[inline]
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(match self {
-            Cow::Borrowed(s) => Value::str(s),
-            Cow::Owned(s) => Value::from_string(s),
-        })
-    }
-}
-impl IntoJs for char {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::Str(LStr::from(self)))
-    }
-}
-impl IntoJs for Vec<u8> {
-    const MAY_RUN_JS: bool = false;
-    /// A `Uint8Array` that adopts the vector as its backing store (no copy).
-    #[inline]
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        Ok(uint8array_from_vec(ctx, self))
-    }
-}
-impl IntoJs for Box<[u8]> {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        Ok(uint8array_from_vec(ctx, self.into_vec()))
-    }
-}
-impl IntoJs for &[u8] {
-    const MAY_RUN_JS: bool = false;
-    /// A `Uint8Array` holding a copy.
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        Ok(uint8array_from_vec(ctx, self.to_vec()))
-    }
-}
-impl IntoJs for &mut [u8] {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        Ok(uint8array_from_vec(ctx, self.to_vec()))
     }
 }
 
 /// Return an `ArrayBuffer` (instead of a `Uint8Array`) adopting the bytes.
 pub struct JsArrayBuffer(pub Vec<u8>);
-impl IntoJs for JsArrayBuffer {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        Ok(ctx.make_array_buffer_from(self.0))
-    }
-}
 
-impl<T: IntoJs> IntoJs for Option<T> {
-    const MAY_RUN_JS: bool = T::MAY_RUN_JS;
-    /// `None` is `null`.
-    #[inline]
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        match self {
-            Some(v) => v.into_js(ctx),
-            None => Ok(Value::Null),
-        }
-    }
-}
-
-impl<T: IntoJs, E: Into<OpError>> IntoJs for Result<T, E> {
-    const MAY_RUN_JS: bool = T::MAY_RUN_JS;
-    /// `Err` throws.
-    #[inline]
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        match self {
-            Ok(v) => v.into_js(ctx),
-            Err(e) => Err(e.into().to_value(ctx)),
-        }
-    }
-}
-
-impl<T: IntoJs + ArrayElem> IntoJs for Vec<T> {
-    const MAY_RUN_JS: bool = T::MAY_RUN_JS;
-    /// A JS Array.
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-        let mut out = Vec::with_capacity(self.len());
-        for v in self {
-            out.push(v.into_js(ctx)?);
-        }
-        Ok(ctx.make_array(out))
-    }
-}
-
-macro_rules! tuple_into_js {
-    ($($n:ident),+) => {
-        impl<$($n: IntoJs),+> IntoJs for ($($n,)+) {
-            const MAY_RUN_JS: bool = false $(|| $n::MAY_RUN_JS)+;
-            /// A JS Array.
-            #[allow(non_snake_case)]
-            fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
-                let ($($n,)+) = self;
-                let out = vec![$($n.into_js(ctx)?),+];
-                Ok(ctx.make_array(out))
-            }
-        }
-    };
-}
-tuple_into_js!(A);
-tuple_into_js!(A, B);
-tuple_into_js!(A, B, C);
-tuple_into_js!(A, B, C, D);
-
-impl IntoJs for JsObject {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(self.0)
-    }
-}
-impl IntoJs for JsFunction {
-    const MAY_RUN_JS: bool = false;
-    fn into_js(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(self.0)
-    }
-}
-
-macro_rules! array_elem {
-    ($($t:ty),*) => {$( impl ArrayElem for $t {} )*};
-}
-array_elem!(
-    f64, f32, i8, i16, u16, i32, u32, i64, u64, isize, usize, bool, char, String, Value, JsObject,
-    JsFunction, BigI64, BigU64, Vec<u8>
-);
-impl ArrayElem for &str {}
-impl ArrayElem for Cow<'_, str> {}
-impl<T: ArrayElem> ArrayElem for Option<T> {}
-impl<T: ArrayElem> ArrayElem for Vec<T> {}
+impl Elem for Value {}
+impl Elem for JsObject {}
+impl Elem for JsFunction {}
+impl Elem for BigI64 {}
+impl Elem for BigU64 {}
 
 /// A fresh `Uint8Array` over a fixed-length `ArrayBuffer` that owns `bytes` — built directly
 /// (like `TypedArray` construction does internally) so no JS-visible lookup or copy happens.
@@ -1335,7 +1231,6 @@ fn uint8array_from_vec(i: &mut Interp, bytes: Vec<u8>) -> Value {
     i.ta_buffer.insert(p, buf);
     Value::Obj(obj)
 }
-
 // =============================================================================================
 // Errors
 // =============================================================================================
@@ -1455,31 +1350,7 @@ impl From<&str> for OpError {
 impl From<std::io::Error> for OpError {
     /// An `Error` with a Node-style `code` (`ENOENT`, `EACCES`, ...) when the kind maps to one.
     fn from(e: std::io::Error) -> OpError {
-        use std::io::ErrorKind as K;
-        let code = match e.kind() {
-            K::NotFound => Some("ENOENT"),
-            K::PermissionDenied => Some("EACCES"),
-            K::AlreadyExists => Some("EEXIST"),
-            K::ConnectionRefused => Some("ECONNREFUSED"),
-            K::ConnectionReset => Some("ECONNRESET"),
-            K::ConnectionAborted => Some("ECONNABORTED"),
-            K::TimedOut => Some("ETIMEDOUT"),
-            K::BrokenPipe => Some("EPIPE"),
-            K::InvalidInput => Some("EINVAL"),
-            K::AddrInUse => Some("EADDRINUSE"),
-            K::WouldBlock => Some("EAGAIN"),
-            K::Interrupted => Some("EINTR"),
-            K::Unsupported => Some("ENOTSUP"),
-            K::DirectoryNotEmpty => Some("ENOTEMPTY"),
-            K::IsADirectory => Some("EISDIR"),
-            K::NotADirectory => Some("ENOTDIR"),
-            _ => None,
-        };
-        let err = OpError::error(e.to_string());
-        match code {
-            Some(c) => err.with_code(c),
-            None => err,
-        }
+        NativeError::from(e).into()
     }
 }
 macro_rules! op_error_from {
@@ -1499,6 +1370,28 @@ op_error_from!(
     std::str::Utf8Error => "TypeError",
     std::string::FromUtf8Error => "TypeError",
     Box<dyn std::error::Error + Send + Sync> => "Error",
+);
+
+macro_rules! into_error_via_op_error {
+    ($($t:ty),* $(,)?) => {$(
+        impl IntoError<JsHost> for $t {
+            fn into_error(self, ctx: &mut Interp) -> Value {
+                OpError::from(self).to_value(ctx)
+            }
+        }
+    )*};
+}
+into_error_via_op_error!(
+    OpError,
+    Value,
+    SendError,
+    std::fmt::Error,
+    std::num::ParseIntError,
+    std::num::ParseFloatError,
+    std::num::TryFromIntError,
+    std::str::Utf8Error,
+    std::string::FromUtf8Error,
+    Box<dyn std::error::Error + Send + Sync>,
 );
 
 // =============================================================================================
@@ -1523,8 +1416,8 @@ impl Deferred {
         self.promise.clone()
     }
     /// Fulfil with `v` (a conversion error rejects instead). Queues reactions as microtasks.
-    pub fn resolve<T: IntoJs>(self, ctx: &mut Interp, v: T) {
-        match v.into_js(ctx) {
+    pub fn resolve<T: IntoRet<JsHost>>(self, ctx: &mut Interp, v: T) {
+        match v.into_ret(ctx) {
             Ok(v) => ctx.resolve_promise(&self.promise, v),
             Err(e) => ctx.reject_promise(&self.promise, e),
         }
@@ -1565,8 +1458,8 @@ impl<T> Promise<T> {
     }
 }
 
-impl<T: IntoJs> IntoJs for Promise<T> {
-    fn into_js(self, ctx: &mut Interp) -> Result<Value, Value> {
+impl<T: IntoRet<JsHost>> IntoRet<JsHost> for Promise<T> {
+    fn into_ret(self, ctx: &mut Interp) -> Result<Value, Value> {
         match self.0 {
             PromiseRepr::Pending(p) => Ok(p),
             PromiseRepr::Ready(r) => {
@@ -1593,7 +1486,7 @@ impl<T: IntoJs> IntoJs for Promise<T> {
 //   2. the work runs elsewhere — a worker-pool thread ([`Interp::spawn_blocking`]), a dedicated
 //      thread, or whatever I/O completion the host drives — and finishes by handing the
 //      `Completer` a result. The loop wakes, and on the JS thread converts that result with
-//      `IntoJs` and settles the promise (reactions run in the loop's microtask checkpoint).
+//      `IntoRet` and settles the promise (reactions run in the loop's microtask checkpoint).
 //
 // The loop itself is the host's business ([`AsyncHost`], installed by lumen-runtime). Without
 // one, `spawn_blocking` runs the work inline and settles immediately (still a promise, still
@@ -1631,9 +1524,9 @@ impl Completer {
     }
     /// Settle with `r`, converted on the JS thread: `Ok`/plain values fulfil, `Err` rejects
     /// (`Result<T, E>` with `E: Into<OpError>`, e.g. `io::Error`, `String`, `OpError`).
-    pub fn complete<R: IntoJs + Send + 'static>(mut self, r: R) {
+    pub fn complete<R: IntoRet<JsHost> + Send + 'static>(mut self, r: R) {
         if let Some(send) = self.send.take() {
-            send(Box::new(move |ctx: &mut Interp| r.into_js(ctx)));
+            send(Box::new(move |ctx: &mut Interp| r.into_ret(ctx)));
         }
     }
     /// Settle with a hand-written conversion (runs on the JS thread).
@@ -1692,6 +1585,29 @@ impl From<SendError> for OpError {
             Some(c) => err.with_code(c),
             None => err,
         }
+    }
+}
+
+/// The JS error class of a language-neutral [`NativeError`] kind (the Python mapping lives in
+/// `lumen_py::bind`; the table is in `lumen_common::native`).
+fn native_error_class(kind: lumen_common::native::ErrorKind) -> &'static str {
+    use lumen_common::native::ErrorKind as K;
+    match kind {
+        K::Type | K::Buffer => "TypeError",
+        K::Value | K::Overflow | K::Index | K::ZeroDivision | K::Memory => "RangeError",
+        K::Key | K::Runtime | K::Os(_) | K::NotImplemented => "Error",
+    }
+}
+
+impl From<NativeError> for SendError {
+    fn from(e: NativeError) -> SendError {
+        SendError { class: native_error_class(e.kind), message: e.message.into_owned(), code: e.code }
+    }
+}
+
+impl From<NativeError> for OpError {
+    fn from(e: NativeError) -> OpError {
+        SendError::from(e).into()
     }
 }
 
@@ -1766,9 +1682,9 @@ impl Interp {
     }
 
     /// Run `work` on the host's worker pool and return a promise of its result (converted with
-    /// `IntoJs` back on the JS thread; an `Err` rejects). This is what `#[op(async)]` expands to.
+    /// `IntoRet` back on the JS thread; an `Err` rejects). This is what `#[op(async)]` expands to.
     /// Without an [`AsyncHost`] the work runs inline and the promise is already settled.
-    pub fn spawn_blocking<R: IntoJs + Send + 'static>(
+    pub fn spawn_blocking<R: IntoRet<JsHost> + Send + 'static>(
         &mut self,
         work: impl FnOnce() -> R + Send + 'static,
     ) -> Promise<R> {
@@ -1777,14 +1693,14 @@ impl Interp {
 
     /// [`Interp::spawn_blocking`] on a dedicated thread, for work that may block for an
     /// unbounded time (waiting on a socket, a child process) and must not hold a pool slot.
-    pub fn spawn_thread<R: IntoJs + Send + 'static>(
+    pub fn spawn_thread<R: IntoRet<JsHost> + Send + 'static>(
         &mut self,
         work: impl FnOnce() -> R + Send + 'static,
     ) -> Promise<R> {
         self.spawn_async(work, true)
     }
 
-    fn spawn_async<R: IntoJs + Send + 'static>(
+    fn spawn_async<R: IntoRet<JsHost> + Send + 'static>(
         &mut self,
         work: impl FnOnce() -> R + Send + 'static,
         dedicated: bool,
@@ -1805,53 +1721,6 @@ impl Interp {
 // =============================================================================================
 // Classes
 // =============================================================================================
-
-/// A Rust type exposed as a JS class (implemented by `#[lumen::class]`). The Rust value lives
-/// in an `Rc<RefCell<T>>` attached to the JS instance; methods borrow it per call.
-pub trait Class: Sized + 'static {
-    /// The JS class name.
-    const NAME: &'static str;
-    /// Constructor + members (implemented by `#[lumen::methods]`).
-    fn class_desc() -> &'static ClassDesc;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemberKind {
-    Method,
-    Getter,
-    Setter,
-    StaticMethod,
-    StaticGetter,
-    StaticSetter,
-}
-
-pub struct MemberDesc {
-    pub kind: MemberKind,
-    /// The wrapper; `op.name` is the JS property name.
-    pub op: &'static OpDesc,
-}
-
-pub struct ClassDesc {
-    pub name: &'static str,
-    /// `None`: `new X()` throws "Illegal constructor" (instances come from Rust only).
-    pub constructor: Option<&'static OpDesc>,
-    pub members: &'static [MemberDesc],
-}
-
-/// What a `#[constructor]` may return: `T` or `Result<T, E>`.
-pub trait CtorReturn<T> {
-    fn into_ctor_result(self) -> Result<T, OpError>;
-}
-impl<T: Class> CtorReturn<T> for T {
-    fn into_ctor_result(self) -> Result<T, OpError> {
-        Ok(self)
-    }
-}
-impl<T: Class, E: Into<OpError>> CtorReturn<T> for Result<T, E> {
-    fn into_ctor_result(self) -> Result<T, OpError> {
-        self.map_err(Into::into)
-    }
-}
 
 /// Per-interpreter class table: TypeId -> (constructor, prototype).
 #[derive(Default)]
@@ -1874,11 +1743,19 @@ struct HostEntry {
     data: Rc<dyn Any>,
 }
 
+/// A bound fn registered with an interpreter (see [`Interp::op_info_of`]).
+#[derive(Clone, Copy, Debug)]
+pub struct OpInfo {
+    pub desc: &'static FnDesc,
+    /// Bit `i`: JS argument `i` is a sync non-escaping callback (`SyncFn`).
+    pub callbacks: u32,
+}
+
 /// Registered ops by native entry address (the JIT's fast-op lookup, see
-/// [`Interp::op_desc_of`]).
+/// [`Interp::op_info_of`]).
 #[derive(Default)]
 struct OpRegistry {
-    by_fn: FastMap<usize, &'static OpDesc>,
+    by_fn: FastMap<usize, OpInfo>,
 }
 
 fn host_data(i: &Interp, v: &Value) -> Option<Rc<dyn Any>> {
@@ -1937,93 +1814,104 @@ fn illegal_constructor(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, V
     Err(i.make_error("TypeError", "Illegal constructor"))
 }
 
+fn registered_class<T: Class>(i: &Interp) -> Option<(Value, Gc)> {
+    i.host_state.get::<ClassRegistry>().and_then(|r| r.map.get(&TypeId::of::<T>())).cloned()
+}
+
+#[cold]
+fn unregistered<T: Class>(i: &mut Interp) -> Value {
+    let msg = format!(
+        "class {} is not registered with this engine (define its module or class first)",
+        class_name::<T>()
+    );
+    i.make_error("TypeError", msg)
+}
+
 /// This interpreter's constructor + prototype for `T`, created on first use.
-fn class_entry<T: Class>(i: &mut Interp) -> (Value, Gc) {
-    if let Some(e) = i
-        .host_state
-        .get::<ClassRegistry>()
-        .and_then(|r| r.map.get(&TypeId::of::<T>()))
-    {
-        return e.clone();
+fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
+    if let Some(e) = registered_class::<T>(i) {
+        return e;
     }
-    let desc = T::class_desc();
+    let mut members = Vec::new();
+    T::members(&mut members);
+    members.retain(|m| m.desc.exposed_to("js"));
+    let name = class_name::<T>();
     let proto = Object::new(Some(i.object_proto.clone()));
-    let (ctor_fn, arity) = match desc.constructor {
-        Some(d) => (d.native, d.arity as usize),
+    let ctor_fn = match members.iter().find(|m| m.desc.role == Role::Constructor) {
+        Some(m) => {
+            register_op(i, m);
+            (m.entry, m.desc.min_pos as usize)
+        }
         None => (illegal_constructor as NativeFn, 0),
     };
-    let ctor = i.make_native(desc.name, arity, ctor_fn);
+    let ctor = i.make_native(name, ctor_fn.1, ctor_fn.0);
     {
         let mut c = ctor.borrow_mut();
         c.is_constructor = true;
-        c.props.insert(
-            "prototype",
-            Property::data(Value::Obj(proto.clone()), false, false, false),
-        );
+        c.props.insert("prototype", Property::data(Value::Obj(proto.clone()), false, false, false));
     }
-    proto.borrow_mut().props.insert(
-        "constructor",
-        Property::data(Value::Obj(ctor.clone()), true, false, true),
-    );
-    crate::builtins::set_to_string_tag(i, &proto, desc.name);
-    // Accessors: pair getters and setters by (static, name).
-    let mut accessors: Vec<(bool, &'static str, Option<Value>, Option<Value>)> = Vec::new();
-    for m in desc.members {
-        let op = m.op;
-        register_op(i, op);
-        let is_static = matches!(
-            m.kind,
-            MemberKind::StaticMethod | MemberKind::StaticGetter | MemberKind::StaticSetter
-        );
-        let target = if is_static { &ctor } else { &proto };
-        match m.kind {
-            MemberKind::Method | MemberKind::StaticMethod => {
-                i.def_method(target, op.name, op.arity as usize, op.native);
-            }
-            MemberKind::Getter | MemberKind::StaticGetter => {
-                let f = i.make_native(&format!("get {}", op.name), 0, op.native);
-                match accessors.iter_mut().find(|a| a.0 == is_static && a.1 == op.name) {
-                    Some(a) => a.2 = Some(Value::Obj(f)),
-                    None => accessors.push((is_static, op.name, Some(Value::Obj(f)), None)),
+    proto
+        .borrow_mut()
+        .props
+        .insert("constructor", Property::data(Value::Obj(ctor.clone()), true, false, true));
+    crate::builtins::set_to_string_tag(i, &proto, name);
+    // Accessors: pair getters and setters by name.
+    let mut accessors: Vec<(Cow<'static, str>, Option<Value>, Option<Value>)> = Vec::new();
+    for m in &members {
+        let d = m.desc;
+        let js = js_name(d);
+        let installed = match d.role {
+            Role::Constructor | Role::Function => false,
+            Role::Proto(p) => matches!(p, "iter" | "next" | "str" | "len"),
+            _ => true,
+        };
+        if !installed {
+            continue;
+        }
+        register_op(i, m);
+        match d.role {
+            Role::Method | Role::Proto("next" | "str") => i.def_method(&proto, &js, d.min_pos as usize, m.entry),
+            Role::Static => i.def_method(&ctor, &js, d.min_pos as usize, m.entry),
+            Role::Proto("iter") => {
+                let f = i.make_native("[Symbol.iterator]", 0, m.entry);
+                if let Some(key) = crate::builtins::well_known_key(i, "iterator") {
+                    proto.borrow_mut().props.insert(key, Property::builtin(Value::Obj(f)));
                 }
             }
-            MemberKind::Setter | MemberKind::StaticSetter => {
-                let f = i.make_native(&format!("set {}", op.name), 1, op.native);
-                match accessors.iter_mut().find(|a| a.0 == is_static && a.1 == op.name) {
-                    Some(a) => a.3 = Some(Value::Obj(f)),
-                    None => accessors.push((is_static, op.name, None, Some(Value::Obj(f)))),
+            Role::Getter | Role::Proto("len") => {
+                let f = Value::Obj(i.make_native(&format!("get {js}"), 0, m.entry));
+                match accessors.iter_mut().find(|a| a.0 == js) {
+                    Some(a) => a.1 = Some(f),
+                    None => accessors.push((js, Some(f), None)),
                 }
             }
+            Role::Setter => {
+                let f = Value::Obj(i.make_native(&format!("set {js}"), 1, m.entry));
+                match accessors.iter_mut().find(|a| a.0 == js) {
+                    Some(a) => a.2 = Some(f),
+                    None => accessors.push((js, None, Some(f))),
+                }
+            }
+            _ => {}
         }
     }
-    for (is_static, name, get, set) in accessors {
-        let target = if is_static { &ctor } else { &proto };
-        target
-            .borrow_mut()
-            .props
-            .insert(name, Property::accessor_prop(get, set, false, true));
+    for (name, get, set) in accessors {
+        proto.borrow_mut().props.insert(&*name, Property::accessor_prop(get, set, false, true));
     }
     let entry = (Value::Obj(ctor), proto);
     if !i.host_state.has::<ClassRegistry>() {
         i.host_state.put(ClassRegistry::default());
     }
-    i.host_state
-        .get_mut::<ClassRegistry>()
-        .unwrap()
-        .map
-        .insert(TypeId::of::<T>(), entry.clone());
+    i.host_state.get_mut::<ClassRegistry>().unwrap().map.insert(TypeId::of::<T>(), entry.clone());
     entry
 }
 
-fn register_op(i: &mut Interp, op: &'static OpDesc) {
+fn register_op(i: &mut Interp, f: &FnItem<JsHost>) {
     if !i.host_state.has::<OpRegistry>() {
         i.host_state.put(OpRegistry::default());
     }
-    i.host_state
-        .get_mut::<OpRegistry>()
-        .unwrap()
-        .by_fn
-        .insert(op.native as usize, op);
+    let info = OpInfo { desc: f.desc, callbacks: f.callbacks };
+    i.host_state.get_mut::<OpRegistry>().unwrap().by_fn.insert(f.entry as usize, info);
 }
 
 // =============================================================================================
@@ -2032,40 +1920,54 @@ fn register_op(i: &mut Interp, op: &'static OpDesc) {
 
 /// Binding-layer methods on the native-function context.
 impl Interp {
-    /// A JS function for `op` (registered for [`Interp::op_desc_of`]).
-    pub fn op_function(&mut self, op: &'static OpDesc) -> Value {
-        register_op(self, op);
-        Value::Obj(self.make_native(op.name, op.arity as usize, op.native))
+    /// A JS function for a bound fn (registered for [`Interp::op_info_of`]).
+    pub fn bound_function(&mut self, f: &FnItem<JsHost>) -> Value {
+        register_op(self, f);
+        Value::Obj(self.make_native(&js_name(f.desc), f.desc.min_pos as usize, f.entry))
     }
 
-    /// The descriptor of the op behind `callee`, if it is a function created from an
-    /// [`OpDesc`] (`define_op`, `define_ops`, `op_function`, class members). The optimizing tier
-    /// uses this (plus [`OpDesc::fast`]) to call `#[op(fast)]` ops without boxing.
-    pub fn op_desc_of(&self, callee: &Value) -> Option<&'static OpDesc> {
+    /// A JS function for `#[op]` `N` (`ctx.op_function::<clamp::Op>()`).
+    pub fn op_function<N: Native<JsHost>>(&mut self) -> Value {
+        self.bound_function(&FnItem::of::<N>())
+    }
+
+    /// A namespace object holding everything `#[module]` `M` declares.
+    pub fn module_object<M: Module<JsHost>>(&mut self) -> Result<Value, Value> {
+        JsHost::module_object::<M>(self)
+    }
+
+    /// Install everything `#[module]` `M` declares directly on `target`.
+    pub fn install_module<M: Module<JsHost>>(&mut self, target: &Value) -> Result<(), Value> {
+        let Value::Obj(o) = target else {
+            return Err(self.make_error("TypeError", "install_module: target must be an object"));
+        };
+        install_items(self, o, ModuleItems::of::<M>())
+    }
+
+    /// The registration record of the bound fn behind `callee`, if it is one (`op_function`,
+    /// modules, class members). The optimizing tier uses it (plus [`FnDesc::scalar`]) to call
+    /// scalar ops without boxing.
+    pub fn op_info_of(&self, callee: &Value) -> Option<OpInfo> {
         let o = callee.as_obj()?;
         let f = match &o.borrow().call {
             Callable::Native(f) => *f,
             _ => return None,
         };
-        self.host_state
-            .get::<OpRegistry>()?
-            .by_fn
-            .get(&(f as usize))
-            .copied()
+        self.host_state.get::<OpRegistry>()?.by_fn.get(&(f as usize)).copied()
     }
 
-    /// The unboxed entry of `callee`, if it is a `#[op(fast)]` op.
-    pub fn fast_op_of(&self, callee: &Value) -> Option<FastSig> {
-        self.op_desc_of(callee)?.fast
+    /// The unboxed entry of `callee`, if it is a scalar op.
+    pub fn fast_op_of(&self, callee: &Value) -> Option<ScalarEntry> {
+        self.op_info_of(callee)?.desc.scalar
     }
 
     /// The constructor of class `T` in this interpreter (created on first use).
-    pub fn class_constructor<T: Class>(&mut self) -> Value {
+    pub fn class_constructor<T: Methods<JsHost>>(&mut self) -> Value {
         class_entry::<T>(self).0
     }
 
     /// Wrap a Rust value as a new JS instance of its class.
-    pub fn new_instance<T: Class>(&mut self, value: T) -> Value {
+    pub fn new_instance<T: Methods<JsHost>>(&mut self, value: T) -> Value {
         let (_, proto) = class_entry::<T>(self);
         new_instance(self, value, proto)
     }
@@ -2109,114 +2011,48 @@ impl Interp {
         let parse = self.get_member(&json, "parse").map_err(abrupt_value)?;
         self.invoke(parse, json, &[Value::str(text)])
     }
+
+    /// `globalThis[name]` when it is an object, else a new plain object installed there.
+    pub fn namespace_object(&mut self, name: &str) -> Value {
+        Value::Obj(self.global_namespace(name))
+    }
+
+    fn global_namespace(&mut self, name: &str) -> Gc {
+        let g = self.global_object();
+        if let Ok(Value::Obj(o)) = self.get_member(&g, name) {
+            return o;
+        }
+        let o = self.new_object();
+        self.global.borrow_mut().props.insert(name, Property::builtin(Value::Obj(o.clone())));
+        o
+    }
 }
 
 impl crate::Engine {
-    /// Define `globalThis.<op.name>` from an op descriptor (`engine.define_op(&clamp::DESC)`).
-    pub fn define_op(&mut self, op: &'static OpDesc) {
-        let f = self.interp.op_function(op);
-        self.interp
-            .global
-            .borrow_mut()
-            .props
-            .insert(op.name, Property::builtin(f));
+    /// Define `globalThis.<name>` as `#[op]` `N` (`engine.define_fn::<clamp::Op>()`).
+    pub fn define_fn<N: Native<JsHost>>(&mut self) {
+        let f = self.interp.op_function::<N>();
+        let name = js_name(N::DESC);
+        self.interp.global.borrow_mut().props.insert(&*name, Property::builtin(f));
     }
 
-    /// Define ops on `globalThis.<namespace>` (created as a plain object if absent, extended if
-    /// it already is one): `engine.define_ops("x", &[&aes_ecb::DESC, &clamp::DESC])` or
-    /// `engine.define_ops("x", lumen::ops![aes_ecb, clamp])`.
-    pub fn define_ops(&mut self, namespace: &str, ops: &[&'static OpDesc]) {
-        let g = self.interp.global_object();
-        let existing = match self.interp.get_member(&g, namespace) {
-            Ok(Value::Obj(o)) => Some(o),
-            _ => None,
-        };
-        let ns = match existing {
-            Some(o) => o,
-            None => {
-                let o = self.interp.new_object();
-                self.interp
-                    .global
-                    .borrow_mut()
-                    .props
-                    .insert(namespace, Property::builtin(Value::Obj(o.clone())));
-                o
-            }
-        };
-        for op in ops {
-            let f = self.interp.op_function(op);
-            ns.borrow_mut().props.insert(op.name, Property::builtin(f));
-        }
+    /// Define `globalThis.<module name>` holding everything `#[module]` `M` declares (an
+    /// existing object of that name is extended).
+    pub fn define_module<M: Module<JsHost>>(&mut self) -> Result<(), Value> {
+        let ns = self.interp.global_namespace(M::DESC.name_for("js"));
+        install_items(&mut self.interp, &ns, ModuleItems::of::<M>())
     }
 
-    /// Define `globalThis.<T::NAME>` as class `T`'s constructor.
-    pub fn define_class<T: Class>(&mut self) {
+    /// Define everything `#[module]` `M` declares as globals.
+    pub fn define_globals<M: Module<JsHost>>(&mut self) -> Result<(), Value> {
+        let g = self.interp.global.clone();
+        install_items(&mut self.interp, &g, ModuleItems::of::<M>())
+    }
+
+    /// Define `globalThis.<class name>` as class `T`'s constructor.
+    pub fn define_class<T: Methods<JsHost>>(&mut self) {
         let ctor = self.interp.class_constructor::<T>();
-        self.interp
-            .global
-            .borrow_mut()
-            .props
-            .insert(T::NAME, Property::builtin(ctor));
-    }
-}
-
-/// Support items for macro-generated code. Not a stable API.
-#[doc(hidden)]
-pub mod private {
-    use super::*;
-
-    pub const OP_COERCE: u32 = 1;
-    pub const OP_CTX: u32 = 2;
-    pub const OP_ASYNC: u32 = 4;
-    /// Bit of JS argument 0 being a `SyncFn` (argument `i`: `<< i`).
-    pub const OP_SYNC_CB_SHIFT: u32 = crate::sync_callbacks::OP_SYNC_CB_SHIFT;
-
-    /// Implemented by `#[methods]`; `#[class]`'s `Class::class_desc` forwards here (a class
-    /// without members still needs an empty `#[methods] impl T {}`).
-    pub trait ClassMethods {
-        fn desc() -> &'static ClassDesc;
-    }
-
-    /// `#[op(async)]`: the promise from [`ArgCx::spawn_blocking`] passes through; an argument
-    /// conversion error (thrown before any work was spawned) becomes a rejected promise.
-    pub fn async_ret(ctx: &mut Interp, r: Result<Value, Value>) -> Result<Value, Value> {
-        if let Ok(p) = r {
-            return Ok(p);
-        }
-        let d = Deferred::new(ctx);
-        let p = d.promise();
-        match r {
-            Ok(v) => ctx.resolve_promise(&p, v),
-            Err(e) => ctx.reject_promise(&p, e),
-        }
-        Ok(p)
-    }
-
-    /// `IntoJs` for a `#[class]` type.
-    pub fn class_into_js<T: Class>(ctx: &mut Interp, v: T) -> Result<Value, Value> {
-        Ok(ctx.new_instance(v))
-    }
-
-    /// `FromJs` for `&T` / `&mut T` of a `#[class]` type.
-    pub fn class_ref<'a, T: Class>(cx: &'a ArgCx<'_>, v: &Value, at: Slot) -> Result<&'a T, Value> {
-        cx.class_ref(v, at)
-    }
-    #[allow(clippy::mut_from_ref)]
-    pub fn class_mut<'a, T: Class>(
-        cx: &'a ArgCx<'_>,
-        v: &Value,
-        at: Slot,
-    ) -> Result<&'a mut T, Value> {
-        cx.class_mut(v, at)
-    }
-
-    pub use super::ArgCx;
-}
-
-impl<'a, T: Class> FromJs<'a> for Rc<RefCell<T>> {
-    /// A shared handle to a class instance's Rust value (no borrow held during the call).
-    fn from_js(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        cx.class_rc::<T>(v, at)
+        self.interp.global.borrow_mut().props.insert(class_name::<T>(), Property::builtin(ctor));
     }
 }
 
@@ -2224,47 +2060,27 @@ impl<'a, T: Class> FromJs<'a> for Rc<RefCell<T>> {
 mod tests {
     use super::*;
 
-    fn sum_native(ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
-        let cx = ArgCx::new(ctx, &this, args, &SUM, 0);
-        let b: &[u8] = cx.arg(0)?;
-        let r: f64 = b.iter().map(|&x| x as f64).sum();
-        cx.ret(r)
-    }
-    static SUM: OpDesc = OpDesc {
-        name: "sum",
-        owner: "",
-        arity: 1,
-        params: &["bytes"],
-        native: sum_native,
-        fast: None,
-        flags: 0,
-    };
+    #[lumen_bind::module(name = "t")]
+    mod t {
+        use super::*;
 
-    fn fill_native(ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
-        let cx = ArgCx::new(ctx, &this, args, &FILL, OP_CTX_FLAG);
-        let a: &mut [u8] = cx.arg(0)?;
-        let b: &[u8] = cx.arg(1)?;
-        let n = cx.with_ctx(|c| {
-            // Re-entrant JS sees the lent buffer as detached.
-            let g = c.global_object();
-            let probe = c.get_member(&g, "probe").map_err(abrupt_value)?;
-            c.invoke(probe, Value::Undefined, &[])
-        })?;
-        for (x, y) in a.iter_mut().zip(b) {
-            *x = *y;
+        #[op]
+        fn sum(bytes: &[u8]) -> f64 {
+            bytes.iter().map(|&x| x as f64).sum()
         }
-        cx.ret(n)
+
+        #[op]
+        fn fill(ctx: &mut Interp, dst: &mut [u8], src: &[u8]) -> Result<Value, Value> {
+            // Re-entrant JS sees the lent buffer as detached.
+            let g = ctx.global_object();
+            let probe = ctx.get_member(&g, "probe").map_err(abrupt_value)?;
+            let n = ctx.invoke(probe, Value::Undefined, &[])?;
+            for (x, y) in dst.iter_mut().zip(src) {
+                *x = *y;
+            }
+            Ok(n)
+        }
     }
-    const OP_CTX_FLAG: u32 = private::OP_CTX;
-    static FILL: OpDesc = OpDesc {
-        name: "fill",
-        owner: "",
-        arity: 2,
-        params: &["dst", "src"],
-        native: fill_native,
-        fast: None,
-        flags: OP_CTX_FLAG,
-    };
 
     fn run(e: &mut crate::Engine, src: &str) -> String {
         match e.eval_value(src).expect("parse") {
@@ -2276,10 +2092,14 @@ mod tests {
             },
             Err(v) => {
                 let m = e.ctx().get_member(&v, "message").ok();
-                format!("threw {}", m.map(|m| match m {
-                    Value::Str(s) => s.to_string(),
-                    _ => "?".into(),
-                }).unwrap_or_default())
+                format!(
+                    "threw {}",
+                    m.map(|m| match m {
+                        Value::Str(s) => s.to_string(),
+                        _ => "?".into(),
+                    })
+                    .unwrap_or_default()
+                )
             }
         }
     }
@@ -2287,8 +2107,7 @@ mod tests {
     #[test]
     fn byte_views_borrow_alias_and_lend() {
         let mut e = crate::Engine::new();
-        e.define_op(&SUM);
-        e.define_op(&FILL);
+        assert!(e.define_globals::<t::Module>().is_ok());
         assert_eq!(run(&mut e, "sum(new Uint8Array([1,2,3]))"), "6");
         assert_eq!(run(&mut e, "sum(new Uint8Array([1,2,3,4]).subarray(1,3))"), "5");
         assert_eq!(run(&mut e, "sum(new Uint16Array([257]).buffer)"), "2");
@@ -2312,11 +2131,7 @@ mod tests {
         assert_eq!(r, "1,2,3");
         // Vec<u8> results adopt the vector.
         let v = uint8array_from_vec(e.ctx(), vec![4, 5, 6]);
-        e.ctx()
-            .global
-            .borrow_mut()
-            .props
-            .insert("made", Property::builtin(v));
+        e.ctx().global.borrow_mut().props.insert("made", Property::builtin(v));
         assert_eq!(run(&mut e, "made instanceof Uint8Array && made.join()"), "4,5,6");
     }
 }

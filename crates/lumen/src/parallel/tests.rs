@@ -145,3 +145,45 @@ fn unsupported_objects_are_rejected_and_repeated_drop_is_steady() {
     sender.collect_garbage();
     assert_eq!(live_objects(), before);
 }
+
+#[test]
+fn functions_use_receiver_globals_and_fresh_code() {
+    let mut sender = Engine::new();
+    evaluate(&mut sender, "var root={arrow:(x)=>Math.max(x,7),async:async function(x){return x+1;},generator:function*(x){yield x;},strict:function(x){'use strict';return this===undefined?x:0;},recursive:function factorial(n){return n<2?1:n*factorial(n-1);},shadow:(x)=>{let outer=9;return {outer:x}.outer+outer;}};");
+    let root = value(&mut sender, "root");
+    let parcel = Parcel::build(&mut sender.interp, &root, Limits::default()).unwrap_or_else(|_| panic!("functions"));
+    std::thread::spawn(move || {
+        let mut receiver = Engine::new();
+        let root = receiver.interp.adopt(parcel);
+        set_data(&receiver.interp.global, "root", root);
+        assert_eq!(evaluate(&mut receiver, "JSON.stringify([root.arrow(2),root.generator(13).next().value,(0,root.strict)(42),root.recursive(5),root.shadow(3)])"), "[7,13,42,120,12]");
+        evaluate(&mut receiver, "var asyncResult;root.async(41).then(x=>asyncResult=x);");
+        assert_eq!(evaluate(&mut receiver, "asyncResult"), "42");
+        receiver.collect_garbage();
+        assert_eq!(evaluate(&mut receiver, "root.recursive(6)"), "720");
+    }).join().unwrap();
+}
+
+#[test]
+fn outer_bindings_are_rejected_but_properties_and_shadowing_are_allowed() {
+    let mut sender = Engine::new();
+    for (source, name) in [
+        ("(()=>{const config=7;return ()=>config;})()", "config"),
+        ("(()=>{let config=7;return ()=>config;})()", "config"),
+        ("(()=>this)", "this"),
+        ("(function(){return ()=>arguments;})()", "arguments"),
+        ("(function(){return ()=>new.target;})()", "new.target"),
+    ] {
+        evaluate(&mut sender, &format!("var root={source};"));
+        let root = value(&mut sender, "root");
+        let error = Parcel::build(&mut sender.interp, &root, Limits::default()).err().expect("capture error");
+        set_data(&sender.interp.global, "error", error);
+        assert_eq!(evaluate(&mut sender, &format!("error instanceof TypeError && error.message.includes('{name}') && error.message.includes('args')")), "true");
+    }
+    evaluate(&mut sender, "const userGlobal=7;var root=()=>userGlobal;");
+    let root = value(&mut sender, "root");
+    assert!(Parcel::build(&mut sender.interp, &root, Limits::default()).is_err());
+    evaluate(&mut sender, "var outer=7;var root=(config)=>{const outer=3;return config.outer+outer;};");
+    let root = value(&mut sender, "root");
+    assert!(Parcel::build(&mut sender.interp, &root, Limits::default()).is_ok());
+}

@@ -1,0 +1,11 @@
+append: BufferError Existing exports of data: object cannot be re-sized
+(127,)
+bytearray(b'\x7f\x02\x03\x04')
+append: BufferError Existing exports of data: object cannot be re-sized
+(127, 2)
+bytearray(b'\x7f\x02\x03\x04\t')
+append: BufferError Existing exports of data: object cannot be re-sized
+(127,)
+b'\x7f\x02\x03\x04\t'
+append: BufferError Existing exports of data: object cannot be re-sized
+None bytearray(b'\x03\x02\x03\x04\t')

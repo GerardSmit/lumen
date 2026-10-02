@@ -1,11 +1,11 @@
 //! `SyncFn<'call>` op parameters and the sync-callback query (`Ctx::sync_callback_params`).
-#![cfg(feature = "macros")]
+#![cfg(feature = "embed")]
 
 use lumen::embed::{OpError, SyncFn, Value};
 use lumen::Engine;
 
 /// Calls `f(i)` for `i < n` and sums the results.
-#[lumen::op]
+#[lumen_bind::op]
 pub fn sum_by(ctx: &mut lumen::embed::Ctx, n: u32, f: SyncFn<'_>) -> Result<f64, OpError> {
     let mut s = 0.0;
     for k in 0..n {
@@ -16,13 +16,13 @@ pub fn sum_by(ctx: &mut lumen::embed::Ctx, n: u32, f: SyncFn<'_>) -> Result<f64,
     Ok(s)
 }
 
-#[lumen::op]
+#[lumen_bind::op]
 pub fn two_cbs(ctx: &mut lumen::embed::Ctx, a: SyncFn<'_>, x: f64, b: SyncFn<'_>) -> Result<Value, OpError> {
     a.call(ctx, Value::Undefined, &[])?;
     b.call(ctx, Value::Undefined, &[Value::Num(x)])
 }
 
-#[lumen::op]
+#[lumen_bind::op]
 pub fn plain(x: f64) -> f64 {
     x
 }
@@ -39,14 +39,16 @@ fn mask(e: &mut Engine, src: &str) -> u32 {
 
 #[test]
 fn op_flags_and_calls() {
-    assert_eq!(sum_by::DESC.flags >> 8, 0b10);
-    assert_eq!(two_cbs::DESC.flags >> 8, 0b101);
-    assert_eq!(plain::DESC.flags >> 8, 0);
+    use lumen::embed::JsHost;
+    use lumen_bind::Native;
+    assert_eq!(<sum_by::Op as Native<JsHost>>::CALLBACKS, 0b10);
+    assert_eq!(<two_cbs::Op as Native<JsHost>>::CALLBACKS, 0b101);
+    assert_eq!(<plain::Op as Native<JsHost>>::CALLBACKS, 0);
 
     let mut e = Engine::new();
-    e.define_op(&sum_by::DESC);
-    e.define_op(&two_cbs::DESC);
-    e.define_op(&plain::DESC);
+    e.define_fn::<sum_by::Op>();
+    e.define_fn::<two_cbs::Op>();
+    e.define_fn::<plain::Op>();
     let r = e.eval_value("sum_by(4, i => i * 10)").unwrap().ok().unwrap();
     assert!(matches!(r, Value::Num(x) if x == 60.0));
     let r = e.eval_value("try { sum_by(2, 1) } catch (e) { e.message }").unwrap().ok().unwrap();

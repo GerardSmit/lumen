@@ -8,6 +8,11 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+# Doc comments on natives are their Python docstrings (CPython's text, indented examples
+# included), not Rust examples.
+[lib]
+doctest = false
+
 [[bin]]
 name = "lumen-py"
 path = "src/main.rs"
@@ -16,4 +21,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-lumen-common = { path = "../lumen-common" }
+lumen-common = { path = "../lumen-common", features = ["hash", "compress"] }
+lumen-os = { path = "../lumen-os" }
+lumen-bind = { path = "../lumen-bind" }
+
+[dev-dependencies]
+# Only for tests/dual_lang.rs: one `#[op]` bound into both engines.
+lumen = { path = "../lumen", default-features = false, features = ["embed"] }

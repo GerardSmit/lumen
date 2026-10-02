@@ -4,6 +4,7 @@
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
 use crate::value::*;
+use lumen_common::limits::size;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
@@ -26,6 +27,7 @@ mod globals;
 mod host;
 mod json;
 mod math;
+pub(crate) mod natives;
 pub(crate) use math::jit_math_fns;
 mod primitives;
 mod promise;
@@ -34,6 +36,7 @@ mod proxy;
 mod reflect;
 mod regexp;
 mod shadowrealm;
+pub(crate) mod vm_context;
 mod string_code_point;
 mod string_substring;
 pub(crate) use string_code_point::nf_code_point_at;
@@ -377,7 +380,7 @@ pub(crate) fn proxy_own_keys(
         let result_set: std::collections::HashSet<&str> =
             key_strs.iter().map(|s| s.as_str()).collect();
         if result_set.len() != key_strs.len() {
-            return Err(i.make_error("TypeError", "ownKeys trap result has duplicate keys"));
+            return Err(i.make_error("TypeError", "'ownKeys' on proxy: trap returned duplicate entries"));
         }
         // Invariants relative to the target's own keys / extensibility.
         if let Value::Obj(t) = target {
@@ -401,7 +404,7 @@ pub(crate) fn proxy_own_keys(
                 if !conf && !result_set.contains(tk.as_str()) {
                     return Err(i.make_error(
                         "TypeError",
-                        "ownKeys trap omitted a non-configurable target key",
+                        &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
                     ));
                 }
             }
@@ -410,14 +413,14 @@ pub(crate) fn proxy_own_keys(
                     if !result_set.contains(tk.as_str()) {
                         return Err(i.make_error(
                             "TypeError",
-                            "ownKeys trap omitted a key of a non-extensible target",
+                            &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
                         ));
                     }
                 }
                 if key_strs.len() != target_keys.len() {
                     return Err(i.make_error(
                         "TypeError",
-                        "ownKeys trap added a key to a non-extensible target",
+                        "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
                     ));
                 }
             }
@@ -603,7 +606,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
                 .and_then(|b| b.as_obj())
                 .is_some_and(|b| {
                     matches!(
-                        b.borrow().props.get("__abResizable").map(|p| p.value()),
+                        b.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
                         Some(Value::Bool(true))
                     )
                 });
@@ -796,6 +799,10 @@ pub(crate) fn proxy_gopd_value(
         ));
     }
     let pd = ab(build_partial(i, &res))?;
+    // A `vm` context's interceptor reports the sandbox's descriptors as they are.
+    if vm_context::is_vm_handler(handler) {
+        return Ok(descriptor_from_prop(i, complete_descriptor(pd)));
+    }
     // A descriptor may be reported for a property the target lacks only on an extensible target.
     if let Value::Obj(t) = target {
         if !t.borrow().props.contains(key) && !t.borrow().extensible {
@@ -985,6 +992,9 @@ fn proxy_define_property(
     )?;
     if !i.to_boolean(&res) {
         return Ok(false);
+    }
+    if vm_context::is_vm_handler(handler) {
+        return Ok(true);
     }
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
@@ -1593,14 +1603,7 @@ fn can_be_held_weakly(i: &Interp, v: &Value) -> bool {
 /// surrogate, or > U+10FFFF is a URIError -> None). An escape whose decoded octet is an ASCII
 /// character in `preserve` (decodeURI's reservedSet) keeps its original `%XX` text instead.
 fn uri_decode(s: &str, preserve: &str) -> Option<String> {
-    fn hex_at(bytes: &[u8], i: usize) -> Option<u8> {
-        if i + 2 >= bytes.len() || bytes[i] != b'%' {
-            return None;
-        }
-        let h = (bytes[i + 1] as char).to_digit(16)?;
-        let l = (bytes[i + 2] as char).to_digit(16)?;
-        Some((h * 16 + l) as u8)
-    }
+    use lumen_common::codec::percent_escape_at as hex_at;
     let bytes = s.as_bytes();
     let mut out = String::new();
     let mut i = 0;
@@ -1640,14 +1643,7 @@ fn uri_decode(s: &str, preserve: &str) -> Option<String> {
         }
         let decoded = std::str::from_utf8(&buf[..cont + 1]).ok()?;
         for c in decoded.chars() {
-            let cp = c as u32;
-            if cp >= crate::jstr::SMUGGLE_BASE {
-                // A real code point in the lone-surrogate smuggle range must take the
-                // engine's smuggled-pair representation (see jstr).
-                out.push_str(&crate::jstr::from_code_points(&[cp]));
-            } else {
-                out.push(c);
-            }
+            crate::jstr::push_char_utf16(&mut out, c);
         }
     }
     Some(out)
@@ -1768,7 +1764,7 @@ fn uri_encode(s: &str, keep: &str) -> Option<String> {
         } else {
             let mut buf = [0u8; 4];
             for b in c.encode_utf8(&mut buf).bytes() {
-                out.push_str(&format!("%{b:02X}"));
+                lumen_common::codec::push_percent_escape(&mut out, b);
             }
         }
     }
@@ -2640,7 +2636,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "Number"
             } else if matches!(b.exotic, Exotic::StrWrap) {
                 "String"
-            } else if b.props.contains("__date_ms") {
+            } else if b.props.contains("\u{0}date_ms") {
                 "Date"
             } else if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
                 "RegExp"
@@ -3093,54 +3089,7 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
 }
 fn install_object(it: &mut Interp) {
     let op = it.object_proto.clone();
-    it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
-        // A string key on an ordinary object or array (no proxy, namespace or typed array —
-        // those clear `ic_plain`): the own entries decide, with no key copy.
-        if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
-            if let Ok(b) = o.try_borrow() {
-                if matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array)
-                    && b.ic_plain.get()
-                    && !Interp::is_private_key(k)
-                {
-                    return Ok(Value::Bool(b.props.contains(k)));
-                }
-            }
-        }
-        let key = ab(i.to_property_key(&arg(args, 0)))?;
-        // A private-name slot (`#x`) is never an observable own property.
-        if Interp::is_private_key(&key) {
-            return Ok(Value::Bool(false));
-        }
-        let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
-        i.materialize_fn(&o);
-        if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
-            return Ok(Value::Bool(true));
-        }
-        // A TypedArray index in range is an own property even though it isn't in the property map;
-        // a canonical-numeric non-index is never an own property.
-        if let Some(info) = ta_info(i, &o) {
-            match i.ta_index_kind(&info, &key) {
-                crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
-                crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
-                crate::value::TaIndex::Ordinary => {}
-            }
-        }
-        // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-            return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
-        }
-        // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
-        let ptr = Gc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            if let Some(res) = i.namespace_own_property(ptr, &key) {
-                ab(res)?;
-                return Ok(Value::Bool(true));
-            }
-        }
-        let has = o.borrow().props.contains(&key);
-        Ok(Value::Bool(has))
-    });
+    it.def_method(&op, "hasOwnProperty", 1, nf_has_own_property);
     // Annex B __defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__.
     fn define_accessor(
         i: &mut Interp,
@@ -3637,7 +3586,9 @@ fn install_object(it: &mut Interp) {
             return Ok(Value::Obj(result));
         }
         for key in o.borrow().props.ordered_keys() {
-            if Interp::is_private_key(&key) {
+            if Interp::is_private_key(&key)
+                || (Interp::is_sym_key(&key) && i.sym_from_key(&key).is_none())
+            {
                 continue;
             }
             let prop = o.borrow().props.get(&key).map(|p| p.clone());
@@ -3795,22 +3746,69 @@ fn install_object(it: &mut Interp) {
 }
 
 /// Named entry so the bytecode call cache can recognize and specialize `Object.hasOwn`.
+pub(crate) fn nf_has_own_property(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+        // A string key on an ordinary object or array (no proxy, namespace or typed array —
+        // those clear `ic_plain`): the own entries decide, with no key copy.
+        if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
+            if let Ok(b) = o.try_borrow() {
+                if matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array)
+                    && b.ic_plain.get()
+                    && !Interp::is_private_key(k)
+                {
+                    return Ok(Value::Bool(b.props.contains(k)));
+                }
+            }
+        }
+        let key = ab(i.to_property_key(&arg(args, 0)))?;
+        // A private-name slot (`#x`) is never an observable own property.
+        if Interp::is_private_key(&key) {
+            return Ok(Value::Bool(false));
+        }
+        let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
+        i.materialize_fn(&o);
+        if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
+            return Ok(Value::Bool(true));
+        }
+        // A TypedArray index in range is an own property even though it isn't in the property map;
+        // a canonical-numeric non-index is never an own property.
+        if let Some(info) = ta_info(i, &o) {
+            match i.ta_index_kind(&info, &key) {
+                crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
+                crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
+                crate::value::TaIndex::Ordinary => {}
+            }
+        }
+        // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
+        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
+            return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
+        }
+        // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
+        let ptr = Gc::as_ptr(&o) as usize;
+        if i.is_namespace(ptr) {
+            if let Some(res) = i.namespace_own_property(ptr, &key) {
+                ab(res)?;
+                return Ok(Value::Bool(true));
+            }
+        }
+        let has = o.borrow().props.contains(&key);
+        Ok(Value::Bool(has))
+}
+
 pub(crate) fn nf_object_has_own(
     i: &mut Interp,
     _this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-    let o = match arg(args, 0) {
-        Value::Obj(o) => o,
-        _ => return Err(i.make_error("TypeError", "Object.hasOwn called on non-object")),
-    };
-    let key = ab(i.to_property_key(&arg(args, 1)))?;
-    i.materialize_fn(&o);
-    let has = {
-        let b = o.borrow();
-        crate::split_view::has_own_elem_obj(&b, &key) || b.props.contains(&key)
-    };
-    Ok(Value::Bool(has))
+    let target = arg(args, 0);
+    if matches!(target, Value::Undefined | Value::Null) {
+        return Err(i.make_error("TypeError", "Cannot convert undefined or null to object"));
+    }
+    nf_has_own_property(i, target, args.get(1..).unwrap_or(&[]))
 }
 
 /// TestIntegrityLevel: extensibility plus per-key configurability (and, for frozen, data-property
@@ -3973,45 +3971,6 @@ fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
     })
 }
 
-/// `Number.prototype.toPrecision(p)`: `p` significant digits, fixed or exponential per the exponent.
-fn to_precision(n: f64, p: usize) -> String {
-    if n == 0.0 {
-        return if p == 1 {
-            "0".to_string()
-        } else {
-            format!("0.{}", "0".repeat(p - 1))
-        };
-    }
-    let neg = n < 0.0;
-    // `p` significant digits via scientific notation (`d.ddde±E`, the mantissa has exactly `p` digits).
-    let sci = format!("{:.*e}", p - 1, n.abs());
-    let (mantissa, exp_str) = sci.split_once('e').unwrap();
-    let e: i32 = exp_str.parse().unwrap();
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let body = if e < -6 || e >= p as i32 {
-        let sign = if e >= 0 { "+" } else { "-" };
-        if p == 1 {
-            format!("{}e{}{}", digits, sign, e.abs())
-        } else {
-            format!("{}.{}e{}{}", &digits[..1], &digits[1..], sign, e.abs())
-        }
-    } else if e >= 0 {
-        let ip = (e + 1) as usize;
-        if ip >= p {
-            digits
-        } else {
-            format!("{}.{}", &digits[..ip], &digits[ip..])
-        }
-    } else {
-        format!("0.{}{}", "0".repeat((-e - 1) as usize), digits)
-    };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
-    }
-}
-
 /// Intrinsic Object.defineProperty, also used by native host property definitions.
 pub(crate) fn object_define_property(
     i: &mut Interp,
@@ -4034,12 +3993,16 @@ pub(crate) fn object_define_property(
             &key,
             &descriptor,
         ))? {
+            if vm_context::is_vm_handler(&handler) {
+                return Err(i.make_error("TypeError", format!("Cannot redefine property: {}", vm_context::key_display(i, &key))));
+            }
             return Err(i.make_error("TypeError", "proxy defineProperty returned a falsish value"));
         }
         return Ok(Value::Obj(o));
     }
     if !ab(define_own_property(i, &o, &key, &descriptor))? {
-        return Err(i.make_error("TypeError", "Cannot redefine property"));
+        let shown = vm_context::key_display(i, &key);
+        return Err(i.make_error("TypeError", format!("Cannot redefine property: {shown}")));
     }
     Ok(Value::Obj(o))
 }
@@ -8527,7 +8490,7 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("RangeError", "invalid count value"));
         }
         let count = n as usize;
-        if s.len().saturating_mul(count) > MAX_STR_LEN {
+        if size::repeat(s.len(), count, MAX_STR_LEN).is_err() {
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
         let out = s.repeat(count);
@@ -8793,11 +8756,7 @@ fn install_string(it: &mut Interp) {
                 // A lone surrogate is a valid argument: smuggle it (see `jstr`).
                 s.push(crate::jstr::smuggle(cp as u16));
             } else if cp >= crate::jstr::SMUGGLE_BASE {
-                // A smuggle-range character is canonically its smuggled pair.
-                let hi = 0xD800 + ((cp - 0x10000) >> 10);
-                let lo = 0xDC00 + ((cp - 0x10000) & 0x3FF);
-                s.push(crate::jstr::smuggle(hi as u16));
-                s.push(crate::jstr::smuggle(lo as u16));
+                crate::jstr::push_char_utf16(&mut s, char::from_u32(cp).unwrap_or('\u{FFFD}'));
             } else {
                 s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
             }
@@ -9044,17 +9003,32 @@ fn to_uint32(n: f64) -> u32 {
     n.trunc().rem_euclid(4294967296.0) as u32
 }
 
-/// A small deterministic PRNG for `Math.random` (lumen has no entropy source; tests only check the
-/// `[0, 1)` range, not distribution).
+/// `Math.random`: xorshift128+ per thread, seeded from the OS-keyed `RandomState` (std's per-process
+/// random SipHash keys) so every process and thread draws its own sequence.
 fn next_random() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x >> 11) as f64 / (1u64 << 53) as f64
+    use std::cell::Cell;
+    use std::hash::{BuildHasher, Hasher};
+    thread_local! {
+        static STATE: Cell<[u64; 2]> = const { Cell::new([0, 0]) };
+    }
+    STATE.with(|cell| {
+        let mut s = cell.get();
+        if s == [0, 0] {
+            let seed = |salt: u64| {
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u64(salt);
+                h.finish()
+            };
+            s = [seed(0x9E37_79B9_7F4A_7C15) | 1, seed(0xBF58_476D_1CE4_E5B9)];
+        }
+        let mut x = s[0];
+        let y = s[1];
+        s[0] = y;
+        x ^= x << 23;
+        s[1] = x ^ y ^ (x >> 17) ^ (y >> 26);
+        cell.set(s);
+        ((s[1].wrapping_add(y)) >> 11) as f64 / (1u64 << 53) as f64
+    })
 }
 
 fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
@@ -9069,63 +9043,3 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     }
 }
 
-/// Number.prototype.toExponential's digit selection: the exact decimal expansion of the binary
-/// value, rounded to `f` fraction digits with ties away from zero (the spec's "larger n").
-/// `shortest` (fractionDigits undefined) picks the minimal digits that round-trip.
-fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
-    // The sign follows x < 0 exclusively; `+ 0.0` then clears a negative zero so it formats as "0".
-    let (sign, x) = if x < 0.0 { ("-", -x) } else { ("", x + 0.0) };
-    let fmt_exp = |exp: i32| format!("e{}{}", if exp < 0 { '-' } else { '+' }, exp.abs());
-    if shortest {
-        let s = format!("{x:e}");
-        let (m, e) = s.split_once('e').unwrap();
-        let exp: i32 = e.parse().unwrap();
-        return format!("{sign}{m}{}", fmt_exp(exp));
-    }
-    if x == 0.0 {
-        let m = if f == 0 {
-            "0".to_string()
-        } else {
-            format!("0.{}", "0".repeat(f))
-        };
-        return format!("{sign}{m}e+0");
-    }
-    // 780 fraction digits is past the longest exact decimal expansion of any f64 mantissa, so the
-    // digits (including everything after the rounding point) are exact.
-    let s = format!("{x:.780e}");
-    let (m, e) = s.split_once('e').unwrap();
-    let mut exp: i32 = e.parse().unwrap();
-    let mut digits: Vec<u8> = m
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| b - b'0')
-        .collect();
-    if digits.len() > f + 1 && digits[f + 1] >= 5 {
-        let mut k = f + 1;
-        loop {
-            if k == 0 {
-                digits.insert(0, 1);
-                exp += 1;
-                break;
-            }
-            k -= 1;
-            if digits[k] == 9 {
-                digits[k] = 0;
-            } else {
-                digits[k] += 1;
-                break;
-            }
-        }
-    }
-    digits.truncate(f + 1);
-    while digits.len() < f + 1 {
-        digits.push(0);
-    }
-    let ds: String = digits.iter().map(|d| (d + b'0') as char).collect();
-    let m = if f == 0 {
-        ds
-    } else {
-        format!("{}.{}", &ds[..1], &ds[1..])
-    };
-    format!("{sign}{m}{}", fmt_exp(exp))
-}

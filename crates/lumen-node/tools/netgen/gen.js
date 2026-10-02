@@ -62,10 +62,6 @@ net = patch(net, `module.exports = {\n`,
   `  return id;\n` +
   `};\n\n` +
   `module.exports = {\n`, 'net.js');
-// lumen's cluster has no handle sharing (no `_getServer`): a worker listens by itself.
-net = patch(net, `  if (cluster.isPrimary || exclusive) {\n`,
-  `  if (cluster.isPrimary || exclusive || typeof cluster._getServer !== 'function') { // lumen\n`,
-  'net.js');
 if (!/\bObjectDefineProperty,/.test(net.slice(0, 2000))) throw new Error('net.js: ObjectDefineProperty not destructured');
 net = patch(net, `} = primordials;\n`, `  PromiseReject,\n} = primordials;\n`, 'net.js');
 

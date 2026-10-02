@@ -25,7 +25,7 @@
 mod ast;
 use lumen_common::bigint;
 mod builtins;
-pub mod bytebuf;
+pub use lumen_common::buffer;
 pub mod bytecode;
 mod console_fmt;
 mod coroutine;
@@ -39,7 +39,9 @@ mod eval;
 /// worker allocations with its own). Binaries opt in:
 /// `#[global_allocator] static A: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;`
 #[cfg(not(target_arch = "wasm32"))]
-pub mod fastalloc;
+pub use lumen_common::fastalloc;
+pub use lumen_common::limits;
+pub mod gc_log;
 use lumen_common::fasthash;
 mod host;
 mod interpreter;
@@ -62,19 +64,16 @@ pub mod memstats;
 mod parser;
 pub mod precompiled;
 mod regex;
-mod regex_emoji;
-mod regex_fold;
 mod snapshot;
 mod split_view;
 mod str_index;
-mod stack;
+use lumen_common::stack;
 mod sync_callbacks;
 mod temporal;
 mod token;
-mod tz;
+use lumen_common::tz;
+mod local_tz;
 pub mod typescript;
-#[rustfmt::skip]
-mod tzdata;
 #[rustfmt::skip]
 mod umalqura;
 #[cfg(feature = "intl")]
@@ -88,6 +87,9 @@ mod cldr_dates;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_units;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod tznames;
 #[rustfmt::skip]
 mod units;
 use lumen_common::unicode_norm_impl;
@@ -117,6 +119,32 @@ static HOST_CLOCK: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new()
 /// milliseconds since the Unix epoch.
 pub fn set_host_clock(f: fn() -> f64) {
     let _ = HOST_CLOCK.set(f);
+}
+
+pub(crate) static TAIL_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn proper tail calls (ES2015 PrepareForTailCall) off for this process. V8 has none, and
+/// hosts that mirror its stack traces need every caller's frame to stay visible.
+pub fn set_tail_calls(on: bool) {
+    TAIL_CALLS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set the process-wide local time zone (V8 keeps one per process too): the zone of `Date`'s
+/// local-time methods and `toString`, the default `Intl.DateTimeFormat` time zone and
+/// `Temporal.Now.timeZoneId`. `name` is an IANA zone (`"Europe/Paris"`; POSIX `TZ` spellings such
+/// as `":Europe/Paris"` or a `.../zoneinfo/Europe/Paris` path work too); `None` means UTC, the
+/// default. Takes effect for every later call. Returns false, and uses UTC, if `name` is unknown.
+pub fn set_local_time_zone(name: Option<&str>) -> bool {
+    local_tz::set(name)
+}
+
+/// The current local time zone's identifier ("UTC" unless [`set_local_time_zone`] chose another).
+pub fn local_time_zone() -> &'static str {
+    local_tz::id()
+}
+
+pub(crate) fn tail_calls_enabled() -> bool {
+    TAIL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Install the WebAssembly JIT host (first call wins; meaningful on wasm32 only). On wasm32 the
@@ -190,6 +218,7 @@ pub fn well_formed_utf8(s: &str) -> std::borrow::Cow<'_, str> {
 /// Ahead-of-time compilation (see [`Engine::load_precompiled`] and the `lumen-aot` crate):
 /// [`precompile`] / [`precompiled::PrecompileBundle`] run at build time and produce a
 /// source-free blob; [`Precompiled`] wraps one linked into the binary.
+pub use interpreter::{AtomicsWaitEvent, AtomicsWaitPhase};
 pub use precompiled::{precompile, Precompiled, SourceKind};
 
 /// A parse-phase failure. test262 reports these as a `SyntaxError` thrown during parsing.
@@ -330,6 +359,11 @@ impl Engine {
     /// Whether this agent may block in `Atomics.wait` (test262's CanBlockIsTrue flag).
     pub fn set_can_block(&mut self, b: bool) {
         self.interp.can_block = b;
+    }
+
+    /// Observe every synchronous `Atomics.wait` of this realm.
+    pub fn set_atomics_wait_hook(&mut self, hook: Option<Box<dyn Fn(&AtomicsWaitEvent)>>) {
+        self.interp.atomics_wait_hook = hook;
     }
 
     pub fn run_as_agent(
@@ -535,7 +569,7 @@ impl Engine {
     /// safe point (a call, a loop turn) throws, every later one throws again, and no further
     /// promise reactions run.
     pub fn set_interrupt(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        self.interp.interrupt = Some(flag);
+        self.interp.stop.set_interrupt(flag);
         self.interp.sync_regex_poll();
     }
 
@@ -543,7 +577,7 @@ impl Engine {
     /// interrupt set, crossing it terminates the realm (see [`Engine::heap_limit_hit`]); without
     /// one it is the usual catchable `RangeError`.
     pub fn set_live_object_limit(&mut self, limit: i64) {
-        self.interp.live_limit = limit.clamp(interpreter::GC_TRIGGER, interpreter::MAX_LIVE);
+        self.interp.live_limit = limit.clamp(interpreter::MIN_LIVE_LIMIT, interpreter::MAX_LIVE);
         self.interp.gc_next = self.interp.gc_next.min(self.interp.live_limit);
     }
 
@@ -562,6 +596,12 @@ impl Engine {
         self.interp.sync_regex_poll();
     }
 
+    /// Make crossing the heap limit terminate the realm outright (see [`Engine::heap_limit_hit`])
+    /// instead of throwing a catchable error first. Needs an interrupt flag on the realm.
+    pub fn set_heap_limit_fatal(&mut self, fatal: bool) {
+        self.interp.heap_fatal = fatal;
+    }
+
     /// Bytes currently allocated through [`fastalloc::ClassAlloc`] by the whole process, or
     /// `None` when it is not the global allocator (a heap limit then has no effect).
     pub fn heap_bytes() -> Option<usize> {
@@ -569,6 +609,14 @@ impl Engine {
         return fastalloc::heap_bytes();
         #[cfg(target_arch = "wasm32")]
         None
+    }
+
+    /// Lower this realm's call-depth ceiling (default [`interpreter::MAX_EVAL_DEPTH`]); past it a
+    /// call throws `RangeError: Maximum call stack size exceeded`. It cannot be raised above the
+    /// default, which is what the engine's thread stacks are sized for.
+    pub fn set_max_depth(&mut self, depth: u32) {
+        self.interp.max_depth = depth.clamp(16, interpreter::MAX_EVAL_DEPTH);
+        self.interp.depth_limit = 0;
     }
 
     /// Whether this realm has been terminated (interrupt or live-object ceiling).
@@ -673,34 +721,17 @@ pub mod embed {
     /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
     pub use crate::value::{NativeClosure, NativeFn, Value};
 
-    // Typed bindings: conversion traits, op/class descriptors, promises (see `embed_convert`).
+    // The JS host of `lumen-bind`, errors, promises and async work (see `embed_convert`).
     pub use crate::embed_convert::{
-        ArgCx, ArrayElem, AsyncHost, BigI64, BigU64, Class, ClassDesc, Completer, CtorReturn,
-        Deferred, FastKind, FastPtr, FastSig, FromJs, IntoJs, JsArrayBuffer, JsFunction, JsObject,
-        MemberDesc, MemberKind, OpDesc, OpError, OpResult, Promise, SendError, Settle, Slot, State,
-        This,
+        class_name, js_name, ArgCx, AsyncHost, BigI64, BigU64, Completer, Deferred, JsArrayBuffer,
+        JsFunction, JsHost, JsObject, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).
     pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};
-    #[doc(hidden)]
-    pub use crate::embed_convert::private as __private;
-    /// The binding macros (feature `macros`), also at the crate root.
-    #[cfg(feature = "macros")]
-    pub use lumen_macros::{class, methods, op};
-}
-
-/// `#[op]` / `#[class]` / `#[methods]` (feature `macros`): see `lumen_macros`.
-#[cfg(feature = "macros")]
-pub use lumen_macros::{class, methods, op};
-
-/// `lumen::ops![a, b, path::c]` — the `&'static OpDesc` list of `#[op]` fns, for
-/// [`Engine::define_ops`].
-#[cfg(feature = "embed")]
-#[macro_export]
-macro_rules! ops {
-    ($($($p:ident)::+),* $(,)?) => {
-        &[$(&$($p)::+::DESC),*]
-    };
+    /// The language-neutral op error (maps to `TypeError` / `RangeError` / `Error`).
+    pub use lumen_common::native::{ErrorKind as NativeErrorKind, NativeError, NativeResult};
+    /// The binding framework (declare natives with `lumen_bind::{op, class, methods, module}`).
+    pub use lumen_bind::{self as bind, State, This};
 }
 
 /// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`
@@ -820,6 +851,35 @@ impl Engine {
             .into_iter()
             .map(|(promise, reason, _)| (promise, reason))
             .collect()
+    }
+
+    /// Start recording rejections that get a handler after being reported unhandled (see
+    /// [`Engine::take_late_handled_rejections`]).
+    pub fn track_late_handled_rejections(&mut self) {
+        self.interp.late_handled_rejections.get_or_insert_with(Vec::new);
+    }
+
+    /// Promises reported by [`Engine::take_unhandled_rejections_full`] that have since been
+    /// handled (Node's `rejectionHandled`), in handling order.
+    pub fn take_late_handled_rejections(&mut self) -> Vec<embed::Value> {
+        match self.interp.late_handled_rejections.as_mut() {
+            Some(list) => std::mem::take(list),
+            None => Vec::new(),
+        }
+    }
+
+    /// Report `queueMicrotask` callback throws through [`Engine::take_task_errors`] instead of
+    /// as unhandled rejections.
+    pub fn report_task_errors(&mut self) {
+        self.interp.task_errors.get_or_insert_with(Vec::new);
+    }
+
+    /// Errors thrown by `queueMicrotask` callbacks since the last call.
+    pub fn take_task_errors(&mut self) -> Vec<embed::Value> {
+        match self.interp.task_errors.as_mut() {
+            Some(list) => std::mem::take(list),
+            None => Vec::new(),
+        }
     }
 
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is

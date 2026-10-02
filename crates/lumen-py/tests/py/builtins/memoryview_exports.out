@@ -1,0 +1,51 @@
+6 6 1 B 1 (6,) (1,) False True
+97 102 b'bcd' [97, 99, 101] b'fedcba'
+bytearray(b'ABCdef')
+b'ABCDef' 414243446566 4142:4344:6566
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+ok None
+ok None
+bytearray(b'feDCrq') 6
+BufferError Existing exports of data: object cannot be re-sized
+[[102, 101, 68], [67, 114, 113]] (2, 3) (3, 1)
+bytearray(b'feDCrq!')
+ValueError operation forbidden on released memoryview object
+ValueError operation forbidden on released memoryview object
+True
+BufferError Existing exports of data: object cannot be re-sized
+bytearray(b'feDCrq!"')
+True True True True
+TypeError cannot modify read-only memory
+ValueError cannot hash writable memoryview object
+i 4 2 True
+TypeError memoryview: cannot cast between two non-byte formats
+TypeError memoryview: product(shape) * itemsize != buffer size
+ValueError memoryview: destination format must be a native single character format prefixed with an optional '@'
+TypeError memoryview: a bytes-like object is required, not 'int'
+TypeError memoryview() missing required argument 'object' (pos 1)
+ok [97, 98]
+TypeError memoryview: a bytes-like object is required, not 'str'
+True True True
+[120, 121, 122] b'zyx'
+ValueError memoryview: invalid value for format 'H'
+TypeError memoryview: invalid type for format 'H'
+bytearray(b'\x00\x00\xff\xff\x00\x00\x00\x00')
+[1.5, 7.0]
+[True, False]
+bytearray(b'\x00\x00\x01\x00\xfe\xff\x00\x00') (1, -2) (281466386841600,)
+bytearray(b'\x00\x00\x01\x00\x07\x00\x00\x00')
+BufferError Existing exports of data: object cannot be re-sized
+[(0,), (1,), (7,), (0,)]
+9
+TypeError argument must be read-write bytes-like object, not memoryview
+BufferError memoryview: underlying buffer is not C-contiguous

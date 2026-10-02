@@ -151,9 +151,9 @@ function deepMatch(subset, obj) {
 
 // ---- hashing ----------------------------------------------------------------------------------
 // All of Bun.hash is real and verified bit-for-bit against Bun 1.2.21 (oracle fixture:
-// crates/lumen-node/tests/fixtures/bun_hash_oracle.txt). crc32/adler32 stay in JS (cheap);
-// wyhash/cityHash/xxHash/murmur/rapidhash are native ops (__bunhash, crates/lumen-node/src/
-// bunhash.rs) ported from the exact Zig stdlib sources Bun compiles in.
+// crates/lumen-node/tests/fixtures/bun_hash_oracle.txt). Every family is a native op
+// (__bunhash, crates/lumen-node/src/bunhash.rs): crc32/adler32 over lumen-common's zlib, the
+// rest ported from the exact Zig stdlib sources Bun compiles in.
 //
 // Input coercion mirrors Bun's hashWrap: no argument → ""; ArrayBuffer/TypedArray/DataView →
 // their bytes; anything else (including explicit undefined/null) → String(x) as UTF-8. The seed
@@ -179,25 +179,6 @@ function hashSeed(args) {
   return 0n;
 }
 const hashU64 = (v) => BigInt.asUintN(64, v);
-const CRC_TABLE = (() => {
-  const t = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-function crc32Core(b) {
-  let c = 0xffffffff;
-  for (let i = 0; i < b.length; i++) c = CRC_TABLE[(c ^ b[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-function adler32Core(b) {
-  let a = 1, s = 0;
-  for (let i = 0; i < b.length; i++) { a = (a + b[i]) % 65521; s = (s + a) % 65521; }
-  return ((s << 16) | a) >>> 0;
-}
 // Bun.hash(input, seed) IS wyhash (the same callback object in Bun).
 const hash = function hash(...args) {
   return hashU64(__bunhash.wyhash(hashBytes(args), hashSeed(args)));
@@ -212,8 +193,8 @@ hash.cityHash32 = function cityHash32(...args) { return __bunhash.cityHash32(has
 hash.xxHash32 = function xxHash32(...args) { return __bunhash.xxHash32(hashBytes(args), hashSeed(args)); };
 hash.murmur32v3 = function murmur32v3(...args) { return __bunhash.murmur32v3(hashBytes(args), hashSeed(args)); };
 hash.murmur32v2 = function murmur32v2(...args) { return __bunhash.murmur32v2(hashBytes(args), hashSeed(args)); };
-hash.crc32 = function crc32(...args) { return crc32Core(hashBytes(args)); }; // seed ignored, like Bun
-hash.adler32 = function adler32(...args) { return adler32Core(hashBytes(args)); };
+hash.crc32 = function crc32(...args) { return __bunhash.crc32(hashBytes(args)); }; // seed ignored, like Bun
+hash.adler32 = function adler32(...args) { return __bunhash.adler32(hashBytes(args)); };
 
 // ---- CryptoHasher / MD5 / SHA* ----------------------------------------------------------------
 // Backed by node crypto (md5/sha1/sha256/sha384/sha512/sha512-224/sha512-256 are real; every other
@@ -1749,7 +1730,7 @@ function generateHeapSnapshot(format = "jsc", outputFormat) {
     objectCount: data.snapshot.lumen_object_count,
   };
 }
-globalThis.__lumenGenerateHeapSnapshot = generateHeapSnapshot;
+Object.defineProperty(globalThis, "__lumenGenerateHeapSnapshot", { value: generateHeapSnapshot, writable: true, configurable: true });
 
 function mmap(path, options = {}) {
   if (options === null || typeof options !== "object") throw new TypeError("Bun.mmap options must be an object");

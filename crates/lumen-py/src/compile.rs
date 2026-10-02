@@ -4,8 +4,8 @@ use crate::ast::*;
 use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::*;
 use crate::object::*;
-use crate::symtable::{self, mangle, Sc, SymTable};
-use std::collections::HashMap;
+use crate::symtable::{self, mangle, type_params_key, AnnKind, Sc, SymTable};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -16,7 +16,7 @@ pub struct CompileError {
 
 type Label = u32;
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum ConstKey {
     None,
     True,
@@ -53,13 +53,13 @@ struct Unit<'a> {
     lines: Vec<u32>,
     labels: Vec<u32>,
     consts: Vec<Value>,
-    const_keys: HashMap<ConstKey, u32>,
+    const_keys: BTreeMap<ConstKey, u32>,
     names: Vec<Obj>,
-    name_idx: HashMap<Rc<str>, u32>,
+    name_idx: BTreeMap<Rc<str>, u32>,
     varnames: Vec<Rc<str>>,
-    var_idx: HashMap<Rc<str>, u32>,
+    var_idx: BTreeMap<Rc<str>, u32>,
     cells: Vec<Rc<str>>,
-    cell_idx: HashMap<Rc<str>, u32>,
+    cell_idx: BTreeMap<Rc<str>, u32>,
     ncellvars: usize,
     fblocks: Vec<FBlock<'a>>,
     line: u32,
@@ -72,13 +72,15 @@ struct Compiler<'a> {
     st: SymTable,
     units: Vec<Unit<'a>>,
     filename: Rc<str>,
+    /// `compile(..., 'single')`: module-level expression statements go to `sys.displayhook`.
+    interactive: bool,
 }
 
 type CResult<T> = Result<T, CompileError>;
 
-pub fn compile_module(m: &Module, filename: &str) -> CResult<Rc<Code>> {
+pub fn compile_module(m: &Module, filename: &str, interactive: bool) -> CResult<Rc<Code>> {
     let st = symtable::build(m).map_err(|e| CompileError { msg: e.msg, line: e.line })?;
-    let mut c = Compiler { st, units: Vec::new(), filename: filename.into() };
+    let mut c = Compiler { st, units: Vec::new(), filename: filename.into(), interactive };
     c.push_unit(0, UnitKind::Module, "<module>".into(), "<module>".into());
     if let Some(d) = docstring(&m.body) {
         c.load_const(Value::str(&d));
@@ -95,7 +97,7 @@ pub fn compile_module(m: &Module, filename: &str) -> CResult<Rc<Code>> {
 
 pub fn compile_eval(e: &Expr, filename: &str) -> CResult<Rc<Code>> {
     let st = symtable::build_expr(e).map_err(|e| CompileError { msg: e.msg, line: e.line })?;
-    let mut c = Compiler { st, units: Vec::new(), filename: filename.into() };
+    let mut c = Compiler { st, units: Vec::new(), filename: filename.into(), interactive: false };
     c.push_unit(0, UnitKind::Module, "<module>".into(), "<module>".into());
     c.expr(e)?;
     c.emit(Op::ReturnValue);
@@ -134,7 +136,7 @@ fn with_label(op: Op, t: u32) -> Op {
     }
 }
 
-fn const_value(c: &Constant) -> Value {
+pub(crate) fn const_value(c: &Constant) -> Value {
     match c {
         Constant::None => Value::None,
         Constant::True => Value::Bool(true),
@@ -207,6 +209,9 @@ impl<'a> Compiler<'a> {
         if sc.has_class_cell {
             cells.push("__class__".into());
         }
+        if sc.needs_classdict {
+            cells.push("__classdict__".into());
+        }
         ncell += cells.len();
         for (n, s) in &sc.syms {
             if s.scope == Sc::Free {
@@ -233,9 +238,9 @@ impl<'a> Compiler<'a> {
             lines: Vec::new(),
             labels: Vec::new(),
             consts: Vec::new(),
-            const_keys: HashMap::new(),
+            const_keys: BTreeMap::new(),
             names: Vec::new(),
-            name_idx: HashMap::new(),
+            name_idx: BTreeMap::new(),
             varnames,
             var_idx,
             cells,
@@ -401,6 +406,18 @@ impl<'a> Compiler<'a> {
         let m = self.mangled(name);
         let sc = self.sym_scope(&m);
         let kind = self.u().kind;
+        let sid = self.u().scope;
+        if self.st.scopes[sid].can_see_class_scope && matches!(sc, Sc::Free | Sc::GlobalImplicit) {
+            let cd = self.u().cell_idx["__classdict__"];
+            self.emit(Op::LoadDeref(cd));
+            let op = if sc == Sc::Free {
+                Op::LoadFromDictOrDeref(self.u().cell_idx[&m])
+            } else {
+                Op::LoadFromDictOrGlobals(self.name_idx(&m))
+            };
+            self.emit(op);
+            return;
+        }
         let op = match (kind, sc) {
             (UnitKind::Function, Sc::Local) => Op::LoadFast(self.u().var_idx[&m]),
             (_, Sc::Cell | Sc::Free) => {
@@ -465,6 +482,12 @@ impl<'a> Compiler<'a> {
         self.u().line = s.pos.line;
         match &s.kind {
             StmtKind::Expr(e) => {
+                if self.interactive && self.units.len() == 1 {
+                    self.expr(e)?;
+                    self.emit(Op::CallIntrinsic1(INTRINSIC1_PRINT));
+                    self.emit(Op::Pop);
+                    return Ok(());
+                }
                 if matches!(e.kind, ExprKind::Constant(_)) {
                     return Ok(());
                 }
@@ -634,6 +657,7 @@ impl<'a> Compiler<'a> {
                 }
             }
             StmtKind::FunctionDef(f) => self.function_def(f, s.pos.line)?,
+            StmtKind::TypeAlias { name, type_params, value } => self.type_alias(s, name, type_params, value)?,
             StmtKind::ClassDef(c) => self.class_def(c, s.pos.line)?,
             StmtKind::With { items, body, is_async } => self.with_stmt(items, body, *is_async)?,
             StmtKind::Try { body, handlers, orelse, finalbody, is_star } => {
@@ -1152,7 +1176,7 @@ impl<'a> Compiler<'a> {
             }
             ExprKind::Lambda { args, body } => {
                 let key = e as *const Expr as usize;
-                self.make_function("<lambda>".into(), args, None, FnBody::Expr(body), key, false, e.pos.line)?;
+                self.make_function("<lambda>".into(), args, None, FnBody::Expr(body), key, None, e.pos.line)?;
             }
             ExprKind::IfExp { test, body, orelse } => {
                 let l_else = self.new_label();
@@ -1417,6 +1441,14 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
         self.seq_display(args, true)?;
+        self.call_kwargs(keywords)?;
+        self.u().line = e.pos.line;
+        self.emit(Op::CallEx(!keywords.is_empty() as u32));
+        Ok(())
+    }
+
+    /// Pushes the keyword-arguments dict of a `CallEx` (nothing when `keywords` is empty).
+    fn call_kwargs(&mut self, keywords: &'a [Keyword]) -> CResult<()> {
         if !keywords.is_empty() {
             let mut pending = 0u32;
             self.emit(Op::BuildMap(0));
@@ -1443,8 +1475,6 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::KwMerge);
             }
         }
-        self.u().line = e.pos.line;
-        self.emit(Op::CallEx(!keywords.is_empty() as u32));
         Ok(())
     }
 
@@ -1578,7 +1608,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn qualname_for(&mut self, name: &str) -> Rc<str> {
-        let p = self.units.last().unwrap();
+        let mut p = self.units.last().unwrap();
+        if self.st.scopes[p.scope].ann == Some(AnnKind::TypeParams) && self.units.len() >= 2 {
+            p = &self.units[self.units.len() - 2];
+        }
         match p.kind {
             UnitKind::Module => name.into(),
             UnitKind::Class => format!("{}.{}", p.qualname, name).into(),
@@ -1610,7 +1643,36 @@ impl<'a> Compiler<'a> {
             self.expr(d)?;
         }
         let key = f as *const FunctionDef as usize;
-        self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, f.is_async, line)?;
+        if f.type_params.is_empty() {
+            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, None, line)?;
+        } else {
+            let flags = self.function_defaults(&f.args)?;
+            let names: Vec<&str> = [(MF_DEFAULTS, ".defaults"), (MF_KWDEFAULTS, ".kwdefaults")]
+                .into_iter()
+                .filter(|(fl, _)| flags & fl != 0)
+                .map(|(_, n)| n)
+                .collect();
+            self.enter_type_params(&f.name, &f.type_params, line)?;
+            for n in &names {
+                let vi = self.u().var_idx[*n];
+                self.emit(Op::LoadFast(vi));
+            }
+            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, Some(flags), line)?;
+            self.emit(Op::Swap(2));
+            self.emit(Op::CallIntrinsic2(INTRINSIC2_SET_FUNCTION_TYPE_PARAMS));
+            let args: Vec<Arg> = names.iter().map(|n| Arg { pos: Pos::default(), arg: (*n).into(), annotation: None }).collect();
+            self.exit_type_params(Arguments { args, ..Default::default() }, line)?;
+            match names.len() {
+                1 => {
+                    self.emit(Op::Swap(2));
+                }
+                2 => {
+                    self.emit(Op::Rot3);
+                }
+                _ => {}
+            }
+            self.emit(Op::Call(names.len() as u32));
+        }
         for _ in &f.decorators {
             self.u().line = line;
             self.emit(Op::Call(1));
@@ -1627,28 +1689,13 @@ impl<'a> Compiler<'a> {
         returns: Option<&'a Expr>,
         body: FnBody<'a>,
         key: usize,
-        _is_async: bool,
+        defaults_pushed: Option<u32>,
         line: u32,
     ) -> CResult<()> {
-        let mut flags = 0;
-        if !args.defaults.is_empty() {
-            for d in &args.defaults {
-                self.expr(d)?;
-            }
-            self.emit(Op::BuildTuple(args.defaults.len() as u32));
-            flags |= MF_DEFAULTS;
-        }
-        let kwd: Vec<(&Arg, &Expr)> =
-            args.kwonlyargs.iter().zip(args.kw_defaults.iter()).filter_map(|(a, d)| d.as_ref().map(|d| (a, d))).collect();
-        if !kwd.is_empty() {
-            for (a, d) in &kwd {
-                let m = self.mangled(&a.arg);
-                self.load_const(Value::str(&m));
-                self.expr(d)?;
-            }
-            self.emit(Op::BuildMap(kwd.len() as u32));
-            flags |= MF_KWDEFAULTS;
-        }
+        let mut flags = match defaults_pushed {
+            Some(f) => f,
+            None => self.function_defaults(args)?,
+        };
         let mut ann: Vec<(Rc<str>, &Expr)> = Vec::new();
         for a in args.posonlyargs.iter().chain(args.args.iter()) {
             if let Some(an) = &a.annotation {
@@ -1731,9 +1778,120 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// Pushes the defaults tuple and keyword-defaults dict of `args`; returns the `MF_*` flags.
+    fn function_defaults(&mut self, args: &'a Arguments) -> CResult<u32> {
+        let mut flags = 0;
+        if !args.defaults.is_empty() {
+            for d in &args.defaults {
+                self.expr(d)?;
+            }
+            self.emit(Op::BuildTuple(args.defaults.len() as u32));
+            flags |= MF_DEFAULTS;
+        }
+        let kwd: Vec<(&Arg, &Expr)> =
+            args.kwonlyargs.iter().zip(args.kw_defaults.iter()).filter_map(|(a, d)| d.as_ref().map(|d| (a, d))).collect();
+        if !kwd.is_empty() {
+            for (a, d) in &kwd {
+                let m = self.mangled(&a.arg);
+                self.load_const(Value::str(&m));
+                self.expr(d)?;
+            }
+            self.emit(Op::BuildMap(kwd.len() as u32));
+            flags |= MF_KWDEFAULTS;
+        }
+        Ok(flags)
+    }
+
+    /// Opens the `<generic parameters of X>` unit and leaves the tuple of the new type
+    /// parameters on its stack.
+    fn enter_type_params(&mut self, name: &str, params: &'a [TypeParam], line: u32) -> CResult<()> {
+        let sid = self.st.ids[&type_params_key(params)];
+        let scope_name: Rc<str> = format!("<generic parameters of {name}>").into();
+        let qual = self.qualname_for(&scope_name);
+        self.push_unit(sid, UnitKind::Function, scope_name, qual);
+        self.u().line = line;
+        for tp in params {
+            self.u().line = tp.pos.line;
+            self.load_const(Value::str(tp.name()));
+            match &tp.kind {
+                TypeParamKind::TypeVar { name, bound: Some(b) } => {
+                    self.annotation_function(tp as *const TypeParam as usize, name.clone(), b, tp.pos.line)?;
+                    let k = if matches!(b.kind, ExprKind::Tuple { .. }) {
+                        INTRINSIC2_TYPEVAR_WITH_CONSTRAINTS
+                    } else {
+                        INTRINSIC2_TYPEVAR_WITH_BOUND
+                    };
+                    self.emit(Op::CallIntrinsic2(k));
+                }
+                TypeParamKind::TypeVar { bound: None, .. } => {
+                    self.emit(Op::CallIntrinsic1(INTRINSIC1_TYPEVAR));
+                }
+                TypeParamKind::ParamSpec { .. } => {
+                    self.emit(Op::CallIntrinsic1(INTRINSIC1_PARAMSPEC));
+                }
+                TypeParamKind::TypeVarTuple { .. } => {
+                    self.emit(Op::CallIntrinsic1(INTRINSIC1_TYPEVARTUPLE));
+                }
+            }
+            self.emit(Op::Dup);
+            self.name_store(tp.name());
+        }
+        self.u().line = line;
+        self.emit(Op::BuildTuple(params.len() as u32));
+        Ok(())
+    }
+
+    /// Returns TOS from the `<generic parameters of X>` unit and pushes the function that runs it.
+    fn exit_type_params(&mut self, args: Arguments, line: u32) -> CResult<()> {
+        self.emit(Op::ReturnValue);
+        let code = self.pop_unit(&args, line);
+        self.emit_closure_function(code, 0)
+    }
+
+    /// Pushes a function (an annotation scope) that evaluates and returns `body`.
+    fn annotation_function(&mut self, key: usize, name: Rc<str>, body: &'a Expr, line: u32) -> CResult<()> {
+        let sid = self.st.ids[&key];
+        let qual = self.qualname_for(&name);
+        self.push_unit(sid, UnitKind::Function, name, qual);
+        self.u().line = line;
+        self.expr(body)?;
+        self.emit(Op::ReturnValue);
+        let code = self.pop_unit(&Arguments::default(), line);
+        self.emit_closure_function(code, 0)
+    }
+
+    fn type_alias(&mut self, s: &'a Stmt, name: &'a Expr, params: &'a [TypeParam], value: &'a Expr) -> CResult<()> {
+        let line = s.pos.line;
+        let ExprKind::Name { id, .. } = &name.kind else {
+            return self.err("invalid type alias name", line);
+        };
+        if params.is_empty() {
+            self.load_const(Value::str(id));
+            self.load_const(Value::None);
+        } else {
+            self.enter_type_params(id, params, line)?;
+            self.load_const(Value::str(id));
+            self.emit(Op::Swap(2));
+        }
+        self.annotation_function(s as *const Stmt as usize, id.clone(), value, line)?;
+        self.emit(Op::BuildTuple(3));
+        self.emit(Op::CallIntrinsic1(INTRINSIC1_TYPEALIAS));
+        if !params.is_empty() {
+            self.exit_type_params(Arguments::default(), line)?;
+            self.emit(Op::Call(0));
+        }
+        self.name_store(id);
+        Ok(())
+    }
+
     fn class_def(&mut self, c: &'a ClassDef, line: u32) -> CResult<()> {
         for d in &c.decorators {
             self.expr(d)?;
+        }
+        let generic = !c.type_params.is_empty();
+        if generic {
+            self.enter_type_params(&c.name, &c.type_params, line)?;
+            self.name_store(".type_params");
         }
         self.emit(Op::LoadBuildClass);
         let key = c as *const ClassDef as usize;
@@ -1753,6 +1911,17 @@ impl<'a> Compiler<'a> {
             let di = self.name_idx("__doc__");
             self.emit(Op::StoreName(di));
         }
+        if generic {
+            self.name_load(".type_params");
+            let ti = self.name_idx("__type_params__");
+            self.emit(Op::StoreName(ti));
+        }
+        let needs_classdict = self.st.scopes[sid].needs_classdict;
+        if needs_classdict {
+            self.emit(Op::LoadLocals);
+            let ci = self.u().cell_idx["__classdict__"];
+            self.emit(Op::StoreDeref(ci));
+        }
         if has_annassign(&c.body) {
             self.emit(Op::SetupAnnotations);
         }
@@ -1764,33 +1933,70 @@ impl<'a> Compiler<'a> {
             let cn = self.name_idx("__classcell__");
             self.emit(Op::StoreName(cn));
         }
+        if needs_classdict {
+            let ci = self.u().cell_idx["__classdict__"];
+            self.emit(Op::LoadClosure(ci));
+            let cn = self.name_idx("__classdictcell__");
+            self.emit(Op::StoreName(cn));
+        }
         self.load_const(Value::None);
         self.emit(Op::ReturnValue);
         let code = self.pop_unit(&Arguments::default(), line);
         self.emit_closure_function(code, 0)?;
         self.load_const(Value::str(&c.name));
+        if generic {
+            self.name_load(".type_params");
+            self.emit(Op::CallIntrinsic1(INTRINSIC1_SUBSCRIPT_GENERIC));
+            self.name_store(".generic_base");
+        }
+        let extra_base = generic.then_some(".generic_base");
         let has_star = c.bases.iter().any(|b| matches!(b.kind, ExprKind::Starred { .. }));
         let has_dstar = c.keywords.iter().any(|k| k.arg.is_none());
+        let nbases = c.bases.len() + extra_base.is_some() as usize;
         if !has_star && !has_dstar {
             for b in &c.bases {
                 self.expr(b)?;
             }
+            if let Some(n) = extra_base {
+                self.name_load(n);
+            }
             self.u().line = line;
             if c.keywords.is_empty() {
-                self.emit(Op::Call(2 + c.bases.len() as u32));
+                self.emit(Op::Call(2 + nbases as u32));
             } else {
                 for k in &c.keywords {
                     self.expr(&k.value)?;
                 }
                 let names: Vec<Value> = c.keywords.iter().map(|k| Value::str(k.arg.as_ref().unwrap())).collect();
                 self.load_const(Value::tuple(names));
-                self.emit(Op::CallKw(2 + (c.bases.len() + c.keywords.len()) as u32));
+                self.emit(Op::CallKw(2 + (nbases + c.keywords.len()) as u32));
             }
         } else {
-            self.emit(Op::BuildList(1));
-            // [fn, name] pair already below; rebuild as list: fn name -> list
-            self.emit(Op::Pop);
-            return self.err("starred class bases are not supported", line);
+            self.emit(Op::BuildList(2));
+            for b in &c.bases {
+                match &b.kind {
+                    ExprKind::Starred { value, .. } => {
+                        self.expr(value)?;
+                        self.emit(Op::ListExtend(1));
+                    }
+                    _ => {
+                        self.expr(b)?;
+                        self.emit(Op::ListAppend(1));
+                    }
+                }
+            }
+            if let Some(n) = extra_base {
+                self.name_load(n);
+                self.emit(Op::ListAppend(1));
+            }
+            self.emit(Op::ListToTuple);
+            self.call_kwargs(&c.keywords)?;
+            self.u().line = line;
+            self.emit(Op::CallEx(!c.keywords.is_empty() as u32));
+        }
+        if generic {
+            self.exit_type_params(Arguments::default(), line)?;
+            self.emit(Op::Call(0));
         }
         for _ in &c.decorators {
             self.u().line = line;

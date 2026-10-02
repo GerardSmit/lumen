@@ -2,7 +2,7 @@
 //! The padding schemes are written out over the RSA primitive so that any digest `node:crypto`
 //! names can be used; the curve and DSA arithmetic is RustCrypto's.
 
-use lumen::embed::{OpDesc, OpError};
+use lumen::embed::OpError;
 use num_bigint_dig::BigUint;
 use rand_core::{OsRng, RngCore};
 use signature::hazmat::{PrehashSigner, PrehashVerifier, RandomizedPrehashSigner};
@@ -10,6 +10,11 @@ use signature::Signer;
 
 use super::keys::{asn1, with_ec_curve, AsymKey, EcCurve, EcKey, PssParams, RsaKey};
 use crate::hash::{self, Algo};
+
+
+#[lumen_bind::module(name = "crypto")]
+pub(crate) mod bindings {
+use super::*;
 
 const RSA_PKCS1_PADDING: i32 = 1;
 const RSA_NO_PADDING: i32 = 3;
@@ -252,6 +257,28 @@ fn pss_verify(em_bits: usize, em: &[u8], mhash: &[u8], cfg: &PssConfig) -> bool 
     hash::digest(cfg.hash, &m) == h
 }
 
+/// EMSA-PSS verification of the recovered message representative `m` against `data`.
+fn pss_verify_message(k: &RsaKey, m: &BigUint, cfg: &PssConfig, data: &[u8]) -> bool {
+    let em_bits = k.n.bits() - 1;
+    let em_len = em_bits.div_ceil(8);
+    let mb = m.to_bytes_be();
+    if mb.len() > em_len {
+        return false;
+    }
+    pss_verify(em_bits, &asn1::pad_be(&mb, em_len), &hash::digest(cfg.hash, data), cfg)
+}
+
+/// RSASSA-PSS verification with MGF1 over `hash` and a fixed salt length (X.509 signatures).
+pub(crate) fn rsa_pss_verify(n: &[u8], e: &[u8], hash: Algo, salt: usize, data: &[u8], sig: &[u8]) -> bool {
+    let k = RsaKey { n: BigUint::from_bytes_be(n), e: BigUint::from_bytes_be(e), private: None, pss: None };
+    let s = BigUint::from_bytes_be(sig);
+    if sig.len() != mod_len(&k) || s >= k.n {
+        return false;
+    }
+    let cfg = PssConfig { hash, mgf1: hash, salt: i32::try_from(salt).unwrap_or(i32::MAX) };
+    pss_verify_message(&k, &rsa_public_op(&k, &s), &cfg, data)
+}
+
 fn rsa_default_padding(k: &RsaKey) -> i32 {
     if k.pss.is_some() {
         RSA_PKCS1_PSS_PADDING
@@ -319,16 +346,7 @@ fn rsa_verify(k: &RsaKey, hash: Option<&str>, padding: Option<i32>, salt: Option
     }
     let m = rsa_public_op(k, &s);
     match (cfg, pkcs_algo) {
-        (Some(cfg), _) => {
-            let em_bits = k.n.bits() - 1;
-            let em_len = em_bits.div_ceil(8);
-            let mb = m.to_bytes_be();
-            if mb.len() > em_len {
-                return Ok(false);
-            }
-            let em = asn1::pad_be(&mb, em_len);
-            Ok(pss_verify(em_bits, &em, &hash::digest(cfg.hash, data), &cfg))
-        }
+        (Some(cfg), _) => Ok(pss_verify_message(k, &m, &cfg, data)),
         (None, Some(algo)) => {
             let t = digest_info(algo, &hash::digest(algo, data))?;
             if k_len < t.len() + 11 {
@@ -421,7 +439,7 @@ fn ecdsa_verify(k: &EcKey, hashed: &[u8], sig: &[u8], p1363: bool) -> bool {
     })
 }
 
-fn dsa_sign(k: &super::keys::DsaKey, hashed: &[u8], p1363: bool) -> Result<Vec<u8>, OpError> {
+fn dsa_sign(k: &crate::crypto::keys::DsaKey, hashed: &[u8], p1363: bool) -> Result<Vec<u8>, OpError> {
     use signature::SignatureEncoding;
     let sk = k.dsa_signing()?;
     let sig = sk.sign_prehash_with_rng(&mut OsRng, hashed).map_err(|_| sign_failed())?;
@@ -433,7 +451,7 @@ fn dsa_sign(k: &super::keys::DsaKey, hashed: &[u8], p1363: bool) -> Result<Vec<u
     }
 }
 
-fn dsa_verify(k: &super::keys::DsaKey, hashed: &[u8], sig: &[u8], p1363: bool) -> bool {
+fn dsa_verify(k: &crate::crypto::keys::DsaKey, hashed: &[u8], sig: &[u8], p1363: bool) -> bool {
     let Ok(vk) = k.dsa_verifying() else { return false };
     let len = k.q.bits().div_ceil(8);
     let (r, s) = if p1363 {
@@ -516,13 +534,13 @@ fn verify_with(key: &AsymKey, hash: Option<&str>, padding: Option<i32>, salt: Op
 }
 
 /// `sign` of `Sign` / `crypto.sign`: the signature of `data` (DER, or `r || s` for `p1363`).
-#[lumen::op(name = "sigSign")]
+#[op(name = "sigSign")]
 fn sig_sign(kind: u32, der: &[u8], hash: Option<String>, padding: Option<i32>, salt: Option<i32>, p1363: bool, data: &[u8]) -> Result<Vec<u8>, OpError> {
     let key = AsymKey::from_handle(kind, der)?;
     sign_with(&key, hash.as_deref(), padding, salt, p1363, data)
 }
 
-#[lumen::op(name = "sigVerify")]
+#[op(name = "sigVerify")]
 fn sig_verify(kind: u32, der: &[u8], hash: Option<String>, padding: Option<i32>, salt: Option<i32>, p1363: bool, data: &[u8], sig: &[u8]) -> Result<bool, OpError> {
     let key = AsymKey::from_handle(kind, der)?;
     verify_with(&key, hash.as_deref(), padding, salt, p1363, data, sig)
@@ -641,7 +659,7 @@ fn raw_transform(k: &RsaKey, private: bool, input: &[u8]) -> Result<Vec<u8>, OpE
 }
 
 /// `publicEncrypt` (0), `privateDecrypt` (1), `privateEncrypt` (2) and `publicDecrypt` (3).
-#[lumen::op(name = "rsaCipher")]
+#[op(name = "rsaCipher")]
 fn rsa_cipher(
     operation: u32,
     kind: u32,
@@ -668,5 +686,4 @@ fn rsa_cipher(
         _ => Err(illegal_padding()),
     }
 }
-
-pub const OPS: &[&OpDesc] = lumen::ops![sig_sign, sig_verify, rsa_cipher];
+}

@@ -19,6 +19,7 @@ struct ProcStart(Instant);
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "process",
+        modules: &[],
         globals: &[],
         namespaces: &[
             (
@@ -64,6 +65,8 @@ pub(crate) fn extension() -> Extension {
                     "metrics" (0) => op_metrics,
                     "isatty" (1) => op_isatty,
                     "ttySize" (1) => op_tty_size,
+                    "startupTitle" (0) => op_startup_title,
+                    "setTitle" (1) => op_set_title,
                 ],
             ),
         ],
@@ -94,7 +97,7 @@ pub(crate) fn install_data_props(
 
     let (args, vars): (Vec<String>, Vec<(String, String)>) = match embedded {
         Some((argv, env)) => (argv.to_vec(), env.to_vec()),
-        None => (std::env::args().collect(), std::env::vars().collect()),
+        None => (startup_args().to_vec(), std::env::vars().collect()),
     };
     let argv0_str = args.first().cloned().unwrap_or_else(|| "lumen".to_string());
     let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
@@ -110,17 +113,10 @@ pub(crate) fn install_data_props(
     let exec_path = match embedded {
         Some(_) => argv0_str.clone(),
         None => std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.canonicalize().unwrap_or(p).to_string_lossy().into_owned())
             .unwrap_or_else(|_| argv0_str.clone()),
     };
     let _ = ctx.set_member(&process, "execPath", Value::from_string(exec_path));
-    let title = argv0_str
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("lumen")
-        .to_string();
-    let _ = ctx.set_member(&process, "title", Value::from_string(title));
 
     crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("startup environment exceeds realm limits"));
 
@@ -302,27 +298,10 @@ fn terminal_size(fd: i32) -> Option<(u16, u16)> {
 
 #[cfg(unix)]
 fn terminal_size(fd: i32) -> Option<(u16, u16)> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct Winsize {
-        rows: u16,
-        cols: u16,
-        x: u16,
-        y: u16,
+    match lumen_os::proc::terminal_size(fd) {
+        Ok((cols, rows)) if cols > 0 => Some((cols as u16, rows as u16)),
+        _ => None,
     }
-    extern "C" {
-        fn ioctl(fd: i32, req: std::os::raw::c_ulong, ...) -> i32;
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
-    let mut ws = Winsize::default();
-    // SAFETY: TIOCGWINSZ writes one `struct winsize` through the pointer.
-    if unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) } != 0 || ws.cols == 0 {
-        return None;
-    }
-    Some((ws.cols, ws.rows))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -374,243 +353,134 @@ fn op_hrtime(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Valu
     ]))
 }
 
-/// Real per-process CPU, resident-memory, and kernel resource counters from `getrusage(2)`.
-/// The compact array keeps the native boundary cheap; lumen-node assigns Node's public names.
-#[cfg(unix)]
+/// Real per-process CPU, resident-memory, and kernel resource counters (`getrusage(2)` and its
+/// Windows equivalents, see `lumen_os::sysinfo`). The compact array keeps the native boundary
+/// cheap; lumen-node assigns Node's public names.
 fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let mut usage = std::mem::MaybeUninit::<ffi::RUsage>::zeroed();
-    if unsafe { ffi::getrusage(ffi::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
-        return Err(ctx.make_error(
-            "Error",
-            format!("getrusage failed: {}", std::io::Error::last_os_error()),
-        ));
-    }
-    let usage = unsafe { usage.assume_init() };
-    let micros = |time: ffi::TimeVal| time.sec * 1_000_000 + time.usec;
-    #[cfg(target_os = "macos")]
-    let max_rss_kib = usage.max_rss / 1024;
-    #[cfg(not(target_os = "macos"))]
-    let max_rss_kib = usage.max_rss;
-    let rss_bytes = current_rss_bytes().unwrap_or_else(|| {
-        #[cfg(target_os = "macos")]
-        {
-            usage.max_rss as u64
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            (usage.max_rss as u64) * 1024
-        }
-    });
-    let (available_memory, constrained_memory) = system_memory(rss_bytes);
-    Ok(ctx.make_array(
-        [
-            rss_bytes as i64,
-            max_rss_kib,
-            micros(usage.user),
-            micros(usage.system),
-            usage.minor_faults,
-            usage.major_faults,
-            usage.swaps,
-            usage.block_inputs,
-            usage.block_outputs,
-            usage.messages_sent,
-            usage.messages_received,
-            usage.signals,
-            usage.voluntary_switches,
-            usage.involuntary_switches,
-            available_memory as i64,
-            constrained_memory as i64,
-        ]
-        .into_iter()
-        .map(|value| Value::Num(value as f64))
-        .collect(),
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn current_rss_bytes() -> Option<u64> {
-    let pages = std::fs::read_to_string("/proc/self/statm")
-        .ok()?
-        .split_whitespace()
-        .nth(1)?
-        .parse::<u64>()
-        .ok()?;
-    Some(pages * 4096)
-}
-
-#[cfg(target_os = "macos")]
-fn current_rss_bytes() -> Option<u64> {
-    let mut info = ffi::RUsageInfoV2::default();
-    let result = unsafe {
-        ffi::proc_pid_rusage(
-            lumen_host::sysfs::process_id() as i32,
-            2,
-            (&mut info as *mut ffi::RUsageInfoV2).cast(),
-        )
-    };
-    (result == 0).then_some(info.resident_size)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn current_rss_bytes() -> Option<u64> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn system_memory(rss: u64) -> (u64, u64) {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let value = |name: &str| {
-        meminfo
-            .lines()
-            .find(|line| line.starts_with(name))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0)
-            * 1024
-    };
-    let total = value("MemTotal:");
-    let host_available = value("MemAvailable:");
-    let raw_limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-        .ok()
-        .or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok());
-    let limit = raw_limit
-        .as_deref()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|limit| *limit > 0 && *limit < total);
-    let constrained = limit.unwrap_or(0);
-    let available = limit.map_or(host_available, |limit| {
-        host_available.min(limit.saturating_sub(rss))
-    });
-    (available, constrained)
-}
-
-#[cfg(target_os = "macos")]
-fn system_memory(rss: u64) -> (u64, u64) {
-    let total = ffi::sysctl_u64("hw.memsize").unwrap_or(0);
-    let pages = ffi::sysctl_u64("vm.page_free_count").unwrap_or(0)
-        + ffi::sysctl_u64("vm.page_inactive_count").unwrap_or(0)
-        + ffi::sysctl_u64("vm.page_purgeable_count").unwrap_or(0);
-    let page_size = ffi::sysctl_u64("hw.pagesize").unwrap_or(4096);
-    (
-        pages
-            .saturating_mul(page_size)
-            .min(total.saturating_sub(rss)),
-        0,
-    )
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn system_memory(_rss: u64) -> (u64, u64) {
-    (0, 0)
-}
-
-/// The same counters on Windows, from the sources libuv's `uv_getrusage` / `uv_resident_set_memory`
-/// use: process times, memory counters (page faults count as major faults, as in libuv) and I/O
-/// operation counts; free memory from `GlobalMemoryStatusEx`.
-#[cfg(windows)]
-fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct MemoryCounters {
-        cb: u32,
-        page_fault_count: u32,
-        peak_working_set: usize,
-        working_set: usize,
-        quota_peak_paged_pool: usize,
-        quota_paged_pool: usize,
-        quota_peak_non_paged_pool: usize,
-        quota_non_paged_pool: usize,
-        pagefile_usage: usize,
-        peak_pagefile_usage: usize,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct IoCounters {
-        read_ops: u64,
-        write_ops: u64,
-        other_ops: u64,
-        read_bytes: u64,
-        write_bytes: u64,
-        other_bytes: u64,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct MemoryStatusEx {
-        length: u32,
-        memory_load: u32,
-        total_phys: u64,
-        avail_phys: u64,
-        total_page_file: u64,
-        avail_page_file: u64,
-        total_virtual: u64,
-        avail_virtual: u64,
-        avail_extended_virtual: u64,
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessTimes(
-            process: isize,
-            creation: *mut FileTime,
-            exit: *mut FileTime,
-            kernel: *mut FileTime,
-            user: *mut FileTime,
-        ) -> i32;
-        fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemoryCounters, cb: u32) -> i32;
-        fn GetProcessIoCounters(process: isize, counters: *mut IoCounters) -> i32;
-        fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
-    }
-    let (mut creation, mut exit, mut kernel, mut user) = Default::default();
-    let mut memory = MemoryCounters {
-        cb: std::mem::size_of::<MemoryCounters>() as u32,
-        ..Default::default()
-    };
-    let mut io = IoCounters::default();
-    let mut status = MemoryStatusEx {
-        length: std::mem::size_of::<MemoryStatusEx>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: the pseudo-handle needs no closing; every out pointer is a live, correctly sized
-    // struct (the sized ones carry their size).
-    unsafe {
-        let process = GetCurrentProcess();
-        GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user);
-        K32GetProcessMemoryInfo(process, &mut memory, memory.cb);
-        GetProcessIoCounters(process, &mut io);
-        GlobalMemoryStatusEx(&mut status);
-    }
-    // FILETIME counts 100 ns units.
-    let micros = |t: &FileTime| ((u64::from(t.high) << 32) | u64::from(t.low)) / 10;
-    let values: [u64; 16] = [
-        memory.working_set as u64,
-        memory.peak_working_set as u64 / 1024,
-        micros(&user),
-        micros(&kernel),
-        0,
-        u64::from(memory.page_fault_count),
-        0,
-        io.read_ops,
-        io.write_ops,
-        0,
-        0,
-        0,
-        0,
-        0,
-        status.avail_phys,
-        0,
+    let usage = lumen_os::sysinfo::resource_usage()
+        .map_err(|e| ctx.make_error("Error", format!("getrusage failed: {e}")))?;
+    let rss = lumen_os::sysinfo::resident_set_bytes().unwrap_or(usage.max_rss_kib * 1024);
+    let (available, constrained) = lumen_os::sysinfo::available_memory(rss);
+    let values = [
+        rss,
+        usage.max_rss_kib,
+        usage.user_us,
+        usage.system_us,
+        usage.minor_faults,
+        usage.major_faults,
+        usage.swaps,
+        usage.block_in,
+        usage.block_out,
+        usage.msgs_sent,
+        usage.msgs_received,
+        usage.signals,
+        usage.voluntary_switches,
+        usage.involuntary_switches,
+        available,
+        constrained,
     ];
     Ok(ctx.make_array(values.iter().map(|&v| Value::Num(v as f64)).collect()))
 }
 
-#[cfg(not(any(unix, windows)))]
-fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(ctx.make_array(vec![Value::Num(0.0); 16]))
+/// The OS process's argv as it was at startup. Setting `process.title` reuses argv's memory (as
+/// libuv does), after which the live argv no longer reads back the arguments.
+fn startup_args() -> &'static [String] {
+    static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ARGS.get_or_init(|| std::env::args().collect())
+}
+
+/// `process.title` before a program sets it: argv[0] as the process was started (an embedded
+/// realm has no title of its own: `undefined`, and the JS side falls back to its argv0).
+fn op_startup_title(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    if ctx.op_state().get::<RealmProcess>().is_some() {
+        return Ok(Value::Undefined);
+    }
+    Ok(match startup_args().first() {
+        Some(t) => Value::from_string(t.clone()),
+        None => Value::Undefined,
+    })
+}
+
+/// `process.title = t`: what `ps` shows for the process, written over the argv strings (the only
+/// memory the kernel reports a process's command line from), truncated to fit them.
+fn op_set_title(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let title = ctx
+        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
+        .to_string();
+    if ctx.op_state().get::<RealmProcess>().is_some() {
+        return Ok(Value::Undefined);
+    }
+    let _ = startup_args();
+    set_os_title(&title);
+    Ok(Value::Undefined)
+}
+
+#[cfg(target_os = "macos")]
+fn set_os_title(title: &str) {
+    use std::os::raw::{c_char, c_int};
+    extern "C" {
+        fn _NSGetArgv() -> *mut *mut *mut c_char;
+        fn _NSGetArgc() -> *mut c_int;
+    }
+    // SAFETY: the argv strings are the process's own, NUL-terminated, and laid out back to back;
+    // only the contiguous run starting at argv[0] is overwritten, within its original length.
+    unsafe {
+        let argc = *_NSGetArgc();
+        let argv = *_NSGetArgv();
+        if argc <= 0 || argv.is_null() || (*argv).is_null() {
+            return;
+        }
+        let start = *argv;
+        let mut end = start.add(std::ffi::CStr::from_ptr(start).to_bytes().len());
+        for i in 1..argc as usize {
+            let arg = *argv.add(i);
+            if arg != end.add(1) {
+                break;
+            }
+            end = arg.add(std::ffi::CStr::from_ptr(arg).to_bytes().len());
+        }
+        overwrite_args(start as *mut u8, end.offset_from(start) as usize, title);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_os_title(title: &str) {
+    // /proc/self/stat fields 48 and 49 (after the parenthesized comm): the argv area's bounds.
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else { return };
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else { return };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let (Some(start), Some(end)) = (
+        fields.get(45).and_then(|f| f.parse::<usize>().ok()),
+        fields.get(46).and_then(|f| f.parse::<usize>().ok()),
+    ) else {
+        return;
+    };
+    if start == 0 || end <= start {
+        return;
+    }
+    // SAFETY: [arg_start, arg_end) is this process's own argv area, mapped and writable; the
+    // write stays inside it.
+    unsafe { overwrite_args(start as *mut u8, end - start - 1, title) };
+    let mut name = [0u8; 16];
+    let n = title.len().min(15);
+    name[..n].copy_from_slice(&title.as_bytes()[..n]);
+    extern "C" {
+        fn prctl(option: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    }
+    // PR_SET_NAME
+    unsafe { prctl(15, name.as_ptr()) };
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn set_os_title(_title: &str) {}
+
+/// Write `title` over `cap` bytes at `start` (NUL-padded, plus the terminating NUL at
+/// `start + cap`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+unsafe fn overwrite_args(start: *mut u8, cap: usize, title: &str) {
+    let n = title.len().min(cap);
+    std::ptr::copy_nonoverlapping(title.as_ptr(), start, n);
+    std::ptr::write_bytes(start.add(n), 0, cap - n + 1);
 }
 
 fn op_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -738,7 +608,13 @@ fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     }
     match std::env::set_current_dir(&dir) {
         Ok(()) => Ok(Value::Undefined),
-        Err(e) => Err(ctx.make_error("Error", format!("ENOENT: chdir '{dir}': {e}"))),
+        Err(e) => {
+            let err = ctx.make_error("Error", format!("chdir '{dir}': {e}"));
+            if let Some(errno) = e.raw_os_error() {
+                let _ = ctx.set_member(&err, "errno", Value::Num(-(errno as f64)));
+            }
+            Err(err)
+        }
     }
 }
 
@@ -750,6 +626,11 @@ fn op_abort(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value
         return end_realm_or_process(ctx, 134);
     }
     std::process::abort();
+}
+
+/// libuv's errno for `code` on this platform.
+fn uv_errno(code: &str) -> i32 {
+    lumen_os::uv::errno(code).unwrap_or(-4094)
 }
 
 /// Node's `kill` failure: `Error: kill ESRCH` with `code`, `errno` and `syscall`.
@@ -794,7 +675,7 @@ fn kill_child_realm(ctx: &mut Ctx, pid: i32, signal: i32) -> Option<Result<Value
     Some(if launcher.signal_pid(pid as u32, signal) {
         Ok(Value::Undefined)
     } else {
-        Err(kill_error(ctx, "ESRCH", -3))
+        Err(kill_error(ctx, "ESRCH", uv_errno("ESRCH")))
     })
 }
 
@@ -811,19 +692,10 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
     if pid <= 0 || pid as u32 == lumen_host::sysfs::process_id() {
         refuse_in_realm(ctx, "process.kill of the host process")?;
     }
-    // SAFETY: kill(2) takes no pointers.
-    let rc = unsafe { ffi::kill(pid, sig) };
-    if rc == 0 {
-        return Ok(Value::Undefined);
+    match lumen_os::proc::kill(pid, sig) {
+        Ok(()) => Ok(Value::Undefined),
+        Err(e) => Err(kill_error(ctx, e.code(), uv_errno(e.code()))),
     }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    let code = match errno {
-        1 => "EPERM",
-        3 => "ESRCH",
-        22 => "EINVAL",
-        _ => "UNKNOWN",
-    };
-    Err(kill_error(ctx, code, -errno))
 }
 
 /// `(pid, signal)` on Windows, as libuv's `uv_kill`: signal 0 checks the process is alive;
@@ -843,11 +715,6 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
     const STILL_ACTIVE: u32 = 259;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_INVALID_PARAMETER: i32 = 87;
-    // libuv's error numbers on Windows.
-    const UV_ESRCH: i32 = -4040;
-    const UV_EPERM: i32 = -4048;
-    const UV_ENOSYS: i32 = -4054;
-    const UV_EINVAL: i32 = -4071;
 
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
@@ -858,15 +725,15 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
         refuse_in_realm(ctx, "process.kill of the host process")?;
     }
     if !matches!(sig, 0 | 2 | 3 | 9 | 15) {
-        return Err(kill_error(ctx, "ENOSYS", UV_ENOSYS));
+        return Err(kill_error(ctx, "ENOSYS", uv_errno("ENOSYS")));
     }
     if pid < 0 {
-        return Err(kill_error(ctx, "EINVAL", UV_EINVAL));
+        return Err(kill_error(ctx, "EINVAL", uv_errno("EINVAL")));
     }
     let os_error = |ctx: &mut Ctx, e: i32| match e {
-        ERROR_INVALID_PARAMETER => kill_error(ctx, "ESRCH", UV_ESRCH),
-        ERROR_ACCESS_DENIED => kill_error(ctx, "EPERM", UV_EPERM),
-        _ => kill_error(ctx, "UNKNOWN", -4094),
+        ERROR_INVALID_PARAMETER => kill_error(ctx, "ESRCH", uv_errno("ESRCH")),
+        ERROR_ACCESS_DENIED => kill_error(ctx, "EPERM", uv_errno("EPERM")),
+        _ => kill_error(ctx, "UNKNOWN", uv_errno("UNKNOWN")),
     };
     // pid 0 means this process, as in libuv.
     let pid = if pid == 0 { lumen_host::sysfs::process_id() } else { pid as u32 };
@@ -884,10 +751,10 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
         if alive {
             Ok(())
         } else {
-            Err(kill_error(ctx, "ESRCH", UV_ESRCH))
+            Err(kill_error(ctx, "ESRCH", uv_errno("ESRCH")))
         }
     } else if !alive {
-        Err(kill_error(ctx, "ESRCH", UV_ESRCH))
+        Err(kill_error(ctx, "ESRCH", uv_errno("ESRCH")))
     // SAFETY: `handle` is open with PROCESS_TERMINATE.
     } else if unsafe { TerminateProcess(handle, 1) } != 0 {
         Ok(())
@@ -906,20 +773,20 @@ fn op_kill(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value>
 }
 
 /// `([mask])` — read (no-arg, via the standard read-then-restore) or set the file-mode creation
-/// mask through libc `umask(2)`. Returns the previous mask. Unix-only; returns 0 off unix.
+/// mask through `umask(2)`. Returns the previous mask. Unix-only; returns 0 off unix.
 #[cfg(unix)]
 fn op_umask(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let prev = match args.first() {
         Some(v) if !matches!(v, Value::Undefined) => {
             refuse_in_realm(ctx, "process.umask(mask)")?;
             let m = ctx.coerce_number(v)? as u32;
-            unsafe { ffi::umask(m) }
+            lumen_os::proc::umask(m)
         }
         // No argument: umask(2) has no pure read, so set-to-0-then-restore is the canonical idiom
         // (this is exactly why Node deprecated the read form).
         _ => {
-            let cur = unsafe { ffi::umask(0) };
-            unsafe { ffi::umask(cur) };
+            let cur = lumen_os::proc::umask(0);
+            lumen_os::proc::umask(cur);
             cur
         }
     };
@@ -934,117 +801,68 @@ fn op_umask(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Valu
 // leaves `process.getuid` &c. undefined, matching Node (which does not define them on Windows).
 #[cfg(unix)]
 fn op_getuid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(unsafe { ffi::getuid() } as f64))
+    Ok(Value::Num(lumen_os::proc::getuid() as f64))
 }
 #[cfg(unix)]
 fn op_geteuid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(unsafe { ffi::geteuid() } as f64))
+    Ok(Value::Num(lumen_os::proc::geteuid() as f64))
 }
 #[cfg(unix)]
 fn op_getgid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(unsafe { ffi::getgid() } as f64))
+    Ok(Value::Num(lumen_os::proc::getgid() as f64))
 }
 #[cfg(unix)]
 fn op_getegid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(unsafe { ffi::getegid() } as f64))
+    Ok(Value::Num(lumen_os::proc::getegid() as f64))
 }
 #[cfg(unix)]
 fn op_getppid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(unsafe { ffi::getppid() } as f64))
+    Ok(Value::Num(lumen_os::proc::getppid() as f64))
 }
 
 #[cfg(unix)]
 fn op_execve(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    use std::ffi::CString;
-    use std::os::raw::c_char;
-
     refuse_in_realm(ctx, "process.execve")?;
-    let path = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let argv = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let env = ctx
-        .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let path = CString::new(path)
-        .map_err(|_| ctx.make_error("TypeError", "execve path contains a null byte"))?;
-    let argv = argv
-        .split('\0')
-        .filter(|value| !value.is_empty())
-        .map(CString::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ctx.make_error("TypeError", "execve argument contains a null byte"))?;
-    let env = env
-        .split('\0')
-        .filter(|value| !value.is_empty())
-        .map(CString::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ctx.make_error("TypeError", "execve environment contains a null byte"))?;
-    let mut argv_ptrs: Vec<*const c_char> = argv.iter().map(|value| value.as_ptr()).collect();
-    argv_ptrs.push(std::ptr::null());
-    let mut env_ptrs: Vec<*const c_char> = env.iter().map(|value| value.as_ptr()).collect();
-    env_ptrs.push(std::ptr::null());
-    unsafe {
-        ffi::execve(path.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+    let mut text = |i: usize| -> Result<String, Value> {
+        Ok(ctx.coerce_string(args.get(i).unwrap_or(&Value::Undefined))?.to_string())
+    };
+    let (path, argv, env) = (text(0)?, text(1)?, text(2)?);
+    if path.contains('\0') {
+        return Err(ctx.make_error("TypeError", "execve path contains a null byte"));
     }
-    Err(ctx.make_error(
-        "Error",
-        format!("execve failed: {}", std::io::Error::last_os_error()),
-    ))
+    let argv: Vec<&str> = argv.split('\0').filter(|value| !value.is_empty()).collect();
+    let env: Vec<&str> = env.split('\0').filter(|value| !value.is_empty()).collect();
+    let e = lumen_os::ident::execve(&path, &argv, &env);
+    Err(ctx.make_error("Error", format!("execve failed: {} (os error {})", e.message(), e.errno())))
 }
 
+/// Node's error for a failed identity change: `Error: EPERM, Operation not permitted` with
+/// `code`, `errno` and `syscall`.
 #[cfg(unix)]
-fn identity_result(ctx: &mut Ctx, rc: i32, _name: &str) -> Result<Value, Value> {
-    if rc == 0 {
+fn identity_result(ctx: &mut Ctx, result: Result<(), lumen_os::FsError>, syscall: &str) -> Result<Value, Value> {
+    let Err(e) = result else {
         return Ok(Value::Undefined);
-    }
-    let os_err = std::io::Error::last_os_error();
-    let errno = os_err.raw_os_error().unwrap_or(0);
-    let code = match errno {
-        1 => "EPERM",
-        12 => "ENOMEM",
-        22 => "EINVAL",
-        _ => "EPERM",
     };
-    let detail = os_err.to_string();
-    let detail = detail.split(" (os error").next().unwrap_or(&detail).to_string();
-    let err = ctx.make_error("Error", format!("{code}, {detail}"));
-    let _ = ctx.set_member(&err, "code", Value::str(code));
-    let _ = ctx.set_member(&err, "errno", Value::Num(-(errno as f64)));
-    let _ = ctx.set_member(&err, "syscall", Value::from_string(_name.to_string()));
+    let err = ctx.make_error("Error", format!("{}, {}", e.code(), e.message()));
+    let _ = ctx.set_member(&err, "code", Value::str(e.code()));
+    let _ = ctx.set_member(&err, "errno", Value::Num(-(e.errno() as f64)));
+    let _ = ctx.set_member(&err, "syscall", Value::from_string(syscall.to_string()));
     Err(err)
 }
 #[cfg(unix)]
 fn op_uid_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let name = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?.to_string();
-    let Ok(name) = std::ffi::CString::new(name) else { return Ok(Value::Undefined) };
-    let entry = unsafe { ffi::getpwnam(name.as_ptr()) };
-    if entry.is_null() {
-        return Ok(Value::Undefined);
-    }
-    Ok(Value::Num(unsafe { (*entry).uid } as f64))
+    Ok(lumen_os::ident::uid_of(&name).map_or(Value::Undefined, |id| Value::Num(id as f64)))
 }
 #[cfg(unix)]
 fn op_gid_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let name = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?.to_string();
-    let Ok(name) = std::ffi::CString::new(name) else { return Ok(Value::Undefined) };
-    let entry = unsafe { ffi::getgrnam(name.as_ptr()) };
-    if entry.is_null() {
-        return Ok(Value::Undefined);
-    }
-    Ok(Value::Num(unsafe { (*entry).gid } as f64))
+    Ok(lumen_os::ident::gid_of(&name).map_or(Value::Undefined, |id| Value::Num(id as f64)))
 }
 #[cfg(unix)]
 fn op_user_name_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let uid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
-    let entry = unsafe { ffi::getpwuid(uid) };
-    if entry.is_null() {
-        return Ok(Value::Undefined);
-    }
-    let name = unsafe { std::ffi::CStr::from_ptr((*entry).name) };
-    Ok(Value::from_string(name.to_string_lossy().into_owned()))
+    Ok(lumen_os::ident::user_name(uid).map_or(Value::Undefined, Value::from_string))
 }
 #[cfg(not(unix))]
 fn op_uid_of(_ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -1062,44 +880,30 @@ fn op_user_name_of(_ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, 
 fn op_setuid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     refuse_in_realm(ctx, "process.setuid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
-    identity_result(ctx, unsafe { ffi::setuid(id) }, "setuid")
+    identity_result(ctx, lumen_os::ident::setuid(id), "setuid")
 }
 #[cfg(unix)]
 fn op_seteuid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     refuse_in_realm(ctx, "process.seteuid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
-    identity_result(ctx, unsafe { ffi::seteuid(id) }, "seteuid")
+    identity_result(ctx, lumen_os::ident::seteuid(id), "seteuid")
 }
 #[cfg(unix)]
 fn op_setgid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     refuse_in_realm(ctx, "process.setgid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
-    identity_result(ctx, unsafe { ffi::setgid(id) }, "setgid")
+    identity_result(ctx, lumen_os::ident::setgid(id), "setgid")
 }
 #[cfg(unix)]
 fn op_setegid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     refuse_in_realm(ctx, "process.setegid")?;
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
-    identity_result(ctx, unsafe { ffi::setegid(id) }, "setegid")
+    identity_result(ctx, lumen_os::ident::setegid(id), "setegid")
 }
 #[cfg(unix)]
 fn op_getgroups(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
-    let count = unsafe { ffi::getgroups(0, std::ptr::null_mut()) };
-    if count < 0 {
-        return Err(ctx.make_error(
-            "Error",
-            format!("getgroups failed: {}", std::io::Error::last_os_error()),
-        ));
-    }
-    let mut groups = vec![0u32; count as usize];
-    let count = unsafe { ffi::getgroups(count, groups.as_mut_ptr()) };
-    if count < 0 {
-        return Err(ctx.make_error(
-            "Error",
-            format!("getgroups failed: {}", std::io::Error::last_os_error()),
-        ));
-    }
-    groups.truncate(count as usize);
+    let groups = lumen_os::ident::groups()
+        .map_err(|e| ctx.make_error("Error", format!("getgroups failed: {e}")))?;
     Ok(ctx.make_array(groups.into_iter().map(|id| Value::Num(id as f64)).collect()))
 }
 #[cfg(unix)]
@@ -1116,27 +920,19 @@ fn op_setgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ctx.make_error("TypeError", "group ids must be numbers"))?
     };
-    identity_result(
-        ctx,
-        unsafe { ffi::setgroups(groups.len(), groups.as_ptr()) },
-        "setgroups",
-    )
+    identity_result(ctx, lumen_os::ident::setgroups(&groups), "setgroups")
 }
 #[cfg(unix)]
 fn op_initgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    use std::ffi::CString;
     refuse_in_realm(ctx, "process.initgroups")?;
     let user = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let user =
-        CString::new(user).map_err(|_| ctx.make_error("TypeError", "user contains a null byte"))?;
+    if user.contains('\0') {
+        return Err(ctx.make_error("TypeError", "user contains a null byte"));
+    }
     let group = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as u32;
-    identity_result(
-        ctx,
-        unsafe { ffi::initgroups(user.as_ptr(), group) },
-        "initgroups",
-    )
+    identity_result(ctx, lumen_os::ident::initgroups(&user, group), "initgroups")
 }
 #[cfg(not(unix))]
 fn op_setuid(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -1192,133 +988,3 @@ fn op_getppid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
     Ok(Value::Num(0.0))
 }
 
-/// Raw libc identity/control calls. Same category as `dylib.rs`'s dlopen FFI: these symbols live
-/// in libc, which std already links into every Rust program, so no third-party dependency is added.
-#[cfg(unix)]
-mod ffi {
-    use std::os::raw::{c_char, c_int, c_long, c_uint};
-
-    pub const RUSAGE_SELF: c_int = 0;
-
-    #[derive(Clone, Copy)]
-    #[repr(C)]
-    pub struct TimeVal {
-        pub sec: c_long,
-        pub usec: c_long,
-    }
-
-    #[repr(C)]
-    pub struct RUsage {
-        pub user: TimeVal,
-        pub system: TimeVal,
-        pub max_rss: c_long,
-        pub shared_memory: c_long,
-        pub unshared_data: c_long,
-        pub unshared_stack: c_long,
-        pub minor_faults: c_long,
-        pub major_faults: c_long,
-        pub swaps: c_long,
-        pub block_inputs: c_long,
-        pub block_outputs: c_long,
-        pub messages_sent: c_long,
-        pub messages_received: c_long,
-        pub signals: c_long,
-        pub voluntary_switches: c_long,
-        pub involuntary_switches: c_long,
-    }
-
-    #[cfg(target_os = "macos")]
-    #[derive(Default)]
-    #[repr(C)]
-    pub struct RUsageInfoV2 {
-        pub uuid: [u8; 16],
-        pub user_time: u64,
-        pub system_time: u64,
-        pub pkg_idle_wkups: u64,
-        pub interrupt_wkups: u64,
-        pub pageins: u64,
-        pub wired_size: u64,
-        pub resident_size: u64,
-        pub phys_footprint: u64,
-        pub proc_start_abstime: u64,
-        pub proc_exit_abstime: u64,
-        pub child_user_time: u64,
-        pub child_system_time: u64,
-        pub child_pkg_idle_wkups: u64,
-        pub child_interrupt_wkups: u64,
-        pub child_pageins: u64,
-        pub child_elapsed_abstime: u64,
-        pub diskio_bytesread: u64,
-        pub diskio_byteswritten: u64,
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn sysctl_u64(name: &str) -> Option<u64> {
-        let name = std::ffi::CString::new(name).ok()?;
-        let mut value = 0_u64;
-        let mut size = std::mem::size_of_val(&value);
-        let result = unsafe {
-            sysctlbyname(
-                name.as_ptr(),
-                (&mut value as *mut u64).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (result == 0).then_some(value)
-    }
-
-    #[repr(C)]
-    pub struct Passwd {
-        pub name: *const c_char,
-        pub passwd: *const c_char,
-        pub uid: c_uint,
-        pub gid: c_uint,
-    }
-
-    #[repr(C)]
-    pub struct Group {
-        pub name: *const c_char,
-        pub passwd: *const c_char,
-        pub gid: c_uint,
-    }
-
-    extern "C" {
-        pub fn getpwnam(name: *const c_char) -> *const Passwd;
-        pub fn getpwuid(uid: c_uint) -> *const Passwd;
-        pub fn getgrnam(name: *const c_char) -> *const Group;
-        pub fn getrusage(who: c_int, usage: *mut RUsage) -> c_int;
-        #[cfg(target_os = "macos")]
-        pub fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut std::ffi::c_void) -> c_int;
-        #[cfg(target_os = "macos")]
-        pub fn sysctlbyname(
-            name: *const c_char,
-            old: *mut std::ffi::c_void,
-            old_len: *mut usize,
-            new: *mut std::ffi::c_void,
-            new_len: usize,
-        ) -> c_int;
-        pub fn getuid() -> c_uint;
-        pub fn geteuid() -> c_uint;
-        pub fn getgid() -> c_uint;
-        pub fn getegid() -> c_uint;
-        pub fn getppid() -> c_int;
-        pub fn kill(pid: c_int, sig: c_int) -> c_int;
-        // mode_t is 16-bit on macOS / 32-bit on Linux; c_uint is ABI-safe for both (small values,
-        // masked on the way out). Passing/returning through a register truncates harmlessly.
-        pub fn umask(mask: c_uint) -> c_uint;
-        pub fn execve(
-            path: *const c_char,
-            argv: *const *const c_char,
-            envp: *const *const c_char,
-        ) -> c_int;
-        pub fn setuid(uid: c_uint) -> c_int;
-        pub fn seteuid(uid: c_uint) -> c_int;
-        pub fn setgid(gid: c_uint) -> c_int;
-        pub fn setegid(gid: c_uint) -> c_int;
-        pub fn getgroups(size: c_int, groups: *mut c_uint) -> c_int;
-        pub fn setgroups(size: usize, groups: *const c_uint) -> c_int;
-        pub fn initgroups(user: *const c_char, group: c_uint) -> c_int;
-    }
-}
