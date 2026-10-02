@@ -48,7 +48,7 @@ Report the findings and resolve them (or schedule a pass to resolve them) as par
 
 ## Python (`crates/lumen-py`)
 
-- Target semantics: CPython 3.12. Vendored CPython modules live unmodified in
+- Target semantics: CPython 3.14 (moving from 3.12; Home Assistant and Hermes need 3.14). Vendored CPython modules live unmodified in
   `crates/lumen-py/lib/` (see `VENDORED.md`); fix the engine, never patch vendored files.
 - Native modules that are C in CPython are written in Rust on top of Lumen's shared code.
 - Correctness is checked against CPython: the corpus (`cargo test -p lumen-py --test corpus`),
