@@ -89,6 +89,9 @@ pub mod singlephasem;
 pub mod testbufferm;
 pub mod testextm;
 pub mod xxlimitedm;
+pub mod lsprofm;
+pub mod monitoringm;
+pub mod opcodem;
 
 use crate::object::*;
 use crate::vm::*;

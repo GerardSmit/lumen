@@ -249,6 +249,9 @@ pub struct TbEntry {
     pub name: Rc<str>,
     pub code: Rc<Code>,
     pub globals: Obj,
+    /// The frame object, when one existed while the exception passed through the frame
+    /// (`tb_frame` keeps its locals alive, as in CPython).
+    pub frame: Option<Obj>,
 }
 
 pub struct ExcData {

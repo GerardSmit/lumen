@@ -24,6 +24,7 @@ pub mod hash;
 pub mod history;
 pub mod json;
 pub mod limits;
+pub mod lineno;
 pub mod local_tz;
 pub mod memcat;
 pub mod mt19937;

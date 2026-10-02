@@ -442,7 +442,7 @@ fn compile_source(it: &mut Interp, mut source: Value, filename: &Value, mode: &s
         super::astconv::Mode::Exec => it.compile_source(&src, &filename)?,
         super::astconv::Mode::Single => it.compile_source_mode(&src, &filename, true)?,
     };
-    let obj = Object::new(Kind::Code(code));
+    let obj = crate::bytecode::Code::object(&code);
     it.code_created(&obj);
     Ok(Value::Obj(obj))
 }

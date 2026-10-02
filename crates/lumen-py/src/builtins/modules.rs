@@ -28,9 +28,11 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
     ("_json", bound::<super::jsonm::_json::Module>),
+    ("_lsprof", bound::<super::lsprofm::_lsprof::Module>),
     ("_lzma", bound::<super::lzmam::_lzma::Module>),
     ("_md5", bound::<super::hashlibm::_md5::Module>),
     ("_multiprocessing", bound::<super::multiprocessingm::multiprocessing::Module>),
+    ("_opcode", bound::<super::opcodem::_opcode::Module>),
     ("_operator", bound::<super::operatorm::_operator::Module>),
     ("_posixshmem", bound::<super::multiprocessingm::posixshmem::Module>),
     ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
@@ -85,6 +87,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("sys", |it| it.sys_module.clone()),
     ("syslog", bound::<super::syslogm::syslog::Module>),
     ("termios", bound::<super::termiosm::termios::Module>),
+    ("sys.monitoring", bound::<super::monitoringm::sys_monitoring::Module>),
     ("time", bound::<super::timem::time::Module>),
     ("unicodedata", bound::<super::unicodedatam::unicodedata::Module>),
     ("xxlimited", bound::<super::xxlimitedm::xxlimited::Module>),
@@ -107,7 +110,7 @@ pub fn init(it: &mut Interp) {
 
 /// `sys.builtin_module_names`.
 pub fn builtin_module_names() -> Vec<&'static str> {
-    BUILTIN_MODULES.iter().map(|(n, _)| *n).collect()
+    BUILTIN_MODULES.iter().map(|(n, _)| *n).filter(|n| !n.contains('.')).collect()
 }
 
 /// `_sysconfigdata_*`, the build-time configuration `sysconfig` reads (generated when CPython is
