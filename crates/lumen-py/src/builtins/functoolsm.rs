@@ -122,6 +122,62 @@ pub mod _functools {
         func: Value,
         args: Value,
         keywords: Value,
+        phcount: usize,
+    }
+
+    /// The type of the Placeholder singleton.
+    ///
+    /// Used as a placeholder for partial arguments.
+    #[class(name = "_PlaceholderType", module = "functools", hint(py(final)))]
+    pub struct PlaceholderType {}
+
+    #[methods]
+    impl PlaceholderType {
+        #[constructor]
+        fn new(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+            if !args.is_empty() || !kw.to_vec().is_empty() {
+                return Err(it.type_error("PlaceholderType takes no arguments"));
+            }
+            let m = Value::Obj(it.import_module("_functools")?);
+            it.get_attr_str(&m, "Placeholder")
+        }
+
+        #[proto(repr)]
+        fn __repr__(&self) -> &'static str {
+            "Placeholder"
+        }
+
+        #[proto(reduce, hint(py(text_signature = "")))]
+        fn __reduce__(&self) -> &'static str {
+            "Placeholder"
+        }
+    }
+
+    #[init]
+    fn init(it: &mut Interp, m: &Value) -> R<()> {
+        if let Value::Obj(m) = m {
+            let ph = Py::new(it, PlaceholderType {}).value().clone();
+            crate::vm::dict_set_str(&it.module_dict(m), "Placeholder", ph);
+        }
+        Ok(())
+    }
+
+    fn is_placeholder(it: &mut Interp, v: &Value) -> bool {
+        Py::<PlaceholderType>::from_value(it, v).is_some()
+    }
+
+    fn count_placeholders(it: &mut Interp, args: &[Value]) -> usize {
+        match args.split_last() {
+            Some((_, init)) => init.iter().filter(|a| is_placeholder(it, a)).count(),
+            None => 0,
+        }
+    }
+
+    fn trailing_placeholder(it: &mut Interp, args: &[Value]) -> R<()> {
+        if args.last().is_some_and(|a| is_placeholder(it, a)) {
+            return Err(it.type_error("trailing Placeholders are not allowed"));
+        }
+        Ok(())
     }
 
     fn dict_len(d: &Obj) -> usize {
@@ -146,35 +202,92 @@ pub mod _functools {
             };
             let Value::Obj(cls) = cls.0 else { unreachable!() };
             let mut func = func.clone();
-            let mut all_args = Vec::new();
+            if !it.is_callable(&func) {
+                return Err(it.type_error("the first argument must be callable"));
+            }
+            trailing_placeholder(it, rest)?;
+            let kw = kw.to_vec();
+            if kw.iter().any(|(_, v)| is_placeholder(it, v)) {
+                return Err(it.type_error("Placeholder cannot be passed as a keyword argument"));
+            }
             let keywords = new_dict(it);
+            let mut pto_args: Vec<Value> = Vec::new();
+            let mut pto_phcount = 0;
             // A plain partial without instance attributes is flattened into the new one.
             if let Some(inner) = Py::<Partial>::from_value(it, &func) {
                 let plain = matches!(&func, Value::Obj(o) if o.dict.borrow().as_ref().is_none_or(|d| dict_len(d) == 0));
                 let partial_type = type_object::<Partial>(it);
                 if plain && std::rc::Rc::ptr_eq(&it.type_of(&func), &partial_type) {
                     let (f, a, k) = partial_parts(it, &inner)?;
-                    all_args.extend(a.tuple_items().unwrap_or(&[]).iter().cloned());
+                    pto_phcount = inner.borrow(it)?.phcount;
+                    pto_args = a.tuple_items().unwrap_or(&[]).to_vec();
                     it.dict_update_from(keywords.as_obj().unwrap(), &k)?;
                     func = f;
                 }
             }
-            if !it.is_callable(&func) {
-                return Err(it.type_error("the first argument must be callable"));
-            }
-            all_args.extend(rest.iter().cloned());
+            let phcount = count_placeholders(it, rest);
+            let (all_args, phcount) = if pto_phcount > 0 && !rest.is_empty() {
+                let new_nargs = rest.len();
+                let npargs = pto_args.len();
+                let tot = npargs + new_nargs.saturating_sub(pto_phcount);
+                let mut remaining = pto_phcount;
+                let mut out = Vec::with_capacity(tot);
+                let mut j = 0;
+                for i in 0..tot {
+                    if i < npargs {
+                        let mut item = pto_args[i].clone();
+                        if j < new_nargs && is_placeholder(it, &item) {
+                            item = rest[j].clone();
+                            j += 1;
+                            remaining -= 1;
+                        }
+                        out.push(item);
+                    } else {
+                        out.push(rest[j].clone());
+                        j += 1;
+                    }
+                }
+                (out, remaining + phcount)
+            } else {
+                pto_args.extend(rest.iter().cloned());
+                (pto_args, pto_phcount + phcount)
+            };
             let kd = keywords.as_obj().unwrap().clone();
-            for (k, v) in kw.to_vec() {
+            for (k, v) in kw {
                 it.dict_set(&kd, Value::Obj(k), v)?;
             }
-            Ok(opaque_instance(&cls, Partial { func, args: Value::tuple(all_args), keywords }))
+            Ok(opaque_instance(&cls, Partial { func, args: Value::tuple(all_args), keywords, phcount }))
+        }
+
+        fn __get__(slf: This<Py<Self>>, obj: &Value, _cls: Option<&Value>) -> R<Value> {
+            let me = slf.0.value().clone();
+            if obj.is_none() {
+                return Ok(me);
+            }
+            Ok(Value::Obj(Object::new(Kind::Method(me, obj.clone()))))
         }
 
         #[proto(call)]
         fn __call__(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
             let (func, pargs, keywords) = partial_parts(it, &slf.0)?;
+            let phcount = slf.0.borrow(it)?.phcount;
+            if args.len() < phcount {
+                return Err(it.type_error(&format!(
+                    "missing positional arguments in 'partial' call; expected at least {phcount}, got {}",
+                    args.len()
+                )));
+            }
             let mut all: Vec<Value> = pargs.tuple_items().unwrap_or(&[]).to_vec();
-            all.extend(args.iter().cloned());
+            let mut next = 0;
+            if phcount > 0 {
+                for slot in all.iter_mut() {
+                    if next < phcount && is_placeholder(it, slot) {
+                        *slot = args[next].clone();
+                        next += 1;
+                    }
+                }
+            }
+            all.extend(args[next..].iter().cloned());
             let mut kwargs = it.dict_to_kwargs(&keywords)?;
             for (k, v) in kw.to_vec() {
                 let name = k.as_str_kind().unwrap_or("");
@@ -237,12 +350,11 @@ pub mod _functools {
             let (func, args, keywords) = partial_parts(it, &slf.0)?;
             let me = slf.0.value().clone();
             let cls = Value::Obj(it.type_of(&me));
-            let kw = if it.truthy(&keywords)? { keywords } else { Value::None };
             let dict = match me.as_obj().and_then(|o| o.dict.borrow().clone()) {
                 Some(d) if dict_len(&d) > 0 => Value::Obj(d),
                 _ => Value::None,
             };
-            Ok(Value::tuple(vec![cls, Value::tuple(vec![func.clone()]), Value::tuple(vec![func, args, kw, dict])]))
+            Ok(Value::tuple(vec![cls, Value::tuple(vec![func.clone()]), Value::tuple(vec![func, args, keywords, dict])]))
         }
 
         #[method(hint(py(text_signature = "")))]
@@ -254,9 +366,13 @@ pub mod _functools {
             let (func, args, kw, dict) = (&items[0], &items[1], &items[2], &items[3]);
             let args_ok = matches!(args, Value::Obj(o) if matches!(o.kind, Kind::Tuple(_)));
             let kw_ok = kw.is_none() || dict_of(kw).is_some();
-            if !it.is_callable(func) || !args_ok || !kw_ok {
+            let dict_ok = dict.is_none() || dict_of(dict).is_some();
+            if !it.is_callable(func) || !args_ok || !kw_ok || !dict_ok {
                 return Err(it.type_error("invalid partial state"));
             }
+            let arg_items = args.tuple_items().unwrap_or(&[]).to_vec();
+            trailing_placeholder(it, &arg_items)?;
+            let phcount = count_placeholders(it, &arg_items);
             let args = match args {
                 Value::Obj(o) if o.cls.is_some() => Value::tuple(args.tuple_items().unwrap_or(&[]).to_vec()),
                 _ => args.clone(),
@@ -276,6 +392,7 @@ pub mod _functools {
                 me.func = func.clone();
                 me.args = args;
                 me.keywords = keywords;
+                me.phcount = phcount;
             }
             if let Some(o) = slf.0.value().as_obj() {
                 *o.dict.borrow_mut() = match dict {

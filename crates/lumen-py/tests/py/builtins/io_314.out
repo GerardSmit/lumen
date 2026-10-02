@@ -1,0 +1,17 @@
+131072
+_BytesIOBuffer
+TypeError cannot create '_io._BytesIOBuffer' instances
+BufferError Existing exports of data: object cannot be re-sized
+NotImplementedError 
+NotImplementedError 
+NotImplementedError 
+[('ResourceWarning', 'unclosed file <_io.FileIO name')]
+[('ResourceWarning', 'unclosed file <_io.BufferedRea')]
+[('ResourceWarning', 'unclosed file <_io.TextIOWrapp')]
+[('ResourceWarning', 'unclosed file <_io.BufferedRea')]
+False
+ValueError I/O operation on closed file
+None
+False
+(False, False)
+_dealloc_warn

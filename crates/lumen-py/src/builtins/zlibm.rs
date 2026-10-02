@@ -134,7 +134,7 @@ pub mod zlib {
     ///     Compression level, in 0-9 or -1.
     ///   wbits
     ///     The window buffer size and container format.
-    #[op]
+    #[op(hint(py(text_signature = "($module, data, /, level=Z_DEFAULT_COMPRESSION, wbits=MAX_WBITS)")))]
     fn compress(it: &mut Interp, data: &Value, #[kw] #[default(-1)] level: i64, #[kw] #[default(15)] wbits: i64) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         let (level, wbits) = (c_int(it, level)?, c_int(it, wbits)?);
@@ -158,7 +158,7 @@ pub mod zlib {
     ///     The window buffer size and container format.
     ///   bufsize
     ///     The initial output buffer size.
-    #[op]
+    #[op(hint(py(text_signature = "($module, data, /, wbits=MAX_WBITS, bufsize=DEF_BUF_SIZE)")))]
     fn decompress(it: &mut Interp, data: &Value, #[kw] #[default(15)] wbits: i64, #[kw] #[default(16384)] bufsize: i64) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         let wbits = c_int(it, wbits)?;
@@ -196,7 +196,7 @@ pub mod zlib {
     ///   zdict
     ///     The predefined compression dictionary - a sequence of bytes
     ///     containing subsequences that are likely to occur in the input data.
-    #[op]
+    #[op(hint(py(text_signature = "($module, /, level=Z_DEFAULT_COMPRESSION, method=DEFLATED,\n            wbits=MAX_WBITS, memLevel=DEF_MEM_LEVEL,\n            strategy=Z_DEFAULT_STRATEGY, zdict=None)")))]
     #[allow(non_snake_case)]
     fn compressobj(
         it: &mut Interp,
@@ -237,7 +237,7 @@ pub mod zlib {
     ///   zdict
     ///     The predefined compression dictionary.  This must be the same
     ///     dictionary as used by the compressor that produced the input data.
-    #[op]
+    #[op(hint(py(text_signature = "($module, /, wbits=MAX_WBITS, zdict=b'')")))]
     fn decompressobj(it: &mut Interp, #[kw] #[default(15)] wbits: i64, #[kw] zdict: Option<&Value>) -> R<Value> {
         let wbits = c_int(it, wbits)?;
         let zdict = zdict_arg(it, zdict)?;
@@ -274,7 +274,7 @@ pub mod zlib {
     ///     Starting value of the checksum.
     ///
     /// The returned checksum is an integer.
-    #[op]
+    #[op(hint(py(text_signature = "($module, data, value=1, /)")))]
     fn adler32(it: &mut Interp, data: &Value, value: Option<&Value>) -> R<u32> {
         let data = buffer(it, data)?;
         let seed = match value {
@@ -290,7 +290,7 @@ pub mod zlib {
     ///     Starting value of the checksum.
     ///
     /// The returned checksum is an integer.
-    #[op]
+    #[op(hint(py(text_signature = "($module, data, value=0, /)")))]
     fn crc32(it: &mut Interp, data: &Value, value: Option<&Value>) -> R<u32> {
         let data = buffer(it, data)?;
         let seed = match value {
@@ -338,6 +338,7 @@ pub mod zlib {
         ///     If mode == Z_FINISH, the compressor object can no longer be
         ///     used after calling the flush() method.  Otherwise, more data
         ///     can still be compressed.
+        #[method(hint(py(text_signature = "($self, mode=zlib.Z_FINISH, /)")))]
         fn flush(slf: This<Py<Self>>, it: &mut Interp, #[default(4)] mode: i64) -> R<Vec<u8>> {
             let mode = c_int(it, mode)?;
             if mode == Z_NO_FLUSH {

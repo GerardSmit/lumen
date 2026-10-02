@@ -37,7 +37,7 @@ pub mod _struct {
     use crate::object::*;
     use crate::vm::{dict_get_str, dict_set_str, Interp};
     use lumen_common::buffer::{load, store_f64, store_float_checked, store_int_checked, store_int_wrapping, struct_code};
-    use lumen_common::buffer::{ElemKind, PackError, StructMode, ViewDesc};
+    use lumen_common::buffer::{ElemKind, PackError, Scalar, StructMode, ViewDesc};
     use std::cell::RefCell;
     use lumen_common::fasthash::FastMap;
     use std::rc::Rc;
@@ -155,6 +155,27 @@ pub mod _struct {
                     num = num * 10 + d;
                 }
             }
+            let complex = match c {
+                b'F' => Some(8usize),
+                b'D' => Some(16),
+                _ => None,
+            };
+            if let Some(csize) = complex {
+                let align = if mode.is_native() { csize / 2 } else { 1 };
+                size = match size.checked_add(align - 1) {
+                    Some(s) => s / align * align,
+                    None => return Err(too_long(it)),
+                };
+                if num > 0 {
+                    if num > (max - size) / csize {
+                        return Err(too_long(it));
+                    }
+                    codes.push(Code { ch: c, kind: None, offset: size, size: csize, repeat: num });
+                    nvalues += num;
+                    size += csize * num;
+                }
+                continue;
+            }
             let Some(sc) = struct_code(c, mode) else {
                 return Err(struct_error(it, "bad char in struct format"));
             };
@@ -241,6 +262,18 @@ pub mod _struct {
         for c in &f.codes {
             match c.kind {
                 None if c.ch == b's' => out.push(Value::bytes(data[c.offset..c.offset + c.size].to_vec())),
+                None if matches!(c.ch, b'F' | b'D') => {
+                    let half = c.size / 2;
+                    for k in 0..c.repeat {
+                        let at = c.offset + k * c.size;
+                        let part = |b: &[u8]| match load(if half == 4 { ElemKind::F32 } else { ElemKind::F64 }, b, order) {
+                            Scalar::Float(x) => x,
+                            _ => 0.0,
+                        };
+                        let (re, im) = (part(&data[at..at + half]), part(&data[at + half..at + c.size]));
+                        out.push(Value::Obj(Object::new(Kind::Complex(re, im))));
+                    }
+                }
                 None => {
                     let n = c.size;
                     let v = if n == 0 {
@@ -359,6 +392,21 @@ pub mod _struct {
         let mut next = 0;
         for c in &f.codes {
             match c.kind {
+                None if matches!(c.ch, b'F' | b'D') => {
+                    let half = c.size / 2;
+                    let kind = if half == 4 { ElemKind::F32 } else { ElemKind::F64 };
+                    for k in 0..c.repeat {
+                        let at = c.offset + k * c.size;
+                        let v = &args[next];
+                        next += 1;
+                        let (re, im) = it
+                            .complex_arg(v)
+                            .map_err(|_| struct_error(it, "required argument is not a complex"))?;
+                        let order = f.mode.order();
+                        store_f64(kind, re, &mut buf[at..at + half], order);
+                        store_f64(kind, im, &mut buf[at + half..at + c.size], order);
+                    }
+                }
                 None => {
                     let v = &args[next];
                     next += 1;

@@ -11,7 +11,7 @@
 ///
 /// Iterators terminating on the shortest input sequence:
 /// accumulate(p[, func]) --> p0, p0+p1, p0+p1+p2
-/// batched(p, n) --> [p0, p1, ..., p_n-1], [p_n, p_n+1, ..., p_2n-1], ...
+/// batched(p, n[, strict]) --> [p0, p1, ..., p_n-1], [p_n, p_n+1, ..., p_2n-1], ...
 /// chain(p, q, ...) --> p0, p1, ... plast, q0, q1, ...
 /// chain.from_iterable([p, q, ...]) --> p0, p1, ... plast, q0, q1, ...
 /// compress(data, selectors) --> (d[0] if s[0]), (d[1] if s[1]), ...
@@ -453,13 +453,16 @@ pub mod itertools {
     ///     ('A', 'B', 'C')
     ///     ('D', 'E', 'F')
     ///     ('G',)
+    ///
+    /// If "strict" is True, raises a ValueError if the final batch is shorter
+    /// than n.
     #[class(name = "batched", hint(py(native_iter)))]
     pub struct Batched;
 
     #[methods]
     impl Batched {
-        #[constructor(hint(py(text_signature = "(iterable, n)")))]
-        fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] n: isize) -> R<NativeIter> {
+        #[constructor(hint(py(text_signature = "(iterable, n, *, strict=False)")))]
+        fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] n: isize, #[kwonly] #[default(false)] strict: bool) -> R<NativeIter> {
             if n < 1 {
                 return Err(it.value_error("n must be at least one"));
             }
@@ -473,7 +476,13 @@ pub mod itertools {
                         None => break,
                     }
                 }
-                Ok(if batch.is_empty() { None } else { Some(Value::tuple(batch)) })
+                if batch.is_empty() {
+                    return Ok(None);
+                }
+                if strict && batch.len() < n {
+                    return Err(it.value_error("batched(): incomplete batch"));
+                }
+                Ok(Some(Value::tuple(batch)))
             }))
         }
     }
@@ -552,8 +561,6 @@ pub mod itertools {
         }
     }
 
-    /// zip_longest(iter1 [,iter2 [...]], [fillvalue=None]) --> zip_longest object
-    ///
     /// Return a zip_longest object whose .__next__() method returns a tuple where
     /// the i-th element comes from the i-th iterable argument.  The .__next__()
     /// method continues until the longest iterable in the argument sequence

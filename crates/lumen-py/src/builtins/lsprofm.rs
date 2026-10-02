@@ -1,18 +1,28 @@
 //! `_lsprof`: the profiler behind `cProfile`, a port of CPython's `Modules/_lsprof.c` on top of
 //! `sys.setprofile` (the call, return and C-function events of the monitoring engine).
 
-use super::sysextra::{frame_code, structseq_full, structseq_type};
+use super::sysextra::{structseq_full, structseq_type};
 use crate::bind::Py;
-use crate::bytecode::Code;
 use crate::object::*;
-use crate::vm::Interp;
+use crate::trace::ev;
+use crate::vm::{dict_set_str, Interp};
 use std::collections::HashMap;
-use std::rc::Rc;
 
-/// The default timer's unit: it counts nanoseconds.
-const DEFAULT_TIME_UNIT: f64 = 1e-9;
-/// Seconds returned by an external timer without a `timeunit` are kept as fixed-point numbers.
-const DOUBLE_TIMER_PRECISION: f64 = 4294967296.0;
+/// The profiler counts nanoseconds.
+const TIME_UNIT: f64 = 1e-9;
+const PROFILER_ID: i64 = 2;
+
+const CALLBACKS: [(u32, &str); 9] = [
+    (ev::PY_START, "_pystart_callback"),
+    (ev::PY_RESUME, "_pystart_callback"),
+    (ev::PY_THROW, "_pythrow_callback"),
+    (ev::PY_RETURN, "_pyreturn_callback"),
+    (ev::PY_YIELD, "_pyreturn_callback"),
+    (ev::PY_UNWIND, "_pyreturn_callback"),
+    (ev::CALL, "_ccall_callback"),
+    (ev::C_RETURN, "_creturn_callback"),
+    (ev::C_RAISE, "_creturn_callback"),
+];
 
 type Key = (usize, usize);
 
@@ -61,8 +71,11 @@ impl Entry {
     }
 }
 
-fn code_key(code: &Rc<Code>) -> Key {
-    (Rc::as_ptr(code) as usize, 0)
+fn code_key(code: &Value) -> Option<Key> {
+    match code {
+        Value::Obj(o) if matches!(o.kind, Kind::Code(_)) => Some((std::rc::Rc::as_ptr(o) as usize, 0)),
+        _ => None,
+    }
 }
 
 /// The identity of a built-in function or bound built-in method, shared by every bound copy.
@@ -85,6 +98,7 @@ pub struct State {
     subcalls: bool,
     builtins: bool,
     enabled: bool,
+    in_timer: bool,
     entries: Vec<Entry>,
     index: HashMap<Key, usize>,
     stack: Vec<Context>,
@@ -98,6 +112,7 @@ impl State {
             subcalls: true,
             builtins: true,
             enabled: false,
+            in_timer: false,
             entries: Vec::new(),
             index: HashMap::new(),
             stack: Vec::new(),
@@ -160,20 +175,18 @@ impl State {
         }
     }
 
-    fn flush_unmatched(&mut self, now: i64) {
-        while let Some(ctx) = self.stack.pop() {
+    fn flush_one(&mut self, now: i64) {
+        if let Some(ctx) = self.stack.pop() {
             let idx = ctx.entry;
             self.stop(ctx, idx, now);
         }
     }
 
     fn factor(&self) -> f64 {
-        if self.timer.is_none() {
-            DEFAULT_TIME_UNIT
-        } else if self.timeunit > 0.0 {
-            self.timeunit
+        if self.timer.is_none() || self.timeunit <= 0.0 {
+            TIME_UNIT
         } else {
-            1.0 / DOUBLE_TIMER_PRECISION
+            self.timeunit
         }
     }
 }
@@ -202,50 +215,85 @@ pub mod _lsprof {
         pub(super) st: State,
     }
 
-    /// The current time in the profiler's units; a failing timer reads as 0.
+    /// The current time in nanoseconds; a failing timer reads as 0 and is reported as unraisable.
     fn clock(it: &mut Interp, p: &Py<Profiler>) -> R<i64> {
         let (timer, unit) = p.with(it, |s| (s.timer.clone(), s.timeunit))?;
         if timer.is_none() {
             return Ok(it.platform.borrow().monotonic_ns() as i64);
         }
-        let Ok(r) = it.call(&timer, Vec::new(), Vec::new()) else { return Ok(0) };
-        Ok(match (&r, unit > 0.0) {
-            (Value::Int(i), true) => *i,
-            (Value::Bool(b), true) => *b as i64,
-            (Value::Int(i), false) => (*i as f64 * DOUBLE_TIMER_PRECISION) as i64,
-            (Value::Float(f), false) => (*f * DOUBLE_TIMER_PRECISION) as i64,
-            _ => 0,
-        })
+        p.with(it, |s| s.in_timer = true)?;
+        let r = it.call(&timer, Vec::new(), Vec::new());
+        p.with(it, |s| s.in_timer = false)?;
+        match r.and_then(|r| timer_ns(it, &r, unit > 0.0)) {
+            Ok(ns) => Ok(ns),
+            Err(e) => {
+                let r = it.repr_of(&timer).unwrap_or_default();
+                it.write_unraisable(&e, Some(&format!("Exception ignored while calling _lsprof timer {r}")), None);
+                Ok(0)
+            }
+        }
     }
 
-    fn profiler_callback(it: &mut Interp, args: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-        let [this, frame, what, arg] = args else { return Ok(Value::None) };
-        let Some(p) = Py::<Profiler>::from_value(it, this) else { return Ok(Value::None) };
-        let what = what.as_str().unwrap_or("").to_string();
-        let (key, user) = match what.as_str() {
-            "call" | "return" => {
-                let Some(code) = frame_code(frame) else { return Ok(Value::None) };
-                (code_key(&code), Value::Obj(Code::object(&code)))
+    fn timer_ns(it: &mut Interp, r: &Value, integral: bool) -> R<i64> {
+        if integral {
+            if !r.is_int_like() {
+                let t = it.type_name_of(r);
+                return Err(it.type_error(&format!("'{t}' object cannot be interpreted as an integer")));
             }
-            "c_call" | "c_return" | "c_exception" => {
-                if !p.with(it, |s| s.builtins)? {
-                    return Ok(Value::None);
-                }
-                let Some(key) = function_key(arg) else { return Ok(Value::None) };
-                (key, arg.clone())
-            }
-            _ => return Ok(Value::None),
-        };
-        let entering = matches!(what.as_str(), "call" | "c_call");
-        if !entering && p.with(it, |s| s.stack.is_empty())? {
-            return Ok(Value::None);
+            return it.index_of(r);
         }
-        let now = clock(it, &p)?;
-        p.with(it, |s| match what.as_str() {
-            "call" | "c_call" => s.enter(key, &user, now),
-            _ => s.leave(key, now),
-        })?;
-        Ok(Value::None)
+        let secs = match r {
+            Value::Float(f) => *f,
+            _ if r.is_int_like() => it.index_of(r)? as f64,
+            _ => {
+                let t = it.type_name_of(r);
+                return Err(it.type_error(&format!("'{t}' object cannot be interpreted as an integer or float")));
+            }
+        };
+        if secs.is_nan() {
+            return Err(it.value_error("Invalid value NaN (not a number)"));
+        }
+        let ns = (secs * 1e9).floor();
+        if !(i64::MIN as f64..i64::MAX as f64).contains(&ns) {
+            return Err(it.overflow_err("timestamp too large to convert to C PyTime_t"));
+        }
+        Ok(ns as i64)
+    }
+
+    fn missing(it: &mut Interp) -> Value {
+        it.monitoring_sentinels().1
+    }
+
+    /// The profiled object of a CALL / C_RETURN / C_RAISE event: a built-in function or method;
+    /// a method descriptor is bound to the first argument (the receiver).
+    fn cfunction(it: &mut Interp, callable: &Value, self_arg: &Value) -> Option<(Key, Value)> {
+        match it.type_name_of(callable).as_str() {
+            "builtin_function_or_method" => function_key(callable).map(|k| (k, callable.clone())),
+            "method_descriptor" => {
+                if self_arg.is(&missing(it)) {
+                    return None;
+                }
+                let bound = Value::Obj(Object::new(Kind::Method(callable.clone(), self_arg.clone())));
+                function_key(&bound).map(|k| (k, bound))
+            }
+            _ => None,
+        }
+    }
+
+    fn enter_call(it: &mut Interp, p: &Py<Profiler>, key: Key, user: &Value) -> R<()> {
+        if p.with(it, |s| s.in_timer)? {
+            return Ok(());
+        }
+        let now = clock(it, p)?;
+        p.with(it, |s| s.enter(key, user, now))
+    }
+
+    fn leave_call(it: &mut Interp, p: &Py<Profiler>, key: Key) -> R<()> {
+        if p.with(it, |s| s.in_timer || s.stack.is_empty())? {
+            return Ok(());
+        }
+        let now = clock(it, p)?;
+        p.with(it, |s| s.leave(key, now))
     }
 
     /// The label `getstats` reports for a profiled object: the code object itself, or a string
@@ -281,6 +329,22 @@ pub mod _lsprof {
         Ok(Value::string(format!("<built-in method {}.{}>", module, native.name)))
     }
 
+    #[init]
+    fn init(it: &mut Interp, m: &Value) -> R<()> {
+        let Value::Obj(m) = m else { return Ok(()) };
+        let d = it.module_dict(m);
+        let (entry, sub) = stats_types(it);
+        dict_set_str(&d, "profiler_entry", Value::Obj(entry));
+        dict_set_str(&d, "profiler_subentry", Value::Obj(sub));
+        Ok(())
+    }
+
+    fn stats_types(it: &mut Interp) -> (Obj, Obj) {
+        let entry = structseq_type::<Stats>(it, "_lsprof", "profiler_entry", &["code", "callcount", "reccallcount", "totaltime", "inlinetime", "calls"], 6);
+        let sub = structseq_type::<SubStats>(it, "_lsprof", "profiler_subentry", &["code", "callcount", "reccallcount", "totaltime", "inlinetime"], 5);
+        (entry, sub)
+    }
+
     #[methods]
     impl Profiler {
         #[constructor]
@@ -304,23 +368,57 @@ pub mod _lsprof {
             #[default(true)]
             builtins: bool,
         ) -> R<()> {
-            if timeunit < 0.0 {
-                return Err(it.value_error("timeunit must not be negative"));
-            }
             let timer = timer.cloned().unwrap_or(Value::None);
-            let was_enabled = slf.0.with(it, |s| s.enabled)?;
-            if was_enabled {
-                return Err(it.new_exc_str("RuntimeError", "Cannot reconfigure the profiler: profiling is enabled"));
-            }
             slf.0.with(it, |s| {
                 s.timer = timer;
                 s.timeunit = timeunit;
                 s.subcalls = subcalls;
                 s.builtins = builtins;
-                s.entries.clear();
-                s.index.clear();
-                s.stack.clear();
             })
+        }
+
+        fn _pystart_callback(slf: This<Py<Self>>, it: &mut Interp, code: &Value, instruction_offset: &Value) -> R<()> {
+            let _ = instruction_offset;
+            if let Some(key) = code_key(code) {
+                enter_call(it, &slf.0, key, code)?;
+            }
+            Ok(())
+        }
+
+        fn _pythrow_callback(slf: This<Py<Self>>, it: &mut Interp, code: &Value, instruction_offset: &Value, exception: &Value) -> R<()> {
+            let _ = (instruction_offset, exception);
+            if let Some(key) = code_key(code) {
+                enter_call(it, &slf.0, key, code)?;
+            }
+            Ok(())
+        }
+
+        fn _pyreturn_callback(slf: This<Py<Self>>, it: &mut Interp, code: &Value, instruction_offset: &Value, retval: &Value) -> R<()> {
+            let _ = (instruction_offset, retval);
+            if let Some(key) = code_key(code) {
+                leave_call(it, &slf.0, key)?;
+            }
+            Ok(())
+        }
+
+        fn _ccall_callback(slf: This<Py<Self>>, it: &mut Interp, code: &Value, instruction_offset: &Value, callable: &Value, self_arg: &Value) -> R<()> {
+            let _ = (code, instruction_offset);
+            if slf.0.with(it, |s| s.builtins)? {
+                if let Some((key, user)) = cfunction(it, callable, self_arg) {
+                    enter_call(it, &slf.0, key, &user)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn _creturn_callback(slf: This<Py<Self>>, it: &mut Interp, code: &Value, instruction_offset: &Value, callable: &Value, self_arg: &Value) -> R<()> {
+            let _ = (code, instruction_offset);
+            if slf.0.with(it, |s| s.builtins)? {
+                if let Some((key, _)) = cfunction(it, callable, self_arg) {
+                    leave_call(it, &slf.0, key)?;
+                }
+            }
+            Ok(())
         }
 
         /// Start collecting profiling information.
@@ -344,31 +442,52 @@ pub mod _lsprof {
             slf.0.with(it, |s| {
                 s.subcalls = subcalls;
                 s.builtins = builtins;
-                s.enabled = true;
             })?;
-            let native = it.new_native("profiler_callback", profiler_callback, false);
-            let callback = Value::Obj(Object::new(Kind::Method(native, slf.0.value().clone())));
-            it.set_profile_func(callback);
-            Ok(())
+            let sys = Value::Obj(it.import_module("sys")?);
+            let mon = it.get_attr_str(&sys, "monitoring")?;
+            it.call_method(&mon, "use_tool_id", vec![Value::Int(PROFILER_ID), Value::str("cProfile")])?;
+            let mut all_events = 0;
+            for (event, name) in CALLBACKS {
+                let callback = it.get_attr_str(slf.0.value(), name)?;
+                it.call_method(&mon, "register_callback", vec![Value::Int(PROFILER_ID), Value::Int(event as i64), callback])?;
+                all_events |= event;
+            }
+            it.call_method(&mon, "set_events", vec![Value::Int(PROFILER_ID), Value::Int(all_events as i64)])?;
+            slf.0.with(it, |s| s.enabled = true)
         }
 
         /// Stop collecting profiling information.
         fn disable(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
-            if slf.0.with(it, |s| s.enabled)? {
-                it.set_profile_func(Value::None);
+            if slf.0.with(it, |s| s.in_timer)? {
+                return Err(it.new_exc_str("RuntimeError", "cannot disable profiler in external timer"));
             }
-            let now = clock(it, &slf.0)?;
-            slf.0.with(it, |s| {
-                s.flush_unmatched(now);
-                s.enabled = false;
-            })
+            if slf.0.with(it, |s| s.enabled)? {
+                let sys = Value::Obj(it.import_module("sys")?);
+                let mon = it.get_attr_str(&sys, "monitoring")?;
+                for (event, _) in CALLBACKS {
+                    it.call_method(&mon, "register_callback", vec![Value::Int(PROFILER_ID), Value::Int(event as i64), Value::None])?;
+                }
+                it.call_method(&mon, "set_events", vec![Value::Int(PROFILER_ID), Value::Int(0)])?;
+                it.call_method(&mon, "free_tool_id", vec![Value::Int(PROFILER_ID)])?;
+                slf.0.with(it, |s| s.enabled = false)?;
+                while !slf.0.with(it, |s| s.stack.is_empty())? {
+                    let now = clock(it, &slf.0)?;
+                    slf.0.with(it, |s| s.flush_one(now))?;
+                }
+            }
+            Ok(())
         }
 
         /// Clear all profiling information collected so far.
-        fn clear(&mut self) {
-            self.entries.clear();
-            self.index.clear();
-            self.stack.clear();
+        fn clear(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
+            if slf.0.with(it, |s| s.in_timer)? {
+                return Err(it.new_exc_str("RuntimeError", "cannot clear profiler in external timer"));
+            }
+            slf.0.with(it, |s| {
+                s.entries.clear();
+                s.index.clear();
+                s.stack.clear();
+            })
         }
 
         /// list of profiler_entry objects.
@@ -408,8 +527,7 @@ pub mod _lsprof {
                 (s.factor(), rows)
             })?;
             let users: Vec<Value> = rows.iter().map(|r| r.0.clone()).collect();
-            let entry_ty = structseq_type::<Stats>(it, "_lsprof", "profiler_entry", &["code", "callcount", "reccallcount", "totaltime", "inlinetime", "calls"], 6);
-            let sub_ty = structseq_type::<SubStats>(it, "_lsprof", "profiler_subentry", &["code", "callcount", "reccallcount", "totaltime", "inlinetime"], 5);
+            let (entry_ty, sub_ty) = stats_types(it);
             let mut out = Vec::with_capacity(rows.len());
             for (user, callcount, recursive, total, inline, calls) in rows {
                 let subs = if calls.is_empty() {

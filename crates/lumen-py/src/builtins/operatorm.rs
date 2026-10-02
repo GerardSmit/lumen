@@ -82,6 +82,18 @@ pub mod _operator {
         !a.is(b)
     }
 
+    /// Same as a is None.
+    #[op]
+    fn is_none(a: &Value) -> bool {
+        matches!(a, Value::None)
+    }
+
+    /// Same as a is not None.
+    #[op]
+    fn is_not_none(a: &Value) -> bool {
+        !matches!(a, Value::None)
+    }
+
     /// Same as abs(a).
     #[op]
     fn abs(it: &mut Interp, a: &Value) -> R<Value> {

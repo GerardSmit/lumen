@@ -56,6 +56,7 @@ const EXC_TABLE: &[(&str, &str)] = &[
     ("SyntaxError", "Exception"),
     ("IndentationError", "SyntaxError"),
     ("TabError", "IndentationError"),
+    ("_IncompleteInputError", "SyntaxError"),
     ("SystemError", "Exception"),
     ("TypeError", "Exception"),
     ("ValueError", "Exception"),

@@ -17,6 +17,8 @@ use lumen_common::decimal as dec;
 use std::rc::Rc;
 use support::parse_args;
 
+const IEEE_CONTEXT_MAX_BITS: i64 = 512;
+
 const ROUNDINGS: [&str; 8] = [
     "ROUND_UP",
     "ROUND_DOWN",
@@ -28,6 +30,16 @@ const ROUNDINGS: [&str; 8] = [
     "ROUND_05UP",
 ];
 
+fn condition_name(flag: u32) -> Option<&'static str> {
+    match flag {
+        dec::flag::CONVERSION_SYNTAX => Some("ConversionSyntax"),
+        dec::flag::DIVISION_IMPOSSIBLE => Some("DivisionImpossible"),
+        dec::flag::DIVISION_UNDEFINED => Some("DivisionUndefined"),
+        dec::flag::INVALID_CONTEXT => Some("InvalidContext"),
+        _ => None,
+    }
+}
+
 /// Module copies made by `import_fresh_module` share one set of exception classes: the state is
 /// per interpreter, so exceptions raised by the arithmetic must match every copy's names.
 fn signal_exceptions(it: &mut Interp, d: &Obj) {
@@ -35,6 +47,11 @@ fn signal_exceptions(it: &mut Interp, d: &Obj) {
         dict_set_str(d, "DecimalException", Value::Obj(excs.decimal_exception.clone()));
         for (name, cls) in context::SIGNAL_NAMES.iter().zip(&excs.signals) {
             dict_set_str(d, name, Value::Obj(cls.clone()));
+        }
+        for (flag, cls) in &excs.conds {
+            if let Some(name) = condition_name(*flag) {
+                dict_set_str(d, name, Value::Obj(cls.clone()));
+            }
         }
         return;
     }
@@ -83,6 +100,11 @@ fn signal_exceptions(it: &mut Interp, d: &Obj) {
     dict_set_str(d, "DecimalException", Value::Obj(base.clone()));
     for (name, cls) in context::SIGNAL_NAMES.iter().zip(&signals) {
         dict_set_str(d, name, Value::Obj(cls.clone()));
+    }
+    for (flag, cls) in &conds {
+        if let Some(name) = condition_name(*flag) {
+            dict_set_str(d, name, Value::Obj(cls.clone()));
+        }
     }
     it.native_state::<State>().excs = Some(Rc::new(Excs { decimal_exception: base, signals, conds }));
 }
@@ -147,6 +169,7 @@ fn build(it: &mut Interp, m: &Value) -> R<()> {
     dict_set_str(&d, "MAX_EMAX", Value::Int(dec::MAX_EMAX));
     dict_set_str(&d, "MIN_EMIN", Value::Int(dec::MIN_EMIN));
     dict_set_str(&d, "MIN_ETINY", Value::Int(dec::MIN_ETINY));
+    dict_set_str(&d, "IEEE_CONTEXT_MAX_BITS", Value::Int(IEEE_CONTEXT_MAX_BITS));
     dict_set_str(&d, "HAVE_THREADS", Value::Bool(true));
     dict_set_str(&d, "HAVE_CONTEXTVAR", Value::Bool(true));
     dict_set_str(&d, "__version__", Value::str("1.70"));
@@ -189,6 +212,26 @@ pub mod _decimal {
         let local = copy_context(it, &base, false)?;
         apply_settings(it, &local, &v[1..])?;
         Ok(Py::new(it, super::context::ContextManager { local, global: None }).into_value())
+    }
+
+    /// Return a context object initialized to the proper values for one of the
+    /// IEEE interchange formats.  The argument must be a multiple of 32 and less
+    /// than IEEE_CONTEXT_MAX_BITS.
+    #[op(hint(py(text_signature = "($module, bits, /)")))]
+    #[allow(non_snake_case)]
+    fn IEEEContext(it: &mut Interp, bits: &Value) -> R<Value> {
+        if !it.has_index(bits) {
+            return Err(it.type_error("an integer is required"));
+        }
+        let bits = it.index_of(bits).unwrap_or(-1);
+        if bits <= 0 || bits > super::IEEE_CONTEXT_MAX_BITS || bits % 32 != 0 {
+            return Err(it.value_error("argument must be a multiple of 32, with a maximum of 512"));
+        }
+        let mut c = PyContext::with_traps(9 * (bits / 32) - 2, lumen_common::decimal::Rounding::HalfEven, 0);
+        c.emax = 3 * (1i64 << (bits / 16 + 3));
+        c.emin = 1 - c.emax;
+        c.clamp = true;
+        Ok(Py::new(it, c).into_value())
     }
 
     #[init]

@@ -112,12 +112,12 @@ pub fn clock_ids() -> &'static [(&'static str, i64)] {
         static T: &[(&str, i64)] = &[
             ("CLOCK_MONOTONIC", libc::CLOCK_MONOTONIC as i64),
             ("CLOCK_MONOTONIC_RAW", libc::CLOCK_MONOTONIC_RAW as i64),
+            ("CLOCK_MONOTONIC_RAW_APPROX", libc::CLOCK_MONOTONIC_RAW_APPROX as i64),
             ("CLOCK_PROCESS_CPUTIME_ID", libc::CLOCK_PROCESS_CPUTIME_ID as i64),
             ("CLOCK_REALTIME", libc::CLOCK_REALTIME as i64),
             ("CLOCK_THREAD_CPUTIME_ID", libc::CLOCK_THREAD_CPUTIME_ID as i64),
             ("CLOCK_UPTIME_RAW", libc::CLOCK_UPTIME_RAW as i64),
-            ("CLOCK_MONOTONIC_RAW_APPROX", 5),
-            ("CLOCK_UPTIME_RAW_APPROX", 9),
+            ("CLOCK_UPTIME_RAW_APPROX", libc::CLOCK_UPTIME_RAW_APPROX as i64),
         ];
         T
     }

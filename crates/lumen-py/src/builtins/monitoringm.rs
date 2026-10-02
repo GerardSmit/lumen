@@ -25,6 +25,7 @@ pub mod sys_monitoring {
         for (i, name) in trace::EVENT_NAMES.iter().enumerate() {
             items.push((*name, Value::Int(1 << i)));
         }
+        items.push(("BRANCH", Value::Int(trace::BRANCH_ALIAS as i64)));
         let events = it.new_namespace(items);
         dict_set_str(&d, "events", events);
         let (disable, missing) = it.monitoring_sentinels();
@@ -50,13 +51,16 @@ pub mod sys_monitoring {
     /// Check an event set for `set_events`: a CALL implies its two ancillary events, which cannot
     /// be selected alone.
     fn checked_events(it: &mut Interp, events: i64, local: bool) -> R<u32> {
-        let limit = if local { 1 << 10 } else { 1 << trace::EVENT_COUNT };
+        let alias = trace::BRANCH_ALIAS as i64;
+        let events = if events & alias != 0 { (events & !alias) | (ev::BRANCH_LEFT | ev::BRANCH_RIGHT) as i64 } else { events };
+        let limit = if local { 1 << 11 } else { 1 << trace::EVENT_COUNT };
         if events < 0 || events >= limit {
             let what = if local { "invalid local event set" } else { "invalid event set" };
             return Err(it.value_error(&format!("{what} {events:#x}")));
         }
         let events = events as u32;
-        if events & trace::C_RETURN_EVENTS != 0 && events & ev::CALL == 0 {
+        let call_events = ev::CALL | trace::C_RETURN_EVENTS;
+        if events & trace::C_RETURN_EVENTS != 0 && events & call_events != call_events {
             return Err(it.value_error("cannot set C_RETURN or C_RAISE events independently"));
         }
         Ok(trace::expand_call(events))
@@ -76,12 +80,16 @@ pub mod sys_monitoring {
         Ok(())
     }
 
-    /// Release a tool id and everything it enabled.
+    /// Unregister all events and callbacks associated with a tool ID.
     #[op]
-    fn free_tool_id(it: &mut Interp, tool_id: i64) -> R<()> {
+    fn clear_tool_id(it: &mut Interp, tool_id: i64) -> R<()> {
         let tool = valid_tool(it, tool_id)?;
+        clear_tool(it, tool);
+        Ok(())
+    }
+
+    fn clear_tool(it: &mut Interp, tool: usize) {
         let t = &mut it.mon.tools[tool];
-        t.name = None;
         t.events = 0;
         t.callbacks = std::array::from_fn(|_| Value::None);
         for l in it.mon.locals.iter_mut() {
@@ -89,6 +97,31 @@ pub mod sys_monitoring {
         }
         it.mon.disabled.retain(|k| k.0 as usize != tool);
         it.mon.refresh();
+    }
+
+    /// The tools listening to each event interpreter-wide, as a bitmask by event name.
+    #[op]
+    fn _all_events(it: &mut Interp) -> Value {
+        let out = it.new_dict();
+        for (i, name) in trace::EVENT_NAMES.iter().enumerate() {
+            let bit = 1u32 << i;
+            if bit & trace::C_RETURN_EVENTS != 0 {
+                continue;
+            }
+            let mask = (0..trace::USER_TOOLS).filter(|&t| it.mon.tools[t].events & bit != 0).fold(0i64, |m, t| m | 1 << t);
+            if mask != 0 {
+                dict_set_str(&out, name, Value::Int(mask));
+            }
+        }
+        Value::Obj(out)
+    }
+
+    /// Release a tool id and everything it enabled.
+    #[op]
+    fn free_tool_id(it: &mut Interp, tool_id: i64) -> R<()> {
+        let tool = valid_tool(it, tool_id)?;
+        clear_tool(it, tool);
+        it.mon.tools[tool].name = None;
         Ok(())
     }
 
@@ -106,6 +139,11 @@ pub mod sys_monitoring {
     #[op]
     fn register_callback(it: &mut Interp, tool_id: i64, event: i64, func: &Value) -> R<Value> {
         let tool = valid_tool(it, tool_id)?;
+        if event == trace::BRANCH_ALIAS as i64 {
+            let left = register_callback(it, tool_id, ev::BRANCH_LEFT as i64, func)?;
+            register_callback(it, tool_id, ev::BRANCH_RIGHT as i64, func)?;
+            return Ok(left);
+        }
         let idx = if event > 0 { 63 - event.leading_zeros() as i64 } else { -1 };
         if idx < 0 || idx >= trace::EVENT_COUNT as i64 {
             return Err(it.value_error(&format!("invalid event {event}")));
@@ -117,7 +155,7 @@ pub mod sys_monitoring {
     #[op]
     fn get_events(it: &mut Interp, tool_id: i64) -> R<i64> {
         let tool = valid_tool(it, tool_id)?;
-        Ok(it.mon.tools[tool].events as i64)
+        Ok((it.mon.tools[tool].events & !trace::C_RETURN_EVENTS) as i64)
     }
 
     /// Select the events a tool listens to in every code object.
@@ -146,7 +184,7 @@ pub mod sys_monitoring {
         let tool = valid_tool(it, tool_id)?;
         let code = code_of(it, code, "get_local_events")?;
         Ok(match it.mon.locals.iter().find(|l| std::rc::Rc::ptr_eq(&l.code, &code)) {
-            Some(l) => l.events[tool] as i64,
+            Some(l) => (l.events[tool] & !trace::C_RETURN_EVENTS) as i64,
             None => 0,
         })
     }

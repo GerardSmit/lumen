@@ -390,6 +390,37 @@ impl PyDecimal {
         it.call(&cls.0, vec![v], Vec::new())
     }
 
+    /// Class method that converts a real number to a decimal number, exactly.
+    ///
+    ///     >>> Decimal.from_number(314)              # int
+    ///     Decimal('314')
+    ///     >>> Decimal.from_number(0.1)              # float
+    ///     Decimal('0.1000000000000000055511151231257827021181583404541015625')
+    ///     >>> Decimal.from_number(Decimal('3.14'))  # another decimal instance
+    ///     Decimal('3.14')
+    #[classmethod]
+    fn from_number(cls: This<Value>, it: &mut Interp, number: &Value) -> R<Value> {
+        let exact = type_object::<PyDecimal>(it);
+        let is_exact_cls = matches!(&cls.0, Value::Obj(c) if Rc::ptr_eq(c, &exact));
+        let v = if let Some(p) = Py::<PyDecimal>::from_value(it, number) {
+            if is_exact_cls && matches!(number, Value::Obj(o) if o.cls.is_none()) {
+                return Ok(number.clone());
+            }
+            let d = p.borrow(it)?.v.clone();
+            wrap(it, d)
+        } else if number.as_bigint().is_some() || float_of(number).is_some() {
+            let d = exact_from_number(it, number)?;
+            wrap(it, d)
+        } else {
+            let t = it.tp_name_of(number);
+            return Err(it.type_error(&format!("conversion from {} to Decimal is not supported", t)));
+        };
+        if is_exact_cls {
+            return Ok(v);
+        }
+        it.call(&cls.0, vec![v], Vec::new())
+    }
+
     #[getter]
     fn real(slf: This<Value>) -> Value {
         slf.0

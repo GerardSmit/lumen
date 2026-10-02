@@ -20,7 +20,11 @@ pub mod array {
     use lumen_common::smuggle;
     use std::rc::Rc;
 
-    const TYPECODES: &str = "bBuhHiIlLqQfd";
+    const TYPECODES: &str = "bBuwhHiIlLqQfd";
+
+    fn is_unicode(tc: u8) -> bool {
+        matches!(tc, b'u' | b'w')
+    }
 
     /// One element type: its typecode, codec kind and size.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,7 +36,7 @@ pub mod array {
 
     impl Spec {
         pub fn of(tc: u8) -> Option<Spec> {
-            if tc == b'u' {
+            if is_unicode(tc) {
                 return Some(Spec { tc, kind: ElemKind::U32, size: 4 });
             }
             if !TYPECODES.as_bytes().contains(&tc) {
@@ -47,7 +51,7 @@ pub mod array {
             match self.tc {
                 b'b' => "b",
                 b'B' => "B",
-                b'u' => "w",
+                b'u' | b'w' => "w",
                 b'h' => "h",
                 b'H' => "H",
                 b'i' => "i",
@@ -68,7 +72,7 @@ pub mod array {
         /// The machine format code `__reduce_ex__` pickles (little-endian, IEEE floats).
         fn mformat(self) -> i64 {
             match (self.tc, self.size) {
-                (b'u', _) => 20,
+                (b'u' | b'w', _) => 20,
                 (b'f', _) => 14,
                 (b'd', _) => 16,
                 (tc, size) => {
@@ -186,19 +190,24 @@ pub mod array {
     pub fn encode(it: &mut Interp, spec: Spec, v: &Value) -> R<[u8; 8]> {
         let mut out = [0u8; 8];
         let buf = &mut out[..spec.size];
-        if spec.tc == b'u' {
+        if is_unicode(spec.tc) {
             let cp = match v {
                 Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => {
                     let s = v.as_str().unwrap_or("");
                     let mut cps = smuggle::code_points(s);
                     match (cps.next(), cps.next()) {
-                        (Some(c), None) => Some(c),
-                        _ => None,
+                        (Some(c), None) => c,
+                        _ => {
+                            let n = smuggle::code_points(s).count();
+                            return Err(it.type_error(&format!("array item must be a unicode character, not a string of length {n}")));
+                        }
                     }
                 }
-                _ => None,
+                _ => {
+                    let t = it.type_name_of(v);
+                    return Err(it.type_error(&format!("array item must be a unicode character, not {t}")));
+                }
             };
-            let Some(cp) = cp else { return Err(it.type_error("array item must be unicode character")) };
             buf.copy_from_slice(&cp.to_ne_bytes());
         } else if spec.is_float() {
             let x = float_item(it, v)?;
@@ -212,7 +221,7 @@ pub mod array {
 
     /// The Python value of one encoded item.
     pub fn decode(it: &mut Interp, spec: Spec, b: &[u8]) -> R<Value> {
-        if spec.tc == b'u' {
+        if is_unicode(spec.tc) {
             let cp = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
             let mut s = String::new();
             if cp > 0x10FFFF || !smuggle::push_code_point(&mut s, cp) {
@@ -286,7 +295,7 @@ pub mod array {
     }
 
     fn bad_typecode(it: &mut Interp) -> Obj {
-        it.value_error("bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)")
+        it.value_error("bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)")
     }
 
     /// Appends `items` one by one (earlier items stay when a later one fails, as in CPython).
@@ -318,8 +327,8 @@ pub mod array {
     }
 
     fn from_unicode(it: &mut Interp, spec: Spec, store: &ByteStore, s: &str) -> R<()> {
-        if spec.tc != b'u' {
-            return Err(it.value_error("fromunicode() may only be called on unicode type arrays"));
+        if !is_unicode(spec.tc) {
+            return Err(it.value_error("fromunicode() may only be called on unicode type arrays ('u' or 'w')"));
         }
         let mut data = Vec::new();
         for cp in smuggle::code_points(s) {
@@ -329,10 +338,14 @@ pub mod array {
     }
 
     fn to_unicode(it: &mut Interp, spec: Spec, store: &ByteStore) -> R<Value> {
-        if spec.tc != b'u' {
-            return Err(it.value_error("tounicode() may only be called on unicode type arrays"));
+        if !is_unicode(spec.tc) {
+            return Err(it.value_error("tounicode() may only be called on unicode type arrays ('u' or 'w')"));
         }
         let data = store.to_vec();
+        if spec.tc == b'w' {
+            let enc = if cfg!(target_endian = "little") { "utf-32-le" } else { "utf-32-be" };
+            return it.call_method(&Value::bytes(data), "decode", vec![Value::str(enc)]);
+        }
         let mut s = String::new();
         for c in data.chunks_exact(4) {
             let cp = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
@@ -348,7 +361,7 @@ pub mod array {
         if let Value::Obj(o) = init {
             match &o.kind {
                 Kind::Str(_) => {
-                    if spec.tc != b'u' {
+                    if !is_unicode(spec.tc) {
                         return Err(it.type_error(&format!("cannot use a str to initialize an array with typecode '{}'", spec.tc as char)));
                     }
                     let s = init.as_str().unwrap_or("").to_string();
@@ -370,7 +383,7 @@ pub mod array {
             }
         }
         if let Some((other, data)) = array_of(it, init) {
-            if other.tc == b'u' && spec.tc != b'u' {
+            if is_unicode(other.tc) && !is_unicode(spec.tc) {
                 return Err(it.type_error(&format!("cannot use a unicode array to initialize an array with typecode '{}'", spec.tc as char)));
             }
             if other == spec {
@@ -385,6 +398,10 @@ pub mod array {
     }
 
     fn instance_dict(it: &mut Interp, v: &Value) -> R<Value> {
+        let base = type_object::<Array>(it);
+        if Rc::ptr_eq(&it.type_of(v), &base) {
+            return Ok(Value::None);
+        }
         match it.get_attr_str(v, "__dict__") {
             Ok(d) => Ok(d),
             Err(e) if it.exc_is(&e, "AttributeError") => Ok(Value::None),
@@ -561,6 +578,14 @@ pub mod array {
                 return Err(it.type_error(&format!("array() takes at most 2 arguments ({} given)", args.len())));
             }
             let tc = typecode_of(it, &args[0], "array() argument 1")?;
+            if tc == b'u' {
+                crate::builtins::warningsm::warn_category(
+                    it,
+                    "DeprecationWarning",
+                    "The 'u' type code is deprecated and will be removed in Python 3.16",
+                    1,
+                )?;
+            }
             let Some(spec) = Spec::of(tc) else { return Err(bad_typecode(it)) };
             let arr = Array::with(spec, Vec::new());
             if let Some(init) = args.get(1) {
@@ -743,6 +768,14 @@ pub mod array {
                 }
                 None => Err(it.value_error("array.remove(x): x not in array")),
             }
+        }
+
+        /// Remove all items from the array.
+        fn clear(&self, it: &mut Interp) -> R<()> {
+            if self.store.len() == 0 {
+                return Ok(());
+            }
+            edit(it, &self.store, |v| v.clear())
         }
 
         /// Reverse the order of the items in the array.
@@ -956,7 +989,7 @@ pub mod array {
             if store.is_empty() {
                 return Ok(Value::string(format!("{}('{}')", name, tc)));
             }
-            let body = if spec.tc == b'u' { to_unicode(it, spec, &store)? } else { Value::list(decode_all(it, spec, &store.to_vec())?) };
+            let body = if is_unicode(spec.tc) { to_unicode(it, spec, &store)? } else { Value::list(decode_all(it, spec, &store.to_vec())?) };
             let r = it.repr_of(&body)?;
             Ok(Value::string(format!("{}('{}', {})", name, tc, r)))
         }
@@ -1158,7 +1191,7 @@ pub mod array {
                 for c in TYPECODES.bytes() {
                     if let Some(s) = Spec::of(c) {
                         let s_signed = matches!(c, b'b' | b'h' | b'i' | b'l' | b'q');
-                        if c != b'u' && !s.is_float() && s.size == size && s_signed == signed {
+                        if !is_unicode(c) && !s.is_float() && s.size == size && s_signed == signed {
                             spec = s;
                         }
                     }
