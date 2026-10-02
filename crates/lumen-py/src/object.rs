@@ -193,6 +193,13 @@ pub struct NativeData {
     pub method: bool,
     /// Set for natives bound with `lumen_bind` (`__text_signature__`, `__module__`, ...).
     pub desc: Option<&'static lumen_bind::FnDesc>,
+    /// The module or class a hand-registered native belongs to (`desc` gives it for bound ones).
+    pub owner: Option<NativeOwner>,
+}
+
+pub enum NativeOwner {
+    Module(Rc<str>),
+    Class(Obj),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

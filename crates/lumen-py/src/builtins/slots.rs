@@ -52,6 +52,18 @@ fn w_iter_self(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn w_reversed(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__reversed__", a, 1, 1)?;
+    if let Value::Obj(o) = &a[0] {
+        if let Kind::Range(r) = &o.kind {
+            // A range reverses to a range iterator, as in CPython (`__setstate__` counts items).
+            let n = crate::ops::slice_len(r.start, r.stop, r.step) as i64;
+            let last = (n - 1).checked_mul(r.step).and_then(|d| r.start.checked_add(d));
+            let stop = r.start.checked_sub(r.step);
+            if let (Some(cur), Some(stop), Some(step)) = (last, stop, r.step.checked_neg()) {
+                let cur = if n == 0 { stop } else { cur };
+                return Ok(it.mk_iter(IterState::Range { cur, stop, step }));
+            }
+        }
+    }
     let n = it.native_len(&a[0])? as i64;
     Ok(it.mk_iter(IterState::Reversed { seq: a[0].clone(), idx: n - 1 }))
 }

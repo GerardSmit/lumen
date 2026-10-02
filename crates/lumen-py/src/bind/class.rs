@@ -24,6 +24,7 @@ pub fn native_value(item: &FnItem<PyHost>) -> Value {
         f: item.entry,
         method: matches!(d.role, Role::Method | Role::Proto(_)),
         desc: Some(d),
+        owner: None,
     })))
 }
 
@@ -61,7 +62,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
         let sig = members.iter().find(|m| m.desc.role == Role::Constructor).and_then(|m| args::text_signature(m.desc));
         dict_set_str(d, "__text_signature__", sig.map_or(Value::None, Value::string));
         if !members.iter().any(|m| m.desc.role == Role::Constructor) {
-            let f = Value::Obj(Object::new(Kind::Native(NativeData { name: "__new__", f: no_new, method: false, desc: None })));
+            let f = Value::Obj(Object::new(Kind::Native(NativeData { name: "__new__", f: no_new, method: false, desc: None, owner: None })));
             dict_set_str(d, "__new__", f);
         }
         if c.flags & CLASS_GENERIC != 0 {
@@ -70,6 +71,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
                 f: class_getitem,
                 method: false,
                 desc: None,
+                owner: None,
             })));
             dict_set_str(d, "__class_getitem__", Value::Obj(Object::new(Kind::ClassMethod(f))));
         }

@@ -279,7 +279,10 @@ impl Interp {
                 if let Some(d) = n.desc.filter(|d| n.method && d.class().is_some()) {
                     Ok(format!("<method '{}' of '{}' objects>", n.name, crate::bind::owner_of(d)))
                 } else if n.method {
-                    Ok(format!("<method '{}' of object>", n.name))
+                    match &n.owner {
+                        Some(NativeOwner::Class(c)) => Ok(format!("<method '{}' of '{}' objects>", n.name, self.type_name(c))),
+                        _ => Ok(format!("<method '{}' of object>", n.name)),
+                    }
                 } else {
                     Ok(format!("<built-in function {}>", n.name))
                 }

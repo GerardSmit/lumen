@@ -882,6 +882,17 @@ impl Interp {
                 ("__qualname__", Some(d)) if d.class().is_some() => {
                     return Ok(Some(Value::string(format!("{}.{}", crate::bind::args::class_name(d), n.name))));
                 }
+                ("__qualname__", None) if n.method => {
+                    if let Some(NativeOwner::Class(c)) = &n.owner {
+                        return Ok(Some(Value::string(format!("{}.{}", self.type_name(c), n.name))));
+                    }
+                    return Ok(Some(Value::str(n.name)));
+                }
+                ("__objclass__", None) if n.method => {
+                    if let Some(NativeOwner::Class(c)) = &n.owner {
+                        return Ok(Some(Value::Obj(c.clone())));
+                    }
+                }
                 ("__qualname__", _) => return Ok(Some(Value::str(n.name))),
                 ("__doc__", Some(d)) => return Ok(Some(d.doc.map(Value::str).unwrap_or(Value::None))),
                 ("__doc__", None) => return Ok(Some(Value::None)),
@@ -891,10 +902,19 @@ impl Interp {
                 ("__module__", Some(d)) if d.class().is_none() && d.module().is_some() => {
                     return Ok(Some(Value::str(d.module().unwrap_or("builtins"))))
                 }
+                ("__module__", None) if matches!(n.owner, Some(NativeOwner::Module(_))) => {
+                    if let Some(NativeOwner::Module(m)) = &n.owner {
+                        return Ok(Some(Value::str(m)));
+                    }
+                }
                 ("__module__", _) => return Ok(Some(Value::str("builtins"))),
                 ("__self__", d) if d.is_none_or(|d| d.class().is_none()) => {
-                    let m = d.and_then(|d| d.module()).unwrap_or("builtins");
-                    return self.import_module(m).map(|m| Some(Value::Obj(m)));
+                    let own = match &n.owner {
+                        Some(NativeOwner::Module(m)) => Some(&**m),
+                        _ => None,
+                    };
+                    let m = d.and_then(|d| d.module()).or(own).unwrap_or("builtins").to_string();
+                    return self.import_module(&m).map(|m| Some(Value::Obj(m)));
                 }
                 _ => {}
             },
@@ -1847,11 +1867,18 @@ impl Interp {
     }
 
     pub fn new_native(&self, name: &'static str, f: NativeFn, method: bool) -> Value {
-        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method, desc: None })))
+        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method, desc: None, owner: None })))
+    }
+
+    /// A module-level function of module `module`.
+    pub fn new_module_native(&self, module: &str, name: &'static str, f: NativeFn) -> Value {
+        let owner = Some(NativeOwner::Module(module.into()));
+        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method: false, desc: None, owner })))
     }
 
     pub fn reg(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let v = self.new_native(name, f, true);
+        let owner = Some(NativeOwner::Class(ty.clone()));
+        let v = Value::Obj(Object::new(Kind::Native(NativeData { name, f, method: true, desc: None, owner })));
         if let Some(d) = ty.dict.borrow().as_ref() {
             dict_set_str(d, name, v);
         }

@@ -200,13 +200,15 @@ fn call_forward(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     it.call(&a[0], a[1..].to_vec(), kw.to_vec())
 }
 
-/// `meth_reduce` and `method_reduce`: a bound method pickles as `getattr(self, name)`, a module
-/// function or unbound builtin as its name.
+/// `meth_reduce`, `method_reduce` and `descr_reduce`: a bound method pickles as
+/// `getattr(self, name)`, a method descriptor as `getattr(type, name)`, a module function as its
+/// name.
 fn method_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__reduce__", a, 1, 1)?;
     let bound_to = match &a[0] {
         Value::Obj(o) => match &o.kind {
             Kind::Method(_, this) => Some(this.clone()),
+            Kind::Native(NativeData { method: true, owner: Some(NativeOwner::Class(c)), .. }) => Some(Value::Obj(c.clone())),
             _ => None,
         },
         _ => None,
