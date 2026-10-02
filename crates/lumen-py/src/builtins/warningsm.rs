@@ -1,6 +1,6 @@
 //! `_warnings`: the native core that `warnings.py` falls back on for `warn` and `warn_explicit`.
 
-pub use _warnings::warn_category;
+pub use _warnings::{warn_category, warn_explicit_category};
 
 /// _warnings provides basic warning filtering support.
 /// It is a helper module to speed up interpreter start-up.
@@ -82,7 +82,11 @@ pub mod _warnings {
             }
         }
         let name = it.get_attr_str(category, "__name__")?;
-        let line = format!("{}:{}: {}: {}\n", it.str_of(filename)?, lineno, it.str_of(&name)?, it.str_of(message)?);
+        let file = it.str_of(filename)?;
+        let mut line = format!("{}:{}: {}: {}\n", file, lineno, it.str_of(&name)?, it.str_of(message)?);
+        if let Some(src) = u32::try_from(lineno).ok().and_then(|n| it.source_line(&file, n)) {
+            line.push_str(&format!("  {src}\n"));
+        }
         it.write_stderr(&line);
         Ok(())
     }
@@ -143,6 +147,15 @@ pub mod _warnings {
         let cat = Value::Obj(it.exc_type(category));
         it.call(&f, vec![Value::str(msg), cat, Value::Int(stacklevel)], Vec::new())?;
         Ok(())
+    }
+
+    /// `PyErr_WarnExplicit(category, msg, filename, lineno, NULL, NULL)` for a builtin category:
+    /// the module is the filename without `.py`, and there is no registry.
+    pub fn warn_explicit_category(it: &mut Interp, category: &str, msg: &str, filename: &str, lineno: u32) -> R<()> {
+        it.import_module("_warnings")?;
+        let cat = Value::Obj(it.exc_type(category));
+        let module = Value::str(filename.strip_suffix(".py").unwrap_or(filename));
+        warn_explicit_impl(it, &Value::str(msg), &cat, &Value::str(filename), lineno as i64, &module, &Value::None, &Value::None)
     }
 
     fn skipped(it: &Interp, frame: usize, prefixes: &[Value]) -> bool {

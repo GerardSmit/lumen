@@ -14,6 +14,14 @@ pub struct CompileError {
     pub line: u32,
 }
 
+/// A `SyntaxWarning` found while compiling, in the order CPython reports it.
+#[derive(Debug, Clone)]
+pub struct CompileWarning {
+    pub msg: String,
+    pub line: u32,
+    pub col: u32,
+}
+
 type Label = u32;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -78,7 +86,10 @@ struct Compiler<'a> {
 
 type CResult<T> = Result<T, CompileError>;
 
-pub fn compile_module(m: &Module, filename: &str, interactive: bool) -> CResult<Rc<Code>> {
+/// Compiles a module; the syntax warnings found on the way are appended to `warnings` (also when
+/// compiling fails).
+pub fn compile_module(m: &Module, filename: &str, interactive: bool, warnings: &mut Vec<CompileWarning>) -> CResult<Rc<Code>> {
+    finally_flow::check(&m.body, warnings);
     let st = symtable::build(m).map_err(|e| CompileError { msg: e.msg, line: e.line })?;
     let mut c = Compiler { st, units: Vec::new(), filename: filename.into(), interactive };
     c.push_unit(0, UnitKind::Module, "<module>".into(), "<module>".into());
@@ -2211,4 +2222,72 @@ enum CompKind {
 enum FnBody<'a> {
     Stmts(&'a [Stmt]),
     Expr(&'a Expr),
+}
+
+/// PEP 765: `return`, `break` and `continue` that leave a `finally` block are `SyntaxWarning`s
+/// (CPython checks this while preprocessing the AST, before compiling).
+mod finally_flow {
+    use super::CompileWarning;
+    use crate::ast::*;
+
+    #[derive(Clone, Copy)]
+    enum Ctx {
+        Finally,
+        Function,
+        Loop,
+    }
+
+    pub fn check(body: &[Stmt], out: &mut Vec<CompileWarning>) {
+        stmts(body, &mut Vec::new(), out);
+    }
+
+    fn stmts(body: &[Stmt], stack: &mut Vec<Ctx>, out: &mut Vec<CompileWarning>) {
+        for s in body {
+            stmt(s, stack, out);
+        }
+    }
+
+    fn within(ctx: Ctx, body: &[Stmt], stack: &mut Vec<Ctx>, out: &mut Vec<CompileWarning>) {
+        stack.push(ctx);
+        stmts(body, stack, out);
+        stack.pop();
+    }
+
+    fn warn(kw: &str, s: &Stmt, out: &mut Vec<CompileWarning>) {
+        out.push(CompileWarning { msg: format!("'{kw}' in a 'finally' block"), line: s.pos.line, col: s.pos.col });
+    }
+
+    fn stmt(s: &Stmt, stack: &mut Vec<Ctx>, out: &mut Vec<CompileWarning>) {
+        let in_finally = matches!(stack.last(), Some(Ctx::Finally));
+        match &s.kind {
+            StmtKind::FunctionDef(f) => within(Ctx::Function, &f.body, stack, out),
+            StmtKind::ClassDef(c) => stmts(&c.body, stack, out),
+            StmtKind::Return(_) if in_finally => warn("return", s, out),
+            StmtKind::Break if in_finally => warn("break", s, out),
+            StmtKind::Continue if in_finally => warn("continue", s, out),
+            StmtKind::For { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+                within(Ctx::Loop, body, stack, out);
+                stmts(orelse, stack, out);
+            }
+            StmtKind::If { body, orelse, .. } => {
+                stmts(body, stack, out);
+                stmts(orelse, stack, out);
+            }
+            StmtKind::With { body, .. } => stmts(body, stack, out),
+            StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
+                stmts(body, stack, out);
+                for h in handlers {
+                    stmts(&h.body, stack, out);
+                }
+                stmts(orelse, stack, out);
+                within(Ctx::Finally, finalbody, stack, out);
+            }
+            StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    stmts(&c.body, stack, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
