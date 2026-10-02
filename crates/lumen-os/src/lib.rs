@@ -14,6 +14,7 @@ pub mod ipc;
 pub mod mmap;
 pub mod net;
 pub mod poll;
+pub mod posix;
 pub mod proc;
 pub mod rlimit;
 pub mod signal;

@@ -34,6 +34,7 @@ pub mod native;
 pub mod pytime;
 pub mod pem;
 pub mod pickle;
+pub mod pypath;
 pub mod stack;
 pub mod regex;
 pub mod rounding;

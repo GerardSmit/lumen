@@ -16,7 +16,7 @@ pub fn open_flags() -> impl Iterator<Item = (&'static str, i64)> {
 /// Everything else a POSIX module exposes: `SEEK_DATA`/`SEEK_HOLE`, `wait` options, `P_*`,
 /// `PRIO_*`, `RTLD_*`, sysexits `EX_*`.
 pub fn misc() -> impl Iterator<Item = (&'static str, i64)> {
-    unix::MISC.iter().chain(SYSEXITS.iter()).copied()
+    unix::MISC.iter().chain(SYSEXITS.iter()).chain(system::MISC.iter()).copied()
 }
 
 /// `sysconf` names (without the leading underscore, as Python spells them) and their numbers.
@@ -73,14 +73,17 @@ mod unix {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod system {
     libc_table!(pub(super) OPEN: O_DIRECT, O_LARGEFILE, O_NOATIME, O_PATH, O_TMPFILE, O_RSYNC);
+    pub(super) static MISC: &[(&str, i64)] = &[];
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod system {
-    libc_table!(pub(super) OPEN: O_SHLOCK, O_EXLOCK, O_EVTONLY, O_SYMLINK);
+    libc_table!(pub(super) OPEN: O_SHLOCK, O_EXLOCK, O_EVTONLY, O_SYMLINK, O_EXEC, O_SEARCH, O_NOFOLLOW_ANY);
+    libc_table!(pub(super) MISC: PRIO_DARWIN_THREAD, PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG, PRIO_DARWIN_NONUI);
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
 mod system {
     pub(super) static OPEN: &[(&str, i64)] = &[];
+    pub(super) static MISC: &[(&str, i64)] = &[];
 }
