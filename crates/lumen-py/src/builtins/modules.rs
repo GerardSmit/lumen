@@ -19,6 +19,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_collections", bound::<super::collectionsm::_collections::Module>),
     ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
     ("_csv", bound::<super::csvm::_csv::Module>),
+    ("_decimal", bound::<super::decimalm::_decimal::Module>),
     ("_functools", bound::<super::functoolsm::_functools::Module>),
     ("_hashlib", bound::<super::hashlibm::_hashlib::Module>),
     ("_heapq", bound::<super::heapqm::_heapq::Module>),

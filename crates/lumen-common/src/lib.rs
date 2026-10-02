@@ -8,6 +8,7 @@ pub mod buffer;
 pub mod civil;
 pub mod codec;
 pub mod csv;
+pub mod decimal;
 #[cfg(feature = "compress")]
 pub mod compress;
 #[cfg(not(target_arch = "wasm32"))]

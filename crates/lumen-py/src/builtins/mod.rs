@@ -5,6 +5,7 @@ pub mod args;
 pub mod bytesm;
 pub mod contextvarsm;
 pub mod csvm;
+pub mod decimalm;
 pub mod jsonm;
 pub mod posixsubprocessm;
 pub mod selectm;
