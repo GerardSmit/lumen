@@ -173,7 +173,6 @@ pub struct Interp {
     pub gc_enabled: bool,
     pub simple_namespace: Option<Obj>,
     pub alias_types: Option<Rc<crate::builtins::alias::AliasTypes>>,
-    pub mappingproxy_type: Option<Obj>,
     pub interrupt: InterruptHandle,
     pub interrupted: bool,
     /// Runs Python signal handlers at `poll` (the interpreter of the thread that owns signals).
@@ -244,7 +243,6 @@ impl Interp {
             gc_enabled: true,
             simple_namespace: None,
             alias_types: None,
-            mappingproxy_type: None,
             interrupt: InterruptHandle::new(),
             interrupted: false,
             handles_signals: false,

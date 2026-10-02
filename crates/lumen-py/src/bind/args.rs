@@ -40,6 +40,7 @@ const SLOT_PROTOS: &[&str] = &[
     "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "repr", "str", "hash", "bool", "eq", "ne", "lt",
     "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul", "and", "rand", "iand", "or",
     "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert", "await", "aiter", "anext",
+    "call",
 ];
 
 /// Whether CPython exposes the member as a slot wrapper (`<slot wrapper '__init__' ..>`), whose
