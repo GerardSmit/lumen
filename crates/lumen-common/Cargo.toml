@@ -12,8 +12,11 @@ test-support = []
 mem-stats = []
 # `hash`: message digests, HMAC, PBKDF2, HKDF, scrypt over the RustCrypto crates.
 hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt"]
-# `compress`: zlib / gzip / raw deflate, Brotli and Zstandard over maintained crates.
-compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd"]
+# `compress`: zlib / gzip / raw deflate, Brotli, Zstandard and bzip2 over maintained crates.
+compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip2"]
+# `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) over liblzma.
+# Needs a C toolchain, so it is unavailable on wasm32; enable it next to `compress`.
+lzma = ["compress", "dep:liblzma-sys"]
 
 [dependencies]
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
@@ -32,11 +35,16 @@ pbkdf2 = { version = "0.12", default-features = false, optional = true }
 scrypt = { version = "0.11", default-features = false, optional = true }
 libz-rs-sys = { version = "0.6", default-features = false, features = ["std", "rust-allocator"], optional = true }
 brotli = { version = "8", optional = true }
+# bzip2 over the pure-Rust libbz2-rs-sys backend (the crate's default), so it also builds for wasm.
+bzip2 = { version = "0.6", optional = true }
 
 # zstd's C library does not build for wasm32-unknown-unknown without a wasm-capable clang;
 # the browser build uses the pure-Rust ruzstd.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = { version = "0.13", optional = true }
+# xz / lzma: liblzma's exact behaviour (filters, checks, memory limits) is the contract of Python's
+# `lzma`; a pure-Rust codec offers no raw / alone / xz stream API with those semantics.
+liblzma-sys = { version = "0.4", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ruzstd = { version = "0.8", optional = true }

@@ -41,3 +41,4 @@ pub mod unicode_norm;
 pub mod unicode_norm_impl;
 pub mod unicode_props;
 pub mod utf;
+pub mod xml;
