@@ -28,7 +28,16 @@ const ROUNDINGS: [&str; 8] = [
     "ROUND_05UP",
 ];
 
+/// Module copies made by `import_fresh_module` share one set of exception classes: the state is
+/// per interpreter, so exceptions raised by the arithmetic must match every copy's names.
 fn signal_exceptions(it: &mut Interp, d: &Obj) {
+    if let Some(excs) = it.native_state::<State>().excs.clone() {
+        dict_set_str(d, "DecimalException", Value::Obj(excs.decimal_exception.clone()));
+        for (name, cls) in context::SIGNAL_NAMES.iter().zip(&excs.signals) {
+            dict_set_str(d, name, Value::Obj(cls.clone()));
+        }
+        return;
+    }
     let arith = it.exc_type("ArithmeticError");
     let zero_div = it.exc_type("ZeroDivisionError");
     let type_err = it.exc_type("TypeError");

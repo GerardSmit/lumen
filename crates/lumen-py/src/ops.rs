@@ -1513,8 +1513,12 @@ impl Interp {
 
     fn list_slice_assign(&mut self, l: &RefCell<Vec<Value>>, start: i64, stop: i64, step: i64, items: Vec<Value>) -> R<()> {
         if step == 1 {
-            let stop = stop.max(start) as usize;
-            l.borrow_mut().splice(start as usize..stop, items);
+            let mut lm = l.borrow_mut();
+            let start = (start.max(0) as usize).min(lm.len());
+            let stop = (stop.max(0) as usize).clamp(start, lm.len());
+            let old: Vec<Value> = lm.splice(start..stop, items).collect();
+            drop(lm);
+            drop(old);
             return Ok(());
         }
         let n = slice_len(start, stop, step);
@@ -1525,10 +1529,16 @@ impl Interp {
                 n
             )));
         }
-        let mut lm = l.borrow_mut();
         let mut i = start;
         for it in items {
-            lm[i as usize] = it;
+            let old = {
+                let mut lm = l.borrow_mut();
+                match lm.get_mut(i as usize) {
+                    Some(slot) => std::mem::replace(slot, it),
+                    None => return Err(self.value_error("list changed size during slice assignment")),
+                }
+            };
+            drop(old);
             i += step;
         }
         Ok(())

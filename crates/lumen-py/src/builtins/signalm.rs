@@ -359,11 +359,8 @@ pub mod _signal {
     #[op]
     fn pthread_kill(it: &mut Interp, thread_id: i64, signalnum: i64) -> R<()> {
         let sig = signalnum as i32;
-        if thread_id != it.threads.main_ident as i64 {
-            return Err(it.os_error_errno(3, None, None));
-        }
-        os::raise(sig).map_err(|e| os_error(it, e))?;
-        if it.handles_signals {
+        os::pthread_kill(thread_id as u64, sig).map_err(|e| os_error(it, e))?;
+        if it.handles_signals && thread_id as u64 == lumen_os::thread::ident() {
             super::run_pending(it)?;
         }
         Ok(())

@@ -208,6 +208,16 @@ fn signal_flag(it: &mut Interp, key: &Value) -> R<u32> {
         if let Some(i) = e.signals.iter().position(|s| Rc::ptr_eq(s, k)) {
             return Ok(SIGNAL_FLAGS[i]);
         }
+        // A second import of the module (`import_fresh_module`) creates its own signal classes
+        // while the per-interpreter state holds the latest ones; match those by name.
+        if let Kind::Type(td) = &k.kind {
+            let name = td.name.borrow().clone();
+            if let Some(i) = SIGNAL_NAMES.iter().position(|n| **n == *name) {
+                if td.mro.borrow().iter().any(|b| matches!(&b.kind, Kind::Type(t) if &**t.name.borrow() == "DecimalException")) {
+                    return Ok(SIGNAL_FLAGS[i]);
+                }
+            }
+        }
     }
     Err(key_error(it, SIGNAL_MAP_ERR))
 }

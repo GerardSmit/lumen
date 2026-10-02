@@ -245,7 +245,18 @@ pub mod _socket {
 
     /// Waits until `fd` is ready (unless the socket is non-blocking) and runs `op`, retrying on
     /// `EINTR` and on spurious readiness, as CPython's `sock_call_ex`.
-    fn sock_call<T>(it: &mut Interp, fd: i32, writing: bool, timeout: Option<f64>, mut op: impl FnMut() -> lumen_os::net::R<T>) -> R<T> {
+    fn sock_call<T: Send>(it: &mut Interp, fd: i32, writing: bool, timeout: Option<f64>, op: impl FnMut() -> lumen_os::net::R<T> + Send) -> R<T> {
+        // BSD kernels ignore MSG_DONTWAIT for large writes on a blocking descriptor, and a send
+        // stuck in the kernel is never interrupted by an `SA_RESTART` handler; wait in `poll` instead.
+        let flip = writing && timeout.is_none() && fd >= 0 && lumen_os::fdctl::set_blocking(fd, false).is_ok();
+        let out = sock_call_inner(it, fd, writing, timeout, op);
+        if flip {
+            let _ = lumen_os::fdctl::set_blocking(fd, true);
+        }
+        out
+    }
+
+    fn sock_call_inner<T>(it: &mut Interp, fd: i32, writing: bool, timeout: Option<f64>, mut op: impl FnMut() -> lumen_os::net::R<T> + Send) -> R<T> where T: Send {
         if fd < 0 {
             return Err(it.os_error_errno(EBADF, None, None));
         }
@@ -255,7 +266,7 @@ pub mod _socket {
                 return Err(timeout_error(it));
             }
             let err = loop {
-                match op() {
+                match it.unlocked(&mut op) {
                     Ok(v) => return Ok(v),
                     Err(e) if e.errno() == EINTR => crate::builtins::signalm::check(it)?,
                     Err(e) => break e,

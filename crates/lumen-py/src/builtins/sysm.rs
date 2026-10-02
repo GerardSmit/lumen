@@ -192,6 +192,22 @@ pub mod sys {
         it.set_trace_func(function.clone());
     }
 
+    /// _settraceallthreads(function)
+    ///
+    /// Set the global debug tracing function in all running threads, and for future threads.
+    #[op(hint(py(text_signature = "")))]
+    fn _settraceallthreads(it: &mut Interp, function: &Value) {
+        it.set_trace_func(function.clone());
+    }
+
+    /// _setprofileallthreads(function)
+    ///
+    /// Set the profiling function in all running threads belonging to the current interpreter.
+    #[op(hint(py(text_signature = "")))]
+    fn _setprofileallthreads(it: &mut Interp, function: &Value) {
+        it.set_profile_func(function.clone());
+    }
+
     /// Return the profiling function set with sys.setprofile.
     ///
     /// See the profiler chapter in the library manual.

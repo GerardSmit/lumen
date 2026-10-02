@@ -189,7 +189,8 @@ fn interpreter_main(id: i64, inbox: Arc<Queue<Job>>, running: Arc<AtomicBool>, p
     it.main_globals = Some(globals.clone());
     let _ = ready.push(Reply::Done);
     loop {
-        match inbox.pop_wait(None) {
+        let next = it.unlocked(|| inbox.pop_wait(None));
+        match next {
             Pop::Message(Job::Run { code, shared, reply }) => {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&mut it, &globals, &code, &shared)));
                 let outcome = outcome.unwrap_or(Reply::Failed { name: None, msg: Some("interpreter crashed".to_string()) });
@@ -200,6 +201,7 @@ fn interpreter_main(id: i64, inbox: Arc<Queue<Job>>, running: Arc<AtomicBool>, p
             Pop::Empty => {}
         }
     }
+    it.wait_for_thread_shutdown();
     it.run_atexit();
     super::iom::flush_std_streams(&mut it);
     it.flush_out();

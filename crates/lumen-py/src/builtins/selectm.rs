@@ -22,7 +22,7 @@ pub(crate) fn wait<T: Send>(it: &mut Interp, timeout_ms: Option<i64>, mut wait_o
         };
         let slice = left.min(SLICE_MS) as i32;
         match it.unlocked(|| wait_once(slice)) {
-            Ok((false, _)) if left > i64::from(slice) => {}
+            Ok((false, _)) if timeout_ms.is_none() || left > i64::from(slice) => {}
             Ok((_, r)) => return Ok(r),
             Err(e) if e.errno() == 4 => {}
             Err(e) => return Err(it.os_error_errno(e.errno(), None, None)),

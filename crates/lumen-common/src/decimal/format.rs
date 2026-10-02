@@ -93,6 +93,9 @@ pub fn parse_format_spec(text: &str) -> Result<FormatSpec, FormatError> {
     })
 }
 
+/// Widths no allocation could satisfy; libmpdec rejects them as an invalid specifier.
+const MAX_WIDTH: usize = 1 << 48;
+
 fn format_sign(negative: bool, spec: &FormatSpec) -> &'static str {
     if negative {
         "-"
@@ -198,6 +201,9 @@ impl Decimal {
     /// Formats the value. `locale` supplies the decimal point, separator and grouping for the
     /// `n` type; given for any other type it overrides the defaults too.
     pub fn format(&self, spec: &FormatSpec, locale: Option<&Locale>, ctx: &Context) -> Result<String, FormatError> {
+        if spec.min_width > MAX_WIDTH {
+            return Err(FormatError::Invalid);
+        }
         let fixed = Locale { decimal_point: ".".into(), thousands_sep: if spec.thousands { ",".into() } else { String::new() }, grouping: vec![3, 0] };
         let loc = match (locale, spec.locale) {
             (Some(l), _) => l.clone(),

@@ -62,6 +62,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             } else if spec == "int_max_str_digits" {
                 return Err(invalid_digits_limit("-X int_max_str_digits"));
             }
+        } else if matches!(a, "-I" | "-E" | "-s" | "-B" | "-u" | "-q") {
         } else if a == "--" {
             i += 1;
             break;
