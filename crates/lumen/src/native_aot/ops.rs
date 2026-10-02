@@ -180,13 +180,7 @@ fn execute(
             let old = i.get_var(name, &frame.env)?;
             let kind = update_kind(i, b)?;
             crate::bytecode::step_and_store(i, &mut frame.stack, kind, old, |i, value| {
-                let mut env = frame.env.borrow_mut();
-                let binding = env
-                    .vars
-                    .get_mut(name)
-                    .ok_or_else(|| i.throw("ReferenceError", "native captured binding missing"))?;
-                binding.value = value;
-                Ok(())
+                i.assign_free_name(name, value, &frame.env)
             })?;
         }
         "LoadName" | "LoadCap" => frame
@@ -194,23 +188,27 @@ fn execute(
             .push(i.get_var(&function.names[a as usize], &frame.env)?),
         "StoreCap" | "StoreCapInit" => {
             let value = pop(frame)?;
-            let mut env = frame.env.borrow_mut();
-            let binding = env
-                .vars
-                .get_mut(&function.names[a as usize])
-                .ok_or_else(|| i.throw("ReferenceError", "native captured binding missing"))?;
-            if op != "StoreCapInit" && !binding.initialized {
-                return Err(i.throw(
-                    "ReferenceError",
-                    format!(
-                        "cannot access '{}' before initialization",
-                        function.names[a as usize]
-                    ),
-                ));
-            }
-            binding.value = value;
-            if op == "StoreCapInit" {
-                binding.initialized = true;
+            let name = &function.names[a as usize];
+            if op == "StoreCap" {
+                i.assign_free_name(name, value, &frame.env)?;
+            } else {
+                let mut scope = Some(frame.env.clone());
+                let mut initialized = false;
+                while let Some(env) = scope {
+                    let mut env = env.borrow_mut();
+                    if let Some(binding) = env.vars.get_mut(name) {
+                        binding.value = value.clone();
+                        binding.initialized = true;
+                        initialized = true;
+                        break;
+                    }
+                    scope = env.parent.clone();
+                }
+                if !initialized {
+                    if !i.global_var_names.contains(name.as_str()) { return Err(i.throw("ReferenceError", "native captured binding missing")); }
+                    let global = Value::Obj(i.global.clone());
+                    i.set_member(&global, name, value)?;
+                }
             }
         }
         "StoreName" | "StoreNameCached" => {

@@ -28,11 +28,11 @@ fn native_script_publishes_global_functions_and_updates_global_vars() {
     let bytes = build.encode(&target).unwrap();
     engine.load_native_value_owned(bytes.into(), None, &[], true).unwrap();
     let global = engine.global_this();
-    let function = engine.ctx().get_member(&global, "request").unwrap();
-    let result = engine.call_function(&function, global.clone(), &[]).unwrap();
+    let function = engine.ctx().get_member(&global, "request").unwrap_or_else(|_| panic!("request lookup failed"));
+    let result = engine.call_function(&function, global.clone(), &[]).unwrap_or_else(|_| panic!("request call failed"));
     assert!(matches!(result, lumen::embed::Value::Num(12.0)));
-    assert!(matches!(engine.ctx().get_member(&global, "count").unwrap(), lumen::embed::Value::Num(12.0)));
-    assert!(matches!(engine.ctx().get_member(&global, "hidden").unwrap(), lumen::embed::Value::Undefined));
+    assert!(matches!(engine.ctx().get_member(&global, "count").unwrap_or_else(|_| panic!("count lookup failed")), lumen::embed::Value::Num(12.0)));
+    assert!(matches!(engine.ctx().get_member(&global, "hidden").unwrap_or_else(|_| panic!("hidden lookup failed")), lumen::embed::Value::Undefined));
     std::fs::remove_file(root.join("app.js")).unwrap();
     std::fs::remove_dir(root).unwrap();
 }
