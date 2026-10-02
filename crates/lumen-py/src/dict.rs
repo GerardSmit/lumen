@@ -7,9 +7,7 @@ use crate::watch::{self, DictEvent};
 use std::cell::Cell;
 use std::rc::Rc;
 
-thread_local! {
-    static NEXT_VERSION: Cell<u64> = const { Cell::new(1) };
-}
+static NEXT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// PEP 509's version tag: assigned on first request from a counter shared by every dict, and
 /// dropped by each mutation so the next request hands out a fresh one. A copy starts untagged.
@@ -320,7 +318,7 @@ impl PyDict {
     /// The PEP 509 version tag (`ma_version_tag`).
     pub fn version(&self) -> u64 {
         if self.version.0.get() == 0 {
-            let v = NEXT_VERSION.with(|n| n.replace(n.get() + 1));
+            let v = NEXT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.version.0.set(v);
         }
         self.version.0.get()

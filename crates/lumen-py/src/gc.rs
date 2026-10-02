@@ -43,20 +43,49 @@ struct Heap {
     seq: u32,
 }
 
+impl Heap {
+    const fn new() -> Heap {
+        Heap { lists: [Vec::new(), Vec::new(), Vec::new(), Vec::new()], sched: Generations::new(), enabled: true, collecting: false, seq: 0 }
+    }
+}
+
 thread_local! {
-    static HEAP: RefCell<Heap> = const {
-        RefCell::new(Heap {
-            lists: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            sched: Generations::new(),
-            enabled: true,
-            collecting: false,
-            seq: 0,
-        })
-    };
+    static HEAP: RefCell<Heap> = const { RefCell::new(Heap::new()) };
     static DUE: Cell<bool> = const { Cell::new(false) };
     static EPOCH: Cell<u64> = const { Cell::new(0) };
     static FINALIZING: Cell<bool> = const { Cell::new(false) };
     static FINALIZERS: RefCell<Vec<Obj>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The collector's bookkeeping, which follows the interpreter from thread to thread as the GIL
+/// changes hands (see `threads`): the generation lists hold raw pointers to every container, so
+/// they must be one set, not one per OS thread.
+pub(crate) struct HeapState {
+    heap: Heap,
+    due: bool,
+    epoch: u64,
+    finalizing: bool,
+    finalizers: Vec<Obj>,
+}
+
+pub(crate) fn state_take() -> HeapState {
+    HeapState {
+        heap: HEAP.with(|h| std::mem::replace(&mut *h.borrow_mut(), Heap::new())),
+        due: DUE.with(|d| d.replace(false)),
+        epoch: EPOCH.with(|e| e.replace(0)),
+        finalizing: FINALIZING.with(|f| f.replace(false)),
+        finalizers: FINALIZERS.with(|f| std::mem::take(&mut *f.borrow_mut())),
+    }
+}
+
+pub(crate) fn state_put(state: HeapState) {
+    let old = HEAP.with(|h| std::mem::replace(&mut *h.borrow_mut(), state.heap));
+    DUE.with(|d| d.set(state.due));
+    EPOCH.with(|e| e.set(state.epoch));
+    FINALIZING.with(|f| f.set(state.finalizing));
+    let finalizers = FINALIZERS.with(|f| std::mem::replace(&mut *f.borrow_mut(), state.finalizers));
+    drop(old);
+    drop(finalizers);
 }
 
 fn remove_at(list: &mut Vec<*const Object>, idx: usize) {
@@ -508,7 +537,7 @@ impl Interp {
     }
 
     fn gc_debug_line(&mut self, text: String) {
-        self.write_stderr(&text);
+        self.print_to_sys_stderr(&text);
     }
 
     /// `gc_collect_main`: collects generation `gen` (and the younger ones); returns the number of

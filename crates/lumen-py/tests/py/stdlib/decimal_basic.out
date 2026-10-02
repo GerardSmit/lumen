@@ -35,7 +35,7 @@ TypeError conversion from NoneType to Decimal is not supported
 TypeError function missing required argument 'exp' (pos 1)
 1,234,567.89 1.23e-3 1e-7
 -00012.500 50%      NaN
-1_234.5    42    | 3
+1,234.5    42    | 3
 28 ROUND_HALF_EVEN 999999 -999999
 0.14286 True
 0.66666

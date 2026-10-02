@@ -114,6 +114,11 @@ impl Interp {
         }
         let r = self.call(f, args, kw)?;
         self.frames.last_mut().unwrap().stack.push(r);
+        // CPython checks for signals when a native call returns, so a handler that raises
+        // interrupts the code right after a blocking call (before any cleanup that follows it).
+        if lumen_os::signal::any_pending() {
+            crate::builtins::signalm::check(self)?;
+        }
         Ok(false)
     }
 

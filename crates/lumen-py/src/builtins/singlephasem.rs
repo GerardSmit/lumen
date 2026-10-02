@@ -6,7 +6,7 @@
 use super::subinterpm;
 use crate::object::*;
 use crate::vm::{dict_set_str, Interp};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -21,8 +21,12 @@ struct Cached {
 thread_local! {
     static COUNT: Cell<i64> = const { Cell::new(NOT_INITIALIZED) };
     static INITIALIZED: Cell<f64> = const { Cell::new(0.0) };
-    static CACHE: RefCell<Option<Cached>> = const { RefCell::new(None) };
 }
+
+/// The copy of the module taken at the first import; it holds an object, so it lives in the
+/// interpreter, not in a thread-local.
+#[derive(Default)]
+struct Cache(Option<Cached>);
 
 /// A time that no earlier call returned: the state is stamped with it.
 fn unique_time() -> f64 {
@@ -55,7 +59,7 @@ pub fn clear_extension(it: &mut Interp, name: &Value, filename: &Value) -> R<()>
         return Err(it.type_error(&format!("clear_extension() argument 2 must be str, not {t}")));
     }
     if name.as_str() == Some(NAME) {
-        CACHE.with(|c| *c.borrow_mut() = None);
+        it.native_state::<Cache>().0 = None;
     }
     Ok(())
 }
@@ -98,7 +102,7 @@ pub mod _testsinglephase {
         }
         let d = it.module_dict(m);
         dict_set_str(&d, "__doc__", Value::str("Test module _testsinglephase"));
-        let cached = CACHE.with(|c| c.borrow().as_ref().map(|c| (c.error.clone(), c.initialized)));
+        let cached = it.native_state::<Cache>().0.as_ref().map(|c| (c.error.clone(), c.initialized));
         let (error, initialized) = match cached {
             Some(copy) => copy,
             None => {
@@ -110,7 +114,7 @@ pub mod _testsinglephase {
                 let base = it.exc_type("Exception");
                 let error = crate::builtins::native::new_type(it, NAME, "error", Some(&base), Layout::Exception);
                 COUNT.with(|c| c.set(c.get() + 1));
-                CACHE.with(|c| *c.borrow_mut() = Some(Cached { error: error.clone(), initialized }));
+                it.native_state::<Cache>().0 = Some(Cached { error: error.clone(), initialized });
                 (error, initialized)
             }
         };

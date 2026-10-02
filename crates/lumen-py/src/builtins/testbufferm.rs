@@ -852,13 +852,13 @@ impl NDArray {
     #[constructor]
     fn new(
         it: &mut Interp,
-        obj: &Value,
-        shape: Option<&Value>,
-        strides: Option<&Value>,
-        offset: Option<i64>,
-        format: Option<&Value>,
-        flags: Option<i64>,
-        getbuf: Option<i64>,
+        #[kw] obj: &Value,
+        #[kw] shape: Option<&Value>,
+        #[kw] strides: Option<&Value>,
+        #[kw] offset: Option<i64>,
+        #[kw] format: Option<&Value>,
+        #[kw] flags: Option<i64>,
+        #[kw] getbuf: Option<i64>,
     ) -> R<NDArray> {
         let offset = offset.unwrap_or(0);
         let mut flags = flags.unwrap_or(0);

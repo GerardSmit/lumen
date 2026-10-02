@@ -1559,8 +1559,8 @@ impl Parser {
                 r
             }
             None => {
-                let context = self.get_context();
                 self.set_general_open(name, true);
+                let context = self.get_context();
                 let f = h.external_entity_ref(Some(&context), ent.base.as_deref(), ent.sysid.as_deref(), ent.pubid.as_deref());
                 self.set_general_open(name, false);
                 match f {

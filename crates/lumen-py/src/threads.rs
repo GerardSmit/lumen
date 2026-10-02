@@ -43,6 +43,30 @@ struct GilState {
 }
 
 /// The global interpreter lock: a mutex with a switch-request flag, after CPython's.
+///
+/// # The invariant that makes `Rc` objects safe across threads
+///
+/// Python objects are `Rc`s, which are neither `Send` nor `Sync`. They are shared by OS threads
+/// anyway, which is sound only because *every touch of an `Rc` (clone, drop, borrow, read of
+/// its contents) happens on the thread that holds the GIL*:
+///
+/// 1. A thread runs interpreter code only between [`Gil::acquire`] and [`Gil::release`]; the
+///    lock's mutex orders those sections, so one thread's writes are visible to the next holder.
+/// 2. Everything that holds objects belongs to the interpreter, not to an OS thread. State kept
+///    in `Interp` is moved by `park` / `unpark` ([`ThreadState`]); state kept in `thread_local!`
+///    caches (weak registry, object ids, the cycle collector's lists, watchers, regex and
+///    struct caches) is moved the same way as [`TlsBundle`]. A thread-local that holds objects
+///    and is not in the bundle is a bug: its destructor would run on a thread with no GIL, and
+///    another thread's `Drop` would not find the object's bookkeeping.
+/// 3. Code that runs without the GIL does so only through [`Interp::unlocked`], whose closure
+///    and result are `Send`, so they cannot carry an `Rc`. Helper threads (the sentinels,
+///    waiters, the signal handler) are `Arc` / atomic state only.
+/// 4. The only `Rc`-carrying value that crosses a thread boundary is the start-up [`Boot`]
+///    (the callable and its arguments). The parent builds it while it holds the GIL and keeps no
+///    copy; the child touches it only after its own `acquire` (the [`Unsend`] wrapper marks the
+///    one `unsafe impl Send`).
+/// 5. Signal handlers only record the signal (`lumen_os::signal`); the Python handler runs on
+///    the main thread, with the GIL, at a poll site.
 pub struct Gil {
     state: Mutex<GilState>,
     free: Condvar,
@@ -152,6 +176,8 @@ struct TlsBundle {
     weak: crate::weak::WeakState,
     sre: Box<dyn std::any::Any>,
     structs: Box<dyn std::any::Any>,
+    gc: crate::gc::HeapState,
+    watch: crate::watch::WatchState,
 }
 
 impl TlsBundle {
@@ -161,6 +187,8 @@ impl TlsBundle {
             weak: crate::weak::state_take(),
             sre: crate::builtins::sre::tls_take(),
             structs: crate::builtins::structm::_struct::tls_take(),
+            gc: crate::gc::state_take(),
+            watch: crate::watch::state_take(),
         }
     }
 
@@ -169,6 +197,8 @@ impl TlsBundle {
         crate::weak::state_put(self.weak);
         crate::builtins::sre::tls_put(self.sre);
         crate::builtins::structm::_struct::tls_put(self.structs);
+        crate::gc::state_put(self.gc);
+        crate::watch::state_put(self.watch);
     }
 }
 
@@ -302,8 +332,9 @@ impl Interp {
         self.threads.tls = Some(Box::new(TlsBundle::take()));
     }
 
-    /// Runs `f`, which must not touch Python objects, without the GIL.
-    pub fn unlocked<T>(&mut self, f: impl FnOnce() -> T) -> T {
+    /// Runs `f`, which must not touch Python objects, without the GIL. The `Send` bounds make the
+    /// compiler enforce that: an `Rc` (every Python object) cannot be captured or returned.
+    pub fn unlocked<T: Send>(&mut self, f: impl FnOnce() -> T + Send) -> T {
         let Some(gil) = self.threads.gil.clone() else { return f() };
         let me: *mut Interp = self;
         gil.publish(me);

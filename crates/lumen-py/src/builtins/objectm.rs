@@ -283,6 +283,23 @@ fn default_getstate(it: &mut Interp, obj: &Value, required: bool) -> R<Value> {
         }
     };
     if !names.is_empty() {
+        // Slot values live in the instance dict here; the state's dict part holds only the rest.
+        if let Value::Obj(d) = &state {
+            let slot_names: Vec<String> = names.iter().filter_map(|n| n.as_str().map(str::to_string)).collect();
+            let rest: Vec<(Value, Value)> = match &d.kind {
+                Kind::Dict(p) => p.borrow().iter().filter(|e| !e.key.as_str().is_some_and(|k| slot_names.iter().any(|s| s == k))).map(|e| (e.key.clone(), e.val.clone())).collect(),
+                _ => Vec::new(),
+            };
+            state = if rest.is_empty() {
+                Value::None
+            } else {
+                let kept = Object::new(Kind::Dict(std::cell::RefCell::new(crate::dict::PyDict::new())));
+                for (k, v) in rest {
+                    it.dict_set(&kept, k, v)?;
+                }
+                Value::Obj(kept)
+            };
+        }
         let slots = Object::new(Kind::Dict(std::cell::RefCell::new(crate::dict::PyDict::new())));
         let mut any = false;
         for n in names {

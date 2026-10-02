@@ -53,6 +53,7 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `encodings/__init__.py`
 - `encodings/aliases.py`
 - `encodings/ascii.py`
+- `encodings/cp437.py`
 - `encodings/latin_1.py`
 - `encodings/utf_8.py`
 - `encodings/utf_8_sig.py`

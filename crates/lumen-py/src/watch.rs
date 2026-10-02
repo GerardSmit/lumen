@@ -122,6 +122,44 @@ thread_local! {
     static CODE_WATCHED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The watcher bookkeeping, which follows the interpreter from thread to thread as the GIL
+/// changes hands (see `threads`): it holds callbacks and queued objects.
+pub(crate) struct WatchState {
+    table: [[Option<Callback>; MAX_WATCHERS]; 4],
+    queue: Vec<Queued>,
+    pending: bool,
+    watched_dicts: Vec<(usize, Weak<Object>)>,
+    clear_epoch: u32,
+    next_tag: u32,
+    func_watched: bool,
+    code_watched: bool,
+}
+
+pub(crate) fn state_take() -> WatchState {
+    WatchState {
+        table: TABLE.with(|t| std::mem::take(&mut *t.borrow_mut())),
+        queue: QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut())),
+        pending: PENDING.with(|p| p.replace(false)),
+        watched_dicts: WATCHED_DICTS.with(|w| std::mem::take(&mut *w.borrow_mut())),
+        clear_epoch: CLEAR_EPOCH.with(|e| e.replace(1)),
+        next_tag: NEXT_TAG.with(|n| n.replace(1)),
+        func_watched: FUNC_WATCHED.with(|f| f.replace(false)),
+        code_watched: CODE_WATCHED.with(|f| f.replace(false)),
+    }
+}
+
+pub(crate) fn state_put(state: WatchState) {
+    let table = TABLE.with(|t| std::mem::replace(&mut *t.borrow_mut(), state.table));
+    let queue = QUEUE.with(|q| std::mem::replace(&mut *q.borrow_mut(), state.queue));
+    PENDING.with(|p| p.set(state.pending));
+    let dicts = WATCHED_DICTS.with(|w| std::mem::replace(&mut *w.borrow_mut(), state.watched_dicts));
+    CLEAR_EPOCH.with(|e| e.set(state.clear_epoch));
+    NEXT_TAG.with(|n| n.set(state.next_tag));
+    FUNC_WATCHED.with(|f| f.set(state.func_watched));
+    CODE_WATCHED.with(|f| f.set(state.code_watched));
+    drop((table, queue, dicts));
+}
+
 fn set_pending() {
     let _ = PENDING.try_with(|p| p.set(true));
 }

@@ -1796,8 +1796,8 @@ pub mod _ssl {
     /// using the ssl() function.
     #[op]
     #[allow(non_snake_case)]
-    fn RAND_status() -> i32 {
-        1
+    fn RAND_status() -> bool {
+        true
     }
 
     fn object_value(info: engine::ObjectInfo) -> Value {

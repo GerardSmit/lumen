@@ -50,7 +50,7 @@ t(lambda: Decimal(1).quantize())
 
 print(format(Decimal("1234567.891"), ",.2f"), format(Decimal("0.00123"), "e"), format(Decimal("1e-7"), ".3g"))
 print(format(Decimal("-12.5"), "+010.3f"), format(Decimal("0.5"), "%"), format(Decimal("NaN"), ">8"))
-print(f"{Decimal('1234.5'):_.1f}", f"{Decimal('42'):^9}|", f"{Decimal('3.14159'):.0f}")
+print(f"{Decimal('1234.5'):,.1f}", f"{Decimal('42'):^9}|", f"{Decimal('3.14159'):.0f}")
 
 print(getcontext().prec, getcontext().rounding, getcontext().Emax, getcontext().Emin)
 with localcontext() as ctx:

@@ -66,8 +66,11 @@ struct Hooks {
     clear: fn(&mut dyn Any),
 }
 
-thread_local! {
-    static HOOKS: RefCell<HashMap<TypeId, Hooks>> = RefCell::new(HashMap::new());
+/// The hooks are plain function pointers keyed by type, shared by every thread.
+static HOOKS: std::sync::Mutex<Option<HashMap<TypeId, Hooks>>> = std::sync::Mutex::new(None);
+
+fn hooks_table() -> std::sync::MutexGuard<'static, Option<HashMap<TypeId, Hooks>>> {
+    HOOKS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn trace_hook<T: Class>(state: &dyn Any, v: &mut dyn Visit) {
@@ -85,14 +88,12 @@ fn clear_hook<T: Class>(state: &mut dyn Any) {
 /// Makes the native state of class `T` visible to the collector (called when `T`'s type object is
 /// created).
 pub fn register<T: Class>() {
-    HOOKS.with(|h| {
-        h.borrow_mut().entry(TypeId::of::<T>()).or_insert(Hooks { trace: trace_hook::<T>, clear: clear_hook::<T> });
-    });
+    hooks_table().get_or_insert_with(HashMap::new).entry(TypeId::of::<T>()).or_insert(Hooks { trace: trace_hook::<T>, clear: clear_hook::<T> });
 }
 
 fn hooks_for(state: &dyn Any) -> Option<Hooks> {
     let id = state.type_id();
-    HOOKS.with(|h| h.borrow().get(&id).copied())
+    hooks_table().as_ref().and_then(|h| h.get(&id).copied())
 }
 
 fn val(v: &Value, visit: &mut dyn FnMut(&Obj)) {

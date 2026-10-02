@@ -248,7 +248,7 @@ fn check_move(source: &State, target: &State) -> Result<usize, &'static str> {
 /// is running.
 pub fn set_lineno(it: &mut Interp, at: Option<usize>, line: i64) -> R<()> {
     let event = it.mon.cur_event;
-    let running = at.filter(|&a| a + 1 == it.frames.len() && event != 0);
+    let running = at.filter(|_| event != 0);
     let Some(at) = running else {
         return Err(it.value_error("f_lineno can only be set by a trace function"));
     };

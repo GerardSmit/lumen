@@ -353,7 +353,7 @@ impl Interp {
             CmpOp::Eq => Ok(Value::Bool(a.is(b))),
             CmpOp::NotEq => Ok(Value::Bool(!a.is(b))),
             _ => {
-                let (ta, tb) = (self.type_name_of(a), self.type_name_of(b));
+                let (ta, tb) = (self.tp_name_of(a), self.tp_name_of(b));
                 Err(self.type_error(&format!("'{}' not supported between instances of '{}' and '{}'", sym, ta, tb)))
             }
         }
@@ -601,7 +601,7 @@ impl Interp {
 
     pub fn binop_error(&mut self, op: BinOp, a: &Value, b: &Value, inplace: bool) -> Obj {
         let (_, _, _, sym) = binop_info(op);
-        let (ta, tb) = (self.type_name_of(a), self.type_name_of(b));
+        let (ta, tb) = (self.tp_name_of(a), self.tp_name_of(b));
         if op == BinOp::Add && !inplace || op == BinOp::Add {
             let seq_left = matches!(ta.as_str(), "str" | "list" | "tuple" | "bytes" | "bytearray");
             if seq_left && matches!(a, Value::Obj(_)) {
@@ -636,7 +636,7 @@ impl Interp {
             if self.exc_is(&e, "TypeError") {
                 let msg = self.exc_message(&e);
                 if msg.starts_with("unsupported operand type(s) for ") {
-                    let (ta, tb) = (self.type_name_of(&a), self.type_name_of(b));
+                    let (ta, tb) = (self.tp_name_of(&a), self.tp_name_of(b));
                     let (_, _, _, sym) = binop_info(op);
                     let sym = if sym == "** or pow()" { "**" } else { sym };
                     return self.type_error(&format!("unsupported operand type(s) for {}=: '{}' and '{}'", sym, ta, tb));
@@ -829,7 +829,15 @@ impl Interp {
                         v.extend_from_slice(&y.bytes());
                         Ok(Some(Value::bytes(v)))
                     }
-                    _ => Ok(None),
+                    _ => match crate::builtins::memview::contiguous_bytes(self, b)? {
+                        Some(y) => {
+                            self.check_bytes_len(x.len() + y.len())?;
+                            let mut v = x.clone();
+                            v.extend_from_slice(&y);
+                            Ok(Some(Value::bytes(v)))
+                        }
+                        None => Ok(None),
+                    },
                 },
                 _ => Ok(None),
             },
@@ -839,7 +847,10 @@ impl Interp {
                     match &ob.kind {
                         Kind::Bytes(y) => v.extend_from_slice(y),
                         Kind::ByteArray(y) => v.extend_from_slice(&y.bytes()),
-                        _ => return Ok(None),
+                        _ => match crate::builtins::memview::contiguous_bytes(self, b)? {
+                            Some(y) => v.extend_from_slice(&y),
+                            None => return Ok(None),
+                        },
                     }
                     Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(v))))))
                 }
