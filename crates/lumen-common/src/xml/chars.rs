@@ -1,5 +1,10 @@
 //! Character classes and the input encodings.
 
+use crate::smuggle::Spelling;
+use crate::utf;
+use std::borrow::Cow;
+use std::convert::Infallible;
+
 /// Stands for an undecodable byte or unpaired surrogate; it is not an XML character, so the
 /// tokenizer reports it as an invalid token at that spot.
 pub const MALFORMED: char = '\u{FFFF}';
@@ -93,56 +98,16 @@ pub fn next_char(enc: &Enc, raw: &[u8]) -> Step {
         return Step::Incomplete;
     }
     match enc {
-        Enc::Utf8 => {
-            let b = raw[0];
-            if b < 0x80 {
-                return Step::Char(b as char, 1);
-            }
-            let need = match b {
-                0xC2..=0xDF => 2,
-                0xE0..=0xEF => 3,
-                0xF0..=0xF4 => 4,
-                _ => return Step::Bad(1),
+        Enc::Utf8 | Enc::Utf16Le | Enc::Utf16Be => {
+            let step = match enc {
+                Enc::Utf8 => utf::step_utf8(raw, 0, false),
+                _ => utf::step_utf16(raw, 0, *enc == Enc::Utf16Be, false),
             };
-            let avail = raw.len().min(need);
-            match std::str::from_utf8(&raw[..avail]) {
-                Ok(s) => match s.chars().next() {
-                    Some(c) if avail == need => Step::Char(c, need),
-                    _ => Step::Incomplete,
-                },
-                Err(e) => match e.error_len() {
-                    None => Step::Incomplete,
-                    Some(n) => Step::Bad(n.max(1)),
-                },
+            match step {
+                utf::Step::Char(cp, n) => Step::Char(char::from_u32(cp).unwrap_or(MALFORMED), n),
+                utf::Step::Bad(m) => Step::Bad((m.end - m.start).max(1)),
+                utf::Step::Incomplete => Step::Incomplete,
             }
-        }
-        Enc::Utf16Le | Enc::Utf16Be => {
-            if raw.len() < 2 {
-                return Step::Incomplete;
-            }
-            let unit = |i: usize| -> u16 {
-                if *enc == Enc::Utf16Le {
-                    u16::from_le_bytes([raw[i], raw[i + 1]])
-                } else {
-                    u16::from_be_bytes([raw[i], raw[i + 1]])
-                }
-            };
-            let hi = unit(0);
-            if (0xD800..0xDC00).contains(&hi) {
-                if raw.len() < 4 {
-                    return Step::Incomplete;
-                }
-                let lo = unit(2);
-                if (0xDC00..0xE000).contains(&lo) {
-                    let cp = 0x10000 + (((hi as u32) - 0xD800) << 10) + ((lo as u32) - 0xDC00);
-                    return Step::Char(char::from_u32(cp).unwrap_or(MALFORMED), 4);
-                }
-                return Step::Bad(2);
-            }
-            if (0xDC00..0xE000).contains(&hi) {
-                return Step::Bad(2);
-            }
-            Step::Char(char::from_u32(hi as u32).unwrap_or(MALFORMED), 2)
         }
         Enc::Latin1 => Step::Char(raw[0] as char, 1),
         Enc::Ascii => {
@@ -161,30 +126,19 @@ pub fn next_char(enc: &Enc, raw: &[u8]) -> Step {
 
 /// Decodes as much of `raw` as possible; returns the bytes used. Stops at an incomplete character.
 pub fn decode_into(enc: &Enc, raw: &[u8], out: &mut String) -> usize {
-    let mut i = 0;
-    if *enc == Enc::Utf8 {
-        while i < raw.len() {
-            match std::str::from_utf8(&raw[i..]) {
-                Ok(s) => {
-                    out.push_str(s);
-                    return raw.len();
-                }
-                Err(e) => {
-                    let ok = e.valid_up_to();
-                    out.push_str(std::str::from_utf8(&raw[i..i + ok]).unwrap_or(""));
-                    i += ok;
-                    match e.error_len() {
-                        None => return i,
-                        Some(n) => {
-                            out.push(MALFORMED);
-                            i += n.max(1);
-                        }
-                    }
-                }
-            }
-        }
-        return i;
+    if matches!(enc, Enc::Utf8 | Enc::Utf16Le | Enc::Utf16Be) {
+        let mut data = Cow::Borrowed(raw);
+        let on_error = |_: &mut Cow<[u8]>, m: utf::Malformed, out: &mut String| -> Result<usize, Infallible> {
+            out.push(MALFORMED);
+            Ok(m.end.max(m.start + 1))
+        };
+        let used = match enc {
+            Enc::Utf8 => utf::decode_utf8(&mut data, false, Spelling::Plain, out, on_error),
+            _ => utf::decode_utf16(&mut data, 0, *enc == Enc::Utf16Be, false, Spelling::Plain, out, on_error),
+        };
+        return used.unwrap_or(0);
     }
+    let mut i = 0;
     while i < raw.len() {
         match next_char(enc, &raw[i..]) {
             Step::Char(c, n) => {
@@ -199,4 +153,37 @@ pub fn decode_into(enc: &Enc, raw: &[u8], out: &mut String) -> usize {
         }
     }
     i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decoded(enc: &Enc, raw: &[u8]) -> (String, usize) {
+        let mut out = String::new();
+        let used = decode_into(enc, raw, &mut out);
+        (out, used)
+    }
+
+    #[test]
+    fn utf8_marks_malformed_and_waits_on_partial() {
+        assert_eq!(decoded(&Enc::Utf8, b"a\xFFb\xE2\x82"), ("a\u{FFFF}b".to_string(), 3));
+        assert_eq!(decoded(&Enc::Utf8, "é€".as_bytes()), ("é€".to_string(), 5));
+    }
+
+    #[test]
+    fn utf16_pairs_lone_surrogates_and_partial() {
+        let le = [0x61, 0, 0x3D, 0xD8, 0x00, 0xDE, 0x00, 0xDC, 0x62, 0, 0x3D];
+        assert_eq!(decoded(&Enc::Utf16Le, &le), ("a\u{1F600}\u{FFFF}b".to_string(), 10));
+        assert_eq!(decoded(&Enc::Utf16Be, &[0xD8, 0x3D]).1, 0);
+    }
+
+    #[test]
+    fn next_char_steps() {
+        assert!(matches!(next_char(&Enc::Utf8, "€".as_bytes()), Step::Char('€', 3)));
+        assert!(matches!(next_char(&Enc::Utf8, &[0xE2, 0x82]), Step::Incomplete));
+        assert!(matches!(next_char(&Enc::Utf8, &[0xC0, 0x80]), Step::Bad(1)));
+        assert!(matches!(next_char(&Enc::Utf16Be, &[0xDC, 0x00]), Step::Bad(2)));
+        assert!(matches!(next_char(&Enc::Utf16Be, &[0x00]), Step::Incomplete));
+    }
 }
