@@ -159,6 +159,8 @@ pub const INTRINSIC1_PARAMSPEC: u32 = 1;
 pub const INTRINSIC1_TYPEVARTUPLE: u32 = 2;
 pub const INTRINSIC1_SUBSCRIPT_GENERIC: u32 = 3;
 pub const INTRINSIC1_TYPEALIAS: u32 = 4;
+/// Passes an interactive expression statement's value to `sys.displayhook`.
+pub const INTRINSIC1_PRINT: u32 = 5;
 
 pub const INTRINSIC2_TYPEVAR_WITH_BOUND: u32 = 0;
 pub const INTRINSIC2_TYPEVAR_WITH_CONSTRAINTS: u32 = 1;

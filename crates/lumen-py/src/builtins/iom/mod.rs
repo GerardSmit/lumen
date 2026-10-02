@@ -115,14 +115,6 @@ pub fn exact<T: Class + Methods<PyHost>>(it: &mut Interp, v: &Value) -> Option<P
 }
 
 /// `warnings.warn(msg, category, stacklevel)`.
-pub fn warn(it: &mut Interp, category: &str, msg: &str, stacklevel: i64) -> R<()> {
-    let m = it.import_module("_warnings")?;
-    let f = it.get_attr_str(&Value::Obj(m), "warn")?;
-    let cat = Value::Obj(it.exc_type(category));
-    it.call(&f, vec![Value::str(msg), cat, Value::Int(stacklevel)], Vec::new())?;
-    Ok(())
-}
-
 /// CPython's UTF-8 mode: `PYTHONUTF8`, else on under the C/POSIX locale (PEP 538/540).
 pub fn utf8_mode(it: &mut Interp) -> bool {
     let p = it.platform.borrow();
@@ -343,7 +335,7 @@ pub fn open_impl(
     }
     if binary && buffering == 1 {
         let msg = "line buffering (buffering=1) isn't supported in binary mode, the default buffer size will be used";
-        warn(it, "RuntimeWarning", msg, 1)?;
+        crate::builtins::warningsm::warn_category(it, "RuntimeWarning", msg, 1)?;
     }
     let mut rawmode = String::new();
     for (on, c) in [(creating, 'x'), (reading, 'r'), (writing, 'w'), (appending, 'a'), (updating, '+')] {

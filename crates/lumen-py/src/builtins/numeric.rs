@@ -350,13 +350,24 @@ fn parse_complex(s: &str) -> Option<(f64, f64)> {
 fn complex_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let cls = cls_of(it, a, "complex")?;
     let b = it.bind_args("complex", &a[1..], kw, &["real", "imag"], 0)?;
+    if let (Some(v @ Value::Obj(o)), None) = (&b[0], &b[1]) {
+        if o.cls.is_none() && matches!(o.kind, Kind::Complex(..)) && Rc::ptr_eq(&cls, &it.types.complex) {
+            return Ok(v.clone());
+        }
+    }
     let (mut re, mut im) = (0.0, 0.0);
-    let parts = |it: &mut Interp, v: &Value| -> R<(f64, f64)> {
+    let parts = |it: &mut Interp, v: &Value, first: bool| -> R<(f64, f64)> {
         if let Value::Obj(o) = v {
-            if let Kind::Complex(r, i) = &o.kind {
-                return Ok((*r, *i));
+            if let Kind::Complex(..) = &o.kind {
+                return it.complex_arg(v);
+            }
+            if first && o.cls.is_some() && it.user_special(v, "__complex__").is_some() {
+                return it.complex_arg(v);
             }
             if let Kind::Str(s) = &o.kind {
+                if !first {
+                    return Err(it.type_error("complex() second arg can't be a string"));
+                }
                 return match parse_complex(&s.s) {
                     Some(p) => Ok(p),
                     None => Err(it.value_error("complex() arg is a malformed string")),
@@ -365,21 +376,31 @@ fn complex_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         }
         match it.float_arg(v) {
             Ok(f) => Ok((f, 0.0)),
+            Err(e) if !it.exc_is(&e, "TypeError") => Err(e),
             Err(_) => {
                 let t = it.type_name_of(v);
-                Err(it.type_error(&format!("complex() first argument must be a string or a number, not '{}'", t)))
+                Err(it.type_error(&if first {
+                    format!("complex() first argument must be a string or a number, not '{t}'")
+                } else {
+                    format!("complex() second argument must be a number, not '{t}'")
+                }))
             }
         }
     };
+    if let (Some(Value::Obj(o)), Some(_)) = (&b[0], &b[1]) {
+        if matches!(o.kind, Kind::Str(_)) {
+            return Err(it.type_error("complex() can't take second arg if first is a string"));
+        }
+    }
     let mut first_complex = false;
     if let Some(r) = &b[0] {
-        let (x, y) = parts(it, r)?;
-        first_complex = matches!(r, Value::Obj(o) if matches!(o.kind, Kind::Complex(..) | Kind::Str(_)));
+        let (x, y) = parts(it, r, true)?;
+        first_complex = matches!(r, Value::Obj(o) if matches!(o.kind, Kind::Complex(..) | Kind::Str(_)) || (o.cls.is_some() && it.user_special(r, "__complex__").is_some()));
         re = x;
         im = y;
     }
     if let Some(i) = &b[1] {
-        let (x, y) = parts(it, i)?;
+        let (x, y) = parts(it, i, false)?;
         if matches!(i, Value::Obj(o) if matches!(o.kind, Kind::Complex(..))) {
             re -= y;
             im += x;
@@ -633,6 +654,26 @@ fn float_getformat(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::string(format!("IEEE, {order}-endian")))
 }
 
+fn complex_self(it: &mut Interp, v: &Value, meth: &str) -> R<(f64, f64)> {
+    match v {
+        Value::Obj(o) => match &o.kind {
+            Kind::Complex(re, im) => Ok((*re, *im)),
+            _ => Err(it.type_error(&format!("descriptor '{meth}' requires a 'complex' object"))),
+        },
+        _ => Err(it.type_error(&format!("descriptor '{meth}' requires a 'complex' object"))),
+    }
+}
+
+fn complex_complex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let (re, im) = complex_self(it, &a[0], "__complex__")?;
+    Ok(Value::Obj(Object::new(Kind::Complex(re, im))))
+}
+
+fn complex_getnewargs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let (re, im) = complex_self(it, &a[0], "__getnewargs__")?;
+    Ok(Value::tuple(vec![Value::Float(re), Value::Float(im)]))
+}
+
 fn complex_conjugate(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     match &a[0] {
         Value::Obj(o) => match &o.kind {
@@ -846,6 +887,8 @@ pub fn init(it: &mut Interp) {
 
     it.reg_new(&complex, complex_new);
     it.reg(&complex, "conjugate", complex_conjugate);
+    it.reg(&complex, "__complex__", complex_complex);
+    it.reg(&complex, "__getnewargs__", complex_getnewargs);
     it.reg(&complex, "__neg__", u_neg);
     it.reg(&complex, "__pos__", u_pos);
     it.reg(&complex, "__abs__", u_abs);

@@ -131,12 +131,16 @@ impl Interp {
     }
 
     pub fn compile_source(&mut self, src: &str, filename: &str) -> R<Rc<crate::bytecode::Code>> {
+        self.compile_source_mode(src, filename, false)
+    }
+
+    pub fn compile_source_mode(&mut self, src: &str, filename: &str, interactive: bool) -> R<Rc<crate::bytecode::Code>> {
         let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(src, filename));
         let module = match parsed {
             Ok(m) => m,
             Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), src)),
         };
-        match crate::compile::compile_module(&module, filename) {
+        match crate::compile::compile_module(&module, filename, interactive) {
             Ok(c) => Ok(c),
             Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, None, src)),
         }
@@ -264,8 +268,10 @@ impl Interp {
     }
 
     pub fn import_module(&mut self, full: &str) -> R<Obj> {
-        if let Some(Value::Obj(m)) = dict_get_str(&self.modules, full) {
-            return Ok(m);
+        match dict_get_str(&self.modules, full) {
+            Some(Value::Obj(m)) => return Ok(m),
+            Some(Value::None) => return Err(self.module_not_found(full, format!("import of {full} halted; None in sys.modules"))),
+            _ => {}
         }
         if let Some(m) = crate::builtins::modules::builtin_module(self, full) {
             self.register_module(full, &m);

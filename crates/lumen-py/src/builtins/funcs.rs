@@ -128,7 +128,12 @@ fn abs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             match &o.kind {
                 Kind::Int(b) => return Ok(Value::big(b.abs())),
                 Kind::Float(f) => return Ok(Value::Float(f.abs())),
-                Kind::Complex(r, i) => return Ok(Value::Float(fmath::hypot(*r, *i))),
+                Kind::Complex(r, i) => {
+                    return match lumen_common::float::complex::abs(lumen_common::float::complex::Complex::new(*r, *i)) {
+                        Ok(f) => Ok(Value::Float(f)),
+                        Err(_) => Err(it.overflow_err("absolute value too large")),
+                    }
+                }
                 _ => {}
             }
         }
@@ -548,6 +553,10 @@ fn pow(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             if it.user_special(&base, "__pow__").is_some() {
                 return it.call_method(&base, "__pow__", vec![exp, m]);
             }
+            let is_complex = |v: &Value| matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Complex(..)));
+            if is_complex(&base) || is_complex(&exp) {
+                return Err(it.value_error("complex modulo"));
+            }
             Err(it.type_error("pow() 3rd argument not allowed unless all arguments are integers"))
         }
     }
@@ -915,7 +924,8 @@ fn compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     }
     let code = match mode.as_str() {
         "eval" => it.compile_eval_str(&src, &filename)?,
-        "exec" | "single" => it.compile_source(&src, &filename)?,
+        "exec" => it.compile_source(&src, &filename)?,
+        "single" => it.compile_source_mode(&src, &filename, true)?,
         _ => return Err(it.value_error("compile() mode must be 'exec', 'eval' or 'single'")),
     };
     Ok(Value::Obj(Object::new(Kind::Code(code))))

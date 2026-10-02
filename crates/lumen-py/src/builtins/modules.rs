@@ -13,12 +13,14 @@ fn bound<M: lumen_bind::Module<crate::bind::PyHost>>(it: &mut Interp) -> Option<
 /// The native modules, sorted by name (also `sys.builtin_module_names`).
 const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_ast", bound::<super::astm::_ast::Module>),
+    ("_bisect", bound::<super::bisectm::_bisect::Module>),
     ("_blake2", bound::<super::hashlibm::_blake2::Module>),
     ("_codecs", |it| Some(super::codecsm::make(it))),
     ("_collections", |it| Some(super::collectionsm::make(it))),
     ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
     ("_csv", bound::<super::csvm::_csv::Module>),
     ("_hashlib", bound::<super::hashlibm::_hashlib::Module>),
+    ("_heapq", bound::<super::heapqm::_heapq::Module>),
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
     ("_md5", bound::<super::hashlibm::_md5::Module>),
@@ -43,6 +45,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("atexit", |it| Some(super::sysmods::make_atexit(it))),
     ("binascii", bound::<super::binasciim::binascii::Module>),
     ("builtins", |it| Some(super::sysmods::make_builtins(it))),
+    ("cmath", bound::<super::cmathm::cmath::Module>),
     ("errno", bound::<super::errnom::errno::Module>),
     ("gc", |it| Some(super::sysmods::make_gc(it))),
     ("itertools", bound::<super::itertools::itertools::Module>),

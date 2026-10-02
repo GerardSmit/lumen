@@ -122,11 +122,61 @@ impl Interp {
             };
         }
         if self.has_index(v) {
-            let i = self.index_of(v)?;
-            return Ok(i as f64);
+            let i = crate::bind::index(self, v)?;
+            return self.float_arg(&i);
         }
         let t = self.type_name_of(v);
         Err(self.type_error(&format!("must be real number, not {}", t)))
+    }
+
+    /// Calls `sys.displayhook(v)`, as an interactive expression statement does.
+    pub fn display_hook(&mut self, v: Value) -> R<Value> {
+        let hook = self.sys_module.clone().and_then(|m| dict_get_str(&self.module_dict(&m), "displayhook"));
+        match hook {
+            Some(h) => self.call(&h, vec![v], Vec::new()),
+            None => Err(self.runtime_error("lost sys.displayhook")),
+        }
+    }
+
+    /// CPython's `PyComplex_AsCComplex`: a complex, the result of `__complex__`, or a real number.
+    pub fn complex_arg(&mut self, v: &Value) -> R<(f64, f64)> {
+        if let Value::Obj(o) = v {
+            if let Kind::Complex(r, i) = &o.kind {
+                if o.cls.is_none() {
+                    return Ok((*r, *i));
+                }
+            }
+        }
+        let cls = self.type_of(v);
+        if let Some(m) = self.lookup_mro(&cls, "__complex__") {
+            let b = self.bind_descr(&m, v, &cls)?;
+            let r = self.call(&b, Vec::new(), Vec::new())?;
+            return match &r {
+                Value::Obj(o) if matches!(o.kind, Kind::Complex(..)) => {
+                    if o.cls.is_some() {
+                        let t = self.type_name_of(&r);
+                        let msg = format!(
+                            "__complex__ returned non-complex (type {t}).  The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python."
+                        );
+                        crate::builtins::warningsm::warn_category(self, "DeprecationWarning", &msg, 1)?;
+                    }
+                    match &o.kind {
+                        Kind::Complex(re, im) => Ok((*re, *im)),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => {
+                    let t = self.type_name_of(&r);
+                    Err(self.type_error(&format!("__complex__ returned non-complex (type {})", t)))
+                }
+            };
+        }
+        if let Value::Obj(o) = v {
+            if let Kind::Complex(r, i) = &o.kind {
+                return Ok((*r, *i));
+            }
+        }
+        Ok((self.float_arg(v)?, 0.0))
     }
 
     pub fn list_val(&self, v: Vec<Value>) -> Value {

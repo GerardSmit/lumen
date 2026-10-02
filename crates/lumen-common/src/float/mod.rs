@@ -2,6 +2,7 @@
 //! libm does: shortest round-trip formatting, exact summation, Euclidean norms, gamma and the error
 //! functions.
 
+pub mod complex;
 mod erf;
 mod fsum;
 mod gamma;

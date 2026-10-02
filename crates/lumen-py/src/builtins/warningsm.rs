@@ -131,6 +131,15 @@ fn warn_explicit_impl(it: &mut Interp, message: &Value, category: &Value, filena
     }
 }
 
+/// `warnings.warn(msg, category, stacklevel)` for a builtin warning category, from native code.
+pub fn warn_category(it: &mut Interp, category: &str, msg: &str, stacklevel: i64) -> R<()> {
+    let m = it.import_module("_warnings")?;
+    let f = it.get_attr_str(&Value::Obj(m), "warn")?;
+    let cat = Value::Obj(it.exc_type(category));
+    it.call(&f, vec![Value::str(msg), cat, Value::Int(stacklevel)], Vec::new())?;
+    Ok(())
+}
+
 fn warn(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let b = it.bind_args("warn", a, kw, &["message", "category", "stacklevel", "source"], 1)?;
     let message = b[0].clone().unwrap();

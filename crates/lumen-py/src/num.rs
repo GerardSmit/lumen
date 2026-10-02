@@ -301,9 +301,11 @@ impl Interp {
             return Err(self.zero_div("zero to a negative power"));
         }
         if x < 0.0 && y.is_finite() && y != fmath::floor(y) {
-            let r = fmath::powf(-x, y);
-            let ang = std::f64::consts::PI * y;
-            return Ok(Value::Obj(Object::new(Kind::Complex(r * fmath::cos(ang), r * fmath::sin(ang)))));
+            use lumen_common::float::complex::{pow, Complex};
+            return match pow(Complex::new(x, 0.0), Complex::new(y, 0.0)) {
+                Ok(z) => Ok(Value::Obj(Object::new(Kind::Complex(z.re, z.im)))),
+                Err(_) => Err(self.overflow_err("complex exponentiation")),
+            };
         }
         let r = fmath::powf(x, y);
         if r.is_infinite() && x.is_finite() && y.is_finite() {

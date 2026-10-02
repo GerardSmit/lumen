@@ -1315,7 +1315,11 @@ impl Interp {
                 }
                 Op::CallIntrinsic1(k) => {
                     let v = pop!();
-                    let r = crate::builtins::typingm::intrinsic1(self, k, v)?;
+                    let r = if k == crate::bytecode::INTRINSIC1_PRINT {
+                        self.display_hook(v)?
+                    } else {
+                        crate::builtins::typingm::intrinsic1(self, k, v)?
+                    };
                     push!(r);
                 }
                 Op::CallIntrinsic2(k) => {

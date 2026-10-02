@@ -72,13 +72,15 @@ struct Compiler<'a> {
     st: SymTable,
     units: Vec<Unit<'a>>,
     filename: Rc<str>,
+    /// `compile(..., 'single')`: module-level expression statements go to `sys.displayhook`.
+    interactive: bool,
 }
 
 type CResult<T> = Result<T, CompileError>;
 
-pub fn compile_module(m: &Module, filename: &str) -> CResult<Rc<Code>> {
+pub fn compile_module(m: &Module, filename: &str, interactive: bool) -> CResult<Rc<Code>> {
     let st = symtable::build(m).map_err(|e| CompileError { msg: e.msg, line: e.line })?;
-    let mut c = Compiler { st, units: Vec::new(), filename: filename.into() };
+    let mut c = Compiler { st, units: Vec::new(), filename: filename.into(), interactive };
     c.push_unit(0, UnitKind::Module, "<module>".into(), "<module>".into());
     if let Some(d) = docstring(&m.body) {
         c.load_const(Value::str(&d));
@@ -95,7 +97,7 @@ pub fn compile_module(m: &Module, filename: &str) -> CResult<Rc<Code>> {
 
 pub fn compile_eval(e: &Expr, filename: &str) -> CResult<Rc<Code>> {
     let st = symtable::build_expr(e).map_err(|e| CompileError { msg: e.msg, line: e.line })?;
-    let mut c = Compiler { st, units: Vec::new(), filename: filename.into() };
+    let mut c = Compiler { st, units: Vec::new(), filename: filename.into(), interactive: false };
     c.push_unit(0, UnitKind::Module, "<module>".into(), "<module>".into());
     c.expr(e)?;
     c.emit(Op::ReturnValue);
@@ -480,6 +482,12 @@ impl<'a> Compiler<'a> {
         self.u().line = s.pos.line;
         match &s.kind {
             StmtKind::Expr(e) => {
+                if self.interactive && self.units.len() == 1 {
+                    self.expr(e)?;
+                    self.emit(Op::CallIntrinsic1(INTRINSIC1_PRINT));
+                    self.emit(Op::Pop);
+                    return Ok(());
+                }
                 if matches!(e.kind, ExprKind::Constant(_)) {
                     return Ok(());
                 }

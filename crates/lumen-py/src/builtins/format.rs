@@ -173,11 +173,14 @@ impl Interp {
                     return Ok(crate::repr::complex_repr(*re, *im));
                 }
                 let sp = self.parse_spec(spec, "complex")?;
+                if sp.zero {
+                    return Err(self.value_error("Zero padding is not allowed in complex format specifier"));
+                }
                 if matches!(sp.align, Some('=')) {
                     return Err(self.value_error("'=' alignment flag is not allowed in complex format specifier"));
                 }
                 let body = match sp.ty {
-                    None if sp.precision.is_none() => crate::repr::complex_repr(*re, *im),
+                    None if sp.precision.is_none() && sp.grouping.is_none() => crate::repr::complex_repr(*re, *im),
                     ty => {
                         let ty = ty.unwrap_or('r');
                         let part_spec = |plus: bool| {
@@ -187,8 +190,14 @@ impl Interp {
                             } else if let Some(sg) = sp.sign {
                                 s.push(sg);
                             }
+                            if sp.z {
+                                s.push('z');
+                            }
                             if sp.alt {
                                 s.push('#');
+                            }
+                            if let Some(g) = sp.grouping {
+                                s.push(g);
                             }
                             if let Some(p) = sp.precision {
                                 s.push_str(&format!(".{}", p));
@@ -199,10 +208,12 @@ impl Interp {
                             s
                         };
                         let show_re = !(*re == 0.0 && re.is_sign_positive() && sp.ty.is_none());
-                        let i = self.format_float(*im, &part_spec(show_re))?;
-                        let j = if matches!(ty, 'E' | 'F' | 'G') { 'J' } else { 'j' };
+                        // Without a type the parts are reprs, which complex shows without ".0".
+                        let part = |s: String| if sp.ty.is_none() { s.strip_suffix(".0").map(str::to_string).unwrap_or(s) } else { s };
+                        let i = part(self.format_float(*im, &part_spec(show_re))?);
+                        let j = 'j';
                         if show_re {
-                            let r = self.format_float(*re, &part_spec(false))?;
+                            let r = part(self.format_float(*re, &part_spec(false))?);
                             let paren = sp.ty.is_none();
                             format!("{}{}{}{}{}{}", if paren { "(" } else { "" }, r, i, j, "", if paren { ")" } else { "" })
                         } else {
@@ -626,7 +637,11 @@ fn fmt_general(a: f64, prec: usize, alt: bool) -> String {
         let decimals = (p as i32 - 1 - x).max(0) as usize;
         let s = format!("{:.*}", decimals, a);
         if alt {
-            s
+            if s.contains('.') {
+                s
+            } else {
+                s + "."
+            }
         } else {
             strip_zeros(&s)
         }

@@ -125,7 +125,10 @@ impl Interp {
                         let t = self.type_name_of(v);
                         return Err(self.type_error(&format!("unhashable type: '{}'", t)));
                     }
-                    Kind::Complex(re, im) => hash_float(*re).wrapping_add(hash_float(*im).wrapping_mul(1000003)),
+                    Kind::Complex(re, im) => match hash_float(*re).wrapping_add(hash_float(*im).wrapping_mul(1000003)) {
+                        -1 => -2,
+                        h => h,
+                    },
                     Kind::Slice(..) => {
                         let t = self.type_name_of(v);
                         return Err(self.type_error(&format!("unhashable type: '{}'", t)));

@@ -1,7 +1,6 @@
 //! Operator protocols: truthiness, comparison, arithmetic, subscripting, containment.
 
 use crate::ast::{BinOp, CmpOp};
-use crate::fmath;
 use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::UnOp;
 use crate::containers::pydict_of;
@@ -9,6 +8,8 @@ use crate::dict::PyDict;
 use crate::num::*;
 use crate::object::*;
 use crate::vm::*;
+use lumen_common::float::complex::{self, Complex};
+use lumen_common::float::MathError;
 use lumen_common::limits::size;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -368,20 +369,18 @@ impl Interp {
                 },
                 _ => None,
             };
-            let real = |s: &mut Self, v: &Value| -> Option<f64> {
-                if cx(v).is_some() {
-                    return None;
-                }
-                to_num(v)?;
-                s.float_arg(v).ok()
-            };
             let pair = match (cx(a), cx(b)) {
-                (Some(p), None) => real(self, b).map(|f| (p, (f, 0.0))),
-                (None, Some(q)) => real(self, a).map(|f| ((f, 0.0), q)),
+                (Some(p), None) => Some((p, b)),
+                (None, Some(q)) => Some((q, a)),
                 _ => None,
             };
-            if let Some((p, q)) = pair {
-                return Ok(Some((p == q) == (op == CmpOp::Eq)));
+            // A complex equals a real number only when its imaginary part is zero and its real part
+            // equals the number exactly.
+            if let Some(((re, im), other)) = pair {
+                if let Some(n) = to_num(other) {
+                    let eq = im == 0.0 && to_num(&Value::Float(re)).and_then(|x| num_cmp(&x, &n)) == Some(Ordering::Equal);
+                    return Ok(Some(eq == (op == CmpOp::Eq)));
+                }
             }
         }
         if let (Some(x), Some(y)) = (to_num(a), to_num(b)) {
@@ -578,10 +577,18 @@ impl Interp {
                 return Ok(r);
             }
         }
+        // Mixed int/float/complex arithmetic is the wider type's slot: when that is `b`'s, its
+        // reflected method runs before the native fallback.
+        let b_wider = !b_first && differ && b_user && numeric_rank(a) > 0 && numeric_rank(b) > numeric_rank(a);
+        if b_wider {
+            if let Some(r) = self.call_cmp_user(b, a, rev)? {
+                return Ok(r);
+            }
+        }
         if let Some(v) = self.native_binop(op, a, b)? {
             return Ok(v);
         }
-        if !b_first && differ && b_user {
+        if !b_first && !b_wider && differ && b_user {
             if let Some(r) = self.call_cmp_user(b, a, rev)? {
                 return Ok(r);
             }
@@ -997,22 +1004,23 @@ impl Interp {
     }
 
     fn complex_binop(&mut self, op: BinOp, a: &Value, b: &Value) -> R<Option<Value>> {
-        let get = |v: &Value| -> Option<(f64, f64)> {
-            match v {
+        let get = |v: &Value| -> Option<Result<(f64, f64), ()>> {
+            Some(Ok(match v {
                 Value::Obj(o) => match &o.kind {
-                    Kind::Complex(r, i) => Some((*r, *i)),
-                    Kind::Int(b) => b.to_float().map(|f| (f, 0.0)),
-                    Kind::Float(f) => Some((*f, 0.0)),
-                    _ => None,
+                    Kind::Complex(r, i) => (*r, *i),
+                    Kind::Int(b) => return Some(b.to_float().map(|f| (f, 0.0)).ok_or(())),
+                    Kind::Float(f) => (*f, 0.0),
+                    _ => return None,
                 },
-                Value::Int(i) => Some((*i as f64, 0.0)),
-                Value::Bool(b) => Some((*b as i64 as f64, 0.0)),
-                Value::Float(f) => Some((*f, 0.0)),
-                _ => None,
-            }
+                Value::Int(i) => (*i as f64, 0.0),
+                Value::Bool(b) => (*b as i64 as f64, 0.0),
+                Value::Float(f) => (*f, 0.0),
+                _ => return None,
+            }))
         };
         let ((a1, b1), (a2, b2)) = match (get(a), get(b)) {
-            (Some(x), Some(y)) => (x, y),
+            (Some(Ok(x)), Some(Ok(y))) => (x, y),
+            (Some(_), Some(_)) => return Err(self.overflow_err("int too large to convert to float")),
             _ => return Ok(None),
         };
         let mk = |r: f64, i: f64| Some(Value::Obj(Object::new(Kind::Complex(r, i))));
@@ -1020,47 +1028,15 @@ impl Interp {
             BinOp::Add => mk(a1 + a2, b1 + b2),
             BinOp::Sub => mk(a1 - a2, b1 - b2),
             BinOp::Mult => mk(a1 * a2 - b1 * b2, a1 * b2 + b1 * a2),
-            BinOp::Div => {
-                let d = a2 * a2 + b2 * b2;
-                if d == 0.0 {
-                    return Err(self.zero_div("division by zero"));
-                }
-                mk((a1 * a2 + b1 * b2) / d, (b1 * a2 - a1 * b2) / d)
-            }
-            BinOp::Pow => {
-                if a2 == 0.0 && b2 == 0.0 {
-                    return Ok(mk(1.0, 0.0));
-                }
-                if b2 == 0.0 && a2 == fmath::trunc(a2) && a2.abs() <= 100.0 {
-                    let mul = |x: (f64, f64), y: (f64, f64)| (x.0 * y.0 - x.1 * y.1, x.0 * y.1 + x.1 * y.0);
-                    let mut n = a2.abs() as u32;
-                    let (mut result, mut base) = ((1.0, 0.0), (a1, b1));
-                    while n > 0 {
-                        if n & 1 == 1 {
-                            result = mul(result, base);
-                        }
-                        base = mul(base, base);
-                        n >>= 1;
-                    }
-                    if a2 < 0.0 {
-                        let d = result.0 * result.0 + result.1 * result.1;
-                        if d == 0.0 {
-                            return Err(self.zero_div("zero to a negative power"));
-                        }
-                        result = (result.0 / d, -result.1 / d);
-                    }
-                    return Ok(mk(result.0, result.1));
-                }
-                let r = fmath::sqrt(a1 * a1 + b1 * b1);
-                let theta = fmath::atan2(b1, a1);
-                if r == 0.0 {
-                    return Ok(mk(0.0, 0.0));
-                }
-                let lnr = fmath::ln(r);
-                let nr = fmath::exp(a2 * lnr - b2 * theta);
-                let nt = b2 * lnr + a2 * theta;
-                mk(nr * fmath::cos(nt), nr * fmath::sin(nt))
-            }
+            BinOp::Div => match complex::quot(Complex::new(a1, b1), Complex::new(a2, b2)) {
+                Some(z) => mk(z.re, z.im),
+                None => return Err(self.zero_div("complex division by zero")),
+            },
+            BinOp::Pow => match complex::pow(Complex::new(a1, b1), Complex::new(a2, b2)) {
+                Ok(z) => mk(z.re, z.im),
+                Err(MathError::Domain) => return Err(self.zero_div("0.0 to a negative or complex power")),
+                Err(MathError::Range) => return Err(self.overflow_err("complex exponentiation")),
+            },
             _ => None,
         })
     }
@@ -2128,5 +2104,20 @@ mod tests {
         assert_eq!(n(r(0, 10, -1)), "0");
         assert_eq!(n(r(5, 5, 1)), "0");
         assert_eq!(n(r(-(1 << 70), 1 << 70, 1 << 69)), "4");
+    }
+}
+
+/// The position of a builtin number in the int < float < complex tower; 0 for anything else.
+fn numeric_rank(v: &Value) -> u8 {
+    match v {
+        Value::Int(_) | Value::Bool(_) => 1,
+        Value::Float(_) => 2,
+        Value::Obj(o) => match o.kind {
+            Kind::Int(_) => 1,
+            Kind::Float(_) => 2,
+            Kind::Complex(..) => 3,
+            _ => 0,
+        },
+        _ => 0,
     }
 }
