@@ -19,6 +19,7 @@ pub mod zlib {
     #![allow(clippy::new_ret_no_self)]
 
     use crate::bind::{opaque_instance, Py, This};
+    use crate::builtins::decompressor::{Chunk, Codec, Decompressor, Failure};
     use crate::object::*;
     use crate::vm::{dict_set_str, Interp};
     use lumen_common::compress::{self as zc, ZStream, Z_BUF_ERROR, Z_FINISH, Z_NEED_DICT, Z_OK, Z_STREAM_END, Z_STREAM_ERROR};
@@ -527,13 +528,33 @@ pub mod zlib {
     ///      compressor that produced the input data.
     #[class(name = "_ZlibDecompressor", module = "zlib", hint(py(final)))]
     pub struct ZlibDecompressor {
+        core: Decompressor<Inflate>,
+    }
+
+    struct Inflate {
+        /// `None` once the end of the stream was reached.
         z: Option<ZStream>,
         zdict: Option<Vec<u8>>,
-        /// Input not yet consumed by zlib.
-        pending: Vec<u8>,
-        unused_data: Vec<u8>,
-        eof: bool,
-        needs_input: bool,
+    }
+
+    impl Codec for Inflate {
+        type Error = i32;
+
+        fn run(&mut self, input: &[u8], max: Option<usize>) -> Result<Chunk, i32> {
+            let Some(z) = self.z.as_mut() else {
+                return Ok(Chunk { out: Vec::new(), consumed: 0, eof: false, room: true });
+            };
+            let first = max.map_or(DEF_BUF_SIZE, |m| m.min(MAX_INITIAL_BUF));
+            let r = drive(z, input, Z_SYNC_FLUSH, first, max, self.zdict.as_deref());
+            if !matches!(r.code, Z_OK | Z_BUF_ERROR | Z_STREAM_END) {
+                return Err(r.code);
+            }
+            let eof = r.code == Z_STREAM_END;
+            if eof {
+                self.z = None;
+            }
+            Ok(Chunk { out: r.out, consumed: r.consumed, eof, room: true })
+        }
     }
 
     #[methods]
@@ -547,8 +568,7 @@ pub mod zlib {
             };
             let z = new_inflate(it, wbits, zdict.as_deref())?;
             let Value::Obj(cls) = &cls.0 else { unreachable!() };
-            let d = ZlibDecompressor { z: Some(z), zdict, pending: Vec::new(), unused_data: Vec::new(), eof: false, needs_input: true };
-            Ok(opaque_instance(cls, d))
+            Ok(opaque_instance(cls, ZlibDecompressor { core: Decompressor::new(Inflate { z: Some(z), zdict }) }))
         }
 
         /// Decompress *data*, returning uncompressed data as bytes.
@@ -567,55 +587,31 @@ pub mod zlib {
         /// the unused_data attribute.
         fn decompress(slf: This<Py<Self>>, it: &mut Interp, #[kw] data: &Value, #[kw] #[default(-1)] max_length: i64) -> R<Vec<u8>> {
             let data = buffer(it, data)?;
+            let max = (0..i64::MAX).contains(&max_length).then_some(max_length as usize);
             let mut guard = slf.0.borrow_mut(it)?;
             let s = &mut *guard;
-            if s.eof {
-                drop(guard);
-                return Err(it.new_exc_str("EOFError", "End of stream already reached"));
-            }
-            let Some(z) = s.z.as_mut() else { return Ok(Vec::new()) };
-            s.pending.extend_from_slice(&data);
-            let (first, max) = if max_length < 0 || max_length == i64::MAX {
-                (DEF_BUF_SIZE, None)
-            } else {
-                ((max_length as usize).min(MAX_INITIAL_BUF), Some(max_length as usize))
-            };
-            let r = drive(z, &s.pending, Z_SYNC_FLUSH, first, max, s.zdict.as_deref());
-            if !matches!(r.code, Z_OK | Z_BUF_ERROR | Z_STREAM_END) {
-                let e = zlib_error(it, Some(z), r.code, "while decompressing data");
-                s.pending.clear();
-                return Err(e);
-            }
-            s.pending.drain(..r.consumed);
-            if r.code == Z_STREAM_END {
-                s.eof = true;
-                s.z = None;
-                s.needs_input = false;
-                if !s.pending.is_empty() {
-                    s.unused_data = std::mem::take(&mut s.pending);
-                }
-            } else {
-                s.needs_input = s.pending.is_empty();
-            }
-            Ok(r.out)
+            s.core.decompress(&data, max).map_err(|e| match e {
+                Failure::AtEof => it.new_exc_str("EOFError", "End of stream already reached"),
+                Failure::Codec(code) => zlib_error(it, s.core.codec.z.as_ref(), code, "while decompressing data"),
+            })
         }
 
         /// True if the end-of-stream marker has been reached.
         #[getter]
         fn eof(&self) -> bool {
-            self.eof
+            self.core.eof
         }
 
         /// Data found after the end of the compressed stream.
         #[getter]
         fn unused_data(&self) -> Vec<u8> {
-            self.unused_data.clone()
+            self.core.unused_data.clone()
         }
 
         /// True if more input is needed before more decompressed data can be produced.
         #[getter]
         fn needs_input(&self) -> bool {
-            self.needs_input
+            self.core.needs_input
         }
     }
 

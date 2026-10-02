@@ -7,6 +7,7 @@ pub mod _lzma {
     #![allow(clippy::new_ret_no_self)]
 
     use crate::bind::{opaque_instance, Py, This};
+    use crate::builtins::decompressor::{make_room, Chunk, Codec, Decompressor, Failure, INITIAL_BLOCK};
     use crate::object::*;
     use crate::pyint::PyInt;
     use crate::vm::{dict_set_str, Interp};
@@ -21,7 +22,6 @@ pub mod _lzma {
     const FORMAT_ALONE: i64 = 2;
     const FORMAT_RAW: i64 = 3;
     const CHECK_UNKNOWN: i64 = CHECK_ID_MAX as i64 + 1;
-    const INITIAL_BLOCK: usize = 8 * 1024;
 
     #[derive(Default)]
     pub struct State {
@@ -244,21 +244,6 @@ pub mod _lzma {
         build_filter_spec(it, &f)
     }
 
-    /// Grows `out` when its window is exhausted; `false` once `limit` forbids more room.
-    fn make_room(out: &mut Vec<u8>, produced: usize, limit: Option<usize>) -> bool {
-        if produced < out.len() {
-            return true;
-        }
-        let grow = out.len().max(INITIAL_BLOCK);
-        let len = match limit {
-            Some(m) if produced >= m => return false,
-            Some(m) => (out.len() + grow).min(m),
-            None => out.len() + grow,
-        };
-        out.resize(len, 0);
-        true
-    }
-
     /// `compress`: `LZMA_RUN` until the input is taken, or `LZMA_FINISH` until the stream ends.
     fn encode(z: &mut XzStream, finish: bool, input: &[u8]) -> Result<Vec<u8>, XzError> {
         let mut out: Vec<u8> = Vec::new();
@@ -442,53 +427,48 @@ pub mod _lzma {
     /// For one-shot decompression, use the decompress() function instead.
     #[class(name = "LZMADecompressor", module = "_lzma", hint(py(final)))]
     pub struct LZMADecompressor {
-        z: XzStream,
-        check: i64,
-        eof: bool,
-        unused_data: Vec<u8>,
-        needs_input: bool,
-        /// Input not yet consumed by liblzma.
-        pending: Vec<u8>,
+        core: Decompressor<Lzma>,
     }
 
-    impl LZMADecompressor {
-        /// `decompress_buf`: at most `max` bytes out; `pending` is advanced past what was consumed.
-        /// Returns the output and whether the output window was left with room.
-        fn drive(&mut self, max: Option<usize>) -> Result<(Vec<u8>, bool), XzError> {
+    struct Lzma {
+        z: XzStream,
+        check: i64,
+    }
+
+    impl Codec for Lzma {
+        type Error = XzError;
+
+        /// `decompress_buf`: at most `max` bytes out.
+        fn run(&mut self, input: &[u8], max: Option<usize>) -> Result<Chunk, XzError> {
             let first = max.map_or(INITIAL_BLOCK, |m| m.min(INITIAL_BLOCK));
             let mut out = vec![0u8; first];
             let (mut consumed, mut produced) = (0, 0);
-            let result = loop {
-                let step = self.z.code(false, &self.pending[consumed..], &mut out[produced..]);
+            let mut eof = false;
+            loop {
+                let step = self.z.code(false, &input[consumed..], &mut out[produced..]);
                 consumed += step.consumed;
                 produced += step.produced;
                 let status = match step.status {
-                    Err(XzError::Buf) if consumed == self.pending.len() && produced < out.len() => Ok(XzStatus::Ok),
+                    Err(XzError::Buf) if consumed == input.len() && produced < out.len() => Ok(XzStatus::Ok),
                     other => other,
-                };
-                let status = match status {
-                    Ok(s) => s,
-                    Err(e) => break Err(e),
-                };
+                }?;
                 if matches!(status, XzStatus::GetCheck | XzStatus::NoCheck) {
                     self.check = self.z.check() as i64;
                 }
                 if status == XzStatus::StreamEnd {
-                    self.eof = true;
-                    break Ok(());
+                    eof = true;
+                    break;
                 } else if produced == out.len() {
                     if !make_room(&mut out, produced, max) {
-                        break Ok(());
+                        break;
                     }
-                } else if consumed == self.pending.len() {
-                    break Ok(());
+                } else if consumed == input.len() {
+                    break;
                 }
-            };
-            self.pending.drain(..consumed);
-            result?;
+            }
             let room = produced < out.len();
             out.truncate(produced);
-            Ok((out, room))
+            Ok(Chunk { out, consumed, eof, room })
         }
     }
 
@@ -533,8 +513,7 @@ pub mod _lzma {
             };
             let z = z.map_err(|e| lzma_error(it, e))?;
             let Value::Obj(cls) = &cls.0 else { unreachable!() };
-            let d = LZMADecompressor { z, check, eof: false, unused_data: Vec::new(), needs_input: true, pending: Vec::new() };
-            Ok(opaque_instance(cls, d))
+            Ok(opaque_instance(cls, LZMADecompressor { core: Decompressor::new(Lzma { z, check }) }))
         }
 
         /// Decompress *data*, returning uncompressed data as bytes.
@@ -553,58 +532,36 @@ pub mod _lzma {
         /// the unused_data attribute.
         fn decompress(slf: This<Py<Self>>, it: &mut Interp, #[kw] data: &Value, #[kw] #[default(-1)] max_length: i64) -> R<Vec<u8>> {
             let data = it.buffer_bytes(data)?;
-            let mut guard = slf.0.borrow_mut(it)?;
-            let s = &mut *guard;
-            if s.eof {
-                drop(guard);
-                return Err(it.new_exc_str("EOFError", "Already at end of stream"));
-            }
-            s.pending.extend_from_slice(&data);
             let max = (max_length >= 0).then_some(max_length as usize);
-            match s.drive(max) {
-                Err(e) => {
-                    s.pending.clear();
-                    drop(guard);
-                    Err(lzma_error(it, e))
-                }
-                Ok((out, room)) => {
-                    if s.eof {
-                        s.needs_input = false;
-                        if !s.pending.is_empty() {
-                            s.unused_data = std::mem::take(&mut s.pending);
-                        }
-                    } else if s.pending.is_empty() {
-                        s.needs_input = room;
-                    } else {
-                        s.needs_input = false;
-                    }
-                    Ok(out)
-                }
-            }
+            let result = slf.0.borrow_mut(it)?.core.decompress(&data, max);
+            result.map_err(|e| match e {
+                Failure::AtEof => it.new_exc_str("EOFError", "Already at end of stream"),
+                Failure::Codec(e) => lzma_error(it, e),
+            })
         }
 
         /// ID of the integrity check used by the input stream.
         #[getter]
         fn check(&self) -> i64 {
-            self.check
+            self.core.codec.check
         }
 
         /// True if the end-of-stream marker has been reached.
         #[getter]
         fn eof(&self) -> bool {
-            self.eof
+            self.core.eof
         }
 
         /// True if more input is needed before more decompressed data can be produced.
         #[getter]
         fn needs_input(&self) -> bool {
-            self.needs_input
+            self.core.needs_input
         }
 
         /// Data found after the end of the compressed stream.
         #[getter]
         fn unused_data(&self) -> Vec<u8> {
-            self.unused_data.clone()
+            self.core.unused_data.clone()
         }
     }
 

@@ -9,9 +9,8 @@ pub mod _bz2 {
     use crate::bind::{opaque_instance, Py, This};
     use crate::object::*;
     use crate::vm::Interp;
+    use crate::builtins::decompressor::{make_room, Chunk, Codec, Decompressor, Failure, INITIAL_BLOCK};
     use lumen_common::compress::bz2::{Bz2Decoder, Bz2Encoder, Bz2Error, Bz2Status, Bz2Step};
-
-    const INITIAL_BLOCK: usize = 8 * 1024;
 
     /// `catch_bz2_error`.
     fn bz2_error(it: &mut Interp, e: Bz2Error) -> Obj {
@@ -21,21 +20,6 @@ pub mod _bz2 {
             Bz2Error::Param => it.new_exc_str("SystemError", "Internal error - invalid parameters passed to libbzip2"),
             Bz2Error::Mem => it.new_exc_str("MemoryError", ""),
         }
-    }
-
-    /// Grows `out` when its window is exhausted; `false` once `limit` forbids more room.
-    fn make_room(out: &mut Vec<u8>, produced: usize, limit: Option<usize>) -> bool {
-        if produced < out.len() {
-            return true;
-        }
-        let grow = out.len().max(INITIAL_BLOCK);
-        let len = match limit {
-            Some(m) if produced >= m => return false,
-            Some(m) => (out.len() + grow).min(m),
-            None => out.len() + grow,
-        };
-        out.resize(len, 0);
-        true
     }
 
     /// Implements `compress` and `flush`: runs the encoder until `finish` reaches the end of the
@@ -136,46 +120,39 @@ pub mod _bz2 {
     /// For one-shot decompression, use the decompress() function instead.
     #[class(name = "BZ2Decompressor", module = "_bz2", hint(py(final)))]
     pub struct BZ2Decompressor {
-        dec: Bz2Decoder,
-        /// Input not yet consumed by libbzip2.
-        pending: Vec<u8>,
-        unused_data: Vec<u8>,
-        eof: bool,
-        needs_input: bool,
+        core: Decompressor<Bz2>,
     }
 
-    impl BZ2Decompressor {
-        /// `decompress_buf`: at most `max` bytes out; `pending` is advanced past what was consumed.
-        fn drive(&mut self, max: Option<usize>) -> Result<Vec<u8>, Bz2Error> {
-            let mut out: Vec<u8> = Vec::new();
-            let mut produced = 0;
+    struct Bz2(Bz2Decoder);
+
+    impl Codec for Bz2 {
+        type Error = Bz2Error;
+        const ERROR_STOPS_INPUT: bool = true;
+
+        /// `decompress_buf`: at most `max` bytes out.
+        fn run(&mut self, input: &[u8], max: Option<usize>) -> Result<Chunk, Bz2Error> {
             let first = max.map_or(INITIAL_BLOCK, |m| m.min(INITIAL_BLOCK));
-            out.resize(first, 0);
-            let mut consumed = 0;
-            let result = loop {
-                let step = self.dec.run(&self.pending[consumed..], &mut out[produced..]);
+            let mut out = vec![0u8; first];
+            let (mut consumed, mut produced) = (0, 0);
+            let mut eof = false;
+            loop {
+                let step = self.0.run(&input[consumed..], &mut out[produced..]);
                 consumed += step.consumed;
                 produced += step.produced;
-                match step.status {
-                    Err(e) => break Err(e),
-                    Ok(Bz2Status::StreamEnd) => {
-                        self.eof = true;
-                        break Ok(());
+                match step.status? {
+                    Bz2Status::StreamEnd => {
+                        eof = true;
+                        break;
                     }
-                    Ok(Bz2Status::Ok) => {
-                        if consumed == self.pending.len() {
-                            break Ok(());
-                        }
-                        if produced == out.len() && !make_room(&mut out, produced, max) {
-                            break Ok(());
+                    Bz2Status::Ok => {
+                        if consumed == input.len() || (produced == out.len() && !make_room(&mut out, produced, max)) {
+                            break;
                         }
                     }
                 }
-            };
-            self.pending.drain(..consumed);
-            result?;
+            }
             out.truncate(produced);
-            Ok(out)
+            Ok(Chunk { out, consumed, eof, room: true })
         }
     }
 
@@ -184,14 +161,7 @@ pub mod _bz2 {
         #[constructor]
         fn new(cls: This<Value>, _it: &mut Interp) -> R<Value> {
             let Value::Obj(cls) = &cls.0 else { unreachable!() };
-            let d = BZ2Decompressor {
-                dec: Bz2Decoder::new(),
-                pending: Vec::new(),
-                unused_data: Vec::new(),
-                eof: false,
-                needs_input: true,
-            };
-            Ok(opaque_instance(cls, d))
+            Ok(opaque_instance(cls, BZ2Decompressor { core: Decompressor::new(Bz2(Bz2Decoder::new())) }))
         }
 
         /// Decompress *data*, returning uncompressed data as bytes.
@@ -210,51 +180,30 @@ pub mod _bz2 {
         /// the unused_data attribute.
         fn decompress(slf: This<Py<Self>>, it: &mut Interp, #[kw] data: &Value, #[kw] #[default(-1)] max_length: i64) -> R<Vec<u8>> {
             let data = it.buffer_bytes(data)?;
-            let mut guard = slf.0.borrow_mut(it)?;
-            let s = &mut *guard;
-            if s.eof {
-                drop(guard);
-                return Err(it.new_exc_str("EOFError", "End of stream already reached"));
-            }
-            s.pending.extend_from_slice(&data);
             let max = (max_length >= 0).then_some(max_length as usize);
-            match s.drive(max) {
-                Err(e) => {
-                    s.needs_input = false;
-                    s.pending.clear();
-                    drop(guard);
-                    Err(bz2_error(it, e))
-                }
-                Ok(out) => {
-                    if s.eof {
-                        s.needs_input = false;
-                        if !s.pending.is_empty() {
-                            s.unused_data = std::mem::take(&mut s.pending);
-                        }
-                    } else {
-                        s.needs_input = s.pending.is_empty();
-                    }
-                    Ok(out)
-                }
-            }
+            let result = slf.0.borrow_mut(it)?.core.decompress(&data, max);
+            result.map_err(|e| match e {
+                Failure::AtEof => it.new_exc_str("EOFError", "End of stream already reached"),
+                Failure::Codec(e) => bz2_error(it, e),
+            })
         }
 
         /// True if the end-of-stream marker has been reached.
         #[getter]
         fn eof(&self) -> bool {
-            self.eof
+            self.core.eof
         }
 
         /// Data found after the end of the compressed stream.
         #[getter]
         fn unused_data(&self) -> Vec<u8> {
-            self.unused_data.clone()
+            self.core.unused_data.clone()
         }
 
         /// True if more input is needed before more decompressed data can be produced.
         #[getter]
         fn needs_input(&self) -> bool {
-            self.needs_input
+            self.core.needs_input
         }
     }
 }

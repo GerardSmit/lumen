@@ -37,6 +37,7 @@ pub mod unraisable;
 pub mod functoolsm;
 pub mod genm;
 pub mod bz2m;
+pub mod decompressor;
 pub mod lzmam;
 pub mod pyexpatm;
 pub mod zlibm;
