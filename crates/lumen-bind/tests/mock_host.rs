@@ -183,6 +183,9 @@ impl Host for Mock {
     fn to_bigint(cx: &Cx<'_>, _: &V, _: Slot) -> Result<BigInt, String> {
         Err(format!("{}: no bigints", cx.desc.name))
     }
+    fn is_true(v: &V) -> bool {
+        matches!(v, V::Bool(true))
+    }
     fn to_bool(cx: &Cx<'_>, v: &V, _: Slot) -> Result<bool, String> {
         match v {
             V::Bool(b) => Ok(*b),

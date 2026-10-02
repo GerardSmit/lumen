@@ -7,16 +7,119 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use lumen_host::{CompletionSender, Ctx, TaskId, TaskRegistry, Value};
+use lumen_bind::NativeError;
+use lumen_host::{Ctx, Value};
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+use lumen_host::{CompletionSender, TaskId, TaskRegistry};
 
 pub(crate) use lumen_os::signal::number;
 
-/// `(name)` — the platform's number for signal `name`, or `undefined` if it is not one.
-pub(crate) fn op_signal_number(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(match args.first() {
-        Some(Value::Str(s)) => number(&s.to_string()).map_or(Value::Undefined, |n| Value::Num(n as f64)),
-        _ => Value::Undefined,
-    })
+pub(crate) use bindings::Module;
+
+#[lumen_bind::module(name = "__node")]
+mod bindings {
+    use super::*;
+
+    /// `(name)` - the platform's number for signal `name`, or `undefined` if it is not one.
+    #[op(name = "signalNumber")]
+    fn signal_number(name: Value) -> Option<f64> {
+        match name {
+            Value::Str(s) => number(s.as_ref()).map(|n| n as f64),
+            _ => None,
+        }
+    }
+
+    /// `(name, callback)` - call `callback(signum)` on the event loop whenever the process
+    /// receives signal `name`, without keeping the loop alive. Returns a watch key for
+    /// `signalUnwatch` (`undefined` where signals cannot be watched), or throws a uv-style error
+    /// for a signal that cannot be caught.
+    #[op(name = "signalWatch")]
+    fn signal_watch(ctx: &mut Ctx, name: Value, callback: Value) -> Result<Option<f64>, NativeError> {
+        let Some(sig) = (match name {
+            Value::Str(s) => number(s.as_ref()),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        if !callback.is_callable() {
+            return Err(NativeError::type_error("signalWatch expects a callback"));
+        }
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            let Some(sender) = ctx.op_state().get::<CompletionSender>().cloned() else {
+                return Ok(None);
+            };
+            if imp::catchable(sig) {
+                let registry = ctx.host_mut::<TaskRegistry>().expect("runtime task registry");
+                let task = registry.register_stream(callback, decode_signal);
+                registry.set_unref(task);
+                if let Some(key) = imp::watch(sig, sender, task) {
+                    return Ok(Some(key as f64));
+                }
+                ctx.host_mut::<TaskRegistry>().unwrap().cancel(task);
+            }
+            Err(NativeError::runtime("uv_signal_start EINVAL")
+                .with_code("EINVAL")
+                .with_prop("errno", -libc::EINVAL)
+                .with_prop("syscall", "uv_signal_start"))
+        }
+        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        {
+            let _ = (ctx, sig, callback);
+            Ok(None)
+        }
+    }
+
+    /// `(key)` - stop a `signalWatch`.
+    #[op(name = "signalUnwatch")]
+    fn signal_unwatch(ctx: &mut Ctx, key: Value) {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        if let Value::Num(key) = key {
+            if let Some(task) = imp::unwatch(key as u64) {
+                if let Some(registry) = ctx.host_mut::<TaskRegistry>() {
+                    registry.cancel(task);
+                }
+            }
+        }
+        let _ = (ctx, key);
+    }
+
+    /// `(signum)` - deliver `signum` to this process synchronously if it has a listener for it
+    /// (see `imp::raise_watched`); `false` when it has none and the caller should `kill(2)`.
+    #[op(name = "signalRaise")]
+    fn signal_raise(signum: Value) -> bool {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        if let Value::Num(sig) = signum {
+            return imp::raise_watched(sig as i32);
+        }
+        let _ = signum;
+        false
+    }
+
+    /// `()` - Node's `startSigintWatchdog`.
+    #[op(name = "sigintWatchdogStart")]
+    fn sigint_watchdog_start() {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        imp::watchdog_start();
+    }
+
+    /// `()` - Node's `stopSigintWatchdog`: whether a SIGINT arrived while it was watching.
+    #[op(name = "sigintWatchdogStop")]
+    fn sigint_watchdog_stop() -> bool {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        return imp::watchdog_stop();
+        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        false
+    }
+
+    /// `()` - Node's `watchdogHasPendingSigint`.
+    #[op(name = "sigintWatchdogPending")]
+    fn sigint_watchdog_pending() -> bool {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        return imp::watchdog_pending();
+        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        false
+    }
 }
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -208,75 +311,10 @@ mod imp {
     }
 }
 
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn decode_signal(_ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
     let sig = payload.downcast::<i32>().map(|b| *b).unwrap_or(0);
     Ok(vec![Value::Num(sig as f64)])
-}
-
-/// `(name, callback)` — call `callback(signum)` on the event loop whenever the process receives
-/// signal `name`, without keeping the loop alive. Returns a watch key for `signalUnwatch`
-/// (`undefined` where signals cannot be watched), or throws a uv-style error for a signal that
-/// cannot be caught.
-pub(crate) fn op_signal_watch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let Some(sig) = (match args.first() {
-        Some(Value::Str(s)) => number(&s.to_string()),
-        _ => None,
-    }) else {
-        return Ok(Value::Undefined);
-    };
-    let Some(callback) = args.get(1).filter(|c| c.is_callable()).cloned() else {
-        return Err(ctx.make_error("TypeError", "signalWatch expects a callback"));
-    };
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    {
-        let Some(sender) = ctx.op_state().get::<CompletionSender>().cloned() else {
-            return Ok(Value::Undefined);
-        };
-        if imp::catchable(sig) {
-            let registry = ctx.host_mut::<TaskRegistry>().expect("runtime task registry");
-            let task = registry.register_stream(callback, decode_signal);
-            registry.set_unref(task);
-            if let Some(key) = imp::watch(sig, sender, task) {
-                return Ok(Value::Num(key as f64));
-            }
-            ctx.host_mut::<TaskRegistry>().unwrap().cancel(task);
-        }
-        let err = ctx.make_error("Error", "uv_signal_start EINVAL");
-        let _ = ctx.set_member(&err, "code", Value::str("EINVAL"));
-        let _ = ctx.set_member(&err, "errno", Value::Num(-(libc::EINVAL as f64)));
-        let _ = ctx.set_member(&err, "syscall", Value::str("uv_signal_start"));
-        Err(err)
-    }
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
-    {
-        let _ = (sig, callback);
-        Ok(Value::Undefined)
-    }
-}
-
-/// `(key)` — stop a `signalWatch`.
-pub(crate) fn op_signal_unwatch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    if let Some(Value::Num(key)) = args.first() {
-        if let Some(task) = imp::unwatch(*key as u64) {
-            if let Some(registry) = ctx.host_mut::<TaskRegistry>() {
-                registry.cancel(task);
-            }
-        }
-    }
-    let _ = (ctx, args);
-    Ok(Value::Undefined)
-}
-
-/// `(signum)` — deliver `signum` to this process synchronously if it has a listener for it
-/// (see `imp::raise_watched`); `false` when it has none and the caller should `kill(2)`.
-pub(crate) fn op_signal_raise(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    if let Some(Value::Num(sig)) = args.first() {
-        return Ok(Value::Bool(imp::raise_watched(*sig as i32)));
-    }
-    let _ = args;
-    Ok(Value::Bool(false))
 }
 
 /// A run that a SIGINT breaks (`vm` `breakOnSigint`, the REPL's evaluation): while the guard
@@ -320,27 +358,4 @@ impl Drop for SigintBreak {
             imp::watchdog_stop();
         }
     }
-}
-
-/// `()` — Node's `startSigintWatchdog`.
-pub(crate) fn op_sigint_watchdog_start(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    imp::watchdog_start();
-    Ok(Value::Undefined)
-}
-
-/// `()` — Node's `stopSigintWatchdog`: whether a SIGINT arrived while it was watching.
-pub(crate) fn op_sigint_watchdog_stop(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    return Ok(Value::Bool(imp::watchdog_stop()));
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
-    Ok(Value::Bool(false))
-}
-
-/// `()` — Node's `watchdogHasPendingSigint`.
-pub(crate) fn op_sigint_watchdog_pending(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    return Ok(Value::Bool(imp::watchdog_pending()));
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
-    Ok(Value::Bool(false))
 }

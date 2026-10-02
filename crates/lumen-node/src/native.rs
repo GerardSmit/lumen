@@ -8,11 +8,11 @@
 //! or an 8 MB file read no longer blocks timers and I/O.
 
 use lumen_common::search;
-use lumen::embed::{Ctx, SendError, Value};
+use lumen::embed::SendError;
 
 use crate::codec;
 
-pub(crate) use bindings::*;
+pub(crate) use bindings::Module;
 
 #[lumen_bind::module(name = "native")]
 pub(crate) mod bindings {
@@ -412,9 +412,4 @@ fn write_file(path: String, data: Vec<u8>, mode: String, perm: Option<u32>) -> R
 
 // ---- registration -------------------------------------------------------------------------------
 
-
-/// `__node.native()`: a fresh object holding every op above (called once by preamble.js).
-pub fn op_native(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    ctx.module_object::<Module>()
-}
 }

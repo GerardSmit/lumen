@@ -132,7 +132,7 @@ mod convert;
 mod desc;
 mod host;
 
-pub use convert::{CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, Passed};
+pub use convert::{CtorRet, Elem, Flag, FromArg, FromRest, FromVarKw, IntoError, IntoRet, Lenient, NextRet, Passed};
 pub use desc::{
     camel_case, flags, setter_property, ClassDesc, CodePtr, FnDesc, Hints, ModuleDesc, Owner, Param, ParamKind, Role, Scalar,
     ScalarEntry, Slot, CLASS_GENERIC, PROTOCOLS,
@@ -143,7 +143,7 @@ pub use host::{
 };
 pub use lumen_bind_macros::{class, methods, module, op};
 pub use lumen_common::bigint::BigInt;
-pub use lumen_common::native::{ErrorKind, NativeError, NativeResult};
+pub use lumen_common::native::{Data, ErrorKind, NativeError, NativeResult};
 
 /// Support for generated code. Not a stable API.
 #[doc(hidden)]

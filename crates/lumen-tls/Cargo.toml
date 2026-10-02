@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+lumen-common = { path = "../lumen-common" }
+
 # Desktop Unix dlopens system OpenSSL. Android and Windows use rustls on the ring provider,
 # trusting the operating system's certificate store with bundled roots as a fallback.
 [target.'cfg(any(not(unix), target_os = "android"))'.dependencies]

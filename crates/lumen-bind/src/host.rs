@@ -94,6 +94,8 @@ pub trait Host: Sized + 'static {
     fn to_int(cx: &Self::Cx<'_>, v: &Self::Value, at: Slot, kind: IntKind) -> Result<i128, Self::Error>;
     fn to_bigint(cx: &Self::Cx<'_>, v: &Self::Value, at: Slot) -> Result<BigInt, Self::Error>;
     fn to_bool(cx: &Self::Cx<'_>, v: &Self::Value, at: Slot) -> Result<bool, Self::Error>;
+    /// Whether `v` is the host's own `true` (no truthiness coercion).
+    fn is_true(v: &Self::Value) -> bool;
     fn to_str<'c>(cx: &'c Self::Cx<'_>, v: &'c Self::Value, at: Slot) -> Result<&'c str, Self::Error>;
     /// The bytes of a byte buffer, borrowed (zero-copy) until the call returns.
     fn to_bytes<'c>(cx: &'c Self::Cx<'_>, v: &'c Self::Value, at: Slot) -> Result<&'c [u8], Self::Error>;

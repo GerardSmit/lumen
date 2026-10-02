@@ -672,7 +672,7 @@
       if (base !== undefined) base = `${base}`;
       // Node hands these to C++ as UTF-8, where lone surrogates become U+FFFD.
       const record = __url.parse(toUSVString(input), base === undefined ? undefined : toUSVString(base));
-      if (record === null) throw invalidUrl(input, base);
+      if (record === undefined) throw invalidUrl(input, base);
       this.#updateContext(record);
     }
 
@@ -717,8 +717,8 @@
 
     #update(action, value) {
       const record = __url.update(this.#context.href, action, toUSVString(value));
-      if (record !== null) this.#updateContext(record);
-      return record !== null;
+      if (record !== undefined) this.#updateContext(record);
+      return record !== undefined;
     }
 
     toString() {
@@ -866,7 +866,7 @@
       const parsed = base === undefined
         ? __url.parse(input)
         : __url.parse(input, toUSVString(`${base}`));
-      return parsed === null ? null : new URL(parsed[0]);
+      return parsed === undefined ? null : new URL(parsed[0]);
     }
 
     static canParse(url, base = undefined) {

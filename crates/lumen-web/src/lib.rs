@@ -27,7 +27,8 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 use lumen_host::SpawnHandle;
-use lumen_host::{ops, Ctx, Extension, OpState, Value};
+use lumen_bind::NativeError;
+use lumen_host::{Ctx, Extension, OpError, OpState, Value};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
@@ -42,11 +43,7 @@ mod websocket;
 #[cfg(target_arch = "wasm32")]
 mod browser;
 #[cfg(target_arch = "wasm32")]
-use browser as server;
-#[cfg(target_arch = "wasm32")]
-use browser as sse;
-#[cfg(target_arch = "wasm32")]
-use browser as websocket;
+use browser::{server, sse, websocket};
 
 /// Close every HTTP listener the realm still holds, waking the accepts blocked on them.
 pub fn close_servers(ctx: &mut Ctx) {
@@ -74,92 +71,16 @@ mod wasm_ops;
 pub fn extension() -> Extension {
     Extension {
         name: "web",
-        modules: &[],
-        globals: &[],
-        namespaces: &[
-            (
-                "__perf",
-                ops!["now" (0) => op_perf_now, "timeOrigin" (0) => op_time_origin],
-            ),
-            (
-                "__encoding",
-                ops![
-                    "encode" (1) => op_encode,
-                    "decode" (2) => op_decode,
-                    "btoa" (1) => op_btoa,
-                    "atob" (1) => op_atob,
-                ],
-            ),
-            (
-                "__url",
-                ops![
-                    "parse" (2) => op_url_parse,
-                    "update" (3) => op_url_update,
-                    "canParse" (2) => op_url_can_parse,
-                    "domainToASCII" (1) => op_url_domain_to_ascii,
-                    "domainToUnicode" (1) => op_url_domain_to_unicode,
-                    "toASCII" (1) => op_idna_to_ascii,
-                    "toUnicode" (1) => op_idna_to_unicode,
-                    "format" (5) => op_url_format,
-                ],
-            ),
-            ("__http", ops!["request" (6) => http_request]),
-            (
-                "__http_server",
-                ops![
-                    "listen" (3) => server::op_server_listen,
-                    "respond" (7) => server::op_server_respond,
-                    "close" (1) => server::op_server_close,
-                    "version" (0) => server::op_server_version,
-                ],
-            ),
-            (
-                "__crypto",
-                ops![
-                    "fill" (1) => op_random_fill,
-                    "uuid" (0) => op_uuid,
-                    "digest" (2) => op_digest,
-                ],
-            ),
-            (
-                "__ws",
-                ops![
-                    "connect" (3) => websocket::op_ws_connect,
-                    "send" (2) => websocket::op_ws_send,
-                    "close" (3) => websocket::op_ws_close,
-                    "upgrade" (5) => websocket::op_ws_upgrade,
-                ],
-            ),
-            (
-                "__sse",
-                ops![
-                    "connect" (3) => sse::op_sse_connect,
-                    "close" (1) => sse::op_sse_close,
-                ],
-            ),
-            (
-                "__wasm",
-                ops![
-                    "validate" (1) => wasm_ops::op_validate,
-                    "compile" (1) => wasm_ops::op_compile,
-                    "moduleExports" (1) => wasm_ops::op_module_exports,
-                    "moduleImports" (1) => wasm_ops::op_module_imports,
-                    "allocMemory" (2) => wasm_ops::op_alloc_memory,
-                    "allocTable" (2) => wasm_ops::op_alloc_table,
-                    "allocGlobal" (3) => wasm_ops::op_alloc_global,
-                    "instantiate" (2) => wasm_ops::op_instantiate,
-                    "call" (2) => wasm_ops::op_call,
-                    "func" (1) => wasm_ops::op_func,
-                    "setErrors" (1) => wasm_ops::op_set_errors,
-                    "memBuffer" (1) => wasm_ops::op_mem_buffer,
-                    "memGrow" (2) => wasm_ops::op_mem_grow,
-                    "tableGet" (2) => wasm_ops::op_table_get,
-                    "tableSet" (3) => wasm_ops::op_table_set,
-                    "tableSize" (1) => wasm_ops::op_table_size,
-                    "globalGet" (1) => wasm_ops::op_global_get,
-                    "globalSet" (2) => wasm_ops::op_global_set,
-                ],
-            ),
+        modules: &[
+            lumen_host::namespace::<perf::Module>,
+            lumen_host::namespace::<encoding::Module>,
+            lumen_host::namespace::<url_ops::Module>,
+            lumen_host::namespace::<crypto::Module>,
+            lumen_host::namespace::<http_ops::Module>,
+            lumen_host::namespace::<server::Module>,
+            lumen_host::namespace::<websocket::Module>,
+            lumen_host::namespace::<sse::Module>,
+            lumen_host::namespace::<wasm_ops::WasmModule>,
         ],
         state_init: Some(|state: &mut OpState| {
             state.put(server::ServerRegistry::default());
@@ -178,271 +99,248 @@ pub fn extension() -> Extension {
 /// text), loaded at boot (see `lumen_host::install`).
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
 
-fn op_perf_now(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(lumen_host::perf::now_ms()))
-}
-
-/// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
-fn op_time_origin(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(lumen_host::perf::time_origin_ms()))
-}
-
-// ---- encoding ----
-
-fn op_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
-    let bytes = lumen_host::well_formed_utf8(&s).as_bytes().to_vec();
-    ctx.make_uint8array(&bytes)
-}
-
-/// `(u8array, fatal)`; the glue has already converted ArrayBuffer inputs to views.
-fn op_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "TextDecoder.decode expects a BufferSource"));
-    };
-    let fatal = matches!(args.get(1), Some(Value::Bool(true)));
-    let text = if fatal {
-        match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return Err(ctx.make_error("TypeError", "TextDecoder: invalid utf-8 (fatal)")),
-        }
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(text)))
-}
-
-/// Base64 of a Latin-1 string, or `null` when a char is past U+00FF.
-fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
-    let mut bytes = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        match u8::try_from(u32::from(c)) {
-            Ok(b) => bytes.push(b),
-            Err(_) => return Ok(Value::Null),
-        }
+#[lumen_bind::module(name = "__perf")]
+mod perf {
+    #[op]
+    pub fn now() -> f64 {
+        lumen_host::perf::now_ms()
     }
-    Ok(Value::from_string(lumen_common::codec::base64_encode(&bytes, false, true)))
+
+    /// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
+    #[op(name = "timeOrigin")]
+    pub fn time_origin() -> f64 {
+        lumen_host::perf::time_origin_ms()
+    }
 }
 
-/// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
-fn op_atob(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
-    Ok(match lumen_common::codec::base64_decode_forgiving(s.as_bytes()) {
-        Some(bytes) => Value::from_string(bytes.into_iter().map(char::from).collect::<String>()),
-        None => Value::Null,
-    })
-}
+#[lumen_bind::module(name = "__encoding")]
+mod encoding {
+    use super::*;
 
-// ---- url ----
+    #[op(coerce)]
+    pub fn encode(s: String) -> Vec<u8> {
+        lumen_host::well_formed_utf8(&s).as_bytes().to_vec()
+    }
 
-fn str_arg(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<Option<String>, Value> {
-    match args.get(i) {
-        None | Some(Value::Undefined) => Ok(None),
-        Some(v) => Ok(Some(ctx.coerce_string(v)?.to_string())),
+    /// `(u8array, fatal)`; the glue has already converted ArrayBuffer inputs to views.
+    #[op(coerce)]
+    pub fn decode(bytes: &[u8], fatal: bool) -> Result<Value, OpError> {
+        let text = if fatal {
+            std::str::from_utf8(bytes)
+                .map_err(|_| OpError::type_error("TextDecoder: invalid utf-8 (fatal)"))?
+                .to_owned()
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(text)))
+    }
+
+    /// Base64 of a Latin-1 string, or `null` when a char is past U+00FF.
+    #[op(coerce)]
+    pub fn btoa(s: String) -> Option<String> {
+        let bytes = s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect::<Option<Vec<u8>>>()?;
+        Some(lumen_common::codec::base64_encode(&bytes, false, true))
+    }
+
+    /// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
+    #[op(coerce)]
+    pub fn atob(s: String) -> Option<String> {
+        lumen_common::codec::base64_decode_forgiving(s.as_bytes())
+            .map(|bytes| bytes.into_iter().map(char::from).collect())
     }
 }
 
 /// `[href, protocol_end, username_end, host_start, host_end, port, pathname_start, search_start,
-/// hash_start, scheme_type]` — the shape Node's `URLContext` keeps (ada's url_components).
+/// hash_start, scheme_type]`: the shape Node's `URLContext` keeps (ada's url_components).
 fn url_record(ctx: &mut Ctx, u: &url::Url) -> Value {
     let mut items = vec![Value::from_string(u.href())];
     items.extend(u.components().iter().map(|&c| Value::Num(c as f64)));
     ctx.make_array(items)
 }
 
-/// `(input, base?)` -> URL record array, or `null` when either fails to parse (the JS side raises
-/// `ERR_INVALID_URL`).
-fn op_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
-    let base = match str_arg(ctx, args, 1)? {
-        Some(b) => match url::parse_url(&b, None) {
-            Some(u) => Some(u),
-            None => return Ok(Value::Null),
-        },
-        None => None,
-    };
-    Ok(match url::parse_url(&input, base.as_ref()) {
-        Some(u) => url_record(ctx, &u),
-        None => Value::Null,
-    })
-}
+#[lumen_bind::module(name = "__url")]
+mod url_ops {
+    use super::*;
 
-/// `(href, action, value)` -> updated record, or `null` when the setter declines (Node's
-/// `bindingUrl.update`; action numbering is internal/url's `updateActions`).
-fn op_url_update(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let href = str_arg(ctx, args, 0)?.unwrap_or_default();
-    let action = match args.get(1) {
-        Some(Value::Num(n)) => *n as i32,
-        _ => -1,
-    };
-    let value = str_arg(ctx, args, 2)?.unwrap_or_default();
-    let Some(mut u) = url::parse_url(&href, None) else {
-        return Ok(Value::Null);
-    };
-    let ok = match action {
-        0 => u.set_protocol(&value),
-        1 => u.set_host(&value),
-        2 => u.set_hostname(&value),
-        3 => u.set_port(&value),
-        4 => u.set_username(&value),
-        5 => u.set_password(&value),
-        6 => u.set_pathname(&value),
-        7 => {
-            u.set_search(&value);
-            true
+    /// `(input, base?)` -> URL record array, or `null` when either fails to parse (the JS side
+    /// raises `ERR_INVALID_URL`).
+    #[op(coerce)]
+    pub fn parse(ctx: &mut Ctx, input: String, base: Option<String>) -> Option<Value> {
+        let base = match base {
+            Some(b) => Some(url::parse_url(&b, None)?),
+            None => None,
+        };
+        url::parse_url(&input, base.as_ref()).map(|u| url_record(ctx, &u))
+    }
+
+    /// `(href, action, value)` -> updated record, or `null` when the setter declines (Node's
+    /// `bindingUrl.update`; action numbering is internal/url's `updateActions`).
+    #[op(coerce)]
+    pub fn update(ctx: &mut Ctx, href: String, action: i32, value: String) -> Option<Value> {
+        let mut u = url::parse_url(&href, None)?;
+        let ok = match action {
+            0 => u.set_protocol(&value),
+            1 => u.set_host(&value),
+            2 => u.set_hostname(&value),
+            3 => u.set_port(&value),
+            4 => u.set_username(&value),
+            5 => u.set_password(&value),
+            6 => u.set_pathname(&value),
+            7 => {
+                u.set_search(&value);
+                true
+            }
+            8 => {
+                u.set_hash(&value);
+                true
+            }
+            9 => u.set_href(&value),
+            _ => false,
+        };
+        ok.then(|| url_record(ctx, &u))
+    }
+
+    #[op(coerce, name = "canParse")]
+    pub fn can_parse(input: String, base: Option<String>) -> bool {
+        match base {
+            Some(b) => url::parse_url(&b, None).is_some_and(|base| url::parse_url(&input, Some(&base)).is_some()),
+            None => url::parse_url(&input, None).is_some(),
         }
-        8 => {
-            u.set_hash(&value);
-            true
-        }
-        9 => u.set_href(&value),
-        _ => false,
-    };
-    Ok(if ok { url_record(ctx, &u) } else { Value::Null })
-}
+    }
 
-fn op_url_can_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
-    let ok = match str_arg(ctx, args, 1)? {
-        Some(b) => url::parse_url(&b, None).is_some_and(|base| url::parse_url(&input, Some(&base)).is_some()),
-        None => url::parse_url(&input, None).is_some(),
-    };
-    Ok(Value::Bool(ok))
-}
+    #[op(coerce, name = "domainToASCII")]
+    pub fn domain_to_ascii(input: String) -> String {
+        url::domain_to_ascii(&input)
+    }
 
-fn op_url_domain_to_ascii(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
-    Ok(Value::from_string(url::domain_to_ascii(&input)))
-}
+    #[op(coerce, name = "domainToUnicode")]
+    pub fn domain_to_unicode(input: String) -> String {
+        url::domain_to_unicode(&input)
+    }
 
-fn op_url_domain_to_unicode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
-    Ok(Value::from_string(url::domain_to_unicode(&input)))
-}
+    #[op(coerce, name = "toASCII")]
+    pub fn idna_to_ascii(input: String) -> String {
+        url::idna_to_ascii(&input)
+    }
 
-fn op_idna_to_ascii(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
-    Ok(Value::from_string(url::idna_to_ascii(&input)))
-}
+    #[op(coerce, name = "toUnicode")]
+    pub fn idna_to_unicode(input: String) -> String {
+        url::domain_to_unicode_raw(&input)
+    }
 
-fn op_idna_to_unicode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let input = str_arg(ctx, args, 0)?.unwrap_or_default();
-    Ok(Value::from_string(url::domain_to_unicode_raw(&input)))
-}
-
-/// `(href, hash, unicode, search, auth)` -> href with the dropped parts removed.
-fn op_url_format(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let href = str_arg(ctx, args, 0)?.unwrap_or_default();
-    let flag = |i: usize| matches!(args.get(i), Some(Value::Bool(true)));
-    Ok(match url::format(&href, flag(1), flag(2), flag(3), flag(4)) {
-        Some(s) => Value::from_string(s),
-        None => Value::from_string(href),
-    })
+    /// `(href, hash, unicode, search, auth)` -> href with the dropped parts removed.
+    #[op(coerce)]
+    pub fn format(href: String, hash: bool, unicode: bool, search: bool, auth: bool) -> String {
+        url::format(&href, hash, unicode, search, auth).unwrap_or(href)
+    }
 }
 
 // ---- crypto ----
 
+fn entropy(buf: &mut [u8]) -> Result<(), OpError> {
+    lumen_os::proc::entropy(buf).map_err(|e| OpError::error(format!("no randomness source: {e}")))
+}
+
 /// `n` cryptographically-random bytes (the WebSocket handshake key needs these, same source as
 /// `crypto.getRandomValues`).
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn web_random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
-    random_bytes(ctx, n)
-}
-
-fn random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
+pub(crate) fn web_random_bytes(n: usize) -> Result<Vec<u8>, OpError> {
     let mut buf = vec![0u8; n];
-    lumen_os::proc::entropy(&mut buf)
-        .map_err(|e| ctx.make_error("Error", format!("no randomness source: {e}")))?;
+    entropy(&mut buf)?;
     Ok(buf)
 }
 
-/// Fill the given typed array in place (the glue enforces the 65536-byte quota + returns it).
-fn op_random_fill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
-    let Some(existing) = ctx.typed_array_bytes(&v) else {
-        return Err(ctx.make_error("TypeError", "getRandomValues expects a typed array"));
-    };
-    let bytes = random_bytes(ctx, existing.len())?;
-    ctx.typed_array_set_bytes(&v, &bytes);
-    Ok(Value::Undefined)
-}
+#[lumen_bind::module(name = "__crypto")]
+mod crypto {
+    use super::*;
 
-fn op_uuid(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let mut b = random_bytes(ctx, 16)?;
-    b[6] = (b[6] & 0x0f) | 0x40; // version 4
-    b[8] = (b[8] & 0x3f) | 0x80; // variant 10
-    let h: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
-    let s = h.join("");
-    Ok(Value::from_string(format!(
-        "{}-{}-{}-{}-{}",
-        &s[0..8],
-        &s[8..12],
-        &s[12..16],
-        &s[16..20],
-        &s[20..32]
-    )))
-}
+    /// Fill the given typed array in place (the glue enforces the 65536-byte quota + returns it).
+    #[op]
+    pub fn fill(buf: &mut [u8]) -> Result<(), OpError> {
+        entropy(buf)
+    }
 
-fn op_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    use lumen_common::hash::{digest, Algo};
-    let name = str_arg(ctx, args, 0)?.unwrap_or_default();
-    let v = args.get(1).unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "digest expects a BufferSource"));
-    };
-    let digest = match name.as_str() {
-        "SHA-1" => digest(Algo::Sha1, &bytes),
-        "SHA-256" => digest(Algo::Sha256, &bytes),
-        "SHA-384" => digest(Algo::Sha384, &bytes),
-        "SHA-512" => digest(Algo::Sha512, &bytes),
-        _ => return Err(ctx.make_error("TypeError", format!("unsupported digest {name}"))),
-    };
-    ctx.make_uint8array(&digest)
+    #[op]
+    pub fn uuid() -> Result<String, OpError> {
+        let mut b = [0u8; 16];
+        entropy(&mut b)?;
+        b[6] = (b[6] & 0x0f) | 0x40; // version 4
+        b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+        let s: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        Ok(format!("{}-{}-{}-{}-{}", &s[0..8], &s[8..12], &s[12..16], &s[16..20], &s[20..32]))
+    }
+
+    #[op(coerce)]
+    pub fn digest(name: String, data: &[u8]) -> Result<Vec<u8>, OpError> {
+        use lumen_common::hash::{digest, Algo};
+        let algo = match name.as_str() {
+            "SHA-1" => Algo::Sha1,
+            "SHA-256" => Algo::Sha256,
+            "SHA-384" => Algo::Sha384,
+            "SHA-512" => Algo::Sha512,
+            _ => return Err(OpError::type_error(format!("unsupported digest {name}"))),
+        };
+        Ok(digest(algo, data).to_vec())
+    }
 }
 
 // ---- fetch ----
 
 #[cfg(target_arch = "wasm32")]
-use browser::op_http_request as http_request;
-#[cfg(not(target_arch = "wasm32"))]
-use op_http_request as http_request;
+use browser::http_ops;
 
-/// `(method, url, headerPairs, bodyOrUndefined, resolve, reject)`: one HTTP request on the
-/// threadpool, settled through the TaskRegistry like every async op.
+/// The `(resolve, reject)` callback pair an async op settles through, or a `TypeError`.
+pub(crate) fn callbacks(resolve: Value, reject: Value, who: &str) -> Result<(Value, Value), NativeError> {
+    if resolve.is_callable() && reject.is_callable() {
+        Ok((resolve, reject))
+    } else {
+        Err(NativeError::type_error(format!("{who} expects (resolve, reject)")))
+    }
+}
+
+/// A request body: bytes of a typed array, or the UTF-8 of any other value; `null` and `undefined`
+/// are no body.
+pub(crate) fn read_body(ctx: &mut Ctx, v: &Value) -> Result<Option<Vec<u8>>, Value> {
+    if matches!(v, Value::Undefined | Value::Null) {
+        return Ok(None);
+    }
+    Ok(Some(match ctx.typed_array_bytes(v) {
+        Some(bytes) => bytes,
+        None => ctx.coerce_string(v)?.as_bytes().to_vec(),
+    }))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let method = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let target = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let headers = read_header_pairs(ctx, args.get(2).unwrap_or(&Value::Undefined))?;
-    let body = match args.get(3) {
-        None | Some(Value::Undefined) | Some(Value::Null) => None,
-        Some(v) => match ctx.typed_array_bytes(v) {
-            Some(bytes) => Some(bytes),
-            None => Some(ctx.coerce_string(v)?.as_bytes().to_vec()),
-        },
-    };
-    let (resolve, reject) = match (args.get(4), args.get(5)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            (res.clone(), rej.clone())
-        }
-        _ => return Err(ctx.make_error("TypeError", "__http.request expects (resolve, reject)")),
-    };
-    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_http);
-    let spawn = ctx
-        .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
-        .clone();
-    spawn.spawn_blocking(id, move || {
-        Box::new(http::request(&method, &target, &headers, body.as_deref()))
-    });
-    Ok(Value::Undefined)
+#[lumen_bind::module(name = "__http")]
+mod http_ops {
+    use super::*;
+
+    /// `(method, url, headerPairs, bodyOrUndefined, resolve, reject)`: one HTTP request on the
+    /// threadpool, settled through the TaskRegistry like every async op.
+    #[op(coerce)]
+    fn request(
+        ctx: &mut Ctx,
+        method: String,
+        target: String,
+        headers: Value,
+        body: Value,
+        resolve: Value,
+        reject: Value,
+    ) -> Result<(), OpError> {
+        let headers = read_header_pairs(ctx, &headers)?;
+        let body = read_body(ctx, &body)?;
+        let (resolve, reject) = callbacks(resolve, reject, "__http.request")?;
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_http);
+        let spawn = ctx
+            .op_state()
+            .get::<SpawnHandle>()
+            .expect("runtime installs the spawn handle")
+            .clone();
+        spawn.spawn_blocking(id, move || {
+            Box::new(http::request(&method, &target, &headers, body.as_deref()))
+        });
+        Ok(())
+    }
 }
 
 /// A JS `[[k, v], ...]` array into Rust pairs, via the curated member API.

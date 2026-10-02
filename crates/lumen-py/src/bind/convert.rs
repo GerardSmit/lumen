@@ -5,7 +5,7 @@ use crate::object::*;
 use crate::vm::Interp;
 use lumen_bind::IntKind;
 use lumen_common::buffer::BufferError;
-use lumen_common::native::{ErrorKind, NativeError};
+use lumen_common::native::{Data, ErrorKind, NativeError};
 
 /// `operator.index(v)` (`PyNumber_Index`): an `int` value, through `__index__` when needed.
 pub fn index(it: &mut Interp, v: &Value) -> R<Value> {
@@ -111,15 +111,27 @@ pub fn native_error(it: &mut Interp, e: NativeError) -> Obj {
         ErrorKind::Buffer => "BufferError",
         ErrorKind::Memory => "MemoryError",
         ErrorKind::NotImplemented => "NotImplementedError",
+        ErrorKind::Named(_) => "RuntimeError",
         ErrorKind::Os(errno) => {
             let exc = it.os_error_errno(errno, None, None);
             if !e.message.is_empty() {
                 it.set_exc_attr(&exc, "strerror", Value::str(&e.message));
             }
+            set_props(it, &exc, e.props);
             return exc;
         }
     };
-    it.new_exc_str(name, &e.message)
+    let exc = it.new_exc_str(name, &e.message);
+    set_props(it, &exc, e.props);
+    exc
+}
+
+fn set_props(it: &mut Interp, exc: &Obj, props: Vec<(std::borrow::Cow<'static, str>, Data)>) {
+    for (name, data) in props {
+        if let Ok(v) = <Data as lumen_bind::IntoRet<super::PyHost>>::into_ret(data, it) {
+            it.set_exc_attr(exc, &name, v);
+        }
+    }
 }
 
 /// A shared-buffer error as CPython words it for `bytearray` / `memoryview`.

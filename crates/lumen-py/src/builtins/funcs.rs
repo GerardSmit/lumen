@@ -1,7 +1,6 @@
 //! Builtin functions.
 
 use crate::ast::{BinOp, StmtKind};
-use crate::bind::KwArgs;
 use crate::fmath;
 use crate::num::{to_num, Num};
 use crate::object::*;
@@ -130,20 +129,12 @@ fn locals_value(it: &mut Interp) -> Value {
     Value::Obj(d)
 }
 
-fn minmax(it: &mut Interp, a: &[Value], kw: &KwArgs<'_>, name: &str, want_max: bool) -> R<Value> {
+fn minmax(it: &mut Interp, a: &[Value], key: Option<&Value>, default: Option<&Value>, name: &str, want_max: bool) -> R<Value> {
     if a.is_empty() {
         return Err(it.type_error(&format!("{} expected at least 1 argument, got 0", name)));
     }
-    let mut key = None;
-    let mut default: Option<Value> = None;
-    for (k, v) in kw.iter() {
-        match k {
-            "key" if !v.is_none() => key = Some(v.clone()),
-            "key" => key = None,
-            "default" => default = Some(v.clone()),
-            other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for {}()", other, name))),
-        }
-    }
+    let key = key.cloned();
+    let default = default.cloned();
     let source = if a.len() == 1 {
         it.get_iter(&a[0])?
     } else {
@@ -949,8 +940,13 @@ pub mod builtin_fns {
     /// the provided iterable is empty.
     /// With two or more arguments, return the largest argument.
     #[op(hint(py(text_signature = "")))]
-    fn max(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs<'_>) -> R<Value> {
-        minmax(it, args, &kw, "max", true)
+    fn max(
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[kwonly] key: Option<&Value>,
+        #[kwonly] default: Passed<&Value>,
+    ) -> R<Value> {
+        minmax(it, args, key, default.0, "max", true)
     }
 
     /// min(iterable, *[, default=obj, key=func]) -> value
@@ -961,8 +957,13 @@ pub mod builtin_fns {
     /// the provided iterable is empty.
     /// With two or more arguments, return the smallest argument.
     #[op(hint(py(text_signature = "")))]
-    fn min(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs<'_>) -> R<Value> {
-        minmax(it, args, &kw, "min", false)
+    fn min(
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[kwonly] key: Option<&Value>,
+        #[kwonly] default: Passed<&Value>,
+    ) -> R<Value> {
+        minmax(it, args, key, default.0, "min", false)
     }
 
     /// Equivalent to base**exp with 2 arguments or base**exp % mod with 3 arguments

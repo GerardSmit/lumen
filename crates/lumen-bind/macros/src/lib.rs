@@ -293,6 +293,7 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let mut new_body: Vec<TokenTree> = Vec::new();
     let mut bounds: Vec<String> = Vec::new();
     let mut pushes: Vec<String> = Vec::new();
+    let mut gates: Vec<String> = Vec::new();
     for it in split_items(&body_toks) {
         let (attrs, after) = take_attrs(&it, 0);
         let bind = attrs.iter().find(|a| ["op", "class", "methods", "constant", "init"].iter().any(|n| a.is(n)));
@@ -300,9 +301,7 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
             new_body.extend(it);
             continue;
         };
-        if attrs.iter().any(|a| a.path == "cfg") {
-            return Err((bind.span, "a cfg-gated item cannot be registered by #[module]".into()));
-        }
+        let cfgs: Vec<String> = attrs.iter().filter(|a| a.path == "cfg").map(|a| a.args_ts().to_string()).collect();
         let kind = bind.name().to_string();
         let mut kept: Vec<TokenTree> = Vec::new();
         for a in &attrs {
@@ -327,16 +326,18 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
                 _ => None,
             }
         };
+        let mut ibounds: Vec<String> = Vec::new();
+        let mut ipushes: Vec<String> = Vec::new();
         match kind.as_str() {
             "op" => {
                 let name = ident_after("fn").ok_or((bind.span, "expected a fn".to_string()))?;
-                bounds.push(format!("{name}::Op: {B}::Native<H>"));
-                pushes.push(format!("out.functions.push({B}::FnItem::of::<{name}::Op>());"));
+                ibounds.push(format!("{name}::Op: {B}::Native<H>"));
+                ipushes.push(format!("out.functions.push({B}::FnItem::of::<{name}::Op>());"));
             }
             "class" => {
                 let name = ident_after("struct").ok_or((bind.span, "expected a struct".to_string()))?;
-                bounds.push(format!("{name}: {B}::Methods<H>"));
-                pushes.push(format!(
+                ibounds.push(format!("{name}: {B}::Methods<H>"));
+                ipushes.push(format!(
                     "out.classes.push({B}::ClassItem {{ desc: <{name} as {B}::Class>::DESC, object: <H as {B}::Host>::class_object::<{name}> }});"
                 ));
             }
@@ -348,8 +349,8 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
                 let o = parse_opts(bind.args_ts())?;
                 o.check(&["name"])?;
                 let shown = o.get("name").unwrap_or(&name).to_string();
-                bounds.push(format!("{ty}: {B}::IntoRet<H>"));
-                pushes.push(format!(
+                ibounds.push(format!("{ty}: {B}::IntoRet<H>"));
+                ipushes.push(format!(
                     "out.constants.push({B}::ConstItem {{ name: {shown:?}, value: |ctx| {B}::__private::constant::<H, {ty}>(ctx, {name}) }});"
                 ));
             }
@@ -361,14 +362,35 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
                 let ctx = render(&sig.params[0].ty[2..], None, Lt::Infer);
                 let val = render(&sig.params[1].ty[1..], None, Lt::Infer);
                 let ret = sig.ret.as_ref().map(|r| render(r, None, Lt::Infer)).unwrap_or_else(|| "()".into());
-                bounds.push(format!("H: {B}::Host<Ctx = {ctx}, Value = {val}>"));
-                bounds.push(format!("{ret}: {B}::IntoRet<H>"));
-                pushes.push(format!(
+                ibounds.push(format!("H: {B}::Host<Ctx = {ctx}, Value = {val}>"));
+                ibounds.push(format!("{ret}: {B}::IntoRet<H>"));
+                ipushes.push(format!(
                     "out.init = ::core::option::Option::Some(|ctx, m| {{ let r = {}(ctx, m); {B}::IntoRet::<H>::into_ret(r, ctx).map(|_| ()) }});",
                     sig.name
                 ));
             }
             _ => {}
+        }
+        if cfgs.is_empty() {
+            bounds.extend(ibounds);
+            pushes.extend(ipushes);
+        } else {
+            // A where-clause cannot be cfg-gated, so a gated item registers through a per-item trait
+            // whose impl is gated instead.
+            let gate = format!("__BindGate{}", gates.len());
+            let pred = if cfgs.len() == 1 { cfgs[0].clone() } else { format!("all({})", cfgs.join(", ")) };
+            gates.push(format!(
+                "trait {gate}<H: {B}::Host> {{ fn push(out: &mut {B}::ModuleItems<H>); }}\n\
+                 #[cfg({pred})]\n\
+                 #[allow(private_bounds, clippy::all)]\n\
+                 impl<H: {B}::Host> {gate}<H> for () where {} {{ fn push(out: &mut {B}::ModuleItems<H>) {{ {} }} }}\n\
+                 #[cfg(not({pred}))]\n\
+                 impl<H: {B}::Host> {gate}<H> for () {{ fn push(_: &mut {B}::ModuleItems<H>) {{}} }}\n",
+                ibounds.join(", "),
+                ipushes.join("\n")
+            ));
+            bounds.push(format!("(): {gate}<H>"));
+            pushes.push(format!("<() as {gate}<H>>::push(out);"));
         }
         new_body.extend(kept);
         new_body.extend(rest.iter().cloned());
@@ -396,6 +418,7 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
         pushes.join("\n")
     );
     new_body.extend(parse_ts(&code, mod_name.span())?);
+    new_body.extend(parse_ts(&gates.join("\n"), mod_name.span())?);
     let mut out: Vec<TokenTree> = toks[..i + 2].to_vec();
     let mut g = proc_macro::Group::new(Delimiter::Brace, new_body.into_iter().collect());
     g.set_span(body.span());

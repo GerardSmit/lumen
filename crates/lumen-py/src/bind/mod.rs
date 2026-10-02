@@ -380,6 +380,11 @@ impl Host for PyHost {
     }
 
     #[inline]
+    fn is_true(v: &Value) -> bool {
+        matches!(v, Value::Bool(true))
+    }
+
+    #[inline]
     fn to_bool(cx: &PyCx<'_>, v: &Value, _: Slot) -> Result<bool, Obj> {
         match v {
             Value::Bool(b) => Ok(*b),

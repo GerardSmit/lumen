@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lumen_host::{Ctx, SpawnHandle, Value};
+use lumen_bind::NativeError;
+use lumen_host::{Ctx, OpError, SpawnHandle, Value};
 
 use lumen_common::hash::{digest, Algo};
 use crate::url;
@@ -350,69 +351,229 @@ fn ws_registry(ctx: &mut Ctx) -> &mut WsRegistry {
         .expect("web installs WsRegistry")
 }
 
-/// `__ws.connect(url, protocolsJoined, dispatch)` → id. The handshake runs on the pool; the
-/// socket's lifecycle then flows entirely through `dispatch(kind, ...)`:
-/// `("open", protocol)`, `("text", string)`, `("binary", u8array)`,
-/// `("close", code, reason, wasClean)`, `("error", message)`.
-pub(crate) fn op_ws_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let target = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let protocols = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
-        _ => return Err(ctx.make_error("TypeError", "connect: dispatch must be a function")),
-    };
+pub(crate) use bindings::Module;
 
-    let u = url::parse(&target, None).map_err(|e| ctx.make_error("SyntaxError", e))?;
-    match u.scheme.as_str() {
-        "ws" | "wss" => {}
-        other => {
-            return Err(ctx.make_error(
-                "SyntaxError",
-                format!("WebSocket: unsupported scheme '{other}'"),
-            ))
+#[lumen_bind::module(name = "__ws")]
+mod bindings {
+    use super::*;
+
+    /// `__ws.connect(url, protocolsJoined, dispatch)` -> id. The handshake runs on the pool; the
+    /// socket's lifecycle then flows entirely through `dispatch(kind, ...)`:
+    /// `("open", protocol)`, `("text", string)`, `("binary", u8array)`,
+    /// `("close", code, reason, wasClean)`, `("error", message)`.
+    #[op(coerce)]
+    fn connect(ctx: &mut Ctx, target: String, protocols: String, dispatch: Value) -> Result<f64, OpError> {
+        if !dispatch.is_callable() {
+            return Err(NativeError::type_error("connect: dispatch must be a function").into());
+        }
+
+        let u = url::parse(&target, None).map_err(|e| NativeError::named("SyntaxError", e))?;
+        match u.scheme.as_str() {
+            "ws" | "wss" => {}
+            other => {
+                return Err(NativeError::named("SyntaxError", format!("WebSocket: unsupported scheme '{other}'")).into())
+            }
+        }
+
+        // 16 random bytes for the handshake key (CSPRNG); also seeds the per-socket mask LCG.
+        let key_bytes = crate::web_random_bytes(16)?;
+        let key = base64(&key_bytes);
+        let mask_seed = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap()) | 1;
+
+        let id = {
+            let reg = ws_registry(ctx);
+            let id = reg.next;
+            reg.next += 1;
+            reg.socks.insert(
+                id,
+                WsEntry {
+                    writer: None,
+                    close_sent: Arc::new(AtomicBool::new(false)),
+                    dead: false,
+                    dispatch: dispatch.clone(),
+                    mask_seed,
+                    masked: true,
+                },
+            );
+            id
+        };
+
+        let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
+        let spawn = ctx
+            .op_state()
+            .get::<SpawnHandle>()
+            .expect("runtime installs the spawn handle")
+            .clone();
+        spawn.spawn_blocking(task, move || {
+            Box::new(ConnectResult {
+                id,
+                outcome: handshake(&u, &key, &protocols),
+            })
+        });
+        Ok(id as f64)
+    }
+
+    /// `__ws.send(id, stringOrBytes)` - encodes and writes one masked data frame on the loop thread.
+    #[op]
+    fn send(ctx: &mut Ctx, id: f64, data: Value) -> Result<bool, OpError> {
+        let id = id as u64;
+        let (opcode, bytes) = match ctx.typed_array_bytes(&data) {
+            Some(b) => (0x2u8, b),
+            None => (0x1u8, ctx.coerce_string(&data)?.to_string().into_bytes()),
+        };
+        let (writer, mask) = {
+            let reg = ws_registry(ctx);
+            let Some(e) = reg.socks.get_mut(&id) else {
+                return Ok(false); // already closed: spec drops silently
+            };
+            if e.close_sent.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            e.mask_seed = e
+                .mask_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Server-adopted sockets never mask (RFC 6455 §5.1).
+            let mask: Option<[u8; 4]> = e
+                .masked
+                .then(|| (e.mask_seed >> 24).to_be_bytes()[4..8].try_into().unwrap());
+            match &e.writer {
+                Some(w) => (w.clone(), mask),
+                None => return Err(NativeError::runtime("send before open").into()),
+            }
+        };
+        let frame = match mask {
+            Some(m) => encode_frame(opcode, &bytes, m),
+            None => encode_frame_unmasked(opcode, &bytes),
+        };
+        let mut writer = writer;
+        writer
+            .write_all(&frame)
+            .map_err(|e| NativeError::runtime(format!("WebSocket send: {e}")))?;
+        Ok(true)
+    }
+
+    /// `__ws.close(id, code, reason)` - sends the close frame (once); the read loop then surfaces
+    /// the peer's echo as the close event.
+    #[op(coerce)]
+    fn close(ctx: &mut Ctx, id: f64, code: Option<f64>, reason: String) {
+        let id = id as u64;
+        let code = code.map_or(1000, |n| n as u16);
+        let (writer, masked) = {
+            let reg = ws_registry(ctx);
+            let Some(e) = reg.socks.get_mut(&id) else {
+                return;
+            };
+            if e.close_sent.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            (e.writer.clone(), e.masked)
+        };
+        if let Some(mut w) = writer {
+            let payload = close_payload(code, &reason);
+            let frame = if masked {
+                encode_frame(0x8, &payload, [0x1f, 0x2e, 0x3d, 0x4c])
+            } else {
+                encode_frame_unmasked(0x8, &payload)
+            };
+            let _ = w.write_all(&frame);
         }
     }
 
-    // 16 random bytes for the handshake key (CSPRNG); also seeds the per-socket mask LCG.
-    let key_bytes = crate::web_random_bytes(ctx, 16)?;
-    let key = base64(&key_bytes);
-    let mask_seed = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap()) | 1;
+    /// `__ws.upgrade(connId, secWebSocketKey, protocol, extraHeaderPairs, dispatch)` -> id.
+    ///
+    /// Adopts a connection accepted by `Lumen.serve` (see server.rs: the parsed request's
+    /// `TcpStream` sits in the resource table under `connId`) as a SERVER-side WebSocket: writes
+    /// the RFC 6455 101 handshake response, then joins the same registry/read-loop machinery the
+    /// client uses - with `masked: false`, since a server must not mask (§5.1). `dispatch(kind,
+    /// ...)` receives `("text", string)`, `("binary", u8array)`, `("close", code, reason,
+    /// wasClean)`, `("fail", code, msg)` (protocol violation), and `("io", msg)` (socket died).
+    /// There is no "open" event: the connection is open the moment this op returns.
+    #[op(coerce)]
+    fn upgrade(
+        ctx: &mut Ctx,
+        conn_id: u32,
+        key: String,
+        protocol: String,
+        extra_headers: Value,
+        dispatch: Value,
+    ) -> Result<f64, OpError> {
+        let extra_headers = crate::read_header_pairs(ctx, &extra_headers)?;
+        if !dispatch.is_callable() {
+            return Err(NativeError::type_error("upgrade: dispatch must be a function").into());
+        }
 
-    let id = {
-        let reg = ws_registry(ctx);
-        let id = reg.next;
-        reg.next += 1;
-        reg.socks.insert(
-            id,
-            WsEntry {
-                writer: None,
-                close_sent: Arc::new(AtomicBool::new(false)),
-                dead: false,
-                dispatch: dispatch.clone(),
-                mask_seed,
-                masked: true,
-            },
+        // Take the socket out of the resource table (same handoff as respond(); a later respond
+        // on this connection now correctly fails as "already answered").
+        let stream = ctx
+            .resource_table()
+            .close(conn_id)
+            .and_then(|rc| rc.downcast::<TcpStream>().ok())
+            .and_then(|rc| std::rc::Rc::try_unwrap(rc).ok());
+        let Some(stream) = stream else {
+            return Err(NativeError::type_error("upgrade: unknown or already-answered connection").into());
+        };
+
+        // The accept loop set a read timeout to bound header parsing; a WebSocket idles
+        // legitimately.
+        stream.set_read_timeout(None).ok();
+        stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+        stream.set_nodelay(true).ok();
+
+        // Write the 101 upgrade response. It is small; writing on the loop thread matches how
+        // sends and closes are written.
+        let mut resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n",
+            websocket_accept(&key)
         );
-        id
-    };
+        if !protocol.is_empty() {
+            resp.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+        }
+        for (name, value) in &extra_headers {
+            // The handshake-critical headers above must not be overridden by user extras.
+            if name.eq_ignore_ascii_case("upgrade")
+                || name.eq_ignore_ascii_case("connection")
+                || name.eq_ignore_ascii_case("sec-websocket-accept")
+            {
+                continue;
+            }
+            resp.push_str(&format!("{name}: {value}\r\n"));
+        }
+        resp.push_str("\r\n");
+        (&stream)
+            .write_all(resp.as_bytes())
+            .map_err(|e| NativeError::runtime(format!("WebSocket upgrade: handshake write: {e}")))?;
 
-    let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
-    let spawn = ctx
-        .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
-        .clone();
-    spawn.spawn_blocking(task, move || {
-        Box::new(ConnectResult {
-            id,
-            outcome: handshake(&u, &key, &protocols),
-        })
-    });
-    Ok(Value::Num(id as f64))
+        let writer = SharedStream(Arc::new(Mutex::new(Box::new(stream))));
+
+        let id = {
+            let reg = ws_registry(ctx);
+            let id = reg.next;
+            reg.next += 1;
+            reg.socks.insert(
+                id,
+                WsEntry {
+                    writer: Some(writer.clone()),
+                    close_sent: Arc::new(AtomicBool::new(false)),
+                    dead: false,
+                    dispatch,
+                    mask_seed: 0,
+                    masked: false,
+                },
+            );
+            id
+        };
+
+        let reader = WsReader {
+            stream: BufReader::new(writer.clone()),
+            writer,
+            mask_seed: 0,
+            masked: false,
+        };
+        arm_read(ctx, id, reader);
+        Ok(id as f64)
+    }
 }
 
 /// Dial + HTTP/1.1 upgrade (RFC 6455 §4.1/§4.2). Returns the open stream and the negotiated
@@ -640,187 +801,6 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
             ])
         }
     }
-}
-
-/// `__ws.send(id, stringOrBytes)` — encodes and writes one masked data frame on the loop thread.
-pub(crate) fn op_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
-        _ => return Err(ctx.make_error("TypeError", "send: bad socket id")),
-    };
-    let (opcode, bytes) = match args.get(1) {
-        Some(v) => match ctx.typed_array_bytes(v) {
-            Some(b) => (0x2u8, b),
-            None => (0x1u8, ctx.coerce_string(v)?.to_string().into_bytes()),
-        },
-        None => return Err(ctx.make_error("TypeError", "send: missing data")),
-    };
-    let (writer, mask) = {
-        let reg = ws_registry(ctx);
-        let Some(e) = reg.socks.get_mut(&id) else {
-            return Ok(Value::Bool(false)); // already closed: spec drops silently
-        };
-        if e.close_sent.load(Ordering::SeqCst) {
-            return Ok(Value::Bool(false));
-        }
-        e.mask_seed = e
-            .mask_seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        // Server-adopted sockets never mask (RFC 6455 §5.1).
-        let mask: Option<[u8; 4]> = e
-            .masked
-            .then(|| (e.mask_seed >> 24).to_be_bytes()[4..8].try_into().unwrap());
-        match &e.writer {
-            Some(w) => (w.clone(), mask),
-            None => return Err(ctx.make_error("Error", "send before open")),
-        }
-    };
-    let frame = match mask {
-        Some(m) => encode_frame(opcode, &bytes, m),
-        None => encode_frame_unmasked(opcode, &bytes),
-    };
-    let mut writer = writer;
-    writer
-        .write_all(&frame)
-        .map_err(|e| ctx.make_error("Error", format!("WebSocket send: {e}")))?;
-    Ok(Value::Bool(true))
-}
-
-/// `__ws.close(id, code, reason)` — sends the close frame (once); the read loop then surfaces
-/// the peer's echo as the close event.
-pub(crate) fn op_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
-        _ => return Err(ctx.make_error("TypeError", "close: bad socket id")),
-    };
-    let code = match args.get(1) {
-        Some(Value::Num(n)) => *n as u16,
-        _ => 1000,
-    };
-    let reason = ctx
-        .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let (writer, masked) = {
-        let reg = ws_registry(ctx);
-        let Some(e) = reg.socks.get_mut(&id) else {
-            return Ok(Value::Undefined);
-        };
-        if e.close_sent.swap(true, Ordering::SeqCst) {
-            return Ok(Value::Undefined);
-        }
-        (e.writer.clone(), e.masked)
-    };
-    if let Some(mut w) = writer {
-        let payload = close_payload(code, &reason);
-        let frame = if masked {
-            encode_frame(0x8, &payload, [0x1f, 0x2e, 0x3d, 0x4c])
-        } else {
-            encode_frame_unmasked(0x8, &payload)
-        };
-        let _ = w.write_all(&frame);
-    }
-    Ok(Value::Undefined)
-}
-
-/// `__ws.upgrade(connId, secWebSocketKey, protocol, extraHeaderPairs, dispatch)` → id.
-///
-/// Adopts a connection accepted by `Lumen.serve` (see server.rs: the parsed request's `TcpStream`
-/// sits in the resource table under `connId`) as a SERVER-side WebSocket: writes the RFC 6455
-/// 101 handshake response, then joins the same registry/read-loop machinery the client uses —
-/// with `masked: false`, since a server must not mask (§5.1). `dispatch(kind, ...)` receives
-/// `("text", string)`, `("binary", u8array)`, `("close", code, reason, wasClean)`,
-/// `("fail", code, msg)` (protocol violation), and `("io", msg)` (socket died). There is no
-/// "open" event: the connection is open the moment this op returns.
-pub(crate) fn op_ws_upgrade(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let conn_id = match args.first() {
-        Some(Value::Num(n)) if *n >= 0.0 => *n as u32,
-        _ => return Err(ctx.make_error("TypeError", "upgrade: bad connection id")),
-    };
-    let key = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let protocol = ctx
-        .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let extra_headers = crate::read_header_pairs(ctx, args.get(3).unwrap_or(&Value::Undefined))?;
-    let dispatch = match args.get(4) {
-        Some(v) if v.is_callable() => v.clone(),
-        _ => return Err(ctx.make_error("TypeError", "upgrade: dispatch must be a function")),
-    };
-
-    // Take the socket out of the resource table (same handoff as respond(); a later respond on
-    // this connection now correctly fails as "already answered").
-    let stream = ctx
-        .resource_table()
-        .close(conn_id)
-        .and_then(|rc| rc.downcast::<TcpStream>().ok())
-        .and_then(|rc| std::rc::Rc::try_unwrap(rc).ok());
-    let Some(stream) = stream else {
-        return Err(ctx.make_error(
-            "TypeError",
-            "upgrade: unknown or already-answered connection",
-        ));
-    };
-
-    // The accept loop set a read timeout to bound header parsing; a WebSocket idles legitimately.
-    stream.set_read_timeout(None).ok();
-    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
-    stream.set_nodelay(true).ok();
-
-    // Write the 101 upgrade response. It is small; writing on the loop thread matches how sends
-    // and closes are written.
-    let mut resp = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {}\r\n",
-        websocket_accept(&key)
-    );
-    if !protocol.is_empty() {
-        resp.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
-    }
-    for (name, value) in &extra_headers {
-        // The handshake-critical headers above must not be overridden by user extras.
-        if name.eq_ignore_ascii_case("upgrade")
-            || name.eq_ignore_ascii_case("connection")
-            || name.eq_ignore_ascii_case("sec-websocket-accept")
-        {
-            continue;
-        }
-        resp.push_str(&format!("{name}: {value}\r\n"));
-    }
-    resp.push_str("\r\n");
-    (&stream)
-        .write_all(resp.as_bytes())
-        .map_err(|e| ctx.make_error("Error", format!("WebSocket upgrade: handshake write: {e}")))?;
-
-    let writer = SharedStream(Arc::new(Mutex::new(Box::new(stream))));
-
-    let id = {
-        let reg = ws_registry(ctx);
-        let id = reg.next;
-        reg.next += 1;
-        reg.socks.insert(
-            id,
-            WsEntry {
-                writer: Some(writer.clone()),
-                close_sent: Arc::new(AtomicBool::new(false)),
-                dead: false,
-                dispatch,
-                mask_seed: 0,
-                masked: false,
-            },
-        );
-        id
-    };
-
-    let reader = WsReader {
-        stream: BufReader::new(writer.clone()),
-        writer,
-        mask_seed: 0,
-        masked: false,
-    };
-    arm_read(ctx, id, reader);
-    Ok(Value::Num(id as f64))
 }
 
 // ---- test support -------------------------------------------------------------------------------

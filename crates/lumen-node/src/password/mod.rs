@@ -21,7 +21,6 @@ use argon2::password_hash::{
 };
 use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
 use base64::Engine;
-use lumen_host::{ops, Ctx, OpDecl, Value};
 use crate::hash::{digest, Algo};
 use subtle::ConstantTimeEq;
 
@@ -240,162 +239,101 @@ pub fn hash_password(
 
 // ---- ops (called only by the bun.js glue) ------------------------------------------------------
 
-pub(crate) const PASSWORD_OPS: &[OpDecl] = ops![
-    "hashSync" (5) => op_hash_sync,
-    "verifySync" (2) => op_verify_sync,
-    "hash" (7) => op_hash_async,
-    "verify" (4) => op_verify_async,
-    "argon2Sync" (9) => op_argon2_sync,
-    "argon2" (11) => op_argon2_async,
-];
+pub(crate) use bindings::Module;
 
-fn arg_bytes(ctx: &mut Ctx, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, Value> {
-    ctx.typed_array_bytes(args.get(i).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", format!("{who} expects Buffer bytes")))
-}
+#[lumen_bind::module(name = "__password")]
+pub(crate) mod bindings {
+    use super::*;
+    use lumen::embed::SendError;
+    use lumen_bind::{NativeError, NativeResult};
 
-fn arg_str(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<String, Value> {
-    Ok(ctx
-        .coerce_string(args.get(i).unwrap_or(&Value::Undefined))?
-        .to_string())
-}
-
-/// Saturating f64 → u32 (the glue has already validated sign/type per Bun's messages).
-fn arg_u32(args: &[Value], i: usize) -> u32 {
-    let n = args.get(i).and_then(|v| v.as_num_opt()).unwrap_or(0.0);
-    if n.is_nan() {
-        0
-    } else {
-        n.clamp(0.0, u32::MAX as f64) as u32
-    }
-}
-
-/// The trailing `(resolve, reject)` pair the glue passes; anything else is a glue bug.
-fn settle_args(
-    ctx: &mut Ctx,
-    args: &[Value],
-    i: usize,
-    who: &str,
-) -> Result<(Value, Value), Value> {
-    match (args.get(i), args.get(i + 1)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            Ok((res.clone(), rej.clone()))
+    /// Saturating f64 to u32 (the glue has already validated sign/type per Bun's messages).
+    fn sat_u32(n: f64) -> u32 {
+        if n.is_nan() {
+            0
+        } else {
+            n.clamp(0.0, u32::MAX as f64) as u32
         }
-        _ => Err(ctx.make_error("TypeError", format!("{who} expects (resolve, reject)"))),
     }
-}
 
-fn op_hash_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let pw = arg_bytes(ctx, a, 0, "__password.hashSync")?;
-    let alg = arg_str(ctx, a, 1)?;
-    match hash_password(&pw, &alg, arg_u32(a, 2), arg_u32(a, 3), arg_u32(a, 4)) {
-        Ok(s) => Ok(Value::from_string(s)),
-        Err(e) => Err(ctx.make_error("Error", e)),
+    #[allow(clippy::too_many_arguments)]
+    fn argon2_params(
+        who: &str,
+        algorithm: &str,
+        lanes: f64,
+        out_len: f64,
+        m_cost: f64,
+        t_cost: f64,
+        secret: Vec<u8>,
+        associated_data: Vec<u8>,
+    ) -> NativeResult<Argon2Params> {
+        let variant = Argon2Variant::from_phc(algorithm)
+            .ok_or_else(|| NativeError::type_error(format!("{who}: invalid Argon2 algorithm")))?;
+        Ok(Argon2Params {
+            lanes: sat_u32(lanes),
+            out_len: sat_u32(out_len) as usize,
+            m_cost: sat_u32(m_cost),
+            t_cost: sat_u32(t_cost),
+            variant,
+            secret,
+            associated_data,
+        })
     }
-}
 
-fn op_verify_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let pw = arg_bytes(ctx, a, 0, "__password.verifySync")?;
-    let hash = arg_str(ctx, a, 1)?;
-    match verify_password(&pw, &hash) {
-        Ok(b) => Ok(Value::Bool(b)),
-        Err(e) => Err(ctx.make_error("Error", e.message())),
+    #[op(name = "hashSync")]
+    pub fn hash_sync(password: &[u8], algorithm: &str, m: f64, t: f64, cost: f64) -> NativeResult<String> {
+        hash_password(password, algorithm, sat_u32(m), sat_u32(t), sat_u32(cost)).map_err(NativeError::runtime)
     }
-}
 
-fn op_hash_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let pw = arg_bytes(ctx, a, 0, "__password.hash")?;
-    let alg = arg_str(ctx, a, 1)?;
-    let (m, t, cost) = (arg_u32(a, 2), arg_u32(a, 3), arg_u32(a, 4));
-    let (resolve, reject) = settle_args(ctx, a, 5, "__password.hash")?;
-    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_hash);
-    crate::spawn_handle(ctx)
-        .spawn_blocking(id, move || Box::new(hash_password(&pw, &alg, m, t, cost)));
-    Ok(Value::Undefined)
-}
-
-fn op_verify_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let pw = arg_bytes(ctx, a, 0, "__password.verify")?;
-    let hash = arg_str(ctx, a, 1)?;
-    let (resolve, reject) = settle_args(ctx, a, 2, "__password.verify")?;
-    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_verify);
-    crate::spawn_handle(ctx).spawn_blocking(id, move || {
-        Box::new(verify_password(&pw, &hash).map_err(|e| e.message().to_string()))
-    });
-    Ok(Value::Undefined)
-}
-
-fn argon2_args(
-    ctx: &mut Ctx,
-    a: &[Value],
-    who: &str,
-) -> Result<(Vec<u8>, Vec<u8>, Argon2Params), Value> {
-    let variant = Argon2Variant::from_phc(&arg_str(ctx, a, 0)?)
-        .ok_or_else(|| ctx.make_error("TypeError", format!("{who}: invalid Argon2 algorithm")))?;
-    let message = arg_bytes(ctx, a, 1, who)?;
-    let nonce = arg_bytes(ctx, a, 2, who)?;
-    let params = Argon2Params {
-        lanes: arg_u32(a, 3),
-        out_len: arg_u32(a, 4) as usize,
-        m_cost: arg_u32(a, 5),
-        t_cost: arg_u32(a, 6),
-        variant,
-        secret: arg_bytes(ctx, a, 7, who)?,
-        associated_data: arg_bytes(ctx, a, 8, who)?,
-    };
-    Ok((message, nonce, params))
-}
-
-fn op_argon2_sync(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let (message, nonce, params) = argon2_args(ctx, a, "crypto.argon2Sync")?;
-    match argon2_hash(&message, &nonce, &params) {
-        Ok(bytes) => ctx.make_uint8array(&bytes),
-        Err(e) => Err(ctx.make_error("Error", e)),
+    #[op(name = "verifySync")]
+    pub fn verify_sync(password: &[u8], hash: &str) -> NativeResult<bool> {
+        verify_password(password, hash).map_err(|e| NativeError::runtime(e.message()))
     }
-}
 
-fn op_argon2_async(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let (message, nonce, params) = argon2_args(ctx, a, "crypto.argon2")?;
-    let (resolve, reject) = settle_args(ctx, a, 9, "crypto.argon2")?;
-    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_argon2);
-    crate::spawn_handle(ctx)
-        .spawn_blocking(id, move || Box::new(argon2_hash(&message, &nonce, &params)));
-    Ok(Value::Undefined)
-}
-
-fn decode_argon2(
-    ctx: &mut Ctx,
-    payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
-    match *payload
-        .downcast::<Result<Vec<u8>, String>>()
-        .expect("argon2 payload")
-    {
-        Ok(bytes) => Ok(vec![ctx.make_uint8array(&bytes)?]),
-        Err(m) => Err(ctx.make_error("Error", m)),
+    #[op(async, name = "hash")]
+    pub fn hash_async(password: Vec<u8>, algorithm: String, m: f64, t: f64, cost: f64) -> Result<String, SendError> {
+        hash_password(&password, &algorithm, sat_u32(m), sat_u32(t), sat_u32(cost))
+            .map_err(|e| SendError::new("Error", e))
     }
-}
 
-fn decode_hash(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
-    match *payload
-        .downcast::<Result<String, String>>()
-        .expect("hash payload")
-    {
-        Ok(s) => Ok(vec![Value::from_string(s)]),
-        Err(m) => Err(ctx.make_error("Error", m)),
+    #[op(async, name = "verify")]
+    pub fn verify_async(password: Vec<u8>, hash: String) -> Result<bool, SendError> {
+        verify_password(&password, &hash).map_err(|e| SendError::new("Error", e.message()))
     }
-}
 
-fn decode_verify(
-    ctx: &mut Ctx,
-    payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
-    match *payload
-        .downcast::<Result<bool, String>>()
-        .expect("verify payload")
-    {
-        Ok(b) => Ok(vec![Value::Bool(b)]),
-        Err(m) => Err(ctx.make_error("Error", m)),
+    #[op(name = "argon2Sync")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn argon2_sync(
+        algorithm: &str,
+        message: &[u8],
+        nonce: &[u8],
+        lanes: f64,
+        out_len: f64,
+        m_cost: f64,
+        t_cost: f64,
+        secret: Vec<u8>,
+        associated_data: Vec<u8>,
+    ) -> NativeResult<Vec<u8>> {
+        let params = argon2_params("crypto.argon2Sync", algorithm, lanes, out_len, m_cost, t_cost, secret, associated_data)?;
+        argon2_hash(message, nonce, &params).map_err(NativeError::runtime)
+    }
+
+    #[op(async, name = "argon2")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn argon2_async(
+        algorithm: String,
+        message: Vec<u8>,
+        nonce: Vec<u8>,
+        lanes: f64,
+        out_len: f64,
+        m_cost: f64,
+        t_cost: f64,
+        secret: Vec<u8>,
+        associated_data: Vec<u8>,
+    ) -> Result<Vec<u8>, SendError> {
+        let params = argon2_params("crypto.argon2", &algorithm, lanes, out_len, m_cost, t_cost, secret, associated_data)
+            .map_err(SendError::from)?;
+        argon2_hash(&message, &nonce, &params).map_err(|e| SendError::new("Error", e))
     }
 }
 

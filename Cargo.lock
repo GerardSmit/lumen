@@ -989,6 +989,7 @@ dependencies = [
 name = "lumen-tls"
 version = "0.1.3"
 dependencies = [
+ "lumen-common",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -1013,6 +1014,7 @@ version = "0.1.3"
 dependencies = [
  "js-sys",
  "lumen",
+ "lumen-bind",
  "lumen-codegen",
  "lumen-common",
  "lumen-host",

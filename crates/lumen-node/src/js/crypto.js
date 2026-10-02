@@ -425,7 +425,7 @@ class Hmac {
 class HashJob extends CryptoJob {
   constructor(mode, algorithm, data, length) {
     super(mode);
-    if (__rc.hashInfo(algorithm) === null) throw invalidDigest(algorithm);
+    if (__rc.hashInfo(algorithm) == null) throw invalidDigest(algorithm);
     this.algorithm = algorithm;
     this.data = new Uint8Array(bytesOf(data));
     this.length = length;
@@ -440,7 +440,7 @@ class HmacJob extends CryptoJob {
   constructor(mode, signMode, hash, key, data, signature) {
     super(mode);
     const info = __rc.hashInfo(hash);
-    if (info === null || info[2]) throw invalidDigest(hash);
+    if (info == null || info[2]) throw invalidDigest(hash);
     this.signMode = signMode;
     this.hash = hash;
     this.key = secretBytes(key);
@@ -459,7 +459,7 @@ class PBKDF2Job extends CryptoJob {
   constructor(mode, password, salt, iterations, keylen, digest) {
     super(mode);
     const info = __rc.hashInfo(digest);
-    if (info === null || info[2]) throw invalidDigest(digest);
+    if (info == null || info[2]) throw invalidDigest(digest);
     this.args = [digest, new Uint8Array(bytesOf(password)), new Uint8Array(bytesOf(salt)), iterations, keylen];
   }
 
@@ -494,7 +494,7 @@ class HKDFJob extends CryptoJob {
   constructor(mode, hash, key, salt, info, length) {
     super(mode);
     const hi = __rc.hashInfo(hash);
-    if (hi === null || hi[2]) throw invalidDigest(hash);
+    if (hi == null || hi[2]) throw invalidDigest(hash);
     if (length > 255 * hi[0]) {
       throw cryptoError(RangeError, "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length");
     }
@@ -664,7 +664,7 @@ class KeyObjectHandle {
 
   initEDRaw(name, data, type) {
     const der = __rc.keyImportOkpRaw(name, bytesOf(data), type === cryptoBinding.kKeyTypePrivate);
-    if (der === null) return false;
+    if (der == null) return false;
     this._type = type;
     this._data = new Uint8Array(der);
     return true;
@@ -672,7 +672,7 @@ class KeyObjectHandle {
 
   initECRaw(curve, data) {
     const der = __rc.keyImportEcRaw(curve, bytesOf(data));
-    if (der === null) return false;
+    if (der == null) return false;
     this._type = cryptoBinding.kKeyTypePublic;
     this._data = new Uint8Array(der);
     return true;
@@ -1016,7 +1016,7 @@ class CipherBase {
 
   init(cipher, password, authTagLength) {
     const mode = __rc.cipherMode(cipher);
-    if (mode === null) throw cryptoError(Error, "ERR_CRYPTO_UNKNOWN_CIPHER", "Unknown cipher");
+    if (mode == null) throw cryptoError(Error, "ERR_CRYPTO_UNKNOWN_CIPHER", "Unknown cipher");
     if (this._enc && (mode === "ctr" || mode === "gcm" || mode === "ccm")) {
       process.emitWarning(`Use Cipheriv for counter mode of ${cipher}`);
     }
@@ -1049,7 +1049,7 @@ class CipherBase {
 
   getAuthTag() {
     const tag = this._c.authTag();
-    return tag === null ? undefined : asBuffer(tag);
+    return tag == null ? undefined : asBuffer(tag);
   }
 
   setAuthTag(tag) {
@@ -1065,7 +1065,7 @@ function getCipherInfo(info, nameOrNid, keyLength, ivLength) {
   const r = typeof nameOrNid === "string" ?
     __rc.cipherInfo(nameOrNid, 0, keyLength, ivLength) :
     __rc.cipherInfo(undefined, nameOrNid, keyLength, ivLength);
-  if (r === null) return undefined;
+  if (r == null) return undefined;
   const [name, mode, [nid, blockSize, ivLen, keyLen]] = r;
   info.mode = mode;
   info.name = name;
@@ -1165,7 +1165,7 @@ function resolveKey(kind, data, format, type, passphrase) {
 
 function digestOrUndefined(algorithm) {
   if (algorithm === undefined || algorithm === null) return undefined;
-  if (__rc.hashInfo(algorithm) === null) throw invalidDigest(algorithm);
+  if (__rc.hashInfo(algorithm) == null) throw invalidDigest(algorithm);
   return algorithm;
 }
 
@@ -1192,7 +1192,7 @@ function sigVerify(key, algorithm, data, signature, padding, salt, dsaEncoding) 
 
 class Sign {
   init(algorithm) {
-    if (__rc.hashInfo(algorithm) === null) {
+    if (__rc.hashInfo(algorithm) == null) {
       throw cryptoError(TypeError, "ERR_CRYPTO_INVALID_DIGEST", "Invalid digest");
     }
     this._algorithm = algorithm;
@@ -1399,7 +1399,7 @@ class DiffieHellmanGroup extends DiffieHellmanBase {
   constructor(name) {
     super();
     const params = __rc.dhGroupParams(name);
-    if (params === null) throw cryptoError(Error, "ERR_CRYPTO_UNKNOWN_DH_GROUP", "Unknown DH group");
+    if (params == null) throw cryptoError(Error, "ERR_CRYPTO_UNKNOWN_DH_GROUP", "Unknown DH group");
     this._init(new Uint8Array(params[0]), new Uint8Array(params[1]));
   }
 }
@@ -1558,7 +1558,7 @@ function orUndefined(value) {
 }
 
 function nameObject(entries) {
-  if (entries === null) return undefined;
+  if (entries == null) return undefined;
   const out = { __proto__: null };
   for (let i = 0; i < entries.length; i += 2) {
     const key = entries[i];
@@ -1710,7 +1710,7 @@ function parseX509(buffer) {
 
 function spkacResult(fn, buffer) {
   const out = fn(bytesOf(buffer));
-  return out === null ? "" : asBuffer(out);
+  return out == null ? "" : asBuffer(out);
 }
 
 Object.assign(cryptoBinding, {

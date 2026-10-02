@@ -7,14 +7,15 @@
 //! Handles live in a [`ChildRegistry`] in OpState, wrapped in `Arc<Mutex<>>` so the worker threads
 //! can read/write them. `kill` sends SIGKILL (std can't send arbitrary signals).
 
+use lumen_bind::NativeError;
+use lumen_host::OpError;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use lumen_host::{
-    ops, ChildRealm, ChildRealmExit, ChildRealmRequest, CompletionSender, Ctx, OpDecl, TaskId,
-    TaskRegistry, Value,
+    ChildRealm, ChildRealmExit, ChildRealmRequest, CompletionSender, Ctx, TaskId, TaskRegistry, Value,
 };
 
 /// A readable child stream (stdout or stderr), boxed to a common type.
@@ -93,90 +94,32 @@ pub struct ChildRegistry {
     procs: HashMap<u32, ChildProc>,
 }
 
-pub const CHILD_OPS: &[OpDecl] = ops![
-    "spawn" (7) => op_spawn,
-    "read" (4) => op_read,
-    "write" (4) => op_write,
-    "wait" (3) => op_wait,
-    "unref" (1) => op_unref,
-    "ref" (1) => op_ref,
-    "kill" (2) => op_kill,
-    "closeStdin" (1) => op_close_stdin,
-    "writeFd" (5) => op_write_fd,
-    "closeFd" (2) => op_close_fd,
-    "execSync" (8) => op_exec_sync,
-    "ipcOpen" (1) => op_ipc_open,
-    "ipcRead" (1) => op_ipc_read,
-    "ipcWrite" (2) => op_ipc_write,
-    "ipcClose" (1) => op_ipc_close,
-];
+/// `spawn(cmd, argv, cwd, env, stdio, verbatim, opts)` minus the command.
+struct SpawnArgs {
+    argv: Value,
+    cwd: Value,
+    env: Value,
+    stdio: Value,
+    verbatim: bool,
+    opts: Value,
+}
 
 // Dedicated inherited IPC descriptors are socketpairs. Keep the child event loop
 // nonblocking; JS controls channel ref/unref and bounds queued serialized messages.
-fn ipc_fd(ctx: &mut Ctx, args: &[Value]) -> Result<i32, Value> {
-    match args.first().and_then(Value::as_num_opt) {
-        Some(fd) if fd >= 3.0 && fd <= i32::MAX as f64 && fd.fract() == 0.0 => Ok(fd as i32),
-        _ => Err(ctx.make_error("TypeError", "IPC descriptor must be an integer of at least 3")),
+fn ipc_fd(fd: f64) -> Result<i32, OpError> {
+    if fd >= 3.0 && fd <= i32::MAX as f64 && fd.fract() == 0.0 {
+        Ok(fd as i32)
+    } else {
+        Err(NativeError::type_error("IPC descriptor must be an integer of at least 3").into())
     }
 }
-fn ipc_failure(ctx: &mut Ctx) -> Value {
-    let error=std::io::Error::last_os_error();
-    let value=ctx.make_error("Error",format!("IPC descriptor: {error}"));
-    let _=ctx.set_member(&value,"code",Value::str(lumen_os::errno::uv_code(&error)));value
+fn ipc_failure() -> NativeError {
+    let error = std::io::Error::last_os_error();
+    NativeError::runtime(format!("IPC descriptor: {error}")).with_prop("code", lumen_os::errno::uv_code(&error))
 }
-fn op_ipc_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd=ipc_fd(ctx,args)?;
-    #[cfg(unix)] {
-        if lumen_os::fdctl::set_blocking(fd,false).is_err() { return Err(ipc_failure(ctx)); }
-        Ok(Value::Undefined)
-    }
-    #[cfg(not(unix))] {let _=fd;Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
-}
-fn op_ipc_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd=ipc_fd(ctx,args)?;
-    #[cfg(unix)] {
-        let mut bytes=[0u8;65536];let count=unsafe {libc::read(fd,bytes.as_mut_ptr().cast(),bytes.len())};
-        if count<0 {
-            let error=std::io::Error::last_os_error();
-            if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) {return Ok(Value::Null);}
-            return Err(ipc_failure(ctx));
-        }
-        ctx.make_uint8array(&bytes[..count as usize])
-    }
-    #[cfg(not(unix))] {let _=fd;Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
-}
-fn op_ipc_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd=ipc_fd(ctx,args)?;
-    let bytes=args.get(1).and_then(|value|ctx.typed_array_bytes(value)).ok_or_else(||ctx.make_error("TypeError","IPC write requires bytes"))?;
-    #[cfg(unix)] {
-        // send suppresses SIGPIPE on Linux/Android; macOS socket setup uses SO_NOSIGPIPE.
-        #[cfg(any(target_os="linux",target_os="android"))] let count=unsafe {libc::send(fd,bytes.as_ptr().cast(),bytes.len(),libc::MSG_NOSIGNAL)};
-        #[cfg(not(any(target_os="linux",target_os="android")))] let count=unsafe {libc::write(fd,bytes.as_ptr().cast(),bytes.len())};
-        if count<0 {
-            let error=std::io::Error::last_os_error();
-            if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) {return Ok(Value::Num(0.0));}
-            return Err(ipc_failure(ctx));
-        }
-        Ok(Value::Num(count as f64))
-    }
-    #[cfg(not(unix))] {let _=(fd,bytes);Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
-}
-fn op_ipc_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd=ipc_fd(ctx,args)?;
-    #[cfg(unix)] {
-        // A child realm's channel is closed by the host that made it, after the realm ends; the
-        // descriptor number must stay valid until then. Shutting it down is what the peer sees.
-        let owned=ctx.op_state().get::<lumen_host::RealmProcess>().is_some_and(|realm|realm.owned_fds.contains(&fd));
-        let status=if owned {unsafe {libc::shutdown(fd,libc::SHUT_RDWR)}} else {unsafe {libc::close(fd)}};
-        if status<0 {return Err(ipc_failure(ctx));}
-        Ok(Value::Undefined)
-    }
-    #[cfg(not(unix))] {let _=fd;Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
-}
-
 // ---- helpers ----------------------------------------------------------------------------------
 
-fn read_string_array(ctx: &mut Ctx, v: &Value) -> Result<Vec<String>, Value> {
+fn read_string_array(ctx: &mut Ctx, v: &Value) -> Result<Vec<String>, OpError> {
     let mut out = Vec::new();
     if v.as_obj().is_none() {
         return Ok(out);
@@ -244,7 +187,7 @@ fn apply_cwd(ctx: &mut Ctx, command: &mut Command, cwd: Option<String>) {
 }
 
 /// env: an array of `[k, v]` pairs *replaces* the environment (Node semantics); absent = inherit.
-fn apply_env(ctx: &mut Ctx, command: &mut Command, env_pairs: &Value) -> Result<(), Value> {
+fn apply_env(ctx: &mut Ctx, command: &mut Command, env_pairs: &Value) -> Result<(), OpError> {
     if env_pairs.as_obj().is_none() {
         return Ok(());
     }
@@ -268,14 +211,14 @@ fn apply_env(ctx: &mut Ctx, command: &mut Command, env_pairs: &Value) -> Result<
 fn build_command(
     ctx: &mut Ctx,
     cmd: &str,
-    args: &[Value],
-) -> Result<(Command, Vec<String>), Value> {
-    let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
-    let cwd = opt_string(ctx, args.get(2));
-    let env_pairs = args.get(3).cloned().unwrap_or(Value::Undefined);
-    let stdio = read_string_array(ctx, args.get(4).unwrap_or(&Value::Undefined))?;
+    args: &SpawnArgs,
+) -> Result<(Command, Vec<String>), OpError> {
+    let arg_list = read_string_array(ctx, &args.argv)?;
+    let cwd = opt_string(ctx, Some(&args.cwd));
+    let env_pairs = args.env.clone();
+    let stdio = read_string_array(ctx, &args.stdio)?;
 
-    let verbatim = matches!(args.get(5), Some(Value::Bool(true)));
+    let verbatim = args.verbatim;
 
     let mut command = Command::new(cmd);
     add_args(&mut command, &arg_list, verbatim);
@@ -391,11 +334,9 @@ fn add_args(command: &mut Command, arg_list: &[String], verbatim: bool) {
 
 /// A failed spawn as an error carrying the errno `code` (`ENOENT` for a missing program); the JS
 /// glue turns it into Node's `spawn <file> ENOENT` error with `syscall`, `path` and `spawnargs`.
-fn spawn_failure(ctx: &mut Ctx, cmd: &str, e: &std::io::Error) -> Value {
+fn spawn_failure(cmd: &str, e: &std::io::Error) -> NativeError {
     let code = lumen_os::errno::uv_code(e);
-    let err = ctx.make_error("Error", format!("spawn {cmd} {code}"));
-    let _ = ctx.set_member(&err, "code", Value::str(code));
-    err
+    NativeError::runtime(format!("spawn {cmd} {code}")).with_prop("code", code)
 }
 
 struct SpawnOpts {
@@ -447,63 +388,6 @@ fn apply_spawn_opts(command: &mut Command, o: &SpawnOpts) {
 #[cfg(not(unix))]
 fn apply_spawn_opts(_command: &mut Command, _o: &SpawnOpts) {}
 
-fn op_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let cmd = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    if let Some(started) = spawn_child_realm(ctx, &cmd, args)? {
-        return Ok(started);
-    }
-    #[cfg(windows)]
-    if args
-        .get(4)
-        .is_some_and(|v| read_string_array(ctx, v).is_ok_and(|s| s.iter().skip(3).any(|k| k == "pipe")))
-    {
-        return spawn_windows_extra(ctx, &cmd, args);
-    }
-    let (mut command, stdio) = build_command(ctx, &cmd, args)?;
-    let spawn_opts = read_spawn_opts(ctx, args.get(6));
-    apply_spawn_opts(&mut command, &spawn_opts);
-    command
-        .stdin(stdio_for(&stdio[0]))
-        .stdout(stdio_for(&stdio[1]))
-        .stderr(stdio_for(&stdio[2]));
-    let mut ipc_fd = None;
-    let extra = wire_extra_stdio(&mut command, &stdio, &mut ipc_fd)
-        .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
-
-    let mut child = match lumen_host::spawn_command(ctx, &mut command) {
-        Ok(child) => child,
-        Err(e) => {
-            #[cfg(unix)]
-            if let Some(fd) = ipc_fd {
-                // SAFETY: the parent's end of the channel, owned here and never handed out.
-                unsafe { libc::close(fd) };
-            }
-            return Err(spawn_failure(ctx, &cmd, &e));
-        }
-    };
-    let pid = child.id();
-    let stdout: Option<Box<dyn Read + Send>> = child.stdout.take().map(|s| Box::new(s) as _);
-    let stderr: Option<Box<dyn Read + Send>> = child.stderr.take().map(|s| Box::new(s) as _);
-    let stdin: Option<Box<dyn Write + Send>> = child.stdin.take().map(|s| Box::new(s) as _);
-    let proc = ChildProc {
-        stdin: Arc::new(Mutex::new(stdin)),
-        stdout: Arc::new(Mutex::new(stdout)),
-        stderr: Arc::new(Mutex::new(stderr)),
-        extra,
-        child: Arc::new(Mutex::new(ProcHandle::Std(child))),
-        unref: false,
-        pending_tasks: Vec::new(),
-        pipes: Vec::new(),
-    };
-    let info = register_child(ctx, proc, pid);
-    if let Some(fd) = ipc_fd {
-        let _ = ctx.set_member(&info, "ipcFd", Value::Num(fd as f64));
-    }
-    Ok(info)
-}
-
 fn register_child(ctx: &mut Ctx, proc: ChildProc, pid: u32) -> Value {
     let reg = ctx
         .host_mut::<ChildRegistry>()
@@ -522,15 +406,15 @@ fn register_child(ctx: &mut Ctx, proc: ChildProc, pid: u32) -> Value {
 /// child is created directly and gets them through the C runtime's inheritance block, as
 /// libuv does (see `win_spawn`).
 #[cfg(windows)]
-fn spawn_windows_extra(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Value, Value> {
-    let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
-    let cwd = opt_string(ctx, args.get(2));
-    let env_pairs = args.get(3).cloned().unwrap_or(Value::Undefined);
-    let mut stdio = read_string_array(ctx, args.get(4).unwrap_or(&Value::Undefined))?;
+fn spawn_windows_extra(ctx: &mut Ctx, cmd: &str, args: &SpawnArgs) -> Result<Value, OpError> {
+    let arg_list = read_string_array(ctx, &args.argv)?;
+    let cwd = opt_string(ctx, Some(&args.cwd));
+    let env_pairs = args.env.clone();
+    let mut stdio = read_string_array(ctx, &args.stdio)?;
     while stdio.len() < 3 {
         stdio.push("pipe".to_string());
     }
-    let verbatim = matches!(args.get(5), Some(Value::Bool(true)));
+    let verbatim = args.verbatim;
     // The same cwd rule as `apply_cwd`: the one asked for (relative to the realm's), else the
     // realm's, else inherited.
     let cwd = match ctx.op_state().get::<lumen_host::RealmProcess>() {
@@ -567,7 +451,7 @@ fn spawn_windows_extra(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Value
         env,
         stdio: &stdio,
     };
-    let spawned = crate::win_spawn::spawn(&spec).map_err(|e| spawn_failure(ctx, cmd, &e))?;
+    let spawned = crate::win_spawn::spawn(&spec).map_err(|e| spawn_failure(cmd, &e))?;
     let pid = spawned.child.id();
     let extra = spawned
         .extra
@@ -596,13 +480,12 @@ fn spawn_windows_extra(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Value
 }
 
 fn take_resolve_reject(
-    ctx: &mut Ctx,
     res: Option<&Value>,
     rej: Option<&Value>,
-) -> Result<(Value, Value), Value> {
+) -> Result<(Value, Value), OpError> {
     match (res, rej) {
         (Some(r), Some(j)) if r.is_callable() && j.is_callable() => Ok((r.clone(), j.clone())),
-        _ => Err(ctx.make_error("TypeError", "child op expects (resolve, reject)")),
+        _ => Err(NativeError::type_error("child op expects (resolve, reject)").into()),
     }
 }
 
@@ -616,54 +499,6 @@ fn completions(ctx: &mut Ctx) -> CompletionSender {
         .clone()
 }
 
-/// `(childId, which, resolve, reject)` — read a chunk from stdout (which=1), stderr (which=2) or
-/// an extra stdio pipe (which=3+). Resolves with a Uint8Array, or `null` at EOF.
-fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0) as u32;
-    let (resolve, reject) = take_resolve_reject(ctx, args.get(2), args.get(3))?;
-
-    let (handle, unref) = ctx
-        .host_mut::<ChildRegistry>()
-        .and_then(|r| r.procs.get(&child_id))
-        .and_then(|p| {
-            let h = match which {
-                2 => p.stderr.clone(),
-                3.. => p.extra.get(&which)?.reader.clone(),
-                _ => p.stdout.clone(),
-            };
-            Some((h, p.unref))
-        })
-        .ok_or_else(|| ctx.make_error("Error", "child: unknown process or stdio slot"))?;
-
-    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    // The task inherits the child's current ref state; `child.ref()`/`unref()` can toggle it later.
-    if unref {
-        reg.set_unref(id);
-    }
-    track_child_task(ctx, child_id, id);
-    completions(ctx).run_blocking(id, move || {
-        let mut guard = handle.lock().expect("stream lock");
-        let result: Result<Vec<u8>, String> = match guard.as_mut() {
-            Some(stream) => {
-                let mut buf = vec![0u8; 65536];
-                match stream.read(&mut buf) {
-                    Ok(0) => Ok(Vec::new()),
-                    Ok(n) => {
-                        buf.truncate(n);
-                        Ok(buf)
-                    }
-                    Err(e) => Err(format!("read: {e}")),
-                }
-            }
-            None => Ok(Vec::new()),
-        };
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
-}
-
 fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
     match *payload
         .downcast::<Result<Vec<u8>, String>>()
@@ -671,42 +506,8 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
     {
         Ok(bytes) if bytes.is_empty() => Ok(vec![Value::Null]), // EOF
         Ok(bytes) => Ok(vec![ctx.make_uint8array(&bytes)?]),
-        Err(e) => Err(ctx.make_error("Error", e)),
+        Err(e) => Err(OpError::from(NativeError::runtime(e)).to_value(ctx)),
     }
-}
-
-/// `(childId, bytes, resolve, reject)` — write to the child's stdin.
-fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let data = ctx
-        .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "child write expects bytes"))?;
-    let (resolve, reject) = take_resolve_reject(ctx, args.get(2), args.get(3))?;
-
-    let handle = ctx
-        .host_mut::<ChildRegistry>()
-        .and_then(|r| r.procs.get(&child_id))
-        .map(|p| p.stdin.clone())
-        .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
-
-    let id = lumen_host::register_task(
-        ctx,
-        resolve,
-        Some(reject),
-        decode_ok,
-    );
-    completions(ctx).run_blocking(id, move || {
-        let mut guard = handle.lock().expect("stdin lock");
-        let result: Result<(), String> = match guard.as_mut() {
-            Some(stdin) => stdin
-                .write_all(&data)
-                .and_then(|()| stdin.flush())
-                .map_err(|e| format!("write: {e}")),
-            None => Err("child stdin is closed".to_string()),
-        };
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
 }
 
 fn decode_ok(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
@@ -715,43 +516,8 @@ fn decode_ok(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Ve
         .expect("ok payload")
     {
         Ok(()) => Ok(vec![]),
-        Err(e) => Err(ctx.make_error("Error", e)),
+        Err(e) => Err(OpError::from(NativeError::runtime(e)).to_value(ctx)),
     }
-}
-
-/// `(childId, resolve, reject)` — wait for exit; resolves with `[code, signal]`: the exit code
-/// and `null`, or `null` and the terminating signal number.
-fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
-    let (handle, unref) = ctx
-        .host_mut::<ChildRegistry>()
-        .and_then(|r| r.procs.get(&child_id))
-        .map(|p| (p.child.clone(), p.unref))
-        .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
-
-    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_exit);
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    if unref {
-        reg.set_unref(id);
-    }
-    track_child_task(ctx, child_id, id);
-    completions(ctx).run_blocking(id, move || {
-        // Poll try_wait(), releasing the child lock between checks, so `kill()` can acquire it (a
-        // blocking wait() would hold the lock for the child's whole life and deadlock kill).
-        let result: Result<(Option<i32>, Option<i32>), String> = loop {
-            {
-                match handle.lock().expect("child lock").try_wait() {
-                    Ok(Some(status)) => break Ok(status),
-                    Ok(None) => {}
-                    Err(e) => break Err(e.to_string()),
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
 }
 
 fn decode_exit(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
@@ -763,7 +529,7 @@ fn decode_exit(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
             let num = |n: Option<i32>| n.map_or(Value::Null, |n| Value::Num(n as f64));
             Ok(vec![ctx.make_array(vec![num(code), num(signal)])])
         }
-        Err(e) => Err(ctx.make_error("Error", e)),
+        Err(e) => Err(OpError::from(NativeError::runtime(e)).to_value(ctx)),
     }
 }
 
@@ -811,85 +577,6 @@ fn set_child_ref(ctx: &mut Ctx, child_id: u32, unref: bool) {
     }
 }
 
-/// `(childId)` — `child.unref()`.
-fn op_unref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    set_child_ref(ctx, child_id, true);
-    Ok(Value::Undefined)
-}
-
-/// `(childId)` — `child.ref()`.
-fn op_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    set_child_ref(ctx, child_id, false);
-    Ok(Value::Undefined)
-}
-
-/// `(childId, fd, bytes, resolve, reject)` — write to an extra stdio pipe (fd 3+).
-fn op_write_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let fd = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let data = ctx
-        .typed_array_bytes(args.get(2).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "child write expects bytes"))?;
-    let (resolve, reject) = take_resolve_reject(ctx, args.get(3), args.get(4))?;
-
-    let handle = ctx
-        .host_mut::<ChildRegistry>()
-        .and_then(|r| r.procs.get(&child_id))
-        .and_then(|p| p.extra.get(&fd))
-        .map(|e| e.writer.clone())
-        .ok_or_else(|| ctx.make_error("Error", "child: unknown process or stdio slot"))?;
-
-    let id = lumen_host::register_task(
-        ctx,
-        resolve,
-        Some(reject),
-        decode_ok,
-    );
-    completions(ctx).run_blocking(id, move || {
-        let mut guard = handle.lock().expect("pipe lock");
-        let result: Result<(), String> = match guard.as_mut() {
-            Some(w) => w
-                .write_all(&data)
-                .and_then(|()| w.flush())
-                .map_err(|e| format!("write: {e}")),
-            None => Err("child pipe is closed".to_string()),
-        };
-        Box::new(result)
-    });
-    Ok(Value::Undefined)
-}
-
-/// `(childId, fd)` — close the parent's write half of an extra stdio pipe (EOF to the child).
-fn op_close_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let fd = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    if let Some(e) = ctx
-        .host_mut::<ChildRegistry>()
-        .and_then(|r| r.procs.get(&child_id))
-        .and_then(|p| p.extra.get(&fd))
-    {
-        e.writer.lock().expect("pipe lock").take();
-    }
-    Ok(Value::Undefined)
-}
-
-/// `(childId, signal)` — `signal` is the numeric signal (0 only probes that the child exists). On unix
-/// any signal is delivered with kill(2); elsewhere every signal is a hard kill. A child realm gets
-/// it as an OS process would: `SIGKILL` stops it at once, any other reaches its `process.on`
-/// listeners or takes the default action (see `ChildRealm::signal`).
-fn op_kill(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    let signal = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as i32;
-    let killed = ctx
-        .host_mut::<ChildRegistry>()
-        .and_then(|r| r.procs.get(&child_id))
-        .map(|p| send_signal(&p.child, signal))
-        .unwrap_or(false);
-    Ok(Value::Bool(killed))
-}
-
 #[cfg(unix)]
 fn send_signal(child: &Arc<Mutex<ProcHandle>>, signal: i32) -> bool {
     let mut child = child.lock().expect("child lock");
@@ -928,195 +615,9 @@ fn send_signal(child: &Arc<Mutex<ProcHandle>>, signal: i32) -> bool {
     child.kill().is_ok()
 }
 
-fn op_close_stdin(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let child_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
-    if let Some(p) = ctx
-        .host_mut::<ChildRegistry>()
-        .and_then(|r| r.procs.get(&child_id))
-    {
-        p.stdin.lock().expect("stdin lock").take(); // drop → EOF to the child
-    }
-    Ok(Value::Undefined)
-}
-
 #[cfg(unix)]
 fn signal_pid(pid: u32, signal: i32) {
     let _ = lumen_os::proc::kill(pid as i32, signal);
-}
-
-/// `(cmd, argsArray, inputBytesOrNull, cwd, envPairsOrNull, verbatim, timeoutMs, opts)` with
-/// `opts = { stdio: [in, out, err], argv0, uid, gid, killSignal, maxBuffer }`. Synchronous: spawns,
-/// writes optional stdin, waits, and captures piped output — for the `*Sync` APIs. A child whose
-/// output passes `maxBuffer` or that outlives `timeout` is killed with `killSignal`.
-fn op_exec_sync(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let cmd = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
-    let input = ctx.typed_array_bytes(args.get(2).unwrap_or(&Value::Undefined));
-    let cwd = opt_string(ctx, args.get(3));
-    let env_pairs = args.get(4).cloned().unwrap_or(Value::Undefined);
-    let verbatim = matches!(args.get(5), Some(Value::Bool(true)));
-    let opts = args.get(7).cloned().unwrap_or(Value::Undefined);
-    let (stdio, max_buffer, kill_signal) = if opts.as_obj().is_some() {
-        let stdio_v = ctx.get_member(&opts, "stdio").unwrap_or(Value::Undefined);
-        let stdio = read_string_array(ctx, &stdio_v)?;
-        let max = match ctx.get_member(&opts, "maxBuffer") {
-            Ok(Value::Num(n)) if n.is_finite() && n >= 0.0 => Some(n as usize),
-            _ => None,
-        };
-        let sig = match ctx.get_member(&opts, "killSignal") {
-            Ok(Value::Num(n)) if n > 0.0 => n as i32,
-            _ => 15,
-        };
-        (stdio, max, sig)
-    } else {
-        (Vec::new(), None, 15)
-    };
-    let mode = |i: usize| stdio.get(i).map(String::as_str).unwrap_or("pipe");
-    let timeout = args
-        .get(6)
-        .and_then(Value::as_num_opt)
-        .filter(|t| t.is_finite() && *t > 0.0)
-        .map(|t| std::time::Duration::from_secs_f64(t / 1000.0));
-    if let Some(site) = realm_site(ctx, &cmd) {
-        let sync = SyncRealm {
-            input,
-            modes: [mode(0).to_string(), mode(1).to_string(), mode(2).to_string()],
-            max_buffer,
-            kill_signal,
-            timeout,
-        };
-        let env = read_env_pairs(ctx, &env_pairs)?;
-        return exec_sync_in_realm(ctx, site, &cmd, &arg_list, cwd, env, sync);
-    }
-    let spawn_opts = read_spawn_opts(ctx, Some(&opts));
-
-    let mut command = Command::new(&cmd);
-    add_args(&mut command, &arg_list, verbatim);
-    apply_spawn_opts(&mut command, &spawn_opts);
-    command
-        .stdout(stdio_for(mode(1)))
-        .stderr(stdio_for(mode(2)));
-    command.stdin(match mode(0) {
-        "inherit" => Stdio::inherit(),
-        "pipe" if input.is_some() => Stdio::piped(),
-        _ => Stdio::null(),
-    });
-    apply_cwd(ctx, &mut command, cwd);
-    apply_env(ctx, &mut command, &env_pairs)?;
-    let mut child =
-        lumen_host::spawn_command(ctx, &mut command).map_err(|e| spawn_failure(ctx, &cmd, &e))?;
-    let pid = child.id();
-    // Feed stdin from its own thread (dropping it signals EOF): a child that fills its stdout
-    // pipe before draining stdin would otherwise deadlock against this write.
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-    }
-    let exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
-    let pipes: [(u8, Option<Box<dyn Read + Send>>); 2] = [
-        (1, child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
-        (2, child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
-    ];
-    let mut piped = [false; 3];
-    for (which, pipe) in pipes {
-        if let Some(mut pipe) = pipe {
-            piped[which as usize] = true;
-            let tx = tx.clone();
-            let exceeded = Arc::clone(&exceeded);
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let mut chunk = vec![0u8; 65536];
-                loop {
-                    match pipe.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            buf.extend_from_slice(&chunk[..n]);
-                            if max_buffer.is_some_and(|max| buf.len() > max) {
-                                exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
-                                #[cfg(unix)]
-                                signal_pid(pid, kill_signal);
-                                break;
-                            }
-                        }
-                    }
-                }
-                let _ = tx.send((which, buf));
-            });
-        }
-    }
-    drop(tx);
-    let wait_error = |ctx: &mut Ctx, e: std::io::Error| ctx.make_error("Error", format!("exec {cmd}: {e}"));
-    let mut timed_out = false;
-    let stop = |child: &mut Child| {
-        #[cfg(unix)]
-        signal_pid(child.id(), kill_signal);
-        #[cfg(not(unix))]
-        let _ = child.kill();
-    };
-    let interrupt = ctx.interrupt_for_host();
-    let status = if timeout.is_none() && !cfg!(unix) && max_buffer.is_some()
-        || timeout.is_some()
-        || interrupt.is_some()
-    {
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(status) = child.try_wait().map_err(|e| wait_error(ctx, e))? {
-                break status;
-            }
-            if interrupt
-                .as_ref()
-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
-            {
-                stop(&mut child);
-                let _ = child.wait();
-                ctx.poll_interrupt_for_host()?;
-            }
-            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-                timed_out = true;
-                stop(&mut child);
-                break child.wait().map_err(|e| wait_error(ctx, e))?;
-            }
-            if !cfg!(unix) && exceeded.load(std::sync::atomic::Ordering::SeqCst) {
-                stop(&mut child);
-                break child.wait().map_err(|e| wait_error(ctx, e))?;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    } else {
-        child.wait().map_err(|e| wait_error(ctx, e))?
-    };
-    // After a timeout, a grandchild may still hold the pipes: take what arrived, don't wait.
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    loop {
-        let got = if timed_out || exceeded.load(std::sync::atomic::Ordering::SeqCst) {
-            rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
-        } else {
-            rx.recv().ok()
-        };
-        match got {
-            Some((1, bytes)) => stdout = bytes,
-            Some((_, bytes)) => stderr = bytes,
-            None => break,
-        }
-    }
-
-    exec_result(
-        ctx,
-        ExecOutcome {
-            stdout,
-            stderr,
-            piped,
-            code: status.code(),
-            signal: exit_signal(&status),
-            pid,
-            timed_out,
-            exceeded: exceeded.load(std::sync::atomic::Ordering::SeqCst),
-        },
-    )
 }
 
 struct ExecOutcome {
@@ -1131,7 +632,7 @@ struct ExecOutcome {
 }
 
 /// The object `execSync` / `spawnSync` read their result from.
-fn exec_result(ctx: &mut Ctx, outcome: ExecOutcome) -> Result<Value, Value> {
+fn exec_result(ctx: &mut Ctx, outcome: ExecOutcome) -> Result<Value, OpError> {
     let o = Value::Obj(ctx.new_object());
     let stdout = if outcome.piped[1] { ctx.make_uint8array(&outcome.stdout)? } else { Value::Null };
     let stderr = if outcome.piped[2] { ctx.make_uint8array(&outcome.stderr)? } else { Value::Null };
@@ -1385,7 +886,7 @@ fn realm_site(ctx: &mut Ctx, cmd: &str) -> Option<RealmSite> {
     })
 }
 
-fn read_env_pairs(ctx: &mut Ctx, pairs: &Value) -> Result<Vec<(String, String)>, Value> {
+fn read_env_pairs(ctx: &mut Ctx, pairs: &Value) -> Result<Vec<(String, String)>, OpError> {
     let mut env = Vec::new();
     if pairs.as_obj().is_some() {
         if let Ok(Value::Num(count)) = ctx.get_member(pairs, "length") {
@@ -1604,16 +1105,16 @@ fn wire_child_realm(
 /// `spawn(process.execPath, [...execArgv, script, ...args])` (what `fork` is) in an embedded
 /// realm: the script runs as a child realm in this process. `Ok(None)` when `cmd` is anything else,
 /// or the realm cannot launch one, and the ordinary OS spawn follows.
-fn spawn_child_realm(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Option<Value>, Value> {
+fn spawn_child_realm(ctx: &mut Ctx, cmd: &str, args: &SpawnArgs) -> Result<Option<Value>, OpError> {
     let Some(site) = realm_site(ctx, cmd) else {
         return Ok(None);
     };
-    let arg_list = read_string_array(ctx, args.get(1).unwrap_or(&Value::Undefined))?;
-    let cwd = opt_string(ctx, args.get(2));
-    let env = read_env_pairs(ctx, args.get(3).unwrap_or(&Value::Undefined))?;
-    let stdio = read_string_array(ctx, args.get(4).unwrap_or(&Value::Undefined))?;
+    let arg_list = read_string_array(ctx, &args.argv)?;
+    let cwd = opt_string(ctx, Some(&args.cwd));
+    let env = read_env_pairs(ctx, &args.env)?;
+    let stdio = read_string_array(ctx, &args.stdio)?;
     let wired = wire_child_realm(&site, cmd, &arg_list, cwd, env, stdio)
-        .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
+        .map_err(|e| NativeError::runtime(format!("spawn {cmd}: {e}")))?;
     let Wired {
         request,
         parent_stdin,
@@ -1626,7 +1127,7 @@ fn spawn_child_realm(ctx: &mut Ctx, cmd: &str, args: &[Value]) -> Result<Option<
     let realm = site
         .launcher
         .launch(request)
-        .map_err(|e| spawn_failure(ctx, cmd, &e))?;
+        .map_err(|e| spawn_failure(cmd, &e))?;
     let pid = realm.pid();
     let proc = ChildProc {
         stdin: Arc::new(Mutex::new(parent_stdin)),
@@ -1666,7 +1167,7 @@ fn exec_sync_in_realm(
     cwd: Option<String>,
     env: Vec<(String, String)>,
     sync: SyncRealm,
-) -> Result<Value, Value> {
+) -> Result<Value, OpError> {
     use std::sync::atomic::Ordering;
     let SyncRealm { input, modes, max_buffer, kill_signal, timeout } = sync;
     let stdio = vec![
@@ -1680,7 +1181,7 @@ fn exec_sync_in_realm(
         modes[2].clone(),
     ];
     let mut wired = wire_child_realm(&site, cmd, arg_list, cwd, env, stdio)
-        .map_err(|e| ctx.make_error("Error", format!("spawn {cmd}: {e}")))?;
+        .map_err(|e| NativeError::runtime(format!("spawn {cmd}: {e}")))?;
     let (parent_stdin, parent_stdout, parent_stderr) = (
         wired.parent_stdin.take(),
         wired.parent_stdout.take(),
@@ -1689,7 +1190,7 @@ fn exec_sync_in_realm(
     let realm = site
         .launcher
         .launch(wired.request)
-        .map_err(|e| spawn_failure(ctx, cmd, &e))?;
+        .map_err(|e| spawn_failure(cmd, &e))?;
     let pid = realm.pid();
     if let (Some(input), Some(mut stdin)) = (input, parent_stdin) {
         std::thread::spawn(move || {
@@ -1816,5 +1317,504 @@ mod tests {
         assert!(locate_script(&args(&["-r", "x"])).is_err());
         assert!(locate_script(&args(&["-"])).is_err());
         assert!(locate_script(&args(&[])).is_err());
+    }
+}
+
+pub(crate) use bindings::Module;
+
+#[lumen_bind::module(name = "__child")]
+mod bindings {
+    use super::*;
+
+    #[op(coerce, name = "spawn")]
+    fn op_spawn(ctx: &mut Ctx, cmd: String, argv: Value, cwd: Value, env: Value, stdio: Value, verbatim: bool, opts: Value) -> Result<Value, OpError> {
+        let spawn_args = SpawnArgs { argv, cwd, env, stdio, verbatim, opts };
+        if let Some(started) = spawn_child_realm(ctx, &cmd, &spawn_args)? {
+            return Ok(started);
+        }
+        #[cfg(windows)]
+        if read_string_array(ctx, &spawn_args.stdio).is_ok_and(|s| s.iter().skip(3).any(|k| k == "pipe")) {
+            return spawn_windows_extra(ctx, &cmd, &spawn_args);
+        }
+        let (mut command, stdio) = build_command(ctx, &cmd, &spawn_args)?;
+        let spawn_opts = read_spawn_opts(ctx, Some(&spawn_args.opts));
+        apply_spawn_opts(&mut command, &spawn_opts);
+        command
+            .stdin(stdio_for(&stdio[0]))
+            .stdout(stdio_for(&stdio[1]))
+            .stderr(stdio_for(&stdio[2]));
+        let mut ipc_fd = None;
+        let extra = wire_extra_stdio(&mut command, &stdio, &mut ipc_fd)
+            .map_err(|e| NativeError::runtime(format!("spawn {cmd}: {e}")))?;
+
+        let mut child = match lumen_host::spawn_command(ctx, &mut command) {
+            Ok(child) => child,
+            Err(e) => {
+                #[cfg(unix)]
+                if let Some(fd) = ipc_fd {
+                    // SAFETY: the parent's end of the channel, owned here and never handed out.
+                    unsafe { libc::close(fd) };
+                }
+                return Err(spawn_failure(&cmd, &e).into());
+            }
+        };
+        let pid = child.id();
+        let stdout: Option<Box<dyn Read + Send>> = child.stdout.take().map(|s| Box::new(s) as _);
+        let stderr: Option<Box<dyn Read + Send>> = child.stderr.take().map(|s| Box::new(s) as _);
+        let stdin: Option<Box<dyn Write + Send>> = child.stdin.take().map(|s| Box::new(s) as _);
+        let proc = ChildProc {
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(stdout)),
+            stderr: Arc::new(Mutex::new(stderr)),
+            extra,
+            child: Arc::new(Mutex::new(ProcHandle::Std(child))),
+            unref: false,
+            pending_tasks: Vec::new(),
+            pipes: Vec::new(),
+        };
+        let info = register_child(ctx, proc, pid);
+        if let Some(fd) = ipc_fd {
+            let _ = ctx.set_member(&info, "ipcFd", Value::Num(fd as f64));
+        }
+        Ok(info)
+    }
+
+    /// `(childId, which, resolve, reject)` — read a chunk from stdout (which=1), stderr (which=2) or
+    /// an extra stdio pipe (which=3+). Resolves with a Uint8Array, or `null` at EOF.
+    #[op(coerce, name = "read")]
+    fn op_read(ctx: &mut Ctx, child_id: f64, which: Option<f64>, resolve: Value, reject: Value) -> Result<(), OpError> {
+        let child_id = child_id as u32;
+        let which = which.unwrap_or(1.0) as u32;
+        let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
+
+        let (handle, unref) = ctx
+            .host_mut::<ChildRegistry>()
+            .and_then(|r| r.procs.get(&child_id))
+            .and_then(|p| {
+                let h = match which {
+                    2 => p.stderr.clone(),
+                    3.. => p.extra.get(&which)?.reader.clone(),
+                    _ => p.stdout.clone(),
+                };
+                Some((h, p.unref))
+            })
+            .ok_or_else(|| NativeError::runtime("child: unknown process or stdio slot"))?;
+
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
+        let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
+        // The task inherits the child's current ref state; `child.ref()`/`unref()` can toggle it later.
+        if unref {
+            reg.set_unref(id);
+        }
+        track_child_task(ctx, child_id, id);
+        completions(ctx).run_blocking(id, move || {
+            let mut guard = handle.lock().expect("stream lock");
+            let result: Result<Vec<u8>, String> = match guard.as_mut() {
+                Some(stream) => {
+                    let mut buf = vec![0u8; 65536];
+                    match stream.read(&mut buf) {
+                        Ok(0) => Ok(Vec::new()),
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Ok(buf)
+                        }
+                        Err(e) => Err(format!("read: {e}")),
+                    }
+                }
+                None => Ok(Vec::new()),
+            };
+            Box::new(result)
+        });
+        Ok(())
+    }
+
+    /// `(childId, bytes, resolve, reject)` — write to the child's stdin.
+    #[op(coerce, name = "write")]
+    fn op_write(ctx: &mut Ctx, child_id: f64, data: Vec<u8>, resolve: Value, reject: Value) -> Result<(), OpError> {
+        let child_id = child_id as u32;
+        let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
+
+        let handle = ctx
+            .host_mut::<ChildRegistry>()
+            .and_then(|r| r.procs.get(&child_id))
+            .map(|p| p.stdin.clone())
+            .ok_or_else(|| NativeError::runtime("child: unknown process"))?;
+
+        let id = lumen_host::register_task(
+            ctx,
+            resolve,
+            Some(reject),
+            decode_ok,
+        );
+        completions(ctx).run_blocking(id, move || {
+            let mut guard = handle.lock().expect("stdin lock");
+            let result: Result<(), String> = match guard.as_mut() {
+                Some(stdin) => stdin
+                    .write_all(&data)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|e| format!("write: {e}")),
+                None => Err("child stdin is closed".to_string()),
+            };
+            Box::new(result)
+        });
+        Ok(())
+    }
+
+    /// `(childId, resolve, reject)` — wait for exit; resolves with `[code, signal]`: the exit code
+    /// and `null`, or `null` and the terminating signal number.
+    #[op(coerce, name = "wait")]
+    fn op_wait(ctx: &mut Ctx, child_id: f64, resolve: Value, reject: Value) -> Result<(), OpError> {
+        let child_id = child_id as u32;
+        let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
+        let (handle, unref) = ctx
+            .host_mut::<ChildRegistry>()
+            .and_then(|r| r.procs.get(&child_id))
+            .map(|p| (p.child.clone(), p.unref))
+            .ok_or_else(|| NativeError::runtime("child: unknown process"))?;
+
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_exit);
+        let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
+        if unref {
+            reg.set_unref(id);
+        }
+        track_child_task(ctx, child_id, id);
+        completions(ctx).run_blocking(id, move || {
+            // Poll try_wait(), releasing the child lock between checks, so `kill()` can acquire it (a
+            // blocking wait() would hold the lock for the child's whole life and deadlock kill).
+            let result: Result<(Option<i32>, Option<i32>), String> = loop {
+                {
+                    match handle.lock().expect("child lock").try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) => {}
+                        Err(e) => break Err(e.to_string()),
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            Box::new(result)
+        });
+        Ok(())
+    }
+
+    /// `(childId)` — `child.unref()`.
+    #[op(coerce, name = "unref")]
+    fn op_unref(ctx: &mut Ctx, child_id: f64) {
+        let child_id = child_id as u32;
+        set_child_ref(ctx, child_id, true);
+    }
+
+    /// `(childId)` — `child.ref()`.
+    #[op(coerce, name = "ref")]
+    fn op_ref(ctx: &mut Ctx, child_id: f64) {
+        let child_id = child_id as u32;
+        set_child_ref(ctx, child_id, false);
+    }
+
+    /// `(childId, signal)` — `signal` is the numeric signal (0 only probes that the child exists). On unix
+    /// any signal is delivered with kill(2); elsewhere every signal is a hard kill. A child realm gets
+    /// it as an OS process would: `SIGKILL` stops it at once, any other reaches its `process.on`
+    /// listeners or takes the default action (see `ChildRealm::signal`).
+    #[op(coerce, name = "kill")]
+    fn op_kill(ctx: &mut Ctx, child_id: f64, signal: Option<f64>) -> bool {
+        let child_id = child_id as u32;
+        let signal = signal.unwrap_or(0.0) as i32;
+        ctx
+            .host_mut::<ChildRegistry>()
+            .and_then(|r| r.procs.get(&child_id))
+            .map(|p| send_signal(&p.child, signal))
+            .unwrap_or(false)
+    }
+
+    #[op(coerce, name = "closeStdin")]
+    fn op_close_stdin(ctx: &mut Ctx, child_id: f64) {
+        let child_id = child_id as u32;
+        if let Some(p) = ctx
+            .host_mut::<ChildRegistry>()
+            .and_then(|r| r.procs.get(&child_id))
+        {
+            p.stdin.lock().expect("stdin lock").take(); // drop → EOF to the child
+        }
+    }
+
+    /// `(childId, fd, bytes, resolve, reject)` — write to an extra stdio pipe (fd 3+).
+    #[op(coerce, name = "writeFd")]
+    fn op_write_fd(ctx: &mut Ctx, child_id: f64, fd: f64, data: Vec<u8>, resolve: Value, reject: Value) -> Result<(), OpError> {
+        let child_id = child_id as u32;
+        let fd = fd as u32;
+        let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
+
+        let handle = ctx
+            .host_mut::<ChildRegistry>()
+            .and_then(|r| r.procs.get(&child_id))
+            .and_then(|p| p.extra.get(&fd))
+            .map(|e| e.writer.clone())
+            .ok_or_else(|| NativeError::runtime("child: unknown process or stdio slot"))?;
+
+        let id = lumen_host::register_task(
+            ctx,
+            resolve,
+            Some(reject),
+            decode_ok,
+        );
+        completions(ctx).run_blocking(id, move || {
+            let mut guard = handle.lock().expect("pipe lock");
+            let result: Result<(), String> = match guard.as_mut() {
+                Some(w) => w
+                    .write_all(&data)
+                    .and_then(|()| w.flush())
+                    .map_err(|e| format!("write: {e}")),
+                None => Err("child pipe is closed".to_string()),
+            };
+            Box::new(result)
+        });
+        Ok(())
+    }
+
+    /// `(childId, fd)` — close the parent's write half of an extra stdio pipe (EOF to the child).
+    #[op(coerce, name = "closeFd")]
+    fn op_close_fd(ctx: &mut Ctx, child_id: f64, fd: f64) {
+        let child_id = child_id as u32;
+        let fd = fd as u32;
+        if let Some(e) = ctx
+            .host_mut::<ChildRegistry>()
+            .and_then(|r| r.procs.get(&child_id))
+            .and_then(|p| p.extra.get(&fd))
+        {
+            e.writer.lock().expect("pipe lock").take();
+        }
+    }
+
+    /// `(cmd, argsArray, inputBytesOrNull, cwd, envPairsOrNull, verbatim, timeoutMs, opts)` with
+    /// `opts = { stdio: [in, out, err], argv0, uid, gid, killSignal, maxBuffer }`. Synchronous: spawns,
+    /// writes optional stdin, waits, and captures piped output — for the `*Sync` APIs. A child whose
+    /// output passes `maxBuffer` or that outlives `timeout` is killed with `killSignal`.
+    #[op(coerce, name = "execSync")]
+    fn op_exec_sync(
+        ctx: &mut Ctx,
+        cmd: String,
+        argv: Value,
+        input: Option<Vec<u8>>,
+        cwd: Value,
+        env: Value,
+        verbatim: bool,
+        timeout: Option<f64>,
+        opts: Value,
+    ) -> Result<Value, OpError> {
+        let arg_list = read_string_array(ctx, &argv)?;
+        let cwd = opt_string(ctx, Some(&cwd));
+        let env_pairs = env;
+        let (stdio, max_buffer, kill_signal) = if opts.as_obj().is_some() {
+            let stdio_v = ctx.get_member(&opts, "stdio").unwrap_or(Value::Undefined);
+            let stdio = read_string_array(ctx, &stdio_v)?;
+            let max = match ctx.get_member(&opts, "maxBuffer") {
+                Ok(Value::Num(n)) if n.is_finite() && n >= 0.0 => Some(n as usize),
+                _ => None,
+            };
+            let sig = match ctx.get_member(&opts, "killSignal") {
+                Ok(Value::Num(n)) if n > 0.0 => n as i32,
+                _ => 15,
+            };
+            (stdio, max, sig)
+        } else {
+            (Vec::new(), None, 15)
+        };
+        let mode = |i: usize| stdio.get(i).map(String::as_str).unwrap_or("pipe");
+        let timeout = timeout
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .map(|t| std::time::Duration::from_secs_f64(t / 1000.0));
+        if let Some(site) = realm_site(ctx, &cmd) {
+            let sync = SyncRealm {
+                input,
+                modes: [mode(0).to_string(), mode(1).to_string(), mode(2).to_string()],
+                max_buffer,
+                kill_signal,
+                timeout,
+            };
+            let env = read_env_pairs(ctx, &env_pairs)?;
+            return exec_sync_in_realm(ctx, site, &cmd, &arg_list, cwd, env, sync);
+        }
+        let spawn_opts = read_spawn_opts(ctx, Some(&opts));
+
+        let mut command = Command::new(&cmd);
+        add_args(&mut command, &arg_list, verbatim);
+        apply_spawn_opts(&mut command, &spawn_opts);
+        command
+            .stdout(stdio_for(mode(1)))
+            .stderr(stdio_for(mode(2)));
+        command.stdin(match mode(0) {
+            "inherit" => Stdio::inherit(),
+            "pipe" if input.is_some() => Stdio::piped(),
+            _ => Stdio::null(),
+        });
+        apply_cwd(ctx, &mut command, cwd);
+        apply_env(ctx, &mut command, &env_pairs)?;
+        let mut child =
+            lumen_host::spawn_command(ctx, &mut command).map_err(|e| spawn_failure(&cmd, &e))?;
+        let pid = child.id();
+        // Feed stdin from its own thread (dropping it signals EOF): a child that fills its stdout
+        // pipe before draining stdin would otherwise deadlock against this write.
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
+        let exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
+        let pipes: [(u8, Option<Box<dyn Read + Send>>); 2] = [
+            (1, child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
+            (2, child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
+        ];
+        let mut piped = [false; 3];
+        for (which, pipe) in pipes {
+            if let Some(mut pipe) = pipe {
+                piped[which as usize] = true;
+                let tx = tx.clone();
+                let exceeded = Arc::clone(&exceeded);
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = vec![0u8; 65536];
+                    loop {
+                        match pipe.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if max_buffer.is_some_and(|max| buf.len() > max) {
+                                    exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    #[cfg(unix)]
+                                    signal_pid(pid, kill_signal);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = tx.send((which, buf));
+                });
+            }
+        }
+        drop(tx);
+        let wait_error = |e: std::io::Error| NativeError::runtime(format!("exec {cmd}: {e}"));
+        let mut timed_out = false;
+        let stop = |child: &mut Child| {
+            #[cfg(unix)]
+            signal_pid(child.id(), kill_signal);
+            #[cfg(not(unix))]
+            let _ = child.kill();
+        };
+        let interrupt = ctx.interrupt_for_host();
+        let status = if timeout.is_none() && !cfg!(unix) && max_buffer.is_some()
+            || timeout.is_some()
+            || interrupt.is_some()
+        {
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().map_err(wait_error)? {
+                    break status;
+                }
+                if interrupt
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    stop(&mut child);
+                    let _ = child.wait();
+                    ctx.poll_interrupt_for_host()?;
+                }
+                if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                    timed_out = true;
+                    stop(&mut child);
+                    break child.wait().map_err(wait_error)?;
+                }
+                if !cfg!(unix) && exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+                    stop(&mut child);
+                    break child.wait().map_err(wait_error)?;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        } else {
+            child.wait().map_err(wait_error)?
+        };
+        // After a timeout, a grandchild may still hold the pipes: take what arrived, don't wait.
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        loop {
+            let got = if timed_out || exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+                rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
+            } else {
+                rx.recv().ok()
+            };
+            match got {
+                Some((1, bytes)) => stdout = bytes,
+                Some((_, bytes)) => stderr = bytes,
+                None => break,
+            }
+        }
+
+        exec_result(
+            ctx,
+            ExecOutcome {
+                stdout,
+                stderr,
+                piped,
+                code: status.code(),
+                signal: exit_signal(&status),
+                pid,
+                timed_out,
+                exceeded: exceeded.load(std::sync::atomic::Ordering::SeqCst),
+            },
+        )
+    }
+
+    #[op(coerce, name = "ipcOpen")]
+    fn op_ipc_open(fd: f64) -> Result<(), OpError> {
+        let fd=ipc_fd(fd)?;
+        #[cfg(unix)] {
+            if lumen_os::fdctl::set_blocking(fd,false).is_err() { return Err(ipc_failure().into()); }
+            Ok(())
+        }
+        #[cfg(not(unix))] {let _=fd;Err(NativeError::runtime("Dedicated subprocess IPC is currently supported on Unix only").into())}
+    }
+
+    #[op(coerce, name = "ipcRead")]
+    fn op_ipc_read(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
+        let fd=ipc_fd(fd)?;
+        #[cfg(unix)] {
+            let mut bytes=[0u8;65536];let count=unsafe {libc::read(fd,bytes.as_mut_ptr().cast(),bytes.len())};
+            if count<0 {
+                let error=std::io::Error::last_os_error();
+                if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) {return Ok(Value::Null);}
+                return Err(ipc_failure().into());
+            }
+            Ok(ctx.make_uint8array(&bytes[..count as usize])?)
+        }
+        #[cfg(not(unix))] {let _=fd;Err(NativeError::runtime("Dedicated subprocess IPC is currently supported on Unix only").into())}
+    }
+
+    #[op(coerce, name = "ipcWrite")]
+    fn op_ipc_write(fd: f64, bytes: &[u8]) -> Result<f64, OpError> {
+        let fd=ipc_fd(fd)?;
+        #[cfg(unix)] {
+            // send suppresses SIGPIPE on Linux/Android; macOS socket setup uses SO_NOSIGPIPE.
+            #[cfg(any(target_os="linux",target_os="android"))] let count=unsafe {libc::send(fd,bytes.as_ptr().cast(),bytes.len(),libc::MSG_NOSIGNAL)};
+            #[cfg(not(any(target_os="linux",target_os="android")))] let count=unsafe {libc::write(fd,bytes.as_ptr().cast(),bytes.len())};
+            if count<0 {
+                let error=std::io::Error::last_os_error();
+                if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) {return Ok(0.0);}
+                return Err(ipc_failure().into());
+            }
+            Ok(count as f64)
+        }
+        #[cfg(not(unix))] {let _=(fd,bytes);Err(NativeError::runtime("Dedicated subprocess IPC is currently supported on Unix only").into())}
+    }
+
+    #[op(coerce, name = "ipcClose")]
+    fn op_ipc_close(ctx: &mut Ctx, fd: f64) -> Result<(), OpError> {
+        let fd=ipc_fd(fd)?;
+        #[cfg(unix)] {
+            // A child realm's channel is closed by the host that made it, after the realm ends; the
+            // descriptor number must stay valid until then. Shutting it down is what the peer sees.
+            let owned=ctx.op_state().get::<lumen_host::RealmProcess>().is_some_and(|realm|realm.owned_fds.contains(&fd));
+            let status=if owned {unsafe {libc::shutdown(fd,libc::SHUT_RDWR)}} else {unsafe {libc::close(fd)}};
+            if status<0 {return Err(ipc_failure().into());}
+            Ok(())
+        }
+        #[cfg(not(unix))] {let _=fd;Err(NativeError::runtime("Dedicated subprocess IPC is currently supported on Unix only").into())}
     }
 }

@@ -130,8 +130,8 @@
       this.writeInProgress = false;
     }
 
-    _open(...args) {
-      this._id = __zlib.handleOpen(this._mode, ...args);
+    _open(id) {
+      this._id = id;
       handleFinalizer?.register(this, this._id, this);
     }
 
@@ -204,7 +204,7 @@
     init(windowBits, level, memLevel, strategy, writeState, processCallback, dictionary) {
       this._writeState = writeState;
       this._processCallback = processCallback;
-      this._open(windowBits, level, memLevel, strategy, dictionary === undefined ? undefined : asBytes(dictionary));
+      this._open(__zlib.handleOpen(this._mode, windowBits, level, memLevel, strategy, dictionary === undefined ? undefined : asBytes(dictionary)));
     }
 
     params(level, strategy) {
@@ -228,11 +228,11 @@
         // modeling flag.
         const disableContext = params[constants.BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING];
         if (disableContext !== unset && disableContext > 1) return false;
-        this._open(new Uint32Array(pairs));
+        this._open(__zlib.brotliOpen(this._mode, new Uint32Array(pairs)));
       } else {
         // The decoder knows only its two parameters.
         for (let i = 2; i < params.length; i++) if (params[i] !== unset) return false;
-        this._open();
+        this._open(__zlib.brotliOpen(this._mode));
       }
       return true;
     }

@@ -308,6 +308,20 @@ impl EngineError {
     }
 }
 
+/// The language-neutral error: a named class with OpenSSL's `library` / `function` / `reason` /
+/// `code` as properties.
+impl From<EngineError> for lumen_common::native::NativeError {
+    fn from(e: EngineError) -> Self {
+        let mut error = lumen_common::native::NativeError::named(e.kind.unwrap_or("Error"), e.message);
+        for (name, value) in [("library", e.library), ("function", e.function), ("reason", e.reason), ("code", e.code)] {
+            if let Some(value) = value {
+                error = error.with_prop(name, value);
+            }
+        }
+        error
+    }
+}
+
 impl From<String> for EngineError {
     fn from(message: String) -> Self {
         EngineError::plain(message)

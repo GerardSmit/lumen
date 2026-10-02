@@ -1,6 +1,8 @@
 //! Realm-owned environment data. SHARE_ENV passes this backing only to admitted child workers;
 //! writes never mutate the embedding process's OS environment.
-use lumen_host::{Ctx, Extension, OpState, Value, ops};
+use lumen_bind::NativeError;
+use lumen::embed::OpError;
+use lumen_host::{Ctx, Extension, OpState, Value};
 use std::sync::{Arc, Mutex};
 
 const MAX_KEYS: usize = 16_384;
@@ -45,14 +47,14 @@ pub(crate) fn replace(
     ctx: &mut Ctx,
     values: Vec<(String, String)>,
     insensitive: bool,
-) -> Result<(), Value> {
+) -> Result<(), OpError> {
     let mut next = Environment {
         insensitive,
         ..Default::default()
     };
     for (key, value) in values {
         next.set(key, value)
-            .map_err(|msg| ctx.make_error("RangeError", msg))?;
+            .map_err(NativeError::value_error)?;
     }
     let backing = ctx
         .op_state()
@@ -98,103 +100,81 @@ fn time_zone_changed(ctx: &mut Ctx, key: &str, value: Option<&str>) {
     }
 }
 
-fn get(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
-    let key = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let backing = backing(ctx);
-    let env = backing.0.lock().unwrap();
-    Ok(env
-        .index(&key)
-        .map(|i| Value::str(&env.values[i].1))
-        .unwrap_or(Value::Undefined))
-}
-fn set(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
-    let key = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let value = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let backing = backing(ctx);
-    let changed = (key == "TZ").then(|| value.clone());
-    backing
-        .0
-        .lock()
-        .unwrap()
-        .set(key, value)
-        .map_err(|msg| ctx.make_error("RangeError", msg))?;
-    if let Some(value) = changed {
-        time_zone_changed(ctx, "TZ", Some(&value));
+#[lumen_bind::module(name = "__env")]
+mod bindings {
+    use super::*;
+
+    #[op(name = "get", coerce)]
+    fn op_get(ctx: &mut Ctx, key: String) -> Option<String> {
+        let backing = backing(ctx);
+        let env = backing.0.lock().unwrap();
+        env.index(&key).map(|i| env.values[i].1.clone())
     }
-    Ok(Value::Undefined)
-}
-fn delete(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
-    let key = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let backing = backing(ctx);
-    {
-        let mut env = backing.0.lock().unwrap();
-        if let Some(i) = env.index(&key) {
-            let (key, value) = env.values.remove(i);
-            env.bytes -= key.len() + value.len();
+
+    #[op(name = "set", coerce)]
+    fn op_set(ctx: &mut Ctx, key: String, value: String) -> Result<(), OpError> {
+        let backing = backing(ctx);
+        let changed = (key == "TZ").then(|| value.clone());
+        backing.0.lock().unwrap().set(key, value).map_err(OpError::range_error)?;
+        if let Some(value) = changed {
+            time_zone_changed(ctx, "TZ", Some(&value));
         }
+        Ok(())
     }
-    time_zone_changed(ctx, &key, None);
-    Ok(Value::Undefined)
-}
-fn keys(ctx: &mut Ctx, _: Value, _: &[Value]) -> Result<Value, Value> {
-    let backing = backing(ctx);
-    let names = backing
-        .0
-        .lock()
-        .unwrap()
-        .values
-        .iter()
-        .map(|(key, _)| Value::str(key))
-        .collect();
-    Ok(ctx.make_array(names))
-}
-fn reset(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
-    let object = args.first().unwrap_or(&Value::Undefined);
-    let mut values = Vec::new();
-    let length = match ctx
-        .get_member(object, "length")
-        .map_err(|_| ctx.make_error("TypeError", "invalid environment entries"))?
-    {
-        Value::Num(n) if n >= 0.0 && n <= MAX_KEYS as f64 && n.fract() == 0.0 => n as usize,
-        _ => return Err(ctx.make_error("RangeError", "invalid environment entry count")),
-    };
-    for index in 0..length {
-        let pair = ctx
-            .get_member(object, &index.to_string())
-            .map_err(|_| ctx.make_error("TypeError", "invalid environment entry"))?;
-        let key = ctx
-            .get_member(&pair, "0")
-            .map_err(|_| ctx.make_error("TypeError", "invalid environment key"))?;
-        let value = ctx
-            .get_member(&pair, "1")
-            .map_err(|_| ctx.make_error("TypeError", "invalid environment value"))?;
-        if !matches!(value, Value::Undefined) {
-            values.push((
-                ctx.coerce_string(&key)?.to_string(),
-                ctx.coerce_string(&value)?.to_string(),
-            ));
+
+    #[op(name = "delete", coerce)]
+    fn op_delete(ctx: &mut Ctx, key: String) {
+        let backing = backing(ctx);
+        {
+            let mut env = backing.0.lock().unwrap();
+            if let Some(i) = env.index(&key) {
+                let (key, value) = env.values.remove(i);
+                env.bytes -= key.len() + value.len();
+            }
         }
+        time_zone_changed(ctx, &key, None);
     }
-    replace(ctx, values, false)?;
-    Ok(Value::Undefined)
+
+    #[op(name = "keys")]
+    fn op_keys(ctx: &mut Ctx) -> Vec<String> {
+        backing(ctx).0.lock().unwrap().values.iter().map(|(key, _)| key.clone()).collect()
+    }
+
+    #[op(name = "reset")]
+    fn op_reset(ctx: &mut Ctx, object: &Value) -> Result<(), OpError> {
+        let mut values = Vec::new();
+        let length = match ctx
+            .get_member(object, "length")
+            .map_err(|_| NativeError::type_error("invalid environment entries"))?
+        {
+            Value::Num(n) if n >= 0.0 && n <= MAX_KEYS as f64 && n.fract() == 0.0 => n as usize,
+            _ => return Err(NativeError::value_error("invalid environment entry count").into()),
+        };
+        for index in 0..length {
+            let pair = ctx
+                .get_member(object, &index.to_string())
+                .map_err(|_| NativeError::type_error("invalid environment entry"))?;
+            let key = ctx
+                .get_member(&pair, "0")
+                .map_err(|_| NativeError::type_error("invalid environment key"))?;
+            let value = ctx
+                .get_member(&pair, "1")
+                .map_err(|_| NativeError::type_error("invalid environment value"))?;
+            if !matches!(value, Value::Undefined) {
+                values.push((
+                    ctx.coerce_string(&key)?.to_string(),
+                    ctx.coerce_string(&value)?.to_string(),
+                ));
+            }
+        }
+        replace(ctx, values, false)
+    }
 }
+
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "realm-environment",
-        modules: &[],
-        globals: &[],
-        namespaces: &[(
-            "__env",
-            ops!["get" (1) => get, "set" (2) => set, "delete" (1) => delete, "keys" (0) => keys, "reset" (1) => reset],
-        )],
+        modules: &[lumen_host::namespace::<bindings::Module>],
         state_init: Some(|state: &mut OpState| state.put(RealmEnvironment::default())),
         js_init: None,
         js_init_snapshot: None,

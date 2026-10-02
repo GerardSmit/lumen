@@ -1290,11 +1290,9 @@ function gaiErrno(error) {
 }
 
 function caresGetaddrinfo(req, hostname, family, hints, verbatim) {
-  __dns.getaddrinfo(
-    hostname,
-    family,
-    hints | 0,
-    (list) => {
+  __dns.getaddrinfo(hostname, family, hints | 0).then(
+    (pairs) => {
+      let list = pairs.map(([address, family]) => ({ address, family }));
       if (verbatim === false) {
         list = [...list.filter((a) => a.family === 4), ...list.filter((a) => a.family !== 4)];
       }
@@ -1306,9 +1304,7 @@ function caresGetaddrinfo(req, hostname, family, hints, verbatim) {
 }
 
 function caresGetnameinfo(req, address, port) {
-  __dns.getnameinfo(
-    address,
-    port,
+  __dns.getnameinfo(address, port).then(
     ([hostname, service]) => req.oncomplete(0, hostname, service),
     (error) => req.oncomplete(gaiErrno(error)),
   );
