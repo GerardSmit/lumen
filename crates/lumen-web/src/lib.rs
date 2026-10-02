@@ -19,12 +19,11 @@
 //! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
 //!   `serve((request) => Response)` convention of Deno/Bun/Workers). v1 is single-accept,
 //!   `Connection: close`, buffered bodies, http only — see `server.rs` for what's deferred.
-//! - [~] Streams: `ReadableStream` (default reader, async iteration, `getReader`/`cancel`/
-//!   `values`) backing Request/Response `.body` over the buffered bytes; no BYOB/byte streams,
-//!   `tee()`, piping, `WritableStream`, or `TransformStream` yet. Bodies remain buffered, so a
-//!   stream used as a body must produce its data synchronously.
-//! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
-//!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
+//! - [x] Streams (`ReadableStream`, `WritableStream`, `TransformStream`, the text and compression
+//!   streams, queuing strategies) come from lumen-node's `webstreams.js` (Node's own WHATWG
+//!   streams), which the runtime installs alongside this crate; the glue here only consumes them.
+//!   Bodies remain buffered, so a stream used as a body must produce its data synchronously.
+//! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `crypto.subtle` beyond digest, `WebSocket`
 
 #[cfg(not(target_arch = "wasm32"))]
 use lumen_host::SpawnHandle;
@@ -136,17 +135,6 @@ pub fn extension() -> Extension {
                 ops![
                     "connect" (3) => sse::op_sse_connect,
                     "close" (1) => sse::op_sse_close,
-                ],
-            ),
-            (
-                "__compress",
-                ops![
-                    "deflate" (1) => op_deflate,
-                    "inflate" (1) => op_inflate,
-                    "deflateRaw" (1) => op_deflate_raw,
-                    "inflateRaw" (1) => op_inflate_raw,
-                    "gzip" (1) => op_gzip,
-                    "gunzip" (1) => op_gunzip,
                 ],
             ),
             (
@@ -412,50 +400,6 @@ fn op_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         _ => return Err(ctx.make_error("TypeError", format!("unsupported digest {name}"))),
     };
     ctx.make_uint8array(&digest)
-}
-
-// ---- compression (DEFLATE/zlib/gzip, backing CompressionStream/DecompressionStream) ----
-
-fn compress_op(ctx: &mut Ctx, args: &[Value], codec: fn(&[u8]) -> Vec<u8>) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "compression expects a BufferSource"));
-    };
-    ctx.make_uint8array(&codec(&bytes))
-}
-
-fn decompress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
-    codec: fn(&[u8]) -> Result<Vec<u8>, String>,
-) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "decompression expects a BufferSource"));
-    };
-    match codec(&bytes) {
-        Ok(out) => ctx.make_uint8array(&out),
-        Err(e) => Err(ctx.make_error("TypeError", e)),
-    }
-}
-
-fn op_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::zlib_compress)
-}
-fn op_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::zlib_decompress)
-}
-fn op_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::deflate)
-}
-fn op_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::inflate)
-}
-fn op_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::gzip_compress)
-}
-fn op_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::gzip_decompress)
 }
 
 // ---- fetch ----
