@@ -86,9 +86,14 @@ pub fn resource_usage() -> R<ResourceUsage> {
 
 /// Bytes of physical memory the process occupies now, where the OS reports it.
 pub fn resident_set_bytes() -> Option<u64> {
+    resident_set_bytes_of(std::process::id())
+}
+
+/// Bytes of physical memory process `pid` occupies now (on Windows only the current process).
+pub fn resident_set_bytes_of(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let pages = std::fs::read_to_string("/proc/self/statm")
+        let pages = std::fs::read_to_string(format!("/proc/{pid}/statm"))
             .ok()?
             .split_whitespace()
             .nth(1)?
@@ -104,7 +109,7 @@ pub fn resident_set_bytes() -> Option<u64> {
         let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
         let rc = unsafe {
             libc::proc_pid_rusage(
-                std::process::id() as libc::c_int,
+                pid as libc::c_int,
                 libc::RUSAGE_INFO_V2,
                 (&mut info as *mut libc::rusage_info_v2).cast(),
             )
@@ -113,10 +118,13 @@ pub fn resident_set_bytes() -> Option<u64> {
     }
     #[cfg(windows)]
     {
-        Some(win::memory_counters().working_set as u64)
+        (pid == std::process::id()).then(|| win::memory_counters().working_set as u64)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    None
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// `(available, constrained)` memory in bytes, as Node's `process.availableMemory()` /

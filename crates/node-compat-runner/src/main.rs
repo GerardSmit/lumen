@@ -407,19 +407,7 @@ fn wait_with_timeout(
     })
     .collect();
 
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
-        }
-    };
+    let status = lumen_os::child::wait_timeout(&mut child, timeout, Duration::from_millis(5)).ok().flatten();
     // Kill whatever the test spawned and left behind (servers, `fork`ed children, a timed-out
     // test's whole tree): stragglers would hold the pipes open and eat CPU for later tests.
     drop(tree);
@@ -865,9 +853,6 @@ mod leaks {
     /// every tagged process, or with `only`, just that test's).
     #[cfg(unix)]
     pub fn sweep(only: Option<usize>, all: bool) {
-        extern "C" {
-            fn kill(pid: i32, signal: i32) -> i32;
-        }
         let needle = format!("{VAR}={}.", std::process::id());
         let me = std::process::id() as i32;
         let active = ACTIVE.lock().unwrap().clone().unwrap_or_default();
@@ -883,7 +868,7 @@ mod leaks {
                 None => all || !active.contains(&serial),
             };
             if doomed && pid != me && pid > 1 {
-                unsafe { kill(pid, 9) };
+                let _ = lumen_os::proc::kill(pid, lumen_os::consts::signal_number("SIGKILL").unwrap_or(9));
             }
         }
     }
@@ -916,14 +901,8 @@ mod tree {
     #[cfg(unix)]
     impl Drop for ProcessTree {
         fn drop(&mut self) {
-            extern "C" {
-                fn kill(pid: i32, signal: i32) -> i32;
-            }
-            const SIGKILL: i32 = 9;
             // The group id is the child's pid (`process_group(0)`); a negative pid targets it.
-            unsafe {
-                kill(-self.0, SIGKILL);
-            }
+            let _ = lumen_os::proc::kill(-self.0, lumen_os::consts::signal_number("SIGKILL").unwrap_or(9));
         }
     }
 

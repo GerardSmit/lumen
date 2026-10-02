@@ -322,6 +322,9 @@ dependencies = [
 [[package]]
 name = "cpython-test-runner"
 version = "0.1.3"
+dependencies = [
+ "lumen-os",
+]
 
 [[package]]
 name = "crypto-bigint"
@@ -850,6 +853,8 @@ name = "lumen-difftest"
 version = "0.1.3"
 dependencies = [
  "lumen",
+ "lumen-common",
+ "lumen-os",
 ]
 
 [[package]]
@@ -1036,6 +1041,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "node-compat-runner"
 version = "0.1.3"
+dependencies = [
+ "lumen-os",
+]
 
 [[package]]
 name = "num-bigint-dig"
@@ -1753,6 +1761,8 @@ name = "test262-runner"
 version = "0.1.3"
 dependencies = [
  "lumen",
+ "lumen-common",
+ "lumen-os",
 ]
 
 [[package]]

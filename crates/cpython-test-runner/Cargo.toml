@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 # Runs CPython's own `Lib/test/test_*.py` files against the `lumen-py` binary, one process per
-# file, and reports per-file unittest counts. Std-only: it never links the interpreter.
+# file, and reports per-file unittest counts. It never links the interpreter; process waiting
+# comes from lumen-os.
+
+[dependencies]
+lumen-os = { path = "../lumen-os" }
 
 [[bin]]
 name = "cpython-test-runner"
