@@ -90,7 +90,14 @@ impl Interp {
         self.run(entry, None)
     }
 
-    pub fn call_inline(&mut self, f: &Value, mut args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
+    pub fn call_inline(&mut self, f: &Value, args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
+        if self.mon.active {
+            return self.call_inline_monitored(f, args, kw);
+        }
+        self.call_inline_plain(f, args, kw)
+    }
+
+    pub(crate) fn call_inline_plain(&mut self, f: &Value, mut args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
         if let Value::Obj(o) = f {
             match &o.kind {
                 Kind::Function(_) => {
@@ -434,6 +441,14 @@ impl Interp {
         if let Some(v) = send {
             frame.stack.push(v);
         }
+        frame.gen = Some(Rc::downgrade(g));
+        frame.entry = if throw.is_some() {
+            crate::trace::ENTRY_THROW
+        } else if frame.pc == 0 {
+            crate::trace::ENTRY_START
+        } else {
+            crate::trace::ENTRY_RESUME
+        };
         if let Err(e) = self.push_frame(frame) {
             *gd.state.borrow_mut() = GenState::Done;
             return Err(e);

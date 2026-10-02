@@ -25,7 +25,9 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
     ("_json", bound::<super::jsonm::_json::Module>),
+    ("_lsprof", bound::<super::lsprofm::_lsprof::Module>),
     ("_md5", bound::<super::hashlibm::_md5::Module>),
+    ("_opcode", bound::<super::opcodem::_opcode::Module>),
     ("_operator", bound::<super::operatorm::_operator::Module>),
     ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
     ("_random", bound::<super::randomm::_random::Module>),
@@ -58,6 +60,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("posix", bound::<super::posixm::posix::Module>),
     ("select", bound::<super::selectm::select::Module>),
     ("sys", |it| it.sys_module.clone()),
+    ("sys.monitoring", bound::<super::monitoringm::sys_monitoring::Module>),
     ("time", bound::<super::timem::time::Module>),
     ("unicodedata", bound::<super::unicodedatam::unicodedata::Module>),
     ("zlib", bound::<super::zlibm::zlib::Module>),
@@ -78,7 +81,7 @@ pub fn init(it: &mut Interp) {
 
 /// `sys.builtin_module_names`.
 pub fn builtin_module_names() -> Vec<&'static str> {
-    BUILTIN_MODULES.iter().map(|(n, _)| *n).collect()
+    BUILTIN_MODULES.iter().map(|(n, _)| *n).filter(|n| !n.contains('.')).collect()
 }
 
 /// `_sysconfigdata_*`, the build-time configuration `sysconfig` reads (generated when CPython is

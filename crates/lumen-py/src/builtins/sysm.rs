@@ -179,8 +179,8 @@ pub mod sys {
     ///
     /// See the debugger chapter in the library manual.
     #[op]
-    fn gettrace() -> Value {
-        Value::None
+    fn gettrace(it: &mut Interp) -> Value {
+        it.mon.trace_func.clone()
     }
 
     /// settrace(function)
@@ -188,16 +188,16 @@ pub mod sys {
     /// Set the global debug tracing function.  It will be called on each
     /// function call.  See the debugger chapter in the library manual.
     #[op(hint(py(text_signature = "")))]
-    fn settrace(function: &Value) {
-        let _ = function;
+    fn settrace(it: &mut Interp, function: &Value) {
+        it.set_trace_func(function.clone());
     }
 
     /// Return the profiling function set with sys.setprofile.
     ///
     /// See the profiler chapter in the library manual.
     #[op]
-    fn getprofile() -> Value {
-        Value::None
+    fn getprofile(it: &mut Interp) -> Value {
+        it.mon.profile_func.clone()
     }
 
     /// setprofile(function)
@@ -205,8 +205,21 @@ pub mod sys {
     /// Set the profiling function.  It will be called on each function call
     /// and return.  See the profiler chapter in the library manual.
     #[op(hint(py(text_signature = "")))]
-    fn setprofile(function: &Value) {
-        let _ = function;
+    fn setprofile(it: &mut Interp, function: &Value) {
+        it.set_profile_func(function.clone());
+    }
+
+    /// call_tracing(func, args)
+    ///
+    /// Call func(*args), while tracing is enabled.  The tracing state is
+    /// saved, and restored afterwards.  This is intended to be called from
+    /// a debugger from a checkpoint, to recursively debug some other code.
+    #[op(hint(py(text_signature = "")))]
+    fn call_tracing(it: &mut Interp, func: &Value, args: &Value) -> R<Value> {
+        let Some(items) = args.tuple_items() else {
+            return Err(it.type_error("call_tracing(): argument 'args' must be tuple"));
+        };
+        it.call_tracing(func, items.to_vec())
     }
 
     /// audit(event, *args)
@@ -433,6 +446,7 @@ pub mod sys {
                     vec![Value::Int(64), Value::Int((1 << 61) - 1), Value::Int(314159), Value::Int(0), Value::Int(1000003), Value::str("siphash13"), Value::Int(64), Value::Int(128), Value::Int(0)],
                 )
             }
+            "monitoring" => Value::Obj(it.import_module("sys.monitoring")?),
             "implementation" => {
                 let sys = it.sys_module.clone();
                 let vi = match &sys {

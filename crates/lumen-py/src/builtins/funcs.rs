@@ -442,7 +442,7 @@ fn compile_source(it: &mut Interp, mut source: Value, filename: &Value, mode: &s
         super::astconv::Mode::Exec => it.compile_source(&src, &filename)?,
         super::astconv::Mode::Single => it.compile_source_mode(&src, &filename, true)?,
     };
-    Ok(Value::Obj(Object::new(Kind::Code(code))))
+    Ok(Value::Obj(crate::bytecode::Code::object(&code)))
 }
 
 pub fn init(it: &mut Interp) {

@@ -849,7 +849,7 @@ impl Interp {
                     return Ok(Some(Value::dict(pd)));
                 }
                 "__globals__" => return Ok(Some(Value::Obj(f.globals.clone()))),
-                "__code__" => return Ok(Some(Value::Obj(Object::new(Kind::Code(f.code.clone()))))),
+                "__code__" => return Ok(Some(Value::Obj(crate::bytecode::Code::object(&f.code)))),
                 "__closure__" => {
                     if f.closure.is_empty() {
                         return Ok(Some(Value::None));
@@ -942,14 +942,12 @@ impl Interp {
                 "__qualname__" => return Ok(Some(Value::str(&g.qualname.borrow()))),
                 "gi_running" | "cr_running" | "ag_running" => return Ok(Some(Value::Bool(matches!(*g.state.borrow(), GenState::Running)))),
                 "gi_frame" | "cr_frame" | "ag_frame" => {
-                    return Ok(Some(match *g.state.borrow() {
-                        GenState::Done => Value::None,
-                        _ => Value::Obj(Object::new(Kind::Frame)),
-                    }))
+                    let done = matches!(*g.state.borrow(), GenState::Done);
+                    return Ok(Some(if done { Value::None } else { self.gen_frame_object(o) }));
                 }
                 "gi_code" | "cr_code" | "ag_code" => {
                     return Ok(Some(match &*g.state.borrow() {
-                        GenState::Created(f) | GenState::Suspended(f) => Value::Obj(Object::new(Kind::Code(f.code.clone()))),
+                        GenState::Created(f) | GenState::Suspended(f) => Value::Obj(crate::bytecode::Code::object(&f.code)),
                         _ => Value::None,
                     }))
                 }
@@ -970,6 +968,7 @@ impl Interp {
                 "co_names" => return Ok(Some(Value::tuple(c.names.iter().map(|n| Value::Obj(n.clone())).collect()))),
                 "co_varnames" => return Ok(Some(Value::tuple(c.varnames.iter().map(|n| Value::str(n)).collect()))),
                 "co_flags" => return Ok(Some(Value::Int(c.flags as i64))),
+                "co_consts" => return Ok(Some(Value::tuple(c.consts.clone()))),
                 _ => {}
             },
             Kind::Slice(a, b, c) => match nm {
@@ -1271,7 +1270,11 @@ impl Interp {
             let d = self.instance_dict(&o);
             dict_set_str(&d, "tb_lineno", Value::Int(e.line as i64));
             dict_set_str(&d, "tb_next", next);
-            dict_set_str(&d, "tb_frame", self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line, e.lasti));
+            let frame = match &e.frame {
+                Some(f) => Value::Obj(f.clone()),
+                None => self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line, e.lasti),
+            };
+            dict_set_str(&d, "tb_frame", frame);
             dict_set_str(&d, "tb_lasti", Value::Int(2 * e.lasti as i64));
             next = Value::Obj(o);
         }

@@ -1,0 +1,16 @@
+None
+True
+('g', 'call', 0, None)
+('g', 'line', 1, None)
+('f', 'call', 0, None)
+('f', 'line', 1, None)
+('f', 'line', 2, None)
+('f', 'line', 3, None)
+('f', 'line', 2, None)
+('f', 'line', 3, None)
+('f', 'line', 2, None)
+('f', 'line', 4, None)
+('f', 'return', 4, 1)
+('g', 'return', 1, 1)
+None
+['call', 'line', ('exception', 'ValueError', 'x'), 'return']

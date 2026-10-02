@@ -105,19 +105,7 @@ pub fn compile_eval(e: &Expr, filename: &str) -> CResult<Rc<Code>> {
 }
 
 fn label_of(op: &Op) -> Option<u32> {
-    match op {
-        Op::Jump(t)
-        | Op::JumpIfFalse(t)
-        | Op::JumpIfTrue(t)
-        | Op::JumpIfFalseKeep(t)
-        | Op::JumpIfTrueKeep(t)
-        | Op::ForIter(t)
-        | Op::SetupBlock(t)
-        | Op::SetupWith(t)
-        | Op::WithExceptEnd(t)
-        | Op::EndAsyncFor(t) => Some(*t),
-        _ => None,
-    }
+    op.jump_target()
 }
 
 fn with_label(op: Op, t: u32) -> Op {
@@ -312,6 +300,8 @@ impl<'a> Compiler<'a> {
             flags,
             cell_args,
             doc,
+            pyobj: Default::default(),
+            info: Default::default(),
         })
     }
 
@@ -1632,7 +1622,7 @@ impl<'a> Compiler<'a> {
             self.emit(Op::BuildTuple(code.freevars.len() as u32));
             flags |= MF_CLOSURE;
         }
-        let ci = self.const_idx(Value::Obj(Object::new(Kind::Code(code))));
+        let ci = self.const_idx(Value::Obj(Code::object(&code)));
         self.emit(Op::LoadConst(ci));
         self.emit(Op::MakeFunction(flags));
         Ok(())

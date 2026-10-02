@@ -25,6 +25,22 @@ pub struct Frame {
     pub names: Option<Obj>,
     pub blocks: Vec<Block>,
     pub func: Option<Obj>,
+    /// Identity of the frame: its frame object finds it again through this number.
+    pub serial: u64,
+    /// The frame object handed out for this frame, created on first use.
+    pub fobj: Option<Obj>,
+    /// The generator or coroutine this frame belongs to.
+    pub gen: Option<std::rc::Weak<Object>>,
+    /// `f_trace`: the local trace function.
+    pub trace: Option<Value>,
+    pub trace_lines: bool,
+    pub trace_opcodes: bool,
+    /// Line of the instruction run before the current one while line events are on (0: none yet).
+    pub prev_line: u32,
+    /// The current instruction was reached by a backward jump.
+    pub jump_back: bool,
+    /// The monitoring event announcing the frame's next run (`crate::trace::ENTRY_*`).
+    pub entry: u8,
 }
 
 macro_rules! types {
@@ -185,6 +201,9 @@ pub struct Interp {
     pub native_state: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
     /// The current `contextvars.Context`, created on first use.
     pub context: Option<Value>,
+    /// `sys.settrace` / `sys.setprofile` / `sys.monitoring` state.
+    pub mon: crate::trace::Monitor,
+    pub frame_serial: std::cell::Cell<u64>,
 }
 
 pub enum GenResult {
@@ -250,6 +269,8 @@ impl Interp {
             native_types: std::collections::HashMap::new(),
             native_state: std::collections::HashMap::new(),
             context: None,
+            mon: crate::trace::Monitor::new(),
+            frame_serial: std::cell::Cell::new(0),
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);
@@ -320,6 +341,8 @@ impl Interp {
             cells.push(Object::new(Kind::Cell(RefCell::new(None))));
         }
         cells.extend(closure.iter().cloned());
+        let serial = self.frame_serial.get() + 1;
+        self.frame_serial.set(serial);
         Frame {
             locals: vec![None; code.varnames.len()],
             stack: Vec::with_capacity(8),
@@ -330,6 +353,15 @@ impl Interp {
             globals,
             names,
             func,
+            serial,
+            fobj: None,
+            gen: None,
+            trace: None,
+            trace_lines: true,
+            trace_opcodes: false,
+            prev_line: 0,
+            jump_back: false,
+            entry: crate::trace::ENTRY_START,
         }
     }
 
@@ -339,7 +371,26 @@ impl Interp {
         }
         self.poll()?;
         self.frames.push(frame);
+        if self.mon.active {
+            if let Err(e) = self.frame_started() {
+                if let Some(f) = self.frames.pop() {
+                    self.retire_frame(f);
+                }
+                return Err(e);
+            }
+        }
         Ok(())
+    }
+
+    /// Drops a frame that left the stack; one that has a frame object moves into it, so
+    /// `frame.f_locals` and tracebacks keep working after the frame returned.
+    pub(crate) fn retire_frame(&mut self, mut frame: Frame) {
+        if frame.fobj.is_some() {
+            frame.stack.clear();
+            frame.blocks.clear();
+            let back = self.frames.len().checked_sub(1).map(|d| self.frame_object(d));
+            crate::builtins::sysextra::bury_frame(frame, back);
+        }
     }
 
     /// Runs `code` as a module-style frame: names resolve through `locals` then `globals`.
@@ -375,7 +426,7 @@ impl Interp {
         e
     }
 
-    fn unwind(&mut self, exc: Obj, entry: usize, mut add_tb: bool) -> R<()> {
+    fn unwind(&mut self, mut exc: Obj, entry: usize, mut add_tb: bool) -> R<()> {
         self.link_context(&exc);
         loop {
             let fr = self.frames.last_mut().unwrap();
@@ -389,19 +440,35 @@ impl Interp {
                     name: fr.code.name.clone(),
                     code: fr.code.clone(),
                     globals: fr.globals.clone(),
+                    frame: fr.fobj.clone(),
                 };
                 if let Kind::Exception(d) = &exc.kind {
                     d.borrow_mut().tb.push(entry_tb);
                 }
             }
+            if self.mon.active {
+                let event = if add_tb { crate::trace::ev::RAISE } else { crate::trace::ev::RERAISE };
+                if let Some(replacement) = self.exception_event(event, &exc) {
+                    exc = replacement;
+                    self.link_context(&exc);
+                }
+            }
+            let fr = self.frames.last_mut().unwrap();
             if let Some(block) = fr.blocks.pop() {
                 fr.stack.truncate(block.depth as usize);
-                fr.stack.push(Value::Obj(exc));
+                fr.stack.push(Value::Obj(exc.clone()));
                 fr.pc = block.handler as usize;
+                if self.mon.active {
+                    self.exception_event(crate::trace::ev::EXCEPTION_HANDLED, &exc);
+                }
                 return Ok(());
             }
+            if self.mon.active {
+                self.exception_event(crate::trace::ev::PY_UNWIND, &exc);
+            }
             let idx = self.frames.len() - 1;
-            self.frames.pop();
+            let frame = self.frames.pop().unwrap();
+            self.retire_frame(frame);
             if idx == entry {
                 return Err(exc);
             }
@@ -467,6 +534,9 @@ impl Interp {
                 fr.pc += 1;
                 op
             };
+            if self.mon.active && self.instrument()? {
+                continue;
+            }
             match op {
                 Op::Nop => {}
                 Op::Pop => {
@@ -731,8 +801,12 @@ impl Interp {
                 }
                 Op::Jump(t) => {
                     let fr = fr!();
+                    let src = fr.pc - 1;
                     let back = (t as usize) < fr.pc;
                     fr.pc = t as usize;
+                    if self.mon.active {
+                        self.jump_event(crate::trace::ev::JUMP, src, t as usize)?;
+                    }
                     if back {
                         self.poll()?;
                     }
@@ -743,8 +817,12 @@ impl Interp {
                         Value::Bool(b) => b,
                         v => self.truthy(&v)?,
                     };
+                    let src = fr!().pc - 1;
                     if !b {
                         fr!().pc = t as usize;
+                    }
+                    if self.mon.active {
+                        self.branch_event(src, t as usize, !b)?;
                     }
                 }
                 Op::JumpIfTrue(t) => {
@@ -753,8 +831,12 @@ impl Interp {
                         Value::Bool(b) => b,
                         v => self.truthy(&v)?,
                     };
+                    let src = fr!().pc - 1;
                     if b {
                         fr!().pc = t as usize;
+                    }
+                    if self.mon.active {
+                        self.branch_event(src, t as usize, b)?;
                     }
                 }
                 Op::JumpIfFalseKeep(t) => {
@@ -763,10 +845,14 @@ impl Interp {
                         Value::Bool(b) => b,
                         v => self.truthy(&v)?,
                     };
+                    let src = fr!().pc - 1;
                     if !b {
                         fr!().pc = t as usize;
                     } else {
                         pop!();
+                    }
+                    if self.mon.active {
+                        self.branch_event(src, t as usize, !b)?;
                     }
                 }
                 Op::JumpIfTrueKeep(t) => {
@@ -775,10 +861,14 @@ impl Interp {
                         Value::Bool(b) => b,
                         v => self.truthy(&v)?,
                     };
+                    let src = fr!().pc - 1;
                     if b {
                         fr!().pc = t as usize;
                     } else {
                         pop!();
+                    }
+                    if self.mon.active {
+                        self.branch_event(src, t as usize, b)?;
                     }
                 }
                 Op::GetIter => {
@@ -788,13 +878,19 @@ impl Interp {
                 }
                 Op::ForIter(t) => {
                     let it = fr!().stack.last().unwrap().clone();
-                    match self.iter_step(&it)? {
+                    let item = self.iter_step(&it)?;
+                    let src = fr!().pc - 1;
+                    let exhausted = item.is_none();
+                    match item {
                         Some(v) => push!(v),
                         None => {
                             let fr = fr!();
                             fr.stack.pop();
                             fr.pc = t as usize;
                         }
+                    }
+                    if self.mon.active {
+                        self.branch_event(src, t as usize, exhausted)?;
                     }
                 }
                 Op::BuildTuple(n) => {
@@ -1021,7 +1117,11 @@ impl Interp {
                 }
                 Op::ReturnValue => {
                     let v = pop!();
-                    self.frames.pop();
+                    if self.mon.active {
+                        self.return_event(crate::trace::ev::PY_RETURN, &v)?;
+                    }
+                    let frame = self.frames.pop().unwrap();
+                    self.retire_frame(frame);
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
                     }
@@ -1032,6 +1132,9 @@ impl Interp {
                 }
                 Op::YieldValue => {
                     let v = pop!();
+                    if self.mon.active {
+                        self.return_event(crate::trace::ev::PY_YIELD, &v)?;
+                    }
                     let frame = self.frames.pop().unwrap();
                     self.yielded = Some(frame);
                     if self.frames.len() == entry {
@@ -1044,6 +1147,9 @@ impl Interp {
                     let it = fr!().stack.last().unwrap().clone();
                     match self.send_to_iter(&it, v)? {
                         GenResult::Yield(y) => {
+                            if self.mon.active {
+                                self.return_event(crate::trace::ev::PY_YIELD, &y)?;
+                            }
                             let fr = fr!();
                             fr.pc -= 1;
                             let frame = self.frames.pop().unwrap();

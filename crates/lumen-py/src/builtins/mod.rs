@@ -65,6 +65,9 @@ pub mod errnom;
 pub mod posixm;
 pub mod typingm;
 pub mod zoneinfom;
+pub mod lsprofm;
+pub mod monitoringm;
+pub mod opcodem;
 
 use crate::object::*;
 use crate::vm::*;
