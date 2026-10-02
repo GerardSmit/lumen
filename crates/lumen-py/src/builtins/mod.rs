@@ -65,6 +65,10 @@ pub mod errnom;
 pub mod posixm;
 pub mod typingm;
 pub mod zoneinfom;
+pub mod xid;
+pub mod testcapi;
+pub mod interpchanm;
+pub mod subinterpm;
 
 use crate::object::*;
 use crate::vm::*;

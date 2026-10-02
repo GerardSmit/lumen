@@ -235,6 +235,14 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
     if let Some(doc) = desc.doc {
         dict_set_str(&d, "__doc__", Value::str(doc));
     }
+    install_module::<M>(it, &m)?;
+    Ok(m)
+}
+
+/// Install everything `M` declares (functions, classes, constants, then its init hook) into the
+/// existing module `m`: one module assembled from several declarations.
+pub fn install_module<M: Module<PyHost>>(it: &mut Interp, m: &Obj) -> R<()> {
+    let d = it.module_dict(m);
     install_functions::<M>(&d);
     let items = ModuleItems::<PyHost>::of::<M>();
     for c in &items.classes {
@@ -251,7 +259,7 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
     if let Some(init) = items.init {
         init(it, &Value::Obj(m.clone()))?;
     }
-    Ok(m)
+    Ok(())
 }
 
 /// Install the functions `M` declares into the existing namespace `d` (the `builtins` functions

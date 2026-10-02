@@ -476,7 +476,7 @@ pub mod sys {
         dict_set_str(&d, "maxsize", Value::Int(i64::MAX));
         dict_set_str(&d, "maxunicode", Value::Int(0x10ffff));
         dict_set_str(&d, "byteorder", Value::str("little"));
-        dict_set_str(&d, "version", Value::str("3.12.15 (lumen-py)"));
+        dict_set_str(&d, "version", Value::str("3.12.15 (main, Jan  1 2026, 00:00:00) [lumen-py]"));
         dict_set_str(&d, "hexversion", Value::Int(0x030c0ff0));
         let (platform, executable, argv) = {
             let p = it.platform.borrow();
