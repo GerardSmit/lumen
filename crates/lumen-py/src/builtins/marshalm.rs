@@ -1,6 +1,7 @@
-//! `marshal`: CPython's value serialization format (version 4) for the data types. Code objects
+//! `marshal`: CPython's value serialization format (version 5) for the data types. Code objects
 //! are not supported, since lumen-py's bytecode is not CPython's. Writing never emits
-//! back-references (CPython's depend on reference counts); reading accepts them.
+//! back-references (CPython's depend on reference counts); reading accepts them. Set elements
+//! are written in the order of their encodings, as CPython does, so output is reproducible.
 
 /// This module contains functions that can read and write Python values in
 /// a binary format. The format is specific to Python, but independent of
@@ -22,6 +23,8 @@
 ///     historical format, version 1 shares interned strings and version 2
 ///     uses a binary format for floating-point numbers.
 ///     Version 3 shares common object references (New in version 3.4).
+///     Version 4 supports small tuples and short strings (New in version 3.4).
+///     Version 5 supports slice objects (New in version 3.14).
 ///
 /// Functions:
 ///
@@ -35,8 +38,9 @@ pub mod marshal {
     use crate::pyint::BigInt;
     use crate::vm::{dict_set_str, Interp};
     use std::cell::RefCell;
+    use std::collections::HashMap;
 
-    const VERSION: i64 = 4;
+    const VERSION: i64 = 5;
     const MAX_DEPTH: usize = 2000;
     const FLAG_REF: u8 = 0x80;
 
@@ -44,6 +48,9 @@ pub mod marshal {
         out: Vec<u8>,
         version: i64,
         depth: usize,
+        /// Mutable containers written so far and their reference index (version 3 and up), so
+        /// shared and recursive containers are written once and referred to afterwards.
+        seen: HashMap<*const Object, i32>,
     }
 
     fn unmarshallable(it: &mut Interp) -> Obj {
@@ -101,9 +108,35 @@ pub mod marshal {
             }
         }
 
-        fn seq(&mut self, it: &mut Interp, code: u8, items: &[Value]) -> R<()> {
+        /// Starts a mutable container: writes a back-reference and returns true if `o` was
+        /// written before, else its type byte with `FLAG_REF` (version 3 and up).
+        fn start(&mut self, o: &Obj, code: u8) -> bool {
+            if self.version < 3 {
+                self.out.push(code);
+                return false;
+            }
+            let key = std::rc::Rc::as_ptr(o);
+            if let Some(&i) = self.seen.get(&key) {
+                self.out.push(b'r');
+                self.long(i);
+                return true;
+            }
+            let i = self.seen.len() as i32;
+            self.seen.insert(key, i);
+            self.out.push(code | FLAG_REF);
+            false
+        }
+
+        fn seq(&mut self, it: &mut Interp, o: Option<&Obj>, code: u8, items: &[Value]) -> R<()> {
             let Ok(n) = i32::try_from(items.len()) else { return Err(unmarshallable(it)) };
-            self.out.push(code);
+            match o {
+                Some(o) => {
+                    if self.start(o, code) {
+                        return Ok(());
+                    }
+                }
+                None => self.out.push(code),
+            }
             self.long(n);
             for v in items {
                 self.value(it, v)?;
@@ -192,16 +225,18 @@ pub mod marshal {
                                     self.value(it, x)?;
                                 }
                             } else {
-                                self.seq(it, b'(', items)?;
+                                self.seq(it, None, b'(', items)?;
                             }
                         }
                         Kind::List(l) => {
                             let items = l.borrow().clone();
-                            self.seq(it, b'[', &items)?;
+                            self.seq(it, Some(o), b'[', &items)?;
                         }
                         Kind::Dict(d) => {
                             let pairs: Vec<(Value, Value)> = d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect();
-                            self.out.push(b'{');
+                            if self.start(o, b'{') {
+                                return Ok(());
+                            }
                             for (k, x) in pairs {
                                 self.value(it, &k)?;
                                 self.value(it, &x)?;
@@ -211,7 +246,34 @@ pub mod marshal {
                         Kind::Set(d) | Kind::FrozenSet(d) => {
                             let code = if matches!(o.kind, Kind::Set(_)) { b'<' } else { b'>' };
                             let items = d.borrow().keys();
-                            self.seq(it, code, &items)?;
+                            let Ok(n) = i32::try_from(items.len()) else { return Err(unmarshallable(it)) };
+                            let mut encoded = Vec::with_capacity(items.len());
+                            for x in &items {
+                                let mut w = Writer { out: Vec::new(), version: self.version, depth: self.depth, seen: HashMap::new() };
+                                w.value(it, x)?;
+                                encoded.push(w.out);
+                            }
+                            encoded.sort();
+                            if code == b'<' {
+                                if self.start(o, code) {
+                                    return Ok(());
+                                }
+                            } else {
+                                self.out.push(code);
+                            }
+                            self.long(n);
+                            for e in encoded {
+                                self.out.extend_from_slice(&e);
+                            }
+                        }
+                        Kind::Slice(a, b, c) => {
+                            if self.version < 5 {
+                                return Err(unmarshallable(it));
+                            }
+                            self.out.push(b':');
+                            for x in [a, b, c] {
+                                self.value(it, x)?;
+                            }
                         }
                         _ => return self.buffer(it, v),
                     }
@@ -232,22 +294,25 @@ pub mod marshal {
     struct Reader<'a> {
         data: &'a [u8],
         pos: usize,
-        refs: Vec<Value>,
+        refs: Vec<Option<Value>>,
         depth: usize,
+        allow_code: bool,
+        file: bool,
     }
 
     fn bad(it: &mut Interp, what: &str) -> Obj {
         it.value_error(&format!("bad marshal data ({what})"))
     }
 
-    fn eof(it: &mut Interp) -> Obj {
-        it.new_exc_str("EOFError", "marshal data too short")
+    fn eof(it: &mut Interp, file: bool) -> Obj {
+        let msg = if file { "EOF read where not expected" } else { "marshal data too short" };
+        it.new_exc_str("EOFError", msg)
     }
 
     impl Reader<'_> {
         fn bytes(&mut self, it: &mut Interp, n: usize) -> R<&[u8]> {
             if self.data.len() - self.pos < n {
-                return Err(eof(it));
+                return Err(eof(it, self.file));
             }
             let s = &self.data[self.pos..self.pos + n];
             self.pos += n;
@@ -255,7 +320,13 @@ pub mod marshal {
         }
 
         fn byte(&mut self, it: &mut Interp) -> R<u8> {
-            Ok(self.bytes(it, 1)?[0])
+            match self.data.get(self.pos) {
+                Some(&b) => {
+                    self.pos += 1;
+                    Ok(b)
+                }
+                None => Err(it.new_exc_str("EOFError", "EOF read where not expected")),
+            }
         }
 
         fn long(&mut self, it: &mut Interp) -> R<i32> {
@@ -304,13 +375,13 @@ pub mod marshal {
             let flag = raw & FLAG_REF != 0;
             let code = raw & !FLAG_REF;
             let slot = if flag {
-                self.refs.push(Value::None);
+                self.refs.push(None);
                 Some(self.refs.len() - 1)
             } else {
                 None
             };
             let v = match code {
-                b'0' => return Err(bad(it, "NULL object")),
+                b'0' => return Err(it.type_error("NULL object in marshal data for object")),
                 b'N' => Value::None,
                 b'F' => Value::Bool(false),
                 b'T' => Value::Bool(true),
@@ -381,7 +452,7 @@ pub mod marshal {
                     let n = self.size(it, "list")?;
                     let list = Object::new(Kind::List(RefCell::new(Vec::with_capacity(n.min(1 << 16)))));
                     if let Some(s) = slot {
-                        self.refs[s] = Value::Obj(list.clone());
+                        self.refs[s] = Some(Value::Obj(list.clone()));
                     }
                     for _ in 0..n {
                         let x = self.object(it)?;
@@ -394,7 +465,7 @@ pub mod marshal {
                 b'{' => {
                     let d = it.new_dict();
                     if let Some(s) = slot {
-                        self.refs[s] = Value::Obj(d.clone());
+                        self.refs[s] = Some(Value::Obj(d.clone()));
                     }
                     let dv = Value::Obj(d);
                     loop {
@@ -408,6 +479,18 @@ pub mod marshal {
                     }
                     return Ok(dv);
                 }
+                b'<' if slot.is_some() => {
+                    let n = self.size(it, "set")?;
+                    let set = it.new_set(Vec::new())?;
+                    if let Some(s) = slot {
+                        self.refs[s] = Some(set.clone());
+                    }
+                    for _ in 0..n {
+                        let x = self.object(it)?;
+                        it.call_method(&set, "add", vec![x])?;
+                    }
+                    return Ok(set);
+                }
                 b'<' | b'>' => {
                     let n = self.size(it, "set")?;
                     let mut items = Vec::with_capacity(n.min(1 << 16));
@@ -420,18 +503,25 @@ pub mod marshal {
                         it.new_frozenset_from(items)?
                     }
                 }
+                b':' => {
+                    let a = self.object(it)?;
+                    let b = self.object(it)?;
+                    let c = self.object(it)?;
+                    Value::Obj(Object::new(Kind::Slice(a, b, c)))
+                }
                 b'r' => {
                     let n = self.long(it)?;
                     return match usize::try_from(n).ok().and_then(|i| self.refs.get(i)) {
-                        Some(v) => Ok(v.clone()),
-                        None => Err(bad(it, "invalid reference")),
+                        Some(Some(v)) => Ok(v.clone()),
+                        _ => Err(bad(it, "invalid reference")),
                     };
                 }
+                b'c' if !self.allow_code => return Err(it.value_error("unmarshalling code objects is disallowed")),
                 b'c' => return Err(bad(it, "code objects are not supported")),
                 _ => return Err(bad(it, "unknown type code")),
             };
             if let Some(s) = slot {
-                self.refs[s] = v.clone();
+                self.refs[s] = Some(v.clone());
             }
             Ok(v)
         }
@@ -446,13 +536,13 @@ pub mod marshal {
     }
 
     fn dump_bytes(it: &mut Interp, value: &Value, version: i64) -> R<Vec<u8>> {
-        let mut w = Writer { out: Vec::new(), version, depth: 0 };
+        let mut w = Writer { out: Vec::new(), version, depth: 0, seen: HashMap::new() };
         w.value(it, value)?;
         Ok(w.out)
     }
 
-    fn load_bytes(it: &mut Interp, data: &[u8]) -> R<(Value, usize)> {
-        let mut r = Reader { data, pos: 0, refs: Vec::new(), depth: 0 };
+    fn load_bytes(it: &mut Interp, data: &[u8], allow_code: bool, file: bool) -> R<(Value, usize)> {
+        let mut r = Reader { data, pos: 0, refs: Vec::new(), depth: 0, allow_code, file };
         let v = r.object(it)?;
         Ok((v, r.pos))
     }
@@ -466,8 +556,11 @@ pub mod marshal {
     ///
     /// Raise a ValueError exception if value has (or contains an object that has) an
     /// unsupported type.
-    #[op(hint(py(text_signature = "($module, value, version=version, /)")))]
-    fn dumps(it: &mut Interp, value: &Value, #[default(4)] version: i64) -> R<Value> {
+    ///   allow_code
+    ///     Allow to write code objects.
+    #[op(hint(py(text_signature = "($module, value, version=version, /, *, allow_code=True)")))]
+    fn dumps(it: &mut Interp, value: &Value, #[default(5)] version: i64, #[kwonly] #[default(true)] allow_code: bool) -> R<Value> {
+        let _ = allow_code; // code objects are unmarshallable either way
         Ok(Value::bytes(dump_bytes(it, value, version)?))
     }
 
@@ -479,12 +572,15 @@ pub mod marshal {
     ///     Must be a writeable binary file.
     ///   version
     ///     Indicates the data format that dump should use.
+    ///   allow_code
+    ///     Allow to write code objects.
     ///
     /// If the value has (or contains an object that has) an unsupported type, a
     /// ValueError exception is raised - but garbage data will also be written
     /// to the file. The object will not be properly read back by load().
-    #[op(hint(py(text_signature = "($module, value, file, version=version, /)")))]
-    fn dump(it: &mut Interp, value: &Value, file: &Value, #[default(4)] version: i64) -> R<()> {
+    #[op(hint(py(text_signature = "($module, value, file, version=version, /, *, allow_code=True)")))]
+    fn dump(it: &mut Interp, value: &Value, file: &Value, #[default(5)] version: i64, #[kwonly] #[default(true)] allow_code: bool) -> R<()> {
+        let _ = allow_code;
         let b = dump_bytes(it, value, version)?;
         it.call_method(file, "write", vec![Value::bytes(b)])?;
         Ok(())
@@ -494,19 +590,23 @@ pub mod marshal {
     ///
     /// If no valid value is found, raise EOFError, ValueError or TypeError.  Extra
     /// bytes in the input are ignored.
-    #[op(hint(py(text_signature = "($module, bytes, /)")))]
-    fn loads(it: &mut Interp, data: &Value) -> R<Value> {
+    ///   allow_code
+    ///     Allow to load code objects.
+    #[op(hint(py(text_signature = "($module, bytes, /, *, allow_code=True)")))]
+    fn loads(it: &mut Interp, data: &Value, #[kwonly] #[default(true)] allow_code: bool) -> R<Value> {
         let Some(b) = crate::builtins::memview::contiguous_bytes(it, data)? else {
             let t = it.type_name_of(data);
             return Err(it.type_error(&format!("a bytes-like object is required, not '{t}'")));
         };
-        Ok(load_bytes(it, &b)?.0)
+        Ok(load_bytes(it, &b, allow_code, false)?.0)
     }
 
     /// Read one value from the open file and return it.
     ///
     ///   file
     ///     Must be readable binary file.
+    ///   allow_code
+    ///     Allow to load code objects.
     ///
     /// If no valid value is read (e.g. because the data has a different Python
     /// version's incompatible marshal format), raise EOFError, ValueError or
@@ -514,15 +614,15 @@ pub mod marshal {
     ///
     /// Note: If an object containing an unsupported type was marshalled with
     /// dump(), load() will substitute None for the unmarshallable type.
-    #[op(hint(py(text_signature = "($module, file, /)")))]
-    fn load(it: &mut Interp, file: &Value) -> R<Value> {
+    #[op(hint(py(text_signature = "($module, file, /, *, allow_code=True)")))]
+    fn load(it: &mut Interp, file: &Value, #[kwonly] #[default(true)] allow_code: bool) -> R<Value> {
         let start = it.call_method(file, "tell", Vec::new())?;
         let rest = it.call_method(file, "read", Vec::new())?;
         let Some(b) = crate::builtins::memview::contiguous_bytes(it, &rest)? else {
             let t = it.type_name_of(&rest);
             return Err(it.type_error(&format!("file.read() returned not bytes but {t}")));
         };
-        let (v, used) = load_bytes(it, &b)?;
+        let (v, used) = load_bytes(it, &b, allow_code, true)?;
         let start = it.index_of(&start)?;
         it.call_method(file, "seek", vec![Value::Int(start + used as i64)])?;
         Ok(v)

@@ -253,7 +253,8 @@ impl<I: ReInput> Matcher<I> {
     /// `` (`want`) or `\B` at `pos`.
     fn word_boundary_ok(&self, pos: usize, want: bool, flavor: Flavor) -> bool {
         if self.dialect == Dialect::Python && self.n == 0 {
-            return false;
+            // 3.14: \B matches the empty string, \b does not
+            return !want;
         }
         let before = pos > 0 && self.is_word_char(self.input.at(pos - 1), flavor);
         let after = pos < self.n && self.is_word_char(self.input.at(pos), flavor);
