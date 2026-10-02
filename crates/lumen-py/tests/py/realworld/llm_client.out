@@ -1,0 +1,42 @@
+| usage: llm [-h] [-m {mock-small,mock-large,mock-busy}] [-t TEMPERATURE]
+|            [--max-tokens MAX_TOKENS] [--system SYSTEM] [--image FILE] [--stream]
+|            [prompt ...]
+
+| Chat with an OpenAI-compatible endpoint.
+
+| positional arguments:
+|   prompt                the user message
+
+| options:
+|   -h, --help            show this help message and exit
+|   -m {mock-small,mock-large,mock-busy}, --model {mock-small,mock-large,mock-busy}
+|   -t TEMPERATURE, --temperature TEMPERATURE
+|   --max-tokens MAX_TOKENS
+|   --system SYSTEM       system prompt
+|   --image FILE
+|   --stream
+parsed: [('image', []), ('max_tokens', 64), ('model', 'mock-small'), ('prompt', ['hello', 'there']), ('serve', False), ('stream', False), ('system', None), ('temperature', 0.2)]
+exit 2 -> llm: error: argument -m/--model: invalid choice: 'gpt-9' (choose from mock-small, mock-large, mock-busy)
+exit 2 -> llm: error: argument -t/--temperature: invalid float value: 'warm'
+models: ['mock-small', 'mock-large']
+cache key: 353db28f7fa979bc
+True dog lazy the over jumps fox brown quick the
+usage: {'prompt_tokens': 9, 'completion_tokens': 9, 'total_tokens': 18}
+cached: True requests: 2
+  rate limited (attempt 1), retrying in 0s
+busy: there you are
+data url: data:image/png;base64,iVBORw0KGgoAAQIDBA... 118
+vision: picture this in is what [saw image/png:8650fa3ad33b]
+system: YOU ARE TERSE
+  content-type: text/event-stream
+> model mock the from reversed back comes it
+> when wrapping need to enough long is sentence
+> this runtime; one on Python and JavaScript
+> runs Lumen
+shortened: model mock the from reversed back [...]
+APIError: HTTP 401: invalid api key 401
+APIError: HTTP 404: no route for /v1/nothing
+token: DTtWByKRXS-TGkxBAKAOy84GPRIeV35rk7u-fAXyOtY
+blake2b: 7edfb3c6ed529703f694bfec3941a7aa da39a3ee5e6b4b0d3255bfef95601890afd80709
+shutdown: 200 {'bye': True}
+server exit code: 0

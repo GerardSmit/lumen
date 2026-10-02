@@ -1,0 +1,48 @@
+12 orders, first: Order(order_id=1001, region='North', rep='Alice', product='Widget', units=12, unit_price=Decimal('19.99'), discount=Decimal('0.05'))
+revenue: 5785.94 Decimal('5785.94') 5,785.94       5,785.94
+avg order (6 digits): 482.162 sqrt: 76.0654
+prec: 28 0.1428571428571428571428571429
+half-even vs half-up: 2.68 2.66 2.67
+InvalidOperation: InvalidOperation
+3.30 3.3000000000000003 0.1000000000000000055511151231257827021181583404541015625 True 1E+3
+region shares (exact):
+  West     1845.72  31.90%  ~6/19
+  East     1448.44  25.03%  ~1/4
+  North    1246.53  21.54%  ~3/14
+  South    1245.25  21.52%  ~3/14
+fractions: 11/12 1/8 3/2 484/49 233/100 (5, 3) -4
+mean 482.162 median 474.125 stdev 251.404 pstdev 240.701
+fmean 482.1617 geo 418.6805 harm 354.2573
+median_low/high: 9 11 mode: Widget ['Alice']
+quartiles: [294.64, 474.12, 698.44]
+deciles: [2.1, 3.2, 4.9, 7.8, 10.0, 11.6, 14.1, 23.0, 38.5]
+corr(units, price): -0.6769
+revenue ~ 10.668 * units + 314.144
+normal: mu=482.16 sigma=251.40 p(<500)=0.5283 q90=804.35
+mean of decimals: 482.1616666666666666666666667 of fractions: 1/4
+variance of ints: 318.02272727272725 1.25
+StatisticsError: mean requires at least one data point
+top 3: [(1009, '990.00'), (1012, '728.64'), (1003, '719.64')]
+smallest 2 by units: [1005, 1008]
+pick list: [(-60, 1009, 'Carol'), (-40, 1003, 'Carol'), (-25, 1006, 'Erin'), (-15, 1011, 'Erin')] left: 8 next: (-12, 1001, 'Alice')
+merged ids: [1001, 1002, 1003, 1006, 1008, 1010] [5, 4, 3, 2, 1]
+heapify: [1, 4, 2, 9, 8, 7] 1 1
+bands: {'small': [1001, 1005], 'medium': [1002, 1006, 1008, 1010, 1011], 'large': [1003, 1004, 1007, 1009, 1012]}
+ladder: [10, 10, 20, 30, 40] 0 2 6
+binary: 240 bytes, 20 per record, e9030000 4e6f7274 68000c00 05590000 00000000
+record 4: (1004, b'East\x00\x00', 7, 51975) 80
+roundtrip ok: True
+header: b'SALE\x02\x00\x0c' 16 (0.1,)
+3fc00000 (-2,) b'\x01\x00ab\x00'
+rep     | orders |  units|     revenue| avg disc
+------------------------------------------------
+Alice   |   4    |     32|    1,775.28|     3.2%
+Carol   |   2    |    100|    1,709.64|    11.0%
+Bob     |   2    |     12|    1,083.34|     2.5%
+Erin    |   2    |     40|      793.60|     1.0%
+Dave    |   2    |      5|      424.08|     7.5%
+================================================
+0003.142|+7|1.234568e+04|dead_beef|0o10|10,000,000|    'x'     |ab*****|0.000123
+ok    | 99.5%|0042|ff|Decimal('1.0')
+['a2', 'a10', 'B1', 'b10'] 1004 [1009, 1003, 1006]
+   1,234.500 0.33333 1.20e-5

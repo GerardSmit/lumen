@@ -1,0 +1,49 @@
+[17:00 local] INFO Porch light at sunset: next sunset trigger at 2024-03-30T18:54:00+01:00
+start: 2024-03-30T17:00:00+01:00 CET 1:00:00
+[18:54 local] INFO Porch light at sunset: triggered by sunset
+[18:54 local] INFO Porch light at sunset: next sunset trigger at 2024-03-31T19:56:00+02:00
+[18:54 local] INFO Porch color: triggered by light.porch
+[18:54 local] WARNING Porch color: light.turn_on failed: light.porch does not support color temperature
+[19:30 local] INFO Hallway motion: triggered by binary_sensor.hallway_motion
+[19:33 local] INFO Hallway motion: restarting
+[19:33 local] INFO Hallway motion: triggered by binary_sensor.hallway_motion
+living room: on
+living room: off {'friendly_name': 'Living Room', 'supported_features': 3, 'brightness': 102, 'color_temp_kelvin': 2700}
+[00:30 local] INFO Lights off at midnight: triggered by time
+after DST: 2024-03-31T05:00:00+02:00 CEST 1:00:00
+[05:00 local] INFO Anna leaves: triggered by person.anna
+[05:00 local] INFO notify: Anna left; porch light off
+[19:56 local] INFO Porch light at sunset: triggered by sunset
+[19:56 local] INFO Porch light at sunset: next sunset trigger at 2024-04-01T19:58:00+02:00
+[19:56 local] INFO Porch color: triggered by light.porch
+[19:56 local] WARNING Porch color: light.turn_on failed: light.porch does not support color temperature
+[00:30 local] INFO Lights off at midnight: triggered by time
+wait_for timed out
+gather: [0, 1, 4, 9]
+event bus stopped; cancelled: True
+17:00 light.living_room=off
+17:00 light.porch=off
+17:00 binary_sensor.hallway_motion=off
+17:00 person.anna=home
+18:54 light.porch=on
+19:30 binary_sensor.hallway_motion=on
+19:30 light.living_room=on
+19:33 binary_sensor.hallway_motion=off
+19:33 binary_sensor.hallway_motion=on
+19:38 light.living_room=off
+00:30 light.porch=off
+05:00 person.anna=not_home
+19:56 person.anna=home
+19:56 light.porch=on
+00:30 light.porch=off
+Porch light at sunset    runs=2 mode=single
+Hallway motion           runs=2 mode=restart
+Anna leaves              runs=1 mode=single
+Porch color              runs=2 mode=single
+Lights off at midnight   runs=2 mode=single
+events: [('state_changed', 15), ('time_changed', 6)]
+features: 3 5 8
+['EntityState.ON', 'EntityState.HOME'] True
+gap: 2024-03-31T02:30:00+01:00 2024-03-31T01:30:00+00:00
+fold: 2:00:00 1:00:00 01:30:00
+ny: 2024-03-31T18:00:00+02:00 6:00:00 zoneinfo.ZoneInfo(key='Europe/Amsterdam')

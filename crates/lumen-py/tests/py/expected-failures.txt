@@ -9,3 +9,8 @@ stdlib/random_basic.py  # random -> `from os import urandom`: no os/posix module
 stdlib/random_mod.py  # random -> `from os import urandom`: no os/posix module
 stdlib/typing_enum.py  # typing -> contextlib -> `import os`: no os/posix module
 stdlib/typing_features.py  # typing -> contextlib -> `import os`: no os/posix module
+realworld/hermes_plugin.py  # needs ast/_ast, os/posix, _io, logging, pathlib, tempfile
+realworld/home_automation.py  # needs asyncio, zoneinfo, logging, _contextvars, select, socket
+realworld/llm_client.py  # needs argparse, urllib.request, http.server, subprocess, socket, hashlib
+realworld/project_audit.py  # needs _csv, os/posix, _io, subprocess/_posixsubprocess, shutil, tempfile
+realworld/sales_report.py  # needs io, decimal (_pydecimal + _contextvars), statistics, fractions
