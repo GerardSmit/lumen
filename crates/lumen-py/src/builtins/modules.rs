@@ -37,7 +37,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_socket", bound::<super::socketm::_socket::Module>),
     ("_sre", |it| Some(super::sre::make(it))),
     ("_statistics", bound::<super::statisticsm::_statistics::Module>),
-    ("_string", |it| Some(super::stringm::make(it))),
+    ("_string", bound::<super::stringm::_string::Module>),
     ("_struct", bound::<super::structm::_struct::Module>),
     ("_thread", bound::<super::threadm::_thread::Module>),
     ("_tokenize", bound::<super::tokenizem::_tokenize::Module>),
