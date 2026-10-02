@@ -94,12 +94,12 @@ fn async_call(it: &mut Interp, v: &Value, special: &str, what: &str) -> R<Value>
     it.call_special(v, special, Vec::new())
 }
 
-fn frame_globals(it: &Interp) -> Obj {
+pub(crate) fn frame_globals(it: &Interp) -> Obj {
     it.frames.last().map(|f| f.globals.clone()).unwrap_or_else(|| it.builtins.clone())
 }
 
 /// `locals()`: the frame's namespace, or a snapshot of its fast locals and cells.
-fn locals_value(it: &mut Interp) -> Value {
+pub(crate) fn locals_value(it: &mut Interp) -> Value {
     let fr = match it.frames.last() {
         Some(f) => f,
         None => return Value::Obj(it.builtins.clone()),
@@ -442,7 +442,9 @@ fn compile_source(it: &mut Interp, mut source: Value, filename: &Value, mode: &s
         super::astconv::Mode::Exec => it.compile_source(&src, &filename)?,
         super::astconv::Mode::Single => it.compile_source_mode(&src, &filename, true)?,
     };
-    Ok(Value::Obj(Object::new(Kind::Code(code))))
+    let obj = Object::new(Kind::Code(code));
+    it.code_created(&obj);
+    Ok(Value::Obj(obj))
 }
 
 pub fn init(it: &mut Interp) {

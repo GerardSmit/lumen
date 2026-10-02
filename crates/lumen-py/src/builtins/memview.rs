@@ -40,7 +40,7 @@ impl Source {
         }
     }
 
-    fn reexport(&self) -> Result<Source, BufferError> {
+    pub fn reexport(&self) -> Result<Source, BufferError> {
         Ok(match self {
             Source::Bytes(o) => Source::Bytes(o.clone()),
             Source::Store(e) => Source::Store(e.store().export()?),
@@ -57,7 +57,15 @@ pub struct Exported {
     pub fmt: Rc<str>,
 }
 
+/// `PyBUF_FULL_RO`: what `memoryview(x)` and most consumers ask an exporter for.
+pub const PYBUF_FULL_RO: i64 = 0x11c;
+
 pub fn export(it: &mut Interp, v: &Value) -> R<Option<Exported>> {
+    export_flags(it, v, PYBUF_FULL_RO)
+}
+
+/// [`export`] with the request flags handed to a `__buffer__` method.
+pub fn export_flags(it: &mut Interp, v: &Value, flags: i64) -> R<Option<Exported>> {
     let Value::Obj(o) = v else { return Ok(None) };
     match &o.kind {
         Kind::Bytes(b) => Ok(Some(Exported {
@@ -84,11 +92,28 @@ pub fn export(it: &mut Interp, v: &Value) -> R<Option<Exported>> {
                     let view = ViewDesc::contiguous(0, Some(spec.kind), spec.size, ByteOrder::NATIVE, vec![n], false);
                     Ok(Some(Exported { src: Source::Store(e), view, obj: v.clone(), fmt: spec.format().into() }))
                 }
-                None => Ok(None),
+                None => export_dunder(it, v, flags),
             },
         },
-        _ => Ok(None),
+        _ => export_dunder(it, v, flags),
     }
+}
+
+/// PEP 688: an instance of a class that defines `__buffer__` exports the memoryview it returns.
+fn export_dunder(it: &mut Interp, v: &Value, flags: i64) -> R<Option<Exported>> {
+    let Value::Obj(o) = v else { return Ok(None) };
+    if o.cls.is_none() {
+        return Ok(None);
+    }
+    let cls = it.type_of_obj(o);
+    if it.lookup_mro(&cls, "__buffer__").is_none() {
+        return Ok(None);
+    }
+    let view = it.call_method(v, "__buffer__", vec![Value::Int(flags)])?;
+    if Py::<MemoryView>::from_value(it, &view).is_none() {
+        return Err(it.type_error("__buffer__ returned non-memoryview object"));
+    }
+    export(it, &view)
 }
 
 /// A writable `memoryview` of `store`, exported by `obj`.
@@ -96,6 +121,11 @@ pub fn view_of_store(it: &mut Interp, obj: Value, store: &Rc<lumen_common::buffe
     let e = store.export().map_err(|e| buffer_error(it, e))?;
     let view = ViewDesc::bytes(0, store.len(), false);
     Ok(Py::new(it, MemoryView { obj, src: Some(Source::Store(e)), view, fmt: "B".into() }).into_value())
+}
+
+/// A `memoryview` of `src` described by `view` and `fmt`, exported by `obj`.
+pub fn view_from_parts(it: &mut Interp, obj: Value, src: Source, view: ViewDesc, fmt: Rc<str>) -> Value {
+    Py::new(it, MemoryView { obj, src: Some(src), view, fmt }).into_value()
 }
 
 /// The bytes of any bytes-like object, in C order (`bytes(x)` for a buffer).
@@ -361,7 +391,7 @@ impl MemoryView {
 }
 
 /// `(start, stop, step)` of a slice object, `None` for omitted bounds.
-fn slice_parts(it: &mut Interp, s: &Value) -> R<(Option<isize>, Option<isize>, isize)> {
+pub fn slice_parts(it: &mut Interp, s: &Value) -> R<(Option<isize>, Option<isize>, isize)> {
     let (a, b, c) = match s {
         Value::Obj(o) => match &o.kind {
             Kind::Slice(a, b, c) => (a.clone(), b.clone(), c.clone()),

@@ -1,3 +1,5 @@
 # Test files that cpython-test-runner does not run (one name per line, with or without .py).
 # Use this for files that hang, exhaust memory or need resources the interpreter cannot provide.
 # Skipped files are counted in the summary but never run and never count as regressions.
+test_launcher  # Windows-only: module-level SkipTest aborts unittest, which the runner reports as an import error
+test_perf_profiler  # needs the perf trampoline (PY_HAVE_PERF_TRAMPOLINE), Linux only

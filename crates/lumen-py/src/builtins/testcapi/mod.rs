@@ -4,6 +4,21 @@
 
 mod abstractm;
 mod containers;
+mod getargsm;
+mod numbersm;
+mod unicodem;
+mod watchersm;
+mod evalm;
+mod typesm;
+mod miscm;
+mod timecapi;
+mod filem;
+mod memm;
+mod threadsm;
+mod structmembersm;
+mod hamtm;
+mod excm;
+mod extram;
 pub(super) mod internal;
 
 use crate::object::*;
@@ -28,6 +43,27 @@ fn nonnull<'a>(it: &mut Interp, v: &'a Value) -> R<&'a Value> {
 
 fn builtin(it: &Interp, name: &str) -> Value {
     dict_get_str(&it.builtins, name).unwrap_or(Value::None)
+}
+
+fn call_builtin(it: &mut Interp, name: &str, args: Vec<Value>) -> R<Value> {
+    let f = builtin(it, name);
+    it.call(&f, args, Vec::new())
+}
+
+fn int_value(n: i128) -> Value {
+    Value::big(BigInt::from_i128(n))
+}
+
+fn complex_value(re: f64, im: f64) -> Value {
+    Value::Obj(Object::new(Kind::Complex(re, im)))
+}
+
+fn pointer_of(it: &Interp, v: &Value) -> usize {
+    it.id_of(v)
+}
+
+fn object_at(_it: &Interp, addr: usize) -> Value {
+    int_value(addr as i128)
 }
 
 fn name_obj(it: &mut Interp, v: &Value) -> R<Obj> {
@@ -163,5 +199,20 @@ pub mod _testcapi {
         dict_set_str(&d, "error", Value::Obj(error));
         let _ = crate::bind::install_module::<abstractm::abstractm::Module>(it, m);
         let _ = crate::bind::install_module::<containers::containers::Module>(it, m);
+        let _ = crate::bind::install_module::<numbersm::numbersm::Module>(it, m);
+        let _ = crate::bind::install_module::<unicodem::unicodem::Module>(it, m);
+        let _ = crate::bind::install_module::<getargsm::getargsm::Module>(it, m);
+        let _ = crate::bind::install_module::<watchersm::watchersm::Module>(it, m);
+        let _ = crate::bind::install_module::<evalm::evalm::Module>(it, m);
+        let _ = crate::bind::install_module::<typesm::typesm::Module>(it, m);
+        let _ = crate::bind::install_module::<miscm::miscm::Module>(it, m);
+        let _ = crate::bind::install_module::<timecapi::timecapi::Module>(it, m);
+        let _ = crate::bind::install_module::<filem::filem::Module>(it, m);
+        let _ = crate::bind::install_module::<memm::memm::Module>(it, m);
+        let _ = crate::bind::install_module::<threadsm::threadsm::Module>(it, m);
+        let _ = crate::bind::install_module::<structmembersm::structmembersm::Module>(it, m);
+        let _ = crate::bind::install_module::<hamtm::hamtm::Module>(it, m);
+        let _ = crate::bind::install_module::<excm::excm::Module>(it, m);
+        let _ = crate::bind::install_module::<extram::extram::Module>(it, m);
     }
 }

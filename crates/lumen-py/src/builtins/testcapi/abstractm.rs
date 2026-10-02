@@ -1,7 +1,7 @@
 //! `_testcapi` wrappers of the abstract object API (`PyObject_*`, `PyNumber_*`, `PySequence_*`,
 //! `PyMapping_*`). A `None` argument stands for a `NULL` pointer, as in CPython's `NULLABLE`.
 
-use super::{builtin, name_obj, nonnull, system_error};
+use super::{call_builtin, name_obj, nonnull, system_error};
 use crate::ast::{BinOp, CmpOp};
 use crate::bytecode::UnOp;
 use crate::object::*;
@@ -28,11 +28,6 @@ fn is_sequence_like(it: &Interp, v: &Value) -> bool {
 
 fn slice_value(i1: i64, i2: i64) -> Value {
     Value::Obj(Object::new(Kind::Slice(Value::Int(i1), Value::Int(i2), Value::None)))
-}
-
-fn call_builtin(it: &mut Interp, name: &str, args: Vec<Value>) -> R<Value> {
-    let f = builtin(it, name);
-    it.call(&f, args, Vec::new())
 }
 
 fn require_sequence(it: &mut Interp, v: &Value, what: &str) -> R<()> {

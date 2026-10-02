@@ -188,8 +188,7 @@ pub mod _imp {
     /// (-1: "never", 1: "always", 0: no override)
     #[op(hint(py(text_signature = "($module, override, /)")))]
     fn _override_multi_interp_extensions_check(flag: i64) -> i64 {
-        let _ = flag;
-        0
+        super::subinterpm::override_extensions_check(flag)
     }
 
     #[init]

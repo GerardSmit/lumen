@@ -192,6 +192,12 @@ pub struct Code {
     pub doc: Option<Value>,
 }
 
+impl Drop for Code {
+    fn drop(&mut self) {
+        crate::watch::code_dropped(self as *const Code as usize);
+    }
+}
+
 impl Code {
     pub fn has(&self, flag: u32) -> bool {
         self.flags & flag != 0

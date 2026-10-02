@@ -35,6 +35,58 @@ struct Entry {
 }
 
 static INTERPRETERS: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+static SETTINGS: Mutex<Vec<(i64, Settings)>> = Mutex::new(Vec::new());
+
+pub(crate) const FLAG_OBMALLOC: u32 = 1 << 5;
+pub(crate) const FLAG_EXTENSIONS: u32 = 1 << 8;
+pub(crate) const FLAG_THREADS: u32 = 1 << 10;
+pub(crate) const FLAG_DAEMON_THREADS: u32 = 1 << 11;
+pub(crate) const FLAG_FORK: u32 = 1 << 15;
+pub(crate) const FLAG_EXEC: u32 = 1 << 16;
+
+/// The `PyInterpreterConfig` an interpreter was created with, as `feature_flags` and `own_gil`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Settings {
+    pub flags: u32,
+    pub own_gil: bool,
+}
+
+impl Settings {
+    /// The legacy configuration of the main interpreter and of `create(isolated=False)`.
+    pub(crate) const LEGACY: Settings = Settings { flags: FLAG_OBMALLOC | FLAG_FORK | FLAG_EXEC | FLAG_THREADS | FLAG_DAEMON_THREADS, own_gil: false };
+    /// `PyInterpreterConfig_OWN_GIL`: everything isolated, extension checks on.
+    pub(crate) const ISOLATED: Settings = Settings { flags: FLAG_THREADS | FLAG_EXTENSIONS, own_gil: true };
+}
+
+thread_local! {
+    static EXTENSIONS_OVERRIDE: Cell<i64> = const { Cell::new(0) };
+}
+
+/// The settings of interpreter `id`.
+pub(crate) fn settings_of(id: i64) -> Settings {
+    let all = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    all.iter().find(|(i, _)| *i == id).map_or(Settings::LEGACY, |(_, s)| *s)
+}
+
+pub(crate) fn set_settings(id: i64, settings: Settings) {
+    let mut all = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|(i, _)| *i != id);
+    all.push((id, settings));
+}
+
+/// `_imp._override_multi_interp_extensions_check`: sets the override of this interpreter
+/// (-1 never, 1 always, 0 use the configuration) and returns the previous one.
+pub(crate) fn override_extensions_check(flag: i64) -> i64 {
+    EXTENSIONS_OVERRIDE.with(|c| c.replace(flag))
+}
+
+/// Whether this interpreter refuses extension modules that are not multi-phase.
+pub(crate) fn extensions_check_enabled() -> bool {
+    match EXTENSIONS_OVERRIDE.with(Cell::get) {
+        0 => settings_of(current_interp_id()).flags & FLAG_EXTENSIONS != 0,
+        n => n > 0,
+    }
+}
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 
 thread_local! {
@@ -89,6 +141,7 @@ fn decref(id: i64) {
 
 /// Ends the interpreter's thread (run outside the registry lock: the thread may need it).
 fn finish(mut entry: Entry) {
+    SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(i, _)| *i != entry.id);
     let _ = entry.inbox.push(Job::Quit);
     entry.inbox.close();
     if let Some(handle) = entry.thread.take() {
@@ -301,8 +354,8 @@ pub mod _xxsubinterpreters {
     /// Create a new interpreter and return a unique generated ID.
     #[op]
     fn create(it: &mut Interp, #[kwonly] #[default(true)] isolated: bool) -> R<Value> {
-        let _ = isolated;
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        set_settings(id, if isolated { Settings::ISOLATED } else { Settings::LEGACY });
         let inbox = Arc::new(Queue::new());
         let running = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(Queue::new());

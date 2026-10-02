@@ -263,8 +263,8 @@ pub mod _thread {
     /// Return a non-zero integer that uniquely identifies the current thread
     /// amongst other threads that exist simultaneously.
     #[op]
-    fn get_ident() -> i64 {
-        MAIN_THREAD
+    fn get_ident(it: &mut Interp) -> i64 {
+        it.thread_ident
     }
 
     /// Return a non-negative integer identifying the thread as reported

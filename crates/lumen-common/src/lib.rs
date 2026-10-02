@@ -8,6 +8,7 @@ pub mod buffer;
 pub mod civil;
 pub mod codec;
 pub mod csv;
+pub mod editdist;
 #[cfg(feature = "compress")]
 pub mod compress;
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,6 +24,7 @@ pub mod local_tz;
 pub mod memcat;
 pub mod mt19937;
 pub mod native;
+pub mod pytime;
 pub mod stack;
 pub mod regex;
 pub mod search;

@@ -23,6 +23,7 @@ pub mod astconv;
 pub mod binasciim;
 pub mod bisectm;
 pub mod unicodedatam;
+pub mod unraisable;
 pub mod functoolsm;
 pub mod genm;
 pub mod zlibm;
@@ -69,6 +70,10 @@ pub mod xid;
 pub mod testcapi;
 pub mod interpchanm;
 pub mod subinterpm;
+pub mod singlephasem;
+pub mod testbufferm;
+pub mod testextm;
+pub mod xxlimitedm;
 
 use crate::object::*;
 use crate::vm::*;

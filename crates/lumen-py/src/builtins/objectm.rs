@@ -386,8 +386,24 @@ fn type_flags(it: &mut Interp, cls: &Obj) -> i64 {
     const BASETYPE: i64 = 1 << 10;
     const READY: i64 = 1 << 12;
     const IS_ABSTRACT: i64 = 1 << 20;
+    const METHOD_DESCRIPTOR: i64 = 1 << 17;
+    const HAVE_VECTORCALL: i64 = 1 << 11;
     let Kind::Type(td) = &cls.kind else { return 0 };
     let mut f = BASETYPE | READY;
+    let own = td.flags.get();
+    if own & TF_METHOD_DESCRIPTOR != 0 {
+        f |= METHOD_DESCRIPTOR;
+    }
+    if own & TF_VECTORCALL != 0 {
+        f |= HAVE_VECTORCALL;
+    }
+    if !it.is_heap(cls) {
+        match &**td.name.borrow() {
+            "function" | "method_descriptor" | "wrapper_descriptor" | "_lru_cache_wrapper" => f |= METHOD_DESCRIPTOR | HAVE_VECTORCALL,
+            "builtin_function_or_method" | "method" | "classmethod_descriptor" | "partial" => f |= HAVE_VECTORCALL,
+            _ => {}
+        }
+    }
     if it.is_heap(cls) {
         f |= HEAPTYPE;
     }
@@ -719,7 +735,7 @@ impl Property {
         if doc.is_none() {
             if let Some(Value::Obj(f)) = fget {
                 if let Kind::Function(func) = &f.kind {
-                    doc = func.code.doc.clone().unwrap_or(Value::None);
+                    doc = func.code.borrow().doc.clone().unwrap_or(Value::None);
                 }
             }
         }

@@ -616,13 +616,23 @@ pub fn quot(a: Complex, b: Complex) -> Option<Complex> {
     }
 }
 
-fn prod(a: Complex, b: Complex) -> Complex {
+pub fn prod(a: Complex, b: Complex) -> Complex {
     c(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
 }
 
 /// `a ** b` (`complex_pow`): repeated squaring for small integral exponents, polar form
 /// otherwise. `Domain` is zero to a negative or complex power, `Range` an infinite result.
 pub fn pow(a: Complex, b: Complex) -> Result<Complex, MathError> {
+    match pow_with_status(a, b) {
+        (r, None) => Ok(r),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// [`pow`] with the value C's `_Py_c_pow` returns next to the `errno` it sets: zero for a domain
+/// error, the infinite result for a range error.
+pub fn pow_with_status(a: Complex, b: Complex) -> (Complex, Option<MathError>) {
+    let mut status = None;
     let r = if b.im == 0.0 && b.re == b.re.floor() && b.re.abs() <= 100.0 {
         let n = b.re as i64;
         let powu = |x: Complex, n: i64| {
@@ -639,13 +649,19 @@ pub fn pow(a: Complex, b: Complex) -> Result<Complex, MathError> {
         if n > 0 {
             powu(a, n)
         } else {
-            quot(c(1.0, 0.0), powu(a, -n)).ok_or(MathError::Domain)?
+            match quot(c(1.0, 0.0), powu(a, -n)) {
+                Some(q) => q,
+                None => {
+                    status = Some(MathError::Domain);
+                    c(0.0, 0.0)
+                }
+            }
         }
     } else if b.re == 0.0 && b.im == 0.0 {
         c(1.0, 0.0)
     } else if a.re == 0.0 && a.im == 0.0 {
         if b.im != 0.0 || b.re < 0.0 {
-            return Err(MathError::Domain);
+            status = Some(MathError::Domain);
         }
         c(0.0, 0.0)
     } else {
@@ -659,10 +675,10 @@ pub fn pow(a: Complex, b: Complex) -> Result<Complex, MathError> {
         }
         c(len * phase.cos(), len * phase.sin())
     };
-    if r.re.is_infinite() || r.im.is_infinite() {
-        return Err(MathError::Range);
+    if status.is_none() && (r.re.is_infinite() || r.im.is_infinite()) {
+        status = Some(MathError::Range);
     }
-    Ok(r)
+    (r, status)
 }
 
 /// `cmath.isclose`: exact equality, then the weak relative test or the absolute tolerance.
