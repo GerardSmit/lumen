@@ -1,0 +1,31 @@
+# Language-neutral asymmetric cryptography and bignum operations shared by Node's crypto and
+# Python's _hashlib / _ssl: RSA (OAEP, PKCS#1 v1.5, raw, PSS), finite-field Diffie-Hellman, DSA,
+# primes and key generation, behind one backend trait. The system OpenSSL (loaded at runtime with
+# the loader shared with lumen-tls) is the first choice; RustCrypto is the fallback, and the only
+# backend on targets without `dlopen` (wasm). Keys and results cross the trait as plain big-endian
+# byte strings; nothing here knows about a language runtime.
+[package]
+name = "lumen-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+lumen-common = { path = "../lumen-common", features = ["hash"] }
+lumen-os = { path = "../lumen-os" }
+rsa = { version = "0.9", features = ["sha2", "sha1", "hazmat"] }
+dsa = "0.6"
+signature = "2"
+digest = "0.10"
+num-bigint-dig = { version = "0.8", features = ["prime", "rand"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Constant-time bignum arithmetic and prime generation for finite-field DH and prime generation.
+# They speak rand_core 0.10; `SysRng` serves both rand_core generations.
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "rand_core"] }
+crypto-primes = "0.7"
+rand_core10 = { package = "rand_core", version = "0.10", default-features = false }
+
+[lints]
+workspace = true

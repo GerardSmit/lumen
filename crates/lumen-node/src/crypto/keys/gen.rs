@@ -1,89 +1,25 @@
-//! Key pair generation (`generateKeyPair`): RSA / RSA-PSS (`rsa`), DSA (`dsa`), EC (the curve
-//! crates), Ed25519 / Ed448 / X25519 / X448, and finite-field DH over `crypto-bigint`.
+//! Key pair generation (`generateKeyPair`): RSA / RSA-PSS, DSA and finite-field DH through
+//! `lumen_crypto`'s backend; EC (the curve crates) and Ed25519 / Ed448 / X25519 / X448 on RustCrypto.
 
 use num_bigint_dig::BigUint;
 
 use super::curves::EcCurve;
 use super::model::{okp_public, AsymKey, DhKey, DsaKey, EcKey, OkpKey, PssParams, RsaKey};
 use super::{KResult, SendError};
-use crate::crypto::bignum::{generate_prime, is_prime, modpow, random_range};
-use crate::crypto::rng::SysRng;
-
-fn exponent_error() -> SendError {
-    SendError::new("Error", "error:1C80006F:Provider routines::invalid public exponent")
-        .with_code("ERR_OSSL_PUB_EXPONENT_OUT_OF_RANGE")
-}
+use crate::crypto::send_error;
 
 /// An RSA key of `bits` bits with public exponent `e`; `pss` makes it an RSASSA-PSS key (with
 /// parameter restrictions when given).
 pub fn rsa(bits: u32, e: u32, pss: Option<Option<PssParams>>) -> KResult<AsymKey> {
-    if e < 3 || e % 2 == 0 {
-        return Err(exponent_error());
-    }
-    if bits < 512 {
-        return Err(SendError::new("Error", "error:1C80006B:Provider routines::key size too small")
-            .with_code("ERR_OSSL_KEY_SIZE_TOO_SMALL"));
-    }
-    let k = rsa::RsaPrivateKey::new_with_exp(&mut SysRng, bits as usize, &BigUint::from(e))
-        .map_err(|err| SendError::new("Error", format!("RSA key generation failed: {err}")))?;
-    Ok(AsymKey::Rsa(RsaKey::from_rsa_private(&k, pss)))
+    let k = lumen_crypto::backend().rsa_generate(bits, &e.to_be_bytes()).map_err(send_error)?;
+    Ok(AsymKey::Rsa(RsaKey::from_parts(&k, pss)))
 }
 
-/// DSA domain parameters with a `l`-bit `p` and `n`-bit `q` (FIPS 186 A.1.1-style search, with
-/// the `dsa` crate's generator for its standard sizes).
-fn dsa_params(l: u32, n: u32) -> KResult<(BigUint, BigUint, BigUint)> {
-    #[allow(deprecated)]
-    let standard = match (l, n) {
-        (1024, 160) => Some(dsa::KeySize::DSA_1024_160),
-        (2048, 224) => Some(dsa::KeySize::DSA_2048_224),
-        (2048, 256) => Some(dsa::KeySize::DSA_2048_256),
-        (3072, 256) => Some(dsa::KeySize::DSA_3072_256),
-        _ => None,
-    };
-    if let Some(size) = standard {
-        let c = dsa::Components::generate(&mut SysRng, size);
-        return Ok((c.p().clone(), c.q().clone(), c.g().clone()));
-    }
-    if n < 2 || n >= l || l < 512 {
-        return Err(SendError::new("Error", "error:1C800069:Provider routines::invalid key length")
-            .with_code("ERR_OSSL_INVALID_KEY_LENGTH"));
-    }
-    let one = BigUint::from(1u8);
-    let two = BigUint::from(2u8);
-    let p_min = BigUint::from(1u8) << (l as usize - 1);
-    let p_max = BigUint::from(1u8) << l as usize;
-    loop {
-        let q = generate_prime(n, false);
-        let two_q = &two * &q;
-        for _ in 0..4 * l {
-            let m = random_range(&p_min, &p_max).expect("non-empty range");
-            let p = &m - (&m % &two_q) + &one;
-            if p.bits() != l as usize || !is_prime(&p, false) {
-                continue;
-            }
-            let e = (&p - &one) / &q;
-            let mut h = two.clone();
-            let g = loop {
-                let g = modpow(&h, &e, &p).expect("p is odd");
-                if g != one {
-                    break g;
-                }
-                h += &one;
-            };
-            return Ok((p, q, g));
-        }
-    }
-}
-
-/// A DSA key with an `l`-bit prime; `divisor` is the bit length of `q` (OpenSSL's default when
-/// `None`: 256 for `l >= 2048`, else 160).
+/// A DSA key with an `l`-bit prime; `divisor` is the bit length of `q` (the backend's default when
+/// `None`).
 pub fn dsa(l: u32, divisor: Option<u32>) -> KResult<AsymKey> {
-    let n = divisor.unwrap_or(if l >= 2048 { 256 } else { 160 });
-    let (p, q, g) = dsa_params(l, n)?;
-    let components = dsa::Components::from_components(p.clone(), q.clone(), g.clone())
-        .map_err(|_| SendError::new("Error", "DSA parameter generation failed"))?;
-    let sk = dsa::SigningKey::generate(&mut SysRng, components);
-    Ok(AsymKey::Dsa(DsaKey { p, q, g, y: sk.verifying_key().y().clone(), x: Some(sk.x().clone()) }))
+    let k = lumen_crypto::backend().dsa_generate(l, divisor).map_err(send_error)?;
+    Ok(AsymKey::Dsa(DsaKey::from_parts(&k)))
 }
 
 pub fn ec(curve: EcCurve, explicit: bool) -> AsymKey {
@@ -106,28 +42,16 @@ pub fn okp(kind: &str) -> KResult<AsymKey> {
     Ok(ctor(OkpKey { public, private: Some(private) }))
 }
 
-/// A safe prime `p = 2q + 1` of `bits` bits.
-pub fn safe_prime(bits: u32) -> KResult<BigUint> {
-    if bits < 2 {
-        return Err(SendError::new("Error", "error:1C80006B:Provider routines::modulus too small")
-            .with_code("ERR_OSSL_MODULUS_TOO_SMALL"));
-    }
-    if bits < 3 {
-        return Ok(BigUint::from(3u8));
-    }
-    Ok(generate_prime(bits, true))
+/// A DH key over `(p, g)` with a random private value.
+pub fn dh(p: BigUint, g: BigUint) -> KResult<AsymKey> {
+    let params = lumen_crypto::DhParams { p: p.to_bytes_be(), g: g.to_bytes_be() };
+    let (x, y) = lumen_crypto::backend().dh_generate_key(&params, None).map_err(send_error)?;
+    let num = |b: &[u8]| BigUint::from_bytes_be(b);
+    Ok(AsymKey::Dh(DhKey { p, g, q: None, y: num(&y), x: Some(num(&x)) }))
 }
 
-/// A DH key over `(p, g)`: a random private value in `[2, p - 2]`.
-pub fn dh(p: BigUint, g: BigUint) -> KResult<AsymKey> {
-    let two = BigUint::from(2u8);
-    let failed = || SendError::new("Error", "Key generation failed").with_code("ERR_CRYPTO_OPERATION_FAILED");
-    if p <= BigUint::from(3u8) {
-        return Err(SendError::new("Error", "error:1C80006B:Provider routines::modulus too small")
-            .with_code("ERR_OSSL_MODULUS_TOO_SMALL"));
-    }
-    let upper = &p - &two;
-    let x = random_range(&two, &upper).ok_or_else(failed)?;
-    let y = modpow(&g, &x, &p).ok_or_else(failed)?;
-    Ok(AsymKey::Dh(DhKey { p, g, q: None, y, x: Some(x) }))
+/// A safe prime of `bits` bits that `g` generates a subgroup of.
+pub fn safe_prime(bits: u32, g: u32) -> KResult<BigUint> {
+    let p = lumen_crypto::backend().dh_generate_prime(bits, g).map_err(send_error)?;
+    Ok(BigUint::from_bytes_be(&p))
 }

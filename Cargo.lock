@@ -900,6 +900,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-crypto"
+version = "0.1.3"
+dependencies = [
+ "crypto-bigint 0.7.5",
+ "crypto-primes",
+ "digest",
+ "dsa",
+ "lumen-common",
+ "lumen-os",
+ "num-bigint-dig",
+ "rand_core 0.10.1",
+ "rand_core 0.6.4",
+ "rsa",
+ "signature",
+]
+
+[[package]]
 name = "lumen-difftest"
 version = "0.1.3"
 dependencies = [
@@ -946,13 +963,10 @@ dependencies = [
  "chacha20",
  "chacha20poly1305",
  "cipher",
- "crypto-bigint 0.7.5",
- "crypto-primes",
  "ctr",
  "der",
  "des",
  "digest",
- "dsa",
  "ecb",
  "ecdsa",
  "ed25519-dalek",
@@ -966,6 +980,7 @@ dependencies = [
  "lumen",
  "lumen-bind",
  "lumen-common",
+ "lumen-crypto",
  "lumen-host",
  "lumen-os",
  "lumen-tls",
@@ -979,9 +994,6 @@ dependencies = [
  "pkcs5",
  "pkcs8",
  "poly1305",
- "rand_core 0.10.1",
- "rand_core 0.6.4",
- "rsa",
  "scrypt",
  "sec1",
  "signature",
@@ -1046,6 +1058,7 @@ dependencies = [
 name = "lumen-tls"
 version = "0.1.3"
 dependencies = [
+ "lumen-os",
  "rcgen",
  "rustls",
  "rustls-native-certs",

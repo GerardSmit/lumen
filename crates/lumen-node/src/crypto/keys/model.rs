@@ -9,6 +9,13 @@ use super::asn1::{self, Reader, TAG_NULL, TAG_OCTET_STRING, TAG_OID, TAG_SEQUENC
 use super::curves::EcCurve;
 use super::{decoder_unsupported, invalid_private, KResult};
 
+/// `g^x mod p`, the public value of a DH or DSA private key.
+fn exp_public(p: &BigUint, g: &BigUint, x: &BigUint) -> Option<BigUint> {
+    let params = lumen_crypto::DhParams { p: p.to_bytes_be(), g: g.to_bytes_be() };
+    let y = lumen_crypto::backend().dh_public(&params, &x.to_bytes_be()).ok()?;
+    Some(BigUint::from_bytes_be(&y))
+}
+
 /// An asymmetric key, public or private (`is_private`).
 #[derive(Clone, Debug)]
 pub enum AsymKey {
@@ -335,33 +342,32 @@ impl RsaKey {
         self.n.bits()
     }
 
-    /// The key as an `rsa` crate public key (moduli up to 16384 bits).
-    pub fn rsa_public(&self) -> KResult<rsa::RsaPublicKey> {
-        rsa::RsaPublicKey::new_with_max_size(self.n.clone(), self.e.clone(), 16384)
-            .map_err(|_| decoder_unsupported())
+    /// The public half in the form `lumen_crypto` takes.
+    pub fn public_parts(&self) -> lumen_crypto::RsaPublicKey {
+        lumen_crypto::RsaPublicKey { n: self.n.to_bytes_be(), e: self.e.to_bytes_be() }
     }
 
-    /// The key as an `rsa` crate private key.
-    pub fn rsa_private(&self) -> KResult<rsa::RsaPrivateKey> {
+    /// The private key in the form `lumen_crypto` takes.
+    pub fn private_parts(&self) -> KResult<lumen_crypto::RsaPrivateKey> {
         let p = self.private.as_ref().ok_or_else(not_private)?;
-        rsa::RsaPrivateKey::from_components(self.n.clone(), self.e.clone(), p.d.clone(), vec![p.p.clone(), p.q.clone()])
-            .map_err(|_| invalid_private())
+        Ok(lumen_crypto::RsaPrivateKey {
+            public: self.public_parts(),
+            d: p.d.to_bytes_be(),
+            p: p.p.to_bytes_be(),
+            q: p.q.to_bytes_be(),
+            dp: p.dp.to_bytes_be(),
+            dq: p.dq.to_bytes_be(),
+            qi: p.qi.to_bytes_be(),
+        })
     }
 
-    /// Builds the model (with CRT values) from an `rsa` crate private key.
-    pub fn from_rsa_private(k: &rsa::RsaPrivateKey, pss: Option<Option<PssParams>>) -> RsaKey {
-        use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-        let primes = k.primes();
-        let (p, q) = (primes[0].clone(), primes[1].clone());
-        let one = BigUint::from(1u8);
-        let d = k.d().clone();
-        let dp = k.dp().cloned().unwrap_or_else(|| &d % (&p - &one));
-        let dq = k.dq().cloned().unwrap_or_else(|| &d % (&q - &one));
-        let qi = k.crt_coefficient().unwrap_or_default();
+    /// Builds the model from a generated `lumen_crypto` private key.
+    pub fn from_parts(k: &lumen_crypto::RsaPrivateKey, pss: Option<Option<PssParams>>) -> RsaKey {
+        let num = |b: &[u8]| BigUint::from_bytes_be(b);
         RsaKey {
-            n: k.n().clone(),
-            e: k.e().clone(),
-            private: Some(RsaPrivateParts { d, p, q, dp, dq, qi }),
+            n: num(&k.public.n),
+            e: num(&k.public.e),
+            private: Some(RsaPrivateParts { d: num(&k.d), p: num(&k.p), q: num(&k.q), dp: num(&k.dp), dq: num(&k.dq), qi: num(&k.qi) }),
             pss,
         }
     }
@@ -373,19 +379,30 @@ impl DsaKey {
         asn1::seq(&[&asn1::biguint(&self.p), &asn1::biguint(&self.q), &asn1::biguint(&self.g)])
     }
 
-    pub fn components(&self) -> KResult<dsa::Components> {
-        dsa::Components::from_components(self.p.clone(), self.q.clone(), self.g.clone()).map_err(|_| decoder_unsupported())
+    /// The public half in the form `lumen_crypto` takes.
+    pub fn public_parts(&self) -> lumen_crypto::DsaPublicKey {
+        lumen_crypto::DsaPublicKey {
+            params: lumen_crypto::DsaParams { p: self.p.to_bytes_be(), q: self.q.to_bytes_be(), g: self.g.to_bytes_be() },
+            y: self.y.to_bytes_be(),
+        }
     }
 
-    /// The key as a `dsa` crate verifying key.
-    pub fn dsa_verifying(&self) -> KResult<dsa::VerifyingKey> {
-        dsa::VerifyingKey::from_components(self.components()?, self.y.clone()).map_err(|_| decoder_unsupported())
+    /// The private key in the form `lumen_crypto` takes.
+    pub fn private_parts(&self) -> KResult<lumen_crypto::DsaPrivateKey> {
+        let x = self.x.as_ref().ok_or_else(not_private)?;
+        Ok(lumen_crypto::DsaPrivateKey { public: self.public_parts(), x: x.to_bytes_be() })
     }
 
-    /// The key as a `dsa` crate signing key.
-    pub fn dsa_signing(&self) -> KResult<dsa::SigningKey> {
-        let x = self.x.clone().ok_or_else(not_private)?;
-        dsa::SigningKey::from_components(self.dsa_verifying()?, x).map_err(|_| invalid_private())
+    /// Builds the model from a generated `lumen_crypto` key.
+    pub fn from_parts(k: &lumen_crypto::DsaPrivateKey) -> DsaKey {
+        let num = |b: &[u8]| BigUint::from_bytes_be(b);
+        DsaKey {
+            p: num(&k.public.params.p),
+            q: num(&k.public.params.q),
+            g: num(&k.public.params.g),
+            y: num(&k.public.y),
+            x: Some(num(&k.x)),
+        }
     }
 }
 
@@ -775,7 +792,7 @@ fn parse_pkcs8(der: &[u8]) -> Option<KResult<AsymKey>> {
     if oid == asn1::OID_DSA {
         let (p, q, g) = three_ints(&params?.1)?;
         let x = Reader::new(key).biguint()?;
-        let y = crate::crypto::bignum::modpow(&g, &x, &p)?;
+        let y = exp_public(&p, &g, &x)?;
         return Some(Ok(AsymKey::Dsa(DsaKey { p, q, g, y, x: Some(x) })));
     }
     if oid == asn1::OID_EC {
@@ -795,7 +812,7 @@ fn parse_pkcs8(der: &[u8]) -> Option<KResult<AsymKey>> {
     if oid == asn1::OID_DH || oid == asn1::OID_DHX {
         let (p, g, q) = dh_params(&oid, &params)?;
         let x = Reader::new(key).biguint()?;
-        let y = crate::crypto::bignum::modpow(&g, &x, &p)?;
+        let y = exp_public(&p, &g, &x)?;
         return Some(Ok(AsymKey::Dh(DhKey { p, g, q, y, x: Some(x) })));
     }
     None

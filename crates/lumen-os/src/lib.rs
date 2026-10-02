@@ -3,6 +3,8 @@
 
 pub mod child;
 pub mod consts;
+#[cfg(unix)]
+pub mod dynlib;
 pub mod errno;
 pub mod fdctl;
 pub mod fs;

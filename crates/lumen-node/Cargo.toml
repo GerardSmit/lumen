@@ -14,11 +14,13 @@ publish = false
 lumen-host = { path = "../lumen-host" }
 lumen-common = { path = "../lumen-common", features = ["hash"] }
 lumen-os = { path = "../lumen-os" }
+# RSA, DSA, finite-field DH, primes and their key generation: OpenSSL first, RustCrypto as fallback.
+lumen-crypto = { path = "../lumen-crypto" }
 # Natives are declared with lumen-bind and exposed through lumen's JS host (`embed`).
 lumen = { path = "../lumen", features = ["embed"] }
 lumen-bind = { path = "../lumen-bind" }
 
-# node:crypto and crypto.subtle: RustCrypto on every platform (native and wasm32). lumen carries
+# node:crypto and crypto.subtle: RustCrypto for ciphers, EC and EdDSA on every platform (native and wasm32); lumen carries
 # no cryptography of its own.
 scrypt = { version = "0.11", default-features = false }
 argon2 = "0.5"
@@ -42,7 +44,6 @@ chacha20poly1305 = "0.10"
 ghash = "0.5"
 poly1305 = "0.8"
 ocb3 = "0.1"
-rsa = { version = "0.9", features = ["sha2", "sha1", "pem", "hazmat"] }
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 p384 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 p521 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
@@ -53,7 +54,6 @@ ecdsa = { version = "0.16", features = ["der", "signing", "verifying", "pkcs8", 
 elliptic-curve = { version = "0.13", features = ["sec1", "pkcs8", "pem", "jwk", "ecdh"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-dsa = "0.6"
 signature = "2"
 pkcs1 = { version = "0.7", features = ["pem", "alloc"] }
 pkcs8 = { version = "0.10", features = ["pem", "alloc", "encryption"] }
@@ -62,12 +62,6 @@ sec1 = { version = "0.7", features = ["pem", "alloc", "der"] }
 der = { version = "0.7", features = ["alloc", "oid", "pem"] }
 x509-cert = "0.2"
 num-bigint-dig = { version = "0.8", features = ["prime", "rand"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
-# Constant-time bignum arithmetic and prime generation for finite-field DH and `generatePrime`.
-# They speak rand_core 0.10; `crypto::rng::SysRng` serves both rand_core generations.
-crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "rand_core"] }
-crypto-primes = "0.7"
-rand_core10 = { package = "rand_core", version = "0.10", default-features = false }
 digest = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

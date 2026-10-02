@@ -4,7 +4,7 @@
 
 use std::convert::Infallible;
 
-pub(crate) struct SysRng;
+pub struct SysRng;
 
 fn fill(dst: &mut [u8]) {
     lumen_os::proc::entropy(dst).expect("operating system randomness source failed");

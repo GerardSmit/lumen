@@ -796,18 +796,6 @@ fn spki_public(spki: &Spki) -> Option<Vec<u8>> {
 
 // ---- signatures ---------------------------------------------------------------------------------
 
-fn digest_info_prefix(algo: Algo) -> Option<&'static [u8]> {
-    Some(match algo {
-        Algo::Md5 => &[0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05, 0x05, 0x00, 0x04, 0x10],
-        Algo::Sha1 => &[0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14],
-        Algo::Sha224 => &[0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05, 0x00, 0x04, 0x1c],
-        Algo::Sha256 => &[0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20],
-        Algo::Sha384 => &[0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30],
-        Algo::Sha512 => &[0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40],
-        _ => return None,
-    })
-}
-
 fn hash_of_oid(oid: &str) -> Option<Algo> {
     Some(match oid {
         "1.2.840.113549.2.5" => Algo::Md5,
@@ -912,16 +900,12 @@ fn verify_signature(alg: &Tlv, spki_raw: &[u8], data: &[u8], signature: &[u8]) -
                 return false;
             }
             let Some((n, e)) = rsa_public(spki.key) else { return false };
-            match scheme {
-                SigScheme::Pkcs1(_) => {
-                    let key = rsa::RsaPublicKey::new_unchecked(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e));
-                    let Some(prefix) = digest_info_prefix(h) else { return false };
-                    let padding = rsa::Pkcs1v15Sign { hash_len: Some(h.out_len()), prefix: prefix.into() };
-                    key.verify(padding, &hash::digest(h, data), signature).is_ok()
-                }
-                SigScheme::Pss(_, salt) => crate::crypto::sign::bindings::rsa_pss_verify(&n, &e, h, salt, data, signature),
-                _ => false,
-            }
+            let rsa_scheme = match scheme {
+                SigScheme::Pss(_, salt) => lumen_crypto::RsaScheme::Pss { hash: h, mgf1: h, salt: lumen_crypto::PssSalt::Length(salt as u32) },
+                _ => lumen_crypto::RsaScheme::Pkcs1 { hash: h },
+            };
+            let key = lumen_crypto::RsaPublicKey { n, e };
+            lumen_crypto::backend().rsa_verify(&key, &rsa_scheme, &hash::digest(h, data), signature).unwrap_or(false)
         }
         SigScheme::Ecdsa(h) => {
             if spki.alg != OID_EC {

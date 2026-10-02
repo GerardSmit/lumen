@@ -1337,7 +1337,7 @@ class DiffieHellmanBase {
 
   computeSecret(key) {
     if (this._priv === undefined) throw cryptoError(Error, "ERR_CRYPTO_OPERATION_FAILED", "Failed to compute DH key");
-    return asBuffer(__rc.dhCompute(this._p, this._priv, bytesOf(key)));
+    return asBuffer(__rc.dhCompute(this._p, this._g, this._priv, bytesOf(key)));
   }
 
   getPrime() {
