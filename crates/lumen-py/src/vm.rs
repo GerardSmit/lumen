@@ -49,7 +49,7 @@ pub fn new_type_raw(name: &str, layout: Layout) -> Obj {
             bases: RefCell::new(Vec::new()),
             mro: RefCell::new(Vec::new()),
             layout: std::cell::Cell::new(layout),
-            flags: std::cell::Cell::new(0),
+            flags: std::cell::Cell::new(TF_IMMUTABLE),
             hooks: std::cell::Cell::new((u64::MAX, 0)),
             slots: RefCell::new(None),
         }),

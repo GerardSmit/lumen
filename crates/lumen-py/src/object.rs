@@ -160,6 +160,8 @@ pub const TF_ABSTRACT: u32 = 4;
 pub const TF_DISPATCH: u32 = 8;
 /// The type cannot be subclassed (no `Py_TPFLAGS_BASETYPE`).
 pub const TF_FINAL: u32 = 16;
+/// A core builtin type: setting or deleting its attributes is a TypeError.
+pub const TF_IMMUTABLE: u32 = 32;
 
 pub struct TypeData {
     pub name: RefCell<Rc<str>>,

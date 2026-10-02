@@ -1118,6 +1118,14 @@ impl Interp {
 
     pub fn generic_setattr(&mut self, obj: &Value, cls: &Obj, name: &Obj, v: Value) -> R<()> {
         let nm = name.as_str_kind().unwrap_or("").to_string();
+        if let Value::Obj(o) = obj {
+            if let Kind::Type(td) = &o.kind {
+                if td.flags.get() & TF_IMMUTABLE != 0 {
+                    let tn = td.name.borrow().clone();
+                    return Err(self.type_error(&format!("cannot set '{nm}' attribute of immutable type '{tn}'")));
+                }
+            }
+        }
         let o = match obj {
             Value::Obj(o) => o,
             _ => return Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), nm))),

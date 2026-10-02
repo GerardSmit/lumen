@@ -76,6 +76,25 @@ fn construct(it: &mut Interp, algo: Algo, data: Option<&Value>, string: Option<&
 }
 
 /// `_hashlib` (OpenSSL in CPython).
+/// `hmac.compare_digest` (also `_operator._compare_digest`): constant-time equality of two ASCII
+/// strs or two bytes-like objects.
+pub fn compare_digest(it: &mut Interp, a: &Value, b: &Value) -> R<bool> {
+    let (x, y) = match (a.as_str(), b.as_str()) {
+        (Some(x), Some(y)) => {
+            if !x.is_ascii() || !y.is_ascii() {
+                return Err(it.type_error("comparing strings with non-ASCII characters is not supported"));
+            }
+            (x.as_bytes().to_vec(), y.as_bytes().to_vec())
+        }
+        _ if !it.is_buffer(a) || !it.is_buffer(b) || a.as_str().is_some() || b.as_str().is_some() => {
+            let (ta, tb) = (it.type_name_of(a), it.type_name_of(b));
+            return Err(it.type_error(&format!("unsupported operand types(s) or combination of types: '{ta}' and '{tb}'")));
+        }
+        _ => (it.buffer_bytes(a)?, it.buffer_bytes(b)?),
+    };
+    Ok(lumen_common::hash::constant_time_eq(&x, &y))
+}
+
 #[lumen_bind::module(name = "_hashlib")]
 pub mod _hashlib {
     use super::*;
@@ -466,22 +485,7 @@ pub mod _hashlib {
     /// types and lengths of a and b--but not their values.
     #[op]
     fn compare_digest(it: &mut Interp, a: &Value, b: &Value) -> R<bool> {
-        let (x, y) = match (a.as_str(), b.as_str()) {
-            (Some(x), Some(y)) => {
-                if !x.is_ascii() || !y.is_ascii() {
-                    return Err(it.type_error("comparing strings with non-ASCII characters is not supported"));
-                }
-                (x.as_bytes().to_vec(), y.as_bytes().to_vec())
-            }
-            _ if !it.is_buffer(a) && !it.is_buffer(b) => return Err(operand_error(it, a, b)),
-            _ => (it.buffer_bytes(a)?, it.buffer_bytes(b)?),
-        };
-        Ok(lumen_common::hash::constant_time_eq(&x, &y))
-    }
-
-    fn operand_error(it: &mut Interp, a: &Value, b: &Value) -> Obj {
-        let (ta, tb) = (it.type_name_of(a), it.type_name_of(b));
-        it.type_error(&format!("unsupported operand types(s) or combination of types: '{ta}' and '{tb}'"))
+        super::compare_digest(it, a, b)
     }
 
     /// Determine the OpenSSL FIPS mode of operation.
