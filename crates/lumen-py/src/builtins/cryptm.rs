@@ -2,7 +2,7 @@
 //! bcrypt), then the system `crypt(3)` through `lumen_os::crypt` for the formats Lumen does not
 //! implement itself (traditional DES, ...).
 
-/// Hashing of passwords with the Unix `crypt()` interface.
+// Hashing of passwords with the Unix `crypt()` interface.
 #[lumen_bind::module(name = "_crypt")]
 pub mod crypt {
     use crate::object::*;

@@ -481,7 +481,7 @@ pub fn init(it: &mut Interp) {
     crate::bind::install_functions::<builtin_fns::Module>(&it.builtins.clone());
 }
 
-/// The functions of the `builtins` module, installed into the interpreter's builtins dict.
+// The functions of the `builtins` module, installed into the interpreter's builtins dict.
 #[lumen_bind::module(name = "builtins")]
 pub mod builtin_fns {
     use super::*;

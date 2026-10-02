@@ -102,7 +102,7 @@ pub mod sys_monitoring {
         })
     }
 
-    /// Register `func` as the callback of a single event of a tool; returns the previous one.
+    // Register `func` as the callback of a single event of a tool; returns the previous one.
     #[op]
     fn register_callback(it: &mut Interp, tool_id: i64, event: i64, func: &Value) -> R<Value> {
         let tool = valid_tool(it, tool_id)?;

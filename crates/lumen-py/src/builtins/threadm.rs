@@ -445,10 +445,10 @@ pub mod _thread {
         }
     }
 
-    /// Thread-local data: each thread sees its own instance dict. The dict of the thread that
-    /// touched the object last is installed as the object's `__dict__`; a thread that finds
-    /// another's installed swaps in its own (created, and `__init__` called with the original
-    /// arguments, on its first access).
+    // Thread-local data: each thread sees its own instance dict. The dict of the thread that
+    // touched the object last is installed as the object's `__dict__`; a thread that finds
+    // another's installed swaps in its own (created, and `__init__` called with the original
+    // arguments, on its first access).
     #[class(name = "_local")]
     pub struct Local {
         args: Vec<Value>,

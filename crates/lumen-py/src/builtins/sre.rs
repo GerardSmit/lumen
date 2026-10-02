@@ -1073,7 +1073,7 @@ impl Scanner {
     }
 }
 
-/// The SRE engine: compiles the opcode lists `re._compiler` produces.
+// The SRE engine: compiles the opcode lists `re._compiler` produces.
 #[lumen_bind::module(name = "_sre")]
 pub mod _sre {
     use super::*;

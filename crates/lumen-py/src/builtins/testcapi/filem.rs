@@ -52,8 +52,8 @@ fn read_object(it: &mut Interp, filename: &Value, to_end: bool) -> R<Value> {
     Ok(Value::tuple(vec![obj?, pos?]))
 }
 
-/// The unbuffered writer of `PyFile_NewStdPrinter` that backs `sys.stdout`/`sys.stderr` before
-/// the `io` module is available: it only writes to its descriptor.
+// The unbuffered writer of `PyFile_NewStdPrinter` that backs `sys.stdout`/`sys.stderr` before
+// the `io` module is available: it only writes to its descriptor.
 #[lumen_bind::class(module = "builtins", name = "stderrprinter", hint(py(final)))]
 pub struct StdPrinter {
     fd: i64,
@@ -104,7 +104,7 @@ impl StdPrinter {
 pub mod filem {
     use super::*;
 
-    /// pyfile_fromfd(fd, name, mode, buffering, encoding, errors, newline, closefd): `PyFile_FromFd`.
+    // pyfile_fromfd(fd, name, mode, buffering, encoding, errors, newline, closefd): `PyFile_FromFd`.
     #[op(hint(py(arg_style = "parse", arg_name = "pyfile_fromfd")))]
     #[allow(clippy::too_many_arguments)]
     fn pyfile_fromfd(it: &mut Interp, fd: i64, name: &Value, mode: &Value, buffering: i64, encoding: &Value, errors: &Value, newline: &Value, closefd: i64) -> R<Value> {
@@ -119,7 +119,7 @@ pub mod filem {
         it.call(&open, args, Vec::new())
     }
 
-    /// pyfile_writestring(str, file): `PyFile_WriteString`.
+    // pyfile_writestring(str, file): `PyFile_WriteString`.
     #[op(hint(py(arg_style = "parse", arg_name = "pyfile_writestring")))]
     fn pyfile_writestring(it: &mut Interp, text: &Value, file: &Value) -> R<i64> {
         let s = required_c_string(it, text)?;
@@ -130,7 +130,7 @@ pub mod filem {
         Ok(0)
     }
 
-    /// pyfile_getline(file, n, /): `PyFile_GetLine`.
+    // pyfile_getline(file, n, /): `PyFile_GetLine`.
     #[op]
     fn pyfile_getline(it: &mut Interp, file: &Value, n: i64) -> R<Value> {
         let args = if n > 0 { vec![Value::Int(n)] } else { Vec::new() };
@@ -163,7 +163,7 @@ pub mod filem {
         }
     }
 
-    /// pyfile_writeobject(obj, file, flags, /): `PyFile_WriteObject`.
+    // pyfile_writeobject(obj, file, flags, /): `PyFile_WriteObject`.
     #[op]
     fn pyfile_writeobject(it: &mut Interp, obj: &Value, file: &Value, flags: i64) -> R<i64> {
         if file.is_none() {
@@ -181,7 +181,7 @@ pub mod filem {
         Ok(0)
     }
 
-    /// pyobject_asfiledescriptor(obj, /): `PyObject_AsFileDescriptor`.
+    // pyobject_asfiledescriptor(obj, /): `PyObject_AsFileDescriptor`.
     #[op]
     fn pyobject_asfiledescriptor(it: &mut Interp, obj: &Value) -> R<i64> {
         let fd = if obj.is_int_like() {
@@ -209,7 +209,7 @@ pub mod filem {
         Ok(i64::from(n))
     }
 
-    /// pyfile_newstdprinter(fd, /): `PyFile_NewStdPrinter`.
+    // pyfile_newstdprinter(fd, /): `PyFile_NewStdPrinter`.
     #[op]
     fn pyfile_newstdprinter(it: &mut Interp, fd: i64) -> R<Value> {
         if fd != 1 && fd != 2 {

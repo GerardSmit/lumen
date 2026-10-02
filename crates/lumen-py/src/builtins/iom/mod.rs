@@ -154,7 +154,7 @@ pub fn is_eagain(e: &crate::platform::IoError) -> bool {
     e.errno == eagain()
 }
 
-/// The `_io` module: classes live in the sibling files and are registered by the init hook.
+// The `_io` module: classes live in the sibling files and are registered by the init hook.
 #[lumen_bind::module(name = "_io")]
 pub mod _io {
     use super::base::{BufferedIOBase, IOBase, RawIOBase, TextIOBase};

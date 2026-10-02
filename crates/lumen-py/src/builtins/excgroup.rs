@@ -31,7 +31,7 @@ pub fn group_text(e: &Obj) -> String {
     format!("{} ({} sub-exception{})", msg.as_str().unwrap_or(""), n, if n == 1 { "" } else { "s" })
 }
 
-/// `BaseExceptionGroup`'s members (installed into the core type).
+// `BaseExceptionGroup`'s members (installed into the core type).
 #[lumen_bind::class(name = "BaseExceptionGroup")]
 pub struct BaseExceptionGroup;
 

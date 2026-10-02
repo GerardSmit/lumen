@@ -492,7 +492,7 @@ pub mod itertools {
 
     #[methods]
     impl ISlice {
-        /// `islice(iterable, stop)` / `islice(iterable, start, stop[, step])`.
+        // `islice(iterable, stop)` / `islice(iterable, start, stop[, step])`.
         #[constructor(hint(py(text_signature = "")))]
         fn new(it: &mut Interp, #[varargs] args: &[Value]) -> R<NativeIter> {
             if args.len() < 2 {
@@ -617,7 +617,7 @@ pub mod itertools {
         running: bool,
     }
 
-    /// One of `tee`'s iterators: a position in the buffer the siblings share.
+    // One of `tee`'s iterators: a position in the buffer the siblings share.
     #[class(name = "_tee")]
     pub struct Tee {
         shared: Rc<RefCell<TeeShared>>,

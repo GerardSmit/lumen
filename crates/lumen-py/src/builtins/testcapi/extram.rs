@@ -9,7 +9,7 @@ use crate::object::*;
 use crate::vm::Interp;
 use lumen_common::buffer::ViewDesc;
 
-/// `testBufType`: exports the bytes `b"test"` and counts the exports not yet released.
+// `testBufType`: exports the bytes `b"test"` and counts the exports not yet released.
 #[lumen_bind::class(module = "builtins", name = "testBufType")]
 pub struct TestBuf {
     obj: Obj,
@@ -53,7 +53,7 @@ impl TestBuf {
     }
 }
 
-/// `ObjExtraData`: instances carry one extra object in storage that follows the object itself.
+// `ObjExtraData`: instances carry one extra object in storage that follows the object itself.
 #[lumen_bind::class(module = "builtins", name = "ObjExtraData")]
 pub struct ObjExtraData {
     extra: Option<Value>,

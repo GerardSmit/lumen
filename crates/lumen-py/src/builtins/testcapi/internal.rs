@@ -199,7 +199,7 @@ pub mod _testinternalcapi {
         Ok(())
     }
 
-    /// exec_interpreter(id, code): run `code` in the interpreter.
+    // exec_interpreter(id, code): run `code` in the interpreter.
     #[op]
     fn exec_interpreter(it: &mut Interp, id: &Value, code: &Value) -> R<()> {
         let m = it.import_module("_xxsubinterpreters")?;
@@ -232,7 +232,7 @@ pub mod _testinternalcapi {
         crate::builtins::singlephasem::clear_extension(it, name, filename)
     }
 
-    /// set_eval_frame_record(list): append the name of every Python function entered to `list`.
+    // set_eval_frame_record(list): append the name of every Python function entered to `list`.
     #[op]
     fn set_eval_frame_record(it: &mut Interp, list: &Value) -> R<()> {
         match list {
@@ -379,8 +379,8 @@ pub mod _testinternalcapi {
         Value::tuple(vec![instructions.clone(), consts.clone()])
     }
 
-    /// assemble_code_object(filename, instructions, metadata): the listing of `compiler_codegen`
-    /// names this interpreter's instructions, which cannot be assembled back.
+    // assemble_code_object(filename, instructions, metadata): the listing of `compiler_codegen`
+    // names this interpreter's instructions, which cannot be assembled back.
     #[op]
     fn assemble_code_object(it: &mut Interp, filename: &Value, instructions: &Value, metadata: &Value) -> R<Value> {
         let _ = (filename, instructions);
@@ -396,7 +396,7 @@ pub mod _testinternalcapi {
         Value::None
     }
 
-    /// set_optimizer(optimizer): only `None` (no optimizer) is accepted.
+    // set_optimizer(optimizer): only `None` (no optimizer) is accepted.
     #[op]
     fn set_optimizer(it: &mut Interp, optimizer: &Value) -> R<()> {
         if optimizer.is_none() {
@@ -497,7 +497,7 @@ pub mod _testinternalcapi {
         Ok(())
     }
 
-    /// normalize_path(path) -> str: collapse `.`, `..` and duplicate separators.
+    // normalize_path(path) -> str: collapse `.`, `..` and duplicate separators.
     #[op]
     fn normalize_path(it: &mut Interp, path: &str) -> R<String> {
         if path.contains('\0') {

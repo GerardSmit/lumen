@@ -101,7 +101,7 @@ fn extension_modules(it: &mut Interp) -> R<Vec<String>> {
 pub mod excm {
     use super::*;
 
-    /// set_exception(exc): `PyErr_SetHandledException`; returns the previous handled exception.
+    // set_exception(exc): `PyErr_SetHandledException`; returns the previous handled exception.
     #[op]
     fn set_exception(it: &mut Interp, new_exc: &Value) -> Value {
         let old = it.handled.take();
@@ -109,8 +109,8 @@ pub mod excm {
         old.map(Value::Obj).unwrap_or(Value::None)
     }
 
-    /// set_exc_info(type, value, traceback): `PyErr_SetExcInfo`; returns the previous
-    /// `(type, value, traceback)`.
+    // set_exc_info(type, value, traceback): `PyErr_SetExcInfo`; returns the previous
+    // `(type, value, traceback)`.
     #[op]
     fn set_exc_info(it: &mut Interp, new_type: &Value, new_value: &Value, new_tb: &Value) -> R<Value> {
         let _ = new_type;
@@ -127,7 +127,7 @@ pub mod excm {
         Ok(old)
     }
 
-    /// err_set_raised(exc): `PyErr_SetRaisedException`, then return NULL.
+    // err_set_raised(exc): `PyErr_SetRaisedException`, then return NULL.
     #[op]
     fn err_set_raised(it: &mut Interp, exc: &Value) -> R<Value> {
         match exc {
@@ -136,26 +136,26 @@ pub mod excm {
         }
     }
 
-    /// exc_set_object(exc, obj): `PyErr_SetObject`, then return NULL.
+    // exc_set_object(exc, obj): `PyErr_SetObject`, then return NULL.
     #[op]
     fn exc_set_object(it: &mut Interp, exc: &Value, obj: &Value) -> R<Value> {
         Err(exception_for(it, exc, obj)?)
     }
 
-    /// exc_set_object_fetch(exc, obj): `PyErr_SetObject` followed by `PyErr_Fetch`.
+    // exc_set_object_fetch(exc, obj): `PyErr_SetObject` followed by `PyErr_Fetch`.
     #[op]
     fn exc_set_object_fetch(it: &mut Interp, exc: &Value, obj: &Value) -> R<Value> {
         Ok(Value::Obj(exception_for(it, exc, obj)?))
     }
 
-    /// err_setstring(exc, message): `PyErr_SetString`, then return NULL.
+    // err_setstring(exc, message): `PyErr_SetString`, then return NULL.
     #[op]
     fn err_setstring(it: &mut Interp, exc: &Value, message: &Value) -> R<Value> {
         let text = bytes_or_str(it, message)?;
         Err(exception_for(it, exc, &Value::string(text))?)
     }
 
-    /// err_setfromerrnowithfilename(errno, exc, filename): `PyErr_SetFromErrnoWithFilename`.
+    // err_setfromerrnowithfilename(errno, exc, filename): `PyErr_SetFromErrnoWithFilename`.
     #[op]
     fn err_setfromerrnowithfilename(it: &mut Interp, i: i64, exc: &Value, filename: &Value) -> R<Value> {
         let os = Value::Obj(it.import_module("os")?);
@@ -182,7 +182,7 @@ pub mod excm {
         }
     }
 
-    /// make_exception_with_doc(name, doc=None, base=None, dict=None): `PyErr_NewExceptionWithDoc`.
+    // make_exception_with_doc(name, doc=None, base=None, dict=None): `PyErr_NewExceptionWithDoc`.
     #[op]
     fn make_exception_with_doc(it: &mut Interp, name: &str, doc: Option<&Value>, base: Option<&Value>, dict: Option<&Value>) -> R<Value> {
         let Some((module, class)) = name.rsplit_once('.') else {
@@ -209,14 +209,14 @@ pub mod excm {
         it.call(&type_fn, vec![Value::str(class), bases, Value::Obj(attrs)], Vec::new())
     }
 
-    /// raise_memoryerror(): `PyErr_NoMemory`.
+    // raise_memoryerror(): `PyErr_NoMemory`.
     #[op]
     fn raise_memoryerror(it: &mut Interp) -> R<Value> {
         Err(it.new_exc_str("MemoryError", ""))
     }
 
-    /// fatal_error(message, release_gil=0): `Py_FatalError` reports the message and the loaded
-    /// extension modules on stderr, then aborts the process.
+    // fatal_error(message, release_gil=0): `Py_FatalError` reports the message and the loaded
+    // extension modules on stderr, then aborts the process.
     #[op]
     fn fatal_error(it: &mut Interp, message: &Value, release_gil: Option<i64>) -> R<Value> {
         let _ = release_gil;

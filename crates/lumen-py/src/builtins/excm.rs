@@ -22,7 +22,7 @@ fn keyword_fields(it: &mut Interp, d: &Obj, kw: KwArgs, allowed: &[&str], cls: &
     Ok(())
 }
 
-/// `BaseException`'s members.
+// `BaseException`'s members.
 #[lumen_bind::class(name = "BaseException")]
 pub struct BaseException;
 
@@ -124,7 +124,7 @@ impl BaseException {
     }
 }
 
-/// `StopIteration.value`.
+// `StopIteration.value`.
 #[lumen_bind::class(name = "StopIteration")]
 pub struct StopIteration;
 
@@ -141,7 +141,7 @@ impl StopIteration {
     }
 }
 
-/// `SystemExit.code`.
+// `SystemExit.code`.
 #[lumen_bind::class(name = "SystemExit")]
 pub struct SystemExit;
 
@@ -165,7 +165,7 @@ impl SystemExit {
     }
 }
 
-/// `ImportError(*args, name=None, path=None)`.
+// `ImportError(*args, name=None, path=None)`.
 #[lumen_bind::class(name = "ImportError")]
 pub struct ImportError;
 
@@ -184,7 +184,7 @@ impl ImportError {
     }
 }
 
-/// `AttributeError(*args, name=None, obj=None)`.
+// `AttributeError(*args, name=None, obj=None)`.
 #[lumen_bind::class(name = "AttributeError")]
 pub struct AttributeError;
 
@@ -205,7 +205,7 @@ impl AttributeError {
     }
 }
 
-/// `NameError(*args, name=None)`.
+// `NameError(*args, name=None)`.
 #[lumen_bind::class(name = "NameError")]
 pub struct NameError;
 
@@ -401,7 +401,7 @@ impl UnicodeTranslateError {
 
 const SYNTAX_FIELDS: [&str; 7] = ["filename", "lineno", "offset", "text", "end_lineno", "end_offset", "print_file_and_line"];
 
-/// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno[, end_offset]]))`.
+// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno[, end_offset]]))`.
 #[lumen_bind::class(name = "SyntaxError")]
 pub struct SyntaxError;
 

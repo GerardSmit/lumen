@@ -1146,7 +1146,7 @@ impl NDArray {
     }
 }
 
-/// `staticarray`: always exports the same twelve read-only bytes and ignores the request flags.
+// `staticarray`: always exports the same twelve read-only bytes and ignores the request flags.
 #[lumen_bind::class(module = "builtins", name = "staticarray")]
 pub struct StaticArray {
     legacy_mode: bool,

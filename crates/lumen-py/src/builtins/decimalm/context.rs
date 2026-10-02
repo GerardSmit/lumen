@@ -63,8 +63,8 @@ fn template(it: &mut Interp, i: usize) -> R<Py<PyContext>> {
     }
 }
 
-/// A decimal context: the arithmetic parameters plus shared cells for the flag and trap words,
-/// which the `SignalDict` views of `flags` and `traps` hold on to.
+// A decimal context: the arithmetic parameters plus shared cells for the flag and trap words,
+// which the `SignalDict` views of `flags` and `traps` hold on to.
 #[lumen_bind::class(name = "Context", module = "decimal")]
 pub struct PyContext {
     pub prec: i64,
@@ -1181,8 +1181,8 @@ impl SignalDict {
     }
 }
 
-/// The object `localcontext()` returns: installs its context on entry, restores the previous one
-/// on exit.
+// The object `localcontext()` returns: installs its context on entry, restores the previous one
+// on exit.
 #[lumen_bind::class(name = "ContextManager", module = "decimal", hint(py(final)))]
 pub struct ContextManager {
     pub local: Py<PyContext>,

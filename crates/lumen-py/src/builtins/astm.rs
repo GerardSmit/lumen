@@ -35,8 +35,8 @@ pub mod _ast {
             Ok(opaque_instance(&cls, AST))
         }
 
-        /// `ast_type_init`: positional arguments fill `_fields` in order, keywords set any
-        /// attribute.
+        // `ast_type_init`: positional arguments fill `_fields` in order, keywords set any
+        // attribute.
         #[proto(init)]
         fn __init__(slf: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
             let cls = it.type_of(&slf.0);

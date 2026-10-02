@@ -101,7 +101,7 @@ pub mod timecapi {
 
     // ---- _PyTime_t ----------------------------------------------------------------------------
 
-    /// PyTime_FromSeconds(seconds): `_PyTime_FromSeconds`, in nanoseconds.
+    // PyTime_FromSeconds(seconds): `_PyTime_FromSeconds`, in nanoseconds.
     #[op]
     fn PyTime_FromSeconds(it: &mut Interp, seconds: &Value) -> R<Value> {
         let i = index(it, seconds)?;
@@ -117,7 +117,7 @@ pub mod timecapi {
         }
     }
 
-    /// PyTime_FromSecondsObject(obj, round): `_PyTime_FromSecondsObject`, in nanoseconds.
+    // PyTime_FromSecondsObject(obj, round): `_PyTime_FromSecondsObject`, in nanoseconds.
     #[op]
     fn PyTime_FromSecondsObject(it: &mut Interp, obj: &Value, round: i64) -> R<Value> {
         let round = rounding(it, round)?;
@@ -131,7 +131,7 @@ pub mod timecapi {
         Ok(int_value(i128::from(ns)))
     }
 
-    /// PyTime_AsSecondsDouble(ns): `_PyTime_AsSecondsDouble`.
+    // PyTime_AsSecondsDouble(ns): `_PyTime_AsSecondsDouble`.
     #[op]
     fn PyTime_AsSecondsDouble(it: &mut Interp, ns: &Value) -> R<f64> {
         Ok(pytime::as_seconds_f64(nanoseconds(it, ns)?))
@@ -185,7 +185,7 @@ pub mod timecapi {
         Ok(int_value(i128::from(pytime::divide(t, pytime::US_TO_NS, round))))
     }
 
-    /// pytime_object_to_time_t(obj, round): `_PyTime_ObjectToTime_t`.
+    // pytime_object_to_time_t(obj, round): `_PyTime_ObjectToTime_t`.
     #[op(hint(py(arg_style = "parse", arg_name = "pytime_object_to_time_t")))]
     fn pytime_object_to_time_t(it: &mut Interp, obj: &Value, round: i64) -> R<Value> {
         let round = rounding(it, round)?;
@@ -238,7 +238,7 @@ pub mod timecapi {
         datetime_check(it, "tzinfo", obj, exact)
     }
 
-    /// make_timezones_capi(): three `timezone` objects for UTC-5.
+    // make_timezones_capi(): three `timezone` objects for UTC-5.
     #[op]
     fn make_timezones_capi(it: &mut Interp) -> R<Value> {
         let offset = datetime_call(it, "timedelta", vec![Value::Int(0), Value::Int(-18000), Value::Int(0)])?;
@@ -249,7 +249,7 @@ pub mod timecapi {
         Ok(Value::tuple(vec![a, b, c]))
     }
 
-    /// get_timezones_offset_zero(): the UTC singleton twice, then a `+00:00` zone that is not it.
+    // get_timezones_offset_zero(): the UTC singleton twice, then a `+00:00` zone that is not it.
     #[op]
     fn get_timezones_offset_zero(it: &mut Interp) -> R<Value> {
         let offset = datetime_call(it, "timedelta", vec![Value::Int(0), Value::Int(0), Value::Int(0)])?;
@@ -259,7 +259,7 @@ pub mod timecapi {
         Ok(Value::tuple(vec![a, b, c]))
     }
 
-    /// get_timezone_utc_capi(macro=False): `datetime.timezone.utc`.
+    // get_timezone_utc_capi(macro=False): `datetime.timezone.utc`.
     #[op]
     fn get_timezone_utc_capi(it: &mut Interp, macro_: Option<&Value>) -> R<Value> {
         let _ = macro_;

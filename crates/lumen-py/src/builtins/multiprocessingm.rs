@@ -1,7 +1,7 @@
 //! `_multiprocessing` (`SemLock`, `sem_unlink`) and `_posixshmem` on `lumen_os::ipc`
 //! (`Modules/_multiprocessing/semaphore.c`, `Modules/_multiprocessing/posixshmem.c`).
 
-/// The semaphore primitive behind `multiprocessing` locks, semaphores and conditions.
+// The semaphore primitive behind `multiprocessing` locks, semaphores and conditions.
 #[lumen_bind::module(name = "_multiprocessing")]
 pub mod multiprocessing {
     use crate::bind::{type_object, Py, This};

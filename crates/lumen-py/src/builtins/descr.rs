@@ -180,7 +180,7 @@ impl ProxyOf {
     }
 }
 
-/// `__class_getitem__` of the core types PEP 585 makes subscriptable.
+// `__class_getitem__` of the core types PEP 585 makes subscriptable.
 #[lumen_bind::class(name = "generic", hint(py(shared)))]
 pub struct ClassGetitem;
 
@@ -195,7 +195,7 @@ impl ClassGetitem {
 
 // ---- function, method, builtin_function_or_method and module ------------------------------------
 
-/// `__call__` of the callable core types.
+// `__call__` of the callable core types.
 #[lumen_bind::class(name = "callable", hint(py(shared)))]
 pub struct CallSlot;
 
@@ -309,7 +309,7 @@ impl ModuleType {
 
 // ---- getset / member descriptors ----------------------------------------------------------------
 
-/// The data descriptors of `function` that CPython exposes as getset/member descriptors.
+// The data descriptors of `function` that CPython exposes as getset/member descriptors.
 #[lumen_bind::class(name = "function")]
 pub struct FunctionType;
 
@@ -331,7 +331,7 @@ impl FunctionType {
     }
 }
 
-/// `__repr__` of `getset_descriptor` and `member_descriptor`.
+// `__repr__` of `getset_descriptor` and `member_descriptor`.
 #[lumen_bind::class(name = "descriptor", hint(py(shared)))]
 pub struct DescriptorRepr;
 

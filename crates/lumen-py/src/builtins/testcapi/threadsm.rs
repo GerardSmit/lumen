@@ -109,7 +109,7 @@ fn config_flag(slots: &[Slot], i: usize) -> i64 {
 pub mod threadsm {
     use super::*;
 
-    /// _test_thread_state(callback): call `callback` from this thread and from threads of its own.
+    // _test_thread_state(callback): call `callback` from this thread and from threads of its own.
     #[op(hint(py(arg_style = "parse", arg_name = "test_thread_state")))]
     fn _test_thread_state(it: &mut Interp, callback: &Value) -> R<()> {
         callable_arg(it, callback, "test_thread_state")?;
@@ -135,7 +135,7 @@ pub mod threadsm {
     #[op]
     fn gilstate_ensure_release() {}
 
-    /// crash_no_current_thread(): `PyThreadState_Get()` with the GIL released.
+    // crash_no_current_thread(): `PyThreadState_Get()` with the GIL released.
     #[op]
     fn crash_no_current_thread(it: &mut Interp) {
         it.flush_out();
@@ -145,14 +145,14 @@ pub mod threadsm {
         std::process::abort()
     }
 
-    /// _pending_threadfunc(callable): schedule `callable()` as a pending call.
+    // _pending_threadfunc(callable): schedule `callable()` as a pending call.
     #[op]
     fn _pending_threadfunc(it: &mut Interp, callable: &Value) -> R<bool> {
         it.call(callable, Vec::new(), Vec::new())?;
         Ok(true)
     }
 
-    /// call_in_temporary_c_thread(callback, wait=True): call `callback` from a new C thread.
+    // call_in_temporary_c_thread(callback, wait=True): call `callback` from a new C thread.
     #[op(hint(py(arg_style = "parse", arg_name = "call_in_temporary_c_thread")))]
     fn call_in_temporary_c_thread(it: &mut Interp, callback: &Value, wait: Option<i64>) -> R<()> {
         let thread = start_in_thread(it, callback)?;
@@ -172,7 +172,7 @@ pub mod threadsm {
         }
     }
 
-    /// _spawn_pthread_waiter(): start a thread the `threading` module does not know about.
+    // _spawn_pthread_waiter(): start a thread the `threading` module does not know about.
     #[op]
     fn _spawn_pthread_waiter(it: &mut Interp) -> R<()> {
         let mut slot = WAITER.lock().unwrap_or_else(|p| p.into_inner());
@@ -199,7 +199,7 @@ pub mod threadsm {
         }
     }
 
-    /// run_in_subinterp(code): `Py_NewInterpreter`, `PyRun_SimpleString`, `Py_EndInterpreter`.
+    // run_in_subinterp(code): `Py_NewInterpreter`, `PyRun_SimpleString`, `Py_EndInterpreter`.
     #[op(hint(py(arg_style = "parse", arg_name = "run_in_subinterp")))]
     fn run_in_subinterp(it: &mut Interp, code: &str) -> R<i64> {
         run_in_new_interpreter(it, code, Settings::LEGACY)

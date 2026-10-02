@@ -1695,7 +1695,7 @@ fn raise_exc(it: &mut Interp, v: &Value) -> Obj {
     }
 }
 
-/// The built-in error handlers (`codecs.lookup_error("strict")`, ...).
+// The built-in error handlers (`codecs.lookup_error("strict")`, ...).
 #[lumen_bind::module(name = "builtins")]
 mod error_handlers {
     use super::*;

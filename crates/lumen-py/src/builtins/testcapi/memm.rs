@@ -73,7 +73,7 @@ fn fatal(it: &mut Interp, text: &str) -> ! {
 pub mod memm {
     use super::*;
 
-    /// set_nomemory(start, stop=0): allocation requests fail after `start` of them, until `stop`.
+    // set_nomemory(start, stop=0): allocation requests fail after `start` of them, until `stop`.
     #[op]
     fn set_nomemory(it: &mut Interp, start: i64, stop: Option<i64>) {
         it.nomemory = Some(NoMemory { start, stop: stop.unwrap_or(0), count: 0 });
@@ -94,7 +94,7 @@ pub mod memm {
         }
     }
 
-    /// pymem_buffer_overflow(): write one byte past a `PyMem_Malloc(16)` block, then free it.
+    // pymem_buffer_overflow(): write one byte past a `PyMem_Malloc(16)` block, then free it.
     #[op]
     fn pymem_buffer_overflow(it: &mut Interp) {
         let mut block = DebugBlock::new('m', 16, 1);
@@ -106,7 +106,7 @@ pub mod memm {
         }
     }
 
-    /// pymem_api_misuse(): allocate with `PyMem_Malloc`, release with `PyMem_RawFree`.
+    // pymem_api_misuse(): allocate with `PyMem_Malloc`, release with `PyMem_RawFree`.
     #[op]
     fn pymem_api_misuse(it: &mut Interp) {
         let block = DebugBlock::new('m', 16, 1);
@@ -115,20 +115,20 @@ pub mod memm {
         fatal(it, &report);
     }
 
-    /// pymem_malloc_without_gil(): `PyMem_Malloc` with the GIL released.
+    // pymem_malloc_without_gil(): `PyMem_Malloc` with the GIL released.
     #[op]
     fn pymem_malloc_without_gil(it: &mut Interp) {
         fatal(it, "Fatal Python error: _PyMem_DebugMalloc: Python memory allocator called without holding the GIL\n\nPython runtime state: initialized\n");
     }
 
-    /// pyobject_malloc_without_gil(): `PyObject_Malloc` with the GIL released.
+    // pyobject_malloc_without_gil(): `PyObject_Malloc` with the GIL released.
     #[op]
     fn pyobject_malloc_without_gil(it: &mut Interp) {
         fatal(it, "Fatal Python error: _PyMem_DebugMalloc: Python memory allocator called without holding the GIL\n\nPython runtime state: initialized\n");
     }
 
-    /// The `_PyObject_IsFreed` probes: each broken object (NULL, uninitialised, truncated, freed)
-    /// is recognised as freed.
+    // The `_PyObject_IsFreed` probes: each broken object (NULL, uninitialised, truncated, freed)
+    // is recognised as freed.
     #[op]
     fn check_pyobject_null_is_freed() {}
 
@@ -156,14 +156,14 @@ pub mod memm {
     #[op]
     fn test_pyobject_new() {}
 
-    /// tracemalloc_track(domain, ptr, size, release_gil=0): `PyTraceMalloc_Track`.
+    // tracemalloc_track(domain, ptr, size, release_gil=0): `PyTraceMalloc_Track`.
     #[op]
     fn tracemalloc_track(it: &mut Interp, domain: i64, ptr: &Value, size: i64, release_gil: Option<i64>) -> R<()> {
         let _ = (domain, ptr, size, release_gil);
         Err(it.runtime_error("PyTraceMalloc_Track error"))
     }
 
-    /// tracemalloc_untrack(domain, ptr, release_gil=0): `PyTraceMalloc_Untrack`.
+    // tracemalloc_untrack(domain, ptr, release_gil=0): `PyTraceMalloc_Untrack`.
     #[op]
     fn tracemalloc_untrack(it: &mut Interp, domain: i64, ptr: &Value, release_gil: Option<i64>) -> R<()> {
         let _ = (domain, ptr, release_gil);

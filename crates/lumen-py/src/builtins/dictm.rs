@@ -256,7 +256,7 @@ impl Dict {
     }
 }
 
-/// `isdisjoint`, `__repr__` and `mapping` of the three dict views.
+// `isdisjoint`, `__repr__` and `mapping` of the three dict views.
 #[lumen_bind::class(name = "dict_view", hint(py(shared)))]
 pub struct DictViews;
 

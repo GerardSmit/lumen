@@ -149,7 +149,7 @@ pub mod _testcapi {
     #[constant(name = "DBL_MIN")]
     const DBL_MIN: f64 = f64::MIN_POSITIVE;
 
-    /// raise_exception(exc, args): instantiate `exc(*args)` and raise it.
+    // raise_exception(exc, args): instantiate `exc(*args)` and raise it.
     #[op]
     fn raise_exception(it: &mut Interp, exc: &Value, args: &Value) -> R<Value> {
         let Some(items) = args.tuple_items() else {
@@ -162,7 +162,7 @@ pub mod _testcapi {
         }
     }
 
-    /// exception_print(exc, legacy=0): print the exception and its traceback to `sys.stderr`.
+    // exception_print(exc, legacy=0): print the exception and its traceback to `sys.stderr`.
     #[op]
     fn exception_print(it: &mut Interp, exc: &Value, legacy: Option<i64>) -> R<()> {
         let _ = legacy;
@@ -172,7 +172,7 @@ pub mod _testcapi {
         Ok(())
     }
 
-    /// traceback_print(tb, file): print a traceback object to `file`.
+    // traceback_print(tb, file): print a traceback object to `file`.
     #[op]
     fn traceback_print(it: &mut Interp, tb: &Value, file: &Value) -> R<()> {
         let m = it.import_module("traceback")?;

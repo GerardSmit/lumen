@@ -265,7 +265,7 @@ pub mod miscm {
 
     // ---- error state --------------------------------------------------------------------------
 
-    /// err_restore(type[, value[, traceback]]): `PyErr_Restore`, then return NULL.
+    // err_restore(type[, value[, traceback]]): `PyErr_Restore`, then return NULL.
     #[op]
     fn err_restore(it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
         match args {
@@ -276,7 +276,7 @@ pub mod miscm {
         }
     }
 
-    /// err_writeunraisable(exc, obj): `PyErr_WriteUnraisable` with `exc` set as the current error.
+    // err_writeunraisable(exc, obj): `PyErr_WriteUnraisable` with `exc` set as the current error.
     #[op]
     fn err_writeunraisable(it: &mut Interp, exc: &Value, obj: &Value) -> R<()> {
         match exc {
@@ -289,7 +289,7 @@ pub mod miscm {
         Ok(())
     }
 
-    /// write_unraisable_exc(exception, err_msg, obj): `_PyErr_WriteUnraisableMsg`.
+    // write_unraisable_exc(exception, err_msg, obj): `_PyErr_WriteUnraisableMsg`.
     #[op]
     fn write_unraisable_exc(it: &mut Interp, exception: &Value, err_msg: &Value, obj: &Value) -> R<()> {
         let msg = match err_msg {
@@ -325,7 +325,7 @@ pub mod miscm {
         Err(cause)
     }
 
-    /// getitem_with_error(map, key): `PyObject_GetItem` with an error already set.
+    // getitem_with_error(map, key): `PyObject_GetItem` with an error already set.
     #[op]
     fn getitem_with_error(it: &mut Interp, map: &Value, key: &Value) -> R<Value> {
         let first = it.new_exc_str("ValueError", "bug");
@@ -338,7 +338,7 @@ pub mod miscm {
         }
     }
 
-    /// unstable_exc_prep_reraise_star(orig, excs): `PyUnstable_Exc_PrepReraiseStar`.
+    // unstable_exc_prep_reraise_star(orig, excs): `PyUnstable_Exc_PrepReraiseStar`.
     #[op]
     fn unstable_exc_prep_reraise_star(it: &mut Interp, orig: &Value, excs: &Value) -> R<Value> {
         let globals = Value::Obj(it.new_dict());
@@ -348,7 +348,7 @@ pub mod miscm {
         it.call(&prep, vec![orig.clone(), excs.clone()], Vec::new())
     }
 
-    /// raise_SIGINT_then_send_None(gen): raise SIGINT, then `gen.send(None)`.
+    // raise_SIGINT_then_send_None(gen): raise SIGINT, then `gen.send(None)`.
     #[op]
     fn raise_SIGINT_then_send_None(it: &mut Interp, gen: &Value) -> R<Value> {
         let is_gen = matches!(gen, Value::Obj(o) if matches!(o.kind, Kind::Generator(_)));
@@ -379,7 +379,7 @@ pub mod miscm {
 
     // ---- numbers, buffers ---------------------------------------------------------------------
 
-    /// pynumber_tobase(n, base): `PyNumber_ToBase`.
+    // pynumber_tobase(n, base): `PyNumber_ToBase`.
     #[op]
     fn pynumber_tobase(it: &mut Interp, n: &Value, base: i64) -> R<Value> {
         let name = match base {
@@ -393,7 +393,7 @@ pub mod miscm {
         call_builtin(it, name, vec![i])
     }
 
-    /// PyBuffer_SizeFromFormat(format): the size `struct.calcsize` computes.
+    // PyBuffer_SizeFromFormat(format): the size `struct.calcsize` computes.
     #[op]
     fn PyBuffer_SizeFromFormat(it: &mut Interp, format: &str) -> R<Value> {
         let m = it.import_module("struct")?;
@@ -401,14 +401,14 @@ pub mod miscm {
         it.call(&f, vec![Value::str(format)], Vec::new())
     }
 
-    /// getbuffer_with_null_view(obj): `PyObject_GetBuffer(obj, NULL, PyBUF_SIMPLE)`.
+    // getbuffer_with_null_view(obj): `PyObject_GetBuffer(obj, NULL, PyBUF_SIMPLE)`.
     #[op]
     fn getbuffer_with_null_view(it: &mut Interp, obj: &Value) -> R<()> {
         call_builtin(it, "memoryview", vec![obj.clone()])?;
         Err(it.new_exc_str("BufferError", "PyObject_GetBuffer: view==NULL argument is obsolete"))
     }
 
-    /// make_memoryview_from_NULL_pointer(): `PyMemoryView_FromBuffer` of a NULL buffer.
+    // make_memoryview_from_NULL_pointer(): `PyMemoryView_FromBuffer` of a NULL buffer.
     #[op]
     fn make_memoryview_from_NULL_pointer(it: &mut Interp) -> R<()> {
         Err(it.value_error("PyMemoryView_FromBuffer(): info->buf must not be NULL"))
@@ -416,14 +416,14 @@ pub mod miscm {
 
     // ---- calling ------------------------------------------------------------------------------
 
-    /// call_vectorcall(callable): `PyObject_Vectorcall(callable, ["foo"], 1, kwnames=("baz",))`.
+    // call_vectorcall(callable): `PyObject_Vectorcall(callable, ["foo"], 1, kwnames=("baz",))`.
     #[op]
     fn call_vectorcall(it: &mut Interp, callable: &Value) -> R<Value> {
         let key = it.str_obj("baz");
         it.call(callable, vec![Value::str("foo")], vec![(key, Value::str("bar"))])
     }
 
-    /// call_vectorcall_method(obj): `PyObject_VectorcallMethod("f", ...)`.
+    // call_vectorcall_method(obj): `PyObject_VectorcallMethod("f", ...)`.
     #[op]
     fn call_vectorcall_method(it: &mut Interp, obj: &Value) -> R<Value> {
         let f = it.get_attr_str(obj, "f")?;
@@ -433,14 +433,14 @@ pub mod miscm {
 
     // ---- tracing ------------------------------------------------------------------------------
 
-    /// settrace_to_record(events): trace function appending `(what, line, arg)` to `events`.
+    // settrace_to_record(events): trace function appending `(what, line, arg)` to `events`.
     #[op]
     fn settrace_to_record(it: &mut Interp, events: &Value) -> R<()> {
         list_arg(it, events)?;
         install_trace(it, RECORD_TRACE, events)
     }
 
-    /// settrace_to_error(events): trace function raising `Exception("an exception")` once.
+    // settrace_to_error(events): trace function raising `Exception("an exception")` once.
     #[op]
     fn settrace_to_error(it: &mut Interp, events: &Value) -> R<()> {
         list_arg(it, events)?;

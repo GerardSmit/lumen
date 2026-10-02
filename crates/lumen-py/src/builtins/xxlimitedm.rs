@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 const BUFSIZE: usize = 10;
 
-/// `xxlimited.Xxo`: attributes in a dictionary of its own and a 10-byte buffer.
+// `xxlimited.Xxo`: attributes in a dictionary of its own and a 10-byte buffer.
 #[lumen_bind::class(module = "xxlimited", name = "Xxo", hint(py(final)))]
 pub struct Xxo {
     attrs: AttrDict,

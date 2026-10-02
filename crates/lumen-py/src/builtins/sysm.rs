@@ -375,7 +375,7 @@ pub mod sys {
         Ok(())
     }
 
-    /// The attributes computed on first use (`flags`, `version_info`, ...).
+    // The attributes computed on first use (`flags`, `version_info`, ...).
     #[op]
     fn __getattr__(it: &mut Interp, name: &str) -> R<Value> {
         lazy_attr(it, name)

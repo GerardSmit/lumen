@@ -89,7 +89,7 @@ fn init_fields(it: &mut Interp, e: &Obj, args: &[Value]) -> R<()> {
     Ok(())
 }
 
-/// `OSError`'s constructor, initializer and pickling (installed into the core type).
+// `OSError`'s constructor, initializer and pickling (installed into the core type).
 #[lumen_bind::class(name = "OSError")]
 pub struct OSErrorType;
 

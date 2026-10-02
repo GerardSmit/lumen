@@ -193,13 +193,13 @@ pub mod evalm {
 
     // ---- evaluation -----------------------------------------------------------------------------
 
-    /// eval_get_func_name(func): `PyEval_GetFuncName`.
+    // eval_get_func_name(func): `PyEval_GetFuncName`.
     #[op]
     fn eval_get_func_name(it: &mut Interp, func: &Value) -> R<String> {
         func_name(it, func)
     }
 
-    /// eval_get_func_desc(func): `PyEval_GetFuncDesc`.
+    // eval_get_func_desc(func): `PyEval_GetFuncDesc`.
     #[op]
     fn eval_get_func_desc(func: &Value) -> &'static str {
         match func {
@@ -370,14 +370,14 @@ pub mod evalm {
         Ok(it.dead_frame_object(c.clone(), g.clone(), line, 0))
     }
 
-    /// frame_getvar(frame, name): `PyFrame_GetVar`.
+    // frame_getvar(frame, name): `PyFrame_GetVar`.
     #[op]
     fn frame_getvar(it: &mut Interp, frame: &Value, name: &Value) -> R<Value> {
         frame_arg(it, frame)?;
         frame_var(it, frame, name)
     }
 
-    /// frame_getvarstring(frame, name): `PyFrame_GetVarString`.
+    // frame_getvarstring(frame, name): `PyFrame_GetVarString`.
     #[op]
     fn frame_getvarstring(it: &mut Interp, frame: &Value, name: &Value) -> R<Value> {
         frame_arg(it, frame)?;
@@ -393,7 +393,7 @@ pub mod evalm {
         }
     }
 
-    /// code_newempty(filename, funcname, firstlineno): `PyCode_NewEmpty`.
+    // code_newempty(filename, funcname, firstlineno): `PyCode_NewEmpty`.
     #[op(hint(py(arg_style = "parse", arg_name = "code_newempty")))]
     fn code_newempty(it: &mut Interp, filename: &str, funcname: &str, firstlineno: i64) -> Value {
         let obj = Object::new(Kind::Code(new_empty_code(filename, funcname, firstlineno)));
@@ -456,7 +456,7 @@ pub mod evalm {
 
     // ---- sys ------------------------------------------------------------------------------------
 
-    /// sys_getobject(name): `PySys_GetObject`; `AttributeError` (the class) when unset or undecodable.
+    // sys_getobject(name): `PySys_GetObject`; `AttributeError` (the class) when unset or undecodable.
     #[op]
     fn sys_getobject(it: &mut Interp, name: &Value) -> Value {
         let attribute_error = Value::Obj(it.exc_type("AttributeError"));
@@ -466,7 +466,7 @@ pub mod evalm {
         sys_dict(it).and_then(|d| dict_get_str(&d, &n)).unwrap_or(attribute_error)
     }
 
-    /// sys_setobject(name, value): `PySys_SetObject`; a NULL value deletes the attribute.
+    // sys_setobject(name, value): `PySys_SetObject`; a NULL value deletes the attribute.
     #[op]
     fn sys_setobject(it: &mut Interp, name: &Value, value: &Value) -> R<i64> {
         let n = required_c_string(it, name)?;
@@ -479,7 +479,7 @@ pub mod evalm {
         Ok(0)
     }
 
-    /// sys_getxoptions(): `PySys_GetXOptions`.
+    // sys_getxoptions(): `PySys_GetXOptions`.
     #[op]
     fn sys_getxoptions(it: &mut Interp) -> Value {
         let Some(d) = sys_dict(it) else { return Value::None };
@@ -550,7 +550,7 @@ pub mod evalm {
         run_source(it, data, &shown, start, globals, locals, cf_flags.unwrap_or(0))
     }
 
-    /// Py_CompileString(str): compile `str` (honouring a coding cookie) as a module.
+    // Py_CompileString(str): compile `str` (honouring a coding cookie) as a module.
     #[op(hint(py(arg_style = "parse", arg_name = "Py_CompileString")))]
     fn Py_CompileString(it: &mut Interp, source: &Value) -> R<Value> {
         call_builtin(it, "compile", vec![source.clone(), Value::str("<string>"), Value::str("exec")])
@@ -578,7 +578,7 @@ pub mod evalm {
         sys_dict(it).and_then(|d| dict_get_str(&d, "modules")).unwrap_or(Value::None)
     }
 
-    /// PyImport_GetModule(name): the module in `sys.modules`, or the `KeyError` class.
+    // PyImport_GetModule(name): the module in `sys.modules`, or the `KeyError` class.
     #[op]
     fn PyImport_GetModule(it: &mut Interp, name: &Value) -> R<Value> {
         match get_module(it, name)? {
@@ -598,7 +598,7 @@ pub mod evalm {
         add_module(it, &Value::string(n))
     }
 
-    /// PyImport_Import(name): import through `__import__` and return the named module.
+    // PyImport_Import(name): import through `__import__` and return the named module.
     #[op]
     fn PyImport_Import(it: &mut Interp, name: &Value) -> R<Value> {
         if name.is_none() {

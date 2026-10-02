@@ -420,10 +420,10 @@ impl Interp {
 
 // ---- frames -------------------------------------------------------------------------------------
 
-/// A frame object. While its frame runs it finds the frame on the interpreter stack by `serial`
-/// (or inside its suspended generator); a frame that finished moves into `dead`, so `f_locals`,
-/// `f_trace` and tracebacks keep working. Frames only known from a traceback entry keep the
-/// snapshot fields alone.
+// A frame object. While its frame runs it finds the frame on the interpreter stack by `serial`
+// (or inside its suspended generator); a frame that finished moves into `dead`, so `f_locals`,
+// `f_trace` and tracebacks keep working. Frames only known from a traceback entry keep the
+// snapshot fields alone.
 #[lumen_bind::class(name = "frame")]
 pub struct FrameObj {
     serial: u64,
@@ -779,8 +779,8 @@ pub struct CodeType;
 
 #[lumen_bind::methods]
 impl CodeType {
-    /// `code.co_positions()`: (lineno, end_lineno, col, end_col) per instruction; columns are not
-    /// tracked, so they are None (tracebacks then print no carets).
+    // `code.co_positions()`: (lineno, end_lineno, col, end_col) per instruction; columns are not
+    // tracked, so they are None (tracebacks then print no carets).
     #[method(hint(py(text_signature = "")))]
     fn co_positions(slf: This<CodeRef>, it: &mut Interp) -> R<Value> {
         let code = &slf.0 .0;
@@ -793,7 +793,7 @@ impl CodeType {
         it.get_iter(&Value::list(items))
     }
 
-    /// `code.co_lines()`: (start, end, lineno) byte ranges of consecutive instructions on one line.
+    // `code.co_lines()`: (start, end, lineno) byte ranges of consecutive instructions on one line.
     #[method(hint(py(text_signature = "")))]
     fn co_lines(slf: This<CodeRef>, it: &mut Interp) -> R<Value> {
         let code = &slf.0 .0;

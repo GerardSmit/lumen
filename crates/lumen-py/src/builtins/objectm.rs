@@ -882,8 +882,8 @@ impl Type {
 
 // ---- descriptors -------------------------------------------------------------------------------
 
-/// `__get__` / `__set__` / `__delete__` of `property`, `function` and the getset and member
-/// descriptors.
+// `__get__` / `__set__` / `__delete__` of `property`, `function` and the getset and member
+// descriptors.
 #[lumen_bind::class(name = "descriptor", hint(py(shared)))]
 pub struct DescrMethods;
 

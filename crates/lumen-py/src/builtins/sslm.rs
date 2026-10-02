@@ -7,7 +7,7 @@ use crate::bind::{Exc, This};
 use crate::object::*;
 use crate::vm::*;
 
-/// `ssl.SSLError.__str__`: the message when `strerror` is a string, else `OSError`'s text.
+// `ssl.SSLError.__str__`: the message when `strerror` is a string, else `OSError`'s text.
 #[lumen_bind::class(name = "SSLError")]
 pub struct SslErrorExt;
 

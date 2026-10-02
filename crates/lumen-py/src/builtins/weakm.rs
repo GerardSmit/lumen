@@ -579,7 +579,7 @@ impl ProxyData {
     }
 }
 
-/// The type of proxies to callable objects: the proxy members plus `__call__`.
+// The type of proxies to callable objects: the proxy members plus `__call__`.
 #[lumen_bind::class(name = "CallableProxyType", module = "weakref", hint(py(unhashable)))]
 pub struct CallableProxy;
 

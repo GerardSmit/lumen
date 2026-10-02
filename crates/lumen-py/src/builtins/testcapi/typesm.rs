@@ -353,7 +353,7 @@ pub mod typesm {
         it.call(func, a, kw)
     }
 
-    /// function_setvectorcall(func): later calls of `func` return "overridden".
+    // function_setvectorcall(func): later calls of `func` return "overridden".
     #[op]
     fn function_setvectorcall(it: &mut Interp, func: &Value) -> R<()> {
         let f = match func {
@@ -382,7 +382,7 @@ pub mod typesm {
 
     #[methods]
     impl VectorCallClass {
-        /// Set self's vectorcall function for `type` to one that returns "vectorcall"
+        // Set self's vectorcall function for `type` to one that returns "vectorcall"
         #[method(name = "set_vectorcall", hint(py(text_signature = "($self, type, /)")))]
         fn set_vectorcall(slf: This<Value>, it: &mut Interp, ty: &Value) -> R<()> {
             let t = type_arg(it, ty, "set_vectorcall")?;
@@ -1077,7 +1077,7 @@ pub mod typesm {
         }
     }
 
-    /// pytype_fromspec_meta(meta): create a class from a spec with `meta` as its metaclass.
+    // pytype_fromspec_meta(meta): create a class from a spec with `meta` as its metaclass.
     #[op]
     fn pytype_fromspec_meta(it: &mut Interp, meta: &Value) -> R<Value> {
         let Value::Obj(m) = meta else {
@@ -1169,7 +1169,7 @@ pub mod typesm {
         }
     }
 
-    /// make_immutable_type_with_base(base): an immutable subclass of `base`.
+    // make_immutable_type_with_base(base): an immutable subclass of `base`.
     #[op]
     fn make_immutable_type_with_base(it: &mut Interp, base: &Value) -> R<Value> {
         let b = must_be_type(it, base)?;
@@ -1184,7 +1184,7 @@ pub mod typesm {
         Ok(Value::Obj(t))
     }
 
-    /// make_type_with_base(base): a subclass of `base` named `_testcapi.Subclass`.
+    // make_type_with_base(base): a subclass of `base` named `_testcapi.Subclass`.
     #[op]
     fn make_type_with_base(it: &mut Interp, base: &Value) -> R<Value> {
         let b = must_be_type(it, base)?;
@@ -1237,7 +1237,7 @@ pub mod typesm {
         Ok(())
     }
 
-    /// type_get_tp_bases(type): the `tp_bases` tuple, or None.
+    // type_get_tp_bases(type): the `tp_bases` tuple, or None.
     #[op]
     fn type_get_tp_bases(it: &mut Interp, ty: &Value) -> R<Value> {
         let t = must_be_type(it, ty)?;
@@ -1247,7 +1247,7 @@ pub mod typesm {
         }
     }
 
-    /// type_get_tp_mro(type): the `tp_mro` tuple, or None.
+    // type_get_tp_mro(type): the `tp_mro` tuple, or None.
     #[op]
     fn type_get_tp_mro(it: &mut Interp, ty: &Value) -> R<Value> {
         let t = must_be_type(it, ty)?;
@@ -1272,7 +1272,7 @@ pub mod typesm {
         Ok(Value::Obj(new_type(it, "builtins", "BasicStaticType", base.as_ref(), Layout::Other)))
     }
 
-    /// bad_get(self, obj, cls, /): call `cls()` then return `repr(self)`.
+    // bad_get(self, obj, cls, /): call `cls()` then return `repr(self)`.
     #[op]
     fn bad_get(it: &mut Interp, this: &Value, obj: &Value, cls: &Value) -> R<String> {
         let _ = obj;
@@ -1294,7 +1294,7 @@ pub mod typesm {
         Ok(ty.clone())
     }
 
-    /// with_tp_del(type): the heap type, with `__tp_del__` called as its finalizer.
+    // with_tp_del(type): the heap type, with `__tp_del__` called as its finalizer.
     #[op(hint(py(arg_style = "parse", arg_name = "with_tp_del")))]
     fn with_tp_del(it: &mut Interp, ty: &Value) -> R<Value> {
         let t = heap_type_arg(it, ty)?;
