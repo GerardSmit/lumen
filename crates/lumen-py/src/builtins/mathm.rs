@@ -386,7 +386,6 @@ pub mod math {
             }
             Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => return Ok(x.clone()),
             Value::Float(v) => return f_to_int(it, f(*v)),
-            Value::Obj(o) if matches!(o.kind, Kind::Float(_)) => {}
             v => {
                 let cls = it.type_of(v);
                 if it.lookup_mro(&cls, dunder).is_some() {
@@ -463,8 +462,9 @@ pub mod math {
         for v in integers {
             let b = crate::bind::index(it, v)?;
             let b = int_value(&b).abs();
-            if b.is_zero() {
-                return Ok(BigInt::from_i64(0));
+            if b.is_zero() || acc.is_zero() {
+                acc = BigInt::from_i64(0);
+                continue;
             }
             let g = acc.gcd(&b);
             acc = acc.mul(&b).floor_div(&g);
@@ -534,30 +534,39 @@ pub mod math {
     }
 
     fn comb_perm(it: &mut Interp, n: &Value, k: Option<&Value>, perm: bool) -> R<BigInt> {
-        let n = it.index_of(n)?;
+        let n = int_value(&crate::bind::index(it, n)?);
         let k = match k {
-            Some(Value::None) | None => n,
-            Some(v) => it.index_of(v)?,
+            Some(Value::None) | None => n.clone(),
+            Some(v) => int_value(&crate::bind::index(it, v)?),
         };
-        if n < 0 {
+        if n.is_negative() {
             return Err(it.value_error("n must be a non-negative integer"));
         }
-        if k < 0 {
+        if k.is_negative() {
             return Err(it.value_error("k must be a non-negative integer"));
         }
-        if k > n {
+        if k.cmp(&n) == std::cmp::Ordering::Greater {
             return Ok(BigInt::from_i64(0));
         }
-        let k = if perm { k } else { k.min(n - k) };
-        let (nf, kf) = (n as f64, k as f64);
-        let bits = if perm { kf * nf.log2() } else { kf * ((nf / kf.max(1.0)).log2() + std::f64::consts::LOG2_E) };
-        it.check_int_bits(bits as u128)?;
+        let k = if perm {
+            k
+        } else {
+            let rest = n.sub(&k);
+            if rest.cmp(&k) == std::cmp::Ordering::Less { rest } else { k }
+        };
+        let Some(k) = k.to_i64() else {
+            let msg = if perm { "k must not exceed 9223372036854775807" } else { "min(n - k, k) must not exceed 9223372036854775807" };
+            return Err(it.overflow_err(msg));
+        };
+        let (nbits, kf) = (n.bit_len() as f64, k as f64);
+        let bits = if perm { kf * nbits } else { kf * (nbits - kf.max(1.0).log2() + std::f64::consts::LOG2_E) };
+        it.check_int_bits(bits.max(0.0) as u128)?;
         let mut acc = BigInt::from_i64(1);
         for i in 0..k {
             if i & 0xff == 0 {
                 it.poll()?;
             }
-            acc = acc.mul(&BigInt::from_i64(n - i));
+            acc = acc.mul(&n.sub(&BigInt::from_i64(i)));
             if !perm {
                 acc = acc.floor_div(&BigInt::from_i64(i + 1));
             }
