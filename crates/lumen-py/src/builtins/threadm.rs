@@ -179,6 +179,11 @@ pub mod _thread {
 
     #[methods]
     impl Lock {
+        #[constructor(hint(py(text_signature = "")))]
+        fn new(_cls: This<Value>, it: &mut Interp) -> Value {
+            new_lock(it)
+        }
+
         /// Lock the lock.  Without argument, this blocks if the lock is already
         /// locked (even by the same thread), waiting for another thread to release
         /// the lock, and return True once the lock is acquired.
@@ -357,6 +362,11 @@ pub mod _thread {
         ///
         /// For internal use by `threading.Condition`.
         #[method(hint(py(text_signature = "")))]
+        /// Return a boolean indicating whether this object is locked right now.
+        fn locked(&self) -> bool {
+            self.core.count.get() > 0
+        }
+
         fn _is_owned(&self) -> bool {
             self.core.owned()
         }
@@ -589,13 +599,179 @@ pub mod _thread {
         new_lock(it)
     }
 
-    /// Set a sentinel lock that will be released when the current thread
-    /// state is finalized (normally when the thread ends).
+    /// A handle to an OS thread started by `start_joinable_thread` (or standing for a thread that
+    /// was not): `join` waits until the thread is done. The "done" state is a lock held while the
+    /// thread runs; the thread's sentinel entry (see `Threads::sentinels`) releases it.
+    #[class(name = "_ThreadHandle", hint(py(final)))]
+    pub struct ThreadHandle {
+        ident: Cell<u64>,
+        started: Cell<bool>,
+        done: Value,
+    }
+
+    #[derive(Default)]
+    struct Shutdown {
+        handles: Vec<Value>,
+    }
+
+    fn new_handle(it: &mut Interp) -> Value {
+        let done = new_lock(it);
+        if let Some(lock) = Py::<Lock>::from_value(it, &done) {
+            if let Ok(core) = lock_core(it, &lock) {
+                core.try_take();
+            }
+        }
+        Py::new(it, ThreadHandle { ident: Cell::new(0), started: Cell::new(false), done }).into_value()
+    }
+
+    fn handle_core(it: &mut Interp, slf: &Py<ThreadHandle>) -> R<Rc<LockCore>> {
+        let done = slf.borrow(it)?.done.clone();
+        match Py::<Lock>::from_value(it, &done) {
+            Some(lock) => lock_core(it, &lock),
+            None => Err(it.runtime_error("thread handle without a lock")),
+        }
+    }
+
+    #[methods]
+    impl ThreadHandle {
+        #[constructor(hint(py(text_signature = "")))]
+        fn new(_cls: This<Value>, it: &mut Interp) -> Value {
+            new_handle(it)
+        }
+
+        #[getter]
+        fn ident(&self) -> u64 {
+            self.ident.get()
+        }
+
+        /// Whether the thread has finished.
+        fn is_done(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
+            Ok(!handle_core(it, &slf.0)?.locked.get())
+        }
+
+        /// Marks the thread done, releasing everything that waits for it.
+        fn _set_done(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
+            let core = handle_core(it, &slf.0)?;
+            if core.locked.get() {
+                core.release(it)?;
+            }
+            Ok(())
+        }
+
+        /// Waits for the thread to finish, up to `timeout` seconds (for ever when omitted).
+        fn join(slf: This<Py<Self>>, it: &mut Interp, #[kw] timeout: Option<&Value>) -> R<()> {
+            let (started, thread) = {
+                let h = slf.0.borrow(it)?;
+                (h.started.get(), h.ident.get())
+            };
+            if !started {
+                return Err(it.runtime_error("thread not started"));
+            }
+            let core = handle_core(it, &slf.0)?;
+            if thread == ident() && core.locked.get() {
+                return Err(it.runtime_error("Cannot join current thread"));
+            }
+            let timeout = match timeout {
+                None | Some(Value::None) => None,
+                Some(v) => Some(v),
+            };
+            let (_, timeout) = acquire_args(it, true, timeout)?;
+            if core.acquire(it, true, timeout)? {
+                core.release(it)?;
+            }
+            Ok(())
+        }
+
+        #[proto(repr)]
+        fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
+            let thread = slf.0.borrow(it)?.ident.get();
+            Ok(format!("<_thread._ThreadHandle object: ident={thread}>"))
+        }
+    }
+
+    /// Starts a joinable thread that calls `function()` and returns its handle. A non-daemon
+    /// thread is joined by `_shutdown`.
     #[op]
-    fn _set_sentinel(it: &mut Interp) -> Value {
-        let lock = new_lock(it);
-        it.threads.sentinels.insert(ident(), lock.clone());
-        lock
+    fn start_joinable_thread(it: &mut Interp, function: &Value, #[kw] handle: Option<&Value>, #[kw] #[default(true)] daemon: bool) -> R<Value> {
+        if !it.is_callable(function) {
+            return Err(it.type_error("thread function must be callable"));
+        }
+        let handle = match handle {
+            None | Some(Value::None) => new_handle(it),
+            Some(h) => h.clone(),
+        };
+        let Some(hobj) = Py::<ThreadHandle>::from_value(it, &handle) else {
+            return Err(it.type_error("'handle' must be a _ThreadHandle"));
+        };
+        if hobj.borrow(it)?.started.get() {
+            return Err(it.runtime_error("thread already started"));
+        }
+        let id = it.start_thread(function.clone(), Vec::new(), Vec::new())?;
+        let done = {
+            let h = hobj.borrow(it)?;
+            h.ident.set(id);
+            h.started.set(true);
+            h.done.clone()
+        };
+        it.threads.sentinels.insert(id, done);
+        if !daemon {
+            it.native_state::<Shutdown>().handles.push(handle.clone());
+        }
+        Ok(handle)
+    }
+
+    /// A handle for the existing thread `ident`; `_set_done` ends it.
+    #[op]
+    fn _make_thread_handle(it: &mut Interp, ident: u64) -> R<Value> {
+        let handle = new_handle(it);
+        if let Some(h) = Py::<ThreadHandle>::from_value(it, &handle) {
+            let h = h.borrow(it)?;
+            h.ident.set(ident);
+            h.started.set(true);
+        }
+        Ok(handle)
+    }
+
+    /// The identifier of the thread that created the interpreter.
+    #[op]
+    fn _get_main_thread_ident(it: &mut Interp) -> u64 {
+        it.threads.main_ident
+    }
+
+    /// Waits for the non-daemon threads started with `start_joinable_thread`.
+    #[op]
+    fn _shutdown(it: &mut Interp) -> R<()> {
+        loop {
+            let next = {
+                let state = it.native_state::<Shutdown>();
+                if state.handles.is_empty() {
+                    None
+                } else {
+                    Some(state.handles.remove(0))
+                }
+            };
+            let Some(handle) = next else { return Ok(()) };
+            it.call_method(&handle, "join", Vec::new())?;
+        }
+    }
+
+    /// The longest name `set_name` stores, in bytes.
+    #[constant(name = "_NAME_MAXLEN")]
+    const NAME_MAXLEN: i64 = lumen_os::thread::NAME_MAXLEN as i64;
+
+    /// Set the name of the current thread.
+    #[op]
+    fn set_name(name: &str) {
+        lumen_os::thread::set_name(name);
+    }
+
+    /// Get the name of the current thread.
+    #[op]
+    fn _get_name() -> Value {
+        match lumen_os::thread::get_name() {
+            Some(n) => Value::string(n),
+            None => Value::None,
+        }
     }
 
     /// Return a non-zero integer that uniquely identifies the current thread
@@ -754,7 +930,8 @@ pub mod _thread {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
         let lock = type_object::<Lock>(it);
-        dict_set_str(&d, "LockType", Value::Obj(lock));
+        dict_set_str(&d, "LockType", Value::Obj(lock.clone()));
+        dict_set_str(&d, "lock", Value::Obj(lock));
         dict_set_str(&d, "error", Value::Obj(it.exc_type("RuntimeError")));
         dict_set_str(&d, "TIMEOUT_MAX", Value::Float(TIMEOUT_MAX));
         let hook_args = except_hook_args_type(it);

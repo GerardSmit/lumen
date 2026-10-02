@@ -149,7 +149,7 @@ pub mod _signal {
         Ok(sig as i32)
     }
 
-    fn signal_set(it: &mut Interp, v: &Value) -> R<Vec<i32>> {
+    pub(crate) fn signal_set(it: &mut Interp, v: &Value) -> R<Vec<i32>> {
         let items = it.iterate_to_vec(v)?;
         let mut out = Vec::with_capacity(items.len());
         for i in items {

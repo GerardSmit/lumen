@@ -298,11 +298,14 @@ pub fn fcntl_constants() -> Vec<(&'static str, i64)> {
         ("F_FULLFSYNC", 51),
         ("F_NOCACHE", 48),
         ("F_RDAHEAD", 45),
-        ("F_PREALLOCATE", 42),
-        ("F_SETSIZE", 43),
         ("FASYNC", 0x40),
-        ("F_DUP2FD", 90),
-        ("F_DUP2FD_CLOEXEC", 91),
+        ("F_OFD_GETLK", 92),
+        ("F_OFD_SETLK", 90),
+        ("F_OFD_SETLKW", 91),
+        ("F_GETNOSIGPIPE", 74),
+        ("F_SETNOSIGPIPE", 73),
+        ("F_GETLEASE", 107),
+        ("F_SETLEASE", 106),
     ]);
     v
 }

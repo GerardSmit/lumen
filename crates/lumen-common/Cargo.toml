@@ -17,8 +17,8 @@ compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip
 # `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) in pure Rust:
 # the decoder is written in `compress::xz`, the encoders come from `lzma-rust2`.
 lzma = ["compress", "dep:lzma-rust2", "dep:sha2"]
-# `crypt`: MD5/SHA-crypt and bcrypt password hashes (`crypt(3)` formats), on `hash`.
-crypt = ["hash", "dep:bcrypt"]
+# `crypt`: bcrypt password hashes (`$2b$` text and raw digest).
+crypt = ["dep:bcrypt"]
 
 [dependencies]
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.

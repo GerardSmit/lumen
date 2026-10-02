@@ -10,7 +10,7 @@ use super::charclass::{Builtin, BuiltinSet, CharClass, Flavor, PreMap};
 use super::ir::Node;
 use super::program::{Options, Regex};
 
-pub const MAGIC: u32 = 20221023;
+pub const MAGIC: u32 = 20230612;
 pub const MAXREPEAT: u32 = u32::MAX;
 pub const MAXGROUPS: u32 = (i32::MAX / 2) as u32;
 

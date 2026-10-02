@@ -5,7 +5,6 @@
 pub mod channel;
 pub mod child;
 pub mod consts;
-pub mod crypt;
 #[cfg(unix)]
 pub mod dynlib;
 pub mod errno;
@@ -17,6 +16,7 @@ pub mod ipc;
 pub mod mmap;
 pub mod net;
 pub mod poll;
+pub mod posix;
 pub mod proc;
 pub mod rlimit;
 pub mod signal;

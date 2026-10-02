@@ -9,7 +9,6 @@ pub mod decimalm;
 pub mod jsonm;
 pub mod posixsubprocessm;
 pub mod selectm;
-pub mod cryptm;
 pub mod fcntlm;
 pub mod mmapm;
 pub mod multiprocessingm;

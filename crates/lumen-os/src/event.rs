@@ -215,7 +215,7 @@ pub fn kqueue_constants() -> Vec<(&'static str, i64)> {
             ("KQ_NOTE_EXIT", 0x8000_0000),
             ("KQ_NOTE_FORK", 0x4000_0000),
             ("KQ_NOTE_EXEC", 0x2000_0000),
-            ("KQ_NOTE_PCTRLMASK", 0xf000_0000),
+            ("KQ_NOTE_PCTRLMASK", -0x10_0000),
             ("KQ_NOTE_PDATAMASK", 0x000f_ffff),
             ("KQ_NOTE_TRACK", 0x1),
             ("KQ_NOTE_CHILD", 0x4),

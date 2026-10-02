@@ -19,7 +19,6 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_codecs", bound::<super::codecsm::_codecs::Module>),
     ("_collections", bound::<super::collectionsm::_collections::Module>),
     ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
-    ("_crypt", bound::<super::cryptm::crypt::Module>),
     ("_csv", bound::<super::csvm::_csv::Module>),
     ("_decimal", bound::<super::decimalm::_decimal::Module>),
     ("_functools", bound::<super::functoolsm::_functools::Module>),
@@ -123,11 +122,11 @@ fn sysconfig_data(it: &mut Interp, name: &str) -> Obj {
     let vars = it.new_dict();
     let strs = [
         ("TZPATH", "/usr/share/zoneinfo:/usr/lib/zoneinfo:/usr/share/lib/zoneinfo:/etc/zoneinfo".to_string()),
-        ("VERSION", "3.12".to_string()),
+        ("VERSION", "3.14".to_string()),
         ("ABIFLAGS", String::new()),
         ("MACHDEP", platform.clone()),
-        ("SOABI", format!("cpython-312-{platform}")),
-        ("EXT_SUFFIX", format!(".cpython-312-{platform}.so")),
+        ("SOABI", format!("cpython-314-{platform}")),
+        ("EXT_SUFFIX", format!(".cpython-314-{platform}.so")),
         ("SHLIB_SUFFIX", ".so".to_string()),
     ];
     for (k, v) in strs {

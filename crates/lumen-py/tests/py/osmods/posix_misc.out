@@ -1,0 +1,73 @@
+a/b/d //a /a .
+b'../..' / a/b z
+('', '//', 'a/b') ('', '/', '//a') ('', '', 'a/b') (b'', b'/', b'x')
+a/b ('', '/', 'a')
+_path_normpath: path should be string, bytes or os.PathLike, not int
+3 7
+statvfs_result os 10 True True True
+True
+True 1 2
+[Errno 2] No such file or directory: '/nonexistent-dir'
+True True
+True True True
+True
+ValueError unrecognized configuration name
+TypeError configuration names must be strings or integers
+3 True
+True
+True
+True
+True True
+True True
+TypeError
+TypeError
+setgroups argument must be a sequence
+uid is less than minimum
+uid is less than minimum
+True
+True
+FileExistsError False
+8
+3
+8 b'aXYZ' b'efgh\x00\x00\x00\x00\x00\x00'
+4 b'Ze' b'fg'
+8 b'aXYZefgh----'
+0 b'aXYZefgh----'
+BufferError Object is not writable.
+TypeError readv() arg 2 must be a sequence
+TypeError a bytes-like object is required, not 'int'
+writev() arg 2 must be a sequence
+True
+/dev/tty
+False
+True True
+True
+OSError
+0
+b'spawned\n'
+3
+4
+5
+(0, 1, 2)
+ValueError
+TypeError posix_spawn: argv must be a tuple or list
+ValueError posix_spawn: argv must not be empty
+ValueError posix_spawn: argv first element cannot be empty
+TypeError posix_spawn: environment must be a mapping object or None
+TypeError Each file_actions element must be a non-empty tuple
+TypeError Unknown file_actions identifier
+TypeError A close file_action tuple must have 2 elements
+FileNotFoundError [Errno 2] No such file or directory: '/nonexistent/prog'
+ValueError illegal environment variable name
+7
+9
+ValueError execv() arg 2 must not be empty
+TypeError execv() arg 2 must be a tuple or list
+ValueError execv() arg 2 first element cannot be empty
+FileNotFoundError [Errno 2] No such file or directory
+FileNotFoundError [Errno 2] No such file or directory: '/nonexistent/prog'
+TypeError execve: environment must be a mapping object
+chroot 1
+dict True True
+waitid_result 5 True
+['getgrouplist', 'initgroups', 'preadv', 'readinto', 'sendfile', 'setpgrp']

@@ -93,7 +93,7 @@ pub mod _testcapi {
     #[constant(name = "the_number_three")]
     const THE_NUMBER_THREE: i64 = 3;
     #[constant(name = "Py_Version")]
-    const PY_VERSION: i64 = 0x030C0FF0;
+    const PY_VERSION: i64 = 0x030E08F0;
     #[constant(name = "WITH_PYMALLOC")]
     const WITH_PYMALLOC: bool = false;
     #[constant(name = "LIMITED_API_AVAILABLE")]

@@ -116,6 +116,8 @@ pub fn clock_ids() -> &'static [(&'static str, i64)] {
             ("CLOCK_REALTIME", libc::CLOCK_REALTIME as i64),
             ("CLOCK_THREAD_CPUTIME_ID", libc::CLOCK_THREAD_CPUTIME_ID as i64),
             ("CLOCK_UPTIME_RAW", libc::CLOCK_UPTIME_RAW as i64),
+            ("CLOCK_MONOTONIC_RAW_APPROX", 5),
+            ("CLOCK_UPTIME_RAW_APPROX", 9),
         ];
         T
     }

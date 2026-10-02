@@ -191,6 +191,10 @@ pub mod _imp {
         crate::builtins::subinterpm::override_extensions_check(flag)
     }
 
+    /// The pyc magic number (3627 for CPython 3.14) with `\r\n`, as a little-endian 32-bit integer.
+    #[constant(name = "pyc_magic_number_token")]
+    const PYC_MAGIC_NUMBER_TOKEN: i64 = 3627 | (13 << 16) | (10 << 24);
+
     #[init]
     fn init(it: &mut Interp, m: &Value) {
         let Value::Obj(m) = m else { return };

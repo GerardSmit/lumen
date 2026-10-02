@@ -4,8 +4,9 @@ Unmodified copies of files from CPython's `Lib/`, kept in CPython's package layo
 Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the list lives in
 `MODULES.txt`. Never edit these files; fix the engine instead.
 
-- Tag: `v3.12.15`
-- Commit: `e848e4b09ca4bc67c0041c9ce7526dae471d4c36`
+- Tag: `v3.14.8`
+- Commit: `8e6e75d9102e39bed2a2b279203a396741180f12`
+- Commit date: 2026-09-30
 - License: `LICENSE` (PSF)
 
 ## Files
@@ -17,7 +18,6 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `abc.py`
 - `bisect.py`
 - `collections/__init__.py`
-- `collections/abc.py`
 - `contextlib.py`
 - `copy.py`
 - `copyreg.py`
@@ -33,7 +33,8 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `numbers.py`
 - `operator.py`
 - `reprlib.py`
-- `string.py`
+- `string/__init__.py`
+- `string/templatelib.py`
 - `struct.py`
 - `textwrap.py`
 - `types.py`
@@ -83,11 +84,13 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `fnmatch.py`
 - `glob.py`
 - `ntpath.py`
-- `pathlib.py`
+- `pathlib/__init__.py`
+- `pathlib/_local.py`
+- `pathlib/_os.py`
+- `pathlib/types.py`
 - `tempfile.py`
 - `shutil.py`
 - `io.py`
-- `_compression.py`
 - `logging/__init__.py`
 - `threading.py`
 - `traceback.py`
@@ -167,11 +170,11 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `importlib/resources/_adapters.py`
 - `importlib/resources/_common.py`
 - `importlib/resources/_itertools.py`
-- `importlib/resources/_legacy.py`
 - `importlib/resources/abc.py`
 - `importlib/resources/readers.py`
 - `importlib/resources/simple.py`
-- `sysconfig.py`
+- `sysconfig/__init__.py`
+- `sysconfig/__main__.py`
 - `_osx_support.py`
 - `zoneinfo/__init__.py`
 - `zoneinfo/_common.py`
@@ -255,7 +258,6 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `platform.py`
 - `tty.py`
 - `pty.py`
-- `crypt.py`
 - `rlcompleter.py`
 - `multiprocessing/__init__.py`
 - `multiprocessing/connection.py`
@@ -279,3 +281,55 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `multiprocessing/util.py`
 - `multiprocessing/dummy/__init__.py`
 - `multiprocessing/dummy/connection.py`
+- `annotationlib.py`
+- `_colorize.py`
+- `code.py`
+- `codeop.py`
+- `_py_warnings.py`
+- `_opcode_metadata.py`
+- `_ast_unparse.py`
+- `_pylong.py`
+- `_threading_local.py`
+- `_sitebuiltins.py`
+- `compression/__init__.py`
+- `compression/bz2.py`
+- `compression/gzip.py`
+- `compression/lzma.py`
+- `compression/zlib.py`
+- `compression/_common/__init__.py`
+- `compression/_common/_streams.py`
+- `compression/zstd/__init__.py`
+- `compression/zstd/_zstdfile.py`
+- `concurrent/interpreters/__init__.py`
+- `concurrent/interpreters/_crossinterp.py`
+- `concurrent/interpreters/_queues.py`
+- `concurrent/futures/interpreter.py`
+- `importlib/resources/_functional.py`
+- `asyncio/__main__.py`
+- `asyncio/graph.py`
+- `asyncio/tools.py`
+- `_pyrepl/__init__.py`
+- `_pyrepl/__main__.py`
+- `_pyrepl/_module_completer.py`
+- `_pyrepl/_threading_handler.py`
+- `_pyrepl/base_eventqueue.py`
+- `_pyrepl/commands.py`
+- `_pyrepl/completing_reader.py`
+- `_pyrepl/console.py`
+- `_pyrepl/fancy_termios.py`
+- `_pyrepl/historical_reader.py`
+- `_pyrepl/input.py`
+- `_pyrepl/keymap.py`
+- `_pyrepl/main.py`
+- `_pyrepl/pager.py`
+- `_pyrepl/reader.py`
+- `_pyrepl/readline.py`
+- `_pyrepl/simple_interact.py`
+- `_pyrepl/terminfo.py`
+- `_pyrepl/trace.py`
+- `_pyrepl/types.py`
+- `_pyrepl/unix_console.py`
+- `_pyrepl/unix_eventqueue.py`
+- `_pyrepl/utils.py`
+- `_pyrepl/windows_console.py`
+- `_pyrepl/windows_eventqueue.py`
