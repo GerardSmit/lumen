@@ -17,7 +17,6 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::sync::{Mutex, OnceLock};
 
-use crate::openssl::{crypto_candidates, ssl_candidates, Library};
 
 type Ptr = *mut c_void;
 type CPtr = *const c_void;
@@ -40,22 +39,14 @@ macro_rules! openssl_api {
         #[allow(non_snake_case)]
         struct Api {
             $( $name: unsafe extern "C" fn($($arg),*) $(-> $ret)?, )*
-            _ssl: Library,
-            _crypto: Library,
         }
         impl Api {
             fn load() -> Result<Api, String> {
-                let crypto = Library::open_candidates(crypto_candidates())?;
-                let ssl = Library::open_candidates(ssl_candidates())?;
+                let crypto = lumen_os::dynlib::openssl_crypto().map_err(str::to_string)?;
+                let ssl = lumen_os::dynlib::openssl_ssl().map_err(str::to_string)?;
                 unsafe {
-                    let init: unsafe extern "C" fn(u64, CPtr) -> c_int = ssl.function("OPENSSL_init_ssl")?;
-                    if init(0, std::ptr::null()) != 1 {
-                        return Err("OPENSSL_init_ssl failed".into());
-                    }
                     Ok(Api {
                         $( $name: openssl_api!(@sel $lib, ssl, crypto, stringify!($name)), )*
-                        _ssl: ssl,
-                        _crypto: crypto,
                     })
                 }
             }

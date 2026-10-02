@@ -6,6 +6,8 @@ use der::asn1::ObjectIdentifier;
 use lumen_common::x509;
 use num_bigint_dig::BigUint;
 
+pub use lumen_crypto::pad_be;
+
 pub const TAG_INTEGER: u8 = x509::INTEGER;
 pub const TAG_BIT_STRING: u8 = x509::BIT_STRING;
 pub const TAG_OCTET_STRING: u8 = x509::OCTET_STRING;
@@ -205,14 +207,3 @@ pub fn explicit(n: u8, content: &[u8]) -> Vec<u8> {
     tlv(0xa0 | n, content)
 }
 
-/// Big-endian bytes of `n`, left-padded with zeros to `len`.
-pub fn pad_be(n: &[u8], len: usize) -> Vec<u8> {
-    let start = n.iter().position(|b| *b != 0).unwrap_or(n.len());
-    let n = &n[start..];
-    if n.len() >= len {
-        return n.to_vec();
-    }
-    let mut out = vec![0; len - n.len()];
-    out.extend_from_slice(n);
-    out
-}

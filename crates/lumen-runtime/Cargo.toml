@@ -26,13 +26,17 @@ lumen = { path = "../lumen" }
 
 # lumen-node's optional builtins (see its Cargo.toml), all on by default.
 [features]
-default = ["bun", "http2", "cluster", "dgram", "wasi"]
+default = ["bun", "http2", "cluster", "dgram", "wasi", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
 bun = ["lumen-node/bun"]
 bundled-sqlite = ["lumen-node/bundled-sqlite"]
 http2 = ["lumen-node/http2"]
 cluster = ["lumen-node/cluster"]
 dgram = ["lumen-node/dgram"]
 wasi = ["lumen-node/wasi"]
+crypto-openssl = ["lumen-node/crypto-openssl"]
+crypto-apple = ["lumen-node/crypto-apple"]
+crypto-cng = ["lumen-node/crypto-cng"]
+crypto-rustcrypto = ["lumen-node/crypto-rustcrypto"]
 
 [lints]
 workspace = true

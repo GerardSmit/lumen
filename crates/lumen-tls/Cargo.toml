@@ -9,6 +9,10 @@ publish = false
 [dependencies]
 lumen-common = { path = "../lumen-common" }
 
+# The shared dlopen loader (`lumen_os::dynlib`) is how desktop Unix reaches the system OpenSSL.
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+lumen-os = { path = "../lumen-os" }
+
 # Desktop Unix dlopens system OpenSSL. Android and Windows use rustls on the ring provider,
 # trusting the operating system's certificate store with bundled roots as a fallback.
 [target.'cfg(any(not(unix), target_os = "android"))'.dependencies]

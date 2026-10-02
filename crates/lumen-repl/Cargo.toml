@@ -12,7 +12,16 @@ publish = false
 
 [dependencies]
 lumen-host = { path = "../lumen-host" }
-lumen-runtime = { path = "../lumen-runtime" }
+lumen-runtime = { path = "../lumen-runtime", default-features = false, features = ["bun", "http2", "cluster", "dgram", "wasi"] }
+
+# The crypto backends are chosen by the final binary (see lumen-cli); a build of this crate alone
+# gets the defaults.
+[features]
+default = ["crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
+crypto-openssl = ["lumen-runtime/crypto-openssl"]
+crypto-apple = ["lumen-runtime/crypto-apple"]
+crypto-cng = ["lumen-runtime/crypto-cng"]
+crypto-rustcrypto = ["lumen-runtime/crypto-rustcrypto"]
 
 [lints]
 workspace = true

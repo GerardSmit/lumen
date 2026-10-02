@@ -6,6 +6,8 @@ pub mod channel;
 pub mod child;
 pub mod consts;
 pub mod crypt;
+#[cfg(unix)]
+pub mod dynlib;
 pub mod errno;
 pub mod event;
 pub mod fdctl;

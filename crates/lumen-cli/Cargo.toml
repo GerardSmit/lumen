@@ -13,14 +13,20 @@ publish = false
 lumen = { path = "../lumen" }
 lumen-common = { path = "../lumen-common" }
 lumen-host = { path = "../lumen-host" }
-lumen-repl = { path = "../lumen-repl" }
-lumen-runtime = { path = "../lumen-runtime" }
+lumen-repl = { path = "../lumen-repl", default-features = false }
+lumen-runtime = { path = "../lumen-runtime", default-features = false, features = ["bun", "http2", "cluster", "dgram", "wasi"] }
 
 [features]
-default = ["typed"]
+default = ["typed", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
 # `lumen typed` analysis modes (the engine's typed-tier checker); `--strip` works without it.
 typed = ["lumen/typed"]
 bundled-sqlite = ["lumen-runtime/bundled-sqlite"]
+# Asymmetric crypto backends; the operating system's own is the default on Apple and Windows.
+# `--no-default-features --features typed,crypto-apple` builds without the RustCrypto asymmetric crates.
+crypto-openssl = ["lumen-runtime/crypto-openssl", "lumen-repl/crypto-openssl"]
+crypto-apple = ["lumen-runtime/crypto-apple", "lumen-repl/crypto-apple"]
+crypto-cng = ["lumen-runtime/crypto-cng", "lumen-repl/crypto-cng"]
+crypto-rustcrypto = ["lumen-runtime/crypto-rustcrypto", "lumen-repl/crypto-rustcrypto"]
 # Exact allocator counters in the `LUMEN_MEM_STATS=1` report (costs a few atomics per allocation).
 mem-stats = ["lumen/mem-stats"]
 # Diagnostic builds: expose individual allocations/frees to memory sanitizers.

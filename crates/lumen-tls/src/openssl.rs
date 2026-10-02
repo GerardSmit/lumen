@@ -11,13 +11,13 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_int, c_long, c_void};
+use lumen_os::dynlib::Library;
 use std::time::Duration;
 
 type SslMethod = c_void;
 type SslCtx = c_void;
 type Ssl = c_void;
 
-type InitSsl = unsafe extern "C" fn(u64, *const c_void) -> c_int;
 type ClientMethod = unsafe extern "C" fn() -> *const SslMethod;
 type ServerMethod = unsafe extern "C" fn() -> *const SslMethod;
 type CtxNew = unsafe extern "C" fn(*const SslMethod) -> *mut SslCtx;
@@ -55,8 +55,7 @@ type ErrGetError = unsafe extern "C" fn() -> u64;
 type ErrErrorString = unsafe extern "C" fn(u64, *mut c_char, usize);
 
 struct Api {
-    _ssl_lib: Library,
-    _crypto_lib: Library,
+    _ssl_lib: &'static Library,
     ctx_new: CtxNew,
     ctx_free: CtxFree,
     ctx_default_paths: CtxDefaultPaths,
@@ -94,13 +93,9 @@ struct Api {
 
 impl Api {
     fn load() -> Result<Self, String> {
-        let crypto = Library::open_candidates(crypto_candidates())?;
-        let ssl = Library::open_candidates(ssl_candidates())?;
+        let ssl = lumen_os::dynlib::openssl_ssl().map_err(str::to_string)?;
+        let crypto = lumen_os::dynlib::openssl_crypto().map_err(str::to_string)?;
         unsafe {
-            let init: InitSsl = ssl.function("OPENSSL_init_ssl")?;
-            if init(0, std::ptr::null()) != 1 {
-                return Err("OPENSSL_init_ssl failed".into());
-            }
             let method: ClientMethod = ssl.function("TLS_client_method")?;
             let ctx_new: CtxNew = ssl.function("SSL_CTX_new")?;
             // Ensure the method symbol is callable before returning the table.
@@ -142,7 +137,6 @@ impl Api {
                 err_get_error: crypto.function("ERR_get_error")?,
                 err_error_string: crypto.function("ERR_error_string_n")?,
                 _ssl_lib: ssl,
-                _crypto_lib: crypto,
             })
         }
     }
@@ -554,92 +548,6 @@ impl Drop for TlsStream {
             (self.api.ctx_free)(self.context);
         }
     }
-}
-
-pub(crate) fn ssl_candidates() -> &'static [&'static str] {
-    #[cfg(target_os = "macos")]
-    {
-        &[
-            "/opt/homebrew/lib/libssl.3.dylib",
-            "/usr/local/lib/libssl.3.dylib",
-            "libssl.3.dylib",
-        ]
-    }
-    #[cfg(target_os = "linux")]
-    {
-        &["libssl.so.3", "libssl.so"]
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        &[]
-    }
-}
-pub(crate) fn crypto_candidates() -> &'static [&'static str] {
-    #[cfg(target_os = "macos")]
-    {
-        &[
-            "/opt/homebrew/lib/libcrypto.3.dylib",
-            "/usr/local/lib/libcrypto.3.dylib",
-            "libcrypto.3.dylib",
-        ]
-    }
-    #[cfg(target_os = "linux")]
-    {
-        &["libcrypto.so.3", "libcrypto.so"]
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        &[]
-    }
-}
-
-pub(crate) struct Library {
-    handle: *mut c_void,
-}
-impl Library {
-    pub(crate) fn open_candidates(paths: &[&str]) -> Result<Self, String> {
-        let mut errors = Vec::new();
-        for path in paths {
-            match Self::open(path) {
-                Ok(lib) => return Ok(lib),
-                Err(error) => errors.push(error),
-            }
-        }
-        Err(format!(
-            "no compatible OpenSSL library found: {}",
-            errors.join("; ")
-        ))
-    }
-    fn open(path: &str) -> Result<Self, String> {
-        let path = CString::new(path).map_err(|_| "library path contains NUL".to_string())?;
-        let handle = unsafe { dlopen(path.as_ptr(), 2) };
-        if handle.is_null() {
-            Err(format!("cannot load {}", path.to_string_lossy()))
-        } else {
-            Ok(Self { handle })
-        }
-    }
-    pub(crate) unsafe fn function<T: Copy>(&self, name: &str) -> Result<T, String> {
-        let name = CString::new(name).map_err(|_| "symbol contains NUL".to_string())?;
-        let symbol = dlsym(self.handle, name.as_ptr());
-        if symbol.is_null() {
-            return Err(format!("missing OpenSSL symbol {}", name.to_string_lossy()));
-        }
-        Ok(std::mem::transmute_copy(&symbol))
-    }
-}
-impl Drop for Library {
-    fn drop(&mut self) {
-        unsafe {
-            dlclose(self.handle);
-        }
-    }
-}
-
-extern "C" {
-    fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
 }
 
 #[cfg(test)]
