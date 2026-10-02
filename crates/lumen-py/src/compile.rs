@@ -5,7 +5,7 @@ use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::*;
 use crate::object::*;
 use crate::symtable::{self, mangle, type_params_key, AnnKind, Sc, SymTable};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -74,6 +74,8 @@ struct Unit<'a> {
     private: Option<Rc<str>>,
     is_async: bool,
     is_gen: bool,
+    /// Class units: the `self.X` attributes assigned in nested functions (`__static_attributes__`).
+    static_attrs: BTreeSet<Rc<str>>,
 }
 
 struct Compiler<'a> {
@@ -279,6 +281,7 @@ impl<'a> Compiler<'a> {
             private,
             is_async,
             is_gen,
+            static_attrs: BTreeSet::new(),
         });
     }
 
@@ -1053,11 +1056,22 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// Records `self.<attr> = ...` in the nearest enclosing class for `__static_attributes__`.
+    fn note_static_attr(&mut self, value: &Expr, attr: &Rc<str>) {
+        if !matches!(&value.kind, ExprKind::Name { id, .. } if &**id == "self") {
+            return;
+        }
+        if let Some(u) = self.units.iter_mut().rev().find(|u| u.kind == UnitKind::Class) {
+            u.static_attrs.insert(attr.clone());
+        }
+    }
+
     fn store_target(&mut self, t: &'a Expr) -> CResult<()> {
         self.u().line = t.pos.line;
         match &t.kind {
             ExprKind::Name { id, .. } => self.name_store(id),
             ExprKind::Attribute { value, attr, .. } => {
+                self.note_static_attr(value, attr);
                 self.expr(value)?;
                 let ai = self.attr_idx(attr);
                 self.emit(Op::StoreAttr(ai));
@@ -1346,6 +1360,9 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::FormatValue(conv, format_spec.is_some()));
             }
             ExprKind::Attribute { value, attr, ctx } => {
+                if *ctx == Ctx::Store {
+                    self.note_static_attr(value, attr);
+                }
                 self.expr(value)?;
                 let ai = self.attr_idx(attr);
                 self.u().line = e.pos.line;
@@ -1676,8 +1693,9 @@ impl<'a> Compiler<'a> {
             self.expr(d)?;
         }
         let key = f as *const FunctionDef as usize;
+        let first_line = f.decorators.first().map_or(line, |d| d.pos.line);
         if f.type_params.is_empty() {
-            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, None, line)?;
+            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, None, first_line)?;
         } else {
             let flags = self.function_defaults(&f.args)?;
             let names: Vec<&str> = [(MF_DEFAULTS, ".defaults"), (MF_KWDEFAULTS, ".kwdefaults")]
@@ -1690,7 +1708,7 @@ impl<'a> Compiler<'a> {
                 let vi = self.u().var_idx[*n];
                 self.emit(Op::LoadFast(vi));
             }
-            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, Some(flags), line)?;
+            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, Some(flags), first_line)?;
             self.emit(Op::Swap(2));
             self.emit(Op::CallIntrinsic2(INTRINSIC2_SET_FUNCTION_TYPE_PARAMS));
             let args: Vec<Arg> = names.iter().map(|n| Arg { pos: Pos::default(), arg: (*n).into(), annotation: None }).collect();
@@ -1918,6 +1936,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn class_def(&mut self, c: &'a ClassDef, line: u32) -> CResult<()> {
+        let first_line = c.decorators.first().map_or(line, |d| d.pos.line);
         for d in &c.decorators {
             self.expr(d)?;
         }
@@ -1939,6 +1958,9 @@ impl<'a> Compiler<'a> {
         self.load_const(Value::str(&qual));
         let qi = self.name_idx("__qualname__");
         self.emit(Op::StoreName(qi));
+        self.load_const(Value::Int(first_line as i64));
+        let fi = self.name_idx("__firstlineno__");
+        self.emit(Op::StoreName(fi));
         if let Some(d) = docstring(&c.body) {
             self.load_const(Value::str(&d));
             let di = self.name_idx("__doc__");
@@ -1959,6 +1981,10 @@ impl<'a> Compiler<'a> {
             self.emit(Op::SetupAnnotations);
         }
         self.stmts(&c.body)?;
+        let attrs: Vec<Value> = self.u().static_attrs.iter().map(|a| Value::str(a)).collect();
+        self.load_const(Value::tuple(attrs));
+        let si = self.name_idx("__static_attributes__");
+        self.emit(Op::StoreName(si));
         let has_cell = self.st.scopes[sid].has_class_cell;
         if has_cell {
             let ci = self.u().cell_idx["__class__"];
@@ -1974,7 +2000,7 @@ impl<'a> Compiler<'a> {
         }
         self.load_const(Value::None);
         self.emit(Op::ReturnValue);
-        let code = self.pop_unit(&Arguments::default(), line);
+        let code = self.pop_unit(&Arguments::default(), first_line);
         self.emit_closure_function(code, 0)?;
         self.load_const(Value::str(&c.name));
         if generic {

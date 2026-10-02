@@ -1,1 +1,2 @@
 # Corpus scripts that are known to fail: `path  # reason`, one per line.
+stdlib/typing_features.py  # vendored typing.py is still 3.12: its _SPECIAL_NAMES lack __static_attributes__/__firstlineno__ (3.13), so Protocol issubclass rejects them; fixed by the 3.14 stdlib
