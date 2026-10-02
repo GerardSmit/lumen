@@ -75,12 +75,12 @@ fn parse_rules(text: &str, out: &mut Vec<String>) {
 
 type Significant = Vec<(Tok, String, (u32, u32), (u32, u32))>;
 
-fn significant(src: &str) -> Option<Significant> {
+fn significant(src: &str) -> Result<Significant, String> {
     let (toks, err) = lexer::tokenize_extra(src);
-    if err.is_some() {
-        return None;
+    if let Some(e) = err {
+        return Err(format!("lexer error: {e:?}"));
     }
-    Some(
+    Ok(
         toks.into_iter()
             .filter(|t| !matches!(t.tok, Tok::Comment | Tok::Nl))
             .map(|t| match t.tok {
@@ -91,11 +91,11 @@ fn significant(src: &str) -> Option<Significant> {
     )
 }
 
-/// `src` without comments. Newlines stay, so every other token keeps its line; `None` when the
-/// source cannot be stripped provably safely (the caller embeds it unchanged).
-fn strip_comments(src: &str) -> Option<String> {
+/// `src` without comments. Newlines stay, so every other token keeps its line; `Err` (with the
+/// reason) when the source cannot be stripped provably safely (the caller embeds it unchanged).
+fn strip_comments(src: &str) -> Result<String, String> {
     if src.contains(['\r', '\0', '\u{feff}']) {
-        return None;
+        return Err("contains CR, NUL or BOM".into());
     }
     let before = significant(src)?;
     let (toks, _) = lexer::tokenize_extra(src);
@@ -103,25 +103,31 @@ fn strip_comments(src: &str) -> Option<String> {
     for t in &toks {
         if t.tok == Tok::Comment {
             if !t.text.starts_with('#') || t.text.contains('\n') {
-                return None;
+                return Err(format!("odd comment token {:?} at {:?}", t.text, t.start));
             }
             comments.push((t.start.0, t.start.1, t.text.len()));
         }
     }
     let mut lines: Vec<String> = src.split('\n').map(str::to_string).collect();
     for &(line, col, len) in comments.iter().rev() {
-        let l = lines.get_mut(line as usize - 1)?;
-        let start = l.char_indices().nth(col as usize).map(|(i, _)| i)?;
+        let l = lines.get_mut(line as usize - 1).ok_or("comment line out of range")?;
+        let start = l.char_indices().nth(col as usize).map(|(i, _)| i).ok_or("comment column out of range")?;
         let end = start + len;
-        if l.get(start..end)?.as_bytes()[0] != b'#' {
-            return None;
+        if l.get(start..end).ok_or("comment span off char boundary")?.as_bytes()[0] != b'#' {
+            return Err(format!("comment position mismatch at {line}:{col}"));
         }
         let head = l[..start].trim_end_matches([' ', '\t']).to_string();
         let tail = l[end..].to_string();
         *l = head + &tail;
     }
     let out = lines.join("\n");
-    (significant(&out)? == before && out.matches('\n').count() == src.matches('\n').count()).then_some(out)
+    if out.matches('\n').count() != src.matches('\n').count() {
+        return Err("line count changed".into());
+    }
+    if significant(&out)? != before {
+        return Err("token stream changed".into());
+    }
+    Ok(out)
 }
 
 fn main() {
@@ -161,6 +167,8 @@ fn main() {
     let mut blob: Vec<u8> = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
     let mut raw_total = 0usize;
+    let mut stripped_total = 0usize;
+    let mut unchanged = Vec::new();
     let mut unstripped = Vec::new();
 
     let flush = |cur: &mut Vec<u8>, blob: &mut Vec<u8>, chunks: &mut Vec<(u32, u32, u32)>| {
@@ -177,14 +185,19 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         raw_total += src.len();
+        let src_len = src.len();
         let body = if keep_comments {
             src
         } else {
-            strip_comments(&src).unwrap_or_else(|| {
-                unstripped.push(rel.clone());
+            strip_comments(&src).unwrap_or_else(|why| {
+                unstripped.push(format!("{rel} ({why})"));
                 src
             })
         };
+        stripped_total += body.len();
+        if body.len() == src_len {
+            unchanged.push(rel.clone());
+        }
         if !cur.is_empty() && cur.len() + body.len() > CHUNK_TARGET {
             flush(&mut cur, &mut blob, &mut chunks);
         }
@@ -196,7 +209,15 @@ fn main() {
     if !unstripped.is_empty() {
         println!("cargo:warning=lumen-py: {} stdlib modules embedded with comments: {}", unstripped.len(), unstripped.join(", "));
     }
-    println!("cargo:warning=lumen-py stdlib: {} files, {} source bytes, {} embedded bytes", files.len(), raw_total, blob.len());
+    println!(
+        "cargo:warning=lumen-py stdlib: {} files, {} source bytes, {} after stripping, {} embedded bytes; {} unchanged: {}",
+        files.len(),
+        raw_total,
+        stripped_total,
+        blob.len(),
+        unchanged.len(),
+        unchanged.join(", ")
+    );
 
     std::fs::write(out_dir.join("stdlib.br"), &blob).expect("write stdlib blob");
     writeln!(generated, "pub static BLOB: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/stdlib.br\"));").unwrap();
