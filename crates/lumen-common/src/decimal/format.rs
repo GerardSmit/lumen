@@ -56,123 +56,39 @@ pub struct FormatSpec {
     pub locale: bool,
 }
 
-struct Rest {
-    sign: Option<char>,
-    no_neg_0: bool,
-    alt: bool,
-    zeropad: bool,
-    min_width: Option<usize>,
-    thousands: bool,
-    precision: Option<usize>,
-    ty: Option<char>,
-}
-
-fn parse_number(s: &[char], mut i: usize, allow_leading_zero: bool) -> Result<Option<(usize, usize)>, FormatError> {
-    let start = i;
-    while i < s.len() && s[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start || (!allow_leading_zero && s[start] == '0') {
-        return Ok(None);
-    }
-    let mut v: usize = 0;
-    for c in &s[start..i] {
-        v = v.checked_mul(10).and_then(|v| v.checked_add(c.to_digit(10).unwrap_or(0) as usize)).ok_or(FormatError::Overflow)?;
-    }
-    Ok(Some((v, i)))
-}
-
-fn parse_rest(s: &[char]) -> Result<Option<Rest>, FormatError> {
-    let mut i = 0;
-    let mut r = Rest { sign: None, no_neg_0: false, alt: false, zeropad: false, min_width: None, thousands: false, precision: None, ty: None };
-    if i < s.len() && matches!(s[i], '-' | '+' | ' ') {
-        r.sign = Some(s[i]);
-        i += 1;
-    }
-    if i < s.len() && s[i] == 'z' {
-        r.no_neg_0 = true;
-        i += 1;
-    }
-    if i < s.len() && s[i] == '#' {
-        r.alt = true;
-        i += 1;
-    }
-    if i < s.len() && s[i] == '0' {
-        r.zeropad = true;
-        i += 1;
-    }
-    if let Some((w, j)) = parse_number(s, i, false)? {
-        r.min_width = Some(w);
-        i = j;
-    }
-    if i < s.len() && s[i] == ',' {
-        r.thousands = true;
-        i += 1;
-    }
-    if i < s.len() && s[i] == '.' {
-        let p = i + 1;
-        let mut j = p;
-        while j < s.len() && s[j].is_ascii_digit() {
-            j += 1;
-        }
-        let digits = &s[p..j];
-        if digits.is_empty() || (digits[0] == '0' && digits.len() > 1) {
-            return Ok(None);
-        }
-        // A precision too large for an index is clamped: it cannot add digits anyway.
-        let value = digits.iter().try_fold(0usize, |v, c| v.checked_mul(10)?.checked_add(c.to_digit(10)? as usize));
-        r.precision = Some(value.unwrap_or(usize::MAX / 4));
-        i = j;
-    }
-    if i < s.len() && matches!(s[i], 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
-        r.ty = Some(s[i]);
-        i += 1;
-    }
-    Ok(if i == s.len() { Some(r) } else { None })
-}
-
-/// Parses a format specifier.
+/// Parses a format specifier: the shared mini-language ([`crate::fmtspec`]) restricted to what
+/// `Decimal` supports.
 pub fn parse_format_spec(text: &str) -> Result<FormatSpec, FormatError> {
-    let s: Vec<char> = text.chars().collect();
-    let is_align = |c: char| matches!(c, '<' | '>' | '=' | '^');
-    let mut attempts: Vec<(Option<char>, Option<char>, usize)> = Vec::new();
-    if s.len() >= 2 && is_align(s[1]) {
-        attempts.push((Some(s[0]), Some(s[1]), 2));
-    }
-    if !s.is_empty() && is_align(s[0]) {
-        attempts.push((None, Some(s[0]), 1));
-    }
-    attempts.push((None, None, 0));
-    let mut found = None;
-    for (fill, align, skip) in attempts {
-        if let Some(rest) = parse_rest(&s[skip..])? {
-            found = Some((fill, align, rest));
-            break;
-        }
-    }
-    let Some((fill, align, rest)) = found else { return Err(FormatError::Invalid) };
-    if rest.zeropad && (fill.is_some() || align.is_some()) {
+    use crate::fmtspec::{parse_decimal, SpecError};
+    let spec = parse_decimal(text).map_err(|e| match e {
+        SpecError::TooManyDigits => FormatError::Overflow,
+        _ => FormatError::Invalid,
+    })?;
+    if spec.grouping == Some('_') || spec.ty.is_some_and(|t| !matches!(t, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%')) {
         return Err(FormatError::Invalid);
     }
-    let locale = rest.ty == Some('n');
-    if locale && rest.thousands {
+    if spec.zero && (spec.fill.is_some() || spec.align.is_some()) {
         return Err(FormatError::Invalid);
     }
-    let mut precision = rest.precision;
-    if precision == Some(0) && matches!(rest.ty, None | Some('g') | Some('G') | Some('n')) {
+    let locale = spec.ty == Some('n');
+    if locale && spec.grouping.is_some() {
+        return Err(FormatError::Invalid);
+    }
+    let mut precision = spec.precision;
+    if precision == Some(0) && matches!(spec.ty, None | Some('g') | Some('G') | Some('n')) {
         precision = Some(1);
     }
     Ok(FormatSpec {
-        fill: fill.unwrap_or(' '),
-        align: align.unwrap_or('>'),
-        sign: rest.sign.unwrap_or('-'),
-        no_neg_0: rest.no_neg_0,
-        alt: rest.alt,
-        zeropad: rest.zeropad,
-        min_width: rest.min_width.unwrap_or(0),
-        thousands: rest.thousands,
+        fill: spec.fill.map_or(' ', |c| char::from_u32(c).unwrap_or('\u{FFFD}')),
+        align: spec.align.unwrap_or('>'),
+        sign: spec.sign.unwrap_or('-'),
+        no_neg_0: spec.z,
+        alt: spec.alt,
+        zeropad: spec.zero,
+        min_width: spec.width.unwrap_or(0),
+        thousands: spec.grouping.is_some(),
         precision,
-        ty: if locale { Some('g') } else { rest.ty },
+        ty: if locale { Some('g') } else { spec.ty },
         locale,
     })
 }

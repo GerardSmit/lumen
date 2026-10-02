@@ -17,6 +17,7 @@ pub mod compress;
 pub mod fastalloc;
 pub mod fasthash;
 pub mod float;
+pub mod fmtspec;
 pub mod float16;
 #[cfg(feature = "crypt")]
 pub mod crypt;
