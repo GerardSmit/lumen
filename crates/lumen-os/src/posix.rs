@@ -223,7 +223,14 @@ pub fn minor(device: u64) -> u32 {
 pub fn makedev(major: u32, minor: u32) -> u64 {
     #[cfg(unix)]
     {
-        libc::makedev(major as _, minor as _) as u64
+        #[cfg(target_vendor = "apple")]
+        {
+            libc::makedev(major as _, minor as _) as u32 as u64
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            libc::makedev(major as _, minor as _) as u64
+        }
     }
     #[cfg(not(unix))]
     {
@@ -323,6 +330,14 @@ pub fn statvfs_flags() -> Vec<(&'static str, i64)> {
     v
 }
 
+#[cfg(unix)]
+fn sched_param(priority: i32) -> libc::sched_param {
+    // SAFETY: sched_param is plain integers (some libcs add private padding).
+    let mut p: libc::sched_param = unsafe { std::mem::zeroed() };
+    p.sched_priority = priority;
+    p
+}
+
 // ---- credentials --------------------------------------------------------------------------------
 
 macro_rules! id_setter {
@@ -403,24 +418,6 @@ linux! {
         // SAFETY: three valid out-parameters.
         ck_unit(unsafe { libc::getresgid(&mut r, &mut e, &mut s) })?;
         Ok([r, e, s])
-    }
-}
-
-sys! {
-    /// `setgroups(2)`.
-    pub fn setgroups(groups: &[u32]) -> R<()> {
-        let list: Vec<libc::gid_t> = groups.iter().map(|&g| g as libc::gid_t).collect();
-        // SAFETY: `list` is a live array of `list.len()` group ids.
-        ck_unit(unsafe { libc::setgroups(list.len() as _, list.as_ptr()) })
-    }
-}
-
-sys! {
-    /// `initgroups(3)`.
-    pub fn initgroups(user: &str, gid: u32) -> R<()> {
-        let u = cstr(user)?;
-        // SAFETY: `u` is a valid NUL-terminated string.
-        ck_unit(unsafe { libc::initgroups(u.as_ptr(), gid as _) })
     }
 }
 
@@ -750,7 +747,7 @@ linux! {
 linux! {
     /// `sched_setscheduler(2)`.
     pub fn sched_setscheduler(pid: i32, policy: i32, priority: i32) -> R<()> {
-        let p = libc::sched_param { sched_priority: priority };
+        let p = sched_param(priority);
         // SAFETY: `p` is a live sched_param.
         ck_unit(unsafe { libc::sched_setscheduler(pid, policy, &p) })
     }
@@ -759,7 +756,7 @@ linux! {
 linux! {
     /// `sched_getparam(2)`: the priority.
     pub fn sched_getparam(pid: i32) -> R<i32> {
-        let mut p = libc::sched_param { sched_priority: 0 };
+        let mut p = sched_param(0);
         // SAFETY: `p` is a live out-parameter.
         ck_unit(unsafe { libc::sched_getparam(pid, &mut p) })?;
         Ok(p.sched_priority)
@@ -769,7 +766,7 @@ linux! {
 linux! {
     /// `sched_setparam(2)`.
     pub fn sched_setparam(pid: i32, priority: i32) -> R<()> {
-        let p = libc::sched_param { sched_priority: priority };
+        let p = sched_param(priority);
         // SAFETY: `p` is a live sched_param.
         ck_unit(unsafe { libc::sched_setparam(pid, &p) })
     }
@@ -1327,8 +1324,10 @@ mod spawn_imp {
 
     #[cfg(target_vendor = "apple")]
     const SETSID: i32 = 0x400;
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     const SETSID: i32 = libc::POSIX_SPAWN_SETSID as i32;
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    const SETSID: i32 = 0;
 
     pub fn run(
         path: &[u8],
@@ -1405,7 +1404,7 @@ mod spawn_imp {
                     code(libc::posix_spawnattr_setschedpolicy(&mut at.0, p))?;
                     all |= libc::POSIX_SPAWN_SETSCHEDULER;
                 }
-                let param = libc::sched_param { sched_priority: priority };
+                let param = super::sched_param(priority);
                 code(libc::posix_spawnattr_setschedparam(&mut at.0, &param))?;
                 all |= libc::POSIX_SPAWN_SETSCHEDPARAM;
             }

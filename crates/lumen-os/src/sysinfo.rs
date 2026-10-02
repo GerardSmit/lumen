@@ -281,16 +281,7 @@ fn meminfo<const N: usize>(fields: &[&str; N]) -> [u64; N] {
 pub fn get_priority(pid: i32) -> R<i32> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        // getpriority legitimately returns -1, so errno is cleared first and consulted after.
-        // SAFETY: the errno cell is this thread's; getpriority takes plain integers.
-        unsafe {
-            *errno_location() = 0;
-            let rc = libc::getpriority(libc::PRIO_PROCESS as _, pid as libc::id_t);
-            if rc == -1 && *errno_location() != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(rc)
-        }
+        crate::posix::getpriority(libc::PRIO_PROCESS as i32, pid as u32)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
