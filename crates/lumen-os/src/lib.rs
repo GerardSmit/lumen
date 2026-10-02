@@ -5,6 +5,9 @@ pub mod consts;
 pub mod errno;
 pub mod fdctl;
 pub mod fs;
+pub mod ident;
 pub mod proc;
+pub mod sysinfo;
+pub mod uv;
 
 pub use errno::FsError;

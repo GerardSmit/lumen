@@ -11,8 +11,7 @@ use super::*;
 const MAX_FDS: usize = 16;
 
 fn set_cloexec(fd: RawFd) {
-    // SAFETY: fcntl on a descriptor this process owns.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = lumen_os::fdctl::set_inheritable(fd, false);
 }
 
 fn sockopt_int(fd: RawFd, level: libc::c_int, name: libc::c_int) -> std::io::Result<libc::c_int> {

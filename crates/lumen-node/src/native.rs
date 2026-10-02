@@ -341,23 +341,8 @@ fn is_fallback_module(name: &str) -> bool {
 
 /// The (code, description) Node prints for an I/O error.
 fn io_code(e: &std::io::Error) -> (&'static str, &'static str) {
-    use std::io::ErrorKind as K;
-    match e.kind() {
-        K::NotFound => ("ENOENT", "no such file or directory"),
-        K::PermissionDenied => ("EACCES", "permission denied"),
-        K::AlreadyExists => ("EEXIST", "file already exists"),
-        K::IsADirectory => ("EISDIR", "illegal operation on a directory"),
-        K::NotADirectory => ("ENOTDIR", "not a directory"),
-        K::InvalidInput => ("EINVAL", "invalid argument"),
-        _ => match e.raw_os_error() {
-            Some(20) if cfg!(unix) => ("ENOTDIR", "not a directory"),
-            Some(21) if cfg!(unix) => ("EISDIR", "illegal operation on a directory"),
-            Some(5) if cfg!(windows) => ("EPERM", "operation not permitted"),
-            Some(32) if cfg!(windows) => ("EBUSY", "resource busy or locked"),
-            Some(123) if cfg!(windows) => ("ENOENT", "no such file or directory"),
-            _ => ("EIO", "i/o error"),
-        },
-    }
+    let code = lumen_os::errno::uv_code(e);
+    (code, lumen_os::uv::message(code).unwrap_or("unknown error"))
 }
 
 /// JS rebuilds the error with `syscall` and `path` (fsError) from `code` + message.

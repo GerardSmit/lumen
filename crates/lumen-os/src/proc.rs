@@ -198,7 +198,7 @@ pub fn free_memory() -> f64 {
 }
 
 #[cfg(target_os = "macos")]
-fn sysctl<T: Default>(name: &str) -> Option<T> {
+pub(crate) fn sysctl<T: Default>(name: &str) -> Option<T> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut value = T::default();
     let mut len = std::mem::size_of::<T>();
@@ -207,6 +207,16 @@ fn sysctl<T: Default>(name: &str) -> Option<T> {
         libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
     };
     (rc == 0).then_some(value)
+}
+
+/// A `sysctlbyname` value of up to `buf.len()` bytes; the length written.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_bytes(name: &str, buf: &mut [u8]) -> Option<usize> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut len = buf.len();
+    // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
+    let rc = unsafe { libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    (rc == 0).then_some(len)
 }
 
 pub fn cpu_count() -> usize {

@@ -253,6 +253,13 @@ pub fn uv_code(e: &io::Error) -> &'static str {
         K::WouldBlock => "EAGAIN",
         K::Unsupported => "ENOSYS",
         K::OutOfMemory => "ENOMEM",
+        K::ConnectionRefused => "ECONNREFUSED",
+        K::ConnectionReset => "ECONNRESET",
+        K::ConnectionAborted => "ECONNABORTED",
+        K::NotConnected => "ENOTCONN",
+        K::AddrInUse => "EADDRINUSE",
+        K::AddrNotAvailable => "EADDRNOTAVAIL",
+        K::TimedOut => "ETIMEDOUT",
         _ => "EIO",
     }
 }
@@ -305,6 +312,19 @@ fn os_code(n: i32) -> Option<&'static str> {
         1921 => "ELOOP",
         4390 => "EINVAL", // NOT_A_REPARSE_POINT
         4393 => "EINVAL", // INVALID_REPARSE_DATA
+        10022 => "EINVAL", // WSAEINVAL
+        10038 => "ENOTSOCK",
+        10040 => "EMSGSIZE",
+        10047 => "EAFNOSUPPORT",
+        10048 => "EADDRINUSE",
+        10049 => "EADDRNOTAVAIL",
+        10051 => "ENETUNREACH",
+        10053 => "ECONNABORTED",
+        10054 => "ECONNRESET",
+        10057 => "ENOTCONN",
+        10060 => "ETIMEDOUT",
+        10061 => "ECONNREFUSED",
+        10065 => "EHOSTUNREACH",
         _ => return None,
     })
 }

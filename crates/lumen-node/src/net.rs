@@ -350,67 +350,11 @@ struct NetErr {
     errno: Option<i32>,
 }
 
+/// libuv's name for a socket error; `UNKNOWN` for one that carries no OS error of its own.
 fn io_code(e: &std::io::Error) -> &'static str {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        ConnectionRefused => "ECONNREFUSED",
-        ConnectionReset => "ECONNRESET",
-        ConnectionAborted => "ECONNABORTED",
-        NotConnected => "ENOTCONN",
-        AddrInUse => "EADDRINUSE",
-        AddrNotAvailable => "EADDRNOTAVAIL",
-        BrokenPipe => "EPIPE",
-        TimedOut => "ETIMEDOUT",
-        PermissionDenied => "EACCES",
-        NotFound => "ENOENT",
-        _ => errno_name(e.raw_os_error()).unwrap_or("UNKNOWN"),
-    }
-}
-
-#[cfg(unix)]
-fn errno_name(raw: Option<i32>) -> Option<&'static str> {
-    use libc::*;
-    let raw = raw?;
-    Some(match raw {
-        EPIPE => "EPIPE",
-        ECONNRESET => "ECONNRESET",
-        EINVAL => "EINVAL",
-        EAFNOSUPPORT => "EAFNOSUPPORT",
-        EMSGSIZE => "EMSGSIZE",
-        ENOBUFS => "ENOBUFS",
-        ENOTSOCK => "ENOTSOCK",
-        ENETUNREACH => "ENETUNREACH",
-        EHOSTUNREACH => "EHOSTUNREACH",
-        EISCONN => "EISCONN",
-        EDESTADDRREQ => "EDESTADDRREQ",
-        EBADF => "EBADF",
-        ENOPROTOOPT => "ENOPROTOOPT",
-        EPROTONOSUPPORT => "EPROTONOSUPPORT",
-        ENODEV => "ENODEV",
-        ENOMEM => "ENOMEM",
-        EMFILE => "EMFILE",
-        EPERM => "EPERM",
-        EAGAIN => "EAGAIN",
-        EADDRINUSE => "EADDRINUSE",
-        EADDRNOTAVAIL => "EADDRNOTAVAIL",
-        ENOTCONN => "ENOTCONN",
-        ECONNREFUSED => "ECONNREFUSED",
-        ENOENT => "ENOENT",
-        EACCES => "EACCES",
-        ENOTDIR => "ENOTDIR",
-        ENAMETOOLONG => "ENAMETOOLONG",
-        _ => return None,
-    })
-}
-
-#[cfg(not(unix))]
-fn errno_name(raw: Option<i32>) -> Option<&'static str> {
-    match raw? {
-        10040 => Some("EMSGSIZE"),
-        10022 => Some("EINVAL"),
-        10047 => Some("EAFNOSUPPORT"),
-        10038 => Some("ENOTSOCK"),
-        _ => None,
+    match lumen_os::errno::uv_code(e) {
+        "EIO" if e.raw_os_error().is_none() => "UNKNOWN",
+        code => code,
     }
 }
 
@@ -682,8 +626,7 @@ fn connect_tcp_from(
     }
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = lumen_os::fdctl::set_inheritable(fd, false);
     let ip = local_ip.unwrap_or(if addr.is_ipv6() {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     } else {
@@ -1304,8 +1247,7 @@ fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Resul
     }
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = lumen_os::fdctl::set_inheritable(fd, false);
     let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
         // SAFETY: `on` is a live c_int of the size passed.
         let rc = unsafe {
@@ -1824,8 +1766,7 @@ fn bind_udp(addr: SocketAddr, flags: u32) -> std::io::Result<UdpSocket> {
     }
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = lumen_os::fdctl::set_inheritable(fd, false);
     let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
         // SAFETY: `on` is a live c_int of the size passed.
         let rc = unsafe {

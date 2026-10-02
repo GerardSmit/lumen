@@ -90,6 +90,18 @@ pub fn signal_number(name: &str) -> Option<i32> {
     }
 }
 
+/// Every signal of this platform as `(name, number)`, in the order Node's `os.constants.signals`
+/// lists them (aliases such as `SIGIOT` included).
+pub fn signals() -> impl Iterator<Item = (&'static str, i32)> {
+    const NAMES: &[&str] = &[
+        "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGIOT", "SIGBUS", "SIGFPE", "SIGKILL",
+        "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGCHLD", "SIGSTKFLT", "SIGCONT",
+        "SIGSTOP", "SIGTSTP", "SIGBREAK", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ", "SIGVTALRM",
+        "SIGPROF", "SIGWINCH", "SIGIO", "SIGPOLL", "SIGPWR", "SIGINFO", "SIGSYS",
+    ];
+    NAMES.iter().filter_map(|&name| signal_number(name).map(|n| (name, n)))
+}
+
 static SYSEXITS: &[(&str, i64)] = &[
     ("EX_OK", 0),
     ("EX_USAGE", 64),

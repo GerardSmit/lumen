@@ -1533,11 +1533,12 @@ __lazyGlue(__glueIndex, "stream/consumers", "", "", () => {
       let table;
       const signals = () => {
         if (table === undefined) {
-          const linux = process.platform !== "darwin";
-          const numbers = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGALRM: 14, SIGTERM: 15, SIGWINCH: 28,
-            SIGUSR1: linux ? 10 : 30, SIGUSR2: linux ? 12 : 31, SIGCONT: linux ? 18 : 19 };
+          const numbers = {};
           const names = {};
-          for (const [name, number] of Object.entries(numbers)) names[number] = name;
+          for (const [name, number] of __oscon.signals()) {
+            numbers[name] = number;
+            names[number] ??= name;
+          }
           table = { numbers, names };
         }
         return table;
