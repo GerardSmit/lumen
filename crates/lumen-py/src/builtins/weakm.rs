@@ -1,13 +1,15 @@
 //! `_weakref`: `ref`, `proxy` and friends, backed by `Rc::downgrade`.
 
-use super::native::*;
+use super::native::with_opaque;
 use crate::ast::{BinOp, CmpOp};
+use crate::bind::{opaque_instance, type_object, KwArgs, Py, This};
+use crate::bytecode::UnOp;
 use crate::object::*;
 use crate::vm::*;
 use crate::weak::{self, ProxyData, WeakRefData};
 use std::rc::Rc;
 
-fn weak_target(it: &mut Interp, v: &Value, what: &str) -> R<Obj> {
+fn weak_target(it: &mut Interp, v: &Value) -> R<Obj> {
     let ok = match v {
         Value::Obj(o) => match &o.kind {
             Kind::Str(_) | Kind::Int(_) | Kind::Float(_) | Kind::Complex(..) | Kind::Tuple(_) | Kind::List(_) | Kind::Dict(_) | Kind::Bytes(_) | Kind::ByteArray(_) => o.cls.is_some(),
@@ -20,332 +22,649 @@ fn weak_target(it: &mut Interp, v: &Value, what: &str) -> R<Obj> {
         Value::Obj(o) if ok => Ok(o.clone()),
         _ => {
             let t = it.type_name_of(v);
-            Err(it.type_error(&format!("cannot create weak reference to '{}' object{}", t, what)))
+            Err(it.type_error(&format!("cannot create weak reference to '{}' object", t)))
         }
     }
-}
-
-fn ref_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("__new__", &a[1.min(a.len())..], kw, &["object", "callback"], 1)?;
-    let cls = match &a[0] {
-        Value::Obj(c) => c.clone(),
-        _ => return Err(it.type_error("ref.__new__(X): X is not a type object")),
-    };
-    let target = weak_target(it, b[0].as_ref().unwrap(), "")?;
-    let callback = b[1].clone().unwrap_or(Value::None);
-    let exact = Rc::ptr_eq(&cls, &it.weak_types()[0]);
-    if exact && callback.is_none() {
-        for r in weak::live_refs(&target) {
-            let reusable = matches!(&r.cls, Some(c) if Rc::ptr_eq(c, &cls)) && with_opaque::<WeakRefData, bool>(&Value::Obj(r.clone()), |d| d.callback.is_none()).unwrap_or(false);
-            if reusable {
-                return Ok(Value::Obj(r));
-            }
-        }
-    }
-    let data = WeakRefData { target: Rc::downgrade(&target), callback, hash: None };
-    let v = new_opaque(&cls, data);
-    if let Value::Obj(o) = &v {
-        weak::register(&target, o);
-    }
-    Ok(v)
-}
-
-fn ref_init(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::None)
 }
 
 fn referent(v: &Value) -> Option<Option<Obj>> {
     with_opaque::<WeakRefData, _>(v, |d| d.target.upgrade())
 }
 
-fn ref_call(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("weakref", kw)?;
-    it.check_args("weakref", &a[1.min(a.len())..], 0, 0)?;
-    match referent(&a[0]) {
-        Some(Some(o)) => Ok(Value::Obj(o)),
-        Some(None) => Ok(Value::None),
-        None => Err(it.self_state_err("weakref")),
+fn arity(it: &mut Interp, name: &str, given: usize, min: usize, max: usize) -> R<()> {
+    if given < min {
+        let s = if min == 1 { "" } else { "s" };
+        return Err(it.type_error(&format!("{} expected at least {} argument{}, got {}", name, min, s, given)));
     }
+    if given > max {
+        let s = if max == 1 { "" } else { "s" };
+        return Err(it.type_error(&format!("{} expected at most {} argument{}, got {}", name, max, s, given)));
+    }
+    Ok(())
 }
 
-fn ref_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    if let Some(Some(h)) = with_opaque::<WeakRefData, _>(&a[0], |d| d.hash) {
-        return Ok(Value::Int(h));
-    }
-    match referent(&a[0]) {
-        Some(Some(o)) => {
-            let h = it.hash_value(&Value::Obj(o))?;
-            with_opaque::<WeakRefData, _>(&a[0], |d| d.hash = Some(h));
-            Ok(Value::Int(h))
+#[lumen_bind::methods]
+impl WeakRefData {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        let _ = kwargs;
+        arity(it, "__new__", args.len(), 1, 2)?;
+        let Value::Obj(cls) = &*cls else { return Err(it.type_error("ref.__new__(X): X is not a type object")) };
+        let target = weak_target(it, &args[0])?;
+        let callback = args.get(1).cloned().unwrap_or(Value::None);
+        if callback.is_none() && Rc::ptr_eq(cls, &type_object::<WeakRefData>(it)) {
+            for r in weak::live_refs(&target) {
+                let reusable = matches!(&r.cls, Some(c) if Rc::ptr_eq(c, cls)) && with_opaque::<WeakRefData, bool>(&Value::Obj(r.clone()), |d| d.callback.is_none()).unwrap_or(false);
+                if reusable {
+                    return Ok(Value::Obj(r));
+                }
+            }
         }
-        _ => Err(it.type_error("weak object has gone away")),
+        let v = opaque_instance(cls, WeakRefData { target: Rc::downgrade(&target), callback, hash: None });
+        if let Value::Obj(o) = &v {
+            weak::register(&target, o);
+        }
+        Ok(v)
+    }
+
+    #[proto(init)]
+    fn init(slf: This<&Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        let _ = (slf, kwargs);
+        arity(it, "__init__", args.len(), 1, 2)
+    }
+
+    #[proto(call)]
+    fn call(&self, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        if !kwargs.is_empty() {
+            return Err(it.type_error("weakref() takes no keyword arguments"));
+        }
+        if !args.is_empty() {
+            return Err(it.type_error(&format!("weakref expected 0 arguments, got {}", args.len())));
+        }
+        Ok(self.target.upgrade().map_or(Value::None, Value::Obj))
+    }
+
+    #[proto(hash)]
+    fn hash(slf: This<Py<Self>>, it: &mut Interp) -> R<i64> {
+        let (cached, target) = {
+            let d = slf.0.borrow(it)?;
+            (d.hash, d.target.upgrade())
+        };
+        if let Some(h) = cached {
+            return Ok(h);
+        }
+        let Some(o) = target else { return Err(it.type_error("weak object has gone away")) };
+        let h = it.hash_value(&Value::Obj(o))?;
+        slf.0.borrow_mut(it)?.hash = Some(h);
+        Ok(h)
+    }
+
+    #[proto(eq)]
+    fn eq(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        ref_eq(it, &slf, value, false)
+    }
+
+    #[proto(ne)]
+    fn ne(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        ref_eq(it, &slf, value, true)
+    }
+
+    #[proto(lt)]
+    fn lt(&self, value: &Value) -> Value {
+        let _ = value;
+        Value::NotImplemented
+    }
+
+    #[proto(le)]
+    fn le(&self, value: &Value) -> Value {
+        let _ = value;
+        Value::NotImplemented
+    }
+
+    #[proto(gt)]
+    fn gt(&self, value: &Value) -> Value {
+        let _ = value;
+        Value::NotImplemented
+    }
+
+    #[proto(ge)]
+    fn ge(&self, value: &Value) -> Value {
+        let _ = value;
+        Value::NotImplemented
+    }
+
+    #[proto(repr)]
+    fn repr(slf: This<Py<Self>>, it: &mut Interp) -> String {
+        let id = it.id_of(slf.0.value());
+        match referent(slf.0.value()).flatten() {
+            Some(o) => {
+                let t = it.type_name_of(&Value::Obj(o.clone()));
+                format!("<weakref at {:#x}; to '{}' at {:#x}>", id, t, it.id_of(&Value::Obj(o)))
+            }
+            None => format!("<weakref at {:#x}; dead>", id),
+        }
+    }
+
+    #[getter(name = "__callback__")]
+    fn callback(&self) -> Value {
+        self.callback.clone()
+    }
+
+    /// See PEP 585
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, item: &Value) -> Value {
+        it.make_alias(cls.0, item)
     }
 }
 
-fn ref_eq_impl(it: &mut Interp, a: &[Value], ne: bool) -> R<Value> {
-    let other_is_ref = with_opaque::<WeakRefData, _>(&a[1], |_| ()).is_some();
-    if !other_is_ref {
+fn ref_eq(it: &mut Interp, a: &Value, b: &Value, ne: bool) -> R<Value> {
+    if with_opaque::<WeakRefData, _>(b, |_| ()).is_none() {
         return Ok(Value::NotImplemented);
     }
-    let (x, y) = (referent(&a[0]).flatten(), referent(&a[1]).flatten());
-    let eq = match (x, y) {
+    let eq = match (referent(a).flatten(), referent(b).flatten()) {
         (Some(x), Some(y)) => {
             let r = it.compare_op(CmpOp::Eq, &Value::Obj(x), &Value::Obj(y))?;
             it.truthy(&r)?
         }
-        _ => a[0].is(&a[1]),
+        _ => a.is(b),
     };
     Ok(Value::Bool(eq != ne))
 }
 
-fn ref_eq(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__eq__", a, 2, 2)?;
-    ref_eq_impl(it, a, false)
+fn proxy_target(it: &mut Interp, p: &Py<ProxyData>) -> R<Value> {
+    match p.borrow(it)?.target.upgrade() {
+        Some(o) => Ok(Value::Obj(o)),
+        None => Err(it.new_exc_str("ReferenceError", "weakly-referenced object no longer exists")),
+    }
 }
 
-fn ref_ne(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__ne__", a, 2, 2)?;
-    ref_eq_impl(it, a, true)
-}
-
-fn ref_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let id = it.id_of(&a[0]);
-    Ok(Value::string(match referent(&a[0]) {
-        Some(Some(o)) => {
-            let t = it.type_name_of(&Value::Obj(o.clone()));
-            format!("<weakref at {:#x}; to '{}' at {:#x}>", id, t, it.id_of(&Value::Obj(o)))
-        }
-        _ => format!("<weakref at {:#x}; dead>", id),
-    }))
-}
-
-fn ref_callback(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(with_opaque::<WeakRefData, _>(&a[0], |d| d.callback.clone()).unwrap_or(Value::None))
-}
-
-fn class_getitem(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(a.first().cloned().unwrap_or(Value::None))
-}
-
-fn proxy_target(it: &mut Interp, v: &Value) -> R<Value> {
+fn unproxy(it: &mut Interp, v: &Value) -> R<Value> {
     match with_opaque::<ProxyData, _>(v, |d| d.target.upgrade()) {
         Some(Some(o)) => Ok(Value::Obj(o)),
         Some(None) => Err(it.new_exc_str("ReferenceError", "weakly-referenced object no longer exists")),
-        None => Err(it.self_state_err("weakproxy")),
+        None => Ok(v.clone()),
     }
 }
 
-fn proxy_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let _ = kw;
-    it.check_args("proxy", a, 1, 2)?;
-    let target = weak_target(it, &a[0], "")?;
-    let callback = a.get(1).cloned().unwrap_or(Value::None);
-    let callable = it.is_callable(&a[0]);
-    let cls = if callable { it.weak_types()[2].clone() } else { it.weak_types()[1].clone() };
-    let v = new_opaque(&cls, ProxyData { target: Rc::downgrade(&target), callback });
-    if let Value::Obj(o) = &v {
-        weak::register(&target, o);
-    }
-    Ok(v)
-}
-
-fn proxy_getattribute(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__getattribute__", a, 2, 2)?;
-    let t = proxy_target(it, &a[0])?;
-    match &a[1] {
-        Value::Obj(n) if matches!(n.kind, Kind::Str(_)) => it.get_attr(&t, n),
+fn attr_name<'a>(it: &mut Interp, name: &'a Value) -> R<&'a Obj> {
+    match name {
+        Value::Obj(n) if matches!(n.kind, Kind::Str(_)) => Ok(n),
         _ => Err(it.type_error("attribute name must be string")),
     }
 }
 
-fn proxy_setattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__setattr__", a, 3, 3)?;
-    let t = proxy_target(it, &a[0])?;
-    match &a[1] {
-        Value::Obj(n) if matches!(n.kind, Kind::Str(_)) => it.set_attr(&t, n, a[2].clone())?,
-        _ => return Err(it.type_error("attribute name must be string")),
+fn binop(it: &mut Interp, op: BinOp, a: &Value, b: &Value) -> R<Value> {
+    let (x, y) = (unproxy(it, a)?, unproxy(it, b)?);
+    it.binary_op(op, &x, &y)
+}
+
+fn binop_cmp(it: &mut Interp, op: CmpOp, a: &Value, b: &Value) -> R<Value> {
+    let (x, y) = (unproxy(it, a)?, unproxy(it, b)?);
+    it.compare_op(op, &x, &y)
+}
+
+fn inplace(it: &mut Interp, op: BinOp, slf: &Py<ProxyData>, value: &Value) -> R<Value> {
+    let (x, y) = (proxy_target(it, slf)?, unproxy(it, value)?);
+    it.inplace_op(op, x, &y)
+}
+
+fn call_builtin(it: &mut Interp, name: &str, arg: Value) -> R<Value> {
+    let f = dict_get_str(&it.builtins, name).unwrap_or(Value::None);
+    it.call(&f, vec![arg], Vec::new())
+}
+
+#[lumen_bind::methods]
+impl ProxyData {
+    #[method(name = "__getattribute__", hint(py(text_signature = "")))]
+    fn getattribute(slf: This<Py<Self>>, it: &mut Interp, name: &Value) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        let n = attr_name(it, name)?;
+        it.get_attr(&t, n)
     }
-    Ok(Value::None)
-}
 
-fn proxy_delattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__delattr__", a, 2, 2)?;
-    let t = proxy_target(it, &a[0])?;
-    match &a[1] {
-        Value::Obj(n) if matches!(n.kind, Kind::Str(_)) => it.del_attr(&t, n)?,
-        _ => return Err(it.type_error("attribute name must be string")),
+    #[method(name = "__setattr__", hint(py(text_signature = "")))]
+    fn setattr(slf: This<Py<Self>>, it: &mut Interp, name: &Value, value: &Value) -> R<()> {
+        let t = proxy_target(it, &slf.0)?;
+        let n = attr_name(it, name)?;
+        it.set_attr(&t, n, value.clone())
     }
-    Ok(Value::None)
-}
 
-fn proxy_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let id = it.id_of(&a[0]);
-    Ok(Value::string(match proxy_target(it, &a[0]) {
-        Ok(t) => format!("<weakproxy at {:#x}; to '{}' at {:#x}>", id, it.type_name_of(&t), it.id_of(&t)),
-        Err(_) => format!("<weakproxy at {:#x}; dead>", id),
-    }))
-}
+    #[method(name = "__delattr__", hint(py(text_signature = "")))]
+    fn delattr(slf: This<Py<Self>>, it: &mut Interp, name: &Value) -> R<()> {
+        let t = proxy_target(it, &slf.0)?;
+        let n = attr_name(it, name)?;
+        it.del_attr(&t, n)
+    }
 
-fn proxy_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = proxy_target(it, &a[0])?;
-    it.str_value(&t)
-}
+    #[proto(repr)]
+    fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
+        let id = it.id_of(slf.0.value());
+        let t = slf.0.borrow(it)?.target.upgrade().map_or(Value::None, Value::Obj);
+        Ok(format!("<weakproxy at {:#x} to {} at {:#x}>", id, it.type_name_of(&t), it.id_of(&t)))
+    }
 
-fn proxy_bool(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = proxy_target(it, &a[0])?;
-    Ok(Value::Bool(it.truthy(&t)?))
-}
+    #[proto(str)]
+    fn str(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        it.str_value(&t)
+    }
 
-fn proxy_len(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = proxy_target(it, &a[0])?;
-    Ok(Value::Int(it.len_of(&t)? as i64))
-}
+    #[proto(bool)]
+    fn bool(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
+        let t = proxy_target(it, &slf.0)?;
+        it.truthy(&t)
+    }
 
-fn proxy_iter(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = proxy_target(it, &a[0])?;
-    it.get_iter(&t)
-}
+    #[proto(len)]
+    fn len(slf: This<Py<Self>>, it: &mut Interp) -> R<usize> {
+        let t = proxy_target(it, &slf.0)?;
+        it.len_of(&t)
+    }
 
-fn proxy_next(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = proxy_target(it, &a[0])?;
-    match it.iter_next(&t)? {
-        Some(v) => Ok(v),
-        None => Err(it.new_exc_str("StopIteration", "")),
+    #[proto(iter)]
+    fn iter(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        it.get_iter(&t)
+    }
+
+    #[proto(next)]
+    fn next(slf: This<Py<Self>>, it: &mut Interp) -> R<Option<Value>> {
+        let t = proxy_target(it, &slf.0)?;
+        it.iter_next(&t)
+    }
+
+    #[proto(getitem)]
+    fn getitem(slf: This<Py<Self>>, it: &mut Interp, key: &Value) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        it.getitem(&t, key)
+    }
+
+    #[proto(setitem)]
+    fn setitem(slf: This<Py<Self>>, it: &mut Interp, key: &Value, value: &Value) -> R<()> {
+        let t = proxy_target(it, &slf.0)?;
+        it.setitem(&t, key.clone(), value.clone())
+    }
+
+    #[proto(delitem)]
+    fn delitem(slf: This<Py<Self>>, it: &mut Interp, key: &Value) -> R<()> {
+        let t = proxy_target(it, &slf.0)?;
+        it.delitem(&t, key)
+    }
+
+    #[proto(contains)]
+    fn contains(slf: This<Py<Self>>, it: &mut Interp, key: &Value) -> R<bool> {
+        let t = proxy_target(it, &slf.0)?;
+        it.contains(&t, key)
+    }
+
+    #[proto(index)]
+    fn index(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        crate::bind::index(it, &t)
+    }
+
+    #[proto(int)]
+    fn int(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        let f = Value::Obj(it.types.int.clone());
+        it.call(&f, vec![t], Vec::new())
+    }
+
+    #[proto(float)]
+    fn float(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        let f = Value::Obj(it.types.float.clone());
+        it.call(&f, vec![t], Vec::new())
+    }
+
+    #[proto(neg)]
+    fn neg(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        it.unary_op(UnOp::Neg, &t)
+    }
+
+    #[proto(pos)]
+    fn pos(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        it.unary_op(UnOp::Pos, &t)
+    }
+
+    #[proto(invert)]
+    fn invert(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        it.unary_op(UnOp::Invert, &t)
+    }
+
+    #[proto(abs)]
+    fn abs(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        call_builtin(it, "abs", t)
+    }
+
+    #[proto(add)]
+    fn add(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Add, &slf, value)
+    }
+
+    #[proto(radd)]
+    fn radd(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Add, value, &slf)
+    }
+
+    #[proto(sub)]
+    fn sub(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Sub, &slf, value)
+    }
+
+    #[proto(rsub)]
+    fn rsub(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Sub, value, &slf)
+    }
+
+    #[proto(mul)]
+    fn mul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mult, &slf, value)
+    }
+
+    #[proto(rmul)]
+    fn rmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mult, value, &slf)
+    }
+
+    #[proto(and)]
+    fn and(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitAnd, &slf, value)
+    }
+
+    #[proto(rand)]
+    fn rand(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitAnd, value, &slf)
+    }
+
+    #[proto(or)]
+    fn or(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitOr, &slf, value)
+    }
+
+    #[proto(ror)]
+    fn ror(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitOr, value, &slf)
+    }
+
+    #[proto(xor)]
+    fn xor(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitXor, &slf, value)
+    }
+
+    #[proto(rxor)]
+    fn rxor(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitXor, value, &slf)
+    }
+
+    #[method(name = "__truediv__", hint(py(text_signature = "")))]
+    fn truediv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Div, &slf, value)
+    }
+
+    #[method(name = "__rtruediv__", hint(py(text_signature = "")))]
+    fn rtruediv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Div, value, &slf)
+    }
+
+    #[method(name = "__floordiv__", hint(py(text_signature = "")))]
+    fn floordiv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::FloorDiv, &slf, value)
+    }
+
+    #[method(name = "__rfloordiv__", hint(py(text_signature = "")))]
+    fn rfloordiv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::FloorDiv, value, &slf)
+    }
+
+    #[method(name = "__mod__", hint(py(text_signature = "")))]
+    fn r#mod(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mod, &slf, value)
+    }
+
+    #[method(name = "__rmod__", hint(py(text_signature = "")))]
+    fn rmod(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mod, value, &slf)
+    }
+
+    #[method(name = "__matmul__", hint(py(text_signature = "")))]
+    fn matmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::MatMult, &slf, value)
+    }
+
+    #[method(name = "__rmatmul__", hint(py(text_signature = "")))]
+    fn rmatmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::MatMult, value, &slf)
+    }
+
+    #[method(name = "__lshift__", hint(py(text_signature = "")))]
+    fn lshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::LShift, &slf, value)
+    }
+
+    #[method(name = "__rlshift__", hint(py(text_signature = "")))]
+    fn rlshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::LShift, value, &slf)
+    }
+
+    #[method(name = "__rshift__", hint(py(text_signature = "")))]
+    fn rshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::RShift, &slf, value)
+    }
+
+    #[method(name = "__rrshift__", hint(py(text_signature = "")))]
+    fn rrshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::RShift, value, &slf)
+    }
+
+    #[method(name = "__pow__", hint(py(text_signature = "")))]
+    fn pow(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Pow, &slf, value)
+    }
+
+    #[method(name = "__rpow__", hint(py(text_signature = "")))]
+    fn rpow(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Pow, value, &slf)
+    }
+
+    #[proto(iadd)]
+    fn iadd(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::Add, &slf.0, value)
+    }
+
+    #[proto(isub)]
+    fn isub(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::Sub, &slf.0, value)
+    }
+
+    #[proto(imul)]
+    fn imul(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::Mult, &slf.0, value)
+    }
+
+    #[proto(iand)]
+    fn iand(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::BitAnd, &slf.0, value)
+    }
+
+    #[proto(ior)]
+    fn ior(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::BitOr, &slf.0, value)
+    }
+
+    #[proto(ixor)]
+    fn ixor(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::BitXor, &slf.0, value)
+    }
+
+    #[method(name = "__itruediv__", hint(py(text_signature = "")))]
+    fn itruediv(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::Div, &slf.0, value)
+    }
+
+    #[method(name = "__ifloordiv__", hint(py(text_signature = "")))]
+    fn ifloordiv(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::FloorDiv, &slf.0, value)
+    }
+
+    #[method(name = "__imod__", hint(py(text_signature = "")))]
+    fn imod(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::Mod, &slf.0, value)
+    }
+
+    #[method(name = "__imatmul__", hint(py(text_signature = "")))]
+    fn imatmul(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::MatMult, &slf.0, value)
+    }
+
+    #[method(name = "__ilshift__", hint(py(text_signature = "")))]
+    fn ilshift(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::LShift, &slf.0, value)
+    }
+
+    #[method(name = "__irshift__", hint(py(text_signature = "")))]
+    fn irshift(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::RShift, &slf.0, value)
+    }
+
+    #[method(name = "__ipow__", hint(py(text_signature = "")))]
+    fn ipow(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
+        inplace(it, BinOp::Pow, &slf.0, value)
+    }
+
+    #[proto(eq)]
+    fn eq(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop_cmp(it, CmpOp::Eq, &slf, value)
+    }
+
+    #[proto(ne)]
+    fn ne(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop_cmp(it, CmpOp::NotEq, &slf, value)
+    }
+
+    #[proto(lt)]
+    fn lt(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop_cmp(it, CmpOp::Lt, &slf, value)
+    }
+
+    #[proto(le)]
+    fn le(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop_cmp(it, CmpOp::LtE, &slf, value)
+    }
+
+    #[proto(gt)]
+    fn gt(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop_cmp(it, CmpOp::Gt, &slf, value)
+    }
+
+    #[proto(ge)]
+    fn ge(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop_cmp(it, CmpOp::GtE, &slf, value)
+    }
+
+    #[method(name = "__bytes__", hint(py(text_signature = "")))]
+    fn bytes(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        call_builtin(it, "bytes", t)
+    }
+
+    #[method(name = "__reversed__", hint(py(text_signature = "")))]
+    fn reversed(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        call_builtin(it, "reversed", t)
     }
 }
 
-fn proxy_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__getitem__", a, 2, 2)?;
-    let t = proxy_target(it, &a[0])?;
-    it.getitem(&t, &a[1])
-}
+/// The type of proxies to callable objects: the proxy members plus `__call__`.
+#[lumen_bind::class(name = "CallableProxyType", module = "weakref", hint(py(unhashable)))]
+pub struct CallableProxy;
 
-fn proxy_setitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__setitem__", a, 3, 3)?;
-    let t = proxy_target(it, &a[0])?;
-    it.setitem(&t, a[1].clone(), a[2].clone())?;
-    Ok(Value::None)
-}
-
-fn proxy_delitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__delitem__", a, 2, 2)?;
-    let t = proxy_target(it, &a[0])?;
-    it.delitem(&t, &a[1])?;
-    Ok(Value::None)
-}
-
-fn proxy_contains(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__contains__", a, 2, 2)?;
-    let t = proxy_target(it, &a[0])?;
-    Ok(Value::Bool(it.contains(&t, &a[1])?))
-}
-
-fn proxy_call(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let t = proxy_target(it, &a[0])?;
-    it.call(&t, a[1..].to_vec(), kw.to_vec())
-}
-
-fn unproxy(it: &mut Interp, v: &Value) -> R<Value> {
-    if with_opaque::<ProxyData, _>(v, |_| ()).is_some() {
-        proxy_target(it, v)
-    } else {
-        Ok(v.clone())
+#[lumen_bind::methods]
+impl CallableProxy {
+    #[proto(call)]
+    fn call(slf: This<Py<ProxyData>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        let t = proxy_target(it, &slf.0)?;
+        it.call(&t, args.to_vec(), kwargs.to_vec())
     }
 }
 
-fn proxy_hash(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.type_error("unhashable type: 'weakref.ProxyType'"))
-}
+/// Weak-reference support module.
+#[lumen_bind::module(name = "_weakref")]
+pub mod _weakref {
+    use super::*;
 
-macro_rules! proxy_cmp {
-    ($name:ident, $op:expr) => {
-        fn $name(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-            it.check_args("comparison", a, 2, 2)?;
-            let (x, y) = (unproxy(it, &a[0])?, unproxy(it, &a[1])?);
-            it.compare_op($op, &x, &y)
+    /// Create a proxy object that weakly references 'object'.
+    ///
+    /// 'callback', if given, is called with a reference to the
+    /// proxy when 'object' is about to be finalized.
+    #[op(hint(py(arg_style = "unpack")))]
+    fn proxy(it: &mut Interp, object: &Value, callback: Option<&Value>) -> R<Value> {
+        let target = weak_target(it, object)?;
+        let callback = callback.cloned().unwrap_or(Value::None);
+        let cls = if it.is_callable(object) { type_object::<CallableProxy>(it) } else { type_object::<ProxyData>(it) };
+        let v = opaque_instance(&cls, ProxyData { target: Rc::downgrade(&target), callback });
+        if let Value::Obj(o) = &v {
+            weak::register(&target, o);
         }
-    };
-}
-proxy_cmp!(proxy_eq, CmpOp::Eq);
-proxy_cmp!(proxy_ne, CmpOp::NotEq);
-proxy_cmp!(proxy_lt, CmpOp::Lt);
-proxy_cmp!(proxy_le, CmpOp::LtE);
-proxy_cmp!(proxy_gt, CmpOp::Gt);
-proxy_cmp!(proxy_ge, CmpOp::GtE);
-
-macro_rules! proxy_bin {
-    ($name:ident, $rname:ident, $op:expr) => {
-        fn $name(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-            it.check_args("binary op", a, 2, 2)?;
-            let (x, y) = (unproxy(it, &a[0])?, unproxy(it, &a[1])?);
-            it.binary_op($op, &x, &y)
-        }
-        fn $rname(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-            it.check_args("binary op", a, 2, 2)?;
-            let (x, y) = (unproxy(it, &a[0])?, unproxy(it, &a[1])?);
-            it.binary_op($op, &y, &x)
-        }
-    };
-}
-proxy_bin!(proxy_add, proxy_radd, BinOp::Add);
-proxy_bin!(proxy_sub, proxy_rsub, BinOp::Sub);
-proxy_bin!(proxy_mul, proxy_rmul, BinOp::Mult);
-proxy_bin!(proxy_truediv, proxy_rtruediv, BinOp::Div);
-proxy_bin!(proxy_floordiv, proxy_rfloordiv, BinOp::FloorDiv);
-proxy_bin!(proxy_mod, proxy_rmod, BinOp::Mod);
-
-fn proxy_index(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = proxy_target(it, &a[0])?;
-    Ok(Value::Int(it.index_of(&t)?))
-}
-
-fn getweakrefcount(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("getweakrefcount", a, 1, 1)?;
-    Ok(Value::Int(match &a[0] {
-        Value::Obj(o) => weak::live_refs(o).len() as i64,
-        _ => 0,
-    }))
-}
-
-fn getweakrefs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("getweakrefs", a, 1, 1)?;
-    Ok(Value::list(match &a[0] {
-        Value::Obj(o) => weak::live_refs(o).into_iter().map(Value::Obj).collect(),
-        _ => Vec::new(),
-    }))
-}
-
-fn remove_dead_weakref(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("_remove_dead_weakref", a, 2, 2)?;
-    let Value::Obj(d) = &a[0] else { return Err(it.type_error("_remove_dead_weakref() argument 1 must be dict")) };
-    if !matches!(d.kind, Kind::Dict(_)) {
-        return Err(it.type_error("_remove_dead_weakref() argument 1 must be dict"));
+        Ok(v)
     }
-    if let Some(Value::Obj(r)) = it.dict_get(d, &a[1])? {
-        if matches!(referent(&Value::Obj(r)), Some(None)) {
-            it.dict_remove(d, &a[1])?;
+
+    /// Return the number of weak references to 'object'.
+    #[op]
+    fn getweakrefcount(object: &Value) -> usize {
+        match object {
+            Value::Obj(o) => weak::live_refs(o).len(),
+            _ => 0,
         }
     }
-    Ok(Value::None)
+
+    /// Return a list of all weak reference objects pointing to 'object'.
+    #[op]
+    fn getweakrefs(object: &Value) -> Value {
+        Value::list(match object {
+            Value::Obj(o) => weak::live_refs(o).into_iter().map(Value::Obj).collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    /// Atomically remove key from dict if it points to a dead weakref.
+    #[op(hint(py(arg_style = "unpack")))]
+    fn _remove_dead_weakref(it: &mut Interp, dct: &Value, key: &Value) -> R<()> {
+        let d = match dct {
+            Value::Obj(d) if matches!(d.kind, Kind::Dict(_)) => d,
+            _ => {
+                let t = it.type_name_of(dct);
+                return Err(it.type_error(&format!("_remove_dead_weakref() argument 1 must be dict, not {}", t)));
+            }
+        };
+        if let Some(r) = it.dict_get(d, key)? {
+            if matches!(referent(&r), Some(None)) {
+                it.dict_remove(d, key)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[init]
+    fn init(it: &mut Interp, m: &Value) {
+        let Value::Obj(m) = m else { return };
+        let refty = type_object::<WeakRefData>(it);
+        super::super::descr::install_getsets::<WeakRefData>(it, &refty, &["__callback__"]);
+        let proxy = type_object::<ProxyData>(it);
+        let callable = type_object::<CallableProxy>(it);
+        crate::bind::install_all::<ProxyData>(&callable);
+        let d = it.module_dict(m);
+        for (name, ty) in [("ReferenceType", &refty), ("ref", &refty), ("ProxyType", &proxy), ("CallableProxyType", &callable)] {
+            dict_set_str(&d, name, Value::Obj(ty.clone()));
+        }
+    }
 }
 
 impl Interp {
-    /// `[ReferenceType, ProxyType, CallableProxyType]` of the loaded `_weakref` module.
-    pub fn weak_types(&mut self) -> Vec<Obj> {
-        let m = match dict_get_str(&self.modules, "_weakref") {
-            Some(Value::Obj(m)) => m,
-            _ => match crate::builtins::modules::builtin_module(self, "_weakref") {
-                Some(m) => {
-                    self.register_module("_weakref", &m);
-                    m
-                }
-                None => unreachable!(),
-            },
-        };
-        let d = self.module_dict(&m);
-        ["ReferenceType", "ProxyType", "CallableProxyType"].iter().filter_map(|n| dict_get_str(&d, n)).filter_map(|v| v.as_obj().cloned()).collect()
-    }
-
     /// Runs the callbacks of weak references whose referent has died since the last check.
     pub fn run_weak_callbacks(&mut self) {
         while weak::has_pending() {
@@ -361,73 +680,4 @@ impl Interp {
             }
         }
     }
-}
-
-pub fn make(it: &mut Interp) -> Obj {
-    let m = it.new_module("_weakref");
-    let d = it.module_dict(&m);
-    let refty = new_type(it, "weakref", "ReferenceType", None, Layout::Other);
-    it.reg_new(&refty, ref_new);
-    it.reg(&refty, "__init__", ref_init);
-    it.reg(&refty, "__call__", ref_call);
-    it.reg(&refty, "__hash__", ref_hash);
-    it.reg(&refty, "__eq__", ref_eq);
-    it.reg(&refty, "__ne__", ref_ne);
-    it.reg(&refty, "__repr__", ref_repr);
-    it.reg_prop(&refty, "__callback__", ref_callback);
-    it.reg_class(&refty, "__class_getitem__", class_getitem);
-    set_type(&d, "ReferenceType", &refty);
-    set_type(&d, "ref", &refty);
-
-    let protos: Vec<(&'static str, NativeFn)> = vec![
-        ("__getattribute__", proxy_getattribute),
-        ("__setattr__", proxy_setattr),
-        ("__delattr__", proxy_delattr),
-        ("__repr__", proxy_repr),
-        ("__str__", proxy_str),
-        ("__bool__", proxy_bool),
-        ("__len__", proxy_len),
-        ("__iter__", proxy_iter),
-        ("__next__", proxy_next),
-        ("__getitem__", proxy_getitem),
-        ("__setitem__", proxy_setitem),
-        ("__delitem__", proxy_delitem),
-        ("__contains__", proxy_contains),
-        ("__hash__", proxy_hash),
-        ("__eq__", proxy_eq),
-        ("__ne__", proxy_ne),
-        ("__lt__", proxy_lt),
-        ("__le__", proxy_le),
-        ("__gt__", proxy_gt),
-        ("__ge__", proxy_ge),
-        ("__add__", proxy_add),
-        ("__radd__", proxy_radd),
-        ("__sub__", proxy_sub),
-        ("__rsub__", proxy_rsub),
-        ("__mul__", proxy_mul),
-        ("__rmul__", proxy_rmul),
-        ("__truediv__", proxy_truediv),
-        ("__rtruediv__", proxy_rtruediv),
-        ("__floordiv__", proxy_floordiv),
-        ("__rfloordiv__", proxy_rfloordiv),
-        ("__mod__", proxy_mod),
-        ("__rmod__", proxy_rmod),
-        ("__index__", proxy_index),
-    ];
-    let proxy_ty = new_type(it, "weakref", "ProxyType", None, Layout::Other);
-    let callable_proxy_ty = new_type(it, "weakref", "CallableProxyType", None, Layout::Other);
-    for ty in [&proxy_ty, &callable_proxy_ty] {
-        for (n, f) in &protos {
-            it.reg(ty, n, *f);
-        }
-    }
-    it.reg(&callable_proxy_ty, "__call__", proxy_call);
-    set_type(&d, "ProxyType", &proxy_ty);
-    set_type(&d, "CallableProxyType", &callable_proxy_ty);
-
-    set_fn(it, &d, "proxy", proxy_new);
-    set_fn(it, &d, "getweakrefcount", getweakrefcount);
-    set_fn(it, &d, "getweakrefs", getweakrefs);
-    set_fn(it, &d, "_remove_dead_weakref", remove_dead_weakref);
-    m
 }

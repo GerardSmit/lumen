@@ -7,12 +7,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
+#[lumen_bind::class(name = "ReferenceType", module = "weakref")]
 pub struct WeakRefData {
     pub target: Weak<Object>,
     pub callback: Value,
     pub hash: Option<i64>,
 }
 
+#[lumen_bind::class(name = "ProxyType", module = "weakref", hint(py(unhashable)))]
 pub struct ProxyData {
     pub target: Weak<Object>,
     pub callback: Value,

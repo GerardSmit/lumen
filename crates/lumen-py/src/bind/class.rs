@@ -120,6 +120,14 @@ pub fn install_into<T: Methods<PyHost>>(ty: &Obj, only: &[&str]) {
     install_members(ty, &members, Some(only));
 }
 
+/// Install all of `T`'s members into the existing type `ty`, which keeps its own identity: a
+/// second type whose instances hold the same native state (`CallableProxyType`).
+pub fn install_all<T: Methods<PyHost>>(ty: &Obj) {
+    let mut members = Vec::new();
+    T::members(&mut members);
+    install_members(ty, &members, None);
+}
+
 fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) {
     let Some(d) = ty.dict.borrow().clone() else { return };
     for m in members {
