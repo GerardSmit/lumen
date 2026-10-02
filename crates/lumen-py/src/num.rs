@@ -297,10 +297,10 @@ impl Interp {
     }
 
     pub fn float_pow(&mut self, x: f64, y: f64) -> R<Value> {
-        if x == 0.0 && y < 0.0 {
-            return Err(self.zero_div("zero to a negative power"));
+        if x == 0.0 && y < 0.0 && y.is_finite() {
+            return Err(self.zero_div("0.0 cannot be raised to a negative power"));
         }
-        if x < 0.0 && y.is_finite() && y != fmath::floor(y) {
+        if x < 0.0 && x.is_finite() && y.is_finite() && y != fmath::floor(y) {
             use lumen_common::float::complex::{pow, Complex};
             return match pow(Complex::new(x, 0.0), Complex::new(y, 0.0)) {
                 Ok(z) => Ok(Value::Obj(Object::new(Kind::Complex(z.re, z.im)))),
@@ -392,7 +392,7 @@ impl Interp {
                 BinOp::Pow => {
                     if b < 0 {
                         if a == 0 {
-                            return Err(self.zero_div("zero to a negative power"));
+                            return Err(self.zero_div("0.0 cannot be raised to a negative power"));
                         }
                         return self.float_pow(a as f64, b as f64);
                     }

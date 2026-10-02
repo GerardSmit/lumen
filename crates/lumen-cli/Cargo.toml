@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 lumen = { path = "../lumen" }
 lumen-aot = { path = "../lumen-aot" }
+lumen-common = { path = "../lumen-common" }
 lumen-host = { path = "../lumen-host" }
 lumen-repl = { path = "../lumen-repl" }
 lumen-runtime = { path = "../lumen-runtime" }

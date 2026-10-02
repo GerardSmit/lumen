@@ -1,5 +1,7 @@
 //! Local time through the C library (`localtime_r`, `mktime`, `tzset`), so the zone and its
-//! abbreviations are the ones the process sees: `TZ`, else the system zone.
+//! abbreviations are the ones the process sees: `TZ`, else the system zone; the system zone's
+//! IANA name ([`system_zone`]) for runtimes that keep their own zone in `lumen_common::local_tz`;
+//! the clocks.
 
 use crate::errno::FsError;
 use lumen_common::civil::Tm;
@@ -70,6 +72,25 @@ pub fn mktime(tm: &Tm) -> Option<i64> {
 #[cfg(not(unix))]
 pub fn mktime(tm: &Tm) -> Option<i64> {
     Some(tm.to_epoch_utc())
+}
+
+/// The system's IANA zone: the `/etc/localtime` link's `.../zoneinfo/<name>` target, else
+/// `/etc/timezone` (Debian).
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub fn system_zone() -> Option<String> {
+    if let Ok(target) = std::fs::read_link("/etc/localtime") {
+        let target = target.to_string_lossy();
+        if let Some(pos) = target.rfind("zoneinfo/") {
+            return Some(target[pos + "zoneinfo/".len()..].to_string());
+        }
+    }
+    let name = std::fs::read_to_string("/etc/timezone").ok()?;
+    Some(name.trim().to_string()).filter(|n| !n.is_empty())
+}
+
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+pub fn system_zone() -> Option<String> {
+    None
 }
 
 /// Re-reads `TZ` for later local-time conversions.

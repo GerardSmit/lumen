@@ -352,6 +352,27 @@ impl FsError {
     pub fn message(self) -> &'static str {
         message(self.0)
     }
+
+    /// An `io::Error` of the matching kind, for callers on `std::io` results. Built from the
+    /// kind rather than the raw errno, which targets without an OS cannot decode.
+    pub fn to_io(self) -> io::Error {
+        use io::ErrorKind as K;
+        let kind = match self.0 {
+            "ENOENT" => K::NotFound,
+            "EEXIST" => K::AlreadyExists,
+            "EINVAL" => K::InvalidInput,
+            "EACCES" | "EPERM" => K::PermissionDenied,
+            "ENOSYS" => K::Unsupported,
+            _ => K::Other,
+        };
+        io::Error::new(kind, self.message())
+    }
+}
+
+impl From<FsError> for io::Error {
+    fn from(e: FsError) -> io::Error {
+        e.to_io()
+    }
 }
 
 impl From<io::Error> for FsError {
@@ -369,24 +390,6 @@ impl fmt::Display for FsError {
 
 impl std::error::Error for FsError {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_both_ways() {
-        let e = io::Error::from_raw_os_error(errno_of_code("ENOENT").unwrap());
-        assert_eq!(uv_code(&e), "ENOENT");
-        assert_eq!(FsError::from(e).errno(), errno_of_code("ENOENT").unwrap());
-        assert_eq!(code_of_errno(errno_of_code("EEXIST").unwrap()), Some("EEXIST"));
-        assert_eq!(message("ENOTDIR"), "Not a directory");
-        assert_eq!(errno_of_code("EOF"), None);
-        let kind_only = io::Error::from(io::ErrorKind::PermissionDenied);
-        assert_eq!(uv_code(&kind_only), "EACCES");
-        assert_eq!(errno(&kind_only), errno_of_code("EACCES").unwrap());
-    }
-}
-
 /// The calling thread's `errno` cell (for code that must save, clear or set it directly, such as
 /// a signal handler or a forked child).
 #[cfg(unix)]
@@ -403,5 +406,23 @@ pub fn errno_location() -> *mut libc::c_int {
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "android")))]
     unsafe {
         libc::__errno_location()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_both_ways() {
+        let e = io::Error::from_raw_os_error(errno_of_code("ENOENT").unwrap());
+        assert_eq!(uv_code(&e), "ENOENT");
+        assert_eq!(FsError::from(e).errno(), errno_of_code("ENOENT").unwrap());
+        assert_eq!(code_of_errno(errno_of_code("EEXIST").unwrap()), Some("EEXIST"));
+        assert_eq!(message("ENOTDIR"), "Not a directory");
+        assert_eq!(errno_of_code("EOF"), None);
+        let kind_only = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(uv_code(&kind_only), "EACCES");
+        assert_eq!(errno(&kind_only), errno_of_code("EACCES").unwrap());
     }
 }

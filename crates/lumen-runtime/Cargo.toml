@@ -13,7 +13,6 @@ publish = false
 [dependencies]
 lumen = { path = "../lumen" }
 lumen-common = { path = "../lumen-common" }
-lumen-fs = { path = "../lumen-fs" }
 lumen-host = { path = "../lumen-host" }
 lumen-node = { path = "../lumen-node", default-features = false }
 lumen-os = { path = "../lumen-os" }

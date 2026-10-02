@@ -24,49 +24,6 @@ pub fn sysconf_names() -> impl Iterator<Item = (&'static str, i64)> {
     unix::SYSCONF.iter().map(|(n, v)| (&n[1..], *v))
 }
 
-/// The signals of this platform by name (Windows: the C runtime's numbers libuv emulates).
-pub fn signals() -> &'static [(&'static str, i32)] {
-    SIGNALS
-}
-
-/// The number of signal `name` (`"SIGTERM"`) on this platform.
-pub fn signal_number(name: &str) -> Option<i32> {
-    SIGNALS.iter().find(|(n, _)| *n == name).map(|e| e.1)
-}
-
-#[cfg(unix)]
-macro_rules! signal_table {
-    ($($(#[$m:meta])* $name:ident),* $(,)?) => {
-        static SIGNALS: &[(&str, i32)] = &[$($(#[$m])* (stringify!($name), libc::$name),)*];
-    };
-}
-
-#[cfg(unix)]
-signal_table!(
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGIOT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1,
-    SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN,
-    SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGSYS,
-    #[cfg(any(target_os = "linux", target_os = "android"))] SIGSTKFLT,
-    #[cfg(any(target_os = "linux", target_os = "android"))] SIGPOLL,
-    #[cfg(any(target_os = "linux", target_os = "android"))] SIGPWR,
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))] SIGEMT,
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))] SIGINFO,
-);
-
-#[cfg(not(unix))]
-static SIGNALS: &[(&str, i32)] = &[
-    ("SIGHUP", 1),
-    ("SIGINT", 2),
-    ("SIGILL", 4),
-    ("SIGABRT", 22),
-    ("SIGFPE", 8),
-    ("SIGKILL", 9),
-    ("SIGSEGV", 11),
-    ("SIGTERM", 15),
-    ("SIGBREAK", 21),
-    ("SIGWINCH", 28),
-];
-
 static SYSEXITS: &[(&str, i64)] = &[
     ("EX_OK", 0),
     ("EX_USAGE", 64),

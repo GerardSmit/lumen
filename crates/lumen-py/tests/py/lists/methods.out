@@ -26,7 +26,7 @@ True True True
 IndexError pop from empty list
 IndexError pop index out of range
 ValueError list.remove(x): x not in list
-ValueError list.index(x): x not in list
+ValueError 2 is not in list
 TypeError 'str' object cannot be interpreted as an integer
 IndexError list index out of range
 TypeError list indices must be integers or slices, not type

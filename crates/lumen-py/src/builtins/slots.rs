@@ -1,91 +1,109 @@
 //! Container slot wrappers (`__getitem__`, `__len__`, ...) shared by the builtin collection types.
 
+use crate::bind::This;
 use crate::object::*;
 use crate::vm::*;
 
-type Kw<'a> = &'a [(Obj, Value)];
+/// The slot wrappers, declared once and installed into each container type that has the slot.
+#[lumen_bind::class(name = "slots", hint(py(shared)))]
+pub struct Slots;
 
-fn w_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__getitem__", a, 2, 2)?;
-    it.native_getitem(&a[0], &a[1])
-}
-
-fn w_setitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__setitem__", a, 3, 3)?;
-    it.native_setitem(&a[0], a[1].clone(), a[2].clone())?;
-    Ok(Value::None)
-}
-
-fn w_delitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__delitem__", a, 2, 2)?;
-    it.native_delitem(&a[0], &a[1])?;
-    Ok(Value::None)
-}
-
-fn w_len(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__len__", a, 1, 1)?;
-    Ok(Value::Int(it.native_len(&a[0])? as i64))
-}
-
-fn w_contains(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__contains__", a, 2, 2)?;
-    Ok(Value::Bool(it.native_contains(&a[0], &a[1])?))
-}
-
-fn w_iter(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__iter__", a, 1, 1)?;
-    it.native_get_iter(&a[0])
-}
-
-fn w_next(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__next__", a, 1, 1)?;
-    match it.native_iter_next(&a[0])? {
-        Some(v) => Ok(v),
-        None => Err(it.new_exc_str("StopIteration", "")),
+#[lumen_bind::methods]
+impl Slots {
+    #[proto(getitem)]
+    fn getitem(slf: This<&Value>, it: &mut Interp, key: &Value) -> R<Value> {
+        it.native_getitem(&slf, key)
     }
-}
 
-fn w_iter_self(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__iter__", a, 1, 1)?;
-    Ok(a[0].clone())
-}
+    #[proto(setitem)]
+    fn setitem(slf: This<&Value>, it: &mut Interp, key: &Value, value: &Value) -> R<()> {
+        it.native_setitem(&slf, key.clone(), value.clone())
+    }
 
-fn w_reversed(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__reversed__", a, 1, 1)?;
-    if let Value::Obj(o) = &a[0] {
-        if let Kind::Range(r) = &o.kind {
-            // A range reverses to a range iterator, as in CPython (`__setstate__` counts items).
-            let n = crate::ops::slice_len(r.start, r.stop, r.step) as i64;
-            let last = (n - 1).checked_mul(r.step).and_then(|d| r.start.checked_add(d));
-            let stop = r.start.checked_sub(r.step);
-            if let (Some(cur), Some(stop), Some(step)) = (last, stop, r.step.checked_neg()) {
-                let cur = if n == 0 { stop } else { cur };
-                return Ok(it.mk_iter(IterState::Range { cur, stop, step }));
+    #[proto(delitem)]
+    fn delitem(slf: This<&Value>, it: &mut Interp, key: &Value) -> R<()> {
+        it.native_delitem(&slf, key)
+    }
+
+    #[proto(len)]
+    fn len(slf: This<&Value>, it: &mut Interp) -> R<usize> {
+        it.native_len(&slf)
+    }
+
+    #[proto(contains)]
+    fn contains(slf: This<&Value>, it: &mut Interp, key: &Value) -> R<bool> {
+        it.native_contains(&slf, key)
+    }
+
+    #[proto(iter)]
+    fn iter(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        it.native_get_iter(&slf)
+    }
+
+    #[proto(reversed)]
+    fn reversed(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        let seq: &Value = &slf;
+        if let Value::Obj(o) = seq {
+            if let Kind::Range(r) = &o.kind {
+                // A range reverses to a range iterator, as in CPython (`__setstate__` counts items).
+                let n = crate::ops::slice_len(r.start, r.stop, r.step) as i64;
+                let last = (n - 1).checked_mul(r.step).and_then(|d| r.start.checked_add(d));
+                let stop = r.start.checked_sub(r.step);
+                if let (Some(cur), Some(stop), Some(step)) = (last, stop, r.step.checked_neg()) {
+                    let cur = if n == 0 { stop } else { cur };
+                    return Ok(it.mk_iter(IterState::Range { cur, stop, step }));
+                }
             }
         }
-    }
-    let n = it.native_len(&a[0])? as i64;
-    Ok(it.mk_iter(IterState::Reversed { seq: a[0].clone(), idx: n - 1 }))
-}
-
-pub fn reg_slots(it: &mut Interp, ty: &Obj, which: &[&str]) {
-    let table: &[(&'static str, NativeFn)] = &[
-        ("__getitem__", w_getitem),
-        ("__setitem__", w_setitem),
-        ("__delitem__", w_delitem),
-        ("__len__", w_len),
-        ("__contains__", w_contains),
-        ("__iter__", w_iter),
-        ("__reversed__", w_reversed),
-    ];
-    for (n, f) in table {
-        if which.contains(n) {
-            it.reg(ty, n, *f);
-        }
+        let n = it.native_len(seq)? as i64;
+        Ok(it.mk_iter(IterState::Reversed { seq: seq.clone(), idx: n - 1 }))
     }
 }
 
-pub fn reg_iterator(it: &mut Interp, ty: &Obj) {
-    it.reg(ty, "__iter__", w_iter_self);
-    it.reg(ty, "__next__", w_next);
+/// `__getitem__` / `__contains__` as the methods (not slot wrappers) some types define over the
+/// slot: `list` and `dict` (`__getitem__`), `dict`, `set` and `frozenset` (`__contains__`).
+#[lumen_bind::class(name = "methods", hint(py(shared)))]
+pub struct MethodForms;
+
+#[lumen_bind::methods]
+impl MethodForms {
+    #[method(name = "__getitem__")]
+    fn getitem(slf: This<&Value>, it: &mut Interp, key: &Value) -> R<Value> {
+        it.native_getitem(&slf, key)
+    }
+
+    #[method(name = "__contains__")]
+    fn contains(slf: This<&Value>, it: &mut Interp, key: &Value) -> R<bool> {
+        it.native_contains(&slf, key)
+    }
+}
+
+/// The iterator protocol of a builtin iterator type.
+#[lumen_bind::class(name = "iterator", hint(py(shared)))]
+pub struct Iterator;
+
+#[lumen_bind::methods]
+impl Iterator {
+    #[proto(iter)]
+    fn iter(slf: This<Value>) -> Value {
+        slf.0
+    }
+
+    #[proto(next)]
+    fn next(slf: This<&Value>, it: &mut Interp) -> R<Option<Value>> {
+        it.native_iter_next(&slf)
+    }
+}
+
+pub fn reg_slots(_it: &mut Interp, ty: &Obj, which: &[&str]) {
+    crate::bind::install_into::<Slots>(ty, which);
+}
+
+/// The method forms of `__getitem__` / `__contains__` named in `which`.
+pub fn reg_method_forms(ty: &Obj, which: &[&str]) {
+    crate::bind::install_into::<MethodForms>(ty, which);
+}
+
+pub fn reg_iterator(_it: &mut Interp, ty: &Obj) {
+    crate::bind::install_into::<Iterator>(ty, &["__iter__", "__next__"]);
 }

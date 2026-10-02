@@ -139,7 +139,9 @@ pub fn close(fd: i32) -> R<()> {
 
 // ---- open flags ---------------------------------------------------------------------------------
 
-/// The `O_*` values of the platform whose numbers Node (and `os.O_*` in Python) expose.
+/// The `O_*` values of the platform whose numbers Node (and `os.O_*` in Python) expose. Targets
+/// without an OS (wasm32) use Linux numbers, as their `process.platform` does. `O_DIRECTORY` /
+/// `O_NOFOLLOW` are 0 where the platform has no such flag.
 pub mod flags {
     #[cfg(windows)]
     mod v {
@@ -149,8 +151,10 @@ pub mod flags {
         pub const O_CREAT: i32 = 256;
         pub const O_TRUNC: i32 = 512;
         pub const O_EXCL: i32 = 1024;
+        pub const O_DIRECTORY: i32 = 0;
+        pub const O_NOFOLLOW: i32 = 0;
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_arch = "wasm32"))]
     mod v {
         pub const O_WRONLY: i32 = 1;
         pub const O_RDWR: i32 = 2;
@@ -158,8 +162,10 @@ pub mod flags {
         pub const O_EXCL: i32 = 0o200;
         pub const O_TRUNC: i32 = 0o1000;
         pub const O_APPEND: i32 = 0o2000;
+        pub const O_DIRECTORY: i32 = 0o200000;
+        pub const O_NOFOLLOW: i32 = 0o400000;
     }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_arch = "wasm32")))]
     mod v {
         pub const O_WRONLY: i32 = 1;
         pub const O_RDWR: i32 = 2;
@@ -167,6 +173,8 @@ pub mod flags {
         pub const O_CREAT: i32 = 0x200;
         pub const O_TRUNC: i32 = 0x400;
         pub const O_EXCL: i32 = 0x800;
+        pub const O_DIRECTORY: i32 = 0x100000;
+        pub const O_NOFOLLOW: i32 = 0x100;
     }
     pub use v::*;
 }

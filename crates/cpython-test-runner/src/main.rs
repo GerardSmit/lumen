@@ -119,7 +119,10 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
         Err(e) => return failure(name, Status::Crash(format!("cannot create log: {e}")), started),
     };
     let lib = fs::canonicalize(o.root.join("Lib")).unwrap_or_else(|_| o.root.join("Lib"));
-    let spawned = Command::new(&o.bin)
+    let mut cmd = Command::new(&o.bin);
+    // Tests that spawn children (signal, subprocess, multiprocessing) can leave them running;
+    // the whole group is killed when the file finishes or times out.
+    let spawned = lumen_os::child::new_group(&mut cmd)
         .args(["-m", "unittest", "-v"])
         .arg(format!("test.{name}"))
         .current_dir(&test_dir)
@@ -133,7 +136,7 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
         Ok(c) => c,
         Err(e) => return failure(name, Status::Crash(format!("cannot spawn {}: {e}", o.bin.display())), started),
     };
-    let exit = match lumen_os::child::wait_timeout(&mut child, o.timeout, Duration::from_millis(10)) {
+    let exit = match lumen_os::child::wait_timeout_group(&mut child, o.timeout, Duration::from_millis(10)) {
         Ok(Some(status)) => Some(status),
         Ok(None) => return failure(name, Status::Timeout, started),
         Err(_) => None,
@@ -184,21 +187,6 @@ fn status_detail(s: &Status) -> String {
     }
 }
 
-fn json_string(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std::io::Result<String> {
     let mut totals = Counts::default();
     let mut by_status: BTreeMap<&'static str, u32> = BTreeMap::new();
@@ -221,14 +209,14 @@ fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std:
         tsv.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\n", r.name, r.status.label(), r.counts.pass, r.counts.fail, r.counts.error, r.counts.skip, r.secs, status_detail(&r.status)));
         json_files.push(format!(
             "    {}: {{ \"status\": {}, \"pass\": {}, \"fail\": {}, \"error\": {}, \"skip\": {}, \"seconds\": {:.2}, \"detail\": {} }}",
-            json_string(&r.name),
-            json_string(r.status.label()),
+            lumen_common::json::json_string(&r.name),
+            lumen_common::json::json_string(r.status.label()),
             r.counts.pass,
             r.counts.fail,
             r.counts.error,
             r.counts.skip,
             r.secs,
-            json_string(&status_detail(&r.status)),
+            lumen_common::json::json_string(&status_detail(&r.status)),
         ));
     }
     fs::write(o.report.join("files.tsv"), tsv)?;

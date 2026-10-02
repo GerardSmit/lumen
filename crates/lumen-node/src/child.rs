@@ -314,21 +314,16 @@ fn wire_extra_stdio(command: &mut Command, stdio: &[String], ipc_fd: &mut Option
             // The parent's end of the IPC channel goes to JS as a raw descriptor (net's
             // adoptFd), so handles can travel over it as SCM_RIGHTS.
             use std::os::fd::IntoRawFd;
-            #[cfg(any(target_os="macos",target_os="ios"))] {
-                let enabled:libc::c_int=1;
-                for sock in [parent.as_raw_fd(), child.as_raw_fd()] {
-                    // SAFETY: setsockopt on a live socket with a c_int option.
-                    unsafe {libc::setsockopt(sock,libc::SOL_SOCKET,libc::SO_NOSIGPIPE,(&enabled as *const libc::c_int).cast(),std::mem::size_of_val(&enabled) as libc::socklen_t)};
-                }
+            #[cfg(any(target_os="macos",target_os="ios"))]
+            for sock in [parent.as_raw_fd(), child.as_raw_fd()] {
+                let _ = lumen_os::net::setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1);
             }
             *ipc_fd = Some(parent.into_raw_fd());
             child_ends.push((child, fd as std::os::raw::c_int));
             continue;
         }
-        #[cfg(any(target_os="macos",target_os="ios"))] {
-            let enabled:libc::c_int=1;
-            if unsafe {libc::setsockopt(child.as_raw_fd(),libc::SOL_SOCKET,libc::SO_NOSIGPIPE,(&enabled as *const libc::c_int).cast(),std::mem::size_of_val(&enabled) as libc::socklen_t)}<0 { return Err(std::io::Error::last_os_error()); }
-        }
+        #[cfg(any(target_os="macos",target_os="ios"))]
+        no_sigpipe(child.as_raw_fd())?;
         let reader: Box<dyn Read + Send> = Box::new(parent.try_clone()?);
         let writer: Box<dyn Write + Send> = Box::new(parent);
         extra.insert(
@@ -1777,27 +1772,19 @@ fn exec_sync_in_realm(
 /// A connected pair of stream sockets for a child realm's IPC channel: the parent keeps the first,
 /// the child reads and writes the second by descriptor number. Both are close-on-exec, so no
 /// subprocess either realm starts inherits them.
+/// `SO_NOSIGPIPE` on: a write to a closed peer fails with `EPIPE` instead of signalling.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn no_sigpipe(fd: i32) -> std::io::Result<()> {
+    lumen_os::net::setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1)
+        .map_err(|e| std::io::Error::from_raw_os_error(e.errno()))
+}
+
 #[cfg(unix)]
 fn socket_pair() -> std::io::Result<(std::os::unix::net::UnixStream, std::os::unix::net::UnixStream)> {
     use std::os::unix::io::AsRawFd;
     let (parent, child) = std::os::unix::net::UnixStream::pair()?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let enabled: libc::c_int = 1;
-        // SAFETY: a valid socket and a correctly sized int option.
-        let status = unsafe {
-            libc::setsockopt(
-                child.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                (&enabled as *const libc::c_int).cast(),
-                std::mem::size_of_val(&enabled) as libc::socklen_t,
-            )
-        };
-        if status < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
+    no_sigpipe(child.as_raw_fd())?;
     let _ = child.as_raw_fd();
     Ok((parent, child))
 }

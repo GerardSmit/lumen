@@ -1,5 +1,6 @@
 //! `bytes` and `bytearray`.
 
+use lumen_common::search;
 use super::numeric::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
@@ -165,15 +166,12 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(wrap(&a[0], out))
 }
 
+/// Where `n` first (or, with `rev`, last) occurs in `h` at or after `from`.
 fn find_sub(h: &[u8], n: &[u8], from: usize, rev: bool) -> Option<usize> {
-    if n.len() > h.len() {
-        return None;
-    }
-    let range = from..=(h.len() - n.len());
     if rev {
-        range.rev().find(|&i| &h[i..i + n.len()] == n)
+        Some(search::rfind(h.get(from..)?, n)? + from)
     } else {
-        range.into_iter().find(|&i| &h[i..i + n.len()] == n)
+        search::find_from(h, n, from)
     }
 }
 
@@ -232,15 +230,7 @@ fn count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("count", a, 2, 2)?;
     let h = data(it, &a[0])?;
     let n = sub_arg(it, &a[1])?;
-    if n.is_empty() {
-        return Ok(Value::Int(h.len() as i64 + 1));
-    }
-    let (mut c, mut i) = (0, 0);
-    while let Some(p) = find_sub(&h, &n, i, false) {
-        c += 1;
-        i = p + n.len();
-    }
-    Ok(Value::Int(c))
+    Ok(Value::Int(search::count(&h, &n, usize::MAX) as i64))
 }
 
 fn affix(it: &mut Interp, a: &[Value], start: bool) -> R<Value> {

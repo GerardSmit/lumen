@@ -16,6 +16,8 @@ hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripem
 compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd"]
 
 [dependencies]
+# Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
+memchr = { version = "2", default-features = false }
 digest = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }

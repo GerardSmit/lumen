@@ -292,7 +292,10 @@ pub fn doc_of(toks: &[TokenTree]) -> Option<String> {
     if lines.is_empty() {
         None
     } else {
-        Some(lines.join("\n").trim().to_string())
+        // A trailing empty `///` line keeps one final newline (CPython docstrings that end in one).
+        let keep_newline = lines.len() > 1 && lines.last().is_some_and(|l| l.trim().is_empty());
+        let text = lines.join("\n").trim().to_string();
+        Some(if keep_newline { text + "\n" } else { text })
     }
 }
 

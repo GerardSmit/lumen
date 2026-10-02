@@ -323,6 +323,7 @@ dependencies = [
 name = "cpython-test-runner"
 version = "0.1.3"
 dependencies = [
+ "lumen-common",
  "lumen-os",
 ]
 
@@ -790,6 +791,7 @@ version = "0.1.3"
 dependencies = [
  "lumen",
  "lumen-aot-macros",
+ "lumen-common",
  "lumen-runtime",
 ]
 
@@ -798,6 +800,7 @@ name = "lumen-aot-macros"
 version = "0.1.3"
 dependencies = [
  "lumen",
+ "lumen-common",
 ]
 
 [[package]]
@@ -818,6 +821,7 @@ version = "0.1.3"
 dependencies = [
  "lumen",
  "lumen-aot",
+ "lumen-common",
  "lumen-host",
  "lumen-repl",
  "lumen-runtime",
@@ -841,6 +845,7 @@ dependencies = [
  "hmac",
  "libz-rs-sys",
  "md-5",
+ "memchr",
  "pbkdf2",
  "ripemd",
  "ruzstd",
@@ -859,13 +864,6 @@ dependencies = [
  "lumen",
  "lumen-common",
  "lumen-os",
-]
-
-[[package]]
-name = "lumen-fs"
-version = "0.1.3"
-dependencies = [
- "lumen-host",
 ]
 
 [[package]]
@@ -947,6 +945,7 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "lumen-common",
+ "web-time",
 ]
 
 [[package]]
@@ -974,7 +973,6 @@ dependencies = [
  "lumen",
  "lumen-bind",
  "lumen-common",
- "lumen-fs",
  "lumen-host",
  "lumen-node",
  "lumen-os",
@@ -1008,6 +1006,7 @@ dependencies = [
  "js-sys",
  "lumen",
  "lumen-host",
+ "lumen-os",
  "lumen-runtime",
  "wasm-bindgen",
 ]

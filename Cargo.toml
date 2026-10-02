@@ -10,7 +10,6 @@ members = [
     "crates/lumen-bind/macros",
     "crates/lumen-common",
     "crates/lumen-difftest",
-    "crates/lumen-fs",
     "crates/lumen-host",
     "crates/lumen-node",
     "crates/lumen-os",

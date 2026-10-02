@@ -1,7 +1,8 @@
 //! The Unicode character database behind Python's `unicodedata` (and `\N{...}` escapes): property
 //! records, decomposition mappings, character names with aliases and named sequences, and the
-//! UCD 3.2.0 view IDNA/stringprep use. Data lives in the generated `unicode_db`; normalization
-//! runs the shared algorithm in `unicode_norm_impl` over it.
+//! UCD 3.2.0 view IDNA/stringprep use, and the character types behind `str` methods ([`CharType`]).
+//! Data lives in the generated `unicode_db`; normalization runs the shared algorithm in
+//! `unicode_norm_impl` over it.
 
 use crate::unicode_db as db;
 use crate::unicode_norm_impl::{self as norm, NormData};
@@ -297,6 +298,120 @@ fn lookup_upper(up: &str, version: Version, named_sequences: bool) -> Option<Vec
     None
 }
 
+// ---- character types (`str` methods) ----------------------------------------------------------
+
+/// The [`CharType`] flags, as CPython's `_PyUnicode_TypeRecord` has them.
+pub mod flag {
+    pub const ALPHA: u16 = 1 << 0;
+    pub const DECIMAL: u16 = 1 << 1;
+    pub const DIGIT: u16 = 1 << 2;
+    pub const NUMERIC: u16 = 1 << 3;
+    pub const SPACE: u16 = 1 << 4;
+    pub const PRINTABLE: u16 = 1 << 5;
+    /// The derived `Lowercase` property.
+    pub const LOWER: u16 = 1 << 6;
+    /// The derived `Uppercase` property.
+    pub const UPPER: u16 = 1 << 7;
+    /// General category Lt.
+    pub const TITLE: u16 = 1 << 8;
+    pub const CASED: u16 = 1 << 9;
+    pub const CASE_IGNORABLE: u16 = 1 << 10;
+    pub const XID_START: u16 = 1 << 11;
+    pub const XID_CONTINUE: u16 = 1 << 12;
+}
+
+/// What `str` methods know about one code point: predicate flags and full case mappings.
+#[derive(Clone, Copy, Debug)]
+pub struct CharType {
+    cp: u32,
+    pub flags: u16,
+    upper: i32,
+    lower: i32,
+    title: i32,
+    fold: i32,
+}
+
+/// The type of `cp` (unassigned beyond U+10FFFF).
+#[inline]
+pub fn char_type(cp: u32) -> CharType {
+    let k = if cp >= 0x110000 {
+        0
+    } else {
+        let block = db::TYPE_INDEX1.get((cp >> db::SHIFT) as usize) as usize;
+        db::TYPE_INDEX2.get((block << db::SHIFT) + (cp & ((1 << db::SHIFT) - 1)) as usize) as usize
+    };
+    let (flags, upper, lower, title, fold) = db::TYPE_RECORDS[k];
+    CharType { cp, flags, upper, lower, title, fold }
+}
+
+impl CharType {
+    /// The code point this is the type of.
+    #[inline]
+    pub fn cp(&self) -> u32 {
+        self.cp
+    }
+
+    #[inline]
+    pub fn is(&self, flag: u16) -> bool {
+        self.flags & flag != 0
+    }
+
+    fn mapping(&self, m: i32) -> CaseMapping {
+        if m >= db::EXTENDED {
+            let at = (m - db::EXTENDED) as usize;
+            CaseMapping { one: None, at: at + 1, end: at + 1 + db::TYPE_EXT.get(at) as usize }
+        } else {
+            CaseMapping { one: Some((self.cp as i32 + m) as u32), at: 0, end: 0 }
+        }
+    }
+
+    pub fn upper(&self) -> CaseMapping {
+        self.mapping(self.upper)
+    }
+
+    pub fn lower(&self) -> CaseMapping {
+        self.mapping(self.lower)
+    }
+
+    pub fn title(&self) -> CaseMapping {
+        self.mapping(self.title)
+    }
+
+    pub fn fold(&self) -> CaseMapping {
+        self.mapping(self.fold)
+    }
+}
+
+/// The code points a character maps to under a case mapping (one to three).
+#[derive(Clone, Debug)]
+pub struct CaseMapping {
+    one: Option<u32>,
+    at: usize,
+    end: usize,
+}
+
+impl CaseMapping {
+    /// The mapping to `c` alone.
+    pub fn single(c: u32) -> CaseMapping {
+        CaseMapping { one: Some(c), at: 0, end: 0 }
+    }
+}
+
+impl Iterator for CaseMapping {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if let Some(c) = self.one.take() {
+            return Some(c);
+        }
+        if self.at < self.end {
+            self.at += 1;
+            return Some(db::TYPE_EXT.get(self.at - 1));
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +428,25 @@ mod tests {
         assert!(props('(' as u32, Version::Current).mirrored);
         assert_eq!(props(0x1f600, Version::V3_2_0).category, "Cn");
         assert_eq!(props(0x1f600, Version::Current).category, "So");
+    }
+
+    #[test]
+    fn char_types() {
+        let t = |c: char| char_type(c as u32);
+        let s = |m: CaseMapping| m.map(|c| char::from_u32(c).unwrap()).collect::<String>();
+        assert!(t('a').is(flag::ALPHA | flag::LOWER) && !t('a').is(flag::UPPER));
+        assert!(t('\u{1c5}').is(flag::TITLE) && t('\u{2168}').is(flag::NUMERIC) && !t('\u{2168}').is(flag::DIGIT));
+        assert!(t('\u{2460}').is(flag::DIGIT) && !t('\u{2460}').is(flag::DECIMAL) && t('\u{663}').is(flag::DECIMAL));
+        assert!(t('\u{1c}').is(flag::SPACE) && t('\u{a0}').is(flag::SPACE) && !t('\u{a0}').is(flag::PRINTABLE));
+        assert!(t('\'').is(flag::CASE_IGNORABLE) && t('\u{2b0}').is(flag::CASED | flag::CASE_IGNORABLE));
+        assert_eq!(s(t('\u{df}').upper()), "SS");
+        assert_eq!(s(t('\u{df}').title()), "Ss");
+        assert_eq!(s(t('\u{df}').fold()), "ss");
+        assert_eq!(s(t('\u{130}').lower()), "i\u{307}");
+        assert_eq!(s(t('\u{1c6}').title()), "\u{1c5}");
+        assert_eq!(s(t('\u{3a3}').lower()), "\u{3c3}");
+        assert_eq!(s(t('\u{1e9e}').fold()), "ss");
+        assert_eq!(char_type(0x110000).upper().collect::<Vec<_>>(), [0x110000]);
     }
 
     #[test]

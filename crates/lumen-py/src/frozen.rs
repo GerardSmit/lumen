@@ -1,7 +1,7 @@
 //! The pure-Python standard library embedded in the binary, served as the lowest-priority
 //! `sys.path` entry through an in-memory file system.
 
-use crate::platform::MemFs;
+use crate::platform::{MemFs, MemPlatform};
 
 /// Virtual directory that holds the embedded modules; `__file__` of an embedded module is
 /// `<FROZEN_DIR>/<relative path>`.
@@ -18,9 +18,9 @@ pub fn table() -> &'static [(&'static str, &'static str)] {
 }
 
 pub fn fs() -> MemFs {
-    let mut fs = MemFs::new();
+    let fs = MemPlatform::bundle();
     for (rel, src) in table() {
-        fs.insert_static(&format!("{}/{}", FROZEN_DIR, rel), src.as_bytes());
+        fs.insert(&format!("{}/{}", FROZEN_DIR, rel), src.as_bytes(), 0o444, 0o555);
     }
     fs
 }

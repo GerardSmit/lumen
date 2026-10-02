@@ -21,7 +21,7 @@ pub(crate) mod bindings {
     /// `[[name, number], ...]`: `os.constants.signals` of this platform.
     #[op]
     pub fn signals() -> Vec<(String, i32)> {
-        lumen_os::consts::signals().iter().map(|&(name, n)| (name.to_string(), n)).collect()
+        lumen_os::signal::names().iter().map(|&(name, n)| (name.to_string(), n)).collect()
     }
 
     /// `[[name, number], ...]`: `os.constants.errno` of this platform.

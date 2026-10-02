@@ -8,7 +8,8 @@
 
 use crate::object::*;
 use crate::vm::*;
-use lumen_common::smuggle::{code_points, escape_text, may_contain, push_code_point};
+use lumen_common::smuggle::{code_points, escape_text, may_contain, push_code_point, Spelling};
+use lumen_common::utf;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -407,6 +408,13 @@ impl<'a> ErrCtx<'a> {
             }
         };
         Ok((r, end))
+    }
+
+    /// [`Self::on_decode`] for a [`utf::Malformed`] sequence, appending the replacement.
+    fn on_malformed(&mut self, it: &mut Interp, data: &mut Cow<'_, [u8]>, m: utf::Malformed, out: &mut String, sp: SurrogateForm) -> R<usize> {
+        let (rep, pos) = self.on_decode(it, data, m.start, m.end, m.reason, Some(sp))?;
+        out.push_str(&rep);
+        Ok(pos)
     }
 
     fn on_decode(&mut self, it: &mut Interp, data: &mut Cow<'_, [u8]>, start: usize, end: usize, reason: &str, sp: Option<SurrogateForm>) -> R<(String, usize)> {
@@ -910,38 +918,11 @@ pub fn utf8_decode(it: &mut Interp, input: &[u8], errors: &str, final_: bool) ->
     if let Ok(s) = std::str::from_utf8(input) {
         return Ok((escape_text(s).into_owned(), input.len()));
     }
-    let mut data = Cow::Borrowed(input);
     let mut out = String::with_capacity(input.len());
     let mut ctx = ErrCtx::new(errors, "utf-8");
-    let mut pos = 0;
-    while pos < data.len() {
-        let (good, err_len) = match std::str::from_utf8(&data[pos..]) {
-            Ok(s) => {
-                out.push_str(&escape_text(s));
-                pos = data.len();
-                break;
-            }
-            Err(e) => (e.valid_up_to(), e.error_len()),
-        };
-        out.push_str(&escape_text(std::str::from_utf8(&data[pos..pos + good]).unwrap_or("")));
-        let start = pos + good;
-        let (end, reason) = match err_len {
-            Some(n) => {
-                let b = data[start];
-                (start + n, if (0x80..0xc2).contains(&b) || b >= 0xf5 { "invalid start byte" } else { "invalid continuation byte" })
-            }
-            None => {
-                if !final_ {
-                    pos = start;
-                    return Ok((out, pos));
-                }
-                (data.len(), "unexpected end of data")
-            }
-        };
-        let (rep, newpos) = ctx.on_decode(it, &mut data, start, end, reason, Some(SurrogateForm::Utf8))?;
-        out.push_str(&rep);
-        pos = newpos;
-    }
+    let pos = utf::decode_utf8(&mut Cow::Borrowed(input), final_, Spelling::CodePoints, &mut out, |data, m, out| {
+        ctx.on_malformed(it, data, m, out, SurrogateForm::Utf8)
+    })?;
     Ok((out, pos))
 }
 
@@ -962,52 +943,11 @@ pub fn utf16_decode(it: &mut Interp, input: &[u8], errors: &str, bo: &mut i32, f
         }
     }
     let be = *bo > 0;
-    let name = if be { "utf-16-be" } else { "utf-16-le" };
-    let rd = |d: &[u8], i: usize| -> u32 {
-        if be {
-            u16::from_be_bytes([d[i], d[i + 1]]) as u32
-        } else {
-            u16::from_le_bytes([d[i], d[i + 1]]) as u32
-        }
-    };
-    let mut data = Cow::Borrowed(input);
     let mut out = String::with_capacity(input.len() / 2);
-    let mut ctx = ErrCtx::new(errors, name);
-    let sp = Some(SurrogateForm::Utf16(be));
-    while pos < data.len() {
-        let (start, end, reason) = if pos + 1 >= data.len() {
-            if !final_ {
-                break;
-            }
-            (pos, data.len(), "truncated data")
-        } else {
-            let u = rd(&data, pos);
-            if !is_surrogate(u) {
-                push_cp(&mut out, u);
-                pos += 2;
-                continue;
-            }
-            if u >= 0xDC00 {
-                (pos, pos + 2, "illegal encoding")
-            } else if pos + 3 >= data.len() {
-                if !final_ {
-                    break;
-                }
-                (pos, data.len(), "unexpected end of data")
-            } else {
-                let u2 = rd(&data, pos + 2);
-                if (0xDC00..0xE000).contains(&u2) {
-                    push_cp(&mut out, 0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00));
-                    pos += 4;
-                    continue;
-                }
-                (pos, pos + 2, "illegal UTF-16 surrogate")
-            }
-        };
-        let (rep, newpos) = ctx.on_decode(it, &mut data, start, end, reason, sp)?;
-        out.push_str(&rep);
-        pos = newpos;
-    }
+    let mut ctx = ErrCtx::new(errors, if be { "utf-16-be" } else { "utf-16-le" });
+    let pos = utf::decode_utf16(&mut Cow::Borrowed(input), pos, be, final_, Spelling::CodePoints, &mut out, |data, m, out| {
+        ctx.on_malformed(it, data, m, out, SurrogateForm::Utf16(be))
+    })?;
     Ok((out, pos))
 }
 

@@ -771,7 +771,7 @@ fn source_of(file: &Path) -> String {
 fn cjs_wrapper(abs_path: &str, source: String) -> String {
     let mut out = format!(
         "const __m = globalThis.require({});\nexport default __m;\n",
-        js_string(abs_path)
+        crate::js_source_string(abs_path)
     );
     let mut names = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -781,7 +781,7 @@ fn cjs_wrapper(abs_path: &str, source: String) -> String {
         // the static scan over-approximated, which is harmless).
         out.push_str(&format!(
             "export const {name} = __m[{}];\n",
-            js_string(&name)
+            crate::js_source_string(&name)
         ));
     }
     out
@@ -1253,57 +1253,6 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// A minimal JSON scan for a `"field": "value"` string — enough for the few `package.json` keys
-/// we read, without a JSON dependency (the workspace is zero-dep). Matches the field as a *key*
-/// (a `"field"` followed by `:`), so it skips occurrences of the same text used as a value — e.g.
-/// the `"module"` in `"type": "module"` is not mistaken for a `"module"` key.
-#[cfg(test)]
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\"");
-    let mut from = 0;
-    while let Some(pos) = json[from..].find(&needle) {
-        let after = json[from + pos + needle.len()..].trim_start();
-        if let Some(value) = after.strip_prefix(':') {
-            // A key: return its string value (`None` if the value isn't a string).
-            return parse_string(value);
-        }
-        // Matched the text as a value or substring; keep looking for the real key.
-        from += pos + needle.len();
-    }
-    None
-}
-
-/// Parse a JSON string literal from `s` (leading whitespace allowed, then the opening `"`).
-#[cfg(test)]
-fn parse_string(s: &str) -> Option<String> {
-    let rest = s.trim_start().strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => out.push(chars.next()?),
-            other => out.push(other),
-        }
-    }
-    None
-}
-
-/// A JSON/JS string literal (for embedding an absolute path in generated source).
-fn js_string(s: &str) -> String {
-    let mut out = String::from('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1485,19 +1434,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_field_scan() {
-        assert_eq!(
-            json_string_field(r#"{"type":"module"}"#, "type").as_deref(),
-            Some("module")
-        );
-        assert_eq!(
-            json_string_field(r#"{ "main" : "lib/i.js" }"#, "main").as_deref(),
-            Some("lib/i.js")
-        );
-        assert_eq!(json_string_field(r#"{"a":1}"#, "type"), None);
-    }
-
-    #[test]
     fn package_type_reads_only_the_root_field() {
         assert_eq!(
             crate::package_type_from_json(r#"{"repository":{"type":"git"},"type":"module"}"#)
@@ -1509,18 +1445,6 @@ mod tests {
             None
         );
         assert_eq!(crate::package_type_from_json(r#"{"type":null}"#), None);
-    }
-
-    #[test]
-    fn json_field_matches_key_not_value() {
-        // `"module"` appears first as the *value* of `"type"`, then as a real key. The scan must
-        // return the key's value, not choke on the value occurrence (the hono package.json shape).
-        let pkg = r#"{ "main": "dist/cjs/index.js", "type": "module", "module": "dist/index.js" }"#;
-        assert_eq!(
-            json_string_field(pkg, "module").as_deref(),
-            Some("dist/index.js")
-        );
-        assert_eq!(json_string_field(pkg, "type").as_deref(), Some("module"));
     }
 
     #[test]
@@ -1617,7 +1541,7 @@ mod tests {
 
     #[test]
     fn js_string_escapes() {
-        assert_eq!(js_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(crate::js_source_string(r#"a"b\c"#), r#""a\"b\\c""#);
     }
     #[test]
     fn subpath_exports_own_legacy_files_and_refuse_blocked_disk_fallback() {

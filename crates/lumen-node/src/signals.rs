@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use lumen_host::{CompletionSender, Ctx, TaskId, TaskRegistry, Value};
 
-pub(crate) use lumen_os::consts::signal_number as number;
+pub(crate) use lumen_os::signal::number;
 
 /// `(name)` — the platform's number for signal `name`, or `undefined` if it is not one.
 pub(crate) fn op_signal_number(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -191,8 +191,7 @@ mod imp {
         if !watchdog && !LISTENERS.lock().unwrap().iter().any(|l| l.sig == sig) {
             return false;
         }
-        // SAFETY: raise(3) takes no pointers.
-        unsafe { libc::raise(sig) == 0 }
+        lumen_os::signal::raise(sig).is_ok()
     }
 
     /// Stop a watch, restoring the default disposition once nothing listens for its signal.

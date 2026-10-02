@@ -49,10 +49,6 @@ use lumen_common::hash;
 mod jsx;
 #[cfg(not(target_arch = "wasm32"))]
 mod napi;
-#[cfg(not(target_arch = "wasm32"))]
-mod fsb;
-#[cfg(target_arch = "wasm32")]
-#[path = "fsb_vfs.rs"]
 mod fsb;
 mod native;
 mod oscon;
@@ -249,10 +245,8 @@ fn arg_path(ctx: &mut Ctx, args: &[Value]) -> Result<String, Value> {
 
 fn op_is_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    return Ok(Value::Bool(lumen_host::vfs::is_file(&p)));
-    #[cfg(not(target_arch = "wasm32"))]
-    Ok(Value::Bool(Path::new(&p).is_file()))
+    use lumen_host::sysfs::PathExt;
+    Ok(Value::Bool(Path::new(&p).fs_is_file()))
 }
 
 /// `(fn, filename)` — name a CommonJS module wrapper's source for stack traces (see
@@ -362,27 +356,13 @@ fn op_set_near_heap_limit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 
 /// `YYYYMMDD.HHMMSS` in local time, as Node's diagnostic file names carry it.
 fn local_stamp() -> String {
-    #[cfg(unix)]
-    // SAFETY: localtime_r fills the zeroed `tm` it is given from a valid `time_t`.
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        if !libc::localtime_r(&now, &mut tm).is_null() {
-            return format!(
-                "{:04}{:02}{:02}.{:02}{:02}{:02}",
-                tm.tm_year + 1900,
-                tm.tm_mon + 1,
-                tm.tm_mday,
-                tm.tm_hour,
-                tm.tm_min,
-                tm.tm_sec
-            );
-        }
-    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    format!("{}.{:06}", secs / 86_400, secs % 86_400)
+        .map_or(0, |d| d.as_secs() as i64);
+    match lumen_os::time::localtime(secs) {
+        Ok(tm) => format!("{:04}{:02}{:02}.{:02}{:02}{:02}", tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec),
+        Err(_) => format!("{}.{:06}", secs / 86_400, secs % 86_400),
+    }
 }
 
 /// `(flags)` — apply the V8 flags lumen implements from a `v8.setFlagsFromString` string
@@ -553,22 +533,14 @@ fn op_compile_commonjs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 fn op_is_dir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    return Ok(Value::Bool(lumen_host::vfs::is_dir(&p)));
-    #[cfg(not(target_arch = "wasm32"))]
-    Ok(Value::Bool(Path::new(&p).is_dir()))
+    Ok(Value::Bool(lumen_host::sysfs::is_dir(&p)))
 }
 
 /// Read a module/JSON source as text; a miss is an error the resolver turns into
 /// MODULE_NOT_FOUND context.
 fn op_read_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    let read = lumen_host::vfs::read_file(&p)
-        .map_err(|e| e.to_io())
-        .and_then(|b| String::from_utf8(b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)));
-    #[cfg(not(target_arch = "wasm32"))]
-    let read = std::fs::read_to_string(&p);
+    let read = lumen_host::sysfs::read_to_string(&p);
     match read {
         Ok(s) => Ok(Value::from_string(crate::codec::canonical(s))),
         Err(e) => Err(ctx.make_error("Error", format!("cannot read '{p}': {e}"))),
@@ -596,10 +568,7 @@ fn op_strip_shebang(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 /// path corrupts binary. Errors carry the errno `code` Node users switch on.
 fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    let read = lumen_host::vfs::read_file(&p).map_err(|e| e.to_io());
-    #[cfg(not(target_arch = "wasm32"))]
-    let read = std::fs::read(&p);
+    let read = lumen_host::sysfs::read(&p);
     match read {
         Ok(bytes) => ctx.make_uint8array(&bytes),
         Err(e) => {
@@ -619,9 +588,6 @@ fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 /// path doesn't exist yet (matching how the JS resolver probes candidates).
 fn op_realpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    let canon = lumen_host::vfs::realpath(&p).map(std::path::PathBuf::from).map_err(|e| e.to_io());
-    #[cfg(not(target_arch = "wasm32"))]
     let canon = lumen_host::canonicalize(&p);
     match canon {
         Ok(c) => Ok(Value::from_string(c.to_string_lossy().into_owned())),
@@ -657,10 +623,10 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .filter(|home| !home.is_empty())
-        .or_else(|| lumen_os::proc::current_user().dir)
+        .or_else(|| lumen_os::ident::current_user().dir)
         .unwrap_or_default();
     let tmpdir = lumen_os::sysinfo::tmpdir();
-    let cpus = lumen_os::proc::cpu_count();
+    let cpus = lumen_os::sysinfo::cpu_count();
     let [_, _, release, version, _] = lumen_os::proc::uname().unwrap_or_default();
 
     let obj = Value::Obj(ctx.new_object());
@@ -773,13 +739,13 @@ pub fn close_child_pipes(ctx: &mut Ctx) { child::close_child_pipes(ctx); }
 /// username, shell, homedir }`, read fresh on each call.
 fn op_os_sysinfo(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let obj = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&obj, "uptime", Value::Num(lumen_os::proc::uptime()));
-    let _ = ctx.set_member(&obj, "freemem", Value::Num(lumen_os::proc::free_memory()));
-    let load = lumen_os::proc::loadavg();
+    let _ = ctx.set_member(&obj, "uptime", Value::Num(lumen_os::sysinfo::uptime()));
+    let _ = ctx.set_member(&obj, "freemem", Value::Num(lumen_os::sysinfo::free_memory()));
+    let load = lumen_os::sysinfo::loadavg();
     for (key, n) in ["load1", "load5", "load15"].into_iter().zip(load) {
         let _ = ctx.set_member(&obj, key, Value::Num(n));
     }
-    let user = lumen_os::proc::current_user();
+    let user = lumen_os::ident::current_user();
     let _ = ctx.set_member(&obj, "uid", Value::Num(user.uid as f64));
     let _ = ctx.set_member(&obj, "gid", Value::Num(user.gid as f64));
     let _ = ctx.set_member(&obj, "username", Value::from_string(user.name.unwrap_or_default()));

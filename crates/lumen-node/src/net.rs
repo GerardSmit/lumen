@@ -617,16 +617,8 @@ fn connect_tcp_from(
     local_ip: Option<IpAddr>,
     local_port: u16,
 ) -> std::io::Result<TcpStream> {
+    use lumen_os::net::{self as os, SockAddr};
     use std::os::fd::FromRawFd;
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
-    // SAFETY: plain socket(2); the descriptor is wrapped (and so closed on error) right away.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a fresh descriptor owned by nothing else.
-    let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    let _ = lumen_os::fdctl::set_inheritable(fd, false);
     let ip = local_ip.unwrap_or(if addr.is_ipv6() {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     } else {
@@ -635,24 +627,24 @@ fn connect_tcp_from(
     if ip.is_ipv6() != addr.is_ipv6() {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let (storage, len) = sockaddr_of(&SocketAddr::new(ip, local_port));
-    // SAFETY: `storage` holds a valid sockaddr of `len` bytes.
-    let rc = unsafe { libc::bind(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let (storage, len) = sockaddr_of(&addr);
+    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+    let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
+    // SAFETY: `fd` is a fresh descriptor owned by nothing else.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    os::bind(fd, &SockAddr::from(SocketAddr::new(ip, local_port))).map_err(os_error)?;
     loop {
-        // SAFETY: as above.
-        let rc = unsafe { libc::connect(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-        if rc == 0 {
-            return Ok(stream);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
+        match os::connect(fd, &SockAddr::from(addr)) {
+            Ok(()) => return Ok(stream),
+            Err(e) if e.errno() == libc::EINTR => {}
+            Err(e) => return Err(os_error(e)),
         }
     }
+}
+
+/// The `io::Error` of a `lumen_os` error, keeping its errno.
+#[cfg(unix)]
+pub(crate) fn os_error(e: lumen_os::FsError) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e.errno())
 }
 
 #[cfg(windows)]
@@ -902,14 +894,10 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
                 Ok(false) => break Ok(0),
                 Err(e) => break Err(e),
             }
-            // SAFETY: the descriptor is kept open by `stream`; `buf` is a live buffer.
-            let n = unsafe { libc::recv(stream.raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
-            if n >= 0 {
-                break Ok(n as usize);
-            }
-            let e = std::io::Error::last_os_error();
-            if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
-                break Err(e);
+            match lumen_os::net::recv(stream.raw_fd(), &mut buf, libc::MSG_DONTWAIT) {
+                Ok(n) => break Ok(n),
+                Err(e) if lumen_os::net::would_block(e.errno()) || e.errno() == libc::EINTR => {}
+                Err(e) => break Err(os_error(e)),
             }
         };
         #[cfg(not(unix))]
@@ -1230,6 +1218,7 @@ fn op_socket_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
 /// IPv6 address (so `::` is dual-stack unless asked otherwise), the real backlog.
 #[cfg(unix)]
 fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Result<TcpListener> {
+    use lumen_os::net as os;
     use std::os::fd::FromRawFd;
     const IPV6ONLY: u32 = 1;
     let addr = match host.parse::<IpAddr>() {
@@ -1240,40 +1229,15 @@ fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Resul
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EADDRNOTAVAIL))?,
     };
     let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
-    // SAFETY: plain socket(2); the descriptor is wrapped (and so closed on error) right away.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    let _ = lumen_os::fdctl::set_inheritable(fd, false);
-    let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
-        // SAFETY: `on` is a live c_int of the size passed.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                (&on as *const i32).cast(),
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-    };
-    set(libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+    os::setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1).map_err(os_error)?;
     if addr.is_ipv6() {
-        set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (flags & IPV6ONLY != 0) as i32)?;
+        os::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (flags & IPV6ONLY != 0) as i32).map_err(os_error)?;
     }
-    let (storage, len) = sockaddr_of(&addr);
-    // SAFETY: `storage` holds a valid sockaddr of `len` bytes.
-    if unsafe { libc::bind(fd, (&storage as *const libc::sockaddr_storage).cast(), len) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a bound stream socket.
-    if unsafe { libc::listen(fd, backlog) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    os::bind(fd, &addr.into()).map_err(os_error)?;
+    os::listen(fd, backlog).map_err(os_error)?;
     Ok(listener)
 }
 
@@ -1710,58 +1674,28 @@ fn invalid_argument_errno() -> i32 {
     10022
 }
 
-#[cfg(unix)]
-pub(crate) fn sockaddr_of(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    let addr = match *addr {
-        SocketAddr::V4(a) => lumen_os::net::SockAddr::V4(a),
-        SocketAddr::V6(a) => lumen_os::net::SockAddr::V6(a),
-    };
-    addr.to_raw().expect("an IP socket address always converts")
-}
-
 /// Bind a UDP socket with the libuv bind flags std cannot express (`UV_UDP_IPV6ONLY` = 1,
 /// `UV_UDP_REUSEADDR` = 4).
 #[cfg(unix)]
 fn bind_udp(addr: SocketAddr, flags: u32) -> std::io::Result<UdpSocket> {
+    use lumen_os::net as os;
     use std::os::fd::FromRawFd;
     const IPV6ONLY: u32 = 1;
     const REUSEADDR: u32 = 4;
     let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
-    // SAFETY: plain socket(2); the descriptor is wrapped (and so closed on error) right away.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let fd = os::socket(domain, libc::SOCK_DGRAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-    let _ = lumen_os::fdctl::set_inheritable(fd, false);
-    let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
-        // SAFETY: `on` is a live c_int of the size passed.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                (&on as *const i32).cast(),
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-    };
+    let set = |level: i32, name: i32| os::setsockopt_int(fd, level, name, 1).map_err(os_error);
     if addr.is_ipv6() && flags & IPV6ONLY != 0 {
-        set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
+        set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)?;
     }
     if flags & REUSEADDR != 0 {
-        set(libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+        set(libc::SOL_SOCKET, libc::SO_REUSEADDR)?;
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        set(libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
+        set(libc::SOL_SOCKET, libc::SO_REUSEPORT)?;
     }
-    let (storage, len) = sockaddr_of(&addr);
-    // SAFETY: `storage` holds a valid sockaddr of `len` bytes.
-    let rc = unsafe { libc::bind(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    os::bind(fd, &addr.into()).map_err(os_error)?;
     Ok(socket)
 }
 
@@ -1799,33 +1733,7 @@ fn op_udp_disconnect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, 
 #[cfg(unix)]
 fn disconnect_udp(socket: &UdpSocket) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    let fd = socket.as_raw_fd();
-    // SAFETY: an all-zero sockaddr_storage with family AF_UNSPEC is the documented way to
-    // dissolve a datagram socket's peer.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    storage.ss_family = libc::AF_UNSPEC as libc::sa_family_t;
-    #[cfg(target_vendor = "apple")]
-    {
-        storage.ss_len = std::mem::size_of::<libc::sockaddr>() as u8;
-    }
-    // SAFETY: `storage` is a live sockaddr of the length passed.
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            (&storage as *const libc::sockaddr_storage).cast(),
-            std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    // Darwin reports the dissolved association as EAFNOSUPPORT on some releases while still
-    // having applied it.
-    if error.raw_os_error() == Some(libc::EAFNOSUPPORT) && socket.peer_addr().is_err() {
-        return Ok(());
-    }
-    Err(error)
+    lumen_os::net::disconnect(socket.as_raw_fd()).map_err(os_error)
 }
 
 #[cfg(not(unix))]
@@ -2052,17 +1960,7 @@ fn op_udp_set_multicast_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
 #[cfg(unix)]
 fn set_ipv6_multicast_hops(socket: &UdpSocket, hops: i32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    // SAFETY: the fd is a live socket and `hops` a c_int of the size passed.
-    let rc = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_MULTICAST_HOPS,
-            (&hops as *const i32).cast(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        )
-    };
-    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    lumen_os::net::setsockopt_int(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, hops).map_err(os_error)
 }
 
 #[cfg(not(unix))]

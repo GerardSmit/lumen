@@ -4,7 +4,10 @@ use super::numeric::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
 use crate::vm::*;
+use crate::unicode::Case;
 use lumen_common::smuggle::{code_points, may_contain};
+use lumen_common::search;
+use lumen_common::ucd::{char_type, flag};
 use std::rc::Rc;
 
 type Kw<'a> = &'a [(Obj, Value)];
@@ -30,7 +33,7 @@ fn str_arg<'a>(it: &mut Interp, v: &'a Value, meth: &str) -> R<&'a str> {
 }
 
 fn is_py_space(c: char) -> bool {
-    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+    crate::unicode::is_space(c as u32)
 }
 
 fn str_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -81,81 +84,33 @@ impl Interp {
     }
 }
 
+fn convert_case(it: &mut Interp, a: &[Value], name: &str, case: Case) -> R<Value> {
+    let s = this(it, a, name)?;
+    Ok(Value::string(crate::unicode::convert(&s.s, case)))
+}
+
 fn upper(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "upper")?;
-    Ok(Value::string(s.s.to_uppercase()))
+    convert_case(it, a, "upper", Case::Upper)
 }
 
 fn lower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "lower")?;
-    Ok(Value::string(s.s.to_lowercase()))
+    convert_case(it, a, "lower", Case::Lower)
 }
 
 fn casefold(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "casefold")?;
-    Ok(Value::string(s.s.to_lowercase().replace('ß', "ss")))
-}
-
-fn push_title(out: &mut String, c: char) {
-    match c as u32 {
-        0x1C4..=0x1C6 => out.push('\u{1C5}'),
-        0x1C7..=0x1C9 => out.push('\u{1C8}'),
-        0x1CA..=0x1CC => out.push('\u{1CB}'),
-        0x1F1..=0x1F3 => out.push('\u{1F2}'),
-        _ => out.extend(c.to_uppercase()),
-    }
-}
-
-fn is_cased(c: char) -> bool {
-    c.is_lowercase() || c.is_uppercase() || crate::unicode::is_titlecase(c)
+    convert_case(it, a, "casefold", Case::Fold)
 }
 
 fn capitalize(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "capitalize")?;
-    let mut out = String::with_capacity(s.s.len());
-    let mut chars = s.s.chars();
-    if let Some(c) = chars.next() {
-        push_title(&mut out, c);
-    }
-    for c in chars {
-        out.extend(c.to_lowercase());
-    }
-    Ok(Value::string(out))
+    convert_case(it, a, "capitalize", Case::Capitalize)
 }
 
 fn title(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "title")?;
-    let mut out = String::with_capacity(s.s.len());
-    let mut prev_cased = false;
-    for c in s.s.chars() {
-        if is_cased(c) {
-            if prev_cased {
-                out.extend(c.to_lowercase());
-            } else {
-                push_title(&mut out, c);
-            }
-            prev_cased = true;
-        } else {
-            out.push(c);
-            prev_cased = false;
-        }
-    }
-    Ok(Value::string(out))
+    convert_case(it, a, "title", Case::Title)
 }
 
 fn swapcase(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "swapcase")?;
-    let mut out = String::with_capacity(s.s.len());
-    for c in s.s.chars() {
-        if c.is_uppercase() {
-            out.extend(c.to_lowercase());
-        } else if c.is_lowercase() {
-            out.extend(c.to_uppercase());
-        } else {
-            out.push(c);
-        }
-    }
-    Ok(Value::string(out))
+    convert_case(it, a, "swapcase", Case::SwapCase)
 }
 
 fn strip_impl(it: &mut Interp, a: &[Value], name: &str, left: bool, right: bool) -> R<Value> {
@@ -495,7 +450,7 @@ fn find_impl(it: &mut Interp, a: &[Value], name: &str, right: bool, raise: bool)
         let bs = s.byte_offset(st);
         let be = s.byte_offset(en);
         let hay = &s.s[bs..be];
-        let pos = if right { hay.rfind(sub) } else { hay.find(sub) };
+        let pos = if right { hay.rfind(sub) } else { search::find(hay.as_bytes(), sub.as_bytes()) };
         pos.map(|p| if s.ascii { bs + p } else { lumen_common::smuggle::count_code_points(&s.s[..bs + p]) })
     };
     match found {
@@ -541,7 +496,7 @@ fn count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if sub.is_empty() {
         return Ok(Value::Int(lumen_common::smuggle::count_code_points(hay) as i64 + 1));
     }
-    Ok(Value::Int(hay.matches(sub).count() as i64))
+    Ok(Value::Int(search::count(hay.as_bytes(), sub.as_bytes(), usize::MAX) as i64))
 }
 
 fn startswith_impl(it: &mut Interp, a: &[Value], name: &str, end: bool) -> R<Value> {
@@ -601,90 +556,98 @@ fn removesuffix(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::str(if p.is_empty() { &s.s } else { s.s.strip_suffix(p).unwrap_or(&s.s) }))
 }
 
-fn all_chars(it: &mut Interp, a: &[Value], name: &str, nonempty: bool, f: fn(char) -> bool) -> R<Value> {
+fn all_chars(it: &mut Interp, a: &[Value], name: &str, nonempty: bool, f: impl Fn(u32) -> bool) -> R<Value> {
     it.check_args(&format!("str.{}", name), a, 1, 1)?;
     let s = this(it, a, name)?;
-    Ok(Value::Bool((!nonempty || s.nchars > 0) && s.s.chars().all(f)))
+    Ok(Value::Bool((!nonempty || s.nchars > 0) && code_points(&s.s).all(f)))
 }
 
-fn is_decimal_char(c: char) -> bool {
-    crate::unicode::is_decimal(c)
-}
-
-fn is_digit_char(c: char) -> bool {
-    is_decimal_char(c) || matches!(c as u32, 0xB2 | 0xB3 | 0xB9 | 0x2070 | 0x2074..=0x2079 | 0x2080..=0x2089)
+fn all_have(it: &mut Interp, a: &[Value], name: &str, f: u16) -> R<Value> {
+    all_chars(it, a, name, true, |c| crate::unicode::has(c, f))
 }
 
 fn isalpha(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isalpha", true, |c| c.is_alphabetic())
+    all_have(it, a, "isalpha", flag::ALPHA)
 }
 fn isalnum(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isalnum", true, |c| c.is_alphanumeric())
+    all_have(it, a, "isalnum", flag::ALPHA | flag::DECIMAL | flag::DIGIT | flag::NUMERIC)
 }
 fn isdigit(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isdigit", true, is_digit_char)
+    all_have(it, a, "isdigit", flag::DIGIT)
 }
 fn isdecimal(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isdecimal", true, is_decimal_char)
+    all_have(it, a, "isdecimal", flag::DECIMAL)
 }
 fn isnumeric(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isnumeric", true, |c| c.is_numeric())
+    all_have(it, a, "isnumeric", flag::NUMERIC)
 }
 fn isspace(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isspace", true, is_py_space)
+    all_chars(it, a, "isspace", true, crate::unicode::is_space)
 }
 fn isascii(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isascii", false, |c| c.is_ascii())
+    all_chars(it, a, "isascii", false, |c| c < 0x80)
 }
 fn isprintable(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isprintable", false, crate::repr::is_printable)
+    all_chars(it, a, "isprintable", false, crate::unicode::is_printable)
+}
+
+/// `str.isupper` (`upper`) or `str.islower`: some cased character, and none of the other case
+/// or titlecase.
+fn is_one_case(it: &mut Interp, a: &[Value], name: &str, upper: bool) -> R<Value> {
+    it.check_args(&format!("str.{}", name), a, 1, 1)?;
+    let s = this(it, a, name)?;
+    let (want, other) = if upper { (flag::UPPER, flag::LOWER) } else { (flag::LOWER, flag::UPPER) };
+    let mut cased = false;
+    for c in code_points(&s.s) {
+        let t = char_type(c);
+        if t.is(other | flag::TITLE) {
+            return Ok(Value::Bool(false));
+        }
+        cased |= t.is(want);
+    }
+    Ok(Value::Bool(cased))
 }
 
 fn isupper(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.isupper", a, 1, 1)?;
-    let s = this(it, a, "isupper")?;
-    let cased = s.s.chars().any(|c| c.is_uppercase() || c.is_lowercase());
-    Ok(Value::Bool(cased && !s.s.chars().any(|c| c.is_lowercase())))
+    is_one_case(it, a, "isupper", true)
 }
 
 fn islower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.islower", a, 1, 1)?;
-    let s = this(it, a, "islower")?;
-    let cased = s.s.chars().any(|c| c.is_uppercase() || c.is_lowercase());
-    Ok(Value::Bool(cased && !s.s.chars().any(|c| c.is_uppercase())))
+    is_one_case(it, a, "islower", false)
 }
 
 fn istitle(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("str.istitle", a, 1, 1)?;
     let s = this(it, a, "istitle")?;
     let mut prev_cased = false;
-    let mut any = false;
-    for c in s.s.chars() {
-        if c.is_uppercase() {
+    let mut cased = false;
+    for c in code_points(&s.s) {
+        let t = char_type(c);
+        if t.is(flag::UPPER | flag::TITLE) {
             if prev_cased {
                 return Ok(Value::Bool(false));
             }
             prev_cased = true;
-            any = true;
-        } else if c.is_lowercase() {
+            cased = true;
+        } else if t.is(flag::LOWER) {
             if !prev_cased {
                 return Ok(Value::Bool(false));
             }
             prev_cased = true;
-            any = true;
+            cased = true;
         } else {
             prev_cased = false;
         }
     }
-    Ok(Value::Bool(any))
+    Ok(Value::Bool(cased))
 }
 
 fn isidentifier(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("str.isidentifier", a, 1, 1)?;
     let s = this(it, a, "isidentifier")?;
-    let mut chars = s.s.chars();
-    let ok = match chars.next() {
-        Some(c) => crate::unicode::is_xid_start(c) && chars.all(crate::unicode::is_xid_continue),
+    let mut cps = code_points(&s.s);
+    let ok = match cps.next() {
+        Some(c) => (c == '_' as u32 || crate::unicode::has(c, flag::XID_START)) && cps.all(|c| crate::unicode::has(c, flag::XID_CONTINUE)),
         None => false,
     };
     Ok(Value::Bool(ok))

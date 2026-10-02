@@ -15,5 +15,6 @@ pub mod spawn;
 pub mod sysinfo;
 pub mod time;
 pub mod uv;
+pub mod vfs;
 
 pub use errno::FsError;

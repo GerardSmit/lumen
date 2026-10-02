@@ -24,7 +24,7 @@ ValueError
 TypeError
 ValueError
 ValueError
-ValueError list.index(x): x not in list
+ValueError 5 is not in list
 ValueError list.remove(x): x not in list
 IndexError pop from empty list
 IndexError list index out of range

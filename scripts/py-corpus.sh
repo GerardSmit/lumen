@@ -4,7 +4,7 @@
 #   scripts/py-corpus.sh run     build lumen-py and print per-directory pass/total
 # Entry scripts are *.py files whose path below tests/py has no component starting with '_'.
 # Expected files: X.out = stdout; X.err = exit code (line 1) + last stderr line (line 2),
-# written only when the exit code is nonzero (an empty X.err means "exit 0").
+# present only when the exit code is nonzero (no X.err means "exit 0").
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CORPUS="$ROOT/crates/lumen-py/tests/py"
@@ -29,7 +29,7 @@ case "${1:-run}" in
       if [ "$code" -ne 0 ]; then
         printf '%s\n%s\n' "$code" "$(tail -n 1 "$SCRATCH/err")" >"$dir/$base.err"
       elif [ -e "$dir/$base.err" ]; then
-        : >"$dir/$base.err"
+        echo "now exits 0, delete ${dir#"$ROOT"/}/$base.err"
       fi
       n=$((n + 1))
     done

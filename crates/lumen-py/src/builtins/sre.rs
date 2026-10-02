@@ -301,7 +301,9 @@ fn clamp(v: i64, len: usize) -> usize {
     v.clamp(0, len as i64) as usize
 }
 
-fn bounds(it: &mut Interp, pos: &Option<Value>, endpos: &Option<Value>, len: usize) -> R<(usize, usize)> {
+/// `pos` and `endpos` as integers, converted before the subject is checked (as CPython's
+/// argument parsing does); [`bounds`] clamps them to the subject.
+fn indices(it: &mut Interp, pos: &Option<Value>, endpos: &Option<Value>) -> R<(i64, i64)> {
     let pos = match pos {
         Some(v) => it.index_of(v)?,
         None => 0,
@@ -310,7 +312,11 @@ fn bounds(it: &mut Interp, pos: &Option<Value>, endpos: &Option<Value>, len: usi
         Some(v) => it.index_of(v)?,
         None => i64::MAX,
     };
-    Ok((clamp(pos, len), clamp(endpos, len)))
+    Ok((pos, endpos))
+}
+
+fn bounds((pos, endpos): (i64, i64), len: usize) -> (usize, usize) {
+    (clamp(pos, len), clamp(endpos, len))
 }
 
 fn new_match(it: &mut Interp, pat: &PatInfo, string: &Value, caps: &Captures, pos: usize, endpos: usize) -> Value {
@@ -500,8 +506,9 @@ fn match_like(it: &mut Interp, a: &[Value], kw: Kw, name: &str, mode: Mode) -> R
     let b = it.bind_args(name, &a[1.min(a.len())..], kw, &["string", "pos", "endpos"], 1)?;
     let pat = pat_info(it, &a[0])?;
     let string = b[0].clone().unwrap();
+    let at = indices(it, &b[1], &b[2])?;
     let input = Input::new(it, &pat, &string)?;
-    let (start, end) = bounds(it, &b[1], &b[2], input.len)?;
+    let (start, end) = bounds(at, input.len);
     let opts = ExecOptions { start, end: Some(end), mode, must_advance: false };
     Ok(match run(it, &pat, &input, opts)? {
         Some(caps) => new_match(it, &pat, &string, &caps, start, end),
@@ -534,8 +541,9 @@ fn pattern_findall(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let b = it.bind_args("findall", &a[1.min(a.len())..], kw, &["string", "pos", "endpos"], 1)?;
     let pat = pat_info(it, &a[0])?;
     let string = b[0].clone().unwrap();
+    let at = indices(it, &b[1], &b[2])?;
     let input = Input::new(it, &pat, &string)?;
-    let (mut start, end) = bounds(it, &b[1], &b[2], input.len)?;
+    let (mut start, end) = bounds(at, input.len);
     let mut out = Vec::new();
     let mut must_advance = false;
     while start <= end {
@@ -562,8 +570,9 @@ fn pattern_scanner(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 fn new_scanner(it: &mut Interp, pattern: &Value, b: &[Option<Value>]) -> R<Value> {
     let pat = pat_info(it, pattern)?;
     let string = b[0].clone().unwrap();
+    let at = indices(it, &b[1], &b[2])?;
     let input = Input::new(it, &pat, &string)?;
-    let (pos, endpos) = bounds(it, &b[1], &b[2], input.len)?;
+    let (pos, endpos) = bounds(at, input.len);
     let ty = types(it).scanner;
     Ok(new_opaque(&ty, ScannerData { pat, string, input, pos, endpos, start: Some(pos), must_advance: false, executing: false }))
 }

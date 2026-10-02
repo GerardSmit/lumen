@@ -1,5 +1,5 @@
-//! Buffer's string codecs (utf8, utf16le, latin1, ascii, hex, base64, base64url) and byte
-//! search, with Node's exact semantics — including its lenient decoders: base64 skips characters
+//! Buffer's string codecs (utf8, utf16le, latin1, ascii, hex, base64, base64url),
+//! with Node's exact semantics — including its lenient decoders: base64 skips characters
 //! outside the alphabet and stops at `=`, hex stops at the first invalid pair, utf8 decodes with
 //! U+FFFD replacement of maximal subparts (WHATWG / V8).
 //!
@@ -19,7 +19,10 @@ pub const BASE64: u32 = 4;
 pub const BASE64URL: u32 = 5;
 pub const UTF16LE: u32 = 6;
 
-use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, SMUGGLE_BASE};
+use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, Spelling};
+use lumen_common::utf;
+use std::borrow::Cow;
+use std::convert::Infallible;
 
 /// Call `f` with each UTF-16 code unit of `s` (smuggled scalars decode to their surrogates).
 #[inline]
@@ -125,11 +128,15 @@ pub(crate) fn canonical(s: String) -> String {
 }
 
 pub fn utf8_decode(bytes: &[u8]) -> String {
-    let s = match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_owned(),
-        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
-    };
-    canonical(s)
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return canonical(s.to_owned());
+    }
+    let mut out = String::with_capacity(bytes.len() + 8);
+    let _ = utf::decode_utf8::<Infallible>(&mut Cow::Borrowed(bytes), true, Spelling::Utf16, &mut out, |_, m, out| {
+        out.push('\u{FFFD}');
+        Ok(m.end)
+    });
+    out
 }
 
 // ---- latin1 / ascii / utf16le -------------------------------------------------------------------
@@ -171,45 +178,17 @@ pub fn utf16le_encode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Units -> string: valid pairs combine, lone surrogates are smuggled.
-pub fn from_units(units: impl Iterator<Item = u16>) -> String {
-    let mut out = String::new();
-    let mut pending: Option<u16> = None;
-    let push_lone = |out: &mut String, u: u16| {
-        out.push(smuggle(u));
-    };
-    for u in units {
-        if let Some(hi) = pending.take() {
-            if (0xDC00..0xE000).contains(&u) {
-                let cp = 0x10000 + (((hi as u32) - 0xD800) << 10) + (u as u32 - 0xDC00);
-                if cp >= SMUGGLE_BASE {
-                    push_lone(&mut out, hi);
-                    push_lone(&mut out, u);
-                } else {
-                    out.push(char::from_u32(cp).unwrap());
-                }
-                continue;
-            }
-            push_lone(&mut out, hi);
-        }
-        match u {
-            0xD800..=0xDBFF => pending = Some(u),
-            0xDC00..=0xDFFF => push_lone(&mut out, u),
-            _ => out.push(char::from_u32(u as u32).unwrap()),
-        }
-    }
-    if let Some(hi) = pending {
-        push_lone(&mut out, hi);
-    }
-    out
-}
-
+/// Node's utf16le: lone surrogates are kept and an odd last byte is dropped.
 pub fn utf16le_decode(bytes: &[u8]) -> String {
-    from_units(
-        bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]])),
-    )
+    let mut out = String::with_capacity(bytes.len());
+    let _ = utf::decode_utf16::<Infallible>(&mut Cow::Borrowed(bytes), 0, false, true, Spelling::Utf16, &mut out, |data, m, out| {
+        if m.end - m.start < 2 {
+            return Ok(m.end);
+        }
+        out.push(smuggle(u16::from_le_bytes([data[m.start], data[m.start + 1]])));
+        Ok(m.start + 2)
+    });
+    out
 }
 
 // ---- hex / base64 (shared byte codecs; Node's lenient decoders) --------------------------------
@@ -323,65 +302,6 @@ pub fn write(dst: &mut [u8], s: &str, enc: u32) -> usize {
     }
 }
 
-// ---- search -------------------------------------------------------------------------------------
-
-/// Index of the first `b` in `hay` (word-at-a-time: 8 bytes per step on the long runs between
-/// candidates, which is what a byte search spends its time on).
-pub fn memchr(b: u8, hay: &[u8]) -> Option<usize> {
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let pat = LO.wrapping_mul(b as u64);
-    let mut i = 0;
-    while i + 8 <= hay.len() {
-        let w = u64::from_le_bytes(hay[i..i + 8].try_into().unwrap()) ^ pat;
-        if (w.wrapping_sub(LO) & !w & HI) != 0 {
-            break; // a match in this word: finish bytewise
-        }
-        i += 8;
-    }
-    hay[i..].iter().position(|&x| x == b).map(|p| p + i)
-}
-
-/// First index >= `from` where `needle` occurs in `hay`.
-pub fn index_of(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if from > hay.len() {
-        return None;
-    }
-    if needle.is_empty() {
-        return Some(from);
-    }
-    let first = needle[0];
-    let last_start = hay.len().checked_sub(needle.len())?;
-    let mut i = from;
-    while i <= last_start {
-        match memchr(first, &hay[i..=last_start]) {
-            None => return None,
-            Some(p) => {
-                i += p;
-                if &hay[i..i + needle.len()] == needle {
-                    return Some(i);
-                }
-                i += 1;
-            }
-        }
-    }
-    None
-}
-
-/// Last index <= `from` where `needle` occurs in `hay`.
-pub fn last_index_of(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.len() > hay.len() {
-        return None;
-    }
-    let start = from.min(hay.len() - needle.len());
-    if needle.is_empty() {
-        return Some(start);
-    }
-    (0..=start)
-        .rev()
-        .find(|&i| hay[i] == needle[0] && &hay[i..i + needle.len()] == needle)
-}
-
 // ---- validation ---------------------------------------------------------------------------------
 
 pub fn is_utf8(bytes: &[u8]) -> bool {
@@ -391,6 +311,7 @@ pub fn is_utf8(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_common::smuggle::SMUGGLE_BASE;
 
     #[test]
     fn base64_node_semantics() {
@@ -449,21 +370,5 @@ mod tests {
         assert_eq!(write(&mut d, "ab\u{e9}", UTF8), 2);
         let mut d = [0u8; 3];
         assert_eq!(write(&mut d, "ab", UTF16LE), 2);
-    }
-
-    #[test]
-    fn search() {
-        assert_eq!(index_of(b"abcabc", b"ca", 0), Some(2));
-        assert_eq!(index_of(b"abcabc", b"abc", 1), Some(3));
-        assert_eq!(index_of(b"abc", b"", 2), Some(2));
-        assert_eq!(index_of(b"abc", b"d", 0), None);
-        assert_eq!(last_index_of(b"abcabc", b"abc", 6), Some(3));
-        assert_eq!(last_index_of(b"abcabc", b"abc", 2), Some(0));
-        let hay: Vec<u8> = (0..1000u32).map(|i| (i * 31 + 7) as u8).collect();
-        for b in 0..=255u8 {
-            assert_eq!(memchr(b, &hay), hay.iter().position(|&x| x == b), "byte {b}");
-            assert_eq!(memchr(b, &hay[3..17]), hay[3..17].iter().position(|&x| x == b));
-        }
-        assert_eq!(index_of(&hay, &hay[500..505], 0), Some(500 % 256));
     }
 }

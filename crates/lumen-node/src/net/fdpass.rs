@@ -15,26 +15,11 @@ fn set_cloexec(fd: RawFd) {
 }
 
 fn sockopt_int(fd: RawFd, level: libc::c_int, name: libc::c_int) -> std::io::Result<libc::c_int> {
-    let mut value: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `value` is a live c_int and `len` its size.
-    let rc = unsafe { libc::getsockopt(fd, level, name, (&mut value as *mut libc::c_int).cast(), &mut len) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(value)
+    lumen_os::net::getsockopt_int(fd, level, name).map_err(os_error)
 }
 
 fn socket_family(fd: RawFd) -> std::io::Result<libc::c_int> {
-    // SAFETY: a zeroed sockaddr_storage is a valid out-buffer for getsockname.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    // SAFETY: `storage`/`len` describe a live buffer.
-    let rc = unsafe { libc::getsockname(fd, (&mut storage as *mut libc::sockaddr_storage).cast(), &mut len) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(storage.ss_family as libc::c_int)
+    Ok(lumen_os::net::getsockname(fd).map_err(os_error)?.family())
 }
 
 fn fd_error(ctx: &mut Ctx, syscall: &'static str, error: &std::io::Error) -> Value {
@@ -201,43 +186,7 @@ pub(super) fn op_release(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Val
 type MsgResult = Result<(Vec<u8>, Vec<RawFd>), NetErr>;
 
 fn recv_with_fds(fd: RawFd, buf: &mut [u8], fds: &mut Vec<RawFd>) -> std::io::Result<usize> {
-    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-    // SAFETY: CMSG_SPACE is a pure size computation.
-    let space = unsafe { libc::CMSG_SPACE((MAX_FDS * std::mem::size_of::<RawFd>()) as u32) } as usize;
-    let mut control = vec![0u8; space];
-    // SAFETY: a zeroed msghdr is valid; the pointers set below outlive the call.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = space as _;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let flags = libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let flags = libc::MSG_DONTWAIT;
-    // SAFETY: `msg` describes live buffers.
-    let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: walking the control buffer recvmsg just filled, with the libc CMSG helpers.
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let data = libc::CMSG_DATA(cmsg) as *const RawFd;
-                let header = libc::CMSG_LEN(0) as usize;
-                let count = ((*cmsg).cmsg_len as usize).saturating_sub(header) / std::mem::size_of::<RawFd>();
-                for i in 0..count {
-                    let received = std::ptr::read_unaligned(data.add(i));
-                    set_cloexec(received);
-                    fds.push(received);
-                }
-            }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
-    }
-    Ok(n as usize)
+    lumen_os::net::recv_fds(fd, buf, libc::MSG_DONTWAIT, MAX_FDS, fds).map_err(os_error)
 }
 
 /// `(socketId, resolve, reject)` — read from a channel socket, collecting any descriptors that
@@ -300,40 +249,8 @@ fn decode_msg(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<V
 
 /// One `sendmsg`, with `pass` (when >= 0) attached as `SCM_RIGHTS`.
 fn send_with_fd(fd: RawFd, data: &[u8], pass: RawFd, dontwait: bool) -> std::io::Result<usize> {
-    let mut iov = libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: data.len() };
-    // SAFETY: CMSG_SPACE is a pure size computation.
-    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-    let mut control = vec![0u8; space];
-    // SAFETY: a zeroed msghdr is valid; the pointers set below outlive the call.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    if pass >= 0 {
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = space as _;
-        // SAFETY: the control buffer has room for one header carrying one descriptor.
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut RawFd, pass);
-        }
-    }
-    let mut flags = 0;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        flags |= libc::MSG_NOSIGNAL;
-    }
-    if dontwait {
-        flags |= libc::MSG_DONTWAIT;
-    }
-    // SAFETY: `msg` describes live buffers.
-    let n = unsafe { libc::sendmsg(fd, &msg, flags) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(n as usize)
+    let flags = if dontwait { libc::MSG_DONTWAIT } else { 0 };
+    lumen_os::net::send_fd(fd, data, (pass >= 0).then_some(pass), flags).map_err(os_error)
 }
 
 fn pass_arg(args: &[Value], i: usize) -> RawFd {
@@ -455,17 +372,14 @@ pub(super) fn op_dup_fd(_ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Val
     if fd < 0 {
         return Ok(Value::Num(-1.0));
     }
-    // SAFETY: F_DUPFD_CLOEXEC on a descriptor number; failure is reported as -1.
-    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    Ok(Value::Num(dup as f64))
+    Ok(Value::Num(lumen_os::net::dup(fd).unwrap_or(-1) as f64))
 }
 
 /// `(fd)` — close a raw descriptor this glue owns (a `dupFd` copy, an unclaimed received one).
 pub(super) fn op_close_fd(_ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let fd = pass_arg(args, 0);
     if fd >= 0 {
-        // SAFETY: the caller owns `fd`.
-        unsafe { libc::close(fd) };
+        let _ = lumen_os::net::close(fd);
     }
     Ok(Value::Undefined)
 }

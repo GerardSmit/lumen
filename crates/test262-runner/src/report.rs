@@ -36,7 +36,7 @@ pub fn write(
         first = false;
         out.push_str(&format!(
             "    {}: {{ \"pass\": {}, \"fail\": {}, \"skip\": {} }}",
-            json_string(cat),
+            lumen_common::json::json_string(cat),
             t.pass,
             t.fail,
             t.skip
@@ -52,12 +52,8 @@ pub fn write(
 fn json_str_array(items: &[String]) -> String {
     items
         .iter()
-        .map(|s| json_string(s))
+        .map(|s| lumen_common::json::json_string(s))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn json_string(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}

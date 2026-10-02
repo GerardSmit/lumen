@@ -1,7 +1,7 @@
 //! `dict`, dict views, `set` and `frozenset`.
 
 use super::numeric::{reg_binops, reg_compare};
-use super::slots::reg_slots;
+use super::slots::{reg_method_forms, reg_slots};
 use crate::containers::pydict_of;
 use crate::dict::PyDict;
 use crate::object::*;
@@ -447,7 +447,8 @@ pub fn init(it: &mut Interp) {
     if let Some(d) = dict.dict.borrow().as_ref() {
         dict_set_str(d, "__hash__", Value::None);
     }
-    reg_slots(it, &dict, &["__getitem__", "__setitem__", "__delitem__", "__len__", "__contains__", "__iter__"]);
+    reg_slots(it, &dict, &["__setitem__", "__delitem__", "__len__", "__iter__"]);
+    reg_method_forms(&dict, &["__getitem__", "__contains__"]);
     reg_binops(it, &dict, &["__or__", "__ror__"]);
     reg_compare(it, &dict, false);
 
@@ -498,7 +499,8 @@ pub fn init(it: &mut Interp) {
         dict_set_str(d, "__hash__", Value::None);
     }
     for t in [&set, &frozenset] {
-        reg_slots(it, t, &["__len__", "__contains__", "__iter__"]);
+        reg_slots(it, t, &["__len__", "__iter__"]);
+        reg_method_forms(t, &["__contains__"]);
         reg_binops(it, t, &["__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__", "__rxor__"]);
         reg_compare(it, t, true);
     }

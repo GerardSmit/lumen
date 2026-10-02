@@ -875,29 +875,35 @@ impl Interp {
                 "__name__" | "__qualname__" | "__doc__" | "__module__" | "__wrapped__" | "__text_signature__" => {
                     return self.get_attr_str(f, nm).map(Some).or_else(|e| if nm == "__doc__" { Ok(Some(Value::None)) } else { Err(e) })
                 }
-                _ => {}
+                // Other attributes not defined by the method type come from the function.
+                _ => {
+                    let mt = self.type_of_obj(o);
+                    if !nm.starts_with("__") && self.lookup_mro(&mt, nm).is_none() {
+                        let f = f.clone();
+                        return self.get_attr_str(&f, nm).map(Some);
+                    }
+                }
             },
             Kind::Native(n) => match (nm, n.desc) {
                 ("__name__", _) => return Ok(Some(Value::str(n.name))),
-                ("__qualname__", Some(d)) if d.class().is_some() => {
-                    return Ok(Some(Value::string(format!("{}.{}", crate::bind::args::class_name(d), n.name))));
-                }
-                ("__qualname__", None) if n.method => {
+                ("__qualname__", _) if matches!(n.owner, Some(NativeOwner::Class(_))) => {
                     if let Some(NativeOwner::Class(c)) = &n.owner {
                         return Ok(Some(Value::string(format!("{}.{}", self.type_name(c), n.name))));
                     }
-                    return Ok(Some(Value::str(n.name)));
                 }
-                ("__objclass__", None) if n.method => {
+                ("__qualname__", Some(d)) if d.class().is_some() => {
+                    return Ok(Some(Value::string(format!("{}.{}", crate::bind::args::class_name(d), n.name))));
+                }
+                ("__objclass__", _) if n.method => {
                     if let Some(NativeOwner::Class(c)) = &n.owner {
                         return Ok(Some(Value::Obj(c.clone())));
                     }
                 }
                 ("__qualname__", _) => return Ok(Some(Value::str(n.name))),
-                ("__doc__", Some(d)) => return Ok(Some(d.doc.map(Value::str).unwrap_or(Value::None))),
+                ("__doc__", Some(d)) => return Ok(Some(crate::bind::args::py_doc(d, n.name).map(Value::str).unwrap_or(Value::None))),
                 ("__doc__", None) => return Ok(Some(Value::None)),
                 ("__text_signature__", d) => {
-                    return Ok(Some(d.and_then(crate::bind::args::text_signature).map(Value::string).unwrap_or(Value::None)))
+                    return Ok(Some(d.and_then(crate::bind::args::native_text_signature).map(Value::string).unwrap_or(Value::None)))
                 }
                 ("__module__", Some(d)) if d.class().is_none() && d.module().is_some() => {
                     return Ok(Some(Value::str(d.module().unwrap_or("builtins"))))
@@ -1045,7 +1051,7 @@ impl Interp {
                         }
                     }
                 }
-                if matches!(o.kind, Kind::Instance | Kind::Module | Kind::List(_) | Kind::Dict(_) | Kind::Exception(_)) || o.cls.is_some() {
+                if matches!(o.kind, Kind::Instance | Kind::Module | Kind::List(_) | Kind::Dict(_) | Kind::Exception(_) | Kind::Opaque(_)) || o.cls.is_some() {
                     let d = self.instance_dict(o);
                     return Ok(Some(Value::Obj(d)));
                 }
@@ -1116,8 +1122,7 @@ impl Interp {
         Ok(())
     }
 
-    pub fn generic_setattr(&mut self, obj: &Value, cls: &Obj, name: &Obj, v: Value) -> R<()> {
-        let nm = name.as_str_kind().unwrap_or("").to_string();
+    fn check_mutable_type(&mut self, obj: &Value, nm: &str) -> R<()> {
         if let Value::Obj(o) = obj {
             if let Kind::Type(td) = &o.kind {
                 if td.flags.get() & TF_IMMUTABLE != 0 {
@@ -1126,6 +1131,12 @@ impl Interp {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn generic_setattr(&mut self, obj: &Value, cls: &Obj, name: &Obj, v: Value) -> R<()> {
+        let nm = name.as_str_kind().unwrap_or("").to_string();
+        self.check_mutable_type(obj, &nm)?;
         let o = match obj {
             Value::Obj(o) => o,
             _ => return Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), nm))),
@@ -1305,6 +1316,10 @@ impl Interp {
 
     pub fn generic_delattr(&mut self, obj: &Value, cls: &Obj, name: &Obj) -> R<()> {
         let nm = name.as_str_kind().unwrap_or("").to_string();
+        self.check_mutable_type(obj, &nm)?;
+        if nm == "__dict__" && matches!(obj, Value::Obj(o) if o.dict.borrow().is_some() || matches!(o.kind, Kind::Instance | Kind::Opaque(_))) {
+            return Err(self.type_error("cannot delete __dict__"));
+        }
         if let Some(d) = self.lookup_mro_name(cls, name) {
             if let Value::Obj(dobj) = &d {
                 match &dobj.kind {

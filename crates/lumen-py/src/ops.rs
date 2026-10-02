@@ -2087,6 +2087,21 @@ pub fn big_range_len(r: &[crate::pyint::BigInt; 3]) -> crate::pyint::BigInt {
     hi.sub(lo).sub(&one).floor_div(&step).add(&one)
 }
 
+/// The position of a builtin number in the int < float < complex tower; 0 for anything else.
+fn numeric_rank(v: &Value) -> u8 {
+    match v {
+        Value::Int(_) | Value::Bool(_) => 1,
+        Value::Float(_) => 2,
+        Value::Obj(o) => match o.kind {
+            Kind::Int(_) => 1,
+            Kind::Float(_) => 2,
+            Kind::Complex(..) => 3,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2104,20 +2119,5 @@ mod tests {
         assert_eq!(n(r(0, 10, -1)), "0");
         assert_eq!(n(r(5, 5, 1)), "0");
         assert_eq!(n(r(-(1 << 70), 1 << 70, 1 << 69)), "4");
-    }
-}
-
-/// The position of a builtin number in the int < float < complex tower; 0 for anything else.
-fn numeric_rank(v: &Value) -> u8 {
-    match v {
-        Value::Int(_) | Value::Bool(_) => 1,
-        Value::Float(_) => 2,
-        Value::Obj(o) => match o.kind {
-            Kind::Int(_) => 1,
-            Kind::Float(_) => 2,
-            Kind::Complex(..) => 3,
-            _ => 0,
-        },
-        _ => 0,
     }
 }

@@ -1,14 +1,21 @@
 //! Generator, coroutine and async-generator methods.
 
+use crate::bind::{PyCx, PyHost, This};
 use crate::object::*;
 use crate::vm::*;
+use lumen_bind::{FromArg, Slot};
 
-type Kw<'a> = &'a [(Obj, Value)];
+/// A generator, coroutine or async generator.
+#[derive(Clone, Copy)]
+pub struct Gen<'a>(pub &'a Obj);
 
-fn gen_of<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a Obj> {
-    match a.first() {
-        Some(Value::Obj(o)) if matches!(o.kind, Kind::Generator(_)) => Ok(o),
-        _ => Err(it.type_error("descriptor requires a generator object")),
+impl<'a> FromArg<'a, PyHost> for Gen<'a> {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        match v {
+            Value::Obj(o) if matches!(o.kind, Kind::Generator(_)) => Ok(Gen(o)),
+            _ => Err(cx.arg_error(at, "generator", v)),
+        }
     }
 }
 
@@ -26,9 +33,15 @@ impl Interp {
         }
     }
 
-    fn throw_exc(&mut self, a: &[Value]) -> R<Obj> {
-        let typ = a.first().cloned().unwrap_or(Value::None);
-        let val = a.get(1).cloned().filter(|v| !v.is_none());
+    /// The exception `throw(typ, val, tb)` raises into the generator; the three-argument form
+    /// warns as deprecated, as in CPython 3.12.
+    fn throw_exc(&mut self, name: &str, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Obj> {
+        if val.is_some() || tb.is_some() {
+            let msg = format!("the (type, exc, tb) signature of {name}() is deprecated, use the single-arg signature instead.");
+            crate::builtins::warningsm::warn_category(self, "DeprecationWarning", &msg, 1)?;
+        }
+        let typ = typ.clone();
+        let val = val.cloned().filter(|v| !v.is_none());
         let exc = match (&typ, val) {
             (Value::Obj(o), Some(v)) if matches!(o.kind, Kind::Type(_)) => {
                 let inst = if matches!(&v, Value::Obj(vo) if matches!(vo.kind, Kind::Exception(_))) {
@@ -48,37 +61,72 @@ impl Interp {
     }
 }
 
-fn gen_next(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let g = gen_of(it, a)?.clone();
-    let r = it.gen_send(&g, Value::None)?;
-    it.gen_result(r)
+/// `send`, `throw` and `close`, shared by generators, coroutines and async generators.
+#[lumen_bind::class(name = "generator", hint(py(shared)))]
+pub struct GenMethods;
+
+#[lumen_bind::methods]
+impl GenMethods {
+    /// send(arg) -> send 'arg' into generator,
+    /// return next yielded value or raise StopIteration.
+    #[method(hint(py(text_signature = "")))]
+    fn send(slf: This<Gen<'_>>, it: &mut Interp, arg: &Value) -> R<Value> {
+        let r = it.gen_send(slf.0 .0, arg.clone())?;
+        it.gen_result(r)
+    }
+
+    /// throw(value)
+    /// throw(type[,value[,tb]])
+    ///
+    /// Raise exception in generator, return next yielded value or raise
+    /// StopIteration.
+    /// the (type, val, tb) signature is deprecated,
+    /// and may be removed in a future version of Python.
+    #[method(hint(py(text_signature = "")))]
+    fn throw(slf: This<Gen<'_>>, it: &mut Interp, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Value> {
+        let exc = it.throw_exc("throw", typ, val, tb)?;
+        let r = it.gen_throw(slf.0 .0, exc)?;
+        it.gen_result(r)
+    }
+
+    /// close() -> raise GeneratorExit inside generator.
+    #[method(hint(py(text_signature = "")))]
+    fn close(slf: This<Gen<'_>>, it: &mut Interp) -> R<()> {
+        it.gen_close(slf.0 .0)
+    }
 }
 
-fn gen_send(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("send", a, 2, 2)?;
-    let g = gen_of(it, a)?.clone();
-    let r = it.gen_send(&g, a[1].clone())?;
-    it.gen_result(r)
+/// The iterator protocol of generators.
+#[lumen_bind::class(name = "generator")]
+pub struct Generator;
+
+#[lumen_bind::methods]
+impl Generator {
+    /// Implement iter(self).
+    #[proto(iter)]
+    fn iter(slf: This<Value>) -> Value {
+        slf.0
+    }
+
+    /// Implement next(self).
+    #[proto(next)]
+    fn next(slf: This<Gen<'_>>, it: &mut Interp) -> R<Value> {
+        let r = it.gen_send(slf.0 .0, Value::None)?;
+        it.gen_result(r)
+    }
 }
 
-fn gen_throw(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("throw", a, 2, 4)?;
-    let g = gen_of(it, a)?.clone();
-    let exc = it.throw_exc(&a[1..])?;
-    let r = it.gen_throw(&g, exc)?;
-    it.gen_result(r)
-}
+/// `coroutine.__await__`.
+#[lumen_bind::class(name = "coroutine")]
+pub struct Coroutine;
 
-fn gen_close(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("close", a, 1, 1)?;
-    let g = gen_of(it, a)?.clone();
-    it.gen_close(&g)?;
-    Ok(Value::None)
-}
-
-fn self_ret(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__iter__", a, 1, 1)?;
-    Ok(a[0].clone())
+#[lumen_bind::methods]
+impl Coroutine {
+    /// Return an iterator to be used in await expression.
+    #[proto(await)]
+    fn await_(slf: This<Value>) -> Value {
+        slf.0
+    }
 }
 
 // ---- async generators --------------------------------------------------------------------------
@@ -103,41 +151,66 @@ pub struct AsyncGenHooks {
 
 /// `async_gen_init_hooks`: on the first `__anext__`/`asend`/`athrow`/`aclose` of `g`, calls
 /// the `firstiter` hook with it.
-fn agen_init_hooks(it: &mut Interp, a: &[Value]) -> R<()> {
-    let g = gen_of(it, a)?;
+fn agen_init_hooks(it: &mut Interp, g: &Obj) -> R<()> {
     let Kind::Generator(gd) = &g.kind else { return Ok(()) };
     if gd.hooks_inited.replace(true) {
         return Ok(());
     }
     if let Some(f) = it.native_state::<AsyncGenHooks>().firstiter.clone() {
-        it.call(&f, vec![a[0].clone()], Vec::new())?;
+        it.call(&f, vec![Value::Obj(g.clone())], Vec::new())?;
     }
     Ok(())
 }
 
-fn agen_anext(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__anext__", a, 1, 1)?;
-    agen_init_hooks(it, a)?;
-    Ok(new_asend(it, &a[0], "anext", Value::None))
-}
+/// `async_generator`'s own members.
+#[lumen_bind::class(name = "async_generator")]
+pub struct AsyncGenerator;
 
-fn agen_asend(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("asend", a, 2, 2)?;
-    agen_init_hooks(it, a)?;
-    Ok(new_asend(it, &a[0], "asend", a[1].clone()))
-}
+#[lumen_bind::methods]
+impl AsyncGenerator {
+    /// Return an awaitable, that resolves in asynchronous iterator.
+    #[proto(aiter)]
+    fn aiter(slf: This<Value>) -> Value {
+        slf.0
+    }
 
-fn agen_athrow(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("athrow", a, 2, 4)?;
-    agen_init_hooks(it, a)?;
-    let exc = it.throw_exc(&a[1..])?;
-    Ok(new_asend(it, &a[0], "athrow", Value::Obj(exc)))
-}
+    /// Return a value or raise StopAsyncIteration.
+    #[proto(anext)]
+    fn anext(slf: This<Gen<'_>>, it: &mut Interp) -> R<Value> {
+        let g = slf.0 .0;
+        agen_init_hooks(it, g)?;
+        Ok(new_asend(it, &Value::Obj(g.clone()), "anext", Value::None))
+    }
 
-fn agen_aclose(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("aclose", a, 1, 1)?;
-    agen_init_hooks(it, a)?;
-    Ok(new_asend(it, &a[0], "aclose", Value::None))
+    /// asend(v) -> send 'v' in generator.
+    #[method(hint(py(text_signature = "")))]
+    fn asend(slf: This<Gen<'_>>, it: &mut Interp, arg: &Value) -> R<Value> {
+        let g = slf.0 .0;
+        agen_init_hooks(it, g)?;
+        Ok(new_asend(it, &Value::Obj(g.clone()), "asend", arg.clone()))
+    }
+
+    /// athrow(value)
+    /// athrow(type[,value[,tb]])
+    ///
+    /// raise exception in generator.
+    /// the (type, val, tb) signature is deprecated,
+    /// and may be removed in a future version of Python.
+    #[method(hint(py(text_signature = "")))]
+    fn athrow(slf: This<Gen<'_>>, it: &mut Interp, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Value> {
+        let g = slf.0 .0;
+        agen_init_hooks(it, g)?;
+        let exc = it.throw_exc("athrow", typ, val, tb)?;
+        Ok(new_asend(it, &Value::Obj(g.clone()), "athrow", Value::Obj(exc)))
+    }
+
+    /// aclose() -> raise GeneratorExit inside generator.
+    #[method(hint(py(text_signature = "")))]
+    fn aclose(slf: This<Gen<'_>>, it: &mut Interp) -> R<Value> {
+        let g = slf.0 .0;
+        agen_init_hooks(it, g)?;
+        Ok(new_asend(it, &Value::Obj(g.clone()), "aclose", Value::None))
+    }
 }
 
 fn asend_step(it: &mut Interp, this: &Value, send: Value, throw: Option<Obj>) -> R<Value> {
@@ -213,52 +286,70 @@ fn asend_step(it: &mut Interp, this: &Value, send: Value, throw: Option<Obj>) ->
     }
 }
 
-fn asend_next(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    asend_step(it, &a[0], Value::None, None)
-}
+/// The awaitable `__anext__`, `asend`, `athrow` and `aclose` return.
+#[lumen_bind::class(name = "async_generator_asend")]
+pub struct AsyncGenAsend;
 
-fn asend_send(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("send", a, 2, 2)?;
-    asend_step(it, &a[0], a[1].clone(), None)
-}
-
-fn asend_throw(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("throw", a, 2, 4)?;
-    let exc = it.throw_exc(&a[1..])?;
-    asend_step(it, &a[0], Value::None, Some(exc))
-}
-
-fn asend_close(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let _ = it;
-    if let Value::Obj(o) = &a[0] {
-        let d = it.instance_dict(o);
-        dict_set_str(&d, "done", Value::Bool(true));
+#[lumen_bind::methods]
+impl AsyncGenAsend {
+    /// Return an iterator to be used in await expression.
+    #[proto(await)]
+    fn await_(slf: This<Value>) -> Value {
+        slf.0
     }
-    Ok(Value::None)
+
+    /// Implement iter(self).
+    #[proto(iter)]
+    fn iter(slf: This<Value>) -> Value {
+        slf.0
+    }
+
+    /// Implement next(self).
+    #[proto(next)]
+    fn next(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        asend_step(it, &slf, Value::None, None)
+    }
+
+    /// send(arg) -> send 'arg' into generator,
+    /// return next yielded value or raise StopIteration.
+    #[method(hint(py(text_signature = "")))]
+    fn send(slf: This<&Value>, it: &mut Interp, arg: &Value) -> R<Value> {
+        asend_step(it, &slf, arg.clone(), None)
+    }
+
+    /// throw(value)
+    /// throw(type[,value[,tb]])
+    ///
+    /// Raise exception in generator, return next yielded value or raise
+    /// StopIteration.
+    /// the (type, val, tb) signature is deprecated,
+    /// and may be removed in a future version of Python.
+    #[method(hint(py(text_signature = "")))]
+    fn throw(slf: This<&Value>, it: &mut Interp, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Value> {
+        let exc = it.throw_exc("throw", typ, val, tb)?;
+        asend_step(it, &slf, Value::None, Some(exc))
+    }
+
+    /// close() -> raise GeneratorExit inside generator.
+    #[method(hint(py(text_signature = "")))]
+    fn close(slf: This<&Value>, it: &mut Interp) {
+        if let Value::Obj(o) = *slf {
+            let d = it.instance_dict(o);
+            dict_set_str(&d, "done", Value::Bool(true));
+        }
+    }
 }
 
 pub fn init(it: &mut Interp) {
     for t in [it.types.generator.clone(), it.types.coroutine.clone(), it.types.async_generator.clone()] {
-        it.reg(&t, "send", gen_send);
-        it.reg(&t, "throw", gen_throw);
-        it.reg(&t, "close", gen_close);
+        crate::bind::install_into::<GenMethods>(&t, &["send", "throw", "close"]);
     }
     let g = it.types.generator.clone();
-    it.reg(&g, "__iter__", self_ret);
-    it.reg(&g, "__next__", gen_next);
+    crate::bind::extend_type::<Generator>(it, &g);
     let c = it.types.coroutine.clone();
-    it.reg(&c, "__await__", self_ret);
+    crate::bind::extend_type::<Coroutine>(it, &c);
     let ag = it.types.async_generator.clone();
-    it.reg(&ag, "__aiter__", self_ret);
-    it.reg(&ag, "__anext__", agen_anext);
-    it.reg(&ag, "asend", agen_asend);
-    it.reg(&ag, "athrow", agen_athrow);
-    it.reg(&ag, "aclose", agen_aclose);
+    crate::bind::extend_type::<AsyncGenerator>(it, &ag);
     let w = it.types.asend.clone();
-    it.reg(&w, "__await__", self_ret);
-    it.reg(&w, "__iter__", self_ret);
-    it.reg(&w, "__next__", asend_next);
-    it.reg(&w, "send", asend_send);
-    it.reg(&w, "throw", asend_throw);
-    it.reg(&w, "close", asend_close);
+    crate::bind::extend_type::<AsyncGenAsend>(it, &w);
 }

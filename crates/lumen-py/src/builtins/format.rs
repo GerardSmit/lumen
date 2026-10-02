@@ -2,6 +2,7 @@
 
 use crate::pyint::{BigInt, PyInt};
 use crate::fmath;
+use lumen_common::float::format::{fixed, significant, Rounding};
 use crate::num::{float_repr, to_num, Num};
 use crate::object::*;
 use crate::vm::*;
@@ -407,14 +408,14 @@ impl Interp {
             "inf".to_string()
         } else {
             match ty {
-                Some('f') | Some('F') => format!("{:.*}", sp.precision.unwrap_or(6), a),
+                Some('f') | Some('F') => fixed(a, sp.precision.unwrap_or(6), Rounding::HalfEven),
                 Some('e') | Some('E') => fmt_exp(a, sp.precision.unwrap_or(6), sp.alt),
-                Some('%') => format!("{:.*}", sp.precision.unwrap_or(6), a * 100.0),
+                Some('%') => fixed(a * 100.0, sp.precision.unwrap_or(6), Rounding::HalfEven),
                 Some('g') | Some('G') | Some('n') => fmt_general(a, sp.precision.unwrap_or(6), sp.alt),
                 _ => match sp.precision {
                     None => float_repr(a),
                     Some(p) => {
-                        let g = fmt_general(a, p, sp.alt);
+                        let g = fmt_general_with(a, p, sp.alt, 1);
                         if g.contains('.') || g.contains('e') || g.contains("inf") || g.contains("nan") {
                             g
                         } else {
@@ -618,24 +619,30 @@ impl Interp {
 }
 
 fn fmt_exp(a: f64, prec: usize, alt: bool) -> String {
-    let s = format!("{:.*e}", prec, a);
-    let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
-    let ev: i32 = e.parse().unwrap_or(0);
-    let m = if alt && prec == 0 { format!("{}.", m) } else { m.to_string() };
+    let (digits, ev) = significant(a, prec + 1, Rounding::HalfEven);
+    let mut m = digits[..1].to_string();
+    if prec > 0 || alt {
+        m.push('.');
+    }
+    m.push_str(&digits[1..]);
     format!("{}e{}{:02}", m, if ev < 0 { '-' } else { '+' }, ev.abs())
 }
 
 fn fmt_general(a: f64, prec: usize, alt: bool) -> String {
+    fmt_general_with(a, prec, alt, 0)
+}
+
+/// `'g'` formatting; the exponential form is used from exponent `p - shorten` up (the format with
+/// no type letter switches one digit earlier than `'g'`).
+fn fmt_general_with(a: f64, prec: usize, alt: bool, shorten: i32) -> String {
     let p = if prec == 0 { 1 } else { prec };
-    if a == 0.0 {
+    let (_, x) = significant(a, p, Rounding::HalfEven);
+    if a == 0.0 && shorten == 0 {
         return if alt { format!("0.{}", "0".repeat(p - 1)) } else { "0".into() };
     }
-    let es = format!("{:.*e}", p - 1, a);
-    let (_, e) = es.split_once('e').unwrap_or(("", "0"));
-    let x: i32 = e.parse().unwrap_or(0);
-    if x >= -4 && x < p as i32 {
+    if x >= -4 && x < p as i32 - shorten {
         let decimals = (p as i32 - 1 - x).max(0) as usize;
-        let s = format!("{:.*}", decimals, a);
+        let s = fixed(a, decimals, Rounding::HalfEven);
         if alt {
             if s.contains('.') {
                 s

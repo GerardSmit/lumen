@@ -64,11 +64,12 @@
 //!
 //! The macros validate only the shape of a hint (`flag` or `key = "value"`); the keys are the
 //! host's. The Python host reads, on an op / member: `text_signature = ".."` (`""`: no
-//! `__text_signature__`), `arg_style = "parse"` (`PyArg_ParseTuple` error wording), `arg_name =
-//! ".."` (the name in argument errors), `aliases = "a, b"` (extra names for the same native);
+//! `__text_signature__`), `arg_style = "parse"` / `"unpack"` (`PyArg_ParseTuple` /
+//! `PyArg_UnpackTuple` error wording), `arg_name = ".."` (the name in argument errors),
+//! `aliases = "a, b"` (extra names for the same native);
 //! on a class: `unhashable` (`__hash__ = None`), `native_iter` (the constructor returns a step
-//! closure the VM drives), `final` (no subclasses) and `base = "module.Class"` (a Python base
-//! class). See `lumen_py::bind::args` and `lumen_py::bind::class`. The JS host reads no hints.
+//! closure the VM drives), `final` (no subclasses), `base = "module.Class"` (a Python base
+//! class) and `shared` (members installed into several core types). See `lumen_py::bind::args` and `lumen_py::bind::class`. The JS host reads no hints.
 //!
 //! Without `name`/`rename`, each host derives its own name (JS camelCases, Python keeps
 //! `snake_case`), its own arity / `length`, `__text_signature__` and argument-error wording.
