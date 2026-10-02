@@ -130,7 +130,7 @@ fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) 
         let names = std::iter::once(py_name(desc)).chain(args::aliases(desc));
         for name in names {
             let f = Value::Obj(Object::new(Kind::Native(NativeData {
-                name: py_name(desc),
+                name,
                 f: m.entry,
                 method: matches!(desc.role, Role::Method | Role::Proto(_)),
                 desc: Some(desc),
