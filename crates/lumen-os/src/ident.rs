@@ -71,10 +71,15 @@ fn group_record(e: &libc::group) -> GroupRecord {
     let mut members = Vec::new();
     if !e.gr_mem.is_null() {
         let mut p = e.gr_mem;
-        // SAFETY: gr_mem is a null-terminated array of C strings.
+        // SAFETY: gr_mem is a null-terminated array of C strings; the array is read unaligned
+        // because some libcs (macOS) place it at an arbitrary offset inside their lookup buffer.
         unsafe {
-            while !(*p).is_null() {
-                members.push(c_text(*p));
+            loop {
+                let member = p.read_unaligned();
+                if member.is_null() {
+                    break;
+                }
+                members.push(c_text(member));
                 p = p.add(1);
             }
         }
