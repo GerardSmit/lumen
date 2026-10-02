@@ -83,6 +83,33 @@ fn expand_op(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     Ok(out)
 }
 
+/// The accessors (`name`, or `0`, `1`, .. for a tuple struct) of the fields of the struct whose
+/// body follows its name in `toks`.
+fn field_accessors(toks: &[TokenTree]) -> Vec<String> {
+    let Some(TokenTree::Group(g)) = toks.first() else { return Vec::new() };
+    let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+    match g.delimiter() {
+        Delimiter::Brace => split_commas(&inner)
+            .iter()
+            .filter_map(|field| {
+                let (_, mut k) = take_attrs(field, 0);
+                if field.get(k).is_some_and(|t| is_ident(t, "pub")) {
+                    k += 1;
+                    if matches!(field.get(k), Some(TokenTree::Group(p)) if p.delimiter() == Delimiter::Parenthesis) {
+                        k += 1;
+                    }
+                }
+                match (field.get(k), field.get(k + 1)) {
+                    (Some(TokenTree::Ident(name)), Some(c)) if is_punct(c, ':') => Some(name.to_string()),
+                    _ => None,
+                }
+            })
+            .collect(),
+        Delimiter::Parenthesis => (0..split_commas(&inner).len()).map(|n| n.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn expand_class(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let opts = parse_opts(attr)?;
     opts.check(&["name", "rename", "only", "skip", "module", "generic", "hint"])?;
@@ -109,9 +136,28 @@ fn expand_class(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
         Some(m) => format!("::core::option::Option::Some({m:?})"),
         None => "::core::option::Option::None".into(),
     };
+    let fields = field_accessors(&toks[i + 2..]);
+    let trace_fields: String = fields
+        .iter()
+        .map(|f| format!("(&{B}::__private::Probe(&self.{f})).__lumen_trace(v);\n"))
+        .collect();
+    let clear_fields: String = fields
+        .iter()
+        .map(|f| format!("(&mut {B}::__private::ProbeMut(&mut self.{f})).__lumen_clear();\n"))
+        .collect();
     let code = format!(
         "impl {B}::Class for {ty} {{\n\
            const DESC: &'static {B}::ClassDesc = &{B}::ClassDesc {{ name: {ty:?}, {}, module: {module}, doc: {doc}, flags: {flags} }};\n\
+           #[allow(unused_imports, unused_variables)]\n\
+           fn gc_trace(&self, v: &mut dyn {B}::Visit) {{\n\
+             use {B}::__private::{{ViaNone as _, ViaTrace as _}};\n\
+             {trace_fields}\
+           }}\n\
+           #[allow(unused_imports, unused_variables)]\n\
+           fn gc_clear(&mut self) {{\n\
+             use {B}::__private::{{ViaNoneMut as _, ViaTraceMut as _}};\n\
+             {clear_fields}\
+           }}\n\
          }}\n\
          impl {B}::Elem for {ty} {{}}\n\
          impl<H: {B}::Host> {B}::IntoRet<H> for {ty} {{\n\
@@ -216,11 +262,15 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
                 "getter" => role = Role::Getter,
                 "setter" => role = Role::Setter,
                 "proto" => {
-                    let p = a.args_ts().to_string();
+                    let args: Vec<TokenTree> = a.args_ts().into_iter().collect();
+                    let p = args.first().map(|t| t.to_string()).unwrap_or_default();
                     if !PROTOCOLS.contains(&p.as_str()) {
                         return Err((a.span, format!("unknown protocol `{p}` (expected one of: {})", PROTOCOLS.join(", "))));
                     }
                     role = Role::Proto(p);
+                    if args.get(1).is_some_and(|t| is_punct(t, ',')) {
+                        opts.extend(parse_opts(args[2..].iter().cloned().collect())?);
+                    }
                     continue;
                 }
                 "method" => {}

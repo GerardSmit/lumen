@@ -93,13 +93,22 @@ fn read_names(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Test modules the way regrtest finds them: `test_*.py` files and `test_*` packages (directories
+/// with an `__init__.py`, such as `test_capi/`).
 fn discover(test_dir: &Path, filters: &[String]) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(test_dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("test_") && n.ends_with(".py"))
-                .map(|n| n.trim_end_matches(".py").to_string())
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    if !name.starts_with("test_") {
+                        return None;
+                    }
+                    if let Some(stem) = name.strip_suffix(".py") {
+                        return Some(stem.to_string());
+                    }
+                    e.path().join("__init__.py").is_file().then_some(name)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -109,6 +118,9 @@ fn discover(test_dir: &Path, filters: &[String]) -> Vec<String> {
     }
     names
 }
+
+/// Tests that skip unless `sysconfig.is_python_build()`: the checkout stands in for a build tree.
+const PROJECT_BASE_TESTS: &[&str] = &["test_asdl_parser"];
 
 fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
     let test_dir = o.root.join("Lib").join("test");
@@ -122,6 +134,9 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
     let mut cmd = Command::new(&o.bin);
     // Tests that spawn children (signal, subprocess, multiprocessing) can leave them running;
     // the whole group is killed when the file finishes or times out.
+    if PROJECT_BASE_TESTS.contains(&name) {
+        cmd.env("_PYTHON_PROJECT_BASE", &o.root);
+    }
     let spawned = lumen_os::child::new_group(&mut cmd)
         .args(["-m", "unittest", "-v"])
         .arg(format!("test.{name}"))

@@ -98,24 +98,24 @@ impl IOBase {
         false
     }
 
-    #[method(name = "_checkClosed")]
+    #[method(name = "_checkClosed", hint(py(text_signature = "")))]
     fn check_closed_m(slf: This<Value>, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
         let _ = args;
         check_closed(it, &slf.0)?;
         Ok(Value::None)
     }
 
-    #[method(name = "_checkSeekable")]
+    #[method(name = "_checkSeekable", hint(py(text_signature = "")))]
     fn check_seekable(slf: This<Value>, it: &mut Interp, msg: Option<&Value>) -> R<Value> {
         check_flag(it, &slf.0, "seekable", msg, "File or stream is not seekable.")
     }
 
-    #[method(name = "_checkReadable")]
+    #[method(name = "_checkReadable", hint(py(text_signature = "")))]
     fn check_readable(slf: This<Value>, it: &mut Interp, msg: Option<&Value>) -> R<Value> {
         check_flag(it, &slf.0, "readable", msg, "File or stream is not readable.")
     }
 
-    #[method(name = "_checkWritable")]
+    #[method(name = "_checkWritable", hint(py(text_signature = "")))]
     fn check_writable(slf: This<Value>, it: &mut Interp, msg: Option<&Value>) -> R<Value> {
         check_flag(it, &slf.0, "writable", msg, "File or stream is not writable.")
     }
@@ -132,13 +132,13 @@ impl IOBase {
         Ok(false)
     }
 
-    #[proto(enter)]
+    #[proto(enter, hint(py(text_signature = "")))]
     fn __enter__(slf: This<Value>, it: &mut Interp) -> R<Value> {
         check_closed(it, &slf.0)?;
         Ok(slf.0)
     }
 
-    #[proto(exit)]
+    #[proto(exit, hint(py(text_signature = "")))]
     fn __exit__(slf: This<Value>, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
         let _ = args;
         call(it, &slf.0, "close", Vec::new())

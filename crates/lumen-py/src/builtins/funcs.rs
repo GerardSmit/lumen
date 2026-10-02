@@ -93,12 +93,12 @@ fn async_call(it: &mut Interp, v: &Value, special: &str, what: &str) -> R<Value>
     it.call_special(v, special, Vec::new())
 }
 
-fn frame_globals(it: &Interp) -> Obj {
+pub(crate) fn frame_globals(it: &Interp) -> Obj {
     it.frames.last().map(|f| f.globals.clone()).unwrap_or_else(|| it.builtins.clone())
 }
 
 /// `locals()`: the frame's namespace, or a snapshot of its fast locals and cells.
-fn locals_value(it: &mut Interp) -> Value {
+pub(crate) fn locals_value(it: &mut Interp) -> Value {
     let fr = match it.frames.last() {
         Some(f) => f,
         None => return Value::Obj(it.builtins.clone()),
@@ -312,7 +312,7 @@ fn sum_values(it: &mut Interp, iterable: &Value, mut acc: Value) -> R<Value> {
     Ok(acc)
 }
 
-fn eval_exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>, is_eval: bool) -> R<Value> {
+fn eval_exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>, closure: Option<&Value>, is_eval: bool) -> R<Value> {
     let name = if is_eval { "eval" } else { "exec" };
     let globals_d = match globals {
         None => frame_globals(it),
@@ -360,10 +360,40 @@ fn eval_exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: O
         },
         _ => return Err(bad(it)),
     };
+    let closure = closure.filter(|c| !matches!(c, Value::None));
+    let nfree = code.freevars.len();
+    let mut cells: Vec<Obj> = Vec::new();
+    if !matches!(source, Value::Obj(o) if matches!(o.kind, Kind::Code(_))) {
+        if closure.is_some() {
+            return Err(it.type_error("closure can only be used when source is a code object"));
+        }
+    } else if nfree == 0 {
+        if closure.is_some() {
+            return Err(it.type_error("cannot use a closure with this code object"));
+        }
+    } else if is_eval {
+        return Err(it.type_error("code object passed to eval() may not contain free variables"));
+    } else {
+        if let Some(Value::Obj(c)) = closure {
+            if let (Kind::Tuple(items), None) = (&c.kind, c.cls.as_ref()) {
+                if items.len() == nfree {
+                    for v in items {
+                        match v {
+                            Value::Obj(cell) if matches!(cell.kind, Kind::Cell(_)) => cells.push(cell.clone()),
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
+        if cells.len() != nfree {
+            return Err(it.type_error(&format!("code object requires a closure of exactly length {nfree}")));
+        }
+    }
     if dict_get_str(&globals_d, "__builtins__").is_none() {
         dict_set_str(&globals_d, "__builtins__", Value::Obj(it.builtins.clone()));
     }
-    let r = it.run_code(code, globals_d, locals_d)?;
+    let r = it.run_code_closure(code, globals_d, locals_d, &cells)?;
     Ok(if is_eval { r } else { Value::None })
 }
 
@@ -433,14 +463,16 @@ fn compile_source(it: &mut Interp, mut source: Value, filename: &Value, mode: &s
         super::astconv::Mode::Exec => it.compile_source(&src, &filename)?,
         super::astconv::Mode::Single => it.compile_source_mode(&src, &filename, true)?,
     };
-    Ok(Value::Obj(Object::new(Kind::Code(code))))
+    let obj = crate::bytecode::Code::object(&code);
+    it.code_created(&obj);
+    Ok(Value::Obj(obj))
 }
 
 pub fn init(it: &mut Interp) {
     crate::bind::install_functions::<builtin_fns::Module>(&it.builtins.clone());
 }
 
-/// The functions of the `builtins` module, installed into the interpreter's builtins dict.
+// The functions of the `builtins` module, installed into the interpreter's builtins dict.
 #[lumen_bind::module(name = "builtins")]
 pub mod builtin_fns {
     use super::*;
@@ -1116,7 +1148,7 @@ pub mod builtin_fns {
     /// If only globals is given, locals defaults to it.
     #[op(hint(py(text_signature = "($module, source, globals=None, locals=None, /)")))]
     fn eval(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>) -> R<Value> {
-        eval_exec(it, source, globals, locals, true)
+        eval_exec(it, source, globals, locals, None, true)
     }
 
     /// Execute the given source in the context of globals and locals.
@@ -1129,8 +1161,8 @@ pub mod builtin_fns {
     /// The closure must be a tuple of cellvars, and can only be used
     /// when source is a code object requiring exactly that many cellvars.
     #[op(hint(py(text_signature = "($module, source, globals=None, locals=None, /, *, closure=None)")))]
-    fn exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>, #[kwonly] _closure: Option<&Value>) -> R<Value> {
-        eval_exec(it, source, globals, locals, false)
+    fn exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>, #[kwonly] closure: Option<&Value>) -> R<Value> {
+        eval_exec(it, source, globals, locals, closure, false)
     }
 
     /// Compile source into a code object that can be executed by exec() or eval().

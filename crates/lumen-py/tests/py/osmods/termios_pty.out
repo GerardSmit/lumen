@@ -1,0 +1,13 @@
+True True
+False False
+7 20 True
+False True
+False
+True
+(24, 80)
+False False
+False
+termios.error True
+TypeError
+error True
+b'ping\n'

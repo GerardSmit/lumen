@@ -1,0 +1,15 @@
+0 False
+11
+11 False
+b'hello'
+6
+b' world'
+b'' False
+False
+b'ab' False
+b'c' True
+SSLError ('cannot write() after write_eof()',)
+2 2
+b'bamv'
+TypeError
+TypeError

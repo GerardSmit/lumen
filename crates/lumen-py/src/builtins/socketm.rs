@@ -228,13 +228,13 @@ pub mod _socket {
         Ok(Some(secs))
     }
 
-    fn now(it: &mut Interp) -> f64 {
+    pub(crate) fn now(it: &mut Interp) -> f64 {
         it.platform.borrow().monotonic_ns() as f64 / 1e9
     }
 
     /// Waits until `fd` is readable or writable or `deadline` (monotonic seconds) passes;
     /// returns whether it became ready.
-    fn wait_ready(it: &mut Interp, fd: i32, writing: bool, deadline: Option<f64>) -> R<bool> {
+    pub(crate) fn wait_ready(it: &mut Interp, fd: i32, writing: bool, deadline: Option<f64>) -> R<bool> {
         let left = deadline.map(|d| ((d - now(it)) * 1000.0).ceil().max(0.0) as i64);
         let events = if writing { POLLOUT } else { POLLIN };
         crate::builtins::selectm::wait(it, left, |ms| {
@@ -245,7 +245,18 @@ pub mod _socket {
 
     /// Waits until `fd` is ready (unless the socket is non-blocking) and runs `op`, retrying on
     /// `EINTR` and on spurious readiness, as CPython's `sock_call_ex`.
-    fn sock_call<T>(it: &mut Interp, fd: i32, writing: bool, timeout: Option<f64>, mut op: impl FnMut() -> lumen_os::net::R<T>) -> R<T> {
+    fn sock_call<T: Send>(it: &mut Interp, fd: i32, writing: bool, timeout: Option<f64>, op: impl FnMut() -> lumen_os::net::R<T> + Send) -> R<T> {
+        // BSD kernels ignore MSG_DONTWAIT for large writes on a blocking descriptor, and a send
+        // stuck in the kernel is never interrupted by an `SA_RESTART` handler; wait in `poll` instead.
+        let flip = writing && timeout.is_none() && fd >= 0 && lumen_os::fdctl::set_blocking(fd, false).is_ok();
+        let out = sock_call_inner(it, fd, writing, timeout, op);
+        if flip {
+            let _ = lumen_os::fdctl::set_blocking(fd, true);
+        }
+        out
+    }
+
+    fn sock_call_inner<T>(it: &mut Interp, fd: i32, writing: bool, timeout: Option<f64>, mut op: impl FnMut() -> lumen_os::net::R<T> + Send) -> R<T> where T: Send {
         if fd < 0 {
             return Err(it.os_error_errno(EBADF, None, None));
         }
@@ -255,7 +266,7 @@ pub mod _socket {
                 return Err(timeout_error(it));
             }
             let err = loop {
-                match op() {
+                match it.unlocked(&mut op) {
                     Ok(v) => return Ok(v),
                     Err(e) if e.errno() == EINTR => crate::builtins::signalm::check(it)?,
                     Err(e) => break e,
@@ -302,6 +313,12 @@ pub mod _socket {
         s.with(it, |s| (s.fd, s.family, s.timeout))
     }
 
+    /// The descriptor and timeout of `v` when it is a `socket.socket` (or a subclass instance).
+    pub(crate) fn fd_and_timeout(it: &mut Interp, v: &Value) -> Option<(i32, Option<f64>)> {
+        let sock = Py::<Sock>::from_value(it, v)?;
+        sock.with(it, |s| (s.fd, s.timeout)).ok()
+    }
+
     fn set_blocking_fd(fd: i32, timeout: Option<f64>) -> lumen_os::net::R<()> {
         if fd < 0 {
             return Ok(());
@@ -339,7 +356,8 @@ pub mod _socket {
             opaque_instance(cls, Sock { fd: -1, family: AF_INET, ty: SOCK_STREAM, proto: 0, timeout: None })
         }
 
-        #[method(name = "__init__")]
+        /// Initialize self.  See help(type(self)) for accurate signature.
+        #[method(name = "__init__", hint(py(text_signature = "($self, /, *args, **kwargs)")))]
         fn init(
             slf: This<Py<Self>>,
             it: &mut Interp,
@@ -377,6 +395,7 @@ pub mod _socket {
             slf.0.with(it, |s| *s = sock)
         }
 
+        /// Return repr(self).
         #[method(name = "__repr__")]
         fn repr(&self) -> String {
             format!("<socket object, fd={}, family={}, type={}, proto={}>", self.fd, self.family, self.ty, self.proto)
@@ -728,7 +747,7 @@ pub mod _socket {
         }
     }
 
-    fn nosignal() -> i32 {
+    pub(crate) fn nosignal() -> i32 {
         net::MSG_NOSIGNAL
     }
 

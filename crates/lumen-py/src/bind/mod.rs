@@ -28,7 +28,7 @@ mod convert;
 pub use crate::object::{Obj, Value, R};
 pub use crate::pyint::BigInt;
 pub use crate::vm::Interp;
-pub use class::{extend_type, extend_type_documented, function_values, install_all, install_functions, install_into, is_instance, module_object, native_value, opaque_instance, owner_of, set_type_text_signature, type_object, type_text_signature, NativeIter, Py};
+pub use class::{extend_type, extend_type_documented, function_values, install_all, install_functions, install_into, install_module, is_instance, module_object, native_value, opaque_instance, owner_of, set_type_text_signature, type_object, type_text_signature, NativeIter, Py};
 pub use convert::{buffer_error, index, native_error};
 pub use path::{bytes_path, convert_path, fspath, wrap_path, FsPath, PathArg, PathOrFd};
 pub use lumen_bind::{ErrorKind, NativeError, NativeResult, This};
@@ -461,6 +461,13 @@ impl Host for PyHost {
                 // SAFETY: the store lives in `Scratch::stores` until after the guard, and the lent
                 // range is unaliased until the guard drops with `cx`.
                 return cx.lend(unsafe { &*store }, None, true).map(|p| unsafe { &mut *p });
+            }
+            if let Some((store, range)) = crate::builtins::memview::writable_part(cx.it(), v)? {
+                let s = cx.scratch();
+                s.stores.push(store);
+                let store: *const crate::object::ByteStore = &**s.stores.last().unwrap();
+                // SAFETY: as for arrays above.
+                return cx.lend(unsafe { &*store }, Some(range), true).map(|p| unsafe { &mut *p });
             }
         }
         Err(cx.arg_error(at, "read-write bytes-like object", v))

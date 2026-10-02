@@ -9,20 +9,7 @@ use crate::vm::*;
 
 pub use crate::repr::ascii_escape;
 
-#[derive(Default, Clone)]
-pub struct Spec {
-    /// A code point: the fill may be a lone surrogate or a reserved-block character.
-    pub fill: Option<u32>,
-    pub align: Option<char>,
-    pub sign: Option<char>,
-    pub alt: bool,
-    pub zero: bool,
-    pub z: bool,
-    pub width: Option<usize>,
-    pub grouping: Option<char>,
-    pub precision: Option<usize>,
-    pub ty: Option<char>,
-}
+pub use lumen_common::fmtspec::Spec;
 
 fn pad(s: &str, width: usize, fill: u32, align: char) -> String {
     let n = lumen_common::smuggle::count_code_points(s);
@@ -61,71 +48,12 @@ fn group_digits(digits: &str, sep: char, size: usize) -> String {
 
 impl Interp {
     pub fn parse_spec(&mut self, spec: &str, tname: &str) -> R<Spec> {
-        let cps: Vec<u32> = lumen_common::smuggle::code_points(spec).collect();
-        let chars: Vec<char> = cps.iter().map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}')).collect();
-        let mut i = 0;
-        let mut s = Spec::default();
-        let bad = |it: &mut Interp| it.value_error(&format!("Invalid format specifier '{}' for object of type '{}'", spec, tname));
-        if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^' | '=') {
-            s.fill = Some(cps[0]);
-            s.align = Some(chars[1]);
-            i = 2;
-        } else if !chars.is_empty() && matches!(chars[0], '<' | '>' | '^' | '=') {
-            s.align = Some(chars[0]);
-            i = 1;
-        }
-        if i < chars.len() && matches!(chars[i], '+' | '-' | ' ') {
-            s.sign = Some(chars[i]);
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == 'z' {
-            s.z = true;
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == '#' {
-            s.alt = true;
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == '0' {
-            s.zero = true;
-            i += 1;
-        }
-        let start = i;
-        while i < chars.len() && chars[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i > start {
-            let w: String = chars[start..i].iter().collect();
-            let w: usize = w.parse().ok().filter(|&w| w <= i64::MAX as usize).ok_or_else(|| self.value_error("Too many decimal digits in format string"))?;
+        let s = lumen_common::fmtspec::parse(spec).map_err(|e| match e.message() {
+            Some(m) => self.value_error(m),
+            None => self.value_error(&format!("Invalid format specifier '{}' for object of type '{}'", spec, tname)),
+        })?;
+        if let Some(w) = s.width {
             self.check_str_len(w)?;
-            s.width = Some(w);
-        }
-        if i < chars.len() && (chars[i] == ',' || chars[i] == '_') {
-            s.grouping = Some(chars[i]);
-            i += 1;
-            if i < chars.len() && (chars[i] == ',' || chars[i] == '_') {
-                return Err(self.value_error("Cannot specify both ',' and '_'."));
-            }
-        }
-        if i < chars.len() && chars[i] == '.' {
-            i += 1;
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i == start {
-                return Err(self.value_error("Format specifier missing precision"));
-            }
-            let p: String = chars[start..i].iter().collect();
-            let p: usize = p.parse().ok().filter(|&p| p <= i64::MAX as usize).ok_or_else(|| self.value_error("Too many decimal digits in format string"))?;
-            s.precision = Some(p);
-        }
-        if i < chars.len() {
-            s.ty = Some(chars[i]);
-            i += 1;
-        }
-        if i < chars.len() {
-            return Err(bad(self));
         }
         Ok(s)
     }

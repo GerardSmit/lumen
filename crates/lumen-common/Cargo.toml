@@ -12,12 +12,18 @@ test-support = []
 mem-stats = []
 # `hash`: message digests, HMAC, PBKDF2, HKDF, scrypt over the RustCrypto crates.
 hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt"]
-# `compress`: zlib / gzip / raw deflate, Brotli and Zstandard over maintained crates.
-compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd"]
+# `compress`: zlib / gzip / raw deflate, Brotli, Zstandard and bzip2 over maintained crates.
+compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip2"]
+# `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) in pure Rust:
+# the decoder is written in `compress::xz`, the encoders come from `lzma-rust2`.
+lzma = ["compress", "dep:lzma-rust2", "dep:sha2"]
+# `crypt`: MD5/SHA-crypt and bcrypt password hashes (`crypt(3)` formats), on `hash`.
+crypt = ["hash", "dep:bcrypt"]
 
 [dependencies]
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
 memchr = { version = "2", default-features = false }
+bcrypt = { version = "0.17", default-features = false, optional = true }
 digest = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
@@ -32,6 +38,9 @@ pbkdf2 = { version = "0.12", default-features = false, optional = true }
 scrypt = { version = "0.11", default-features = false, optional = true }
 libz-rs-sys = { version = "0.6", default-features = false, features = ["std", "rust-allocator"], optional = true }
 brotli = { version = "8", optional = true }
+# bzip2 over the pure-Rust libbz2-rs-sys backend (the crate's default), so it also builds for wasm.
+bzip2 = { version = "0.6", optional = true }
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder"], optional = true }
 
 # zstd's C library does not build for wasm32-unknown-unknown without a wasm-capable clang;
 # the browser build uses the pure-Rust ruzstd.
@@ -40,6 +49,10 @@ zstd = { version = "0.13", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ruzstd = { version = "0.8", optional = true }
+
+# The xz container writer, as an independent encoder for the decoder tests.
+[dev-dependencies]
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder", "xz"] }
 
 [lints]
 workspace = true

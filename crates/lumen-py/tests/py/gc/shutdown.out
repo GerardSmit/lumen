@@ -1,0 +1,6 @@
+end of script, finalizing: False
+atexit 2, finalizing: False
+atexit 1
+del a
+del b
+del cycle

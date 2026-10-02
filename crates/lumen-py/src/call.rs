@@ -90,7 +90,14 @@ impl Interp {
         self.run(entry, None)
     }
 
-    pub fn call_inline(&mut self, f: &Value, mut args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
+    pub fn call_inline(&mut self, f: &Value, args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
+        if self.mon.active {
+            return self.call_inline_monitored(f, args, kw);
+        }
+        self.call_inline_plain(f, args, kw)
+    }
+
+    pub(crate) fn call_inline_plain(&mut self, f: &Value, mut args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
         if let Value::Obj(o) = f {
             match &o.kind {
                 Kind::Function(_) => {
@@ -107,6 +114,11 @@ impl Interp {
         }
         let r = self.call(f, args, kw)?;
         self.frames.last_mut().unwrap().stack.push(r);
+        // CPython checks for signals when a native call returns, so a handler that raises
+        // interrupts the code right after a blocking call (before any cleanup that follows it).
+        if lumen_os::signal::any_pending() {
+            crate::builtins::signalm::check(self)?;
+        }
         Ok(false)
     }
 
@@ -144,7 +156,7 @@ impl Interp {
             Kind::Function(f) => f,
             _ => unreachable!(),
         };
-        let code = func.code.clone();
+        let code = func.code.borrow().clone();
         let mut frame = self.new_frame(code.clone(), func.globals.clone(), None, Some(func_obj.clone()), &func.closure);
         let argcount = code.argcount as usize;
         let kwonly = code.kwonly as usize;
@@ -309,7 +321,7 @@ impl Interp {
         let f = Function {
             name: RefCell::new(code.name.clone()),
             qualname: RefCell::new(code.qualname.clone()),
-            code,
+            code: RefCell::new(code),
             globals,
             defaults: RefCell::new(defaults),
             kwdefaults: RefCell::new(kwdefaults),
@@ -434,6 +446,14 @@ impl Interp {
         if let Some(v) = send {
             frame.stack.push(v);
         }
+        frame.generator = Some(Rc::downgrade(g));
+        frame.entry = if throw.is_some() {
+            crate::trace::ENTRY_THROW
+        } else if frame.pc == 0 {
+            crate::trace::ENTRY_START
+        } else {
+            crate::trace::ENTRY_RESUME
+        };
         if let Err(e) = self.push_frame(frame) {
             *gd.state.borrow_mut() = GenState::Done;
             return Err(e);

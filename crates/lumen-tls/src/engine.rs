@@ -147,6 +147,54 @@ openssl_api! {
     ssl SSL_get_security_level(CPtr) -> c_int;
     ssl SSL_is_init_finished(CPtr) -> c_int;
     ssl SSL_dup_CA_list(CPtr) -> Ptr;
+    ssl SSL_CTX_clear_options(Ptr, u64) -> u64;
+    ssl SSL_CTX_get_verify_mode(CPtr) -> c_int;
+    ssl SSL_CTX_load_verify_locations(Ptr, *const c_char, *const c_char) -> c_int;
+    ssl SSL_CTX_set_default_verify_paths(Ptr) -> c_int;
+    ssl SSL_CTX_get0_param(CPtr) -> Ptr;
+    ssl SSL_get0_param(Ptr) -> Ptr;
+    ssl SSL_CTX_get_security_level(CPtr) -> c_int;
+    ssl SSL_set_post_handshake_auth(Ptr, c_int);
+    ssl SSL_verify_client_post_handshake(Ptr) -> c_int;
+    ssl SSL_CTX_set_num_tickets(Ptr, usize) -> c_int;
+    ssl SSL_CTX_get_num_tickets(CPtr) -> usize;
+    ssl SSL_get_client_ciphers(CPtr) -> Ptr;
+    ssl SSL_CIPHER_get_bits(CPtr, *mut c_int) -> c_int;
+    ssl SSL_CIPHER_get_id(CPtr) -> u32;
+    ssl SSL_CIPHER_description(CPtr, *mut c_char, c_int) -> *mut c_char;
+    ssl SSL_CIPHER_get_kx_nid(CPtr) -> c_int;
+    ssl SSL_CIPHER_get_auth_nid(CPtr) -> c_int;
+    ssl SSL_CIPHER_get_cipher_nid(CPtr) -> c_int;
+    ssl SSL_CIPHER_get_digest_nid(CPtr) -> c_int;
+    ssl SSL_CIPHER_is_aead(CPtr) -> c_int;
+    ssl SSL_get_current_compression(CPtr) -> CPtr;
+    ssl SSL_SESSION_get_time(CPtr) -> c_long;
+    ssl SSL_SESSION_get_timeout(CPtr) -> c_long;
+    ssl SSL_SESSION_has_ticket(CPtr) -> c_int;
+    ssl SSL_SESSION_get_ticket_lifetime_hint(CPtr) -> c_ulong;
+    ssl SSL_callback_ctrl(Ptr, c_int, Option<unsafe extern "C" fn()>) -> c_long;
+    crypto BIO_ctrl(Ptr, c_int, c_long, Ptr) -> c_long;
+    crypto d2i_X509_bio(Ptr, *mut Ptr) -> Ptr;
+    crypto X509_check_ca(CPtr) -> c_int;
+    crypto X509_VERIFY_PARAM_set_flags(Ptr, c_ulong) -> c_int;
+    crypto X509_VERIFY_PARAM_clear_flags(Ptr, c_ulong) -> c_int;
+    crypto X509_VERIFY_PARAM_get_flags(Ptr) -> c_ulong;
+    crypto X509_VERIFY_PARAM_set_hostflags(Ptr, c_uint);
+    crypto X509_VERIFY_PARAM_set1_host(Ptr, *const c_char, usize) -> c_int;
+    crypto X509_VERIFY_PARAM_set1_ip_asc(Ptr, *const c_char) -> c_int;
+    crypto X509_get_default_cert_file_env() -> *const c_char;
+    crypto X509_get_default_cert_dir_env() -> *const c_char;
+    crypto OBJ_nid2ln(c_int) -> *const c_char;
+    crypto OBJ_nid2sn(c_int) -> *const c_char;
+    crypto OBJ_sn2nid(*const c_char) -> c_int;
+    crypto OBJ_nid2obj(c_int) -> CPtr;
+    crypto OBJ_txt2obj(*const c_char, c_int) -> Ptr;
+    crypto OBJ_obj2nid(CPtr) -> c_int;
+    crypto OBJ_obj2txt(*mut c_char, c_int, CPtr, c_int) -> c_int;
+    crypto ASN1_OBJECT_free(Ptr);
+    crypto COMP_get_type(CPtr) -> c_int;
+    crypto OpenSSL_version_num() -> c_ulong;
+    crypto OpenSSL_version(c_int) -> *const c_char;
     crypto BIO_s_mem() -> CPtr;
     crypto BIO_new(CPtr) -> Ptr;
     crypto BIO_new_mem_buf(CPtr, c_int) -> Ptr;
@@ -289,6 +337,9 @@ pub struct EngineError {
     pub code: Option<String>,
     /// The JS error class: `Error` unless the failure is a usage error.
     pub kind: Option<&'static str>,
+    /// The oldest and newest raw OpenSSL error codes of the queue entry that produced this error.
+    pub raw_first: u64,
+    pub raw_last: u64,
 }
 
 impl EngineError {
@@ -453,6 +504,8 @@ impl Api {
             reason,
             code,
             kind: None,
+            raw_first: first as u64,
+            raw_last: last as u64,
         }
     }
 
@@ -1298,6 +1351,14 @@ pub struct ClientHello {
     pub ocsp_request: bool,
 }
 
+/// One protocol message OpenSSL reported through its message callback.
+pub struct Message {
+    pub write: bool,
+    pub version: i32,
+    pub content_type: i32,
+    pub data: Vec<u8>,
+}
+
 #[derive(Default)]
 struct State {
     events: Vec<Event>,
@@ -1317,6 +1378,9 @@ struct State {
     ocsp_response: Option<Vec<u8>>,
     next_session: Ptr,
     is_server: bool,
+    hello_alert: Option<i32>,
+    alpn_noack: bool,
+    messages: Vec<Message>,
 }
 
 pub struct Session {
@@ -1424,10 +1488,14 @@ fn parse_hello(api: &Api, ssl: Ptr) -> ClientHello {
     hello
 }
 
-unsafe extern "C" fn client_hello_callback(ssl: Ptr, _alert: *mut c_int, _arg: Ptr) -> c_int {
+unsafe extern "C" fn client_hello_callback(ssl: Ptr, alert: *mut c_int, _arg: Ptr) -> c_int {
     let api = global_api();
     let Some(state) = state_of(api, ssl) else { return 1 };
     if state.hello_done || !state.is_server {
+        if let Some(code) = state.hello_alert.take() {
+            unsafe { *alert = code };
+            return 0;
+        }
         return 1;
     }
     if state.hello_reported {
@@ -1495,7 +1563,7 @@ unsafe extern "C" fn alpn_select_callback(
         )
     };
     if status != 1 {
-        return 2;
+        return if state.alpn_noack { 3 } else { 2 };
     }
     unsafe {
         *out = selected;
@@ -1560,6 +1628,17 @@ pub enum Io {
 
 impl Session {
     pub fn new(context: &Context, is_server: bool) -> Result<Session, EngineError> {
+        Session::create(context, is_server, true)
+    }
+
+    /// A session that keeps the verification mode and callback of its context, so a failed
+    /// verification aborts the handshake as OpenSSL does (see [`Context::set_verify`]), where
+    /// [`Session::new`] always completes the handshake and leaves the verdict to the owner.
+    pub fn new_inherit(context: &Context, is_server: bool) -> Result<Session, EngineError> {
+        Session::create(context, is_server, false)
+    }
+
+    fn create(context: &Context, is_server: bool, owner_verifies: bool) -> Result<Session, EngineError> {
         let api = context.api;
         let ctx = context.live()?;
         let ssl = unsafe { (api.SSL_new)(ctx) };
@@ -1580,7 +1659,9 @@ impl Session {
         });
         unsafe {
             (api.SSL_set_ex_data)(ssl, 0, &mut *state as *mut State as Ptr);
-            (api.SSL_set_verify)(ssl, 0, Some(accept_all));
+            if owner_verifies {
+                (api.SSL_set_verify)(ssl, 0, Some(accept_all));
+            }
             (api.SSL_ctrl)(ssl, SSL_CTRL_MODE, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS | 2, std::ptr::null_mut());
             (api.SSL_set_info_callback)(ssl, Some(info_callback));
             if is_server {
@@ -2069,4 +2150,796 @@ impl Drop for Session {
         }
         let _ = (self.rbio, self.wbio);
     }
+}
+
+// ---- OpenSSL-faithful additions ---------------------------------------------------------------
+//
+// What an embedder needs when it keeps OpenSSL's own semantics (the verification verdict aborts
+// the handshake, the trust store follows `SSL_CTX_load_verify_locations`, a handshake is driven
+// explicitly): Python's `_ssl` is built on these. Node's `tls` uses the surface above.
+
+const ERR_LIB_X509: c_ulong = 11;
+const ERR_LIB_ASN1: c_ulong = 13;
+const X509_R_CERT_ALREADY_IN_HASH_TABLE: c_ulong = 101;
+const ASN1_R_HEADER_TOO_LONG: c_ulong = 123;
+const X509_LU_CRL: c_int = 2;
+const SSL_CTRL_SET_MSG_CALLBACK: c_int = 15;
+const SSL_CTRL_SESS_NUMBER: c_int = 20;
+const BIO_C_SET_BUF_MEM_EOF_RETURN: c_int = 130;
+const SSL_VERIFY_POST_HANDSHAKE: c_int = 8;
+const SSL_RECEIVED_SHUTDOWN: c_int = 2;
+
+/// What OpenSSL calls an error code: its library (`SSL`), the symbolic reason
+/// (`CERTIFICATE_VERIFY_FAILED`) and the reason text (`certificate verify failed`).
+#[derive(Debug, Clone, Default)]
+pub struct ErrorDetails {
+    pub library: Option<String>,
+    pub reason: Option<String>,
+    pub text: Option<String>,
+}
+
+/// The library, symbolic reason and text of a raw OpenSSL error code.
+pub fn error_details(code: u64) -> ErrorDetails {
+    let Ok(api) = api() else { return ErrorDetails::default() };
+    if code == 0 {
+        return ErrorDetails::default();
+    }
+    let code = code as c_ulong;
+    let library = match lib_prefix(err_lib(code)) {
+        "" => None,
+        prefix => Some(prefix.trim_end_matches('_').to_string()),
+    };
+    let text = cstr(unsafe { (api.ERR_reason_error_string)(code) });
+    let reason = text.as_ref().map(|text| {
+        text.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .collect()
+    });
+    ErrorDetails { library, reason, text }
+}
+
+/// `ERR_GET_LIB` and `ERR_GET_REASON` of a raw OpenSSL error code.
+pub fn error_parts(code: u64) -> (u64, u64) {
+    (err_lib(code as c_ulong) as u64, err_reason(code as c_ulong) as u64)
+}
+
+/// The text of an X509 verification result code (`X509_verify_cert_error_string`).
+pub fn verify_error_text(code: i64) -> Option<String> {
+    let api = api().ok()?;
+    cstr(unsafe { (api.X509_verify_cert_error_string)(code as c_long) })
+}
+
+/// `(OPENSSL_VERSION_NUMBER, "OpenSSL 3.0.13 30 Jan 2024")` of the loaded library.
+pub fn openssl_version() -> Option<(u64, String)> {
+    let api = api().ok()?;
+    let number = unsafe { (api.OpenSSL_version_num)() } as u64;
+    let text = cstr(unsafe { (api.OpenSSL_version)(0) })?;
+    Some((number, text))
+}
+
+/// `(cafile environment variable, cafile, capath environment variable, capath)`: where OpenSSL
+/// looks for trusted certificates by default.
+pub fn default_verify_paths() -> Option<(String, String, String, String)> {
+    let api = api().ok()?;
+    unsafe {
+        Some((
+            cstr((api.X509_get_default_cert_file_env)())?,
+            cstr((api.X509_get_default_cert_file)())?,
+            cstr((api.X509_get_default_cert_dir_env)())?,
+            cstr((api.X509_get_default_cert_dir)())?,
+        ))
+    }
+}
+
+/// An ASN.1 object identifier with the names OpenSSL knows it by.
+#[derive(Debug, Clone)]
+pub struct ObjectInfo {
+    pub nid: i32,
+    pub short_name: String,
+    pub long_name: String,
+    pub oid: String,
+}
+
+fn object_info(api: &Api, object: CPtr) -> Option<ObjectInfo> {
+    let nid = unsafe { (api.OBJ_obj2nid)(object) };
+    if nid == 0 {
+        return None;
+    }
+    let mut buffer = [0 as c_char; 256];
+    let written = unsafe { (api.OBJ_obj2txt)(buffer.as_mut_ptr(), buffer.len() as c_int, object, 1) };
+    if written < 0 {
+        return None;
+    }
+    Some(ObjectInfo {
+        nid,
+        short_name: cstr(unsafe { (api.OBJ_nid2sn)(nid) }).unwrap_or_default(),
+        long_name: cstr(unsafe { (api.OBJ_nid2ln)(nid) }).unwrap_or_default(),
+        oid: cstr(buffer.as_ptr()).unwrap_or_default(),
+    })
+}
+
+/// `OBJ_txt2obj`: an object by dotted OID or, with `by_name`, by short or long name.
+pub fn object_from_text(text: &str, by_name: bool) -> Option<ObjectInfo> {
+    let api = api().ok()?;
+    let text = CString::new(text).ok()?;
+    let object = unsafe { (api.OBJ_txt2obj)(text.as_ptr(), if by_name { 0 } else { 1 }) };
+    unsafe { (api.ERR_clear_error)() };
+    if object.is_null() {
+        return None;
+    }
+    let info = object_info(api, object);
+    unsafe { (api.ASN1_OBJECT_free)(object) };
+    info
+}
+
+/// `OBJ_nid2obj`.
+pub fn object_from_nid(nid: i32) -> Option<ObjectInfo> {
+    let api = api().ok()?;
+    let object = unsafe { (api.OBJ_nid2obj)(nid) };
+    unsafe { (api.ERR_clear_error)() };
+    if object.is_null() {
+        return None;
+    }
+    object_info(api, object)
+}
+
+/// A decoded `SSL_SESSION`.
+#[derive(Debug, Clone, Default)]
+pub struct SessionInfo {
+    pub id: Vec<u8>,
+    pub time: i64,
+    pub timeout: i64,
+    pub has_ticket: bool,
+    pub ticket_lifetime_hint: u64,
+}
+
+/// The fields of a session serialized by [`Session::session_bytes`].
+pub fn session_info(der: &[u8]) -> Option<SessionInfo> {
+    let api = api().ok()?;
+    let mut cursor = der.as_ptr();
+    let session = unsafe { (api.d2i_SSL_SESSION)(std::ptr::null_mut(), &mut cursor, der.len() as c_long) };
+    if session.is_null() {
+        unsafe { (api.ERR_clear_error)() };
+        return None;
+    }
+    let mut id_length: c_uint = 0;
+    let id = unsafe { (api.SSL_SESSION_get_id)(session, &mut id_length) };
+    let info = SessionInfo {
+        id: if id.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(id, id_length as usize) }.to_vec()
+        },
+        time: unsafe { (api.SSL_SESSION_get_time)(session) } as i64,
+        timeout: unsafe { (api.SSL_SESSION_get_timeout)(session) } as i64,
+        has_ticket: unsafe { (api.SSL_SESSION_has_ticket)(session) } != 0,
+        ticket_lifetime_hint: unsafe { (api.SSL_SESSION_get_ticket_lifetime_hint)(session) } as u64,
+    };
+    unsafe { (api.SSL_SESSION_free)(session) };
+    Some(info)
+}
+
+/// One cipher suite as `SSLContext.get_ciphers()` describes it.
+#[derive(Debug, Clone, Default)]
+pub struct CipherInfo {
+    pub id: u32,
+    pub name: String,
+    pub protocol: String,
+    pub description: String,
+    pub strength_bits: i32,
+    pub alg_bits: i32,
+    pub aead: bool,
+    pub symmetric: Option<String>,
+    pub digest: Option<String>,
+    pub kea: Option<String>,
+    pub auth: Option<String>,
+}
+
+fn cipher_info(api: &Api, cipher: CPtr) -> CipherInfo {
+    let mut alg_bits: c_int = 0;
+    let strength_bits = unsafe { (api.SSL_CIPHER_get_bits)(cipher, &mut alg_bits) };
+    let mut description = [0 as c_char; 512];
+    unsafe { (api.SSL_CIPHER_description)(cipher, description.as_mut_ptr(), description.len() as c_int) };
+    let named = |nid: c_int| {
+        if nid == 0 {
+            None
+        } else {
+            cstr(unsafe { (api.OBJ_nid2ln)(nid) })
+        }
+    };
+    CipherInfo {
+        id: unsafe { (api.SSL_CIPHER_get_id)(cipher) },
+        name: cstr(unsafe { (api.SSL_CIPHER_get_name)(cipher) }).unwrap_or_default(),
+        protocol: cstr(unsafe { (api.SSL_CIPHER_get_version)(cipher) }).unwrap_or_default(),
+        description: cstr(description.as_ptr()).unwrap_or_default(),
+        strength_bits,
+        alg_bits,
+        aead: unsafe { (api.SSL_CIPHER_is_aead)(cipher) } != 0,
+        symmetric: named(unsafe { (api.SSL_CIPHER_get_cipher_nid)(cipher) }),
+        digest: named(unsafe { (api.SSL_CIPHER_get_digest_nid)(cipher) }),
+        kea: named(unsafe { (api.SSL_CIPHER_get_kx_nid)(cipher) }),
+        auth: named(unsafe { (api.SSL_CIPHER_get_auth_nid)(cipher) }),
+    }
+}
+
+/// How OpenSSL asks for the passphrase of an encrypted private key.
+struct Passphrase<'a> {
+    callback: Option<&'a mut dyn FnMut(usize) -> Result<Vec<u8>, ()>>,
+}
+
+unsafe extern "C" fn passphrase_callback(buffer: *mut c_char, size: c_int, _write: c_int, user: Ptr) -> c_int {
+    let state = unsafe { &mut *(user as *mut Passphrase) };
+    let Some(callback) = state.callback.as_mut() else { return -1 };
+    match callback(size.max(0) as usize) {
+        Ok(bytes) => {
+            let length = bytes.len().min(size.max(0) as usize);
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer as *mut u8, length) };
+            length as c_int
+        }
+        Err(()) => -1,
+    }
+}
+
+unsafe extern "C" fn message_callback(
+    write: c_int,
+    version: c_int,
+    content_type: c_int,
+    buffer: CPtr,
+    length: usize,
+    ssl: Ptr,
+    _arg: Ptr,
+) {
+    let api = global_api();
+    let Some(state) = state_of(api, ssl) else { return };
+    let data = if buffer.is_null() || length == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(buffer as *const u8, length) }.to_vec()
+    };
+    state.messages.push(Message {
+        write: write == 1,
+        version,
+        content_type,
+        data,
+    });
+}
+
+impl Context {
+    pub fn clear_options(&mut self, options: u64) -> Result<(), EngineError> {
+        let ctx = self.live()?;
+        unsafe { (self.api.SSL_CTX_clear_options)(ctx, options) };
+        Ok(())
+    }
+
+    pub fn options(&self) -> u64 {
+        if self.ctx.is_null() {
+            return 0;
+        }
+        unsafe { (self.api.SSL_CTX_get_options)(self.ctx) }
+    }
+
+    /// `SSL_CTX_set_verify` with OpenSSL's default verify callback.
+    pub fn set_verify(&mut self, mode: i32) -> Result<(), EngineError> {
+        let ctx = self.live()?;
+        unsafe { (self.api.SSL_CTX_set_verify)(ctx, mode, None) };
+        Ok(())
+    }
+
+    pub fn verify_mode(&self) -> i32 {
+        if self.ctx.is_null() {
+            return 0;
+        }
+        unsafe { (self.api.SSL_CTX_get_verify_mode)(self.ctx) }
+    }
+
+    pub fn verify_flags(&self) -> u64 {
+        if self.ctx.is_null() {
+            return 0;
+        }
+        let param = unsafe { (self.api.SSL_CTX_get0_param)(self.ctx) };
+        unsafe { (self.api.X509_VERIFY_PARAM_get_flags)(param) as u64 }
+    }
+
+    /// Makes the context's X509 verification flags exactly `flags`.
+    pub fn set_verify_flags(&mut self, flags: u64) -> Result<(), EngineError> {
+        let api = self.api;
+        let ctx = self.live()?;
+        let param = unsafe { (api.SSL_CTX_get0_param)(ctx) };
+        let current = unsafe { (api.X509_VERIFY_PARAM_get_flags)(param) } as u64;
+        let clear = current & !flags;
+        let set = !current & flags;
+        unsafe { (api.ERR_clear_error)() };
+        if clear != 0 && unsafe { (api.X509_VERIFY_PARAM_clear_flags)(param, clear as c_ulong) } != 1 {
+            return Err(api.take_error("X509_VERIFY_PARAM_clear_flags"));
+        }
+        if set != 0 && unsafe { (api.X509_VERIFY_PARAM_set_flags)(param, set as c_ulong) } != 1 {
+            return Err(api.take_error("X509_VERIFY_PARAM_set_flags"));
+        }
+        Ok(())
+    }
+
+    /// `X509_CHECK_FLAG_*` applied to every hostname check of the context's sessions.
+    pub fn set_hostflags(&mut self, flags: u32) -> Result<(), EngineError> {
+        let ctx = self.live()?;
+        let param = unsafe { (self.api.SSL_CTX_get0_param)(ctx) };
+        unsafe { (self.api.X509_VERIFY_PARAM_set_hostflags)(param, flags as c_uint) };
+        Ok(())
+    }
+
+    pub fn security_level(&self) -> i32 {
+        if self.ctx.is_null() {
+            return 0;
+        }
+        unsafe { (self.api.SSL_CTX_get_security_level)(self.ctx) }
+    }
+
+    pub fn set_session_cache_mode(&mut self, mode: i32) -> Result<(), EngineError> {
+        let ctx = self.live()?;
+        unsafe { (self.api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, mode as c_long, std::ptr::null_mut()) };
+        Ok(())
+    }
+
+    /// `number, connect, connect_good, connect_renegotiate, accept, accept_good,
+    /// accept_renegotiate, hits, cb_hits, misses, timeouts, cache_full`.
+    pub fn session_stats(&self) -> [i64; 12] {
+        let mut stats = [0i64; 12];
+        if self.ctx.is_null() {
+            return stats;
+        }
+        for (index, slot) in stats.iter_mut().enumerate() {
+            *slot = unsafe {
+                (self.api.SSL_CTX_ctrl)(self.ctx, SSL_CTRL_SESS_NUMBER + index as c_int, 0, std::ptr::null_mut())
+            } as i64;
+        }
+        stats
+    }
+
+    pub fn num_tickets(&self) -> usize {
+        if self.ctx.is_null() {
+            return 0;
+        }
+        unsafe { (self.api.SSL_CTX_get_num_tickets)(self.ctx) }
+    }
+
+    pub fn set_num_tickets(&mut self, count: usize) -> bool {
+        match self.live() {
+            Ok(ctx) => unsafe { (self.api.SSL_CTX_set_num_tickets)(ctx, count) == 1 },
+            Err(_) => false,
+        }
+    }
+
+    /// `SSL_CTX_load_verify_locations`: a CA bundle file and/or a hashed certificate directory.
+    pub fn load_verify_locations(&mut self, file: Option<&str>, dir: Option<&str>) -> Result<(), EngineError> {
+        let api = self.api;
+        let ctx = self.live()?;
+        let to_c = |text: Option<&str>| text.map(CString::new).transpose().map_err(|_| EngineError::plain("embedded null byte"));
+        let file = to_c(file)?;
+        let dir = to_c(dir)?;
+        self.private_store()?;
+        unsafe { (api.ERR_clear_error)() };
+        let ok = unsafe {
+            (api.SSL_CTX_load_verify_locations)(
+                ctx,
+                file.as_ref().map_or(std::ptr::null(), |text| text.as_ptr()),
+                dir.as_ref().map_or(std::ptr::null(), |text| text.as_ptr()),
+            )
+        };
+        if ok != 1 {
+            return Err(api.take_error("SSL_CTX_load_verify_locations"));
+        }
+        Ok(())
+    }
+
+    /// `SSL_CTX_set_default_verify_paths`; where OpenSSL's defaults name neither an existing file
+    /// nor directory, the platform's own root certificates are loaded instead.
+    pub fn set_default_verify_paths(&mut self) -> Result<(), EngineError> {
+        let api = self.api;
+        let ctx = self.live()?;
+        let store = self.private_store()?;
+        unsafe { (api.ERR_clear_error)() };
+        if unsafe { (api.SSL_CTX_set_default_verify_paths)(ctx) } != 1 {
+            return Err(api.take_error("SSL_CTX_set_default_verify_paths"));
+        }
+        if let Some((file_env, file, dir_env, dir)) = default_verify_paths() {
+            let file = std::env::var(file_env).unwrap_or(file);
+            let dir = std::env::var(dir_env).unwrap_or(dir);
+            if !std::path::Path::new(&file).is_file() && !std::path::Path::new(&dir).is_dir() {
+                for pem in root_certificate_pems() {
+                    let _ = load_pem_text(api, store, pem.as_bytes());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds every certificate of `data` (concatenated PEM, or concatenated DER) to the trust
+    /// store; `cadata` of `SSLContext.load_verify_locations`.
+    pub fn add_ca_data(&mut self, data: &[u8], der: bool) -> Result<(), EngineError> {
+        let api = self.api;
+        self.live()?;
+        let store = self.private_store()?;
+        let bio = api.mem_bio(data)?;
+        unsafe { (api.ERR_clear_error)() };
+        let mut loaded = 0usize;
+        let mut failure: Option<EngineError> = None;
+        loop {
+            let cert = unsafe {
+                if der {
+                    (api.d2i_X509_bio)(bio, std::ptr::null_mut())
+                } else {
+                    (api.PEM_read_bio_X509)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+                }
+            };
+            if cert.is_null() {
+                break;
+            }
+            let added = unsafe { (api.X509_STORE_add_cert)(store, cert) };
+            unsafe { (api.X509_free)(cert) };
+            if added != 1 {
+                let err = unsafe { (api.ERR_peek_last_error)() };
+                if err_lib(err) == ERR_LIB_X509 && err_reason(err) == X509_R_CERT_ALREADY_IN_HASH_TABLE {
+                    unsafe { (api.ERR_clear_error)() };
+                } else {
+                    failure = Some(api.take_error("X509_STORE_add_cert"));
+                    break;
+                }
+            }
+            loaded += 1;
+        }
+        unsafe { (api.BIO_free)(bio) };
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let err = unsafe { (api.ERR_peek_last_error)() };
+        let end_of_data = if der {
+            err_lib(err) == ERR_LIB_ASN1 && err_reason(err) == ASN1_R_HEADER_TOO_LONG
+        } else {
+            err_lib(err) == ERR_LIB_PEM && err_reason(err) == PEM_R_NO_START_LINE
+        };
+        if end_of_data {
+            unsafe { (api.ERR_clear_error)() };
+        } else if err != 0 {
+            return Err(api.take_error("add_ca_data"));
+        }
+        if loaded == 0 {
+            return Err(EngineError::plain(if der {
+                "not enough data: cadata does not contain a certificate"
+            } else {
+                "no start line: cadata does not contain a certificate"
+            }));
+        }
+        Ok(())
+    }
+
+    fn store_objects(&self) -> Vec<(c_int, Ptr)> {
+        let api = self.api;
+        if self.ctx.is_null() {
+            return Vec::new();
+        }
+        let store = unsafe { (api.SSL_CTX_get_cert_store)(self.ctx) };
+        if store.is_null() {
+            return Vec::new();
+        }
+        let objects = unsafe { (api.X509_STORE_get0_objects)(store) };
+        if objects.is_null() {
+            return Vec::new();
+        }
+        (0..unsafe { (api.OPENSSL_sk_num)(objects) })
+            .map(|index| {
+                let object = unsafe { (api.OPENSSL_sk_value)(objects, index) };
+                (unsafe { (api.X509_OBJECT_get_type)(object) }, object)
+            })
+            .collect()
+    }
+
+    /// The DER of every CA certificate in the trust store (`get_ca_certs`).
+    pub fn ca_certs(&self) -> Vec<Vec<u8>> {
+        let api = self.api;
+        self.store_objects()
+            .into_iter()
+            .filter(|(kind, _)| *kind == X509_LU_X509)
+            .filter_map(|(_, object)| {
+                let cert = unsafe { (api.X509_OBJECT_get0_X509)(object) };
+                (unsafe { (api.X509_check_ca)(cert) } != 0).then(|| api.der_of(cert))
+            })
+            .collect()
+    }
+
+    /// `(certificates, revocation lists, CA certificates)` in the trust store.
+    pub fn store_stats(&self) -> (usize, usize, usize) {
+        let api = self.api;
+        let (mut x509, mut crl, mut ca) = (0, 0, 0);
+        for (kind, object) in self.store_objects() {
+            if kind == X509_LU_X509 {
+                x509 += 1;
+                let cert = unsafe { (api.X509_OBJECT_get0_X509)(object) };
+                if unsafe { (api.X509_check_ca)(cert) } != 0 {
+                    ca += 1;
+                }
+            } else if kind == X509_LU_CRL {
+                crl += 1;
+            }
+        }
+        (x509, crl, ca)
+    }
+
+    /// Loads the private key of `pem`. An encrypted key asks `password` (called with the
+    /// buffer size OpenSSL offers); without one, loading an encrypted key fails instead of
+    /// prompting a terminal.
+    pub fn use_private_key(
+        &mut self,
+        pem: &[u8],
+        password: Option<&mut dyn FnMut(usize) -> Result<Vec<u8>, ()>>,
+    ) -> Result<(), EngineError> {
+        let api = self.api;
+        let ctx = self.live()?;
+        let bio = api.mem_bio(pem)?;
+        unsafe { (api.ERR_clear_error)() };
+        let mut state = Passphrase { callback: password };
+        let key = unsafe {
+            (api.PEM_read_bio_PrivateKey)(
+                bio,
+                std::ptr::null_mut(),
+                passphrase_callback as unsafe extern "C" fn(*mut c_char, c_int, c_int, Ptr) -> c_int as *const c_void,
+                &mut state as *mut Passphrase as Ptr,
+            )
+        };
+        unsafe { (api.BIO_free)(bio) };
+        if key.is_null() {
+            return Err(api.take_error("PEM_read_bio_PrivateKey"));
+        }
+        let ok = unsafe { (api.SSL_CTX_use_PrivateKey)(ctx, key) };
+        unsafe { (api.EVP_PKEY_free)(key) };
+        if ok != 1 {
+            return Err(api.take_error("SSL_CTX_use_PrivateKey"));
+        }
+        Ok(())
+    }
+
+    /// `SSL_CTX_check_private_key` with OpenSSL's error on a mismatch.
+    pub fn verify_private_key(&self) -> Result<(), EngineError> {
+        let ctx = self.live()?;
+        unsafe { (self.api.ERR_clear_error)() };
+        if unsafe { (self.api.SSL_CTX_check_private_key)(ctx) } != 1 {
+            return Err(self.api.take_error("SSL_CTX_check_private_key"));
+        }
+        Ok(())
+    }
+
+    /// Diffie-Hellman parameters from `pem` (`load_dh_params`).
+    pub fn load_dh_params(&mut self, pem: &[u8]) -> Result<(), EngineError> {
+        let api = self.api;
+        let ctx = self.live()?;
+        let bio = api.mem_bio(pem)?;
+        unsafe { (api.ERR_clear_error)() };
+        let dh = unsafe {
+            (api.PEM_read_bio_DHparams)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+        };
+        unsafe { (api.BIO_free)(bio) };
+        if dh.is_null() {
+            return Err(api.take_error("PEM_read_bio_DHparams"));
+        }
+        let ok = unsafe { (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_TMP_DH, 0, dh) };
+        unsafe { (api.DH_free)(dh) };
+        if ok != 1 {
+            return Err(api.take_error("SSL_CTX_set_tmp_dh"));
+        }
+        Ok(())
+    }
+
+    /// The cipher suites a session of this context offers, in preference order.
+    pub fn ciphers(&self) -> Result<Vec<CipherInfo>, EngineError> {
+        let api = self.api;
+        let ctx = self.live()?;
+        let ssl = unsafe { (api.SSL_new)(ctx) };
+        if ssl.is_null() {
+            return Err(api.take_error("SSL_new"));
+        }
+        let mut out = Vec::new();
+        let stack = unsafe { (api.SSL_get_ciphers)(ssl) };
+        if !stack.is_null() {
+            for index in 0..unsafe { (api.OPENSSL_sk_num)(stack) } {
+                out.push(cipher_info(api, unsafe { (api.OPENSSL_sk_value)(stack, index) }));
+            }
+        }
+        unsafe { (api.SSL_free)(ssl) };
+        Ok(out)
+    }
+}
+
+impl Session {
+    /// Runs the handshake as far as the buffered bytes allow: `0` when it is complete, else the
+    /// `SSL_ERROR_*` code (`SSL_ERROR_WANT_READ` when more bytes must be fed).
+    pub fn do_handshake(&mut self) -> i32 {
+        unsafe {
+            (self.api.ERR_clear_error)();
+            let ret = (self.api.SSL_do_handshake)(self.ssl);
+            if ret == 1 {
+                0
+            } else {
+                (self.api.SSL_get_error)(self.ssl, ret)
+            }
+        }
+    }
+
+    /// One `SSL_shutdown`: `(return value, SSL_ERROR_* code or 0)`.
+    pub fn shutdown_step(&mut self) -> (i32, i32) {
+        unsafe {
+            (self.api.ERR_clear_error)();
+            let ret = (self.api.SSL_shutdown)(self.ssl);
+            let err = if ret < 0 { (self.api.SSL_get_error)(self.ssl, ret) } else { 0 };
+            (ret, err)
+        }
+    }
+
+    /// Decrypted bytes already buffered by the library (`SSL_pending`).
+    pub fn pending(&self) -> usize {
+        unsafe { (self.api.SSL_pending)(self.ssl) }.max(0) as usize
+    }
+
+    /// Whether the peer's close_notify was received.
+    pub fn received_shutdown(&self) -> bool {
+        unsafe { (self.api.SSL_get_shutdown)(self.ssl) & SSL_RECEIVED_SHUTDOWN != 0 }
+    }
+
+    /// Signals end of input: once the fed bytes are consumed, reads see EOF instead of asking
+    /// for more.
+    pub fn feed_eof(&mut self) {
+        unsafe { (self.api.BIO_ctrl)(self.rbio, BIO_C_SET_BUF_MEM_EOF_RETURN, 0, std::ptr::null_mut()) };
+    }
+
+    /// The newest raw code on OpenSSL's error queue, without consuming it.
+    pub fn peek_error(&self) -> u64 {
+        unsafe { (self.api.ERR_peek_last_error)() as u64 }
+    }
+
+    /// The raw X509 verification result (`X509_V_OK` is 0).
+    pub fn verify_result(&self) -> i64 {
+        unsafe { (self.api.SSL_get_verify_result)(self.ssl) as i64 }
+    }
+
+    pub fn verify_mode(&self) -> i32 {
+        unsafe { (self.api.SSL_get_verify_mode)(self.ssl) }
+    }
+
+    /// Checks the peer certificate against `host` (an IP address when `ip`) with `hostflags`.
+    pub fn set_host_check(&mut self, host: &str, hostflags: u32, ip: bool) -> Result<(), EngineError> {
+        let api = self.api;
+        let host = CString::new(host).map_err(|_| EngineError::plain("embedded null byte"))?;
+        unsafe { (api.ERR_clear_error)() };
+        let param = unsafe { (api.SSL_get0_param)(self.ssl) };
+        unsafe { (api.X509_VERIFY_PARAM_set_hostflags)(param, hostflags as c_uint) };
+        let ok = unsafe {
+            if ip {
+                (api.X509_VERIFY_PARAM_set1_ip_asc)(param, host.as_ptr())
+            } else {
+                (api.X509_VERIFY_PARAM_set1_host)(param, host.as_ptr(), 0)
+            }
+        };
+        if ok != 1 {
+            return Err(api.take_error("X509_VERIFY_PARAM_set1_host"));
+        }
+        Ok(())
+    }
+
+    /// Enables TLS 1.3 post-handshake authentication: a client offers it, a server may later
+    /// request a certificate with [`Session::verify_client_post_handshake`].
+    pub fn enable_post_handshake_auth(&mut self) {
+        unsafe {
+            if self.is_server {
+                let mode = (self.api.SSL_get_verify_mode)(self.ssl);
+                (self.api.SSL_set_verify)(self.ssl, mode | SSL_VERIFY_POST_HANDSHAKE, None);
+            } else {
+                (self.api.SSL_set_post_handshake_auth)(self.ssl, 1);
+            }
+        }
+    }
+
+    pub fn verify_client_post_handshake(&mut self) -> Result<(), EngineError> {
+        unsafe { (self.api.ERR_clear_error)() };
+        if unsafe { (self.api.SSL_verify_client_post_handshake)(self.ssl) } != 1 {
+            return Err(self.api.take_error("SSL_verify_client_post_handshake"));
+        }
+        Ok(())
+    }
+
+    /// Continues this session with `context`'s certificates and settings (`SSL_set_SSL_CTX`).
+    pub fn switch_context(&mut self, context: &Context) -> Result<(), EngineError> {
+        let ctx = context.live()?;
+        unsafe { (self.api.SSL_set_SSL_CTX)(self.ssl, ctx) };
+        Ok(())
+    }
+
+    /// Secret key bits of the negotiated cipher.
+    pub fn cipher_bits(&self) -> i32 {
+        let cipher = unsafe { (self.api.SSL_get_current_cipher)(self.ssl) };
+        if cipher.is_null() {
+            return 0;
+        }
+        unsafe { (self.api.SSL_CIPHER_get_bits)(cipher, std::ptr::null_mut()) }
+    }
+
+    /// `(name, protocol, bits)` of the server's ciphers the client also offered.
+    pub fn shared_ciphers(&self) -> Option<Vec<(String, String, i32)>> {
+        let api = self.api;
+        let server = unsafe { (api.SSL_get_ciphers)(self.ssl) };
+        if server.is_null() {
+            return None;
+        }
+        let client = unsafe { (api.SSL_get_client_ciphers)(self.ssl) };
+        if client.is_null() {
+            return None;
+        }
+        let offered: Vec<Ptr> = (0..unsafe { (api.OPENSSL_sk_num)(client) })
+            .map(|index| unsafe { (api.OPENSSL_sk_value)(client, index) })
+            .collect();
+        let mut out = Vec::new();
+        for index in 0..unsafe { (api.OPENSSL_sk_num)(server) } {
+            let cipher = unsafe { (api.OPENSSL_sk_value)(server, index) };
+            if !offered.contains(&cipher) {
+                continue;
+            }
+            out.push((
+                cstr(unsafe { (api.SSL_CIPHER_get_name)(cipher) }).unwrap_or_default(),
+                cstr(unsafe { (api.SSL_CIPHER_get_version)(cipher) }).unwrap_or_default(),
+                unsafe { (api.SSL_CIPHER_get_bits)(cipher, std::ptr::null_mut()) },
+            ));
+        }
+        Some(out)
+    }
+
+    /// The negotiated compression method's name, if compression is in use.
+    pub fn compression(&self) -> Option<String> {
+        let api = self.api;
+        let method = unsafe { (api.SSL_get_current_compression)(self.ssl) };
+        if method.is_null() {
+            return None;
+        }
+        let nid = unsafe { (api.COMP_get_type)(method) };
+        if nid == 0 {
+            return None;
+        }
+        cstr(unsafe { (api.OBJ_nid2sn)(nid) })
+    }
+
+    /// Starts recording protocol messages for [`Session::take_messages`].
+    pub fn enable_messages(&mut self) {
+        let callback: unsafe extern "C" fn(c_int, c_int, c_int, CPtr, usize, Ptr, Ptr) = message_callback;
+        // SAFETY: OpenSSL stores the pointer as `void (*)(void)` and casts it back to the
+        // message callback signature before calling it.
+        let callback: unsafe extern "C" fn() = unsafe { std::mem::transmute(callback) };
+        unsafe { (self.api.SSL_callback_ctrl)(self.ssl, SSL_CTRL_SET_MSG_CALLBACK, Some(callback)) };
+    }
+
+    pub fn take_messages(&mut self) -> Vec<Message> {
+        std::mem::take(&mut self.state.messages)
+    }
+
+    /// Fails a paused client hello with TLS alert `alert` instead of resuming it.
+    pub fn set_hello_alert(&mut self, alert: i32) {
+        self.state.hello_alert = Some(alert);
+        self.state.hello_done = true;
+    }
+
+    /// Make a server that finds no common ALPN protocol continue without one, rather than send
+    /// a `no_application_protocol` alert.
+    pub fn set_alpn_lenient(&mut self) {
+        self.state.alpn_noack = true;
+    }
+}
+
+impl Context {
+    /// `SSL_CTX_set_min_proto_version` / `SSL_CTX_set_max_proto_version`: whether OpenSSL accepted
+    /// `version` (`0` lifts the bound).
+    pub fn try_set_proto(&mut self, max: bool, version: i32) -> bool {
+        let Ok(ctx) = self.live() else { return false };
+        let cmd = if max { SSL_CTRL_SET_MAX_PROTO_VERSION } else { SSL_CTRL_SET_MIN_PROTO_VERSION };
+        unsafe { (self.api.SSL_CTX_ctrl)(ctx, cmd, version as c_long, std::ptr::null_mut()) == 1 }
+    }
+}
+
+/// Whether OpenSSL knows an object with the short name `name` (an elliptic curve name).
+pub fn short_name_known(name: &str) -> bool {
+    let (Ok(api), Ok(name)) = (api(), CString::new(name)) else { return false };
+    unsafe { (api.OBJ_sn2nid)(name.as_ptr()) != 0 }
 }

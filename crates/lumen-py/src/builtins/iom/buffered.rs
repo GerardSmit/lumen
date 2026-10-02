@@ -131,7 +131,7 @@ fn check_closed(it: &mut Interp, v: &Value, msg: &str) -> R<Value> {
 fn raw_read(it: &mut Interp, raw: &Value, n: usize) -> R<Option<Vec<u8>>> {
     if let Some((fd, true, _)) = native_fd(it, raw) {
         let mut buf = vec![0u8; n];
-        return match read_fd(it, fd, &mut buf) {
+        return match read_fd(it, fd, &mut buf)? {
             Ok(k) => {
                 buf.truncate(k);
                 Ok(Some(buf))
@@ -1109,43 +1109,53 @@ impl BufferedRWPair {
         Ok(())
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Value> {
         let a = size.cloned().unwrap_or(Value::None);
         forward(it, &slf.0, false, "read", vec![a])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn peek(slf: This<Py<Self>>, it: &mut Interp, #[default(0)] size: i64) -> R<Value> {
         forward(it, &slf.0, false, "peek", vec![Value::Int(size)])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn read1(slf: This<Py<Self>>, it: &mut Interp, #[default(-1)] size: i64) -> R<Value> {
         forward(it, &slf.0, false, "read1", vec![Value::Int(size)])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn readinto(slf: This<Py<Self>>, it: &mut Interp, buffer: &Value) -> R<Value> {
         forward(it, &slf.0, false, "readinto", vec![buffer.clone()])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn readinto1(slf: This<Py<Self>>, it: &mut Interp, buffer: &Value) -> R<Value> {
         forward(it, &slf.0, false, "readinto1", vec![buffer.clone()])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn write(slf: This<Py<Self>>, it: &mut Interp, buffer: &Value) -> R<Value> {
         forward(it, &slf.0, true, "write", vec![buffer.clone()])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn flush(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         forward(it, &slf.0, true, "flush", Vec::new())
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn readable(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         forward(it, &slf.0, false, "readable", Vec::new())
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn writable(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         forward(it, &slf.0, true, "writable", Vec::new())
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn close(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
         let w = forward(it, &slf.0, true, "close", Vec::new());
         let r = forward(it, &slf.0, false, "close", Vec::new());
@@ -1159,6 +1169,7 @@ impl BufferedRWPair {
         }
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn isatty(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         let w = forward(it, &slf.0, true, "isatty", Vec::new())?;
         if it.truthy(&w)? {

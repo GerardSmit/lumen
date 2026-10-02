@@ -1,8 +1,12 @@
 //! Compression codecs for the runtime: safe wrappers over maintained crates (zlib-rs through
-//! `libz-rs-sys`, `brotli`, `zstd`). The wrappers keep the streaming shape of the C libraries
+//! `libz-rs-sys`, `brotli`, `zstd`; `bz2` over `bzip2`, `xz` in pure Rust). The wrappers keep the streaming shape of the C libraries
 //! (explicit input/output windows, flush modes, status codes) so `node:zlib` can reproduce
 //! zlib's and Brotli's exact write semantics on top of them; the one-shot helpers serve
 //! `CompressionStream`, `Bun.zstd*` and friends.
+
+pub mod bz2;
+#[cfg(feature = "lzma")]
+pub mod xz;
 
 use std::ffi::c_int;
 

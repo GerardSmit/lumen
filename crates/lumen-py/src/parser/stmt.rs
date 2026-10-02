@@ -645,14 +645,18 @@ impl Parser {
             let pos = self.pos();
             let kind = if self.eat_op("*") {
                 let name = self.ident()?;
-                if self.at_op(":") {
-                    return self.error("cannot use bound with TypeVarTuple");
+                if self.eat_op(":") {
+                    let bound = self.expression()?;
+                    let what = if matches!(bound.kind, ExprKind::Tuple { .. }) { "constraints" } else { "bound" };
+                    return self.error(format!("cannot use {what} with TypeVarTuple"));
                 }
                 TypeParamKind::TypeVarTuple { name }
             } else if self.eat_op("**") {
                 let name = self.ident()?;
-                if self.at_op(":") {
-                    return self.error("cannot use bound with ParamSpec");
+                if self.eat_op(":") {
+                    let bound = self.expression()?;
+                    let what = if matches!(bound.kind, ExprKind::Tuple { .. }) { "constraints" } else { "bound" };
+                    return self.error(format!("cannot use {what} with ParamSpec"));
                 }
                 TypeParamKind::ParamSpec { name }
             } else {

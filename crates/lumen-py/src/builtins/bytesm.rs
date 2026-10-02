@@ -473,7 +473,7 @@ fn byte_val(it: &mut Interp, v: &Value) -> R<u8> {
     Ok(n as u8)
 }
 
-/// The methods `bytes` and `bytearray` share (same signature and docs).
+// The methods `bytes` and `bytearray` share (same signature and docs).
 #[lumen_bind::class(name = "bytes", hint(py(shared)))]
 pub struct ByteMethods;
 

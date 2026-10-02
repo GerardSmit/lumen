@@ -43,6 +43,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     let module = c.module.unwrap_or("builtins");
     let base = c.hint(HOST, "base").and_then(|path| python_base(it, path));
     let ty = new_type(it, module, c.name_for(HOST), base.as_ref(), Layout::Other);
+    crate::gc_traverse::register::<T>();
     it.native_types.insert(TypeId::of::<T>(), ty.clone());
     // Like CPython's extension types, native classes reject attribute assignment unless they are
     // declared `mutable` (`ast.AST`, whose node classes are mutable heap types there too).
@@ -235,6 +236,14 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
     if let Some(doc) = desc.doc {
         dict_set_str(&d, "__doc__", Value::str(doc));
     }
+    install_module::<M>(it, &m)?;
+    Ok(m)
+}
+
+/// Install everything `M` declares (functions, classes, constants, then its init hook) into the
+/// existing module `m`: one module assembled from several declarations.
+pub fn install_module<M: Module<PyHost>>(it: &mut Interp, m: &Obj) -> R<()> {
+    let d = it.module_dict(m);
     install_functions::<M>(&d);
     let items = ModuleItems::<PyHost>::of::<M>();
     for c in &items.classes {
@@ -251,7 +260,7 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
     if let Some(init) = items.init {
         init(it, &Value::Obj(m.clone()))?;
     }
-    Ok(m)
+    Ok(())
 }
 
 /// Install the functions `M` declares into the existing namespace `d` (the `builtins` functions
@@ -363,6 +372,12 @@ impl<T: Class> Py<T> {
 
     pub fn into_value(self) -> Value {
         self.v
+    }
+
+    /// Drops the handle's reference (the cycle collector breaking a cycle); the handle must not be
+    /// used afterwards.
+    pub(crate) fn release(&mut self) {
+        self.v = Value::None;
     }
 
     fn cell(&self) -> &RefCell<Box<dyn Any>> {

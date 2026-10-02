@@ -409,6 +409,17 @@ pub fn errno_location() -> *mut libc::c_int {
     }
 }
 
+/// Sets the calling thread's `errno`.
+pub fn set_errno(value: i32) {
+    #[cfg(unix)]
+    // SAFETY: `errno_location` is the address of the calling thread's errno.
+    unsafe {
+        *errno_location() = value;
+    }
+    #[cfg(not(unix))]
+    let _ = value;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

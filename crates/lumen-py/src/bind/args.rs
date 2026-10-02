@@ -534,6 +534,9 @@ fn slot_doc(name: &str) -> Option<&'static str> {
 /// `__doc__` of the native bound as `name`: its own doc, else the one CPython gives every
 /// `__new__` and slot wrapper.
 pub fn py_doc(d: &'static FnDesc, name: &str) -> Option<&'static str> {
+    if let Some(doc) = d.hint(HOST, "doc") {
+        return Some(doc);
+    }
     if d.doc.is_some() {
         return d.doc;
     }

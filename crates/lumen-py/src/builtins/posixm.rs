@@ -373,11 +373,13 @@ pub mod posix {
 
     #[methods]
     impl DirEntry {
+        /// the entry's base filename, relative to scandir() "path" argument
         #[getter]
         fn name(&self) -> Value {
             self.name.clone()
         }
 
+        /// the entry's full path name; equivalent to os.path.join(scandir_path, entry.name)
         #[getter]
         fn path(&self) -> Value {
             self.path.clone()
@@ -743,6 +745,7 @@ pub mod posix {
         if length < 0 {
             return Err(it.os_error_errno(einval(), None, None));
         }
+        it.wait_fd(fd, lumen_os::poll::POLLIN)?;
         let mut buf = vec![0u8; length as usize];
         let r = it.platform.borrow_mut().fd_read(fd, &mut buf, None);
         let n = r.map_err(|e| os_err(it, e))?;
@@ -1050,15 +1053,220 @@ pub mod posix {
     /// Wait for completion of a given child process.
     #[op]
     fn waitpid(it: &mut Interp, pid: i32, options: i32) -> R<(i32, i32)> {
-        let r = it.platform.borrow_mut().waitpid(pid, options);
+        let r = it.waitpid_blocking(pid, options)?;
         r.map_err(|e| os_err(it, e))
     }
 
     /// Wait for completion of a child process.
     #[op]
     fn wait(it: &mut Interp) -> R<(i32, i32)> {
-        let r = it.platform.borrow_mut().waitpid(-1, 0);
+        let r = it.waitpid_blocking(-1, 0)?;
         r.map_err(|e| os_err(it, e))
+    }
+
+    struct WaitidResult;
+
+    fn fs_err(it: &mut Interp, e: lumen_os::FsError) -> Obj {
+        it.os_error_errno(e.errno(), None, None)
+    }
+
+    #[derive(Default)]
+    pub struct ForkHooks {
+        before: Vec<Value>,
+        parent: Vec<Value>,
+        child: Vec<Value>,
+    }
+
+    fn run_fork_hooks(it: &mut Interp, hooks: Vec<Value>) {
+        for hook in hooks {
+            if let Err(e) = it.call(&hook, Vec::new(), Vec::new()) {
+                it.flush_out();
+                let repr = it.repr_of(&hook).unwrap_or_default();
+                it.write_stderr(&format!("Exception ignored in: {repr}\n"));
+                let text = it.format_exception(&e);
+                it.write_stderr(&text);
+            }
+        }
+    }
+
+    pub(crate) fn before_fork(it: &mut Interp) {
+        it.flush_out();
+        let hooks: Vec<Value> = it.native_state::<ForkHooks>().before.iter().rev().cloned().collect();
+        run_fork_hooks(it, hooks);
+    }
+
+    pub(crate) fn after_fork(it: &mut Interp, in_child: bool) {
+        let state = it.native_state::<ForkHooks>();
+        let hooks = if in_child { state.child.clone() } else { state.parent.clone() };
+        run_fork_hooks(it, hooks);
+    }
+
+    /// Runs `spawn` (a fork) between the registered fork hooks; `pid_of` extracts the child
+    /// indicator from its result.
+    fn forked<T>(it: &mut Interp, spawn: impl FnOnce() -> Result<T, lumen_os::FsError>, pid_of: impl Fn(&T) -> i32) -> R<T> {
+        before_fork(it);
+        match spawn() {
+            Ok(r) => {
+                after_fork(it, pid_of(&r) == 0);
+                Ok(r)
+            }
+            Err(e) => {
+                after_fork(it, false);
+                Err(fs_err(it, e))
+            }
+        }
+    }
+
+    /// Fork a child process.
+    ///
+    /// Return 0 to child process and PID of child to parent process.
+    #[op]
+    fn fork(it: &mut Interp) -> R<i32> {
+        forked(it, lumen_os::proc::fork, |&pid| pid)
+    }
+
+    /// Register callables to be called when forking a new process.
+    ///
+    ///   before
+    ///     A callable to be called in the parent before the fork() syscall.
+    ///   after_in_child
+    ///     A callable to be called in the child after fork().
+    ///   after_in_parent
+    ///     A callable to be called in the parent after fork().
+    ///
+    /// 'before' callbacks are called in reverse order.
+    /// 'after_in_child' and 'after_in_parent' callbacks are called in order.
+    #[op]
+    fn register_at_fork(
+        it: &mut Interp,
+        #[kwonly] before: Option<&Value>,
+        #[kwonly] after_in_child: Option<&Value>,
+        #[kwonly] after_in_parent: Option<&Value>,
+    ) -> R<()> {
+        let given = [("before", before), ("after_in_child", after_in_child), ("after_in_parent", after_in_parent)];
+        if given.iter().all(|(_, v)| v.is_none()) {
+            return Err(it.type_error("At least one argument is required."));
+        }
+        for (name, v) in &given {
+            if let Some(v) = v {
+                if !it.is_callable(v) {
+                    let t = it.type_name_of(v);
+                    return Err(it.type_error(&format!("'{name}' must be callable, not {t}")));
+                }
+            }
+        }
+        let state = it.native_state::<ForkHooks>();
+        if let Some(v) = before {
+            state.before.push(v.clone());
+        }
+        if let Some(v) = after_in_child {
+            state.child.push(v.clone());
+        }
+        if let Some(v) = after_in_parent {
+            state.parent.push(v.clone());
+        }
+        Ok(())
+    }
+
+    /// Open a pseudo-terminal.
+    ///
+    /// Return a tuple of (master_fd, slave_fd) containing open file descriptors
+    /// for both the master and slave ends.
+    #[op]
+    fn openpty(it: &mut Interp) -> R<(i32, i32)> {
+        lumen_os::tty::openpty().map_err(|e| fs_err(it, e))
+    }
+
+    /// Fork a new process with a new pseudo-terminal as controlling tty.
+    ///
+    /// Returns a tuple of (pid, master_fd).
+    /// Like fork(), return pid of 0 to the child process,
+    /// and pid of child to the parent process.
+    /// To both, return fd of newly opened pseudo-terminal.
+    #[op]
+    fn forkpty(it: &mut Interp) -> R<(i32, i32)> {
+        forked(it, lumen_os::tty::forkpty, |&(pid, _)| pid)
+    }
+
+    /// Prepare the tty of which fd is a file descriptor for a new login session.
+    ///
+    /// Make the calling process a session leader; make the tty the
+    /// controlling tty, the stdin, the stdout, and the stderr of the
+    /// calling process; close fd.
+    #[op]
+    fn login_tty(it: &mut Interp, fd: &Value) -> R<()> {
+        let fd = super::as_file_descriptor(it, fd)?;
+        lumen_os::tty::login_tty(fd).map_err(|e| fs_err(it, e))
+    }
+
+    fn rusage_result(it: &mut Interp, pid: i32, status: i32, usage: &lumen_os::rlimit::Rusage) -> (i32, i32, Value) {
+        (pid, status, crate::builtins::resourcem::resource::rusage_value(it, usage))
+    }
+
+    /// Wait for completion of a child process.
+    ///
+    /// Returns a tuple of information about the child process:
+    ///   (pid, status, rusage)
+    #[op]
+    fn wait3(it: &mut Interp, options: i32) -> R<(i32, i32, Value)> {
+        it.flush_out();
+        let (pid, status, usage) = lumen_os::proc::wait4(-1, options).map_err(|e| fs_err(it, e))?;
+        it.poll()?;
+        Ok(rusage_result(it, pid, status, &usage))
+    }
+
+    /// Wait for completion of a specific child process.
+    ///
+    /// Returns a tuple of information about the child process:
+    ///   (pid, status, rusage)
+    #[op]
+    fn wait4(it: &mut Interp, pid: i32, options: i32) -> R<(i32, i32, Value)> {
+        it.flush_out();
+        let (pid, status, usage) = lumen_os::proc::wait4(pid, options).map_err(|e| fs_err(it, e))?;
+        it.poll()?;
+        Ok(rusage_result(it, pid, status, &usage))
+    }
+
+    /// Returns the result of waiting for a process or processes.
+    ///
+    ///   idtype
+    ///     Must be one of be P_PID, P_PGID or P_ALL.
+    ///   id
+    ///     The id to wait on.
+    ///   options
+    ///     Constructed from the ORing of one or more of WEXITED, WSTOPPED
+    ///     or WCONTINUED and additionally may be ORed with WNOHANG or WNOWAIT.
+    ///
+    /// Returns either waitid_result or None if WNOHANG is specified and there are
+    /// no children in a waitable state.
+    #[op]
+    fn waitid(it: &mut Interp, idtype: i32, id: &Value, options: i32) -> R<Value> {
+        let id = match it.index_of(id)? {
+            n if n >= 0 && n <= u32::MAX as i64 => n as u32,
+            n if n == -1 => u32::MAX,
+            _ => return Err(it.overflow_err("Python int too large to convert to C unsigned int")),
+        };
+        it.flush_out();
+        let info = lumen_os::proc::waitid(idtype, id, options).map_err(|e| fs_err(it, e))?;
+        it.poll()?;
+        let Some(w) = info else { return Ok(Value::None) };
+        let ty = structseq_type::<WaitidResult>(
+            it,
+            "posix",
+            "waitid_result",
+            &["si_pid", "si_uid", "si_signo", "si_status", "si_code"],
+            5,
+        );
+        Ok(structseq_full(
+            &ty,
+            vec![
+                Value::Int(w.pid as i64),
+                Value::Int(w.uid as i64),
+                Value::Int(w.signo as i64),
+                Value::Int(w.status as i64),
+                Value::Int(w.code as i64),
+            ],
+        ))
     }
 
     /// Return True if the process returning status exited via the exit() system call.
@@ -1180,6 +1388,9 @@ pub mod posix {
             let _ = it.dict_set(&env, Value::bytes(k), Value::bytes(v));
         }
         dict_set_str(&d, "environ", Value::Obj(env));
+        for (name, v) in lumen_os::proc::CLD_CONSTANTS {
+            dict_set_str(&d, name, Value::Int(v));
+        }
         dict_set_str(&d, "_have_functions", Value::list(HAVE_FUNCTIONS.iter().map(|n| Value::str(n)).collect()));
     }
 }

@@ -32,7 +32,7 @@ pub fn install_default_handlers(it: &mut Interp) {
 
 /// `PyErr_CheckSignals`: runs the handlers of any signals caught so far.
 pub fn check(it: &mut Interp) -> R<()> {
-    if it.handles_signals && lumen_os::signal::any_pending() {
+    if lumen_os::signal::any_pending() && it.handles_signals && it.is_main_thread() {
         return run_pending(it);
     }
     Ok(())
@@ -196,7 +196,7 @@ pub mod _signal {
         it.flush_out();
         while !os::any_pending() {
             it.poll()?;
-            it.platform.borrow_mut().sleep(0.02);
+            it.sleep_slice(0.02);
         }
         super::run_pending(it)
     }
@@ -240,6 +240,9 @@ pub mod _signal {
             return Err(it.os_error_errno(22, None, None));
         }
         os::set_disposition(sig, disposition, true).map_err(|e| os_error(it, e))?;
+        if disposition == Disposition::Catch && it.handles_signals {
+            it.catching_signals = true;
+        }
         let st = it.native_state::<State>();
         let old = std::mem::replace(&mut st.handlers[sig as usize], handler.clone());
         Ok(old)
@@ -359,11 +362,8 @@ pub mod _signal {
     #[op]
     fn pthread_kill(it: &mut Interp, thread_id: i64, signalnum: i64) -> R<()> {
         let sig = signalnum as i32;
-        if thread_id != crate::builtins::threadm::_thread::MAIN_THREAD {
-            return Err(it.os_error_errno(3, None, None));
-        }
-        os::raise(sig).map_err(|e| os_error(it, e))?;
-        if it.handles_signals {
+        os::pthread_kill(thread_id as u64, sig).map_err(|e| os_error(it, e))?;
+        if it.handles_signals && thread_id as u64 == lumen_os::thread::ident() {
             super::run_pending(it)?;
         }
         Ok(())

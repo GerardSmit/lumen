@@ -84,6 +84,19 @@ thread_local! {
     static WIDE: RefCell<Vec<(Obj, Rc<[u32]>)>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The decoded-text cache, moved out of this thread's slot when the thread gives up the GIL
+/// (it holds objects, so it must follow the interpreter, not the OS thread).
+pub(crate) fn tls_take() -> Box<dyn std::any::Any> {
+    Box::new(WIDE.with(|w| std::mem::take(&mut *w.borrow_mut())))
+}
+
+pub(crate) fn tls_put(state: Box<dyn std::any::Any>) {
+    if let Ok(v) = state.downcast::<Vec<(Obj, Rc<[u32]>)>>() {
+        let old = WIDE.with(|w| std::mem::replace(&mut *w.borrow_mut(), *v));
+        drop(old);
+    }
+}
+
 /// The code points of a non-ASCII `str`, cached so scanning a long string with many matches does
 /// not re-decode it for every call.
 fn wide_text(w: &[u32]) -> String {
@@ -1060,7 +1073,7 @@ impl Scanner {
     }
 }
 
-/// The SRE engine: compiles the opcode lists `re._compiler` produces.
+// The SRE engine: compiles the opcode lists `re._compiler` produces.
 #[lumen_bind::module(name = "_sre")]
 pub mod _sre {
     use super::*;

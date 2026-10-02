@@ -1,0 +1,36 @@
+enabled by default: True
+disabled: True
+enabled again: True
+threshold: (700, 10, 10)
+one value: (500, 10, 10)
+two values: (600, 5, 10)
+restored: True
+count is a triple of ints: True
+stats: 3 ['collected', 'collections', 'uncollectable']
+tracked: True True False False
+tracked objects: False True True
+instance tracked: True False
+in get_objects: True
+in a generation: True
+ValueError: generation parameter must be less than the number of available generations (3)
+referrers: True
+referents: True
+referents of a list: True
+frozen objects: True
+frozen objects are not collected: True
+unfrozen: True
+back in the heap: True
+callbacks: [('start', ['collected', 'generation', 'uncollectable']), ('stop', ['collected', 'generation', 'uncollectable'])]
+start: ('start', 2, 0, 0)
+stop collected a few: ('stop', 2) True 0
+full collections counted: True
+garbage list: []
+debug flags: True
+saved by DEBUG_SAVEALL: 4
+garbage empty: True
+DEBUG_LEAK: True
+DEBUG_COLLECTABLE lines: 4
+threshold 0 disables automatic collection: True
+automatic collections ran: True
+none while disabled: True
+is_finalizing: False

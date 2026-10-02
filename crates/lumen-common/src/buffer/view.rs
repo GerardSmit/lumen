@@ -58,6 +58,12 @@ pub fn f_strides(shape: &[usize], itemsize: usize) -> Vec<isize> {
 /// meaning the end appropriate for the step's sign) against `len` and return
 /// `(start, slice_len)`. `step` must be nonzero.
 pub fn adjust_slice(len: usize, start: Option<isize>, stop: Option<isize>, step: isize) -> (isize, usize) {
+    let (start, _, n) = adjust_slice_bounds(len, start, stop, step);
+    (start, n)
+}
+
+/// [`adjust_slice`] that also returns the clamped `stop`: `(start, stop, slice_len)`.
+pub fn adjust_slice_bounds(len: usize, start: Option<isize>, stop: Option<isize>, step: isize) -> (isize, isize, usize) {
     debug_assert!(step != 0);
     let len = len as isize;
     let clamp = |v: Option<isize>, default: isize| -> isize {
@@ -101,7 +107,7 @@ pub fn adjust_slice(len: usize, start: Option<isize>, stop: Option<isize>, step:
     } else {
         0
     };
-    (start, n as usize)
+    (start, stop, n as usize)
 }
 
 /// A shaped, strided, typed view of a store: what Python's `memoryview` (and the buffer protocol)

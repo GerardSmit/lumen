@@ -824,7 +824,7 @@ impl Complex {
     }
 }
 
-/// The number slots `int`, `float` and `complex` share.
+// The number slots `int`, `float` and `complex` share.
 #[lumen_bind::class(name = "number", hint(py(shared)))]
 pub struct NumberSlots;
 

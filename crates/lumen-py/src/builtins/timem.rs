@@ -453,6 +453,9 @@ pub mod time {
             return Err(it.value_error("sleep length must be non-negative"));
         }
         it.flush_out();
+        if s == 0.0 {
+            it.yield_gil();
+        }
         let deadline = it.platform.borrow().monotonic_ns().saturating_add((s.min(1e9) * 1e9) as u64);
         loop {
             it.poll()?;
@@ -461,7 +464,7 @@ pub mod time {
                 return Ok(());
             }
             // Sleep in slices so an interrupt is noticed promptly.
-            it.platform.borrow_mut().sleep(left.min(20_000_000) as f64 / 1e9);
+            it.sleep_slice(left.min(20_000_000) as f64 / 1e9);
         }
     }
 

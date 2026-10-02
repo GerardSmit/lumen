@@ -75,7 +75,21 @@ fn update_dict(it: &mut Interp, d: &Obj, name: &str, args: &[Value], kwargs: KwA
         return Err(it.type_error(&format!("{} expected at most 1 argument, got {}", name, args.len())));
     }
     if let Some(src) = args.first() {
-        it.dict_update_from(d, src)?;
+        let into_empty = pydict_of(d).filter(|p| p.borrow().watch() != 0 && p.borrow().is_empty());
+        let from_dict = matches!(src, Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Dict(_)));
+        match into_empty {
+            Some(p) if from_dict => {
+                let mask = p.borrow().watch();
+                p.borrow().set_watch(0);
+                let r = it.dict_update_from(d, src);
+                p.borrow().set_watch(mask);
+                r?;
+                if !p.borrow().is_empty() {
+                    p.borrow().notify_cloned();
+                }
+            }
+            _ => it.dict_update_from(d, src)?,
+        }
     }
     for (k, v) in kwargs.to_vec() {
         it.dict_set(d, Value::Obj(k), v)?;
@@ -242,7 +256,7 @@ impl Dict {
     }
 }
 
-/// `isdisjoint`, `__repr__` and `mapping` of the three dict views.
+// `isdisjoint`, `__repr__` and `mapping` of the three dict views.
 #[lumen_bind::class(name = "dict_view", hint(py(shared)))]
 pub struct DictViews;
 

@@ -1,0 +1,17 @@
+duplicate type parameter 'A'
+duplicate type parameter 'A'
+duplicate type parameter 'A'
+cannot use bound with TypeVarTuple
+cannot use constraints with TypeVarTuple
+cannot use bound with ParamSpec
+cannot use constraints with ParamSpec
+nonlocal binding not allowed for type parameter 'X'
+nonlocal binding not allowed for type parameter 'T'
+nonlocal binding not allowed for type parameter 'T'
+Cannot use comprehension in annotation scope within class scope
+Cannot use comprehension in annotation scope within class scope
+Cannot use lambda in annotation scope within class scope
+Cannot use comprehension in annotation scope within class scope
+yield expression cannot be used within a type alias
+await expression cannot be used within a TypeVar bound
+named expression cannot be used within the definition of a generic

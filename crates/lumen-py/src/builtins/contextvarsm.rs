@@ -417,7 +417,7 @@ impl Values {
     }
 }
 
-/// The `(variable, value)` pairs of a context; its own iterator.
+// The `(variable, value)` pairs of a context; its own iterator.
 #[lumen_bind::class(name = "items", hint(py(final)))]
 pub struct Items {
     items: Vec<Value>,
@@ -444,7 +444,7 @@ impl Items {
     }
 }
 
-/// The `Token.MISSING` marker.
+// The `Token.MISSING` marker.
 #[lumen_bind::class(name = "Token.MISSING", hint(py(final)))]
 pub struct Missing;
 

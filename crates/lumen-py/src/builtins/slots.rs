@@ -61,8 +61,8 @@ impl Slots {
     }
 }
 
-/// `__getitem__` / `__contains__` as the methods (not slot wrappers) some types define over the
-/// slot: `list` and `dict` (`__getitem__`), `dict`, `set` and `frozenset` (`__contains__`).
+// `__getitem__` / `__contains__` as the methods (not slot wrappers) some types define over the
+// slot: `list` and `dict` (`__getitem__`), `dict`, `set` and `frozenset` (`__contains__`).
 #[lumen_bind::class(name = "methods", hint(py(shared)))]
 pub struct MethodForms;
 
