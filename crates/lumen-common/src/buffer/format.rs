@@ -193,7 +193,8 @@ pub struct StructCode {
 
 const C_LONG: usize = if cfg!(windows) { 4 } else { core::mem::size_of::<usize>() };
 
-const fn int_kind(size: usize, signed: bool) -> ElemKind {
+/// The integer kind of `size` bytes (8 for any larger size).
+pub const fn int_kind(size: usize, signed: bool) -> ElemKind {
     match (size, signed) {
         (1, true) => ElemKind::I8,
         (1, false) => ElemKind::U8,

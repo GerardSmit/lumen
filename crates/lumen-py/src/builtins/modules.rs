@@ -39,6 +39,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_warnings", |it| Some(super::warningsm::make(it))),
     ("_weakref", |it| Some(super::weakm::make(it))),
     ("_zoneinfo", bound::<super::zoneinfom::_zoneinfo::Module>),
+    ("array", bound::<super::arraym::array::Module>),
     ("atexit", |it| Some(super::sysmods::make_atexit(it))),
     ("binascii", bound::<super::binasciim::binascii::Module>),
     ("builtins", |it| Some(super::sysmods::make_builtins(it))),

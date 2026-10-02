@@ -69,12 +69,12 @@ pub fn norm_index(i: i64, len: usize) -> Option<usize> {
 pub fn slice_len(start: i64, stop: i64, step: i64) -> usize {
     if step > 0 {
         if stop > start {
-            ((stop - start + step - 1) / step) as usize
+            ((stop - start - 1) / step + 1) as usize
         } else {
             0
         }
     } else if start > stop {
-        ((start - stop - step - 1) / (-step)) as usize
+        ((start - stop - 1) / step.saturating_neg() + 1) as usize
     } else {
         0
     }
@@ -1128,7 +1128,7 @@ impl Interp {
             _ => return Err(self.type_error("slice expected")),
         };
         let len = len as i64;
-        let step = if step.is_none() { 1 } else { self.index_of(&step)? };
+        let step = if step.is_none() { 1 } else { self.slice_index(&step)?.max(-i64::MAX) };
         if step == 0 {
             return Err(self.value_error("slice step cannot be zero"));
         }
@@ -1838,9 +1838,9 @@ impl Interp {
         Ok(out)
     }
 
-    /// Whether `v` exports a contiguous buffer (`bytes`, `bytearray`, `memoryview`).
+    /// Whether `v` exports a contiguous buffer (`bytes`, `bytearray`, `memoryview`, `array`).
     pub fn is_buffer(&mut self, v: &Value) -> bool {
-        matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_))) || crate::builtins::memview::is_memoryview(self, v)
+        matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_))) || crate::builtins::memview::is_buffer_object(self, v)
     }
 
     /// The bytes of a buffer argument (`Py_buffer` in CPython's argument clinic); anything else
@@ -1858,7 +1858,7 @@ impl Interp {
             Value::Obj(o) => match &o.kind {
                 Kind::Bytes(b) => Ok(b.clone()),
                 Kind::ByteArray(b) => Ok(b.to_vec()),
-                Kind::Opaque(_) if crate::builtins::memview::is_memoryview(self, v) => {
+                Kind::Opaque(_) if crate::builtins::memview::is_buffer_object(self, v) => {
                     Ok(crate::builtins::memview::contiguous_bytes(self, v)?.unwrap_or_default())
                 }
                 Kind::List(_) | Kind::Tuple(_) | Kind::Range(_) => {

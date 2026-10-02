@@ -77,7 +77,15 @@ pub fn export(it: &mut Interp, v: &Value) -> R<Option<Exported>> {
                 let src = src.reexport().map_err(|e| buffer_error(it, e))?;
                 Ok(Some(Exported { src, view: m.view.clone(), obj: m.obj.clone(), fmt: m.fmt.clone() }))
             }
-            None => Ok(None),
+            None => match super::arraym::array::parts(it, v) {
+                Some((spec, store)) => {
+                    let e = store.export().map_err(|e| buffer_error(it, e))?;
+                    let n = store.len() / spec.size;
+                    let view = ViewDesc::contiguous(0, Some(spec.kind), spec.size, ByteOrder::NATIVE, vec![n], false);
+                    Ok(Some(Exported { src: Source::Store(e), view, obj: v.clone(), fmt: spec.format().into() }))
+                }
+                None => Ok(None),
+            },
         },
         _ => Ok(None),
     }
@@ -773,10 +781,15 @@ pub enum Part {
     Store(Rc<ByteStore>, std::ops::Range<usize>),
 }
 
-/// The bytes of memoryview `v` (`BufferError` unless it is C-contiguous); `None` when `v` is
-/// not a memoryview.
+/// The bytes of memoryview `v` (`BufferError` unless it is C-contiguous) or of an array; `None`
+/// for any other object.
 pub fn contiguous_part(it: &mut Interp, v: &Value) -> R<Option<Part>> {
-    let Some(p) = Py::<MemoryView>::from_value(it, v) else { return Ok(None) };
+    let Some(p) = Py::<MemoryView>::from_value(it, v) else {
+        return Ok(super::arraym::array::parts(it, v).map(|(_, store)| {
+            let n = store.len();
+            Part::Store(store, 0..n)
+        }));
+    };
     let m = p.borrow(it)?;
     let src = m.src(it)?;
     if !m.view.is_c_contiguous() {
@@ -793,6 +806,11 @@ pub fn contiguous_part(it: &mut Interp, v: &Value) -> R<Option<Part>> {
 
 pub fn is_memoryview(it: &Interp, v: &Value) -> bool {
     crate::bind::is_instance::<MemoryView>(it, v)
+}
+
+/// Whether `v` is a native object exporting a buffer (`memoryview`, `array.array`).
+pub fn is_buffer_object(it: &Interp, v: &Value) -> bool {
+    is_memoryview(it, v) || crate::bind::is_instance::<super::arraym::array::Array>(it, v)
 }
 
 /// Installs `memoryview` in `builtins`.

@@ -343,7 +343,7 @@ fn writeflush(it: &mut Interp, slf: &Slf) -> R<()> {
 fn bytes_from(it: &mut Interp, v: &Value, method: &str) -> R<Vec<u8>> {
     match v {
         Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(v),
-        Value::Obj(o) if matches!(o.kind, Kind::Opaque(_)) && crate::builtins::memview::is_memoryview(it, v) => it.bytes_of(v),
+        Value::Obj(o) if matches!(o.kind, Kind::Opaque(_)) && crate::builtins::memview::is_buffer_object(it, v) => it.bytes_of(v),
         _ => {
             let t = it.type_name_of(v);
             Err(it.type_error(&format!("underlying {}() should have returned a bytes-like object, not '{}'", method, t)))
