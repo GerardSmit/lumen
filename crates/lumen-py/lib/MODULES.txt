@@ -221,3 +221,30 @@ gzip.py
 # running modules as scripts (-m)
 runpy.py
 pkgutil.py
+# terminal, pty, password hashing and line-editor helpers, multiprocessing
+tty.py
+pty.py
+crypt.py
+rlcompleter.py
+multiprocessing/__init__.py
+multiprocessing/connection.py
+multiprocessing/context.py
+multiprocessing/forkserver.py
+multiprocessing/heap.py
+multiprocessing/managers.py
+multiprocessing/pool.py
+multiprocessing/popen_fork.py
+multiprocessing/popen_forkserver.py
+multiprocessing/popen_spawn_posix.py
+multiprocessing/process.py
+multiprocessing/queues.py
+multiprocessing/reduction.py
+multiprocessing/resource_sharer.py
+multiprocessing/resource_tracker.py
+multiprocessing/shared_memory.py
+multiprocessing/sharedctypes.py
+multiprocessing/spawn.py
+multiprocessing/synchronize.py
+multiprocessing/util.py
+multiprocessing/dummy/__init__.py
+multiprocessing/dummy/connection.py

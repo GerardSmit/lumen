@@ -107,30 +107,17 @@ pub fn argon2_phc(
         .map_err(|e| e.to_string())
 }
 
-fn bcrypt_raw(password: &[u8], salt: &[u8; 16], cost: u32) -> [u8; 23] {
-    let mut key = Vec::with_capacity(73);
+fn bcrypt_key(password: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if password.len() > 72 {
-        key.extend_from_slice(&digest(Algo::Sha512, password));
+        std::borrow::Cow::Owned(digest(Algo::Sha512, password))
     } else {
-        key.extend_from_slice(password);
+        std::borrow::Cow::Borrowed(password)
     }
-    key.push(0);
-    key.truncate(72);
-    let out = bcrypt::bcrypt(cost, *salt, &key);
-    let mut digest = [0u8; 23];
-    digest.copy_from_slice(&out[..23]);
-    digest
 }
 
 /// `$2b$NN$<22 salt chars><31 digest chars>`.
 pub fn bcrypt_string(password: &[u8], salt: &[u8; 16], cost: u32) -> String {
-    let digest = bcrypt_raw(password, salt, cost);
-    format!(
-        "$2b${:02}${}{}",
-        cost,
-        bcrypt::BASE_64.encode(salt),
-        bcrypt::BASE_64.encode(digest)
-    )
+    lumen_common::crypt::bcrypt_string('b', &bcrypt_key(password), salt, cost)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,13 +159,13 @@ fn bcrypt_verify(password: &[u8], hash: &str) -> Result<bool, PasswordError> {
     if !(4..=31).contains(&cost) {
         return Err(inv);
     }
-    let salt: [u8; 16] = bcrypt::BASE_64
-        .decode(&hash[7..29])
-        .map_err(|_| inv)?
+    let salt: [u8; 16] = lumen_common::crypt::bcrypt_decode(&hash[7..29])
+        .ok_or(inv)?
         .try_into()
         .map_err(|_| inv)?;
-    let expect = bcrypt::BASE_64.decode(&hash[29..60]).map_err(|_| inv)?;
-    Ok(bool::from(bcrypt_raw(password, &salt, cost)[..].ct_eq(&expect)))
+    let expect = lumen_common::crypt::bcrypt_decode(&hash[29..60]).ok_or(inv)?;
+    let got = lumen_common::crypt::bcrypt_raw(&bcrypt_key(password), &salt, cost);
+    Ok(bool::from(got[..].ct_eq(&expect)))
 }
 
 /// Verify `password` against a PHC argon2 string or a `$2[abxy]$` bcrypt string,

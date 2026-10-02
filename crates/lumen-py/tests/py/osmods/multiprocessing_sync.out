@@ -1,0 +1,12 @@
+True False
+True
+ValueError semaphore or lock released too many times
+True True
+AssertionError attempt to release recursive lock not owned by thread
+True True False
+True
+ValueError semaphore or lock released too many times
+False
+True
+True
+0

@@ -1,0 +1,8 @@
+TypeError At least one argument is required.
+TypeError 'before' must be callable, not int
+True True 7 struct_rusage
+['before 2', 'before 1', 'parent 1', 'parent 2']
+True 3 16
+waitid_result True True True True
+ChildProcessError 10
+b'from child\n'

@@ -1,0 +1,18 @@
+16 False 0
+11 b'hello world'
+b'hello' b' world\x00\x00\x00\x00\x00' 16
+-1 -1 -1 7
+104 0 b'low'
+b'hEllo'
+b'world world'
+16 b'world'
+BufferError cannot close exported pointers exist
+True
+ValueError mmap closed or invalid
+100 b'abcdefghij' 100
+True
+b'abcdefghijXYZde'
+TypeError mmap can't modify a readonly memory map.
+b'###defghijXY'
+b'abcdefghijXYZde'
+True 0 1 2 3

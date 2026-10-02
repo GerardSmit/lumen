@@ -84,11 +84,28 @@ pub fn export(it: &mut Interp, v: &Value) -> R<Option<Exported>> {
                     let view = ViewDesc::contiguous(0, Some(spec.kind), spec.size, ByteOrder::NATIVE, vec![n], false);
                     Ok(Some(Exported { src: Source::Store(e), view, obj: v.clone(), fmt: spec.format().into() }))
                 }
-                None => Ok(None),
+                None => match super::mmapm::mmap::buffer_of(it, v)? {
+                    Some((store, readonly)) => {
+                        let e = store.export().map_err(|e| buffer_error(it, e))?;
+                        let view = ViewDesc::bytes(0, store.len(), readonly);
+                        Ok(Some(Exported { src: Source::Store(e), view, obj: v.clone(), fmt: "B".into() }))
+                    }
+                    None => Ok(None),
+                },
             },
         },
         _ => Ok(None),
     }
+}
+
+/// Runs `f` on the bytes of the writable, C-contiguous buffer `v`; `None` when `v` is not one.
+pub fn with_writable<T>(it: &mut Interp, v: &Value, f: impl FnOnce(&mut [u8]) -> T) -> R<Option<T>> {
+    let Some(e) = export(it, v)? else { return Ok(None) };
+    if e.view.readonly || !e.view.is_c_contiguous() {
+        return Ok(None);
+    }
+    let (offset, n) = (e.view.offset, e.view.nbytes());
+    e.src.with_mut(|b| f(&mut b[offset..offset + n])).map(Some).map_err(|e| inaccessible(it, e))
 }
 
 /// A writable `memoryview` of `store`, exported by `obj`.
@@ -785,7 +802,11 @@ pub enum Part {
 /// for any other object.
 pub fn contiguous_part(it: &mut Interp, v: &Value) -> R<Option<Part>> {
     let Some(p) = Py::<MemoryView>::from_value(it, v) else {
-        return Ok(super::arraym::array::parts(it, v).map(|(_, store)| {
+        let store = match super::arraym::array::parts(it, v) {
+            Some((_, store)) => Some(store),
+            None => super::mmapm::mmap::buffer_of(it, v)?.map(|(store, _)| store),
+        };
+        return Ok(store.map(|store| {
             let n = store.len();
             Part::Store(store, 0..n)
         }));
@@ -804,13 +825,34 @@ pub fn contiguous_part(it: &mut Interp, v: &Value) -> R<Option<Part>> {
     }))
 }
 
+/// The store range of a writable C-contiguous memoryview or of a writable `mmap`; `None` for any
+/// other object.
+pub fn writable_part(it: &mut Interp, v: &Value) -> R<Option<(Rc<ByteStore>, std::ops::Range<usize>)>> {
+    if let Some((store, false)) = super::mmapm::mmap::buffer_of(it, v)? {
+        let n = store.len();
+        return Ok(Some((store, 0..n)));
+    }
+    let Some(p) = Py::<MemoryView>::from_value(it, v) else { return Ok(None) };
+    let m = p.borrow(it)?;
+    if m.view.readonly || !m.view.is_c_contiguous() {
+        return Ok(None);
+    }
+    let src = m.src(it)?;
+    let Source::Store(e) = src else { return Ok(None) };
+    let len = src.with(|b| b.len()).map_err(|e| inaccessible(it, e))?;
+    m.view.check(len).map_err(|e| inaccessible(it, e))?;
+    Ok(Some((e.store().clone(), m.view.offset..m.view.offset + m.view.nbytes())))
+}
+
 pub fn is_memoryview(it: &Interp, v: &Value) -> bool {
     crate::bind::is_instance::<MemoryView>(it, v)
 }
 
-/// Whether `v` is a native object exporting a buffer (`memoryview`, `array.array`).
+/// Whether `v` is a native object exporting a buffer (`memoryview`, `array.array`, `mmap.mmap`).
 pub fn is_buffer_object(it: &Interp, v: &Value) -> bool {
-    is_memoryview(it, v) || crate::bind::is_instance::<super::arraym::array::Array>(it, v)
+    is_memoryview(it, v)
+        || crate::bind::is_instance::<super::arraym::array::Array>(it, v)
+        || crate::bind::is_instance::<super::mmapm::mmap::Mmap>(it, v)
 }
 
 /// Installs `memoryview` in `builtins`.

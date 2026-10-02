@@ -26,32 +26,24 @@ pub struct ResourceUsage {
 
 #[cfg(unix)]
 pub fn resource_usage() -> R<ResourceUsage> {
-    // SAFETY: a zeroed rusage is a valid out-parameter for getrusage.
-    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    let u = crate::rlimit::getrusage(crate::rlimit::RUSAGE_SELF)?;
+    let [maxrss, _, _, _, minflt, majflt, nswap, inblock, oublock, msgsnd, msgrcv, nsignals, nvcsw, nivcsw] = u.counters;
     // macOS reports ru_maxrss in bytes, everyone else in KiB.
-    let max_rss_kib = if cfg!(any(target_os = "macos", target_os = "ios")) {
-        u.ru_maxrss as u64 / 1024
-    } else {
-        u.ru_maxrss as u64
-    };
+    let max_rss_kib = if cfg!(any(target_os = "macos", target_os = "ios")) { maxrss as u64 / 1024 } else { maxrss as u64 };
     Ok(ResourceUsage {
-        user_us: micros(u.ru_utime),
-        system_us: micros(u.ru_stime),
+        user_us: (u.utime * 1_000_000.0).round() as u64,
+        system_us: (u.stime * 1_000_000.0).round() as u64,
         max_rss_kib,
-        minor_faults: u.ru_minflt as u64,
-        major_faults: u.ru_majflt as u64,
-        swaps: u.ru_nswap as u64,
-        block_in: u.ru_inblock as u64,
-        block_out: u.ru_oublock as u64,
-        msgs_sent: u.ru_msgsnd as u64,
-        msgs_received: u.ru_msgrcv as u64,
-        signals: u.ru_nsignals as u64,
-        voluntary_switches: u.ru_nvcsw as u64,
-        involuntary_switches: u.ru_nivcsw as u64,
+        minor_faults: minflt as u64,
+        major_faults: majflt as u64,
+        swaps: nswap as u64,
+        block_in: inblock as u64,
+        block_out: oublock as u64,
+        msgs_sent: msgsnd as u64,
+        msgs_received: msgrcv as u64,
+        signals: nsignals as u64,
+        voluntary_switches: nvcsw as u64,
+        involuntary_switches: nivcsw as u64,
     })
 }
 
