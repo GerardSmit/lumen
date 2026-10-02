@@ -1,0 +1,11 @@
+True
+0
+True
+True
+5
+True 5
+flock busy True
+ValueError unrecognized lockf argument
+ValueError
+ValueError file descriptor cannot be a negative integer (-1)
+OSError 9

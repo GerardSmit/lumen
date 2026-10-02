@@ -457,6 +457,13 @@ impl Host for PyHost {
                 // range is unaliased until the guard drops with `cx`.
                 return cx.lend(unsafe { &*store }, None, true).map(|p| unsafe { &mut *p });
             }
+            if let Some((store, range)) = crate::builtins::memview::writable_part(cx.it(), v)? {
+                let s = cx.scratch();
+                s.stores.push(store);
+                let store: *const crate::object::ByteStore = &**s.stores.last().unwrap();
+                // SAFETY: as for arrays above.
+                return cx.lend(unsafe { &*store }, Some(range), true).map(|p| unsafe { &mut *p });
+            }
         }
         Err(cx.arg_error(at, "read-write bytes-like object", v))
     }

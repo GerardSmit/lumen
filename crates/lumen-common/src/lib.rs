@@ -16,8 +16,11 @@ pub mod fastalloc;
 pub mod fasthash;
 pub mod float;
 pub mod float16;
+#[cfg(feature = "crypt")]
+pub mod crypt;
 #[cfg(feature = "hash")]
 pub mod hash;
+pub mod history;
 pub mod json;
 pub mod limits;
 pub mod local_tz;

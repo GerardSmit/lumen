@@ -17,10 +17,13 @@ compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip
 # `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) over liblzma.
 # Needs a C toolchain, so it is unavailable on wasm32; enable it next to `compress`.
 lzma = ["compress", "dep:liblzma-sys"]
+# `crypt`: MD5/SHA-crypt and bcrypt password hashes (`crypt(3)` formats), on `hash`.
+crypt = ["hash", "dep:bcrypt"]
 
 [dependencies]
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
 memchr = { version = "2", default-features = false }
+bcrypt = { version = "0.17", default-features = false, optional = true }
 digest = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }

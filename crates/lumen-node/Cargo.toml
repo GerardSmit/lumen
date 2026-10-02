@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 lumen-host = { path = "../lumen-host" }
-lumen-common = { path = "../lumen-common", features = ["hash"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "crypt"] }
 lumen-os = { path = "../lumen-os" }
 # Natives are declared with lumen-bind and exposed through lumen's JS host (`embed`).
 lumen = { path = "../lumen", features = ["embed"] }
@@ -22,7 +22,6 @@ lumen-bind = { path = "../lumen-bind" }
 # no cryptography of its own.
 scrypt = { version = "0.11", default-features = false }
 argon2 = "0.5"
-bcrypt = { version = "0.17", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 subtle = { version = "2.4", default-features = false }
 cipher = { version = "0.4", features = ["alloc", "block-padding"] }

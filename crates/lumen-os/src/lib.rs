@@ -3,17 +3,24 @@
 
 pub mod child;
 pub mod consts;
+pub mod crypt;
 pub mod errno;
+pub mod event;
 pub mod fdctl;
 pub mod fs;
 pub mod ident;
+pub mod ipc;
+pub mod mmap;
 pub mod net;
 pub mod poll;
 pub mod proc;
+pub mod rlimit;
 pub mod signal;
 pub mod spawn;
+pub mod syslog;
 pub mod sysinfo;
 pub mod time;
+pub mod tty;
 pub mod uv;
 pub mod vfs;
 

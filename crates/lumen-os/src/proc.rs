@@ -292,6 +292,93 @@ pub fn waitpid(pid: i32, options: i32) -> R<(i32, i32)> {
     }
 }
 
+/// `fork(2)`: the child's pid in the parent, 0 in the child.
+pub fn fork() -> R<i32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: the caller runs the fork hooks and keeps the child single-threaded.
+        check(unsafe { libc::fork() })
+    }
+    #[cfg(not(unix))]
+    Err(FsError("ENOSYS"))
+}
+
+/// `wait4(2)` (`pid` -1 for any child; `wait3` is the same call): `(pid, status, usage)`; `pid`
+/// is 0 when `WNOHANG` found no child. Retries on `EINTR`.
+pub fn wait4(pid: i32, options: i32) -> R<(i32, i32, crate::rlimit::Rusage)> {
+    #[cfg(unix)]
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: a zeroed rusage is a valid out-parameter; `status` is live.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::wait4(pid, &mut status, options, &mut usage) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        return Ok((r, status, crate::rlimit::rusage_of(&usage)));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, options);
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// The `siginfo_t` fields `waitid(2)` fills in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitInfo {
+    pub pid: i32,
+    pub uid: u32,
+    pub signo: i32,
+    pub status: i32,
+    pub code: i32,
+}
+
+/// `waitid(2)`; `None` when `WNOHANG` found no child. Retries on `EINTR`.
+pub fn waitid(idtype: i32, id: u32, options: i32) -> R<Option<WaitInfo>> {
+    #[cfg(unix)]
+    loop {
+        // SAFETY: a zeroed siginfo_t is a valid out-parameter for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::waitid(idtype as _, id as _, &mut info, options) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: waitid filled the union members read here.
+        let (pid, uid, status) = unsafe { (info.si_pid(), info.si_uid(), info.si_status()) };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let (pid, uid, status) = (info.si_pid, info.si_uid, info.si_status);
+        if pid == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(WaitInfo { pid, uid: uid as u32, signo: info.si_signo, status, code: info.si_code }));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (idtype, id, options);
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// The `CLD_*` codes of a `waitid` result.
+pub const CLD_CONSTANTS: [(&str, i64); 6] = [
+    ("CLD_EXITED", 1),
+    ("CLD_KILLED", 2),
+    ("CLD_DUMPED", 3),
+    ("CLD_TRAPPED", 4),
+    ("CLD_STOPPED", 5),
+    ("CLD_CONTINUED", 6),
+];
+
 /// `system(3)`: the raw wait status of `/bin/sh -c command`.
 pub fn system(command: &str) -> R<i32> {
     #[cfg(unix)]

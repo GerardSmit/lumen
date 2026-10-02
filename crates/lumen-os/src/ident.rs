@@ -19,14 +19,77 @@ fn cstr(s: &str) -> R<std::ffi::CString> {
     std::ffi::CString::new(s).map_err(|_| FsError("EINVAL"))
 }
 
-/// The uid of user `name` (`getpwnam`).
-pub fn uid_of(name: &str) -> Option<u32> {
+/// A complete password-database entry (`struct passwd`), as the Python `pwd` module reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasswdRecord {
+    pub name: String,
+    pub passwd: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub gecos: String,
+    pub dir: String,
+    pub shell: String,
+}
+
+/// A group-database entry (`struct group`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupRecord {
+    pub name: String,
+    pub passwd: String,
+    pub gid: u32,
+    pub members: Vec<String>,
+}
+
+#[cfg(unix)]
+fn c_text(p: *const libc::c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    // SAFETY: a non-null database string field is a NUL-terminated C string.
+    unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+#[cfg(unix)]
+fn passwd_record(e: &libc::passwd) -> PasswdRecord {
+    #[cfg(not(target_os = "android"))]
+    let gecos = c_text(e.pw_gecos);
+    #[cfg(target_os = "android")]
+    let gecos = String::new();
+    PasswdRecord {
+        name: c_text(e.pw_name),
+        passwd: c_text(e.pw_passwd),
+        uid: e.pw_uid as u32,
+        gid: e.pw_gid as u32,
+        gecos,
+        dir: c_text(e.pw_dir),
+        shell: c_text(e.pw_shell),
+    }
+}
+
+#[cfg(unix)]
+fn group_record(e: &libc::group) -> GroupRecord {
+    let mut members = Vec::new();
+    if !e.gr_mem.is_null() {
+        let mut p = e.gr_mem;
+        // SAFETY: gr_mem is a null-terminated array of C strings.
+        unsafe {
+            while !(*p).is_null() {
+                members.push(c_text(*p));
+                p = p.add(1);
+            }
+        }
+    }
+    GroupRecord { name: c_text(e.gr_name), passwd: c_text(e.gr_passwd), gid: e.gr_gid as u32, members }
+}
+
+/// The entry of user `name` (`getpwnam`).
+pub fn getpwnam(name: &str) -> Option<PasswdRecord> {
     #[cfg(unix)]
     {
         let name = cstr(name).ok()?;
         // SAFETY: getpwnam returns null or a pointer to static storage valid until the next call.
         let entry = unsafe { libc::getpwnam(name.as_ptr()) };
-        (!entry.is_null()).then(|| unsafe { (*entry).pw_uid } as u32)
+        (!entry.is_null()).then(|| passwd_record(unsafe { &*entry }))
     }
     #[cfg(not(unix))]
     {
@@ -35,20 +98,106 @@ pub fn uid_of(name: &str) -> Option<u32> {
     }
 }
 
-/// The gid of group `name` (`getgrnam`).
-pub fn gid_of(name: &str) -> Option<u32> {
+/// The entry of user `uid` (`getpwuid`).
+pub fn getpwuid(uid: u32) -> Option<PasswdRecord> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getpwuid returns null or a pointer to static storage valid until the next call.
+        let entry = unsafe { libc::getpwuid(uid as libc::uid_t) };
+        (!entry.is_null()).then(|| passwd_record(unsafe { &*entry }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        None
+    }
+}
+
+/// Every entry of the password database (`getpwent` until the end).
+pub fn getpwall() -> Vec<PasswdRecord> {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        let mut out = Vec::new();
+        // SAFETY: the iteration functions return static storage valid until the next call.
+        unsafe {
+            libc::setpwent();
+            loop {
+                let entry = libc::getpwent();
+                if entry.is_null() {
+                    break;
+                }
+                out.push(passwd_record(&*entry));
+            }
+            libc::endpwent();
+        }
+        out
+    }
+    #[cfg(not(all(unix, not(target_os = "android"))))]
+    Vec::new()
+}
+
+/// The entry of group `name` (`getgrnam`).
+pub fn getgrnam(name: &str) -> Option<GroupRecord> {
     #[cfg(unix)]
     {
         let name = cstr(name).ok()?;
         // SAFETY: getgrnam returns null or a pointer to static storage valid until the next call.
         let entry = unsafe { libc::getgrnam(name.as_ptr()) };
-        (!entry.is_null()).then(|| unsafe { (*entry).gr_gid } as u32)
+        (!entry.is_null()).then(|| group_record(unsafe { &*entry }))
     }
     #[cfg(not(unix))]
     {
         let _ = name;
         None
     }
+}
+
+/// The entry of group `gid` (`getgrgid`).
+pub fn getgrgid(gid: u32) -> Option<GroupRecord> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getgrgid returns null or a pointer to static storage valid until the next call.
+        let entry = unsafe { libc::getgrgid(gid as libc::gid_t) };
+        (!entry.is_null()).then(|| group_record(unsafe { &*entry }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = gid;
+        None
+    }
+}
+
+/// Every entry of the group database.
+pub fn getgrall() -> Vec<GroupRecord> {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        let mut out = Vec::new();
+        // SAFETY: the iteration functions return static storage valid until the next call.
+        unsafe {
+            libc::setgrent();
+            loop {
+                let entry = libc::getgrent();
+                if entry.is_null() {
+                    break;
+                }
+                out.push(group_record(&*entry));
+            }
+            libc::endgrent();
+        }
+        out
+    }
+    #[cfg(not(all(unix, not(target_os = "android"))))]
+    Vec::new()
+}
+
+/// The uid of user `name` (`getpwnam`).
+pub fn uid_of(name: &str) -> Option<u32> {
+    getpwnam(name).map(|e| e.uid)
+}
+
+/// The gid of group `name` (`getgrnam`).
+pub fn gid_of(name: &str) -> Option<u32> {
+    getgrnam(name).map(|e| e.gid)
 }
 
 /// A password-database entry. Without one (or off Unix) the ids are still set (-1 off Unix) and
@@ -63,34 +212,8 @@ pub struct PasswdEntry {
 
 /// The password-database entry of `uid` (`getpwuid`), `None` without one.
 pub fn passwd(uid: u32) -> Option<PasswdEntry> {
-    #[cfg(unix)]
-    {
-        use std::ffi::CStr;
-        let text = |p: *const libc::c_char| {
-            // SAFETY: a non-null passwd string field is a NUL-terminated C string.
-            (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-        };
-        // SAFETY: getpwuid returns null or a pointer to static storage valid until the next call.
-        unsafe {
-            let entry = libc::getpwuid(uid as libc::uid_t);
-            if entry.is_null() {
-                return None;
-            }
-            let e = &*entry;
-            Some(PasswdEntry {
-                uid: e.pw_uid as i64,
-                gid: e.pw_gid as i64,
-                name: text(e.pw_name),
-                dir: text(e.pw_dir),
-                shell: text(e.pw_shell),
-            })
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = uid;
-        None
-    }
+    let e = getpwuid(uid)?;
+    Some(PasswdEntry { uid: e.uid as i64, gid: e.gid as i64, name: Some(e.name), dir: Some(e.dir), shell: Some(e.shell) })
 }
 
 /// The entry of the real user id, keeping the real uid and gid when the database has none.
