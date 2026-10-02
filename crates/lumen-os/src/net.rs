@@ -548,10 +548,15 @@ mod imp {
         Ok(if e == libc::EISCONN { 0 } else { e })
     }
 
+    // `NAME = value` covers constants the libc crate leaves out on some platforms.
     macro_rules! const_table {
-        ($($(#[$m:meta])* $name:ident),* $(,)?) => {
-            &[$($(#[$m])* (stringify!($name), libc::$name as i64),)*]
+        ($($(#[$m:meta])* $name:ident $(= $value:expr)?),* $(,)?) => {
+            &[$($(#[$m])* (stringify!($name), const_value!($name $(, $value)?)),)*]
         };
+    }
+    macro_rules! const_value {
+        ($name:ident) => { libc::$name as i64 };
+        ($name:ident, $value:expr) => { $value as i64 };
     }
 
     /// The socket constants of this platform by C name.
@@ -604,9 +609,14 @@ mod imp {
             #[cfg(any(target_os = "linux", target_os = "android"))] IP_BIND_ADDRESS_NO_PORT,
             #[cfg(any(target_os = "linux", target_os = "android"))] IP_DEFAULT_MULTICAST_TTL,
             #[cfg(any(target_os = "linux", target_os = "android"))] IP_DEFAULT_MULTICAST_LOOP,
-            #[cfg(any(target_os = "linux", target_os = "android"))] IP_MAX_MEMBERSHIPS,
+            #[cfg(any(target_os = "linux", target_os = "android"))] IP_MAX_MEMBERSHIPS = 20,
             #[cfg(target_vendor = "apple")] IP_RECVDSTADDR,
-            IPV6_V6ONLY, IPV6_JOIN_GROUP, IPV6_LEAVE_GROUP, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF,
+            IPV6_V6ONLY,
+            #[cfg(target_vendor = "apple")] IPV6_JOIN_GROUP,
+            #[cfg(target_vendor = "apple")] IPV6_LEAVE_GROUP,
+            #[cfg(any(target_os = "linux", target_os = "android"))] IPV6_JOIN_GROUP = libc::IPV6_ADD_MEMBERSHIP,
+            #[cfg(any(target_os = "linux", target_os = "android"))] IPV6_LEAVE_GROUP = libc::IPV6_DROP_MEMBERSHIP,
+            IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF,
             IPV6_MULTICAST_LOOP, IPV6_UNICAST_HOPS, IPV6_CHECKSUM, IPV6_RECVTCLASS, IPV6_TCLASS,
             IPV6_RECVPKTINFO, IPV6_PKTINFO, IPV6_HOPLIMIT, IPV6_RECVHOPLIMIT, IPV6_DONTFRAG,
             TCP_NODELAY, TCP_MAXSEG, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_FASTOPEN,
@@ -626,11 +636,13 @@ mod imp {
             #[cfg(target_vendor = "apple")] AI_DEFAULT,
             #[cfg(target_vendor = "apple")] AI_MASK,
             #[cfg(target_vendor = "apple")] AI_V4MAPPED_CFG,
-            NI_NUMERICHOST, NI_NUMERICSERV, NI_NOFQDN, NI_NAMEREQD, NI_DGRAM, NI_MAXHOST, NI_MAXSERV,
+            NI_NUMERICHOST, NI_NUMERICSERV, NI_NOFQDN, NI_NAMEREQD, NI_DGRAM, NI_MAXHOST,
+            #[cfg(target_vendor = "apple")] NI_MAXSERV,
+            #[cfg(any(target_os = "linux", target_os = "android"))] NI_MAXSERV = 32,
             EAI_AGAIN, EAI_BADFLAGS, EAI_FAIL, EAI_FAMILY, EAI_MEMORY, EAI_NONAME, EAI_SERVICE,
             EAI_SOCKTYPE, EAI_SYSTEM, EAI_OVERFLOW,
             #[cfg(any(target_os = "linux", target_os = "android"))] EAI_NODATA,
-            #[cfg(any(target_os = "linux", target_os = "android"))] EAI_ADDRFAMILY,
+            #[cfg(any(target_os = "linux", target_os = "android"))] EAI_ADDRFAMILY = -9,
             #[cfg(target_vendor = "apple")] EAI_NODATA,
             #[cfg(target_vendor = "apple")] LOCAL_PEERCRED,
         )

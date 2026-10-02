@@ -868,6 +868,7 @@ dependencies = [
 name = "lumen-host"
 version = "0.1.3"
 dependencies = [
+ "getrandom 0.2.17",
  "js-sys",
  "lumen",
  "lumen-bind",
