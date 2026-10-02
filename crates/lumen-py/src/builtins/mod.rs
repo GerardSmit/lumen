@@ -17,6 +17,7 @@ pub mod excm;
 pub mod format;
 pub mod funcs;
 pub mod iom;
+pub mod astconv;
 pub mod binasciim;
 pub mod unicodedatam;
 pub mod genm;

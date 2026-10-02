@@ -372,6 +372,17 @@ fn f_lasti(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::Int(2 * lasti as i64))
 }
 
+/// `frame.clear()`: an executing frame refuses; a finished one keeps no locals here to drop.
+fn f_clear(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let live = frame_data(it, &a[0], |d| d.depth.map(|x| (x, d.code.clone())))?;
+    if let Some((depth, code)) = live {
+        if it.frames.get(depth).is_some_and(|f| Rc::ptr_eq(&f.code, &code)) {
+            return Err(it.new_exc_str("RuntimeError", "cannot clear an executing frame"));
+        }
+    }
+    Ok(Value::None)
+}
+
 fn f_none(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::None)
 }
@@ -480,6 +491,7 @@ pub fn init_frame_type(it: &mut Interp) {
     it.reg_prop(&ty, "f_locals", f_locals);
     it.reg_prop(&ty, "f_trace", f_none);
     it.reg(&ty, "__repr__", f_repr);
+    it.reg(&ty, "clear", f_clear);
     if let Kind::Type(td) = &ty.kind {
         td.flags.set(td.flags.get() | TF_DISPATCH);
     }

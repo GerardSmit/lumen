@@ -707,8 +707,16 @@ fn dd_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let ty = it.type_of(&a[0]);
     let name = it.type_name(&ty);
     let f = factory_of(it, &a[0]);
-    let fr = if f.is_none() { "None".to_string() } else { it.repr_of(&f)? };
     let d = it.native_repr(&a[0])?;
+    let fr = match &a[0] {
+        _ if f.is_none() => "None".to_string(),
+        Value::Obj(o) if it.repr_enter(o) => "...".to_string(),
+        _ => {
+            let r = it.repr_of(&f);
+            it.repr_leave();
+            r?
+        }
+    };
     Ok(Value::string(format!("{}({}, {})", name, fr, d)))
 }
 

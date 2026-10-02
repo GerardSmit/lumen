@@ -427,6 +427,14 @@ impl Value {
         }
     }
 
+    /// The text of an exact `str` (not a subclass instance, whose `__str__` may differ).
+    pub fn as_exact_str(&self) -> Option<&str> {
+        match self {
+            Value::Obj(o) if o.cls.is_none() => self.as_str(),
+            _ => None,
+        }
+    }
+
     pub fn as_pystr(&self) -> Option<&PyStr> {
         match self {
             Value::Obj(o) => match &o.kind {

@@ -893,7 +893,10 @@ fn translate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn str_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__str__", a, 1, 1)?;
-    it.str_value(&a[0])
+    match &a[0] {
+        Value::Obj(o) if matches!(o.kind, Kind::Str(_)) && o.cls.is_some() => Ok(Value::str(a[0].as_str().unwrap_or(""))),
+        v => it.str_value(v),
+    }
 }
 
 fn str_getnewargs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {

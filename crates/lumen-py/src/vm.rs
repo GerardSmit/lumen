@@ -338,7 +338,7 @@ impl Interp {
     }
 
     pub fn push_frame(&mut self, frame: Frame) -> R<()> {
-        if self.frames.len() >= self.recursion_limit {
+        if self.frames.len() >= self.recursion_limit || lumen_common::stack::exhausted() {
             return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"));
         }
         self.poll()?;

@@ -203,8 +203,10 @@ pub fn hash_float(v: f64) -> i64 {
     }
 }
 
+/// The inverse of `a` modulo |m|, in [0, |m|).
 fn mod_inverse(a: &BigInt, m: &BigInt) -> Option<BigInt> {
     let one = BigInt::from_i64(1);
+    let m = &m.abs();
     let (mut old_r, mut r) = (a.floor_mod(m), m.clone());
     let (mut old_s, mut s) = (one.clone(), BigInt::zero());
     while !r.is_zero() {

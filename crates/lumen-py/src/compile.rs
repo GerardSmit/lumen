@@ -134,7 +134,7 @@ fn with_label(op: Op, t: u32) -> Op {
     }
 }
 
-fn const_value(c: &Constant) -> Value {
+pub(crate) fn const_value(c: &Constant) -> Value {
     match c {
         Constant::None => Value::None,
         Constant::True => Value::Bool(true),

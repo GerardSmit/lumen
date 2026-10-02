@@ -58,7 +58,7 @@ fn print(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             if i > 0 {
                 out.push_str(&sep);
             }
-            match v.as_str() {
+            match v.as_exact_str() {
                 Some(s) => out.push_str(s),
                 None => out.push_str(&it.str_of(v)?),
             }
@@ -70,7 +70,7 @@ fn print(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             if i > 0 {
                 it.write_to(&file, &sep)?;
             }
-            match v.as_str() {
+            match v.as_exact_str() {
                 Some(s) => it.write_to(&file, s)?,
                 None => {
                     let s = it.str_of(v)?;
@@ -857,11 +857,36 @@ fn fs_filename(it: &mut Interp, v: &Value) -> R<String> {
     }
 }
 
+const PY_CF_ONLY_AST: i64 = 0x400;
+
 fn compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("compile", a, kw, &["source", "filename", "mode", "flags", "dont_inherit", "optimize"], 3)?;
-    let source = b[0].clone().unwrap_or(Value::None);
+    let b = it.bind_args("compile", a, kw, &["source", "filename", "mode", "flags", "dont_inherit", "optimize", "_feature_version"], 3)?;
+    let mut source = b[0].clone().unwrap_or(Value::None);
     let filename = fs_filename(it, &b[1].clone().unwrap_or(Value::None))?;
     let mode = it.str_arg(&b[2].clone().unwrap_or(Value::None), "compile() arg 3")?;
+    let flags = match &b[3] {
+        Some(v) => it.index_of(v)?,
+        None => 0,
+    };
+    let ast_mode = match mode.as_str() {
+        "exec" => super::astconv::Mode::Exec,
+        "eval" => super::astconv::Mode::Eval,
+        "single" => super::astconv::Mode::Single,
+        "func_type" if flags & PY_CF_ONLY_AST != 0 => {
+            return Err(it.value_error("compile() mode 'func_type' is not supported"));
+        }
+        "func_type" => return Err(it.value_error("compile() mode 'func_type' requires flag PyCF_ONLY_AST")),
+        _ => return Err(it.value_error("compile() mode must be 'exec', 'eval' or 'single'")),
+    };
+    if crate::bind::is_instance::<super::astm::_ast::AST>(it, &source) {
+        if flags & PY_CF_ONLY_AST != 0 {
+            return Ok(source);
+        }
+        // Compiling a tree goes through its source text: positions follow the unparsed text.
+        let ast = Value::Obj(it.import_module("ast")?);
+        let unparse = it.get_attr_str(&ast, "unparse")?;
+        source = it.call(&unparse, vec![source], Vec::new())?;
+    }
     let src = match &source {
         Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => o.as_str_kind().unwrap_or("").to_string(),
         _ => match crate::builtins::memview::contiguous_bytes(it, &source)? {
@@ -875,6 +900,18 @@ fn compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             crate::vm::dict_set_str(d, "lineno", Value::None);
         }
         return Err(e);
+    }
+    if flags & PY_CF_ONLY_AST != 0 {
+        let text = if ast_mode == super::astconv::Mode::Eval { src.trim_start_matches([' ', '\t']) } else { &src };
+        let parsed = crate::limits::with_literal_digit_limit(it.int_max_str_digits, || crate::parser::parse(text, &filename));
+        let module = match parsed {
+            Ok(m) => m,
+            Err(e) => return Err(it.syntax_error(&e.msg, &filename, e.line, Some(e.col), text)),
+        };
+        if ast_mode == super::astconv::Mode::Eval && !matches!(module.body.as_slice(), [s] if matches!(s.kind, StmtKind::Expr(_))) {
+            return Err(it.syntax_error("invalid syntax", &filename, 1, None, text));
+        }
+        return super::astconv::module_to_py(it, &module, ast_mode);
     }
     let code = match mode.as_str() {
         "eval" => it.compile_eval_str(&src, &filename)?,

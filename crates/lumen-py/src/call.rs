@@ -34,6 +34,9 @@ impl Interp {
                 return Err(self.new_exc_str("TypeError", &format!("'{}' object is not callable", t)));
             }
         };
+        if lumen_common::stack::exhausted() {
+            return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"));
+        }
         match &o.kind {
             Kind::Function(_) => {
                 let frame = self.bind_frame(o, args, kw)?;
