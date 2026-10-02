@@ -323,5 +323,6 @@ pub mod readline {
         dict_set_str(&d, "_READLINE_VERSION", Value::Int(0x0802));
         dict_set_str(&d, "_READLINE_RUNTIME_VERSION", Value::Int(0x0802));
         dict_set_str(&d, "_READLINE_LIBRARY_VERSION", Value::str("8.2"));
+        dict_set_str(&d, "backend", Value::str("readline"));
     }
 }
