@@ -369,24 +369,6 @@ impl fmt::Display for FsError {
 
 impl std::error::Error for FsError {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_both_ways() {
-        let e = io::Error::from_raw_os_error(errno_of_code("ENOENT").unwrap());
-        assert_eq!(uv_code(&e), "ENOENT");
-        assert_eq!(FsError::from(e).errno(), errno_of_code("ENOENT").unwrap());
-        assert_eq!(code_of_errno(errno_of_code("EEXIST").unwrap()), Some("EEXIST"));
-        assert_eq!(message("ENOTDIR"), "Not a directory");
-        assert_eq!(errno_of_code("EOF"), None);
-        let kind_only = io::Error::from(io::ErrorKind::PermissionDenied);
-        assert_eq!(uv_code(&kind_only), "EACCES");
-        assert_eq!(errno(&kind_only), errno_of_code("EACCES").unwrap());
-    }
-}
-
 /// The calling thread's `errno` cell (for code that must save, clear or set it directly, such as
 /// a signal handler or a forked child).
 #[cfg(unix)]
@@ -403,5 +385,23 @@ pub fn errno_location() -> *mut libc::c_int {
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "android")))]
     unsafe {
         libc::__errno_location()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_both_ways() {
+        let e = io::Error::from_raw_os_error(errno_of_code("ENOENT").unwrap());
+        assert_eq!(uv_code(&e), "ENOENT");
+        assert_eq!(FsError::from(e).errno(), errno_of_code("ENOENT").unwrap());
+        assert_eq!(code_of_errno(errno_of_code("EEXIST").unwrap()), Some("EEXIST"));
+        assert_eq!(message("ENOTDIR"), "Not a directory");
+        assert_eq!(errno_of_code("EOF"), None);
+        let kind_only = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(uv_code(&kind_only), "EACCES");
+        assert_eq!(errno(&kind_only), errno_of_code("EACCES").unwrap());
     }
 }

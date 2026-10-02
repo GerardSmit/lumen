@@ -119,7 +119,10 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
         Err(e) => return failure(name, Status::Crash(format!("cannot create log: {e}")), started),
     };
     let lib = fs::canonicalize(o.root.join("Lib")).unwrap_or_else(|_| o.root.join("Lib"));
-    let spawned = Command::new(&o.bin)
+    let mut cmd = Command::new(&o.bin);
+    // Tests that spawn children (signal, subprocess, multiprocessing) can leave them running;
+    // the whole group is killed when the file finishes or times out.
+    let spawned = lumen_os::child::new_group(&mut cmd)
         .args(["-m", "unittest", "-v"])
         .arg(format!("test.{name}"))
         .current_dir(&test_dir)
@@ -133,7 +136,7 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
         Ok(c) => c,
         Err(e) => return failure(name, Status::Crash(format!("cannot spawn {}: {e}", o.bin.display())), started),
     };
-    let exit = match lumen_os::child::wait_timeout(&mut child, o.timeout, Duration::from_millis(10)) {
+    let exit = match lumen_os::child::wait_timeout_group(&mut child, o.timeout, Duration::from_millis(10)) {
         Ok(Some(status)) => Some(status),
         Ok(None) => return failure(name, Status::Timeout, started),
         Err(_) => None,
