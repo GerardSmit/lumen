@@ -18,6 +18,7 @@ pub mod format;
 pub mod funcs;
 pub mod iom;
 pub mod binasciim;
+pub mod unicodedatam;
 pub mod genm;
 pub mod zlibm;
 pub mod hashlibm;

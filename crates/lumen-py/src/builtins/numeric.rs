@@ -619,6 +619,20 @@ fn float_fromhex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     }
 }
 
+/// `float.__getformat__(typestr)`: the storage format of C doubles and floats.
+fn float_getformat(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__getformat__", a, 2, 2)?;
+    let Some(t) = a[1].as_str() else {
+        let n = it.type_name_of(&a[1]);
+        return Err(it.type_error(&format!("float.__getformat__() argument must be str, not {n}")));
+    };
+    if t != "double" && t != "float" {
+        return Err(it.value_error("__getformat__() argument 1 must be 'double' or 'float'"));
+    }
+    let order = if cfg!(target_endian = "little") { "little" } else { "big" };
+    Ok(Value::string(format!("IEEE, {order}-endian")))
+}
+
 fn complex_conjugate(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     match &a[0] {
         Value::Obj(o) => match &o.kind {
@@ -806,6 +820,7 @@ pub fn init(it: &mut Interp) {
     it.reg(&float, "as_integer_ratio", float_as_ratio);
     it.reg(&float, "hex", float_hex);
     it.reg_class(&float, "fromhex", float_fromhex);
+    it.reg_class(&float, "__getformat__", float_getformat);
     it.reg(&float, "conjugate", int_conjugate);
     it.reg(&float, "__trunc__", float_trunc);
     it.reg(&float, "__int__", float_trunc);

@@ -31,6 +31,9 @@ pub mod tz;
 #[rustfmt::skip]
 pub mod tzdata;
 pub mod tzrules;
+pub mod ucd;
+#[rustfmt::skip]
+pub mod unicode_db;
 pub mod unicode_norm;
 pub mod unicode_norm_impl;
 pub mod unicode_props;

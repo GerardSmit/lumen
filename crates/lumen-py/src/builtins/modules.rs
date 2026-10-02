@@ -51,6 +51,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("select", bound::<super::selectm::select::Module>),
     ("sys", |it| it.sys_module.clone()),
     ("time", bound::<super::timem::time::Module>),
+    ("unicodedata", bound::<super::unicodedatam::unicodedata::Module>),
     ("zlib", bound::<super::zlibm::zlib::Module>),
 ];
 
