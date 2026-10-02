@@ -24,7 +24,6 @@ mod report;
 
 use frontmatter::{Frontmatter, Phase};
 use lumen::{Completion, Engine};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -68,39 +67,8 @@ const MEM_CAP: usize = 2560 * 1024 * 1024;
 /// process, no test blamed. Tests leak by design between recycles; this bounds the accumulation.
 const MEM_SOFT_CAP: usize = 256 * 1024 * 1024;
 
-static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
-
-struct CapAlloc;
-
-// SAFETY: delegates to `System`; the byte counter never affects layout or pointer validity.
-unsafe impl GlobalAlloc for CapAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size() > MEM_CAP {
-            HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
-            return std::ptr::null_mut();
-        }
-        System.alloc(layout)
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
-        System.dealloc(ptr, layout)
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if new_size > layout.size() {
-            let grow = new_size - layout.size();
-            if HEAP_USED.fetch_add(grow, Ordering::Relaxed) + grow > MEM_CAP {
-                HEAP_USED.fetch_sub(grow, Ordering::Relaxed);
-                return std::ptr::null_mut();
-            }
-        } else {
-            HEAP_USED.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-        }
-        System.realloc(ptr, layout, new_size)
-    }
-}
-
 #[global_allocator]
-static ALLOC: CapAlloc = CapAlloc;
+static ALLOC: lumen_common::limits::CappedAlloc = lumen_common::limits::CappedAlloc::new(MEM_CAP);
 
 /// Per-worker address-space ceiling (passed to `ulimit -v`, in KiB) so a runaway allocation makes
 /// `malloc` fail (the worker aborts and is recorded as a crash) instead of eating all RAM. Enforced
@@ -403,25 +371,21 @@ fn worker_loop(
                 // loop) test, which makes no progress for the whole window, is killed.
                 let mut deadline = Instant::now() + chunk_timeout();
                 let mut last_len = 0u64;
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(st)) => break Ok(st),
-                        Ok(None) => {
-                            let len = std::fs::metadata(&out_file).map(|m| m.len()).unwrap_or(0);
-                            if len > last_len {
-                                last_len = len;
-                                deadline = Instant::now() + chunk_timeout();
-                            }
-                            if Instant::now() >= deadline {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                timed_out = true;
-                                break Err(std::io::Error::other("timed out"));
-                            }
-                            std::thread::sleep(Duration::from_millis(20));
-                        }
-                        Err(e) => break Err(e),
+                let waited = lumen_os::child::wait_or_kill(&mut child, Duration::from_millis(20), || {
+                    let len = std::fs::metadata(&out_file).map(|m| m.len()).unwrap_or(0);
+                    if len > last_len {
+                        last_len = len;
+                        deadline = Instant::now() + chunk_timeout();
                     }
+                    Instant::now() >= deadline
+                });
+                match waited {
+                    Ok(Some(st)) => Ok(st),
+                    Ok(None) => {
+                        timed_out = true;
+                        Err(std::io::Error::other("timed out"))
+                    }
+                    Err(e) => Err(e),
                 }
             }
             Err(e) => Err(e),
@@ -541,7 +505,7 @@ fn run_worker_inner(argv: &[String]) {
         let _ = out.flush();
         // Retire while still healthy once leaked heap accumulates — the parent respawns a fresh
         // process for the rest of the chunk (this result is already on disk, so progress is made).
-        if HEAP_USED.load(Ordering::Relaxed) > MEM_SOFT_CAP {
+        if ALLOC.live() > MEM_SOFT_CAP {
             std::process::exit(0);
         }
     }

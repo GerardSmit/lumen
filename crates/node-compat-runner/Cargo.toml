@@ -8,8 +8,11 @@ publish = false
 
 # Runs Node.js's own test suite (test/parallel, test/sequential from nodejs/node) against the
 # `lumen-cli` runtime, the way Deno's tests/node_compat does. Each test file is a standalone
-# script that passes by exiting 0. Std-only: it drives the runtime binary as child processes and
-# does not link it.
+# script that passes by exiting 0. It drives the runtime binary as child processes and does not
+# link it; process waiting and signalling come from lumen-os.
+
+[dependencies]
+lumen-os = { path = "../lumen-os" }
 
 [[bin]]
 name = "node-compat-runner"

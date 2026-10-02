@@ -433,51 +433,12 @@ fn data_url_module(specifier: &str) -> Option<String> {
         return None;
     }
     let base64 = parts.any(|p| p.trim().eq_ignore_ascii_case("base64"));
-    let bytes = if base64 { decode_base64(body)? } else { percent_decode(body) };
+    let bytes = if base64 {
+        lumen_common::codec::base64_decode_forgiving(body.as_bytes())?
+    } else {
+        lumen_common::codec::percent_decode(body.as_bytes())
+    };
     String::from_utf8(bytes).ok()
-}
-
-fn percent_decode(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = |c: u8| (c as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
-fn decode_base64(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' | b' ' | b'\n' | b'\r' | b'\t' => continue,
-            _ => return None,
-        } as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
 }
 
 /// Reduce a `file://` URL to a filesystem path: `file:///C:/x` -> `C:/x` on Windows (the drive
@@ -503,21 +464,7 @@ fn strip_file_scheme(s: &str) -> std::borrow::Cow<'_, str> {
     if !rest.contains('%') {
         return std::borrow::Cow::Owned(rest.to_string());
     }
-    let mut out = Vec::with_capacity(rest.len());
-    let b = rest.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = |c: u8| (c as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
+    let out = lumen_common::codec::percent_decode(rest.as_bytes());
     std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 

@@ -133,17 +133,10 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
         Ok(c) => c,
         Err(e) => return failure(name, Status::Crash(format!("cannot spawn {}: {e}", o.bin.display())), started),
     };
-    let exit = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() > o.timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return failure(name, Status::Timeout, started);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => break None,
-        }
+    let exit = match lumen_os::child::wait_timeout(&mut child, o.timeout, Duration::from_millis(10)) {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => return failure(name, Status::Timeout, started),
+        Err(_) => None,
     };
     let bytes = fs::read(&log_path).unwrap_or_default();
     let output = String::from_utf8_lossy(&bytes).into_owned();

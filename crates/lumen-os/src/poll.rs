@@ -43,7 +43,7 @@ mod imp {
             ("POLLWRNORM", libc::POLLWRNORM as i32),
             ("POLLWRBAND", libc::POLLWRBAND as i32),
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            ("POLLMSG", libc::POLLMSG as i32),
+            ("POLLMSG", 0x400),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             ("POLLRDHUP", libc::POLLRDHUP as i32),
             ("PIPE_BUF", libc::PIPE_BUF as i32),

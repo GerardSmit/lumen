@@ -16,7 +16,7 @@ for f in (math.cos, math.sin, math.tan):
     t(f, -inf)
 t(math.atanh, 1.0)
 t(math.atanh, -1.0)
-t(math.atanh, 0.5)
+t(math.atanh, -0.0)
 t(math.acosh, 0.5)
 t(math.asinh, -0.0)
 t(math.lgamma, 0.0)

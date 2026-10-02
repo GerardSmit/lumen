@@ -136,7 +136,7 @@ pub fn current_user() -> PasswdEntry {
 
 /// The 1, 5 and 15 minute load averages (zeros where the OS has none).
 pub fn loadavg() -> [f64; 3] {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         let mut out = [0f64; 3];
         // SAFETY: `out` has room for the three samples requested.
@@ -198,7 +198,7 @@ pub fn free_memory() -> f64 {
 }
 
 #[cfg(target_os = "macos")]
-fn sysctl<T: Default>(name: &str) -> Option<T> {
+pub(crate) fn sysctl<T: Default>(name: &str) -> Option<T> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut value = T::default();
     let mut len = std::mem::size_of::<T>();
@@ -207,6 +207,16 @@ fn sysctl<T: Default>(name: &str) -> Option<T> {
         libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
     };
     (rc == 0).then_some(value)
+}
+
+/// A `sysctlbyname` value of up to `buf.len()` bytes; the length written.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_bytes(name: &str, buf: &mut [u8]) -> Option<usize> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut len = buf.len();
+    // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
+    let rc = unsafe { libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    (rc == 0).then_some(len)
 }
 
 pub fn cpu_count() -> usize {
@@ -231,22 +241,43 @@ pub fn terminal_size(fd: i32) -> R<(u32, u32)> {
     }
 }
 
-/// Fills `buf` from the operating system's entropy source.
+/// Fills `buf` from the operating system's CSPRNG: `/dev/urandom` on Unix (opened once),
+/// `ProcessPrng` on Windows (what std itself uses), `crypto.getRandomValues` on wasm32.
 pub fn entropy(buf: &mut [u8]) -> R<()> {
     #[cfg(unix)]
     {
         use std::io::Read;
-        std::fs::File::open("/dev/urandom")?.read_exact(buf)?;
+        static URANDOM: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+        let file = match URANDOM.get() {
+            Some(file) => file,
+            None => {
+                let opened = std::fs::File::open("/dev/urandom")?;
+                URANDOM.get_or_init(|| opened)
+            }
+        };
+        (&*file).read_exact(buf)?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        use std::hash::{BuildHasher, Hasher};
-        for chunk in buf.chunks_mut(8) {
-            let h = std::collections::hash_map::RandomState::new().build_hasher();
-            chunk.copy_from_slice(&h.finish().to_le_bytes()[..chunk.len()]);
+        #[link(name = "bcryptprimitives", kind = "raw-dylib")]
+        extern "system" {
+            fn ProcessPrng(data: *mut u8, len: usize) -> i32;
+        }
+        // SAFETY: `buf` is a live, writable slice of `len` bytes. Documented to always succeed.
+        if unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) } == 0 {
+            return Err(FsError("EIO"));
         }
         Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        getrandom::getrandom(buf).map_err(|_| FsError("EIO"))
+    }
+    #[cfg(not(any(unix, windows, target_arch = "wasm32")))]
+    {
+        let _ = buf;
+        Err(FsError("ENOSYS"))
     }
 }
 

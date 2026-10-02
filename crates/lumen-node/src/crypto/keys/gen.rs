@@ -102,7 +102,7 @@ pub fn okp(kind: &str) -> KResult<AsymKey> {
         _ => return Err(SendError::new("Error", "Unsupported key type")),
     };
     let mut private = vec![0u8; len];
-    getrandom::getrandom(&mut private).map_err(|e| SendError::new("Error", e.to_string()))?;
+    lumen_os::proc::entropy(&mut private).map_err(|e| SendError::new("Error", e.to_string()))?;
     let public = okp_public(kind, &private)?;
     Ok(ctor(OkpKey { public, private: Some(private) }))
 }

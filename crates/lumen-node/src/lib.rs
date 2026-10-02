@@ -55,6 +55,7 @@ mod fsb;
 #[path = "fsb_vfs.rs"]
 mod fsb;
 mod native;
+mod oscon;
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
 mod password;
@@ -89,7 +90,7 @@ pub fn extension() -> Extension {
     let dev_glue = glue_dev::source();
     Extension {
         name: "node",
-        modules: &[],
+        modules: &[lumen_host::namespace::<oscon::Module>],
         globals: &[],
         namespaces: &[
             (
@@ -198,6 +199,8 @@ pub fn extension() -> Extension {
                     "murmur32v2" (2) => bunhash::op_murmur32v2,
                     "murmur64v2" (2) => bunhash::op_murmur64v2,
                     "rapidhash" (2) => bunhash::op_rapidhash,
+                    "crc32" (1) => bunhash::op_crc32,
+                    "adler32" (1) => bunhash::op_adler32,
                 ],
             ),
             ("__child", child::CHILD_OPS),
@@ -656,16 +659,9 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         .filter(|home| !home.is_empty())
         .or_else(|| lumen_os::proc::current_user().dir)
         .unwrap_or_default();
-    #[cfg(target_arch = "wasm32")]
-    let (tmpdir, cpus) = ("/tmp".to_string(), 1usize);
-    #[cfg(not(target_arch = "wasm32"))]
-    let (tmpdir, cpus) = (
-        std::env::temp_dir().to_string_lossy().into_owned(),
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    );
-    let (release, version) = os_release_version();
+    let tmpdir = lumen_os::sysinfo::tmpdir();
+    let cpus = lumen_os::proc::cpu_count();
+    let [_, _, release, version, _] = lumen_os::proc::uname().unwrap_or_default();
 
     let obj = Value::Obj(ctx.new_object());
     for (k, v) in [
@@ -689,129 +685,11 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         let _ = ctx.set_member(&obj, k, Value::from_string(v));
     }
     let _ = ctx.set_member(&obj, "cpus", Value::Num(cpus as f64));
-    let (cpu_model, cpu_speed_mhz, total_mem) = cpu_and_memory_facts();
+    let (cpu_model, cpu_speed_mhz, total_mem) = lumen_os::sysinfo::cpu_and_memory();
     let _ = ctx.set_member(&obj, "cpuModel", Value::from_string(cpu_model));
     let _ = ctx.set_member(&obj, "cpuSpeed", Value::Num(cpu_speed_mhz as f64));
     let _ = ctx.set_member(&obj, "totalmem", Value::Num(total_mem as f64));
     Ok(obj)
-}
-
-/// `(cpu model, cpu speed in MHz, total memory in bytes)` for `os.cpus()` / `os.totalmem()`.
-/// Playwright reads the model to tell Apple silicon from Intel when it picks a browser build.
-#[cfg(target_os = "macos")]
-fn cpu_and_memory_facts() -> (String, u64, u64) {
-    extern "C" {
-        fn sysctlbyname(
-            name: *const std::os::raw::c_char,
-            oldp: *mut std::os::raw::c_void,
-            oldlenp: *mut usize,
-            newp: *mut std::os::raw::c_void,
-            newlen: usize,
-        ) -> std::os::raw::c_int;
-    }
-    fn read(name: &str, buf: &mut [u8]) -> Option<usize> {
-        let cname = std::ffi::CString::new(name).ok()?;
-        let mut len = buf.len();
-        // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
-        let rc = unsafe {
-            sysctlbyname(
-                cname.as_ptr(),
-                buf.as_mut_ptr().cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (rc == 0).then_some(len)
-    }
-    let mut model = [0u8; 256];
-    let model = read("machdep.cpu.brand_string", &mut model)
-        .map(|n| String::from_utf8_lossy(&model[..n]).trim_end_matches('\0').to_string())
-        .unwrap_or_default();
-    let mut u64_buf = [0u8; 8];
-    let hz = read("hw.cpufrequency", &mut u64_buf)
-        .filter(|&n| n == 8)
-        .map(|_| u64::from_ne_bytes(u64_buf))
-        .unwrap_or(0);
-    let memsize = read("hw.memsize", &mut u64_buf)
-        .filter(|&n| n == 8)
-        .map(|_| u64::from_ne_bytes(u64_buf))
-        .unwrap_or(0);
-    (model, hz / 1_000_000, memsize)
-}
-
-#[cfg(target_os = "linux")]
-fn cpu_and_memory_facts() -> (String, u64, u64) {
-    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let field = |key: &str| {
-        cpuinfo
-            .lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_once(':'))
-            .map(|(_, v)| v.trim().to_string())
-    };
-    let model = field("model name").unwrap_or_default();
-    let mhz = field("cpu MHz")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0) as u64;
-    let total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            m.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-        })
-        .map(|kb| kb * 1024)
-        .unwrap_or(0);
-    (model, mhz, total)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn cpu_and_memory_facts() -> (String, u64, u64) {
-    (String::new(), 0, 0)
-}
-
-/// `(os.release(), os.version())` — utsname's `release` and `version` fields. std exposes no
-/// uname(), so on macOS and Linux this calls it directly; Playwright reads the release to pick a
-/// browser build for the running macOS, and an empty string sends it to the wrong one.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn os_release_version() -> (String, String) {
-    // struct utsname is N fixed-size char arrays: 256 each on macOS, 65 each on Linux (glibc
-    // adds a sixth, `domainname`). Only sysname/nodename/release/version/machine are read.
-    #[cfg(target_os = "macos")]
-    const FIELD: usize = 256;
-    #[cfg(target_os = "linux")]
-    const FIELD: usize = 65;
-    #[repr(C)]
-    struct Utsname([[std::os::raw::c_char; FIELD]; 6]);
-    extern "C" {
-        fn uname(buf: *mut Utsname) -> std::os::raw::c_int;
-    }
-    let mut buf = Utsname([[0; FIELD]; 6]);
-    // SAFETY: `buf` is a writable utsname at least as large as the platform's struct.
-    if unsafe { uname(&mut buf) } != 0 {
-        return (String::new(), String::new());
-    }
-    let field = |i: usize| {
-        let bytes: Vec<u8> = buf.0[i]
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    (field(2), field(3))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn os_release_version() -> (String, String) {
-    // No uname; Linux-style fallback for other unixes, blank elsewhere rather than an invented
-    // version.
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    (release, String::new())
 }
 
 /// Best-effort hostname without a syscall or crate: env, then the file Linux writes it to,
@@ -831,94 +709,32 @@ fn op_hostname(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, V
 }
 
 // ---- os.getPriority / os.setPriority, over getpriority(2)/setpriority(2) ----
-// std exposes no nice-value API, so reach libc directly (same category as the utimes/statvfs FFI
-// above). `PRIO_PROCESS` is 0 on macOS and Linux. Each op returns either the numeric priority /
-// undefined on success, or `{ errno, code }` on failure so os.js can build Node's ERR_SYSTEM_ERROR.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-extern "C" {
-    fn getpriority(which: std::os::raw::c_int, who: std::os::raw::c_uint) -> std::os::raw::c_int;
-    fn setpriority(
-        which: std::os::raw::c_int,
-        who: std::os::raw::c_uint,
-        prio: std::os::raw::c_int,
-    ) -> std::os::raw::c_int;
-}
+// Each op returns the numeric priority / undefined on success, or `{ errno, code }` on failure so
+// os.js can build Node's ERR_SYSTEM_ERROR.
 
-// The thread-local errno cell, so getpriority's -1 return can be disambiguated from a real error
-// (a nice value of -1 is legal). macOS spells the accessor `__error`, Linux `__errno_location`.
-#[cfg(target_os = "macos")]
-extern "C" {
-    #[link_name = "__error"]
-    fn errno_location() -> *mut std::os::raw::c_int;
-}
-#[cfg(target_os = "linux")]
-extern "C" {
-    #[link_name = "__errno_location"]
-    fn errno_location() -> *mut std::os::raw::c_int;
-}
-
-/// Map a raw errno to the code string Node reports (the subset getpriority/setpriority raise).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn priority_errno_code(errno: i32) -> &'static str {
-    match errno {
-        1 => "EPERM",
-        3 => "ESRCH",
-        13 => "EACCES",
-        22 => "EINVAL",
-        _ => "UNKNOWN",
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn priority_error(ctx: &mut Ctx, errno: i32) -> Value {
+fn priority_error(ctx: &mut Ctx, e: lumen_os::FsError) -> Value {
     let obj = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&obj, "errno", Value::Num(-(errno as f64)));
-    let _ = ctx.set_member(&obj, "code", Value::str(priority_errno_code(errno)));
+    let errno = lumen_os::uv::errno(e.code()).unwrap_or(-e.errno());
+    let _ = ctx.set_member(&obj, "errno", Value::Num(errno as f64));
+    let _ = ctx.set_member(&obj, "code", Value::str(e.code()));
     obj
 }
 
 fn op_os_getpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i64;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        // getpriority can legitimately return -1..-20, so zero errno first and consult it after.
-        // SAFETY: errno_location returns a valid pointer to the thread's errno cell; PRIO_PROCESS(0)
-        // with a pid touches no memory.
-        let rc = unsafe {
-            *errno_location() = 0;
-            getpriority(0, pid as std::os::raw::c_uint)
-        };
-        let errno = unsafe { *errno_location() };
-        if rc == -1 && errno != 0 {
-            return Ok(priority_error(ctx, errno));
-        }
-        Ok(Value::Num(rc as f64))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        Ok(Value::Num(0.0))
-    }
+    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
+    Ok(match lumen_os::sysinfo::get_priority(pid) {
+        Ok(p) => Value::Num(p as f64),
+        Err(e) => priority_error(ctx, e),
+    })
 }
 
 fn op_os_setpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i64;
+    let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let prio = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        // SAFETY: PRIO_PROCESS(0) with a pid and an integer priority; no memory is touched.
-        let rc = unsafe { setpriority(0, pid as std::os::raw::c_uint, prio) };
-        if rc != 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Ok(priority_error(ctx, errno));
-        }
-        Ok(Value::Undefined)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (pid, prio);
-        Ok(Value::Undefined)
-    }
+    Ok(match lumen_os::sysinfo::set_priority(pid, prio) {
+        Ok(()) => Value::Undefined,
+        Err(e) => priority_error(ctx, e),
+    })
 }
 
 /// `() -> string | undefined` — the embedded realm's working directory, or `undefined` when the

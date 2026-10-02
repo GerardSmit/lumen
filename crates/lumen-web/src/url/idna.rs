@@ -37,156 +37,18 @@ fn map(input: &[u32]) -> Option<Vec<u32>> {
     Some(out)
 }
 
-// ---- NFC normalization ----
-
-const HANGUL_SBASE: u32 = 0xAC00;
-const HANGUL_TBASE: u32 = 0x11A7;
-const HANGUL_VBASE: u32 = 0x1161;
-const HANGUL_LBASE: u32 = 0x1100;
-const HANGUL_LCOUNT: u32 = 19;
-const HANGUL_VCOUNT: u32 = 21;
-const HANGUL_TCOUNT: u32 = 28;
-const HANGUL_NCOUNT: u32 = HANGUL_VCOUNT * HANGUL_TCOUNT;
-const HANGUL_SCOUNT: u32 = HANGUL_LCOUNT * HANGUL_VCOUNT * HANGUL_TCOUNT;
-
-fn decomposition_of(c: u32) -> &'static [u32] {
-    if c >= 0x110000 {
-        return &[];
-    }
-    let block = &DECOMPOSITION_BLOCK[DECOMPOSITION_INDEX[(c >> 8) as usize] as usize];
-    let lo = block[(c % 256) as usize];
-    let hi = block[(c % 256) as usize + 1];
-    let len = ((hi >> 2) - (lo >> 2)) as usize;
-    if len == 0 || lo & 1 != 0 {
-        return &[];
-    }
-    let start = (lo >> 2) as usize;
-    &DECOMPOSITION_DATA[start..start + len]
-}
-
-fn ccc(c: u32) -> u8 {
-    if c < 0x110000 {
-        CCC_BLOCK[CCC_INDEX[(c >> 8) as usize] as usize][(c % 256) as usize]
-    } else {
-        0
-    }
-}
-
-fn decompose(input: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(input.len());
-    for &c in input {
-        if (HANGUL_SBASE..HANGUL_SBASE + HANGUL_SCOUNT).contains(&c) {
-            let s = c - HANGUL_SBASE;
-            out.push(HANGUL_LBASE + s / HANGUL_NCOUNT);
-            out.push(HANGUL_VBASE + (s % HANGUL_NCOUNT) / HANGUL_TCOUNT);
-            if s % HANGUL_TCOUNT != 0 {
-                out.push(HANGUL_TBASE + s % HANGUL_TCOUNT);
-            }
-        } else {
-            let d = decomposition_of(c);
-            if d.is_empty() {
-                out.push(c);
-            } else {
-                out.extend_from_slice(d);
-            }
-        }
-    }
-    // Canonical ordering (stable insertion sort by combining class).
-    for idx in 1..out.len() {
-        let k = ccc(out[idx]);
-        if k == 0 {
-            continue;
-        }
-        let cur = out[idx];
-        let mut back = idx;
-        while back != 0 && ccc(out[back - 1]) > k {
-            out[back] = out[back - 1];
-            back -= 1;
-        }
-        out[back] = cur;
-    }
-    out
-}
-
-fn composition_row(c: u32) -> (u16, u16) {
-    let block = &COMPOSITION_BLOCK[COMPOSITION_INDEX[(c >> 8) as usize] as usize];
-    (block[(c % 256) as usize], block[(c % 256) as usize + 1])
-}
-
-fn compose(input: &mut Vec<u32>) {
-    let n = input.len();
-    let mut i = 0; // input_count
-    let mut w = 0; // composition_count
-    while i < n {
-        input[w] = input[i];
-        let c = input[i];
-        if (HANGUL_LBASE..HANGUL_LBASE + HANGUL_LCOUNT).contains(&c) {
-            if i + 1 < n && (HANGUL_VBASE..HANGUL_VBASE + HANGUL_VCOUNT).contains(&input[i + 1]) {
-                input[w] = HANGUL_SBASE
-                    + ((c - HANGUL_LBASE) * HANGUL_VCOUNT + input[i + 1] - HANGUL_VBASE)
-                        * HANGUL_TCOUNT;
-                i += 1;
-                if i + 1 < n && input[i + 1] > HANGUL_TBASE && input[i + 1] < HANGUL_TBASE + HANGUL_TCOUNT
-                {
-                    i += 1;
-                    input[w] += input[i] - HANGUL_TBASE;
-                }
-            }
-        } else if (HANGUL_SBASE..HANGUL_SBASE + HANGUL_SCOUNT).contains(&c) {
-            if (c - HANGUL_SBASE) % HANGUL_TCOUNT != 0
-                && i + 1 < n
-                && input[i + 1] > HANGUL_TBASE
-                && input[i + 1] < HANGUL_TBASE + HANGUL_TCOUNT
-            {
-                i += 1;
-                input[w] += input[i] - HANGUL_TBASE;
-            }
-        } else if c < 0x110000 {
-            let mut row = composition_row(c);
-            let start = w;
-            let mut previous_ccc: i32 = -1;
-            while i + 1 < n {
-                let next = input[i + 1];
-                let k = ccc(next);
-                if row.1 != row.0 && previous_ccc < k as i32 {
-                    // Binary search the (code point, composite) pairs for `next`.
-                    let (mut left, mut right) = (row.0 as usize, row.1 as usize);
-                    while left + 2 < right {
-                        let middle = left + (((right - left) >> 1) & !1);
-                        if COMPOSITION_DATA[middle] <= next {
-                            left = middle;
-                        }
-                        if COMPOSITION_DATA[middle] >= next {
-                            right = middle;
-                        }
-                    }
-                    if COMPOSITION_DATA[left] == next {
-                        let composite = COMPOSITION_DATA[left + 1];
-                        input[start] = composite;
-                        row = composition_row(composite);
-                        i += 1;
-                        continue;
-                    }
-                }
-                if k == 0 {
-                    break;
-                }
-                previous_ccc = k as i32;
-                w += 1;
-                input[w] = next;
-                i += 1;
-            }
-        }
-        i += 1;
-        w += 1;
-    }
-    input.truncate(w);
-}
-
 fn normalize(input: &[u32]) -> Vec<u32> {
-    let mut d = decompose(input);
-    compose(&mut d);
-    d
+    lumen_common::unicode_norm_impl::normalize(input, "NFC")
+}
+
+fn is_mark(c: u32) -> bool {
+    let marks = lumen_common::unicode_props::lookup("gc", Some("M")).unwrap_or(&[]);
+    let i = marks.partition_point(|&(_, last)| last < c);
+    marks.get(i).is_some_and(|&(first, _)| first <= c)
+}
+
+fn is_virama(c: u32) -> bool {
+    lumen_common::unicode_norm_impl::ccc(c) == 9
 }
 
 // ---- punycode (RFC 3492) ----
@@ -387,22 +249,24 @@ fn is_label_valid(label: &[u32]) -> bool {
     let Some(&first) = label.first() else {
         return true;
     };
-    if COMBINING.binary_search(&first).is_ok() {
+    if is_mark(first) {
         return false;
     }
     for (i, &c) in label.iter().enumerate() {
         if c == 0x200c {
-            if i > 0 && VIRAMA.binary_search(&label[i - 1]).is_ok() {
+            if i > 0 && is_virama(label[i - 1]) {
                 return true;
             }
             if i == 0 || i + 1 >= label.len() {
                 return false;
             }
-            let l_or_d = |x: &u32| JOIN_L.binary_search(x).is_ok() || JOIN_D.binary_search(x).is_ok();
-            let r_or_d = |x: &u32| JOIN_R.binary_search(x).is_ok() || JOIN_D.binary_search(x).is_ok();
+            let l_or_d =
+                |x: &u32| JOIN_L.binary_search(x).is_ok() || JOIN_D.binary_search(x).is_ok();
+            let r_or_d =
+                |x: &u32| JOIN_R.binary_search(x).is_ok() || JOIN_D.binary_search(x).is_ok();
             return label[..i].iter().any(l_or_d) && label[i + 1..].iter().any(r_or_d);
         } else if c == 0x200d {
-            return i > 0 && VIRAMA.binary_search(&label[i - 1]).is_ok();
+            return i > 0 && is_virama(label[i - 1]);
         }
     }
     let Some(last_non_nsm) = label.iter().rposition(|&c| !is(direction(c), Dir::Nsm)) else {
@@ -420,9 +284,18 @@ fn is_label_valid(label: &[u32]) -> bool {
         // fires for LTR labels; kept as-is for parity with Node.
         for &c in label.iter().take(last_non_nsm) {
             let d = direction(c);
-            let ok = [Dir::L, Dir::En, Dir::Es, Dir::Cs, Dir::Et, Dir::On, Dir::Bn, Dir::Nsm]
-                .iter()
-                .any(|&x| is(d, x));
+            let ok = [
+                Dir::L,
+                Dir::En,
+                Dir::Es,
+                Dir::Cs,
+                Dir::Et,
+                Dir::On,
+                Dir::Bn,
+                Dir::Nsm,
+            ]
+            .iter()
+            .any(|&x| is(d, x));
             if !ok {
                 return false;
             }
@@ -461,7 +334,11 @@ fn is_label_valid(label: &[u32]) -> bool {
             if !ok {
                 return false;
             }
-            if i == last_non_nsm && ![Dir::R, Dir::Al, Dir::An, Dir::En].iter().any(|&x| is(d, x)) {
+            if i == last_non_nsm
+                && ![Dir::R, Dir::Al, Dir::An, Dir::En]
+                    .iter()
+                    .any(|&x| is(d, x))
+            {
                 return false;
             }
         }
@@ -562,7 +439,11 @@ pub(crate) fn to_unicode(input: &str) -> String {
             .strip_prefix("xn--")
             .filter(|body| body.is_ascii())
             .and_then(|body| punycode_decode(body.as_bytes()))
-            .and_then(|cps| cps.into_iter().map(char::from_u32).collect::<Option<String>>());
+            .and_then(|cps| {
+                cps.into_iter()
+                    .map(char::from_u32)
+                    .collect::<Option<String>>()
+            });
         match decoded {
             Some(s) => out.push_str(&s),
             None => out.push_str(label),
@@ -581,13 +462,25 @@ mod tests {
     #[test]
     fn ascii_and_unicode() {
         assert_eq!(to_ascii(b"EXAMPLE.com").as_deref(), Some("example.com"));
-        assert_eq!(to_ascii("bücher.de".as_bytes()).as_deref(), Some("xn--bcher-kva.de"));
-        assert_eq!(to_ascii("ＥＸＡＭＰＬＥ。com".as_bytes()).as_deref(), Some("example.com"));
-        assert_eq!(to_ascii(b"xn--bcher-kva.de").as_deref(), Some("xn--bcher-kva.de"));
+        assert_eq!(
+            to_ascii("bücher.de".as_bytes()).as_deref(),
+            Some("xn--bcher-kva.de")
+        );
+        assert_eq!(
+            to_ascii("ＥＸＡＭＰＬＥ。com".as_bytes()).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            to_ascii(b"xn--bcher-kva.de").as_deref(),
+            Some("xn--bcher-kva.de")
+        );
         assert_eq!(to_ascii(b"xn--a.de"), None);
         assert_eq!(to_unicode("xn--bcher-kva.de"), "bücher.de");
         // NFC composition: u + combining diaeresis.
-        assert_eq!(to_ascii("bu\u{308}cher".as_bytes()).as_deref(), Some("xn--bcher-kva"));
+        assert_eq!(
+            to_ascii("bu\u{308}cher".as_bytes()).as_deref(),
+            Some("xn--bcher-kva")
+        );
         // Hangul syllables.
         assert_eq!(to_ascii("한국".as_bytes()).as_deref(), Some("xn--3e0b707e"));
     }

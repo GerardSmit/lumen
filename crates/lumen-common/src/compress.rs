@@ -201,12 +201,6 @@ impl Drop for ZStream {
     }
 }
 
-#[inline]
-pub fn adler32_from(seed: u32, data: &[u8]) -> u32 {
-    // SAFETY: the pointer and length describe a live slice.
-    unsafe { z::adler32_z(seed as _, data.as_ptr(), data.len()) as u32 }
-}
-
 /// The zlib version string the library reports.
 pub fn zlib_version() -> String {
     // SAFETY: `zlibVersion` returns a NUL-terminated static string.
@@ -217,6 +211,13 @@ pub fn zlib_version() -> String {
 pub fn crc32_from(seed: u32, data: &[u8]) -> u32 {
     // SAFETY: the pointer and length describe a live slice.
     unsafe { z::crc32_z(seed as _, data.as_ptr(), data.len()) as u32 }
+}
+
+/// Adler-32 of `data`, continued from `seed` (1 for a fresh checksum).
+#[inline]
+pub fn adler32_from(seed: u32, data: &[u8]) -> u32 {
+    // SAFETY: the pointer and length describe a live slice.
+    unsafe { z::adler32_z(seed as _, data.as_ptr(), data.len()) as u32 }
 }
 
 fn compress_with(window_bits: i32, data: &[u8]) -> Vec<u8> {

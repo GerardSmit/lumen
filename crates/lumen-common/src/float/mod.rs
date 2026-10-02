@@ -1,9 +1,10 @@
 //! Floating-point algorithms whose results the languages specify more tightly than the platform
-//! libm does: shortest round-trip formatting, exact summation, Euclidean norms, gamma and the error
+//! libm does: shortest round-trip and correctly rounded fixed-precision formatting, exact summation, Euclidean norms, gamma and the error
 //! functions.
 
 pub mod complex;
 mod erf;
+pub mod format;
 mod fsum;
 mod gamma;
 mod norm;
@@ -121,8 +122,10 @@ mod tests {
     #[test]
     fn inverse_hyperbolics() {
         assert_eq!(atanh(-0.9999999999999999), -18.714973875118524);
-        assert_eq!(atanh(-0.5), -0.5493061443340549);
-        assert_eq!(fdlibm_atanh(-0.5), -0.5493061443340549);
+        // Both go through the platform libm (`log1p` for fdlibm's), and glibc and Apple's differ
+        // by an ulp here.
+        assert!((atanh(-0.5) - -0.5493061443340549).abs() <= f64::EPSILON);
+        assert!((fdlibm_atanh(-0.5) - -0.5493061443340549).abs() <= f64::EPSILON);
         assert_eq!(atanh(1.0), f64::INFINITY);
         assert!(atanh(1.5).is_nan());
         assert_eq!(asinh(-0.0).to_bits(), (-0.0f64).to_bits());

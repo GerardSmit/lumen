@@ -1,6 +1,6 @@
 // Headers/Request/Response + fetch over the native __http.request op. Bodies are buffered; a body
 // can be consumed once, either through `text()`/`json()`/… or by reading its `.body` ReadableStream
-// (see streams.js). The two share one "consumed" flag.
+// (lumen-node's webstreams.js). The two share one "consumed" flag.
 
 function normalizeHeaderName(name) {
   name = String(name);

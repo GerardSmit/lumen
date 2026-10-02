@@ -14,11 +14,9 @@ publish = false
 lumen = { path = "../lumen", features = ["embed"] }
 lumen-bind = { path = "../lumen-bind" }
 lumen-common = { path = "../lumen-common", features = ["compress"] }
+lumen-os = { path = "../lumen-os" }
 
 web-time = "1"
-
-[target.'cfg(unix)'.dependencies]
-lumen-os = { path = "../lumen-os" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
