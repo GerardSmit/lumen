@@ -200,6 +200,27 @@ fn call_forward(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     it.call(&a[0], a[1..].to_vec(), kw.to_vec())
 }
 
+/// `meth_reduce` and `method_reduce`: a bound method pickles as `getattr(self, name)`, a module
+/// function or unbound builtin as its name.
+fn method_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__reduce__", a, 1, 1)?;
+    let bound_to = match &a[0] {
+        Value::Obj(o) => match &o.kind {
+            Kind::Method(_, this) => Some(this.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let name = it.get_attr_str(&a[0], "__name__")?;
+    match bound_to {
+        Some(this) if !matches!(&this, Value::Obj(o) if matches!(o.kind, Kind::Module)) => {
+            let getattr = dict_get_str(&it.builtins, "getattr").unwrap_or(Value::None);
+            Ok(Value::tuple(vec![getattr, Value::tuple(vec![this, name])]))
+        }
+        _ => Ok(name),
+    }
+}
+
 fn module_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let Some(Value::Obj(cls)) = a.first() else { return Err(it.type_error("module.__new__(X): X is not a type object")) };
     let m = it.new_module("");
@@ -241,6 +262,9 @@ pub fn init(it: &mut Interp) {
     it.reg_new(&method_ty, method_new);
     for ty in [it.types.function.clone(), it.types.method.clone(), it.types.builtin_function.clone()] {
         it.reg(&ty, "__call__", call_forward);
+    }
+    for ty in [it.types.method.clone(), it.types.builtin_function.clone()] {
+        it.reg(&ty, "__reduce__", method_reduce);
     }
     super::memview::init(it);
     let getset = new_type(it, "builtins", "getset_descriptor", None, Layout::Other);

@@ -83,6 +83,13 @@ pub fn export(it: &mut Interp, v: &Value) -> R<Option<Exported>> {
     }
 }
 
+/// A writable `memoryview` of `store`, exported by `obj`.
+pub fn view_of_store(it: &mut Interp, obj: Value, store: &Rc<lumen_common::buffer::ByteStore>) -> R<Value> {
+    let e = store.export().map_err(|e| buffer_error(it, e))?;
+    let view = ViewDesc::bytes(0, store.len(), false);
+    Ok(Py::new(it, MemoryView { obj, src: Some(Source::Store(e)), view, fmt: "B".into() }).into_value())
+}
+
 /// The bytes of any bytes-like object, in C order (`bytes(x)` for a buffer).
 pub fn contiguous_bytes(it: &mut Interp, v: &Value) -> R<Option<Vec<u8>>> {
     let Some(e) = export(it, v)? else { return Ok(None) };

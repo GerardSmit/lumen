@@ -6,5 +6,6 @@ pub mod errno;
 pub mod fdctl;
 pub mod fs;
 pub mod proc;
+pub mod time;
 
 pub use errno::FsError;

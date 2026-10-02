@@ -1,48 +1,70 @@
-//! `BytesIO`: a buffered binary stream over an in-memory byte buffer.
+//! `BytesIO`: a buffered binary stream over an in-memory byte buffer. The bytes live in a
+//! [`ByteStore`], so `getbuffer()` views share them and pin their size.
 
 use super::{closed_error, size_arg};
 use crate::bind::{KwArgs, Py, This};
 use crate::object::*;
 use crate::vm::Interp;
+use lumen_common::buffer::ByteStore;
+use std::rc::Rc;
 
 /// Buffered I/O implementation using an in-memory bytes buffer.
 #[lumen_bind::class(module = "_io", name = "BytesIO")]
 pub struct BytesIO {
-    buf: Vec<u8>,
+    buf: Rc<ByteStore>,
     pos: usize,
     closed: bool,
 }
 
 impl BytesIO {
     fn take(&mut self, size: i64) -> Vec<u8> {
-        let start = self.pos.min(self.buf.len());
-        let avail = self.buf.len() - start;
+        let buf = self.buf.bytes();
+        let start = self.pos.min(buf.len());
+        let avail = buf.len() - start;
         let n = if size < 0 { avail } else { (size as usize).min(avail) };
         self.pos = start + n;
-        self.buf[start..start + n].to_vec()
+        buf[start..start + n].to_vec()
     }
 
     fn line(&mut self, size: i64) -> Vec<u8> {
-        let start = self.pos.min(self.buf.len());
-        let rest = &self.buf[start..];
+        let buf = self.buf.bytes();
+        let start = self.pos.min(buf.len());
+        let rest = &buf[start..];
         let limit = if size < 0 { rest.len() } else { (size as usize).min(rest.len()) };
         let n = rest[..limit].iter().position(|&b| b == b'\n').map_or(limit, |p| p + 1);
         self.pos = start + n;
-        self.buf[start..start + n].to_vec()
+        buf[start..start + n].to_vec()
     }
 
     fn write_at(&mut self, data: &[u8]) -> usize {
-        let end = self.pos + data.len();
-        if self.buf.len() < self.pos {
-            self.buf.resize(self.pos, 0);
-        }
-        if end > self.buf.len() {
-            self.buf.resize(end, 0);
-        }
-        self.buf[self.pos..end].copy_from_slice(data);
-        self.pos = end;
+        let pos = self.pos;
+        let _ = self.buf.edit(|v| {
+            let end = pos + data.len();
+            if end > v.len() {
+                v.resize(end, 0);
+            }
+            v[pos..end].copy_from_slice(data);
+        });
+        self.pos = pos + data.len();
         data.len()
     }
+
+    fn reset(&mut self, bytes: Vec<u8>) {
+        self.buf = Rc::new(ByteStore::new(bytes).growable());
+    }
+}
+
+fn new_store() -> Rc<ByteStore> {
+    Rc::new(ByteStore::new(Vec::new()).growable())
+}
+
+/// `check_exports`: a `BufferError` while a `getbuffer()` view is alive.
+fn check_exports(it: &mut Interp, slf: &Py<BytesIO>) -> R<()> {
+    let pinned = slf.with(it, |s| s.buf.is_pinned())?;
+    if pinned {
+        return Err(it.new_exc_str("BufferError", "Existing exports of data: object cannot be re-sized"));
+    }
+    Ok(())
 }
 
 /// Runs `f` on the open state; `ValueError` when closed.
@@ -56,21 +78,28 @@ impl BytesIO {
     #[constructor]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BytesIO {
         let _ = (args, kwargs);
-        BytesIO { buf: Vec::new(), pos: 0, closed: false }
+        BytesIO { buf: new_store(), pos: 0, closed: false }
     }
 
     #[proto(init)]
     fn __init__(slf: This<Py<Self>>, it: &mut Interp, #[kw] initial_bytes: Option<&[u8]>) -> R<()> {
+        check_exports(it, &slf.0)?;
         let mut s = slf.0.borrow_mut(it)?;
         s.closed = false;
-        s.buf = initial_bytes.map(|b| b.to_vec()).unwrap_or_default();
+        s.reset(initial_bytes.map(|b| b.to_vec()).unwrap_or_default());
         s.pos = 0;
         Ok(())
     }
 
     /// Retrieve the entire contents of the BytesIO object.
     fn getvalue(slf: This<Py<Self>>, it: &mut Interp) -> R<Vec<u8>> {
-        st(it, &slf.0, |s| s.buf.clone())
+        st(it, &slf.0, |s| s.buf.to_vec())
+    }
+
+    /// Get a read-write view over the contents of the BytesIO object.
+    fn getbuffer(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let store = st(it, &slf.0, |s| s.buf.clone())?;
+        crate::builtins::memview::view_of_store(it, slf.0.value().clone(), &store)
     }
 
     /// Read at most size bytes, returned as a bytes object.
@@ -122,12 +151,15 @@ impl BytesIO {
 
     /// Write bytes to file.
     fn write(slf: This<Py<Self>>, it: &mut Interp, b: &[u8]) -> R<usize> {
+        st(it, &slf.0, |_| ())?;
+        check_exports(it, &slf.0)?;
         st(it, &slf.0, |s| if b.is_empty() { 0 } else { s.write_at(b) })
     }
 
     /// Write lines to the file.
     fn writelines(slf: This<Py<Self>>, it: &mut Interp, lines: &Value) -> R<()> {
         st(it, &slf.0, |_| ())?;
+        check_exports(it, &slf.0)?;
         let iter = it.get_iter(lines)?;
         while let Some(line) = it.iter_next(&iter)? {
             it.call_method(slf.0.value(), "write", vec![line])?;
@@ -159,6 +191,7 @@ impl BytesIO {
     /// Truncate the file to at most size bytes.
     fn truncate(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<i64> {
         let cur = st(it, &slf.0, |s| s.pos as i64)?;
+        check_exports(it, &slf.0)?;
         let size = match size {
             None | Some(Value::None) => cur,
             Some(v) => it.index_of(v)?,
@@ -166,7 +199,9 @@ impl BytesIO {
         if size < 0 {
             return Err(it.value_error(&format!("negative size value {}", size)));
         }
-        st(it, &slf.0, |s| s.buf.truncate(size as usize))?;
+        st(it, &slf.0, |s| {
+            let _ = s.buf.edit(|v| v.truncate(size as usize));
+        })?;
         Ok(size)
     }
 
@@ -198,9 +233,12 @@ impl BytesIO {
     }
 
     /// Disable all I/O operations.
-    fn close(&mut self) {
-        self.closed = true;
-        self.buf = Vec::new();
+    fn close(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
+        check_exports(it, &slf.0)?;
+        let mut s = slf.0.borrow_mut(it)?;
+        s.closed = true;
+        s.reset(Vec::new());
+        Ok(())
     }
 
     /// True if the file is closed.
@@ -222,7 +260,7 @@ impl BytesIO {
     }
 
     fn __getstate__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        let (buf, pos) = st(it, &slf.0, |s| (s.buf.clone(), s.pos))?;
+        let (buf, pos) = st(it, &slf.0, |s| (s.buf.to_vec(), s.pos))?;
         let Value::Obj(o) = slf.0.value() else { unreachable!() };
         let d = o.dict.borrow().clone().map_or(Value::None, |d| it.call_method(&Value::Obj(d), "copy", Vec::new()).unwrap_or(Value::None));
         Ok(Value::tuple(vec![Value::bytes(buf), Value::Int(pos as i64), d]))
@@ -241,8 +279,9 @@ impl BytesIO {
         if pos < 0 {
             return Err(it.value_error("position value cannot be negative"));
         }
+        check_exports(it, &slf.0)?;
         st(it, &slf.0, |s| {
-            s.buf = buf;
+            s.reset(buf);
             s.pos = pos as usize;
         })?;
         if let Value::Obj(d) = &items[2] {

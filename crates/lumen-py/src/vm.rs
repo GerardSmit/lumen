@@ -181,6 +181,8 @@ pub struct Interp {
     pub codecs: crate::codecs::CodecState,
     /// Type objects of the native classes bound with `#[class]` (see `bind::type_object`).
     pub native_types: std::collections::HashMap<std::any::TypeId, Obj>,
+    /// Per-interpreter state of native modules (CPython's module state), keyed by its type.
+    pub native_state: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
     /// The current `contextvars.Context`, created on first use.
     pub context: Option<Value>,
 }
@@ -191,6 +193,12 @@ pub enum GenResult {
 }
 
 impl Interp {
+    /// The native-module state `T`, created on first use.
+    pub fn native_state<T: Default + 'static>(&mut self) -> &mut T {
+        let slot = self.native_state.entry(std::any::TypeId::of::<T>()).or_insert_with(|| Box::new(T::default()));
+        slot.downcast_mut::<T>().expect("native state keyed by its own type")
+    }
+
     #[allow(clippy::new_without_default)]
     pub fn new() -> Interp {
         Interp::with_platform(Box::new(StdPlatform::new()))
@@ -241,6 +249,7 @@ impl Interp {
             int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
             codecs: Default::default(),
             native_types: std::collections::HashMap::new(),
+            native_state: std::collections::HashMap::new(),
             context: None,
         };
         it.bootstrap_types();

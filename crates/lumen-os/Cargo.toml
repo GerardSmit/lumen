@@ -9,6 +9,9 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+lumen-common = { path = "../lumen-common" }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

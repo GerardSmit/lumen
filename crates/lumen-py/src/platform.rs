@@ -2,6 +2,7 @@
 //! operating system (streams, files, clocks, entropy, environment, module sources) goes through
 //! [`Platform`], so an embedder without an OS can supply its own implementation.
 
+use lumen_common::civil::Tm;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -314,6 +315,32 @@ pub trait Platform {
     }
     fn cpu_count(&self) -> usize {
         1
+    }
+
+    // ---- local time (`time`) -----------------------------------------------------------------
+
+    /// The local broken-down time of an instant; UTC on a host without time zones.
+    fn localtime(&self, sec: i64) -> PResult<Tm> {
+        let mut tm = Tm::from_epoch(sec, 0);
+        tm.zone = Some("UTC".to_string());
+        Ok(tm)
+    }
+    /// The instant of local time `tm`, `None` when it cannot be represented.
+    fn mktime(&self, tm: &Tm) -> Option<i64> {
+        Some(tm.to_epoch_utc())
+    }
+    /// Re-reads the local time zone from the environment.
+    fn tzset(&mut self) {}
+    /// CPU time of the process (or the calling thread) in nanoseconds.
+    fn cpu_time_ns(&self, _thread: bool) -> PResult<i128> {
+        Ok(self.monotonic_ns() as i128)
+    }
+    /// `clock_gettime` (or with `res`, `clock_getres`) in nanoseconds.
+    fn clock_ns(&self, _id: i64, _res: bool) -> PResult<i128> {
+        Err(no_sys())
+    }
+    fn clock_set_ns(&mut self, _id: i64, _ns: i128) -> PResult<()> {
+        Err(no_sys())
     }
 
     // ---- descriptor control and process signals (`posix`) ------------------------------------
@@ -675,6 +702,30 @@ impl Platform for StdPlatform {
 
     fn cpu_count(&self) -> usize {
         lumen_os::proc::cpu_count()
+    }
+
+    fn localtime(&self, sec: i64) -> PResult<Tm> {
+        Ok(lumen_os::time::localtime(sec)?)
+    }
+
+    fn mktime(&self, tm: &Tm) -> Option<i64> {
+        lumen_os::time::mktime(tm)
+    }
+
+    fn tzset(&mut self) {
+        lumen_os::time::tzset()
+    }
+
+    fn cpu_time_ns(&self, thread: bool) -> PResult<i128> {
+        Ok(lumen_os::time::cpu_time_ns(thread)?)
+    }
+
+    fn clock_ns(&self, id: i64, res: bool) -> PResult<i128> {
+        Ok(lumen_os::time::clock_ns(id, res)?)
+    }
+
+    fn clock_set_ns(&mut self, id: i64, ns: i128) -> PResult<()> {
+        Ok(lumen_os::time::clock_set_ns(id, ns)?)
     }
 
     fn fd_dup2(&mut self, fd: Fd, fd2: Fd, inheritable: bool) -> PResult<Fd> {
@@ -1134,6 +1185,30 @@ impl Platform for MemPlatform {
 
     fn cpu_count(&self) -> usize {
         self.inner.cpu_count()
+    }
+
+    fn localtime(&self, sec: i64) -> PResult<Tm> {
+        self.inner.localtime(sec)
+    }
+
+    fn mktime(&self, tm: &Tm) -> Option<i64> {
+        self.inner.mktime(tm)
+    }
+
+    fn tzset(&mut self) {
+        self.inner.tzset()
+    }
+
+    fn cpu_time_ns(&self, thread: bool) -> PResult<i128> {
+        self.inner.cpu_time_ns(thread)
+    }
+
+    fn clock_ns(&self, id: i64, res: bool) -> PResult<i128> {
+        self.inner.clock_ns(id, res)
+    }
+
+    fn clock_set_ns(&mut self, id: i64, ns: i128) -> PResult<()> {
+        self.inner.clock_set_ns(id, ns)
     }
 
     fn fd_dup2(&mut self, fd: Fd, fd2: Fd, inheritable: bool) -> PResult<Fd> {

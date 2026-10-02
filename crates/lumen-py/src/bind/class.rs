@@ -3,7 +3,8 @@
 //!
 //! Python hints on `#[class]`: `hint(py(unhashable))` (`__hash__ = None`), `hint(py(native_iter))`
 //! (the constructor returns a [`NativeIter`] the VM steps directly), `hint(py(final))` (cannot be
-//! subclassed).
+//! subclassed), `hint(py(base = "module.Class"))` (a Python base class, imported when the type is
+//! first created).
 
 use super::args::{self, py_name, HOST};
 use super::PyHost;
@@ -33,7 +34,8 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     }
     let c = T::DESC;
     let module = c.module.unwrap_or("builtins");
-    let ty = new_type(it, module, c.name_for(HOST), None, Layout::Other);
+    let base = c.hint(HOST, "base").and_then(|path| python_base(it, path));
+    let ty = new_type(it, module, c.name_for(HOST), base.as_ref(), Layout::Other);
     it.native_types.insert(TypeId::of::<T>(), ty.clone());
     if c.hint(HOST, "final").is_some() {
         if let Kind::Type(td) = &ty.kind {
@@ -73,6 +75,16 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
         }
     }
     ty
+}
+
+/// The class `module.name` of a `base` hint, imported on first use of the native class.
+fn python_base(it: &mut Interp, path: &str) -> Option<Obj> {
+    let (module, name) = path.rsplit_once('.')?;
+    let m = it.import_module(module).ok()?;
+    match it.get_attr_str(&Value::Obj(m), name) {
+        Ok(Value::Obj(t)) if matches!(t.kind, Kind::Type(_)) => Some(t),
+        _ => None,
+    }
 }
 
 fn install_members(ty: &Obj, members: &[FnItem<PyHost>]) {

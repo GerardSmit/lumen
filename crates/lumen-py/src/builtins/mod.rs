@@ -27,6 +27,7 @@ pub mod sysextra;
 pub mod sysm;
 pub mod sysmods;
 pub mod threadm;
+pub mod timem;
 pub mod tokenizem;
 pub mod weakm;
 pub mod stringm;
@@ -41,6 +42,7 @@ pub mod oserror;
 pub mod errnom;
 pub mod posixm;
 pub mod typingm;
+pub mod zoneinfom;
 
 use crate::object::*;
 use crate::vm::*;

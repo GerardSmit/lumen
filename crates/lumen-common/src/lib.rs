@@ -24,9 +24,11 @@ pub mod native;
 pub mod stack;
 pub mod regex;
 pub mod smuggle;
+pub mod strftime;
 pub mod tz;
 #[rustfmt::skip]
 pub mod tzdata;
+pub mod tzrules;
 pub mod unicode_norm;
 pub mod unicode_norm_impl;
 pub mod unicode_props;

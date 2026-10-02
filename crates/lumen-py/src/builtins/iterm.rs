@@ -237,6 +237,17 @@ fn iter_length_hint(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::Int(0))
 }
 
+/// `range.__reduce__` and `slice.__reduce__`: `(type, (start, stop, step))`.
+fn start_stop_step_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__reduce__", a, 1, 1)?;
+    let mut parts = Vec::with_capacity(3);
+    for name in ["start", "stop", "step"] {
+        parts.push(it.get_attr_str(&a[0], name)?);
+    }
+    let t = it.type_of(&a[0]);
+    Ok(Value::tuple(vec![Value::Obj(t), Value::tuple(parts)]))
+}
+
 pub fn init(it: &mut Interp) {
     let range = it.types.range.clone();
     it.reg_new(&range, range_new);
@@ -244,6 +255,7 @@ pub fn init(it: &mut Interp) {
     it.reg(&range, "count", range_count);
     it.reg(&range, "__hash__", range_hash);
     it.reg(&range, "__repr__", range_repr);
+    it.reg(&range, "__reduce__", start_stop_step_reduce);
     reg_slots(it, &range, &["__getitem__", "__len__", "__contains__", "__iter__", "__reversed__"]);
     reg_compare(it, &range, false);
 
@@ -251,6 +263,7 @@ pub fn init(it: &mut Interp) {
     it.reg_new(&slice, slice_new);
     it.reg(&slice, "indices", slice_indices);
     it.reg(&slice, "__repr__", slice_repr);
+    it.reg(&slice, "__reduce__", start_stop_step_reduce);
     reg_compare(it, &slice, true);
 
     let (enumerate, zip, map, filter, reversed) =

@@ -581,9 +581,9 @@ impl Interp {
                     let mn = o.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__name__")).and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
                     format!("module '{}' has no attribute '{}'", mn, name)
                 }
-                _ => format!("'{}' object has no attribute '{}'", self.type_name_of(obj), name),
+                _ => format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), name),
             },
-            _ => format!("'{}' object has no attribute '{}'", self.type_name_of(obj), name),
+            _ => format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), name),
         };
         let e = self.new_exc_str("AttributeError", &msg);
         self.set_exc_attr(&e, "name", Value::str(name));
@@ -634,16 +634,18 @@ impl Interp {
             match &o.kind {
                 Kind::Type(_) => return self.type_getattr(obj, o, name),
                 Kind::Module => {
-                    if let Some(d) = o.dict.borrow().as_ref() {
-                        if let Some(v) = dict_get_name(d, name) {
-                            return Ok(v);
-                        }
-                        if let Some(ga) = dict_get_str(d, "__getattr__") {
-                            return self.call(&ga, vec![Value::Obj(name.clone())], Vec::new());
-                        }
+                    let d = o.dict.borrow().clone();
+                    if let Some(v) = d.as_ref().and_then(|d| dict_get_name(d, name)) {
+                        return Ok(v);
                     }
                     if let Some(v) = self.special_attr(obj, nm)? {
                         return Ok(v);
+                    }
+                    if let Some(descr) = self.lookup_mro_name(cls, name) {
+                        return self.bind_descr(&descr, obj, cls);
+                    }
+                    if let Some(ga) = d.as_ref().and_then(|d| dict_get_str(d, "__getattr__")) {
+                        return self.call(&ga, vec![Value::Obj(name.clone())], Vec::new());
                     }
                     return Err(self.attr_error(obj, nm));
                 }
@@ -870,7 +872,7 @@ impl Interp {
             Kind::Method(f, this) => match nm {
                 "__self__" => return Ok(Some(this.clone())),
                 "__func__" => return Ok(Some(f.clone())),
-                "__name__" | "__qualname__" | "__doc__" | "__module__" | "__wrapped__" => {
+                "__name__" | "__qualname__" | "__doc__" | "__module__" | "__wrapped__" | "__text_signature__" => {
                     return self.get_attr_str(f, nm).map(Some).or_else(|e| if nm == "__doc__" { Ok(Some(Value::None)) } else { Err(e) })
                 }
                 _ => {}
@@ -890,6 +892,10 @@ impl Interp {
                     return Ok(Some(Value::str(d.module().unwrap_or("builtins"))))
                 }
                 ("__module__", _) => return Ok(Some(Value::str("builtins"))),
+                ("__self__", d) if d.is_none_or(|d| d.class().is_none()) => {
+                    let m = d.and_then(|d| d.module()).unwrap_or("builtins");
+                    return self.import_module(m).map(|m| Some(Value::Obj(m)));
+                }
                 _ => {}
             },
             Kind::Generator(g) => match nm {
@@ -1046,7 +1052,7 @@ impl Interp {
         let nm = name.as_str_kind().unwrap_or("").to_string();
         let o = match obj {
             Value::Obj(o) => o,
-            _ => return Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.type_name_of(obj), nm))),
+            _ => return Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), nm))),
         };
         if let Some(d) = self.lookup_mro_name(cls, name) {
             if let Value::Obj(dobj) = &d {
@@ -1165,7 +1171,7 @@ impl Interp {
                     return Err(self.new_exc_str("TypeError", "__class__ assignment not supported"));
                 }
                 if matches!(o.kind, Kind::Instance) && self.lookup_mro(cls, "__slots__").is_some() && self.slots_forbid(cls, &nm) {
-                    let msg = format!("'{}' object has no attribute '{}'", self.type_name(cls), nm);
+                    let msg = format!("'{}' object has no attribute '{}'", self.tp_name(cls), nm);
                     return Err(self.new_exc_str("AttributeError", &msg));
                 }
                 let dd = self.instance_dict(o);
@@ -1175,7 +1181,7 @@ impl Interp {
             _ => {
                 if o.cls.is_some() {
                     if self.lookup_mro(cls, "__slots__").is_some() && self.slots_forbid(cls, &nm) {
-                        let msg = format!("'{}' object has no attribute '{}'", self.type_name(cls), nm);
+                        let msg = format!("'{}' object has no attribute '{}'", self.tp_name(cls), nm);
                         return Err(self.new_exc_str("AttributeError", &msg));
                     }
                     let dd = self.instance_dict(o);
@@ -1187,7 +1193,7 @@ impl Interp {
                     }
                     Ok(())
                 } else {
-                    Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.type_name_of(obj), nm)))
+                    Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", self.tp_name_of(obj), nm)))
                 }
             }
         }

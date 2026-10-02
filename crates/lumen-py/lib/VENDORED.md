@@ -21,6 +21,8 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `contextlib.py`
 - `copy.py`
 - `copyreg.py`
+- `pickle.py`
+- `_compat_pickle.py`
 - `dataclasses.py`
 - `enum.py`
 - `functools.py`
@@ -144,6 +146,7 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `asyncio/trsock.py`
 - `asyncio/unix_events.py`
 - `sysconfig.py`
+- `_osx_support.py`
 - `zoneinfo/__init__.py`
 - `zoneinfo/_common.py`
 - `zoneinfo/_tzpath.py`

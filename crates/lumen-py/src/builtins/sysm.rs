@@ -443,6 +443,9 @@ pub mod sys {
             (p.platform_name(), p.executable(), p.argv())
         };
         dict_set_str(&d, "platform", Value::str(&platform));
+        if platform == "darwin" {
+            dict_set_str(&d, "_framework", Value::str(""));
+        }
         dict_set_str(&d, "executable", Value::str(&executable));
         if !argv.is_empty() {
             dict_set_str(&d, "argv", Value::list(argv.iter().map(|a| Value::str(a)).collect()));
