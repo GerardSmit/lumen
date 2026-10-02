@@ -1,0 +1,15 @@
+ValueError map() argument 2 is longer than argument 1
+ValueError map() argument 2 is shorter than argument 1
+ValueError map() argument 3 is shorter than arguments 1-2
+ValueError map() argument 3 is longer than arguments 1-2
+ValueError map() argument 2 is longer than argument 1
+[2, 4]
+[1, 2]
+[2]
+[2]
+[]
+TypeError map() must have at least two arguments.
+TypeError map() must have at least two arguments.
+True
+2
+ValueError map() argument 2 is longer than argument 1

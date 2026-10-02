@@ -139,7 +139,7 @@ fn iter_state(st: &IterState, visit: &mut dyn FnMut(&Obj)) {
                 val(v, visit);
             }
         }
-        IterState::Map { f, its } => {
+        IterState::Map { f, its, .. } => {
             val(f, visit);
             for v in its {
                 val(v, visit);

@@ -195,7 +195,7 @@ fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) 
                         fset = f;
                     }
                     let doc = desc.doc.map(Value::str).unwrap_or(Value::None);
-                    Value::Obj(Object::new(Kind::Property(PropData { fget, fset, fdel: Value::None, doc })))
+                    Value::Obj(Object::new(Kind::Property(PropData { fget, fset, fdel: Value::None, doc, name: Default::default() })))
                 }
                 _ => f,
             };
