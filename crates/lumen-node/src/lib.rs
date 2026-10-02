@@ -356,27 +356,13 @@ fn op_set_near_heap_limit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 
 /// `YYYYMMDD.HHMMSS` in local time, as Node's diagnostic file names carry it.
 fn local_stamp() -> String {
-    #[cfg(unix)]
-    // SAFETY: localtime_r fills the zeroed `tm` it is given from a valid `time_t`.
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        if !libc::localtime_r(&now, &mut tm).is_null() {
-            return format!(
-                "{:04}{:02}{:02}.{:02}{:02}{:02}",
-                tm.tm_year + 1900,
-                tm.tm_mon + 1,
-                tm.tm_mday,
-                tm.tm_hour,
-                tm.tm_min,
-                tm.tm_sec
-            );
-        }
-    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    format!("{}.{:06}", secs / 86_400, secs % 86_400)
+        .map_or(0, |d| d.as_secs() as i64);
+    match lumen_os::time::localtime(secs) {
+        Ok(tm) => format!("{:04}{:02}{:02}.{:02}{:02}{:02}", tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec),
+        Err(_) => format!("{}.{:06}", secs / 86_400, secs % 86_400),
+    }
 }
 
 /// `(flags)` — apply the V8 flags lumen implements from a `v8.setFlagsFromString` string
@@ -637,10 +623,10 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .filter(|home| !home.is_empty())
-        .or_else(|| lumen_os::proc::current_user().dir)
+        .or_else(|| lumen_os::ident::current_user().dir)
         .unwrap_or_default();
     let tmpdir = lumen_os::sysinfo::tmpdir();
-    let cpus = lumen_os::proc::cpu_count();
+    let cpus = lumen_os::sysinfo::cpu_count();
     let [_, _, release, version, _] = lumen_os::proc::uname().unwrap_or_default();
 
     let obj = Value::Obj(ctx.new_object());
@@ -753,13 +739,13 @@ pub fn close_child_pipes(ctx: &mut Ctx) { child::close_child_pipes(ctx); }
 /// username, shell, homedir }`, read fresh on each call.
 fn op_os_sysinfo(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let obj = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&obj, "uptime", Value::Num(lumen_os::proc::uptime()));
-    let _ = ctx.set_member(&obj, "freemem", Value::Num(lumen_os::proc::free_memory()));
-    let load = lumen_os::proc::loadavg();
+    let _ = ctx.set_member(&obj, "uptime", Value::Num(lumen_os::sysinfo::uptime()));
+    let _ = ctx.set_member(&obj, "freemem", Value::Num(lumen_os::sysinfo::free_memory()));
+    let load = lumen_os::sysinfo::loadavg();
     for (key, n) in ["load1", "load5", "load15"].into_iter().zip(load) {
         let _ = ctx.set_member(&obj, key, Value::Num(n));
     }
-    let user = lumen_os::proc::current_user();
+    let user = lumen_os::ident::current_user();
     let _ = ctx.set_member(&obj, "uid", Value::Num(user.uid as f64));
     let _ = ctx.set_member(&obj, "gid", Value::Num(user.gid as f64));
     let _ = ctx.set_member(&obj, "username", Value::from_string(user.name.unwrap_or_default()));

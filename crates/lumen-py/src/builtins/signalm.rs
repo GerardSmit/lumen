@@ -407,7 +407,7 @@ pub mod _signal {
         for (name, v) in [("SIG_DFL", SIG_DFL), ("SIG_IGN", SIG_IGN), ("NSIG", NSIG as i64)] {
             dict_set_str(&d, name, Value::Int(v));
         }
-        for &(name, v) in lumen_os::consts::signals().iter().chain(os::constants()) {
+        for &(name, v) in os::names().iter().chain(os::constants()) {
             dict_set_str(&d, name, Value::Int(v as i64));
         }
         let os_error = it.exc_type("OSError");

@@ -51,18 +51,39 @@ pub fn gid_of(name: &str) -> Option<u32> {
     }
 }
 
-/// The login name of `uid` (`getpwuid`).
-pub fn user_name(uid: u32) -> Option<String> {
+/// A password-database entry. Without one (or off Unix) the ids are still set (-1 off Unix) and
+/// the strings are absent.
+pub struct PasswdEntry {
+    pub uid: i64,
+    pub gid: i64,
+    pub name: Option<String>,
+    pub dir: Option<String>,
+    pub shell: Option<String>,
+}
+
+/// The password-database entry of `uid` (`getpwuid`), `None` without one.
+pub fn passwd(uid: u32) -> Option<PasswdEntry> {
     #[cfg(unix)]
     {
-        // SAFETY: getpwuid returns null or a pointer to static storage valid until the next call;
-        // a non-null pw_name is a NUL-terminated C string.
+        use std::ffi::CStr;
+        let text = |p: *const libc::c_char| {
+            // SAFETY: a non-null passwd string field is a NUL-terminated C string.
+            (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        };
+        // SAFETY: getpwuid returns null or a pointer to static storage valid until the next call.
         unsafe {
             let entry = libc::getpwuid(uid as libc::uid_t);
-            if entry.is_null() || (*entry).pw_name.is_null() {
+            if entry.is_null() {
                 return None;
             }
-            Some(std::ffi::CStr::from_ptr((*entry).pw_name).to_string_lossy().into_owned())
+            let e = &*entry;
+            Some(PasswdEntry {
+                uid: e.pw_uid as i64,
+                gid: e.pw_gid as i64,
+                name: text(e.pw_name),
+                dir: text(e.pw_dir),
+                shell: text(e.pw_shell),
+            })
         }
     }
     #[cfg(not(unix))]
@@ -70,6 +91,26 @@ pub fn user_name(uid: u32) -> Option<String> {
         let _ = uid;
         None
     }
+}
+
+/// The entry of the real user id, keeping the real uid and gid when the database has none.
+pub fn current_user() -> PasswdEntry {
+    #[cfg(unix)]
+    {
+        // SAFETY: no arguments, cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut entry = passwd(uid).unwrap_or(PasswdEntry { uid: 0, gid: 0, name: None, dir: None, shell: None });
+        entry.uid = uid as i64;
+        entry.gid = gid as i64;
+        entry
+    }
+    #[cfg(not(unix))]
+    PasswdEntry { uid: -1, gid: -1, name: None, dir: None, shell: None }
+}
+
+/// The login name of `uid` (`getpwuid`).
+pub fn user_name(uid: u32) -> Option<String> {
+    passwd(uid)?.name
 }
 
 macro_rules! set_id {

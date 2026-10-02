@@ -18,6 +18,15 @@ pub enum SockAddr {
     Other(i32),
 }
 
+impl From<std::net::SocketAddr> for SockAddr {
+    fn from(addr: std::net::SocketAddr) -> SockAddr {
+        match addr {
+            std::net::SocketAddr::V4(a) => SockAddr::V4(a),
+            std::net::SocketAddr::V6(a) => SockAddr::V6(a),
+        }
+    }
+}
+
 /// One `getaddrinfo` result.
 #[derive(Clone, Debug)]
 pub struct AddrInfo {
@@ -220,6 +229,27 @@ mod imp {
         check(unsafe { libc::connect(fd, (&s as *const libc::sockaddr_storage).cast(), len) }).map(drop)
     }
 
+    /// Dissolve a datagram socket's peer (`connect` to an `AF_UNSPEC` address).
+    pub fn disconnect(fd: i32) -> R<()> {
+        // SAFETY: an all-zero sockaddr_storage with family AF_UNSPEC is the documented way to
+        // dissolve a datagram socket's peer.
+        let mut s: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        s.ss_family = libc::AF_UNSPEC as libc::sa_family_t;
+        #[cfg(target_vendor = "apple")]
+        {
+            s.ss_len = std::mem::size_of::<libc::sockaddr>() as u8;
+        }
+        let len = std::mem::size_of::<libc::sockaddr>() as libc::socklen_t;
+        // SAFETY: `s` is a live sockaddr of the length passed.
+        match check(unsafe { libc::connect(fd, (&s as *const libc::sockaddr_storage).cast(), len) }) {
+            Ok(_) => Ok(()),
+            // Darwin reports the dissolved association as EAFNOSUPPORT on some releases while
+            // still having applied it.
+            Err(e) if e.code() == "EAFNOSUPPORT" && getpeername(fd).is_err() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn listen(fd: i32, backlog: i32) -> R<()> {
         // SAFETY: plain syscall.
         check(unsafe { libc::listen(fd, backlog) }).map(drop)
@@ -276,6 +306,72 @@ mod imp {
     pub fn recv(fd: i32, buf: &mut [u8], flags: i32) -> R<usize> {
         // SAFETY: `buf` is a live, writable slice.
         check_size(unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), flags) })
+    }
+
+    /// `recvmsg(2)` of up to `buf.len()` bytes, appending the descriptors that arrive as
+    /// `SCM_RIGHTS` (at most `max_fds`, each made close-on-exec) to `fds`.
+    pub fn recv_fds(fd: i32, buf: &mut [u8], flags: i32, max_fds: usize, fds: &mut Vec<i32>) -> R<usize> {
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+        // SAFETY: CMSG_SPACE is a pure size computation.
+        let space = unsafe { libc::CMSG_SPACE((max_fds * std::mem::size_of::<i32>()) as u32) } as usize;
+        let mut control = vec![0u8; space];
+        // SAFETY: a zeroed msghdr is valid; the pointers set below outlive the call.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let flags = flags | libc::MSG_CMSG_CLOEXEC;
+        // SAFETY: `msg` describes live buffers.
+        let n = check_size(unsafe { libc::recvmsg(fd, &mut msg, flags) })?;
+        // SAFETY: walking the control buffer recvmsg just filled, with the libc CMSG helpers.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(cmsg) as *const i32;
+                    let header = libc::CMSG_LEN(0) as usize;
+                    let count = ((*cmsg).cmsg_len as usize).saturating_sub(header) / std::mem::size_of::<i32>();
+                    for i in 0..count {
+                        let received = std::ptr::read_unaligned(data.add(i));
+                        let _ = crate::fdctl::set_inheritable(received, false);
+                        fds.push(received);
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        Ok(n)
+    }
+
+    /// `sendmsg(2)` of `data`, with `pass` attached as `SCM_RIGHTS`; never raises `SIGPIPE`
+    /// where the platform has `MSG_NOSIGNAL`.
+    pub fn send_fd(fd: i32, data: &[u8], pass: Option<i32>, flags: i32) -> R<usize> {
+        let mut iov = libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: data.len() };
+        // SAFETY: CMSG_SPACE is a pure size computation.
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+        let mut control = vec![0u8; space];
+        // SAFETY: a zeroed msghdr is valid; the pointers set below outlive the call.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if let Some(pass) = pass {
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            // SAFETY: the control buffer has room for one header carrying one descriptor.
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as _;
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut i32, pass);
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let flags = flags | libc::MSG_NOSIGNAL;
+        // SAFETY: `msg` describes live buffers.
+        check_size(unsafe { libc::sendmsg(fd, &msg, flags) })
     }
 
     /// `recvfrom(2)`; the sender is `None` when the kernel reports no address (a connected

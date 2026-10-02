@@ -868,7 +868,7 @@ mod leaks {
                 None => all || !active.contains(&serial),
             };
             if doomed && pid != me && pid > 1 {
-                let _ = lumen_os::proc::kill(pid, lumen_os::consts::signal_number("SIGKILL").unwrap_or(9));
+                let _ = lumen_os::proc::kill(pid, lumen_os::signal::number("SIGKILL").unwrap_or(9));
             }
         }
     }
@@ -902,7 +902,7 @@ mod tree {
     impl Drop for ProcessTree {
         fn drop(&mut self) {
             // The group id is the child's pid (`process_group(0)`); a negative pid targets it.
-            let _ = lumen_os::proc::kill(-self.0, lumen_os::consts::signal_number("SIGKILL").unwrap_or(9));
+            let _ = lumen_os::proc::kill(-self.0, lumen_os::signal::number("SIGKILL").unwrap_or(9));
         }
     }
 

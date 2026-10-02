@@ -537,7 +537,7 @@ impl Platform for StdPlatform {
     }
 
     fn cpu_count(&self) -> usize {
-        lumen_os::proc::cpu_count()
+        lumen_os::sysinfo::cpu_count()
     }
 
     fn localtime(&self, sec: i64) -> PResult<Tm> {
@@ -617,7 +617,7 @@ impl Platform for StdPlatform {
     }
 
     fn getgroups(&mut self) -> PResult<Vec<u32>> {
-        Ok(lumen_os::proc::getgroups()?)
+        Ok(lumen_os::ident::groups()?)
     }
 }
 
