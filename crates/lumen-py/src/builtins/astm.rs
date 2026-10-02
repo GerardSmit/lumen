@@ -23,7 +23,7 @@ pub mod _ast {
     const PY_CF_TYPE_COMMENTS: i64 = 0x1000;
     const PY_CF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
 
-    #[class(name = "AST", module = "ast")]
+    #[class(name = "AST", module = "ast", hint(py(mutable)))]
     pub struct AST;
 
     #[methods]

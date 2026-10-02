@@ -460,7 +460,7 @@ pub mod _operator {
             let mut paths = Vec::new();
             for a in args {
                 let Some(s) = a.as_str() else { return Err(it.type_error("attribute name must be a string")) };
-                paths.push(s.split('.').map(|p| Value::str(p)).collect());
+                paths.push(s.split('.').map(Value::str).collect());
             }
             let Value::Obj(cls) = cls.0 else { unreachable!() };
             Ok(opaque_instance(&cls, AttrGetter { attrs: args.to_vec(), paths }))

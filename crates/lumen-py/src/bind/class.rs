@@ -38,6 +38,13 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     let base = c.hint(HOST, "base").and_then(|path| python_base(it, path));
     let ty = new_type(it, module, c.name_for(HOST), base.as_ref(), Layout::Other);
     it.native_types.insert(TypeId::of::<T>(), ty.clone());
+    // Like CPython's extension types, native classes reject attribute assignment unless they are
+    // declared `mutable` (`ast.AST`, whose node classes are mutable heap types there too).
+    if c.hint(HOST, "mutable").is_none() {
+        if let Kind::Type(td) = &ty.kind {
+            td.flags.set(td.flags.get() | TF_IMMUTABLE);
+        }
+    }
     if c.hint(HOST, "final").is_some() {
         if let Kind::Type(td) = &ty.kind {
             td.flags.set(td.flags.get() | TF_FINAL);
