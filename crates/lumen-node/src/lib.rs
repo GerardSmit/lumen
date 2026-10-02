@@ -49,10 +49,6 @@ use lumen_common::hash;
 mod jsx;
 #[cfg(not(target_arch = "wasm32"))]
 mod napi;
-#[cfg(not(target_arch = "wasm32"))]
-mod fsb;
-#[cfg(target_arch = "wasm32")]
-#[path = "fsb_vfs.rs"]
 mod fsb;
 mod native;
 mod oscon;
@@ -249,10 +245,8 @@ fn arg_path(ctx: &mut Ctx, args: &[Value]) -> Result<String, Value> {
 
 fn op_is_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    return Ok(Value::Bool(lumen_host::vfs::is_file(&p)));
-    #[cfg(not(target_arch = "wasm32"))]
-    Ok(Value::Bool(Path::new(&p).is_file()))
+    use lumen_host::sysfs::PathExt;
+    Ok(Value::Bool(Path::new(&p).fs_is_file()))
 }
 
 /// `(fn, filename)` — name a CommonJS module wrapper's source for stack traces (see
@@ -553,22 +547,14 @@ fn op_compile_commonjs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 fn op_is_dir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    return Ok(Value::Bool(lumen_host::vfs::is_dir(&p)));
-    #[cfg(not(target_arch = "wasm32"))]
-    Ok(Value::Bool(Path::new(&p).is_dir()))
+    Ok(Value::Bool(lumen_host::sysfs::is_dir(&p)))
 }
 
 /// Read a module/JSON source as text; a miss is an error the resolver turns into
 /// MODULE_NOT_FOUND context.
 fn op_read_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    let read = lumen_host::vfs::read_file(&p)
-        .map_err(|e| e.to_io())
-        .and_then(|b| String::from_utf8(b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)));
-    #[cfg(not(target_arch = "wasm32"))]
-    let read = std::fs::read_to_string(&p);
+    let read = lumen_host::sysfs::read_to_string(&p);
     match read {
         Ok(s) => Ok(Value::from_string(crate::codec::canonical(s))),
         Err(e) => Err(ctx.make_error("Error", format!("cannot read '{p}': {e}"))),
@@ -596,10 +582,7 @@ fn op_strip_shebang(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 /// path corrupts binary. Errors carry the errno `code` Node users switch on.
 fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    let read = lumen_host::vfs::read_file(&p).map_err(|e| e.to_io());
-    #[cfg(not(target_arch = "wasm32"))]
-    let read = std::fs::read(&p);
+    let read = lumen_host::sysfs::read(&p);
     match read {
         Ok(bytes) => ctx.make_uint8array(&bytes),
         Err(e) => {
@@ -619,9 +602,6 @@ fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 /// path doesn't exist yet (matching how the JS resolver probes candidates).
 fn op_realpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let p = arg_path(ctx, args)?;
-    #[cfg(target_arch = "wasm32")]
-    let canon = lumen_host::vfs::realpath(&p).map(std::path::PathBuf::from).map_err(|e| e.to_io());
-    #[cfg(not(target_arch = "wasm32"))]
     let canon = lumen_host::canonicalize(&p);
     match canon {
         Ok(c) => Ok(Value::from_string(c.to_string_lossy().into_owned())),

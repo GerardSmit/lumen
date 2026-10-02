@@ -658,7 +658,7 @@ fn async_await_settles_before_loop_exit() {
     assert_eq!(out.lines(), ["before", "after"]);
 }
 
-// ---- fs (the runtime assembles lumen-fs, so its behavior tests live here) ----
+// ---- fs (node:fs as the runtime assembles it) ----
 
 /// A unique temp dir per test, cleaned up on drop.
 struct TempDir(std::path::PathBuf);
@@ -692,12 +692,13 @@ fn fs_sync_and_async_roundtrip() {
         &mut rt,
         &format!(
             r#"
+            const fs = require("node:fs");
             const sync = {sync:?}, asyncPath = {async_:?};
             fs.writeFileSync(sync, "hello sync");
-            console.log("sync:", fs.readFileSync(sync));
+            console.log("sync:", fs.readFileSync(sync, "utf8"));
             (async () => {{
                 await fs.promises.writeFile(asyncPath, "hello async");
-                console.log("async:", await fs.promises.readFile(asyncPath));
+                console.log("async:", await fs.promises.readFile(asyncPath, "utf8"));
             }})();
             "#,
             sync = dir.path("s.txt"),
@@ -715,11 +716,12 @@ fn fs_exists_readdir_unlink_append() {
         &mut rt,
         &format!(
             r#"
+            const fs = require("node:fs");
             const d = {dir:?}, f = {file:?};
             console.log(fs.existsSync(f));
             fs.writeFileSync(f, "a");
             fs.appendFileSync(f, "b");
-            console.log(fs.existsSync(f), fs.readFileSync(f));
+            console.log(fs.existsSync(f), fs.readFileSync(f, "utf8"));
             console.log(fs.readdirSync(d).join(","));
             fs.unlinkSync(f);
             console.log(fs.existsSync(f));
@@ -732,29 +734,32 @@ fn fs_exists_readdir_unlink_append() {
 }
 
 #[test]
-fn fs_handles_via_resource_table() {
+fn fs_descriptors_read_write_and_close() {
     let dir = TempDir::new("handles");
     let (mut rt, out, _err) = test_runtime();
     eval_ok(
         &mut rt,
         &format!(
             r#"
+            const fs = require("node:fs");
             const f = {file:?};
             const w = fs.openSync(f, "w");
             fs.writeSync(w, "line one\n");
             fs.writeSync(w, "line two\n");
             fs.closeSync(w);
             const r = fs.openSync(f, "r");
-            console.log(JSON.stringify(fs.readSync(r)));
+            const buf = Buffer.alloc(64);
+            const n = fs.readSync(r, buf);
+            console.log(JSON.stringify(buf.toString("utf8", 0, n)));
             fs.closeSync(r);
-            try {{ fs.readSync(r) }} catch (e) {{ console.log("stale:", e.constructor.name) }}
+            try {{ fs.readSync(r, buf) }} catch (e) {{ console.log("stale:", e.code) }}
             "#,
             file = dir.path("h.txt"),
         ),
     );
     assert_eq!(
         out.lines(),
-        [r#""line one\nline two\n""#, "stale: TypeError"]
+        [r#""line one\nline two\n""#, "stale: EBADF"]
     );
 }
 
@@ -766,12 +771,13 @@ fn fs_promise_rejection_is_catchable() {
         &mut rt,
         &format!(
             r#"
+            const fs = require("node:fs");
             (async () => {{
                 try {{
                     await fs.promises.readFile({missing:?});
                     console.log("unexpected success");
                 }} catch (e) {{
-                    console.log("caught:", e.message.includes("readFile"), e.message.includes("nope.txt"));
+                    console.log("caught:", e.code === "ENOENT", e.message.includes("nope.txt"));
                 }}
             }})();
             "#,
@@ -788,7 +794,7 @@ fn fs_sync_error_throws_catchable_error() {
     eval_ok(
         &mut rt,
         &format!(
-            "try {{ fs.readFileSync({missing:?}) }} catch (e) {{ console.log('caught', e instanceof Error) }}",
+            "try {{ require('node:fs').readFileSync({missing:?}) }} catch (e) {{ console.log('caught', e instanceof Error) }}",
             missing = dir.path("gone.txt"),
         ),
     );
@@ -1890,7 +1896,7 @@ fn perf_boot_breakdown() {
     println!("Engine::new (realm intrinsics)   {engine_us:8.1} us");
 
     // Per-extension install (state + ops + js_init parse+eval), in the real order.
-    let names = ["timers", "console", "process", "fs", "web", "node"];
+    let names = ["timers", "console", "process", "web", "node"];
     let mut totals = vec![Vec::new(); names.len()];
     for _ in 0..30 {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1902,7 +1908,6 @@ fn perf_boot_breakdown() {
             lumen_timers::extension(),
             console::extension(),
             process::extension(),
-            lumen_fs::extension(),
             lumen_web::extension(),
             lumen_node::extension(),
         ];
@@ -2084,7 +2089,7 @@ fn node_run_main_dirname_and_module() {
 }
 
 #[test]
-fn node_fs_module_over_global_fs() {
+fn node_fs_module_round_trips() {
     use std::fs;
     let dir = TempDir::new("nodefs");
     let target = dir.path("f.txt");

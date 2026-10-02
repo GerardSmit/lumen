@@ -418,10 +418,8 @@ impl Runtime {
                 console::extension(),
                 process::extension(),
                 process_env::extension(),
-                lumen_fs::extension(),
                 lumen_web::extension(),
-                // Last: node's glue wraps the fs global, Buffer uses TextEncoder (web), and
-                // require() calls process.cwd().
+                // Last: Buffer uses TextEncoder (web), and require() calls process.cwd().
                 lumen_node::extension(),
                 clone_transfer::extension(),
                 ports::extension(),

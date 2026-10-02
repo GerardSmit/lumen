@@ -34,10 +34,6 @@ pub mod sysfs;
 /// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;
 
-/// The in-memory virtual file system behind `node:fs` on targets without an OS file system, and
-/// the mount table that lets a path be served by the embedder (OPFS, a remote origin).
-pub mod vfs;
-
 /// Browser-embedding hooks: the suspending synchronous host call (Worker + `Atomics.wait`, or
 /// JSPI) and the completion queue the embedder pushes settled Promises into.
 pub mod browser;
@@ -815,7 +811,9 @@ pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::p
 
 #[cfg(target_arch = "wasm32")]
 pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
-    vfs::realpath(&path.as_ref().to_string_lossy())
+    use lumen_os::vfs::FileSystem;
+    lumen_os::vfs::mem()
+        .realpath(&path.as_ref().to_string_lossy())
         .map(std::path::PathBuf::from)
         .map_err(std::io::Error::from)
 }

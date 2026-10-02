@@ -352,6 +352,27 @@ impl FsError {
     pub fn message(self) -> &'static str {
         message(self.0)
     }
+
+    /// An `io::Error` of the matching kind, for callers on `std::io` results. Built from the
+    /// kind rather than the raw errno, which targets without an OS cannot decode.
+    pub fn to_io(self) -> io::Error {
+        use io::ErrorKind as K;
+        let kind = match self.0 {
+            "ENOENT" => K::NotFound,
+            "EEXIST" => K::AlreadyExists,
+            "EINVAL" => K::InvalidInput,
+            "EACCES" | "EPERM" => K::PermissionDenied,
+            "ENOSYS" => K::Unsupported,
+            _ => K::Other,
+        };
+        io::Error::new(kind, self.message())
+    }
+}
+
+impl From<FsError> for io::Error {
+    fn from(e: FsError) -> io::Error {
+        e.to_io()
+    }
 }
 
 impl From<io::Error> for FsError {

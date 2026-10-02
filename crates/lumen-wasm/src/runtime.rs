@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use lumen_host::browser::{self, Arg, Event};
-use lumen_host::{vfs, CompletionSender, TaskId, TaskRegistry};
+use lumen_host::{CompletionSender, TaskId, TaskRegistry};
+use lumen_os::vfs::{self, FileSystem};
 use lumen_runtime::{Completion, Embedding, LoopStatus, Runtime, SharedWriter};
 use wasm_bindgen::prelude::*;
 
@@ -138,8 +139,8 @@ impl RuntimeSession {
         browser::set_host(host);
         lumen_host::time::install_engine_clock();
         let cwd = get(&options, "cwd").as_string().unwrap_or_else(|| "/".to_string());
-        let _ = vfs::mkdir(&cwd, 0o755, true);
-        let _ = vfs::set_cwd(&cwd);
+        let _ = vfs::mem().mkdir(&cwd, 0o755, true);
+        let _ = vfs::mem().chdir(&cwd);
         let argv: Vec<String> = match get(&options, "argv").dyn_ref::<Array>() {
             Some(list) => list.iter().filter_map(|v| v.as_string()).collect(),
             None => vec!["lumen".to_string()],
@@ -223,21 +224,22 @@ impl RuntimeSession {
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), JsValue> {
         if let Some((dir, _)) = path.rsplit_once('/') {
             if !dir.is_empty() {
-                let _ = vfs::mkdir(dir, 0o755, true);
+                let _ = vfs::mem().mkdir(dir, 0o755, true);
             }
         }
-        vfs::write_file(path, data).map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
+        use lumen_os::fs::flags::{O_CREAT, O_TRUNC, O_WRONLY};
+        vfs::mem().write_file(path, data, O_WRONLY | O_CREAT | O_TRUNC, 0o666).map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
     }
 
     #[wasm_bindgen(js_name = readFile)]
     pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>, JsValue> {
-        vfs::read_file(path).map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
+        vfs::mem().read_file(path, 0).map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
     }
 
     /// Serve the paths under `prefix` through the host's `syncCall("fs.*")` (see [`Remote`]).
     #[wasm_bindgen(js_name = mountRemote)]
     pub fn mount_remote(&mut self, prefix: &str) {
-        vfs::mount(prefix, Arc::new(Remote { prefix: prefix.to_string() }));
+        vfs::mem().mount(prefix, Arc::new(Remote { prefix: prefix.to_string() }));
     }
 }
 

@@ -1,6 +1,6 @@
 //! The few file-system and process queries the runtime layer makes outside `node:fs`: module
 //! loading, config discovery, the working directory. Natively they are `std`; on
-//! `wasm32-unknown-unknown`, where `std::fs` always fails, they read the in-memory [`crate::vfs`].
+//! `wasm32-unknown-unknown`, where `std::fs` always fails, they read the in-memory [`lumen_os::vfs::mem`].
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,8 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 
 #[cfg(target_arch = "wasm32")]
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    crate::vfs::read_file(&path.as_ref().to_string_lossy()).map_err(io::Error::from)
+    use lumen_os::vfs::FileSystem;
+    lumen_os::vfs::mem().read_file(&path.as_ref().to_string_lossy(), 0).map_err(io::Error::from)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,7 +34,8 @@ pub fn current_dir() -> io::Result<PathBuf> {
 
 #[cfg(target_arch = "wasm32")]
 pub fn current_dir() -> io::Result<PathBuf> {
-    Ok(PathBuf::from(crate::vfs::cwd()))
+    use lumen_os::vfs::FileSystem;
+    lumen_os::vfs::mem().cwd().map(PathBuf::from).map_err(io::Error::from)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -43,7 +45,10 @@ pub fn is_dir(path: impl AsRef<Path>) -> bool {
 
 #[cfg(target_arch = "wasm32")]
 pub fn is_dir(path: impl AsRef<Path>) -> bool {
-    crate::vfs::is_dir(&path.as_ref().to_string_lossy())
+    use lumen_os::vfs::FileSystem;
+    lumen_os::vfs::mem()
+        .stat(&path.as_ref().to_string_lossy(), true)
+        .is_ok_and(|s| s.mode & lumen_os::fs::S_IFMT == lumen_os::fs::S_IFDIR)
 }
 
 /// Whether `path` exists and is not itself a symbolic link.
@@ -54,8 +59,10 @@ pub fn exists_not_symlink(path: impl AsRef<Path>) -> bool {
 
 #[cfg(target_arch = "wasm32")]
 pub fn exists_not_symlink(path: impl AsRef<Path>) -> bool {
-    crate::vfs::stat(&path.as_ref().to_string_lossy(), false)
-        .is_ok_and(|s| s.kind != crate::vfs::Kind::Symlink)
+    use lumen_os::vfs::FileSystem;
+    lumen_os::vfs::mem()
+        .stat(&path.as_ref().to_string_lossy(), false)
+        .is_ok_and(|s| s.mode & lumen_os::fs::S_IFMT != lumen_os::fs::S_IFLNK)
 }
 
 /// The OS process id; `std::process::id` panics where there are no processes.
@@ -83,7 +90,10 @@ impl PathExt for Path {
 
     #[cfg(target_arch = "wasm32")]
     fn fs_is_file(&self) -> bool {
-        crate::vfs::is_file(&self.to_string_lossy())
+        use lumen_os::vfs::FileSystem;
+        lumen_os::vfs::mem()
+            .stat(&self.to_string_lossy(), true)
+            .is_ok_and(|s| s.mode & lumen_os::fs::S_IFMT == lumen_os::fs::S_IFREG)
     }
 
     fn fs_is_dir(&self) -> bool {

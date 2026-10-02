@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 lumen-common = { path = "../lumen-common" }
+web-time = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

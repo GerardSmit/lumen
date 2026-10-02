@@ -65,10 +65,9 @@ On top of that:
   `setImmediate`, plus `queueMicrotask`.
 - **`console` and `process`** — streaming `console.*`; `process.argv`/`env`/`platform`/
   `cwd()`/`exit()`/`nextTick()`.
-- **Filesystem** (`lumen-fs`) — synchronous ops (`readFileSync`, `writeFileSync`,
-  `existsSync`, `mkdirSync`, `readdirSync`, …), file handles via a resource table
-  (`openSync`/`readSync`/`writeSync`/`closeSync`), and async `fs.promises.readFile`/
-  `writeFile` on the thread pool.
+- **Filesystem** — `node:fs` (sync, callback and promise APIs, the async forms on the thread
+  pool) over `lumen_os::vfs`, the file-system interface the Python runtime shares: the OS
+  natively, an in-memory tree on wasm.
 - **Web platform** (`lumen-web`) — a growing slice of the WinterTC Minimum Common API:
   `Event`/`EventTarget`/`CustomEvent`/`AbortController`/`AbortSignal`/`DOMException`,
   `TextEncoder`/`TextDecoder` (UTF-8 and WHATWG Windows-1252 labels), `atob`/`btoa`, `structuredClone`, `URL`/`URLSearchParams`,
@@ -220,10 +219,9 @@ On top of that:
 ```
 lumen          engine (std-only, zero-dep; `embed` feature gates the runtime API)
 lumen-common   engine-neutral code shared with lumen-py: bigint, Unicode, byte codecs, civil dates, tz tables; optional `hash` / `compress` features
-lumen-os       engine-neutral OS services: file-system primitives and the errno mapping
+lumen-os       engine-neutral OS services: file-system primitives, the `vfs` backends (OS, in-memory, overlay), errno
 lumen-host     substrate: OpState, ResourceTable, Extension, the thread-pool/callback primitives
 lumen-timers   setTimeout/setInterval/queueMicrotask/setImmediate
-lumen-fs       filesystem (sync + async)
 lumen-web      WinterTC Minimum Common API (Event, URL, crypto, fetch, …)
 lumen-node     node: compatibility (require, node:path/os/fs, Buffer)
 lumen-runtime  the event loop; assembles the op crates; console + process
