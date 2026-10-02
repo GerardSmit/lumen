@@ -1,10 +1,10 @@
 //! X.509 certificate reading shared by every language's TLS layer: a small lenient TLV walk (so
 //! certificates OpenSSL accepts, with odd string types or invalid names inside extensions, still
 //! parse), the text formats of OpenSSL's `X509_NAME_print_ex`, `ASN1_TIME_print` and Node's
-//! `PrintGeneralName`, PEM framing, and [`decode_cert`], the structured form Python's
+//! `PrintGeneralName`, and [`decode_cert`], the structured form Python's
 //! `ssl.getpeercert()` reports. No OS calls, no cryptography.
 
-use crate::codec::{self, Padding};
+use crate::codec;
 use codec::hex_encode_upper as hex_upper;
 
 #[derive(Clone, Copy)]
@@ -633,51 +633,6 @@ pub fn print_time(t: &Tlv) -> Option<String> {
     let gmt = if tail == "Z" { " GMT" } else { "" };
     Some(format!("{name} {day:2} {hour:02}:{minute:02}:{second:02}{frac} {year}{gmt}"))
 }
-
-// ---- PEM ----------------------------------------------------------------------------------------
-
-pub fn pem_encode(label: &str, der: &[u8]) -> String {
-    let b64 = codec::base64_encode(der, false, true);
-    let mut out = format!("-----BEGIN {label}-----\n");
-    for chunk in b64.as_bytes().chunks(64) {
-        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-        out.push('\n');
-    }
-    out.push_str(&format!("-----END {label}-----\n"));
-    out
-}
-
-pub enum PemError {
-    NoStartLine,
-    BadBase64,
-}
-
-/// The body of the first PEM block whose label is one of `labels`.
-pub fn pem_find(input: &[u8], labels: &[&str]) -> Result<Vec<u8>, PemError> {
-    let text = String::from_utf8_lossy(input);
-    let mut pos = 0;
-    while let Some(at) = text[pos..].find("-----BEGIN ") {
-        let start = pos + at + "-----BEGIN ".len();
-        let Some(end_label) = text[start..].find("-----") else { break };
-        let label = &text[start..start + end_label];
-        let body_start = start + end_label + 5;
-        pos = body_start;
-        if !labels.contains(&label) {
-            continue;
-        }
-        let end_marker = format!("-----END {label}-----");
-        let Some(end) = text[body_start..].find(&end_marker) else { return Err(PemError::NoStartLine) };
-        let body = &text[body_start..body_start + end];
-        let lines: String = body
-            .lines()
-            .filter(|l| !l.contains(':'))
-            .flat_map(|l| l.chars().filter(|c| !c.is_whitespace()))
-            .collect();
-        return codec::base64_decode_strict(lines.as_bytes(), false, Padding::Required).map_err(|_| PemError::BadBase64);
-    }
-    Err(PemError::NoStartLine)
-}
-
 
 // ---- decoded certificate ------------------------------------------------------------------------
 

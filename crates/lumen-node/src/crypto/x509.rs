@@ -4,6 +4,7 @@
 
 use lumen_common::codec::{self, Padding};
 use lumen::embed::OpError;
+use lumen_common::pem::{self, PemError};
 use lumen_common::x509::*;
 
 use crate::hash::{self, Algo};
@@ -623,7 +624,7 @@ fn cert_of(der: &[u8]) -> Result<Cert<'_>, OpError> {
 /// certificate.
 #[op(name = "x509Parse")]
 fn x509_parse(input: &[u8]) -> Result<Vec<u8>, OpError> {
-    match pem_find(input, &["CERTIFICATE", "X509 CERTIFICATE", "TRUSTED CERTIFICATE"]) {
+    match pem::find(input, &["CERTIFICATE", "X509 CERTIFICATE", "TRUSTED CERTIFICATE"]) {
         Ok(der) => parse_cert(&der).map(|c| c.raw.to_vec()).ok_or_else(asn1_error),
         Err(PemError::BadBase64) => Err(OpError::error("error:04800064:PEM routines::bad base64 decode")
             .with_code("ERR_OSSL_PEM_BAD_BASE64_DECODE")),
@@ -720,7 +721,7 @@ fn x509_serial_number(der: &[u8]) -> Result<String, OpError> {
 #[op(name = "x509Pem")]
 fn x509_pem(der: &[u8]) -> Result<String, OpError> {
     let c = cert_of(der)?;
-    Ok(pem_encode("CERTIFICATE", c.raw))
+    Ok(pem::encode("CERTIFICATE", &[], c.raw))
 }
 
 /// The SubjectPublicKeyInfo DER; throws like `X509_get_pubkey` when the key cannot be decoded.
@@ -905,7 +906,7 @@ fn cert_export_public_key(input: &[u8]) -> Result<Option<Vec<u8>>, OpError> {
     let Some(der) = spkac_decode(input) else { return Ok(None) };
     let Some(s) = spkac_parse(&der) else { return Ok(None) };
     match parse_spki(s.spki) {
-        Some(spki) if spki_is_valid(&spki) => Ok(Some(pem_encode("PUBLIC KEY", s.spki).into_bytes())),
+        Some(spki) if spki_is_valid(&spki) => Ok(Some(pem::encode("PUBLIC KEY", &[], s.spki).into_bytes())),
         _ => Ok(None),
     }
 }

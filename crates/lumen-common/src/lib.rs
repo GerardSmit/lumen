@@ -32,6 +32,7 @@ pub mod memcat;
 pub mod mt19937;
 pub mod native;
 pub mod pytime;
+pub mod pem;
 pub mod pickle;
 pub mod stack;
 pub mod regex;

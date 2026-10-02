@@ -1853,7 +1853,7 @@ pub mod _ssl {
     #[op]
     fn _test_decode_cert(it: &mut Interp, path: &Value) -> R<Value> {
         let pem = read_file(it, path)?;
-        match x509::pem_find(&pem, x509::CERTIFICATE_LABELS) {
+        match lumen_common::pem::find(&pem, x509::CERTIFICATE_LABELS) {
             Ok(der) => cert_dict(it, &der),
             Err(_) => Err(ssl_error(it, "Error decoding PEM-encoded file")),
         }
