@@ -1,6 +1,6 @@
-//! `_testcapi` thread-state, pending-call, sub-interpreter and cross-interpreter helpers. The
-//! interpreter runs on one thread, so a callback "run in another C thread" runs on this thread
-//! under another thread identifier; sub-interpreters are the real ones of `_xxsubinterpreters`.
+//! `_testcapi` thread-state, pending-call, sub-interpreter and cross-interpreter helpers. A
+//! callback "run in another C thread" runs in a real thread of the interpreter;
+//! sub-interpreters are the real ones of `_xxsubinterpreters`.
 
 #![allow(non_snake_case)]
 
@@ -27,12 +27,22 @@ fn callable_arg(it: &mut Interp, v: &Value, func: &str) -> R<()> {
     }
 }
 
-/// Runs `callback` as the thread `ident`; the identity is restored afterwards.
-fn call_as_thread(it: &mut Interp, callback: &Value, ident: i64) -> R<Value> {
-    let saved = std::mem::replace(&mut it.thread_ident, ident);
-    let r = it.call(callback, Vec::new(), Vec::new());
-    it.thread_ident = saved;
-    r
+#[derive(Default)]
+struct TempThread(Option<Value>);
+
+/// Starts a `threading.Thread` that calls `callback`.
+fn start_in_thread(it: &mut Interp, callback: &Value) -> R<Value> {
+    let threading = Value::Obj(it.import_module("threading")?);
+    let thread_cls = it.get_attr_str(&threading, "Thread")?;
+    let target = it.str_obj("target");
+    let thread = it.call(&thread_cls, Vec::new(), vec![(target, callback.clone())])?;
+    it.call_method(&thread, "start", Vec::new())?;
+    Ok(thread)
+}
+
+fn join_thread(it: &mut Interp, thread: &Value) -> R<()> {
+    it.call_method(thread, "join", Vec::new())?;
+    Ok(())
 }
 
 fn report_thread_error(it: &mut Interp, e: &Obj) {
@@ -103,20 +113,17 @@ pub mod threadsm {
     #[op(hint(py(arg_style = "parse", arg_name = "test_thread_state")))]
     fn _test_thread_state(it: &mut Interp, callback: &Value) -> R<()> {
         callable_arg(it, callback, "test_thread_state")?;
-        let main = it.thread_ident;
         let mut failure: Option<Obj> = None;
-        if let Err(e) = call_as_thread(it, callback, main + 1) {
-            report_thread_error(it, &e);
-        }
+        let thread = start_in_thread(it, callback)?;
+        join_thread(it, &thread)?;
         for _ in 0..2 {
-            if let Err(e) = call_as_thread(it, callback, main) {
+            if let Err(e) = it.call(callback, Vec::new(), Vec::new()) {
                 failure.get_or_insert(e);
             }
         }
-        if let Err(e) = call_as_thread(it, callback, main + 2) {
-            report_thread_error(it, &e);
-        }
-        if let Err(e) = call_as_thread(it, callback, main) {
+        let thread = start_in_thread(it, callback)?;
+        join_thread(it, &thread)?;
+        if let Err(e) = it.call(callback, Vec::new(), Vec::new()) {
             failure.get_or_insert(e);
         }
         match failure {
@@ -148,16 +155,22 @@ pub mod threadsm {
     /// call_in_temporary_c_thread(callback, wait=True): call `callback` from a new C thread.
     #[op(hint(py(arg_style = "parse", arg_name = "call_in_temporary_c_thread")))]
     fn call_in_temporary_c_thread(it: &mut Interp, callback: &Value, wait: Option<i64>) -> R<()> {
-        let _ = wait;
-        let ident = it.thread_ident + 1;
-        if let Err(e) = call_as_thread(it, callback, ident) {
-            report_thread_error(it, &e);
+        let thread = start_in_thread(it, callback)?;
+        if wait.unwrap_or(1) != 0 {
+            join_thread(it, &thread)
+        } else {
+            it.native_state::<TempThread>().0 = Some(thread);
+            Ok(())
         }
-        Ok(())
     }
 
     #[op]
-    fn join_temporary_c_thread() {}
+    fn join_temporary_c_thread(it: &mut Interp) -> R<()> {
+        match it.native_state::<TempThread>().0.take() {
+            Some(thread) => join_thread(it, &thread),
+            None => Ok(()),
+        }
+    }
 
     /// _spawn_pthread_waiter(): start a thread the `threading` module does not know about.
     #[op]

@@ -502,7 +502,7 @@ impl Interp {
         for cb in cbs {
             let args = vec![Value::str(phase), Value::Obj(info.clone())];
             if let Err(e) = self.call(&cb, args, Vec::new()) {
-                self.write_unraisable(e, None, Some(cb));
+                self.write_unraisable(&e, None, Some(&cb));
             }
         }
     }
@@ -632,7 +632,7 @@ impl Interp {
         for wr in calls {
             if let Some(cb) = crate::weak::take_callback(&wr) {
                 if let Err(e) = self.call(&cb, vec![Value::Obj(wr.clone())], Vec::new()) {
-                    self.write_unraisable(e, None, Some(cb));
+                    self.write_unraisable(&e, None, Some(&cb));
                 }
             }
         }
@@ -656,7 +656,7 @@ impl Interp {
             Err(e) => Err(e),
         };
         if let Err(e) = r {
-            self.write_unraisable(e, None, Some(del));
+            self.write_unraisable(&e, None, Some(&del));
         }
     }
 
@@ -668,7 +668,7 @@ impl Interp {
             let name = gd.qualname.borrow().to_string();
             let msg = format!("coroutine '{name}' was never awaited");
             if let Err(e) = crate::builtins::warningsm::warn_category(self, "RuntimeWarning", &msg, 1) {
-                self.write_unraisable(e, None, Some(this));
+                self.write_unraisable(&e, None, Some(&this));
             }
             return;
         }
@@ -676,69 +676,14 @@ impl Interp {
             let finalizer = self.native_state::<crate::builtins::genm::AsyncGenHooks>().finalizer.clone();
             if let Some(f) = finalizer {
                 if let Err(e) = self.call(&f, vec![this.clone()], Vec::new()) {
-                    self.write_unraisable(e, None, Some(f));
+                    self.write_unraisable(&e, None, Some(&f));
                 }
                 return;
             }
         }
         if let Err(e) = self.gen_close(o) {
-            self.write_unraisable(e, None, Some(this));
+            self.write_unraisable(&e, None, Some(&this));
         }
-    }
-
-    /// `PyErr_WriteUnraisable`: reports an exception that cannot propagate through
-    /// `sys.unraisablehook`.
-    pub fn write_unraisable(&mut self, exc: Obj, msg: Option<&str>, obj: Option<Value>) {
-        let sys_dict = self.sys_module.clone().map(|m| self.module_dict(&m));
-        let hook = sys_dict.as_ref().and_then(|d| dict_get_str(d, "unraisablehook"));
-        let default = sys_dict.as_ref().and_then(|d| dict_get_str(d, "__unraisablehook__"));
-        let custom = match (&hook, &default) {
-            (Some(h), Some(d)) if !h.is(d) => Some(h.clone()),
-            (Some(h), None) => Some(h.clone()),
-            _ => None,
-        };
-        let Some(hook) = custom else {
-            self.default_unraisable(&exc, msg, obj.as_ref());
-            return;
-        };
-        let exc_type = Value::Obj(self.type_of_obj(&exc));
-        let args = self.new_namespace(vec![
-            ("exc_type", exc_type),
-            ("exc_value", Value::Obj(exc.clone())),
-            ("exc_traceback", Value::None),
-            ("err_msg", msg.map_or(Value::None, Value::str)),
-            ("object", obj.unwrap_or(Value::None)),
-        ]);
-        if let Err(e) = self.call(&hook, vec![args], Vec::new()) {
-            let repr = self.repr_of(&hook).unwrap_or_default();
-            self.write_stderr(&format!("Exception ignored in sys.unraisablehook: {repr}\n"));
-            let text = self.format_exception(&e);
-            self.write_stderr(&text);
-        }
-    }
-
-    /// The default `sys.unraisablehook`.
-    pub fn default_unraisable(&mut self, exc: &Obj, msg: Option<&str>, obj: Option<&Value>) {
-        let mut head = String::new();
-        match obj.filter(|o| !o.is_none()) {
-            Some(o) => {
-                head.push_str(msg.unwrap_or("Exception ignored in"));
-                head.push_str(": ");
-                match self.repr_of(o) {
-                    Ok(r) => head.push_str(&r),
-                    Err(_) => head.push_str("<object repr() failed>"),
-                }
-                head.push('\n');
-            }
-            None => {
-                if let Some(m) = msg {
-                    head.push_str(m);
-                    head.push_str(":\n");
-                }
-            }
-        }
-        let text = self.format_exception(exc);
-        self.write_stderr(&format!("{head}{text}"));
     }
 
     /// Runs the queued finalizers and weak-reference callbacks of objects that died since the
@@ -753,7 +698,7 @@ impl Interp {
             for r in dead {
                 if let Some(cb) = crate::weak::take_callback(&r) {
                     if let Err(e) = self.call(&cb, vec![Value::Obj(r.clone())], Vec::new()) {
-                        self.write_unraisable(e, None, Some(cb));
+                        self.write_unraisable(&e, None, Some(&cb));
                     }
                 }
             }

@@ -1163,7 +1163,7 @@ pub mod getargsm {
             _ => None,
         };
         let mut slots = vec![Slot { encoding: Some(String::new()), ..Slot::default() }; 8];
-        parse_tuple_and_keywords(it, positional, kwargs.as_ref(), sub_format, &names, &mut slots, true)?;
+        super::parse_tuple_and_keywords(it, positional, kwargs.as_ref(), sub_format, &names, &mut slots, true)?;
         let mut count = 0;
         for c in sub_format.bytes() {
             if c.is_ascii_alphanumeric() {
@@ -1201,7 +1201,7 @@ pub mod getargsm {
         let mut slots = Vec::new();
         parse_tuple(it, &[], "|:test_empty_argparse", &mut slots, true)?;
         let d = it.new_dict();
-        parse_tuple_and_keywords(it, &[], Some(&d), "|:test_empty_argparse", &[], &mut slots, true)
+        super::parse_tuple_and_keywords(it, &[], Some(&d), "|:test_empty_argparse", &[], &mut slots, true)
     }
 
     #[op]

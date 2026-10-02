@@ -269,7 +269,8 @@ pub mod multiprocessing {
         }
         dict_set_str(&d, "flags", Value::Obj(flags));
         let cls = type_object::<SemLock>(it);
-        if let Some(cd) = cls.dict.borrow().as_ref() {
+        let cd = cls.dict.borrow().clone();
+        if let Some(cd) = cd.as_ref() {
             dict_set_str(cd, "SEM_VALUE_MAX", Value::Int(ipc::sem_value_max() as i64));
         }
     }

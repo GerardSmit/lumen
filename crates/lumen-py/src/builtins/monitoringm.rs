@@ -49,7 +49,7 @@ pub mod sys_monitoring {
 
     /// Check an event set for `set_events`: a CALL implies its two ancillary events, which cannot
     /// be selected alone.
-    fn event_set(it: &mut Interp, events: i64, local: bool) -> R<u32> {
+    fn checked_events(it: &mut Interp, events: i64, local: bool) -> R<u32> {
         let limit = if local { 1 << 10 } else { 1 << trace::EVENT_COUNT };
         if events < 0 || events >= limit {
             let what = if local { "invalid local event set" } else { "invalid event set" };
@@ -124,7 +124,7 @@ pub mod sys_monitoring {
     #[op]
     fn set_events(it: &mut Interp, tool_id: i64, event_set: i64) -> R<()> {
         let tool = used_tool(it, tool_id)?;
-        let events = event_set(it, event_set, false)?;
+        let events = checked_events(it, event_set, false)?;
         it.mon.tools[tool].events = events;
         it.mon.refresh();
         Ok(())
@@ -156,7 +156,7 @@ pub mod sys_monitoring {
     fn set_local_events(it: &mut Interp, tool_id: i64, code: &Value, event_set: i64) -> R<()> {
         let tool = used_tool(it, tool_id)?;
         let code = code_of(it, code, "set_local_events")?;
-        let events = event_set(it, event_set, true)?;
+        let events = checked_events(it, event_set, true)?;
         it.mon.local_slot(&code).events[tool] = events;
         it.mon.pin(&code);
         it.mon.refresh();

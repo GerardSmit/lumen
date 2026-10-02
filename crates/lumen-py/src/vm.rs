@@ -195,8 +195,6 @@ pub struct Interp {
     /// `_testinternalcapi.set_eval_frame_record`: the list that receives the name of every
     /// Python function entered.
     pub eval_record: Option<Obj>,
-    /// What `_thread.get_ident()` reports; `_testcapi` runs callbacks as other threads.
-    pub thread_ident: i64,
     pub yielded: Option<Frame>,
     pub no_tb: bool,
     pub repr_stack: Vec<usize>,
@@ -272,7 +270,6 @@ impl Interp {
             recursion_limit: 1000,
             nomemory: None,
             eval_record: None,
-            thread_ident: crate::builtins::threadm::_thread::MAIN_THREAD,
             yielded: None,
             no_tb: false,
             repr_stack: Vec::new(),

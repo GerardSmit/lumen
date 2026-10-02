@@ -28,8 +28,8 @@ pub fn native_id() -> u64 {
     #[cfg(target_vendor = "apple")]
     {
         let mut id = 0u64;
-        // SAFETY: a null thread means the calling thread; `id` is a live out-pointer.
-        unsafe { libc::pthread_threadid_np(std::ptr::null_mut(), &mut id) };
+        // SAFETY: a zero thread means the calling thread; `id` is a live out-pointer.
+        unsafe { libc::pthread_threadid_np(0, &mut id) };
         id
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]

@@ -98,7 +98,7 @@ pub mod _testinternalcapi {
     /// get_recursion_depth() -> int
     #[op]
     fn get_recursion_depth(it: &mut Interp) -> i64 {
-        i64::from(it.depth)
+        it.frames.len() as i64
     }
 
     /// get_c_recursion_remaining() -> int

@@ -340,7 +340,7 @@ pub mod _xxsubinterpreters {
 
         #[proto(ne)]
         fn __ne__(&self, it: &mut Interp, other: &Value) -> R<Value> {
-            self.equals(it, other, crate::ast::CmpOp::Ne)
+            self.equals(it, other, crate::ast::CmpOp::NotEq)
         }
 
         #[getter]

@@ -457,7 +457,7 @@ fn frame_lasti(fr: &Frame) -> i64 {
 
 /// The generator or coroutine whose body is the executing frame `v`, else `None`.
 pub fn frame_generator(it: &Interp, v: &Value) -> Option<Value> {
-    let live = crate::builtins::native::with_opaque::<FrameObj, _>(v, |f| f.live_depth(it))?;
+    let live = crate::builtins::native::with_opaque::<FrameObj, _>(v, |f| f.running_at(it))?;
     let owner = it.frames.get(live?)?.generator.as_ref()?.upgrade()?;
     Some(Value::Obj(owner))
 }

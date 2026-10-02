@@ -2,7 +2,7 @@
 //! `PyBytes_*`, `PyByteArray_*`). `None` stands for a `NULL` pointer. Where the C API reads an
 //! item slot that was never filled (`PyList_New(n)`), the slot holds `None`.
 
-use super::{bad_internal_call, builtin, nonnull};
+use super::{bad_internal_call, builtin, nonnull, system_error};
 use crate::containers::pydict_of;
 use crate::object::*;
 use crate::vm::Interp;
@@ -696,7 +696,7 @@ pub mod containers {
         let data = z_arg(s, it)?;
         let size = size.unwrap_or_else(|| data.as_ref().map_or(0, |d| d.len() as i64));
         if size < 0 {
-            return Err(super::system_error(it, "Negative size passed to PyBytes_FromStringAndSize"));
+            return Err(system_error(it, "Negative size passed to PyBytes_FromStringAndSize"));
         }
         match data {
             Some(mut d) => {
@@ -711,7 +711,7 @@ pub mod containers {
     fn bytes_fromstring(it: &mut Interp, s: &Value) -> R<Value> {
         match z_arg(s, it)? {
             Some(d) => Ok(Value::bytes(d.into_iter().take_while(|b| *b != 0).collect())),
-            None => Err(super::system_error(it, "null argument to internal routine")),
+            None => Err(system_error(it, "null argument to internal routine")),
         }
     }
 
@@ -824,7 +824,7 @@ pub mod containers {
         let data = z_arg(s, it)?;
         let size = size.unwrap_or_else(|| data.as_ref().map_or(0, |d| d.len() as i64));
         if size < 0 {
-            return Err(super::system_error(it, "Negative size passed to PyByteArray_FromStringAndSize"));
+            return Err(system_error(it, "Negative size passed to PyByteArray_FromStringAndSize"));
         }
         let mut d = data.unwrap_or_default();
         d.resize(size as usize, 0);
@@ -868,7 +868,8 @@ pub mod containers {
         let left = nonnull(it, left)?;
         let right = nonnull(it, right)?;
         if !it.is_buffer(left) || !it.is_buffer(right) {
-            let t = it.tp_name_of(if it.is_buffer(left) { right } else { left });
+            let bad = if it.is_buffer(left) { right } else { left };
+            let t = it.tp_name_of(bad);
             return Err(it.type_error(&format!("can't concat {t} to bytearray")));
         }
         let mut l = it.bytes_from_object(left)?;

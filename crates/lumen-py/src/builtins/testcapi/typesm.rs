@@ -689,7 +689,7 @@ pub mod typesm {
     /// A heap type with GC, and with overridden dealloc.
     ///
     /// The 'value' attribute is set to 10 in __init__.
-    pub struct HeapGcCType(Ints);
+    pub struct HeapGcCType(pub(super) Ints);
 
     #[methods]
     impl HeapGcCType {
@@ -718,7 +718,7 @@ pub mod typesm {
     /// A heap type without GC, but with overridden dealloc.
     ///
     /// The 'value' attribute is set to 10 in __init__.
-    pub struct HeapCType(Ints);
+    pub struct HeapCType(pub(super) Ints);
 
     #[methods]
     impl HeapCType {
@@ -747,7 +747,7 @@ pub mod typesm {
     /// Subclass of HeapCType, without GC.
     ///
     /// __init__ sets the 'value' attribute to 10 and 'value2' to 20.
-    pub struct HeapCTypeSubclass(Ints);
+    pub struct HeapCTypeSubclass(pub(super) Ints);
 
     #[methods]
     impl HeapCTypeSubclass {
@@ -781,7 +781,7 @@ pub mod typesm {
     ///
     /// __class__ is set to plain HeapCTypeSubclass during finalization.
     /// __init__ sets the 'value' attribute to 10 and 'value2' to 20.
-    pub struct HeapCTypeSubclassWithFinalizer(Ints);
+    pub struct HeapCTypeSubclassWithFinalizer(pub(super) Ints);
 
     #[methods]
     impl HeapCTypeSubclassWithFinalizer {
@@ -955,7 +955,7 @@ pub mod typesm {
     /// A heap type without GC, but with overridden __setattr__.
     ///
     /// The 'value' attribute is set to 10 in __init__ and updated via attribute setting.
-    pub struct HeapCTypeSetattr(Ints);
+    pub struct HeapCTypeSetattr(pub(super) Ints);
 
     #[methods]
     impl HeapCTypeSetattr {

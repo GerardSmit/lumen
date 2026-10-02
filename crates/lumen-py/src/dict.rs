@@ -132,7 +132,9 @@ impl PyDict {
     /// A table laid out like CPython's set (open addressing with linear probes), so iteration
     /// order matches for hashes that are deterministic (ints, floats, tuples of those).
     pub fn new_set() -> PyDict {
-        PyDict { set_mode: true, ..PyDict::default() }
+        let mut d = PyDict::default();
+        d.set_mode = true;
+        d
     }
 
     fn set_slot_probe(&self, hash: i64, mut visit: impl FnMut(usize) -> bool) {
@@ -286,12 +288,13 @@ impl PyDict {
 
     pub fn set_val(&mut self, idx: usize, val: Value) {
         let mask = self.watch.0.get();
+        let me = self as *const PyDict as usize;
         if let Some(Some(e)) = self.entries.get_mut(idx) {
             if !e.val.is(&val) {
                 self.version.0.set(0);
             }
             if mask != 0 {
-                watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Modified, Some(&e.key), Some(&val));
+                watch::dict_event(mask, me, DictEvent::Modified, Some(&e.key), Some(&val));
             }
             e.val = val;
         }
@@ -523,7 +526,8 @@ impl PyDict {
 
     /// Empties the table and returns its former contents (so they can be released later).
     pub fn take_all(&mut self) -> PyDict {
-        let fresh = PyDict { set_mode: self.set_mode, ..PyDict::default() };
+        let mut fresh = PyDict::default();
+        fresh.set_mode = self.set_mode;
         std::mem::replace(self, fresh)
     }
 

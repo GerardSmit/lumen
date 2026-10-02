@@ -1195,7 +1195,7 @@ pub mod posix {
     /// calling process; close fd.
     #[op]
     fn login_tty(it: &mut Interp, fd: &Value) -> R<()> {
-        let fd = as_file_descriptor(it, fd)?;
+        let fd = super::as_file_descriptor(it, fd)?;
         lumen_os::tty::login_tty(fd).map_err(|e| fs_err(it, e))
     }
 

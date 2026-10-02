@@ -458,7 +458,7 @@ pub mod _xxinterpchannels {
 
         #[proto(ne)]
         fn __ne__(&self, it: &mut Interp, other: &Value) -> R<Value> {
-            self.equals(it, other, CmpOp::Ne)
+            self.equals(it, other, CmpOp::NotEq)
         }
 
         /// 'send', 'recv', or 'both'

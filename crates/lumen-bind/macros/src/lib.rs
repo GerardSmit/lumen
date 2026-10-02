@@ -262,11 +262,15 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
                 "getter" => role = Role::Getter,
                 "setter" => role = Role::Setter,
                 "proto" => {
-                    let p = a.args_ts().to_string();
+                    let args: Vec<TokenTree> = a.args_ts().into_iter().collect();
+                    let p = args.first().map(|t| t.to_string()).unwrap_or_default();
                     if !PROTOCOLS.contains(&p.as_str()) {
                         return Err((a.span, format!("unknown protocol `{p}` (expected one of: {})", PROTOCOLS.join(", "))));
                     }
                     role = Role::Proto(p);
+                    if args.get(1).is_some_and(|t| is_punct(t, ',')) {
+                        opts.extend(parse_opts(args[2..].iter().cloned().collect())?);
+                    }
                     continue;
                 }
                 "method" => {}

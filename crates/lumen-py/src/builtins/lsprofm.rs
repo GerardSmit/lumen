@@ -79,7 +79,7 @@ fn function_key(callable: &Value) -> Option<Key> {
     Some((native.f as usize, native.name.as_ptr() as usize))
 }
 
-struct State {
+pub struct State {
     timer: Value,
     timeunit: f64,
     subcalls: bool,

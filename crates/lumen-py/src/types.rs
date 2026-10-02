@@ -892,7 +892,7 @@ impl Interp {
                     return Ok(Some(Value::dict(pd)));
                 }
                 "__globals__" => return Ok(Some(Value::Obj(f.globals.clone()))),
-                "__code__" => return Ok(Some(Value::Obj(crate::bytecode::Code::object(&f.code)))),
+                "__code__" => return Ok(Some(Value::Obj(crate::bytecode::Code::object(&f.code.borrow())))),
                 "__closure__" => {
                     if f.closure.is_empty() {
                         return Ok(Some(Value::None));

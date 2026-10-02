@@ -860,7 +860,8 @@ pub mod unicodem {
     fn unicode_tailmatch(it: &mut Interp, s: &Value, substr: &Value, start: i64, end: i64, direction: i64) -> R<i64> {
         str_or_type_error(it, substr, "tailmatch arg must be str")?;
         let name = if direction > 0 { "endswith" } else { "startswith" };
-        let r = str_method(it, name, vec![nonnull(it, s)?.clone(), substr.clone(), Value::Int(start), Value::Int(end)])?;
+        let s = nonnull(it, s)?.clone();
+        let r = str_method(it, name, vec![s, substr.clone(), Value::Int(start), Value::Int(end)])?;
         Ok(i64::from(matches!(r, Value::Bool(true))))
     }
 

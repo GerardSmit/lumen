@@ -529,7 +529,6 @@ pub mod _ssl {
             self.alpn = protos.to_vec();
         }
 
-        #[kw_wrap]
         fn _wrap_socket(
             slf: This<Py<Self>>,
             it: &mut Interp,

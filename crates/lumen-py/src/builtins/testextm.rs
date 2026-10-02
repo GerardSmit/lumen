@@ -81,7 +81,7 @@ pub fn demo_optional(it: &mut Interp, args: &[Value]) -> R<Value> {
 pub fn str_subclass(it: &mut Interp, module: &str) -> R<Value> {
     let attrs = it.new_dict();
     dict_set_str(&attrs, "__module__", Value::str(module));
-    let bases = Value::tuple(vec![Value::Obj(it.types.str.clone())]);
+    let bases = Value::tuple(vec![Value::Obj(it.types.str_.clone())]);
     let type_fn = dict_get_str(&it.builtins, "type").unwrap_or(Value::None);
     it.call(&type_fn, vec![Value::str("Str"), bases, Value::Obj(attrs)], Vec::new())
 }

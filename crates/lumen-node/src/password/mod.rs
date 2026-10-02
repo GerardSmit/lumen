@@ -422,6 +422,7 @@ mod tests {
 
     #[test]
     fn bcrypt_prehash_boundary() {
+        let bcrypt_raw = |pw: &[u8], salt: &[u8; 16], cost: u32| lumen_common::crypt::bcrypt_raw(&bcrypt_key(pw), salt, cost);
         let salt = [3u8; 16];
         let long = vec![b'A'; 100];
         assert_eq!(

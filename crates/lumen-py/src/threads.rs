@@ -431,7 +431,7 @@ impl Interp {
     fn run_thread(&mut self, ident: u64, func: Value, args: Vec<Value>, kwargs: Vec<(Obj, Value)>) {
         if let Err(e) = self.call(&func, args, kwargs) {
             if !self.exc_is(&e, "SystemExit") {
-                self.write_unraisable("Exception ignored in thread started by", Some(&func), &e);
+                self.write_unraisable(&e, Some("Exception ignored in thread started by"), Some(&func));
             }
         }
         drop(func);
@@ -482,35 +482,6 @@ impl Interp {
             }
         }
         self.write_stderr(text);
-    }
-
-    /// `PyErr_WriteUnraisable`: reports an exception nobody can handle through
-    /// `sys.unraisablehook` (or on stderr when there is none).
-    pub fn write_unraisable(&mut self, msg: &str, object: Option<&Value>, exc: &Obj) {
-        let hook = self.sys_module.clone().and_then(|m| {
-            let d = self.module_dict(&m);
-            dict_get_str(&d, "unraisablehook")
-        });
-        if let Some(hook) = hook.filter(|h| !h.is_none()) {
-            let ty = Value::Obj(self.type_of_obj(exc));
-            let args = self.new_namespace(vec![
-                ("exc_type", ty),
-                ("exc_value", Value::Obj(exc.clone())),
-                ("exc_traceback", Value::None),
-                ("err_msg", Value::str(msg)),
-                ("object", object.cloned().unwrap_or(Value::None)),
-            ]);
-            if self.call(&hook, vec![args], Vec::new()).is_ok() {
-                return;
-            }
-        }
-        self.flush_out();
-        let head = match object {
-            Some(o) => format!("{msg}: {}\n", self.repr_of(o).unwrap_or_default()),
-            None => format!("{msg}\n"),
-        };
-        let body = self.format_exception(exc);
-        self.print_to_sys_stderr(&format!("{head}{body}"));
     }
 
     /// Waits for the non-daemon threads (`threading._shutdown`) before the interpreter exits.

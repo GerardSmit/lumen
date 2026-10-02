@@ -347,7 +347,7 @@ pub mod sys {
         let msg = get(it, "err_msg")?;
         let obj = get(it, "object")?;
         let Value::Obj(exc) = exc else { return Ok(()) };
-        it.default_unraisable(&exc, msg.as_str(), Some(&obj));
+        it.default_unraisable(&exc, Some(&msg), Some(&obj));
         Ok(())
     }
 

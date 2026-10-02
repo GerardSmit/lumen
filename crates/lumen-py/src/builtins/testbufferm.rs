@@ -1044,7 +1044,8 @@ impl NDArray {
         if let Some(o) = obj {
             it.hash_value(&o)?;
         }
-        let bytes = nd_tobytes(it, &slf.0.borrow(it)?)?;
+        let nd = slf.0.borrow(it)?;
+        let bytes = nd_tobytes(it, &nd)?;
         it.hash_value(&Value::bytes(bytes))
     }
 

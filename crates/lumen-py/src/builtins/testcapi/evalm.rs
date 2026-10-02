@@ -88,6 +88,8 @@ fn new_empty_code(filename: &str, name: &str, first_line: i64) -> Rc<Code> {
         flags: 0,
         cell_args: Vec::new(),
         doc: None,
+        pyobj: Default::default(),
+        info: Default::default(),
     })
 }
 
