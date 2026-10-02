@@ -198,7 +198,7 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
         }
     }
     let cls = it.type_of(x);
-    for name in ["__int__", "__index__", "__trunc__"] {
+    for name in ["__int__", "__index__"] {
         if let Some(m) = it.lookup_mro(&cls, name) {
             let b = it.bind_descr(&m, x, &cls)?;
             let r = it.call(&b, Vec::new(), Vec::new())?;
@@ -676,6 +676,18 @@ impl Float {
         it.call(&cls, vec![Value::Float(f)], Vec::new())
     }
 
+    /// Convert real number to a floating-point number.
+    #[classmethod]
+    fn from_number(cls: This<Value>, it: &mut Interp, number: &Value) -> R<Value> {
+        reject_text_number(it, number)?;
+        let f = it.float_arg(number)?;
+        let Value::Obj(c) = &*cls else { return Ok(Value::Float(f)) };
+        if Rc::ptr_eq(c, &it.types.float) {
+            return Ok(Value::Float(f));
+        }
+        it.call(&cls, vec![Value::Float(f)], Vec::new())
+    }
+
     /// You probably don't want to use this function.
     ///
     ///   typestr
@@ -793,6 +805,23 @@ impl Complex {
     #[method]
     fn conjugate(slf: This<ComplexArg>) -> Value {
         Value::Obj(Object::new(Kind::Complex(slf.0 .0, -slf.0 .1)))
+    }
+
+    /// Convert number to a complex floating-point number.
+    #[classmethod]
+    fn from_number(cls: This<Value>, it: &mut Interp, number: &Value) -> R<Value> {
+        reject_text_number(it, number)?;
+        let exact = match number {
+            Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Complex(..)) => number.clone(),
+            _ => {
+                let (re, im) = it.complex_arg(number)?;
+                Value::Obj(Object::new(Kind::Complex(re, im)))
+            }
+        };
+        match &*cls {
+            Value::Obj(c) if !Rc::ptr_eq(c, &it.types.complex) => it.call(&cls, vec![exact], Vec::new()),
+            _ => Ok(exact),
+        }
     }
 
     /// Convert this value to exact type complex.
@@ -924,6 +953,15 @@ fn num_pow(it: &mut Interp, slf: &Value, other: &Value, m: Option<&Value>, refle
         return Ok(Value::NotImplemented);
     }
     Ok(it.native_binop(BinOp::Pow, a, b)?.unwrap_or(Value::NotImplemented))
+}
+
+fn reject_text_number(it: &mut Interp, v: &Value) -> R<()> {
+    let text = matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Str(_) | Kind::Bytes(_) | Kind::ByteArray(_)));
+    if text {
+        let t = it.type_name_of(v);
+        return Err(it.type_error(&format!("must be real number, not {t}")));
+    }
+    Ok(())
 }
 
 fn float_from_value(it: &mut Interp, x: &Value) -> R<f64> {
