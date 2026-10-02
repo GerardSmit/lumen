@@ -903,10 +903,32 @@ impl TextIOWrapper {
         }
     }
 
+    /// Return the stream position as an opaque number.
+    ///
+    /// The return value of tell() can be given as input to seek(), to restore a
+    /// previous stream position.
     fn tell(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         tell(it, &slf.0)
     }
 
+    /// Set the stream position, and return the new stream position.
+    ///
+    ///   cookie
+    ///     Zero or an opaque number returned by tell().
+    ///   whence
+    ///     The relative position to seek from.
+    ///
+    /// Four operations are supported, given by the following argument
+    /// combinations:
+    ///
+    /// - seek(0, SEEK_SET): Rewind to the start of the stream.
+    /// - seek(cookie, SEEK_SET): Restore a previous position;
+    ///   'cookie' must be a number returned by tell().
+    /// - seek(0, SEEK_END): Fast-forward to the end of the stream.
+    /// - seek(0, SEEK_CUR): Leave the current stream position unchanged.
+    ///
+    /// Any other argument combinations are invalid,
+    /// and may raise exceptions.
     fn seek(slf: This<Py<Self>>, it: &mut Interp, cookie: &Value, #[default(0)] whence: i32) -> R<Value> {
         seek(it, &slf.0, cookie, whence)
     }

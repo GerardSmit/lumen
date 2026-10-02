@@ -361,6 +361,9 @@ impl Interp {
 
     /// Comparison implemented by the builtin types; `None` means NotImplemented.
     pub fn native_compare(&mut self, op: CmpOp, a: &Value, b: &Value) -> R<Option<bool>> {
+        if lumen_common::stack::exhausted() {
+            return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded in comparison"));
+        }
         if op == CmpOp::Eq || op == CmpOp::NotEq {
             let cx = |v: &Value| match v {
                 Value::Obj(o) => match &o.kind {
@@ -1370,11 +1373,7 @@ impl Interp {
     }
 
     fn is_builtin_generic(&self, t: &Obj) -> bool {
-        !self.is_heap(t)
-            && matches!(
-                self.type_name(t).as_str(),
-                "list" | "dict" | "set" | "frozenset" | "tuple" | "type" | "str" | "int" | "float" | "bytes"
-            )
+        Rc::ptr_eq(t, &self.types.type_)
     }
 
     pub fn is_slice(&self, v: &Value) -> bool {

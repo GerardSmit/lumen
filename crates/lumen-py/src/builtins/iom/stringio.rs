@@ -323,6 +323,7 @@ impl StringIO {
         Ok((line.as_str() != Some("")).then_some(line))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __getstate__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let (value, readnl, pos) = st(it, &slf.0, |s| (text_of(&s.buf), s.readnl.clone(), s.pos))?;
         let Value::Obj(o) = slf.0.value() else { unreachable!() };
@@ -335,6 +336,7 @@ impl StringIO {
         Ok(Value::tuple(vec![Value::string(value), nl, Value::Int(pos as i64), d]))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __setstate__(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
         let items = match state.tuple_items() {
             Some(t) if t.len() >= 4 => t.to_vec(),

@@ -205,16 +205,19 @@ impl BytesIO {
         Ok(size)
     }
 
+    /// Returns True if the IO object can be read.
     fn readable(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         st(it, &slf.0, |_| ())?;
         Ok(true)
     }
 
+    /// Returns True if the IO object can be written.
     fn writable(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         st(it, &slf.0, |_| ())?;
         Ok(true)
     }
 
+    /// Returns True if the IO object can be seeked.
     fn seekable(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         st(it, &slf.0, |_| ())?;
         Ok(true)
@@ -259,6 +262,7 @@ impl BytesIO {
         Ok((!l.is_empty()).then(|| Value::bytes(l)))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __getstate__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let (buf, pos) = st(it, &slf.0, |s| (s.buf.to_vec(), s.pos))?;
         let Value::Obj(o) = slf.0.value() else { unreachable!() };
@@ -266,6 +270,7 @@ impl BytesIO {
         Ok(Value::tuple(vec![Value::bytes(buf), Value::Int(pos as i64), d]))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __setstate__(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
         let items = match state.tuple_items() {
             Some(t) if t.len() >= 3 => t.to_vec(),

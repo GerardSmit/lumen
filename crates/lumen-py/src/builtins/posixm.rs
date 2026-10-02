@@ -373,11 +373,13 @@ pub mod posix {
 
     #[methods]
     impl DirEntry {
+        /// the entry's base filename, relative to scandir() "path" argument
         #[getter]
         fn name(&self) -> Value {
             self.name.clone()
         }
 
+        /// the entry's full path name; equivalent to os.path.join(scandir_path, entry.name)
         #[getter]
         fn path(&self) -> Value {
             self.path.clone()

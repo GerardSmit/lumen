@@ -73,6 +73,7 @@ pub mod _functools {
             Ok(Py::new(it, KeyWrapper { cmp, obj: Some(obj.clone()) }).value().clone())
         }
 
+        /// Value wrapped by a key function.
         #[getter]
         fn obj(&self, it: &mut Interp) -> R<Value> {
             self.obj.clone().ok_or_else(|| it.new_exc_str("AttributeError", "obj"))
@@ -231,7 +232,7 @@ pub mod _functools {
             r
         }
 
-        #[proto(reduce)]
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let (func, args, keywords) = partial_parts(it, &slf.0)?;
             let me = slf.0.value().clone();
@@ -244,6 +245,7 @@ pub mod _functools {
             Ok(Value::tuple(vec![cls, Value::tuple(vec![func.clone()]), Value::tuple(vec![func, args, kw, dict])]))
         }
 
+        #[method(hint(py(text_signature = "")))]
         fn __setstate__(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
             let items = match state.tuple_items() {
                 Some(t) if t.len() == 4 => t.to_vec(),
@@ -284,7 +286,8 @@ pub mod _functools {
             Ok(())
         }
 
-        #[classmethod]
+        /// See PEP 585
+        #[classmethod(hint(py(text_signature = "")))]
         fn __class_getitem__(cls: This<Value>, it: &mut Interp, item: &Value) -> R<Value> {
             let types = Value::Obj(it.import_module("types")?);
             let alias = it.get_attr_str(&types, "GenericAlias")?;
@@ -455,17 +458,17 @@ pub mod _functools {
             Ok(Value::Obj(Object::new(Kind::Method(me, obj.clone()))))
         }
 
-        #[proto(reduce)]
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             it.get_attr_str(slf.0.value(), "__qualname__")
         }
 
-        #[proto(copy)]
+        #[proto(copy, hint(py(text_signature = "")))]
         fn __copy__(slf: This<Py<Self>>) -> Value {
             slf.0.value().clone()
         }
 
-        #[proto(deepcopy)]
+        #[proto(deepcopy, hint(py(text_signature = "")))]
         fn __deepcopy__(slf: This<Py<Self>>, _memo: &Value) -> Value {
             slf.0.value().clone()
         }

@@ -105,6 +105,10 @@ impl Interp {
             (t.function.clone(), obj.clone()),
             (t.method.clone(), obj.clone()),
             (t.builtin_function.clone(), obj.clone()),
+            (t.method_descriptor.clone(), obj.clone()),
+            (t.wrapper_descriptor.clone(), obj.clone()),
+            (t.classmethod_descriptor.clone(), obj.clone()),
+            (t.method_wrapper.clone(), obj.clone()),
             (t.module.clone(), obj.clone()),
             (t.cell.clone(), obj.clone()),
             (t.code.clone(), obj.clone()),
@@ -170,6 +174,36 @@ impl Interp {
             let mro = self.compute_mro(ty, &bases).unwrap_or_else(|| vec![ty.clone()]);
             *td.mro.borrow_mut() = mro;
         }
+    }
+
+    /// `type.__bases__ = ...`: the new bases, and the MROs of the class and of every subclass
+    /// rebuilt from them.
+    pub fn reassign_bases(&mut self, ty: &Obj, bases: Vec<Obj>) {
+        self.set_bases(ty, bases);
+        let affected: Vec<Obj> = self
+            .subclass_registry
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .filter(|t| !Rc::ptr_eq(t, ty) && self.is_subtype(t, ty))
+            .collect();
+        for _ in 0..=affected.len() {
+            let mut changed = false;
+            for t in &affected {
+                let Kind::Type(td) = &t.kind else { continue };
+                let bases = td.bases.borrow().clone();
+                if let Some(mro) = self.compute_mro(t, &bases) {
+                    let same = mro.len() == td.mro.borrow().len() && mro.iter().zip(td.mro.borrow().iter()).all(|(a, b)| Rc::ptr_eq(a, b));
+                    if !same {
+                        *td.mro.borrow_mut() = mro;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.type_epoch += 1;
     }
 
     pub fn compute_mro(&self, ty: &Obj, bases: &[Obj]) -> Option<Vec<Obj>> {
@@ -307,9 +341,15 @@ impl Interp {
             Kind::ByteArray(_) => t.bytearray.clone(),
             Kind::Type(_) => t.type_.clone(),
             Kind::Function(_) => t.function.clone(),
+            Kind::Method(Value::Obj(f), _) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some_and(crate::bind::args::is_slot_wrapper)) => {
+                t.method_wrapper.clone()
+            }
             Kind::Method(Value::Obj(f), _) if matches!(f.kind, Kind::Native(_)) => t.builtin_function.clone(),
             Kind::Method(..) => t.method.clone(),
+            Kind::Native(n) if n.method && n.desc.is_some_and(crate::bind::args::is_slot_wrapper) => t.wrapper_descriptor.clone(),
+            Kind::Native(n) if n.method => t.method_descriptor.clone(),
             Kind::Native(_) => t.builtin_function.clone(),
+            Kind::ClassMethod(Value::Obj(f)) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some()) => t.classmethod_descriptor.clone(),
             Kind::Module => t.module.clone(),
             Kind::Cell(_) => t.cell.clone(),
             Kind::Code(_) => t.code.clone(),
@@ -889,7 +929,7 @@ impl Interp {
                 // Other attributes not defined by the method type come from the function.
                 _ => {
                     let mt = self.type_of_obj(o);
-                    if !nm.starts_with("__") && self.lookup_mro(&mt, nm).is_none() {
+                    if nm != "__class__" && self.lookup_mro(&mt, nm).is_none() {
                         let f = f.clone();
                         return self.get_attr_str(&f, nm).map(Some);
                     }
@@ -1015,6 +1055,14 @@ impl Interp {
                 if nm == "__isabstractmethod__" {
                     let f = f.clone();
                     return Ok(Some(Value::Bool(self.is_abstract_value(&f)?)));
+                }
+                if matches!(nm, "__module__" | "__name__" | "__qualname__" | "__annotations__" | "__doc__") {
+                    let f = f.clone();
+                    match self.get_attr_str(&f, nm) {
+                        Ok(v) => return Ok(Some(v)),
+                        Err(e) if self.exc_is(&e, "AttributeError") => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             Kind::Complex(re, im) => match nm {
@@ -1279,6 +1327,10 @@ impl Interp {
                         let msg = format!("'{}' object has no attribute '{}'", self.tp_name(cls), nm);
                         return Err(self.new_exc_str("AttributeError", &msg));
                     }
+                    let dd = self.instance_dict(o);
+                    dict_set_name(&dd, name, v);
+                    Ok(())
+                } else if matches!(o.kind, Kind::ClassMethod(_) | Kind::StaticMethod(_)) {
                     let dd = self.instance_dict(o);
                     dict_set_name(&dd, name, v);
                     Ok(())

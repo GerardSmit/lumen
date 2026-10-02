@@ -344,6 +344,7 @@ impl Interp {
     }
 }
 
+/// Unicode encoding error.
 #[lumen_bind::class(name = "UnicodeEncodeError")]
 pub struct UnicodeEncodeError;
 
@@ -361,6 +362,7 @@ impl UnicodeEncodeError {
     }
 }
 
+/// Unicode decoding error.
 #[lumen_bind::class(name = "UnicodeDecodeError")]
 pub struct UnicodeDecodeError;
 
@@ -378,6 +380,7 @@ impl UnicodeDecodeError {
     }
 }
 
+/// Unicode translation error.
 #[lumen_bind::class(name = "UnicodeTranslateError")]
 pub struct UnicodeTranslateError;
 

@@ -480,16 +480,19 @@ impl FileIO {
         r.map(|_| ())
     }
 
+    /// True if the file is closed
     #[getter]
     fn closed(&self) -> bool {
         self.fd < 0
     }
 
+    /// True if the file descriptor will be closed by close().
     #[getter]
     fn closefd(&self) -> bool {
         self.closefd
     }
 
+    /// String giving the file mode
     #[getter]
     fn mode(&self) -> &'static str {
         self.mode_string()

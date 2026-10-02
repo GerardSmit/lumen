@@ -214,12 +214,7 @@ impl ObjectType {
     /// Helper for pickle.
     #[method(name = "__getstate__")]
     fn getstate(slf: This<&Value>, it: &mut Interp) -> R<Value> {
-        let Value::Obj(o) = &*slf else { return Ok(Value::None) };
-        let d = match o.dict.borrow().as_ref() {
-            Some(d) if matches!(&d.kind, Kind::Dict(p) if !p.borrow().is_empty()) => d.clone(),
-            _ => return Ok(Value::None),
-        };
-        it.call_method(&Value::Obj(d), "copy", Vec::new())
+        default_getstate(it, &slf, false)
     }
 
     /// This method is called when a class is subclassed.
@@ -256,6 +251,102 @@ impl ObjectType {
     }
 }
 
+/// `object.__getstate__`: the instance dict, plus a dict of the slot values when the class has slots.
+fn default_getstate(it: &mut Interp, obj: &Value, required: bool) -> R<Value> {
+    let cls = it.type_of(obj);
+    if required && matches!(it.type_layout(&cls), Layout::Other) {
+        let t = it.tp_name(&cls);
+        return Err(it.type_error(&format!("cannot pickle '{t}' object")));
+    }
+    let mut state = match obj {
+        Value::Obj(o) => match o.dict.borrow().as_ref() {
+            Some(d) if matches!(&d.kind, Kind::Dict(p) if !p.borrow().is_empty()) => Value::Obj(d.clone()),
+            _ => Value::None,
+        },
+        _ => Value::None,
+    };
+    let copyreg = it.import_module("copyreg")?;
+    let cached = cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__slotnames__"));
+    let slotnames = match cached {
+        Some(v) => v,
+        None => {
+            let f = it.get_attr_str(&Value::Obj(copyreg), "_slotnames")?;
+            it.call(&f, vec![Value::Obj(cls.clone())], Vec::new())?
+        }
+    };
+    let names = match &slotnames {
+        Value::None => Vec::new(),
+        Value::Obj(o) if matches!(o.kind, Kind::List(_)) => it.iterate_to_vec(&slotnames)?,
+        _ => {
+            let t = it.tp_name_of(&slotnames);
+            return Err(it.type_error(&format!("copyreg._slotnames didn't return a list or None but {t}")));
+        }
+    };
+    if !names.is_empty() {
+        let slots = Object::new(Kind::Dict(std::cell::RefCell::new(crate::dict::PyDict::new())));
+        let mut any = false;
+        for n in names {
+            let Some(name) = n.as_str().map(str::to_string) else { continue };
+            match it.get_attr_str(obj, &name) {
+                Ok(v) => {
+                    it.dict_set(&slots, n, v)?;
+                    any = true;
+                }
+                Err(e) if it.exc_is(&e, "AttributeError") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if any {
+            state = Value::tuple(vec![state, Value::Obj(slots)]);
+        }
+    }
+    Ok(state)
+}
+
+/// `object_getstate`: a user `__getstate__` is called, `object.__getstate__` runs the default.
+fn object_getstate(it: &mut Interp, obj: &Value, cls: &Obj, required: bool) -> R<Value> {
+    match it.lookup_mro_with_owner(cls, "__getstate__") {
+        Some((owner, _)) if Rc::ptr_eq(&owner, &it.types.object) => default_getstate(it, obj, required),
+        _ => it.call_method(obj, "__getstate__", Vec::new()),
+    }
+}
+
+/// `_PyObject_GetNewArguments`: `(args, kwargs)` from `__getnewargs_ex__`, else `__getnewargs__`.
+fn new_arguments(it: &mut Interp, obj: &Value, cls: &Obj) -> R<(Option<Vec<Value>>, Option<Value>)> {
+    if let Some(m) = it.lookup_mro(cls, "__getnewargs_ex__") {
+        let b = it.bind_descr(&m, obj, cls)?;
+        let r = it.call(&b, Vec::new(), Vec::new())?;
+        let Some(items) = r.tuple_items() else {
+            let t = it.tp_name_of(&r);
+            return Err(it.type_error(&format!("__getnewargs_ex__ should return a tuple, not '{t}'")));
+        };
+        if items.len() != 2 {
+            let n = items.len();
+            return Err(it.type_error(&format!("__getnewargs_ex__ should return a tuple of length 2, not {n}")));
+        }
+        let (args, kwargs) = (items[0].clone(), items[1].clone());
+        let Some(a) = args.tuple_items() else {
+            let t = it.tp_name_of(&args);
+            return Err(it.type_error(&format!("first item of the tuple returned by __getnewargs_ex__ must be a tuple, not '{t}'")));
+        };
+        if !matches!(&kwargs, Value::Obj(o) if matches!(o.kind, Kind::Dict(_))) {
+            let t = it.tp_name_of(&kwargs);
+            return Err(it.type_error(&format!("second item of the tuple returned by __getnewargs_ex__ must be a dict, not '{t}'")));
+        }
+        return Ok((Some(a.to_vec()), Some(kwargs)));
+    }
+    if let Some(m) = it.lookup_mro(cls, "__getnewargs__") {
+        let b = it.bind_descr(&m, obj, cls)?;
+        let r = it.call(&b, Vec::new(), Vec::new())?;
+        let Some(items) = r.tuple_items() else {
+            let t = it.tp_name_of(&r);
+            return Err(it.type_error(&format!("__getnewargs__ should return a tuple, not '{t}'")));
+        };
+        return Ok((Some(items.to_vec()), None));
+    }
+    Ok((None, None))
+}
+
 /// `_common_reduce`: `copyreg._reduce_ex` below protocol 2, `reduce_newobj` from it on.
 fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value> {
     if matches!(obj, Value::Obj(o) if matches!(o.kind, Kind::Type(_) | Kind::Function(_) | Kind::Native(_) | Kind::Method(..) | Kind::Module)) || !matches!(obj, Value::Obj(_)) {
@@ -268,15 +359,12 @@ fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value
         return it.call(&f, vec![obj.clone(), Value::Int(proto)], Vec::new());
     }
     let cls = cls.clone();
-    let mut args = vec![Value::Obj(cls.clone())];
-    if let Some(m) = it.lookup_mro(&cls, "__getnewargs__") {
-        let b = it.bind_descr(&m, obj, &cls)?;
-        let extra = it.call(&b, Vec::new(), Vec::new())?;
-        args.extend(it.iterate_to_vec(&extra)?);
-    }
-    let state = it.call_method(obj, "__getstate__", Vec::new())?;
+    let (args, kwargs) = new_arguments(it, obj, &cls)?;
+    let mut hasargs = args.is_some();
+    let mut args = args.unwrap_or_default();
     let layout = it.type_layout(&cls);
     if matches!(layout, Layout::Set | Layout::FrozenSet) {
+        let state = object_getstate(it, obj, &cls, false)?;
         let items = it.iterate_to_vec(obj)?;
         return Ok(Value::tuple(vec![Value::Obj(cls), Value::tuple(vec![Value::list(items)]), state]));
     }
@@ -288,13 +376,26 @@ fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value
         Layout::Bytes => Some(it.types.bytes.clone()),
         _ => None,
     };
-    if let (Some(base), 1) = (base, args.len()) {
+    if let (Some(base), false) = (base, hasargs) {
         args.push(it.call(&Value::Obj(base), vec![obj.clone()], Vec::new())?);
+        hasargs = true;
     }
-    let copyreg = it.import_module("copyreg")?;
-    let newobj = it.get_attr_str(&Value::Obj(copyreg), "__newobj__")?;
+    let copyreg = Value::Obj(it.import_module("copyreg")?);
+    let kwargs = kwargs.filter(|k| matches!(k, Value::Obj(o) if matches!(&o.kind, Kind::Dict(p) if !p.borrow().is_empty())));
+    let (newobj, newargs) = match kwargs {
+        None => {
+            let mut v = vec![Value::Obj(cls.clone())];
+            v.extend(args);
+            (it.get_attr_str(&copyreg, "__newobj__")?, v)
+        }
+        Some(k) => (
+            it.get_attr_str(&copyreg, "__newobj_ex__")?,
+            vec![Value::Obj(cls.clone()), Value::tuple(args), k],
+        ),
+    };
     let is_list = it.isinstance_value(obj, &Value::Obj(it.types.list.clone()))?;
     let is_dict = it.isinstance_value(obj, &Value::Obj(it.types.dict.clone()))?;
+    let state = object_getstate(it, obj, &cls, !(hasargs || is_list || is_dict))?;
     let listitems = if is_list { it.get_iter(obj)? } else { Value::None };
     let dictitems = if is_dict {
         let items = it.call_method(obj, "items", Vec::new())?;
@@ -302,7 +403,7 @@ fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value
     } else {
         Value::None
     };
-    Ok(Value::tuple(vec![newobj, Value::tuple(args), state, listitems, dictitems]))
+    Ok(Value::tuple(vec![newobj, Value::tuple(newargs), state, listitems, dictitems]))
 }
 
 impl Interp {
@@ -365,9 +466,24 @@ fn type_getset(it: &mut Interp, cls: &Obj, name: &str) -> R<Value> {
     match (name, own) {
         ("__module__", Some(v)) => Ok(v),
         ("__doc__", Some(v)) => it.bind_descr_cls(&v, cls),
+        ("__module__", None) if it.is_heap(cls) => Err(it.new_exc_str("AttributeError", "__module__")),
         ("__module__", None) => Ok(Value::str("builtins")),
         ("__doc__", None) if is_type => Ok(<Type as lumen_bind::Class>::DESC.doc.map_or(Value::None, Value::str)),
         ("__doc__", None) => Ok(Value::None),
+        ("__abstractmethods__", Some(v)) => Ok(v),
+        ("__abstractmethods__", None) => Err(it.new_exc_str("AttributeError", "__abstractmethods__")),
+        ("__type_params__", Some(v)) => Ok(v),
+        ("__type_params__", None) => Ok(Value::tuple(Vec::new())),
+        ("__annotations__", _) if !it.is_heap(cls) => {
+            let msg = format!("type object '{}' has no attribute '__annotations__'", it.tp_name(cls));
+            Err(it.new_exc_str("AttributeError", &msg))
+        }
+        ("__annotations__", Some(v)) => it.bind_descr_cls(&v, cls),
+        ("__annotations__", None) => {
+            let v = Value::Obj(it.new_dict());
+            type_getset_store(it, cls, "__annotations__", &v)?;
+            Ok(v)
+        }
         _ => match it.type_special_attr(cls, name) {
             Some(v) => Ok(v),
             None => Err(it.new_exc_str("AttributeError", &format!("type object '{}' has no attribute '{name}'", it.type_name(cls)))),
@@ -378,6 +494,73 @@ fn type_getset(it: &mut Interp, cls: &Obj, name: &str) -> R<Value> {
 fn type_getset_store(it: &mut Interp, cls: &Obj, name: &str, v: &Value) -> R<()> {
     let Value::Obj(n) = Value::str(name) else { unreachable!("a str") };
     it.type_store_attr(cls, &n, v.clone())
+}
+
+/// `check_set_special_type_attr`: the slots of `type` cannot be written on an immutable type.
+fn check_special_set(it: &mut Interp, cls: &Obj, name: &str) -> R<()> {
+    let Kind::Type(td) = &cls.kind else { return Ok(()) };
+    if td.flags.get() & TF_IMMUTABLE != 0 {
+        let msg = format!("cannot set '{}' attribute of immutable type '{}'", name, it.tp_name(cls));
+        return Err(it.type_error(&msg));
+    }
+    Ok(())
+}
+
+/// The deleter of the `type` slots that cannot be deleted: always a `TypeError` (CPython's
+/// setters receive a NULL value).
+fn del_special(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
+    let tp = match a.first() {
+        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => it.tp_name(c),
+        _ => String::new(),
+    };
+    Err(it.type_error(&format!("cannot delete '{}' attribute of immutable type '{}'", name, tp)))
+}
+
+macro_rules! type_deleter {
+    ($($f:ident => $name:literal),* $(,)?) => {
+        $(fn $f(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+            del_special(it, a, $name)
+        })*
+    };
+}
+
+type_deleter! {
+    del_name => "__name__",
+    del_qualname => "__qualname__",
+    del_bases => "__bases__",
+    del_module => "__module__",
+    del_doc => "__doc__",
+    del_type_params => "__type_params__",
+}
+
+/// Deleting a dict-backed slot of `type` (`__annotations__`, `__abstractmethods__`): the entry
+/// goes, an absent one is an `AttributeError`.
+fn del_dict_slot(it: &mut Interp, a: &[Value], name: &'static str) -> R<Value> {
+    let Some(Value::Obj(c)) = a.first() else { return Err(it.type_error("descriptor requires a 'type' object")) };
+    let Kind::Type(td) = &c.kind else { return Err(it.type_error("descriptor requires a 'type' object")) };
+    if name == "__annotations__" {
+        check_special_set(it, c, name)?;
+    }
+    let removed = match c.dict.borrow().as_ref() {
+        Some(d) => dict_del_str(d, name),
+        None => None,
+    };
+    if removed.is_none() {
+        return Err(it.new_exc_str("AttributeError", name));
+    }
+    if name == "__abstractmethods__" {
+        td.flags.set(td.flags.get() & !TF_ABSTRACT);
+    }
+    it.type_epoch += 1;
+    Ok(Value::None)
+}
+
+fn del_annotations(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    del_dict_slot(it, a, "__annotations__")
+}
+
+fn del_abstractmethods(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    del_dict_slot(it, a, "__abstractmethods__")
 }
 
 /// CPython's `tp_flags` bits that Python code tests (`copyreg`, `inspect`, `abc`).
@@ -529,7 +712,16 @@ impl Type {
 
     #[setter(name = "__name__")]
     fn set_name(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__name__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__name__")?;
+        let Some(s) = value.as_str() else {
+            let msg = format!("can only assign string to {}.__name__, not '{}'", it.tp_name(cls), it.tp_name_of(value));
+            return Err(it.type_error(&msg));
+        };
+        if s.contains('\0') {
+            return Err(it.value_error("type name must not contain null characters"));
+        }
+        type_getset_store(it, cls, "__name__", value)
     }
 
     #[getter(name = "__qualname__")]
@@ -539,7 +731,9 @@ impl Type {
 
     #[setter(name = "__qualname__")]
     fn set_qualname(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__qualname__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__qualname__")?;
+        type_getset_store(it, cls, "__qualname__", value)
     }
 
     #[getter(name = "__bases__")]
@@ -549,7 +743,37 @@ impl Type {
 
     #[setter(name = "__bases__")]
     fn set_bases(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__bases__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__bases__")?;
+        let name = it.tp_name(cls);
+        let Some(items) = value.tuple_items() else {
+            let msg = format!("can only assign tuple to {}.__bases__, not {}", name, it.tp_name_of(value));
+            return Err(it.type_error(&msg));
+        };
+        if items.is_empty() {
+            let msg = format!("can only assign non-empty tuple to {}.__bases__, not ()", name);
+            return Err(it.type_error(&msg));
+        }
+        let mut bases = Vec::with_capacity(items.len());
+        for b in items {
+            match b {
+                Value::Obj(o) if matches!(o.kind, Kind::Type(_)) => {
+                    if it.is_subtype(o, cls) {
+                        return Err(it.type_error("a __bases__ item causes an inheritance cycle"));
+                    }
+                    bases.push(o.clone());
+                }
+                _ => {
+                    let msg = format!("{}.__bases__ must be tuple of classes, not '{}'", name, it.tp_name_of(b));
+                    return Err(it.type_error(&msg));
+                }
+            }
+        }
+        if it.compute_mro(cls, &bases).is_none() {
+            return Err(it.type_error("Cannot create a consistent method resolution order (MRO) for bases"));
+        }
+        it.reassign_bases(cls, bases);
+        Ok(())
     }
 
     #[getter(name = "__base__")]
@@ -569,7 +793,9 @@ impl Type {
 
     #[setter(name = "__module__")]
     fn set_module(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__module__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__module__")?;
+        type_getset_store(it, cls, "__module__", value)
     }
 
     #[getter(name = "__doc__")]
@@ -579,7 +805,46 @@ impl Type {
 
     #[setter(name = "__doc__")]
     fn set_doc(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__doc__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__doc__")?;
+        type_getset_store(it, cls, "__doc__", value)
+    }
+
+    #[getter(name = "__abstractmethods__")]
+    fn get_abstractmethods(slf: This<TypeRef<'_>>, it: &mut Interp) -> R<Value> {
+        type_getset(it, slf.0 .0, "__abstractmethods__")
+    }
+
+    #[setter(name = "__abstractmethods__")]
+    fn set_abstractmethods(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
+        type_getset_store(it, slf.0 .0, "__abstractmethods__", value)
+    }
+
+    #[getter(name = "__annotations__")]
+    fn get_annotations(slf: This<TypeRef<'_>>, it: &mut Interp) -> R<Value> {
+        type_getset(it, slf.0 .0, "__annotations__")
+    }
+
+    #[setter(name = "__annotations__")]
+    fn set_annotations(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__annotations__")?;
+        type_getset_store(it, cls, "__annotations__", value)
+    }
+
+    #[getter(name = "__type_params__")]
+    fn get_type_params(slf: This<TypeRef<'_>>, it: &mut Interp) -> R<Value> {
+        type_getset(it, slf.0 .0, "__type_params__")
+    }
+
+    #[setter(name = "__type_params__")]
+    fn set_type_params(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__type_params__")?;
+        if value.tuple_items().is_none() {
+            return Err(it.type_error("__type_params__ must be set to a tuple"));
+        }
+        type_getset_store(it, cls, "__type_params__", value)
     }
 
     #[getter(name = "__dict__")]
@@ -610,8 +875,12 @@ impl DescrMethods {
     /// Return an attribute of instance, which is of type owner.
     #[method(name = "__get__", hint(py(text_signature = "($self, instance, owner=None, /)")))]
     fn get(slf: This<&Value>, it: &mut Interp, instance: &Value, owner: Option<&Value>) -> R<Value> {
-        let _ = owner;
         if instance.is_none() {
+            if let (Value::Obj(o), Some(Value::Obj(owner))) = (&*slf, owner) {
+                if matches!(o.kind, Kind::ClassMethod(_)) && matches!(owner.kind, Kind::Type(_)) {
+                    return it.bind_descr_cls(&slf, owner);
+                }
+            }
             return Ok(slf.clone());
         }
         if let Value::Obj(o) = &*slf {
@@ -1050,6 +1319,49 @@ impl NoneType {
     }
 }
 
+#[lumen_bind::class(name = "ellipsis")]
+pub struct EllipsisType;
+
+#[lumen_bind::methods]
+impl EllipsisType {
+    #[constructor]
+    fn new(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        if !kwargs.is_empty() {
+            return Err(it.type_error("ellipsis() takes no keyword arguments"));
+        }
+        if !args.is_empty() {
+            return Err(it.type_error(&format!("ellipsis expected 0 arguments, got {}", args.len())));
+        }
+        Ok(Value::Ellipsis)
+    }
+
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<&Value>) -> String {
+        let _ = slf;
+        "Ellipsis".to_string()
+    }
+}
+
+#[lumen_bind::class(name = "NotImplementedType")]
+pub struct NotImplementedType;
+
+#[lumen_bind::methods]
+impl NotImplementedType {
+    #[constructor]
+    fn new(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        if !args.is_empty() || !kwargs.is_empty() {
+            return Err(it.type_error("NotImplementedType takes no arguments"));
+        }
+        Ok(Value::NotImplemented)
+    }
+
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<&Value>) -> String {
+        let _ = slf;
+        "NotImplemented".to_string()
+    }
+}
+
 pub fn init(it: &mut Interp) {
     let t = &it.types;
     let (object, type_, property, staticmethod, classmethod, super_, none_type, function) = (
@@ -1076,14 +1388,36 @@ pub fn init(it: &mut Interp) {
     extend_type_documented::<ClassMethod>(it, &classmethod);
     extend_type_documented::<Super>(it, &super_);
     extend_type::<NoneType>(it, &none_type);
+    let (ellipsis, not_implemented) = (it.types.ellipsis_type.clone(), it.types.notimpl_type.clone());
+    extend_type::<EllipsisType>(it, &ellipsis);
+    extend_type::<NotImplementedType>(it, &not_implemented);
 }
 
 /// Installs the getset and member descriptors of `type` and `super` (once the descriptor types
 /// exist).
 pub fn install_getset_descriptors(it: &mut Interp) {
     let (type_, super_) = (it.types.type_.clone(), it.types.super_.clone());
-    super::descr::install_getsets::<Type>(it, &type_, &["__base__"]);
+    super::descr::install_getsets::<Type>(it, &type_, &["__base__", "__mro__", "__flags__"]);
+    super::descr::install_deleters(
+        it,
+        &type_,
+        &[
+            ("__name__", del_name),
+            ("__qualname__", del_qualname),
+            ("__bases__", del_bases),
+            ("__module__", del_module),
+            ("__doc__", del_doc),
+            ("__type_params__", del_type_params),
+            ("__annotations__", del_annotations),
+            ("__abstractmethods__", del_abstractmethods),
+        ],
+    );
     super::descr::install_getsets::<Super>(it, &super_, &["__thisclass__", "__self__", "__self_class__"]);
+}
+
+/// Installs `__get__` into a native method descriptor type.
+pub fn install_descr_methods_get(ty: &Obj) {
+    install_into::<DescrMethods>(ty, &["__get__"]);
 }
 
 /// Installs the descriptor methods into the getset / member descriptor type `ty`.

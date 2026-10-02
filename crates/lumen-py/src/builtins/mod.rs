@@ -52,6 +52,7 @@ pub mod marshalm;
 pub mod cmathm;
 pub mod mathm;
 pub mod operatorm;
+pub mod picklem;
 pub mod memview;
 pub mod modules;
 pub mod native;

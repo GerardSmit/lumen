@@ -35,6 +35,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_opcode", bound::<super::opcodem::_opcode::Module>),
     ("_operator", bound::<super::operatorm::_operator::Module>),
     ("_posixshmem", bound::<super::multiprocessingm::posixshmem::Module>),
+    ("_pickle", bound::<super::picklem::_pickle::Module>),
     ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
     ("_random", bound::<super::randomm::_random::Module>),
     ("_scproxy", bound::<super::scproxym::_scproxy::Module>),

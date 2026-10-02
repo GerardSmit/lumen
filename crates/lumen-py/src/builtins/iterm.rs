@@ -34,6 +34,14 @@ fn new_iter(it: &Interp, cls: &Value, base: &Obj, st: IterState) -> Value {
     }
 }
 
+/// range(stop) -> range object
+/// range(start, stop[, step]) -> range object
+///
+/// Return an object that produces a sequence of integers from start (inclusive)
+/// to stop (exclusive) by step.  range(i, j) produces i, i+1, i+2, ..., j-1.
+/// start defaults to 0, and stop is omitted!  range(4) produces 0, 1, 2, 3.
+/// These are exactly the valid indices for a list of 4 elements.
+/// When step is given, it specifies the increment (or decrement).
 #[lumen_bind::class(name = "range")]
 pub struct Range;
 
@@ -136,6 +144,10 @@ impl Range {
     }
 }
 
+/// slice(stop)
+/// slice(start, stop[, step])
+///
+/// Create a slice object.  This is used for extended slicing (e.g. a[0:10:2]).
 #[lumen_bind::class(name = "slice")]
 pub struct Slice;
 
@@ -188,12 +200,22 @@ fn start_stop_step_reduce(it: &mut Interp, v: &Value) -> R<Value> {
     Ok(Value::tuple(vec![Value::Obj(t), Value::tuple(parts)]))
 }
 
+/// Return an enumerate object.
+///
+///   iterable
+///     an object supporting iteration
+///
+/// The enumerate object yields pairs containing a count (from start, which
+/// defaults to zero) and a value yielded by the iterable argument.
+///
+/// enumerate is useful for obtaining an indexed list:
+///     (0, seq[0]), (1, seq[1]), (2, seq[2]), ...
 #[lumen_bind::class(name = "enumerate")]
 pub struct Enumerate;
 
 #[lumen_bind::methods]
 impl Enumerate {
-    #[constructor(hint(py(text_signature = "")))]
+    #[constructor(hint(py(text_signature = "(iterable, start=0)")))]
     fn new(cls: This<Value>, it: &mut Interp, #[kw] iterable: &Value, #[kw] start: Passed<&Value>) -> R<Value> {
         let src = it.get_iter(iterable)?;
         let idx = match start.0 {
@@ -211,6 +233,18 @@ impl Enumerate {
     }
 }
 
+/// zip(*iterables, strict=False) --> Yield tuples until an input is exhausted.
+///
+///    >>> list(zip('abcdefg', range(3), range(4)))
+///    [('a', 0, 0), ('b', 1, 1), ('c', 2, 2)]
+///
+/// The zip object yields n-length tuples, where n is the number of iterables
+/// passed as positional arguments to zip().  The i-th element in every tuple
+/// comes from the i-th iterable argument to zip().  This continues until the
+/// shortest argument is exhausted.
+///
+/// If strict is true and one of the arguments is exhausted before the others,
+/// raise a ValueError.
 #[lumen_bind::class(name = "zip")]
 pub struct Zip;
 
@@ -241,6 +275,10 @@ impl Zip {
     }
 }
 
+/// map(func, *iterables) --> map object
+///
+/// Make an iterator that computes the function using arguments from
+/// each of the iterables.  Stops when the shortest iterable is exhausted.
 #[lumen_bind::class(name = "map")]
 pub struct Map;
 
@@ -260,6 +298,10 @@ impl Map {
     }
 }
 
+/// filter(function or None, iterable) --> filter object
+///
+/// Return an iterator yielding those items of iterable for which function(item)
+/// is true. If function is None, return the items that are true.
 #[lumen_bind::class(name = "filter")]
 pub struct Filter;
 
@@ -273,12 +315,13 @@ impl Filter {
     }
 }
 
+/// Return a reverse iterator over the values of the given sequence.
 #[lumen_bind::class(name = "reversed")]
 pub struct Reversed;
 
 #[lumen_bind::methods]
 impl Reversed {
-    #[constructor(hint(py(text_signature = "")))]
+    #[constructor(hint(py(text_signature = "(sequence, /)")))]
     fn new(cls: This<Value>, it: &mut Interp, sequence: &Value) -> R<Value> {
         let seq = sequence;
         let base = it.types.reversed.clone();

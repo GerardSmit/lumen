@@ -315,6 +315,9 @@ pub fn set_structseq_hidden(v: &Value, hidden: Vec<Value>) {
 
 // ---- SimpleNamespace ----------------------------------------------------------------------------
 
+/// A simple attribute-based namespace.
+///
+/// SimpleNamespace(**kwargs)
 #[lumen_bind::class(name = "SimpleNamespace", module = "types")]
 pub struct SimpleNamespace;
 
@@ -770,6 +773,7 @@ impl<'a> FromArg<'a, PyHost> for CodeRef {
     }
 }
 
+/// Create a code object.  Not for the faint of heart.
 #[lumen_bind::class(name = "code")]
 pub struct CodeType;
 

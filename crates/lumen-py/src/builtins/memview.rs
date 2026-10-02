@@ -98,7 +98,10 @@ pub fn export_flags(it: &mut Interp, v: &Value, flags: i64) -> R<Option<Exported
                         let view = ViewDesc::bytes(0, store.len(), readonly);
                         Ok(Some(Exported { src: Source::Store(e), view, obj: v.clone(), fmt: "B".into() }))
                     }
-                    None => export_dunder(it, v, flags),
+                    None => match super::picklem::buffer_inner(it, v)? {
+                        Some(inner) => export(it, &inner),
+                        None => export_dunder(it, v, flags),
+                    },
                 },
             },
         },
@@ -262,6 +265,7 @@ fn pack_item(it: &mut Interp, fmt: &str, kind: ElemKind, v: &Value, out: &mut [u
 /// CPython's `PyBUF_MAX_NDIM`.
 const MAX_NDIM: usize = 64;
 
+/// Create a new memoryview object which references the given object.
 #[lumen_bind::class(name = "memoryview", module = "builtins")]
 pub struct MemoryView {
     obj: Value,
@@ -426,7 +430,7 @@ pub fn slice_parts(it: &mut Interp, s: &Value) -> R<(Option<isize>, Option<isize
 
 #[lumen_bind::methods]
 impl MemoryView {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(object)")))]
     fn new(it: &mut Interp, #[kw] object: &Value) -> R<MemoryView> {
         MemoryView::of(it, object)
     }
@@ -609,6 +613,7 @@ impl MemoryView {
         Err(it.type_error("cannot pickle 'memoryview' object"))
     }
 
+    /// Return the data in the buffer as a list of elements.
     #[method(hint(py(text_signature = "($self, /)")))]
     fn tolist(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
@@ -625,6 +630,13 @@ impl MemoryView {
         Ok(nest(&self.view.shape, &mut flat.into_iter()))
     }
 
+    /// Return the data in the buffer as a byte string.
+    ///
+    /// Order can be {'C', 'F', 'A'}. When order is 'C' or 'F', the data of the
+    /// original array is converted to C or Fortran order. For contiguous views,
+    /// 'A' returns an exact copy of the physical memory. In particular, in-memory
+    /// Fortran order is preserved. For non-contiguous views, the data is converted
+    /// to C first. order=None is the same as order='C'.
     #[method(hint(py(text_signature = "($self, /, order='C')")))]
     fn tobytes(&self, it: &mut Interp, #[kw] order: Option<&Value>) -> R<Value> {
         if let Some(o) = order.filter(|o| !o.is_none()) {
@@ -636,6 +648,24 @@ impl MemoryView {
         Ok(Value::bytes(self.bytes(it)?))
     }
 
+    /// Return the data in the buffer as a str of hexadecimal numbers.
+    ///
+    ///   sep
+    ///     An optional single character or byte to separate hex bytes.
+    ///   bytes_per_sep
+    ///     How many bytes between separators.  Positive values count from the
+    ///     right, negative values count from the left.
+    ///
+    /// Example:
+    /// >>> value = memoryview(b'\xb9\x01\xef')
+    /// >>> value.hex()
+    /// 'b901ef'
+    /// >>> value.hex(':')
+    /// 'b9:01:ef'
+    /// >>> value.hex(':', 2)
+    /// 'b9:01ef'
+    /// >>> value.hex(':', -2)
+    /// 'b901:ef'
     #[method(hint(py(text_signature = "($self, /, sep=<unrepresentable>, bytes_per_sep=1)")))]
     fn hex(&self, it: &mut Interp, #[kw] sep: Option<&Value>, #[kw] bytes_per_sep: Option<&Value>) -> R<String> {
         let data = self.bytes(it)?;
@@ -647,11 +677,13 @@ impl MemoryView {
         Ok(lumen_common::codec::hex_encode_sep(&data, sep, per))
     }
 
+    /// Release the underlying buffer exposed by the memoryview object.
     #[method(hint(py(text_signature = "($self, /)")))]
     fn release(&mut self) {
         self.src = None;
     }
 
+    /// Return a readonly version of the memoryview.
     #[method(hint(py(text_signature = "($self, /)")))]
     fn toreadonly(&self, it: &mut Interp) -> R<Value> {
         let mut v = self.view.clone();
@@ -660,6 +692,7 @@ impl MemoryView {
         self.derive(it, v, fmt)
     }
 
+    /// Cast a memoryview to a new format or shape.
     #[method(hint(py(text_signature = "($self, /, format, shape=<unrepresentable>)")))]
     fn cast(&self, it: &mut Interp, #[kw] format: &Value, #[kw] shape: Option<&Value>) -> R<Value> {
         self.src(it)?;
@@ -729,72 +762,89 @@ impl MemoryView {
         self.derive(it, v, fmt.as_str().into())
     }
 
+    /// The amount of space in bytes that the array would use in
+    ///  a contiguous representation.
     #[getter]
     fn nbytes(&self, it: &mut Interp) -> R<usize> {
         self.src(it)?;
         Ok(self.view.nbytes())
     }
 
+    /// A bool indicating whether the memory is read only.
     #[getter]
     fn readonly(&self, it: &mut Interp) -> R<bool> {
         self.src(it)?;
         Ok(self.view.readonly)
     }
 
+    /// The size in bytes of each element of the memoryview.
     #[getter]
     fn itemsize(&self, it: &mut Interp) -> R<usize> {
         self.src(it)?;
         Ok(self.view.itemsize)
     }
 
+    /// A string containing the format (in struct module style)
+    ///  for each element in the view.
     #[getter]
     fn format(&self, it: &mut Interp) -> R<String> {
         self.src(it)?;
         Ok(self.fmt.to_string())
     }
 
+    /// An integer indicating how many dimensions of a multi-dimensional
+    ///  array the memory represents.
     #[getter]
     fn ndim(&self, it: &mut Interp) -> R<usize> {
         self.src(it)?;
         Ok(self.view.ndim())
     }
 
+    /// A tuple of ndim integers giving the shape of the memory
+    ///  as an N-dimensional array.
     #[getter]
     fn shape(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
         Ok(Value::tuple(self.view.shape.iter().map(|n| Value::Int(*n as i64)).collect()))
     }
 
+    /// A tuple of ndim integers giving the size in bytes to access
+    ///  each element for each dimension of the array.
     #[getter]
     fn strides(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
         Ok(Value::tuple(self.view.strides.iter().map(|n| Value::Int(*n as i64)).collect()))
     }
 
+    /// A tuple of integers used internally for PIL-style arrays.
     #[getter]
     fn suboffsets(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
         Ok(Value::tuple(Vec::new()))
     }
 
+    /// The underlying object of the memoryview.
     #[getter]
     fn obj(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
         Ok(self.obj.clone())
     }
 
+    /// A bool indicating whether the memory is C contiguous.
     #[getter]
     fn c_contiguous(&self, it: &mut Interp) -> R<bool> {
         self.src(it)?;
         Ok(self.view.is_c_contiguous())
     }
 
+    /// A bool indicating whether the memory is Fortran contiguous.
     #[getter]
     fn f_contiguous(&self, it: &mut Interp) -> R<bool> {
         self.src(it)?;
         Ok(self.view.is_f_contiguous())
     }
 
+    /// A bool indicating whether the memory is contiguous.
     #[getter]
     fn contiguous(&self, it: &mut Interp) -> R<bool> {
         self.src(it)?;
@@ -836,10 +886,14 @@ pub fn contiguous_part(it: &mut Interp, v: &Value) -> R<Option<Part>> {
             Some((_, store)) => Some(store),
             None => super::mmapm::mmap::buffer_of(it, v)?.map(|(store, _)| store),
         };
-        return Ok(store.map(|store| {
+        if let Some(store) = store {
             let n = store.len();
-            Part::Store(store, 0..n)
-        }));
+            return Ok(Some(Part::Store(store, 0..n)));
+        }
+        return match super::picklem::buffer_inner(it, v)? {
+            Some(inner) => contiguous_part(it, &inner),
+            None => Ok(None),
+        };
     };
     let m = p.borrow(it)?;
     let src = m.src(it)?;
@@ -878,11 +932,13 @@ pub fn is_memoryview(it: &Interp, v: &Value) -> bool {
     crate::bind::is_instance::<MemoryView>(it, v)
 }
 
-/// Whether `v` is a native object exporting a buffer (`memoryview`, `array.array`, `mmap.mmap`).
+/// Whether `v` is a native object exporting a buffer (`memoryview`, `array.array`, `mmap.mmap`,
+/// `pickle.PickleBuffer`).
 pub fn is_buffer_object(it: &Interp, v: &Value) -> bool {
     is_memoryview(it, v)
         || crate::bind::is_instance::<super::arraym::array::Array>(it, v)
         || crate::bind::is_instance::<super::mmapm::mmap::Mmap>(it, v)
+        || super::picklem::is_pickle_buffer(it, v)
 }
 
 /// Installs `memoryview` in `builtins`.
