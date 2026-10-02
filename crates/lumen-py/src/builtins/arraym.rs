@@ -507,11 +507,13 @@ pub mod array {
             Ok(opaque_instance(&cls, arr))
         }
 
+        /// the typecode character used to create the array
         #[getter]
         fn typecode(&self) -> String {
             (self.spec.tc as char).to_string()
         }
 
+        /// the size, in bytes, of one array item
         #[getter]
         fn itemsize(&self) -> usize {
             self.spec.size
@@ -987,6 +989,7 @@ pub mod array {
         }
     }
 
+    /// Internal. Used for pickling support.
     #[op]
     fn _array_reconstructor(it: &mut Interp, arraytype: &Value, typecode: &Value, mformat_code: i64, items: &Value) -> R<Value> {
         let Value::Obj(cls) = arraytype else {

@@ -27,6 +27,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_json", bound::<super::jsonm::_json::Module>),
     ("_md5", bound::<super::hashlibm::_md5::Module>),
     ("_operator", bound::<super::operatorm::_operator::Module>),
+    ("_pickle", bound::<super::picklem::_pickle::Module>),
     ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
     ("_random", bound::<super::randomm::_random::Module>),
     ("_scproxy", bound::<super::scproxym::_scproxy::Module>),

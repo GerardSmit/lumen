@@ -466,9 +466,24 @@ fn type_getset(it: &mut Interp, cls: &Obj, name: &str) -> R<Value> {
     match (name, own) {
         ("__module__", Some(v)) => Ok(v),
         ("__doc__", Some(v)) => it.bind_descr_cls(&v, cls),
+        ("__module__", None) if it.is_heap(cls) => Err(it.new_exc_str("AttributeError", "__module__")),
         ("__module__", None) => Ok(Value::str("builtins")),
         ("__doc__", None) if is_type => Ok(<Type as lumen_bind::Class>::DESC.doc.map_or(Value::None, Value::str)),
         ("__doc__", None) => Ok(Value::None),
+        ("__abstractmethods__", Some(v)) => Ok(v),
+        ("__abstractmethods__", None) => Err(it.new_exc_str("AttributeError", "__abstractmethods__")),
+        ("__type_params__", Some(v)) => Ok(v),
+        ("__type_params__", None) => Ok(Value::tuple(Vec::new())),
+        ("__annotations__", _) if !it.is_heap(cls) => {
+            let msg = format!("type object '{}' has no attribute '__annotations__'", it.tp_name(cls));
+            Err(it.new_exc_str("AttributeError", &msg))
+        }
+        ("__annotations__", Some(v)) => it.bind_descr_cls(&v, cls),
+        ("__annotations__", None) => {
+            let v = Value::Obj(it.new_dict());
+            type_getset_store(it, cls, "__annotations__", &v)?;
+            Ok(v)
+        }
         _ => match it.type_special_attr(cls, name) {
             Some(v) => Ok(v),
             None => Err(it.new_exc_str("AttributeError", &format!("type object '{}' has no attribute '{name}'", it.type_name(cls)))),
@@ -479,6 +494,73 @@ fn type_getset(it: &mut Interp, cls: &Obj, name: &str) -> R<Value> {
 fn type_getset_store(it: &mut Interp, cls: &Obj, name: &str, v: &Value) -> R<()> {
     let Value::Obj(n) = Value::str(name) else { unreachable!("a str") };
     it.type_store_attr(cls, &n, v.clone())
+}
+
+/// `check_set_special_type_attr`: the slots of `type` cannot be written on an immutable type.
+fn check_special_set(it: &mut Interp, cls: &Obj, name: &str) -> R<()> {
+    let Kind::Type(td) = &cls.kind else { return Ok(()) };
+    if td.flags.get() & TF_IMMUTABLE != 0 {
+        let msg = format!("cannot set '{}' attribute of immutable type '{}'", name, it.tp_name(cls));
+        return Err(it.type_error(&msg));
+    }
+    Ok(())
+}
+
+/// The deleter of the `type` slots that cannot be deleted: always a `TypeError` (CPython's
+/// setters receive a NULL value).
+fn del_special(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
+    let tp = match a.first() {
+        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => it.tp_name(c),
+        _ => String::new(),
+    };
+    Err(it.type_error(&format!("cannot delete '{}' attribute of immutable type '{}'", name, tp)))
+}
+
+macro_rules! type_deleter {
+    ($($f:ident => $name:literal),* $(,)?) => {
+        $(fn $f(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+            del_special(it, a, $name)
+        })*
+    };
+}
+
+type_deleter! {
+    del_name => "__name__",
+    del_qualname => "__qualname__",
+    del_bases => "__bases__",
+    del_module => "__module__",
+    del_doc => "__doc__",
+    del_type_params => "__type_params__",
+}
+
+/// Deleting a dict-backed slot of `type` (`__annotations__`, `__abstractmethods__`): the entry
+/// goes, an absent one is an `AttributeError`.
+fn del_dict_slot(it: &mut Interp, a: &[Value], name: &'static str) -> R<Value> {
+    let Some(Value::Obj(c)) = a.first() else { return Err(it.type_error("descriptor requires a 'type' object")) };
+    let Kind::Type(td) = &c.kind else { return Err(it.type_error("descriptor requires a 'type' object")) };
+    if name == "__annotations__" {
+        check_special_set(it, c, name)?;
+    }
+    let removed = match c.dict.borrow().as_ref() {
+        Some(d) => dict_del_str(d, name),
+        None => None,
+    };
+    if removed.is_none() {
+        return Err(it.new_exc_str("AttributeError", name));
+    }
+    if name == "__abstractmethods__" {
+        td.flags.set(td.flags.get() & !TF_ABSTRACT);
+    }
+    it.type_epoch += 1;
+    Ok(Value::None)
+}
+
+fn del_annotations(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    del_dict_slot(it, a, "__annotations__")
+}
+
+fn del_abstractmethods(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    del_dict_slot(it, a, "__abstractmethods__")
 }
 
 /// CPython's `tp_flags` bits that Python code tests (`copyreg`, `inspect`, `abc`).
@@ -614,7 +696,16 @@ impl Type {
 
     #[setter(name = "__name__")]
     fn set_name(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__name__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__name__")?;
+        let Some(s) = value.as_str() else {
+            let msg = format!("can only assign string to {}.__name__, not '{}'", it.tp_name(cls), it.tp_name_of(value));
+            return Err(it.type_error(&msg));
+        };
+        if s.contains('\0') {
+            return Err(it.value_error("type name must not contain null characters"));
+        }
+        type_getset_store(it, cls, "__name__", value)
     }
 
     #[getter(name = "__qualname__")]
@@ -624,7 +715,9 @@ impl Type {
 
     #[setter(name = "__qualname__")]
     fn set_qualname(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__qualname__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__qualname__")?;
+        type_getset_store(it, cls, "__qualname__", value)
     }
 
     #[getter(name = "__bases__")]
@@ -634,7 +727,37 @@ impl Type {
 
     #[setter(name = "__bases__")]
     fn set_bases(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__bases__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__bases__")?;
+        let name = it.tp_name(cls);
+        let Some(items) = value.tuple_items() else {
+            let msg = format!("can only assign tuple to {}.__bases__, not {}", name, it.tp_name_of(value));
+            return Err(it.type_error(&msg));
+        };
+        if items.is_empty() {
+            let msg = format!("can only assign non-empty tuple to {}.__bases__, not ()", name);
+            return Err(it.type_error(&msg));
+        }
+        let mut bases = Vec::with_capacity(items.len());
+        for b in items {
+            match b {
+                Value::Obj(o) if matches!(o.kind, Kind::Type(_)) => {
+                    if it.is_subtype(o, cls) {
+                        return Err(it.type_error("a __bases__ item causes an inheritance cycle"));
+                    }
+                    bases.push(o.clone());
+                }
+                _ => {
+                    let msg = format!("{}.__bases__ must be tuple of classes, not '{}'", name, it.tp_name_of(b));
+                    return Err(it.type_error(&msg));
+                }
+            }
+        }
+        if it.compute_mro(cls, &bases).is_none() {
+            return Err(it.type_error("Cannot create a consistent method resolution order (MRO) for bases"));
+        }
+        it.reassign_bases(cls, bases);
+        Ok(())
     }
 
     #[getter(name = "__base__")]
@@ -654,7 +777,9 @@ impl Type {
 
     #[setter(name = "__module__")]
     fn set_module(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__module__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__module__")?;
+        type_getset_store(it, cls, "__module__", value)
     }
 
     #[getter(name = "__doc__")]
@@ -664,7 +789,46 @@ impl Type {
 
     #[setter(name = "__doc__")]
     fn set_doc(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
-        type_getset_store(it, slf.0 .0, "__doc__", value)
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__doc__")?;
+        type_getset_store(it, cls, "__doc__", value)
+    }
+
+    #[getter(name = "__abstractmethods__")]
+    fn get_abstractmethods(slf: This<TypeRef<'_>>, it: &mut Interp) -> R<Value> {
+        type_getset(it, slf.0 .0, "__abstractmethods__")
+    }
+
+    #[setter(name = "__abstractmethods__")]
+    fn set_abstractmethods(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
+        type_getset_store(it, slf.0 .0, "__abstractmethods__", value)
+    }
+
+    #[getter(name = "__annotations__")]
+    fn get_annotations(slf: This<TypeRef<'_>>, it: &mut Interp) -> R<Value> {
+        type_getset(it, slf.0 .0, "__annotations__")
+    }
+
+    #[setter(name = "__annotations__")]
+    fn set_annotations(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__annotations__")?;
+        type_getset_store(it, cls, "__annotations__", value)
+    }
+
+    #[getter(name = "__type_params__")]
+    fn get_type_params(slf: This<TypeRef<'_>>, it: &mut Interp) -> R<Value> {
+        type_getset(it, slf.0 .0, "__type_params__")
+    }
+
+    #[setter(name = "__type_params__")]
+    fn set_type_params(slf: This<TypeRef<'_>>, it: &mut Interp, value: &Value) -> R<()> {
+        let cls = slf.0 .0;
+        check_special_set(it, cls, "__type_params__")?;
+        if value.tuple_items().is_none() {
+            return Err(it.type_error("__type_params__ must be set to a tuple"));
+        }
+        type_getset_store(it, cls, "__type_params__", value)
     }
 
     #[getter(name = "__dict__")]
@@ -1217,7 +1381,21 @@ pub fn init(it: &mut Interp) {
 /// exist).
 pub fn install_getset_descriptors(it: &mut Interp) {
     let (type_, super_) = (it.types.type_.clone(), it.types.super_.clone());
-    super::descr::install_getsets::<Type>(it, &type_, &["__base__"]);
+    super::descr::install_getsets::<Type>(it, &type_, &["__base__", "__mro__", "__flags__"]);
+    super::descr::install_deleters(
+        it,
+        &type_,
+        &[
+            ("__name__", del_name),
+            ("__qualname__", del_qualname),
+            ("__bases__", del_bases),
+            ("__module__", del_module),
+            ("__doc__", del_doc),
+            ("__type_params__", del_type_params),
+            ("__annotations__", del_annotations),
+            ("__abstractmethods__", del_abstractmethods),
+        ],
+    );
     super::descr::install_getsets::<Super>(it, &super_, &["__thisclass__", "__self__", "__self_class__"]);
 }
 

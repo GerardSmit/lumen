@@ -209,6 +209,7 @@ pub mod itertools {
             chain_of(move |_| Ok(pending.pop_front()))
         }
 
+        /// Alternative chain() constructor taking a single iterable argument that evaluates lazily.
         #[classmethod]
         fn from_iterable(cls: This<Value>, it: &mut Interp, iterable: &Value) -> R<Value> {
             let Value::Obj(cls) = cls.0 else { return Err(it.type_error("from_iterable() needs a class")) };
@@ -596,6 +597,7 @@ pub mod itertools {
         }
     }
 
+    /// Returns a tuple of n independent iterators.
     #[op]
     fn tee(it: &mut Interp, iterable: &Value, #[default(2)] n: isize) -> R<Value> {
         if n < 0 {

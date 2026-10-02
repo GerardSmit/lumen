@@ -364,6 +364,7 @@ impl Deque {
         self.state += 1;
     }
 
+    /// maximum size of a deque or None if unbounded
     #[getter]
     fn maxlen(&self) -> Option<usize> {
         self.maxlen

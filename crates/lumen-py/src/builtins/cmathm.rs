@@ -51,81 +51,99 @@ pub mod cmath {
         Ok(())
     }
 
+    /// Return the square root of z.
     #[op]
     fn sqrt(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::sqrt)
     }
 
+    /// Return the exponential value e**z.
     #[op]
     fn exp(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::exp)
     }
 
+    /// Return the base-10 logarithm of z.
     #[op]
     fn log10(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::log10)
     }
 
+    /// Return the arc cosine of z.
     #[op]
     fn acos(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::acos)
     }
 
+    /// Return the arc sine of z.
     #[op]
     fn asin(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::asin)
     }
 
+    /// Return the arc tangent of z.
     #[op]
     fn atan(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::atan)
     }
 
+    /// Return the cosine of z.
     #[op]
     fn cos(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::cos)
     }
 
+    /// Return the sine of z.
     #[op]
     fn sin(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::sin)
     }
 
+    /// Return the tangent of z.
     #[op]
     fn tan(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::tan)
     }
 
+    /// Return the inverse hyperbolic cosine of z.
     #[op]
     fn acosh(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::acosh)
     }
 
+    /// Return the inverse hyperbolic sine of z.
     #[op]
     fn asinh(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::asinh)
     }
 
+    /// Return the inverse hyperbolic tangent of z.
     #[op]
     fn atanh(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::atanh)
     }
 
+    /// Return the hyperbolic cosine of z.
     #[op]
     fn cosh(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::cosh)
     }
 
+    /// Return the hyperbolic sine of z.
     #[op]
     fn sinh(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::sinh)
     }
 
+    /// Return the hyperbolic tangent of z.
     #[op]
     fn tanh(it: &mut Interp, z: &Value) -> R<Value> {
         apply(it, z, cx::tanh)
     }
 
+    /// log(z[, base]) -> the logarithm of z to the given base.
+    ///
+    /// If the base is not specified, returns the natural logarithm (base e) of z.
     #[op]
     fn log(it: &mut Interp, x: &Value, base: Option<&Value>) -> R<Value> {
         let x = arg(it, x)?;
@@ -150,11 +168,15 @@ pub mod cmath {
         }
     }
 
+    /// Return argument, also known as the phase angle, of a complex.
     #[op]
     fn phase(it: &mut Interp, z: &Value) -> R<f64> {
         Ok(cx::phase(arg(it, z)?))
     }
 
+    /// Convert a complex from rectangular coordinates to polar coordinates.
+    ///
+    /// r is the distance from 0 and phi the phase angle.
     #[op]
     fn polar(it: &mut Interp, z: &Value) -> R<Value> {
         let z = arg(it, z)?;
@@ -165,6 +187,7 @@ pub mod cmath {
         }
     }
 
+    /// Convert from polar coordinates to rectangular coordinates.
     #[op]
     fn rect(it: &mut Interp, r: f64, phi: f64) -> R<Value> {
         match cx::rect(r, phi) {
@@ -173,24 +196,43 @@ pub mod cmath {
         }
     }
 
+    /// Return True if both the real and imaginary parts of z are finite, else False.
     #[op]
     fn isfinite(it: &mut Interp, z: &Value) -> R<bool> {
         let z = arg(it, z)?;
         Ok(z.re.is_finite() && z.im.is_finite())
     }
 
+    /// Checks if the real or imaginary part of z not a number (NaN).
     #[op]
     fn isnan(it: &mut Interp, z: &Value) -> R<bool> {
         let z = arg(it, z)?;
         Ok(z.re.is_nan() || z.im.is_nan())
     }
 
+    /// Checks if the real or imaginary part of z is infinite.
     #[op]
     fn isinf(it: &mut Interp, z: &Value) -> R<bool> {
         let z = arg(it, z)?;
         Ok(z.re.is_infinite() || z.im.is_infinite())
     }
 
+    /// Determine whether two complex numbers are close in value.
+    ///
+    ///   rel_tol
+    ///     maximum difference for being considered "close", relative to the
+    ///     magnitude of the input values
+    ///   abs_tol
+    ///     maximum difference for being considered "close", regardless of the
+    ///     magnitude of the input values
+    ///
+    /// Return True if a is close in value to b, and False otherwise.
+    ///
+    /// For the values to be considered close, the difference between them must be
+    /// smaller than at least one of the tolerances.
+    ///
+    /// -inf, inf and NaN behave similarly to the IEEE 754 Standard. That is, NaN is
+    /// not close to anything, even itself. inf and -inf are only close to themselves.
     #[op]
     fn isclose(
         it: &mut Interp,

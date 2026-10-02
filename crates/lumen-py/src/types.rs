@@ -176,6 +176,36 @@ impl Interp {
         }
     }
 
+    /// `type.__bases__ = ...`: the new bases, and the MROs of the class and of every subclass
+    /// rebuilt from them.
+    pub fn reassign_bases(&mut self, ty: &Obj, bases: Vec<Obj>) {
+        self.set_bases(ty, bases);
+        let affected: Vec<Obj> = self
+            .subclass_registry
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .filter(|t| !Rc::ptr_eq(t, ty) && self.is_subtype(t, ty))
+            .collect();
+        for _ in 0..=affected.len() {
+            let mut changed = false;
+            for t in &affected {
+                let Kind::Type(td) = &t.kind else { continue };
+                let bases = td.bases.borrow().clone();
+                if let Some(mro) = self.compute_mro(t, &bases) {
+                    let same = mro.len() == td.mro.borrow().len() && mro.iter().zip(td.mro.borrow().iter()).all(|(a, b)| Rc::ptr_eq(a, b));
+                    if !same {
+                        *td.mro.borrow_mut() = mro;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.type_epoch += 1;
+    }
+
     pub fn compute_mro(&self, ty: &Obj, bases: &[Obj]) -> Option<Vec<Obj>> {
         let mut seqs: Vec<Vec<Obj>> = Vec::new();
         for b in bases {
@@ -1024,7 +1054,7 @@ impl Interp {
                     let f = f.clone();
                     return Ok(Some(Value::Bool(self.is_abstract_value(&f)?)));
                 }
-                if matches!(nm, "__module__" | "__name__" | "__qualname__" | "__annotations__") {
+                if matches!(nm, "__module__" | "__name__" | "__qualname__" | "__annotations__" | "__doc__") {
                     let f = f.clone();
                     match self.get_attr_str(&f, nm) {
                         Ok(v) => return Ok(Some(v)),

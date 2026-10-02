@@ -433,6 +433,22 @@ pub fn install_member(it: &mut Interp, owner: &Obj, name: &'static str, fget: Va
     put_descriptor(it, owner, name, fget, Value::None, Value::None, true);
 }
 
+/// Gives the getset descriptors `name` of the builtin class `owner` the deleter `f` (CPython's
+/// setters double as deleters; ours are separate natives).
+pub fn install_deleters(it: &mut Interp, owner: &Obj, deleters: &[(&'static str, NativeFn)]) {
+    let Some(od) = owner.dict.borrow().clone() else { return };
+    for &(name, f) in deleters {
+        let Some(Value::Obj(old)) = dict_get_str(&od, name) else { continue };
+        let Kind::Property(p) = &old.kind else { continue };
+        let fdel = it.new_native(name, f, false);
+        let cls = old.cls.clone().unwrap_or_else(|| it.types.property.clone());
+        let new = Object::with_cls(cls, Kind::Property(PropData { fget: p.fget.clone(), fset: p.fset.clone(), fdel, doc: p.doc.clone() }));
+        let dict = old.dict.borrow().clone();
+        *new.dict.borrow_mut() = dict;
+        dict_set_str(&od, name, Value::Obj(new));
+    }
+}
+
 fn put_descriptor(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value, fset: Value, doc: Value, member: bool) {
     let types = it.native_state::<DescrTypes>();
     let Some(ty) = (if member { types.member.clone() } else { types.getset.clone() }) else { return };
