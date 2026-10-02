@@ -242,7 +242,7 @@ def _read_headers(fp):
 
 def _parse_header_lines(header_lines, _class=HTTPMessage):
     """
-    Parses only RFC2822 headers from header lines.
+    Parses only RFC 5322 headers from header lines.
 
     email Parser wants to see strings rather than bytes.
     But a TextIOWrapper around self.rfile would buffer too many bytes
@@ -255,7 +255,7 @@ def _parse_header_lines(header_lines, _class=HTTPMessage):
     return email.parser.Parser(_class=_class).parsestr(hstring)
 
 def parse_headers(fp, _class=HTTPMessage):
-    """Parses only RFC2822 headers from a file pointer."""
+    """Parses only RFC 5322 headers from a file pointer."""
 
     headers = _read_headers(fp)
     return _parse_header_lines(headers, _class)
@@ -1075,7 +1075,7 @@ class HTTPConnection:
                 response.close()
 
     def send(self, data):
-        """Send `data' to the server.
+        """Send 'data' to the server.
         ``data`` can be a string object, a bytes object, an array object, a
         file-like object that supports a .read() method, or an iterable object.
         """
@@ -1187,10 +1187,10 @@ class HTTPConnection:
                    skip_accept_encoding=False):
         """Send a request to the server.
 
-        `method' specifies an HTTP request method, e.g. 'GET'.
-        `url' specifies the object being requested, e.g. '/index.html'.
-        `skip_host' if True does not add automatically a 'Host:' header
-        `skip_accept_encoding' if True does not add automatically an
+        'method' specifies an HTTP request method, e.g. 'GET'.
+        'url' specifies the object being requested, e.g. '/index.html'.
+        'skip_host' if True does not add automatically a 'Host:' header
+        'skip_accept_encoding' if True does not add automatically an
            'Accept-Encoding:' header
         """
 

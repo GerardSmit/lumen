@@ -110,13 +110,13 @@ from _ssl import RAND_status, RAND_add, RAND_bytes
 try:
     from _ssl import RAND_egd
 except ImportError:
-    # LibreSSL does not provide RAND_egd
+    # RAND_egd is not supported on some platforms
     pass
 
 
 from _ssl import (
     HAS_SNI, HAS_ECDH, HAS_NPN, HAS_ALPN, HAS_SSLv2, HAS_SSLv3, HAS_TLSv1,
-    HAS_TLSv1_1, HAS_TLSv1_2, HAS_TLSv1_3
+    HAS_TLSv1_1, HAS_TLSv1_2, HAS_TLSv1_3, HAS_PSK, HAS_PHA
 )
 from _ssl import _DEFAULT_CIPHERS, _OPENSSL_API_VERSION
 
@@ -186,7 +186,7 @@ class _TLSContentType:
 class _TLSAlertType:
     """Alert types for TLSContentType.ALERT messages
 
-    See RFC 8466, section B.2
+    See RFC 8446, section B.2
     """
     CLOSE_NOTIFY = 0
     UNEXPECTED_MESSAGE = 10
@@ -371,6 +371,20 @@ def _ipaddress_match(cert_ipaddress, host_ip):
     # commonly with IPv6 addresses. Strip off trailing \n.
     ip = _inet_paton(cert_ipaddress.rstrip())
     return ip == host_ip
+
+
+def _check_sslobject_params(server_side, context=None, server_hostname=None, session=None):
+    """Raises a ValueError if SSLObject._create() parameters aren't valid.
+    """
+    if server_side:
+        if server_hostname:
+            raise ValueError("server_hostname can only be specified "
+                             "in client mode")
+        if session is not None:
+            raise ValueError("session can only be specified in "
+                             "client mode")
+    if context.check_hostname and not server_hostname:
+        raise ValueError("check_hostname requires server_hostname")
 
 
 DefaultVerifyPaths = namedtuple("DefaultVerifyPaths",
@@ -703,6 +717,16 @@ def create_default_context(purpose=Purpose.SERVER_AUTH, *, cafile=None,
     else:
         raise ValueError(purpose)
 
+    # `VERIFY_X509_PARTIAL_CHAIN` makes OpenSSL's chain building behave more
+    # like RFC 3280 and 5280, which specify that chain building stops with the
+    # first trust anchor, even if that anchor is not self-signed.
+    #
+    # `VERIFY_X509_STRICT` makes OpenSSL more conservative about the
+    # certificates it accepts, including "disabling workarounds for
+    # some broken certificates."
+    context.verify_flags |= (_ssl.VERIFY_X509_PARTIAL_CHAIN |
+                             _ssl.VERIFY_X509_STRICT)
+
     if cafile or capath or cadata:
         context.load_verify_locations(cafile, capath, cadata)
     elif context.verify_mode != CERT_NONE:
@@ -745,6 +769,8 @@ def _create_unverified_context(protocol=None, *, cert_reqs=CERT_NONE,
         raise ValueError(purpose)
 
     context = SSLContext(protocol)
+    # Setting verify_mode to CERT_NONE fails while check_hostname is
+    # enabled, so assign check_hostname first (gh-114905).
     context.check_hostname = check_hostname
     if cert_reqs is not None:
         context.verify_mode = cert_reqs
@@ -803,19 +829,8 @@ class SSLObject:
     @classmethod
     def _create(cls, incoming, outgoing, server_side=False,
                  server_hostname=None, session=None, context=None):
-        if server_side:
-            if server_hostname:
-                raise ValueError("server_hostname can only be specified "
-                                 "in client mode")
-            if session is not None:
-                raise ValueError("session can only be specified in "
-                                 "client mode")
-        if context.check_hostname and server_hostname is None:
-            # Note: server_hostname='' is handled within _wrap_bio().
-            warnings.warn("check_hostname requires server_hostname",
-                          category=DeprecationWarning,
-                          stacklevel=3)
-
+        _check_sslobject_params(server_side=server_side, context=context,
+                                server_hostname=server_hostname, session=session)
         self = cls.__new__(cls)
         sslobj = context._wrap_bio(
             incoming, outgoing, server_side=server_side,
@@ -887,6 +902,31 @@ class SSLObject:
         provided, but not validated.
         """
         return self._sslobj.getpeercert(binary_form)
+
+    def get_verified_chain(self):
+        """Returns verified certificate chain provided by the other
+        end of the SSL channel as a list of DER-encoded bytes.
+
+        If certificate verification was disabled method acts the same as
+        ``SSLSocket.get_unverified_chain``.
+        """
+        chain = self._sslobj.get_verified_chain()
+
+        if chain is None:
+            return []
+
+        return [cert.public_bytes(_ssl.ENCODING_DER) for cert in chain]
+
+    def get_unverified_chain(self):
+        """Returns raw certificate chain provided by the other
+        end of the SSL channel as a list of DER-encoded bytes.
+        """
+        chain = self._sslobj.get_unverified_chain()
+
+        if chain is None:
+            return []
+
+        return [cert.public_bytes(_ssl.ENCODING_DER) for cert in chain]
 
     def selected_npn_protocol(self):
         """Return the currently selected NPN protocol as a string, or ``None``
@@ -971,15 +1011,8 @@ class SSLSocket(socket):
                 context=None, session=None):
         if sock.getsockopt(SOL_SOCKET, SO_TYPE) != SOCK_STREAM:
             raise NotImplementedError("only stream sockets are supported")
-        if server_side:
-            if server_hostname:
-                raise ValueError("server_hostname can only be specified "
-                                 "in client mode")
-            if session is not None:
-                raise ValueError("session can only be specified in "
-                                 "client mode")
-        if context.check_hostname and not server_hostname:
-            raise ValueError("check_hostname requires server_hostname")
+        _check_sslobject_params(server_side=server_side, context=context,
+                                server_hostname=server_hostname, session=session)
 
         sock_timeout = sock.gettimeout()
         kwargs = dict(
@@ -1139,6 +1172,24 @@ class SSLSocket(socket):
         self._checkClosed()
         self._check_connected()
         return self._sslobj.getpeercert(binary_form)
+
+    @_sslcopydoc
+    def get_verified_chain(self):
+        chain = self._sslobj.get_verified_chain()
+
+        if chain is None:
+            return []
+
+        return [cert.public_bytes(_ssl.ENCODING_DER) for cert in chain]
+
+    @_sslcopydoc
+    def get_unverified_chain(self):
+        chain = self._sslobj.get_unverified_chain()
+
+        if chain is None:
+            return []
+
+        return [cert.public_bytes(_ssl.ENCODING_DER) for cert in chain]
 
     @_sslcopydoc
     def selected_npn_protocol(self):
