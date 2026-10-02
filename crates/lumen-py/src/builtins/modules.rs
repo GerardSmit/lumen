@@ -58,6 +58,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("marshal", bound::<super::marshalm::marshal::Module>),
     ("math", bound::<super::mathm::math::Module>),
     ("posix", bound::<super::posixm::posix::Module>),
+    ("pyexpat", bound::<super::pyexpatm::pyexpat::Module>),
     ("select", bound::<super::selectm::select::Module>),
     ("sys", |it| it.sys_module.clone()),
     ("time", bound::<super::timem::time::Module>),

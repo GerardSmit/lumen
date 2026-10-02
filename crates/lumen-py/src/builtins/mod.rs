@@ -27,6 +27,7 @@ pub mod functoolsm;
 pub mod genm;
 pub mod bz2m;
 pub mod lzmam;
+pub mod pyexpatm;
 pub mod zlibm;
 pub mod hashlibm;
 pub mod heapqm;
