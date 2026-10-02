@@ -249,6 +249,21 @@ impl Interp {
         self.index_of(v)
     }
 
+    /// `PyNumber_Check`: an `int`/`float`/`complex`, or an object with `__index__`, `__int__` or
+    /// `__float__`.
+    pub fn number_check(&self, v: &Value) -> bool {
+        match v {
+            Value::Int(_) | Value::Bool(_) | Value::Float(_) => true,
+            Value::Obj(o) => {
+                matches!(o.kind, Kind::Int(_) | Kind::Float(_) | Kind::Complex(..)) || {
+                    let cls = self.type_of_obj(o);
+                    ["__index__", "__int__", "__float__"].iter().any(|m| self.lookup_mro(&cls, m).is_some())
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub fn has_index(&self, v: &Value) -> bool {
         match v {
             Value::Int(_) | Value::Bool(_) => true,

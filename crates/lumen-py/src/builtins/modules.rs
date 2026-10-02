@@ -16,6 +16,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_codecs", |it| Some(super::codecsm::make(it))),
     ("_collections", |it| Some(super::collectionsm::make(it))),
     ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
+    ("_csv", bound::<super::csvm::_csv::Module>),
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
     ("_random", bound::<super::randomm::_random::Module>),

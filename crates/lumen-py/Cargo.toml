@@ -8,6 +8,11 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+# Doc comments on natives are their Python docstrings (CPython's text, indented examples
+# included), not Rust examples.
+[lib]
+doctest = false
+
 [[bin]]
 name = "lumen-py"
 path = "src/main.rs"

@@ -4,6 +4,7 @@ pub mod alias;
 pub mod args;
 pub mod bytesm;
 pub mod contextvarsm;
+pub mod csvm;
 pub mod descr;
 pub mod dictm;
 pub mod excgroup;

@@ -1,6 +1,6 @@
 # Corpus scripts that are known to fail: `path  # reason`, one per line.
 realworld/home_automation.py  # asyncio needs select, _socket, _signal
 realworld/llm_client.py  # needs _socket, select, _posixsubprocess, binascii, _md5/_sha1/_blake2
-realworld/project_audit.py  # needs _csv, select and _posixsubprocess (subprocess)
+realworld/project_audit.py  # subprocess needs _signal, select and _posixsubprocess
 stdlib/asyncio_basic.py  # asyncio needs select, _socket, _signal
 stdlib/asyncio_mod.py  # asyncio needs select, _socket, _signal

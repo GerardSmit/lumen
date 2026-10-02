@@ -34,20 +34,6 @@ pub mod itertools {
 
     // ---- count / repeat -----------------------------------------------------------------------
 
-    fn is_number(it: &mut Interp, v: &Value) -> bool {
-        match v {
-            Value::Int(_) | Value::Bool(_) | Value::Float(_) => true,
-            Value::Obj(o) => {
-                matches!(o.kind, Kind::Int(_) | Kind::Float(_) | Kind::Complex(..)) || {
-                    let cls = it.type_of_obj(o);
-                    it.lookup_mro(&cls, "__add__").is_some() && it.lookup_mro(&cls, "__index__").is_some()
-                        || it.lookup_mro(&cls, "__float__").is_some()
-                }
-            }
-            _ => false,
-        }
-    }
-
     #[class(name = "count")]
     pub struct Count {
         cur: Value,
@@ -59,7 +45,7 @@ pub mod itertools {
         #[constructor]
         fn new(it: &mut Interp, #[kw] #[default(0)] start: Value, #[kw] #[default(1)] step: Value) -> R<Count> {
             for v in [&start, &step] {
-                if !is_number(it, v) {
+                if !it.number_check(v) {
                     return Err(it.type_error("a number is required"));
                 }
             }
