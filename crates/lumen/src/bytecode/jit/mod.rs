@@ -417,11 +417,13 @@ pub(crate) const SHADOW_END: i32 = std::mem::offset_of!(Shadow, end) as i32;
 /// path, so this bounds only how deep JIT-to-JIT calls stay direct. On Windows the buffer is
 /// committed from the start (private bytes, though not working set), so it is kept smaller
 /// there; elsewhere untouched pages cost nothing.
-#[cfg(all(target_pointer_width = "64", not(windows)))]
+#[cfg(target_os = "none")]
+const SHADOW_BYTES: usize = 64 << 10;
+#[cfg(all(target_pointer_width = "64", not(windows), not(target_os = "none")))]
 const SHADOW_BYTES: usize = 4 << 20;
-#[cfg(all(target_pointer_width = "64", windows))]
+#[cfg(all(target_pointer_width = "64", windows, not(target_os = "none")))]
 const SHADOW_BYTES: usize = 1 << 20;
-#[cfg(target_pointer_width = "32")]
+#[cfg(all(target_pointer_width = "32", not(target_os = "none")))]
 const SHADOW_BYTES: usize = 1 << 20;
 
 /// Engine-owned storage follows its active frame across exclusive coroutine handoffs.
@@ -429,22 +431,24 @@ const SHADOW_BYTES: usize = 1 << 20;
 /// while a previously compiled chunk executes elsewhere.
 pub(crate) fn shadow(i: &mut Interp) -> *mut Shadow {
     i.jit_shadow
-        .get_or_insert_with(|| {
-            let storage = match lumen_codegen::jitmem::DataMemory::new(SHADOW_BYTES) {
-                Some(memory) => ShadowStorage::Pages(memory),
-                None => ShadowStorage::Heap(vec![0u128; SHADOW_BYTES / 16].into_boxed_slice()),
-            };
-            let base = match &storage {
-                ShadowStorage::Pages(memory) => memory.as_ptr() as usize,
-                ShadowStorage::Heap(memory) => memory.as_ptr() as usize,
-            };
-            Box::new(Shadow {
-                top: base,
-                end: base + SHADOW_BYTES,
-                _storage: storage,
-            })
-        })
+        .get_or_insert_with(|| new_shadow(SHADOW_BYTES))
         .as_mut() as *mut Shadow
+}
+
+fn new_shadow(bytes: usize) -> Box<Shadow> {
+    let storage = match lumen_codegen::jitmem::DataMemory::new(bytes) {
+        Some(memory) => ShadowStorage::Pages(memory),
+        None => ShadowStorage::Heap(vec![0u128; bytes / 16].into_boxed_slice()),
+    };
+    let base = match &storage {
+        ShadowStorage::Pages(memory) => memory.as_ptr() as usize,
+        ShadowStorage::Heap(memory) => memory.as_ptr() as usize,
+    };
+    Box::new(Shadow {
+        top: base,
+        end: base + bytes,
+        _storage: storage,
+    })
 }
 
 #[cfg(test)]
@@ -586,6 +590,9 @@ fn eager() -> bool {
 }
 
 fn jit_enabled() -> bool {
+    if cfg!(target_os = "none") {
+        return cfg!(target_arch = "aarch64") && lumen_codegen::jitmem::native_backend_available();
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let target = cfg!(target_arch = "x86_64")
@@ -620,6 +627,7 @@ fn compile(
         i, env, chunk, header, backedge, slots, widen, undef_ok, this_val,
     )
     .and_then(|built| finish(built, header, backedge));
+    record_compilation(i, &r);
     stats_end(t, "loop", &r);
     r
 }
@@ -642,8 +650,25 @@ fn compile_fn(
     let t = stats_start();
     let r = build::build_fn(i, env, chunk, slots, widen, not_num, guess, this_val)
         .and_then(|built| finish(built, 0, chunk.ops.len().saturating_sub(1)));
+    record_compilation(i, &r);
     stats_end(t, "fn", &r);
     r
+}
+
+fn record_compilation(i: &Interp, result: &Result<Native, String>) {
+    if let Ok(native) = result {
+        let mut stats = i.jit_stats.get();
+        stats.compiled_units += 1;
+        stats.code_bytes += native._keep.downcast_ref::<lumen_codegen::jitmem::ExecMemory>()
+            .map_or(0, |memory| memory.len());
+        i.jit_stats.set(stats);
+    }
+}
+
+fn record_execution(i: &Interp) {
+    let mut stats = i.jit_stats.get();
+    stats.executed_entries += 1;
+    i.jit_stats.set(stats);
 }
 
 /// `LUMEN_JIT_STATS`: one stderr line per compile attempt with its time and the running totals.
@@ -1210,6 +1235,7 @@ fn enter(
     // SAFETY: the frame points at live state for the whole call; native code follows the
     // contract above (it touches only `slots`, `area` and the frame, and calls helpers).
     let word = unsafe { (native.entry)(&mut frame) };
+    record_execution(i);
     let kind = word & 0xff;
     let exit_pc = (word >> 8) as usize;
     let depth = (frame.exit_depth as usize).min(area.len());
@@ -1654,6 +1680,7 @@ pub(crate) unsafe fn call_direct(
     // --- run ---
     let code: NativeFn = std::mem::transmute::<usize, NativeFn>(entry);
     let word = code(nf);
+    record_execution(i);
     let r = if word & 0xff == EXIT_RETURN {
         let v = std::ptr::replace((*nf).stack, Value::Undefined);
         for k in 0..n {

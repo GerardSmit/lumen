@@ -50,6 +50,8 @@ mod jstr;
 mod lexer;
 mod lstr;
 mod modules;
+#[cfg(feature = "parallel")]
+pub mod parallel;
 #[doc(hidden)]
 pub use modules::load_stats;
 #[cfg(feature = "intl")]
@@ -133,6 +135,17 @@ pub(crate) static WASM_JIT_HOST: std::sync::OnceLock<fn(&[u8]) -> Option<u32>> =
 /// The installed host clock's current time, if one was set.
 pub(crate) fn host_now_ms() -> Option<f64> {
     HOST_CLOCK.get().map(|f| f())
+}
+
+pub use lumen_codegen::jitmem::{NativeBackend, install_native_backend as install_native_jit_backend};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitStats {
+    pub compiled_units: u64,
+    pub code_bytes: usize,
+    /// Native entries that returned to the interpreter; generated direct calls
+    /// inside one such entry are not counted separately.
+    pub executed_entries: u64,
 }
 
 /// Parse `src` as a script and encode its AST to a snapshot blob — a build-time helper (used
@@ -220,9 +233,25 @@ pub struct Engine {
 /// while borrowing its objects. External value handles stay roots. This lets a worker
 /// reclaim dead cycles before its thread-local heap teardown would leak live chunks.
 pub fn collect_disposed_realms() {
+    collect_quiescent_realms();
+}
+
+/// Collect retired realm cycles while other engines remain alive on this driver.
+/// Every engine must be idle: no suspended JS evaluation, callback, or borrowed
+/// object. Live engines and external value handles stay roots. Embedders that
+/// cannot ensure this boundary must wait until all realms have been disposed.
+pub fn collect_quiescent_realms() {
     let before = memstats::enabled().then(crate::value::live_objects);
     let mut collector = Interp::uninitialized();
-    collector.gc_collect();
+    let mut previous = crate::value::live_objects();
+    loop {
+        collector.gc_collect();
+        let remaining = crate::value::live_objects();
+        // Sweeping a retired function can drop native code whose constant
+        // handles rooted other cycles during this pass. Finish those next.
+        if remaining >= previous { break; }
+        previous = remaining;
+    }
     drop(collector);
     if let Some(before) = before {
         eprintln!(
@@ -269,10 +298,24 @@ impl Drop for Engine {
         }
         drop(std::mem::replace(&mut self.interp, Interp::uninitialized()));
         self.interp.gc_collect();
+        // Native owning cores stay online after their final worker exits. Return
+        // cached free blocks now rather than waiting for nonexistent thread exit.
+        #[cfg(target_os = "none")]
+        crate::fastalloc::trim();
     }
 }
 
 impl Engine {
+    pub fn jit_stats(&self) -> JitStats {
+        self.interp.jit_stats.get()
+    }
+
+    /// Collect unreachable object/scope cycles between evaluations. External
+    /// value handles and this realm's global bindings remain roots.
+    pub fn collect_garbage(&mut self) -> i64 {
+        self.interp.collect_garbage_for_host()
+    }
+
     pub fn new() -> Engine {
         interpreter::sym_for_reset();
         let _mem = memstats::enter(memstats::Cat::Builtins);

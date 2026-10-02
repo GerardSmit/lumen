@@ -11,11 +11,17 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
+#[cfg(feature = "hosted")]
 use lumen_host::time::Instant;
+#[cfg(not(feature = "hosted"))]
+use std::time::Instant;
 
-use lumen_host::{ops, CallbackQueue, Ctx, Extension, Value};
+use lumen::embed::{Ctx, Value};
+#[cfg(feature = "hosted")]
+use lumen_host::{ops, CallbackQueue, Extension};
 
 /// The extension a runtime installs: the five timer globals plus the [`Timers`] state.
+#[cfg(feature = "hosted")]
 pub fn extension() -> Extension {
     Extension {
         name: "timers",
@@ -36,6 +42,15 @@ pub fn extension() -> Extension {
     }
 }
 
+/// Install only timer globals, without the hosted filesystem/thread substrate.
+pub fn install(engine: &mut lumen::Engine, max_timers: usize) {
+    engine.ctx().op_state().put(Timers { limit: Some(max_timers), ..Timers::default() });
+    engine.define_global("setTimeout", 2, op_set_timeout);
+    engine.define_global("setInterval", 2, op_set_interval);
+    engine.define_global("clearTimeout", 1, op_clear_timer);
+    engine.define_global("clearInterval", 1, op_clear_timer);
+}
+
 struct Entry {
     callback: Value,
     args: Vec<Value>,
@@ -54,6 +69,7 @@ struct Entry {
 /// skipped (and popped) when they surface, so `clearTimeout` is O(1).
 #[derive(Default)]
 pub struct Timers {
+    limit: Option<usize>,
     next_id: u64,
     heap: BinaryHeap<Reverse<(Instant, u64)>>,
     entries: HashMap<u64, Entry>,
@@ -66,10 +82,10 @@ impl Timers {
         args: Vec<Value>,
         delay: Duration,
         repeat: bool,
+        deadline: Instant,
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        let deadline = Instant::now() + delay;
         self.entries.insert(
             id,
             Entry {
@@ -87,6 +103,12 @@ impl Timers {
 
     fn clear(&mut self, id: u64) {
         self.entries.remove(&id);
+        if self.heap.len() > self.entries.len().saturating_mul(2) + 32 {
+            let entries = &self.entries;
+            self.heap.retain(|Reverse((deadline, id))| {
+                entries.get(id).is_some_and(|entry| entry.deadline == *deadline)
+            });
+        }
     }
 
     /// `timer.ref()` / `timer.unref()`; false when the timer no longer exists.
@@ -206,9 +228,14 @@ fn schedule_op(ctx: &mut Ctx, args: &[Value], repeat: bool) -> Result<Value, Val
     } else {
         0
     });
+    let deadline = Instant::now().checked_add(delay)
+        .ok_or_else(|| ctx.make_error("RangeError", "timer delay exceeds the clock range"))?;
     let extra: Vec<Value> = args.iter().skip(2).cloned().collect();
     let timers = ctx.host_mut::<Timers>().expect("timers state installed");
-    let id = timers.schedule(callback, extra, delay, repeat);
+    if timers.limit.is_some_and(|limit| timers.entries.len() >= limit) {
+        return Err(ctx.make_error("RangeError", "timer capacity exhausted"));
+    }
+    let id = timers.schedule(callback, extra, delay, repeat, deadline);
     Ok(Value::Num(id as f64))
 }
 
@@ -233,6 +260,7 @@ fn op_clear_timer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
+#[cfg(feature = "hosted")]
 fn timer_id_arg(ctx: &mut Ctx, args: &[Value]) -> Result<Option<u64>, Value> {
     match args.first() {
         Some(v) => {
@@ -244,6 +272,7 @@ fn timer_id_arg(ctx: &mut Ctx, args: &[Value]) -> Result<Option<u64>, Value> {
 }
 
 /// `(id, refed)` — Node's `timer.ref()`/`unref()`; returns whether the timer is still live.
+#[cfg(feature = "hosted")]
 fn op_timer_set_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let Some(id) = timer_id_arg(ctx, args)? else {
         return Ok(Value::Bool(false));
@@ -254,6 +283,7 @@ fn op_timer_set_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 }
 
 /// `(id)` — Node's `timer.refresh()`; false when the timer must be re-scheduled from scratch.
+#[cfg(feature = "hosted")]
 fn op_timer_refresh(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let Some(id) = timer_id_arg(ctx, args)? else {
         return Ok(Value::Bool(false));
@@ -263,6 +293,7 @@ fn op_timer_refresh(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 }
 
 /// Queue for the next loop turn (after microtasks, before timers get another look).
+#[cfg(feature = "hosted")]
 fn op_set_immediate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let callback = match args.first() {
         Some(cb) if cb.is_callable() => cb.clone(),

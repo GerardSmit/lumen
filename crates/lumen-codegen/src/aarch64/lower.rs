@@ -82,6 +82,37 @@ fn class_of(t: Type) -> RegClass {
     }
 }
 
+#[cfg(test)]
+mod softfloat_tests {
+    use super::*;
+
+    #[test]
+    fn imported_float_calls_use_gprs_without_changing_generated_entries() {
+        let mut function = Function::new("softfloat_bridge", Signature::new(vec![Type::F64], vec![Type::F64]));
+        let imported = function.import_function(Signature::new(vec![Type::I64, Type::F64], vec![Type::F64]), 1);
+        let mut builder = crate::FunctionBuilder::new(&mut function);
+        let entry = builder.create_entry_block();
+        let number = builder.block_params(entry)[0];
+        let context = builder.iconst(Type::I64, 7);
+        let result = builder.call_fn(imported, &[context, number]);
+        builder.ret(&result);
+        builder.finish();
+        let abi = Abi { softfloat_calls: true, ..aapcs64() };
+        let graph = Cfg::new(&function);
+        let lowered = lower(&function, &graph, &abi).unwrap();
+        let call = lowered.vcode.insts.iter().find_map(|instruction| match instruction {
+            MInst::Call(call) => Some(call), _ => None,
+        }).unwrap();
+        assert_eq!(call.reg_args.iter().map(|(_, register)| *register).collect::<Vec<_>>(), vec![x(0), x(1)]);
+        assert_eq!(call.rets[0].1, x(0));
+        assert!(lowered.vcode.insts.iter().any(|instruction| matches!(instruction, MInst::FprToGpr { .. })));
+        assert!(lowered.vcode.insts.iter().any(|instruction| matches!(instruction, MInst::GprToFpr { .. })));
+        assert!(lowered.vcode.insts.iter().any(|instruction| match instruction {
+            MInst::Args { regs, .. } => regs.iter().any(|(_, register)| *register == v(0)), _ => false,
+        }));
+    }
+}
+
 fn int_cc(cc: IntCC) -> Cond {
     match cc {
         IntCC::Eq => Cond::Eq,
@@ -592,8 +623,21 @@ impl Lower<'_> {
         if sig.results.len() > 1 {
             return Err("aarch64: calls with multiple results are not supported".into());
         }
-        let vals: Vec<VReg> = args.iter().map(|&a| self.use_val(a)).collect();
-        let (locs, size) = arg_locs(self.abi, &sig.params);
+        let mut vals = Vec::with_capacity(args.len());
+        let mut params = sig.params.clone();
+        for (&argument, ty) in args.iter().zip(&mut params) {
+            let source = self.use_val(argument);
+            if self.abi.softfloat_calls && ty.is_float() {
+                let size = size_of(*ty);
+                *ty = if *ty == Type::F64 { Type::I64 } else { Type::I32 };
+                let temporary = self.fresh(*ty);
+                self.push(MInst::FprToGpr { size, dst: temporary, src: source });
+                vals.push(temporary);
+            } else {
+                vals.push(source);
+            }
+        }
+        let (locs, size) = arg_locs(self.abi, &params);
         self.outgoing = self.outgoing.max(size);
         let mut reg_args = Vec::new();
         let mut stack_args = Vec::new();
@@ -607,7 +651,11 @@ impl Lower<'_> {
         let mut post = None;
         if let (Some(&t), Some(&r)) = (sig.results.first(), results.first()) {
             let dst = self.vreg(r);
-            if t == Type::I32 {
+            if self.abi.softfloat_calls && t.is_float() {
+                let temporary = self.fresh(if t == Type::F64 { Type::I64 } else { Type::I32 });
+                rets.push((temporary, X0));
+                post = Some(MInst::GprToFpr { size: size_of(t), dst, src: temporary });
+            } else if t == Type::I32 {
                 let tmp = self.fresh(t);
                 rets.push((tmp, ret_reg(t)));
                 post = Some(MInst::Mov {

@@ -1,5 +1,10 @@
 # lumen
 
+Bitnest embedding changes in this checkout include the native ARM64 JIT memory
+backend, soft-float helper ABI, collection API and a timer-only installation
+without the hosted filesystem/thread substrate. Review these changes manually
+before committing or updating the parent submodule pin.
+
 A from-scratch JavaScript **engine** in Rust — std only, zero dependencies — and a
 **runtime** being built on top of it, the way Node/Deno/Bun wrap a JS engine with an event
 loop and host APIs. The engine remains std-only. The Node runtime uses `libc` on Unix for portable kernel

@@ -44,6 +44,13 @@ pub struct SharedBufferHandle {
     id: u64,
     backing: SharedMem,
 }
+#[cfg(feature = "parallel")]
+impl SharedBufferHandle {
+    pub(crate) fn adopt_into(&self, interp: &mut Interp, pointer: usize) {
+        shared_mem_registry().lock().unwrap().entry(self.id).or_insert_with(|| self.backing.clone());
+        interp.shared_buffers.insert(pointer, self.id);
+    }
+}
 pub fn shared_mem_registry() -> &'static Mutex<HashMap<u64, SharedMem>> {
     static R: OnceLock<Mutex<HashMap<u64, SharedMem>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(Default::default()))
@@ -1058,6 +1065,7 @@ pub struct Interp {
     /// Lazy bounded shadow stack owned by this engine, shared only by its exclusive
     /// coroutine handoffs. Compiled code loads it from its current frame.
     pub(crate) jit_shadow: Option<Box<crate::bytecode::jit::Shadow>>,
+    pub(crate) jit_stats: std::cell::Cell<crate::JitStats>,
     /// The innermost running native function's [`frames::NativeCtx`] (its address on the
     /// dispatcher's Rust stack; 0 = none), for the builtin frames of a stack trace.
     pub(crate) native_top: usize,
@@ -1579,6 +1587,7 @@ impl Interp {
             fn_frames: Vec::new(),
             jit_frames: 0,
             jit_shadow: None,
+            jit_stats: std::cell::Cell::new(crate::JitStats::default()),
             native_top: 0,
             cur_site: frames::NO_SITE,
             sources: Default::default(),

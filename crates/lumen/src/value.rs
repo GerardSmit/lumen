@@ -1675,12 +1675,16 @@ pub(crate) struct GcState {
     scope_serial: Cell<u64>,
 }
 
+#[cfg(test)]
+#[path = "value/heap_transfer_tests.rs"]
+mod heap_transfer_tests;
+
 // See the type-level comment: exclusivity comes from the coroutine handoff, not from these cells.
 unsafe impl Send for GcState {}
 unsafe impl Sync for GcState {}
 
 impl GcState {
-    fn new() -> Arc<GcState> {
+    pub(crate) fn new() -> Arc<GcState> {
         Arc::new(GcState {
             heap: heap::ObjHeap::new(),
             live: Cell::new(0),
@@ -1691,6 +1695,20 @@ impl GcState {
             scope_epoch: Cell::new(0),
             scope_serial: Cell::new(0),
         })
+    }
+
+    /// Requires exclusive ownership of `other`; no realm may run on either
+    /// heap until all side tables and prototypes have also been installed.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn absorb(&self, other: &GcState) {
+        let mut shapes = std::collections::HashMap::new();
+        other.heap.for_each_live(|pointer| unsafe {
+            (*(*pointer).value.get()).props.remap_shape(&mut shapes);
+        });
+        self.heap.absorb(&other.heap, &self.live);
+        self.live.set(self.live.get() + other.live.replace(0));
+        self.scopes.borrow_mut().append(&mut other.scopes.borrow_mut());
+        self.lazy_fns.borrow_mut().append(&mut other.lazy_fns.borrow_mut());
     }
 }
 

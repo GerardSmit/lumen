@@ -1,6 +1,27 @@
 //! Executable memory with a W^X policy: code is written into read-write pages, which are then
 //! made read-execute (macOS uses `MAP_JIT` with the per-thread write-protect toggle).
 
+/// A bare-metal embedder's executable-page services. Allocation must return RW/NX
+/// storage; sealing must finish cache maintenance and change it to RO/X.
+#[derive(Clone, Copy)]
+pub struct NativeBackend {
+    pub alloc: unsafe extern "C" fn(usize) -> *mut u8,
+    pub seal: unsafe extern "C" fn(*mut u8, usize) -> bool,
+    pub free: unsafe extern "C" fn(*mut u8, usize),
+}
+
+static NATIVE_BACKEND: std::sync::OnceLock<NativeBackend> = std::sync::OnceLock::new();
+
+/// Install before creating an engine. Callback correctness, exclusive mapping
+/// ownership, and lifetime are the embedder's responsibility.
+pub unsafe fn install_native_backend(backend: NativeBackend) -> bool {
+    NATIVE_BACKEND.set(backend).is_ok()
+}
+
+pub fn native_backend_available() -> bool {
+    NATIVE_BACKEND.get().is_some()
+}
+
 /// A block of executable code, freed on drop.
 pub struct ExecMemory {
     ptr: *mut u8,
@@ -221,7 +242,32 @@ mod sys {
 
 /// No executable memory on targets without an OS memory API (wasm32): allocation fails and
 /// callers fall back (on wasm32, to the [`crate::wasm`] backend).
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+mod sys {
+    pub unsafe fn alloc(len: usize) -> *mut u8 {
+        match super::NATIVE_BACKEND.get() {
+            Some(backend) => unsafe { (backend.alloc)(len) },
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    pub unsafe fn alloc_data(_: usize) -> *mut u8 {
+        // Scratch data must not consume the bounded executable-page arena.
+        std::ptr::null_mut()
+    }
+
+    pub unsafe fn make_exec(memory: *mut u8, len: usize) -> bool {
+        super::NATIVE_BACKEND.get().is_some_and(|backend| unsafe { (backend.seal)(memory, len) })
+    }
+
+    pub unsafe fn free_exec(memory: *mut u8, len: usize) {
+        if let Some(backend) = super::NATIVE_BACKEND.get() {
+            unsafe { (backend.free)(memory, len) }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows, all(target_arch = "aarch64", target_os = "none"))))]
 mod sys {
     pub unsafe fn alloc(_len: usize) -> *mut u8 {
         std::ptr::null_mut()

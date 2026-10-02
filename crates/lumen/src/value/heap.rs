@@ -416,6 +416,39 @@ pub(super) struct ObjHeap {
 }
 
 impl ObjHeap {
+    /// Move all chunks from an exclusively owned heap, preserving box addresses.
+    /// Both heaps must stay pinned, and no allocator or collector may run during
+    /// the move. The caller transfers the live count and remaps object shapes.
+    #[cfg(any(test, feature = "parallel"))]
+    pub(super) fn absorb(&self, other: &Self, live: &Cell<i64>) {
+        assert!(!std::ptr::eq(self, other), "cannot absorb the same heap");
+        for (target, source) in self.classes.iter().zip(&other.classes) {
+            let mut head = source.free.replace(std::ptr::null_mut());
+            if !head.is_null() {
+                let first = head;
+                unsafe {
+                    while !free_next(head).is_null() {
+                        head = free_next(head);
+                    }
+                    set_free_next(head, target.free.get());
+                }
+                target.free.set(first);
+            }
+            source.cur.set(std::ptr::null_mut());
+            for chunk in source.chunks().drain(..) {
+                unsafe {
+                    let header = &mut *chunk.as_ptr();
+                    header.free_head = &target.free;
+                    header.live = live;
+                    header.emptied = &self.emptied;
+                }
+                target.chunks().push(chunk);
+            }
+        }
+        self.emptied.set(self.emptied.get().saturating_add(other.emptied.replace(0)));
+        other.purge_at.set(None);
+    }
+
     pub(super) const fn new() -> ObjHeap {
         ObjHeap {
             classes: [const { ClassHeap::new() }; CLASSES],

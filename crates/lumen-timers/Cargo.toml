@@ -10,7 +10,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-lumen-host = { path = "../lumen-host" }
+lumen = { path = "../lumen", default-features = false, features = ["embed"] }
+lumen-host = { path = "../lumen-host", optional = true }
+
+[features]
+default = ["hosted"]
+hosted = ["dep:lumen-host"]
 
 [lints]
 workspace = true

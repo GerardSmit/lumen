@@ -94,12 +94,35 @@ fn init() -> usize {
             (size != 0).then(|| (base.saturating_sub(size), size))
         })
         .map(|(low, size)| {
-            let margin = (size / 8).clamp(MIN_MARGIN, MAX_MARGIN);
+            let margin = safety_margin(size);
             (low + margin).min(sp()).max(1)
         })
         .unwrap_or(1);
     LIMIT.with(|l| l.set(lim));
     lim
+}
+
+fn safety_margin(size: usize) -> usize {
+    // A fixed desktop reserve must not consume an embedded stack's entire budget.
+    (size / 8).clamp(MIN_MARGIN, MAX_MARGIN).min(size / 4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_stack_keeps_evaluation_headroom() {
+        assert_eq!(safety_margin(256 * 1024), 64 * 1024);
+        assert_eq!(safety_margin(512 * 1024), 128 * 1024);
+        assert_eq!(safety_margin(64 * 1024), 16 * 1024);
+    }
+
+    #[test]
+    fn desktop_stack_retains_its_reserve() {
+        assert_eq!(safety_margin(2 * 1024 * 1024), MIN_MARGIN);
+        assert_eq!(safety_margin(64 * 1024 * 1024), MAX_MARGIN);
+    }
 }
 
 /// `(lowest address, size)` of the current thread's stack.

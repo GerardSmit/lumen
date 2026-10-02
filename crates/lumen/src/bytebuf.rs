@@ -85,6 +85,19 @@ impl ByteBuf {
         matches!(self.0, Repr::External { .. })
     }
 
+    /// Release the buffer's accounting charge and return independently owned
+    /// bytes. External memory is copied; its owner stays on the current thread.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        if self.is_external() {
+            return self.to_vec();
+        }
+        let this = std::mem::ManuallyDrop::new(self);
+        let Repr::Heap(bytes) = (unsafe { std::ptr::read(&this.0) }) else { unreachable!() };
+        track_sub(bytes.capacity());
+        bytes
+    }
+
     /// Resize to `n` bytes, zero-filling. An external buffer is first copied to the heap (its
     /// size belongs to its owner).
     pub fn resize(&mut self, n: usize, fill: u8) {
