@@ -158,6 +158,30 @@ impl ZStream {
         Some(text.to_string_lossy().into_owned())
     }
 
+    /// `deflateCopy` / `inflateCopy`: an independent stream in the same state.
+    pub fn try_clone(&mut self) -> Result<Self, i32> {
+        let mut strm = Box::new(z::z_stream::default());
+        // zlib-rs refuses to copy an inflate stream without an output window; lend an empty one.
+        let mut empty = [0u8; 1];
+        self.strm.next_out = empty.as_mut_ptr();
+        self.strm.avail_out = 0;
+        let src: *mut z::z_stream = &mut *self.strm;
+        // SAFETY: both streams are live; the copy gets its own state pointing back at `strm`.
+        let code = unsafe {
+            if self.deflating {
+                z::deflateCopy(&mut *strm, src)
+            } else {
+                z::inflateCopy(&mut *strm, src)
+            }
+        };
+        self.strm.next_out = std::ptr::null_mut();
+        strm.next_out = std::ptr::null_mut();
+        if code != Z_OK {
+            return Err(code);
+        }
+        Ok(ZStream { strm, deflating: self.deflating, carry: self.carry.clone() })
+    }
+
     #[allow(clippy::unnecessary_cast)] // `uLong` is 32-bit on some targets
     pub fn total_in(&self) -> u64 {
         self.strm.total_in as u64
@@ -175,6 +199,18 @@ impl Drop for ZStream {
             }
         }
     }
+}
+
+#[inline]
+pub fn adler32_from(seed: u32, data: &[u8]) -> u32 {
+    // SAFETY: the pointer and length describe a live slice.
+    unsafe { z::adler32_z(seed as _, data.as_ptr(), data.len()) as u32 }
+}
+
+/// The zlib version string the library reports.
+pub fn zlib_version() -> String {
+    // SAFETY: `zlibVersion` returns a NUL-terminated static string.
+    unsafe { std::ffi::CStr::from_ptr(z::zlibVersion()) }.to_string_lossy().into_owned()
 }
 
 #[inline]

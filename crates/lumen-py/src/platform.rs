@@ -433,6 +433,10 @@ fn convert_io(e: &std::io::Error) -> IoError {
 }
 
 impl Platform for StdPlatform {
+    fn executable(&self) -> String {
+        std::env::current_exe().map_or_else(|_| "lumen-py".to_string(), |p| p.to_string_lossy().into_owned())
+    }
+
     fn write_stdout(&mut self, bytes: &[u8]) {
         use std::io::Write;
         let _ = std::io::stdout().lock().write_all(bytes);

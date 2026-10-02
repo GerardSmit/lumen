@@ -1838,6 +1838,21 @@ impl Interp {
         Ok(out)
     }
 
+    /// Whether `v` exports a contiguous buffer (`bytes`, `bytearray`, `memoryview`).
+    pub fn is_buffer(&mut self, v: &Value) -> bool {
+        matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_))) || crate::builtins::memview::is_memoryview(self, v)
+    }
+
+    /// The bytes of a buffer argument (`Py_buffer` in CPython's argument clinic); anything else
+    /// is "a bytes-like object is required".
+    pub fn buffer_bytes(&mut self, v: &Value) -> R<Vec<u8>> {
+        if !self.is_buffer(v) {
+            let t = self.type_name_of(v);
+            return Err(self.type_error(&format!("a bytes-like object is required, not '{t}'")));
+        }
+        self.bytes_of(v)
+    }
+
     pub fn bytes_of(&mut self, v: &Value) -> R<Vec<u8>> {
         match v {
             Value::Obj(o) => match &o.kind {

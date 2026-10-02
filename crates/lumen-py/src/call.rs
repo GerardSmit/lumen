@@ -57,6 +57,7 @@ impl Interp {
                 self.call(&func.clone(), a, kw)
             }
             Kind::Type(_) => self.call_type(o, args, kw),
+            Kind::StaticMethod(inner) => self.call(&inner.clone(), args, kw),
             _ => {
                 let cls = self.type_of_obj(o);
                 match self.lookup_mro(&cls, "__call__") {

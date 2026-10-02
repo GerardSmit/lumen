@@ -64,6 +64,12 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `encodings/utf_32_be.py`
 - `encodings/unicode_escape.py`
 - `encodings/raw_unicode_escape.py`
+- `encodings/base64_codec.py`
+- `encodings/hex_codec.py`
+- `encodings/quopri_codec.py`
+- `encodings/uu_codec.py`
+- `encodings/rot_13.py`
+- `encodings/zlib_codec.py`
 - `json/__init__.py`
 - `json/decoder.py`
 - `json/encoder.py`
@@ -200,3 +206,6 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `ast.py`
 - `dis.py`
 - `opcode.py`
+- `secrets.py`
+- `uuid.py`
+- `gzip.py`

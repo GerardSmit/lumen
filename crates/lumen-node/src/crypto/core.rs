@@ -245,13 +245,6 @@ fn random_fill(buf: &mut [u8]) -> Result<(), OpError> {
 
 #[op(name = "timingSafeEqual")]
 fn timing_safe_equal(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    std::hint::black_box(diff) == 0
+    a.len() == b.len() && lumen_common::hash::constant_time_eq(a, b)
 }
 }

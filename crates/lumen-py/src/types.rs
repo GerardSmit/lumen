@@ -1557,6 +1557,11 @@ impl Interp {
                 }
             }
         }
+        if let Some(Value::Obj(f)) = dict_get_str(&dict, "__new__") {
+            if matches!(f.kind, Kind::Function(_)) {
+                dict_set_str(&dict, "__new__", Value::Obj(Object::new(Kind::StaticMethod(Value::Obj(f)))));
+            }
+        }
         let slots = match dict_get_str(&dict, "__slots__") {
             None => None,
             Some(v) => {

@@ -54,6 +54,12 @@ encodings/utf_32_le.py
 encodings/utf_32_be.py
 encodings/unicode_escape.py
 encodings/raw_unicode_escape.py
+encodings/base64_codec.py
+encodings/hex_codec.py
+encodings/quopri_codec.py
+encodings/uu_codec.py
+encodings/rot_13.py
+encodings/zlib_codec.py
 json/__init__.py
 json/decoder.py
 json/encoder.py
@@ -206,3 +212,8 @@ email/utils.py
 ast.py
 dis.py
 opcode.py
+
+# hashing, ids and compression
+secrets.py
+uuid.py
+gzip.py

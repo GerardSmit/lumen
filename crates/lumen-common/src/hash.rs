@@ -1,7 +1,8 @@
 //! Message digests, HMAC and the password-based KDFs behind `node:crypto` and `crypto.subtle`,
 //! all from the RustCrypto crates (`digest` family, `hmac`, `pbkdf2`, `hkdf`, `scrypt`).
 
-use digest::{Digest, ExtendableOutput, Update};
+use digest::core_api::{Block, Buffer, UpdateCore, VariableOutputCore};
+use digest::{Digest, ExtendableOutput, Output, Update};
 use hmac::{Mac, SimpleHmac};
 
 /// A digest algorithm `createHash` knows by name.
@@ -209,6 +210,93 @@ pub fn digest(algo: Algo, data: &[u8]) -> Vec<u8> {
     h.finish()
 }
 
+// ---- BLAKE2 with parameters ------------------------------------------------------------------------
+
+/// BLAKE2b (`wide`) or BLAKE2s in sequential mode with a digest size, key, salt and personalization
+/// (RFC 7693; Python's `hashlib.blake2b` / `blake2s`).
+#[derive(Clone)]
+pub enum Blake2 {
+    B(blake2::Blake2bVarCore, Buffer<blake2::Blake2bVarCore>, usize),
+    S(blake2::Blake2sVarCore, Buffer<blake2::Blake2sVarCore>, usize),
+}
+
+impl Blake2 {
+    /// Maximum digest and key size in bytes: 64 for BLAKE2b, 32 for BLAKE2s.
+    pub fn max_size(wide: bool) -> usize {
+        if wide {
+            64
+        } else {
+            32
+        }
+    }
+
+    /// Maximum salt and personalization length in bytes: 16 for BLAKE2b, 8 for BLAKE2s.
+    pub fn salt_size(wide: bool) -> usize {
+        Self::max_size(wide) / 4
+    }
+
+    /// The caller checks the sizes against [`Blake2::max_size`] and [`Blake2::salt_size`].
+    pub fn new(wide: bool, digest_size: usize, key: &[u8], salt: &[u8], person: &[u8]) -> Blake2 {
+        // A key is hashed as a first block of its own, zero-padded.
+        macro_rules! keyed {
+            ($core:ty) => {{
+                let mut buf = Buffer::<$core>::default();
+                if !key.is_empty() {
+                    let mut block = Block::<$core>::default();
+                    block[..key.len()].copy_from_slice(key);
+                    buf = Buffer::<$core>::new(&block);
+                }
+                buf
+            }};
+        }
+        if wide {
+            let core = blake2::Blake2bVarCore::new_with_params(salt, person, key.len(), digest_size);
+            Blake2::B(core, keyed!(blake2::Blake2bVarCore), digest_size)
+        } else {
+            let core = blake2::Blake2sVarCore::new_with_params(salt, person, key.len(), digest_size);
+            Blake2::S(core, keyed!(blake2::Blake2sVarCore), digest_size)
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            Blake2::B(core, buf, _) => buf.digest_blocks(data, |blocks| core.update_blocks(blocks)),
+            Blake2::S(core, buf, _) => buf.digest_blocks(data, |blocks| core.update_blocks(blocks)),
+        }
+    }
+
+    pub fn digest_size(&self) -> usize {
+        match self {
+            Blake2::B(.., n) | Blake2::S(.., n) => *n,
+        }
+    }
+
+    pub fn block_size(&self) -> usize {
+        match self {
+            Blake2::B(..) => 128,
+            Blake2::S(..) => 64,
+        }
+    }
+
+    /// The digest so far; the hash itself stays usable.
+    pub fn finish(&self) -> Vec<u8> {
+        let mut out = match self.clone() {
+            Blake2::B(mut core, mut buf, _) => {
+                let mut out = Output::<blake2::Blake2bVarCore>::default();
+                core.finalize_variable_core(&mut buf, &mut out);
+                out.to_vec()
+            }
+            Blake2::S(mut core, mut buf, _) => {
+                let mut out = Output::<blake2::Blake2sVarCore>::default();
+                core.finalize_variable_core(&mut buf, &mut out);
+                out.to_vec()
+            }
+        };
+        out.truncate(self.digest_size());
+        out
+    }
+}
+
 // ---- HMAC ---------------------------------------------------------------------------------------
 
 macro_rules! define_hmac {
@@ -287,6 +375,16 @@ macro_rules! define_hkdf {
 }
 fixed_digests!(define_hkdf);
 
+/// Equality of two byte strings in time that depends only on their lengths (`timingSafeEqual`,
+/// `hmac.compare_digest`).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() != b.len()) as u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
 /// Whether HMAC/PBKDF2/HKDF are defined over `algo`.
 pub fn supports_mac(algo: Algo) -> bool {
     !matches!(algo, Algo::Shake128 | Algo::Shake256 | Algo::Md5Sha1)
@@ -313,6 +411,12 @@ mod tests {
     #[test]
     fn known_vectors() {
         assert_eq!(hex(&digest(Algo::Sha256, b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let mut b = Blake2::new(true, 64, b"", b"", b"");
+        b.update(b"abc");
+        assert_eq!(hex(&b.finish()), hex(&digest(Algo::Blake2b512, b"abc")));
+        let mut k = Blake2::new(false, 32, b"key", b"", b"");
+        k.update(b"abc");
+        assert_eq!(hex(&k.finish()), "3f9723437b033bf0c1f4df43cafd0776068cb0a95912de13f3b2952a3aba764d");
         assert_eq!(hex(&hmac(Algo::Sha1, b"key", b"The quick brown fox jumps over the lazy dog")), "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9");
     }
 }

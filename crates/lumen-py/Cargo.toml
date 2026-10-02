@@ -21,7 +21,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-lumen-common = { path = "../lumen-common", features = ["hash"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "compress"] }
 lumen-os = { path = "../lumen-os" }
 lumen-bind = { path = "../lumen-bind" }
 

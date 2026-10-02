@@ -13,15 +13,21 @@ fn bound<M: lumen_bind::Module<crate::bind::PyHost>>(it: &mut Interp) -> Option<
 /// The native modules, sorted by name (also `sys.builtin_module_names`).
 const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_ast", bound::<super::astm::_ast::Module>),
+    ("_blake2", bound::<super::hashlibm::_blake2::Module>),
     ("_codecs", |it| Some(super::codecsm::make(it))),
     ("_collections", |it| Some(super::collectionsm::make(it))),
     ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
     ("_csv", bound::<super::csvm::_csv::Module>),
+    ("_hashlib", bound::<super::hashlibm::_hashlib::Module>),
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
+    ("_md5", bound::<super::hashlibm::_md5::Module>),
     ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
     ("_random", bound::<super::randomm::_random::Module>),
-    ("_sha2", |it| Some(super::sha2m::make(it))),
+    ("_scproxy", bound::<super::scproxym::_scproxy::Module>),
+    ("_sha1", bound::<super::hashlibm::_sha1::Module>),
+    ("_sha2", bound::<super::hashlibm::_sha2::Module>),
+    ("_sha3", bound::<super::hashlibm::_sha3::Module>),
     ("_signal", bound::<super::signalm::_signal::Module>),
     ("_socket", bound::<super::socketm::_socket::Module>),
     ("_sre", |it| Some(super::sre::make(it))),
@@ -34,6 +40,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_weakref", |it| Some(super::weakm::make(it))),
     ("_zoneinfo", bound::<super::zoneinfom::_zoneinfo::Module>),
     ("atexit", |it| Some(super::sysmods::make_atexit(it))),
+    ("binascii", bound::<super::binasciim::binascii::Module>),
     ("builtins", |it| Some(super::sysmods::make_builtins(it))),
     ("errno", bound::<super::errnom::errno::Module>),
     ("gc", |it| Some(super::sysmods::make_gc(it))),
@@ -44,6 +51,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("select", bound::<super::selectm::select::Module>),
     ("sys", |it| it.sys_module.clone()),
     ("time", bound::<super::timem::time::Module>),
+    ("zlib", bound::<super::zlibm::zlib::Module>),
 ];
 
 pub fn builtin_module(it: &mut Interp, name: &str) -> Option<Obj> {
