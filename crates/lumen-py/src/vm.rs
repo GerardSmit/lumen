@@ -528,29 +528,46 @@ impl Interp {
     }
 
     fn link_context(&mut self, exc: &Obj) {
-        if let Kind::Exception(d) = &exc.kind {
+        let Kind::Exception(d) = &exc.kind else { return };
+        {
             let mut d = d.borrow_mut();
             if d.ctx_set {
                 return;
             }
             d.ctx_set = true;
-            if let Some(h) = &self.handled {
-                if Rc::ptr_eq(h, exc) {
-                    return;
-                }
-                let mut cur = Some(h.clone());
-                while let Some(c) = cur {
-                    if Rc::ptr_eq(&c, exc) {
-                        return;
-                    }
-                    cur = match &c.kind {
-                        Kind::Exception(cd) => cd.borrow().context.clone(),
-                        _ => None,
-                    };
-                }
-                d.context = Some(h.clone());
-            }
         }
+        let Some(h) = self.handled.clone() else { return };
+        if Rc::ptr_eq(&h, exc) {
+            return;
+        }
+        let context_of = |e: &Obj| match &e.kind {
+            Kind::Exception(cd) => cd.borrow().context.clone(),
+            _ => None,
+        };
+        // cut a chain that leads back to `exc`, and stop at a cycle (Floyd's algorithm)
+        let mut o = h.clone();
+        let mut slow = h.clone();
+        let mut toggle = false;
+        while let Some(context) = context_of(&o) {
+            if Rc::ptr_eq(&context, exc) {
+                if let Kind::Exception(od) = &o.kind {
+                    od.borrow_mut().context = None;
+                }
+                break;
+            }
+            o = context;
+            if Rc::ptr_eq(&o, &slow) {
+                break;
+            }
+            if toggle {
+                match context_of(&slow) {
+                    Some(next) => slow = next,
+                    None => break,
+                }
+            }
+            toggle = !toggle;
+        }
+        d.borrow_mut().context = Some(h);
     }
 
     fn name_err(&mut self, name: &Obj) -> Obj {

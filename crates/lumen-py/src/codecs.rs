@@ -447,11 +447,17 @@ impl<'a> ErrCtx<'a> {
                     Some([rep, pos]) if rep.as_str().is_some() && pos.is_int_like() => (rep.as_str().unwrap_or("").to_string(), pos.clone()),
                     _ => return Err(it.type_error("decoding error handler must return (str, int) tuple")),
                 };
-                if let Some(Value::Obj(o)) = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "object")) {
-                    if let Kind::Bytes(b) = &o.kind {
-                        if b[..] != data[..] {
-                            *data = Cow::Owned(b.clone());
+                let object = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "object"));
+                if let Some(object) = object {
+                    match &object {
+                        Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => {
+                            if let Kind::Bytes(b) = &o.kind {
+                                if b[..] != data[..] {
+                                    *data = Cow::Owned(b.clone());
+                                }
+                            }
                         }
+                        _ => return Err(it.type_error("exception attribute object must be bytes")),
                     }
                 }
                 let newpos = handler_pos(it, &pos, data.len())?;
