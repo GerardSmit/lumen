@@ -79,7 +79,6 @@ pub fn init(it: &mut Interp) {
     iterm::init(it);
     genm::init(it);
     excm::init(it);
-    codecsm::init(it);
     excgroup::init(it);
     funcs::init(it);
     sysextra::init_frame_type(it);

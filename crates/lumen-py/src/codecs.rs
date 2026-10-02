@@ -1502,11 +1502,6 @@ pub fn unregister(it: &mut Interp, f: &Value) {
     }
 }
 
-pub fn forget_codec(it: &mut Interp, encoding: &str) {
-    let norm = normalize_encoding(encoding);
-    it.codecs.cache.remove(&norm);
-}
-
 /// `lookup()` that refuses codecs marked `_is_text_encoding = False` (CPython's
 /// `_PyCodec_LookupTextEncoding`).
 pub fn lookup_text(it: &mut Interp, encoding: &str, alternate: &str) -> R<Value> {
@@ -1642,15 +1637,6 @@ pub fn register_error(it: &mut Interp, name: &str, handler: Value) -> R<()> {
     ensure_errors(it);
     it.codecs.errors.insert(name.to_string(), handler);
     Ok(())
-}
-
-/// `_codecs._unregister_error`: whether a handler was removed; built-in ones cannot be.
-pub fn unregister_error(it: &mut Interp, name: &str) -> R<bool> {
-    if BUILTIN_ERRORS.iter().any(|(n, _)| *n == name) {
-        return Err(it.value_error(&format!("cannot un-register built-in error handler '{}'", name)));
-    }
-    ensure_errors(it);
-    Ok(it.codecs.errors.remove(name).is_some())
 }
 
 // The built-in handlers as Python callables (`codecs.strict_errors`, ...), working from the

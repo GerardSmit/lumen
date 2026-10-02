@@ -15,7 +15,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_ast", bound::<super::astm::_ast::Module>),
     ("_bisect", bound::<super::bisectm::_bisect::Module>),
     ("_blake2", bound::<super::hashlibm::_blake2::Module>),
-    ("_codecs", |it| Some(super::codecsm::make(it))),
+    ("_codecs", bound::<super::codecsm::_codecs::Module>),
     ("_collections", bound::<super::collectionsm::_collections::Module>),
     ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
     ("_csv", bound::<super::csvm::_csv::Module>),
