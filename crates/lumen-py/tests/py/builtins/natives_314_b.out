@@ -1,0 +1,56 @@
+ValueError batched(): incomplete batch
+[('a', 'b', 'c'), ('d', 'e', 'f')]
+[('a', 'b', 'c'), ('d', 'e', 'f'), ('g',)]
+(iterable, n, *, strict=False)
+TypeError batched() takes exactly 2 positional arguments (3 given)
+b'\x00\x00\x80?\x00\x00\x00\x00'
+8
+24
+12
+b'\x00\x00\x00\x00\x00\x00\xf0?\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00@'
+((1.5+0j), 2j)
+((1+2j),)
+error required argument is not a complex
+b'\xa0\xc8\xeb\x85\xf3\xcc\xe1\x7f\xa0\xc8\xeb\x85\xf3\xcc\xe1\x7f'
+{
+ "a": [
+  1,
+  2.5,
+  null
+ ],
+ "b": {},
+ "c": [],
+ "d": {
+  "e": [
+   1
+  ]
+ }
+}
+[
+	1,
+	[
+		2,
+		3
+	]
+]
+{
+  "a": 1,
+  "b": [
+    1,
+    2
+  ]
+}
+[]
+[
+1
+]
+[['1', None, '2', '']]
+[[1.0, None, '2', '']]
+ValueError could not convert string to float: 'a'
+[['a', 'b']]
+False
+($module, data, value=0, /)
+($module, /, level=Z_DEFAULT_COMPRESSION, method=DEFLATED,
+            wbits=MAX_WBITS, memLevel=DEF_MEM_LEVEL,
+            strategy=Z_DEFAULT_STRATEGY, zdict=None)
+($self, mode=zlib.Z_FINISH, /)
