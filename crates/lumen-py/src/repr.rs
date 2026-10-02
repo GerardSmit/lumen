@@ -130,6 +130,11 @@ impl Interp {
     }
 
     pub fn type_qualname(&self, t: &Obj) -> String {
+        if let Kind::Type(td) = &t.kind {
+            if let Some(q) = &*td.qualname.borrow() {
+                return q.to_string();
+            }
+        }
         if let Some(d) = t.dict.borrow().as_ref() {
             if let Some(q) = dict_get_str(d, "__qualname__") {
                 if let Some(s) = q.as_str() {

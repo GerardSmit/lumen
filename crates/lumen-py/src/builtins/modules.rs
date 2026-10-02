@@ -6,28 +6,39 @@ use crate::vm::*;
 
 type Kw<'a> = &'a [(Obj, Value)];
 
+type MakeModule = fn(&mut Interp) -> Option<Obj>;
+
+fn bound<M: lumen_bind::Module<crate::bind::PyHost>>(it: &mut Interp) -> Option<Obj> {
+    crate::bind::module_object::<M>(it).ok()
+}
+
+/// The native modules, sorted by name (also `sys.builtin_module_names`).
+const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
+    ("_codecs", |it| Some(super::codecsm::make(it))),
+    ("_collections", |it| Some(super::collectionsm::make(it))),
+    ("_random", bound::<super::randomm::_random::Module>),
+    ("_sha2", |it| Some(super::sha2m::make(it))),
+    ("_sre", |it| Some(super::sre::make(it))),
+    ("_string", |it| Some(super::stringm::make(it))),
+    ("_struct", bound::<super::structm::_struct::Module>),
+    ("_thread", |it| Some(super::sysmods::make_thread(it))),
+    ("_typing", |it| Some(super::typingm::make(it))),
+    ("_warnings", |it| Some(super::warningsm::make(it))),
+    ("_weakref", |it| Some(super::weakm::make(it))),
+    ("atexit", |it| Some(super::sysmods::make_atexit(it))),
+    ("builtins", |it| Some(super::sysmods::make_builtins(it))),
+    ("errno", bound::<super::errnom::errno::Module>),
+    ("gc", |it| Some(super::sysmods::make_gc(it))),
+    ("itertools", bound::<super::itertools::itertools::Module>),
+    ("math", bound::<super::mathm::math::Module>),
+    ("posix", bound::<super::posixm::posix::Module>),
+    ("sys", |it| Some(make_sys(it))),
+    ("time", |it| Some(make_time(it))),
+];
+
 pub fn builtin_module(it: &mut Interp, name: &str) -> Option<Obj> {
-    match name {
-        "sys" => Some(make_sys(it)),
-        "math" => crate::bind::module_object::<super::mathm::math::Module>(it).ok(),
-        "time" => Some(make_time(it)),
-        "builtins" => Some(super::sysmods::make_builtins(it)),
-        "_thread" => Some(super::sysmods::make_thread(it)),
-        "gc" => Some(super::sysmods::make_gc(it)),
-        "atexit" => Some(super::sysmods::make_atexit(it)),
-        "itertools" => crate::bind::module_object::<super::itertools::itertools::Module>(it).ok(),
-        "_string" => Some(super::stringm::make(it)),
-        "_warnings" => Some(super::warningsm::make(it)),
-        "_weakref" => Some(super::weakm::make(it)),
-        "_collections" => Some(super::collectionsm::make(it)),
-        "_codecs" => Some(super::codecsm::make(it)),
-        "_random" => Some(super::randomm::make(it)),
-        "_sre" => Some(super::sre::make(it)),
-        "_sha2" => Some(super::sha2m::make(it)),
-        "_struct" => crate::bind::module_object::<super::structm::_struct::Module>(it).ok(),
-        "_typing" => Some(super::typingm::make(it)),
-        _ => None,
-    }
+    let (_, make) = BUILTIN_MODULES.iter().find(|(n, _)| *n == name)?;
+    make(it)
 }
 
 pub fn init(it: &mut Interp) {
@@ -65,8 +76,7 @@ fn make_sys(it: &mut Interp) -> Obj {
         dict_set_str(&d, "argv", Value::list(argv.iter().map(|a| Value::str(a)).collect()));
         it.argv = argv;
     }
-    let builtin_names = ["_codecs", "_collections","_random", "_sha2", "_sre", "_string", "_struct", "_thread", "_typing", "_warnings", "_weakref", "atexit", "builtins", "gc", "itertools", "math", "sys", "time"];
-    dict_set_str(&d, "builtin_module_names", Value::tuple(builtin_names.iter().map(|n| Value::str(n)).collect()));
+    dict_set_str(&d, "builtin_module_names", Value::tuple(BUILTIN_MODULES.iter().map(|(n, _)| Value::str(n)).collect()));
     dict_set_str(&d, "stdout", new_file(it, FileMode::Stdout, true, "<stdout>"));
     dict_set_str(&d, "stderr", new_file(it, FileMode::Stderr, true, "<stderr>"));
     dict_set_str(&d, "stdin", new_file(it, FileMode::Stdin, true, "<stdin>"));

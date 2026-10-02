@@ -34,6 +34,8 @@ pub mod sha2m;
 pub mod sre;
 pub mod structm;
 pub mod oserror;
+pub mod errnom;
+pub mod posixm;
 pub mod typingm;
 
 use crate::object::*;

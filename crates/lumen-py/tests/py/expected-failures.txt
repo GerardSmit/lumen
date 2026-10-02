@@ -1,16 +1,11 @@
 # Corpus scripts that are known to fail: `path  # reason`, one per line.
-classes/pep695_classes.py  # typing -> contextlib -> `import os`: no os/posix module
-stdlib/asyncio_basic.py  # asyncio is not vendored (needs os, socket, select, selectors)
-stdlib/asyncio_mod.py  # asyncio is not vendored (needs os, socket, select, selectors)
-stdlib/dataclasses_basic.py  # dataclasses -> inspect -> ast (needs _ast), dis, os
-stdlib/dataclasses_mod.py  # dataclasses -> inspect -> ast (needs _ast), dis, os
-stdlib/enum_typing.py  # typing -> contextlib -> `import os`: no os/posix module
-stdlib/random_basic.py  # random -> `from os import urandom`: no os/posix module
-stdlib/random_mod.py  # random -> `from os import urandom`: no os/posix module
-stdlib/typing_enum.py  # typing -> contextlib -> `import os`: no os/posix module
-stdlib/typing_features.py  # typing -> contextlib -> `import os`: no os/posix module
-realworld/hermes_plugin.py  # needs ast/_ast, os/posix, _io, logging, pathlib, tempfile
-realworld/home_automation.py  # needs asyncio, zoneinfo, logging, _contextvars, select, socket
-realworld/llm_client.py  # needs argparse, urllib.request, http.server, subprocess, socket, hashlib
-realworld/project_audit.py  # needs _csv, os/posix, _io, subprocess/_posixsubprocess, shutil, tempfile
-realworld/sales_report.py  # needs io, decimal (_pydecimal + _contextvars), statistics, fractions
+realworld/hermes_plugin.py  # needs ast/_ast (inspect, dataclasses), _io (io, tempfile, logging)
+realworld/home_automation.py  # needs _io, select, _socket, _signal (asyncio), _contextvars, sysconfig data (zoneinfo)
+realworld/llm_client.py  # needs _io, _socket, select, _posixsubprocess, binascii, _md5/_sha1/_blake2
+realworld/project_audit.py  # needs _csv, _io (io, tempfile), select and _posixsubprocess (subprocess)
+realworld/sales_report.py  # needs _io (io.StringIO), _contextvars (_pydecimal)
+stdlib/asyncio_basic.py  # asyncio needs _io, select, _socket, _signal, _contextvars
+stdlib/asyncio_mod.py  # asyncio needs _io, select, _socket, _signal, _contextvars
+stdlib/dataclasses_basic.py  # dataclasses -> inspect -> ast: no _ast module
+stdlib/dataclasses_mod.py  # dataclasses -> inspect -> ast: no _ast module
+stdlib/typing_features.py  # runtime protocol isinstance -> inspect -> ast: no _ast module

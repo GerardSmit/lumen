@@ -684,8 +684,8 @@ impl Interp {
         }
         Some(match nm {
             "__name__" => Value::str(&td.name.borrow()),
-            "__qualname__" => match cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "__qualname__")) {
-                Some(v) => v,
+            "__qualname__" => match &*td.qualname.borrow() {
+                Some(q) => Value::str(q),
                 None => Value::str(&td.name.borrow()),
             },
             "__bases__" => Value::tuple(td.bases.borrow().iter().map(|b| Value::Obj(b.clone())).collect()),
@@ -1066,6 +1066,14 @@ impl Interp {
                 match nm.as_str() {
                     "__name__" => {
                         *td.name.borrow_mut() = v.as_str().unwrap_or("").into();
+                        return Ok(());
+                    }
+                    "__qualname__" => {
+                        let Some(q) = v.as_str() else {
+                            let msg = format!("can only assign string to {}.__qualname__, not '{}'", td.name.borrow(), self.type_name_of(&v));
+                            return Err(self.type_error(&msg));
+                        };
+                        *td.qualname.borrow_mut() = Some(q.into());
                         return Ok(());
                     }
                     "__bases__" => {
@@ -1494,6 +1502,20 @@ impl Interp {
             Kind::Dict(d) => d.borrow().clone(),
             _ => PyDict::new(),
         })));
+        let qualname: Option<Rc<str>> = match dict_get_str(&dict, "__qualname__") {
+            Some(v) => match v.as_str() {
+                Some(q) => {
+                    let q = q.into();
+                    dict_del_str(&dict, "__qualname__");
+                    Some(q)
+                }
+                None => {
+                    let msg = format!("type __qualname__ must be a str, not {}", self.type_name_of(&v));
+                    return Err(self.type_error(&msg));
+                }
+            },
+            None => None,
+        };
         if dict_get_str(&dict, "__module__").is_none() {
             let m = self.frames.last().and_then(|f| dict_get_str(&f.globals, "__name__")).unwrap_or_else(|| Value::str("__main__"));
             dict_set_str(&dict, "__module__", m);
@@ -1511,6 +1533,7 @@ impl Interp {
             id: std::cell::Cell::new(0),
             kind: Kind::Type(TypeData {
                 name: RefCell::new(name.into()),
+                qualname: RefCell::new(qualname),
                 bases: RefCell::new(Vec::new()),
                 mro: RefCell::new(Vec::new()),
                 layout: Cell::new(layout),

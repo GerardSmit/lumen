@@ -126,6 +126,18 @@ pub fn new_structseq_type_ext(it: &mut Interp, module: &str, name: &str, fields:
     ty
 }
 
+/// The interpreter's single [`new_structseq_type_ext`] type identified by the marker type `K`,
+/// created on first use, so natives can build instances without a module lookup.
+pub fn structseq_type<K: 'static>(it: &mut Interp, module: &str, name: &str, fields: &[&'static str], n_seq: usize) -> Obj {
+    let key = std::any::TypeId::of::<K>();
+    if let Some(t) = it.native_types.get(&key) {
+        return t.clone();
+    }
+    let t = new_structseq_type_ext(it, module, name, fields, n_seq);
+    it.native_types.insert(key, t.clone());
+    t
+}
+
 /// An instance of a [`new_structseq_type_ext`] type from all of its field values.
 pub fn structseq_full(ty: &Obj, mut vals: Vec<Value>) -> Value {
     let n_seq = type_int(ty, "n_sequence_fields").min(vals.len());

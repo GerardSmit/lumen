@@ -21,6 +21,7 @@
 //! `BufferError`.
 
 pub mod args;
+pub mod path;
 mod class;
 mod convert;
 
@@ -29,6 +30,7 @@ pub use crate::pyint::BigInt;
 pub use crate::vm::Interp;
 pub use class::{is_instance, module_object, native_value, opaque_instance, owner_of, type_object, NativeIter, Py};
 pub use convert::{buffer_error, index, native_error};
+pub use path::{convert_path, fspath, wrap_path, FsPath, PathArg, PathOrFd};
 pub use lumen_bind::{ErrorKind, NativeError, NativeResult, This};
 
 use crate::object::Kind;

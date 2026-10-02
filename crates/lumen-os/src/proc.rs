@@ -349,3 +349,149 @@ pub mod wait {
         }
     }
 }
+
+#[cfg(unix)]
+fn check(rc: libc::c_int) -> R<libc::c_int> {
+    if rc < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(rc)
+    }
+}
+
+/// `waitpid(2)`: `(pid, status)`; `pid` is 0 when `WNOHANG` found no exited child. Retries on
+/// `EINTR`.
+pub fn waitpid(pid: i32, options: i32) -> R<(i32, i32)> {
+    #[cfg(unix)]
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid out-parameter.
+        let r = unsafe { libc::waitpid(pid, &mut status, options) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        return Ok((r, status));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, options);
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// `system(3)`: the raw wait status of `/bin/sh -c command`.
+pub fn system(command: &str) -> R<i32> {
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(command).map_err(|_| FsError("EINVAL"))?;
+        // SAFETY: `c` is a valid NUL-terminated string.
+        Ok(unsafe { libc::system(c.as_ptr()) })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// Process-group and session calls.
+pub mod group {
+    use super::*;
+
+    pub fn getpgrp() -> i32 {
+        #[cfg(unix)]
+        {
+            // SAFETY: no arguments, cannot fail.
+            unsafe { libc::getpgrp() }
+        }
+        #[cfg(not(unix))]
+        0
+    }
+
+    pub fn getpgid(pid: i32) -> R<i32> {
+        #[cfg(unix)]
+        {
+            // SAFETY: plain integer argument.
+            check(unsafe { libc::getpgid(pid) })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Err(FsError("ENOSYS"))
+        }
+    }
+
+    pub fn getsid(pid: i32) -> R<i32> {
+        #[cfg(unix)]
+        {
+            // SAFETY: plain integer argument.
+            check(unsafe { libc::getsid(pid) })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Err(FsError("ENOSYS"))
+        }
+    }
+
+    pub fn setpgid(pid: i32, pgrp: i32) -> R<()> {
+        #[cfg(unix)]
+        {
+            // SAFETY: plain integer arguments.
+            check(unsafe { libc::setpgid(pid, pgrp) })?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (pid, pgrp);
+            Err(FsError("ENOSYS"))
+        }
+    }
+
+    pub fn setsid() -> R<i32> {
+        #[cfg(unix)]
+        {
+            // SAFETY: no arguments.
+            check(unsafe { libc::setsid() })
+        }
+        #[cfg(not(unix))]
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// The login name of the session's user (`getlogin(3)`).
+pub fn getlogin() -> R<String> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getlogin returns null or a pointer to static storage.
+        let p = unsafe { libc::getlogin() };
+        if p.is_null() {
+            let e = std::io::Error::last_os_error();
+            return Err(if e.raw_os_error() == Some(0) { FsError("ENOENT") } else { e.into() });
+        }
+        // SAFETY: a non-null result is a NUL-terminated string.
+        Ok(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+    #[cfg(not(unix))]
+    Err(FsError("ENOSYS"))
+}
+
+/// The supplementary group ids of the process (`getgroups(2)`).
+pub fn getgroups() -> R<Vec<u32>> {
+    #[cfg(unix)]
+    {
+        // SAFETY: a zero-length query returns the count.
+        let n = check(unsafe { libc::getgroups(0, std::ptr::null_mut()) })?;
+        let mut v: Vec<libc::gid_t> = vec![0; n as usize];
+        // SAFETY: `v` has room for `n` ids.
+        let n = check(unsafe { libc::getgroups(n, v.as_mut_ptr()) })?;
+        v.truncate(n as usize);
+        Ok(v)
+    }
+    #[cfg(not(unix))]
+    Ok(Vec::new())
+}

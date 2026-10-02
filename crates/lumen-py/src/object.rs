@@ -161,6 +161,8 @@ pub const TF_DISPATCH: u32 = 8;
 
 pub struct TypeData {
     pub name: RefCell<Rc<str>>,
+    /// `__qualname__`, when it differs from `name` (taken out of the class namespace).
+    pub qualname: RefCell<Option<Rc<str>>>,
     pub bases: RefCell<Vec<Obj>>,
     pub mro: RefCell<Vec<Obj>>,
     pub layout: Cell<Layout>,

@@ -340,6 +340,23 @@ pub trait Platform {
     fn sysconf(&self, _name: i32) -> PResult<i64> {
         Err(IoError::from_code("EINVAL"))
     }
+    /// `waitpid(2)`: `(pid, raw status)`.
+    fn waitpid(&mut self, _pid: i32, _options: i32) -> PResult<(i32, i32)> {
+        Err(no_sys())
+    }
+    /// `system(3)`: the raw wait status.
+    fn system(&mut self, _command: &str) -> PResult<i32> {
+        Err(no_sys())
+    }
+    fn process_group(&mut self, _call: ProcGroup) -> PResult<i32> {
+        Err(no_sys())
+    }
+    fn getlogin(&mut self) -> PResult<String> {
+        Err(no_sys())
+    }
+    fn getgroups(&mut self) -> PResult<Vec<u32>> {
+        Err(no_sys())
+    }
     /// Ends the process at once (`os._exit`).
     fn exit_process(&mut self, code: i32) -> ! {
         self.flush_stdout();
@@ -349,6 +366,16 @@ pub trait Platform {
         self.flush_stdout();
         std::process::abort()
     }
+}
+
+/// The process-group and session calls behind [`Platform::process_group`].
+#[derive(Clone, Copy, Debug)]
+pub enum ProcGroup {
+    GetPgrp,
+    GetPgid(i32),
+    GetSid(i32),
+    SetPgid(i32, i32),
+    SetSid,
 }
 
 fn no_sys() -> IoError {
@@ -676,6 +703,34 @@ impl Platform for StdPlatform {
 
     fn sysconf(&self, name: i32) -> PResult<i64> {
         Ok(lumen_os::proc::sysconf(name)?)
+    }
+
+    fn waitpid(&mut self, pid: i32, options: i32) -> PResult<(i32, i32)> {
+        Ok(lumen_os::proc::waitpid(pid, options)?)
+    }
+
+    fn system(&mut self, command: &str) -> PResult<i32> {
+        self.flush_stdout();
+        Ok(lumen_os::proc::system(command)?)
+    }
+
+    fn process_group(&mut self, call: ProcGroup) -> PResult<i32> {
+        use lumen_os::proc::group;
+        Ok(match call {
+            ProcGroup::GetPgrp => group::getpgrp(),
+            ProcGroup::GetPgid(pid) => group::getpgid(pid)?,
+            ProcGroup::GetSid(pid) => group::getsid(pid)?,
+            ProcGroup::SetPgid(pid, pgrp) => group::setpgid(pid, pgrp).map(|_| 0)?,
+            ProcGroup::SetSid => group::setsid()?,
+        })
+    }
+
+    fn getlogin(&mut self) -> PResult<String> {
+        Ok(lumen_os::proc::getlogin()?)
+    }
+
+    fn getgroups(&mut self) -> PResult<Vec<u32>> {
+        Ok(lumen_os::proc::getgroups()?)
     }
 }
 
@@ -1122,6 +1177,26 @@ impl Platform for MemPlatform {
 
     fn sysconf(&self, name: i32) -> PResult<i64> {
         self.inner.sysconf(name)
+    }
+
+    fn waitpid(&mut self, pid: i32, options: i32) -> PResult<(i32, i32)> {
+        self.inner.waitpid(pid, options)
+    }
+
+    fn system(&mut self, command: &str) -> PResult<i32> {
+        self.inner.system(command)
+    }
+
+    fn process_group(&mut self, call: ProcGroup) -> PResult<i32> {
+        self.inner.process_group(call)
+    }
+
+    fn getlogin(&mut self) -> PResult<String> {
+        self.inner.getlogin()
+    }
+
+    fn getgroups(&mut self) -> PResult<Vec<u32>> {
+        self.inner.getgroups()
     }
 
     fn exit_process(&mut self, code: i32) -> ! {

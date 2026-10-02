@@ -1,0 +1,22 @@
+ok 0.25 True
+True
+True 0 True True
+ValueError
+TypeError
+TypeError
+TypeError
+ValueError
+ValueError
+True 625
+TypeError
+TypeError
+ValueError
+IndexError
+ValueError
+ValueError
+ValueError
+True True True 5 1
+seed ignored
+NotImplementedError
+[492925, 190532, 763640, 606446] 50887665514211183203 3
+True

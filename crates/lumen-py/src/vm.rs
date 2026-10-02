@@ -45,6 +45,7 @@ pub fn new_type_raw(name: &str, layout: Layout) -> Obj {
         dict: RefCell::new(Some(Object::new(Kind::Dict(RefCell::new(PyDict::new()))))),
         kind: Kind::Type(TypeData {
             name: RefCell::new(name.into()),
+            qualname: RefCell::new(None),
             bases: RefCell::new(Vec::new()),
             mro: RefCell::new(Vec::new()),
             layout: std::cell::Cell::new(layout),
