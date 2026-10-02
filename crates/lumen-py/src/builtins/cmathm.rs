@@ -1,5 +1,7 @@
 //! The `cmath` module, on the shared complex functions of `lumen_common::float::complex`.
 
+/// This module provides access to mathematical functions for complex
+/// numbers.
 #[lumen_bind::module(name = "cmath")]
 pub mod cmath {
     use crate::object::*;

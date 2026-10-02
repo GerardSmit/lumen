@@ -1,5 +1,7 @@
 //! The `math` module.
 
+/// This module provides access to the mathematical functions
+/// defined by the C standard.
 #[lumen_bind::module(name = "math")]
 pub mod math {
     use crate::ast::BinOp;

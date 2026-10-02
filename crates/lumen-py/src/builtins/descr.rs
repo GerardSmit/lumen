@@ -209,7 +209,7 @@ impl CallSlot {
     // `meth_reduce`, `method_reduce` and `descr_reduce`: a bound method pickles as
     // `getattr(self, name)`, a method descriptor as `getattr(type, name)`, a module function as
     // its name.
-    #[method(name = "__reduce__")]
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
     fn reduce(slf: This<&Value>, it: &mut Interp) -> R<Value> {
         let bound_to = match &*slf {
             Value::Obj(o) => match &o.kind {
@@ -230,12 +230,13 @@ impl CallSlot {
     }
 }
 
+/// Create a bound instance method object.
 #[lumen_bind::class(name = "method")]
 pub struct MethodType;
 
 #[lumen_bind::methods]
 impl MethodType {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(function, instance, /)")))]
     fn new(it: &mut Interp, function: &Value, instance: &Value) -> R<Value> {
         if !it.is_callable(function) {
             return Err(it.type_error("first argument must be callable"));
@@ -260,12 +261,15 @@ impl<'a> lumen_bind::FromArg<'a, crate::bind::PyHost> for ModuleRef<'a> {
     }
 }
 
+/// Create a module object.
+///
+/// The name must be a string; the optional doc argument can have any type.
 #[lumen_bind::class(name = "module")]
 pub struct ModuleType;
 
 #[lumen_bind::methods]
 impl ModuleType {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(name, doc=None)")))]
     fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> Value {
         let _ = (args, kwargs);
         let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };

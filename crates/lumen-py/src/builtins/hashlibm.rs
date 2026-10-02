@@ -95,6 +95,7 @@ pub fn compare_digest(it: &mut Interp, a: &Value, b: &Value) -> R<bool> {
     Ok(lumen_common::hash::constant_time_eq(&x, &y))
 }
 
+/// OpenSSL interface for hashlib module
 #[lumen_bind::module(name = "_hashlib")]
 pub mod _hashlib {
     use super::*;

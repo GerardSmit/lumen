@@ -2,6 +2,36 @@
 //! sources, which the VM drives directly; `count` and `repeat` keep inspectable state for their
 //! `repr`.
 
+/// Functional tools for creating and using iterators.
+///
+/// Infinite iterators:
+/// count(start=0, step=1) --> start, start+step, start+2*step, ...
+/// cycle(p) --> p0, p1, ... plast, p0, p1, ...
+/// repeat(elem [,n]) --> elem, elem, elem, ... endlessly or up to n times
+///
+/// Iterators terminating on the shortest input sequence:
+/// accumulate(p[, func]) --> p0, p0+p1, p0+p1+p2
+/// batched(p, n) --> [p0, p1, ..., p_n-1], [p_n, p_n+1, ..., p_2n-1], ...
+/// chain(p, q, ...) --> p0, p1, ... plast, q0, q1, ...
+/// chain.from_iterable([p, q, ...]) --> p0, p1, ... plast, q0, q1, ...
+/// compress(data, selectors) --> (d[0] if s[0]), (d[1] if s[1]), ...
+/// dropwhile(predicate, seq) --> seq[n], seq[n+1], starting when predicate fails
+/// groupby(iterable[, keyfunc]) --> sub-iterators grouped by value of keyfunc(v)
+/// filterfalse(predicate, seq) --> elements of seq where predicate(elem) is False
+/// islice(seq, [start,] stop [, step]) --> elements from
+///        seq[start:stop:step]
+/// pairwise(s) --> (s[0],s[1]), (s[1],s[2]), (s[2], s[3]), ...
+/// starmap(fun, seq) --> fun(*seq[0]), fun(*seq[1]), ...
+/// tee(it, n=2) --> (it1, it2 , ... itn) splits one iterator into n
+/// takewhile(predicate, seq) --> seq[0], seq[1], until predicate fails
+/// zip_longest(p, q, ...) --> (p[0], q[0]), (p[1], q[1]), ...
+///
+/// Combinatoric generators:
+/// product(p, q, ... [repeat=1]) --> cartesian product
+/// permutations(p[, r])
+/// combinations(p, r)
+/// combinations_with_replacement(p, r)
+///
 #[lumen_bind::module(name = "itertools")]
 pub mod itertools {
     // `__new__` of a `native_iter` class returns the step closure, not `Self`.
@@ -34,6 +64,14 @@ pub mod itertools {
 
     // ---- count / repeat -----------------------------------------------------------------------
 
+    /// Return a count object whose .__next__() method returns consecutive values.
+    ///
+    /// Equivalent to:
+    ///     def count(firstval=0, step=1):
+    ///         x = firstval
+    ///         while 1:
+    ///             yield x
+    ///             x += step
     #[class(name = "count")]
     pub struct Count {
         cur: Value,
@@ -42,7 +80,7 @@ pub mod itertools {
 
     #[methods]
     impl Count {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(start=0, step=1)")))]
         fn new(it: &mut Interp, #[kw] #[default(0)] start: Value, #[kw] #[default(1)] step: Value) -> R<Count> {
             for v in [&start, &step] {
                 if !it.number_check(v) {
@@ -92,6 +130,9 @@ pub mod itertools {
         }
     }
 
+    /// repeat(object [,times]) -> create an iterator which returns the object
+    /// for the specified number of times.  If not specified, returns the object
+    /// endlessly.
     #[class(name = "repeat")]
     pub struct Repeat {
         obj: Value,
@@ -142,6 +183,8 @@ pub mod itertools {
             })
         }
 
+        /// Private method returning an estimate of len(list(it)).
+        #[method(hint(py(text_signature = "")))]
         fn __length_hint__(&self) -> NativeResult<i64> {
             self.times.ok_or_else(|| NativeError::type_error("len() of unsized object"))
         }
@@ -149,12 +192,13 @@ pub mod itertools {
 
     // ---- infinite and simple adaptors -----------------------------------------------------------
 
+    /// Return elements from the iterable until it is exhausted. Then repeat the sequence indefinitely.
     #[class(name = "cycle", hint(py(native_iter)))]
     pub struct Cycle;
 
     #[methods]
     impl Cycle {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, /)")))]
         fn new(it: &mut Interp, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             let mut saved: Vec<Value> = Vec::new();
@@ -198,6 +242,11 @@ pub mod itertools {
         })
     }
 
+    /// chain(*iterables) --> chain object
+    ///
+    /// Return a chain object whose .__next__() method returns elements from the
+    /// first iterable until it is exhausted, then elements from the next
+    /// iterable, until all of the iterables are exhausted.
     #[class(name = "chain", generic, hint(py(native_iter)))]
     pub struct Chain;
 
@@ -218,12 +267,13 @@ pub mod itertools {
         }
     }
 
+    /// Return series of accumulated sums (or other binary function results).
     #[class(name = "accumulate", hint(py(native_iter)))]
     pub struct Accumulate;
 
     #[methods]
     impl Accumulate {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, func=None, *, initial=None)")))]
         fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] #[default(Value::None)] func: Value, #[kwonly] initial: Option<Value>) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             let mut initial = initial;
@@ -245,12 +295,16 @@ pub mod itertools {
         }
     }
 
+    /// Return data elements corresponding to true selector elements.
+    ///
+    /// Forms a shorter iterator from selected data elements using the selectors to
+    /// choose the data elements.
     #[class(name = "compress", hint(py(native_iter)))]
     pub struct Compress;
 
     #[methods]
     impl Compress {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(data, selectors)")))]
         fn new(it: &mut Interp, #[kw] data: &Value, #[kw] selectors: &Value) -> R<NativeIter> {
             let data = it.get_iter(data)?;
             let sel = it.get_iter(selectors)?;
@@ -264,12 +318,15 @@ pub mod itertools {
         }
     }
 
+    /// Drop items from the iterable while predicate(item) is true.
+    ///
+    /// Afterwards, return every element until the iterable is exhausted.
     #[class(name = "dropwhile", hint(py(native_iter)))]
     pub struct DropWhile;
 
     #[methods]
     impl DropWhile {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(predicate, iterable, /)")))]
         fn new(it: &mut Interp, predicate: Value, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             let mut dropping = true;
@@ -287,12 +344,13 @@ pub mod itertools {
         }
     }
 
+    /// Return successive entries from an iterable as long as the predicate evaluates to true for each entry.
     #[class(name = "takewhile", hint(py(native_iter)))]
     pub struct TakeWhile;
 
     #[methods]
     impl TakeWhile {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(predicate, iterable, /)")))]
         fn new(it: &mut Interp, predicate: Value, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             let mut done = false;
@@ -312,12 +370,15 @@ pub mod itertools {
         }
     }
 
+    /// Return those items of iterable for which function(item) is false.
+    ///
+    /// If function is None, return the items that are false.
     #[class(name = "filterfalse", hint(py(native_iter)))]
     pub struct FilterFalse;
 
     #[methods]
     impl FilterFalse {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(function, iterable, /)")))]
         fn new(it: &mut Interp, function: Value, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             Ok(NativeIter::new(move |it| loop {
@@ -329,12 +390,13 @@ pub mod itertools {
         }
     }
 
+    /// Return an iterator whose values are returned from the function evaluated with an argument tuple taken from the given sequence.
     #[class(name = "starmap", hint(py(native_iter)))]
     pub struct StarMap;
 
     #[methods]
     impl StarMap {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(function, iterable, /)")))]
         fn new(it: &mut Interp, function: Value, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             Ok(NativeIter::new(move |it| {
@@ -345,12 +407,15 @@ pub mod itertools {
         }
     }
 
+    /// Return an iterator of overlapping pairs taken from the input iterator.
+    ///
+    ///     s -> (s0,s1), (s1,s2), (s2, s3), ...
     #[class(name = "pairwise", hint(py(native_iter)))]
     pub struct Pairwise;
 
     #[methods]
     impl Pairwise {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, /)")))]
         fn new(it: &mut Interp, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             let mut prev: Option<Value> = None;
@@ -375,12 +440,25 @@ pub mod itertools {
         }
     }
 
+    /// Batch data into tuples of length n. The last batch may be shorter than n.
+    ///
+    /// Loops over the input iterable and accumulates data into tuples
+    /// up to size n.  The input is consumed lazily, just enough to
+    /// fill a batch.  The result is yielded as soon as a batch is full
+    /// or when the input iterable is exhausted.
+    ///
+    ///     >>> for batch in batched('ABCDEFG', 3):
+    ///     ...     print(batch)
+    ///     ...
+    ///     ('A', 'B', 'C')
+    ///     ('D', 'E', 'F')
+    ///     ('G',)
     #[class(name = "batched", hint(py(native_iter)))]
     pub struct Batched;
 
     #[methods]
     impl Batched {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, n)")))]
         fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] n: isize) -> R<NativeIter> {
             if n < 1 {
                 return Err(it.value_error("n must be at least one"));
@@ -400,6 +478,15 @@ pub mod itertools {
         }
     }
 
+    /// islice(iterable, stop) --> islice object
+    /// islice(iterable, start, stop[, step]) --> islice object
+    ///
+    /// Return an iterator whose next() method returns selected values from an
+    /// iterable.  If start is specified, will skip all preceding elements;
+    /// otherwise, start defaults to zero.  Step defaults to one.  If
+    /// specified as another value, step determines how many values are
+    /// skipped between successive calls.  Works like a slice() on a list
+    /// but returns an iterator.
     #[class(name = "islice", hint(py(native_iter)))]
     pub struct ISlice;
 
@@ -465,6 +552,15 @@ pub mod itertools {
         }
     }
 
+    /// zip_longest(iter1 [,iter2 [...]], [fillvalue=None]) --> zip_longest object
+    ///
+    /// Return a zip_longest object whose .__next__() method returns a tuple where
+    /// the i-th element comes from the i-th iterable argument.  The .__next__()
+    /// method continues until the longest iterable in the argument sequence
+    /// is exhausted and then it raises StopIteration.  When the shorter iterables
+    /// are exhausted, the fillvalue is substituted in their place.  The fillvalue
+    /// defaults to None or can be specified by a keyword argument.
+    ///
     #[class(name = "zip_longest", hint(py(native_iter)))]
     pub struct ZipLongest;
 
@@ -591,7 +687,8 @@ pub mod itertools {
             Ok(Some(v))
         }
 
-        #[proto(copy)]
+        /// Returns an independent iterator.
+        #[proto(copy, hint(py(text_signature = "")))]
         fn __copy__(&self) -> Tee {
             Tee::at(&self.shared, self.pos.get())
         }
@@ -658,12 +755,20 @@ pub mod itertools {
     #[methods]
     impl Grouper {}
 
+    /// make an iterator that returns consecutive keys and groups from the iterable
+    ///
+    ///   iterable
+    ///     Elements to divide into groups according to the key function.
+    ///   key
+    ///     A function for computing the group category for each element.
+    ///     If the key function is not specified or is None, the element itself
+    ///     is used for grouping.
     #[class(name = "groupby", hint(py(native_iter)))]
     pub struct GroupBy;
 
     #[methods]
     impl GroupBy {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, key=None)")))]
         fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] #[default(Value::None)] key: Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             let g = Rc::new(RefCell::new(GroupState { src, keyfunc: key, tgtkey: None, currkey: None, currvalue: None, grouper_id: 0 }));
@@ -720,6 +825,21 @@ pub mod itertools {
         Value::tuple(indices.iter().map(|&i| pool[i].clone()).collect())
     }
 
+    /// product(*iterables, repeat=1) --> product object
+    ///
+    /// Cartesian product of input iterables.  Equivalent to nested for-loops.
+    ///
+    /// For example, product(A, B) returns the same as:  ((x,y) for x in A for y in B).
+    /// The leftmost iterators are in the outermost for-loop, so the output tuples
+    /// cycle in a manner similar to an odometer (with the rightmost element changing
+    /// on every iteration).
+    ///
+    /// To compute the product of an iterable with itself, specify the number
+    /// of repetitions with the optional repeat keyword argument. For example,
+    /// product(A, repeat=4) means the same as product(A, A, A, A).
+    ///
+    /// product('ab', range(3)) --> ('a',0) ('a',1) ('a',2) ('b',0) ('b',1) ('b',2)
+    /// product((0,1), (0,1), (0,1)) --> (0,0,0) (0,0,1) (0,1,0) (0,1,1) (1,0,0) ...
     #[class(name = "product", hint(py(native_iter)))]
     pub struct Product;
 
@@ -766,12 +886,15 @@ pub mod itertools {
         }
     }
 
+    /// Return successive r-length permutations of elements in the iterable.
+    ///
+    /// permutations(range(3), 2) --> (0,1), (0,2), (1,0), (1,2), (2,0), (2,1)
     #[class(name = "permutations", hint(py(native_iter)))]
     pub struct Permutations;
 
     #[methods]
     impl Permutations {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, r=None)")))]
         fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] r: Option<&Value>) -> R<NativeIter> {
             let pool = it.iterate_to_vec(iterable)?;
             let n = pool.len();
@@ -830,12 +953,15 @@ pub mod itertools {
         Ok(r as usize)
     }
 
+    /// Return successive r-length combinations of elements in the iterable.
+    ///
+    /// combinations(range(4), 3) --> (0,1,2), (0,1,3), (0,2,3), (1,2,3)
     #[class(name = "combinations", hint(py(native_iter)))]
     pub struct Combinations;
 
     #[methods]
     impl Combinations {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, r)")))]
         fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] r: &Value) -> R<NativeIter> {
             let pool = it.iterate_to_vec(iterable)?;
             let r = combinations_r(it, r)?;
@@ -870,12 +996,15 @@ pub mod itertools {
         }
     }
 
+    /// Return successive r-length combinations of elements in the iterable allowing individual elements to have successive repeats.
+    ///
+    /// combinations_with_replacement('ABC', 2) --> ('A','A'), ('A','B'), ('A','C'), ('B','B'), ('B','C'), ('C','C')
     #[class(name = "combinations_with_replacement", hint(py(native_iter)))]
     pub struct CombinationsWithReplacement;
 
     #[methods]
     impl CombinationsWithReplacement {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "(iterable, r)")))]
         fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] r: &Value) -> R<NativeIter> {
             let pool = it.iterate_to_vec(iterable)?;
             let r = combinations_r(it, r)?;

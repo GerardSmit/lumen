@@ -218,6 +218,7 @@ fn pack_item(it: &mut Interp, fmt: &str, kind: ElemKind, v: &Value, out: &mut [u
 /// CPython's `PyBUF_MAX_NDIM`.
 const MAX_NDIM: usize = 64;
 
+/// Create a new memoryview object which references the given object.
 #[lumen_bind::class(name = "memoryview", module = "builtins")]
 pub struct MemoryView {
     obj: Value,
@@ -382,7 +383,7 @@ fn slice_parts(it: &mut Interp, s: &Value) -> R<(Option<isize>, Option<isize>, i
 
 #[lumen_bind::methods]
 impl MemoryView {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(object)")))]
     fn new(it: &mut Interp, #[kw] object: &Value) -> R<MemoryView> {
         MemoryView::of(it, object)
     }
@@ -565,6 +566,7 @@ impl MemoryView {
         Err(it.type_error("cannot pickle 'memoryview' object"))
     }
 
+    /// Return the data in the buffer as a list of elements.
     #[method(hint(py(text_signature = "($self, /)")))]
     fn tolist(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
@@ -581,6 +583,13 @@ impl MemoryView {
         Ok(nest(&self.view.shape, &mut flat.into_iter()))
     }
 
+    /// Return the data in the buffer as a byte string.
+    ///
+    /// Order can be {'C', 'F', 'A'}. When order is 'C' or 'F', the data of the
+    /// original array is converted to C or Fortran order. For contiguous views,
+    /// 'A' returns an exact copy of the physical memory. In particular, in-memory
+    /// Fortran order is preserved. For non-contiguous views, the data is converted
+    /// to C first. order=None is the same as order='C'.
     #[method(hint(py(text_signature = "($self, /, order='C')")))]
     fn tobytes(&self, it: &mut Interp, #[kw] order: Option<&Value>) -> R<Value> {
         if let Some(o) = order.filter(|o| !o.is_none()) {
@@ -592,6 +601,24 @@ impl MemoryView {
         Ok(Value::bytes(self.bytes(it)?))
     }
 
+    /// Return the data in the buffer as a str of hexadecimal numbers.
+    ///
+    ///   sep
+    ///     An optional single character or byte to separate hex bytes.
+    ///   bytes_per_sep
+    ///     How many bytes between separators.  Positive values count from the
+    ///     right, negative values count from the left.
+    ///
+    /// Example:
+    /// >>> value = memoryview(b'\xb9\x01\xef')
+    /// >>> value.hex()
+    /// 'b901ef'
+    /// >>> value.hex(':')
+    /// 'b9:01:ef'
+    /// >>> value.hex(':', 2)
+    /// 'b9:01ef'
+    /// >>> value.hex(':', -2)
+    /// 'b901:ef'
     #[method(hint(py(text_signature = "($self, /, sep=<unrepresentable>, bytes_per_sep=1)")))]
     fn hex(&self, it: &mut Interp, #[kw] sep: Option<&Value>, #[kw] bytes_per_sep: Option<&Value>) -> R<String> {
         let data = self.bytes(it)?;
@@ -603,11 +630,13 @@ impl MemoryView {
         Ok(lumen_common::codec::hex_encode_sep(&data, sep, per))
     }
 
+    /// Release the underlying buffer exposed by the memoryview object.
     #[method(hint(py(text_signature = "($self, /)")))]
     fn release(&mut self) {
         self.src = None;
     }
 
+    /// Return a readonly version of the memoryview.
     #[method(hint(py(text_signature = "($self, /)")))]
     fn toreadonly(&self, it: &mut Interp) -> R<Value> {
         let mut v = self.view.clone();
@@ -616,6 +645,7 @@ impl MemoryView {
         self.derive(it, v, fmt)
     }
 
+    /// Cast a memoryview to a new format or shape.
     #[method(hint(py(text_signature = "($self, /, format, shape=<unrepresentable>)")))]
     fn cast(&self, it: &mut Interp, #[kw] format: &Value, #[kw] shape: Option<&Value>) -> R<Value> {
         self.src(it)?;

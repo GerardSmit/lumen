@@ -52,6 +52,7 @@ fn memoryview_of(it: &mut Interp, obj: &Value) -> R<Value> {
     it.call(&ty, vec![obj.clone()], Vec::new())
 }
 
+/// Optimized C implementation for the Python pickle module.
 #[lumen_bind::module(name = "_pickle")]
 pub mod _pickle {
     use super::load::{find_class_impl, set_buffers, set_input_stream, set_string_input, Ld, UnpicklerCore};

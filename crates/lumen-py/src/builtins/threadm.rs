@@ -175,26 +175,62 @@ pub mod _thread {
             self.release_impl(it)
         }
 
-        #[proto(enter)]
+        /// acquire(blocking=True) -> bool
+        ///
+        /// Lock the lock.  `blocking` indicates whether we should wait
+        /// for the lock to be available or not.  If `blocking` is False
+        /// and another thread holds the lock, the method will return False
+        /// immediately.  If `blocking` is True and another thread holds
+        /// the lock, the method will wait for the lock to be released,
+        /// take it and then return True.
+        /// (note: the blocking operation is interruptible.)
+        ///
+        /// In all other cases, the method will return True immediately.
+        /// Precisely, if the current thread already holds the lock, its
+        /// internal counter is simply incremented. If nobody holds the lock,
+        /// the lock is taken and its internal counter initialized to 1.
+        #[proto(enter, hint(py(text_signature = "")))]
         fn enter(&mut self) -> bool {
             self.count += 1;
             true
         }
 
-        #[proto(exit)]
+        /// release()
+        ///
+        /// Release the lock, allowing another thread that is blocked waiting for
+        /// the lock to acquire the lock.  The lock must be in the locked state,
+        /// and must be locked by the same thread that unlocks it; otherwise a
+        /// `RuntimeError` is raised.
+        ///
+        /// Do note that if the lock was acquire()d several times in a row by the
+        /// current thread, release() needs to be called as many times for the lock
+        /// to be available for other threads.
+        #[proto(exit, hint(py(text_signature = "")))]
         fn exit(&mut self, it: &mut Interp, #[varargs] args: &[Value]) -> R<()> {
             let _ = args;
             self.release_impl(it)
         }
 
+        /// _is_owned() -> bool
+        ///
+        /// For internal use by `threading.Condition`.
+        #[method(hint(py(text_signature = "")))]
         fn _is_owned(&self) -> bool {
             self.count > 0
         }
 
+        /// _recursion_count() -> int
+        ///
+        /// For internal use by reentrancy checks.
+        #[method(hint(py(text_signature = "")))]
         fn _recursion_count(&self) -> usize {
             self.count
         }
 
+        /// _release_save() -> tuple
+        ///
+        /// For internal use by `threading.Condition`.
+        #[method(hint(py(text_signature = "")))]
         fn _release_save(&mut self, it: &mut Interp) -> R<(usize, i64)> {
             if self.count == 0 {
                 return Err(it.runtime_error("cannot release un-acquired lock"));
@@ -202,6 +238,10 @@ pub mod _thread {
             Ok((std::mem::take(&mut self.count), MAIN_THREAD))
         }
 
+        /// _acquire_restore(state) -> None
+        ///
+        /// For internal use by `threading.Condition`.
+        #[method(hint(py(text_signature = "")))]
         fn _acquire_restore(&mut self, it: &mut Interp, state: &Value) -> R<()> {
             let n = match state.tuple_items() {
                 Some([c, _]) => it.index_of(c)?,
@@ -211,6 +251,7 @@ pub mod _thread {
             Ok(())
         }
 
+        #[method(hint(py(text_signature = "")))]
         fn _at_fork_reinit(&mut self) {
             self.count = 0;
         }

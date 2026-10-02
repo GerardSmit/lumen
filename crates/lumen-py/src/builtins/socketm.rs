@@ -339,7 +339,8 @@ pub mod _socket {
             opaque_instance(cls, Sock { fd: -1, family: AF_INET, ty: SOCK_STREAM, proto: 0, timeout: None })
         }
 
-        #[method(name = "__init__")]
+        /// Initialize self.  See help(type(self)) for accurate signature.
+        #[method(name = "__init__", hint(py(text_signature = "($self, /, *args, **kwargs)")))]
         fn init(
             slf: This<Py<Self>>,
             it: &mut Interp,
@@ -377,6 +378,7 @@ pub mod _socket {
             slf.0.with(it, |s| *s = sock)
         }
 
+        /// Return repr(self).
         #[method(name = "__repr__")]
         fn repr(&self) -> String {
             format!("<socket object, fd={}, family={}, type={}, proto={}>", self.fd, self.family, self.ty, self.proto)

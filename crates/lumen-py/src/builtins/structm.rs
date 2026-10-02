@@ -526,33 +526,65 @@ pub mod _struct {
             self.fmt.as_ref().map_or(-1, |f| f.size as i64)
         }
 
+        /// S.pack(v1, v2, ...) -> bytes
+        ///
+        /// Return a bytes object containing values v1, v2, ... packed according
+        /// to the format string S.format.  See help(struct) for more on format
+        /// strings.
         #[method(hint(py(text_signature = "")))]
         fn pack(&self, it: &mut Interp, #[varargs] values: &[Value]) -> R<Value> {
             let f = self.fmt(it)?;
             Ok(Value::bytes(pack_values(it, &f, "pack", values)?))
         }
 
+        /// S.pack_into(buffer, offset, v1, v2, ...)
+        ///
+        /// Pack the values v1, v2, ... according to the format string S.format
+        /// and write the packed bytes into the writable buffer buf starting at
+        /// offset.  Note that the offset is a required argument.  See
+        /// help(struct) for more on format strings.
         #[method(hint(py(text_signature = "")))]
         fn pack_into(&self, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
             let f = self.fmt(it)?;
             do_pack_into(it, &f, args)
         }
 
+        /// Return a tuple containing unpacked values.
+        ///
+        /// Unpack according to the format string Struct.format. The buffer's size
+        /// in bytes must be Struct.size.
+        ///
+        /// See help(struct) for more on format strings.
         fn unpack(&self, it: &mut Interp, buffer: &[u8]) -> R<Value> {
             let f = self.fmt(it)?;
             do_unpack(it, &f, buffer)
         }
 
+        /// Return a tuple containing unpacked values.
+        ///
+        /// Values are unpacked according to the format string Struct.format.
+        ///
+        /// The buffer's size in bytes, starting at position offset, must be
+        /// at least Struct.size.
+        ///
+        /// See help(struct) for more on format strings.
         fn unpack_from(&self, it: &mut Interp, #[kw] buffer: &[u8], #[kw] #[default(0)] offset: isize) -> R<Value> {
             let f = self.fmt(it)?;
             do_unpack_from(it, &f, buffer, offset)
         }
 
+        /// Return an iterator yielding tuples.
+        ///
+        /// Tuples are unpacked from the given bytes source, like a repeated
+        /// invocation of unpack_from().
+        ///
+        /// Requires that the bytes length be a multiple of the struct size.
         fn iter_unpack(&self, it: &mut Interp, buffer: &Value) -> R<Value> {
             let f = self.fmt(it)?;
             make_iter(it, f, buffer)
         }
 
+        /// S.__sizeof__() -> size of S in memory, in bytes
         #[method(hint(py(text_signature = "")))]
         fn __sizeof__(&self) -> i64 {
             56 + 32 * (self.fmt.as_ref().map_or(0, |f| f.codes.len()) as i64 + 1)

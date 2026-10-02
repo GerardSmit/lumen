@@ -487,7 +487,8 @@ pub mod _operator {
             Ok(format!("operator.attrgetter({})", reprs(it, &attrs)?.join(", ")))
         }
 
-        #[proto(reduce)]
+        /// Return state information for pickling
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let attrs = slf.0.borrow(it)?.attrs.clone();
             let cls = Value::Obj(it.type_of(slf.0.value()));
@@ -536,7 +537,8 @@ pub mod _operator {
             Ok(format!("operator.itemgetter({})", reprs(it, &items)?.join(", ")))
         }
 
-        #[proto(reduce)]
+        /// Return state information for pickling
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let items = slf.0.borrow(it)?.items.clone();
             let cls = Value::Obj(it.type_of(slf.0.value()));
@@ -594,7 +596,8 @@ pub mod _operator {
             Ok(format!("operator.methodcaller({})", parts.join(", ")))
         }
 
-        #[proto(reduce)]
+        /// Return state information for pickling
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let (name, args, kwargs) = {
                 let me = slf.0.borrow(it)?;
