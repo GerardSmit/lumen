@@ -35,7 +35,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_sha3", bound::<super::hashlibm::_sha3::Module>),
     ("_signal", bound::<super::signalm::_signal::Module>),
     ("_socket", bound::<super::socketm::_socket::Module>),
-    ("_sre", |it| Some(super::sre::make(it))),
+    ("_sre", bound::<super::sre::_sre::Module>),
     ("_statistics", bound::<super::statisticsm::_statistics::Module>),
     ("_string", bound::<super::stringm::_string::Module>),
     ("_struct", bound::<super::structm::_struct::Module>),
