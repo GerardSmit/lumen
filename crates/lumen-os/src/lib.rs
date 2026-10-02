@@ -5,7 +5,6 @@
 pub mod channel;
 pub mod child;
 pub mod consts;
-pub mod crypt;
 pub mod errno;
 pub mod event;
 pub mod fdctl;
