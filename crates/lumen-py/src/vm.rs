@@ -172,7 +172,6 @@ pub struct Interp {
     pub atexit: Vec<(Value, Vec<Value>, Vec<(Obj, Value)>)>,
     pub gc_enabled: bool,
     pub simple_namespace: Option<Obj>,
-    pub alias_types: Option<Rc<crate::builtins::alias::AliasTypes>>,
     pub interrupt: InterruptHandle,
     pub interrupted: bool,
     /// Runs Python signal handlers at `poll` (the interpreter of the thread that owns signals).
@@ -242,7 +241,6 @@ impl Interp {
             atexit: Vec::new(),
             gc_enabled: true,
             simple_namespace: None,
-            alias_types: None,
             interrupt: InterruptHandle::new(),
             interrupted: false,
             handles_signals: false,

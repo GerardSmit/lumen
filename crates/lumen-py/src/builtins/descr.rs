@@ -326,7 +326,7 @@ impl DescriptorRepr {
         let name = it.str_of(&name)?;
         let owner = it.get_attr_str(&slf, "__objclass__")?;
         let owner = match &owner {
-            Value::Obj(o) => it.type_name(o),
+            Value::Obj(o) => it.type_display(o),
             _ => String::new(),
         };
         let is_member = matches!(&*slf, Value::Obj(o) if o.cls.as_ref().is_some_and(|c| it.type_name(c) == "member_descriptor"));
@@ -381,7 +381,8 @@ pub fn install_getsets<T: lumen_bind::Methods<crate::bind::PyHost>>(it: &mut Int
         }
         let name = crate::bind::args::py_name(item.desc);
         let fget = crate::bind::native_value(item);
-        put_descriptor(it, owner, name, fget, Value::None, members.contains(&name));
+        let doc = item.desc.doc.map_or(Value::None, Value::str);
+        put_descriptor(it, owner, name, fget, Value::None, doc, members.contains(&name));
     }
 }
 
@@ -390,13 +391,13 @@ pub fn install_getsets<T: lumen_bind::Methods<crate::bind::PyHost>>(it: &mut Int
 pub fn add_getset(it: &mut Interp, owner: &Obj, name: &'static str, get: NativeFn, set: Option<NativeFn>, member: bool) {
     let fget = it.new_native(name, get, false);
     let fset = set.map_or(Value::None, |f| it.new_native(name, f, false));
-    put_descriptor(it, owner, name, fget, fset, member);
+    put_descriptor(it, owner, name, fget, fset, Value::None, member);
 }
 
-fn put_descriptor(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value, fset: Value, member: bool) {
+fn put_descriptor(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value, fset: Value, doc: Value, member: bool) {
     let types = it.native_state::<DescrTypes>();
     let Some(ty) = (if member { types.member.clone() } else { types.getset.clone() }) else { return };
-    let p = Object::with_cls(ty, Kind::Property(PropData { fget, fset, fdel: Value::None, doc: Value::None }));
+    let p = Object::with_cls(ty, Kind::Property(PropData { fget, fset, fdel: Value::None, doc }));
     let d = it.instance_dict(&p);
     let owner_name = it.type_name(owner);
     dict_set_str(&d, "__name__", Value::str(name));
