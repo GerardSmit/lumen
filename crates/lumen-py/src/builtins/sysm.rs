@@ -5,7 +5,7 @@
 #[lumen_bind::module(name = "sys")]
 pub mod sys {
     use crate::builtins::genm::AsyncGenHooks;
-    use crate::builtins::sysextra::{new_structseq_type, structseq};
+    use crate::builtins::sysextra::{new_structseq_type, new_structseq_type_ext, structseq, structseq_full};
     use crate::object::*;
     use crate::vm::*;
     use std::rc::Rc;
@@ -173,6 +173,58 @@ pub mod sys {
     #[op]
     fn is_finalizing() -> bool {
         crate::gc::is_finalizing()
+    }
+
+    /// Return True if the GIL is enabled and False if it is disabled.
+    #[op]
+    fn _is_gil_enabled() -> bool {
+        true
+    }
+
+    /// Return True if the given object is "interned".
+    #[op]
+    fn _is_interned(string: &Value) -> bool {
+        string.as_str().is_some()
+    }
+
+    /// Return True if the given object is "immortal" per PEP 683.
+    #[op]
+    fn _is_immortal(op: &Value) -> bool {
+        !matches!(op, Value::Obj(_))
+    }
+
+    /// Clear all internal performance-related caches.
+    #[op]
+    fn _clear_internal_caches() {
+        crate::watch::clear_type_cache();
+    }
+
+    /// Return the name of the module of the frame `depth` calls below the top of the stack,
+    /// or None if the frame has no `__name__` global.
+    #[op]
+    fn _getframemodulename(it: &mut Interp, #[kw] #[default(0)] depth: i64) -> R<Value> {
+        let n = it.frames.len() as i64;
+        if depth < 0 || depth >= n {
+            return Ok(Value::None);
+        }
+        let frame = it.frame_object((n - 1 - depth) as usize);
+        let globals = it.get_attr_str(&frame, "f_globals")?;
+        match &globals {
+            Value::Obj(d) => Ok(dict_get_str(d, "__name__").unwrap_or(Value::None)),
+            _ => Ok(Value::None),
+        }
+    }
+
+    /// Return True if remote debugging is enabled, False otherwise.
+    #[op]
+    fn is_remote_debug_enabled() -> bool {
+        false
+    }
+
+    /// Return the directory where the standard library lives.
+    #[op]
+    fn _stdlib_dir() -> &'static str {
+        crate::frozen::FROZEN_DIR
     }
 
     /// Return the global debug tracing function set with sys.settrace.
@@ -428,7 +480,7 @@ pub mod sys {
         let v = match name.as_str() {
             "version_info" => {
                 let ty = new_structseq_type(it, "sys", "version_info", &["major", "minor", "micro", "releaselevel", "serial"]);
-                structseq(&ty, vec![Value::Int(3), Value::Int(12), Value::Int(15), Value::str("final"), Value::Int(0)])
+                structseq(&ty, vec![Value::Int(3), Value::Int(14), Value::Int(8), Value::str("final"), Value::Int(0)])
             }
             "flags" => {
                 let names = [
@@ -450,14 +502,17 @@ pub mod sys {
                     "warn_default_encoding",
                     "safe_path",
                     "int_max_str_digits",
+                    "gil",
+                    "thread_inherit_context",
+                    "context_aware_warnings",
                 ];
-                let ty = new_structseq_type(it, "sys", "flags", &names);
+                let ty = new_structseq_type_ext(it, "sys", "flags", &names, 18);
                 let digits = it.int_max_str_digits() as i64;
                 let utf8 = crate::builtins::iom::utf8_mode(it) as i64;
                 let vals = names
                     .iter()
                     .map(|n| match *n {
-                        "hash_randomization" | "dont_write_bytecode" => Value::Int(1),
+                        "hash_randomization" | "dont_write_bytecode" | "gil" => Value::Int(1),
                         "utf8_mode" => Value::Int(utf8),
                         "int_max_str_digits" => Value::Int(digits),
                         "dev_mode" => Value::Bool(false),
@@ -465,7 +520,7 @@ pub mod sys {
                         _ => Value::Int(0),
                     })
                     .collect();
-                structseq(&ty, vals)
+                structseq_full(&ty, vals)
             }
             "float_info" => {
                 let names = ["max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig", "mant_dig", "epsilon", "radix", "rounds"];
@@ -522,10 +577,11 @@ pub mod sys {
                 };
                 it.new_namespace(vec![
                     ("name", Value::str("lumen-py")),
-                    ("cache_tag", Value::str("lumen-312")),
+                    ("cache_tag", Value::str("lumen-314")),
                     ("version", vi),
-                    ("hexversion", Value::Int(0x030c0ff0)),
+                    ("hexversion", Value::Int(0x030e08f0)),
                     ("_multiarch", Value::str("")),
+                    ("supports_isolated_interpreters", Value::Bool(true)),
                 ])
             }
             _ => {
@@ -551,8 +607,8 @@ pub mod sys {
         dict_set_str(&d, "maxsize", Value::Int(i64::MAX));
         dict_set_str(&d, "maxunicode", Value::Int(0x10ffff));
         dict_set_str(&d, "byteorder", Value::str("little"));
-        dict_set_str(&d, "version", Value::str("3.12.15 (main, Jan  1 2026, 00:00:00) [lumen-py]"));
-        dict_set_str(&d, "hexversion", Value::Int(0x030c0ff0));
+        dict_set_str(&d, "version", Value::str("3.14.8 (main, Jan  1 2026, 00:00:00) [lumen-py]"));
+        dict_set_str(&d, "hexversion", Value::Int(0x030e08f0));
         let (platform, executable, argv) = {
             let p = it.platform.borrow();
             (p.platform_name(), p.executable(), p.argv())
