@@ -39,6 +39,8 @@ pub mod bz2m;
 pub mod lzmam;
 pub mod pyexpatm;
 pub mod zlibm;
+#[cfg(all(unix, not(target_os = "android")))]
+pub mod sslm;
 pub mod hashlibm;
 pub mod heapqm;
 pub mod impm;

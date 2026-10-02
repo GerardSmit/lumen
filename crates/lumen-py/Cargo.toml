@@ -24,6 +24,7 @@ workspace = true
 lumen-common = { path = "../lumen-common", features = ["hash", "crypt", "compress", "lzma"] }
 lumen-os = { path = "../lumen-os" }
 lumen-bind = { path = "../lumen-bind" }
+lumen-tls = { path = "../lumen-tls" }
 
 [dev-dependencies]
 # Only for tests/dual_lang.rs: one `#[op]` bound into both engines.

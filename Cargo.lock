@@ -980,6 +980,7 @@ dependencies = [
  "lumen-bind",
  "lumen-common",
  "lumen-os",
+ "lumen-tls",
 ]
 
 [[package]]

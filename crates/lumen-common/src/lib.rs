@@ -45,3 +45,4 @@ pub mod unicode_norm_impl;
 pub mod unicode_props;
 pub mod utf;
 pub mod xml;
+pub mod x509;

@@ -42,6 +42,8 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_signal", bound::<super::signalm::_signal::Module>),
     ("_socket", bound::<super::socketm::_socket::Module>),
     ("_sre", bound::<super::sre::_sre::Module>),
+    #[cfg(all(unix, not(target_os = "android")))]
+    ("_ssl", bound::<super::sslm::_ssl::Module>),
     ("_statistics", bound::<super::statisticsm::_statistics::Module>),
     ("_string", bound::<super::stringm::_string::Module>),
     ("_struct", bound::<super::structm::_struct::Module>),

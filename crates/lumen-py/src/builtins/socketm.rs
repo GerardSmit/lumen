@@ -228,13 +228,13 @@ pub mod _socket {
         Ok(Some(secs))
     }
 
-    fn now(it: &mut Interp) -> f64 {
+    pub(crate) fn now(it: &mut Interp) -> f64 {
         it.platform.borrow().monotonic_ns() as f64 / 1e9
     }
 
     /// Waits until `fd` is readable or writable or `deadline` (monotonic seconds) passes;
     /// returns whether it became ready.
-    fn wait_ready(it: &mut Interp, fd: i32, writing: bool, deadline: Option<f64>) -> R<bool> {
+    pub(crate) fn wait_ready(it: &mut Interp, fd: i32, writing: bool, deadline: Option<f64>) -> R<bool> {
         let left = deadline.map(|d| ((d - now(it)) * 1000.0).ceil().max(0.0) as i64);
         let events = if writing { POLLOUT } else { POLLIN };
         crate::builtins::selectm::wait(it, left, |ms| {
@@ -300,6 +300,12 @@ pub mod _socket {
 
     fn fields(it: &mut Interp, s: &Py<Sock>) -> R<(i32, i32, Option<f64>)> {
         s.with(it, |s| (s.fd, s.family, s.timeout))
+    }
+
+    /// The descriptor and timeout of `v` when it is a `socket.socket` (or a subclass instance).
+    pub(crate) fn fd_and_timeout(it: &mut Interp, v: &Value) -> Option<(i32, Option<f64>)> {
+        let sock = Py::<Sock>::from_value(it, v)?;
+        sock.with(it, |s| (s.fd, s.timeout)).ok()
     }
 
     fn set_blocking_fd(fd: i32, timeout: Option<f64>) -> lumen_os::net::R<()> {
@@ -728,7 +734,7 @@ pub mod _socket {
         }
     }
 
-    fn nosignal() -> i32 {
+    pub(crate) fn nosignal() -> i32 {
         net::MSG_NOSIGNAL
     }
 

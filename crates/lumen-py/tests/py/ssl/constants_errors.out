@@ -1,0 +1,18 @@
+0 1 2
+2 16 17 5
+-2 -1 772
+1 2 3 8
+40 112
+True True True True False
+True True
+5
+['SSLError', 'OSError', 'Exception', 'BaseException', 'object']
+['SSLCertVerificationError', 'SSLError', 'OSError', 'ValueError', 'Exception', 'BaseException', 'object']
+True
+True
+True
+('plain',) False
+message 1 message
+16 b''
+True
+num must be positive
